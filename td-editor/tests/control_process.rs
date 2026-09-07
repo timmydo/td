@@ -1,0 +1,751 @@
+//! Real editor process and control/file workers; the display is a wire fixture,
+//! not a compositor or pixel oracle. Ordinary transport tests inspect SHM bytes.
+#![forbid(unsafe_code)]
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+
+use std::collections::BTreeMap;
+use std::io::{self, Read, Write};
+use std::os::unix::fs::PermissionsExt;
+use std::os::unix::net::{UnixListener, UnixStream};
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
+
+type Result<T> = std::result::Result<T, String>;
+const TIMEOUT: Duration = Duration::from_secs(10);
+static NEXT: AtomicU64 = AtomicU64::new(0);
+
+struct Directory(PathBuf);
+impl Directory {
+    fn new() -> Self {
+        // Linux pathname sockets need a short path, independent of TMPDIR.
+        let path = Path::new("/tmp").join(format!(
+            "td-editor-process-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir(&path).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        Self(path)
+    }
+}
+impl Drop for Directory {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn words(values: &[u32]) -> Vec<u8> {
+    values.iter().flat_map(|v| v.to_ne_bytes()).collect()
+}
+fn word(bytes: &[u8], at: usize) -> Result<u32> {
+    Ok(u32::from_ne_bytes(
+        bytes
+            .get(at..at + 4)
+            .ok_or("short display word")?
+            .try_into()
+            .map_err(|_| "display word")?,
+    ))
+}
+fn remaining(deadline: Instant) -> io::Result<Duration> {
+    deadline
+        .checked_duration_since(Instant::now())
+        .filter(|duration| !duration.is_zero())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "fixture I/O deadline"))
+}
+fn read_until(stream: &mut UnixStream, mut bytes: &mut [u8], deadline: Instant) -> io::Result<()> {
+    while !bytes.is_empty() {
+        stream.set_read_timeout(Some(remaining(deadline)?))?;
+        match stream.read(bytes) {
+            Ok(0) => return Err(io::ErrorKind::UnexpectedEof.into()),
+            Ok(n) => bytes = &mut bytes[n..],
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+fn write_until(stream: &mut UnixStream, mut bytes: &[u8], deadline: Instant) -> io::Result<()> {
+    while !bytes.is_empty() {
+        stream.set_write_timeout(Some(remaining(deadline)?))?;
+        match stream.write(bytes) {
+            Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+            Ok(n) => bytes = &bytes[n..],
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+fn transport(error: io::Error) -> String {
+    format!("transport: {error}")
+}
+fn field<'a>(state: &'a str, name: &str) -> Option<&'a str> {
+    state.split('\t').find_map(|field| {
+        let (key, value) = field.split_once('=')?;
+        (key == name).then_some(value)
+    })
+}
+fn send(stream: &mut UnixStream, object: u32, opcode: u16, payload: &[u8]) -> Result<()> {
+    let size = u32::try_from(payload.len() + 8).map_err(|_| "display size")?;
+    if size > u16::MAX as u32 || !size.is_multiple_of(4) {
+        return Err("display size".into());
+    }
+    let mut message = words(&[object, (size << 16) | u32::from(opcode)]);
+    message.extend_from_slice(payload);
+    write_until(stream, &message, Instant::now() + Duration::from_secs(2)).map_err(transport)
+}
+fn global(
+    stream: &mut UnixStream,
+    registry: u32,
+    name: u32,
+    interface: &str,
+    version: u32,
+) -> Result<()> {
+    let mut body = words(&[
+        name,
+        u32::try_from(interface.len() + 1).map_err(|_| "interface size")?,
+    ]);
+    body.extend_from_slice(interface.as_bytes());
+    body.push(0);
+    while !body.len().is_multiple_of(4) {
+        body.push(0);
+    }
+    body.extend(words(&[version]));
+    send(stream, registry, 0, &body)
+}
+
+#[derive(Clone, Copy)]
+enum Object {
+    Display,
+    Registry,
+    Compositor,
+    Shm,
+    Seat,
+    Pointer,
+    Wm,
+    Surface,
+    XdgSurface,
+    Toplevel,
+    Pool,
+    Buffer,
+}
+#[derive(Default)]
+struct DisplayStats {
+    commits: usize,
+    callbacks: usize,
+    buffers: usize,
+}
+impl DisplayStats {
+    fn assert_rendered(&self) {
+        assert!(self.commits > 0, "no buffered commit");
+        assert!(self.callbacks > 0, "no frame callback");
+        assert!(self.buffers > 0, "no created buffer");
+    }
+}
+struct Display {
+    stop: Arc<AtomicBool>,
+    join: Option<JoinHandle<Result<DisplayStats>>>,
+}
+impl Display {
+    fn start(path: &Path, pointer: bool) -> Self {
+        let listener = UnixListener::bind(path).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let signal = stop.clone();
+        let join = std::thread::spawn(move || {
+            let deadline = Instant::now() + TIMEOUT;
+            let mut stream = loop {
+                if signal.load(Ordering::Relaxed) {
+                    return Ok(DisplayStats::default());
+                }
+                if Instant::now() >= deadline {
+                    return Err("display accept timeout".into());
+                }
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(2))
+                    }
+                    Err(e) => return Err(e.to_string()),
+                }
+            };
+            stream
+                .set_read_timeout(Some(Duration::from_millis(20)))
+                .map_err(|e| e.to_string())?;
+            let lifetime = Instant::now() + Duration::from_secs(30);
+            let mut objects = BTreeMap::from([(1, Object::Display)]);
+            let mut pending = Vec::new();
+            let mut input = [0; 4096];
+            let mut stats = DisplayStats::default();
+            let mut configured = false;
+            let mut surface = 0;
+            let mut xdg = 0;
+            let mut toplevel = 0;
+            let mut attached = None;
+            let mut current_buffer = 0;
+            let mut callback = None;
+            let mut pointer_id = None;
+            let mut entered = false;
+            while !signal.load(Ordering::Relaxed) {
+                remaining(lifetime).map_err(transport)?;
+                match stream.read(&mut input) {
+                    Ok(0) => return Ok(stats),
+                    Ok(n) => pending.extend_from_slice(&input[..n]),
+                    Err(e)
+                        if matches!(
+                            e.kind(),
+                            io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                        ) =>
+                    {
+                        continue
+                    }
+                    Err(e) => return Err(e.to_string()),
+                }
+                if pending.len() > 128 * 1024 {
+                    return Err("display pending bound".into());
+                }
+                while pending.len() >= 8 {
+                    if signal.load(Ordering::Relaxed) {
+                        return Ok(stats);
+                    }
+                    remaining(lifetime).map_err(transport)?;
+                    let object = word(&pending, 0)?;
+                    let header = word(&pending, 4)?;
+                    let size = (header >> 16) as usize;
+                    if size < 8 || !size.is_multiple_of(4) {
+                        return Err("invalid display request".into());
+                    }
+                    if pending.len() < size {
+                        break;
+                    }
+                    let payload = pending[8..size].to_vec();
+                    pending.drain(..size);
+                    let opcode = (header & 0xffff) as u16;
+                    match (
+                        objects
+                            .get(&object)
+                            .copied()
+                            .ok_or("unknown display object")?,
+                        opcode,
+                    ) {
+                        (Object::Display, 1) => {
+                            let registry = word(&payload, 0)?;
+                            objects.insert(registry, Object::Registry);
+                            for (id, interface, version) in [
+                                (1, "wl_compositor", 4),
+                                (2, "wl_shm", 1),
+                                (3, "xdg_wm_base", 1),
+                                (4, "wl_seat", 5),
+                            ] {
+                                global(&mut stream, registry, id, interface, version)?;
+                            }
+                        }
+                        (Object::Display, 0) => {
+                            let sync = word(&payload, 0)?;
+                            send(&mut stream, sync, 0, &words(&[0]))?;
+                            send(&mut stream, 1, 1, &words(&[sync]))?;
+                        }
+                        (Object::Registry, 0) => {
+                            let kind = match word(&payload, 0)? {
+                                1 => Object::Compositor,
+                                2 => Object::Shm,
+                                3 => Object::Wm,
+                                4 => Object::Seat,
+                                _ => return Err("unexpected global bind".into()),
+                            };
+                            let id =
+                                word(&payload, payload.len().checked_sub(4).ok_or("bind size")?)?;
+                            objects.insert(id, kind);
+                            if matches!(kind, Object::Shm) {
+                                send(&mut stream, id, 0, &words(&[1]))?;
+                            }
+                            if matches!(kind, Object::Seat) {
+                                send(&mut stream, id, 0, &words(&[u32::from(pointer)]))?;
+                            }
+                        }
+                        (Object::Compositor, 0) => {
+                            if surface != 0 {
+                                return Err("fixture supports one main surface only".into());
+                            }
+                            surface = word(&payload, 0)?;
+                            objects.insert(surface, Object::Surface);
+                        }
+                        (Object::Seat, 0) if pointer => {
+                            let id = word(&payload, 0)?;
+                            objects.insert(id, Object::Pointer);
+                            pointer_id = Some(id);
+                        }
+                        (Object::Wm, 2) => {
+                            xdg = word(&payload, 0)?;
+                            objects.insert(xdg, Object::XdgSurface);
+                        }
+                        (Object::XdgSurface, 1) => {
+                            toplevel = word(&payload, 0)?;
+                            objects.insert(toplevel, Object::Toplevel);
+                        }
+                        (Object::Shm, 0) => {
+                            // Plain read intentionally discards SCM_RIGHTS. This fixture
+                            // checks lifecycle, while separate tests inspect mapped pixels.
+                            objects.insert(word(&payload, 0)?, Object::Pool);
+                        }
+                        (Object::Pool, 0) => {
+                            if word(&payload, 8)? != 640
+                                || word(&payload, 12)? != 480
+                                || word(&payload, 16)? != 640 * 4
+                                || word(&payload, 20)? != 1
+                            {
+                                return Err(
+                                    "expected 640x480 XRGB buffer with packed stride".into()
+                                );
+                            }
+                            objects.insert(word(&payload, 0)?, Object::Buffer);
+                            stats.buffers += 1;
+                        }
+                        (Object::Pool, 1) | (Object::Buffer, 0) => {
+                            objects.remove(&object);
+                            send(&mut stream, 1, 1, &words(&[object]))?;
+                        }
+                        (Object::Surface, 1) => {
+                            attached = Some(word(&payload, 0)?);
+                        }
+                        (Object::Surface, 3) => {
+                            callback = Some(word(&payload, 0)?);
+                        }
+                        (Object::Surface, 6) if !configured => {
+                            if toplevel == 0 || xdg == 0 {
+                                return Err("commit before role".into());
+                            }
+                            configured = true;
+                            send(&mut stream, toplevel, 0, &words(&[640, 480, 0]))?;
+                            send(&mut stream, xdg, 0, &words(&[1]))?;
+                        }
+                        (Object::Surface, 6) => {
+                            let newly_attached = attached.take();
+                            if let Some(buffer) = newly_attached {
+                                if buffer != 0
+                                    && !matches!(objects.get(&buffer), Some(Object::Buffer))
+                                {
+                                    return Err("uncreated buffer".into());
+                                }
+                                current_buffer = buffer;
+                            }
+                            if current_buffer != 0 {
+                                stats.commits += 1;
+                            }
+                            if let Some(id) = callback.take() {
+                                send(&mut stream, id, 0, &words(&[1]))?;
+                                send(&mut stream, 1, 1, &words(&[id]))?;
+                                stats.callbacks += 1;
+                            }
+                            if let Some(buffer) = newly_attached.filter(|buffer| *buffer != 0) {
+                                send(&mut stream, buffer, 0, &[])?;
+                            }
+                        }
+                        (Object::Surface, 2 | 7 | 9)
+                        | (Object::XdgSurface, 3 | 4)
+                        | (Object::Toplevel, 2 | 3 | 8) => {}
+                        _ => return Err(format!("unexpected display request {object}:{opcode}")),
+                    }
+                    if configured && !entered {
+                        if let Some(id) = pointer_id {
+                            send(&mut stream, id, 0, &words(&[1, surface, 0, 0]))?;
+                            entered = true;
+                        }
+                    }
+                }
+            }
+            Ok(stats)
+        });
+        Self {
+            stop,
+            join: Some(join),
+        }
+    }
+    fn finish(&mut self) -> DisplayStats {
+        self.stop.store(true, Ordering::Relaxed);
+        self.join.take().unwrap().join().unwrap().unwrap()
+    }
+}
+impl Drop for Display {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(join) = self.join.take() {
+            if let Ok(Err(detail)) = join.join() {
+                eprintln!("display fixture: {detail}");
+            }
+        }
+    }
+}
+
+struct EditorProcess {
+    child: Child,
+    socket: PathBuf,
+    log: PathBuf,
+    next: u64,
+}
+impl EditorProcess {
+    fn start(directory: &Directory, display: &Path, file: &Path, dictionary: &Path) -> Self {
+        let socket = directory.0.join("control");
+        let log = directory.0.join("stderr");
+        let child = Command::new(env!("CARGO_BIN_EXE_td-editor"))
+            .args(["--window", "--control-socket"])
+            .arg(&socket)
+            .arg("--dictionary")
+            .arg(dictionary)
+            .arg("--")
+            .arg(file)
+            .env_clear()
+            .env("WAYLAND_DISPLAY", display)
+            .env("XDG_RUNTIME_DIR", &directory.0)
+            .env("TMPDIR", &directory.0)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(std::fs::File::create(&log).unwrap())
+            .spawn()
+            .unwrap();
+        Self {
+            child,
+            socket,
+            log,
+            next: 0,
+        }
+    }
+    fn request(&mut self, tail: &str) -> Result<String> {
+        let deadline = Instant::now() + TIMEOUT;
+        let mut stream = loop {
+            match UnixStream::connect(&self.socket) {
+                Ok(stream) => break stream,
+                Err(_) if Instant::now() < deadline => {
+                    if let Some(status) = self.child.try_wait().map_err(|e| e.to_string())? {
+                        return Err(format!(
+                            "editor exited {status}: {}",
+                            std::fs::read_to_string(&self.log).unwrap_or_default()
+                        ));
+                    }
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                Err(e) => return Err(e.to_string()),
+            }
+        };
+        self.next += 1;
+        let payload = format!("1\t{}\t{tail}", self.next);
+        let frame = td_editor::control::frame(payload.as_bytes()).map_err(|e| e.to_string())?;
+        write_until(&mut stream, &frame, deadline).map_err(transport)?;
+        let mut header = [0; 4];
+        read_until(&mut stream, &mut header, deadline).map_err(transport)?;
+        let length = u32::from_be_bytes(header) as usize;
+        if length == 0 || length > td_editor::control::MAX_FRAME {
+            return Err("control response bound".into());
+        }
+        let mut response = vec![0; length];
+        read_until(&mut stream, &mut response, deadline).map_err(transport)?;
+        let response = String::from_utf8(response).map_err(|e| e.to_string())?;
+        let prefix = format!("1\t{}\t", self.next);
+        Ok(response
+            .strip_prefix(&prefix)
+            .ok_or("response identity")?
+            .to_owned())
+    }
+    fn ok(&mut self, tail: &str) -> String {
+        let response = self.request(tail);
+        assert!(
+            response.is_ok(),
+            "{tail}: {response:?}; status: {:?}; stderr: {}",
+            self.child.try_wait(),
+            std::fs::read_to_string(&self.log).unwrap_or_default()
+        );
+        let response = response.unwrap();
+        response.strip_prefix("ok\t").expect(&response).to_owned()
+    }
+    fn wait_job(&mut self, id: &str) -> String {
+        let deadline = Instant::now() + TIMEOUT;
+        loop {
+            let state = self.ok("state");
+            let prefix = format!("job={id},");
+            let job = state
+                .split('\t')
+                .find(|field| field.starts_with(&prefix))
+                .expect(&state);
+            if !job.contains(",pending,") {
+                assert!(job.ends_with(",complete,-"), "{job}");
+                return job.to_owned();
+            }
+            assert!(Instant::now() < deadline, "job deadline: {state}");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+    fn job(&mut self, tail: &str) -> String {
+        let response = self.request(tail).unwrap();
+        let id = response.strip_prefix("pending\t").expect(&response);
+        self.wait_job(id)
+    }
+    fn press(&mut self, tab: u64, revision: u64, x: i64, y: i64) {
+        let deadline = Instant::now() + TIMEOUT;
+        let state = loop {
+            let state = self.ok("state");
+            if field(&state, "pointer-ready") == Some("1") {
+                break state;
+            }
+            assert!(Instant::now() < deadline, "pointer readiness: {state}");
+            std::thread::sleep(Duration::from_millis(2));
+        };
+        assert_eq!(field(&state, "key-ready"), Some("0"));
+        let token = field(&state, "input-generation").unwrap();
+        self.ok(&format!(
+            "pointer\t{tab}\t{revision}\t{token}\tpress\t{x}\t{y}\t0"
+        ));
+    }
+    fn menu(&mut self, tab: u64, revision: u64, group: usize, row: usize) {
+        let geometry =
+            td_editor::render::Geometry::new(640, 480, td_editor::render::Scale::new(1).unwrap())
+                .unwrap();
+        let header = geometry.menu(group).unwrap();
+        self.press(tab, revision, header.x + 4, 8);
+        // At width 640 the 320px panel clamps x to 640 - 320. Single
+        // presses activate 24px item rows; a trailing release is separate.
+        self.press(
+            tab,
+            revision,
+            header.x.min(320) + 4,
+            24 + row as i64 * 24 + 12,
+        );
+    }
+    fn answer(&mut self, tab: u64, revision: u64, kind: &str, action: &str) {
+        let snapshot = self.ok("prompt-state");
+        // Input replies follow synchronous prompt dispatch: polling here
+        // would hide a wrong transition rather than wait for queued work.
+        assert_eq!(field(&snapshot, "prompt"), Some(kind), "{snapshot}");
+        assert_eq!(
+            field(&snapshot, "target"),
+            Some(format!("{tab},{revision}").as_str())
+        );
+        assert_eq!(field(&snapshot, "key-ready"), Some("0"));
+        let token = field(&snapshot, "input-generation").unwrap();
+        self.ok(&format!(
+            "prompt-answer\t{tab}\t{revision}\t{token}\t{kind}\t{action}"
+        ));
+    }
+    fn rendered(&mut self) {
+        let state = self.ok("state");
+        let generation = field(&state, "window-generation").unwrap();
+        let frame = self.ok(&format!("wait-frame\t{generation}"));
+        assert!(frame.ends_with(",640,480,1"), "{frame}");
+        assert!(
+            frame.split(',').next().unwrap().parse::<u64>().unwrap()
+                >= generation.parse::<u64>().unwrap()
+        );
+    }
+    fn quit(&mut self) {
+        // Shutdown may lose the last transport reply, but a received
+        // protocol refusal must never be mistaken for successful quit.
+        match self.request("quit") {
+            Ok(reply) => assert_eq!(reply, "ok\t"),
+            Err(error) => assert!(error.starts_with("transport: "), "{error}"),
+        }
+        assert!(
+            self.exit().success(),
+            "{}",
+            std::fs::read_to_string(&self.log).unwrap()
+        );
+        assert!(!self.socket.exists());
+    }
+    fn exit(&mut self) -> std::process::ExitStatus {
+        let deadline = Instant::now() + TIMEOUT;
+        loop {
+            if let Some(status) = self.child.try_wait().unwrap() {
+                return status;
+            }
+            assert!(Instant::now() < deadline, "editor exit timeout");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+}
+impl Drop for EditorProcess {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+#[test]
+fn production_process_roundtrips_remote_edit_jobs_frames_and_close_dialogs() {
+    let directory = Directory::new();
+    let display_path = directory.0.join("wayland");
+    let mut display = Display::start(&display_path, false);
+    let file = directory.0.join("-draft");
+    let dictionary = directory.0.join("dictionary");
+    std::fs::write(&file, b"\xef\xbb\xbfone\r\nwrng\r\n").unwrap();
+    std::fs::write(&dictionary, b"one\nwarm\nwrong\n").unwrap();
+    let mut editor = EditorProcess::start(&directory, &display_path, &file, &dictionary);
+    assert_eq!(field(&editor.ok("state"), "key-ready"), Some("0"));
+    let spelling = editor.job("check-spelling\t1\t0");
+    let scan = spelling.split(',').nth(4).unwrap();
+    assert_eq!(
+        editor.ok(&format!("spelling-results\t1\t0\t{scan}\t0\t10")),
+        format!("1\t0\t{scan}\tcomplete\t1\t1\t2\t1\t0\t0\t4,8")
+    );
+    editor.ok("insert\t1\t0\t0\t0\t7761726d20");
+    assert!(editor
+        .request(&format!("spelling-results\t1\t1\t{scan}\t0\t10"))
+        .unwrap()
+        .starts_with("error\tstale-revision\t"));
+    assert!(editor
+        .request("insert\t1\t0\t0\t0\t78")
+        .unwrap()
+        .starts_with("error\tstale-revision\t"));
+    editor.ok("replace\t1\t1\t77726e67\t77726f6e67");
+    editor.ok("undo\t1\t2");
+    assert!(editor
+        .ok("text\t1\t3\t0\t100")
+        .contains(&td_editor::control::hex(b"warm one\nwrng\n")));
+    editor.ok("redo\t1\t3");
+    assert!(editor
+        .ok("text\t1\t4\t0\t100")
+        .contains(&td_editor::control::hex(b"warm one\nwrong\n")));
+    let spelling = editor.job("check-spelling\t1\t4");
+    let scan = spelling.split(',').nth(4).unwrap();
+    assert_eq!(
+        editor.ok(&format!("spelling-results\t1\t4\t{scan}\t0\t10")),
+        format!("1\t4\t{scan}\tcomplete\t0\t0\t3\t0\t0\t0\t-")
+    );
+    assert!(editor.job("save\t1\t4").contains(",save,1,4,"));
+    assert_eq!(
+        std::fs::read(&file).unwrap(),
+        b"\xef\xbb\xbfwarm one\r\nwrong\r\n"
+    );
+    assert_eq!(editor.ok("new"), "2");
+    let unicode = "e\u{301}🦀";
+    editor.ok(&format!(
+        "insert\t2\t0\t0\t0\t{}",
+        td_editor::control::hex(unicode.as_bytes())
+    ));
+    assert!(editor
+        .ok("text\t2\t1\t0\t100")
+        .contains(&td_editor::control::hex(unicode.as_bytes())));
+    let first = editor.ok("close-tab\t2\t1");
+    let first = first.strip_prefix("dialog\t").unwrap();
+    editor.ok(&format!("dialog-answer\t{first}\t2\t1\tcancel"));
+    let second = editor.ok("close-tab\t2\t1");
+    let second = second.strip_prefix("dialog\t").unwrap();
+    assert_ne!(first, second);
+    assert!(editor
+        .request(&format!("dialog-answer\t{first}\t2\t1\tdiscard"))
+        .unwrap()
+        .starts_with("error\tinvalid-argument\t"));
+    editor.ok(&format!("dialog-answer\t{second}\t2\t1\tdiscard"));
+    editor.rendered();
+    assert_eq!(field(&editor.ok("prompt-state"), "prompt"), Some("none"));
+    editor.quit();
+    display.finish().assert_rendered();
+}
+
+#[test]
+fn production_pointer_menu_and_prompt_answers_work_without_keyboard_focus() {
+    let directory = Directory::new();
+    let display_path = directory.0.join("wayland");
+    let mut display = Display::start(&display_path, true);
+    let file = directory.0.join("draft");
+    let dictionary = directory.0.join("dictionary");
+    std::fs::write(&file, b"one wrng\n").unwrap();
+    std::fs::write(&dictionary, b"one\nwrong\n").unwrap();
+    let mut editor = EditorProcess::start(&directory, &display_path, &file, &dictionary);
+    editor.menu(1, 0, 1, 8); // Edit > Find.
+    editor.answer(1, 0, "find-forward", "entry\t77726e67");
+    editor.answer(1, 0, "find-forward", "submit");
+    editor.menu(1, 0, 1, 11); // Edit > Replace; selected match seeds Find.
+    editor.answer(1, 0, "replace", "next-field");
+    editor.answer(1, 0, "replace", "entry\t77726f6e67");
+    editor.answer(1, 0, "replace", "replace-one");
+    editor.answer(1, 1, "replace", "cancel");
+    assert!(editor
+        .ok("text\t1\t1\t0\t100")
+        .contains(&td_editor::control::hex(b"one wrong\n")));
+    editor.menu(1, 1, 3, 1); // Help > Command.
+    editor.answer(1, 1, "command", "entry\t73");
+    editor.answer(1, 1, "command", "complete");
+    editor.answer(1, 1, "command", "submit");
+    editor.answer(1, 1, "fill-column", "entry\t3830");
+    editor.answer(1, 1, "fill-column", "submit");
+    assert_eq!(field(&editor.ok("prompt-state"), "prompt"), Some("none"));
+    editor.job("save\t1\t1");
+    assert_eq!(std::fs::read(&file).unwrap(), b"one wrong\n");
+    // Exercise the stored fill setting: 80 keeps sixteen words on line one;
+    // the default 72 would keep only fourteen.
+    let paragraph = format!("{}word", "word ".repeat(16));
+    let filled = format!("{}word\nword", "word ".repeat(15));
+    editor.ok("select-range\t1\t1\t0\t10");
+    editor.ok(&format!(
+        "insert\t1\t1\t0\t10\t{}",
+        td_editor::control::hex(paragraph.as_bytes())
+    ));
+    editor.ok("select-range\t1\t2\t0\t0");
+    editor.ok("fill-paragraph\t1\t2\t0\t0");
+    assert!(editor
+        .ok("text\t1\t3\t0\t100")
+        .contains(&td_editor::control::hex(filled.as_bytes())));
+    editor.job("save\t1\t3");
+    assert_eq!(std::fs::read(&file).unwrap(), filled.as_bytes());
+    editor.rendered();
+    editor.quit();
+    display.finish().assert_rendered();
+}
+
+#[test]
+fn production_display_loss_exits_nonzero_without_saving_dirty_text() {
+    let directory = Directory::new();
+    let display_path = directory.0.join("wayland");
+    let mut display = Display::start(&display_path, false);
+    let file = directory.0.join("draft");
+    let dictionary = directory.0.join("dictionary");
+    std::fs::write(&file, b"original\n").unwrap();
+    std::fs::write(&dictionary, b"original\n").unwrap();
+    let mut editor = EditorProcess::start(&directory, &display_path, &file, &dictionary);
+    editor.ok("insert\t1\t0\t0\t0\t78");
+    editor.rendered();
+    display.finish().assert_rendered();
+    assert_eq!(editor.exit().code(), Some(1));
+    let diagnostic = std::fs::read_to_string(&editor.log).unwrap();
+    assert!(
+        diagnostic.contains("Wayland compositor disconnected")
+            || diagnostic.contains("Wayland receive:"),
+        "{diagnostic}"
+    );
+    assert_eq!(std::fs::read(&file).unwrap(), b"original\n");
+    assert!(!editor.socket.exists());
+}
+
+#[test]
+fn fixture_io_deadlines_bound_partial_and_expired_io() {
+    let (mut reader, mut writer) = UnixStream::pair().unwrap();
+    writer.write_all(b"x").unwrap();
+    let error = read_until(
+        &mut reader,
+        &mut [0; 2],
+        Instant::now() + Duration::from_millis(20),
+    )
+    .unwrap_err();
+    assert!(matches!(
+        error.kind(),
+        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+    ));
+    writer.write_all(b"y").unwrap();
+    assert_eq!(
+        read_until(&mut reader, &mut [0], Instant::now())
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::TimedOut
+    );
+    assert_eq!(
+        write_until(&mut writer, b"z", Instant::now())
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::TimedOut
+    );
+    let mut byte = [0];
+    read_until(&mut reader, &mut byte, Instant::now() + TIMEOUT).unwrap();
+    assert_eq!(byte, *b"y");
+}

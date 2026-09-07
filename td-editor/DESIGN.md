@@ -2128,6 +2128,26 @@ that td-mail's jail can launch the editor.
 
 ## Test and control architecture
 
+Default `tests/control_process.rs` launches the real editor executable with
+literal CLI file/dictionary/control arguments and an isolated test Wayland
+peer. Requests cross the private Unix endpoint into the production event
+loop and file/spelling workers; the test never accesses a Window/controller.
+It verifies edits/undo/redo, saved BOM/CRLF bytes, callback fences, close
+dialog replay refusal, pointer-menu and pinned non-file prompt actions
+without keyboard focus, clean exit/endpoint cleanup and fatal display loss
+without an implicit save after a configured frame (exit 1 plus the display
+disconnect diagnostic, not an arbitrary crash). Helpers bound
+accept/read/write/job/exit waits; each control exchange has a ten-second
+absolute I/O deadline and each connected peer a thirty-second lifetime;
+owned child/peer guards clean up on assertion failure. The display fixture
+supports one main surface with 640x480 packed XRGB buffers, checking their
+wire dimensions independently of control replies. It rejects second surfaces
+and unlisted requests explicitly; a new legitimate production request needs
+an accompanying fixture update. It emits callbacks/releases but
+deliberately discards SHM descriptors. Existing transport/pixel tests own
+the mapped-buffer oracle. This process proof neither substitutes for a real
+compositor nor proves GPU, jail or caller `$EDITOR` integration.
+
 The safe `control` library now supplies the one-frame decoder/encoder,
 `state`/`text` queries and a bounded revision-checked editing subset. It
 shares controller snapshots,

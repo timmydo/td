@@ -362,6 +362,26 @@ TD_EDITOR_TEST_WAYLAND=/absolute/path/to/weston-socket cargo test --frozen --man
 This waits for actual frame completion. The ordinary tests need no display
 and check transferred pool pixels and lifecycle behavior with Unix sockets.
 
+The default process-level control tests launch the actual editor executable
+against a bounded test Wayland peer and use only its private control socket.
+The trusted-root flag supplies the endpoint's trusted-ancestor ownership
+fixture in rootless containers (see `DEVELOPMENT.md`):
+
+```text
+TD_TEST_TRUSTED_ROOT=1 cargo test --frozen --manifest-path td-editor/Cargo.toml --test control_process
+```
+
+They cover CLI startup, Unicode edits/undo/redo, spelling and save workers,
+BOM/CRLF disk preservation, callback fences, dirty-tab Cancel/Discard,
+stale dialog refusal, and clean child/socket shutdown. A pointer-only seat
+drives menus and pinned Find/Replace/command/numeric answers without keyboard
+focus. Display loss after a configured frame exits 1 with a disconnect
+diagnostic without saving dirty text. The single-surface XRGB peer verifies
+640x480 buffer geometry on the wire and sends
+protocol callbacks but does not map the SHM descriptors: this is production
+process/event-loop coverage, not real-compositor presentation or pixel proof.
+It does not prove td-jail, `$EDITOR` caller lifetime or GPU integration.
+
 `src/keyboard.rs` and the `xkb*` modules compile bounded, self-contained XKB
 text-v1 maps into deterministic logical chords. Keycode aliases, symbols,
 table-driven types, modifier maps and compatibility interpretations supply
