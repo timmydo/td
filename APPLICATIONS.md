@@ -8386,9 +8386,11 @@ a key is `/dev/hidraw`, not evdev, so the compositor's input path does
 not cover it, and a rogue process holding hidraw can solicit an assertion
 timed with the prompt and consume the operator's touch. No jail binds
 hidraw; the USB transport requires root-owned mode-0600 token nodes.
-This blocks unprivileged direct access but does not serialize root
-consumers: hidraw allows concurrent opens. Exclusive CTAP operation
-mediation remains required before enabling consent or a WebAuthn grant.
+This blocks unprivileged direct access. The td-owned HID workers serialize
+through one root-private runtime lock held until the worker actually exits.
+Hidraw itself permits concurrent opens, and a different trusted root program
+can ignore that advisory lock. Complete presented-operation mediation remains
+required before enabling consent or a WebAuthn grant.
 
 **Neither consent mechanism is implemented.** The inert screen above
 provides no approval. The kernel now carries USB PCI xHCI, generic HID,

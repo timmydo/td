@@ -3,13 +3,16 @@
 use crate::{fido_hid as hid, store};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
-use std::os::fd::OwnedFd;
-use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt};
+use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 const NOFOLLOW: i32 = 0o400000;
+const DIRECTORY: i32 = 0o200000;
+const NONBLOCK: i32 = 0o4000;
+const LOCK_REFUSED: u8 = 1;
 const MAX_LIFETIME: Duration = Duration::from_secs(120);
 const MAX_DESCRIPTOR: usize = 4096;
 const WRITE: u8 = 1;
@@ -235,6 +238,9 @@ impl Session {
         let deadline = self.deadline;
         let mut ready = [0];
         receive(self.socket()?, &mut ready, deadline)?;
+        if ready == [LOCK_REFUSED] {
+            return Err("token transport is busy or unavailable".into());
+        }
         if ready != [0] {
             return Err("token worker refused initialization".into());
         }
@@ -352,6 +358,80 @@ impl Drop for Report {
     }
 }
 
+fn operation_lock() -> Result<File, String> {
+    let run = OpenOptions::new()
+        .read(true)
+        .custom_flags(NOFOLLOW | DIRECTORY)
+        .open("/run")
+        .map_err(|e| format!("open token runtime: {e}"))?;
+    operation_lock_in(&run, 0, 0)
+}
+
+fn checked_directory(file: &File, uid: u32, gid: u32, mode: u32, name: &str) -> Result<(), String> {
+    let meta = file.metadata().map_err(|e| e.to_string())?;
+    if !meta.is_dir() || meta.uid() != uid || meta.gid() != gid || meta.mode() & 0o7777 != mode {
+        return Err(format!("{name} has invalid ownership, mode or type"));
+    }
+    Ok(())
+}
+
+// The stable lock is never renamed or removed while /run exists.
+fn operation_lock_in(run: &File, uid: u32, gid: u32) -> Result<File, String> {
+    checked_directory(run, uid, gid, 0o755, "token /run")?;
+    let path = format!("/proc/self/fd/{}/td-fido", run.as_raw_fd());
+    let created = match fs::DirBuilder::new().mode(0o700).create(&path) {
+        Ok(()) => true,
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => false,
+        Err(e) => return Err(format!("create token runtime: {e}")),
+    };
+    let directory = OpenOptions::new()
+        .read(true)
+        .custom_flags(NOFOLLOW | DIRECTORY)
+        .open(path)
+        .map_err(|e| format!("open private token runtime: {e}"))?;
+    if created {
+        std::os::unix::fs::fchown(&directory, Some(uid), Some(gid)).map_err(|e| e.to_string())?;
+        directory
+            .set_permissions(fs::Permissions::from_mode(0o700))
+            .map_err(|e| e.to_string())?;
+    }
+    checked_directory(&directory, uid, gid, 0o700, "token /run/td-fido")?;
+    let path = format!("/proc/self/fd/{}/operation.lock", directory.as_raw_fd());
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        .write(true)
+        .custom_flags(NOFOLLOW | NONBLOCK);
+    let file = match options.create_new(true).mode(0o600).open(&path) {
+        Ok(file) => {
+            std::os::unix::fs::fchown(&file, Some(uid), Some(gid)).map_err(|e| e.to_string())?;
+            file.set_permissions(fs::Permissions::from_mode(0o600))
+                .map_err(|e| e.to_string())?;
+            file
+        }
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(NOFOLLOW | NONBLOCK)
+            .open(&path)
+            .map_err(|e| format!("open token operation lock: {e}"))?,
+        Err(e) => return Err(format!("create token operation lock: {e}")),
+    };
+    let meta = file.metadata().map_err(|e| e.to_string())?;
+    if !meta.is_file()
+        || meta.nlink() != 1
+        || meta.len() != 0
+        || meta.uid() != uid
+        || meta.gid() != gid
+        || meta.mode() & 0o7777 != 0o600
+    {
+        return Err("token operation lock has invalid ownership, mode, type or contents".into());
+    }
+    file.try_lock()
+        .map_err(|e| format!("token transport is busy or unavailable: {e}"))?;
+    Ok(file)
+}
+
 // A separate thread can request process exit while the device thread is blocked.
 // This function belongs only to the dedicated worker process, never the authority.
 fn arm_watchdog(lifetime: Duration) -> Result<(), String> {
@@ -373,6 +453,16 @@ pub fn worker(index: &str, inode: &str, rdev: &str) -> Result<(), String> {
     let expected_rdev: u64 = canonical(rdev)?;
     let deadline = Instant::now() + MAX_LIFETIME;
     arm_watchdog(MAX_LIFETIME)?;
+    let _operation = match operation_lock() {
+        Ok(lock) => lock,
+        Err(error) => {
+            io::stdout()
+                .write_all(&[LOCK_REFUSED])
+                .and_then(|()| io::stdout().flush())
+                .map_err(|_| "report token lock refusal")?;
+            return Err(error);
+        }
+    };
     let (device, mut file) = Device::open(index)?;
     if device.inode != expected_inode || device.rdev != expected_rdev {
         return Err("token device changed before opening".into());
@@ -500,6 +590,45 @@ mod tests {
         let Ok(role) = std::env::var("TD_HID_WORKER_FIXTURE") else {
             return;
         };
+        if role == "orphan-parent" {
+            let mut child = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "fido_device::tests::worker_fixture",
+                    "--nocapture",
+                    "--quiet",
+                ])
+                .env_clear()
+                .env("TD_HID_WORKER_FIXTURE", "lock")
+                .env(
+                    "TD_HID_LOCK_ROOT",
+                    std::env::var_os("TD_HID_LOCK_ROOT").unwrap(),
+                )
+                .stdin(Stdio::inherit())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap();
+            let mut output = child.stdout.take().unwrap();
+            let mut preamble = Vec::new();
+            while !preamble.ends_with(SYNC) {
+                let mut byte = [0];
+                output.read_exact(&mut byte).unwrap();
+                preamble.extend(byte);
+                assert!(preamble.len() < 256);
+            }
+            io::stdout().write_all(SYNC).unwrap();
+            io::stdout().flush().unwrap();
+            // The grandchild holds the lock and inherited input after this exit.
+            std::process::exit(0);
+        }
+        let _operation = if role == "lock" {
+            let run = File::open(std::env::var("TD_HID_LOCK_ROOT").unwrap()).unwrap();
+            let meta = run.metadata().unwrap();
+            Some(operation_lock_in(&run, meta.uid(), meta.gid()).unwrap())
+        } else {
+            None
+        };
         if role == "watchdog" {
             arm_watchdog(Duration::from_millis(80)).unwrap();
         }
@@ -507,6 +636,11 @@ mod tests {
         let mut output = io::stdout().lock();
         output.write_all(SYNC).unwrap();
         output.flush().unwrap();
+        if role == "lock-refused" {
+            output.write_all(&[LOCK_REFUSED]).unwrap();
+            output.flush().unwrap();
+            std::process::exit(0);
+        }
         let mut op = [0];
         while input.read_exact(&mut op).is_ok() {
             match op {
@@ -593,6 +727,220 @@ mod tests {
             );
             assert!(session.cbor(&[4]).is_err());
         }
+    }
+
+    struct LockFixture(std::path::PathBuf);
+    impl LockFixture {
+        fn new() -> Self {
+            let nonce = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let path =
+                std::env::temp_dir().join(format!("td-hid-lock-{}-{nonce}", std::process::id()));
+            fs::DirBuilder::new().mode(0o755).create(&path).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+            Self(path)
+        }
+        fn run(&self) -> File {
+            File::open(&self.0).unwrap()
+        }
+        fn acquire_after_release(&self) -> File {
+            // A concurrent test fork may briefly inherit a CLOEXEC descriptor
+            // until its exec. Observe final kernel release within a fixed bound.
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                match self.acquire() {
+                    Ok(file) => return file,
+                    Err(error) => {
+                        assert!(Instant::now() < deadline, "lock did not release: {error}");
+                        std::thread::sleep(Duration::from_millis(2));
+                    }
+                }
+            }
+        }
+        fn acquire(&self) -> Result<File, String> {
+            let run = self.run();
+            let meta = run.metadata().unwrap();
+            operation_lock_in(&run, meta.uid(), meta.gid())
+        }
+    }
+    impl Drop for LockFixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn operation_lock_is_exclusive_stable_and_rejects_mutated_metadata() {
+        let fixture = LockFixture::new();
+        let first = fixture.acquire().unwrap();
+        let meta = first.metadata().unwrap();
+        assert!(fixture.acquire().is_err());
+        drop(first);
+        let second = fixture.acquire_after_release();
+        assert_eq!(
+            (
+                second.metadata().unwrap().dev(),
+                second.metadata().unwrap().ino()
+            ),
+            (meta.dev(), meta.ino())
+        );
+        drop(second);
+        let lock = fixture.0.join("td-fido/operation.lock");
+        fs::set_permissions(&lock, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(fixture.acquire().is_err());
+        assert_eq!(fs::metadata(&lock).unwrap().mode() & 0o777, 0o644);
+        fs::set_permissions(&lock, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::write(&lock, [1]).unwrap();
+        assert!(fixture.acquire().is_err());
+        fs::write(&lock, []).unwrap();
+        let alias = fixture.0.join("alias");
+        fs::hard_link(&lock, &alias).unwrap();
+        assert!(fixture.acquire().is_err());
+        fs::remove_file(alias).unwrap();
+        let saved = fixture.0.join("saved");
+        fs::rename(&lock, &saved).unwrap();
+        std::os::unix::fs::symlink(&saved, &lock).unwrap();
+        assert!(fixture.acquire().is_err());
+        fs::remove_file(&lock).unwrap();
+        fs::rename(saved, &lock).unwrap();
+        drop(fixture.acquire_after_release());
+        fs::set_permissions(fixture.0.join("td-fido"), fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(fixture.acquire().is_err());
+        fs::set_permissions(fixture.0.join("td-fido"), fs::Permissions::from_mode(0o700)).unwrap();
+        let directory = fixture.0.join("td-fido");
+        let saved = fixture.0.join("saved-directory");
+        fs::rename(&directory, &saved).unwrap();
+        std::os::unix::fs::symlink(&saved, &directory).unwrap();
+        assert!(fixture.acquire().is_err());
+        fs::remove_file(&directory).unwrap();
+        fs::rename(saved, &directory).unwrap();
+        let run = fixture.run();
+        let meta = run.metadata().unwrap();
+        assert!(operation_lock_in(&run, meta.uid().wrapping_add(1), meta.gid()).is_err());
+        assert!(operation_lock_in(&run, meta.uid(), meta.gid().wrapping_add(1)).is_err());
+    }
+
+    #[test]
+    fn production_worker_retains_its_lock_before_device_access() {
+        let source = include_str!("fido_device.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap();
+        let worker = source
+            .split("pub fn worker(")
+            .nth(1)
+            .unwrap()
+            .split("fn canonical<")
+            .next()
+            .unwrap();
+        let lock = worker
+            .find("let _operation = match operation_lock()")
+            .unwrap();
+        let open = worker.find("Device::open(index)?").unwrap();
+        assert!(lock < open);
+        assert_eq!(worker.matches("_operation").count(), 1);
+        assert_eq!(source.matches("Device::open(").count(), 1);
+        let mut refused = fixture("lock-refused", Duration::from_secs(5));
+        assert_eq!(
+            refused.initialize().unwrap_err(),
+            "token transport is busy or unavailable"
+        );
+    }
+
+    #[test]
+    fn worker_process_owns_the_lock_until_its_kernel_exit() {
+        let fixture = LockFixture::new();
+        let (mut socket, peer) = UnixStream::pair().unwrap();
+        let input: OwnedFd = peer.try_clone().unwrap().into();
+        let output: OwnedFd = peer.into();
+        let child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "fido_device::tests::worker_fixture",
+                "--nocapture",
+                "--quiet",
+            ])
+            .env_clear()
+            .env("TD_HID_WORKER_FIXTURE", "lock")
+            .env("TD_HID_LOCK_ROOT", &fixture.0)
+            .stdin(Stdio::from(input))
+            .stdout(Stdio::from(output))
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut worker = Worker {
+            child,
+            socket: socket.try_clone().unwrap(),
+        };
+        socket
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut preamble = Vec::new();
+        while !preamble.ends_with(SYNC) {
+            let mut byte = [0];
+            socket.read_exact(&mut byte).unwrap();
+            preamble.extend(byte);
+            assert!(preamble.len() < 256);
+        }
+        assert!(fixture.acquire().is_err());
+        // No parent owns the lock: it is held by the child's independent open.
+        drop(socket);
+        assert!(fixture.acquire().is_err());
+        worker.child.kill().unwrap();
+        worker.child.wait().unwrap();
+        drop(worker);
+        drop(fixture.acquire_after_release());
+    }
+
+    #[test]
+    fn parent_exit_cannot_release_a_live_workers_lock() {
+        let fixture = LockFixture::new();
+        let (mut socket, peer) = UnixStream::pair().unwrap();
+        let input: OwnedFd = peer.try_clone().unwrap().into();
+        let output: OwnedFd = peer.into();
+        let child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "fido_device::tests::worker_fixture",
+                "--nocapture",
+                "--quiet",
+            ])
+            .env_clear()
+            .env("TD_HID_WORKER_FIXTURE", "orphan-parent")
+            .env("TD_HID_LOCK_ROOT", &fixture.0)
+            .stdin(Stdio::from(input))
+            .stdout(Stdio::from(output))
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut worker = Worker {
+            child,
+            socket: socket.try_clone().unwrap(),
+        };
+        socket
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut preamble = Vec::new();
+        while !preamble.ends_with(SYNC) {
+            let mut byte = [0];
+            socket.read_exact(&mut byte).unwrap();
+            preamble.extend(byte);
+            assert!(preamble.len() < 256);
+        }
+        assert!(fixture.acquire().is_err());
+        // No parent owns the lock: it is held by the child's independent open.
+        drop(socket);
+        assert!(fixture.acquire().is_err());
+        assert!(worker.child.wait().unwrap().success());
+        assert!(
+            fixture.acquire().is_err(),
+            "parent exit released the worker lock"
+        );
+        worker.socket.shutdown(std::net::Shutdown::Both).unwrap();
+        drop(fixture.acquire_after_release());
+        drop(worker);
     }
 
     #[test]

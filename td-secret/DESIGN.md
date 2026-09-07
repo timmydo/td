@@ -355,6 +355,36 @@ the deadline bounds accepted protocol replies, not teardown completion.
 This is not a hard real-time bound on an unresponsive kernel. No late
 reply is accepted as authorization.
 
+Every td-owned HID worker takes a nonblocking exclusive file lock before
+opening a token. The stable empty `operation.lock` lives under root-owned
+mode-0700 `/run/td-fido`, with root-owned mode-0600 single-link regular-file
+metadata. The runtime and lock are opened through retained directory
+handles without following leaf symlinks; existing invalid metadata is
+refused rather than repaired. No worker renames or removes the lock.
+The worker requires the deployment's procfs and root-owned mode-0755
+`/run`. Creation normalizes only newly created objects, so a concurrent
+creator or termination during normalization can leave a refusal until
+trusted runtime provisioning or reboot; no existing object is repaired.
+This volatile lock never survives reboot and is not recovery metadata.
+The worker owns it through all device I/O until actual process exit, so a
+parent crash cannot release exclusivity while its child still holds a
+token. A lock refusal crosses the private startup channel as a fixed
+busy-or-unavailable status, without file metadata or payload bytes.
+A busy transport refuses promptly; there is no queued touch, stale
+PID recovery, or retry. The independent watchdog remains the backstop for
+an orphaned worker, including while it holds the lock.
+
+This serializes all td-owned workers across tokens and sessions. Root and
+the kernel remain trusted: the advisory lock cannot constrain a different
+root program that opens hidraw directly. Trusted root must not replace
+or overmount the runtime or lock while workers exist: that can split the
+lock inode just as unlinking it would. The future authority must still
+serialize complete presented operations, including any gap between worker
+sessions, and bind a fresh assertion to each request. A transport lock is
+neither consent nor enrollment. Host fixtures prove cross-process exclusion,
+release after child exit and invalid metadata refusal; these do not claim
+root path admission or physical token presence.
+
 The trusted consumer must negotiate getInfo message limits before
 constructing requests, bind fresh challenges to presented operations,
 and verify enrollment/assertions through the metadata API. Keepalives
