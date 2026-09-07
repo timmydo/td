@@ -439,6 +439,20 @@ struct EditorProcess {
     next: u64,
 }
 impl EditorProcess {
+    fn wait_field(&mut self, request: &str, name: &str, expected: &str) {
+        let deadline = Instant::now() + TIMEOUT;
+        loop {
+            let state = self.ok(request);
+            if field(&state, name) == Some(expected) {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "waiting for {request} {name}={expected}: {state}"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
     fn wait_keyboard(&mut self, profile: &str) -> String {
         let deadline = Instant::now() + TIMEOUT;
         loop {
@@ -946,20 +960,37 @@ impl WestonInput {
         assert!(done, "compositor sync missing within 128 events");
     }
     fn key(&mut self, key: u32, pressed: bool) {
+        self.timed(5, key, u32::from(pressed));
+    }
+    fn timed(&mut self, opcode: u16, first: u32, second: u32) {
         self.ticks += 1;
         send(
             &mut self.stream,
             4,
-            5,
+            opcode,
             &words(&[
                 0,
                 1 + self.ticks / 1000,
                 (self.ticks % 1000) * 1_000_000,
-                key,
-                u32::from(pressed),
+                first,
+                second,
             ]),
         )
         .unwrap();
+    }
+    fn motion(&mut self, x: i32, y: i32) {
+        // Unlike wl_pointer coordinates, weston_test.move_pointer uses ints.
+        self.timed(1, x as u32, y as u32);
+        self.barrier();
+    }
+    fn left_button(&mut self, pressed: bool) {
+        self.timed(2, 0x110, u32::from(pressed)); // Linux BTN_LEFT.
+        self.barrier();
+    }
+    fn click(&mut self, x: i32, y: i32) {
+        self.motion(x, y);
+        self.left_button(true);
+        self.left_button(false);
     }
     fn chord(&mut self, modifier: Option<u32>, key: u32) {
         if let Some(modifier) = modifier {
@@ -1077,6 +1108,100 @@ fn disposable_weston_delivers_windows_keyboard_events() {
 #[ignore = "requires explicit Weston executable and matching upstream test-plugin; see README"]
 fn disposable_weston_delivers_emacs_keyboard_events() {
     weston_keyboard_profile("emacs");
+}
+
+#[test]
+fn weston_test_timed_requests_use_integer_pixels_and_nanosecond_timestamps() {
+    let (client, mut peer) = UnixStream::pair().unwrap();
+    let mut input = WestonInput::over(client);
+    input.ticks = 998;
+    std::thread::scope(|scope| {
+        let oracle = scope.spawn(move || {
+            for (index, expected) in [
+                [4u32, (28 << 16) | 1, 0, 1, 999_000_000, 0xfffffff7, 56],
+                [4, (28 << 16) | 2, 0, 2, 0, 0x110, 1],
+                [4, (28 << 16) | 1, 0, 2, 1_000_000, 12, 34],
+                [4, (28 << 16) | 2, 0, 2, 2_000_000, 0x110, 1],
+                [4, (28 << 16) | 2, 0, 2, 3_000_000, 0x110, 0],
+                [4, (28 << 16) | 5, 0, 2, 4_000_000, 48, 0],
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let mut actual = [0; 28];
+                read_until(&mut peer, &mut actual, Instant::now() + TIMEOUT).unwrap();
+                for (bytes, value) in actual.as_chunks::<4>().0.iter().zip(expected) {
+                    assert_eq!(u32::from_ne_bytes(*bytes), value);
+                }
+                if index < 5 {
+                    let mut sync = [0; 12];
+                    read_until(&mut peer, &mut sync, Instant::now() + TIMEOUT).unwrap();
+                    let id = 5 + index as u32;
+                    assert_eq!(sync.as_slice(), words(&[1, 12 << 16, id]));
+                    send(&mut peer, id, 0, &words(&[0])).unwrap();
+                }
+            }
+            peer.set_read_timeout(Some(TIMEOUT)).unwrap();
+            assert_eq!(peer.read(&mut [0]).unwrap(), 0, "extra test requests");
+        });
+        // Exercise the actual helpers, including signed-coordinate wire bits,
+        // button choice, click ordering and their compositor sync requests.
+        input.motion(-9, 56);
+        input.left_button(true);
+        input.click(12, 34);
+        input.key(48, false);
+        drop(input);
+        oracle.join().unwrap();
+    });
+}
+
+#[test]
+#[ignore = "requires explicit Weston executable and matching upstream test-plugin; see README"]
+fn disposable_weston_delivers_pointer_selection_and_menu_events() {
+    const EDIT_X: i32 = 68;
+    const PANEL_TOP: i32 = 24;
+    const MENU_ROW_HEIGHT: i32 = 24;
+    const FIND_ROW: i32 = 8;
+    let directory = Directory::new();
+    let display = directory.0.join("wayland");
+    let mut weston = WestonProcess::start(&directory);
+    let file = directory.0.join("draft");
+    let dictionary = directory.0.join("dictionary");
+    std::fs::write(&file, b"one two\n").unwrap();
+    std::fs::write(&dictionary, b"one\ntwo\n").unwrap();
+    let mut editor = EditorProcess::start(&directory, &display, &file, &dictionary);
+    editor.rendered_at(1024, 768);
+    editor.wait_keyboard("windows");
+    let mut input = WestonInput::connect(&display);
+    // Kiosk fills the output; scale-one text starts at (8,48), 8px cells.
+    // Use explicit pixel expectations, independent of the hit-test code.
+    input.motion(9, 56);
+    editor.wait_field("state", "pointer-ready", "1");
+    input.left_button(true);
+    input.motion(33, 56);
+    editor.wait_field("state", "tab", "1,0,0,8,0,3,0,72,0,lf");
+    input.left_button(false);
+    // A later unheld motion must not extend the selected range.
+    input.motion(65, 56);
+    input.chord(None, 48); // Native lowercase b replaces exactly "one".
+    editor.wait_tab(1, "b two\n");
+    input.chord(Some(29), 44); // Native Windows undo.
+    editor.wait_tab(2, "one two\n");
+    input.click(EDIT_X, 8); // Edit header.
+    editor.wait_field("state", "modal", "0,0,0,0,1,0,0,0,0");
+    input.click(
+        EDIT_X,
+        PANEL_TOP + FIND_ROW * MENU_ROW_HEIGHT + MENU_ROW_HEIGHT / 2,
+    ); // Find, pinned to zero-based row eight.
+    editor.wait_field("prompt-state", "prompt", "find-forward");
+    input.chord(None, 1); // Escape cancels without changing text.
+    editor.wait_field("prompt-state", "prompt", "none");
+    editor.wait_tab(2, "one two\n");
+    editor.job("save\t1\t2");
+    assert_eq!(std::fs::read(&file).unwrap(), b"one two\n");
+    editor.rendered_at(1024, 768);
+    editor.quit();
+    weston.assert_serving();
 }
 
 #[test]

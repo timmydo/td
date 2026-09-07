@@ -2187,6 +2187,22 @@ Default decoder tests distinguish schema rejection from a transport timeout.
 This is synthetic Wayland keyboard-event coverage, not hardware/evdev,
 repeat timing, pointer, clipboard or comprehensive keyboard-layout coverage.
 
+The opt-in `disposable_weston_delivers_pointer_selection_and_menu_events`
+test uses the same owned compositor and its test-seat motion/button requests.
+At scale one it drags an exact three-byte selection using independent pixel
+coordinates, releases the button and moves away, then uses native keyboard
+replacement/undo to verify both selection and release behavior. Native clicks
+open Edit and Find; read-only control observations fence each modal transition,
+and native Escape cancels. Text/revision and saved-byte checks remain exact.
+The fixed coordinates and Find's zero-based Edit row eight are an independent
+UI expectation; a deliberate layout/menu reorder must update this fixture.
+The default timed-request test drives the actual motion/button/click helpers,
+checks signed integer coordinates, button choice, nanosecond timestamp rollover
+and sync ordering, and refuses trailing requests. No decoded editor pointer
+operation or editor surface ID is injected. This is selection/menu
+interoperability, not hardware, wheel, touch, clipboard, cursor pixels or
+multi-output/scaling coverage.
+
 The safe `control` library now supplies the one-frame decoder/encoder,
 `state`/`text` queries and a bounded revision-checked editing subset. It
 shares controller snapshots,

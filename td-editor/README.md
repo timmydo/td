@@ -388,7 +388,7 @@ jobs, exact BOM/CRLF output and foreground/cleanup behavior. It does not inject
 physical input or prove GPU, scanout, captured pixels, or td-jail integration.
 Weston is optional host test tooling, not an editor or ordinary-gate dependency.
 
-The `disposable_weston` invocation above runs all three cases.
+The `disposable_weston` invocation above runs all four cases.
 Keep the executable/module outside the host's `/tmp` or in the bound
 worktree: the trusted-root fixture replaces `/tmp` with its own empty mount.
 The two separately reported keyboard cases create fresh instances for the
@@ -398,6 +398,13 @@ the two native undo bindings, exact remote text/revisions, and saved bytes.
 The test does not inject decoded editor chords: Weston sends real Wayland
 keyboard events. This still does not prove hardware input, repeat timing,
 pointer/clipboard interoperability or additional keyboard layouts.
+
+The pointer case delivers motion and left-button events through Weston,
+checks drag selection and button release by native replacement/undo, and
+opens Edit → Find with real pointer events before native Escape cancellation.
+Read-only state/prompt observations fence input delivery; exact text/revisions
+and saved bytes verify the result. It does not prove wheel, touch, clipboard,
+hardware input, cursor pixels or multi-output/scaling behavior.
 
 The default process-level control tests launch the actual editor executable
 against a bounded test Wayland peer and use only its private control socket.
