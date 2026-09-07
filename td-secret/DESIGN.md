@@ -878,3 +878,15 @@ EOF, truncation, malformed descriptors, a wrong owner and an unknown
 operation all remove a seeded portal-owned runtime key. It also exercises
 the production descriptor inventory and unnamed-socket admission. Ordinary
 host tests never run this fixture.
+
+The private root-only `lock-session --uid UID` entry invokes the existing
+volatile-session lock directly, before any persistent-store access. It
+accepts only a canonical human UID and requires root through that API.
+The authority's child supervisor uses it only after killing and reaping
+an abandoned unlock child; reversing that order would permit a late
+publication after cleanup. This entry grants no secret access and has no
+human consent flow. Paired generation activation remains pending in
+`td-authd/DESIGN.md`.
+
+The disposable root fixture also runs `lock-session` against a seeded
+portal-owned runtime key and requires successful exit with the key absent.

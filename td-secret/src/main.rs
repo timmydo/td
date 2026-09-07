@@ -57,6 +57,9 @@ fn run(args: &[String]) -> Result<(), String> {
         [command, flag, uid] if command == "unlock-operation" && flag == "--uid" => {
             operation::run(parse_uid(uid)?)
         }
+        [command, flag, uid] if command == "lock-session" && flag == "--uid" => {
+            store::lock_session(parse_uid(uid)?)
+        }
         [command, index, inode, rdev] if command == "hid-worker" => fido_device::worker(index, inode, rdev),
         [command, uid_flag, uid, pcr_flag, pcrs, recovery]
             if command == "seal"
@@ -150,7 +153,7 @@ mod confinement {
     fn private_unlock_controller_and_shared_description_are_pinned() {
         let fingerprint = |source: &str| source.bytes().fold(0xcbf29ce484222325u64,
             |hash, byte| (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3));
-        assert_eq!(fingerprint(include_str!("operation.rs")), 0x53060fda67b3ebc7);
+        assert_eq!(fingerprint(include_str!("operation.rs")), 0x5b3c1897a3e0da16);
         assert_eq!(fingerprint(include_str!("../../td-authd/src/consent.rs")), 0xf1d3b878619f19f4, "shared consent changed: reconcile td-authd/tests/confinement.rs and td-compositor/src/main.rs pins");
     }
 

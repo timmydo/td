@@ -35,7 +35,8 @@ fn the_production_source_and_raw_boundary_are_closed() {
             "main.rs",
             "mount_sys.rs",
             "portal_files.rs",
-            "sys.rs"
+            "sys.rs",
+            "unlock.rs"
         ]
     );
     for (name, count) in [
@@ -46,6 +47,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
         ("consent.rs", 0),
         ("sys.rs", 4),
         ("launch.rs", 0),
+        ("unlock.rs", 0),
         ("mount_sys.rs", 4),
         ("portal_files.rs", 0),
     ] {
@@ -67,7 +69,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
             "println!",
             "eprintln!",
         ] {
-            let child_api = matches!(name, "launch.rs" | "application.rs")
+            let child_api = matches!(name, "launch.rs" | "application.rs" | "unlock.rs")
                 && ["::Command", "::thread", ".spawn(", ".exec("].contains(&forbidden);
             let mapping_child_api =
                 matches!(name, "portal_files.rs" | "application_files.rs") && ["::Command", ".spawn("].contains(&forbidden);
@@ -80,6 +82,11 @@ fn the_production_source_and_raw_boundary_are_closed() {
         fingerprint(include_str!("../src/consent.rs")),
         0xf1d3b878619f19f4,
         "shared consent changed: reconcile td-secret/src/main.rs, compositor confinement and this pin"
+    );
+    assert_eq!(
+        fingerprint(include_str!("../src/unlock.rs").split("#[cfg(test)]").next().unwrap()),
+        0x47eff8b6678ed7c9,
+        "private unlock supervisor changed"
     );
     let application = include_str!("../src/application.rs")
         .split("#[cfg(test)]")
@@ -227,7 +234,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
     // Pin startup as well as raw code: aliases can evade API-name scans.
     assert_eq!(
         fingerprint(main),
-        0xa2940fb3feed11ff,
+        0x24d2e316b17225c4,
         "main.rs: production startup changed"
     );
     assert_eq!(

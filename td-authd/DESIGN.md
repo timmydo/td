@@ -765,3 +765,91 @@ insufficient: cancellation, peer loss, deadline or request replacement
 must invalidate authority before committing any write or release. The
 renderer and its current unconsumed receipt API are specified in
 `td-compositor/DESIGN.md`.
+
+## Private unlock child supervision prerequisite
+
+`unlock.rs` owns one root-private `td-secret unlock-operation --uid
+1000` child. The paired service does not call this controller yet; this
+is the supervision prerequisite for its compositor receipt integration.
+There is no public listener, automatic release, or new keyboard
+authorization. The live caller must enforce root startup and
+paired-session admission before constructing the production controller.
+The child independently requires root; this controller adds no
+credential switch. It generates the complete Unlock request with fresh
+kernel randomness and a typed primary/recovery role, rather than
+accepting a caller-selected nonce, executable, path, account or argument
+vector.
+
+The fixed child starts from `/`, with an empty environment, private
+stdin socketpair, and null stdout/stderr. Its peer endpoint is
+exclusively owned by the controller and is CLOEXEC. The child inherits
+the authority process group; it does not create a detached lifetime. The
+supervisor's endpoint is nonblocking. Each poll performs at most four
+socket calls and reads no more than the current bounded frame. A partial
+frame or pending write has a five-second deadline; waiting for token
+work has the overall 120-second operation deadline. A received
+presentation/commit invitation expires after three seconds, leaving
+margin against the child's five-second window. Delayed delivery can
+still exhaust the child's own deadline and fail the operation. Each
+canonical description must exactly match the root-owned request. The
+child-generated round stays private to this controller. The caller
+receives only the immutable public description.
+
+Presentation and commit acknowledgements are separate state transitions.
+The caller must validate the actual completed compositor presentation
+receipt before invoking `presented`, and serialize physical cancellation
+and peer loss against `commit`. These are distinct methods: repeating a
+presentation acknowledgement cannot approve the later commit round. A
+matching public Request is structural evidence, not proof that pixels
+were presented. Receipt validation remains a duty of the authenticated
+paired caller; this controller cannot observe the compositor output. The
+root controller validates the retained request and deadline again before
+queuing either acknowledgement. Each controller owns exactly one
+request. The caller must own at most one controller per admitted session
+and must not construct a replacement while the old child remains owned.
+Publication is complete only after the final success frame and observed
+successful child exit. A final frame followed by a failed exit is a
+failed operation and requires relocking.
+
+Cancellation closes the endpoint, kills the exact unreaped child, and
+polls for its exit before spawning the fixed root-only `td-secret
+lock-session --uid 1000` cleanup. That helper clears volatile release
+state without opening the persistent store or accessing hardware.
+Cleanup runs with empty environment, `/` cwd and null standard
+descriptors. Its observed deadline is two seconds; expiry kills the
+helper. Polling waits for reaping even after a kill, so a blocked kernel
+task cannot be abandoned and later publish into a subsequent operation.
+Normal cancellation and cleanup never block the caller in `wait`; the
+caller continues heartbeats while polling. A successfully relocked
+failed or cancelled operation returns the typed `Event::Failed` result.
+Failed helper spawn, exit or deadline produces a stable terminal `Err`,
+which must end the authority generation. Callers must not classify
+policy by parsing diagnostic strings. Repeated polling returns the same
+terminal outcome; no failure becomes permission to retry an uncertain
+token operation.
+
+Dropping an unfinished controller is emergency teardown: it kills and
+waits for its retained direct child, and does not claim runtime-key
+cleanup. The live caller must cancel and poll through completed
+relocking before dropping it. The paired supervisor must kill/reap the
+prior process group and successfully clear its session runtime before
+admitting a replacement generation. SIGKILL after publication still
+requires that generation cleanup. These caller duties remain mandatory
+for activation; this unused controller alone does not establish them.
+
+Tests run actual exec children through the same sanitizer and socket
+controller. They cover both round acknowledgements, failed exit after
+the success frame, stale request/receipt refusal, partial-frame
+deadlines, prompt polling during a stalled child, cancellation and
+subsequent cleanup. They also cover missing, failed and stalled cleanup
+helpers and stable fatal results. The target recipe stages and compiles
+the same tests. No test substitutes a protocol acknowledgement for
+physical token presence.
+
+The ignored root fixture
+`unlock::tests::root_supervisor_relocks_after_the_production_worker_refuses`
+requires the marked disposable VM and production `/bin/td-secret`. It
+starts the actual controller against a missing persistent store and
+proves the child refusal is followed by successful real cleanup, no
+presentation or release event, and removal of a seeded portal-owned
+runtime key.

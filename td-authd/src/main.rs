@@ -9,6 +9,8 @@ mod channel;
 )]
 mod consent;
 mod launch;
+#[allow(dead_code, reason = "private token child supervision; paired caller follows")]
+mod unlock;
 mod mount_sys;
 mod portal_files;
 mod sys;

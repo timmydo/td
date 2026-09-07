@@ -462,14 +462,19 @@ mod tests {
             fs::create_dir_all(path).unwrap();
             fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
         }
-        for case in 0..5 {
+        for case in 0..6 {
             let key = "/run/td-secret/1000/key";
             fs::write(key, [0u8; 64]).unwrap();
             fs::set_permissions(key, fs::Permissions::from_mode(0o600)).unwrap();
             std::os::unix::fs::fchown(File::open(key).unwrap(), Some(991), Some(991)).unwrap();
             let (mut parent, child) = UnixStream::pair().unwrap();
+            let verb = if case == 5 {
+                "lock-session"
+            } else {
+                "unlock-operation"
+            };
             let mut process = Command::new("/bin/td-secret")
-                .args(["unlock-operation", "--uid", "1000"])
+                .args([verb, "--uid", "1000"])
                 .stdin(Stdio::from(OwnedFd::from(child)))
                 .stdout(Stdio::inherit())
                 .stderr(Stdio::inherit())
@@ -478,7 +483,7 @@ mod tests {
                 .spawn()
                 .unwrap();
             match case {
-                0 => {}
+                0 | 5 => {}
                 1 => parent.write_all(&[0, 47, 1]).unwrap(),
                 2 => parent.write_all(&[0, 1, 255]).unwrap(),
                 _ => {
@@ -495,10 +500,10 @@ mod tests {
                 }
             }
             drop(parent);
-            assert!(!process.wait().unwrap().success());
+            assert_eq!(process.wait().unwrap().success(), case == 5);
             assert!(
                 !std::path::Path::new(key).exists(),
-                "initial failure {case} retained a key"
+                "case {case} retained a key"
             );
         }
     }
