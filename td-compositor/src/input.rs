@@ -1151,6 +1151,36 @@ fn event_paths(input_dir: &Path) -> Result<Vec<PathBuf>, String> {
     Ok(paths)
 }
 
+// Seat assignment is a boot snapshot; late USB nodes may remain root-only.
+// Open the complete admitted roster before starting any input thread.
+fn open_event_devices<T>(
+    paths: Vec<PathBuf>,
+    mut open: impl FnMut(&Path) -> std::io::Result<T>,
+) -> Result<Vec<(PathBuf, T)>, String> {
+    let mut devices = Vec::with_capacity(paths.len());
+    for path in paths {
+        match open(&path) {
+            Ok(device) => devices.push((path, device)),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::NotFound
+                ) || error.raw_os_error() == Some(19) =>
+            {
+                eprintln!(
+                    "td-compositor: skipping unavailable input {}: {error}",
+                    path.display()
+                );
+            }
+            Err(error) => return Err(format!("open input {}: {error}", path.display())),
+        }
+    }
+    if devices.is_empty() {
+        return Err("no accessible input devices; seat assignment is required".into());
+    }
+    Ok(devices)
+}
+
 #[cfg(test)]
 fn apply<T: InputTarget>(
     runtime: &Mutex<T>,
@@ -1694,7 +1724,8 @@ pub fn start(
     runtime: Arc<Mutex<Runtime>>,
     launches: LaunchBackend,
 ) -> Result<usize, String> {
-    let paths = event_paths(input_dir)?;
+    let devices = open_event_devices(event_paths(input_dir)?, |path| File::open(path))?;
+    let count = devices.len();
     let attention_enabled = runtime
         .lock()
         .map_err(|_| "runtime lock poisoned".to_string())?
@@ -1704,9 +1735,7 @@ pub fn start(
         ..KeyBindings::default()
     }));
     let target = Arc::new(Mutex::new(LiveInputTarget { runtime, launches }));
-    for (device, path) in paths.iter().enumerate() {
-        let mut file =
-            File::open(path).map_err(|e| format!("open input {}: {e}", path.display()))?;
+    for (device, (path, mut file)) in devices.into_iter().enumerate() {
         if attention_enabled {
             sys::input_monotonic_clock(&file)?;
         }
@@ -1761,7 +1790,7 @@ pub fn start(
             })
             .map_err(|e| format!("spawn input reader for {label}: {e}"))?;
     }
-    Ok(paths.len())
+    Ok(count)
 }
 
 #[cfg(test)]
@@ -1777,6 +1806,48 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_file(&self.0);
         }
+    }
+
+    #[test]
+    fn late_unassigned_or_removed_input_does_not_discard_the_seat() {
+        let paths = (0..4)
+            .map(|n| PathBuf::from(format!("/dev/input/event{n}")))
+            .collect();
+        let mut attempt = 0;
+        let devices = open_event_devices(paths, |_| {
+            attempt += 1;
+            match attempt {
+                1 => Ok("assigned keyboard"),
+                2 => Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+                3 => Err(std::io::Error::from(std::io::ErrorKind::NotFound)),
+                _ => Err(std::io::Error::from_raw_os_error(19)),
+            }
+        })
+        .unwrap();
+        assert_eq!(attempt, 4);
+        assert_eq!(
+            devices,
+            [(PathBuf::from("/dev/input/event0"), "assigned keyboard")]
+        );
+        for code in [2, 13, 19, 5] {
+            assert!(
+                open_event_devices::<()>(vec!["/dev/input/event0".into()], |_| Err(
+                    std::io::Error::from_raw_os_error(code)
+                ))
+                .is_err()
+            );
+        }
+        assert!(open_event_devices::<()>(Vec::new(), |_| Ok(())).is_err());
+        let mut attempt = 0;
+        assert!(open_event_devices(vec!["one".into(), "two".into()], |_| {
+            attempt += 1;
+            if attempt == 1 {
+                Ok(())
+            } else {
+                Err(std::io::Error::from_raw_os_error(5))
+            }
+        })
+        .is_err());
     }
 
     fn key(code: u16, value: i32) -> Event {

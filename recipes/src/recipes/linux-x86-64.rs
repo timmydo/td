@@ -395,6 +395,10 @@ pub fn recipe() -> Recipe {
     //    BLK_DEV_LOOP under `menuconfig BLK_DEV` (already =y), so no new menuconfig
     //    parent is required.
     //
+    //    FIDO USB: explicit prompted parents survive allnoconfig. xHCI PCI
+    //    support has no prompt and is checked only after resolution. hidraw
+    //    stays root-owned; the token worker validates the FIDO report profile.
+    //
     //    SOFTWARE UI: the first graphical profile writes XRGB8888 through the
     //    virtio-gpu driver's fbdev client and reads QEMU's PS/2 devices through
     //    evdev. Every driver is built in because modules remain forbidden.
@@ -555,6 +559,15 @@ pub fn recipe() -> Recipe {
                   /^#? *CONFIG_ACPI[ =]/d; \
                   /^#? *CONFIG_PNP[ =]/d; \
                   /^#? *CONFIG_PNPACPI[ =]/d; \
+                  /^#? *CONFIG_USB_SUPPORT[ =]/d; \
+                  /^#? *CONFIG_USB[ =]/d; \
+                  /^#? *CONFIG_USB_PCI[ =]/d; \
+                  /^#? *CONFIG_USB_XHCI_HCD[ =]/d; \
+                  /^#? *CONFIG_HID_SUPPORT[ =]/d; \
+                  /^#? *CONFIG_HID[ =]/d; \
+                  /^#? *CONFIG_HID_GENERIC[ =]/d; \
+                  /^#? *CONFIG_HIDRAW[ =]/d; \
+                  /^#? *CONFIG_USB_HID[ =]/d; \
                   /^#? *CONFIG_TCG_TPM[ =]/d; \
                   /^#? *CONFIG_TCG_TIS[ =]/d; \
                   /^#? *CONFIG_TCG_CRB[ =]/d; \
@@ -659,6 +672,15 @@ pub fn recipe() -> Recipe {
                    'CONFIG_ACPI=y' \
                    'CONFIG_PNP=y' \
                    'CONFIG_PNPACPI=y' \
+                   'CONFIG_USB_SUPPORT=y' \
+                   'CONFIG_USB=y' \
+                   'CONFIG_USB_PCI=y' \
+                   'CONFIG_USB_XHCI_HCD=y' \
+                   'CONFIG_HID_SUPPORT=y' \
+                   'CONFIG_HID=y' \
+                   'CONFIG_HID_GENERIC=y' \
+                   'CONFIG_HIDRAW=y' \
+                   'CONFIG_USB_HID=y' \
                    'CONFIG_TCG_TPM=y' \
                    'CONFIG_TCG_TIS=y' \
                    'CONFIG_TCG_CRB=y' \
@@ -759,6 +781,16 @@ pub fn recipe() -> Recipe {
                  grep -q '^CONFIG_ACPI=y' .config || { echo 'ACPI off - TPM enrollment requires ACPI discovery and TPM2 device support' >&2; exit 1; }; \
                  grep -q '^CONFIG_PNP=y' .config || { echo 'PNP off - TPM enrollment requires ACPI discovery and TPM2 device support' >&2; exit 1; }; \
                  grep -q '^CONFIG_PNPACPI=y' .config || { echo 'PNPACPI off - TPM enrollment requires ACPI discovery and TPM2 device support' >&2; exit 1; }; \
+                 grep -q '^CONFIG_USB_SUPPORT=y' .config || { echo 'USB_SUPPORT off - FIDO USB transport requires built-in xHCI and hidraw' >&2; exit 1; }; \
+                 grep -q '^CONFIG_USB=y' .config || { echo 'USB off - FIDO USB transport requires built-in xHCI and hidraw' >&2; exit 1; }; \
+                 grep -q '^CONFIG_USB_PCI=y' .config || { echo 'USB_PCI off - FIDO USB transport requires built-in xHCI and hidraw' >&2; exit 1; }; \
+                 grep -q '^CONFIG_USB_XHCI_HCD=y' .config || { echo 'USB_XHCI_HCD off - FIDO USB transport requires built-in xHCI and hidraw' >&2; exit 1; }; \
+                 grep -q '^CONFIG_HID_SUPPORT=y' .config || { echo 'HID_SUPPORT off - FIDO USB transport requires built-in xHCI and hidraw' >&2; exit 1; }; \
+                 grep -q '^CONFIG_HID=y' .config || { echo 'HID off - FIDO USB transport requires built-in xHCI and hidraw' >&2; exit 1; }; \
+                 grep -q '^CONFIG_HID_GENERIC=y' .config || { echo 'HID_GENERIC off - FIDO USB transport requires built-in xHCI and hidraw' >&2; exit 1; }; \
+                 grep -q '^CONFIG_HIDRAW=y' .config || { echo 'HIDRAW off - FIDO USB transport requires built-in xHCI and hidraw' >&2; exit 1; }; \
+                 grep -q '^CONFIG_USB_HID=y' .config || { echo 'USB_HID off - FIDO USB transport requires built-in xHCI and hidraw' >&2; exit 1; }; \
+                 grep -q '^CONFIG_USB_XHCI_PCI=y' .config || { echo 'USB_XHCI_PCI off - FIDO USB transport requires built-in xHCI and hidraw' >&2; exit 1; }; \
                  grep -q '^CONFIG_TCG_TPM=y' .config || { echo 'TCG_TPM off - TPM enrollment requires ACPI discovery and TPM2 device support' >&2; exit 1; }; \
                  grep -q '^CONFIG_TCG_TIS=y' .config || { echo 'TCG_TIS off - TPM enrollment requires ACPI discovery and TPM2 device support' >&2; exit 1; }; \
                  grep -q '^CONFIG_TCG_CRB=y' .config || { echo 'TCG_CRB off - TPM enrollment requires ACPI discovery and TPM2 device support' >&2; exit 1; }; \

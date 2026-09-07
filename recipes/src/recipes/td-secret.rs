@@ -6,6 +6,7 @@ const MODULES: &[(&str, &str)] = &[
     ("crypto", include_str!("../../../td-secret/src/crypto.rs")),
     ("fido_cbor", include_str!("../../../td-secret/src/fido_cbor.rs")),
     ("fido_ctap", include_str!("../../../td-secret/src/fido_ctap.rs")),
+    ("fido_device", include_str!("../../../td-secret/src/fido_device.rs")),
     ("fido_enroll", include_str!("../../../td-secret/src/fido_enroll.rs")),
     ("fido_hid", include_str!("../../../td-secret/src/fido_hid.rs")),
     ("fido_metadata", include_str!("../../../td-secret/src/fido_metadata.rs")),
@@ -155,6 +156,24 @@ pub fn recipe() -> Recipe {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn embedded_rust_has_no_recipe_substitution_tokens() {
+        for step in recipe().steps.iter().flatten() {
+            let Step::WriteFile { path, content, .. } = step else {
+                continue;
+            };
+            if !path.ends_with(".rs") {
+                continue;
+            }
+            for token in ["{root}", "{src}", "{out}", "{tools}", "{jobs}", "{in:", "{payload:"] {
+                assert!(
+                    !content.contains(token),
+                    "embedded source {path} contains recipe substitution token {token}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn recipe_embeds_every_declared_module() {

@@ -385,8 +385,10 @@ Deliberately not here: disk free, which needs `statfs(2)` and so an
 wireless, ethernet and temperature fields of the i3status config this is
 modelled on. All three are additions rather than changes to what is above.
 
-Input is QEMU's PS/2 keyboard and pointer plus its virtio tablet, all through
-evdev. The compositor
+The stock QEMU input fixture has a PS/2 keyboard and pointer plus a virtio
+tablet. The USB-enabled kernel also exposes USB HID input through evdev.
+The compositor enumerates all available evdev nodes at startup; this is
+not a PS/2/virtio device allowlist. The compositor
 supports EV_KEY, EV_REL, EV_ABS, and EV_SYN. It has a fixed US key map. Every
 binding is ONE chord on `Super`:
 
@@ -506,13 +508,11 @@ device does not have the problem to fix, since each report says where rather
 than how far. QEMU's default PS/2 mouse is relative, so an image wanting the
 edges needs an absolute device attached, and this one attaches
 `-device virtio-tablet-pci`. Virtio rather than the more familiar
-`-device usb-tablet`: the USB tablet would want a host controller and the
-guest's whole USB and HID stack built in for one device, where the virtio
-tablet rides the VIRTIO_PCI transport already carrying the disk and the GPU
-and costs one Kconfig symbol under a menuconfig parent the erofs root
-already pins. The PS/2 mouse stays attached beside it, since a relative
-device is still what an ordinary machine has and the compositor must keep
-serving one.
+`-device usb-tablet`: the virtio tablet rides the VIRTIO_PCI transport
+already carrying the disk and GPU. The kernel also carries USB/HID for
+tokens, but the stock pointer fixture remains virtio. The PS/2 mouse stays
+attached beside it, since a relative device is still what an ordinary
+machine has and the compositor must keep serving one.
 
 That a device is ATTACHED is not the same as a device ANSWERING, and only
 the second is worth a check. So the compositor prints `TD-POINTER-ABSOLUTE`
@@ -671,9 +671,10 @@ fix needs no new ioctl — `/sys/class/input/*/properties` carries the
 `INPUT_PROP_*` bitmap as an ordinary file, and `INPUT_PROP_POINTER` versus
 `INPUT_PROP_DIRECT` is the distinction wanted — but the property a QEMU
 tablet actually sets cannot be checked from here, and gating on the wrong
-bit would make the feature refuse the one device it exists for. The hardware
-profile above has none of them: it is a PS/2 keyboard, a PS/2 mouse, and a
-virtio tablet.
+bit would make the feature refuse the one device it exists for. The stock
+QEMU fixture has none of them: it is a PS/2 keyboard, a PS/2 mouse, and a
+virtio tablet. The USB-enabled kernel can expose additional HID devices;
+startup enumeration does not distinguish their intended use.
 
 Compositor commands act only on key presses. Evdev autorepeat records are
 ignored for both compositor and client delivery. A held `Super+v` therefore
@@ -4005,7 +4006,8 @@ offers one.
 
 The landing must prove:
 
-- the kernel pins fbdev, virtio-gpu, PS/2, virtio-input, and evdev built in;
+- the kernel pins fbdev, virtio-gpu, PS/2, virtio-input, evdev, USB PCI
+  xHCI, generic HID, USB HID and hidraw built in;
 - interactive QEMU attaches virtio-vga and preserves ttyS0 on stdio;
 - the seat and compositor multicall artifacts are static ELF64 ET_EXEC files,
   and the demo entry point is a relative symlink to that static multicall;
@@ -6243,6 +6245,28 @@ compositor-owned display socket directory; startup and resize use the same
 client directory. A bare readiness filename without a directory is refused.
 
 ## Physical secure attention
+
+The trusted input boundary includes every evdev device admitted at startup,
+including USB HID keyboards and pointers. USB provenance is not device
+attestation. A composite token's separate OTP keyboard interface is an input
+device and can type into the focused application; the FIDO hidraw interface
+is separate, remains root-only, and supplies no keyboard events itself.
+A malicious admitted keyboard can synthesize the attention chord. This
+profile trusts attached input hardware and root's device provisioning; it
+provides no defense against a malicious keyboard or USB peripheral that
+presents as one. Token presence is never inferred from keyboard events.
+
+Seat assignment is a boot oneshot, so late USB nodes can remain root-owned
+and inaccessible to UID 993. Compositor startup skips permission-denied,
+missing, or removed-device nodes with one diagnostic per node. Other open
+errors fail startup, and an empty accessible roster still fails; it never
+changes permissions or admits an inaccessible device. All admitted handles
+are opened before any reader starts. A restart alone does not assign a new
+device: it needs trusted seat assignment as well. The running compositor
+keeps its fixed roster and has no input hotplug service. The nonempty roster
+check does not prove that a usable keyboard remains or that the attention
+chord is reachable; removing the assigned keyboard can deny that input
+path. Startup input counts are not an authentication-readiness claim.
 
 Only the root-paired stock compositor profile reserves Ctrl+Alt+Esc. The
 Escape press opens an opaque, built-in screen with no pending authorization

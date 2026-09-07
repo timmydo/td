@@ -297,6 +297,74 @@ components, and repeats verification beyond the TPM transient-slot count.
 The fixture requires no OpenSSL at test time. Neither these tests nor
 their software authenticator framing inputs prove a physical token touch.
 
+## USB token transport
+
+`fido_device.rs` discovers at most 256 fixed `/dev/hidrawN` names. It
+requires a root-owned, root-group, mode-0600 character device and the
+kernel's USB HID bus metadata. Discovery reads metadata without opening
+the device. The report descriptor must describe one FIDO usage-page
+0xf1d0/application-usage 1 collection with exactly one unnumbered 64-byte
+input and output report. Reports use byte-sized data/variable/absolute
+fields and the FIDO input/output usages. Numbered reports, features,
+nested/additional collections, push/pop and unsupported items refuse;
+this deliberately supports a narrower profile than general HID.
+Descriptor and uevent reads are bounded. The kernel and root-owned
+`/dev` and `/sys` are trusted; a device name or bus claim is never an
+enrolled token identity. The FIDO signature establishes that identity.
+
+The built-in kernel profile enables USB, PCI xHCI, HID, generic HID,
+hidraw and USB HID. The prompted parents are explicitly enabled after
+allnoconfig; derived USB_XHCI_PCI is checked after olddefconfig without
+a fictitious direct pin. The profile does not add legacy USB host
+controller drivers. Raw token nodes stay root-only and never enter an
+application jail or the compositor's input-device delegation. Separate
+USB keyboard/pointer interfaces do enter the compositor's startup evdev
+roster; its trusted-device boundary is specified in
+`td-compositor/DESIGN.md` under Physical secure attention.
+
+One root-owned Session starts `/proc/self/exe hid-worker`, retaining the
+same executable version across deployment changes, with a cleared
+environment and private inherited Unix socket stdio. Its typed arguments
+contain only the bounded device index and
+expected inode/rdev; the helper reopens without symlink following and
+revalidates the device and descriptor. It never reads credentials or
+store keys, changes device permissions, or spawns another process.
+Root-only helper access grants no elevation. It accepts only a complete
+report write or a request to read one report. Linux hidraw writes carry
+a leading zero report ID, making 65 bytes; reads must return exactly
+64 bytes, with a 65-byte receive buffer detecting oversized reports.
+Short writes and failures have an unknown device outcome and are never
+replayed. The API follows [Linux hidraw](https://docs.kernel.org/hid/hidraw.html).
+
+Device input uses blocking reads without periodic touch polling.
+USB output would block even with O_NONBLOCK, as the pinned kernel's
+usbhid output path uses a synchronous USB transfer. The parent retains
+an owned Child and uses one absolute socket-I/O deadline, at most two
+minutes, across startup, fresh kernel-nonce channel allocation, every
+write/read, keepalive and CBOR exchange. Partial stream traffic and
+other channels cannot extend it. Any error poisons the Session and
+kills and reaps its worker; Drop also kills and reaps it. The helper
+arms a separate watchdog thread before device access; that thread requests
+process exit after two minutes even while the I/O thread blocks. It also
+checks the same lifetime between device operations and exits on parent
+channel EOF. Abrupt parent death therefore leaves an independent exit
+request even when device I/O cannot observe EOF. Uninterruptible kernel
+waits can delay process exit and the parent's synchronous reaping. The
+calling Session method or Drop can therefore return after the deadline;
+the deadline bounds accepted protocol replies, not teardown completion.
+This is not a hard real-time bound on an unresponsive kernel. No late
+reply is accepted as authorization.
+
+The trusted consumer must negotiate getInfo message limits before
+constructing requests, bind fresh challenges to presented operations,
+and verify enrollment/assertions through the metadata API. Keepalives
+are transport progress only. This increment provides no enrollment UI,
+session release, persistent store change or one-operation elevation.
+Ordinary tests cover descriptor/profile refusals, real child/socket
+ownership, successful repeated exchanges, stalled and malformed workers,
+keepalive floods and partial-traffic deadline refusal. These fixtures
+do not themselves prove physical token presence or a USB controller.
+
 ## CTAP assertion codec
 
 `fido_cbor.rs` implements CTAP's canonical CBOR profile, bounded to 7609

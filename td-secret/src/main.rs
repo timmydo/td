@@ -10,6 +10,8 @@
 )]
 
 mod client;
+#[allow(dead_code, reason = "physical token transport; trusted consumer follows")]
+mod fido_device;
 #[allow(dead_code, reason = "FIDO2 transport prerequisite; no release consumer yet")]
 mod fido_hid;
 #[allow(dead_code, reason = "enrollment metadata prerequisite; no release consumer yet")]
@@ -48,6 +50,7 @@ use std::io::{self, Read};
 fn run(args: &[String]) -> Result<(), String> {
     match args {
         [command] if command == "selftest" => crypto::selftest(),
+        [command, index, inode, rdev] if command == "hid-worker" => fido_device::worker(index, inode, rdev),
         [command, uid_flag, uid, pcr_flag, pcrs, recovery]
             if command == "seal"
                 && uid_flag == "--uid"
@@ -155,6 +158,7 @@ mod confinement {
             ("crypto.rs", include_str!("crypto.rs")),
             ("fido_cbor.rs", include_str!("fido_cbor.rs")),
             ("fido_ctap.rs", include_str!("fido_ctap.rs")),
+            ("fido_device.rs", include_str!("fido_device.rs")),
             ("fido_enroll.rs", include_str!("fido_enroll.rs")),
             ("fido_hid.rs", include_str!("fido_hid.rs")),
             ("fido_metadata.rs", include_str!("fido_metadata.rs")),
@@ -213,6 +217,7 @@ pub fn take_received(fd: RawFd) -> Result<File, String> {
                 "crypto.rs",
                 "fido_cbor.rs",
                 "fido_ctap.rs",
+                "fido_device.rs",
                 "fido_enroll.rs",
                 "fido_hid.rs",
                 "fido_metadata.rs",

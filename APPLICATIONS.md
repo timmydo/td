@@ -8384,16 +8384,20 @@ holds the key may elevate*, consistent with physical access being out of
 scope. If a token is used, **CTAP access must be exclusively mediated**:
 a key is `/dev/hidraw`, not evdev, so the compositor's input path does
 not cover it, and a rogue process holding hidraw can solicit an assertion
-timed with the prompt and consume the operator's touch. Today no jail
-binds hidraw, which closes it by accident and reopens the moment anything
-wants WebAuthn.
+timed with the prompt and consume the operator's touch. No jail binds
+hidraw; the USB transport requires root-owned mode-0600 token nodes.
+This blocks unprivileged direct access but does not serialize root
+consumers: hidraw allows concurrent opens. Exclusive CTAP operation
+mediation remains required before enabling consent or a WebAuthn grant.
 
 **Neither consent mechanism is implemented.** The inert screen above
-provides no approval, and the token is further away than it looks: the pin
-list contains **no `CONFIG_USB*` at all** — not merely no `HIDRAW` but no
-host controller — so a token cannot be
-enumerated. The key combination needs only what the compositor already
-has, which is the other reason it is primary.
+provides no approval. The kernel now carries USB PCI xHCI, generic HID,
+USB HID and hidraw. The root-only worker implements the narrow CTAP HID
+transport described in `td-secret/DESIGN.md`; it does not grant consent.
+USB keyboard interfaces follow the compositor's seat-assigned startup
+roster, including the separate OTP interface of a composite token.
+Physical input hardware remains trusted; keyboard events never prove a
+FIDO assertion.
 
 #### Threats a consent dialog invites
 
@@ -8416,8 +8420,8 @@ path; account-password recovery; and a policy language — the operation
 table is code, reviewed as code. Hardware PIN and recovery policy belong to
 `td-install/ENCRYPTION.md`; the application-secret policy remains in §W.4.
 
-**Cost, honestly.** A new root component and a new trust surface, needing
-USB HID and CTAP2 in a kernel config that has neither. The physical
+**Cost, honestly.** A root authority and a new trust surface, with exclusive
+operation mediation still to connect to the USB HID/CTAP transport. The physical
 attention screen is inert; immutable request presentation, consent and
 one-operation execution remain unimplemented. This plan grants no current
 authority and supplies no account-password prompt.
