@@ -423,11 +423,11 @@ const DRAIN_BUDGET: usize = 4 * 1024 * 1024;
 /// flooded — generous enough that a normal boot's few KiB of printk never trips it.
 const MAX_CONSOLE_BYTES: u64 = 64 * 1024 * 1024;
 const PERSISTENT_DEPLOYMENT_COPIES: u64 = 3;
-// Firefox and its runtime make each non-debug root materially larger than the
-// native-only image. Reserve three GiB across the three transactional copies,
-// then another for Btrfs metadata and the writable @var subvolume. The sparse
-// image does not allocate that whole logical ceiling on the host.
-const PERSISTENT_NON_DEBUG_BYTES: u64 = 3 * 1024 * 1024 * 1024;
+// The standard root includes Firefox and the source-built developer tools.
+// Reserve two GiB of non-debug payload per transactional copy, separately
+// from each copy's one-GiB debug allowance and the writable-state headroom.
+// The sparse volume does not allocate its whole logical size on the host.
+const PERSISTENT_NON_DEBUG_BYTES: u64 = 6 * 1024 * 1024 * 1024;
 const PERSISTENT_VOLUME_HEADROOM: u64 = 1024 * 1024 * 1024;
 const PERSISTENT_VOLUME_BYTES: u64 = td_engine::target_profile::DEPLOYMENT_DEBUG_CEILING_BYTES
     * PERSISTENT_DEPLOYMENT_COPIES

@@ -93,7 +93,7 @@ pub const ASSEMBLY_EXCEPTIONS: [(&str, &str); 7] = [
 /// and libgcc boundaries apply to every output passed to the target splitter;
 /// this roster adds Rust/LLVM and is pinned against both Cargo and direct-rustc
 /// recipes by the catalog tests.
-pub const RUST_PROFILED_RECIPES: [&str; 28] = [
+pub const RUST_PROFILED_RECIPES: [&str; 29] = [
     "codex",
     "fd",
     "ripgrep",
@@ -102,6 +102,7 @@ pub const RUST_PROFILED_RECIPES: [&str; 28] = [
     "td-authd",
     "td-boot",
     "td-busd",
+    "td-cc",
     "td-compositor",
     "td-firstboot",
     "td-init",
@@ -220,9 +221,9 @@ pub fn debug_companion_policy(recipe: &str) -> String {
 /// without permitting unbounded full DWARF.
 pub const TOOLCHAIN_DEBUG_CEILING_BYTES: u64 = 4_294_967_296;
 
-/// The shipped image excludes the compiler toolchain, so its companions have a
-/// separate one-GiB budget. This is deliberately not coupled to the much larger
-/// LLVM/rustc ceiling: growth in one scope must not silently relax the other.
+/// The shipped image includes the source-built development toolchain within a
+/// one-GiB companion budget. This is independent of the toolchain producer's
+/// ceiling: compiler growth must also fit the complete deployment budget.
 pub const DEPLOYMENT_DEBUG_CEILING_BYTES: u64 = 1_073_741_824;
 
 /// Compose the Cargo runner's target-only RUSTFLAGS. The three varying source

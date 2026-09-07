@@ -186,9 +186,12 @@ host-wide finite resources even though build locks are isolated.
 
 ## Add development capabilities to the existing image
 
-Extend the existing system image only where its capability checks identify a
-gap. These are requirements for development readiness, not prerequisites for
-the initial stock-desktop lifecycle increment. The image producer owns:
+Use one standard system image, including its source-built development tools;
+there is no separate desktop/development profile. The common `./build-qcow`
+producer prepares the template once, and instances reuse that immutable
+base. Extend the existing system image where its capability checks identify
+a gap. These are requirements for development readiness, not prerequisites
+for the initial stock-desktop lifecycle increment. The image producer owns:
 
 - Source-built Rust, Cargo, linker/compiler tools, td control-plane tools,
   Git, the source-built OpenSSH client and key generator, required build/test
@@ -224,6 +227,15 @@ Distinguish `Booting`, `Preparing workspace`, `Needs host attention`, and
 In particular, toolchain checks and a provider-authentication probe must pass
 before displaying an agent as ready. Probes do not submit prompts or paid
 model requests merely to check login.
+
+The native-toolchain increment packs source-built Rust/Cargo, GCC, binutils,
+and the `td-cc` compiler defaults into that standard image. Its published
+sparse volume is 10 GiB, allowing the boot/update fixtures to hold three
+complete deployments with their debug companions. This is a deployment
+capacity allowance, not a claim that a cold distribution build fits there.
+Private development-store placement and VM data-capacity management remain
+required before reporting the complete repository workflow ready. Clippy and
+the target-native control-plane helper path are also still outstanding.
 
 ## Copy/paste before account linking
 

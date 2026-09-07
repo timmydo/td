@@ -168,8 +168,9 @@ exception removes it and then structurally rejects a retained line program
 which declares `DW_FORM_strp`. The image recipe records the companions' total
 bytes and enforces a literal compiled ceiling kept outside the measuring code.
 The source-built toolchain and shipped deployment have independent ceilings:
-four GiB for the LLVM/rustc-dominated toolchain and one GiB for the image,
-which deliberately excludes that build-only toolchain.
+four GiB for the LLVM/rustc-dominated toolchain output and one GiB for the
+complete standard image, including its source-built development toolchain.
+The toolchain's producer ceiling does not enlarge the deployment allowance.
 Changing either is reviewed with the corresponding size report. This keeps
 the always-available data useful for function and source-line attribution
 without turning every deployment into a full debugger SDK.

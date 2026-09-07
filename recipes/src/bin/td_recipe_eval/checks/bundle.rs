@@ -58,7 +58,7 @@ const MARKER_FORMAT: &str = "td-bundle-v1";
 #[derive(Debug, Clone)]
 pub(crate) struct BundleOptions {
     pub(crate) out: PathBuf,
-    /// Skip the qcow2 conversion and ship the 5 GiB raw volume. For a host
+    /// Skip the qcow2 conversion and ship the 10 GiB raw volume. For a host
     /// with no `qemu-img`, and for anyone who would rather hand out a raw
     /// image than depend on qcow2 at all.
     pub(crate) raw: bool,

@@ -171,6 +171,7 @@ mod tests {
             "td-authd",
             "td-boot",
             "td-busd",
+            "td-cc",
             "td-compositor",
             "td-firstboot",
             "td-init",

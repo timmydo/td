@@ -162,12 +162,12 @@ same recipe output and system image. Bootstrap seeds, build-only intermediates,
 the kernel, firmware, marked foreign payloads, hand-written assembly, and the
 exact coverage and reproducibility rules are specified in
 `td-profiler/DESIGN.md`; profiler output reports every boundary explicitly.
-The Codex 0.148.0 dynamically linked CLI is the one named source-line
-boundary: its structurally checked line program exceeds the profiler's
-bounded per-object reader, so its companion retains the line program and
-ordinary symbols while td-profiler reports source-line attribution
-unavailable. The exact producer ceiling, marker, and retained-section policy
-are specified in that design.
+The Codex 0.148.0 dynamically linked CLI and Rust 1.96.0's named
+librustc_driver are source-line boundaries: their structurally checked line
+programs exceed the profiler's bounded reader, so their companions retain
+the line programs and ordinary symbols while td-profiler reports source-line
+attribution unavailable. The exact producer ceiling, marker, and
+retained-section policy are specified in that design.
 
 The first `td-profiler/DESIGN.md` implementation increment enforces the
 producer side in compiler flags, per-output runtime/debug pair checks, size

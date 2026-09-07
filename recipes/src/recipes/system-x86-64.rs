@@ -4222,6 +4222,10 @@ fn real_root_steps(sys: &SystemDef) -> Result<Vec<Step>, String> {
         "{in:openssh-x86-64}".into(),
         "{in:git-x86-64}".into(),
         "{in:codex}".into(),
+        "{in:rust-toolchain}".into(),
+        "{in:gcc-x86-64-self}".into(),
+        "{in:binutils-x86-64-self}".into(),
+        "{in:td-cc}".into(),
     ];
     runtime_roots.extend(
         application_payload_inputs(sys)
@@ -4373,6 +4377,26 @@ fn real_root_steps(sys: &SystemDef) -> Result<Vec<Step>, String> {
         target: "{in:td-busd}/bin/td-busd".into(),
         link: "{root}/real-root/bin/td-busd".into(),
     });
+    // One standard image includes the source-built development toolchain.
+    // The compiler launcher supplies exact store paths without shell setup.
+    for name in ["rustc", "rustdoc", "cargo"] {
+        steps.push(Step::Symlink {
+            target: format!("{{in:rust-toolchain}}/bin/{name}"),
+            link: format!("{{root}}/real-root/bin/{name}"),
+        });
+    }
+    for name in ["td-cc", "cc", "gcc", "c++", "g++"] {
+        steps.push(Step::Symlink {
+            target: "{in:td-cc}/bin/td-cc".into(),
+            link: format!("{{root}}/real-root/bin/{name}"),
+        });
+    }
+    for name in ["ar", "as", "ld", "nm", "ranlib", "objcopy", "objdump", "readelf", "strip"] {
+        steps.push(Step::Symlink {
+            target: format!("{{in:binutils-x86-64-self}}/bin/{name}"),
+            link: format!("{{root}}/real-root/bin/{name}"),
+        });
+    }
     // /bin/td-fetchd — the fetch service (APPLICATIONS.md §W.8), an applet of
     // the target-built td-net multicall: the link's basename selects it, as
     // the applet links do on the host. Named in full by the fetchd unit's
@@ -5137,6 +5161,10 @@ pub fn recipe() -> Recipe {
             "td-portal",
             "td-secret",
             "td-net",
+            "rust-toolchain",
+            "gcc-x86-64-self",
+            "binutils-x86-64-self",
+            "td-cc",
         ])
         .steps(steps);
     let application_inputs = application_payload_inputs(&SYSTEM);
@@ -7751,6 +7779,10 @@ news\tnews-0.1\tsource\tempty-runtime-1\tsource\n"
             "{in:openssh-x86-64}".to_string(),
             "{in:git-x86-64}".to_string(),
             "{in:codex}".to_string(),
+            "{in:rust-toolchain}".to_string(),
+            "{in:gcc-x86-64-self}".to_string(),
+            "{in:binutils-x86-64-self}".to_string(),
+            "{in:td-cc}".to_string(),
             format!("{{payload:{CLAUDE_NAME}}}"),
             "{payload:empty-runtime}".to_string(),
             format!("{{payload:{FIREFOX_NAME}}}"),
@@ -7836,6 +7868,23 @@ news\tnews-0.1\tsource\tempty-runtime-1\tsource\n"
             ("codex", "{in:codex}/bin/codex"),
             ("bwrap", "{in:codex-bwrap}/bin/bwrap"),
             ("openssl", "{in:libressl-x86-64}/bin/openssl"),
+            ("rustc", "{in:rust-toolchain}/bin/rustc"),
+            ("rustdoc", "{in:rust-toolchain}/bin/rustdoc"),
+            ("cargo", "{in:rust-toolchain}/bin/cargo"),
+            ("td-cc", "{in:td-cc}/bin/td-cc"),
+            ("cc", "{in:td-cc}/bin/td-cc"),
+            ("gcc", "{in:td-cc}/bin/td-cc"),
+            ("c++", "{in:td-cc}/bin/td-cc"),
+            ("g++", "{in:td-cc}/bin/td-cc"),
+            ("ar", "{in:binutils-x86-64-self}/bin/ar"),
+            ("ld", "{in:binutils-x86-64-self}/bin/ld"),
+            ("as", "{in:binutils-x86-64-self}/bin/as"),
+            ("nm", "{in:binutils-x86-64-self}/bin/nm"),
+            ("ranlib", "{in:binutils-x86-64-self}/bin/ranlib"),
+            ("objcopy", "{in:binutils-x86-64-self}/bin/objcopy"),
+            ("objdump", "{in:binutils-x86-64-self}/bin/objdump"),
+            ("readelf", "{in:binutils-x86-64-self}/bin/readelf"),
+            ("strip", "{in:binutils-x86-64-self}/bin/strip"),
         ] {
             let link = format!("{{root}}/real-root/bin/{name}");
             let targets: Vec<&str> = steps
@@ -7856,18 +7905,13 @@ news\tnews-0.1\tsource\tempty-runtime-1\tsource\n"
         }
 
         let native_inputs = recipe().native_inputs.expect("system native inputs");
-        for required in ["codex", "codex-bwrap", "libressl-x86-64"] {
+        for required in ["codex", "codex-bwrap", "libressl-x86-64", "rust-toolchain", "gcc-x86-64-self", "binutils-x86-64-self", "td-cc"] {
             assert!(
                 native_inputs.iter().any(|input| input == required),
                 "shipped input {required} must be declared"
             );
         }
-        for forbidden in [
-            "rust-stage0",
-            "rust-toolchain",
-            "gcc-x86-64-self",
-            "binutils-x86-64-self",
-        ] {
+        for forbidden in ["rust-stage0", "gcc-x86-64-native", "bash-mesboot"] {
             assert!(
                 !native_inputs.iter().any(|input| input == forbidden),
                 "build-only input {forbidden} must not be a direct system input"
