@@ -1,4 +1,4 @@
-//! Native redraw generations and immutable submitted/callback snapshots.
+//! Native input/redraw generations and immutable submitted/callback snapshots.
 
 use crate::render::Geometry;
 use crate::ui::Controller;
@@ -33,6 +33,7 @@ impl Stamp {
 
 pub(crate) struct Frames {
     requested: Option<u64>,
+    input: Option<u64>,
     submitted: Option<Stamp>,
     completed: Option<Stamp>,
     dirty: bool,
@@ -42,6 +43,7 @@ impl Default for Frames {
     fn default() -> Self {
         Self {
             requested: Some(1),
+            input: Some(1),
             submitted: None,
             completed: None,
             dirty: true,
@@ -57,13 +59,28 @@ impl Frames {
     /// Overflow poisons the window; the adapter must exit, never wrap a fence.
     pub(crate) fn invalidate(&mut self, changed: bool) {
         if changed {
+            self.input = self.input.and_then(|n| n.checked_add(1));
+        }
+        self.invalidate_caret(changed);
+    }
+
+    /// Only the controller's clock-only caret transition may skip input fencing.
+    pub(crate) fn invalidate_caret(&mut self, changed: bool) {
+        if changed {
             self.requested = self.requested.and_then(|n| n.checked_add(1));
             self.dirty = true;
         }
     }
 
+    /// Either counter's exhaustion stops input and presentation progress.
     pub(crate) fn generation(&self) -> Result<u64> {
+        self.input.ok_or(Error::Exhausted)?;
         self.requested.ok_or(Error::Exhausted)
+    }
+
+    pub(crate) fn input_generation(&self) -> Result<u64> {
+        self.requested.ok_or(Error::Exhausted)?;
+        self.input.ok_or(Error::Exhausted)
     }
 
     pub(crate) fn capture(&self, ui: &Controller) -> Result<Stamp> {
@@ -108,7 +125,8 @@ impl Frames {
 
     pub(crate) fn fields(&self) -> Result<String> {
         Ok(format!(
-            "window-generation={}\tframe-submitted={}\tframe-completed={}",
+            "input-generation={}\twindow-generation={}\tframe-submitted={}\tframe-completed={}",
+            self.input_generation()?,
             self.generation()?,
             self.submitted.map_or_else(|| "-".into(), Stamp::fields),
             self.completed.map_or_else(|| "-".into(), Stamp::fields),
@@ -169,17 +187,67 @@ mod tests {
         let mut frames = Frames::default();
         assert_eq!(
             frames.fields().unwrap(),
-            "window-generation=1\tframe-submitted=-\tframe-completed=-"
+            "input-generation=1\twindow-generation=1\tframe-submitted=-\tframe-completed=-"
         );
         let stamp = frames.capture(&ui).unwrap();
         assert_eq!(stamp.fields(), "1,0,0,0,800,600,1");
         frames.submit(stamp).unwrap();
         assert_eq!(
             frames.fields().unwrap(),
-            "window-generation=1\tframe-submitted=1,0,0,0,800,600,1\tframe-completed=-"
+            "input-generation=1\twindow-generation=1\tframe-submitted=1,0,0,0,800,600,1\tframe-completed=-"
         );
         frames.complete().unwrap();
-        assert_eq!(frames.fields().unwrap(), "window-generation=1\tframe-submitted=1,0,0,0,800,600,1\tframe-completed=1,0,0,0,800,600,1");
+        assert_eq!(frames.fields().unwrap(), "input-generation=1\twindow-generation=1\tframe-submitted=1,0,0,0,800,600,1\tframe-completed=1,0,0,0,800,600,1");
+    }
+
+    #[test]
+    fn caret_only_damage_preserves_input_but_not_frame_fences() {
+        let ui = Controller::default();
+        let mut frames = Frames::default();
+        let stamp = frames.capture(&ui).unwrap();
+        frames.submit(stamp).unwrap();
+        frames.invalidate_caret(false);
+        assert!(!frames.is_dirty());
+        for generation in 2..=8 {
+            frames.invalidate_caret(true);
+            assert_eq!(frames.input_generation(), Ok(1));
+            assert_eq!(frames.generation(), Ok(generation));
+            assert!(frames.is_dirty());
+        }
+        assert_eq!(frames.submit(stamp), Err(Error::StaleRevision));
+        frames.complete().unwrap();
+        assert_eq!(frames.wait(1), Ok(Some(stamp)));
+        assert_eq!(frames.wait(2), Ok(None));
+        frames.invalidate(false);
+        assert_eq!(frames.input_generation(), Ok(1));
+        frames.invalidate(true);
+        assert_eq!(frames.input_generation(), Ok(2));
+        assert_eq!(frames.generation(), Ok(9));
+    }
+
+    #[test]
+    fn either_counter_exhaustion_permanently_poisons_both_fences() {
+        for input in [false, true] {
+            let mut frames = Frames::default();
+            if input {
+                frames.input = Some(u64::MAX);
+                frames.invalidate(true);
+            } else {
+                frames.requested = Some(u64::MAX);
+                frames.invalidate_caret(true);
+            }
+            for _ in 0..2 {
+                assert_eq!(frames.input_generation(), Err(Error::Exhausted));
+                assert_eq!(frames.generation(), Err(Error::Exhausted));
+                assert_eq!(frames.fields(), Err(Error::Exhausted));
+                assert_eq!(
+                    frames.capture(&Controller::default()),
+                    Err(Error::Exhausted)
+                );
+                frames.invalidate(true);
+                frames.invalidate_caret(true);
+            }
+        }
     }
 
     #[test]

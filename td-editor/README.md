@@ -107,15 +107,16 @@ bound to their live ID and revision, including while unfocused. Dictionary
 jobs report installation or failure without changing document text/history.
 Decoded `key` drives editing and menu/Find/Replace/numeric/command prompts
 through the native handler. It requires real keyboard readiness and pins the
-current native redraw generation as well as the active tab/revision. File,
+current input-context generation as well as the active tab/revision. File,
 close and conflict dialogs require explicit token-bound answers, never keys.
 A key reply acknowledges delivery, not command success or file completion.
-Native adapter errors stop the window; conservative generation changes can
-starve slow key clients. Prefer semantic commands when available.
+Native adapter errors stop the window. Caret-only blinks do not invalidate
+input, but other context changes do; query fresh state after each delivery.
+Prefer semantic commands when available.
 Copy/Cut still require a physical press; Paste uses an existing compositor
 offer. See CONTROL.md for exact fields, refusal and lost-reply semantics.
 Decoded pointer press/move/release shares native hit testing and menu/close
-routing. It requires real pointer presence and exact native generation, and
+routing. It requires real pointer presence and exact input generation, and
 keeps remote drags separate from physical input without moving the cursor.
 Close confirmation still requires explicit dialog answers. Wheel control and
 prompt-entry text queries are not connected yet.

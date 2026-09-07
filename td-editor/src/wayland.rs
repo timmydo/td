@@ -1528,7 +1528,9 @@ impl Window {
         }
         let before = self.ui.generation();
         self.ui.dispatch(Event::Tick(now)).map_err(error)?;
+        self.frames.invalidate_caret(self.ui.generation() != before);
         self.clock = now;
+        let before = self.ui.generation();
         self.clipboard_tick(now, repeat)?;
         self.frames.invalidate(self.ui.generation() != before);
         if repeat {
@@ -1954,7 +1956,7 @@ impl Window {
         if generation == 0 {
             return Err(crate::Error::InvalidArgument);
         }
-        if generation != self.frames.generation()? {
+        if generation != self.frames.input_generation()? {
             return Err(crate::Error::StaleRevision);
         }
         let point = self.ui.editor().revision_point(tab, revision)?;
@@ -2030,7 +2032,7 @@ impl Window {
         if generation == 0 {
             return Err(crate::Error::InvalidArgument);
         }
-        if generation != self.frames.generation()? {
+        if generation != self.frames.input_generation()? {
             return Err(crate::Error::StaleRevision);
         }
         self.ui
@@ -2470,7 +2472,7 @@ impl Window {
             let flag = u8::from;
             response.push_str(&format!(
                 concat!(
-                    "\tadapter=native-pointer\tkey-ready={}\tpointer-ready={}\tpointer-drag={}\tnative={},{},{},{}",
+                    "\tadapter=native-input-context\tkey-ready={}\tpointer-ready={}\tpointer-drag={}\tnative={},{},{},{}",
                     "\tmodal={},{},{},{},{},{},{},{},{}\tspelling={},{}",
                 ),
                 flag(self.control_key_available()),
@@ -6140,7 +6142,7 @@ mod tests {
         crate::control::Request::parse(
             format!(
                 "1\t8\tpointer\t{tab}\t{revision}\t{}\t{phase}\t{x}\t{y}\t{}",
-                w.frames.generation().unwrap(),
+                w.frames.input_generation().unwrap(),
                 u8::from(extend)
             )
             .as_bytes(),
@@ -6278,7 +6280,7 @@ mod tests {
         let tab = w.ui.geometry().tab(0, 1, 2).unwrap();
         let command = format!(
             "1\t1\tpointer\t2\t0\t{}\tpress\t{}\t{}\t0",
-            w.frames.generation().unwrap(),
+            w.frames.input_generation().unwrap(),
             tab.x + 4,
             tab.y + 4
         );
@@ -6288,7 +6290,7 @@ mod tests {
         let close = w.ui.geometry().tab_close(0, 0, 2).unwrap();
         let command = format!(
             "1\t2\tpointer\t1\t1\t{}\tpress\t{}\t{}\t0",
-            w.frames.generation().unwrap(),
+            w.frames.input_generation().unwrap(),
             close.x,
             close.y
         );
@@ -6298,7 +6300,7 @@ mod tests {
         assert!(state.contains("dialog=1,close-tab,question,1,1,cancel+discard+save"));
         let command = format!(
             "1\t3\tpointer\t1\t1\t{}\tpress\t{}\t{}\t0",
-            w.frames.generation().unwrap(),
+            w.frames.input_generation().unwrap(),
             close.x,
             close.y
         );
@@ -6320,7 +6322,7 @@ mod tests {
         let close = w.ui.geometry().tab_close(0, 1, 2).unwrap();
         let command = format!(
             "1\t5\tpointer\t2\t0\t{}\tpress\t{}\t{}\t0",
-            w.frames.generation().unwrap(),
+            w.frames.input_generation().unwrap(),
             close.x,
             close.y
         );
@@ -6481,7 +6483,7 @@ mod tests {
         crate::control::Request::parse(
             format!(
                 "1\t9\tkey\t{tab}\t{revision}\t{}\t{}",
-                w.frames.generation().unwrap(),
+                w.frames.input_generation().unwrap(),
                 crate::control::hex(chord.as_bytes())
             )
             .as_bytes(),
@@ -6492,6 +6494,89 @@ mod tests {
     fn decoded_key(w: &mut Window, chord: &str) {
         let request = decoded_key_request(w, chord);
         assert_eq!(w.control_response(&request), "1\t9\tok\t", "{chord}");
+    }
+
+    #[test]
+    fn remote_input_context_survives_caret_blinks_but_not_native_menu_changes() {
+        let (mut w, _peer) = file_dialog_fixture();
+        configure(&mut w, 800, 600);
+        w.ui.dispatch(Event::Focus(true)).unwrap();
+        let old = decoded_key_request(&w, "x");
+        let input = w.frames.input_generation().unwrap();
+        let redraw = w.frames.generation().unwrap();
+        for now in [500, 1000, 1500, 2000] {
+            w.tick(now, false).unwrap();
+            assert_eq!(w.frames.input_generation(), Ok(input));
+        }
+        assert_eq!(w.frames.generation(), Ok(redraw + 4));
+        assert_eq!(w.control_response(&old), "1\t9\tok\t");
+        assert_eq!(w.ui.editor().document(1).unwrap().text(), "x");
+        let old = decoded_key_request(&w, "Return");
+        w.chord("F10", false).unwrap();
+        assert!(w
+            .control_response(&old)
+            .contains("\terror\tstale-revision\t"));
+        assert!(w.menu.is_some());
+        assert_eq!(w.ui.editor().document(1).unwrap().text(), "x");
+    }
+
+    #[test]
+    fn remote_pointer_context_survives_blink_with_owned_drag_intact() {
+        let (mut w, _peer) = file_dialog_fixture();
+        configure(&mut w, 800, 600);
+        w.ui.dispatch(Event::Load(b"abcd")).unwrap();
+        w.ui.dispatch(Event::Focus(true)).unwrap();
+        pointer_enter(&mut w);
+        let area = w.ui.geometry().document();
+        remote_pointer(&mut w, "press", area.x, area.y, false);
+        let old = remote_pointer_request(&w, "move", area.x + 16, area.y, false);
+        let input = w.frames.input_generation().unwrap();
+        let redraw = w.frames.generation().unwrap();
+        let owner = w
+            .control_pointer
+            .as_ref()
+            .map(|point| (point.tab, point.revision));
+        w.tick(500, false).unwrap();
+        assert_eq!(w.frames.input_generation(), Ok(input));
+        assert_eq!(w.frames.generation(), Ok(redraw + 1));
+        assert_eq!(
+            w.control_pointer
+                .as_ref()
+                .map(|point| (point.tab, point.revision)),
+            owner
+        );
+        w.ui.editor()
+            .check_revision(w.control_pointer.as_ref().unwrap())
+            .unwrap();
+        assert_eq!(w.control_response(&old), "1\t8\tok\t");
+        assert_eq!(w.ui.editor().document(2).unwrap().selection().caret, 2);
+        assert!(w.control_pointer.is_some());
+        assert!(!w.pointer.held && w.activation_serial.is_none());
+    }
+
+    #[test]
+    fn clipboard_completion_is_not_caret_only_input_damage() {
+        let (mut w, peer, _keyboard, device) = clipboard_fixture();
+        configure(&mut w, 800, 600);
+        drain(&peer);
+        selection_offer(&mut w, device, 0xff00_0010, &[crate::data::UTF8]);
+        decoded_key(&mut w, "C-v");
+        let (_, mut files) = drain(&peer);
+        let mut writer = files.pop().unwrap();
+        let old = decoded_key_request(&w, "x");
+        let input = w.frames.input_generation().unwrap();
+        let redraw = w.frames.generation().unwrap();
+        writer.write_all(b"pasted").unwrap();
+        drop(writer);
+        w.tick(500, true).unwrap();
+        assert!(w.frames.input_generation().unwrap() > input);
+        assert!(
+            w.frames.generation().unwrap() - redraw > w.frames.input_generation().unwrap() - input
+        );
+        assert!(w
+            .control_response(&old)
+            .contains("\terror\tstale-revision\t"));
+        assert_eq!(w.ui.editor().document(1).unwrap().text(), "pasted abc\n");
     }
 
     #[test]
@@ -6579,8 +6664,8 @@ mod tests {
         decoded_key(&mut w, "Escape");
         for (tab, revision, generation, expected) in [
             (1, 1, 0, "invalid-argument"),
-            (9, 1, w.frames.generation().unwrap(), "missing-tab"),
-            (1, 0, w.frames.generation().unwrap(), "stale-revision"),
+            (9, 1, w.frames.input_generation().unwrap(), "missing-tab"),
+            (1, 0, w.frames.input_generation().unwrap(), "stale-revision"),
         ] {
             let request = crate::control::Request::parse(
                 format!("1\t9\tkey\t{tab}\t{revision}\t{generation}\t61").as_bytes(),
@@ -6698,6 +6783,7 @@ mod tests {
         let destination = directory.path("saved");
         let (mut w, peer) = file_dialog_fixture();
         configure(&mut w, 800, 600);
+        w.ui.dispatch(Event::Focus(true)).unwrap();
         w.control = Some(
             crate::control_worker::Worker::start(
                 crate::control_socket::Socket::bind(&socket).unwrap(),
@@ -6708,13 +6794,18 @@ mod tests {
         assert!(state.contains("\tkey-ready=1\t"));
         let generation = state
             .split('\t')
-            .find_map(|field| field.strip_prefix("window-generation="))
+            .find_map(|field| field.strip_prefix("input-generation="))
             .unwrap();
         let command = format!("1\t1\tkey\t1\t0\t{generation}\t78");
+        let redraw = w.frames.generation().unwrap();
+        for now in [500, 1000, 1500] {
+            w.tick(now, false).unwrap();
+        }
+        assert_eq!(w.frames.generation(), Ok(redraw + 3));
         assert_eq!(job_request(&mut w, &peer, &socket, &command), "1\t1\tok\t");
         assert!(job_request(&mut w, &peer, &socket, &command).contains("\terror\tstale-revision\t"));
         assert_eq!(w.ui.editor().document(1).unwrap().text(), "x");
-        let generation = w.frames.generation().unwrap();
+        let generation = w.frames.input_generation().unwrap();
         assert_eq!(
             job_request(
                 &mut w,
@@ -6815,11 +6906,12 @@ mod tests {
         };
         let before = query.response(&w.ui);
         let generation = w.frames.generation().unwrap();
+        let input = w.frames.input_generation().unwrap();
         let response = w.control_response(&query);
         assert_eq!(
             response,
             format!(
-                "{before}\tadapter=native-pointer\tkey-ready=0\tpointer-ready=0\tpointer-drag=-\tnative=0,1,0,0\tmodal=0,0,0,0,0,0,0,0,0\tspelling=-,0\tjob-last=0\tdialog-last=0\tdialog=-\twindow-generation={generation}\tframe-submitted=-\tframe-completed=-"
+                "{before}\tadapter=native-input-context\tkey-ready=0\tpointer-ready=0\tpointer-drag=-\tnative=0,1,0,0\tmodal=0,0,0,0,0,0,0,0,0\tspelling=-,0\tjob-last=0\tdialog-last=0\tdialog=-\tinput-generation={input}\twindow-generation={generation}\tframe-submitted=-\tframe-completed=-"
             )
         );
         assert_eq!(query.response(&w.ui), before);
@@ -9919,7 +10011,7 @@ mod tests {
             assert!(drain(&peer).0.contains(&message(WM, 3, &[100 + id as u32])));
             let response = control_answer(&mut w, client, &peer);
             assert!(response.starts_with(&format!("1\t{id}\tok\t")));
-            assert!(response.contains("\tadapter=native-pointer\t"));
+            assert!(response.contains("\tadapter=native-input-context\t"));
         }
         assert_eq!(w.ui.editor().tabs().count(), 1);
         assert_eq!(w.ui.editor().document(1).unwrap().text(), "");

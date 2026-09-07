@@ -76,8 +76,8 @@ In the examples below, field spaces denote literal Tab separators.
 | `1 ID dialog-answer DIALOG TAB REVISION reload` | Request Reload from a live conflict; dirty text requires a second answer. |
 | `1 ID dialog-answer DIALOG TAB REVISION discard-reload` | Confirm the conflict's second question before replacing unsaved text. |
 | `1 ID dialog-answer DIALOG TAB REVISION save-as HEX_PATH` | Save the conflict target to a new literal destination. |
-| `1 ID key TAB REVISION GENERATION HEX_CHORD` | Deliver one decoded native chord with an exact redraw-generation fence. |
-| `1 ID pointer TAB REVISION GENERATION PHASE X Y EXTEND` | Deliver a bounded pointer press/move/release with the same generation fence. |
+| `1 ID key TAB REVISION GENERATION HEX_CHORD` | Deliver one decoded native chord with an exact input-context fence. |
+| `1 ID pointer TAB REVISION GENERATION PHASE X Y EXTEND` | Deliver a bounded pointer press/move/release with the same input-context fence. |
 | `1 ID text TAB REVISION OFFSET LIMIT` | Read a scalar-aligned UTF-8 page. |
 | `1 ID spelling-results TAB REVISION SCAN OFFSET LIMIT` | Read native spelling status and a scan-pinned range page. |
 | `1 ID wait-frame GENERATION` | Wait for a main-surface callback at or beyond this native redraw generation. |
@@ -494,20 +494,30 @@ other UI modals retain coarse flags and accept decoded keys as specified next.
 
 `1 ID key TAB REVISION GENERATION HEX_CHORD` delivers one logical chord to
 the same native handler as a translated key press. `GENERATION` must be the
-exact current `window-generation` from state, not controller generation or
-a frame callback. It fences native prompt/menu/selection context as well as
-the named active tab/revision. Zero is `invalid-argument`; any different
-generation is `stale-revision`. Redraw invalidations are conservative: caret
-blink, resize, notice changes or other input can make a queued key stale even
-when document bytes did not change. Query again after an explicit refusal;
-never blindly retry a lost reply. An old Return cannot select a newly opened
-menu or answer a later prompt merely because its text revision is unchanged.
+exact current `input-generation` from state, not controller generation,
+`window-generation` or a frame callback. It fences native prompt, menu and
+selection context as well as the named active tab/revision. Zero is
+`invalid-argument`; any different generation is `stale-revision`.
+Input invalidations are conservative: resize, notice changes or other input
+can make a queued key stale even when document bytes did not change. Query
+again after an explicit refusal; never blindly retry a lost reply. An old
+Return cannot select a newly opened menu or answer a later prompt merely
+because its text revision is unchanged.
 Every admitted key invalidates this generation, even when ignored, so obtain
-fresh state before the next key. There is no bounded retry/progress guarantee:
-slow clients or busy turns can repeatedly cross the 500-ms caret-blink boundary
-and starve key admission. Prefer semantic commands where available. A separate
-input-context generation is deferred; this increment keeps the conservative
-fence rather than weakening changed-context rejection.
+fresh state before the next key. Prefer semantic commands where available.
+
+The input counter starts at one and advances on every native redraw
+invalidation except a clock-only caret visibility transition. Idle caret
+blinking therefore does not stale a queued input request. Clock processing
+still fences clipboard completion and any other input/UI change normally;
+text, selection, layout, menu, prompt, notice and job-related damage are not
+exempt. The checked counter never wraps or reuses a value. Exhaustion of
+either input or redraw generation poisons both fences and stops the window.
+The counters may happen to be numerically equal, but are not interchangeable.
+This removes blink-driven starvation, not contention from real context
+changes, and supplies no bounded latency or general admission guarantee.
+Frame submission/callback snapshots and `wait-frame` keep using the separate
+redraw generation, including caret-only redraws.
 
 The chord is 1..=32 UTF-8 bytes in lowercase hex, with no control characters.
 Use names such as `Return`, `Tab`, `Space`, `C-x`, `C-S-s`, or a single
@@ -596,7 +606,7 @@ therefore enter a prompt it cannot dismiss remotely until readiness returns.
 Prompt-entry answers remain later work; do not activate those menu items
 when the client cannot supply ordinary prompt input.
 
-The nonzero exact native-generation fence and active tab/revision admission
+The nonzero exact `input-generation` fence and active tab/revision admission
 match decoded keys. The named active tab is the input context, not necessarily
 the tab hit by a tab-strip click. Hit testing resolves that tab under the
 same fence. Counter admission conservatively reserves eight possible dispatches
@@ -615,7 +625,7 @@ A changed point refuses with its model error, and a lost controller gesture
 is `unavailable`; a fresh Press can replace it. Release ends the remote drag.
 Without an owned remote gesture, Move may hover a menu and Release is ignored;
 neither may continue an existing physical drag. Each request still needs fresh
-native-generation admission; the gesture is not a generation bypass.
+input-generation admission; the gesture is not a generation bypass.
 
 Remote input cancels prior physical drag/wheel/repeat/Paste context, including
 the adapter's remembered held flag. It never changes the physical pointer's
@@ -925,6 +935,9 @@ it; multiple invalidations can coalesce into one submitted frame, so values
 may be skipped in the submitted/completed streams. This is separate from
 the controller's `generation` and is not a version of every native job flag.
 It is local to one window lifetime, not durable across endpoint restarts.
+Exhaustion of either input or redraw generation poisons both fences,
+including `wait-frame`, and stops the window. Multiple invalidations in one
+clock turn may advance the redraw counter more than once.
 
 `wait-frame GENERATION` requires `1..=window-generation` at UI admission.
 Zero or a future value is `invalid-argument`. The request has no side effects,
@@ -1035,7 +1048,7 @@ this order. Error responses are unchanged:
 
 | Field | Value |
 | --- | --- |
-| `adapter=native-pointer` | Explicit implemented adapter identity. |
+| `adapter=native-input-context` | Explicit implemented adapter identity. |
 | `key-ready=0\|1` | Native key availability, before target/generation/counter validation. |
 | `pointer-ready=0\|1` | Native pointer availability, before target/generation/counter validation. |
 | `pointer-drag=TAB,REVISION` or `-` | Valid remote drag, never a physical gesture. |
@@ -1046,6 +1059,7 @@ this order. Error responses are unchanged:
 | `job=...` (repeated) | Up to 64 ordered spelling/Open/Save/Save As/Reload/Dictionary rows. |
 | `dialog-last=N` | Largest admitted close/conflict/path ID, or zero. |
 | `dialog=...` | Live close/conflict/path scope/phase/target/allowed answers, or `-`. |
+| `input-generation=N` | Current native input-context generation; excludes caret-only ticks. |
 | `window-generation=N` | Current native redraw-invalidation generation. |
 | `frame-submitted=...` | Last submitted snapshot, or `-`. |
 | `frame-completed=...` | Last callback-completed snapshot, or `-`. |
@@ -1059,7 +1073,8 @@ Replace, numeric and command entry. No path or entry text
 is disclosed by these added fields. Query `text` separately for document
 bytes. Controller generation does not cover native-only modal/job changes,
 and is not a submitted/callback-completed frame generation. Clients must not
-use it as a native snapshot version or presentation fence. Use the separate
+use it as a native snapshot version or presentation fence. Use
+`input-generation` for decoded keys/pointers and the separate
 `window-generation` with `wait-frame` under the frame contract above.
 
 On ordinary window exit, stop and join the worker and explicitly attempt

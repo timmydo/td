@@ -69,6 +69,18 @@ fn source_inventory_and_allowances_are_closed() {
         let name = entry.file_name().into_string().unwrap();
         actual.insert(name.clone());
         let text = std::fs::read_to_string(entry.path()).unwrap();
+        if !matches!(name.as_str(), "wayland.rs" | "control_frame.rs") {
+            assert_eq!(
+                identifier_count(&text, "Frames"),
+                0,
+                "frame owner in {name}"
+            );
+            assert_eq!(
+                identifier_count(&text, "invalidate_caret"),
+                0,
+                "caret bypass in {name}"
+            );
+        }
         if !matches!(
             name.as_str(),
             "keyboard.rs"
@@ -341,6 +353,44 @@ fn control_worker_keeps_bounded_nonblocking_transport_separate_from_editor_state
 }
 
 #[test]
+fn only_native_caret_ticks_bypass_the_input_context_fence() {
+    let ui = include_str!("../src/ui.rs");
+    assert!(ui.contains(concat!(
+        "Event::Tick(now) => {\n",
+        "                if now < self.clock {\n",
+        "                    return Err(Error::InvalidArgument);\n",
+        "                }\n",
+        "                let visible = self.focused && ((now - self.blink_start) / 500).is_multiple_of(2);\n",
+        "                self.clock = now;\n",
+        "                let changed = visible != self.caret_visible;\n",
+        "                self.caret_visible = visible;\n",
+        "                Ok(if changed {\n",
+        "                    Outcome::Changed\n",
+        "                } else {\n",
+        "                    Outcome::Ignored\n",
+        "                })\n",
+        "            }"
+    )));
+    let source = include_str!("../src/wayland.rs");
+    let production = source.split("#[cfg(test)]").next().unwrap();
+    assert_eq!(
+        production.matches("self.frames.invalidate_caret(").count(),
+        1
+    );
+    let tick = production.split("fn tick(").nth(1).unwrap();
+    let tick = tick.split("\n    fn ").next().unwrap();
+    assert!(tick.contains(concat!(
+        "let before = self.ui.generation();\n",
+        "        self.ui.dispatch(Event::Tick(now)).map_err(error)?;\n",
+        "        self.frames.invalidate_caret(self.ui.generation() != before);\n",
+        "        self.clock = now;\n",
+        "        let before = self.ui.generation();\n",
+        "        self.clipboard_tick(now, repeat)?;\n",
+        "        self.frames.invalidate(self.ui.generation() != before);"
+    )));
+}
+
+#[test]
 fn native_control_is_opt_in_and_liveness_checked_with_bounded_outer_turns() {
     let source = include_str!("../src/wayland.rs");
     let production = source.split("#[cfg(test)]").next().unwrap();
@@ -419,7 +469,7 @@ fn native_control_is_opt_in_and_liveness_checked_with_bounded_outer_turns() {
     let mut prior = 0;
     for guard in [
         "control_key_available()",
-        "generation != self.frames.generation()?",
+        "generation != self.frames.input_generation()?",
         "revision_point(target.tab, target.revision)",
         "self.ui.editor().active() != Some(target.tab)",
         "validate_chord(chord)?",
@@ -486,7 +536,7 @@ fn native_control_is_opt_in_and_liveness_checked_with_bounded_outer_turns() {
     let mut prior = 0;
     for guard in [
         "control_pointer_available()",
-        "generation != self.frames.generation()?",
+        "generation != self.frames.input_generation()?",
         "revision_point(tab, revision)",
         "self.ui.editor().active() != Some(tab)",
         "check_revision(gesture)",

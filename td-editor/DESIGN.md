@@ -34,7 +34,7 @@ and explicit second-stage discard-before-Reload are connected, with bounded
 Reload outcomes. Ordinary Open/Save As/Dictionary path prompts also have
 revision-bound remote answers; Dictionary jobs report bounded outcomes.
 Decoded key control drives editing, menus, Find, Replace, numeric and command
-entry with an exact native redraw-generation fence. It requires real input
+entry with an exact native input-context fence. It requires real input
 readiness and cannot answer file/close/conflict flows. Decoded pointer
 press/move/release share native hit testing with separately tracked remote
 drags; wheel control remains deferred. Other UI prompts still expose only
@@ -2195,7 +2195,7 @@ ID, and conflict-driven Save As gets a fresh independent path ID. CONTROL.md
 defines scope, lifetime, counter exhaustion, reply ambiguity and failure
 semantics. Decoded key control now invokes the same native chord handler,
 including menu/Find/Replace/numeric/command input. It requires configured,
-focused and synchronized real keyboard state plus an exact native redraw
+focused and synchronized real keyboard state plus an exact native input-context
 generation and active tab/revision. This prevents a delayed key from silently
 acting on changed native input context. File/close/conflict flows refuse all
 decoded keys and require their explicit live dialog answers. No synthetic
@@ -2206,11 +2206,15 @@ row. CONTROL.md pins grammar, generation/availability guards, conservative
 counter admission, cleanup and reply ambiguity. Native adapter errors latch a
 fatal state and stop further control/drawing before nonzero shutdown, just as
 physical input does; a partially written Wayland message cannot be resumed.
-The redraw fence may starve slow clients across caret blinks; it promises no
-bounded admission progress. A separate input-context fence is deferred.
-Decoded pointer press/move/
-release also pin the native generation and active tab/revision, require a
-real pointer enter, and use the shared native hover/hit-testing path. They do
+Input and redraw generations are separate checked counters starting at one.
+Only clock-only caret visibility changes skip input invalidation; clipboard
+completion, selection, layout and native prompt/menu/notice changes still
+invalidate it. Idle blinks cannot starve input admission. Exhaustion of either
+counter poisons both, and frame snapshots/waits keep the redraw generation.
+Other context changes can still stale input; bounded progress is not promised.
+Decoded pointer press/move/release also pin the input generation and active
+tab/revision, require a real pointer enter, and use the shared native
+hover/hit-testing path. They do
 not move the physical cursor or manufacture its coordinates/serials. A
 separate owner-bound remote drag can continue only the controller gesture it
 started; physical input and ordinary input cancellation end it. Native modals
