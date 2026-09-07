@@ -18,7 +18,7 @@ const MAX_DESCRIPTOR: usize = 4096;
 const WRITE: u8 = 1;
 const READ: u8 = 2;
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Eq, PartialEq)]
 pub struct Device {
     index: u8,
     inode: u64,

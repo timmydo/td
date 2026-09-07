@@ -910,3 +910,113 @@ human consent flow. Paired generation activation remains pending in
 
 The disposable root fixture also runs `lock-session` against a seeded
 portal-owned runtime key and requires successful exit with the key absent.
+
+## Private enrollment worker
+
+`enroll-operation --uid UID` uses the private unlock worker's root startup,
+unnamed socketpair, descriptor inventory, bounded framing and deadline
+checks. It is a private child entry, with no human CLI or automatic caller.
+The first canonical request must select Enroll, SHA-256 PCR 7, one explicit
+recovery policy, and CreatePrimary for the configured session owner. The root
+parent supplies the fresh unpredictable nonce. This increment does not
+activate enrollment or remove the interim console/boot paths.
+
+The child clears any runtime release before receiving the request, retains
+the installed store's exclusive lock, and refuses an already token-enrolled
+store. It generates a fresh opaque 32-byte user handle for both tokens. Each
+step sends `10`, a fresh private 32-byte round and its complete description,
+and requires `11` plus exactly that round and description before token I/O.
+All descriptions retain the initial nonce, owner, platform and recovery
+policy; only the step advances, in this fixed order:
+
+1. CreatePrimary: wait for exactly one connected token, negotiate getInfo,
+   then makeCredential with a challenge bound to this displayed step.
+2. ProvePrimary: retain the same token session and creation response, make a
+   fresh assertion, and verify its signature and signed presence through
+   the TPM before obtaining a Credential value.
+3. CreateRecovery, only for SecondToken: release the primary device session,
+   wait for a different device node, and create with the proved primary ID
+   in the mandatory exclusion list.
+4. ProveRecovery: prove the new credential on that same recovery session.
+
+Each challenge is SHA-256 of `td-secret/presented-enrollment/v1`, a zero
+byte, and the complete canonical description, so roles, steps and recovery
+policy cannot share an assertion. Device-node equality is a transport hint,
+not token identity. Replugging the original token may change that hint, but
+its possession of the excluded primary credential must still refuse normal
+CTAP creation. Metadata additionally refuses equal IDs or public keys. An
+untrusted token's own implementation remains part of the physical-token
+trust assumption; USB discovery cannot prove two separate pieces of hardware.
+
+Read-only discovery waits up to 100 ms between bounded passes until one
+eligible node appears. During recovery it excludes the retained primary
+node before counting candidates, so inserting the recovery token alongside
+the primary is supported. More than one new eligible node refuses. No CTAP request retries after uncertain
+delivery. A failure can leave an unused credential on a token, but never
+publishes a partially proved enrollment. Primary and recovery token sessions
+are separate, with only one open at a time. The entire operation, including
+all touches, token replacement, acknowledgements and TPM work, shares the
+existing 120-second lifetime; this is not a new window per step. The root
+supervisor must enforce that deadline and kill/reap before cleanup if a TPM
+call blocks. Child cooperative checks alone do not enforce a blocked syscall.
+
+After the final proof the child constructs metadata and validates distinct
+credential IDs and keys before requesting a separate `12`/`13` commit round
+bound to that final step. Only that acknowledgement permits the existing
+atomic token enrollment. This round is a private execution decision, not
+another presentation or touch: the caller consumes the final step's completed
+presentation receipt and serializes cancellation against the decision. The
+already presented description names enrollment, platform and recovery policy;
+no new prompt is rendered for the commit round. An existing TPM-only master is
+unsealed privately for migration, never published to the portal. The child
+sends `14` on success and clears runtime release on every ordinary return,
+including success. The parent must also observe successful child exit before
+reporting enrollment complete. Enrollment does not implicitly unlock a
+session, and no token response, credential ID, secret or master travels on
+this channel. Parent loss, cancellation and deadline require the same
+retained-child teardown duties as unlock. A future compositor step transition
+must invalidate the previous receipt and fully present the exact next request
+before acknowledging it; this worker does not widen the current renderer's
+one-prompt attention contract.
+
+Socket oracles exercise both recovery policies and omit or alter every step
+and commit acknowledgement. They prove that no corresponding device call or
+publication occurs, and that successful steps retain the primary credential
+and bind separate challenges. An independent SHA-256 vector pins the complete
+challenge encoding. These tests use the actual private framing and operation
+sequence with a fake device; existing enrollment/TPM fixtures cover the
+cryptographic composition. Neither is evidence of a physical token touch.
+
+The marked disposable root fixture also exercises the production enrollment
+entry on actual unnamed root socketpairs. For both unlock and enrollment,
+initial EOF, truncation, malformed descriptions, a wrong owner, an unknown
+operation and a valid request without installed store state must refuse and
+remove the seeded portal-owned key. The existing explicit lock command is
+checked alongside each entry. These fourteen cases need no TPM or token.
+
+
+A failure after persistent publication does not mean the store is unenrolled.
+Lost final delivery, late exit observation or cleanup failure can leave a fully
+proved, enrolled store locked while the operation reports failure. The caller
+must treat that completion as indeterminate, inspect current protector state
+through a new admitted read-only operation, and offer a fresh unlock when it
+is token protected. It must not retry enrollment as replacement or infer that
+the old TPM-only master survives. Merely observing token-protected state does
+not prove that this particular attempt succeeded. The compositor activation
+must implement this reconciliation; this private worker exposes no query UI.
+
+Production hardware wiring is parameterized over discovery, token sessions
+and the TPM transport factory solely so ordinary fixtures can exercise the
+same creation/proof path. The physical implementation still opens only the
+existing fixed root device surfaces. Tests inspect the actual recovery
+makeCredential CBOR exclusion list, prove separate session ownership, and
+cover empty, primary-only, primary-plus-recovery and ambiguous discovery.
+The test TPM accepts structurally valid verification packets as a wiring
+stand-in; the separate pinned-emulator oracles establish real signature
+verification. Fixtures additionally prove metadata refusal precedes the
+commit invitation and lost completion does not undo a completed publication.
+The root startup oracle's fourteen executions contain twelve distinct cases:
+the explicit lock command is intentionally exercised alongside both workers.
+It proves startup refusal and relocking, not production token I/O or presented
+enrollment. The in-process framing and hardware-wiring oracles cover those
+separate boundaries without claiming a physical touch.

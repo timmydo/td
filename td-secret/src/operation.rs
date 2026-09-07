@@ -10,15 +10,19 @@ use std::time::{Duration, Instant};
 
 const LIMIT: usize = 289;
 const FRAME_TIME: Duration = Duration::from_secs(5);
-const OPERATION_TIME: Duration = fido_device::MAX_LIFETIME;
+pub(super) const OPERATION_TIME: Duration = fido_device::MAX_LIFETIME;
 
-struct Wire {
+pub(super) struct Wire {
     stream: UnixStream,
     deadline: Instant,
 }
 
 impl Wire {
-    fn new(stream: UnixStream, deadline: Instant) -> Result<Self, String> {
+    pub(super) fn deadline(&self) -> Instant {
+        self.deadline
+    }
+
+    pub(super) fn new(stream: UnixStream, deadline: Instant) -> Result<Self, String> {
         stream
             .set_nonblocking(false)
             .map_err(|_| "set blocking operation endpoint")?;
@@ -65,7 +69,7 @@ impl Wire {
         self.frame_remaining(deadline).map(|_| ())
     }
 
-    fn receive(&mut self) -> Result<Vec<u8>, String> {
+    pub(super) fn receive(&mut self) -> Result<Vec<u8>, String> {
         let deadline = self.frame_deadline()?;
         let mut header = [0; 2];
         self.read(&mut header, deadline)?;
@@ -78,7 +82,7 @@ impl Wire {
         Ok(bytes)
     }
 
-    fn send(&mut self, bytes: &[u8]) -> Result<(), String> {
+    pub(super) fn send(&mut self, bytes: &[u8]) -> Result<(), String> {
         if bytes.is_empty() || bytes.len() > LIMIT {
             return Err("invalid operation frame length".into());
         }
@@ -114,7 +118,7 @@ impl Wire {
         self.frame_remaining(deadline).map(|_| ())
     }
 
-    fn acknowledge(
+    pub(super) fn acknowledge(
         &mut self,
         tag: u8,
         answer: u8,
@@ -136,14 +140,14 @@ impl Wire {
     }
 }
 
-fn remaining(deadline: Instant) -> Result<Duration, String> {
+pub(super) fn remaining(deadline: Instant) -> Result<Duration, String> {
     deadline
         .checked_duration_since(Instant::now())
         .filter(|duration| !duration.is_zero())
         .ok_or_else(|| "private token operation expired".into())
 }
 
-fn startup() -> Result<UnixStream, String> {
+pub(super) fn startup() -> Result<UnixStream, String> {
     store::require_root()?;
     let mut status = String::new();
     File::open("/proc/self/status")
@@ -462,49 +466,61 @@ mod tests {
             fs::create_dir_all(path).unwrap();
             fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
         }
-        for case in 0..6 {
-            let key = "/run/td-secret/1000/key";
-            fs::write(key, [0u8; 64]).unwrap();
-            fs::set_permissions(key, fs::Permissions::from_mode(0o600)).unwrap();
-            std::os::unix::fs::fchown(File::open(key).unwrap(), Some(991), Some(991)).unwrap();
-            let (mut parent, child) = UnixStream::pair().unwrap();
-            let verb = if case == 5 {
-                "lock-session"
-            } else {
-                "unlock-operation"
-            };
-            let mut process = Command::new("/bin/td-secret")
-                .args([verb, "--uid", "1000"])
-                .stdin(Stdio::from(OwnedFd::from(child)))
-                .stdout(Stdio::inherit())
-                .stderr(Stdio::inherit())
-                .env_clear()
-                .current_dir("/")
-                .spawn()
-                .unwrap();
-            match case {
-                0 | 5 => {}
-                1 => parent.write_all(&[0, 47, 1]).unwrap(),
-                2 => parent.write_all(&[0, 1, 255]).unwrap(),
-                _ => {
-                    let mut bytes = request().encode();
-                    if case == 3 {
-                        bytes[43] = 233;
-                    } else {
-                        bytes[44] = 255;
+        for command in ["unlock-operation", "enroll-operation"] {
+            for case in 0..7 {
+                let key = "/run/td-secret/1000/key";
+                fs::write(key, [0u8; 64]).unwrap();
+                fs::set_permissions(key, fs::Permissions::from_mode(0o600)).unwrap();
+                std::os::unix::fs::fchown(File::open(key).unwrap(), Some(991), Some(991)).unwrap();
+                let (mut parent, child) = UnixStream::pair().unwrap();
+                let verb = if case == 5 { "lock-session" } else { command };
+                let mut process = Command::new("/bin/td-secret")
+                    .args([verb, "--uid", "1000"])
+                    .stdin(Stdio::from(OwnedFd::from(child)))
+                    .stdout(Stdio::inherit())
+                    .stderr(Stdio::inherit())
+                    .env_clear()
+                    .current_dir("/")
+                    .spawn()
+                    .unwrap();
+                match case {
+                    0 | 5 => {}
+                    1 => parent.write_all(&[0, 47, 1]).unwrap(),
+                    2 => parent.write_all(&[0, 1, 255]).unwrap(),
+                    _ => {
+                        let mut bytes = if command == "enroll-operation" {
+                            consent::Request::new(
+                                [42; 32],
+                                1000,
+                                consent::Operation::Enroll {
+                                    platform: consent::Platform::TpmPcr7,
+                                    recovery: consent::Recovery::SecondToken,
+                                    step: consent::Enrollment::CreatePrimary,
+                                },
+                            )
+                            .unwrap()
+                            .encode()
+                        } else {
+                            request().encode()
+                        };
+                        if case == 3 {
+                            bytes[43] = 233;
+                        } else if case == 4 {
+                            bytes[44] = 255;
+                        }
+                        parent
+                            .write_all(&(bytes.len() as u16).to_be_bytes())
+                            .unwrap();
+                        parent.write_all(&bytes).unwrap();
                     }
-                    parent
-                        .write_all(&(bytes.len() as u16).to_be_bytes())
-                        .unwrap();
-                    parent.write_all(&bytes).unwrap();
                 }
+                drop(parent);
+                assert_eq!(process.wait().unwrap().success(), case == 5);
+                assert!(
+                    !std::path::Path::new(key).exists(),
+                    "command {command} case {case} retained a key"
+                );
             }
-            drop(parent);
-            assert_eq!(process.wait().unwrap().success(), case == 5);
-            assert!(
-                !std::path::Path::new(key).exists(),
-                "case {case} retained a key"
-            );
         }
     }
 
