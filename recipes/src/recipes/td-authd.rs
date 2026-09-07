@@ -2,6 +2,8 @@ use crate::ladder::{split_target_debug, target_rustc};
 use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 
 const SOURCES: &[(&str, &str)] = &[
+    ("src/session.rs", include_str!("../../../td-authd/src/session.rs")),
+    ("tests/session.rs", include_str!("../../../td-authd/tests/session.rs")),
     ("src/unlock.rs", include_str!("../../../td-authd/src/unlock.rs")),
     ("tests/unlock.rs", include_str!("../../../td-authd/tests/unlock.rs")),
     ("src/consent.rs", include_str!("../../../td-authd/src/consent.rs")),

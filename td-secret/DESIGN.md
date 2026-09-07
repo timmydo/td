@@ -799,7 +799,7 @@ survive unchanged. It never runs by default on the development host.
 ## Private unlock worker
 
 `unlock-operation --uid UID` is a root-only child controller for the
-future paired authority. It requires single-threaded startup, only
+paired authority session extension. It requires single-threaded startup, only
 standard inherited descriptors, and an unnamed root-owned socketpair on
 stdin; neither log descriptor may duplicate the child endpoint inode.
 The descriptor-directory iterator observes itself as fd 3, after
@@ -882,9 +882,10 @@ host tests never run this fixture.
 The private root-only `lock-session --uid UID` entry invokes the existing
 volatile-session lock directly, before any persistent-store access. It
 accepts only a canonical human UID and requires root through that API.
-The authority's child supervisor uses it only after killing and reaping
-an abandoned unlock child; reversing that order would permit a late
-publication after cleanup. This entry grants no secret access and has no
+The authority uses it for generation preparation and teardown as well
+as after killing and reaping an abandoned unlock child. Cleanup never
+replaces a still-owned unlock worker; reversing that order would permit
+a late publication after cleanup. This entry grants no secret access and has no
 human consent flow. Paired generation activation remains pending in
 `td-authd/DESIGN.md`.
 

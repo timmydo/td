@@ -306,6 +306,7 @@ enum Request {
     Start,
     Poll(u64),
     Heartbeat,
+    Secret(crate::session::Request),
 }
 
 fn request(bytes: &[u8]) -> Result<Request, String> {
@@ -320,6 +321,7 @@ fn request(bytes: &[u8]) -> Result<Request, String> {
             Ok(Request::Poll(handle))
         }
         [3] => Ok(Request::Heartbeat),
+        [0x10..=0x15, ..] => Ok(Request::Secret(crate::session::Request::decode(bytes)?)),
         _ => Err("invalid terminal authority request".into()),
     }
 }
@@ -341,6 +343,7 @@ impl Launches {
 
     fn answer(&mut self, config: &Config, request: Request) -> Result<Vec<u8>, String> {
         match request {
+            Request::Secret(_) => Err("secret request reached terminal dispatcher".into()),
             Request::Heartbeat => Ok(vec![0x83]),
             Request::Start => {
                 if self.children.len() >= LIMIT {
@@ -394,10 +397,25 @@ pub(crate) fn serve(mut channel: Channel, config: Config) -> Result<(), String> 
     check_session(&config)?;
     let mut launches = Launches::new(generation()?);
     channel.send(&[0x80]).map_err(|e| e.to_string())?;
-    loop {
-        let request = request(&channel.receive().map_err(|e| e.to_string())?)?;
-        let answer = launches.answer(&config, request)?;
-        channel.send(&answer).map_err(|e| e.to_string())?;
+    let mut secrets = crate::session::Session::new(config.owner)?;
+    let result = (|| -> Result<(), String> {
+        loop {
+            let request = request(&channel.receive().map_err(|e| e.to_string())?)?;
+            let answer = match request {
+                Request::Secret(request) => secrets.answer(request)?,
+                request => {
+                    secrets.tick()?;
+                    launches.answer(&config, request)?
+                }
+            };
+            channel.send(&answer).map_err(|e| e.to_string())?;
+        }
+    })();
+    let cleanup = secrets.close();
+    match (result, cleanup) {
+        (Err(reason), Err(cleanup)) => Err(format!("{reason}; {cleanup}")),
+        (result, Ok(())) => result,
+        (Ok(()), Err(cleanup)) => Err(cleanup),
     }
 }
 

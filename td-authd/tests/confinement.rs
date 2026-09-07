@@ -35,6 +35,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
             "main.rs",
             "mount_sys.rs",
             "portal_files.rs",
+            "session.rs",
             "sys.rs",
             "unlock.rs"
         ]
@@ -48,6 +49,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
         ("sys.rs", 4),
         ("launch.rs", 0),
         ("unlock.rs", 0),
+        ("session.rs", 0),
         ("mount_sys.rs", 4),
         ("portal_files.rs", 0),
     ] {
@@ -69,10 +71,13 @@ fn the_production_source_and_raw_boundary_are_closed() {
             "println!",
             "eprintln!",
         ] {
-            let child_api = matches!(name, "launch.rs" | "application.rs" | "unlock.rs")
-                && ["::Command", "::thread", ".spawn(", ".exec("].contains(&forbidden);
-            let mapping_child_api =
-                matches!(name, "portal_files.rs" | "application_files.rs") && ["::Command", ".spawn("].contains(&forbidden);
+            let child_api = matches!(
+                name,
+                "launch.rs" | "application.rs" | "unlock.rs" | "session.rs"
+            ) && ["::Command", "::thread", ".spawn(", ".exec("]
+                .contains(&forbidden);
+            let mapping_child_api = matches!(name, "portal_files.rs" | "application_files.rs")
+                && ["::Command", ".spawn("].contains(&forbidden);
             if !child_api && !mapping_child_api {
                 assert!(!source.contains(forbidden), "{name}: {forbidden}");
             }
@@ -84,9 +89,24 @@ fn the_production_source_and_raw_boundary_are_closed() {
         "shared consent changed: reconcile td-secret/src/main.rs, compositor confinement and this pin"
     );
     assert_eq!(
-        fingerprint(include_str!("../src/unlock.rs").split("#[cfg(test)]").next().unwrap()),
-        0x47eff8b6678ed7c9,
+        fingerprint(
+            include_str!("../src/unlock.rs")
+                .split("#[cfg(test)]")
+                .next()
+                .unwrap()
+        ),
+        0x1cb0f1e8581e48e9,
         "private unlock supervisor changed"
+    );
+    assert_eq!(
+        fingerprint(
+            include_str!("../src/session.rs")
+                .split("#[cfg(test)]")
+                .next()
+                .unwrap()
+        ),
+        0xcfef94a2fc023999,
+        "paired secret controller changed"
     );
     let application = include_str!("../src/application.rs")
         .split("#[cfg(test)]")
@@ -212,11 +232,31 @@ fn the_production_source_and_raw_boundary_are_closed() {
     assert_eq!(files.matches("mount_sys::publish(").count(), 1);
     let application_files = include_str!("../src/application_files.rs");
     assert_eq!(fingerprint(application_files), 0x3cec66b5b2025b31);
-    assert_eq!(application_files.matches("mount_sys::clone_directory(").count(), 1);
-    assert_eq!(application_files.matches("mount_sys::application_attributes(").count(), 1);
+    assert_eq!(
+        application_files
+            .matches("mount_sys::clone_directory(")
+            .count(),
+        1
+    );
+    assert_eq!(
+        application_files
+            .matches("mount_sys::application_attributes(")
+            .count(),
+        1
+    );
     assert_eq!(application_files.matches("mount_sys::publish(").count(), 1);
-    assert_eq!(application_files.matches("application::admitted_uid(").count(), 2);
-    assert_eq!(application_files.matches("Command::new(\"/bin/umount\")").count(), 1);
+    assert_eq!(
+        application_files
+            .matches("application::admitted_uid(")
+            .count(),
+        2
+    );
+    assert_eq!(
+        application_files
+            .matches("Command::new(\"/bin/umount\")")
+            .count(),
+        1
+    );
     let channel = include_str!("../src/channel.rs");
     assert_eq!(channel.matches("sys::prepare(").count(), 1);
     assert_eq!(channel.matches("sys::receive(").count(), 1);
@@ -234,7 +274,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
     // Pin startup as well as raw code: aliases can evade API-name scans.
     assert_eq!(
         fingerprint(main),
-        0x24d2e316b17225c4,
+        0x672cd381940b88e7,
         "main.rs: production startup changed"
     );
     assert_eq!(
@@ -252,4 +292,4 @@ fn fingerprint(source: &str) -> u64 {
     })
 }
 
-const LAUNCH_FINGERPRINT: u64 = 0x669bfcca5d49e145;
+const LAUNCH_FINGERPRINT: u64 = 0xac770e461e98fb85;

@@ -1,8 +1,9 @@
 # td-authd
 
-This supplies the private channel and fixed terminal-launch prerequisite for
-secure attention and subsequent one-operation elevation. It enables no secret
-access, FIDO2 release, consent prompt, or public request listener. The image
+This supplies the private channel, fixed terminal launcher and root side of
+one-operation token release. The compositor does not yet invoke its secret
+session extension; no graphical authentication flow or public request
+listener is enabled. The image
 starts it paired with the dedicated compositor and uses its terminal launcher.
 The eventual operation policy follows APPLICATIONS.md §L.1 and principle 7:
 one named operation, typed and descriptor-pinned arguments, one protected
@@ -755,8 +756,9 @@ tests assert the complete public argument display.
 
 These are structural checks, not caller admission or proof of
 randomness. The private root unlock worker in `td-secret/DESIGN.md`
-consumes this codec. Its paired-authority caller and compositor receipt
-integration are not activated; there is no public operation listener.
+consumes this codec. The paired authority exposes its typed private
+session extension; the compositor receipt integration is not activated; there is no
+public operation listener.
 The future authority must pin the requester and credential input, admit
 the application from deployment policy, own an immutable operation under
 its fresh nonce, and bind its token challenge to the complete canonical
@@ -769,8 +771,9 @@ renderer and its current unconsumed receipt API are specified in
 ## Private unlock child supervision prerequisite
 
 `unlock.rs` owns one root-private `td-secret unlock-operation --uid
-1000` child. The paired service does not call this controller yet; this
-is the supervision prerequisite for its compositor receipt integration.
+1000` child. The paired service calls this controller through the
+private session extension below. The compositor receipt integration
+remains the activation prerequisite.
 There is no public listener, automatic release, or new keyboard
 authorization. The live caller must enforce root startup and
 paired-session admission before constructing the production controller.
@@ -835,7 +838,7 @@ relocking before dropping it. The paired supervisor must kill/reap the
 prior process group and successfully clear its session runtime before
 admitting a replacement generation. SIGKILL after publication still
 requires that generation cleanup. These caller duties remain mandatory
-for activation; this unused controller alone does not establish them.
+for activation; the controller alone does not establish them.
 
 Tests run actual exec children through the same sanitizer and socket
 controller. They cover both round acknowledgements, failed exit after
@@ -853,3 +856,104 @@ starts the actual controller against a missing persistent store and
 proves the child refusal is followed by successful real cleanup, no
 presentation or release event, and removal of a seeded portal-owned
 runtime key.
+
+## Paired secret session extension
+
+After root startup, sender-pidfd greeting and the existing immutable
+account/ledger admission, the paired authority owns exactly one Session
+for the configured human UID 1000. Its TDLA001 protocol gains the exact
+requests below; the existing terminal client does not send them yet.
+No new socket or public listener is created. Only the pinned compositor
+process may send these records. None contains a credential, token
+assertion, private worker round, caller-selected executable or path.
+
+| Request | Response |
+| --- | --- |
+| `10` prepare this generation | `90` cleanup started |
+| `11` poll session | `91` plus status and, for operation statuses, the full canonical description |
+| `12 01` primary unlock, `12 02` recovery unlock | `92` plus the root-generated canonical description |
+| `13` plus canonical description | `93` presentation acknowledged |
+| `14` plus canonical description | `94` commit queued |
+| `15` plus the nonzero 32-byte operation nonce | `95 00` stopping, `95 01` already completed, or `95 02` already failed/relocked |
+
+Session status is 0 unprepared, 1 preparing, 2 idle, 3 operation waiting,
+4 presentation required, 5 commit required, 6 completed, or 7 failed
+and successfully relocked. Idle does not assert locked state: a
+completed unlock leaves its released key until generation cleanup.
+Statuses 3 through 7 include exactly the retained public description.
+Polling a terminal status retires that one operation; a lost response
+ends the generation, never permits retry. Terminal heartbeats also poll
+the child and enforce watchdogs but do not consume its result. The
+compositor must continue ordinary heartbeats or requests within the
+transport deadline, including throughout a token wait. During preparation
+and an outstanding operation it must additionally poll secret status at
+least every 250 ms; terminal heartbeats alone do not deliver invitations.
+A heartbeat may start the supervisor's three-second acknowledgement
+window while retaining its invitation for the next secret poll. Neither
+polling nor heartbeat traffic renews that window. All helper deadlines
+bound observed completion, not an unobservable earlier exit time; a peer
+that delays observation beyond them fails the generation even if the
+helper has already exited.
+
+Prepare is single use. It runs only the fixed root `td-secret
+lock-session --uid 1000` helper with an empty environment, root cwd,
+and null standard descriptors. Polling requires successful observed
+exit within two seconds before admitting any unlock. Expiry kills and
+retains the child until reaping; failed cleanup ends the generation.
+This does not open a persistent store or access hardware. A new operation
+requires completed preparation and no retained predecessor, including
+an unpolled completion. Root generates its nonce and fixes its owner;
+the peer selects only the primary or recovery role. The existing worker
+refuses a store that is not token protected.
+
+Acknowledgements must exactly match the immutable description and the
+supervisor phase/deadline. Cancellation must match the active nonce and
+is applied before any further child poll. Queueing commit is the root
+execution decision: cancellation after the worker receives it cannot
+undo an already completed release. A presentation or commit
+acknowledgement reports the queued transition,
+not token success. Cancellation against a retained terminal result
+reports that result explicitly and preserves it. A stopping response
+requires subsequent polling for final cleanup; it is not proof that the
+worker has already stopped. Only status 6 follows the
+final worker response and successful observed exit. Repeated or stale
+acknowledgements, unknown cancellation, malformed records and overlapping
+operations end the paired generation, as terminal protocol errors do.
+
+On any channel or dispatch failure after preparation was attempted,
+the authority closes the private worker endpoint, kills and waits for
+its retained direct child, then runs explicit runtime-key cleanup,
+including after a completed unlock or the operation's own cleanup error.
+It does not replay that internal error instead of attempting final
+cleanup. Successful wait proves death even when the earlier kill failed;
+an unreapable child refuses cleanup rather than permitting a late
+publication. It accepts no more requests during teardown. Blocking wait
+is confined to this already-failed peer path. Cleanup polls are bounded
+but may retain a killed task indefinitely in kernel sleep; td-svc owns
+the enclosing service containment and refuses a replacement while it is
+populated. Root authority workers remain in that containment, unlike
+terminals intentionally handed to the human session. SIGKILL cannot run
+this cleanup, so the next compositor generation must complete Prepare
+before device/input admission or any secret request. That activation
+ordering is mandatory for the upcoming compositor integration.
+
+This extension stages the root API. The current compositor uses only
+terminal records and keeps secure attention inert. Before sending the
+new records, its client must bind a physical attention lifetime to one
+immutable presentation receipt, serialize observed cancellation against
+commit and withhold input admission until generation cleanup succeeds.
+The root verifies the authenticated peer and exact public description;
+it cannot independently observe the peer's framebuffer. A matching
+public byte string alone is not evidence of presentation or token touch.
+
+Host exec tests cover preparation before admission, failed/missing/stalled
+cleanup, one retained operation, bound presentation and commit records,
+and nonconsuming heartbeat polls. The ignored root fixture
+`session::tests::root_session_preparation_failure_and_generation_exit_relock`
+requires the marked disposable VM and production `/bin/td-secret`. It
+proves preparation removes a seeded runtime key, a missing persistent
+store never reaches presentation, failed-operation cleanup completes,
+and generation teardown removes a newly seeded key. This fixture calls
+the actual session controller; the separate channel fixtures prove
+sender authentication. It does not claim physical token presence or a
+compositor presentation.

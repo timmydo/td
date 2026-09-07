@@ -223,6 +223,25 @@ impl Unlock {
         })
     }
 
+    /// After peer failure only; prove this child cannot publish again.
+    pub fn reap_for_teardown(mut self) -> Result<(), String> {
+        self.wire = None;
+        if let Some(child) = &mut self.child {
+            let stopped = child.kill();
+            if let Err(error) = child.wait() {
+                return Err(format!(
+                    "reap unlock generation child: {error}; kill result: {stopped:?}"
+                ));
+            }
+            self.child = None;
+        }
+        Ok(())
+    }
+
+    pub fn request(&self) -> &Request {
+        &self.request
+    }
+
     pub fn presented(&mut self, request: &Request) -> Result<(), String> {
         self.acknowledge(request, Phase::Presented)
     }
@@ -445,6 +464,17 @@ impl Drop for Unlock {
             let _ = child.kill();
             let _ = child.wait();
         }
+    }
+}
+
+#[cfg(test)]
+impl Unlock {
+    pub(crate) fn fixture_pid(&self) -> Option<u32> {
+        self.child.as_ref().map(Child::id)
+    }
+
+    pub(crate) fn fixture(request: Request, command: Command) -> Result<Self, String> {
+        Self::spawn(request, command)
     }
 }
 
