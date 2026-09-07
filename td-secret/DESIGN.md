@@ -654,18 +654,27 @@ volatile release fingerprint.
 
 The safe root enrollment API requires an already proved metadata value
 from the trusted enrollment flow. It validates the no-swap, zero-core and
-volatile-runtime requirements before handling a new master, while retaining
-an existing release long enough to migrate TPM-only records. It rotates the
-master, verifies a real
-bound seal/unseal roundtrip without publishing that key, re-encrypts every
-credential, and atomically publishes the protector and records together.
-It retires legacy files and clears the volatile release. Existing
-TPM-only stores must already be released to migrate their records. A
-failed operation before publication leaves the old store usable; after
-publication, the token format is authoritative even if cleanup needs a
-retry. Every attempted rotation clears the volatile release even when
-publication, sync or cleanup reports an error; a prepublication failure
-can therefore require another release of the unchanged TPM-only store.
+volatile-runtime requirements and clears any prior runtime release before
+parsing enrollment metadata or reading the old protector. For an existing
+TPM-only store it unseals the old master directly into the root operation's
+memory; that migration key is never published to the portal runtime. The
+store retains one decoded protector/record snapshot throughout migration.
+Its advisory exclusive lock excludes cooperating readers and writers; the
+credential service itself remains trusted.
+It rotates the master, verifies a real bound seal/unseal roundtrip without
+publishing that key, re-encrypts every credential, and atomically publishes
+the protector and records together. File-backed stores use their existing
+private master; token-protected stores refuse replacement before TPM access.
+Owned old and new master buffers are cleared on return, on a best-effort basis.
+It retires legacy files and clears the volatile release. A failed operation
+before publication preserves the previous persistent store; after publication,
+the token format is authoritative even if cleanup needs a retry. Every
+attempt, including malformed metadata or a refused replacement, clears the
+volatile release. A prepublication failure can therefore require another
+release of the unchanged TPM-only store; no migration requires an earlier
+runtime release or temporarily grants portal access. A mistaken enrollment
+attempt against an already token-enrolled store also clears its live release;
+restoring that session requires another fresh token assertion.
 There is no token replacement or downgrade operation. A missing master in
 an existing store directory always refuses initialization, even if only the
 lock remains: deleting a sealed bundle cannot silently mint a new master or
@@ -673,6 +682,16 @@ placeholder. An interrupted first creation that never published its master
 also refuses automatic retry and requires explicit repair. This is missing-
 record protection, not an authenticated history marker: the credential
 service is trusted, and whole-store substitution retains the rollback limit.
+
+The pinned-emulator migration oracle starts with a locked TPM-only store,
+converts two application records without a runtime release, reopens the
+published token store, and proves that both enrolled roles recover the
+original credentials. The old master cannot decrypt the new records. Failed
+old-key acquisition preserves the original bundle byte-for-byte; a refused
+token replacement clears the runtime release without accessing the TPM.
+Ordinary tests cover relocking before malformed metadata and protector
+admission. These oracles exercise TPM protocol and public signature fixtures,
+not a physical enrollment gesture.
 
 A release request owns the exact protector snapshot and the selected
 primary or recovery assertion. Starting a request clears any old volatile

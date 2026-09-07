@@ -250,9 +250,21 @@ impl Store {
         seal: impl FnOnce(&[u8; 32]) -> Result<Vec<u8>, String>,
         verify: impl FnOnce(&[u8], &[u8; 32]) -> Result<(), String>,
     ) -> Result<(), String> {
-        let legacy = self.legacy_names()?;
         let previous = self.bundle()?;
-        let names = match previous.as_ref() {
+        self.rotate_using(previous.as_ref(), seal, verify, |app, name, bundle| {
+            self.get_from(app, name, bundle)
+        })
+    }
+
+    fn rotate_using(
+        &self,
+        previous: Option<&Bundle>,
+        seal: impl FnOnce(&[u8; 32]) -> Result<Vec<u8>, String>,
+        verify: impl FnOnce(&[u8], &[u8; 32]) -> Result<(), String>,
+        read: impl Fn(&str, &str, Option<&Bundle>) -> Result<Option<Vec<u8>>, String>,
+    ) -> Result<(), String> {
+        let legacy = self.legacy_names()?;
+        let names = match previous {
             Some(bundle) => bundle.records.keys().cloned().collect(),
             None => legacy,
         };
@@ -268,8 +280,7 @@ impl Store {
                 };
                 let (_, aad) = Self::record(app, name)?;
                 let nonce = random::<12>()?;
-                let mut secret = self
-                    .get_from(app, name, previous.as_ref())?
+                let mut secret = read(app, name, previous)?
                     .ok_or("credential disappeared during sealing")?;
                 let mut derived = crypto::derive(&master, app);
                 let mut record = MAGIC.to_vec();
@@ -415,21 +426,40 @@ impl Store {
         runtime: &File,
         client: impl Fn() -> Result<tpm::Client<T>, String>,
     ) -> Result<(), String> {
-        if self.token_protected()? {
-            return Err("credential store is already token enrolled".into());
+        lock_runtime(runtime)?;
+        let mut previous_master = None;
+        let rotated = (|| {
+            let previous = self.bundle()?;
+            if previous.as_ref().is_some_and(Bundle::token_protected) {
+                return Err("credential store is already token enrolled".into());
+            }
+            let metadata = super::fido_metadata::Metadata::decode(&metadata.encode()?, self.uid)?;
+            let binding = metadata.binding()?;
+            if let Some(bundle) = &previous {
+                // The old platform-only key stays private during migration.
+                previous_master = Some(client()?.unseal(&tpm::SealedKey::decode(&bundle.key)?)?);
+            }
+            self.rotate_using(
+                previous.as_ref(),
+                |master| {
+                    let key = client()?.seal_bound(self.uid, pcrs, master, &binding)?;
+                    super::fido_metadata::Protection::new(self.uid, metadata, key)?.encode()
+                },
+                |blob, master| {
+                    super::fido_metadata::Protection::decode(blob, self.uid)?
+                        .verify_sealed_master(master, client()?)
+                },
+                |app, name, bundle| {
+                    self.get_from_key(app, name, bundle, || match &previous_master {
+                        Some(master) => Ok(crypto::derive(master, app)),
+                        None => self.key(app, bundle),
+                    })
+                },
+            )
+        })();
+        if let Some(master) = &mut previous_master {
+            master.fill(0);
         }
-        let metadata = super::fido_metadata::Metadata::decode(&metadata.encode()?, self.uid)?;
-        let binding = metadata.binding()?;
-        let rotated = self.rotate_with(
-            |master| {
-                let key = client()?.seal_bound(self.uid, pcrs, master, &binding)?;
-                super::fido_metadata::Protection::new(self.uid, metadata, key)?.encode()
-            },
-            |blob, master| {
-                super::fido_metadata::Protection::decode(blob, self.uid)?
-                    .verify_sealed_master(master, client()?)
-            },
-        );
         // Publication may have succeeded even if directory sync or cleanup failed.
         let locked = lock_runtime(runtime);
         match (rotated, locked) {
@@ -637,6 +667,16 @@ impl Store {
     }
 
     fn get_from(&self, app: &str, name: &str, bundle: Option<&Bundle>) -> Result<Option<Vec<u8>>, String> {
+        self.get_from_key(app, name, bundle, || self.key(app, bundle))
+    }
+
+    fn get_from_key(
+        &self,
+        app: &str,
+        name: &str,
+        bundle: Option<&Bundle>,
+        key: impl FnOnce() -> Result<[u8; 32], String>,
+    ) -> Result<Option<Vec<u8>>, String> {
         let (file, aad) = Self::record(app, name)?;
         let bytes = if let Some(bundle) = bundle {
             match bundle.records.get(&file) {
@@ -658,7 +698,7 @@ impl Store {
             .and_then(|s| s.try_into().ok())
             .ok_or("truncated credential nonce")?;
         let sealed = bytes.get(20..).ok_or("truncated credential record")?;
-        let mut key = self.key(app, bundle)?;
+        let mut key = key()?;
         let result = crypto::open(&key, &nonce, &aad, sealed).map(Some);
         key.fill(0);
         result
@@ -1425,6 +1465,136 @@ mod tests {
         assert!(runtime_key_in(&runtime, owner, &bundle.key).is_err());
         drop(runtime);
         drop(store);
+        drop(emulator);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn refused_enrollment_clears_release_before_metadata_or_protector_admission() {
+        let root = std::env::temp_dir().join(format!(
+            "td-enroll-refused-{}-{}", std::process::id(),
+            u64::from_le_bytes(random::<8>().unwrap()),
+        ));
+        fs::create_dir(&root).unwrap();
+        let owner = fs::metadata(&root).unwrap().uid();
+        let store = Store::open_owned(&root.join("store"), 1000, owner, true).unwrap();
+        let runtime = runtime_directory_at(&root, owner, 1000, true).unwrap();
+        let key_path = pinned(&runtime).join("key");
+        for case in 0..3 {
+            if case == 1 {
+                store.write("sealed", b"malformed protector").unwrap();
+            } else if case == 2 {
+                let bundle = Bundle {
+                    key: crate::fido_metadata::tests::protection_fixture(1000, false).encode().unwrap(),
+                    records: BTreeMap::new(),
+                };
+                store.write("sealed", &bundle.encode().unwrap()).unwrap();
+            }
+            let before = store.read("sealed", MAX_BUNDLE).ok();
+            atomic_write(&runtime, owner, "key", &[42; 64]).unwrap();
+            let error = store.enroll_tokens_into(
+                crate::fido_metadata::tests::metadata_fixture(1001, false),
+                tpm::Pcrs::parse("7").unwrap(), &runtime,
+                || -> Result<tpm::Client<tpm::tests::Socket>, String> {
+                    panic!("refused metadata or protector reached the TPM");
+                },
+            ).unwrap_err();
+            assert_eq!(error, match case {
+                0 => "enrollment metadata belongs to another session",
+                1 => "invalid sealed store format",
+                _ => "credential store is already token enrolled",
+            });
+            assert!(!key_path.exists(), "refused enrollment retained a release");
+            assert_eq!(store.read("sealed", MAX_BUNDLE).ok(), before);
+            if case == 0 {
+                assert!(store.bundle().unwrap().is_none());
+                assert_eq!(store.read("master", 32).unwrap().len(), 32);
+            }
+        }
+        drop(runtime);
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires explicitly supplied pinned host swtpm; never accesses hardware"]
+    fn emulator_enrolls_a_locked_tpm_store_without_a_portal_release() {
+        use crate::fido_metadata::{tests as fixtures, Protection, Role};
+        let root = std::env::temp_dir().join(format!(
+            "td-enroll-locked-{}-{}", std::process::id(),
+            u64::from_le_bytes(random::<8>().unwrap()),
+        ));
+        fs::create_dir(&root).unwrap();
+        let owner = fs::metadata(&root).unwrap().uid();
+        let uid = 1000;
+        let emulator = tpm::tests::Emulator::start(&root.join("tpm"));
+        emulator.extend(&[9; 32]);
+        let pcrs = tpm::Pcrs::parse("7").unwrap();
+        let runtime = runtime_directory_at(&root, owner, uid, true).unwrap();
+        let key_path = pinned(&runtime).join("key");
+        let path = root.join("store");
+        let store = Store::open_owned(&path, uid, owner, true).unwrap();
+        store.set("mail", "main", b"mail migration credential").unwrap();
+        store.set("news", "account", b"news migration credential").unwrap();
+        store.seal_with(
+            |master| emulator.client().seal(uid, pcrs, master)?.encode(),
+            |blob| emulator.client().unseal(&tpm::SealedKey::decode(blob)?),
+        ).unwrap();
+        let before = store.read("sealed", MAX_BUNDLE).unwrap();
+        assert!(!key_path.exists());
+        assert!(!path.join("master").exists());
+        let old_bundle = store.bundle().unwrap().unwrap();
+        let old_master = emulator.client().unseal(
+            &tpm::SealedKey::decode(&old_bundle.key).unwrap(),
+        ).unwrap();
+
+        // An unseal failure must preserve the entire old store and stay locked.
+        let failed = store.enroll_tokens_into(
+            fixtures::metadata_fixture(uid, true), pcrs, &runtime,
+            || Err::<tpm::Client<tpm::tests::Socket>, _>("TPM unavailable".into()),
+        ).unwrap_err();
+        assert_eq!(failed, "TPM unavailable");
+        assert_eq!(store.read("sealed", MAX_BUNDLE).unwrap(), before);
+        assert!(!key_path.exists());
+
+        let calls = std::cell::Cell::new(0);
+        store.enroll_tokens_into(
+            fixtures::metadata_fixture(uid, true), pcrs, &runtime,
+            || {
+                assert!(!key_path.exists(), "migration published a portal key");
+                calls.set(calls.get() + 1);
+                Ok(emulator.client())
+            },
+        ).unwrap();
+        assert_eq!(calls.get(), 3); // old unseal, new seal, new roundtrip
+        assert!(!key_path.exists());
+        drop(store);
+        let store = Store::open_owned(&path, uid, owner, false).unwrap();
+        let bundle = store.bundle().unwrap().unwrap();
+        let protection = Protection::decode(&bundle.key, uid).unwrap();
+        assert!(decrypt(&bundle, &old_master, "mail", "main").is_err());
+        for role in [Role::Primary, Role::Recovery] {
+            let (request, response) = fixtures::release_fixture(&protection, role);
+            store.release_token_into(&runtime, request, &response, emulator.client()).unwrap();
+            let master = runtime_key_in(&runtime, owner, &bundle.key).unwrap();
+            assert_eq!(decrypt(&bundle, &master, "mail", "main").unwrap(), b"mail migration credential");
+            assert_eq!(decrypt(&bundle, &master, "news", "account").unwrap(), b"news migration credential");
+        }
+        let enrolled = store.read("sealed", MAX_BUNDLE).unwrap();
+        for private in [old_master.as_slice(), b"mail migration credential", b"news migration credential"] {
+            assert!(!enrolled.windows(private.len()).any(|bytes| bytes == private));
+        }
+        assert!(key_path.exists());
+        assert!(store.enroll_tokens_into(
+            fixtures::metadata_fixture(uid, false), pcrs, &runtime,
+            || -> Result<tpm::Client<tpm::tests::Socket>, String> {
+                panic!("token replacement reached the TPM");
+            },
+        ).unwrap_err().contains("already token enrolled"));
+        assert!(!key_path.exists());
+        assert_eq!(store.read("sealed", MAX_BUNDLE).unwrap(), enrolled);
+        drop(store);
+        drop(runtime);
         drop(emulator);
         fs::remove_dir_all(root).unwrap();
     }
