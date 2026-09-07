@@ -376,8 +376,8 @@ pub struct Runtime {
     /// case it cannot: pixels the compositor did not write and its shadow
     /// copy therefore cannot see.
     owed_damage: Damage,
-    /// What the last paint's submission answered, or `None` before one has
-    /// happened. `Option` rather than a `Presented` default so that observing
+    /// The latest requested paint's answer, or None before a paint, while
+    /// pending, or after failure. No `Presented` default, so observing
     /// `Presented` proves a paint answered it, which a default would make
     /// unfalsifiable — fbdev has no other answer to give.
     last_submission: Option<Submission>,
@@ -667,6 +667,7 @@ impl Runtime {
     /// pixels are on glass is `last_submission`'s to answer, and against a
     /// KMS backend the answer would be "not yet".
     pub fn repaint(&mut self) -> Result<(), String> {
+        self.last_submission = None;
         if let Some(compound) = self.compound_settle.as_mut() {
             compound.paint = true;
             return Ok(());
@@ -681,10 +682,9 @@ impl Runtime {
         Ok(())
     }
 
-    /// What the last submission answered, or `None` before the first paint.
-    /// Test-only until a backend that can answer `Queued` exists; the field is
-    /// not test-only, because dropping the value on the floor is what
-    /// `paint`-means-submit exists to prevent.
+    /// The latest requested paint's answer; pending or failed requests are None.
+    /// Test-only until a production consumer binds this answer to its request.
+    /// None supplies no completion evidence; it does not distinguish why.
     #[cfg(test)]
     pub(crate) fn last_submission(&self) -> Option<Submission> {
         self.last_submission
@@ -693,6 +693,7 @@ impl Runtime {
     /// Owe a paint instead of taking one. The scene is already current, so any
     /// repaint before the flush settles the debt.
     pub fn defer_repaint(&mut self) {
+        self.last_submission = None;
         self.pending_paint = true;
     }
 
@@ -1123,6 +1124,7 @@ impl Runtime {
             layout_changed |= self.enforce_parent_layout();
         }
         if let Some(compound) = self.compound_settle.as_mut() {
+            self.last_submission = None;
             compound.paint = true;
             compound.focus = true;
             compound.layout_changed |= layout_changed;
@@ -4611,6 +4613,49 @@ mod tests {
         runtime
             .pointer_frame(1, 30, 30, &[], PointerScroll::default())
             .unwrap();
+        runtime.flush_paint().unwrap();
+        assert_eq!(runtime.last_submission(), Some(Submission::Presented));
+    }
+
+    #[test]
+    fn pending_or_failed_paints_cannot_reuse_an_earlier_submission() {
+        let cleanup = Cleanup(std::env::temp_dir().join(format!(
+            "td-runtime-stale-submission-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        )));
+        let mut runtime =
+            Runtime::new(Framebuffer::test_file(&cleanup.0, 120, 80, 120 * 4).unwrap());
+        runtime.repaint().unwrap();
+        assert_eq!(runtime.last_submission(), Some(Submission::Presented));
+        runtime.fail_next_repaint();
+        assert!(runtime.repaint().is_err());
+        assert_eq!(runtime.last_submission(), None);
+        runtime.flush_paint().unwrap();
+        assert_eq!(runtime.last_submission(), Some(Submission::Presented));
+
+        runtime.defer_repaint();
+        assert_eq!(runtime.last_submission(), None);
+        runtime.flush_paint().unwrap();
+        assert_eq!(runtime.last_submission(), Some(Submission::Presented));
+
+        runtime.begin_compound_commit().unwrap();
+        runtime.repaint().unwrap();
+        assert_eq!(runtime.last_submission(), None);
+        runtime.finish_compound_commit().unwrap();
+        assert_eq!(runtime.last_submission(), Some(Submission::Presented));
+
+        runtime.begin_compound_commit().unwrap();
+        runtime
+            .commit(SurfaceKey { client: 1, object: 1 }, surface([1, 2, 3, 0]))
+            .unwrap();
+        assert_eq!(runtime.last_submission(), None);
+        runtime.fail_next_repaint();
+        assert!(runtime.finish_compound_commit().is_err());
+        assert_eq!(runtime.last_submission(), None);
+        runtime.fail_next_repaint();
+        assert!(runtime.flush_paint().is_err());
+        assert_eq!(runtime.last_submission(), None);
         runtime.flush_paint().unwrap();
         assert_eq!(runtime.last_submission(), Some(Submission::Presented));
     }

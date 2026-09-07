@@ -703,7 +703,13 @@ now: a caller written against a `paint` that returned `()` would have encoded
 the contract afterwards means auditing every caller instead of none.
 `Runtime` therefore keeps the answer in `last_submission` rather than
 discarding it, and `repaint`'s cleared debt is "the scene has been submitted",
-which is a claim it can make.
+which is a claim it can make. A new repaint request invalidates the prior
+answer before either compound-commit deferral or backend I/O; explicitly
+deferred repaint does the same. A pending or failed request therefore leaves
+`last_submission` empty, and only that request's successful backend answer
+can fill it again. An earlier frame's `Presented` cannot stand in for a new
+prompt. This is submission bookkeeping, not request-bound consent: trusted
+prompt identity and cancellation must still be checked by the consumer.
 
 `Damage` travels the other way. `Unknown` means the caller does not know what
 changed and a backend may discover it — fbdev compares its own shadow copy —
