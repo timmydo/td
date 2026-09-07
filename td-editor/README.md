@@ -49,9 +49,9 @@ soft wrapping does not affect line numbers. Return moves, Escape/Ctrl+G
 cancels, and Ctrl+U clears. Invalid or nonexistent lines leave the prompt
 open for correction. Replay also accepts `go-to-line TAB REVISION LINE`
 (tab-separated arguments).
-Native query/edit/file control is available explicitly; remote conflict and
-non-close path answers, GPU rendering and td-mail integration remain
-unimplemented. Do not set
+Native query/edit/file control is available explicitly. Remote non-close path
+and other keyboard-prompt answers, GPU rendering and td-mail integration
+remain unimplemented. Do not set
 `$EDITOR` to this binary yet.
 
 Build and verify from the repository root:
@@ -86,8 +86,8 @@ pending scans expose no partial marks. Remote `open` queues the ordinary file
 worker and records the selected/created tab ID and revision in shared bounded
 job history, including duplicate-file and missing-file behavior. Paths use
 literal OS bytes. Remote Close Tab, Quit and close-dialog
-Cancel/Discard/Save/path are also connected; other dialog answers remain
-later work.
+Cancel/Discard/Save/path are connected, as are conflict Cancel/Reload/Save As
+answers.
 These answers pin the live dialog ID, tab and revision and work independently
 of physical focus/prompt visibility, without bypassing the close coordinator.
 Remote `save` and `save-as` also return job IDs. They recheck the requested
@@ -97,7 +97,12 @@ file; Save As takes an explicit literal OS-byte path and cannot overwrite an
 existing destination. Job errors may require inspecting disk and the native
 warning before retrying. Close-dialog Save asks for a path for untitled tabs;
 an explicit path answer queues the same Save As job. Cancel keeps tabs open
-but does not roll back an accepted save. Conflict and non-close path answers
+but does not roll back an accepted save. Dirty conflict Reload still needs
+two explicit answers bound to the live dialog and revision. Reload job
+history distinguishes replacement, failure and cancellation; Cancel drops
+the replacement permit, not the read syscall. Conflict Save As takes an
+explicit new destination and leaves the external file untouched. Non-close
+path and other keyboard-prompt answers (menu/Find/Replace/numeric/command)
 are not remotely connected yet.
 `check-spelling` returns a job ID; native state retains
 up to 64 completion/error/cancellation outcomes, separate from scan-pinned
@@ -290,8 +295,9 @@ Starting close during unrelated pending I/O is refused. A save started by a
 close dialog keeps the dialog modal; Escape/Ctrl+G cancels closing but the
 save still finishes. You can then keep editing without an unexpected later
 exit. Fatal errors or process termination can lose unsaved edits; a pending
-write may have reached disk. There is no recovery. Conflict Reload and
-ordinary `$EDITOR` invocation remain future work.
+write may have reached disk. There is no recovery. Conflict Reload uses
+the explicit discard-before-replacement policy described above; ordinary
+`$EDITOR` invocation remains future work.
 
 The original no-file-access scratch fixture is still available:
 

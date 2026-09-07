@@ -489,6 +489,33 @@ fn native_control_is_opt_in_and_liveness_checked_with_bounded_outer_turns() {
     assert!(answer.contains("self.control_close_save_job(target, Some(path.clone()))"));
     assert!(!answer.contains("Event::"));
     assert!(!answer.contains("close_answer_visible"));
+    let conflict = production
+        .split("fn control_conflict_answer(")
+        .nth(1)
+        .unwrap()
+        .split("\n    fn ")
+        .next()
+        .unwrap();
+    assert!(conflict.contains("dialog != self.last_dialog_id"));
+    assert!(conflict.contains("current.tab != target.tab"));
+    assert!(conflict.contains("current.revision != target.revision"));
+    assert!(conflict.contains("conflict.needs_discard()"));
+    assert!(conflict.find(".checked_add(1)").unwrap() < conflict.find(".begin_reload(").unwrap());
+    assert!(
+        conflict.find(".begin_reload(").unwrap()
+            < conflict.find(".answer(self.ui.editor(), discard)").unwrap()
+    );
+    assert!(conflict.contains("self.start_reload(target, permit)"));
+    assert!(!conflict.contains("Event::Reload") && !conflict.contains("close_answer_visible"));
+    let cancel = production
+        .split("fn cancel_conflict(")
+        .nth(1)
+        .unwrap()
+        .split("\n    fn ")
+        .next()
+        .unwrap();
+    assert!(cancel.contains("files.cancel_reload()"));
+    assert!(cancel.contains(".reloaded(*id, Ok(ReloadOutcome::Cancelled))"));
     assert!(!dispatch.contains("Event::Discard"));
     assert!(!dispatch.contains("Event::Saved"));
     let startup = production.split("pub fn file_window(").nth(1).unwrap();

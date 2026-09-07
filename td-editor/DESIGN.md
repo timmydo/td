@@ -29,8 +29,11 @@ bounded completion/error/cancellation history in native state. Remote New
 creates an ordinary empty tab and returns its stable ID. Remote Open and
 revision-pinned Save/Save As use the ordinary file worker and bounded job
 history. Remote Close Tab, Quit and live close-dialog Cancel/Discard/Save/path
-answers use the ordinary close coordinator. Other dialog answers remain
-unimplemented.
+answers use the ordinary close coordinator. Conflict Cancel/Reload/Save As
+and explicit second-stage discard-before-Reload are connected, with bounded
+Reload outcomes. Non-close path and other keyboard-prompt answers remain
+unimplemented; menus, Find, Replace, numeric and command entry have only
+coarse presence flags.
 Replay emits explicit external-operation requests and does not pretend to
 perform native file, clipboard or display work.
 The allocation-free layout library supplies visual rows, glyph intervals,
@@ -1034,6 +1037,18 @@ answers. Input loss or a smaller window retains the question and replaces
 choices with restoration/resize instructions. Window-manager close can
 replace an idle conflict question with the ordinary close flow.
 
+Each created conflict also receives a checked nonzero dialog ID from the
+same window-local counter as Close. It remains fixed across the Reload
+discard/read phases; a later conflict or replacing Close gets a fresh ID.
+Counter exhaustion preserves text and the failed Save outcome but does not
+create a question. The trusted remote endpoint can answer a live conflict
+without physical focus/input/visibility, using its ID, tab and revision.
+Remote Reload of dirty text still requires the separate explicit
+discard-reload answer; no direct discard or force overwrite is added.
+Remote conflict Save As takes an explicit literal OS-byte path and reuses
+the queued revision-pinned Save As job without a keyboard path entry.
+CONTROL.md pins the exact phases, errors and reply/job formats.
+
 `dialog::Conflict` pins editor identity, tab and revision. Only a live answer
 can mint the opaque, single-use `Reload` permit; a dirty permit additionally
 requires the second discard answer. The file coordinator checks the permit
@@ -1044,6 +1059,15 @@ baseline rejected. The user may edit again after Cancel. A new close during
 the pending read is refused like other unrelated I/O. A stale completion,
 invalid file, exhausted counter or failed budget admission leaves text,
 history, selection, saved state and old file association unchanged.
+
+Remote Reload shares the same permit, submission, prepared-candidate and
+replacement path. Its bounded historical job row retains the requested
+tab/revision and becomes complete only after model acceptance. Explicit
+native or remote cancellation records cancelled immediately, drops the
+permit, and leaves the read busy until its ignored result arrives; completion
+cannot rewrite that cancelled row. Submission/read/model failures retain
+the ordinary diagnostic and coarse unavailable outcome. A remotely accepted
+read cannot authorize any later revision or silently resume a failed Close.
 
 Successful `Event::Reload` keeps the same TabId, active-tab choice and that
 document's Auto Fill, fill column and soft-wrap preferences. It replaces
@@ -2149,7 +2173,12 @@ Close-dialog Save may instead open the ordinary path entry; an explicit Path
 answer queues Save As for the coordinator's target, including an inactive tab
 in a window close. Cancel never rolls back accepted saves; queued revision
 validation and immutable post-handoff snapshots still apply.
-Other dialog answers remain unimplemented.
+Conflict answers are also connected with fresh IDs from the same dialog
+counter. Reload still requires its opaque live permit and an additional
+discard question for dirty text, and job outcomes distinguish accepted
+replacement, cancellation and failure. Conflict Save As queues the same
+explicit-path Save As job. Non-close path and other keyboard-prompt answers
+remain unimplemented, including menu/Find/Replace/numeric/command input.
 The complete endpoint below remains the version-1 target; controller
 generations are not presentation evidence.
 

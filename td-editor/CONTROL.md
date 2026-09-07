@@ -3,8 +3,10 @@
 The experimental `--window --control-socket PATH` endpoint implements the
 query and revision-checked editing subset below. It is off by default;
 scratch preview and replay do not accept the option. Remote Close Tab, Quit and
-close-dialog Cancel/Discard/Save/path and file Open/Save/Save As are connected;
-other dialog answers remain unimplemented. Remote Check Spelling admission and
+close-dialog Cancel/Discard/Save/path, conflict Cancel/Reload/Save As and file
+Open/Save/Save As are connected. Non-close path and other keyboard-prompt
+answers, including menu/Find/Replace/numeric/command input, remain unimplemented.
+Remote Check Spelling admission and
 bounded job outcomes are implemented below. The complete version-1 target is
 specified in
 [DESIGN.md](DESIGN.md#test-and-control-architecture).
@@ -68,6 +70,9 @@ In the examples below, field spaces denote literal Tab separators.
 | `1 ID quit` | Start ordinary whole-window close, without approving discard. |
 | `1 ID dialog-answer DIALOG TAB REVISION ANSWER` | Answer the live close question with `cancel`, `discard` or `save`. |
 | `1 ID dialog-answer DIALOG TAB REVISION path HEX_PATH` | Supply a literal path for close-driven Save As. |
+| `1 ID dialog-answer DIALOG TAB REVISION reload` | Request Reload from a live conflict; dirty text requires a second answer. |
+| `1 ID dialog-answer DIALOG TAB REVISION discard-reload` | Confirm the conflict's second question before replacing unsaved text. |
+| `1 ID dialog-answer DIALOG TAB REVISION save-as HEX_PATH` | Save the conflict target to a new literal destination. |
 | `1 ID text TAB REVISION OFFSET LIMIT` | Read a scalar-aligned UTF-8 page. |
 | `1 ID spelling-results TAB REVISION SCAN OFFSET LIMIT` | Read native spelling status and a scan-pinned range page. |
 | `1 ID wait-frame GENERATION` | Wait for a main-surface callback at or beyond this native redraw generation. |
@@ -170,7 +175,7 @@ separately. No path, title or document bytes are retained in job rows. The
 same eviction and transport-lifetime rules as spelling apply. In particular,
 disconnect or a lost reply cannot cancel an admitted Open, and clients must
 not blindly retry it. Native Open/dictionary/Save operations do not create
-remote job rows. Remote conflict and non-close path answers remain later work.
+remote job rows. Remote non-close path answers remain later work.
 
 ## Save and Save As jobs
 
@@ -226,9 +231,9 @@ partially succeeded, so inspect the native warning and destination before
 retrying. Only a revision/identity rejection before handoff proves that this
 job submitted no write. Terminal rows, eviction and transport ambiguity use
 the shared job contract. Ordinary conflict dialogs may appear after Save
-fails; remote conflict/reload answers remain unimplemented. Close-driven
-Save/path answers below share these jobs. No force answer or conflict bypass
-is added.
+fails; remote conflict answers below retain the ordinary Reload/Save As
+policy. Close-driven Save/path answers share these jobs. No force answer or
+conflict bypass is added.
 
 ## Close requests and dialog answers
 
@@ -261,8 +266,9 @@ transport liveness/deadline rules still apply, and a lost reply must not be
 blindly retried.
 
 Native state adds `dialog-last=N`, initially zero, and exactly one
-`dialog=ID,SCOPE,PHASE,TAB,REVISION,ANSWERS` field, or `dialog=-` when no close
-coordinator exists. `SCOPE` is `close-tab` or `close-window`; `PHASE` is
+`dialog=ID,SCOPE,PHASE,TAB,REVISION,ANSWERS` field, or `dialog=-` when neither
+close nor conflict flow exists. Close `SCOPE` is `close-tab` or `close-window`;
+conflict fields are defined below. Close `PHASE` is
 `question`, `path` (Save As entry during closing), or `saving`. The answers
 are `cancel+discard+save` for a question, `cancel+path` for path entry, and
 `cancel` while saving. An invalid coordinator reports `invalid,-,-,-` after
@@ -270,11 +276,12 @@ scope and offers no remote answer.
 This covers stale pinned targets and a defensive no-question fallback;
 ordinary completion removes a fully answered coordinator synchronously,
 before the next control request. The coarse native file-busy flag remains
-available even for an invalid coordinator. Other native prompts retain only
+available even for an invalid coordinator. Non-close path prompts retain only
 their coarse presence flags and cannot be answered with this close token.
 
-Each admitted ordinary or remote close request consumes a new nonzero
-window-local checked `u64` dialog ID, including clean immediate closes. The
+Each admitted ordinary or remote close request and each new conflict question
+consumes a new nonzero window-local checked `u64` dialog ID, including clean
+immediate closes. Close and conflict IDs share this counter. The
 ID is retained across that coordinator's questions and Save phases, never
 reset or reused in that window. Dialog, transport request, spelling job/scan,
 tab and frame IDs have separate namespaces; their numeric values may coincide.
@@ -321,8 +328,7 @@ explicit choice, not file persistence or presentation; state may now name
 the next question or no dialog. Queries are immutable. Rare admitted coordinator
 completion failures report their error and retain unapproved text, but may
 clear the failed dialog and update its native diagnostic; they are not
-side-effect-free validation refusals. Conflict/reload and non-close path
-answers remain later work.
+side-effect-free validation refusals. Non-close path answers remain later work.
 
 `dialog-answer DIALOG TAB REVISION save` is accepted only in the question
 phase with no pending file work. An associated target queues the same remote
@@ -353,6 +359,78 @@ without an edit the queued write still proceeds; an edit before handoff makes
 it stale, while an edit after handoff remains unsaved. Successful earlier
 saves are not rolled back. A final save can exit the window before its job
 outcome is queried; a pending reply or connection EOF is not persistence proof.
+
+## Conflict answers and Reload jobs
+
+An ordinary Save conflict opens `dialog=ID,conflict,question,TAB,REVISION,
+cancel+reload+save-as` (one comma-separated field, without the shown line
+break). This uses a fresh ID after any failed close Save; answering the
+conflict never resumes that cancelled close plan. If the shared dialog
+counter is exhausted, no conflict question is created: preserve text and the
+old association, retain the failed Save job outcome, and show an exhaustion
+diagnostic. IDs are not reused. An idle conflict replaced by native Close
+gets a fresh Close ID. Native or remote cancellation followed by another
+Save conflict likewise gets a fresh ID, even for identical text/revision.
+
+Conflict answers require the nonzero live ID and the pinned tab/revision,
+including for an inactive target. The opaque coordinator revalidates editor
+identity and current revision. Missing flow is `unavailable`, wrong ID/tab
+is `invalid-argument`, and stale text is `stale-revision`; missing targets
+are `missing-tab`. Invalid coordinator state offers no answers and reports
+`ID,conflict,invalid,-,-,-`. The approved trusted semantic-answer policy also
+applies here: no physical focus, keymap or visibility requirement is added.
+Physical non-Cancel answers keep all their existing input/visibility guards.
+
+`reload` is allowed only in the first conflict question. For dirty text it
+starts no read and returns `1 ID ok dialog DIALOG`; state changes to
+`ID,conflict,discard,TAB,REVISION,cancel+discard-reload`. Only an explicit
+`discard-reload` in that second phase can authorize replacing unsaved text.
+An initial discard-reload, repeated Reload in the discard phase, or Save As
+there is `unavailable`. Neither a `discard` close answer nor a force answer
+can substitute for this authorization. For clean text the first Reload can
+start the read immediately without a discard question.
+
+Before consuming a Reload permit, reserve the bounded job ID and room for
+input cleanup. Busy/closed/counter/history refusals preserve the question
+and unconsumed permit. A submitted read returns `1 ID pending JOB` and state
+changes to `ID,conflict,reloading,TAB,REVISION,cancel`. The ordinary file
+coordinator checks the single-use permit before I/O and again during model
+replacement. It alone adopts the candidate baseline after successful model
+admission. Missing, invalid, changed-target or failed reads retain text,
+history, saved state and the old association. There is no force overwrite.
+
+Reload job rows are `job=JOB,reload,TAB,REVISION,0,STATUS,CODE`, using the
+same shared 64-row bound and checked job counter. Tab/revision identify the
+requested pre-replacement snapshot, not a later active tab or output revision.
+`complete,-` means the candidate was accepted by the ordinary model/file
+path. Query fresh state/text for the new revision. Completion replaces text,
+resets selection/undo history and preserves tab identity, active-tab choice
+and formatting/view preferences under the ordinary Reload contract.
+I/O, submission and model-admission failures are `error,unavailable`, with
+the specific diagnostic retained natively. A defensive permit-creation
+failure may retain its model error code or `protocol`. Like other jobs,
+`pending` acknowledges admission even if startup already failed.
+
+`cancel` is allowed in any conflict phase and returns `1 ID ok` with an empty
+trailing field. During Reload it drops the permit, not the read syscall;
+the eventual result cannot replace text or adopt its baseline. A remotely
+started Reload becomes `cancelled,-` immediately, including cancellation by
+physical Escape/C-g. Its terminal row is not rewritten when the worker
+finishes. The file-busy flag remains set until that read finishes; edits may
+resume meanwhile, but unrelated file work/close still refuses while busy.
+Cancelling a question starts no job and preserves the original file notice.
+An unreachable registry-correlation failure may report an error after Cancel
+has already dropped the permit; that defensive error cannot undo cancellation.
+
+`save-as HEX_PATH` is allowed only in the first conflict question. It directly
+queues the same revision-pinned Save As job for that target, then dismisses
+the conflict. It does not open a path prompt. It preserves the external file
+and refuses existing/reserved destinations under ordinary file policy.
+Paths share the 1..4096-byte non-NUL OS-byte hex grammar and Debug/state
+privacy. Counter/busy refusals retain the question. Failed accepted jobs
+retain text and do not resume a previous close plan. Native Save As still
+opens its ordinary keyboard path prompt; remote answers to that non-close
+prompt remain subsequent work.
 
 ## Revision-checked editing
 
@@ -599,8 +677,8 @@ or cancel the job; a lost reply is ambiguous and must not be blindly retried.
 
 Native state adds `job-last=N`, the largest admitted ID (zero initially),
 followed by job fields in increasing job-ID order. Spelling rows are
-`job=JOB,spelling,TAB,REVISION,SCAN,STATUS,CODE`; Open and Save/Save As rows
-are defined above.
+`job=JOB,spelling,TAB,REVISION,SCAN,STATUS,CODE`; Open, Save/Save As and Reload
+rows are defined above.
 Scan zero means spelling startup produced no scan. Status
 is `pending`, `complete`, `cancelled`, or `error`; code is `-` except for a
 stable error code with `error`. Pending/complete spelling rows name the
@@ -700,8 +778,8 @@ pending dialog/job or spelling range is serialized by this controller-only
 snapshot. Its generation means local UI state, **not** a submitted buffer,
 frame callback or scanout. The native extension below adds its own redraw
 generations/snapshots, coarse flags, bounded spelling/file outcomes and close
-dialog identity/answers. Other dialog identities/answers remain later work
-before claiming complete remote control.
+and conflict dialog identity/answers. Non-close path identities/answers
+remain later work before claiming complete remote control.
 
 ## Experimental native adapter
 
@@ -745,14 +823,14 @@ this order. Error responses are unchanged:
 
 | Field | Value |
 | --- | --- |
-| `adapter=native-close-save` | Explicit implemented adapter identity. |
+| `adapter=native-conflict` | Explicit implemented adapter identity. |
 | `native=...` | Configured, file session present, file job busy, quitting. |
 | `modal=...` | Path entry, close question, conflict question, pending Reload, menu, Find, numeric entry, command entry, Replace. |
 | `spelling=...` | Selected dictionary entry count or `-`, scan running. |
 | `job-last=N` | Largest admitted remote background-job ID, or zero. |
-| `job=...` (repeated) | Up to 64 ordered spelling/Open/Save/Save As rows. |
-| `dialog-last=N` | Largest admitted close-coordinator ID, or zero. |
-| `dialog=...` | Live close scope/phase/target/allowed answers, or `-`. |
+| `job=...` (repeated) | Up to 64 ordered spelling/Open/Save/Save As/Reload rows. |
+| `dialog-last=N` | Largest admitted close/conflict ID, or zero. |
+| `dialog=...` | Live close/conflict scope/phase/target/allowed answers, or `-`. |
 | `window-generation=N` | Current native redraw-invalidation generation. |
 | `frame-submitted=...` | Last submitted snapshot, or `-`. |
 | `frame-completed=...` | Last callback-completed snapshot, or `-`. |
@@ -760,8 +838,9 @@ this order. Error responses are unchanged:
 Boolean flags are `0|1`; the dictionary field is an entry count or `-`.
 The native/modal/spelling flags remain coarse presence information, not
 dialog IDs, allowed answers or spelling ranges. Separate dialog fields expose
-the close coordinator only; job rows expose spelling and file outcomes.
-Other dialog IDs remain absent. No path or entry text
+close and conflict coordinators; job rows expose spelling and file outcomes.
+Other modal IDs remain absent, including non-close paths, menus, Find,
+Replace, numeric and command entry. No path or entry text
 is disclosed by these added fields. Query `text` separately for document
 bytes. Controller generation does not cover native-only modal/job changes,
 and is not a submitted/callback-completed frame generation. Clients must not

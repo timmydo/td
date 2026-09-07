@@ -1,5 +1,6 @@
 //! Wayland presentation and input, with an optional asynchronous file session.
 
+use crate::control_jobs::ReloadOutcome;
 use crate::dialog::{Close, Closed, Conflict, Scope, Target};
 use crate::font::Font;
 use crate::keyboard::{Keymap, Modifiers};
@@ -367,6 +368,7 @@ struct Window {
 enum ControlFile {
     Open(u64),
     Save(u64),
+    Reload(u64),
 }
 
 enum ControlAnswer {
@@ -1425,6 +1427,13 @@ impl Window {
                     ControlFile::Save(id) => self
                         .control_jobs
                         .saved(id, result.as_ref().map(|_| ()).map_err(|error| error.code)),
+                    ControlFile::Reload(id) => self.control_jobs.reloaded(
+                        id,
+                        result
+                            .as_ref()
+                            .map(|_| ReloadOutcome::Complete)
+                            .map_err(|error| error.code),
+                    ),
                 };
                 if let Err(detail) = outcome {
                     job_error = Some(detail);
@@ -1463,9 +1472,17 @@ impl Window {
             self.reloading = None;
             if let Some(target) = self.files.as_mut().and_then(|files| files.take_conflict()) {
                 self.input.cancel_repeat();
-                match Conflict::new(self.ui.editor(), target) {
-                    Ok(conflict) => {
+                let prepared = self
+                    .last_dialog_id
+                    .checked_add(1)
+                    .ok_or(crate::Error::Exhausted)
+                    .and_then(|id| {
+                        Conflict::new(self.ui.editor(), target).map(|conflict| (id, conflict))
+                    });
+                match prepared {
+                    Ok((id, conflict)) => {
                         self.stop_pointer();
+                        self.last_dialog_id = id;
                         self.conflict = Some(conflict);
                     }
                     Err(detail) => self.notify(format!("Conflict question unavailable: {detail}")),
@@ -1882,7 +1899,9 @@ impl Window {
         if self.closed || self.files.is_none() {
             return Err(crate::Error::Unavailable);
         }
-        let close = self.closing.as_ref().ok_or(crate::Error::Unavailable)?;
+        let Some(close) = self.closing.as_ref() else {
+            return self.control_conflict_answer(dialog, target, answer);
+        };
         if dialog == 0 || dialog != self.last_dialog_id {
             return Err(crate::Error::InvalidArgument);
         }
@@ -1949,9 +1968,106 @@ impl Window {
                 }
                 return self.control_close_save_job(target, Some(path.clone()));
             }
+            crate::control::DialogAnswer::Reload
+            | crate::control::DialogAnswer::DiscardReload
+            | crate::control::DialogAnswer::SaveAs(_) => return Err(crate::Error::Unavailable),
         }
         self.control_mutation_accepted();
         Ok(ControlAnswer::Done)
+    }
+
+    fn control_conflict_answer(
+        &mut self,
+        dialog: u64,
+        target: Target,
+        answer: &crate::control::DialogAnswer,
+    ) -> crate::Result<ControlAnswer> {
+        if self.reloading.is_none() && self.conflict.is_none() {
+            return Err(crate::Error::Unavailable);
+        }
+        if dialog == 0 || dialog != self.last_dialog_id {
+            return Err(crate::Error::InvalidArgument);
+        }
+        let current = if let Some(current) = self.reloading {
+            self.ui
+                .editor()
+                .revision_point(current.tab, current.revision)?;
+            current
+        } else {
+            self.conflict
+                .as_ref()
+                .ok_or(crate::Error::Unavailable)?
+                .target(self.ui.editor())?
+        };
+        if current.tab != target.tab {
+            return Err(crate::Error::InvalidArgument);
+        }
+        if current.revision != target.revision {
+            return Err(crate::Error::StaleRevision);
+        }
+        if matches!(answer, crate::control::DialogAnswer::Cancel) {
+            self.cancel_conflict()?;
+            self.control_mutation_accepted();
+            return Ok(ControlAnswer::Done);
+        }
+        if self.reloading.is_some()
+            || self.files.as_ref().is_some_and(|files| files.busy())
+            || self.control_file_job.is_some()
+            || self.prompt.is_some()
+        {
+            return Err(crate::Error::Unavailable);
+        }
+        let conflict = self.conflict.as_ref().ok_or(crate::Error::Unavailable)?;
+        match answer {
+            crate::control::DialogAnswer::SaveAs(path) if !conflict.needs_discard() => {
+                let id = self.control_save_job(target, Some(path.clone()))?;
+                self.conflict = None;
+                return Ok(ControlAnswer::Job(id));
+            }
+            crate::control::DialogAnswer::Reload if !conflict.needs_discard() => {}
+            crate::control::DialogAnswer::DiscardReload if conflict.needs_discard() => {}
+            _ => return Err(crate::Error::Unavailable),
+        }
+        let discard = matches!(answer, crate::control::DialogAnswer::DiscardReload);
+        if !discard && self.ui.editor().document(target.tab)?.dirty() {
+            let conflict = self.conflict.as_mut().ok_or(crate::Error::Unavailable)?;
+            if conflict.answer(self.ui.editor(), false)?.is_some() {
+                return Err(crate::Error::Protocol);
+            }
+            self.control_mutation_accepted();
+            return Ok(ControlAnswer::Dialog(dialog));
+        }
+        self.ui
+            .generation()
+            .checked_add(1)
+            .ok_or(crate::Error::Exhausted)?;
+        let id = self
+            .control_jobs
+            .begin_reload(target.tab, target.revision)?;
+        let permit = self
+            .conflict
+            .as_mut()
+            .ok_or(crate::Error::Unavailable)?
+            .answer(self.ui.editor(), discard);
+        match permit {
+            Ok(Some(permit)) => {
+                if self.start_reload(target, permit) {
+                    self.control_file_job = Some(ControlFile::Reload(id));
+                } else {
+                    self.control_jobs
+                        .reloaded(id, Err(crate::Error::Unavailable))?;
+                }
+            }
+            other => {
+                let code = other.err().unwrap_or(crate::Error::Protocol);
+                self.control_jobs.reloaded(id, Err(code))?;
+                self.conflict = None;
+                self.notify(format!("Reload refused: {code}; text retained"));
+            }
+        }
+        self.stop_pointer();
+        self.control_mutation_accepted();
+        Ok(ControlAnswer::Job(id))
     }
 
     fn control_close_save_job(
@@ -1971,7 +2087,40 @@ impl Window {
     fn control_dialog_fields(&self) -> String {
         let mut fields = format!("dialog-last={}\tdialog=", self.last_dialog_id);
         let Some(close) = self.closing.as_ref() else {
-            fields.push('-');
+            if let Some(target) = self.reloading {
+                if self
+                    .ui
+                    .editor()
+                    .revision_point(target.tab, target.revision)
+                    .is_ok()
+                {
+                    fields.push_str(&format!(
+                        "{},conflict,reloading,{},{},cancel",
+                        self.last_dialog_id, target.tab, target.revision
+                    ));
+                } else {
+                    fields.push_str(&format!("{},conflict,invalid,-,-,-", self.last_dialog_id));
+                }
+            } else if let Some(conflict) = &self.conflict {
+                match conflict.target(self.ui.editor()) {
+                    Ok(target) => {
+                        let (phase, answers) = if conflict.needs_discard() {
+                            ("discard", "cancel+discard-reload")
+                        } else {
+                            ("question", "cancel+reload+save-as")
+                        };
+                        fields.push_str(&format!(
+                            "{},conflict,{phase},{},{},{answers}",
+                            self.last_dialog_id, target.tab, target.revision
+                        ));
+                    }
+                    Err(_) => {
+                        fields.push_str(&format!("{},conflict,invalid,-,-,-", self.last_dialog_id))
+                    }
+                }
+            } else {
+                fields.push('-');
+            }
             return fields;
         };
         let scope = match close.scope() {
@@ -2014,7 +2163,7 @@ impl Window {
             let flag = u8::from;
             response.push_str(&format!(
                 concat!(
-                    "\tadapter=native-close-save\tnative={},{},{},{}",
+                    "\tadapter=native-conflict\tnative={},{},{},{}",
                     "\tmodal={},{},{},{},{},{},{},{},{}\tspelling={},{}",
                 ),
                 flag(self.configured),
@@ -2740,15 +2889,8 @@ impl Window {
             return;
         }
         if matches!(chord, "Escape" | "C-g") {
-            self.conflict = None;
-            if self.reloading.take().is_some() {
-                if let Some(files) = self.files.as_mut() {
-                    files.cancel_reload();
-                }
-                self.notify("Reload cancelled; pending read will finish without replacing text or baseline.");
-            } else {
-                // Keep the original file diagnostic available after dismissal.
-                self.frames.invalidate(true);
+            if let Err(detail) = self.cancel_conflict() {
+                self.notify(format!("Reload cancellation outcome unavailable: {detail}"));
             }
             return;
         }
@@ -2780,19 +2922,7 @@ impl Window {
         };
         match conflict.answer(self.ui.editor(), discard) {
             Ok(Some(permit)) => {
-                self.conflict = None;
-                let result = self
-                    .files
-                    .as_mut()
-                    .ok_or_else(|| "File session unavailable".to_string())
-                    .and_then(|files| files.reload(&self.ui, permit));
-                match result {
-                    Ok(()) => {
-                        self.reloading = Some(target);
-                        self.frames.invalidate(true);
-                    }
-                    Err(detail) => self.notify(format!("Reload refused: {detail}; text retained")),
-                }
+                self.start_reload(target, permit);
             }
             Ok(None) => self.frames.invalidate(true),
             Err(detail) => {
@@ -2800,6 +2930,51 @@ impl Window {
                 self.notify(format!("Reload refused: {detail}; text retained"));
             }
         }
+    }
+
+    fn start_reload(&mut self, target: Target, permit: crate::Reload) -> bool {
+        self.conflict = None;
+        let result = self
+            .files
+            .as_mut()
+            .ok_or_else(|| "File session unavailable".to_string())
+            .and_then(|files| files.reload(&self.ui, permit));
+        match result {
+            Ok(()) => {
+                self.reloading = Some(target);
+                self.frames.invalidate(true);
+                true
+            }
+            Err(detail) => {
+                self.notify(format!("Reload refused: {detail}; text retained"));
+                false
+            }
+        }
+    }
+
+    fn cancel_conflict(&mut self) -> crate::Result<()> {
+        self.conflict = None;
+        let outcome = if let Some(ControlFile::Reload(id)) = self.control_file_job.as_ref() {
+            let result = self
+                .control_jobs
+                .reloaded(*id, Ok(ReloadOutcome::Cancelled));
+            self.control_file_job = None;
+            result
+        } else {
+            Ok(())
+        };
+        if self.reloading.take().is_some() {
+            if let Some(files) = self.files.as_mut() {
+                files.cancel_reload();
+            }
+            self.notify(
+                "Reload cancelled; pending read will finish without replacing text or baseline.",
+            );
+        } else {
+            // Keep the original file diagnostic available after dismissal.
+            self.frames.invalidate(true);
+        }
+        outcome
     }
 
     fn conflict_notice(&self) -> Option<String> {
@@ -5626,7 +5801,7 @@ mod tests {
         assert_eq!(
             response,
             format!(
-                "{before}\tadapter=native-close-save\tnative=0,1,0,0\tmodal=0,0,0,0,0,0,0,0,0\tspelling=-,0\tjob-last=0\tdialog-last=0\tdialog=-\twindow-generation={generation}\tframe-submitted=-\tframe-completed=-"
+                "{before}\tadapter=native-conflict\tnative=0,1,0,0\tmodal=0,0,0,0,0,0,0,0,0\tspelling=-,0\tjob-last=0\tdialog-last=0\tdialog=-\twindow-generation={generation}\tframe-submitted=-\tframe-completed=-"
             )
         );
         assert_eq!(query.response(&w.ui), before);
@@ -6147,6 +6322,373 @@ mod tests {
         assert_eq!(std::fs::read(file).unwrap(), b"disk");
     }
 
+    fn remote_conflict_fixture(
+        directory: &DialogDirectory,
+        inactive: bool,
+    ) -> (Window, UnixStream, PathBuf, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&directory.0, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let socket = directory.path("control");
+        let file = directory.path("draft");
+        std::fs::write(&file, b"disk").unwrap();
+        let (mut w, peer) = file_dialog_fixture();
+        w.files.as_mut().unwrap().open(file.clone()).unwrap();
+        finish_file(&mut w);
+        w.chord("a", false).unwrap();
+        std::fs::write(&file, b"external").unwrap();
+        w.control = Some(
+            crate::control_worker::Worker::start(
+                crate::control_socket::Socket::bind(&socket).unwrap(),
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            job_request(&mut w, &peer, &socket, "1\t1\tsave\t2\t1"),
+            "1\t1\tpending\t1"
+        );
+        if inactive {
+            w.ui.dispatch(Event::New).unwrap();
+        }
+        finish_file(&mut w);
+        assert!(w
+            .control_dialog_fields()
+            .contains("dialog=1,conflict,question,2,1,cancel+reload+save-as"));
+        (w, peer, socket, file)
+    }
+
+    #[test]
+    fn remote_conflict_reload_needs_live_second_discard_and_keeps_inactive_target() {
+        let directory = DialogDirectory::new();
+        let (mut w, peer, socket, file) = remote_conflict_fixture(&directory, true);
+        configure(&mut w, 100, 80);
+        let device = w.device.unwrap();
+        w.event(message(device, 2, &[99, SURFACE])).unwrap();
+        w.conflict_chord("C-r", false);
+        assert!(!w.conflict.as_ref().unwrap().needs_discard());
+        let before = job_request(&mut w, &peer, &socket, "1\t0\tstate");
+        for (args, code) in [
+            ("0\t2\t1\treload", "invalid-argument"),
+            ("2\t2\t1\treload", "invalid-argument"),
+            ("1\t3\t1\treload", "invalid-argument"),
+            ("1\t2\t0\treload", "stale-revision"),
+            ("1\t2\t1\tdiscard-reload", "unavailable"),
+            ("1\t2\t1\tdiscard", "unavailable"),
+            ("1\t2\t1\tpath\t61", "unavailable"),
+        ] {
+            assert!(job_request(
+                &mut w,
+                &peer,
+                &socket,
+                &format!("1\t2\tdialog-answer\t{args}")
+            )
+            .contains(&format!("\terror\t{code}\t")));
+            assert_eq!(job_request(&mut w, &peer, &socket, "1\t0\tstate"), before);
+        }
+        assert_eq!(
+            job_request(
+                &mut w,
+                &peer,
+                &socket,
+                "1\t3\tdialog-answer\t1\t2\t1\treload"
+            ),
+            "1\t3\tok\tdialog\t1"
+        );
+        assert!(w
+            .control_dialog_fields()
+            .contains("1,conflict,discard,2,1,cancel+discard-reload"));
+        for action in ["reload", "save-as\t61"] {
+            assert!(job_request(
+                &mut w,
+                &peer,
+                &socket,
+                &format!("1\t4\tdialog-answer\t1\t2\t1\t{action}")
+            )
+            .contains("\terror\tunavailable\t"));
+        }
+        assert_eq!(
+            job_request(
+                &mut w,
+                &peer,
+                &socket,
+                "1\t5\tdialog-answer\t1\t2\t1\tdiscard-reload"
+            ),
+            "1\t5\tpending\t2"
+        );
+        assert_eq!(w.ui.editor().document(2).unwrap().text(), "adisk");
+        assert!(w
+            .control_dialog_fields()
+            .contains("1,conflict,reloading,2,1,cancel"));
+        assert!(job_request(
+            &mut w,
+            &peer,
+            &socket,
+            "1\t6\tdialog-answer\t1\t2\t1\tdiscard-reload"
+        )
+        .contains("\terror\tunavailable\t"));
+        finish_file(&mut w);
+        assert_eq!(w.ui.editor().active(), Some(3));
+        let doc = w.ui.editor().document(2).unwrap();
+        assert_eq!(doc.text(), "external");
+        assert_eq!(doc.revision(), 2);
+        assert!(!doc.dirty());
+        assert_eq!(std::fs::read(file).unwrap(), b"external");
+        assert!(w.conflict.is_none() && w.reloading.is_none());
+        assert!(job_request(&mut w, &peer, &socket, "1\t0\tstate")
+            .contains("job=2,reload,2,1,0,complete,-"));
+        w.stop_control();
+    }
+
+    #[test]
+    fn remote_reload_cancel_rejects_the_read_and_preserves_old_baseline() {
+        for (physical, edit) in [(false, false), (false, true), (true, false), (true, true)] {
+            let directory = DialogDirectory::new();
+            let (mut w, peer, socket, file) = remote_conflict_fixture(&directory, false);
+            assert_eq!(
+                job_request(
+                    &mut w,
+                    &peer,
+                    &socket,
+                    "1\t2\tdialog-answer\t1\t2\t1\treload"
+                ),
+                "1\t2\tok\tdialog\t1"
+            );
+            assert_eq!(
+                job_request(
+                    &mut w,
+                    &peer,
+                    &socket,
+                    "1\t3\tdialog-answer\t1\t2\t1\tdiscard-reload"
+                ),
+                "1\t3\tpending\t2"
+            );
+            if physical {
+                w.conflict_chord("Escape", false);
+            } else {
+                assert_eq!(
+                    job_request(
+                        &mut w,
+                        &peer,
+                        &socket,
+                        "1\t4\tdialog-answer\t1\t2\t1\tcancel"
+                    ),
+                    "1\t4\tok\t"
+                );
+            }
+            assert!(w.files.as_ref().unwrap().busy());
+            assert!(w.reloading.is_none() && w.control_file_job.is_none());
+            if edit {
+                w.chord("b", false).unwrap();
+            }
+            finish_file(&mut w);
+            assert_eq!(
+                w.ui.editor().document(2).unwrap().text(),
+                if edit { "abdisk" } else { "adisk" }
+            );
+            assert!(w.ui.editor().document(2).unwrap().dirty());
+            assert!(job_request(&mut w, &peer, &socket, "1\t0\tstate")
+                .contains("job=2,reload,2,1,0,cancelled,-"));
+            let revision = if edit { 2 } else { 1 };
+            assert_eq!(
+                job_request(
+                    &mut w,
+                    &peer,
+                    &socket,
+                    &format!("1\t5\tsave\t2\t{revision}")
+                ),
+                "1\t5\tpending\t3"
+            );
+            finish_file(&mut w);
+            assert_eq!(std::fs::read(&file).unwrap(), b"external");
+            assert!(w
+                .control_dialog_fields()
+                .contains(&format!("2,conflict,question,2,{revision},")));
+            assert!(job_request(
+                &mut w,
+                &peer,
+                &socket,
+                &format!("1\t6\tdialog-answer\t1\t2\t{revision}\tcancel")
+            )
+            .contains("\terror\tinvalid-argument\t"));
+            assert_eq!(
+                job_request(
+                    &mut w,
+                    &peer,
+                    &socket,
+                    &format!("1\t7\tdialog-answer\t2\t2\t{revision}\tcancel")
+                ),
+                "1\t7\tok\t"
+            );
+            assert!(w.conflict.is_none());
+            w.stop_control();
+        }
+    }
+
+    #[test]
+    fn remote_conflict_save_as_preserves_external_file_and_failed_reload_keeps_text() {
+        use std::os::unix::ffi::OsStringExt;
+        let directory = DialogDirectory::new();
+        let (mut w, peer, socket, file) = remote_conflict_fixture(&directory, true);
+        let path = directory
+            .0
+            .join(std::ffi::OsString::from_vec(b"copy-\xff".to_vec()));
+        let command = format!(
+            "1\t2\tdialog-answer\t1\t2\t1\tsave-as\t{}",
+            crate::control::hex(path.as_os_str().as_encoded_bytes())
+        );
+        assert_eq!(
+            job_request(&mut w, &peer, &socket, &command),
+            "1\t2\tpending\t2"
+        );
+        assert!(w.conflict.is_none() && w.prompt.is_none());
+        finish_file(&mut w);
+        assert_eq!(std::fs::read(file).unwrap(), b"external");
+        assert_eq!(std::fs::read(path).unwrap(), b"adisk");
+        assert!(!w.ui.editor().document(2).unwrap().dirty());
+        assert_eq!(w.ui.editor().active(), Some(3));
+        w.stop_control();
+        for bytes in [b"\0".as_slice(), b"\xff".as_slice()] {
+            let directory = DialogDirectory::new();
+            let (mut w, peer, socket, file) = remote_conflict_fixture(&directory, false);
+            std::fs::write(&file, bytes).unwrap();
+            assert_eq!(
+                job_request(
+                    &mut w,
+                    &peer,
+                    &socket,
+                    "1\t2\tdialog-answer\t1\t2\t1\treload"
+                ),
+                "1\t2\tok\tdialog\t1"
+            );
+            assert_eq!(
+                job_request(
+                    &mut w,
+                    &peer,
+                    &socket,
+                    "1\t3\tdialog-answer\t1\t2\t1\tdiscard-reload"
+                ),
+                "1\t3\tpending\t2"
+            );
+            finish_file(&mut w);
+            assert_eq!(w.ui.editor().document(2).unwrap().text(), "adisk");
+            assert_eq!(w.ui.editor().document(2).unwrap().revision(), 1);
+            assert!(w.ui.editor().document(2).unwrap().dirty());
+            assert!(job_request(&mut w, &peer, &socket, "1\t0\tstate")
+                .contains("job=2,reload,2,1,0,error,unavailable"));
+            w.stop_control();
+        }
+    }
+
+    #[test]
+    fn remote_clean_reload_is_one_answer_and_conflict_id_exhaustion_is_fail_closed() {
+        let directory = DialogDirectory::new();
+        let (mut w, peer, socket, _file) = remote_conflict_fixture(&directory, false);
+        assert_eq!(
+            job_request(
+                &mut w,
+                &peer,
+                &socket,
+                "1\t2\tdialog-answer\t1\t2\t1\tcancel"
+            ),
+            "1\t2\tok\t"
+        );
+        w.chord("C-z", false).unwrap();
+        assert!(!w.ui.editor().document(2).unwrap().dirty());
+        assert_eq!(w.ui.editor().document(2).unwrap().revision(), 2);
+        assert_eq!(
+            job_request(&mut w, &peer, &socket, "1\t3\tsave\t2\t2"),
+            "1\t3\tpending\t2"
+        );
+        finish_file(&mut w);
+        assert!(w
+            .control_dialog_fields()
+            .contains("2,conflict,question,2,2,"));
+        assert_eq!(
+            job_request(
+                &mut w,
+                &peer,
+                &socket,
+                "1\t4\tdialog-answer\t2\t2\t2\treload"
+            ),
+            "1\t4\tpending\t3"
+        );
+        finish_file(&mut w);
+        let doc = w.ui.editor().document(2).unwrap();
+        assert_eq!(doc.text(), "external");
+        assert_eq!(doc.revision(), 3);
+        assert!(!doc.dirty());
+        assert!(job_request(&mut w, &peer, &socket, "1\t0\tstate")
+            .contains("job=3,reload,2,2,0,complete,-"));
+        w.stop_control();
+
+        let directory = DialogDirectory::new();
+        let (mut w, peer, socket, file) = remote_conflict_fixture(&directory, false);
+        assert_eq!(
+            job_request(
+                &mut w,
+                &peer,
+                &socket,
+                "1\t2\tdialog-answer\t1\t2\t1\tcancel"
+            ),
+            "1\t2\tok\t"
+        );
+        w.last_dialog_id = u64::MAX;
+        assert_eq!(
+            job_request(&mut w, &peer, &socket, "1\t3\tsave\t2\t1"),
+            "1\t3\tpending\t2"
+        );
+        finish_file(&mut w);
+        assert!(w.conflict.is_none() && w.reloading.is_none());
+        assert_eq!(w.last_dialog_id, u64::MAX);
+        assert!(w.notice.as_ref().unwrap().contains("exhausted"));
+        assert_eq!(std::fs::read(file).unwrap(), b"external");
+        assert_eq!(w.ui.editor().document(2).unwrap().text(), "adisk");
+        assert!(w.ui.editor().document(2).unwrap().dirty());
+        assert!(job_request(&mut w, &peer, &socket, "1\t0\tstate")
+            .contains("job=2,save,2,1,0,error,unavailable"));
+        w.stop_control();
+    }
+
+    #[test]
+    fn remote_reload_counter_refusals_preserve_the_unconsumed_discard_permit() {
+        for guard in ["generation", "jobs"] {
+            let directory = DialogDirectory::new();
+            let (mut w, peer, socket, _file) = remote_conflict_fixture(&directory, false);
+            assert_eq!(
+                job_request(
+                    &mut w,
+                    &peer,
+                    &socket,
+                    "1\t2\tdialog-answer\t1\t2\t1\treload"
+                ),
+                "1\t2\tok\tdialog\t1"
+            );
+            if guard == "generation" {
+                w.ui.generation_for_test(u64::MAX);
+            } else {
+                w.control_jobs.exhaust_for_test();
+            }
+            let before = job_request(&mut w, &peer, &socket, "1\t0\tstate");
+            assert!(job_request(
+                &mut w,
+                &peer,
+                &socket,
+                "1\t3\tdialog-answer\t1\t2\t1\tdiscard-reload"
+            )
+            .contains("\terror\texhausted\t"));
+            assert_eq!(job_request(&mut w, &peer, &socket, "1\t0\tstate"), before);
+            assert_eq!(
+                w.conflict.as_ref().unwrap().target(w.ui.editor()).unwrap(),
+                Target {
+                    tab: 2,
+                    revision: 1
+                }
+            );
+            assert!(w.conflict.as_ref().unwrap().needs_discard());
+            assert!(!w.files.as_ref().unwrap().busy());
+            w.stop_control();
+        }
+    }
+
     #[test]
     fn remote_close_save_targets_unfocused_dialog_and_writes_before_closing() {
         use std::os::unix::fs::PermissionsExt;
@@ -6442,7 +6984,11 @@ mod tests {
             )));
             assert!(w
                 .control_response(&request("save"))
-                .contains("\terror\tunavailable\t"));
+                .contains(if associated {
+                    "\terror\tinvalid-argument\t"
+                } else {
+                    "\terror\tunavailable\t"
+                }));
         }
         let (mut w, _peer) = file_dialog_fixture();
         w.chord("a", false).unwrap();
@@ -8074,7 +8620,7 @@ mod tests {
             assert!(drain(&peer).0.contains(&message(WM, 3, &[100 + id as u32])));
             let response = control_answer(&mut w, client, &peer);
             assert!(response.starts_with(&format!("1\t{id}\tok\t")));
-            assert!(response.contains("\tadapter=native-close-save\t"));
+            assert!(response.contains("\tadapter=native-conflict\t"));
         }
         assert_eq!(w.ui.editor().tabs().count(), 1);
         assert_eq!(w.ui.editor().document(1).unwrap().text(), "");

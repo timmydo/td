@@ -233,6 +233,9 @@ pub enum DialogAnswer {
     Discard,
     Save,
     Path(PathBuf),
+    Reload,
+    DiscardReload,
+    SaveAs(PathBuf),
 }
 
 impl std::fmt::Debug for DialogAnswer {
@@ -243,6 +246,12 @@ impl std::fmt::Debug for DialogAnswer {
             Self::Save => f.write_str("Save"),
             Self::Path(path) => f
                 .debug_struct("Path")
+                .field("path_bytes", &path.as_os_str().len())
+                .finish(),
+            Self::Reload => f.write_str("Reload"),
+            Self::DiscardReload => f.write_str("DiscardReload"),
+            Self::SaveAs(path) => f
+                .debug_struct("SaveAs")
                 .field("path_bytes", &path.as_os_str().len())
                 .finish(),
         }
@@ -381,6 +390,11 @@ impl Request {
                         "cancel" => DialogAnswer::Cancel,
                         "discard" => DialogAnswer::Discard,
                         "save" => DialogAnswer::Save,
+                        "reload" => DialogAnswer::Reload,
+                        "discard-reload" => DialogAnswer::DiscardReload,
+                        "save-as" => {
+                            DialogAnswer::SaveAs(os_path(args.next().ok_or(Error::Protocol)?)?)
+                        }
                         "path" => DialogAnswer::Path(os_path(args.next().ok_or(Error::Protocol)?)?),
                         _ => return Err(Error::InvalidArgument),
                     },
@@ -999,6 +1013,9 @@ mod tests {
             "1\t3\tdialog-answer\t4\t2\t3\tdiscard",
             "1\t4\tdialog-answer\t4\t2\t3\tsave",
             "1\t5\tdialog-answer\t4\t2\t3\tpath\t2fff",
+            "1\t6\tdialog-answer\t4\t2\t3\treload",
+            "1\t7\tdialog-answer\t4\t2\t3\tdiscard-reload",
+            "1\t8\tdialog-answer\t4\t2\t3\tsave-as\t2fff",
         ] {
             let request = Request::parse(payload.as_bytes()).unwrap();
             assert!(request.is_mutating());
@@ -1017,6 +1034,10 @@ mod tests {
             "dialog-answer\t1\t2\t3\tsave\textra",
             "dialog-answer\t1\t2\t3\tpath",
             "dialog-answer\t1\t2\t3\tpath\t61\textra",
+            "dialog-answer\t1\t2\t3\treload\textra",
+            "dialog-answer\t1\t2\t3\tdiscard-reload\textra",
+            "dialog-answer\t1\t2\t3\tsave-as",
+            "dialog-answer\t1\t2\t3\tsave-as\t61\textra",
         ] {
             assert_eq!(
                 Request::parse(format!("1\t4\t{payload}").as_bytes())
@@ -1069,6 +1090,32 @@ mod tests {
             format!("1\t0\tdialog-answer\t1\t2\t3\tpath\t{}", "61".repeat(4096)).as_bytes()
         )
         .is_ok());
+    }
+
+    #[test]
+    fn conflict_save_as_paths_share_bounds_and_debug_privacy() {
+        let secret = b"private-conflict-destination";
+        let request = Request::parse(
+            format!("1\t0\tdialog-answer\t1\t2\t3\tsave-as\t{}", hex(secret)).as_bytes(),
+        )
+        .unwrap();
+        let debug = format!("{request:?}");
+        assert!(debug.contains("SaveAs { path_bytes: 28 }"));
+        assert!(!debug.contains("private-conflict-destination"));
+        assert!(!debug.contains(&hex(secret)));
+        for (path, error) in [
+            ("".into(), Error::Protocol),
+            ("00".into(), Error::InvalidArgument),
+            ("x1".into(), Error::Protocol),
+            ("61".repeat(4097), Error::Limit),
+        ] {
+            assert_eq!(
+                Request::parse(format!("1\t0\tdialog-answer\t1\t2\t3\tsave-as\t{path}").as_bytes())
+                    .unwrap_err()
+                    .error,
+                error
+            );
+        }
     }
 
     #[test]

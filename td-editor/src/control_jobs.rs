@@ -9,6 +9,12 @@ use std::fmt::Write;
 const RECORDS: usize = 64;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ReloadOutcome {
+    Complete,
+    Cancelled,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Status {
     Pending,
     Complete,
@@ -22,6 +28,7 @@ enum Kind {
     Open,
     Save,
     SaveAs,
+    Reload,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -56,6 +63,27 @@ impl Jobs {
 
     pub(crate) fn begin_open(&mut self) -> Result<u64> {
         self.reserve(Kind::Open, 0, 0)
+    }
+
+    pub(crate) fn begin_reload(&mut self, tab: TabId, revision: u64) -> Result<u64> {
+        self.reserve(Kind::Reload, tab, revision)
+    }
+
+    pub(crate) fn reloaded(&mut self, id: u64, result: Result<ReloadOutcome>) -> Result<()> {
+        let record = self
+            .records
+            .iter_mut()
+            .find(|record| record.id == id)
+            .ok_or(Error::InvalidArgument)?;
+        if record.kind != Kind::Reload || record.status != Status::Pending {
+            return Err(Error::InvalidArgument);
+        }
+        record.status = match result {
+            Ok(ReloadOutcome::Complete) => Status::Complete,
+            Ok(ReloadOutcome::Cancelled) => Status::Cancelled,
+            Err(error) => Status::Failed(error),
+        };
+        Ok(())
     }
 
     pub(crate) fn begin_save(&mut self, tab: TabId, revision: u64, save_as: bool) -> Result<u64> {
@@ -190,6 +218,7 @@ impl Jobs {
                     Kind::Open => "open",
                     Kind::Save => "save",
                     Kind::SaveAs => "save-as",
+                    Kind::Reload => "reload",
                 },
                 record.tab,
                 record.revision,
@@ -212,6 +241,41 @@ mod tests {
     use crate::model::{Command, Selection};
     use crate::spelling::Dictionary;
     use crate::ui::{Controller, Event};
+
+    #[test]
+    fn reload_jobs_pin_requested_targets_and_cancellation_is_terminal() {
+        let mut jobs = Jobs::default();
+        let id = jobs.begin_reload(7, 9).unwrap();
+        assert_eq!(jobs.saved(id, Ok(())), Err(Error::InvalidArgument));
+        assert_eq!(jobs.started(id, Ok(Some(1))), Err(Error::InvalidArgument));
+        assert!(!jobs.observe(&Editor::default(), &WindowState::default()));
+        jobs.reloaded(id, Ok(ReloadOutcome::Cancelled)).unwrap();
+        assert!(jobs
+            .fields()
+            .unwrap()
+            .contains("job=1,reload,7,9,0,cancelled,-"));
+        assert_eq!(
+            jobs.reloaded(id, Ok(ReloadOutcome::Complete)),
+            Err(Error::InvalidArgument)
+        );
+        let next = jobs.begin_reload(7, 9).unwrap();
+        jobs.reloaded(next, Ok(ReloadOutcome::Complete)).unwrap();
+        assert!(jobs
+            .fields()
+            .unwrap()
+            .contains("job=2,reload,7,9,0,complete,-"));
+        let error = jobs.begin_reload(7, 10).unwrap();
+        jobs.reloaded(error, Err(Error::Unavailable)).unwrap();
+        assert!(jobs
+            .fields()
+            .unwrap()
+            .contains("job=3,reload,7,10,0,error,unavailable"));
+        let save = jobs.begin_save(7, 10, false).unwrap();
+        assert_eq!(
+            jobs.reloaded(save, Ok(ReloadOutcome::Cancelled)),
+            Err(Error::InvalidArgument)
+        );
+    }
 
     #[test]
     fn save_jobs_keep_the_requested_revision_and_reject_cross_kind_completion() {
