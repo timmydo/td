@@ -6,6 +6,8 @@ const FRAME_BYTES: usize = 800 * 600 * 3;
 const KEY_W: u32 = 17;
 const KEY_Y: u32 = 21;
 const KEY_G: u32 = 34;
+const KEY_C: u32 = 46;
+const KEY_LEFT_ALT: u32 = 56;
 const KEY_SPACE: u32 = 57;
 const KEY_HOME: u32 = 102;
 const KEY_RIGHT: u32 = 106;
@@ -611,13 +613,30 @@ fn native_horizontal_wheel_respects_wrap_and_clamps_columns() {
 #[test]
 #[ignore = "requires explicit built TD_TEST_COMPOSITOR; ready prepares it"]
 fn native_clipboard_transfers_cut_snapshot_between_editors() {
-    clipboard_between_editors("windows");
+    clipboard_between_editors("windows", ClipboardOperation::Cut);
 }
 
 #[test]
 #[ignore = "requires explicit built TD_TEST_COMPOSITOR; ready prepares it"]
 fn native_emacs_clipboard_transfers_marked_snapshot_between_editors() {
-    clipboard_between_editors("emacs");
+    clipboard_between_editors("emacs", ClipboardOperation::Cut);
+}
+
+#[test]
+#[ignore = "requires explicit built TD_TEST_COMPOSITOR; ready prepares it"]
+fn native_windows_copy_preserves_selection_and_transfers_snapshot() {
+    clipboard_between_editors("windows", ClipboardOperation::Copy);
+}
+
+#[test]
+#[ignore = "requires explicit built TD_TEST_COMPOSITOR; ready prepares it"]
+fn native_emacs_copy_preserves_selection_and_transfers_snapshot() {
+    clipboard_between_editors("emacs", ClipboardOperation::Copy);
+}
+
+enum ClipboardOperation {
+    Copy,
+    Cut,
 }
 
 fn select_clipboard_text(compositor: &mut Compositor, profile: &str) {
@@ -630,7 +649,7 @@ fn select_clipboard_text(compositor: &mut Compositor, profile: &str) {
     }
 }
 
-fn clipboard_between_editors(profile: &str) {
+fn clipboard_between_editors(profile: &str, operation: ClipboardOperation) {
     assert!(matches!(profile, "windows" | "emacs"), "unsupported key profile");
     let compositor_directory = Directory::new();
     let source_directory = Directory::new();
@@ -657,20 +676,40 @@ fn clipboard_between_editors(profile: &str) {
     select_clipboard_text(&mut compositor, profile);
     // CONTROL.md tab: ID, revision, dirty, bytes, anchor, caret,
     // auto-fill, fill-column, BOM, ending. Keep the full wire oracle literal.
-    source.wait_field(
-        "state",
-        "tab",
-        &format!("1,0,0,{0},0,{0},0,72,0,lf", text.len()),
-    );
-    let cut_key = if profile == "emacs" { KEY_W } else { KEY_X };
+    let initial_selection = format!("1,0,0,{0},0,{0},0,72,0,lf", text.len());
+    source.wait_field("state", "tab", &initial_selection);
     let paste_key = if profile == "emacs" { KEY_Y } else { KEY_V };
-    compositor.chord(Some(KEY_LEFT_CTRL), cut_key);
-    source.wait_tab(1, "");
+    let source_revision = match operation {
+        ClipboardOperation::Cut => {
+            let cut_key = if profile == "emacs" { KEY_W } else { KEY_X };
+            compositor.chord(Some(KEY_LEFT_CTRL), cut_key);
+            source.wait_tab(1, "");
+            2
+        }
+        ClipboardOperation::Copy => {
+            let offered = td_editor::control::hex(b"Selection offered to clipboard.");
+            assert_ne!(
+                field(&source.ok("prompt-state"), "notice"),
+                Some(offered.as_str()),
+                "Copy must start without prior selection-offered feedback"
+            );
+            if profile == "emacs" {
+                compositor.chord(Some(KEY_LEFT_ALT), KEY_W);
+            } else {
+                compositor.chord(Some(KEY_LEFT_CTRL), KEY_C);
+            }
+            source.wait_field("prompt-state", "notice", &offered);
+            source.wait_field("state", "tab", &initial_selection);
+            source.wait_tab(0, text);
+            assert_eq!(std::fs::read(&source_path).unwrap(), text.as_bytes());
+            1
+        }
+    };
     let before = compositor.observe(&source_window);
     compositor.chord(None, KEY_B);
-    source.wait_tab(2, "b");
-    compositor.rendered_text(&mut source, &source_window, 2, before, "b", 1);
-    source.job("save\t1\t2");
+    source.wait_tab(source_revision, "b");
+    compositor.rendered_text(&mut source, &source_window, source_revision, before, "b", 1);
+    source.job(&format!("save\t1\t{source_revision}"));
     assert_eq!(std::fs::read(&source_path).unwrap(), b"b");
     // Reveal tiling before mapping the destination. The reply fences the
     // compositor layout change; no intermediate source frame is sampled.
@@ -714,7 +753,7 @@ fn clipboard_between_editors(profile: &str) {
     );
     destination.job("save\t1\t1");
     assert_eq!(std::fs::read(&destination_path).unwrap(), text.as_bytes());
-    source.wait_tab(2, "b");
+    source.wait_tab(source_revision, "b");
     source.quit();
     let deadline = Instant::now() + TIMEOUT;
     loop {

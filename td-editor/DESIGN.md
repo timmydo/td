@@ -2262,6 +2262,16 @@ revision/text/disk bytes. That collapse receives the same publication and
 pixel fence as Right in the Windows case, which retains non-modal
 feedback after motion. These are profile-specific
 input paths to the same ordinary Wayland clipboard, not a kill ring.
+Two additional native cases exercise Copy without any following Cut:
+Windows Ctrl+C and Emacs M-w (routed Left Alt plus W). Fresh
+selection-offered feedback fences the command before asserting unchanged
+directed selection, revision, text and disk. Replacing the source with `b`
+then takes one revision rather than Cut's two. Paste into the second
+editor must still receive the complete pre-replacement UTF-8 snapshot.
+Both cases retain the source/destination capture fences and owner-exit
+refusal, profile-specific collapse and saved-byte checks above. Offered
+feedback means local publication, not compositor acknowledgement; the
+actual inter-client transfer independently proves the usable selection.
 Weston remains separate optional interoperability evidence below.
 
 The opt-in `disposable_weston_runs_the_production_editor_and_control_workers`
