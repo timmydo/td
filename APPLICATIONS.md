@@ -1973,6 +1973,16 @@ user, handed over through their own descriptors, written once and never
 rewritten. The jail's ownership rules are unchanged: it still refuses state
 that is not the user's.
 
+The application-identity preparation supports private account homes at
+`/var/lib/td/applications/APP_UID`, retaining the same relative jail layout.
+Only an installed, validated application account consumes its reservation.
+Firstboot moves existing state behind a root-owned home, converts ownership,
+then publishes that home to the app; it preserves credential-store ownership
+and the logical human identity. The restart, refusal and startup assumptions
+are specified in `td-authd/DESIGN.md` under Application state preparation.
+The stock image still reserves application accounts; their activation must
+switch launch, cgroups, grants and socket authorization together (§L).
+
 
 ### B.5 Activation and state — there is no install
 

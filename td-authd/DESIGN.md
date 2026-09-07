@@ -310,6 +310,73 @@ active applications: only the current immutable deployment declares those.
 Root and deployment configuration remain trusted; these checks catch
 accidental UID recycling, not a root attacker rewriting the ledger.
 
+### Application state preparation
+
+An activated application account's home must be exactly
+`/var/lib/td/applications/APP_UID`. The shared account validator checks this
+for retained as well as current application reservations. An absent account
+remains a reservation; its row alone creates no application state or runtime.
+The stock image still reserves these accounts. Their image activation must
+also switch the root launcher, cgroups, socket admission and fetch services.
+
+When a deployed application account is present, firstboot prepares its home
+after checking the durable registry and before reporting enrollment success.
+It requires the configured human migration home for that application's
+owner. The current provisioner invocation configures one human home; it
+refuses a deployment with active applications for another owner. This is a
+sysinit operation before human or application processes start, not a live
+ownership conversion. Root configuration and that startup ordering are trusted.
+It does not revoke descriptors or historical copies from an earlier session.
+Unlike optional template provisioning, failed active-account preparation is
+fatal to firstboot and withholds enrollment success and dependent services.
+It must never authorize launch against an unconverted state tree. The image
+currently has one human session; multiple active owners need a provisioner
+configuration naming each migration source before that deployment can boot.
+A refused source remains available for correction from a previous deployment;
+an I/O-interrupted moved tree may require root offline repair. No fallback
+silently creates a fresh app profile or discards existing data. Human UID and
+GID may differ; the application account uses its assigned UID for both.
+The stock /home link and private state share the persistent @var subvolume.
+Cross-filesystem rename is unsupported and refuses before moving data.
+
+The persistent applications parent is root-owned mode 0755. A stable,
+root-owned, single-link, empty mode-0600 `.migration.lock` serializes home
+conversion writers with an immediate busy refusal. It is acquired per home, not across template provisioning or credential
+writes. It is never renamed or removed.
+Interrupted creation may normalize missing owner mode bits on this validated
+empty lock. Root must not replace a live lock or change the mount hierarchy.
+
+Each new home stays root-owned mode 0700 until its entire conversion is
+synced. Firstboot validates the existing human `.td/app/NAME` tree without writes,
+then moves its directory into
+that home, through retained source and destination directory descriptors.
+It keeps the jail's `.td/app/NAME` layout. It never copies or merges a second
+tree over existing state. A published app-owned mode-0700 home is complete;
+later human recreations of the old path are ignored. All supported launches
+must use the private home when the image activates the account.
+
+Conversion preserves regular-file bytes and permission bits, changes UID/GID
+to the reserved app identity, and syncs files and directories before
+publishing home ownership. It preserves symlink text without following it;
+only the link's owner changes. Special files, hardlinks, foreign owners,
+cross-device trees and setuid/setgid bits are refused. Traversal is bounded
+to one million entries and depth 64. A preflight refusal leaves the human pathname and ownership intact.
+A later I/O failure during conversion leaves the moved tree behind
+the root-owned home; it is not discarded. Failure before the move does not
+claim removal of human access. Same-device bind aliases and previously open
+descriptors are excluded by the trusted pre-session startup assumption,
+not detected by the device-number check.
+
+Restart accepts partially converted app-owned children under the root-owned
+home, including converted scaffolds and an interrupted empty creation with
+masked permissions. An unpublished empty destination does not override an
+existing legacy tree: validation and rename are retried first. It never repairs a published app-owned home's contents.
+The terminal configuration provisioner then writes only each application's
+own template into its private home. Credential records retain the logical
+human UID and the portal file owner; an application UID never becomes the
+credential-store identity. No account, launch or FIDO consent is enabled by
+this preparation support alone.
+
 Recovery of this non-secret ledger is an offline maintenance operation, not
 token recovery or an authorization bypass. Stop all enrollment writers
 before repairing a scratch file; unlinking a live lock would split writer

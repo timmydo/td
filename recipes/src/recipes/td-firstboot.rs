@@ -38,6 +38,7 @@ pub(crate) const MAIN_RS: &str = include_str!("../../../td-firstboot/src/main.rs
 
 // (module basename, source text). rustc resolves `mod NAME;` to `{src}/NAME.rs`.
 const MODULES: &[(&str, &str)] = &[
+    ("application_state", include_str!("../../../td-firstboot/src/application_state.rs")),
     (
         "credentials",
         include_str!("../../../td-firstboot/src/credentials.rs"),

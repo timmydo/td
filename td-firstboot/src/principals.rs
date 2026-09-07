@@ -5,12 +5,16 @@ use std::fs::{File, OpenOptions};
 use std::io::Read;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 #[path = "../../engine/src/principals.rs"]
 mod table;
 use table::decimal;
-pub(crate) use table::{Registry, MAX_BYTES};
+pub(crate) use table::{Application, Registry, MAX_BYTES};
+
+pub(crate) fn application_home(uid: u32) -> PathBuf {
+    Path::new("/var/lib/td/applications").join(uid.to_string())
+}
 
 const TABLE_NAME: &str = "td-principals.tsv";
 pub(crate) const O_NOFOLLOW: i32 = 0x20000;
@@ -99,6 +103,34 @@ fn account_rows(text: &str) -> Result<Vec<Vec<&str>>, String> {
 }
 
 impl Registry {
+    /// Call after the complete current and retained account validation.
+    pub(crate) fn active_applications(&self) -> Result<Vec<Application>, String> {
+        let etc = etc_directory(Path::new("/"), Some((0, 0)))?;
+        self.application_accounts(&read_root_file(&etc, "passwd", None)?)
+    }
+
+    fn application_accounts(&self, passwd: &str) -> Result<Vec<Application>, String> {
+        let mut active = Vec::new();
+        for row in account_rows(passwd)? {
+            let [name, "x", uid, gid, _, home, shell] = row.as_slice() else {
+                return Err("invalid principal passwd row".into());
+            };
+            let uid = decimal(uid, 0..=u32::MAX)?;
+            if let Some(application) = self.applications().find(|application| application.uid == uid) {
+                if *name != format!("tda{uid}")
+                    || *gid != uid.to_string()
+                    || std::ffi::OsStr::new(home) != application_home(uid).as_os_str()
+                    || *shell != "/bin/false"
+                    || active.iter().any(|prior: &Application| prior.uid == uid)
+                {
+                    return Err("application account does not match its private identity and home".into());
+                }
+                active.push(application.clone());
+            }
+        }
+        Ok(active)
+    }
+
     pub fn verify_launch_session(
         &self,
         user: &str,
@@ -207,6 +239,7 @@ impl Registry {
         group: &str,
         shadow: &str,
     ) -> Result<(), String> {
+        self.application_accounts(passwd)?;
         let names = self.account_names();
         let mut seen_uids = BTreeSet::new();
         let mut seen_names = BTreeSet::new();

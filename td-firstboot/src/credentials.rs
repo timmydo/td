@@ -207,11 +207,12 @@ pub(super) fn provision(
     owner: &ApplicationHome,
     directory: &File,
     file_owner: u32,
+    logical_uid: u32,
 ) -> Result<(), Failure> {
     let _parent = store_parent(state)?;
-    let store = secret_store::Store::open_owned(&state.join("secrets").join(owner.uid.to_string()), owner.uid, file_owner, true)
+    let store = secret_store::Store::open_owned(&state.join("secrets").join(logical_uid.to_string()), logical_uid, file_owner, true)
         .map_err(Failure::Failed)?;
-    if file_owner == owner.uid {
+    if file_owner == logical_uid {
         store.release().map_err(Failure::Failed)?;
     }
     let pinned = std::path::PathBuf::from(format!("/proc/self/fd/{}", directory.as_raw_fd()));
@@ -377,12 +378,12 @@ mod tests {
             Some(&owner),
         )
         .unwrap();
-        provision(&root, &owner, &directory, owner.uid).unwrap();
+        provision(&root, &owner, &directory, owner.uid, owner.uid).unwrap();
         assert_eq!(
             fs::metadata(root.join("secrets")).unwrap().mode() & 0o7777,
             0o755
         );
-        provision(&root, &owner, &directory, owner.uid).unwrap();
+        provision(&root, &owner, &directory, owner.uid, owner.uid).unwrap();
         assert!(!root.join("password").exists());
         assert!(fs::read_to_string(root.join("config.toml"))
             .unwrap()
@@ -407,7 +408,7 @@ mod tests {
                 Some(&owner),
             )
             .unwrap();
-            assert!(provision(&root, &owner, &directory, owner.uid).is_err());
+            assert!(provision(&root, &owner, &directory, owner.uid, owner.uid).is_err());
             assert_eq!(
                 fs::read_to_string(root.join("config.toml")).unwrap(),
                 custom

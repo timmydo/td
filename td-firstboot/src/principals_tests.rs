@@ -9,6 +9,31 @@ const GROUP: &str = "root:x:0:\ntester:x:1000:\nother:x:1001:\nwheel:x:10:tester
 const SHADOW: &str = "root::0:0:99999:7:::\ntester::0:0:99999:7:::\nother::0:0:99999:7:::\n";
 
 #[test]
+fn active_application_accounts_bind_reserved_uids_to_private_homes() {
+    let registry = Registry::parse(TABLE).unwrap();
+    assert!(registry.application_accounts(PASSWD).unwrap().is_empty());
+    let row = "tda65536:x:65536:65536:Browser:/var/lib/td/applications/65536:/bin/false\n";
+    let passwd = format!("{PASSWD}{row}");
+    let group = format!("{GROUP}tda65536:x:65536:\n");
+    let shadow = format!("{SHADOW}tda65536:!td-service:0:0:99999:7:::\n");
+    registry.verify_accounts(&passwd, &group, &shadow).unwrap();
+    let active = registry.application_accounts(&passwd).unwrap();
+    assert_eq!(active, vec![Application { owner: 1000, name: "firefox".into(), uid: 65536 }]);
+    for bad in [
+        passwd.replace("applications/65536", "applications/65537"),
+        passwd.replace("/var/lib/td/applications/65536", "/home/tester"),
+        passwd.replace("applications/65536", "applications/65536/../65536"),
+        passwd.replace("applications/65536", "applications//65536"),
+        passwd.replace("applications/65536", "applications/./65536"),
+        passwd.replace("65536:65536", "65536:1000"),
+        passwd.replace("tda65536", "tester-app"),
+        format!("{passwd}{row}"),
+    ] {
+        assert!(registry.verify_accounts(&bad, &group, &shadow).is_err());
+    }
+}
+
+#[test]
 fn reservations_allow_only_unique_service_accounts_without_supplementary_authority() {
     let registry = Registry::parse(TABLE).unwrap();
     registry.verify_accounts(PASSWD, GROUP, SHADOW).unwrap();

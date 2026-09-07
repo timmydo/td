@@ -15,6 +15,7 @@
 //! program in the image that already has the required key implementation, so this crate
 //! stays dependency-free `std`; credential encryption shares td-secret's implementation.
 
+mod application_state;
 mod credentials;
 #[path = "../../td-secret/src/crypto.rs"]
 mod crypto;
@@ -202,7 +203,7 @@ fn usage() -> String {
          [--application-home DIR --application-owner UID:GID] [--enroll-principals]\n  \
          provisions this machine's identity under {DEFAULT_STATE_DIR}: {MACHINE_ID}, \
          {HOST_KEY}(.pub), {AUTHORIZED_KEYS}; with the application pair, a first \
-         configuration for each terminal application under DIR/{APPLICATION_STATE_ROOT}\n  \
+         configuration under DIR/{APPLICATION_STATE_ROOT} or its validated private app home\n  \
          td-firstboot check-principals ROOT validates staged deployment identities without writing\n  \
          td-firstboot check-launch-session USER UID COMPOSITOR_UID verifies live reservations\n"
     )
@@ -255,6 +256,7 @@ fn run(args: &[String]) -> Result<(), Failure> {
     // machine on the next boot.
     sync_directories(&plan.key_dir, boundary.as_deref())?;
 
+    let mut active_homes = std::collections::BTreeMap::new();
     let mut credential_owner = config.applications.as_ref().map(|home| home.uid);
     if config.enroll_principals {
         let desired = principals::Registry::load().map_err(Failure::Failed)?;
@@ -262,6 +264,15 @@ fn run(args: &[String]) -> Result<(), Failure> {
         principal_store::prepare_broker_runtimes(&desired).map_err(Failure::Failed)?;
         principal_store::prepare_portal_runtimes(&desired).map_err(Failure::Failed)?;
         credentials::isolate_stores(&config.state, &desired)?;
+        for application in desired.active_applications().map_err(Failure::Failed)? {
+            let former = config.applications.as_ref().filter(|home| home.uid == application.owner)
+                .ok_or_else(|| Failure::Failed("active application lacks its configured human migration home".into()))?;
+            let home = application_state::prepare(former, &application.name, application.uid)
+                .map_err(Failure::Failed)?;
+            emit(&format!("TD-APPLICATION-STATE-READY owner={} app={} uid={}\n",
+                application.owner, application.name, application.uid)).map_err(Failure::Failed)?;
+            active_homes.insert(application.name, home);
+        }
         if let Some(home) = &config.applications {
             credential_owner = Some(desired.sessions().find(|session| session.owner == home.uid)
                 .ok_or_else(|| Failure::Failed("credential owner has no configured session".into()))?.portal);
@@ -294,15 +305,12 @@ fn run(args: &[String]) -> Result<(), Failure> {
     ))
     .map_err(Failure::Failed)?;
 
-    // After the identity has been reported, and outside the first-boot
-    // decision: an application added by a later image gets its configuration
-    // on the next boot without that boot reporting a re-minted identity, and
-    // nothing under the login user's own home can withhold that report or
-    // fail this unit. The home is the user's to break; what breaks there is
-    // said on the console and shows up as the application's own failure.
+    // Template errors do not change machine identity or fail unrelated services.
+    // Active-account ownership preparation above must succeed before enrollment
+    // is reported; template provisioning does not substitute for that boundary.
     if let Some(applications) = &config.applications {
         let credential_owner = credential_owner.ok_or_else(|| Failure::Failed("credential owner is missing".into()))?;
-        match provision_applications(applications, &config.state, credential_owner) {
+        match provision_application_homes(applications, &config.state, credential_owner, &active_homes) {
             Ok(outcomes) => {
                 for (application, outcome) in outcomes {
                     emit_err(&format!(
@@ -499,12 +507,41 @@ fn parse_owner(value: &str) -> Result<(u32, u32), Failure> {
 /// following a link. A file that exists is left exactly as it is, whatever it
 /// says: the operator's edits are the point, and "provision" must never mean
 /// "reset". A home that is absent, a link, not a directory, or not the user's
-/// is reported and skipped, never failed: the identity does not depend on a
-/// mail client, and the home is the user's to break.
+/// is reported and skipped during this optional template step. Activated
+/// account ownership preparation is separate and must succeed before the
+/// enrollment marker or any dependent application launch.
 fn provision_applications(
     owner: &ApplicationHome,
     state_dir: &Path,
     credential_owner: u32,
+) -> Result<Vec<(&'static str, Outcome)>, Failure> {
+    provision_selected(owner, state_dir, credential_owner, owner.uid, APPLICATION_CONFIGS)
+}
+
+fn provision_application_homes(
+    owner: &ApplicationHome,
+    state_dir: &Path,
+    credential_owner: u32,
+    homes: &std::collections::BTreeMap<String, ApplicationHome>,
+) -> Result<Vec<(&'static str, Outcome)>, Failure> {
+    if homes.is_empty() {
+        return provision_applications(owner, state_dir, credential_owner);
+    }
+    let mut outcomes = Vec::new();
+    for config in APPLICATION_CONFIGS {
+        let filesystem_owner = homes.get(config.application).unwrap_or(owner);
+        outcomes.extend(provision_selected(filesystem_owner, state_dir, credential_owner,
+            owner.uid, std::slice::from_ref(config))?);
+    }
+    Ok(outcomes)
+}
+
+fn provision_selected(
+    owner: &ApplicationHome,
+    state_dir: &Path,
+    credential_owner: u32,
+    logical_uid: u32,
+    configs: &[ApplicationConfig],
 ) -> Result<Vec<(&'static str, Outcome)>, Failure> {
     let home = match open_directory(&owner.home) {
         Ok(home) => home,
@@ -553,8 +590,8 @@ fn provision_applications(
         parent = owned_dir(&applications, owner, &parent)?;
     }
     let root = parent;
-    let mut outcomes = Vec::with_capacity(APPLICATION_CONFIGS.len());
-    for config in APPLICATION_CONFIGS {
+    let mut outcomes = Vec::with_capacity(configs.len());
+    for config in configs {
         let mut directory = applications.join(config.application);
         let application = owned_dir(&directory, owner, &root)?;
         directory.push("config");
@@ -563,7 +600,7 @@ fn provision_applications(
         let program_dir = owned_dir(&directory, owner, &configuration)?;
         if config.application == "mail" {
             if let Err(Failure::Failed(reason) | Failure::Usage(reason)) =
-                credentials::provision(state_dir, owner, &program_dir, credential_owner)
+                credentials::provision(state_dir, owner, &program_dir, credential_owner, logical_uid)
             {
                 emit_err(&format!("td-firstboot: mail credential/configuration not provisioned: {reason}\n"));
                 continue;
@@ -1390,6 +1427,40 @@ mod tests {
     /// The tree td-jail expects, owned by the user, written once. Run as the
     /// current user: `chown` to one's own identity is permitted unprivileged,
     /// which is what lets the ownership path execute here at all.
+    #[test]
+    fn active_application_configs_use_private_homes_and_the_human_secret_identity() {
+        let root = std::env::temp_dir().join(format!("td-firstboot-active-apps-{}", std::process::id()));
+        std::fs::create_dir(&root).unwrap();
+        struct Cleanup(PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
+        }
+        let _cleanup = Cleanup(root.clone());
+        let metadata = std::fs::metadata(&root).unwrap();
+        let uid = metadata.uid();
+        let gid = metadata.gid();
+        let logical = uid.checked_add(1).unwrap();
+        let human = ApplicationHome { home: root.join("human"), uid: logical, gid: logical };
+        let mut homes = std::collections::BTreeMap::new();
+        for name in ["mail", "news"] {
+            let home = root.join(name);
+            std::fs::create_dir(&home).unwrap();
+            homes.insert(name.into(), ApplicationHome { home, uid, gid });
+        }
+        assert_eq!(provision_application_homes(&human, &root, uid, &homes).unwrap(),
+            vec![("mail", Outcome::Created), ("news", Outcome::Created)]);
+        assert!(!human.home.exists());
+        for name in ["mail", "news"] {
+            let directory = root.join(name).join(APPLICATION_STATE_ROOT);
+            assert!(directory.join(name).is_dir());
+            let other = if name == "mail" { "news" } else { "mail" };
+            assert!(!directory.join(other).exists());
+        }
+        let store = secret_store::Store::open_owned(&root.join("secrets").join(logical.to_string()), logical, uid, false).unwrap();
+        assert_eq!(store.get("mail", "main").unwrap().unwrap(), b"replace-me\n");
+        assert!(!root.join("secrets").join(uid.to_string()).exists());
+    }
+
     #[test]
     fn application_configurations_are_provisioned_once_into_the_jail_state_tree() {
         let root =
