@@ -13,6 +13,7 @@ const HELP: &str = concat!(
     "Remote control answers human-opened dialogs, without physical focus.\n",
     "Control conflict Reload needs a second discard answer for unsaved text.\n",
     "Control conflict Save As takes a new path; Reload jobs report cancellation.\n",
+    "Control also answers live Open/Save As/Dictionary paths by ID and revision.\n",
     "Experimental Wayland file editor. Do not use as $EDITOR yet.\n",
     "Windows files: Ctrl+O, Ctrl+S, Ctrl+Shift+S. Emacs: C-x C-f, C-x C-s, C-x C-w.\n",
     "Open/Save As path entry: Return submits, Escape/Ctrl+G cancels, Ctrl+U clears.\n",
@@ -185,6 +186,7 @@ mod tests {
             "human-opened dialogs, without physical focus",
             "Reload needs a second discard answer",
             "Reload jobs report cancellation",
+            "answers live Open/Save As/Dictionary paths by ID and revision",
         ] {
             assert!(HELP.contains(feature), "{feature}");
         }

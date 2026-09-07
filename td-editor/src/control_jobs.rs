@@ -29,6 +29,7 @@ enum Kind {
     Save,
     SaveAs,
     Reload,
+    Dictionary,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -67,6 +68,26 @@ impl Jobs {
 
     pub(crate) fn begin_reload(&mut self, tab: TabId, revision: u64) -> Result<u64> {
         self.reserve(Kind::Reload, tab, revision)
+    }
+
+    pub(crate) fn begin_dictionary(&mut self) -> Result<u64> {
+        self.reserve(Kind::Dictionary, 0, 0)
+    }
+
+    pub(crate) fn dictionary(&mut self, id: u64, result: Result<()>) -> Result<()> {
+        let record = self
+            .records
+            .iter_mut()
+            .find(|record| record.id == id)
+            .ok_or(Error::InvalidArgument)?;
+        if record.kind != Kind::Dictionary || record.status != Status::Pending {
+            return Err(Error::InvalidArgument);
+        }
+        record.status = match result {
+            Ok(()) => Status::Complete,
+            Err(error) => Status::Failed(error),
+        };
+        Ok(())
     }
 
     pub(crate) fn reloaded(&mut self, id: u64, result: Result<ReloadOutcome>) -> Result<()> {
@@ -219,6 +240,7 @@ impl Jobs {
                     Kind::Save => "save",
                     Kind::SaveAs => "save-as",
                     Kind::Reload => "reload",
+                    Kind::Dictionary => "dictionary",
                 },
                 record.tab,
                 record.revision,
@@ -241,6 +263,32 @@ mod tests {
     use crate::model::{Command, Selection};
     use crate::spelling::Dictionary;
     use crate::ui::{Controller, Event};
+
+    #[test]
+    fn dictionary_jobs_are_global_historical_and_kind_bound() {
+        let mut jobs = Jobs::default();
+        let id = jobs.begin_dictionary().unwrap();
+        assert!(!jobs.observe(&Editor::default(), &WindowState::default()));
+        assert_eq!(jobs.saved(id, Ok(())), Err(Error::InvalidArgument));
+        assert_eq!(jobs.started(id, Ok(Some(1))), Err(Error::InvalidArgument));
+        jobs.dictionary(id, Ok(())).unwrap();
+        assert!(jobs
+            .fields()
+            .unwrap()
+            .contains("job=1,dictionary,0,0,0,complete,-"));
+        assert_eq!(
+            jobs.dictionary(id, Err(Error::Unavailable)),
+            Err(Error::InvalidArgument)
+        );
+        let failure = jobs.begin_dictionary().unwrap();
+        jobs.dictionary(failure, Err(Error::Unavailable)).unwrap();
+        assert!(jobs
+            .fields()
+            .unwrap()
+            .contains("job=2,dictionary,0,0,0,error,unavailable"));
+        let save = jobs.begin_save(1, 0, false).unwrap();
+        assert_eq!(jobs.dictionary(save, Ok(())), Err(Error::InvalidArgument));
+    }
 
     #[test]
     fn reload_jobs_pin_requested_targets_and_cancellation_is_terminal() {

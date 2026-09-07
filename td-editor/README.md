@@ -49,9 +49,9 @@ soft wrapping does not affect line numbers. Return moves, Escape/Ctrl+G
 cancels, and Ctrl+U clears. Invalid or nonexistent lines leave the prompt
 open for correction. Replay also accepts `go-to-line TAB REVISION LINE`
 (tab-separated arguments).
-Native query/edit/file control is available explicitly. Remote non-close path
-and other keyboard-prompt answers, GPU rendering and td-mail integration
-remain unimplemented. Do not set
+Native query/edit/file/dialog control is available explicitly. Decoded remote
+key/pointer input, other keyboard-prompt answers, GPU rendering and td-mail
+integration remain unimplemented. Do not set
 `$EDITOR` to this binary yet.
 
 Build and verify from the repository root:
@@ -101,9 +101,12 @@ but does not roll back an accepted save. Dirty conflict Reload still needs
 two explicit answers bound to the live dialog and revision. Reload job
 history distinguishes replacement, failure and cancellation; Cancel drops
 the replacement permit, not the read syscall. Conflict Save As takes an
-explicit new destination and leaves the external file untouched. Non-close
-path and other keyboard-prompt answers (menu/Find/Replace/numeric/command)
-are not remotely connected yet.
+explicit new destination and leaves the external file untouched. Ordinary
+Open/Save As/Dictionary prompts also accept a literal Path or Cancel answer
+bound to their live ID and revision, including while unfocused. Dictionary
+jobs report installation or failure without changing document text/history.
+Other keyboard-prompt answers (menu/Find/Replace/numeric/command) are not
+remotely connected yet.
 `check-spelling` returns a job ID; native state retains
 up to 64 completion/error/cancellation outcomes, separate from scan-pinned
 result pages. Native state also exposes separate redraw/submitted/callback

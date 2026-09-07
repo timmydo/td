@@ -31,9 +31,10 @@ revision-pinned Save/Save As use the ordinary file worker and bounded job
 history. Remote Close Tab, Quit and live close-dialog Cancel/Discard/Save/path
 answers use the ordinary close coordinator. Conflict Cancel/Reload/Save As
 and explicit second-stage discard-before-Reload are connected, with bounded
-Reload outcomes. Non-close path and other keyboard-prompt answers remain
-unimplemented; menus, Find, Replace, numeric and command entry have only
-coarse presence flags.
+Reload outcomes. Ordinary Open/Save As/Dictionary path prompts also have
+revision-bound remote answers; Dictionary jobs report bounded outcomes.
+Other keyboard-prompt answers remain unimplemented; menus, Find, Replace,
+numeric and command entry have only coarse presence flags.
 Replay emits explicit external-operation requests and does not pretend to
 perform native file, clipboard or display work.
 The allocation-free layout library supplies visual rows, glyph intervals,
@@ -685,7 +686,10 @@ its next argument is always the literal path, including a leading dash.
 After `--`, all arguments are document paths. Invalid startup dictionaries
 fail startup without writing any file. Format > Dictionary uses the same
 keyboard path prompt and worker after startup, without blocking display
-dispatch. Dictionary loads share the single pending-file-job admission guard;
+dispatch. Remote answers to this path prompt use the same read/parser and
+installation, with a global Dictionary job outcome; native Return does not
+create a remote job. CONTROL.md defines the prompt ID and job contract.
+Dictionary loads share the single pending-file-job admission guard;
 they create no editable file association. The old dictionary, marks and scan
 remain selected until a successful replacement is delivered. Failure leaves
 them intact; success clears all results and cancels any scan, including when
@@ -975,7 +979,8 @@ prompt and displays pending/success/failure; retry starts a fresh prompt.
 Prompts and notices share the existing clipped top-six-document-row overlay.
 When input is unavailable or not synchronized, the prompt instead prefixes
 readiness instructions without erasing the entered path.
-Path and confirmation dialogs remain keyboard-only. Native pointer selection,
+Path and confirmation dialogs remain keyboard-only for physical interaction;
+trusted semantic control answers use their live IDs. Native pointer selection,
 tab clicks and scrolling follow the pointer contract below. Menus use the
 native menu contract; clipboard uses the data-device contract below.
 
@@ -2177,8 +2182,16 @@ Conflict answers are also connected with fresh IDs from the same dialog
 counter. Reload still requires its opaque live permit and an additional
 discard question for dirty text, and job outcomes distinguish accepted
 replacement, cancellation and failure. Conflict Save As queues the same
-explicit-path Save As job. Non-close path and other keyboard-prompt answers
-remain unimplemented, including menu/Find/Replace/numeric/command input.
+explicit-path Save As job. Ordinary Open/Save As/Dictionary path entries also
+mint fresh IDs and owner-bound tab/revision points. Remote Cancel/Path answers
+validate the point and retain partial entry on refusal. Accepted answers use
+the same Open/Save As jobs or a global Dictionary job; dictionary replacement
+clears marks without editing documents. Close-driven paths retain the close
+ID, and conflict-driven Save As gets a fresh independent path ID. CONTROL.md
+defines scope, lifetime, counter exhaustion, reply ambiguity and failure
+semantics. Decoded key/pointer control remains the next admission increment.
+Other keyboard-prompt answers remain unimplemented, including
+menu/Find/Replace/numeric/command input.
 The complete endpoint below remains the version-1 target; controller
 generations are not presentation evidence.
 

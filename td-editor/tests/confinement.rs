@@ -408,12 +408,12 @@ fn native_control_is_opt_in_and_liveness_checked_with_bounded_outer_turns() {
     assert_eq!(dispatch.matches("self.ui.dispatch(").count(), 1);
     assert_eq!(dispatch.matches("Event::").count(), 1);
     assert!(dispatch.contains("self.ui.dispatch(Event::New)"));
-    let open = dispatch
-        .split("if let crate::control::Operation::Open(path)")
+    assert!(dispatch.contains("self.control_open_job(path.clone())"));
+    let open = production
+        .split("fn control_open_job(")
         .nth(1)
-        .unwrap();
-    let open = open
-        .split("if matches!(request.operation, crate::control::Operation::New)")
+        .unwrap()
+        .split("\n    fn ")
         .next()
         .unwrap();
     assert!(
@@ -422,7 +422,7 @@ fn native_control_is_opt_in_and_liveness_checked_with_bounded_outer_turns() {
     );
     assert!(open.find("files.busy()").unwrap() < open.find("begin_open()").unwrap());
     assert!(open.find(".checked_add(1)").unwrap() < open.find("begin_open()").unwrap());
-    assert!(open.find("begin_open()").unwrap() < open.find("files.open(path.clone())").unwrap());
+    assert!(open.find("begin_open()").unwrap() < open.find("files.open(path)").unwrap());
     assert!(open.contains("self.control_file_job = Some(ControlFile::Open(id))"));
     assert!(!open.contains("Event::Load") && !open.contains("std::fs::"));
     let tick = production
@@ -518,6 +518,41 @@ fn native_control_is_opt_in_and_liveness_checked_with_bounded_outer_turns() {
     assert!(cancel.contains(".reloaded(*id, Ok(ReloadOutcome::Cancelled))"));
     assert!(!dispatch.contains("Event::Discard"));
     assert!(!dispatch.contains("Event::Saved"));
+    let path = production
+        .split("fn control_path_answer(")
+        .nth(1)
+        .unwrap()
+        .split("\n    fn ")
+        .next()
+        .unwrap();
+    assert!(path.contains("dialog != identity.id"));
+    assert!(path.contains("target.tab != identity.point.tab"));
+    assert!(path.contains("target.revision != identity.point.revision"));
+    assert!(
+        path.find("check_revision(&identity.point)").unwrap()
+            < path.find("self.control_open_job(path)").unwrap()
+    );
+    assert!(path.contains("self.control_dictionary_job(path)"));
+    assert!(path.contains("self.control_save_job(target, Some(path))"));
+    assert!(!path.contains("Event::") && !path.contains("files."));
+    let dictionary = production
+        .split("fn control_dictionary_job(")
+        .nth(1)
+        .unwrap()
+        .split("\n    fn ")
+        .next()
+        .unwrap();
+    assert!(dictionary.find("files.busy()").unwrap() < dictionary.find(".checked_add(1)").unwrap());
+    assert!(
+        dictionary.find(".checked_add(1)").unwrap()
+            < dictionary.find("begin_dictionary()").unwrap()
+    );
+    assert!(
+        dictionary.find("begin_dictionary()").unwrap()
+            < dictionary.find("files.dictionary(path)").unwrap()
+    );
+    assert!(dictionary.contains("self.control_file_job = Some(ControlFile::Dictionary(id))"));
+    assert!(!dictionary.contains("std::fs::") && !dictionary.contains("Event::"));
     let startup = production.split("pub fn file_window(").nth(1).unwrap();
     assert!(startup.find("Socket::bind").unwrap() < startup.find("prepare_files(").unwrap());
     assert!(startup.contains("window.finish_control(result)"));
