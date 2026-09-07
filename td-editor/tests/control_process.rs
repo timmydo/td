@@ -18,6 +18,9 @@ type Result<T> = std::result::Result<T, String>;
 const TIMEOUT: Duration = Duration::from_secs(10);
 static NEXT: AtomicU64 = AtomicU64::new(0);
 
+#[path = "support/native_compositor.rs"]
+mod native_compositor;
+
 // Linux evdev key codes used by the owned Weston seat, never ASCII.
 const KEY_ESCAPE: u32 = 1;
 const KEY_LEFT_CTRL: u32 = 29;

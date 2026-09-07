@@ -2165,6 +2165,40 @@ deliberately discards SHM descriptors. Existing transport/pixel tests own
 the mapped-buffer oracle. This process proof neither substitutes for a real
 compositor nor proves GPU, jail or caller `$EDITOR` integration.
 
+The native `tests/support/native_compositor.rs` fixture runs both key
+profiles in disposable td-compositor processes. For this first editor
+increment the two process cases are explicit opt-in with an absolute
+`TD_EDITOR_TEST_COMPOSITOR` path; their bounded observation/capture decoders
+run in the ordinary suite. Promotion into the declared gate-tool workflow
+is the next integration step, not an existing default-gate claim.
+The owned compositor starts with an empty inherited environment, an owner
+stdin lifetime and separate input/capture grants. Session readiness, numbered
+input receipts, applied client-publication snapshots and completed PPM output
+follow [AUTOMATION.md](../td-compositor/AUTOMATION.md). No host display,
+configuration, external compositor or device is used.
+
+The editor maps normally, then compositor fullscreen leaves an 800x576
+scale-one client beneath the 24-pixel desktop bar. Shift+A, released-Shift b
+and Windows Ctrl+Z / Emacs Ctrl+/ use real evdev-code routing, keymap and
+modifier messages, never decoded editor key/Insert/Undo control requests.
+Remote queries assert exact text revisions and bytes, then native callback
+snapshots must name the expected tab/revision and dimensions. Capture is
+bracketed by a stable positive client publication newer than the pre-input
+snapshot, with matching session/window/client and completed-output bounds.
+The document prefix at output (8,72) must match Aone, Abone, then Aone
+painted with the pinned Unifont and existing editor raster, excluding only
+the one-pixel blinking caret column. This is a shared-font/raster oracle
+for actual transported pixels, not an independent test of the font painter.
+Caret-only redraws can advance publication, so semantic state and pixel
+checks remain necessary. Save verifies exact disk bytes; normal shutdown
+checks editor control cleanup and owner-EOF compositor directory removal.
+Guards reap the editor before its compositor before deleting fixture files.
+
+This proves native keyboard/state/callback/pixel integration, not GPU,
+hardware input, jail or caller `$EDITOR` integration. Pointer/menu/wheel and
+inter-client clipboard scenarios remain the following native increments.
+Weston remains separate optional interoperability evidence below.
+
 The opt-in `disposable_weston_runs_the_production_editor_and_control_workers`
 test requires explicit absolute paths to a Weston executable and its matching
 upstream `test-plugin.so`. It starts an owned headless Pixman/kiosk compositor
