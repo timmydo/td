@@ -12,6 +12,10 @@
 mod client;
 #[allow(dead_code, reason = "FIDO2 transport prerequisite; no release consumer yet")]
 mod fido_hid;
+#[allow(dead_code, reason = "CTAP codec prerequisite; no release consumer yet")]
+mod fido_cbor;
+#[allow(dead_code, reason = "CTAP codec prerequisite; no release consumer yet")]
+mod fido_ctap;
 #[path = "../../td-firstboot/src/principals.rs"]
 #[allow(dead_code, reason = "shared immutable session identity loader")]
 mod principals;
@@ -145,6 +149,8 @@ mod confinement {
             ("main.rs", include_str!("main.rs")),
             ("client.rs", include_str!("client.rs")),
             ("crypto.rs", include_str!("crypto.rs")),
+            ("fido_cbor.rs", include_str!("fido_cbor.rs")),
+            ("fido_ctap.rs", include_str!("fido_ctap.rs")),
             ("fido_hid.rs", include_str!("fido_hid.rs")),
             ("store.rs", include_str!("store.rs")),
             ("sys.rs", include_str!("sys.rs")),
@@ -199,6 +205,8 @@ pub fn take_received(fd: RawFd) -> Result<File, String> {
             [
                 "client.rs",
                 "crypto.rs",
+                "fido_cbor.rs",
+                "fido_ctap.rs",
                 "fido_hid.rs",
                 "main.rs",
                 "store.rs",

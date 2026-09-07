@@ -4,6 +4,8 @@ const MAIN_RS: &str = include_str!("../../../td-secret/src/main.rs");
 const MODULES: &[(&str, &str)] = &[
     ("client", include_str!("../../../td-secret/src/client.rs")),
     ("crypto", include_str!("../../../td-secret/src/crypto.rs")),
+    ("fido_cbor", include_str!("../../../td-secret/src/fido_cbor.rs")),
+    ("fido_ctap", include_str!("../../../td-secret/src/fido_ctap.rs")),
     ("fido_hid", include_str!("../../../td-secret/src/fido_hid.rs")),
     ("tpm", include_str!("../../../td-secret/src/tpm.rs")),
     ("store", include_str!("../../../td-secret/src/store.rs")),
@@ -146,4 +148,29 @@ pub fn recipe() -> Recipe {
             "glibc-x86-64",
         ])
         .steps(steps)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recipe_embeds_every_declared_module() {
+        let production = MAIN_RS.split("#[cfg(test)]").next().unwrap();
+        let code = production.lines().map(|line| line.split("//").next().unwrap()).collect::<Vec<_>>().join("\n");
+        let mut words = code.split_whitespace();
+        let mut declared = Vec::new();
+        while let Some(word) = words.next() {
+            if word == "mod" {
+                if let Some(name) = words.next().and_then(|name| name.strip_suffix(';')) { declared.push(name); }
+            }
+        }
+        let mut embedded: Vec<_> = MODULES.iter().map(|(name, _)| *name).collect();
+        embedded.push("principals");
+        declared.sort_unstable(); embedded.sort_unstable();
+        assert_eq!(declared, embedded);
+        assert!(recipe().steps.iter().flatten().any(|step| matches!(step,
+            Step::WriteFile { path, content, .. } if path == "{src}/td-firstboot/src/principals.rs"
+                && content == include_str!("../../../td-firstboot/src/principals.rs"))));
+    }
 }

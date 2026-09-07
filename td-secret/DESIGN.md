@@ -297,6 +297,75 @@ components, and repeats verification beyond the TPM transient-slot count.
 The fixture requires no OpenSSL at test time. Neither these tests nor
 their software authenticator framing inputs prove a physical token touch.
 
+## CTAP assertion codec
+
+`fido_cbor.rs` implements CTAP's canonical CBOR profile, bounded to 7609
+input bytes, 1024 total values, and four nested maps or arrays. Byte and
+UTF-8 strings borrow the caller's owned message. Integer and length
+arguments must use the shortest representation; indefinite items, tags,
+duplicate or unordered keys, invalid UTF-8, and trailing bytes are refused.
+Map keys use the CTAP order for integers, strings and simple values;
+complex container keys are unsupported. Floating-point representations
+remain distinct by their encoded width, as CTAP requires. The prefix
+reader supports embedded values; the whole-value reader requires complete
+consumption. The bounded encoder preallocates its maximum capacity and validates its
+complete output before returning it. Drop clears abandoned or failed output;
+success transfers the allocation to a caller responsible for clearing it. These limits deliberately refuse larger future responses.
+The ordinary CTAP message-size negotiation remains a transport obligation:
+1024 bytes by default, enlarged only by the authenticator's getInfo value.
+
+`fido_ctap.rs` builds one `authenticatorGetAssertion` request for the fixed
+local relying-party ID `td.invalid`, one nonempty credential ID of at most
+1024 bytes, and an exact 32-byte client-data hash. It requests user presence
+and does not request user verification. It neither implements PIN handling
+nor changes token policy: a token requiring an unsupported authorization
+returns an error. The request is bounded by the caller's negotiated message
+limit and the HID limit, including its command byte. Its typed owner retains
+the same allow-list identity and client-data hash for response verification,
+and is consumed on success or failure. Owned request buffers clear on drop
+on a best-effort basis. Protocol diagnostics contain no payload bytes.
+
+A response must have a successful CTAP status and canonical complete CBOR.
+An optional credential descriptor must match the sole requested ID and
+`public-key` type. Omission is permitted for the single-entry allow list.
+A returned user entity must carry a bounded byte-string handle. A credential
+count, if present, must be one; `userSelected` is forbidden for this request.
+Unknown response members are ignored after bounded structural validation.
+The authenticator data must match SHA-256 of the fixed relying-party ID,
+set UP, clear the attested-data flag, and have consistent backup flags.
+Reserved bits are ignored for compatibility; their exact received values
+remain covered by the signature. The optional extension tail must be one complete
+map with text keys; unsolicited extensions are accepted because CTAP permits
+extensions without input. No tail is accepted when ED is clear.
+
+The verifier hashes the ENTIRE authenticator data, including extensions,
+followed by the request's exact client-data hash. It parses two positive,
+minimal DER ECDSA integers into bounded 32-byte components, then verifies
+through the TPM ES256 primitive. COSE keys must identify public-only EC2,
+ES256 and P-256 with exact coordinate lengths; curve membership is checked
+by the TPM. Returned counter, UV and backup flags are observations only.
+Zero counters are accepted; no persistent clone-detection policy is claimed.
+
+The caller must obtain the public key and credential ID from enrollment
+metadata bound to the sealed store, and construct client data binding fresh
+kernel randomness and the exact trusted operation. This codec cannot prove
+those caller obligations. Reusing a challenge, substituting unbound metadata,
+or accepting an unsolicited request would defeat the intended authorization.
+No new command, device I/O, enrollment, store release or elevation is enabled
+by this increment. Enrollment, getInfo policy and physical transport remain
+subsequent work. The relying-party ID is a local namespace, not a contacted
+server or a web-origin authorization mechanism.
+
+The profile follows [CTAP 2.3 sections 6.2 and 8](https://fidoalliance.org/specs/fido-v2.3-ps-20260226/fido-client-to-authenticator-protocol-v2.3-ps-20260226.html)
+and [WebAuthn authenticator data](https://www.w3.org/TR/webauthn-3/#sctn-authenticator-data).
+Tests exercise independent literal request bytes, every truncation, canonical
+encoding and resource boundaries, identity/flag/extension substitutions, and
+DER/COSE rejection. An opt-in pinned TPM emulator test accepts a separately
+OpenSSL-signed assertion and rejects changed client data, extension bytes and
+signature bytes. Only public fixture material is committed; OpenSSL is not a
+test dependency. This is a software protocol oracle, not a physical-token or
+secure-attention demonstration.
+
 ## TPM validation
 
 The optional host oracle uses upstream swtpm 0.10.1 and libtpms 0.10.2,
