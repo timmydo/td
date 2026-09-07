@@ -43,6 +43,9 @@ const SOURCE_CONSUMER_TIMEOUT: Duration = Duration::from_secs(120);
 const MAX_ARTIFACT_BYTES: u64 = 16 * 1024 * 1024 * 1024;
 const MAX_INDEX_BYTES: u64 = 64 * 1024 * 1024;
 const FEED_NO_DAEMON_ENV: &str = "TD_FEED_NO_DAEMON";
+// Linux UAPI on td's x86/ARM targets: refuse final symlinks and avoid blocking
+// on a substituted FIFO before fstat can reject its file type.
+const OPEN_REGULAR_NOFOLLOW: i32 = 0x20000 | 0x800;
 
 /// One mirror artifact: served at `path`, fetched from `url`, content sha256 `sha256`.
 struct Entry {
@@ -1586,11 +1589,7 @@ fn is_warm_complete(vendor: &Path, lock: &Path) -> bool {
 /// non-regular file: a marker or lock replaced by a symlink to something huge
 /// must read as "not warm", not exhaust memory deciding.
 fn lock_digest(lock: &Path) -> Option<String> {
-    let meta = std::fs::metadata(lock).ok()?;
-    if !meta.is_file() || meta.len() > MAX_CARGO_LOCK_BYTES {
-        return None;
-    }
-    std::fs::read(lock).ok().map(|bytes| hex_sha256(&bytes))
+    read_locked_cargo_sources(lock).ok().map(|(_, digest)| digest)
 }
 
 /// The marker is one digest line and one count line. Read it under a small
@@ -1794,6 +1793,127 @@ fn account_locked_cargo_source(
     Ok(())
 }
 
+/// Read and hash the same bounded lock bytes used to select the archives.
+fn read_locked_cargo_sources(path: &Path) -> Result<(LockedCargoSources, String), String> {
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(OPEN_REGULAR_NOFOLLOW)
+        .open(path)
+        .map_err(|e| {
+            format!(
+                "open Cargo.lock {} (regular file required; final symlinks refused): {e}",
+                path.display()
+            )
+        })?;
+    let metadata = file
+        .metadata()
+        .map_err(|e| format!("stat Cargo.lock {}: {e}", path.display()))?;
+    if !metadata.is_file() || metadata.len() > MAX_CARGO_LOCK_BYTES {
+        return Err(format!(
+            "Cargo.lock {} is not a regular file within the {MAX_CARGO_LOCK_BYTES}-byte limit",
+            path.display()
+        ));
+    }
+    let mut text = String::new();
+    file.take(MAX_CARGO_LOCK_BYTES + 1)
+        .read_to_string(&mut text)
+        .map_err(|e| format!("read Cargo.lock {}: {e}", path.display()))?;
+    if text.len() as u64 > MAX_CARGO_LOCK_BYTES {
+        return Err(format!(
+            "Cargo.lock {} exceeds the {MAX_CARGO_LOCK_BYTES}-byte limit",
+            path.display()
+        ));
+    }
+    if !text.lines().any(|line| line.trim() == "[[package]]") {
+        return Err(format!(
+            "Cargo.lock {} has no package records; select a generated lockfile",
+            path.display()
+        ));
+    }
+    Ok((
+        parse_locked_cargo_sources(&text)?,
+        hex_sha256(text.as_bytes()),
+    ))
+}
+
+fn registry_archive_name(package: &LockedRegistryPackage) -> String {
+    format!("{}-{}.crate", package.name, package.version)
+}
+
+fn registry_feed_path(package: &LockedRegistryPackage) -> String {
+    // The lock checksum is part of the key, so distinct revisions or registries
+    // cannot replace each other's bytes at a name/version-only destination.
+    format!(
+        "cargo/sha256/{}/{}",
+        package.checksum,
+        registry_archive_name(package)
+    )
+}
+
+fn transfer_locked_registry(
+    lock: &Path,
+    archives: &Path,
+    store: &Path,
+    consumer_base: Option<&str>,
+) -> Result<(), String> {
+    let base = consumer_base.map(consumer_feed_base).transpose()?;
+    let (sources, _) = read_locked_cargo_sources(lock)?;
+    let action = if base.is_some() { "consume" } else { "export" };
+    let completed = if base.is_some() {
+        "acquired"
+    } else {
+        "exported"
+    };
+    let mut names = std::collections::BTreeSet::new();
+    for package in &sources.registry {
+        let name = registry_archive_name(package);
+        if !names.insert(name.clone()) {
+            return Err(format!(
+                "Cargo.lock packages collide at registry archive filename {name}"
+            ));
+        }
+    }
+    let mut failures = Vec::new();
+    for package in &sources.registry {
+        let name = registry_archive_name(package);
+        let archive = archives.join(&name);
+        let path = registry_feed_path(package);
+        let result = if let Some(base) = base {
+            let guard = ResponseGuard::without_client(Instant::now() + SOURCE_CONSUMER_TIMEOUT);
+            download_verified_policy(
+                &format!("{base}/{path}"),
+                &archive,
+                &package.checksum,
+                Some(&guard),
+                false,
+            )
+        } else {
+            export_verified_file(&archive, &store.join(path), &package.checksum)
+        };
+        match result {
+            Ok(()) => eprintln!(">> td-feed {action} cargo: {name} verified"),
+            Err(error) => failures.push(format!("{name} SHA-256 {}: {error}", package.checksum)),
+        }
+    }
+    eprintln!(
+        ">> td-feed {action} cargo: {} registry archive(s) selected; {} Git package(s) require separate recipe-pinned source archives; no Git transport",
+        sources.registry.len(), sources.git_packages,
+    );
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        let remedy = if base.is_some() {
+            "Fix local destination errors; for missing or mismatched host entries, warm the named bytes on the host and run td-feed export cargo LOCK ARCHIVES."
+        } else {
+            "Populate missing or repair corrupt files in the host ARCHIVES directory, fix any feed-store errors above, then retry export."
+        };
+        Err(format!(
+            "{} registry archive(s) were not {completed}:\n{}\n{remedy} Neither cargo transfer command downloads upstream or follows redirects.",
+            failures.len(), failures.join("\n"),
+        ))
+    }
+}
+
 /// Fetch only the registry members of the committed lock through td's
 /// verifying sparse-index/static-crate egress. Git members are represented by
 /// separately pinned source archives and are intentionally never contacted.
@@ -1807,18 +1927,7 @@ fn fetch_locked_registry(
     lock_path: &Path,
     store: &Path,
 ) -> Result<(LockedCargoSources, String), String> {
-    let metadata = std::fs::metadata(lock_path)
-        .map_err(|e| format!("stat Cargo.lock {}: {e}", lock_path.display()))?;
-    if !metadata.is_file() || metadata.len() > MAX_CARGO_LOCK_BYTES {
-        return Err(format!(
-            "Cargo.lock {} is not a regular file within the {MAX_CARGO_LOCK_BYTES}-byte limit",
-            lock_path.display()
-        ));
-    }
-    let text = std::fs::read_to_string(lock_path)
-        .map_err(|e| format!("read Cargo.lock {}: {e}", lock_path.display()))?;
-    let digest = hex_sha256(text.as_bytes());
-    let sources = parse_locked_cargo_sources(&text)?;
+    let (sources, digest) = read_locked_cargo_sources(lock_path)?;
     for package in &sources.registry {
         let guard = ResponseGuard {
             deadline: Instant::now() + RESPONSE_DEADLINE,
@@ -2480,16 +2589,22 @@ fn reserved_download_name(name: &str) -> bool {
 fn export_source_pin(pin: &SourcePin, sources: &Path, store: &Path) -> Result<(), String> {
     let path = source_feed_path(pin)?;
     let dst = store.join(path);
+    export_verified_file(&sources.join(&pin.file), &dst, &pin.sha256)
+}
+
+fn export_verified_file(source: &Path, dst: &Path, checksum: &str) -> Result<(), String> {
     let guard = ResponseGuard::without_client(Instant::now() + SOURCE_CONSUMER_TIMEOUT);
-    let source = sources.join(&pin.file);
     acquire_verified(
-        &dst,
-        &pin.sha256,
+        dst,
+        checksum,
         &source.display().to_string(),
         Some(&guard),
         |temp| {
-            let mut input =
-                File::open(&source).map_err(|e| format!("open {}: {e}", source.display()))?;
+            let mut input = OpenOptions::new()
+                .read(true)
+                .custom_flags(OPEN_REGULAR_NOFOLLOW)
+                .open(source)
+                .map_err(|e| format!("open {}: {e}", source.display()))?;
             let metadata = input
                 .metadata()
                 .map_err(|e| format!("stat {}: {e}", source.display()))?;
@@ -2524,7 +2639,7 @@ fn export_source_pin(pin: &SourcePin, sources: &Path, store: &Path) -> Result<()
             }
             Ok(())
         },
-        || write_atomic(&sidecar_path(&dst), format!("{}\n", pin.sha256).as_bytes()),
+        || write_atomic(&sidecar_path(dst), format!("{checksum}\n").as_bytes()),
     )
 }
 
@@ -2615,7 +2730,7 @@ fn vm_feed_base(path: &Path, owner: u32) -> Result<String, String> {
     // Refuse a final symlink and avoid blocking on a substituted special file.
     let file = std::fs::OpenOptions::new()
         .read(true)
-        .custom_flags(0x20000 | 0x800)
+        .custom_flags(OPEN_REGULAR_NOFOLLOW)
         .open(path)
         .map_err(|e| format!("requires TD_FEED_BASE or a provisioned VM feed endpoint: {e}"))?;
     let meta = file.metadata().map_err(|e| e.to_string())?;
@@ -2640,7 +2755,7 @@ fn vm_feed_base(path: &Path, owner: u32) -> Result<String, String> {
     Ok(format!("http://10.0.2.2:{port}"))
 }
 
-fn consume_sources(root: &Path) -> Result<(), String> {
+fn configured_consumer_feed_base() -> Result<String, String> {
     let base = match std::env::var("TD_FEED_BASE") {
         Ok(base) => base,
         Err(std::env::VarError::NotPresent) => vm_feed_base(
@@ -2649,6 +2764,11 @@ fn consume_sources(root: &Path) -> Result<(), String> {
         )?,
         Err(_) => return Err("TD_FEED_BASE is not UTF-8".into()),
     };
+    consumer_feed_base(&base).map(str::to_owned)
+}
+
+fn consume_sources(root: &Path) -> Result<(), String> {
+    let base = configured_consumer_feed_base()?;
     let pins = recipe_source_pins_result(root)?;
     consume_source_pins(&pins, &sources_dir(), &base)?;
     warm_kernel_headers_from_pins("i386", &pins);
@@ -3428,6 +3548,23 @@ pub fn run(a: &[String]) {
                 die(format!("consume sources: {error}"));
             }
         }
+        Some(action @ ("export" | "consume"))
+            if a.len() == 5 && a.get(2).map(String::as_str) == Some("cargo") =>
+        {
+            let result = (|| {
+                let lock = Path::new(a.get(3).ok_or("missing Cargo.lock path")?);
+                let archives = Path::new(a.get(4).ok_or("missing archive directory")?);
+                let base = if action == "consume" {
+                    Some(configured_consumer_feed_base()?)
+                } else {
+                    None
+                };
+                transfer_locked_registry(lock, archives, &feed_dir().join("store"), base.as_deref())
+            })();
+            if let Err(error) = result {
+                die(format!("{action} cargo: {error}"));
+            }
+        }
         // warm <action> — the structured host-PREP orchestration (consolidated warm-*.sh).
         // The low-level `warm INDEX STORE` primitive (feed-shared gate, feed-ensure serve)
         // stays: dispatch on a known action keyword, else treat it as the legacy 2-arg form.
@@ -3523,7 +3660,7 @@ pub fn run(a: &[String]) {
                  td-feed warm sources\n  td-feed warm kernel-headers ARCH\n  \
                  td-feed warm ostree REPOSITORY REF COMMIT CONTENT DEST\n  \
                  td-feed serve STORE ADDR\n  \
-                 td-feed export sources  (publish existing host archives; no downloads)\n  td-feed consume sources  (TD_FEED_BASE or VM endpoint; no upstream fallback)\n  td-feed ensure-serve\n  td-feed cargo-proxy STORE ADDR\n  td-feed selftest\n  \
+                 td-feed export sources  (publish existing host archives; no downloads)\n  td-feed consume sources  (TD_FEED_BASE or VM endpoint; no upstream fallback)\n  td-feed export cargo LOCK ARCHIVES\n  td-feed consume cargo LOCK ARCHIVES\n  td-feed ensure-serve\n  td-feed cargo-proxy STORE ADDR\n  td-feed selftest\n  \
                  td-feed cargo-proxy-selftest\n  td-feed warm-selftest"
             );
             std::process::exit(2);
@@ -4093,6 +4230,187 @@ mod tests {
         );
         assert!(origin.count() > 0);
         drop(origin);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    fn cargo_transfer_lock(
+        dir: &std::path::Path,
+        bytes: &[u8],
+        git_url: &str,
+    ) -> std::path::PathBuf {
+        std::fs::create_dir_all(dir).unwrap();
+        let lock = dir.join("Cargo.lock");
+        std::fs::write(&lock, format!(
+            "version = 4\n[[package]]\nname = \"dep\"\nversion = \"1.0.0\"\nsource = \"registry+https://example.invalid/index\"\nchecksum = \"{}\"\n[[package]]\nname = \"git-dep\"\nversion = \"1.0.0\"\nsource = \"git+{git_url}#123456\"\n",
+            super::hex_sha256(bytes),
+        )).unwrap();
+        lock
+    }
+
+    #[test]
+    fn cargo_transfer_refuses_a_manifest_but_accepts_a_dependency_free_lock() {
+        let dir = unique_tmp_dir("cargo-lock-selection");
+        std::fs::create_dir_all(&dir).unwrap();
+        let lock = dir.join("Cargo.lock");
+        std::fs::write(&lock, "[package]\nname = \"local\"\nversion = \"1.0.0\"\n").unwrap();
+        assert!(super::read_locked_cargo_sources(&lock).is_err());
+        std::fs::write(
+            &lock,
+            "version = 4\n[[package]]\nname = \"local\"\nversion = \"1.0.0\"\n",
+        )
+        .unwrap();
+        let (sources, _) = super::read_locked_cargo_sources(&lock).unwrap();
+        assert!(sources.registry.is_empty());
+        assert_eq!(sources.git_packages, 0);
+        super::transfer_locked_registry(&lock, &dir.join("unused"), &dir.join("store"), None)
+            .unwrap();
+        let symlink = dir.join("link.lock");
+        std::os::unix::fs::symlink(&lock, &symlink).unwrap();
+        assert!(super::lock_digest(&symlink).is_none());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn exporting_source_archives_refuses_final_symlinks_and_special_files() {
+        let dir = unique_tmp_dir("export-special");
+        let sources = dir.join("sources");
+        let store = dir.join("store");
+        std::fs::create_dir_all(&sources).unwrap();
+        let bytes = b"archive bytes";
+        let pin = super::SourcePin {
+            key: "fixture".into(),
+            file: "archive.tar".into(),
+            url: "https://example.invalid/archive.tar".into(),
+            sha256: super::hex_sha256(bytes),
+        };
+        let archive = sources.join(&pin.file);
+        let plain = sources.join("plain.tar");
+        std::fs::write(&plain, bytes).unwrap();
+        std::os::unix::fs::symlink(&plain, &archive).unwrap();
+        assert!(super::export_source_pin(&pin, &sources, &store).is_err());
+        std::fs::remove_file(&archive).unwrap();
+        let socket = std::os::unix::net::UnixListener::bind(&archive).unwrap();
+        assert!(super::export_source_pin(&pin, &sources, &store).is_err());
+        drop(socket);
+        std::fs::remove_file(&archive).unwrap();
+        std::fs::rename(plain, archive).unwrap();
+        super::export_source_pin(&pin, &sources, &store).unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn cargo_feed_reuses_locked_bytes_in_two_private_caches_and_survives_restart() {
+        use super::transfer_locked_registry as transfer;
+        let dir = unique_tmp_dir("cargo-transfer");
+        let origin = ConsumerServer::start(dir.join("upstream"), None);
+        let bytes = b"locked crate bytes";
+        let lock = cargo_transfer_lock(&dir, bytes, &origin.base);
+        let archives = dir.join("archives");
+        let store = dir.join("store");
+        std::fs::create_dir_all(&archives).unwrap();
+        std::fs::write(archives.join("dep-1.0.0.crate"), bytes).unwrap();
+        std::fs::write(archives.join("unselected-1.0.0.crate"), b"ignore me").unwrap();
+        transfer(&lock, &archives, &store, None).unwrap();
+        std::fs::remove_dir_all(&archives).unwrap();
+        transfer(&lock, &archives, &store, None).unwrap();
+        let feed = ConsumerServer::start(store.clone(), None);
+        for guest in ["one", "two"] {
+            let cache = dir.join(guest);
+            transfer(&lock, &cache, &store, Some(&feed.base)).unwrap();
+            assert_eq!(std::fs::read(cache.join("dep-1.0.0.crate")).unwrap(), bytes);
+            assert!(!cache.join("unselected-1.0.0.crate").exists());
+            assert!(!cache.join(".warm-complete").exists());
+        }
+        assert_eq!(feed.count(), 2);
+        std::fs::write(dir.join("one/dep-1.0.0.crate"), b"guest mutation").unwrap();
+        assert_eq!(
+            std::fs::read(dir.join("two/dep-1.0.0.crate")).unwrap(),
+            bytes
+        );
+        drop(feed);
+        transfer(&lock, &dir.join("two"), &store, Some("http://127.0.0.1:1")).unwrap();
+        let restarted = ConsumerServer::start(store.clone(), None);
+        transfer(&lock, &dir.join("one"), &store, Some(&restarted.base)).unwrap();
+        assert_eq!(
+            std::fs::read(dir.join("one/dep-1.0.0.crate")).unwrap(),
+            bytes
+        );
+        assert_eq!(origin.count(), 0);
+        drop(restarted);
+        drop(origin);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn cargo_feed_namespaces_checksums_and_rejects_bad_or_incomplete_transfers() {
+        use super::transfer_locked_registry as transfer;
+        let dir = unique_tmp_dir("cargo-transfer-refusal");
+        let origin = ConsumerServer::start(dir.join("upstream"), None);
+        let first = cargo_transfer_lock(&dir.join("first"), b"first", &origin.base);
+        let second = cargo_transfer_lock(&dir.join("second"), b"second", &origin.base);
+        let store = dir.join("store");
+        for (lock, bytes) in [
+            (&first, b"first".as_slice()),
+            (&second, b"second".as_slice()),
+        ] {
+            let archives = lock.parent().unwrap();
+            std::fs::write(archives.join("dep-1.0.0.crate"), b"corrupt").unwrap();
+            assert!(transfer(lock, archives, &store, None).is_err());
+            std::fs::write(archives.join("dep-1.0.0.crate"), bytes).unwrap();
+            transfer(lock, archives, &store, None).unwrap();
+        }
+        let feed = ConsumerServer::start(store.clone(), None);
+        for (lock, bytes) in [
+            (&first, b"first".as_slice()),
+            (&second, b"second".as_slice()),
+        ] {
+            let cache = dir.join("guest");
+            transfer(lock, &cache, &store, Some(&feed.base)).unwrap();
+            assert_eq!(std::fs::read(cache.join("dep-1.0.0.crate")).unwrap(), bytes);
+        }
+        drop(feed);
+        for (i, response) in [
+            b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec(),
+            b"HTTP/1.1 200 OK\r\nContent-Length: 7\r\nConnection: close\r\n\r\ncorrupt".to_vec(),
+            format!("HTTP/1.1 302 Found\r\nLocation: {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", origin.base).into_bytes(),
+            b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nf".to_vec(),
+        ].into_iter().enumerate() {
+            let feed = ConsumerServer::start(dir.join("unused"), Some(response));
+            let cache = dir.join(format!("bad-{i}"));
+            let error = transfer(&first, &cache, &store, Some(&feed.base)).unwrap_err();
+            assert!(error.contains("1 registry archive(s)"), "{error}");
+            assert!(!cache.join("dep-1.0.0.crate").exists());
+            assert_eq!(origin.count(), 0);
+        }
+        drop(origin);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn cargo_transfer_rejects_unbounded_special_and_unsafe_locks() {
+        use super::read_locked_cargo_sources as read_lock;
+        let dir = unique_tmp_dir("cargo-transfer-lock");
+        let lock = cargo_transfer_lock(&dir, b"bytes", "https://example.invalid/git");
+        let original = std::fs::read_to_string(&lock).unwrap();
+        for replacement in ["../escape", "a/b", "a\\b"] {
+            std::fs::write(
+                &lock,
+                original.replace("name = \"dep\"", &format!("name = \"{replacement}\"")),
+            )
+            .unwrap();
+            assert!(read_lock(&lock).is_err());
+        }
+        std::fs::remove_file(&lock).unwrap();
+        std::os::unix::fs::symlink("/dev/zero", &lock).unwrap();
+        assert!(read_lock(&lock).is_err());
+        assert!(read_lock(std::path::Path::new("/dev/zero")).is_err());
+        assert!(read_lock(&dir).is_err());
+        std::fs::remove_file(&lock).unwrap();
+        std::fs::File::create(&lock)
+            .unwrap()
+            .set_len(super::MAX_CARGO_LOCK_BYTES + 1)
+            .unwrap();
+        assert!(read_lock(&lock).is_err());
         std::fs::remove_dir_all(dir).unwrap();
     }
 

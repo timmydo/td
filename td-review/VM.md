@@ -320,7 +320,8 @@ ordinary non-secret data in its volatile `/run/td-compositor/1000/vm-feed`.
 `td-feed consume sources` uses that compositor-owned regular file when
 `TD_FEED_BASE` is unset. An explicit environment value wins. This avoids
 changing login environments or requiring a new terminal after configuration.
-Other acquisition paths do not implicitly adopt this endpoint yet.
+The explicit Cargo archive consumer described below uses the same endpoint.
+Host producer warm commands do not implicitly adopt it.
 
 The source archive consumer is `TD_FEED_BASE=http://HOST:PORT td-feed consume
 sources`. It resolves the checkout's recipe source pins, reads verified host
@@ -349,13 +350,37 @@ missing or corrupt archives are reported together. Run `td-feed ensure-serve`
 to expose the result through the existing loopback server. This closes the
 case where a warm private host cache had never populated its HTTP feed.
 
-`warm sources` remains the host producer operation and may fetch upstream,
-including when `TD_FEED_BASE` is set. The consumer command currently covers
-recipe source archives only; the remaining fixed-output acquisition paths
-still need integration. These include locked
-Cargo registry sources,
-reviewed Git-source archives, and other declared transfer objects that the
-existing warm paths need. Unsupported paths remain visible coverage gaps.
+For Cargo registry archives, run `td-feed export cargo LOCK ARCHIVES` on the
+host. `LOCK` is the selected Cargo.lock and `ARCHIVES` is an existing directory
+of downloaded `NAME-VERSION.crate` files, such as
+`.td-build-cache/crate-vendor/td-net/vendor`. Only the lock's registry packages
+are exported; unrelated cached archives are ignored. Feed paths include the
+package's locked checksum as well as name and version, so different checkouts or registries
+can retain distinct bytes concurrently. No sparse index or registry access is
+needed. Each object receives the same bounded copy, checksum verification,
+atomic publication and integrity sidecar as recipe archives.
+
+In the guest, `td-feed consume cargo LOCK ARCHIVES` reads that guest's own lock
+and puts verified archives in its private destination directory. It uses
+`TD_FEED_BASE` or the live compositor endpoint, refuses redirects and upstream
+fallback, and reports every missing or mismatched package with its checksum.
+A valid private archive remains usable with the host down. Both commands read
+the lock once through a bounded regular-file descriptor and refuse a final
+symlink. A file without generated package records is refused; a valid lock
+with only local packages succeeds with zero registry transfers. The shared
+`export sources` reader also refuses final archive symlinks and opens special
+files without blocking before rejecting their type. Neither command starts a daemon or copies host Cargo configuration. They
+report Git package counts explicitly and never attempt a Git transport.
+
+These commands transfer registry archives only. They do not extract sources,
+remove unrelated destination files, write a `.warm-complete` marker, or claim
+a complete build workspace. Use a private destination for each selected lock.
+Automatic warm-job selection and vendor-set publication still need integration;
+until then, invoking an ordinary host `warm` command inside a guest can still
+fetch upstream. `warm sources` likewise remains a host producer operation,
+including when `TD_FEED_BASE` is set. Reviewed Git-source archives and other
+declared transfer objects remain visible coverage gaps wherever they are not
+already exposed by the recipe source-pin table.
 
 Warm the selected repository revision's declared inputs on the host once.
 Guests have read access to the resulting artifacts, not a general cache upload
