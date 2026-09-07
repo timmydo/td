@@ -24,10 +24,10 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
     let glibc_tree = runner.ladder_out_from(&build_out, "glibc-x86-64")?;
     let busybox_tree = runner.ladder_out_from(&build_out, "busybox-x86-64")?;
     println!(
-        "   [ladder] x86_64 Rust bridge via build-plan --auto: exact stage0 snapshot -> source-built rustc/std/Cargo ({})",
+        "   [ladder] x86_64 Rust bridge via build-plan --auto: exact stage0 snapshot -> source-built rustc/std/Cargo/Clippy ({})",
         rust_tree.display()
     );
-    for binary in ["rustc", "rustdoc", "cargo"] {
+    for binary in ["rustc", "rustdoc", "cargo", "cargo-clippy", "clippy-driver"] {
         let path = rust_tree.join("bin").join(binary);
         if !is_executable(&path) {
             return Err(format!(
@@ -100,7 +100,7 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
          \"$bb\" grep -F -x 'admitted_ceiling_bytes=134217728' \"$line_marker\" >/dev/null\n\
          \"$bb\" grep -F -x 'companion_ceiling_bytes=201326592' \"$line_marker\" >/dev/null\n\
          \"$bb\" grep -F \"Rust 1.96.0 librustc_driver's line program\" \"$line_marker\" >/dev/null\n\
-         for name in rustc rustdoc cargo; do\n\
+         for name in rustc rustdoc cargo cargo-clippy clippy-driver; do\n\
            runtime='{rust_path}/bin/'\"$name\"\n\
            debug='{rust_path}/lib/debug/bin/'\"$name\"'.debug'\n\
            test -f \"$debug\"\n\
@@ -159,7 +159,7 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
         busybox_base,
     )?;
     println!(
-        "PASS: rust-toolchain: source-built Rust 1.96.0 rustc/std/Cargo contain no stage0 artifacts; td shell builds and runs ripgrep/fd/uutils against td GCC/glibc with /gnu/store absent"
+        "PASS: rust-toolchain: source-built Rust 1.96.0 rustc/std/Cargo/Clippy contain no stage0 artifacts; td shell builds and runs ripgrep/fd/uutils against td GCC/glibc with /gnu/store absent"
     );
     Ok(())
 }

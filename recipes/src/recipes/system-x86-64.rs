@@ -4379,7 +4379,7 @@ fn real_root_steps(sys: &SystemDef) -> Result<Vec<Step>, String> {
     });
     // One standard image includes the source-built development toolchain.
     // The compiler launcher supplies exact store paths without shell setup.
-    for name in ["rustc", "rustdoc", "cargo"] {
+    for name in ["rustc", "rustdoc", "cargo", "cargo-clippy", "clippy-driver"] {
         steps.push(Step::Symlink {
             target: format!("{{in:rust-toolchain}}/bin/{name}"),
             link: format!("{{root}}/real-root/bin/{name}"),
@@ -7871,6 +7871,8 @@ news\tnews-0.1\tsource\tempty-runtime-1\tsource\n"
             ("rustc", "{in:rust-toolchain}/bin/rustc"),
             ("rustdoc", "{in:rust-toolchain}/bin/rustdoc"),
             ("cargo", "{in:rust-toolchain}/bin/cargo"),
+            ("cargo-clippy", "{in:rust-toolchain}/bin/cargo-clippy"),
+            ("clippy-driver", "{in:rust-toolchain}/bin/clippy-driver"),
             ("td-cc", "{in:td-cc}/bin/td-cc"),
             ("cc", "{in:td-cc}/bin/td-cc"),
             ("gcc", "{in:td-cc}/bin/td-cc"),

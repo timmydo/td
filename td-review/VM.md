@@ -254,8 +254,10 @@ sparse volume is 10 GiB, allowing the boot/update fixtures to hold three
 complete deployments with their debug companions. This is a deployment
 capacity allowance, not a claim that a cold distribution build fits there.
 Private development-store placement and VM data-capacity management remain
-required before reporting the complete repository workflow ready. Clippy and
-the target-native control-plane helper path are also still outstanding.
+required before reporting the complete repository workflow ready. The standard
+Rust toolchain also builds cargo-clippy and clippy-driver from its pinned
+source release, with an offline clean/denied-lint/repaired recipe probe.
+The target-native control-plane helper path is still outstanding.
 
 ## Copy/paste before account linking
 

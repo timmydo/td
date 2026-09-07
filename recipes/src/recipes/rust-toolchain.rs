@@ -1,4 +1,4 @@
-use crate::ladder::{mesboot0_inputs, unpack_into, unpack_keep_top, SH};
+use crate::ladder::{mesboot0_inputs, target_rustc, unpack_into, unpack_keep_top, SH};
 use crate::types::{CheckRunner, Recipe, RecipeCheck, Step, TextEdit};
 
 // rust-toolchain is the shipped, source-built Rust 1.96.0 toolchain. The exact
@@ -11,7 +11,8 @@ use crate::types::{CheckRunner, Recipe, RecipeCheck, Step, TextEdit};
 // `build.full-bootstrap = true` is load-bearing: stage1 builds the in-tree std,
 // then stage1 rebuilds rustc as stage2 and stage2 rebuilds the final std instead
 // of uplifting stage1. Cargo is built from `src/tools/cargo` by the source-built
-// compiler. CMake is the explicitly approved build-only dependency used to build
+// compiler, alongside in-tree cargo-clippy and clippy-driver. CMake is the
+// explicitly approved build-only dependency used to build
 // LLVM; Ninja is disabled and the td-built GNU Make drives its generated graph.
 //
 // td Cargo builds are normatively offline. Reviewed Git dependencies are supplied
@@ -239,7 +240,7 @@ locked-deps = true
 vendor = true
 full-bootstrap = true
 extended = true
-tools = ["cargo"]
+tools = ["cargo", "clippy"]
 docs = false
 compiler-docs = false
 sanitizers = false
@@ -308,7 +309,7 @@ jemalloc = false
     // (this bash has neither `pipefail` nor `PIPESTATUS`).
     let xpy = format!(
         "( {py} x.py build --stage 2 library compiler/rustc src/tools/rustdoc \
-         src/tools/cargo; echo $? > '{{root}}/x-py-status' ) 2>&1 | tee '{{root}}/x-py-build.log'; \
+         src/tools/cargo src/tools/clippy; echo $? > '{{root}}/x-py-status' ) 2>&1 | tee '{{root}}/x-py-build.log'; \
          exit \"$(cat '{{root}}/x-py-status')\""
     );
     steps.push(
@@ -397,6 +398,8 @@ jemalloc = false
             "{out}/bin/rustc".into(),
             "{out}/bin/rustdoc".into(),
             "{out}/bin/cargo".into(),
+            "{out}/bin/cargo-clippy".into(),
+            "{out}/bin/clippy-driver".into(),
         ],
         exec: true,
     });
@@ -424,6 +427,22 @@ jemalloc = false
         "{out}",
         &format!("{nbin}/objcopy"),
     ));
+    for binary in ["cargo-clippy", "clippy-driver"] {
+        steps.push(Step::run("{out}", &[&format!("{{out}}/bin/{binary}"), "--version"])
+            .env("PATH", &path));
+    }
+    steps.push(Step::WriteFile {
+        path: "{root}/clippy-proof/probe.rs".into(),
+        content: include_str!("../probes/rust_clippy.rs").into(),
+        exec: false,
+    });
+    steps.push(target_rustc(
+        "{root}/clippy-proof", "{out}/bin/rustc",
+        &["--edition=2021", "probe.rs", "-Clinker={root}/wb/cc", "-o", "{root}/clippy-proof/probe"],
+    ).env("PATH", &path));
+    steps.push(Step::run("{root}/clippy-proof", &[
+        "{root}/clippy-proof/probe", "{out}/bin/cargo", "{out}/bin/rustc", "{root}/wb/cc",
+    ]).env("PATH", "{out}/bin:{tools}"));
     steps.push(Step::assert_debug_size(
         "{out}",
         "{out}/share/td/debug-size",
