@@ -321,10 +321,12 @@ the current auto-login and credential-switching behavior below is unchanged.
 TPM credential-store enrollment and boot release are separate root-owned
 operations in td-secret and td-firstboot, specified by
 `td-secret/DESIGN.md`. They do not switch process credentials or
-authenticate a human. Firstboot unseals an explicitly enrolled store
+authenticate a human. Firstboot unseals an explicitly TPM-only enrolled store
 into volatile storage before the existing auto-login path runs; the TPM
 policy authenticates selected platform state, not that login's user.
-td-login's session authorization table is unchanged. Firstboot reserves
+Token-protected stores instead remain locked during boot; their safe
+release API requires a verified assertion and has no login/UI consumer
+yet. td-login's session authorization table is unchanged. Firstboot reserves
 compositor, broker, portal, and per-app identities in a persistent
 ledger, and refuses account records that alias a reservation. The image
 activates the compositor assignment as service account `tdc1000` at

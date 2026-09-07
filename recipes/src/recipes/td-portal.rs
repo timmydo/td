@@ -142,6 +142,11 @@ pub fn recipe() -> Recipe {
     }
 
     for (path, source) in [
+        ("{src}/td-secret/src/fido_cbor.rs", include_str!("../../../td-secret/src/fido_cbor.rs")),
+        ("{src}/td-secret/src/fido_ctap.rs", include_str!("../../../td-secret/src/fido_ctap.rs")),
+        ("{src}/td-secret/src/fido_enroll.rs", include_str!("../../../td-secret/src/fido_enroll.rs")),
+        ("{src}/td-secret/src/fido_hid.rs", include_str!("../../../td-secret/src/fido_hid.rs")),
+        ("{src}/td-secret/src/fido_metadata.rs", include_str!("../../../td-secret/src/fido_metadata.rs")),
         ("{src}/td-secret/src/tpm.rs", include_str!("../../../td-secret/src/tpm.rs")),
         (
             "{src}/td-portal/src/secret.rs",

@@ -199,6 +199,14 @@ impl BoundKey {
         self.key.uid
     }
 
+    /// Structural agreement only; TPM Load must still authenticate this object.
+    pub fn require_binding(&self, uid: u32, binding: &[u8; 32]) -> Result<(), String> {
+        if self.uid() != uid || &self.binding != binding {
+            return Err("sealed key and enrollment metadata disagree".into());
+        }
+        Ok(())
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>, String> {
         let mut bytes = b"TDBOUND1".to_vec();
         bytes.extend_from_slice(&self.binding);

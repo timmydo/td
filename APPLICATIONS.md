@@ -9338,7 +9338,7 @@ components the platform measures. The stock direct-kernel QEMU path has no
 measured-deployment policy and remains unenrolled. The kernel carries ACPI
 TPM discovery and the TIS/FIFO and CRB drivers.
 
-Firstboot automatically releases existing enrolled stores for every
+Firstboot automatically releases existing TPM-only stores for every
 deployed session into checked `/run` tmpfs after identity enrollment and
 before application-home provisioning. Invalid homes cannot leave an old
 store human-owned after a successful migration. A refused migration
@@ -9357,6 +9357,17 @@ physical-bus, rollback and update boundaries, plus the pinned
 host-emulator oracle. That oracle covers TPM restart, changed
 measurements, a different TPM and actual store migration; it is separate
 from the desktop boot check.
+
+The persistent FIDO prerequisite adds a versioned store joining canonical
+primary/recovery metadata with its matching TPM-bound key. Atomic enrollment
+rotates the master and records together; release owns the exact protector
+snapshot, verifies the selected assertion, and only then unseals. Firstboot
+recognizes token-protected stores and leaves them locked without touching the
+TPM or writing placeholder credentials. There is no enrollment or release UI
+consumer yet; the current console cannot enroll tokens or bypass their
+assertion requirement. `td-secret/DESIGN.md` specifies these formats and the
+pinned-emulator store oracle. Existing TPM-only automatic release remains
+limited to that backend pending the trusted-input activation cutover.
 
 The secure-attention prerequisites reserve distinct compositor, broker,
 portal, and application identities in immutable

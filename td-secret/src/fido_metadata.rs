@@ -217,8 +217,127 @@ impl ReleaseRequest {
     }
 }
 
+/// One canonical persistence field: complete recovery policy and its bound key.
+/// Parsing authenticates neither the metadata nor the TPM object's private bytes.
+pub struct Protection {
+    metadata: Metadata,
+    key: tpm::BoundKey,
+}
+
+pub const MAX_PROTECTION: usize = 8192;
+const PROTECTION_MAGIC: &[u8] = b"TDFIDO01";
+
+impl Protection {
+    pub fn new(uid: u32, metadata: Metadata, key: tpm::BoundKey) -> Result<Self, String> {
+        if metadata.uid != uid {
+            return Err("enrollment protection belongs to another session".into());
+        }
+        key.require_binding(uid, &metadata.binding()?)?;
+        Ok(Self { metadata, key })
+    }
+
+    pub fn uid(&self) -> u32 {
+        self.metadata.uid
+    }
+
+    pub fn has_recovery(&self) -> bool {
+        self.metadata.has_recovery()
+    }
+
+    pub fn encode(&self) -> Result<Vec<u8>, String> {
+        self.key.require_binding(self.uid(), &self.metadata.binding()?)?;
+        let metadata = self.metadata.encode()?;
+        let key = self.key.encode()?;
+        let mut bytes = PROTECTION_MAGIC.to_vec();
+        for field in [metadata.as_slice(), key.as_slice()] {
+            let size = u16::try_from(field.len()).map_err(|_| "oversized protection field")?;
+            bytes.extend_from_slice(&size.to_be_bytes());
+            bytes.extend_from_slice(field);
+        }
+        if bytes.len() > MAX_PROTECTION {
+            return Err("oversized enrollment protection".into());
+        }
+        Ok(bytes)
+    }
+
+    pub fn decode(bytes: &[u8], expected_uid: u32) -> Result<Self, String> {
+        if bytes.len() > MAX_PROTECTION {
+            return Err("oversized enrollment protection".into());
+        }
+        let mut reader = Reader(bytes);
+        if reader.take(PROTECTION_MAGIC.len())? != PROTECTION_MAGIC {
+            return Err("invalid enrollment protection version".into());
+        }
+        let metadata = Metadata::decode(reader.field()?, expected_uid)?;
+        let key = tpm::BoundKey::decode(reader.field()?)?;
+        if !reader.0.is_empty() {
+            return Err("trailing enrollment protection".into());
+        }
+        Self::new(expected_uid, metadata, key)
+    }
+
+    /// Enrollment checks the newly sealed master without publishing a release.
+    pub(crate) fn verify_sealed_master<T: tpm::Transport>(
+        &self,
+        expected: &[u8; 32],
+        client: tpm::Client<T>,
+    ) -> Result<(), String> {
+        let mut actual = client.unseal_bound(&self.key, &self.metadata.binding()?)?;
+        let matches = &actual == expected;
+        actual.fill(0);
+        if !matches {
+            return Err("TPM enrollment roundtrip changed the key".into());
+        }
+        Ok(())
+    }
+
+    /// Own the complete protector snapshot before a token operation begins.
+    pub fn request(
+        &self,
+        role: Role,
+        challenge: [u8; 32],
+        info: &Info,
+    ) -> Result<BoundRelease, String> {
+        Ok(BoundRelease {
+            request: self.metadata.request(role, challenge, info)?,
+            key: tpm::BoundKey::decode(&self.key.encode()?)?,
+            id: crypto::digest(&self.encode()?),
+        })
+    }
+}
+
+/// Binds a fresh assertion to the exact stored protector selected for release.
+pub struct BoundRelease {
+    request: ReleaseRequest,
+    key: tpm::BoundKey,
+    id: [u8; 32],
+}
+
+impl BoundRelease {
+    pub fn bytes(&self) -> &[u8] {
+        self.request.bytes()
+    }
+
+    pub fn protection_id(&self) -> &[u8; 32] {
+        &self.id
+    }
+
+    pub fn unseal<T: tpm::Transport>(
+        self,
+        response: &[u8],
+        client: tpm::Client<T>,
+    ) -> Result<[u8; 32], String> {
+        self.request.unseal(response, &self.key, client)
+    }
+}
+
 struct Reader<'a>(&'a [u8]);
 impl<'a> Reader<'a> {
+    fn field(&mut self) -> Result<&'a [u8], String> {
+        let length = u16::from_be_bytes(self.take(2)?.try_into().map_err(|_| "short protection field")?);
+        self.take(usize::from(length))
+    }
+
     fn take(&mut self, size: usize) -> Result<&'a [u8], String> {
         let bytes = self.0.get(..size).ok_or("truncated enrollment metadata")?;
         self.0 = self.0.get(size..).ok_or("truncated enrollment metadata")?;
@@ -250,7 +369,7 @@ impl<'a> Reader<'a> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::fido_cbor::Encoder;
     use crate::fido_enroll::MakeCredential;
@@ -301,6 +420,55 @@ mod tests {
             recovery: recovery.then(|| token(8, SECOND)),
         }
     }
+    pub(crate) fn metadata_fixture(uid: u32, recovery: bool) -> Metadata {
+        let mut metadata = metadata(recovery);
+        metadata.uid = uid;
+        metadata
+    }
+
+    pub(crate) fn protection_fixture(uid: u32, recovery: bool) -> Protection {
+        let metadata = metadata_fixture(uid, recovery);
+        let key = tpm::tests::fixture(uid);
+        let mut bytes = b"TDBOUND1".to_vec();
+        bytes.extend_from_slice(&metadata.binding().unwrap());
+        bytes.extend_from_slice(&(key.len() as u16).to_be_bytes());
+        bytes.extend_from_slice(&key);
+        Protection::new(uid, metadata, tpm::BoundKey::decode(&bytes).unwrap()).unwrap()
+    }
+
+    pub(crate) fn release_fixture(protection: &Protection, role: Role) -> (BoundRelease, Vec<u8>) {
+        let signature = match role { Role::Primary => PRIMARY_SIGNATURE, Role::Recovery => SECOND_SIGNATURE };
+        (protection.request(role, challenge(), &info()).unwrap(), signed(signature))
+    }
+
+    #[test]
+    fn persisted_protection_requires_one_canonical_matching_session_and_policy() {
+        for recovery in [false, true] {
+            let protection = protection_fixture(1000, recovery);
+            let encoded = protection.encode().unwrap();
+            let decoded = Protection::decode(&encoded, 1000).unwrap();
+            assert_eq!(decoded.encode().unwrap(), encoded);
+            assert_eq!(decoded.has_recovery(), recovery);
+            assert!(Protection::decode(&encoded, 1001).is_err());
+            for size in 0..encoded.len() {
+                assert!(Protection::decode(&encoded[..size], 1000).is_err(), "length {size}");
+            }
+            let mut trailing = encoded.clone(); trailing.push(0);
+            assert!(Protection::decode(&trailing, 1000).is_err());
+            let mut changed = encoded.clone();changed[0] ^= 1;
+            assert!(Protection::decode(&changed, 1000).is_err());
+            let primary = decoded.request(Role::Primary, challenge(), &info()).unwrap();
+            assert_eq!(primary.protection_id(), &crypto::digest(&encoded));
+            assert_eq!(decoded.request(Role::Recovery, challenge(), &info()).is_ok(), recovery);
+        }
+        let protection = protection_fixture(1000, false);
+        let wrong_policy = metadata_fixture(1000, true);
+        assert!(Protection::new(1000, wrong_policy, protection.key).is_err());
+        let protection = protection_fixture(1000, false);
+        assert!(Protection::new(1001, metadata_fixture(1000, false), protection.key).is_err());
+        assert!(Protection::decode(&vec![0; MAX_PROTECTION + 1], 1000).is_err());
+    }
+
     fn signed(signature: &str) -> Vec<u8> {
         signed_flags(signature, 0x81)
     }

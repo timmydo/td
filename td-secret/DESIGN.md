@@ -193,8 +193,8 @@ selected PCR state loses access: enrollment explicitly requires
 `--unrecoverable`. Re-enrollment and policy-authorized upgrades are not yet
 provided. Do not enroll a store whose measured updates require recovery.
 
-Firstboot isolates and releases every deployed session's existing
-enrolled store after identity enrollment and before application-home
+Firstboot isolates every deployed session's existing store and releases
+TPM-only enrolled stores after identity enrollment and before application-home
 provisioning. An invalid home cannot leave the existing store
 human-owned after a successful migration. Migration refusal is handled
 as described above. Once the store is isolated, a failed open or TPM
@@ -560,8 +560,8 @@ UID, relying-party, enrolled-key and recovery policy; require the matching
 FIDO assertion on the trusted operation; and only then invoke unseal.
 The current oracle is the pinned software TPM; no particular hardware vendor
 is certified by this increment. A device refusing this published primary
-template fails closed, without selecting another parent. No store file,
-console command or boot-release behavior consumes this API yet.
+template fails closed, without selecting another parent. The persistent token protector below consumes this API; no console
+command or automatic boot release consumes it.
 The existing unbound API remains for current stores until the atomic FIDO
 cutover. This API does not authorize token replacement or rollback a lost
 recovery policy. A metadata change requires authorized unseal with the old
@@ -615,9 +615,10 @@ request encoding. The later trusted caller must supply fresh kernel
 randomness bound to one presented secure-attention operation; this API
 cannot establish freshness or consent from arbitrary caller bytes.
 
-These safe APIs introduce no device access, persistent file, root command
-or automatic release consumer. The current TPM-only backend stays active
-until the complete FIDO store migration lands. Root and the trusted TPM
+The persistent protector below consumes these safe metadata APIs. They
+introduce no device access, root command or automatic token release. The
+current TPM-only backend stays active until the trusted FIDO activation
+flow can enroll existing stores. Root and the trusted TPM
 remain in the trust boundary; this is a td-owned software ordering check,
 not a TPM policy that itself evaluates FIDO presence. This store profile
 requires presence only: it does not request PIN/UV or enforce a signature
@@ -633,6 +634,83 @@ and refuses changed challenges/signatures, the wrong role's key, removed
 recovery, substituted metadata plus envelope digest, and another UID.
 Only public fixture bytes are committed; no signing key or OpenSSL runtime
 dependency is added. These are protocol tests, not physical-token evidence.
+
+## Persistent token protector prerequisite
+
+`TDFIDO01` joins canonical enrollment metadata and its matching TPM-bound
+key into one immutable protector: eight magic bytes, a big-endian u16
+metadata length and metadata, then a big-endian u16 key length and key.
+The complete protector is bounded to 8192 bytes. Decoding independently
+checks the logical session UID, exact metadata binding, canonical inner
+formats and absence of trailing data. These checks prove structure; the
+TPM authenticates the sealed child's parent on release.
+
+A token-protected store uses `TDSEAL02` with the same record framing and
+bounds as `TDSEAL01`, replacing its TPM-only envelope with this protector.
+The outer version must match the inner kind. A malformed token protector
+cannot select the old TPM-only or file-master backend. The complete
+protector, including both credentials and recovery policy, supplies the
+volatile release fingerprint.
+
+The safe root enrollment API requires an already proved metadata value
+from the trusted enrollment flow. It validates the no-swap, zero-core and
+volatile-runtime requirements before handling a new master, while retaining
+an existing release long enough to migrate TPM-only records. It rotates the
+master, verifies a real
+bound seal/unseal roundtrip without publishing that key, re-encrypts every
+credential, and atomically publishes the protector and records together.
+It retires legacy files and clears the volatile release. Existing
+TPM-only stores must already be released to migrate their records. A
+failed operation before publication leaves the old store usable; after
+publication, the token format is authoritative even if cleanup needs a
+retry. Every attempted rotation clears the volatile release even when
+publication, sync or cleanup reports an error; a prepublication failure
+can therefore require another release of the unchanged TPM-only store.
+There is no token replacement or downgrade operation. A missing master in
+an existing store directory always refuses initialization, even if only the
+lock remains: deleting a sealed bundle cannot silently mint a new master or
+placeholder. An interrupted first creation that never published its master
+also refuses automatic retry and requires explicit repair. This is missing-
+record protection, not an authenticated history marker: the credential
+service is trusted, and whole-store substitution retains the rollback limit.
+
+A release request owns the exact protector snapshot and the selected
+primary or recovery assertion. Starting a request clears any old volatile
+key before parsing or selecting the token. Completing a request clears
+any old release before comparing the snapshot to the current stored
+protector, verifying signed presence, and unsealing. With a valid writable runtime, every refusal leaves
+it locked; publication follows successful verification and
+legacy cleanup. The store's stable lock covers each API call. The future
+authority must serialize the entire presented operation across separate
+calls and supply a fresh challenge bound to that operation.
+
+Firstboot clears a prior volatile release before opening an existing store,
+so malformed persistent bytes cannot bypass relocking. It recognizes the
+token format during isolation and provisioning, clears volatile release state and retires interrupted legacy store files
+without accessing a token or TPM. A locked store does not prevent
+application configuration or compositor startup. It neither reads nor
+creates a placeholder credential in an enrolled locked store. A legacy
+plaintext mail credential still present beside that application is
+refused and retained for explicit migration; it is never silently erased.
+The existing root `release` command refuses a token-protected store.
+
+This is a persistent-format and boot prerequisite. No CLI or compositor
+flow enrolls tokens or calls the token-release API yet. The stock image
+continues with its explicitly unenrolled backend, and existing TPM-only
+stores retain their documented automatic release until the secure-input
+activation cutover. No new user authentication or one-operation elevation
+is claimed. Root and the TPM remain trusted; whole-store rollback,
+historical extents and best-effort memory clearing retain their existing
+limits. The token assertion is checked by td-owned software before TPM
+unseal, not by a TPM policy that understands FIDO.
+
+Ordinary fixtures cover atomic rotation, failed roundtrip preservation,
+complete format bounds and wrong-UID/version refusal. The pinned TPM
+emulator seals and reopens an actual encrypted store, releases it through
+both independently signed public token fixtures, and rejects changed
+signatures, another protector and changed PCRs while removing any prior
+volatile key. This is software protocol evidence, not a physical touch
+or trusted presentation demonstration.
 
 ## TPM validation
 

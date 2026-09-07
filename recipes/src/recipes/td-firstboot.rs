@@ -38,6 +38,11 @@ pub(crate) const MAIN_RS: &str = include_str!("../../../td-firstboot/src/main.rs
 
 // (module basename, source text). rustc resolves `mod NAME;` to `{src}/NAME.rs`.
 const MODULES: &[(&str, &str)] = &[
+    ("fido_cbor", include_str!("../../../td-secret/src/fido_cbor.rs")),
+    ("fido_ctap", include_str!("../../../td-secret/src/fido_ctap.rs")),
+    ("fido_enroll", include_str!("../../../td-secret/src/fido_enroll.rs")),
+    ("fido_hid", include_str!("../../../td-secret/src/fido_hid.rs")),
+    ("fido_metadata", include_str!("../../../td-secret/src/fido_metadata.rs")),
     ("application_runtime", include_str!("../../../td-firstboot/src/application_runtime.rs")),
     ("application_state", include_str!("../../../td-firstboot/src/application_state.rs")),
     (
@@ -110,6 +115,11 @@ pub fn recipe() -> Recipe {
     for (name, source) in MODULES {
         steps.push(Step::WriteFile {
             path: match *name {
+                "fido_cbor" => "{src}/td-secret/src/fido_cbor.rs".into(),
+                "fido_ctap" => "{src}/td-secret/src/fido_ctap.rs".into(),
+                "fido_enroll" => "{src}/td-secret/src/fido_enroll.rs".into(),
+                "fido_hid" => "{src}/td-secret/src/fido_hid.rs".into(),
+                "fido_metadata" => "{src}/td-secret/src/fido_metadata.rs".into(),
                 "tpm" => "{src}/td-secret/src/tpm.rs".into(),
                 "crypto" => "{src}/td-secret/src/crypto.rs".into(),
                 "secret_store" => "{src}/td-secret/src/store.rs".into(),
