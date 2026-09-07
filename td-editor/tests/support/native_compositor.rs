@@ -208,9 +208,13 @@ impl Compositor {
     }
 
     fn pointer(&mut self, x: u32, y: u32, buttons: u8) {
+        self.pointer_frame(x, y, buttons, 0, 0);
+    }
+
+    fn pointer_frame(&mut self, x: u32, y: u32, buttons: u8, vertical: i32, horizontal: i32) {
         let time = self.action + 1;
         self.receipt(&format!(
-            "pointer {} {time} {x} {y} {buttons} 0 0",
+            "pointer {} {time} {x} {y} {buttons} {vertical} {horizontal}",
             self.session
         ));
     }
@@ -346,7 +350,7 @@ impl Drop for Compositor {
 }
 
 fn text_pixels(text: &str) -> Vec<u8> {
-    use td_editor::render::{Draw, Geometry, GlyphStyle, Primitive, Raster, Scale, INK, PAPER};
+    use td_editor::render::{Draw, Geometry, GlyphStyle, INK, PAPER, Primitive, Raster, Scale};
     assert!(text.is_ascii() && !text.is_empty() && text.len() <= 32);
     let font = td_editor::font::pinned().unwrap();
     let width = text.len() * 8;
@@ -468,6 +472,52 @@ fn native_pointer_selection_and_menus() {
     compositor.rendered_text(&mut editor, &window, 2, before, "one two", 7);
     editor.job("save\t1\t2");
     assert_eq!(std::fs::read(&file).unwrap(), b"one two\n");
+    editor.quit();
+    compositor.stop();
+}
+
+#[test]
+#[ignore = "requires explicit built TD_TEST_COMPOSITOR; ready prepares it"]
+fn native_vertical_wheel_scrolls_without_editing() {
+    let compositor_directory = Directory::new();
+    let directory = Directory::new();
+    let mut compositor = Compositor::start(&compositor_directory);
+    let file = directory.0.join("draft");
+    let dictionary = directory.0.join("dictionary");
+    let text: String = (0..64).map(|row| format!("row{row:02}\n")).collect();
+    std::fs::write(&file, &text).unwrap();
+    std::fs::write(&dictionary, b"row\n").unwrap();
+    let display = compositor.directory.join("wayland-0");
+    let mut editor = EditorProcess::start(&directory, &display, &file, &dictionary);
+    editor.wait_keyboard("windows");
+    let window = compositor.window();
+    assert_eq!(compositor.request("fullscreen", 1024), b"ok\n");
+    editor.wait_field("state", "window", "800,576,1");
+    editor.rendered_at(800, 576);
+    compositor.pointer(400, 80, 0);
+    editor.wait_field("state", "pointer-ready", "1");
+    for (detents, row) in [(-1, 3), (-1, 6), (2, 0)] {
+        let before = compositor.observe(&window);
+        compositor.pointer_frame(400, 80, 0, detents, 0);
+        editor.wait_field("state", "view", &format!("1,{row},0,98,31,1,downstream,-"));
+        editor.wait_field("state", "tab", "1,0,0,384,0,0,0,72,0,lf");
+        assert_eq!(
+            editor.ok("text\t1\t0\t0\t384"),
+            format!("384\t{}", td_editor::control::hex(text.as_bytes()))
+        );
+        let prefix = format!("row{row:02}");
+        // The caret stays on row zero. Scrolled rows compare every pixel;
+        // prefix.len() places the optional one-column mask outside the crop.
+        compositor.rendered_text(
+            &mut editor,
+            &window,
+            0,
+            before,
+            &prefix,
+            if row == 0 { 0 } else { prefix.len() },
+        );
+    }
+    assert_eq!(std::fs::read(&file).unwrap(), text.as_bytes());
     editor.quit();
     compositor.stop();
 }

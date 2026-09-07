@@ -2210,9 +2210,18 @@ The case checks menu/prompt transitions semantically and document pixels
 after dismissal; it does not assert open menu/prompt pixels or caret
 visibility. Those are separate visual-coverage boundaries.
 
-This proves native keyboard/pointer/menu/state/callback/pixel integration,
-not GPU, hardware input, jail or caller `$EDITOR` integration. Wheel and
-inter-client clipboard scenarios remain the following native increments.
+The native vertical-wheel case opens 64 numbered lines, keeps the pointer
+inside the document but outside the captured prefix, and routes complete
+reports with vertical detents -1, -1, then +2. Exact viewport rows 3, 6,
+then 0 pin the evdev sign conversion, three-rows-per-detent adapter policy
+and accumulation. Each step checks unchanged document revision, full text,
+selection and caret, a fresh callback/client-publication bracket and the
+captured first visible row. Disk bytes remain unchanged. It does not cover
+horizontal wheels, high-resolution scrolling or clamped no-op reports.
+
+This proves native keyboard/pointer/menu/wheel/state/callback/pixel
+integration, not GPU, hardware input, jail or caller `$EDITOR` integration.
+Inter-client clipboard remains the following native increment.
 Weston remains separate optional interoperability evidence below.
 
 The opt-in `disposable_weston_runs_the_production_editor_and_control_workers`
