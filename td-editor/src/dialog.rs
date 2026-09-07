@@ -92,6 +92,10 @@ pub(crate) struct Close {
 }
 
 impl Close {
+    pub(crate) fn scope(&self) -> Scope {
+        self.scope
+    }
+
     pub(crate) fn new(editor: &Editor, scope: Scope) -> Result<Self> {
         let mut points = match scope {
             Scope::Tab { tab, revision } => vec![editor.revision_point(tab, revision)?],

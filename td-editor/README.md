@@ -82,7 +82,10 @@ dispatch without changing text or history. `spelling-results` exposes status,
 whole-scan counts and bounded range pages pinned to both text revision and
 scan ID. Checking starts with ordinary F7 or remote `check-spelling`;
 pending scans expose no partial marks. File operations and dialog answers
-remain later work. `check-spelling` returns a job ID; native state retains
+remain later work except for Close Tab, Quit and close-dialog Cancel/Discard.
+These answers pin the live dialog ID, tab and revision and work independently
+of physical focus/prompt visibility, without bypassing the close coordinator.
+`check-spelling` returns a job ID; native state retains
 up to 64 completion/error/cancellation outcomes, separate from scan-pinned
 result pages. Native state also exposes separate redraw/submitted/callback
 generations; `wait-frame`

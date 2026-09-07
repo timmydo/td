@@ -2,8 +2,9 @@
 
 The experimental `--window --control-socket PATH` endpoint implements the
 query and revision-checked editing subset below. It is off by default;
-scratch preview and replay do not accept the option. Remote file operations
-and dialog answers remain unimplemented. Remote Check Spelling admission and
+scratch preview and replay do not accept the option. Remote Close Tab, Quit and
+close-dialog Cancel/Discard are connected; remote file I/O and other dialog
+answers remain unimplemented. Remote Check Spelling admission and
 bounded job outcomes are implemented below. The complete version-1 target is
 specified in
 [DESIGN.md](DESIGN.md#test-and-control-architecture).
@@ -60,19 +61,22 @@ In the examples below, field spaces denote literal Tab separators.
 | --- | --- |
 | `1 ID state` | Snapshot the current controller. |
 | `1 ID new` | Create and activate an empty tab; return its stable ID. |
+| `1 ID close-tab TAB REVISION` | Start ordinary active-tab close, without approving discard. |
+| `1 ID quit` | Start ordinary whole-window close, without approving discard. |
+| `1 ID dialog-answer DIALOG TAB REVISION ANSWER` | Answer the current close question with `cancel` or `discard`. |
 | `1 ID text TAB REVISION OFFSET LIMIT` | Read a scalar-aligned UTF-8 page. |
 | `1 ID spelling-results TAB REVISION SCAN OFFSET LIMIT` | Read native spelling status and a scan-pinned range page. |
 | `1 ID wait-frame GENERATION` | Wait for a main-surface callback at or beyond this native redraw generation. |
 | `1 ID check-spelling TAB REVISION` | Admit an on-demand whole-document spelling job for the active tab. |
 
 Tab creation and the editing subset are specified below. `load`, file I/O,
-physical-input simulation and dialog answers remain refused; this parser is
+physical-input simulation and other dialog answers remain refused; this parser is
 not a route into replay's broader command set.
 `Request::response` borrows `&Controller`, so it cannot dispatch an edit or
 change selection, views, history or generation. It returns `unavailable`
-for creation, editing, spelling and frame requests; `Request::execute`
-admits edits, and the native adapter dispatches creation and supplies its
-spelling/frame state.
+for creation, closing, dialog, editing, spelling and frame requests.
+`Request::execute` admits edits; the native adapter dispatches creation,
+close/dialog actions and supplies its spelling/frame state.
 
 An error response is `1 ID error CODE HEX_DIAGNOSTIC`. A recoverable request
 ID is echoed even if the command name is missing or later arguments are
@@ -115,6 +119,99 @@ invalidates the native frame. The reply is not presentation evidence;
 use state and `wait-frame` separately. The immutable controller-only
 response API returns `unavailable`; creation is a native action, while
 headless tests can dispatch `Event::New` directly or use replay `new`.
+
+## Close requests and dialog answers
+
+Close Tab uses the native file-window close coordinator. It requires the
+active tab and its current revision, and refuses during any existing modal,
+while closed/quitting, without a file session, or while file work is busy.
+These native guards precede missing-tab/revision/active-tab checks. Missing,
+stale or inactive targets use `missing-tab`, `stale-revision` or
+`invalid-argument`. The checked dialog counter and room for two possible
+controller dispatches are admitted before native input changes; exhaustion
+is `exhausted`. Validation refusals preserve the snapshot and visible notice.
+The two-dispatch reservation covers pointer cancellation and clean completion;
+it may conservatively refuse near counter exhaustion even for a dirty tab.
+
+`quit` has no arguments and uses the same guarded coordinator with window
+scope. It pins the current set of tabs/revisions at admission and asks about
+each dirty target; it never grants discard itself. There is no expected
+active tab because the requested scope is the whole window. New/removed or
+changed tabs invalidate the existing coordinator rather than expanding its
+approval. Close Tab and Quit remain unavailable in scratch preview.
+
+A clean scope closes immediately with `1 ID ok closed`. Dirty text is not
+removed: success is `1 ID ok dialog DIALOG`, and state supplies its live
+question. Successful close admission shares ordinary pointer/repeat reset,
+then cancels native Paste and updates search/spelling/frame state through
+the common control boundary. There is no file read/write or save job here.
+Closing the last tab exits the window; shutdown can drop the reply before
+delivery. Connection EOF is not a receipt or persistence proof. Normal
+transport liveness/deadline rules still apply, and a lost reply must not be
+blindly retried.
+
+Native state adds `dialog-last=N`, initially zero, and exactly one
+`dialog=ID,SCOPE,PHASE,TAB,REVISION,ANSWERS` field, or `dialog=-` when no close
+coordinator exists. `SCOPE` is `close-tab` or `close-window`; `PHASE` is
+`question`, `path` (Save As entry during closing), or `saving`. The answers
+are `cancel+discard` for a question and `cancel` for path/saving. An invalid
+coordinator reports `invalid,-,-,-` after scope and offers no remote answer.
+This covers stale pinned targets and a defensive no-question fallback;
+ordinary completion removes a fully answered coordinator synchronously,
+before the next control request. The coarse native file-busy flag remains
+available even for an invalid coordinator. Other native prompts retain only
+their coarse presence flags and cannot be answered with this close token.
+
+Each admitted ordinary or remote close request consumes a new nonzero
+window-local checked `u64` dialog ID, including clean immediate closes. The
+ID is retained across that coordinator's questions and Save phases, never
+reset or reused in that window. Dialog, transport request, spelling job/scan,
+tab and frame IDs have separate namespaces; their numeric values may coincide.
+Repeated window-manager close while the coordinator is already live keeps
+its ID. Cancellation and a fresh close get
+a new ID even for identical tab text/revision. IDs are not durable across
+window/process restarts. No dialog history, path or entry text is retained
+or exposed by these fields.
+
+An answer must match the nonzero live ID and the coordinator's current
+question tab and revision. A missing/closed coordinator is `unavailable`;
+zero/wrong ID or wrong question tab is `invalid-argument`; wrong revision
+or a coordinator invalidated by later text is `stale-revision`. A vanished
+pinned tab may report `missing-tab`. The existing coordinator revalidates
+every pinned model point, not just the named tab. Repeated answers cannot
+approve the next window-close target. Missing fields are `protocol`;
+unsupported/case-mismatched answers, including remote `save`, are currently
+`invalid-argument`. Fields are decoded left to right, so an invalid answer
+precedes a trailing-field error; an otherwise valid answer with extra fields
+is `protocol`. No force/discard bypass exists.
+
+As explicitly approved for automation, trusted remote answers do not require
+keyboard focus, a synchronized keymap/seat, or a fully visible prompt.
+Physical Save/Discard still require their existing input and 272x160-pixel
+visibility conditions. This does not fabricate input state or a physical
+serial. The remote authority is the private control endpoint plus an explicit
+answer bound to the live dialog, tab and revision. This includes a dialog
+opened by a human through ordinary input or the window manager; the client
+need not have opened it. The same policy will apply to future remote
+Save/path answers; those are not implemented by this subset.
+
+`discard` is accepted only in the question phase, with no pending file work,
+and prechecks room for its possible controller dispatch. It invokes the same
+coordinator approval and completion path as physical Ctrl+D. Tab close removes
+only that tab and its file association. Window-close approvals stay deferred:
+all text/tabs remain until all dirty documents have decisions; Cancel drops
+all approvals. `cancel` is also allowed during close-driven Save As or Save;
+it drops the close coordinator and its path entry, but never cancels or rolls
+back an accepted write. Completed saves stay saved and later edits stay dirty.
+Neither answer alters the physical confirmation checks.
+
+Answer success is `1 ID ok` plus a trailing Tab. It acknowledges that explicit
+choice, not file persistence or presentation; state may now name the next
+question or no dialog. Queries are immutable. Rare admitted coordinator
+completion failures report their error and retain unapproved text, but may
+clear the failed dialog and update its native diagnostic; they are not
+side-effect-free validation refusals. Conflict/reload answers, remote Open,
+Save and Save As remain later work.
 
 ## Revision-checked editing
 
@@ -456,8 +553,8 @@ There are at most 64 tab/view pairs. No text bytes, file path, title, dictionary
 pending dialog/job or spelling range is serialized by this controller-only
 snapshot. Its generation means local UI state, **not** a submitted buffer,
 frame callback or scanout. The native extension below adds its own redraw
-generations/snapshots, coarse flags and bounded spelling-job outcomes.
-File/dialog job identities remain
+generations/snapshots, coarse flags, bounded spelling-job outcomes and close
+dialog identity/answers. File job and other dialog identities remain
 later work before claiming complete remote control.
 
 ## Experimental native adapter
@@ -502,20 +599,23 @@ this order. Error responses are unchanged:
 
 | Field | Value |
 | --- | --- |
-| `adapter=native-jobs` | Explicit implemented adapter identity. |
+| `adapter=native-close` | Explicit implemented adapter identity. |
 | `native=...` | Configured, file session present, file job busy, quitting. |
 | `modal=...` | Path entry, close question, conflict question, pending Reload, menu, Find, numeric entry, command entry, Replace. |
 | `spelling=...` | Selected dictionary entry count or `-`, scan running. |
 | `job-last=N` | Largest admitted remote background-job ID, or zero. |
 | `job=...` (repeated) | Up to 64 ordered spelling-job rows under the contract above. |
+| `dialog-last=N` | Largest admitted close-coordinator ID, or zero. |
+| `dialog=...` | Live close scope/phase/target/allowed answers, or `-`. |
 | `window-generation=N` | Current native redraw-invalidation generation. |
 | `frame-submitted=...` | Last submitted snapshot, or `-`. |
 | `frame-completed=...` | Last callback-completed snapshot, or `-`. |
 
 Boolean flags are `0|1`; the dictionary field is an entry count or `-`.
 The native/modal/spelling flags remain coarse presence information, not
-dialog IDs, allowed answers or spelling ranges. Job rows expose only the
-spelling outcomes above; file/dialog job IDs remain absent. No path or entry text
+dialog IDs, allowed answers or spelling ranges. Separate dialog fields expose
+the close coordinator only; job rows expose spelling outcomes. File jobs and
+other dialog IDs remain absent. No path or entry text
 is disclosed by these added fields. Query `text` separately for document
 bytes. Controller generation does not cover native-only modal/job changes,
 and is not a submitted/callback-completed frame generation. Clients must not

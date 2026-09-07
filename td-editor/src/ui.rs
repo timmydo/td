@@ -707,6 +707,13 @@ impl Controller {
 }
 
 #[cfg(test)]
+impl Controller {
+    pub(crate) fn generation_for_test(&mut self, value: u64) {
+        self.generation = value;
+    }
+}
+
+#[cfg(test)]
 mod clipboard_admission_tests {
     use super::*;
     use crate::clipboard::{Paste, Snapshot};

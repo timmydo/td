@@ -97,6 +97,17 @@ pub fn frame(payload: &[u8]) -> Result<Vec<u8>> {
 pub enum Operation {
     State,
     New,
+    Quit,
+    CloseTab {
+        tab: TabId,
+        revision: u64,
+    },
+    DialogAnswer {
+        dialog: u64,
+        tab: TabId,
+        revision: u64,
+        answer: DialogAnswer,
+    },
     WaitFrame(u64),
     CheckSpelling {
         tab: TabId,
@@ -120,6 +131,12 @@ pub enum Operation {
         revision: u64,
         edit: Edit,
     },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DialogAnswer {
+    Cancel,
+    Discard,
 }
 
 #[derive(Clone, Eq, PartialEq)]
@@ -231,6 +248,21 @@ impl Request {
             let operation = match name {
                 "state" => Operation::State,
                 "new" => Operation::New,
+                "quit" => Operation::Quit,
+                "close-tab" => Operation::CloseTab {
+                    tab: decimal(args.next().ok_or(Error::Protocol)?)?,
+                    revision: decimal(args.next().ok_or(Error::Protocol)?)?,
+                },
+                "dialog-answer" => Operation::DialogAnswer {
+                    dialog: decimal(args.next().ok_or(Error::Protocol)?)?,
+                    tab: decimal(args.next().ok_or(Error::Protocol)?)?,
+                    revision: decimal(args.next().ok_or(Error::Protocol)?)?,
+                    answer: match args.next().ok_or(Error::Protocol)? {
+                        "cancel" => DialogAnswer::Cancel,
+                        "discard" => DialogAnswer::Discard,
+                        _ => return Err(Error::InvalidArgument),
+                    },
+                },
                 "wait-frame" => Operation::WaitFrame(decimal(args.next().ok_or(Error::Protocol)?)?),
                 "check-spelling" => Operation::CheckSpelling {
                     tab: decimal(args.next().ok_or(Error::Protocol)?)?,
@@ -346,6 +378,9 @@ impl Request {
             } => page(ui, *tab, *revision, *offset, *limit),
             Operation::Edit { .. }
             | Operation::New
+            | Operation::Quit
+            | Operation::CloseTab { .. }
+            | Operation::DialogAnswer { .. }
             | Operation::CheckSpelling { .. }
             | Operation::SpellingResults { .. }
             | Operation::WaitFrame(_) => Err(Error::Unavailable),
@@ -381,7 +416,11 @@ impl Request {
         self.is_edit()
             || matches!(
                 self.operation,
-                Operation::New | Operation::CheckSpelling { .. }
+                Operation::New
+                    | Operation::Quit
+                    | Operation::CheckSpelling { .. }
+                    | Operation::CloseTab { .. }
+                    | Operation::DialogAnswer { .. }
             )
     }
 
@@ -725,6 +764,46 @@ mod tests {
     use super::*;
     use crate::model::{Command, Selection};
     use crate::ui::Event;
+
+    #[test]
+    fn close_requests_have_strict_native_only_grammar() {
+        for payload in [
+            "1\t0\tquit",
+            "1\t1\tclose-tab\t2\t3",
+            "1\t2\tdialog-answer\t4\t2\t3\tcancel",
+            "1\t3\tdialog-answer\t4\t2\t3\tdiscard",
+        ] {
+            let request = Request::parse(payload.as_bytes()).unwrap();
+            assert!(request.is_mutating());
+            let mut ui = Controller::default();
+            assert_eq!(request.execute(&mut ui), Err(Error::InvalidArgument));
+            assert!(request.response(&ui).contains("\terror\tunavailable\t"));
+        }
+        for payload in [
+            "quit\textra",
+            "close-tab",
+            "close-tab\t1",
+            "close-tab\t1\t0\textra",
+            "dialog-answer\t1\t2\t3",
+            "dialog-answer\t1\t2\t3\tcancel\textra",
+            "dialog-answer\t-1\t2\t3\tdiscard",
+        ] {
+            assert_eq!(
+                Request::parse(format!("1\t4\t{payload}").as_bytes())
+                    .unwrap_err()
+                    .error,
+                Error::Protocol
+            );
+        }
+        for answer in ["save", "force", "Discard", ""] {
+            assert_eq!(
+                Request::parse(format!("1\t5\tdialog-answer\t1\t2\t3\t{answer}").as_bytes())
+                    .unwrap_err()
+                    .error,
+                Error::InvalidArgument
+            );
+        }
+    }
 
     #[test]
     fn new_tab_admission_is_native_only_and_has_no_arguments() {
@@ -1741,8 +1820,8 @@ mod tests {
             "fill-paragraph\t1\t0",
             "new\t",
             "open\t2f746d702f78",
-            "close-tab\t1\t0",
-            "quit",
+            "close-tab\t1\t0\textra",
+            "quit\textra",
             "save\t1\t0",
             "save-as\t1\t0\t78",
             "dialog-answer\t1\t0\tdiscard",

@@ -7,8 +7,9 @@ const HELP: &str = concat!(
     "td-editor --window [--keys=windows|emacs] [--] [FILE...]\n",
     "Window option: --dictionary PATH loads an explicit local English word list.\n",
     "Window option: --control-socket PATH enables private state/text and edits.\n",
-    "Control edits check revision/selection; remote Save/Close remain unavailable.\n",
-    "Control can read/edit tabs, including unsaved text.\n",
+    "Control edits check revision/selection; remote Save remains unavailable.\n",
+    "Control can read/edit tabs and answer live Close/Quit with Cancel/Discard.\n",
+    "Remote Discard also answers human-opened dialogs, without physical focus.\n",
     "Experimental Wayland file editor. Do not use as $EDITOR yet.\n",
     "Windows files: Ctrl+O, Ctrl+S, Ctrl+Shift+S. Emacs: C-x C-f, C-x C-s, C-x C-w.\n",
     "Open/Save As path entry: Return submits, Escape/Ctrl+G cancels, Ctrl+U clears.\n",
@@ -175,7 +176,9 @@ mod tests {
             "F7 checks the whole document on demand",
             "No bundled word list, GPU renderer",
             "private state/text and edits",
-            "remote Save/Close remain unavailable",
+            "remote Save remains unavailable",
+            "answer live Close/Quit with Cancel/Discard",
+            "human-opened dialogs, without physical focus",
         ] {
             assert!(HELP.contains(feature), "{feature}");
         }

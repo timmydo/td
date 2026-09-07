@@ -27,7 +27,8 @@ edits. Native redraw/submitted/callback generations and bounded `wait-frame`
 acknowledgement are connected. Remote Check Spelling returns a job ID with
 bounded completion/error/cancellation history in native state. Remote New
 creates an ordinary empty tab and returns its stable ID. Remote file
-operations and dialog answers remain unimplemented.
+I/O and other dialog answers remain unimplemented. Remote Close Tab, Quit and
+live close-dialog Cancel/Discard use the ordinary close coordinator.
 Replay emits explicit external-operation requests and does not pretend to
 perform native file, clipboard or display work.
 The allocation-free layout library supplies visual rows, glyph intervals,
@@ -1080,9 +1081,10 @@ Escape/C-g cancels the whole close request. These modal keys are the same in
 both profiles. Repeated keys never confirm a choice. The first caption line
 identifies the document by stable tab ID, followed by its escaped leaf name
 (or Untitled), shortened to 27 scalars plus an ellipsis when needed. Save and
-Discard require synchronized input and at least 272x160 buffer pixels: all
-six caption/control lines then fit the notice region. Smaller windows show a
-resize instruction and accept only Cancel. Input loss retains the question
+Discard from physical input require synchronized input and at least 272x160
+buffer pixels: all six caption/control lines then fit the notice region.
+Smaller windows show a resize instruction and accept only Cancel. Input loss
+retains the question
 and shows restoration instructions instead of choices. A close-driven path
 prompt explicitly says cancellation cancels the whole close request. Any
 save refusal or failure explicitly reports that closing was cancelled and
@@ -1096,8 +1098,15 @@ Only this coordinator can construct the opaque `Discard` permit consumed
 by `Event::Discard`, which rechecks its editor/revision binding before
 removing a tab. The controller's generation admission still precedes mutation.
 The window's single-threaded dispatcher supplies explicit choices; there is
-no wire shortcut for minting a permit. A future control adapter must answer
-the live dialog, not call a discard bypass.
+no wire shortcut for minting a permit. Remote Close Tab, Quit and
+Cancel/Discard now use this coordinator with a checked window-local dialog
+ID plus current question tab/revision. A trusted control client may answer
+while unfocused,
+without a synchronized seat/keymap, or with a clipped prompt: its explicit
+live-token answer is the authority, not synthetic physical input. Physical
+confirmation retains its visibility/input requirements. This approved remote
+policy also governs future Save/path answers; CONTROL.md defines the current
+Cancel/Discard subset and its refusal, phase and shutdown semantics.
 
 Window-close discard approvals are deferred: no tab is removed and no dirty
 state is cleared while further decisions remain. Cancel drops the approvals
@@ -2113,8 +2122,10 @@ CONTROL.md defines startup errors, cancellation, completion, eviction and
 transport-lifetime semantics. Remote New uses the ordinary controller event,
 returns the created tab ID, and preserves existing text and file associations.
 It has no revision target or file authority; CONTROL.md pins its non-idempotent
-admission and refusal rules. Remote file operations and dialog answers remain
-unimplemented.
+admission and refusal rules. Remote Close Tab, Quit and close-dialog
+Cancel/Discard are connected, with IDs shared by physical and remote close
+and deferred window-close approvals. File I/O and other dialog answers
+remain unimplemented.
 The complete endpoint below remains the version-1 target; controller
 generations are not presentation evidence.
 

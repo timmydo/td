@@ -344,6 +344,7 @@ struct Window {
     files: Option<crate::session::Session>,
     prompt: Option<PathPrompt>,
     closing: Option<Close>,
+    last_dialog_id: u64,
     closing_save: bool,
     conflict: Option<Conflict>,
     reloading: Option<Target>,
@@ -444,6 +445,7 @@ impl Window {
             files: None,
             prompt: None,
             closing: None,
+            last_dialog_id: 0,
             closing_save: false,
             conflict: None,
             reloading: None,
@@ -840,7 +842,7 @@ impl Window {
         self.stop_pointer();
         self.input.cancel_repeat();
         if self.files.is_some() {
-            self.start_close(Scope::Window);
+            let _ = self.start_close(Scope::Window);
             return;
         }
         self.prompt = None;
@@ -1407,7 +1409,7 @@ impl Window {
             if self.closing_save {
                 self.closing_save = false;
                 if succeeded {
-                    self.advance_close();
+                    let _ = self.advance_close();
                 } else {
                     self.close_failed();
                 }
@@ -1551,12 +1553,73 @@ impl Window {
             }
             .response();
         }
+        if let crate::control::Operation::DialogAnswer {
+            dialog,
+            tab,
+            revision,
+            answer,
+        } = request.operation
+        {
+            return match self.control_dialog_answer(dialog, Target { tab, revision }, answer) {
+                Ok(()) => format!("1\t{}\tok\t", request.id),
+                Err(error) => crate::control::Refusal {
+                    id: request.id,
+                    error,
+                }
+                .response(),
+            };
+        }
         if request.is_mutating() && (self.closed || self.pointer_modal() || self.menu.is_some()) {
             return crate::control::Refusal {
                 id: request.id,
                 error: crate::Error::Unavailable,
             }
             .response();
+        }
+        if matches!(
+            request.operation,
+            crate::control::Operation::CloseTab { .. } | crate::control::Operation::Quit
+        ) {
+            let result = (|| -> crate::Result<String> {
+                if self.files.is_none() || self.files.as_ref().is_some_and(|files| files.busy()) {
+                    return Err(crate::Error::Unavailable);
+                }
+                let scope = match request.operation {
+                    crate::control::Operation::CloseTab { tab, revision } => {
+                        self.ui.editor().revision_point(tab, revision)?;
+                        if self.ui.editor().active() != Some(tab) {
+                            return Err(crate::Error::InvalidArgument);
+                        }
+                        Scope::Tab { tab, revision }
+                    }
+                    crate::control::Operation::Quit => Scope::Window,
+                    _ => return Err(crate::Error::InvalidArgument),
+                };
+                // Native start_close also checks this, after its input cleanup.
+                self.last_dialog_id
+                    .checked_add(1)
+                    .ok_or(crate::Error::Exhausted)?;
+                // Pointer cancellation and clean-tab completion can each dispatch once.
+                self.ui
+                    .generation()
+                    .checked_add(2)
+                    .ok_or(crate::Error::Exhausted)?;
+                self.start_close(scope)?;
+                self.control_mutation_accepted();
+                Ok(if self.closing.is_some() {
+                    format!("dialog\t{}", self.last_dialog_id)
+                } else {
+                    "closed".into()
+                })
+            })();
+            return match result {
+                Ok(body) => format!("1\t{}\tok\t{body}", request.id),
+                Err(error) => crate::control::Refusal {
+                    id: request.id,
+                    error,
+                }
+                .response(),
+            };
         }
         if matches!(request.operation, crate::control::Operation::New) {
             return match self.ui.dispatch(Event::New) {
@@ -1649,6 +1712,75 @@ impl Window {
         }
     }
 
+    fn control_dialog_answer(
+        &mut self,
+        dialog: u64,
+        target: Target,
+        answer: crate::control::DialogAnswer,
+    ) -> crate::Result<()> {
+        if self.closed || self.files.is_none() {
+            return Err(crate::Error::Unavailable);
+        }
+        let close = self.closing.as_ref().ok_or(crate::Error::Unavailable)?;
+        if dialog == 0 || dialog != self.last_dialog_id {
+            return Err(crate::Error::InvalidArgument);
+        }
+        let current = close
+            .next(self.ui.editor())?
+            .ok_or(crate::Error::Unavailable)?;
+        if current.tab != target.tab {
+            return Err(crate::Error::InvalidArgument);
+        }
+        if current.revision != target.revision {
+            return Err(crate::Error::StaleRevision);
+        }
+        match answer {
+            crate::control::DialogAnswer::Cancel => self.cancel_close(),
+            crate::control::DialogAnswer::Discard => {
+                if self.closing_save
+                    || self.prompt.is_some()
+                    || self.files.as_ref().is_some_and(|files| files.busy())
+                {
+                    return Err(crate::Error::Unavailable);
+                }
+                self.ui
+                    .generation()
+                    .checked_add(1)
+                    .ok_or(crate::Error::Exhausted)?;
+                self.discard_close(target)?;
+            }
+        }
+        self.control_mutation_accepted();
+        Ok(())
+    }
+
+    fn control_dialog_fields(&self) -> String {
+        let mut fields = format!("dialog-last={}\tdialog=", self.last_dialog_id);
+        let Some(close) = self.closing.as_ref() else {
+            fields.push('-');
+            return fields;
+        };
+        let scope = match close.scope() {
+            Scope::Tab { .. } => "close-tab",
+            Scope::Window => "close-window",
+        };
+        let (phase, answers) = if self.closing_save {
+            ("saving", "cancel")
+        } else if self.prompt.is_some() {
+            ("path", "cancel")
+        } else {
+            ("question", "cancel+discard")
+        };
+        match close.next(self.ui.editor()) {
+            Ok(Some(target)) => fields.push_str(&format!(
+                "{},{scope},{phase},{},{},{answers}",
+                self.last_dialog_id, target.tab, target.revision
+            )),
+            _ => fields.push_str(&format!("{},{scope},invalid,-,-,-", self.last_dialog_id)),
+        }
+        fields
+    }
+
     fn control_mutation_accepted(&mut self) {
         self.input.cancel_repeat();
         // Controller admission already cancelled its own drag.
@@ -1668,7 +1800,7 @@ impl Window {
             let flag = u8::from;
             response.push_str(&format!(
                 concat!(
-                    "\tadapter=native-jobs\tnative={},{},{},{}",
+                    "\tadapter=native-close\tnative={},{},{},{}",
                     "\tmodal={},{},{},{},{},{},{},{},{}\tspelling={},{}",
                 ),
                 flag(self.configured),
@@ -1691,6 +1823,8 @@ impl Window {
             ));
             response.push('\t');
             response.push_str(&self.control_jobs.fields()?);
+            response.push('\t');
+            response.push_str(&self.control_dialog_fields());
             response.push('\t');
             response.push_str(&self.frames.fields()?);
         }
@@ -2228,7 +2362,7 @@ impl Window {
 
     fn close_tab(&mut self, tab: crate::model::TabId, revision: u64) {
         if self.files.is_some() {
-            self.start_close(Scope::Tab { tab, revision });
+            let _ = self.start_close(Scope::Tab { tab, revision });
             return;
         }
         match self.ui.dispatch(Event::Close { tab, revision }) {
@@ -2244,53 +2378,64 @@ impl Window {
         }
     }
 
-    fn start_close(&mut self, scope: Scope) {
+    fn start_close(&mut self, scope: Scope) -> crate::Result<()> {
         self.menu = None;
         self.stop_pointer();
         self.input.cancel_repeat();
         if self.closing.is_some() {
-            return;
+            return Ok(());
         }
         if self.reloading.is_some() || self.files.as_ref().is_some_and(|files| files.busy()) {
             self.notify(match scope {
                 Scope::Tab { .. } => "File operation pending; wait before closing tabs.",
                 Scope::Window => "File operation pending. Wait for completion, then close again; quitting does not cancel a write.",
             });
-            return;
+            return Err(crate::Error::Unavailable);
         }
-        match Close::new(self.ui.editor(), scope) {
-            Ok(close) => {
+        let prepared = (|| {
+            let id = self
+                .last_dialog_id
+                .checked_add(1)
+                .ok_or(crate::Error::Exhausted)?;
+            Ok((id, Close::new(self.ui.editor(), scope)?))
+        })();
+        match prepared {
+            Ok((id, close)) => {
                 self.prompt = None;
                 self.conflict = None;
                 self.notice = None;
                 self.closing = Some(close);
-                self.advance_close();
+                self.last_dialog_id = id;
+                self.advance_close()
             }
-            Err(detail) => self.notify(format!("Close refused: {detail}")),
+            Err(detail) => {
+                self.notify(format!("Close refused: {detail}"));
+                Err(detail)
+            }
         }
     }
 
-    fn advance_close(&mut self) {
+    fn advance_close(&mut self) -> crate::Result<()> {
         if self.files.as_ref().is_some_and(|files| files.busy()) {
-            return;
+            return Ok(());
         }
         self.frames.invalidate(true);
         let Some(close) = self.closing.as_ref() else {
-            return;
+            return Ok(());
         };
         match close.next(self.ui.editor()) {
-            Ok(Some(_)) => return,
+            Ok(Some(_)) => return Ok(()),
             Err(detail) => {
                 self.closing = None;
                 self.notify(format!(
                     "Close cancelled: documents changed ({detail}); all remaining tabs retained."
                 ));
-                return;
+                return Err(detail);
             }
             Ok(None) => {}
         }
         let Some(close) = self.closing.take() else {
-            return;
+            return Ok(());
         };
         match close.complete(&mut self.ui) {
             Ok(Closed::Window) => self.closed = true,
@@ -2301,8 +2446,31 @@ impl Window {
                 }
                 self.closed = self.ui.editor().active().is_none();
             }
-            Err(detail) => self.notify(format!("Close cancelled: {detail}")),
+            Err(detail) => {
+                self.notify(format!("Close cancelled: {detail}"));
+                return Err(detail);
+            }
         }
+        Ok(())
+    }
+
+    fn cancel_close(&mut self) {
+        self.closing = None;
+        self.closing_save = false;
+        self.prompt = None;
+        self.notify(if self.files.as_ref().is_some_and(|f| f.busy()) {
+            "Close cancelled; the pending Save will still finish."
+        } else {
+            "Close cancelled; tabs retained. Completed saves are not reverted."
+        });
+    }
+
+    fn discard_close(&mut self, target: Target) -> crate::Result<()> {
+        self.closing
+            .as_mut()
+            .ok_or(crate::Error::Unavailable)?
+            .discard(self.ui.editor(), target)?;
+        self.advance_close()
     }
 
     fn close_chord(&mut self, chord: &str, repeated: bool) {
@@ -2310,13 +2478,7 @@ impl Window {
             return;
         }
         if matches!(chord, "Escape" | "C-g") {
-            self.closing = None;
-            self.closing_save = false;
-            self.notify(if self.files.as_ref().is_some_and(|f| f.busy()) {
-                "Close cancelled; the pending Save will still finish."
-            } else {
-                "Close cancelled; tabs retained. Completed saves are not reverted."
-            });
+            self.cancel_close();
             return;
         }
         if self.closing_save || !self.close_answer_visible() {
@@ -2328,17 +2490,18 @@ impl Window {
         let target = match close.next(self.ui.editor()) {
             Ok(Some(target)) => target,
             _ => {
-                self.advance_close();
+                let _ = self.advance_close();
                 return;
             }
         };
         match chord {
             "C-d" => {
-                if let Err(detail) = close.discard(self.ui.editor(), target) {
-                    self.closing = None;
-                    self.notify(format!("Discard refused: {detail}"));
-                } else {
-                    self.advance_close();
+                if let Err(detail) = self.discard_close(target) {
+                    // Completion already consumes the coordinator and reports
+                    // its own error. Only an approval failure needs cleanup.
+                    if self.closing.take().is_some() {
+                        self.notify(format!("Discard refused: {detail}"));
+                    }
                 }
             }
             "C-s" => {
@@ -5249,7 +5412,7 @@ mod tests {
         assert_eq!(
             response,
             format!(
-                "{before}\tadapter=native-jobs\tnative=0,1,0,0\tmodal=0,0,0,0,0,0,0,0,0\tspelling=-,0\tjob-last=0\twindow-generation={generation}\tframe-submitted=-\tframe-completed=-"
+                "{before}\tadapter=native-close\tnative=0,1,0,0\tmodal=0,0,0,0,0,0,0,0,0\tspelling=-,0\tjob-last=0\tdialog-last=0\tdialog=-\twindow-generation={generation}\tframe-submitted=-\tframe-completed=-"
             )
         );
         assert_eq!(query.response(&w.ui), before);
@@ -5344,6 +5507,351 @@ mod tests {
     ) -> String {
         let mut client = control_client(path, payload.as_bytes());
         control_answer_pump(w, &mut client, peer, false) // Explicitly withhold background steps.
+    }
+
+    #[test]
+    fn remote_close_dialog_ids_and_revisions_guard_unfocused_discard() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = DialogDirectory::new();
+        std::fs::set_permissions(&directory.0, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let path = directory.path("control");
+        let (mut w, peer) = file_dialog_fixture();
+        w.chord("a", false).unwrap();
+        w.ui.dispatch(Event::New).unwrap();
+        w.chord("b", false).unwrap();
+        w.control = Some(
+            crate::control_worker::Worker::start(
+                crate::control_socket::Socket::bind(&path).unwrap(),
+            )
+            .unwrap(),
+        );
+        let documents = format!("{:?}", w.ui.editor());
+        assert_eq!(
+            job_request(&mut w, &peer, &path, "1\t1\tclose-tab\t2\t1"),
+            "1\t1\tok\tdialog\t1"
+        );
+        let state = job_request(&mut w, &peer, &path, "1\t0\tstate");
+        assert!(state.contains("\tdialog=1,close-tab,question,2,1,cancel+discard\t"));
+        assert_eq!(format!("{:?}", w.ui.editor()), documents);
+        assert_eq!(
+            job_request(&mut w, &peer, &path, "1\t2\tdialog-answer\t1\t2\t1\tcancel"),
+            "1\t2\tok\t"
+        );
+        assert_eq!(format!("{:?}", w.ui.editor()), documents);
+        assert_eq!(
+            job_request(&mut w, &peer, &path, "1\t3\tclose-tab\t2\t1"),
+            "1\t3\tok\tdialog\t2"
+        );
+        configure(&mut w, 100, 80);
+        let device = w.device.unwrap();
+        w.event(message(device, 2, &[99, SURFACE])).unwrap();
+        assert!(!w.input.focused);
+        assert!(!w.close_answer_visible());
+        w.close_chord("C-d", false); // Physical confirmation is still refused.
+        assert_eq!(w.ui.editor().tabs().count(), 2);
+        let before = job_request(&mut w, &peer, &path, "1\t0\tstate");
+        let notice = w.notice.clone();
+        for (args, code) in [
+            ("1\t2\t1\tdiscard", "invalid-argument"),
+            ("0\t2\t1\tdiscard", "invalid-argument"),
+            ("2\t1\t1\tdiscard", "invalid-argument"),
+            ("2\t2\t0\tdiscard", "stale-revision"),
+        ] {
+            assert!(job_request(
+                &mut w,
+                &peer,
+                &path,
+                &format!("1\t4\tdialog-answer\t{args}")
+            )
+            .contains(&format!("\terror\t{code}\t")));
+            assert_eq!(job_request(&mut w, &peer, &path, "1\t0\tstate"), before);
+            assert_eq!(w.notice, notice);
+        }
+        assert_eq!(
+            job_request(
+                &mut w,
+                &peer,
+                &path,
+                "1\t5\tdialog-answer\t2\t2\t1\tdiscard"
+            ),
+            "1\t5\tok\t"
+        );
+        assert_eq!(w.ui.editor().active(), Some(1));
+        assert_eq!(w.ui.editor().document(1).unwrap().text(), "a");
+        assert!(w.ui.editor().document(1).unwrap().dirty());
+        assert!(job_request(
+            &mut w,
+            &peer,
+            &path,
+            "1\t6\tdialog-answer\t2\t2\t1\tdiscard"
+        )
+        .contains("\terror\tunavailable\t"));
+        w.stop_control();
+    }
+
+    #[test]
+    fn remote_window_close_answers_preserve_deferred_approvals_and_native_paths() {
+        let (mut w, _peer) = file_dialog_fixture();
+        configure(&mut w, 800, 600);
+        w.chord("a", false).unwrap();
+        w.ui.dispatch(Event::New).unwrap();
+        w.chord("b", false).unwrap();
+        let before = format!("{:?}", w.ui.editor());
+        let quit = crate::control::Request::parse(b"1\t0\tquit").unwrap();
+        assert_eq!(w.control_response(&quit), "1\t0\tok\tdialog\t1");
+        w.close(); // Repeated window-manager close keeps the same coordinator and ID.
+        assert_eq!(w.last_dialog_id, 1);
+        let request = |args: &str| {
+            crate::control::Request::parse(format!("1\t1\tdialog-answer\t{args}").as_bytes())
+                .unwrap()
+        };
+        assert!(w
+            .control_dialog_fields()
+            .contains("dialog=1,close-window,question,2,1,cancel+discard"));
+        assert_eq!(
+            w.control_response(&request("1\t2\t1\tdiscard")),
+            "1\t1\tok\t"
+        );
+        assert_eq!(format!("{:?}", w.ui.editor()), before);
+        assert!(w
+            .control_dialog_fields()
+            .contains("dialog=1,close-window,question,1,1,cancel+discard"));
+        assert!(w
+            .control_response(&request("1\t2\t1\tdiscard"))
+            .contains("\terror\tinvalid-argument\t"));
+        assert_eq!(
+            w.control_response(&request("1\t1\t1\tcancel")),
+            "1\t1\tok\t"
+        );
+        assert_eq!(format!("{:?}", w.ui.editor()), before);
+        assert!(!w.closed);
+        w.close();
+        assert_eq!(w.last_dialog_id, 2);
+        w.close_chord("C-d", false); // Physical approval advances the remotely visible target.
+        assert!(w
+            .control_dialog_fields()
+            .contains("dialog=2,close-window,question,1,1,cancel+discard"));
+        assert_eq!(
+            w.control_response(&request("2\t1\t1\tdiscard")),
+            "1\t1\tok\t"
+        );
+        assert!(w.closed);
+    }
+
+    #[test]
+    fn remote_close_clean_targets_stale_requests_and_exhaustion_are_bounded() {
+        let (mut w, _peer) = file_dialog_fixture();
+        w.ui.dispatch(Event::New).unwrap();
+        let request = |args: &str| {
+            crate::control::Request::parse(format!("1\t1\tclose-tab\t{args}").as_bytes()).unwrap()
+        };
+        let state = crate::control::Request::parse(b"1\t0\tstate").unwrap();
+        let before = w.control_response(&state);
+        let notice = w.notice.clone();
+        for (args, code) in [
+            ("99\t0", "missing-tab"),
+            ("1\t0", "invalid-argument"),
+            ("2\t1", "stale-revision"),
+        ] {
+            assert!(w
+                .control_response(&request(args))
+                .contains(&format!("\terror\t{code}\t")));
+            assert_eq!(w.control_response(&state), before);
+            assert_eq!(w.notice, notice);
+        }
+        assert_eq!(w.control_response(&request("2\t0")), "1\t1\tok\tclosed");
+        assert_eq!(w.ui.editor().active(), Some(1));
+        assert!(w.closing.is_none());
+        w.last_dialog_id = u64::MAX;
+        let before = w.control_response(&state);
+        let notice = w.notice.clone();
+        assert!(w
+            .control_response(&request("1\t0"))
+            .contains("\terror\texhausted\t"));
+        assert_eq!(w.control_response(&state), before);
+        assert_eq!(w.notice, notice);
+        let (mut last, _peer) = file_dialog_fixture();
+        assert_eq!(last.control_response(&request("1\t0")), "1\t1\tok\tclosed");
+        assert!(last.closed);
+    }
+
+    #[test]
+    fn remote_dialog_answer_refuses_closed_scratch_and_unrelated_native_modals() {
+        let answer =
+            crate::control::Request::parse(b"1\t1\tdialog-answer\t1\t1\t1\tdiscard").unwrap();
+        let state = crate::control::Request::parse(b"1\t0\tstate").unwrap();
+        let (mut w, _peer) = file_dialog_fixture();
+        w.chord("a", false).unwrap();
+        w.close_tab(1, 1);
+        // A closed-adapter fixture retains the live token to isolate this guard.
+        w.closed = true;
+        let before = w.control_response(&state);
+        let notice = w.notice.clone();
+        assert!(w
+            .control_response(&answer)
+            .contains("\terror\tunavailable\t"));
+        assert_eq!(w.control_response(&state), before);
+        assert_eq!(w.notice, notice);
+
+        let (mut scratch, peer, device) = seat_fixture();
+        send_map(&mut scratch, &peer, device, &map_file());
+        focus(&mut scratch, device);
+        key(&mut scratch, device, 30);
+        for quitting in [false, true] {
+            if quitting {
+                scratch.close();
+            }
+            let before = scratch.control_response(&state);
+            let notice = scratch.notice.clone();
+            assert!(scratch
+                .control_response(&answer)
+                .contains("\terror\tunavailable\t"));
+            assert_eq!(scratch.control_response(&state), before);
+            assert_eq!(scratch.notice, notice);
+        }
+        for chord in ["C-o", "C-f", "C-h", "F6", "F10"] {
+            let (mut w, _peer) = file_dialog_fixture();
+            configure(&mut w, 800, 600);
+            w.chord(chord, false).unwrap();
+            let before = w.control_response(&state);
+            let notice = w.notice.clone();
+            assert!(w
+                .control_response(&answer)
+                .contains("\terror\tunavailable\t"));
+            assert_eq!(w.control_response(&state), before);
+            assert_eq!(w.notice, notice);
+        }
+    }
+
+    #[test]
+    fn physical_discard_retains_close_completion_failure_diagnostic() {
+        let (mut w, _peer) = file_dialog_fixture();
+        configure(&mut w, 800, 600);
+        w.chord("a", false).unwrap();
+        w.close_tab(1, 1);
+        assert!(w.close_answer_visible());
+        w.ui.generation_for_test(u64::MAX);
+        w.close_chord("C-d", false);
+        assert!(w.closing.is_none());
+        assert!(!w.closed);
+        assert_eq!(w.notice.as_deref(), Some("Close cancelled: exhausted"));
+        assert_eq!(w.ui.editor().document(1).unwrap().text(), "a");
+        assert!(w.ui.editor().document(1).unwrap().dirty());
+    }
+
+    #[test]
+    fn remote_cancel_drops_close_path_and_never_cancels_an_accepted_save() {
+        let request = |action: &str| {
+            crate::control::Request::parse(
+                format!("1\t1\tdialog-answer\t1\t2\t1\t{action}").as_bytes(),
+            )
+            .unwrap()
+        };
+        let (mut path_window, _peer) = file_dialog_fixture();
+        configure(&mut path_window, 800, 600);
+        path_window.ui.dispatch(Event::New).unwrap();
+        path_window.chord("a", false).unwrap();
+        path_window.close_tab(2, 1);
+        path_window.close_chord("C-s", false);
+        assert!(path_window
+            .control_dialog_fields()
+            .contains("dialog=1,close-tab,path,2,1,cancel"));
+        let before = path_window.control_dialog_fields();
+        assert!(path_window
+            .control_response(&request("discard"))
+            .contains("\terror\tunavailable\t"));
+        assert_eq!(path_window.control_dialog_fields(), before);
+        assert_eq!(
+            path_window.control_response(&request("cancel")),
+            "1\t1\tok\t"
+        );
+        assert!(path_window.prompt.is_none() && path_window.closing.is_none());
+        assert_eq!(path_window.ui.editor().document(2).unwrap().text(), "a");
+
+        let directory = DialogDirectory::new();
+        let path = directory.path("document");
+        std::fs::write(&path, b"disk").unwrap();
+        let (mut w, _peer) = file_dialog_fixture();
+        configure(&mut w, 800, 600);
+        w.files.as_mut().unwrap().open(path.clone()).unwrap();
+        finish_file(&mut w);
+        w.chord("a", false).unwrap();
+        w.close_tab(2, 1);
+        w.close_chord("C-s", false);
+        assert!(w.files.as_ref().unwrap().busy());
+        assert!(w
+            .control_dialog_fields()
+            .contains("dialog=1,close-tab,saving,2,1,cancel"));
+        let state = crate::control::Request::parse(b"1\t0\tstate").unwrap();
+        let before = w.control_response(&state);
+        assert!(w
+            .control_response(&request("discard"))
+            .contains("\terror\tunavailable\t"));
+        assert_eq!(w.control_response(&state), before);
+        assert_eq!(w.control_response(&request("cancel")), "1\t1\tok\t");
+        assert!(w.closing.is_none() && !w.closing_save);
+        assert!(w.files.as_ref().unwrap().busy());
+        w.chord("b", false).unwrap();
+        finish_file(&mut w);
+        assert_eq!(std::fs::read(&path).unwrap(), b"adisk");
+        assert_eq!(w.ui.editor().document(2).unwrap().text(), "abdisk");
+        assert!(w.ui.editor().document(2).unwrap().dirty());
+        assert!(!w.closed);
+    }
+
+    #[test]
+    fn remote_close_counter_and_edit_undo_races_never_grant_discard() {
+        let (mut w, _peer) = file_dialog_fixture();
+        w.chord("a", false).unwrap();
+        let close = crate::control::Request::parse(b"1\t1\tclose-tab\t1\t1").unwrap();
+        let state = crate::control::Request::parse(b"1\t0\tstate").unwrap();
+        w.ui.generation_for_test(u64::MAX - 1);
+        let before = w.control_response(&state);
+        assert!(w.control_response(&close).contains("\terror\texhausted\t"));
+        assert_eq!(w.control_response(&state), before);
+        assert!(w.closing.is_none());
+        let (mut w, _peer) = file_dialog_fixture();
+        w.chord("a", false).unwrap();
+        assert_eq!(w.control_response(&close), "1\t1\tok\tdialog\t1");
+        let discard =
+            crate::control::Request::parse(b"1\t2\tdialog-answer\t1\t1\t1\tdiscard").unwrap();
+        w.ui.generation_for_test(u64::MAX);
+        let before = w.control_response(&state);
+        assert!(w
+            .control_response(&discard)
+            .contains("\terror\texhausted\t"));
+        assert_eq!(w.control_response(&state), before);
+        assert!(w
+            .closing
+            .as_ref()
+            .unwrap()
+            .next(w.ui.editor())
+            .unwrap()
+            .is_some());
+        let (mut w, _peer) = file_dialog_fixture();
+        w.chord("a", false).unwrap();
+        assert_eq!(w.control_response(&close), "1\t1\tok\tdialog\t1");
+        // Inject a validated model transition to exercise the coordinator's late guard.
+        w.ui.dispatch(Event::Edit {
+            tab: 1,
+            revision: 1,
+            command: crate::model::Command::Insert("b".into()),
+        })
+        .unwrap();
+        w.ui.dispatch(Event::Edit {
+            tab: 1,
+            revision: 2,
+            command: crate::model::Command::Undo,
+        })
+        .unwrap();
+        assert_eq!(w.ui.editor().document(1).unwrap().text(), "a");
+        let before = w.control_response(&state);
+        assert!(before.contains("dialog=1,close-tab,invalid,-,-,-"));
+        assert!(w
+            .control_response(&discard)
+            .contains("\terror\tstale-revision\t"));
+        assert_eq!(w.control_response(&state), before);
+        assert!(!w.closed);
     }
 
     #[test]
@@ -5851,6 +6359,8 @@ mod tests {
             let notice = w.notice.clone();
             for command in [
                 "new",
+                "close-tab\t1\t1",
+                "quit",
                 "select-tab\t1\t1",
                 "select-range\t1\t1\t0\t0",
                 "insert\t1\t1\t1\t1\t62",
@@ -6603,7 +7113,7 @@ mod tests {
             assert!(drain(&peer).0.contains(&message(WM, 3, &[100 + id as u32])));
             let response = control_answer(&mut w, client, &peer);
             assert!(response.starts_with(&format!("1\t{id}\tok\t")));
-            assert!(response.contains("\tadapter=native-jobs\t"));
+            assert!(response.contains("\tadapter=native-close\t"));
         }
         assert_eq!(w.ui.editor().tabs().count(), 1);
         assert_eq!(w.ui.editor().document(1).unwrap().text(), "");
