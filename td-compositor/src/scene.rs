@@ -862,6 +862,8 @@ pub struct Scene {
     help: Help,
     attention: bool,
     attention_draining: bool,
+    attention_request: Option<crate::attention::Prepared>,
+    attention_request_attempted: bool,
     status: String,
 }
 
@@ -898,6 +900,8 @@ impl Scene {
             help: Help::default(),
             attention: false,
             attention_draining: false,
+            attention_request: None,
+            attention_request_attempted: false,
             status: String::new(),
         }
     }
@@ -3155,6 +3159,7 @@ impl Scene {
     }
 
     pub(crate) fn set_attention(&mut self, visible: bool) {
+        self.attention_request = None;
         self.attention = visible;
         self.attention_draining = false;
         if visible {
@@ -3163,8 +3168,40 @@ impl Scene {
         }
     }
 
+    pub(crate) fn finish_attention_close(&mut self) {
+        self.attention_request_attempted = false;
+    }
+
     pub(crate) fn drain_attention(&mut self) {
+        self.attention_request = None;
         self.attention_draining = true;
+    }
+
+    pub(crate) fn prepare_attention_request(
+        &mut self,
+        request: crate::authority::consent::Request,
+        width: usize,
+        height: usize,
+        stride: usize,
+    ) -> Result<(), String> {
+        if !self.attention || self.attention_draining || self.attention_request_attempted {
+            return Err("trusted prompt requires a fresh active attention screen".into());
+        }
+        self.attention_request_attempted = true;
+        self.attention_request = Some(crate::attention::Prepared::new(
+            request, width, height, stride,
+        )?);
+        Ok(())
+    }
+
+    pub(crate) fn discard_attention_request(&mut self) {
+        self.attention_request = None;
+    }
+
+    pub(crate) fn attention_request(&self) -> Option<&crate::authority::consent::Request> {
+        self.attention_request
+            .as_ref()
+            .map(crate::attention::Prepared::request)
     }
 
     pub(crate) fn render_display(
@@ -3173,12 +3210,20 @@ impl Scene {
         width: usize,
         height: usize,
         stride: usize,
-    ) {
+    ) -> Result<(), String> {
         if self.attention {
+            if let Some(request) = &self.attention_request {
+                return if request.paint(frame, width, height, stride) {
+                    Ok(())
+                } else {
+                    Err("trusted prompt raster does not match output target".into())
+                };
+            }
             crate::attention::paint(frame, width, height, stride, self.attention_draining);
         } else {
             self.render(frame, width, height, stride);
         }
+        Ok(())
     }
 
     pub fn render(&self, frame: &mut [u8], width: usize, height: usize, stride: usize) {
@@ -9681,7 +9726,9 @@ mod tests {
         scene.render(&mut capture, 320, 200, 320 * 4);
         assert_eq!(capture, ordinary);
         let mut display = vec![0xff; ordinary.len()];
-        scene.render_display(&mut display, 320, 200, 320 * 4);
+        scene
+            .render_display(&mut display, 320, 200, 320 * 4)
+            .unwrap();
         assert_ne!(display, ordinary);
         assert_eq!(&display[..4], &[0x28, 0x20, 0x18, 0]);
         assert_eq!(&display[display.len() - 4..], &[0x28, 0x20, 0x18, 0]);

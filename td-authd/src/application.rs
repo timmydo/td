@@ -39,12 +39,6 @@ fn decimal(text: &str, range: std::ops::RangeInclusive<u32>) -> Result<u32, Stri
     Ok(value)
 }
 
-fn application_name(name: &str) -> bool {
-    name.len() <= 64
-        && name.as_bytes().first().is_some_and(u8::is_ascii_lowercase)
-        && name.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"._-".contains(&b))
-}
-
 impl Request {
     fn parse(arguments: &[String]) -> Result<Self, String> {
         let [owner, name, mode, separator, rest @ ..] = arguments else {
@@ -52,7 +46,7 @@ impl Request {
         };
         let owner = decimal(owner, 1000..=1000)?;
         if separator != "--"
-            || !application_name(name)
+            || !crate::consent::application_name(name)
             || rest.len() > 128
             || rest.iter().any(|arg| arg.contains('\0'))
             || rest
@@ -222,7 +216,7 @@ fn read_reply(mut parent: UnixStream, deadline: Instant) -> Result<Vec<u8>, Stri
 }
 
 pub(crate) fn admitted_uid(name: &str) -> Result<u32, String> {
-    if !application_name(name) { return Err("invalid application name".into()); }
+    if !crate::consent::application_name(name) { return Err("invalid application name".into()); }
     admit(1000, name)
 }
 

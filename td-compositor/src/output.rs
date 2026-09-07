@@ -420,7 +420,7 @@ pub trait OutputBackend {
     /// promise.
     fn paint(&mut self, scene: &Scene, damage: Damage) -> Result<Submission, String> {
         let target = self.begin_frame(damage)?;
-        scene.render_display(target.pixels, target.width, target.height, target.stride);
+        scene.render_display(target.pixels, target.width, target.height, target.stride)?;
         self.present()
     }
 }
@@ -428,6 +428,87 @@ pub trait OutputBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_mismatched_trusted_raster_never_reaches_present() {
+        use crate::authority::consent::{Operation, Request, Role};
+        struct Backend {
+            frame: Vec<u8>,
+            width: usize,
+            presents: usize,
+        }
+        impl OutputBackend for Backend {
+            fn output(&self) -> Output {
+                Output {
+                    id: OutputId::FIRST,
+                    dimensions: OutputDimensions {
+                        width: 800,
+                        height: 600,
+                    },
+                    scale: OutputScale::ONE,
+                    transform: OutputTransform::Normal,
+                }
+            }
+            fn supported_formats(&self) -> &[Fourcc] {
+                &[DRM_FORMAT_XRGB8888]
+            }
+            fn begin_frame(&mut self, _: Damage) -> Result<FrameTarget<'_>, String> {
+                Ok(FrameTarget {
+                    pixels: &mut self.frame,
+                    width: self.width,
+                    height: 600,
+                    stride: 3200,
+                })
+            }
+            fn present(&mut self) -> Result<Submission, String> {
+                self.presents += 1;
+                Ok(Submission::Presented)
+            }
+            fn poll_events(&mut self, _: &mut Vec<OutputEvent>) -> Result<(), String> {
+                Ok(())
+            }
+        }
+        let request = Request::new(
+            [1; 32],
+            1000,
+            Operation::Unlock {
+                role: Role::Primary,
+            },
+        )
+        .unwrap();
+        let mut scene = Scene::new();
+        scene.set_attention(true);
+        scene
+            .prepare_attention_request(request.clone(), 800, 600, 3200)
+            .unwrap();
+        for (width, length) in [
+            (799, 3200 * 600),
+            (800, 3200 * 600 + 4096),
+            (800, 3200 * 600 - 1),
+        ] {
+            let mut backend = Backend {
+                frame: vec![0; length],
+                width,
+                presents: 0,
+            };
+            assert!(backend.paint(&scene, Damage::Whole).is_err());
+            assert_eq!(backend.presents, 0);
+        }
+        let mut backend = Backend {
+            frame: vec![0; 3200 * 600],
+            width: 800,
+            presents: 0,
+        };
+        assert_eq!(
+            backend.paint(&scene, Damage::Whole).unwrap(),
+            Submission::Presented
+        );
+        let prepared = crate::attention::Prepared::new(request, 800, 600, 3200).unwrap();
+        let mut expected = vec![0; backend.frame.len()];
+        assert!(prepared.paint(&mut expected, 800, 600, 3200));
+        assert_eq!(backend.frame, expected);
+        assert_eq!(backend.presents, 1);
+    }
 
     /// Zero is what an uninitialised `user_data` reads as, so the first id a
     /// backend mints must not be zero — a completion carrying zero has to be

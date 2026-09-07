@@ -6353,6 +6353,52 @@ Direct-profile readers retain their per-device partial-report fast path;
 they never claim secure attention or use the trusted timestamp cutoff.
 
 
+### Immutable prompt presentation prerequisite
+
+The shared `td-authd/src/consent.rs` value describes one session and one
+operation: enrollment with an encoded platform profile, explicit recovery policy and proof step,
+session unlock with a token role, or one credential write with the exact
+application name, credential name, external application UID and requester
+UID. Its private fields preserve construction checks. Decoding validates
+bounded canonical framing and identities; it does not authenticate a sender,
+prove nonce freshness or admit an operation. The authority must supply fresh
+entropy and independently admitted identities over its private channel.
+
+The private renderer rasterizes every human-relevant operation argument once with the
+pinned case-sensitive font and retains the exact immutable request beside
+those pixels. The nonce is retained but not displayed. Every glyph must exist. It wraps bounded ASCII text with indented continuation rows without
+case folding, and refuses an output too small to contain every row; clipped
+arguments never produce a receipt. The raster is bounded to 64 MiB and one
+exact output geometry. A mismatched render target fails before backend submission. Public scene rendering excludes these pixels.
+
+`present_attention_request` requires the physical-input origin witness,
+active paired attention outside cancellation drain, no compound commit and
+no prior request on that attention screen. It installs the prepared frame,
+owes the entire output and repaints synchronously. Only an immediate
+`Submission::Presented` with no pending paint returns a `PresentedRequest`
+containing the exact description. A failed or queued paint returns no
+receipt, discards the prepared prompt and retains capture. A later flush
+paints the inert attention screen. Replacement and repeated receipt requests
+refuse even after failure or repeated entry; only a successfully completed
+close followed by reopening creates a fresh presentation opportunity.
+Failed-close recovery preserves the consumed slot. Draining or closing discards the retained prompt.
+
+The current fbdev backend presents immediately. A future queued backend can
+scan out an already submitted invitation after receipt refusal and before
+the inert repaint; discarding the request does not revoke queued pixels.
+Before activating this API there, the backend must provide completion and
+cancellation or superseding-frame guarantees. It must also release any
+frame state when rendering refuses before submission; dropping the current
+fbdev shadow-buffer borrow already does so.
+
+This receipt records a completed paint, not live authorization. The later
+channel consumer must bind it to its outstanding nonce, serialize the whole
+operation, invalidate it on cancellation/channel loss and start token I/O
+only after accepting that exact receipt. A receipt already handed out does
+not revoke itself when attention closes. No production caller uses this API
+or the request codec yet; the stock attention screen remains inert and no
+token release or write is enabled by this prerequisite.
+
 ## td-owned development VM bridge
 
 [td-vm's host/guest bridge](../td-review/VM.md#the-hostguest-bridge) owns the

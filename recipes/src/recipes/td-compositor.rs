@@ -158,6 +158,10 @@ pub fn recipe() -> Recipe {
     }
     for (name, source) in [
         (
+            "auth/consent.rs",
+            include_str!("../../../td-authd/src/consent.rs"),
+        ),
+        (
             "auth/channel.rs",
             include_str!("../../../td-authd/src/channel.rs"),
         ),
@@ -358,11 +362,15 @@ mod tests {
             .iter()
             .find_map(|(name, source)| (*name == "authority").then_some(*source))
             .unwrap();
-        for path in ["auth/channel.rs", "auth/sys.rs"] {
+        for path in ["auth/channel.rs", "auth/sys.rs", "auth/consent.rs"] {
             assert!(authority.contains(&format!("path = {path:?}")));
         }
         let recipe = recipe();
         for (path, expected) in [
+            (
+                "{src}/auth/consent.rs",
+                include_str!("../../../td-authd/src/consent.rs"),
+            ),
             (
                 "{src}/auth/channel.rs",
                 include_str!("../../../td-authd/src/channel.rs"),

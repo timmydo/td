@@ -5,6 +5,13 @@
 #[cfg_attr(not(feature = "target-recipe"), path = "../../td-authd/src/channel.rs")]
 #[cfg_attr(feature = "target-recipe", path = "auth/channel.rs")]
 mod channel;
+#[cfg_attr(not(feature = "target-recipe"), path = "../../td-authd/src/consent.rs")]
+#[cfg_attr(feature = "target-recipe", path = "auth/consent.rs")]
+#[allow(
+    dead_code,
+    reason = "immutable trusted-prompt contract; authority consumer follows"
+)]
+pub(crate) mod consent;
 #[cfg_attr(not(feature = "target-recipe"), path = "../../td-authd/src/sys.rs")]
 #[cfg_attr(feature = "target-recipe", path = "auth/sys.rs")]
 mod sys;

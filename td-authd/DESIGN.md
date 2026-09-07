@@ -722,3 +722,44 @@ including its root, through the otherwise reserved home boundary. The
 maintenance backing-volume ancestor remains read-only and grants no
 sibling state. Nested mounts pointing outside the declared human source
 and protected mounts at or below it are refused.
+
+## Immutable consent description prerequisite
+
+`consent.rs` supplies a bounded, immutable public description for the trusted
+renderer. The canonical wire value is `TDCONS01`, a nonzero 32-byte operation
+nonce, a big-endian u32 human UID, and a one-byte operation. Enrollment (1)
+adds platform profile 1 (TPM PCR 7), the recovery policy (1 second token,
+0 explicitly unrecoverable, matching TDENROL1) and
+step (1 create primary, 2 prove primary, 3 create recovery, 4 prove recovery).
+An unrecoverable request refuses either recovery-token step. Unlock (2) adds
+role 1 primary or 2 recovery. Credential write (3) adds big-endian u32
+application and requester UIDs, then a one-byte length and ASCII bytes for
+each application and credential name. The whole value is at most 256 bytes;
+unknown tags, truncation and trailing bytes refuse.
+
+The human UID is 1000 through 65533; the external application UID is 65536
+through 2147483647. A write's requester must equal its human owner. Names are
+at most 64 ASCII bytes: application names share the launcher predicate,
+credential names admit alphanumerics, hyphen and underscore and retain case.
+The value contains no credential bytes, file path, executable or arbitrary
+instruction text. Rendering shows every human-relevant operation argument, token role or
+recovery choice; the nonce is retained but not shown. Enrollment binds the
+fixed TPM PCR 7 profile in its canonical encoding and refuses other tags.
+This means exactly SHA-256 PCR selection `7` (mask bit 7 alone); the
+store's other supported PCR selections are deliberately unencodable in
+this prompt profile. A future authority must refuse those selections, never
+map a different mask onto this label. Spaces and dots are excluded from
+credential names: indented continuation text cannot imitate the fixed
+labels or token instructions. Both consumers pin the codec source and its
+tests assert the complete public argument display.
+
+These are structural checks, not caller admission or proof of randomness.
+No channel opcode, root operation, public listener or token access consumes
+this codec yet. The future authority must pin the requester and credential
+input, admit the application from deployment policy, own an immutable
+operation under its fresh nonce, and bind its token challenge to the complete
+canonical description. The compositor's presentation receipt is necessary
+but insufficient: cancellation, peer loss, deadline or request replacement
+must invalidate authority before committing any write or release. The
+renderer and its current unconsumed receipt API are specified in
+`td-compositor/DESIGN.md`.

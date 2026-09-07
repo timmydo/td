@@ -1207,7 +1207,7 @@ mod confinement {
     const SHARED_SHA256: &str = include_str!("../../engine/src/sha256.rs");
     const SYS: &str = include_str!("sys.rs");
     const DRM: &str = include_str!("drm.rs");
-    const AUTHORITY_FINGERPRINT: u64 = 0xe936a8fbfb61b341;
+    const AUTHORITY_FINGERPRINT: u64 = 0x72a18a246867a53d;
     const AUTH_SYS_FINGERPRINT: u64 = 0x42363c39df98214d;
     const AUTH_CHANNEL_FINGERPRINT: u64 = 0xbad9a1ce43bb1449;
     const AUTHORITY: &str = include_str!("authority.rs");
@@ -1318,6 +1318,11 @@ mod confinement {
                 (hash ^ byte as u64).wrapping_mul(0x100000001b3)
             })
         };
+        assert_eq!(
+            fingerprint(include_str!("../../td-authd/src/consent.rs")),
+            0xf1d3b878619f19f4,
+            "shared consent changed: reconcile td-authd/tests/confinement.rs and this pin"
+        );
         assert_eq!(fingerprint(AUTHORITY), AUTHORITY_FINGERPRINT);
         assert_eq!(
             fingerprint(AUTH_CHANNEL),
@@ -1332,7 +1337,8 @@ mod confinement {
         assert!(AUTHORITY.starts_with("#![deny(unsafe_code)]"));
         assert_eq!(AUTHORITY.matches("mod channel;").count(), 1);
         assert_eq!(AUTHORITY.matches("mod sys;").count(), 1);
-        assert_eq!(AUTHORITY.matches("path =").count(), 4);
+        assert_eq!(AUTHORITY.matches("path =").count(), 6);
+        assert_eq!(AUTHORITY.matches("mod consent;").count(), 1);
         assert_eq!(AUTH_SYS.matches("unsafe").count(), 4);
         assert_eq!(AUTH_SYS.matches("#[allow(unsafe_code)]").count(), 2);
         assert_eq!(AUTH_SYS.matches("const SYS_").count(), 4);

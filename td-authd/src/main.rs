@@ -3,6 +3,11 @@
 mod application;
 mod application_files;
 mod channel;
+#[allow(
+    dead_code,
+    reason = "immutable trusted-prompt contract; authority consumer follows"
+)]
+mod consent;
 mod launch;
 mod mount_sys;
 mod portal_files;

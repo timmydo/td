@@ -367,6 +367,19 @@ impl KeyboardSubscription {
 /// to interpret, and a band has no client to hand them to.
 const POINTER_BUTTON_LEFT: u32 = 272;
 
+/// Evidence of one completed paint, not permission to perform an operation.
+#[allow(dead_code, reason = "trusted authority request consumer follows")]
+pub(crate) struct PresentedRequest {
+    request: crate::authority::consent::Request,
+}
+
+#[allow(dead_code, reason = "trusted authority request consumer follows")]
+impl PresentedRequest {
+    pub fn into_request(self) -> crate::authority::consent::Request {
+        self.request
+    }
+}
+
 pub struct Runtime {
     scene: Scene,
     attention_enabled: bool,
@@ -1699,6 +1712,45 @@ impl Runtime {
         self.attention_enabled
     }
 
+    /// Only the physical-input owner may present an authenticated root request.
+    #[allow(dead_code, reason = "trusted authority request consumer follows")]
+    pub(crate) fn present_attention_request(
+        &mut self,
+        _origin: &crate::input::EvdevOrigin,
+        request: crate::authority::consent::Request,
+    ) -> Result<PresentedRequest, String> {
+        if !self.attention_enabled || self.compound_settle.is_some() {
+            return Err("trusted prompt cannot be presented in this runtime state".into());
+        }
+        let size = self.framebuffer.dimensions();
+        self.scene.prepare_attention_request(
+            request,
+            size.width,
+            size.height,
+            self.framebuffer.stride(),
+        )?;
+        self.owed_damage = Damage::Whole;
+        let painted = self.repaint().and_then(|()| {
+            if self.pending_paint || self.last_submission != Some(Submission::Presented) {
+                Err("trusted prompt has not been presented".into())
+            } else {
+                Ok(())
+            }
+        });
+        if let Err(error) = painted {
+            self.scene.discard_attention_request();
+            self.owed_damage = Damage::Whole;
+            self.defer_repaint();
+            return Err(error);
+        }
+        let request = self
+            .scene
+            .attention_request()
+            .ok_or("trusted prompt was cancelled")?
+            .clone();
+        Ok(PresentedRequest { request })
+    }
+
     pub(crate) fn drain_attention(
         &mut self,
         _origin: &crate::input::EvdevOrigin,
@@ -1738,7 +1790,12 @@ impl Runtime {
             }
         })();
         match result {
-            Ok(cutoff) => Ok(cutoff),
+            Ok(cutoff) => {
+                if !visible {
+                    self.scene.finish_attention_close();
+                }
+                Ok(cutoff)
+            }
             Err(mut error) => {
                 self.scene.set_attention(true);
                 if was_draining {
@@ -12924,6 +12981,103 @@ mod tests {
         let evidence = ready.try_recv().unwrap();
         assert_eq!(evidence.content_pixels, [5_000; 2]);
         assert_eq!(evidence.app_id, "org.mozilla.firefox");
+    }
+
+    #[test]
+    fn trusted_prompt_receipt_requires_complete_private_presentation() {
+        use crate::authority::consent::{Operation, Request, Role};
+        let cleanup = Cleanup(std::env::temp_dir().join(format!(
+            "td-trusted-prompt-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        )));
+        let mut runtime = Runtime::new(Framebuffer::test_file(&cleanup.0, 800, 600, 3200).unwrap());
+        let origin = crate::input::test_origin();
+        let request = Request::new(
+            [1; 32],
+            1000,
+            Operation::Unlock {
+                role: Role::Primary,
+            },
+        )
+        .unwrap();
+        assert!(runtime
+            .present_attention_request(&origin, request.clone())
+            .is_err());
+        runtime.enable_attention(true);
+        runtime.attention(&origin, true).unwrap();
+        let inert = std::fs::read(&cleanup.0).unwrap();
+        let mut public = vec![0; inert.len()];
+        runtime.scene.render(&mut public, 800, 600, 3200);
+        runtime.begin_compound_commit().unwrap();
+        assert!(runtime
+            .present_attention_request(&origin, request.clone())
+            .is_err());
+        runtime.finish_compound_commit().unwrap();
+        assert!(runtime.scene.attention_request().is_none());
+
+        let receipt = runtime
+            .present_attention_request(&origin, request.clone())
+            .unwrap();
+        assert_eq!(receipt.into_request(), request);
+        let presented = std::fs::read(&cleanup.0).unwrap();
+        assert_ne!(presented, inert);
+        let mut capture = vec![0; inert.len()];
+        runtime.scene.render(&mut capture, 800, 600, 3200);
+        assert_eq!(capture, public);
+        assert!(runtime
+            .present_attention_request(&origin, request.clone())
+            .is_err());
+        assert_eq!(std::fs::read(&cleanup.0).unwrap(), presented);
+        runtime.drain_attention(&origin).unwrap();
+        assert!(runtime.scene.attention_request().is_none());
+        assert!(runtime
+            .present_attention_request(&origin, request.clone())
+            .is_err());
+        runtime.attention(&origin, false).unwrap();
+        runtime.attention(&origin, true).unwrap();
+        runtime.fail_next_repaint();
+        assert!(runtime
+            .present_attention_request(&origin, request.clone())
+            .is_err());
+        assert_eq!(runtime.last_submission(), None);
+        assert!(runtime.scene.attention_visible());
+        assert!(runtime.scene.attention_request().is_none());
+        assert!(runtime.present_attention_request(&origin, request).is_err());
+        runtime.flush_paint().unwrap();
+        assert_eq!(std::fs::read(&cleanup.0).unwrap(), inert);
+    }
+
+    #[test]
+    fn repeated_entry_and_failed_close_cannot_reopen_a_prompt_slot() {
+        use crate::authority::consent::{Operation, Request, Role};
+        for fail_prompt in [false, true] {
+            let cleanup = Cleanup(std::env::temp_dir().join(format!(
+                "td-prompt-slot-{}-{}", std::process::id(), SEQ.fetch_add(1, Ordering::Relaxed)
+            )));
+            let mut runtime = Runtime::new(Framebuffer::test_file(&cleanup.0, 800, 600, 3200).unwrap());
+            let origin = crate::input::test_origin();
+            let request = Request::new([1; 32], 1000, Operation::Unlock { role: Role::Primary }).unwrap();
+            runtime.enable_attention(true);
+            runtime.attention(&origin, true).unwrap();
+            if fail_prompt { runtime.fail_next_repaint(); }
+            assert_eq!(
+                runtime.present_attention_request(&origin, request.clone()).is_err(),
+                fail_prompt
+            );
+            runtime.attention(&origin, true).unwrap();
+            assert!(runtime
+                .present_attention_request(&origin, request.clone())
+                .is_err());
+            runtime.fail_next_repaint();
+            assert!(runtime.attention(&origin, false).is_err());
+            assert!(runtime
+                .present_attention_request(&origin, request.clone())
+                .is_err());
+            runtime.attention(&origin, false).unwrap();
+            runtime.attention(&origin, true).unwrap();
+            assert!(runtime.present_attention_request(&origin, request).is_ok());
+        }
     }
 
     #[test]

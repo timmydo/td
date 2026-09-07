@@ -30,6 +30,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
             "application.rs",
             "application_files.rs",
             "channel.rs",
+            "consent.rs",
             "launch.rs",
             "main.rs",
             "mount_sys.rs",
@@ -42,6 +43,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
         ("application_files.rs", 0),
         ("main.rs", 1),
         ("channel.rs", 0),
+        ("consent.rs", 0),
         ("sys.rs", 4),
         ("launch.rs", 0),
         ("mount_sys.rs", 4),
@@ -74,13 +76,18 @@ fn the_production_source_and_raw_boundary_are_closed() {
             }
         }
     }
+    assert_eq!(
+        fingerprint(include_str!("../src/consent.rs")),
+        0xf1d3b878619f19f4,
+        "shared consent changed: reconcile compositor confinement and this pin"
+    );
     let application = include_str!("../src/application.rs")
         .split("#[cfg(test)]")
         .next()
         .unwrap();
     assert_eq!(
         fingerprint(application),
-        0xcd6d0efd2e359ddb,
+        0xc0abac3ae244ab3c,
         "application launch controller changed"
     );
     for forbidden in [
@@ -220,7 +227,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
     // Pin startup as well as raw code: aliases can evade API-name scans.
     assert_eq!(
         fingerprint(main),
-        0x9fc0356494471a92,
+        0xa2940fb3feed11ff,
         "main.rs: production startup changed"
     );
     assert_eq!(
