@@ -248,6 +248,41 @@ impl Framebuffer {
         })
     }
 
+    /// An owned ordinary file exercises the same composition and presentation
+    /// path as fbdev, without opening a device or consulting sysfs.
+    pub(crate) fn headless(file: File, width: usize, height: usize) -> Result<Self, String> {
+        let stride = width.checked_mul(4).ok_or("headless stride overflow")?;
+        let size = validate_geometry(width, height, stride)?;
+        file.set_len(u64::try_from(size).map_err(|_| "headless output size overflow")?)
+            .map_err(|error| format!("size headless output: {error}"))?;
+        let allocate = || -> Result<Vec<u8>, String> {
+            let mut bytes = Vec::new();
+            bytes.try_reserve_exact(size)
+                .map_err(|error| format!("allocate headless output: {error}"))?;
+            bytes.resize(size, 0);
+            Ok(bytes)
+        };
+        Ok(Self {
+            file,
+            width,
+            height,
+            stride,
+            frame: allocate()?,
+            comparison: Vec::new(),
+            written: allocate()?,
+            resend_all: true,
+            since_resend: 0,
+            #[cfg(test)]
+            writes: Vec::new(),
+            #[cfg(test)]
+            fail_next_paint: false,
+            #[cfg(test)]
+            fail_next_write: false,
+            #[cfg(test)]
+            after_next_write: None,
+        })
+    }
+
     #[cfg(test)]
     pub fn fail_next_paint(&mut self) {
         self.fail_next_paint = true;

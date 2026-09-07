@@ -18,6 +18,7 @@ mod filter;
 mod font;
 mod font_data;
 mod framebuffer;
+mod headless;
 mod help;
 mod input;
 mod keyboard;
@@ -70,6 +71,7 @@ fn usage() -> String {
      --application-ready-socket PATH --application-app-id ID \
      --application-content-rgb-a RGB --application-content-rgb-b RGB) \
      (--terminal-client PATH | --terminal-authority stdin) | \
+     td-compositor headless --session-dir NEW_ABSOLUTE_PATH --width N --height N | \
      td-compositor probe-terminal-authority | \
      td-compositor probe SOCKET | \
      td-compositor probe-application SOCKET ID RGB_A RGB_B [--quiet] | \
@@ -721,6 +723,7 @@ fn run(args: &[String]) -> Result<(), String> {
             session::probe_terminal_authority()
         }
         "run" => run_compositor(parse_run(args.get(1..).ok_or_else(usage)?)?),
+        "headless" => headless::run(args.get(1..).ok_or_else(usage)?, std::io::stdin()),
         // §M row 1's discovery half, as a subcommand rather than as something
         // the compositor does on the way up: it reads a card and takes no
         // mastership, so it can run on a booted image beside the fbdev
@@ -1230,6 +1233,7 @@ mod confinement {
         ("font.rs", include_str!("font.rs")),
         ("font_data.rs", include_str!("font_data.rs")),
         ("framebuffer.rs", include_str!("framebuffer.rs")),
+        ("headless.rs", include_str!("headless.rs")),
         ("help.rs", include_str!("help.rs")),
         ("input.rs", include_str!("input.rs")),
         ("keyboard.rs", include_str!("keyboard.rs")),
@@ -1354,6 +1358,12 @@ mod confinement {
                 );
             }
         }
+        // Only the disjoint headless personality receives an ordinary stdin
+        // reader. No module may independently acquire the authority endpoint.
+        assert_eq!(production(MAIN).matches("std::io::stdin()").count(), 1);
+        assert!(production(MAIN).contains(
+            "\"headless\" => headless::run(args.get(1..).ok_or_else(usage)?, std::io::stdin()),"
+        ));
         let client = production(AUTHORITY);
         for absent in [
             "::Command",

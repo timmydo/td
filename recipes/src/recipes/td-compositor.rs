@@ -46,6 +46,10 @@ const MODULES: &[(&str, &str)] = &[
         "framebuffer",
         include_str!("../../../td-compositor/src/framebuffer.rs"),
     ),
+    (
+        "headless",
+        include_str!("../../../td-compositor/src/headless.rs"),
+    ),
     ("help", include_str!("../../../td-compositor/src/help.rs")),
     ("input", include_str!("../../../td-compositor/src/input.rs")),
     (

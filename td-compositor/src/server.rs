@@ -7701,6 +7701,34 @@ pub fn serve(
     )
 }
 
+/// Hardware-free startup shares ordinary public-client admission, dispatch,
+/// configure workers, seat delivery, buffer ingestion and rendering.
+pub(crate) fn serve_headless(
+    listener: UnixListener,
+    directory: &Path,
+    runtime: Arc<Mutex<Runtime>>,
+    ended: std::sync::mpsc::Sender<Result<(), String>>,
+) -> Result<(), String> {
+    let keymap = keymap_file(directory)?;
+    let completion = crate::headless::Completion::new(ended, "Wayland");
+    thread::Builder::new()
+        .name("td-wl-accept".into())
+        .spawn(move || {
+            let result = accept_clients(
+                listener,
+                "headless Wayland",
+                ClientAccess::Public,
+                runtime,
+                keymap,
+                SocketPolicy::Private,
+            )
+            .and_then(|()| Err("headless Wayland listener retired".into()));
+            completion.report(result);
+        })
+        .map(|_| ())
+        .map_err(|error| format!("start headless Wayland listener: {error}"))
+}
+
 pub fn probe(path: &Path) -> Result<(), String> {
     UnixStream::connect(path)
         .map(|_| ())

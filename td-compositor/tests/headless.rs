@@ -1,0 +1,300 @@
+#![deny(unsafe_code)]
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+use std::fs;
+use std::io::{BufRead, BufReader, Read, Write};
+use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, PermissionsExt};
+use std::os::unix::net::{UnixListener, UnixStream};
+use std::os::unix::process::CommandExt;
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    mpsc,
+};
+use std::time::{Duration, Instant};
+
+const TIMEOUT: Duration = Duration::from_secs(20);
+static NEXT: AtomicU64 = AtomicU64::new(0);
+
+struct Root(PathBuf);
+
+impl Root {
+    fn new() -> Self {
+        let path = std::env::temp_dir().join(format!(
+            "td-headless-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::DirBuilder::new().mode(0o700).create(&path).unwrap();
+        Self(path)
+    }
+}
+
+impl Drop for Root {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+struct Process {
+    child: Child,
+    output: mpsc::Receiver<String>,
+}
+
+impl Process {
+    fn start(command: &mut Command, log: &Path, marker: &'static str) -> Self {
+        let mut child = command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(fs::File::create(log).unwrap())
+            .spawn()
+            .unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let (send, output) = mpsc::sync_channel(1);
+        std::thread::spawn(move || {
+            let mut reader = BufReader::new(stdout);
+            for _ in 0..8 {
+                let mut line = String::new();
+                if reader.by_ref().take(4097).read_line(&mut line).is_err()
+                    || line.is_empty()
+                    || line.len() > 4096
+                {
+                    break;
+                }
+                if line.starts_with(marker) {
+                    let _ = send.send(line);
+                    break;
+                }
+            }
+            // Keep stdout open and drained until process exit.
+            let _ = std::io::copy(&mut reader, &mut std::io::sink());
+        });
+        Self { child, output }
+    }
+
+    fn ready(&self) -> String {
+        self.output
+            .recv_timeout(TIMEOUT)
+            .expect("owned process did not become ready")
+    }
+
+    fn wait(&mut self) -> ExitStatus {
+        let deadline = Instant::now() + TIMEOUT;
+        loop {
+            if let Some(status) = self.child.try_wait().unwrap() {
+                return status;
+            }
+            assert!(Instant::now() < deadline, "owned child did not exit");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+}
+
+impl Drop for Process {
+    fn drop(&mut self) {
+        self.child.stdin.take();
+        if self.child.try_wait().ok().flatten().is_none() {
+            let _ = self.child.kill();
+        }
+        let _ = self.child.wait();
+    }
+}
+
+fn headless(path: &Path) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_td-compositor"));
+    command
+        .args(["headless", "--session-dir"])
+        .arg(path)
+        .args(["--width", "800", "--height", "600"]);
+    command
+}
+
+fn request(path: &Path, line: &[u8]) -> String {
+    let mut stream = UnixStream::connect(path).unwrap();
+    stream.set_read_timeout(Some(TIMEOUT)).unwrap();
+    stream.set_write_timeout(Some(TIMEOUT)).unwrap();
+    stream.write_all(line).unwrap();
+    let mut answer = String::new();
+    stream.take(65537).read_to_string(&mut answer).unwrap();
+    assert!(answer.len() <= 65536);
+    answer
+}
+
+#[test]
+fn a_disposable_production_session_maps_a_real_client_and_dies_with_its_owner() {
+    let root = Root::new();
+    let session = root.0.join("session");
+    let log = root.0.join("compositor.log");
+    let mut compositor = Process::start(
+        &mut headless(&session),
+        &log,
+        "TD-COMPOSITOR-HEADLESS-READY",
+    );
+    assert_eq!(
+        compositor.ready(),
+        "TD-COMPOSITOR-HEADLESS-READY version=1 width=800 height=600 scale=1\n"
+    );
+    assert_eq!(
+        fs::metadata(&session).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+    for name in ["wayland-0", "td-control"] {
+        let metadata = fs::symlink_metadata(session.join(name)).unwrap();
+        assert!(metadata.file_type().is_socket());
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+    }
+    assert_eq!(fs::read_dir(&session).unwrap().count(), 2);
+    let control = session.join("td-control");
+    let empty = request(&control, b"layout\n");
+    assert!(empty.starts_with("ok\noutput "), "{empty}");
+    assert!(empty.contains("windows=0\n"), "{empty}");
+
+    let mut command = Command::new(env!("CARGO_BIN_EXE_td-compositor"));
+    command
+        .arg0("td-ui-demo")
+        .args(["run", "--socket"])
+        .arg(session.join("wayland-0"))
+        .arg("--ready-socket")
+        .arg(root.0.join("client.ready"));
+    let mut demo = Process::start(
+        &mut command,
+        &root.0.join("client.log"),
+        "TD-UI-CLIENT-READY",
+    );
+    assert!(demo.ready().starts_with("TD-UI-CLIENT-READY"));
+    let mapped = request(&control, b"layout\n");
+    assert!(mapped.contains("windows=1\n"), "{mapped}");
+    assert!(mapped.contains("visible=true focused=true"), "{mapped}");
+    // Real control orders still take the ordinary Runtime path.
+    assert_eq!(request(&control, b"workspace 2\n"), "ok\n");
+    let hidden = request(&control, b"layout\n");
+    assert!(hidden.contains("visible=false focused=false"), "{hidden}");
+    assert_eq!(request(&control, b"workspace 1\n"), "ok\n");
+    compositor.child.stdin.take();
+    assert!(
+        compositor.wait().success(),
+        "{}",
+        fs::read_to_string(log).unwrap()
+    );
+    assert!(!session.exists());
+    assert!(!demo.wait().success(), "disconnect should end the client");
+}
+
+#[test]
+fn startup_refuses_existing_paths_and_rolls_back_a_failed_bind() {
+    let root = Root::new();
+    let session = root.0.join("occupied");
+    fs::create_dir(&session).unwrap();
+    fs::write(session.join("keep"), b"owned by caller").unwrap();
+    let mut existing = Process::start(
+        &mut headless(&session),
+        &root.0.join("existing.log"),
+        "TD-COMPOSITOR-HEADLESS-READY",
+    );
+    assert!(!existing.wait().success());
+    assert_eq!(fs::read(session.join("keep")).unwrap(), b"owned by caller");
+    let too_long = root.0.join("s".repeat(120));
+    let mut refused = Process::start(
+        &mut headless(&too_long),
+        &root.0.join("long.log"),
+        "TD-COMPOSITOR-HEADLESS-READY",
+    );
+    assert!(!refused.wait().success());
+    assert!(!too_long.exists(), "failed startup left its new directory");
+    assert!(refused.output.try_recv().is_err());
+}
+
+#[test]
+fn lifetime_input_is_not_a_command_channel_and_client_files_are_not_removed() {
+    let root = Root::new();
+    let session = root.0.join("session");
+    let mut compositor = Process::start(
+        &mut headless(&session),
+        &root.0.join("compositor.log"),
+        "TD-COMPOSITOR-HEADLESS-READY",
+    );
+    compositor.ready();
+    fs::write(session.join("keep"), b"client data").unwrap();
+    compositor
+        .child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(b"x")
+        .unwrap();
+    assert!(!compositor.wait().success());
+    assert_eq!(fs::read(session.join("keep")).unwrap(), b"client data");
+    assert!(!session.join("wayland-0").exists());
+    assert!(!session.join("td-control").exists());
+    let log = fs::read_to_string(root.0.join("compositor.log")).unwrap();
+    assert_eq!(
+        log.matches("remove headless session directory:").count(),
+        1,
+        "{log}"
+    );
+}
+
+#[test]
+fn shutdown_preserves_replaced_endpoint_and_directory_identities() {
+    let root = Root::new();
+    for replace_directory in [false, true] {
+        let session = root.0.join(format!("session-{replace_directory}"));
+        let mut compositor = Process::start(
+            &mut headless(&session),
+            &root.0.join(format!("{replace_directory}.log")),
+            "TD-COMPOSITOR-HEADLESS-READY",
+        );
+        compositor.ready();
+        let sentinel = if replace_directory {
+            fs::rename(&session, root.0.join("original-session")).unwrap();
+            fs::create_dir(&session).unwrap();
+            session.join("keep")
+        } else {
+            let endpoint = session.join("wayland-0");
+            fs::remove_file(&endpoint).unwrap();
+            endpoint
+        };
+        fs::write(&sentinel, b"replacement belongs to caller").unwrap();
+        compositor.child.stdin.take();
+        assert!(!compositor.wait().success());
+        assert_eq!(
+            fs::read(sentinel).unwrap(),
+            b"replacement belongs to caller"
+        );
+        if !replace_directory {
+            assert!(
+                !session.join("td-control").exists(),
+                "replacement hid cleanup of another owned endpoint"
+            );
+        }
+        let log = fs::read_to_string(root.0.join(format!("{replace_directory}.log"))).unwrap();
+        assert_eq!(log.matches("td-compositor:").count(), 1, "{log}");
+    }
+}
+
+#[test]
+fn same_type_socket_replacement_is_not_the_owned_inode() {
+    let root = Root::new();
+    let session = root.0.join("session");
+    let mut compositor = Process::start(
+        &mut headless(&session),
+        &root.0.join("compositor.log"),
+        "TD-COMPOSITOR-HEADLESS-READY",
+    );
+    compositor.ready();
+    let path = session.join("wayland-0");
+    fs::remove_file(&path).unwrap();
+    let replacement = UnixListener::bind(&path).unwrap();
+    let identity = fs::symlink_metadata(&path).unwrap();
+    compositor.child.stdin.take();
+    assert!(!compositor.wait().success());
+    let remaining = fs::symlink_metadata(&path).unwrap();
+    assert_eq!(
+        (remaining.dev(), remaining.ino()),
+        (identity.dev(), identity.ino())
+    );
+    assert!(remaining.file_type().is_socket());
+    assert!(!session.join("td-control").exists());
+    drop(replacement);
+}

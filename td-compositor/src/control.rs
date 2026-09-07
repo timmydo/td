@@ -758,6 +758,24 @@ pub fn serve(
         .map_err(|error| format!("start control listener {}: {error}", path.display()))
 }
 
+/// The disposable session owns the already-bound private endpoint. A retired
+/// control worker ends that session instead of leaving readiness stale.
+pub(crate) fn serve_headless(
+    listener: UnixListener,
+    runtime: Arc<Mutex<Runtime>>,
+    ended: std::sync::mpsc::Sender<Result<(), String>>,
+) -> Result<(), String> {
+    let completion = crate::headless::Completion::new(ended, "control");
+    thread::Builder::new()
+        .name("td-control".into())
+        .spawn(move || {
+            accept(listener.incoming(), &runtime, SocketPolicy::Private);
+            completion.report(Err("headless control listener retired".into()));
+        })
+        .map(|_| ())
+        .map_err(|error| format!("start headless control listener: {error}"))
+}
+
 /// Takes the connections rather than the listener, for `socket::serve`'s
 /// reason: a bound on a run of failed accepts that no test can reach is a
 /// bound nobody can trust.

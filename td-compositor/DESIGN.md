@@ -6400,6 +6400,13 @@ receipt API yet. The private root unlock worker consumes the request codec
 as specified in `td-secret/DESIGN.md`, but its paired-authority caller is
 not activated. The stock attention screen remains inert.
 
+## Native headless automation
+
+[AUTOMATION.md](AUTOMATION.md) specifies disposable hardware-free sessions,
+their lifecycle and proof boundary, and the subsequent separately enabled
+input/capture work. This is the primary native client integration platform;
+it does not replace independent compositor interoperability checks.
+
 ## td-owned development VM bridge
 
 [td-vm's host/guest bridge](../td-review/VM.md#the-hostguest-bridge) owns the
