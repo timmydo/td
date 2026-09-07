@@ -1066,3 +1066,43 @@ It writes the two-byte result directly to that socket with a two-second
 write timeout. There is no buffered stdout result. The parent deadline
 also bounds filesystem work and observed completion. Both production and
 ordinary child fixtures use the same factory and descriptor assignment.
+
+## Token-authorized named write backend
+
+The root-only `Store::set_token` API consumes one owned assertion request
+and its response for a single application/name and bounded credential byte
+slice. Its caller must already have admitted the application and requester,
+pinned the exact credential snapshot to a fresh operation nonce, presented
+the immutable description, and won the one-operation commit decision. This
+backend does not admit an unprivileged caller or display consent itself.
+The public console writer remains the explicit interim until its paired
+one-operation consumer and descriptor intake replace it atomically.
+
+The store keeps its existing exclusive lock throughout the operation.
+The API checks that swap is disabled and the core-dump soft limit is zero
+through the same memory prerequisite helper as runtime access, without
+opening or changing a runtime key. Unreadable or unsafe settings refuse
+before the write callback can acquire a master.
+Before signature verification or TPM unseal, it refuses malformed targets,
+empty or oversized credentials, file and TPM-only stores, a changed token
+protector, and adding a new record when all 128 slots are occupied. It
+consumes the bound request to verify the signed assertion and unseal only
+its matching TPM-protected master. An existing volatile release does not
+substitute for this fresh assertion. The derived application key encrypts
+one replacement record with a fresh nonce. One atomic bundle publication
+preserves the protector and every unrelated encrypted record. Errors before
+publication preserve the previous bundle; the existing rename/fsync contract
+still permits an uncertain result after publication. There is no automatic
+retry or rollback based on a missing success reply.
+
+This operation neither publishes nor reads a session release, and does not
+change any existing runtime key. The authority owns cancellation and session
+cleanup policy. Master and derived-key buffers are cleared on every return
+after acquisition, subject to the existing best-effort erasure limitation.
+A pinned-swtpm oracle uses independently signed primary and recovery fixtures
+to change one record in a locked store, verifies the other record is byte
+identical, rejects invalid signatures without publication, and proves that
+neither a runtime key nor persistent plaintext was produced. Host structural
+cases reject invalid targets, legacy backends, changed protectors and full
+stores before their unseal callback can execute. These are store-backend
+oracles, not evidence of descriptor intake, a physical touch or UI consent.

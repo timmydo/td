@@ -514,6 +514,68 @@ impl Store {
         self.publish_release(&bundle, runtime, |_| request.unseal(response, client))
     }
 
+    /// Commit one admitted write without publishing a session release.
+    pub fn set_token<T: tpm::Transport>(
+        &self,
+        app: &str,
+        name: &str,
+        plaintext: &[u8],
+        request: super::fido_metadata::BoundRelease,
+        response: &[u8],
+        client: tpm::Client<T>,
+    ) -> Result<(), String> {
+        require_root()?;
+        let protector = *request.protection_id();
+        with_memory_state(
+            fs::read_to_string("/proc/swaps"),
+            fs::read_to_string("/proc/self/limits"),
+            || {
+                self.set_token_with(app, name, plaintext, &protector, || {
+                    request.unseal(response, client)
+                })
+            },
+        )
+    }
+
+    fn set_token_with(
+        &self,
+        app: &str,
+        name: &str,
+        plaintext: &[u8],
+        protector: &[u8; 32],
+        unseal: impl FnOnce() -> Result<[u8; 32], String>,
+    ) -> Result<(), String> {
+        if plaintext.is_empty() || plaintext.len() > MAX_SECRET {
+            return Err(format!("credential must contain 1..{MAX_SECRET} bytes"));
+        }
+        let (file, aad) = Self::record(app, name)?;
+        let mut bundle = self
+            .bundle()?
+            .ok_or("credential store is not token enrolled")?;
+        if !bundle.token_protected() {
+            return Err("credential store is not token enrolled".into());
+        }
+        if &crypto::digest(&bundle.key) != protector {
+            return Err("credential protector changed during token write".into());
+        }
+        if bundle.records.len() >= MAX_ENTRIES && !bundle.records.contains_key(&file) {
+            return Err("credential store has no free record slot".into());
+        }
+        let mut master = unseal()?;
+        let mut key = crypto::derive(&master, app);
+        master.fill(0);
+        let result = (|| {
+            let nonce = random::<12>()?;
+            let mut bytes = MAGIC.to_vec();
+            bytes.extend_from_slice(&nonce);
+            bytes.extend_from_slice(&crypto::seal(&key, &nonce, &aad, plaintext));
+            bundle.records.insert(file, bytes);
+            self.write("sealed", &bundle.encode()?)
+        })();
+        key.fill(0);
+        result
+    }
+
     /// Only firstboot creates the uid leaf. All ancestors must already exist.
     pub fn open(path: &Path, uid: u32, create: bool) -> Result<Self, String> {
         Self::open_owned(path, uid, uid, create)
@@ -916,10 +978,22 @@ fn check_swap_state(swaps: io::Result<String>) -> Result<(), String> {
     Ok(())
 }
 
+fn with_memory_state<T>(
+    swaps: io::Result<String>,
+    limits: io::Result<String>,
+    operation: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    check_swap_state(swaps)?;
+    check_core_limit(&limits.map_err(|e| e.to_string())?)?;
+    operation()
+}
+
 fn runtime_directory(uid: u32, create: bool) -> Result<File, String> {
-    check_swap_state(fs::read_to_string("/proc/swaps"))?;
-    let limits = fs::read_to_string("/proc/self/limits").map_err(|e| e.to_string())?;
-    check_core_limit(&limits)?;
+    with_memory_state(
+        fs::read_to_string("/proc/swaps"),
+        fs::read_to_string("/proc/self/limits"),
+        || Ok(()),
+    )?;
     // /run is an image-owned tmpfs. No environment variable can relocate keys.
     let mut mounts = String::new();
     File::open("/proc/self/mountinfo")
@@ -1710,6 +1784,301 @@ mod tests {
         assert!(Store::open(&base.join("alias"), uid, false).is_err());
         fs::remove_dir_all(base).unwrap();
     }
+    #[test]
+    fn protected_memory_refusal_prevents_the_key_operation() {
+        let never = || -> Result<(), String> { panic!("unsafe memory reached unseal") };
+        let no_swap = || Ok("Filename Type Size Used Priority\n".into());
+        let no_core = || Ok("Max core file size 0 unlimited bytes\n".into());
+        assert!(with_memory_state(
+            Ok("Filename Type Size Used Priority\n/swap file 1 1 0\n".into()),
+            no_core(),
+            never
+        )
+        .is_err());
+        assert!(with_memory_state(
+            Err(io::ErrorKind::PermissionDenied.into()),
+            no_core(),
+            never
+        )
+        .is_err());
+        assert!(with_memory_state(
+            no_swap(),
+            Ok("Max core file size unlimited unlimited bytes\n".into()),
+            never
+        )
+        .is_err());
+        assert!(with_memory_state(
+            no_swap(),
+            Err(io::ErrorKind::PermissionDenied.into()),
+            never
+        )
+        .is_err());
+        assert_eq!(
+            with_memory_state(no_swap(), no_core(), || Ok(42)).unwrap(),
+            42
+        );
+        assert_eq!(
+            with_memory_state(Err(io::ErrorKind::NotFound.into()), no_core(), || Ok(43)).unwrap(),
+            43
+        );
+    }
+
+    #[test]
+    fn token_write_refuses_invalid_target_or_protector_before_unseal() {
+        let root = std::env::temp_dir().join(format!(
+            "td-token-write-{}-{}",
+            std::process::id(),
+            u64::from_le_bytes(random::<8>().unwrap())
+        ));
+        fs::create_dir(&root).unwrap();
+        let owner = fs::metadata(&root).unwrap().uid();
+        let path = root.join("store");
+        let store = Store::open_owned(&path, 1000, owner, true).unwrap();
+        store.set("mail", "main", b"old credential").unwrap();
+        let never = || -> Result<[u8; 32], String> { panic!("invalid write reached unseal") };
+        assert_eq!(
+            store
+                .set_token_with("mail", "main", b"new", &[0; 32], never)
+                .unwrap_err(),
+            "credential store is not token enrolled"
+        );
+        store
+            .write(
+                "sealed",
+                &Bundle {
+                    key: tpm::tests::fixture(1000),
+                    records: BTreeMap::new(),
+                }
+                .encode()
+                .unwrap(),
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .set_token_with("mail", "main", b"new", &[0; 32], never)
+                .unwrap_err(),
+            "credential store is not token enrolled"
+        );
+        let key = crate::fido_metadata::tests::protection_fixture(1000, true)
+            .encode()
+            .unwrap();
+        let protector = crypto::digest(&key);
+        let mut bundle = Bundle {
+            key,
+            records: BTreeMap::new(),
+        };
+        store.write("sealed", &bundle.encode().unwrap()).unwrap();
+        let before = store.read("sealed", MAX_BUNDLE).unwrap();
+        for (app, name, bytes) in [
+            ("mail", "../main", b"new".as_slice()),
+            ("../mail", "main", b"new"),
+            ("mail", "main", b""),
+        ] {
+            assert!(store
+                .set_token_with(app, name, bytes, &protector, never)
+                .is_err());
+        }
+        assert!(store
+            .set_token_with("mail", "main", &[7; MAX_SECRET + 1], &protector, never)
+            .is_err());
+        assert_eq!(
+            store
+                .set_token_with("mail", "main", b"new", &[0; 32], never)
+                .unwrap_err(),
+            "credential protector changed during token write"
+        );
+        assert_eq!(
+            store
+                .set_token_with("mail", "main", b"new", &protector, || Err(
+                    "signature refused".into()
+                ))
+                .unwrap_err(),
+            "signature refused"
+        );
+        assert_eq!(store.read("sealed", MAX_BUNDLE).unwrap(), before);
+        for index in 0..128 {
+            bundle.records.insert(
+                format!("mail.entry{index}"),
+                fs::read(path.join("mail.main")).unwrap(),
+            );
+        }
+        store.write("sealed", &bundle.encode().unwrap()).unwrap();
+        assert_eq!(
+            store
+                .set_token_with("mail", "main", b"new", &protector, never)
+                .unwrap_err(),
+            "credential store has no free record slot"
+        );
+        assert_eq!(
+            store.read("sealed", MAX_BUNDLE).unwrap(),
+            bundle.encode().unwrap()
+        );
+        store
+            .set_token_with(
+                "mail",
+                "entry0",
+                b"replacement at capacity",
+                &protector,
+                || Ok([42; 32]),
+            )
+            .unwrap();
+        let updated = store.bundle().unwrap().unwrap();
+        assert_eq!(updated.records.len(), MAX_ENTRIES);
+        assert_eq!(
+            decrypt(&updated, &[42; 32], "mail", "entry0").unwrap(),
+            b"replacement at capacity"
+        );
+        assert_eq!(
+            updated.records.get("mail.entry1"),
+            bundle.records.get("mail.entry1")
+        );
+        if owner != 0 {
+            struct Never;
+            impl tpm::Transport for Never {
+                fn exchange(&mut self, _: &[u8]) -> Result<Vec<u8>, String> {
+                    panic!("unprivileged write reached TPM")
+                }
+            }
+            let protection = crate::fido_metadata::Protection::decode(&updated.key, 1000).unwrap();
+            let (request, response) = crate::fido_metadata::tests::release_fixture(
+                &protection,
+                crate::fido_metadata::Role::Primary,
+            );
+            assert_eq!(
+                store
+                    .set_token(
+                        "mail",
+                        "entry0",
+                        b"forbidden",
+                        request,
+                        &response,
+                        tpm::Client::new(Never)
+                    )
+                    .unwrap_err(),
+                require_root().unwrap_err()
+            );
+        }
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires explicitly supplied pinned host swtpm; never accesses hardware"]
+    fn emulator_token_write_changes_one_record_without_releasing_the_store() {
+        use crate::fido_metadata::{tests as fixtures, Protection, Role};
+        let root = std::env::temp_dir().join(format!(
+            "td-token-write-emulator-{}-{}",
+            std::process::id(),
+            u64::from_le_bytes(random::<8>().unwrap())
+        ));
+        fs::create_dir(&root).unwrap();
+        let owner = fs::metadata(&root).unwrap().uid();
+        let emulator = tpm::tests::Emulator::start(&root.join("tpm"));
+        emulator.extend(&[9; 32]);
+        let path = root.join("store");
+        let store = Store::open_owned(&path, 1000, owner, true).unwrap();
+        store.set("mail", "main", b"old mail credential").unwrap();
+        store
+            .set("news", "work", b"preserved news credential")
+            .unwrap();
+        let runtime = runtime_directory_at(&root, owner, 1000, true).unwrap();
+        store
+            .enroll_tokens_into(
+                fixtures::metadata_fixture(1000, true),
+                tpm::Pcrs::parse("7").unwrap(),
+                &runtime,
+                || Ok(emulator.client()),
+            )
+            .unwrap();
+        let initial = store.bundle().unwrap().unwrap();
+        let protection = Protection::decode(&initial.key, 1000).unwrap();
+        for role in [Role::Primary, Role::Recovery] {
+            let (request, response) = fixtures::release_fixture(&protection, role);
+            let id = *request.protection_id();
+            store
+                .set_token_with("mail", "main", b"new mail credential", &id, || {
+                    request.unseal(&response, emulator.client())
+                })
+                .unwrap();
+            assert!(!pinned(&runtime).join("key").exists());
+            let updated = store.bundle().unwrap().unwrap();
+            assert_eq!(updated.key, initial.key);
+            assert_eq!(updated.records.len(), 2);
+            assert_eq!(
+                updated.records.get("news.work"),
+                initial.records.get("news.work")
+            );
+            assert_ne!(
+                updated.records.get("mail.main"),
+                initial.records.get("mail.main")
+            );
+            let (request, response) = fixtures::release_fixture(&protection, role);
+            let mut master = request.unseal(&response, emulator.client()).unwrap();
+            assert_eq!(
+                decrypt(&updated, &master, "mail", "main").unwrap(),
+                b"new mail credential"
+            );
+            assert_eq!(
+                decrypt(&updated, &master, "news", "work").unwrap(),
+                b"preserved news credential"
+            );
+            let persisted = fs::read(path.join("sealed")).unwrap();
+            assert!(!persisted.windows(32).any(|bytes| bytes == master));
+            assert!(!persisted
+                .windows(19)
+                .any(|bytes| bytes == b"new mail credential"));
+            master.fill(0);
+            let (request, mut response) = fixtures::release_fixture(&protection, role);
+            *response.last_mut().unwrap() ^= 1;
+            let id = *request.protection_id();
+            assert!(store
+                .set_token_with("mail", "main", b"forbidden", &id, || request
+                    .unseal(&response, emulator.client()))
+                .is_err());
+            assert_eq!(fs::read(path.join("sealed")).unwrap(), persisted);
+        }
+        let before = store.bundle().unwrap().unwrap();
+        let (request, response) = fixtures::release_fixture(&protection, Role::Primary);
+        store
+            .release_token_into(&runtime, request, &response, emulator.client())
+            .unwrap();
+        let runtime_before = fs::read(pinned(&runtime).join("key")).unwrap();
+        let (request, response) = fixtures::release_fixture(&protection, Role::Recovery);
+        let id = *request.protection_id();
+        store
+            .set_token_with("mail", "secondary", b"new account credential", &id, || {
+                request.unseal(&response, emulator.client())
+            })
+            .unwrap();
+        let added = store.bundle().unwrap().unwrap();
+        assert_eq!(added.records.len(), 3);
+        for (name, record) in &before.records {
+            assert_eq!(added.records.get(name), Some(record));
+        }
+        assert_eq!(
+            fs::read(pinned(&runtime).join("key")).unwrap(),
+            runtime_before
+        );
+        let mut master = runtime_key_in(&runtime, owner, &added.key).unwrap();
+        assert_eq!(
+            decrypt(&added, &master, "mail", "secondary").unwrap(),
+            b"new account credential"
+        );
+        assert_eq!(
+            decrypt(&added, &master, "mail", "main").unwrap(),
+            b"new mail credential"
+        );
+        assert_eq!(
+            decrypt(&added, &master, "news", "work").unwrap(),
+            b"preserved news credential"
+        );
+        master.fill(0);
+        drop(runtime);
+        drop(store);
+        drop(emulator);
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn applications_refuse_unenrolled_backends_even_with_readable_credentials() {
         let root = std::env::temp_dir().join(format!("td-app-secret-{}-{}", std::process::id(), u64::from_le_bytes(random::<8>().unwrap())));
