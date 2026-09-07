@@ -2203,6 +2203,21 @@ operation or editor surface ID is injected. This is selection/menu
 interoperability, not hardware, wheel, touch, clipboard, cursor pixels or
 multi-output/scaling coverage.
 
+The opt-in `disposable_weston_transfers_clipboard_between_editor_processes`
+test starts two editor clients on the same private owned Weston. Native Cut
+passes the editor's current-input gate and publishes a source snapshot;
+a subsequent source edit must not change that snapshot. Weston 10 does not
+fully validate the first selection owner's serial, so this is not a proof
+of compositor-side serial authorization. The newly mapped destination gains
+focus, remains empty before Paste, and receives native Paste through Weston's
+data-device offer and descriptor transport. Exact UTF-8 text and saved bytes
+cover accents, combining marks, supplementary scalars and multiple lines.
+Both clients and Weston are reaped; the source stays alive until the
+destination finishes. No control Insert or decoded clipboard action bypasses
+the Wayland transfer. This is two-editor interoperability, not arbitrary
+external applications, clipboard-manager persistence, source-exit survival
+or hostile peer/large-transfer coverage.
+
 The safe `control` library now supplies the one-frame decoder/encoder,
 `state`/`text` queries and a bounded revision-checked editing subset. It
 shares controller snapshots,

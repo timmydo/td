@@ -388,7 +388,7 @@ jobs, exact BOM/CRLF output and foreground/cleanup behavior. It does not inject
 physical input or prove GPU, scanout, captured pixels, or td-jail integration.
 Weston is optional host test tooling, not an editor or ordinary-gate dependency.
 
-The `disposable_weston` invocation above runs all four cases.
+The `disposable_weston` invocation above runs all five cases.
 Keep the executable/module outside the host's `/tmp` or in the bound
 worktree: the trusted-root fixture replaces `/tmp` with its own empty mount.
 The two separately reported keyboard cases create fresh instances for the
@@ -405,6 +405,13 @@ opens Edit → Find with real pointer events before native Escape cancellation.
 Read-only state/prompt observations fence input delivery; exact text/revisions
 and saved bytes verify the result. It does not prove wheel, touch, clipboard,
 hardware input, cursor pixels or multi-output/scaling behavior.
+
+The clipboard case starts two editor processes on one disposable Weston.
+Native Cut offers a Unicode snapshot; editing the source afterward must not
+change what native Paste receives in the focused destination. Exact text,
+revisions and saved bytes check the real data-device/descriptor transfer.
+The source stays alive until transfer completion. This is not an external-app
+or clipboard-manager persistence test and adds no clipboard utility dependency.
 
 The default process-level control tests launch the actual editor executable
 against a bounded test Wayland peer and use only its private control socket.

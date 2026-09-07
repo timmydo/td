@@ -18,6 +18,17 @@ type Result<T> = std::result::Result<T, String>;
 const TIMEOUT: Duration = Duration::from_secs(10);
 static NEXT: AtomicU64 = AtomicU64::new(0);
 
+// Linux evdev key codes used by the owned Weston seat, never ASCII.
+const KEY_ESCAPE: u32 = 1;
+const KEY_LEFT_CTRL: u32 = 29;
+const KEY_A: u32 = 30;
+const KEY_LEFT_SHIFT: u32 = 42;
+const KEY_Z: u32 = 44;
+const KEY_X: u32 = 45;
+const KEY_V: u32 = 47;
+const KEY_B: u32 = 48;
+const KEY_SLASH: u32 = 53;
+
 struct Directory(PathBuf);
 impl Directory {
     fn new() -> Self {
@@ -1063,12 +1074,6 @@ fn weston_test_global_decoder_checks_strings_versions_and_payload_bounds() {
 }
 
 fn weston_keyboard_profile(profile: &str) {
-    const LEFT_SHIFT: u32 = 42;
-    const LEFT_CTRL: u32 = 29;
-    const A: u32 = 30;
-    const B: u32 = 48;
-    const Z: u32 = 44;
-    const SLASH: u32 = 53;
     let directory = Directory::new();
     let display = directory.0.join("wayland");
     let mut weston = WestonProcess::start(&directory);
@@ -1082,13 +1087,17 @@ fn weston_keyboard_profile(profile: &str) {
     editor.wait_keyboard(profile);
     let mut input = WestonInput::connect(&display);
     // Linux evdev codes, not ASCII or already decoded editor chords.
-    input.chord(Some(LEFT_SHIFT), A);
+    input.chord(Some(KEY_LEFT_SHIFT), KEY_A);
     editor.wait_tab(1, "Aone\n");
-    input.chord(None, B); // Lowercase b after releasing Shift.
+    input.chord(None, KEY_B); // Lowercase b after releasing Shift.
     editor.wait_tab(2, "Abone\n");
     input.chord(
-        Some(LEFT_CTRL),
-        if profile == "windows" { Z } else { SLASH },
+        Some(KEY_LEFT_CTRL),
+        if profile == "windows" {
+            KEY_Z
+        } else {
+            KEY_SLASH
+        },
     );
     editor.wait_tab(3, "Aone\n");
     editor.job("save\t1\t3");
@@ -1149,7 +1158,7 @@ fn weston_test_timed_requests_use_integer_pixels_and_nanosecond_timestamps() {
         input.motion(-9, 56);
         input.left_button(true);
         input.click(12, 34);
-        input.key(48, false);
+        input.key(KEY_B, false);
         drop(input);
         oracle.join().unwrap();
     });
@@ -1183,9 +1192,9 @@ fn disposable_weston_delivers_pointer_selection_and_menu_events() {
     input.left_button(false);
     // A later unheld motion must not extend the selected range.
     input.motion(65, 56);
-    input.chord(None, 48); // Native lowercase b replaces exactly "one".
+    input.chord(None, KEY_B); // Native lowercase b replaces exactly "one".
     editor.wait_tab(1, "b two\n");
-    input.chord(Some(29), 44); // Native Windows undo.
+    input.chord(Some(KEY_LEFT_CTRL), KEY_Z); // Native Windows undo.
     editor.wait_tab(2, "one two\n");
     input.click(EDIT_X, 8); // Edit header.
     editor.wait_field("state", "modal", "0,0,0,0,1,0,0,0,0");
@@ -1194,13 +1203,68 @@ fn disposable_weston_delivers_pointer_selection_and_menu_events() {
         PANEL_TOP + FIND_ROW * MENU_ROW_HEIGHT + MENU_ROW_HEIGHT / 2,
     ); // Find, pinned to zero-based row eight.
     editor.wait_field("prompt-state", "prompt", "find-forward");
-    input.chord(None, 1); // Escape cancels without changing text.
+    input.chord(None, KEY_ESCAPE); // Escape cancels without changing text.
     editor.wait_field("prompt-state", "prompt", "none");
     editor.wait_tab(2, "one two\n");
     editor.job("save\t1\t2");
     assert_eq!(std::fs::read(&file).unwrap(), b"one two\n");
     editor.rendered_at(1024, 768);
     editor.quit();
+    weston.assert_serving();
+}
+
+#[test]
+#[ignore = "requires explicit Weston executable and matching upstream test-plugin; see README"]
+fn disposable_weston_transfers_clipboard_between_editor_processes() {
+    let compositor = Directory::new();
+    let display = compositor.0.join("wayland");
+    let mut weston = WestonProcess::start(&compositor);
+    let source_dir = Directory::new();
+    let source_path = source_dir.0.join("source");
+    let dictionary = source_dir.0.join("dictionary");
+    let text = "café e\u{301} 🦀\nsecond line\n";
+    std::fs::write(&source_path, text).unwrap();
+    std::fs::write(&dictionary, b"line\nsecond\n").unwrap();
+    let mut source = EditorProcess::start(&source_dir, &display, &source_path, &dictionary);
+    source.rendered_at(1024, 768);
+    source.wait_keyboard("windows");
+    let mut input = WestonInput::connect(&display);
+    input.chord(Some(KEY_LEFT_CTRL), KEY_A);
+    input.chord(Some(KEY_LEFT_CTRL), KEY_X);
+    // The Cut edit proves the editor accepted native input. Weston 10 does
+    // not fully validate the first selection owner's activation serial.
+    source.wait_tab(1, "");
+    input.chord(None, KEY_B);
+    source.wait_tab(2, "b");
+    source.job("save\t1\t2");
+    assert_eq!(std::fs::read(&source_path).unwrap(), b"b");
+    source.rendered_at(1024, 768);
+
+    let destination_dir = Directory::new();
+    let destination_path = destination_dir.0.join("destination");
+    let destination_dictionary = destination_dir.0.join("dictionary");
+    std::fs::write(&destination_path, b"").unwrap();
+    std::fs::write(&destination_dictionary, b"line\nsecond\n").unwrap();
+    let mut destination = EditorProcess::start(
+        &destination_dir,
+        &display,
+        &destination_path,
+        &destination_dictionary,
+    );
+    destination.rendered_at(1024, 768);
+    destination.wait_keyboard("windows");
+    source.wait_field("state", "focus", "0");
+    destination.wait_tab(0, ""); // Receiving an offer must not insert text.
+    input.chord(Some(KEY_LEFT_CTRL), KEY_V);
+    // Clipboard must retain the pre-cut snapshot, not the edited source.
+    destination.wait_tab(1, text);
+    destination.job("save\t1\t1");
+    assert_eq!(std::fs::read(&destination_path).unwrap(), text.as_bytes());
+    source.wait_tab(2, "b");
+    // Source is now occluded; its saved frame was fenced before mapping here.
+    destination.rendered_at(1024, 768);
+    destination.quit();
+    source.quit();
     weston.assert_serving();
 }
 
