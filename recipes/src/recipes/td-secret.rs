@@ -6,6 +6,7 @@ const MODULES: &[(&str, &str)] = &[
     ("crypto", include_str!("../../../td-secret/src/crypto.rs")),
     ("fido_cbor", include_str!("../../../td-secret/src/fido_cbor.rs")),
     ("fido_ctap", include_str!("../../../td-secret/src/fido_ctap.rs")),
+    ("fido_enroll", include_str!("../../../td-secret/src/fido_enroll.rs")),
     ("fido_hid", include_str!("../../../td-secret/src/fido_hid.rs")),
     ("tpm", include_str!("../../../td-secret/src/tpm.rs")),
     ("store", include_str!("../../../td-secret/src/store.rs")),

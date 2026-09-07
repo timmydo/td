@@ -366,6 +366,63 @@ signature bytes. Only public fixture material is committed; OpenSSL is not a
 test dependency. This is a software protocol oracle, not a physical-token or
 secure-attention demonstration.
 
+## Token enrollment protocol
+
+`fido_enroll.rs` negotiates the removable, presence-only CTAP2 profile with
+getInfo. It admits advertised FIDO_2_0, FIDO_2_1 or FIDO_2_3; preview-only,
+U2F-only and unknown-only devices are refused. FIDO_2_2 is not a defined
+version string: CTAP 2.3 section 6.4 explicitly forbids advertising it.
+It requires a 16-byte AAGUID, boolean options, user-presence
+support, no platform attachment and no alwaysUv policy. ES256 must appear
+when an algorithm list is advertised. Message and ID limits are positive,
+clamped to td's existing bounds, with the specified 1024-byte message default.
+An already configured PIN/UV token may create a non-discoverable credential
+without PIN handling only when a modern version advertises makeCredUvNotRqd.
+The implementation never changes token settings or retries around policy
+refusals. Capabilities are untrusted hints, not identity or consent.
+
+MakeCredential owns its exact client-data hash and requests only ES256 for
+`td.invalid`, with a fresh opaque 32-byte user handle and fixed display text.
+It sets rk=false; the default up=true and uv=false stay implicit, keeping
+unsupported option keys absent. The request includes its command byte in the
+negotiated size limit. Recovery enrollment must exclude the already proved
+primary credential ID on the proposed second token; an oversized exclusion
+refuses the operation rather than silently dropping that protection. Thus the second token must
+support the primary token's actual credential-ID length. Separate primary
+and recovery constructors make a recovery request require an already proved
+Credential; its exclusion cannot be omitted through the public API.
+
+The bounded response parser checks the RP hash, UP and AT flags, AAGUID
+consistency (or an anonymized zero AAGUID for the none format), ID and public-only P-256 COSE key, and complete extension tail.
+Reserved flag bits are ignored for compatibility. Backup-eligible or backed-up
+credentials are refused by this device-bound profile. The attestation statement
+is optional and structurally parsed when present, but not trusted: no attestation CA, manufacturer claim
+or verifier dependency is added. This response produces only an EnrollmentProof
+request with a different fresh client-data hash and the single returned ID.
+Only a successful TPM-verified assertion under that returned key, with signed
+UP and device-bound backup flags, produces a Credential. Request buffers and
+credential ID/key buffers are cleared on drop on a best-effort basis.
+
+The future trusted caller must supply kernel randomness bound to the exact
+secure-attention operation. Merely differing from the MakeCredential hash is
+not a freshness oracle. It must bind the complete public credential bytes,
+logical UID, RP and explicit second-token or unrecoverable policy into the TPM
+metadata digest before atomic publication. A recovery workflow must require
+an operator to use a second token and prove both credentials before publishing.
+The enrollment API does not retain counters or UV observations for a clone
+policy, nor persist unsigned AAGUID hints as identity. Exclusion detects
+reuse of an ordinary authenticator; neither AAGUID nor an
+unsigned capability claim proves that two credentials reside on distinct
+physical hardware. Malicious/cloned authenticators remain outside that claim.
+This increment enables no device I/O, console enrollment, boot release or
+credential write; those consumers must perform the atomic policy cutover.
+
+The profile follows [CTAP 2.3 sections 6.1, 6.2 and 6.4](https://fidoalliance.org/specs/fido-v2.3-ps-20260226/fido-client-to-authenticator-protocol-v2.3-ps-20260226.html).
+Ordinary tests exercise policy refusal, negotiation defaults and limits,
+recovery exclusion, all authenticator-data truncations and substituted fields.
+An explicit pinned-emulator oracle uses the independent public OpenSSL fixture
+to prove that enrollment requires the returned key and fresh proof challenge.
+
 ## TPM binding for enrollment metadata
 
 The safe TPM API offers a `BoundKey` prerequisite for token enrollment.
