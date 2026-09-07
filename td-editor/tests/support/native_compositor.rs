@@ -3,7 +3,13 @@ use std::io::{BufRead, BufReader};
 use std::sync::mpsc;
 
 const FRAME_BYTES: usize = 800 * 600 * 3;
+const KEY_W: u32 = 17;
+const KEY_Y: u32 = 21;
+const KEY_G: u32 = 34;
+const KEY_SPACE: u32 = 57;
+const KEY_HOME: u32 = 102;
 const KEY_RIGHT: u32 = 106;
+const KEY_END: u32 = 107;
 
 struct Compositor {
     child: Child,
@@ -605,6 +611,27 @@ fn native_horizontal_wheel_respects_wrap_and_clamps_columns() {
 #[test]
 #[ignore = "requires explicit built TD_TEST_COMPOSITOR; ready prepares it"]
 fn native_clipboard_transfers_cut_snapshot_between_editors() {
+    clipboard_between_editors("windows");
+}
+
+#[test]
+#[ignore = "requires explicit built TD_TEST_COMPOSITOR; ready prepares it"]
+fn native_emacs_clipboard_transfers_marked_snapshot_between_editors() {
+    clipboard_between_editors("emacs");
+}
+
+fn select_clipboard_text(compositor: &mut Compositor, profile: &str) {
+    if profile == "emacs" {
+        compositor.chord(Some(KEY_LEFT_CTRL), KEY_HOME);
+        compositor.chord(Some(KEY_LEFT_CTRL), KEY_SPACE); // Set mark.
+        compositor.chord(Some(KEY_LEFT_CTRL), KEY_END); // Extend to document end.
+    } else {
+        compositor.chord(Some(KEY_LEFT_CTRL), KEY_A);
+    }
+}
+
+fn clipboard_between_editors(profile: &str) {
+    assert!(matches!(profile, "windows" | "emacs"), "unsupported key profile");
     let compositor_directory = Directory::new();
     let source_directory = Directory::new();
     let destination_directory = Directory::new();
@@ -615,19 +642,29 @@ fn native_clipboard_transfers_cut_snapshot_between_editors() {
     std::fs::write(&source_path, text).unwrap();
     std::fs::write(&source_dictionary, b"clip\nline\nsecond\n").unwrap();
     let display = compositor.directory.join("wayland-0");
-    let mut source = EditorProcess::start(
+    let mut source = EditorProcess::start_with_profile(
         &source_directory,
         &display,
         &source_path,
         &source_dictionary,
+        profile,
     );
-    source.wait_keyboard("windows");
+    source.wait_keyboard(profile);
     let source_window = compositor.window();
     assert_eq!(compositor.request("fullscreen", 1024), b"ok\n");
     source.wait_field("state", "window", "800,576,1");
     source.rendered_at(800, 576);
-    compositor.chord(Some(KEY_LEFT_CTRL), KEY_A);
-    compositor.chord(Some(KEY_LEFT_CTRL), KEY_X);
+    select_clipboard_text(&mut compositor, profile);
+    // CONTROL.md tab: ID, revision, dirty, bytes, anchor, caret,
+    // auto-fill, fill-column, BOM, ending. Keep the full wire oracle literal.
+    source.wait_field(
+        "state",
+        "tab",
+        &format!("1,0,0,{0},0,{0},0,72,0,lf", text.len()),
+    );
+    let cut_key = if profile == "emacs" { KEY_W } else { KEY_X };
+    let paste_key = if profile == "emacs" { KEY_Y } else { KEY_V };
+    compositor.chord(Some(KEY_LEFT_CTRL), cut_key);
     source.wait_tab(1, "");
     let before = compositor.observe(&source_window);
     compositor.chord(None, KEY_B);
@@ -643,13 +680,14 @@ fn native_clipboard_transfers_cut_snapshot_between_editors() {
     let destination_dictionary = destination_directory.0.join("dictionary");
     std::fs::write(&destination_path, b"").unwrap();
     std::fs::write(&destination_dictionary, b"clip\nline\nsecond\n").unwrap();
-    let mut destination = EditorProcess::start(
+    let mut destination = EditorProcess::start_with_profile(
         &destination_directory,
         &display,
         &destination_path,
         &destination_dictionary,
+        profile,
     );
-    destination.wait_keyboard("windows");
+    destination.wait_keyboard(profile);
     destination.wait_field("state", "focus", "1");
     source.wait_field("state", "focus", "0");
     let windows = compositor.windows();
@@ -662,7 +700,7 @@ fn native_clipboard_transfers_cut_snapshot_between_editors() {
     destination.wait_tab(0, ""); // An offer is not an insertion.
     let before_paste = compositor.observe(destination_window);
     assert_ne!(before_paste.client, before.client);
-    compositor.chord(Some(KEY_LEFT_CTRL), KEY_V);
+    compositor.chord(Some(KEY_LEFT_CTRL), paste_key);
     destination.wait_tab(1, text);
     // The ASCII prefix proves transported pixels; full UTF-8 is checked above.
     // The caret is on the final empty line; mask column 4 is outside the crop.
@@ -695,7 +733,7 @@ fn native_clipboard_transfers_cut_snapshot_between_editors() {
         std::thread::sleep(Duration::from_millis(2));
     }
     destination.wait_field("state", "focus", "1");
-    compositor.chord(Some(KEY_LEFT_CTRL), KEY_A);
+    select_clipboard_text(&mut compositor, profile);
     let selected = format!("1,1,0,{0},0,{0},0,72,0,lf", text.len());
     destination.wait_field("state", "tab", &selected);
     let no_offer = td_editor::control::hex(b"Clipboard has no supported UTF-8 text offer.");
@@ -703,19 +741,27 @@ fn native_clipboard_transfers_cut_snapshot_between_editors() {
         field(&destination.ok("prompt-state"), "notice"),
         Some(no_offer.as_str())
     );
-    compositor.chord(Some(KEY_LEFT_CTRL), KEY_V);
+    compositor.chord(Some(KEY_LEFT_CTRL), paste_key);
     // Pin the native refusal, not just unchanged text: stale identical data
     // could replace the selection without visibly changing its bytes.
     destination.wait_field("prompt-state", "notice", &no_offer);
     destination.wait_field("state", "tab", &selected);
     destination.wait_tab(1, text);
     let before_collapse = compositor.observe(destination_window);
-    compositor.chord(None, KEY_RIGHT); // Collapse to the selection end.
+    if profile == "emacs" {
+        compositor.chord(Some(KEY_LEFT_CTRL), KEY_G); // Deactivate and collapse mark.
+        destination.wait_field("prompt-state", "notice", "-");
+    } else {
+        compositor.chord(None, KEY_RIGHT); // Collapse to the selection end.
+    }
     destination.wait_field(
         "state",
         "tab",
         &format!("1,1,0,{0},{0},{0},0,72,0,lf", text.len()),
     );
+    if profile == "windows" {
+        destination.wait_field("prompt-state", "notice", &no_offer);
+    }
     compositor.rendered_text(
         &mut destination,
         destination_window,

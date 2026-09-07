@@ -2251,6 +2251,17 @@ stable error-code API. Unicode glyph pixels and mid-transfer cancellation
 are not covered by this process case. No editor clipboard or decoded-key
 control request supplies the data. This exercises ordinary Wayland
 selection authority, not physical trusted-input authorization.
+
+An Emacs-profile variant runs the same two-editor case. Routed C-Home,
+C-Space and C-End select the complete directed byte range through the
+active mark before C-w cuts it; C-y pastes the immutable UTF-8 snapshot
+into the second Emacs editor. Repeat the marked selection and C-y after
+owner exit to check the same fresh no-offer refusal. C-g then deactivates
+and collapses the mark at its caret, dismisses feedback and preserves
+revision/text/disk bytes. That collapse receives the same publication and
+pixel fence as Right in the Windows case, which retains non-modal
+feedback after motion. These are profile-specific
+input paths to the same ordinary Wayland clipboard, not a kill ring.
 Weston remains separate optional interoperability evidence below.
 
 The opt-in `disposable_weston_runs_the_production_editor_and_control_workers`

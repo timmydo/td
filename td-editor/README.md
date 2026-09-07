@@ -394,6 +394,11 @@ After the source exits, another native Paste must report no offer and
 preserve the selected text, revision and saved bytes. Native Right then
 collapses selection, with another callback/publication/pixel check.
 Unicode glyph pixels and mid-transfer cancellation remain outside this case.
+The Emacs variant selects through C-Space and document motion, cuts with
+C-w and pastes with C-y. After the same owner-exit refusal, C-g collapses
+the mark and dismisses feedback without editing; captured pixels and saved
+bytes are checked in both profiles. Windows Right retains the feedback.
+This does not implement a kill ring.
 Vertical and horizontal wheel cases also test page-bound clamping and
 inward movement after repeated outward reports. Horizontal scrolling is
 checked with Soft Wrap enabled, then disabled through the native menu;
