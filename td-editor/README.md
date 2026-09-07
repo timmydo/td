@@ -389,8 +389,11 @@ exact viewport rows and captured numbered-line pixels, with unchanged text,
 revision, selection, caret and disk bytes. The clipboard case uses two
 editors in one private compositor: native Cut, another source edit, then
 native Paste must transfer the original UTF-8 snapshot with exact saved
-bytes. Distinct client identities and captured ASCII prefixes are checked;
-Unicode glyph pixels and clipboard-owner exit/cancellation are not.
+bytes. Distinct client identities and captured ASCII prefixes are checked.
+After the source exits, another native Paste must report no offer and
+preserve the selected text, revision and saved bytes. Native Right then
+collapses selection, with another callback/publication/pixel check.
+Unicode glyph pixels and mid-transfer cancellation remain outside this case.
 Vertical and horizontal wheel cases also test page-bound clamping and
 inward movement after repeated outward reports. Horizontal scrolling is
 checked with Soft Wrap enabled, then disabled through the native menu;

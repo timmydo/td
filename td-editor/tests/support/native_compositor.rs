@@ -3,6 +3,7 @@ use std::io::{BufRead, BufReader};
 use std::sync::mpsc;
 
 const FRAME_BYTES: usize = 800 * 600 * 3;
+const KEY_RIGHT: u32 = 106;
 
 struct Compositor {
     child: Child,
@@ -676,8 +677,57 @@ fn native_clipboard_transfers_cut_snapshot_between_editors() {
     destination.job("save\t1\t1");
     assert_eq!(std::fs::read(&destination_path).unwrap(), text.as_bytes());
     source.wait_tab(2, "b");
-    destination.quit();
     source.quit();
+    let deadline = Instant::now() + TIMEOUT;
+    loop {
+        let remaining = compositor.windows();
+        assert!(
+            remaining.contains(destination_window),
+            "destination window exited prematurely: {remaining:?}"
+        );
+        if remaining.as_slice() == std::slice::from_ref(destination_window) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "source window still live: {remaining:?}"
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    destination.wait_field("state", "focus", "1");
+    compositor.chord(Some(KEY_LEFT_CTRL), KEY_A);
+    let selected = format!("1,1,0,{0},0,{0},0,72,0,lf", text.len());
+    destination.wait_field("state", "tab", &selected);
+    let no_offer = td_editor::control::hex(b"Clipboard has no supported UTF-8 text offer.");
+    assert_ne!(
+        field(&destination.ok("prompt-state"), "notice"),
+        Some(no_offer.as_str())
+    );
+    compositor.chord(Some(KEY_LEFT_CTRL), KEY_V);
+    // Pin the native refusal, not just unchanged text: stale identical data
+    // could replace the selection without visibly changing its bytes.
+    destination.wait_field("prompt-state", "notice", &no_offer);
+    destination.wait_field("state", "tab", &selected);
+    destination.wait_tab(1, text);
+    let before_collapse = compositor.observe(destination_window);
+    compositor.chord(None, KEY_RIGHT); // Collapse to the selection end.
+    destination.wait_field(
+        "state",
+        "tab",
+        &format!("1,1,0,{0},{0},{0},0,72,0,lf", text.len()),
+    );
+    compositor.rendered_text(
+        &mut destination,
+        destination_window,
+        1,
+        before_collapse,
+        "clip",
+        4,
+    );
+    destination.wait_tab(1, text);
+    assert_eq!(std::fs::read(&destination_path).unwrap(), text.as_bytes());
+    assert_eq!(std::fs::read(&source_path).unwrap(), b"b");
+    destination.quit();
     compositor.stop();
 }
 

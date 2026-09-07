@@ -2240,10 +2240,15 @@ source to `b` must not replace the published snapshot. After the destination
 receives keyboard focus, it stays empty until routed Ctrl+V; Paste must
 insert the complete pre-cut bytes in one revision. Distinct window/client
 identities, source focus loss, unchanged source text, exact saved bytes and
-normal two-editor/compositor teardown are asserted. Source `b` and the
-destination's ASCII `clip` prefix have callback/publication/capture fences;
-Unicode glyph pixels, selection-owner exit and transfer cancellation are
-not covered by this process case. No editor clipboard or decoded-key
+normal two-editor/compositor teardown are asserted. The source then exits;
+after its window disappears, native Select All/Paste in the still-focused
+destination must produce fresh no-offer feedback and preserve the complete
+selection, revision, text and saved bytes. Native Right collapses the
+selection without editing. Source `b` and the destination's ASCII `clip`
+prefix have callback/publication/capture fences, including after that
+collapse. The feedback assertion pins current diagnostic wording, not a
+stable error-code API. Unicode glyph pixels and mid-transfer cancellation
+are not covered by this process case. No editor clipboard or decoded-key
 control request supplies the data. This exercises ordinary Wayland
 selection authority, not physical trusted-input authorization.
 Weston remains separate optional interoperability evidence below.
