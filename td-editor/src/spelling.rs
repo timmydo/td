@@ -306,9 +306,28 @@ struct Tagged<T> {
     value: T,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ScanStatus {
+    NoDictionary,
+    NotChecked,
+    Checking,
+    Complete,
+}
+
+impl ScanStatus {
+    pub(crate) fn code(self) -> &'static str {
+        match self {
+            Self::NoDictionary => "no-dictionary",
+            Self::NotChecked => "not-checked",
+            Self::Checking => "checking",
+            Self::Complete => "complete",
+        }
+    }
+}
+
 pub(crate) struct Snapshot<'a> {
     pub scan: u64,
-    pub status: &'static str,
+    pub status: ScanStatus,
     pub counts: Option<Counts>,
     pub marks: &'a [Range<usize>],
 }
@@ -324,26 +343,26 @@ impl WindowState {
         editor.revision_point(tab, revision)?;
         let mut snapshot = Snapshot {
             scan: 0,
-            status: "no-dictionary",
+            status: ScanStatus::NoDictionary,
             counts: None,
             marks: &[],
         };
         let Some(dictionary) = &self.dictionary else {
             return Ok(snapshot);
         };
-        snapshot.status = "not-checked";
+        snapshot.status = ScanStatus::NotChecked;
         if let Some(scan) = self.scan.as_ref().filter(|scan| {
             scan.value.report.tab() == tab && scan.value.report.validate(editor, dictionary).is_ok()
         }) {
             snapshot.scan = scan.id.get();
-            snapshot.status = "checking";
+            snapshot.status = ScanStatus::Checking;
         } else if let Some(report) = self
             .reports
             .get(&tab)
             .filter(|report| report.value.validate(editor, dictionary).is_ok())
         {
             snapshot.scan = report.id.get();
-            snapshot.status = "complete";
+            snapshot.status = ScanStatus::Complete;
             snapshot.counts = Some(report.value.counts);
             snapshot.marks = &report.value.marks;
         }
@@ -405,11 +424,16 @@ impl WindowState {
         stale || self.reports.len() != before
     }
 
-    pub(crate) fn start(&mut self, editor: &Editor, tab: TabId, revision: u64) -> Result<bool> {
+    pub(crate) fn start(
+        &mut self,
+        editor: &Editor,
+        tab: TabId,
+        revision: u64,
+    ) -> Result<Option<u64>> {
         self.observe(editor);
         editor.revision_point(tab, revision)?;
         let Some(dictionary) = &self.dictionary else {
-            return Ok(false);
+            return Ok(None);
         };
         // Never reuse an ID, even after cancellation or dictionary replacement.
         let next_scan = self.last_scan.checked_add(1).ok_or(Error::Exhausted)?;
@@ -425,7 +449,7 @@ impl WindowState {
         self.reports.remove(&tab);
         self.scan = Some(Tagged { id, value: scan });
         self.last_scan = next_scan;
-        Ok(true)
+        Ok(Some(next_scan))
     }
 
     /// Exactly one chunk, even if a timer or input batch contains many events.
@@ -535,11 +559,11 @@ mod tests {
     fn window_scans_are_explicit_atomic_cancellable_and_revision_bound() {
         let mut ui = document(&format!("{}known wrong", " ".repeat(STEP_SCALARS)));
         let mut state = WindowState::default();
-        assert!(!state.start(ui.editor(), 1, 0).unwrap());
+        assert_eq!(state.start(ui.editor(), 1, 0).unwrap(), None);
         assert!(state.view(ui.editor()).0.contains("no dictionary"));
         state.install(Dictionary::parse(b"known").unwrap());
         assert!(!state.running());
-        assert!(state.start(ui.editor(), 1, 0).unwrap());
+        assert_eq!(state.start(ui.editor(), 1, 0).unwrap(), Some(1));
         assert!(!state.step(ui.editor()).unwrap());
         assert!(state.view(ui.editor()).1.is_empty());
         assert!(state.view(ui.editor()).0.contains("checking"));
@@ -841,7 +865,7 @@ mod tests {
         state.last_scan = u64::MAX; // Checked-counter exhaustion is terminal.
         assert_eq!(state.start(ui.editor(), 1, 0), Err(Error::Exhausted));
         let snapshot = state.snapshot(ui.editor(), 1, 0).unwrap();
-        assert_eq!((snapshot.scan, snapshot.status), (2, "complete"));
+        assert_eq!((snapshot.scan, snapshot.status), (2, ScanStatus::Complete));
         assert_eq!(snapshot.marks.len(), 1);
         assert_eq!(snapshot.marks.first(), Some(&(0..3)));
         state.install(Dictionary::parse(b"known").unwrap());

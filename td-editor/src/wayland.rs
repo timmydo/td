@@ -356,6 +356,7 @@ struct Window {
     replace: Option<crate::replace::Prompt>,
     searches: crate::search::History,
     spelling: crate::spelling::WindowState,
+    control_jobs: crate::control_jobs::Jobs,
     control: Option<crate::control_worker::Worker>,
     frame_waiters: VecDeque<crate::control_worker::Job>,
     control_cleanup_error: Option<String>,
@@ -455,6 +456,7 @@ impl Window {
             replace: None,
             searches: crate::search::History::default(),
             spelling: crate::spelling::WindowState::default(),
+            control_jobs: crate::control_jobs::Jobs::default(),
             control: None,
             frame_waiters: VecDeque::new(),
             control_cleanup_error: None,
@@ -553,6 +555,7 @@ impl Window {
         self.searches.observe(self.ui.editor());
         self.frames
             .invalidate(self.spelling.observe(self.ui.editor()));
+        self.observe_control_jobs();
         result
     }
 
@@ -1274,7 +1277,8 @@ impl Window {
         let revision = self.ui.editor().document(tab).map_err(error)?.revision();
         if chord == "F7" {
             if !repeated {
-                self.spelling_request(tab, revision);
+                // The shared action already renders startup feedback.
+                let _ = self.spelling_request(tab, revision);
             }
             return Ok(false);
         }
@@ -1459,6 +1463,7 @@ impl Window {
         if self.spelling.running() {
             self.connection.wait = self.connection.wait.min(Duration::from_millis(1));
         }
+        self.observe_control_jobs();
         self.control_tick();
         self.frames.generation().map_err(error)?;
         Ok(())
@@ -1546,6 +1551,36 @@ impl Window {
             }
             .response();
         }
+        if request.is_mutating() && (self.closed || self.pointer_modal() || self.menu.is_some()) {
+            return crate::control::Refusal {
+                id: request.id,
+                error: crate::Error::Unavailable,
+            }
+            .response();
+        }
+        if let crate::control::Operation::CheckSpelling { tab, revision } = request.operation {
+            let result = (|| -> crate::Result<u64> {
+                self.ui.editor().revision_point(tab, revision)?;
+                if self.ui.editor().active() != Some(tab) {
+                    return Err(crate::Error::InvalidArgument);
+                }
+                let id = self.control_jobs.begin(tab, revision)?;
+                let started = self.spelling_request(tab, revision);
+                // No intervening admission: this fresh pending row cannot be evicted.
+                self.control_jobs.started(id, started)?;
+                self.observe_control_jobs();
+                self.frames.invalidate(true);
+                Ok(id)
+            })();
+            return match result {
+                Ok(id) => format!("1\t{}\tpending\t{id}", request.id),
+                Err(error) => crate::control::Refusal {
+                    id: request.id,
+                    error,
+                }
+                .response(),
+            };
+        }
         if let crate::control::Operation::WaitFrame(target) = request.operation {
             return match self.frames.wait(target) {
                 Ok(Some(stamp)) => format!("1\t{}\tok\t{}", request.id, stamp.fields()),
@@ -1569,13 +1604,6 @@ impl Window {
             return request.spelling_response(&self.ui, &self.spelling);
         }
         if request.is_edit() {
-            if self.closed || self.pointer_modal() || self.menu.is_some() {
-                return crate::control::Refusal {
-                    id: request.id,
-                    error: crate::Error::Unavailable,
-                }
-                .response();
-            }
             let result = request.execute(&mut self.ui);
             return match result {
                 Ok(()) => {
@@ -1588,6 +1616,7 @@ impl Window {
                     self.clipboard.incoming_target = None;
                     self.searches.observe(self.ui.editor());
                     self.spelling.observe(self.ui.editor());
+                    self.observe_control_jobs();
                     self.frames.invalidate(true);
                     format!("1\t{}\tok\t", request.id)
                 }
@@ -1613,7 +1642,7 @@ impl Window {
             let flag = u8::from;
             response.push_str(&format!(
                 concat!(
-                    "\tadapter=native-frame\tnative={},{},{},{}",
+                    "\tadapter=native-jobs\tnative={},{},{},{}",
                     "\tmodal={},{},{},{},{},{},{},{},{}\tspelling={},{}",
                 ),
                 flag(self.configured),
@@ -1634,6 +1663,8 @@ impl Window {
                     .map_or_else(|| "-".into(), |n| n.to_string()),
                 flag(self.spelling.running()),
             ));
+            response.push('\t');
+            response.push_str(&self.control_jobs.fields()?);
             response.push('\t');
             response.push_str(&self.frames.fields()?);
         }
@@ -2126,7 +2157,8 @@ impl Window {
                 return Ok(());
             }
             Item::Spell => {
-                self.spelling_request(tab, revision);
+                // The shared action already renders startup feedback.
+                let _ = self.spelling_request(tab, revision);
                 return Ok(());
             }
             Item::Dictionary => {
@@ -2480,7 +2512,11 @@ impl Window {
         Some(format!("{readiness}{closing}{}", prompt.notice()))
     }
 
-    fn spelling_request(&mut self, tab: crate::model::TabId, revision: u64) {
+    fn spelling_request(
+        &mut self,
+        tab: crate::model::TabId,
+        revision: u64,
+    ) -> crate::Result<Option<u64>> {
         self.menu = None;
         self.stop_pointer();
         self.input.cancel_repeat();
@@ -2488,18 +2524,26 @@ impl Window {
         self.searches.cancel_wrap();
         if let Err(detail) = self.ui.dispatch(Event::CancelInput) {
             self.notify(format!("Spelling request refused: {detail}"));
-            return;
+            return Err(detail);
         }
         self.frames.invalidate(true);
-        match self.spelling.start(self.ui.editor(), tab, revision) {
-            Ok(true) => self.notice = None,
-            Ok(false) => self.notify(if self.files.is_some() {
+        let result = self.spelling.start(self.ui.editor(), tab, revision);
+        match result {
+            Ok(Some(_)) => self.notice = None,
+            Ok(None) => self.notify(if self.files.is_some() {
                 "Spelling: no dictionary. Use Format > Dictionary to load a local English word list."
             } else {
                 "Spelling: no dictionary. Scratch preview cannot load dictionaries; use --window."
             }),
             Err(detail) => self.notify(format!("Spelling request refused: {detail}")),
         }
+        self.observe_control_jobs();
+        result
+    }
+
+    fn observe_control_jobs(&mut self) {
+        self.frames
+            .invalidate(self.control_jobs.observe(self.ui.editor(), &self.spelling));
     }
 
     fn spelling_selection(&mut self, previous: bool) -> Result<()> {
@@ -5179,7 +5223,7 @@ mod tests {
         assert_eq!(
             response,
             format!(
-                "{before}\tadapter=native-frame\tnative=0,1,0,0\tmodal=0,0,0,0,0,0,0,0,0\tspelling=-,0\twindow-generation={generation}\tframe-submitted=-\tframe-completed=-"
+                "{before}\tadapter=native-jobs\tnative=0,1,0,0\tmodal=0,0,0,0,0,0,0,0,0\tspelling=-,0\tjob-last=0\twindow-generation={generation}\tframe-submitted=-\tframe-completed=-"
             )
         );
         assert_eq!(query.response(&w.ui), before);
@@ -5235,13 +5279,26 @@ mod tests {
     }
 
     fn control_answer(w: &mut Window, client: &mut UnixStream, peer: &UnixStream) -> String {
+        control_answer_pump(w, client, peer, true)
+    }
+
+    fn control_answer_pump(
+        w: &mut Window,
+        client: &mut UnixStream,
+        peer: &UnixStream,
+        advance_turn: bool,
+    ) -> String {
         drain(peer);
         let deadline = Instant::now() + Duration::from_secs(3);
         let mut decoder = crate::control::Decoder::default();
         let mut bytes = [0; 4096];
         loop {
             assert!(Instant::now() < deadline, "native control response timeout");
-            w.end_turn(w.clock, false).unwrap();
+            if advance_turn {
+                w.end_turn(w.clock, false).unwrap();
+            } else {
+                w.control_tick();
+            }
             match client.read(&mut bytes) {
                 Ok(0) => return String::from_utf8(decoder.finish().unwrap()).unwrap(),
                 Ok(count) => decoder.push(&bytes[..count]).unwrap(),
@@ -5251,6 +5308,178 @@ mod tests {
                 Err(error) => panic!("native control read: {error}"),
             }
         }
+    }
+
+    fn job_request(
+        w: &mut Window,
+        peer: &UnixStream,
+        path: &std::path::Path,
+        payload: &str,
+    ) -> String {
+        let mut client = control_client(path, payload.as_bytes());
+        control_answer_pump(w, &mut client, peer, false) // Explicitly withhold background steps.
+    }
+
+    #[test]
+    fn native_spelling_job_socket_refusals_preserve_modal_and_capacity_state() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = DialogDirectory::new();
+        std::fs::set_permissions(&directory.0, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let path = directory.path("control");
+        let (mut w, peer) = file_dialog_fixture();
+        w.control = Some(
+            crate::control_worker::Worker::start(
+                crate::control_socket::Socket::bind(&path).unwrap(),
+            )
+            .unwrap(),
+        );
+        w.chord("C-f", false).unwrap();
+        let before = job_request(&mut w, &peer, &path, "1\t0\tstate");
+        assert!(
+            job_request(&mut w, &peer, &path, "1\t1\tcheck-spelling\t99\t99")
+                .contains("\terror\tunavailable\t")
+        );
+        assert_eq!(job_request(&mut w, &peer, &path, "1\t0\tstate"), before);
+        w.chord("Escape", false).unwrap();
+        w.spelling
+            .install(crate::spelling::Dictionary::parse(b"known").unwrap());
+        let scan = w.spelling.start(w.ui.editor(), 1, 0).unwrap();
+        // Synthetic registry saturation: native one-scan use cannot fill it with pending rows.
+        for _ in 0..64 {
+            let id = w.control_jobs.begin(1, 0).unwrap();
+            w.control_jobs.started(id, Ok(scan)).unwrap();
+        }
+        let before = job_request(&mut w, &peer, &path, "1\t0\tstate");
+        assert!(
+            job_request(&mut w, &peer, &path, "1\t2\tcheck-spelling\t1\t0")
+                .contains("\terror\tlimit\t")
+        );
+        assert_eq!(job_request(&mut w, &peer, &path, "1\t0\tstate"), before);
+        w.stop_control();
+    }
+
+    #[test]
+    fn native_spelling_jobs_report_admission_completion_cancellation_and_history() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = DialogDirectory::new();
+        std::fs::set_permissions(&directory.0, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let path = directory.path("control");
+        let (mut w, peer) = file_dialog_fixture();
+        let text = "known bad ".repeat(2048);
+        w.ui.dispatch(Event::Load(text.as_bytes())).unwrap();
+        w.ui.dispatch(Event::Profile(Profile::Emacs)).unwrap();
+        w.chord("C-x", false).unwrap();
+        w.control = Some(
+            crate::control_worker::Worker::start(
+                crate::control_socket::Socket::bind(&path).unwrap(),
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            job_request(&mut w, &peer, &path, "1\t1\tcheck-spelling\t2\t0"),
+            "1\t1\tpending\t1"
+        );
+        let state = job_request(&mut w, &peer, &path, "1\t0\tstate");
+        assert!(state.contains("job=1,spelling,2,0,0,error,unavailable"));
+        assert!(state.contains("\tprefix=0\t"));
+        assert_eq!(w.ui.editor().document(2).unwrap().text(), text);
+        assert!(w.notice.as_ref().unwrap().contains("no dictionary"));
+        w.spelling
+            .install(crate::spelling::Dictionary::parse(b"known").unwrap());
+        assert_eq!(
+            job_request(&mut w, &peer, &path, "1\t2\tcheck-spelling\t2\t0"),
+            "1\t2\tpending\t2"
+        );
+        let state = job_request(&mut w, &peer, &path, "1\t0\tstate");
+        assert!(state.contains("job=2,spelling,2,0,1,pending,-"));
+        assert_eq!(
+            job_request(
+                &mut w,
+                &peer,
+                &path,
+                "1\t3\tspelling-results\t2\t0\t1\t0\t2"
+            ),
+            "1\t3\tok\t2\t0\t1\tchecking\t0\t0\t-\t-\t-\t-\t-"
+        );
+        w.event(message(WM, 0, &[77])).unwrap();
+        assert!(drain(&peer).0.contains(&message(WM, 3, &[77])));
+        w.chord("F7", false).unwrap(); // An ordinary recheck cancels the old remote job.
+        assert!(job_request(&mut w, &peer, &path, "1\t0\tstate")
+            .contains("job=2,spelling,2,0,1,cancelled,-"));
+        assert_eq!(
+            job_request(&mut w, &peer, &path, "1\t4\tcheck-spelling\t2\t0"),
+            "1\t4\tpending\t3"
+        );
+        w.chord("Escape", false).unwrap();
+        w.end_turn(w.clock, false).unwrap();
+        assert!(job_request(&mut w, &peer, &path, "1\t0\tstate")
+            .contains("job=3,spelling,2,0,3,cancelled,-"));
+        assert_eq!(
+            job_request(&mut w, &peer, &path, "1\t5\tcheck-spelling\t2\t0"),
+            "1\t5\tpending\t4"
+        );
+        assert_eq!(
+            job_request(&mut w, &peer, &path, "1\t6\tinsert\t2\t0\t0\t0\t62"),
+            "1\t6\tok\t"
+        );
+        assert!(job_request(&mut w, &peer, &path, "1\t0\tstate")
+            .contains("job=4,spelling,2,0,4,error,stale-revision"));
+        assert_eq!(
+            job_request(&mut w, &peer, &path, "1\t7\tcheck-spelling\t2\t1"),
+            "1\t7\tpending\t5"
+        );
+        for _ in 0..32 {
+            if !w.spelling.running() {
+                break;
+            }
+            w.end_turn(w.clock, false).unwrap();
+        }
+        assert!(!w.spelling.running());
+        assert!(job_request(&mut w, &peer, &path, "1\t0\tstate")
+            .contains("job=5,spelling,2,1,5,complete,-"));
+        assert!(job_request(
+            &mut w,
+            &peer,
+            &path,
+            "1\t8\tspelling-results\t2\t1\t5\t0\t2"
+        )
+        .contains("\t5\tcomplete\t2\t2049\t4096\t2049\t0\t0\t"));
+        assert_eq!(
+            job_request(&mut w, &peer, &path, "1\t9\tundo\t2\t1"),
+            "1\t9\tok\t"
+        );
+        assert!(job_request(&mut w, &peer, &path, "1\t0\tstate")
+            .contains("job=5,spelling,2,1,5,complete,-"));
+        assert_eq!(
+            job_request(&mut w, &peer, &path, "1\t10\tcheck-spelling\t2\t2"),
+            "1\t10\tpending\t6"
+        );
+        w.spelling
+            .install(crate::spelling::Dictionary::parse(b"bad").unwrap());
+        w.end_turn(w.clock, false).unwrap();
+        assert!(job_request(&mut w, &peer, &path, "1\t0\tstate")
+            .contains("job=6,spelling,2,2,6,cancelled,-"));
+        let before = job_request(&mut w, &peer, &path, "1\t0\tstate");
+        for (command, code) in [
+            ("check-spelling\t1\t0", "invalid-argument"),
+            ("check-spelling\t2\t0", "stale-revision"),
+            ("check-spelling\t99\t0", "missing-tab"),
+        ] {
+            assert!(
+                job_request(&mut w, &peer, &path, &format!("1\t11\t{command}"))
+                    .contains(&format!("\terror\t{code}\t"))
+            );
+            assert_eq!(job_request(&mut w, &peer, &path, "1\t0\tstate"), before);
+        }
+        w.chord("C-x", false).unwrap();
+        w.control_jobs.exhaust_for_test();
+        let before = job_request(&mut w, &peer, &path, "1\t0\tstate");
+        assert!(
+            job_request(&mut w, &peer, &path, "1\t12\tcheck-spelling\t2\t2")
+                .contains("\terror\texhausted\t")
+        );
+        assert_eq!(job_request(&mut w, &peer, &path, "1\t0\tstate"), before);
+        w.stop_control();
     }
 
     #[test]
@@ -5449,6 +5678,7 @@ mod tests {
                 "set-key-profile\t1\t1\temacs",
                 "find\t1\t1\t1\t1\t61\t0\t1",
                 "replace\t1\t1\t61\t62",
+                "check-spelling\t1\t1",
             ] {
                 let request =
                     crate::control::Request::parse(format!("1\t1\t{command}").as_bytes()).unwrap();
@@ -5476,13 +5706,16 @@ mod tests {
         let revision = w.ui.editor().document(tab).unwrap().revision();
         let state = crate::control::Request::parse(b"1\t0\tstate").unwrap();
         let before = w.control_response(&state);
-        let request =
-            crate::control::Request::parse(format!("1\t1\tundo\t{tab}\t{revision}").as_bytes())
-                .unwrap();
-        assert!(w
-            .control_response(&request)
-            .contains("\terror\tunavailable\t"));
-        assert_eq!(w.control_response(&state), before);
+        for command in ["undo", "check-spelling"] {
+            let request = crate::control::Request::parse(
+                format!("1\t1\t{command}\t{tab}\t{revision}").as_bytes(),
+            )
+            .unwrap();
+            assert!(w
+                .control_response(&request)
+                .contains("\terror\tunavailable\t"));
+            assert_eq!(w.control_response(&state), before);
+        }
         assert!(w.quitting && !w.closed);
     }
 
@@ -6182,7 +6415,7 @@ mod tests {
             assert!(drain(&peer).0.contains(&message(WM, 3, &[100 + id as u32])));
             let response = control_answer(&mut w, client, &peer);
             assert!(response.starts_with(&format!("1\t{id}\tok\t")));
-            assert!(response.contains("\tadapter=native-frame\t"));
+            assert!(response.contains("\tadapter=native-jobs\t"));
         }
         assert_eq!(w.ui.editor().tabs().count(), 1);
         assert_eq!(w.ui.editor().document(1).unwrap().text(), "");

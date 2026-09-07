@@ -7,6 +7,7 @@ pub mod clipboard;
 mod command;
 pub mod control;
 mod control_frame;
+mod control_jobs;
 pub mod control_socket;
 pub mod control_worker;
 mod data;

@@ -22,6 +22,7 @@ fn source_inventory_and_allowances_are_closed() {
         "command.rs",
         "control.rs",
         "control_frame.rs",
+        "control_jobs.rs",
         "control_socket.rs",
         "control_worker.rs",
         "data.rs",
@@ -347,6 +348,14 @@ fn native_control_is_opt_in_and_liveness_checked_with_bounded_outer_turns() {
     let end_turn = production.split("fn end_turn(").nth(1).unwrap();
     let end_turn = end_turn.split("\n    fn ").next().unwrap();
     assert!(end_turn.contains("self.control_tick();"));
+    assert!(
+        end_turn.find("self.spelling.step(").unwrap()
+            < end_turn.find("self.observe_control_jobs();").unwrap()
+    );
+    assert!(
+        end_turn.find("self.observe_control_jobs();").unwrap()
+            < end_turn.find("self.control_tick();").unwrap()
+    );
     assert!(end_turn.contains("self.frames.generation().map_err(error)?"));
     let poll = production.split("fn control_tick(").nth(1).unwrap();
     let poll = poll.split("\n    fn ").next().unwrap();
@@ -387,7 +396,7 @@ fn native_control_is_opt_in_and_liveness_checked_with_bounded_outer_turns() {
     let dispatch = dispatch.split("\n    fn ").next().unwrap();
     assert!(
         dispatch.find("self.frames.generation()").unwrap()
-            < dispatch.find("request.is_edit()").unwrap()
+            < dispatch.find("request.is_mutating()").unwrap()
     );
     assert!(dispatch.contains("self.closed || self.pointer_modal() || self.menu.is_some()"));
     assert!(dispatch.contains("request.execute(&mut self.ui)"));

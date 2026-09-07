@@ -1,0 +1,284 @@
+//! Bounded remote job outcomes. No text, filesystem, clocks or transport.
+
+use crate::model::{Editor, TabId};
+use crate::spelling::{ScanStatus, WindowState};
+use crate::{Error, Result};
+use std::collections::VecDeque;
+use std::fmt::Write;
+
+const RECORDS: usize = 64;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Status {
+    Pending,
+    Complete,
+    Cancelled,
+    Failed(Error),
+}
+
+#[derive(Clone, Copy, Debug)]
+struct Record {
+    id: u64,
+    tab: TabId,
+    revision: u64,
+    scan: Option<u64>,
+    status: Status,
+}
+
+pub(crate) struct Jobs {
+    last: u64,
+    records: VecDeque<Record>,
+}
+
+impl Default for Jobs {
+    fn default() -> Self {
+        Self {
+            last: 0,
+            records: VecDeque::with_capacity(RECORDS),
+        }
+    }
+}
+
+impl Jobs {
+    /// Reserve before invoking the shared action. Failure cannot evict history.
+    pub(crate) fn begin(&mut self, tab: TabId, revision: u64) -> Result<u64> {
+        let id = self.last.checked_add(1).ok_or(Error::Exhausted)?;
+        if self.records.len() == RECORDS {
+            let terminal = self
+                .records
+                .iter()
+                .position(|job| job.status != Status::Pending)
+                .ok_or(Error::Limit)?;
+            self.records.remove(terminal).ok_or(Error::Protocol)?;
+        }
+        self.records.push_back(Record {
+            id,
+            tab,
+            revision,
+            scan: None,
+            status: Status::Pending,
+        });
+        self.last = id;
+        Ok(id)
+    }
+
+    pub(crate) fn started(&mut self, id: u64, result: Result<Option<u64>>) -> Result<()> {
+        let record = self
+            .records
+            .iter_mut()
+            .find(|record| record.id == id)
+            .ok_or(Error::InvalidArgument)?;
+        if record.status != Status::Pending || record.scan.is_some() {
+            return Err(Error::InvalidArgument);
+        }
+        match result {
+            Ok(Some(0)) => record.status = Status::Failed(Error::Protocol),
+            Ok(Some(scan)) => record.scan = Some(scan),
+            Ok(None) => record.status = Status::Failed(Error::Unavailable),
+            Err(error) => record.status = Status::Failed(error),
+        }
+        Ok(())
+    }
+
+    /// Terminal outcomes are historical facts, not promises of current marks.
+    pub(crate) fn observe(&mut self, editor: &Editor, spelling: &WindowState) -> bool {
+        let mut changed = false;
+        for record in &mut self.records {
+            if record.status != Status::Pending {
+                continue;
+            }
+            let Some(scan) = record.scan else {
+                continue;
+            };
+            let status = match spelling.snapshot(editor, record.tab, record.revision) {
+                Ok(snapshot) if snapshot.scan != scan => Status::Cancelled,
+                Ok(snapshot) => match snapshot.status {
+                    ScanStatus::Checking => Status::Pending,
+                    ScanStatus::Complete => Status::Complete,
+                    ScanStatus::NoDictionary | ScanStatus::NotChecked => Status::Cancelled,
+                },
+                Err(error) => Status::Failed(error),
+            };
+            changed |= record.status != status;
+            record.status = status;
+        }
+        changed
+    }
+
+    pub(crate) fn fields(&self) -> Result<String> {
+        let mut fields = format!("job-last={}", self.last);
+        fields.reserve(self.records.len() * 128);
+        for record in &self.records {
+            let (status, error) = match record.status {
+                Status::Pending => ("pending", "-"),
+                Status::Complete => ("complete", "-"),
+                Status::Cancelled => ("cancelled", "-"),
+                Status::Failed(error) => ("error", error.code()),
+            };
+            write!(
+                fields,
+                "\tjob={},spelling,{},{},{},{status},{error}",
+                record.id,
+                record.tab,
+                record.revision,
+                record.scan.unwrap_or(0)
+            )
+            .map_err(|_| Error::Protocol)?;
+        }
+        Ok(fields)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn exhaust_for_test(&mut self) {
+        self.last = u64::MAX;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{Command, Selection};
+    use crate::spelling::Dictionary;
+    use crate::ui::{Controller, Event};
+
+    #[test]
+    fn job_outcomes_distinguish_complete_cancelled_stale_and_start_failure() {
+        let mut ui = Controller::default();
+        ui.dispatch(Event::Load(b"bad")).unwrap();
+        let mut spelling = WindowState::default();
+        spelling.install(Dictionary::parse(b"known").unwrap());
+        let mut jobs = Jobs::default();
+        let first = jobs.begin(1, 0).unwrap();
+        jobs.started(first, spelling.start(ui.editor(), 1, 0))
+            .unwrap();
+        assert!(jobs
+            .fields()
+            .unwrap()
+            .contains("job=1,spelling,1,0,1,pending,-"));
+        spelling.step(ui.editor()).unwrap();
+        assert!(jobs.observe(ui.editor(), &spelling));
+        assert!(jobs
+            .fields()
+            .unwrap()
+            .contains("job=1,spelling,1,0,1,complete,-"));
+        let second = jobs.begin(1, 0).unwrap();
+        jobs.started(second, spelling.start(ui.editor(), 1, 0))
+            .unwrap();
+        spelling.cancel();
+        assert!(jobs.observe(ui.editor(), &spelling));
+        assert!(jobs
+            .fields()
+            .unwrap()
+            .contains("job=2,spelling,1,0,2,cancelled,-"));
+        let third = jobs.begin(1, 0).unwrap();
+        jobs.started(third, spelling.start(ui.editor(), 1, 0))
+            .unwrap();
+        ui.dispatch(Event::Edit {
+            tab: 1,
+            revision: 0,
+            command: Command::Insert("x".into()),
+        })
+        .unwrap();
+        assert!(jobs.observe(ui.editor(), &spelling));
+        assert!(jobs
+            .fields()
+            .unwrap()
+            .contains("job=3,spelling,1,0,3,error,stale-revision"));
+        assert!(jobs
+            .fields()
+            .unwrap()
+            .contains("job=1,spelling,1,0,1,complete,-"));
+        let fourth = jobs.begin(1, 1).unwrap();
+        jobs.started(fourth, Ok(None)).unwrap();
+        assert!(jobs
+            .fields()
+            .unwrap()
+            .contains("job=4,spelling,1,1,0,error,unavailable"));
+        assert!(!jobs.observe(ui.editor(), &spelling));
+        assert_eq!(
+            jobs.started(fourth, Ok(Some(4))),
+            Err(Error::InvalidArgument)
+        );
+        ui.dispatch(Event::Edit {
+            tab: 1,
+            revision: 1,
+            command: Command::Select(Selection {
+                anchor: 0,
+                caret: 0,
+            }),
+        })
+        .unwrap();
+        assert!(!jobs.observe(ui.editor(), &spelling));
+    }
+
+    #[test]
+    fn closing_a_pending_target_records_missing_tab() {
+        let mut editor = Editor::default();
+        let tab = editor.load_bytes(b"bad").unwrap();
+        let mut spelling = WindowState::default();
+        spelling.install(Dictionary::parse(b"known").unwrap());
+        let mut jobs = Jobs::default();
+        let id = jobs.begin(tab, 0).unwrap();
+        jobs.started(id, spelling.start(&editor, tab, 0)).unwrap();
+        editor.close_tab(tab, 0).unwrap();
+        assert!(jobs.observe(&editor, &spelling));
+        assert!(jobs
+            .fields()
+            .unwrap()
+            .contains("job=1,spelling,1,0,1,error,missing-tab"));
+    }
+
+    #[test]
+    fn bounded_history_preserves_pending_jobs_and_exhaustion_cannot_evict() {
+        let mut jobs = Jobs::default();
+        assert_eq!(jobs.fields().unwrap(), "job-last=0");
+        let held = jobs.begin(1, 0).unwrap();
+        jobs.started(held, Ok(Some(1))).unwrap();
+        for _ in 1..RECORDS {
+            let id = jobs.begin(2, 0).unwrap();
+            jobs.started(id, Err(Error::Limit)).unwrap();
+        }
+        let next = jobs.begin(3, 0).unwrap();
+        assert_eq!(next, 65);
+        let fields = jobs.fields().unwrap();
+        assert_eq!(fields.matches("\tjob=").count(), 64);
+        assert!(fields.contains("job=1,spelling,"));
+        assert!(!fields.contains("job=2,spelling,"));
+        assert!(fields.contains("job=65,spelling,"));
+        jobs.exhaust_for_test();
+        let before = jobs.fields().unwrap();
+        assert_eq!(jobs.begin(4, 0), Err(Error::Exhausted));
+        assert_eq!(jobs.fields().unwrap(), before);
+        let mut pending = Jobs::default();
+        for _ in 0..RECORDS {
+            pending.begin(1, 0).unwrap();
+        }
+        let before = pending.fields().unwrap();
+        assert_eq!(pending.begin(1, 0), Err(Error::Limit));
+        assert_eq!(pending.fields().unwrap(), before);
+
+        let mut middle = Jobs::default();
+        for _ in 0..RECORDS {
+            let id = middle.begin(1, 0).unwrap();
+            middle
+                .started(
+                    id,
+                    if id == 32 {
+                        Ok(Some(1))
+                    } else {
+                        Err(Error::Limit)
+                    },
+                )
+                .unwrap();
+        }
+        for _ in 0..32 {
+            let id = middle.begin(1, 0).unwrap();
+            middle.started(id, Err(Error::Limit)).unwrap();
+        }
+        let fields = middle.fields().unwrap();
+        assert!(fields.contains("job=32,spelling,1,0,1,pending,-"));
+        assert!(!fields.contains("job=31,spelling,"));
+        assert!(!fields.contains("job=33,spelling,"));
+        assert_eq!(fields.matches("\tjob=").count(), 64);
+    }
+}

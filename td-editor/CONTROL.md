@@ -2,9 +2,10 @@
 
 The experimental `--window --control-socket PATH` endpoint implements the
 query and revision-checked editing subset below. It is off by default;
-scratch preview and replay do not accept the option. Remote file operations,
-dialog answers and Check Spelling admission remain unimplemented. The complete
-version-1 target is specified in
+scratch preview and replay do not accept the option. Remote file operations
+and dialog answers remain unimplemented. Remote Check Spelling admission and
+bounded job outcomes are implemented below. The complete version-1 target is
+specified in
 [DESIGN.md](DESIGN.md#test-and-control-architecture).
 
 `control` has no listener, thread, filesystem access, clock or Wayland access.
@@ -61,6 +62,7 @@ In the examples below, field spaces denote literal Tab separators.
 | `1 ID text TAB REVISION OFFSET LIMIT` | Read a scalar-aligned UTF-8 page. |
 | `1 ID spelling-results TAB REVISION SCAN OFFSET LIMIT` | Read native spelling status and a scan-pinned range page. |
 | `1 ID wait-frame GENERATION` | Wait for a main-surface callback at or beyond this native redraw generation. |
+| `1 ID check-spelling TAB REVISION` | Admit an on-demand whole-document spelling job for the active tab. |
 
 The editing subset is specified below. `new`, `load`, file I/O,
 physical-input simulation and dialog answers remain refused; this parser is
@@ -248,8 +250,8 @@ its expected text revision and a scan ID. `SCAN=0` discovers the current
 status/ID and requires `OFFSET=0`. Later pages must pin the returned nonzero
 scan ID as well as the revision. `OFFSET` is a zero-based range index, not a
 document byte offset. `LIMIT` is 1..=256 ranges. Queries never start a scan,
-load a dictionary, advance scanning or publish partial marks. Use the ordinary
-F7 action to check; remote `check-spelling` is not yet implemented.
+load a dictionary, advance scanning or publish partial marks. Use ordinary
+F7 or remote `check-spelling` to admit a scan.
 
 Success is `1 ID ok TAB REVISION SCAN STATUS NEXT TOTAL CHECKED UNKNOWN
 SKIPPED CAPPED` followed by one or more range fields. All separators,
@@ -286,6 +288,66 @@ UI thread without changing selection, generation, notices, modals or history;
 queries remain available during modals. Existing whole-request transport
 bounds apply. Each page is below 16 KiB under the document/range ceilings,
 and serialization neither copies the whole document nor clones its marks.
+
+## Spelling job admission and outcomes
+
+`check-spelling` is native-only and uses the same action as F7. It takes a
+stable active tab and expected text revision, not an expected selection.
+Native closed/quitting/modal guards run first, then missing-tab, revision
+and active-tab checks. Refusals use the same codes as editing and do not
+allocate a job, change UI state or evict history. Job-counter exhaustion is
+`exhausted`; a full history with no terminal record to evict is `limit`.
+The latter is a defensive registry bound, not a normally reachable wire
+outcome under the current one-scan policy.
+Neither refuses ordinary F7 or poisons the window's frame counter.
+
+Admission returns `1 ID pending JOB`, with a new nonzero window-local `u64`
+job ID. This ID is distinct from the caller's request ID, spelling scan ID,
+tab/revision and frame generation. It never wraps or resets in that window.
+`pending` acknowledges the job, not that it is still running when received:
+startup can already have completed with an error. Accepted admission invokes
+the ordinary F7 input/Paste/repeat/drag/wrap cancellation and visible feedback,
+even if no dictionary is loaded. Unlike remote text editing, ordinary F7
+silently cancels an incoming Paste and clears an existing notice on
+successful scan startup; remote Check Spelling intentionally does the same.
+No dictionary produces a terminal
+`error,unavailable` job with scan zero and the usual visible dictionary
+notice. Other startup errors retain their stable code. These are accepted
+job outcomes, not side-effect-free admission refusals.
+
+The job uses the current explicitly loaded local dictionary. It does not
+open a file, select a dictionary, download data, change text/revision/history,
+or start interactive checking. One bounded spelling step runs per ordinary
+outer turn; no partial marks/counts appear. A recheck replaces the existing
+scan just like F7. Socket I/O stays on the transport worker. The transport's
+five-second deadline and liveness checks govern admission/reply, not the
+accepted background job's lifetime. Disconnect after admission cannot undo
+or cancel the job; a lost reply is ambiguous and must not be blindly retried.
+
+Native state adds `job-last=N`, the largest admitted ID (zero initially),
+followed by zero or more `job=JOB,spelling,TAB,REVISION,SCAN,STATUS,CODE` fields
+in increasing job-ID order. Scan zero means startup produced no scan. Status
+is `pending`, `complete`, `cancelled`, or `error`; code is `-` except for a
+stable error code with `error`. Pending/complete rows name the real nonzero
+scan ID, which can be passed to `spelling-results` with that tab/revision.
+A matching completed report completes the job. While pending, changed text
+is `error,stale-revision` and a closed tab is `error,missing-tab`; explicit
+scan cancellation, recheck or dictionary replacement is `cancelled`.
+Cancellation does not restart work. A low-level scan failure that removes
+the scan is also observed as `cancelled`; its native notice remains the
+more specific diagnostic.
+
+Terminal rows are historical outcomes. Later edits, Undo, tab closure or
+dictionary replacement do not rewrite them or promise their marks still
+exist. `spelling-results` independently validates the current report.
+At most 64 job rows may be retained. Admission at capacity evicts the oldest
+terminal row, never pending work; no wall-clock expiry or text payload is
+stored. A requested ID at or below `job-last` absent from the rows has been
+evicted: its outcome is unknown, not failed or never run. No eviction occurs
+on a refused admission. The window's one-scan policy ordinarily leaves at
+most one pending spelling job. Observation runs after native events, after
+the outer-turn spelling step and after accepted remote actions; state
+serialization itself only borrows validated job records.
 
 ## Frame acknowledgement
 
@@ -361,7 +423,8 @@ There are at most 64 tab/view pairs. No text bytes, file path, title, dictionary
 pending dialog/job or spelling range is serialized by this controller-only
 snapshot. Its generation means local UI state, **not** a submitted buffer,
 frame callback or scanout. The native extension below adds its own redraw
-generations/snapshots and coarse flags. File/dialog job identities remain
+generations/snapshots, coarse flags and bounded spelling-job outcomes.
+File/dialog job identities remain
 later work before claiming complete remote control.
 
 ## Experimental native adapter
@@ -406,17 +469,20 @@ this order. Error responses are unchanged:
 
 | Field | Value |
 | --- | --- |
-| `adapter=native-frame` | Explicit implemented adapter identity. |
+| `adapter=native-jobs` | Explicit implemented adapter identity. |
 | `native=...` | Configured, file session present, file job busy, quitting. |
 | `modal=...` | Path entry, close question, conflict question, pending Reload, menu, Find, numeric entry, command entry, Replace. |
 | `spelling=...` | Selected dictionary entry count or `-`, scan running. |
+| `job-last=N` | Largest admitted remote background-job ID, or zero. |
+| `job=...` (repeated) | Up to 64 ordered spelling-job rows under the contract above. |
 | `window-generation=N` | Current native redraw-invalidation generation. |
 | `frame-submitted=...` | Last submitted snapshot, or `-`. |
 | `frame-completed=...` | Last callback-completed snapshot, or `-`. |
 
 Boolean flags are `0|1`; the dictionary field is an entry count or `-`.
-These are coarse presence flags, not dialog/job IDs,
-allowed answers, operation results or spelling ranges. No path or entry text
+The native/modal/spelling flags remain coarse presence information, not
+dialog IDs, allowed answers or spelling ranges. Job rows expose only the
+spelling outcomes above; file/dialog job IDs remain absent. No path or entry text
 is disclosed by these added fields. Query `text` separately for document
 bytes. Controller generation does not cover native-only modal/job changes,
 and is not a submitted/callback-completed frame generation. Clients must not

@@ -24,8 +24,9 @@ dictionary selection and next/previous marked-word navigation. GPU rendering
 is not implemented yet. The optional native control socket now exposes
 state/text and scan-pinned spelling queries, plus revision/selection-checked
 edits. Native redraw/submitted/callback generations and bounded `wait-frame`
-acknowledgement are connected. Remote file operations, dialog answers and
-Check Spelling admission remain unimplemented.
+acknowledgement are connected. Remote Check Spelling returns a job ID with
+bounded completion/error/cancellation history in native state. Remote file
+operations and dialog answers remain unimplemented.
 Replay emits explicit external-operation requests and does not pretend to
 perform native file, clipboard or display work.
 The allocation-free layout library supplies visual rows, glyph intervals,
@@ -2104,7 +2105,11 @@ reports, pin text revision and a never-reused window scan ID, and expose no
 partial marks. This also distinguishes a recheck or dictionary replacement
 without text changes. Native frame snapshots and held `wait-frame` requests
 now implement callback acknowledgement without blocking Wayland dispatch.
-Remote file operations, dialog answers and Check Spelling admission remain
+Remote Check Spelling invokes ordinary F7 admission and returns a checked
+window-local job ID. Native state retains up to 64 ordered historical outcomes,
+evicts only terminal rows, and exposes the associated scan ID for result pages.
+CONTROL.md defines startup errors, cancellation, completion, eviction and
+transport-lifetime semantics. Remote file operations and dialog answers remain
 unimplemented.
 The complete endpoint below remains the version-1 target; controller
 generations are not presentation evidence.

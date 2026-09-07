@@ -97,6 +97,10 @@ pub fn frame(payload: &[u8]) -> Result<Vec<u8>> {
 pub enum Operation {
     State,
     WaitFrame(u64),
+    CheckSpelling {
+        tab: TabId,
+        revision: u64,
+    },
     SpellingResults {
         tab: TabId,
         revision: u64,
@@ -226,6 +230,10 @@ impl Request {
             let operation = match name {
                 "state" => Operation::State,
                 "wait-frame" => Operation::WaitFrame(decimal(args.next().ok_or(Error::Protocol)?)?),
+                "check-spelling" => Operation::CheckSpelling {
+                    tab: decimal(args.next().ok_or(Error::Protocol)?)?,
+                    revision: decimal(args.next().ok_or(Error::Protocol)?)?,
+                },
                 "spelling-results" => Operation::SpellingResults {
                     tab: decimal(args.next().ok_or(Error::Protocol)?)?,
                     revision: decimal(args.next().ok_or(Error::Protocol)?)?,
@@ -335,6 +343,7 @@ impl Request {
                 limit,
             } => page(ui, *tab, *revision, *offset, *limit),
             Operation::Edit { .. }
+            | Operation::CheckSpelling { .. }
             | Operation::SpellingResults { .. }
             | Operation::WaitFrame(_) => Err(Error::Unavailable),
         };
@@ -363,6 +372,10 @@ impl Request {
         } else {
             Refusal { id: self.id, error }.response()
         }
+    }
+
+    pub(crate) fn is_mutating(&self) -> bool {
+        self.is_edit() || matches!(self.operation, Operation::CheckSpelling { .. })
     }
 
     pub(crate) fn spelling_response(
@@ -407,7 +420,7 @@ impl Request {
             let mut body = format!(
                 "{tab}\t{revision}\t{}\t{}\t{}\t{}\t{counts}",
                 snapshot.scan,
-                snapshot.status,
+                snapshot.status.code(),
                 offset + page.len(),
                 snapshot.marks.len()
             );
@@ -705,6 +718,27 @@ mod tests {
     use super::*;
     use crate::model::{Command, Selection};
     use crate::ui::Event;
+
+    #[test]
+    fn spelling_job_admission_is_native_only_and_strictly_framed() {
+        let request = Request::parse(b"1\t1\tcheck-spelling\t2\t0").unwrap();
+        assert!(request.is_mutating());
+        assert!(!request.is_edit());
+        let mut ui = Controller::default();
+        assert_eq!(request.execute(&mut ui), Err(Error::InvalidArgument));
+        assert!(request.response(&ui).contains("\terror\tunavailable\t"));
+        for payload in [
+            "1\t1\tcheck-spelling",
+            "1\t1\tcheck-spelling\t2",
+            "1\t1\tcheck-spelling\t2\t0\textra",
+            "1\t1\tcheck-spelling\t2\t-1",
+        ] {
+            assert_eq!(
+                Request::parse(payload.as_bytes()).unwrap_err().error,
+                Error::Protocol
+            );
+        }
+    }
 
     #[test]
     fn remote_mode_and_line_commands_match_replay_without_text_history() {

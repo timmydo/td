@@ -78,10 +78,12 @@ tab revision; native modals refuse remote edits. Auto Fill, fill-column and
 key-profile setters and Go To Line also use revision-checked native control
 dispatch without changing text or history. `spelling-results` exposes status,
 whole-scan counts and bounded range pages pinned to both text revision and
-scan ID. Checking still starts with ordinary F7; pending scans expose no
-partial marks. File operations, dialog answers and Check Spelling admission
-remain later work. Native state
-now exposes separate redraw/submitted/callback generations; `wait-frame`
+scan ID. Checking starts with ordinary F7 or remote `check-spelling`;
+pending scans expose no partial marks. File operations and dialog answers
+remain later work. `check-spelling` returns a job ID; native state retains
+up to 64 completion/error/cancellation outcomes, separate from scan-pinned
+result pages. Native state also exposes separate redraw/submitted/callback
+generations; `wait-frame`
 waits for a matching main-surface callback without blocking editing.
 The separate `control_socket` library publishes a private Linux Unix
 listener only when explicitly requested. It checks directory
