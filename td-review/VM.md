@@ -2,10 +2,75 @@
 
 ## Status and scope
 
-The main acceptance criterion is **create an instance, open its QEMU window,
-and start working in td with the selected agent and existing host identity**.
-Installing compilers, cloning the repository, configuring terminals, and
-logging in separately on every image are not user setup steps.
+The first milestone is **import an existing clean td system image, create
+independent persistent instances, and open their QEMU desktops from a TUI**.
+Login reuse follows usable VM lifecycle, copy/paste, verified download reuse,
+and the development/Git workflow. It is not a prerequisite for creating or
+booting a VM.
+
+The eventual acceptance criterion remains creating an instance and working in
+td with the selected agent and linked host identity, without repeating image
+setup or login. Capability status distinguishes that eventual workflow from
+an ordinary running desktop.
+
+### Implemented lifecycle increment
+
+`td-vm` is a host binary in the dependency-free `td-review` crate. It imports
+the existing `./build-qcow` bundle format, verifies and privately copies the
+kernel, selector and disk, and creates one persistent qcow2 overlay per
+instance. It does not execute the bundle's launcher. The TUI offers import,
+create, open, template listing, bounded log-tail viewing, refresh, confirmed
+force-stop, and confirmed deletion. Equivalent CLI commands are available.
+
+```text
+cargo build --release --manifest-path td-review/Cargo.toml --bin td-vm
+td-review/target/release/td-vm import current /path/to/dist/td-vm-x86-64
+td-review/target/release/td-vm create worker-a current
+td-review/target/release/td-vm create worker-b current
+td-review/target/release/td-vm
+```
+
+Import an unused bundle from the existing image producer; importing a running
+or personalized disk is not template preparation. Import never builds the
+image. If no bundle exists, `./build-qcow` prepares one once. Later create/open
+operations reuse those bytes. `TD_VM_HOME` selects manager storage, defaulting
+to `~/.local/share/td-vm`; keep that directory at its original absolute path
+because overlays refer to their managed bases there.
+
+Open defaults to GTK and automatic KVM/TCG selection. CLI options select
+`--display sdl`, `--accel kvm` (strict), or `--accel tcg`. KVM initialization
+failure falls through within QEMU's accelerator selection; unrelated errors
+are not retried. A successful QMP query records the actual accelerator.
+Existing windows are identified by their `td-vm: NAME` title; select one through
+the host desktop when Open reports it already running. Window focusing is not
+implemented yet.
+
+A separate supervisor waits for each QEMU independently of TUI exit. The TUI
+reaps its completed supervisors through waiting threads. A slow template
+verification remains visibly starting and continues in the background; it
+does not turn a startup observation deadline into a failed launch. QEMU
+inherits the supervisor's lifetime lock on its unused stdin descriptor, so a
+supervisor exit cannot release that exclusion while QEMU lives. Operation
+locks serialize changes to one instance, QEMU's own disk lock remains in
+force, and a stopped disk must pass a writable lock probe before deletion.
+Imports prepare under individual staging leases outside the short catalog
+publication lock. Those leases are removed with their transient staging;
+reusable instance/template lock inodes remain stable. Referenced templates cannot be removed. Read-only CLI
+listing does not create manager state or take catalog locks.
+
+This increment boots the stock desktop and reports workspace integration as
+pending. Guest provisioning/unique guest identities, orderly host power
+operations, a guest bridge, private writable development stores, automatic
+Git setup, copy/paste across the VM boundary, shared download configuration,
+and account linking are not implemented. Stop from the guest; host
+`stop NAME --force` explicitly cuts power. Disk deletion requires `--yes` or
+typing the instance name in the TUI and reports unsubmitted work as unknown.
+The table currently reports allocated overlay space; virtual capacity,
+configurable free-space reserves, and on-disk log rotation remain outstanding.
+Log display reads bounded tails, but QEMU's retained serial log can grow.
+
+The sections below specify the remaining complete workflow. Features described
+there are not implied by the lifecycle increment's successful launch.
 
 The host is Linux x86-64 with a graphical session. KVM is preferred; QEMU TCG
 software emulation is a supported fallback. The fallback changes performance,
@@ -86,16 +151,21 @@ operations. Force-stop is a distinct destructive action through QMP.
 
 ## Templates and isolated persistent state
 
-A reusable template contains a verified td development deployment, not a
-previous developer's machine. Build it locally from pinned recipes once and
-reuse it. No maintainer-operated image server or binary cache is introduced.
+A reusable template starts from the existing clean `system-x86-64` deployment
+and `./build-qcow` bundle. Reuse its kernel, selector, signed deployment, and
+Btrfs/EROFS layout. Add missing development capabilities through that same
+image producer, rather than introducing a second distro image pipeline. No
+maintainer-operated image server or binary cache is introduced.
 Cold template preparation may require the full bootstrap build; show that as
 template preparation, never hide it inside every New operation.
 
-Import verifies the consumed kernel, selector, disk, and development manifest
-against checksums and the deployment's existing trust chain. The manifest
+Import verifies consumed files against bundle checksums; the existing boot
+selector retains responsibility for deployment authentication. Checksums alone
+do not authenticate an untrusted image. The stock bundle is a valid desktop
+base without a development manifest. A later development-capability manifest
 records source revision, CLI versions, guest protocol version, and development
-capabilities. Reject external qcow2 backing/data dependencies. Copy imported
+capabilities; its absence prevents workspace/agent readiness, not desktop boot.
+Reject external qcow2 backing/data dependencies. Copy imported
 bytes into manager-owned storage before publishing an immutable template.
 
 Each instance has an independent qcow2 overlay, machine identity, home,
@@ -114,9 +184,11 @@ virtual disk capacity and actual allocated space; refuse an allocation that
 cannot satisfy the configured reserve. CPU, RAM, and storage bandwidth remain
 host-wide finite resources even though build locks are isolated.
 
-## A development image, not a demo needing setup
+## Add development capabilities to the existing image
 
-The image producer owns these requirements:
+Extend the existing system image only where its capability checks identify a
+gap. These are requirements for development readiness, not prerequisites for
+the initial stock-desktop lifecycle increment. The image producer owns:
 
 - Source-built Rust, Cargo, linker/compiler tools, td control-plane tools,
   Git, the source-built OpenSSH client and key generator, required build/test
@@ -152,6 +224,85 @@ Distinguish `Booting`, `Preparing workspace`, `Needs host attention`, and
 In particular, toolchain checks and a provider-authentication probe must pass
 before displaying an agent as ready. Probes do not submit prompts or paid
 model requests merely to check login.
+
+## Copy/paste before account linking
+
+Make ordinary text copy/paste work in both directions between the host desktop
+and td-term in the selected QEMU window. Treat this as a first-class development
+capability. The current compositor has a focus-scoped Wayland clipboard and
+td-term can copy a selection, but td-term currently discards incoming offers;
+paste consumption must be implemented there as well as the host/guest transport.
+
+Use the existing compositor clipboard and terminal PTY input paths. Preserve
+UTF-8, multiline text, selection ownership, and bracketed paste when the child
+requests it. Pasting inserts text; it must not add an Enter key to run it.
+Do not simulate characters with QMP keycodes or turn terminal escape sequences
+into an implicit host clipboard-write interface. Initial support is text;
+file drag/drop is a separate capability.
+
+The transport increment must select and test a concrete QEMU/guest clipboard
+interface with the supported display backend. QEMU has a clipboard subsystem,
+but a graphical window alone does not connect td's clipboard to it; see
+[QEMU UI interfaces](https://www.qemu.org/docs/master/devel/ui.html).
+Keep the clipboard channel separate from credential delivery. A background VM
+must not receive every host clipboard update or overwrite the host selection:
+pin selection/focus authority, explicit copy/paste actions, bounded payloads,
+transfer deadlines, cancellation, and loop suppression in the compositor
+contract when implementing the bridge. An ordinary background Wayland client
+cannot bypass the existing focus policy to perform this integration.
+
+Test host-to-guest and guest-to-host text in the real desktop, including Unicode,
+multiline paste, application-requested bracketed paste, switching between two
+VM windows, replacing selections mid-transfer, and disabled sharing. No
+credentials are required to demonstrate this milestone.
+
+## Reuse verified downloads with private guest writes
+
+Reuse the host's existing `td-feed` artifact cache. Guests fetch pinned bytes
+from a host-local endpoint and verify them against their own committed recipe
+pins and Cargo lock checksums. Keep guest stores, Cargo extraction/build state,
+locks, and writable caches on each instance's disk. Serving immutable download
+bytes does not make a shared writable filesystem part of the design.
+
+The existing building blocks are `td-feed ensure-serve`, its verified artifact
+store, and the `TD_FEED_BASE` fetch routing setting. With QEMU user networking,
+provision a guest-reachable endpoint for the host feed, such as
+`http://10.0.2.2:<port>` after testing the actual listener/network pairing. Do
+not copy a host `127.0.0.1` URL unchanged into a guest. Keep the listener local
+to the development host; no maintainer-operated cache or public server is
+required. Feed endpoint discovery/restart is host profile state, not a baked-in
+port in each image.
+
+Setting `TD_FEED_BASE` alone is not yet proof of reuse. In particular, current
+`td-feed warm sources` attempts local `warm_one` before reading the explicit
+feed, which can fetch upstream again in a new guest. The artifact increment
+must distinguish a guest consuming a remote feed from its host producer,
+consume warm entries first, and cover every selected fixed-output acquisition
+path. This includes recipe source archives, locked Cargo registry sources,
+reviewed Git-source archives, and other declared transfer objects that the
+existing warm paths need. Unsupported paths remain visible coverage gaps.
+
+Warm the selected repository revision's declared inputs on the host once.
+Guests have read access to the resulting artifacts, not a general cache upload
+or host-command API. For a missing pin, report what needs warming and permit
+an explicit host warm of that declared input; do not claim zero downloads by
+silently falling back upstream in each VM. Offline recipe steps remain offline;
+provisioning/acquisition stages obtain and validate bytes before a build starts.
+A guest cannot supply a URL/path pair that makes the host fetch arbitrary data.
+
+The first acceptance test starts two fresh guest caches with host inputs warm,
+disables guest upstream access, and proves both can acquire the selected
+source/dependency closure without external downloads. Include corrupted cache
+entries, missing pins, mismatched hashes, interrupted transfers, and host feed
+restart. Corruption must fail verification rather than becoming a trusted
+artifact because it came from the host.
+
+Built-output reuse is separate from download reuse. The imported system image
+already shares its immutable deployment bytes through overlays. Any additional
+binary substitution must use td's existing provenance/closure contract and
+retain foreign-payload marks; exposing the host's executable store as recipe
+inputs is not an artifact-cache optimization. This milestone does not require
+sharing mutable build databases or compiling everything anew for every VM.
 
 ## Sharing settings without sharing mutable homes
 
@@ -225,7 +376,8 @@ rewriting a file cannot be assumed to update that process. See
 [Claude authentication](https://code.claude.com/docs/en/authentication) and
 [environment variables](https://code.claude.com/docs/en/env-vars).
 
-This provider-compatibility spike is the first implementation step. Its output
+This provider-compatibility spike follows the VM, clipboard, artifact, and
+development workflow increments below. Its output
 must name the exact host/guest versions, supported login modes, refresh owner,
 and behavior under concurrent use. Unsupported modes remain visibly incomplete.
 Do not declare effortless login solved by startup-only copy tests or invent an
@@ -523,16 +675,27 @@ implementation landings; this proposal does not relax them.
 
 ## Implementation sequence and acceptance
 
-1. Prove the account adapters, especially concurrent subscription use and token
-   refresh, with real pinned CLIs. Record the supported modes and any one-time
-   host authorization required. Use synthetic credentials for parser tests.
-2. Build the complete development template and fixed guest provisioner. Prove
-   an independent clone can build, check, review, and submit through the intended
-   Git transport; include both CLI launch paths and application confinement.
-3. Implement the TUI, QEMU windows, supervisors, and bridge with the specified
-   disk-lifecycle safeguards. Any migration of existing instance metadata must
-   preserve its disks and guest work through an explicit import path.
-4. Enable the daily workflow only after the complete user journey passes.
+1. **Create/open from the existing image.** Import a clean existing bundle;
+   implement the TUI, independent overlays, QEMU windows, KVM/TCG behavior,
+   lifetime recovery, and safe deletion. Boot two desktops from the same base
+   without image preparation on each create. Keep remaining capabilities
+   visibly pending. The host lifecycle increment above starts this milestone.
+2. **Make the desktop useful for development.** Implement td-term paste and the
+   host/guest clipboard path, plus verified read-only reuse of host downloads.
+   Prove two fresh guests consume warm artifacts without upstream downloads.
+   These capabilities precede account linking.
+3. **Complete the development workspace and Git round trip.** Extend the same
+   image with missing development tools, private writable build state, and the
+   fixed guest provisioner/power bridge. Enroll per-VM Git keys for host `test`,
+   clone automatically, build/check in both guests, push distinct branches over
+   SSH, review/land with host td-review, and fetch the resulting main back.
+   Bring both CLI launch paths through their proper application confinement;
+   authentication can remain explicitly unconfigured at this stage.
+4. **Add settings and login reuse.** Prove the account adapters with real pinned
+   CLIs, including concurrent subscription use and refresh ownership. Record
+   supported modes and one-time host authorization. Then enable the complete
+   agent-ready daily workflow. Synthetic credentials cover protocol tests;
+   startup-only cache copying is not login-reuse acceptance.
 
 Required evidence includes:
 
@@ -549,9 +712,11 @@ Required evidence includes:
   `test` login keys and repository ACLs remain intact. Require shell, forwarding,
   alternate-repository, forged-instance, and wrong-host-key refusals. Revoking
   one VM must leave sibling access and the integrator's main publication working.
-- Both guest CLIs work inside td-term without installation or per-VM login;
+- At the final account-linking milestone, both guest CLIs work inside td-term
+  without installation or per-VM login;
   settings, permission intent, checkout, model, and provider identity agree.
-- Concurrent credential use crosses expiry/refresh, host CLI activity, account
+- At the final account-linking milestone, concurrent credential use crosses
+  expiry/refresh, host CLI activity, account
   change, host-adapter restart, guest reboot, and deletion of a sibling VM.
   A stale snapshot cannot overwrite the host's newer login state.
 - KVM and forced TCG boot the same image. Missing and permission-denied KVM
