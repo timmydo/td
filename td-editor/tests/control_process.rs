@@ -439,7 +439,56 @@ struct EditorProcess {
     next: u64,
 }
 impl EditorProcess {
+    fn wait_keyboard(&mut self, profile: &str) -> String {
+        let deadline = Instant::now() + TIMEOUT;
+        loop {
+            let state = self.ok("state");
+            assert_eq!(field(&state, "keys"), Some(profile), "{state}");
+            if field(&state, "key-ready") == Some("1") {
+                return state;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "keyboard readiness: {state}; {}",
+                self.ok("prompt-state")
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+    fn wait_tab(&mut self, revision: u64, text: &str) {
+        let deadline = Instant::now() + TIMEOUT;
+        loop {
+            let state = self.ok("state");
+            let row = field(&state, "tab").unwrap();
+            assert_eq!(row.split(',').next(), Some("1"), "{state}");
+            let actual = row.split(',').nth(1).unwrap().parse::<u64>().unwrap();
+            assert!(actual <= revision, "unexpected extra edit: {state}");
+            if actual == revision {
+                assert_eq!(
+                    self.ok(&format!("text\t1\t{revision}\t0\t100")),
+                    format!(
+                        "{}\t{}",
+                        text.len(),
+                        td_editor::control::hex(text.as_bytes())
+                    ),
+                    "{state}"
+                );
+                return;
+            }
+            assert!(Instant::now() < deadline, "input delivery timeout: {state}");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
     fn start(directory: &Directory, display: &Path, file: &Path, dictionary: &Path) -> Self {
+        Self::start_with_profile(directory, display, file, dictionary, "windows")
+    }
+    fn start_with_profile(
+        directory: &Directory,
+        display: &Path,
+        file: &Path,
+        dictionary: &Path,
+        profile: &str,
+    ) -> Self {
         let socket = directory.0.join("control");
         let log = directory.0.join("stderr");
         let child = Command::new(env!("CARGO_BIN_EXE_td-editor"))
@@ -447,6 +496,7 @@ impl EditorProcess {
             .arg(&socket)
             .arg("--dictionary")
             .arg(dictionary)
+            .arg(format!("--keys={profile}"))
             .arg("--")
             .arg(file)
             .env_clear()
@@ -629,6 +679,14 @@ struct WestonProcess {
     directory: PathBuf,
 }
 impl WestonProcess {
+    fn assert_serving(&mut self) {
+        display_roundtrip(UnixStream::connect(self.directory.join("wayland")).unwrap());
+        assert!(
+            self.child.try_wait().unwrap().is_none(),
+            "Editor quit must not stop Weston: {}",
+            self.diagnostics()
+        );
+    }
     fn diagnostics(&self) -> String {
         format!(
             "Weston log: {}\nWeston stderr: {}",
@@ -646,6 +704,73 @@ impl Drop for WestonProcess {
         }
     }
 }
+impl WestonProcess {
+    fn start(directory: &Directory) -> Self {
+        let executable = PathBuf::from(
+            std::env::var_os("TD_EDITOR_TEST_WESTON").expect("explicit Weston executable"),
+        );
+        let module = PathBuf::from(
+            std::env::var_os("TD_EDITOR_TEST_WESTON_MODULE")
+                .expect("explicit matching upstream Weston test-plugin"),
+        );
+        assert!(
+            executable.is_absolute(),
+            "absolute Weston executable required"
+        );
+        assert!(
+            module.is_absolute(),
+            "absolute matching Weston test module required"
+        );
+        let display = directory.0.join("wayland");
+        let log = directory.0.join("weston.log");
+        let mut module_arg = std::ffi::OsString::from("--modules=");
+        module_arg.push(&module);
+        let mut log_arg = std::ffi::OsString::from("--log=");
+        log_arg.push(&log);
+        let mut weston = WestonProcess {
+            directory: directory.0.clone(),
+            child: Command::new(executable)
+                .env_clear()
+                .env("XDG_RUNTIME_DIR", &directory.0)
+                .args([
+                    "--backend=headless-backend.so",
+                    "--use-pixman",
+                    "--shell=kiosk-shell.so",
+                    "--no-config",
+                    "--width=1024",
+                    "--height=768",
+                    "--idle-time=0",
+                    "--socket=wayland",
+                ])
+                .arg(module_arg)
+                .arg(log_arg)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(std::fs::File::create(directory.0.join("weston-stderr")).unwrap())
+                .spawn()
+                .unwrap(),
+        };
+        let deadline = Instant::now() + TIMEOUT;
+        let ready = loop {
+            if let Ok(stream) = UnixStream::connect(&display) {
+                break stream;
+            }
+            assert!(
+                weston.child.try_wait().unwrap().is_none(),
+                "{}",
+                weston.diagnostics()
+            );
+            assert!(
+                Instant::now() < deadline,
+                "Weston startup timeout: {}",
+                weston.diagnostics()
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        };
+        display_roundtrip(ready);
+        weston
+    }
+}
 
 fn display_roundtrip(mut stream: UnixStream) {
     let deadline = Instant::now() + TIMEOUT;
@@ -659,88 +784,16 @@ fn display_roundtrip(mut stream: UnixStream) {
 #[test]
 #[ignore = "requires explicit Weston executable and matching upstream test-plugin; see README"]
 fn disposable_weston_runs_the_production_editor_and_control_workers() {
-    let executable = PathBuf::from(
-        std::env::var_os("TD_EDITOR_TEST_WESTON").expect("explicit Weston executable"),
-    );
-    let module = PathBuf::from(
-        std::env::var_os("TD_EDITOR_TEST_WESTON_MODULE")
-            .expect("explicit matching upstream Weston test-plugin"),
-    );
-    assert!(
-        executable.is_absolute(),
-        "absolute Weston executable required"
-    );
-    assert!(
-        module.is_absolute(),
-        "absolute matching Weston test module required"
-    );
     let directory = Directory::new();
     let display = directory.0.join("wayland");
-    let log = directory.0.join("weston.log");
-    let mut module_arg = std::ffi::OsString::from("--modules=");
-    module_arg.push(&module);
-    let mut log_arg = std::ffi::OsString::from("--log=");
-    log_arg.push(&log);
-    let mut weston = WestonProcess {
-        directory: directory.0.clone(),
-        child: Command::new(executable)
-            .env_clear()
-            .env("XDG_RUNTIME_DIR", &directory.0)
-            .args([
-                "--backend=headless-backend.so",
-                "--use-pixman",
-                "--shell=kiosk-shell.so",
-                "--no-config",
-                "--width=1024",
-                "--height=768",
-                "--idle-time=0",
-                "--socket=wayland",
-            ])
-            .arg(module_arg)
-            .arg(log_arg)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(std::fs::File::create(directory.0.join("weston-stderr")).unwrap())
-            .spawn()
-            .unwrap(),
-    };
-    let deadline = Instant::now() + TIMEOUT;
-    let ready = loop {
-        if let Ok(stream) = UnixStream::connect(&display) {
-            break stream;
-        }
-        assert!(
-            weston.child.try_wait().unwrap().is_none(),
-            "{}",
-            weston.diagnostics()
-        );
-        assert!(
-            Instant::now() < deadline,
-            "Weston startup timeout: {}",
-            weston.diagnostics()
-        );
-        std::thread::sleep(Duration::from_millis(2));
-    };
-    display_roundtrip(ready);
+    let mut weston = WestonProcess::start(&directory);
     let file = directory.0.join("-draft with spaces.txt");
     let dictionary = directory.0.join("dictionary");
     std::fs::write(&file, b"\xef\xbb\xbfone\r\nwrng\r\n").unwrap();
     std::fs::write(&dictionary, b"one\nwrong\n").unwrap();
     let mut editor = EditorProcess::start(&directory, &display, &file, &dictionary);
     editor.rendered_at(1024, 768);
-    let deadline = Instant::now() + TIMEOUT;
-    let state = loop {
-        let state = editor.ok("state");
-        if field(&state, "key-ready") == Some("1") {
-            break state;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "keyboard readiness: {state}; {}",
-            editor.ok("prompt-state")
-        );
-        std::thread::sleep(Duration::from_millis(2));
-    };
+    let state = editor.wait_keyboard("windows");
     let token = field(&state, "input-generation").unwrap();
     editor.ok(&format!("key\t1\t0\t{token}\t432d66")); // Native Ctrl+F.
     let prompt = editor.ok("prompt-state");
@@ -776,11 +829,254 @@ fn disposable_weston_runs_the_production_editor_and_control_workers() {
         "Save must not exit the editor"
     );
     editor.quit();
-    display_roundtrip(UnixStream::connect(&display).unwrap());
-    assert!(
-        weston.child.try_wait().unwrap().is_none(),
-        "Editor quit must not stop Weston"
+    weston.assert_serving();
+}
+
+// The upstream Weston 10 test protocol is used only on our owned private
+// compositor. No editor-private object ID or logical key command is injected.
+struct WestonInput {
+    stream: UnixStream,
+    sync: u32,
+    ticks: u32,
+}
+fn protocol_string(payload: &[u8], at: usize) -> Result<(&str, usize)> {
+    let length = word(payload, at)? as usize;
+    let start = at.checked_add(4).ok_or("test protocol string size")?;
+    let end = start
+        .checked_add(length)
+        .ok_or("test protocol string size")?;
+    let padded = end.checked_add(3).ok_or("test protocol string size")? & !3;
+    let bytes = payload
+        .get(start..end)
+        .and_then(|bytes| bytes.strip_suffix(&[0]))
+        .ok_or("test protocol string terminator/bound")?;
+    if bytes.contains(&0) || padded > payload.len() {
+        return Err("test protocol string bound".into());
+    }
+    Ok((
+        std::str::from_utf8(bytes).map_err(|_| "test protocol string UTF-8")?,
+        padded,
+    ))
+}
+fn registry_global(payload: &[u8]) -> Result<(u32, &str, u32)> {
+    let name = word(payload, 0)?;
+    let (interface, end) = protocol_string(payload, 4)?;
+    let version = word(payload, end)?;
+    if name == 0 || version == 0 || end + 4 != payload.len() {
+        return Err("test registry global schema".into());
+    }
+    Ok((name, interface, version))
+}
+impl WestonInput {
+    fn over(stream: UnixStream) -> Self {
+        // IDs 1..4 are display, registry, first sync and weston_test.
+        Self {
+            stream,
+            sync: 5,
+            ticks: 0,
+        }
+    }
+    fn read(&mut self, deadline: Instant) -> Result<(u32, u16, Vec<u8>)> {
+        let mut header = [0; 8];
+        read_until(&mut self.stream, &mut header, deadline).map_err(transport)?;
+        let object = word(&header, 0)?;
+        let code = word(&header, 4)?;
+        let size = (code >> 16) as usize;
+        if size < 8 || !size.is_multiple_of(4) {
+            return Err("test protocol frame size".into());
+        }
+        let mut payload = vec![0; size - 8];
+        read_until(&mut self.stream, &mut payload, deadline).map_err(transport)?;
+        if object == 1 && code as u16 == 0 {
+            let object = word(&payload, 0)?;
+            let error = word(&payload, 4)?;
+            let (detail, end) = protocol_string(&payload, 8)?;
+            if end != payload.len() {
+                return Err("test display error schema".into());
+            }
+            return Err(format!(
+                "Weston protocol error on object {object}, code {error}: {detail}"
+            ));
+        }
+        Ok((object, code as u16, payload))
+    }
+    fn connect(path: &Path) -> Self {
+        let mut input = Self::over(UnixStream::connect(path).unwrap());
+        send(&mut input.stream, 1, 1, &words(&[2])).unwrap();
+        send(&mut input.stream, 1, 0, &words(&[3])).unwrap();
+        let deadline = Instant::now() + TIMEOUT;
+        let mut name = None;
+        let mut done = false;
+        for _ in 0..128 {
+            let (object, opcode, payload) = input.read(deadline).unwrap();
+            if object == 3 && opcode == 0 {
+                done = true;
+                break;
+            }
+            if object == 2 && opcode == 0 {
+                let (global, interface, _) =
+                    registry_global(&payload).expect("valid registry global");
+                if interface == "weston_test" {
+                    assert!(name.is_none());
+                    name = Some(global);
+                }
+            }
+        }
+        assert!(done, "registry sync missing within 128 events");
+        let mut bind = words(&[name.expect("Weston test global"), 12]);
+        bind.extend_from_slice(b"weston_test\0");
+        bind.extend(words(&[1, 4]));
+        send(&mut input.stream, 2, 0, &bind).unwrap();
+        input.barrier();
+        input
+    }
+    fn barrier(&mut self) {
+        let id = self.sync;
+        self.sync += 1;
+        send(&mut self.stream, 1, 0, &words(&[id])).unwrap();
+        let deadline = Instant::now() + TIMEOUT;
+        let mut done = false;
+        for _ in 0..128 {
+            let (object, opcode, _) = self.read(deadline).unwrap();
+            if object == id && opcode == 0 {
+                done = true;
+                break;
+            }
+        }
+        assert!(done, "compositor sync missing within 128 events");
+    }
+    fn key(&mut self, key: u32, pressed: bool) {
+        self.ticks += 1;
+        send(
+            &mut self.stream,
+            4,
+            5,
+            &words(&[
+                0,
+                1 + self.ticks / 1000,
+                (self.ticks % 1000) * 1_000_000,
+                key,
+                u32::from(pressed),
+            ]),
+        )
+        .unwrap();
+    }
+    fn chord(&mut self, modifier: Option<u32>, key: u32) {
+        if let Some(modifier) = modifier {
+            self.key(modifier, true);
+        }
+        self.key(key, true);
+        self.key(key, false);
+        if let Some(modifier) = modifier {
+            self.key(modifier, false);
+        }
+        self.barrier();
+    }
+}
+
+#[test]
+fn weston_test_event_reader_refuses_short_unaligned_and_error_frames() {
+    for header in [(1, 4u32 << 16), (2, 9u32 << 16)] {
+        let (stream, mut peer) = UnixStream::pair().unwrap();
+        peer.write_all(&words(&[header.0, header.1])).unwrap();
+        // A removed alignment guard must fail immediately, not via timeout.
+        peer.write_all(&[0]).unwrap();
+        let mut input = WestonInput::over(stream);
+        assert_eq!(
+            input.read(Instant::now() + TIMEOUT).unwrap_err(),
+            "test protocol frame size"
+        );
+    }
+    let (stream, mut peer) = UnixStream::pair().unwrap();
+    let mut error = words(&[4, 7, 5]);
+    error.extend_from_slice(b"oops\0\0\0\0");
+    send(&mut peer, 1, 0, &error).unwrap();
+    let mut input = WestonInput::over(stream);
+    assert_eq!(
+        input.read(Instant::now() + TIMEOUT).unwrap_err(),
+        "Weston protocol error on object 4, code 7: oops"
     );
+    send(&mut peer, 3, 0, &words(&[42])).unwrap();
+    assert_eq!(
+        input.read(Instant::now() + TIMEOUT).unwrap(),
+        (3, 0, words(&[42]))
+    );
+}
+
+#[test]
+fn weston_test_global_decoder_checks_strings_versions_and_payload_bounds() {
+    let mut global = words(&[77, 12]);
+    global.extend_from_slice(b"weston_test\0");
+    global.extend(words(&[1]));
+    assert_eq!(registry_global(&global).unwrap(), (77, "weston_test", 1));
+    for length in 0..global.len() {
+        assert!(registry_global(&global[..length]).is_err());
+    }
+    let mut bad = global.clone();
+    bad[19] = b'x';
+    assert!(registry_global(&bad).is_err());
+    let mut bad = global.clone();
+    bad[20..24].fill(0);
+    assert_eq!(
+        registry_global(&bad).unwrap_err(),
+        "test registry global schema"
+    );
+    let mut bad = global.clone();
+    bad[4..8].copy_from_slice(&u32::MAX.to_ne_bytes());
+    assert!(registry_global(&bad).is_err());
+    global.extend(words(&[0]));
+    assert_eq!(
+        registry_global(&global).unwrap_err(),
+        "test registry global schema"
+    );
+}
+
+fn weston_keyboard_profile(profile: &str) {
+    const LEFT_SHIFT: u32 = 42;
+    const LEFT_CTRL: u32 = 29;
+    const A: u32 = 30;
+    const B: u32 = 48;
+    const Z: u32 = 44;
+    const SLASH: u32 = 53;
+    let directory = Directory::new();
+    let display = directory.0.join("wayland");
+    let mut weston = WestonProcess::start(&directory);
+    let file = directory.0.join("draft");
+    let dictionary = directory.0.join("dictionary");
+    std::fs::write(&file, b"one\n").unwrap();
+    std::fs::write(&dictionary, b"one\n").unwrap();
+    let mut editor =
+        EditorProcess::start_with_profile(&directory, &display, &file, &dictionary, profile);
+    editor.rendered_at(1024, 768);
+    editor.wait_keyboard(profile);
+    let mut input = WestonInput::connect(&display);
+    // Linux evdev codes, not ASCII or already decoded editor chords.
+    input.chord(Some(LEFT_SHIFT), A);
+    editor.wait_tab(1, "Aone\n");
+    input.chord(None, B); // Lowercase b after releasing Shift.
+    editor.wait_tab(2, "Abone\n");
+    input.chord(
+        Some(LEFT_CTRL),
+        if profile == "windows" { Z } else { SLASH },
+    );
+    editor.wait_tab(3, "Aone\n");
+    editor.job("save\t1\t3");
+    assert_eq!(std::fs::read(&file).unwrap(), b"Aone\n");
+    editor.rendered_at(1024, 768);
+    editor.quit();
+    weston.assert_serving();
+}
+
+#[test]
+#[ignore = "requires explicit Weston executable and matching upstream test-plugin; see README"]
+fn disposable_weston_delivers_windows_keyboard_events() {
+    weston_keyboard_profile("windows");
+}
+
+#[test]
+#[ignore = "requires explicit Weston executable and matching upstream test-plugin; see README"]
+fn disposable_weston_delivers_emacs_keyboard_events() {
+    weston_keyboard_profile("emacs");
 }
 
 #[test]

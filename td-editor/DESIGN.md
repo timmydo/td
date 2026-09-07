@@ -2169,6 +2169,24 @@ This proves real-compositor protocol/callback interoperability, not physical
 input injection, scanout/pixel correctness, GPU rendering, or td-mail/jail
 integration. See README for the explicit opt-in invocation.
 
+The companion opt-in `disposable_weston_delivers_windows_keyboard_events`
+and `disposable_weston_delivers_emacs_keyboard_events` tests start fresh
+compositor/editor pairs and drive the private upstream `weston_test` v1
+protocol. Only registry binding, display round trips and test-seat key
+press/release are used; no editor object IDs or decoded editor key commands
+enter this path.
+Shift+A, released-Shift lowercase b, and Windows Ctrl+Z / Emacs Ctrl+/ travel
+through Weston's seat, the actual keyboard keymap/modifier messages, and the
+editor's native input decoder. Control queries wait for exact revisions and
+text, refusing unexpected extra edits; Save verifies disk bytes afterward.
+A compositor round trip orders injection but does not prove editor dispatch,
+which is why the separate control observation is required. Reads have an
+absolute deadline and a bounded message/event count. Registry strings and
+display errors are schema-checked; errors name the object/code/message.
+Default decoder tests distinguish schema rejection from a transport timeout.
+This is synthetic Wayland keyboard-event coverage, not hardware/evdev,
+repeat timing, pointer, clipboard or comprehensive keyboard-layout coverage.
+
 The safe `control` library now supplies the one-frame decoder/encoder,
 `state`/`text` queries and a bounded revision-checked editing subset. It
 shares controller snapshots,

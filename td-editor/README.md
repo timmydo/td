@@ -362,7 +362,7 @@ TD_EDITOR_TEST_WAYLAND=/absolute/path/to/weston-socket cargo test --frozen --man
 This waits for actual frame completion. The ordinary tests need no display
 and check transferred pool pixels and lifecycle behavior with Unix sockets.
 
-For the production editor/control-worker acceptance test, no existing display
+For the production editor/control-worker and keyboard tests, no existing display
 is needed. Supply an absolute Weston executable path and the matching
 upstream build-tree `test-plugin.so` (normally not installed). The test starts
 and reaps its own headless Pixman/kiosk compositor and editor:
@@ -372,7 +372,7 @@ TD_TEST_TRUSTED_ROOT=1 \
 TD_EDITOR_TEST_WESTON=/absolute/path/to/weston \
 TD_EDITOR_TEST_WESTON_MODULE=/absolute/path/to/test-plugin.so \
 cargo test --frozen --manifest-path td-editor/Cargo.toml --test control_process \
-  disposable_weston_runs_the_production_editor_and_control_workers -- --ignored
+  disposable_weston -- --ignored
 ```
 
 This was exercised with Weston 10.0.2 and its unmodified upstream test plugin.
@@ -387,6 +387,17 @@ at 1024x768, keyboard readiness and decoded Find/cancel, undo/redo, spelling/sav
 jobs, exact BOM/CRLF output and foreground/cleanup behavior. It does not inject
 physical input or prove GPU, scanout, captured pixels, or td-jail integration.
 Weston is optional host test tooling, not an editor or ordinary-gate dependency.
+
+The `disposable_weston` invocation above runs all three cases.
+Keep the executable/module outside the host's `/tmp` or in the bound
+worktree: the trusted-root fixture replaces `/tmp` with its own empty mount.
+The two separately reported keyboard cases create fresh instances for the
+Windows/Emacs profiles and inject key press/release through Weston's
+private upstream test protocol. It verifies shifted text, modifier release,
+the two native undo bindings, exact remote text/revisions, and saved bytes.
+The test does not inject decoded editor chords: Weston sends real Wayland
+keyboard events. This still does not prove hardware input, repeat timing,
+pointer/clipboard interoperability or additional keyboard layouts.
 
 The default process-level control tests launch the actual editor executable
 against a bounded test Wayland peer and use only its private control socket.
