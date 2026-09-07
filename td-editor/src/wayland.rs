@@ -1558,6 +1558,28 @@ impl Window {
             }
             .response();
         }
+        if matches!(request.operation, crate::control::Operation::New) {
+            return match self.ui.dispatch(Event::New) {
+                Ok(Outcome::Created(tab)) => {
+                    self.control_mutation_accepted();
+                    format!("1\t{}\tok\t{tab}", request.id)
+                }
+                Ok(_) => {
+                    // Defensive against a changed controller outcome, not bad wire input.
+                    self.control_mutation_accepted();
+                    crate::control::Refusal {
+                        id: request.id,
+                        error: crate::Error::Unavailable,
+                    }
+                    .response()
+                }
+                Err(error) => crate::control::Refusal {
+                    id: request.id,
+                    error,
+                }
+                .response(),
+            };
+        }
         if let crate::control::Operation::CheckSpelling { tab, revision } = request.operation {
             let result = (|| -> crate::Result<u64> {
                 self.ui.editor().revision_point(tab, revision)?;
@@ -1607,17 +1629,7 @@ impl Window {
             let result = request.execute(&mut self.ui);
             return match result {
                 Ok(()) => {
-                    self.input.cancel_repeat();
-                    // Controller admission already cancelled its own drag.
-                    self.clear_pointer_gesture();
-                    if self.clipboard.incoming.take().is_some() {
-                        self.notify("Paste cancelled: remote control command accepted.");
-                    }
-                    self.clipboard.incoming_target = None;
-                    self.searches.observe(self.ui.editor());
-                    self.spelling.observe(self.ui.editor());
-                    self.observe_control_jobs();
-                    self.frames.invalidate(true);
+                    self.control_mutation_accepted();
                     format!("1\t{}\tok\t", request.id)
                 }
                 Err(error) => request.admitted_edit_refusal(error),
@@ -1635,6 +1647,20 @@ impl Window {
         } else {
             response
         }
+    }
+
+    fn control_mutation_accepted(&mut self) {
+        self.input.cancel_repeat();
+        // Controller admission already cancelled its own drag.
+        self.clear_pointer_gesture();
+        if self.clipboard.incoming.take().is_some() {
+            self.notify("Paste cancelled: remote control command accepted.");
+        }
+        self.clipboard.incoming_target = None;
+        self.searches.observe(self.ui.editor());
+        self.spelling.observe(self.ui.editor());
+        self.observe_control_jobs();
+        self.frames.invalidate(true);
     }
 
     fn native_state(&self, mut response: String) -> crate::Result<String> {
@@ -5236,7 +5262,7 @@ mod tests {
         assert_eq!(query.response(&w.ui), before);
         w.chord("Escape", false).unwrap();
         assert!(w.search.is_none());
-        let refused = crate::control::Request::parse(b"1\t77\tnew")
+        let refused = crate::control::Request::parse(b"1\t77\tnew\textra")
             .unwrap_err()
             .response();
         assert_eq!(w.native_state(refused.clone()), Ok(refused));
@@ -5355,6 +5381,165 @@ mod tests {
                 .contains("\terror\tlimit\t")
         );
         assert_eq!(job_request(&mut w, &peer, &path, "1\t0\tstate"), before);
+        w.stop_control();
+    }
+
+    #[test]
+    fn native_remote_new_returns_stable_ids_and_preserves_other_tabs() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = DialogDirectory::new();
+        std::fs::set_permissions(&directory.0, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let path = directory.path("control");
+        let (mut w, peer) = file_dialog_fixture();
+        w.chord("a", false).unwrap();
+        let old = format!("{:?}", w.ui.editor().document(1).unwrap());
+        w.spelling
+            .install(crate::spelling::Dictionary::parse(b"known").unwrap());
+        w.chord("F7", false).unwrap();
+        w.end_turn(w.clock, false).unwrap();
+        w.ui.dispatch(Event::Profile(Profile::Emacs)).unwrap();
+        w.chord("C-x", false).unwrap();
+        assert!(crate::control::state(&w.ui)
+            .unwrap()
+            .contains("\tprefix=1\t"));
+        w.event(message(SHM, 0, &[1])).unwrap();
+        configure(&mut w, 800, 600);
+        w.draw().unwrap();
+        drain(&peer);
+        let pixels = w.pixels.clone();
+        let generation = w.frames.generation().unwrap();
+        w.control = Some(
+            crate::control_worker::Worker::start(
+                crate::control_socket::Socket::bind(&path).unwrap(),
+            )
+            .unwrap(),
+        );
+        let mut client = control_client(&path, b"1\t1\tnew");
+        assert_eq!(control_answer(&mut w, &mut client, &peer), "1\t1\tok\t2");
+        assert_eq!(w.ui.editor().active(), Some(2));
+        assert_eq!(format!("{:?}", w.ui.editor().document(1).unwrap()), old);
+        let new = w.ui.editor().document(2).unwrap();
+        assert_eq!(new.text(), "");
+        assert_eq!(new.revision(), 0);
+        assert_eq!(
+            new.selection(),
+            crate::model::Selection {
+                anchor: 0,
+                caret: 0
+            }
+        );
+        assert_eq!(new.history_depth(), (0, 0));
+        assert!(!new.dirty());
+        assert!(crate::control::state(&w.ui)
+            .unwrap()
+            .contains("\ttab=2,0,0,0,0,0,0,72,0,lf\t"));
+        assert!(w
+            .control_response(&crate::control::Request::parse(b"1\t0\tstate").unwrap())
+            .contains("\tprefix=0\t"));
+        assert!(w.frames.generation().unwrap() > generation);
+        done(&mut w);
+        w.draw().unwrap();
+        drain(&peer);
+        assert_ne!(w.pixels, pixels);
+        assert_eq!(w.files.as_ref().unwrap().labels().count(), 0);
+        let marks = w.spelling.snapshot(w.ui.editor(), 1, 1).unwrap();
+        assert_eq!(marks.status, crate::spelling::ScanStatus::Complete);
+        assert_eq!(marks.marks.len(), 1);
+        assert_eq!(marks.marks.first(), Some(&(0..1)));
+        // The response names its tab even if physical New runs before state.
+        w.ui.dispatch(Event::Profile(Profile::Windows)).unwrap();
+        w.chord("C-n", false).unwrap();
+        assert_eq!(w.ui.editor().active(), Some(3));
+        let mut client = control_client(&path, b"1\t2\tselect-tab\t2\t0");
+        assert_eq!(control_answer(&mut w, &mut client, &peer), "1\t2\tok\t");
+        assert_eq!(w.ui.editor().active(), Some(2));
+        // Exercise the real model cap, not a test-only admission exception.
+        for id in 4..=64 {
+            let request = crate::control::Request::parse(b"1\t3\tnew").unwrap();
+            assert_eq!(w.control_response(&request), format!("1\t3\tok\t{id}"));
+        }
+        w.ui.dispatch(Event::Profile(Profile::Emacs)).unwrap();
+        w.chord("C-x", false).unwrap();
+        let state = crate::control::Request::parse(b"1\t0\tstate").unwrap();
+        let before = w.control_response(&state);
+        let mut client = control_client(&path, b"1\t4\tnew");
+        assert!(control_answer(&mut w, &mut client, &peer).contains("\terror\tlimit\t"));
+        assert_eq!(w.control_response(&state), before);
+        assert_eq!(w.ui.editor().tabs().count(), 64);
+        assert_eq!(format!("{:?}", w.ui.editor().document(1).unwrap()), old);
+        w.stop_control();
+    }
+
+    #[test]
+    fn remote_new_preserves_an_inactive_scan_and_real_file_association() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = DialogDirectory::new();
+        std::fs::set_permissions(&directory.0, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let path = directory.path("control");
+        let document = directory.path("document");
+        let text = "wrong ".repeat(2048);
+        std::fs::write(&document, &text).unwrap();
+        let (mut w, peer) = file_dialog_fixture();
+        w.files.as_mut().unwrap().open(document.clone()).unwrap();
+        finish_file(&mut w);
+        w.chord("a", false).unwrap();
+        let edited = w.ui.editor().document(2).unwrap().text().to_owned();
+        let labels = w
+            .files
+            .as_ref()
+            .unwrap()
+            .labels()
+            .map(|(id, label)| (id, label.to_owned()))
+            .collect::<Vec<_>>();
+        assert_eq!(labels.len(), 1);
+        w.spelling
+            .install(crate::spelling::Dictionary::parse(b"known").unwrap());
+        w.control = Some(
+            crate::control_worker::Worker::start(
+                crate::control_socket::Socket::bind(&path).unwrap(),
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            job_request(&mut w, &peer, &path, "1\t1\tcheck-spelling\t2\t1"),
+            "1\t1\tpending\t1"
+        );
+        assert_eq!(
+            job_request(&mut w, &peer, &path, "1\t2\tnew"),
+            "1\t2\tok\t3"
+        );
+        assert!(job_request(&mut w, &peer, &path, "1\t0\tstate")
+            .contains("job=1,spelling,2,1,1,pending,-"));
+        assert_eq!(
+            w.files
+                .as_ref()
+                .unwrap()
+                .labels()
+                .map(|(id, label)| (id, label.to_owned()))
+                .collect::<Vec<_>>(),
+            labels
+        );
+        assert_eq!(std::fs::read_to_string(&document).unwrap(), text);
+        for _ in 0..32 {
+            if !w.spelling.running() {
+                break;
+            }
+            w.end_turn(w.clock, false).unwrap();
+        }
+        assert!(!w.spelling.running());
+        assert!(job_request(&mut w, &peer, &path, "1\t0\tstate")
+            .contains("job=1,spelling,2,1,1,complete,-"));
+        assert_eq!(
+            job_request(&mut w, &peer, &path, "1\t3\tselect-tab\t2\t1"),
+            "1\t3\tok\t"
+        );
+        w.chord("C-s", false).unwrap();
+        assert!(w.prompt.is_none()); // Existing association, not Save As.
+        finish_file(&mut w);
+        assert_eq!(std::fs::read_to_string(&document).unwrap(), edited);
+        assert!(!w.ui.editor().document(2).unwrap().dirty());
+        assert!(!w.ui.editor().document(3).unwrap().dirty());
+        assert_eq!(w.ui.editor().document(3).unwrap().text(), "");
         w.stop_control();
     }
 
@@ -5665,6 +5850,7 @@ mod tests {
             let before = w.control_response(&state);
             let notice = w.notice.clone();
             for command in [
+                "new",
                 "select-tab\t1\t1",
                 "select-range\t1\t1\t0\t0",
                 "insert\t1\t1\t1\t1\t62",
@@ -5706,11 +5892,13 @@ mod tests {
         let revision = w.ui.editor().document(tab).unwrap().revision();
         let state = crate::control::Request::parse(b"1\t0\tstate").unwrap();
         let before = w.control_response(&state);
-        for command in ["undo", "check-spelling"] {
-            let request = crate::control::Request::parse(
-                format!("1\t1\t{command}\t{tab}\t{revision}").as_bytes(),
-            )
-            .unwrap();
+        for command in [
+            format!("undo\t{tab}\t{revision}"),
+            format!("check-spelling\t{tab}\t{revision}"),
+            "new".into(),
+        ] {
+            let request =
+                crate::control::Request::parse(format!("1\t1\t{command}").as_bytes()).unwrap();
             assert!(w
                 .control_response(&request)
                 .contains("\terror\tunavailable\t"));
@@ -6320,7 +6508,7 @@ mod tests {
             control_answer(&mut w, &mut client, &peer),
             "1\t11\tok\t1\t61"
         );
-        let mut client = control_client(&path, b"1\t12\tnew");
+        let mut client = control_client(&path, b"1\t12\tnew\textra");
         assert!(control_answer(&mut w, &mut client, &peer).starts_with("1\t12\terror\tprotocol\t"));
         assert_eq!(w.control_response(&state), before);
         w.chord("Escape", false).unwrap();

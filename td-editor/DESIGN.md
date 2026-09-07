@@ -25,7 +25,8 @@ is not implemented yet. The optional native control socket now exposes
 state/text and scan-pinned spelling queries, plus revision/selection-checked
 edits. Native redraw/submitted/callback generations and bounded `wait-frame`
 acknowledgement are connected. Remote Check Spelling returns a job ID with
-bounded completion/error/cancellation history in native state. Remote file
+bounded completion/error/cancellation history in native state. Remote New
+creates an ordinary empty tab and returns its stable ID. Remote file
 operations and dialog answers remain unimplemented.
 Replay emits explicit external-operation requests and does not pretend to
 perform native file, clipboard or display work.
@@ -2109,7 +2110,10 @@ Remote Check Spelling invokes ordinary F7 admission and returns a checked
 window-local job ID. Native state retains up to 64 ordered historical outcomes,
 evicts only terminal rows, and exposes the associated scan ID for result pages.
 CONTROL.md defines startup errors, cancellation, completion, eviction and
-transport-lifetime semantics. Remote file operations and dialog answers remain
+transport-lifetime semantics. Remote New uses the ordinary controller event,
+returns the created tab ID, and preserves existing text and file associations.
+It has no revision target or file authority; CONTROL.md pins its non-idempotent
+admission and refusal rules. Remote file operations and dialog answers remain
 unimplemented.
 The complete endpoint below remains the version-1 target; controller
 generations are not presentation evidence.

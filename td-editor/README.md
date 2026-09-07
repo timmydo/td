@@ -71,8 +71,10 @@ The safe `control` library supplies one-frame decoding, controller state/text
 queries and revision-checked edits through the shared controller. See
 [CONTROL.md](CONTROL.md) for exact fields and bounds. The experimental
 `--window --control-socket PATH` option connects state/text inspection and
-coarse native modal/job/spelling flags. It also supports Select Tab/Range,
-Insert, Delete, Undo, Redo, Fill Paragraph, literal Find and Replace All.
+coarse native modal/job/spelling flags. Remote `new` creates an ordinary
+empty tab and returns its stable ID without touching existing documents or
+opening a file. The control endpoint also supports Select Tab/Range, Insert,
+Delete, Undo, Redo, Fill Paragraph, literal Find and Replace All.
 Insert/Delete/Fill/Find check the expected directed selection as well as the
 tab revision; native modals refuse remote edits. Auto Fill, fill-column and
 key-profile setters and Go To Line also use revision-checked native control

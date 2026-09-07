@@ -96,6 +96,7 @@ pub fn frame(payload: &[u8]) -> Result<Vec<u8>> {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Operation {
     State,
+    New,
     WaitFrame(u64),
     CheckSpelling {
         tab: TabId,
@@ -229,6 +230,7 @@ impl Request {
         let result = (|| {
             let operation = match name {
                 "state" => Operation::State,
+                "new" => Operation::New,
                 "wait-frame" => Operation::WaitFrame(decimal(args.next().ok_or(Error::Protocol)?)?),
                 "check-spelling" => Operation::CheckSpelling {
                     tab: decimal(args.next().ok_or(Error::Protocol)?)?,
@@ -343,6 +345,7 @@ impl Request {
                 limit,
             } => page(ui, *tab, *revision, *offset, *limit),
             Operation::Edit { .. }
+            | Operation::New
             | Operation::CheckSpelling { .. }
             | Operation::SpellingResults { .. }
             | Operation::WaitFrame(_) => Err(Error::Unavailable),
@@ -375,7 +378,11 @@ impl Request {
     }
 
     pub(crate) fn is_mutating(&self) -> bool {
-        self.is_edit() || matches!(self.operation, Operation::CheckSpelling { .. })
+        self.is_edit()
+            || matches!(
+                self.operation,
+                Operation::New | Operation::CheckSpelling { .. }
+            )
     }
 
     pub(crate) fn spelling_response(
@@ -718,6 +725,25 @@ mod tests {
     use super::*;
     use crate::model::{Command, Selection};
     use crate::ui::Event;
+
+    #[test]
+    fn new_tab_admission_is_native_only_and_has_no_arguments() {
+        let request = Request::parse(b"1\t8\tnew").unwrap();
+        assert_eq!(request.operation, Operation::New);
+        assert!(request.is_mutating());
+        let mut ui = Controller::default();
+        assert!(request.response(&ui).contains("\terror\tunavailable\t"));
+        assert_eq!(request.execute(&mut ui), Err(Error::InvalidArgument));
+        assert_eq!(ui.editor().tabs().count(), 0);
+        for extra in ["1", "extra", ""] {
+            assert_eq!(
+                Request::parse(format!("1\t8\tnew\t{extra}").as_bytes())
+                    .unwrap_err()
+                    .error,
+                Error::Protocol,
+            );
+        }
+    }
 
     #[test]
     fn spelling_job_admission_is_native_only_and_strictly_framed() {
@@ -1158,7 +1184,7 @@ mod tests {
             ("1\t12\tstate\n", 0),
             ("1\t12\tstáte", 0),
             ("1\t12\tstate\t", 12),
-            ("1\t12\tnew", 12),
+            ("1\t12\tnew\t1", 12),
             ("1\t12\tinsert\t1\t0\t61", 12),
             ("1\t12\ttext\t1\t0\t0", 12),
             ("1\t12\ttext\t1\t0\t-1\t4", 12),
@@ -1713,7 +1739,7 @@ mod tests {
             "undo\t1\t0\t0",
             "redo\t1\t-1",
             "fill-paragraph\t1\t0",
-            "new",
+            "new\t",
             "open\t2f746d702f78",
             "close-tab\t1\t0",
             "quit",

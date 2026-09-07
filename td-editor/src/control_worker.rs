@@ -392,7 +392,7 @@ mod tests {
                 },
             ),
             (
-                frame(b"1\t9\tnew").unwrap(),
+                frame(b"1\t9\tnew\textra").unwrap(),
                 false,
                 Refusal {
                     id: 9,

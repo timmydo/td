@@ -401,6 +401,9 @@ fn native_control_is_opt_in_and_liveness_checked_with_bounded_outer_turns() {
     assert!(dispatch.contains("self.closed || self.pointer_modal() || self.menu.is_some()"));
     assert!(dispatch.contains("request.execute(&mut self.ui)"));
     assert!(dispatch.contains("request.spelling_response(&self.ui, &self.spelling)"));
+    assert_eq!(dispatch.matches("self.ui.dispatch(").count(), 1);
+    assert_eq!(dispatch.matches("Event::").count(), 1);
+    assert!(dispatch.contains("self.ui.dispatch(Event::New)"));
     assert!(!dispatch.contains("Event::Discard"));
     assert!(!dispatch.contains("Event::Saved"));
     let startup = production.split("pub fn file_window(").nth(1).unwrap();

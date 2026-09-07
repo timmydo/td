@@ -59,18 +59,20 @@ In the examples below, field spaces denote literal Tab separators.
 | Payload fields | Meaning |
 | --- | --- |
 | `1 ID state` | Snapshot the current controller. |
+| `1 ID new` | Create and activate an empty tab; return its stable ID. |
 | `1 ID text TAB REVISION OFFSET LIMIT` | Read a scalar-aligned UTF-8 page. |
 | `1 ID spelling-results TAB REVISION SCAN OFFSET LIMIT` | Read native spelling status and a scan-pinned range page. |
 | `1 ID wait-frame GENERATION` | Wait for a main-surface callback at or beyond this native redraw generation. |
 | `1 ID check-spelling TAB REVISION` | Admit an on-demand whole-document spelling job for the active tab. |
 
-The editing subset is specified below. `new`, `load`, file I/O,
+Tab creation and the editing subset are specified below. `load`, file I/O,
 physical-input simulation and dialog answers remain refused; this parser is
 not a route into replay's broader command set.
 `Request::response` borrows `&Controller`, so it cannot dispatch an edit or
 change selection, views, history or generation. It returns `unavailable`
-for editing, spelling and frame requests; only `Request::execute` admits
-edits, and the native adapter supplies its spelling/frame state.
+for creation, editing, spelling and frame requests; `Request::execute`
+admits edits, and the native adapter dispatches creation and supplies its
+spelling/frame state.
 
 An error response is `1 ID error CODE HEX_DIAGNOSTIC`. A recoverable request
 ID is echoed even if the command name is missing or later arguments are
@@ -82,6 +84,37 @@ lowercase hex. Empty byte strings use `-`; nonempty hex has two lowercase
 digits per byte. `hex`/`unhex` and the frame/page limits are shared with
 replay, whose old public helper names remain re-exports, not duplicate codecs.
 Replay also uses the bounded response-frame encoder.
+
+## Tab creation
+
+`1 ID new` has no arguments. The native adapter dispatches the same
+`Event::New` as the File > New menu and replay, returning `1 ID ok TAB`
+with the newly allocated stable tab ID. The tab becomes active and is empty,
+clean and unnamed, with revision zero, an empty selection at byte zero,
+empty Undo/Redo history and ordinary new-document defaults. Existing tabs,
+their file associations, dirty text, selections, history and spelling
+reports remain intact. A scan on an existing tab may keep running.
+No filesystem operation, background job or prompt is created.
+
+This command does not target existing text, so it has no expected tab or
+revision. It is not idempotent: each admitted request creates a separate tab,
+even when the caller reuses a request ID. Request IDs are correlation values,
+not deduplication tokens. The returned tab ID belongs to that admission;
+another input can select or create a different tab before a subsequent
+state query. Do not blindly retry a lost reply.
+
+The same closed/quitting/modal and transport-liveness guards as remote
+edits apply before dispatch. The ordinary 64-tab ceiling and checked tab
+and controller counters refuse before input/view changes. These admission
+refusals preserve all state and do not cancel a pending Paste. New consumes
+the same tab budget as a pending Open; taking the last slot can make that
+Open refuse when its read completes, without creating a file-backed tab.
+Success resets controller
+input, cancels native Paste/repeat/drag/wrap context as applicable, and
+invalidates the native frame. The reply is not presentation evidence;
+use state and `wait-frame` separately. The immutable controller-only
+response API returns `unavailable`; creation is a native action, while
+headless tests can dispatch `Event::New` directly or use replay `new`.
 
 ## Revision-checked editing
 
