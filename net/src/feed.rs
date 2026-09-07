@@ -241,10 +241,7 @@ fn snapshot_for_serve_before(path: &Path, guard: &ResponseGuard<'_>) -> io::Resu
     for _ in 0..128 {
         guard.check()?;
         let nonce = NEXT_SNAPSHOT.fetch_add(1, Ordering::Relaxed);
-        let tmp = parent.join(format!(
-            ".td-feed-serve-{}-{nonce}.tmp",
-            std::process::id()
-        ));
+        let tmp = parent.join(format!(".td-feed-serve-{}-{nonce}.tmp", std::process::id()));
         let opened = OpenOptions::new()
             .read(true)
             .write(true)
@@ -278,7 +275,10 @@ fn snapshot_for_serve_before(path: &Path, guard: &ResponseGuard<'_>) -> io::Resu
                 ));
             }
             let chunk = buf.get(..n).ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidData, "snapshot read exceeded its buffer")
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "snapshot read exceeded its buffer",
+                )
             })?;
             hasher.update(chunk);
             snapshot.write_all(chunk)?;
@@ -471,12 +471,50 @@ fn download_verified_policy(
     if !allow_redirects && guard.is_none() {
         return Err("redirect refusal requires a transfer deadline".into());
     }
+    acquire_verified(
+        dst,
+        want,
+        url,
+        guard,
+        |path| {
+            if let Some(guard) = guard {
+                guard.check().map_err(|e| e.to_string())?;
+                if allow_redirects {
+                    crate::http::get_to_file_before(url, path, MAX_ARTIFACT_BYTES, guard.deadline)?;
+                } else {
+                    crate::http::get_to_file_accounted_no_redirects_before(
+                        url,
+                        path,
+                        MAX_ARTIFACT_BYTES,
+                        &AtomicU64::new(0),
+                        MAX_ARTIFACT_BYTES,
+                        guard.deadline,
+                    )?;
+                }
+                guard.check().map_err(|e| e.to_string())?;
+            } else {
+                crate::http::get_to_file(url, path, MAX_ARTIFACT_BYTES)?;
+            }
+            Ok(())
+        },
+        || Ok(()),
+    )
+}
+
+/// One locked publication path for downloaded and locally exported artifacts.
+fn acquire_verified(
+    dst: &Path,
+    want: &str,
+    source: &str,
+    guard: Option<&ResponseGuard<'_>>,
+    acquire: impl FnOnce(&Path) -> Result<(), String>,
+    finish: impl FnOnce() -> Result<(), String>,
+) -> Result<(), String> {
     static NEXT_DOWNLOAD: AtomicU64 = AtomicU64::new(0);
     let parent = dst
         .parent()
         .ok_or_else(|| format!("download destination {} has no parent", dst.display()))?;
-    std::fs::create_dir_all(parent)
-        .map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
+    std::fs::create_dir_all(parent).map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
     require_disk_backed(parent).map_err(|e| e.to_string())?;
     // Serializing downloads within one destination directory lowers demand
     // and makes crash cleanup race-free. SIGKILL releases this lock, so the
@@ -519,7 +557,7 @@ fn download_verified_policy(
             .map_err(|e| format!("hash {}: {e}", dst.display()))?;
     }
     if existing.ok().as_deref() == Some(want) {
-        return Ok(());
+        return finish();
     }
     let (path, reservation) = loop {
         let nonce = NEXT_DOWNLOAD.fetch_add(1, Ordering::Relaxed);
@@ -544,56 +582,46 @@ fn download_verified_policy(
         _reservation: reservation,
     };
     (|| {
-        if let Some(guard) = guard {
-            guard.check().map_err(|e| e.to_string())?;
-            if allow_redirects {
-                crate::http::get_to_file_before(
-                    url, &tmp.path, MAX_ARTIFACT_BYTES, guard.deadline,
-                )?;
-            } else {
-                crate::http::get_to_file_accounted_no_redirects_before(
-                    url, &tmp.path, MAX_ARTIFACT_BYTES,
-                    &AtomicU64::new(0), MAX_ARTIFACT_BYTES, guard.deadline,
-                )?;
-            }
-            guard.check().map_err(|e| e.to_string())?;
-        } else {
-            crate::http::get_to_file(url, &tmp.path, MAX_ARTIFACT_BYTES)?;
-        }
+        acquire(&tmp.path)?;
         let got = file_sha256_before(&tmp.path, MAX_ARTIFACT_BYTES, guard)
             .map_err(|e| format!("hash {}: {e}", tmp.path.display()))?;
         if got != want {
             return Err(format!(
-                "sha256 mismatch for {url}\n  want {want}\n  got  {got}"
+                "sha256 mismatch for {source}\n  want {want}\n  got  {got}"
             ));
         }
-        std::fs::rename(&tmp.path, dst)
-            .map_err(|e| format!("publish {}: {e}", dst.display()))?;
-        Ok(())
+        std::fs::rename(&tmp.path, dst).map_err(|e| format!("publish {}: {e}", dst.display()))?;
+        finish()
     })()
 }
 
 /// Warm one entry into `store` (+ its sidecar); Ok(true) if fetched, Ok(false) if already
 /// warm + verified. Never egresses for an entry already present + matching.
 fn warm_one(e: &Entry, store: &Path) -> Result<bool, String> {
-    let dst =
-        store_path(store, &e.path).ok_or_else(|| format!("unsafe index path {:?}", e.path))?;
-    let side = sidecar_path(&dst);
-    if let Ok(have) = file_sha256(&dst) {
-        if have == e.sha256 {
-            // File is warm; make sure the integrity sidecar is present + correct.
-            let ok = read_digest_sidecar(&side)
-                .map(|digest| digest == e.sha256)
-                .unwrap_or(false);
-            if !ok {
+    if !source_feed_path_is_safe(&e.path) {
+        return Err(format!("unsafe feed artifact path {:?}", e.path));
+    }
+    let dst = store.join(&e.path);
+    let mut fetched = false;
+    acquire_verified(
+        &dst,
+        &e.sha256,
+        &e.url,
+        None,
+        |temp| {
+            crate::http::get_to_file(&e.url, temp, MAX_ARTIFACT_BYTES)?;
+            fetched = true;
+            Ok(())
+        },
+        || {
+            let side = sidecar_path(&dst);
+            if read_digest_sidecar(&side).ok().as_deref() != Some(&e.sha256) {
                 write_atomic(&side, format!("{}\n", e.sha256).as_bytes())?;
             }
-            return Ok(false);
-        }
-    }
-    download_verified(&e.url, &dst, &e.sha256)?;
-    write_atomic(&side, format!("{}\n", e.sha256).as_bytes())?;
-    Ok(true)
+            Ok(())
+        },
+    )?;
+    Ok(fetched)
 }
 
 /// Warm every entry; returns (fetched, already-warm).
@@ -646,9 +674,9 @@ impl<'a> ResponseGuard<'a> {
 }
 
 fn response_remaining(deadline: Instant) -> io::Result<Duration> {
-    deadline.checked_duration_since(Instant::now()).ok_or_else(|| {
-        io::Error::new(io::ErrorKind::TimedOut, "feed response deadline expired")
-    })
+    deadline
+        .checked_duration_since(Instant::now())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "feed response deadline expired"))
 }
 
 fn client_disconnected(conn: &TcpStream) -> io::Result<bool> {
@@ -693,7 +721,10 @@ fn write_before(conn: &mut TcpStream, mut bytes: &[u8], deadline: Instant) -> io
             ));
         }
         bytes = bytes.get(count..).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidData, "feed response write exceeded its buffer")
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "feed response write exceeded its buffer",
+            )
         })?;
     }
     Ok(())
@@ -739,7 +770,10 @@ fn respond_file_before(
     while remaining > 0 {
         let width = usize::try_from(remaining.min(buf.len() as u64)).unwrap_or(buf.len());
         let chunk = buf.get_mut(..width).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidData, "feed response read exceeded its buffer")
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "feed response read exceeded its buffer",
+            )
         })?;
         let count = file.read(chunk)?;
         if count == 0 {
@@ -749,7 +783,10 @@ fn respond_file_before(
             ));
         }
         let bytes = chunk.get(..count).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidData, "feed response read exceeded its buffer")
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "feed response read exceeded its buffer",
+            )
         })?;
         write_before(conn, bytes, deadline)?;
         remaining = remaining.saturating_sub(u64::try_from(count).unwrap_or(u64::MAX));
@@ -1135,9 +1172,9 @@ fn serve_crate_before(
     let idxpath = index_path(cr).ok_or_else(|| format!("bad download crate name {cr:?}"))?;
     if ver.is_empty()
         || ver.len() > 128
-        || !ver.bytes().all(|byte| {
-            byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'+' | b'_')
-        })
+        || !ver
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'+' | b'_'))
     {
         return Err(format!("bad download version {ver:?}"));
     }
@@ -1272,7 +1309,9 @@ fn handle_cargo_conn(mut conn: TcpStream, store: &Path, base: &str) -> io::Resul
         cargo_route_before(store, base, target, &guard)
     };
     match route {
-        Ok(CargoBody::Bytes(bytes)) => respond_before(&mut conn, 200, "OK", &bytes, response_deadline),
+        Ok(CargoBody::Bytes(bytes)) => {
+            respond_before(&mut conn, 200, "OK", &bytes, response_deadline)
+        }
         Ok(CargoBody::File(mut file, len)) => {
             respond_file_before(&mut conn, &mut file, len, response_deadline)
         }
@@ -1734,9 +1773,9 @@ fn account_locked_cargo_source(
     if index_path(name).is_none()
         || version.is_empty()
         || version.len() > 128
-        || !version.bytes().all(|byte| {
-            byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'+' | b'_')
-        })
+        || !version
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'+' | b'_'))
     {
         return Err(format!(
             "Cargo.lock registry package has an unsafe name or version: `{name}-{version}'"
@@ -1937,7 +1976,9 @@ fn warm_crate(root: &Path, krate: &str, ver: &str, dest: &str) {
     let dlurl = format!("http://{addr}/dl/{krate}/{ver}/download");
     if std::fs::create_dir_all(&work).is_err()
         || crate::http::get_to_file(&dlurl, &srccrate, MAX_ARTIFACT_BYTES).is_err()
-        || std::fs::metadata(&srccrate).map(|m| m.len() == 0).unwrap_or(true)
+        || std::fs::metadata(&srccrate)
+            .map(|m| m.len() == 0)
+            .unwrap_or(true)
     {
         eprintln!("td-feed warm crate: could not stage the source crate for {krate}-{ver}");
         return;
@@ -2036,12 +2077,7 @@ fn warm_crate(root: &Path, krate: &str, ver: &str, dest: &str) {
 /// committed lock. The archive is re-hashed to bind this warm job to its source
 /// pin, but dependency selection needs neither its manifest nor an extracted
 /// scratch source tree: the committed lock is the build gate's exact oracle.
-fn valid_crate_source_coordinates(
-    file: &str,
-    sha256: &str,
-    lock: &str,
-    dest: &str,
-) -> bool {
+fn valid_crate_source_coordinates(file: &str, sha256: &str, lock: &str, dest: &str) -> bool {
     let file_is_plain = Path::new(file).file_name() == Some(std::ffi::OsStr::new(file));
     let lock_is_plain = Path::new(lock).file_name() == Some(std::ffi::OsStr::new("Cargo.lock"))
         && Path::new(lock)
@@ -2404,45 +2440,152 @@ fn shared_feed() -> Option<(String, PathBuf)> {
     }
 }
 
+fn source_feed_path(pin: &SourcePin) -> Result<&str, String> {
+    if pin.file.is_empty()
+        || pin.file == "."
+        || pin.file == ".."
+        || pin.file.contains('/')
+        || pin.file.contains('\\')
+        || reserved_download_name(&pin.file)
+    {
+        return Err(format!("unsafe source cache filename for {}", pin.key));
+    }
+    let path = pin
+        .url
+        .strip_prefix("https://")
+        .or_else(|| pin.url.strip_prefix("http://"))
+        .ok_or_else(|| format!("source {} is not an HTTP artifact", pin.key))?;
+    if !source_feed_path_is_safe(path) {
+        return Err(format!("source {} has no safe feed path", pin.key));
+    }
+    Ok(path)
+}
+
+fn source_feed_path_is_safe(path: &str) -> bool {
+    !path.is_empty()
+        && !path.contains(['?', '#'])
+        && path.split('/').all(|part| {
+            !part.is_empty()
+                && part != "."
+                && part != ".."
+                && !part.ends_with(".sha256")
+                && !reserved_download_name(part)
+        })
+}
+
+fn reserved_download_name(name: &str) -> bool {
+    name == ".td-feed-download.lock" || name.starts_with(".td-feed-download-")
+}
+
+fn export_source_pin(pin: &SourcePin, sources: &Path, store: &Path) -> Result<(), String> {
+    let path = source_feed_path(pin)?;
+    let dst = store.join(path);
+    let guard = ResponseGuard::without_client(Instant::now() + SOURCE_CONSUMER_TIMEOUT);
+    let source = sources.join(&pin.file);
+    acquire_verified(
+        &dst,
+        &pin.sha256,
+        &source.display().to_string(),
+        Some(&guard),
+        |temp| {
+            let mut input =
+                File::open(&source).map_err(|e| format!("open {}: {e}", source.display()))?;
+            let metadata = input
+                .metadata()
+                .map_err(|e| format!("stat {}: {e}", source.display()))?;
+            if !metadata.is_file() || metadata.len() > MAX_ARTIFACT_BYTES {
+                return Err(format!(
+                    "source {} is not a bounded regular file",
+                    source.display()
+                ));
+            }
+            let mut output =
+                File::create(temp).map_err(|e| format!("open {}: {e}", temp.display()))?;
+            let mut buffer = [0u8; 64 * 1024];
+            let mut count = 0u64;
+            loop {
+                guard.check().map_err(|e| e.to_string())?;
+                let read = input
+                    .read(&mut buffer)
+                    .map_err(|e| format!("read {}: {e}", source.display()))?;
+                if read == 0 {
+                    break;
+                }
+                count = count
+                    .checked_add(read as u64)
+                    .ok_or("source byte count overflow")?;
+                if count > MAX_ARTIFACT_BYTES {
+                    return Err("source exceeds artifact byte ceiling".into());
+                }
+                let bytes = buffer.get(..read).ok_or("invalid source read length")?;
+                output
+                    .write_all(bytes)
+                    .map_err(|e| format!("write {}: {e}", temp.display()))?;
+            }
+            Ok(())
+        },
+        || write_atomic(&sidecar_path(&dst), format!("{}\n", pin.sha256).as_bytes()),
+    )
+}
+
+/// Populate the read-only HTTP feed from already downloaded private bytes.
+/// Missing pins fail visibly; this path never fetches or starts a daemon.
+fn export_source_pins(pins: &[SourcePin], sources: &Path, store: &Path) -> Result<(), String> {
+    if pins.is_empty() {
+        return Err("no recipe source pins to export".into());
+    }
+    let mut failures = Vec::new();
+    for pin in pins {
+        match export_source_pin(pin, sources, store) {
+            Ok(()) => eprintln!(">> td-feed export sources: {} verified", pin.file),
+            Err(error) => failures.push(format!("{} ({}): {error}", pin.key, pin.file)),
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("{} source archive(s) were not exported:\n{}\nWarm the named pins on the host, then retry; export never downloads.", failures.len(), failures.join("\n")))
+    }
+}
+
 /// Explicit consumers never populate a producer store or fall back upstream.
 fn consume_source_pins(pins: &[SourcePin], dest: &Path, base: &str) -> Result<(), String> {
     let base = base.trim_end_matches('/');
-    let authority = base.strip_prefix("http://")
+    let authority = base
+        .strip_prefix("http://")
         .or_else(|| base.strip_prefix("https://"))
         .ok_or("TD_FEED_BASE must be an http:// or https:// endpoint")?;
-    if authority.is_empty() || authority.bytes().any(|b| {
-        b.is_ascii_whitespace() || b.is_ascii_control() || matches!(b, b'/' | b'?' | b'#' | b'@' | b'\\')
-    }) {
-        return Err("TD_FEED_BASE must name one server without a path, query or credentials".into());
+    if authority.is_empty()
+        || authority.bytes().any(|b| {
+            b.is_ascii_whitespace()
+                || b.is_ascii_control()
+                || matches!(b, b'/' | b'?' | b'#' | b'@' | b'\\')
+        })
+    {
+        return Err(
+            "TD_FEED_BASE must name one server without a path, query or credentials".into(),
+        );
     }
     if pins.is_empty() {
         return Err("no recipe source pins to consume".into());
     }
     let mut failures = Vec::new();
     for pin in pins {
-        if pin.file.is_empty() || pin.file == "." || pin.file == ".."
-            || pin.file.contains('/') || pin.file.contains('\\')
-            || pin.file == ".td-feed-download.lock"
-            || pin.file.starts_with(".td-feed-download-")
-        {
-            return Err(format!("unsafe source destination for {}", pin.key));
-        }
-        let path = pin.url.strip_prefix("https://")
-            .or_else(|| pin.url.strip_prefix("http://"))
-            .ok_or_else(|| format!("source {} is not an HTTP artifact", pin.key))?;
-        if store_path(Path::new("."), path).is_none() {
-            return Err(format!("source {} has no safe feed path", pin.key));
-        }
-        let guard = ResponseGuard::without_client(Instant::now() + SOURCE_CONSUMER_TIMEOUT);
-        let result = download_verified_policy(
-            &format!("{base}/{path}"), &dest.join(&pin.file), &pin.sha256,
-            Some(&guard), false,
-        );
+        let result = source_feed_path(pin).and_then(|path| {
+            let guard = ResponseGuard::without_client(Instant::now() + SOURCE_CONSUMER_TIMEOUT);
+            download_verified_policy(
+                &format!("{base}/{path}"),
+                &dest.join(&pin.file),
+                &pin.sha256,
+                Some(&guard),
+                false,
+            )
+        });
         match result {
             Ok(()) => eprintln!(">> td-feed consume sources: {} verified", pin.file),
             Err(error) => {
                 let failure = format!(
-                    "source {} ({}): {error}; resolve any local cache error above; if the host entry is missing or mismatched, warm this declared pin on the host ({} SHA-256 {}); upstream fallback is disabled",
+                    "source {} ({}): {error}; resolve any local cache error above; if the host entry is missing or mismatched, export this declared pin on the host with td-feed export sources (warm missing host bytes first; {} SHA-256 {}); upstream fallback is disabled",
                     pin.key, pin.file, pin.url, pin.sha256,
                 );
                 eprintln!(">> td-feed consume sources: {failure}");
@@ -2450,14 +2593,19 @@ fn consume_source_pins(pins: &[SourcePin], dest: &Path, base: &str) -> Result<()
             }
         }
     }
-    if failures.is_empty() { Ok(()) } else {
-        Err(format!("{} source archive(s) were not acquired:\n{}", failures.len(), failures.join("\n")))
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "{} source archive(s) were not acquired:\n{}",
+            failures.len(),
+            failures.join("\n")
+        ))
     }
 }
 
 fn consume_sources(root: &Path) -> Result<(), String> {
-    let base = std::env::var("TD_FEED_BASE")
-        .map_err(|_| "requires TD_FEED_BASE".to_string())?;
+    let base = std::env::var("TD_FEED_BASE").map_err(|_| "requires TD_FEED_BASE".to_string())?;
     let pins = recipe_source_pins_result(root)?;
     consume_source_pins(&pins, &sources_dir(), &base)?;
     warm_kernel_headers_from_pins("i386", &pins);
@@ -3086,9 +3234,7 @@ fn feed_addr_reachable(addr: &str) -> bool {
     let Ok(mut socks) = addr.to_socket_addrs() else {
         return false;
     };
-    socks.any(|sa| {
-        TcpStream::connect_timeout(&sa, std::time::Duration::from_secs(1)).is_ok()
-    })
+    socks.any(|sa| TcpStream::connect_timeout(&sa, std::time::Duration::from_secs(1)).is_ok())
 }
 
 /// `td-feed ensure-serve` — ensure ONE shared, persistent td-feed `serve` daemon
@@ -3183,11 +3329,9 @@ fn ensure_serve_daemon(feed_dir: &Path) -> Result<String, String> {
     // TD_FEED_BIN the operator aimed at a standalone (non-multicall) feed executable — must be
     // invoked verbatim (`<bin> serve …`), never handed a spurious `feed` arg it can't parse.
     let is_umbrella = Path::new(&bin).file_name().and_then(|s| s.to_str()) == Some("td-net");
-    let log = std::fs::File::create(&log_f)
-        .map_err(|e| format!("create {}: {e}", log_f.display()))?;
-    let log2 = log
-        .try_clone()
-        .map_err(|e| format!("clone log fd: {e}"))?;
+    let log =
+        std::fs::File::create(&log_f).map_err(|e| format!("create {}: {e}", log_f.display()))?;
+    let log2 = log.try_clone().map_err(|e| format!("clone log fd: {e}"))?;
     let mut cmd = Command::new(&bin);
     if is_umbrella {
         cmd.arg("feed");
@@ -3228,6 +3372,14 @@ fn ensure_serve_daemon(feed_dir: &Path) -> Result<String, String> {
 
 pub fn run(a: &[String]) {
     match a.get(1).map(String::as_str) {
+        Some("export") if a.len() == 3 && a.get(2).map(String::as_str) == Some("sources") => {
+            let result = recipe_source_pins_result(&repo_root()).and_then(|pins| {
+                export_source_pins(&pins, &sources_dir(), &feed_dir().join("store"))
+            });
+            if let Err(error) = result {
+                die(format!("export sources: {error}"));
+            }
+        }
         Some("consume") if a.len() == 3 && a.get(2).map(String::as_str) == Some("sources") => {
             if let Err(error) = consume_sources(&repo_root()) {
                 die(format!("consume sources: {error}"));
@@ -3328,7 +3480,7 @@ pub fn run(a: &[String]) {
                  td-feed warm sources\n  td-feed warm kernel-headers ARCH\n  \
                  td-feed warm ostree REPOSITORY REF COMMIT CONTENT DEST\n  \
                  td-feed serve STORE ADDR\n  \
-                 td-feed consume sources  (requires TD_FEED_BASE; no upstream fallback)\n  td-feed ensure-serve\n  td-feed cargo-proxy STORE ADDR\n  td-feed selftest\n  \
+                 td-feed export sources  (publish existing host archives; no downloads)\n  td-feed consume sources  (requires TD_FEED_BASE; no upstream fallback)\n  td-feed ensure-serve\n  td-feed cargo-proxy STORE ADDR\n  td-feed selftest\n  \
                  td-feed cargo-proxy-selftest\n  td-feed warm-selftest"
             );
             std::process::exit(2);
@@ -3339,13 +3491,12 @@ pub fn run(a: &[String]) {
 #[cfg(test)]
 mod tests {
     use super::{
-        is_warm_complete, mark_warm_complete,
         cargo_route, detach_from_workspace, download_verified, ensure_serve_daemon,
-        feed_daemon_policy, file_sha256_before, index_path, mount_is_memory_backed,
-        parse_locked_cargo_sources, parse_serve_addr, read_digest_sidecar, real_relative_file,
-        resolve_feed_dir, snapshot_for_serve, snapshot_for_serve_before, sweep_download_temps,
-        sweep_kernel_header_temps, valid_crate_source_coordinates, write_before, FeedDaemonPolicy,
-        ResponseGuard, RESPONSE_DEADLINE,
+        feed_daemon_policy, file_sha256_before, index_path, is_warm_complete, mark_warm_complete,
+        mount_is_memory_backed, parse_locked_cargo_sources, parse_serve_addr, read_digest_sidecar,
+        real_relative_file, resolve_feed_dir, snapshot_for_serve, snapshot_for_serve_before,
+        sweep_download_temps, sweep_kernel_header_temps, valid_crate_source_coordinates,
+        write_before, FeedDaemonPolicy, ResponseGuard, RESPONSE_DEADLINE,
     };
     use std::io::Read;
     use std::path::PathBuf;
@@ -3496,10 +3647,7 @@ mod tests {
         let (server, _) = listener.accept().unwrap();
         client.shutdown(std::net::Shutdown::Both).unwrap();
         drop(client);
-        let guard = ResponseGuard::client(
-            std::time::Instant::now() + RESPONSE_DEADLINE,
-            &server,
-        );
+        let guard = ResponseGuard::client(std::time::Instant::now() + RESPONSE_DEADLINE, &server);
 
         let error = snapshot_for_serve_before(&path, &guard).unwrap_err();
 
@@ -3561,16 +3709,10 @@ mod tests {
                       33 30 0:4 / /huge rw - hugetlbfs hugetlbfs rw\n\
                       34 30 0:5 / /devices rw - devtmpfs devtmpfs rw\n";
         assert!(!mount_is_memory_backed(std::path::Path::new("/home/u"), mounts, 0).unwrap());
-        assert!(
-            mount_is_memory_backed(std::path::Path::new("/dev/shm/cache"), mounts, 0).unwrap()
-        );
-        assert!(
-            mount_is_memory_backed(std::path::Path::new("/overlay/cache"), mounts, 0).unwrap()
-        );
+        assert!(mount_is_memory_backed(std::path::Path::new("/dev/shm/cache"), mounts, 0).unwrap());
+        assert!(mount_is_memory_backed(std::path::Path::new("/overlay/cache"), mounts, 0).unwrap());
         assert!(mount_is_memory_backed(std::path::Path::new("/huge/cache"), mounts, 0).unwrap());
-        assert!(
-            mount_is_memory_backed(std::path::Path::new("/devices/cache"), mounts, 0).unwrap()
-        );
+        assert!(mount_is_memory_backed(std::path::Path::new("/devices/cache"), mounts, 0).unwrap());
     }
 
     #[test]
@@ -3611,7 +3753,10 @@ mod tests {
         assert_eq!(index_path("a"), Some("1/a".to_string()));
         assert_eq!(index_path("AB"), Some("2/ab".to_string()));
         assert_eq!(index_path("abc"), Some("3/a/abc".to_string()));
-        assert_eq!(index_path("serde_json"), Some("se/rd/serde_json".to_string()));
+        assert_eq!(
+            index_path("serde_json"),
+            Some("se/rd/serde_json".to_string())
+        );
         assert_eq!(index_path("aéx"), None);
 
         let dir = unique_tmp_dir("cargo-route-input");
@@ -3660,9 +3805,16 @@ mod tests {
                 sha256: super::hex_sha256(b"bytes"), file: name.into(),
             };
             let error = super::consume_source_pins(&[pin], &dir, "http://127.0.0.1:0").unwrap_err();
-            assert!(error.contains("unsafe source destination"), "{error}");
+            assert!(error.contains("unsafe source cache filename"), "{error}");
         }
-        let error = super::download_verified_policy("http://127.0.0.1:0", &dir.join("source"), "", None, false).unwrap_err();
+        let error = super::download_verified_policy(
+            "http://127.0.0.1:0",
+            &dir.join("source"),
+            "",
+            None,
+            false,
+        )
+        .unwrap_err();
         assert!(error.contains("requires a transfer deadline"));
         assert!(!dir.exists());
     }
@@ -3676,8 +3828,11 @@ mod tests {
 
     impl ConsumerServer {
         fn start(store: PathBuf, response: Option<Vec<u8>>) -> Self {
-            use std::sync::{Arc, atomic::{AtomicBool, AtomicUsize, Ordering}};
             use std::io::Write;
+            use std::sync::{
+                atomic::{AtomicBool, AtomicUsize, Ordering},
+                Arc,
+            };
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             listener.set_nonblocking(true).unwrap();
             let base = format!("http://{}", listener.local_addr().unwrap());
@@ -3691,7 +3846,9 @@ mod tests {
                         Ok((mut stream, _)) => {
                             seen.fetch_add(1, Ordering::Relaxed);
                             if let Some(bytes) = &response {
-                                stream.set_read_timeout(Some(std::time::Duration::from_secs(2))).unwrap();
+                                stream
+                                    .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                                    .unwrap();
                                 let mut scratch = [0; 4096];
                                 let _ = stream.read(&mut scratch);
                                 let _ = stream.write_all(bytes);
@@ -3706,7 +3863,12 @@ mod tests {
                     }
                 }
             });
-            Self { base, requests, stop, thread: Some(thread) }
+            Self {
+                base,
+                requests,
+                stop,
+                thread: Some(thread),
+            }
         }
         fn count(&self) -> usize {
             self.requests.load(std::sync::atomic::Ordering::Relaxed)
@@ -3718,6 +3880,253 @@ mod tests {
             self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
             if let Some(thread) = self.thread.take() { let _ = thread.join(); }
         }
+    }
+
+    #[test]
+    fn export_publication_keeps_its_lock_through_cold_and_warm_sidecars() {
+        let dir = unique_tmp_dir("export-publish-lock");
+        std::fs::create_dir_all(&dir).unwrap();
+        let dst = dir.join("source.tar");
+        let bytes = b"verified source";
+        let digest = super::hex_sha256(bytes);
+        for warm in [false, true] {
+            let guard = super::ResponseGuard::without_client(
+                std::time::Instant::now() + std::time::Duration::from_secs(2),
+            );
+            super::acquire_verified(
+                &dst,
+                &digest,
+                "fixture bytes",
+                Some(&guard),
+                |temp| {
+                    assert!(!warm, "warm entry unnecessarily copied");
+                    std::fs::write(temp, bytes).map_err(|e| e.to_string())
+                },
+                || {
+                    assert_eq!(std::fs::read(&dst).unwrap(), bytes);
+                    let competing = std::fs::OpenOptions::new()
+                        .write(true)
+                        .open(dir.join(".td-feed-download.lock"))
+                        .unwrap();
+                    assert!(matches!(
+                        competing.try_lock(),
+                        Err(std::fs::TryLockError::WouldBlock)
+                    ));
+                    super::write_atomic(
+                        &super::sidecar_path(&dst),
+                        format!("{digest}\n").as_bytes(),
+                    )
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                super::read_digest_sidecar(&super::sidecar_path(&dst)).unwrap(),
+                digest
+            );
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn concurrent_exporters_leave_a_matching_object_and_sidecar() {
+        let dir = unique_tmp_dir("export-concurrent");
+        let store = dir.join("store");
+        let barrier = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| {
+            for (name, bytes) in [
+                ("first", b"first content".as_slice()),
+                ("second", b"second content".as_slice()),
+            ] {
+                let sources = dir.join(name);
+                std::fs::create_dir_all(&sources).unwrap();
+                std::fs::write(sources.join("source.tar"), bytes).unwrap();
+                let store = &store;
+                let barrier = &barrier;
+                scope.spawn(move || {
+                    let pin = super::SourcePin {
+                        key: name.into(),
+                        url: "https://example.invalid/source.tar".into(),
+                        file: "source.tar".into(),
+                        sha256: super::hex_sha256(bytes),
+                    };
+                    barrier.wait();
+                    for _ in 0..16 {
+                        super::export_source_pin(&pin, &sources, store).unwrap();
+                    }
+                });
+            }
+        });
+        let dst = store.join("example.invalid/source.tar");
+        assert_eq!(
+            super::file_sha256(&dst).unwrap(),
+            super::read_digest_sidecar(&super::sidecar_path(&dst)).unwrap()
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn warming_and_export_share_the_same_publication_lock() {
+        let dir = unique_tmp_dir("warm-export-concurrent");
+        let source = dir.join("source");
+        let store = dir.join("store");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(source.join("source.tar"), b"exported").unwrap();
+        let origin = ConsumerServer::start(
+            dir.join("upstream"),
+            Some(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: close\r\n\r\nwarmed".to_vec(),
+            ),
+        );
+        let pin = super::SourcePin {
+            key: "fixture".into(),
+            url: format!("{}/source.tar", origin.base),
+            file: "source.tar".into(),
+            sha256: super::hex_sha256(b"exported"),
+        };
+        let entry = super::Entry {
+            path: super::strip_scheme(&pin.url),
+            url: pin.url.clone(),
+            sha256: super::hex_sha256(b"warmed"),
+        };
+        let barrier = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                barrier.wait();
+                for _ in 0..16 {
+                    super::warm_one(&entry, &store).unwrap();
+                }
+            });
+            scope.spawn(|| {
+                barrier.wait();
+                for _ in 0..16 {
+                    super::export_source_pin(&pin, &source, &store).unwrap();
+                }
+            });
+        });
+        let dst = store.join(&entry.path);
+        assert_eq!(
+            super::file_sha256(&dst).unwrap(),
+            super::read_digest_sidecar(&super::sidecar_path(&dst)).unwrap()
+        );
+        assert!(origin.count() > 0);
+        drop(origin);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn exported_private_sources_feed_two_guests_without_upstream_or_shared_writes() {
+        let dir = unique_tmp_dir("export-consumers");
+        let sources = dir.join("sources");
+        let store = dir.join("store");
+        std::fs::create_dir_all(&sources).unwrap();
+        let origin = ConsumerServer::start(dir.join("upstream"), None);
+        let bytes = b"already downloaded on the host";
+        let pin = super::SourcePin {
+            key: "fixture".into(),
+            url: format!("{}/source.tar", origin.base),
+            sha256: super::hex_sha256(bytes),
+            file: "source.tar".into(),
+        };
+        std::fs::write(sources.join(&pin.file), bytes).unwrap();
+        super::export_source_pins(std::slice::from_ref(&pin), &sources, &store).unwrap();
+        let hosted = store.join(super::strip_scheme(&pin.url));
+        assert_eq!(std::fs::read(&hosted).unwrap(), bytes);
+        assert_eq!(
+            super::read_digest_sidecar(&super::sidecar_path(&hosted)).unwrap(),
+            pin.sha256
+        );
+        std::fs::write(sources.join(&pin.file), b"changed private copy").unwrap();
+        assert_eq!(std::fs::read(&hosted).unwrap(), bytes);
+        std::fs::remove_file(super::sidecar_path(&hosted)).unwrap();
+        super::export_source_pins(std::slice::from_ref(&pin), &sources, &store).unwrap();
+        let feed = ConsumerServer::start(store.clone(), None);
+        for guest in ["one", "two"] {
+            super::consume_source_pins(std::slice::from_ref(&pin), &dir.join(guest), &feed.base)
+                .unwrap();
+            assert_eq!(
+                std::fs::read(dir.join(guest).join(&pin.file)).unwrap(),
+                bytes
+            );
+        }
+        std::fs::write(dir.join("one").join(&pin.file), b"guest mutation").unwrap();
+        assert_eq!(
+            std::fs::read(dir.join("two").join(&pin.file)).unwrap(),
+            bytes
+        );
+        assert_eq!(std::fs::read(&hosted).unwrap(), bytes);
+        assert_eq!(origin.count(), 0);
+        assert_eq!(feed.count(), 2);
+        drop(feed);
+        drop(origin);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn export_refuses_corrupt_missing_and_reserved_sources_without_partial_publication() {
+        let dir = unique_tmp_dir("export-refusal");
+        let sources = dir.join("sources");
+        let store = dir.join("store");
+        std::fs::create_dir_all(&sources).unwrap();
+        let pin = super::SourcePin {
+            key: "bad".into(),
+            url: "https://example.invalid/bad.tar".into(),
+            sha256: super::hex_sha256(b"expected"),
+            file: "bad.tar".into(),
+        };
+        let missing = super::SourcePin {
+            key: "missing".into(),
+            url: "https://example.invalid/missing.tar".into(),
+            sha256: pin.sha256.clone(),
+            file: "missing.tar".into(),
+        };
+        std::fs::write(sources.join(&pin.file), b"corrupt").unwrap();
+        let error = super::export_source_pins(&[pin, missing], &sources, &store).unwrap_err();
+        assert!(error.contains("2 source archive(s)"), "{error}");
+        assert!(
+            error.contains(&format!(
+                "sha256 mismatch for {}",
+                sources.join("bad.tar").display()
+            )),
+            "{error}"
+        );
+        assert!(error.contains("missing.tar"), "{error}");
+        let parent = store.join("example.invalid");
+        assert!(!parent.join("bad.tar").exists());
+        assert!(!parent.join("bad.tar.sha256").exists());
+        assert!(std::fs::read_dir(&parent).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .ends_with(".tmp")
+        }));
+        for url in [
+            "https://example.invalid/.td-feed-download.lock",
+            "https://example.invalid/.td-feed-download-1.tmp/file",
+            "https://example.invalid/source.tar.sha256",
+            "https://example.invalid/source.tar.sha256/child",
+            "https://example.invalid/source.tar?download=1",
+            "https://example.invalid/source.tar#fragment",
+        ] {
+            let pin = super::SourcePin {
+                key: "reserved".into(),
+                url: url.into(),
+                sha256: super::hex_sha256(b"ok"),
+                file: "safe.tar".into(),
+            };
+            assert!(super::export_source_pin(&pin, &sources, &store)
+                .unwrap_err()
+                .contains("safe feed path"));
+            let entry = super::Entry {
+                path: super::strip_scheme(&pin.url),
+                url: pin.url.clone(),
+                sha256: pin.sha256.clone(),
+            };
+            assert!(super::warm_one(&entry, &store)
+                .unwrap_err()
+                .contains("unsafe feed artifact path"));
+        }
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -3736,24 +4145,43 @@ mod tests {
         std::fs::write(super::sidecar_path(&host_file), format!("{}\n", pin.sha256)).unwrap();
         let feed = ConsumerServer::start(store, None);
         for guest in ["first", "second"] {
-            super::consume_source_pins(std::slice::from_ref(&pin), &dir.join(guest), &feed.base).unwrap();
-            assert_eq!(std::fs::read(dir.join(guest).join(&pin.file)).unwrap(), bytes);
+            super::consume_source_pins(std::slice::from_ref(&pin), &dir.join(guest), &feed.base)
+                .unwrap();
+            assert_eq!(
+                std::fs::read(dir.join(guest).join(&pin.file)).unwrap(),
+                bytes
+            );
         }
         assert_eq!(feed.count(), 2);
         assert_eq!(origin.count(), 0);
         std::fs::write(&host_file, b"corrupt host object").unwrap();
-        let error = super::consume_source_pins(std::slice::from_ref(&pin), &dir.join("third"), &feed.base).unwrap_err();
+        let error =
+            super::consume_source_pins(std::slice::from_ref(&pin), &dir.join("third"), &feed.base)
+                .unwrap_err();
         assert!(error.contains("500"), "{error}");
         assert!(!dir.join("third").join(&pin.file).exists());
         std::fs::write(&host_file, bytes).unwrap();
         // A warm private cache remains usable after the host feed is unavailable.
-        super::consume_source_pins(std::slice::from_ref(&pin), &dir.join("first"), "http://127.0.0.1:0").unwrap();
+        super::consume_source_pins(
+            std::slice::from_ref(&pin),
+            &dir.join("first"),
+            "http://127.0.0.1:0",
+        )
+        .unwrap();
         std::fs::write(dir.join("first").join(&pin.file), b"private mutation").unwrap();
         assert_eq!(std::fs::read(&host_file).unwrap(), bytes);
-        assert_eq!(std::fs::read(dir.join("second").join(&pin.file)).unwrap(), bytes);
+        assert_eq!(
+            std::fs::read(dir.join("second").join(&pin.file)).unwrap(),
+            bytes
+        );
         drop(feed);
         let restarted = ConsumerServer::start(dir.join("host"), None);
-        super::consume_source_pins(std::slice::from_ref(&pin), &dir.join("third"), &restarted.base).unwrap();
+        super::consume_source_pins(
+            std::slice::from_ref(&pin),
+            &dir.join("third"),
+            &restarted.base,
+        )
+        .unwrap();
         assert_eq!(origin.count(), 0);
         drop(restarted);
         drop(origin);
@@ -3764,13 +4192,28 @@ mod tests {
     fn consumer_reports_all_missing_pins_in_one_pass() {
         let dir = unique_tmp_dir("consumer-all-misses");
         let feed = ConsumerServer::start(dir.join("empty"), None);
-        let pins: Vec<_> = ["first", "second"].into_iter().map(|key| super::SourcePin {
-            key: key.into(), url: format!("https://example.invalid/{key}"),
-            sha256: super::hex_sha256(b"bytes"), file: key.into(),
-        }).collect();
+        let mut pins: Vec<_> = ["first", "second"]
+            .into_iter()
+            .map(|key| super::SourcePin {
+                key: key.into(),
+                url: format!("https://example.invalid/{key}"),
+                sha256: super::hex_sha256(b"bytes"),
+                file: key.into(),
+            })
+            .collect();
+        pins.insert(
+            0,
+            super::SourcePin {
+                key: "invalid".into(),
+                url: "https://example.invalid/safe".into(),
+                sha256: super::hex_sha256(b"bytes"),
+                file: "..".into(),
+            },
+        );
         let error = super::consume_source_pins(&pins, &dir.join("guest"), &feed.base).unwrap_err();
-        assert!(error.contains("2 source archive(s)"), "{error}");
+        assert!(error.contains("3 source archive(s)"), "{error}");
         assert!(error.contains("source first") && error.contains("source second"));
+        assert!(error.contains("unsafe source cache filename"));
         assert_eq!(feed.count(), 2);
         drop(feed);
         std::fs::remove_dir_all(dir).unwrap();
@@ -3793,7 +4236,7 @@ mod tests {
             let feed = ConsumerServer::start(dir.join("unused"), Some(response));
             let dest = dir.join(index.to_string());
             let error = super::consume_source_pins(std::slice::from_ref(&pin), &dest, &feed.base).unwrap_err();
-            assert!(error.contains("warm this declared pin on the host"), "{error}");
+            assert!(error.contains("export this declared pin on the host"), "{error}");
             assert!(!dest.join(&pin.file).exists());
             assert_eq!(feed.count(), if index == 3 { 3 } else { 1 });
             assert_eq!(origin.count(), 0);
@@ -3805,10 +4248,7 @@ mod tests {
 
     #[test]
     fn hosted_checks_never_create_an_implicit_feed_daemon() {
-        assert_eq!(
-            feed_daemon_policy(None, true),
-            FeedDaemonPolicy::Disabled
-        );
+        assert_eq!(feed_daemon_policy(None, true), FeedDaemonPolicy::Disabled);
         assert_eq!(
             feed_daemon_policy(Some("http://127.0.0.1:9".to_string()), true),
             FeedDaemonPolicy::Explicit("http://127.0.0.1:9".to_string()),
@@ -3830,7 +4270,10 @@ mod tests {
         detach_from_workspace(&manifest).unwrap();
         let once = std::fs::read_to_string(&manifest).unwrap();
         assert!(once.contains("[workspace]"), "{once}");
-        assert!(once.contains("name = \"rg\""), "the package must survive: {once}");
+        assert!(
+            once.contains("name = \"rg\""),
+            "the package must survive: {once}"
+        );
         // Re-running leaves it byte-identical (a warm re-extracts and re-detaches).
         detach_from_workspace(&manifest).unwrap();
         assert_eq!(once, std::fs::read_to_string(&manifest).unwrap());
@@ -3907,7 +4350,9 @@ mod tests {
             flags.contains(&"-cf"),
             "must create an UNCOMPRESSED tar (-cf), got {flags:?}"
         );
-        for bad in ["-z", "-czf", "-cJf", "-cjf", "--gzip", "--xz", "--bzip2", "--zstd"] {
+        for bad in [
+            "-z", "-czf", "-cJf", "-cjf", "--gzip", "--xz", "--bzip2", "--zstd",
+        ] {
             assert!(
                 !flags.contains(&bad),
                 "compression flag {bad} reintroduces host-dependent (non-reproducible) bytes"
@@ -3935,7 +4380,10 @@ mod tests {
         let removes_tar_options = cmd
             .get_envs()
             .any(|(k, v)| k == "TAR_OPTIONS" && v.is_none());
-        assert!(removes_tar_options, "packing must scrub ambient TAR_OPTIONS");
+        assert!(
+            removes_tar_options,
+            "packing must scrub ambient TAR_OPTIONS"
+        );
         let pins_c_locale = cmd
             .get_envs()
             .any(|(k, v)| k == "LC_ALL" && v == Some(std::ffi::OsStr::new("C")));
@@ -3944,7 +4392,10 @@ mod tests {
             .get_args()
             .map(|a| a.to_string_lossy().into_owned())
             .collect();
-        assert!(args.contains(&"-cf".to_string()), "must stay uncompressed (-cf)");
+        assert!(
+            args.contains(&"-cf".to_string()),
+            "must stay uncompressed (-cf)"
+        );
         for bad in ["-z", "--gzip", "-czf"] {
             assert!(!args.iter().any(|a| a == bad), "must not pack with {bad}");
         }
@@ -3956,7 +4407,9 @@ mod tests {
         use std::path::Path;
         // Classification: markers/command-records are byproducts; headers are not.
         assert!(super::is_kbuild_byproduct(Path::new("/k/asm/.install")));
-        assert!(super::is_kbuild_byproduct(Path::new("/k/asm/..install.cmd")));
+        assert!(super::is_kbuild_byproduct(Path::new(
+            "/k/asm/..install.cmd"
+        )));
         assert!(!super::is_kbuild_byproduct(Path::new("/k/asm/types.h")));
         assert!(!super::is_kbuild_byproduct(Path::new("/k/linux/version.h")));
 
@@ -4075,12 +4528,7 @@ mod tests {
                 "recipes/locks/codex/Cargo.lock",
                 "codex",
             ),
-            (
-                "source.tar.gz",
-                sha.as_str(),
-                "../Cargo.lock",
-                "codex",
-            ),
+            ("source.tar.gz", sha.as_str(), "../Cargo.lock", "codex"),
             (
                 "source.tar.gz",
                 sha.as_str(),
@@ -4094,10 +4542,8 @@ mod tests {
 
     #[test]
     fn committed_lock_resolution_rejects_symlinks() {
-        let root = std::env::temp_dir().join(format!(
-            "td-feed-committed-lock-{}",
-            std::process::id()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("td-feed-committed-lock-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("locks/real")).unwrap();
         std::fs::write(root.join("locks/real/Cargo.lock"), "version = 4\n").unwrap();

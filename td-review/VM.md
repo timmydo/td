@@ -289,6 +289,18 @@ one. The command supplies that selection to the existing evaluator helper.
 Like `warm sources`, it attempts local kernel-header preparation after the
 archives are present; that best-effort preparation is not a readiness claim.
 
+On the host, run `td-feed export sources` to publish the selected checkout's
+already downloaded `~/.td/sources` archives into `~/.td/feed/store` (or
+`TD_FEED_DIR/store`). It verifies each pin, copies through a bounded atomic
+publication path, and writes the feed's integrity sidecar before releasing
+the writer lock. Each archive must satisfy both the 16 GiB size ceiling
+and two-minute deadline. A concurrent read during replacement can fail closed until
+both files are published; retry the read. Export never downloads
+or starts a daemon. Already verified feed entries need no local archive;
+missing or corrupt archives are reported together. Run `td-feed ensure-serve`
+to expose the result through the existing loopback server. This closes the
+case where a warm private host cache had never populated its HTTP feed.
+
 `warm sources` remains the host producer operation and may fetch upstream,
 including when `TD_FEED_BASE` is set. The consumer command currently covers
 recipe source archives only; VM endpoint provisioning and the remaining
