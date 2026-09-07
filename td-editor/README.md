@@ -356,8 +356,9 @@ Temporary SHM files are private, immediately unlinked, and bounded to three
 buffers; busy buffers are never overwritten before compositor release.
 
 The native td-compositor editor tests need no existing display or hardware.
-`ready` builds their compositor tool and runs both key profiles automatically
-when the editor is selected. To run just this tier from the repository root:
+`ready` builds their compositor tool and runs both key profiles plus native
+pointer selection and menu tests when the editor is selected. To run just
+this tier from the repository root:
 
 ```text
 target/release/td-builder gate-crates native-compositor --manifest-path td-editor/Cargo.toml
@@ -373,13 +374,17 @@ TD_TEST_COMPOSITOR="$PWD/td-compositor/target/debug/td-compositor" \
   --test control_process native_compositor:: -- --include-ignored
 ```
 
-This starts and reaps a private compositor/editor pair for each key profile.
+This starts and reaps a private compositor/editor pair for each case.
 Real routed Shift/Control input, exact remote text/revision assertions,
 frame callbacks, correlated public captures and saved bytes are checked.
+The pointer case drags a word, verifies release through a later unheld move,
+replaces and undoes it, and opens/cancels Edit > Find through real input.
 The capture must contain the expected Unifont text at the document origin
-after every edit, excluding only the one-pixel blinking caret column.
+after every edit, excluding the one-pixel blinking caret column when it
+falls within the sampled prefix. Caret visibility and open menu/prompt
+pixels are not asserted by this case; menu transitions use semantic state.
 Bare Cargo leaves these process cases ignored; their decoder tests run by
-default. Native pointer/wheel/clipboard coverage is subsequent work.
+default. Native wheel/clipboard coverage is subsequent work.
 This does not prove GPU or jail integration.
 
 An optional test runs against a separately launched Weston (not a dependency

@@ -1167,6 +1167,8 @@ impl Window {
                 .words(pool, 0, &[buffer, 0, 16, 24, 64, 0])?;
             self.connection.words(pool, 1, &[])?;
             self.set_kind(pool, Kind::Retired)?;
+            // Establish the cursor role before publishing its first buffer.
+            self.connection.words(device, 0, &[serial, surface, 0, 0])?;
             self.connection.words(surface, 1, &[buffer, 0, 0])?;
             self.connection.words(surface, 2, &[0, 0, 16, 24])?;
             self.connection.words(surface, 6, &[])?;
@@ -1175,6 +1177,7 @@ impl Window {
                 buffer,
                 busy: true,
             });
+            return Ok(());
         }
         let image = self.cursor_image.as_ref().ok_or("cursor image missing")?;
         self.connection
@@ -5182,10 +5185,15 @@ mod tests {
         let pointer = w.pointer.device.unwrap();
         let (requests, files) = drain(&peer);
         assert_eq!(files.len(), 1);
-        assert_eq!(
-            requests.last().unwrap(),
-            &message(pointer, 0, &[19, surface, 0, 0])
-        );
+        let role = requests.iter().position(|request| {
+            *request == message(pointer, 0, &[19, surface, 0, 0])
+        }).unwrap();
+        assert_eq!(&requests[role..], &[
+            message(pointer, 0, &[19, surface, 0, 0]),
+            message(surface, 1, &[buffer, 0, 0]),
+            message(surface, 2, &[0, 0, 16, 24]),
+            message(surface, 6, &[]),
+        ]);
         let file = &files[0];
         use std::os::unix::fs::MetadataExt;
         assert_eq!(file.metadata().unwrap().mode() & 0o777, 0o600);

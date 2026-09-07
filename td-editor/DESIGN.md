@@ -1408,7 +1408,9 @@ carry resets when the next frame targets a different tab or revision.
 On enter, after ARGB8888 is advertised, one code-defined 16x24 charcoal/warm
 arrow is installed with that enter's serial and hotspot (0,0). It uses a
 separate surface and one unlinked 0600 backing file through the existing
-SHM pool request. The local file closes after transfer; the server-owned
+SHM pool request. Send `set_cursor` before the first buffer
+attach/damage/commit, including when ARGB support arrives after enter.
+The local file closes after transfer; the server-owned
 pool/buffer retains its bytes. Its 1536 bytes are immutable for the connection
 lifetime, never rewritten while busy or reattached on enter. A release is
 accepted exactly once for the sole attachment; subsequent enters reuse the
@@ -2189,15 +2191,27 @@ bracketed by a stable positive client publication newer than the pre-input
 snapshot, with matching session/window/client and completed-output bounds.
 The document prefix at output (8,72) must match Aone, Abone, then Aone
 painted with the pinned Unifont and existing editor raster, excluding only
-the one-pixel blinking caret column. This is a shared-font/raster oracle
+the one-pixel blinking caret column when it falls within that prefix.
+This is a shared-font/raster oracle
 for actual transported pixels, not an independent test of the font painter.
 Caret-only redraws can advance publication, so semantic state and pixel
 checks remain necessary. Save verifies exact disk bytes; normal shutdown
 checks editor control cleanup and owner-EOF compositor directory removal.
 Guards reap the editor before its compositor before deleting fixture files.
 
-This proves native keyboard/state/callback/pixel integration, not GPU,
-hardware input, jail or caller `$EDITOR` integration. Pointer/menu/wheel and
+The native pointer case uses complete output-coordinate reports to drag
+over exactly `one`, release, then move unheld before replacing the selection
+with `b`. Exact state and captured `b two` pixels prove the selected extent
+and release behavior. Undo restores the document; a click collapses its
+restored selection. Native clicks open Edit > Find and native Escape closes
+it; callbacks, restored document pixels and saved bytes are checked too.
+This also exercises the real cursor role/first-buffer ordering on enter.
+The case checks menu/prompt transitions semantically and document pixels
+after dismissal; it does not assert open menu/prompt pixels or caret
+visibility. Those are separate visual-coverage boundaries.
+
+This proves native keyboard/pointer/menu/state/callback/pixel integration,
+not GPU, hardware input, jail or caller `$EDITOR` integration. Wheel and
 inter-client clipboard scenarios remain the following native increments.
 Weston remains separate optional interoperability evidence below.
 

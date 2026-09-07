@@ -100,9 +100,10 @@ fn ppm<'a>(reply: &'a [u8], session: &str) -> Result<(u64, &'a [u8])> {
 
 impl Compositor {
     fn start(directory: &Directory) -> Self {
-        let binary = PathBuf::from(std::env::var_os("TD_TEST_COMPOSITOR").expect(
-            "set TD_TEST_COMPOSITOR to an explicitly built td-compositor; see README",
-        ));
+        let binary = PathBuf::from(
+            std::env::var_os("TD_TEST_COMPOSITOR")
+                .expect("set TD_TEST_COMPOSITOR to an explicitly built td-compositor; see README"),
+        );
         assert!(
             binary.is_absolute(),
             "compositor test tool must be an absolute path"
@@ -186,18 +187,51 @@ impl Compositor {
     }
 
     fn key(&mut self, key: u32, down: bool) {
-        let action = self.action + 1;
+        // Timestamps follow the receipt counter; callers do not send action IDs.
+        let time = self.action + 1;
         let line = format!(
-            "key {} {action} {key} {}",
+            "key {} {time} {key} {}",
             self.session,
             if down { "down" } else { "up" }
         );
+        self.receipt(&line);
+    }
+
+    fn receipt(&mut self, line: &str) {
+        let action = self.action + 1;
         let expected = format!(
             "ok\ntd-action-v1 session={} action={action}\n",
             self.session
         );
-        assert_eq!(self.request(&line, 1024), expected.as_bytes());
+        assert_eq!(self.request(line, 1024), expected.as_bytes());
         self.action = action;
+    }
+
+    fn pointer(&mut self, x: u32, y: u32, buttons: u8) {
+        let time = self.action + 1;
+        self.receipt(&format!(
+            "pointer {} {time} {x} {y} {buttons} 0 0",
+            self.session
+        ));
+    }
+
+    fn click(&mut self, x: u32, y: u32) {
+        self.pointer(x, y, 1);
+        self.pointer(x, y, 0);
+    }
+
+    fn stop(&mut self) {
+        self.child.stdin.take();
+        let deadline = Instant::now() + TIMEOUT;
+        loop {
+            if let Some(status) = self.child.try_wait().unwrap() {
+                assert!(status.success());
+                break;
+            }
+            assert!(Instant::now() < deadline, "compositor owner-EOF deadline");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(!self.directory.exists());
     }
 
     fn chord(&mut self, modifier: Option<u32>, key: u32) {
@@ -256,7 +290,7 @@ impl Compositor {
         );
         let expected = text_pixels(text);
         let width = text.len() * 8;
-        assert!(caret < text.len());
+        assert!(caret <= text.len());
         let deadline = Instant::now() + TIMEOUT;
         loop {
             assert!(
@@ -278,7 +312,8 @@ impl Compositor {
             assert!(output > first.output && output <= second.output);
             // Desktop bar stays 24px high in fullscreen; the document starts
             // at surface (8,48), hence output (8,72). Ignore only the
-            // one-pixel caret column so blinking cannot hide a text change.
+            // one-pixel caret column when it falls inside the sampled prefix.
+            // This compares text pixels, not caret visibility.
             let equal = (0..16).all(|y| {
                 (0..width).all(|x| {
                     if x == caret * 8 {
@@ -311,7 +346,7 @@ impl Drop for Compositor {
 }
 
 fn text_pixels(text: &str) -> Vec<u8> {
-    use td_editor::render::{Draw, Geometry, GlyphStyle, INK, PAPER, Primitive, Raster, Scale};
+    use td_editor::render::{Draw, Geometry, GlyphStyle, Primitive, Raster, Scale, INK, PAPER};
     assert!(text.is_ascii() && !text.is_empty() && text.len() <= 32);
     let font = td_editor::font::pinned().unwrap();
     let width = text.len() * 8;
@@ -370,17 +405,7 @@ fn keyboard_profile(profile: &str) {
     editor.job("save\t1\t3");
     assert_eq!(std::fs::read(&file).unwrap(), b"Aone\n");
     editor.quit();
-    compositor.child.stdin.take();
-    let deadline = Instant::now() + TIMEOUT;
-    loop {
-        if let Some(status) = compositor.child.try_wait().unwrap() {
-            assert!(status.success());
-            break;
-        }
-        assert!(Instant::now() < deadline, "compositor owner-EOF deadline");
-        std::thread::sleep(Duration::from_millis(2));
-    }
-    assert!(!compositor.directory.exists());
+    compositor.stop();
 }
 
 #[test]
@@ -393,6 +418,58 @@ fn native_windows_keyboard() {
 #[ignore = "requires explicit built TD_TEST_COMPOSITOR; ready prepares it"]
 fn native_emacs_keyboard() {
     keyboard_profile("emacs");
+}
+
+#[test]
+#[ignore = "requires explicit built TD_TEST_COMPOSITOR; ready prepares it"]
+fn native_pointer_selection_and_menus() {
+    let compositor_directory = Directory::new();
+    let directory = Directory::new();
+    let mut compositor = Compositor::start(&compositor_directory);
+    let file = directory.0.join("draft");
+    let dictionary = directory.0.join("dictionary");
+    std::fs::write(&file, b"one two\n").unwrap();
+    std::fs::write(&dictionary, b"one\ntwo\n").unwrap();
+    let display = compositor.directory.join("wayland-0");
+    let mut editor = EditorProcess::start(&directory, &display, &file, &dictionary);
+    editor.wait_keyboard("windows");
+    let window = compositor.window();
+    assert_eq!(compositor.request("fullscreen", 1024), b"ok\n");
+    editor.wait_field("state", "window", "800,576,1");
+    editor.rendered_at(800, 576);
+    // Output includes the 24px desktop bar: document origin is (8,72).
+    // Literal 8px-cell expectations are independent of editor hit testing.
+    compositor.pointer(9, 80, 0);
+    editor.wait_field("state", "pointer-ready", "1");
+    compositor.pointer(9, 80, 1);
+    compositor.pointer(33, 80, 1);
+    editor.wait_field("state", "tab", "1,0,0,8,0,3,0,72,0,lf");
+    compositor.pointer(33, 80, 0);
+    compositor.pointer(65, 80, 0);
+    let before = compositor.observe(&window);
+    compositor.chord(None, KEY_B);
+    // Unheld motion must not extend the selection: replace only "one".
+    editor.wait_tab(1, "b two\n");
+    compositor.rendered_text(&mut editor, &window, 1, before, "b two", 1);
+    compositor.chord(Some(KEY_LEFT_CTRL), KEY_Z);
+    editor.wait_tab(2, "one two\n");
+    let before = compositor.observe(&window);
+    compositor.click(65, 80); // Collapse Undo's restored selection after "two".
+    editor.wait_field("state", "tab", "1,2,0,8,7,7,0,72,0,lf");
+    compositor.rendered_text(&mut editor, &window, 2, before, "one two", 7);
+    compositor.click(68, 32); // Edit header: surface y=8 plus desktop bar.
+    editor.wait_field("state", "modal", "0,0,0,0,1,0,0,0,0");
+    compositor.click(68, 252); // Find: panel y=24, zero-based row eight.
+    editor.wait_field("prompt-state", "prompt", "find-forward");
+    let before = compositor.observe(&window);
+    compositor.chord(None, KEY_ESCAPE);
+    editor.wait_field("prompt-state", "prompt", "none");
+    editor.wait_tab(2, "one two\n");
+    compositor.rendered_text(&mut editor, &window, 2, before, "one two", 7);
+    editor.job("save\t1\t2");
+    assert_eq!(std::fs::read(&file).unwrap(), b"one two\n");
+    editor.quit();
+    compositor.stop();
 }
 
 #[test]
