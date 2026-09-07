@@ -386,8 +386,12 @@ pixels are not asserted by this case; menu transitions use semantic state.
 Bare Cargo leaves these process cases ignored; their decoder tests run by
 default. The vertical-wheel case checks forward and reverse detents against
 exact viewport rows and captured numbered-line pixels, with unchanged text,
-revision, selection, caret and disk bytes. Horizontal/high-resolution wheels
-and inter-client clipboard coverage remain subsequent work.
+revision, selection, caret and disk bytes. The clipboard case uses two
+editors in one private compositor: native Cut, another source edit, then
+native Paste must transfer the original UTF-8 snapshot with exact saved
+bytes. Distinct client identities and captured ASCII prefixes are checked;
+Unicode glyph pixels and clipboard-owner exit/cancellation are not.
+Horizontal/high-resolution wheels remain subsequent work.
 This does not prove GPU or jail integration.
 
 An optional test runs against a separately launched Weston (not a dependency

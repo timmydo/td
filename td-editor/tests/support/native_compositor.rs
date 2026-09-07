@@ -250,24 +250,27 @@ impl Compositor {
     }
 
     fn window(&self) -> String {
-        let layout = self.request("layout", 65536);
-        let text = std::str::from_utf8(&layout).unwrap();
-        let mut windows = text
-            .lines()
-            .filter_map(|line| line.strip_prefix("window id="));
-        let window = windows
-            .next()
-            .unwrap()
-            .split_whitespace()
-            .next()
-            .unwrap()
-            .to_string();
-        assert!(number(window.strip_prefix('@').unwrap()).unwrap() > 0);
-        assert!(
-            windows.next().is_none(),
+        let windows = self.windows();
+        assert_eq!(
+            windows.len(),
+            1,
             "fixture expects exactly one editor window"
         );
-        window
+        windows.into_iter().next().unwrap()
+    }
+
+    fn windows(&self) -> Vec<String> {
+        let layout = self.request("layout", 65536);
+        let text = std::str::from_utf8(&layout).unwrap();
+        text.lines()
+            .filter_map(|line| line.strip_prefix("window id="))
+            .map(|line| {
+                let window = line.split_whitespace().next().expect("layout window ID");
+                let id = window.strip_prefix('@').expect("layout window ID sigil");
+                assert!(number(id).expect("canonical layout window ID") > 0);
+                window.to_string()
+            })
+            .collect()
     }
 
     fn observe(&self, window: &str) -> Observation {
@@ -519,6 +522,86 @@ fn native_vertical_wheel_scrolls_without_editing() {
     }
     assert_eq!(std::fs::read(&file).unwrap(), text.as_bytes());
     editor.quit();
+    compositor.stop();
+}
+
+#[test]
+#[ignore = "requires explicit built TD_TEST_COMPOSITOR; ready prepares it"]
+fn native_clipboard_transfers_cut_snapshot_between_editors() {
+    let compositor_directory = Directory::new();
+    let source_directory = Directory::new();
+    let destination_directory = Directory::new();
+    let mut compositor = Compositor::start(&compositor_directory);
+    let source_path = source_directory.0.join("source");
+    let source_dictionary = source_directory.0.join("dictionary");
+    let text = "clip café e\u{301} 🦀\nsecond line\n";
+    std::fs::write(&source_path, text).unwrap();
+    std::fs::write(&source_dictionary, b"clip\nline\nsecond\n").unwrap();
+    let display = compositor.directory.join("wayland-0");
+    let mut source = EditorProcess::start(
+        &source_directory,
+        &display,
+        &source_path,
+        &source_dictionary,
+    );
+    source.wait_keyboard("windows");
+    let source_window = compositor.window();
+    assert_eq!(compositor.request("fullscreen", 1024), b"ok\n");
+    source.wait_field("state", "window", "800,576,1");
+    source.rendered_at(800, 576);
+    compositor.chord(Some(KEY_LEFT_CTRL), KEY_A);
+    compositor.chord(Some(KEY_LEFT_CTRL), KEY_X);
+    source.wait_tab(1, "");
+    let before = compositor.observe(&source_window);
+    compositor.chord(None, KEY_B);
+    source.wait_tab(2, "b");
+    compositor.rendered_text(&mut source, &source_window, 2, before, "b", 1);
+    source.job("save\t1\t2");
+    assert_eq!(std::fs::read(&source_path).unwrap(), b"b");
+    // Reveal tiling before mapping the destination. The reply fences the
+    // compositor layout change; no intermediate source frame is sampled.
+    assert_eq!(compositor.request("fullscreen", 1024), b"ok\n");
+
+    let destination_path = destination_directory.0.join("destination");
+    let destination_dictionary = destination_directory.0.join("dictionary");
+    std::fs::write(&destination_path, b"").unwrap();
+    std::fs::write(&destination_dictionary, b"clip\nline\nsecond\n").unwrap();
+    let mut destination = EditorProcess::start(
+        &destination_directory,
+        &display,
+        &destination_path,
+        &destination_dictionary,
+    );
+    destination.wait_keyboard("windows");
+    destination.wait_field("state", "focus", "1");
+    source.wait_field("state", "focus", "0");
+    let windows = compositor.windows();
+    assert_eq!(windows.len(), 2);
+    assert!(windows.contains(&source_window));
+    let destination_window = windows.iter().find(|id| **id != source_window).unwrap();
+    assert_eq!(compositor.request("fullscreen", 1024), b"ok\n");
+    destination.wait_field("state", "window", "800,576,1");
+    destination.rendered_at(800, 576);
+    destination.wait_tab(0, ""); // An offer is not an insertion.
+    let before_paste = compositor.observe(destination_window);
+    assert_ne!(before_paste.client, before.client);
+    compositor.chord(Some(KEY_LEFT_CTRL), KEY_V);
+    destination.wait_tab(1, text);
+    // The ASCII prefix proves transported pixels; full UTF-8 is checked above.
+    // The caret is on the final empty line; mask column 4 is outside the crop.
+    compositor.rendered_text(
+        &mut destination,
+        destination_window,
+        1,
+        before_paste,
+        "clip",
+        4,
+    );
+    destination.job("save\t1\t1");
+    assert_eq!(std::fs::read(&destination_path).unwrap(), text.as_bytes());
+    source.wait_tab(2, "b");
+    destination.quit();
+    source.quit();
     compositor.stop();
 }
 
