@@ -23,8 +23,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::fs::File;
 use std::io::{Read, Write};
+use std::os::fd::OwnedFd;
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{sync_channel, RecvTimeoutError, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -73,16 +76,14 @@ const FIRST_DYNAMIC_ID: u32 = DATA_DEVICE + 1;
 const DATA_DEVICE_MANAGER_VERSION: u32 = 3;
 const LEFT_BUTTON: u32 = 0x110;
 const CLIPBOARD_KEY: u16 = 46;
+const PASTE_KEY: u16 = 47;
+const PASTE_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_CLIPBOARD_BYTES: usize = 64 * 1024;
 const MAX_CLIPBOARD_SOURCES: usize = 8;
 const MAX_CLIPBOARD_SYNCS: usize = 8;
 const MAX_CLIPBOARD_OFFERS: usize = 8;
 const MAX_CLIPBOARD_WRITES: usize = 4;
-const CLIPBOARD_MIME_TYPES: [&str; 3] = [
-    "text/plain;charset=utf-8",
-    "text/plain",
-    "UTF8_STRING",
-];
+const CLIPBOARD_MIME_TYPES: [&str; 3] = ["text/plain;charset=utf-8", "text/plain", "UTF8_STRING"];
 const CLIPBOARD_PROOF_BYTES: &[u8; 7] = b"Welcome";
 const CLIPBOARD_TARGET_PREFIX: &str = "TD-TERM-CLIPBOARD-TARGET-READY";
 const CLIPBOARD_FOCUS_PREFIX: &str = "TD-TERM-CLIPBOARD-FOCUS-READY serial=";
@@ -298,10 +299,37 @@ struct PointerSelectionFrame {
     extent: (i32, i32),
 }
 
+#[derive(Default)]
+struct ClipboardOffer {
+    mime: Option<&'static str>,
+    count: usize,
+}
+
+struct PasteRequest {
+    id: u64,
+    stream: UnixStream,
+    cancel: Arc<AtomicBool>,
+}
+
+struct PendingPaste {
+    id: u64,
+    cancel: Arc<AtomicBool>,
+}
+
+impl Drop for PendingPaste {
+    fn drop(&mut self) {
+        self.cancel.store(true, Ordering::Relaxed);
+    }
+}
+
 struct ClipboardState {
     sources: BTreeMap<u32, Arc<[u8]>>,
     syncs: BTreeMap<u32, (u32, usize)>,
-    offers: BTreeSet<u32>,
+    offers: BTreeMap<u32, ClipboardOffer>,
+    selected_offer: Option<u32>,
+    incoming: Option<PendingPaste>,
+    paste_sequence: u64,
+    paste_reader: Option<SyncSender<PasteRequest>>,
     current: Option<u32>,
     registry: SourceRegistry,
 }
@@ -311,7 +339,11 @@ impl ClipboardState {
         Self {
             sources: BTreeMap::new(),
             syncs: BTreeMap::new(),
-            offers: BTreeSet::new(),
+            offers: BTreeMap::new(),
+            selected_offer: None,
+            incoming: None,
+            paste_sequence: 0,
+            paste_reader: None,
             current: None,
             registry: Arc::new(Mutex::new(BTreeMap::new())),
         }
@@ -409,6 +441,8 @@ struct Surface {
     /// driven by tests that inject events, not time.
     pending_key: Option<(u16, bool)>,
     pending_copy: Option<u32>,
+    pending_paste: bool,
+    keyboard_focused: bool,
     pending_clipboard_marker: Option<usize>,
     pending_clipboard_focus_marker: Option<u32>,
     clipboard_focus_pending: Option<u32>,
@@ -465,6 +499,8 @@ impl Surface {
             pending_input: None,
             pending_key: None,
             pending_copy: None,
+            pending_paste: false,
+            keyboard_focused: false,
             pending_clipboard_marker: None,
             pending_clipboard_focus_marker: None,
             clipboard_focus_pending: None,
@@ -570,6 +606,10 @@ impl Surface {
                     let capabilities = args.u32()?;
                     args.finish()?;
                     self.seat_capabilities = Some(capabilities);
+                    if capabilities & SEAT_KEYBOARD == 0 {
+                        self.keyboard_focused = false;
+                        self.cancel_paste();
+                    }
                     if capabilities & SEAT_KEYBOARD != 0 && !self.keyboard_requested {
                         let mut keyboard = wire::Builder::new();
                         keyboard.u32(KEYBOARD);
@@ -634,6 +674,7 @@ impl Surface {
                         args.u32()?;
                     }
                     args.finish()?;
+                    self.keyboard_focused = true;
                     if self.clipboard_proof && !self.reported_clipboard_focus {
                         self.clipboard_focus_pending = Some(serial);
                     }
@@ -652,6 +693,8 @@ impl Surface {
                     // Ctrl — but a client that kept one would be wrong, and the
                     // cost of not keeping it is a word.
                     self.modifiers = 0;
+                    self.keyboard_focused = false;
+                    self.cancel_paste();
                     self.repeat.cancel();
                     self.clipboard_focus_pending = None;
                     self.reported_clipboard_focus = false;
@@ -667,15 +710,21 @@ impl Surface {
                         state => return Err(format!("wl_keyboard key has invalid state {state}")),
                     };
                     args.finish()?;
-                    let copy = u16::try_from(code).ok() == Some(CLIPBOARD_KEY)
-                        && self.modifiers
-                            & !(crate::keyboard::MOD_CAPS | crate::keyboard::MOD_NUM)
-                            == (crate::keyboard::MOD_SHIFT | crate::keyboard::MOD_CONTROL)
+                    let clipboard_chord = self.modifiers
+                        & !(crate::keyboard::MOD_CAPS | crate::keyboard::MOD_NUM)
+                        == (crate::keyboard::MOD_SHIFT | crate::keyboard::MOD_CONTROL)
                         && self.group == 0;
-                    if copy {
+                    let copy = clipboard_chord && code == u32::from(CLIPBOARD_KEY);
+                    let paste = clipboard_chord && code == u32::from(PASTE_KEY);
+                    if copy || paste {
                         self.repeat.cancel();
                         if pressed {
-                            self.pending_copy = Some(serial);
+                            if copy {
+                                self.pending_copy = Some(serial);
+                            }
+                            if paste {
+                                self.pending_paste = true;
+                            }
                         }
                     } else {
                         if let Ok(code) = u16::try_from(code) {
@@ -683,7 +732,7 @@ impl Surface {
                         }
                     }
                     let modifier = u16::try_from(code).ok().is_some_and(keys::is_modifier);
-                    if pressed && !copy {
+                    if pressed && !copy && !paste {
                         if !modifier {
                             self.clear_selection();
                         }
@@ -809,9 +858,7 @@ impl Surface {
                                     Some((self.pointer_x, self.pointer_y));
                             }
                             _ => {
-                                return Err(format!(
-                                    "wl_pointer button has invalid state {state}"
-                                ))
+                                return Err(format!("wl_pointer button has invalid state {state}"))
                             }
                         }
                     }
@@ -875,7 +922,11 @@ impl Surface {
                     args.finish()?;
                     if offer == 0
                         || self.clipboard.offers.len() >= MAX_CLIPBOARD_OFFERS
-                        || !self.clipboard.offers.insert(offer)
+                        || self
+                            .clipboard
+                            .offers
+                            .insert(offer, ClipboardOffer::default())
+                            .is_some()
                     {
                         return Err(format!("wl_data_device introduced invalid offer {offer}"));
                     }
@@ -883,14 +934,18 @@ impl Surface {
                 5 => {
                     let offer = args.u32()?;
                     args.finish()?;
-                    if offer != 0 {
-                        if !self.clipboard.offers.remove(&offer) {
-                            return Err(format!(
-                                "wl_data_device selected unknown offer {offer}"
-                            ));
-                        }
-                        connection.send(offer, 2, wire::Builder::new())?;
+                    if offer != 0 && !self.clipboard.offers.contains_key(&offer) {
+                        return Err(format!("wl_data_device selected unknown offer {offer}"));
                     }
+                    self.cancel_paste();
+                    let selected = (offer != 0).then_some(offer);
+                    if let Some(old) = self.clipboard.selected_offer.take() {
+                        if Some(old) != selected {
+                            self.clipboard.offers.remove(&old);
+                            connection.send(old, 2, wire::Builder::new())?;
+                        }
+                    }
+                    self.clipboard.selected_offer = selected;
                 }
                 _ => {
                     return Err(format!(
@@ -901,7 +956,7 @@ impl Surface {
             }
             return Ok(false);
         }
-        if self.clipboard.offers.contains(&message.object) {
+        if let Some(offer) = self.clipboard.offers.get_mut(&message.object) {
             if message.opcode != 0 {
                 return Err(format!(
                     "unexpected wl_data_offer event opcode={}",
@@ -909,8 +964,22 @@ impl Surface {
                 ));
             }
             let mut args = wire::Cursor::new(&message.payload);
-            args.string()?;
+            let mime = args.string()?;
             args.finish()?;
+            if mime.len() > 256 || offer.count >= 64 {
+                return Err("clipboard MIME offers exceed their bounds".into());
+            }
+            offer.count += 1;
+            if let Some(rank) = CLIPBOARD_MIME_TYPES.iter().position(|item| *item == mime) {
+                let current = offer.mime.and_then(|selected| {
+                    CLIPBOARD_MIME_TYPES
+                        .iter()
+                        .position(|item| *item == selected)
+                });
+                if current.is_none_or(|current| rank < current) {
+                    offer.mime = CLIPBOARD_MIME_TYPES.get(rank).copied();
+                }
+            }
             return Ok(false);
         }
         if self.clipboard.sources.contains_key(&message.object) {
@@ -1169,8 +1238,8 @@ impl Surface {
             (selection.extent, selection.anchor)
         };
         let viewport = self.viewport.offset(terminal.scrollback());
-        let snapshot = render::Snapshot::new(terminal, self.activated, false)
-            .scrolled_back(viewport);
+        let snapshot =
+            render::Snapshot::new(terminal, self.activated, false).scrolled_back(viewport);
         let mut selected = Vec::new();
         for row in start.0..=end.0 {
             if row != start.0 {
@@ -1210,10 +1279,89 @@ impl Surface {
         }
     }
 
-    fn clipboard_target_marker(
+    fn cancel_paste(&mut self) {
+        if let Some(paste) = &self.clipboard.incoming {
+            paste.cancel.store(true, Ordering::Relaxed);
+        }
+        self.pending_paste = false;
+    }
+
+    fn finish_paste(
         &mut self,
-        terminal: &Terminal,
-    ) -> Result<Option<String>, String> {
+        id: u64,
+        result: Result<Vec<u8>, String>,
+        model: &mut Option<Terminal>,
+        input: &pty::Input,
+    ) -> Result<(), String> {
+        if !self.clipboard.incoming.as_ref().is_some_and(|p| p.id == id) {
+            return Ok(());
+        }
+        let pending = self
+            .clipboard
+            .incoming
+            .take()
+            .ok_or("missing pending paste")?;
+        if pending.cancel.load(Ordering::Relaxed) || !self.keyboard_focused {
+            return Ok(());
+        }
+        if let Some(terminal) = model.as_mut() {
+            let encoded = result.and_then(|bytes| {
+                paste_input(bytes, terminal.mode("bracketed-paste").unwrap_or(false))
+            });
+            match encoded {
+                Ok(bytes) if bytes.is_empty() => return Ok(()),
+                Ok(bytes) if input.push(&bytes)? => {
+                    self.viewport = keys::Viewport::new();
+                    self.clear_selection();
+                }
+                Ok(_) | Err(_) => terminal.ring(),
+            }
+            self.stale = true;
+        }
+        Ok(())
+    }
+
+    fn request_paste(&mut self, connection: &mut Connection) -> Result<bool, String> {
+        if !self.keyboard_focused || self.clipboard.incoming.is_some() {
+            return Ok(false);
+        }
+        let Some(sender) = &self.clipboard.paste_reader else {
+            return Ok(false);
+        };
+        let Some((offer, mime)) = self
+            .clipboard
+            .selected_offer
+            .and_then(|id| self.clipboard.offers.get(&id)?.mime.map(|mime| (id, mime)))
+        else {
+            return Ok(false);
+        };
+        let (read, write) =
+            UnixStream::pair().map_err(|e| format!("create paste endpoints: {e}"))?;
+        let id = self
+            .clipboard
+            .paste_sequence
+            .checked_add(1)
+            .ok_or("paste sequence exhausted")?;
+        let cancel = Arc::new(AtomicBool::new(false));
+        match sender.try_send(PasteRequest {
+            id,
+            stream: read,
+            cancel: Arc::clone(&cancel),
+        }) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) => return Ok(false),
+            Err(TrySendError::Disconnected(_)) => return Err("the paste reader stopped".into()),
+        }
+        self.clipboard.paste_sequence = id;
+        self.clipboard.incoming = Some(PendingPaste { id, cancel });
+        let mut receive = wire::Builder::new();
+        receive.string(mime)?;
+        let endpoint = File::from(OwnedFd::from(write));
+        connection.send_with_fd(offer, 1, receive, &endpoint)?;
+        Ok(true)
+    }
+
+    fn clipboard_target_marker(&mut self, terminal: &Terminal) -> Result<Option<String>, String> {
         if !self.clipboard_proof
             || self.stale
             || !self.ready()
@@ -1297,7 +1445,9 @@ impl Surface {
             registry.insert(source, Arc::clone(&payload));
         }
         self.clipboard.current = Some(source);
-        self.clipboard.syncs.insert(callback, (source, payload.len()));
+        self.clipboard
+            .syncs
+            .insert(callback, (source, payload.len()));
 
         let mut create = wire::Builder::new();
         create.u32(source);
@@ -1384,13 +1534,21 @@ impl Surface {
 }
 
 fn clipboard_target(terminal: &Terminal) -> Option<(usize, usize)> {
-    let last_start = terminal.columns().checked_sub(CLIPBOARD_PROOF_BYTES.len())?;
+    let last_start = terminal
+        .columns()
+        .checked_sub(CLIPBOARD_PROOF_BYTES.len())?;
     for row in 0..terminal.rows() {
         for column in 0..=last_start {
-            if CLIPBOARD_PROOF_BYTES.iter().enumerate().all(|(offset, expected)| {
-                terminal.cell(row, column.saturating_add(offset)).map(|cell| cell.scalar)
-                    == Some(char::from(*expected))
-            }) {
+            if CLIPBOARD_PROOF_BYTES
+                .iter()
+                .enumerate()
+                .all(|(offset, expected)| {
+                    terminal
+                        .cell(row, column.saturating_add(offset))
+                        .map(|cell| cell.scalar)
+                        == Some(char::from(*expected))
+                })
+            {
                 return Some((row, column));
             }
         }
@@ -1646,6 +1804,10 @@ struct Session<'a> {
 /// Wayland reader is the first producer; the child's output and its exit are
 /// the ones the next landing adds.
 enum Event {
+    Paste {
+        id: u64,
+        result: Result<Vec<u8>, String>,
+    },
     Wayland(wire::Message),
     /// Bytes the child wrote. Whole reads, not lines: the parser is a state
     /// machine and an escape sequence split across two reads is ordinary.
@@ -1742,6 +1904,89 @@ fn clipboard_sent_marker(enabled: bool, payload: &[u8]) -> Option<String> {
             CLIPBOARD_PROOF_BYTES.len()
         )
     })
+}
+
+fn read_paste(request: &mut PasteRequest, timeout: Duration) -> Result<Vec<u8>, String> {
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .ok_or("paste deadline overflow")?;
+    let mut bytes = Vec::new();
+    let mut chunk = [0; 4096];
+    loop {
+        if request.cancel.load(Ordering::Relaxed) {
+            return Err("paste cancelled".into());
+        }
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .filter(|d| !d.is_zero())
+            .ok_or("paste transfer timed out")?;
+        request
+            .stream
+            .set_read_timeout(Some(remaining.min(Duration::from_millis(50))))
+            .map_err(|e| format!("bound paste read: {e}"))?;
+        match request.stream.read(&mut chunk) {
+            Ok(0) => return Ok(bytes),
+            Ok(count) => {
+                if bytes.len().saturating_add(count) > MAX_CLIPBOARD_BYTES {
+                    return Err("paste exceeds 64 KiB".into());
+                }
+                bytes.extend_from_slice(chunk.get(..count).ok_or("paste read exceeded buffer")?);
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock
+                        | std::io::ErrorKind::TimedOut
+                        | std::io::ErrorKind::Interrupted
+                ) => {}
+            Err(error) => return Err(format!("read paste: {error}")),
+        }
+    }
+}
+
+fn paste_input(bytes: Vec<u8>, bracketed: bool) -> Result<Vec<u8>, String> {
+    let text = std::str::from_utf8(&bytes).map_err(|_| "paste is not UTF-8")?;
+    if text
+        .chars()
+        .any(|c| c.is_control() && !matches!(c, '\t' | '\r' | '\n'))
+    {
+        return Err("paste contains terminal control characters".into());
+    }
+    if bytes.is_empty() {
+        return Ok(bytes);
+    }
+    let size = bytes.len().saturating_add(if bracketed { 12 } else { 0 });
+    if size > keys::MAX_INPUT_BYTES {
+        return Err("encoded paste exceeds the input queue bound".into());
+    }
+    if !bracketed {
+        return Ok(bytes);
+    }
+    let mut result = Vec::with_capacity(size);
+    result.extend_from_slice(b"\x1b[200~");
+    result.extend_from_slice(&bytes);
+    result.extend_from_slice(b"\x1b[201~");
+    Ok(result)
+}
+
+fn spawn_paste_reader(
+    events: SyncSender<Event>,
+) -> Result<(SyncSender<PasteRequest>, JoinHandle<()>), String> {
+    let (sender, requests) = sync_channel::<PasteRequest>(1);
+    let thread = thread::Builder::new()
+        .name("td-term-paste".into())
+        .spawn(move || {
+            while let Ok(mut request) = requests.recv() {
+                let result = read_paste(&mut request, PASTE_TIMEOUT);
+                let id = request.id;
+                drop(request);
+                if events.send(Event::Paste { id, result }).is_err() {
+                    break;
+                }
+            }
+        })
+        .map_err(|e| format!("spawn paste reader: {e}"))?;
+    Ok((sender, thread))
 }
 
 fn spawn_clipboard_writer(
@@ -2006,6 +2251,7 @@ fn serve_event(
     event: Event,
 ) -> Result<(), String> {
     match event {
+        Event::Paste { id, result } => surface.finish_paste(id, result, model, &child.input)?,
         Event::Closed(error) => return Err(error),
         Event::Exit(status) => child.status = Some(status),
         Event::Drained => child.drained = true,
@@ -2040,6 +2286,12 @@ fn serve_event(
             if closes_pointer_frame {
                 if let Some(selection) = surface.take_pointer_selection() {
                     surface.apply_pointer_selection(selection, session.font);
+                }
+            }
+            if std::mem::take(&mut surface.pending_paste) && !surface.request_paste(connection)? {
+                if let Some(terminal) = model.as_mut() {
+                    terminal.ring();
+                    surface.stale = true;
                 }
             }
             if let Some(serial) = surface.pending_copy.take() {
@@ -2634,6 +2886,8 @@ pub fn run(options: &Options) -> Result<(), String> {
     let (clipboard, _clipboard_writer) = spawn_clipboard_writer(clipboard_proof)?;
     let reader = connection.detach_reader()?;
     let (sender, events) = sync_channel(MAX_PENDING_EVENTS);
+    let (paste_reader, _paste_thread) = spawn_paste_reader(sender.clone())?;
+    surface.clipboard.paste_reader = Some(paste_reader);
     let _wayland = spawn_wayland_reader(reader, sender.clone(), sources, clipboard)?;
     let (_children, mut child, _ready) = start(
         &pty,
@@ -3022,10 +3276,16 @@ mod tests {
         assert_eq!(clipboard_target(&terminal), Some((0, 2)));
 
         let mut surface = test_surface();
-        let size = Size { width: 96, height: 32 };
+        let size = Size {
+            width: 96,
+            height: 32,
+        };
         surface.current = Some(size);
         surface.activated = true;
-        surface.drawn = Some(Drawn { size, activated: true });
+        surface.drawn = Some(Drawn {
+            size,
+            activated: true,
+        });
         surface.layout_configured = true;
         surface.cells = Some((2, 12));
         surface.frame = Some(Frame {
@@ -3044,13 +3304,17 @@ mod tests {
         scrolled_terminal.feed(b"old\r\n  Welcome");
         surface.history = scrolled_terminal.scrollback();
         surface.viewport.by_lines(1, surface.history);
-        assert_eq!(surface.clipboard_target_marker(&scrolled_terminal).unwrap(), None);
+        assert_eq!(
+            surface.clipboard_target_marker(&scrolled_terminal).unwrap(),
+            None
+        );
         surface.viewport = keys::Viewport::new();
         assert_eq!(
-            surface.clipboard_target_marker(&terminal).unwrap().as_deref(),
-            Some(
-                "TD-TERM-CLIPBOARD-TARGET-READY rows=2 columns=12 row=0 column=2 bytes=7\n"
-            )
+            surface
+                .clipboard_target_marker(&terminal)
+                .unwrap()
+                .as_deref(),
+            Some("TD-TERM-CLIPBOARD-TARGET-READY rows=2 columns=12 row=0 column=2 bytes=7\n")
         );
         assert_eq!(surface.clipboard_target_marker(&terminal).unwrap(), None);
 
@@ -3062,7 +3326,10 @@ mod tests {
         assert_eq!(surface.clipboard_selection_marker(&terminal).unwrap(), None);
         surface.stale = false;
         assert_eq!(
-            surface.clipboard_selection_marker(&terminal).unwrap().as_deref(),
+            surface
+                .clipboard_selection_marker(&terminal)
+                .unwrap()
+                .as_deref(),
             Some("TD-TERM-CLIPBOARD-SELECTION-READY bytes=7")
         );
         assert_eq!(surface.clipboard_selection_marker(&terminal).unwrap(), None);
@@ -3089,14 +3356,19 @@ mod tests {
         std::fs::write(&path, b"quiet td.firefox-input=1").unwrap();
         assert!(clipboard_proof_enabled(&path).unwrap());
         std::fs::write(&path, vec![b'x'; MAX_CMDLINE_BYTES + 1]).unwrap();
-        assert!(clipboard_proof_enabled(&path).unwrap_err().contains("exceeded"));
+        assert!(clipboard_proof_enabled(&path)
+            .unwrap_err()
+            .contains("exceeded"));
         std::fs::remove_file(path).unwrap();
     }
 
     #[test]
     fn clipboard_focus_marker_follows_enter_modifiers_handshake() {
         let (mut connection, _peer) = pair();
-        let fallback = Size { width: 8, height: 8 };
+        let fallback = Size {
+            width: 8,
+            height: 8,
+        };
         let mut surface = test_surface();
         surface.enable_clipboard_proof();
         surface
@@ -3202,11 +3474,7 @@ mod tests {
             &session,
             fallback,
             &mut child,
-            Event::Wayland(words_message(
-                pointer,
-                3,
-                &[2, 9, LEFT_BUTTON, KEY_PRESSED],
-            )),
+            Event::Wayland(words_message(pointer, 3, &[2, 9, LEFT_BUTTON, KEY_PRESSED])),
         )
         .unwrap();
         assert_eq!(surface.selection, None, "press escaped its pointer frame");
@@ -3274,6 +3542,399 @@ mod tests {
             )
             .unwrap_err();
         assert!(error.contains("invalid state"), "{error}");
+    }
+
+    fn select_paste_offer(surface: &mut Surface, connection: &mut Connection, id: u32) {
+        let fallback = Size {
+            width: 8,
+            height: 8,
+        };
+        surface
+            .dispatch(connection, &words_message(DATA_DEVICE, 0, &[id]), fallback)
+            .unwrap();
+        let mut mime = wire::Builder::new();
+        mime.string("text/plain;charset=utf-8").unwrap();
+        let bytes = mime.message(id, 0).unwrap();
+        surface
+            .dispatch(connection, &message(id, 0, bytes[8..].to_vec()), fallback)
+            .unwrap();
+        surface
+            .dispatch(connection, &words_message(DATA_DEVICE, 5, &[id]), fallback)
+            .unwrap();
+    }
+
+    #[test]
+    fn paste_round_trip_uses_the_offered_endpoint_and_brackets_exact_text() {
+        let (mut connection, peer) = pair();
+        let mut peer = Connection::over(peer, None, FIRST_DYNAMIC_ID)
+            .detach_reader()
+            .unwrap();
+        let (events, results) = sync_channel(2);
+        let (requests, thread) = spawn_paste_reader(events).unwrap();
+        let mut surface = test_surface();
+        surface.keyboard_focused = true;
+        surface.clipboard.paste_reader = Some(requests);
+        let offer = 0xff00_0000;
+        select_paste_offer(&mut surface, &mut connection, offer);
+        assert!(surface.request_paste(&mut connection).unwrap());
+        assert!(
+            !surface.request_paste(&mut connection).unwrap(),
+            "second transfer was admitted"
+        );
+        let request = peer.next().unwrap();
+        assert_eq!((request.object, request.opcode), (offer, 1));
+        let mut args = wire::Cursor::new(&request.payload);
+        assert_eq!(args.string().unwrap(), "text/plain;charset=utf-8");
+        args.finish().unwrap();
+        let mut endpoint = peer.take_file("paste receive").unwrap();
+        endpoint
+            .write_all("café λ\nsecond line".as_bytes())
+            .unwrap();
+        drop(endpoint);
+        let Event::Paste { id, result } = results.recv_timeout(Duration::from_secs(2)).unwrap()
+        else {
+            panic!("wrong event");
+        };
+        let input = pty::Input::new();
+        let mut model = Some(Terminal::new(2, 40).unwrap());
+        model.as_mut().unwrap().feed(b"\x1b[?2004h");
+        surface
+            .finish_paste(id, result, &mut model, &input)
+            .unwrap();
+        assert_eq!(
+            input.take_for_test(),
+            "\x1b[200~café λ\nsecond line\x1b[201~".as_bytes()
+        );
+        drop(surface);
+        thread.join().unwrap();
+    }
+
+    #[test]
+    fn paste_cancellation_and_queue_refusal_never_admit_partial_input() {
+        let (mut connection, _peer) = pair();
+        let input = pty::Input::new();
+        let mut model = Some(Terminal::new(2, 20).unwrap());
+        let mut surface = test_surface();
+        surface.keyboard_focused = true;
+        for focus_loss in [false, true] {
+            surface.clipboard.incoming = Some(PendingPaste {
+                id: 9,
+                cancel: Arc::new(AtomicBool::new(false)),
+            });
+            if focus_loss {
+                surface
+                    .dispatch(
+                        &mut connection,
+                        &words_message(KEYBOARD, 2, &[1, SURFACE]),
+                        Size {
+                            width: 8,
+                            height: 8,
+                        },
+                    )
+                    .unwrap();
+            } else {
+                surface
+                    .dispatch(
+                        &mut connection,
+                        &words_message(DATA_DEVICE, 5, &[0]),
+                        Size {
+                            width: 8,
+                            height: 8,
+                        },
+                    )
+                    .unwrap();
+            }
+            surface
+                .finish_paste(9, Ok(b"stale text".to_vec()), &mut model, &input)
+                .unwrap();
+            assert!(input.take_for_test().is_empty());
+        }
+        surface.keyboard_focused = true;
+        surface.clipboard.incoming = Some(PendingPaste {
+            id: 10,
+            cancel: Arc::new(AtomicBool::new(false)),
+        });
+        input.push(&vec![b'x'; keys::MAX_INPUT_BYTES - 2]).unwrap();
+        surface
+            .finish_paste(10, Ok(b"more than two".to_vec()), &mut model, &input)
+            .unwrap();
+        assert_eq!(input.take_for_test(), vec![b'x'; keys::MAX_INPUT_BYTES - 2]);
+        assert!(model.as_mut().unwrap().take_bell());
+    }
+
+    #[test]
+    fn empty_paste_does_not_redraw_or_touch_a_closed_input_queue() {
+        let input = pty::Input::new();
+        input.close().unwrap();
+        let mut model = Some(Terminal::new(2, 20).unwrap());
+        let mut surface = test_surface();
+        surface.stale = false;
+        surface.keyboard_focused = true;
+        surface.clipboard.incoming = Some(PendingPaste {
+            id: 1,
+            cancel: Arc::new(AtomicBool::new(false)),
+        });
+        surface
+            .finish_paste(1, Ok(Vec::new()), &mut model, &input)
+            .unwrap();
+        assert!(!surface.stale);
+        assert!(!model.as_mut().unwrap().take_bell());
+    }
+
+    #[test]
+    fn paste_mime_preference_is_independent_of_advertisement_order() {
+        let (mut connection, _peer) = pair();
+        for names in [
+            ["UTF8_STRING", "text/plain", "text/plain;charset=utf-8"],
+            ["text/plain", "text/plain;charset=utf-8", "UTF8_STRING"],
+        ] {
+            let mut surface = test_surface();
+            let id = 0xff00_0000;
+            let fallback = Size {
+                width: 8,
+                height: 8,
+            };
+            surface
+                .dispatch(
+                    &mut connection,
+                    &words_message(DATA_DEVICE, 0, &[id]),
+                    fallback,
+                )
+                .unwrap();
+            for name in names {
+                let mut body = wire::Builder::new();
+                body.string(name).unwrap();
+                let bytes = body.message(id, 0).unwrap();
+                surface
+                    .dispatch(
+                        &mut connection,
+                        &message(id, 0, bytes[8..].to_vec()),
+                        fallback,
+                    )
+                    .unwrap();
+                if name == "text/plain" {
+                    assert_ne!(
+                        surface.clipboard.offers.get(&id).unwrap().mime,
+                        Some("UTF8_STRING")
+                    );
+                }
+            }
+            assert_eq!(
+                surface.clipboard.offers.get(&id).unwrap().mime,
+                Some("text/plain;charset=utf-8")
+            );
+        }
+    }
+
+    #[test]
+    fn paste_authority_tracks_focus_capabilities_and_request_identity() {
+        let (mut connection, _peer) = pair();
+        let mut surface = test_surface();
+        let (requests, _reader) = sync_channel(1);
+        surface.clipboard.paste_reader = Some(requests);
+        select_paste_offer(&mut surface, &mut connection, 0xff00_0000);
+        assert!(!surface.request_paste(&mut connection).unwrap());
+        assert!(surface.clipboard.incoming.is_none());
+        surface.keyboard_focused = true;
+        let cancel = Arc::new(AtomicBool::new(false));
+        surface.clipboard.incoming = Some(PendingPaste {
+            id: 9,
+            cancel: Arc::clone(&cancel),
+        });
+        let input = pty::Input::new();
+        let mut model = Some(Terminal::new(2, 20).unwrap());
+        surface
+            .finish_paste(8, Ok(b"stale".to_vec()), &mut model, &input)
+            .unwrap();
+        assert_eq!(surface.clipboard.incoming.as_ref().unwrap().id, 9);
+        assert!(!cancel.load(Ordering::Relaxed));
+        assert!(input.take_for_test().is_empty());
+        surface
+            .dispatch(
+                &mut connection,
+                &words_message(SEAT, 0, &[0]),
+                Size {
+                    width: 8,
+                    height: 8,
+                },
+            )
+            .unwrap();
+        assert!(!surface.keyboard_focused);
+        assert!(cancel.load(Ordering::Relaxed));
+        surface
+            .finish_paste(9, Ok(b"revoked".to_vec()), &mut model, &input)
+            .unwrap();
+        assert!(input.take_for_test().is_empty());
+    }
+
+    #[test]
+    fn paste_replacement_destroys_old_offer_and_bounds_mime_metadata() {
+        let (mut connection, peer) = pair();
+        let mut peer = Connection::over(peer, None, FIRST_DYNAMIC_ID)
+            .detach_reader()
+            .unwrap();
+        let mut surface = test_surface();
+        let first = 0xff00_0000;
+        let second = first + 1;
+        select_paste_offer(&mut surface, &mut connection, first);
+        select_paste_offer(&mut surface, &mut connection, second);
+        let destroyed = peer.next().unwrap();
+        assert_eq!((destroyed.object, destroyed.opcode), (first, 2));
+        assert!(destroyed.payload.is_empty());
+        assert_eq!(surface.clipboard.offers.len(), 1);
+        assert!(!surface.clipboard.offers.contains_key(&first));
+        let fallback = Size {
+            width: 8,
+            height: 8,
+        };
+        let mut body = wire::Builder::new();
+        body.string(&"x".repeat(257)).unwrap();
+        let bytes = body.message(second, 0).unwrap();
+        assert!(surface
+            .dispatch(
+                &mut connection,
+                &message(second, 0, bytes[8..].to_vec()),
+                fallback
+            )
+            .unwrap_err()
+            .contains("bounds"));
+        let mut body = wire::Builder::new();
+        body.string(&"x".repeat(256)).unwrap();
+        let bytes = body.message(second, 0).unwrap();
+        let offered = message(second, 0, bytes[8..].to_vec());
+        for _ in 1..64 {
+            surface
+                .dispatch(&mut connection, &offered, fallback)
+                .unwrap();
+        }
+        assert!(surface
+            .dispatch(&mut connection, &offered, fallback)
+            .unwrap_err()
+            .contains("bounds"));
+    }
+
+    #[test]
+    fn refused_paste_key_rings_without_reaching_the_child() {
+        let (mut connection, _peer) = pair();
+        let mut surface = test_surface();
+        surface.modifiers = crate::keyboard::MOD_CONTROL | crate::keyboard::MOD_SHIFT;
+        surface.stale = false;
+        let font = font();
+        let palette = render::Palette::pinned();
+        let pty = Pty::open(Path::new(pty::DEV_PTMX)).unwrap();
+        let directory = std::env::temp_dir();
+        let session = Session {
+            directory: &directory,
+            pty: &pty,
+            font: &font,
+            palette: &palette,
+        };
+        let mut model = Some(Terminal::new(2, 20).unwrap());
+        let mut child = Child::default();
+        serve_event(
+            &mut connection,
+            &mut surface,
+            &mut model,
+            &session,
+            default_size(&font).unwrap(),
+            &mut child,
+            Event::Wayland(words_message(
+                KEYBOARD,
+                3,
+                &[1, 0, u32::from(PASTE_KEY), KEY_PRESSED],
+            )),
+        )
+        .unwrap();
+        assert!(model.as_mut().unwrap().take_bell());
+        assert!(surface.stale);
+        assert!(child.input.take_for_test().is_empty());
+        assert!(!surface.pending_paste);
+    }
+
+    #[test]
+    fn paste_decoder_rejects_controls_bad_utf8_and_oversized_framing() {
+        for bytes in [b"a\x1b[201~b".to_vec(), vec![0xff], b"a\0b".to_vec()] {
+            assert!(paste_input(bytes, true).is_err());
+        }
+        assert!(paste_input(vec![b'x'; keys::MAX_INPUT_BYTES], true).is_err());
+        assert_eq!(
+            paste_input(b"one\r\ntwo".to_vec(), false).unwrap(),
+            b"one\r\ntwo"
+        );
+        assert!(paste_input(Vec::new(), true).unwrap().is_empty());
+        let mut terminal = Terminal::new(1, 1).unwrap();
+        assert_eq!(terminal.mode("bracketed-paste"), Some(false));
+        terminal.feed(b"\x1b[?2004h");
+        assert_eq!(terminal.mode("bracketed-paste"), Some(true));
+        terminal.feed(b"\x1b[?2004l");
+        assert_eq!(terminal.mode("bracketed-paste"), Some(false));
+        terminal.feed(b"\x1b[?2004h\x1bc");
+        assert_eq!(terminal.mode("bracketed-paste"), Some(false));
+    }
+
+    #[test]
+    fn paste_chord_is_local_and_requires_the_exact_modifiers() {
+        use crate::keyboard::{MOD_ALT, MOD_CAPS, MOD_CONTROL, MOD_LOGO, MOD_NUM, MOD_SHIFT};
+        let (mut connection, _peer) = pair();
+        for (extra, accepted) in [
+            (0, true),
+            (MOD_CAPS | MOD_NUM, true),
+            (MOD_ALT, false),
+            (MOD_LOGO, false),
+        ] {
+            let mut surface = test_surface();
+            surface.modifiers = MOD_CONTROL | MOD_SHIFT | extra;
+            surface
+                .dispatch(
+                    &mut connection,
+                    &words_message(KEYBOARD, 3, &[1, 0, u32::from(PASTE_KEY), KEY_PRESSED]),
+                    Size {
+                        width: 8,
+                        height: 8,
+                    },
+                )
+                .unwrap();
+            assert_eq!(surface.pending_paste, accepted);
+            if accepted {
+                assert!(surface.pending_input.is_none());
+                assert!(surface.pending_key.is_none());
+                assert!(!surface.repeat.armed());
+            }
+        }
+    }
+
+    #[test]
+    fn oversized_paste_is_rejected_before_any_pty_bytes_are_available() {
+        let (stream, mut write) = UnixStream::pair().unwrap();
+        write
+            .write_all(&vec![b'x'; MAX_CLIPBOARD_BYTES + 1])
+            .unwrap();
+        drop(write);
+        let mut request = PasteRequest {
+            id: 1,
+            stream,
+            cancel: Arc::new(AtomicBool::new(false)),
+        };
+        assert!(read_paste(&mut request, Duration::from_secs(1))
+            .unwrap_err()
+            .contains("exceeds"));
+    }
+
+    #[test]
+    fn stalled_paste_times_out_and_cancelled_paste_drops_without_waiting() {
+        let (stream, _write) = UnixStream::pair().unwrap();
+        let mut request = PasteRequest {
+            id: 1,
+            stream,
+            cancel: Arc::new(AtomicBool::new(false)),
+        };
+        assert!(read_paste(&mut request, Duration::from_millis(10))
+            .unwrap_err()
+            .contains("timed out"));
+        request.cancel.store(true, Ordering::Relaxed);
+        assert!(read_paste(&mut request, Duration::from_secs(5))
+            .unwrap_err()
+            .contains("cancelled"));
     }
 
     #[test]
@@ -3438,7 +4099,10 @@ mod tests {
         assert_eq!(surface.pending_input, None);
         assert_eq!(surface.pending_key, None);
         assert!(!surface.repeat.armed());
-        assert!(surface.selection.is_some(), "copy cleared its own selection");
+        assert!(
+            surface.selection.is_some(),
+            "copy cleared its own selection"
+        );
     }
 
     #[test]
@@ -3485,11 +4149,7 @@ mod tests {
             assert_eq!(surface.pending_copy, Some(71), "locks disabled copy");
         }
 
-        for excluded in [
-            crate::keyboard::MOD_ALT,
-            crate::keyboard::MOD_LOGO,
-            1 << 5,
-        ] {
+        for excluded in [crate::keyboard::MOD_ALT, crate::keyboard::MOD_LOGO, 1 << 5] {
             let mut surface = test_surface();
             surface.selection = Some(render::Selection {
                 anchor: (0, 0),
@@ -3549,7 +4209,10 @@ mod tests {
             )
             .unwrap();
         assert_eq!(surface.selection, None);
-        assert!(surface.stale, "cleared highlight was not scheduled to repaint");
+        assert!(
+            surface.stale,
+            "cleared highlight was not scheduled to repaint"
+        );
     }
 
     #[test]
@@ -3564,7 +4227,10 @@ mod tests {
         let callback = FIRST_DYNAMIC_ID + 1;
 
         let (object, opcode, payload) = said(&mut peer);
-        assert_eq!((object, opcode, payload), (DATA_DEVICE_MANAGER, 0, source.to_ne_bytes().to_vec()));
+        assert_eq!(
+            (object, opcode, payload),
+            (DATA_DEVICE_MANAGER, 0, source.to_ne_bytes().to_vec())
+        );
         for mime_type in CLIPBOARD_MIME_TYPES {
             let (object, opcode, payload) = said(&mut peer);
             assert_eq!((object, opcode), (source, 0));
@@ -4633,6 +5299,7 @@ mod tests {
 
     fn named(event: &Event) -> &'static str {
         match event {
+            Event::Paste { .. } => "a paste result",
             Event::Wayland(_) => "a Wayland event",
             Event::Output(_) => "child output",
             Event::Exit(_) => "a child exit",
@@ -5181,7 +5848,11 @@ mod tests {
         let pty = Pty::open(Path::new(pty::DEV_PTMX)).unwrap();
         let (sender, _events) = sync_channel(MAX_PENDING_EVENTS);
         let directory = std::env::temp_dir();
-        let unique = format!("{}-{}", std::process::id(), SEQ.fetch_add(1, Ordering::Relaxed));
+        let unique = format!(
+            "{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        );
         let ready_socket = directory.join(format!("td-term-relative-command-{unique}"));
         // A passwd fixture naming THIS process's uid, so the account resolves
         // on any host and the failure asserted is the command's, not the account's.
@@ -5233,7 +5904,11 @@ mod tests {
         let pty = Pty::open(Path::new(pty::DEV_PTMX)).unwrap();
         let (sender, _events) = sync_channel(MAX_PENDING_EVENTS);
         let directory = std::env::temp_dir();
-        let unique = format!("{}-{}", std::process::id(), SEQ.fetch_add(1, Ordering::Relaxed));
+        let unique = format!(
+            "{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        );
         let ready_socket = directory.join(format!("td-term-named-command-{unique}"));
         let status = std::fs::read_to_string(PROC_STATUS).unwrap();
         let uid = status

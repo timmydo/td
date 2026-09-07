@@ -4474,7 +4474,8 @@ for td's shell and userland. It implements:
   the 16-color palette, indexed 256 colors, and 24-bit colors;
 - normal and application cursor keys, primary device attributes, cursor
   position reports, and the replies required by the claimed profile; and
-- DEC cursor preservation for mode 1048 and alternate-screen mode 1049.
+- DEC cursor preservation for mode 1048 and alternate-screen mode 1049;
+- bracketed-paste mode 2004, initially disabled and cleared by terminal reset.
 
 UTF-8 scalars are initially single-cell glyphs. Wide cells, combining
 sequences, grapheme clustering, bidi, shaping, and emoji presentation require
@@ -4924,11 +4925,35 @@ and calls `set_selection` with the key event's compositor serial. Caps Lock and
 Num Lock do not disable the chord. td-term retains at most eight live sources,
 eight outstanding sync callbacks, and eight incoming offers. A cancelled
 source retains its callback until `done`, so the callback ceiling also gates
-new copies. It destroys an incoming selection offer immediately because paste
-is not yet implemented; drag and drop remains deferred. td's compositor never
+new copies. Incoming offers retain only a preferred text MIME, with at most
+64 MIME events of at most 256 bytes per offer. A replaced selection destroys
+the previous offer. Drag and drop remains deferred. td's compositor never
 starts a drag and cancels every attempted version-3 drag source, so DnD-only
 device and offer events are fail-closed arms outside this client profile rather
 than silently implemented partial drag and drop.
+
+`Control+Shift+V` with the same modifier policy requests the selected text
+offer only while td-term owns keyboard focus. It is neither PTY key input nor
+a repeat candidate. One incoming transfer may be active, queued, or awaiting
+main-loop completion. A dedicated reader receives through a private Unix
+socket pair passed using the existing SCM_RIGHTS request path. It reads at
+most 64 KiB against a five-second absolute deadline; a focus leave, keyboard
+removal, or replacement selection cancels the transfer. Cancellation is
+checked between reads with at most a 50 ms read timeout. The main loop checks
+the request identity and cancellation again before admitting the completed
+payload. An old completion cannot satisfy a newer request. These checks use
+focus and selection events observed by the client; a transfer accepted by the
+compositor is not retroactively revoked before that client learns of a change.
+
+Only complete valid UTF-8 is admitted. Control characters other than tab, CR,
+and LF are refused, including ESC that could terminate a bracketed paste.
+No newline or Enter is appended. Mode 2004 wraps nonempty text in the standard
+`CSI 200~` and `CSI 201~` delimiters; otherwise bytes pass unchanged. The whole
+encoded paste must fit the existing 64 KiB PTY input queue or none is admitted
+and the terminal rings its visual bell. Empty text is a no-op. Successful
+nonempty paste clears the visual selection and returns to the live viewport.
+Transfer, encoding, and queue failures leave the terminal usable. No terminal
+escape sequence reads or writes the host clipboard.
 
 The payload enters a shared source registry before any request can make the
 source callable. A data-source `send` event consumes exactly one SCM_RIGHTS
@@ -5259,16 +5284,21 @@ hidden grid never adds history. Growth appends blank rows to both grids. The
 client updates and verifies the PTY size before rendering the replacement
 buffer.
 
-A Wayland reader, blocking PTY reader and writer, bounded clipboard writer, and
-child waiter surround one main loop. A full PTY-output channel blocks its
-reader thread and lets the kernel PTY buffer backpressure the child. The
+A Wayland reader, blocking PTY reader and writer, bounded clipboard writer,
+bounded paste reader, and child waiter surround one main loop. A full
+PTY-output channel blocks its reader thread and lets the kernel PTY buffer
+backpressure the child. The
 clipboard writer instead has the four-entry refusal and five-second endpoint
 deadline above, so a receiver that stops reading cannot backpressure input,
 rendering, the protocol reader, or all later transfers indefinitely. The main
 loop alone mutates the terminal model and writes ordinary Wayland requests;
 the reader transfers only an already-requested clipboard payload to its exact
-endpoint. No correctness condition relies on poll, elapsed sleeps, or
-scheduler order; the startup deadline bounds failure detection rather than
+endpoint. Paste adds at most one 64 KiB payload beyond the PTY-output event
+budget and one bounded encoded copy during main-loop admission. Its worker
+closes the receive endpoint before publishing completion; cancellation and
+process exit release pending transfer authority. No correctness condition
+relies on poll, elapsed sleeps, or scheduler order; the startup deadline
+bounds failure detection rather than
 ordering state transitions.
 
 td-term exposes a mode-0600 readiness socket and prints `TD-TERM-READY` with

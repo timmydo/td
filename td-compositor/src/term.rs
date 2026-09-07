@@ -934,6 +934,7 @@ pub(crate) struct Terminal {
     auto_wrap: bool,
     cursor_visible: bool,
     application_cursor: bool,
+    bracketed_paste: bool,
     g0: Charset,
     g1: Charset,
     use_g1: bool,
@@ -962,6 +963,7 @@ impl Terminal {
             auto_wrap: true,
             cursor_visible: true,
             application_cursor: false,
+            bracketed_paste: false,
             g0: Charset::Ascii,
             g1: Charset::Ascii,
             use_g1: false,
@@ -1073,6 +1075,7 @@ impl Terminal {
         match name {
             "alternate-screen" => Some(self.alternate_active),
             "application-cursor" => Some(self.application_cursor),
+            "bracketed-paste" => Some(self.bracketed_paste),
             "autowrap" => Some(self.auto_wrap),
             "cursor-visible" => Some(self.cursor_visible),
             "origin" => Some(self.origin_mode),
@@ -1775,6 +1778,7 @@ impl Terminal {
         for index in 0..csi.count {
             match csi.value(index, 0) {
                 1 => self.application_cursor = enabled,
+                2004 => self.bracketed_paste = enabled,
                 6 => {
                     self.origin_mode = enabled;
                     let row = if enabled { self.screen().scroll_top } else { 0 };
@@ -1866,6 +1870,7 @@ impl Terminal {
         self.auto_wrap = true;
         self.cursor_visible = true;
         self.application_cursor = false;
+        self.bracketed_paste = false;
         self.g0 = Charset::Ascii;
         self.g1 = Charset::Ascii;
         self.use_g1 = false;

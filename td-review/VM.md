@@ -229,9 +229,10 @@ model requests merely to check login.
 
 Make ordinary text copy/paste work in both directions between the host desktop
 and td-term in the selected QEMU window. Treat this as a first-class development
-capability. The current compositor has a focus-scoped Wayland clipboard and
-td-term can copy a selection, but td-term currently discards incoming offers;
-paste consumption must be implemented there as well as the host/guest transport.
+capability. The compositor has a focus-scoped Wayland clipboard; td-term
+supports selection copy and bounded UTF-8 paste using Control+Shift+C/V,
+including application-requested bracketed paste. The host/guest transport
+remains to be implemented.
 
 Use the existing compositor clipboard and terminal PTY input paths. Preserve
 UTF-8, multiline text, selection ownership, and bracketed paste when the child
