@@ -61,10 +61,25 @@ fn run(args: &[String]) -> Result<(), String> {
         [command, flag, uid] if command == "unlock-operation" && flag == "--uid" => {
             operation::run(parse_uid(uid)?)
         }
+        [command, flag, uid] if command == "inspect-store" && flag == "--uid" => {
+            let mut endpoint = operation::startup()?;
+            let uid = parse_uid(uid)?;
+            let state =
+                store::Store::inspect_owned(&store::user_path(uid), uid, store_owner(uid)?)?;
+            use std::io::Write;
+            endpoint
+                .set_write_timeout(Some(std::time::Duration::from_secs(2)))
+                .map_err(|e| e.to_string())?;
+            endpoint
+                .write_all(&[0x17, state])
+                .map_err(|e| e.to_string())
+        }
         [command, flag, uid] if command == "lock-session" && flag == "--uid" => {
             store::lock_session(parse_uid(uid)?)
         }
-        [command, index, inode, rdev] if command == "hid-worker" => fido_device::worker(index, inode, rdev),
+        [command, index, inode, rdev] if command == "hid-worker" => {
+            fido_device::worker(index, inode, rdev)
+        }
         [command, uid_flag, uid, pcr_flag, pcrs, recovery]
             if command == "seal"
                 && uid_flag == "--uid"
@@ -123,11 +138,18 @@ fn run(args: &[String]) -> Result<(), String> {
 }
 
 fn owned_store(uid: u32) -> Result<store::Store, String> {
+    store::Store::open_owned(&store::user_path(uid), uid, store_owner(uid)?, false)
+}
+
+fn store_owner(uid: u32) -> Result<u32, String> {
     let registry = principals::Registry::load()?;
     registry.verify_installed_accounts(&registry)?;
-    let owner = registry.sessions().find(|session| session.owner == uid)
-        .ok_or("credential user has no deployment reservation")?.portal;
-    store::Store::open_owned(&store::user_path(uid), uid, owner, false)
+    let owner = registry
+        .sessions()
+        .find(|session| session.owner == uid)
+        .ok_or("credential user has no deployment reservation")?
+        .portal;
+    Ok(owner)
 }
 
 fn parse_uid(value: &str) -> Result<u32, String> {

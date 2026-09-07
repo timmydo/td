@@ -1,6 +1,7 @@
 //! At most one concurrent secret operation per authenticated generation.
 
 use crate::consent::{Recovery, Request as Description, Role};
+use crate::inspection::{Event as InspectionEvent, Inspection};
 use crate::unlock::{Event, Unlock};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -11,6 +12,7 @@ const CLEANUP_TIME: Duration = Duration::from_secs(2);
 pub(crate) enum Request {
     Prepare,
     Poll,
+    Inspect,
     Begin(Role),
     Enroll(Recovery),
     Presented(Description),
@@ -23,6 +25,7 @@ impl Request {
         match bytes {
             [0x10] => Ok(Self::Prepare),
             [0x11] => Ok(Self::Poll),
+            [0x17] => Ok(Self::Inspect),
             [0x12, 1] => Ok(Self::Begin(Role::Primary)),
             [0x12, 2] => Ok(Self::Begin(Role::Recovery)),
             [0x16, 0] => Ok(Self::Enroll(Recovery::Unrecoverable)),
@@ -135,6 +138,8 @@ pub(crate) struct Session {
     cleanup: Option<Cleanup>,
     operation: Option<Unlock>,
     event: Option<Event>,
+    inspection: Option<Inspection>,
+    inspection_event: Option<InspectionEvent>,
 }
 
 impl Session {
@@ -150,6 +155,8 @@ impl Session {
             cleanup: None,
             operation: None,
             event: None,
+            inspection: None,
+            inspection_event: None,
         })
     }
 
@@ -177,6 +184,7 @@ impl Session {
                 self.tick()?;
                 self.reply()
             }
+            Request::Inspect => self.inspect_with(Inspection::start),
             Request::Begin(role) => self.begin(Start::Unlock(role), begin),
             Request::Enroll(recovery) => self.begin(Start::Enroll(recovery), begin),
             Request::Presented(description) => {
@@ -213,12 +221,32 @@ impl Session {
         }
     }
 
+    fn inspect_with(
+        &mut self,
+        start: impl FnOnce(u32) -> Result<Inspection, String>,
+    ) -> Result<Vec<u8>, String> {
+        if !self.prepared
+            || self.cleanup.is_some()
+            || self.operation.is_some()
+            || self.inspection.is_some()
+        {
+            return Err("secret session is not ready for inspection".into());
+        }
+        self.inspection = Some(start(self.owner)?);
+        self.inspection_event = Some(InspectionEvent::Waiting);
+        Ok(vec![0x97])
+    }
+
     fn begin(
         &mut self,
         start: Start,
         begin: impl FnOnce(u32, Start) -> Result<Unlock, String>,
     ) -> Result<Vec<u8>, String> {
-        if !self.prepared || self.cleanup.is_some() || self.operation.is_some() {
+        if !self.prepared
+            || self.cleanup.is_some()
+            || self.operation.is_some()
+            || self.inspection.is_some()
+        {
             return Err("secret session is not ready for a new operation".into());
         }
         let operation = begin(self.owner, start)?;
@@ -240,10 +268,26 @@ impl Session {
         if let Some(operation) = &mut self.operation {
             self.event = Some(operation.poll()?);
         }
+        if let Some(inspection) = &mut self.inspection {
+            self.inspection_event = Some(inspection.poll()?);
+        }
         Ok(())
     }
 
     fn reply(&mut self) -> Result<Vec<u8>, String> {
+        if self.inspection.is_some() {
+            let event = self.inspection_event.ok_or("missing inspection event")?;
+            let answer = match event {
+                InspectionEvent::Waiting => vec![0x91, 8],
+                InspectionEvent::State(state) => vec![0x91, 9, state.tag()],
+                InspectionEvent::Unavailable => vec![0x91, 10],
+            };
+            if event != InspectionEvent::Waiting {
+                self.inspection = None;
+                self.inspection_event = None;
+            }
+            return Ok(answer);
+        }
         let Some(operation) = &self.operation else {
             return Ok(vec![
                 0x91,
@@ -290,6 +334,8 @@ impl Session {
             // proven child death, not replaying that result, permits relocking.
             operation.reap_for_teardown()?;
         }
+        self.inspection = None;
+        self.inspection_event = None;
         // Dropping pending generation cleanup also reaps before replacement.
         self.cleanup = None;
         self.prepared = false;

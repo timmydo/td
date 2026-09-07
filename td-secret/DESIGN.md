@@ -1020,3 +1020,41 @@ the explicit lock command is intentionally exercised alongside both workers.
 It proves startup refusal and relocking, not production token I/O or presented
 enrollment. The in-process framing and hardware-wiring oracles cover those
 separate boundaries without claiming a physical touch.
+
+## Read-only enrollment-state inspection
+
+The hidden root helper `td-secret inspect-store --uid UID` resolves the
+reserved portal owner through the immutable installed identity table. It
+opens the existing store and existing lock without creating either, takes
+the same nonblocking exclusive lock as cooperating readers and writers,
+and validates the backend's bounded structure and ownership. It returns
+exactly `17` followed by one byte: 0 file master, 1 TPM-only, 2 token with
+explicit unrecoverability, or 3 token with a recovery credential. Failure
+returns no state. The parent must require the exact result, EOF and a
+successful observed exit. No path or filesystem owner comes from the peer.
+
+Inspection does not access token/TPM devices, read a runtime key, decrypt
+records, retire legacy files, normalize metadata, or create a lock/master.
+The existing file-master validator reads and clears its private 32-byte
+buffer internally; those bytes never enter the result. The existing lock
+is taken read-only and released on close. Ordinary filesystem access-time
+updates remain possible. Contention, missing state and malformed state
+refuse; they never become permission to initialize a replacement store.
+
+This is an advisory structural snapshot, not proof of a valid hardware
+binding, token presence, usable recovery, or current release. A stored
+recovery record still depends on the enrolled second token and the bound
+platform. A subsequent operation independently validates current state.
+In particular, after an enrollment whose success reply was lost, seeing
+a token protector permits offering a fresh unlock operation; it does not
+prove which attempt published it and never authorizes enrollment retry,
+replacement, release or write. The paired root controller owns the helper
+lifetime and admission, as specified in td-authd/DESIGN.md.
+
+The inspection helper uses the private operation startup admission:
+all root UIDs, single-threaded startup, only standard inherited descriptors,
+and a root-owned unnamed stdin socket whose inode neither log aliases.
+It writes the two-byte result directly to that socket with a two-second
+write timeout. There is no buffered stdout result. The parent deadline
+also bounds filesystem work and observed completion. Both production and
+ordinary child fixtures use the same factory and descriptor assignment.

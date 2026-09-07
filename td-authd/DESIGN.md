@@ -1019,3 +1019,48 @@ root cannot observe its framebuffer and trusts that admitted peer to
 supply receipts honestly. These duties apply before a compositor consumer
 ships. Presentation acknowledgements carry descriptions in the request;
 responses are the bare 93/94 tags, while poll results carry descriptions.
+
+## Paired read-only store inspection
+
+The admitted paired peer may send exact request `17` only after Prepare
+has completed and while neither an operation nor an unconsumed inspection
+is retained. Root fixes owner 1000 and starts `/bin/td-secret inspect-store
+--uid 1000` with an empty environment, `/` cwd, null stdout/stderr, and a
+private stdin socketpair. The immediate response is `97` (started).
+The peer continues polling at least every 250 ms. Poll `11` returns `91
+08` while pending, `91 09 STATE` for a completed structural snapshot, or
+`91 0a` for unavailable state. STATE is 0 file master, 1 TPM-only, 2 token
+unrecoverable, or 3 token with recovery. Only a terminal poll consumes
+the result; heartbeats advance the helper without retiring its state.
+An unconsumed result excludes another inspection and every secret operation.
+
+The nonblocking parent performs at most one read of three bytes per tick.
+It requires exactly the helper's two-byte result, EOF, and a successful
+exit observed within one two-second deadline. Partial, trailing or malformed
+output, failed exit and deadline expiry become Unavailable only after the
+child is reaped. Expiry or read failure closes the endpoint and kills the
+owned child, retaining it through kernel sleep. Failure to kill or reap
+ends the generation rather than losing ownership. Missing helper/spawn
+failure also ends the generation. No uncertain result is retried by the
+controller. A later explicit inspection can observe newer state.
+
+Generation teardown drops the inspection, closes its endpoint, kills and
+waits for its owned child before final runtime cleanup. This blocking wait
+is confined to the already-failed peer path, with td-svc's containment and
+replacement refusal still applying. The read-only helper cannot publish a
+key or store; nevertheless a retained child is never abandoned to admit
+another operation. It adds no listener, descriptor transfer to the peer,
+raw syscall, authentication mechanism or compositor activation.
+
+The result is structural metadata, not a claim that the last enrollment
+succeeded, a token exists, or credentials are released. After an uncertain
+enrollment outcome the UI must issue a new inspection, then offer fresh
+unlock for a token store or a new explicit enrollment for an unenrolled
+store. Unavailable state cannot select a fallback. An unlock/enrollment
+independently revalidates the current store; no snapshot grants authority.
+
+An inspection request before preparation, overlapping requests, or an
+operation started before consuming the inspection result is a protocol
+error that ends the authority generation. It is not a soft busy response.
+The helper applies the same private root/stdin startup admission as the
+token workers and writes directly to the socket, with no buffered stdout.

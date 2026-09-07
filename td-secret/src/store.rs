@@ -68,6 +68,13 @@ fn private_metadata(file: &File, uid: u32, mode: u32, dir: bool) -> Result<(), S
     Ok(())
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OpenMode {
+    Open,
+    Create,
+    Inspect,
+}
+
 pub struct Store {
     directory: File,
     lock: File,
@@ -390,6 +397,17 @@ impl Store {
         result
     }
 
+    /// A structural snapshot only: this never authenticates or releases a key.
+    pub fn inspect_owned(path: &Path, uid: u32, owner: u32) -> Result<u8, String> {
+        let (_store, bundle) = Self::open_mode(path, uid, owner, OpenMode::Inspect)?;
+        let Some(bundle) = bundle else { return Ok(0) };
+        if !bundle.token_protected() {
+            return Ok(1);
+        }
+        let protection = super::fido_metadata::Protection::decode(&bundle.key, uid)?;
+        Ok(if protection.has_recovery() { 3 } else { 2 })
+    }
+
     pub fn token_protected(&self) -> Result<bool, String> {
         Ok(self.bundle()?.is_some_and(|bundle| bundle.token_protected()))
     }
@@ -526,6 +544,25 @@ impl Store {
         file_owner: u32,
         create: bool,
     ) -> Result<Self, String> {
+        Self::open_mode(
+            path,
+            uid,
+            file_owner,
+            if create {
+                OpenMode::Create
+            } else {
+                OpenMode::Open
+            },
+        )
+        .map(|(store, _)| store)
+    }
+
+    fn open_mode(
+        path: &Path,
+        uid: u32,
+        file_owner: u32,
+        mode: OpenMode,
+    ) -> Result<(Self, Option<Bundle>), String> {
         if !path.is_absolute() {
             return Err("credential store path must be absolute".into());
         }
@@ -538,7 +575,7 @@ impl Store {
             };
             let child = pinned(&parent).join(name);
             let last = index + 1 == components.len();
-            let created = if last && create {
+            let created = if last && mode == OpenMode::Create {
                 match fs::DirBuilder::new().mode(0o700).create(&child) {
                     Ok(()) => true,
                     Err(e) if e.kind() == io::ErrorKind::AlreadyExists => false,
@@ -566,28 +603,36 @@ impl Store {
         }
         private_metadata(&parent, file_owner, 0o700, true)?;
         let lock_path = pinned(&parent).join("lock");
-        let lock = match OpenOptions::new()
-            .read(true)
-            .write(true)
-            .mode(0o600)
-            .custom_flags(O_NOFOLLOW | O_NONBLOCK)
-            .create_new(true)
-            .open(&lock_path)
-        {
-            Ok(file) => {
-                file.set_permissions(fs::Permissions::from_mode(0o600))
-                    .map_err(|e| e.to_string())?;
-                std::os::unix::fs::fchown(&file, Some(file_owner), None)
-                    .map_err(|e| e.to_string())?;
-                file
-            }
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => OpenOptions::new()
+        let lock = if mode == OpenMode::Inspect {
+            OpenOptions::new()
+                .read(true)
+                .custom_flags(O_NOFOLLOW | O_NONBLOCK)
+                .open(&lock_path)
+                .map_err(|e| format!("open credential lock: {e}"))?
+        } else {
+            match OpenOptions::new()
                 .read(true)
                 .write(true)
+                .mode(0o600)
                 .custom_flags(O_NOFOLLOW | O_NONBLOCK)
-                .open(lock_path)
-                .map_err(|e| e.to_string())?,
-            Err(e) => return Err(format!("open credential lock: {e}")),
+                .create_new(true)
+                .open(&lock_path)
+            {
+                Ok(file) => {
+                    file.set_permissions(fs::Permissions::from_mode(0o600))
+                        .map_err(|e| e.to_string())?;
+                    std::os::unix::fs::fchown(&file, Some(file_owner), None)
+                        .map_err(|e| e.to_string())?;
+                    file
+                }
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .custom_flags(O_NOFOLLOW | O_NONBLOCK)
+                    .open(lock_path)
+                    .map_err(|e| e.to_string())?,
+                Err(e) => return Err(format!("open credential lock: {e}")),
+            }
         };
         private_metadata(&lock, file_owner, 0o600, false)?;
         lock.try_lock()
@@ -598,8 +643,8 @@ impl Store {
             uid,
             file_owner,
         };
-        if store.bundle()?.is_some() {
-            return Ok(store);
+        if let Some(bundle) = store.bundle()? {
+            return Ok((store, Some(bundle)));
         }
         match store.read("master", 32) {
             Ok(mut bytes) if bytes.len() == 32 => bytes.fill(0),
@@ -615,7 +660,7 @@ impl Store {
             }
             Err(e) => return Err(format!("read credential master: {e}")),
         }
-        Ok(store)
+        Ok((store, None))
     }
 
     fn read(&self, name: &str, max: usize) -> io::Result<Vec<u8>> {
@@ -1683,6 +1728,63 @@ mod tests {
         assert!(Store::open(&base.join("alias"), uid, false).is_err());
         fs::remove_dir_all(base).unwrap();
     }
+    #[test]
+    fn inspection_preserves_store_bytes_and_refuses_missing_or_invalid_state() {
+        let root = std::env::temp_dir().join(format!("td-inspect-{}-{}", std::process::id(), u64::from_le_bytes(random::<8>().unwrap())));
+        fs::create_dir(&root).unwrap();
+        let owner = fs::metadata(&root).unwrap().uid();
+        let path = root.join("store");
+        assert!(Store::inspect_owned(&path, 1000, owner).is_err());
+        assert!(!path.exists());
+        let store = Store::open_owned(&path, 1000, owner, true).unwrap();
+        store.set("mail", "main", b"private inspection fixture").unwrap();
+        assert!(Store::inspect_owned(&path, 1000, owner).is_err());
+        drop(store);
+        let snapshot = || fs::read_dir(&path).unwrap().map(|entry| {
+            let entry = entry.unwrap(); (entry.file_name(), fs::read(entry.path()).unwrap())
+        }).collect::<BTreeMap<_,_>>();
+        let initial = snapshot();
+        assert_eq!(Store::inspect_owned(&path, 1000, owner).unwrap(), 0);
+        assert_eq!(snapshot(), initial);
+        fs::remove_file(path.join("master")).unwrap();
+        assert!(Store::inspect_owned(&path, 1000, owner).is_err());
+        assert!(!path.join("master").exists());
+        for bytes in [&[][..], &[1; 31][..], &[1; 33][..]] {
+            fs::write(path.join("master"), bytes).unwrap();
+            fs::set_permissions(path.join("master"), fs::Permissions::from_mode(0o600)).unwrap();
+            assert!(Store::inspect_owned(&path, 1000, owner).is_err());
+            assert_eq!(fs::read(path.join("master")).unwrap(), bytes);
+        }
+        fs::write(path.join("master"), initial.get(std::ffi::OsStr::new("master")).unwrap()).unwrap();
+        let store = Store::open_owned(&path, 1000, owner, false).unwrap();
+        store.write("sealed", &Bundle { key: tpm::tests::fixture(1000), records: BTreeMap::new() }.encode().unwrap()).unwrap();
+        drop(store);
+        let initial = snapshot();
+        assert_eq!(Store::inspect_owned(&path, 1000, owner).unwrap(), 1);
+        assert!(Store::inspect_owned(&path, 1001, owner).is_err());
+        assert_eq!(snapshot(), initial);
+        fs::remove_file(path.join("sealed")).unwrap();
+        for recovery in [false, true] {
+            let protection = super::super::fido_metadata::tests::protection_fixture(1000, recovery).encode().unwrap();
+            let store = Store::open_owned(&path, 1000, owner, false).unwrap();
+            store.write("sealed", &Bundle { key: protection, records: BTreeMap::new() }.encode().unwrap()).unwrap();
+            drop(store);
+            let initial = snapshot();
+            assert_eq!(Store::inspect_owned(&path, 1000, owner).unwrap(), if recovery { 3 } else { 2 });
+            assert_eq!(snapshot(), initial);
+            assert!(Store::inspect_owned(&path, 1001, owner).is_err());
+            fs::remove_file(path.join("sealed")).unwrap();
+        }
+        fs::write(path.join("sealed"), b"malformed protector").unwrap();
+        fs::set_permissions(path.join("sealed"), fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(Store::inspect_owned(&path, 1000, owner).is_err());
+        fs::remove_file(path.join("sealed")).unwrap();
+        fs::remove_file(path.join("lock")).unwrap();
+        assert!(Store::inspect_owned(&path, 1000, owner).is_err());
+        assert!(!path.join("lock").exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn records_survive_reopen_are_private_and_authenticate_identity() {
         let base = std::env::temp_dir().join(format!("td-secret-test-{}", std::process::id()));

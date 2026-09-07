@@ -31,6 +31,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
             "application_files.rs",
             "channel.rs",
             "consent.rs",
+            "inspection.rs",
             "launch.rs",
             "main.rs",
             "mount_sys.rs",
@@ -50,6 +51,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
         ("launch.rs", 0),
         ("unlock.rs", 0),
         ("session.rs", 0),
+        ("inspection.rs", 0),
         ("mount_sys.rs", 4),
         ("portal_files.rs", 0),
     ] {
@@ -73,7 +75,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
         ] {
             let child_api = matches!(
                 name,
-                "launch.rs" | "application.rs" | "unlock.rs" | "session.rs"
+                "launch.rs" | "application.rs" | "unlock.rs" | "session.rs" | "inspection.rs"
             ) && ["::Command", "::thread", ".spawn(", ".exec("]
                 .contains(&forbidden);
             let mapping_child_api = matches!(name, "portal_files.rs" | "application_files.rs")
@@ -105,8 +107,18 @@ fn the_production_source_and_raw_boundary_are_closed() {
                 .next()
                 .unwrap()
         ),
-        0xb62dc9d600ca92ca,
+        0x56cccb71a3945c10,
         "paired secret controller changed"
+    );
+    assert_eq!(
+        fingerprint(
+            include_str!("../src/inspection.rs")
+                .split("#[cfg(test)]")
+                .next()
+                .unwrap()
+        ),
+        0x13e77bb9effa0802,
+        "read-only store controller changed"
     );
     let application = include_str!("../src/application.rs")
         .split("#[cfg(test)]")
@@ -274,7 +286,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
     // Pin startup as well as raw code: aliases can evade API-name scans.
     assert_eq!(
         fingerprint(main),
-        0x672cd381940b88e7,
+        0x3be7a456ea994990,
         "main.rs: production startup changed"
     );
     assert_eq!(
@@ -292,4 +304,4 @@ fn fingerprint(source: &str) -> u64 {
     })
 }
 
-const LAUNCH_FINGERPRINT: u64 = 0xfb91bd5c084d2b47;
+const LAUNCH_FINGERPRINT: u64 = 0xbbe187bccdba8518;

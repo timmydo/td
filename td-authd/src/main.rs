@@ -11,6 +11,7 @@ mod consent;
 mod launch;
 mod unlock;
 mod session;
+mod inspection;
 mod mount_sys;
 mod portal_files;
 mod sys;

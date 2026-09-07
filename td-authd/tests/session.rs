@@ -625,3 +625,125 @@ fn invalid_enrollment_receipts_require_generation_teardown() {
         assert!(session.operation.is_none());
     }
 }
+
+#[test]
+fn inspection_requires_idle_preparation_and_retains_its_result_until_poll() {
+    assert_eq!(Request::decode(&[0x17]).unwrap(), Request::Inspect);
+    assert!(Request::decode(&[0x17, 0]).is_err());
+    let mut session = Session::new(1000).unwrap();
+    let start = |_| Ok(crate::inspection::tests::fixture(3));
+    assert!(session.inspect_with(start).is_err());
+    prepare(&mut session);
+    assert_eq!(session.inspect_with(start).unwrap(), [0x97]);
+    assert!(session.inspect_with(start).is_err());
+    assert!(session
+        .answer_with(
+            Request::Begin(Role::Primary),
+            |_| fixture("cleanup_child"),
+            unexpected_begin
+        )
+        .is_err());
+    let until = Instant::now() + Duration::from_secs(4);
+    while session.inspection_event == Some(InspectionEvent::Waiting) {
+        session.tick().unwrap();
+        assert!(Instant::now() < until);
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert!(session.inspect_with(start).is_err());
+    assert_eq!(session.answer(Request::Poll).unwrap(), [0x91, 9, 3]);
+    assert_eq!(session.answer(Request::Poll).unwrap(), [0x91, 2]);
+    session
+        .inspect_with(|_| Ok(crate::inspection::tests::fixture(7)))
+        .unwrap();
+    let until = Instant::now() + Duration::from_secs(4);
+    loop {
+        let answer = session.answer(Request::Poll).unwrap();
+        if answer != [0x91, 8] {
+            assert_eq!(answer, [0x91, 10]);
+            break;
+        }
+        assert!(Instant::now() < until);
+        thread::sleep(Duration::from_millis(1));
+    }
+    session
+        .inspect_with(|_| Ok(crate::inspection::tests::fixture(8)))
+        .unwrap();
+    session.close_with(|_| fixture("cleanup_child")).unwrap();
+    assert!(session.inspection.is_none());
+}
+
+#[test]
+#[ignore = "requires the marked disposable root VM and production inspector"]
+fn root_inspection_observes_file_state_without_publishing_or_repairing() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::{fs, path::Path};
+    assert!(fs::read_to_string("/proc/cmdline")
+        .unwrap()
+        .split_whitespace()
+        .any(|word| word == "td.operation-fixture=1"));
+    assert!(fs::read_to_string("/proc/self/status")
+        .unwrap()
+        .lines()
+        .find_map(|line| line.strip_prefix("Uid:"))
+        .is_some_and(|ids| ids.split_whitespace().collect::<Vec<_>>() == ["0"; 4]));
+    assert!(!Path::new("/etc/td-principals.tsv").exists());
+    assert!(!Path::new("/var/lib/td/secrets/1000").exists());
+    fs::create_dir_all("/etc").unwrap();
+    for (path, bytes, mode) in [
+        (
+            "/etc/td-principals.tsv",
+            "td-principals-v1\nsession\t1000\t993\t992\t991\n",
+            0o444,
+        ),
+        (
+            "/etc/passwd",
+            "root:x:0:0:root:/root:/bin/false\ntester:x:1000:1000:Test:/home/tester:/bin/false\n",
+            0o644,
+        ),
+        ("/etc/group", "root:x:0:\ntester:x:1000:\n", 0o644),
+        (
+            "/etc/shadow",
+            "root::1:0:99999:7:::\ntester::1:0:99999:7:::\n",
+            0o600,
+        ),
+    ] {
+        fs::write(path, bytes).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+    }
+    let path = Path::new("/var/lib/td/secrets/1000");
+    fs::create_dir_all(path).unwrap();
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+    std::os::unix::fs::chown(path, Some(991), Some(991)).unwrap();
+    for (name, bytes) in [("master", &[42; 32][..]), ("lock", &[][..])] {
+        fs::write(path.join(name), bytes).unwrap();
+        fs::set_permissions(path.join(name), fs::Permissions::from_mode(0o600)).unwrap();
+        std::os::unix::fs::chown(path.join(name), Some(991), Some(991)).unwrap();
+    }
+    let mut session = Session::new(1000).unwrap();
+    session.answer(Request::Prepare).unwrap();
+    let until = Instant::now() + Duration::from_secs(5);
+    while session.answer(Request::Poll).unwrap() != [0x91, 2] {
+        assert!(Instant::now() < until);
+        thread::sleep(Duration::from_millis(1));
+    }
+    let inspect = |session: &mut Session| {
+        assert_eq!(session.answer(Request::Inspect).unwrap(), [0x97]);
+        let until = Instant::now() + Duration::from_secs(5);
+        loop {
+            let answer = session.answer(Request::Poll).unwrap();
+            if answer != [0x91, 8] {
+                break answer;
+            }
+            assert!(Instant::now() < until);
+            thread::sleep(Duration::from_millis(1));
+        }
+    };
+    assert_eq!(inspect(&mut session), [0x91, 9, 0]);
+    assert_eq!(fs::read(path.join("master")).unwrap(), [42; 32]);
+    assert!(!Path::new("/run/td-secret/1000/key").exists());
+    fs::remove_file(path.join("lock")).unwrap();
+    assert_eq!(inspect(&mut session), [0x91, 10]);
+    assert!(!path.join("lock").exists());
+    assert_eq!(fs::read(path.join("master")).unwrap(), [42; 32]);
+    session.close().unwrap();
+}
