@@ -85,8 +85,16 @@ Git setup, and account linking are not implemented. The td-owned clipboard
 and feed bridge described below requires a matching updated system image. Stop from the guest; host
 `stop NAME --force` explicitly cuts power. Disk deletion requires `--yes` or
 typing the instance name in the TUI and reports unsubmitted work as unknown.
-The table currently reports allocated overlay space; virtual capacity,
-configurable free-space reserves, and on-disk log rotation remain outstanding.
+The table reports allocated overlay space (`HOST MiB`) and virtual disk
+capacity (`CAP MiB`), rounded down to whole MiB. Allocation excludes the shared
+template and logs; capacity is the guest's block-device size, not filesystem
+size or free space. Refresh reads the qcow2 header without contacting QMP or
+taking a disk lock, so it also works while a VM runs. This read does not
+validate qcow2 allocation tables. Invalid or truncated headers make that row
+unavailable. The field layout follows the
+[qcow2 format](https://www.qemu.org/docs/master/interop/qcow2.html).
+Disk expansion, configurable free-space reserves, and on-disk log rotation
+remain outstanding.
 Log display reads bounded tails, but QEMU's retained serial log can grow.
 
 The sections below specify the remaining complete workflow. Features described

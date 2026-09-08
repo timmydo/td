@@ -29,6 +29,8 @@ mod vm_clipboard;
 mod vm_wire;
 
 type Result<T> = std::result::Result<T, String>;
+const TABLE_HEADER: &str = "NAME                             STATE    ACCEL    TEMPLATE         CPU RAM MiB HOST MiB  CAP MiB";
+const DISK_LEGEND: &str = "HOST: allocated overlay; CAP: virtual capacity. Neither is guest free space.";
 const HELP: &str = "td-vm: manage persistent graphical td instances
 
   td-vm                              open the TUI
@@ -361,6 +363,61 @@ fn verify_template(base: &Path) -> Result<()> {
     Ok(())
 }
 
+// Read only the stable header fields, including while QEMU owns the disk.
+// This is capacity reporting, not validation of the image's allocation tables.
+fn disk_usage(path: &Path) -> Result<(u64, u64)> {
+    if !io(fs::symlink_metadata(path), "inspect disk")?.is_file() {
+        return Err("disk must be a regular qcow2 file".into());
+    }
+    // Linux O_NOFOLLOW | O_NONBLOCK: replacement cannot follow a link or
+    // block on a FIFO before the opened-file type check.
+    let mut file = io(
+        OpenOptions::new()
+            .read(true)
+            .custom_flags(0x20000 | 0x800)
+            .open(path),
+        "open disk header",
+    )?;
+    let metadata = io(file.metadata(), "inspect opened disk")?;
+    if !metadata.is_file() {
+        return Err("disk must be a regular qcow2 file".into());
+    }
+    let mut header = [0u8; 104];
+    let prefix = header.get_mut(..72).ok_or("invalid disk header buffer")?;
+    io(file.read_exact(prefix), "read qcow2 header")?;
+    if header.get(..4) != Some(b"QFI\xfb") {
+        return Err("disk has no qcow2 header".into());
+    }
+    let word = |bytes: Option<&[u8]>| -> Result<u32> {
+        Ok(u32::from_be_bytes(
+            bytes
+                .and_then(|bytes| bytes.try_into().ok())
+                .ok_or("short qcow2 field")?,
+        ))
+    };
+    match word(header.get(4..8))? {
+        2 => {}
+        3 => {
+            io(
+                file.read_exact(header.get_mut(72..).ok_or("invalid disk header buffer")?),
+                "read qcow2 v3 header",
+            )?;
+            let length = u64::from(word(header.get(100..104))?);
+            if length < 104 || length % 8 != 0 || length > metadata.len() {
+                return Err("invalid qcow2 header length".into());
+            }
+        }
+        _ => return Err("unsupported qcow2 version".into()),
+    }
+    let capacity = u64::from_be_bytes(
+        header
+            .get(24..32)
+            .and_then(|bytes| bytes.try_into().ok())
+            .ok_or("short qcow2 capacity")?,
+    );
+    Ok((metadata.blocks() / 2048, capacity / (1024 * 1024)))
+}
+
 fn lock_file(path: &Path, key: &str, retry: bool) -> Result<File> {
     if path.is_symlink() {
         return Err("lock path is a symlink".into());
@@ -586,7 +643,7 @@ impl Manager {
                 let row = (|| {
                     let dir = self.instance(&value)?;
                     let config = Config::read(&dir)?;
-                    let blocks = io(fs::metadata(dir.join("disk.qcow2")), "inspect disk")?.blocks();
+                    let (host_mib, capacity_mib) = disk_usage(&dir.join("disk.qcow2"))?;
                     let state = if running(&dir)? {
                         "live"
                     } else if self.active(&value)? {
@@ -597,12 +654,11 @@ impl Manager {
                     let accel =
                         fs::read_to_string(dir.join("accel")).unwrap_or_else(|_| "unknown".into());
                     Ok::<_, String>(format!(
-                        "{value:<32} {state:<8} {:<8} {:<16} {:>3} {:>7} {:>7}",
+                        "{value:<32} {state:<8} {:<8} {:<16} {:>3} {:>7} {host_mib:>8} {capacity_mib:>8}",
                         accel.trim(),
                         config.template,
                         config.cpus,
-                        config.memory,
-                        blocks / 2048
+                        config.memory
                     ))
                 })();
                 Ok((value, row.unwrap_or_else(|e| format!("unavailable: {e}"))))
@@ -611,10 +667,11 @@ impl Manager {
     }
 
     fn list(&self) -> Result<()> {
-        println!("NAME                             STATE    ACCEL    TEMPLATE         CPU RAM MiB DISK MiB");
+        println!("{TABLE_HEADER}");
         for (_, row) in self.rows()? {
             println!("{}", term::scrub(&row));
         }
+        println!("{DISK_LEGEND}");
         Ok(())
     }
 
@@ -1377,8 +1434,8 @@ fn tui(manager: &Manager) -> Result<()> {
         let mut frame = term::Frame::new(height, width);
         frame.push_text("td-vm  Enter open · n new · i import · t templates · D delete · X cut power", term::Style::bar(term::CYAN));
         frame.push_text("h status · R resume · l logs · v paste · c copy · f feed · s sharing · r refresh · q quit", term::Style::bar(term::CYAN));
-        frame.push_text("NAME                             STATE    ACCEL    TEMPLATE         CPU RAM MiB DISK MiB", term::Style::bold());
-        let page = height.saturating_sub(7).max(1);
+        frame.push_text(TABLE_HEADER, term::Style::bold());
+        let page = height.saturating_sub(8).max(1);
         let offset = selected.saturating_sub(page - 1);
         for (index, (_, row)) in rows.iter().enumerate().skip(offset).take(page) {
             let style = if index == selected {
@@ -1392,6 +1449,7 @@ fn tui(manager: &Manager) -> Result<()> {
             frame.push_text("No instances yet.", term::Style::dim());
         }
         frame.push_text("Live means a QEMU process exists. h inspects guest execution and disk faults.", term::Style::dim());
+        frame.push_text(DISK_LEGEND, term::Style::dim());
         frame.push_text(&status, term::Style::fg(term::YELLOW));
         terminal.draw(frame.finish()).map_err(|e| e.to_string())?;
         let keys = terminal.read_keys().map_err(|e| e.to_string())?;
@@ -2076,6 +2134,51 @@ mod tests {
         assert!(!absent.exists());
     }
 
+    #[test]
+    fn capacity_header_refuses_truncation_unknown_format_and_non_files() {
+        let scratch = Scratch::new();
+        let path = scratch.0.join("disk.qcow2");
+        let mut header = [0u8; 104];
+        header[..4].copy_from_slice(b"QFI\xfb");
+        header[4..8].copy_from_slice(&3u32.to_be_bytes());
+        header[24..32].copy_from_slice(&(10u64 * 1024 * 1024 * 1024).to_be_bytes());
+        header[100..104].copy_from_slice(&104u32.to_be_bytes());
+        for length in [0, 31, 71, 72, 103] {
+            fs::write(&path, &header[..length]).unwrap();
+            assert!(disk_usage(&path).is_err(), "accepted length {length}");
+        }
+        fs::write(&path, header).unwrap();
+        assert_eq!(disk_usage(&path).unwrap().1, 10240);
+        for length in [72u32, 105, 112] {
+            header[100..104].copy_from_slice(&length.to_be_bytes());
+            fs::write(&path, header).unwrap();
+            assert!(disk_usage(&path).is_err());
+        }
+        let mut extended = header.to_vec();
+        extended.resize(112, 0);
+        fs::write(&path, extended).unwrap();
+        assert_eq!(disk_usage(&path).unwrap().1, 10240);
+        header[4..8].copy_from_slice(&2u32.to_be_bytes());
+        fs::write(&path, &header[..72]).unwrap();
+        assert_eq!(disk_usage(&path).unwrap().1, 10240);
+        for version in [0u32, 1, 4, u32::MAX] {
+            header[4..8].copy_from_slice(&version.to_be_bytes());
+            fs::write(&path, header).unwrap();
+            assert!(disk_usage(&path).is_err());
+        }
+        header[4..8].copy_from_slice(&2u32.to_be_bytes());
+        header[0] = 0;
+        fs::write(&path, header).unwrap();
+        assert!(disk_usage(&path).is_err());
+        header[0] = b'Q';
+        fs::write(&path, header).unwrap();
+        assert_eq!(disk_usage(&path).unwrap().1, 10240);
+        let link = scratch.0.join("link");
+        std::os::unix::fs::symlink(&path, &link).unwrap();
+        assert!(disk_usage(&link).is_err());
+        assert!(disk_usage(&scratch.0).is_err());
+    }
+
     fn firmware_command(dir: &Path, accel: &str) -> Command {
         // Exercise the production devices/acceleration/disk command with only
         // boot payloads removed and display disabled: no td image in host gates.
@@ -2165,12 +2268,17 @@ mod tests {
         }
         let one = manager.instance("one").unwrap();
         let two = manager.instance("two").unwrap();
+        assert_eq!(disk_usage(&one.join("disk.qcow2")).unwrap().1, 16);
+        assert_eq!(disk_usage(&one.join("disk.qcow2")).unwrap().0,
+            fs::metadata(one.join("disk.qcow2")).unwrap().blocks() / 2048);
         command(
             Command::new("qemu-io")
                 .args(["-f", "qcow2", "-c", "write -P 0x5a 0 4096"])
                 .arg(one.join("disk.qcow2")),
         )
         .unwrap();
+        assert_eq!(disk_usage(&one.join("disk.qcow2")).unwrap().0,
+            fs::metadata(one.join("disk.qcow2")).unwrap().blocks() / 2048);
         for path in [manager.template("base").unwrap(), two.clone()] {
             command(
                 Command::new("qemu-io")
@@ -2186,6 +2294,12 @@ mod tests {
         let supervisor =
             thread::spawn(move || Manager::existing(&root).unwrap().run_qemu("one", cmd));
         wait_running(&one);
+        let (allocated, capacity) = disk_usage(&one.join("disk.qcow2")).unwrap();
+        assert_eq!(capacity, 16);
+        assert_eq!(
+            allocated,
+            fs::metadata(one.join("disk.qcow2")).unwrap().blocks() / 2048
+        );
         assert!(manager.status("one").unwrap().contains("prelaunch"));
         manager.resume("one").unwrap();
         Qmp::connect(&one.join("qmp")).unwrap().execute("stop").unwrap();
