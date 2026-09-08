@@ -9,6 +9,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
 const BIN: &str = env!("CARGO_BIN_EXE_td-vm-git");
+const KEY_A: &str = "AAAAC3NzaC1lZDI1NTE5AAAAIAEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEB";
+const KEY_B: &str = "AAAAC3NzaC1lZDI1NTE5AAAAIAICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIC";
 const A: &str = "0123456789abcdef0123456789abcdef";
 const B: &str = "1123456789abcdef0123456789abcdef";
 
@@ -110,7 +112,7 @@ impl Fixture {
         fixture.pack = fixture.git(&["-C", "seed", "pack-objects", "--stdout", "--all"], &[])?;
         fixture.git(&["-C", "seed", "push", "../origin.git", "main"], &[])?;
         let text = format!(
-            "TDVM-GIT-1\nrepository={}\ngit={}\npath={}\nbranch={A} vm-a\nbranch={B} vm-b\n",
+            "TDVM-GIT-2\ndispatcher={BIN}\nkey={A} {KEY_A}\nkey={B} {KEY_B}\nrepository={}\ngit={}\npath={}\nbranch={A} vm-a\nbranch={B} vm-b\n",
             fixture.repo().display(),
             fixture.git.display(),
             std::env::var("PATH")?
@@ -159,6 +161,7 @@ impl Fixture {
             .args(["serve"])
             .arg(self.root.join("policy"))
             .arg(id)
+            .arg(if id == A { KEY_A } else { KEY_B })
             .env("SSH_ORIGINAL_COMMAND", command)
             // A caller cannot turn off hooks or choose another identity.
             .env("GIT_CONFIG_COUNT", "1")
@@ -364,6 +367,7 @@ fn receive_hook_rereads_policy_and_refuses_changed_session_profile() -> Result<(
             .env_clear()
             .env("TD_VM_GIT_POLICY", &policy_path)
             .env("TD_VM_GIT_INSTANCE", A)
+            .env("TD_VM_GIT_KEY", KEY_A)
             .env("TD_VM_GIT_REPOSITORY", f.repo())
             .env("TD_VM_GIT_EXECUTABLE", &f.git)
             .env("TD_VM_GIT_PATH", std::env::var("PATH")?)
@@ -515,5 +519,354 @@ fn reserved_symbolic_ref_cannot_update_main() -> Result<()> {
     let dangling = f.push(A, &[(&"0".repeat(40), &f.oid, "refs/heads/vm-a")])?;
     assert!(dangling.contains("pre-receive hook declined"), "{dangling}");
     assert!(!f.refs()?.contains("refs/heads/vm-b"));
+    Ok(())
+}
+
+fn admin(args: &[&str], success: bool) -> Result<Output> {
+    let output = Command::new(BIN).args(args).stdin(Stdio::null()).output()?;
+    assert_eq!(
+        output.status.success(),
+        success,
+        "{args:?}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    Ok(output)
+}
+
+fn initialize_registry(f: &Fixture) -> Result<PathBuf> {
+    let path = f.root.join("profile 'quoted'").join("registry");
+    admin(
+        &[
+            "init",
+            path.to_str().ok_or("path")?,
+            f.repo().to_str().ok_or("repo")?,
+            f.git.to_str().ok_or("git")?,
+            &std::env::var("PATH")?,
+            BIN,
+        ],
+        true,
+    )?;
+    Ok(path)
+}
+
+#[test]
+fn enrollment_lookup_reservations_and_revocation_publish_one_registry() -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    if in_trusted_root("enrollment_lookup_reservations_and_revocation_publish_one_registry")? {
+        return Ok(());
+    }
+    let f = Fixture::new("sha1")?;
+    let registry = initialize_registry(&f)?;
+    let path = registry.to_str().ok_or("registry path")?;
+    let key_file = f.root.join("public-key");
+    let key_path = key_file.to_str().ok_or("key path")?;
+    fs::write(
+        &key_file,
+        format!("ssh-ed25519 {KEY_A} ignored human comment\n"),
+    )?;
+    assert!(
+        admin(&["authorized-keys", path, "ssh-ed25519", KEY_A], true)?
+            .stdout
+            .is_empty()
+    );
+    admin(&["enroll", path, A, "topic-a", key_path], true)?;
+    assert_eq!(
+        String::from_utf8(f.git(
+            &["--git-dir=origin.git", "rev-parse", "refs/heads/topic-a"],
+            &[]
+        )?)?
+        .trim(),
+        f.oid
+    );
+    let lookup = admin(&["authorized-keys", path, "ssh-ed25519", KEY_A], true)?;
+    let line = String::from_utf8(lookup.stdout)?;
+    assert!(line.starts_with("restrict,command=\""));
+    assert!(line.contains("profile '\\''quoted'\\''/registry"), "{line}");
+    assert!(line.contains(&format!("{A} {KEY_A}")));
+    assert!(line.ends_with(&format!("ssh-ed25519 {KEY_A} td-vm:{A}\n")));
+    assert_eq!(line.lines().count(), 1);
+    assert!(admin(&["authorized-keys", path, "ssh-rsa", KEY_A], true)?
+        .stdout
+        .is_empty());
+    let before = fs::read(&registry)?;
+    let inode = fs::metadata(&registry)?.ino();
+    admin(&["enroll", path, A, "topic-a", key_path], true)?;
+    assert_eq!(
+        fs::metadata(&registry)?.ino(),
+        inode,
+        "idempotent enrollment must not rewrite"
+    );
+    admin(&["enroll", path, B, "topic-b", key_path], false)?;
+    assert_eq!(fs::read(&registry)?, before);
+    fs::write(&key_file, format!("ssh-ed25519 {KEY_B}\n"))?;
+    admin(&["enroll", path, B, "topic-a", key_path], false)?;
+    admin(&["enroll", path, B, "topic-b", key_path], true)?;
+    admin(&["reserve", path, A, "topic-a/child"], false)?;
+    admin(&["reserve", path, A, "main"], false)?;
+    f.git(
+        &[
+            "--git-dir=origin.git",
+            "update-ref",
+            "refs/heads/human-topic",
+            &f.oid,
+        ],
+        &[],
+    )?;
+    admin(&["reserve", path, A, "human-topic"], false)?;
+    admin(&["reserve", path, A, "topic-extra"], true)?;
+    let before = fs::read(&registry)?;
+    admin(
+        &[
+            "init",
+            path,
+            f.repo().to_str().ok_or("repo")?,
+            f.git.to_str().ok_or("git")?,
+            &std::env::var("PATH")?,
+            BIN,
+        ],
+        false,
+    )?;
+    assert_eq!(fs::read(&registry)?, before);
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(registry.parent().ok_or("parent")?.join(".td-vm-git.lock"))?;
+    lock.try_lock()?;
+    admin(&["reserve", path, A, "busy-topic"], false)?;
+    assert_eq!(fs::read(&registry)?, before);
+    drop(lock);
+    admin(&["reserve", path, A, "busy-topic"], true)?;
+    admin(&["revoke", path, A], true)?;
+    assert!(
+        admin(&["authorized-keys", path, "ssh-ed25519", KEY_A], true)?
+            .stdout
+            .is_empty()
+    );
+    assert!(
+        !admin(&["authorized-keys", path, "ssh-ed25519", KEY_B], true)?
+            .stdout
+            .is_empty()
+    );
+    let revoked = fs::read(&registry)?;
+    admin(&["revoke", path, A], true)?;
+    assert_eq!(fs::read(&registry)?, revoked);
+    assert_eq!(fs::metadata(&registry)?.mode() & 0o777, 0o600);
+    assert_eq!(fs::read_dir(registry.parent().ok_or("parent")?)?.count(), 2);
+    assert!(f.refs()?.contains("refs/heads/human-topic"));
+    Ok(())
+}
+
+#[test]
+fn competing_enrollments_cannot_share_a_branch_or_lose_a_key() -> Result<()> {
+    if in_trusted_root("competing_enrollments_cannot_share_a_branch_or_lose_a_key")? {
+        return Ok(());
+    }
+    let f = Fixture::new("sha1")?;
+    let registry = initialize_registry(&f)?;
+    let first = f.root.join("first.pub");
+    let second = f.root.join("second.pub");
+    fs::write(&first, format!("ssh-ed25519 {KEY_A}\n"))?;
+    fs::write(&second, format!("ssh-ed25519 {KEY_B}\n"))?;
+    let start = |id: &str, key: &PathBuf| {
+        Command::new(BIN)
+            .arg("enroll")
+            .arg(&registry)
+            .args([id, "contested"])
+            .arg(key)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+    };
+    let mut a = start(A, &first)?;
+    let mut b = start(B, &second)?;
+    assert_ne!(a.wait()?.success(), b.wait()?.success());
+    let bytes = fs::read_to_string(&registry)?;
+    assert_eq!(
+        bytes
+            .lines()
+            .filter(|line| line.starts_with("key="))
+            .count(),
+        1
+    );
+    assert_eq!(
+        bytes
+            .lines()
+            .filter(|line| line.starts_with("branch="))
+            .count(),
+        1
+    );
+    let a = admin(
+        &[
+            "authorized-keys",
+            registry.to_str().ok_or("path")?,
+            "ssh-ed25519",
+            KEY_A,
+        ],
+        true,
+    )?;
+    let b = admin(
+        &[
+            "authorized-keys",
+            registry.to_str().ok_or("path")?,
+            "ssh-ed25519",
+            KEY_B,
+        ],
+        true,
+    )?;
+    assert_ne!(a.stdout.is_empty(), b.stdout.is_empty());
+    Ok(())
+}
+
+#[test]
+fn old_forced_command_cannot_rejoin_a_reenrolled_instance() -> Result<()> {
+    if in_trusted_root("old_forced_command_cannot_rejoin_a_reenrolled_instance")? {
+        return Ok(());
+    }
+    let f = Fixture::new("sha1")?;
+    let registry = initialize_registry(&f)?;
+    let path = registry.to_str().ok_or("path")?;
+    let key = f.root.join("key.pub");
+    fs::write(&key, format!("ssh-ed25519 {KEY_A}\n"))?;
+    admin(
+        &[
+            "enroll",
+            path,
+            A,
+            "before-revoke",
+            key.to_str().ok_or("key")?,
+        ],
+        true,
+    )?;
+    admin(&["revoke", path, A], true)?;
+    fs::write(&key, format!("ssh-ed25519 {KEY_B}\n"))?;
+    admin(
+        &[
+            "enroll",
+            path,
+            A,
+            "after-revoke",
+            key.to_str().ok_or("key")?,
+        ],
+        true,
+    )?;
+    let old = Command::new(BIN)
+        .args(["serve", path, A, KEY_A])
+        .env(
+            "SSH_ORIGINAL_COMMAND",
+            format!("git-upload-pack '{}'", f.repo().display()),
+        )
+        .stdin(Stdio::null())
+        .output()?;
+    assert!(!old.status.success());
+    assert!(old.stdout.is_empty());
+    assert!(
+        admin(&["authorized-keys", path, "ssh-ed25519", KEY_A], true)?
+            .stdout
+            .is_empty()
+    );
+    assert!(
+        !admin(&["authorized-keys", path, "ssh-ed25519", KEY_B], true)?
+            .stdout
+            .is_empty()
+    );
+    let alternate = f.root.join("alternate-dispatcher");
+    symlink(BIN, &alternate)?;
+    let legacy = Command::new(&alternate)
+        .args(["serve", path, A])
+        .env("TD_VM_GIT_EXECUTABLE", program("true")?)
+        .env("TD_VM_GIT_HOOKS", "/tmp")
+        .env("TD_VM_GIT_REPOSITORY", &f.root)
+        .stdin(Stdio::null())
+        .output()?;
+    assert!(
+        !legacy.status.success(),
+        "legacy argv must not fall through to internal hook mode"
+    );
+    Ok(())
+}
+
+#[test]
+fn concurrent_human_ref_creation_cannot_be_enrolled() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    if in_trusted_root("concurrent_human_ref_creation_cannot_be_enrolled")? {
+        return Ok(());
+    }
+    let f = Fixture::new("sha256")?;
+    let registry = initialize_registry(&f)?;
+    let wrapper = f.root.join("git-wrapper");
+    let shell = program("sh")?;
+    let quote = |value: &str| format!("'{}'", value.replace('\'', "'\\''"));
+    fs::write(&wrapper, format!(
+        "#!{}\nif [ \"$4\" = symbolic-ref ]; then\n  {} --git-dir {} update-ref refs/heads/human-race {} || exit 2\n  exit 1\nfi\nexec {} \"$@\"\n",
+        shell.display(), quote(f.git.to_str().ok_or("git")?),
+        quote(f.repo().to_str().ok_or("repo")?), f.oid,
+        quote(f.git.to_str().ok_or("git")?)
+    ))?;
+    fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o700))?;
+    let policy = fs::read_to_string(&registry)?.replace(
+        &format!("git={}\n", f.git.display()),
+        &format!("git={}\n", wrapper.display()),
+    );
+    fs::write(&registry, &policy)?;
+    let key = f.root.join("key.pub");
+    fs::write(&key, format!("ssh-ed25519 {KEY_A}\n"))?;
+    admin(
+        &[
+            "enroll",
+            registry.to_str().ok_or("registry")?,
+            A,
+            "human-race",
+            key.to_str().ok_or("key")?,
+        ],
+        false,
+    )?;
+    assert!(f.refs()?.contains("refs/heads/human-race"));
+    assert_eq!(fs::read_to_string(&registry)?, policy);
+    Ok(())
+}
+
+#[test]
+fn reservation_requires_head_and_respects_reference_transaction_veto() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    if in_trusted_root("reservation_requires_head_and_respects_reference_transaction_veto")? {
+        return Ok(());
+    }
+    let f = Fixture::new("sha256")?;
+    let registry = initialize_registry(&f)?;
+    let path = registry.to_str().ok_or("registry")?;
+    let key = f.root.join("key.pub");
+    fs::write(&key, format!("ssh-ed25519 {KEY_A}\n"))?;
+    let key_path = key.to_str().ok_or("key")?;
+    let initial = fs::read(&registry)?;
+    f.git(
+        &[
+            "--git-dir=origin.git",
+            "symbolic-ref",
+            "HEAD",
+            "refs/heads/missing",
+        ],
+        &[],
+    )?;
+    admin(&["enroll", path, A, "new-topic", key_path], false)?;
+    assert_eq!(fs::read(&registry)?, initial);
+    assert!(!f.refs()?.contains("refs/heads/new-topic"));
+    f.git(
+        &[
+            "--git-dir=origin.git",
+            "symbolic-ref",
+            "HEAD",
+            "refs/heads/main",
+        ],
+        &[],
+    )?;
+    let hook = f.repo().join("hooks/reference-transaction");
+    fs::write(&hook, format!("#!{}\nexit 1\n", program("sh")?.display()))?;
+    fs::set_permissions(&hook, fs::Permissions::from_mode(0o700))?;
+    admin(&["enroll", path, A, "new-topic", key_path], false)?;
+    assert_eq!(fs::read(&registry)?, initial);
+    assert!(!f.refs()?.contains("refs/heads/new-topic"));
+    fs::remove_file(hook)?;
+    admin(&["enroll", path, A, "new-topic", key_path], true)?;
+    assert!(f.refs()?.contains("refs/heads/new-topic"));
     Ok(())
 }

@@ -803,12 +803,12 @@ to act as `test` are different grants.
 Codex/Claude settings and login reuse still come from `timmy`'s selected host
 profiles. Selecting `test` for Git does not select `test`'s AI accounts.
 
-The default authorized-key location is **`~test/.ssh/authorized_keys`**
-(normally `/home/test/.ssh/authorized_keys`). It remains owned and managed
-under `test`'s authority. Keep existing human/automation key entries unchanged;
-only td-vm's registered VM entries carry the restrictions below. Do not apply
-an account-wide forced command, disable `test`'s ordinary logins, or replace
-its existing SSH configuration to implement this feature.
+`test`'s existing authorized-key files, normally
+`/home/test/.ssh/authorized_keys`, retain their human and automation entries.
+VM keys live only in td-vm's private registry. A per-account OpenSSH
+`AuthorizedKeysCommand` looks them up after the normal key files; its output
+contains the restrictions below. Do not apply an account-wide forced command,
+disable `test`'s ordinary logins, or replace its existing key files.
 
 Each VM generates its own Ed25519 Git key on first boot. Its private half
 stays in that instance's private persistent user state, mode 0600. Firstboot
@@ -823,30 +823,37 @@ as `test`, accepts requests from the configured operator UID (`timmy`) over
 an authenticated Unix socket, and manages only its own key records and branch
 reservations. The manager associates guest public-key requests with its own
 instance identity. The registrar accepts a validated public key and opaque
-instance id, constructs the restrictions itself, and journals updates to its
-records and authorized_keys while preserving unrelated entries. Publish each
-file atomically; enable a key only when both records agree, and recover an
-interrupted update without widening access. Reject
-unexpected file metadata and conflicting edits rather than overwriting them.
+instance id, constructs the restrictions itself, and publishes keys and branch
+reservations together in one private registry.
+An exclusive stable registry lock serializes writers; a synced temporary file
+is renamed over the previous generation and the parent directory is synced.
+Initialization also syncs the containing directory that names the new private
+registry directory, including when retrying an interrupted initialization.
+Readers see one complete generation, including across interrupted enrollment
+or revocation. No authorized-key file is rewritten. Reject unexpected file
+metadata and conflicting reservations rather than overwriting them.
 Never accept caller-supplied authorized_keys options or a destination path.
 
 One-time host integration installs/enables that registrar and establishes
 `timmy`'s socket access under `test`'s authority. Existing ACLs may already
 provide the necessary repository access; they do not automatically authorize
-editing `test`'s SSH keys. This setup must complete before the profile is Ready,
+editing `test`'s VM registry. This setup must complete before the profile is Ready,
 so creating later instances needs neither per-VM sudo nor hand-edited keys.
 The registrar and Git dispatcher are dependency-free host code; the registrar
 is not a network service or a general command runner.
 
 Each VM key receives OpenSSH's `restrict` option plus a fixed forced command
-naming a trusted Git dispatcher and the registrar-assigned instance identity.
+naming a trusted Git dispatcher, the registrar-assigned instance identity,
+and the exact enrolled public-key bytes.
 `restrict` disables PTYs, forwarding, and user rc execution; the forced command
 restricts execution itself. The dispatcher validates SSH_ORIGINAL_COMMAND as
 an allowed Git operation on this exact repository and invokes Git with fixed
 argv and a sanitized environment. It never evaluates the supplied command
 through a shell. Arbitrary commands, alternate paths, and SFTP are refused.
-The identity comes from the authorized key's forced command, not a key comment
-or client-supplied environment. See the
+The identity and key come from the authorized key's forced command, not a key
+comment or client-supplied environment. The dispatcher checks both against the
+current registry; a stale lookup result cannot reenable an old key after the
+same instance id is enrolled with a different key. See the
 [OpenSSH authorized-key contract](https://man.openbsd.org/sshd.8).
 
 Firstboot also installs the host's verified public host key in the guest's
@@ -857,7 +864,7 @@ connection. A host-key change requires updating the trusted profile. The SSH
 address must work from QEMU's configured network; a LAN address can serve other
 machines too. No inbound guest SSH listener is part of this arrangement.
 
-Deleting or revoking an instance removes its enrolled key and stops accepting
+Deleting or revoking an instance removes its registry key and stops accepting
 new Git sessions. Track active sessions by registrar identity so explicit
 revocation can terminate that instance's sessions too; removing a key alone
 is not termination of an already authenticated connection. Posted Git branches
@@ -865,13 +872,69 @@ remain in the bare origin. Stopping and later booting a VM retains its key.
 
 ### Implemented host Git dispatcher
 
-`td-review` builds the dependency-free host binary `td-vm-git`. Its only
-command is `td-vm-git serve /absolute/private/policy INSTANCE`, installed as
-the fixed forced command on an individual `restrict` authorized-key entry.
-This is the receive-policy prerequisite; automatic registration, key-file
-updates, guest provisioning, and tracking/terminating active sessions remain
-unimplemented. Building the binary changes no account, SSH configuration,
-repository hook, or live repository.
+`td-review` builds the dependency-free host binary `td-vm-git`. Its host-account
+administrative commands initialize a registry, enroll an instance's public key
+and first branch together, reserve additional branches, and revoke an instance.
+The SSH lookup and Git-only dispatcher consume that same registry. The
+operator-authenticated registrar socket, guest provisioning, and tracking or
+terminating active sessions remain unimplemented. These commands run as `test`;
+they do not let `timmy` or a guest become that account. Building the binary
+changes no live account, SSH configuration, or repository.
+
+A one-time host setup installs a root-owned dispatcher executable that is not
+writable by group/others, validates the existing SSH configuration, and adds
+the per-account lookup. For example:
+
+```text
+Match User test
+    AuthorizedKeysCommand /usr/local/libexec/td-vm-git authorized-keys /home/test/.td-vm-git/policy %t %k
+    AuthorizedKeysCommandUser test
+Match all
+```
+
+Keep normal `AuthorizedKeysFile` settings. If an authorized-key lookup command
+already serves this account, host setup must integrate it explicitly rather
+than silently replace it. OpenSSH enforces ownership of the lookup executable;
+the command then runs as `test`. Unknown keys and unsupported key types produce
+no entries; a missing or invalid registry fails the VM lookup. See the
+[OpenSSH lookup contract](https://man.openbsd.org/sshd_config#AuthorizedKeysCommand).
+
+The administrative operations are fixed argv commands, illustrated below.
+`init` creates only the final private parent directory; its ancestors must
+already exist. It refuses an existing registry and verifies the bare origin
+and executable dispatcher. `enroll` accepts one ordinary Ed25519 public-key
+file, ignoring only its human comment. No private key or provider credential
+is read or copied.
+
+```text
+td-vm-git init /home/test/.td-vm-git/policy /srv/git/td.git /absolute/host/git /trusted/host/bin:/bin /usr/local/libexec/td-vm-git
+td-vm-git enroll /home/test/.td-vm-git/policy 0123456789abcdef0123456789abcdef terminal-scroll-fix /path/to/guest.pub
+td-vm-git reserve /home/test/.td-vm-git/policy 0123456789abcdef0123456789abcdef terminal-followup
+td-vm-git revoke /home/test/.td-vm-git/policy 0123456789abcdef0123456789abcdef
+```
+
+An identical enrollment/reservation or repeated revocation is idempotent.
+Re-enrolling an existing instance with its same key and a new branch acts as
+`reserve`; the key remains unchanged. A
+key cannot belong to two identities, a branch cannot belong to two instances,
+and an existing instance cannot silently replace its key. New reservations
+also refuse branches already present in the origin, including overlapping ref
+names. Before publishing a new reservation, Git atomically creates its ref at
+that operation's sampled origin `HEAD` commit using a no-dereference `create`
+transaction. This claims the name against ordinary concurrent Git writers;
+a missing/unborn origin `HEAD`, a concurrent creation, or a reference hook veto
+fails without granting the key access. Repeated reservations do not reset refs.
+If a crash or publication error follows a successful ref claim, the unowned
+branch remains and a retry refuses it: the host must inspect and explicitly
+clean it up or choose another name. No automatic rollback deletes a branch
+another writer might have updated. Git ref storage retains Git's configured
+durability policy; the registry's synced publication is not a joint filesystem
+transaction with Git. Explicit ownership transfer remains unimplemented.
+Revocation removes
+the key and every reservation in one publication, leaving submitted Git refs
+unchanged. A concurrent writer receives a busy error and may retry. All writers
+must use these operations and retain the stable `.td-vm-git.lock` inode.
+Registry reads need no writer lock.
 
 The host account owns a private policy directory (normally mode 0700) and
 regular policy file (normally mode 0600). Neither may grant group/other access;
@@ -883,23 +946,33 @@ setuid or privilege changes. Git must support `git hook run --to-stdin`
 looks like this, with host-selected absolute Git and tool paths:
 
 ```text
-TDVM-GIT-1
+TDVM-GIT-2
 repository=/srv/git/td.git
 git=/absolute/host/profile/bin/git
 path=/absolute/host/profile/bin:/run/current-system/profile/bin
+dispatcher=/usr/local/libexec/td-vm-git
+key=0123456789abcdef0123456789abcdef AAAAC3NzaC1lZDI1NTE5AAAAIAEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEB
+key=1123456789abcdef0123456789abcdef AAAAC3NzaC1lZDI1NTE5AAAAIAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI
 branch=0123456789abcdef0123456789abcdef terminal-scroll-fix
 branch=1123456789abcdef0123456789abcdef editor-selection-fix
 ```
 
-The format requires a final newline, exactly one of each singleton field,
-no unknown fields, and at most 4,096 branch reservations in one MiB. Instance
+The key bytes above are format examples, not usable guest identities.
+`TDVM-GIT-2` replaces the earlier manual branch-only policy; version 1 is not
+accepted. Initialize a new registry and enroll the existing guest public keys
+when replacing an experimental policy. Remove its experimental VM entries
+from the normal authorized-key files during that cutover: OpenSSH tries those
+before the registry lookup. The format requires a final newline,
+exactly one of each singleton field,
+no unknown fields, and at most 4,096 keys and 4,096 branch reservations in one
+MiB. Every key needs a branch and every reservation needs an enrolled key. Instance
 ids are exactly 32 lowercase hexadecimal characters. Branches are exact names,
 at most 200 ASCII bytes, with alphanumeric, hyphen, underscore and dot
 components separated by `/`; empty components, leading dots/hyphens, trailing
 dots/`.lock`, `..`, `main`, `HEAD`, and `refs/` names are refused. Duplicate and
 prefix-overlapping reservations are refused even for one owner. An instance
 without any reservation receives no read or write session. Only the trusted
-host publishes policy changes; the future registrar must make them atomic.
+host publishes policy changes through the atomic registry operations above.
 
 `SSH_ORIGINAL_COMMAND` must exactly match Git's usual single-quoted
 `git-upload-pack 'REPOSITORY'` or `git-receive-pack 'REPOSITORY'` request,
@@ -920,7 +993,8 @@ Each hook entry dispatches through Git's own `hook run` command using the
 original hook path and arguments, so adjacent resources and Git's executable
 script fallback keep working. Relative paths may include `..`. The receive
 wrapper rereads the authoritative policy, checks the session's repository,
-Git executable and tool path still match, and authorizes the entire proposed
+Git executable and tool path still match, verifies the enrolled key is still
+current, and authorizes the entire proposed
 transaction before invoking the original executable pre-receive hook with the
 same stdin and Git quarantine environment. An original hook that exits before
 reading all stdin retains its own exit status. Every ref must be a unique exact

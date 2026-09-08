@@ -8,6 +8,9 @@ use std::path::{Component, Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+#[path = "../vm_git_registry.rs"]
+mod registry;
+
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 const LIMIT: u64 = 1024 * 1024;
 const MAX_BRANCHES: usize = 4096;
@@ -19,6 +22,8 @@ struct Policy {
     git: PathBuf,
     path: String,
     branches: BTreeMap<String, String>,
+    keys: BTreeMap<String, String>,
+    dispatcher: PathBuf,
 }
 
 fn bounded(mut reader: impl Read) -> Result<Vec<u8>> {
@@ -73,11 +78,12 @@ fn absolute(value: &str) -> Result<PathBuf> {
 impl Policy {
     fn parse(text: &str) -> Result<Self> {
         let mut lines = text.lines();
-        if lines.next() != Some("TDVM-GIT-1") || !text.ends_with('\n') {
+        if lines.next() != Some("TDVM-GIT-2") || !text.ends_with('\n') {
             return Err("invalid policy header or missing final newline".into());
         }
         let mut fields = BTreeMap::new();
         let mut branches: BTreeMap<String, String> = BTreeMap::new();
+        let mut keys = BTreeMap::new();
         for line in lines {
             let (key, value) = line.split_once('=').ok_or("invalid policy field")?;
             if key == "branch" {
@@ -97,7 +103,18 @@ impl Policy {
                     return Err("duplicate or overlapping branch reservation".into());
                 }
                 branches.insert(branch.into(), id.into());
-            } else if !["repository", "git", "path"].contains(&key)
+            } else if key == "key" {
+                let (id, encoded) = value.split_once(' ').ok_or("invalid instance key")?;
+                registry::key_valid(encoded)?;
+                if !instance_valid(id)
+                    || keys.len() >= MAX_BRANCHES
+                    || keys.contains_key(id)
+                    || keys.values().any(|key| key == encoded)
+                {
+                    return Err("duplicate or invalid instance key".into());
+                }
+                keys.insert(id.to_string(), encoded.to_string());
+            } else if !["repository", "git", "path", "dispatcher"].contains(&key)
                 || fields.insert(key, value).is_some()
             {
                 return Err("unknown or duplicate policy field".into());
@@ -109,30 +126,33 @@ impl Policy {
         for entry in path.split(':') {
             absolute(entry)?;
         }
+        let owners: BTreeSet<_> = branches.values().collect();
+        if owners.iter().any(|id| !keys.contains_key(*id))
+            || keys.keys().any(|id| !owners.contains(id))
+        {
+            return Err("every branch needs a registered key and every key needs a branch".into());
+        }
+        let dispatcher = absolute(fields.get("dispatcher").ok_or("missing dispatcher")?)?;
         Ok(Self {
             repository,
             git,
             path: path.into(),
             branches,
+            keys,
+            dispatcher,
         })
     }
 
-    fn load(path: &Path) -> Result<Self> {
+    fn private_parent(path: &Path) -> Result<()> {
         absolute(path.to_str().ok_or("policy path is not UTF-8")?)?;
-        // The containing private directory is also the session scratch root.
+        if path.file_name() == Some(std::ffi::OsStr::new(".td-vm-git.lock")) {
+            return Err("policy path collides with the registry lock".into());
+        }
         let uid = fs::metadata("/proc/self")?.uid();
         let parent = path.parent().ok_or("policy has no parent")?;
-        for (candidate, private) in [(parent, true), (path, false)] {
-            let meta = fs::symlink_metadata(candidate)?;
-            if meta.uid() != uid
-                || meta.mode() & 0o077 != 0
-                || (private && !meta.is_dir())
-                || (!private && !meta.is_file())
-            {
-                return Err(
-                    "policy and parent must be private, caller-owned regular file/directory".into(),
-                );
-            }
+        let meta = fs::symlink_metadata(parent)?;
+        if !meta.is_dir() || meta.uid() != uid || meta.mode() & 0o077 != 0 {
+            return Err("policy parent must be a private, caller-owned directory".into());
         }
         for ancestor in parent.ancestors().skip(1) {
             let meta = fs::symlink_metadata(ancestor)?;
@@ -143,11 +163,26 @@ impl Policy {
                 return Err("untrusted policy ancestor".into());
             }
         }
+        Ok(())
+    }
+
+    fn load(path: &Path) -> Result<Self> {
+        Self::private_parent(path)?;
+        let meta = fs::symlink_metadata(path)?;
+        if !meta.is_file()
+            || meta.uid() != fs::metadata("/proc/self")?.uid()
+            || meta.mode() & 0o077 != 0
+        {
+            return Err("policy must be a private, caller-owned regular file".into());
+        }
         Self::parse(&String::from_utf8(bounded(File::open(path)?)?)?)
     }
 
-    fn authorized(&self, instance: &str) -> bool {
-        instance_valid(instance) && self.branches.values().any(|owner| owner == instance)
+    fn authorized(&self, instance: &str, key: &str) -> bool {
+        self.keys
+            .get(instance)
+            .is_some_and(|registered| registered == key)
+            && self.branches.values().any(|owner| owner == instance)
     }
 
     fn command(&self) -> Command {
@@ -236,11 +271,11 @@ fn install_hooks(session: &Session, original: &Path) -> Result<()> {
     Ok(())
 }
 
-fn serve(path: &Path, instance: &str, original: &str) -> Result<bool> {
+fn serve(path: &Path, instance: &str, key: &str, original: &str) -> Result<bool> {
     let path = absolute(path.to_str().ok_or("policy path is not UTF-8")?)?;
     let policy = Policy::load(&path)?;
-    if !policy.authorized(instance) {
-        return Err("instance has no branch reservation".into());
+    if !policy.authorized(instance, key) {
+        return Err("instance key is not enrolled with a branch reservation".into());
     }
     let operation = operation(original, &policy.repository)?;
     if policy.query(&["rev-parse", "--is-bare-repository"])? != "true" {
@@ -279,6 +314,7 @@ fn serve(path: &Path, instance: &str, original: &str) -> Result<bool> {
             .arg(format!("core.hooksPath={}", owned.0.display()))
             .env("TD_VM_GIT_POLICY", &path)
             .env("TD_VM_GIT_INSTANCE", instance)
+            .env("TD_VM_GIT_KEY", key)
             .env("TD_VM_GIT_REPOSITORY", &policy.repository)
             .env("TD_VM_GIT_EXECUTABLE", &policy.git)
             .env("TD_VM_GIT_PATH", &policy.path)
@@ -336,7 +372,7 @@ fn validate_updates<'a>(
 fn pre_receive() -> Result<bool> {
     let policy = Policy::load(Path::new(&env::var("TD_VM_GIT_POLICY")?))?;
     let instance = env::var("TD_VM_GIT_INSTANCE")?;
-    if !policy.authorized(&instance)
+    if !policy.authorized(&instance, &env::var("TD_VM_GIT_KEY")?)
         || policy.repository != Path::new(&env::var("TD_VM_GIT_REPOSITORY")?)
         || policy.git != Path::new(&env::var("TD_VM_GIT_EXECUTABLE")?)
         || policy.path != env::var("TD_VM_GIT_PATH")?
@@ -407,14 +443,19 @@ fn run() -> Result<bool> {
     let remaining: Vec<_> = args.collect();
     // Forced-command argv always selects serve before considering hook mode;
     // client environment cannot turn the SSH entry point into a hook launcher.
-    if let [verb, path, instance] = remaining.as_slice() {
-        if verb == "serve" {
-            return serve(
-                Path::new(path),
-                instance.to_str().ok_or("invalid instance")?,
-                &env::var("SSH_ORIGINAL_COMMAND")?,
-            );
-        }
+    if remaining.first().is_some_and(|verb| verb == "serve") {
+        let [_, path, instance, key] = remaining.as_slice() else {
+            return Err("usage: td-vm-git serve POLICY INSTANCE KEY_BASE64".into());
+        };
+        return serve(
+            Path::new(path),
+            instance.to_str().ok_or("invalid instance")?,
+            key.to_str().ok_or("invalid key identity")?,
+            &env::var("SSH_ORIGINAL_COMMAND")?,
+        );
+    }
+    if let Some(result) = registry::cli(&remaining) {
+        return result;
     }
     let name = Path::new(&executable)
         .file_name()
@@ -429,7 +470,10 @@ fn run() -> Result<bool> {
     {
         return Ok(hook_command(name, &remaining)?.status()?.success());
     }
-    Err("usage: td-vm-git serve /absolute/private/policy INSTANCE (OpenSSH forced command)".into())
+    Err(
+        "usage: td-vm-git init|enroll|reserve|revoke|authorized-keys|serve (see td-review/VM.md)"
+            .into(),
+    )
 }
 
 fn main() -> ExitCode {
@@ -452,15 +496,17 @@ fn main() -> ExitCode {
 )]
 mod tests {
     use super::*;
+    const KEY_A: &str = "AAAAC3NzaC1lZDI1NTE5AAAAIAEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEB";
+    const KEY_B: &str = "AAAAC3NzaC1lZDI1NTE5AAAAIAICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIC";
     const A: &str = "0123456789abcdef0123456789abcdef";
     const B: &str = "1123456789abcdef0123456789abcdef";
     fn policy() -> String {
-        format!("TDVM-GIT-1\nrepository=/srv/git/td.git\ngit=/bin/git\npath=/bin:/usr/bin\nbranch={A} vm-a\nbranch={B} vm-b\n")
+        format!("TDVM-GIT-2\ndispatcher=/bin/td-vm-git\nkey={A} {KEY_A}\nkey={B} {KEY_B}\nrepository=/srv/git/td.git\ngit=/bin/git\npath=/bin:/usr/bin\nbranch={A} vm-a\nbranch={B} vm-b\n")
     }
     #[test]
     fn strict_policy_and_exact_ownership() {
         let parsed = Policy::parse(&policy()).unwrap();
-        assert!(parsed.authorized(A));
+        assert!(parsed.authorized(A, KEY_A));
         for suffix in [
             "unknown=x\n",
             "git=/other\n",
