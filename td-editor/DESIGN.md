@@ -2204,6 +2204,19 @@ no-keyboard-focus protocol-peer variant remains a separate default test.
 Intermediate tab and dialog rendering is outside this scenario's visual
 oracle; only the final document frame and pixels are asserted.
 
+A second shared prompt scenario opens Find, Replace and Help > Command
+through native compositor clicks, then submits remote prompt answers with
+the current input generation. It verifies Find-seeded replacement, command
+completion to the fill-column prompt, and a stored column of 80 through
+exact paragraph wrapping and saved bytes. Final full tab state, retired
+prompt and correlated `word` pixels are required. Its default protocol-peer
+variant still requires every pointer and prompt answer to work without
+keyboard focus; the native variant explicitly requires keyboard readiness.
+Native keyboard entry into prompts is not exercised by this case. Menu,
+prompt and the wrapped second row's pixels are not asserted; transitions
+and complete wrapping use semantic state and disk bytes before the
+independent first-row document-pixel check.
+
 The editor maps normally, then compositor fullscreen leaves an 800x576
 scale-one client beneath the 24-pixel desktop bar. Shift+A, released-Shift b
 and Windows Ctrl+Z / Emacs Ctrl+/ use real evdev-code routing, keymap and

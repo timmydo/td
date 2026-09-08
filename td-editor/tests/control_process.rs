@@ -643,7 +643,7 @@ impl EditorProcess {
             24 + row as i64 * 24 + 12,
         );
     }
-    fn answer(&mut self, tab: u64, revision: u64, kind: &str, action: &str) {
+    fn answer(&mut self, tab: u64, revision: u64, kind: &str, action: &str, key_ready: bool) {
         let snapshot = self.ok("prompt-state");
         // Input replies follow synchronous prompt dispatch: polling here
         // would hide a wrong transition rather than wait for queued work.
@@ -652,7 +652,10 @@ impl EditorProcess {
             field(&snapshot, "target"),
             Some(format!("{tab},{revision}").as_str())
         );
-        assert_eq!(field(&snapshot, "key-ready"), Some("0"));
+        assert_eq!(
+            field(&snapshot, "key-ready"),
+            Some(if key_ready { "1" } else { "0" })
+        );
         let token = field(&snapshot, "input-generation").unwrap();
         self.ok(&format!(
             "prompt-answer\t{tab}\t{revision}\t{token}\t{kind}\t{action}"
@@ -1364,26 +1367,40 @@ fn production_pointer_menu_and_prompt_answers_work_without_keyboard_focus() {
     std::fs::write(&file, b"one wrng\n").unwrap();
     std::fs::write(&dictionary, b"one\nwrong\n").unwrap();
     let mut editor = EditorProcess::start(&directory, &display_path, &file, &dictionary);
-    editor.menu(1, 0, 1, 8); // Edit > Find.
-    editor.answer(1, 0, "find-forward", "entry\t77726e67");
-    editor.answer(1, 0, "find-forward", "submit");
-    editor.menu(1, 0, 1, 11); // Edit > Replace; selected match seeds Find.
-    editor.answer(1, 0, "replace", "next-field");
-    editor.answer(1, 0, "replace", "entry\t77726f6e67");
-    editor.answer(1, 0, "replace", "replace-one");
-    editor.answer(1, 1, "replace", "cancel");
+    control_menu_prompts_and_fill(&mut editor, &file, false, |editor, revision, group, row| {
+        editor.menu(1, revision, group, row);
+    });
+    editor.rendered();
+    editor.quit();
+    display.finish().assert_rendered();
+}
+
+fn control_menu_prompts_and_fill(
+    editor: &mut EditorProcess,
+    file: &Path,
+    key_ready: bool,
+    mut menu: impl FnMut(&mut EditorProcess, u64, usize, usize),
+) {
+    menu(editor, 0, 1, 8); // Edit > Find.
+    editor.answer(1, 0, "find-forward", "entry\t77726e67", key_ready);
+    editor.answer(1, 0, "find-forward", "submit", key_ready);
+    menu(editor, 0, 1, 11); // Edit > Replace; selected match seeds Find.
+    editor.answer(1, 0, "replace", "next-field", key_ready);
+    editor.answer(1, 0, "replace", "entry\t77726f6e67", key_ready);
+    editor.answer(1, 0, "replace", "replace-one", key_ready);
+    editor.answer(1, 1, "replace", "cancel", key_ready);
     assert!(editor
         .ok("text\t1\t1\t0\t100")
         .contains(&td_editor::control::hex(b"one wrong\n")));
-    editor.menu(1, 1, 3, 1); // Help > Command.
-    editor.answer(1, 1, "command", "entry\t73");
-    editor.answer(1, 1, "command", "complete");
-    editor.answer(1, 1, "command", "submit");
-    editor.answer(1, 1, "fill-column", "entry\t3830");
-    editor.answer(1, 1, "fill-column", "submit");
+    menu(editor, 1, 3, 1); // Help > Command.
+    editor.answer(1, 1, "command", "entry\t73", key_ready);
+    editor.answer(1, 1, "command", "complete", key_ready);
+    editor.answer(1, 1, "command", "submit", key_ready);
+    editor.answer(1, 1, "fill-column", "entry\t3830", key_ready);
+    editor.answer(1, 1, "fill-column", "submit", key_ready);
     assert_eq!(field(&editor.ok("prompt-state"), "prompt"), Some("none"));
     editor.job("save\t1\t1");
-    assert_eq!(std::fs::read(&file).unwrap(), b"one wrong\n");
+    assert_eq!(std::fs::read(file).unwrap(), b"one wrong\n");
     // Exercise the stored fill setting: 80 keeps sixteen words on line one;
     // the default 72 would keep only fourteen.
     let paragraph = format!("{}word", "word ".repeat(16));
@@ -1399,10 +1416,7 @@ fn production_pointer_menu_and_prompt_answers_work_without_keyboard_focus() {
         .ok("text\t1\t3\t0\t100")
         .contains(&td_editor::control::hex(filled.as_bytes())));
     editor.job("save\t1\t3");
-    assert_eq!(std::fs::read(&file).unwrap(), filled.as_bytes());
-    editor.rendered();
-    editor.quit();
-    display.finish().assert_rendered();
+    assert_eq!(std::fs::read(file).unwrap(), filled.as_bytes());
 }
 
 #[test]

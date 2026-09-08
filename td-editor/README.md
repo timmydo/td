@@ -395,6 +395,11 @@ Undo/Redo and spelling pages agree, saved BOM/CRLF bytes are exact, old close
 dialog IDs cannot discard a newer dialog, and the final single saved tab
 has correlated `warm` pixels. The default strict protocol-peer case remains
 independent and runs without keyboard focus.
+Another shared scenario opens Find, Replace and Command with native clicks
+and answers their prompts through editor control. It checks command
+completion, a fill column of 80 through exact paragraph wrapping and saved
+bytes, complete final tab state and correlated `word` pixels. The strict
+peer variant retains its no-keyboard-focus checks for every prompt answer.
 The vertical-wheel case checks forward and reverse detents against
 exact viewport rows and captured numbered-line pixels, with unchanged text,
 revision, selection, caret and disk bytes. The clipboard case uses two

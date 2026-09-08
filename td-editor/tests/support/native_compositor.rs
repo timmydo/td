@@ -1099,6 +1099,50 @@ fn native_control_edit_spelling_save_and_dirty_close() {
 }
 
 #[test]
+#[ignore = "requires an explicitly built TD_TEST_COMPOSITOR; ready runs this case"]
+fn native_menu_prompts_and_fill_column() {
+    let compositor_directory = Directory::new();
+    let directory = Directory::new();
+    let mut compositor = Compositor::start(&compositor_directory);
+    let file = directory.0.join("draft");
+    let dictionary = directory.0.join("dictionary");
+    std::fs::write(&file, b"one wrng\n").unwrap();
+    std::fs::write(&dictionary, b"one\nwrong\n").unwrap();
+    let display = compositor.directory.join("wayland-0");
+    let mut editor = EditorProcess::start(&directory, &display, &file, &dictionary);
+    editor.wait_keyboard("windows");
+    let window = compositor.window();
+    assert_eq!(compositor.request("fullscreen", 1024), b"ok\n");
+    editor.wait_field("state", "window", "800,576,1");
+    editor.rendered_at(800, 576);
+    compositor.pointer(9, 80, 0);
+    editor.wait_field("state", "pointer-ready", "1");
+    let before = compositor.observe(&window);
+    control_menu_prompts_and_fill(&mut editor, &file, true, |process, _, group, row| {
+        // Literal output coordinates include the 24px desktop bar.
+        // Native clicks have no revision field; the prompt answers pin it.
+        let (x, prompt) = match (group, row) {
+            (1, 8) => (68, "find-forward"),
+            (1, 11) => (68, "replace"),
+            (3, 1) => (196, "command"),
+            _ => panic!("unexpected shared menu choice"),
+        };
+        compositor.click(x, 32); // Desktop bar (24) plus header inset (8).
+        process.wait_field("state", "modal", "0,0,0,0,1,0,0,0,0");
+        compositor.click(x, 60 + row as u32 * 24); // Two bars plus row center (12).
+        process.wait_field("prompt-state", "prompt", prompt);
+    });
+    let filled = format!("{}word\nword", "word ".repeat(15));
+    editor.wait_field("state", "tab", "1,3,0,84,0,0,0,80,0,lf");
+    editor.wait_tab(3, &filled);
+    editor.wait_field("prompt-state", "prompt", "none");
+    compositor.rendered_text(&mut editor, &window, 3, before, "word", 0);
+    assert_eq!(std::fs::read(&file).unwrap(), filled.as_bytes());
+    editor.quit();
+    compositor.stop();
+}
+
+#[test]
 fn native_observation_and_capture_decoders_refuse_stale_or_truncated_evidence() {
     let session = "00000000000000000000000000000007";
     let reply = format!(
