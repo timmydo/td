@@ -109,6 +109,10 @@ fn ppm<'a>(reply: &'a [u8], session: &str) -> Result<(u64, &'a [u8])> {
 
 impl Compositor {
     fn start(directory: &Directory) -> Self {
+        Self::start_with_clipboard(directory, false)
+    }
+
+    fn start_with_clipboard(directory: &Directory, clipboard: bool) -> Self {
         let binary = PathBuf::from(
             std::env::var_os("TD_TEST_COMPOSITOR")
                 .expect("set TD_TEST_COMPOSITOR to an explicitly built td-compositor; see README"),
@@ -118,8 +122,14 @@ impl Compositor {
             "compositor test tool must be an absolute path"
         );
         let session_dir = directory.0.join("session");
-        let child = Command::new(binary)
-            .args(["headless", "--session-dir"])
+        let mut command = Command::new(binary);
+        if clipboard {
+            command.args(["headless", "--clipboard-control", "enabled"]);
+        } else {
+            command.arg("headless");
+        }
+        let child = command
+            .arg("--session-dir")
             .arg(&session_dir)
             .args([
                 "--width",
@@ -662,7 +672,7 @@ fn clipboard_between_editors(profile: &str, operation: ClipboardOperation) {
     let compositor_directory = Directory::new();
     let source_directory = Directory::new();
     let destination_directory = Directory::new();
-    let mut compositor = Compositor::start(&compositor_directory);
+    let mut compositor = Compositor::start_with_clipboard(&compositor_directory, true);
     let source_path = source_directory.0.join("source");
     let source_dictionary = source_directory.0.join("dictionary");
     let text = "clip café e\u{301} 🦀\nsecond line\n";
@@ -762,6 +772,96 @@ fn clipboard_between_editors(profile: &str, operation: ClipboardOperation) {
     destination.wait_tab(0, ""); // An offer is not an insertion.
     let before_paste = compositor.observe(destination_window);
     assert_ne!(before_paste.client, before.client);
+    let hold_reply = |state: &str| format!(
+        "ok\ntd-clipboard-v1 session={} hold=1 window={destination_window} state={state}\n",
+        compositor.session,
+    );
+    // Pin the first hold in this fresh compositor; do not accept arbitrary IDs.
+    assert_eq!(compositor.request(&format!(
+        "clipboard-arm {} {destination_window}", compositor.session,
+    ), 1024), hold_reply("armed").as_bytes());
+    let held = hold_reply("held");
+    let armed = hold_reply("armed");
+    let released = hold_reply("released");
+    let paste_started = Instant::now();
+    compositor.chord(Some(KEY_LEFT_CTRL), paste_key);
+    let deadline = Instant::now() + TIMEOUT;
+    loop {
+        let reply = compositor.request(&format!("clipboard-status {} 1", compositor.session), 1024);
+        if reply == held.as_bytes() {
+            break;
+        }
+        assert_eq!(reply, armed.as_bytes(), "hold failed before receiving the transfer");
+        assert!(
+            Instant::now() < deadline,
+            "native Paste never reached the hold: {}",
+            String::from_utf8_lossy(&reply)
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    destination.wait_field("clipboard-state", "incoming", "1");
+    source.wait_field("clipboard-state", "outgoing", "0");
+    destination.wait_field("state", "tab", "1,0,0,0,0,0,0,72,0,lf");
+    destination.wait_tab(0, "");
+    let pasting = td_editor::control::hex(b"Pasting UTF-8 text; Escape cancels.");
+    destination.wait_field("prompt-state", "notice", &pasting);
+    if profile == "emacs" {
+        compositor.chord(Some(KEY_LEFT_CTRL), KEY_G);
+    } else {
+        compositor.chord(None, KEY_ESCAPE);
+    }
+    destination.wait_field("clipboard-state", "incoming", "0");
+    // A timeout followed by Cancel could clear both fields too. Finish
+    // within four seconds measured before Paste, below its five-second
+    // reader deadline, or fail closed even if all state assertions pass.
+    destination.wait_field("prompt-state", "notice", "-");
+    assert!(
+        paste_started.elapsed() < Duration::from_secs(4),
+        "native Cancel exceeded its evidence budget"
+    );
+    destination.wait_field("state", "tab", "1,0,0,0,0,0,0,72,0,lf");
+    destination.wait_tab(0, "");
+    compositor.rendered_text(&mut destination, destination_window, 0, before_paste, " ", 0);
+    let send_failed = b"Clipboard send failed:";
+    let prior_notice = source.ok("prompt-state");
+    let prior_notice = field(&prior_notice, "notice").unwrap();
+    assert!(
+        prior_notice == "-"
+            || !td_editor::control::unhex(prior_notice).unwrap().starts_with(send_failed)
+    );
+    let release_started = Instant::now();
+    assert_eq!(compositor.request(&format!(
+        "clipboard-release {} 1", compositor.session,
+    ), 1024), released.as_bytes());
+    // Fence source processing, not just compositor queue admission or a
+    // transient outgoing=0 observed before DataSourceSend reached it.
+    let deadline = Instant::now() + TIMEOUT;
+    loop {
+        let reply = source.ok("prompt-state");
+        let notice = field(&reply, "notice").unwrap();
+        if notice != "-" && td_editor::control::unhex(notice).unwrap().starts_with(send_failed) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "source did not observe the cancelled receiver: {reply}"
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    source.wait_field("clipboard-state", "outgoing", "0");
+    assert!(
+        release_started.elapsed() < Duration::from_secs(4),
+        "source failure exceeded its evidence budget"
+    );
+    destination.wait_field("clipboard-state", "incoming", "0");
+    destination.wait_field("state", "tab", "1,0,0,0,0,0,0,72,0,lf");
+    destination.wait_tab(0, "");
+    source.wait_tab(source_revision, "b");
+    source.wait_field("state", "tab", &collapsed);
+    assert_eq!(std::fs::read(&source_path).unwrap(), b"b");
+    assert_eq!(std::fs::read(&destination_path).unwrap(), b"");
+    let before_paste = compositor.observe(destination_window);
+    // A fresh Paste after cancellation must still consume the original offer.
     compositor.chord(Some(KEY_LEFT_CTRL), paste_key);
     destination.wait_tab(1, text);
     destination.wait_field("clipboard-state", "incoming", "0");

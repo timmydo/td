@@ -398,7 +398,7 @@ bytes. Distinct client identities and captured ASCII prefixes are checked.
 After the source exits, another native Paste must report no offer and
 preserve the selected text, revision and saved bytes. Native Right then
 collapses selection, with another callback/publication/pixel check.
-Unicode glyph pixels and mid-transfer cancellation remain outside this case.
+Unicode glyph pixels remain outside this case.
 The Emacs variant selects through C-Space and document motion, cuts with
 C-w and pastes with C-y. After the same owner-exit refusal, C-g collapses
 the mark and dismisses feedback without editing; captured pixels and saved
@@ -411,6 +411,14 @@ Copy offer in these cases; both retain owner-exit and pixel checks.
 All four clipboard variants also try Copy with no selection: the prior
 snapshot must remain available to the other editor, with source state
 and saved bytes unchanged.
+They also hold one native Paste at the compositor before source delivery,
+confirm `incoming=1`, and cancel via Escape or Emacs C-g. Only then is the
+descriptor released: fresh source send-failure feedback fences its encounter
+with the closed receiver. Cancellation preserves both documents and disk
+bytes, and a fresh Paste still succeeds. The opt-in hold has a deadline;
+tests do not rely on a large payload being slow. Cancellation and producer
+failure each have a fail-closed four-second evidence budget, shorter than
+the editor's five-second transfer deadlines.
 Vertical and horizontal wheel cases also test page-bound clamping and
 inward movement after repeated outward reports. Horizontal scrolling is
 checked with Soft Wrap enabled, then disabled through the native menu;

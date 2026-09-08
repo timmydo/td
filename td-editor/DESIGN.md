@@ -2257,7 +2257,7 @@ selection, revision, text and saved bytes. Native Right collapses the
 selection without editing. Source `b` and the destination's ASCII `clip`
 prefix have callback/publication/capture fences, including after that
 collapse. The feedback assertion pins current diagnostic wording, not a
-stable error-code API. Unicode glyph pixels and mid-transfer cancellation
+stable error-code API. Unicode glyph pixels
 are not covered by this process case. No editor clipboard or decoded-key
 control request supplies the data. This exercises ordinary Wayland
 selection authority, not physical trusted-input authorization.
@@ -2287,6 +2287,23 @@ selection after saving `b`. Fresh no-selection feedback fences this
 no-op before exact revision, selection, text and disk checks. The second
 editor must still paste the original UTF-8 snapshot, proving that empty
 Copy preserves both prior Copy and prior Cut ownership in each profile.
+All four cases opt into the compositor's separate clipboard-transfer hold
+grant. Before successful Paste, arm hold 1 for the focused destination and
+route Paste, then require compositor `held` and editor `incoming=1` with
+unchanged empty document/selection/revision. Native Escape (Windows) or C-g
+(Emacs) must clear both incoming state and pasting feedback within four
+seconds measured before Paste dispatch, below its five-second read deadline.
+This excludes timeout followed by late Cancel clearing the timeout notice.
+A publication/callback check follows cancellation. Release the
+held endpoint only after cancellation; fresh source send-failure feedback
+proves the source processed the now-closed receiver rather than merely
+seeing compositor queue admission. This failure must also be observed within
+four seconds measured before release, below its five-second write deadline.
+Both full tab states and disk bytes remain
+unchanged, and the following fresh Paste must succeed with the original UTF-8
+snapshot. No pause is inferred from payload size or timing, and no editor
+control mutation performs the clipboard action. The hold grant is absent
+from unrelated native keyboard/pointer/wheel sessions.
 Weston remains separate optional interoperability evidence below.
 
 The opt-in `disposable_weston_runs_the_production_editor_and_control_workers`
