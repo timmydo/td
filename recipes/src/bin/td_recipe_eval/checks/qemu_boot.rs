@@ -28,6 +28,8 @@
 //! host-side TEST tool — it never enters the target artifact graph. If host qemu
 //! is absent the tool FAILS loudly rather than silently passing, so a green result
 //! always means a real boot happened.
+pub(crate) mod secret;
+
 use std::env;
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
@@ -4084,6 +4086,19 @@ fn boot(
     plan: BootPlan<'_>,
     scratch_base: &Path,
 ) -> Result<BootResult, String> {
+    boot_with_timeout(
+        qemu, bzimage, initramfs, plan, scratch_base, boot_timeout(),
+    )
+}
+
+fn boot_with_timeout(
+    qemu: &str,
+    bzimage: &Path,
+    initramfs: &Path,
+    plan: BootPlan<'_>,
+    scratch_base: &Path,
+    timeout: Duration,
+) -> Result<BootResult, String> {
     validate_boot_plan_tokens(plan.extra_append)?;
     if plan.capture_firefox_audio && (!plan.audio || !plan.physical_input) {
         return Err(
@@ -4106,7 +4121,6 @@ fn boot(
     let firefox_audio_path = plan
         .capture_firefox_audio
         .then(|| dir.join("firefox-audio.wav"));
-    let timeout = boot_timeout();
     let firefox_audio_ceiling = firefox_audio_path
         .as_ref()
         .map(|_| firefox_audio_capture_ceiling(timeout))

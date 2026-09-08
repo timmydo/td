@@ -190,8 +190,8 @@ fn root_public_client_uses_the_human_identity_and_immutable_descriptor() {
             std::thread::sleep(Duration::from_millis(1));
         }
         let output = child.wait_with_output().unwrap();
-        assert_eq!(captured, uid == 1000);
-        assert_eq!(output.status.success(), uid == 1000, "{}", String::from_utf8_lossy(&output.stderr));
+        assert_eq!(captured, uid == 1000, "client uid {uid}: {}", String::from_utf8_lossy(&output.stderr));
+        assert_eq!(output.status.success(), uid == 1000, "client uid {uid}: {}", String::from_utf8_lossy(&output.stderr));
         assert!(output.stdout.is_empty());
         assert!(!output.stderr.windows(16).any(|bytes| bytes == b"exact credential"));
     }

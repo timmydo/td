@@ -1115,3 +1115,29 @@ fallback or automatic write retry. Root, the deployment identity table and
 the paired compositor remain trusted. The intake bounds resource use, but
 a malicious human process can occupy the single queue slot until expiry;
 this does not authorize its request or force a prompt.
+
+## Focused credential authority VM checks
+
+`cargo run --release --manifest-path recipes/Cargo.toml --bin
+td-recipe-eval -- qemu-secret` builds the target kernel, production
+`td-secret` and `td-init`, and the separate `td-secret-vm-test` artifact.
+That artifact contains the source-built authority test executable and a
+Rust fixture init; it is not an input to the distribution image. Host QEMU
+is an execution oracle only, as for `qemu-boot-system`, and is required.
+This command runs outside the host-free recipe-check sandbox.
+
+Four fresh, diskless TCG guests exercise the existing root-only cases:
+public `td-secret set` descriptor intake for both token roles, refusal of
+nonhuman callers, preparation and generation-exit relocking, read-only
+store inspection, and cleanup after the production worker refuses. Each
+guest has private account files and tmpfs runtime state, no network, TPM,
+token, or persistent disk, and a 180-second host deadline. The fixture
+selects exactly one named ignored test, requires its successful exit and
+one-test passing summary, then powers off. The host requires the fixture
+marker and a clean guest exit without a kernel panic.
+
+These checks prove the kernel-facing authority and client boundaries;
+they do not claim token presence, a presented compositor prompt, TPM
+unseal, or a credential-store write. The public intake fixture explicitly
+stands in for the completion reply. Pinned-emulator tests in
+`td-secret/DESIGN.md` cover the separate cryptographic store operations.

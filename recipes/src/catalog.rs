@@ -187,6 +187,7 @@ mod tests {
             "td-profiler",
             "td-seatd",
             "td-secret",
+            "td-secret-vm-test",
             "td-sh",
             "td-svc",
             "td-txt",
