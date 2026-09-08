@@ -410,6 +410,11 @@ the separate confirmation before discarding unsaved text. Cancel at either
 question preserves dirty text, and the cancelled discard cannot be replayed
 against a fresh conflict. Reload must produce exact clean state/text and
 correlated `outside` pixels while preserving the external file bytes.
+A native Open/Save As case uses paths with spaces, leading dashes and
+non-UTF-8 bytes. Missing Open creates no file, Save As changes only the new
+destination, and duplicate Open selects the existing dirty tab unchanged.
+It checks complete two-tab state and tab-2-correlated `xnew` pixels before
+plain Save writes the new association, leaving the old missing path absent.
 The vertical-wheel case checks forward and reverse detents against
 exact viewport rows and captured numbered-line pixels, with unchanged text,
 revision, selection, caret and disk bytes. The clipboard case uses two

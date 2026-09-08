@@ -306,13 +306,25 @@ impl Compositor {
         text: &str,
         caret: usize,
     ) {
+        self.rendered_tab_text(editor, window, (1, revision), after, text, caret);
+    }
+
+    fn rendered_tab_text(
+        &self,
+        editor: &mut EditorProcess,
+        window: &str,
+        (tab, revision): (u64, u64),
+        after: Observation,
+        text: &str,
+        caret: usize,
+    ) {
         let state = editor.ok("state");
         let generation = field(&state, "window-generation").unwrap();
         let frame = editor.ok(&format!("wait-frame\t{generation}"));
         let fields: Vec<_> = frame.split(',').collect();
         assert_eq!(
             &fields[2..],
-            &["1", &revision.to_string(), "800", "576", "1"]
+            &[&tab.to_string(), &revision.to_string(), "800", "576", "1"]
         );
         let expected = text_pixels(text);
         let width = text.len() * 8;
@@ -1275,6 +1287,83 @@ fn native_conflict_reload_requires_fresh_dialog_and_explicit_discard() {
     editor.wait_tab(2, "outside\n");
     compositor.rendered_text(&mut editor, &window, 2, before, "outside", 0);
     assert_eq!(std::fs::read(&file).unwrap(), b"outside\n");
+    editor.quit();
+    compositor.stop();
+}
+
+#[test]
+#[ignore = "requires an explicitly built TD_TEST_COMPOSITOR; ready runs this case"]
+fn native_open_and_save_as_preserve_literal_paths_and_dirty_duplicate() {
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+
+    let compositor_directory = Directory::new();
+    let directory = Directory::new();
+    let mut compositor = Compositor::start(&compositor_directory);
+    let file = directory.0.join("draft");
+    let dictionary = directory.0.join("dictionary");
+    let missing = directory.0.join(std::ffi::OsString::from_vec(
+        b"-missing \xff".to_vec(),
+    ));
+    let destination = directory.0.join(std::ffi::OsString::from_vec(
+        b"-saved \xfe".to_vec(),
+    ));
+    let missing_hex = td_editor::control::hex(missing.as_os_str().as_bytes());
+    let destination_hex = td_editor::control::hex(destination.as_os_str().as_bytes());
+    std::fs::write(&file, b"base\n").unwrap();
+    std::fs::write(&dictionary, b"base\nnew\n").unwrap();
+    let display = compositor.directory.join("wayland-0");
+    let mut editor = EditorProcess::start(&directory, &display, &file, &dictionary);
+    editor.wait_keyboard("windows");
+    let window = compositor.window();
+    assert_eq!(compositor.request("fullscreen", 1024), b"ok\n");
+    editor.wait_field("state", "window", "800,576,1");
+    editor.rendered_at(800, 576);
+    let second_tab = |process: &mut EditorProcess, row: &str, revision: u64, text: &str| {
+        let state = process.ok("state");
+        assert_eq!(field(&state, "active"), Some("2"));
+        process.wait_tab(0, "base\n");
+        let tabs: Vec<_> = state.split('\t')
+            .filter(|field| field.starts_with("tab="))
+            .collect();
+        assert_eq!(tabs.len(), 2);
+        assert_eq!(tabs.first().copied(), Some("tab=1,0,0,5,0,0,0,72,0,lf"));
+        assert_eq!(tabs.get(1).and_then(|tab| tab.strip_prefix("tab=")), Some(row));
+        assert_eq!(
+            process.ok(&format!("text\t2\t{revision}\t0\t100")),
+            format!("{}\t{}", text.len(), td_editor::control::hex(text.as_bytes()))
+        );
+    };
+    let file_job = |process: &mut EditorProcess, request: &str, fields: &str| {
+        let response = process.request(request).unwrap();
+        let job = response.strip_prefix("pending\t").expect(&response);
+        assert_eq!(process.wait_job(job), format!("job={job},{fields},complete,-"));
+    };
+    file_job(&mut editor, &format!("open\t{missing_hex}"), "open,2,0,0");
+    second_tab(&mut editor, "2,0,1,0,0,0,0,72,0,lf", 0, "");
+    assert!(!missing.exists());
+    editor.ok("insert\t2\t0\t0\t0\t6e65770a");
+    file_job(
+        &mut editor,
+        &format!("save-as\t2\t1\t{destination_hex}"),
+        "save-as,2,1,0",
+    );
+    second_tab(&mut editor, "2,1,0,4,4,4,0,72,0,lf", 1, "new\n");
+    assert_eq!(std::fs::read(&destination).unwrap(), b"new\n");
+    assert!(!missing.exists());
+    editor.ok("select-range\t2\t1\t0\t0");
+    editor.ok("insert\t2\t1\t0\t0\t78");
+    editor.ok("select-tab\t1\t0");
+    editor.wait_field("state", "active", "1");
+    let before = compositor.observe(&window);
+    file_job(&mut editor, &format!("open\t{destination_hex}"), "open,2,2,0");
+    second_tab(&mut editor, "2,2,1,5,1,1,0,72,0,lf", 2, "xnew\n");
+    compositor.rendered_tab_text(&mut editor, &window, (2, 2), before, "xnew", 1);
+    assert_eq!(std::fs::read(&destination).unwrap(), b"new\n");
+    file_job(&mut editor, "save\t2\t2", "save,2,2,0");
+    second_tab(&mut editor, "2,2,0,5,1,1,0,72,0,lf", 2, "xnew\n");
+    assert_eq!(std::fs::read(&destination).unwrap(), b"xnew\n");
+    assert_eq!(std::fs::read(&file).unwrap(), b"base\n");
+    assert!(!missing.exists());
     editor.quit();
     compositor.stop();
 }

@@ -2240,6 +2240,20 @@ and show correlated
 ordinary conflict recovery, not cancellation during an in-flight read or
 an assertion about intermediate dialog pixels.
 
+A native Open/Save As case uses literal filenames containing spaces,
+leading dashes and non-UTF-8 bytes. Opening the missing path must create a
+dirty empty second tab without creating a file. Save As publishes its
+edited bytes only at a different literal path. After another edit and
+switch to tab 1, duplicate Open must select the same dirty tab 2 at its
+current revision without replacing text or disk. Capture is explicitly
+fenced to tab 2/revision 2 with correlated `xnew` pixels. Plain Save then
+writes the new association, preserves tab 1's state/file, and leaves the
+original missing path absent. The existing tab-1 capture helper delegates
+to the same explicit-target frame/pixel oracle.
+Tab-title pixels are not asserted. Process survival and completed frames
+exclude a title-rendering crash, but do not prove the escaped title's
+appearance.
+
 The editor maps normally, then compositor fullscreen leaves an 800x576
 scale-one client beneath the 24-pixel desktop bar. Shift+A, released-Shift b
 and Windows Ctrl+Z / Emacs Ctrl+/ use real evdev-code routing, keymap and
