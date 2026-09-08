@@ -17,13 +17,14 @@ const EVIDENCE_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const ATTRIBUTION_WORK_SLICE: Duration = Duration::from_millis(50);
 const ATTRIBUTION_REST_SLICE: Duration = Duration::from_millis(50);
 const MAX_EVIDENCE_WAIT: Duration = Duration::from_secs(MAX_EVIDENCE_WAIT_SECS as u64);
-const REQUIRED_FILES: [&str; 8] = [
+const REQUIRED_FILES: [&str; 9] = [
     "manifest.json",
     "overview.jsonl",
     "processes.jsonl",
     "hotspots.jsonl",
     "lines.jsonl",
     "stacks.jsonl",
+    "frames.jsonl",
     "stacks.folded",
     "samples.bin",
 ];
@@ -1315,7 +1316,7 @@ mod tests {
     fn attribution(line: u64) -> String {
         let function = format!("_Rabc{ATTRIBUTION_FUNCTION_FRAGMENT}def");
         format!(
-            "{{\"schema\":1,\"pid\":7,\"start_kind\":\"ticks\",\"start_value\":9,\
+            "{{\"schema\":2,\"pid\":7,\"start_kind\":\"ticks\",\"start_value\":9,\
              \"generation\":1,\"symbol_resolved\":true,\"line_resolved\":true,{},{},\
              \"build_id\":\"0011\",\"function_address\":256,\"object_address\":null,{},\
              \"source_line\":{line},\"source_column\":1,\"discriminator\":0,\"samples\":7}}\n",
@@ -1380,13 +1381,13 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir(&root).unwrap();
         let path = root.join("overview.jsonl");
-        let valid = "{\"schema\":1,\"kind\":\"process\",\"rank\":1,\"pid\":7,\
+        let valid = "{\"schema\":2,\"kind\":\"process\",\"rank\":1,\"pid\":7,\
                      \"start_kind\":\"proc-start-ticks\",\"start_value\":9,\
                      \"generation\":1,\"comm\":\"a\",\"comm_bytes_prefix\":\"61\",\
                      \"comm_bytes_length\":1,\"comm_truncated\":false,\"observed\":true,\
                      \"baseline_valid\":true,\"exited\":false,\"samples\":7,\
                      \"sample_share_millionths\":1000000}\n\
-                     {\"schema\":1,\"kind\":\"stack\",\"rank\":1,\"pid\":7,\
+                     {\"schema\":2,\"kind\":\"stack\",\"rank\":1,\"pid\":7,\
                      \"start_kind\":\"proc-start-ticks\",\"start_value\":9,\
                      \"generation\":1,\"tid\":7,\"state\":\"complete\",\
                      \"reason\":\"\",\"reason_bytes_prefix\":\"\",\
@@ -1395,7 +1396,7 @@ mod tests {
                      \"folded_bytes_prefix\":\"6d61696e\",\"folded_bytes_length\":4,\
                      \"folded_truncated\":false,\"samples\":7,\
                      \"sample_share_millionths\":1000000}\n\
-                     {\"schema\":1,\"kind\":\"hotspot\",\"rank\":1,\"pid\":7,\
+                     {\"schema\":2,\"kind\":\"hotspot\",\"rank\":1,\"pid\":7,\
                      \"start_kind\":\"proc-start-ticks\",\"start_value\":9,\
                      \"generation\":1,\"resolved\":false,\"object\":\"\",\
                      \"object_bytes_prefix\":\"\",\"object_bytes_length\":0,\
@@ -1404,7 +1405,7 @@ mod tests {
                      \"function_truncated\":false,\"build_id\":\"\",\
                      \"function_address\":0,\"samples\":7,\
                      \"sample_share_millionths\":1000000}\n\
-                     {\"schema\":1,\"kind\":\"line\",\"rank\":1,\"pid\":7,\
+                     {\"schema\":2,\"kind\":\"line\",\"rank\":1,\"pid\":7,\
                      \"start_kind\":\"proc-start-ticks\",\"start_value\":9,\
                      \"generation\":1,\"symbol_resolved\":false,\"line_resolved\":false,\
                      \"object\":\"\",\"object_bytes_prefix\":\"\",\
@@ -1417,7 +1418,7 @@ mod tests {
                      \"source_file_truncated\":false,\"source_line\":null,\
                      \"source_column\":null,\"discriminator\":null,\"samples\":7,\
                      \"sample_share_millionths\":1000000}\n\
-                     {\"schema\":1,\"kind\":\"capture\",\"samples\":7,\
+                     {\"schema\":2,\"kind\":\"capture\",\"samples\":7,\
                      \"process_rows\":1,\"stack_rows\":1,\"hotspot_rows\":1,\"line_rows\":1,\
                      \"rows_per_kind_limit\":32,\"complete_stack_samples\":7,\
                      \"truncated_stack_samples\":0,\"unresolved_stack_samples\":0,\
@@ -1433,8 +1434,8 @@ mod tests {
         std::fs::write(
             &path,
             valid.replace(
-                "{\"schema\":1,\"kind\":\"process\",\"rank\":1,\"pid\":7",
-                "{\"schema\":1,\"kind\":\"process\",\"rank\":1,\"x\":0,\"pid\":7",
+                "{\"schema\":2,\"kind\":\"process\",\"rank\":1,\"pid\":7",
+                "{\"schema\":2,\"kind\":\"process\",\"rank\":1,\"x\":0,\"pid\":7",
             ),
         )
         .unwrap();

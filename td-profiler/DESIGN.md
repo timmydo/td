@@ -323,7 +323,10 @@ pipeline has at most one active roster and one processing roster, for a
 capture may add at most 128 MiB, including event-order and cross-CPU ambiguity
 indexes and each distinct retained stack once rather than every matching
 sample. Report/symbol materialization has a separate 128 MiB peak expansion
-budget for retained ordering/aggregate state plus one transient resolved stack.
+budget for retained ordering/aggregate state, the frame dictionary, one
+transient resolved stack, and bounded serialization of one frame. The
+dictionary retains each distinct complete frame encoding once and releases
+its reservation before hotspot, line, and manifest publication.
 The object
 inventory and the LRU set of parsed symbol and line tables each have independent
 128-MiB heap ceilings. Loading one cold companion has its own 128-MiB transient
@@ -481,6 +484,7 @@ processes.jsonl     one process/image generation and its accounted samples
 hotspots.jsonl      sorted process/object/function aggregates
 lines.jsonl         sorted process/object/function/source-line aggregates
 stacks.jsonl        sorted stack aggregates with state, reason, and count
+frames.jsonl        numbered distinct frame records referenced by stacks
 stacks.folded       deterministic folded stacks with integer sample counts
 samples.bin         versioned raw records needed for re-symbolization
 ```
@@ -496,14 +500,22 @@ remains partial rather than exceeding the metadata allowance. If analysis or
 derived generation fails, it still publishes `samples.bin` with a bounded
 `report-error.txt` marker. The pending manifest and failure marker share a
 one-MiB metadata allowance, while all other original derived output shares the
-remaining 127 MiB. Such a capture intentionally need not contain the six
+remaining 127 MiB. Such a capture intentionally need not contain all derived
 summary files or a complete derived manifest: its canonical incomplete
 manifest preserves the metadata needed by `td-profiler report`. Raw evidence
 is preferable to deleting the only record of the failure, and the report can
 be regenerated offline.
 
-`stacks.jsonl` is the structured source for per-stack state. The folded form
-prepends one reserved synthetic frame such as
+`stacks.jsonl` is the structured source for per-stack state. Its `frame_ids`
+array retains leaf-to-root order and recursive duplicates. Each ID refers to
+the one-based line in `frames.jsonl`, whose row contains `schema`, `id`, and
+the complete `frame` object. IDs are assigned on first encounter in the
+canonically sorted stack traversal, so the dictionary is deterministic. Only
+byte-identical complete frame encodings share an ID: addresses, mapping
+identity, raw path bytes, symbol attribution and source location all remain
+part of that identity. Stacks therefore share repeated caller metadata without
+discarding samples, shortening callchains, or weakening either output budget.
+The folded form prepends one reserved synthetic frame such as
 `[td:truncated:foreign-no-frame-pointer]`; escaping rules prevent a program
 symbol from entering the `[td:*]` namespace. Lost records which produced no
 stack appear in manifest counters rather than as fabricated folded samples.
@@ -517,9 +529,12 @@ identity. Invalid bytes are never placed in a JSON string or replaced. The
 binary stream has an explicit magic, endian marker, schema version, record
 lengths, and reserved fields that must be zero. Unknown raw-schema record
 kinds are skipped by length and reported; well-formed unmodeled kernel perf
-kinds use the known ignored-event record. Report schema 1 permits additive
-derived fields and files; the raw schema is separately versioned, and this
-increment does not change it.
+kinds use the known ignored-event record. Report schema 2 replaces schema 1's
+inline stack `frames` array with `frame_ids` and `frames.jsonl`. Other reports
+retain their fields with the new schema number. The raw schema is unchanged;
+offline regeneration accepts canonical schema 1 or 2 manifests and publishes
+schema 2 reports in the separate regenerated directory. New collection and
+boot evidence require the new dictionary; there is no inline-writer fallback.
 
 `overview.jsonl` is the bounded entry point for an authorized human or agent
 which should not have to ingest a report near the complete derived-output
@@ -555,8 +570,9 @@ or not exceed them when only the top 32 are present. Thus a reader can judge
 prominence, caller context, and attribution quality before opening the complete
 JSONL files. The overview is derived from the same in-memory aggregates while
 their canonical ordering is being written; it is not a second analysis or an
-independent source of truth. Its fixed 129-row ceiling is part of report schema
-1, and offline regeneration produces it under the same publication boundary.
+independent source of truth. Its fixed 129-row ceiling remains part of report
+schema 2, and offline regeneration produces it under the same publication
+boundary.
 
 The version-one task body records a `u32` identity tag (`0` unknown, `1`
 `/proc` start ticks, `2` perf fork time), a zero `u32`, its `u64` value, the

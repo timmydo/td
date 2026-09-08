@@ -13,7 +13,7 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
-pub const SCHEMA: u32 = 1;
+pub const SCHEMA: u32 = 2;
 pub const MAX_REPORT_BYTES: u64 = 128 * 1024 * 1024;
 pub const MAX_OVERVIEW_BYTES: u64 = 2 * 1024 * 1024;
 pub const MAX_CAPTURE_METADATA_BYTES: u64 = 1024 * 1024;
@@ -431,8 +431,11 @@ fn manifest_prefix(capture: &Path) -> Result<String, String> {
     }
     let text =
         std::str::from_utf8(&bytes).map_err(|_| format!("{} is not UTF-8 JSON", path.display()))?;
-    if text.lines().count() != 1 || !text.starts_with("{\"schema\":1,\"profiler_build\":") {
-        return Err("existing manifest is not canonical td-profiler schema 1".into());
+    if text.lines().count() != 1
+        || !(text.starts_with("{\"schema\":1,\"profiler_build\":")
+            || text.starts_with("{\"schema\":2,\"profiler_build\":"))
+    {
+        return Err("existing manifest is not canonical td-profiler schema 1 or 2".into());
     }
     let marker = ",\"samples\":";
     let at = text
@@ -468,7 +471,10 @@ fn manifest_prefix(capture: &Path) -> Result<String, String> {
             .and_then(|value| value.checked_add(field.len()))
             .ok_or("existing manifest field offset overflow")?;
     }
-    Ok(stable.to_string())
+    Ok(match stable.strip_prefix("{\"schema\":1,") {
+        Some(rest) => format!("{{\"schema\":{SCHEMA},{rest}"),
+        None => stable.to_string(),
+    })
 }
 
 fn regenerated_manifest_prefix(prefix: &str, samples: u64) -> Result<String, String> {
@@ -604,6 +610,9 @@ fn write_stacks(
             .then_with(|| left_key.cmp(right_key))
     });
     let mut structured = output(capture.join("stacks.jsonl"), budget)?;
+    let mut frames = output(capture.join("frames.jsonl"), budget)?;
+    let mut frame_ids = BTreeMap::new();
+    let mut frame_table_bytes = 0usize;
     let mut folded = output(capture.join("stacks.folded"), budget)?;
     let mut hotspots: BTreeMap<HotspotKey, u64> = BTreeMap::new();
     let mut lines: BTreeMap<LineKey, u64> = BTreeMap::new();
@@ -654,7 +663,7 @@ fn write_stacks(
             structured,
             "{{\"schema\":{SCHEMA},\"pid\":{},\"start_kind\":\"{}\",\"start_value\":{},\
              \"generation\":{},\"tid\":{},\
-             \"state\":\"{}\",\"reason_bytes\":\"{}\",\"count\":{},\"frames\":[",
+             \"state\":\"{}\",\"reason_bytes\":\"{}\",\"count\":{},\"frame_ids\":[",
             stack.image.pid,
             start_kind,
             start_value,
@@ -669,7 +678,15 @@ fn write_stacks(
             if number != 0 {
                 structured.write_all(b",").map_err(|e| e.to_string())?;
             }
-            write_frame(&mut structured, frame, symbol.as_ref())?;
+            let id = intern_frame(
+                &mut frames,
+                &mut frame_ids,
+                frame,
+                symbol.as_ref(),
+                expansion,
+                &mut frame_table_bytes,
+            )?;
+            write!(structured, "{id}").map_err(|e| format!("write frame reference: {e}"))?;
         }
         structured
             .write_all(b"]}\n")
@@ -734,7 +751,10 @@ fn write_stacks(
         expansion.release(transient_bytes);
     }
     finish(structured, "stacks.jsonl")?;
+    finish(frames, "frames.jsonl")?;
     finish(folded, "stacks.folded")?;
+    drop(frame_ids);
+    expansion.release(frame_table_bytes);
     Ok(StackRows {
         stack_rows,
         hotspots,
@@ -844,7 +864,7 @@ fn reported_stack_state(base: &StackState, resolved: &[Option<Resolved>]) -> Sta
 }
 
 fn write_frame(
-    file: &mut Output,
+    file: &mut impl Write,
     frame: &Frame,
     resolved: Option<&Resolved>,
 ) -> Result<(), String> {
@@ -875,6 +895,80 @@ fn write_frame(
         .map_err(|e| e.to_string())?;
     }
     file.write_all(b"}").map_err(|e| e.to_string())
+}
+
+fn intern_frame(
+    output: &mut Output,
+    ids: &mut BTreeMap<Box<[u8]>, usize>,
+    frame: &Frame,
+    resolved: Option<&Resolved>,
+    expansion: &mut ExpansionBudget,
+    retained_bytes: &mut usize,
+) -> Result<usize, String> {
+    let limit = frame
+        .path
+        .len()
+        .saturating_mul(8)
+        .saturating_add(resolved.map_or(0, resolved_json_expansion))
+        .saturating_add(1024);
+    // The buffer's growth and the formatter's temporary strings coexist.
+    let transient = limit.saturating_mul(4);
+    expansion.claim(transient, "frame serialization")?;
+    let mut encoded = FrameBuffer {
+        bytes: Vec::with_capacity(limit),
+        limit,
+    };
+    write_frame(&mut encoded, frame, resolved)?;
+    let next = ids.len().checked_add(1).ok_or("frame ID overflow")?;
+    let id = match ids.entry(encoded.bytes.into_boxed_slice()) {
+        Entry::Occupied(entry) => {
+            expansion.release(transient);
+            *entry.get()
+        }
+        Entry::Vacant(entry) => {
+            // The first insertion allocates a whole node before entry charges
+            // can amortize its spare slots.
+            let structure = if next == 1 { 1024 + 128 } else { 128 };
+            let bytes = entry.key().len().saturating_add(structure);
+            let excess = transient
+                .checked_sub(bytes)
+                .ok_or("frame dictionary entry exceeds serialization reservation")?;
+            expansion.release(excess);
+            write!(output, "{{\"schema\":{SCHEMA},\"id\":{next},\"frame\":")
+                .map_err(|e| format!("write frames.jsonl: {e}"))?;
+            output
+                .write_all(entry.key())
+                .map_err(|e| format!("write frames.jsonl: {e}"))?;
+            output
+                .write_all(b"}\n")
+                .map_err(|e| format!("write frames.jsonl: {e}"))?;
+            entry.insert(next);
+            *retained_bytes = retained_bytes.saturating_add(bytes);
+            next
+        }
+    };
+    Ok(id)
+}
+
+struct FrameBuffer {
+    bytes: Vec<u8>,
+    limit: usize,
+}
+
+impl Write for FrameBuffer {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if bytes.len() > self.limit.saturating_sub(self.bytes.len()) {
+            return Err(io::Error::other(
+                "frame serialization exceeds its reservation",
+            ));
+        }
+        self.bytes.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 fn hotspot_key(image: &ImageKey, frame: &Frame, resolved: Option<&Resolved>) -> HotspotKey {
@@ -1951,6 +2045,264 @@ mod tests {
     }
 
     #[test]
+    fn frame_dictionary_preserves_identity_and_accounts_for_retained_memory() {
+        let root =
+            std::env::temp_dir().join(format!("td-profiler-frame-identity-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir(&root).unwrap();
+        let mut output = super::output(root.join("frames.jsonl"), &OutputBudget::new()).unwrap();
+        let mut ids = std::collections::BTreeMap::new();
+        let mut expansion = ExpansionBudget::new();
+        let mut retained = 0;
+        let base = Frame {
+            address: 100,
+            relative: Some(1),
+            major: 1,
+            minor: 2,
+            inode: 3,
+            inode_generation: 4,
+            path: vec![b'/', 0xff],
+        };
+        let symbol = Resolved {
+            function: b"f".to_vec(),
+            object: b"o".to_vec(),
+            debug: b"d".to_vec(),
+            build_id: vec![0; 20],
+            provenance: b"source-built".to_vec(),
+            object_address: 1,
+            function_address: 1,
+            assembly_boundary: false,
+            source: Some(crate::dwarf::Location {
+                file: b"file.rs".to_vec(),
+                line: 7,
+                column: 1,
+                discriminator: 0,
+            }),
+        };
+        let mut intern = |frame: &Frame, symbol: Option<&Resolved>| {
+            let id = super::intern_frame(
+                &mut output,
+                &mut ids,
+                frame,
+                symbol,
+                &mut expansion,
+                &mut retained,
+            )
+            .unwrap();
+            assert_eq!(expansion.remaining(), MAX_REPORT_EXPANSION_BYTES - retained);
+            if ids.len() == 1 {
+                assert_eq!(
+                    retained,
+                    ids.first_key_value().unwrap().0.len() + 1024 + 128
+                );
+            }
+            id
+        };
+        assert_eq!(intern(&base, Some(&symbol)), 1);
+        assert_eq!(intern(&base, Some(&symbol)), 1);
+        let mut mapped = base.clone();
+        mapped.inode += 1;
+        assert_eq!(intern(&mapped, Some(&symbol)), 2);
+        mapped = base.clone();
+        mapped.path = vec![b'/', 0xfe];
+        assert_eq!(intern(&mapped, Some(&symbol)), 3);
+        let mut source = symbol.clone();
+        source.source.as_mut().unwrap().line += 1;
+        assert_eq!(intern(&base, Some(&source)), 4);
+        assert_eq!(intern(&base, None), 5);
+        assert_eq!(intern(&base, Some(&symbol)), 1);
+        super::finish(output, "frames.jsonl").unwrap();
+        let rows = std::fs::read_to_string(root.join("frames.jsonl")).unwrap();
+        assert_eq!(rows.lines().count(), 5);
+        assert!(rows.contains("\"mapping_path_bytes\":\"2fff\""));
+        assert!(rows.contains("\"source_line\":8"));
+        let mut bounded = super::FrameBuffer {
+            bytes: Vec::with_capacity(2),
+            limit: 2,
+        };
+        bounded.write_all(b"ab").unwrap();
+        assert!(bounded.write_all(b"c").is_err());
+        assert_eq!(bounded.bytes, b"ab");
+        let mut refused = ExpansionBudget { remaining: 0 };
+        let mut file = super::output(root.join("refused.jsonl"), &OutputBudget::new()).unwrap();
+        assert!(super::intern_frame(
+            &mut file,
+            &mut ids,
+            &base,
+            Some(&symbol),
+            &mut refused,
+            &mut retained
+        )
+        .is_err());
+        assert_eq!(ids.len(), 5);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn distinct_short_frames_do_not_retain_serialization_reservations() {
+        let root =
+            std::env::temp_dir().join(format!("td-profiler-distinct-short-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir(&root).unwrap();
+        let mut events = vec![Event {
+            time_ns: 1,
+            cpu: 0,
+            sequence: 1,
+            pid: 7,
+            tid: 7,
+            kind: Kind::Task {
+                start: StartIdentity::ProcTicks(1),
+                generation: 0,
+                comm: b"worker".to_vec(),
+                valid: true,
+            },
+        }];
+        for sample in 0..80000 {
+            events.push(Event {
+                time_ns: sample + 2,
+                cpu: 0,
+                sequence: sample + 2,
+                pid: 7,
+                tid: 7,
+                kind: Kind::Sample {
+                    ip: 0x1000 + sample,
+                    callchain: vec![],
+                },
+            });
+        }
+        let analysis = crate::state::analyze(&events).unwrap();
+        assert_eq!(analysis.sample_records, 80000);
+        assert_eq!(analysis.stacks.len(), 80000);
+        let meta = Meta {
+            profiler_build: "profiler".into(),
+            deployment: "deployment".into(),
+            boot_id: "boot".into(),
+            start_ns: 1,
+            end_ns: 80002,
+            wall_start_seconds: 3,
+            rate_hz: 99,
+            cpus: vec![0],
+            coverage: vec![(0, 1, 80002)],
+        };
+        generate(
+            &root,
+            &meta,
+            &mut Symbolizer::from_index(None),
+            &analysis,
+            0,
+        )
+        .unwrap();
+        let frames = std::fs::read_to_string(root.join("frames.jsonl")).unwrap();
+        assert_eq!(frames.lines().count(), 80000);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn shared_callers_fit_the_report_budget_without_dropping_samples() {
+        let root =
+            std::env::temp_dir().join(format!("td-profiler-shared-callers-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir(&root).unwrap();
+        let event = |time_ns, kind| Event {
+            time_ns,
+            cpu: 0,
+            sequence: time_ns,
+            pid: 7,
+            tid: 7,
+            kind,
+        };
+        let mut events = vec![
+            event(
+                1,
+                Kind::Task {
+                    start: StartIdentity::ProcTicks(1),
+                    generation: 0,
+                    comm: b"worker".to_vec(),
+                    valid: true,
+                },
+            ),
+            event(
+                2,
+                Kind::Mmap {
+                    address: 0x1000,
+                    length: 0x100000,
+                    page_offset: 0,
+                    major: 1,
+                    minor: 2,
+                    inode: 3,
+                    inode_generation: 0,
+                    path: vec![b'x'; 200],
+                    synthetic: true,
+                },
+            ),
+        ];
+        for sample in 0..6000 {
+            events.push(event(
+                sample + 3,
+                Kind::Sample {
+                    ip: 0x2000 + sample,
+                    callchain: (0..32).map(|frame| 0x1000 + frame).collect(),
+                },
+            ));
+        }
+        let analysis = crate::state::analyze(&events).unwrap();
+        assert_eq!(analysis.sample_records, 6000);
+        assert_eq!(analysis.stacks.len(), 6000);
+        let meta = Meta {
+            profiler_build: "profiler".into(),
+            deployment: "deployment".into(),
+            boot_id: "boot".into(),
+            start_ns: 1,
+            end_ns: 6003,
+            wall_start_seconds: 3,
+            rate_hz: 99,
+            cpus: vec![0],
+            coverage: vec![(0, 1, 6003)],
+        };
+        generate(
+            &root,
+            &meta,
+            &mut Symbolizer::from_index(None),
+            &analysis,
+            0,
+        )
+        .unwrap();
+        let bytes: u64 = std::fs::read_dir(&root)
+            .unwrap()
+            .map(|entry| entry.unwrap().metadata().unwrap().len())
+            .sum();
+        assert!(bytes < 64 * 1024 * 1024, "report used {bytes} bytes");
+        println!("shared-caller report: {bytes} bytes for 6000 complete sample records");
+        let stacks = std::fs::read_to_string(root.join("stacks.jsonl")).unwrap();
+        assert_eq!(stacks.lines().count(), 6000);
+        assert_eq!(stacks.matches("\"count\":1").count(), 6000);
+        let frames = std::fs::read_to_string(root.join("frames.jsonl")).unwrap();
+        let frames: Vec<_> = frames.lines().collect();
+        assert_eq!(frames.len(), 6032);
+        for (sample, stack) in stacks.lines().enumerate() {
+            let ids = stack
+                .split("\"frame_ids\":[")
+                .nth(1)
+                .unwrap()
+                .strip_suffix("]}")
+                .unwrap();
+            let ids: Vec<usize> = ids.split(',').map(|id| id.parse().unwrap()).collect();
+            assert_eq!(ids.len(), 33);
+            for (at, id) in ids.into_iter().enumerate() {
+                let expected = if at == 0 {
+                    0x2000 + sample
+                } else {
+                    0x1000 + at - 1
+                };
+                let row = frames.get(id - 1).unwrap();
+                assert!(row.contains(&format!("\"id\":{id},")));
+                assert!(row.contains(&format!("\"address\":{expected},")));
+            }
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn overview_is_a_bounded_ranked_entry_point_with_weighted_quality() {
         let root =
             std::env::temp_dir().join(format!("td-profiler-overview-test-{}", std::process::id()));
@@ -2368,6 +2720,7 @@ mod tests {
             b"original\n"
         );
         let manifest = std::fs::read_to_string(capture.join("regenerated/manifest.json")).unwrap();
+        assert!(manifest.starts_with("{\"schema\":2,"));
         assert!(manifest.contains("\"regenerated\":true"));
         assert!(manifest.contains("\"samples\":1"));
         assert!(manifest.contains("\"effective_rate_millihz\":1000"));
@@ -2376,8 +2729,8 @@ mod tests {
         let lines = std::fs::read_to_string(capture.join("regenerated/lines.jsonl")).unwrap();
         assert!(lines.contains("\"symbol_resolved\":false"));
         assert!(lines.contains("\"line_resolved\":false"));
-        let stacks = std::fs::read_to_string(capture.join("regenerated/stacks.jsonl")).unwrap();
-        assert!(stacks.contains(
+        let frames = std::fs::read_to_string(capture.join("regenerated/frames.jsonl")).unwrap();
+        assert!(frames.contains(
             "\"line_resolved\":false,\"source_file\":\"\",\"source_file_bytes\":\"\",\"source_line\":null"
         ));
         let overview = std::fs::read_to_string(capture.join("regenerated/overview.jsonl")).unwrap();
