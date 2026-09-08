@@ -2225,6 +2225,21 @@ control endpoint and preserve the original disk bytes. No editor Quit,
 Save or discard answer is sent. This covers normal headless owner-EOF
 shutdown with a live dirty client, not a kernel kill or hardware failure.
 
+A native conflict-recovery case externally changes an associated file
+while the editor holds different dirty text. Save must report its exact
+failed job and conflict question. Cancel and repeat Save must mint a fresh
+dialog; the old Reload answer and a premature Discard Reload both refuse.
+The current Reload answer only opens the second discard question and
+preserves exact dirty state/text and external disk bytes. Cancel there must
+also retire the dialog and preserve both versions. A third Save conflict
+must reject the cancelled discard answer before its own Reload question.
+Explicit Discard Reload must complete its revision-pinned job, retire the
+dialog, preserve tab identity, adopt exact clean replacement state/text,
+and show correlated
+`outside` pixels without overwriting the external file. This is completed
+ordinary conflict recovery, not cancellation during an in-flight read or
+an assertion about intermediate dialog pixels.
+
 The editor maps normally, then compositor fullscreen leaves an 800x576
 scale-one client beneath the 24-pixel desktop bar. Shift+A, released-Shift b
 and Windows Ctrl+Z / Emacs Ctrl+/ use real evdev-code routing, keymap and

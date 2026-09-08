@@ -404,6 +404,12 @@ A native display-loss case closes the owned compositor while the editor
 has dirty, pixel-verified text. The compositor exits normally; the editor
 must exit with failure, report Wayland loss, remove its control endpoint
 and leave the original file unchanged, without any editor Quit or Save.
+A native conflict case checks failed Save after an external file change,
+fresh dialog IDs after Cancel, stale and premature answer refusal, and
+the separate confirmation before discarding unsaved text. Cancel at either
+question preserves dirty text, and the cancelled discard cannot be replayed
+against a fresh conflict. Reload must produce exact clean state/text and
+correlated `outside` pixels while preserving the external file bytes.
 The vertical-wheel case checks forward and reverse detents against
 exact viewport rows and captured numbered-line pixels, with unchanged text,
 revision, selection, caret and disk bytes. The clipboard case uses two

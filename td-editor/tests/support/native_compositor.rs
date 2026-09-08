@@ -1182,6 +1182,104 @@ fn native_display_loss_preserves_unsaved_file_and_retires_control() {
 }
 
 #[test]
+#[ignore = "requires an explicitly built TD_TEST_COMPOSITOR; ready runs this case"]
+fn native_conflict_reload_requires_fresh_dialog_and_explicit_discard() {
+    let compositor_directory = Directory::new();
+    let directory = Directory::new();
+    let mut compositor = Compositor::start(&compositor_directory);
+    let file = directory.0.join("draft");
+    let dictionary = directory.0.join("dictionary");
+    std::fs::write(&file, b"original\n").unwrap();
+    std::fs::write(&dictionary, b"original\noutside\n").unwrap();
+    let display = compositor.directory.join("wayland-0");
+    let mut editor = EditorProcess::start(&directory, &display, &file, &dictionary);
+    editor.wait_keyboard("windows");
+    let window = compositor.window();
+    assert_eq!(compositor.request("fullscreen", 1024), b"ok\n");
+    editor.wait_field("state", "window", "800,576,1");
+    editor.rendered_at(800, 576);
+    editor.ok("insert\t1\t0\t0\t0\t78");
+    editor.wait_field("state", "tab", "1,1,1,10,1,1,0,72,0,lf");
+    editor.wait_tab(1, "xoriginal\n");
+    std::fs::write(&file, b"outside\n").unwrap();
+    let conflict = |process: &mut EditorProcess| {
+        let response = process.request("save\t1\t1").unwrap();
+        let job = response.strip_prefix("pending\t").expect(&response);
+        assert_eq!(
+            process.wait_job_outcome(job, ",error,unavailable"),
+            format!("job={job},save,1,1,0,error,unavailable")
+        );
+        let state = process.ok("state");
+        let dialog = field(&state, "dialog").unwrap();
+        let (id, rest) = dialog.split_once(',').unwrap();
+        assert_eq!(rest, "conflict,question,1,1,cancel+reload+save-as");
+        id.to_owned()
+    };
+    let first = conflict(&mut editor);
+    editor.ok(&format!("dialog-answer\t{first}\t1\t1\tcancel"));
+    editor.wait_field("state", "dialog", "-");
+    let second = conflict(&mut editor);
+    assert_ne!(first, second);
+    assert!(editor
+        .request(&format!("dialog-answer\t{first}\t1\t1\treload"))
+        .unwrap()
+        .starts_with("error\tinvalid-argument\t"));
+    assert!(editor
+        .request(&format!("dialog-answer\t{second}\t1\t1\tdiscard-reload"))
+        .unwrap()
+        .starts_with("error\tunavailable\t"));
+    assert_eq!(
+        editor.ok(&format!("dialog-answer\t{second}\t1\t1\treload")),
+        format!("dialog\t{second}")
+    );
+    editor.wait_field(
+        "state",
+        "dialog",
+        &format!("{second},conflict,discard,1,1,cancel+discard-reload"),
+    );
+    editor.wait_field("state", "tab", "1,1,1,10,1,1,0,72,0,lf");
+    editor.wait_tab(1, "xoriginal\n");
+    assert_eq!(std::fs::read(&file).unwrap(), b"outside\n");
+    editor.ok(&format!("dialog-answer\t{second}\t1\t1\tcancel"));
+    editor.wait_field("state", "dialog", "-");
+    editor.wait_field("state", "tab", "1,1,1,10,1,1,0,72,0,lf");
+    editor.wait_tab(1, "xoriginal\n");
+    assert_eq!(std::fs::read(&file).unwrap(), b"outside\n");
+    let third = conflict(&mut editor);
+    assert_ne!(third, first);
+    assert_ne!(third, second);
+    assert!(editor
+        .request(&format!("dialog-answer\t{second}\t1\t1\tdiscard-reload"))
+        .unwrap()
+        .starts_with("error\tinvalid-argument\t"));
+    assert_eq!(
+        editor.ok(&format!("dialog-answer\t{third}\t1\t1\treload")),
+        format!("dialog\t{third}")
+    );
+    editor.wait_field(
+        "state",
+        "dialog",
+        &format!("{third},conflict,discard,1,1,cancel+discard-reload"),
+    );
+    let before = compositor.observe(&window);
+    let response = editor
+        .request(&format!("dialog-answer\t{third}\t1\t1\tdiscard-reload"))
+        .unwrap();
+    let job = response.strip_prefix("pending\t").expect(&response);
+    assert_eq!(
+        editor.wait_job(job),
+        format!("job={job},reload,1,1,0,complete,-")
+    );
+    editor.wait_field("state", "dialog", "-");
+    editor.wait_field("state", "tab", "1,2,0,8,0,0,0,72,0,lf");
+    editor.wait_tab(2, "outside\n");
+    compositor.rendered_text(&mut editor, &window, 2, before, "outside", 0);
+    assert_eq!(std::fs::read(&file).unwrap(), b"outside\n");
+    editor.quit();
+    compositor.stop();
+}
+
+#[test]
 fn native_observation_and_capture_decoders_refuse_stale_or_truncated_evidence() {
     let session = "00000000000000000000000000000007";
     let reply = format!(

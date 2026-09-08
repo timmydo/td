@@ -591,16 +591,20 @@ impl EditorProcess {
         response.strip_prefix("ok\t").expect(&response).to_owned()
     }
     fn wait_job(&mut self, id: &str) -> String {
+        self.wait_job_outcome(id, ",complete,-")
+    }
+    fn wait_job_outcome(&mut self, id: &str, outcome: &str) -> String {
+        assert!(outcome.starts_with(','));
         let deadline = Instant::now() + TIMEOUT;
+        let prefix = format!("job={id},");
         loop {
             let state = self.ok("state");
-            let prefix = format!("job={id},");
             let job = state
                 .split('\t')
                 .find(|field| field.starts_with(&prefix))
                 .expect(&state);
             if !job.contains(",pending,") {
-                assert!(job.ends_with(",complete,-"), "{job}");
+                assert!(job.ends_with(outcome), "{job}");
                 return job.to_owned();
             }
             assert!(Instant::now() < deadline, "job deadline: {state}");
