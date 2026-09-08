@@ -9,7 +9,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, Mutex};
 
 const USAGE: &str = "headless requires --session-dir NEW_ABSOLUTE_PATH \
-    --width N --height N [--input-control enabled] [--capture-control enabled]; \
+    --width N --height N [--input-control enabled] [--capture-control enabled] \
+    [--clipboard-control enabled]; \
     keep stdin open for the session lifetime";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -39,16 +40,18 @@ struct Options {
     height: usize,
     input_control: bool,
     capture_control: bool,
+    clipboard_control: bool,
 }
 
 impl Options {
     fn parse(args: &[String]) -> Result<Self, String> {
-        if !matches!(args.len(), 6 | 8 | 10) {
+        if !matches!(args.len(), 6 | 8 | 10 | 12) {
             return Err(USAGE.into());
         }
         let (mut directory, mut width, mut height) = (None, None, None);
         let mut input_control = None;
         let mut capture_control = None;
+        let mut clipboard_control = None;
         for [flag, value] in args.as_chunks::<2>().0 {
             let slot = match flag.as_str() {
                 "--session-dir" => &mut directory,
@@ -56,6 +59,7 @@ impl Options {
                 "--height" => &mut height,
                 "--input-control" => &mut input_control,
                 "--capture-control" => &mut capture_control,
+                "--clipboard-control" => &mut clipboard_control,
                 _ => return Err(format!("unknown headless option {flag}; {USAGE}")),
             };
             if slot.replace(value.as_str()).is_some() {
@@ -86,6 +90,11 @@ impl Options {
             Some("enabled") => true,
             Some(_) => return Err("--capture-control accepts only 'enabled'".into()),
         };
+        let clipboard_control = match clipboard_control {
+            None => false,
+            Some("enabled") => true,
+            Some(_) => return Err("--clipboard-control accepts only 'enabled'".into()),
+        };
         if width
             .checked_mul(height)
             .and_then(|n| n.checked_mul(4))
@@ -99,6 +108,7 @@ impl Options {
             height,
             input_control,
             capture_control,
+            clipboard_control,
         })
     }
 }
@@ -271,6 +281,23 @@ fn owner_closed(input: &mut impl Read) -> Result<(), String> {
     }
 }
 
+pub(crate) fn clipboard_lifetime(
+    runtime: &Mutex<Runtime>, outcome: mpsc::Receiver<Result<(), String>>,
+) -> Result<(), String> {
+    loop {
+        match outcome.recv_timeout(std::time::Duration::from_millis(50)) {
+            Ok(result) => return result,
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err("headless lifecycle observers departed".into());
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                runtime.lock().map_err(|_| "headless runtime is poisoned")?
+                    .expire_clipboard_hold(std::time::Instant::now());
+            }
+        }
+    }
+}
+
 /// This is a process entry point, not an embeddable server. Returning retires
 /// all blocking client/listener workers through the immediate process exit.
 pub(crate) fn run(args: &[String], mut input: impl Read + Send + 'static) -> Result<(), String> {
@@ -281,6 +308,9 @@ pub(crate) fn run(args: &[String], mut input: impl Read + Send + 'static) -> Res
         let framebuffer =
             Framebuffer::headless(directory.output_file()?, options.width, options.height)?;
         let mut runtime = Runtime::headless(framebuffer, identity);
+        if options.clipboard_control {
+            runtime.enable_clipboard_control()?;
+        }
         runtime.repaint()?;
         let runtime = Arc::new(Mutex::new(runtime));
         let wayland = directory.bind("wayland-0")?;
@@ -293,7 +323,8 @@ pub(crate) fn run(args: &[String], mut input: impl Read + Send + 'static) -> Res
             ended.clone(),
         )?;
         control::serve_headless(
-            control, runtime, options.input_control, options.capture_control, ended.clone(),
+            control, Arc::clone(&runtime), options.input_control, options.capture_control,
+            ended.clone(),
         )?;
         let completion = Completion::new(ended, "owner");
         std::thread::Builder::new()
@@ -311,9 +342,11 @@ pub(crate) fn run(args: &[String], mut input: impl Read + Send + 'static) -> Res
         .and_then(|()| out.flush())
         .map_err(|error| format!("announce headless readiness: {error}"))?;
         drop(out);
-        outcome
-            .recv()
-            .map_err(|_| "headless lifecycle observers departed".to_string())?
+        if !options.clipboard_control {
+            return outcome.recv()
+                .map_err(|_| "headless lifecycle observers departed".to_string())?;
+        }
+        clipboard_lifetime(&runtime, outcome)
     })();
     let cleanup = directory.clean();
     match (result, cleanup) {
@@ -402,6 +435,26 @@ mod tests {
     }
 
     #[test]
+    fn clipboard_is_a_separate_explicit_startup_grant() {
+        let mut values = args("800", "600");
+        assert!(!Options::parse(&values).unwrap().clipboard_control);
+        values.extend(["--clipboard-control".into(), "enabled".into()]);
+        let options = Options::parse(&values).unwrap();
+        assert!(options.clipboard_control);
+        assert!(!options.input_control && !options.capture_control);
+        values.extend(["--input-control".into(), "enabled".into(),
+            "--capture-control".into(), "enabled".into()]);
+        let options = Options::parse(&values).unwrap();
+        assert!(options.clipboard_control && options.input_control && options.capture_control);
+        let mut values = args("800", "600");
+        values.extend(["--clipboard-control".into(), "true".into()]);
+        assert!(Options::parse(&values).is_err());
+        *values.last_mut().unwrap() = "enabled".into();
+        values.extend(["--clipboard-control".into(), "enabled".into()]);
+        assert!(Options::parse(&values).is_err());
+    }
+
+    #[test]
     fn lifetime_is_eof_not_an_unbounded_command_stream() {
         assert!(owner_closed(&mut &b""[..]).is_ok());
         assert!(owner_closed(&mut &b"quit\n"[..]).is_err());
@@ -450,6 +503,10 @@ mod tests {
         assert!(source.contains("server::serve_headless("));
         assert!(source.contains("control::serve_headless("));
         assert!(source.contains("Runtime::headless(framebuffer, identity)"));
+        let run = source.split_once("pub(crate) fn run(").unwrap().1;
+        assert!(run.contains("if options.clipboard_control {\n            runtime.enable_clipboard_control()?;"));
+        assert!(run.contains("if !options.clipboard_control {\n            return outcome.recv()"));
+        assert!(run.contains("clipboard_lifetime(&runtime, outcome)"));
         let identity = source.find("let identity = session_identity()?").unwrap();
         let paint = source.find("runtime.repaint()?").unwrap();
         let bind = source.find("directory.bind(\"wayland-0\")?").unwrap();

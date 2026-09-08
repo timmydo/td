@@ -73,7 +73,7 @@ fn usage() -> String {
      --application-content-rgb-a RGB --application-content-rgb-b RGB) \
      (--terminal-client PATH | --terminal-authority stdin) | \
      td-compositor headless --session-dir NEW_ABSOLUTE_PATH --width N --height N \
-     [--input-control enabled] [--capture-control enabled] | \
+     [--input-control enabled] [--capture-control enabled] [--clipboard-control enabled] | \
      td-compositor probe-terminal-authority | \
      td-compositor probe SOCKET | \
      td-compositor probe-application SOCKET ID RGB_A RGB_B [--quiet] | \

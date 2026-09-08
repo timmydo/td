@@ -6487,9 +6487,12 @@ boot release are removed when this consumer is activated.
 
 [AUTOMATION.md](AUTOMATION.md) specifies disposable hardware-free sessions,
 their lifecycle, opt-in normal seat routing, session-guarded input receipts,
-passive client-publication/completed-output observation and stamped public
-capture. This is the primary native integration
-platform; it does not replace independent compositor interoperability checks.
+passive client-publication/completed-output observation, stamped public
+capture, and separately enabled bounded clipboard-transfer holds. The hold
+routes an existing opaque transfer endpoint without reading payload bytes,
+adding syscalls, or weakening public Wayland admission. This is the primary
+native integration platform; it does not replace independent compositor
+interoperability checks.
 
 ## td-owned development VM bridge
 

@@ -396,6 +396,7 @@ pub struct Runtime {
     last_submission: Option<Submission>,
     headless_output: Option<crate::headless::OutputStamp>,
     headless_action: u64,
+    clipboard_control: Option<ClipboardControl>,
     /// Only live headless clients, with no retained event journal.
     headless_commits: BTreeMap<u64, ClientCommit>,
     layout: Arc<BTreeMap<SurfaceKey, ViewLayout>>,
@@ -464,6 +465,49 @@ pub struct Runtime {
 struct ClientCommit {
     number: u64,
     valid: bool,
+}
+
+#[derive(Default)]
+struct ClipboardControl {
+    number: u64,
+    hold: Option<ClipboardHold>,
+}
+
+struct ClipboardHold {
+    number: u64,
+    window: u64,
+    receiver: SurfaceKey,
+    source: DataSourceIdentity,
+    deadline: std::time::Instant,
+    stage: ClipboardStage,
+}
+
+enum ClipboardStage {
+    Armed,
+    Held { mime_type: String, file: TransferEndpoint },
+    Released,
+    Dropped,
+    Expired,
+    Invalidated,
+    Failed,
+}
+
+impl ClipboardStage {
+    fn word(&self) -> &'static str {
+        match self {
+            Self::Armed => "armed",
+            Self::Held { .. } => "held",
+            Self::Released => "released",
+            Self::Dropped => "dropped",
+            Self::Expired => "expired",
+            Self::Invalidated => "invalidated",
+            Self::Failed => "failed",
+        }
+    }
+
+    fn active(&self) -> bool {
+        matches!(self, Self::Armed | Self::Held { .. })
+    }
 }
 
 #[derive(Default)]
@@ -559,6 +603,7 @@ impl Runtime {
             last_submission: None,
             headless_output: None,
             headless_action: 0,
+            clipboard_control: None,
             headless_commits: BTreeMap::new(),
             layout: Arc::new(BTreeMap::new()),
             subscribers: BTreeMap::new(),
@@ -693,6 +738,130 @@ impl Runtime {
         let mut runtime = Self::new(framebuffer);
         runtime.headless_output = Some(crate::headless::OutputStamp { session, output: 0 });
         runtime
+    }
+
+    pub(crate) fn enable_clipboard_control(&mut self) -> Result<(), String> {
+        if self.headless_output.is_none() || self.attention_enabled
+            || self.scene.attention_visible() || self.clipboard_control.is_some()
+        {
+            return Err("clipboard control requires a fresh public headless runtime".into());
+        }
+        self.clipboard_control = Some(ClipboardControl::default());
+        Ok(())
+    }
+
+    fn admit_clipboard_control(&self, session: u128) -> Result<(), String> {
+        if self.clipboard_control.is_none() || self.attention_enabled
+            || self.scene.attention_visible()
+            || self.headless_output.is_none_or(|stamp| stamp.session != session)
+        {
+            return Err("clipboard control disabled or session unavailable".into());
+        }
+        Ok(())
+    }
+
+    fn invalidate_clipboard_hold(&mut self) {
+        if let Some(hold) = self.clipboard_control.as_mut().and_then(|c| c.hold.as_mut()) {
+            if hold.stage.active() {
+                hold.stage = ClipboardStage::Invalidated;
+            }
+        }
+    }
+
+    pub(crate) fn expire_clipboard_hold(&mut self, now: std::time::Instant) {
+        let Some(hold) = self.clipboard_control.as_ref().and_then(|c| c.hold.as_ref()) else {
+            return;
+        };
+        if !hold.stage.active() {
+            return;
+        }
+        let stage = if now >= hold.deadline {
+            ClipboardStage::Expired
+        } else if self.attention_enabled || self.scene.attention_visible()
+            || self.window_for_handle(hold.window) != Some(hold.receiver)
+            || self.keyboard.snapshot().focus != Some(hold.receiver)
+            || self.selection.as_ref().map(|s| s.identity) != Some(hold.source)
+        {
+            ClipboardStage::Invalidated
+        } else {
+            return;
+        };
+        if let Some(hold) = self.clipboard_control.as_mut().and_then(|c| c.hold.as_mut()) {
+            hold.stage = stage;
+        }
+    }
+
+    pub(crate) fn arm_clipboard_hold(&mut self, session: u128, window: u64) -> Result<String, String> {
+        self.admit_clipboard_control(session)?;
+        let now = std::time::Instant::now();
+        self.expire_clipboard_hold(now);
+        let receiver = self.window_for_handle(window).ok_or("clipboard receiver window is gone")?;
+        if self.keyboard.snapshot().focus != Some(receiver) {
+            return Err("clipboard receiver does not have keyboard focus".into());
+        }
+        let source = self.selection.as_ref().map(|s| s.identity)
+            .filter(|s| s.client != 0).ok_or("clipboard has no client selection")?;
+        let control = self.clipboard_control.as_mut().ok_or("clipboard control disabled")?;
+        if control.hold.as_ref().is_some_and(|hold| hold.stage.active()) {
+            return Err("clipboard hold is already active".into());
+        }
+        let number = control.number.checked_add(1).ok_or("clipboard hold identity exhausted")?;
+        let deadline = now.checked_add(std::time::Duration::from_secs(10))
+            .ok_or("clipboard hold deadline overflow")?;
+        control.number = number;
+        control.hold = Some(ClipboardHold {
+            number, window, receiver, source, deadline, stage: ClipboardStage::Armed,
+        });
+        self.clipboard_hold_record(session, number)
+    }
+
+    fn clipboard_hold_record(&self, session: u128, number: u64) -> Result<String, String> {
+        let hold = self.clipboard_control.as_ref().and_then(|c| c.hold.as_ref())
+            .filter(|hold| hold.number == number).ok_or("clipboard hold identity is not current")?;
+        Ok(format!(
+            "td-clipboard-v1 session={session:032x} hold={} window=@{} state={}\n",
+            hold.number, hold.window, hold.stage.word(),
+        ))
+    }
+
+    pub(crate) fn clipboard_hold(
+        &mut self, session: u128, number: u64, action: crate::control::ClipboardAction,
+    ) -> Result<String, String> {
+        use crate::control::ClipboardAction;
+        self.admit_clipboard_control(session)?;
+        // Check identity before even deadline cleanup: a stale command cannot
+        // consume a newer controller's descriptor.
+        self.clipboard_hold_record(session, number)?;
+        self.expire_clipboard_hold(std::time::Instant::now());
+        let hold = self.clipboard_control.as_mut().and_then(|c| c.hold.as_mut())
+            .ok_or("clipboard hold is unavailable")?;
+        match action {
+            ClipboardAction::Status => {}
+            ClipboardAction::Drop => {
+                if !hold.stage.active() {
+                    return Err("clipboard hold is no longer active".into());
+                }
+                hold.stage = ClipboardStage::Dropped;
+            }
+            ClipboardAction::Release => {
+                if !matches!(hold.stage, ClipboardStage::Held { .. }) {
+                    return Err("clipboard hold has no releasable transfer".into());
+                }
+                let source = hold.source;
+                let stage = std::mem::replace(&mut hold.stage, ClipboardStage::Failed);
+                if let ClipboardStage::Held { mime_type, file } = stage {
+                    let sent = self.queue_transfer_delivery(source.client,
+                        KeyboardDelivery::DataSourceSend { source, mime_type, file })?;
+                    if !sent {
+                        return Err("clipboard source unavailable or busy".into());
+                    }
+                    if let Some(hold) = self.clipboard_control.as_mut().and_then(|c| c.hold.as_mut()) {
+                        hold.stage = ClipboardStage::Released;
+                    }
+                }
+            }
+        }
+        self.clipboard_hold_record(session, number)
     }
 
     pub(crate) fn prepare_input_action(
@@ -1858,6 +2027,11 @@ impl Runtime {
     }
 
     pub fn remove_client(&mut self, client: u64) -> Result<(), String> {
+        if self.clipboard_control.as_ref().and_then(|c| c.hold.as_ref())
+            .is_some_and(|hold| hold.receiver.client == client || hold.source.client == client)
+        {
+            self.invalidate_clipboard_hold();
+        }
         self.forget_drag(|dragged| dragged.client == client);
         self.unregister_client_resources(client);
         if let Some(ready) = self.application_ready.as_mut() {
@@ -3590,6 +3764,7 @@ impl Runtime {
     }
 
     fn next_selection_revision(&mut self) -> Result<u64, String> {
+        self.invalidate_clipboard_hold();
         self.bump_vm_revision()?;
         self.selection_revision = self
             .selection_revision
@@ -3837,6 +4012,18 @@ impl Runtime {
         }
         if self.keyboard.snapshot().focus.map(|surface| surface.client) != Some(receiver) {
             return Ok(false);
+        }
+        self.expire_clipboard_hold(std::time::Instant::now());
+        if let Some(hold) = self.clipboard_control.as_mut().and_then(|c| c.hold.as_mut()) {
+            if hold.receiver.client == receiver && hold.source == source {
+                if matches!(hold.stage, ClipboardStage::Armed) {
+                    hold.stage = ClipboardStage::Held { mime_type, file };
+                    return Ok(true);
+                }
+                if matches!(hold.stage, ClipboardStage::Held { .. }) {
+                    return Ok(false);
+                }
+            }
         }
         if let Some((identity, bytes)) = &self.vm_text {
             if *identity == source {
@@ -4113,6 +4300,12 @@ impl Runtime {
     }
 
     fn publish_keyboard(&mut self, events: Vec<RoutedKeyboardEvent>) -> Result<(), String> {
+        if events.iter().any(|event| matches!(event.event,
+            crate::keyboard::KeyboardEvent::Leave { .. }
+                | crate::keyboard::KeyboardEvent::Enter { .. }))
+        {
+            self.invalidate_clipboard_hold();
+        }
         if !events.is_empty() { self.bump_vm_revision()?; }
         let leaving = events.iter().find_map(|event| match event.event {
             crate::keyboard::KeyboardEvent::Leave { surface } => Some(surface.client),
@@ -4870,6 +5063,222 @@ mod tests {
             .unwrap();
         runtime.flush_paint().unwrap();
         assert_eq!(runtime.last_submission(), Some(Submission::Presented));
+    }
+
+    fn clipboard_fixture() -> (Cleanup, Runtime, Receiver<KeyboardDelivery>, DataSourceIdentity, u64) {
+        let cleanup = Cleanup(std::env::temp_dir().join(format!(
+            "td-runtime-hold-{}-{}", std::process::id(), SEQ.fetch_add(1, Ordering::Relaxed),
+        )));
+        let mut runtime = Runtime::headless(
+            Framebuffer::test_file(&cleanup.0, 120, 80, 480).unwrap(), 7,
+        );
+        let (events, _) = runtime.subscribe_keyboard(1).unwrap().split();
+        let source_key = SurfaceKey { client: 1, object: 10 };
+        runtime.commit(source_key, surface([1, 2, 3, 0])).unwrap();
+        let source = DataSourceIdentity { client: 1, object: 20, generation: 1 };
+        runtime.set_selection(1, Some(SelectionSource {
+            identity: source, mime_types: Arc::new(vec!["text/plain".into()]),
+        })).unwrap().unwrap();
+        let receiver = SurfaceKey { client: 2, object: 30 };
+        runtime.commit(receiver, surface([4, 5, 6, 0])).unwrap();
+        runtime.control_focus(receiver).unwrap();
+        let window = runtime.scene.handle(receiver).unwrap();
+        while events.try_recv().is_ok() {}
+        (cleanup, runtime, events, source, window)
+    }
+
+    fn clipboard_endpoint() -> (std::os::unix::net::UnixStream, TransferEndpoint) {
+        let (reader, writer) = std::os::unix::net::UnixStream::pair().unwrap();
+        reader.set_nonblocking(true).unwrap();
+        (reader, TransferEndpoint::from_file(std::fs::File::from(
+            std::os::fd::OwnedFd::from(writer),
+        )))
+    }
+
+    #[test]
+    fn clipboard_hold_routes_one_exact_descriptor_only_on_release() {
+        use crate::control::ClipboardAction::{Drop, Release, Status};
+        use std::io::{Read, Write};
+        let (_cleanup, mut runtime, events, source, window) = clipboard_fixture();
+        // An ordinary headless session still routes immediately.
+        let (_reader, file) = clipboard_endpoint();
+        assert!(runtime.send_selection_data(2, source, "text/plain".into(), file).unwrap());
+        assert!(matches!(events.try_recv().unwrap(), KeyboardDelivery::DataSourceSend { .. }));
+        assert!(runtime.arm_clipboard_hold(7, window).is_err());
+        runtime.enable_clipboard_control().unwrap();
+        assert!(runtime.enable_clipboard_control().is_err());
+        let armed = runtime.arm_clipboard_hold(7, window).unwrap();
+        assert_eq!(armed, format!(
+            "td-clipboard-v1 session={:032x} hold=1 window=@{window} state=armed\n", 7,
+        ));
+        assert!(runtime.arm_clipboard_hold(7, window).is_err());
+        assert!(runtime.clipboard_hold(7, 1, Release).is_err());
+        let (mut reader, file) = clipboard_endpoint();
+        assert!(runtime.send_selection_data(2, source, "text/plain".into(), file).unwrap());
+        assert_eq!(events.try_recv().err(), Some(TryRecvError::Empty));
+        assert_eq!(reader.read(&mut [0]).unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
+        assert!(runtime.clipboard_hold(7, 1, Status).unwrap().ends_with("state=held\n"));
+        assert!(runtime.clipboard_hold(8, 1, Drop).is_err());
+        assert!(runtime.clipboard_hold(7, 2, Drop).is_err());
+        let (mut extra, file) = clipboard_endpoint();
+        assert!(!runtime.send_selection_data(2, source, "text/plain".into(), file).unwrap());
+        assert_eq!(extra.read(&mut [0]).unwrap(), 0);
+        assert!(runtime.clipboard_hold(7, 1, Release).unwrap().ends_with("state=released\n"));
+        let KeyboardDelivery::DataSourceSend { source: sent, mime_type, file } = events.try_recv().unwrap()
+            else { panic!("no source delivery") };
+        assert_eq!(sent, source);
+        assert_eq!(mime_type, "text/plain");
+        let mut writer = file.into_file();
+        writer.write_all(b"exact payload").unwrap();
+        drop(writer);
+        let mut bytes = Vec::new();
+        reader.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, b"exact payload");
+        assert!(runtime.clipboard_hold(7, 1, Release).is_err());
+        assert!(runtime.clipboard_hold(7, 1, Drop).is_err());
+        assert!(runtime.arm_clipboard_hold(7, window).unwrap().contains("hold=2 "));
+        assert!(runtime.clipboard_hold(7, 1, Status).is_err());
+        assert!(runtime.clipboard_hold(7, 2, Drop).unwrap().ends_with("state=dropped\n"));
+        runtime.clipboard_control.as_mut().unwrap().number = u64::MAX;
+        assert!(runtime.arm_clipboard_hold(7, window).is_err());
+        assert!(runtime.clipboard_hold(7, 2, Status).unwrap().ends_with("state=dropped\n"));
+    }
+
+    #[test]
+    fn clipboard_hold_drops_descriptors_on_expiry_invalidation_and_explicit_drop() {
+        use crate::control::ClipboardAction::{Drop, Release, Status};
+        use std::io::Read;
+        for cause in ["drop", "expiry", "focus", "selection", "source", "receiver", "attention"] {
+            let (_cleanup, mut runtime, _events, source, window) = clipboard_fixture();
+            runtime.enable_clipboard_control().unwrap();
+            runtime.arm_clipboard_hold(7, window).unwrap();
+            let (mut reader, file) = clipboard_endpoint();
+            assert!(runtime.send_selection_data(2, source, "text/plain".into(), file).unwrap());
+            match cause {
+                "drop" => { runtime.clipboard_hold(7, 1, Drop).unwrap(); }
+                "expiry" => {
+                    let deadline = runtime.clipboard_control.as_ref().unwrap().hold.as_ref().unwrap().deadline;
+                    runtime.expire_clipboard_hold(deadline);
+                }
+                "focus" => {
+                    runtime.control_focus(SurfaceKey { client: 1, object: 10 }).unwrap();
+                    runtime.control_focus(SurfaceKey { client: 2, object: 30 }).unwrap();
+                }
+                "selection" => { runtime.clear_selection(source, None).unwrap(); }
+                "source" => { runtime.remove_client(1).unwrap(); }
+                "receiver" => { runtime.remove_client(2).unwrap(); }
+                "attention" => {
+                    runtime.enable_attention(true);
+                    assert!(runtime.clipboard_hold(7, 1, Release).is_err());
+                    runtime.expire_clipboard_hold(std::time::Instant::now());
+                    runtime.enable_attention(false);
+                }
+                _ => panic!("unknown cause"),
+            }
+            assert_eq!(reader.read(&mut [0]).unwrap(), 0, "{cause}");
+            let state = match cause { "drop" => "dropped", "expiry" => "expired", _ => "invalidated" };
+            assert!(runtime.clipboard_hold(7, 1, Status).unwrap().ends_with(&format!("state={state}\n")));
+            assert!(runtime.clipboard_hold(7, 1, Release).is_err());
+        }
+    }
+
+    #[test]
+    fn clipboard_hold_refuses_wrong_authority_and_preserves_armed_state_on_invalid_receive() {
+        use crate::control::ClipboardAction::{Release, Status};
+        use std::io::Read;
+        let (_cleanup, mut runtime, _events, source, window) = clipboard_fixture();
+        runtime.headless_output = None;
+        assert!(runtime.enable_clipboard_control().is_err());
+        runtime.headless_output = Some(crate::headless::OutputStamp { session: 7, output: 0 });
+        runtime.enable_attention(true);
+        assert!(runtime.enable_clipboard_control().is_err());
+        runtime.enable_attention(false);
+        runtime.enable_clipboard_control().unwrap();
+        assert!(runtime.arm_clipboard_hold(8, window).is_err());
+        assert!(runtime.arm_clipboard_hold(7, u64::MAX).is_err());
+        let other = runtime.scene.handle(SurfaceKey { client: 1, object: 10 }).unwrap();
+        assert!(runtime.arm_clipboard_hold(7, other).is_err());
+        runtime.arm_clipboard_hold(7, window).unwrap();
+        for (receiver, source) in [(1, source), (2, DataSourceIdentity { generation: 2, ..source })] {
+            let (mut reader, file) = clipboard_endpoint();
+            assert!(!runtime.send_selection_data(receiver, source, "text/plain".into(), file).unwrap());
+            assert_eq!(reader.read(&mut [0]).unwrap(), 0);
+            assert!(runtime.clipboard_hold(7, 1, Status).unwrap().ends_with("state=armed\n"));
+        }
+        let (mut reader, file) = clipboard_endpoint();
+        runtime.send_selection_data(2, source, "text/plain".into(), file).unwrap();
+        runtime.unsubscribe_keyboard(1);
+        assert!(runtime.clipboard_hold(7, 1, Release).is_err());
+        assert_eq!(reader.read(&mut [0]).unwrap(), 0);
+        assert!(runtime.clipboard_hold(7, 1, Status).unwrap().ends_with("state=failed\n"));
+    }
+
+    #[test]
+    fn clipboard_hold_arm_expires_without_receive_or_status_and_cannot_be_revived() {
+        use crate::control::ClipboardAction::Status;
+        let (_cleanup, mut runtime, events, source, window) = clipboard_fixture();
+        runtime.enable_clipboard_control().unwrap();
+        runtime.arm_clipboard_hold(7, window).unwrap();
+        let deadline = runtime.clipboard_control.as_ref().unwrap().hold.as_ref().unwrap().deadline;
+        runtime.expire_clipboard_hold(deadline);
+        assert!(runtime.clipboard_hold(7, 1, Status).unwrap().ends_with("state=expired\n"));
+        let (_reader, file) = clipboard_endpoint();
+        assert!(runtime.send_selection_data(2, source, "text/plain".into(), file).unwrap());
+        assert!(matches!(events.try_recv().unwrap(), KeyboardDelivery::DataSourceSend { .. }));
+        assert!(runtime.arm_clipboard_hold(7, window).unwrap().contains("hold=2 "));
+        assert_eq!(runtime.clipboard_control.as_ref().unwrap().number, 2);
+    }
+
+    #[test]
+    fn clipboard_hold_same_client_surface_focus_aba_invalidates_armed_and_held() {
+        use crate::control::ClipboardAction::{Release, Status};
+        use std::io::Read;
+        for held in [false, true] {
+            let (_cleanup, mut runtime, events, source, window) = clipboard_fixture();
+            let original = SurfaceKey { client: 2, object: 30 };
+            let other = SurfaceKey { client: 2, object: 31 };
+            runtime.commit(other, surface([7, 8, 9, 0])).unwrap();
+            runtime.control_focus(original).unwrap();
+            runtime.enable_clipboard_control().unwrap();
+            runtime.arm_clipboard_hold(7, window).unwrap();
+            let (mut reader, file) = clipboard_endpoint();
+            if held {
+                assert!(runtime.send_selection_data(2, source, "text/plain".into(), file).unwrap());
+            } else {
+                drop(file);
+            }
+            let revision = runtime.selection_revision;
+            runtime.control_focus(other).unwrap();
+            runtime.control_focus(original).unwrap();
+            assert_eq!(runtime.selection_revision, revision, "same-client offers need no revision");
+            assert_eq!(reader.read(&mut [0]).unwrap(), 0);
+            assert!(runtime.clipboard_hold(7, 1, Status).unwrap().ends_with("state=invalidated\n"));
+            assert!(runtime.clipboard_hold(7, 1, Release).is_err());
+            assert!(!events.try_iter().any(|event| matches!(event, KeyboardDelivery::DataSourceSend { .. })));
+        }
+    }
+
+    #[test]
+    fn clipboard_hold_lifecycle_wait_closes_expired_endpoint_without_control_traffic() {
+        use std::io::Read;
+        let (_cleanup, mut runtime, _events, source, window) = clipboard_fixture();
+        runtime.enable_clipboard_control().unwrap();
+        runtime.arm_clipboard_hold(7, window).unwrap();
+        let (mut reader, file) = clipboard_endpoint();
+        runtime.send_selection_data(2, source, "text/plain".into(), file).unwrap();
+        runtime.clipboard_control.as_mut().unwrap().hold.as_mut().unwrap().deadline = std::time::Instant::now();
+        reader.set_nonblocking(false).unwrap();
+        reader.set_read_timeout(Some(std::time::Duration::from_secs(2))).unwrap();
+        let (ended, outcome) = mpsc::channel();
+        let peer = std::thread::spawn(move || {
+            let result = match reader.read(&mut [0]) {
+                Ok(0) => Ok(()),
+                other => Err(format!("lifecycle did not close held endpoint: {other:?}")),
+            };
+            ended.send(result).unwrap();
+        });
+        crate::headless::clipboard_lifetime(&Mutex::new(runtime), outcome).unwrap();
+        peer.join().unwrap();
     }
 
     #[test]

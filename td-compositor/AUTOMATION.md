@@ -352,6 +352,95 @@ Native editor tests must also assert the expected editor remote state and
 inspect the captured pixels. Input receipts, client publication, completed
 output and editor semantic state remain distinct pieces of evidence.
 
+## Opt-in clipboard transfer holds
+
+Append `--clipboard-control enabled` to headless startup to enable a bounded
+transfer scheduling control. It is independent of input and capture; neither
+of those grants implies it. Ordinary `run` sessions cannot enable it, and a
+trusted-attention-enabled or private-attention-visible runtime refuses every
+clipboard command. The public Wayland socket acquires no new requests or
+authority. This is a deterministic test barrier, not clipboard injection or a
+clipboard manager. It reads no payload bytes and never manufactures an input
+serial, offer, selection, source, or receive request.
+
+The private control endpoint and `td-ctl` accept:
+
+```text
+clipboard-arm <session> <@receiver-window>
+clipboard-status <session> <hold>
+clipboard-release <session> <hold>
+clipboard-drop <session> <hold>
+```
+
+Session syntax is the readiness record's exact 32-lowercase-hex nonce. Hold
+identities are positive canonical decimal u64 values. Arming requires the
+named live window itself to own keyboard focus and a current client-owned
+selection; compositor-owned VM selections are excluded. It pins that surface
+and source identity, allocates the next checked hold number, and starts one
+absolute ten-second monotonic deadline. The deadline does not restart when
+the transfer arrives or status is queried. Exhaustion refuses without wrapping.
+Only one armed/held record may exist; a new arm refuses while it is active.
+A later arm replaces the one terminal record. There is no history or queue.
+
+The next matching receive which passes the production offer, selection and
+focus checks moves its exact owned descriptor into the hold instead of
+queuing `wl_data_source.send`. No descriptor is duplicated and no bytes are
+read or buffered. A receive with stale source/focus does not consume the arm.
+While held, another receive for the same receiver/source is refused and its
+descriptor closed; unrelated receives retain normal handling. No source
+send is queued until explicit release. Release rechecks live window, focus,
+selection and deadline under the same runtime lock, then moves the descriptor
+through the existing bounded source-delivery queue. `released` means queue
+admission, not source receipt, EOF, successful paste, or application mutation.
+Queue refusal consumes/closes the descriptor and retains `failed` status;
+it cannot be retried. Source-side Wayland dispatch still validates the source
+object before sending its event.
+
+Selection revision changes and every surface-focus transition invalidate
+active holds, including transitions between surfaces owned by one client
+which do not change its selection offer. An ABA focus return cannot revive
+one. Either participating
+client's removal also invalidates it. A headless lifecycle tick checks expiry,
+live window/focus/selection and attention every 50 ms while this grant is
+enabled. It takes the runtime lock but never waits on transfer I/O. The tick
+interval is not a real-time cleanup guarantee: scheduling and runtime-lock
+work can delay it. Commands and receive interception also check expiry before
+using an active hold. Without this grant, the original blocking lifecycle wait
+is unchanged. Session exit closes any retained endpoint with the process.
+
+Drop closes a held descriptor or disarms an arm. Expiry and invalidation also
+close it; they never release it automatically. Closing an unwritten endpoint
+can produce ordinary EOF at the receiver, not a special cancellation event.
+To test editor cancellation, first observe `held` and editor `incoming=1`,
+send the native cancel action, and observe editor `incoming=0` before release.
+The source may then encounter a closed receiver normally. Large payloads and
+sleeps are not substitutes for this barrier.
+
+Success is `ok\n` followed by exactly one record in this field order:
+
+```text
+td-clipboard-v1 session=0123456789abcdef0123456789abcdef hold=1 window=@12 state=held
+```
+
+States are `armed`, `held`, `released`, `dropped`, `expired`, `invalidated`,
+or `failed`. Arm returns `armed`, release `released`, and drop `dropped`.
+If a deadline and invalid authority are observed together, expiry takes
+precedence; both states close the descriptor and forbid release. These are
+test scheduling results, not an attention audit trail.
+Status accepts the latest hold identity, including its terminal state. It
+does not forward or read data, but may discard an expired/invalid active hold.
+Repeated release/drop of a terminal hold refuses. Wrong session or hold
+identity refuses before altering that record, including deadline cleanup;
+the independent lifecycle tick may still expire it. All unavailable grants,
+stale identities and invalid transitions use `unavailable`; malformed syntax
+uses `error`. The CLI validates exact framing, canonical identities, expected
+session and hold (or receiver window for arm), and the command's allowed
+success state before printing. Replies have a 1,024-byte ceiling and one
+five-second post-connect read/write deadline. A lost response is not an
+idempotency receipt: do not blindly repeat arm/release/drop. Controllers must
+serialize their scenario; the one endpoint and hold belong to the session,
+not an individual control connection.
+
 ## Planned control and observation increments
 
 These are the next implementation requirements, not available commands:

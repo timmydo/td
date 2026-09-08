@@ -362,6 +362,34 @@ fn reusing_a_session_path_starts_a_new_capture_identity() {
 }
 
 #[test]
+fn clipboard_startup_grant_is_separate_and_owner_eof_still_reaps_session() {
+    let root = Root::new();
+    let session = root.0.join("session");
+    let mut command = headless(&session);
+    command.args(["--clipboard-control", "enabled"]);
+    let mut compositor = Process::start(
+        &mut command, &root.0.join("compositor.log"), "TD-COMPOSITOR-HEADLESS-READY",
+    );
+    let ready = compositor.ready();
+    let identity = ready_session(&ready);
+    let control = session.join("td-control");
+    assert_eq!(request(&control, format!("clipboard-arm {identity} @1\n").as_bytes()),
+        "unavailable clipboard receiver window is gone\n");
+    for verb in ["clipboard-arm", "clipboard-status", "clipboard-release", "clipboard-drop"] {
+        let argument = if verb == "clipboard-arm" { "@1" } else { "1" };
+        let (status, output) = query_cli_args(&control, &root.0, verb, &[verb, identity, argument]);
+        assert_eq!(status.code(), Some(1));
+        assert!(output.is_empty());
+    }
+    assert_eq!(request(&control, format!("key {identity} 1 30 down\n").as_bytes()),
+        "error input automation is disabled\n");
+    assert_eq!(request(&control, b"observe\n"), "error capture automation is disabled\n");
+    compositor.child.stdin.take();
+    assert!(compositor.wait().success());
+    assert!(!session.exists());
+}
+
+#[test]
 fn binary_capture_cli_requires_its_own_grant_and_captures_real_client_output() {
     let root = Root::new();
     for (input, capture_enabled) in [(false, false), (true, false), (false, true), (true, true)] {
@@ -381,6 +409,12 @@ fn binary_capture_cli_requires_its_own_grant_and_captures_real_client_output() {
         let ready = compositor.ready();
         let identity = ready_session(&ready);
         let control = session.join("td-control");
+        // Neither input nor capture grants clipboard scheduling authority.
+        for verb in ["clipboard-arm", "clipboard-status", "clipboard-release", "clipboard-drop"] {
+            let argument = if verb == "clipboard-arm" { "@1" } else { "1" };
+            assert_eq!(request(&control, format!("{verb} {identity} {argument}\n").as_bytes()),
+                "unavailable clipboard control disabled or session unavailable\n");
+        }
         if capture_enabled {
             let expected = format!("ok\ntd-output-v1 session={identity} output=1 current=yes\n");
             assert_eq!(request(&control, b"observe\n"), expected);

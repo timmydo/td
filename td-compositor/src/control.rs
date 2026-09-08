@@ -58,6 +58,23 @@ const MAX_ACCEPT_FAILURES: u32 = 64;
 const TITLE_LIMIT: usize = 200;
 const MAX_CAPTURE_BYTES: usize = crate::MAX_UI_FRAME_BYTES / 4 * 3 + 128;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ClipboardAction {
+    Status,
+    Release,
+    Drop,
+}
+
+impl ClipboardAction {
+    fn verb(self) -> &'static str {
+        match self {
+            Self::Status => "clipboard-status",
+            Self::Release => "clipboard-release",
+            Self::Drop => "clipboard-drop",
+        }
+    }
+}
+
 /// Layout orders share the keyboard's `Command` vocabulary. Synthetic key
 /// requests additionally require the headless input grant at dispatch.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -91,6 +108,8 @@ pub enum Request {
     Capture,
     Observe,
     ObserveClient { session: u128, window: u64 },
+    ClipboardArm { session: u128, window: u64 },
+    Clipboard { session: u128, hold: u64, action: ClipboardAction },
 }
 
 /// The vocabulary, as one list, so the parser and the help text cannot drift:
@@ -130,6 +149,10 @@ pub const USAGE: &[(&str, &str)] = &[
         "observe-client <session> <@id>",
         "report that live client's applied commit and output identities",
     ),
+    ("clipboard-arm <session> <@id>", "hold that focused receiver's next selection transfer"),
+    ("clipboard-status <session> <hold>", "report the current bounded clipboard hold"),
+    ("clipboard-release <session> <hold>", "forward the held descriptor to its original source"),
+    ("clipboard-drop <session> <hold>", "discard an armed or held clipboard transfer"),
 ];
 
 impl Request {
@@ -173,6 +196,22 @@ impl Request {
                 session: input_session(words.next())?,
                 window: window(words.next(), verb)?,
             },
+            "clipboard-arm" => Request::ClipboardArm {
+                session: input_session(words.next())?,
+                window: window(words.next(), verb)?,
+            },
+            "clipboard-status" | "clipboard-release" | "clipboard-drop" => Request::Clipboard {
+                session: input_session(words.next())?,
+                hold: words.next().and_then(parse_counter).filter(|n| *n > 0)
+                    .ok_or("clipboard hold must be a positive canonical u64")?,
+                action: if verb == "clipboard-status" {
+                    ClipboardAction::Status
+                } else if verb == "clipboard-release" {
+                    ClipboardAction::Release
+                } else {
+                    ClipboardAction::Drop
+                },
+            },
             other => return Err(format!("no such request '{other}'; try 'help'")),
         };
         // Refused rather than ignored: a caller spelling an argument this verb
@@ -211,6 +250,12 @@ impl Request {
             Request::Observe => "observe".into(),
             Request::ObserveClient { session, window } => {
                 format!("observe-client {session:032x} {}", handle_word(window))
+            }
+            Request::ClipboardArm { session, window } => {
+                format!("clipboard-arm {session:032x} {}", handle_word(window))
+            }
+            Request::Clipboard { session, hold, action } => {
+                format!("{} {session:032x} {hold}", action.verb())
             }
             Request::FocusWindow(handle) => format!("focus {}", handle_word(handle)),
             Request::SendWindow(handle, number) => {
@@ -716,6 +761,12 @@ pub(crate) fn reportable(character: char) -> bool {
 /// caller's lock, and written after it is released.
 pub fn apply(runtime: &mut Runtime, request: Request) -> Result<Answer, String> {
     let command = match request {
+        Request::ClipboardArm { session, window } => {
+            return runtime.arm_clipboard_hold(session, window).map(Answer::Report);
+        }
+        Request::Clipboard { session, hold, action } => {
+            return runtime.clipboard_hold(session, hold, action).map(Answer::Report);
+        }
         Request::Layout => return Ok(Answer::Report(report(&runtime.control_snapshot()))),
         Request::Capture | Request::Observe | Request::ObserveClient { .. } => {
             return Ok(Answer::CaptureDisabled);
@@ -1147,6 +1198,11 @@ fn write_answer(stream: &mut UnixStream, answer: &[u8], deadline: Instant) -> Re
 /// without reading the text — which is the whole reason the status is a line
 /// of its own rather than a word in front of the report.
 pub fn ask(path: &Path, request: Request) -> Result<String, ControlFailure> {
+    if matches!(request, Request::ClipboardArm { .. } | Request::Clipboard { .. }) {
+        let line = format!("{}\n", request.render());
+        let answer = ask_bounded(path, line.as_bytes(), REQUEST_LIMIT)?;
+        return decode_clipboard_record(&answer, request).map(str::to_string);
+    }
     if let Request::ObserveClient { session, window } = request {
         let line = format!("{}\n", request.render());
         let answer = ask_bounded(path, line.as_bytes(), REQUEST_LIMIT)?;
@@ -1244,6 +1300,50 @@ fn decode_observation(body: &str) -> Result<(), ControlFailure> {
         return Err(bad());
     }
     Ok(())
+}
+
+fn decode_clipboard_record(answer: &[u8], request: Request) -> Result<&str, ControlFailure> {
+    let bad = || ControlFailure::Unreachable("malformed clipboard hold reply".into());
+    if answer.len() > REQUEST_LIMIT {
+        return Err(bad());
+    }
+    let text = std::str::from_utf8(answer).map_err(|_| bad())?;
+    let Some(body) = text.strip_prefix("ok\n") else {
+        return split_answer(text, false).and_then(|_| Err(bad()));
+    };
+    let mut fields = body.strip_suffix('\n').ok_or_else(bad)?.split(' ');
+    if fields.next() != Some("td-clipboard-v1") {
+        return Err(bad());
+    }
+    let session = fields.next().and_then(|s| s.strip_prefix("session="))
+        .and_then(parse_session).ok_or_else(bad)?;
+    let hold = fields.next().and_then(|s| s.strip_prefix("hold="))
+        .and_then(parse_counter).filter(|n| *n > 0).ok_or_else(bad)?;
+    let window = fields.next().and_then(|s| s.strip_prefix("window="))
+        .and_then(|s| window(Some(s), "clipboard").ok()).ok_or_else(bad)?;
+    let state = fields.next().and_then(|s| s.strip_prefix("state=")).ok_or_else(bad)?;
+    if fields.next().is_some() || !matches!(state,
+        "armed" | "held" | "released" | "dropped" | "expired" | "invalidated" | "failed")
+    {
+        return Err(bad());
+    }
+    let matches_request = match request {
+        Request::ClipboardArm { session: expected, window: target } => {
+            session == expected && window == target && state == "armed"
+        }
+        Request::Clipboard { session: expected, hold: target, action } => {
+            session == expected && hold == target && match action {
+                ClipboardAction::Status => true,
+                ClipboardAction::Release => state == "released",
+                ClipboardAction::Drop => state == "dropped",
+            }
+        }
+        _ => false,
+    };
+    if !matches_request {
+        return Err(bad());
+    }
+    Ok(body)
 }
 
 fn decode_client_observation(
@@ -1644,6 +1744,56 @@ mod tests {
     }
 
     #[test]
+    fn clipboard_control_grammar_and_reply_identity_are_strict() {
+        let arm = Request::ClipboardArm { session: 7, window: 12 };
+        let reply = format!(
+            "ok\ntd-clipboard-v1 session={:032x} hold=1 window=@12 state=armed\n", 7,
+        );
+        assert_eq!(Request::parse(&arm.render()).unwrap(), arm);
+        assert_eq!(decode_clipboard_record(reply.as_bytes(), arm).unwrap(), &reply[3..]);
+        for end in 0..reply.len() {
+            assert!(decode_clipboard_record(&reply.as_bytes()[..end], arm).is_err());
+        }
+        for (from, to) in [
+            ("hold=1", "hold=0"), ("hold=1", "hold=01"),
+            ("hold=1", "hold=18446744073709551616"), ("hold=1", "hold=+1"),
+            ("window=@12", "window=@012"), ("window=@12", "window=@13"),
+            ("state=armed", "state=held"), ("state=armed", "state=unknown"),
+            (" state=", "  state="), ("\n", "\r\n"),
+            ("state=armed\n", "state=armed\n\n"),
+            ("session=00000000000000000000000000000007", "session=00000000000000000000000000000008"),
+        ] {
+            assert!(decode_clipboard_record(reply.replace(from, to).as_bytes(), arm).is_err());
+        }
+        assert!(decode_clipboard_record(&[b'x'; REQUEST_LIMIT + 1], arm).is_err());
+        assert!(decode_clipboard_record(b"ok\n", arm).is_err());
+        assert_eq!(decode_clipboard_record(b"unavailable disabled\n", arm),
+            Err(ControlFailure::Unreachable("disabled".into())));
+        for action in [ClipboardAction::Status, ClipboardAction::Release, ClipboardAction::Drop] {
+            let request = Request::Clipboard { session: 7, hold: 1, action };
+            assert_eq!(Request::parse(&request.render()).unwrap(), request);
+            for state in ["armed", "held", "released", "dropped", "expired", "invalidated", "failed"] {
+                let reply = reply.replace("state=armed", &format!("state={state}"));
+                let valid = action == ClipboardAction::Status
+                    || (action == ClipboardAction::Release && state == "released")
+                    || (action == ClipboardAction::Drop && state == "dropped");
+                assert_eq!(decode_clipboard_record(reply.as_bytes(), request).is_ok(), valid);
+                assert!(decode_clipboard_record(reply.replace("hold=1", "hold=2").as_bytes(), request).is_err());
+            }
+            for id in ["0", "01", "+1", "-1", "18446744073709551616", "1 extra"] {
+                assert!(Request::parse(&format!("{} {:032x} {id}", action.verb(), 7)).is_err());
+            }
+        }
+        for line in ["clipboard-arm", "clipboard-arm 7 @12",
+            "clipboard-arm 00000000000000000000000000000007 @0",
+            "clipboard-arm 00000000000000000000000000000007 @12 extra",
+            "clipboard-status", "clipboard-release", "clipboard-drop"]
+        {
+            assert!(Request::parse(line).is_err());
+        }
+    }
+
+    #[test]
     fn client_observation_grammar_is_exact_bounded_and_generation_guarded() {
         let reply = format!(
             "ok\ntd-client-v1 session={:032x} window=@12 client=5 commit=8 output=9 current=yes\n", 7,
@@ -1803,6 +1953,7 @@ mod tests {
         match inner {
             "session" => format!("{:032x}", 7),
             "1-9" => "1".to_string(),
+            "hold" => "1".to_string(),
             "time-ms" => "0".to_string(),
             "1-247" => "30".to_string(),
             "x" | "y" | "buttons" | "vertical" | "horizontal" => "0".to_string(),
