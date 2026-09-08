@@ -81,6 +81,16 @@ impl Session {
                 scale: u8::try_from(number(scale)?).map_err(|_| Error::InvalidArgument)?,
             })?),
             ("focus", [value]) => reply(self.ui.dispatch(Event::Focus(boolean(value)?))?),
+            ("set-line-numbers", [tab, rev, value]) => {
+                let tab = number(tab)?;
+                if self.ui.editor().document(tab)?.revision() != number(rev)? {
+                    return Err(Error::StaleRevision);
+                }
+                if self.ui.editor().active() != Some(tab) {
+                    return Err(Error::InvalidArgument);
+                }
+                reply(self.ui.dispatch(Event::LineNumbers(boolean(value)?))?)
+            }
             ("tick", [now]) => reply(self.ui.dispatch(Event::Tick(number(now)?))?),
             ("set-soft-wrap", [tab, rev, value]) => reply(self.ui.dispatch(Event::Wrap {
                 tab: number(tab)?,

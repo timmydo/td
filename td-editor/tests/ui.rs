@@ -13,6 +13,8 @@ use td_editor::{font, replay, Error};
 
 fn loaded(text: &str) -> Controller {
     let mut ui = Controller::default();
+    // These legacy geometry fixtures exercise the optional gutter-off layout.
+    ui.dispatch(Event::LineNumbers(false)).unwrap();
     ui.dispatch(Event::Load(text.as_bytes())).unwrap();
     ui
 }
@@ -74,6 +76,210 @@ fn pixels(ui: &Controller) -> Vec<u8> {
         .paint(&ui.scene(&[]).unwrap(), geometry.bounds())
         .unwrap();
     pixels
+}
+
+#[test]
+fn line_numbers_default_toggle_digit_growth_and_hits_share_geometry() {
+    for scale in 1..=4 {
+        let mut ui = Controller::default();
+        assert!(ui.line_numbers());
+        ui.dispatch(Event::Load(b"abc\ndef\n")).unwrap();
+        resize(&mut ui, 320 * scale, 240 * scale, scale as u8);
+        assert_eq!(ui.geometry().gutter().width, (24 * scale) as u32);
+        assert_eq!(ui.geometry().document().x, (32 * scale) as i64);
+        let before = format!("{:?}", ui.editor());
+        assert_eq!(
+            pointer(
+                &mut ui,
+                PointerPhase::Press,
+                (16 * scale) as i64,
+                (48 * scale) as i64,
+                false
+            ),
+            Outcome::Ignored
+        );
+        assert_eq!(format!("{:?}", ui.editor()), before);
+        pointer(
+            &mut ui,
+            PointerPhase::Press,
+            (40 * scale) as i64,
+            (48 * scale) as i64,
+            false,
+        );
+        assert_eq!(selection(&ui).caret, 1);
+        let before = format!("{:?}", ui.editor());
+        let columns = ui.geometry().grid().0;
+        ui.dispatch(Event::LineNumbers(false)).unwrap();
+        assert_eq!(ui.geometry().grid().0, columns + 3);
+        assert_eq!(format!("{:?}", ui.editor()), before);
+        let generation = ui.generation();
+        assert_eq!(
+            ui.dispatch(Event::LineNumbers(false)).unwrap(),
+            Outcome::Ignored
+        );
+        assert_eq!(ui.generation(), generation);
+        ui.dispatch(Event::LineNumbers(true)).unwrap();
+        assert_eq!(format!("{:?}", ui.editor()), before);
+        ui.dispatch(Event::Load("\n".repeat(98).as_bytes()))
+            .unwrap();
+        assert_eq!(ui.geometry().gutter().width, (24 * scale) as u32);
+        edit(&mut ui, Command::Insert("\n".into()));
+        assert_eq!(ui.geometry().gutter().width, (32 * scale) as u32);
+        ui.dispatch(Event::SelectTab(1)).unwrap();
+        assert_eq!(ui.geometry().gutter().width, (24 * scale) as u32);
+        ui.dispatch(Event::SelectTab(2)).unwrap();
+        assert_eq!(ui.geometry().gutter().width, (32 * scale) as u32);
+        key(&mut ui, "C-Tab");
+        assert_eq!(ui.editor().active(), Some(1));
+        assert_eq!(ui.geometry().gutter().width, (24 * scale) as u32);
+        key(&mut ui, "C-S-Tab");
+        assert_eq!(ui.editor().active(), Some(2));
+        assert_eq!(ui.geometry().gutter().width, (32 * scale) as u32);
+        let first = ui.geometry().tab(0, 1, 2).unwrap();
+        pointer(
+            &mut ui,
+            PointerPhase::Press,
+            first.x + 1,
+            first.y + 1,
+            false,
+        );
+        assert_eq!(ui.editor().active(), Some(1));
+        assert_eq!(ui.geometry().gutter().width, (24 * scale) as u32);
+        let second = ui.geometry().tab(1, 0, 2).unwrap();
+        pointer(
+            &mut ui,
+            PointerPhase::Press,
+            second.x + 1,
+            second.y + 1,
+            false,
+        );
+        assert_eq!(ui.editor().active(), Some(2));
+        assert_eq!(ui.geometry().gutter().width, (32 * scale) as u32);
+        assert_eq!(
+            ui.geometry().grid(),
+            ui.tab_view(2).unwrap().viewport.dimensions()
+        );
+        edit(&mut ui, Command::Undo);
+        assert_eq!(ui.geometry().gutter().width, (24 * scale) as u32);
+        ui.dispatch(Event::SelectTab(1)).unwrap();
+        assert!(ui.line_numbers());
+        assert_eq!(ui.geometry().grid().0, columns);
+        resize(&mut ui, 1, 1, scale as u8);
+        assert_eq!(ui.geometry().document().width, 0);
+        assert_eq!(pixels(&ui).len(), 4);
+    }
+}
+
+#[test]
+fn line_number_glyphs_skip_wrapped_rows_and_partial_damage_matches_full_frame() {
+    use td_editor::render::{Draw, Primitive, Rect, LINE_NUMBER};
+    for scale in 1..=4 {
+        let mut ui = Controller::default();
+        ui.dispatch(Event::Load(b"abcde\nx\n")).unwrap();
+        resize(&mut ui, 72 * scale, 168 * scale, scale as u8); // Four text cells.
+        let mut numbers = Vec::new();
+        ui.scene(&[])
+            .unwrap()
+            .emit(ui.geometry().bounds(), &mut |draw: Draw| {
+                if let Primitive::Glyph {
+                    x,
+                    y,
+                    scalar,
+                    style,
+                } = draw.primitive
+                {
+                    if style.ink == LINE_NUMBER {
+                        numbers.push((x, y, scalar));
+                    }
+                }
+            });
+        assert_eq!(
+            numbers,
+            vec![
+                (16 * scale as i64, 48 * scale as i64, '1'),
+                (16 * scale as i64, 80 * scale as i64, '2'),
+                (16 * scale as i64, 96 * scale as i64, '3')
+            ]
+        );
+        let full = pixels(&ui);
+        let geometry = ui.geometry();
+        let (width, height) = geometry.dimensions();
+        let font = font::pinned().unwrap();
+        let mut tiled = vec![0; full.len()];
+        let mut raster = Raster::new(&mut tiled, &font, geometry, width * 4).unwrap();
+        for x in (0..width).step_by(13) {
+            raster
+                .paint(
+                    &ui.scene(&[]).unwrap(),
+                    Rect {
+                        x: x as i64,
+                        y: 0,
+                        width: 13,
+                        height: height as u32,
+                    },
+                )
+                .unwrap();
+        }
+        assert_eq!(tiled, full);
+        resize(&mut ui, 72 * scale, 104 * scale, scale as u8);
+        ui.dispatch(Event::Scroll {
+            tab: 1,
+            revision: 0,
+            rows: 1,
+            columns: 0,
+        })
+        .unwrap();
+        assert_eq!(ui.tab_view(1).unwrap().viewport.origin().row, 1);
+        numbers.clear();
+        ui.scene(&[])
+            .unwrap()
+            .emit(ui.geometry().bounds(), &mut |draw: Draw| {
+                if let Primitive::Glyph {
+                    x,
+                    y,
+                    scalar,
+                    style,
+                } = draw.primitive
+                {
+                    if style.ink == LINE_NUMBER {
+                        numbers.push((x, y, scalar));
+                    }
+                }
+            });
+        assert_eq!(numbers, vec![(16 * scale as i64, 64 * scale as i64, '2')]);
+        ui.dispatch(Event::Wrap {
+            tab: 1,
+            revision: 0,
+            enabled: false,
+        })
+        .unwrap();
+        ui.dispatch(Event::Scroll {
+            tab: 1,
+            revision: 0,
+            rows: 0,
+            columns: 1,
+        })
+        .unwrap();
+        assert_eq!(ui.tab_view(1).unwrap().viewport.origin().column, 1);
+        numbers.clear();
+        ui.scene(&[])
+            .unwrap()
+            .emit(ui.geometry().bounds(), &mut |draw: Draw| {
+                if let Primitive::Glyph {
+                    x,
+                    y,
+                    scalar,
+                    style,
+                } = draw.primitive
+                {
+                    if style.ink == LINE_NUMBER {
+                        numbers.push((x, y, scalar));
+                    }
+                }
+            });
+        assert_eq!(numbers.first().unwrap().0, 16 * scale as i64);
+        assert_eq!(ui.editor().document(1).unwrap().revision(), 0);
+    }
 }
 
 #[test]

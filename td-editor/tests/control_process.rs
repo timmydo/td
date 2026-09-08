@@ -453,6 +453,13 @@ struct EditorProcess {
     next: u64,
 }
 impl EditorProcess {
+    fn legacy_keyboard(&mut self, profile: &str) -> String {
+        self.wait_keyboard(profile);
+        // Existing fixed-coordinate native oracles explicitly use gutter-off.
+        self.ok("set-line-numbers\t1\t0\t0");
+        self.wait_field("state", "line-numbers", "0");
+        self.ok("state")
+    }
     fn wait_field(&mut self, request: &str, name: &str, expected: &str) {
         let deadline = Instant::now() + TIMEOUT;
         loop {

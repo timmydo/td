@@ -910,6 +910,7 @@ byte offsets, not scalar indices or a sorted range.
 | `1 ID set-fill-column TAB REVISION COLUMN` | Set this tab's fill column, 20..=240. |
 | `1 ID go-to-line TAB REVISION LINE` | Collapse selection at the start of the one-based logical line. |
 | `1 ID set-key-profile TAB REVISION PROFILE` | Set the whole window's key profile to `windows` or `emacs`. |
+| `1 ID set-line-numbers TAB REVISION ENABLED` | Set the whole window's logical-line gutter; exactly `0` or `1`, default `1`. |
 | `1 ID find TAB REVISION EXPECTED_ANCHOR EXPECTED_CARET HEX_NEEDLE BACKWARD WRAP` | Find a literal match from the expected selection; flags are exactly `0` or `1`. |
 | `1 ID replace TAB REVISION HEX_NEEDLE HEX_REPLACEMENT` | Replace all nonoverlapping literal matches in the whole active document. |
 
@@ -1229,7 +1230,8 @@ Success begins `1 ID ok` followed by these tab-separated fields, in order:
 2. One `tab=ID,REV,DIRTY,BYTES,ANCHOR,CARET,AUTO_FILL,FILL_COLUMN,BOM,ENDING`
    for each open tab in ascending ID order. Flags are `0|1`; `ENDING` is
    `lf|crlf`. Selection endpoints are directed UTF-8 byte offsets.
-3. `generation=N`, `window=WIDTH,HEIGHT,SCALE`, `focus=0|1`.
+3. `generation=N`, `window=WIDTH,HEIGHT,SCALE`, `focus=0|1`,
+   `line-numbers=0|1` (window-wide, on by default).
 4. One `view=ID,ROW,COLUMN,COLUMNS,ROWS,WRAP,AFFINITY,DESIRED_COLUMN` per tab
    in ascending ID order. `AFFINITY` is `upstream|downstream`; an absent
    desired column is `-`. View coordinates are the existing controller's

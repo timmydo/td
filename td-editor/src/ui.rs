@@ -55,6 +55,7 @@ pub enum Event<'a> {
         scale: u8,
     },
     Profile(Profile),
+    LineNumbers(bool),
     Wrap {
         tab: TabId,
         revision: u64,
@@ -113,6 +114,8 @@ pub struct Controller {
     keys: Keymap,
     tabs: BTreeMap<TabId, TabView>,
     geometry: Geometry,
+    line_numbers: bool,
+    line_count: Option<(TabId, u64, usize)>,
     mark: Option<TabId>,
     drag: Option<(TabId, usize)>,
     focused: bool,
@@ -128,7 +131,9 @@ impl Default for Controller {
             editor: Editor::default(),
             keys: Keymap::default(),
             tabs: BTreeMap::new(),
-            geometry: Geometry::default(),
+            geometry: Geometry::default().with_line_numbers(Some(1)),
+            line_numbers: true,
+            line_count: None,
             mark: None,
             drag: None,
             focused: true,
@@ -149,6 +154,9 @@ impl Controller {
     }
     pub fn geometry(&self) -> Geometry {
         self.geometry
+    }
+    pub fn line_numbers(&self) -> bool {
+        self.line_numbers
     }
     pub fn generation(&self) -> u64 {
         self.generation
@@ -226,6 +234,25 @@ impl Controller {
     // Thus these checked constructors cannot reject an admitted controller
     // state. Cache metrics by revision, wrap mode and full-cell width.
     fn refresh(&mut self, reveal: Option<TabId>) -> Result<()> {
+        let lines = if !self.line_numbers {
+            1
+        } else if let Some(tab) = self.editor.active() {
+            let doc = self.editor.document(tab)?;
+            if !self
+                .line_count
+                .is_some_and(|(id, rev, _)| id == tab && rev == doc.revision())
+            {
+                let count = doc.text().bytes().filter(|b| *b == b'\n').count() + 1;
+                self.line_count = Some((tab, doc.revision(), count));
+            }
+            self.line_count.map_or(1, |(_, _, count)| count)
+        } else {
+            self.line_count = None;
+            1
+        };
+        self.geometry = self
+            .geometry
+            .with_line_numbers(self.line_numbers.then_some(lines));
         let (columns, rows) = self.geometry.grid();
         let columns = columns.max(1);
         let rows = rows.max(1);
@@ -313,6 +340,7 @@ impl Controller {
             Event::SelectTab(id) => {
                 self.editor.select_tab(id)?;
                 self.reset_input();
+                self.refresh(None)?;
                 self.wake_caret();
                 Ok(Outcome::Changed)
             }
@@ -353,7 +381,9 @@ impl Controller {
                 scale,
             } => {
                 let geometry = Geometry::new(width, height, Scale::new(scale)?)?;
-                if geometry == self.geometry {
+                if geometry.dimensions() == self.geometry.dimensions()
+                    && geometry.scale() == self.geometry.scale()
+                {
                     return Ok(Outcome::Ignored);
                 }
                 self.geometry = geometry;
@@ -364,6 +394,15 @@ impl Controller {
             Event::Profile(profile) => {
                 self.reset_input();
                 self.keys.set_profile(profile);
+                Ok(Outcome::Changed)
+            }
+            Event::LineNumbers(enabled) => {
+                if self.line_numbers == enabled {
+                    return Ok(Outcome::Ignored);
+                }
+                self.line_numbers = enabled;
+                self.reset_input();
+                self.refresh(self.editor.active())?;
                 Ok(Outcome::Changed)
             }
             Event::Wrap {
@@ -490,6 +529,7 @@ impl Controller {
             }
             Action::NextTab(backward) => {
                 self.editor.next_tab(backward)?;
+                self.refresh(None)?;
                 self.mark = None;
                 keys.reset();
                 Outcome::Changed
@@ -638,6 +678,7 @@ impl Controller {
                     });
                 }
                 self.editor.select_tab(id)?;
+                self.refresh(None)?;
                 self.wake_caret();
                 return Ok(Outcome::Changed);
             }

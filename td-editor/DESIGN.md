@@ -589,6 +589,35 @@ edits stay dirty. Exact disk, tab/text, historical job and correlated pixel
 checks precede ordinary explicit save/teardown. Kernel-stalled I/O and the
 queued-before-handoff Save race remain outside these process cases.
 
+## Line-number display
+
+Line numbers are on by default, a window-wide view preference shared by all
+tabs for the lifetime of the process. Format > Line Numbers toggles it in
+either key profile; `display-line-numbers-mode` is the named command. No
+preference persistence or startup flag is implemented in this increment.
+Native control and replay accept `set-line-numbers TAB REVISION 0|1` for the
+active revision-checked tab, and state reports `line-numbers=0|1`.
+
+The gutter numbers one-based logical lines, including the empty final line
+after a newline. A soft-wrapped continuation has no repeated number, even
+when it is the first visible row. The gutter stays fixed during horizontal
+scrolling. Its width is the active document's decimal line-count width,
+with at least two digit cells plus one blank separator cell. Numbers are
+right-aligned medium-weight Unifont in muted warm gray on the paper color.
+The ordinary left margin remains eight unscaled pixels. Gutter and text
+have disjoint clips, including for partial repaints and tiny windows.
+
+Text layout, caret, wrapping, horizontal scrolling and pointer hit testing
+all use the remaining document rectangle. Gutter presses do not select
+text; an existing drag into the gutter clamps at the text edge. Toggling
+cancels pending input and reflows/reveals the active caret without changing
+text, selection, revision, dirty state, spelling marks or history. Repeating
+the current setting is a controller no-op; native admission retains its
+usual input-cancellation/redraw semantics. Switching tabs or crossing a
+decimal digit boundary can change the shared viewport width. Counts are
+cached by active tab identity and text revision, not rescanned on scrolling.
+When the gutter is disabled, edits do not scan for a new line count.
+
 ## Paragraph filling
 
 Auto Fill and Fill Paragraph insert real line breaks; soft wrapping only
@@ -857,8 +886,9 @@ exemption with target-artifact coverage, as specified below.
 
 Chrome dimensions below are logical pixels multiplied by the frame scale.
 The menu occupies the first 24 pixels, the tab strip the next 24, and the
-status strip the bottom 24. Document content starts at (8, 48), has eight
-pixels of right margin, and uses only full 8x16 cells. Tabs are 160 pixels
+status strip the bottom 24. The gutter starts at (8, 48); document text
+starts immediately after it, or at (8, 48) when disabled. Text has eight
+pixels of right margin and uses only full 8x16 cells. Tabs are 160 pixels
 wide with 24 pixels reserved for the close mark. A contiguous slice of tabs
 is shown, keeping the active tab visible; a surface narrower than one tab
 clips that tab. Tiny surfaces may have no document cells; status paints last
@@ -1876,6 +1906,7 @@ The closed registry is exactly:
 | Name | Existing action |
 | --- | --- |
 | `auto-fill-mode` | Toggle the active tab's Auto Fill. |
+| `display-line-numbers-mode` | Toggle the whole window's line-number gutter. |
 | `fill-paragraph` | Fill its current paragraph. |
 | `goto-line` | Open Go To Line. |
 | `ispell-buffer` | Check the whole active document on demand. |
@@ -1913,11 +1944,11 @@ suppression, focus pause and pointer blocking match Go To Line. There is no
 new direct key binding. Fill Column follows Fill Paragraph, before the
 spelling commands. The larger Edit menu follows its current item-count
 minimum under the native menu contract.
-Format itself now requires 320 by 240 pixels at scale 1, up from 320 by 216;
+Format requires 320 by 264 pixels at scale 1 with Line Numbers appended;
 multiply both axes by the integer scale. At smaller heights its entire popup
 is refused with the existing enlargement notice. F6 and F7 remain available
-without their menus, but Fill Column and other menu-only actions require
-enlarging the window.
+without their menus. Named commands also remain available without a
+fitting menu, including Fill Column and Line Numbers.
 
 The fill-column prompt additionally captures the original fill setting,
 since setting changes do not advance text revision. A changed setting at
@@ -2674,7 +2705,8 @@ Version 1 exposes `state`, `clipboard-state`, `prompt-state`,
 `prompt-answer`, `text`, `new`,
 `open`, `select-tab`, `select-range`, `insert`, `delete`, `undo`, `redo`,
 `find`, `go-to-line`, `replace`, `fill-paragraph`,
-`set-auto-fill`, `set-fill-column`, `set-key-profile`, `check-spelling`,
+`set-auto-fill`, `set-fill-column`, `set-key-profile`, `set-line-numbers`,
+`check-spelling`,
 `spelling-results`, `save`, `save-as`, `close-tab`, `quit`, `dialog-answer`,
 `key`, `pointer`, `wheel`, and `wait-frame`. Text mutations and close requests
 name a stable tab ID and expected revision. Stale commands return

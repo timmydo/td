@@ -491,6 +491,7 @@ pub enum Edit {
     FillColumn(usize),
     GoToLine(usize),
     Profile(crate::keys::Profile),
+    LineNumbers(bool),
     Find {
         expected: Selection,
         needle: String,
@@ -524,6 +525,7 @@ impl std::fmt::Debug for Edit {
             Self::FillColumn(value) => f.debug_tuple("FillColumn").field(value).finish(),
             Self::GoToLine(value) => f.debug_tuple("GoToLine").field(value).finish(),
             Self::Profile(value) => f.debug_tuple("Profile").field(value).finish(),
+            Self::LineNumbers(value) => f.debug_tuple("LineNumbers").field(value).finish(),
             Self::Find {
                 expected,
                 needle,
@@ -695,7 +697,7 @@ impl Request {
                 },
                 "select-tab" | "select-range" | "insert" | "delete" | "undo" | "redo"
                 | "fill-paragraph" | "set-auto-fill" | "set-fill-column" | "go-to-line"
-                | "set-key-profile" | "find" | "replace" => {
+                | "set-key-profile" | "set-line-numbers" | "find" | "replace" => {
                     let tab = decimal(args.next().ok_or(Error::Protocol)?)?;
                     let revision = decimal(args.next().ok_or(Error::Protocol)?)?;
                     let mut selection = || -> Result<Selection> {
@@ -728,6 +730,9 @@ impl Request {
                             Edit::FillColumn(size(args.next().ok_or(Error::Protocol)?)?)
                         }
                         "go-to-line" => Edit::GoToLine(size(args.next().ok_or(Error::Protocol)?)?),
+                        "set-line-numbers" => {
+                            Edit::LineNumbers(boolean(args.next().ok_or(Error::Protocol)?)?)
+                        }
                         "set-key-profile" => {
                             Edit::Profile(match args.next().ok_or(Error::Protocol)? {
                                 "windows" => crate::keys::Profile::Windows,
@@ -938,6 +943,10 @@ impl Request {
             ui.dispatch(Event::Profile(*profile))?;
             return Ok(());
         }
+        if let Edit::LineNumbers(enabled) = edit {
+            ui.dispatch(Event::LineNumbers(*enabled))?;
+            return Ok(());
+        }
         if let Edit::Insert { expected, .. }
         | Edit::Delete { expected }
         | Edit::FillParagraph { expected }
@@ -949,7 +958,9 @@ impl Request {
         }
         let command = match edit {
             // Exhaustiveness for variants already dispatched above; never panic.
-            Edit::SelectTab | Edit::Profile(_) => return Err(Error::InvalidArgument),
+            Edit::SelectTab | Edit::Profile(_) | Edit::LineNumbers(_) => {
+                return Err(Error::InvalidArgument)
+            }
             Edit::SelectRange(selection) => Command::Select(*selection),
             Edit::Insert { text, .. } => {
                 // Public requests can also be constructed without the parser.
@@ -1184,10 +1195,11 @@ pub(crate) fn state(ui: &Controller) -> Result<String> {
     }
     let (width, height) = ui.geometry().dimensions();
     out.push_str(&format!(
-        "\tgeneration={}\twindow={width},{height},{}\tfocus={}",
+        "\tgeneration={}\twindow={width},{height},{}\tfocus={}\tline-numbers={}",
         ui.generation(),
         ui.geometry().scale().value(),
-        u8::from(ui.focused())
+        u8::from(ui.focused()),
+        u8::from(ui.line_numbers())
     ));
     for (id, _) in ui.editor().tabs() {
         let view = ui.tab_view(id)?;
@@ -1244,6 +1256,47 @@ mod tests {
     use super::*;
     use crate::model::{Command, Selection};
     use crate::ui::Event;
+
+    #[test]
+    fn line_number_mode_is_default_on_revision_checked_and_nonediting() {
+        let mut ui = Controller::default();
+        ui.dispatch(Event::Load(b"one\ntwo")).unwrap();
+        assert!(state(&ui).unwrap().contains("\tline-numbers=1\t"));
+        let before = format!("{:?}", ui.editor());
+        let command = Request::parse(b"1\t1\tset-line-numbers\t1\t0\t0").unwrap();
+        assert!(command.is_edit() && command.is_mutating());
+        command.execute(&mut ui).unwrap();
+        assert!(!ui.line_numbers());
+        assert_eq!(format!("{:?}", ui.editor()), before);
+        let generation = ui.generation();
+        command.execute(&mut ui).unwrap();
+        assert_eq!(ui.generation(), generation);
+        assert_eq!(
+            Request::parse(b"1\t2\tset-line-numbers\t1\t1\t1")
+                .unwrap()
+                .execute(&mut ui),
+            Err(Error::StaleRevision)
+        );
+        for request in [
+            b"1\t2\tset-line-numbers\t1\t0\t2".as_slice(),
+            b"1\t2\tset-line-numbers\t1\t0",
+            b"1\t2\tset-line-numbers\t1\t0\t1\tx",
+        ] {
+            assert!(Request::parse(request).is_err());
+        }
+        ui.dispatch(Event::New).unwrap();
+        assert_eq!(command.execute(&mut ui), Err(Error::InvalidArgument));
+        let mut replay = crate::replay::Session::default();
+        assert_eq!(replay.request(b"1\t1\tnew"), "1\t1\tok\t1");
+        assert_eq!(
+            replay.request(b"1\t2\tset-line-numbers\t1\t0\t0"),
+            "1\t2\tok\t"
+        );
+        assert!(!replay.ui.line_numbers());
+        assert!(replay
+            .request(b"1\t3\tset-line-numbers\t1\t1\t1")
+            .contains("\terror\tstale-revision\t"));
+    }
 
     #[test]
     fn clipboard_state_is_a_read_only_native_query_with_exact_arity() {

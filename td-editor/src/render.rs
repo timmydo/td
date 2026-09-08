@@ -18,6 +18,7 @@ pub const CHROME: u32 = 0xe1dbcf;
 pub const BORDER: u32 = 0xb5ada0;
 pub const SELECTED: u32 = 0x536b73;
 pub const INACTIVE_SELECTION: u32 = 0xc8c4bb;
+pub const LINE_NUMBER: u32 = 0x817a6f;
 pub(crate) const MISSPELLED: u32 = 0x9c5548;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -135,6 +136,7 @@ pub struct Geometry {
     width: usize,
     height: usize,
     scale: Scale,
+    gutter_columns: usize,
 }
 
 const MENU_BAR: &str = "File   Edit   Format   Help";
@@ -145,6 +147,7 @@ impl Default for Geometry {
             width: 800,
             height: 600,
             scale: Scale(1),
+            gutter_columns: 0,
         }
     }
 }
@@ -165,10 +168,25 @@ impl Geometry {
             width,
             height,
             scale,
+            gutter_columns: 0,
         })
     }
     pub fn dimensions(self) -> (usize, usize) {
         (self.width, self.height)
+    }
+    pub(crate) fn with_line_numbers(mut self, lines: Option<usize>) -> Self {
+        self.gutter_columns = lines.map_or(0, |n| n.to_string().len().max(2) + 1);
+        self
+    }
+    pub fn gutter(self) -> Rect {
+        let s = self.scale.value();
+        Rect {
+            x: (8 * s) as i64,
+            y: (48 * s) as i64,
+            width: (self.gutter_columns * CELL_WIDTH * s).min(self.width.saturating_sub(16 * s))
+                as u32,
+            height: self.height.saturating_sub(72 * s) as u32,
+        }
     }
     pub fn scale(self) -> Scale {
         self.scale
@@ -200,10 +218,11 @@ impl Geometry {
     }
     pub fn document(self) -> Rect {
         let s = self.scale.value();
+        let gutter = self.gutter();
         Rect {
-            x: (8 * s) as i64,
+            x: gutter.x + i64::from(gutter.width),
             y: (48 * s) as i64,
-            width: self.width.saturating_sub(16 * s) as u32,
+            width: self.width.saturating_sub(16 * s + gutter.width as usize) as u32,
             height: self.height.saturating_sub(72 * s) as u32,
         }
     }
@@ -656,9 +675,6 @@ impl<'a> Scene<'a> {
         if columns == 0 || rows == 0 {
             return;
         }
-        let Some(clip) = self.geometry.document().intersection(damage) else {
-            return;
-        };
         let Some(doc) = self
             .editor
             .active()
@@ -667,6 +683,40 @@ impl<'a> Scene<'a> {
             return;
         };
         let Ok(layout) = Layout::for_document(doc, columns, self.view.soft_wrap) else {
+            return;
+        };
+        let gutter = self.geometry.gutter();
+        if gutter.width != 0 && gutter.intersection(damage).is_some() {
+            let mut number = 1usize;
+            let mut first = true;
+            for (index, row) in layout
+                .rows()
+                .take(self.view.origin.row.saturating_add(rows))
+                .enumerate()
+            {
+                if index >= self.view.origin.row && first {
+                    let label = number.to_string();
+                    let s = self.geometry.scale.value();
+                    self.label(
+                        label.chars(),
+                        (
+                            gutter.x + i64::from(gutter.width)
+                                - ((label.len() + 1) * CELL_WIDTH * s) as i64,
+                            gutter.y + ((index - self.view.origin.row) * CELL_HEIGHT * s) as i64,
+                        ),
+                        gutter,
+                        GlyphStyle::medium(LINE_NUMBER, PAPER),
+                        damage,
+                        sink,
+                    );
+                }
+                first = row.ending() == Break::Newline;
+                if first {
+                    number += 1;
+                }
+            }
+        }
+        let Some(clip) = self.geometry.document().intersection(damage) else {
             return;
         };
         let s = self.geometry.scale.value();

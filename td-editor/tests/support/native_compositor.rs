@@ -408,6 +408,129 @@ fn text_pixels(text: &str) -> Vec<u8> {
     pixels
 }
 
+fn numbered_pixels(
+    compositor: &Compositor,
+    editor: &mut EditorProcess,
+    window: &str,
+    after: Observation,
+    enabled: bool,
+) {
+    use td_editor::render::{
+        Draw, Geometry, GlyphStyle, Primitive, Raster, Scale, INK, LINE_NUMBER, PAPER,
+    };
+    let state = editor.ok("state");
+    let frame = editor.ok(&format!(
+        "wait-frame\t{}",
+        field(&state, "window-generation").unwrap()
+    ));
+    assert!(frame.ends_with(",1,0,800,576,1"), "{frame}");
+    let font = td_editor::font::pinned().unwrap();
+    let geometry = Geometry::new(56, 48, Scale::new(1).unwrap()).unwrap();
+    let mut expected = PAPER.to_le_bytes().repeat(56 * 48);
+    let mut raster = Raster::new(&mut expected, &font, geometry, 56 * 4).unwrap();
+    for (row, text) in ["abc", "x", ""].into_iter().enumerate() {
+        let digits = (row + 1).to_string();
+        for (text, x, ink) in [
+            (if enabled { digits.as_str() } else { "" }, 16, LINE_NUMBER),
+            (text, if enabled { 32 } else { 8 }, INK),
+        ] {
+            for (column, scalar) in text.chars().enumerate() {
+                raster.draw(Draw {
+                    clip: geometry.bounds(),
+                    primitive: Primitive::Glyph {
+                        x: x + (column * 8) as i64,
+                        y: (row * 16) as i64,
+                        scalar,
+                        style: GlyphStyle::medium(ink, PAPER),
+                    },
+                });
+            }
+        }
+    }
+    let deadline = Instant::now() + TIMEOUT;
+    loop {
+        assert!(
+            Instant::now() < deadline,
+            "numbered document pixel deadline"
+        );
+        let first = compositor.observe(window);
+        if !first.current || first.commit <= after.commit {
+            continue;
+        }
+        assert_eq!(first.client, after.client);
+        let capture = compositor.request("capture", FRAME_BYTES + 128);
+        let (output, pixels) = ppm(&capture, &compositor.session).unwrap();
+        let second = compositor.observe(window);
+        if !second.current || second.commit != first.commit {
+            continue;
+        }
+        assert_eq!(second.client, first.client);
+        assert!(output > first.output && output <= second.output);
+        let same = (0..48).all(|y| {
+            (0..56).all(|x| {
+                if y < 16 && x == if enabled { 32 } else { 8 } {
+                    return true;
+                }
+                let source = ((y + 72) * 800 + x) * 3;
+                let target = (y * 56 + x) * 4;
+                pixels[source..source + 3]
+                    == [expected[target + 2], expected[target + 1], expected[target]]
+            })
+        });
+        if same {
+            break;
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires explicit built TD_TEST_COMPOSITOR; ready prepares it"]
+fn native_line_numbers_default_menu_remote_and_pointer() {
+    for profile in ["windows", "emacs"] {
+        let compositor_directory = Directory::new();
+        let directory = Directory::new();
+        let mut compositor = Compositor::start(&compositor_directory);
+        let file = directory.0.join("draft");
+        let dictionary = directory.0.join("dictionary");
+        std::fs::write(&file, b"abc\nx\n").unwrap();
+        std::fs::write(&dictionary, b"abc\nx\n").unwrap();
+        let display = compositor.directory.join("wayland-0");
+        let mut editor =
+            EditorProcess::start_with_profile(&directory, &display, &file, &dictionary, profile);
+        editor.wait_keyboard(profile); // Exercise the actual production default.
+        editor.wait_field("state", "line-numbers", "1");
+        let window = compositor.window();
+        let before = compositor.observe(&window);
+        assert_eq!(compositor.request("fullscreen", 1024), b"ok\n");
+        editor.wait_field("state", "window", "800,576,1");
+        numbered_pixels(&compositor, &mut editor, &window, before, true);
+        let before = compositor.observe(&window);
+        compositor.click(136, 32); // Format header.
+        editor.wait_field("state", "modal", "0,0,0,0,1,0,0,0,0");
+        compositor.click(136, 252); // Line Numbers, zero-based Format row eight.
+        editor.wait_field("state", "line-numbers", "0");
+        editor.wait_field("state", "modal", "0,0,0,0,0,0,0,0,0");
+        numbered_pixels(&compositor, &mut editor, &window, before, false);
+        let before = compositor.observe(&window);
+        editor.ok("set-line-numbers\t1\t0\t1");
+        editor.wait_field("state", "line-numbers", "1");
+        numbered_pixels(&compositor, &mut editor, &window, before, true);
+        compositor.click(40, 80);
+        editor.wait_field("state", "tab", "1,0,0,6,1,1,0,72,0,lf");
+        compositor.click(16, 80); // Gutter cannot change the selection.
+                                  // A later menu opening fences consumption of the preceding click.
+        compositor.click(136, 32);
+        editor.wait_field("state", "modal", "0,0,0,0,1,0,0,0,0");
+        editor.wait_field("state", "tab", "1,0,0,6,1,1,0,72,0,lf");
+        compositor.chord(None, KEY_ESCAPE);
+        editor.wait_field("state", "modal", "0,0,0,0,0,0,0,0,0");
+        editor.wait_tab(0, "abc\nx\n");
+        assert_eq!(std::fs::read(&file).unwrap(), b"abc\nx\n");
+        editor.quit();
+        compositor.stop();
+    }
+}
+
 fn keyboard_profile(profile: &str) {
     let compositor_directory = Directory::new();
     let directory = Directory::new();
@@ -419,7 +542,7 @@ fn keyboard_profile(profile: &str) {
     let display = compositor.directory.join("wayland-0");
     let mut editor =
         EditorProcess::start_with_profile(&directory, &display, &file, &dictionary, profile);
-    editor.wait_keyboard(profile);
+    editor.legacy_keyboard(profile);
     let window = compositor.window();
     assert_eq!(compositor.request("fullscreen", 1024), b"ok\n");
     editor.wait_field("state", "window", "800,576,1");
@@ -473,7 +596,7 @@ fn native_pointer_selection_and_menus() {
     std::fs::write(&dictionary, b"one\ntwo\n").unwrap();
     let display = compositor.directory.join("wayland-0");
     let mut editor = EditorProcess::start(&directory, &display, &file, &dictionary);
-    editor.wait_keyboard("windows");
+    editor.legacy_keyboard("windows");
     let window = compositor.window();
     assert_eq!(compositor.request("fullscreen", 1024), b"ok\n");
     editor.wait_field("state", "window", "800,576,1");
@@ -526,7 +649,7 @@ fn native_vertical_wheel_scrolls_without_editing() {
     std::fs::write(&dictionary, b"row\n").unwrap();
     let display = compositor.directory.join("wayland-0");
     let mut editor = EditorProcess::start(&directory, &display, &file, &dictionary);
-    editor.wait_keyboard("windows");
+    editor.legacy_keyboard("windows");
     let window = compositor.window();
     assert_eq!(compositor.request("fullscreen", 1024), b"ok\n");
     editor.wait_field("state", "window", "800,576,1");
@@ -585,7 +708,7 @@ fn native_horizontal_wheel_respects_wrap_and_clamps_columns() {
     std::fs::write(&dictionary, b"word\n").unwrap();
     let display = compositor.directory.join("wayland-0");
     let mut editor = EditorProcess::start(&directory, &display, &file, &dictionary);
-    editor.wait_keyboard("windows");
+    editor.legacy_keyboard("windows");
     let window = compositor.window();
     assert_eq!(compositor.request("fullscreen", 1024), b"ok\n");
     editor.wait_field("state", "window", "800,576,1");
@@ -701,7 +824,7 @@ fn clipboard_between_editors(profile: &str, operation: ClipboardOperation) {
         &source_dictionary,
         profile,
     );
-    source.wait_keyboard(profile);
+    source.legacy_keyboard(profile);
     let source_window = compositor.window();
     assert_eq!(compositor.request("fullscreen", 1024), b"ok\n");
     source.wait_field("state", "window", "800,576,1");
@@ -770,7 +893,7 @@ fn clipboard_between_editors(profile: &str, operation: ClipboardOperation) {
         &destination_dictionary,
         profile,
     );
-    destination.wait_keyboard(profile);
+    destination.legacy_keyboard(profile);
     destination.wait_field("state", "focus", "1");
     source.wait_field("state", "focus", "0");
     source.wait_field("clipboard-state", "focus", "0");
@@ -1099,7 +1222,7 @@ fn native_control_edit_spelling_save_and_dirty_close() {
     std::fs::write(&dictionary, b"one\nwarm\nwrong\n").unwrap();
     let display = compositor.directory.join("wayland-0");
     let mut editor = EditorProcess::start(&directory, &display, &file, &dictionary);
-    editor.wait_keyboard("windows");
+    editor.legacy_keyboard("windows");
     let window = compositor.window();
     assert_eq!(compositor.request("fullscreen", 1024), b"ok\n");
     editor.wait_field("state", "window", "800,576,1");
@@ -1125,7 +1248,7 @@ fn native_menu_prompts_and_fill_column() {
     std::fs::write(&dictionary, b"one\nwrong\n").unwrap();
     let display = compositor.directory.join("wayland-0");
     let mut editor = EditorProcess::start(&directory, &display, &file, &dictionary);
-    editor.wait_keyboard("windows");
+    editor.legacy_keyboard("windows");
     let window = compositor.window();
     assert_eq!(compositor.request("fullscreen", 1024), b"ok\n");
     editor.wait_field("state", "window", "800,576,1");
@@ -1169,7 +1292,7 @@ fn native_display_loss_preserves_unsaved_file_and_retires_control() {
     std::fs::write(&dictionary, b"original\n").unwrap();
     let display = compositor.directory.join("wayland-0");
     let mut editor = EditorProcess::start(&directory, &display, &file, &dictionary);
-    editor.wait_keyboard("windows");
+    editor.legacy_keyboard("windows");
     let window = compositor.window();
     assert_eq!(compositor.request("fullscreen", 1024), b"ok\n");
     editor.wait_field("state", "window", "800,576,1");
@@ -1208,7 +1331,7 @@ fn native_conflict_reload_requires_fresh_dialog_and_explicit_discard() {
     std::fs::write(&dictionary, b"original\noutside\n").unwrap();
     let display = compositor.directory.join("wayland-0");
     let mut editor = EditorProcess::start(&directory, &display, &file, &dictionary);
-    editor.wait_keyboard("windows");
+    editor.legacy_keyboard("windows");
     let window = compositor.window();
     assert_eq!(compositor.request("fullscreen", 1024), b"ok\n");
     editor.wait_field("state", "window", "800,576,1");
@@ -1316,7 +1439,7 @@ fn native_open_and_save_as_preserve_literal_paths_and_dirty_duplicate() {
     std::fs::write(&dictionary, b"base\nnew\n").unwrap();
     let display = compositor.directory.join("wayland-0");
     let mut editor = EditorProcess::start(&directory, &display, &file, &dictionary);
-    editor.wait_keyboard("windows");
+    editor.legacy_keyboard("windows");
     let window = compositor.window();
     assert_eq!(compositor.request("fullscreen", 1024), b"ok\n");
     editor.wait_field("state", "window", "800,576,1");

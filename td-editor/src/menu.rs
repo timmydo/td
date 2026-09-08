@@ -50,6 +50,7 @@ impl Group {
                 Dictionary,
                 NextMisspelling,
                 PreviousMisspelling,
+                LineNumbers,
             ],
             Self::Help => &[About, Command],
         }
@@ -73,6 +74,7 @@ pub(crate) enum Item {
     Windows,
     Emacs,
     Wrap,
+    LineNumbers,
     AutoFill,
     Fill,
     FillColumn,
@@ -107,6 +109,7 @@ impl Item {
             Self::Windows => "Windows key bindings",
             Self::Emacs => "Emacs key bindings",
             Self::Wrap => "Soft Wrap",
+            Self::LineNumbers => "Line Numbers",
             Self::AutoFill => "Auto Fill",
             Self::Fill => "Fill Paragraph",
             Self::FillColumn => "Fill Column...",
@@ -168,6 +171,7 @@ pub(crate) struct Menu {
     pub(crate) undo: bool,
     pub(crate) redo: bool,
     pub(crate) wrap: bool,
+    pub(crate) line_numbers: bool,
     pub(crate) auto_fill: bool,
     pub(crate) copy: bool,
     pub(crate) paste: bool,
@@ -189,6 +193,7 @@ impl Menu {
             Item::Windows => self.profile == Profile::Windows,
             Item::Emacs => self.profile == Profile::Emacs,
             Item::Wrap => self.wrap,
+            Item::LineNumbers => self.line_numbers,
             Item::AutoFill => self.auto_fill,
             _ => false,
         }
@@ -325,6 +330,7 @@ mod tests {
             undo: false,
             redo: false,
             wrap: true,
+            line_numbers: true,
             auto_fill: false,
             copy: false,
             paste: false,
@@ -332,16 +338,17 @@ mod tests {
     }
 
     #[test]
-    fn format_with_fill_column_requires_240_scaled_pixels_of_height() {
+    fn format_with_line_numbers_requires_264_scaled_pixels_of_height() {
         for scale in 1..=4 {
             let s = scale as usize;
             let menu = menu(Group::Format);
-            assert_eq!(Group::Format.items().len(), 8);
+            assert_eq!(Group::Format.items().len(), 9);
+            assert!(menu.checked(Item::LineNumbers));
             assert!(menu
-                .panel(Geometry::new(320 * s, 239 * s, Scale::new(scale).unwrap()).unwrap())
+                .panel(Geometry::new(320 * s, 263 * s, Scale::new(scale).unwrap()).unwrap())
                 .is_none());
             assert!(menu
-                .panel(Geometry::new(320 * s, 240 * s, Scale::new(scale).unwrap()).unwrap())
+                .panel(Geometry::new(320 * s, 264 * s, Scale::new(scale).unwrap()).unwrap())
                 .is_some());
         }
     }

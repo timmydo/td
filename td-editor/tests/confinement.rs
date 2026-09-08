@@ -473,9 +473,10 @@ fn native_prompt_answers_pin_context_before_cleanup_and_never_route_global_keys(
         .split("];\n")
         .next()
         .unwrap();
-    assert_eq!(names.matches("Item::").count(), 7);
+    assert_eq!(names.matches("Item::").count(), 8);
     for action in [
         "AutoFill",
+        "LineNumbers",
         "Fill",
         "GoToLine",
         "Spell",

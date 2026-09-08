@@ -3114,6 +3114,7 @@ impl Window {
             redo: redo != 0,
             auto_fill: doc.auto_fill(),
             wrap: self.ui.tab_view(tab).map_err(error)?.soft_wrap,
+            line_numbers: self.ui.line_numbers(),
             copy: self.input.focused
                 && self.clipboard.device.is_some()
                 && self.clipboard.outgoing.is_none()
@@ -3323,6 +3324,7 @@ impl Window {
             },
             Item::Windows => Event::Profile(Profile::Windows),
             Item::Emacs => Event::Profile(Profile::Emacs),
+            Item::LineNumbers => Event::LineNumbers(!self.ui.line_numbers()),
             Item::Wrap => Event::Wrap {
                 tab,
                 revision,

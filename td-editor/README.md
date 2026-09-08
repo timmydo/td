@@ -60,6 +60,11 @@ to test cancellation during file jobs; its scheduling socket is not part
 of the editor control protocol. Normal binaries ignore the fixture variable.
 See DESIGN.md's isolated file-worker test-build contract.
 
+Line numbers are on by default. Use **Format > Line Numbers** to toggle
+them, or the `display-line-numbers-mode` named command in either key profile.
+This window-wide preference lasts until exit. Numbers count logical lines;
+soft-wrapped continuations are blank. The gutter never becomes copied text.
+
 Build and verify from the repository root:
 
 ```text
@@ -209,7 +214,8 @@ remains unimplemented; scan-pinned remote result pages are available.
 
 Emacs `M-x` or Help > Command opens exact named editor actions. Type a prefix
 and Tab to complete; Return runs an exact name, Ctrl+U clears, and
-Escape/Ctrl+G cancels. The fixed list is `auto-fill-mode`, `fill-paragraph`,
+Escape/Ctrl+G cancels. The fixed list is `auto-fill-mode`,
+`display-line-numbers-mode`, `fill-paragraph`,
 `goto-line`, `ispell-buffer`, `next-misspelling`, `previous-misspelling`, and
 `set-fill-column`. These use the same handlers as the menus; they are not
 shell commands, executable names or Lisp. Command entry works through the
@@ -605,6 +611,7 @@ future control adapter.
 | `key` | active tab ID, revision, hex logical chord |
 | `resize` | nonzero surface width, height, scale (1..=4) |
 | `set-soft-wrap` | tab ID, revision, `0` or `1` |
+| `set-line-numbers` | active tab ID, revision, `0` or `1`; window-wide |
 | `scroll` | tab ID, revision, `rows` or `columns`, `forward` or `backward`, amount |
 | `pointer` | active tab ID, revision, `press`/`move`/`release`, x, y, extend (0/1) |
 | `focus` | `0` or `1`; keyboard focus, not pointer presence |

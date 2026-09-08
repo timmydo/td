@@ -7,6 +7,7 @@ use crate::{Error, Result};
 pub(crate) const BYTES: usize = 64;
 const NAMES: &[(&str, Item)] = &[
     ("auto-fill-mode", Item::AutoFill),
+    ("display-line-numbers-mode", Item::LineNumbers),
     ("fill-paragraph", Item::Fill),
     ("goto-line", Item::GoToLine),
     ("ispell-buffer", Item::Spell),
@@ -159,6 +160,7 @@ mod tests {
         let ui = controller();
         let expected = [
             ("auto-fill-mode", Item::AutoFill),
+            ("display-line-numbers-mode", Item::LineNumbers),
             ("fill-paragraph", Item::Fill),
             ("goto-line", Item::GoToLine),
             ("ispell-buffer", Item::Spell),
@@ -182,6 +184,7 @@ mod tests {
             undo: false,
             redo: false,
             wrap: false,
+            line_numbers: true,
             auto_fill: false,
             copy: false,
             paste: false,
@@ -203,7 +206,7 @@ mod tests {
         let mut prompt = Prompt::new(ui.editor(), 1, 0).unwrap();
         prompt.type_chord("Tab");
         assert!(prompt.text.is_empty());
-        assert!(prompt.notice().contains("7 matches"));
+        assert!(prompt.notice().contains("8 matches"));
         assert!(prompt.action().is_err());
         prompt.type_chord("z");
         prompt.type_chord("Tab");

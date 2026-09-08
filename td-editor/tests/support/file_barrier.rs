@@ -136,7 +136,7 @@ fn scenario(reload: bool) {
         "windows",
         Some(&barrier.path),
     );
-    editor.wait_keyboard("windows");
+    editor.legacy_keyboard("windows");
     let window = compositor.window();
     assert_eq!(compositor.request("fullscreen", 1024), b"ok\n");
     editor.wait_field("state", "window", "800,576,1");
