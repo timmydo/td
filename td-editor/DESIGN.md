@@ -2318,6 +2318,21 @@ fresh Paste still succeeds. Invalidation closes the held descriptor before
 source delivery, so empty EOF can race keyboard leave. This scenario proves
 settled focus/offer/transfer state and the compositor's stale-release fence,
 not which editor cancellation path wins that race.
+The source-exit phase also starts with a third held Paste after saving the
+destination's successful original snapshot. Observe held/incoming=1 before
+normal source shutdown. Its window must disappear, the still-focused
+destination must retire the selection and pending input, and the compositor
+must invalidate hold 3 and refuse release. Exact saved revision, collapsed
+selection/caret, text and both disk files remain unchanged. All these
+observations finish within four seconds measured before Paste to exclude
+the independent five-second read deadline. The existing fresh no-offer
+Paste refusal then runs with the entire destination selected. EOF can
+race selection retirement here; this proves settled owner-exit behavior,
+not a particular editor diagnostic ordering or clipboard-manager
+persistence.
+The four-second evidence budgets fail closed on a starved host. They must
+not restart after observing held state, which would allow an earlier reader
+deadline to masquerade as the tested cancellation or lifecycle transition.
 Weston remains separate optional interoperability evidence below.
 
 The opt-in `disposable_weston_runs_the_production_editor_and_control_workers`

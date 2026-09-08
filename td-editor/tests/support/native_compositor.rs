@@ -957,6 +957,44 @@ fn clipboard_between_editors(profile: &str, operation: ClipboardOperation) {
     destination.job("save\t1\t1");
     assert_eq!(std::fs::read(&destination_path).unwrap(), text.as_bytes());
     source.wait_tab(source_revision, "b");
+    let saved_destination = format!("1,1,0,{0},{0},{0},0,72,0,lf", text.len());
+    destination.wait_field("state", "tab", &saved_destination);
+    source.wait_field("state", "tab", &collapsed);
+    let hold_id = 3;
+    let hold_reply = |state: &str| format!(
+        "ok\ntd-clipboard-v1 session={} hold={hold_id} window={destination_window} state={state}\n",
+        compositor.session,
+    );
+    let armed = hold_reply("armed");
+    assert_eq!(compositor.request(&format!(
+        "clipboard-arm {} {destination_window}", compositor.session,
+    ), 1024), armed.as_bytes());
+    let held = hold_reply("held");
+    let invalidated = hold_reply("invalidated");
+    let owner_exit_paste_started = Instant::now();
+    compositor.chord(Some(KEY_LEFT_CTRL), paste_key);
+    let deadline = Instant::now() + TIMEOUT;
+    let status_command = format!("clipboard-status {} {hold_id}", compositor.session);
+    loop {
+        let reply = compositor.request(&status_command, 1024);
+        if reply == held.as_bytes() {
+            break;
+        }
+        assert_eq!(
+            reply, armed.as_bytes(), "owner-exit hold failed before receive: {}",
+            String::from_utf8_lossy(&reply),
+        );
+        assert!(
+            Instant::now() < deadline,
+            "owner-exit Paste never reached the hold"
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    destination.wait_field("clipboard-state", "incoming", "1");
+    destination.wait_field("prompt-state", "notice", &pasting);
+    destination.wait_field("state", "tab", &saved_destination);
+    destination.wait_tab(1, text);
+    source.wait_field("clipboard-state", "outgoing", "0");
     source.quit();
     let deadline = Instant::now() + TIMEOUT;
     loop {
@@ -975,6 +1013,20 @@ fn clipboard_between_editors(profile: &str, operation: ClipboardOperation) {
         std::thread::sleep(Duration::from_millis(2));
     }
     destination.wait_field("state", "focus", "1");
+    destination.wait_field("clipboard-state", "selection", "none");
+    destination.wait_field("clipboard-state", "incoming", "0");
+    destination.wait_field("state", "tab", &saved_destination);
+    destination.wait_tab(1, text);
+    assert_eq!(compositor.request(&status_command, 1024), invalidated.as_bytes());
+    assert_eq!(compositor.request(&format!(
+        "clipboard-release {} {hold_id}", compositor.session,
+    ), 1024), b"unavailable clipboard hold has no releasable transfer\n");
+    assert_eq!(std::fs::read(&destination_path).unwrap(), text.as_bytes());
+    assert_eq!(std::fs::read(&source_path).unwrap(), b"b");
+    assert!(
+        owner_exit_paste_started.elapsed() < Duration::from_secs(4),
+        "owner exit exceeded its transfer evidence budget"
+    );
     select_clipboard_text(&mut compositor, profile);
     destination.wait_field("clipboard-state", "selection", "none");
     let selected = format!("1,1,0,{0},0,{0},0,72,0,lf", text.len());

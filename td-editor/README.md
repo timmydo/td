@@ -424,6 +424,10 @@ command. The destination must retire its offer and pending transfer without
 editing; the invalidated hold cannot be released, even after focus returns.
 Fresh Paste after refocus still works. Empty EOF can race Wayland leave here,
 so this checks settled state rather than claiming which cancel path won.
+Finally, the owner exits while a third Paste is held. Its window disappears,
+the pending transfer and offer retire without changing the saved destination,
+and the compositor refuses the invalidated hold's release. These observations
+finish below the editor's read deadline before the fresh no-offer test runs.
 Vertical and horizontal wheel cases also test page-bound clamping and
 inward movement after repeated outward reports. Horizontal scrolling is
 checked with Soft Wrap enabled, then disabled through the native menu;
