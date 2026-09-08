@@ -2217,6 +2217,14 @@ prompt and the wrapped second row's pixels are not asserted; transitions
 and complete wrapping use semantic state and disk bytes before the
 independent first-row document-pixel check.
 
+A native display-loss case first proves exact dirty text/tab state and a
+correlated `xoriginal` pixel prefix while the associated file stays clean.
+Closing only the owned compositor's lifetime pipe must reap it normally,
+then the editor must exit with status 1, report Wayland loss, remove its
+control endpoint and preserve the original disk bytes. No editor Quit,
+Save or discard answer is sent. This covers normal headless owner-EOF
+shutdown with a live dirty client, not a kernel kill or hardware failure.
+
 The editor maps normally, then compositor fullscreen leaves an 800x576
 scale-one client beneath the 24-pixel desktop bar. Shift+A, released-Shift b
 and Windows Ctrl+Z / Emacs Ctrl+/ use real evdev-code routing, keymap and

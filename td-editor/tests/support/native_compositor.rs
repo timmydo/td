@@ -1143,6 +1143,45 @@ fn native_menu_prompts_and_fill_column() {
 }
 
 #[test]
+#[ignore = "requires an explicitly built TD_TEST_COMPOSITOR; ready runs this case"]
+fn native_display_loss_preserves_unsaved_file_and_retires_control() {
+    let compositor_directory = Directory::new();
+    let directory = Directory::new();
+    let mut compositor = Compositor::start(&compositor_directory);
+    let file = directory.0.join("draft");
+    let dictionary = directory.0.join("dictionary");
+    std::fs::write(&file, b"original\n").unwrap();
+    std::fs::write(&dictionary, b"original\n").unwrap();
+    let display = compositor.directory.join("wayland-0");
+    let mut editor = EditorProcess::start(&directory, &display, &file, &dictionary);
+    editor.wait_keyboard("windows");
+    let window = compositor.window();
+    assert_eq!(compositor.request("fullscreen", 1024), b"ok\n");
+    editor.wait_field("state", "window", "800,576,1");
+    editor.rendered_at(800, 576);
+    let before = compositor.observe(&window);
+    editor.ok("insert\t1\t0\t0\t0\t78");
+    editor.wait_field("state", "tab", "1,1,1,10,1,1,0,72,0,lf");
+    editor.wait_tab(1, "xoriginal\n");
+    compositor.rendered_text(&mut editor, &window, 1, before, "xoriginal", 1);
+    assert_eq!(std::fs::read(&file).unwrap(), b"original\n");
+    // Normal owned compositor EOF closes Wayland while this dirty client lives.
+    compositor.stop();
+    assert_eq!(editor.exit().code(), Some(1));
+    let diagnostic = std::fs::read_to_string(&editor.log).unwrap();
+    // A focused caret redraw can observe the closed socket before receive does.
+    assert!(
+        diagnostic.contains("Wayland compositor disconnected")
+            || diagnostic.contains("Wayland receive:")
+            || diagnostic.contains("Wayland write:"),
+        "{diagnostic}"
+    );
+    assert_eq!(std::fs::read(&file).unwrap(), b"original\n");
+    assert_eq!(std::fs::read(&dictionary).unwrap(), b"original\n");
+    assert!(!editor.socket.exists());
+}
+
+#[test]
 fn native_observation_and_capture_decoders_refuse_stale_or_truncated_evidence() {
     let session = "00000000000000000000000000000007";
     let reply = format!(

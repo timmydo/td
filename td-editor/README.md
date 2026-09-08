@@ -400,6 +400,10 @@ and answers their prompts through editor control. It checks command
 completion, a fill column of 80 through exact paragraph wrapping and saved
 bytes, complete final tab state and correlated `word` pixels. The strict
 peer variant retains its no-keyboard-focus checks for every prompt answer.
+A native display-loss case closes the owned compositor while the editor
+has dirty, pixel-verified text. The compositor exits normally; the editor
+must exit with failure, report Wayland loss, remove its control endpoint
+and leave the original file unchanged, without any editor Quit or Save.
 The vertical-wheel case checks forward and reverse detents against
 exact viewport rows and captured numbered-line pixels, with unchanged text,
 revision, selection, caret and disk bytes. The clipboard case uses two
