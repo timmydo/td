@@ -103,6 +103,31 @@ staging, publication, cleanup and parent synchronization retain one directory
 identity even if its caller-visible path is retargeted. A second caller,
 another flag, or another `*at` operation is an amendment here.
 
+The shared PID-namespace workload boundary uses `close_range(436)` with
+first descriptor 3 and last `u32::MAX`. Before its final fork, namespace
+PID 1 marks that range `CLOSE_RANGE_CLOEXEC` (4), preserving std's exec-error
+pipe until workload exec. A private blocking `pipe2(O_CLOEXEC)` pair gates
+that exec. After the fork, the reaper closes descriptors above stderr in
+two ranges excluding only this new writer, with flags zero; it never execs
+and must not retain ambient files or the error pipe. The writer is at least
+3 and is passed only from that freshly created pair, never from an external
+argument. After cleanup, raw `write` sends exactly byte 1 and closes the
+writer. The workload closes its writer copy and raw `read` requires that
+byte followed by EOF before closing the reader and proceeding to exec.
+Early EOF, another byte, trailing data or any syscall failure refuses exec;
+EINTR is retried. Thus workload code cannot race cleanup by reopening an
+ambient descriptor through `/proc/1/fd`. Only the shared
+`pid1_serve_as_init` helper calls these descriptor/barrier wrappers.
+The host sandbox, derivation sandbox and check lifetime namespace all use
+that helper. Standard input, output and error remain configured by Command.
+Failure refuses the workload or terminates namespace PID 1; there is no
+fallback that preserves extra workload descriptors. Tests pin the syscall
+requests and caller placement, inject a non-CLOEXEC descriptor only in a
+forked fixture, delay the reaper's cleanup and require both descriptor tables
+clean at workload entry. Barrier framing/EOF and exec-error tests cover
+refusal. The fixture alone uses `fcntl(F_DUPFD)` to inject the descriptor;
+production gains no general duplication or flag API.
+
 The builder's host and derivation sandboxes create user, mount, PID, network
 and UTS namespaces together, then select IPC isolation after PID 1 mounts a
 fresh private procfs and before any workload executes. When its `self/ns/ipc`

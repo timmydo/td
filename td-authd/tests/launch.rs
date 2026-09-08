@@ -120,6 +120,40 @@ fn probe_command() -> Command {
     command
 }
 
+fn probe_diagnostics() -> String {
+    // Child stderr must stay null for this probe. Report the parent's ambient
+    // inheritable descriptors without reading their contents or environment.
+    let mut descriptors = Vec::new();
+    if let Ok(entries) = std::fs::read_dir("/proc/self/fd") {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(fd) = name.to_str().and_then(|name| name.parse::<u32>().ok()) else {
+                continue;
+            };
+            if fd < 3 {
+                continue;
+            }
+            let flags = std::fs::read_to_string(format!("/proc/self/fdinfo/{fd}"))
+                .ok()
+                .and_then(|info| info.lines().find_map(|line| {
+                    line.strip_prefix("flags:")
+                        .and_then(|value| u32::from_str_radix(value.trim(), 8).ok())
+                }));
+            if flags.is_some_and(|flags| flags & 0o2000000 == 0) {
+                descriptors.push((fd, std::fs::read_link(entry.path())));
+            }
+        }
+    }
+    descriptors.sort_by_key(|(fd, _)| *fd);
+    format!("parent inheritable descriptors: {descriptors:?}; /dev/null: {:?}",
+        std::fs::metadata("/dev/null").map(|m| (m.file_type().is_char_device(), m.rdev())))
+}
+
+fn wait_for_probe(child: &mut std::process::Child) {
+    let status = child.wait().unwrap();
+    assert!(status.success(), "launch probe exited {status}; {}", probe_diagnostics());
+}
+
 #[test]
 #[ignore = "exec-only fixture: requires sanitized standard descriptors"]
 fn spawn_probe() {
@@ -149,7 +183,7 @@ fn spawn_probe() {
 #[test]
 fn real_exec_replaces_stdio_discards_environment_and_has_no_extra_descriptors() {
     let mut child = spawn(&mut probe_command()).unwrap();
-    assert!(child.wait().unwrap().success());
+    wait_for_probe(&mut child);
 }
 
 #[test]
@@ -164,7 +198,7 @@ fn a_polled_completion_retires_its_handle_and_unknown_handles_fail() {
         if response == [0x82, 1] {
             break;
         }
-        assert_eq!(response, [0x82, 0]);
+        assert_eq!(response, [0x82, 0], "launch probe failed; {}", probe_diagnostics());
         assert!(Instant::now() < deadline);
         thread::sleep(Duration::from_millis(5));
     }
@@ -181,7 +215,7 @@ fn capacity_counts_unacknowledged_completions_and_cannot_spawn_over_the_limit() 
     let mut launches = Launches::new("000102030405060708090a0b0c0d0e0f".into());
     for handle in 1..=LIMIT as u64 {
         let mut child = spawn(&mut probe_command()).unwrap();
-        assert!(child.wait().unwrap().success());
+        wait_for_probe(&mut child);
         launches.children.insert(handle, child);
     }
     assert_eq!(
@@ -299,7 +333,7 @@ fn root_startup_checks_every_credential_column_and_single_threadedness() {
 #[test]
 fn a_late_validator_success_is_refused_even_after_reaping() {
     let mut child = spawn(&mut probe_command()).unwrap();
-    assert!(child.wait().unwrap().success());
+    wait_for_probe(&mut child);
     assert!(wait_check(&mut child, Instant::now())
         .unwrap_err()
         .contains("timed out"));

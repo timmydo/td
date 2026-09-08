@@ -1217,11 +1217,45 @@ fn pid1_confirm_parent(live_r: i32, live_w: i32) -> io::Result<()> {
 /// The reaper must never return: a second sync-pipe write after the program's
 /// exec would turn a spawn that succeeded into a spawn error, so a wait
 /// failure ends the namespace with `failure` on stderr and exit 1 instead.
-/// Post-fork safe: raw syscalls only.
+/// Setup failures before the fork return through std's exec-error pipe;
+/// reaper failures after it print a dedicated diagnostic and end PID 1.
+/// Production post-fork path: raw syscalls only.
 fn pid1_serve_as_init(failure: &'static [u8]) -> io::Result<()> {
+    // Namespace and environment isolation do not revoke inherited descriptors.
+    // Keep std's error pipe usable if exec fails, then close it at exec too.
+    sys::mark_extra_descriptors_cloexec().map_err(|e| {
+        sys::warn(b"td-builder sandbox: FAILED marking inherited descriptors close-on-exec\n");
+        e
+    })?;
+    let (reader, writer) = sys::pipe_exec_barrier().map_err(|e| {
+        sys::warn(b"td-builder sandbox: FAILED creating the exec barrier\n");
+        e
+    })?;
     let program = sys::fork()?;
     if program == 0 {
-        return Ok(());
+        sys::close(writer)?;
+        let ready = sys::await_exec_barrier(reader);
+        let closed = sys::close(reader);
+        ready.map_err(|e| {
+            sys::warn(b"td-builder sandbox: reaper did not complete descriptor cleanup\n");
+            e
+        })?;
+        return closed;
+    }
+    #[cfg(test)]
+    if DELAY_REAPER_CLEANUP.load(std::sync::atomic::Ordering::Relaxed) {
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    // Init never execs. Do not retain ambient files or std's exec-error pipe
+    // for the workload's entire lifetime. The child cannot exec until the
+    // success byte AND EOF prove these copies are gone, including the writer.
+    if sys::close_reaper_descriptors(writer).is_err() {
+        sys::warn(b"td-builder sandbox: FAILED closing the reaper's inherited descriptors\n");
+        sys::exit_group(1);
+    }
+    if sys::release_exec_barrier(writer).is_err() {
+        sys::warn(b"td-builder sandbox: FAILED releasing the exec barrier\n");
+        sys::exit_group(1);
     }
     loop {
         match sys::wait_any() {
@@ -1234,6 +1268,10 @@ fn pid1_serve_as_init(failure: &'static [u8]) -> io::Result<()> {
         }
     }
 }
+
+#[cfg(test)]
+pub(crate) static DELAY_REAPER_CLEANUP: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// WHO issued the authority for a staged input's hash — its provenance CLASS
 /// (re #469). Integrity and provenance are distinct: integrity is "the bytes

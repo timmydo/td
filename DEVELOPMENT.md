@@ -236,6 +236,18 @@ still kill without a record.
 
 # Test binaries run under a memory ceiling
 
+Namespace workloads inherit only their configured standard descriptors.
+The shared host/build/check namespace boundary marks descriptors above
+stderr close-on-exec and closes the reaper's copies after its final fork.
+A private success-byte/EOF handshake holds workload exec until those copies
+are gone, preventing recovery of a descriptor through `/proc/1/fd`.
+An invoking shell or persistent daemon's extra descriptor therefore cannot
+reach a recipe test. Setup errors name the descriptor-cleanup operation;
+the exec-error pipe remains usable until exec, so a missing program still
+reports its original error. This uses Linux `close_range` with
+`CLOSE_RANGE_CLOEXEC`, available since Linux 5.11 (the mount boundary already
+requires Linux 5.12).
+
 `.cargo/config.toml` points cargo's `runner` at `td-builder run-capped`, so
 every cargo TEST binary runs under a per-process `RLIMIT_DATA` ceiling: 2 GiB
 for `td-builder`/`td-recipe`/`td-engine`, 1 GiB for every other crate. A test

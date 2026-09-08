@@ -17,6 +17,8 @@ use std::io;
 
 const SYS_READ: usize = 0;
 const SYS_CLOSE: usize = 3;
+const SYS_CLOSE_RANGE: usize = 436;
+const CLOSE_RANGE_CLOEXEC: usize = 4;
 const SYS_IOCTL: usize = 16;
 const SYS_PIPE2: usize = 293;
 const SYS_SOCKET: usize = 41;
@@ -157,6 +159,22 @@ fn check(ret: isize) -> io::Result<()> {
 
 pub fn unshare(flags: usize) -> io::Result<()> {
     check(unsafe { syscall5(SYS_UNSHARE, flags, 0, 0, 0, 0) })
+}
+
+/// Only in a forked Command child: preserve std's exec-error pipe until exec.
+pub fn mark_extra_descriptors_cloexec() -> io::Result<()> {
+    check(unsafe { syscall5(SYS_CLOSE_RANGE, 3, u32::MAX as usize, CLOSE_RANGE_CLOEXEC, 0, 0) })
+}
+
+/// Only the namespace reaper's newly created exec-barrier writer may remain.
+pub fn close_reaper_descriptors(writer: i32) -> io::Result<()> {
+    if writer < 3 {
+        return Err(io::Error::from_raw_os_error(22));
+    }
+    if writer > 3 {
+        check(unsafe { syscall5(SYS_CLOSE_RANGE, 3, writer as usize - 1, 0, 0, 0) })?;
+    }
+    check(unsafe { syscall5(SYS_CLOSE_RANGE, writer as usize + 1, u32::MAX as usize, 0, 0, 0) })
 }
 
 /// mount(2). `src`/`fstype`/`data` may be None (NULL) — e.g. the
@@ -346,6 +364,61 @@ pub fn pipe_liveness() -> io::Result<(i32, i32)> {
         )
     })?;
     Ok((fds[0], fds[1]))
+}
+
+/// Blocking pipe: the workload must wait for completed reaper cleanup.
+pub fn pipe_exec_barrier() -> io::Result<(i32, i32)> {
+    let mut fds = [-1i32; 2];
+    check(unsafe {
+        syscall5(SYS_PIPE2, fds.as_mut_ptr() as usize, O_CLOEXEC, 0, 0, 0)
+    })?;
+    let [reader, writer] = fds;
+    if reader < 3 || writer < 3 {
+        let _ = close(reader);
+        let _ = close(writer);
+        return Err(io::Error::from_raw_os_error(22));
+    }
+    Ok((reader, writer))
+}
+
+/// A success byte followed by EOF proves cleanup and writer closure.
+pub fn await_exec_barrier(reader: i32) -> io::Result<()> {
+    let mut byte = [0u8];
+    let mut acknowledged = false;
+    loop {
+        let ret = unsafe {
+            syscall5(SYS_READ, reader as usize, byte.as_mut_ptr() as usize, 1, 0, 0)
+        };
+        if ret == 0 {
+            return if acknowledged { Ok(()) } else { Err(io::Error::from_raw_os_error(32)) };
+        }
+        if ret == 1 {
+            if acknowledged || byte != [1] {
+                return Err(io::Error::from_raw_os_error(22));
+            }
+            acknowledged = true;
+        } else if ret != -(EINTR as isize) {
+            check(ret)?;
+            return Err(io::Error::from_raw_os_error(5));
+        }
+    }
+}
+
+/// Called only after the reaper has closed every other extra descriptor.
+pub fn release_exec_barrier(writer: i32) -> io::Result<()> {
+    let byte = [1u8];
+    loop {
+        let ret = unsafe {
+            syscall5(SYS_WRITE, writer as usize, byte.as_ptr() as usize, 1, 0, 0)
+        };
+        if ret == 1 {
+            return close(writer);
+        }
+        if ret != -(EINTR as isize) {
+            check(ret)?;
+            return Err(io::Error::from_raw_os_error(5));
+        }
+    }
 }
 
 /// close(2).
@@ -839,6 +912,134 @@ pub fn exit_group(code: i32) -> ! {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn descriptor_exec_boundary_is_value_pinned() {
+        assert_eq!(super::SYS_CLOSE_RANGE, 436);
+        assert_eq!(super::CLOSE_RANGE_CLOEXEC, 4);
+        let compact = |text: &str| text.chars().filter(|ch| !ch.is_whitespace()).collect::<String>();
+        let source = compact(shipped_part(include_str!("sys.rs")));
+        assert_eq!(source.matches("SYS_CLOSE_RANGE,").count(), 3);
+        assert!(source.contains("syscall5(SYS_CLOSE_RANGE,3,u32::MAXasusize,CLOSE_RANGE_CLOEXEC,0,0)"));
+        assert!(source.contains("syscall5(SYS_CLOSE_RANGE,3,writerasusize-1,0,0,0)"));
+        assert!(source.contains("syscall5(SYS_CLOSE_RANGE,writerasusize+1,u32::MAXasusize,0,0,0)"));
+        assert!(source.contains("ifwriter<3{returnErr(io::Error::from_raw_os_error(22));}"));
+        assert!(source.contains("syscall5(SYS_PIPE2,fds.as_mut_ptr()asusize,O_CLOEXEC,0,0,0)"));
+        let sandbox = include_str!("sandbox.rs").split("#[cfg(test)]\nmod tests").next().unwrap();
+        assert_eq!(sandbox.matches("sys::mark_extra_descriptors_cloexec()").count(), 1);
+        assert_eq!(sandbox.matches("sys::close_reaper_descriptors(writer)").count(), 1);
+        assert_eq!(sandbox.matches("sys::pipe_exec_barrier()").count(), 1);
+        assert_eq!(sandbox.matches("sys::await_exec_barrier(reader)").count(), 1);
+        assert_eq!(sandbox.matches("sys::release_exec_barrier(writer)").count(), 1);
+        let boundary = sandbox.split("fn pid1_serve_as_init(").nth(1).unwrap().split("\n}\n").next().unwrap();
+        assert!(boundary.find("sys::mark_extra_descriptors_cloexec()").unwrap()
+            < boundary.find("sys::fork()").unwrap());
+        assert!(boundary.find("sys::close_reaper_descriptors(writer)").unwrap()
+            < boundary.find("sys::release_exec_barrier(writer)").unwrap());
+        assert!(boundary.find("sys::release_exec_barrier(writer)").unwrap()
+            < boundary.find("sys::wait_any()").unwrap());
+        assert_eq!(sandbox.matches("pid1_serve_as_init(b\"").count(), 3);
+    }
+
+    #[test]
+    #[ignore = "exec-only inherited descriptor fixture"]
+    fn descriptor_exec_probe() {
+        assert_eq!(std::env::var("TD_DESCRIPTOR_EXEC_PROBE").unwrap(), "1");
+        let mut descriptors = std::fs::read_dir("/proc/self/fd").unwrap()
+            .map(|entry| entry.unwrap().file_name().to_str().unwrap().parse::<u32>().unwrap())
+            .collect::<Vec<_>>();
+        descriptors.sort_unstable();
+        assert_eq!(descriptors, [0, 1, 2, 3], "workload inherited ambient descriptors");
+        // Must be clean at workload entry, not merely eventually clean.
+        let mut reaper = std::fs::read_dir("/proc/1/fd").unwrap()
+            .map(|entry| entry.unwrap().file_name().to_str().unwrap().parse::<u32>().unwrap())
+            .collect::<Vec<_>>();
+        reaper.sort_unstable();
+        assert_eq!(reaper, [0, 1, 2], "workload can reopen the reaper's ambient descriptors");
+        println!("TD-DESCRIPTOR-EXEC-OK");
+    }
+
+    #[test]
+    fn namespace_workload_and_reaper_discard_inherited_descriptors() {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::process::CommandExt;
+        const SYS_FCNTL: usize = 72;
+        const F_DUPFD: usize = 0;
+        let sentinel = std::fs::File::open("/dev/null").unwrap();
+        let fd = sentinel.as_raw_fd();
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command.args(["--exact", "sys::tests::descriptor_exec_probe", "--ignored", "--nocapture"])
+            .env_clear().env("TD_DESCRIPTOR_EXEC_PROBE", "1");
+        unsafe {
+            command.pre_exec(move || {
+                // Test-only fcntl(F_DUPFD, 64): inject a non-CLOEXEC copy in
+                // this child alone, never into the parallel parent harness.
+                crate::sandbox::DELAY_REAPER_CLEANUP.store(true, std::sync::atomic::Ordering::Relaxed);
+                check(syscall5(SYS_FCNTL, fd as usize, F_DUPFD, 64, 0, 0))
+            });
+        }
+        crate::sandbox::contain_pid_namespace(&mut command).unwrap();
+        let output = command.output().unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert!(String::from_utf8_lossy(&output.stdout).contains("TD-DESCRIPTOR-EXEC-OK"));
+        assert!(sentinel.metadata().is_ok(), "child cleanup changed the parent's descriptor");
+    }
+
+    #[test]
+    fn descriptor_cleanup_preserves_exec_failure_reporting() {
+        let mut command = std::process::Command::new("/td-descriptor-test-missing/program");
+        crate::sandbox::contain_pid_namespace(&mut command).unwrap();
+        let error = command.spawn().unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn exec_barrier_rejects_missing_standard_descriptors() {
+        use std::os::unix::process::CommandExt;
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        unsafe {
+            command.pre_exec(|| {
+                close(0)?;
+                match pipe_exec_barrier() {
+                    Err(error) => Err(error),
+                    Ok((reader, writer)) => {
+                        let _ = close(reader);
+                        let _ = close(writer);
+                        Err(std::io::Error::from_raw_os_error(5))
+                    }
+                }
+            });
+        }
+        assert_eq!(command.spawn().unwrap_err().raw_os_error(), Some(22));
+    }
+
+    #[test]
+    fn exec_barrier_requires_success_and_eof() {
+        use std::io::Write;
+        use std::os::fd::FromRawFd;
+        for bytes in [&[][..], &[2][..], &[1, 1][..], &[1][..]] {
+            let (reader, writer) = pipe_exec_barrier().unwrap();
+            let mut writer = unsafe { std::fs::File::from_raw_fd(writer) };
+            writer.write_all(bytes).unwrap();
+            drop(writer);
+            assert_eq!(await_exec_barrier(reader).is_ok(), bytes == [1]);
+            close(reader).unwrap();
+        }
+        let (reader, writer) = pipe_exec_barrier().unwrap();
+        let mut writer = unsafe { std::fs::File::from_raw_fd(writer) };
+        let (send, receive) = std::sync::mpsc::channel();
+        let child = std::thread::spawn(move || {
+            let result = await_exec_barrier(reader);
+            close(reader).unwrap();
+            send.send(result).unwrap();
+        });
+        writer.write_all(&[1]).unwrap();
+        assert!(matches!(receive.recv_timeout(std::time::Duration::from_millis(50)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)));
+        drop(writer);
+        receive.recv_timeout(std::time::Duration::from_secs(10)).unwrap().unwrap();
+        child.join().unwrap();
+    }
+
     #[test]
     fn mount_restriction_request_is_additive_and_value_pinned() {
         assert_eq!(super::SYS_MOUNT_SETATTR, 442);
