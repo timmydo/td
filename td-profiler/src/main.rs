@@ -18,6 +18,7 @@ mod state;
 mod symbol;
 #[allow(unsafe_code)]
 mod sys;
+mod topology;
 
 use std::env;
 use std::ffi::{OsStr, OsString};
@@ -292,6 +293,9 @@ mod confinement {
             "const SYS_MMAP: usize = 9;",
             "const SYS_MUNMAP: usize = 11;",
             "const SYS_IOCTL: usize = 16;",
+            "const SYS_SOCKET: usize = 41;",
+            "const SYS_RECVFROM: usize = 45;",
+            "const SYS_BIND: usize = 49;",
             "const SYS_SETUID: usize = 105;",
             "const SYS_SETGID: usize = 106;",
             "const SYS_SETGROUPS: usize = 116;",
@@ -300,7 +304,7 @@ mod confinement {
         ] {
             assert!(SYS.contains(pin), "missing syscall pin {pin}");
         }
-        assert_eq!(SYS.matches("const SYS_").count(), 9);
+        assert_eq!(SYS.matches("const SYS_").count(), 12);
         for request in [
             "const PERF_EVENT_IOC_ENABLE: usize = 0x2400;",
             "const PERF_EVENT_IOC_DISABLE: usize = 0x2401;",
@@ -313,19 +317,22 @@ mod confinement {
     }
 
     #[test]
-    fn collector_has_no_socket_or_export_surface() {
+    fn collector_has_only_a_kernel_notification_socket_and_no_export_surface() {
         let shipped = MAIN.split_once("#[cfg(test)]").unwrap().0;
-        for forbidden in [
-            "TcpStream",
-            "UnixStream",
-            "bind(",
-            "listen(",
-            "sendmsg",
-            "recvmsg",
-        ] {
+        let topology = include_str!("topology.rs")
+            .split_once("#[cfg(test)]")
+            .unwrap()
+            .0;
+        assert!(!topology.contains("unsafe"));
+        assert_eq!(topology.matches("sys::UeventSocket::open()").count(), 1);
+        assert_eq!(SYS.matches("SYS_SOCKET,").count(), 1);
+        assert_eq!(SYS.matches("SYS_BIND,").count(), 1);
+        assert_eq!(SYS.matches("SYS_RECVFROM,").count(), 1);
+        for forbidden in ["TcpStream", "UnixStream", "listen(", "sendmsg", "recvmsg"] {
             assert!(!shipped.contains(forbidden));
             assert!(!COLLECTOR.contains(forbidden));
             assert!(!SYS.contains(forbidden));
+            assert!(!topology.contains(forbidden));
         }
     }
 }

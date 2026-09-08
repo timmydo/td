@@ -74,7 +74,7 @@ an ioctl) the amendment is made here first rather than found in a diff.
 | 8 | `td-sh` | `umask(2)`, `rt_sigaction(2)` (disposition-only), `ioctl(2)` (three pinned requests), `poll(2)` |
 | 9 | `td-jail` | `close(2)`, `ioctl(2)` with three value-pinned requests, `wait4(2)`, `kill(2)` with two fixed signals, `setsid(2)`, `capget(2)`, `capset(2)`, `pivot_root(2)`, `prctl(2)`, `mount(2)`, `umount2(2)`, `unshare(2)` with two value-pinned namespace sets, `prlimit64(2)` with one value-pinned resource, `seccomp(2)` with one value-pinned operation and two exact flag values |
 | 10 | `td-busd` | `recvmsg(2)`, `sendmsg(2)`, `getsockopt(2)` with two value-pinned options; plus a SECOND scoped allow for descriptor adoption — see [§10](#10-td-busd--the-session-bus-broker) |
-| 11 | `td-profiler` | `close(2)`, `mmap(2)`, `munmap(2)`, `ioctl(2)` with four pinned requests, `setgroups(2)`, `setgid(2)`, `setuid(2)`, `clock_gettime(2)`, `perf_event_open(2)` |
+| 11 | `td-profiler` | `close(2)`, `mmap(2)`, `munmap(2)`, `ioctl(2)` with four pinned requests, `setgroups(2)`, `setgid(2)`, `setuid(2)`, `clock_gettime(2)`, `perf_event_open(2)`, `socket(2)`, `bind(2)`, `recvfrom(2)` for fixed kernel CPU notifications |
 | 12 | `td-portal` | `recvmsg(2)`, `sendmsg(2)`, `close(2)` for bounded Wayland transfer and credential replies; one scoped received-descriptor adoption |
 | 13 | `td-audio` | `ioctl(2)` with eleven value-pinned PCM requests, `poll(2)`, `getsockopt(2)` pinned to `SOL_SOCKET`/`SO_PEERCRED` |
 | 14 | `td-editor` | `recvmsg(2)`, `sendmsg(2)`, `fcntl(2)` pinned to `F_DUPFD_CLOEXEC`, `F_GETFL` and `F_SETFL`, `flistxattr(2)` pinned to a size-only query; plus one scoped descriptor adoption |
@@ -1869,9 +1869,10 @@ same landing.
 
 ## 11. `td-profiler` — continuous system observation
 
-The profiler carries exactly NINE syscalls through one x86-64 `syscall6`
+The profiler carries exactly TWELVE syscalls through one x86-64 `syscall6`
 instruction: `perf_event_open(2)`, `mmap(2)`, `munmap(2)`, `ioctl(2)`,
-`close(2)`, `clock_gettime(2)`, `setgroups(2)`, `setgid(2)`, and `setuid(2)`.
+`close(2)`, `clock_gettime(2)`, `setgroups(2)`, `setgid(2)`, `setuid(2)`,
+`socket(2)`, `bind(2)`, and `recvfrom(2)`.
 One module-level allowance covers that instruction, atomic acquire/release
 accesses to the kernel-owned perf ring head and tail, bounded metadata-header
 reads used to validate the data offset and size, and the bounded copy from the
@@ -1900,7 +1901,25 @@ CPU-clock event into that CPU's metadata ring; ID writes one live `u64`; enable
 and disable take argument zero. `mmap` is exactly shared read/write over the
 metadata descriptor at offset zero for one metadata page plus a power-of-two
 data page count. `munmap` receives only the owned pair. `close` receives only
-the two event descriptors created by this module.
+the event descriptors and the kernel-notification socket created by this module.
+
+`UeventSocket` owns that socket without exposing its descriptor. Creation is
+pinned to AF_NETLINK (16), SOCK_DGRAM|SOCK_CLOEXEC|SOCK_NONBLOCK (0x80802),
+and NETLINK_KOBJECT_UEVENT (15). Bind takes the owned descriptor and a
+12-byte sockaddr_nl with family 16, zero pad and port, and multicast group 1.
+Receive takes only that owned descriptor and a borrowed writable byte slice,
+with MSG_DONTWAIT|MSG_TRUNC (0x60), a live 12-byte sender address and a
+four-byte in/out length. The returned address must have the expected size
+and family. Only sender port zero and group 1 reach the kernel-event parser;
+other senders are discarded within the same bounded drain. Zero or oversized
+kernel datagrams and every error except EAGAIN/EINTR fail observation.
+EAGAIN ends a drain; EINTR consumes an attempt. The object closes on every
+setup error and on drop. It never sets NETLINK_NO_ENOBUFS and carries no
+send, connect, listen, socket-option, ancillary-data or descriptor-adoption
+operation. The safe topology module alone constructs and consumes this
+endpoint, with the sequence/loss policy in `td-profiler/DESIGN.md`.
+Tests pin all request values, address layout, call counts, close-on-exec
+and nonblocking flags, and the absence of an export or control operation.
 
 `clock_gettime` is pinned to `CLOCK_MONOTONIC`, the clock selected in both event
 attributes, so startup fences, ring records, and capture coverage share one
@@ -1910,10 +1929,11 @@ and startup inventory and before sampling is enabled. Collection reads
 `/proc/self/status` through safe `std` and refuses unless all four uid/gid slots
 and the empty supplementary group list agree.
 
-Deliberately absent are ptrace, BPF, sockets, `openat`, `statx`, caller-supplied
+Deliberately absent are ptrace, BPF, network/control sockets, `openat`, `statx`, caller-supplied
 ioctl requests, another perf event type, kernel samples, and a signal handler.
 Ordinary capture files, `/proc` and `/sys` reads, fsync, and atomic rename use
-safe `std`. A tenth syscall, a fifth request, another event layout, a second
+safe `std`. A thirteenth syscall, a fifth ioctl request, another socket
+family/protocol/group or receive flag, another event layout, a second
 scoped unsafe allowance, or any pointer escape from `sys.rs` is an amendment
 here and in `td-profiler/DESIGN.md`.
 

@@ -11,6 +11,9 @@ const SYS_CLOSE: usize = 3;
 const SYS_MMAP: usize = 9;
 const SYS_MUNMAP: usize = 11;
 const SYS_IOCTL: usize = 16;
+const SYS_SOCKET: usize = 41;
+const SYS_RECVFROM: usize = 45;
+const SYS_BIND: usize = 49;
 const SYS_SETGID: usize = 106;
 const SYS_SETUID: usize = 105;
 const SYS_SETGROUPS: usize = 116;
@@ -153,6 +156,108 @@ impl Drop for CpuEvents {
         let _ = ioctl_value(self.metadata_fd, PERF_EVENT_IOC_DISABLE, 0);
         let _ = close(self.sample_fd);
         let _ = close(self.metadata_fd);
+    }
+}
+
+const AF_NETLINK: u16 = 16;
+const SOCK_DGRAM_CLOEXEC_NONBLOCK: usize = 2 | 0x80000 | 0x800;
+const NETLINK_KOBJECT_UEVENT: usize = 15;
+const MSG_DONTWAIT_TRUNC: usize = 0x40 | 0x20;
+
+#[repr(C)]
+struct NetlinkAddress {
+    family: u16,
+    pad: u16,
+    port: u32,
+    groups: u32,
+}
+
+pub struct UeventSocket {
+    fd: i32,
+}
+
+pub enum UeventRead {
+    Empty,
+    Foreign,
+    Kernel(usize),
+}
+
+impl UeventSocket {
+    pub fn open() -> io::Result<Self> {
+        let fd = value(syscall6(
+            SYS_SOCKET,
+            usize::from(AF_NETLINK),
+            SOCK_DGRAM_CLOEXEC_NONBLOCK,
+            NETLINK_KOBJECT_UEVENT,
+            0,
+            0,
+            0,
+        ))?;
+        let socket = Self { fd: fd as i32 };
+        let address = NetlinkAddress {
+            family: AF_NETLINK,
+            pad: 0,
+            port: 0,
+            groups: 1,
+        };
+        check(syscall6(
+            SYS_BIND,
+            socket.fd as usize,
+            &address as *const NetlinkAddress as usize,
+            std::mem::size_of::<NetlinkAddress>(),
+            0,
+            0,
+            0,
+        ))?;
+        Ok(socket)
+    }
+
+    pub fn receive(&mut self, buffer: &mut [u8]) -> io::Result<UeventRead> {
+        let mut address = NetlinkAddress {
+            family: 0,
+            pad: 0,
+            port: u32::MAX,
+            groups: 0,
+        };
+        let mut length = std::mem::size_of::<NetlinkAddress>() as u32;
+        let received = match value(syscall6(
+            SYS_RECVFROM,
+            self.fd as usize,
+            buffer.as_mut_ptr() as usize,
+            buffer.len(),
+            MSG_DONTWAIT_TRUNC,
+            &mut address as *mut NetlinkAddress as usize,
+            &mut length as *mut u32 as usize,
+        )) {
+            Ok(received) => received,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                return Ok(UeventRead::Empty)
+            }
+            Err(error) => return Err(error),
+        };
+        if length as usize != std::mem::size_of::<NetlinkAddress>() || address.family != AF_NETLINK
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid netlink sender address",
+            ));
+        }
+        if address.port != 0 || address.groups != 1 {
+            return Ok(UeventRead::Foreign);
+        }
+        if received == 0 || received > buffer.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "truncated kernel notification",
+            ));
+        }
+        Ok(UeventRead::Kernel(received))
+    }
+}
+
+impl Drop for UeventSocket {
+    fn drop(&mut self) {
+        let _ = close(self.fd);
     }
 }
 
@@ -505,6 +610,32 @@ mod tests {
         metadata_attr, sample_attr, AtomicU64, ATTR_BYTES, ATTR_SAMPLE_ID_ALL, DATA_HEAD_OFFSET,
         DATA_TAIL_OFFSET,
     };
+
+    #[test]
+    fn kernel_notification_abi_and_descriptor_policy_are_pinned() {
+        use super::*;
+        assert_eq!(AF_NETLINK, 16);
+        assert_eq!(NETLINK_KOBJECT_UEVENT, 15);
+        assert_eq!(SOCK_DGRAM_CLOEXEC_NONBLOCK, 0x80802);
+        assert_eq!(MSG_DONTWAIT_TRUNC, 0x60);
+        assert_eq!(std::mem::size_of::<NetlinkAddress>(), 12);
+        assert_eq!(std::mem::offset_of!(NetlinkAddress, family), 0);
+        assert_eq!(std::mem::offset_of!(NetlinkAddress, port), 4);
+        assert_eq!(std::mem::offset_of!(NetlinkAddress, groups), 8);
+        let socket = UeventSocket::open().unwrap();
+        let info = std::fs::read_to_string(format!("/proc/self/fdinfo/{}", socket.fd)).unwrap();
+        let flags = info
+            .lines()
+            .find_map(|line| line.strip_prefix("flags:\t"))
+            .unwrap();
+        let flags = u64::from_str_radix(flags, 8).unwrap();
+        assert_eq!(flags & 0x80800, 0x80800);
+        let mut socket = socket;
+        assert!(matches!(
+            socket.receive(&mut [0; 4096]).unwrap(),
+            UeventRead::Empty | UeventRead::Kernel(_)
+        ));
+    }
 
     #[test]
     fn attributes_pin_size_clock_and_sample_contract() {

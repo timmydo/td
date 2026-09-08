@@ -250,8 +250,9 @@ Collection from outside application jails is deliberate. It requires no jail
 API or relaxation: an application neither opens the events nor reads another
 process's profile through td-profiler. The collector uses `perf_event_open`,
 read-only startup `/proc` metadata, and memory-mapped perf ring buffers. It
-does not use ptrace, BPF, a kernel module, shell, an external library, or a
-socket.
+does not use ptrace, BPF, a kernel module, shell, or an external library.
+One receive-only netlink socket observes kernel CPU notifications; it has
+no request, control, descriptor-transfer or profile-export operation.
 
 Both perf events pin the same non-sample trailer fields:
 `PERF_SAMPLE_IDENTIFIER`, `TID`, `TIME`, and `CPU`. The sample event additionally
@@ -259,9 +260,22 @@ requests `IP` and `CALLCHAIN`, which affect only `PERF_RECORD_SAMPLE`. The
 identifier and fixed trailer subset make records from the shared ring
 unambiguous without guessing which event emitted them.
 
-The first version pins `CONFIG_HOTPLUG_CPU=n`. Runtime CPU topology is therefore
-immutable: supporting hotplug later requires a design amendment and a new
-loss-aware event source, not polling the current mask. The daemon recovers or
+The standard kernel enables upstream SMP and CPU hotplug, with 256 possible
+CPUs matching td-vm's allocation ceiling. CPU topology is not immutable.
+The collector subscribes to kernel `NETLINK_KOBJECT_UEVENT` group 1 before
+reading the CPU mask or constructing the startup baseline. It keeps that
+descriptor after dropping credentials. Only multicast datagrams with the
+kernel's port ID zero are parsed. Datagram truncation, receive errors including
+`ENOBUFS`, malformed identities, sequence discontinuities, or exhausting the
+bounded drain all invalidate the observation. Unrelated kernel events advance
+the sequence; every CPU-subsystem event invalidates it. Global sequence gaps
+can reflect unrelated namespace-filtered events as well as loss, so this is
+deliberately conservative. The receiver never enables `NETLINK_NO_ENOBUFS`.
+Each drain consumes at most 256 datagrams with one reusable 4096-byte buffer.
+Startup drains bracket the online-mask/perf/baseline setup; a CPU event in
+that interval retries the entire setup, even if the final mask is unchanged.
+
+The daemon recovers or
 reclaims old capture directories before collection, then starts the privileged
 observation sequence. A persistent owner file and its kernel-held exclusive
 lock serialize collectors for the entire daemon lifetime; partial-directory
@@ -352,12 +366,29 @@ prior worker finishes, so processing latency cannot create an unsampled
 interval or an unbounded worker backlog.
 
 The image pins `kernel.perf_event_paranoid` to at least 1, so the unprivileged
-process cannot open another system-wide event. The service uses
-`restart=on-failure`; it has no planned exit or reconfiguration path. An online
-mask change despite the kernel pin is a conformance failure: the daemon closes
-the capture with each CPU's last known coverage end and exits nonzero. Sampling
+process cannot open another system-wide event. Each capture iteration drains
+the notification stream before perf rings, including while a processing worker
+is active. Rotation drains it again and rechecks the online mask before
+enabling another capture. A CPU event, uncertain notification stream, or mask
+disagreement closes the active capture with a global loss fence at its start,
+no claimed coverage rows, and a terminal diagnostic. This invalidates all its
+task baselines and does not fabricate an exact transition timestamp. Sampling
+stays disabled while the affected report is published, then the process exits
+nonzero. The existing `restart=on-failure` service starts a fresh privileged
+opener and rebuilds the complete baseline for the current online set. No
+collector regains credentials, retains a privileged worker, or silently drops
+a failed CPU. Repeated topology churn uses the supervisor's failure backoff.
+
+Kernel notifications are asynchronous and contain no transition timestamp.
+Capture coverage measures the enabled interval of its configured perf events;
+it is not a certificate that the system-wide CPU mask was constant at every
+instant. A late notification invalidates the active capture conservatively;
+it cannot revise an already published capture or assign exact online/offline
+intervals to it. Reports preserve the configured CPU roster and notification
+loss explicitly. Exact hotplug timing is outside this measurement contract.
+Sampling
 defaults to 99 Hz per online CPU so periodic work is less likely to phase-lock
-with the profiler. The rate and fixed CPU mask are recorded in every capture
+with the profiler. The rate and configured CPU mask are recorded in every capture
 manifest.
 
 ## 4. Address ownership and symbols
@@ -764,8 +795,9 @@ design:
    capture directory, rotation policy, deployment object index, and boot/image
    assertions. Account-roster tests pin `profiler`, the members-capable
    `profiler-read` group, setgid directory modes, and the
-   `perf_event_paranoid` value. They also pin `CONFIG_HOTPLUG_CPU=n`, prove the
-   running online mask is fixed, prove the indexed store is the read-only EROFS
+   `perf_event_paranoid` value. They also pin SMP and CPU-hotplug support,
+   exercise one- and two-CPU boots and a real CPU offline/online transition,
+   require collector restart and capture loss evidence, prove the indexed store is the read-only EROFS
    deployment mount, and prove indexed companions remain readable after the
    credential drop. Tests distinguish whole-baseline startup loss from a
    per-task snapshot failure and pin the three-attempt nonzero failure path.
@@ -805,6 +837,7 @@ through offline regeneration against the same indexed symbol closure.
 A release is conforming only when the built kernel exposes the required perf
 event ABI, the collector remains outside jails, every shipped source-built
 user-mode ELF has a verified companion, capture loss is visible, and the image
-contains no profiler socket, uploader, socket syscall, inherited socket
-descriptor, or automatic export path. An explicitly authorized reader remains
+contains no profiler control socket, uploader, inherited socket descriptor,
+or automatic export path. Its only socket is the internally created,
+receive-only kernel notification endpoint described above. An explicitly authorized reader remains
 responsible for what it does with the files it can read.

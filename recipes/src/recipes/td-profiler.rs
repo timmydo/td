@@ -22,6 +22,7 @@ const MODULES: &[(&str, &str)] = &[
     ("state", include_str!("../../../td-profiler/src/state.rs")),
     ("symbol", include_str!("../../../td-profiler/src/symbol.rs")),
     ("sys", include_str!("../../../td-profiler/src/sys.rs")),
+    ("topology", include_str!("../../../td-profiler/src/topology.rs")),
 ];
 
 #[cfg(test)]
@@ -138,7 +139,7 @@ mod tests {
         declared.sort_unstable();
         written.sort_unstable();
         assert_eq!(written, declared);
-        assert_eq!(written.len(), 14);
+        assert_eq!(written.len(), 15);
     }
 
     #[test]

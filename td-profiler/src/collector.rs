@@ -167,6 +167,7 @@ impl CollectorLock {
 
 struct Observation {
     cpus: Vec<sys::CpuEvents>,
+    topology: crate::topology::Monitor,
     cpu_numbers: Vec<u32>,
     carry: Vec<Event>,
     symbolizer: Option<Symbolizer>,
@@ -201,6 +202,7 @@ impl ReportWorker {
 }
 
 fn start_observation(config: &Config) -> Result<Observation, String> {
+    let mut topology = crate::topology::Monitor::open()?;
     let paranoid = perf_event_paranoid()?;
     if paranoid < 1 {
         return Err(format!(
@@ -214,6 +216,7 @@ fn start_observation(config: &Config) -> Result<Observation, String> {
         },
         None => Symbolizer::default(),
     };
+    topology.check()?;
     let cpu_numbers = online_cpus()?;
     let mut cpus = Vec::with_capacity(cpu_numbers.len());
     for cpu in &cpu_numbers {
@@ -275,9 +278,11 @@ fn start_observation(config: &Config) -> Result<Observation, String> {
             "online CPU topology changed during startup: before {cpu_numbers:?}, after {after:?}"
         ));
     }
+    topology.check()?;
     carry.sort_by_key(Event::ordering_key);
     Ok(Observation {
         cpus,
+        topology,
         cpu_numbers,
         carry,
         symbolizer: Some(symbolizer),
@@ -336,6 +341,7 @@ fn collect_capture(
         .unwrap_or_else(|| vec![None; observation.cpus.len()]);
     let mut coverage_ends = vec![None; observation.cpus.len()];
     let mut fatal_errors = Vec::new();
+    let mut topology_failed = false;
     let mut reservation_uncertain = false;
     let mut raw_full = false;
     let mut enabled: Vec<bool> = coverage_starts.iter().map(Option::is_some).collect();
@@ -351,6 +357,11 @@ fn collect_capture(
     let mut loss_fences = vec![start_ns; observation.cpus.len()];
 
     while fatal_errors.is_empty() {
+        if let Err(error) = observation.topology.check() {
+            topology_failed = true;
+            fatal_errors.push(error);
+            break;
+        }
         if reporter.as_ref().is_some_and(ReportWorker::is_finished) {
             if let Err(error) = finish_report(observation, reporter, false) {
                 fatal_errors.push(format!("finish prior capture: {error}"));
@@ -468,29 +479,43 @@ fn collect_capture(
             raw_full = outcome.raw_full;
         }
     }
-    if let Some(fence) = disable_failure_fence {
-        append_event(
-            &mut events,
-            &mut raw_bytes,
-            Event {
-                time_ns: fence,
-                cpu: 0,
-                sequence: u64::MAX,
-                pid: 0,
-                tid: 0,
-                kind: Kind::Lost {
-                    count: disable_failed.iter().filter(|failed| **failed).count() as u64,
-                    reason: b"sample-disable-failure".to_vec(),
-                },
-            },
-        )?;
-    }
     let end_ns = sys::monotonic_ns().map_err(|e| format!("read capture end: {e}"))?;
     if reporter.is_some() {
         if let Err(error) = finish_report(observation, reporter, false) {
             fatal_errors.push(format!("finish prior capture: {error}"));
             reservation_uncertain = true;
         }
+    }
+    if !topology_failed {
+        if let Err(error) = observation.topology.check() {
+            topology_failed = true;
+            fatal_errors.push(error);
+        }
+    }
+    match online_cpus() {
+        Ok(after) if after == observation.cpu_numbers => {}
+        Ok(after) => {
+            let message = format!(
+                "online CPU topology changed during capture: before {:?}, after {after:?}",
+                observation.cpu_numbers
+            );
+            topology_failed = true;
+            fatal_errors.push(message);
+        }
+        Err(error) => {
+            let message = format!("read online CPU topology after capture: {error}");
+            topology_failed = true;
+            fatal_errors.push(message);
+        }
+    }
+    if let Some(loss) = loss_after_stop(
+        start_ns,
+        topology_failed,
+        disable_failure_fence,
+        &disable_failed,
+        &mut coverage_ends,
+    ) {
+        append_event(&mut events, &mut raw_bytes, loss)?;
     }
     let carry = std::mem::take(&mut observation.carry);
     let meta = Meta {
@@ -529,20 +554,6 @@ fn collect_capture(
                 wall_start_seconds: next_wall_start_seconds,
                 starts: next_starts,
             });
-        }
-    }
-    match online_cpus() {
-        Ok(after) if after == observation.cpu_numbers => {}
-        Ok(after) => {
-            let message = format!(
-                "online CPU topology changed during capture: before {:?}, after {after:?}",
-                observation.cpu_numbers
-            );
-            fatal_errors.push(message);
-        }
-        Err(error) => {
-            let message = format!("read online CPU topology after capture: {error}");
-            fatal_errors.push(message);
         }
     }
     if !fatal_errors.is_empty() {
@@ -584,6 +595,36 @@ fn collect_capture(
         finish_report(observation, reporter, true)?;
         Err(fatal_errors.join("; "))
     }
+}
+
+fn loss_after_stop(
+    start_ns: u64,
+    topology_failed: bool,
+    disable_failure_fence: Option<u64>,
+    disable_failed: &[bool],
+    coverage_ends: &mut [Option<u64>],
+) -> Option<Event> {
+    let fence = if topology_failed {
+        coverage_ends.fill(None);
+        start_ns
+    } else {
+        disable_failure_fence?
+    };
+    Some(Event {
+        time_ns: fence,
+        cpu: 0,
+        sequence: u64::MAX,
+        pid: 0,
+        tid: 0,
+        kind: Kind::Lost {
+            count: (disable_failed.iter().filter(|failed| **failed).count() as u64).max(1),
+            reason: if topology_failed {
+                b"cpu-topology-uncertain".to_vec()
+            } else {
+                b"sample-disable-failure".to_vec()
+            },
+        },
+    })
 }
 
 fn wall_seconds() -> Result<u64, String> {
@@ -2352,6 +2393,70 @@ mod tests {
     use std::path::Path;
     use std::path::PathBuf;
     use std::time::Duration;
+
+    #[test]
+    fn topology_loss_removes_coverage_and_uses_one_reserved_loss_slot() {
+        for disables in [vec![false, false], vec![true, true]] {
+            let mut ends = vec![Some(150), Some(160)];
+            let loss = super::loss_after_stop(100, true, Some(120), &disables, &mut ends).unwrap();
+            assert_eq!(loss.time_ns, 100);
+            assert!(ends.iter().all(Option::is_none));
+            assert!(
+                matches!(&loss.kind, Kind::Lost { reason, .. } if reason == b"cpu-topology-uncertain")
+            );
+            let mut events = Vec::new();
+            let mut bytes = NORMAL_RAW_BYTES;
+            append_event(&mut events, &mut bytes, loss).unwrap();
+            append_event(
+                &mut events,
+                &mut bytes,
+                terminal_error_event(170, &["CPU changed".into()]),
+            )
+            .unwrap();
+            assert_eq!(events.len(), 2);
+            assert!(bytes <= raw::MAX_RAW_FILE_BYTES);
+            let analysis = crate::state::analyze(&events).unwrap();
+            assert!(analysis.lost_records > 0);
+        }
+        let mut ends = [Some(150)];
+        assert!(super::loss_after_stop(100, false, None, &[false], &mut ends).is_none());
+        assert_eq!(ends, [Some(150)]);
+    }
+
+    #[test]
+    fn topology_observation_brackets_startup_and_rotation() {
+        let source = include_str!("collector.rs")
+            .split_once("#[cfg(test)]")
+            .unwrap()
+            .0;
+        let startup = source
+            .split_once("fn start_observation")
+            .unwrap()
+            .1
+            .split_once("fn collect_capture")
+            .unwrap()
+            .0;
+        assert!(startup.find("Monitor::open()").unwrap() < startup.find("online_cpus()").unwrap());
+        assert_eq!(startup.matches("topology.check()").count(), 2);
+        let capture = source
+            .split_once("fn collect_capture")
+            .unwrap()
+            .1
+            .split_once("fn loss_after_stop")
+            .unwrap()
+            .0;
+        assert_eq!(capture.matches("observation.topology.check()").count(), 2);
+        assert!(
+            capture.find("observation.topology.check()").unwrap()
+                < capture.find("drain_cpu(").unwrap()
+        );
+        let rotation = capture.split_once("let end_ns =").unwrap().1;
+        assert!(
+            rotation.find("observation.topology.check()").unwrap()
+                < rotation.find("enable_sampling(").unwrap()
+        );
+        assert!(capture.contains("loss_after_stop("));
+    }
 
     #[test]
     fn proc_maps_preserve_path_bytes_and_device_identity() {

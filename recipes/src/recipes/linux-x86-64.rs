@@ -575,6 +575,8 @@ pub fn recipe() -> Recipe {
                   /^#? *CONFIG_HW_RANDOM_TPM[ =]/d; \
                   /^#? *CONFIG_PERF_EVENTS[ =]/d; \
                   /^#? *CONFIG_HOTPLUG_CPU[ =]/d; \
+                  /^#? *CONFIG_SMP[ =]/d; \
+                  /^#? *CONFIG_NR_CPUS[ =]/d; \
                   /^#? *CONFIG_USER_NS[ =]/d; \
                   /^#? *CONFIG_PID_NS[ =]/d; \
                   /^#? *CONFIG_UTS_NS[ =]/d; \
@@ -687,7 +689,9 @@ pub fn recipe() -> Recipe {
                    '# CONFIG_TCG_TPM2_HMAC is not set' \
                    '# CONFIG_HW_RANDOM_TPM is not set' \
                    'CONFIG_PERF_EVENTS=y' \
-                   '# CONFIG_HOTPLUG_CPU is not set' \
+                   'CONFIG_SMP=y' \
+                   'CONFIG_NR_CPUS=256' \
+                   'CONFIG_HOTPLUG_CPU=y' \
                    'CONFIG_USER_NS=y' \
                    'CONFIG_PID_NS=y' \
                    'CONFIG_UTS_NS=y' \
@@ -795,7 +799,9 @@ pub fn recipe() -> Recipe {
                  grep -q '^CONFIG_TCG_TIS=y' .config || { echo 'TCG_TIS off - TPM enrollment requires ACPI discovery and TPM2 device support' >&2; exit 1; }; \
                  grep -q '^CONFIG_TCG_CRB=y' .config || { echo 'TCG_CRB off - TPM enrollment requires ACPI discovery and TPM2 device support' >&2; exit 1; }; \
                  grep -q '^CONFIG_PERF_EVENTS=y' .config || { echo 'PERF_EVENTS off — td-profiler cannot open its per-CPU software sampling events' >&2; exit 1; }; \
-                 if grep -q '^CONFIG_HOTPLUG_CPU=y' .config; then echo 'HOTPLUG_CPU on — td-profiler requires one fixed online-CPU roster for complete system-wide coverage' >&2; exit 1; fi; \
+                 grep -q '^CONFIG_SMP=y$' .config || { echo 'SMP missing' >&2; exit 1; }; \
+                 grep -q '^CONFIG_NR_CPUS=256$' .config || { echo 'NR_CPUS does not match the VM allocation ceiling' >&2; exit 1; }; \
+                 grep -q '^CONFIG_HOTPLUG_CPU=y$' .config || { echo 'HOTPLUG_CPU missing' >&2; exit 1; }; \
                  grep -q '^CONFIG_USER_NS=y' .config || { echo 'USER_NS off — unshare(CLONE_NEWUSER) returns EINVAL, so td-jail cannot build a sandbox at all' >&2; exit 1; }; \
                  grep -q '^CONFIG_PID_NS=y' .config || { echo 'PID_NS off — a jailed app would see (and could signal) every process on the machine' >&2; exit 1; }; \
                  grep -q '^CONFIG_UTS_NS=y' .config || { echo 'UTS_NS off — a jail could not present its own hostname' >&2; exit 1; }; \
@@ -1092,7 +1098,7 @@ mod tests {
     }
 
     #[test]
-    fn profiler_perf_events_are_builtin_and_cpu_hotplug_is_off() {
+    fn profiler_perf_events_and_smp_hotplug_are_builtin() {
         let command_text = recipe()
             .steps
             .unwrap_or_default()
@@ -1105,9 +1111,13 @@ mod tests {
             .join("\n");
         for required in [
             "CONFIG_PERF_EVENTS=y",
-            "# CONFIG_HOTPLUG_CPU is not set",
+            "CONFIG_SMP=y",
+            "CONFIG_NR_CPUS=256",
+            "CONFIG_HOTPLUG_CPU=y",
             "grep -q '^CONFIG_PERF_EVENTS=y' .config",
-            "grep -q '^CONFIG_HOTPLUG_CPU=y' .config",
+            "grep -q '^CONFIG_SMP=y$' .config",
+            "grep -q '^CONFIG_NR_CPUS=256$' .config",
+            "grep -q '^CONFIG_HOTPLUG_CPU=y$' .config",
         ] {
             assert!(
                 command_text.contains(required),

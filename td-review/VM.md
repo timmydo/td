@@ -263,6 +263,13 @@ complete deployments with their debug companions. This is a deployment
 capacity allowance, not a claim that a cold distribution build fits there.
 Private development-store placement and VM data-capacity management remain
 required before reporting the complete repository workflow ready. The standard
+kernel enables upstream SMP and CPU hotplug, with up to 256 possible CPUs.
+Assigned VM CPUs come online at boot. The profiler observes kernel CPU
+notifications and restarts with a new baseline after a topology change,
+recording the affected capture's uncertainty instead of requiring a patched
+kernel with CPU hotplug disabled. CPU allocation in the manager still applies
+at boot; live QEMU CPU-device management is not implemented.
+The standard
 Rust toolchain also builds cargo-clippy and clippy-driver from its pinned
 source release, with an offline clean/denied-lint/repaired recipe probe.
 On a standard td system, the control-plane helper resolver selects the
