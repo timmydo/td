@@ -1404,16 +1404,9 @@ fn payload_paths(drv: &Derivation) -> io::Result<Vec<String>> {
     Ok(paths)
 }
 
-/// The remount flags an item takes BEYOND the read-only lock every closure item
-/// gets. Keyed on CANONICAL — the path the build sees, and the one the payload map
-/// names — never on the on-disk path, which differs for a td-interned item and
-/// would silently match nothing.
-fn extra_bind_flags(payloads: &[String], canonical: &str) -> usize {
-    if payloads.iter().any(|p| p == canonical) {
-        sys::MS_NOEXEC
-    } else {
-        0
-    }
+/// Canonical payload identities request noexec in addition to read-only.
+fn payload_noexec(payloads: &[String], canonical: &str) -> bool {
+    payloads.iter().any(|path| path == canonical)
 }
 
 /// The whole flag PLAN for a closure: one `(canonical, on_disk, extra)` per entry,
@@ -1423,17 +1416,17 @@ fn extra_bind_flags(payloads: &[String], canonical: &str) -> usize {
 /// a namespace and so cannot be tested: a payload argument there is one an
 /// untestable caller could pass empty. Pure otherwise, so the flag a payload gets
 /// is a value an assertion can hold.
-fn plan_bind_flags<'a>(
+fn plan_bind_restrictions<'a>(
     drv: &Derivation,
     closure: &'a [String],
-) -> io::Result<Vec<(&'a str, &'a str, usize)>> {
+) -> io::Result<Vec<(&'a str, &'a str, bool)>> {
     // The DATA channel's paths, read off the drv's own env — hashed drv data, so
     // the set cannot change without changing the derivation.
     let payloads = &payload_paths(drv)?;
     let mut plan = Vec::with_capacity(closure.len());
     for entry in closure {
         let (canonical, on_disk) = split_closure_entry(entry);
-        plan.push((canonical, on_disk, extra_bind_flags(payloads, canonical)));
+        plan.push((canonical, on_disk, payload_noexec(payloads, canonical)));
     }
     // Items are staged flat under `newstore/<basename>`, so two entries sharing a
     // basename bind onto ONE target and the second stacks over the first. That
@@ -1469,12 +1462,11 @@ fn plan_bind_flags<'a>(
     Ok(plan)
 }
 
-/// The flag word the child's SECOND mount issues — the remount that locks a staged
-/// item. A function so a test can hold it: re-composing the same `|` chain in an
-/// assertion observes nothing. The creating BIND deliberately does not take it,
-/// since bind creation ignores the flag word entirely.
-fn remount_flags(extra: usize) -> usize {
-    sys::MS_REMOUNT | sys::MS_BIND | sys::MS_RDONLY | extra
+fn mount_restriction_error(error: io::Error) -> io::Error {
+    if matches!(error.raw_os_error(), Some(1 | 38)) {
+        sys::warn(b"td-builder: mount_setattr requires Linux 5.12+ and permission from the host sandbox policy\n");
+    }
+    error
 }
 
 /// Run the drv's builder inside the namespace sandbox. `closure` lists every
@@ -1514,8 +1506,8 @@ pub fn build(
     // the mounts themselves happen in the child's namespace.
     let newstore = scratch.join("newstore");
     fs::create_dir_all(&newstore)?;
-    let plan = plan_bind_flags(drv, closure)?;
-    let mut binds: Vec<(CString, CString, usize)> = Vec::with_capacity(closure.len());
+    let plan = plan_bind_restrictions(drv, closure)?;
+    let mut binds: Vec<(CString, CString, bool)> = Vec::with_capacity(closure.len());
     // CANONICAL is the store path the build SEES; ON-DISK is where to bind FROM
     // (== canonical for daemon-resident items, a td store dir for td-interned ones).
     for (canonical, on_disk, extra) in plan {
@@ -1747,9 +1739,9 @@ pub fn build(
             // writable — outputs land as NEW entries beside the binds, never
             // through one — and the /gnu/store rbind below carries each
             // child's ro flag along.
-            for (src, dst, extra) in &binds {
+            for (src, dst, noexec) in &binds {
                 sys::mount(Some(src), dst, None, sys::MS_BIND, None)?;
-                sys::mount(None, dst, None, remount_flags(*extra), None)?;
+                sys::restrict_mount(dst, *noexec, false).map_err(mount_restriction_error)?;
             }
             // The fresh minimal root, then its skeleton dirs.
             sys::mount(Some(&tmpfs_c), &newroot_c, Some(&tmpfs_c), 0, None)?;
@@ -1973,7 +1965,7 @@ pub fn host_shell(
             target: CString::new(target.as_os_str().as_encoded_bytes())
                 .map_err(|_| err(format!("{}: NUL in path", target.display())))?,
             fail_msg: format!(
-                "td-builder host-sandbox: FAILED ro-remounting the bind parent dir {d}\n"
+                "td-builder host-sandbox: FAILED restricting the read-only bind parent dir {d}\n"
             )
             .into_bytes(),
         });
@@ -2150,7 +2142,7 @@ pub fn host_shell(
             // pivot_root requires), owned by the host uid/gid.
             sys::mount(Some(&tmpfs_c), &newroot_c, Some(&tmpfs_c), 0, Some(&tmpfs_data))
                 .map_err(|e| { sys::warn(b"td-builder host-sandbox: FAILED mounting the tmpfs root\n"); e })?;
-            // Expose each requested host path (rbind), read-only where asked.
+            // Expose each requested host path (rbind), recursively read-only where asked.
             // The mountpoint matches the source kind: dir → dir, file → file.
             for spec in &bind_specs {
                 if spec.src_is_dir {
@@ -2166,15 +2158,9 @@ pub fn host_shell(
                 sys::mount(Some(&spec.src), &spec.target, None, sys::MS_BIND | sys::MS_REC, None)
                     .map_err(|e| { sys::warn(&spec.fail_msg); e })?;
                 if spec.readonly {
-                    let ro = sys::mount(
-                        None,
-                        &spec.target,
-                        None,
-                        sys::MS_REMOUNT | sys::MS_BIND | sys::MS_REC | sys::MS_RDONLY,
-                        None,
-                    );
-                    // A child userns cannot always remount read-only a mount
-                    // owned by the host userns. For ro_optional binds that
+                    let ro = sys::restrict_mount(&spec.target, false, true).map_err(mount_restriction_error);
+                    // Adding restrictions preserves locked nosuid/nodev/noexec
+                    // attributes inherited from the source mount. For ro_optional binds that
                     // failure detaches the bind; every load-bearing read-only
                     // bind (notably the store) remains fatal.
                     if let Err(e) = ro {
@@ -2182,11 +2168,14 @@ pub fn host_shell(
                             // Rather than leave the host subtree writable inside
                             // the hermetic sandbox, detach it. The leftover empty
                             // mountpoint is harmless.
-                            sys::warn(b"td-builder host-sandbox: ro-remount not permitted for an ro_optional bind; detached (fail-closed, no host exposure)\n");
-                            let _ = sys::umount2(&spec.target, sys::MNT_DETACH);
+                            sys::umount2(&spec.target, sys::MNT_DETACH).map_err(|detach| {
+                                sys::warn(b"td-builder host-sandbox: mount_setattr failed and the optional exposure could not be detached\n");
+                                detach
+                            })?;
+                            sys::warn(b"td-builder host-sandbox: mount_setattr failed for an optional bind; detached without exposure\n");
                         } else {
                             sys::warn(&spec.fail_msg);
-                            sys::warn(b"td-builder host-sandbox: (FAILED ro-remounting the exposed path above)\n");
+                            sys::warn(b"td-builder host-sandbox: (FAILED restricting the exposed path above with mount_setattr)\n");
                             return Err(e);
                         }
                     }
@@ -2216,13 +2205,8 @@ pub fn host_shell(
                     None,
                 )
                 .map_err(|e| { sys::warn(&spec.fail_msg); e })?;
-                sys::mount(
-                    None,
-                    &spec.target,
-                    None,
-                    sys::MS_REMOUNT | sys::MS_BIND | sys::MS_RDONLY,
-                    None,
-                )
+                sys::restrict_mount(&spec.target, false, false)
+                .map_err(mount_restriction_error)
                 .map_err(|e| { sys::warn(&spec.fail_msg); e })?;
             }
             // Minimal /dev (replaces the dropped blanket host /dev bind): a fresh
@@ -2871,36 +2855,13 @@ mod tests {
 
     // A closure item binds WHOLE: `plan_staged_item` returns one `(on-disk, target)`
     // pair keyed by the store basename, whatever runnable programs the tree ships.
-    /// The DATA channel's mount half (APPLICATIONS.md §B.8). Three properties, and
-    /// the third is the one a reader should check first: `MS_NOEXEC` is pinned by
-    /// VALUE, because it reaches the kernel as a bit in a flag word and a wrong
-    /// constant is a mount that succeeds having promised something else.
+    /// Typed payload policy feeds the value-pinned mount attribute wrapper.
     #[test]
-    fn a_payload_binds_noexec_and_nothing_else_does() {
-        assert_eq!(sys::MS_NOEXEC, 0x8, "MS_NOEXEC is the kernel's, not ours");
+    fn only_payloads_request_additional_noexec() {
         let payloads = vec!["/td/store/def-firefox".to_string()];
-        assert_eq!(
-            extra_bind_flags(&payloads, "/td/store/def-firefox"),
-            sys::MS_NOEXEC
-        );
-        // An ordinary input keeps exactly the flags it always had — this landing
-        // must not quietly make the whole store non-executable, which would break
-        // every build rather than confine one payload.
-        assert_eq!(extra_bind_flags(&payloads, "/td/store/abc-gcc"), 0);
-        assert_eq!(extra_bind_flags(&[], "/td/store/def-firefox"), 0);
-        // The word the child ACTUALLY issues, through the same function the call
-        // site calls. Re-composing the `|` chain here instead would assert
-        // nothing — `(A|B|C|X) & X == X` for any values — and deleting `extra`
-        // from the production remount would leave it green.
-        assert_eq!(
-            remount_flags(extra_bind_flags(&payloads, "/td/store/def-firefox")),
-            sys::MS_REMOUNT | sys::MS_BIND | sys::MS_RDONLY | sys::MS_NOEXEC
-        );
-        assert_eq!(
-            remount_flags(extra_bind_flags(&payloads, "/td/store/abc-gcc")),
-            sys::MS_REMOUNT | sys::MS_BIND | sys::MS_RDONLY,
-            "an ordinary item must gain nothing"
-        );
+        assert!(payload_noexec(&payloads, "/td/store/def-firefox"));
+        assert!(!payload_noexec(&payloads, "/td/store/abc-gcc"));
+        assert!(!payload_noexec(&[], "/td/store/def-firefox"));
     }
 
     /// A drv declaring `paths` through the payload channel and nothing else.
@@ -2943,20 +2904,20 @@ mod tests {
             // where the bytes are. The flag must key on the FORMER.
             "/gnu/store/ghi-bash\t/td/store/ghi-bash".to_string(),
         ];
-        let plan = plan_bind_flags(&drv_with_payloads(&["/td/store/def-firefox"]), &closure).unwrap();
+        let plan = plan_bind_restrictions(&drv_with_payloads(&["/td/store/def-firefox"]), &closure).unwrap();
         assert_eq!(
             plan,
             vec![
-                ("/td/store/abc-gcc", "/td/store/abc-gcc", 0),
-                ("/td/store/def-firefox", "/td/store/def-firefox", sys::MS_NOEXEC),
-                ("/gnu/store/ghi-bash", "/td/store/ghi-bash", 0),
+                ("/td/store/abc-gcc", "/td/store/abc-gcc", false),
+                ("/td/store/def-firefox", "/td/store/def-firefox", true),
+                ("/gnu/store/ghi-bash", "/td/store/ghi-bash", false),
             ]
         );
         // A drv declaring no payload is exactly what every build is today.
-        assert!(plan_bind_flags(&drv_with_payloads(&[]), &closure)
+        assert!(plan_bind_restrictions(&drv_with_payloads(&[]), &closure)
             .unwrap()
             .iter()
-            .all(|(_, _, extra)| *extra == 0));
+            .all(|(_, _, noexec)| !*noexec));
     }
 
     /// A declared payload the closure never offers is a restriction that applied
@@ -2965,7 +2926,7 @@ mod tests {
     #[test]
     fn a_payload_missing_from_the_closure_is_an_error_not_a_no_op() {
         let closure = vec!["/td/store/abc-gcc".to_string()];
-        let e = plan_bind_flags(&drv_with_payloads(&["/td/store/def-firefox"]), &closure)
+        let e = plan_bind_restrictions(&drv_with_payloads(&["/td/store/def-firefox"]), &closure)
             .expect_err("a payload outside the closure must refuse");
         assert!(e.to_string().contains("def-firefox"), "{e}");
         assert!(e.to_string().contains("apply to nothing"), "{e}");
@@ -2973,8 +2934,8 @@ mod tests {
         // matching against it would let the restriction pass while applying to
         // a path the build never sees.
         let interned = vec!["/gnu/store/def-firefox\t/td/store/def-firefox".to_string()];
-        assert!(plan_bind_flags(&drv_with_payloads(&["/td/store/def-firefox"]), &interned).is_err());
-        assert!(plan_bind_flags(&drv_with_payloads(&["/gnu/store/def-firefox"]), &interned).is_ok());
+        assert!(plan_bind_restrictions(&drv_with_payloads(&["/td/store/def-firefox"]), &interned).is_err());
+        assert!(plan_bind_restrictions(&drv_with_payloads(&["/gnu/store/def-firefox"]), &interned).is_ok());
     }
 
     /// Items stage flat under `newstore/<basename>`, so two entries sharing one
@@ -2987,11 +2948,11 @@ mod tests {
             "/gnu/store/abc-x".to_string(),
             "/td/store/abc-x".to_string(),
         ];
-        let e = plan_bind_flags(&drv_with_payloads(&["/td/store/abc-x"]), &collide)
+        let e = plan_bind_restrictions(&drv_with_payloads(&["/td/store/abc-x"]), &collide)
             .expect_err("one payload and one ordinary item on one target must refuse");
         assert!(e.to_string().contains("shadow"), "{e}");
         // Agreeing entries are the pre-existing case and are left as they were.
-        assert!(plan_bind_flags(&drv_with_payloads(&[]), &collide).is_ok());
+        assert!(plan_bind_restrictions(&drv_with_payloads(&[]), &collide).is_ok());
     }
 
     /// `payload_paths` is how a plan learns what is restricted, so a SECOND
@@ -3008,13 +2969,13 @@ mod tests {
         let calls: Vec<&str> = shipped
             .lines()
             .map(str::trim)
-            .filter(|l| l.contains("payload_paths(drv)") || l.contains("plan_bind_flags("))
+            .filter(|l| l.contains("payload_paths(drv)") || l.contains("plan_bind_restrictions("))
             .collect();
         assert_eq!(
             calls,
             vec![
                 "let payloads = &payload_paths(drv)?;",
-                "let plan = plan_bind_flags(drv, closure)?;",
+                "let plan = plan_bind_restrictions(drv, closure)?;",
             ],
             "one reader of the payload set, one planner, and the planner is what \
              the staging loop consumes (APPLICATIONS.md section B.8)"
@@ -3039,12 +3000,12 @@ mod tests {
         let calls: Vec<&str> = shipped
             .lines()
             .map(str::trim)
-            .filter(|l| l.contains("sys::mount(") && l.contains("extra"))
+            .filter(|l| l.contains("sys::restrict_mount(") && l.contains("noexec"))
             .collect();
         assert_eq!(
             calls,
-            ["sys::mount(None, dst, None, remount_flags(*extra), None)?;"],
-            "the payload flag must reach the kernel through the remount and nowhere \
+            ["sys::restrict_mount(dst, *noexec, false).map_err(mount_restriction_error)?;"],
+            "the payload restriction must reach the kernel through mount_setattr and nowhere \
              else (APPLICATIONS.md section B.8)"
         );
         // The creating bind must stay a bare MS_BIND: a flag word there applies
@@ -3055,7 +3016,7 @@ mod tests {
         );
         // ...and the scan must be able to SEE the loop, or it passes for nothing.
         assert!(
-            shipped.contains("fn remount_flags") && shipped.len() < src.len(),
+            shipped.contains("fn payload_noexec") && shipped.len() < src.len(),
             "the shipped-half split stopped working"
         );
         // The last seam a type cannot hold: the staging loop copies the plan's

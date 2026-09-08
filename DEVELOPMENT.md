@@ -29,6 +29,14 @@ integrator may land the first commits of a branch and stop, so never depend on
 a later commit to repair an earlier one. Do not combine several increments to
 save review work: the commit is the review and checkpoint unit.
 
+## Host kernel
+
+The builder requires Linux 5.12 or newer with `mount_setattr` available to
+its namespace sandbox. Read-only binds add restrictions without clearing
+locked source flags; td's writable `/var` is mounted nosuid,nodev. A blocked
+operation is a sandbox setup failure, with no writable-bind fallback. The
+value-pinned syscall boundary is recorded in `UNSAFE.md`.
+
 ## Ready
 
 `td-builder ready` is the pre-push gate. It runs

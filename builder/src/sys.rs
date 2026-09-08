@@ -23,6 +23,7 @@ const SYS_SOCKET: usize = 41;
 const SYS_GETUID: usize = 102;
 const SYS_GETGID: usize = 104;
 const SYS_MOUNT: usize = 165;
+const SYS_MOUNT_SETATTR: usize = 442;
 const SYS_UMOUNT2: usize = 166;
 const SYS_PIVOT_ROOT: usize = 155;
 const SYS_UNSHARE: usize = 272;
@@ -89,13 +90,6 @@ pub const CLONE_NEWUSER: usize = 0x1000_0000;
 pub const CLONE_NEWPID: usize = 0x2000_0000;
 pub const CLONE_NEWNET: usize = 0x4000_0000;
 
-pub const MS_RDONLY: usize = 0x1;
-/// APPLICATIONS.md §B.8: a declared `payloadInputs` item binds `ro,noexec`, so
-/// "never executed" is refused by the kernel rather than by a scan of the
-/// recipe's argv — which a build tool that can see the path defeats by
-/// concatenating it, reading it out of a file, or walking the store.
-pub const MS_NOEXEC: usize = 0x8;
-pub const MS_REMOUNT: usize = 0x20;
 pub const MS_BIND: usize = 0x1000;
 pub const MS_REC: usize = 0x4000;
 pub const MS_PRIVATE: usize = 0x4_0000;
@@ -180,6 +174,44 @@ pub fn mount(
     let d = data.map_or(std::ptr::null(), CStr::as_ptr);
     check(unsafe {
         syscall5(SYS_MOUNT, s as usize, target.as_ptr() as usize, t as usize, flags, d as usize)
+    })
+}
+
+const AT_RECURSIVE: usize = 0x8000;
+const MOUNT_ATTR_RDONLY: u64 = 0x1;
+const MOUNT_ATTR_NOEXEC: u64 = 0x8;
+
+#[repr(C)]
+struct MountAttr {
+    attr_set: u64,
+    attr_clr: u64,
+    propagation: u64,
+    userns_fd: u64,
+}
+
+fn readonly_mount_attr(noexec: bool) -> MountAttr {
+    MountAttr {
+        attr_set: MOUNT_ATTR_RDONLY | if noexec { MOUNT_ATTR_NOEXEC } else { 0 },
+        attr_clr: 0,
+        propagation: 0,
+        userns_fd: 0,
+    }
+}
+
+/// Add restrictions without clearing inherited locked mount attributes.
+/// Targets are mounts just created in the caller's private namespace.
+pub fn restrict_mount(target: &CStr, noexec: bool, recursive: bool) -> io::Result<()> {
+    let attr = readonly_mount_attr(noexec);
+    let flags = if recursive { AT_RECURSIVE } else { 0 };
+    check(unsafe {
+        syscall5(
+            SYS_MOUNT_SETATTR,
+            AT_FDCWD as usize,
+            target.as_ptr() as usize,
+            flags,
+            &attr as *const MountAttr as usize,
+            std::mem::size_of::<MountAttr>(),
+        )
     })
 }
 
@@ -807,6 +839,33 @@ pub fn exit_group(code: i32) -> ! {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn mount_restriction_request_is_additive_and_value_pinned() {
+        assert_eq!(super::SYS_MOUNT_SETATTR, 442);
+        assert_eq!(super::AT_FDCWD, -100);
+        assert_eq!(super::AT_RECURSIVE, 0x8000);
+        assert_eq!(super::MOUNT_ATTR_RDONLY, 1);
+        assert_eq!(super::MOUNT_ATTR_NOEXEC, 8);
+        assert_eq!(std::mem::size_of::<super::MountAttr>(), 32);
+        assert_eq!(std::mem::align_of::<super::MountAttr>(), 8);
+        assert_eq!(std::mem::offset_of!(super::MountAttr, attr_set), 0);
+        assert_eq!(std::mem::offset_of!(super::MountAttr, attr_clr), 8);
+        assert_eq!(std::mem::offset_of!(super::MountAttr, propagation), 16);
+        assert_eq!(std::mem::offset_of!(super::MountAttr, userns_fd), 24);
+        for noexec in [false, true] {
+            let attr = super::readonly_mount_attr(noexec);
+            assert_eq!(attr.attr_set, if noexec { 9 } else { 1 });
+            assert_eq!(attr.attr_clr, 0, "inherited restrictions must not be cleared");
+            assert_eq!(attr.propagation, 0);
+            assert_eq!(attr.userns_fd, 0);
+        }
+        let source = shipped_part(include_str!("sys.rs"));
+        assert_eq!(source.matches("SYS_MOUNT_SETATTR,").count(), 1);
+        assert!(source.contains("let attr = readonly_mount_attr(noexec);"));
+        assert!(source.contains("let flags = if recursive { AT_RECURSIVE } else { 0 };"));
+        assert!(source.contains("&attr as *const MountAttr as usize"));
+    }
+
     use super::*;
     use std::os::unix::ffi::OsStrExt;
 

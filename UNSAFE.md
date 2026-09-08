@@ -117,6 +117,25 @@ or caller-supplied proc tree cannot supply these witnesses. Confinement tests
 pin both callers immediately after their fresh proc mount and the one IPC
 unshare site. No new syscall or raw-syscall allowance is introduced.
 
+The builder's read-only bind restrictions use `mount_setattr(442)` through
+one safe wrapper in `sys.rs`. Its directory descriptor is `AT_FDCWD`, path
+is a NUL-free target just mounted in the private namespace, and flags are
+exactly zero or `AT_RECURSIVE` (0x8000). The 32-byte, four-u64 `mount_attr`
+sets `MOUNT_ATTR_RDONLY` (1), optionally `MOUNT_ATTR_NOEXEC` (8); its clear,
+propagation and user-namespace fields are always zero. No caller supplies an
+attribute word, descriptor, propagation mode or ID mapping. The operation
+only adds restrictions, preserving inherited locked nosuid, nodev, noexec
+and atime attributes that a legacy bind remount could accidentally clear.
+
+Derivation input binds restrict the newly created mount; declared payloads
+also request noexec. Host exposure rbinds restrict the whole mounted tree.
+The private tmpfs parents holding item binds restrict only their top mount,
+preserving separately writable children. Mandatory failures refuse workload
+execution; optional host exposures are detached on failure. Linux 5.12 or
+newer with this operation allowed is required; no weaker fallback is used.
+Tests pin the syscall and flag values, C layout, zero clear/propagation/ID
+fields, one raw call site, and the payload restriction's caller path.
+
 ## 1. `td-kexec` — the guest kexec helper
 
 The `td-kexec` guest helper is confined to exactly two syscalls

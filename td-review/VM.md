@@ -309,6 +309,12 @@ These helpers alone do not establish the complete repository workflow. Private
 writable store placement, capacity, workspace provisioning, and a two-guest
 full-check/Git round trip remain separate acceptance requirements.
 
+The builder preserves inherited mount restrictions when making private-store
+inputs read-only. Both host and derivation sandboxes use additive mount
+attributes, so td's nosuid,nodev writable state can hold executable native
+build inputs without weakening its mount policy. A successful IPC capability
+check alone does not prove private-store preparation or a complete build.
+
 ## Copy/paste before account linking
 
 Make ordinary text copy/paste work in both directions between the host desktop
