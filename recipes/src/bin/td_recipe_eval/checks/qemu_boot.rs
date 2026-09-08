@@ -435,6 +435,9 @@ const PERSISTENT_VOLUME_BYTES: u64 = td_engine::target_profile::DEPLOYMENT_DEBUG
     * PERSISTENT_DEPLOYMENT_COPIES
     + PERSISTENT_NON_DEBUG_BYTES
     + PERSISTENT_VOLUME_HEADROOM;
+// Published desktops need room for private development stores and checkouts.
+// This is virtual capacity; untouched space remains sparse on the host.
+pub(crate) const PUBLISHED_VOLUME_BYTES: u64 = 256 * 1024 * 1024 * 1024;
 // A 64 MiB console needs 17 passes including EOF; allow seven EINTR retries.
 const FINAL_DRAIN_PASSES: usize = 24;
 
@@ -3225,6 +3228,15 @@ pub(crate) enum VolumePurpose {
     Published,
 }
 
+impl VolumePurpose {
+    fn volume_bytes(self) -> u64 {
+        match self {
+            Self::Fixture => PERSISTENT_VOLUME_BYTES,
+            Self::Published => PUBLISHED_VOLUME_BYTES,
+        }
+    }
+}
+
 pub(crate) fn create_persistent_volume(
     deployment: &Path,
     mkfs: &Path,
@@ -3308,11 +3320,12 @@ fn create_persistent_volume_layout(
     };
     let fixture_payload_bytes =
         persistent_fixture_payload_bytes(deployment, copies, seccomp_probe)?;
-    let payload_limit = PERSISTENT_VOLUME_BYTES.saturating_sub(PERSISTENT_VOLUME_HEADROOM);
+    let volume_bytes = purpose.volume_bytes();
+    let payload_limit = volume_bytes.saturating_sub(PERSISTENT_VOLUME_HEADROOM);
     if fixture_payload_bytes > payload_limit {
         return Err(format!(
-            "persistent fixture payloads are {fixture_payload_bytes} bytes, exceeding the \
-             {payload_limit}-byte payload limit for the {PERSISTENT_VOLUME_BYTES}-byte volume"
+            "persistent volume payloads are {fixture_payload_bytes} bytes, exceeding the \
+             {payload_limit}-byte payload limit for the {volume_bytes}-byte volume"
         ));
     }
     let parent = output.parent().ok_or_else(|| {
@@ -3400,7 +3413,7 @@ fn create_persistent_volume_layout(
         .args(["--rootdir"])
         .arg(&seed)
         .args(["--subvol", "rw:@var", "--byte-count"])
-        .arg(PERSISTENT_VOLUME_BYTES.to_string())
+        .arg(volume_bytes.to_string())
         .args(["--uuid", &fixture_uuid, "--label", "td-system"])
         .arg(output)
         .status()

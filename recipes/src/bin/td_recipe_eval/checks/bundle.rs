@@ -21,15 +21,16 @@
 //! so in those words.
 
 use std::fs;
-use std::io::Write;
-use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::check_runner::RecipeCheckRunner;
 use crate::checks::qemu_boot::{
     build_btrfs_tools, create_persistent_volume, find_qemu_tool, provision_selector,
-    verify_deployment, verify_selector, RunTrust, VolumePurpose, SYSTEM_GUEST_MEMORY_MIB,
+    verify_deployment, verify_selector, RunTrust, VolumePurpose, PUBLISHED_VOLUME_BYTES,
+    SYSTEM_GUEST_MEMORY_MIB,
 };
 use crate::checks::vm_profile::{
     self, Compression, DiskFormat, CHECKSUMS_NAME, INITRD_NAME, KERNEL_NAME, LAUNCHER_NAME,
@@ -58,7 +59,7 @@ const MARKER_FORMAT: &str = "td-bundle-v1";
 #[derive(Debug, Clone)]
 pub(crate) struct BundleOptions {
     pub(crate) out: PathBuf,
-    /// Skip the qcow2 conversion and ship the 10 GiB raw volume. For a host
+    /// Skip the qcow2 conversion and ship the sparse raw volume. For a host
     /// with no `qemu-img`, and for anyone who would rather hand out a raw
     /// image than depend on qcow2 at all.
     pub(crate) raw: bool,
@@ -471,19 +472,54 @@ fn move_into_place(from: &Path, to: &Path) -> Result<(), String> {
             ))
         }
     }
-    // Unlink `to` first: `fs::copy` FOLLOWS a symlink at the destination, so a
-    // link planted at a bundle name would take the image bytes outside `out`.
-    // `open_out_dir` already cleared these names, so this is the second lock on
-    // the same door rather than the only one — but the copy path is the common
-    // one here and the cost is a syscall.
-    match fs::remove_file(to) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(format!("clear {}: {error}", to.display())),
-    }
-    fs::copy(from, to)
+    // open_out_dir cleared the owned names; refuse a replacement at `to`.
+    // A bytewise copy would allocate a raw disk's entire virtual capacity.
+    copy_sparse_new(from, to)
         .map_err(|e| format!("copy {} -> {}: {e}", from.display(), to.display()))?;
     fs::remove_file(from).map_err(|e| format!("remove staged {}: {e}", from.display()))
+}
+
+/// Scan the private staged file, leaving all-zero chunks unallocated. This
+/// still reads its full logical length; it bounds writes, not read time.
+fn copy_sparse_new(from: &Path, to: &Path) -> std::io::Result<()> {
+    let mut source = fs::File::open(from)?;
+    let permissions = source.metadata()?.permissions();
+    let mut destination = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(to)?;
+    let mut buffer = vec![0u8; 1024 * 1024];
+    let mut length = 0u64;
+    let mut written_position = 0u64;
+    loop {
+        let count = match source.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(count) => count,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        };
+        let chunk = buffer.get(..count).ok_or_else(|| {
+            std::io::Error::other("sparse copy read exceeded its buffer")
+        })?;
+        // Small metadata islands should not allocate a whole read buffer.
+        for block in chunk.chunks(64 * 1024) {
+            let end = length.checked_add(block.len() as u64).ok_or_else(|| {
+                std::io::Error::other("sparse copy length overflow")
+            })?;
+            if block.iter().any(|byte| *byte != 0) {
+                if written_position != length {
+                    destination.seek(SeekFrom::Start(length))?;
+                }
+                destination.write_all(block)?;
+                written_position = end;
+            }
+            length = end;
+        }
+    }
+    // Seeking over the last hole alone does not extend the file.
+    destination.set_len(length)?;
+    destination.set_permissions(permissions)
 }
 
 /// The nearest existing ancestor of `path`, canonicalised.
@@ -762,6 +798,7 @@ fn human_bytes(bytes: u64) -> String {
 fn readme(deployment_id: &str, format: DiskFormat) -> String {
     let disk = format.file_name();
     let minimum_qemu = format.minimum_qemu();
+    let capacity = human_bytes(PUBLISHED_VOLUME_BYTES);
     // Only the compressed formats pay a write-amplification cost, and the two
     // of them pay different ones. A raw image is written in place, so claiming
     // a cluster rewrite there would be a warning about nothing.
@@ -842,6 +879,13 @@ fn readme(deployment_id: &str, format: DiskFormat) -> String {
          | `{disk}` | a Btrfs volume: the signed deployment (td's userland, plus Firefox and its runtime) and an empty `@var` |\n\
          | `{README_NAME}` | this file |\n\
          | `{CHECKSUMS_NAME}` | SHA-256 of every file above |\n\
+         \n\
+         The disk and its Btrfs filesystem have {capacity} of virtual capacity,\n\
+         shared by the deployment and writable `@var` state. Empty space is\n\
+         sparse; host allocation grows as the guest writes. Copies of a raw\n\
+         image must preserve holes to retain that saving. For persistent\n\
+         development, import this clean bundle into `td-vm`, which creates\n\
+         private overlays and keeps the shared template unchanged.\n\
          \n\
          Verify what you downloaded:\n\
          \n\
@@ -971,6 +1015,66 @@ mod tests {
         ));
         fs::create_dir_all(&base).expect("scratch");
         base
+    }
+
+    #[test]
+    fn sparse_publication_preserves_bytes_length_and_executable_mode() {
+        use std::os::unix::fs::MetadataExt;
+
+        let base = scratch("sparse-copy");
+        let from = base.join("staged");
+        let to = base.join("published");
+        let mut bytes = vec![0u8; 4 * 1024 * 1024 + 173];
+        bytes[1024 * 1024 + 17..1024 * 1024 + 20].copy_from_slice(b"td!");
+        bytes[2 * 1024 * 1024 - 100..2 * 1024 * 1024 + 100].fill(0x8f);
+        fs::write(&from, &bytes).unwrap();
+        fs::set_permissions(&from, fs::Permissions::from_mode(0o751)).unwrap();
+
+        copy_sparse_new(&from, &to).unwrap();
+        fs::File::open(&to).unwrap().sync_all().unwrap();
+        let metadata = fs::metadata(&to).unwrap();
+        assert_eq!(metadata.len(), bytes.len() as u64);
+        assert_eq!(fs::read(&to).unwrap(), bytes);
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o751);
+        assert!(metadata.blocks() * 512 < 512 * 1024);
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn sparse_publication_preserves_empty_and_all_hole_files() {
+        use std::os::unix::fs::MetadataExt;
+
+        let base = scratch("sparse-empty");
+        for length in [0, 1024 * 1024 + 7] {
+            let from = base.join(format!("staged-{length}"));
+            let to = base.join(format!("published-{length}"));
+            fs::File::create(&from).unwrap().set_len(length).unwrap();
+            copy_sparse_new(&from, &to).unwrap();
+            let metadata = fs::metadata(&to).unwrap();
+            assert_eq!(metadata.len(), length);
+            assert!(metadata.blocks() * 512 < 128 * 1024);
+            assert!(fs::read(&to).unwrap().iter().all(|byte| *byte == 0));
+        }
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn sparse_publication_refuses_existing_files_and_symlinks() {
+        let base = scratch("sparse-existing");
+        let from = base.join("staged");
+        let existing = base.join("existing");
+        let link = base.join("link");
+        fs::write(&from, b"new bundle").unwrap();
+        fs::write(&existing, b"keep this").unwrap();
+        std::os::unix::fs::symlink(&existing, &link).unwrap();
+        for to in [&existing, &link] {
+            let error = copy_sparse_new(&from, to).unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+            assert_eq!(fs::read(&existing).unwrap(), b"keep this");
+        }
+        assert!(fs::symlink_metadata(&link).unwrap().is_symlink());
+        assert_eq!(fs::read(&from).unwrap(), b"new bundle");
+        fs::remove_dir_all(base).unwrap();
     }
 
     /// Checking a destination may CREATE it, but must never remove anything.

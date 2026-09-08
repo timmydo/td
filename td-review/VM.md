@@ -257,12 +257,17 @@ before displaying an agent as ready. Probes do not submit prompts or paid
 model requests merely to check login.
 
 The native-toolchain increment packs source-built Rust/Cargo, GCC, binutils,
-and the `td-cc` compiler defaults into that standard image. Its published
-sparse volume is 10 GiB, allowing the boot/update fixtures to hold three
-complete deployments with their debug companions. This is a deployment
-capacity allowance, not a claim that a cold distribution build fits there.
-Private development-store placement and VM data-capacity management remain
-required before reporting the complete repository workflow ready. The standard
+and the `td-cc` compiler defaults into that standard image. Newly published
+bundles have a 256 GiB sparse disk and Btrfs filesystem, shared by the signed
+deployment and private writable `@var` state. Untouched capacity consumes no
+host space; writes grow each instance's overlay. Raw bundle publication across
+filesystems preserves zero chunks as holes, while still reading the full
+logical length. Boot/update fixtures retain their separate 10 GiB budget for
+three deployments with debug companions. Existing bundles and instances keep
+their original size; importing a new bundle does not resize them. This is
+working space, not a claim that every cold distribution build fits. Private
+development-store placement and capacity management remain required before
+reporting the complete repository workflow ready. The standard
 kernel enables upstream SMP and CPU hotplug, with up to 256 possible CPUs.
 Assigned VM CPUs come online at boot. The profiler observes kernel CPU
 notifications and restarts with a new baseline after a topology change,
