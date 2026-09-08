@@ -863,6 +863,90 @@ revocation can terminate that instance's sessions too; removing a key alone
 is not termination of an already authenticated connection. Posted Git branches
 remain in the bare origin. Stopping and later booting a VM retains its key.
 
+### Implemented host Git dispatcher
+
+`td-review` builds the dependency-free host binary `td-vm-git`. Its only
+command is `td-vm-git serve /absolute/private/policy INSTANCE`, installed as
+the fixed forced command on an individual `restrict` authorized-key entry.
+This is the receive-policy prerequisite; automatic registration, key-file
+updates, guest provisioning, and tracking/terminating active sessions remain
+unimplemented. Building the binary changes no account, SSH configuration,
+repository hook, or live repository.
+
+The host account owns a private policy directory (normally mode 0700) and
+regular policy file (normally mode 0600). Neither may grant group/other access;
+the path may not traverse symlinks or untrusted writable ancestors. A trusted
+root/account-owned sticky ancestor such as `/tmp` is allowed. The dispatcher
+runs on a Linux host with `/proc` mounted, as the repository account, without
+setuid or privilege changes. Git must support `git hook run --to-stdin`
+(Git 2.43 or newer; validated with 2.54). A policy
+looks like this, with host-selected absolute Git and tool paths:
+
+```text
+TDVM-GIT-1
+repository=/srv/git/td.git
+git=/absolute/host/profile/bin/git
+path=/absolute/host/profile/bin:/run/current-system/profile/bin
+branch=0123456789abcdef0123456789abcdef terminal-scroll-fix
+branch=1123456789abcdef0123456789abcdef editor-selection-fix
+```
+
+The format requires a final newline, exactly one of each singleton field,
+no unknown fields, and at most 4,096 branch reservations in one MiB. Instance
+ids are exactly 32 lowercase hexadecimal characters. Branches are exact names,
+at most 200 ASCII bytes, with alphanumeric, hyphen, underscore and dot
+components separated by `/`; empty components, leading dots/hyphens, trailing
+dots/`.lock`, `..`, `main`, `HEAD`, and `refs/` names are refused. Duplicate and
+prefix-overlapping reservations are refused even for one owner. An instance
+without any reservation receives no read or write session. Only the trusted
+host publishes policy changes; the future registrar must make them atomic.
+
+`SSH_ORIGINAL_COMMAND` must exactly match Git's usual single-quoted
+`git-upload-pack 'REPOSITORY'` or `git-receive-pack 'REPOSITORY'` request,
+including Git's single-quote escaping when needed. No shell parses it. The
+dispatcher starts the configured Git executable against the configured bare
+repository, clears the incoming environment, disables system/global Git
+configuration, and supplies only the trusted tool `PATH`. The only optional
+client environment carried through is exact `GIT_PROTOCOL=version=2`.
+Repository configuration remains host authority; repositories using
+`receive.procReceiveRefs` ref rewriting or `hook.*` configured hook chains
+are refused for pushes; only the traditional filesystem hooks are supported.
+
+For each push a private temporary hooks directory shadows the effective
+repository hooks directory. It installs dispatch entries for existing hooks
+and an unconditional `pre-receive` guard, including when the original hooks
+are selected by relative `core.hooksPath`.
+Each hook entry dispatches through Git's own `hook run` command using the
+original hook path and arguments, so adjacent resources and Git's executable
+script fallback keep working. Relative paths may include `..`. The receive
+wrapper rereads the authoritative policy, checks the session's repository,
+Git executable and tool path still match, and authorizes the entire proposed
+transaction before invoking the original executable pre-receive hook with the
+same stdin and Git quarantine environment. An original hook that exits before
+reading all stdin retains its own exit status. Every ref must be a unique exact
+`refs/heads/BRANCH` reserved for this identity, with nonzero new object id.
+Git must confirm each branch is not a symbolic ref, including a dangling one;
+otherwise an authorized name could update a protected target such as `main`.
+SHA-1 and SHA-256 repositories are supported. Malformed, oversized, mixed-owner,
+tag, internal-ref and deletion transactions fail as a whole. Existing hooks
+keep their veto; repository files and hook configuration are never rewritten.
+
+The policy reread catches revocation before the receive check, but is not a
+transaction lock against policy changes after that check. Removing a reservation
+refuses new sessions; it does not terminate an already running fetch or a push
+past its check. Full active revocation still belongs to the registrar design
+above. Trusted hooks and other processes running as the host account remain
+trusted repository writers. This is Git authorization, not an OS sandbox for
+Git or protection from a compromised host account.
+
+Control-file and receive-hook input are bounded to one MiB, hook-directory
+enumeration to 256 entries, and ref transactions to 4,096 updates. Git streams
+object traffic directly; this increment imposes no pack-size, total-session,
+or concurrent-session quota beyond the existing host/Git limits. Normal
+completion removes the private session directory. A hard-killed dispatcher may
+leave one behind; it must not be pruned while its Git process is alive. The
+registrar's eventual owned-process tracking must cover that cleanup.
+
 ### First boot creates the clone automatically
 
 The development image uses ordinary Git and its source-built OpenSSH client.
