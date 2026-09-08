@@ -860,6 +860,84 @@ fn clipboard_between_editors(profile: &str, operation: ClipboardOperation) {
     source.wait_field("state", "tab", &collapsed);
     assert_eq!(std::fs::read(&source_path).unwrap(), b"b");
     assert_eq!(std::fs::read(&destination_path).unwrap(), b"");
+    // A second held Paste loses focus before any source send. Compositor
+    // invalidation closes its endpoint, so EOF may race the keyboard leave;
+    // this checks the settled native state, not which cancellation wins.
+    let hold_id = 2;
+    let hold_reply = |state: &str| format!(
+        "ok\ntd-clipboard-v1 session={} hold={hold_id} window={destination_window} state={state}\n",
+        compositor.session,
+    );
+    let armed = hold_reply("armed");
+    assert_eq!(compositor.request(&format!(
+        "clipboard-arm {} {destination_window}", compositor.session,
+    ), 1024), armed.as_bytes());
+    let held = hold_reply("held");
+    let invalidated = hold_reply("invalidated");
+    let focus_paste_started = Instant::now();
+    compositor.chord(Some(KEY_LEFT_CTRL), paste_key);
+    let deadline = Instant::now() + TIMEOUT;
+    loop {
+        let reply = compositor.request(
+            &format!("clipboard-status {} {hold_id}", compositor.session), 1024,
+        );
+        if reply == held.as_bytes() {
+            break;
+        }
+        assert_eq!(reply, armed.as_bytes(), "second hold failed before receive");
+        assert!(
+            Instant::now() < deadline,
+            "second native Paste never reached the hold"
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    destination.wait_field("clipboard-state", "incoming", "1");
+    destination.wait_field("prompt-state", "notice", &pasting);
+    let before_focus = compositor.observe(destination_window);
+    assert_eq!(
+        compositor.request(&format!("focus {source_window}"), 1024), b"ok\n",
+    );
+    destination.wait_field("state", "focus", "0");
+    destination.wait_field("clipboard-state", "focus", "0");
+    destination.wait_field("clipboard-state", "selection", "none");
+    destination.wait_field("clipboard-state", "incoming", "0");
+    assert_ne!(
+        field(&destination.ok("prompt-state"), "notice"), Some(pasting.as_str()),
+    );
+    destination.wait_field("state", "tab", "1,0,0,0,0,0,0,72,0,lf");
+    destination.wait_tab(0, "");
+    source.wait_field("state", "focus", "1");
+    source.wait_field("state", "tab", &collapsed);
+    source.wait_tab(source_revision, "b");
+    assert_eq!(compositor.request(&format!(
+        "clipboard-status {} {hold_id}", compositor.session,
+    ), 1024), invalidated.as_bytes());
+    assert_eq!(compositor.request(&format!(
+        "clipboard-release {} {hold_id}", compositor.session,
+    ), 1024), b"unavailable clipboard hold has no releasable transfer\n");
+    assert_eq!(std::fs::read(&source_path).unwrap(), b"b");
+    assert_eq!(std::fs::read(&destination_path).unwrap(), b"");
+    assert!(
+        focus_paste_started.elapsed() < Duration::from_secs(4),
+        "focus loss exceeded its transfer evidence budget"
+    );
+    assert_eq!(
+        compositor.request(&format!("focus {destination_window}"), 1024), b"ok\n",
+    );
+    destination.wait_field("state", "focus", "1");
+    destination.wait_field("clipboard-state", "selection", "utf8");
+    // Named focus reveals the tiled layout; restore the capture geometry.
+    assert_eq!(compositor.request("fullscreen", 1024), b"ok\n");
+    destination.wait_field("state", "window", "800,576,1");
+    destination.wait_field("state", "tab", "1,0,0,0,0,0,0,72,0,lf");
+    source.wait_field("state", "focus", "0");
+    compositor.rendered_text(
+        &mut destination, destination_window, 0, before_focus, " ", 0,
+    );
+    // Returning focus never revives the old descriptor or its hold identity.
+    assert_eq!(compositor.request(&format!(
+        "clipboard-status {} {hold_id}", compositor.session,
+    ), 1024), invalidated.as_bytes());
     let before_paste = compositor.observe(destination_window);
     // A fresh Paste after cancellation must still consume the original offer.
     compositor.chord(Some(KEY_LEFT_CTRL), paste_key);

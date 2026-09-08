@@ -419,6 +419,11 @@ bytes, and a fresh Paste still succeeds. The opt-in hold has a deadline;
 tests do not rely on a large payload being slow. Cancellation and producer
 failure each have a fail-closed four-second evidence budget, shorter than
 the editor's five-second transfer deadlines.
+A second held Paste loses focus through the compositor's named-window
+command. The destination must retire its offer and pending transfer without
+editing; the invalidated hold cannot be released, even after focus returns.
+Fresh Paste after refocus still works. Empty EOF can race Wayland leave here,
+so this checks settled state rather than claiming which cancel path won.
 Vertical and horizontal wheel cases also test page-bound clamping and
 inward movement after repeated outward reports. Horizontal scrolling is
 checked with Soft Wrap enabled, then disabled through the native menu;

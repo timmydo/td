@@ -2304,6 +2304,20 @@ unchanged, and the following fresh Paste must succeed with the original UTF-8
 snapshot. No pause is inferred from payload size or timing, and no editor
 control mutation performs the clipboard action. The hold grant is absent
 from unrelated native keyboard/pointer/wheel sessions.
+Before the final successful Paste, a second held receive loses focus via
+the compositor's ordinary named-window control command. Real Wayland leave
+and selection retirement must settle to destination focus=0, selection=none,
+incoming=0, retired pasting feedback and unchanged full tab/text/disk state
+within four seconds measured before Paste, below its five-second read
+deadline. Result feedback may persist; it need not be blank. The source
+gains focus without changing its full tab state. The compositor reports the
+second hold invalidated and refuses release. Returning focus restores a
+UTF-8 offer and correlated blank destination pixels but does not revive
+that hold; the final
+fresh Paste still succeeds. Invalidation closes the held descriptor before
+source delivery, so empty EOF can race keyboard leave. This scenario proves
+settled focus/offer/transfer state and the compositor's stale-release fence,
+not which editor cancellation path wins that race.
 Weston remains separate optional interoperability evidence below.
 
 The opt-in `disposable_weston_runs_the_production_editor_and_control_workers`
