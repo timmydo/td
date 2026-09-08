@@ -2191,6 +2191,19 @@ input receipts, applied client-publication snapshots and completed PPM output
 follow [AUTOMATION.md](../td-compositor/AUTOMATION.md). No host display,
 configuration, external compositor or device is used.
 
+A native control-worker scenario shares the exact edit/spelling/save and
+dirty-close command sequence with the strict protocol-peer test. With
+td-compositor's real keymap initialized, it verifies stale spelling/edit
+refusal, Replace All with Undo/Redo, exact spelling pages, BOM/CRLF save
+bytes, a second dirty Unicode tab, cancelled close and replay-refused old
+dialog IDs before explicit discard. It ends with exactly one active saved
+tab at revision 4, complete text/selection/format state, and a correlated
+`warm` pixel prefix. It uses editor control mutations deliberately, not
+synthetic compositor keys, and needs no clipboard scheduling grant. The
+no-keyboard-focus protocol-peer variant remains a separate default test.
+Intermediate tab and dialog rendering is outside this scenario's visual
+oracle; only the final document frame and pixels are asserted.
+
 The editor maps normally, then compositor fullscreen leaves an 800x576
 scale-one client beneath the 24-pixel desktop bar. Shift+A, released-Shift b
 and Windows Ctrl+Z / Emacs Ctrl+/ use real evdev-code routing, keymap and

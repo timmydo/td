@@ -389,7 +389,13 @@ after every edit, excluding the one-pixel blinking caret column when it
 falls within the sampled prefix. Caret visibility and open menu/prompt
 pixels are not asserted by this case; menu transitions use semantic state.
 Bare Cargo leaves these process cases ignored; their decoder tests run by
-default. The vertical-wheel case checks forward and reverse detents against
+default. A native control-worker case also runs the shared edit, spelling,
+save and dirty-close scenario against td-compositor: stale requests refuse,
+Undo/Redo and spelling pages agree, saved BOM/CRLF bytes are exact, old close
+dialog IDs cannot discard a newer dialog, and the final single saved tab
+has correlated `warm` pixels. The default strict protocol-peer case remains
+independent and runs without keyboard focus.
+The vertical-wheel case checks forward and reverse detents against
 exact viewport rows and captured numbered-line pixels, with unchanged text,
 revision, selection, caret and disk bytes. The clipboard case uses two
 editors in one private compositor: native Cut, another source edit, then

@@ -1282,6 +1282,13 @@ fn production_process_roundtrips_remote_edit_jobs_frames_and_close_dialogs() {
     std::fs::write(&dictionary, b"one\nwarm\nwrong\n").unwrap();
     let mut editor = EditorProcess::start(&directory, &display_path, &file, &dictionary);
     assert_eq!(field(&editor.ok("state"), "key-ready"), Some("0"));
+    control_edit_jobs_and_close_dialogs(&mut editor, &file);
+    editor.rendered();
+    editor.quit();
+    display.finish().assert_rendered();
+}
+
+fn control_edit_jobs_and_close_dialogs(editor: &mut EditorProcess, file: &Path) {
     let spelling = editor.job("check-spelling\t1\t0");
     let scan = spelling.split(',').nth(4).unwrap();
     assert_eq!(
@@ -1314,7 +1321,7 @@ fn production_process_roundtrips_remote_edit_jobs_frames_and_close_dialogs() {
     );
     assert!(editor.job("save\t1\t4").contains(",save,1,4,"));
     assert_eq!(
-        std::fs::read(&file).unwrap(),
+        std::fs::read(file).unwrap(),
         b"\xef\xbb\xbfwarm one\r\nwrong\r\n"
     );
     assert_eq!(editor.ok("new"), "2");
@@ -1337,10 +1344,14 @@ fn production_process_roundtrips_remote_edit_jobs_frames_and_close_dialogs() {
         .unwrap()
         .starts_with("error\tinvalid-argument\t"));
     editor.ok(&format!("dialog-answer\t{second}\t2\t1\tdiscard"));
-    editor.rendered();
     assert_eq!(field(&editor.ok("prompt-state"), "prompt"), Some("none"));
-    editor.quit();
-    display.finish().assert_rendered();
+    editor.wait_field("state", "active", "1");
+    editor.wait_field("state", "tab", "1,4,0,15,15,15,0,72,1,crlf");
+    editor.wait_tab(4, "warm one\nwrong\n");
+    assert_eq!(
+        editor.ok("state").split('\t').filter(|field| field.starts_with("tab=")).count(),
+        1
+    );
 }
 
 #[test]

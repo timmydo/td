@@ -1073,6 +1073,32 @@ fn clipboard_between_editors(profile: &str, operation: ClipboardOperation) {
 }
 
 #[test]
+#[ignore = "requires an explicitly built TD_TEST_COMPOSITOR; ready runs this case"]
+fn native_control_edit_spelling_save_and_dirty_close() {
+    let compositor_directory = Directory::new();
+    let directory = Directory::new();
+    let mut compositor = Compositor::start(&compositor_directory);
+    let file = directory.0.join("-draft");
+    let dictionary = directory.0.join("dictionary");
+    std::fs::write(&file, b"\xef\xbb\xbfone\r\nwrng\r\n").unwrap();
+    std::fs::write(&dictionary, b"one\nwarm\nwrong\n").unwrap();
+    let display = compositor.directory.join("wayland-0");
+    let mut editor = EditorProcess::start(&directory, &display, &file, &dictionary);
+    editor.wait_keyboard("windows");
+    let window = compositor.window();
+    assert_eq!(compositor.request("fullscreen", 1024), b"ok\n");
+    editor.wait_field("state", "window", "800,576,1");
+    editor.rendered_at(800, 576);
+    let before = compositor.observe(&window);
+    control_edit_jobs_and_close_dialogs(&mut editor, &file);
+    // Caret is on the final empty line, outside the first-row prefix.
+    compositor.rendered_text(&mut editor, &window, 4, before, "warm", 4);
+    assert_eq!(std::fs::read(&file).unwrap(), b"\xef\xbb\xbfwarm one\r\nwrong\r\n");
+    editor.quit();
+    compositor.stop();
+}
+
+#[test]
 fn native_observation_and_capture_decoders_refuse_stale_or_truncated_evidence() {
     let session = "00000000000000000000000000000007";
     let reply = format!(
