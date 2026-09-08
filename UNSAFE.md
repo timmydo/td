@@ -103,6 +103,20 @@ staging, publication, cleanup and parent synchronization retain one directory
 identity even if its caller-visible path is retargeted. A second caller,
 another flag, or another `*at` operation is an amendment here.
 
+The builder's host and derivation sandboxes create user, mount, PID, network
+and UTS namespaces together, then select IPC isolation after PID 1 mounts a
+fresh private procfs and before any workload executes. When its `self/ns/ipc`
+exists, the existing `unshare(CLONE_NEWIPC)` operation must succeed and its
+namespace identity must change. A missing IPC namespace is acceptable only
+when that fresh procfs has neither `sysvipc` nor `sys/fs/mqueue`, and its
+bounded, structurally checked filesystem inventory includes `proc` but no
+`mqueue`. Missing or malformed inventory and lookup errors refuse execution.
+This permits td's kernel with both IPC facilities disabled; it never omits
+isolation for exposed facilities or after a failed IPC unshare. An inherited
+or caller-supplied proc tree cannot supply these witnesses. Confinement tests
+pin both callers immediately after their fresh proc mount and the one IPC
+unshare site. No new syscall or raw-syscall allowance is introduced.
+
 ## 1. `td-kexec` — the guest kexec helper
 
 The `td-kexec` guest helper is confined to exactly two syscalls

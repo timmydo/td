@@ -297,6 +297,14 @@ implementation as well as the script entry point. The helpers remain control
 plane programs: compiling one inside td does not admit it as a target recipe
 tool or replace the source-bootstrap artifact graph.
 
+The native build sandboxes also accommodate the standard kernel's disabled
+SysV IPC and POSIX message queues. They inspect only their freshly mounted
+procfs before executing a workload. Available IPC facilities require a new,
+verified IPC namespace; only verified absence permits omitting it. Errors
+and exposed facilities without namespace support refuse the build. This
+preserves the deployed kernel policy; it does not infer isolation from the
+distribution identity or an inherited `/proc` view.
+
 These helpers alone do not establish the complete repository workflow. Private
 writable store placement, capacity, workspace provisioning, and a two-guest
 full-check/Git round trip remain separate acceptance requirements.

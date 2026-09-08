@@ -1,7 +1,8 @@
 //! The S3 build sandbox: execute a parsed `.drv` in a fresh user namespace,
 //! replicating the pinned daemon's guest-visible contract (read off
 //! nix/libstore/build.cc):
-//!   - namespaces: NEWUSER|NEWNS|NEWPID|NEWNET|NEWIPC|NEWUTS. NEWNET makes the
+//!   - namespaces: NEWUSER|NEWNS|NEWPID|NEWNET|NEWUTS, plus NEWIPC when the
+//!     kernel has IPC facilities (see isolate_ipc). NEWNET makes the
 //!     build offline by construction; NEWPID (in the same unshare as NEWUSER, so
 //!     the PID ns is owned by the new user ns) forks PID 1 of a fresh pid
 //!     namespace, which mounts a FRESH procfs and then serves as init for the
@@ -36,7 +37,7 @@
 use std::collections::BTreeSet;
 use std::ffi::{CString, OsStr};
 use std::fs;
-use std::io;
+use std::io::{self, Read};
 use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::DirBuilderExt;
 use std::os::unix::process::CommandExt;
@@ -60,6 +61,65 @@ const GUEST_GID: u32 = 30000;
 
 fn err(what: String) -> io::Error {
     io::Error::new(io::ErrorKind::Other, what)
+}
+
+/// Called only after mounting a fresh procfs in the private PID namespace,
+/// before executing any workload. An inherited or caller-supplied /proc
+/// could hide the kernel interfaces that make the absence decision safe.
+fn isolate_ipc(fresh_proc: &Path) -> io::Result<()> {
+    let namespace = fresh_proc.join("self/ns/ipc");
+    match fs::read_link(&namespace) {
+        Ok(before) => {
+            sys::unshare(sys::CLONE_NEWIPC)?;
+            if fs::read_link(&namespace)? == before {
+                return Err(err("IPC namespace did not change".into()));
+            }
+            Ok(())
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            require_no_ipc_facilities(fresh_proc)?;
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn require_no_ipc_facilities(fresh_proc: &Path) -> io::Result<()> {
+    for relative in ["sysvipc", "sys/fs/mqueue"] {
+        match fs::symlink_metadata(fresh_proc.join(relative)) {
+            Ok(_) => return Err(err(format!("kernel exposes {relative} without an IPC namespace"))),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    let mut filesystems = String::new();
+    fs::File::open(fresh_proc.join("filesystems"))?
+        .take(65537)
+        .read_to_string(&mut filesystems)?;
+    if filesystems.len() > 65536 {
+        return Err(err("kernel filesystem list exceeds 64 KiB".into()));
+    }
+    let mut has_proc = false;
+    for line in filesystems.lines() {
+        let mut words = line.split_whitespace();
+        let first = words.next().ok_or_else(|| err("empty kernel filesystem row".into()))?;
+        let kind = if first == "nodev" {
+            words.next().ok_or_else(|| err("incomplete kernel filesystem row".into()))?
+        } else {
+            first
+        };
+        if words.next().is_some() {
+            return Err(err("malformed kernel filesystem row".into()));
+        }
+        if kind == "mqueue" {
+            return Err(err("kernel exposes POSIX message queues without an IPC namespace".into()));
+        }
+        has_proc |= kind == "proc";
+    }
+    if !has_proc {
+        return Err(err("kernel filesystem list does not identify procfs".into()));
+    }
+    Ok(())
 }
 
 fn trusted_recipe_builder(builder: &str) -> bool {
@@ -1629,7 +1689,7 @@ pub fn build(
                 // orphan-avoidance bail for a build that ran.
                 return Err(io::Error::from_raw_os_error(ESRCH));
             }
-            // New USER + PID + mount + net + IPC + UTS namespaces. NEWPID rides in
+            // New USER + PID + mount + net + UTS namespaces. NEWPID rides in
             // the SAME unshare as NEWUSER so the new PID namespace is owned by the
             // new user namespace; the fork below then lands the builder at PID 1 of
             // that namespace, where a fresh /proc reflects only the build's own
@@ -1640,7 +1700,6 @@ pub fn build(
                     | sys::CLONE_NEWNS
                     | sys::CLONE_NEWPID
                     | sys::CLONE_NEWNET
-                    | sys::CLONE_NEWIPC
                     | sys::CLONE_NEWUTS,
             )?;
             // Map the guest ids before touching anything else so file
@@ -1724,6 +1783,8 @@ pub fn build(
             // A FRESH procfs reflecting the build's OWN pid namespace (we are PID 1),
             // not the invoking namespace's /proc.
             sys::mount(Some(&procfs_c), &proc_dir_c, Some(&procfs_c), 0, None)?;
+            isolate_ipc(&proc_dir)
+                .map_err(|e| { sys::warn(b"td-builder build: FAILED isolating IPC\n"); e })?;
             // Minimal /etc.
             fs::write(&etc_passwd, &passwd_body)?;
             fs::write(&etc_group, &group_body)?;
@@ -2013,7 +2074,7 @@ pub fn host_shell(
                 sys::warn(b"td-builder host-sandbox: parent died before PR_SET_PDEATHSIG armed\n");
                 return Err(io::Error::from_raw_os_error(ESRCH));
             }
-            // New USER + PID + mount + net + IPC + UTS namespaces. NEWPID is in
+            // New USER + PID + mount + net + UTS namespaces. NEWPID is in
             // the SAME unshare as NEWUSER so the new PID namespace is OWNED by the
             // new user namespace (the kernel applies NEWUSER first); the fork
             // below then lands the command at PID 1 of that PID namespace, where a
@@ -2026,11 +2087,10 @@ pub fn host_shell(
                     | sys::CLONE_NEWNS
                     | sys::CLONE_NEWPID
                     | sys::CLONE_NEWNET
-                    | sys::CLONE_NEWIPC
                     | sys::CLONE_NEWUTS,
             )
             .map_err(|e| {
-                sys::warn(b"td-builder host-sandbox: FAILED at unshare(NEWUSER|NEWNS|NEWPID|NEWNET|NEWIPC|NEWUTS)\n");
+                sys::warn(b"td-builder host-sandbox: FAILED at unshare(NEWUSER|NEWNS|NEWPID|NEWNET|NEWUTS)\n");
                 e
             })?;
             // IDENTITY map (host uid/gid → itself), exactly like `guix shell -C`:
@@ -2200,6 +2260,8 @@ pub fn host_shell(
             fs::create_dir_all(&proc_target_dir)?;
             sys::mount(Some(&proc_c), &proc_target_c, Some(&proc_c), 0, None)
                 .map_err(|e| { sys::warn(b"td-builder host-sandbox: FAILED mounting a fresh /proc\n"); e })?;
+            isolate_ipc(&proc_target_dir)
+                .map_err(|e| { sys::warn(b"td-builder host-sandbox: FAILED isolating IPC\n"); e })?;
             // Writable scratch tmpfs mounts (/tmp, HOME), owned by the host uid.
             for (target_dir, target_c) in &tmpfs_specs {
                 fs::create_dir_all(target_dir)?;
@@ -2228,6 +2290,55 @@ pub fn host_shell(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ipc_absence_requires_no_kernel_facilities_and_a_complete_inventory() {
+        struct Scratch(PathBuf);
+        impl Drop for Scratch {
+            fn drop(&mut self) { let _ = fs::remove_dir_all(&self.0); }
+        }
+        let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let root = std::env::temp_dir().join(format!("td-ipc-capabilities-{}-{nonce}", std::process::id()));
+        fs::create_dir(&root).unwrap();
+        let _scratch = Scratch(root.clone());
+        fs::create_dir_all(root.join("sys/fs")).unwrap();
+        assert!(require_no_ipc_facilities(&root).is_err());
+        for content in ["", "nodev\n", "nodev proc extra\n", "nodev tmpfs\n", "nodev proc\nnodev mqueue\n"] {
+            fs::write(root.join("filesystems"), content).unwrap();
+            assert!(require_no_ipc_facilities(&root).is_err(), "{content:?}");
+        }
+        fs::write(root.join("filesystems"), "nodev\tproc\nnodev\ttmpfs\n\text4\n").unwrap();
+        require_no_ipc_facilities(&root).unwrap();
+        isolate_ipc(&root).unwrap();
+        fs::create_dir_all(root.join("self/ns")).unwrap();
+        fs::write(root.join("self/ns/ipc"), b"not a namespace link").unwrap();
+        assert!(isolate_ipc(&root).is_err());
+        fs::remove_file(root.join("self/ns/ipc")).unwrap();
+        for relative in ["sysvipc", "sys/fs/mqueue"] {
+            let path = root.join(relative);
+            fs::create_dir(&path).unwrap();
+            assert!(require_no_ipc_facilities(&root).is_err());
+            fs::remove_dir(&path).unwrap();
+            std::os::unix::fs::symlink("/absent-ipc-test-target", &path).unwrap();
+            assert!(require_no_ipc_facilities(&root).is_err());
+            fs::remove_file(&path).unwrap();
+        }
+        fs::write(root.join("filesystems"), "x".repeat(65537)).unwrap();
+        assert!(require_no_ipc_facilities(&root).is_err());
+    }
+
+    #[test]
+    fn ipc_selection_uses_only_the_fresh_proc_mount_before_workload_exec() {
+        let source = include_str!("sandbox.rs");
+        let production = source.split("#[cfg(test)]\nmod tests").next().unwrap();
+        assert_eq!(production.matches("isolate_ipc(").count(), 3);
+        assert_eq!(production.matches("sys::CLONE_NEWIPC").count(), 1);
+        assert!(production.contains("sys::unshare(sys::CLONE_NEWIPC)?;"));
+        let normalize = |text: &str| text.chars().filter(|ch| !ch.is_whitespace()).collect::<String>();
+        let compact = normalize(production);
+        assert!(compact.contains(&normalize("sys::mount(Some(&procfs_c), &proc_dir_c, Some(&procfs_c), 0, None)?; isolate_ipc(&proc_dir)")));
+        assert!(compact.contains(&normalize("sys::warn(b\"td-builder host-sandbox: FAILED mounting a fresh /proc\\n\"); e })?; isolate_ipc(&proc_target_dir)")));
+    }
 
     // The #469 staging gate, exercised at the unit level (no namespace needed):
     // an item no td-owned db vouches for refuses to stage, tampered bytes refuse

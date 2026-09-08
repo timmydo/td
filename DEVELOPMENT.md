@@ -304,9 +304,12 @@ The helper requires UTF-8 paths/environment and replaces
 under the old `/tmp` are not retained unless inside the bound working tree.
 This includes contents of `HOME`, `CARGO_HOME` and `XDG_RUNTIME_DIR` beneath
 the old `/tmp`. Environment strings are retained, not silently rewritten
-to a different directory. Network, IPC and UTS namespaces are also private:
-host network services, abstract Unix sockets, SysV IPC and hostname are not
-shared. Pathname sockets in retained bound paths remain filesystem objects.
+to a different directory. Network and UTS namespaces are also private.
+IPC gets a private namespace when the kernel provides IPC facilities; their
+absence must be established from a freshly mounted procfs as specified in
+`UNSAFE.md`. Host network services, abstract Unix sockets, SysV IPC and
+hostname are not shared. Pathname sockets in retained bound paths remain
+filesystem objects.
 The inner process does not inherit the opt-in variable, preventing recursive
 wrapping through another runner invocation. Other ancestor ownership is not
 rewritten, and no production permission predicate gains a test exception.

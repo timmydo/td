@@ -341,6 +341,13 @@ symbol that is `default y` behind a dependency somebody may pin later
 arrives unasked. `td-jail` omits `CLONE_NEWIPC` on the strength of it
 being off, so the guard is what makes that a decision.
 
+Native control-plane builds retain that kernel decision. The builder checks
+its own freshly mounted procfs before executing a workload: it creates and
+verifies a private IPC namespace when supported, or verifies that SysV IPC
+and POSIX message queues are both absent. Exposed facilities without namespace
+support are refused. `UNSAFE.md` owns the exact witnesses and call ordering;
+this does not change td-jail's namespace policy or enable a kernel feature.
+
 **`MEMCG` needed a different runtime witness, and the reason is a trap
 worth carrying into §P.** `/proc/cgroups` is the obvious place to look
 for a controller, and it does not list `memory` on this kernel even
