@@ -274,6 +274,18 @@ main checkout's config instead and execs the main checkout's builder, so a
 `cargo clean` there makes its tests fail with `No such file or directory`.
 Build the release binary in whichever checkout supplies the config.
 
+## Native compositor fixture builds
+
+A crate with `native-compositor-tests = true` may additionally declare one
+ASCII `native-compositor-fixture-feature` name in its gate metadata. The
+native gate first tests the default binary, then uses a fresh separate
+target directory for that feature's library tests, ignored
+`native_compositor::fixture::` process cases, and strict all-target Clippy.
+Both process legs require positive passing summaries. This is a test-build
+declaration, not a shipping feature or a broader affected-path mapping.
+The runner removes ambient `TD_EDITOR_TEST_FILE_BARRIER`; only the owned
+process fixture may give that scheduling endpoint to its child editor.
+
 ## Trusted filesystem roots for permission tests
 
 A standalone `td-*` roster crate may declare `trusted-test-root = true` in its

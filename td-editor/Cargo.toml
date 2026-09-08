@@ -7,10 +7,14 @@ license = "GPL-3.0-or-later"
 
 [workspace]
 
+[features]
+test-file-barrier = []
+
 [package.metadata.td-gate]
 clippy-all-targets = true
 trusted-test-root = true
 native-compositor-tests = true
+native-compositor-fixture-feature = "test-file-barrier"
 
 [lints.clippy]
 unwrap_used = "deny"

@@ -546,6 +546,49 @@ temporary files and explicit stage-failure injection; a model integration
 test edits while a snapshot is pending and acknowledges only the written
 content state. The scratch-window warning remains unchanged.
 
+## Isolated file-worker test build
+
+The non-default `test-file-barrier` Cargo feature is for test binaries only.
+Normal builds contain neither the barrier module nor its worker calls and
+never read `TD_EDITOR_TEST_FILE_BARRIER`. An ignored native test verifies
+that the normal binary ignores that variable even when it names no socket.
+There is no barrier command in the editor control protocol and no new
+filesystem authority, production startup option, syscall or dependency.
+
+In the explicit feature build, an unset variable leaves scheduling ordinary.
+When set, it names a fixture-owned Unix listener. The file worker connects
+once and exchanges `td-file-v1 N KIND\n` / `continue N\n` before each job's
+I/O, including initial Open and Dictionary. KIND is `open`, `dictionary`,
+`reload` or `save`; Save As shares `save`. N starts at 1 and is checked for
+exhaustion. The channel carries no path, document bytes or model authority.
+The fixture automatically continues startup and unrelated jobs and may hold
+one selected job. A Save checkpoint occurs after immutable snapshot handoff;
+it cannot prove queued-before-handoff rejection. A Reload checkpoint precedes
+the candidate read; cancellation does not cancel the worker operation, but
+its eventual result must not replace text or adopt the candidate baseline.
+
+Each exchange has a ten-second total write/read budget. A reply ends at its
+newline: bytes after a valid reply belong to the next exchange, whose
+validation cannot retroactively revoke an already released job. EOF before
+the expected newline, malformed or stale current replies, exhaustion and
+timeout terminate the worker before that job's I/O; no timeout releases it.
+This trusted scheduling channel does not authenticate when replies were sent.
+Fixture startup, including
+the ordinary blocking Unix connect, is bounded by the parent test's child
+deadline and teardown. Only the worker waits; the UI/control loop continues.
+Tests require held/busy state, cancellation and subsequent edits within four
+seconds before release, excluding barrier timeout as a false explanation.
+
+The native gate runs the ordinary suite first, then builds/tests the named
+feature in a fresh, separately owned target directory. It runs feature
+library tests, non-vacuous `native_compositor::fixture::` cases and strict
+all-target feature Clippy. It never replaces the ordinary editor binary.
+The cases prove cancelled Reload retains later edits and its old baseline,
+and cancelled close-Save still writes the handed-off snapshot while newer
+edits stay dirty. Exact disk, tab/text, historical job and correlated pixel
+checks precede ordinary explicit save/teardown. Kernel-stalled I/O and the
+queued-before-handoff Save race remain outside these process cases.
+
 ## Paragraph filling
 
 Auto Fill and Fill Paragraph insert real line breaks; soft wrapping only

@@ -1,4 +1,7 @@
 use super::*;
+#[cfg(feature = "test-file-barrier")]
+#[path = "file_barrier.rs"]
+mod fixture;
 use std::io::{BufRead, BufReader};
 use std::sync::mpsc;
 
@@ -1364,6 +1367,31 @@ fn native_open_and_save_as_preserve_literal_paths_and_dirty_duplicate() {
     assert_eq!(std::fs::read(&destination).unwrap(), b"xnew\n");
     assert_eq!(std::fs::read(&file).unwrap(), b"base\n");
     assert!(!missing.exists());
+    editor.quit();
+    compositor.stop();
+}
+
+#[cfg(not(feature = "test-file-barrier"))]
+#[test]
+#[ignore = "ready checks that the ordinary editor has no fixture channel"]
+fn ordinary_editor_ignores_file_barrier_environment() {
+    let compositor_directory = Directory::new();
+    let directory = Directory::new();
+    let mut compositor = Compositor::start(&compositor_directory);
+    let file = directory.0.join("draft");
+    let dictionary = directory.0.join("dictionary");
+    std::fs::write(&file, b"ordinary").unwrap();
+    std::fs::write(&dictionary, b"ordinary\n").unwrap();
+    let display = compositor.directory.join("wayland-0");
+    let missing_barrier = directory.0.join("must-not-connect");
+    let mut editor = EditorProcess::start_with_barrier(
+        &directory, &display, &file, &dictionary, "windows", Some(&missing_barrier),
+    );
+    editor.wait_keyboard("windows");
+    editor.wait_tab(0, "ordinary");
+    editor.job("save\t1\t0");
+    assert_eq!(std::fs::read(file).unwrap(), b"ordinary");
+    assert!(!missing_barrier.exists());
     editor.quit();
     compositor.stop();
 }

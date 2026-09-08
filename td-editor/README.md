@@ -54,6 +54,12 @@ GPU rendering and td-mail integration remain
 unimplemented. Do not set
 `$EDITOR` to this binary yet.
 
+The optional `test-file-barrier` feature is a separate test editor, never a
+normal runtime option. The native gate builds it in an isolated directory
+to test cancellation during file jobs; its scheduling socket is not part
+of the editor control protocol. Normal binaries ignore the fixture variable.
+See DESIGN.md's isolated file-worker test-build contract.
+
 Build and verify from the repository root:
 
 ```text

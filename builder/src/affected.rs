@@ -2824,7 +2824,10 @@ pub(crate) fn gate_crates_cli(args: &[String]) -> ExitCode {
             if !roster.iter().any(|k| k.name == "td-compositor") {
                 return fail("native tests require the td-compositor roster crate");
             }
-            match crate::native_tests::run(&root, manifest, krate.trusted_test_root) {
+            match crate::native_tests::run(
+                &root, manifest, krate.trusted_test_root,
+                krate.native_fixture_feature.as_deref(),
+            ) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => fail(&e),
             }
@@ -3108,6 +3111,7 @@ fn dependency_free(lock: &str, text: &str, expected: usize) -> Result<(), String
 struct GateCrate {
     trusted_test_root: bool,
     native_compositor_tests: bool,
+    native_fixture_feature: Option<String>,
     /// The directory name, which is also the crate name and the manifest path
     /// the commands are spelled with: `td-sh`.
     name: String,
@@ -3272,6 +3276,7 @@ fn parse_gate_crate(name: &str, manifest: &str) -> Result<GateCrate, String> {
     let mut out = GateCrate {
         trusted_test_root: false,
         native_compositor_tests: false,
+        native_fixture_feature: None,
         name: name.to_string(),
         clippy_all_targets: false,
         test_args: None,
@@ -3337,6 +3342,13 @@ fn parse_gate_crate(name: &str, manifest: &str) -> Result<GateCrate, String> {
             return Err(format!("{name}: `{line}` is not `key = value`"));
         };
         match key.trim() {
+            "native-compositor-fixture-feature" => {
+                let feature = gate_string(name, key.trim(), value.trim())?;
+                if feature.is_empty() || !feature.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') {
+                    return Err(format!("{name}: native fixture feature must be one ASCII feature name"));
+                }
+                out.native_fixture_feature = Some(feature);
+            }
             "native-compositor-tests" => {
                 out.native_compositor_tests =
                     gate_bool(name, "native-compositor-tests", value.trim())?;
@@ -3357,6 +3369,9 @@ fn parse_gate_crate(name: &str, manifest: &str) -> Result<GateCrate, String> {
                 ));
             }
         }
+    }
+    if out.native_fixture_feature.is_some() && !out.native_compositor_tests {
+        return Err(format!("{name}: native fixture feature requires native-compositor-tests"));
     }
     Ok(out)
 }
@@ -4554,6 +4569,7 @@ mod tests {
         let krate = |name: &str| GateCrate {
             trusted_test_root: false,
             native_compositor_tests: false,
+            native_fixture_feature: None,
             name: name.to_string(),
             clippy_all_targets: false,
             test_args: None,
@@ -6982,6 +6998,14 @@ mod tests {
 
     #[test]
     fn native_compositor_tests_follow_metadata_in_both_legs_without_widening_consumers() {
+        let prefix = "[package.metadata.td-gate]\nnative-compositor-tests = true\n";
+        let feature = "native-compositor-fixture-feature";
+        assert_eq!(parse_gate_crate("td-x", &format!("{prefix}{feature} = \"test-file-barrier\"\n"))
+            .unwrap().native_fixture_feature.as_deref(), Some("test-file-barrier"));
+        for value in ["", "a,b", "a b", "../a", "a/b", "é", "--features=bad"] {
+            assert!(parse_gate_crate("td-x", &format!("{prefix}{feature} = \"{value}\"\n")).is_err());
+        }
+        assert!(parse_gate_crate("td-x", &format!("[package.metadata.td-gate]\n{feature} = \"x\"\n")).is_err());
         assert_eq!(
             cmd_manifest_crate(concat!(
                 "'/repo/--manifest-path td-decoy/tool' gate-crates native-compositor ",

@@ -61,7 +61,13 @@ fn toml_string(text: &str) -> String {
     out
 }
 
-fn test_command(root: &Path, manifest: &str, binary: &Path, trusted: bool) -> Result<Command> {
+fn test_command(
+    root: &Path,
+    manifest: &str,
+    binary: &Path,
+    trusted: bool,
+    fixture: Option<(&str, &Path, bool)>,
+) -> Result<Command> {
     let tool = binary
         .to_str()
         .ok_or("native compositor path must be UTF-8")?;
@@ -73,9 +79,9 @@ fn test_command(root: &Path, manifest: &str, binary: &Path, trusted: bool) -> Re
             &format!("env.TD_TEST_COMPOSITOR.value={}", toml_string(tool)),
         ])
         .args(["--config", "env.TD_TEST_COMPOSITOR.force=true"])
-        .args(["--test", "control_process", "native_compositor::"])
         .env_remove("TD_TEST_COMPOSITOR")
         .env_remove("TD_TEST_TRUSTED_ROOT")
+        .env_remove("TD_EDITOR_TEST_FILE_BARRIER")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit());
@@ -83,7 +89,19 @@ fn test_command(root: &Path, manifest: &str, binary: &Path, trusted: bool) -> Re
         cmd.args(["--config", "env.TD_TEST_TRUSTED_ROOT.value=\"1\""])
             .args(["--config", "env.TD_TEST_TRUSTED_ROOT.force=true"]);
     }
-    cmd.args(["--", "--ignored", "--test-threads=2"]);
+    if let Some((feature, target, library)) = fixture {
+        cmd.args(["--features", feature, "--target-dir"])
+            .arg(target);
+        if library {
+            cmd.arg("--lib");
+        } else {
+            cmd.args(["--test", "control_process", "native_compositor::fixture::"])
+                .args(["--", "--ignored", "--test-threads=2"]);
+        }
+    } else {
+        cmd.args(["--test", "control_process", "native_compositor::"])
+            .args(["--", "--ignored", "--test-threads=2"]);
+    }
     Ok(cmd)
 }
 
@@ -176,7 +194,12 @@ fn run_cases(mut cmd: Command) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn run(root: &Path, manifest: &str, trusted: bool) -> Result<()> {
+pub(crate) fn run(
+    root: &Path,
+    manifest: &str,
+    trusted: bool,
+    fixture_feature: Option<&str>,
+) -> Result<()> {
     let root = root
         .canonicalize()
         .map_err(|e| format!("native test root: {e}"))?;
@@ -203,7 +226,45 @@ pub(crate) fn run(root: &Path, manifest: &str, trusted: bool) -> Result<()> {
     if !binary.is_file() {
         return Err("native compositor build did not produce its host binary".into());
     }
-    run_cases(test_command(&root, manifest, &binary, trusted)?)
+    run_cases(test_command(&root, manifest, &binary, trusted, None)?)?;
+    if let Some(feature) = fixture_feature {
+        // Never replace or reuse the ordinary editor's build directory.
+        let target = scratch.0.join("fixture");
+        run_cases(test_command(
+            &root,
+            manifest,
+            &binary,
+            trusted,
+            Some((feature, &target, true)),
+        )?)?;
+        run_cases(test_command(
+            &root,
+            manifest,
+            &binary,
+            trusted,
+            Some((feature, &target, false)),
+        )?)?;
+        let status = Command::new("cargo")
+            .current_dir(&root)
+            .args([
+                "clippy",
+                "--frozen",
+                "--manifest-path",
+                manifest,
+                "--features",
+                feature,
+                "--target-dir",
+            ])
+            .arg(&target)
+            .args(["--all-targets", "--", "-D", "warnings"])
+            .stdin(Stdio::null())
+            .status()
+            .map_err(|e| format!("fixture Clippy: {e}"))?;
+        if !status.success() {
+            return Err(format!("fixture Clippy failed: {status}"));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -213,11 +274,38 @@ mod tests {
 
     #[test]
     fn native_command_pins_the_tool_and_only_runs_ignored_native_cases() {
+        for library in [true, false] {
+            let fixture = test_command(
+                Path::new("/repo"),
+                "td-editor/Cargo.toml",
+                Path::new("/repo/tool"),
+                true,
+                Some(("test-file-barrier", Path::new("/repo/private"), library)),
+            )
+            .unwrap();
+            let args: Vec<_> = fixture
+                .get_args()
+                .map(|arg| arg.to_str().unwrap())
+                .collect();
+            assert!(args.windows(4).any(|args| args
+                == [
+                    "--features",
+                    "test-file-barrier",
+                    "--target-dir",
+                    "/repo/private"
+                ]));
+            assert_eq!(args.contains(&"--lib"), library);
+            assert_eq!(args.contains(&"native_compositor::fixture::"), !library);
+            assert!(args.contains(&"env.TD_TEST_TRUSTED_ROOT.force=true"));
+            assert!(fixture.get_envs().any(|(key, value)|
+                key == "TD_EDITOR_TEST_FILE_BARRIER" && value.is_none()));
+        }
         let cmd = test_command(
             Path::new("/repo"),
             "td-editor/Cargo.toml",
             Path::new("/repo/tool"),
             true,
+            None,
         )
         .unwrap();
         let args: Vec<_> = cmd.get_args().map(|v| v.to_str().unwrap()).collect();
@@ -232,13 +320,13 @@ mod tests {
                 "env.TD_TEST_COMPOSITOR.value=\"/repo/tool\"",
                 "--config",
                 "env.TD_TEST_COMPOSITOR.force=true",
-                "--test",
-                "control_process",
-                "native_compositor::",
                 "--config",
                 "env.TD_TEST_TRUSTED_ROOT.value=\"1\"",
                 "--config",
                 "env.TD_TEST_TRUSTED_ROOT.force=true",
+                "--test",
+                "control_process",
+                "native_compositor::",
                 "--",
                 "--ignored",
                 "--test-threads=2"
@@ -249,6 +337,7 @@ mod tests {
             "td-x/Cargo.toml",
             Path::new("/repo/tool"),
             false,
+            None,
         )
         .unwrap();
         assert!(cmd

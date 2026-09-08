@@ -32,6 +32,8 @@ pub mod replay;
 mod seat;
 mod search;
 mod session;
+#[cfg(feature = "test-file-barrier")]
+mod test_file_barrier;
 pub mod spelling;
 mod sys;
 pub mod text;

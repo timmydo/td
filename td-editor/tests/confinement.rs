@@ -3,6 +3,19 @@
 use std::collections::BTreeSet;
 use std::path::Path;
 
+#[test]
+fn file_barrier_is_excluded_from_default_builds() {
+    let library = include_str!("../src/lib.rs");
+    let worker = include_str!("../src/session.rs");
+    let manifest = include_str!("../Cargo.toml");
+    assert!(library.contains("#[cfg(feature = \"test-file-barrier\")]\nmod test_file_barrier;"));
+    assert!(worker.contains("#[cfg(feature = \"test-file-barrier\")]\n    let mut barrier ="));
+    assert!(worker.contains("#[cfg(feature = \"test-file-barrier\")]\n        if let Some(barrier)"));
+    assert_eq!(worker.matches("barrier.checkpoint(").count(), 1);
+    assert!(manifest.contains("[features]\ntest-file-barrier = []"));
+    assert!(!manifest.contains("default ="));
+}
+
 fn raw_module_tokens(text: &str) -> usize {
     identifier_count(text, "sys")
 }
@@ -46,6 +59,7 @@ fn source_inventory_and_allowances_are_closed() {
         "session.rs",
         "spelling.rs",
         "sys.rs",
+        "test_file_barrier.rs",
         "text.rs",
         "transfer.rs",
         "ui.rs",

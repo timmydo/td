@@ -408,10 +408,31 @@ impl Session {
 }
 
 fn worker(jobs: Receiver<Job>, results: SyncSender<Result<Completion>>) {
+    #[cfg(feature = "test-file-barrier")]
+    let mut barrier = match crate::test_file_barrier::Barrier::connect() {
+        Ok(barrier) => barrier,
+        Err(detail) => {
+            let _ = results.send(Err(detail));
+            return;
+        }
+    };
     let mut files = Files::default();
     let mut known = BTreeSet::new();
     let mut incoming = jobs.recv();
     while let Ok(job) = incoming {
+        #[cfg(feature = "test-file-barrier")]
+        if let Some(barrier) = barrier.as_mut() {
+            let kind = match &job.operation {
+                Operation::Dictionary(_) => "dictionary",
+                Operation::Open(_) => "open",
+                Operation::Reload(_) => "reload",
+                Operation::Save { .. } => "save",
+            };
+            if let Err(detail) = barrier.checkpoint(kind) {
+                let _ = results.send(Err(detail));
+                return;
+            }
+        }
         let result = if let Operation::Reload(original) = job.operation {
             retain_files(&mut files, &mut known, &job.keep);
             match files.prepare_reload(original) {
