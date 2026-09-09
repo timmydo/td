@@ -6361,6 +6361,14 @@ that exact description and requires the same presentation and commit
 receipts as unlock. No ready write produces a notice, never a retry or an
 automatic enrollment/unlock. Success displays CREDENTIAL STORED.
 
+The device dispatcher treats a secret selection as work even when that
+key produces no ordinary key, modifier or pointer delivery. Its device-event
+regression exercises all five selections through the complete adapter,
+including refusal outside attention and one selection per lifetime.
+The optional `qemu-secret --tpm` desktop case in `td-secret/DESIGN.md`
+executes this dispatcher with a UHID keyboard and the real paired authority,
+framebuffer presentation, token workers and public credential client.
+
 Enrollment first asks root for admitted read-only protector state. Only file
 or legacy TPM state permits enrollment; token state displays a fresh-unlock
 instruction. Successful enrollment remains locked. Every reported enrollment

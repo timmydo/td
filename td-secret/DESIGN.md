@@ -774,7 +774,7 @@ normal cargo pass with those tests ignored is not TPM integration evidence.
 
 `td-recipe-eval qemu-secret --tpm /absolute/path/to/swtpm` requires the
 same pinned host swtpm described above and adds four cold TPM guest boots
-and the six HID guests below to the authority checks. The host starts a
+and the seven HID guests below to the authority checks. The host starts a
 private software TPM control socket and attaches QEMU's emulated TIS device; there is no host TPM
 passthrough. The source-built test executable calls the unchanged
 `Device::open` and `Client` implementations through `/dev/tpmrm0`.
@@ -802,7 +802,7 @@ credential-store write. The stock deployment remains unenrolled.
 
 ### HID through the QEMU guest kernel
 
-The same optional command runs six further isolated guests using a
+The same optional command runs seven further isolated guests using a
 test-only virtual token created through Linux
 [UHID](https://docs.kernel.org/hid/uhid.html). The fixture requires its
 kernel opt-in and exact case selector before opening `/dev/uhid`, then
@@ -934,6 +934,46 @@ credential frames. It does not exercise td-authd's public descriptor intake,
 compositor receipts, physical secure attention or the application's portal
 connection. The earlier authority/intake guests and protocol negative cases
 remain separate checks; they are not a combined desktop acceptance claim.
+
+### Compositor and public write integration
+
+The `fido-desktop` guest starts the production compositor at UID/GID 993
+through `td-login exec-service-as`, paired with the production root
+`td-authd terminal-serve`. The authority runs the real firstboot reservation
+check against a disposable root-owned account table and matching ledger.
+The compositor loads the normal immutable application policy, uses the
+QEMU framebuffer, and opens the guest evdev devices after session preparation.
+The fixture assigns those device nodes to the compositor just as trusted
+seat setup does; the FIDO hidraw node remains root-only.
+
+A separate UHID keyboard supplies ordinary key reports. X outside secure
+attention must cause no token traffic or enrollment. Ctrl+Alt+Esc followed
+by X enrolls an explicitly unrecoverable store through the compositor's
+physical-input adapter, immutable renderer, private client, authority
+controller and production token workers. Enrollment leaves the store locked;
+a new attention lifetime with U must obtain a fresh assertion to release it.
+
+The real human-UID `td-secret set mail/main` client submits credential bytes
+through its sealed descriptor. Before W selection it must remain pending,
+with no additional token command and an unchanged store bundle. A new
+attention lifetime with W authorizes the write. Successful public completion
+must accompany a changed bundle and correct credential readback, preserving
+the other application record. Killing the compositor then requires observed
+authority exit, runtime-key removal and listener retirement. A replacement
+pair must start locked and require another attention selection and assertion
+before reading the written credential.
+
+The virtual token accepts the complete fixed CTAP command sequence and
+requires distinct nonzero creation/assertion challenges and signs requests
+using the earlier emulated-TPM signer. It does not
+substitute presentation or commit acknowledgements: the running compositor
+supplies those through its normal framebuffer receipt path. Exact challenge
+binding and refusal cases remain covered by the preceding independent
+fixtures. This test exercises one recovery policy; the preceding worker
+fixtures retain both policies. It observes backend credential readback,
+not an application portal connection, and it is a disposable initramfs
+and software-device test, not a cold-disk or physical-presence claim.
+
 
 ## Portal evidence
 

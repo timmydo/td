@@ -1483,6 +1483,7 @@ fn apply_locked<T: InputTarget>(
     }
     if !decision.draining
         && decision.attention.is_none()
+        && decision.secret.is_none()
         && decision.command.is_none()
         && decision.launcher.is_none()
         && decision.help.is_none()
@@ -5621,6 +5622,43 @@ mod tests {
         }
         assert!(bindings.attention == AttentionState::Closed);
         assert!(target.secret_attempt.is_none());
+    }
+
+    #[test]
+    fn device_dispatch_delivers_each_secret_selection_once() {
+        use crate::authority::consent::{Recovery, Role};
+        use crate::secret_client::Selection;
+        for (code, selected) in [
+            (KEY_U, Selection::Unlock(Role::Primary)),
+            (KEY_R, Selection::Unlock(Role::Recovery)),
+            (KEY_E, Selection::Enroll(Recovery::SecondToken)),
+            (KEY_X, Selection::Enroll(Recovery::Unrecoverable)),
+            (KEY_W, Selection::Write),
+        ] {
+            let target = Mutex::new(RecordingTarget::default());
+            let bindings = Mutex::new(KeyBindings {
+                attention_enabled: true,
+                ..KeyBindings::default()
+            });
+            let mut resync = || None;
+            let mut state = DeviceState::new(None, &mut resync, true);
+            for event in [key(code, KEY_PRESS), key(code, KEY_RELEASE)] {
+                apply_device_event(&target, event, 0, &bindings, &mut state).unwrap();
+            }
+            assert!(target.lock().unwrap().secret_roles.is_empty());
+            for event in [
+                key(KEY_LEFTCTRL, KEY_PRESS), key(KEY_LEFTALT, KEY_PRESS),
+                key(KEY_ESC, KEY_PRESS), key(KEY_ESC, KEY_RELEASE),
+                key(KEY_LEFTCTRL, KEY_RELEASE), key(KEY_LEFTALT, KEY_RELEASE),
+                key(code, KEY_PRESS), key(code, KEY_REPEAT), key(code, KEY_RELEASE),
+                key(KEY_U, KEY_PRESS), key(KEY_U, KEY_RELEASE),
+            ] {
+                apply_device_event(&target, event, 0, &bindings, &mut state).unwrap();
+            }
+            let target = target.lock().unwrap();
+            assert_eq!(target.attention_events, [true]);
+            assert_eq!(target.secret_roles, [selected]);
+        }
     }
 
     #[test]

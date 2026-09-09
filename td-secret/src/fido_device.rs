@@ -2025,4 +2025,387 @@ mod vm_tests {
         guard("fido-operations-recovery");
         private_operations(true);
     }
+
+    mod desktop {
+        use super::*;
+        use std::os::unix::fs::{chown, PermissionsExt};
+        use std::path::Path;
+        use std::sync::atomic::AtomicUsize;
+
+        fn wait(label: &str, mut done: impl FnMut() -> bool) {
+            let deadline = Instant::now() + Duration::from_secs(15);
+            while !done() {
+                if Instant::now() >= deadline {
+                    for log in [
+                        "/run/desktop-authd.log",
+                        "/run/desktop-compositor.log",
+                        "/run/desktop-set.log",
+                    ] {
+                        if let Ok(file) = File::open(log) {
+                            let mut text = String::new();
+                            file.take(65_537).read_to_string(&mut text).unwrap();
+                            eprintln!("{log}: {text}");
+                        }
+                    }
+                    panic!("desktop fixture timed out: {label}");
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
+
+        fn read_released(expected: &[u8]) {
+            // Key publication precedes the worker dropping its store lock.
+            wait("released store admission", || {
+                let Ok(store) = crate::owned_store(1000) else {
+                    return false;
+                };
+                assert_eq!(store.application_secret("mail", "main").unwrap().unwrap(), expected);
+                assert_eq!(store.application_secret("news", "main").unwrap().unwrap(), b"untouched fixture");
+                true
+            });
+        }
+
+        // Standard keyboard: eight modifiers, padding, and six key usages.
+        const KEYBOARD: &[u8] = &[
+            5, 1, 9, 6, 0xa1, 1, 5, 7, 0x19, 0xe0, 0x29, 0xe7, 0x15, 0, 0x25, 1, 0x75, 1, 0x95, 8,
+            0x81, 2, 0x95, 1, 0x75, 8, 0x81, 1, 0x95, 6, 0x75, 8, 0x15, 0, 0x25, 0x65, 5, 7, 0x19, 0,
+            0x29, 0x65, 0x81, 0, 0xc0,
+        ];
+
+        struct Keyboard(File);
+        impl Keyboard {
+            fn new() -> Self {
+                let mut file = OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .custom_flags(NOFOLLOW | NONBLOCK)
+                    .open("/dev/uhid")
+                    .unwrap();
+                let mut event = [0; UHID_EVENT_SIZE];
+                event[..4].copy_from_slice(&11_u32.to_ne_bytes());
+                event[4..24].copy_from_slice(b"td desktop keyboard\0");
+                event[260..262].copy_from_slice(&(KEYBOARD.len() as u16).to_ne_bytes());
+                event[262..264].copy_from_slice(&3_u16.to_ne_bytes());
+                event[264..268].copy_from_slice(&0x1209_u32.to_ne_bytes());
+                event[268..272].copy_from_slice(&2_u32.to_ne_bytes());
+                event[CREATE2_DESCRIPTOR..CREATE2_DESCRIPTOR + KEYBOARD.len()]
+                    .copy_from_slice(KEYBOARD);
+                write_event(&mut file, &event);
+                wait("keyboard enumeration", || {
+                    fs::read_dir("/sys/class/input").unwrap().any(|entry| {
+                        let path = entry.unwrap().path();
+                        path.file_name()
+                            .unwrap()
+                            .to_str()
+                            .unwrap()
+                            .starts_with("event")
+                            && fs::read_to_string(path.join("device/name")).ok().as_deref()
+                                == Some("td desktop keyboard\n")
+                    })
+                });
+                Self(file)
+            }
+            fn report(&mut self, modifiers: u8, key: u8) {
+                let mut event = [0; 14];
+                event[..4].copy_from_slice(&12_u32.to_ne_bytes());
+                event[4..6].copy_from_slice(&8_u16.to_ne_bytes());
+                event[6] = modifiers;
+                event[8] = key;
+                write_event(&mut self.0, &event);
+                thread::sleep(Duration::from_millis(100));
+            }
+            fn key(&mut self, key: u8) {
+                self.report(0, key);
+                self.report(0, 0);
+            }
+            fn select(&mut self, key: u8) {
+                // A fresh report drains the post-close input quarantine.
+                self.key(0x39); // Caps Lock, outside the attention vocabulary.
+                self.report(5, 0); // Left Ctrl + Left Alt.
+                self.report(5, 0x29); // Escape.
+                self.report(0, 0);
+                self.key(key);
+            }
+            fn close(&mut self) {
+                self.key(0x29);
+            }
+        }
+
+        struct Process(std::process::Child);
+        impl Process {
+            fn start(mut command: Command, log: &str) -> Self {
+                let errors = OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .mode(0o600)
+                    .open(log)
+                    .unwrap();
+                command
+                    .env_clear()
+                    .current_dir("/")
+                    .stdout(Stdio::null())
+                    .stderr(errors);
+                Self(command.spawn().unwrap())
+            }
+            fn exited(&mut self) -> Option<std::process::ExitStatus> {
+                self.0.try_wait().unwrap()
+            }
+        }
+        impl Drop for Process {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+
+        struct Pair {
+            compositor: Process,
+            authority: Process,
+        }
+        impl Pair {
+            fn start() -> Self {
+                let (root, peer) = UnixStream::pair().unwrap();
+                let mut command = Command::new("/bin/td-authd");
+                command
+                    .args([
+                        "terminal-serve",
+                        "--user",
+                        "tester",
+                        "--uid",
+                        "1000",
+                        "--peer-uid",
+                        "993",
+                    ])
+                    .stdin(Stdio::from(OwnedFd::from(root)));
+                let authority = Process::start(command, "/run/desktop-authd.log");
+                let mut command = Command::new("/bin/td-login");
+                command
+                    .args([
+                        "exec-service-as",
+                        "tdc1000",
+                        "--",
+                        "/bin/td-compositor",
+                        "run",
+                        "--framebuffer",
+                        "/dev/fb0",
+                        "--input",
+                        "/dev/input",
+                        "--socket",
+                        "/run/td-compositor/1000/wayland-0",
+                        "--portal-socket",
+                        "/run/td-compositor/1000/portal-wayland",
+                        "--control-socket",
+                        "/run/td-compositor/1000/td-control",
+                        "--launcher-application",
+                        "mail",
+                        "--application-ready-socket",
+                        "/run/td-compositor/1000/application-ready",
+                        "--application-app-id",
+                        "td.mail",
+                        "--application-content-rgb-a",
+                        "112233",
+                        "--application-content-rgb-b",
+                        "445566",
+                        "--terminal-authority",
+                        "stdin",
+                    ])
+                    .stdin(Stdio::from(OwnedFd::from(peer)));
+                let compositor = Process::start(command, "/run/desktop-compositor.log");
+                let mut pair = Self {
+                    compositor,
+                    authority,
+                };
+                wait("paired compositor startup", || {
+                    assert!(
+                        pair.authority.exited().is_none(),
+                        "{}",
+                        fs::read_to_string("/run/desktop-authd.log").unwrap()
+                    );
+                    assert!(
+                        pair.compositor.exited().is_none(),
+                        "{}",
+                        fs::read_to_string("/run/desktop-compositor.log").unwrap()
+                    );
+                    fs::read_to_string("/run/desktop-compositor.log")
+                        .unwrap()
+                        .contains("software output")
+                });
+                no_release();
+                pair
+            }
+            fn disconnect(mut self) {
+                assert!(self.authority.exited().is_none());
+                assert!(self.compositor.exited().is_none());
+                self.compositor.0.kill().unwrap();
+                assert!(!self.compositor.0.wait().unwrap().success());
+                let mut status = None;
+                wait("authority generation cleanup", || {
+                    status = self.authority.exited();
+                    status.is_some()
+                });
+                assert!(!status.unwrap().success());
+                no_release();
+                assert!(!Path::new("/run/td-authd/1000/set").exists());
+            }
+        }
+
+        fn setup() {
+            prepare_operation_store();
+            for (name, text, mode) in [
+                (
+                    "/var/lib/td/principals.tsv",
+                    fs::read_to_string("/etc/td-principals.tsv").unwrap(),
+                    0o600,
+                ),
+                (
+                    "/etc/td-bus-applications.tsv",
+                    "td-bus-applications-v1\t1000\n65537\tmail\t\n".into(),
+                    0o444,
+                ),
+            ] {
+                fs::write(name, text).unwrap();
+                fs::set_permissions(name, fs::Permissions::from_mode(mode)).unwrap();
+            }
+            for (name, text) in [
+                (
+                    "passwd",
+                    "tdc1000:x:993:993::/run/td-compositor/1000:/bin/false\n",
+                ),
+                ("group", "tdc1000:x:993:\n"),
+                ("shadow", "tdc1000:!td-service:0:0:99999:7:::\n"),
+            ] {
+                OpenOptions::new()
+                    .append(true)
+                    .open(format!("/etc/{name}"))
+                    .unwrap()
+                    .write_all(text.as_bytes())
+                    .unwrap();
+            }
+            for (path, owner, mode) in [
+                ("/run/td-compositor", 0, 0o755),
+                ("/run/td-compositor/1000", 993, 0o755),
+                ("/run/user", 0, 0o755),
+                ("/run/user/1000", 1000, 0o700),
+                ("/home/tester", 1000, 0o700),
+            ] {
+                fs::create_dir_all(path).unwrap();
+                chown(path, Some(owner), Some(owner)).unwrap();
+                fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+            }
+            for entry in fs::read_dir("/dev/input").unwrap() {
+                let path = entry.unwrap().path();
+                if !path.file_name().unwrap().to_str().unwrap().starts_with("event") {
+                    continue;
+                }
+                assert!(fs::symlink_metadata(&path).unwrap().file_type().is_char_device());
+                chown(&path, Some(993), Some(993)).unwrap();
+                fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+            }
+            chown("/dev/fb0", Some(993), Some(993)).unwrap();
+            fs::set_permissions("/dev/fb0", fs::Permissions::from_mode(0o600)).unwrap();
+        }
+
+        #[test]
+        #[ignore = "requires qemu-secret --tpm with a disposable desktop and HID devices"]
+        fn qemu_compositor_enrolls_unlocks_and_authorizes_public_credential_write() {
+            guard("fido-desktop");
+            let mut keyboard = Keyboard::new();
+            setup();
+            crate::tpm::tests::qemu_extend(&[9; 32]);
+            let token = VirtualCredential::new(44);
+            let requests = Arc::new(AtomicUsize::new(0));
+            let observed = Arc::clone(&requests);
+            let mut challenges = std::collections::BTreeSet::new();
+            let hid = token.checked(move |request, index| {
+                eprintln!("desktop CTAP {index}: {}", request[0]);
+                let expected = [4, 1, 2, 4, 2, 4, 2, 4, 2];
+                assert_eq!(request[0], expected[index]);
+                if request[0] != 4 {
+                    use crate::fido_cbor::{self, Value};
+                    let value = fido_cbor::decode(&request[1..]).unwrap();
+                    let field = if request[0] == 1 { 1 } else { 2 };
+                    let hash: [u8; 32] = value.required(&Value::Unsigned(field)).unwrap()
+                        .bytes().unwrap().try_into().unwrap();
+                    assert_ne!(hash, [0; 32]);
+                    assert!(challenges.insert(hash), "desktop reused a token challenge");
+                }
+                observed.store(index + 1, Ordering::SeqCst);
+            });
+            let pair = Pair::start();
+            keyboard.key(0x1b); // X outside attention must not enroll.
+            thread::sleep(Duration::from_millis(500));
+            assert_eq!(requests.load(Ordering::SeqCst), 0);
+            assert!(!Path::new("/var/lib/td/secrets/1000/sealed").exists());
+            keyboard.select(0x1b); // X: explicitly unrecoverable enrollment.
+            wait("desktop enrollment", || {
+                Path::new("/var/lib/td/secrets/1000/sealed").exists()
+            });
+            no_release();
+            assert_eq!(requests.load(Ordering::SeqCst), 3);
+            keyboard.close();
+            keyboard.select(0x18); // U: fresh primary assertion.
+            wait("desktop unlock", || {
+                Path::new("/run/td-secret/1000/key").exists()
+            });
+            read_released(b"firstboot fixture");
+            keyboard.close();
+            let before = sealed_bytes();
+            let mut command = Command::new("/bin/td-login");
+            command
+                .args([
+                    "exec-as",
+                    "tester",
+                    "--",
+                    "/bin/td-secret",
+                    "set",
+                    "mail/main",
+                ])
+                .stdin(Stdio::piped());
+            let mut client = Process::start(command, "/run/desktop-set.log");
+            client
+                .0
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(b"desktop fixture")
+                .unwrap();
+            wait("public credential queue", || {
+                assert!(client.exited().is_none(), "{}", fs::read_to_string("/run/desktop-set.log").unwrap());
+                fs::read_to_string("/run/desktop-set.log")
+                    .unwrap()
+                    .contains("then W")
+            });
+            thread::sleep(Duration::from_millis(500));
+            assert!(client.exited().is_none());
+            assert_eq!(sealed_bytes(), before);
+            assert_eq!(requests.load(Ordering::SeqCst), 5);
+            keyboard.select(0x1a); // W: authorize exactly the queued write.
+            let mut status = None;
+            wait("public credential completion", || {
+                status = client.exited();
+                status.is_some()
+            });
+            assert!(
+                status.unwrap().success(),
+                "{}",
+                fs::read_to_string("/run/desktop-set.log").unwrap()
+            );
+            assert_ne!(sealed_bytes(), before);
+            read_released(b"desktop fixture");
+            assert_eq!(requests.load(Ordering::SeqCst), 7);
+            pair.disconnect();
+            // A fresh production generation must prepare while locked and
+            // require another physical selection and assertion before release.
+            let pair = Pair::start();
+            keyboard.select(0x18);
+            wait("replacement generation unlock", || {
+                Path::new("/run/td-secret/1000/key").exists()
+            });
+            read_released(b"desktop fixture");
+            assert_eq!(requests.load(Ordering::SeqCst), 9);
+            pair.disconnect();
+            assert_eq!(hid.finish(), (9, 0));
+        }
+    }
 }

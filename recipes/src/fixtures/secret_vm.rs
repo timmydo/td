@@ -60,6 +60,10 @@ pub const FIDO_CASES: &[(&str, &str)] = &[
         "fido-operations-recovery",
         "fido_device::vm_tests::qemu_private_workers_enroll_unlock_and_write_with_recovery",
     ),
+    (
+        "fido-desktop",
+        "fido_device::vm_tests::desktop::qemu_compositor_enrolls_unlocks_and_authorizes_public_credential_write",
+    ),
 ];
 pub const PASS: &str = "TD-SECRET-VM-PASS";
 pub const FAIL: &str = "TD-SECRET-VM-FAIL";
