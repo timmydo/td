@@ -1013,10 +1013,61 @@ have no hard elapsed-time bound.
 These checks do not enroll a key, contact SSH, prove the supplied host key
 matches the SSH endpoint, or provision a guest workspace. They report this
 remaining uncertainty explicitly. The sampled main commit is informational,
-not retained for provisioning. Existing create/open behavior does not yet
-attach a profile to an instance, and the TUI has no profile editor. Per-VM
-profile snapshots, guest key generation/enrollment, and automatic cloning
-remain the next workspace increment.
+not retained for provisioning. The TUI has no global profile editor. Guest
+key generation/enrollment and automatic cloning remain pending.
+
+### Implemented per-instance workspace plans
+
+When a Git profile is configured, New/create saves a private copy with the
+new instance. The task branch defaults to the instance name; the TUI prompts
+for it, and the CLI accepts
+`td-vm create NAME TEMPLATE --branch BRANCH [CPUS MEMORY_MIB]`. Without a
+profile, ordinary create remains a plain VM; an explicit branch requires a
+profile. Invalid profile data is an error, never a silently unconfigured VM.
+The manager does not contact the registrar or SSH during creation.
+
+`td-vm workspace prepare NAME BRANCH` attaches the current profile to a
+previously unconfigured, stopped instance without modifying its disk or
+lifecycle configuration. The equivalent TUI key is `W`. `w` or
+`td-vm workspace show NAME` displays the saved identity, branch, profile
+fingerprint, and public configuration, independently of the current default.
+Read-only inspection creates no state and contacts no guest or host service.
+Initial preparation holds the VM lifetime lock through publication so a
+delayed supervisor cannot start the guest between the stopped check and save.
+
+The `workspace` record starts with `TDVM-WORKSPACE-1`, a newline, a random
+128-bit identity as 32 lowercase hex digits, a newline, the exact task branch,
+another newline, and the complete canonical `TDVM-GIT-PROFILE-1` snapshot.
+It is at most 8704 bytes, caller-owned, singly linked and mode 0600 when
+published. Reads require a regular file with no group/other access; final
+symlinks and nonregular files are refused. A temporary record is synced and
+renamed under the existing catalog and instance locks, then the instance
+directory is synced. A failure of that last sync reports an error even if
+the new record is already visible. Interrupted temporary files are reclaimed
+only under those same locks. New-instance records travel inside the existing
+private creation staging directory and are published with the overlay.
+
+The snapshot is immutable. Repeating prepare with the same branch returns
+the saved identity/profile even when the manager default changed or vanished;
+another branch is refused. Existing records are not rewritten on open or
+restart. Recreating a deleted instance produces a fresh identity. All task
+branches use the dispatcher's shared grammar. The catalog lock prevents
+duplicate or prefix-overlapping planned branches for the same repository
+within one manager root, and also rejects a duplicate identity. This local
+check is not an origin reservation; other managers and ordinary host Git
+writers remain independent. The registrar must resolve those races before
+enrollment can be declared successful.
+An unreadable or unknown existing workspace stops new plan publication and
+names the affected instance: ignoring it would make the conflict check
+incomplete. Inspection and ordinary VM lifecycle operations remain separate.
+
+This version records intent only. No key, retained starting commit, branch
+reservation, or clone exists as a consequence of saving it. The display
+explicitly says enrollment/cloning are pending and the branch and commit are
+unreserved. Guest provisioning will require a later state format; deletion
+refuses unknown or corrupt workspace records so this version cannot erase
+future enrolled state without understanding revocation. Deleting a valid
+version-1 plan removes only local VM state and does not contact Git.
 
 ### Implemented host Git dispatcher
 

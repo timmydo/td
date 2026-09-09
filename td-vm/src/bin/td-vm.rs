@@ -35,6 +35,10 @@ mod vm_git_profile;
 #[path = "../vm_git_origin.rs"]
 #[allow(dead_code)]
 mod vm_git_origin;
+#[path = "../vm_git_names.rs"]
+mod vm_git_names;
+#[path = "../vm_workspace.rs"]
+mod vm_workspace;
 
 type Result<T> = std::result::Result<T, String>;
 const TABLE_HEADER: &str = "NAME                             STATE    ACCEL    TEMPLATE         CPU RAM MiB HOST MiB  CAP MiB";
@@ -46,6 +50,7 @@ const HELP: &str = "td-vm: manage persistent graphical td instances
   td-vm templates
   td-vm remove-template TEMPLATE
   td-vm create NAME TEMPLATE [CPUS MEMORY_MIB]
+  td-vm create NAME TEMPLATE --branch BRANCH [CPUS MEMORY_MIB]
   td-vm list
   td-vm status NAME                  inspect QEMU execution and disk I/O state
   td-vm resume NAME                  resume an explicitly paused guest
@@ -62,6 +67,8 @@ const HELP: &str = "td-vm: manage persistent graphical td instances
   td-vm git-profile set FILE          save a host Git profile
   td-vm git-profile show              display configured profile
   td-vm git-profile check             authenticate registrar and verify origin
+  td-vm workspace prepare NAME BRANCH save a private workspace plan
+  td-vm workspace show NAME           inspect saved identity and Git profile
 
 TD_VM_HOME defaults to ~/.local/share/td-vm. Requires host QEMU, qemu-img and qemu-io.
 Reuse dist/td-vm-x86-64 from ./build-qcow; no image rebuild on create/open.
@@ -95,7 +102,7 @@ fn run(args: Vec<String>) -> Result<()> {
     };
     let words: Vec<&str> = args.iter().map(String::as_str).collect();
     let read_only = matches!(words.first(), Some(&"list" | &"templates" | &"logs" | &"status"))
-        || matches!(words.as_slice(), ["git-profile", "show" | "check"]);
+        || matches!(words.as_slice(), ["git-profile", "show" | "check"] | ["workspace", "show", _]);
     let manager = if read_only {
         if !home.exists() && matches!(words.as_slice(), ["list"] | ["templates"]) {
             println!("No managed instances or templates yet.");
@@ -125,10 +132,26 @@ fn run(args: Vec<String>) -> Result<()> {
             Ok(())
         }
         ["import", name, bundle] => manager.import(name, Path::new(bundle)),
+        ["workspace", "prepare", name, branch] => {
+            println!("{}", term::scrub_lines(&manager.prepare_workspace(name, branch)?));
+            Ok(())
+        }
+        ["workspace", "show", name] => {
+            println!("{}", term::scrub_lines(&manager.workspace(name)?));
+            Ok(())
+        }
         ["templates"] => manager.templates(),
         ["prune"] => manager.prune(),
         ["remove-template", name] => manager.remove_template(name),
         ["create", name, template] => manager.create(name, template, "4", "8192"),
+        ["create", name, template, "--branch", branch, resources @ ..] => {
+            let (cpus, memory) = match resources {
+                [] => ("4", "8192"),
+                [cpus, memory] => (*cpus, *memory),
+                _ => return Err("create --branch needs either no resources or CPUS MEMORY_MIB".into()),
+            };
+            manager.create_workspace(name, template, cpus, memory, Some(branch))
+        }
         ["create", name, template, cpus, memory] => manager.create(name, template, cpus, memory),
         ["list"] => manager.list(),
         ["status", name] => {
@@ -628,7 +651,21 @@ impl Manager {
     }
 
     fn create(&self, value: &str, template: &str, cpus: &str, memory: &str) -> Result<()> {
+        self.create_workspace(value, template, cpus, memory, None)
+    }
+
+    fn create_workspace(&self, value: &str, template: &str, cpus: &str, memory: &str, branch: Option<&str>) -> Result<()> {
         name(value)?;
+        let workspace = match vm_git_profile::optional(&self.root)? {
+            Some(profile) => {
+                if branch.is_none() && !vm_git_names::branch_valid(value) {
+                    return Err("instance name is reserved as a task branch; select another with create NAME TEMPLATE --branch BRANCH".into());
+                }
+                Some(vm_workspace::Workspace::new(branch.unwrap_or(value), profile)?)
+            }
+            None if branch.is_some() => return Err("configure a Git profile before selecting a task branch".into()),
+            None => None,
+        };
         let config = Config {
             template: name(template)?.into(),
             cpus: number(cpus, 1, 256, "vCPUs")?,
@@ -644,6 +681,9 @@ impl Manager {
             return Err("instance already exists".into());
         }
         let result = (|| {
+            if let Some(workspace) = &workspace {
+                self.check_workspace(value, workspace)?;
+            }
             command(
                 Command::new("qemu-img")
                     .args(["create", "-f", "qcow2", "-F", "qcow2", "-b"])
@@ -651,18 +691,69 @@ impl Manager {
                     .arg(scratch.join("disk.qcow2")),
             )?;
             config.write(&scratch)?;
+            if let Some(workspace) = &workspace {
+                workspace.publish(&scratch)?;
+            }
             io(
                 fs::remove_file(scratch.join("lease")),
                 "remove published staging lease",
             )?;
             io(fs::rename(&scratch, dest), "publish instance")?;
             println!("created {value}: {cpus} vCPUs, {memory} MiB");
+            if let Some(workspace) = &workspace {
+                println!("{}", term::scrub_lines(&workspace.summary()?));
+            }
             Ok(())
         })();
         if scratch.exists() {
             let _ = fs::remove_dir_all(&scratch);
         }
         result
+    }
+
+    // Catalog lock serializes workspace publication across instance names.
+    fn check_workspace(&self, value: &str, workspace: &vm_workspace::Workspace) -> Result<()> {
+        for other in entries(&self.root.join("instances"))? {
+            if other == value { continue; }
+            if let Some(existing) = vm_workspace::load(&self.instance(&other)?)
+                .map_err(|error| format!("cannot inspect workspace for instance {other}: {error}"))? {
+                if workspace.conflicts(&existing)? {
+                    return Err(format!("workspace identity or task branch overlaps instance {other}"));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn prepare_workspace(&self, value: &str, branch: &str) -> Result<String> {
+        name(value)?;
+        let _catalog = self.lock("catalog")?;
+        let _instance = self.lock(&format!("instance-{value}"))?;
+        let dir = self.instance(value)?;
+        Config::read(&dir)?;
+        if let Some(workspace) = vm_workspace::load(&dir)? {
+            if workspace.branch != branch {
+                return Err("workspace is already bound to another task branch; create a new instance".into());
+            }
+            return workspace.summary();
+        }
+        let _lifetime = lock_file(&self.root.join("locks").join(format!("run-{value}")), "workspace", false)
+            .map_err(|error| format!("stop the instance before preparing its workspace: {error}"))?;
+        if running(&dir)? {
+            return Err("stop the instance before preparing its workspace".into());
+        }
+        disk_available(&dir)?;
+        let workspace = vm_workspace::Workspace::new(branch, vm_git_profile::load(&self.root)?)?;
+        self.check_workspace(value, &workspace)?;
+        workspace.publish(&dir)?;
+        workspace.summary()
+    }
+
+    fn workspace(&self, value: &str) -> Result<String> {
+        match vm_workspace::load(&self.instance(value)?)? {
+            Some(workspace) => Ok(format!("{}\n\n{}", workspace.summary()?, workspace.profile.encode())),
+            None => Ok("Workspace is unconfigured; prepare it while the instance is stopped.".into()),
+        }
     }
 
     fn rows(&self) -> Result<Vec<(String, String)>> {
@@ -995,6 +1086,9 @@ impl Manager {
         // Open raw read/write without writing: require QEMU's write lock while
         // permitting a damaged header. Read-only raw opens do NOT test this lock.
         disk_available(&dir)?;
+        // Future enrollment formats need their own revocation path. An older
+        // manager must refuse unknown/corrupt state rather than erase its disk.
+        vm_workspace::load(&dir)?;
         io(fs::remove_dir_all(dir), "delete stopped instance")?;
         println!("deleted {value}");
         Ok(())
@@ -1462,7 +1556,7 @@ fn tui(manager: &Manager) -> Result<()> {
         let (height, width) = terminal.size();
         let mut frame = term::Frame::new(height, width);
         frame.push_text("td-vm  Enter open · n new · i import · t templates · D delete · X cut power", term::Style::bar(term::CYAN));
-        frame.push_text("h status · R resume · l logs · v paste · c copy · f feed · s sharing · r refresh · q quit", term::Style::bar(term::CYAN));
+        frame.push_text("h status · R resume · w workspace · W prepare · l logs · v paste · c copy · f feed · s sharing · r refresh · q quit", term::Style::bar(term::CYAN));
         frame.push_text(TABLE_HEADER, term::Style::bold());
         let page = height.saturating_sub(8).max(1);
         let offset = selected.saturating_sub(page - 1);
@@ -1532,9 +1626,23 @@ fn tui(manager: &Manager) -> Result<()> {
                     } else {
                         template.as_str()
                     };
+                    let branch = if vm_git_profile::optional(&manager.root)?.is_some() {
+                        let Some(branch) = prompt(&mut terminal, &format!("Task branch — blank uses {name}"))? else { break; };
+                        Some(if branch.is_empty() { name.clone() } else { branch })
+                    } else { None };
                     terminal
-                        .suspend(|| manager.create(&name, template, "4", "8192"))
+                        .suspend(|| manager.create_workspace(&name, template, "4", "8192", branch.as_deref()))
                         .map_err(|e| e.to_string())?
+                }
+                term::Key::Char('W') if current.is_some() => {
+                    let name = current.ok_or("no instance selected")?;
+                    let Some(branch) = prompt(&mut terminal, &format!("Task branch — blank uses {name}"))? else { break; };
+                    let branch = if branch.is_empty() { name } else { branch.as_str() };
+                    status = match manager.prepare_workspace(name, branch) {
+                        Ok(_) => "Workspace plan saved. Press w for details; guest enrollment and cloning remain pending.".into(),
+                        Err(error) => error,
+                    };
+                    break;
                 }
                 term::Key::Char('t') => {
                     status = format!(
@@ -1630,10 +1738,12 @@ fn tui(manager: &Manager) -> Result<()> {
                     status = manager.resume(name).unwrap_or_else(|e| e);
                     break;
                 }
-                term::Key::Char('l' | 'h') if current.is_some() => {
+                term::Key::Char('l' | 'h' | 'w') if current.is_some() => {
                     let name = current.ok_or("no instance selected")?;
                     let logs = if key == term::Key::Char('h') {
                         manager.status(name).unwrap_or_else(|e| e)
+                    } else if key == term::Key::Char('w') {
+                        manager.workspace(name).unwrap_or_else(|e| e)
                     } else {
                         manager.logs(name)?
                     };
@@ -1641,6 +1751,8 @@ fn tui(manager: &Manager) -> Result<()> {
                     let mut frame = term::Frame::new(height, width);
                     let title = if key == term::Key::Char('h') {
                         "QEMU status snapshot — any key returns"
+                    } else if key == term::Key::Char('w') {
+                        "Workspace plan — any key returns"
                     } else {
                         "Log tail — any key returns"
                     };

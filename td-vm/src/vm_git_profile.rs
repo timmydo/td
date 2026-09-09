@@ -154,6 +154,10 @@ impl Profile {
             .ok_or_else(|| format!("missing {name}"))
     }
 
+    pub fn repository(&self) -> Result<&str> {
+        self.get("repository")
+    }
+
     pub fn encode(&self) -> String {
         let mut text = String::from("TDVM-GIT-PROFILE-1\n");
         for (name, value) in &self.fields {
@@ -315,6 +319,14 @@ pub fn read(path: &Path, private: bool) -> Result<Profile> {
 
 pub fn load(root: &Path) -> Result<Profile> {
     read(&root.join(FILE), true)
+}
+
+pub fn optional(root: &Path) -> Result<Option<Profile>> {
+    match fs::symlink_metadata(root.join(FILE)) {
+        Ok(_) => load(root).map(Some),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(format!("inspect Git profile: {e}")),
+    }
 }
 
 pub fn configure(root: &Path, input: &Path) -> Result<()> {

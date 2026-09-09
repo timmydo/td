@@ -41,30 +41,9 @@ fn bounded(mut reader: impl Read) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-fn instance_valid(id: &str) -> bool {
-    id.len() == 32
-        && id
-            .bytes()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-}
-
-fn branch_valid(branch: &str) -> bool {
-    !branch.is_empty()
-        && branch.len() <= 200
-        && branch != "main"
-        && branch != "HEAD"
-        && !branch.starts_with("refs/")
-        && !branch.contains("..")
-        && branch.split('/').all(|part| {
-            !part.is_empty()
-                && !part.starts_with(['.', '-'])
-                && !part.ends_with('.')
-                && !part.ends_with(".lock")
-                && part
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
-        })
-}
+#[path = "../vm_git_names.rs"]
+mod names;
+use names::{branch_valid, instance_valid};
 
 fn absolute(value: &str) -> Result<PathBuf> {
     let path = PathBuf::from(value);
