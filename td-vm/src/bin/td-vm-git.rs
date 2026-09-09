@@ -473,7 +473,7 @@ fn run() -> Result<bool> {
         return Ok(hook_command(name, &remaining)?.status()?.success());
     }
     Err(
-        "usage: td-vm-git check|init|enroll|reserve|revoke|authorized-keys|serve (see td-review/VM.md)"
+        "usage: td-vm-git check|init|enroll|reserve|revoke|authorized-keys|serve (see td-vm/DESIGN.md)"
             .into(),
     )
 }

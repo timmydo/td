@@ -44,10 +44,12 @@ one-package locks the gate requires of a root crate leave no shared crate to
 put it in. §17 argues it once; §18 records only that the copy is the same
 bytes.
 
-The host-only `td-vm-registrar` binary in `td-review` has one separately
+The host-only `td-vm-registrar` binary in `td-vm` has one separately
 recorded account-authentication surface, H1 below. The existing `td-review`,
 `td-vm` and `td-vm-git` binary roots retain `forbid(unsafe_code)`; only the
-registrar root uses `deny` with its one function-scoped allowance.
+registrar root uses `deny` with its one function-scoped allowance. The
+separate `td-review` package forbids unsafe code package-wide and contains
+no VM binaries or services.
 
 Do not add `unsafe` anywhere else; a new `unsafe` surface is a reviewed
 amendment recorded HERE. A new syscall in an existing surface, a new
@@ -2545,7 +2547,7 @@ a change to both, reviewed once and recorded in §17.
 
 ## H1. `td-vm-registrar` — host Git account enrollment
 
-The host-only registrar in `td-review` has exactly one x86-64 Linux syscall:
+The host-only registrar in `td-vm` has exactly one x86-64 Linux syscall:
 `getsockopt` (55), fixed to `SOL_SOCKET` (1) and `SO_PEERCRED` (17). Stable
 `std` does not expose Unix peer credentials. Both the listener and client
 call the same `vm_registrar_sys::peer_uid` wrapper with a borrowed live
@@ -2570,5 +2572,5 @@ slack, register mapping, fixed values, module path and both production call
 sites. Existing binary roots stay forbidden; new code outside this one raw
 function cannot add a scoped allowance. Kernel tests check actual connected
 credentials; parser tests refuse short, zero and unmapped results. A second
-syscall, option, caller or allowance amends this section and `td-review/VM.md`
+syscall, option, caller or allowance amends this section and `td-vm/DESIGN.md`
 in the same landing.

@@ -15,7 +15,7 @@ const A: &str = "0123456789abcdef0123456789abcdef";
 const B: &str = "1123456789abcdef0123456789abcdef";
 
 // Only these permission fixtures need a mapped filesystem root. Other
-// td-review host tests keep their existing network/QEMU environment.
+// td-vm host tests keep their existing network/QEMU environment.
 fn in_trusted_root(name: &str) -> Result<bool> {
     if std::env::var_os("TD_VM_GIT_TEST_INNER").as_deref() == Some(std::ffi::OsStr::new("1")) {
         return Ok(false);

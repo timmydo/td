@@ -1380,8 +1380,8 @@ fn map_path(root: &Path, roster: &Result<Vec<GateCrate>, String>, p: &str, sel: 
         return;
     }
 
-    // td-review: the HOST-side integrator TUI. In neither bootstrap graph — no
-    // recipe builds it and it never enters a closure — so unlike the crates
+    // td-review and td-vm are independent host tools. Neither enters a
+    // bootstrap graph or recipe closure, so unlike the crates
     // above there is no target artifact for recipe-checks to link.
     //
     // `cargo-test` is the one gate that reaches td-review at all —
@@ -1397,10 +1397,7 @@ fn map_path(root: &Path, roster: &Result<Vec<GateCrate>, String>, p: &str, sel: 
     // an hour of mes/tcc/gcc that cannot read a host-side crate. Bounded means
     // bounded by what the diff can break; a selection nothing in it inspects is
     // latency, and latency is what gets a pre-push check skipped.
-    if pattern_matches(
-        "td-review/*|td-review/src/*|td-review/tests/*|td-review/Cargo.toml|td-review/Cargo.lock",
-        p,
-    ) {
+    if pattern_matches("td-review/*|td-vm/*", p) {
         sel.add_preflight("cargo-test");
         return;
     }
@@ -2626,6 +2623,19 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     assert_no_target!("td-review/tests/land.rs", "check");
     assert_no_target!("td-review/Cargo.toml", "check");
     assert_no_target!("td-review/Cargo.lock", "check");
+    for path in [
+        "td-vm/src/bin/td-vm.rs",
+        "td-vm/src/bin/td-vm-git.rs",
+        "td-vm/src/bin/td-vm-registrar.rs",
+        "td-vm/src/vm_registrar_sys.rs",
+        "td-vm/tests/vm_git.rs",
+        "td-vm/Cargo.toml",
+        "td-vm/Cargo.lock",
+    ] {
+        assert_preflight!(path, "cargo-test");
+        assert_no_target!(path, "recipe-checks");
+        assert_no_target!(path, "check");
+    }
     // The record fixture is read by the builder AND td-review suites; the one
     // cargo-test preflight runs both, and it must not escalate to the full check.
     assert_preflight!("tests/review-record.cases", "cargo-test");
@@ -4223,7 +4233,7 @@ mod tests {
     #[test]
     fn ready_defers_every_nonempty_selection_before_execution() {
         let root = repo_root();
-        for path in ["README.md", "td-review/VM.md", ".gitignore"] {
+        for path in ["README.md", "td-vm/DESIGN.md", ".gitignore"] {
             let args = vec!["--path".into(), path.into(), "--run".into()];
             assert_eq!(
                 run_selected(&root, &args, true),
@@ -4476,7 +4486,7 @@ mod tests {
         // The conservative textual edge widens checks even without a read.
         assert_eq!(
             readers_of("td-compositor"),
-            ["td-authd", "td-editor", "td-jail", "td-portal", "td-review", "td-seatd", "td-secret"]
+            ["td-authd", "td-editor", "td-jail", "td-portal", "td-seatd", "td-secret", "td-vm"]
         );
         assert_eq!(readers_of("td-authd"), ["td-compositor", "td-secret"]);
         // td-login is here for a test's argument string `/bin/td-busd/`, no
@@ -4485,6 +4495,7 @@ mod tests {
         assert_eq!(readers_of("td-busd"), ["td-audio", "td-compositor", "td-jail", "td-login", "td-portal", "td-secret"]);
         assert_eq!(readers_of("td-boot"), ["td-install"]);
         assert!(readers_of("td-review").is_empty(), "{readers:?}");
+        assert!(readers_of("td-vm").is_empty(), "{readers:?}");
         assert!(readers_of("td-sh").is_empty(), "{readers:?}");
         for (read, its_readers) in &readers {
             assert!(!its_readers.contains(read), "{read} reads itself");
@@ -4518,9 +4529,9 @@ mod tests {
                 "td-firstboot",
                 "td-jail",
                 "td-portal",
-                "td-review",
                 "td-seatd",
-                "td-secret"
+                "td-secret",
+                "td-vm"
             ]))
         );
         assert_eq!(check_scope(&root, &paths(&["td-sh/src/lib.rs"]), &check), Some(paths(&["td-sh"])));
@@ -6566,6 +6577,10 @@ mod tests {
         assert_eq!(review.len(), 4, "{review:?}");
         assert_eq!(workspace(&review), 2);
         assert_eq!(names(&review), ["td-review"]);
+        let vm = one("td-vm/src/bin/td-vm-registrar.rs");
+        assert_eq!(vm.len(), 4, "{vm:?}");
+        assert_eq!(workspace(&vm), 2);
+        assert_eq!(names(&vm), ["td-vm"]);
         // An embedded crate nobody else reads: the same shape.
         let sh = one("td-sh/src/main.rs");
         assert_eq!(sh.len(), 4, "{sh:?}");
@@ -6583,9 +6598,9 @@ mod tests {
                 "td-firstboot",
                 "td-jail",
                 "td-portal",
-                "td-review",
                 "td-seatd",
-                "td-secret"
+                "td-secret",
+                "td-vm"
             ]
         );
         assert_eq!(comp.len(), 21, "{comp:?}");
@@ -6601,9 +6616,9 @@ mod tests {
                 "td-jail",
                 "td-login",
                 "td-portal",
-                "td-review",
                 "td-seatd",
-                "td-secret"
+                "td-secret",
+                "td-vm"
             ]
         );
         assert_eq!(
@@ -6934,17 +6949,19 @@ mod tests {
                 .cloned()
                 .unwrap_or_default()
         };
-        let gate_review = line(&gate, "td-review/Cargo.toml");
-        let host_review = line(&host, "td-review/Cargo.toml");
-        assert!(
-            gate_review.ends_with("--bins"),
-            "the sandbox gate must run td-review's bins only: `{gate_review}`"
-        );
-        assert!(
-            host_review.contains("-- --include-ignored"),
-            "the host preflight must opt into td-review's ignored tests: `{host_review}`"
-        );
-        assert_ne!(gate_review, host_review);
+        for manifest in ["td-review/Cargo.toml", "td-vm/Cargo.toml"] {
+            let gate_line = line(&gate, manifest);
+            let host_line = line(&host, manifest);
+            assert!(
+                gate_line.ends_with("--bins"),
+                "the sandbox gate must run {manifest}'s bins only: `{gate_line}`"
+            );
+            assert!(
+                host_line.contains("-- --include-ignored"),
+                "the host preflight must opt into {manifest}'s ignored tests: `{host_line}`"
+            );
+            assert_ne!(gate_line, host_line);
+        }
     }
 
     #[test]

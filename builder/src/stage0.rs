@@ -11,7 +11,7 @@
 //! or replacement Rust toolchain. Both configurations produce statically linked
 //! helpers checked with `assert_static`; selecting the native configuration
 //! grants no target-artifact provenance. The musl details below describe other
-//! hosts. See td-review/VM.md for the native development contract.
+//! hosts. See td-vm/DESIGN.md for the native development contract.
 //!
 //! - `provision_rust` / `provision_cc` — resolve the SEED build's toolchain
 //!   guix-free and return a PATH fragment (colon-joined bin dirs). Resolution

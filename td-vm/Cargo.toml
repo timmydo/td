@@ -1,14 +1,13 @@
 [package]
-name = "td-review"
+name = "td-vm"
 version = "0.1.0"
 edition = "2021"
-default-run = "td-review"
-description = "Host-side integrator TUI: review branches against main, squash-land them, push to every remote"
+default-run = "td-vm"
+description = "Host VM manager and Git enrollment services for td development"
 license = "GPL-3.0-or-later"
 
 # How builder/src/affected.rs gates this crate; absent keys take the defaults.
-# The App-level tests drive a real git repo and are `#[ignore]`d so the
-# git-less sandbox gate stays honest — this preflight is their only tier.
+# Lifecycle and integration tests need host QEMU, Git and trusted-root fixtures.
 [package.metadata.td-gate]
 clippy-all-targets = true
 test-args = "--include-ignored"
@@ -21,11 +20,11 @@ gate-test-args = "--bins"
 [workspace]
 
 [[bin]]
-name = "td-review"
-path = "src/main.rs"
+name = "td-vm"
+path = "src/bin/td-vm.rs"
 
 [lints.rust]
-unsafe_code = "forbid"
+unsafe_code = "deny"
 
 [lints.clippy]
 unwrap_used = "deny"

@@ -15,7 +15,11 @@ an ordinary running desktop.
 
 ### Implemented lifecycle increment
 
-`td-vm` is a host binary in the dependency-free `td-review` crate. It imports
+`td-vm` is a standalone, dependency-free host crate. It owns the VM manager,
+Git dispatcher and account-authenticated registrar binaries. `td-review` is
+a separate review tool; their integration is ordinary Git branches. The VM
+TUI owns its terminal helpers in `src/term.rs`, with no source or Cargo
+dependency on the review tool. It imports
 the existing `./build-qcow` bundle format, verifies and privately copies the
 kernel, selector and disk, and creates one persistent qcow2 overlay per
 instance. It does not execute the bundle's launcher. The TUI offers import,
@@ -23,11 +27,11 @@ create, open, template listing, bounded log-tail viewing, refresh, confirmed
 force-stop, and confirmed deletion. Equivalent CLI commands are available.
 
 ```text
-cargo build --release --manifest-path td-review/Cargo.toml --bin td-vm
-td-review/target/release/td-vm import current /path/to/dist/td-vm-x86-64
-td-review/target/release/td-vm create worker-a current
-td-review/target/release/td-vm create worker-b current
-td-review/target/release/td-vm
+cargo build --release --manifest-path td-vm/Cargo.toml --bins
+td-vm/target/release/td-vm import current /path/to/dist/td-vm-x86-64
+td-vm/target/release/td-vm create worker-a current
+td-vm/target/release/td-vm create worker-b current
+td-vm/target/release/td-vm
 ```
 
 Import an unused bundle from the existing image producer; importing a running
@@ -106,7 +110,7 @@ not which td image boots or which development features are available.
 
 ## The daily flow
 
-Running `td-vm` opens a table in the host terminal, using td-review's compact
+Running `td-vm` opens a table in the host terminal, using a compact
 keyboard-driven interaction style. Each row shows instance name, selected
 repository/branch, template revision, VM state, accelerator, CPU/RAM allocation,
 disk usage, and agent readiness. Details and failures appear below the table.
@@ -872,7 +876,7 @@ remain in the bare origin. Stopping and later booting a VM retains its key.
 
 ### Implemented local Git registrar
 
-`td-review` also builds the host-only `td-vm-registrar`. Host setup starts it
+`td-vm` also builds the host-only `td-vm-registrar`. Host setup starts it
 as `test` with four fixed configuration values: socket directory, private
 registry file, installed `td-vm-git` executable, and operator UID. For this
 host the operator is `timmy` (UID 1000) and Git account is `test` (UID 1001):
@@ -937,7 +941,7 @@ termination is inferred from this local health check.
 
 ### Implemented host Git dispatcher
 
-`td-review` builds the dependency-free host binary `td-vm-git`. Its host-account
+`td-vm` builds the dependency-free host binary `td-vm-git`. Its host-account
 administrative commands initialize a registry, enroll an instance's public key
 and first branch together, reserve additional branches, and revoke an instance.
 The SSH lookup and Git-only dispatcher consume that same registry. The

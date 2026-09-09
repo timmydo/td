@@ -294,7 +294,8 @@ message.
   crate's confinement tests must pin the source-level contract the compiler
   cannot express.
 - `builder`, `recipes`, and `engine` are one zero-external-dependency workspace.
-  Target crates and `td-review` are standalone one-package locks. The `td-net`
+  Target crates and the host tools `td-review` and `td-vm` have standalone
+  one-package locks. The `td-net`
   multicall is the sole external-dependency tier and may use only its existing
   reviewed vendored closure. Any new dependency needs principle-2 sign-off.
 - A new standalone crate joins the gate by EXISTING: `builder/src/affected.rs`

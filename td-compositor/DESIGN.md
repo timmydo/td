@@ -6496,7 +6496,7 @@ interoperability checks.
 
 ## td-owned development VM bridge
 
-[td-vm's host/guest bridge](../td-review/VM.md#the-hostguest-bridge) owns the
+[td-vm's host/guest bridge](../td-vm/DESIGN.md#the-hostguest-bridge) owns the
 wire vocabulary, framing and bounds. QEMU supplies only a standard virtio-serial
 byte carrier. Seat startup retries discovery for at most two seconds because
 the kernel publishes the port name asynchronously. td-seatd delegates the exact `org.td.vm.1` device, discovered in

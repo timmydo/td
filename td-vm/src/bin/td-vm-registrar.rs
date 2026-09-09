@@ -475,7 +475,6 @@ mod tests {
         }
         assert!(root.contains("#[path = \"../vm_registrar_sys.rs\"]\nmod sys;"));
         for source in [
-            include_str!("../main.rs"),
             include_str!("td-vm.rs"),
             include_str!("td-vm-git.rs"),
         ] {
