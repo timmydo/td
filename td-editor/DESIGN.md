@@ -586,8 +586,22 @@ all-target feature Clippy. It never replaces the ordinary editor binary.
 The cases prove cancelled Reload retains later edits and its old baseline,
 and cancelled close-Save still writes the handed-off snapshot while newer
 edits stay dirty. Exact disk, tab/text, historical job and correlated pixel
-checks precede ordinary explicit save/teardown. Kernel-stalled I/O and the
-queued-before-handoff Save race remain outside these process cases.
+checks precede ordinary explicit save/teardown.
+
+Direct remote Save and Save As cases also hold an admitted snapshot before
+I/O. The submitting peer never reads its reply and closes only after the
+worker hold receipt proves admission. The fixture does not retry that
+ambiguous request; state discovers the one pending job. While held, another
+Save, Save As, Open and Close refuse without allocating jobs or dialogs.
+Edits and a newly active dirty tab remain usable. All held-state evidence
+finishes within four seconds measured before submission. After release,
+the historical job still names its original tab/revision; exact disk bytes
+match the earlier snapshot, both tabs retain their later dirty states, and
+a correlated capture still shows the newly active tab. A subsequent plain
+Save proves the association belongs to the original tab, including after
+Save As. This is lost-client-reply and post-handoff isolation evidence, not
+a pre-admission cancellation, queued-before-handoff or kernel-stalled-I/O
+oracle. Those boundaries remain outside these process cases.
 
 ## Line-number display
 

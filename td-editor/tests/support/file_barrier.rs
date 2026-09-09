@@ -118,6 +118,150 @@ fn cancelled_close_save_keeps_captured_snapshot_and_later_edits() {
     scenario(false);
 }
 
+#[test]
+#[ignore = "ready builds the isolated test-file-barrier editor"]
+fn admitted_save_survives_unread_reply_edits_and_tab_switch() {
+    admitted_save(false);
+}
+
+#[test]
+#[ignore = "ready builds the isolated test-file-barrier editor"]
+fn admitted_save_as_survives_unread_reply_edits_and_tab_switch() {
+    admitted_save(true);
+}
+
+fn admitted_save(save_as: bool) {
+    let compositor_directory = Directory::new();
+    let directory = Directory::new();
+    let mut compositor = Compositor::start(&compositor_directory);
+    let mut barrier = Barrier::start(&directory);
+    let file = directory.0.join("draft");
+    let destination = directory.0.join("saved copy");
+    let refused = directory.0.join("refused");
+    let dictionary = directory.0.join("dictionary");
+    std::fs::write(&file, b"disk").unwrap();
+    std::fs::write(&dictionary, b"disk\n").unwrap();
+    let display = compositor.directory.join("wayland-0");
+    let mut editor = EditorProcess::start_with_barrier(
+        &directory,
+        &display,
+        &file,
+        &dictionary,
+        "windows",
+        Some(&barrier.path),
+    );
+    editor.legacy_keyboard("windows");
+    let window = compositor.window();
+    assert_eq!(compositor.request("fullscreen", 1024), b"ok\n");
+    editor.wait_field("state", "window", "800,576,1");
+    editor.rendered_at(800, 576);
+    editor.ok("insert\t1\t0\t0\t0\t61");
+    let kind = if save_as { "save-as" } else { "save" };
+    let request = if save_as {
+        let path = td_editor::control::hex(destination.as_os_str().as_encoded_bytes());
+        format!("save-as\t1\t1\t{path}")
+    } else {
+        "save\t1\t1".into()
+    };
+    barrier.arm("save"); // Both Save and Save As use the worker's save checkpoint.
+    let started = Instant::now();
+    let mut unread = UnixStream::connect(&editor.socket).unwrap();
+    editor.next += 1;
+    let payload = format!("1\t{}\t{request}", editor.next);
+    let frame = td_editor::control::frame(payload.as_bytes()).unwrap();
+    write_until(&mut unread, &frame, Instant::now() + TIMEOUT).unwrap();
+    let held = barrier.held(); // Worker receipt proves admission and snapshot handoff.
+    drop(unread); // Deliberately never read the pending reply and never retry it.
+    editor.wait_field("state", "job", &format!("1,{kind},1,1,0,pending,-"));
+    editor.wait_field("state", "job-last", "1");
+    editor.wait_field("state", "native", "1,1,1,0");
+    let refused_path = td_editor::control::hex(refused.as_os_str().as_encoded_bytes());
+    for request in [
+        "save\t1\t1".into(),
+        format!("save-as\t1\t1\t{refused_path}"),
+        format!("open\t{refused_path}"),
+        "close-tab\t1\t1".into(),
+    ] {
+        let response = editor.request(&request).unwrap();
+        assert!(response.starts_with("error\tunavailable\t"), "{response}");
+    }
+    editor.wait_field("state", "job-last", "1");
+    editor.wait_field("state", "dialog-last", "0");
+    editor.wait_field("state", "dialog", "-");
+    assert!(!refused.exists());
+    editor.ok("insert\t1\t1\t1\t1\t62");
+    assert_eq!(editor.ok("new"), "2");
+    editor.ok("insert\t2\t0\t0\t0\t6672657368");
+    editor.wait_field("state", "active", "2");
+    editor.wait_field("state", "tab", "1,2,1,6,2,2,0,72,0,lf");
+    let state = editor.ok("state");
+    assert!(
+        state
+            .split('\t')
+            .any(|field| field == "tab=2,1,1,5,5,5,0,72,0,lf"),
+        "{state}"
+    );
+    assert_eq!(editor.ok("text\t1\t2\t0\t100"), "6\t61626469736b");
+    assert_eq!(editor.ok("text\t2\t1\t0\t100"), "5\t6672657368");
+    assert_eq!(std::fs::read(&file).unwrap(), b"disk");
+    assert!(!destination.exists());
+    editor.wait_field("state", "native", "1,1,1,0");
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(4),
+        "admitted-save evidence exceeded four seconds: {elapsed:?}"
+    );
+    let before = compositor.observe(&window);
+    barrier.release(held);
+    assert_eq!(
+        editor.wait_job("1"),
+        format!("job=1,{kind},1,1,0,complete,-")
+    );
+    editor.wait_field("state", "native", "1,1,0,0");
+    editor.wait_field("state", "active", "2");
+    editor.wait_field("state", "tab", "1,2,1,6,2,2,0,72,0,lf");
+    let state = editor.ok("state");
+    assert!(
+        state
+            .split('\t')
+            .any(|field| field == "tab=2,1,1,5,5,5,0,72,0,lf"),
+        "{state}"
+    );
+    compositor.rendered_tab_text(&mut editor, &window, (2, 1), before, "fresh", 5);
+    let saved_path = if save_as { &destination } else { &file };
+    assert_eq!(std::fs::read(saved_path).unwrap(), b"adisk");
+    if save_as {
+        assert_eq!(std::fs::read(&file).unwrap(), b"disk");
+    }
+    // The new tab must remain unnamed, without inheriting the save destination.
+    let response = editor.request("save\t2\t1").unwrap();
+    assert!(
+        response.starts_with("error\tinvalid-argument\t"),
+        "{response}"
+    );
+    editor.wait_field("state", "job-last", "1");
+    editor.ok("select-tab\t1\t2");
+    assert_eq!(editor.job("save\t1\t2"), "job=2,save,1,2,0,complete,-");
+    assert_eq!(std::fs::read(saved_path).unwrap(), b"abdisk");
+    if save_as {
+        assert_eq!(std::fs::read(&file).unwrap(), b"disk");
+    }
+    editor.wait_field("state", "tab", "1,2,0,6,2,2,0,72,0,lf");
+    editor.ok("select-tab\t2\t1");
+    editor.ok("close-tab\t2\t1");
+    let state = editor.ok("state");
+    let dialog = field(&state, "dialog")
+        .expect("close dialog field")
+        .split(',')
+        .next()
+        .unwrap();
+    editor.ok(&format!("dialog-answer\t{dialog}\t2\t1\tdiscard"));
+    editor.wait_field("state", "active", "1");
+    editor.quit();
+    barrier.finish();
+    compositor.stop();
+}
+
 fn scenario(reload: bool) {
     let compositor_directory = Directory::new();
     let directory = Directory::new();

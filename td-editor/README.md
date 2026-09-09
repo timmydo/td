@@ -59,6 +59,10 @@ normal runtime option. The native gate builds it in an isolated directory
 to test cancellation during file jobs; its scheduling socket is not part
 of the editor control protocol. Normal binaries ignore the fixture variable.
 See DESIGN.md's isolated file-worker test-build contract.
+It also verifies admitted remote Save/Save As after an unread reply is
+discarded: later edits and tab switches cannot retarget the write, competing
+file operations refuse while busy, and Save As retains the original tab's
+association. Historical job rows, disk bytes and active-tab pixels agree.
 
 Line numbers are on by default. Use **Format > Line Numbers** to toggle
 them, or the `display-line-numbers-mode` named command in either key profile.
