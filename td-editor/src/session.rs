@@ -26,6 +26,10 @@ impl PollFailure {
 }
 
 enum Operation {
+    Mkdir {
+        source: crate::files::DirectorySource,
+        name: std::ffi::OsString,
+    },
     Delete(crate::files::DeletePlan),
     Dictionary(PathBuf),
     Open(PathBuf),
@@ -51,6 +55,10 @@ struct Loaded {
     missing: bool,
 }
 enum Completion {
+    CreatedDirectory {
+        result: crate::files::CreatedDirectory,
+        listing: Result<Option<crate::directory::Snapshot>>,
+    },
     Deleted {
         result: crate::files::Deleted,
         listing: Result<Option<crate::directory::Snapshot>>,
@@ -70,6 +78,7 @@ enum Completion {
     },
 }
 enum Pending {
+    Mkdir(TabId),
     Delete,
     Dictionary,
     Open,
@@ -228,6 +237,34 @@ impl Session {
         next.text = String::new();
         self.directories.insert(tab, next);
         Ok(())
+    }
+
+    pub(crate) fn create_directory(
+        &mut self,
+        ui: &Controller,
+        tab: TabId,
+        revision: u64,
+        source: crate::files::DirectorySource,
+        name: std::ffi::OsString,
+    ) -> Result<()> {
+        ui.editor()
+            .revision_point(tab, revision)
+            .map_err(|e| e.to_string())?;
+        let directory = self
+            .directory(tab)
+            .ok_or("Creation needs a directory tab")?;
+        if source.path() != directory.path {
+            return Err("Creation belongs to a different directory".into());
+        }
+        let path = source.destination(&name).map_err(|e| e.to_string())?;
+        if self
+            .directories
+            .values()
+            .any(|snapshot| snapshot.path.starts_with(&path))
+        {
+            return Err("Destination belongs to an open directory tab".into());
+        }
+        self.submit(Operation::Mkdir { source, name }, Pending::Mkdir(tab))
     }
 
     pub(crate) fn delete(
@@ -552,6 +589,54 @@ impl Session {
         result: Result<Completion>,
     ) -> Result<String> {
         match (pending, result?) {
+            (Some(Pending::Mkdir(origin)), Completion::CreatedDirectory { result, listing }) => {
+                let mut notice = result.warning.unwrap_or_else(|| "Directory created".into());
+                let mut stale = false;
+                match listing {
+                    Ok(Some(fresh)) => {
+                        for (&tab, old) in &mut self.directories {
+                            if old.path != fresh.path {
+                                continue;
+                            }
+                            let refreshed = (|| -> Result<crate::directory::Snapshot> {
+                                let doc = ui.editor().document(tab).map_err(|e| e.to_string())?;
+                                let point = ui
+                                    .editor()
+                                    .revision_point(tab, doc.revision())
+                                    .map_err(|e| e.to_string())?;
+                                let row = doc
+                                    .text()
+                                    .get(..doc.selection().caret)
+                                    .ok_or("Invalid selection")?
+                                    .bytes()
+                                    .filter(|b| *b == b'\n')
+                                    .count();
+                                let selected = if tab == origin {
+                                    Some(result.path.clone())
+                                } else {
+                                    old.entry(row)
+                                };
+                                let mut next = fresh.clone();
+                                next.arrange(old.sort, old.reverse);
+                                let caret = selected.as_ref().map_or(0, |path| next.offset(path));
+                                ui.refresh_directory(point, next.text.as_bytes(), caret)
+                                    .map_err(|e| e.to_string())?;
+                                next.text = String::new();
+                                Ok(next)
+                            })();
+                            match refreshed {
+                                Ok(next) => *old = next,
+                                Err(_) => stale = true,
+                            }
+                        }
+                    }
+                    _ => stale = true,
+                }
+                if stale {
+                    notice.push_str("; listing stale: use g to refresh");
+                }
+                Ok(notice)
+            }
             (Some(Pending::Delete), Completion::Deleted { result, listing }) => {
                 let mut notice = format!(
                     "Removed {}/{} entries permanently (not undoable)",
@@ -841,6 +926,7 @@ fn worker(jobs: Receiver<Job>, results: SyncSender<Result<Completion>>) {
                 Operation::Save { .. } => "save",
                 Operation::Rename { .. } => "rename",
                 Operation::Delete(_) => "delete",
+                Operation::Mkdir { .. } => "mkdir",
             };
             if let Err(detail) = barrier.checkpoint(kind) {
                 let _ = results.send(Err(detail));
@@ -899,6 +985,14 @@ fn execute(files: &mut Files, known: &mut BTreeSet<FileId>, job: Job) -> Result<
     // Release closed tabs and rejected Open admissions before the next job.
     retain_files(files, known, &job.keep);
     match job.operation {
+        Operation::Mkdir { source, name } => {
+            let parent = source.path().to_path_buf();
+            let result = files
+                .create_directory(source, &name)
+                .map_err(|e| format!("Directory creation failed: {e}"))?;
+            let listing = crate::directory::read(&parent);
+            Ok(Completion::CreatedDirectory { result, listing })
+        }
         Operation::Delete(plan) => {
             let result = files
                 .delete(plan)

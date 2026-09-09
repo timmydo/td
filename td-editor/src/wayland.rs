@@ -371,6 +371,7 @@ struct Window {
 
 enum ControlFile {
     Delete(u64),
+    Mkdir(u64),
     Open(u64),
     Save(u64),
     Reload(u64),
@@ -386,6 +387,7 @@ enum ControlAnswer {
 
 enum PathAction {
     Delete(DeletePrompt),
+    Mkdir(crate::files::DirectorySource),
     Open,
     Dictionary,
     Rename(crate::files::RenameSource),
@@ -468,6 +470,7 @@ impl PathPrompt {
             PathAction::Save { .. } => "Save As",
             PathAction::Rename(_) => "Rename",
             PathAction::Delete(_) => "Delete",
+            PathAction::Mkdir(_) => "New Directory",
         };
         let header = if !paused.is_empty() {
             paused.to_string()
@@ -482,7 +485,9 @@ impl PathPrompt {
             .rev()
             .nth(columns.saturating_sub(2))
             .map_or(0, |(i, _)| i);
-        let entry = if columns == 1 { "|".into() } else {
+        let entry = if columns == 1 {
+            "|".into()
+        } else {
             format!("{}|", escaped.get(start..).unwrap_or_default())
         };
         format!("{header}\n{entry}\n{}", self.completion.notice(rows))
@@ -507,6 +512,9 @@ impl PathPrompt {
             PathAction::Open => "Open",
             PathAction::Dictionary => "Dictionary (read only)",
             PathAction::Delete(review) => return review.notice(&self.text, 64),
+            PathAction::Mkdir(_) => return format!(
+                "New directory in this tab\nNew basename only; existing names refused\nReturn: submit; Escape/Ctrl+G: cancel; Ctrl+U: clear\n{tail}|"
+            ),
             PathAction::Save { .. } => "Save As (new path only)",
             PathAction::Rename(source) => {
                 let label: String = format!(
@@ -1491,7 +1499,7 @@ impl Window {
         let directory = doc.directory();
         if directory
             && !self.ui.keys().pending()
-            && matches!(chord, "w" | "s" | "S" | "R" | "d" | "u" | "x")
+            && matches!(chord, "w" | "s" | "S" | "R" | "d" | "u" | "x" | "+")
         {
             if !repeated {
                 if chord == "w" {
@@ -1500,6 +1508,8 @@ impl Window {
                     self.rename_request(tab, revision);
                 } else if chord == "x" {
                     self.delete_request(tab, revision);
+                } else if chord == "+" {
+                    self.mkdir_request(tab, revision);
                 } else if matches!(chord, "d" | "u") {
                     self.mark_directory(tab, revision, chord == "d");
                 } else {
@@ -1720,6 +1730,10 @@ impl Window {
                     ControlFile::Delete(id) => self
                         .control_jobs
                         .deleted(id, result.as_ref().map(|_| ()).map_err(|error| error.code)),
+                    ControlFile::Mkdir(id) => self.control_jobs.created_directory(
+                        id,
+                        result.as_ref().map(|_| ()).map_err(|error| error.code),
+                    ),
                 };
                 if let Err(detail) = outcome {
                     job_error = Some(detail);
@@ -2641,6 +2655,42 @@ impl Window {
         Ok(id)
     }
 
+    fn control_mkdir_job(
+        &mut self,
+        target: Target,
+        source: crate::files::DirectorySource,
+        name: std::ffi::OsString,
+    ) -> crate::Result<u64> {
+        if self.files.as_ref().is_none_or(|files| files.busy()) || self.control_file_job.is_some() {
+            return Err(crate::Error::Unavailable);
+        }
+        self.ui
+            .editor()
+            .revision_point(target.tab, target.revision)?;
+        self.ui
+            .generation()
+            .checked_add(2)
+            .ok_or(crate::Error::Exhausted)?;
+        let files = self.files.as_mut().ok_or(crate::Error::Unavailable)?;
+        let id = self.control_jobs.begin_mkdir(target.tab, target.revision)?;
+        let notice =
+            match files.create_directory(&self.ui, target.tab, target.revision, source, name) {
+                Ok(()) => {
+                    self.control_file_job = Some(ControlFile::Mkdir(id));
+                    "Directory creation pending".into()
+                }
+                Err(detail) => {
+                    self.control_jobs
+                        .created_directory(id, Err(crate::Error::Unavailable))?;
+                    format!("Directory creation refused: {detail}")
+                }
+            };
+        self.stop_pointer();
+        self.control_mutation_accepted();
+        self.notify(notice);
+        Ok(id)
+    }
+
     fn control_delete_job(
         &mut self,
         target: Target,
@@ -2652,7 +2702,10 @@ impl Window {
         self.ui
             .editor()
             .revision_point(target.tab, target.revision)?;
-        self.ui.generation().checked_add(2).ok_or(crate::Error::Exhausted)?;
+        self.ui
+            .generation()
+            .checked_add(2)
+            .ok_or(crate::Error::Exhausted)?;
         let files = self.files.as_mut().ok_or(crate::Error::Unavailable)?;
         let id = self
             .control_jobs
@@ -2821,7 +2874,10 @@ impl Window {
         }
         self.ui.editor().check_revision(&identity.point)?;
         // A job may cancel a drag before retiring this prompt's inset.
-        self.ui.generation().checked_add(2).ok_or(crate::Error::Exhausted)?;
+        self.ui
+            .generation()
+            .checked_add(2)
+            .ok_or(crate::Error::Exhausted)?;
         let path = match answer {
             crate::control::DialogAnswer::Cancel => {
                 self.prompt = None;
@@ -2837,6 +2893,9 @@ impl Window {
             PathAction::Save { .. } => self.control_save_job(target, Some(path))?,
             PathAction::Rename(source) => {
                 self.control_rename_job(target, source.clone(), path.into_os_string())?
+            }
+            PathAction::Mkdir(source) => {
+                self.control_mkdir_job(target, source.clone(), path.into_os_string())?
             }
             PathAction::Delete(review) => {
                 if path.as_os_str().as_encoded_bytes() != b"DELETE" {
@@ -3000,6 +3059,7 @@ impl Window {
                         PathAction::Save { .. } => "path-save-as",
                         PathAction::Rename(_) => "path-rename",
                         PathAction::Delete(_) => "path-delete",
+                        PathAction::Mkdir(_) => "path-mkdir",
                     };
                     if self.ui.editor().check_revision(&identity.point).is_ok() {
                         fields.push_str(&format!(
@@ -3090,6 +3150,7 @@ impl Window {
                 PathAction::Save { .. } => "path-save-as",
                 PathAction::Rename(_) => "path-rename",
                 PathAction::Delete(_) => "path-delete",
+                PathAction::Mkdir(_) => "path-mkdir",
             };
             snapshot.field = "text";
             snapshot.text = &prompt.text;
@@ -3729,13 +3790,21 @@ impl Window {
                         Item::SortModified => crate::directory::Sort::Modified,
                         _ => directory.sort,
                     };
-                    let reverse = if item == Item::SortReverse { !directory.reverse } else { directory.reverse };
+                    let reverse = if item == Item::SortReverse {
+                        !directory.reverse
+                    } else {
+                        directory.reverse
+                    };
                     self.sort_directory(tab, revision, sort, reverse);
                 }
                 return Ok(());
             }
             Item::RenameEntry => {
                 self.rename_request(tab, revision);
+                return Ok(());
+            }
+            Item::NewDirectory => {
+                self.mkdir_request(tab, revision);
                 return Ok(());
             }
             Item::MarkDelete | Item::UnmarkDelete => {
@@ -4391,6 +4460,46 @@ impl Window {
         }
     }
 
+    fn mkdir_request(&mut self, tab: crate::model::TabId, revision: u64) {
+        let prepared = (|| -> Result<(crate::files::DirectorySource, PathIdentity)> {
+            let files = self.files.as_ref().ok_or("Not a file window")?;
+            if files.busy() {
+                return Err("File operation pending; wait before creating a directory".into());
+            }
+            let source = files
+                .directory(tab)
+                .ok_or("Not a directory tab")?
+                .creation_source();
+            let id = self
+                .last_dialog_id
+                .checked_add(1)
+                .ok_or("Dialog counter exhausted")?;
+            let point = self
+                .ui
+                .editor()
+                .revision_point(tab, revision)
+                .map_err(error)?;
+            Ok((source, PathIdentity { id, point }))
+        })();
+        match prepared {
+            Ok((source, identity)) => {
+                self.last_dialog_id = identity.id;
+                self.menu = None;
+                self.notice = None;
+                self.stop_pointer();
+                self.input.cancel_repeat();
+                self.prompt = Some(PathPrompt {
+                    action: PathAction::Mkdir(source),
+                    text: String::new(),
+                    identity: Some(identity),
+                    completion: crate::path_completion::State::Idle,
+                });
+                self.frames.invalidate(true);
+            }
+            Err(detail) => self.notify(format!("Directory creation refused: {detail}")),
+        }
+    }
+
     fn rename_request(&mut self, tab: crate::model::TabId, revision: u64) {
         let prepared = (|| -> Result<(crate::files::RenameSource, PathIdentity)> {
             let files = self.files.as_ref().ok_or("Not a file window")?;
@@ -4602,6 +4711,27 @@ impl Window {
                     }
                     return;
                 }
+                if let PathAction::Mkdir(source) = &prompt.action {
+                    let result = prompt
+                        .identity
+                        .as_ref()
+                        .ok_or(crate::Error::Unavailable)
+                        .and_then(|identity| {
+                            self.ui.editor().check_revision(&identity.point)?;
+                            self.control_mkdir_job(
+                                Target {
+                                    tab: identity.point.tab,
+                                    revision: identity.point.revision,
+                                },
+                                source.clone(),
+                                std::ffi::OsString::from(&prompt.text),
+                            )
+                        });
+                    if let Err(detail) = result {
+                        self.notify(format!("Directory creation refused: {detail}"));
+                    }
+                    return;
+                }
                 if let PathAction::Rename(source) = &prompt.action {
                     let result = prompt
                         .identity
@@ -4632,9 +4762,10 @@ impl Window {
                     PathAction::Save { tab, revision } => {
                         files.save(&self.ui, tab, revision, Some(path))
                     }
-                    // Rename returns above through its pinned job helper.
+                    // Path mutations return above through pinned job helpers.
                     PathAction::Rename(_) => Err("Rename requires a pinned source".into()),
                     PathAction::Delete(_) => Err("Deletion requires a confirmed plan".into()),
+                    PathAction::Mkdir(_) => Err("Creation requires a pinned directory".into()),
                 };
                 let close_failed = self.closing.is_some() && result.is_err();
                 if self.closing.is_some() {
@@ -4666,7 +4797,7 @@ impl Window {
                     self.prompt = Some(prompt);
                     return;
                 }
-                if matches!(prompt.action, PathAction::Rename(_)) {
+                if matches!(prompt.action, PathAction::Rename(_) | PathAction::Mkdir(_)) {
                     self.prompt = Some(prompt);
                     return;
                 }
@@ -4678,7 +4809,9 @@ impl Window {
                     {
                         let path = if matches!(chord, "PageUp" | "PageDown") {
                             matches.page_by(chord == "PageUp", self.completion_rows())
-                        } else { matches.cycle(backward) };
+                        } else {
+                            matches.cycle(backward)
+                        };
                         if let Some(path) = path {
                             prompt.text = path.to_string();
                         }
@@ -9775,14 +9908,154 @@ mod tests {
             assert!(w.prompt.is_none());
             finish_file(&mut w);
             assert!(!dir.path("file").exists());
-            assert!(
-                w.control_jobs
-                    .fields()
-                    .unwrap()
-                    .contains(&format!("job=1,delete,2,{revision},0,complete,-"))
-            );
+            assert!(w
+                .control_jobs
+                .fields()
+                .unwrap()
+                .contains(&format!("job=1,delete,2,{revision},0,complete,-")));
             assert_eq!(w.files.as_ref().unwrap().directory(2).unwrap().marked(), 0);
         }
+    }
+
+    #[test]
+    fn mkdir_prompt_fences_cancel_repeat_and_native_submission() {
+        for profile in [Profile::Windows, Profile::Emacs] {
+            let dir = DialogDirectory::new();
+            let (mut w, _peer) = file_dialog_fixture();
+            configure(&mut w, 800, 600);
+            w.ui.dispatch(Event::Profile(profile)).unwrap();
+            w.files.as_mut().unwrap().open(dir.0.clone()).unwrap();
+            finish_file(&mut w);
+            w.chord("+", true).unwrap();
+            assert!(w.prompt.is_none());
+            w.chord("+", false).unwrap();
+            let id = w.last_dialog_id;
+            assert!(w.control_dialog_fields().contains("path-mkdir"));
+            w.path_chord("n", false);
+            w.path_chord("Tab", false);
+            assert!(w.path_completion.is_none());
+            assert_eq!(w.prompt.as_ref().unwrap().text, "n");
+            let answer = crate::control::DialogAnswer::Path("child".into());
+            assert_eq!(
+                w.control_path_answer(
+                    id,
+                    Target {
+                        tab: 2,
+                        revision: 1
+                    },
+                    &answer
+                )
+                .err(),
+                Some(crate::Error::StaleRevision)
+            );
+            assert_eq!(
+                w.control_path_answer(
+                    id + 1,
+                    Target {
+                        tab: 2,
+                        revision: 0
+                    },
+                    &answer
+                )
+                .err(),
+                Some(crate::Error::InvalidArgument)
+            );
+            w.control_path_answer(
+                id,
+                Target {
+                    tab: 2,
+                    revision: 0,
+                },
+                &crate::control::DialogAnswer::Cancel,
+            )
+            .unwrap();
+            assert_eq!(std::fs::read_dir(&dir.0).unwrap().count(), 0);
+            w.chord("+", false).unwrap();
+            assert_ne!(w.last_dialog_id, id);
+            w.path_chord("Return", false);
+            assert!(w.prompt.is_some());
+            w.path_chord("n", false);
+            w.path_chord("Return", true);
+            assert!(w.prompt.is_some());
+            w.path_chord("Return", false);
+            assert!(w.prompt.is_none());
+            finish_file(&mut w);
+            assert!(dir.path("n").is_dir());
+            assert!(w
+                .control_jobs
+                .fields()
+                .unwrap()
+                .contains("job=1,mkdir,2,0,0,complete,-"));
+            assert!(w.ui.editor().document(2).unwrap().text().ends_with(" n/"));
+            w.chord("+", false).unwrap();
+            w.path_chord("n", false);
+            w.path_chord("Return", false);
+            finish_file(&mut w);
+            assert!(w
+                .control_jobs
+                .fields()
+                .unwrap()
+                .contains("job=2,mkdir,2,1,0,error,unavailable"));
+            assert_eq!(w.ui.editor().document(2).unwrap().revision(), 1);
+            assert!(w.notice.as_ref().unwrap().contains("never replaces"));
+        }
+    }
+
+    #[test]
+    fn mkdir_invalid_names_refuse_before_reservation_checks_or_io() {
+        let dir = DialogDirectory::new();
+        let (mut w, _peer) = file_dialog_fixture();
+        w.files.as_mut().unwrap().open(dir.0.clone()).unwrap();
+        finish_file(&mut w);
+        for name in ["", ".", "..", "/", "/absolute", "a/b", "zero\0byte"] {
+            w.chord("+", false).unwrap();
+            let id = w.last_dialog_id;
+            w.control_path_answer(
+                id,
+                Target {
+                    tab: 2,
+                    revision: 0,
+                },
+                &crate::control::DialogAnswer::Path(name.into()),
+            )
+            .unwrap();
+            assert!(w
+                .notice
+                .as_ref()
+                .unwrap()
+                .contains("new basename, not a path"));
+            assert!(w.prompt.is_none());
+            assert!(!w.files.as_ref().unwrap().busy());
+            assert!(w.control_file_job.is_none());
+            assert!(w
+                .control_jobs
+                .fields()
+                .unwrap()
+                .contains(&format!("job={id},mkdir,2,0,0,error,unavailable")));
+        }
+        assert_eq!(std::fs::read_dir(&dir.0).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn mkdir_immediate_refusal_does_not_claim_a_pending_job() {
+        let dir = DialogDirectory::new();
+        std::fs::create_dir(dir.path("child")).unwrap();
+        let (mut w, _peer) = file_dialog_fixture();
+        for path in [dir.path("child"), dir.0.clone()] {
+            w.files.as_mut().unwrap().open(path).unwrap();
+            finish_file(&mut w);
+        }
+        w.chord("+", false).unwrap();
+        w.prompt.as_mut().unwrap().text = "child".into();
+        w.path_chord("Return", false);
+        assert!(!w.files.as_ref().unwrap().busy());
+        assert!(w.control_file_job.is_none());
+        assert!(w
+            .control_jobs
+            .fields()
+            .unwrap()
+            .contains("job=1,mkdir,3,0,0,error,unavailable"));
+        assert!(w.notice.as_ref().unwrap().contains("open directory tab"));
     }
 
     #[test]

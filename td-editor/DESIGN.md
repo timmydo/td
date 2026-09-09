@@ -568,9 +568,9 @@ In the explicit feature build, an unset variable leaves scheduling ordinary.
 When set, it names a fixture-owned Unix listener. The file worker connects
 once and exchanges `td-file-v1 N KIND\n` / `continue N\n` before each job's
 I/O, including initial Open and Dictionary. KIND is `open`, `dictionary`,
-`reload`, `rename`, `delete` or `save`; Save As shares `save`. N starts at 1 and is
-checked for exhaustion. The channel carries no path, document bytes or
-model authority.
+`reload`, `rename`, `delete`, `mkdir` or `save`; Save As shares `save`.
+N starts at 1 and is checked for exhaustion. The channel carries no path,
+document bytes or model authority.
 The fixture automatically continues startup and unrelated jobs and may hold
 one selected job. A Save checkpoint occurs after immutable snapshot handoff;
 it cannot prove queued-before-handoff rejection. A Reload checkpoint precedes
@@ -1336,6 +1336,43 @@ or model admission does not undo rename:
 paths remain updated, old listing rows remain stale, and the notice asks for
 `g` refresh. Source observations add one fixed-size metadata stamp per cached
 entry and one parent identity per snapshot, still within the 4096-entry cap.
+
+#### Create directory
+
+`+` in either profile or Directory > New Directory opens `path-mkdir`, a
+revision/owner-bound prompt for one literal new basename. It works in empty
+listings. Return submits, Escape/C-g cancels, C-u clears; there is no path
+completion, shell expansion or recursive creation. Empty, slash-containing,
+NUL, dot and dot-dot names refuse. Semantic `dialog-answer ... path HEX`
+accepts raw OS bytes, including non-UTF-8 names, through the same prompt and
+historical `mkdir` job. Repeat and pending Emacs prefixes do not invoke it.
+
+The prompt captures the displayed directory's resolved path and device/inode
+from its cached snapshot. The exclusive worker re-resolves that parent and
+checks its identity before creation. Input and resolved paths fit 4096
+bytes. Open file associations and directory tabs reserve destination paths,
+including descendants. Existing names of any type refuse atomically through
+safe std `DirBuilder`, requesting mode 0700 with the caller's umask honored.
+There is no overwrite, fallback, retry, cleanup or Undo. No raw syscall or
+dependency is added. Path checks are not atomic with mkdir or subsequent
+opening: same-authority name/ancestor replacement remains outside the
+guarantee, as for other path-based operations.
+
+Kernel success is followed by a no-follow directory open, private-mode
+check, node/parent sync, parent identity check and named metadata readback.
+Failure after creation retains the directory and reports a confirmation
+warning; `complete` means the kernel reported creation, not durable success.
+Syscall errors report publication attempted: remote filesystems can perform
+an operation and still return an error. A lost worker/reply is uncertain;
+inspect the destination before explicitly trying again.
+
+After kernel success, the worker attempts to rescan the parent. Matching
+directory tabs retain their sort choices, clear deletion marks on admitted
+refresh and preserve the active tab and unrelated editing state. The origin
+selects the new entry; duplicate directory views retain their selected
+basenames. An unsuccessful scan or model admission leaves the old listing
+stale and asks for `g`; it never removes the created directory or masks a
+confirmation warning. Closed origin tabs are not recreated.
 
 #### Marked deletion
 

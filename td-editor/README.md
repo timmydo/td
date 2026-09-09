@@ -26,6 +26,8 @@ Directories also open through File > Open or a command-line path, for example
 - File > Copy Full File Path copies the directory's own absolute path.
 - `R` or Directory > Rename Entry renames within the current directory,
   without overwriting existing names; open tabs follow without losing edits.
+- `+` or Directory > New Directory creates a private directory with one
+  literal new basename. Existing names are refused; Escape cancels.
 - `d` marks for deletion, `u` unmarks, and `x` reviews the marked entries.
   PageUp/PageDown shows full paths; type `DELETE` and Return to confirm.
   Deletion is permanent (no trash or Undo), never recursive, and refuses
@@ -293,6 +295,14 @@ or undo history. Escape cancels the prompt; submission cannot be cancelled.
 Refresh stale listings with `g`. Remote `path-rename` answers use literal
 OS-byte basenames and report a `rename` job; inspect notices for any
 post-publication durability or listing-refresh warning.
+
+New Directory (`+`) also works in an empty listing. Enter a single basename,
+not a path; no existing name is replaced and missing ancestors are not
+created. The requested mode is 0700 (umask honored). Creation uses the same
+worker and remote prompt authority as rename, with `path-mkdir` scope and
+a `mkdir` job. A confirmation warning does not undo creation: inspect disk
+state before retrying. Successful listing refresh selects the new entry in
+the originating tab without stealing focus from another tab.
 
 Deletion marks belong to each directory view. Sorting keeps them; refresh,
 navigation and completed filesystem rescans clear them. At most 64 entries

@@ -59,6 +59,10 @@ struct Entry {
 }
 
 impl Snapshot {
+    pub(crate) fn creation_source(&self) -> crate::files::DirectorySource {
+        crate::files::DirectorySource::observed(self.path.clone(), self.parent_identity)
+    }
+
     pub(crate) fn marked(&self) -> usize {
         self.entries.iter().filter(|entry| entry.delete).count()
     }

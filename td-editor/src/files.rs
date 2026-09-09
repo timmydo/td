@@ -5,7 +5,9 @@ use std::collections::BTreeMap;
 use std::fs::{self, File, Metadata, OpenOptions, Permissions};
 use std::io::{self, Write};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt, PermissionsExt, fchown};
+use std::os::unix::fs::{
+    fchown, DirBuilderExt, FileExt, MetadataExt, OpenOptionsExt, PermissionsExt,
+};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -240,6 +242,67 @@ impl RenameSource {
         }
         Ok(())
     }
+}
+
+/// Identity of the directory displayed when creation was requested.
+#[derive(Clone)]
+pub struct DirectorySource {
+    path: PathBuf,
+    identity: (u64, u64),
+}
+
+impl DirectorySource {
+    pub fn inspect(path: &Path) -> Result<Self> {
+        let path = fs::canonicalize(path)?;
+        if path.as_os_str().as_bytes().len() > 4096 {
+            return Err(Failure::new(
+                Kind::InvalidPath,
+                "directory path exceeds 4096 bytes",
+            ));
+        }
+        let node = OpenOptions::new()
+            .read(true)
+            .custom_flags(O_DIRECTORY | O_NOFOLLOW)
+            .open(&path)?;
+        let metadata = node.metadata()?;
+        Ok(Self::observed(path, (metadata.dev(), metadata.ino())))
+    }
+    pub(crate) fn observed(path: PathBuf, identity: (u64, u64)) -> Self {
+        Self { path, identity }
+    }
+
+    pub(crate) fn destination(&self, name: &std::ffi::OsStr) -> Result<PathBuf> {
+        let raw = name.as_bytes();
+        if raw.is_empty()
+            || raw.len() > 4096
+            || matches!(raw, b"." | b"..")
+            || raw.contains(&b'/')
+            || raw.contains(&0)
+        {
+            return Err(Failure::new(
+                Kind::InvalidPath,
+                "creation requires a new basename, not a path",
+            ));
+        }
+        let path = self.path.join(name);
+        if path.as_os_str().as_bytes().len() > 4096 {
+            return Err(Failure::new(
+                Kind::InvalidPath,
+                "created path exceeds 4096 bytes",
+            ));
+        }
+        Ok(path)
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+/// Kernel creation succeeded; warnings never trigger cleanup or retry.
+pub struct CreatedDirectory {
+    pub path: PathBuf,
+    pub warning: Option<String>,
 }
 
 /// Immutable, ordered observations captured before deletion confirmation.
@@ -485,10 +548,15 @@ impl Session {
                 }
             })();
             if let Err(error) = removal {
-                let quoted = format!("{:?}", source.path.file_name().unwrap_or(source.path.as_os_str()));
+                let quoted = format!(
+                    "{:?}",
+                    source.path.file_name().unwrap_or(source.path.as_os_str())
+                );
                 let mut chars = quoted.chars();
                 let mut label: String = chars.by_ref().take(96).collect();
-                if chars.next().is_some() { label.push_str("..."); }
+                if chars.next().is_some() {
+                    label.push_str("...");
+                }
                 result.failure = Some(format!(
                     "{}; entry {}/{}: {error}; name {label}",
                     if attempted {
@@ -496,12 +564,94 @@ impl Session {
                     } else {
                         "this removal was not attempted"
                     },
-                    index + 1, plan.len()
+                    index + 1,
+                    plan.len()
                 ));
                 break;
             }
         }
         Ok(result)
+    }
+
+    /// Create one private directory under the captured parent, without
+    /// replacing existing names or retrying uncertain publication.
+    pub fn create_directory(
+        &mut self,
+        source: DirectorySource,
+        name: &std::ffi::OsStr,
+    ) -> Result<CreatedDirectory> {
+        self.create_directory_with(source, name, |_| Ok(()))
+    }
+
+    fn create_directory_with(
+        &mut self,
+        source: DirectorySource,
+        name: &std::ffi::OsStr,
+        mut step: impl FnMut(Stage) -> io::Result<()>,
+    ) -> Result<CreatedDirectory> {
+        let path = source.destination(name)?;
+        let location = Location::resolve(&path)?;
+        if location.path != path || location.parent_identity != source.identity {
+            return Err(Failure::new(
+                Kind::Conflict,
+                "directory changed; refresh and retry",
+            ));
+        }
+        if self
+            .entries
+            .values()
+            .any(|entry| entry.location.path.starts_with(&path))
+        {
+            return Err(Failure::new(
+                Kind::Exists,
+                "destination belongs to an open association",
+            ));
+        }
+        step(Stage::Publish)?;
+        location.check_parent()?;
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&path)
+            .map_err(|error| {
+                let mut failure = if error.kind() == io::ErrorKind::AlreadyExists {
+                    Failure::new(Kind::Exists, "creation never replaces an existing name")
+                } else {
+                    Failure::from(error)
+                };
+                failure.publication_attempted = true;
+                failure
+            })?;
+        let confirmed = (|| -> Result<()> {
+            let node = OpenOptions::new()
+                .read(true)
+                .custom_flags(O_DIRECTORY | O_NOFOLLOW)
+                .open(&path)?;
+            let stamp = Stamp::read(&node.metadata()?);
+            if stamp.mode & 0o077 != 0 {
+                return Err(Failure::new(
+                    Kind::Metadata,
+                    "created directory is not private",
+                ));
+            }
+            node.sync_all()?;
+            step(Stage::SyncParent)?;
+            location.parent.sync_all()?;
+            step(Stage::Readback)?;
+            location.check_parent()?;
+            if Stamp::read(&fs::symlink_metadata(&path)?) != stamp {
+                return Err(Failure::new(
+                    Kind::Conflict,
+                    "created directory changed during confirmation",
+                ));
+            }
+            Ok(())
+        })();
+        Ok(CreatedDirectory {
+            path,
+            warning: confirmed
+                .err()
+                .map(|error| format!("Directory created; confirmation failed: {error}")),
+        })
     }
 
     /// Rename within the same directory, preserving the inode and all bytes.
@@ -1221,6 +1371,126 @@ mod tests {
     use crate::model::{Command, Editor};
     use std::os::unix::ffi::OsStringExt;
     use std::os::unix::fs::symlink;
+
+    #[test]
+    fn mkdir_is_private_literal_nonrecursive_and_never_overwrites() {
+        let dir = Directory::new();
+        let source = DirectorySource::inspect(&dir.0).unwrap();
+        let mut files = Session::default();
+        let raw = std::ffi::OsString::from_vec(b"new-\xff".to_vec());
+        let created = files.create_directory(source.clone(), &raw).unwrap();
+        assert!(created.warning.is_none());
+        assert_eq!(created.path, dir.0.join(&raw));
+        let meta = fs::symlink_metadata(&created.path).unwrap();
+        assert!(meta.is_dir());
+        assert_eq!(meta.mode() & 0o077, 0);
+        dir.write("file", b"keep");
+        symlink(dir.path("absent"), dir.path("link")).unwrap();
+        for name in ["file".as_ref(), "link".as_ref(), raw.as_os_str()] {
+            let failure = files.create_directory(source.clone(), name).err().unwrap();
+            assert_eq!(failure.kind, Kind::Exists);
+            assert!(failure.publication_attempted);
+        }
+        for name in ["", ".", "..", "a/b", "/absolute", "zero\0byte"] {
+            let failure = files
+                .create_directory(source.clone(), name.as_ref())
+                .err()
+                .unwrap();
+            assert_eq!(failure.kind, Kind::InvalidPath);
+            assert!(!failure.publication_attempted);
+        }
+        assert!(!dir.path("a").exists());
+        assert!(!dir.path("absent").exists());
+        assert_eq!(fs::read(dir.path("file")).unwrap(), b"keep");
+        assert_eq!(
+            fs::symlink_metadata(created.path).unwrap().ino(),
+            meta.ino()
+        );
+        files.open(&dir.path("reserved")).unwrap();
+        let failure = files
+            .create_directory(source, "reserved".as_ref())
+            .err()
+            .unwrap();
+        assert_eq!(failure.kind, Kind::Exists);
+        assert!(!failure.publication_attempted);
+        assert!(!dir.path("reserved").exists());
+    }
+
+    #[test]
+    fn mkdir_refuses_replaced_parent_before_publication() {
+        let dir = Directory::new();
+        let parent = dir.path("parent");
+        fs::create_dir(&parent).unwrap();
+        let source = DirectorySource::inspect(&parent).unwrap();
+        fs::rename(&parent, dir.path("old")).unwrap();
+        fs::create_dir(&parent).unwrap();
+        let mut files = Session::default();
+        let failure = files
+            .create_directory(source, "child".as_ref())
+            .err()
+            .unwrap();
+        assert_eq!(failure.kind, Kind::Conflict);
+        assert!(!failure.publication_attempted);
+        let source = DirectorySource::inspect(&parent).unwrap();
+        let failure = files
+            .create_directory_with(source, "child".as_ref(), |stage| {
+                if stage == Stage::Publish {
+                    fs::rename(&parent, dir.path("second"))?;
+                    fs::create_dir(&parent)?;
+                }
+                Ok(())
+            })
+            .err()
+            .unwrap();
+        assert_eq!(failure.kind, Kind::Conflict);
+        assert!(!failure.publication_attempted);
+        for name in ["parent/child", "old/child", "second/child"] {
+            assert!(!dir.path(name).exists());
+        }
+    }
+
+    #[test]
+    fn mkdir_races_and_confirmation_failures_never_cleanup_or_retry() {
+        let dir = Directory::new();
+        let source = DirectorySource::inspect(&dir.0).unwrap();
+        let mut files = Session::default();
+        let failure = files
+            .create_directory_with(source.clone(), "race".as_ref(), |stage| {
+                if stage == Stage::Publish {
+                    fs::write(dir.path("race"), b"winner")?;
+                }
+                Ok(())
+            })
+            .err()
+            .unwrap();
+        assert_eq!(failure.kind, Kind::Exists);
+        assert_eq!(fs::read(dir.path("race")).unwrap(), b"winner");
+        let created = files
+            .create_directory_with(source.clone(), "sync".as_ref(), |stage| {
+                if stage == Stage::SyncParent {
+                    return Err(io::Error::other("injected sync failure"));
+                }
+                Ok(())
+            })
+            .unwrap();
+        assert!(created.warning.unwrap().contains("injected sync failure"));
+        assert!(created.path.is_dir());
+        let created = files
+            .create_directory_with(source, "replaced".as_ref(), |stage| {
+                if stage == Stage::Readback {
+                    fs::rename(dir.path("replaced"), dir.path("moved"))?;
+                    fs::write(dir.path("replaced"), b"winner")?;
+                }
+                Ok(())
+            })
+            .unwrap();
+        assert!(created
+            .warning
+            .unwrap()
+            .contains("changed during confirmation"));
+        assert!(dir.path("moved").is_dir());
+        assert_eq!(fs::read(created.path).unwrap(), b"winner");
+    }
 
     struct Directory(PathBuf);
     impl Directory {

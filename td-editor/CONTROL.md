@@ -195,7 +195,7 @@ semantic dialog answers still supply explicit OS-byte paths and do not
 gain a completion mutation verb or physical clipboard authority.
 
 Kinds are `none`, `path-open`, `path-save-as`, `path-dictionary`,
-`path-rename`, `path-delete`, `close-save-as`, `find-forward`,
+`path-rename`, `path-delete`, `path-mkdir`, `close-save-as`, `find-forward`,
 `find-backward`, `replace`, `go-to-line`, `fill-column`, and `command`.
 `close-save-as` is Save As answered through the close dialog's ID rather
 than an independent path ID, including after a save conflict during
@@ -644,13 +644,13 @@ path ID under the following contract.
 
 ## Ordinary path answers and Dictionary jobs
 
-Opening a native Open, Save As, Dictionary, Rename or deletion review
-mints a fresh checked dialog ID and captures an editor-bound
+Opening a native Open, Save As, Dictionary, Rename, New Directory or deletion
+review mints a fresh checked dialog ID and captures an editor-bound
 tab/revision point. State reports
 `ID,SCOPE,path,TAB,REVISION,cancel+path`, with scope `path-open`,
-`path-save-as`, `path-dictionary`, `path-rename` or `path-delete`. Save
-As reached through a conflict gets a fresh path ID, and its target can
-remain inactive. Close-driven Save As instead retains its existing close
+`path-save-as`, `path-dictionary`, `path-rename`, `path-delete` or
+`path-mkdir`. Save As reached through a conflict gets a fresh path ID;
+its target can remain inactive. Close-driven Save As retains its close
 ID and close scope. Typing, empty Return and input loss keep the current
 ID. Cancelling and reopening never reuse it. Counter exhaustion refuses
 new path creation with a visible diagnostic and retains documents;
@@ -698,6 +698,18 @@ inspect both names before retrying (not all remote filesystems guarantee
 that an error means no rename occurred). There is no cancellation after
 submission, implicit save, overwrite or cross-directory move. Unsaved text
 and history remain intact.
+
+Directory creation uses scope `path-mkdir`. `path HEX_PATH` supplies one
+literal new basename, including non-UTF-8 bytes, under the captured directory
+identity. Empty, slash, NUL, dot and dot-dot names refuse; creation is not
+recursive and never replaces an existing name. Admission records
+`job=JOB,mkdir,TAB,REVISION,0,STATUS,CODE`. `complete,-` means the kernel
+reported creation, even when the notice reports sync/readback or listing
+refresh failure. `error` is not proof of absence, especially after a syscall
+error or worker disconnect. Creation is never retried or rolled back.
+Open associations and directory tabs reserve their paths. Successful parent
+rescans refresh matching views without stealing focus or changing edits.
+Read the notice and inspect disk state before explicitly retrying.
 
 Deletion uses the same revision/owner-bound path-dialog authority, with scope
 `path-delete`. Only `path 44454c455445` (literal `DELETE`) confirms the captured
