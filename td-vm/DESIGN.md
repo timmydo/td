@@ -885,9 +885,9 @@ host the operator is `timmy` (UID 1000) and Git account is `test` (UID 1001):
 td-vm-registrar serve /home/test/.td-vm-registrar /home/test/.td-vm-git/policy /usr/local/libexec/td-vm-git 1000
 td-vm-registrar request /home/test/.td-vm-registrar 1001 ping
 td-vm-registrar request /home/test/.td-vm-registrar 1001 origin
-td-vm-registrar request /home/test/.td-vm-registrar 1001 enroll INSTANCE_ID TASK_BRANCH ED25519_BASE64
-td-vm-registrar request /home/test/.td-vm-registrar 1001 reserve INSTANCE_ID TASK_BRANCH
-td-vm-registrar request /home/test/.td-vm-registrar 1001 revoke INSTANCE_ID
+td-vm-registrar request /home/test/.td-vm-registrar 1001 enroll /srv/git/td.git INSTANCE_ID TASK_BRANCH ED25519_BASE64
+td-vm-registrar request /home/test/.td-vm-registrar 1001 reserve /srv/git/td.git INSTANCE_ID TASK_BRANCH
+td-vm-registrar request /home/test/.td-vm-registrar 1001 revoke /srv/git/td.git INSTANCE_ID
 ```
 
 The server runs in the foreground under the host's existing service manager;
@@ -909,12 +909,15 @@ symlinks, untrusted writable ancestors, and another live server are refused.
 The registry stays in its separate private directory; the operator never
 gains filesystem write access to it.
 
-One connection carries one bounded UTF-8 frame, at most 512 bytes, starting
-with `TDVM-REGISTRAR-1` and a newline, then one space-delimited request and a
+One connection carries one bounded UTF-8 frame, at most 768 bytes, starting
+with `TDVM-REGISTRAR-2` and a newline, then one space-delimited request and a
 final newline. The client must shut down its write half; trailing bytes or
-extra operations are refused. Requests contain only an instance ID, exact
-branch and ordinary public-key base64 bytes as applicable, never a path,
-command, SSH option or environment. `td-vm-git` enforces the final key/branch
+extra operations are refused. Mutation requests include the expected canonical repository path, instance
+ID, exact branch and ordinary public-key base64 bytes as applicable. The
+repository is an equality assertion, never a selectable execution path: the
+fixed dispatcher checks it against the loaded policy under the registry lock
+before any mutation. The earlier argument form without this assertion is
+refused. No command, SSH option or environment is accepted. `td-vm-git` enforces the final key/branch
 and ownership policy. The registrar writes an enrollment public key to a
 private temporary file, invokes the fixed dispatcher with fixed argv and an
 empty environment, then removes its scratch directory. No private key or
@@ -929,7 +932,11 @@ Filesystem lookup, connecting a Unix socket, and trusted Git/backend execution
 have no hard elapsed-time bound in this increment. A timed-out/disconnected
 client does not cancel a started registry operation: its outcome is unknown
 and the caller must retry the same idempotent operation or inspect host state.
-The host supervisor owns service and descendant teardown. Automatic guest
+Each dispatcher inherits the registrar lifetime lock on stdin until it exits.
+After an abrupt registrar death, that lock prevents a replacement listener
+from overtaking its unfinished dispatcher, even if a client timed out or lost
+the connection. A normal supervisor stop still tears down the process group.
+Automatic guest
 provisioning must not treat a failed or absent reply as enrollment success.
 
 The response is the same version header followed by `OK` or a generic
@@ -1449,3 +1456,52 @@ This exchange does not enroll the key with the host registrar or reserve a
 branch. Workspace plans still report enrollment and cloning pending. The
 next increment uses the returned public key for the saved host Git profile;
 a key reply alone must never be displayed as an enrolled or ready workspace.
+
+
+## Recoverable host Git enrollment
+
+`td-vm workspace enroll NAME` (E in the TUI) authenticates the instance's
+saved Git profile, requests its guest public key, and enrolls that exact key
+and task branch through the host registrar. The instance lock spans the
+identity read and every request. This is an explicit provisioning step;
+Open does not yet enroll or clone automatically. Successful enrollment
+reserves the branch at origin's HEAD through the existing registry operation.
+It does not establish a guest clone or retain a separate starting-commit ref.
+
+Before the first external mutation, the manager atomically and durably
+upgrades `workspace` to `TDVM-WORKSPACE-2`, retaining the immutable instance ID,
+branch and public Git profile and adding the exact public key and a `pending`
+phase. It records `enrolled` only after registrar acknowledgement. Lost
+acknowledgements or failed local saves are retried with the same ID, branch
+and key; a different guest key is refused. Status describes the saved
+acknowledgement, not a continuously probed grant. Older managers reject this
+format, so they cannot delete enrolled disks without revocation.
+
+Deleting a stopped instance with an enrollment record first durably records
+`revoking`, then authenticates the saved origin and revokes that instance ID.
+Only acknowledgement permits disk removal. Failure keeps the disk and saved
+profile for retry; `revoking` cannot transition back to enrollment. Deletion
+is retryable if revocation succeeds but local removal fails. Revocation keeps
+submitted Git refs and other VMs' keys. An unavailable or damaged host origin
+can therefore block deletion until its registrar/profile is repaired. A
+plain v1 workspace plan has never attempted enrollment and needs no revoke.
+
+The v2 record is exactly the header, ID, branch, phase, public key and canonical
+Git profile, each separated by LF. Its maximum is 8960 bytes. Publication
+retains the private caller-owned, singly linked regular-file requirement;
+transitions refuse changed immutable fields, key replacement and reversal
+from revocation. New plans keep v1 until an enrollment attempt is recorded.
+
+Enrollment repeats the durable record publication before every grant attempt,
+including a retry after a prior rename whose directory sync failed. It syncs
+the instance directory and its ancestors before granting access, so newly
+created manager/instance directory entries retain the recovery record. The
+mutation client inherits the instance lock on stdin and holds it through its
+reply, preventing manager death from admitting deletion ahead of a surviving
+client's request. Registrar and dispatcher installation must move together: an
+older endpoint refuses the new expected-origin mutation arguments.
+
+The manager resolves its root to a bounded absolute canonical path. Durable
+workspace publication requires readable ancestors whose filesystems support
+directory sync; failure refuses the grant. It does not substitute a weaker
+publication protocol on filesystems that cannot provide this guarantee.

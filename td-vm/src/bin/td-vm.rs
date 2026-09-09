@@ -70,6 +70,7 @@ const HELP: &str = "td-vm: manage persistent graphical td instances
   td-vm workspace prepare NAME BRANCH save a private workspace plan
   td-vm workspace show NAME           inspect saved identity and Git profile
   td-vm workspace key NAME            request the guest-generated SSH public key
+  td-vm workspace enroll NAME         enroll its Git key and reserve its task branch
 
 TD_VM_HOME defaults to ~/.local/share/td-vm. Requires host QEMU, qemu-img and qemu-io.
 Reuse dist/td-vm-x86-64 from ./build-qcow; no image rebuild on create/open.
@@ -135,6 +136,10 @@ fn run(args: Vec<String>) -> Result<()> {
         ["import", name, bundle] => manager.import(name, Path::new(bundle)),
         ["workspace", "prepare", name, branch] => {
             println!("{}", term::scrub_lines(&manager.prepare_workspace(name, branch)?));
+            Ok(())
+        }
+        ["workspace", "enroll", name] => {
+            println!("{}", term::scrub_lines(&manager.enroll_workspace(name)?));
             Ok(())
         }
         ["workspace", "key", name] => {
@@ -558,6 +563,28 @@ impl Manager {
         let dir = self.root.join("instances").join(name(value)?);
         check_private_dir(&dir)?;
         Ok(dir)
+    }
+
+    fn enroll_workspace(&self, value: &str) -> Result<String> {
+        name(value)?;
+        let _lock = self.lock(&format!("instance-{value}"))?;
+        let dir = self.instance(value)?;
+        let mut workspace = vm_workspace::load(&dir)?.ok_or("instance has no workspace plan")?;
+        if workspace.enrollment.as_ref().is_some_and(|state| state.phase == vm_workspace::Phase::Revoking) {
+            return Err("cannot enroll a revoking workspace; retry deletion, then create a fresh instance".into());
+        }
+        workspace.profile.check()?;
+        let reply = vm_bridge::ask(&dir, vm_wire::KEY, workspace.id.as_bytes().to_vec())?;
+        let key = vm_wire::git_key::parse(&reply, &workspace.id)?;
+        if let Some(state) = &workspace.enrollment {
+            if state.key != key { return Err("guest key differs from the saved enrollment; refusing replacement".into()); }
+        }
+        let phase = workspace.enrollment.as_ref().map_or(vm_workspace::Phase::Pending, |state| state.phase);
+        workspace.transition(&dir, phase, &key)?;
+        workspace.profile.enroll(&workspace.id, &workspace.branch, &key, &_lock)
+            .map_err(|error| format!("Git enrollment is unconfirmed; retry with this same instance: {error}"))?;
+        workspace.transition(&dir, vm_workspace::Phase::Enrolled, &key)?;
+        workspace.summary()
     }
 
     fn workspace_key(&self, value: &str) -> Result<String> {
@@ -1102,7 +1129,15 @@ impl Manager {
         disk_available(&dir)?;
         // Future enrollment formats need their own revocation path. An older
         // manager must refuse unknown/corrupt state rather than erase its disk.
-        vm_workspace::load(&dir)?;
+        if let Some(mut workspace) = vm_workspace::load(&dir)? {
+            if let Some(state) = &workspace.enrollment {
+                let key = state.key.clone();
+                workspace.transition(&dir, vm_workspace::Phase::Revoking, &key)?;
+                workspace.profile.revoke(&workspace.id, &_lock).map_err(|error| format!(
+                    "Git key revocation unconfirmed; disk retained. Retry deletion: {error}"
+                ))?;
+            }
+        }
         io(fs::remove_dir_all(dir), "delete stopped instance")?;
         println!("deleted {value}");
         Ok(())
@@ -1570,7 +1605,7 @@ fn tui(manager: &Manager) -> Result<()> {
         let (height, width) = terminal.size();
         let mut frame = term::Frame::new(height, width);
         frame.push_text("td-vm  Enter open · n new · i import · t templates · D delete · X cut power", term::Style::bar(term::CYAN));
-        frame.push_text("h status · R resume · w workspace · W prepare · l logs · v paste · c copy · f feed · s sharing · r refresh · q quit", term::Style::bar(term::CYAN));
+        frame.push_text("h status · R resume · w workspace · W prepare · E enroll · l logs · v paste · c copy · f feed · s sharing · r refresh · q quit", term::Style::bar(term::CYAN));
         frame.push_text(TABLE_HEADER, term::Style::bold());
         let page = height.saturating_sub(8).max(1);
         let offset = selected.saturating_sub(page - 1);
@@ -1654,6 +1689,14 @@ fn tui(manager: &Manager) -> Result<()> {
                     let branch = if branch.is_empty() { name } else { branch.as_str() };
                     status = match manager.prepare_workspace(name, branch) {
                         Ok(_) => "Workspace plan saved. Press w for details; guest enrollment and cloning remain pending.".into(),
+                        Err(error) => error,
+                    };
+                    break;
+                }
+                term::Key::Char('E') if current.is_some() => {
+                    let name = current.ok_or("no instance selected")?;
+                    status = match manager.enroll_workspace(name) {
+                        Ok(_) => "Git key enrolled and task branch reserved. Press w for details; cloning remains pending.".into(),
                         Err(error) => error,
                     };
                     break;

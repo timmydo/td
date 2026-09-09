@@ -1,18 +1,49 @@
-//! Persistent host intent. This record grants no guest or registrar authority.
+//! Persistent workspace intent and recoverable Git enrollment lifecycle.
 use crate::{io, vm_git_names, vm_git_profile::Profile, Result};
 use std::fs::{self, File, OpenOptions};
 use std::io::Read;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::Path;
 
-const LIMIT: u64 = 8704;
+const LIMIT: u64 = 8960;
 const FILE: &str = "workspace";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Phase {
+    Pending,
+    Enrolled,
+    Revoking,
+}
+impl Phase {
+    fn text(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Enrolled => "enrolled",
+            Self::Revoking => "revoking",
+        }
+    }
+    fn parse(value: &str) -> Result<Self> {
+        match value {
+            "pending" => Ok(Self::Pending),
+            "enrolled" => Ok(Self::Enrolled),
+            "revoking" => Ok(Self::Revoking),
+            _ => Err("invalid workspace enrollment phase".into()),
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct Enrollment {
+    pub phase: Phase,
+    pub key: String,
+}
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct Workspace {
     pub id: String,
     pub branch: String,
     pub profile: Profile,
+    pub enrollment: Option<Enrollment>,
 }
 
 impl Workspace {
@@ -29,41 +60,113 @@ impl Workspace {
             id: random.iter().map(|byte| format!("{byte:02x}")).collect(),
             branch: branch.into(),
             profile,
+            enrollment: None,
         })
     }
 
     pub fn parse(text: &str) -> Result<Self> {
-        let mut fields = text.splitn(4, '\n');
-        if text.len() as u64 > LIMIT || fields.next() != Some("TDVM-WORKSPACE-1") {
-            return Err("invalid workspace header or size".into());
+        if text.len() as u64 > LIMIT {
+            return Err("workspace exceeds size limit".into());
         }
+        let (header, rest) = text.split_once('\n').ok_or("missing workspace header")?;
+        if !matches!(header, "TDVM-WORKSPACE-1" | "TDVM-WORKSPACE-2") {
+            return Err("invalid workspace header".into());
+        }
+        let mut fields = rest.splitn(if header == "TDVM-WORKSPACE-2" { 5 } else { 3 }, '\n');
+
         let id = fields.next().ok_or("missing workspace identity")?;
         let branch = fields.next().ok_or("missing workspace branch")?;
         if !vm_git_names::instance_valid(id) || !vm_git_names::branch_valid(branch) {
             return Err("invalid workspace identity or branch".into());
         }
+        let enrollment = if header == "TDVM-WORKSPACE-2" {
+            let phase = Phase::parse(fields.next().ok_or("missing enrollment phase")?)?;
+            let key = fields.next().ok_or("missing enrolled public key")?;
+            crate::vm_wire::git_key::key(key)?;
+            Some(Enrollment {
+                phase,
+                key: key.into(),
+            })
+        } else {
+            None
+        };
         let profile = Profile::parse(fields.next().ok_or("missing workspace profile")?)?;
         Ok(Self {
             id: id.into(),
             branch: branch.into(),
             profile,
+            enrollment,
         })
     }
 
     pub fn encode(&self) -> String {
-        format!(
-            "TDVM-WORKSPACE-1\n{}\n{}\n{}",
-            self.id,
-            self.branch,
-            self.profile.encode()
-        )
+        match &self.enrollment {
+            None => format!(
+                "TDVM-WORKSPACE-1\n{}\n{}\n{}",
+                self.id,
+                self.branch,
+                self.profile.encode()
+            ),
+            Some(state) => format!(
+                "TDVM-WORKSPACE-2\n{}\n{}\n{}\n{}\n{}",
+                self.id,
+                self.branch,
+                state.phase.text(),
+                state.key,
+                self.profile.encode()
+            ),
+        }
     }
 
     pub fn summary(&self) -> Result<String> {
+        let state = match self.enrollment.as_ref().map(|value| value.phase) {
+            None => "Guest key enrollment and cloning pending; branch and starting commit are not reserved.",
+            Some(Phase::Pending) => "Git key enrollment outcome unconfirmed; retry enrollment. Cloning pending.",
+            Some(Phase::Enrolled) => "Git key enrollment and task-branch reservation recorded. Cloning pending.",
+            Some(Phase::Revoking) => "Git key revocation pending; retry deletion after stopping the VM. Enrollment is disabled.",
+        };
         Ok(format!(
-            "Workspace planned: {}\nInstance identity: {}\nOrigin: {}\nGit profile: {}\nGuest key enrollment and cloning pending; branch and starting commit are not reserved.",
-            self.branch, self.id, self.profile.repository()?, self.profile.fingerprint()
+            "Workspace planned: {}\nInstance identity: {}\nOrigin: {}\nGit profile: {}\n{state}",
+            self.branch,
+            self.id,
+            self.profile.repository()?,
+            self.profile.fingerprint()
         ))
+    }
+
+    /// The instance lock spans the transition and any external operation.
+    pub fn transition(&mut self, dir: &Path, phase: Phase, key: &str) -> Result<()> {
+        crate::vm_wire::git_key::key(key)?;
+        let current = load(dir)?.ok_or("workspace disappeared")?;
+        if current != *self {
+            return Err("workspace changed before enrollment transition".into());
+        }
+        let allowed = match &self.enrollment {
+            None => phase == Phase::Pending,
+            Some(state) => {
+                state.key == key
+                    && match state.phase {
+                        Phase::Pending => true,
+                        Phase::Enrolled => matches!(phase, Phase::Enrolled | Phase::Revoking),
+                        Phase::Revoking => phase == Phase::Revoking,
+                    }
+            }
+        };
+        if !allowed {
+            return Err("refusing workspace key replacement or enrollment reversal".into());
+        }
+        let next = Self {
+            id: self.id.clone(),
+            branch: self.branch.clone(),
+            profile: self.profile.clone(),
+            enrollment: Some(Enrollment {
+                phase,
+                key: key.into(),
+            }),
+        };
+        next.save(dir)?;
+        *self = next;
+        Ok(())
     }
 
     pub fn conflicts(&self, other: &Self) -> Result<bool> {
@@ -85,6 +188,13 @@ impl Workspace {
         if load(dir)?.is_some() {
             return Err("workspace is already configured".into());
         }
+        self.save(dir)
+    }
+
+    fn save(&self, dir: &Path) -> Result<()> {
+        if Self::parse(&self.encode())? != *self {
+            return Err("workspace does not round trip".into());
+        }
         let temporary = dir.join("workspace.tmp");
         match fs::symlink_metadata(&temporary) {
             Ok(meta) if meta.is_file() => io(
@@ -104,7 +214,11 @@ impl Workspace {
             io(
                 File::open(dir).and_then(|file| file.sync_all()),
                 "sync workspace directory",
-            )
+            )?;
+            for parent in dir.ancestors().skip(1) {
+                io(File::open(parent).and_then(|file| file.sync_all()), "sync workspace publication ancestor")?;
+            }
+            Ok(())
         })();
         let _ = fs::remove_file(temporary);
         result

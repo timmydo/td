@@ -23,7 +23,7 @@ const FIELDS: &[&str] = &[
     "author-email",
 ];
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Profile {
     fields: BTreeMap<String, String>,
 }
@@ -188,6 +188,29 @@ impl Profile {
         Ok(text.trim_end_matches('\n').into())
     }
 
+    pub fn enroll(&self, id: &str, branch: &str, key: &str, lock: &File) -> Result<()> {
+        if !crate::vm_git_names::instance_valid(id) || !crate::vm_git_names::branch_valid(branch) {
+            return Err("invalid workspace enrollment identity or branch".into());
+        }
+        let key = crate::vm_wire::git_key::key(key)?;
+        self.change(&["enroll", self.repository()?, id, branch, key], lock)
+    }
+
+    pub fn revoke(&self, id: &str, lock: &File) -> Result<()> {
+        if !crate::vm_git_names::instance_valid(id) { return Err("invalid workspace revocation identity".into()); }
+        self.check()?;
+        self.change(&["revoke", self.repository()?, id], lock)
+    }
+
+    fn change(&self, args: &[&str], lock: &File) -> Result<()> {
+        let registrar = trusted_program(self.get("registrar")?)?;
+        let mut command = Command::new(registrar);
+        command.env_clear().current_dir("/").arg("request")
+            .arg(self.get("socket")?).arg(self.get("server-uid")?).args(args);
+        if !capture_input(command, Stdio::from(io(lock.try_clone(), "retain instance lock in registrar client")?))?.is_empty() { return Err("unexpected registrar mutation output".into()); }
+        Ok(())
+    }
+
     pub fn check(&self) -> Result<Origin> {
         let repository = io(
             fs::canonicalize(self.get("repository")?),
@@ -254,10 +277,14 @@ fn trusted_program(value: &str) -> Result<PathBuf> {
     Ok(path)
 }
 
-fn capture(mut command: Command) -> Result<Vec<u8>> {
+fn capture(command: Command) -> Result<Vec<u8>> {
+    capture_input(command, Stdio::null())
+}
+
+fn capture_input(mut command: Command, input: Stdio) -> Result<Vec<u8>> {
     let mut child = io(
         command
-            .stdin(Stdio::null())
+            .stdin(input)
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
             .spawn(),

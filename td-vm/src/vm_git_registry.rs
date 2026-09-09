@@ -246,10 +246,20 @@ fn claim_branch(policy: &Policy, branch: &str) -> Result<()> {
 }
 
 fn change(verb: &str, args: &[OsString]) -> Result<bool> {
+    change_origin(None, verb, args)
+}
+
+fn change_origin(expected: Option<&str>, verb: &str, args: &[OsString]) -> Result<bool> {
     let (path, remaining) = args.split_first().ok_or("missing registry path")?;
     let path = Path::new(path);
     let _lock = lock(path)?;
     let mut policy = Policy::load(path)?;
+    if let Some(expected) = expected {
+        super::origin::Origin::new(expected.into(), "a".repeat(40))?;
+        if fs::canonicalize(&policy.repository)?.to_str() != Some(expected) {
+            return Err("registry origin differs from the requested repository".into());
+        }
+    }
     let before = serialize(&policy)?;
     let words: Vec<_> = remaining
         .iter()
@@ -366,6 +376,13 @@ pub(super) fn cli(args: &[OsString]) -> Option<Result<bool>> {
             Ok(true)
         })()),
         "init" => Some(init(remaining)),
+        "change-origin" => Some((|| {
+            let [expected, verb, args @ ..] = remaining else {
+                return Err("usage: td-vm-git change-origin REPOSITORY enroll|reserve|revoke POLICY ARGS".into());
+            };
+            change_origin(Some(expected.to_str().ok_or("invalid expected origin")?),
+                verb.to_str().ok_or("invalid registry verb")?, args)
+        })()),
         "enroll" | "reserve" | "revoke" => Some(change(verb.to_str()?, remaining)),
         "authorized-keys" => Some(authorized_keys(remaining)),
         _ => None,

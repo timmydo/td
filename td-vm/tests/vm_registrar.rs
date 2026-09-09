@@ -168,12 +168,17 @@ fn launch(directory: &Path, policy: &Path, operator: u32) -> Result<Server> {
     Ok(server)
 }
 fn request(directory: &Path, uid: u32, args: &[&str], success: bool) -> Result<Output> {
+    let repository = directory.parent().ok_or("fixture root")?.join("origin.git");
+    let mut words = args.to_vec();
+    if matches!(args.first(), Some(&"enroll" | &"reserve" | &"revoke")) {
+        words.insert(1, repository.to_str().ok_or("origin path")?);
+    }
     invoke(
         Command::new(BIN)
             .arg("request")
             .arg(directory)
             .arg(uid.to_string())
-            .args(args),
+            .args(words),
         success,
     )
 }
@@ -213,8 +218,11 @@ fn registrar_authenticates_accounts_and_preserves_registry_across_restart() -> R
     request(&directory, uid, &["enroll", ID, "task", KEY], true)?;
     request(&directory, uid, &["reserve", ID, "followup"], true)?;
     let enrolled = fs::read(&policy)?;
+    invoke(Command::new(BIN).arg("request").arg(&directory).arg(uid.to_string())
+        .args(["revoke", "/srv/git/wrong.git", ID]), false)?;
+    assert_eq!(fs::read(&policy)?, enrolled);
     let mut bad = UnixStream::connect(directory.join("control"))?;
-    bad.write_all(b"TDVM-REGISTRAR-1\nrevoke ../private/registry\n")?;
+    bad.write_all(b"TDVM-REGISTRAR-2\nrevoke ../private/registry\n")?;
     bad.shutdown(Shutdown::Write)?;
     bad.set_read_timeout(Some(Duration::from_secs(5)))?;
     let mut response = String::new();
@@ -395,5 +403,184 @@ fn manager_profile_authenticates_exact_origin_and_preserves_failed_updates() -> 
     )?;
     request(&directory, uid, &["origin"], false)?;
     request(&directory, uid, &["ping"], true)?;
+    Ok(())
+}
+
+fn enroll_reply(home: &Path, name: &str, key: &str, success: bool) -> Result<Output> {
+    use std::io::BufRead;
+    let directory = home.join("instances").join(name);
+    let record = fs::read_to_string(directory.join("workspace"))?;
+    let id = record.lines().nth(1).ok_or("missing instance ID")?.to_string();
+    let path = directory.join("bridge");
+    let listener = UnixListener::bind(&path)?;
+    listener.set_nonblocking(true)?;
+    let key = key.to_string();
+    let peer = std::thread::spawn(move || -> std::result::Result<(), String> {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let (mut stream, _) = loop {
+            match listener.accept() {
+                Ok(pair) => break pair,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock && Instant::now() < deadline => std::thread::sleep(Duration::from_millis(5)),
+                Err(e) => return Err(format!("guest fixture accept: {e}")),
+            }
+        };
+        stream.set_read_timeout(Some(Duration::from_secs(5))).map_err(|e| e.to_string())?;
+        let mut line = String::new();
+        std::io::BufReader::new((&stream).take(1024)).read_line(&mut line).map_err(|e| e.to_string())?;
+        let mut fields = line.split_whitespace();
+        assert_eq!(fields.next(), Some("TDVM1"));
+        let request = fields.next().ok_or("missing request ID")?;
+        assert_eq!(fields.next(), Some("git-key"));
+        assert_eq!(fields.next(), Some("0"));
+        assert_eq!(fields.next(), Some("32"));
+        let encoded: String = id.bytes().map(|byte| format!("{byte:02x}")).collect();
+        assert_eq!(fields.next(), Some(encoded.as_str()));
+        assert!(fields.next().is_none());
+        let data = format!("TDVM-GIT-KEY-1\n{id}\nssh-ed25519 {key}\n");
+        let encoded: String = data.bytes().map(|byte| format!("{byte:02x}")).collect();
+        writeln!(stream, "TDVM1 {request} ok 0 {} {encoded}", data.len()).map_err(|e| e.to_string())?;
+        Ok(())
+    });
+    let result = invoke(Command::new(env!("CARGO_BIN_EXE_td-vm")).env("TD_VM_HOME", home).args(["workspace", "enroll", name]), success);
+    let joined = peer.join().map_err(|_| "guest fixture panicked")?;
+    fs::remove_file(path)?;
+    joined?;
+    result
+}
+
+#[test]
+fn manager_enrollment_retries_exact_keys_and_revokes_before_disk_deletion() -> Result<()> {
+    if in_trusted_root("manager_enrollment_retries_exact_keys_and_revokes_before_disk_deletion")? { return Ok(()); }
+    let (root, policy) = fixture()?;
+    let uid = fs::metadata("/proc/self")?.uid();
+    let socket = root.0.join("socket");
+    let server = launch(&socket, &policy, uid)?;
+    let client = root.0.join("td-vm-registrar");
+    let git = root.0.join("git");
+    for (source, destination) in [(PathBuf::from(BIN), &client), (host_git()?, &git)] {
+        fs::copy(source, destination)?;
+        fs::set_permissions(destination, fs::Permissions::from_mode(0o700))?;
+    }
+    let repository = root.0.join("origin.git");
+    let home = root.0.join("vms");
+    let input = root.0.join("profile");
+    fs::write(&input, format!("TDVM-GIT-PROFILE-1\nrepository={}\naddress=10.0.2.2\nport=22\nuser=test\nserver-uid={uid}\nsocket={}\nregistrar={}\ngit={}\nhost-key=ssh-ed25519 {KEY}\nauthor-name=Fixture\nauthor-email=fixture@example.invalid\n", repository.display(), socket.display(), client.display(), git.display()))?;
+    fs::set_permissions(&input, fs::Permissions::from_mode(0o600))?;
+    let manager = |args: &[&str], success| invoke(Command::new(env!("CARGO_BIN_EXE_td-vm")).env("TD_VM_HOME", &home).args(args), success);
+    manager(&["git-profile", "set", input.to_str().ok_or("profile path")?], true)?;
+    let template = home.join("templates/base");
+    DirBuilder::new().mode(0o700).create(&template)?;
+    invoke(Command::new("qemu-img").args(["create", "-f", "qcow2"]).arg(template.join("disk.qcow2")).arg("4M"), true)?;
+    for name in ["one", "two"] { manager(&["create", name, "base"], true)?; }
+    let record = home.join("instances/one/workspace");
+    let original = fs::read_to_string(&record)?;
+    let id = original.lines().nth(1).ok_or("missing ID")?;
+    let git_cmd = |args: &[&str]| invoke(Command::new(&git).arg("--git-dir").arg(&repository).args(args), true);
+    let main = git_cmd(&["rev-parse", "refs/heads/main"])?.stdout;
+    // An existing unowned branch refuses enrollment after the pending record
+    // is durable. Clearing this fixture conflict allows the same-key retry.
+    git_cmd(&["update-ref", "refs/heads/one", "refs/heads/main"])?;
+    enroll_reply(&home, "one", KEY, false)?;
+    let pending = fs::read_to_string(&record)?;
+    assert!(pending.starts_with("TDVM-WORKSPACE-2\n"));
+    assert!(pending.contains(&format!("\npending\nssh-ed25519 {KEY}\n")));
+    assert!(!fs::read_to_string(&policy)?.contains(&format!("key={id} ")));
+    git_cmd(&["update-ref", "-d", "refs/heads/one"])?;
+    enroll_reply(&home, "one", KEY, true)?;
+    let enrolled = fs::read_to_string(&record)?;
+    assert!(enrolled.contains(&format!("\nenrolled\nssh-ed25519 {KEY}\n")));
+    let authority = fs::read(&policy)?;
+    enroll_reply(&home, "one", KEY, true)?;
+    assert_eq!(fs::read_to_string(&record)?, enrolled);
+    assert_eq!(fs::read(&policy)?, authority);
+    let other_key = format!("{}C", KEY.strip_suffix('B').ok_or("fixture key suffix")?);
+    enroll_reply(&home, "one", &other_key, false)?;
+    assert_eq!(fs::read_to_string(&record)?, enrolled);
+    assert_eq!(fs::read(&policy)?, authority);
+    enroll_reply(&home, "two", &other_key, true)?;
+    let second = fs::read_to_string(home.join("instances/two/workspace"))?;
+    let second_id = second.lines().nth(1).ok_or("second ID")?;
+    assert_eq!(git_cmd(&["rev-parse", "refs/heads/one"])?.stdout, main);
+    drop(server);
+    manager(&["delete", "one", "--yes"], false)?;
+    assert!(home.join("instances/one/disk.qcow2").is_file());
+    assert!(fs::read_to_string(&record)?.contains("\nrevoking\n"));
+    manager(&["workspace", "enroll", "one"], false)?;
+    let _server = launch(&socket, &policy, uid)?;
+    manager(&["delete", "one", "--yes"], true)?;
+    assert!(!home.join("instances/one").exists());
+    let authority = fs::read_to_string(&policy)?;
+    assert!(!authority.contains(&format!("key={id} ")));
+    assert!(authority.contains(&format!("key={second_id} {other_key}")));
+    assert_eq!(git_cmd(&["rev-parse", "refs/heads/main"])?.stdout, main);
+    assert_eq!(git_cmd(&["rev-parse", "refs/heads/one"])?.stdout, main);
+    assert_eq!(fs::read_to_string(home.join("instances/two/workspace"))?, second);
+    Ok(())
+}
+
+#[test]
+fn registrar_crash_retains_dispatcher_lifetime_before_rebind() -> Result<()> {
+    if in_trusted_root("registrar_crash_retains_dispatcher_lifetime_before_rebind")? { return Ok(()); }
+    let (root, policy) = fixture()?;
+    let uid = fs::metadata("/proc/self")?.uid();
+    let socket = root.0.join("socket");
+    let source = root.0.join("delayed.rs");
+    let marker = root.0.join("running");
+    let release = root.0.join("release");
+    let done = root.0.join("done");
+    // A host-only Rust dispatcher fixture keeps the production stdin contract.
+    fs::write(&source, format!(r#"
+use std::{{fs, path::Path, process::{{Command, Stdio}}, time::{{Duration, Instant}}}};
+fn main() {{
+    let args: Vec<_> = std::env::args_os().skip(1).collect();
+    let delayed = args.iter().any(|arg| arg == "enroll");
+    if delayed {{
+        fs::write({marker:?}, std::process::id().to_string()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while !Path::new({release:?}).exists() {{
+            if Instant::now() >= deadline {{ std::process::exit(124); }}
+            std::thread::sleep(Duration::from_millis(5));
+        }}
+    }}
+    let status = Command::new({GIT_BIN:?}).args(args).stdin(Stdio::inherit()).status().unwrap();
+    if delayed {{ fs::write({done:?}, b"done").unwrap(); }}
+    std::process::exit(status.code().unwrap_or(125));
+}}
+"#))?;
+    invoke(Command::new("rustc").args(["--edition", "2021", "-C", "linker=gcc"]).arg(&source).arg("-o").arg(installed(&policy)?), true)?;
+    let mut server = launch(&socket, &policy, uid)?;
+    let client_socket = socket.clone();
+    let client = std::thread::spawn(move || {
+        request(&client_socket, uid, &["enroll", ID, "task", KEY], false)
+            .map(|_| ()).map_err(|error| error.to_string())
+    });
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !marker.exists() {
+        if Instant::now() >= deadline { return Err("delayed dispatcher did not start".into()); }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    server.0.kill()?;
+    server.0.wait()?;
+    client.join().map_err(|_| "client fixture panicked")??;
+    let replacement = launch(&socket, &policy, uid);
+    let refused = replacement.is_err();
+    drop(replacement);
+    fs::write(&release, b"release")?;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !done.exists() {
+        if Instant::now() >= deadline { return Err("delayed dispatcher did not finish".into()); }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(refused, "replacement listener overtook an unfinished enrollment");
+    assert!(fs::read_to_string(&policy)?.contains(&format!("key={ID} {KEY}")));
+    let _server = loop {
+        match launch(&socket, &policy, uid) {
+            Ok(server) => break server,
+            Err(_) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(5)),
+            Err(error) => return Err(error),
+        }
+    };
+    request(&socket, uid, &["revoke", ID], true)?;
+    assert!(!fs::read_to_string(&policy)?.contains(&format!("key={ID} ")));
     Ok(())
 }

@@ -19,8 +19,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
-const HEADER: &str = "TDVM-REGISTRAR-1\n";
-const MAX_FRAME: usize = 512;
+const HEADER: &str = "TDVM-REGISTRAR-2\n";
+const MAX_FRAME: usize = 768;
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
 static SERIAL: AtomicU64 = AtomicU64::new(0);
 
@@ -29,15 +29,18 @@ enum Request {
     Ping,
     Origin,
     Enroll {
+        repository: String,
         id: String,
         branch: String,
         key: String,
     },
     Reserve {
+        repository: String,
         id: String,
         branch: String,
     },
     Revoke {
+        repository: String,
         id: String,
     },
 }
@@ -58,14 +61,15 @@ impl Request {
             .strip_suffix('\n')
             .ok_or("incomplete registrar request")?;
         let words: Vec<_> = body.split(' ').collect();
-        let (id, branch, key) = match words.as_slice() {
+        let (repository, id, branch, key) = match words.as_slice() {
             ["ping"] => return Ok(Self::Ping),
             ["origin"] => return Ok(Self::Origin),
-            ["enroll", id, branch, key] => (*id, Some(*branch), Some(*key)),
-            ["reserve", id, branch] => (*id, Some(*branch), None),
-            ["revoke", id] => (*id, None, None),
+            ["enroll", repository, id, branch, key] => (*repository, *id, Some(*branch), Some(*key)),
+            ["reserve", repository, id, branch] => (*repository, *id, Some(*branch), None),
+            ["revoke", repository, id] => (*repository, *id, None, None),
             _ => return Err("invalid registrar request".into()),
         };
+        origin::Origin::new(repository.into(), "a".repeat(40))?;
         if !identifier(id) {
             return Err("invalid instance id".into());
         }
@@ -89,17 +93,19 @@ impl Request {
                     return Err("invalid public key argument".into());
                 }
                 return Ok(Self::Enroll {
+                    repository: repository.into(),
                     id: id.into(),
                     branch: branch.into(),
                     key: key.into(),
                 });
             }
             return Ok(Self::Reserve {
+                repository: repository.into(),
                 id: id.into(),
                 branch: branch.into(),
             });
         }
-        Ok(Self::Revoke { id: id.into() })
+        Ok(Self::Revoke { repository: repository.into(), id: id.into() })
     }
 }
 
@@ -119,7 +125,7 @@ fn receive(stream: &mut UnixStream, deadline: Instant) -> Result<String> {
             return Ok(String::from_utf8(bytes)?);
         }
         if bytes.len().saturating_add(count) > MAX_FRAME {
-            return Err("registrar frame exceeds 512 bytes".into());
+            return Err("registrar frame exceeds 768 bytes".into());
         }
         bytes.extend_from_slice(chunk.get(..count).ok_or("invalid read length")?);
     }
@@ -127,7 +133,7 @@ fn receive(stream: &mut UnixStream, deadline: Instant) -> Result<String> {
 
 fn send(stream: &mut UnixStream, frame: &str) -> Result<()> {
     if frame.len() > MAX_FRAME {
-        return Err("registrar frame exceeds 512 bytes".into());
+        return Err("registrar frame exceeds 768 bytes".into());
     }
     let deadline = Instant::now() + IO_TIMEOUT;
     let mut bytes = frame.as_bytes();
@@ -275,12 +281,12 @@ impl Drop for Scratch {
     }
 }
 
-fn execute(policy: &Path, dispatcher: &Path, request: Request) -> Result<String> {
+fn execute(policy: &Path, dispatcher: &Path, request: Request, lifetime: Option<&File>) -> Result<String> {
     let mut command = Command::new(dispatcher);
     command
         .env_clear()
         .current_dir("/")
-        .stdin(Stdio::null())
+        .stdin(lifetime.map(File::try_clone).transpose()?.map(Stdio::from).unwrap_or_else(Stdio::null))
         .stdout(Stdio::null())
         .stderr(Stdio::inherit());
     let mut scratch = None;
@@ -292,7 +298,7 @@ fn execute(policy: &Path, dispatcher: &Path, request: Request) -> Result<String>
         Request::Origin => {
             command.arg("origin").arg(policy).stdout(Stdio::piped());
         }
-        Request::Enroll { id, branch, key } => {
+        Request::Enroll { repository, id, branch, key } => {
             let parent = policy.parent().ok_or("missing registry parent")?;
             let directory = parent.join(format!(
                 "registrar-{}-{}",
@@ -309,16 +315,16 @@ fn execute(policy: &Path, dispatcher: &Path, request: Request) -> Result<String>
                 .open(&key_path)?;
             writeln!(file, "ssh-ed25519 {key}")?;
             command
-                .arg("enroll")
+                .arg("change-origin").arg(repository).arg("enroll")
                 .arg(policy)
                 .args([id, branch])
                 .arg(key_path);
         }
-        Request::Reserve { id, branch } => {
-            command.arg("reserve").arg(policy).args([id, branch]);
+        Request::Reserve { repository, id, branch } => {
+            command.arg("change-origin").arg(repository).arg("reserve").arg(policy).args([id, branch]);
         }
-        Request::Revoke { id } => {
-            command.arg("revoke").arg(policy).arg(id);
+        Request::Revoke { repository, id } => {
+            command.arg("change-origin").arg(repository).arg("revoke").arg(policy).arg(id);
         }
     }
     let mut child = command.spawn()?;
@@ -357,7 +363,7 @@ fn serve(directory: &Path, policy: &Path, dispatcher: &Path, operator: u32) -> R
     {
         return Err("dispatcher must be a trusted executable file".into());
     }
-    execute(policy, dispatcher, Request::Ping)?;
+    execute(policy, dispatcher, Request::Ping, None)?;
     let endpoint = bind(directory, uid)?;
     for stream in endpoint._listener.incoming() {
         let mut stream = match stream {
@@ -378,7 +384,7 @@ fn serve(directory: &Path, policy: &Path, dispatcher: &Path, operator: u32) -> R
             .and_then(|frame| Request::parse(&frame))
             .and_then(|request| {
                 private_policy(policy, uid)?;
-                execute(policy, dispatcher, request)
+                execute(policy, dispatcher, request, Some(&endpoint._lock))
             });
         let reply = match result {
             Ok(reply) => format!("{HEADER}{reply}"),
@@ -426,7 +432,7 @@ fn run() -> Result<()> {
     match args.as_slice() {
         [verb, directory, policy, dispatcher, operator] if verb == "serve" => serve(Path::new(directory), Path::new(policy), Path::new(dispatcher), operator.parse()?),
         [verb, directory, server, remaining @ ..] if verb == "request" => request(Path::new(directory), server.parse()?, remaining),
-        _ => Err("usage: td-vm-registrar serve SOCKET_DIRECTORY POLICY DISPATCHER OPERATOR_UID | request SOCKET_DIRECTORY SERVER_UID ping|origin|enroll ID BRANCH KEY_BASE64|reserve ID BRANCH|revoke ID".into()),
+        _ => Err("usage: td-vm-registrar serve SOCKET_DIRECTORY POLICY DISPATCHER OPERATOR_UID | request SOCKET_DIRECTORY SERVER_UID ping|origin|enroll REPOSITORY ID BRANCH KEY_BASE64|reserve REPOSITORY ID BRANCH|revoke REPOSITORY ID".into()),
     }
 }
 
@@ -450,7 +456,7 @@ mod tests {
             Request::parse(&format!("{HEADER}ping\n")).ok(),
             Some(Request::Ping)
         );
-        assert!(Request::parse(&format!("{HEADER}reserve {id} topic/subtask\n")).is_ok());
+        assert!(Request::parse(&format!("{HEADER}reserve /srv/git/td.git {id} topic/subtask\n")).is_ok());
         for body in [
             "ping\nrevoke anything",
             "ping extra",
@@ -462,7 +468,7 @@ mod tests {
         ] {
             assert!(Request::parse(&format!("{HEADER}{body}\n")).is_err());
         }
-        assert!(Request::parse("TDVM-REGISTRAR-2\nping\n").is_err());
+        assert!(Request::parse("TDVM-REGISTRAR-1\nping\n").is_err());
         assert!(Request::parse(&format!("{HEADER}ping")).is_err());
     }
 
