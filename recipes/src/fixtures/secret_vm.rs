@@ -72,6 +72,14 @@ pub const FIDO_CASES: &[(&str, &str)] = &[
         "fido-cold-reopen",
         "fido_device::vm_tests::desktop::qemu_desktop_reopens_persistent_store_locked",
     ),
+    (
+        "fido-cold-recovery-create",
+        "fido_device::vm_tests::desktop::qemu_desktop_creates_persistent_recovery_store",
+    ),
+    (
+        "fido-cold-recovery-reopen",
+        "fido_device::vm_tests::desktop::qemu_desktop_recovers_persistent_store_without_primary",
+    ),
 ];
 pub const PASS: &str = "TD-SECRET-VM-PASS";
 pub const FAIL: &str = "TD-SECRET-VM-FAIL";

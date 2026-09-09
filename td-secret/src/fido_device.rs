@@ -2652,10 +2652,11 @@ mod vm_tests {
         #[ignore = "requires qemu-secret --tpm with a disposable desktop and HID devices"]
         fn qemu_compositor_enrolls_unlocks_and_authorizes_public_credential_write() {
             guard("fido-desktop");
-            desktop_roundtrip(false);
+            desktop_roundtrip(false, false);
         }
 
-        fn desktop_roundtrip(persistent: bool) {
+        fn desktop_roundtrip(persistent: bool, recovery: bool) {
+            assert!(!recovery || persistent);
             let _diagnostics = Diagnostics;
             assert!(Command::new("/bin/td-init")
                 .args(["hostname", "td-secret-fixture"])
@@ -2671,9 +2672,11 @@ mod vm_tests {
             setup(false);
             setup_portal(false);
             crate::tpm::tests::qemu_extend(&[9; 32]);
-            let token = if persistent { persistent_token(true) } else { VirtualCredential::new(44) };
+            let token = if persistent { persistent_token(true, false) } else { VirtualCredential::new(44) };
             let requests = Arc::new(AtomicUsize::new(0));
             let observed = Arc::clone(&requests);
+            let enrollment_user = Arc::new(std::sync::Mutex::new(None::<Vec<u8>>));
+            let primary_user = Arc::clone(&enrollment_user);
             let mut challenges = std::collections::BTreeSet::new();
             let hid = token.checked(move |request, index| {
                 eprintln!("desktop CTAP {index}: {}", request[0]);
@@ -2682,15 +2685,23 @@ mod vm_tests {
                 if request[0] != 4 {
                     use crate::fido_cbor::{self, Value};
                     let value = fido_cbor::decode(&request[1..]).unwrap();
+                    if request[0] == 1 {
+                        *primary_user.lock().unwrap() = Some(value.required(&Value::Unsigned(3)).unwrap()
+                            .required(&Value::Text("id")).unwrap().bytes().unwrap().to_vec());
+                    }
                     let field = if request[0] == 1 { 1 } else { 2 };
                     let hash: [u8; 32] = value.required(&Value::Unsigned(field)).unwrap()
                         .bytes().unwrap().try_into().unwrap();
                     assert_ne!(hash, [0; 32]);
                     assert!(challenges.insert(hash), "desktop reused a token challenge");
                     if persistent {
+                        let path = format!("{COLD_STATE}/challenges");
+                        if Path::new(&path).exists() {
+                            let prior = fs::read(&path).unwrap();
+                            assert!(!prior.as_chunks::<32>().0.contains(&hash));
+                        }
                         OpenOptions::new().append(true).create(true)
-                            .mode(0o600).open(format!("{COLD_STATE}/challenges")).unwrap()
-                            .write_all(&hash).unwrap();
+                            .mode(0o600).open(path).unwrap().write_all(&hash).unwrap();
                     }
                 }
                 observed.store(index + 1, Ordering::SeqCst);
@@ -2705,11 +2716,45 @@ mod vm_tests {
             thread::sleep(Duration::from_millis(500));
             assert_eq!(requests.load(Ordering::SeqCst), 0);
             assert!(!Path::new("/var/lib/td/secrets/1000/sealed").exists());
-            keyboard.select(0x1b); // X: explicitly unrecoverable enrollment.
+            keyboard.select(if recovery { 0x08 } else { 0x1b }); // E: recovery; X: unrecoverable.
+            let recovery_hid = if recovery {
+                wait("primary proof request", || requests.load(Ordering::SeqCst) == 3);
+                let second = persistent_token(true, true);
+                assert_ne!(token.signer.lock().unwrap().cose, second.signer.lock().unwrap().cose);
+                Some(second.checked(move |request, index| {
+                    use crate::fido_cbor::{self, Value};
+                    assert_eq!(request[0], [4, 1, 2][index]);
+                    if request[0] != 4 {
+                        let value = fido_cbor::decode(&request[1..]).unwrap();
+                        if request[0] == 1 {
+                            let user = value.required(&Value::Unsigned(3)).unwrap()
+                                .required(&Value::Text("id")).unwrap().bytes().unwrap();
+                            assert_eq!(Some(user), enrollment_user.lock().unwrap().as_deref());
+                            let Value::Array(excluded) = value.required(&Value::Unsigned(5)).unwrap() else {
+                                panic!("recovery creation omitted the primary exclusion");
+                            };
+                            assert_eq!(excluded.len(), 1);
+                            assert_eq!(excluded[0].required(&Value::Text("id")).unwrap().bytes().unwrap(), [44; 32]);
+                        }
+                        let field = if request[0] == 1 { 1 } else { 2 };
+                        let hash = value.required(&Value::Unsigned(field)).unwrap().bytes().unwrap();
+                        assert_eq!(hash.len(), 32);
+                        assert_ne!(hash, [0; 32]);
+                        let path = format!("{COLD_STATE}/challenges");
+                        let prior = fs::read(&path).unwrap();
+                        assert!(!prior.as_chunks::<32>().0.iter().any(|old| old == hash));
+                        OpenOptions::new().append(true).open(path).unwrap().write_all(hash).unwrap();
+                    }
+                }))
+            } else { None };
             wait("desktop enrollment", || {
                 Path::new("/var/lib/td/secrets/1000/sealed").exists()
             });
             no_release();
+            if let Some(hid) = recovery_hid {
+                assert_eq!(hid.finish(), (3, 0));
+                wait("recovery device removal", || Device::discover().unwrap().len() == 1);
+            }
             assert_eq!(requests.load(Ordering::SeqCst), 3);
             mail.retrieve("main", "unavailable");
             keyboard.close();
@@ -2829,30 +2874,49 @@ mod vm_tests {
             }));
         }
 
-        fn persistent_token(create: bool) -> VirtualCredential {
+        fn persistent_token(create: bool, recovery: bool) -> VirtualCredential {
+            let role = if recovery { "recovery" } else { "primary" };
             if create {
                 directory(COLD_STATE, 0, 0o700);
-                fs::write(format!("{COLD_STATE}/token-seed"), fresh()).unwrap();
+                fs::write(format!("{COLD_STATE}/{role}-template"), fresh()).unwrap();
             }
-            let seed: [u8; 32] = fs::read(format!("{COLD_STATE}/token-seed")).unwrap().try_into().unwrap();
+            let seed: [u8; 32] = fs::read(format!("{COLD_STATE}/{role}-template")).unwrap().try_into().unwrap();
             let signer = crate::tpm::tests::SigningKey::persistent(&seed);
-            let public = format!("{COLD_STATE}/token-public");
+            let public = format!("{COLD_STATE}/{role}-public");
             if create { fs::write(public, &signer.cose).unwrap(); }
             else { assert_eq!(fs::read(public).unwrap(), signer.cose, "cold token changed key"); }
-            VirtualCredential { id: vec![44; 32], signer: Arc::new(std::sync::Mutex::new(signer)) }
+            VirtualCredential { id: vec![if recovery { 45 } else { 44 }; 32], signer: Arc::new(std::sync::Mutex::new(signer)) }
         }
 
         #[test]
         #[ignore = "requires qemu-secret --tpm with disposable persistent disk"]
         fn qemu_desktop_creates_persistent_store() {
             guard("fido-cold-create");
-            desktop_roundtrip(true);
+            desktop_roundtrip(true, false);
         }
 
         #[test]
         #[ignore = "requires qemu-secret --tpm after the persistent creation guest"]
         fn qemu_desktop_reopens_persistent_store_locked() {
             guard("fido-cold-reopen");
+            cold_reopen(false);
+        }
+
+        #[test]
+        #[ignore = "requires qemu-secret --tpm with a disposable recovery-policy disk"]
+        fn qemu_desktop_creates_persistent_recovery_store() {
+            guard("fido-cold-recovery-create");
+            desktop_roundtrip(true, true);
+        }
+
+        #[test]
+        #[ignore = "requires qemu-secret --tpm after recovery-policy creation"]
+        fn qemu_desktop_recovers_persistent_store_without_primary() {
+            guard("fido-cold-recovery-reopen");
+            cold_reopen(true);
+        }
+
+        fn cold_reopen(recovery: bool) {
             let _diagnostics = Diagnostics;
             applet(&["hostname", "td-secret-fixture"]);
             let mut keyboard = Keyboard::new();
@@ -2870,9 +2934,9 @@ mod vm_tests {
             setup_portal(true);
             assert_eq!(sealed_bytes(), before, "reopen setup rewrote the store");
             crate::tpm::tests::qemu_extend(&[9; 32]);
-            let token = persistent_token(false);
+            let token = persistent_token(false, recovery);
             let prior = fs::read(format!("{COLD_STATE}/challenges")).unwrap();
-            assert_eq!(prior.len(), 5 * 32);
+            assert_eq!(prior.len(), if recovery { 7 * 32 } else { 5 * 32 });
             let requests = Arc::new(AtomicUsize::new(0));
             let observed = Arc::clone(&requests);
             let hid = token.checked(move |request, index| {
@@ -2887,6 +2951,7 @@ mod vm_tests {
                 }
                 observed.store(index + 1, Ordering::SeqCst);
             });
+            discover_one();
             let pair = Pair::start();
             let mut portal = Portal::start();
             let mut mail = Application::start(65537, "mail");
@@ -2894,7 +2959,7 @@ mod vm_tests {
             mail.retrieve("main", "unavailable");
             news.retrieve("main", "unavailable");
             assert_eq!(requests.load(Ordering::SeqCst), 0);
-            keyboard.select(0x18);
+            keyboard.select(if recovery { 0x15 } else { 0x18 }); // R or U.
             wait("cold desktop unlock", || Path::new("/run/td-secret/1000/key").exists());
             read_released(b"desktop fixture");
             assert_eq!(requests.load(Ordering::SeqCst), 2);

@@ -83,6 +83,14 @@ pub(crate) fn run(runner: &RecipeCheckRunner, tpm: Option<&Path>) -> Result<(), 
             .map_err(|e| format!("size persistent store fixture disk: {e}"))?;
         Ok::<_, String>(path)
     }).transpose()?;
+    let recovery_disk = tpm_scratch.as_ref().map(|scratch| {
+        let path = scratch.dir.join("recovery-store.img");
+        let file = OpenOptions::new().write(true).create_new(true).open(&path)
+            .map_err(|e| format!("create recovery store fixture disk: {e}"))?;
+        file.set_len(256 * 1024 * 1024)
+            .map_err(|e| format!("size recovery store fixture disk: {e}"))?;
+        Ok::<_, String>(path)
+    }).transpose()?;
     let cases = fixture::CASES.iter().map(|case| (case, false)).chain(
         fixture::TPM_CASES
             .iter()
@@ -124,7 +132,9 @@ pub(crate) fn run(runner: &RecipeCheckRunner, tpm: Option<&Path>) -> Result<(), 
             &kernel,
             &archive,
             BootPlan {
-                disk: if name.starts_with("fido-cold-") {
+                disk: if name.starts_with("fido-cold-recovery-") {
+                    recovery_disk.as_deref().map(|path| BootDisk { path, read_only: false })
+                } else if name.starts_with("fido-cold-") {
                     store_disk.as_deref().map(|path| BootDisk { path, read_only: false })
                 } else {
                     tpm_disk.as_deref().filter(|_| name.starts_with("tpm-"))
@@ -186,7 +196,7 @@ pub(crate) fn run(runner: &RecipeCheckRunner, tpm: Option<&Path>) -> Result<(), 
         println!("PASS: guest HID discovery, production worker, signed fixture assertion and challenge refusal through the TPM, keepalive deadline and worker cleanup; no physical USB or token presence claim");
         println!("PASS: production private enrollment, unlock and named-write workers; both recovery policies, commit cancellation, locked writes and credential readback; simulated parent acknowledgements, no desktop or physical-presence claim");
         println!("PASS: production compositor attention, root authority, public sealed-descriptor credential write and generation relocking through virtual keyboard/token devices; jailed application portal retrieval, application isolation and locked refusal; no physical-presence claim");
-        println!("PASS: cold Btrfs @var credential-store reopen with retained TPM state; unchanged bundle, locked jailed retrieval, fresh token assertion and per-application readback; no power-loss or physical-presence claim");
+        println!("PASS: cold Btrfs @var credential-store reopen with retained TPM state under both recovery policies; unchanged bundle, locked jailed retrieval, fresh primary or recovery assertion and per-application readback with the primary token absent during recovery; no power-loss or physical-presence claim");
     }
     Ok(())
 }

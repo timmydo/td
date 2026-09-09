@@ -774,7 +774,7 @@ normal cargo pass with those tests ignored is not TPM integration evidence.
 
 `td-recipe-eval qemu-secret --tpm /absolute/path/to/swtpm` requires the
 same pinned host swtpm described above and adds four cold TPM guest boots
-and the nine HID guests below to the authority checks. The host starts a
+and the eleven HID guests below to the authority checks. The host starts a
 private software TPM control socket and attaches QEMU's emulated TIS device; there is no host TPM
 passthrough. The source-built test executable calls the unchanged
 `Device::open` and `Client` implementations through `/dev/tpmrm0`.
@@ -802,7 +802,7 @@ credential-store write. The stock deployment remains unenrolled.
 
 ### HID through the QEMU guest kernel
 
-The same optional command runs nine further isolated guests using a
+The same optional command runs eleven further isolated guests using a
 test-only virtual token created through Linux
 [UHID](https://docs.kernel.org/hid/uhid.html). The fixture requires its
 kernel opt-in and exact case selector before opening `/dev/uhid`, then
@@ -835,7 +835,7 @@ retirement and disappearance of the virtual hidraw node after the fixture
 closes its UHID descriptor. Fixture event reads are nonblocking, its thread
 has a fifteen-second lifetime, and Drop stops and joins that thread.
 Every guest also retains the outer 180-second boot bound and exact one-test
-passing-summary requirement. Only the two cold desktop guests described
+passing-summary requirement. Only the four cold desktop guests described
 below attach a persistent filesystem disk.
 
 This is evidence for kernel HID transport, production worker ownership,
@@ -1034,6 +1034,25 @@ test-only signer; production token transport and TPM sealing are unchanged.
 The second guest's assertion challenge must be nonzero and differ from every
 creation/proof/assertion challenge recorded by the first guest. The expected
 CTAP sequence permits no automatic enrollment or assertion before attention.
+
+The `fido-cold-recovery-create` and `fido-cold-recovery-reopen` pair repeats
+that disk lifecycle on a separate fresh volume with the second-token policy.
+E on the real compositor attention screen selects enrollment. Only the primary
+device is initially connected; after its proof request the fixture inserts a
+second virtual device while leaving the first attached. Recovery creation
+must retain the same opaque user handle and exclude the primary credential.
+The two COSE public keys must differ. Both creation and proof consume fresh,
+nonzero challenges, retained with the primary's challenges for the cold check.
+The second device is removed after enrollment before the primary's normal
+unlock/write sequence. Each token must consume its exact CTAP command count.
+
+The recovery boot reconstructs and connects only the enrolled recovery device;
+no primary signer or primary HID node is created. It requires exactly one
+admitted FIDO device and zero token commands during both jailed locked reads.
+R on secure attention must produce exactly getInfo plus one fresh assertion,
+then the same mail/news scope and relock checks as the primary-policy boot.
+This checks desktop enrollment and cold recovery through the public portal;
+it does not claim that a recovery token can replace a lost TPM seed.
 
 This proves orderly cold persistence and desktop release in QEMU. The fixture
 regenerates immutable account/package scaffolding, not a full installed
