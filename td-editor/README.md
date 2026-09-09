@@ -329,7 +329,7 @@ child, set `$EDITOR` to the executable's absolute path. No wrapper or mode
 flag is needed. The process stays in the foreground until its window closes;
 it does not consume inherited stdin. Exit 0 includes explicit discard, not
 only saving. This does not complete td-mail composition: its current caller
-uses shell command construction and removes temporary drafts after exit.
+uses shell command construction and retains drafts but cannot submit mail.
 See DESIGN.md before attempting that integration.
 
 Try the actual window from a terminal in your Linux x86-64 Wayland session:
@@ -711,6 +711,6 @@ lists its driver, runtime-policy and DMA-BUF prerequisites. Direct GPU
 rendering for the dependency-free editor also needs a source-built graphics
 implementation; the software reference backend does not complete that goal.
 
-td-mail currently deletes its temporary draft and attachment files when its
-editor child exits. Saving a draft in place does not retain it, and td-mail has
-no mail submission path. The design describes this integration gap explicitly.
+td-mail retains drafts and attachments in its persistent state directory
+after editor exit. Explicitly delete them when no longer needed. It still
+has no mail submission path; the design describes the remaining integration.

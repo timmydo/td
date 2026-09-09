@@ -1,7 +1,7 @@
 use std::fs;
 use std::io;
-use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -374,8 +374,7 @@ fn html_to_plain(html: &str) -> String {
     crate::html::to_text(html.as_bytes(), 80)
 }
 
-/// Paths produced by [`write_compose_draft`] that the caller must remove once
-/// the editor exits: the draft file plus an optional attachments directory.
+/// Retained draft and sidecar paths. Editor exit never authorizes deletion.
 pub struct PreparedDraft {
     pub draft_path: PathBuf,
     pub attachment_dir: Option<PathBuf>,
@@ -385,9 +384,27 @@ pub struct PreparedDraft {
 /// per-draft subdirectory and are referenced from the body via MML `<#part>`
 /// tags, then the (possibly augmented) body is written to the draft file.
 pub fn write_compose_draft(draft: &ComposeDraft) -> io::Result<PreparedDraft> {
-    let dir = draft_dir();
-    fs::create_dir_all(&dir)?;
-    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))?;
+    write_compose_draft_in(draft, &draft_dir()?)
+}
+
+fn write_compose_draft_in(draft: &ComposeDraft, dir: &Path) -> io::Result<PreparedDraft> {
+    if !draft.attachments.is_empty() && dir.to_str().is_none_or(|s| !valid_mml_attribute(s)) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "attachment directory cannot be represented by the draft's MML path",
+        ));
+    }
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)?;
+    let metadata = fs::symlink_metadata(dir)?;
+    if !metadata.is_dir() || metadata.permissions().mode() & 0o077 != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "draft directory must be a private directory, not a symlink",
+        ));
+    }
 
     let stamp = format!(
         "{}-{}",
@@ -398,51 +415,107 @@ pub fn write_compose_draft(draft: &ComposeDraft) -> io::Result<PreparedDraft> {
             .as_nanos()
     );
 
+    prepare_draft(draft, dir, &stamp)
+}
+
+fn prepare_draft(draft: &ComposeDraft, dir: &Path, stamp: &str) -> io::Result<PreparedDraft> {
+    let att_dir = dir.join(format!("td-mail-att-{stamp}"));
+    let draft_path = dir.join(format!("td-mail-draft-{stamp}.eml"));
     let mut body = draft.body.clone();
-    let attachment_dir = if draft.attachments.is_empty() {
-        None
-    } else {
-        let att_dir = dir.join(format!("td-mail-att-{}", stamp));
-        fs::create_dir_all(&att_dir)?;
-        fs::set_permissions(&att_dir, fs::Permissions::from_mode(0o700))?;
-        for att in &draft.attachments {
-            let path = att_dir.join(sanitize_filename(&att.filename));
-            write_secure_file(&path, &att.data)?;
-            body.push_str(&mml_part(
-                &att.content_type,
-                &path,
-                att.description.as_deref(),
+    let mut parts = Vec::with_capacity(draft.attachments.len());
+    let mut names = std::collections::BTreeSet::new();
+    for att in &draft.attachments {
+        let name = sanitize_filename(&att.filename);
+        if !names.insert(name.clone()) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "duplicate sanitized attachment filename",
             ));
         }
-        Some(att_dir)
-    };
-
-    let draft_path = dir.join(format!("td-mail-draft-{}.eml", stamp));
-    write_secure_file(&draft_path, body.as_bytes())?;
-
+        let path = att_dir.join(name);
+        body.push_str(&mml_part(
+            &att.content_type,
+            &path,
+            att.description.as_deref(),
+        )?);
+        parts.push((path, att.data.as_slice()));
+    }
+    let mut attachment_created = false;
+    let mut draft_created = false;
+    let result = (|| {
+        if !parts.is_empty() {
+            fs::DirBuilder::new().mode(0o700).create(&att_dir)?;
+            attachment_created = true;
+            for (path, bytes) in &parts {
+                let mut file = create_secure_file(path)?;
+                io::Write::write_all(&mut file, bytes)?;
+            }
+        }
+        let mut file = create_secure_file(&draft_path)?;
+        draft_created = true;
+        io::Write::write_all(&mut file, body.as_bytes())
+    })();
+    if let Err(error) = result {
+        let mut detail = error.to_string();
+        for (created, path, directory) in [
+            (draft_created, &draft_path, false),
+            (attachment_created, &att_dir, true),
+        ] {
+            if created {
+                let cleanup = if directory {
+                    fs::remove_dir_all(path)
+                } else {
+                    fs::remove_file(path)
+                };
+                if let Err(cleanup) = cleanup {
+                    detail.push_str(&format!(
+                        "; incomplete preparation remains at {path:?}: {cleanup}"
+                    ));
+                }
+            }
+        }
+        return Err(io::Error::new(error.kind(), detail));
+    }
     Ok(PreparedDraft {
         draft_path,
-        attachment_dir,
+        attachment_dir: attachment_created.then_some(att_dir),
     })
 }
 
-/// Write `bytes` to `path`, creating it fresh with 0600 permissions.
-fn write_secure_file(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    let mut file = fs::OpenOptions::new()
+fn create_secure_file(path: &Path) -> io::Result<fs::File> {
+    fs::OpenOptions::new()
         .write(true)
-        .truncate(true)
         .create_new(true)
         .mode(0o600)
-        .open(path)?;
-    io::Write::write_all(&mut file, bytes)
+        .open(path)
+}
+
+fn valid_mml_attribute(text: &str) -> bool {
+    !text
+        .chars()
+        .any(|c| c.is_control() || matches!(c, '"' | '\\' | '<' | '>'))
 }
 
 /// Render an MML part tag that tells message-mode to attach `path` on send.
-fn mml_part(content_type: &str, path: &Path, description: Option<&str>) -> String {
+fn mml_part(content_type: &str, path: &Path, description: Option<&str>) -> io::Result<String> {
+    let path = path
+        .to_str()
+        .filter(|text| valid_mml_attribute(text))
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "attachment path cannot be represented by MML",
+            )
+        })?;
+    if !valid_mml_attribute(content_type) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "attachment content type cannot be represented by MML",
+        ));
+    }
     let mut tag = format!(
         "\n<#part type=\"{}\" filename=\"{}\" disposition=\"attachment\"",
-        content_type,
-        path.display()
+        content_type, path
     );
     if let Some(desc) = description {
         // Strip characters that would terminate the attribute / tag.
@@ -450,14 +523,17 @@ fn mml_part(content_type: &str, path: &Path, description: Option<&str>) -> Strin
             .chars()
             .map(|c| match c {
                 '"' => '\'',
-                '\n' | '\r' => ' ',
+                '\\' => '/',
+                '<' => '(',
+                '>' => ')',
+                c if c.is_control() => ' ',
                 other => other,
             })
             .collect();
         tag.push_str(&format!(" description=\"{}\"", clean));
     }
     tag.push_str(">\n<#/part>\n");
-    tag
+    Ok(tag)
 }
 
 /// Make a filename safe to use as a single path component.
@@ -477,35 +553,29 @@ fn sanitize_filename(name: &str) -> String {
     }
 }
 
-fn draft_dir() -> PathBuf {
-    draft_dir_from_env(
-        std::env::var("XDG_RUNTIME_DIR").ok(),
-        std::env::var("XDG_STATE_HOME").ok(),
-        std::env::var("HOME").ok(),
-    )
+fn draft_dir() -> io::Result<PathBuf> {
+    draft_dir_from_env(std::env::var_os("XDG_STATE_HOME"), std::env::var_os("HOME"))
 }
 
 fn draft_dir_from_env(
-    xdg_runtime_dir: Option<String>,
-    xdg_state_home: Option<String>,
-    home: Option<String>,
-) -> PathBuf {
-    if let Some(runtime_dir) = xdg_runtime_dir {
-        let trimmed = runtime_dir.trim();
-        if !trimmed.is_empty() {
-            return PathBuf::from(trimmed).join("td-mail").join("drafts");
-        }
-    }
-
-    let state_dir = if let Some(xdg) = xdg_state_home {
-        PathBuf::from(xdg)
-    } else if let Some(home) = home {
-        PathBuf::from(home).join(".local").join("state")
-    } else {
-        PathBuf::from(".")
-    };
-
-    state_dir.join("td-mail").join("drafts")
+    xdg_state_home: Option<std::ffi::OsString>,
+    home: Option<std::ffi::OsString>,
+) -> io::Result<PathBuf> {
+    let state_dir = xdg_state_home
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .or_else(|| {
+            home.map(PathBuf::from)
+                .filter(|p| p.is_absolute())
+                .map(|p| p.join(".local/state"))
+        })
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "draft retention requires an absolute XDG_STATE_HOME or HOME",
+            )
+        })?;
+    Ok(state_dir.join("td-mail/drafts"))
 }
 
 #[cfg(test)]
@@ -767,7 +837,8 @@ mod tests {
             "message/rfc822",
             Path::new("/tmp/fwd/orig.eml"),
             Some("Forwarded: say \"hi\"\nthere"),
-        );
+        )
+        .unwrap();
         assert!(part.contains("type=\"message/rfc822\""));
         assert!(part.contains("filename=\"/tmp/fwd/orig.eml\""));
         assert!(part.contains("disposition=\"attachment\""));
@@ -785,41 +856,193 @@ mod tests {
     }
 
     #[test]
-    fn test_draft_dir_uses_xdg_runtime_dir() {
+    fn test_draft_dir_uses_persistent_state() {
         assert_eq!(
-            draft_dir_from_env(
-                Some("/tmp/runtime-test".to_string()),
-                Some("/tmp/state-test".to_string()),
-                Some("/home/example".to_string())
-            ),
-            PathBuf::from("/tmp/runtime-test")
+            draft_dir_from_env(Some("/tmp/state-test".into()), Some("/home/example".into()))
+                .unwrap(),
+            PathBuf::from("/tmp/state-test")
                 .join("td-mail")
                 .join("drafts")
         );
     }
 
     #[test]
-    fn test_draft_dir_falls_back_to_state_home() {
-        assert_eq!(
-            draft_dir_from_env(
-                None,
-                Some("/tmp/state-test".to_string()),
-                Some("/home/example".to_string())
-            ),
-            PathBuf::from("/tmp/state-test").join("td-mail").join("drafts")
-        );
+    fn test_invalid_state_home_falls_back_but_never_to_runtime_or_cwd() {
+        for state in [None, Some("".into()), Some("relative".into())] {
+            assert_eq!(
+                draft_dir_from_env(state.clone(), Some("/home/example".into())).unwrap(),
+                PathBuf::from("/home/example/.local/state/td-mail/drafts")
+            );
+            assert!(draft_dir_from_env(state, Some("relative".into())).is_err());
+        }
     }
 
     #[test]
     fn test_draft_dir_falls_back_to_home_state() {
         assert_eq!(
-            draft_dir_from_env(None, None, Some("/home/example".to_string())),
+            draft_dir_from_env(None, Some("/home/example".into())).unwrap(),
             PathBuf::from("/home/example")
                 .join(".local")
                 .join("state")
                 .join("td-mail")
                 .join("drafts")
         );
+    }
+
+    #[test]
+    fn state_paths_preserve_os_bytes_and_attachment_paths_refuse_lossy_mml() {
+        use std::os::unix::ffi::OsStringExt;
+        let raw = std::ffi::OsString::from_vec(b"/state-\xff".to_vec());
+        assert_eq!(
+            draft_dir_from_env(Some(raw.clone()), None).unwrap(),
+            PathBuf::from(raw).join("td-mail/drafts")
+        );
+        let draft = ComposeDraft {
+            body: String::new(),
+            attachments: vec![DraftAttachment {
+                filename: "forward.eml".into(),
+                content_type: "message/rfc822".into(),
+                description: None,
+                data: Vec::new(),
+            }],
+        };
+        for bytes in [
+            b"/state-\xff".as_slice(),
+            b"/state-\"",
+            b"/state-\\",
+            b"/state-\n",
+            b"/state-\t",
+            b"/state->",
+            b"/state-<",
+        ] {
+            let path = PathBuf::from(std::ffi::OsString::from_vec(bytes.to_vec()));
+            assert_eq!(
+                write_compose_draft_in(&draft, &path).err().unwrap().kind(),
+                io::ErrorKind::InvalidInput
+            );
+        }
+    }
+
+    #[test]
+    fn retained_drafts_have_private_files_and_stable_sidecars() -> io::Result<()> {
+        let root = std::env::temp_dir().join(format!(
+            "td-mail-retained-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let draft = ComposeDraft {
+            body: "body\n".into(),
+            attachments: vec![DraftAttachment {
+                filename: "forward.eml".into(),
+                content_type: "message/rfc822".into(),
+                description: None,
+                data: b"original bytes".to_vec(),
+            }],
+        };
+        let first = write_compose_draft_in(&draft, &root)?;
+        let second = write_compose_draft_in(&draft, &root)?;
+        assert_ne!(first.draft_path, second.draft_path);
+        let sidecar = first.attachment_dir.as_ref().unwrap();
+        let attachment = sidecar.join("forward.eml");
+        let body = fs::read_to_string(&first.draft_path)?;
+        assert!(body.contains(attachment.to_str().unwrap()));
+        assert_eq!(fs::read(&attachment)?, b"original bytes");
+        for path in [&root, sidecar] {
+            assert_eq!(fs::metadata(path)?.permissions().mode() & 0o777, 0o700);
+        }
+        for path in [&first.draft_path, &attachment] {
+            assert_eq!(fs::metadata(path)?.permissions().mode() & 0o777, 0o600);
+        }
+        drop(first);
+        drop(second);
+        assert_eq!(fs::read(&attachment)?, b"original bytes");
+        fs::remove_dir_all(root)
+    }
+
+    #[test]
+    fn mml_attributes_refuse_hostile_paths_types_and_clean_descriptions() {
+        for value in [
+            "bad\"name",
+            "bad\nname",
+            "bad\rname",
+            "bad\\name",
+            "bad\tname",
+            "bad>name",
+            "bad<name",
+        ] {
+            assert!(mml_part("text/plain", Path::new(value), None).is_err());
+            assert!(mml_part(value, Path::new("/safe/file"), None).is_err());
+        }
+        let part = mml_part(
+            "text/plain",
+            Path::new("/safe/file"),
+            Some("bad\\\"\n\r\tname"),
+        )
+        .unwrap();
+        assert!(part.contains("description=\"bad/'   name\""));
+    }
+
+    #[test]
+    fn preparation_failure_removes_only_attempt_owned_sidecars() -> io::Result<()> {
+        let root = std::env::temp_dir().join(format!(
+            "td-mail-prepare-failure-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::DirBuilder::new().mode(0o700).create(&root)?;
+        let attachment = |filename: &str| DraftAttachment {
+            filename: filename.into(),
+            content_type: "text/plain".into(),
+            description: None,
+            data: b"private attachment".to_vec(),
+        };
+        let mut draft = ComposeDraft {
+            body: "body".into(),
+            attachments: vec![attachment("a/b"), attachment("a_b")],
+        };
+        assert!(prepare_draft(&draft, &root, "duplicate").is_err());
+        assert_eq!(fs::read_dir(&root)?.count(), 0);
+        draft.attachments = vec![attachment("first"), attachment(&"x".repeat(256))];
+        assert!(prepare_draft(&draft, &root, "partial").is_err());
+        assert_eq!(fs::read_dir(&root)?.count(), 0);
+        draft.attachments = vec![attachment("first")];
+        let existing = root.join("td-mail-draft-collision.eml");
+        fs::write(&existing, b"do not remove or replace")?;
+        assert!(prepare_draft(&draft, &root, "collision").is_err());
+        assert_eq!(fs::read(&existing)?, b"do not remove or replace");
+        assert!(!root.join("td-mail-att-collision").exists());
+        let sidecar = root.join("td-mail-att-existing");
+        fs::create_dir(&sidecar)?;
+        fs::write(sidecar.join("keep"), b"owned earlier")?;
+        assert!(prepare_draft(&draft, &root, "existing").is_err());
+        assert_eq!(fs::read(sidecar.join("keep"))?, b"owned earlier");
+        fs::remove_dir_all(root)
+    }
+
+    #[test]
+    fn private_directory_policy_does_not_chmod_or_follow_a_final_symlink() -> io::Result<()> {
+        let root = std::env::temp_dir().join(format!(
+            "td-mail-dir-policy-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&root)?;
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o755))?;
+        assert!(write_compose_draft_in(&ComposeDraft::text("x".into()), &root).is_err());
+        assert_eq!(fs::metadata(&root)?.permissions().mode() & 0o777, 0o755);
+        let link = root.join("link");
+        std::os::unix::fs::symlink(&root, &link)?;
+        assert!(write_compose_draft_in(&ComposeDraft::text("x".into()), &link).is_err());
+        fs::remove_dir_all(root)
     }
 
     #[test]

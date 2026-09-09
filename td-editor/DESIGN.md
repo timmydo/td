@@ -2282,35 +2282,34 @@ share a control socket, or enable GPU devices.
 
 td-editor is a general text editor. Version 1 neither submits mail nor
 interprets MML, starts a mail transport, or manages attachment lifetimes.
-Those are outside this editor increment. Save As is the explicit way to
-retain draft text before the caller removes its temporary file.
+Those are outside this editor increment. td-mail retains local drafts and
+their sidecars; Save As does not move or rewrite attachment references.
 
 The caller inspected for this design is td-mail (then the standalone
 `tmc` repository, now `td-mail/` in this tree). Its `src/tui/mod.rs`
 selects `[ui].editor`, then `$EDITOR`, then `vi`; `spawn_editor` starts
 `sh -c` with the configured editor command followed by quoted `"$1"`,
-passing the displayed draft pathname as a separate shell argument. Spaces
-and shell metacharacters in that path remain one argument. The TUI
-continues immediately. A background
-thread waits for the shell child, ignores its exit status, and removes both
-the draft and any attachment directory. td-mail neither rereads the saved file
-nor submits mail. Consequently a normal Save followed by Quit loses the
-temporary draft to caller cleanup; retaining it requires Save As to a
-persistent granted path. This editor must not be described as a complete
-td-mail mail-composition workflow until draft retention/submission is resolved.
+passing the OS pathname as a separate shell argument. Spaces, shell
+metacharacters and non-UTF-8 filename bytes remain one unchanged argument.
+The TUI continues immediately. A background thread reaps the shell child;
+exit, failure and failed launch never delete drafts or attachment sidecars.
+td-mail neither rereads the saved file nor submits mail. Local retention is
+implemented; a complete mail-composition workflow still needs submission.
 
 `src/compose.rs` creates mode-0600 `.eml` files inside a mode-0700 directory,
-preferring `$XDG_RUNTIME_DIR/td-mail/drafts`, then the XDG state directory. The
-draft format includes mail headers, `--text follows this line--`, and
-potential MML attachment tags pointing to temporary sidecar files. Preserve
-these bytes as ordinary text. Saving the draft elsewhere does not preserve
-the referenced attachment files when td-mail later removes them. Recognizing,
-retaining, or submitting mail is a separate requested product capability.
+using `$XDG_STATE_HOME/td-mail/drafts`, then `$HOME/.local/state/td-mail/drafts`.
+Only absolute roots are accepted; runtime storage is no longer selected.
+The draft format includes mail headers, `--text follows this line--`, and
+potential MML attachment tags pointing to retained sidecar files. Preserve
+these bytes as ordinary text. Saving the draft elsewhere does not copy
+its referenced attachments. Recognizing or submitting mail is a separate
+product capability. The caller retains sidecars until explicit user removal.
+td-mail/README.md owns the local
+retention, private-directory and MML-representability details.
 
-td-mail still interprets its configured editor command as shell text, and
-converts the draft path through `display().to_string()`, which is lossy for
-non-UTF-8 paths. An integration change must preserve OS-byte path identity
-at the caller; td-editor cannot recover bytes already changed by its parent.
+td-mail still interprets its configured editor command as shell text, but
+passes the draft's original OS bytes separately. Integration must preserve
+that identity; td-editor cannot recover bytes already changed by its parent.
 Do not add shell evaluation to the editor. The editor leaves the caller's
 inherited terminal input untouched.
 
@@ -2325,10 +2324,10 @@ marked foreign application payloads.
 
 The caller's real launch path is the acceptance test: launch td-mail, request a
 draft, observe an editor frame, edit and save while its child remains live,
-and verify exact saved bytes before caller cleanup. For retention, exercise
-Save As to a persistent granted directory, close the window, and prove that
-td-mail remains responsive, its temporary draft is cleaned up, and the retained
-copy survives. Attachment retention and submission need their own agreed
+and verify exact saved bytes after editor exit. For retention, prove that
+td-mail remains responsive and both the saved draft and attachment sidecars
+survive. Also exercise Save As to a persistent granted directory without
+claiming that moving text rewrites attachments. Submission needs its own
 oracle. Include spaces, leading dashes and non-UTF-8 paths with exact caller
 argument preservation, unwritable paths, cancellation, missing display,
 and an attempted path outside the grant. An isolated Wayland smoke test
@@ -2887,7 +2886,8 @@ td-builder's automatic cargo test/clippy gate and commits its one-package
    synchronization. Exercise the production dispatcher through both inputs.
 4. Source-built recipe and td-mail jail integration: staged shared sources and
    data licenses, runtime closure, file grants, `$EDITOR`, debug companions,
-   and a test of the actual caller's child lifetime and draft cleanup.
+   and a test of the actual caller's child lifetime, draft retention and
+   explicit user removal.
 5. GPU editor rendering after the separately specified graphics producer and
    jail/compositor prerequisites. Validate both reference and GPU backends
    against the same scene operations and image oracles. A software-only

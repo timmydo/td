@@ -268,49 +268,94 @@ pub fn run(
 }
 
 fn spawn_editor(draft: &compose::ComposeDraft, editor_cmd: &str) {
-    // Write draft (and any attachment sidecar files) to temp storage.
+    // Retain the draft and sidecars independently of the editor's lifetime.
     let prepared = match compose::write_compose_draft(draft) {
         Ok(prepared) => prepared,
         Err(e) => {
-            crate::log_error!("Failed to create temp file: {}", e);
+            crate::log_error!("Failed to retain draft: {}", e);
             return;
         }
     };
 
-    let compose::PreparedDraft {
-        draft_path,
-        attachment_dir,
-    } = prepared;
+    crate::log_info!("Draft retained at {}", prepared.draft_path.display());
+    if let Some(path) = &prepared.attachment_dir {
+        crate::log_info!("Draft attachments retained at {}", path.display());
+    }
+    match launch_draft_editor(&prepared, editor_cmd) {
+        Ok(child) => reap_in_background(child),
+        Err(e) => crate::log_error!("Failed to spawn editor; draft retained: {}", e),
+    }
+}
 
-    // Spawn editor as a separate process. The path is the shell's `$1`
-    // rather than part of the command: a temporary directory with a
-    // space in it is not unheard of, and this way the shell sees the
-    // path as one word whatever it holds.
-    let path_str = draft_path.display().to_string();
-    let child = std::process::Command::new("sh")
+fn launch_draft_editor(
+    prepared: &compose::PreparedDraft,
+    editor_cmd: &str,
+) -> io::Result<std::process::Child> {
+    let editor_cmd = editor_cmd.trim();
+    if editor_cmd.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "editor command is empty",
+        ));
+    }
+    // Preserve the OS path as one quoted positional argument, not shell text.
+    std::process::Command::new("sh")
         .arg("-c")
         .arg(format!("{} \"$1\"", editor_cmd))
         .arg("sh")
-        .arg(&path_str)
-        .spawn();
+        .arg(&prepared.draft_path)
+        .spawn()
+}
 
-    match child {
-        Ok(mut child) => {
-            // Background thread waits for editor exit then cleans up temp files
-            std::thread::spawn(move || {
-                let _ = child.wait();
-                let _ = std::fs::remove_file(&draft_path);
-                if let Some(dir) = attachment_dir {
-                    let _ = std::fs::remove_dir_all(&dir);
+#[cfg(test)]
+mod draft_tests {
+    use super::*;
+    use std::os::unix::ffi::OsStringExt;
+
+    #[test]
+    fn editor_exit_keeps_saved_draft_and_attachments_with_exact_path_bytes() -> io::Result<()> {
+        let root = std::env::temp_dir().join(format!(
+            "td-mail-editor-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&root)?;
+        let path = root.join(std::ffi::OsString::from_vec(b"draft ;$' \xff.eml".to_vec()));
+        let sidecar = root.join("attachments");
+        std::fs::create_dir(&sidecar)?;
+        std::fs::write(sidecar.join("original"), b"attachment")?;
+        let prepared = compose::PreparedDraft {
+            draft_path: path.clone(),
+            attachment_dir: Some(sidecar.clone()),
+        };
+        assert!(launch_draft_editor(&prepared, "  ").is_err());
+        for (command, success, saved) in [
+            ("printf saved > \"$1\"; exit 0 #", true, true),
+            ("test -f\n", true, false),
+            ("exit 7 #", false, false),
+            ("exec /definitely-absent-td-editor", false, false),
+        ] {
+            std::fs::write(&path, b"original")?;
+            let status = launch_draft_editor(&prepared, command)?.wait()?;
+            assert_eq!(status.success(), success);
+            assert_eq!(
+                std::fs::read(&path)?,
+                if saved {
+                    b"saved".as_slice()
+                } else {
+                    b"original"
                 }
-            });
+            );
+            assert_eq!(std::fs::read(sidecar.join("original"))?, b"attachment");
         }
-        Err(e) => {
-            crate::log_error!("Failed to spawn editor: {}", e);
-            let _ = std::fs::remove_file(&draft_path);
-            if let Some(dir) = attachment_dir {
-                let _ = std::fs::remove_dir_all(&dir);
-            }
-        }
+        // The background reaper receives only Child, never retained paths.
+        let source = include_str!("mod.rs");
+        let production = source.split("#[cfg(test)]").next().unwrap();
+        assert!(!production.contains("remove_file"));
+        assert!(!production.contains("remove_dir_all"));
+        std::fs::remove_dir_all(root)
     }
 }

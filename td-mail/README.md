@@ -18,6 +18,38 @@
 - Supports optional mail rules and retention policies.
 - Provides `--cli` NDJSON mode for integrations and automation.
 
+## Local drafts
+
+Compose, reply and forward retain `.eml` drafts in
+`$XDG_STATE_HOME/td-mail/drafts`, falling back to
+`$HOME/.local/state/td-mail/drafts`. Only absolute state/home paths are
+accepted; an empty or relative state setting falls back to HOME. Runtime
+storage is not used, so logout does not intentionally discard a draft.
+Missing directories are created private; an existing draft directory must
+already be private and must not itself be a symlink. Files are mode 0600.
+These checks are not protection against a hostile ancestor-directory owner.
+
+Editor exit, including failure, never deletes the draft or its attachment
+sidecar. A failed launch retains them too. The log records both paths.
+Reopen the `.eml` file with your editor or file manager; delete it explicitly
+when no longer needed. The matching `td-mail-att-ID` directory belongs to
+`td-mail-draft-ID.eml`: keep it while the draft needs its attachments and
+remove it separately when discarding that draft. Moving only the `.eml`
+file does not move or rewrite attachment references. There is no draft-list
+UI, automatic expiry or mail submission in this increment.
+
+The configured editor remains shell command text, but the draft pathname is
+one quoted argument with its OS bytes preserved. Attachment-bearing drafts
+require a UTF-8 storage path without quotes, backslashes, angle brackets or
+control characters;
+unrepresentable MML paths or content types fail explicitly instead of
+pointing elsewhere. Descriptions replace control/attribute characters for
+display. Colliding sanitized attachment names refuse before writing files.
+On preparation failure, only that attempt's created files and sidecar
+directory are removed; cleanup failure reports the remaining paths. This
+is best-effort error cleanup, not recovery from process death or power loss.
+Older runtime drafts are not moved or deleted automatically.
+
 ## Requirements
 
 - Rust toolchain (stable) with Cargo. No crates at all: td-mail is `std` alone,
