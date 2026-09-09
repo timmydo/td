@@ -17,6 +17,7 @@ pub(crate) struct Snapshot {
     entries: Vec<Entry>,
     pub(crate) sort: Sort,
     pub(crate) reverse: bool,
+    parent_identity: (u64, u64),
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -53,9 +54,24 @@ struct Entry {
     gid: u32,
     size: u64,
     modified: (i64, i64),
+    stamp: crate::files::Stamp,
 }
 
 impl Snapshot {
+    pub(crate) fn rename_source(&self, row: usize) -> Option<crate::files::RenameSource> {
+        let entry = self.entries.get(row)?;
+        Some(crate::files::RenameSource::observed(
+            self.path.join(&entry.name),
+            self.parent_identity,
+            entry.stamp.clone(),
+        ))
+    }
+
+    pub(crate) fn relocate(&mut self, path: PathBuf) {
+        self.title = title(&path);
+        self.path = path;
+    }
+
     pub(crate) fn entry(&self, row: usize) -> Option<PathBuf> {
         self.entries
             .get(row)
@@ -234,16 +250,14 @@ pub(crate) fn read(path: &Path) -> Result<Option<Snapshot>, String> {
             gid: metadata.gid(),
             size: metadata.size(),
             modified: (metadata.mtime(), metadata.mtime_nsec()),
+            stamp: crate::files::Stamp::read(&metadata),
         });
     }
     let after = std::fs::symlink_metadata(&path).map_err(|e| format!("Directory changed: {e}"))?;
     if !after.is_dir() || (before.dev(), before.ino()) != (after.dev(), after.ino()) {
         return Err("Directory replaced during listing; retry Open".into());
     }
-    let title = format!("[dir] {:?}", path.file_name().unwrap_or(path.as_os_str()))
-        .chars()
-        .take(80)
-        .collect();
+    let title = title(&path);
     let mut snapshot = Snapshot {
         path,
         title,
@@ -251,9 +265,17 @@ pub(crate) fn read(path: &Path) -> Result<Option<Snapshot>, String> {
         entries,
         sort: Sort::Name,
         reverse: false,
+        parent_identity: (before.dev(), before.ino()),
     };
     snapshot.arrange(Sort::Name, false);
     Ok(Some(snapshot))
+}
+
+fn title(path: &Path) -> String {
+    format!("[dir] {:?}", path.file_name().unwrap_or(path.as_os_str()))
+        .chars()
+        .take(80)
+        .collect()
 }
 
 #[cfg(test)]
@@ -276,6 +298,7 @@ mod tests {
 
     #[test]
     fn metadata_rows_sort_without_parsing_names_and_keep_directories_first() {
+        let stamp = crate::files::Stamp::read(&std::fs::metadata(file!()).unwrap());
         let entry = |name: &[u8], kind, size, modified| Entry {
             name: std::ffi::OsStr::from_bytes(name).to_owned(),
             kind,
@@ -285,6 +308,7 @@ mod tests {
             gid: 34,
             size,
             modified,
+            stamp: stamp.clone(),
         };
         let mut snapshot = Snapshot {
             path: PathBuf::from("/browse"),
@@ -292,6 +316,7 @@ mod tests {
             text: String::new(),
             sort: Sort::Name,
             reverse: false,
+            parent_identity: (0, 0),
             entries: vec![
                 entry(b"z\xff\n", '-', 99, (0, 1)),
                 entry(b"a", '-', 1, (0, 2)),

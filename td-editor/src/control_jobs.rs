@@ -30,6 +30,7 @@ enum Kind {
     SaveAs,
     Reload,
     Dictionary,
+    Rename,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -72,6 +73,26 @@ impl Jobs {
 
     pub(crate) fn begin_dictionary(&mut self) -> Result<u64> {
         self.reserve(Kind::Dictionary, 0, 0)
+    }
+
+    pub(crate) fn begin_rename(&mut self, tab: TabId, revision: u64) -> Result<u64> {
+        self.reserve(Kind::Rename, tab, revision)
+    }
+
+    pub(crate) fn renamed(&mut self, id: u64, result: Result<()>) -> Result<()> {
+        let record = self
+            .records
+            .iter_mut()
+            .find(|record| record.id == id)
+            .ok_or(Error::InvalidArgument)?;
+        if record.kind != Kind::Rename || record.status != Status::Pending {
+            return Err(Error::InvalidArgument);
+        }
+        record.status = match result {
+            Ok(()) => Status::Complete,
+            Err(error) => Status::Failed(error),
+        };
+        Ok(())
     }
 
     pub(crate) fn dictionary(&mut self, id: u64, result: Result<()>) -> Result<()> {
@@ -241,6 +262,7 @@ impl Jobs {
                     Kind::SaveAs => "save-as",
                     Kind::Reload => "reload",
                     Kind::Dictionary => "dictionary",
+                    Kind::Rename => "rename",
                 },
                 record.tab,
                 record.revision,

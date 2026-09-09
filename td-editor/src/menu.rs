@@ -55,7 +55,14 @@ impl Group {
                 LineNumbers,
             ],
             Self::Help => &[About, Command],
-            Self::Directory => &[CopyEntryPath, SortName, SortSize, SortModified, SortReverse],
+            Self::Directory => &[
+                CopyEntryPath,
+                SortName,
+                SortSize,
+                SortModified,
+                SortReverse,
+                RenameEntry,
+            ],
         }
     }
 }
@@ -69,6 +76,7 @@ pub(crate) enum Item {
     Close,
     CopyPath,
     CopyEntryPath,
+    RenameEntry,
     SortName,
     SortSize,
     SortModified,
@@ -115,6 +123,7 @@ impl Item {
             Self::Copy => "Copy",
             Self::CopyPath => "Copy Full File Path",
             Self::CopyEntryPath => "Copy Entry Full Path",
+            Self::RenameEntry => "Rename Entry",
             Self::SortName => "Sort by Name",
             Self::SortSize => "Sort by Size",
             Self::SortModified => "Sort by Modified",
@@ -144,6 +153,7 @@ impl Item {
     pub(crate) fn shortcut(self, profile: Profile) -> &'static str {
         match (self, profile) {
             (Self::CopyEntryPath, _) => "w",
+            (Self::RenameEntry, _) => "R",
             (Self::SortReverse, _) => "S",
             (Self::Command, Profile::Emacs) => "M-x",
             (Self::New, Profile::Windows) => "Ctrl+N",
@@ -224,6 +234,7 @@ impl Menu {
         }
         match item {
             Item::CopyEntryPath => self.directory_entry && self.copy_path,
+            Item::RenameEntry => self.directory_entry && self.file_window,
             Item::SortName | Item::SortSize | Item::SortModified | Item::SortReverse => self.directory,
             Item::Cut | Item::Copy => self.copy,
             Item::CopyPath => self.copy_path,

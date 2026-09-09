@@ -28,6 +28,10 @@ impl PollFailure {
 enum Operation {
     Dictionary(PathBuf),
     Open(PathBuf),
+    Rename {
+        source: crate::files::RenameSource,
+        name: std::ffi::OsString,
+    },
     Reload(FileId),
     Save {
         file: Option<FileId>,
@@ -49,6 +53,10 @@ enum Completion {
     Dictionary(crate::spelling::Dictionary),
     Open(Loaded),
     Directory(crate::directory::Snapshot),
+    Renamed {
+        result: crate::files::Renamed,
+        listing: Result<Option<crate::directory::Snapshot>>,
+    },
     Reload(Loaded),
     Conflict(String),
     Saved { file: FileId, path: PathBuf },
@@ -56,6 +64,7 @@ enum Completion {
 enum Pending {
     Dictionary,
     Open,
+    Rename,
     Browse(crate::model::RevisionPoint),
     Reload {
         permit: Option<crate::Reload>,
@@ -178,6 +187,37 @@ impl Session {
 
     pub(crate) fn directory(&self, tab: TabId) -> Option<&crate::directory::Snapshot> {
         self.directories.get(&tab)
+    }
+
+    pub(crate) fn rename(
+        &mut self,
+        ui: &Controller,
+        tab: TabId,
+        revision: u64,
+        source: crate::files::RenameSource,
+        name: std::ffi::OsString,
+    ) -> Result<()> {
+        ui.editor()
+            .revision_point(tab, revision)
+            .map_err(|e| e.to_string())?;
+        if self.directory(tab).is_none() {
+            return Err("Rename needs a directory tab".into());
+        }
+        let to = source
+            .path()
+            .parent()
+            .ok_or("Rename source has no parent")?
+            .join(&name);
+        // Cached directory paths are not owned by the file worker. Admit
+        // their rebasing before it can publish any filesystem change.
+        for snapshot in self.directories.values() {
+            if let Ok(suffix) = snapshot.path.strip_prefix(source.path()) {
+                if to.join(suffix).as_os_str().as_bytes().len() > 4096 {
+                    return Err("Renamed directory-tab path exceeds 4096 bytes".into());
+                }
+            }
+        }
+        self.submit(Operation::Rename { source, name }, Pending::Rename)
     }
 
     pub(crate) fn sort_directory(
@@ -440,6 +480,78 @@ impl Session {
         result: Result<Completion>,
     ) -> Result<String> {
         match (pending, result?) {
+            (Some(Pending::Rename), Completion::Renamed { result, listing }) => {
+                for association in self.associations.values_mut() {
+                    if let Some(path) = result.relocated(&association.path) {
+                        association.path = path;
+                        association.title = format!(
+                            "{:?}",
+                            association
+                                .path
+                                .file_name()
+                                .unwrap_or(association.path.as_os_str())
+                        )
+                        .chars()
+                        .take(512)
+                        .collect();
+                    }
+                }
+                for snapshot in self.directories.values_mut() {
+                    if let Some(path) = result.relocated(&snapshot.path) {
+                        snapshot.relocate(path);
+                    }
+                }
+                let mut notice = result.warning.unwrap_or_else(|| {
+                    format!(
+                        "Renamed to {:?}; open tabs followed the new path",
+                        result.to
+                    )
+                });
+                match listing {
+                    Ok(Some(fresh)) => {
+                        for (&tab, old) in &mut self.directories {
+                            if old.path != fresh.path {
+                                continue;
+                            }
+                            let replaced = (|| -> Result<crate::directory::Snapshot> {
+                                let doc = ui.editor().document(tab).map_err(|e| e.to_string())?;
+                                let revision = doc.revision();
+                                let point = ui
+                                    .editor()
+                                    .revision_point(tab, revision)
+                                    .map_err(|e| e.to_string())?;
+                                let row = doc
+                                    .text()
+                                    .get(..doc.selection().caret)
+                                    .ok_or("Invalid selection")?
+                                    .bytes()
+                                    .filter(|b| *b == b'\n')
+                                    .count();
+                                let selected = old.entry(row).map(|path| {
+                                    if path == result.from {
+                                        result.to.clone()
+                                    } else {
+                                        path
+                                    }
+                                });
+                                let mut next = fresh.clone();
+                                next.arrange(old.sort, old.reverse);
+                                let caret = selected.as_ref().map_or(0, |path| next.offset(path));
+                                ui.refresh_directory(point, next.text.as_bytes(), caret)
+                                    .map_err(|e| e.to_string())?;
+                                next.text = String::new();
+                                Ok(next)
+                            })();
+                            match replaced {
+                                Ok(next) => *old = next,
+                                Err(_) => notice.push_str("; listing not refreshed: use g"),
+                            }
+                        }
+                    }
+                    _ => notice.push_str("; directory read failed: use g to refresh"),
+                }
+                Ok(notice)
+            }
             (Some(Pending::Dictionary), Completion::Dictionary(dictionary)) => {
                 let count = dictionary.entry_count();
                 self.dictionary = Some(dictionary);
@@ -605,6 +717,7 @@ fn worker(jobs: Receiver<Job>, results: SyncSender<Result<Completion>>) {
                 Operation::Open(_) => "open",
                 Operation::Reload(_) => "reload",
                 Operation::Save { .. } => "save",
+                Operation::Rename { .. } => "rename",
             };
             if let Err(detail) = barrier.checkpoint(kind) {
                 let _ = results.send(Err(detail));
@@ -663,6 +776,17 @@ fn execute(files: &mut Files, known: &mut BTreeSet<FileId>, job: Job) -> Result<
     // Release closed tabs and rejected Open admissions before the next job.
     retain_files(files, known, &job.keep);
     match job.operation {
+        Operation::Rename { source, name } => {
+            let result = files
+                .rename(source, &name)
+                .map_err(|e| format!("Rename failed: {e}"))?;
+            let listing = result
+                .to
+                .parent()
+                .ok_or_else(|| "Rename path has no parent".to_string())
+                .and_then(crate::directory::read);
+            Ok(Completion::Renamed { result, listing })
+        }
         Operation::Dictionary(path) => crate::files::read_dictionary(&path)
             .map(Completion::Dictionary)
             .map_err(|detail| {
@@ -1113,6 +1237,96 @@ mod tests {
             Err(crate::Error::InvalidArgument)
         );
         assert_eq!(h.ui.editor().document(tab).unwrap().text(), "body");
+    }
+
+    #[test]
+    fn directory_rename_reassociates_dirty_tabs_without_touching_model_state() {
+        let dir = Directory::new();
+        fs::create_dir_all(dir.path("tree/sub")).unwrap();
+        fs::write(dir.path("tree/sub/file"), b"disk").unwrap();
+        let mut h = Harness::new();
+        let file = h.open(dir.path("tree/sub/file"));
+        h.ui.dispatch(Event::Edit {
+            tab: file,
+            revision: 0,
+            command: Command::Insert("edit".into()),
+        })
+        .unwrap();
+        let child = h.open(dir.path("tree/sub"));
+        let parent = h.open(dir.0.clone());
+        let duplicate = h.open(dir.0.clone());
+        h.ui.dispatch(Event::SelectTab(parent)).unwrap();
+        let source = h
+            .session
+            .directory(parent)
+            .unwrap()
+            .rename_source(0)
+            .unwrap();
+        let before = format!("{:?}", h.ui.editor().document(file).unwrap());
+        h.session
+            .rename(&h.ui, parent, 0, source, "forest".into())
+            .unwrap();
+        assert!(h.session.open(dir.0.clone()).is_err());
+        h.complete().unwrap();
+        assert_eq!(h.ui.editor().active(), Some(parent));
+        assert!(h.ui.editor().document(duplicate).unwrap().text().ends_with("forest/"));
+        assert_eq!(
+            format!("{:?}", h.ui.editor().document(file).unwrap()),
+            before
+        );
+        assert_eq!(
+            h.session.path(file).unwrap().as_os_str().as_bytes(),
+            dir.path("forest/sub/file").as_os_str().as_bytes()
+        );
+        assert_eq!(h.session.path(child).unwrap(), dir.path("forest/sub"));
+        assert_eq!(h.ui.editor().document(child).unwrap().revision(), 0);
+        assert!(h
+            .ui
+            .editor()
+            .document(parent)
+            .unwrap()
+            .text()
+            .ends_with("forest/"));
+        // Rename that same dirty file, then edit again while the job is busy.
+        let source = h
+            .session
+            .directory(child)
+            .unwrap()
+            .rename_source(0)
+            .unwrap();
+        h.session
+            .rename(&h.ui, child, 0, source, "renamed".into())
+            .unwrap();
+        h.ui.dispatch(Event::Edit {
+            tab: file,
+            revision: 1,
+            command: Command::Insert("later".into()),
+        })
+        .unwrap();
+        let before = format!("{:?}", h.ui.editor().document(file).unwrap());
+        h.ui.dispatch(Event::SelectTab(file)).unwrap();
+        h.complete().unwrap();
+        assert_eq!(h.ui.editor().active(), Some(file));
+        assert_eq!(
+            format!("{:?}", h.ui.editor().document(file).unwrap()),
+            before
+        );
+        assert_eq!(
+            h.session.path(file).unwrap().as_os_str().as_bytes(),
+            dir.path("forest/sub/renamed").as_os_str().as_bytes()
+        );
+        assert_eq!(
+            h.ui.editor().document(file).unwrap().history_depth(),
+            (2, 0)
+        );
+        h.session.save(&h.ui, file, 2, None).unwrap();
+        h.complete().unwrap();
+        assert_eq!(
+            fs::read(dir.path("forest/sub/renamed")).unwrap(),
+            b"editlaterdisk"
+        );
+        assert!(!dir.path("tree").exists());
+        assert!(!dir.path("forest/sub/file").exists());
     }
 
     #[test]

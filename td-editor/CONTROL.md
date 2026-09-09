@@ -194,7 +194,7 @@ entry's keyboard path;
 semantic dialog answers still supply explicit OS-byte paths and do not
 gain a completion mutation verb or physical clipboard authority.
 
-Kinds are `none`, `path-open`, `path-save-as`, `path-dictionary`,
+Kinds are `none`, `path-open`, `path-save-as`, `path-dictionary`, `path-rename`,
 `close-save-as`, `find-forward`, `find-backward`, `replace`, `go-to-line`,
 `fill-column`, and `command`. `close-save-as` is Save As answered through
 the close dialog's ID rather than an independent path ID, including after
@@ -643,11 +643,12 @@ path ID under the following contract.
 
 ## Ordinary path answers and Dictionary jobs
 
-Opening a native Open, Save As or Dictionary path entry also mints a fresh
+Opening a native Open, Save As, Dictionary or Rename entry mints a fresh
 checked dialog ID and captures an editor-bound tab/revision point. State
 reports `ID,SCOPE,path,TAB,REVISION,cancel+path`, with scope `path-open`,
-`path-save-as` or `path-dictionary`. Save As reached through a conflict gets
-a fresh path ID, and its target can remain inactive. Close-driven Save As
+`path-save-as`, `path-dictionary` or `path-rename`. Save As reached through
+a conflict gets a fresh path ID, and its target can remain inactive.
+Close-driven Save As
 instead retains its existing close ID and close scope. Typing, empty Return
 and input loss keep the current ID. Cancelling and reopening never reuse it.
 Counter exhaustion refuses new path creation with a visible diagnostic and
@@ -679,6 +680,22 @@ Dictionary points authorize the answer, not later worker results: subsequent
 edits or tab changes cannot retarget the supplied path, but do not cancel
 an already accepted read. The Save As job independently rechecks its queued
 point at handoff. A lost reply or disconnect is not job cancellation.
+
+Rename answers use `path HEX_PATH` to supply one literal new basename, not
+an absolute/relative path with slashes. The live prompt pins the originally
+selected directory entry's raw path and metadata observation. Worker-side
+stale-source, invalid-name and existing-destination checks refuse before
+publication. Physical Return and semantic answers both create
+`job=JOB,rename,TAB,REVISION,0,STATUS,CODE`; TAB/REVISION describe the directory
+at admission, not its refreshed listing revision. `complete,-` means kernel
+publication succeeded and open-tab paths followed it, even if the native
+notice reports failed durability/readback or listing refresh. `error` means
+the operation did not confirm success (worker disconnect remains uncertain).
+Read the notice for details. Syscall errors report publication attempted:
+inspect both names before retrying (not all remote filesystems guarantee
+that an error means no rename occurred). There is no cancellation after
+submission, implicit save, overwrite or cross-directory move. Unsaved text
+and history remain intact.
 
 Dictionary Path uses the ordinary bounded read/parser and window-wide
 dictionary replacement. Its job is `job=JOB,dictionary,0,0,0,STATUS,CODE`:

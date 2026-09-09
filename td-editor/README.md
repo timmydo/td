@@ -24,10 +24,12 @@ Directories also open through File > Open or a command-line path, for example
 - Shift-click or Shift+Enter opens it in a new foreground tab.
 - `^` goes to the parent; `g` refreshes; arrow/Emacs movement keys navigate.
 - File > Copy Full File Path copies the directory's own absolute path.
+- `R` or Directory > Rename Entry renames within the current directory,
+  without overwriting existing names; open tabs follow without losing edits.
 
 Already-open files select their existing tab and preserve edits. Listings
 include dotfiles and escape unusual filename bytes; symlink activation is
-refused. Rename and confirmed deletion are not implemented yet. See DESIGN.md
+refused. Confirmed deletion is not implemented yet. See DESIGN.md
 for sorting, resource limits, navigation failure and tab-reuse guarantees.
 
 ### Text editing
@@ -154,8 +156,8 @@ two explicit answers bound to the live dialog and revision. Reload job
 history distinguishes replacement, failure and cancellation; Cancel drops
 the replacement permit, not the read syscall. Conflict Save As takes an
 explicit new destination and leaves the external file untouched. Ordinary
-Open/Save As/Dictionary prompts also accept a literal Path or Cancel answer
-bound to their live ID and revision, including while unfocused. Dictionary
+Open/Save As/Dictionary/Rename prompts also accept a literal Path or Cancel
+answer bound to their live ID and revision, including while unfocused. Dictionary
 jobs report installation or failure without changing document text/history.
 Decoded `key` drives editing and menu/Find/Replace/numeric/command prompts
 through the native handler. It requires real keyboard readiness and pins the
@@ -278,6 +280,15 @@ window prompts are now connected by `session.rs`. It permits one file job at
 a time; additional requests are visibly refused, not queued. Saves acknowledge
 only the snapshot written, so typing during a save leaves newer edits dirty.
 See DESIGN's file-safety section for metadata restrictions and race limits.
+
+Directory `R` or Directory > Rename Entry asks for a new basename in the
+same directory. Existing destinations are never overwritten. Files, links
+and directories retain their contents; open tabs follow the new path,
+including descendants of a renamed directory, without losing unsaved edits
+or undo history. Escape cancels the prompt; submission cannot be cancelled.
+Refresh stale listings with `g`. Remote `path-rename` answers use literal
+OS-byte basenames and report a `rename` job; inspect notices for any
+post-publication durability or listing-refresh warning.
 
 The file adapter also exposes a prepared Reload: dropping it keeps the old
 baseline, while accepting it adopts validated replacement bytes under a new

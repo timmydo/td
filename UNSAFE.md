@@ -84,7 +84,7 @@ an ioctl) the amendment is made here first rather than found in a diff.
 | 11 | `td-profiler` | `close(2)`, `mmap(2)`, `munmap(2)`, `ioctl(2)` with four pinned requests, `setgroups(2)`, `setgid(2)`, `setuid(2)`, `clock_gettime(2)`, `perf_event_open(2)`, `socket(2)`, `bind(2)`, `recvfrom(2)` for fixed kernel CPU notifications |
 | 12 | `td-portal` | `recvmsg(2)`, `sendmsg(2)`, `close(2)` for bounded Wayland transfer and credential replies; one scoped received-descriptor adoption |
 | 13 | `td-audio` | `ioctl(2)` with eleven value-pinned PCM requests, `poll(2)`, `getsockopt(2)` pinned to `SOL_SOCKET`/`SO_PEERCRED` |
-| 14 | `td-editor` | `recvmsg(2)`, `sendmsg(2)`, `fcntl(2)` pinned to `F_DUPFD_CLOEXEC`, `F_GETFL` and `F_SETFL`, `flistxattr(2)` pinned to a size-only query; plus one scoped descriptor adoption |
+| 14 | `td-editor` | `recvmsg(2)`, `sendmsg(2)`, `fcntl(2)` pinned to `F_DUPFD_CLOEXEC`, `F_GETFL` and `F_SETFL`, `flistxattr(2)` pinned to a size-only query, `renameat2(2)` pinned to same-parent `RENAME_NOREPLACE`; plus one scoped descriptor adoption |
 | 15 | `td-secret` | shared `recvmsg(2)`, `sendmsg(2)`, `close(2)` transport and scoped adoption for bounded credential replies; plus the named credential intake module of §16 |
 | 16 | `td-authd` | `recvmsg(2)`, `setsockopt(2)` with fixed `SO_PASSCRED`/`SO_PASSPIDFD`, `getsockopt(2)` with fixed `SO_PEERCRED`, and `poll(2)` on the peer pidfd; one scoped descriptor adoption; a separate mount instruction/adoption for `unshare(2)`, `open_tree(2)`, `mount_setattr(2)`, and `move_mount(2)` with the fixed portal file-grant values below; plus the separate named credential intake module below |
 | 17 | `td-mail` | `ioctl(2)` (three pinned requests), `poll(2)` — td-sh's terminal half, in `term_sys.rs` |
@@ -2191,9 +2191,9 @@ amendment here and in `APPLICATIONS.md` §K in the same landing.
 
 ## 14. `td-editor` — the Wayland scratch editor
 
-The editor's `sys.rs` carries exactly FOUR x86-64 Linux syscalls through one
+The editor's `sys.rs` carries exactly FIVE x86-64 Linux syscalls through one
 function-scoped instruction: `recvmsg` (47), `sendmsg` (46), `fcntl` (72),
-and `flistxattr` (196).
+`flistxattr` (196), and `renameat2` (316).
 A second function-scoped allowance adopts newly installed nonnegative
 descriptors into `OwnedFd`. Safe `std` owns connection setup, byte-only sends,
 timeouts, file creation/unlinking, positional pixel writes, and every close.
@@ -2201,7 +2201,7 @@ No raw pointer or unowned received descriptor escapes this private module.
 Other architectures are refused at compile time rather than inheriting its
 ABI. The core, layout, renderer and controller still have no raw boundary.
 
-`flistxattr` is the file adapter's only raw operation. `files.rs` alone calls
+`flistxattr` is the file adapter's attribute query. `files.rs` alone calls
 `has_attributes` with a borrowed, opened regular file: the destination before
 replacement and the prepared/published temporary inode. The wrapper fixes
 both list pointer and size to zero, returns whether the kernel reports any
@@ -2213,6 +2213,21 @@ open/read/write, hard-link publication, rename, unlink and sync use `std` too.
 An unsupported query refuses saving, not just replacement. Attributes hidden
 from the calling credentials are not proven absent by Linux's listing API;
 the exact supported-file boundary is recorded in `td-editor/DESIGN.md`.
+
+`files.rs` alone also calls `rename_entry`, borrowing one opened directory
+and two literal Unix basenames. The wrapper rejects empty, dot, dot-dot,
+slash-containing, NUL-containing and over-4096-byte names, owns both C
+strings across the call, fixes both directory arguments to the same borrowed
+descriptor, and fixes flags to `RENAME_NOREPLACE` (1). It cannot overwrite,
+exchange, move across parents, follow a final symlink, or adopt a descriptor.
+The one instruction now accepts five arguments (r10/r8 for the last two);
+the existing three-argument callers pass zero for both extra registers.
+Unsupported kernels/filesystems return an error; there is no fallback to
+overwriting std rename or a copy/unlink sequence. Source observations and
+no-follow O_PATH handles use safe std; they detect stale entries but cannot
+provide a source-inode compare-and-swap against a same-authority racer.
+After kernel success the worker always reports publication and updates file
+paths, even when sync/readback fails. See the editor rename contract.
 
 The inherited-stream `fcntl` caller is pinned to `F_DUPFD_CLOEXEC` (1030),
 minimum descriptor 3. It duplicates the borrowed `WAYLAND_SOCKET` descriptor;
@@ -2302,7 +2317,7 @@ control test checks cleanup beyond unrecognized records and invalid entries.
 
 No mmap, ioctl, GPU access, poll, close syscall, credential call, child exec,
 raw environment-fd adoption or other received-fd consumer is authorized here. A
-fifth syscall, fourth fcntl command, another caller, incoming descriptor
+sixth syscall, fourth fcntl command, another caller, incoming descriptor
 consumer, or additional allowance amends this section and
 `td-editor/DESIGN.md` in the same landing.
 

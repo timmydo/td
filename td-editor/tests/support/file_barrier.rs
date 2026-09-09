@@ -52,7 +52,7 @@ impl Barrier {
                 let kind = fields.next().unwrap();
                 assert!(matches!(
                     kind,
-                    "open" | "dictionary" | "save" | "reload" | "queued-save"
+                    "open" | "dictionary" | "save" | "reload" | "rename" | "queued-save"
                 ));
                 assert_eq!(fields.next(), None);
                 let hold = {
@@ -107,6 +107,94 @@ impl Drop for Barrier {
             let _ = thread.join();
         }
     }
+}
+
+#[test]
+#[ignore = "ready builds the isolated test-file-barrier editor"]
+fn admitted_rename_preserves_edits_focus_and_duplicate_directory_views() {
+    let compositor_directory = Directory::new();
+    let directory = Directory::new();
+    let mut compositor = Compositor::start(&compositor_directory);
+    let mut barrier = Barrier::start(&directory);
+    let root = directory.0.join("browse");
+    std::fs::create_dir(&root).unwrap();
+    let file = root.join("draft");
+    let destination = root.join("renamed");
+    let dictionary = directory.0.join("dictionary");
+    std::fs::write(&file, b"disk").unwrap();
+    std::fs::write(&dictionary, b"disk\n").unwrap();
+    let mut editor = EditorProcess::start_with_barrier(
+        &directory,
+        &compositor.directory.join("wayland-0"),
+        &file,
+        &dictionary,
+        "emacs",
+        Some(&barrier.path),
+    );
+    editor.wait_keyboard("emacs");
+    let window = compositor.window();
+    assert_eq!(compositor.request("fullscreen", 1024), b"ok\n");
+    editor.wait_field("state", "window", "800,576,1");
+    editor.ok("insert\t1\t0\t0\t0\t61");
+    for _ in 0..2 {
+        editor.job(&format!(
+            "open\t{}",
+            td_editor::control::hex(root.as_os_str().as_encoded_bytes())
+        ));
+    }
+    editor.ok("select-tab\t2\t0");
+    compositor.chord(Some(KEY_LEFT_SHIFT), 19);
+    editor.wait_field("prompt-state", "prompt", "path-rename");
+    let state = editor.ok("state");
+    let dialog = field(&state, "dialog").unwrap().split(',').next().unwrap();
+    barrier.arm("rename");
+    let started = Instant::now();
+    let response = editor
+        .request(&format!(
+            "dialog-answer\t{dialog}\t2\t0\tpath\t72656e616d6564"
+        ))
+        .unwrap();
+    let job = response.strip_prefix("pending\t").unwrap();
+    let held = barrier.held();
+    let state = editor.ok("state");
+    assert!(state
+        .split('\t')
+        .any(|field| field == format!("job={job},rename,2,0,0,pending,-")));
+    editor.ok("select-tab\t1\t1");
+    editor.ok("insert\t1\t1\t1\t1\t62");
+    editor.wait_tab(2, "abdisk");
+    compositor.chord(Some(KEY_LEFT_CTRL), KEY_SPACE);
+    compositor.chord(Some(KEY_LEFT_CTRL), 45); // C-x prefix, with an active mark.
+    editor.wait_field("state", "prefix", "1");
+    let state = editor.ok("state");
+    assert_eq!(field(&state, "line-numbers"), Some("1"));
+    let view = field(&state, "view").unwrap().to_owned();
+    assert_eq!(std::fs::read(&file).unwrap(), b"disk");
+    assert!(!destination.exists());
+    assert!(started.elapsed() < Duration::from_secs(4));
+    let before = compositor.observe(&window);
+    barrier.release(held);
+    assert_eq!(
+        editor.wait_job(job),
+        format!("job={job},rename,2,0,0,complete,-")
+    );
+    editor.wait_field("state", "active", "1");
+    editor.wait_field("state", "prefix", "1");
+    editor.wait_field("state", "view", &view);
+    editor.wait_field("state", "tab", "1,2,1,6,2,2,0,72,0,lf");
+    wait_directory_rows(&mut editor, 2, 1, &["renamed"]);
+    wait_directory_rows(&mut editor, 3, 1, &["renamed"]);
+    // The default two-digit gutter plus gap moves text 24px right.
+    compositor.rendered_tab_text_at(&mut editor, &window, (1, 2, 32), before, "abdisk", 2);
+    compositor.chord(Some(KEY_LEFT_CTRL), KEY_G);
+    assert!(!file.exists());
+    assert_eq!(std::fs::read(&destination).unwrap(), b"disk");
+    editor.job("save\t1\t2");
+    assert_eq!(std::fs::read(&destination).unwrap(), b"abdisk");
+    assert!(!file.exists());
+    editor.quit();
+    barrier.finish();
+    compositor.stop();
 }
 
 #[test]

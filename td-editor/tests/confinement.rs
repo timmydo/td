@@ -213,7 +213,7 @@ fn source_inventory_and_allowances_are_closed() {
             raw_tokens,
             match name.as_str() {
                 "lib.rs" => 1,
-                "files.rs" => 1,
+                "files.rs" => 2,
                 "wayland.rs" => 4,
                 "transfer.rs" => 2,
                 _ => 0,
@@ -231,7 +231,7 @@ fn complete_raw_layer_and_production_callers_are_pinned() {
         (h ^ u64::from(b)).wrapping_mul(0x100000001b3)
     });
     assert_eq!(
-        hash, 0xc1b0a580e9da8ee8,
+        hash, 0x8026c52796f74e05,
         "review the complete raw layer before updating its fingerprint"
     );
     for pin in [
@@ -239,13 +239,18 @@ fn complete_raw_layer_and_production_callers_are_pinned() {
         "const SYS_RECVMSG: usize = 47;",
         "const SYS_FCNTL: usize = 72;",
         "const SYS_FLISTXATTR: usize = 196;",
+        "const SYS_RENAMEAT2: usize = 316;",
+        "const RENAME_NOREPLACE: usize = 1;",
+        "in(\"r10\") a4,",
+        "in(\"r8\") a5,",
+        "syscall5(number, a1, a2, a3, 0, 0)",
         "syscall3(SYS_FLISTXATTR, file.as_raw_fd() as usize, 0, 0)",
         "const F_DUPFD_CLOEXEC: usize = 1030;",
         "const F_GETFL: usize = 3;",
         "const F_SETFL: usize = 4;",
         "const O_NONBLOCK: usize = 0o4000;",
         "const O_ACCMODE: usize = 3;",
-        "#[allow(unsafe_code)]\nfn syscall3(",
+        "#[allow(unsafe_code)]\nfn syscall5(",
         "#[allow(unsafe_code)]\nfn adopt(",
     ] {
         assert!(raw.contains(pin), "{pin}");
@@ -269,7 +274,13 @@ fn complete_raw_layer_and_production_callers_are_pinned() {
     );
     let files = include_str!("../src/files.rs");
     assert_eq!(files.matches("crate::sys::has_attributes(file)").count(), 1);
-    assert_eq!(files.matches("crate::sys::").count(), 1);
+    assert_eq!(files.matches("crate::sys::").count(), 2);
+    assert_eq!(
+        files
+            .matches("crate::sys::rename_entry(&location.parent, from_name, name)")
+            .count(),
+        1
+    );
     for pin in [
         "const O_NOFOLLOW: i32 = 0o400000;",
         "const O_NONBLOCK: i32 = 0o4000;",

@@ -12,6 +12,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 const O_NOFOLLOW: i32 = 0o400000;
 const O_NONBLOCK: i32 = 0o4000;
 const O_DIRECTORY: i32 = 0o200000;
+const O_PATH: i32 = 0o10000000;
 const BASELINE_BYTES: usize = 64 * 1024 * 1024;
 const MAX_FILES: usize = 64;
 static TEMP_SERIAL: AtomicU64 = AtomicU64::new(1);
@@ -82,7 +83,7 @@ impl std::fmt::Display for Failure {
 impl std::error::Error for Failure {}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct Stamp {
+pub(crate) struct Stamp {
     dev: u64,
     ino: u64,
     uid: u32,
@@ -95,7 +96,7 @@ struct Stamp {
 }
 
 impl Stamp {
-    fn read(meta: &Metadata) -> Self {
+    pub(crate) fn read(meta: &Metadata) -> Self {
         Self {
             dev: meta.dev(),
             ino: meta.ino(),
@@ -189,6 +190,75 @@ struct Entry {
     // Pin the inode so removal cannot recycle its identity into another file.
     _baseline_file: Option<File>,
     bytes: Vec<u8>,
+    rename_uncertain: bool,
+}
+
+/// A no-follow source observation. A rename refuses if this observation is
+/// stale; callers must capture it when selecting the entry, not on approval.
+#[derive(Clone)]
+pub struct RenameSource {
+    path: PathBuf,
+    parent_identity: (u64, u64),
+    stamp: Stamp,
+}
+
+impl RenameSource {
+    pub fn inspect(path: &Path) -> Result<Self> {
+        let location = Location::resolve(path)?;
+        let stamp = Stamp::read(&fs::symlink_metadata(&location.path)?);
+        location.check_parent()?;
+        Ok(Self::observed(
+            location.path,
+            location.parent_identity,
+            stamp,
+        ))
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub(crate) fn observed(path: PathBuf, parent_identity: (u64, u64), stamp: Stamp) -> Self {
+        Self {
+            path,
+            parent_identity,
+            stamp,
+        }
+    }
+
+    fn check(&self, location: &Location, node: &File) -> Result<()> {
+        location.check_parent()?;
+        if location.path != self.path
+            || location.parent_identity != self.parent_identity
+            || Stamp::read(&node.metadata()?) != self.stamp
+            || Stamp::read(&fs::symlink_metadata(&location.path)?) != self.stamp
+        {
+            return Err(Failure::new(
+                Kind::Conflict,
+                "rename source changed; refresh and retry",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Kernel publication succeeded. Even when durability/readback cannot be
+/// confirmed, associations follow the new name; there is no rollback rename.
+pub struct Renamed {
+    pub from: PathBuf,
+    pub to: PathBuf,
+    pub warning: Option<String>,
+}
+
+impl Renamed {
+    pub fn relocated(&self, path: &Path) -> Option<PathBuf> {
+        let suffix = path.strip_prefix(&self.from).ok()?;
+        Some(if suffix.as_os_str().is_empty() {
+            self.to.clone()
+        } else {
+            self.to.join(suffix)
+        })
+    }
 }
 
 impl Entry {
@@ -282,6 +352,162 @@ impl Default for Session {
 }
 
 impl Session {
+    /// Rename within the same directory, preserving the inode and all bytes.
+    /// Existing destinations and paths reserved by other tabs are refused.
+    pub fn rename(&mut self, source: RenameSource, name: &std::ffi::OsStr) -> Result<Renamed> {
+        self.rename_with(source, name, |_| Ok(()))
+    }
+
+    fn rename_with(
+        &mut self,
+        source: RenameSource,
+        name: &std::ffi::OsStr,
+        mut step: impl FnMut(Stage) -> io::Result<()>,
+    ) -> Result<Renamed> {
+        let raw = name.as_bytes();
+        if raw.is_empty()
+            || raw.len() > 4096
+            || raw == b"."
+            || raw == b".."
+            || raw.contains(&b'/')
+            || raw.contains(&0)
+        {
+            return Err(Failure::new(
+                Kind::InvalidPath,
+                "rename requires a new basename, not a path",
+            ));
+        }
+        let location = Location::resolve(&source.path)?;
+        let parent = location
+            .path
+            .parent()
+            .ok_or_else(|| Failure::new(Kind::InvalidPath, "rename source has no parent"))?;
+        let from_name = location
+            .path
+            .file_name()
+            .ok_or_else(|| Failure::new(Kind::InvalidPath, "rename source has no basename"))?;
+        let to = parent.join(name);
+        if to.as_os_str().as_bytes().len() > 4096 {
+            return Err(Failure::new(
+                Kind::InvalidPath,
+                "renamed path exceeds 4096 bytes",
+            ));
+        }
+        if to == source.path {
+            return Err(Failure::new(
+                Kind::Exists,
+                "rename destination is the source",
+            ));
+        }
+        let node = OpenOptions::new()
+            .read(true)
+            .custom_flags(O_PATH | O_NOFOLLOW)
+            .open(&location.path)?;
+        source.check(&location, &node)?;
+        let directory = source.stamp.mode & 0o170000 == 0o040000;
+        let mut paths = BTreeMap::new();
+        for (&id, entry) in &self.entries {
+            let path = &entry.location.path;
+            if path == &to || (directory && path.starts_with(&to)) {
+                return Err(Failure::new(
+                    Kind::Exists,
+                    "rename destination belongs to an open association",
+                ));
+            }
+            let moved = if path == &source.path {
+                if entry.rename_uncertain || entry.stamp.as_ref() != Some(&source.stamp) {
+                    return Err(Failure::new(
+                        Kind::Conflict,
+                        "open file changed since its last load/save",
+                    ));
+                }
+                let baseline = entry._baseline_file.as_ref().ok_or_else(|| {
+                    Failure::new(Kind::Conflict, "open file has no retained inode")
+                })?;
+                compare_stable(baseline, &source.stamp, &entry.bytes)?;
+                Some(to.clone())
+            } else if directory {
+                path.strip_prefix(&source.path)
+                    .ok()
+                    .map(|suffix| to.join(suffix))
+            } else {
+                None
+            };
+            if let Some(moved) = moved {
+                if moved.as_os_str().as_bytes().len() > 4096 {
+                    return Err(Failure::new(
+                        Kind::Limit,
+                        "renamed open-file path exceeds 4096 bytes",
+                    ));
+                }
+                entry.location.check_parent()?;
+                paths.insert(id, moved);
+            }
+        }
+        step(Stage::Recheck)?;
+        source.check(&location, &node)?;
+        step(Stage::Publish)?;
+        crate::sys::rename_entry(&location.parent, from_name, name).map_err(|error| {
+            let mut failure = if error.kind() == io::ErrorKind::AlreadyExists {
+                Failure::new(
+                    Kind::Exists,
+                    "rename never overwrites an existing destination",
+                )
+            } else {
+                Failure::from(error)
+            };
+            failure.publication_attempted = true;
+            failure
+        })?;
+
+        // Once published, every outcome carries the new path. A failed
+        // readback retains the old baseline stamp so Save detects conflict.
+        let confirmed = (|| -> Result<Stamp> {
+            step(Stage::SyncParent)?;
+            location.parent.sync_all()?;
+            step(Stage::Readback)?;
+            location.check_parent()?;
+            let stamp = Stamp::read(&node.metadata()?);
+            let mut expected = source.stamp.clone();
+            expected.ctime = stamp.ctime;
+            if stamp != expected || Stamp::read(&fs::symlink_metadata(&to)?) != stamp {
+                return Err(Failure::new(
+                    Kind::Conflict,
+                    "renamed entry changed during publication",
+                ));
+            }
+            if let Some(entry) = self
+                .entries
+                .values()
+                .find(|entry| entry.location.path == source.path)
+            {
+                let file = entry._baseline_file.as_ref().ok_or_else(|| {
+                    Failure::new(Kind::Conflict, "open file has no retained inode")
+                })?;
+                compare_stable(file, &stamp, &entry.bytes)?;
+            }
+            Ok(stamp)
+        })();
+        for (id, path) in paths {
+            if let Some(entry) = self.entries.get_mut(&id) {
+                if entry.location.path == source.path {
+                    entry.rename_uncertain = confirmed.is_err();
+                    if let Ok(stamp) = &confirmed {
+                        entry.stamp = Some(stamp.clone());
+                    }
+                }
+                entry.location.path = path;
+            }
+        }
+        Ok(Renamed {
+            from: source.path,
+            to,
+            warning: confirmed
+                .err()
+                .map(|error| format!("Rename published; confirmation failed: {error}")),
+        })
+    }
+
     pub fn baseline_bytes(&self) -> usize {
         self.entries.values().map(|e| e.bytes.len()).sum()
     }
@@ -408,6 +634,7 @@ impl Session {
             stamp,
             _baseline_file: baseline_file,
             bytes,
+            rename_uncertain: false,
         })
     }
 
@@ -434,6 +661,12 @@ impl Session {
         let entry = self.entry(id)?;
         self.admit(entry.bytes.len(), bytes.len())?;
         validate(&bytes)?;
+        if target.is_none() && entry.rename_uncertain {
+            return Err(Failure::new(
+                Kind::Conflict,
+                "rename confirmation failed; Reload or Save As before saving",
+            ));
+        }
         let location = target.as_ref().unwrap_or(&entry.location);
         let expected = if target.is_some() {
             None
@@ -549,6 +782,7 @@ impl Session {
         entry.stamp = Some(stamp);
         entry._baseline_file = Some(temporary.file);
         entry.bytes = bytes;
+        entry.rename_uncertain = false;
         Ok(())
     }
 }
@@ -875,6 +1109,145 @@ mod tests {
     impl Drop for Directory {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn rename_preserves_inode_baseline_and_later_save_destination() {
+        let dir = Directory::new();
+        let old = dir.write("old", b"\xef\xbb\xbfbody\r\n");
+        let mut files = Session::default();
+        let id = files.open(&old).unwrap();
+        let before = fs::metadata(&old).unwrap();
+        let outcome = files
+            .rename(RenameSource::inspect(&old).unwrap(), "new".as_ref())
+            .unwrap();
+        assert!(outcome.warning.is_none());
+        assert_eq!(
+            outcome.relocated(&old).unwrap().as_os_str().as_bytes(),
+            dir.path("new").as_os_str().as_bytes()
+        );
+        assert_eq!(files.path(id).unwrap(), dir.path("new"));
+        assert_eq!(files.bytes(id).unwrap(), b"\xef\xbb\xbfbody\r\n");
+        assert_eq!(before.ino(), fs::metadata(dir.path("new")).unwrap().ino());
+        assert!(!old.exists());
+        files.save(id, b"edited\n".to_vec()).unwrap();
+        assert_eq!(fs::read(dir.path("new")).unwrap(), b"edited\n");
+        assert!(!old.exists());
+        dir.no_temporaries();
+    }
+
+    #[test]
+    fn rename_refuses_existing_reserved_invalid_and_stale_sources() {
+        let dir = Directory::new();
+        let old = dir.write("old", b"body");
+        dir.write("taken", b"other");
+        let mut files = Session::default();
+        files.open(&dir.path("reserved")).unwrap();
+        for name in [
+            "taken",
+            "reserved",
+            "old",
+            "",
+            ".",
+            "..",
+            "a/b",
+            "bad\0name",
+        ] {
+            assert!(files
+                .rename(RenameSource::inspect(&old).unwrap(), name.as_ref())
+                .is_err());
+            assert_eq!(fs::read(&old).unwrap(), b"body");
+            assert_eq!(fs::read(dir.path("taken")).unwrap(), b"other");
+        }
+        let source = RenameSource::inspect(&old).unwrap();
+        fs::write(&old, b"changed").unwrap();
+        assert_eq!(
+            files.rename(source, "new".as_ref()).err().unwrap().kind,
+            Kind::Conflict
+        );
+        assert!(!dir.path("new").exists());
+        let source = RenameSource::inspect(&old).unwrap();
+        let failure = files
+            .rename_with(source, "raced".as_ref(), |stage| {
+                if stage == Stage::Publish {
+                    fs::write(dir.path("raced"), b"racer")?;
+                }
+                Ok(())
+            })
+            .err()
+            .unwrap();
+        assert_eq!(failure.kind, Kind::Exists);
+        assert!(!failure.published && failure.publication_attempted);
+        assert_eq!(fs::read(dir.path("raced")).unwrap(), b"racer");
+        assert_eq!(fs::read(&old).unwrap(), b"changed");
+    }
+
+    #[test]
+    fn rename_symlink_and_directory_rebase_without_following_or_refreshing_children() {
+        let dir = Directory::new();
+        let target = dir.write("target", b"target");
+        symlink(&target, dir.path("link")).unwrap();
+        let mut files = Session::default();
+        let raw = std::ffi::OsString::from_vec(b"link-\xff\n".to_vec());
+        let moved = files
+            .rename(RenameSource::inspect(&dir.path("link")).unwrap(), &raw)
+            .unwrap();
+        assert!(moved.warning.is_none());
+        assert_eq!(fs::read_link(&moved.to).unwrap(), target);
+        assert_eq!(fs::read(&target).unwrap(), b"target");
+        fs::create_dir_all(dir.path("tree/sub")).unwrap();
+        dir.write("tree/sub/file", b"original");
+        let id = files.open(&dir.path("tree/sub/file")).unwrap();
+        let missing = files.open(&dir.path("tree/sub/missing")).unwrap();
+        let outcome = files
+            .rename(
+                RenameSource::inspect(&dir.path("tree")).unwrap(),
+                "forest".as_ref(),
+            )
+            .unwrap();
+        assert!(outcome.warning.is_none());
+        assert_eq!(files.path(id).unwrap(), dir.path("forest/sub/file"));
+        assert_eq!(files.path(missing).unwrap(), dir.path("forest/sub/missing"));
+        files.save(id, b"edited".to_vec()).unwrap();
+        files.save(missing, b"created".to_vec()).unwrap();
+        assert_eq!(fs::read(dir.path("forest/sub/file")).unwrap(), b"edited");
+        assert_eq!(
+            fs::read(dir.path("forest/sub/missing")).unwrap(),
+            b"created"
+        );
+        assert!(!dir.path("tree").exists());
+    }
+
+    #[test]
+    fn rename_published_failures_keep_new_path_and_force_explicit_recovery() {
+        for failure in [Stage::SyncParent, Stage::Readback] {
+            let dir = Directory::new();
+            let old = dir.write("old", b"body");
+            let mut files = Session::default();
+            let id = files.open(&old).unwrap();
+            let source = RenameSource::inspect(&old).unwrap();
+            let outcome = files
+                .rename_with(source, "new".as_ref(), |stage| {
+                    if stage == failure {
+                        return Err(io::Error::other("injected"));
+                    }
+                    Ok(())
+                })
+                .unwrap();
+            assert!(outcome.warning.unwrap().contains("Rename published"));
+            assert_eq!(files.path(id).unwrap(), dir.path("new"));
+            assert_eq!(files.bytes(id).unwrap(), b"body");
+            assert_eq!(
+                files.save(id, b"edit".to_vec()).err().unwrap().kind,
+                Kind::Conflict
+            );
+            assert_eq!(fs::read(dir.path("new")).unwrap(), b"body");
+            assert!(!old.exists());
+            files
+                .save_as(id, &dir.path("recovered"), b"edit".to_vec())
+                .unwrap();
+            assert_eq!(fs::read(dir.path("recovered")).unwrap(), b"edit");
         }
     }
 

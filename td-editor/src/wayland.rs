@@ -374,6 +374,7 @@ enum ControlFile {
     Save(u64),
     Reload(u64),
     Dictionary(u64),
+    Rename(u64),
 }
 
 enum ControlAnswer {
@@ -385,6 +386,7 @@ enum ControlAnswer {
 enum PathAction {
     Open,
     Dictionary,
+    Rename(crate::files::RenameSource),
     Save {
         tab: crate::model::TabId,
         revision: u64,
@@ -407,6 +409,7 @@ impl PathPrompt {
             PathAction::Open => "Open",
             PathAction::Dictionary => "Dictionary",
             PathAction::Save { .. } => "Save As",
+            PathAction::Rename(_) => "Rename",
         };
         let header = if !paused.is_empty() {
             paused.to_string()
@@ -433,11 +436,6 @@ impl PathPrompt {
     }
 
     fn notice(&self) -> String {
-        let action = match self.action {
-            PathAction::Open => "Open",
-            PathAction::Dictionary => "Dictionary (read only)",
-            PathAction::Save { .. } => "Save As (new path only)",
-        };
         // Keep the insertion end visible even for a long path. The full literal
         // value, never this presentation, is passed to the worker.
         let start = self
@@ -447,6 +445,21 @@ impl PathPrompt {
             .nth(159)
             .map_or(0, |(i, _)| i);
         let tail = self.text.get(start..).unwrap_or_default();
+        let action = match &self.action {
+            PathAction::Open => "Open",
+            PathAction::Dictionary => "Dictionary (read only)",
+            PathAction::Save { .. } => "Save As (new path only)",
+            PathAction::Rename(source) => {
+                let label: String = format!(
+                    "{:?}",
+                    source.path().file_name().unwrap_or(source.path().as_os_str())
+                )
+                .chars()
+                .take(80)
+                .collect();
+                return format!("Rename {label}\nNew basename only; existing names refused\nReturn: submit; Escape/Ctrl+G: cancel; Ctrl+U: clear\n{tail}|");
+            }
+        };
         format!("{action}: literal path; Tab completes; no shell expansion\nReturn: submit; Escape/Ctrl+G: cancel; Ctrl+U: clear\n{}{}|", if tail.len() < self.text.len() { "..." } else { "" }, tail)
     }
 }
@@ -1404,12 +1417,13 @@ impl Window {
         let doc = self.ui.editor().document(tab).map_err(error)?;
         let revision = doc.revision();
         let directory = doc.directory();
-        if directory
-            && !self.ui.keys().pending() && matches!(chord, "w" | "s" | "S")
-        {
+        if directory && !self.ui.keys().pending() && matches!(chord, "w" | "s" | "S" | "R") {
             if !repeated {
-                if chord == "w" { self.clipboard_request("copy-entry-path", tab, revision)?; }
-                else {
+                if chord == "w" {
+                    self.clipboard_request("copy-entry-path", tab, revision)?;
+                } else if chord == "R" {
+                    self.rename_request(tab, revision);
+                } else {
                     let directory = self.files.as_ref().and_then(|files| files.directory(tab));
                     if let Some(directory) = directory {
                         let sort = if chord == "s" { directory.sort.next() } else { directory.sort };
@@ -1613,6 +1627,9 @@ impl Window {
                     ControlFile::Dictionary(id) => self
                         .control_jobs
                         .dictionary(id, result.as_ref().map(|_| ()).map_err(|error| error.code)),
+                    ControlFile::Rename(id) => self
+                        .control_jobs
+                        .renamed(id, result.as_ref().map(|_| ()).map_err(|error| error.code)),
                 };
                 if let Err(detail) = outcome {
                     job_error = Some(detail);
@@ -2534,6 +2551,43 @@ impl Window {
         Ok(id)
     }
 
+    fn control_rename_job(
+        &mut self,
+        target: Target,
+        source: crate::files::RenameSource,
+        name: std::ffi::OsString,
+    ) -> crate::Result<u64> {
+        if self.files.is_none()
+            || self.files.as_ref().is_some_and(|files| files.busy())
+            || self.control_file_job.is_some()
+        {
+            return Err(crate::Error::Unavailable);
+        }
+        self.ui
+            .editor()
+            .revision_point(target.tab, target.revision)?;
+        self.ui.generation().checked_add(2).ok_or(crate::Error::Exhausted)?;
+        let files = self.files.as_mut().ok_or(crate::Error::Unavailable)?;
+        let id = self
+            .control_jobs
+            .begin_rename(target.tab, target.revision)?;
+        let notice = match files.rename(&self.ui, target.tab, target.revision, source, name) {
+            Ok(()) => {
+                self.control_file_job = Some(ControlFile::Rename(id));
+                "Rename pending; open tabs will follow the new path".into()
+            }
+            Err(detail) => {
+                self.control_jobs
+                    .renamed(id, Err(crate::Error::Unavailable))?;
+                format!("Rename refused: {detail}")
+            }
+        };
+        self.stop_pointer();
+        self.control_mutation_accepted();
+        self.notify(notice);
+        Ok(id)
+    }
+
     fn control_dialog_answer(
         &mut self,
         dialog: u64,
@@ -2562,7 +2616,10 @@ impl Window {
             return Err(crate::Error::StaleRevision);
         }
         // Reserve existing cleanup/completion plus the admitted layout change.
-        self.ui.generation().checked_add(2).ok_or(crate::Error::Exhausted)?;
+        self.ui
+            .generation()
+            .checked_add(2)
+            .ok_or(crate::Error::Exhausted)?;
         match answer {
             crate::control::DialogAnswer::Cancel => self.cancel_close(),
             crate::control::DialogAnswer::Discard => {
@@ -2651,10 +2708,13 @@ impl Window {
             crate::control::DialogAnswer::Path(path) => path.clone(),
             _ => return Err(crate::Error::Unavailable),
         };
-        let id = match prompt.action {
+        let id = match &prompt.action {
             PathAction::Open => self.control_open_job(path)?,
             PathAction::Dictionary => self.control_dictionary_job(path)?,
             PathAction::Save { .. } => self.control_save_job(target, Some(path))?,
+            PathAction::Rename(source) => {
+                self.control_rename_job(target, source.clone(), path.into_os_string())?
+            }
         };
         self.prompt = None;
         Ok(ControlAnswer::Job(id))
@@ -2809,6 +2869,7 @@ impl Window {
                         PathAction::Open => "path-open",
                         PathAction::Dictionary => "path-dictionary",
                         PathAction::Save { .. } => "path-save-as",
+                        PathAction::Rename(_) => "path-rename",
                     };
                     if self.ui.editor().check_revision(&identity.point).is_ok() {
                         fields.push_str(&format!(
@@ -2897,6 +2958,7 @@ impl Window {
                 PathAction::Dictionary => "path-dictionary",
                 PathAction::Save { .. } if prompt.identity.is_none() => "close-save-as",
                 PathAction::Save { .. } => "path-save-as",
+                PathAction::Rename(_) => "path-rename",
             };
             snapshot.field = "text";
             snapshot.text = &prompt.text;
@@ -3515,6 +3577,10 @@ impl Window {
                 }
                 return Ok(());
             }
+            Item::RenameEntry => {
+                self.rename_request(tab, revision);
+                return Ok(());
+            }
             Item::Cut | Item::Copy | Item::CopyPath | Item::CopyEntryPath | Item::Paste => {
                 self.clipboard_request(
                     match item {
@@ -4072,6 +4138,54 @@ impl Window {
         self.files.as_ref()?.directory(tab)?.entry(row)
     }
 
+    fn rename_request(&mut self, tab: crate::model::TabId, revision: u64) {
+        let prepared = (|| -> Result<(crate::files::RenameSource, PathIdentity)> {
+            let files = self.files.as_ref().ok_or("Not a file window")?;
+            if files.busy() {
+                return Err("File operation pending; wait before renaming".into());
+            }
+            let doc = self.ui.editor().document(tab).map_err(error)?;
+            let row = doc
+                .text()
+                .get(..doc.selection().caret)
+                .ok_or("Invalid directory selection")?
+                .bytes()
+                .filter(|b| *b == b'\n')
+                .count();
+            let source = files
+                .directory(tab)
+                .and_then(|directory| directory.rename_source(row))
+                .ok_or("No directory entry selected")?;
+            let id = self
+                .last_dialog_id
+                .checked_add(1)
+                .ok_or("Dialog counter exhausted")?;
+            let point = self
+                .ui
+                .editor()
+                .revision_point(tab, revision)
+                .map_err(error)?;
+            Ok((source, PathIdentity { id, point }))
+        })();
+        match prepared {
+            Ok((source, identity)) => {
+                self.last_dialog_id = identity.id;
+                self.menu = None;
+                self.notice = None;
+                self.stop_pointer();
+                self.input.cancel_repeat();
+                self.prompt = Some(PathPrompt {
+                    action: PathAction::Rename(source),
+                    text: String::new(),
+                    identity: Some(identity),
+                    completion: crate::path_completion::State::Idle,
+                });
+                self.frames.invalidate(true);
+            }
+            Err(detail) => self.notify(format!("Rename refused: {detail}")),
+        }
+    }
+
     fn sort_directory(&mut self, tab: crate::model::TabId, revision: u64,
         sort: crate::directory::Sort, reverse: bool) {
         let result = self.files.as_mut().ok_or_else(|| "Not a file window".to_string())
@@ -4201,6 +4315,26 @@ impl Window {
                     self.prompt = Some(prompt);
                     return;
                 }
+                if let PathAction::Rename(source) = &prompt.action {
+                    let result = prompt
+                        .identity
+                        .as_ref()
+                        .ok_or(crate::Error::Unavailable)
+                        .and_then(|identity| {
+                            self.control_rename_job(
+                                Target {
+                                    tab: identity.point.tab,
+                                    revision: identity.point.revision,
+                                },
+                                source.clone(),
+                                std::ffi::OsString::from(&prompt.text),
+                            )
+                        });
+                    if let Err(detail) = result {
+                        self.notify(format!("Rename refused: {detail}"));
+                    }
+                    return;
+                }
                 let Some(files) = &mut self.files else {
                     return;
                 };
@@ -4211,6 +4345,8 @@ impl Window {
                     PathAction::Save { tab, revision } => {
                         files.save(&self.ui, tab, revision, Some(path))
                     }
+                    // Rename returns above through its pinned job helper.
+                    PathAction::Rename(_) => Err("Rename requires a pinned source".into()),
                 };
                 let close_failed = self.closing.is_some() && result.is_err();
                 if self.closing.is_some() {
@@ -4234,6 +4370,10 @@ impl Window {
                 prompt.completion = crate::path_completion::State::Idle;
             }
             "Tab" | "S-Tab" | "Up" | "Down" | "PageUp" | "PageDown" => {
+                if matches!(prompt.action, PathAction::Rename(_)) {
+                    self.prompt = Some(prompt);
+                    return;
+                }
                 let backward = matches!(chord, "S-Tab" | "Up");
                 match &mut prompt.completion {
                     crate::path_completion::State::Pending(_) => {}
@@ -9119,6 +9259,97 @@ mod tests {
     ) -> String {
         let mut client = control_client(path, payload.as_bytes());
         control_answer_pump(w, &mut client, peer, false) // Explicitly withhold background steps.
+    }
+
+    #[test]
+    fn rename_native_immediate_refusal_does_not_claim_a_pending_job() {
+        let dir = DialogDirectory::new();
+        std::fs::create_dir(dir.path("child")).unwrap();
+        let (mut w, _peer) = file_dialog_fixture();
+        configure(&mut w, 800, 600);
+        for path in [dir.path("child"), dir.0.clone()] {
+            w.files.as_mut().unwrap().open(path).unwrap();
+            finish_file(&mut w);
+        }
+        w.chord("R", false).unwrap();
+        w.prompt.as_mut().unwrap().text = "x".repeat(4096);
+        w.path_chord("Return", false);
+        assert!(!w.files.as_ref().unwrap().busy());
+        assert!(w.control_file_job.is_none());
+        assert!(w.prompt.is_none());
+        assert!(w.notice.as_ref().unwrap().starts_with("Rename refused:"));
+        assert!(!w.notice.as_ref().unwrap().contains("pending"));
+        assert!(w.control_jobs.fields().unwrap().contains("job=1,rename,3,0,0,error,unavailable"));
+        assert!(dir.path("child").is_dir());
+    }
+
+    #[test]
+    fn rename_prompt_fences_cancel_repeat_and_native_submission() {
+        for profile in [Profile::Windows, Profile::Emacs] {
+            let dir = DialogDirectory::new();
+            std::fs::write(dir.path("old"), b"disk").unwrap();
+            let (mut w, _peer) = file_dialog_fixture();
+            configure(&mut w, 800, 600);
+            w.ui.dispatch(Event::Profile(profile)).unwrap();
+            w.files.as_mut().unwrap().open(dir.0.clone()).unwrap();
+            finish_file(&mut w);
+            w.chord("R", true).unwrap();
+            assert!(w.prompt.is_none());
+            w.chord("R", false).unwrap();
+            let id = w.last_dialog_id;
+            w.path_chord("n", false);
+            w.path_chord("Tab", false);
+            assert!(w.path_completion.is_none());
+            assert_eq!(
+                w.control_path_answer(
+                    id,
+                    Target {
+                        tab: 2,
+                        revision: 1
+                    },
+                    &crate::control::DialogAnswer::Cancel
+                )
+                .err(),
+                Some(crate::Error::StaleRevision)
+            );
+            assert_eq!(
+                w.control_path_answer(
+                    id + 1,
+                    Target {
+                        tab: 2,
+                        revision: 0
+                    },
+                    &crate::control::DialogAnswer::Cancel
+                )
+                .err(),
+                Some(crate::Error::InvalidArgument)
+            );
+            w.control_path_answer(
+                id,
+                Target {
+                    tab: 2,
+                    revision: 0,
+                },
+                &crate::control::DialogAnswer::Cancel,
+            )
+            .unwrap();
+            assert_eq!(std::fs::read(dir.path("old")).unwrap(), b"disk");
+            w.chord("R", false).unwrap();
+            assert_ne!(id, w.last_dialog_id);
+            w.path_chord("n", false);
+            w.path_chord("Return", true);
+            assert!(w.prompt.is_some());
+            w.path_chord("Return", false);
+            assert!(w.prompt.is_none());
+            finish_file(&mut w);
+            assert!(w
+                .control_jobs
+                .fields()
+                .unwrap()
+                .contains("job=1,rename,2,0,0,complete,-"));
+            assert!(!dir.path("old").exists());
+            assert_eq!(std::fs::read(dir.path("n")).unwrap(), b"disk");
+        }
     }
 
     #[test]

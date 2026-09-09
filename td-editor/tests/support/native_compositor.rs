@@ -37,6 +37,110 @@ fn wait_directory_rows(editor: &mut EditorProcess, tab: u64, revision: u64, name
 
 #[test]
 #[ignore = "ready supplies the disposable native compositor"]
+fn native_directory_rename_keeps_dirty_file_tabs_and_remote_outcomes() {
+    use std::os::unix::ffi::OsStringExt;
+    for profile in ["windows", "emacs"] {
+        let compositor_directory = Directory::new();
+        let directory = Directory::new();
+        let mut compositor = Compositor::start(&compositor_directory);
+        let root = directory.0.join("browse");
+        std::fs::create_dir(&root).unwrap();
+        let file = root.join("old");
+        std::fs::write(&file, b"body").unwrap();
+        let dictionary = directory.0.join("dictionary");
+        std::fs::write(&dictionary, b"body\n").unwrap();
+        let mut editor = EditorProcess::start_with_profile(
+            &directory,
+            &compositor.directory.join("wayland-0"),
+            &file,
+            &dictionary,
+            profile,
+        );
+        editor.wait_keyboard(profile);
+        let window = compositor.window();
+        assert_eq!(compositor.request("fullscreen", 1024), b"ok\n");
+        editor.wait_field("state", "window", "800,576,1");
+        editor.ok("insert\t1\t0\t0\t0\t65646974");
+        editor.job(&format!(
+            "open\t{}",
+            td_editor::control::hex(root.as_os_str().as_encoded_bytes())
+        ));
+        wait_directory_rows(&mut editor, 2, 0, &["old"]);
+        compositor.chord(Some(KEY_LEFT_SHIFT), 19); // R, in both profiles.
+        editor.wait_field("prompt-state", "prompt", "path-rename");
+        let state = editor.ok("state");
+        let dialog = field(&state, "dialog")
+            .unwrap()
+            .split(',')
+            .next()
+            .unwrap()
+            .to_owned();
+        editor.ok(&format!("dialog-answer\t{dialog}\t2\t0\tcancel"));
+        assert_eq!(std::fs::read(&file).unwrap(), b"body");
+        // A delivered decoded key opens the same prompt; it cannot answer it.
+        let state = editor.ok("state");
+        editor.ok(&format!(
+            "key\t2\t0\t{}\t52",
+            field(&state, "input-generation").unwrap()
+        ));
+        editor.wait_field("prompt-state", "prompt", "path-rename");
+        let state = editor.ok("state");
+        let next = field(&state, "dialog")
+            .unwrap()
+            .split(',')
+            .next()
+            .unwrap()
+            .to_owned();
+        assert_ne!(dialog, next);
+        assert!(editor
+            .request(&format!("dialog-answer\t{dialog}\t2\t0\tpath\t6e6577"))
+            .unwrap()
+            .starts_with("error\tinvalid-argument"));
+        let reply = editor
+            .request(&format!("dialog-answer\t{next}\t2\t0\tpath\t6f6c64"))
+            .unwrap();
+        let job = reply.strip_prefix("pending\t").unwrap();
+        assert!(editor
+            .wait_job_outcome(job, ",error,unavailable")
+            .contains(",rename,2,0,0,"));
+        assert_eq!(std::fs::read(&file).unwrap(), b"body");
+        compositor.click(270, 32);
+        editor.wait_field("state", "modal", "0,0,0,0,1,0,0,0,0");
+        compositor.click(270, 180); // Directory > Rename Entry.
+        editor.wait_field("prompt-state", "prompt", "path-rename");
+        let state = editor.ok("state");
+        let dialog = field(&state, "dialog").unwrap().split(',').next().unwrap();
+        let before = compositor.observe(&window);
+        assert!(editor
+            .job(&format!("dialog-answer\t{dialog}\t2\t0\tpath\t6e65772dff"))
+            .contains(",rename,2,0,0,complete,-"));
+        let listing = wait_directory_rows(&mut editor, 2, 1, &["new-\\xff"]);
+        compositor.rendered_tab_text(&mut editor, &window, (2, 1), before, &listing[..10], 0);
+        let destination = root.join(std::ffi::OsString::from_vec(b"new-\xff".to_vec()));
+        editor.wait_field(
+            "state",
+            "directory-entry",
+            &format!(
+                "2,{}",
+                td_editor::control::hex(destination.as_os_str().as_encoded_bytes())
+            ),
+        );
+        assert!(!file.exists());
+        assert_eq!(std::fs::read(&destination).unwrap(), b"body");
+        assert_eq!(editor.ok("text\t1\t1\t0\t100"), "8\t65646974626f6479");
+        editor.ok("select-tab\t1\t1");
+        editor.ok("undo\t1\t1");
+        editor.ok("redo\t1\t2");
+        editor.job("save\t1\t3");
+        assert_eq!(std::fs::read(&destination).unwrap(), b"editbody");
+        assert!(!file.exists());
+        editor.quit();
+        compositor.stop();
+    }
+}
+
+#[test]
+#[ignore = "ready supplies the disposable native compositor"]
 fn native_directory_details_sort_and_copy_selected_entry() {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     for profile in ["windows", "emacs"] {
@@ -806,6 +910,18 @@ impl Compositor {
         text: &str,
         caret: usize,
     ) {
+        self.rendered_tab_text_at(editor, window, (tab, revision, 8), after, text, caret);
+    }
+
+    fn rendered_tab_text_at(
+        &self,
+        editor: &mut EditorProcess,
+        window: &str,
+        (tab, revision, left): (u64, u64, usize),
+        after: Observation,
+        text: &str,
+        caret: usize,
+    ) {
         let state = editor.ok("state");
         let generation = field(&state, "window-generation").unwrap();
         let frame = editor.ok(&format!("wait-frame\t{generation}"));
@@ -816,7 +932,7 @@ impl Compositor {
         );
         let expected = text_pixels(text);
         let width = text.len() * 8;
-        assert!(caret <= text.len());
+        assert!(caret <= text.len() && left + width <= 800);
         let deadline = Instant::now() + TIMEOUT;
         loop {
             assert!(
@@ -845,7 +961,7 @@ impl Compositor {
                     if x == caret * 8 {
                         return true;
                     }
-                    let source = ((y + 72) * 800 + x + 8) * 3;
+                    let source = ((y + 72) * 800 + x + left) * 3;
                     let target = (y * width + x) * 4;
                     pixels[source..source + 3]
                         == [expected[target + 2], expected[target + 1], expected[target]]

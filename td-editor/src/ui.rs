@@ -203,6 +203,50 @@ impl Controller {
         Ok(outcome)
     }
 
+    /// Incidental listing replacement must not switch geometry or reset input
+    /// belonging to an unrelated tab while a filesystem job was running.
+    pub(crate) fn refresh_directory(
+        &mut self,
+        point: crate::model::RevisionPoint,
+        bytes: &[u8],
+        caret: usize,
+    ) -> Result<()> {
+        let generation = self.generation.checked_add(1).ok_or(Error::Exhausted)?;
+        let active = self.editor.active().ok_or(Error::MissingTab)?;
+        let tab = point.tab;
+        let revision = point.revision.checked_add(1).ok_or(Error::Exhausted)?;
+        // Listing bytes are escaped ASCII, so decoding cannot move a caret
+        // boundary. All remaining admission is inside the atomic model Open.
+        if !bytes.is_ascii() || bytes.contains(&b'\r') || caret > bytes.len() {
+            return Err(Error::InvalidArgument);
+        }
+        self.editor.open(crate::model::Open {
+            source: Some(point),
+            bytes,
+            missing: false,
+            directory: true,
+            existing: None,
+        })?;
+        self.editor.select_tab(active)?;
+        self.editor.dispatch(
+            tab,
+            revision,
+            Command::Select(Selection {
+                anchor: caret,
+                caret,
+            }),
+        )?;
+        self.tabs.remove(&tab);
+        if active == tab {
+            self.reset_input();
+            self.wake_caret();
+        }
+        // Active identity/geometry never changed at the controller boundary.
+        self.refresh(Some(tab))?;
+        self.generation = generation;
+        Ok(())
+    }
+
     fn checked(&self, tab: TabId, revision: u64, active: bool) -> Result<()> {
         if self.editor.document(tab)?.revision() != revision {
             return Err(Error::StaleRevision);
@@ -427,7 +471,9 @@ impl Controller {
             }
             Event::PromptRows(rows) => {
                 let geometry = self.geometry.with_prompt_rows(rows)?;
-                if geometry == self.geometry { return Ok(Outcome::Ignored); }
+                if geometry == self.geometry {
+                    return Ok(Outcome::Ignored);
+                }
                 self.geometry = geometry;
                 self.drag = None;
                 self.refresh(None)?;
@@ -794,6 +840,85 @@ mod clipboard_admission_tests {
     use super::*;
     use crate::clipboard::{Paste, Snapshot};
     use crate::model::Limits;
+
+    #[test]
+    fn incidental_directory_refresh_preserves_other_view_input_and_refuses_atomically() {
+        let mut ui = Controller::default();
+        ui.dispatch(Event::Resize {
+            width: 280,
+            height: 160,
+            scale: 1,
+        })
+        .unwrap();
+        ui.dispatch(Event::Load("x".repeat(200).as_bytes()))
+            .unwrap();
+        ui.dispatch(Event::Open(crate::model::Open {
+            source: None,
+            bytes: b"old",
+            missing: false,
+            directory: true,
+            existing: None,
+        }))
+        .unwrap();
+        ui.dispatch(Event::SelectTab(1)).unwrap();
+        ui.dispatch(Event::Wrap {
+            tab: 1,
+            revision: 0,
+            enabled: false,
+        })
+        .unwrap();
+        ui.dispatch(Event::Edit {
+            tab: 1,
+            revision: 0,
+            command: Command::Select(Selection {
+                anchor: 200,
+                caret: 200,
+            }),
+        })
+        .unwrap();
+        ui.dispatch(Event::Profile(Profile::Emacs)).unwrap();
+        for chord in ["C-Space", "C-x"] {
+            ui.dispatch(Event::Key {
+                tab: 1,
+                revision: 0,
+                chord,
+            })
+            .unwrap();
+        }
+        ui.drag = Some((1, 200));
+        assert!(ui.keys.pending());
+        assert_eq!(ui.mark, Some(1));
+        let view = ui.tab_view(1).unwrap();
+        assert!(view.viewport.origin().column > 0);
+        let geometry = ui.geometry;
+        let doc = format!("{:?}", ui.editor.document(1).unwrap());
+        let generation = ui.generation;
+        let point = ui.editor.revision_point(2, 0).unwrap();
+        ui.refresh_directory(point, b"renamed", 3).unwrap();
+        assert_eq!(ui.editor.active(), Some(1));
+        assert_eq!(ui.tab_view(1).unwrap(), view);
+        assert_eq!(ui.geometry, geometry);
+        assert_eq!(format!("{:?}", ui.editor.document(1).unwrap()), doc);
+        assert!(ui.keys.pending());
+        assert_eq!(ui.mark, Some(1));
+        assert_eq!(ui.drag, Some((1, 200)));
+        assert_eq!(ui.generation, generation + 1);
+        assert_eq!(ui.editor.document(2).unwrap().selection().caret, 3);
+        for bytes in [b"\xc3\xa9".as_slice(), b"x\r\n", b"\0"] {
+            let point = ui.editor.revision_point(2, 1).unwrap();
+            assert!(ui.refresh_directory(point, bytes, 0).is_err());
+            assert_eq!(ui.editor.document(2).unwrap().text(), "renamed");
+            assert_eq!(ui.tab_view(1).unwrap(), view);
+            assert!(ui.keys.pending());
+        }
+        let point = ui.editor.revision_point(2, 1).unwrap();
+        ui.generation = u64::MAX;
+        assert_eq!(
+            ui.refresh_directory(point, b"new", 0),
+            Err(Error::Exhausted)
+        );
+        assert_eq!(ui.editor.document(2).unwrap().text(), "renamed");
+    }
 
     #[test]
     fn clipboard_generation_and_encoded_file_budgets_refuse_without_mutation() {

@@ -34,6 +34,9 @@ answers use the ordinary close coordinator. Conflict Cancel/Reload/Save As
 and explicit second-stage discard-before-Reload are connected, with bounded
 Reload outcomes. Ordinary Open/Save As/Dictionary path prompts also have
 revision-bound remote answers; Dictionary jobs report bounded outcomes.
+Directory tabs provide metadata listings, sorting, path copy and same-parent
+no-overwrite rename. Rename has a pinned path prompt and remote job outcome;
+open tabs follow renamed paths without losing unsaved text or history.
 Decoded key control drives editing, menus, Find, Replace, numeric and command
 entry with an exact native input-context fence. It requires real input
 readiness and cannot answer file/close/conflict flows. Decoded pointer
@@ -563,8 +566,9 @@ In the explicit feature build, an unset variable leaves scheduling ordinary.
 When set, it names a fixture-owned Unix listener. The file worker connects
 once and exchanges `td-file-v1 N KIND\n` / `continue N\n` before each job's
 I/O, including initial Open and Dictionary. KIND is `open`, `dictionary`,
-`reload` or `save`; Save As shares `save`. N starts at 1 and is checked for
-exhaustion. The channel carries no path, document bytes or model authority.
+`reload`, `rename` or `save`; Save As shares `save`. N starts at 1 and is
+checked for exhaustion. The channel carries no path, document bytes or
+model authority.
 The fixture automatically continues startup and unrelated jobs and may hold
 one selected job. A Save checkpoint occurs after immutable snapshot handoff;
 it cannot prove queued-before-handoff rejection. A Reload checkpoint precedes
@@ -591,6 +595,13 @@ The cases prove cancelled Reload retains later edits and its old baseline,
 and cancelled close-Save still writes the handed-off snapshot while newer
 edits stay dirty. Exact disk, tab/text, historical job and correlated pixel
 checks precede ordinary explicit save/teardown.
+
+A Rename checkpoint precedes filesystem mutation. Its native case holds
+rename with two directory views open, selects an already dirty file and
+edits it again before release, within the four-second held-state budget.
+After release, both listings refresh without changing the active tab,
+correlated pixels still show the newer edit, and a subsequent Save writes
+the renamed path without recreating the old name.
 
 Direct remote Save and Save As cases also hold an admitted snapshot before
 I/O. The submitting peer never reads its reply and closes only after the
@@ -1198,8 +1209,8 @@ the current directory. Activation/refresh do not auto-repeat. Clicks below
 the last entry do nothing; directory clicks do not start text drags. Existing
 modifier readiness and decoded-input fences remain required. Back/Forward
 history, watchers, recursive traversal and background refresh are not
-implemented. Rename and confirmed deletion are subsequent increments, not
-editable text commands against a listing.
+implemented. Confirmed deletion is a subsequent increment, not an editable
+text command against a listing.
 
 Directory > Sort by Name/Size/Modified and Reverse Sort change the cached
 listing without filesystem I/O. `s` cycles name, size, modified; `S`
@@ -1260,6 +1271,68 @@ state. Only one selected path is emitted, retaining the one-MiB state-frame
 bound even with 64 maximum-length directory paths.
 Open jobs and fenced decoded input use the same navigation/worker path as
 physical input, with no filesystem mutation shortcut.
+
+#### Rename
+
+`R` in either profile or Directory > Rename Entry opens a revision-bound
+minibuffer for the selected entry. It retains that snapshot's literal name,
+parent device/inode and full no-follow metadata observation, not parsed
+display text or a later caret position. Enter submits a new basename;
+Escape/C-g cancels before submission. C-u clears. Rename has no path
+completion: it does not choose an existing destination. Slash, NUL, empty,
+dot and dot-dot names are refused. Moving across directories is not yet
+implemented. Remote `dialog-answer ... path HEX` answers the same
+`path-rename` dialog with literal OS bytes, including non-UTF-8 basenames.
+Both physical and remote submission create a historical `rename` job.
+Submission is final: there is no cancellation or rollback after admission.
+
+The exclusive file worker re-resolves and checks the observed parent, opens
+the source with safe std `O_PATH | O_NOFOLLOW`, and compares device/inode,
+mode, owner/group, link count, size and mtime/ctime to the selected snapshot.
+Stale observations refuse with a refresh instruction. Symlinks rename the
+link itself; directories and other entry types rename without reading their
+contents. Renaming preserves the inode, data and metadata (except normal
+kernel ctime/parent changes), so the save replacement profile does not limit
+rename. An exactly associated open file must still match its saved metadata
+and complete encoded baseline; dirty model text is never written by rename.
+
+Publication uses the private audited Linux x86-64 `renameat2` (316) wrapper,
+with both directory descriptors pinned to the same opened parent and flags
+fixed to `RENAME_NOREPLACE` (1). No existing destination is replaced, even
+when created concurrently. Existing names reserved by another open file
+also refuse. Unsupported kernels/filesystems refuse; no copy/unlink or
+overwriting fallback exists. Parent/name prechecks do not make the source
+comparison atomic; the existing same-authority race limitation applies.
+Syscall errors retain associations and report publication attempted; verify
+both names before retrying, since a remote filesystem can return an error
+after performing the rename. No automatic retry or rollback is performed.
+
+On kernel success, paths and labels for open file and directory tabs at or
+beneath the old name follow the new name. Model text, revision, dirty state,
+cursor, undo/redo and saved content state are untouched. New paths must fit
+4096 bytes, including descendant tabs, before publication. Baseline file and
+parent handles stay pinned. The renamed file's baseline ctime is adopted
+only after parent sync, no-follow name/metadata readback and complete-byte
+comparison; descendant-file baselines are not refreshed. A sync/readback
+failure still reports a published rename and updates paths, retaining the
+old baseline stamp and an explicit uncertainty bit so later Save refuses
+until Reload or Save As, even on coarse-timestamp filesystems. No rename-back
+is tried.
+The job's `complete` means publication succeeded; the notice explicitly
+reports any durability/readback warning, not an unchanged-filesystem claim.
+
+The worker then tries to reread the source parent. Matching directory tabs
+refresh their listing, keep sort choices and select the renamed basename
+when it was selected. Incidental refresh preserves the active tab, including
+when duplicate directory views exist or the user switches tabs during I/O.
+One controller operation replaces the escaped-ASCII listing and caret,
+restores model focus before any geometry refresh, and leaves unrelated
+viewport, Emacs prefix/mark and drag state untouched. It admits generation,
+caret boundary and model counters/budgets before replacement. A failed scan
+or model admission does not undo rename:
+paths remain updated, old listing rows remain stale, and the notice asks for
+`g` refresh. Source observations add one fixed-size metadata stamp per cached
+entry and one parent identity per snapshot, still within the 4096-entry cap.
 
 ### Literal path completion
 
