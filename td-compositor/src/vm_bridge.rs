@@ -147,6 +147,15 @@ impl Session {
                     Ok((revision, read_selection(runtime, revision, deadline)?))
                 }
             }
+            wire::KEY if request.revision == 0 => {
+                self.lease = None;
+                let uid = fs::metadata("/proc/self").map_err(|e| e.to_string())?.uid();
+                guest_key(
+                    &feed_path.with_file_name("vm-git-identity"),
+                    Path::new(wire::git_key::RESPONSE),
+                    &request.data, uid, 1000,
+                ).map(|data| (0, data))
+            }
             wire::FEED if request.revision == 0 => {
                 self.lease = None;
                 publish_feed(feed_path, &request.data)?;
@@ -272,31 +281,63 @@ fn publish_feed(path: &Path, bytes: &[u8]) -> Result<(), String> {
             Err(e) => Err(format!("clear VM feed configuration: {e}")),
         };
     }
-    if let Ok(file) = File::open(path) {
+    publish_public(path, bytes)
+}
+
+fn publish_public(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    if let Ok(file) = OpenOptions::new().read(true).custom_flags(0x20000 | 0x800).open(path) {
         let mut current = Vec::new();
-        if file.take(129).read_to_end(&mut current).is_ok() && current == bytes {
+        let meta = file.metadata().map_err(|e| e.to_string())?;
+        if !meta.is_file() { return Err("invalid VM public configuration type".into()); }
+        if meta.uid() == fs::metadata("/proc/self").map_err(|e| e.to_string())?.uid()
+            && meta.nlink() == 1 && meta.mode() & 0o022 == 0
+            && file.take(129).read_to_end(&mut current).is_ok() && current == bytes {
             return Ok(());
         }
     }
     let mut nonce = [0; 16];
     File::open("/dev/urandom")
         .and_then(|mut file| file.read_exact(&mut nonce))
-        .map_err(|e| format!("name VM feed staging file: {e}"))?;
+        .map_err(|e| format!("name VM public staging file: {e}"))?;
     let temp = path.with_extension(format!("tmp-{:032x}", u128::from_le_bytes(nonce)));
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(0o644)
         .open(&temp)
-        .map_err(|e| format!("stage VM feed configuration: {e}"))?;
+        .map_err(|e| format!("stage VM public configuration: {e}"))?;
     let result = (|| {
         file.write_all(bytes).map_err(|e| e.to_string())?;
         file.set_permissions(fs::Permissions::from_mode(0o644))
             .map_err(|e| e.to_string())?;
-        fs::rename(&temp, path).map_err(|e| format!("publish VM feed configuration: {e}"))
+        fs::rename(&temp, path).map_err(|e| format!("publish VM public configuration: {e}"))
     })();
     let _ = fs::remove_file(temp);
     result
+}
+
+fn guest_key(request: &Path, response: &Path, bytes: &[u8], compositor: u32, human: u32) -> Result<Vec<u8>, String> {
+    let id = wire::git_key::identity(bytes)?;
+    for (path, owner) in [(request, compositor), (response, human)] {
+        let parent = path.parent().ok_or("VM key endpoint has no parent")?;
+        let meta = fs::symlink_metadata(parent).map_err(|e| format!("inspect VM key runtime: {e}"))?;
+        if !meta.is_dir() || meta.uid() != owner || meta.mode() & 0o022 != 0 {
+            return Err("VM key runtime has an untrusted type, owner or mode".into());
+        }
+    }
+    publish_public(request, bytes)?;
+    let file = OpenOptions::new().read(true).custom_flags(0x20000 | 0x800).open(response)
+        .map_err(|e| if e.kind() == std::io::ErrorKind::NotFound {
+            "Guest Git key pending; retry once the guest helper has generated it".into()
+        } else { format!("open guest public key: {e}") })?;
+    let meta = file.metadata().map_err(|e| e.to_string())?;
+    if !meta.is_file() || meta.uid() != human || meta.nlink() != 1 || meta.mode() & 0o022 != 0 {
+        return Err("guest public key has an untrusted type, owner or mode".into());
+    }
+    let mut reply = Vec::new();
+    file.take((wire::git_key::LIMIT + 1) as u64).read_to_end(&mut reply).map_err(|e| e.to_string())?;
+    wire::git_key::parse(&reply, id)?;
+    Ok(reply)
 }
 
 #[cfg(test)]
@@ -577,4 +618,41 @@ mod tests {
         assert_eq!(f.request(&mut s, 3, wire::FEED, 0, b"").verb, wire::OK);
         assert!(!f.dir.join("feed").exists());
     }
+    #[test]
+    fn git_key_exchange_publishes_only_valid_identity_and_checks_public_reply() {
+        let f = Fixture::new();
+        let uid = fs::metadata(&f.dir).unwrap().uid();
+        let request = f.dir.join("vm-git-identity");
+        let response = f.dir.join("git-key");
+        let id = "0123456789abcdef0123456789abcdef";
+        let key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEB";
+        assert!(guest_key(&request, &response, b"../path", uid, uid).is_err());
+        assert!(!request.exists());
+        assert!(guest_key(&request, &response, id.as_bytes(), uid, uid).unwrap_err().contains("pending"));
+        assert_eq!(fs::read(&request).unwrap(), id.as_bytes());
+        fs::set_permissions(&request, fs::Permissions::from_mode(0o666)).unwrap();
+        assert!(guest_key(&request, &response, id.as_bytes(), uid, uid).unwrap_err().contains("pending"));
+        assert_eq!(fs::metadata(&request).unwrap().mode() & 0o777, 0o644);
+        let alias = f.dir.join("request-alias");
+        fs::hard_link(&request, &alias).unwrap();
+        assert!(guest_key(&request, &response, id.as_bytes(), uid, uid).unwrap_err().contains("pending"));
+        assert_eq!(fs::metadata(&request).unwrap().nlink(), 1);
+        assert_ne!(fs::metadata(&request).unwrap().ino(), fs::metadata(&alias).unwrap().ino());
+        let reply = wire::git_key::encode(id, key).unwrap();
+        fs::write(&response, &reply).unwrap();
+        fs::set_permissions(&response, fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(guest_key(&request, &response, id.as_bytes(), uid, uid).unwrap(), reply);
+        assert!(guest_key(&request, &response, b"1123456789abcdef0123456789abcdef", uid, uid).is_err());
+        fs::set_permissions(&response, fs::Permissions::from_mode(0o666)).unwrap();
+        assert!(guest_key(&request, &response, id.as_bytes(), uid, uid).is_err());
+        fs::set_permissions(&response, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(guest_key(&request, &response, id.as_bytes(), uid, uid + 1).is_err());
+        fs::write(&response, [reply, b"PRIVATE DATA".to_vec()].concat()).unwrap();
+        assert!(guest_key(&request, &response, id.as_bytes(), uid, uid).is_err());
+        fs::remove_file(&response).unwrap();
+        std::os::unix::fs::symlink(&request, &response).unwrap();
+        assert!(guest_key(&request, &response, id.as_bytes(), uid, uid).is_err());
+        assert_eq!(fs::read(&request).unwrap(), id.as_bytes());
+    }
+
 }

@@ -39,6 +39,10 @@ fn reply(
         wire::OK => {
             let shape = match request.verb.as_str() {
                 wire::SNAPSHOT => reply.revision != 0 && reply.data == b"clipboard-v1 feed-v1",
+                wire::KEY => {
+                    reply.revision == 0 && wire::git_key::identity(&request.data)
+                        .is_ok_and(|id| wire::git_key::parse(&reply.data, id).is_ok())
+                }
                 wire::GET => {
                     reply.revision == request.revision
                         && !reply.data.is_empty()
@@ -249,6 +253,7 @@ fn forward(dir: &Path, request: wire::Message, deadline: Instant) -> Result<wire
             }
         }
         wire::GET | wire::SNAPSHOT if request.data.is_empty() => {}
+        wire::KEY => { wire::git_key::identity(&request.data)?; }
         wire::FEED => {
             wire::feed(&request.data)?;
         }
@@ -354,4 +359,40 @@ mod tests {
         drop(supervisor);
         assert!(!temp.0.join("bridge").exists());
     }
+    #[test]
+    fn public_key_relay_needs_no_clipboard_lease_and_refuses_wrong_identity() {
+        let temp = Temp::new();
+        let id = "0123456789abcdef0123456789abcdef";
+        let key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEB";
+        let listener = UnixListener::bind(temp.0.join("guest")).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let peer = thread::spawn(move || {
+            for identity in [id, "1123456789abcdef0123456789abcdef"] {
+                let deadline = Instant::now() + wire::TIMEOUT;
+                let (mut stream, _) = loop {
+                    match listener.accept() {
+                        Ok(pair) => break pair,
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock && Instant::now() < deadline => thread::sleep(Duration::from_millis(5)),
+                        Err(e) => panic!("guest accept: {e}"),
+                    }
+                };
+                stream.set_nonblocking(true).unwrap();
+                let request = wire::receive(&mut stream, None, deadline).unwrap();
+                assert_eq!(request.verb, wire::KEY);
+                assert_eq!(request.data, id.as_bytes());
+                assert_eq!(request.revision, 0);
+                let reply = wire::Message::new(request.id, wire::OK, 0, wire::git_key::encode(identity, key).unwrap());
+                wire::write_all(&mut stream, &reply.encode().unwrap(), deadline).unwrap();
+            }
+        });
+        let supervisor = Supervisor::start(&temp.0).unwrap();
+        sharing(&temp.0, "off").unwrap();
+        let reply = ask(&temp.0, wire::KEY, id.as_bytes().to_vec()).unwrap();
+        assert_eq!(wire::git_key::parse(&reply, id).unwrap(), key);
+        assert!(ask(&temp.0, wire::KEY, id.as_bytes().to_vec()).unwrap_err().contains("does not match"));
+        assert!(ask(&temp.0, wire::KEY, b"invalid".to_vec()).is_err());
+        peer.join().unwrap();
+        drop(supervisor);
+    }
+
 }

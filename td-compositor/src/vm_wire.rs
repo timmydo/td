@@ -15,6 +15,7 @@ pub const SNAPSHOT: &str = "snapshot";
 pub const PUT: &str = "put";
 pub const GET: &str = "get";
 pub const FEED: &str = "feed";
+pub const KEY: &str = "git-key";
 pub const OK: &str = "ok";
 pub const ERROR: &str = "error";
 
@@ -96,7 +97,7 @@ impl Message {
 }
 
 fn valid_verb(verb: &str) -> bool {
-    matches!(verb, SNAPSHOT | PUT | GET | FEED | OK | ERROR)
+    matches!(verb, SNAPSHOT | PUT | GET | FEED | KEY | OK | ERROR)
 }
 
 fn decimal(value: Option<&str>) -> Result<u64, String> {
@@ -314,6 +315,98 @@ mod tests {
             "http://10.0.2.2:65536",
         ] {
             assert!(feed(endpoint.as_bytes()).is_err());
+        }
+    }
+}
+
+#[allow(dead_code)] // Public key codec is shared with the guest helper and host manager.
+pub mod git_key {
+    //! Public key exchange only; the guest never sends private key bytes.
+
+    pub const REQUEST: &str = "/run/td-compositor/1000/vm-git-identity";
+    pub const RESPONSE: &str = "/run/td-guest/1000/git-key";
+    pub const LIMIT: usize = 256;
+
+    pub fn identity(bytes: &[u8]) -> Result<&str, String> {
+        let value = std::str::from_utf8(bytes).map_err(|_| "invalid VM identity")?;
+        if value.len() != 32
+            || !value
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        {
+            return Err("VM identity must be 32 lowercase hexadecimal digits".into());
+        }
+        Ok(value)
+    }
+
+    pub fn key(value: &str) -> Result<&str, String> {
+        let encoded = value
+            .strip_prefix("ssh-ed25519 ")
+            .ok_or("expected Ed25519 public key")?;
+        if encoded.len() != 68
+            || !encoded.starts_with("AAAAC3NzaC1lZDI1NTE5AAAAI")
+            || !matches!(encoded.as_bytes().get(25), Some(b'A'..=b'P'))
+            || !encoded
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"+/".contains(&b))
+        {
+            return Err("invalid Ed25519 public key".into());
+        }
+        Ok(encoded)
+    }
+
+    pub fn encode(id: &str, public_key: &str) -> Result<Vec<u8>, String> {
+        identity(id.as_bytes())?;
+        key(public_key)?;
+        Ok(format!("TDVM-GIT-KEY-1\n{id}\n{public_key}\n").into_bytes())
+    }
+
+    pub fn parse(bytes: &[u8], expected: &str) -> Result<String, String> {
+        identity(expected.as_bytes())?;
+        if bytes.len() > LIMIT {
+            return Err("VM public key reply exceeds limit".into());
+        }
+        let text = std::str::from_utf8(bytes).map_err(|_| "invalid public key reply")?;
+        let mut lines = text
+            .strip_suffix('\n')
+            .ok_or("incomplete public key reply")?
+            .split('\n');
+        if lines.next() != Some("TDVM-GIT-KEY-1") {
+            return Err("unsupported guest public key reply header".into());
+        }
+        let id = lines
+            .next()
+            .filter(|id| !id.is_empty())
+            .ok_or("missing guest key identity")?;
+        if id != expected {
+            return Err("guest key identity does not match this instance".into());
+        }
+        let public_key = lines.next().ok_or("missing guest public key")?;
+        key(public_key)?;
+        if lines.next().is_some() {
+            return Err("extra public key reply data".into());
+        }
+        Ok(public_key.into())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        #![allow(clippy::unwrap_used)]
+        use super::*;
+        const ID: &str = "0123456789abcdef0123456789abcdef";
+        const KEY: &str =
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEB";
+        #[test]
+        fn reply_is_bounded_and_bound_to_one_identity() {
+            assert!(parse(b"TDVM-GIT-KEY-1\n", ID)
+                .unwrap_err()
+                .contains("missing guest key identity"));
+            let reply = encode(ID, KEY).unwrap();
+            assert_eq!(parse(&reply, ID).unwrap(), KEY);
+            assert!(parse(&reply, "1123456789abcdef0123456789abcdef").is_err());
+            assert!(parse(&[reply, b"extra\n".to_vec()].concat(), ID).is_err());
+            assert!(identity(b"../path").is_err());
+            assert!(encode(ID, &format!("{KEY}\nprivate-data")).is_err());
         }
     }
 }

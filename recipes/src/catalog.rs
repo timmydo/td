@@ -192,6 +192,7 @@ mod tests {
             "td-svc",
             "td-txt",
             "td-util",
+            "td-vm-guest",
         ];
         let mut covered = Vec::new();
         for (stem, recipe) in all() {

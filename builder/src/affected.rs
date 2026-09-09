@@ -372,6 +372,7 @@ const TARGET_STATIC_RECIPES: &[(&str, &str)] = &[
     ("recipes/src/fixtures", "recipes/src/recipes/td-secret-vm-test.rs"),
     ("td-profiler/src", "recipes/src/recipes/td-profiler.rs"),
     ("td-seatd/src", "recipes/src/recipes/td-seatd.rs"),
+    ("td-vm-guest/src", "recipes/src/recipes/td-vm-guest.rs"),
     ("td-sh/src", "recipes/src/recipes/td-sh.rs"),
     ("td-svc/src", "recipes/src/recipes/td-svc.rs"),
     ("td-txt/src", "recipes/src/recipes/td-txt.rs"),
@@ -4486,7 +4487,7 @@ mod tests {
         // The conservative textual edge widens checks even without a read.
         assert_eq!(
             readers_of("td-compositor"),
-            ["td-authd", "td-editor", "td-jail", "td-portal", "td-seatd", "td-secret", "td-vm"]
+            ["td-authd", "td-editor", "td-jail", "td-portal", "td-seatd", "td-secret", "td-vm", "td-vm-guest"]
         );
         assert_eq!(readers_of("td-authd"), ["td-compositor", "td-secret"]);
         // td-login is here for a test's argument string `/bin/td-busd/`, no
@@ -4531,7 +4532,8 @@ mod tests {
                 "td-portal",
                 "td-seatd",
                 "td-secret",
-                "td-vm"
+                "td-vm",
+                "td-vm-guest"
             ]))
         );
         assert_eq!(check_scope(&root, &paths(&["td-sh/src/lib.rs"]), &check), Some(paths(&["td-sh"])));
@@ -6600,10 +6602,11 @@ mod tests {
                 "td-portal",
                 "td-seatd",
                 "td-secret",
-                "td-vm"
+                "td-vm",
+                "td-vm-guest"
             ]
         );
-        assert_eq!(comp.len(), 21, "{comp:?}");
+        assert_eq!(comp.len(), 23, "{comp:?}");
         assert_eq!(
             names(&one("td-busd/src/wire.rs")),
             [
@@ -6618,7 +6621,8 @@ mod tests {
                 "td-portal",
                 "td-seatd",
                 "td-secret",
-                "td-vm"
+                "td-vm",
+                "td-vm-guest"
             ]
         );
         assert_eq!(

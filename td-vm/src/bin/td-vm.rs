@@ -69,6 +69,7 @@ const HELP: &str = "td-vm: manage persistent graphical td instances
   td-vm git-profile check             authenticate registrar and verify origin
   td-vm workspace prepare NAME BRANCH save a private workspace plan
   td-vm workspace show NAME           inspect saved identity and Git profile
+  td-vm workspace key NAME            request the guest-generated SSH public key
 
 TD_VM_HOME defaults to ~/.local/share/td-vm. Requires host QEMU, qemu-img and qemu-io.
 Reuse dist/td-vm-x86-64 from ./build-qcow; no image rebuild on create/open.
@@ -134,6 +135,10 @@ fn run(args: Vec<String>) -> Result<()> {
         ["import", name, bundle] => manager.import(name, Path::new(bundle)),
         ["workspace", "prepare", name, branch] => {
             println!("{}", term::scrub_lines(&manager.prepare_workspace(name, branch)?));
+            Ok(())
+        }
+        ["workspace", "key", name] => {
+            println!("{}", manager.workspace_key(name)?);
             Ok(())
         }
         ["workspace", "show", name] => {
@@ -553,6 +558,15 @@ impl Manager {
         let dir = self.root.join("instances").join(name(value)?);
         check_private_dir(&dir)?;
         Ok(dir)
+    }
+
+    fn workspace_key(&self, value: &str) -> Result<String> {
+        name(value)?;
+        let _lock = self.lock(&format!("instance-{value}"))?;
+        let dir = self.instance(value)?;
+        let workspace = vm_workspace::load(&dir)?.ok_or("instance has no workspace plan")?;
+        let reply = vm_bridge::ask(&dir, vm_wire::KEY, workspace.id.as_bytes().to_vec())?;
+        vm_wire::git_key::parse(&reply, &workspace.id)
     }
 
     fn bridge(&self, value: &str, verb: &str, data: Vec<u8>) -> Result<Vec<u8>> {

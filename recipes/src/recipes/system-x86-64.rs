@@ -1240,13 +1240,14 @@ fn td_portal_settings_etc_name() -> &'static str {
 /// on a table it cannot parse, but a unit SILENTLY dropped from the plan — skipped for
 /// an unsatisfiable dependency — is a clean exit with a shorter list, and that is the
 /// regression this catches: the boot comes up missing a service and says nothing.
-const TD_SVC_UNITS: [&str; 43] = [
+const TD_SVC_UNITS: [&str; 44] = [
     "hostname",
     "td-firstboot",
     "rootcheck",
     "profiler",
     "profiler-evidence",
     "seat",
+    "vm-guest",
     "audio",
     "netup",
     "busd",
@@ -1452,6 +1453,16 @@ fn build_td_svc_conf() -> String {
          exec=/bin/td-seatd assign --uid {ui_uid} --gid {ui_gid} --compositor-uid {compositor_uid} --audio-uid {audio_uid} --audio-gid {audio_gid}\n\
          after=rootcheck\n\
          timeout={seat}\n\
+         \n\
+         # Guest Git keys belong to the human; no private key crosses the bridge.\n\
+         [vm-guest]\n\
+         type=daemon\n\
+         cgroup=session\n\
+         exec=/bin/td-login exec-as {ui_user} -- /bin/td-vm-guest serve\n\
+         after=seat,netup\n\
+         requires=seat,td-firstboot\n\
+         restart=always\n\
+         log=/var/log/svc/td-vm-guest.log\n\
          \n\
          # The service-only audio identity owns the playback PCMs and daemon\n\
          # socket. A live connect is required before applications may launch.\n\
@@ -4156,6 +4167,14 @@ fn real_root_steps(sys: &SystemDef) -> Result<Vec<Step>, String> {
     });
     // The software UI is static and owns no dynamic runtime closure.
     steps.push(Step::CopyTree {
+        from: "{in:td-vm-guest}".into(),
+        dest: "{root}/real-root{in:td-vm-guest}".into(),
+    });
+    steps.push(Step::Symlink {
+        target: "{in:td-vm-guest}/bin/td-vm-guest".into(),
+        link: "{root}/real-root/bin/td-vm-guest".into(),
+    });
+    steps.push(Step::CopyTree {
         from: "{in:td-seatd}".into(),
         dest: "{root}/real-root{in:td-seatd}".into(),
     });
@@ -5155,6 +5174,7 @@ pub fn recipe() -> Recipe {
             "td-profiler",
             "td-jail",
             "td-seatd",
+            "td-vm-guest",
             "td-audio",
             "td-compositor",
             "td-busd",
@@ -6764,7 +6784,8 @@ news\tnews-0.1\tsource\tempty-runtime-1\tsource\n"
         assert_eq!(unit_key("portal-files", "requires").as_deref(), Some("td-firstboot"));
         let seat = include_str!("../../../td-seatd/src/main.rs");
         assert!(seat.contains(r#"const COMPOSITOR_RUNTIME_NAME: &str = "td-compositor";"#));
-        assert!(seat.contains("Ok(run.join(COMPOSITOR_RUNTIME_NAME).join(owner))"));
+        assert!(seat.contains("shared_runtime(human_runtime, COMPOSITOR_RUNTIME_NAME)"));
+        assert!(seat.contains("Ok(run.join(name).join(owner))"));
         assert_eq!(
             td_engine::permissions::TD_COMPOSITOR_RUNTIME_PATH,
             format!("/run/td-compositor/{UI_UID}")
@@ -7027,6 +7048,21 @@ news\tnews-0.1\tsource\tempty-runtime-1\tsource\n"
         }
     }
 
+    #[test]
+    fn vm_guest_helper_runs_without_root_in_the_standard_image() {
+        assert_eq!(unit_key("vm-guest", "exec").as_deref(), Some("/bin/td-login exec-as tester -- /bin/td-vm-guest serve"));
+        assert_eq!(unit_key("vm-guest", "cgroup").as_deref(), Some("session"));
+        assert_eq!(unit_key("vm-guest", "requires").as_deref(), Some("seat,td-firstboot"));
+        assert_eq!(unit_key("vm-guest", "restart").as_deref(), Some("always"));
+        assert!(ordered_before("seat", "vm-guest"));
+        assert!(ordered_before("netup", "vm-guest"));
+        let steps = recipe().steps.unwrap();
+        assert!(steps.iter().any(|step| matches!(step, Step::Symlink { target, link }
+            if target == "{in:td-vm-guest}/bin/td-vm-guest" && link == "{root}/real-root/bin/td-vm-guest")));
+        assert!(steps.iter().any(|step| matches!(step, Step::CopyTree { from, dest }
+            if from == "{in:td-vm-guest}" && dest == "{root}/real-root{in:td-vm-guest}")));
+    }
+
     /// The COMPLETE `after=` edge set, pinned.
     ///
     /// This is the guard that actually protects the boot order, and it exists because
@@ -7048,6 +7084,7 @@ news\tnews-0.1\tsource\tempty-runtime-1\tsource\n"
             ("td-firstboot", vec!["hostname"]),
             ("rootcheck", vec!["td-firstboot"]),
             ("seat", vec!["rootcheck"]),
+            ("vm-guest", vec!["seat", "netup"]),
             ("audio", vec!["seat"]),
             ("netup", vec!["rootcheck"]),
             ("busd", vec!["seat"]),

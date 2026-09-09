@@ -479,6 +479,10 @@ fn prepare_audio_runtime(
 }
 
 fn compositor_runtime(human_runtime: &Path) -> Result<PathBuf, String> {
+    shared_runtime(human_runtime, COMPOSITOR_RUNTIME_NAME)
+}
+
+fn shared_runtime(human_runtime: &Path, name: &str) -> Result<PathBuf, String> {
     let owner = human_runtime
         .file_name()
         .ok_or("human runtime has no owner")?;
@@ -486,7 +490,7 @@ fn compositor_runtime(human_runtime: &Path) -> Result<PathBuf, String> {
         .parent()
         .and_then(Path::parent)
         .ok_or("human runtime has no runtime root")?;
-    Ok(run.join(COMPOSITOR_RUNTIME_NAME).join(owner))
+    Ok(run.join(name).join(owner))
 }
 
 fn prepare_compositor_runtime(
@@ -523,6 +527,9 @@ fn assign(
         &compositor_runtime(runtime)?,
         assignment.compositor,
         require_char,
+    )?;
+    prepare_compositor_runtime(
+        &shared_runtime(runtime, "td-guest")?, assignment.seat, require_char,
     )?;
     prepare_audio_runtime(audio_runtime, assignment.audio, require_char)?;
     assign_path(framebuffer, assignment.compositor, require_char)?;
@@ -574,6 +581,9 @@ fn probe(
         require_char,
     )?;
     verify_owner_mode(&compositor_runtime, assignment.compositor, 0o755)?;
+    let vm_runtime = shared_runtime(runtime, "td-guest")?;
+    verify_runtime_base(vm_runtime.parent().ok_or("missing VM parent")?, require_char)?;
+    verify_owner_mode(&vm_runtime, assignment.seat, 0o755)?;
     verify_owner_mode(audio_runtime, assignment.audio, 0o755)?;
     checked_metadata(framebuffer, require_char)?;
     verify_owner_mode(framebuffer, assignment.compositor, 0o600)?;
@@ -1209,6 +1219,11 @@ mod tests {
                 & 0o7777,
             0o755
         );
+        let vm_runtime = shared_runtime(&runtime, "td-guest").unwrap();
+        verify_owner_mode(&vm_runtime, assignment.seat, 0o755).unwrap();
+        verify_runtime_base(vm_runtime.parent().unwrap(), false).unwrap();
+        fs::set_permissions(&vm_runtime, Permissions::from_mode(0o777)).unwrap();
+        assert!(probe(&dev.join("fb0"), &input, &sound, &runtime, &audio_runtime, assignment, false).is_err());
         let base = fs::symlink_metadata(run.join("user")).unwrap();
         assert!(base.file_type().is_dir());
         assert_eq!(base.permissions().mode() & 0o7777, 0o755);

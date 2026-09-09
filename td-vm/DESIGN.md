@@ -83,9 +83,9 @@ reusable instance/template lock inodes remain stable. Referenced templates canno
 listing does not create manager state or take catalog locks.
 
 This increment boots the stock desktop and reports workspace integration as
-pending. Guest provisioning/unique guest identities, orderly host power
-operations, private writable development stores, automatic
-Git setup, and account linking are not implemented. The td-owned clipboard
+pending. Per-instance Git keys use the guest helper below. Key enrollment,
+cloning, orderly host power operations, private writable development stores,
+automatic Git setup, and account linking are not implemented. The td-owned clipboard
 and feed bridge described below requires a matching updated system image. Stop from the guest; host
 `stop NAME --force` explicitly cuts power. Disk deletion requires `--yes` or
 typing the instance name in the TUI and reports unsubmitted work as unknown.
@@ -1426,3 +1426,26 @@ Required evidence includes:
 
 Host lifecycle tests alone do not prove these guest behaviors. Keep the design
 and implementation status explicit until this evidence exists.
+
+
+## Guest Git public key exchange
+
+The standard image includes [td-vm-guest](../td-vm-guest/DESIGN.md), running
+as `tester` through the existing login launcher. For an instance with a saved
+workspace plan, `td-vm workspace key NAME` sends its immutable instance ID
+over the compositor-owned `git-key` operation. The first request can report
+pending while the helper generates the key; repeating it returns the same
+Ed25519 public key. The manager validates the reply's identity and exact
+public-key format at both relay boundaries. It never receives private bytes.
+Clipboard sharing and keyboard focus do not gate this provisioning request.
+Older images without this operation cannot provide a key; use the updated
+standard image for new instances.
+
+Seat setup creates a separate public tester runtime at
+`/run/td-guest/1000`; it leaves the human's private runtime private. Persistent
+keys live under `/home/tester/.local/share/td-vm/git` inside each VM disk.
+Changing the host-assigned ID of a used disk is refused by the guest helper.
+This exchange does not enroll the key with the host registrar or reserve a
+branch. Workspace plans still report enrollment and cloning pending. The
+next increment uses the returned public key for the saved host Git profile;
+a key reply alone must never be displayed as an enrolled or ready workspace.

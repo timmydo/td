@@ -6546,7 +6546,20 @@ host boundary; the native terminal retains its normal bracketed-paste behavior.
 The same worker publishes a validated, non-secret host-feed URL into the
 compositor-owned volatile `vm-feed` file for `td-feed consume sources`.
 Configuration does not alter login environments or grant host-command access.
-The initial vocabulary has no credential or provisioning operation. A guest
+The `git-key` operation below provisions only a guest Git public identity. A guest
 cannot write the host clipboard without an explicit manager Copy action.
 Host QEMU-window focus is outside this protocol; the initial UI uses explicit
 host-terminal actions rather than automatic desktop clipboard synchronization.
+
+
+The `git-key` request carries a 32-digit lowercase hexadecimal instance ID and
+revision zero. It cancels any clipboard lease and does not need keyboard
+focus. The compositor atomically publishes the ID in its volatile
+`vm-git-identity` file, then returns only a matching bounded public reply from
+the tester-owned `/run/td-guest/1000/git-key` file. A missing reply reports
+pending; retrying the same request is idempotent. Directory ownership and
+opened-file type, owner, link count and write permissions are checked before
+reading. This is a private carrier operation, absent from public Wayland and
+the control socket. [The guest helper](../td-vm-guest/DESIGN.md) retains the
+private key in tester's persistent home. The compositor cannot generate,
+import, export or enroll a private key through this operation.
