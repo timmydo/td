@@ -316,7 +316,9 @@ Descriptor and uevent reads are bounded. The kernel and root-owned
 enrolled token identity. The FIDO signature establishes that identity.
 
 The built-in kernel profile enables USB, PCI xHCI, HID, generic HID,
-hidraw and USB HID. The prompted parents are explicitly enabled after
+hidraw, USB HID and UHID. UHID permits the guest fixture below to exercise
+kernel HID I/O; its root-only device is not delegated to applications.
+The prompted parents are explicitly enabled after
 allnoconfig; derived USB_XHCI_PCI is checked after olddefconfig without
 a fictitious direct pin. The profile does not add legacy USB host
 controller drivers. Raw token nodes stay root-only and never enter an
@@ -771,9 +773,9 @@ normal cargo pass with those tests ignored is not TPM integration evidence.
 ### TPM through the QEMU guest device
 
 `td-recipe-eval qemu-secret --tpm /absolute/path/to/swtpm` requires the
-same pinned host swtpm described above and adds four cold guest boots to
-the authority checks. The host starts a private software TPM control
-socket and attaches QEMU's emulated TIS device; there is no host TPM
+same pinned host swtpm described above and adds four cold TPM guest boots
+and the two HID guests below to the authority checks. The host starts a
+private software TPM control socket and attaches QEMU's emulated TIS device; there is no host TPM
 passthrough. The source-built test executable calls the unchanged
 `Device::open` and `Client` implementations through `/dev/tpmrm0`.
 
@@ -797,6 +799,50 @@ failure. This proves the guest device transport, sealed-object persistence
 and TPM/PCR binding. The key and measurements are fixtures; it does not
 prove a measured deployment, FIDO2 presence, session authorization or a
 credential-store write. The stock deployment remains unenrolled.
+
+### HID through the QEMU guest kernel
+
+The same optional command runs two further isolated guests using a
+test-only virtual token created through Linux
+[UHID](https://docs.kernel.org/hid/uhid.html). The fixture requires its
+kernel opt-in and exact case selector before opening `/dev/uhid`, then
+checks that it is a root-owned, root-group mode-0600 character device.
+Its FIDO report descriptor creates a kernel hidraw node with USB bus
+metadata. The normal bounded `Device::discover` and root-only admission
+checks select it without changing permissions or accepting alternate
+device paths. The fixture launches the source-built `/bin/td-secret
+hid-worker` and exercises the unchanged Session initialization and CBOR
+exchange. Production Session creation still uses `/proc/self/exe`.
+
+The assertion case exchanges a fresh HID initialization nonce and a
+fragmented CTAP request and response. Its known challenge, public key and
+signature come from the independent OpenSSL fixture used by the host
+TPM oracle; no signer or private token key is included. The virtual token
+compares every reconstructed request byte-for-byte with the expected
+sequence before counting it or responding, including the changed challenge.
+Verification uses
+the production TPM device client through `/dev/tpmrm0`. A second request
+changes the challenge while the virtual token replays the original
+signature; only the specific TPM VerifySignature refusal counts as the
+expected rejection. A transport failure cannot satisfy that assertion.
+
+The deadline case sends repeated waiting-for-presence keepalives without
+an assertion. The Session's five-second deadline must expire, poison the
+session, and kill and reap the production worker. The fixture must have
+received the full CTAP request and emitted at least five keepalives; silence
+does not satisfy the case. Both cases verify worker
+retirement and disappearance of the virtual hidraw node after the fixture
+closes its UHID descriptor. Fixture event reads are nonblocking, its thread
+has a fifteen-second lifetime, and Drop stops and joins that thread.
+Every guest also retains the outer 180-second boot bound and exact one-test
+passing-summary requirement. The FIDO guests have no persistent disk.
+
+This is evidence for kernel HID transport, production worker ownership,
+assertion verification and deadline refusal. The USB metadata and presence
+bit are software fixtures: this does not test a USB controller, establish
+physical presence, enroll recovery tokens, release a session, or authorize
+a credential write. Ordinary crate tests leave these guest-only cases
+explicitly ignored. UHID device creation remains a trusted-root operation.
 
 ## Portal evidence
 

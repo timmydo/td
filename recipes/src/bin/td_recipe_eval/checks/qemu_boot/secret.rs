@@ -61,6 +61,7 @@ pub(crate) fn run(runner: &RecipeCheckRunner, tpm: Option<&Path>) -> Result<(), 
     let cases = fixture::CASES.iter().map(|case| (case, false)).chain(
         fixture::TPM_CASES
             .iter()
+            .chain(fixture::FIDO_CASES)
             .filter(|_| tpm.is_some())
             .map(|case| (case, true)),
     );
@@ -98,14 +99,19 @@ pub(crate) fn run(runner: &RecipeCheckRunner, tpm: Option<&Path>) -> Result<(), 
             &kernel,
             &archive,
             BootPlan {
-                disk: tpm_disk.as_deref().filter(|_| is_tpm).map(|path| BootDisk {
-                    path,
-                    read_only: *name != "tpm-seal",
-                }),
+                disk: tpm_disk
+                    .as_deref()
+                    .filter(|_| name.starts_with("tpm-"))
+                    .map(|path| BootDisk {
+                        path,
+                        read_only: *name != "tpm-seal",
+                    }),
                 mem: "512",
                 target_marker: fixture::PASS,
                 kill_on_marker: false,
-                extra_append: if is_tpm {
+                extra_append: if name.starts_with("fido-") {
+                    "td.hid-fixture=1"
+                } else if is_tpm {
                     "td.tpm-fixture=1"
                 } else {
                     "td.operation-fixture=1 td.write-intake-fixture=1"
@@ -152,6 +158,7 @@ pub(crate) fn run(runner: &RecipeCheckRunner, tpm: Option<&Path>) -> Result<(), 
     println!("PASS: secret authority VM cases ({} fresh guests); credential intake, inspection and relocking; no token or TPM release claim", fixture::CASES.len());
     if tpm.is_some() {
         println!("PASS: TPM guest device, persistent sealed key, cold reopen, changed PCR and different TPM refusal; fixture measurements only, no FIDO2 or measured-deployment claim");
+        println!("PASS: guest HID discovery, production worker, signed fixture assertion and challenge refusal through the TPM, keepalive deadline and worker cleanup; no physical USB or token presence claim");
     }
     Ok(())
 }
@@ -320,6 +327,10 @@ mod tests {
             fixture::TPM_CASES.iter().map(|(name, _)| name).collect();
         assert_eq!(names.len(), 4);
         for (_, test) in fixture::TPM_CASES {
+            assert!(source.contains(&format!("fn {}()", test.rsplit("::").next().unwrap())));
+        }
+        let source = include_str!("../../../../../../td-secret/src/fido_device.rs");
+        for (_, test) in fixture::FIDO_CASES {
             assert!(source.contains(&format!("fn {}()", test.rsplit("::").next().unwrap())));
         }
     }

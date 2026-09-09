@@ -982,3 +982,302 @@ mod tests {
         assert!(send(&mut socket, &[7], Instant::now()).is_err());
     }
 }
+
+#[cfg(test)]
+mod vm_tests {
+    use super::*;
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
+    use std::thread::{self, JoinHandle};
+
+    const CREATE2_DESCRIPTOR: usize = 4 + 128 + 64 + 64 + 2 + 2 + 4 * 4;
+    const UHID_EVENT_SIZE: usize = CREATE2_DESCRIPTOR + 4096;
+    const CHANNEL: u32 = 0x10203040;
+    const DESCRIPTOR: &[u8] = &[
+        0x06, 0xd0, 0xf1, 0x09, 1, 0xa1, 1, 0x09, 0x20, 0x15, 0, 0x26, 0xff, 0, 0x75, 8, 0x95, 64,
+        0x81, 2, 0x09, 0x21, 0x95, 64, 0x91, 2, 0xc0,
+    ];
+
+    fn guard(case: &str) {
+        assert!(fs::read_to_string("/proc/cmdline")
+            .unwrap()
+            .split_ascii_whitespace()
+            .any(|arg| arg == "td.hid-fixture=1"));
+        assert_eq!(fs::read_to_string("/case").unwrap(), case);
+        store::require_root().unwrap();
+    }
+
+    fn write_event(file: &mut File, event: &[u8]) {
+        assert_eq!(file.write(event).unwrap(), event.len());
+    }
+
+    fn input(file: &mut File, report: &[u8; 64]) {
+        let mut event = [0; 70];
+        event[..4].copy_from_slice(&12_u32.to_ne_bytes());
+        event[4..6].copy_from_slice(&64_u16.to_ne_bytes());
+        event[6..].copy_from_slice(report);
+        write_event(file, &event);
+    }
+
+    struct Token {
+        stop: Arc<AtomicBool>,
+        worker: Option<JoinHandle<(usize, usize)>>,
+    }
+
+    impl Token {
+        fn start(expected: Vec<Vec<u8>>, response: Vec<u8>, keepalive: bool) -> Self {
+            let mut file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .custom_flags(NOFOLLOW | NONBLOCK)
+                .open("/dev/uhid")
+                .unwrap();
+            let meta = file.metadata().unwrap();
+            assert!(meta.file_type().is_char_device());
+            assert_eq!(
+                (meta.uid(), meta.gid(), meta.mode() & 0o7777),
+                (0, 0, 0o600)
+            );
+            let mut event = [0; UHID_EVENT_SIZE];
+            event[..4].copy_from_slice(&11_u32.to_ne_bytes());
+            event[4..20].copy_from_slice(b"td FIDO fixture\0");
+            event[260..262].copy_from_slice(&(DESCRIPTOR.len() as u16).to_ne_bytes());
+            event[262..264].copy_from_slice(&3_u16.to_ne_bytes());
+            event[264..268].copy_from_slice(&0x1209_u32.to_ne_bytes());
+            event[268..272].copy_from_slice(&1_u32.to_ne_bytes());
+            event[CREATE2_DESCRIPTOR..CREATE2_DESCRIPTOR + DESCRIPTOR.len()].copy_from_slice(DESCRIPTOR);
+            write_event(&mut file, &event);
+            let stop = Arc::new(AtomicBool::new(false));
+            let stopped = stop.clone();
+            let worker = thread::spawn(move || {
+                let deadline = Instant::now() + Duration::from_secs(15);
+                let mut decoder = hid::Decoder::cbor(CHANNEL).unwrap();
+                let mut waiting = false;
+                let mut next_keepalive = Instant::now();
+                let mut requests = 0;
+                let mut keepalives = 0;
+                while !stopped.load(Ordering::Relaxed) {
+                    assert!(Instant::now() < deadline, "virtual HID fixture expired");
+                    event.fill(0);
+                    match file.read(&mut event) {
+                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                        Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                        Err(error) => panic!("read UHID: {error}"),
+                        Ok(size) => {
+                            assert!(size >= 4);
+                            let kind = u32::from_ne_bytes(event[..4].try_into().unwrap());
+                            if kind == 6 {
+                                let size = u16::from_ne_bytes(event[4100..4102].try_into().unwrap())
+                                    as usize;
+                                assert_eq!(event[4102], 1);
+                                // hidraw's unnumbered output carries its leading report ID.
+                                assert_eq!(size, 65);
+                                assert_eq!(event[4], 0);
+                                let report: [u8; 64] = event[5..69].try_into().unwrap();
+                                if report[..7] == [255, 255, 255, 255, 0x86, 0, 8] {
+                                    let mut reply = [0; 64];
+                                    reply[..7].copy_from_slice(&[255, 255, 255, 255, 0x86, 0, 17]);
+                                    reply[7..15].copy_from_slice(&report[7..15]);
+                                    reply[15..19].copy_from_slice(&CHANNEL.to_be_bytes());
+                                    reply[19..24].copy_from_slice(&[2, 1, 0, 0, 4]);
+                                    input(&mut file, &reply);
+                                } else if let hid::Event::Complete(request) =
+                                    decoder.push(&report).unwrap()
+                                {
+                                    assert_eq!(request.as_ref(), expected.get(requests).unwrap());
+                                    requests += 1;
+                                    if keepalive {
+                                        waiting = true;
+                                    } else {
+                                        for report in
+                                            hid::cbor(CHANNEL, &response).unwrap().as_ref()
+                                        {
+                                            input(&mut file, report);
+                                        }
+                                    }
+                                    decoder = hid::Decoder::cbor(CHANNEL).unwrap();
+                                }
+                            } else {
+                                assert!(
+                                    [2, 3, 4, 5].contains(&kind),
+                                    "unexpected UHID event {kind}"
+                                );
+                            }
+                        }
+                    }
+                    if waiting && Instant::now() >= next_keepalive {
+                        let mut report = [0; 64];
+                        report[..4].copy_from_slice(&CHANNEL.to_be_bytes());
+                        report[4..8].copy_from_slice(&[0xbb, 0, 1, 2]);
+                        input(&mut file, &report);
+                        keepalives += 1;
+                        next_keepalive = Instant::now() + Duration::from_millis(20);
+                    }
+                    thread::sleep(Duration::from_millis(2));
+                }
+                (requests, keepalives)
+            });
+            Self {
+                stop,
+                worker: Some(worker),
+            }
+        }
+
+        fn finish(mut self) -> (usize, usize) {
+            self.stop.store(true, Ordering::Relaxed);
+            self.worker.take().unwrap().join().unwrap()
+        }
+    }
+
+    impl Drop for Token {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Relaxed);
+            if let Some(worker) = self.worker.take() {
+                let _ = worker.join();
+            }
+        }
+    }
+
+    fn discover_one() -> Device {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let devices = Device::discover().unwrap();
+            if devices.len() == 1 {
+                return devices[0];
+            }
+            assert!(
+                Instant::now() < deadline,
+                "virtual token was not discovered"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn session(device: Device, lifetime: Duration) -> Session {
+        let (socket, peer) = UnixStream::pair().unwrap();
+        let input: OwnedFd = peer.try_clone().unwrap().into();
+        let output: OwnedFd = peer.into();
+        let child = Command::new("/bin/td-secret")
+            .args([
+                "hid-worker",
+                &device.index.to_string(),
+                &device.inode.to_string(),
+                &device.rdev.to_string(),
+            ])
+            .env_clear()
+            .current_dir("/")
+            .stdin(Stdio::from(input))
+            .stdout(Stdio::from(output))
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut session = Session {
+            worker: Some(Worker { child, socket }),
+            deadline: Instant::now() + lifetime,
+            channel: hid::BROADCAST,
+        };
+        session.initialize().unwrap();
+        session
+    }
+
+    fn hex(value: &str) -> Vec<u8> {
+        value
+            .as_bytes()
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
+            .collect()
+    }
+
+    fn assertion_fixture() -> (Vec<u8>, crate::fido_ctap::Es256PublicKey, [u8; 32]) {
+        // The independent OpenSSL fixture also used by the host TPM oracle.
+        let mut cose = vec![0xa5, 1, 2, 3, 0x26, 0x20, 1, 0x21, 0x58, 0x20];
+        cose.extend(hex(
+            "ab8ace3ba858575dd060bf6e790f73982165b36abbfffb86cf0f5e032fafbb5a",
+        ));
+        cose.extend([0x22, 0x58, 0x20]);
+        cose.extend(hex(
+            "552ef0c808cfa668e3012f4411fc0a3ad01a39d3a0fb158534721a8016b31553",
+        ));
+        let key = crate::fido_ctap::Es256PublicKey::from_cose(&cose).unwrap();
+        let challenge = hex("f3ad24f2731ea324507944e3ae1b9a172f14eaac6a57e004788390dc14a4c7ca")
+            .try_into()
+            .unwrap();
+        let auth = hex("34e2ef54cd9003d2930734cfb0402ccab6a44dcb5024fc367878c413c78ce2dd8100000007a16b6372656450726f7465637401");
+        let signature = hex("3045022100fcd359f2e59ed2e63367ec882724beae6d78fd876d9208b9ec0900b4114aa98c02205c58e5c6d917e85e879fed77b43f0b73cf4394eb1caadb657855e362e541b4f7");
+        let mut response = crate::fido_cbor::Encoder::new();
+        response.head(5, 2).unwrap();
+        response.head(0, 2).unwrap();
+        response.bytes(&auth).unwrap();
+        response.head(0, 3).unwrap();
+        response.bytes(&signature).unwrap();
+        let mut bytes = vec![0];
+        bytes.extend(response.finish().unwrap());
+        (bytes, key, challenge)
+    }
+
+    #[test]
+    #[ignore = "requires qemu-secret --tpm with disposable guest HID and TPM devices"]
+    fn qemu_hid_assertion_uses_production_worker_and_guest_tpm() {
+        guard("fido-hid");
+        assert!(Device::discover().unwrap().is_empty());
+        let (response, key, challenge) = assertion_fixture();
+        let request = crate::fido_ctap::AssertionRequest::new(&[7], challenge, 1024).unwrap();
+        let mut changed = challenge;
+        changed[0] ^= 1;
+        let changed = crate::fido_ctap::AssertionRequest::new(&[7], changed, 1024).unwrap();
+        let token = Token::start(
+            vec![request.bytes().to_vec(), changed.bytes().to_vec()],
+            response.clone(),
+            false,
+        );
+        let mut session = session(discover_one(), Duration::from_secs(10));
+        let worker = session.worker.as_ref().unwrap().child.id();
+        let mut tpm = crate::tpm::Client::new(crate::tpm::Device::open().unwrap());
+        let received = session.cbor(request.bytes()).unwrap();
+        assert_eq!(received.as_ref(), response);
+        assert_eq!(
+            request
+                .verify(received.as_ref(), &key, &mut tpm)
+                .unwrap()
+                .counter,
+            7
+        );
+        let replay = session.cbor(changed.bytes()).unwrap();
+        assert_eq!(replay.as_ref(), response);
+        let error = changed
+            .verify(replay.as_ref(), &key, &mut tpm)
+            .err()
+            .unwrap();
+        assert!(error.starts_with("TPM command 0x177 refused:"), "{error}");
+        drop(session);
+        assert!(!std::path::Path::new(&format!("/proc/{worker}")).exists());
+        assert_eq!(token.finish(), (2, 0));
+        assert!(Device::discover().unwrap().is_empty());
+    }
+
+    #[test]
+    #[ignore = "requires qemu-secret --tpm with disposable guest HID devices"]
+    fn qemu_hid_keepalives_cannot_extend_the_worker_deadline() {
+        guard("fido-deadline");
+        assert!(Device::discover().unwrap().is_empty());
+        let (response, _, challenge) = assertion_fixture();
+        let request = crate::fido_ctap::AssertionRequest::new(&[7], challenge, 1024).unwrap();
+        let token = Token::start(vec![request.bytes().to_vec()], response, true);
+        let mut session = session(discover_one(), Duration::from_secs(5));
+        let worker = session.worker.as_ref().unwrap().child.id();
+        let started = Instant::now();
+        let error = session.cbor(request.bytes()).err().unwrap();
+        assert!(error.contains("expired"), "{error}");
+        assert!(started.elapsed() < Duration::from_secs(7));
+        assert!(session.worker.is_none());
+        assert!(!std::path::Path::new(&format!("/proc/{worker}")).exists());
+        let (requests, keepalives) = token.finish();
+        assert_eq!(requests, 1);
+        assert!(keepalives >= 5);
+        assert!(Device::discover().unwrap().is_empty());
+    }
+}

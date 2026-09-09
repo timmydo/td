@@ -35,6 +35,16 @@ pub const TPM_CASES: &[(&str, &str)] = &[
     ("tpm-pcr", "tpm::tests::qemu_device_refuses_changed_pcr"),
     ("tpm-other", "tpm::tests::qemu_device_refuses_another_tpm"),
 ];
+pub const FIDO_CASES: &[(&str, &str)] = &[
+    (
+        "fido-hid",
+        "fido_device::vm_tests::qemu_hid_assertion_uses_production_worker_and_guest_tpm",
+    ),
+    (
+        "fido-deadline",
+        "fido_device::vm_tests::qemu_hid_keepalives_cannot_extend_the_worker_deadline",
+    ),
+];
 pub const PASS: &str = "TD-SECRET-VM-PASS";
 pub const FAIL: &str = "TD-SECRET-VM-FAIL";
 
@@ -86,6 +96,7 @@ fn run() -> Result<(), String> {
         .chain(
             TPM_CASES
                 .iter()
+                .chain(FIDO_CASES)
                 .map(|(name, test)| (*name, *test, "/bin/td-secret-tests")),
         )
         .find(|(name, _, _)| *name == selected)

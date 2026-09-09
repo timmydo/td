@@ -566,6 +566,7 @@ pub fn recipe() -> Recipe {
                   /^#? *CONFIG_HID_SUPPORT[ =]/d; \
                   /^#? *CONFIG_HID[ =]/d; \
                   /^#? *CONFIG_HID_GENERIC[ =]/d; \
+                  /^#? *CONFIG_UHID[ =]/d; \
                   /^#? *CONFIG_HIDRAW[ =]/d; \
                   /^#? *CONFIG_USB_HID[ =]/d; \
                   /^#? *CONFIG_TCG_TPM[ =]/d; \
@@ -681,6 +682,7 @@ pub fn recipe() -> Recipe {
                    'CONFIG_HID_SUPPORT=y' \
                    'CONFIG_HID=y' \
                    'CONFIG_HID_GENERIC=y' \
+                   'CONFIG_UHID=y' \
                    'CONFIG_HIDRAW=y' \
                    'CONFIG_USB_HID=y' \
                    'CONFIG_TCG_TPM=y' \
@@ -792,6 +794,7 @@ pub fn recipe() -> Recipe {
                  grep -q '^CONFIG_HID_SUPPORT=y' .config || { echo 'HID_SUPPORT off - FIDO USB transport requires built-in xHCI and hidraw' >&2; exit 1; }; \
                  grep -q '^CONFIG_HID=y' .config || { echo 'HID off - FIDO USB transport requires built-in xHCI and hidraw' >&2; exit 1; }; \
                  grep -q '^CONFIG_HID_GENERIC=y' .config || { echo 'HID_GENERIC off - FIDO USB transport requires built-in xHCI and hidraw' >&2; exit 1; }; \
+                 grep -q '^CONFIG_UHID=y' .config || { echo 'UHID off - secret VM fixture requires kernel HID transport' >&2; exit 1; }; \
                  grep -q '^CONFIG_HIDRAW=y' .config || { echo 'HIDRAW off - FIDO USB transport requires built-in xHCI and hidraw' >&2; exit 1; }; \
                  grep -q '^CONFIG_USB_HID=y' .config || { echo 'USB_HID off - FIDO USB transport requires built-in xHCI and hidraw' >&2; exit 1; }; \
                  grep -q '^CONFIG_USB_XHCI_PCI=y' .config || { echo 'USB_XHCI_PCI off - FIDO USB transport requires built-in xHCI and hidraw' >&2; exit 1; }; \
