@@ -25,7 +25,7 @@ impl Group {
     pub(crate) fn items(self) -> &'static [Item] {
         use Item::*;
         match self {
-            Self::File => &[New, Open, Save, SaveAs, Close, Quit],
+            Self::File => &[New, Open, Save, SaveAs, Close, CopyPath, Quit],
             Self::Edit => &[
                 Undo,
                 Redo,
@@ -64,6 +64,7 @@ pub(crate) enum Item {
     Save,
     SaveAs,
     Close,
+    CopyPath,
     Quit,
     Undo,
     Redo,
@@ -104,6 +105,7 @@ impl Item {
             Self::Redo => "Redo",
             Self::Cut => "Cut",
             Self::Copy => "Copy",
+            Self::CopyPath => "Copy Full File Path",
             Self::Paste => "Paste",
             Self::SelectAll => "Select All",
             Self::Windows => "Windows key bindings",
@@ -174,6 +176,7 @@ pub(crate) struct Menu {
     pub(crate) line_numbers: bool,
     pub(crate) auto_fill: bool,
     pub(crate) copy: bool,
+    pub(crate) copy_path: bool,
     pub(crate) paste: bool,
 }
 
@@ -181,6 +184,7 @@ impl Menu {
     pub(crate) fn enabled(&self, item: Item) -> bool {
         match item {
             Item::Cut | Item::Copy => self.copy,
+            Item::CopyPath => self.copy_path,
             Item::Paste => self.paste,
             Item::Dictionary | Item::Open | Item::Save | Item::SaveAs => self.file_window,
             Item::Undo => self.undo,
@@ -333,7 +337,24 @@ mod tests {
             line_numbers: true,
             auto_fill: false,
             copy: false,
+            copy_path: false,
             paste: false,
+        }
+    }
+
+    #[test]
+    fn file_with_copy_path_requires_216_scaled_pixels_of_height() {
+        for scale in 1..=4 {
+            let s = scale as usize;
+            let menu = menu(Group::File);
+            assert_eq!(Group::File.items().len(), 7);
+            assert_eq!(Group::File.items().last(), Some(&Item::Quit));
+            assert!(menu
+                .panel(Geometry::new(320 * s, 215 * s, Scale::new(scale).unwrap()).unwrap())
+                .is_none());
+            assert!(menu
+                .panel(Geometry::new(320 * s, 216 * s, Scale::new(scale).unwrap()).unwrap())
+                .is_some());
         }
     }
 

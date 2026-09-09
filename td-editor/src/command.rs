@@ -187,6 +187,7 @@ mod tests {
             line_numbers: true,
             auto_fill: false,
             copy: false,
+            copy_path: false,
             paste: false,
         };
         assert!(NAMES.iter().all(|(_, item)| menu.enabled(*item)));

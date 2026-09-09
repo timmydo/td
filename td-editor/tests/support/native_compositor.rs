@@ -847,6 +847,78 @@ enum ClipboardOperation {
     Cut,
 }
 
+#[test]
+#[ignore = "ready supplies the disposable native compositor"]
+fn native_file_menu_copies_full_path_to_another_editor_without_selection() {
+    for profile in ["windows", "emacs"] {
+        let compositor_directory = Directory::new();
+        let source_directory = Directory::new();
+        let destination_directory = Directory::new();
+        let mut compositor = Compositor::start(&compositor_directory);
+        let source_path = source_directory.0.join("a path é;$");
+        let dictionary = source_directory.0.join("dictionary");
+        std::fs::write(&source_path, b"unchanged\n").unwrap();
+        std::fs::write(&dictionary, b"unchanged\n").unwrap();
+        let display = compositor.directory.join("wayland-0");
+        let mut source = EditorProcess::start_with_profile(
+            &source_directory,
+            &display,
+            &source_path,
+            &dictionary,
+            profile,
+        );
+        source.legacy_keyboard(profile);
+        assert_eq!(compositor.request("fullscreen", 1024), b"ok\n");
+        source.wait_field("state", "window", "800,576,1");
+        source.rendered_at(800, 576);
+        source.wait_field("state", "tab", "1,0,0,10,0,0,0,72,0,lf");
+        compositor.pointer(400, 80, 0);
+        source.wait_field("state", "pointer-ready", "1");
+        compositor.click(12, 36); // File header, including compositor bar.
+        source.wait_field("state", "modal", "0,0,0,0,1,0,0,0,0");
+        compositor.click(100, 180); // File row five: Copy Full File Path.
+        source.wait_field(
+            "prompt-state",
+            "notice",
+            &td_editor::control::hex(b"Full file path offered to clipboard."),
+        );
+        let expected = std::fs::canonicalize(&source_path)
+            .unwrap()
+            .into_os_string()
+            .into_string()
+            .unwrap();
+        source.wait_field("clipboard-state", "source-bytes", &expected.len().to_string());
+        source.wait_field("state", "tab", "1,0,0,10,0,0,0,72,0,lf");
+        assert_eq!(std::fs::read(&source_path).unwrap(), b"unchanged\n");
+        assert_eq!(compositor.request("fullscreen", 1024), b"ok\n");
+        let destination_path = destination_directory.0.join("destination");
+        std::fs::write(&destination_path, b"").unwrap();
+        let mut destination = EditorProcess::start_with_profile(
+            &destination_directory,
+            &display,
+            &destination_path,
+            &dictionary,
+            profile,
+        );
+        destination.legacy_keyboard(profile);
+        destination.wait_field("clipboard-state", "selection", "utf8");
+        assert_eq!(compositor.request("fullscreen", 1024), b"ok\n");
+        destination.wait_field("state", "window", "800,576,1");
+        destination.rendered_at(800, 576);
+        compositor.chord(
+            Some(KEY_LEFT_CTRL),
+            if profile == "emacs" { KEY_Y } else { KEY_V },
+        );
+        destination.wait_tab(1, &expected);
+        destination.job("save\t1\t1");
+        assert_eq!(std::fs::read(&destination_path).unwrap(), expected.as_bytes());
+        source.wait_tab(0, "unchanged\n"); // Revision zero of tab one.
+        destination.quit();
+        source.quit();
+        compositor.stop();
+    }
+}
+
 fn copy_clipboard_text(compositor: &mut Compositor, profile: &str) {
     if profile == "emacs" {
         compositor.chord(Some(KEY_LEFT_ALT), KEY_W);

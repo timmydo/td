@@ -1581,7 +1581,8 @@ Opening cancels pending key prefix, Emacs mark, controller drag and native
 held/repeat/wheel state, preserving the document and selection. The new
 controller CancelInput event performs this reset without a fake focus loss.
 
-File exposes New, Open, Save, Save As, Close Tab and Quit. Edit exposes Undo,
+File exposes New, Open, Save, Save As, Close Tab, Copy Full File Path and
+Quit. Edit exposes Undo,
 Redo, Select All and the two key profiles, with clipboard commands enabled
 according to the data-device contract below. Format exposes Soft Wrap,
 Auto Fill, Fill Paragraph, Fill Column, Check Spelling, Dictionary and
@@ -1641,6 +1642,28 @@ Save and dirty-close flows, stale targets, resize and late file completion.
 Menus do not imply a remote-control socket, GPU or jail milestone.
 
 ### Implemented clipboard admission prerequisite
+
+File > Copy Full File Path offers the active tab's associated absolute path
+as literal UTF-8 clipboard text, without quotes, shell escaping or an added
+newline. It needs no document selection and does not edit, mark saved or
+change undo history. Untitled/scratch tabs disable the item. Non-UTF-8 paths
+refuse with feedback, preserving the previous clipboard source rather than
+substituting a lossy display name. Opened missing-file tabs have their intended
+absolute path even before Save; successful Save As updates the cached path,
+while a failed Save As leaves the original association. No filesystem read
+runs on menu activation: the file worker publishes that path with its normal
+Open/Save/Reload completion.
+
+The seven-row File menu requires 320 by 216 font pixels, multiplied by
+integer scale. Smaller windows refuse the complete popup; existing File
+keyboard commands remain available. Copy Full File Path has no shortcut in
+this profile and requires enlarging the window to open the menu.
+
+The action shares Copy's focus, current physical press serial, 1 MiB bound,
+pending-writer refusal, UTF-8 MIME pair and immutable source lifecycle. It
+does not create a clipboard authority shortcut in remote control. Native
+compositor tests use the real File-menu pointer path and paste into a second
+editor in both profiles; exact saved bytes prove the transferred value.
 
 The safe `clipboard` module captures clipboard intent independently of any
 display, descriptor, clock or worker. It does not claim system clipboard

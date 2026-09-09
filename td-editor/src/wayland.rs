@@ -3119,6 +3119,13 @@ impl Window {
                 && self.clipboard.device.is_some()
                 && self.clipboard.outgoing.is_none()
                 && !doc.selection().range().is_empty(),
+            copy_path: self.input.focused
+                && self.clipboard.device.is_some()
+                && self.clipboard.outgoing.is_none()
+                && self
+                    .files
+                    .as_ref()
+                    .is_some_and(|files| files.associated(tab)),
             paste: self.input.focused
                 && self.clipboard.device.is_some()
                 && self.clipboard.incoming.is_none()
@@ -3292,12 +3299,14 @@ impl Window {
                 self.close();
                 return Ok(());
             }
-            Item::Cut | Item::Copy | Item::Paste => {
+            Item::Cut | Item::Copy | Item::CopyPath | Item::Paste => {
                 self.clipboard_request(
                     match item {
                         Item::Cut => "cut",
                         Item::Copy => "copy",
-                        _ => "paste",
+                        Item::CopyPath => "copy-path",
+                        Item::Paste => "paste",
+                        _ => return Err("non-clipboard menu item".into()),
                     },
                     tab,
                     revision,
@@ -4622,11 +4631,33 @@ impl Window {
             return Ok(());
         }
         let Some(serial) = self.activation_serial else {
-            self.notify("Copy/Cut requires a current physical key or pointer press.");
+            self.notify("Clipboard action requires a current physical key or pointer press.");
             return Ok(());
         };
         if self.clipboard.outgoing.is_some() {
-            self.notify("Clipboard is being sent; retry Copy/Cut after it completes.");
+            self.notify("Clipboard is being sent; retry the clipboard action after it completes.");
+            return Ok(());
+        }
+        if name == "copy-path" {
+            if self.ui.editor().active() != Some(tab)
+                || self.ui.editor().revision_point(tab, revision).is_err()
+            {
+                self.notify("Copy path refused: document changed.");
+                return Ok(());
+            }
+            let Some(path) = self.files.as_ref().and_then(|files| files.path(tab)) else {
+                self.notify("Copy path unavailable: this tab has no file path.");
+                return Ok(());
+            };
+            let Some(text) = path
+                .to_str()
+                .filter(|text| text.len() <= crate::clipboard::MAX_BYTES)
+            else {
+                self.notify("Copy path refused: path is not bounded UTF-8 clipboard text.");
+                return Ok(());
+            };
+            self.offer_clipboard(std::sync::Arc::from(text), serial)?;
+            self.notify("Full file path offered to clipboard.");
             return Ok(());
         }
         let snapshot = match crate::clipboard::Snapshot::capture(self.ui.editor(), tab, revision) {
@@ -4640,6 +4671,19 @@ impl Window {
                 return Ok(());
             }
         };
+        self.offer_clipboard(snapshot.text(), serial)?;
+        if name == "cut" {
+            match self.ui.dispatch(Event::Cut(snapshot)) {
+                Ok(_) => self.notify("Cut offered to clipboard; Undo restores the selection."),
+                Err(e) => self.notify(format!("Copied, but Cut refused: {e}")),
+            }
+        } else {
+            self.notify("Selection offered to clipboard.");
+        }
+        Ok(())
+    }
+
+    fn offer_clipboard(&mut self, text: std::sync::Arc<str>, serial: u32) -> Result<()> {
         let (_, manager) = self.clipboard.manager.ok_or("missing clipboard manager")?;
         let device = self.clipboard.device.ok_or("missing clipboard device")?;
         let source = self.allocate(Kind::ClipboardSource)?;
@@ -4650,18 +4694,10 @@ impl Window {
             self.connection.send(source, 0, body, None)?;
         }
         self.connection.words(device, 1, &[source, serial])?;
-        if let Some((old, _)) = self.clipboard.source.replace((source, snapshot.text())) {
+        if let Some((old, _)) = self.clipboard.source.replace((source, text)) {
             self.retire_source(old)?;
         }
         self.clipboard.incoming = None;
-        if name == "cut" {
-            match self.ui.dispatch(Event::Cut(snapshot)) {
-                Ok(_) => self.notify("Cut offered to clipboard; Undo restores the selection."),
-                Err(e) => self.notify(format!("Copied, but Cut refused: {e}")),
-            }
-        } else {
-            self.notify("Selection offered to clipboard.");
-        }
         Ok(())
     }
 
@@ -5857,6 +5893,133 @@ mod tests {
             w.event(text_event(id, 0, mime)).unwrap();
         }
         w.event(message(device, 5, &[id])).unwrap();
+    }
+
+    #[test]
+    fn copy_file_path_uses_menu_press_serial_without_editing_and_follows_save_as() {
+        for profile in [Profile::Windows, Profile::Emacs] {
+            let directory = DialogDirectory::new();
+            let path = directory.path("a path é\nfile");
+            let next = directory.path("renamed");
+            std::fs::write(&path, b"keep").unwrap();
+            let (mut w, peer, keyboard, device) = clipboard_fixture();
+            w.ui = Controller::default();
+            let mut files = crate::session::Session::start().unwrap();
+            files.initial_open(&mut w.ui, path.clone()).unwrap();
+            w.files = Some(files);
+            w.ui.dispatch(Event::Profile(profile)).unwrap();
+            configure(&mut w, 800, 600);
+            let index = crate::menu::Group::File
+                .items()
+                .iter()
+                .position(|item| *item == crate::menu::Item::CopyPath)
+                .unwrap();
+            let before = format!("{:?}", w.ui.editor());
+            for expected in [&path, &next] {
+                w.open_menu(crate::menu::Group::File).unwrap();
+                assert!(w
+                    .menu
+                    .as_ref()
+                    .unwrap()
+                    .enabled(crate::menu::Item::CopyPath));
+                w.menu.as_mut().unwrap().selected = index;
+                w.event(message(keyboard, 3, &[7788, 0, 28, 1])).unwrap();
+                w.event(message(keyboard, 3, &[8899, 0, 28, 0])).unwrap();
+                assert!(w.activation_serial.is_none());
+                let (source, text) = w.clipboard.source.as_ref().unwrap();
+                assert_eq!(text.as_ref(), expected.to_str().unwrap());
+                assert!(drain(&peer)
+                    .0
+                    .contains(&message(device, 1, &[*source, 7788])));
+                assert_eq!(format!("{:?}", w.ui.editor()), before);
+                w.clipboard_request("copy-path", 1, 0).unwrap();
+                assert!(w.notice.as_deref().unwrap().contains("physical"));
+                assert!(drain(&peer).0.is_empty());
+                if expected == &path {
+                    w.files
+                        .as_mut()
+                        .unwrap()
+                        .save(&w.ui, 1, 0, Some(next.clone()))
+                        .unwrap();
+                    finish_file(&mut w);
+                    assert_eq!(w.files.as_ref().unwrap().path(1), Some(next.as_path()));
+                }
+            }
+            assert_eq!(std::fs::read(&path).unwrap(), b"keep");
+            assert_eq!(std::fs::read(&next).unwrap(), b"keep");
+        }
+    }
+
+    #[test]
+    fn copy_file_path_offers_intended_missing_path_without_creating_a_file() {
+        let directory = DialogDirectory::new();
+        let path = directory.path("not saved yet");
+        let (mut w, peer, keyboard, _) = clipboard_fixture();
+        w.ui = Controller::default();
+        let mut files = crate::session::Session::start().unwrap();
+        files.initial_open(&mut w.ui, path.clone()).unwrap();
+        w.files = Some(files);
+        configure(&mut w, 800, 600);
+        let before = format!("{:?}", w.ui.editor());
+        w.open_menu(crate::menu::Group::File).unwrap();
+        w.menu.as_mut().unwrap().selected = crate::menu::Group::File
+            .items()
+            .iter()
+            .position(|item| *item == crate::menu::Item::CopyPath)
+            .unwrap();
+        key(&mut w, keyboard, 28);
+        assert_eq!(w.clipboard.source.as_ref().unwrap().1.as_ref(), path.to_str().unwrap());
+        assert!(w.activation_serial.is_none());
+        assert_eq!(format!("{:?}", w.ui.editor()), before);
+        assert!(!path.exists());
+        drain(&peer);
+    }
+
+    #[test]
+    fn copy_file_path_refuses_untitled_non_utf8_and_stale_target_without_replacing_source() {
+        use std::os::unix::ffi::OsStringExt;
+        let directory = DialogDirectory::new();
+        let path = directory
+            .0
+            .join(std::ffi::OsString::from_vec(b"bad-\xff".to_vec()));
+        std::fs::write(&path, b"keep").unwrap();
+        let (mut w, peer, keyboard, _) = clipboard_fixture();
+        w.event(message(keyboard, 4, &[0, 4, 0, 0, 0])).unwrap();
+        key(&mut w, keyboard, 46);
+        let old = w.clipboard.source.clone();
+        drain(&peer);
+        w.activation_serial = Some(999);
+        w.clipboard_request("copy-path", 1, 0).unwrap();
+        assert!(w.notice.as_deref().unwrap().contains("no file path"));
+        w.ui = Controller::default();
+        let mut files = crate::session::Session::start().unwrap();
+        files.initial_open(&mut w.ui, path).unwrap();
+        w.files = Some(files);
+        w.clipboard_request("copy-path", 1, 0).unwrap();
+        assert!(w.notice.as_deref().unwrap().contains("UTF-8"));
+        w.clipboard_request("copy-path", 1, 1).unwrap();
+        assert!(w.notice.as_deref().unwrap().contains("document changed"));
+        assert_eq!(w.clipboard.source, old);
+        assert!(drain(&peer).0.is_empty());
+        assert_eq!(w.ui.editor().document(1).unwrap().text(), "keep");
+        assert!(!w.ui.editor().document(1).unwrap().dirty());
+        w.activation_serial = None;
+        w.event(message(keyboard, 4, &[0, 0, 0, 0, 0])).unwrap();
+        configure(&mut w, 800, 600);
+        w.open_menu(crate::menu::Group::File).unwrap();
+        w.menu.as_mut().unwrap().selected = crate::menu::Group::File
+            .items()
+            .iter()
+            .position(|item| *item == crate::menu::Item::CopyPath)
+            .unwrap();
+        drain(&peer);
+        key(&mut w, keyboard, 28);
+        assert!(w.notice.as_deref().unwrap().contains("UTF-8"));
+        assert!(w.activation_serial.is_none());
+        assert_eq!(w.clipboard.source, old);
+        w.clipboard_request("copy-path", 1, 0).unwrap();
+        assert!(w.notice.as_deref().unwrap().contains("physical"));
+        assert!(drain(&peer).0.is_empty());
     }
 
     fn source_send(w: &mut Window, peer: &UnixStream, source: u32, mime: &str, file: &File) {
@@ -11675,7 +11838,7 @@ mod tests {
         assert!(w.menu.is_none());
         w.chord("Escape", false).unwrap();
         assert_eq!(format!("{:?}", w.ui.editor()), before);
-        menu_click(&mut w, Group::File, 5);
+        menu_click(&mut w, Group::File, 6);
         assert!(w.closing.is_some());
         w.chord("C-d", false).unwrap();
         assert!(w.closed);

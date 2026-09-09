@@ -78,6 +78,14 @@ them, or the `display-line-numbers-mode` named command in either key profile.
 This window-wide preference lasts until exit. Numbers count logical lines;
 soft-wrapped continuations are blank. The gutter never becomes copied text.
 
+**File > Copy Full File Path** copies the active file's absolute path without
+changing its text or selection. It follows successful Save As and also works
+for an opened filename not yet saved. Untitled tabs have no path; non-UTF-8
+paths refuse explicitly because the clipboard offers UTF-8 text only.
+The File menu requires 320 by 216 font pixels (multiplied by display scale).
+At smaller sizes, enlarge the window for this action; existing File keyboard
+shortcuts remain available, but Copy Full File Path has no shortcut yet.
+
 Build and verify from the repository root:
 
 ```text

@@ -70,6 +70,7 @@ enum Pending {
 struct Association {
     file: FileId,
     title: String,
+    path: PathBuf,
 }
 
 pub(crate) struct Session {
@@ -171,6 +172,9 @@ impl Session {
 
     pub(crate) fn associated(&self, tab: TabId) -> bool {
         self.associations.contains_key(&tab)
+    }
+    pub(crate) fn path(&self, tab: TabId) -> Option<&std::path::Path> {
+        self.associations.get(&tab).map(|a| a.path.as_path())
     }
     pub(crate) fn take_conflict(&mut self) -> Option<crate::dialog::Target> {
         self.conflict.take()
@@ -423,7 +427,14 @@ impl Session {
             .chars()
             .take(512)
             .collect();
-        self.associations.insert(tab, Association { file, title });
+        self.associations.insert(
+            tab,
+            Association {
+                file,
+                title,
+                path: path.to_path_buf(),
+            },
+        );
     }
 }
 
