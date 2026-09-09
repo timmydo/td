@@ -202,13 +202,30 @@ impl Profile {
         self.change(&["revoke", self.repository()?, id], lock)
     }
 
+    pub fn start(&self, id: &str, branch: &str, expected: Option<&str>, lock: &File) -> Result<String> {
+        if !crate::vm_git_names::instance_valid(id) || !crate::vm_git_names::branch_valid(branch) {
+            return Err("invalid starting-commit identity or branch".into());
+        }
+        if let Some(oid) = expected { Origin::new(self.repository()?.into(), oid.into())?; }
+        let output = self.request(&["start", self.repository()?, id, branch, expected.unwrap_or("main")], lock)?;
+        let origin = Origin::parse(std::str::from_utf8(&output).map_err(|_| "invalid starting-commit reply")?)?;
+        if origin.repository != self.repository()? || expected.is_some_and(|oid| oid != origin.head) {
+            return Err("registrar starting commit differs from the workspace".into());
+        }
+        Ok(origin.head)
+    }
+
     fn change(&self, args: &[&str], lock: &File) -> Result<()> {
+        if !self.request(args, lock)?.is_empty() { return Err("unexpected registrar mutation output".into()); }
+        Ok(())
+    }
+
+    fn request(&self, args: &[&str], lock: &File) -> Result<Vec<u8>> {
         let registrar = trusted_program(self.get("registrar")?)?;
         let mut command = Command::new(registrar);
         command.env_clear().current_dir("/").arg("request")
             .arg(self.get("socket")?).arg(self.get("server-uid")?).args(args);
-        if !capture_input(command, Stdio::from(io(lock.try_clone(), "retain instance lock in registrar client")?))?.is_empty() { return Err("unexpected registrar mutation output".into()); }
-        Ok(())
+        capture_input(command, Stdio::from(io(lock.try_clone(), "retain instance lock in registrar client")?))
     }
 
     pub fn check(&self) -> Result<Origin> {

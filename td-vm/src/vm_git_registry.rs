@@ -249,6 +249,88 @@ fn change(verb: &str, args: &[OsString]) -> Result<bool> {
     change_origin(None, verb, args)
 }
 
+fn start_ref(id: &str) -> Result<String> {
+    if !instance_valid(id) {
+        return Err("invalid starting-commit identity".into());
+    }
+    Ok(format!("refs/td-vm/start/{id}"))
+}
+
+fn retained(policy: &Policy, name: &str) -> Result<Option<String>> {
+    let status = policy.command().args(["symbolic-ref", "--quiet", name])
+        .stdin(Stdio::null()).stdout(Stdio::null()).status()?;
+    if status.code() != Some(1) {
+        return Err("starting-commit ref is symbolic or could not be inspected".into());
+    }
+    // Listing silently skips some damaged refs, including an all-zero object ID.
+    let exists = policy.command().args(["show-ref", "--verify", "--quiet", name])
+        .stdin(Stdio::null()).stdout(Stdio::null()).status()?;
+    if !matches!(exists.code(), Some(0 | 1)) {
+        return Err("starting-commit ref is damaged or could not be inspected".into());
+    }
+    let text = policy.query(&["for-each-ref", "--format=%(refname) %(objectname)", name])?;
+    if text.is_empty() {
+        return if exists.code() == Some(1) { Ok(None) }
+            else { Err("starting-commit ref disappeared during inspection".into()) };
+    }
+    let (found, oid) = text.split_once(' ').ok_or("invalid starting-commit ref")?;
+    if found != name || text.contains('\n') {
+        return Err("unexpected starting-commit ref namespace".into());
+    }
+    super::origin::Origin::new("/validation".into(), oid.into())?;
+    if policy.query(&["cat-file", "-t", oid])? != "commit" {
+        return Err("starting-commit ref does not name a commit".into());
+    }
+    Ok(Some(oid.into()))
+}
+
+fn start(policy: &Policy, id: &str, branch: &str, expected: &str) -> Result<super::origin::Origin> {
+    let name = start_ref(id)?;
+    if !branch_valid(branch) || !policy.keys.contains_key(id)
+        || policy.branches.get(branch).map(String::as_str) != Some(id)
+    {
+        return Err("starting commit needs this instance's enrolled task branch".into());
+    }
+    if expected != "main" {
+        super::origin::Origin::new("/validation".into(), expected.into())?;
+    }
+    let oid = match retained(policy, &name)? {
+        Some(oid) => {
+            if expected != "main" && expected != oid {
+                return Err("retained starting commit differs from the workspace record".into());
+            }
+            oid
+        }
+        None => {
+            if expected != "main" {
+                return Err("recorded starting-commit ref is missing; repair the host origin".into());
+            }
+            if policy.query(&["rev-parse", "--is-bare-repository"])? != "true"
+                || policy.query(&["symbolic-ref", "HEAD"])? != "refs/heads/main"
+            {
+                return Err("VM origin must be bare with main as its default branch".into());
+            }
+            let oid = policy.query(&["rev-parse", "--verify", "refs/heads/main^{commit}"])?;
+            super::origin::Origin::new("/validation".into(), oid.clone())?;
+            let zero = "0".repeat(oid.len());
+            // Git arbitrates with ordinary writers. Never replace an existing ref.
+            policy.query(&["update-ref", "--no-deref", &name, &oid, &zero])?;
+            oid
+        }
+    };
+    Ok(super::origin::Origin::new(
+        fs::canonicalize(&policy.repository)?.to_str().ok_or("origin path must be UTF-8")?.into(), oid,
+    )?)
+}
+
+fn release_start(policy: &Policy, id: &str) -> Result<()> {
+    let name = start_ref(id)?;
+    if let Some(oid) = retained(policy, &name)? {
+        policy.query(&["update-ref", "--no-deref", "-d", &name, &oid])?;
+    }
+    Ok(())
+}
+
 fn change_origin(expected: Option<&str>, verb: &str, args: &[OsString]) -> Result<bool> {
     let (path, remaining) = args.split_first().ok_or("missing registry path")?;
     let path = Path::new(path);
@@ -267,6 +349,11 @@ fn change_origin(expected: Option<&str>, verb: &str, args: &[OsString]) -> Resul
         .collect::<std::result::Result<_, _>>()?;
     let mut claim = None;
     match (verb, words.as_slice()) {
+        ("start", [id, branch, expected]) => {
+            let origin = start(&policy, id, branch, expected)?;
+            io::stdout().lock().write_all(origin.encode().as_bytes())?;
+            return Ok(true);
+        }
         ("enroll", [id, branch, key_path]) => {
             let key = public_key(Path::new(key_path))?;
             if !instance_valid(id) || policy.keys.iter().any(|(owner, registered)| owner != id && registered == &key) {
@@ -289,7 +376,7 @@ fn change_origin(expected: Option<&str>, verb: &str, args: &[OsString]) -> Resul
             policy.keys.remove(*id);
             policy.branches.retain(|_, owner| owner != id);
         }
-        _ => return Err("usage: td-vm-git enroll POLICY ID BRANCH PUBLIC_KEY | reserve POLICY ID BRANCH | revoke POLICY ID".into()),
+        _ => return Err("usage: td-vm-git enroll POLICY ID BRANCH PUBLIC_KEY | reserve POLICY ID BRANCH | start POLICY ID BRANCH main|COMMIT | revoke POLICY ID".into()),
     }
     if serialize(&policy)? != before {
         // Git's create transaction arbitrates with ordinary repository writers.
@@ -303,6 +390,10 @@ fn change_origin(expected: Option<&str>, verb: &str, args: &[OsString]) -> Resul
         // sync failed; an idempotent retry must not acknowledge unsynced state.
         File::open(path)?.sync_all()?;
         File::open(path.parent().ok_or("missing policy parent")?)?.sync_all()?;
+    }
+    if let ("revoke", [id]) = (verb, words.as_slice()) {
+        // Revoke authority first. Failed ref cleanup retains the disk for retry.
+        release_start(&policy, id)?;
     }
     Ok(true)
 }
@@ -378,12 +469,12 @@ pub(super) fn cli(args: &[OsString]) -> Option<Result<bool>> {
         "init" => Some(init(remaining)),
         "change-origin" => Some((|| {
             let [expected, verb, args @ ..] = remaining else {
-                return Err("usage: td-vm-git change-origin REPOSITORY enroll|reserve|revoke POLICY ARGS".into());
+                return Err("usage: td-vm-git change-origin REPOSITORY enroll|reserve|start|revoke POLICY ARGS".into());
             };
             change_origin(Some(expected.to_str().ok_or("invalid expected origin")?),
                 verb.to_str().ok_or("invalid registry verb")?, args)
         })()),
-        "enroll" | "reserve" | "revoke" => Some(change(verb.to_str()?, remaining)),
+        "enroll" | "reserve" | "start" | "revoke" => Some(change(verb.to_str()?, remaining)),
         "authorized-keys" => Some(authorized_keys(remaining)),
         _ => None,
     }

@@ -70,7 +70,7 @@ const HELP: &str = "td-vm: manage persistent graphical td instances
   td-vm workspace prepare NAME BRANCH save a private workspace plan
   td-vm workspace show NAME           inspect saved identity and Git profile
   td-vm workspace key NAME            request the guest-generated SSH public key
-  td-vm workspace enroll NAME         enroll its Git key and reserve its task branch
+  td-vm workspace enroll NAME         enroll its Git key, branch and starting commit
 
 TD_VM_HOME defaults to ~/.local/share/td-vm. Requires host QEMU, qemu-img and qemu-io.
 Reuse dist/td-vm-x86-64 from ./build-qcow; no image rebuild on create/open.
@@ -584,6 +584,9 @@ impl Manager {
         workspace.profile.enroll(&workspace.id, &workspace.branch, &key, &_lock)
             .map_err(|error| format!("Git enrollment is unconfirmed; retry with this same instance: {error}"))?;
         workspace.transition(&dir, vm_workspace::Phase::Enrolled, &key)?;
+        let start = workspace.profile.start(&workspace.id, &workspace.branch, workspace.start.as_deref(), &_lock)
+            .map_err(|error| format!("Git key enrolled; starting commit unconfirmed. Retry enrollment: {error}"))?;
+        workspace.record_start(&dir, &start)?;
         workspace.summary()
     }
 
@@ -1696,7 +1699,7 @@ fn tui(manager: &Manager) -> Result<()> {
                 term::Key::Char('E') if current.is_some() => {
                     let name = current.ok_or("no instance selected")?;
                     status = match manager.enroll_workspace(name) {
-                        Ok(_) => "Git key enrolled and task branch reserved. Press w for details; cloning remains pending.".into(),
+                        Ok(_) => "Git key enrolled, task branch reserved and starting commit retained. Press w for details; cloning remains pending.".into(),
                         Err(error) => error,
                     };
                     break;

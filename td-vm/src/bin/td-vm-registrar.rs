@@ -39,6 +39,12 @@ enum Request {
         id: String,
         branch: String,
     },
+    Start {
+        repository: String,
+        id: String,
+        branch: String,
+        expected: String,
+    },
     Revoke {
         repository: String,
         id: String,
@@ -61,6 +67,17 @@ impl Request {
             .strip_suffix('\n')
             .ok_or("incomplete registrar request")?;
         let words: Vec<_> = body.split(' ').collect();
+        if let ["start", repository, id, branch, expected] = words.as_slice() {
+            // Reuse the reservation grammar, then validate the extra commit assertion.
+            let request = Self::parse(&format!("{HEADER}reserve {repository} {id} {branch}\n"))?;
+            if *expected != "main" {
+                origin::Origin::new((*repository).into(), (*expected).into())?;
+            }
+            let Self::Reserve { repository, id, branch } = request else {
+                return Err("invalid starting-commit request".into());
+            };
+            return Ok(Self::Start { repository, id, branch, expected: (*expected).into() });
+        }
         let (repository, id, branch, key) = match words.as_slice() {
             ["ping"] => return Ok(Self::Ping),
             ["origin"] => return Ok(Self::Origin),
@@ -290,7 +307,7 @@ fn execute(policy: &Path, dispatcher: &Path, request: Request, lifetime: Option<
         .stdout(Stdio::null())
         .stderr(Stdio::inherit());
     let mut scratch = None;
-    let inspect_origin = matches!(request, Request::Origin);
+    let inspect_origin = matches!(request, Request::Origin | Request::Start { .. });
     match request {
         Request::Ping => {
             command.arg("check").arg(policy);
@@ -322,6 +339,10 @@ fn execute(policy: &Path, dispatcher: &Path, request: Request, lifetime: Option<
         }
         Request::Reserve { repository, id, branch } => {
             command.arg("change-origin").arg(repository).arg("reserve").arg(policy).args([id, branch]);
+        }
+        Request::Start { repository, id, branch, expected } => {
+            command.arg("change-origin").arg(repository).arg("start").arg(policy)
+                .args([id, branch, expected]).stdout(Stdio::piped());
         }
         Request::Revoke { repository, id } => {
             command.arg("change-origin").arg(repository).arg("revoke").arg(policy).arg(id);
@@ -401,7 +422,7 @@ fn serve(directory: &Path, policy: &Path, dispatcher: &Path, operator: u32) -> R
 fn request(directory: &Path, server: u32, words: &[String]) -> Result<()> {
     absolute(directory)?;
     let frame = format!("{HEADER}{}\n", words.join(" "));
-    let inspect_origin = matches!(Request::parse(&frame)?, Request::Origin);
+    let inspect_origin = matches!(Request::parse(&frame)?, Request::Origin | Request::Start { .. });
     let mut stream = UnixStream::connect(directory.join("control"))?;
     if sys::peer_uid(&stream)? != server {
         return Err("registrar server account mismatch".into());
@@ -432,7 +453,7 @@ fn run() -> Result<()> {
     match args.as_slice() {
         [verb, directory, policy, dispatcher, operator] if verb == "serve" => serve(Path::new(directory), Path::new(policy), Path::new(dispatcher), operator.parse()?),
         [verb, directory, server, remaining @ ..] if verb == "request" => request(Path::new(directory), server.parse()?, remaining),
-        _ => Err("usage: td-vm-registrar serve SOCKET_DIRECTORY POLICY DISPATCHER OPERATOR_UID | request SOCKET_DIRECTORY SERVER_UID ping|origin|enroll REPOSITORY ID BRANCH KEY_BASE64|reserve REPOSITORY ID BRANCH|revoke REPOSITORY ID".into()),
+        _ => Err("usage: td-vm-registrar serve SOCKET_DIRECTORY POLICY DISPATCHER OPERATOR_UID | request SOCKET_DIRECTORY SERVER_UID ping|origin|enroll REPOSITORY ID BRANCH KEY_BASE64|reserve REPOSITORY ID BRANCH|start REPOSITORY ID BRANCH main|COMMIT|revoke REPOSITORY ID".into()),
     }
 }
 

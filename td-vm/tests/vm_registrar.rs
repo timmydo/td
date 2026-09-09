@@ -77,6 +77,9 @@ fn host_git() -> Result<PathBuf> {
     Err("host Git not found".into())
 }
 fn fixture() -> Result<(Root, PathBuf)> {
+    fixture_format("sha1")
+}
+fn fixture_format(format: &str) -> Result<(Root, PathBuf)> {
     let root = Root(std::env::temp_dir().join(format!(
         "td-registrar-{}-{}",
         std::process::id(),
@@ -88,6 +91,7 @@ fn fixture() -> Result<(Root, PathBuf)> {
     invoke(
         Command::new(&git)
             .args(["init", "--bare", "--initial-branch=main"])
+            .arg(format!("--object-format={format}"))
             .arg(&repo),
         true,
     )?;
@@ -95,6 +99,7 @@ fn fixture() -> Result<(Root, PathBuf)> {
     invoke(
         Command::new(&git)
             .args(["init", "--initial-branch=main"])
+            .arg(format!("--object-format={format}"))
             .arg(&seed),
         true,
     )?;
@@ -170,7 +175,7 @@ fn launch(directory: &Path, policy: &Path, operator: u32) -> Result<Server> {
 fn request(directory: &Path, uid: u32, args: &[&str], success: bool) -> Result<Output> {
     let repository = directory.parent().ok_or("fixture root")?.join("origin.git");
     let mut words = args.to_vec();
-    if matches!(args.first(), Some(&"enroll" | &"reserve" | &"revoke")) {
+    if matches!(args.first(), Some(&"enroll" | &"reserve" | &"start" | &"revoke")) {
         words.insert(1, repository.to_str().ok_or("origin path")?);
     }
     invoke(
@@ -181,6 +186,86 @@ fn request(directory: &Path, uid: u32, args: &[&str], success: bool) -> Result<O
             .args(words),
         success,
     )
+}
+
+#[test]
+fn starting_commits_survive_moving_refs_gc_and_revoke_retries() -> Result<()> {
+    if in_trusted_root("starting_commits_survive_moving_refs_gc_and_revoke_retries")? { return Ok(()); }
+    for format in ["sha1", "sha256"] {
+        let (root, policy) = fixture_format(format)?;
+        let uid = fs::metadata("/proc/self")?.uid();
+        let directory = root.0.join("socket");
+        let server = launch(&directory, &policy, uid)?;
+        let git = host_git()?;
+        let repo = root.0.join("origin.git");
+        let run = |args: &[&str], success| -> Result<String> {
+            let output = invoke(Command::new(&git).arg("--git-dir").arg(&repo).args(args), success)?;
+            Ok(String::from_utf8(output.stdout)?.trim_end().into())
+        };
+        let start_ref = format!("refs/td-vm/start/{ID}");
+        request(&directory, uid, &["start", ID, "task", "main"], false)?;
+        assert!(run(&["for-each-ref", &start_ref], true)?.is_empty());
+        request(&directory, uid, &["enroll", ID, "task", KEY], true)?;
+        request(&directory, uid, &["start", ID, "other", "main"], false)?;
+        invoke(Command::new(BIN).arg("request").arg(&directory).arg(uid.to_string())
+            .args(["start", "/srv/git/wrong.git", ID, "task", "main"]), false)?;
+        // A lost reply is harmless: the next request reads the already selected ref.
+        let first = request(&directory, uid, &["start", ID, "task", "main"], true)?.stdout;
+        let old = run(&["rev-parse", "HEAD"], true)?;
+        assert_eq!(run(&["rev-parse", &start_ref], true)?, old);
+        let replacement = run(&["-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
+            "commit-tree", "HEAD^{tree}", "-m", "unrelated replacement"], true)?;
+        assert_ne!(old, replacement);
+        for name in ["refs/heads/main", "refs/heads/task"] {
+            run(&["update-ref", name, &replacement], true)?;
+        }
+        run(&["pack-refs", "--all"], true)?;
+        run(&["reflog", "expire", "--expire=now", "--all"], true)?;
+        run(&["gc", "--prune=now"], true)?;
+        drop(server);
+        let _server = launch(&directory, &policy, uid)?;
+        assert_eq!(request(&directory, uid, &["start", ID, "task", "main"], true)?.stdout, first);
+        assert_eq!(request(&directory, uid, &["start", ID, "task", &old], true)?.stdout, first);
+        request(&directory, uid, &["start", ID, "task", &replacement], false)?;
+        // A normal clone's head mapping excludes internal refs. Fetch the anchor explicitly.
+        let clone = root.0.join("clone");
+        invoke(Command::new(&git).args(["init", "--initial-branch=main"])
+            .arg(format!("--object-format={format}")).arg(&clone), true)?;
+        invoke(Command::new(&git).arg("-C").arg(&clone).args(["fetch", "--no-tags"])
+            .arg(&repo).arg(&start_ref), true)?;
+        let fetched = invoke(Command::new(&git).arg("-C").arg(&clone)
+            .args(["rev-parse", "FETCH_HEAD"]), true)?;
+        assert_eq!(String::from_utf8(fetched.stdout)?.trim(), old);
+        let sibling = "1123456789abcdef0123456789abcdef";
+        let sibling_key = KEY.replace("IAEB", "IAgI");
+        request(&directory, uid, &["enroll", sibling, "sibling", &sibling_key], true)?;
+        request(&directory, uid, &["start", sibling, "sibling", "main"], true)?;
+        let sibling_ref = format!("refs/td-vm/start/{sibling}");
+        assert_eq!(run(&["rev-parse", &sibling_ref], true)?, replacement);
+        // Ref-lock failure revokes the key but cannot acknowledge completed cleanup.
+        let lock = repo.join(format!("{start_ref}.lock"));
+        fs::create_dir_all(lock.parent().ok_or("lock parent")?)?;
+        fs::write(&lock, "fixture lock")?;
+        request(&directory, uid, &["revoke", ID], false)?;
+        assert!(!fs::read_to_string(&policy)?.contains(&format!("key={ID} ")));
+        assert_eq!(run(&["rev-parse", &start_ref], true)?, old);
+        fs::remove_file(lock)?;
+        request(&directory, uid, &["revoke", ID], true)?;
+        request(&directory, uid, &["revoke", ID], true)?;
+        request(&directory, uid, &["start", ID, "task", "main"], false)?;
+        assert!(run(&["for-each-ref", &start_ref], true)?.is_empty());
+        assert_eq!(run(&["rev-parse", "refs/heads/main"], true)?, replacement);
+        assert_eq!(run(&["rev-parse", "refs/heads/task"], true)?, replacement);
+        assert_eq!(run(&["rev-parse", &sibling_ref], true)?, replacement);
+        // A damaged/deleted recorded anchor is refused, never silently reselected.
+        run(&["update-ref", "-d", &sibling_ref], true)?;
+        request(&directory, uid, &["start", sibling, "sibling", &replacement], false)?;
+        run(&["symbolic-ref", &sibling_ref, "refs/heads/main"], true)?;
+        request(&directory, uid, &["start", sibling, "sibling", "main"], false)?;
+        request(&directory, uid, &["revoke", sibling], false)?;
+        assert_eq!(run(&["rev-parse", "refs/heads/main"], true)?, replacement);
+    }
+    Ok(())
 }
 
 #[test]
@@ -488,8 +573,16 @@ fn manager_enrollment_retries_exact_keys_and_revokes_before_disk_deletion() -> R
     git_cmd(&["update-ref", "-d", "refs/heads/one"])?;
     enroll_reply(&home, "one", KEY, true)?;
     let enrolled = fs::read_to_string(&record)?;
+    assert!(enrolled.starts_with("TDVM-WORKSPACE-3\n"));
+    let start = std::str::from_utf8(&main)?.trim();
+    let anchor = format!("refs/td-vm/start/{id}");
+    assert_eq!(git_cmd(&["rev-parse", &anchor])?.stdout, main);
+    assert_eq!(enrolled.lines().nth(5), Some(start));
     assert!(enrolled.contains(&format!("\nenrolled\nssh-ed25519 {KEY}\n")));
     let authority = fs::read(&policy)?;
+    // Simulate loss of the host acknowledgement before publishing the v3 record.
+    fs::write(&record, enrolled.replace("TDVM-WORKSPACE-3", "TDVM-WORKSPACE-2")
+        .replace(&format!("{start}\nTDVM-GIT-PROFILE-1"), "TDVM-GIT-PROFILE-1"))?;
     enroll_reply(&home, "one", KEY, true)?;
     assert_eq!(fs::read_to_string(&record)?, enrolled);
     assert_eq!(fs::read(&policy)?, authority);
@@ -507,6 +600,20 @@ fn manager_enrollment_retries_exact_keys_and_revokes_before_disk_deletion() -> R
     assert!(fs::read_to_string(&record)?.contains("\nrevoking\n"));
     manager(&["workspace", "enroll", "one"], false)?;
     let _server = launch(&socket, &policy, uid)?;
+    let ref_lock = repository.join(format!("{anchor}.lock"));
+    fs::write(&ref_lock, "blocked ref cleanup")?;
+    manager(&["delete", "one", "--yes"], false)?;
+    assert!(home.join("instances/one/disk.qcow2").is_file());
+    assert!(!fs::read_to_string(&policy)?.contains(&format!("key={id} ")));
+    assert_eq!(git_cmd(&["rev-parse", &anchor])?.stdout, main);
+    fs::remove_file(ref_lock)?;
+    let anchor_path = repository.join(&anchor);
+    let anchor_bytes = fs::read(&anchor_path)?;
+    fs::write(&anchor_path, format!("{}\n", "0".repeat(start.len())))?;
+    manager(&["delete", "one", "--yes"], false)?;
+    assert!(home.join("instances/one/disk.qcow2").is_file());
+    assert!(fs::read_to_string(&record)?.contains("\nrevoking\n"));
+    fs::write(&anchor_path, anchor_bytes)?;
     manager(&["delete", "one", "--yes"], true)?;
     assert!(!home.join("instances/one").exists());
     let authority = fs::read_to_string(&policy)?;
@@ -515,6 +622,8 @@ fn manager_enrollment_retries_exact_keys_and_revokes_before_disk_deletion() -> R
     assert_eq!(git_cmd(&["rev-parse", "refs/heads/main"])?.stdout, main);
     assert_eq!(git_cmd(&["rev-parse", "refs/heads/one"])?.stdout, main);
     assert_eq!(fs::read_to_string(home.join("instances/two/workspace"))?, second);
+    assert!(git_cmd(&["for-each-ref", &anchor])?.stdout.is_empty());
+    assert_eq!(git_cmd(&["rev-parse", &format!("refs/td-vm/start/{second_id}")])?.stdout, main);
     Ok(())
 }
 

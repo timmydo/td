@@ -83,8 +83,7 @@ reusable instance/template lock inodes remain stable. Referenced templates canno
 listing does not create manager state or take catalog locks.
 
 This increment boots the stock desktop and reports workspace integration as
-pending. Per-instance Git keys use the guest helper below. Key enrollment,
-cloning, orderly host power operations, private writable development stores,
+pending. Per-instance Git keys use the guest helper below. Cloning, orderly host power operations, private writable development stores,
 automatic Git setup, and account linking are not implemented. The td-owned clipboard
 and feed bridge described below requires a matching updated system image. Stop from the guest; host
 `stop NAME --force` explicitly cuts power. Disk deletion requires `--yes` or
@@ -1020,8 +1019,8 @@ have no hard elapsed-time bound.
 These checks do not enroll a key, contact SSH, prove the supplied host key
 matches the SSH endpoint, or provision a guest workspace. They report this
 remaining uncertainty explicitly. The sampled main commit is informational,
-not retained for provisioning. The TUI has no global profile editor. Guest
-key generation/enrollment and automatic cloning remain pending.
+not retained for provisioning. The TUI has no global profile editor. Automatic cloning remains pending; per-instance enrollment and starting-commit
+retention are described below.
 
 ### Implemented per-instance workspace plans
 
@@ -1234,13 +1233,15 @@ The development image uses ordinary Git and its source-built OpenSSH client.
 After key enrollment and host-key provisioning, the selected origin is ready
 for an ordinary SSH clone. No custom Git remote helper is required.
 
-On New, the manager selects a starting branch, normally `main`, records its
-commit id, and reserves a unique descriptive task branch. The instance name
+New records a descriptive task branch without contacting the origin. During
+enrollment, the manager reserves that branch, then retains the current `main`
+commit as the starting commit. Other source branches are not selectable yet. The instance name
 is the suggested branch name; the example below uses `terminal-scroll-fix`.
 Use the normal branch naming rules in DEVELOPMENT.md, including reserving
 `-rolling` for explicitly long-lived workstreams. The host retains the selected
-commit for the duration of provisioning so concurrent origin updates or GC
-cannot remove the source while the guest clones it.
+commit until VM revocation so concurrent origin updates or GC cannot remove
+the source while the guest clones it. The guest must fetch the internal ref
+explicitly and check its object ID against the saved starting commit.
 
 Firstboot performs the equivalent of the following inside the guest. These
 commands illustrate the provisioner's fixed argv operations, not manual setup
@@ -1452,10 +1453,9 @@ Seat setup creates a separate public tester runtime at
 `/run/td-guest/1000`; it leaves the human's private runtime private. Persistent
 keys live under `/home/tester/.local/share/td-vm/git` inside each VM disk.
 Changing the host-assigned ID of a used disk is refused by the guest helper.
-This exchange does not enroll the key with the host registrar or reserve a
-branch. Workspace plans still report enrollment and cloning pending. The
-next increment uses the returned public key for the saved host Git profile;
-a key reply alone must never be displayed as an enrolled or ready workspace.
+The key exchange alone does not enroll or reserve anything. The enrollment
+operation below uses this public key and the saved host Git profile; a key
+reply alone must never be displayed as an enrolled or ready workspace.
 
 
 ## Recoverable host Git enrollment
@@ -1466,7 +1466,8 @@ and task branch through the host registrar. The instance lock spans the
 identity read and every request. This is an explicit provisioning step;
 Open does not yet enroll or clone automatically. Successful enrollment
 reserves the branch at origin's HEAD through the existing registry operation.
-It does not establish a guest clone or retain a separate starting-commit ref.
+It then requests and records the retained starting commit described below.
+It does not establish a guest clone.
 
 Before the first external mutation, the manager atomically and durably
 upgrades `workspace` to `TDVM-WORKSPACE-2`, retaining the immutable instance ID,
@@ -1505,3 +1506,59 @@ The manager resolves its root to a bounded absolute canonical path. Durable
 workspace publication requires readable ancestors whose filesystems support
 directory sync; failure refuses the grant. It does not substitute a weaker
 publication protocol on filesystems that cannot provide this guarantee.
+
+
+## Retained workspace starting commits
+
+Enrollment continues with `start REPOSITORY ID BRANCH main|COMMIT` on the
+existing authenticated registrar protocol. Its successful reply uses the
+`origin` response codec, but reports the retained commit. `td-vm-git start
+POLICY ID BRANCH main|COMMIT` is the account-local equivalent; the registrar
+uses the expected-origin dispatcher form under the same registry writer lock.
+The instance must still own its enrolled key and the named task branch.
+
+The first request uses `main` and creates exactly `refs/td-vm/start/ID` at
+the sampled main commit. Git's no-dereference, compare-and-create operation
+refuses another writer's ref; no task branch is reset. Subsequent requests
+return that same internal ref even after main or the task branch moves.
+A request with an exact commit additionally requires the existing ref to
+match; a missing ref is a repair error, never permission to select a new
+base. Symbolic refs, non-commit objects and unexpected descendants are
+refused. SHA-1 and SHA-256 repositories use their ordinary object IDs.
+
+An acknowledged commit is published in `TDVM-WORKSPACE-3`: header, ID,
+branch, enrollment phase, public key, starting commit and canonical public
+Git profile, each separated by LF. The existing 8960-byte bound and private
+atomic publication rules apply. Version 3 requires enrolled or revoking
+state. The starting commit cannot change and survives revocation retries.
+Existing v1/v2 records acquire a start on their next successful enrollment;
+there is no implicit migration on inspection or boot. Older managers refuse
+v3, including deletion. The display reports the saved commit separately
+from enrollment and still reports cloning pending.
+
+The host ref is published before its reply and before the local v3 record.
+An interrupted request or lost reply is retried with the same instance, so
+it recovers the host's original selection. An interrupted local save can
+leave v2 or v3; both use the same idempotent host operation. Once v3 is
+visible, requests assert its exact commit. The manager's instance lock and
+registrar's inherited lifetime lock cover this operation just as they do
+enrollment, preventing deletion from overtaking surviving request processes.
+Git retains its configured ref durability policy; this does not introduce a
+joint power-loss transaction between the repository and manager storage.
+A missing or damaged acknowledged ref fails closed on the next check.
+
+Revocation first publishes the removal of the key and branch reservations,
+then removes only that instance's internal start ref with an expected-old-ID,
+no-dereference deletion. It acknowledges only after cleanup succeeds. A Git
+lock or hook failure therefore keeps the disk and revoking record for retry,
+even when the key was already revoked. Missing refs are already cleaned;
+symbolic or damaged refs require host repair. Main, submitted task branches,
+and sibling retention refs remain unchanged. An in-flight Git session past
+its authorization check remains subject to the existing revocation limits.
+The receive guard already refuses guest pushes to every internal ref.
+
+Retention keeps the selected commit reachable through ordinary Git GC.
+A normal clone's branch fetch mapping excludes this namespace; provisioning
+fetches `refs/td-vm/start/ID` explicitly when needed, verifies the saved ID,
+and creates the task worktree from that commit. A private clone and terminal
+launch are the next implementation step, not implied by successful retention.
