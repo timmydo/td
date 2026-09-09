@@ -71,11 +71,13 @@ const HELP: &str = "td-vm: manage persistent graphical td instances
   td-vm workspace show NAME           inspect saved identity and Git profile
   td-vm workspace key NAME            request the guest-generated SSH public key
   td-vm workspace enroll NAME         enroll its Git key, branch and starting commit
+  td-vm workspace clone NAME          provision its private guest clone and worktree
 
 TD_VM_HOME defaults to ~/.local/share/td-vm. Requires host QEMU, qemu-img and qemu-io.
 Reuse dist/td-vm-x86-64 from ./build-qcow; no image rebuild on create/open.
 Clipboard and feed actions require a bridge-capable system image. Workspace
-provisioning and login integration remain pending. Shut down from inside td;
+clone provisioning uses the updated image. Terminal launch, build-store setup
+and login integration remain pending. Shut down from inside td;
 only explicit force-stop is available until the guest power bridge lands.";
 
 fn main() -> ExitCode {
@@ -140,6 +142,10 @@ fn run(args: Vec<String>) -> Result<()> {
         }
         ["workspace", "enroll", name] => {
             println!("{}", term::scrub_lines(&manager.enroll_workspace(name)?));
+            Ok(())
+        }
+        ["workspace", "clone", name] => {
+            println!("{}", term::scrub_lines(&manager.clone_workspace(name)?));
             Ok(())
         }
         ["workspace", "key", name] => {
@@ -588,6 +594,22 @@ impl Manager {
             .map_err(|error| format!("Git key enrolled; starting commit unconfirmed. Retry enrollment: {error}"))?;
         workspace.record_start(&dir, &start)?;
         workspace.summary()
+    }
+
+    fn clone_workspace(&self, value: &str) -> Result<String> {
+        name(value)?;
+        let lock = self.lock(&format!("instance-{value}"))?;
+        let dir = self.instance(value)?;
+        let workspace = vm_workspace::load(&dir)?.ok_or("instance has no workspace plan")?;
+        let enrollment = workspace.enrollment.as_ref().filter(|state| state.phase == vm_workspace::Phase::Enrolled)
+            .ok_or("enroll this workspace before cloning")?;
+        let start = workspace.start.as_deref().ok_or("enroll again to retain a starting commit")?;
+        workspace.profile.check()?;
+        workspace.profile.start(&workspace.id, &workspace.branch, Some(start), &lock)?;
+        let plan = workspace.profile.clone_plan(&workspace.id, &workspace.branch, start, &enrollment.key)?;
+        let reply = vm_bridge::ask(&dir, vm_wire::WORKSPACE, plan.encode())?;
+        vm_wire::workspace::parse_ready(&reply, &plan)?;
+        Ok(format!("Guest workspace prepared on {} at /home/tester/src/td-vm/work. Terminal launch and agent setup remain pending.", workspace.branch))
     }
 
     fn workspace_key(&self, value: &str) -> Result<String> {
@@ -1608,7 +1630,7 @@ fn tui(manager: &Manager) -> Result<()> {
         let (height, width) = terminal.size();
         let mut frame = term::Frame::new(height, width);
         frame.push_text("td-vm  Enter open · n new · i import · t templates · D delete · X cut power", term::Style::bar(term::CYAN));
-        frame.push_text("h status · R resume · w workspace · W prepare · E enroll · l logs · v paste · c copy · f feed · s sharing · r refresh · q quit", term::Style::bar(term::CYAN));
+        frame.push_text("h status · R resume · w workspace · W prepare · E enroll · C clone · l logs · v paste · c copy · f feed · s sharing · r refresh · q quit", term::Style::bar(term::CYAN));
         frame.push_text(TABLE_HEADER, term::Style::bold());
         let page = height.saturating_sub(8).max(1);
         let offset = selected.saturating_sub(page - 1);
@@ -1700,6 +1722,13 @@ fn tui(manager: &Manager) -> Result<()> {
                     let name = current.ok_or("no instance selected")?;
                     status = match manager.enroll_workspace(name) {
                         Ok(_) => "Git key enrolled, task branch reserved and starting commit retained. Press w for details; cloning remains pending.".into(),
+                        Err(error) => error,
+                    };
+                    break;
+                }
+                term::Key::Char('C') if current.is_some() => {
+                    status = match manager.clone_workspace(current.ok_or("no instance selected")?) {
+                        Ok(message) => message,
                         Err(error) => error,
                     };
                     break;

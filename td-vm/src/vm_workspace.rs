@@ -137,7 +137,7 @@ impl Workspace {
         let state = match self.enrollment.as_ref().map(|value| value.phase) {
             None => "Guest key enrollment and cloning pending; branch and starting commit are not reserved.",
             Some(Phase::Pending) => "Git key enrollment outcome unconfirmed; retry enrollment. Cloning pending.",
-            Some(Phase::Enrolled) => "Git key enrollment and task-branch reservation recorded. Cloning pending.",
+            Some(Phase::Enrolled) => "Git key enrollment and task-branch reservation recorded. Use workspace clone to prepare or inspect the guest clone.",
             Some(Phase::Revoking) => "Git key revocation pending; retry deletion after stopping the VM. Enrollment is disabled.",
         };
         Ok(format!(

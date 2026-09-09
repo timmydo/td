@@ -491,6 +491,50 @@ fn manager_profile_authenticates_exact_origin_and_preserves_failed_updates() -> 
     Ok(())
 }
 
+#[allow(dead_code)]
+#[path = "../../td-compositor/src/vm_wire.rs"]
+mod vm_wire;
+
+fn clone_reply(home: &Path, mismatch: bool) -> Result<Output> {
+    use std::io::BufRead;
+    let dir = home.join("instances/one");
+    let record = fs::read_to_string(dir.join("workspace"))?;
+    let id = record.lines().nth(1).ok_or("instance ID")?.to_string();
+    let start = record.lines().nth(5).ok_or("starting commit")?.to_string();
+    let path = dir.join("bridge");
+    let listener = UnixListener::bind(&path)?;
+    listener.set_nonblocking(true)?;
+    let peer = std::thread::spawn(move || -> std::result::Result<(), String> {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let (mut stream, _) = loop {
+            match listener.accept() {
+                Ok(pair) => break pair,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock && Instant::now() < deadline => std::thread::sleep(Duration::from_millis(5)),
+                Err(e) => return Err(e.to_string()),
+            }
+        };
+        stream.set_read_timeout(Some(Duration::from_secs(5))).map_err(|e| e.to_string())?;
+        let mut bytes = Vec::new();
+        std::io::BufReader::new((&stream).take(vm_wire::MAX_LINE as u64 + 1))
+            .read_until(b'\n', &mut bytes).map_err(|e| e.to_string())?;
+        let message = vm_wire::Message::decode(&bytes)?;
+        assert_eq!(message.verb, vm_wire::WORKSPACE);
+        let mut plan = vm_wire::workspace::Plan::parse(&message.data)?;
+        assert_eq!(plan.id, id); assert_eq!(plan.commit, start); assert_eq!(plan.branch, "one");
+        assert_eq!(plan.guest_key, format!("ssh-ed25519 {KEY}"));
+        if mismatch { plan.branch = "other".into(); }
+        stream.write_all(&vm_wire::Message::new(message.id, vm_wire::OK, 0, vm_wire::workspace::ready(&plan)).encode()?)
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    });
+    let result = invoke(Command::new(env!("CARGO_BIN_EXE_td-vm")).env("TD_VM_HOME", home)
+        .args(["workspace", "clone", "one"]), !mismatch);
+    let joined = peer.join().map_err(|_| "clone peer fixture panicked")?;
+    fs::remove_file(path)?;
+    joined?;
+    result
+}
+
 fn enroll_reply(home: &Path, name: &str, key: &str, success: bool) -> Result<Output> {
     use std::io::BufRead;
     let directory = home.join("instances").join(name);
@@ -586,6 +630,9 @@ fn manager_enrollment_retries_exact_keys_and_revokes_before_disk_deletion() -> R
     enroll_reply(&home, "one", KEY, true)?;
     assert_eq!(fs::read_to_string(&record)?, enrolled);
     assert_eq!(fs::read(&policy)?, authority);
+    clone_reply(&home, false)?;
+    clone_reply(&home, true)?;
+    assert_eq!(fs::read_to_string(&record)?, enrolled);
     let other_key = format!("{}C", KEY.strip_suffix('B').ok_or("fixture key suffix")?);
     enroll_reply(&home, "one", &other_key, false)?;
     assert_eq!(fs::read_to_string(&record)?, enrolled);

@@ -4174,6 +4174,10 @@ fn real_root_steps(sys: &SystemDef) -> Result<Vec<Step>, String> {
         target: "{in:td-vm-guest}/bin/td-vm-guest".into(),
         link: "{root}/real-root/bin/td-vm-guest".into(),
     });
+    steps.push(Step::Symlink {
+        target: "{in:td-vm-guest}/bin/td-vm-ssh".into(),
+        link: "{root}/real-root/bin/td-vm-ssh".into(),
+    });
     steps.push(Step::CopyTree {
         from: "{in:td-seatd}".into(),
         dest: "{root}/real-root{in:td-seatd}".into(),
@@ -7059,6 +7063,8 @@ news\tnews-0.1\tsource\tempty-runtime-1\tsource\n"
         let steps = recipe().steps.unwrap();
         assert!(steps.iter().any(|step| matches!(step, Step::Symlink { target, link }
             if target == "{in:td-vm-guest}/bin/td-vm-guest" && link == "{root}/real-root/bin/td-vm-guest")));
+        assert!(steps.iter().any(|step| matches!(step, Step::Symlink { target, link }
+            if target == "{in:td-vm-guest}/bin/td-vm-ssh" && link == "{root}/real-root/bin/td-vm-ssh")));
         assert!(steps.iter().any(|step| matches!(step, Step::CopyTree { from, dest }
             if from == "{in:td-vm-guest}" && dest == "{root}/real-root{in:td-vm-guest}")));
     }

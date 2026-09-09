@@ -31,6 +31,11 @@ pub fn recipe() -> Recipe {
             content: include_str!("../../../td-compositor/src/vm_wire.rs").into(),
             exec: false,
         },
+        Step::WriteFile {
+            path: "{src}/workspace.rs".into(),
+            content: include_str!("../../../td-vm-guest/src/workspace.rs").into(),
+            exec: false,
+        },
         Step::MkDir {
             path: "{root}/eh".into(),
         },
@@ -79,6 +84,10 @@ pub fn recipe() -> Recipe {
                 "{out}/lib/debug/.td-assembly-exception".into(),
             ],
             exec: false,
+        },
+        Step::Symlink {
+            target: "td-vm-guest".into(),
+            link: "{out}/bin/td-vm-ssh".into(),
         },
         Step::assert_static(&["{out}/bin/td-vm-guest"]),
         Step::run("{out}", &["{out}/bin/td-vm-guest", "--help"]),

@@ -39,6 +39,10 @@ fn reply(
         wire::OK => {
             let shape = match request.verb.as_str() {
                 wire::SNAPSHOT => reply.revision != 0 && reply.data == b"clipboard-v1 feed-v1",
+                wire::WORKSPACE => {
+                    reply.revision == 0 && wire::workspace::Plan::parse(&request.data)
+                        .is_ok_and(|plan| wire::workspace::parse_ready(&reply.data, &plan).is_ok())
+                }
                 wire::KEY => {
                     reply.revision == 0 && wire::git_key::identity(&request.data)
                         .is_ok_and(|id| wire::git_key::parse(&reply.data, id).is_ok())
@@ -254,6 +258,7 @@ fn forward(dir: &Path, request: wire::Message, deadline: Instant) -> Result<wire
         }
         wire::GET | wire::SNAPSHOT if request.data.is_empty() => {}
         wire::KEY => { wire::git_key::identity(&request.data)?; }
+        wire::WORKSPACE => { wire::workspace::Plan::parse(&request.data)?; }
         wire::FEED => {
             wire::feed(&request.data)?;
         }

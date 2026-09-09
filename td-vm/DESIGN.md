@@ -82,10 +82,12 @@ publication lock. Those leases are removed with their transient staging;
 reusable instance/template lock inodes remain stable. Referenced templates cannot be removed. Read-only CLI
 listing does not create manager state or take catalog locks.
 
-This increment boots the stock desktop and reports workspace integration as
-pending. Per-instance Git keys use the guest helper below. Cloning, orderly host power operations, private writable development stores,
-automatic Git setup, and account linking are not implemented. The td-owned clipboard
-and feed bridge described below requires a matching updated system image. Stop from the guest; host
+The stock desktop supports per-instance Git keys, enrollment and explicit
+clone provisioning through the guest helper below. Orderly host power
+operations, private writable development stores, automatic launch
+provisioning, task-terminal launch and account linking remain pending. The
+td-owned clipboard, feed and workspace bridges require a matching updated
+system image. Stop from the guest; host
 `stop NAME --force` explicitly cuts power. Disk deletion requires `--yes` or
 typing the instance name in the TUI and reports unsubmitted work as unknown.
 The table reports allocated overlay space (`HOST MiB`) and virtual disk
@@ -694,7 +696,8 @@ comes from the existing `build-qcow` producer and can be imported once and
 reused for every new instance; an older template still boots its desktop but
 cannot acquire the new capabilities without an image update.
 
-The implemented vocabulary is `snapshot`, `put`, `get`, `feed`, `ok`, `error`.
+The implemented vocabulary is `snapshot`, `put`, `get`, `feed`, `git-key`,
+`workspace`, `ok`, and `error`.
 Each newline-terminated frame contains exactly six space-delimited fields:
 `TDVM1 ID VERB REVISION LENGTH HEX_PAYLOAD`. Numbers are canonical unsigned decimal
 u64, IDs are nonzero random host request identifiers, and payload hex is
@@ -725,7 +728,8 @@ rewritten. The initial protocol has no asynchronous guest-reboot notification.
 The host does not accept unsolicited guest requests, paths, commands or URLs.
 
 The bridge currently handles clipboard and feed configuration directly in the
-compositor. Future provisioning, credentials, status and power operations need
+compositor. Workspace provisioning uses the fixed helper described below. Credentials
+and power operations need
 separate fixed-purpose guest endpoints and their own reviewed authority; the
 current worker does not implement them. Git uses ordinary outbound SSH to the
 host; neither an SSH daemon in the guest nor a host-to-guest port-forward is
@@ -775,8 +779,8 @@ replace a repository when the configured origin is absent or inaccessible.
 | Location | Repository and purpose |
 | --- | --- |
 | Host `/srv/git/td.git` | Shared bare origin: `refs/heads/main` and submitted topic branches. No working tree. |
-| Each guest `/home/tester/src/td` | Full private clone, with `origin` addressing the host as `test` over SSH. |
-| Each guest `/home/tester/src/work/<branch>` | Private task worktree on a descriptive branch, where the agent runs. |
+| Each guest `/home/tester/src/td-vm/repo` | Full private clone, with `origin` addressing the host as `test` over SSH. |
+| Each guest `/home/tester/src/td-vm/work` | Private task worktree on a descriptive branch, where the agent runs. |
 | Host integrator checkout | Separate ordinary clone whose `origin` is `/srv/git/td.git`; td-review fetches and reviews its remote-tracking branches. |
 
 ```mermaid
@@ -1227,7 +1231,7 @@ completion removes the private session directory. A hard-killed dispatcher may
 leave one behind; it must not be pruned while its Git process is alive. The
 registrar's eventual owned-process tracking must cover that cleanup.
 
-### First boot creates the clone automatically
+### Guest clone and task worktree
 
 The development image uses ordinary Git and its source-built OpenSSH client.
 After key enrollment and host-key provisioning, the selected origin is ready
@@ -1243,14 +1247,15 @@ commit until VM revocation so concurrent origin updates or GC cannot remove
 the source while the guest clones it. The guest must fetch the internal ref
 explicitly and check its object ID against the saved starting commit.
 
-Firstboot performs the equivalent of the following inside the guest. These
+The explicit workspace clone operation performs the equivalent of the
+following inside the guest; automatic provisioning on Open remains pending. These
 commands illustrate the provisioner's fixed argv operations, not manual setup
 or a generated shell script:
 
 ```text
-git clone --no-checkout --origin origin ssh://test@td-host/srv/git/td.git /home/tester/src/td
-git -C /home/tester/src/td fetch origin
-git -C /home/tester/src/td worktree add -b terminal-scroll-fix /home/tester/src/work/terminal-scroll-fix <selected-commit-id>
+git clone --no-checkout --origin origin ssh://test@td-host/srv/git/td.git /home/tester/src/td-vm/repo
+git -C /home/tester/src/td-vm/repo fetch origin
+git -C /home/tester/src/td-vm/repo worktree add --relative-paths -b terminal-scroll-fix /home/tester/src/td-vm/work <selected-commit-id>
 ```
 
 The clone contains the full history needed for merge-base, review, and rebase;
@@ -1534,7 +1539,7 @@ state. The starting commit cannot change and survives revocation retries.
 Existing v1/v2 records acquire a start on their next successful enrollment;
 there is no implicit migration on inspection or boot. Older managers refuse
 v3, including deletion. The display reports the saved commit separately
-from enrollment and still reports cloning pending.
+from enrollment and directs the user to explicit clone provisioning.
 
 The host ref is published before its reply and before the local v3 record.
 An interrupted request or lost reply is retried with the same instance, so
@@ -1560,5 +1565,86 @@ The receive guard already refuses guest pushes to every internal ref.
 Retention keeps the selected commit reachable through ordinary Git GC.
 A normal clone's branch fetch mapping excludes this namespace; provisioning
 fetches `refs/td-vm/start/ID` explicitly when needed, verifies the saved ID,
-and creates the task worktree from that commit. A private clone and terminal
-launch are the next implementation step, not implied by successful retention.
+and creates the task worktree from that commit. The clone operation below consumes it. Terminal launch is a separate step,
+not implied by successful retention or cloning.
+
+
+## Explicit guest clone provisioning
+
+After enrollment, `td-vm workspace clone NAME` or C in the TUI prepares the
+private Git workspace through the td-owned carrier. It rechecks the saved
+origin and exact retained commit before sending a typed public clone plan.
+The instance lock covers the request, just as it covers enrollment. A pending
+reply means provisioning may be running; repeat Clone to inspect completion.
+Open does not yet enroll or clone automatically. The local workspace view
+reports its saved enrollment and starting commit without claiming live clone
+status. A successful clone reply reports only workspace preparation, not
+terminal launch, build-store readiness, tests, or provider authentication.
+
+The `workspace` request has revision zero and contains `TDVM-CLONE-1`, then
+exactly eleven LF-separated fields with a final LF: instance ID, task branch,
+retained commit, canonical repository path, guest-visible SSH address, port,
+SSH user, public host key, enrolled guest public key, author name, author email.
+Its maximum is 2048 bytes. Branches share the registrar's exact grammar;
+object IDs are nonzero lowercase SHA-1 or SHA-256. Paths, hostnames, ports,
+account names, keys and author values retain the public Git profile's bounds.
+No executable, private key, host filesystem destination or shell fragment is
+accepted. The origin is ordinary `ssh://USER@td-host/REPOSITORY`; the private
+SSH profile supplies its verified address and port.
+
+The compositor validates the plan and atomically publishes it in its own
+volatile `/run/td-compositor/1000/vm-workspace`. It returns only a matching
+bounded response from `/run/td-guest/1000/workspace`, checking both directories
+and the opened response's ownership, type, link count and write permissions.
+This operation requires neither clipboard sharing nor focus, cancels any
+clipboard lease, and is absent from public Wayland and the control socket.
+Each explicit request replaces the request inode, enabling retry of a failed
+attempt. The service suppresses retries while its observed request/state is
+unchanged. A request arriving during an attempt observes that attempt's result;
+a failure needs another explicit Clone after correcting its cause.
+
+Success is `TDVM-CLONE-READY-1` plus the exact canonical plan. Failure is
+`TDVM-CLONE-FAILED-1`, one bounded diagnostic line, and that same plan. Replies
+are at most 4096 bytes. Every relay validates completion against all request
+fields; stale or mismatched responses cannot acknowledge another plan.
+A response describes completed provisioning for that plan, not continuous
+inspection of subsequent human edits. New helper startup clears stale replies.
+Plan/status files contain public configuration only, never provider tokens or
+private SSH key bytes. A lost carrier reply does not cancel a clone.
+
+The source-built helper runs fixed Git commands as tester. It validates its
+existing private key against the enrolled public key, publishes a private SSH
+configuration, then prepares the full clone in `/home/tester/src/.td-vm.tmp`.
+The matching standard image includes the `td-vm-ssh` alias of this Rust helper.
+Git records that fixed executable as `core.sshCommand`; the single executable
+path needs no generated shell command. The alias execs `/bin/ssh` with the
+fixed private configuration and carries only exact Git protocol-v2 metadata.
+No SSH daemon, host terminal relay, tmux or forwarded agent runs in the guest.
+
+The full clone and task worktree live at `/home/tester/src/td-vm/repo` and
+`/home/tester/src/td-vm/work`. Git's relative worktree links allow the complete
+staged parent to be renamed atomically into place after validation and sync.
+Clone rejects a shallow source and uses SSH exclusively, without alternates,
+hardlinks to host objects, a bundle, or a repository snapshot in the image.
+Provisioning disables ambient Git configuration, automatic maintenance,
+recursive submodule fetches and hooks; it uses an empty private template and
+Git object verification. It explicitly fetches the internal retention ref,
+checks the exact selected object ID, configures author and origin/main, and
+creates the named task branch at that commit. The published clone retains
+ordinary branch fetch mapping and the fixed SSH launcher for later fetch/push.
+
+The helper's private `ssh` configuration and final workspace plan are immutable.
+A conflicting plan, damaged configuration or existing unrecognized workspace
+is refused, never overwritten. Retries may reclaim only the helper's reserved
+`ssh.tmp` and `.td-vm.tmp` staging directories. A published workspace is
+validated and reused without recloning, resetting, rebasing or changing dirty
+and untracked files. Publication sync is bounded to one million entries and
+64 directory levels; symlinks are preserved as Git data and never followed by
+the sync walk. The deployed root stays immutable; all writes are in the VM's
+private home. The helper's detailed contract is in
+[td-vm-guest/DESIGN.md](../td-vm-guest/DESIGN.md).
+
+An explicit Clone action can briefly return the previous failed attempt's
+message while the helper observes the new request. That diagnostic explicitly
+says a retry was requested and directs the operator to inspect completion;
+it does not attribute the old failure to the new attempt.

@@ -5,6 +5,10 @@
 #[path = "../vm_git_origin.rs"]
 mod origin;
 
+#[allow(dead_code)]
+#[path = "../../../td-compositor/src/vm_wire.rs"]
+mod vm_wire;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs::{self, DirBuilder, File};

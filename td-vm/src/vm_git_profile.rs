@@ -188,6 +188,17 @@ impl Profile {
         Ok(text.trim_end_matches('\n').into())
     }
 
+    pub fn clone_plan(&self, id: &str, branch: &str, commit: &str, key: &str) -> Result<crate::vm_wire::workspace::Plan> {
+        let plan = crate::vm_wire::workspace::Plan {
+            id: id.into(), branch: branch.into(), commit: commit.into(),
+            repository: self.repository()?.into(), address: self.get("address")?.into(),
+            port: self.get("port")?.parse().map_err(|_| "invalid SSH port")?,
+            user: self.get("user")?.into(), host_key: self.get("host-key")?.into(), guest_key: key.into(),
+            author_name: self.get("author-name")?.into(), author_email: self.get("author-email")?.into(),
+        };
+        crate::vm_wire::workspace::Plan::parse(&plan.encode())
+    }
+
     pub fn enroll(&self, id: &str, branch: &str, key: &str, lock: &File) -> Result<()> {
         if !crate::vm_git_names::instance_valid(id) || !crate::vm_git_names::branch_valid(branch) {
             return Err("invalid workspace enrollment identity or branch".into());

@@ -2,13 +2,14 @@
 name = "td-vm-guest"
 version = "0.1.0"
 edition = "2021"
-description = "Private development VM Git identity provisioning for td"
+description = "Private development VM Git identity and workspace provisioning for td"
 license = "GPL-3.0-or-later"
 
 # How builder/src/affected.rs gates this crate; absent keys take the defaults.
 [package.metadata.td-gate]
 clippy-all-targets = true
-# Real key fixtures require the host OpenSSH tool, absent from gate 325.
+# Real key/clone fixtures require host OpenSSH, Git, rustc and GCC.
+# The compiler-only sandbox does not supply these runtime fixture tools.
 test-args = "--include-ignored"
 gate-test-args = "--bins"
 

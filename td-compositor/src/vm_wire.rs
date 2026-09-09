@@ -16,6 +16,7 @@ pub const PUT: &str = "put";
 pub const GET: &str = "get";
 pub const FEED: &str = "feed";
 pub const KEY: &str = "git-key";
+pub const WORKSPACE: &str = "workspace";
 pub const OK: &str = "ok";
 pub const ERROR: &str = "error";
 
@@ -97,7 +98,7 @@ impl Message {
 }
 
 fn valid_verb(verb: &str) -> bool {
-    matches!(verb, SNAPSHOT | PUT | GET | FEED | KEY | OK | ERROR)
+    matches!(verb, SNAPSHOT | PUT | GET | FEED | KEY | WORKSPACE | OK | ERROR)
 }
 
 fn decimal(value: Option<&str>) -> Result<u64, String> {
@@ -409,4 +410,249 @@ pub mod git_key {
             assert!(encode(ID, &format!("{KEY}\nprivate-data")).is_err());
         }
     }
+}
+
+
+#[allow(dead_code)] // Shared public provisioning contract at all three boundaries.
+pub mod workspace {
+    pub const REQUEST: &str = "/run/td-compositor/1000/vm-workspace";
+    pub const RESPONSE: &str = "/run/td-guest/1000/workspace";
+    pub const LIMIT: usize = 2048;
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct Plan {
+        pub id: String,
+        pub branch: String,
+        pub commit: String,
+        pub repository: String,
+        pub address: String,
+        pub port: u16,
+        pub user: String,
+        pub host_key: String,
+        pub guest_key: String,
+        pub author_name: String,
+        pub author_email: String,
+    }
+    impl Plan {
+        pub fn parse(bytes: &[u8]) -> Result<Self, String> {
+            if bytes.len() > LIMIT {
+                return Err("workspace plan exceeds limit".into());
+            }
+            let text = std::str::from_utf8(bytes).map_err(|_| "workspace plan is not UTF-8")?;
+            let mut fields = text
+                .strip_suffix('\n')
+                .ok_or("incomplete workspace plan")?
+                .split('\n');
+            if fields.next() != Some("TDVM-CLONE-1") {
+                return Err("unsupported workspace plan".into());
+            }
+            let mut field = || {
+                fields
+                    .next()
+                    .filter(|value| !value.is_empty() && !value.chars().any(char::is_control))
+                    .map(String::from)
+                    .ok_or_else(|| "missing or invalid workspace field".to_string())
+            };
+            let id = field()?;
+            let branch = field()?;
+            let commit = field()?;
+            let repository = field()?;
+            let address = field()?;
+            let port_text = field()?;
+            let port: u16 = port_text
+                .parse()
+                .map_err(|_| "invalid workspace SSH port")?;
+            let result = Self {
+                id,
+                branch,
+                commit,
+                repository,
+                address,
+                port,
+                user: field()?,
+                host_key: field()?,
+                guest_key: field()?,
+                author_name: field()?,
+                author_email: field()?,
+            };
+            if fields.next().is_some() || port == 0 || port.to_string() != port_text {
+                return Err("extra workspace fields or invalid port".into());
+            }
+            super::git_key::identity(result.id.as_bytes())?;
+            super::git_key::key(&result.host_key)?;
+            super::git_key::key(&result.guest_key)?;
+            if !branch_valid(&result.branch)
+                || !matches!(result.commit.len(), 40 | 64)
+                || !result
+                    .commit
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+                || result.commit.bytes().all(|b| b == b'0')
+            {
+                return Err("invalid workspace branch or commit".into());
+            }
+            let path = &result.repository;
+            if !path.starts_with('/')
+                || path.len() > 200
+                || path
+                    .split('/')
+                    .skip(1)
+                    .any(|s| s.is_empty() || s == "." || s == "..")
+                || !path
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"/-_.".contains(&b))
+            {
+                return Err("invalid workspace origin path".into());
+            }
+            if result.address.len() > 253
+                || result.address.split('.').any(|part| {
+                    part.is_empty()
+                        || part.len() > 63
+                        || part.starts_with('-')
+                        || part.ends_with('-')
+                        || !part.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+                })
+            {
+                return Err("invalid workspace host address".into());
+            }
+            if result.address.split('.').count() == 4
+                && result
+                    .address
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || b == b'.')
+                && result.address.parse::<std::net::Ipv4Addr>().is_err()
+            {
+                return Err("invalid workspace IPv4 address".into());
+            }
+            if result.user.len() > 32
+                || result.user.starts_with('-')
+                || !result
+                    .user
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"_-".contains(&b))
+            {
+                return Err("invalid workspace SSH user".into());
+            }
+            for author in [&result.author_name, &result.author_email] {
+                if author.len() > 200 || author.trim() != author || author.contains(['<', '>']) {
+                    return Err("invalid workspace author".into());
+                }
+            }
+            Ok(result)
+        }
+        pub fn encode(&self) -> Vec<u8> {
+            format!(
+                "TDVM-CLONE-1\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n",
+                self.id,
+                self.branch,
+                self.commit,
+                self.repository,
+                self.address,
+                self.port,
+                self.user,
+                self.host_key,
+                self.guest_key,
+                self.author_name,
+                self.author_email
+            )
+            .into_bytes()
+        }
+        pub fn retention_ref(&self) -> String {
+            format!("refs/td-vm/start/{}", self.id)
+        }
+        pub fn origin(&self) -> String {
+            format!("ssh://{}@td-host{}", self.user, self.repository)
+        }
+    }
+    pub fn branch_valid(branch: &str) -> bool {
+        !branch.is_empty()
+            && branch.len() <= 200
+            && branch != "main"
+            && branch != "HEAD"
+            && !branch.starts_with("refs/")
+            && !branch.contains("..")
+            && branch.split('/').all(|part| {
+                !part.is_empty()
+                    && !part.starts_with(['.', '-'])
+                    && !part.ends_with('.')
+                    && !part.ends_with(".lock")
+                    && part
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
+            })
+    }
+    pub fn ready(plan: &Plan) -> Vec<u8> {
+        [b"TDVM-CLONE-READY-1\n".as_slice(), plan.encode().as_slice()].concat()
+    }
+    pub fn parse_ready(bytes: &[u8], expected: &Plan) -> Result<(), String> {
+        let plan = Plan::parse(
+            bytes
+                .strip_prefix(b"TDVM-CLONE-READY-1\n")
+                .ok_or("workspace is not ready")?,
+        )?;
+        if plan != *expected {
+            return Err("workspace reply differs from this request".into());
+        }
+        Ok(())
+    }
+    pub fn failure(plan: &Plan, error: &str) -> Vec<u8> {
+        let message: String = error
+            .chars()
+            .filter(|c| !c.is_control())
+            .take(256)
+            .collect();
+        [
+            format!("TDVM-CLONE-FAILED-1\n{message}\n").as_bytes(),
+            plan.encode().as_slice(),
+        ]
+        .concat()
+    }
+    pub fn status(bytes: &[u8], expected: &Plan) -> Result<(), String> {
+        if let Some(rest) = bytes.strip_prefix(b"TDVM-CLONE-FAILED-1\n") {
+            let text = std::str::from_utf8(rest).map_err(|_| "invalid workspace failure")?;
+            let (message, encoded) = text.split_once('\n').ok_or("invalid workspace failure")?;
+            if message.len() > 1024
+                || message.chars().any(char::is_control)
+                || Plan::parse(encoded.as_bytes())? != *expected
+            {
+                return Err("workspace failure differs from this request".into());
+            }
+            return Err(format!(
+                "Previous guest clone attempt failed: {message}. A retry was requested; run clone again to inspect completion"
+            ));
+        }
+        parse_ready(bytes, expected)
+    }
+    #[cfg(test)]
+    pub fn example() -> Plan {
+        let key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEB";
+        Plan { id: "0123456789abcdef0123456789abcdef".into(), branch: "task".into(), commit: "a".repeat(40),
+            repository: "/srv/git/td.git".into(), address: "10.0.2.2".into(), port: 22, user: "test".into(),
+            host_key: key.into(), guest_key: key.into(), author_name: "Fixture".into(), author_email: "fixture@example.invalid".into() }
+    }
+    #[cfg(test)]
+    mod tests {
+        #![allow(clippy::unwrap_used)]
+        use super::*;
+        #[test]
+        fn plans_and_status_bind_every_field_and_refuse_injection() {
+            let plan = example();
+            let text = String::from_utf8(plan.encode()).unwrap();
+            assert_eq!(Plan::parse(text.as_bytes()).unwrap(), plan);
+            for bad in [
+                text.replace("\ntask\n", "\nmain\n"), text.replace("\ntask\n", "\n--option\n"),
+                text.replace("10.0.2.2", "host -oProxyCommand=bad"), text.replace("10.0.2.2", "999.0.0.1"),
+                text.replace("/srv/git/td.git", "/srv/../repo"), text.replace("/srv/git/td.git", "/repo;command"),
+                text.replace("\n22\n", "\n022\n"), text.replace("\n22\n", "\n0\n"),
+                text.replace(&"a".repeat(40), &"0".repeat(40)), text.replace("Fixture", "Bad\rName"),
+                format!("{text}extra\n"), text.trim_end().into(),
+            ] { assert!(Plan::parse(bad.as_bytes()).is_err(), "{bad}"); }
+            assert!(parse_ready(&ready(&plan), &plan).is_ok());
+            let mut other = plan.clone(); other.branch = "other".into();
+            assert!(parse_ready(&ready(&other), &plan).is_err());
+            assert!(status(&failure(&plan, "fixed failure"), &plan).unwrap_err().contains("fixed failure"));
+            assert!(status(&failure(&other, "fixed failure"), &plan).unwrap_err().contains("differs"));
+        }
+    }
+
 }

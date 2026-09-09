@@ -6563,3 +6563,15 @@ reading. This is a private carrier operation, absent from public Wayland and
 the control socket. [The guest helper](../td-vm-guest/DESIGN.md) retains the
 private key in tester's persistent home. The compositor cannot generate,
 import, export or enroll a private key through this operation.
+
+
+The `workspace` carrier operation accepts only the bounded public clone plan
+in [td-vm's clone contract](../td-vm/DESIGN.md#explicit-guest-clone-provisioning).
+It cancels clipboard leases and publishes to compositor-owned `vm-workspace`,
+then validates a matching bounded tester-owned status. Explicit requests replace
+the request inode so the helper can retry a failed attempt. The compositor does
+not run Git, SSH, key tools or a terminal for this operation. The helper owns
+private configuration and staging; only the complete public plan and status
+cross the carrier. Success is recorded workspace preparation, not live
+inspection of human edits or agent readiness. Public Wayland/control clients
+cannot invoke this operation, and neither clipboard sharing nor focus gates it.

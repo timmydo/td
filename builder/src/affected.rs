@@ -4496,7 +4496,9 @@ mod tests {
         assert_eq!(readers_of("td-busd"), ["td-audio", "td-compositor", "td-jail", "td-login", "td-portal", "td-secret"]);
         assert_eq!(readers_of("td-boot"), ["td-install"]);
         assert!(readers_of("td-review").is_empty(), "{readers:?}");
-        assert!(readers_of("td-vm").is_empty(), "{readers:?}");
+        // Public VM retention-ref and guest workspace paths also spell td-vm/.
+        // As with runtime directory names above, these widen the textual graph.
+        assert_eq!(readers_of("td-vm"), ["td-compositor", "td-vm-guest"]);
         assert!(readers_of("td-sh").is_empty(), "{readers:?}");
         for (read, its_readers) in &readers {
             assert!(!its_readers.contains(read), "{read} reads itself");
@@ -6580,9 +6582,7 @@ mod tests {
         assert_eq!(workspace(&review), 2);
         assert_eq!(names(&review), ["td-review"]);
         let vm = one("td-vm/src/bin/td-vm-registrar.rs");
-        assert_eq!(vm.len(), 4, "{vm:?}");
         assert_eq!(workspace(&vm), 2);
-        assert_eq!(names(&vm), ["td-vm"]);
         // An embedded crate nobody else reads: the same shape.
         let sh = one("td-sh/src/main.rs");
         assert_eq!(sh.len(), 4, "{sh:?}");
@@ -6607,6 +6607,8 @@ mod tests {
             ]
         );
         assert_eq!(comp.len(), 23, "{comp:?}");
+        // Runtime td-vm/ spellings conservatively connect the same reader set.
+        assert_eq!(vm, comp);
         assert_eq!(
             names(&one("td-busd/src/wire.rs")),
             [

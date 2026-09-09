@@ -7,6 +7,7 @@
     path = "../../td-compositor/src/vm_wire.rs"
 )]
 mod vm_wire;
+mod workspace;
 use std::fs::{self, DirBuilder, File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::fd::OwnedFd;
@@ -403,10 +404,12 @@ fn failure_state(
                 ino: m.ino(),
                 mode: m.mode(),
                 uid: m.uid(),
-                links: m.nlink(),
-                size: m.len(),
-                mtime: (m.mtime(), m.mtime_nsec()),
-                ctime: (m.ctime(), m.ctime_nsec()),
+                // The key and clone jobs share directories. Their proof and
+                // reply churn must not trigger each other's failed attempts.
+                links: if m.is_dir() { 0 } else { m.nlink() },
+                size: if m.is_dir() { 0 } else { m.len() },
+                mtime: if m.is_dir() { (0, 0) } else { (m.mtime(), m.mtime_nsec()) },
+                ctime: if m.is_dir() { (0, 0) } else { (m.ctime(), m.ctime_nsec()) },
             })
             .map_err(|e| e.kind())
     })
@@ -419,6 +422,7 @@ fn serve() -> Result<()> {
         return Err("VM guest helper must run as tester (UID 1000)".into());
     }
     clear_response(Path::new(protocol::RESPONSE), uid)?;
+    clear_response(Path::new(vm_wire::workspace::RESPONSE), uid)?;
     let home = Path::new("/home/tester");
     directory(home, uid, false)?;
     let mut state = home.to_path_buf();
@@ -450,11 +454,18 @@ fn serve() -> Result<()> {
     }
     lock.try_lock()
         .map_err(|e| format!("guest key helper already active: {e}"))?;
+    let mut workspace = workspace::Worker::default();
+    let worker_lock = state.join("git-worker.lock");
+    let tools = workspace::Tools { git: Path::new("/bin/git"), keygen: Path::new("/bin/ssh-keygen"), launcher: Path::new("/bin/td-vm-ssh"), worker_lock: &worker_lock };
+    let mut workspace_error = String::new();
     let mut last_error = String::new();
     let mut published: Option<(Vec<u8>, Vec<u8>)> = None;
     let mut failed = None;
     let keygen = Path::new("/bin/ssh-keygen");
     loop {
+        if let Err(error) = workspace.poll(&state, home, &lock, uid, &tools) {
+            if error != workspace_error { eprintln!("td-vm-guest: {error}"); workspace_error = error; }
+        }
         let request = Path::new(protocol::REQUEST);
         let response = Path::new(protocol::RESPONSE);
         let idle = matches!(fs::symlink_metadata(request), Err(e) if e.kind() == std::io::ErrorKind::NotFound);
@@ -503,6 +514,12 @@ fn serve() -> Result<()> {
 }
 
 fn main() -> ExitCode {
+    if std::env::args_os().next().as_deref().and_then(|s| Path::new(s).file_name()) == Some(std::ffi::OsStr::new("td-vm-ssh")) {
+        return match workspace::ssh(&std::env::args_os().skip(1).collect::<Vec<_>>()) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => { eprintln!("td-vm-ssh: {error}"); ExitCode::FAILURE }
+        };
+    }
     let args: Vec<_> = std::env::args().skip(1).collect();
     let result = if args.as_slice() == ["--help"] {
         println!("usage: td-vm-guest serve");
@@ -616,6 +633,43 @@ FnRkLXFlbXUtYWRtaW4tc2VsZnRlc3QBAgMEBQYH
             damaged
         );
         assert!(!f.state().join("git.proof").exists());
+        // Model both jobs after a service restart. Their proof/response writes
+        // must not invalidate the other job's unchanged-failure suppression.
+        let workspace_request = f.root.join("request/vm-workspace");
+        let workspace_response = f.root.join("response/workspace");
+        let mut plan = vm_wire::workspace::example();
+        plan.guest_key = public.trim().into();
+        write(&workspace_request, &plan.encode(), 0o644).unwrap();
+        let worker_path = f.state().join("git-worker.lock");
+        let tools = workspace::Tools {
+            git: Path::new("/missing-git"), keygen: &f.keygen,
+            launcher: Path::new("/missing-ssh"), worker_lock: &worker_path,
+        };
+        let lock_path = f.state().join("lock");
+        write(&lock_path, b"", 0o600).unwrap();
+        let lock = File::options().read(true).write(true).open(&lock_path).unwrap();
+        lock.try_lock().unwrap();
+        let endpoints = workspace::Endpoints {
+            request: &workspace_request, response: &workspace_response, owner: f.uid,
+        };
+        let mut worker = workspace::Worker::default();
+        let mut failed = None;
+        let mut attempts = (0, 0);
+        for _ in 0..4 {
+            if worker.poll_at(&f.state(), &f.root, &lock, f.uid, &tools, &endpoints).is_err() {
+                attempts.0 += 1;
+            }
+            let observed = failure_state(&f.state(), &f.request(), &f.response(), &f.keygen);
+            if failed.as_ref() != Some(&observed) {
+                assert!(f.exchange().is_err());
+                attempts.1 += 1;
+                failed = Some(failure_state(&f.state(), &f.request(), &f.response(), &f.keygen));
+            }
+        }
+        assert_eq!(attempts, (1, 1), "workers retried each other's directory churn");
+        fs::write(&workspace_request, plan.encode()).unwrap();
+        assert!(worker.poll_at(&f.state(), &f.root, &lock, f.uid, &tools, &endpoints).is_err());
+        assert!(failed == Some(failure_state(&f.state(), &f.request(), &f.response(), &f.keygen)));
         let failed = failure_state(&f.state(), &f.request(), &f.response(), &f.keygen);
         assert!(failed == failure_state(&f.state(), &f.request(), &f.response(), &f.keygen));
         fs::set_permissions(
