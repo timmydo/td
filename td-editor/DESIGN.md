@@ -612,6 +612,18 @@ Save then writes the later draft to its original path while the contested
 destination remains intact. This orders creation before worker I/O; it is
 not a race injection inside filesystem publication itself.
 
+A feature-only disconnect case closes the held barrier peer without a
+release, after proving later edits are usable within the four-second
+budget. The historical unavailable error and cleared busy slot must also
+be observed within four seconds measured before Save submission, excluding
+barrier timeout as the cause. Disk bytes remain unchanged and later text
+stays dirty, checked alongside correlated pixels.
+A subsequent Save also reaches a terminal error without writing or remaining
+pending; further edits, their rendered text and explicit close-discard still
+work. This does not prove that no worker restart was attempted. It proves
+the test barrier's pre-I/O fail-closed behavior, not that
+arbitrary worker death after publication leaves the destination unchanged.
+
 ## Line-number display
 
 Line numbers are on by default, a window-wide view preference shared by all

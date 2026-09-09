@@ -208,6 +208,95 @@ fn save_as_destination_created_after_handoff_is_not_overwritten() {
     compositor.stop();
 }
 
+#[test]
+#[ignore = "ready builds the isolated test-file-barrier editor"]
+fn barrier_disconnect_fails_before_write_and_leaves_document_editable() {
+    let compositor_directory = Directory::new();
+    let directory = Directory::new();
+    let mut compositor = Compositor::start(&compositor_directory);
+    let mut barrier = Barrier::start(&directory);
+    let file = directory.0.join("draft");
+    let dictionary = directory.0.join("dictionary");
+    std::fs::write(&file, b"disk").unwrap();
+    std::fs::write(&dictionary, b"disk\n").unwrap();
+    let display = compositor.directory.join("wayland-0");
+    let mut editor = EditorProcess::start_with_barrier(
+        &directory,
+        &display,
+        &file,
+        &dictionary,
+        "windows",
+        Some(&barrier.path),
+    );
+    editor.legacy_keyboard("windows");
+    let window = compositor.window();
+    assert_eq!(compositor.request("fullscreen", 1024), b"ok\n");
+    editor.wait_field("state", "window", "800,576,1");
+    editor.rendered_at(800, 576);
+    editor.ok("insert\t1\t0\t0\t0\t61");
+    barrier.arm("save");
+    let started = Instant::now();
+    assert_eq!(editor.request("save\t1\t1").unwrap(), "pending\t1");
+    barrier.held();
+    editor.wait_field("state", "job", "1,save,1,1,0,pending,-");
+    editor.wait_field("state", "native", "1,1,1,0");
+    editor.ok("insert\t1\t1\t1\t1\t62");
+    editor.wait_tab(2, "abdisk");
+    assert_eq!(std::fs::read(&file).unwrap(), b"disk");
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(4),
+        "held evidence: {elapsed:?}"
+    );
+    let before = compositor.observe(&window);
+    // Drop the release sender and join: the held peer closes without continue.
+    barrier.finish();
+    assert_eq!(
+        editor.wait_job_outcome("1", ",error,unavailable"),
+        "job=1,save,1,1,0,error,unavailable"
+    );
+    editor.wait_field("state", "native", "1,1,0,0");
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(4),
+        "disconnect completion exceeded four seconds: {elapsed:?}"
+    );
+    editor.wait_field("state", "dialog", "-");
+    editor.wait_field("state", "dialog-last", "0");
+    editor.wait_field("state", "tab", "1,2,1,6,2,2,0,72,0,lf");
+    editor.wait_tab(2, "abdisk");
+    compositor.rendered_text(&mut editor, &window, 2, before, "abdisk", 2);
+    assert_eq!(std::fs::read(&file).unwrap(), b"disk");
+    // Another Save must fail without writing or leaving a job pending.
+    assert_eq!(editor.request("save\t1\t2").unwrap(), "pending\t2");
+    assert_eq!(
+        editor.wait_job_outcome("2", ",error,unavailable"),
+        "job=2,save,1,2,0,error,unavailable"
+    );
+    editor.wait_field("state", "native", "1,1,0,0");
+    let before_edit = compositor.observe(&window);
+    editor.ok("insert\t1\t2\t2\t2\t63");
+    editor.wait_tab(3, "abcdisk");
+    editor.wait_field("state", "tab", "1,3,1,7,3,3,0,72,0,lf");
+    compositor.rendered_text(&mut editor, &window, 3, before_edit, "abcdisk", 3);
+    assert_eq!(std::fs::read(&file).unwrap(), b"disk");
+    // Keep a clean tab so discard has a live reply before ordinary quit.
+    assert_eq!(editor.ok("new"), "2");
+    editor.ok("select-tab\t1\t3");
+    editor.ok("close-tab\t1\t3");
+    let state = editor.ok("state");
+    let dialog = field(&state, "dialog")
+        .expect("close dialog field")
+        .split(',')
+        .next()
+        .unwrap();
+    assert_ne!(dialog, "-", "{state}");
+    editor.ok(&format!("dialog-answer\t{dialog}\t1\t3\tdiscard"));
+    editor.wait_field("state", "active", "2");
+    editor.quit();
+    compositor.stop();
+}
+
 fn admitted_save(save_as: bool) {
     let compositor_directory = Directory::new();
     let directory = Directory::new();
