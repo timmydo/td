@@ -5742,7 +5742,12 @@ reply-expected method call receives `LimitsExceeded`; a call carrying
 the broker's own bound, a truncated frame, or a corrupt broker stream
 terminates the service and lets supervision restart it. Setup calls and the
 connect attempt share finite 20-second bounds. The service's idle read is
-deliberately unbounded because a daemon with no calls is healthy. Malformed
+deliberately unbounded because a daemon with no calls is healthy. Calls and
+signals arriving during setup are retained in receive order and dispatched
+before later service events: public-name acquisition can expose the service
+before its setup reply arrives. This queue has a shared 32-frame ceiling,
+each within the 256-KiB frame bound; exhaustion stops startup. Setup still
+refuses oversized or descriptor-bearing frames. Malformed
 calls below the portal cap receive bounded D-Bus errors where their decoded
 shape permits it.
 

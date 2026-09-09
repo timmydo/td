@@ -392,6 +392,7 @@ struct Connection {
     serial: u32,
     unique: Option<String>,
     until: Option<Instant>,
+    setup_events: Vec<Vec<u8>>,
 }
 
 #[derive(Debug)]
@@ -564,6 +565,7 @@ impl Connection {
             serial: 0,
             unique: None,
             until: Some(until),
+            setup_events: Vec::new(),
         };
         connection.handshake(uid)?;
         let hello = connection.call(BUS_NAME, BUS_PATH, BUS_NAME, "Hello", "", |_| Ok(()))?;
@@ -734,6 +736,13 @@ impl Connection {
                 return Err(io::Error::other(
                     "Request.Response arrived before its method reply",
                 ));
+            }
+            if matches!(reply.kind, MessageType::MethodCall | MessageType::Signal) {
+                if self.setup_events.len() == MAX_QUEUED_SERVICE_EVENTS {
+                    return Err(io::Error::other("too many portal events during setup"));
+                }
+                self.setup_events.push(bytes);
+                continue;
             }
             if reply.fields.reply_serial != Some(serial) {
                 continue;
@@ -1188,6 +1197,11 @@ fn serve(connection: &mut Connection, settings: &Settings, application_policy: a
         application_policy: Some(application_policy),
         ..ServiceState::default()
     };
+    // Calls can precede the reply that grants our public name.
+    for bytes in std::mem::take(&mut connection.setup_events) {
+        consume_bus_frame(connection, settings, &mut state, &sender,
+            IncomingFrame::Message(bytes))?;
+    }
     loop {
         let event = receiver
             .recv()
@@ -4297,6 +4311,7 @@ mod tests {
             serial: 40,
             unique: Some(":1.10".into()),
             until: None,
+            setup_events: Vec::new(),
         };
         let mut state = service_state();
         begin_open_file(&mut connection, &mut state, &call).unwrap();
@@ -4336,6 +4351,7 @@ mod tests {
                 serial: 40,
                 unique: Some(":1.10".into()),
                 until: None,
+                setup_events: Vec::new(),
             };
             let mut state = service_state();
             let count = if global {
@@ -4381,6 +4397,7 @@ mod tests {
                 serial: 40,
                 unique: Some(":1.10".into()),
                 until: None,
+                setup_events: Vec::new(),
             };
             let mut state = service_state();
             let path = "/org/freedesktop/portal/desktop/request/1_8/audit";
@@ -4437,6 +4454,7 @@ mod tests {
                 serial: 40,
                 unique: Some(":1.10".into()),
                 until: None,
+                setup_events: Vec::new(),
             };
             let mut state = service_state();
             let path = "/org/freedesktop/portal/desktop/request/1_9/audit";
@@ -4534,6 +4552,7 @@ mod tests {
                 serial: 50,
                 unique: Some(":1.10".into()),
                 until: None,
+                setup_events: Vec::new(),
             };
             let mut state = service_state();
             state.pending.insert(41, pending_open(":1.9", "denied"));
@@ -4570,6 +4589,7 @@ mod tests {
             serial: 50,
             unique: Some(":1.10".into()),
             until: None,
+            setup_events: Vec::new(),
         };
         let mut state = service_state();
         state.pending.insert(41, pending_open(":1.9", "second"));
@@ -4641,6 +4661,7 @@ mod tests {
             serial: 50,
             unique: Some(":1.10".into()),
             until: None,
+            setup_events: Vec::new(),
         };
         let mut state = service_state();
         let path = state
@@ -5379,6 +5400,108 @@ mod tests {
     }
 
     #[test]
+    fn setup_event_ceiling_is_shared_across_setup_calls() {
+        let (stream, mut broker) = UnixStream::pair().unwrap();
+        let mut connection = Connection {
+            stream,
+            serial: 0,
+            unique: Some(":1.10".into()),
+            until: Some(Instant::now() + Duration::from_secs(2)),
+            setup_events: Vec::new(),
+        };
+        let ping = call(PEER_INTERFACE, "Ping", "", |_| Ok(()));
+        let per_call = MAX_QUEUED_SERVICE_EVENTS / 3 + 1;
+        assert!(per_call < MAX_UNRELATED_MESSAGES);
+        for serial in 1..=3 {
+            for _ in 0..per_call { broker.write_all(&ping).unwrap(); }
+            let reply = message::Builder::method_return(Endian::Little, serial)
+                .sender(BUS_NAME).destination(":1.10").serial(20 + serial)
+                .body("", |_| Ok(())).unwrap().encode().unwrap();
+            broker.write_all(&reply).unwrap();
+        }
+        subscribe_to_owner_departures(&mut connection).unwrap();
+        subscribe_to_owner_departures(&mut connection).unwrap();
+        let error = subscribe_to_owner_departures(&mut connection).unwrap_err();
+        assert_eq!(error.to_string(), "too many portal events during setup");
+        assert_eq!(connection.setup_events.len(), MAX_QUEUED_SERVICE_EVENTS);
+    }
+
+    #[test]
+    fn calls_arriving_during_name_acquisition_and_subscription_are_served() {
+        let (service_stream, mut broker) = UnixStream::pair().unwrap();
+        broker.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        thread::scope(|scope| {
+            let service = scope.spawn(move || {
+                let mut connection = Connection {
+                    stream: service_stream,
+                    serial: 0,
+                    unique: Some(":1.10".into()),
+                    until: Some(Instant::now() + Duration::from_secs(2)),
+                    setup_events: Vec::new(),
+                };
+                request_name(&mut connection).unwrap();
+                subscribe_to_owner_departures(&mut connection).unwrap();
+                connection.finish_setup().unwrap();
+                serve(&mut connection, &Settings::parse(settings::DEFAULT_CONFIG).unwrap(),
+                    service_state().application_policy.unwrap())
+            });
+            for (serial, member) in [(1, "RequestName"), (2, "AddMatch")] {
+                let IncomingFrame::Message(request) = read_frame(&mut broker).unwrap() else {
+                    panic!("missing setup request");
+                };
+                let (request, _) = message::decode(&request, 0).unwrap();
+                assert_eq!(request.fields.member, Some(member));
+                assert_eq!(request.serial, serial);
+                let (interface, method, signature) = if serial == 1 {
+                    (PEER_INTERFACE, "Ping", "")
+                } else {
+                    (SECRET_INTERFACE, "Retrieve", "s")
+                };
+                let call = message::Builder::method_call(Endian::Little, PORTAL_PATH,
+                    Some(interface), method)
+                    .sender(":1.9").destination(PORTAL_NAME).serial(10 + serial)
+                    .body(signature, |writer| {
+                        if serial == 2 { writer.string("main")?; }
+                        Ok(())
+                    }).unwrap().encode().unwrap();
+                broker.write_all(&call).unwrap();
+                let reply = message::Builder::method_return(Endian::Little, serial)
+                    .sender(BUS_NAME).destination(":1.10").serial(20 + serial)
+                    .body(if serial == 1 { "u" } else { "" }, |writer| {
+                        if serial == 1 { writer.uint32(REQUEST_NAME_PRIMARY_OWNER); }
+                        Ok(())
+                    }).unwrap().encode().unwrap();
+                broker.write_all(&reply).unwrap();
+            }
+            let IncomingFrame::Message(reply) = read_frame(&mut broker).unwrap() else {
+                panic!("missing queued Ping reply");
+            };
+            let (reply, _) = message::decode(&reply, 0).unwrap();
+            assert_eq!(reply.kind, MessageType::MethodReturn);
+            assert_eq!(reply.fields.reply_serial, Some(11));
+            assert_eq!(reply.fields.destination, Some(":1.9"));
+            let IncomingFrame::Message(query) = read_frame(&mut broker).unwrap() else {
+                panic!("missing queued Retrieve identity query");
+            };
+            let (query, _) = message::decode(&query, 0).unwrap();
+            assert_eq!(query.fields.member, Some("GetConnectionCredentials"));
+            assert_eq!(query.fields.destination, Some(BUS_NAME));
+            assert_eq!(query.args(), vec![Value::Str(":1.9")]);
+            broker.write_all(&credentials_reply(query.serial, 0, None)).unwrap();
+            let IncomingFrame::Message(reply) = read_frame(&mut broker).unwrap() else {
+                panic!("missing queued Retrieve refusal");
+            };
+            let (reply, _) = message::decode(&reply, 0).unwrap();
+            assert_eq!(reply.kind, MessageType::Error);
+            assert_eq!(reply.fields.reply_serial, Some(12));
+            assert_eq!(reply.fields.destination, Some(":1.9"));
+            assert_eq!(reply.fields.error_name, Some("org.freedesktop.portal.Error.NotAllowed"));
+            drop(broker);
+            assert!(service.join().unwrap().is_err());
+        });
+    }
+
+    #[test]
     fn the_service_answers_an_oversized_call_and_keeps_serving() {
         let payload = "x".repeat(MAX_PORTAL_FRAME);
         let oversized = call(SETTINGS_INTERFACE, "ReadAll", "s", |writer| {
@@ -5397,6 +5520,7 @@ mod tests {
                     serial: 19,
                     unique: Some(":1.10".into()),
                     until: None,
+                    setup_events: Vec::new(),
                 };
                 serve(&mut connection, &settings, service_state().application_policy.unwrap())
             });
@@ -5530,6 +5654,7 @@ mod tests {
                 serial: 0,
                 unique: Some(":1.9".into()),
                 until: Some(Instant::now() + Duration::from_secs(2)),
+                setup_events: Vec::new(),
             },
             server_stream,
         )
@@ -5631,6 +5756,7 @@ mod tests {
             serial: 0,
             unique: Some(":1.9".into()),
             until: Some(Instant::now() + Duration::from_secs(2)),
+            setup_events: Vec::new(),
         };
         let error = connection
             .call_guarded(

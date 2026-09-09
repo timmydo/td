@@ -2032,23 +2032,30 @@ mod vm_tests {
         use std::path::Path;
         use std::sync::atomic::AtomicUsize;
 
+        struct Diagnostics;
+        impl Drop for Diagnostics {
+            fn drop(&mut self) {
+                if !thread::panicking() { return; }
+                for log in [
+                    "/run/desktop-authd.log", "/run/desktop-compositor.log",
+                    "/run/desktop-set.log", "/run/desktop-busd.log",
+                    "/run/desktop-portal.log", "/run/desktop-mail.log",
+                    "/run/desktop-news.log",
+                ] {
+                    if let Ok(file) = File::open(log) {
+                        let mut bytes = Vec::new();
+                        if file.take(65_536).read_to_end(&mut bytes).is_ok() {
+                            eprintln!("{log}: {}", String::from_utf8_lossy(&bytes));
+                        }
+                    }
+                }
+            }
+        }
+
         fn wait(label: &str, mut done: impl FnMut() -> bool) {
             let deadline = Instant::now() + Duration::from_secs(15);
             while !done() {
-                if Instant::now() >= deadline {
-                    for log in [
-                        "/run/desktop-authd.log",
-                        "/run/desktop-compositor.log",
-                        "/run/desktop-set.log",
-                    ] {
-                        if let Ok(file) = File::open(log) {
-                            let mut text = String::new();
-                            file.take(65_537).read_to_string(&mut text).unwrap();
-                            eprintln!("{log}: {text}");
-                        }
-                    }
-                    panic!("desktop fixture timed out: {label}");
-                }
+                assert!(Instant::now() < deadline, "desktop fixture timed out: {label}");
                 thread::sleep(Duration::from_millis(10));
             }
         }
@@ -2063,6 +2070,341 @@ mod vm_tests {
                 assert_eq!(store.application_secret("news", "main").unwrap().unwrap(), b"untouched fixture");
                 true
             });
+        }
+
+        const APP_TEST: &str = "fido_device::vm_tests::desktop::qemu_application_portal_client";
+        const RUNTIME: &str = "/td/store/0123456789abcdfghijklmnpqrsvwxyz-empty-runtime-1";
+
+        fn directory(path: impl AsRef<Path>, owner: u32, mode: u32) {
+            let path = path.as_ref();
+            fs::create_dir_all(path).unwrap();
+            chown(path, Some(owner), Some(owner))
+                .unwrap_or_else(|error| panic!("chown {}: {error}", path.display()));
+            fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+        }
+
+        fn application_home(uid: u32, app: &str) -> std::path::PathBuf {
+            Path::new("/var/lib/td/applications")
+                .join(uid.to_string())
+                .join(".td/app")
+                .join(app)
+                .join("home")
+        }
+
+        fn setup_portal() {
+            for (path, owner, mode) in [
+                ("/run/td-bus", 0, 0o755),
+                ("/run/td-bus/1000", 992, 0o755),
+                ("/run/td-portal", 0, 0o755),
+                ("/run/td-portal/1000", 991, 0o700),
+                ("/var/lib/td/applications", 0, 0o755),
+                ("/var/home", 0, 0o755),
+                ("/var/home/tester", 1000, 0o700),
+                ("/etc/ssl/certs", 0, 0o755),
+            ] {
+                directory(path, owner, mode);
+            }
+            directory(format!("{RUNTIME}/files"), 0, 0o755);
+            // Only the PEM envelope is admitted; this offline guest performs no TLS.
+            fs::write(
+                format!("{RUNTIME}/ca.pem"),
+                b"-----BEGIN CERTIFICATE-----\nAQID\n-----END CERTIFICATE-----\n",
+            )
+            .unwrap();
+            std::os::unix::fs::symlink(
+                format!("{RUNTIME}/ca.pem"),
+                "/etc/ssl/certs/ca-certificates.crt",
+            )
+            .unwrap();
+            fs::write("/etc/td-app.conf", "format=1\npackage-root=/td/store\nstate-root=.td/app\nregistry=/etc/td-applications.tsv\nlauncher-table=/etc/td-launcher.tsv\ncgroup-root=/sys/fs/cgroup/td-user-1000\n").unwrap();
+            fs::write("/etc/td-portal-settings", "format=1\ncolor-scheme=1\naccent-color=0.125,0.375,0.75\ncontrast=0\ngtk-theme=Adwaita\nicon-theme=Adwaita\ncursor-theme=Adwaita\ncursor-size=24\nfont-name=Sans 11\ndocument-font-name=Sans 11\nmonospace-font-name=Monospace 11\ntext-scaling-factor=1.0\n").unwrap();
+            for (name, text) in [
+                            ("passwd", "tdb1000:x:992:992::/run/td-bus/1000:/bin/false\ntdp1000:x:991:991::/run/td-portal/1000:/bin/false\ntda65538:x:65538:65538::/var/lib/td/applications/65538:/bin/false\n"),
+                            ("group", "tdb1000:x:992:\ntdp1000:x:991:\ntda65538:x:65538:\n"),
+                            ("shadow", "tdb1000:!td-service:0:0:99999:7:::\ntdp1000:!td-service:0:0:99999:7:::\ntda65538:!td-service:0:0:99999:7:::\n"),
+                            ("td-principals.tsv", "application\t1000\tnews\t65538\n"),
+                        ] {
+                            OpenOptions::new().append(true).open(format!("/etc/{name}"))
+                                .unwrap().write_all(text.as_bytes()).unwrap();
+                        }
+            fs::copy("/etc/td-principals.tsv", "/var/lib/td/principals.tsv").unwrap();
+            fs::set_permissions(
+                "/var/lib/td/principals.tsv",
+                fs::Permissions::from_mode(0o600),
+            )
+            .unwrap();
+            fs::write(
+                "/etc/td-bus-applications.tsv",
+                "td-bus-applications-v1\t1000\n65537\tmail\t\n65538\tnews\t\n",
+            )
+            .unwrap();
+            // Mount the real hierarchy and delegate each app's sibling leaves.
+            fs::create_dir_all("/sys/fs/cgroup").unwrap();
+            assert!(Command::new("/bin/td-init")
+                .args(["mount", "-t", "cgroup2", "cgroup2", "/sys/fs/cgroup"])
+                .status()
+                .unwrap()
+                .success());
+            fs::write(
+                "/sys/fs/cgroup/cgroup.subtree_control",
+                "+cpu +memory +pids\n",
+            )
+            .unwrap();
+            let mut registry = String::new();
+            for (uid, app) in [(65537, "mail"), (65538, "news")] {
+                directory(format!("/var/lib/td/applications/{uid}"), uid, 0o700);
+                directory(format!("/run/user/{uid}"), uid, 0o700);
+                let home = application_home(uid, app);
+                for ancestor in home
+                    .ancestors()
+                    .take(4)
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                {
+                    directory(ancestor, uid, 0o700);
+                }
+                let cgroup = format!("/sys/fs/cgroup/td-app-{uid}");
+                directory(&cgroup, uid, 0o755);
+                fs::write(
+                    format!("{cgroup}/cgroup.subtree_control"),
+                    "+cpu +memory +pids\n",
+                )
+                .unwrap();
+                directory(format!("{cgroup}/session"), 0, 0o755);
+                for leaf in [
+                    "cgroup.procs",
+                    "cgroup.threads",
+                    "cgroup.subtree_control",
+                    "session/cgroup.procs",
+                    "session/cgroup.threads",
+                ] {
+                    chown(format!("{cgroup}/{leaf}"), Some(uid), Some(uid)).unwrap();
+                }
+                let package = format!("/td/store/portal-{app}");
+                directory(format!("{package}/files/bin"), 0, 0o755);
+                fs::hard_link("/bin/td-secret-tests", format!("{package}/files/bin/probe")).unwrap();
+                fs::hard_link("/bin/td-secret", format!("{package}/files/bin/td-secret")).unwrap();
+                fs::write(
+                    format!("{package}/manifest"),
+                    "disposable source-built portal fixture\n",
+                )
+                .unwrap();
+                // Both apps advertise mail: only the broker's UID binding counts.
+                fs::write(format!("{package}/spec"), format!("format=1\nname={app}\nruntime={RUNTIME}\nentry=/app/bin/probe\n\n[Environment]\nDBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus\nFLATPAK_ID=mail\nHOME=/home/td\nWAYLAND_DISPLAY=wayland-0\nXDG_RUNTIME_DIR=/run/user/1000\n\n[Context]\nsockets=wayland\n")).unwrap();
+                std::os::unix::fs::symlink("/bin/td-jail", format!("/bin/{app}")).unwrap();
+                registry.push_str(&format!("{app}\t{package}\n"));
+            }
+            fs::write("/etc/td-applications.tsv", registry).unwrap();
+            std::os::unix::fs::symlink("/bin/td-init", "/bin/umount").unwrap();
+            application_files("prepare-application-files");
+            let store = crate::owned_store(1000).unwrap();
+            store.set("mail", "private", b"mail-only fixture").unwrap();
+        }
+
+        fn application_files(operation: &str) {
+            let output = Command::new("/bin/td-authd")
+                .args([operation, "mail"])
+                .env_clear()
+                .stdin(Stdio::null())
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        struct Portal {
+            broker: Process,
+            supervisor: Process,
+        }
+        impl Portal {
+            fn start() -> Self {
+                let mut command = Command::new("/bin/td-login");
+                command.args([
+                    "exec-service-as",
+                    "tdb1000",
+                    "--",
+                    "/bin/td-busd",
+                    "run-session",
+                ]);
+                let mut broker = Process::start(command, "/run/desktop-busd.log");
+                wait("session broker", || {
+                    assert!(
+                        broker.exited().is_none(),
+                        "{}",
+                        fs::read_to_string("/run/desktop-busd.log").unwrap()
+                    );
+                    fs::read_to_string("/run/desktop-busd.log")
+                        .unwrap()
+                        .contains("td-busd: listening on /run/td-bus/1000/bus as ")
+                });
+                let mut command = Command::new("/bin/td-portal");
+                command.args([
+                    "supervise",
+                    "--bus",
+                    "/run/td-bus/1000/bus",
+                    "--settings",
+                    "/etc/td-portal-settings",
+                ]);
+                let supervisor = Process::start(command, "/run/desktop-portal.log");
+                let mut portal = Self { broker, supervisor };
+                wait("activated portal", || {
+                    portal.live();
+                    let result = Command::new("/bin/td-secret")
+                        .args(["get", "main"])
+                        .env_clear()
+                        .env("DBUS_SESSION_BUS_ADDRESS", "unix:path=/run/td-bus/1000/bus")
+                        .output()
+                        .unwrap();
+                    assert!(!result.status.success() && result.stdout.is_empty());
+                    let error = String::from_utf8(result.stderr).unwrap();
+                    if error == "td-secret: credential portal refused the request: org.freedesktop.DBus.Error.NameHasNoOwner\n" {
+                                    return false;
+                                }
+                    assert_eq!(error, "td-secret: credential portal refused the request: org.freedesktop.portal.Error.NotAllowed\n");
+                    true
+                });
+                portal
+            }
+            fn live(&mut self) {
+                assert!(self.broker.exited().is_none());
+                assert!(
+                    self.supervisor.exited().is_none(),
+                    "{}",
+                    fs::read_to_string("/run/desktop-portal.log").unwrap()
+                );
+            }
+            fn finish(mut self) {
+                self.live();
+                self.broker.0.kill().unwrap();
+                assert!(!self.broker.0.wait().unwrap().success());
+                let mut status = None;
+                wait("portal child and supervisor exit", || {
+                    status = self.supervisor.exited();
+                    status.is_some()
+                });
+                assert!(!status.unwrap().success());
+            }
+        }
+
+        struct Application {
+            process: Process,
+            home: std::path::PathBuf,
+            sequence: usize,
+        }
+        impl Application {
+            fn start(uid: u32, app: &str) -> Self {
+                let mut command = Command::new("/bin/td-login");
+                command.args([
+                    "exec-service-as",
+                    &format!("tda{uid}"),
+                    "--",
+                    &format!("/bin/{app}"),
+                    "--exact",
+                    APP_TEST,
+                    "--ignored",
+                    "--test-threads=1",
+                ]);
+                let mut result = Self {
+                    process: Process::start(command, &format!("/run/desktop-{app}.log")),
+                    home: application_home(uid, app),
+                    sequence: 0,
+                };
+                wait("jailed application startup", || {
+                    assert!(
+                        result.process.exited().is_none(),
+                        "{}",
+                        fs::read_to_string(format!("/run/desktop-{app}.log")).unwrap()
+                    );
+                    result.home.join("ready").exists()
+                });
+                result
+            }
+            fn retrieve(&mut self, name: &str, expected: &str) {
+                self.sequence += 1;
+                let sequence = self.sequence;
+                fs::write(
+                    self.home.join("request.next"),
+                    format!("{sequence}\t{name}\t{expected}"),
+                )
+                .unwrap();
+                // Root is the disposable fixture controller; the app only reads.
+                fs::set_permissions(
+                    self.home.join("request.next"),
+                    fs::Permissions::from_mode(0o444),
+                )
+                .unwrap();
+                fs::rename(self.home.join("request.next"), self.home.join("request")).unwrap();
+                wait("application portal response", || {
+                    assert!(self.process.exited().is_none());
+                    let response = fs::read_to_string(self.home.join("response")).unwrap_or_default();
+                    if !response.starts_with(&format!("{sequence}\t")) {
+                        return false;
+                    }
+                    assert_eq!(response, format!("{sequence}\tok"));
+                    true
+                });
+            }
+            fn finish(mut self) {
+                fs::write(self.home.join("stop"), b"").unwrap();
+                let mut status = None;
+                wait("application exit", || {
+                    status = self.process.exited();
+                    status.is_some()
+                });
+                assert!(status.unwrap().success());
+            }
+        }
+
+        #[test]
+        #[ignore = "test-only application entry for the disposable desktop portal guest"]
+        fn qemu_application_portal_client() {
+            assert_eq!(fs::metadata("/proc/self").unwrap().uid(), 1000);
+            assert!(!Path::new("/var/lib/td/secrets").exists());
+            assert!(!Path::new("/run/td-secret").exists());
+            let home = Path::new("/home/td");
+            fs::write(home.join("ready"), b"ready").unwrap();
+            let deadline = Instant::now() + Duration::from_secs(90);
+            let mut previous = String::new();
+            while !home.join("stop").exists() {
+                assert!(Instant::now() < deadline);
+                let request = fs::read_to_string(home.join("request")).unwrap_or_default();
+                if !request.is_empty() && request != previous {
+                    let parts: Vec<_> = request.split('\t').collect();
+                    assert_eq!(parts.len(), 3);
+                    let result = Command::new("/app/bin/td-secret")
+                        .args(["get", parts[1]])
+                        .output()
+                        .unwrap();
+                    let success = if parts[2] == "unavailable" {
+                        !result.status.success() && result.stdout.is_empty()
+                                        && std::str::from_utf8(&result.stderr).is_ok_and(|error|
+                                            error == "td-secret: credential portal refused the request: org.freedesktop.portal.Error.Failed\n")
+                    } else {
+                        result.status.success() && result.stdout == parts[2].as_bytes()
+                    };
+                    let response = if success {
+                        "ok".into()
+                    } else {
+                        format!(
+                            "failed: {} {}",
+                            result.status,
+                            String::from_utf8_lossy(&result.stderr)
+                        )
+                    };
+                    fs::write(
+                        home.join("response.next"),
+                        format!("{}\t{response}", parts[0]),
+                    )
+                    .unwrap();
+                    fs::rename(home.join("response.next"), home.join("response")).unwrap();
+                    previous = request;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
         }
 
         // Standard keyboard: eight modifiers, padding, and six key usages.
@@ -2310,8 +2652,18 @@ mod vm_tests {
         #[ignore = "requires qemu-secret --tpm with a disposable desktop and HID devices"]
         fn qemu_compositor_enrolls_unlocks_and_authorizes_public_credential_write() {
             guard("fido-desktop");
+            let _diagnostics = Diagnostics;
+            assert!(Command::new("/bin/td-init")
+                .args(["hostname", "td-secret-fixture"])
+                .status().unwrap().success());
             let mut keyboard = Keyboard::new();
+            // Mail's declared idmapped view needs a mountable backing filesystem.
+            fs::create_dir_all("/var").unwrap();
+            assert!(Command::new("/bin/td-init")
+                .args(["mount", "-t", "tmpfs", "-o", "nosuid,nodev,mode=0755", "tmpfs", "/var"])
+                .status().unwrap().success());
             setup();
+            setup_portal();
             crate::tpm::tests::qemu_extend(&[9; 32]);
             let token = VirtualCredential::new(44);
             let requests = Arc::new(AtomicUsize::new(0));
@@ -2333,6 +2685,11 @@ mod vm_tests {
                 observed.store(index + 1, Ordering::SeqCst);
             });
             let pair = Pair::start();
+            let mut portal = Portal::start();
+            let mut mail = Application::start(65537, "mail");
+            let mut news = Application::start(65538, "news");
+            portal.live();
+            mail.retrieve("main", "unavailable");
             keyboard.key(0x1b); // X outside attention must not enroll.
             thread::sleep(Duration::from_millis(500));
             assert_eq!(requests.load(Ordering::SeqCst), 0);
@@ -2343,12 +2700,17 @@ mod vm_tests {
             });
             no_release();
             assert_eq!(requests.load(Ordering::SeqCst), 3);
+            mail.retrieve("main", "unavailable");
             keyboard.close();
             keyboard.select(0x18); // U: fresh primary assertion.
             wait("desktop unlock", || {
                 Path::new("/run/td-secret/1000/key").exists()
             });
             read_released(b"firstboot fixture");
+            mail.retrieve("main", "firstboot fixture");
+            mail.retrieve("private", "mail-only fixture");
+            news.retrieve("main", "untouched fixture");
+            news.retrieve("private", "unavailable");
             keyboard.close();
             let before = sealed_bytes();
             let mut command = Command::new("/bin/td-login");
@@ -2394,7 +2756,11 @@ mod vm_tests {
             assert_ne!(sealed_bytes(), before);
             read_released(b"desktop fixture");
             assert_eq!(requests.load(Ordering::SeqCst), 7);
+            mail.retrieve("main", "desktop fixture");
+            news.retrieve("main", "untouched fixture");
             pair.disconnect();
+            portal.live();
+            mail.retrieve("main", "unavailable");
             // A fresh production generation must prepare while locked and
             // require another physical selection and assertion before release.
             let pair = Pair::start();
@@ -2404,7 +2770,14 @@ mod vm_tests {
             });
             read_released(b"desktop fixture");
             assert_eq!(requests.load(Ordering::SeqCst), 9);
+            mail.retrieve("main", "desktop fixture");
             pair.disconnect();
+            portal.live();
+            mail.retrieve("main", "unavailable");
+            mail.finish();
+            news.finish();
+            portal.finish();
+            application_files("release-application-files");
             assert_eq!(hid.finish(), (9, 0));
         }
     }

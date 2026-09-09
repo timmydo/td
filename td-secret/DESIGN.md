@@ -970,9 +970,38 @@ substitute presentation or commit acknowledgements: the running compositor
 supplies those through its normal framebuffer receipt path. Exact challenge
 binding and refusal cases remain covered by the preceding independent
 fixtures. This test exercises one recovery policy; the preceding worker
-fixtures retain both policies. It observes backend credential readback,
-not an application portal connection, and it is a disposable initramfs
-and software-device test, not a cold-disk or physical-presence claim.
+fixtures retain both policies.
+
+The same guest starts the stock session broker at UID 992 and the root
+portal supervisor, which activates its direct child at UID 991. Two
+source-built test applications run through the production td-jail entry,
+with immutable mail/news UID assignments, real cgroup delegation, namespace
+and seccomp confinement, and completed broker registration. Disposable
+package and account files are prepared by the guest controller. A disposable
+tmpfs backs /var; the production prepare-application-files command supplies
+mail's required idmapped Downloads view and its matching release removes it
+after the applications stop. This does not exercise image composition or
+the root application-start launcher.
+Both applications deliberately carry FLATPAK_ID=mail. Each test entry invokes
+the production td-secret get client and checks its captured stdout against
+exact credential fixture bytes. The client also completes its normal D-Bus
+descriptor receipt acknowledgement.
+The test entries and control files are absent from the distribution image.
+
+Mail retrieval must receive the portal's unavailable error before enrollment
+and while the newly enrolled store is locked. After a fresh unlock it must
+receive its original credential and a mail-only record; news must receive its
+own distinct main credential and be refused the mail-only name. A successful
+public write must become visible through a fresh mail retrieval while news
+remains unchanged. The applications, broker and portal stay live across
+compositor loss and replacement: fresh retrievals must refuse after each
+relock, and only another token unlock permits retrieval of the written value.
+The applications cannot see the persistent store or volatile release path.
+Previously delivered credentials cannot be recalled; the relock oracle
+covers future retrieval, not application memory erasure.
+
+This remains a disposable initramfs and software-device test, not a
+cold-disk or physical-presence claim.
 
 
 ## Portal evidence

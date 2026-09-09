@@ -5,7 +5,7 @@ use td_engine::cpio::{self, Entry, Kind};
 #[allow(dead_code)]
 mod fixture;
 
-pub(crate) const TARGETS: &[&str] = &["linux-x86-64", "td-secret-vm-test", "td-secret", "td-init", "td-firstboot", "td-login", "td-compositor"];
+pub(crate) const TARGETS: &[&str] = &["linux-x86-64", "td-secret-vm-test", "td-secret", "td-init", "td-firstboot", "td-login", "td-compositor", "td-busd", "td-portal", "td-jail"];
 
 fn output(runner: &RecipeCheckRunner, name: &str) -> Result<PathBuf, String> {
     runner.prepare_recipe_target(name)?;
@@ -31,13 +31,15 @@ pub(crate) fn run(runner: &RecipeCheckRunner, tpm: Option<&Path>) -> Result<(), 
     ];
     if tpm.is_some() {
         files.push(("bin/td-authd", tests.join("bin/td-authd")));
-        for name in ["td-firstboot", "td-login", "td-compositor"] {
+        for (name, destination) in [
+            ("td-firstboot", "bin/td-firstboot"),
+            ("td-login", "bin/td-login"),
+            ("td-compositor", "bin/td-compositor"),
+            ("td-busd", "bin/td-busd"),
+            ("td-portal", "bin/td-portal"),
+            ("td-jail", "bin/td-jail"),
+        ] {
             let built = output(runner, name)?;
-            let destination = match name {
-                "td-firstboot" => "bin/td-firstboot",
-                "td-login" => "bin/td-login",
-                _ => "bin/td-compositor",
-            };
             files.push((destination, built.join("bin").join(name)));
         }
     }
@@ -173,7 +175,7 @@ pub(crate) fn run(runner: &RecipeCheckRunner, tpm: Option<&Path>) -> Result<(), 
         println!("PASS: virtual credential creation, proof, recovery exclusion and both recovery policies; fresh assertion before TPM unseal, replay and wrong-key refusal; no physical presence or session-release claim");
         println!("PASS: guest HID discovery, production worker, signed fixture assertion and challenge refusal through the TPM, keepalive deadline and worker cleanup; no physical USB or token presence claim");
         println!("PASS: production private enrollment, unlock and named-write workers; both recovery policies, commit cancellation, locked writes and credential readback; simulated parent acknowledgements, no desktop or physical-presence claim");
-        println!("PASS: production compositor attention, root authority, public sealed-descriptor credential write and generation relocking through virtual keyboard/token devices; backend readback, no application portal or physical-presence claim");
+        println!("PASS: production compositor attention, root authority, public sealed-descriptor credential write and generation relocking through virtual keyboard/token devices; jailed application portal retrieval, application isolation and locked refusal; no physical-presence claim");
     }
     Ok(())
 }

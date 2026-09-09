@@ -338,6 +338,7 @@ mod tests {
                 serial: 10,
                 unique: Some(":1.10".into()),
                 until: None,
+                setup_events: Vec::new(),
             },
             peer,
         )
