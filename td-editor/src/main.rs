@@ -4,7 +4,8 @@ use std::io::{self, Write};
 use std::process::ExitCode;
 
 const HELP: &str = concat!(
-    "td-editor --window [--keys=windows|emacs] [--] [FILE...]\n",
+    "td-editor [--keys=windows|emacs] [--] [FILE...]\n",
+    "With no file, open an Untitled tab. --window is an optional alias.\n",
     "Window option: --dictionary PATH loads an explicit local English word list.\n",
     "Window option: --control-socket PATH enables private state/text and edits.\n",
     "Control edits and queued Save/Save As check expected revisions.\n",
@@ -21,7 +22,7 @@ const HELP: &str = concat!(
     "Control wheel uses bounded signed row/column deltas and the input fence.\n",
     "Control prompt-state reads full entries and feedback without answering.\n",
     "Control prompt-answer pins non-file entry/actions without requiring focus.\n",
-    "Experimental Wayland file editor. Do not use as $EDITOR yet.\n",
+    "Experimental foreground Wayland editor; exit 0 includes explicit discard.\n",
     "Windows files: Ctrl+O, Ctrl+S, Ctrl+Shift+S. Emacs: C-x C-f, C-x C-s, C-x C-w.\n",
     "Open/Save As path entry: Return submits, Escape/Ctrl+G cancels, Ctrl+U clears.\n",
     "Paths are literal; Save As requires a new destination. No shell expansion.\n",
@@ -61,19 +62,30 @@ const HELP: &str = concat!(
 fn main() -> ExitCode {
     let args: Vec<_> = std::env::args_os().skip(1).collect();
     let result = match args.as_slice() {
-        [arg] if arg == "--replay" => td_editor::replay::run(&mut io::stdin().lock(), &mut io::stdout().lock()),
+        [arg] if arg == "--replay" => {
+            td_editor::replay::run(&mut io::stdin().lock(), &mut io::stdout().lock())
+        }
         [arg] if arg == "--preview" => td_editor::render::preview(&mut io::stdout().lock()),
         [arg] if arg == "--window-preview" => td_editor::wayland::preview(),
-        [arg, keys] if arg == "--window-preview" && keys == "--keys=emacs" => td_editor::wayland::preview_with_profile(td_editor::keys::Profile::Emacs),
-        [arg, keys] if arg == "--window-preview" && keys == "--keys=windows" => td_editor::wayland::preview(),
+        [arg, keys] if arg == "--window-preview" && keys == "--keys=emacs" => {
+            td_editor::wayland::preview_with_profile(td_editor::keys::Profile::Emacs)
+        }
+        [arg, keys] if arg == "--window-preview" && keys == "--keys=windows" => {
+            td_editor::wayland::preview()
+        }
         [arg, rest @ ..] if arg == "--window" => file_window(rest),
         [arg] if arg == "--font-license" => {
             let mut output = io::stdout().lock();
-            [td_editor::render::FONT_PROVENANCE, td_editor::render::FONT_COPYING,
-                td_editor::render::FONT_LICENSE].iter().try_for_each(|notice| output.write_all(notice.as_bytes()))
+            [
+                td_editor::render::FONT_PROVENANCE,
+                td_editor::render::FONT_COPYING,
+                td_editor::render::FONT_LICENSE,
+            ]
+            .iter()
+            .try_for_each(|notice| output.write_all(notice.as_bytes()))
         }
         [arg] if arg == "--help" => io::stdout().lock().write_all(HELP.as_bytes()),
-        _ => Err(io::Error::other("use --window, --replay, --preview, --window-preview, --font-license or --help; ordinary $EDITOR invocation is not ready")),
+        _ => file_window(&args),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -171,7 +183,7 @@ mod tests {
     use std::os::unix::ffi::OsStringExt;
 
     #[test]
-    fn help_describes_native_adapters_without_claiming_editor_integration() {
+    fn help_describes_foreground_invocation_without_claiming_mail_integration() {
         assert_eq!(td_editor::clipboard::MAX_BYTES, 1024 * 1024);
         for feature in [
             "data-device v3",
@@ -183,7 +195,8 @@ mod tests {
             "Emacs M-x or Help > Command",
             "not incremental",
             "At the start/end, repeat the same search to wrap",
-            "Do not use as $EDITOR yet",
+            "foreground Wayland editor; exit 0 includes explicit discard",
+            "--window is an optional alias",
             "F7 checks the whole document on demand",
             "No bundled word list, GPU renderer",
             "private state/text and edits",

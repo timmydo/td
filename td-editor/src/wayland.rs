@@ -3341,7 +3341,7 @@ impl Window {
                 command: crate::model::Command::FillParagraph,
             },
             Item::About => {
-                self.notify("td-editor: experimental Wayland text editor. Pure std Rust; bitmap Unifont, warm palette. UTF-8 clipboard needs data-device v3. F7 checks spelling with an explicit local word list. No recovery. Do not use as $EDITOR. F10 opens menus.");
+                self.notify("td-editor: experimental Wayland text editor. Pure std Rust; bitmap Unifont, warm palette. UTF-8 clipboard needs data-device v3. F7 checks spelling with an explicit local word list. No crash recovery or mail integration. F10 opens menus.");
                 return Ok(());
             }
             Item::Spell => {
@@ -4953,7 +4953,7 @@ pub struct FileWindowOptions {
     pub control: Option<PathBuf>,
 }
 
-/// Experimental file window; ordinary $EDITOR invocation remains unavailable.
+/// Foreground file window; caller integration does not imply mail submission.
 pub fn file_window(options: FileWindowOptions) -> io::Result<()> {
     let FileWindowOptions {
         profile,
@@ -4985,7 +4985,7 @@ pub fn file_window(options: FileWindowOptions) -> io::Result<()> {
             .map(crate::control_worker::Worker::start)
             .transpose()
             .map_err(error)?;
-        window.notify(format!("{dictionary_notice}Experimental file window. UTF-8 clipboard needs data-device v3. F7 checks spelling; Format > Dictionary selects a local word list. No recovery. Not ready for $EDITOR."));
+        window.notify(format!("{dictionary_notice}UTF-8 clipboard needs data-device v3. F7 checks spelling; Format > Dictionary selects a local word list. Experimental software rendering; no crash recovery."));
         let result = window.run();
         match window.finish_control(result) {
             Err(detail) if window.files.as_ref().is_some_and(|files| files.busy()) => Err(format!(

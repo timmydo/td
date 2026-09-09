@@ -16,6 +16,66 @@ const KEY_HOME: u32 = 102;
 const KEY_RIGHT: u32 = 106;
 const KEY_END: u32 = 107;
 
+#[test]
+#[ignore = "ready supplies the disposable native compositor"]
+fn ordinary_invocation_keeps_foreground_lifetime_and_inherited_stdin() {
+    use std::io::Seek;
+    let compositor_directory = Directory::new();
+    let directory = Directory::new();
+    let mut compositor = Compositor::start(&compositor_directory);
+    let first_name = "-draft é;$";
+    let first = directory.0.join(first_name);
+    let second = directory.0.join("new draft");
+    let input = directory.0.join("caller-input");
+    let output = directory.0.join("caller-output");
+    let socket = directory.0.join("control");
+    let log = directory.0.join("stderr");
+    std::fs::write(&first, b"old\n").unwrap();
+    std::fs::write(&input, b"caller-owned unread input\n").unwrap();
+    let mut inherited = std::fs::File::open(&input).unwrap();
+    let child = Command::new(env!("CARGO_BIN_EXE_td-editor"))
+        .arg("--control-socket").arg(&socket)
+        .arg("--").arg(first_name).arg("new draft")
+        .current_dir(&directory.0)
+        .env_clear()
+        .env("WAYLAND_DISPLAY", compositor.directory.join("wayland-0"))
+        .env("XDG_RUNTIME_DIR", &directory.0)
+        .env("TMPDIR", &directory.0)
+        .stdin(Stdio::from(inherited.try_clone().unwrap()))
+        .stdout(Stdio::from(std::fs::File::create(&output).unwrap()))
+        .stderr(Stdio::from(std::fs::File::create(&log).unwrap()))
+        .spawn().unwrap();
+    let mut editor = EditorProcess { child, socket, log, next: 0 };
+    editor.wait_keyboard("windows");
+    editor.wait_field("state", "active", "2");
+    assert!(!second.exists());
+    let window = compositor.window();
+    assert_eq!(compositor.request("fullscreen", 1024), b"ok\n");
+    editor.wait_field("state", "window", "800,576,1");
+    editor.rendered_at(800, 576);
+    editor.ok("set-line-numbers\t2\t0\t0");
+    editor.ok("select-tab\t1\t0");
+    assert_eq!(editor.ok("text\t1\t0\t0\t100"), "4\t6f6c640a");
+    let before = compositor.observe(&window);
+    editor.ok("insert\t1\t0\t0\t0\t78");
+    compositor.rendered_text(&mut editor, &window, 1, before, "xold", 1);
+    assert!(editor.child.try_wait().unwrap().is_none());
+    assert_eq!(inherited.stream_position().unwrap(), 0);
+    assert_eq!(std::fs::metadata(&output).unwrap().len(), 0);
+    assert_eq!(editor.job("save\t1\t1"), "job=1,save,1,1,0,complete,-");
+    assert_eq!(std::fs::read(&first).unwrap(), b"xold\n");
+    editor.ok("select-tab\t2\t0");
+    editor.ok("insert\t2\t0\t0\t0\t6e65770a");
+    assert_eq!(editor.job("save\t2\t1"), "job=2,save,2,1,0,complete,-");
+    assert_eq!(std::fs::read(&second).unwrap(), b"new\n");
+    assert!(editor.child.try_wait().unwrap().is_none());
+    editor.quit();
+    assert_eq!(inherited.stream_position().unwrap(), 0);
+    assert_eq!(std::fs::metadata(&output).unwrap().len(), 0);
+    assert_eq!(std::fs::metadata(&editor.log).unwrap().len(), 0);
+    compositor.stop();
+}
+
 struct Compositor {
     child: Child,
     directory: PathBuf,

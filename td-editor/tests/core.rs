@@ -507,7 +507,7 @@ fn replacing_a_selection_with_identical_text_collapses_without_history() {
 }
 
 #[test]
-fn the_executable_replays_without_a_display_and_refuses_editor_invocation() {
+fn the_executable_replays_without_a_display_and_rejects_invalid_window_inputs() {
     use std::io::Write;
     use std::process::{Command as Process, Stdio};
     let binary = env!("CARGO_BIN_EXE_td-editor");
@@ -531,21 +531,32 @@ fn the_executable_replays_without_a_display_and_refuses_editor_invocation() {
     assert!(output.status.success());
     assert!(output.stdout.ends_with(b"1\t1\tok\t1"));
     assert!(output.stderr.is_empty());
-    let failure = Process::new(binary).arg("file.txt").output().unwrap();
+    let failure = Process::new(binary).arg("--invalid-option").output().unwrap();
     assert!(!failure.status.success());
+    assert!(failure.stdout.is_empty());
     assert!(String::from_utf8_lossy(&failure.stderr)
-        .contains("ordinary $EDITOR invocation is not ready"));
+        .contains("unknown window option"));
+    let failure = Process::new(binary).env_clear().output().unwrap();
+    assert!(!failure.status.success());
+    assert!(failure.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&failure.stderr).contains("XDG_RUNTIME_DIR"));
+    let failure = Process::new(binary).arg("/dev/null").output().unwrap();
+    assert!(!failure.status.success());
+    assert!(failure.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&failure.stderr).contains("NotRegular"));
     let failure = Process::new(binary)
         .args(["--window", "/dev/null"])
         .output()
         .unwrap();
     assert!(!failure.status.success());
+    assert!(failure.stdout.is_empty());
     assert!(String::from_utf8_lossy(&failure.stderr).contains("NotRegular"));
     let failure = Process::new(binary)
         .args(["--window", "--keys=invalid"])
         .output()
         .unwrap();
     assert!(!failure.status.success());
+    assert!(failure.stdout.is_empty());
     assert!(String::from_utf8_lossy(&failure.stderr).contains("unknown window option"));
 }
 

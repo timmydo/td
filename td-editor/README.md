@@ -21,7 +21,7 @@ The safe, dependency-free library implements UTF-8/BOM/LF/CRLF conversion,
 scalar edits and selection, tabs, bounded undo/redo with saved-state tracking,
 literal search/replace, paragraph filling and Auto Fill. Logical Windows and
 Emacs keys share those commands. The controller also handles visual navigation
-and pointer selection. The experimental `--window` connects file Open/Save
+and pointer selection. The default experimental window connects file Open/Save
 and Save As through one worker, with literal keyboard path prompts and both
 key profiles. Native mouse input selects/drags text, switches tabs, uses their
 close marks and scrolls with wheels/touchpads. A small bitmap arrow supplies
@@ -50,9 +50,9 @@ cancels, and Ctrl+U clears. Invalid or nonexistent lines leave the prompt
 open for correction. Replay also accepts `go-to-line TAB REVISION LINE`
 (tab-separated arguments).
 Native query/edit/file/dialog and decoded key/pointer/wheel control are explicit.
-GPU rendering and td-mail integration remain
-unimplemented. Do not set
-`$EDITOR` to this binary yet.
+Ordinary foreground invocation is implemented for experimental local
+`$EDITOR` use. GPU rendering, crash recovery and td-mail/jail integration
+remain unimplemented; keep backups of important files.
 
 The optional `test-file-barrier` feature is a separate test editor, never a
 normal runtime option. The native gate builds it in an isolated directory
@@ -316,11 +316,19 @@ use a GPU. Building from source
 currently needs the full td checkout for the shared modules and license data;
 the resulting executable does not need an installed td system.
 
+For a caller that passes filenames as literal arguments and waits for its
+child, set `$EDITOR` to the executable's absolute path. No wrapper or mode
+flag is needed. The process stays in the foreground until its window closes;
+it does not consume inherited stdin. Exit 0 includes explicit discard, not
+only saving. This does not complete td-mail composition: its current caller
+uses shell command construction and removes temporary drafts after exit.
+See DESIGN.md before attempting that integration.
+
 Try the actual window from a terminal in your Linux x86-64 Wayland session:
 
 ```text
-td-editor/target/release/td-editor --window /absolute/path/to/test-draft.txt
-td-editor/target/release/td-editor --window --keys=emacs /absolute/path/to/test-draft.txt
+td-editor/target/release/td-editor /absolute/path/to/test-draft.txt
+td-editor/target/release/td-editor --keys=emacs /absolute/path/to/test-draft.txt
 ```
 
 Use a disposable copy while this is experimental. With no path, it starts an
@@ -328,8 +336,9 @@ Untitled tab; a missing path starts a dirty new-file tab without creating the
 file until Save. Windows: Ctrl+O opens, Ctrl+S saves, Ctrl+Shift+S saves as.
 Emacs: C-x C-f opens, C-x C-s saves, C-x C-w saves as. Paths are literal:
 Return submits, Escape/Ctrl+G cancels, Backspace deletes, Ctrl+U clears. Save
-As requires a new pathname. Put the mode flag `--window` first, and use `--`
-before dash-prefixed command-line paths.
+As requires a new pathname. Use `--` before dash-prefixed command-line paths.
+The older leading `--window` flag remains an optional alias.
+
 Switch tabs with Ctrl+Tab. An existing file opened again selects its current
 tab without reloading it. External disk changes refuse Save and offer Ctrl+R
 Reload, Ctrl+S Save As to a new name, or Escape/Ctrl+G Cancel. These dialog
@@ -353,8 +362,7 @@ close dialog keeps the dialog modal; Escape/Ctrl+G cancels closing but the
 save still finishes. You can then keep editing without an unexpected later
 exit. Fatal errors or process termination can lose unsaved edits; a pending
 write may have reached disk. There is no recovery. Conflict Reload uses
-the explicit discard-before-replacement policy described above; ordinary
-`$EDITOR` invocation remains future work.
+the explicit discard-before-replacement policy described above.
 
 The original no-file-access scratch fixture is still available:
 
@@ -585,8 +593,8 @@ Focus loss, modifier changes, map replacement and capability withdrawal cancel
 repeat. Enter's already-held keys never synthesize presses. Protocol tests
 send real descriptors and key events through both profiles, then check model
 bytes and submitted pixels. This is not yet a live Weston input/pixel proof;
-the optional Weston test above proves presentation only. The `$EDITOR`
-warning still applies.
+the optional Weston test above proves presentation only. These tests do not
+establish td-mail/jail integration or GPU rendering.
 
 Editor-only changes are routed by `td-builder ready` to this crate's tests
 and Clippy alongside the workspace Rust suite, whose tests validate every

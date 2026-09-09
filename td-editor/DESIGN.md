@@ -59,9 +59,11 @@ connected by the window adapter; remaining adapters are future work.
 editable scratch tabs through the real Wayland transport and SHM lifecycle.
 It accepts keyboard input in both profiles, but cannot save or open user
 documents. Dirty window close requires explicit discard; process termination
-still loses scratch text. `--window` is a separate experimental file window;
-it is not yet the usable `$EDITOR` milestone. See the implemented file-window
-contract below for its narrower scheduling and close/conflict behavior.
+still loses scratch text. Ordinary invocation now opens the separate
+experimental file window; `--window` remains an optional explicit alias.
+It supports foreground local `$EDITOR` use, not td-mail/jail integration
+or the GPU milestone. See the file-window contract below for its narrower
+scheduling and close/conflict behavior.
 
 File-window close now has per-document Save/Discard/Cancel decisions,
 including Save As for untitled tabs and cancellation during a pending save.
@@ -1096,8 +1098,8 @@ any failed initial open exits nonzero without creating a window or writing
 files. Duplicate paths/inodes select the existing tab without refreshing its
 baseline or replacing edits. With no paths, New creates one clean Untitled
 tab. Missing paths create empty dirty tabs without creating a disk file.
-Ordinary no-option/filename invocation remains refused: this explicit mode
-is experimental, not the `$EDITOR`/td-mail integration milestone.
+Ordinary no-option/filename invocation uses this same experimental window;
+td-mail/jail and GPU integration remain separate milestones.
 
 The file window reuses the preview's transport, input dispatcher and bitmap
 renderer, with the warm palette and medium weight. It requires a v5+ seat
@@ -1834,7 +1836,7 @@ Tests use actual SCM_RIGHTS and pipe/socket endpoints, exact native input
 serials in both key profiles, menu activation, fragmented UTF-8/CRLF, terminal
 cancellation, immutable source data and repeated offer-ID retirement/reuse.
 This does not claim live third-party toolkit clipboard interoperability yet.
-The software window is still experimental, not the default $EDITOR path.
+The default software window remains experimental and has no crash recovery.
 
 ### Implemented native Find
 
@@ -2224,14 +2226,30 @@ module is imported. These fixtures do not replace the live Weston test.
 
 ## `$EDITOR`, td-mail, and td-jail
 
-The command contract is `td-editor [options] -- [file ...]`. It opens the
-requested paths in tabs and stays in the foreground until the invocation's
+The implemented command contract is `td-editor [options] -- [file ...]`.
+The separator is optional except before dash-prefixed paths. With no files,
+the editor opens an Untitled tab. `--window` remains an explicit alias for
+the same file-window path, not a second implementation. `--replay`,
+`--preview`, `--window-preview`, `--font-license` and `--help` retain their
+explicit nondefault meanings; unknown options fail before opening a window.
+The editor opens the requested paths in tabs and stays in the foreground
+until the invocation's
 window closes. No implicit daemon, single-instance forwarding, shell
 interpretation of filenames, terminal input requirement, or background fork.
 This lets a caller set `EDITOR` to an executable path and wait normally.
 Exit 0 means the user completed the session (including an explicit discard),
 not that every file was saved. Invocation, open, and fatal runtime failures
 have nonzero status and diagnostics on stderr.
+
+A native process case invokes that ordinary argument path with multiple
+relative filenames, including a dash prefix, spaces, Unicode and shell
+metacharacters after `--`. It edits and saves an existing file and creates
+a missing one only on Save. The invoked child remains alive through mapped
+frames and completed saves, then exits successfully on explicit Quit. A
+shared-offset inherited stdin file remains unread and stdout stays empty.
+This is foreground local-call evidence, not terminal control, td-mail draft
+retention, td-jail confinement or GPU rendering proof. Experimental local
+use still has no crash recovery; retain backups for important work.
 
 The editor inherits the caller's filesystem namespace, working directory,
 and Wayland connection environment. It never escapes a jail to find a host
@@ -2247,8 +2265,10 @@ retain draft text before the caller removes its temporary file.
 The caller inspected for this design is td-mail (then the standalone
 `tmc` repository, now `td-mail/` in this tree). Its `src/tui/mod.rs`
 selects `[ui].editor`, then `$EDITOR`, then `vi`; `spawn_editor` starts
-`sh -c` with the editor command and displayed draft path concatenated into
-one string. The TUI continues immediately. A background
+`sh -c` with the configured editor command followed by quoted `"$1"`,
+passing the displayed draft pathname as a separate shell argument. Spaces
+and shell metacharacters in that path remain one argument. The TUI
+continues immediately. A background
 thread waits for the shell child, ignores its exit status, and removes both
 the draft and any attachment directory. td-mail neither rereads the saved file
 nor submits mail. Consequently a normal Save followed by Quit loses the
@@ -2264,12 +2284,12 @@ these bytes as ordinary text. Saving the draft elsewhere does not preserve
 the referenced attachment files when td-mail later removes them. Recognizing,
 retaining, or submitting mail is a separate requested product capability.
 
-td-mail's unquoted shell concatenation also means paths containing shell syntax
-or spaces are not passed as literal argv today. td-editor can accept such
-paths correctly but cannot repair a command already misparsed by its parent.
-A td-mail integration change must resolve argument construction at the caller;
-do not work around it by evaluating shell text inside the editor. The editor
-must avoid consuming the TUI's inherited terminal input.
+td-mail still interprets its configured editor command as shell text, and
+converts the draft path through `display().to_string()`, which is lossy for
+non-UTF-8 paths. An integration change must preserve OS-byte path identity
+at the caller; td-editor cannot recover bytes already changed by its parent.
+Do not add shell evaluation to the editor. The editor leaves the caller's
+inherited terminal input untouched.
 
 An integration increment must make the executable and exact runtime closure
 available inside the jail in which td-mail runs, set its explicit `EDITOR`
@@ -2286,10 +2306,10 @@ and verify exact saved bytes before caller cleanup. For retention, exercise
 Save As to a persistent granted directory, close the window, and prove that
 td-mail remains responsive, its temporary draft is cleaned up, and the retained
 copy survives. Attachment retention and submission need their own agreed
-oracle. Include filenames with spaces and leading dashes after correcting
-the caller, unwritable paths, cancellation, missing display, and an attempted
-path outside the grant. An isolated Wayland smoke test alone is not evidence
-that td-mail's jail can launch the editor.
+oracle. Include spaces, leading dashes and non-UTF-8 paths with exact caller
+argument preservation, unwritable paths, cancellation, missing display,
+and an attempted path outside the grant. An isolated Wayland smoke test
+alone is not evidence that td-mail's jail can launch the editor.
 
 ## Test and control architecture
 
