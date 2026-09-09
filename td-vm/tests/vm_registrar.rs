@@ -290,3 +290,110 @@ fn registrar_refuses_exposed_registry_and_non_socket_replacement() -> Result<()>
     );
     Ok(())
 }
+
+#[test]
+fn manager_profile_authenticates_exact_origin_and_preserves_failed_updates() -> Result<()> {
+    if in_trusted_root("manager_profile_authenticates_exact_origin_and_preserves_failed_updates")? {
+        return Ok(());
+    }
+    let (root, policy) = fixture()?;
+    let uid = fs::metadata("/proc/self")?.uid();
+    let directory = root.0.join("socket");
+    let _server = launch(&directory, &policy, uid)?;
+    let client = root.0.join("td-vm-registrar");
+    let git = root.0.join("git");
+    for (source, destination) in [(PathBuf::from(BIN), &client), (host_git()?, &git)] {
+        fs::copy(source, destination)?;
+        fs::set_permissions(destination, fs::Permissions::from_mode(0o700))?;
+    }
+    let home = root.0.join("vms");
+    let input = root.0.join("profile");
+    let repository = root.0.join("origin.git");
+    let profile = format!("TDVM-GIT-PROFILE-1\nrepository={}\naddress=10.0.2.2\nport=22\nuser=test\nserver-uid={uid}\nsocket={}\nregistrar={}\ngit={}\nhost-key=ssh-ed25519 {KEY}\nauthor-name=Fixture\nauthor-email=fixture@example.invalid\n", repository.display(), directory.display(), client.display(), git.display());
+    fs::write(&input, &profile)?;
+    fs::set_permissions(&input, fs::Permissions::from_mode(0o600))?;
+    let manager = |args: &[&str], success| {
+        invoke(
+            Command::new(env!("CARGO_BIN_EXE_td-vm"))
+                .env("TD_VM_HOME", &home)
+                .args(args),
+            success,
+        )
+    };
+    manager(&["git-profile", "show"], false)?;
+    assert!(!home.exists(), "read-only probe created state");
+    manager(
+        &["git-profile", "set", input.to_str().ok_or("profile path")?],
+        true,
+    )?;
+    let original = fs::read(home.join("git-profile"))?;
+    let registry = fs::read(&policy)?;
+    assert_eq!(
+        fs::metadata(home.join("git-profile"))?.mode() & 0o777,
+        0o600
+    );
+    let check = manager(&["git-profile", "check"], true)?;
+    assert!(String::from_utf8(check.stdout)?
+        .contains("Guest SSH and workspace readiness remain unverified"));
+    assert_eq!(
+        fs::read(&policy)?,
+        registry,
+        "profile check changed registry"
+    );
+    let origin = request(&directory, uid, &["origin"], true)?;
+    assert!(!origin.stdout.is_empty());
+    request(&directory, uid + 1, &["origin"], false)?;
+    fs::write(&input, "not a profile\n")?;
+    manager(
+        &["git-profile", "set", input.to_str().ok_or("profile path")?],
+        false,
+    )?;
+    assert_eq!(fs::read(home.join("git-profile"))?, original);
+    fs::write(
+        &input,
+        profile.replace(
+            &format!("server-uid={uid}"),
+            &format!("server-uid={}", uid + 1),
+        ),
+    )?;
+    manager(
+        &["git-profile", "set", input.to_str().ok_or("profile path")?],
+        true,
+    )?;
+    manager(&["git-profile", "check"], false)?;
+    // A second valid bare repository must not pass against the first registrar.
+    let other = root.0.join("other.git");
+    invoke(
+        Command::new(&git)
+            .args(["clone", "--bare"])
+            .arg(&repository)
+            .arg(&other),
+        true,
+    )?;
+    fs::write(
+        &input,
+        profile.replace(
+            &format!("repository={}", repository.display()),
+            &format!("repository={}", other.display()),
+        ),
+    )?;
+    manager(
+        &["git-profile", "set", input.to_str().ok_or("profile path")?],
+        true,
+    )?;
+    let refused = manager(&["git-profile", "check"], false)?;
+    assert!(String::from_utf8(refused.stderr)?.contains("different repository"));
+    assert_eq!(fs::read(&policy)?, registry);
+    // An origin with a different default branch cannot be provisioned.
+    invoke(
+        Command::new(&git).arg("-C").arg(&repository).args([
+            "symbolic-ref",
+            "HEAD",
+            "refs/heads/other",
+        ]),
+        true,
+    )?;
+    request(&directory, uid, &["origin"], false)?;
+    request(&directory, uid, &["ping"], true)?;
+    Ok(())
+}

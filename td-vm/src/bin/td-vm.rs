@@ -30,6 +30,12 @@ mod vm_clipboard;
 #[path = "../../../td-compositor/src/vm_wire.rs"]
 mod vm_wire;
 
+#[path = "../vm_git_profile.rs"]
+mod vm_git_profile;
+#[path = "../vm_git_origin.rs"]
+#[allow(dead_code)]
+mod vm_git_origin;
+
 type Result<T> = std::result::Result<T, String>;
 const TABLE_HEADER: &str = "NAME                             STATE    ACCEL    TEMPLATE         CPU RAM MiB HOST MiB  CAP MiB";
 const DISK_LEGEND: &str = "HOST: allocated overlay; CAP: virtual capacity. Neither is guest free space.";
@@ -53,6 +59,9 @@ const HELP: &str = "td-vm: manage persistent graphical td instances
   td-vm sharing NAME on|off           enable/disable explicit transfers
   td-vm feed NAME PORT|off            provision host feed endpoint
   td-vm bridge NAME                   query guest clipboard capability
+  td-vm git-profile set FILE          save a host Git profile
+  td-vm git-profile show              display configured profile
+  td-vm git-profile check             authenticate registrar and verify origin
 
 TD_VM_HOME defaults to ~/.local/share/td-vm. Requires host QEMU, qemu-img and qemu-io.
 Reuse dist/td-vm-x86-64 from ./build-qcow; no image rebuild on create/open.
@@ -85,7 +94,8 @@ fn run(args: Vec<String>) -> Result<()> {
         }
     };
     let words: Vec<&str> = args.iter().map(String::as_str).collect();
-    let read_only = matches!(words.first(), Some(&"list" | &"templates" | &"logs" | &"status"));
+    let read_only = matches!(words.first(), Some(&"list" | &"templates" | &"logs" | &"status"))
+        || matches!(words.as_slice(), ["git-profile", "show" | "check"]);
     let manager = if read_only {
         if !home.exists() && matches!(words.as_slice(), ["list"] | ["templates"]) {
             println!("No managed instances or templates yet.");
@@ -97,6 +107,23 @@ fn run(args: Vec<String>) -> Result<()> {
     };
     match words.as_slice() {
         [] => tui(&manager),
+        ["git-profile", "set", file] => {
+            let _lock = manager.lock("git-profile")?;
+            vm_git_profile::configure(&manager.root, Path::new(file))?;
+            println!("Git profile saved; run td-vm git-profile check to verify host setup");
+            Ok(())
+        }
+        ["git-profile", "show"] => {
+            let profile = vm_git_profile::load(&manager.root)?;
+            println!("{}", term::scrub_lines(&profile.encode()));
+            Ok(())
+        }
+        ["git-profile", "check"] => {
+            let profile = vm_git_profile::load(&manager.root)?;
+            let origin = profile.check()?;
+            println!("Git profile {}: registrar authenticated; origin {} at main {}. Guest SSH and workspace readiness remain unverified.", profile.fingerprint(), origin.repository, origin.head);
+            Ok(())
+        }
         ["import", name, bundle] => manager.import(name, Path::new(bundle)),
         ["templates"] => manager.templates(),
         ["prune"] => manager.prune(),

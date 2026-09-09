@@ -349,6 +349,22 @@ pub(super) fn cli(args: &[OsString]) -> Option<Result<bool>> {
             }
             Ok(true)
         })()),
+        "origin" => Some((|| {
+            let [path] = remaining else { return Err("usage: td-vm-git origin POLICY".into()); };
+            let policy = Policy::load(Path::new(path))?;
+            if policy.query(&["rev-parse", "--is-bare-repository"])? != "true"
+                || policy.query(&["symbolic-ref", "HEAD"])? != "refs/heads/main"
+            {
+                return Err("VM origin must be bare with main as its default branch".into());
+            }
+            let repository = fs::canonicalize(&policy.repository)?;
+            let origin = super::origin::Origin::new(
+                repository.to_str().ok_or("origin path must be UTF-8")?.into(),
+                policy.query(&["rev-parse", "--verify", "HEAD^{commit}"])?
+            )?;
+            io::stdout().lock().write_all(origin.encode().as_bytes())?;
+            Ok(true)
+        })()),
         "init" => Some(init(remaining)),
         "enroll" | "reserve" | "revoke" => Some(change(verb.to_str()?, remaining)),
         "authorized-keys" => Some(authorized_keys(remaining)),

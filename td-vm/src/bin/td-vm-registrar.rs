@@ -4,6 +4,9 @@
 #[path = "../vm_registrar_sys.rs"]
 mod sys;
 
+#[path = "../vm_git_origin.rs"]
+mod origin;
+
 use std::env;
 use std::fs::{self, DirBuilder, File, OpenOptions};
 use std::io::{self, Read, Write};
@@ -24,6 +27,7 @@ static SERIAL: AtomicU64 = AtomicU64::new(0);
 #[derive(Debug, PartialEq, Eq)]
 enum Request {
     Ping,
+    Origin,
     Enroll {
         id: String,
         branch: String,
@@ -56,6 +60,7 @@ impl Request {
         let words: Vec<_> = body.split(' ').collect();
         let (id, branch, key) = match words.as_slice() {
             ["ping"] => return Ok(Self::Ping),
+            ["origin"] => return Ok(Self::Origin),
             ["enroll", id, branch, key] => (*id, Some(*branch), Some(*key)),
             ["reserve", id, branch] => (*id, Some(*branch), None),
             ["revoke", id] => (*id, None, None),
@@ -270,7 +275,7 @@ impl Drop for Scratch {
     }
 }
 
-fn execute(policy: &Path, dispatcher: &Path, request: Request) -> Result<()> {
+fn execute(policy: &Path, dispatcher: &Path, request: Request) -> Result<String> {
     let mut command = Command::new(dispatcher);
     command
         .env_clear()
@@ -279,9 +284,13 @@ fn execute(policy: &Path, dispatcher: &Path, request: Request) -> Result<()> {
         .stdout(Stdio::null())
         .stderr(Stdio::inherit());
     let mut scratch = None;
+    let inspect_origin = matches!(request, Request::Origin);
     match request {
         Request::Ping => {
             command.arg("check").arg(policy);
+        }
+        Request::Origin => {
+            command.arg("origin").arg(policy).stdout(Stdio::piped());
         }
         Request::Enroll { id, branch, key } => {
             let parent = policy.parent().ok_or("missing registry parent")?;
@@ -312,12 +321,27 @@ fn execute(policy: &Path, dispatcher: &Path, request: Request) -> Result<()> {
             command.arg("revoke").arg(policy).arg(id);
         }
     }
-    let status = command.status()?;
+    let mut child = command.spawn()?;
+    let mut output = Vec::new();
+    if let Some(stdout) = child.stdout.take() {
+        let read = stdout.take(MAX_FRAME as u64 + 1).read_to_end(&mut output);
+        if read.is_err() || output.len() > MAX_FRAME {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err("invalid registry output".into());
+        }
+    }
+    let status = child.wait()?;
     drop(scratch);
     if !status.success() {
         return Err("registry operation failed; inspect registrar diagnostics".into());
     }
-    Ok(())
+    if inspect_origin {
+        let origin = origin::Origin::parse(std::str::from_utf8(&output)?)?;
+        Ok(format!("OK {}", origin.encode()))
+    } else {
+        Ok("OK\n".into())
+    }
 }
 
 fn serve(directory: &Path, policy: &Path, dispatcher: &Path, operator: u32) -> Result<()> {
@@ -357,7 +381,7 @@ fn serve(directory: &Path, policy: &Path, dispatcher: &Path, operator: u32) -> R
                 execute(policy, dispatcher, request)
             });
         let reply = match result {
-            Ok(()) => format!("{HEADER}OK\n"),
+            Ok(reply) => format!("{HEADER}{reply}"),
             Err(error) => {
                 eprintln!("td-vm-registrar: {error}");
                 format!("{HEADER}ERROR request failed; inspect registrar diagnostics\n")
@@ -371,13 +395,21 @@ fn serve(directory: &Path, policy: &Path, dispatcher: &Path, operator: u32) -> R
 fn request(directory: &Path, server: u32, words: &[String]) -> Result<()> {
     absolute(directory)?;
     let frame = format!("{HEADER}{}\n", words.join(" "));
-    Request::parse(&frame)?;
+    let inspect_origin = matches!(Request::parse(&frame)?, Request::Origin);
     let mut stream = UnixStream::connect(directory.join("control"))?;
     if sys::peer_uid(&stream)? != server {
         return Err("registrar server account mismatch".into());
     }
     send(&mut stream, &frame)?;
     let response = receive(&mut stream, Instant::now() + Duration::from_secs(30))?;
+    if inspect_origin {
+        let payload = response
+            .strip_prefix(&format!("{HEADER}OK "))
+            .ok_or("registrar origin request failed; inspect server diagnostics")?;
+        let origin = origin::Origin::parse(payload)?;
+        io::stdout().lock().write_all(origin.encode().as_bytes())?;
+        return Ok(());
+    }
     if response != format!("{HEADER}OK\n") {
         return Err(
             "registrar request failed or its outcome is unknown; inspect server diagnostics".into(),
@@ -394,7 +426,7 @@ fn run() -> Result<()> {
     match args.as_slice() {
         [verb, directory, policy, dispatcher, operator] if verb == "serve" => serve(Path::new(directory), Path::new(policy), Path::new(dispatcher), operator.parse()?),
         [verb, directory, server, remaining @ ..] if verb == "request" => request(Path::new(directory), server.parse()?, remaining),
-        _ => Err("usage: td-vm-registrar serve SOCKET_DIRECTORY POLICY DISPATCHER OPERATOR_UID | request SOCKET_DIRECTORY SERVER_UID ping|enroll ID BRANCH KEY_BASE64|reserve ID BRANCH|revoke ID".into()),
+        _ => Err("usage: td-vm-registrar serve SOCKET_DIRECTORY POLICY DISPATCHER OPERATOR_UID | request SOCKET_DIRECTORY SERVER_UID ping|origin|enroll ID BRANCH KEY_BASE64|reserve ID BRANCH|revoke ID".into()),
     }
 }
 
@@ -465,8 +497,8 @@ mod tests {
         assert_eq!(digest, RAW_FINGERPRINT);
         assert_eq!(raw.matches("unsafe").count(), 2);
         assert_eq!(root.matches("unsafe").count(), 1);
-        assert_eq!(root.matches("mod ").count(), 1);
-        assert_eq!(root.matches("#[path").count(), 1);
+        assert_eq!(root.matches("mod ").count(), 2);
+        assert_eq!(root.matches("#[path").count(), 2);
         assert_eq!(root.matches("sys::").count(), 2);
         assert_eq!(root.matches("sys::peer_uid(&stream)").count(), 2);
         for text in [root, raw] {
@@ -474,12 +506,11 @@ mod tests {
             assert!(!text.contains("include!("));
         }
         assert!(root.contains("#[path = \"../vm_registrar_sys.rs\"]\nmod sys;"));
-        for source in [
-            include_str!("td-vm.rs"),
-            include_str!("td-vm-git.rs"),
-        ] {
+        assert!(root.contains("#[path = \"../vm_git_origin.rs\"]\nmod origin;"));
+        for source in [include_str!("td-vm.rs"), include_str!("td-vm-git.rs")] {
             assert!(source.contains("#![forbid(unsafe_code)]"));
         }
+        assert!(include_str!("../vm_git_origin.rs").contains("#![forbid(unsafe_code)]"));
         assert!(include_str!("../../Cargo.toml").contains("unsafe_code = \"deny\""));
     }
     const RAW_FINGERPRINT: u64 = 0x50343090757487b4;

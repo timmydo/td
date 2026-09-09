@@ -884,6 +884,7 @@ host the operator is `timmy` (UID 1000) and Git account is `test` (UID 1001):
 ```text
 td-vm-registrar serve /home/test/.td-vm-registrar /home/test/.td-vm-git/policy /usr/local/libexec/td-vm-git 1000
 td-vm-registrar request /home/test/.td-vm-registrar 1001 ping
+td-vm-registrar request /home/test/.td-vm-registrar 1001 origin
 td-vm-registrar request /home/test/.td-vm-registrar 1001 enroll INSTANCE_ID TASK_BRANCH ED25519_BASE64
 td-vm-registrar request /home/test/.td-vm-registrar 1001 reserve INSTANCE_ID TASK_BRANCH
 td-vm-registrar request /home/test/.td-vm-registrar 1001 revoke INSTANCE_ID
@@ -932,12 +933,90 @@ The host supervisor owns service and descendant teardown. Automatic guest
 provisioning must not treat a failed or absent reply as enrollment success.
 
 The response is the same version header followed by `OK` or a generic
-`ERROR` line. Detailed failures go to the host service's stderr, not the
+`ERROR` line. An `origin` success adds one space and the origin identity to
+`OK`: the canonical repository path encoded as lowercase hexadecimal, a
+space, and the current main commit's lowercase 40- or 64-digit object ID.
+The path is at most 200 ASCII bytes, containing only letters, digits,
+`/`, `-`, `_`, and `.`, without empty or dot components. The response still
+fits the 512-byte frame. The dispatcher must report a bare repository with
+symbolic `HEAD` pointing to `refs/heads/main` and an existing commit. The
+client validates the response and prints its identity without the protocol
+header or `OK`. This is a read-only inspection, not a reservation of that
+commit; main may move immediately afterward.
+
+Detailed failures go to the host service's stderr, not the
 operator protocol. `ping` invokes `td-vm-git check POLICY`, checking the live
 registry grammar and bare repository through the configured backend. It
 proves neither SSH reachability nor guest readiness. No VM lifecycle,
 firstboot, manager configuration, sshd installation, or active-session
 termination is inferred from this local health check.
+
+### Implemented host Git profile
+
+The manager stores one operator-selected public Git profile under its private
+state root. Configure it with `td-vm git-profile set FILE`, inspect it with
+`td-vm git-profile show`, and verify the local host setup with
+`td-vm git-profile check`. The input format requires exactly these fields,
+each once, with a final newline:
+
+```text
+TDVM-GIT-PROFILE-1
+repository=/srv/git/td.git
+address=10.0.2.2
+port=22
+user=test
+server-uid=1001
+socket=/home/test/.td-vm-registrar
+registrar=/usr/local/libexec/td-vm-registrar
+git=/absolute/path/to/git
+host-key=ssh-ed25519 BASE64_PUBLIC_HOST_KEY
+author-name=Timmy Douglas
+author-email=mail@timmydouglas.com
+```
+
+Replace the host-key placeholder with the host's ordinary Ed25519 public
+key, without a comment, obtained through trusted host setup. `address` is
+the guest-visible IPv4 address or DNS hostname; IPv6 is not supported in
+this format. `user` selects the SSH account, while `server-uid` independently
+pins the registrar's kernel identity. The operator supplies both; profile
+checking does not infer a username-to-UID mapping. `git` and `registrar`
+select trusted host executables, never guest paths or shell commands.
+
+Profiles are bounded to 8192 UTF-8 bytes, reject unknown/duplicate fields and
+control characters, and contain no private key or provider credential.
+Repository paths obey the origin protocol's grammar. Other paths must be
+absolute without empty or dot components; the socket directory must leave
+room for `/control` in a Linux Unix-socket pathname. Ports and UIDs are
+canonical decimal values. Input files must be regular, singly linked,
+root/operator-owned and not group/other writable; symlinks are refused.
+The stable profile lock serializes replacement. The manager writes and
+syncs a mode-0600 temporary file, atomically renames it, then syncs the
+directory. Invalid input preserves the previous profile. A directory-sync
+failure after rename reports an error even though the new file is visible.
+Stored profiles must also have no group/other access. The manager displays
+the canonical field order and identifies that snapshot by SHA-256.
+
+`set` validates and saves configuration without connecting to the service.
+`check` verifies the canonical local bare repository, its main default and
+commit, then invokes the fixed registrar client for `origin`. That client
+authenticates the configured server UID before sending any request; the
+returned repository must match the profile exactly. Configured executables
+and their canonical ancestors must be root/operator-owned and protected
+from other writers, except trusted sticky directories. Commands have an
+empty environment and fixed arguments; captured output is bounded.
+Git probes select the operator's explicit repository with `--git-dir`,
+without discovery or replacement objects, as the dispatcher does. This
+supports the shared origin's existing owner and ACLs without global Git
+configuration exceptions. Trusted tool execution and filesystem operations
+have no hard elapsed-time bound.
+
+These checks do not enroll a key, contact SSH, prove the supplied host key
+matches the SSH endpoint, or provision a guest workspace. They report this
+remaining uncertainty explicitly. The sampled main commit is informational,
+not retained for provisioning. Existing create/open behavior does not yet
+attach a profile to an instance, and the TUI has no profile editor. Per-VM
+profile snapshots, guest key generation/enrollment, and automatic cloning
+remain the next workspace increment.
 
 ### Implemented host Git dispatcher
 
