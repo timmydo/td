@@ -404,12 +404,17 @@ fn native_prompt_inspection_is_borrow_only_and_cannot_dispatch_or_poll() {
     ] {
         assert!(!query.contains(forbidden), "{forbidden}");
     }
-    let dispatch = production.split("fn control_response(").nth(1).unwrap();
+    let dispatch = production.split("fn control_response_inner(").nth(1).unwrap();
     let dispatch = dispatch.split("\n    fn ").next().unwrap();
     assert!(
         dispatch.find("Operation::PromptState").unwrap()
             < dispatch.find("request.is_mutating()").unwrap()
     );
+    let wrapper = production.split("fn control_response(").nth(1).unwrap()
+        .split("\n    fn ").next().unwrap();
+    assert!(wrapper.contains("request.is_mutating() && matches!(response.split('\\t').nth(2), Some(\"ok\" | \"pending\"))"));
+    assert!(wrapper.find("request.is_mutating()").unwrap()
+        < wrapper.find("self.sync_prompt_layout()").unwrap());
     let control = include_str!("../src/control.rs");
     let fields = control
         .split("fn fields(&self, generation: u64, notice: &str)")
@@ -505,7 +510,7 @@ fn native_prompt_answers_pin_context_before_cleanup_and_never_route_global_keys(
     ] {
         assert!(answer.contains(required), "{required}");
     }
-    let dispatch = production.split("fn control_response(").nth(1).unwrap();
+    let dispatch = production.split("fn control_response_inner(").nth(1).unwrap();
     let dispatch = dispatch.split("\n    fn ").next().unwrap();
     assert!(
         dispatch.find("Operation::PromptAnswer").unwrap()
@@ -655,7 +660,7 @@ fn native_control_is_opt_in_and_liveness_checked_with_bounded_outer_turns() {
     assert!(production.contains("control: None"));
     assert!(production.contains("fn control_response(&mut self,"));
     assert!(production.contains("let response = request.response(&self.ui);"));
-    let dispatch = production.split("fn control_response(").nth(1).unwrap();
+    let dispatch = production.split("fn control_response_inner(").nth(1).unwrap();
     let dispatch = dispatch.split("\n    fn ").next().unwrap();
     assert!(
         dispatch.find("self.frames.generation()").unwrap()

@@ -181,13 +181,16 @@ Completion adds state-specific fields after `completion`: pending includes
 `completion-id=N`, a checked scan ID, not answer authority. Error includes
 `completion-error=HEX`, a UTF-8 diagnostic limited to 160 characters. Ready
 includes `completion-count=N`, `completion-skipped=N` (non-UTF-8 basenames),
-`completion-selected=INDEX|-`, then up to three repeated
+`completion-selected=INDEX|-`, `completion-page-size=N`, then up to twelve
+repeated
 `completion-item=INDEX,HEX` fields for the currently displayed page. Indices
 are zero-based sorted match indices; values are full literal UTF-8 paths,
 not escaped display labels. Each path is at most 4096 bytes and the list at
-most 128 paths; only the current three-row page is returned. These bounded
+most 4096 paths; only the current page is returned. The page size is 1..=12,
+chosen from window height as specified in DESIGN.md. These bounded
 fields fit the existing one-MiB frame. Inspecting them never starts or polls
-a scan. Physical Tab/Shift+Tab/Up/Down uses the path entry's keyboard path;
+a scan. Physical Tab/Shift+Tab/Up/Down and PageUp/PageDown use the path
+entry's keyboard path;
 semantic dialog answers still supply explicit OS-byte paths and do not
 gain a completion mutation verb or physical clipboard authority.
 
@@ -510,8 +513,9 @@ is `protocol`. No force/discard bypass exists.
 
 As explicitly approved for automation, trusted remote answers do not require
 keyboard focus, a synchronized keymap/seat, or a fully visible prompt.
-Physical Save/Discard still require their existing input and 272x160-pixel
-visibility conditions. This does not fabricate input state or a physical
+Physical Save/Discard still require their existing input and
+272x168-logical-pixel visibility conditions. This does not fabricate input
+state or a physical
 serial. The remote authority is the private control endpoint plus an explicit
 answer bound to the live dialog, tab and revision. This includes a dialog
 opened by a human through ordinary input or the window manager; the client
@@ -1242,6 +1246,11 @@ state, and ordinary endpoint cleanup cancels pending waits.
 Success begins `1 ID ok` followed by these tab-separated fields, in order:
 
 1. `active=TAB_OR_0`, `keys=windows|emacs`, `prefix=0|1`.
+   While a minibuffer is active, `minibuffer=ROWS,PIXEL_HEIGHT` follows:
+   requested rows are 1..=15; pixel height is clamped to available complete
+   scaled rows, and may be zero on a tiny surface. Absence means no inset.
+   The tabs and document start below this reserved height. This reports
+   controller geometry, not prompt-answer authority or presented pixels.
 2. One `tab=ID,REV,DIRTY,BYTES,ANCHOR,CARET,AUTO_FILL,FILL_COLUMN,BOM,ENDING`
    for each open tab in ascending ID order. Flags are `0|1`; `ENDING` is
    `lf|crlf`. Selection endpoints are directed UTF-8 byte offsets.

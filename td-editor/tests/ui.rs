@@ -79,6 +79,47 @@ fn pixels(ui: &Controller) -> Vec<u8> {
 }
 
 #[test]
+fn minibuffer_reserves_chrome_and_retains_document_pixels_and_hits() {
+    for scale in 1..=4 {
+        let mut ui = loaded("first\nsecond\nthird\nfourth\nfifth\nsixth\nseventh");
+        resize(&mut ui, 320 * scale, 320 * scale, scale as u8);
+        ui.dispatch(Event::Focus(false)).unwrap();
+        let before = pixels(&ui);
+        let model = format!("{:?}", ui.editor());
+        let old = ui.geometry();
+        let generation = ui.generation();
+        ui.dispatch(Event::PromptRows(6)).unwrap();
+        assert_eq!(ui.generation(), generation + 1);
+        assert_eq!(format!("{:?}", ui.editor()), model);
+        let geometry = ui.geometry();
+        assert_eq!(geometry.prompt().y, (24 * scale) as i64);
+        assert_eq!(geometry.prompt().height, (96 * scale) as u32);
+        assert_eq!(geometry.tab(0, 0, 1).unwrap().y, (120 * scale) as i64);
+        assert_eq!(geometry.document().y, (144 * scale) as i64);
+        assert_eq!(geometry.status(), old.status());
+        let shifted = pixels(&ui);
+        for y in 0..7 * 16 * scale {
+            for x in 8 * scale..64 * scale {
+                let source = ((y + 48 * scale) * 320 * scale + x) * 4;
+                let target = ((y + 144 * scale) * 320 * scale + x) * 4;
+                assert_eq!(&before[source..source + 4], &shifted[target..target + 4]);
+            }
+        }
+        pointer(&mut ui, PointerPhase::Press, 24 * scale as i64, 144 * scale as i64, false);
+        assert_eq!(selection(&ui).caret, 2);
+        assert_eq!(ui.dispatch(Event::PromptRows(16)), Err(Error::Limit));
+        ui.dispatch(Event::PromptRows(0)).unwrap();
+        assert_eq!(ui.geometry(), old);
+        assert_eq!(selection(&ui).caret, 2);
+        ui.dispatch(Event::PromptRows(15)).unwrap();
+        resize(&mut ui, 320 * scale, 104 * scale, scale as u8);
+        assert_eq!(ui.geometry().prompt().height, (32 * scale) as u32);
+        assert_eq!(ui.geometry().grid().1, 0);
+        assert!(ui.geometry().document().y <= ui.geometry().status().y);
+    }
+}
+
+#[test]
 fn line_numbers_default_toggle_digit_growth_and_hits_share_geometry() {
     for scale in 1..=4 {
         let mut ui = Controller::default();

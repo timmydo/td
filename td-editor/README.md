@@ -367,12 +367,20 @@ Tab/Shift+Tab or Down/Up cycles them; Enter submits the selected path.
 Directory matches end in `/`; once a directory is the sole match, Tab
 again lists its contents. Typing or Backspace clears the old completion;
 press Tab again to scan the changed entry.
-The list shows three names per page and follows the selected match.
+The list shows up to twelve names per page, depending on window height,
+and follows the selected match. PageDown/PageUp moves by a page; the range
+and total count show how many more choices are available.
 Completion runs off the UI thread and does not open or modify files.
 It includes dotfiles, does no shell or `~` expansion, and uses the startup
 working directory for relative paths. Non-UTF-8 names are omitted with a
-count; large directories or more than 128 matches refuse explicitly.
+count; scans exceeding 4096 entries or 1 MiB of names refuse explicitly.
+All matching UTF-8 paths within those bounds are retained, with no separate
+128-match cutoff.
 Open, Save As and Dictionary use the same keys in both profiles.
+
+Active prompts reserve space above the tabs. The tabs and document move
+down while the minibuffer is open, so Find, Replace and Open no longer
+cover the beginning of the visible buffer. Escape removes this space.
 
 Switch tabs with Ctrl+Tab. An existing file opened again selects its current
 tab without reloading it. External disk changes refuse Save and offer Ctrl+R
@@ -383,7 +391,8 @@ starts at the document's beginning. Reload refuses a deleted destination and
 retains the document; use Save As to preserve it under a new name.
 Cancelling a pending Reload retains both
 the old text and its conflict baseline; the read may still finish.
-Resize small windows to at least 272x160 to answer close/conflict questions.
+Resize small windows to at least 272x168 logical pixels to answer
+close/conflict questions.
 
 Close asks about each dirty tab: Ctrl+S saves, Ctrl+D approves discarding that
 tab's edits, and Escape/Ctrl+G cancels closing. Untitled tabs enter Save As.

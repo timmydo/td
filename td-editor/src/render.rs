@@ -137,7 +137,10 @@ pub struct Geometry {
     height: usize,
     scale: Scale,
     gutter_columns: usize,
+    prompt_rows: usize,
 }
+
+pub const MAX_PROMPT_ROWS: usize = 15;
 
 const MENU_BAR: &str = "File   Edit   Format   Help";
 
@@ -148,6 +151,7 @@ impl Default for Geometry {
             height: 600,
             scale: Scale(1),
             gutter_columns: 0,
+            prompt_rows: 0,
         }
     }
 }
@@ -169,10 +173,23 @@ impl Geometry {
             height,
             scale,
             gutter_columns: 0,
+            prompt_rows: 0,
         })
     }
     pub fn dimensions(self) -> (usize, usize) {
         (self.width, self.height)
+    }
+    pub fn with_prompt_rows(mut self, rows: usize) -> Result<Self> {
+        if rows > MAX_PROMPT_ROWS { return Err(Error::Limit); }
+        self.prompt_rows = rows;
+        Ok(self)
+    }
+    pub fn prompt_rows(self) -> usize { self.prompt_rows }
+    pub fn prompt(self) -> Rect {
+        let scale = self.scale.value();
+        let rows = self.prompt_rows.min(self.height.saturating_sub(72 * scale) / (16 * scale));
+        Rect { x: 0, y: (24 * scale) as i64, width: self.width as u32,
+            height: (rows * 16 * scale) as u32 }
     }
     pub(crate) fn with_line_numbers(mut self, lines: Option<usize>) -> Self {
         self.gutter_columns = lines.map_or(0, |n| n.to_string().len().max(2) + 1);
@@ -182,10 +199,10 @@ impl Geometry {
         let s = self.scale.value();
         Rect {
             x: (8 * s) as i64,
-            y: (48 * s) as i64,
+            y: (48 * s + self.prompt().height as usize) as i64,
             width: (self.gutter_columns * CELL_WIDTH * s).min(self.width.saturating_sub(16 * s))
                 as u32,
-            height: self.height.saturating_sub(72 * s) as u32,
+            height: self.height.saturating_sub(72 * s + self.prompt().height as usize) as u32,
         }
     }
     pub fn scale(self) -> Scale {
@@ -221,9 +238,9 @@ impl Geometry {
         let gutter = self.gutter();
         Rect {
             x: gutter.x + i64::from(gutter.width),
-            y: (48 * s) as i64,
+            y: (48 * s + self.prompt().height as usize) as i64,
             width: self.width.saturating_sub(16 * s + gutter.width as usize) as u32,
-            height: self.height.saturating_sub(72 * s) as u32,
+            height: self.height.saturating_sub(72 * s + self.prompt().height as usize) as u32,
         }
     }
     pub fn grid(self) -> (usize, usize) {
@@ -265,7 +282,7 @@ impl Geometry {
         }
         Some(Rect {
             x: (slot * width) as i64,
-            y: (24 * self.scale.value()) as i64,
+            y: (24 * self.scale.value() + self.prompt().height as usize) as i64,
             width: width as u32,
             height: (24 * self.scale.value()) as u32,
         })
@@ -528,7 +545,7 @@ impl<'a> Scene<'a> {
                 x: 0,
                 y: 0,
                 width: self.geometry.width as u32,
-                height: (48 * s) as u32,
+                height: (48 * s) as u32 + self.geometry.prompt().height,
             },
             CHROME,
             sink,

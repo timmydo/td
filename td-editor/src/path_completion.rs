@@ -7,7 +7,7 @@ type Result<T> = std::result::Result<T, String>;
 const PATH_BYTES: usize = 4096;
 const ENTRIES: usize = 4096;
 const NAME_BYTES: usize = 1024 * 1024;
-const MATCHES: usize = 128;
+pub(crate) const PAGE_ROWS: usize = 12;
 
 pub(crate) struct Matches {
     paths: Vec<String>,
@@ -55,13 +55,26 @@ impl Matches {
         self.paths.len() == 1 && text.ends_with('/')
     }
 
-    fn page(&self) -> impl Iterator<Item = (usize, &str)> {
-        let start = self.selected.unwrap_or(0) / 3 * 3;
+    pub(crate) fn page_by(&mut self, backward: bool, rows: usize) -> Option<&str> {
+        let rows = rows.clamp(1, PAGE_ROWS);
+        let last = self.paths.len().checked_sub(1)?;
+        let current = self.selected.unwrap_or(0);
+        let next = if backward { current.saturating_sub(rows) }
+            else { current.saturating_add(rows).min(last) };
+        self.selected = Some(next);
+        self.paths.get(next).map(String::as_str)
+    }
+
+    pub(crate) fn count(&self) -> usize { self.paths.len() }
+
+    fn page(&self, rows: usize) -> impl Iterator<Item = (usize, &str)> {
+        let rows = rows.clamp(1, PAGE_ROWS);
+        let start = self.selected.unwrap_or(0) / rows * rows;
         self.paths
             .iter()
             .enumerate()
             .skip(start)
-            .take(3)
+            .take(rows)
             .map(|(n, p)| (n, p.as_str()))
     }
 }
@@ -76,7 +89,7 @@ pub(crate) enum State {
 }
 
 impl State {
-    pub(crate) fn notice(&self) -> String {
+    pub(crate) fn notice(&self, rows: usize) -> String {
         match self {
             Self::Idle => "Tab: complete; Up/Down: choose matches".into(),
             Self::Pending(_) => "Reading directory for completion...".into(),
@@ -86,11 +99,13 @@ impl State {
             ),
             Self::Ready(matches) => {
                 let mut text = format!(
-                    "{} matches; {} non-UTF-8 names omitted",
+                    "{}-{} / {} matches; PgUp/PgDn; {} non-UTF-8 omitted",
+                    matches.page(rows).next().map_or(0, |(i, _)| i + 1),
+                    matches.page(rows).last().map_or(0, |(i, _)| i + 1),
                     matches.paths.len(),
                     matches.skipped
                 );
-                for (index, path) in matches.page() {
+                for (index, path) in matches.page(rows) {
                     let leaf = Path::new(path)
                         .file_name()
                         .and_then(|s| s.to_str())
@@ -112,7 +127,7 @@ impl State {
         }
     }
 
-    pub(crate) fn fields(&self) -> String {
+    pub(crate) fn fields(&self, rows: usize) -> String {
         match self {
             Self::Idle => "completion=idle".into(),
             Self::Pending(id) => format!("completion=pending\tcompletion-id={id}"),
@@ -123,7 +138,8 @@ impl State {
             Self::Ready(matches) => {
                 let mut fields = format!("completion=ready\tcompletion-count={}\tcompletion-skipped={}\tcompletion-selected={}",
                     matches.paths.len(), matches.skipped, matches.selected.map_or_else(|| "-".into(), |i| i.to_string()));
-                for (index, path) in matches.page() {
+                fields.push_str(&format!("\tcompletion-page-size={}", rows.clamp(1, PAGE_ROWS)));
+                for (index, path) in matches.page(rows) {
                     fields.push_str(&format!(
                         "\tcompletion-item={index},{}",
                         crate::control::hex(path.as_bytes())
@@ -222,9 +238,6 @@ pub(crate) fn scan(text: &str) -> Result<Matches> {
         if !name.starts_with(prefix) {
             continue;
         }
-        if paths.len() == MATCHES {
-            return Err("more than 128 matches; type a longer prefix".into());
-        }
         let is_dir = entry
             .file_type()
             .map_err(|error| error.to_string())?
@@ -282,12 +295,12 @@ mod tests {
         let mut matches = scan(&directory.prefix("al")).unwrap();
         assert_eq!(matches.prefix(), directory.prefix("alp"));
         assert_eq!(matches.cycle(true), Some(directory.prefix("alpê").as_str()));
-        assert_eq!(matches.page().count(), 1);
+        assert_eq!(matches.page(3).count(), 1);
         assert_eq!(
             matches.cycle(false),
             Some(directory.prefix("alpha").as_str())
         );
-        assert_eq!(matches.page().count(), 3);
+        assert_eq!(matches.page(3).count(), 3);
         assert_eq!(
             scan(&directory.prefix("alpé")).unwrap().prefix(),
             directory.prefix("alpé")
@@ -295,9 +308,9 @@ mod tests {
         assert_eq!(scan(&directory.prefix("alp")).unwrap().paths.len(), 4);
         assert_eq!(scan(&directory.prefix(".")).unwrap().paths.len(), 1);
         let state = State::Ready(matches);
-        assert!(state.fields().contains("completion-count=4"));
-        assert_eq!(state.fields().matches("completion-item=").count(), 3);
-        assert!(state.notice().contains("alpé"));
+        assert!(state.fields(3).contains("completion-count=4"));
+        assert_eq!(state.fields(3).matches("completion-item=").count(), 3);
+        assert!(state.notice(3).contains("alpé"));
         let unicode = Matches {
             paths: vec!["é".into(), "ê".into()],
             selected: None,
@@ -342,10 +355,17 @@ mod tests {
         for index in 0..129 {
             std::fs::write(directory.0.join(format!("item{index:04}")), b"").unwrap();
         }
-        assert!(scan(&directory.prefix("item"))
-            .err()
-            .unwrap()
-            .contains("128"));
+        let mut matches = scan(&directory.prefix("item")).unwrap();
+        assert_eq!(matches.count(), 129);
+        assert_eq!(matches.page(12).count(), 12);
+        assert_eq!(matches.page_by(false, 12), Some(directory.prefix("item0012").as_str()));
+        assert_eq!(matches.page(12).next().unwrap().0, 12);
+        assert_eq!(matches.page_by(true, 12), Some(directory.prefix("item0000").as_str()));
+        assert_eq!(matches.page_by(false, usize::MAX), Some(directory.prefix("item0012").as_str()));
+        assert_eq!(matches.page_by(true, 0), Some(directory.prefix("item0011").as_str()));
+        for _ in 0..12 { matches.page_by(false, 12); }
+        assert_eq!(matches.selected, Some(128));
+        assert_eq!(matches.page(12).last().unwrap().0, 128);
         assert_eq!(scan(&directory.prefix("item0000")).unwrap().paths.len(), 1);
         for index in 129..4097 {
             std::fs::write(directory.0.join(format!("item{index:04}")), b"").unwrap();

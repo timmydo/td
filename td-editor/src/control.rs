@@ -1175,6 +1175,9 @@ pub(crate) fn state(ui: &Controller) -> Result<String> {
         },
         u8::from(ui.keys().pending())
     );
+    if ui.geometry().prompt_rows() != 0 {
+        out.push_str(&format!("\tminibuffer={},{}", ui.geometry().prompt_rows(), ui.geometry().prompt().height));
+    }
     for (id, doc) in ui.editor().tabs() {
         let sel = doc.selection();
         if doc.directory() {

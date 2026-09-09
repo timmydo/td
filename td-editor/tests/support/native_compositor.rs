@@ -18,6 +18,90 @@ const KEY_END: u32 = 107;
 
 #[test]
 #[ignore = "ready supplies the disposable native compositor"]
+fn native_minibuffer_keeps_document_visible_and_pages_large_completions() {
+    let lines = ["first", "second", "third", "fourth", "fifth", "sixth", "seventh"];
+    let contents = lines.join("\n");
+    for profile in ["windows", "emacs"] {
+        let compositor_directory = Directory::new();
+        let directory = Directory::new();
+        let mut compositor = Compositor::start(&compositor_directory);
+        std::fs::write(directory.0.join("draft"), &contents).unwrap();
+        for i in 0..320 {
+            std::fs::write(directory.0.join(format!("item{i:04}")), format!("payload {i}")).unwrap();
+        }
+        let socket = directory.0.join("control");
+        let log = directory.0.join("stderr");
+        let child = Command::new(env!("CARGO_BIN_EXE_td-editor"))
+            .arg("--control-socket").arg(&socket).arg(format!("--keys={profile}"))
+            .arg("draft").current_dir(&directory.0).env_clear()
+            .env("WAYLAND_DISPLAY", compositor.directory.join("wayland-0"))
+            .env("XDG_RUNTIME_DIR", &directory.0).env("TMPDIR", &directory.0)
+            .stdin(Stdio::null()).stdout(Stdio::null())
+            .stderr(Stdio::from(std::fs::File::create(&log).unwrap())).spawn().unwrap();
+        let mut editor = EditorProcess { child, socket, log, next: 0 };
+        editor.legacy_keyboard(profile);
+        let window = compositor.window();
+        assert_eq!(compositor.request("fullscreen", 1024), b"ok\n");
+        editor.wait_field("state", "window", "800,576,1");
+        editor.rendered_at(800, 576);
+        for prompt in ["find-forward", "replace", "path-open"] {
+            let before = compositor.observe(&window);
+            match (prompt, profile) {
+                ("find-forward", "windows") => compositor.chord(Some(KEY_LEFT_CTRL), 33),
+                ("find-forward", _) => compositor.chord(Some(KEY_LEFT_CTRL), 31),
+                ("replace", "windows") => compositor.chord(Some(KEY_LEFT_CTRL), 35),
+                ("replace", _) => {
+                    compositor.click(68, 32);
+                    editor.wait_field("state", "modal", "0,0,0,0,1,0,0,0,0");
+                    compositor.click(68, 324);
+                }
+                (_, "windows") => compositor.chord(Some(KEY_LEFT_CTRL), 24),
+                _ => { compositor.chord(Some(KEY_LEFT_CTRL), KEY_X); compositor.chord(Some(KEY_LEFT_CTRL), 33); }
+            }
+            editor.wait_field("prompt-state", "prompt", prompt);
+            editor.wait_field("state", "minibuffer", "6,96");
+            editor.rendered_at(800, 576);
+            compositor.rendered_rows(&window, before, 168, &lines, td_editor::render::PAPER);
+            editor.wait_tab(0, &contents);
+            if prompt != "path-open" {
+                compositor.chord(None, KEY_ESCAPE);
+                editor.wait_field("prompt-state", "prompt", "none");
+            }
+        }
+        for code in [23, 20, 18, 50] { compositor.chord(None, code); } // item
+        let before = compositor.observe(&window);
+        compositor.chord(None, 15);
+        editor.wait_field("prompt-state", "completion", "ready");
+        editor.wait_field("prompt-state", "completion-count", "320");
+        editor.wait_field("state", "minibuffer", "15,240");
+        let page = editor.ok("prompt-state");
+        assert_eq!(field(&page, "completion-page-size"), Some("12"));
+        assert_eq!(page.matches("completion-item=").count(), 12);
+        editor.rendered_at(800, 576);
+        compositor.rendered_rows(&window, before, 312, &lines, td_editor::render::PAPER);
+        compositor.rendered_rows(&window, before, 272, &["  item0011"], td_editor::render::CHROME);
+        for _ in 0..26 { compositor.chord(None, 109); } // PageDown
+        editor.wait_field("prompt-state", "completion-selected", "312");
+        let page = editor.ok("prompt-state");
+        assert_eq!(page.matches("completion-item=").count(), 8);
+        assert!(page.contains("completion-item=319,6974656d30333139"));
+        compositor.chord(None, 104); // PageUp
+        editor.wait_field("prompt-state", "completion-selected", "300");
+        compositor.chord(None, 109);
+        compositor.chord(None, 109);
+        editor.wait_field("prompt-state", "completion-selected", "319");
+        compositor.chord(None, 28);
+        editor.wait_field("state", "active", "2");
+        assert_eq!(editor.ok("text\t2\t0\t0\t100"), "11\t7061796c6f616420333139");
+        editor.wait_tab(0, &contents);
+        assert_eq!(std::fs::read_to_string(directory.0.join("draft")).unwrap(), contents);
+        editor.quit();
+        compositor.stop();
+    }
+}
+
+#[test]
+#[ignore = "ready supplies the disposable native compositor"]
 fn native_directory_tabs_reuse_shift_open_refresh_and_copy_path() {
     for profile in ["windows", "emacs"] {
         let compositor_directory = Directory::new();
@@ -206,7 +290,7 @@ fn native_path_completion_lists_cycles_and_opens_literal_relative_file() {
             assert_eq!(second.client, first.client);
             assert!(output > first.output && output <= second.output);
             if (0..32).all(|y| (0..64).all(|x| {
-                let source = ((y + 120) * 800 + x + 8) * 3;
+                    let source = ((y + 96) * 800 + x + 8) * 3;
                 let target = (y * 64 + x) * 4;
                 pixels[source..source + 3] == [expected[target + 2], expected[target + 1], expected[target]]
             })) { break; }
@@ -381,6 +465,32 @@ fn ppm<'a>(reply: &'a [u8], session: &str) -> Result<(u64, &'a [u8])> {
 }
 
 impl Compositor {
+    fn rendered_rows(&self, window: &str, after: Observation, top: usize, lines: &[&str], background: u32) {
+        let expected: Vec<_> = lines.iter().map(|line| text_pixels_on(line, background)).collect();
+        let deadline = Instant::now() + TIMEOUT;
+        loop {
+            assert!(Instant::now() < deadline, "minibuffer covered document pixel deadline");
+            let first = self.observe(window);
+            if !first.current || first.commit <= after.commit { continue; }
+            let capture = self.request("capture", FRAME_BYTES + 128);
+            let (output, pixels) = ppm(&capture, &self.session).unwrap();
+            let second = self.observe(window);
+            if !second.current || first.commit != second.commit { continue; }
+            assert_eq!(first.client, after.client);
+            assert_eq!(second.client, first.client);
+            assert!(output > first.output && output <= second.output);
+            if lines.iter().zip(&expected).enumerate().all(|(row, (line, glyphs))| {
+                let width = line.len() * 8;
+                (0..16).all(|y| (0..width).all(|x| {
+                    if row == 0 && x == 0 { return true; } // blinking caret only
+                    let source = ((top + row * 16 + y) * 800 + 8 + x) * 3;
+                    let target = (y * width + x) * 4;
+                    pixels[source..source + 3] == [glyphs[target + 2], glyphs[target + 1], glyphs[target]]
+                }))
+            }) { break; }
+        }
+    }
+
     fn start(directory: &Directory) -> Self {
         Self::start_with_clipboard(directory, false)
     }
@@ -657,12 +767,16 @@ impl Drop for Compositor {
 }
 
 fn text_pixels(text: &str) -> Vec<u8> {
-    use td_editor::render::{Draw, Geometry, GlyphStyle, INK, PAPER, Primitive, Raster, Scale};
+    text_pixels_on(text, td_editor::render::PAPER)
+}
+
+fn text_pixels_on(text: &str, background: u32) -> Vec<u8> {
+    use td_editor::render::{Draw, Geometry, GlyphStyle, INK, Primitive, Raster, Scale};
     assert!(text.is_ascii() && !text.is_empty() && text.len() <= 32);
     let font = td_editor::font::pinned().unwrap();
     let width = text.len() * 8;
     let geometry = Geometry::new(width, 16, Scale::new(1).unwrap()).unwrap();
-    let mut pixels = PAPER.to_le_bytes().repeat(width * 16);
+    let mut pixels = background.to_le_bytes().repeat(width * 16);
     let mut raster = Raster::new(&mut pixels, &font, geometry, width * 4).unwrap();
     for (column, scalar) in text.chars().enumerate() {
         raster.draw(Draw {
@@ -671,7 +785,7 @@ fn text_pixels(text: &str) -> Vec<u8> {
                 x: (column * 8) as i64,
                 y: 0,
                 scalar,
-                style: GlyphStyle::medium(INK, PAPER),
+                style: GlyphStyle::medium(INK, background),
             },
         });
     }

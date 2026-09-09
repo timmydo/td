@@ -5,7 +5,7 @@ use crate::dialog::{Close, Closed, Conflict, Scope, Target};
 use crate::font::Font;
 use crate::keyboard::{Keymap, Modifiers};
 use crate::keys::Profile;
-use crate::render::{Draw, Geometry, GlyphStyle, Label, Primitive, Raster, Rect, CHROME, INK};
+use crate::render::{Draw, Geometry, GlyphStyle, Label, Primitive, Raster, CHROME, INK};
 use crate::seat::Input;
 use crate::ui::{Controller, Event, Outcome};
 use crate::wire::{self, Builder, Cursor, Message};
@@ -401,7 +401,7 @@ struct PathIdentity {
     point: crate::model::RevisionPoint,
 }
 impl PathPrompt {
-    fn completion_notice(&self, columns: usize, paused: &str, closing: bool) -> String {
+    fn completion_notice(&self, columns: usize, rows: usize, paused: &str, closing: bool) -> String {
         let columns = columns.clamp(1, 72);
         let action = match self.action {
             PathAction::Open => "Open",
@@ -424,9 +424,9 @@ impl PathPrompt {
         let entry = if columns == 1 { "|".into() } else {
             format!("{}|", escaped.get(start..).unwrap_or_default())
         };
-        format!("{header}\n{entry}\n{}", self.completion.notice())
+        format!("{header}\n{entry}\n{}", self.completion.notice(rows))
             .lines()
-            .take(6)
+            .take(3 + rows)
             .map(|line| line.chars().take(columns).collect::<String>())
             .collect::<Vec<_>>()
             .join("\n")
@@ -616,6 +616,7 @@ impl Window {
 
     fn event(&mut self, message: Message) -> Result<()> {
         let result = self.event_inner(message);
+        self.sync_prompt_layout()?;
         self.cancel_stale_paste();
         self.searches.observe(self.ui.editor());
         self.frames
@@ -1329,6 +1330,12 @@ impl Window {
     }
 
     fn chord(&mut self, chord: &str, repeated: bool) -> Result<bool> {
+        let result = self.chord_inner(chord, repeated);
+        self.sync_prompt_layout()?;
+        result
+    }
+
+    fn chord_inner(&mut self, chord: &str, repeated: bool) -> Result<bool> {
         if self.control_pointer.is_some() {
             self.stop_pointer();
         }
@@ -1682,6 +1689,7 @@ impl Window {
         self.searches.observe(self.ui.editor());
         self.frames
             .invalidate(self.spelling.observe(self.ui.editor()));
+        self.sync_prompt_layout()?;
         Ok(())
     }
 
@@ -1777,6 +1785,17 @@ impl Window {
     }
 
     fn control_response(&mut self, request: &crate::control::Request) -> String {
+        let response = self.control_response_inner(request);
+        if request.is_mutating() && matches!(response.split('\t').nth(2), Some("ok" | "pending")) {
+            if let Err(detail) = self.sync_prompt_layout() {
+                self.control_input_error = Some(detail);
+                return crate::control::Refusal { id: request.id, error: crate::Error::Unavailable }.response();
+            }
+        }
+        response
+    }
+
+    fn control_response_inner(&mut self, request: &crate::control::Request) -> String {
         if self.control_input_error.is_some() {
             return crate::control::Refusal {
                 id: request.id,
@@ -1922,10 +1941,10 @@ impl Window {
                 self.last_dialog_id
                     .checked_add(1)
                     .ok_or(crate::Error::Exhausted)?;
-                // Pointer cancellation and clean-tab completion can each dispatch once.
+                // Pointer cancellation, clean-tab completion and prompt layout.
                 self.ui
                     .generation()
-                    .checked_add(2)
+                    .checked_add(3)
                     .ok_or(crate::Error::Exhausted)?;
                 self.start_close(scope)?;
                 self.control_mutation_accepted();
@@ -2524,6 +2543,8 @@ impl Window {
         if current.revision != target.revision {
             return Err(crate::Error::StaleRevision);
         }
+        // Reserve existing cleanup/completion plus the admitted layout change.
+        self.ui.generation().checked_add(2).ok_or(crate::Error::Exhausted)?;
         match answer {
             crate::control::DialogAnswer::Cancel => self.cancel_close(),
             crate::control::DialogAnswer::Discard => {
@@ -2601,6 +2622,8 @@ impl Window {
             return Err(crate::Error::StaleRevision);
         }
         self.ui.editor().check_revision(&identity.point)?;
+        // A job may cancel a drag before retiring this prompt's inset.
+        self.ui.generation().checked_add(2).ok_or(crate::Error::Exhausted)?;
         let path = match answer {
             crate::control::DialogAnswer::Cancel => {
                 self.prompt = None;
@@ -2648,6 +2671,7 @@ impl Window {
         if current.revision != target.revision {
             return Err(crate::Error::StaleRevision);
         }
+        self.ui.generation().checked_add(2).ok_or(crate::Error::Exhausted)?;
         if matches!(answer, crate::control::DialogAnswer::Cancel) {
             self.cancel_conflict()?;
             self.control_mutation_accepted();
@@ -2917,8 +2941,8 @@ impl Window {
         fields.push_str(&self.control_dialog_fields());
         fields.push('\t');
         fields.push_str(&self.prompt.as_ref().map_or_else(
-            || crate::path_completion::State::Idle.fields(),
-            |prompt| prompt.completion.fields(),
+            || crate::path_completion::State::Idle.fields(self.completion_rows()),
+            |prompt| prompt.completion.fields(self.completion_rows()),
         ));
         Ok(fields)
     }
@@ -3007,7 +3031,28 @@ impl Window {
         }
     }
 
+    fn completion_rows(&self) -> usize {
+        let geometry = self.ui.geometry();
+        let scale = geometry.scale().value();
+        let available = geometry.dimensions().1.saturating_sub(72 * scale) / (16 * scale);
+        (available.saturating_sub(3) / 2).clamp(1, crate::path_completion::PAGE_ROWS)
+    }
+
+    fn sync_prompt_layout(&mut self) -> Result<()> {
+        let rows = if let Some(PathPrompt { completion: crate::path_completion::State::Ready(matches), .. }) = &self.prompt {
+            3 + matches.count().min(self.completion_rows())
+        } else if self.pointer_modal() {
+            6
+        } else { 0 };
+        if self.ui.geometry().prompt_rows() == rows { return Ok(()); }
+        let before = self.ui.generation();
+        self.ui.dispatch(Event::PromptRows(rows)).map_err(error)?;
+        self.frames.invalidate(before != self.ui.generation());
+        Ok(())
+    }
+
     fn draw(&mut self) -> Result<()> {
+        self.sync_prompt_layout()?;
         self.control_input_health()?;
         self.frames.generation().map_err(error)?;
         if self.closed
@@ -3837,8 +3882,9 @@ impl Window {
 
     fn close_answer_visible(&self) -> bool {
         let (width, height) = self.ui.geometry().dimensions();
-        width >= 272
-            && height >= 160
+        let scale = self.ui.geometry().scale().value();
+        width >= 272 * scale
+            && height >= 168 * scale
             && self.device.is_some()
             && self.input.map.is_some()
             && self.input.focused
@@ -3889,6 +3935,7 @@ impl Window {
             return Some(prompt.completion_notice(
                 self.ui.geometry().dimensions().0.saturating_sub(16 * self.ui.geometry().scale().value())
                     / (8 * self.ui.geometry().scale().value()),
+                self.completion_rows(),
                 paused,
                 self.closing.is_some(),
             ));
@@ -4122,14 +4169,17 @@ impl Window {
                 prompt.text.clear();
                 prompt.completion = crate::path_completion::State::Idle;
             }
-            "Tab" | "S-Tab" | "Up" | "Down" => {
+            "Tab" | "S-Tab" | "Up" | "Down" | "PageUp" | "PageDown" => {
                 let backward = matches!(chord, "S-Tab" | "Up");
                 match &mut prompt.completion {
                     crate::path_completion::State::Pending(_) => {}
                     crate::path_completion::State::Ready(matches)
                         if chord != "Tab" || !matches.descend(&prompt.text) =>
                     {
-                        if let Some(path) = matches.cycle(backward) {
+                        let path = if matches!(chord, "PageUp" | "PageDown") {
+                            matches.page_by(chord == "PageUp", self.completion_rows())
+                        } else { matches.cycle(backward) };
+                        if let Some(path) = path {
                             prompt.text = path.to_string();
                         }
                     }
@@ -5092,15 +5142,11 @@ fn read_keymap(fd: OwnedFd, format: u32, size: u32) -> Result<Keymap> {
 }
 
 fn paint_prompt(raster: &mut Raster<'_, '_>, geometry: Geometry, text: &str) {
-    let (width, height) = geometry.dimensions();
+    let (width, _) = geometry.dimensions();
     let scale = geometry.scale().value();
-    let y = if height >= 160 * scale { 48 * scale } else { 0 };
-    let clip = Rect {
-        x: 0,
-        y: y as i64,
-        width: width as u32,
-        height: (height as u32).saturating_sub(y as u32).min((96 * scale) as u32),
-    };
+    let clip = geometry.prompt();
+    let y = clip.y as usize;
+    let rows = clip.height as usize / (16 * scale);
     raster.draw(Draw {
         clip,
         primitive: Primitive::Fill {
@@ -5111,12 +5157,12 @@ fn paint_prompt(raster: &mut Raster<'_, '_>, geometry: Geometry, text: &str) {
     let columns = width.saturating_sub(16 * scale).checked_div(8 * scale).unwrap_or(0).max(1);
     let mut column = 0;
     let mut row = 0;
-    for scalar in text.chars().take(512) {
+    for scalar in text.chars().take(crate::render::MAX_PROMPT_ROWS * 73) {
         if scalar == '\n' || column == columns {
             row += 1;
             column = 0;
         }
-        if row >= 6 {
+        if row >= rows {
             break;
         }
         if scalar == '\n' {
@@ -9400,6 +9446,71 @@ mod tests {
     }
 
     #[test]
+    fn remote_pending_path_answers_retire_layout_before_next_request() {
+        for action in ["open", "save-as", "dictionary"] {
+            let directory = DialogDirectory::new();
+            let file = directory.path("chosen");
+            if action != "save-as" { std::fs::write(&file, b"word\n").unwrap(); }
+            let (mut w, _peer) = file_dialog_fixture();
+            configure(&mut w, 800, 600);
+            pointer_enter(&mut w);
+            w.chord("a", false).unwrap();
+            assert!(w.file_request(action, 1, 1));
+            w.sync_prompt_layout().unwrap();
+            assert_eq!(w.ui.geometry().prompt_rows(), 6);
+            let generation = w.frames.input_generation().unwrap();
+            let answer = crate::control::Request::parse(format!(
+                "1\t1\tdialog-answer\t1\t1\t1\tpath\t{}",
+                crate::control::hex(file.as_os_str().as_encoded_bytes())
+            ).as_bytes()).unwrap();
+            assert_eq!(w.control_response(&answer), "1\t1\tpending\t1");
+            // No event, tick or draw may repair the state before these checks.
+            assert!(w.prompt.is_none());
+            assert_eq!(w.ui.geometry().prompt_rows(), 0);
+            assert!(w.frames.input_generation().unwrap() > generation);
+            let state = crate::control::Request::parse(b"1\t0\tstate").unwrap();
+            assert!(!w.control_response(&state).contains("minibuffer="));
+            remote_pointer(&mut w, "press", 32, 48, false);
+            assert_eq!(w.ui.editor().document(1).unwrap().selection().caret, 0);
+            finish_file(&mut w);
+        }
+    }
+
+    #[test]
+    fn remote_dialog_layout_headroom_refusals_preserve_prompts_and_documents() {
+        for kind in ["path", "close"] {
+            for remaining in [0, 1] {
+                for answer in if kind == "path" { ["cancel", "path\t61"] }
+                    else { ["cancel", "discard"] }
+                {
+                    let (mut w, _peer) = file_dialog_fixture();
+                    configure(&mut w, 800, 600);
+                    w.chord("a", false).unwrap();
+                    if kind == "path" { w.chord("C-o", false).unwrap(); }
+                    else { w.close_tab(1, 1); }
+                    w.sync_prompt_layout().unwrap();
+                    assert_eq!(w.ui.geometry().prompt_rows(), 6);
+                    w.ui.generation_for_test(u64::MAX - remaining);
+                    let state = crate::control::Request::parse(b"1\t0\tstate").unwrap();
+                    let before = w.control_response(&state);
+                    let notice = w.notice.clone();
+                    let generation = w.frames.input_generation().unwrap();
+                    let request = crate::control::Request::parse(format!(
+                        "1\t1\tdialog-answer\t1\t1\t1\t{answer}"
+                    ).as_bytes()).unwrap();
+                    assert!(w.control_response(&request).contains("\terror\texhausted\t"));
+                    assert_eq!(w.control_response(&state), before);
+                    assert_eq!(w.notice, notice);
+                    assert_eq!(w.frames.input_generation().unwrap(), generation);
+                    assert!(w.control_input_error.is_none());
+                    assert!(!w.files.as_ref().unwrap().busy());
+                    assert!(!w.closed);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn remote_path_answers_bind_reopened_prompts_and_keep_partial_entries_on_refusal() {
         use std::os::unix::ffi::OsStringExt;
         use std::os::unix::fs::PermissionsExt;
@@ -12405,7 +12516,8 @@ mod tests {
         let font = crate::font::pinned().unwrap();
         let draw = |scale: u8| {
             let s = usize::from(scale);
-            let geometry = Geometry::new(320 * s, 200 * s, Scale::new(scale).unwrap()).unwrap();
+            let geometry = Geometry::new(320 * s, 200 * s, Scale::new(scale).unwrap()).unwrap()
+                .with_prompt_rows(6).unwrap();
             let mut pixels = vec![0; 320 * 200 * 4 * s * s];
             let mut raster = Raster::new(&mut pixels, &font, geometry, 320 * 4 * s).unwrap();
             paint_prompt(&mut raster, geometry, "A\nB\nC\nD\nE\nF");
@@ -12435,9 +12547,9 @@ mod tests {
         w.path_chord("Tab", false);
         let prompt = w.prompt.as_ref().unwrap();
         assert_eq!(prompt.text, "literal");
-        assert!(prompt.completion.fields().contains("completion=error"));
+        assert!(prompt.completion.fields(3).contains("completion=error"));
         for columns in 1..=100 {
-            let notice = prompt.completion_notice(columns, "Paused: restore keyboard", false);
+            let notice = prompt.completion_notice(columns, 3, "Paused: restore keyboard", false);
             assert!(notice.lines().all(|line| line.chars().count() <= columns.min(72)));
             assert!(notice.chars().count() < 512);
             assert!(notice.lines().nth(1).unwrap().ends_with('|'));
@@ -13044,7 +13156,7 @@ mod tests {
         w.chord("a", false).unwrap();
         let tab = w.ui.editor().active().unwrap();
         w.close();
-        for (width, height) in [(1, 1), (208, 480), (272, 159)] {
+        for (width, height) in [(1, 1), (208, 480), (272, 167)] {
             w.ui.dispatch(Event::Resize {
                 width,
                 height,
@@ -13062,7 +13174,7 @@ mod tests {
         }
         w.ui.dispatch(Event::Resize {
             width: 272,
-            height: 160,
+            height: 168,
             scale: 1,
         })
         .unwrap();
@@ -13266,7 +13378,7 @@ mod tests {
         assert!(!w.conflict.as_ref().unwrap().needs_discard());
         w.ui.dispatch(Event::Resize {
             width: 272,
-            height: 160,
+            height: 168,
             scale: 1,
         })
         .unwrap();
@@ -13311,7 +13423,7 @@ mod tests {
         assert!(!w.conflict.as_ref().unwrap().needs_discard());
         w.ui.dispatch(Event::Resize {
             width: 272,
-            height: 160,
+            height: 168,
             scale: 1,
         })
         .unwrap();

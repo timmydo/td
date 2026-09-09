@@ -58,6 +58,8 @@ pub enum Event<'a> {
     },
     Profile(Profile),
     LineNumbers(bool),
+    /// Native minibuffer space above the tabs, not a document overlay.
+    PromptRows(usize),
     Wrap {
         tab: TabId,
         revision: u64,
@@ -397,7 +399,8 @@ impl Controller {
                 height,
                 scale,
             } => {
-                let geometry = Geometry::new(width, height, Scale::new(scale)?)?;
+                let geometry = Geometry::new(width, height, Scale::new(scale)?)?
+                    .with_prompt_rows(self.geometry.prompt_rows())?;
                 if geometry.dimensions() == self.geometry.dimensions()
                     && geometry.scale() == self.geometry.scale()
                 {
@@ -420,6 +423,14 @@ impl Controller {
                 self.line_numbers = enabled;
                 self.reset_input();
                 self.refresh(self.editor.active())?;
+                Ok(Outcome::Changed)
+            }
+            Event::PromptRows(rows) => {
+                let geometry = self.geometry.with_prompt_rows(rows)?;
+                if geometry == self.geometry { return Ok(Outcome::Ignored); }
+                self.geometry = geometry;
+                self.drag = None;
+                self.refresh(None)?;
                 Ok(Outcome::Changed)
             }
             Event::Wrap {

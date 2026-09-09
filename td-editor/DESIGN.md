@@ -950,10 +950,13 @@ There is no editor recipe yet; adding one must replace the editor-only gate
 exemption with target-artifact coverage, as specified below.
 
 Chrome dimensions below are logical pixels multiplied by the frame scale.
-The menu occupies the first 24 pixels, the tab strip the next 24, and the
-status strip the bottom 24. The gutter starts at (8, 48); document text
-starts immediately after it, or at (8, 48) when disabled. Text has eight
-pixels of right margin and uses only full 8x16 cells. Tabs are 160 pixels
+The menu occupies the first 24 pixels, then any active minibuffer, then
+the 24-pixel tab strip. The status strip occupies the bottom 24 pixels.
+The gutter starts at (8, 48); document text
+starts immediately after it, or at (8, 48) when disabled. An active
+minibuffer adds its height to tab, gutter and document y coordinates.
+Text has eight pixels of right margin and uses only full 8x16 cells.
+Tabs are 160 pixels
 wide with 24 pixels reserved for the close mark. A contiguous slice of tabs
 is shown, keeping the active tab visible; a surface narrower than one tab
 clips that tab. Tiny surfaces may have no document cells; status paints last
@@ -1123,11 +1126,42 @@ Cancelling preserves document selection, undo and text. Opening a prompt
 clears the previous notice so cancellation does not resurrect stale feedback.
 Submission closes the
 prompt and displays pending/success/failure; retry starts a fresh prompt.
-Interactive prompts keep the clipped top-six-document-row overlay. Ordinary
+Interactive prompts reserve a minibuffer above the tabs, shifting the tabs
+and document down rather than painting over document rows. Ordinary
 non-modal notices use the bottom status row as specified below; routine
 feedback does not cover editable text.
 When input is unavailable or not synchronized, the prompt instead prefixes
 readiness instructions without erasing the entered path.
+
+### Minibuffer layout
+
+Find, Replace, path, numeric, command and close/conflict prompts share a
+reserved area between the menu and tabs. Normal prompts request six scaled
+16-pixel rows; path completion requests three header/entry/status rows plus
+its candidate page, at most fifteen rows total.
+Non-ready path prompts keep the six-row baseline for the ordinary entry's
+wrapping caption, readiness and save-before-close guidance.
+Geometry clamps this area to complete rows after retaining the menu, tab
+and status strips. Tiny
+windows may have no document cells or only a clipped prompt; nothing paints
+over document cells. Physical close/conflict answers require at least
+272x168 logical pixels, multiplied by scale, to show all six caption rows.
+Remote explicit-answer authority and modal precedence are unchanged.
+
+The controller owns this inset: layout, viewport height, rendering, caret
+reveal and hit testing agree. Opening/closing/resizing a prompt recomputes
+the view without editing text or changing selection; its origin is retained
+unless normal viewport clamping requires a change. Cancelling removes the
+inset, not any search/replace changes already explicitly applied. Ordinary
+status feedback remains at the bottom and reserves no inset. Drawing clips
+to the reserved area and visits at most 1095 caption scalars; path lines are
+additionally clipped to 72 scaled font columns. Prompt layout changes fence
+native input/render generations; read-only queries and refused remote
+commands do not synchronize or mutate layout. Control exposes the requested
+row count and actual pixel height alongside the reduced viewport dimensions.
+Accepted synchronous and pending-job answers synchronize before the next
+request, with controller-generation headroom reserved before admission for
+both the answer's existing dispatches and its layout change.
 
 ### Directory tabs
 
@@ -1222,17 +1256,28 @@ prompt state and revision-bound owner prevent cancelled, edited-away-and-
 back, replaced or stale entries from adopting late results.
 
 Scans visit at most 4096 directory entries and charge at most 1 MiB of raw
-basename bytes. They retain at most 128 matching paths, each at most 4096
-UTF-8 bytes. Any scan error or exceeded bound refuses the whole result,
+basename bytes. They retain every matching UTF-8 path within that scan,
+at most 4096 paths of 4096 bytes each (16 MiB of path payload).
+There is no separate 128-match cutoff. Any scan error or exceeded bound
+refuses the whole result,
 never a truncated set that could falsely imply a unique completion.
 Non-UTF-8 basenames are omitted with a reported count; argv and semantic
 file-control requests still preserve arbitrary OS paths. Listings escape
 control characters only for display and keep the literal completion bytes.
 
-Completion feedback uses the existing six-row path overlay: action or
-paused-input header, tail of entry plus caret, status/count, and three
-candidate rows. Cycling changes the displayed page. Every line is clipped
-to available scaled font columns, capped at 72. The shared modal painter
+Completion feedback uses the reserved minibuffer: action or paused-input
+header, tail of entry plus caret, range/count/help, and up to twelve candidate
+rows. Let A be the number of complete text rows after the fixed 72-pixel
+chrome: page size is clamp(floor(max(A-3,0)/2), 1, 12). Short lists reserve
+only their actual candidate count. Resizing changes page size without
+changing the selected match. Tab/Shift+Tab and Down/Up cycle as before;
+PageDown/PageUp moves by a page and clamps to the last/first match. From an
+unselected prefix, PageDown moves from index zero by a page (clamped to the
+last match); PageUp selects index zero. Paging changes the entry to
+the selected full literal path; Enter still performs the only submission.
+The displayed range makes undisplayed matches explicit; no mouse wheel or
+pointer activation is added to the keyboard-only path entry. Every line is
+clipped to available scaled font columns, capped at 72. The shared modal painter
 scales its origin, row/column spacing and clip with glyphs, preventing
 overlapping rows at integer scales 2-4. The full literal paths remain
 available from prompt-state. Completion has no independent modal or answer
@@ -1379,8 +1424,8 @@ Escape/C-g cancels the whole close request. These modal keys are the same in
 both profiles. Repeated keys never confirm a choice. The first caption line
 identifies the document by stable tab ID, followed by its escaped leaf name
 (or Untitled), shortened to 27 scalars plus an ellipsis when needed. Save and
-Discard from physical input require synchronized input and at least 272x160
-buffer pixels: all six caption/control lines then fit the notice region.
+Discard from physical input require synchronized input and at least 272x168
+logical pixels, multiplied by scale: all six caption/control lines then fit.
 Smaller windows show a resize instruction and accept only Cancel. Input loss
 retains the question
 and shows restoration instructions instead of choices. A close-driven path
@@ -1472,7 +1517,7 @@ the read-only control `prompt-state` query. Escape/C-g dismisses it and
 restores the normal line/column, mode and spelling status; dismissal is never
 required to continue editing. No timer silently dismisses an error. Modal
 Find/Replace/path/numeric/command and close/conflict questions retain their
-existing overlay, precedence and input rules; ordinary status feedback is
+reserved minibuffer, precedence and input rules; ordinary status feedback is
 not painted while one of these prompts is active.
 Notices do not mutate document text. The binary refuses filenames and ordinary
 `$EDITOR` invocation.
@@ -1641,7 +1686,7 @@ drag autoscroll, selection clipboard or context menu is implemented.
 Path, close, conflict and pending-Reload modals consume pointer actions:
 clicks cannot answer a question, activate obscured tabs or edit text. Starting
 one of these flows clears native held-button/wheel state. Cancelling it does
-not resume an old drag. The pointer remains visible over modal overlays.
+not resume an old drag. The pointer remains visible over the minibuffer.
 
 Motion/buttons are dispatched in wire order; wheel axes accumulate until
 wl_pointer.frame. One fixed-size two-axis accumulator accepts at most 256
@@ -1993,7 +2038,7 @@ entry with a nonempty printable selection within the limit; otherwise use
 the last submitted query. Queries persist across tabs for the window's
 lifetime, not on disk. Prompt plus history retain at most 8 KiB of query
 bytes. The notice includes at most the final 160 scalars, an ellipsis and
-caret; the six-row overlay can clip this text on narrow windows, especially
+caret; the six-row minibuffer can clip this text on narrow windows, especially
 while the input-readiness prefix is present.
 Clipboard paste into query/path entry is not implemented in this increment.
 
@@ -2024,7 +2069,7 @@ controller and never create an undo entry or change text revision.
 The three Find entries are followed by Replace and Go To Line. Complete panel
 fitting uses the menu's current item count. Tests cover native chords
 in both profiles, query entry/cancel, both directions, explicit wrap,
-missing/stale/foreign targets, scalar byte limits and overlay-only pixels.
+missing/stale/foreign targets, scalar byte limits and prompt pixels.
 The headless model/replay Find interface is unchanged.
 
 ### Implemented native Replace
@@ -2072,7 +2117,7 @@ stay edited and can be undone after closing. Window close dismisses entry
 before normal dirty-document questions. Neither cancellation path rolls back
 already confirmed edits.
 
-The overlay shows result, Find/With tails (24 scalars each with ellipses),
+The minibuffer shows result, Find/With tails (24 scalars each with ellipses),
 active-field marker and action guidance. While paused, readiness replaces the
 result line without discarding it, keeping close/clear guidance in six rows
 at 320 pixels wide. Narrower windows retain the ordinary clipping rule. Field
@@ -2173,7 +2218,7 @@ user can correct it. Leading zeros are accepted; signs, whitespace and other
 characters are ignored. Escape/Ctrl+G cancel without moving selection.
 Error text precedes the ordinary prompt/help so it remains visible at the
 320-pixel menu minimum width even with a paused-input prefix. As with other
-overlays, extremely narrow windows may clip the six-row notice.
+prompts, extremely narrow windows may clip the six-row notice.
 The platform-independent 20-digit entry bound accommodates 64-bit numbers;
 values overflowing `usize`, including on 32-bit hosts, refuse normally.
 
@@ -2197,7 +2242,7 @@ handling. The largest fixed menu has thirteen rows (a 320 by 360 pixel
 minimum at scale 1) and is shown only when
 its complete panel fits, using the existing scale bounds. Native tests cover
 both profiles, real digit/Return events, invalid input, focus pause, stale
-targets, close cancellation and overlay restoration. The shared command is
+targets, close cancellation and prompt restoration. The shared command is
 also tested through replay, including UTF-8 offsets and empty final lines.
 
 ### Version-1 compatibility target
