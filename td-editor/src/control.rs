@@ -1177,6 +1177,9 @@ pub(crate) fn state(ui: &Controller) -> Result<String> {
     );
     for (id, doc) in ui.editor().tabs() {
         let sel = doc.selection();
+        if doc.directory() {
+            out.push_str(&format!("\ttab-kind={id},directory"));
+        }
         out.push_str(&format!(
             "\ttab={id},{},{},{},{},{},{},{},{},{}",
             doc.revision(),

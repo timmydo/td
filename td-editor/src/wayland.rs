@@ -1140,6 +1140,24 @@ impl Window {
             && x < area.x + i64::from(area.width)
             && y >= area.y
             && y < area.y + i64::from(area.height);
+        if text && self.ui.editor().document(tab).map_err(error)?.directory() {
+            let (columns, rows) = geometry.grid();
+            let full_row = ((y - area.y) as usize) < rows * 16 * geometry.scale().value();
+            if phase == crate::ui::PointerPhase::Press && columns != 0 && full_row {
+                let row = self.ui.tab_view(tab).map_err(error)?.viewport.origin().row
+                    + (y - area.y) as usize / (16 * geometry.scale().value());
+                let path = self
+                    .files
+                    .as_ref()
+                    .and_then(|files| files.directory(tab))
+                    .and_then(|directory| directory.entry(row));
+                if let Some(path) = path {
+                    self.browse_directory(tab, revision, path, extend);
+                }
+                self.pointer.held = false;
+            }
+            return Ok(());
+        }
         let x = if text || phase != crate::ui::PointerPhase::Press {
             let ceil = x + i64::from(fixed_x.rem_euclid(256) != 0);
             if text {
@@ -1377,6 +1395,41 @@ impl Window {
             return Ok(false);
         };
         let revision = self.ui.editor().document(tab).map_err(error)?.revision();
+        if self.ui.editor().document(tab).map_err(error)?.directory()
+            && !self.ui.keys().pending()
+            && matches!(chord, "Return" | "S-Return" | "^" | "g")
+        {
+            if !repeated {
+                let path = self
+                    .files
+                    .as_ref()
+                    .and_then(|files| files.directory(tab))
+                    .and_then(|directory| match chord {
+                        "^" => Some(
+                            directory
+                                .path
+                                .parent()
+                                .unwrap_or(&directory.path)
+                                .to_owned(),
+                        ),
+                        "g" => Some(directory.path.clone()),
+                        _ => {
+                            let doc = self.ui.editor().document(tab).ok()?;
+                            let row = doc
+                                .text()
+                                .get(..doc.selection().caret)?
+                                .bytes()
+                                .filter(|b| *b == b'\n')
+                                .count();
+                            directory.entry(row)
+                        }
+                    });
+                if let Some(path) = path {
+                    self.browse_directory(tab, revision, path, chord == "S-Return");
+                }
+            }
+            return Ok(false);
+        }
         if chord == "F7" {
             if !repeated {
                 // The shared action already renders startup feedback.
@@ -1483,10 +1536,20 @@ impl Window {
     }
 
     fn tick(&mut self, now: u64, repeat: bool) -> Result<()> {
-        if let Some((id, result)) = self.path_completion.as_mut().and_then(|worker| worker.poll()) {
+        if let Some((id, result)) = self
+            .path_completion
+            .as_mut()
+            .and_then(|worker| worker.poll())
+        {
             self.completed_path(id, result);
         }
-        let active = self.ui.editor().active();
+        let active = self.ui.editor().active().and_then(|tab| {
+            self.ui
+                .editor()
+                .document(tab)
+                .ok()
+                .map(|doc| (tab, doc.revision()))
+        });
         if let Some(result) = self
             .files
             .as_mut()
@@ -1532,7 +1595,14 @@ impl Window {
                 self.frames.invalidate(true);
             }
             self.menu = None;
-            if self.ui.editor().active() != active {
+            if self.ui.editor().active().and_then(|tab| {
+                self.ui
+                    .editor()
+                    .document(tab)
+                    .ok()
+                    .map(|doc| (tab, doc.revision()))
+            }) != active
+            {
                 self.input.cancel_repeat();
             }
             let succeeded = result.is_ok();
@@ -2855,6 +2925,17 @@ impl Window {
 
     fn native_state(&self, mut response: String) -> crate::Result<String> {
         if response.split('\t').nth(2) == Some("ok") {
+            if let Some(files) = &self.files {
+                for (tab, _) in self.ui.editor().tabs() {
+                    if let Some(directory) = files.directory(tab) {
+                        response.push_str(&format!(
+                            "\tdirectory={tab},{},{}",
+                            directory.len(),
+                            crate::control::hex(directory.path.as_os_str().as_encoded_bytes())
+                        ));
+                    }
+                }
+            }
             let flag = u8::from;
             response.push_str(&format!(
                 concat!(
@@ -3157,6 +3238,7 @@ impl Window {
             },
             profile: self.ui.keys().profile(),
             file_window: self.files.is_some(),
+            directory: doc.directory(),
             undo: undo != 0,
             redo: redo != 0,
             auto_fill: doc.auto_fill(),
@@ -3172,7 +3254,7 @@ impl Window {
                 && self
                     .files
                     .as_ref()
-                    .is_some_and(|files| files.associated(tab)),
+                    .is_some_and(|files| files.path(tab).is_some()),
             paste: self.input.focused
                 && self.clipboard.device.is_some()
                 && self.clipboard.incoming.is_none()
@@ -3831,6 +3913,10 @@ impl Window {
         tab: crate::model::TabId,
         revision: u64,
     ) -> crate::Result<Option<u64>> {
+        if self.ui.editor().document(tab)?.directory() {
+            self.notify("Directory listings cannot be spell checked.");
+            return Err(crate::Error::Unavailable);
+        }
         self.menu = None;
         self.stop_pointer();
         self.input.cancel_repeat();
@@ -3890,7 +3976,37 @@ impl Window {
         Ok(())
     }
 
+    fn browse_directory(
+        &mut self,
+        tab: crate::model::TabId,
+        revision: u64,
+        path: std::path::PathBuf,
+        new_tab: bool,
+    ) {
+        self.stop_pointer();
+        self.input.cancel_repeat();
+        let result = self
+            .files
+            .as_mut()
+            .ok_or_else(|| "Directory worker unavailable".to_string())
+            .and_then(|files| files.browse(&self.ui, tab, revision, path, new_tab));
+        self.notify(match result {
+            Ok(()) => "Opening path...".into(),
+            Err(detail) => detail,
+        });
+    }
+
     fn file_request(&mut self, name: &str, tab: crate::model::TabId, revision: u64) -> bool {
+        if matches!(name, "save" | "save-as")
+            && self
+                .ui
+                .editor()
+                .document(tab)
+                .is_ok_and(|doc| doc.directory())
+        {
+            self.notify("Directory listings are read-only; nothing written.");
+            return false;
+        }
         self.menu = None;
         self.stop_pointer();
         let Some(files) = &mut self.files else {
@@ -6014,6 +6130,67 @@ mod tests {
             w.event(text_event(id, 0, mime)).unwrap();
         }
         w.event(message(device, 5, &[id])).unwrap();
+    }
+
+    #[test]
+    fn directory_copy_path_menu_and_scaled_pointer_navigation() {
+        for scale in 1..=4 {
+            let directory = DialogDirectory::new();
+            std::fs::create_dir(directory.path("child")).unwrap();
+            std::fs::write(directory.path("child/note"), b"body").unwrap();
+            let (mut w, peer, keyboard, device) = clipboard_fixture();
+            w.ui = Controller::default();
+            let mut files = crate::session::Session::start().unwrap();
+            files.initial_open(&mut w.ui, directory.0.clone()).unwrap();
+            w.files = Some(files);
+            w.ui.dispatch(Event::Resize {
+                width: 800 * scale,
+                height: 600 * scale,
+                scale: scale as u8,
+            })
+            .unwrap();
+            w.open_menu(crate::menu::Group::File).unwrap();
+            let menu = w.menu.as_mut().unwrap();
+            assert!(menu.enabled(crate::menu::Item::CopyPath));
+            assert!(!menu.enabled(crate::menu::Item::Save));
+            menu.selected = 5;
+            w.event(message(keyboard, 3, &[7788, 0, 28, 1])).unwrap();
+            w.event(message(keyboard, 3, &[8899, 0, 28, 0])).unwrap();
+            let (source, text) = w.clipboard.source.as_ref().unwrap();
+            assert_eq!(text.as_ref(), directory.0.to_str().unwrap());
+            assert!(drain(&peer)
+                .0
+                .contains(&message(device, 1, &[*source, 7788])));
+            assert!(w.spelling_request(1, 0).is_err());
+            assert!(!w.file_request("save-as", 1, 0));
+            assert!(w.prompt.is_none());
+            w.decoded_pointer_action(
+                crate::ui::PointerPhase::Press,
+                (40 * scale * 256) as i32,
+                (56 * scale * 256) as i32,
+                true,
+            )
+            .unwrap();
+            finish_file(&mut w);
+            assert_eq!(w.ui.editor().active(), Some(2));
+            assert_eq!(w.ui.editor().document(2).unwrap().text(), "f note");
+            assert_eq!(
+                w.files.as_ref().unwrap().path(1),
+                Some(directory.0.as_path())
+            );
+            w.decoded_pointer_action(
+                crate::ui::PointerPhase::Press,
+                (40 * scale * 256) as i32,
+                (56 * scale * 256) as i32,
+                false,
+            )
+            .unwrap();
+            finish_file(&mut w);
+            assert_eq!(w.ui.editor().active(), Some(2));
+            assert_eq!(w.ui.editor().document(2).unwrap().text(), "body");
+            assert!(!w.ui.editor().document(2).unwrap().directory());
+            assert_eq!(w.ui.editor().document(2).unwrap().revision(), 1);
+        }
     }
 
     #[test]

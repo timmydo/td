@@ -1245,6 +1245,10 @@ Success begins `1 ID ok` followed by these tab-separated fields, in order:
 2. One `tab=ID,REV,DIRTY,BYTES,ANCHOR,CARET,AUTO_FILL,FILL_COLUMN,BOM,ENDING`
    for each open tab in ascending ID order. Flags are `0|1`; `ENDING` is
    `lf|crlf`. Selection endpoints are directed UTF-8 byte offsets.
+   A directory additionally has `tab-kind=ID,directory` immediately before
+   its row; absence means ordinary text. Text pages contain escaped listing
+   rows, not editable file bytes. Text/settings mutations and saves refuse;
+   selection, Find and Go To Line remain available.
 3. `generation=N`, `window=WIDTH,HEIGHT,SCALE`, `focus=0|1`,
    `line-numbers=0|1` (window-wide, on by default).
 4. One `view=ID,ROW,COLUMN,COLUMNS,ROWS,WRAP,AFFINITY,DESIRED_COLUMN` per tab
@@ -1264,6 +1268,18 @@ query exposes native entry values and feedback under its contract above;
 physical readiness.
 
 ## Experimental native adapter
+
+Directory Open uses the ordinary `open` job protocol and returns its tab and
+revision. Native state additionally includes one
+`directory=TAB,ENTRY_COUNT,PATH_HEX` field per directory tab, before `adapter`.
+The path is the resolved absolute literal Unix pathname, at most 4096 bytes;
+there are at most 64 rows. These fields are read-only metadata. Decoded
+Enter/click reuses a directory tab, Shift+Enter or pointer `extend=1` opens a
+foreground tab, `^` opens its parent and `g` refreshes, under the existing
+input fences. Delivery is not completion: poll the native file-busy flag,
+then inspect tab revision/path/text. Semantic Open always adds/selects a tab
+and retains normal job history. DESIGN.md specifies stale-result refusal,
+read-only mutation errors and existing-file deduplication.
 
 `--control-socket PATH` may appear once after `--window`, before the literal
 `--` delimiter. Its next argument is one literal OS-byte pathname, not shell

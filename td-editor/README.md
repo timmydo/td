@@ -17,6 +17,21 @@ library and native F7/Format controls are implemented.
 
 ## Implemented core
 
+Directories also open through File > Open or a command-line path, for example
+`td-editor .`. Their `[dir]` tabs are read-only listings:
+
+- Click or Enter opens an entry in the current tab.
+- Shift-click or Shift+Enter opens it in a new foreground tab.
+- `^` goes to the parent; `g` refreshes; arrow/Emacs movement keys navigate.
+- File > Copy Full File Path copies the directory's own absolute path.
+
+Already-open files select their existing tab and preserve edits. Listings
+include dotfiles and escape unusual filename bytes; symlink activation is
+refused. Rename and confirmed deletion are not implemented yet. See DESIGN.md
+for sorting, resource limits, navigation failure and tab-reuse guarantees.
+
+### Text editing
+
 The safe, dependency-free library implements UTF-8/BOM/LF/CRLF conversion,
 scalar edits and selection, tabs, bounded undo/redo with saved-state tracking,
 literal search/replace, paragraph filling and Auto Fill. Logical Windows and

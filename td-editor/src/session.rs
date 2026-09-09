@@ -48,6 +48,7 @@ struct Loaded {
 enum Completion {
     Dictionary(crate::spelling::Dictionary),
     Open(Loaded),
+    Directory(crate::directory::Snapshot),
     Reload(Loaded),
     Conflict(String),
     Saved { file: FileId, path: PathBuf },
@@ -55,6 +56,7 @@ enum Completion {
 enum Pending {
     Dictionary,
     Open,
+    Browse(crate::model::RevisionPoint),
     Reload {
         permit: Option<crate::Reload>,
     },
@@ -80,6 +82,7 @@ pub(crate) struct Session {
     receiver: Receiver<Result<Completion>>,
     pending: Option<Pending>,
     associations: BTreeMap<TabId, Association>,
+    directories: BTreeMap<TabId, crate::directory::Snapshot>,
     failed: bool,
     conflict: Option<crate::dialog::Target>,
     dictionary: Option<crate::spelling::Dictionary>,
@@ -102,6 +105,7 @@ impl Session {
             receiver,
             pending: None,
             associations: BTreeMap::new(),
+            directories: BTreeMap::new(),
             failed: false,
             conflict: None,
             dictionary: None,
@@ -139,6 +143,43 @@ impl Session {
         self.submit(Operation::Open(path), Pending::Open)
     }
 
+    pub(crate) fn browse(
+        &mut self,
+        ui: &Controller,
+        tab: TabId,
+        revision: u64,
+        path: PathBuf,
+        new_tab: bool,
+    ) -> Result<()> {
+        let point = ui
+            .editor()
+            .revision_point(tab, revision)
+            .map_err(|e| e.to_string())?;
+        if !ui
+            .editor()
+            .document(tab)
+            .map_err(|e| e.to_string())?
+            .directory()
+        {
+            return Err("Navigation needs a directory tab".into());
+        }
+        if path.as_os_str().as_bytes().len() > 4096 {
+            return Err("Path exceeds 4096 bytes".into());
+        }
+        self.submit(
+            Operation::Open(path),
+            if new_tab {
+                Pending::Open
+            } else {
+                Pending::Browse(point)
+            },
+        )
+    }
+
+    pub(crate) fn directory(&self, tab: TabId) -> Option<&crate::directory::Snapshot> {
+        self.directories.get(&tab)
+    }
+
     pub(crate) fn dictionary(&mut self, path: PathBuf) -> Result<()> {
         let bytes = path.as_os_str().as_bytes();
         if bytes.is_empty() || bytes.len() > 4096 || bytes.contains(&0) {
@@ -174,7 +215,10 @@ impl Session {
         self.associations.contains_key(&tab)
     }
     pub(crate) fn path(&self, tab: TabId) -> Option<&std::path::Path> {
-        self.associations.get(&tab).map(|a| a.path.as_path())
+        self.associations
+            .get(&tab)
+            .map(|a| a.path.as_path())
+            .or_else(|| self.directories.get(&tab).map(|d| d.path.as_path()))
     }
     pub(crate) fn take_conflict(&mut self) -> Option<crate::dialog::Target> {
         self.conflict.take()
@@ -203,11 +247,17 @@ impl Session {
     }
     pub(crate) fn forget(&mut self, tab: TabId) {
         self.associations.remove(&tab);
+        self.directories.remove(&tab);
     }
     pub(crate) fn labels(&self) -> impl Iterator<Item = (TabId, &str)> {
         self.associations
             .iter()
             .map(|(id, a)| (*id, a.title.as_str()))
+            .chain(
+                self.directories
+                    .iter()
+                    .map(|(id, d)| (*id, d.title.as_str())),
+            )
     }
 
     pub(crate) fn save(
@@ -261,6 +311,9 @@ impl Session {
             return Err("Path exceeds 4096 bytes".into());
         }
         let doc = ui.editor().document(tab).map_err(|e| e.to_string())?;
+        if doc.directory() {
+            return Err("Directory listings are read-only; nothing written".into());
+        }
         if doc.revision() != revision {
             return Err(
                 "Save refused: tab changed since the request; retry Save (stale-revision)".into(),
@@ -363,31 +416,63 @@ impl Session {
                 self.associate(tab, loaded.file, &loaded.path);
                 Ok("Reloaded disk snapshot; undo history cleared".into())
             }
-            (Some(Pending::Open), Completion::Open(loaded)) => {
-                if let Some((&tab, _)) = self
-                    .associations
-                    .iter()
-                    .find(|(_, a)| a.file == loaded.file)
-                {
-                    ui.dispatch(Event::SelectTab(tab))
-                        .map_err(|e| e.to_string())?;
-                    return Ok("Selected already-open file; edits and baseline retained".into());
-                }
-                let event = if loaded.missing {
-                    Event::MissingFile
-                } else {
-                    Event::Load(&loaded.bytes)
+            (
+                Some(pending @ (Pending::Open | Pending::Browse(_))),
+                completion @ (Completion::Open(_) | Completion::Directory(_)),
+            ) => {
+                let source = match pending {
+                    Pending::Browse(point) => Some(point),
+                    _ => None,
                 };
-                let Outcome::Created(tab) = ui.dispatch(event).map_err(|e| match e {
-                    crate::Error::Limit => {
-                        "Open refused: tab or text budget exhausted; existing tabs unchanged"
-                            .to_string()
+                let replaced = source.as_ref().map(|point| point.tab);
+                let (bytes, missing, directory, existing) = match &completion {
+                    Completion::Directory(snapshot) => {
+                        (snapshot.text.as_bytes(), false, true, None)
                     }
-                    _ => format!("Open was not admitted ({e}); existing tabs unchanged"),
-                })?
+                    Completion::Open(loaded) => (
+                        loaded.bytes.as_slice(),
+                        loaded.missing,
+                        false,
+                        self.associations
+                            .iter()
+                            .find(|(_, a)| a.file == loaded.file)
+                            .map(|(&tab, _)| tab),
+                    ),
+                    _ => return Err("Invalid Open completion".into()),
+                };
+                let Outcome::Created(tab) = ui
+                    .dispatch(Event::Open(crate::model::Open {
+                        source,
+                        bytes,
+                        missing,
+                        directory,
+                        existing,
+                    }))
+                    .map_err(|e| match e {
+                        crate::Error::Limit => {
+                            "Open refused: tab or text budget exhausted; existing tabs unchanged"
+                                .to_string()
+                        }
+                        _ => format!("Open was not admitted ({e}); existing tabs unchanged"),
+                    })?
                 else {
                     return Err("file admission did not create a tab".into());
                 };
+                if let Some(tab) = replaced {
+                    self.forget(tab);
+                }
+                let loaded = match completion {
+                    Completion::Open(loaded) => loaded,
+                    Completion::Directory(mut snapshot) => {
+                        snapshot.text = String::new();
+                        self.directories.insert(tab, snapshot);
+                        return Ok("Directory: Enter/click opens here; Shift opens a new tab; ^ parent; g refresh".into());
+                    }
+                    _ => return Err("Invalid Open completion".into()),
+                };
+                if existing.is_some() {
+                    return Ok("Selected already-open file; edits and baseline retained".into());
+                }
                 self.associate(tab, loaded.file, &loaded.path);
                 Ok(format!(
                     "Opened{}: {:?}",
@@ -524,6 +609,9 @@ fn execute(files: &mut Files, known: &mut BTreeSet<FileId>, job: Job) -> Result<
         // The outer worker owns Reload's borrow across jobs; never adopt here.
         Operation::Reload(_) => Err("Reload requires the worker's prepared handoff".into()),
         Operation::Open(path) => {
+            if let Some(snapshot) = crate::directory::read(&path)? {
+                return Ok(Completion::Directory(snapshot));
+            }
             let file = files.open(&path).map_err(file_error)?;
             known.insert(file);
             Ok(Completion::Open(Loaded {
@@ -636,6 +724,7 @@ impl Session {
             receiver,
             pending: None,
             associations: BTreeMap::new(),
+            directories: BTreeMap::new(),
             failed: false,
             conflict: None,
             dictionary: None,
@@ -817,6 +906,184 @@ mod tests {
 
     // Manually advance ordinary jobs; Reload tests hold the prepared borrow
     // across explicitly ordered completion delivery and admission instead.
+    #[test]
+    fn directory_browsing_reuses_identity_or_adds_a_tab_and_preserves_file_dedup() {
+        let dir = Directory::new();
+        fs::create_dir(dir.path("child")).unwrap();
+        fs::write(dir.path("child/file"), "original").unwrap();
+        let mut h = Harness::new();
+        let tab = h.open(dir.0.clone());
+        assert!(h.ui.editor().document(tab).unwrap().directory());
+        assert_eq!(h.ui.editor().document(tab).unwrap().text(), "d child/");
+        assert!(!h.ui.tab_view(tab).unwrap().soft_wrap);
+        assert_eq!(h.session.path(tab), Some(dir.0.as_path()));
+        h.session
+            .browse(&h.ui, tab, 0, dir.path("child"), false)
+            .unwrap();
+        h.complete().unwrap();
+        assert_eq!(h.ui.editor().active(), Some(tab));
+        assert_eq!(h.ui.editor().tabs().count(), 1);
+        assert_eq!(h.ui.editor().document(tab).unwrap().revision(), 1);
+        h.session
+            .browse(&h.ui, tab, 1, dir.path("child/file"), true)
+            .unwrap();
+        h.complete().unwrap();
+        let file = h.ui.editor().active().unwrap();
+        assert_ne!(file, tab);
+        h.ui.dispatch(Event::Edit {
+            tab: file,
+            revision: 0,
+            command: Command::Insert("dirty ".into()),
+        })
+        .unwrap();
+        h.ui.dispatch(Event::SelectTab(tab)).unwrap();
+        h.session
+            .browse(&h.ui, tab, 1, dir.path("child/file"), false)
+            .unwrap();
+        h.complete().unwrap();
+        assert_eq!(h.ui.editor().active(), Some(file));
+        assert_eq!(h.ui.editor().tabs().count(), 1);
+        assert!(h.session.directory(tab).is_none());
+        assert!(h.ui.tab_view(tab).is_err());
+        assert!(h.ui.editor().document(file).unwrap().dirty());
+        assert_eq!(
+            h.ui.editor().document(file).unwrap().text(),
+            "dirty original"
+        );
+        h.session.save(&h.ui, file, 1, None).unwrap();
+        h.complete().unwrap();
+        assert_eq!(fs::read(dir.path("child/file")).unwrap(), b"dirty original");
+    }
+
+    #[test]
+    fn directory_mutations_are_refused_and_navigation_failure_is_atomic() {
+        let dir = Directory::new();
+        fs::write(dir.path("bad"), b"\xff").unwrap();
+        let mut h = Harness::new();
+        let tab = h.open(dir.0.clone());
+        let commands = [
+            Command::Insert("x".into()),
+            Command::Type('x'),
+            Command::Backspace,
+            Command::Delete,
+            Command::Undo,
+            Command::Redo,
+            Command::FillParagraph,
+            Command::AutoFill(true),
+            Command::FillColumn(80),
+            Command::ReplaceAll {
+                needle: "bad".into(),
+                replacement: "good".into(),
+            },
+        ];
+        let generation = h.ui.generation();
+        for command in commands {
+            assert_eq!(
+                h.ui.dispatch(Event::Edit {
+                    tab,
+                    revision: 0,
+                    command
+                }),
+                Err(crate::Error::Unavailable)
+            );
+        }
+        assert_eq!(h.ui.generation(), generation);
+        assert!(h.ui.editor().save_snapshot(tab).is_err());
+        assert!(h
+            .session
+            .save(&h.ui, tab, 0, Some(dir.path("output")))
+            .is_err());
+        assert!(h
+            .session
+            .queue_save(&h.ui, tab, 0, Some(dir.path("output")))
+            .is_err());
+        h.session
+            .browse(&h.ui, tab, 0, dir.path("bad"), false)
+            .unwrap();
+        assert!(h.complete().is_err());
+        assert_eq!(h.ui.generation(), generation);
+        assert_eq!(h.ui.editor().document(tab).unwrap().text(), "f bad");
+        assert_eq!(h.session.path(tab), Some(dir.0.as_path()));
+        assert!(!dir.path("output").exists());
+        h.session
+            .browse(&h.ui, tab, 0, dir.0.clone(), false)
+            .unwrap();
+        h.ui.dispatch(Event::Close { tab, revision: 0 }).unwrap();
+        assert!(h.complete().is_err());
+        assert_eq!(h.ui.editor().tabs().count(), 0);
+    }
+
+    #[test]
+    fn directory_replacement_preserves_tab_limit_and_cannot_replace_editable_text() {
+        let dir = Directory::new();
+        fs::write(dir.path("file"), "body").unwrap();
+        let mut h = Harness::new();
+        let tab = h.open(dir.0.clone());
+        for _ in 1..64 {
+            h.ui.dispatch(Event::New).unwrap();
+        }
+        h.session
+            .browse(&h.ui, tab, 0, dir.path("file"), true)
+            .unwrap();
+        assert!(h.complete().is_err());
+        h.session
+            .browse(&h.ui, tab, 0, dir.path("file"), false)
+            .unwrap();
+        h.complete().unwrap();
+        assert_eq!(h.ui.editor().active(), Some(tab));
+        assert_eq!(h.ui.editor().tabs().count(), 64);
+        assert!(!h.ui.editor().document(tab).unwrap().directory());
+        assert_eq!(h.ui.editor().document(tab).unwrap().revision(), 1);
+        assert!(h.ui.tab_view(tab).unwrap().soft_wrap);
+        assert!(h
+            .session
+            .browse(&h.ui, tab, 1, dir.0.clone(), false)
+            .is_err());
+        let source = Some(h.ui.editor().revision_point(tab, 1).unwrap());
+        assert_eq!(
+            h.ui.dispatch(Event::Open(crate::model::Open {
+                source,
+                bytes: b"replacement",
+                directory: true,
+                missing: false,
+                existing: None,
+            })),
+            Err(crate::Error::InvalidArgument)
+        );
+        assert_eq!(h.ui.editor().document(tab).unwrap().text(), "body");
+    }
+
+    #[test]
+    fn directory_raw_names_bounds_empty_and_symlink_policy() {
+        use std::os::unix::ffi::OsStringExt;
+        let dir = Directory::new();
+        let raw = std::ffi::OsString::from_vec(b"bad\xff\n\\name".to_vec());
+        fs::write(dir.0.join(&raw), "body").unwrap();
+        fs::create_dir(dir.path("z")).unwrap();
+        std::os::unix::fs::symlink(dir.path("z"), dir.path("link")).unwrap();
+        let snapshot = crate::directory::read(&dir.0).unwrap().unwrap();
+        assert_eq!(snapshot.text, "d z/\nf bad\\xff\\n\\\\name\nl link");
+        assert_eq!(snapshot.entry(1), Some(dir.0.join(raw)));
+        assert_eq!(snapshot.entry(3), None);
+        assert!(crate::directory::read(&dir.path("link/"))
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            crate::directory::read(&dir.path("z"))
+                .unwrap()
+                .unwrap()
+                .len(),
+            0
+        );
+        for i in 0..4094 {
+            fs::write(dir.path(&format!("entry-{i}")), "").unwrap();
+        }
+        assert!(crate::directory::read(&dir.0)
+            .err()
+            .unwrap()
+            .contains("4096"));
+    }
+
     struct Harness {
         session: Session,
         jobs: Receiver<Job>,
@@ -837,6 +1104,7 @@ mod tests {
                     receiver,
                     pending: None,
                     associations: BTreeMap::new(),
+                    directories: BTreeMap::new(),
                     failed: false,
                     conflict: None,
                     dictionary: None,

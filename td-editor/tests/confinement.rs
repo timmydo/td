@@ -46,6 +46,7 @@ fn source_inventory_and_allowances_are_closed() {
         "control_worker.rs",
         "data.rs",
         "dialog.rs",
+        "directory.rs",
         "files.rs",
         "fill.rs",
         "keys.rs",

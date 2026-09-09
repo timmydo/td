@@ -173,6 +173,7 @@ mod tests {
             .windows(2)
             .all(|pair| matches!(pair, [(a, _), (b, _)] if a < b)));
         let menu = crate::menu::Menu {
+            directory: false,
             group: crate::menu::Group::Help,
             selected: 0,
             target: crate::dialog::Target {

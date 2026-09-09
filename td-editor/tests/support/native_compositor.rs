@@ -18,6 +18,122 @@ const KEY_END: u32 = 107;
 
 #[test]
 #[ignore = "ready supplies the disposable native compositor"]
+fn native_directory_tabs_reuse_shift_open_refresh_and_copy_path() {
+    for profile in ["windows", "emacs"] {
+        let compositor_directory = Directory::new();
+        let directory = Directory::new();
+        let mut compositor = Compositor::start(&compositor_directory);
+        let root = directory.0.join("browse");
+        std::fs::create_dir_all(root.join("child")).unwrap();
+        std::fs::write(root.join("child/note"), b"body").unwrap();
+        let dictionary = directory.0.join("dictionary");
+        std::fs::write(&dictionary, b"body\n").unwrap();
+        let display = compositor.directory.join("wayland-0");
+        let mut editor =
+            EditorProcess::start_with_profile(&directory, &display, &root, &dictionary, profile);
+        editor.wait_keyboard(profile);
+        let window = compositor.window();
+        assert_eq!(compositor.request("fullscreen", 1024), b"ok\n");
+        editor.wait_field("state", "window", "800,576,1");
+        editor.rendered_at(800, 576);
+        assert_eq!(field(&editor.ok("state"), "line-numbers"), Some("1"));
+        editor.wait_tab(0, "d child/");
+        assert!(editor.request("insert\t1\t0\t0\t0\t78").unwrap().starts_with("error\tunavailable\t"));
+        editor.wait_tab(0, "d child/");
+        let before = compositor.observe(&window);
+        compositor.chord(None, 28); // Enter reuses tab 1.
+        editor.wait_tab(1, "f note");
+        compositor.rendered_text(&mut editor, &window, 1, before, "f note", 0);
+        let state = editor.ok("state");
+        assert_eq!(state.matches("\ttab=").count(), 1);
+        assert_eq!(field(&state, "tab-kind"), Some("1,directory"));
+        assert_eq!(
+            field(&state, "directory"),
+            Some(
+                format!(
+                    "1,1,{}",
+                    td_editor::control::hex(root.join("child").as_os_str().as_encoded_bytes())
+                )
+                .as_str()
+            )
+        );
+        compositor.chord(Some(KEY_LEFT_SHIFT), 28); // Shift+Enter keeps origin.
+        editor.wait_field("state", "active", "2");
+        assert_eq!(editor.ok("text\t2\t0\t0\t100"), "4\t626f6479");
+        editor.ok("select-tab\t1\t1");
+        compositor.chord(Some(KEY_LEFT_SHIFT), 7); // ^ returns to parent.
+        editor.wait_tab(2, "d child/");
+        compositor.key(KEY_LEFT_SHIFT, true);
+        compositor.click(40, 80); // Shift-click opens child in a third tab.
+        compositor.key(KEY_LEFT_SHIFT, false);
+        editor.wait_field("state", "active", "3");
+        assert_eq!(editor.ok("text\t3\t0\t0\t100"), "6\t66206e6f7465");
+        compositor.click(40, 80); // Already-open note selects tab 2 and retires 3.
+        editor.wait_field("state", "active", "2");
+        assert_eq!(editor.ok("state").matches("\ttab=").count(), 2);
+        editor.ok("select-tab\t1\t2");
+        std::fs::write(root.join("added"), b"new").unwrap();
+        compositor.chord(None, KEY_G);
+        editor.wait_tab(3, "d child/\nf added");
+        compositor.chord(None, 68); // F10.
+        editor.wait_field("state", "modal", "0,0,0,0,1,0,0,0,0");
+        compositor.click(60, 180); // File > Copy Full File Path, including directory.
+        editor.wait_field("state", "modal", "0,0,0,0,0,0,0,0,0");
+        editor.wait_field(
+            "clipboard-state",
+            "source-bytes",
+            &root.as_os_str().as_encoded_bytes().len().to_string(),
+        );
+        editor.ok("select-tab\t2\t0");
+        compositor.chord(
+            Some(KEY_LEFT_CTRL),
+            if profile == "windows" { 47 } else { KEY_Y },
+        );
+        let deadline = Instant::now() + TIMEOUT;
+        loop {
+            let state = editor.ok("state");
+            if state.split('\t').any(|row| row.starts_with("tab=2,1,")) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "directory clipboard paste: {state}"
+            );
+        }
+        let expected = format!("{}body", root.display());
+        assert_eq!(
+            editor.ok("text\t2\t1\t0\t4096"),
+            format!(
+                "{}\t{}",
+                expected.len(),
+                td_editor::control::hex(expected.as_bytes())
+            )
+        );
+        editor.job("save\t2\t1");
+        editor.job(&format!("open\t{}", td_editor::control::hex(root.as_os_str().as_encoded_bytes())));
+        editor.wait_field("state", "active", "4");
+        let state = editor.ok("state");
+        assert!(state.contains("tab-kind=4,directory"));
+        let token = field(&state, "input-generation").unwrap();
+        editor.ok(&format!("key\t4\t0\t{token}\t52657475726e"));
+        let deadline = Instant::now() + TIMEOUT;
+        loop {
+            let state = editor.ok("state");
+            if state.split('\t').any(|row| row.starts_with("tab=4,1,")) { break; }
+            assert!(Instant::now() < deadline, "remote directory navigation: {state}");
+        }
+        assert_eq!(editor.ok("text\t4\t1\t0\t100"), "6\t66206e6f7465");
+        assert_eq!(
+            std::fs::read(root.join("child/note")).unwrap(),
+            expected.as_bytes()
+        );
+        editor.quit();
+        compositor.stop();
+    }
+}
+
+#[test]
+#[ignore = "ready supplies the disposable native compositor"]
 fn native_path_completion_lists_cycles_and_opens_literal_relative_file() {
     use td_editor::render::{Draw, Geometry, GlyphStyle, Primitive, Raster, Scale, CHROME, INK};
     for profile in ["windows", "emacs"] {

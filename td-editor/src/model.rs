@@ -67,6 +67,7 @@ impl Transaction {
 
 #[derive(Debug)]
 pub struct Document {
+    directory: bool,
     text: String,
     format: text::Format,
     newlines: usize,
@@ -81,6 +82,9 @@ pub struct Document {
 }
 
 impl Document {
+    pub fn directory(&self) -> bool {
+        self.directory
+    }
     pub fn text(&self) -> &str {
         &self.text
     }
@@ -105,6 +109,16 @@ impl Document {
     pub fn history_depth(&self) -> (usize, usize) {
         (self.undo.len(), self.redo.len())
     }
+}
+
+/// Worker completion. Only directory views can authorize in-place navigation;
+/// an editable document can never be replaced through this path.
+pub struct Open<'a> {
+    pub(crate) source: Option<RevisionPoint>,
+    pub(crate) bytes: &'a [u8],
+    pub(crate) directory: bool,
+    pub(crate) missing: bool,
+    pub(crate) existing: Option<TabId>,
 }
 
 /// A save adapter captures this alongside bytes, then acknowledges only
@@ -256,6 +270,7 @@ impl Editor {
         self.tabs.insert(
             id,
             Document {
+                directory: false,
                 text: decoded.text,
                 format: decoded.format,
                 newlines,
@@ -358,6 +373,7 @@ impl Editor {
         let state = self.next_state;
         let newlines = decoded.text.bytes().filter(|&b| b == b'\n').count();
         let replacement = Document {
+            directory: false,
             text: decoded.text,
             format: decoded.format,
             newlines,
@@ -382,8 +398,43 @@ impl Editor {
         }
     }
 
+    pub(crate) fn open(&mut self, open: Open<'_>) -> Result<TabId> {
+        if let Some(point) = &open.source {
+            self.check_revision(point)?;
+            if !self.document(point.tab)?.directory {
+                return Err(Error::InvalidArgument);
+            }
+        }
+        if let Some(existing) = open.existing {
+            self.document(existing)?;
+            if let Some(point) = open.source {
+                if point.tab == existing {
+                    return Err(Error::InvalidArgument);
+                }
+                self.remove_tab(point.tab);
+            }
+            self.active = Some(existing);
+            return Ok(existing);
+        }
+        let tab = if let Some(point) = open.source {
+            let tab = point.tab;
+            self.reload_bytes(point, open.bytes, open.missing)?;
+            self.active = Some(tab);
+            tab
+        } else if open.missing {
+            self.missing_file()?
+        } else {
+            self.load_bytes(open.bytes)?
+        };
+        self.document_mut(tab)?.directory = open.directory;
+        Ok(tab)
+    }
+
     pub fn save_snapshot(&self, id: TabId) -> Result<(SavePoint, Vec<u8>)> {
         let doc = self.document(id)?;
+        if doc.directory {
+            return Err(Error::Unavailable);
+        }
         Ok((
             SavePoint {
                 owner: self.identity.clone(),
@@ -411,6 +462,17 @@ impl Editor {
 
     pub fn dispatch(&mut self, id: TabId, revision: u64, command: Command) -> Result<()> {
         let doc = self.checked(id, revision)?;
+        if doc.directory
+            && !matches!(
+                command,
+                Command::Select(_)
+                    | Command::Move { .. }
+                    | Command::GoToLine(_)
+                    | Command::Find { .. }
+            )
+        {
+            return Err(Error::Unavailable);
+        }
         match command {
             Command::Select(selection) => {
                 if !doc.text.is_char_boundary(selection.anchor)

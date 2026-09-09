@@ -12,6 +12,7 @@ pub mod control_socket;
 pub mod control_worker;
 mod data;
 mod dialog;
+mod directory;
 pub use dialog::{Discard, Reload};
 pub mod files;
 pub mod fill;

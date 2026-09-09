@@ -19,6 +19,8 @@ pub enum Event<'a> {
     New,
     /// Byte fixture or already-authorized file-adapter completion, not a path.
     Load(&'a [u8]),
+    /// Authorized file/directory completion, including directory navigation.
+    Open(crate::model::Open<'a>),
     /// Authorized file completion: an absent file must not appear saved.
     MissingFile,
     /// Opaque token for the exact state successfully published by the adapter.
@@ -234,7 +236,13 @@ impl Controller {
     // Thus these checked constructors cannot reject an admitted controller
     // state. Cache metrics by revision, wrap mode and full-cell width.
     fn refresh(&mut self, reveal: Option<TabId>) -> Result<()> {
-        let lines = if !self.line_numbers {
+        let numbers = self.line_numbers
+            && !self
+                .editor
+                .active()
+                .and_then(|id| self.editor.document(id).ok())
+                .is_some_and(|doc| doc.directory());
+        let lines = if !numbers {
             1
         } else if let Some(tab) = self.editor.active() {
             let doc = self.editor.document(tab)?;
@@ -250,9 +258,7 @@ impl Controller {
             self.line_count = None;
             1
         };
-        self.geometry = self
-            .geometry
-            .with_line_numbers(self.line_numbers.then_some(lines));
+        self.geometry = self.geometry.with_line_numbers(numbers.then_some(lines));
         let (columns, rows) = self.geometry.grid();
         let columns = columns.max(1);
         let rows = rows.max(1);
@@ -263,7 +269,7 @@ impl Controller {
                 viewport: new_view,
                 affinity: Affinity::Downstream,
                 desired_column: None,
-                soft_wrap: true,
+                soft_wrap: !doc.directory(),
                 metrics: Metrics {
                     rows: 0,
                     columns: 0,
@@ -309,6 +315,17 @@ impl Controller {
 
     fn apply(&mut self, event: Event<'_>) -> Result<Outcome> {
         match event {
+            Event::Open(open) => {
+                let existing = open.existing.is_some();
+                let tab = self.editor.open(open)?;
+                if !existing {
+                    self.tabs.remove(&tab);
+                }
+                self.reset_input();
+                self.refresh((!existing).then_some(tab))?;
+                self.wake_caret();
+                Ok(Outcome::Created(tab))
+            }
             Event::New | Event::Load(_) | Event::MissingFile => {
                 let id = match event {
                     Event::Load(bytes) => self.editor.load_bytes(bytes)?,
@@ -411,6 +428,9 @@ impl Controller {
                 enabled,
             } => {
                 self.checked(tab, revision, false)?;
+                if self.editor.document(tab)?.directory() {
+                    return Err(Error::Unavailable);
+                }
                 let state = self.tabs.get_mut(&tab).ok_or(Error::MissingTab)?;
                 if state.soft_wrap == enabled {
                     return Ok(Outcome::Ignored);

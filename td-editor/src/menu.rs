@@ -170,6 +170,7 @@ pub(crate) struct Menu {
     pub(crate) target: Target,
     pub(crate) profile: Profile,
     pub(crate) file_window: bool,
+    pub(crate) directory: bool,
     pub(crate) undo: bool,
     pub(crate) redo: bool,
     pub(crate) wrap: bool,
@@ -182,6 +183,27 @@ pub(crate) struct Menu {
 
 impl Menu {
     pub(crate) fn enabled(&self, item: Item) -> bool {
+        if self.directory
+            && matches!(
+                item,
+                Item::Save
+                    | Item::SaveAs
+                    | Item::Cut
+                    | Item::Paste
+                    | Item::Undo
+                    | Item::Redo
+                    | Item::Wrap
+                    | Item::AutoFill
+                    | Item::Fill
+                    | Item::FillColumn
+                    | Item::Spell
+                    | Item::Replace
+                    | Item::NextMisspelling
+                    | Item::PreviousMisspelling
+            )
+        {
+            return false;
+        }
         match item {
             Item::Cut | Item::Copy => self.copy,
             Item::CopyPath => self.copy_path,
@@ -323,6 +345,7 @@ mod tests {
 
     fn menu(group: Group) -> Menu {
         Menu {
+            directory: false,
             group,
             selected: 0,
             target: Target {

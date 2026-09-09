@@ -312,8 +312,9 @@ a BOM on reopen; interior U+FEFF remains ordinary text.
 
 Open paths are `OsString`/`PathBuf`; display escaping never changes a path.
 `--` terminates options. Opening an already associated file selects its tab
-using file device/inode identity. Only regular files are opened; devices,
-directories, sockets and FIFOs are refused. A missing file opens an empty dirty tab
+using file device/inode identity. Regular files open as editable text;
+directories open as read-only navigation tabs under the contract below.
+Devices, sockets and FIFOs are refused. A missing file opens an empty dirty tab
 associated with that path; other initial open failures report nonzero status
 before the window is created. An interactive open failure keeps existing tabs.
 
@@ -1127,6 +1128,73 @@ non-modal notices use the bottom status row as specified below; routine
 feedback does not cover editable text.
 When input is unavailable or not synchronized, the prompt instead prefixes
 readiness instructions without erasing the entered path.
+
+### Directory tabs
+
+CLI paths, File > Open and semantic remote Open accept directories as well
+as regular/missing files. These entry points add a tab. Directory labels
+start with `[dir]`; generated listings are clean and read-only, with no undo
+history. The model refuses text/settings mutations and save snapshots,
+including control commands. Native menus disable Save/Save As, Cut/Paste,
+Replace, text formatting and spelling. Selection, Find, Go To Line and
+navigation remain available. Directory views suppress the line-number gutter
+and soft wrapping without changing other tabs or the window preference.
+
+Each entry occupies one logical row: `d ` plus an escaped basename and
+trailing slash for directories, `f ` for regular files, `l ` for symlinks,
+and `? ` for other types. Directories sort first, then other entries; each
+group uses raw Unix-byte basename order, including dotfiles. Names use ASCII
+byte escapes for non-ASCII bytes, controls and backslashes. Activation uses
+retained literal `OsString` names, never parsed display text. Empty listings
+have no activatable row. Final symlinks are not followed on activation, even
+with trailing slashes. Parent components may follow links, as for file paths;
+explicit `.` and `..` directory paths are supported.
+
+Click or Enter opens an entry in the current tab. Shift-click or Shift+Enter
+opens a new foreground tab, retaining the source. Both profiles use these
+bindings. Arrow/Page keys and Emacs movement keys move the caret between
+entries. `^` opens the parent in place (root refreshes root); `g` refreshes
+the current directory. Activation/refresh do not auto-repeat. Clicks below
+the last entry do nothing; directory clicks do not start text drags. Existing
+modifier readiness and decoded-input fences remain required. Back/Forward
+history, watchers, recursive traversal and background refresh are not
+implemented. Rename and confirmed deletion are subsequent increments, not
+editable text commands against a listing.
+
+Reads occupy the existing file worker's exclusive slot. Scans admit at most
+4096 entries and 1 MiB of raw basename bytes; any read/type error or exceeded
+bound refuses the whole result. Input/resolved paths and activated child
+paths must fit 4096 bytes. Directory identity is checked before/after the
+scan, but this is not an atomic filesystem snapshot or protection against
+same-authority pathname races. Entries can become stale immediately; each
+activation performs ordinary file/directory admission again. The worker
+retains its existing unbounded syscall-duration limitation.
+Display expansion is bounded by four bytes per name byte plus four bytes
+per entry and charged to the model's live-text budget. Each admitted
+directory additionally retains at most 1 MiB of raw names and 4096 fixed-size
+entry records, with no duplicate listing string, baseline, file handle or
+directory iterator after admission.
+
+In-place completion pins editor identity, directory tab and revision. All
+decoding, budgets and counters are checked before replacement. Success keeps
+the TabId, increments revision, resets selection/viewport and adopts the new
+path/type. File views start with ordinary wrap/format defaults. Failed,
+stale, closed-origin or over-budget admission leaves existing tabs unchanged.
+Replacement consumes no new tab slot and works at the 64-tab ceiling.
+File deduplication is preserved: normal activation of an already-open file
+atomically removes the source directory and selects that file; Shift
+activation selects it without removing the source. Existing edits, history,
+cursor and saved-file baseline survive. Directories may have separate tabs
+for the same path. Replacement cancels held-key repeat even if TabId stays
+unchanged. Selecting a different tab while I/O runs does not retarget it.
+
+File > Copy Full File Path copies the directory tab's resolved absolute path,
+without an added slash, quotes or newline (root remains `/`). It uses the
+same physical activation serial, UTF-8 bound and immutable clipboard offer
+as file paths, not the selected entry's pathname. Control state exposes
+directory kind, raw path and entry count; text pages expose escaped rows.
+Open jobs and fenced decoded input use the same navigation/worker path as
+physical input, with no filesystem mutation shortcut.
 
 ### Literal path completion
 
