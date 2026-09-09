@@ -52,6 +52,14 @@ pub const FIDO_CASES: &[(&str, &str)] = &[
         "fido-enroll-recovery",
         "fido_device::vm_tests::qemu_hid_enrolls_recovery_and_refuses_replays_and_wrong_keys",
     ),
+    (
+        "fido-operations-single",
+        "fido_device::vm_tests::qemu_private_workers_enroll_unlock_write_and_cancel_without_recovery",
+    ),
+    (
+        "fido-operations-recovery",
+        "fido_device::vm_tests::qemu_private_workers_enroll_unlock_and_write_with_recovery",
+    ),
 ];
 pub const PASS: &str = "TD-SECRET-VM-PASS";
 pub const FAIL: &str = "TD-SECRET-VM-FAIL";

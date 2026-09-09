@@ -774,7 +774,7 @@ normal cargo pass with those tests ignored is not TPM integration evidence.
 
 `td-recipe-eval qemu-secret --tpm /absolute/path/to/swtpm` requires the
 same pinned host swtpm described above and adds four cold TPM guest boots
-and the four HID guests below to the authority checks. The host starts a
+and the six HID guests below to the authority checks. The host starts a
 private software TPM control socket and attaches QEMU's emulated TIS device; there is no host TPM
 passthrough. The source-built test executable calls the unchanged
 `Device::open` and `Client` implementations through `/dev/tpmrm0`.
@@ -802,7 +802,7 @@ credential-store write. The stock deployment remains unenrolled.
 
 ### HID through the QEMU guest kernel
 
-The same optional command runs four further isolated guests using a
+The same optional command runs six further isolated guests using a
 test-only virtual token created through Linux
 [UHID](https://docs.kernel.org/hid/uhid.html). The fixture requires its
 kernel opt-in and exact case selector before opening `/dev/uhid`, then
@@ -886,6 +886,54 @@ These cases use no persistent disk and publish no store or session key.
 They prove fresh credential/proof/recovery protocol composition and
 assertion-before-unseal, not the private enrollment/unlock workers, trusted
 presentation, physical presence, portal release or authorized writes.
+
+
+### Private operations with virtual tokens
+
+`fido-operations-single` and `fido-operations-recovery` run the production
+`/bin/td-secret` enrollment, unlock and named-write workers over unnamed
+root socketpairs. Each disposable guest installs a minimal root-owned
+principal/account fixture and initializes a portal-owned file-backed store
+with two known credentials. The existing guest TPM and UHID token helpers
+supply fresh keys and signed assertions. No alternate executable, token
+path, store path or environment setting enters a production worker.
+
+The fixture parent checks every complete presentation and commit invitation
+against its canonical request. It enables exactly the expected CTAP commands
+only after receiving that step's presentation invitation, before echoing
+its private acknowledgement. A token command before its invitation, or a repeated or out-of-order
+command, fails the fixture. Expected challenges independently hash the documented
+domain and full request, including the operation nonce, role and typed write
+target. Enrollment checks the same opaque user handle across both tokens and
+the complete recovery exclusion list. The primary virtual device remains
+connected while the recovery device is inserted, exercising production
+selection of a different node and separate HID-worker ownership.
+
+Successful enrollment must retire the file master and individual records,
+publish a token store, and leave it locked. Both policies then exercise
+cancelled unlock and write commit rounds: parent EOF must produce the
+specific authority-disconnected error, preserve the entire store bundle,
+and leave no release. Successful unlock makes the original credentials
+readable through the application-secret backend. A successful named write
+changes the selected credential while the store is locked, produces no
+runtime key, and requires another fresh unlock before readback. The other
+credential must survive. The recovery policy additionally writes and unlocks
+through the recovery token; the unrecoverable policy requires the specific
+missing-recovery refusal after getInfo without an assertion.
+
+The parent owns each worker, requires successful exit after the success
+frame, bounds exit observation and stderr, and kills/reaps on unwinding.
+Each token script must be completely consumed, with the exact exchange count,
+and closing it must remove its HID node. The guest finishes with its release
+cleared. Blocking TPM or teardown I/O retains the outer 180-second VM bound.
+
+These are production worker and store-transition oracles in a disposable
+guest filesystem, not cold-persistent store or physical-presence proofs.
+The parent supplies simulated presentation acknowledgements and private
+credential frames. It does not exercise td-authd's public descriptor intake,
+compositor receipts, physical secure attention or the application's portal
+connection. The earlier authority/intake guests and protocol negative cases
+remain separate checks; they are not a combined desktop acceptance claim.
 
 ## Portal evidence
 

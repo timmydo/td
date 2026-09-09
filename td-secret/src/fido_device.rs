@@ -987,8 +987,8 @@ mod tests {
 mod vm_tests {
     use super::*;
     use std::sync::{
-        Arc,
         atomic::{AtomicBool, Ordering},
+        Arc,
     };
     use std::thread::{self, JoinHandle};
 
@@ -1001,12 +1001,10 @@ mod vm_tests {
     ];
 
     fn guard(case: &str) {
-        assert!(
-            fs::read_to_string("/proc/cmdline")
-                .unwrap()
-                .split_ascii_whitespace()
-                .any(|arg| arg == "td.hid-fixture=1")
-        );
+        assert!(fs::read_to_string("/proc/cmdline")
+            .unwrap()
+            .split_ascii_whitespace()
+            .any(|arg| arg == "td.hid-fixture=1"));
         assert_eq!(fs::read_to_string("/case").unwrap(), case);
         store::require_root().unwrap();
     }
@@ -1327,12 +1325,18 @@ mod vm_tests {
         }
 
         fn start(&self, expected: Vec<Vec<u8>>) -> Token {
+            self.checked(move |request, index| {
+                assert_eq!(request, expected.get(index).unwrap());
+            })
+        }
+
+        fn checked(&self, mut check: impl FnMut(&[u8], usize) + Send + 'static) -> Token {
             use crate::fido_cbor::{self as cbor, Encoder, Value};
             let signer = Arc::clone(&self.signer);
             let id = self.id.clone();
             let mut counter = 0u32;
             Token::serve(Duration::from_secs(60), false, move |request, index| {
-                assert_eq!(request, expected.get(index).unwrap());
+                check(request, index);
                 if request == [4] {
                     return info_reply();
                 }
@@ -1421,7 +1425,7 @@ mod vm_tests {
             &self,
             primary: Option<&crate::fido_enroll::Credential>,
         ) -> crate::fido_enroll::Credential {
-            use crate::fido_enroll::{GET_INFO, Info, MakeCredential};
+            use crate::fido_enroll::{Info, MakeCredential, GET_INFO};
             let creation = fresh();
             let proof_hash = fresh();
             assert_ne!(creation, proof_hash);
@@ -1581,5 +1585,444 @@ mod vm_tests {
     fn qemu_hid_enrolls_recovery_and_refuses_replays_and_wrong_keys() {
         guard("fido-enroll-recovery");
         enrollment_and_release(true);
+    }
+    type Script = Arc<std::sync::Mutex<std::collections::VecDeque<ExpectedCtap>>>;
+    enum ExpectedCtap {
+        Info,
+        Create {
+            hash: [u8; 32],
+            excluded: Option<Vec<u8>>,
+            user: Arc<std::sync::Mutex<Option<[u8; 32]>>>,
+        },
+        Assert {
+            hash: [u8; 32],
+            id: Vec<u8>,
+        },
+    }
+
+    fn scripted(token: &VirtualCredential) -> (Token, Script) {
+        use crate::fido_cbor::{self as cbor, Value};
+        use crate::fido_enroll::{Info, MakeCredential};
+        let script: Script = Arc::default();
+        let input = Arc::clone(&script);
+        let token = token.checked(move |request, _| {
+            let expected = input
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("token I/O before its presentation acknowledgement");
+            match expected {
+                ExpectedCtap::Info => assert_eq!(request, [4]),
+                ExpectedCtap::Assert { hash, id } => {
+                    let expected =
+                        crate::fido_ctap::AssertionRequest::new(&id, hash, 1024).unwrap();
+                    assert_eq!(request, expected.bytes());
+                }
+                ExpectedCtap::Create {
+                    hash,
+                    excluded,
+                    user,
+                } => {
+                    assert_eq!(request[0], 1);
+                    let actual = cbor::decode(&request[1..]).unwrap();
+                    let handle: [u8; 32] = actual
+                        .required(&Value::Unsigned(3))
+                        .unwrap()
+                        .required(&Value::Text("id"))
+                        .unwrap()
+                        .bytes()
+                        .unwrap()
+                        .try_into()
+                        .unwrap();
+                    let mut user = user.lock().unwrap();
+                    if let Some(previous) = *user {
+                        assert_eq!(previous, handle);
+                    }
+                    *user = Some(handle);
+                    let base =
+                        MakeCredential::primary(Info::parse(&info_reply()).unwrap(), hash, handle)
+                            .unwrap();
+                    let mut expected = cbor::decode(&base.bytes()[1..]).unwrap();
+                    if let Some(id) = &excluded {
+                        let Value::Map(entries) = &mut expected else {
+                            panic!("make map")
+                        };
+                        entries.insert(
+                            4,
+                            (
+                                Value::Unsigned(5),
+                                Value::Array(vec![Value::Map(vec![
+                                    (Value::Text("id"), Value::Bytes(id)),
+                                    (Value::Text("type"), Value::Text("public-key")),
+                                ])]),
+                            ),
+                        );
+                    }
+                    assert!(
+                        actual == expected,
+                        "makeCredential did not bind the presented step and exclusion"
+                    );
+                }
+            }
+        });
+        (token, script)
+    }
+
+    struct OperationChild {
+        child: std::process::Child,
+        log: std::path::PathBuf,
+    }
+    impl OperationChild {
+        fn start(command: &str) -> (Self, crate::operation::Wire) {
+            static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            let log = std::path::PathBuf::from(format!(
+                "/run/private-operation-{}.log",
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            let errors = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&log)
+                .unwrap();
+            let (parent, child) = UnixStream::pair().unwrap();
+            let child = Command::new("/bin/td-secret")
+                .args([command, "--uid", "1000"])
+                .env_clear()
+                .current_dir("/")
+                .stdin(Stdio::from(OwnedFd::from(child)))
+                .stdout(Stdio::null())
+                .stderr(errors)
+                .spawn()
+                .unwrap();
+            let wire =
+                crate::operation::Wire::new(parent, Instant::now() + Duration::from_secs(120))
+                    .unwrap();
+            (Self { child, log }, wire)
+        }
+        fn finish(mut self, error: Option<&str>) {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let status = loop {
+                if let Some(status) = self.child.try_wait().unwrap() {
+                    break status;
+                }
+                assert!(Instant::now() < deadline, "private worker failed to exit");
+                thread::sleep(Duration::from_millis(10));
+            };
+            let mut bytes = Vec::new();
+            File::open(&self.log)
+                .unwrap()
+                .take(65_537)
+                .read_to_end(&mut bytes)
+                .unwrap();
+            assert!(bytes.len() <= 65_536, "private worker stderr exceeded 64 KiB");
+            let log = String::from_utf8(bytes).expect("private worker stderr was not UTF-8");
+            assert_eq!(status.success(), error.is_none(), "{log}");
+            if let Some(error) = error {
+                assert!(log.contains(error), "{log}");
+            } else {
+                assert!(log.is_empty(), "{log}");
+            }
+            assert!(!std::path::Path::new(&format!("/proc/{}", self.child.id())).exists());
+        }
+    }
+    impl Drop for OperationChild {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+
+    fn invitation(
+        wire: &mut crate::operation::Wire,
+        tag: u8,
+        request: &crate::consent::Request,
+    ) -> Vec<u8> {
+        let mut frame = wire.receive().unwrap();
+        let encoded = request.encode();
+        assert_eq!(frame.len(), 33 + encoded.len(), "unexpected private invitation length");
+        assert_eq!(frame[0], tag);
+        assert_eq!(&frame[33..], encoded);
+        frame[0] += 1;
+        frame
+    }
+    fn presented_hash(domain: &[u8], request: &crate::consent::Request) -> [u8; 32] {
+        let mut bytes = domain.to_vec();
+        bytes.extend_from_slice(&request.encode());
+        crate::crypto::digest(&bytes)
+    }
+    fn no_release() {
+        assert!(!std::path::Path::new("/run/td-secret/1000/key").exists());
+    }
+    fn sealed_bytes() -> Vec<u8> {
+        fs::read("/var/lib/td/secrets/1000/sealed").unwrap()
+    }
+
+    fn prepare_operation_store() {
+        use std::os::unix::fs::PermissionsExt;
+        assert!(!std::path::Path::new("/etc/td-principals.tsv").exists());
+        assert!(!store::user_path(1000).exists());
+        fs::create_dir_all("/etc").unwrap();
+        for (name, text, mode) in [
+            ("td-principals.tsv", "td-principals-v1\nsession\t1000\t993\t992\t991\napplication\t1000\tmail\t65537\n", 0o444),
+            ("passwd", "tester:x:1000:1000::/home/tester:/bin/false\ntda65537:x:65537:65537::/var/lib/td/applications/65537:/bin/false\n", 0o644),
+            ("group", "tester:x:1000:\ntda65537:x:65537:\n", 0o644),
+            ("shadow", "tester::0:0:99999:7:::\ntda65537:!td-service:0:0:99999:7:::\n", 0o600),
+        ] {
+            let path = std::path::Path::new("/etc").join(name);
+            fs::write(&path, text).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
+        }
+        fs::create_dir_all("/var/lib/td/secrets").unwrap();
+        let store = store::Store::open_owned(&store::user_path(1000), 1000, 991, true).unwrap();
+        store.set("mail", "main", b"firstboot fixture").unwrap();
+        store.set("news", "main", b"untouched fixture").unwrap();
+        assert!(store.application_secret("mail", "main").is_err());
+    }
+
+    fn enroll_worker(primary: &VirtualCredential, recovery: Option<&VirtualCredential>) {
+        use crate::consent::{Enrollment, Operation, Platform, Recovery, Request};
+        let mut request = Request::new(
+            fresh(),
+            1000,
+            Operation::Enroll {
+                platform: Platform::TpmPcr7,
+                recovery: if recovery.is_some() {
+                    Recovery::SecondToken
+                } else {
+                    Recovery::Unrecoverable
+                },
+                step: Enrollment::CreatePrimary,
+            },
+        )
+        .unwrap();
+        let old_master = fs::read(store::user_path(1000).join("master")).unwrap();
+        let user = Arc::new(std::sync::Mutex::new(None));
+        let (primary_hid, primary_script) = scripted(primary);
+        let mut recovery_hid = None;
+        let mut recovery_script: Option<Script> = None;
+        let (child, mut wire) = OperationChild::start("enroll-operation");
+        wire.send(&request.encode()).unwrap();
+        loop {
+            let reply = invitation(&mut wire, 0x10, &request);
+            assert!(primary_script.lock().unwrap().is_empty());
+            let Operation::Enroll { step, .. } = request.operation() else {
+                panic!("enrollment")
+            };
+            if *step == Enrollment::CreateRecovery {
+                let (hid, script) = scripted(recovery.unwrap());
+                recovery_hid = Some(hid);
+                recovery_script = Some(script);
+            }
+            let (script, token, excluded) = match step {
+                Enrollment::CreatePrimary | Enrollment::ProvePrimary => {
+                    (&primary_script, primary, None)
+                }
+                _ => (
+                    recovery_script.as_ref().unwrap(),
+                    recovery.unwrap(),
+                    Some(primary.id.clone()),
+                ),
+            };
+            assert!(script.lock().unwrap().is_empty());
+            let hash = presented_hash(b"td-secret/presented-enrollment/v1\0", &request);
+            let mut pending = script.lock().unwrap();
+            match step {
+                Enrollment::CreatePrimary | Enrollment::CreateRecovery => {
+                    pending.push_back(ExpectedCtap::Info);
+                    pending.push_back(ExpectedCtap::Create {
+                        hash,
+                        excluded,
+                        user: Arc::clone(&user),
+                    });
+                }
+                _ => pending.push_back(ExpectedCtap::Assert {
+                    hash,
+                    id: token.id.clone(),
+                }),
+            }
+            drop(pending);
+            no_release();
+            assert_eq!(
+                fs::read(store::user_path(1000).join("master")).unwrap(),
+                old_master
+            );
+            wire.send(&reply).unwrap();
+            let Some(next) = request.following_enrollment_step().unwrap() else {
+                break;
+            };
+            request = next;
+        }
+        let commit = invitation(&mut wire, 0x12, &request);
+        assert!(primary_script.lock().unwrap().is_empty());
+        if let Some(script) = &recovery_script {
+            assert!(script.lock().unwrap().is_empty());
+        }
+        assert!(!store::user_path(1000).join("sealed").exists());
+        no_release();
+        wire.send(&commit).unwrap();
+        assert_eq!(wire.receive().unwrap(), [0x14]);
+        drop(wire);
+        child.finish(None);
+        assert_eq!(primary_hid.finish(), (3, 0));
+        if let Some(token) = recovery_hid {
+            assert_eq!(token.finish(), (3, 0));
+        }
+        assert!(Device::discover().unwrap().is_empty());
+        no_release();
+        for retired in ["master", "mail.main", "news.main"] {
+            assert!(!store::user_path(1000).join(retired).exists());
+        }
+        let store = crate::owned_store(1000).unwrap();
+        assert!(store.token_protected().unwrap());
+        assert!(store.application_secret("mail", "main").is_err());
+    }
+
+    fn operate(
+        token: &VirtualCredential,
+        role: crate::consent::Role,
+        value: Option<&[u8]>,
+        cancel: bool,
+        absent_role: bool,
+    ) {
+        use crate::consent::{Operation, Request};
+        let operation = if value.is_some() {
+            Operation::Set {
+                role,
+                application: "mail".into(),
+                name: "main".into(),
+                application_uid: 65537,
+                requester: 1000,
+            }
+        } else {
+            Operation::Unlock { role }
+        };
+        let request = Request::new(fresh(), 1000, operation).unwrap();
+        let domain = if value.is_some() {
+            b"td-secret/presented-write/v1\0".as_slice()
+        } else {
+            b"td-secret/presented-unlock/v1\0".as_slice()
+        };
+        let before = sealed_bytes();
+        no_release();
+        let (hid, script) = scripted(token);
+        let (child, mut wire) = OperationChild::start(if value.is_some() {
+            "write-operation"
+        } else {
+            "unlock-operation"
+        });
+        wire.send(&request.encode()).unwrap();
+        if let Some(value) = value {
+            wire.send(value).unwrap();
+        }
+        let reply = invitation(&mut wire, 0x10, &request);
+        script.lock().unwrap().push_back(ExpectedCtap::Info);
+        if !absent_role {
+            script.lock().unwrap().push_back(ExpectedCtap::Assert {
+                hash: presented_hash(domain, &request),
+                id: token.id.clone(),
+            });
+        }
+        wire.send(&reply).unwrap();
+        if absent_role {
+            assert!(wire.receive().is_err());
+            drop(wire);
+            child.finish(Some("store is explicitly unrecoverable"));
+        } else {
+            let commit = invitation(&mut wire, 0x12, &request);
+            assert!(script.lock().unwrap().is_empty());
+            assert_eq!(sealed_bytes(), before);
+            no_release();
+            if !cancel {
+                wire.send(&commit).unwrap();
+                assert_eq!(wire.receive().unwrap(), [0x14]);
+            }
+            drop(wire);
+            child.finish(cancel.then_some("operation authority disconnected"));
+        }
+        assert!(script.lock().unwrap().is_empty());
+        assert_eq!(hid.finish(), (if absent_role { 1 } else { 2 }, 0));
+        assert!(Device::discover().unwrap().is_empty());
+        if cancel || absent_role || value.is_none() {
+            assert_eq!(sealed_bytes(), before);
+        } else {
+            assert_ne!(sealed_bytes(), before, "successful write left the bundle unchanged");
+        }
+        if cancel || absent_role || value.is_some() {
+            no_release();
+        } else {
+            assert!(std::path::Path::new("/run/td-secret/1000/key").exists());
+        }
+    }
+
+    fn read_records(expected: &[u8]) {
+        let store = crate::owned_store(1000).unwrap();
+        assert_eq!(
+            store.application_secret("mail", "main").unwrap().unwrap(),
+            expected
+        );
+        assert_eq!(
+            store.application_secret("news", "main").unwrap().unwrap(),
+            b"untouched fixture"
+        );
+    }
+
+    fn private_operations(second: bool) {
+        use crate::consent::Role;
+        prepare_operation_store();
+        crate::tpm::tests::qemu_extend(&[9; 32]);
+        let primary = VirtualCredential::new(42);
+        let recovery = second.then(|| VirtualCredential::new(43));
+        enroll_worker(&primary, recovery.as_ref());
+        operate(&primary, Role::Primary, None, true, false);
+        operate(&primary, Role::Primary, None, false, false);
+        read_records(b"firstboot fixture");
+        store::lock_session(1000).unwrap();
+        operate(
+            &primary,
+            Role::Primary,
+            Some(b"cancelled fixture"),
+            true,
+            false,
+        );
+        operate(
+            &primary,
+            Role::Primary,
+            Some(b"changed fixture"),
+            false,
+            false,
+        );
+        operate(&primary, Role::Primary, None, false, false);
+        read_records(b"changed fixture");
+        store::lock_session(1000).unwrap();
+        if let Some(recovery) = recovery {
+            operate(
+                &recovery,
+                Role::Recovery,
+                Some(b"recovered fixture"),
+                false,
+                false,
+            );
+            operate(&recovery, Role::Recovery, None, false, false);
+            read_records(b"recovered fixture");
+            store::lock_session(1000).unwrap();
+        } else {
+            operate(&primary, Role::Recovery, None, false, true);
+        }
+        no_release();
+    }
+
+    #[test]
+    #[ignore = "requires qemu-secret --tpm with disposable guest HID devices"]
+    fn qemu_private_workers_enroll_unlock_write_and_cancel_without_recovery() {
+        guard("fido-operations-single");
+        private_operations(false);
+    }
+
+    #[test]
+    #[ignore = "requires qemu-secret --tpm with disposable guest HID devices"]
+    fn qemu_private_workers_enroll_unlock_and_write_with_recovery() {
+        guard("fido-operations-recovery");
+        private_operations(true);
     }
 }
