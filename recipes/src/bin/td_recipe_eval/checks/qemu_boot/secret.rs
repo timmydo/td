@@ -5,7 +5,7 @@ use td_engine::cpio::{self, Entry, Kind};
 #[allow(dead_code)]
 mod fixture;
 
-pub(crate) const TARGETS: &[&str] = &["linux-x86-64", "td-secret-vm-test", "td-secret", "td-init", "td-firstboot", "td-login", "td-compositor", "td-busd", "td-portal", "td-jail"];
+pub(crate) const TARGETS: &[&str] = &["linux-x86-64", "td-secret-vm-test", "td-secret", "td-init", "td-firstboot", "td-login", "td-compositor", "td-busd", "td-portal", "td-jail", "btrfs-progs-x86-64"];
 
 fn output(runner: &RecipeCheckRunner, name: &str) -> Result<PathBuf, String> {
     runner.prepare_recipe_target(name)?;
@@ -42,6 +42,9 @@ pub(crate) fn run(runner: &RecipeCheckRunner, tpm: Option<&Path>) -> Result<(), 
             let built = output(runner, name)?;
             files.push((destination, built.join("bin").join(name)));
         }
+        let btrfs = output(runner, "btrfs-progs-x86-64")?;
+        files.push(("bin/btrfs", btrfs.join("bin/btrfs")));
+        files.push(("bin/mkfs.btrfs", btrfs.join("bin/mkfs.btrfs")));
     }
     let mut contents = Vec::new();
     for (name, path) in &files {
@@ -72,6 +75,14 @@ pub(crate) fn run(runner: &RecipeCheckRunner, tpm: Option<&Path>) -> Result<(), 
             Ok::<_, String>(path)
         })
         .transpose()?;
+    let store_disk = tpm_scratch.as_ref().map(|scratch| {
+        let path = scratch.dir.join("store.img");
+        let file = OpenOptions::new().write(true).create_new(true).open(&path)
+            .map_err(|e| format!("create persistent store fixture disk: {e}"))?;
+        file.set_len(256 * 1024 * 1024)
+            .map_err(|e| format!("size persistent store fixture disk: {e}"))?;
+        Ok::<_, String>(path)
+    }).transpose()?;
     let cases = fixture::CASES.iter().map(|case| (case, false)).chain(
         fixture::TPM_CASES
             .iter()
@@ -113,13 +124,12 @@ pub(crate) fn run(runner: &RecipeCheckRunner, tpm: Option<&Path>) -> Result<(), 
             &kernel,
             &archive,
             BootPlan {
-                disk: tpm_disk
-                    .as_deref()
-                    .filter(|_| name.starts_with("tpm-"))
-                    .map(|path| BootDisk {
-                        path,
-                        read_only: *name != "tpm-seal",
-                    }),
+                disk: if name.starts_with("fido-cold-") {
+                    store_disk.as_deref().map(|path| BootDisk { path, read_only: false })
+                } else {
+                    tpm_disk.as_deref().filter(|_| name.starts_with("tpm-"))
+                        .map(|path| BootDisk { path, read_only: *name != "tpm-seal" })
+                },
                 mem: "512",
                 target_marker: fixture::PASS,
                 kill_on_marker: false,
@@ -176,6 +186,7 @@ pub(crate) fn run(runner: &RecipeCheckRunner, tpm: Option<&Path>) -> Result<(), 
         println!("PASS: guest HID discovery, production worker, signed fixture assertion and challenge refusal through the TPM, keepalive deadline and worker cleanup; no physical USB or token presence claim");
         println!("PASS: production private enrollment, unlock and named-write workers; both recovery policies, commit cancellation, locked writes and credential readback; simulated parent acknowledgements, no desktop or physical-presence claim");
         println!("PASS: production compositor attention, root authority, public sealed-descriptor credential write and generation relocking through virtual keyboard/token devices; jailed application portal retrieval, application isolation and locked refusal; no physical-presence claim");
+        println!("PASS: cold Btrfs @var credential-store reopen with retained TPM state; unchanged bundle, locked jailed retrieval, fresh token assertion and per-application readback; no power-loss or physical-presence claim");
     }
     Ok(())
 }

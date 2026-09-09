@@ -64,6 +64,14 @@ pub const FIDO_CASES: &[(&str, &str)] = &[
         "fido-desktop",
         "fido_device::vm_tests::desktop::qemu_compositor_enrolls_unlocks_and_authorizes_public_credential_write",
     ),
+    (
+        "fido-cold-create",
+        "fido_device::vm_tests::desktop::qemu_desktop_creates_persistent_store",
+    ),
+    (
+        "fido-cold-reopen",
+        "fido_device::vm_tests::desktop::qemu_desktop_reopens_persistent_store_locked",
+    ),
 ];
 pub const PASS: &str = "TD-SECRET-VM-PASS";
 pub const FAIL: &str = "TD-SECRET-VM-FAIL";

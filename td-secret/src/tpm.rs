@@ -756,6 +756,14 @@ pub(crate) mod tests {
 
     impl SigningKey {
         pub(crate) fn new() -> Self {
+            Self::in_hierarchy(NULL, &random().unwrap())
+        }
+
+        pub(crate) fn persistent(unique: &[u8; 32]) -> Self {
+            Self::in_hierarchy(OWNER, unique)
+        }
+
+        fn in_hierarchy(hierarchy: u32, unique: &[u8; 32]) -> Self {
             let mut client = Client::new(Device::open().unwrap());
             let mut public = Vec::new();
             put16(&mut public, 0x23);
@@ -766,7 +774,7 @@ pub(crate) mod tests {
                 put16(&mut public, value);
             }
             let prefix = public.len();
-            put_blob(&mut public, &random().unwrap()).unwrap();
+            put_blob(&mut public, unique).unwrap();
             put_blob(&mut public, &[]).unwrap();
             let mut parameters = Vec::new();
             put_blob(&mut parameters, &[0; 4]).unwrap();
@@ -774,7 +782,7 @@ pub(crate) mod tests {
             put_blob(&mut parameters, &[]).unwrap();
             put32(&mut parameters, 0);
             let (handle, out) = client
-                .call(CREATE_PRIMARY, &[NULL], Some(PASSWORD), &parameters, true)
+                .call(CREATE_PRIMARY, &[hierarchy], Some(PASSWORD), &parameters, true)
                 .unwrap();
             let mut reader = Reader(&out);
             let returned = reader.blob().unwrap();
@@ -795,7 +803,7 @@ pub(crate) mod tests {
             let creation_data = reader.blob().unwrap();
             assert_eq!(reader.blob().unwrap(), crypto::digest(creation_data));
             assert_eq!(reader.u16().unwrap(), 0x8021);
-            assert_eq!(reader.u32().unwrap(), NULL);
+            assert_eq!(reader.u32().unwrap(), hierarchy);
             assert!(matches!(reader.blob().unwrap().len(), 20 | 32 | 48 | 64));
             check_name(returned, reader.blob().unwrap()).unwrap();
             reader.end().unwrap();

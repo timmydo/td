@@ -774,7 +774,7 @@ normal cargo pass with those tests ignored is not TPM integration evidence.
 
 `td-recipe-eval qemu-secret --tpm /absolute/path/to/swtpm` requires the
 same pinned host swtpm described above and adds four cold TPM guest boots
-and the seven HID guests below to the authority checks. The host starts a
+and the nine HID guests below to the authority checks. The host starts a
 private software TPM control socket and attaches QEMU's emulated TIS device; there is no host TPM
 passthrough. The source-built test executable calls the unchanged
 `Device::open` and `Client` implementations through `/dev/tpmrm0`.
@@ -802,7 +802,7 @@ credential-store write. The stock deployment remains unenrolled.
 
 ### HID through the QEMU guest kernel
 
-The same optional command runs seven further isolated guests using a
+The same optional command runs nine further isolated guests using a
 test-only virtual token created through Linux
 [UHID](https://docs.kernel.org/hid/uhid.html). The fixture requires its
 kernel opt-in and exact case selector before opening `/dev/uhid`, then
@@ -835,7 +835,8 @@ retirement and disappearance of the virtual hidraw node after the fixture
 closes its UHID descriptor. Fixture event reads are nonblocking, its thread
 has a fifteen-second lifetime, and Drop stops and joins that thread.
 Every guest also retains the outer 180-second boot bound and exact one-test
-passing-summary requirement. The FIDO guests have no persistent disk.
+passing-summary requirement. Only the two cold desktop guests described
+below attach a persistent filesystem disk.
 
 This is evidence for kernel HID transport, production worker ownership,
 assertion verification and deadline refusal. The USB metadata and presence
@@ -1002,6 +1003,45 @@ covers future retrieval, not application memory erasure.
 
 This remains a disposable initramfs and software-device test, not a
 cold-disk or physical-presence claim.
+
+
+### Complete store across a cold desktop boot
+
+The additional `fido-cold-create` and `fido-cold-reopen` guests share one
+fresh 256-MiB disk and retained emulator state. The guest uses td-built
+btrfs-progs to create a Btrfs `@var` subvolume and mounts it at `/var` with
+nosuid,nodev. Each guest starts from a fresh initramfs and `/run`; distinct
+kernel boot IDs establish that the second run is a new boot. Both guests
+must unmount `/var` successfully before their normal poweroff.
+
+Creation repeats the full desktop enrollment, public write, jailed retrieval
+and generation-relock sequence with the explicitly unrecoverable policy.
+It persists the encrypted bundle's digest and the public assertion challenges
+beside the fixture's account ledger. Application control/response files are
+removed after the jailed helpers exit, before unmount. The second guest
+requires the same encrypted bundle and ledger, with no file master or old
+individual records. Fixture setup never initializes or writes that store.
+Before any token command, fresh mail and news requests must receive the
+portal's exact unavailable refusal. A fresh secure-attention unlock then
+permits mail's written credential and private record, preserves news's distinct
+credential, and refuses news access to the private mail name. Compositor loss
+must relock later requests. Unlock and retrieval must leave the bundle intact.
+
+The disposable virtual-token signer uses an owner-hierarchy primary with a
+persisted random public template input, so retained TPM state reconstructs
+its key. The reopened public key must match the first guest's key. This is a
+test-only signer; production token transport and TPM sealing are unchanged.
+The second guest's assertion challenge must be nonzero and differ from every
+creation/proof/assertion challenge recorded by the first guest. The expected
+CTAP sequence permits no automatic enrollment or assertion before attention.
+
+This proves orderly cold persistence and desktop release in QEMU. The fixture
+regenerates immutable account/package scaffolding, not a full installed
+system deployment; it does not exercise the system image's firstboot path.
+The virtual token and sealed store share an emulator, so this does not prove
+independent physical devices, token presence, TPM seed recovery, changed-PCR
+migration, rollback resistance or abrupt power-loss behavior. The independent
+worker guests continue to cover both recovery policies.
 
 
 ## Portal evidence

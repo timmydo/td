@@ -1758,10 +1758,9 @@ mod vm_tests {
         fs::read("/var/lib/td/secrets/1000/sealed").unwrap()
     }
 
-    fn prepare_operation_store() {
+    fn prepare_operation_accounts() {
         use std::os::unix::fs::PermissionsExt;
         assert!(!std::path::Path::new("/etc/td-principals.tsv").exists());
-        assert!(!store::user_path(1000).exists());
         fs::create_dir_all("/etc").unwrap();
         for (name, text, mode) in [
             ("td-principals.tsv", "td-principals-v1\nsession\t1000\t993\t992\t991\napplication\t1000\tmail\t65537\n", 0o444),
@@ -1773,6 +1772,11 @@ mod vm_tests {
             fs::write(&path, text).unwrap();
             fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
         }
+    }
+
+    fn prepare_operation_store() {
+        prepare_operation_accounts();
+        assert!(!store::user_path(1000).exists());
         fs::create_dir_all("/var/lib/td/secrets").unwrap();
         let store = store::Store::open_owned(&store::user_path(1000), 1000, 991, true).unwrap();
         store.set("mail", "main", b"firstboot fixture").unwrap();
@@ -2091,7 +2095,7 @@ mod vm_tests {
                 .join("home")
         }
 
-        fn setup_portal() {
+        fn setup_portal(reopen: bool) {
             for (path, owner, mode) in [
                 ("/run/td-bus", 0, 0o755),
                 ("/run/td-bus/1000", 992, 0o755),
@@ -2127,12 +2131,14 @@ mod vm_tests {
                             OpenOptions::new().append(true).open(format!("/etc/{name}"))
                                 .unwrap().write_all(text.as_bytes()).unwrap();
                         }
-            fs::copy("/etc/td-principals.tsv", "/var/lib/td/principals.tsv").unwrap();
-            fs::set_permissions(
-                "/var/lib/td/principals.tsv",
-                fs::Permissions::from_mode(0o600),
-            )
-            .unwrap();
+            if reopen {
+                assert_eq!(fs::read("/etc/td-principals.tsv").unwrap(),
+                    fs::read("/var/lib/td/principals.tsv").unwrap());
+            } else {
+                fs::copy("/etc/td-principals.tsv", "/var/lib/td/principals.tsv").unwrap();
+                fs::set_permissions("/var/lib/td/principals.tsv",
+                    fs::Permissions::from_mode(0o600)).unwrap();
+            }
             fs::write(
                 "/etc/td-bus-applications.tsv",
                 "td-bus-applications-v1\t1000\n65537\tmail\t\n65538\tnews\t\n",
@@ -2198,8 +2204,10 @@ mod vm_tests {
             fs::write("/etc/td-applications.tsv", registry).unwrap();
             std::os::unix::fs::symlink("/bin/td-init", "/bin/umount").unwrap();
             application_files("prepare-application-files");
-            let store = crate::owned_store(1000).unwrap();
-            store.set("mail", "private", b"mail-only fixture").unwrap();
+            if !reopen {
+                let store = crate::owned_store(1000).unwrap();
+                store.set("mail", "private", b"mail-only fixture").unwrap();
+            }
         }
 
         fn application_files(operation: &str) {
@@ -2356,6 +2364,9 @@ mod vm_tests {
                     status.is_some()
                 });
                 assert!(status.unwrap().success());
+                for name in ["ready", "request", "response", "stop"] {
+                    fs::remove_file(self.home.join(name)).unwrap();
+                }
             }
         }
 
@@ -2592,23 +2603,12 @@ mod vm_tests {
             }
         }
 
-        fn setup() {
-            prepare_operation_store();
-            for (name, text, mode) in [
-                (
-                    "/var/lib/td/principals.tsv",
-                    fs::read_to_string("/etc/td-principals.tsv").unwrap(),
-                    0o600,
-                ),
-                (
-                    "/etc/td-bus-applications.tsv",
-                    "td-bus-applications-v1\t1000\n65537\tmail\t\n".into(),
-                    0o444,
-                ),
-            ] {
-                fs::write(name, text).unwrap();
-                fs::set_permissions(name, fs::Permissions::from_mode(mode)).unwrap();
-            }
+        fn setup(reopen: bool) {
+            if reopen { prepare_operation_accounts(); } else { prepare_operation_store(); }
+            fs::write("/etc/td-bus-applications.tsv",
+                "td-bus-applications-v1\t1000\n65537\tmail\t\n").unwrap();
+            fs::set_permissions("/etc/td-bus-applications.tsv",
+                fs::Permissions::from_mode(0o444)).unwrap();
             for (name, text) in [
                 (
                     "passwd",
@@ -2652,6 +2652,10 @@ mod vm_tests {
         #[ignore = "requires qemu-secret --tpm with a disposable desktop and HID devices"]
         fn qemu_compositor_enrolls_unlocks_and_authorizes_public_credential_write() {
             guard("fido-desktop");
+            desktop_roundtrip(false);
+        }
+
+        fn desktop_roundtrip(persistent: bool) {
             let _diagnostics = Diagnostics;
             assert!(Command::new("/bin/td-init")
                 .args(["hostname", "td-secret-fixture"])
@@ -2659,13 +2663,15 @@ mod vm_tests {
             let mut keyboard = Keyboard::new();
             // Mail's declared idmapped view needs a mountable backing filesystem.
             fs::create_dir_all("/var").unwrap();
-            assert!(Command::new("/bin/td-init")
-                .args(["mount", "-t", "tmpfs", "-o", "nosuid,nodev,mode=0755", "tmpfs", "/var"])
-                .status().unwrap().success());
-            setup();
-            setup_portal();
+            if persistent {
+                mount_persistent_var(true);
+            } else {
+                applet(&["mount", "-t", "tmpfs", "-o", "nosuid,nodev,mode=0755", "tmpfs", "/var"]);
+            }
+            setup(false);
+            setup_portal(false);
             crate::tpm::tests::qemu_extend(&[9; 32]);
-            let token = VirtualCredential::new(44);
+            let token = if persistent { persistent_token(true) } else { VirtualCredential::new(44) };
             let requests = Arc::new(AtomicUsize::new(0));
             let observed = Arc::clone(&requests);
             let mut challenges = std::collections::BTreeSet::new();
@@ -2681,6 +2687,11 @@ mod vm_tests {
                         .bytes().unwrap().try_into().unwrap();
                     assert_ne!(hash, [0; 32]);
                     assert!(challenges.insert(hash), "desktop reused a token challenge");
+                    if persistent {
+                        OpenOptions::new().append(true).create(true)
+                            .mode(0o600).open(format!("{COLD_STATE}/challenges")).unwrap()
+                            .write_all(&hash).unwrap();
+                    }
                 }
                 observed.store(index + 1, Ordering::SeqCst);
             });
@@ -2779,6 +2790,128 @@ mod vm_tests {
             portal.finish();
             application_files("release-application-files");
             assert_eq!(hid.finish(), (9, 0));
+            if persistent {
+                fs::write(format!("{COLD_STATE}/bundle-hash"), crate::crypto::digest(&sealed_bytes())).unwrap();
+                fs::copy("/proc/sys/kernel/random/boot_id", format!("{COLD_STATE}/boot-id")).unwrap();
+                applet(&["umount", "/var"]);
+            }
+        }
+
+        const COLD_STATE: &str = "/var/lib/td/secret-fixture";
+
+        fn applet(args: &[&str]) {
+            assert!(Command::new("/bin/td-init").args(args).status().unwrap().success(), "{args:?}");
+        }
+
+        fn mount_persistent_var(create: bool) {
+            assert!(fs::metadata("/dev/vda").unwrap().file_type().is_block_device());
+            fs::create_dir_all("/var").unwrap();
+            if create {
+                let mut prefix = [0; 4096];
+                File::open("/dev/vda").unwrap().read_exact(&mut prefix).unwrap();
+                assert_eq!(prefix, [0; 4096], "fixture disk is not fresh");
+                assert!(Command::new("/bin/mkfs.btrfs").args(["-q", "/dev/vda"])
+                    .status().unwrap().success());
+                fs::create_dir("/volume").unwrap();
+                applet(&["mount", "-t", "btrfs", "-o", "nosuid,nodev", "/dev/vda", "/volume"]);
+                assert!(Command::new("/bin/btrfs").args(["subvolume", "create", "/volume/@var"])
+                    .status().unwrap().success());
+                applet(&["umount", "/volume"]);
+            }
+            applet(&["mount", "-t", "btrfs", "-o", "nosuid,nodev,subvol=@var", "/dev/vda", "/var"]);
+            assert!(fs::read_to_string("/proc/self/mountinfo").unwrap().lines().any(|line| {
+                let fields: Vec<_> = line.split_whitespace().collect();
+                fields.get(3) == Some(&"/@var") && fields.get(4) == Some(&"/var")
+                    && fields.get(5).is_some_and(|options|
+                        ["rw", "nosuid", "nodev"].iter().all(|required|
+                            options.split(',').any(|option| option == *required)))
+                    && line.contains(" - btrfs ")
+            }));
+        }
+
+        fn persistent_token(create: bool) -> VirtualCredential {
+            if create {
+                directory(COLD_STATE, 0, 0o700);
+                fs::write(format!("{COLD_STATE}/token-seed"), fresh()).unwrap();
+            }
+            let seed: [u8; 32] = fs::read(format!("{COLD_STATE}/token-seed")).unwrap().try_into().unwrap();
+            let signer = crate::tpm::tests::SigningKey::persistent(&seed);
+            let public = format!("{COLD_STATE}/token-public");
+            if create { fs::write(public, &signer.cose).unwrap(); }
+            else { assert_eq!(fs::read(public).unwrap(), signer.cose, "cold token changed key"); }
+            VirtualCredential { id: vec![44; 32], signer: Arc::new(std::sync::Mutex::new(signer)) }
+        }
+
+        #[test]
+        #[ignore = "requires qemu-secret --tpm with disposable persistent disk"]
+        fn qemu_desktop_creates_persistent_store() {
+            guard("fido-cold-create");
+            desktop_roundtrip(true);
+        }
+
+        #[test]
+        #[ignore = "requires qemu-secret --tpm after the persistent creation guest"]
+        fn qemu_desktop_reopens_persistent_store_locked() {
+            guard("fido-cold-reopen");
+            let _diagnostics = Diagnostics;
+            applet(&["hostname", "td-secret-fixture"]);
+            let mut keyboard = Keyboard::new();
+            mount_persistent_var(false);
+            assert_ne!(fs::read("/proc/sys/kernel/random/boot_id").unwrap(),
+                fs::read(format!("{COLD_STATE}/boot-id")).unwrap());
+            let before = sealed_bytes();
+            assert_eq!(crate::crypto::digest(&before).as_slice(),
+                fs::read(format!("{COLD_STATE}/bundle-hash")).unwrap());
+            for name in ["master", "mail.main", "news.main", "mail.private"] {
+                assert!(!store::user_path(1000).join(name).exists());
+            }
+            no_release();
+            setup(true);
+            setup_portal(true);
+            assert_eq!(sealed_bytes(), before, "reopen setup rewrote the store");
+            crate::tpm::tests::qemu_extend(&[9; 32]);
+            let token = persistent_token(false);
+            let prior = fs::read(format!("{COLD_STATE}/challenges")).unwrap();
+            assert_eq!(prior.len(), 5 * 32);
+            let requests = Arc::new(AtomicUsize::new(0));
+            let observed = Arc::clone(&requests);
+            let hid = token.checked(move |request, index| {
+                assert_eq!(request[0], [4, 2][index]);
+                if request[0] == 2 {
+                    use crate::fido_cbor::{self, Value};
+                    let value = fido_cbor::decode(&request[1..]).unwrap();
+                    let hash = value.required(&Value::Unsigned(2)).unwrap().bytes().unwrap();
+                    assert_eq!(hash.len(), 32);
+                    assert_ne!(hash, [0; 32]);
+                    assert!(!prior.as_chunks::<32>().0.iter().any(|old| old == hash), "cold unlock replayed a challenge");
+                }
+                observed.store(index + 1, Ordering::SeqCst);
+            });
+            let pair = Pair::start();
+            let mut portal = Portal::start();
+            let mut mail = Application::start(65537, "mail");
+            let mut news = Application::start(65538, "news");
+            mail.retrieve("main", "unavailable");
+            news.retrieve("main", "unavailable");
+            assert_eq!(requests.load(Ordering::SeqCst), 0);
+            keyboard.select(0x18);
+            wait("cold desktop unlock", || Path::new("/run/td-secret/1000/key").exists());
+            read_released(b"desktop fixture");
+            assert_eq!(requests.load(Ordering::SeqCst), 2);
+            mail.retrieve("main", "desktop fixture");
+            mail.retrieve("private", "mail-only fixture");
+            news.retrieve("main", "untouched fixture");
+            news.retrieve("private", "unavailable");
+            pair.disconnect();
+            portal.live();
+            mail.retrieve("main", "unavailable");
+            mail.finish();
+            news.finish();
+            portal.finish();
+            application_files("release-application-files");
+            assert_eq!(hid.finish(), (2, 0));
+            assert_eq!(sealed_bytes(), before, "cold unlock rewrote the store");
+            applet(&["umount", "/var"]);
         }
     }
 }
