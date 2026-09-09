@@ -5,7 +5,7 @@ use crate::dialog::{Close, Closed, Conflict, Scope, Target};
 use crate::font::Font;
 use crate::keyboard::{Keymap, Modifiers};
 use crate::keys::Profile;
-use crate::render::{Draw, Geometry, GlyphStyle, Label, Primitive, Raster, CHROME, INK};
+use crate::render::{CHROME, Draw, Geometry, GlyphStyle, INK, Label, Primitive, Raster};
 use crate::seat::Input;
 use crate::ui::{Controller, Event, Outcome};
 use crate::wire::{self, Builder, Cursor, Message};
@@ -370,6 +370,7 @@ struct Window {
 }
 
 enum ControlFile {
+    Delete(u64),
     Open(u64),
     Save(u64),
     Reload(u64),
@@ -384,6 +385,7 @@ enum ControlAnswer {
 }
 
 enum PathAction {
+    Delete(DeletePrompt),
     Open,
     Dictionary,
     Rename(crate::files::RenameSource),
@@ -402,14 +404,70 @@ struct PathIdentity {
     id: u64,
     point: crate::model::RevisionPoint,
 }
+
+struct DeletePrompt {
+    plan: crate::files::DeletePlan,
+    page: usize,
+}
+
+impl DeletePrompt {
+    fn lines(&self, columns: usize, page: usize) -> (usize, Vec<String>) {
+        let mut lines = Vec::new();
+        let start = page.saturating_mul(2);
+        let mut total = 0usize;
+        for (index, path) in self.plan.paths().enumerate() {
+            let mut line = format!("{}: ", index + 1);
+            for byte in path.as_os_str().as_encoded_bytes() {
+                line.extend(std::ascii::escape_default(*byte).map(char::from));
+            }
+            for chunk in line.as_bytes().chunks(columns.clamp(1, 64)) {
+                if (start..start.saturating_add(2)).contains(&total) {
+                    lines.push(String::from_utf8_lossy(chunk).into_owned());
+                }
+                total += 1;
+            }
+        }
+        (total, lines)
+    }
+
+    fn page(&mut self, backward: bool, columns: usize) {
+        let last = self.lines(columns, 0).0.saturating_sub(1) / 2;
+        let page = self.page.min(last);
+        self.page = if backward {
+            page.saturating_sub(1)
+        } else {
+            page.saturating_add(1).min(last)
+        };
+    }
+
+    fn notice(&self, text: &str, columns: usize) -> String {
+        let (total, _) = self.lines(columns, 0);
+        let page = self.page.min(total.saturating_sub(1) / 2);
+        let preview = self.lines(columns, page).1.join("\n");
+        format!(
+            "Delete {} permanently; NO UNDO\nPage {}/{}; PgUp/PgDn\n{preview}\nType DELETE+Return; Esc cancels\n{}|",
+            self.plan.len(),
+            page + 1,
+            total.div_ceil(2),
+            text.chars().take(16).collect::<String>()
+        )
+    }
+}
 impl PathPrompt {
-    fn completion_notice(&self, columns: usize, rows: usize, paused: &str, closing: bool) -> String {
+    fn completion_notice(
+        &self,
+        columns: usize,
+        rows: usize,
+        paused: &str,
+        closing: bool,
+    ) -> String {
         let columns = columns.clamp(1, 72);
         let action = match self.action {
             PathAction::Open => "Open",
             PathAction::Dictionary => "Dictionary",
             PathAction::Save { .. } => "Save As",
             PathAction::Rename(_) => "Rename",
+            PathAction::Delete(_) => "Delete",
         };
         let header = if !paused.is_empty() {
             paused.to_string()
@@ -448,19 +506,33 @@ impl PathPrompt {
         let action = match &self.action {
             PathAction::Open => "Open",
             PathAction::Dictionary => "Dictionary (read only)",
+            PathAction::Delete(review) => return review.notice(&self.text, 64),
             PathAction::Save { .. } => "Save As (new path only)",
             PathAction::Rename(source) => {
                 let label: String = format!(
                     "{:?}",
-                    source.path().file_name().unwrap_or(source.path().as_os_str())
+                    source
+                        .path()
+                        .file_name()
+                        .unwrap_or(source.path().as_os_str())
                 )
                 .chars()
                 .take(80)
                 .collect();
-                return format!("Rename {label}\nNew basename only; existing names refused\nReturn: submit; Escape/Ctrl+G: cancel; Ctrl+U: clear\n{tail}|");
+                return format!(
+                    "Rename {label}\nNew basename only; existing names refused\nReturn: submit; Escape/Ctrl+G: cancel; Ctrl+U: clear\n{tail}|"
+                );
             }
         };
-        format!("{action}: literal path; Tab completes; no shell expansion\nReturn: submit; Escape/Ctrl+G: cancel; Ctrl+U: clear\n{}{}|", if tail.len() < self.text.len() { "..." } else { "" }, tail)
+        format!(
+            "{action}: literal path; Tab completes; no shell expansion\nReturn: submit; Escape/Ctrl+G: cancel; Ctrl+U: clear\n{}{}|",
+            if tail.len() < self.text.len() {
+                "..."
+            } else {
+                ""
+            },
+            tail
+        )
     }
 }
 
@@ -890,7 +962,7 @@ impl Window {
                 return Err(format!(
                     "unexpected Wayland event {}:{}",
                     message.object, message.opcode
-                ))
+                ));
             }
         }
         cursor.finish()
@@ -1417,17 +1489,32 @@ impl Window {
         let doc = self.ui.editor().document(tab).map_err(error)?;
         let revision = doc.revision();
         let directory = doc.directory();
-        if directory && !self.ui.keys().pending() && matches!(chord, "w" | "s" | "S" | "R") {
+        if directory
+            && !self.ui.keys().pending()
+            && matches!(chord, "w" | "s" | "S" | "R" | "d" | "u" | "x")
+        {
             if !repeated {
                 if chord == "w" {
                     self.clipboard_request("copy-entry-path", tab, revision)?;
                 } else if chord == "R" {
                     self.rename_request(tab, revision);
+                } else if chord == "x" {
+                    self.delete_request(tab, revision);
+                } else if matches!(chord, "d" | "u") {
+                    self.mark_directory(tab, revision, chord == "d");
                 } else {
                     let directory = self.files.as_ref().and_then(|files| files.directory(tab));
                     if let Some(directory) = directory {
-                        let sort = if chord == "s" { directory.sort.next() } else { directory.sort };
-                        let reverse = if chord == "S" { !directory.reverse } else { directory.reverse };
+                        let sort = if chord == "s" {
+                            directory.sort.next()
+                        } else {
+                            directory.sort
+                        };
+                        let reverse = if chord == "S" {
+                            !directory.reverse
+                        } else {
+                            directory.reverse
+                        };
                         self.sort_directory(tab, revision, sort, reverse);
                     }
                 }
@@ -1630,6 +1717,9 @@ impl Window {
                     ControlFile::Rename(id) => self
                         .control_jobs
                         .renamed(id, result.as_ref().map(|_| ()).map_err(|error| error.code)),
+                    ControlFile::Delete(id) => self
+                        .control_jobs
+                        .deleted(id, result.as_ref().map(|_| ()).map_err(|error| error.code)),
                 };
                 if let Err(detail) = outcome {
                     job_error = Some(detail);
@@ -2551,6 +2641,39 @@ impl Window {
         Ok(id)
     }
 
+    fn control_delete_job(
+        &mut self,
+        target: Target,
+        plan: crate::files::DeletePlan,
+    ) -> crate::Result<u64> {
+        if self.files.as_ref().is_none_or(|files| files.busy()) || self.control_file_job.is_some() {
+            return Err(crate::Error::Unavailable);
+        }
+        self.ui
+            .editor()
+            .revision_point(target.tab, target.revision)?;
+        self.ui.generation().checked_add(2).ok_or(crate::Error::Exhausted)?;
+        let files = self.files.as_mut().ok_or(crate::Error::Unavailable)?;
+        let id = self
+            .control_jobs
+            .begin_delete(target.tab, target.revision)?;
+        let notice = match files.delete(&self.ui, target.tab, target.revision, plan) {
+            Ok(()) => {
+                self.control_file_job = Some(ControlFile::Delete(id));
+                "Deletion submitted; cannot cancel or undo".into()
+            }
+            Err(detail) => {
+                self.control_jobs
+                    .deleted(id, Err(crate::Error::Unavailable))?;
+                format!("Deletion refused: {detail}")
+            }
+        };
+        self.stop_pointer();
+        self.control_mutation_accepted();
+        self.notify(notice);
+        Ok(id)
+    }
+
     fn control_rename_job(
         &mut self,
         target: Target,
@@ -2715,6 +2838,12 @@ impl Window {
             PathAction::Rename(source) => {
                 self.control_rename_job(target, source.clone(), path.into_os_string())?
             }
+            PathAction::Delete(review) => {
+                if path.as_os_str().as_encoded_bytes() != b"DELETE" {
+                    return Err(crate::Error::InvalidArgument);
+                }
+                self.control_delete_job(target, review.plan.clone())?
+            }
         };
         self.prompt = None;
         Ok(ControlAnswer::Job(id))
@@ -2870,6 +2999,7 @@ impl Window {
                         PathAction::Dictionary => "path-dictionary",
                         PathAction::Save { .. } => "path-save-as",
                         PathAction::Rename(_) => "path-rename",
+                        PathAction::Delete(_) => "path-delete",
                     };
                     if self.ui.editor().check_revision(&identity.point).is_ok() {
                         fields.push_str(&format!(
@@ -2959,6 +3089,7 @@ impl Window {
                 PathAction::Save { .. } if prompt.identity.is_none() => "close-save-as",
                 PathAction::Save { .. } => "path-save-as",
                 PathAction::Rename(_) => "path-rename",
+                PathAction::Delete(_) => "path-delete",
             };
             snapshot.field = "text";
             snapshot.text = &prompt.text;
@@ -3024,6 +3155,23 @@ impl Window {
             || crate::path_completion::State::Idle.fields(self.completion_rows()),
             |prompt| prompt.completion.fields(self.completion_rows()),
         ));
+        if let Some(PathPrompt {
+            action: PathAction::Delete(review),
+            ..
+        }) = &self.prompt
+        {
+            fields.push_str(&format!(
+                "\tdelete-count={}\tdelete-page={}",
+                review.plan.len(),
+                review.page
+            ));
+            for (index, path) in review.plan.paths().enumerate() {
+                fields.push_str(&format!(
+                    "\tdelete-entry={index},{}",
+                    crate::control::hex(path.as_os_str().as_encoded_bytes())
+                ));
+            }
+        }
         Ok(fields)
     }
 
@@ -3037,12 +3185,21 @@ impl Window {
                             directory.len(),
                             crate::control::hex(directory.path.as_os_str().as_encoded_bytes())
                         ));
-                        response.push_str(&format!("\tdirectory-sort={tab},{},{}",
-                            directory.sort.label(), u8::from(directory.reverse)));
+                        response.push_str(&format!(
+                            "\tdirectory-sort={tab},{},{}",
+                            directory.sort.label(),
+                            u8::from(directory.reverse)
+                        ));
+                        response
+                            .push_str(&format!("\tdirectory-marks={tab},{}", directory.marked()));
                         if let Some(path) = (self.ui.editor().active() == Some(tab))
-                            .then(|| self.directory_entry_path(tab)).flatten() {
-                            response.push_str(&format!("\tdirectory-entry={tab},{}",
-                                crate::control::hex(path.as_os_str().as_encoded_bytes())));
+                            .then(|| self.directory_entry_path(tab))
+                            .flatten()
+                        {
+                            response.push_str(&format!(
+                                "\tdirectory-entry={tab},{}",
+                                crate::control::hex(path.as_os_str().as_encoded_bytes())
+                            ));
                         }
                     }
                 }
@@ -3581,6 +3738,14 @@ impl Window {
                 self.rename_request(tab, revision);
                 return Ok(());
             }
+            Item::MarkDelete | Item::UnmarkDelete => {
+                self.mark_directory(tab, revision, item == Item::MarkDelete);
+                return Ok(());
+            }
+            Item::DeleteMarked => {
+                self.delete_request(tab, revision);
+                return Ok(());
+            }
             Item::Cut | Item::Copy | Item::CopyPath | Item::CopyEntryPath | Item::Paste => {
                 self.clipboard_request(
                     match item {
@@ -3944,7 +4109,7 @@ impl Window {
             Err(detail) => {
                 return Some(format!(
                     "Conflict question changed.\n{detail}\nEscape/Ctrl+G cancels.\nRetry Save."
-                ))
+                ));
             }
         };
         let identity = format!("Tab {}", target.tab);
@@ -4010,29 +4175,51 @@ impl Window {
             ""
         };
         if self.closing_save {
-            return Some(format!("{readiness}Saving before close...\nEscape/Ctrl+G: Cancel closing (the Save still finishes)\nOther commands wait; no pending write is discarded."));
+            return Some(format!(
+                "{readiness}Saving before close...\nEscape/Ctrl+G: Cancel closing (the Save still finishes)\nOther commands wait; no pending write is discarded."
+            ));
         }
         match close.next(self.ui.editor()) {
             Ok(Some(target)) => {
-                let title = self.files.as_ref().and_then(|f| f.labels().find(|(tab, _)| *tab == target.tab).map(|(_, label)| label)).unwrap_or("Untitled");
+                let title = self
+                    .files
+                    .as_ref()
+                    .and_then(|f| {
+                        f.labels()
+                            .find(|(tab, _)| *tab == target.tab)
+                            .map(|(_, label)| label)
+                    })
+                    .unwrap_or("Untitled");
                 let identity = format!("Tab {}", target.tab);
                 if !readiness.is_empty() {
                     return Some(format!("{identity}\n{readiness}"));
                 }
                 if !self.close_answer_visible() {
-                    return Some(format!("{identity}\nEnlarge window to answer close.\nEscape/Ctrl+G cancels closing."));
+                    return Some(format!(
+                        "{identity}\nEnlarge window to answer close.\nEscape/Ctrl+G cancels closing."
+                    ));
                 }
                 let short: String = title.chars().take(27).collect();
                 let suffix = if short.len() < title.len() { "..." } else { "" };
-                Some(format!("{identity}\n{short}{suffix}\nCtrl+S: Save\nCtrl+D: Discard this tab\nEsc/Ctrl+G: Cancel closing\ncompleted saves stay saved"))
+                Some(format!(
+                    "{identity}\n{short}{suffix}\nCtrl+S: Save\nCtrl+D: Discard this tab\nEsc/Ctrl+G: Cancel closing\ncompleted saves stay saved"
+                ))
             }
             Ok(None) => None,
-            Err(detail) => Some(format!("Close request changed ({detail}); Escape/Ctrl+G cancels.\nNo unapproved edits will be discarded.")),
+            Err(detail) => Some(format!(
+                "Close request changed ({detail}); Escape/Ctrl+G cancels.\nNo unapproved edits will be discarded."
+            )),
         }
     }
 
     fn path_notice(&self) -> Option<String> {
         let prompt = self.prompt.as_ref()?;
+        if let PathAction::Delete(review) = &prompt.action {
+            if !self.deletion_question_visible() {
+                return Some("Deletion paused: enlarge window.\nEscape cancels; files unchanged.".into());
+            }
+            return Some(review.notice(&prompt.text, self.path_columns()));
+        }
         if !matches!(prompt.completion, crate::path_completion::State::Idle) {
             let paused = if self.device.is_none() || self.input.map.is_none() {
                 "Path entry paused: restore keyboard/keymap"
@@ -4134,8 +4321,74 @@ impl Window {
 
     fn directory_entry_path(&self, tab: crate::model::TabId) -> Option<PathBuf> {
         let doc = self.ui.editor().document(tab).ok()?;
-        let row = doc.text().get(..doc.selection().caret)?.bytes().filter(|b| *b == b'\n').count();
+        let row = doc
+            .text()
+            .get(..doc.selection().caret)?
+            .bytes()
+            .filter(|b| *b == b'\n')
+            .count();
         self.files.as_ref()?.directory(tab)?.entry(row)
+    }
+
+    fn mark_directory(&mut self, tab: crate::model::TabId, revision: u64, delete: bool) {
+        let result = self
+            .files
+            .as_mut()
+            .ok_or_else(|| "Not a file window".to_string())
+            .and_then(|files| files.mark_directory(&mut self.ui, tab, revision, delete));
+        match result {
+            Ok(()) => {
+                self.menu = None;
+                self.stop_pointer();
+                self.control_mutation_accepted();
+                self.notify(if delete {
+                    "Marked for deletion; x reviews, u unmarks"
+                } else {
+                    "Deletion mark removed"
+                });
+            }
+            Err(detail) => self.notify(format!("Mark refused: {detail}")),
+        }
+    }
+
+    fn delete_request(&mut self, tab: crate::model::TabId, revision: u64) {
+        let prepared = (|| -> Result<(crate::files::DeletePlan, PathIdentity)> {
+            let files = self.files.as_ref().ok_or("Not a file window")?;
+            if files.busy() {
+                return Err("File operation pending; wait before deletion".into());
+            }
+            let plan = files
+                .directory(tab)
+                .ok_or("Not a directory tab")?
+                .delete_plan()?;
+            let point = self
+                .ui
+                .editor()
+                .revision_point(tab, revision)
+                .map_err(error)?;
+            let id = self
+                .last_dialog_id
+                .checked_add(1)
+                .ok_or("Dialog counter exhausted")?;
+            Ok((plan, PathIdentity { id, point }))
+        })();
+        match prepared {
+            Ok((plan, identity)) => {
+                self.last_dialog_id = identity.id;
+                self.menu = None;
+                self.notice = None;
+                self.stop_pointer();
+                self.input.cancel_repeat();
+                self.prompt = Some(PathPrompt {
+                    action: PathAction::Delete(DeletePrompt { plan, page: 0 }),
+                    text: String::new(),
+                    identity: Some(identity),
+                    completion: crate::path_completion::State::Idle,
+                });
+                self.frames.invalidate(true);
+            }
+            Err(detail) => self.notify(format!("Deletion refused: {detail}")),
+        }
     }
 
     fn rename_request(&mut self, tab: crate::model::TabId, revision: u64) {
@@ -4292,6 +4545,16 @@ impl Window {
         }
     }
 
+    fn deletion_question_visible(&self) -> bool {
+        self.path_columns() >= 32
+            && self.ui.geometry().dimensions().1 >= 168 * self.ui.geometry().scale().value()
+    }
+
+    fn path_columns(&self) -> usize {
+        let scale = self.ui.geometry().scale().value();
+        (self.ui.geometry().dimensions().0.saturating_sub(16 * scale) / (8 * scale)).clamp(1, 64)
+    }
+
     fn path_chord(&mut self, chord: &str, repeated: bool) {
         if repeated {
             return;
@@ -4313,6 +4576,30 @@ impl Window {
             "Return" => {
                 if prompt.text.is_empty() {
                     self.prompt = Some(prompt);
+                    return;
+                }
+                if let PathAction::Delete(review) = &prompt.action {
+                    if prompt.text != "DELETE" || !self.deletion_question_visible() {
+                        self.prompt = Some(prompt);
+                        return;
+                    }
+                    let result = prompt
+                        .identity
+                        .as_ref()
+                        .ok_or(crate::Error::Unavailable)
+                        .and_then(|identity| {
+                            self.ui.editor().check_revision(&identity.point)?;
+                            self.control_delete_job(
+                                Target {
+                                    tab: identity.point.tab,
+                                    revision: identity.point.revision,
+                                },
+                                review.plan.clone(),
+                            )
+                        });
+                    if let Err(detail) = result {
+                        self.notify(format!("Deletion refused: {detail}"));
+                    }
                     return;
                 }
                 if let PathAction::Rename(source) = &prompt.action {
@@ -4347,6 +4634,7 @@ impl Window {
                     }
                     // Rename returns above through its pinned job helper.
                     PathAction::Rename(_) => Err("Rename requires a pinned source".into()),
+                    PathAction::Delete(_) => Err("Deletion requires a confirmed plan".into()),
                 };
                 let close_failed = self.closing.is_some() && result.is_err();
                 if self.closing.is_some() {
@@ -4370,6 +4658,14 @@ impl Window {
                 prompt.completion = crate::path_completion::State::Idle;
             }
             "Tab" | "S-Tab" | "Up" | "Down" | "PageUp" | "PageDown" => {
+                if let PathAction::Delete(review) = &mut prompt.action {
+                    review.page(
+                        matches!(chord, "S-Tab" | "Up" | "PageUp"),
+                        self.path_columns(),
+                    );
+                    self.prompt = Some(prompt);
+                    return;
+                }
                 if matches!(prompt.action, PathAction::Rename(_)) {
                     self.prompt = Some(prompt);
                     return;
@@ -4422,21 +4718,28 @@ impl Window {
     }
 
     fn completed_path(&mut self, id: u64, result: Result<crate::path_completion::Matches>) {
-        let Some(prompt) = &mut self.prompt else { return };
-        if !matches!(prompt.completion, crate::path_completion::State::Pending(pending) if pending == id) {
+        let Some(prompt) = &mut self.prompt else {
+            return;
+        };
+        if !matches!(prompt.completion, crate::path_completion::State::Pending(pending) if pending == id)
+        {
             return;
         }
         let current = if let Some(identity) = &prompt.identity {
             self.ui.editor().check_revision(&identity.point).is_ok()
         } else {
-            self.closing.as_ref().is_some_and(|closing| matches!(closing.next(self.ui.editor()), Ok(Some(_))))
+            self.closing
+                .as_ref()
+                .is_some_and(|closing| matches!(closing.next(self.ui.editor()), Ok(Some(_))))
         };
         prompt.completion = match result {
             Ok(matches) if current => {
                 prompt.text = matches.prefix().to_string();
                 crate::path_completion::State::Ready(matches)
             }
-            Ok(_) => crate::path_completion::State::Failed("document changed; reopen the path prompt".into()),
+            Ok(_) => crate::path_completion::State::Failed(
+                "document changed; reopen the path prompt".into(),
+            ),
             Err(detail) => crate::path_completion::State::Failed(detail),
         };
         self.frames.invalidate(true);
@@ -5414,7 +5717,7 @@ fn backing_file(directory: &Path, size: usize) -> Result<File> {
                 return Err(format!(
                     "create Wayland pool in {}: {e}",
                     directory.display()
-                ))
+                ));
             }
         }
     }
@@ -5592,7 +5895,7 @@ mod tests {
                         io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
                     ) =>
                 {
-                    break
+                    break;
                 }
                 Err(e) => panic!("{e}"),
             }
@@ -5753,15 +6056,19 @@ mod tests {
         let pointer = w.pointer.device.unwrap();
         let (requests, files) = drain(&peer);
         assert_eq!(files.len(), 1);
-        let role = requests.iter().position(|request| {
-            *request == message(pointer, 0, &[19, surface, 0, 0])
-        }).unwrap();
-        assert_eq!(&requests[role..], &[
-            message(pointer, 0, &[19, surface, 0, 0]),
-            message(surface, 1, &[buffer, 0, 0]),
-            message(surface, 2, &[0, 0, 16, 24]),
-            message(surface, 6, &[]),
-        ]);
+        let role = requests
+            .iter()
+            .position(|request| *request == message(pointer, 0, &[19, surface, 0, 0]))
+            .unwrap();
+        assert_eq!(
+            &requests[role..],
+            &[
+                message(pointer, 0, &[19, surface, 0, 0]),
+                message(surface, 1, &[buffer, 0, 0]),
+                message(surface, 2, &[0, 0, 16, 24]),
+                message(surface, 6, &[]),
+            ]
+        );
         let file = &files[0];
         use std::os::unix::fs::MetadataExt;
         assert_eq!(file.metadata().unwrap().mode() & 0o777, 0o600);
@@ -9259,6 +9566,223 @@ mod tests {
     ) -> String {
         let mut client = control_client(path, payload.as_bytes());
         control_answer_pump(w, &mut client, peer, false) // Explicitly withhold background steps.
+    }
+
+    #[test]
+    fn deletion_protects_open_directories_and_reports_partial_worker_results() {
+        let dir = DialogDirectory::new();
+        std::fs::create_dir(dir.path("child")).unwrap();
+        let (mut w, _peer) = file_dialog_fixture();
+        configure(&mut w, 800, 600);
+        for path in [dir.path("child"), dir.0.clone()] {
+            w.files.as_mut().unwrap().open(path).unwrap();
+            finish_file(&mut w);
+        }
+        w.chord("d", false).unwrap();
+        w.chord("x", false).unwrap();
+        w.prompt.as_mut().unwrap().text = "DELETE".into();
+        w.path_chord("Return", false);
+        assert!(!w.files.as_ref().unwrap().busy());
+        assert!(w.control_file_job.is_none());
+        assert!(w.notice.as_ref().unwrap().contains("open directory"));
+        assert!(dir.path("child").is_dir());
+        assert!(w.control_jobs.fields().unwrap().contains("job=1,delete,3,1,0,error,unavailable"));
+
+        let dir = DialogDirectory::new();
+        let mut browse = dir.0.clone();
+        for _ in 0..4 {
+            browse.push("p".repeat(180));
+            std::fs::create_dir(&browse).unwrap();
+        }
+        for name in ["a", "z"] { std::fs::write(browse.join(name), b"disk").unwrap(); }
+        let (mut w, _peer) = file_dialog_fixture();
+        configure(&mut w, 800, 600);
+        w.files.as_mut().unwrap().open(browse.clone()).unwrap();
+        finish_file(&mut w);
+        w.chord("d", false).unwrap();
+        w.chord("d", false).unwrap();
+        w.chord("x", false).unwrap();
+        std::fs::write(browse.join("z"), b"changed").unwrap();
+        w.control_path_answer(w.last_dialog_id, Target { tab: 2, revision: 2 }, &crate::control::DialogAnswer::Path("DELETE".into())).unwrap();
+        finish_file(&mut w);
+        assert!(!browse.join("a").exists());
+        assert_eq!(std::fs::read(browse.join("z")).unwrap(), b"changed");
+        assert!(w.notice.as_ref().unwrap().contains("Removed 1/2"));
+        assert!(w.notice.as_ref().unwrap().contains("directory entry changed"));
+        assert!(w.notice.as_ref().unwrap().contains("entry 2/2"));
+        assert!(w.notice.as_ref().unwrap().contains("name \"z\""));
+        assert!(w.control_jobs.fields().unwrap().contains("job=1,delete,2,2,0,error,unavailable"));
+        let doc = w.ui.editor().document(2).unwrap();
+        assert_eq!(doc.revision(), 3);
+        assert!(doc.text().starts_with("  "));
+        assert_eq!(w.files.as_ref().unwrap().directory(2).unwrap().marked(), 0);
+    }
+
+    #[test]
+    fn deletion_maximum_review_fits_minimum_window_and_clamps_resized_pages() {
+        use std::os::unix::ffi::OsStringExt;
+        let stamp = crate::files::Stamp::read(&std::fs::metadata(".").unwrap());
+        let mut raw = vec![b'/'];
+        raw.extend(std::iter::repeat_n(0xff, 4088));
+        let parent = PathBuf::from(std::ffi::OsString::from_vec(raw));
+        let sources = (0..64).map(|i| crate::files::RenameSource::observed(
+            parent.join(format!("{i:02}")), (0, 0), stamp.clone())).collect();
+        let mut review = DeletePrompt { plan: crate::files::DeletePlan::new(sources).unwrap(), page: 1000 };
+        let notice = review.notice("DELETE", 32);
+        assert_eq!(notice.lines().count(), 6);
+        assert!(notice.lines().all(|line| line.chars().count() <= 32), "{notice}");
+        let narrow_last = review.lines(32, 0).0.saturating_sub(1) / 2;
+        let wide_last = review.lines(64, 0).0.saturating_sub(1) / 2;
+        review.page = narrow_last;
+        review.page(true, 64);
+        assert_eq!(review.page, wide_last - 1);
+        let (mut w, _peer) = file_dialog_fixture();
+        configure(&mut w, 272, 168);
+        let tab = w.ui.editor().active().unwrap();
+        let revision = w.ui.editor().document(tab).unwrap().revision();
+        w.prompt = Some(PathPrompt { action: PathAction::Delete(review), text: "DELETE".into(),
+            identity: Some(PathIdentity { id: 1, point: w.ui.editor().revision_point(tab, revision).unwrap() }),
+            completion: crate::path_completion::State::Idle });
+        w.sync_prompt_layout().unwrap();
+        assert!(w.deletion_question_visible());
+        assert_eq!(w.ui.geometry().prompt_rows(), 6);
+        assert!(w.path_notice().unwrap().lines().all(|line| line.chars().count() <= 32));
+        let state = w.control_prompt_state().unwrap();
+        assert_eq!(state.matches("\tdelete-entry=").count(), 64);
+        assert!(state.len() < 1024 * 1024 - 100);
+    }
+
+    #[test]
+    fn deletion_marks_are_bounded_sorted_and_paged_without_truncating_paths() {
+        let dir = DialogDirectory::new();
+        for i in 0..65 {
+            std::fs::write(dir.path(&format!("{i:02}-{}", "x".repeat(180))), b"disk").unwrap();
+        }
+        let mut snapshot = crate::directory::read(&dir.0).unwrap().unwrap();
+        for i in 0..64 {
+            snapshot.mark(i, true).unwrap();
+        }
+        assert_eq!(snapshot.marked(), 64);
+        assert!(snapshot.mark(64, true).is_err());
+        snapshot.arrange(crate::directory::Sort::Name, true);
+        assert_eq!(snapshot.marked(), 64);
+        assert!(snapshot.text.lines().next().unwrap().starts_with("  "));
+        let review = DeletePrompt {
+            plan: crate::files::DeletePlan::new(vec![snapshot.rename_source(1).unwrap(), snapshot.rename_source(2).unwrap()]).unwrap(),
+            page: 0,
+        };
+        let expected: String = review
+            .plan
+            .paths()
+            .enumerate()
+            .map(|(i, path)| {
+                let escaped: String = path
+                    .as_os_str()
+                    .as_encoded_bytes()
+                    .iter()
+                    .flat_map(|b| std::ascii::escape_default(*b))
+                    .map(char::from)
+                    .collect();
+                format!("{}: {escaped}", i + 1)
+            })
+            .collect();
+        for columns in [1, 16, 32, 64] {
+            let (total, _) = review.lines(columns, 0);
+            let mut actual = String::new();
+            for page in 0..total.div_ceil(2) {
+                let (_, lines) = review.lines(columns, page);
+                assert!(lines.len() <= 2);
+                for line in lines {
+                    assert!(line.len() <= columns);
+                    actual.push_str(&line);
+                }
+            }
+            assert_eq!(actual, expected);
+        }
+    }
+
+    #[test]
+    fn directory_deletion_requires_exact_live_confirmation_in_both_profiles() {
+        for profile in [Profile::Windows, Profile::Emacs] {
+            let dir = DialogDirectory::new();
+            std::fs::write(dir.path("file"), b"disk").unwrap();
+            let (mut w, _peer) = file_dialog_fixture();
+            configure(&mut w, 800, 600);
+            w.ui.dispatch(Event::Profile(profile)).unwrap();
+            w.files.as_mut().unwrap().open(dir.0.clone()).unwrap();
+            finish_file(&mut w);
+            w.chord("d", true).unwrap();
+            assert_eq!(w.files.as_ref().unwrap().directory(2).unwrap().marked(), 0);
+            w.chord("d", false).unwrap();
+            assert!(w.ui.editor().document(2).unwrap().text().starts_with("D "));
+            w.chord("u", false).unwrap();
+            assert_eq!(w.files.as_ref().unwrap().directory(2).unwrap().marked(), 0);
+            w.chord("d", false).unwrap();
+            let revision = w.ui.editor().document(2).unwrap().revision();
+            w.chord("x", false).unwrap();
+            let id = w.last_dialog_id;
+            assert!(w.control_dialog_fields().contains("path-delete"));
+            assert!(w.path_notice().unwrap().contains("NO UNDO"));
+            assert!(w.path_notice().unwrap().lines().count() <= 6);
+            let target = Target { tab: 2, revision };
+            assert_eq!(
+                w.control_path_answer(
+                    id + 1,
+                    target,
+                    &crate::control::DialogAnswer::Path("DELETE".into())
+                )
+                .err(),
+                Some(crate::Error::InvalidArgument)
+            );
+            assert_eq!(
+                w.control_path_answer(
+                    id,
+                    Target {
+                        tab: 2,
+                        revision: revision - 1
+                    },
+                    &crate::control::DialogAnswer::Path("DELETE".into())
+                )
+                .err(),
+                Some(crate::Error::StaleRevision)
+            );
+            assert_eq!(
+                w.control_path_answer(
+                    id,
+                    target,
+                    &crate::control::DialogAnswer::Path("yes".into())
+                )
+                .err(),
+                Some(crate::Error::InvalidArgument)
+            );
+            assert!(w.prompt.is_some());
+            w.control_path_answer(id, target, &crate::control::DialogAnswer::Cancel)
+                .unwrap();
+            assert_eq!(std::fs::read(dir.path("file")).unwrap(), b"disk");
+            w.chord("x", false).unwrap();
+            assert_ne!(id, w.last_dialog_id);
+            for key in ["D", "E", "L", "E", "T", "E"] {
+                w.path_chord(key, false);
+            }
+            w.path_chord("Return", true);
+            assert!(w.prompt.is_some());
+            configure(&mut w, 200, 100);
+            w.path_chord("Return", false);
+            assert!(w.prompt.is_some());
+            assert_eq!(std::fs::read(dir.path("file")).unwrap(), b"disk");
+            configure(&mut w, 800, 600);
+            w.path_chord("Return", false);
+            assert!(w.prompt.is_none());
+            finish_file(&mut w);
+            assert!(!dir.path("file").exists());
+            assert!(
+                w.control_jobs
+                    .fields()
+                    .unwrap()
+                    .contains(&format!("job=1,delete,2,{revision},0,complete,-"))
+            );
+            assert_eq!(w.files.as_ref().unwrap().directory(2).unwrap().marked(), 0);
+        }
     }
 
     #[test]
@@ -12798,14 +13322,17 @@ mod tests {
             finish_file(&mut w);
             assert!(w.prompt.is_none());
             assert_eq!(w.ui.editor().document(2).unwrap().text(), "two");
-            assert_eq!(std::fs::read(directory.path("folder/apricot")).unwrap(), b"two");
+            assert_eq!(
+                std::fs::read(directory.path("folder/apricot")).unwrap(),
+                b"two"
+            );
             drain(&peer);
         }
     }
 
     #[test]
     fn completion_results_cannot_revive_edited_cancelled_replaced_or_stale_prompts() {
-        use crate::path_completion::{scan, State};
+        use crate::path_completion::{State, scan};
         let directory = DialogDirectory::new();
         std::fs::write(directory.path("file"), b"keep").unwrap();
         let prefix = directory.path("fi").to_str().unwrap().to_string();

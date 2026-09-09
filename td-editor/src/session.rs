@@ -26,6 +26,7 @@ impl PollFailure {
 }
 
 enum Operation {
+    Delete(crate::files::DeletePlan),
     Dictionary(PathBuf),
     Open(PathBuf),
     Rename {
@@ -50,6 +51,10 @@ struct Loaded {
     missing: bool,
 }
 enum Completion {
+    Deleted {
+        result: crate::files::Deleted,
+        listing: Result<Option<crate::directory::Snapshot>>,
+    },
     Dictionary(crate::spelling::Dictionary),
     Open(Loaded),
     Directory(crate::directory::Snapshot),
@@ -59,9 +64,13 @@ enum Completion {
     },
     Reload(Loaded),
     Conflict(String),
-    Saved { file: FileId, path: PathBuf },
+    Saved {
+        file: FileId,
+        path: PathBuf,
+    },
 }
 enum Pending {
+    Delete,
     Dictionary,
     Open,
     Rename,
@@ -187,6 +196,69 @@ impl Session {
 
     pub(crate) fn directory(&self, tab: TabId) -> Option<&crate::directory::Snapshot> {
         self.directories.get(&tab)
+    }
+
+    pub(crate) fn mark_directory(
+        &mut self,
+        ui: &mut Controller,
+        tab: TabId,
+        revision: u64,
+        delete: bool,
+    ) -> Result<()> {
+        self.available()?;
+        let point = ui
+            .editor()
+            .revision_point(tab, revision)
+            .map_err(|e| e.to_string())?;
+        let doc = ui.editor().document(tab).map_err(|e| e.to_string())?;
+        let row = doc
+            .text()
+            .get(..doc.selection().caret)
+            .ok_or("Invalid selection")?
+            .bytes()
+            .filter(|b| *b == b'\n')
+            .count();
+        let mut next = self.directory(tab).ok_or("Not a directory tab")?.clone();
+        next.mark(row, delete)?;
+        // Like dired, marking advances by one entry, but never beyond EOF.
+        let selected = next.entry((row + 1).min(next.len().saturating_sub(1)));
+        let caret = selected.as_ref().map_or(0, |path| next.offset(path));
+        ui.refresh_directory(point, next.text.as_bytes(), caret)
+            .map_err(|e| e.to_string())?;
+        next.text = String::new();
+        self.directories.insert(tab, next);
+        Ok(())
+    }
+
+    pub(crate) fn delete(
+        &mut self,
+        ui: &Controller,
+        tab: TabId,
+        revision: u64,
+        plan: crate::files::DeletePlan,
+    ) -> Result<()> {
+        ui.editor()
+            .revision_point(tab, revision)
+            .map_err(|e| e.to_string())?;
+        let directory = self
+            .directory(tab)
+            .ok_or("Deletion needs a directory tab")?;
+        if plan
+            .paths()
+            .any(|path| path.parent() != Some(directory.path.as_path()))
+        {
+            return Err("Deletion plan belongs to a different directory".into());
+        }
+        for path in plan.paths() {
+            if self
+                .directories
+                .values()
+                .any(|snapshot| snapshot.path.starts_with(path))
+            {
+                return Err("Deletion includes an open directory; close that tab first".into());
+            }
+        }
+        self.submit(Operation::Delete(plan), Pending::Delete)
     }
 
     pub(crate) fn rename(
@@ -480,6 +552,56 @@ impl Session {
         result: Result<Completion>,
     ) -> Result<String> {
         match (pending, result?) {
+            (Some(Pending::Delete), Completion::Deleted { result, listing }) => {
+                let mut notice = format!(
+                    "Removed {}/{} entries permanently (not undoable)",
+                    result.removed, result.requested
+                );
+                if let Some(failure) = &result.failure {
+                    notice.push_str(&format!("; {failure}"));
+                }
+                match listing {
+                    Ok(Some(fresh)) => {
+                        for (&tab, old) in &mut self.directories {
+                            if old.path != fresh.path {
+                                continue;
+                            }
+                            let refreshed = (|| -> Result<crate::directory::Snapshot> {
+                                let doc = ui.editor().document(tab).map_err(|e| e.to_string())?;
+                                let point = ui
+                                    .editor()
+                                    .revision_point(tab, doc.revision())
+                                    .map_err(|e| e.to_string())?;
+                                let row = doc
+                                    .text()
+                                    .get(..doc.selection().caret)
+                                    .ok_or("Invalid selection")?
+                                    .bytes()
+                                    .filter(|b| *b == b'\n')
+                                    .count();
+                                let selected = old.entry(row);
+                                let mut next = fresh.clone();
+                                next.arrange(old.sort, old.reverse);
+                                let caret = selected.as_ref().map_or(0, |path| next.offset(path));
+                                ui.refresh_directory(point, next.text.as_bytes(), caret)
+                                    .map_err(|e| e.to_string())?;
+                                next.text = String::new();
+                                Ok(next)
+                            })();
+                            match refreshed {
+                                Ok(next) => *old = next,
+                                Err(_) => notice.push_str("; listing stale: use g to refresh"),
+                            }
+                        }
+                    }
+                    _ => notice.push_str("; listing stale: use g to refresh"),
+                }
+                if result.failure.is_some() {
+                    Err(notice)
+                } else {
+                    Ok(notice)
+                }
+            }
             (Some(Pending::Rename), Completion::Renamed { result, listing }) => {
                 for association in self.associations.values_mut() {
                     if let Some(path) = result.relocated(&association.path) {
@@ -718,6 +840,7 @@ fn worker(jobs: Receiver<Job>, results: SyncSender<Result<Completion>>) {
                 Operation::Reload(_) => "reload",
                 Operation::Save { .. } => "save",
                 Operation::Rename { .. } => "rename",
+                Operation::Delete(_) => "delete",
             };
             if let Err(detail) = barrier.checkpoint(kind) {
                 let _ = results.send(Err(detail));
@@ -776,6 +899,13 @@ fn execute(files: &mut Files, known: &mut BTreeSet<FileId>, job: Job) -> Result<
     // Release closed tabs and rejected Open admissions before the next job.
     retain_files(files, known, &job.keep);
     match job.operation {
+        Operation::Delete(plan) => {
+            let result = files
+                .delete(plan)
+                .map_err(|e| format!("Deletion refused: {e}"))?;
+            let listing = crate::directory::read(&result.parent);
+            Ok(Completion::Deleted { result, listing })
+        }
         Operation::Rename { source, name } => {
             let result = files
                 .rename(source, &name)
@@ -847,7 +977,7 @@ fn execute(files: &mut Files, known: &mut BTreeSet<FileId>, job: Job) -> Result<
                         Err(e) => {
                             return Err(format!(
                                 "Cannot inspect Save As destination; nothing written: {e}"
-                            ))
+                            ));
                         }
                     }
                     let file = files.open(&path).map_err(|e| {
@@ -1379,7 +1509,7 @@ mod tests {
         let snapshot = crate::directory::read(&dir.0).unwrap().unwrap();
         assert_eq!(snapshot.text.lines().map(|line| line.split_whitespace().last().unwrap()).collect::<Vec<_>>(),
             ["z/", "bad\\xff\\n\\\\name", "link"]);
-        assert_eq!(snapshot.text.lines().map(|line| line.chars().next().unwrap()).collect::<Vec<_>>(), ['d', '-', 'l']);
+        assert_eq!(snapshot.text.lines().map(|line| line.chars().nth(2).unwrap()).collect::<Vec<_>>(), ['d', '-', 'l']);
         assert_eq!(snapshot.entry(1), Some(dir.0.join(raw)));
         assert_eq!(snapshot.entry(3), None);
         assert!(crate::directory::read(&dir.path("link/"))

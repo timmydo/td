@@ -52,7 +52,7 @@ impl Barrier {
                 let kind = fields.next().unwrap();
                 assert!(matches!(
                     kind,
-                    "open" | "dictionary" | "save" | "reload" | "rename" | "queued-save"
+                    "open" | "dictionary" | "save" | "reload" | "rename" | "delete" | "queued-save"
                 ));
                 assert_eq!(fields.next(), None);
                 let hold = {
@@ -107,6 +107,98 @@ impl Drop for Barrier {
             let _ = thread.join();
         }
     }
+}
+
+#[test]
+#[ignore = "ready builds the isolated test-file-barrier editor"]
+fn admitted_deletion_preserves_edits_and_incidental_directory_views() {
+    let compositor_directory = Directory::new();
+    let directory = Directory::new();
+    let mut compositor = Compositor::start(&compositor_directory);
+    let mut barrier = Barrier::start(&directory);
+    let root = directory.0.join("browse");
+    std::fs::create_dir(&root).unwrap();
+    let victim = root.join("a-victim");
+    let file = root.join("keep");
+    std::fs::write(&victim, b"delete me").unwrap();
+    std::fs::write(&file, b"disk").unwrap();
+    let dictionary = directory.0.join("dictionary");
+    std::fs::write(&dictionary, b"disk\n").unwrap();
+    let mut editor = EditorProcess::start_with_barrier(
+        &directory,
+        &compositor.directory.join("wayland-0"),
+        &file,
+        &dictionary,
+        "emacs",
+        Some(&barrier.path),
+    );
+    editor.wait_keyboard("emacs");
+    let window = compositor.window();
+    assert_eq!(compositor.request("fullscreen", 1024), b"ok\n");
+    editor.wait_field("state", "window", "800,576,1");
+    editor.ok("insert\t1\t0\t0\t0\t61");
+    for _ in 0..2 {
+        editor.job(&format!(
+            "open\t{}",
+            td_editor::control::hex(root.as_os_str().as_encoded_bytes())
+        ));
+    }
+    editor.ok("select-tab\t2\t0");
+    compositor.chord(None, 32); // d marks the first row and advances.
+    editor.wait_field("state", "directory-marks", "2,1");
+    compositor.chord(None, 45); // x reviews, but does not delete.
+    editor.wait_field("prompt-state", "prompt", "path-delete");
+    let state = editor.ok("state");
+    let dialog = field(&state, "dialog").unwrap().split(',').next().unwrap();
+    let prompt = editor.ok("prompt-state");
+    assert_eq!(field(&prompt, "delete-count"), Some("1"));
+    assert!(prompt.contains(&format!(
+        "delete-entry=0,{}",
+        td_editor::control::hex(victim.as_os_str().as_encoded_bytes())
+    )));
+    barrier.arm("delete");
+    let started = Instant::now();
+    let response = editor
+        .request(&format!(
+            "dialog-answer\t{dialog}\t2\t1\tpath\t44454c455445"
+        ))
+        .unwrap();
+    let job = response.strip_prefix("pending\t").unwrap();
+    let held = barrier.held();
+    assert!(
+        editor
+            .ok("state")
+            .contains(&format!("job={job},delete,2,1,0,pending,-"))
+    );
+    editor.ok("select-tab\t1\t1");
+    editor.ok("insert\t1\t1\t1\t1\t62");
+    compositor.chord(Some(KEY_LEFT_CTRL), KEY_SPACE);
+    compositor.chord(Some(KEY_LEFT_CTRL), 45);
+    editor.wait_field("state", "prefix", "1");
+    let state = editor.ok("state");
+    let view = field(&state, "view").unwrap().to_owned();
+    assert_eq!(std::fs::read(&victim).unwrap(), b"delete me");
+    assert!(started.elapsed() < Duration::from_secs(4));
+    let before = compositor.observe(&window);
+    barrier.release(held);
+    assert_eq!(
+        editor.wait_job(job),
+        format!("job={job},delete,2,1,0,complete,-")
+    );
+    editor.wait_field("state", "active", "1");
+    editor.wait_field("state", "prefix", "1");
+    editor.wait_field("state", "view", &view);
+    wait_directory_rows(&mut editor, 2, 2, &["keep"]);
+    wait_directory_rows(&mut editor, 3, 1, &["keep"]);
+    compositor.rendered_tab_text_at(&mut editor, &window, (1, 2, 32), before, "abdisk", 2);
+    assert!(!victim.exists());
+    assert_eq!(std::fs::read(&file).unwrap(), b"disk");
+    compositor.chord(Some(KEY_LEFT_CTRL), KEY_G);
+    editor.job("save\t1\t2");
+    assert_eq!(std::fs::read(&file).unwrap(), b"abdisk");
+    editor.quit();
+    barrier.finish();
+    compositor.stop();
 }
 
 #[test]

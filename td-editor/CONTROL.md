@@ -194,12 +194,13 @@ entry's keyboard path;
 semantic dialog answers still supply explicit OS-byte paths and do not
 gain a completion mutation verb or physical clipboard authority.
 
-Kinds are `none`, `path-open`, `path-save-as`, `path-dictionary`, `path-rename`,
-`close-save-as`, `find-forward`, `find-backward`, `replace`, `go-to-line`,
-`fill-column`, and `command`. `close-save-as` is Save As answered through
-the close dialog's ID rather than an independent path ID, including after
-a save conflict during close. Other ordinary paths always have their own
-revision-bound identity; opening one without a valid tab is refused.
+Kinds are `none`, `path-open`, `path-save-as`, `path-dictionary`,
+`path-rename`, `path-delete`, `close-save-as`, `find-forward`,
+`find-backward`, `replace`, `go-to-line`, `fill-column`, and `command`.
+`close-save-as` is Save As answered through the close dialog's ID rather
+than an independent path ID, including after a save conflict during
+close. Other ordinary paths always have their own revision-bound
+identity; opening one without a valid tab is refused.
 
 An async save conflict can cover a retained Find/Replace/numeric/command
 entry. The snapshot still exposes that retained entry, not the surface
@@ -643,19 +644,20 @@ path ID under the following contract.
 
 ## Ordinary path answers and Dictionary jobs
 
-Opening a native Open, Save As, Dictionary or Rename entry mints a fresh
-checked dialog ID and captures an editor-bound tab/revision point. State
-reports `ID,SCOPE,path,TAB,REVISION,cancel+path`, with scope `path-open`,
-`path-save-as`, `path-dictionary` or `path-rename`. Save As reached through
-a conflict gets a fresh path ID, and its target can remain inactive.
-Close-driven Save As
-instead retains its existing close ID and close scope. Typing, empty Return
-and input loss keep the current ID. Cancelling and reopening never reuse it.
-Counter exhaustion refuses new path creation with a visible diagnostic and
-retains documents; native input cleanup may already have run. Native conflict
-Save As dismisses its conflict before attempting path creation, so exhaustion
-also loses that question; a later Save can raise the conflict again. Associated
-native Save needs no path prompt and consumes no path ID.
+Opening a native Open, Save As, Dictionary, Rename or deletion review
+mints a fresh checked dialog ID and captures an editor-bound
+tab/revision point. State reports
+`ID,SCOPE,path,TAB,REVISION,cancel+path`, with scope `path-open`,
+`path-save-as`, `path-dictionary`, `path-rename` or `path-delete`. Save
+As reached through a conflict gets a fresh path ID, and its target can
+remain inactive. Close-driven Save As instead retains its existing close
+ID and close scope. Typing, empty Return and input loss keep the current
+ID. Cancelling and reopening never reuse it. Counter exhaustion refuses
+new path creation with a visible diagnostic and retains documents;
+native input cleanup may already have run. Native conflict Save As
+dismisses its conflict before attempting path creation, so exhaustion
+also loses that question; a later Save can raise the conflict again.
+Associated native Save needs no path prompt and consumes no path ID.
 
 `dialog-answer DIALOG TAB REVISION cancel` dismisses only that live prompt
 and returns `1 ID ok` with a trailing empty field. `path HEX_PATH` replaces
@@ -696,6 +698,31 @@ inspect both names before retrying (not all remote filesystems guarantee
 that an error means no rename occurred). There is no cancellation after
 submission, implicit save, overwrite or cross-directory move. Unsaved text
 and history remain intact.
+
+Deletion uses the same revision/owner-bound path-dialog authority, with scope
+`path-delete`. Only `path 44454c455445` (literal `DELETE`) confirms the captured
+batch; `cancel` leaves marks/files unchanged. Other path answers refuse and
+retain the prompt. `prompt-state` adds `delete-count=N`, zero-based
+`delete-page=N`, and repeated `delete-entry=INDEX,HEX_PATH` fields in captured
+order. These expose full literal paths even when the visual review is paged.
+There are at most 64 entries of at most 4096 raw bytes: this separate prompt
+response stays below one MiB, without adding the paths to ordinary `state`.
+Ordinary `state` adds `directory-marks=TAB,COUNT` for each directory tab;
+text pages show the leading `D ` marks. Fenced decoded d/u/x drive the same
+mark/review actions but cannot confirm or cancel the file dialog.
+
+Submission creates `job=JOB,delete,TAB,REVISION,0,STATUS,CODE`. Complete
+means all requested removals and their sync/absence checks succeeded; an
+error may follow partial or uncertain removal. The native notice reports
+the successful-removal count, captured entry ordinal and first failure
+reason before a bounded escaped basename. No history entry, disconnect
+or retry implies rollback. Open file identities/paths and open directory
+tabs are protected; non-empty directories and special files refuse.
+Earlier removals remain permanent when a later entry fails. Rescans
+clear marks only when admitted and preserve unrelated editing. Use `g`
+after a stale listing; inspect disk state and explicitly mark/confirm
+again rather than retry an ambiguous request automatically. Deletion has
+no trash, recursion or Undo.
 
 Dictionary Path uses the ordinary bounded read/parser and window-wide
 dictionary replacement. Its job is `job=JOB,dictionary,0,0,0,STATUS,CODE`:

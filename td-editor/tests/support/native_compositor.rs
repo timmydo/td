@@ -16,23 +16,127 @@ const KEY_HOME: u32 = 102;
 const KEY_RIGHT: u32 = 106;
 const KEY_END: u32 = 107;
 
-fn wait_directory_rows(editor: &mut EditorProcess, tab: u64, revision: u64, names: &[&str]) -> String {
+fn wait_directory_rows(
+    editor: &mut EditorProcess,
+    tab: u64,
+    revision: u64,
+    names: &[&str],
+) -> String {
     let deadline = Instant::now() + TIMEOUT;
     loop {
         let state = editor.ok("state");
-        if state.split('\t').any(|field| field.starts_with(&format!("tab={tab},{revision},"))) { break; }
+        if state
+            .split('\t')
+            .any(|field| field.starts_with(&format!("tab={tab},{revision},")))
+        {
+            break;
+        }
         assert!(Instant::now() < deadline, "directory revision: {state}");
     }
     let reply = editor.ok(&format!("text\t{tab}\t{revision}\t0\t4096"));
     let (length, hex) = reply.split_once('\t').unwrap();
     let (pairs, remainder) = hex.as_bytes().as_chunks::<2>();
     assert!(remainder.is_empty());
-    let text = String::from_utf8(pairs.iter().map(|pair|
-        u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap()).collect()).unwrap();
+    let text = String::from_utf8(
+        pairs
+            .iter()
+            .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
+            .collect(),
+    )
+    .unwrap();
     assert_eq!(text.len(), length.parse::<usize>().unwrap());
-    assert_eq!(text.lines().map(|line| line.split_whitespace().last().unwrap()).collect::<Vec<_>>(), names);
-    assert!(text.lines().all(|line| line.split_whitespace().count() == 8));
+    assert_eq!(
+        text.lines()
+            .map(|line| line.split_whitespace().last().unwrap())
+            .collect::<Vec<_>>(),
+        names
+    );
+    assert!(
+        text.lines()
+            .all(|line| line.split_whitespace().count() == 8)
+    );
     text
+}
+
+#[test]
+#[ignore = "ready supplies the disposable native compositor"]
+fn native_directory_marks_cancel_and_confirm_literal_deletion() {
+    use std::os::unix::ffi::OsStringExt;
+    for profile in ["windows", "emacs"] {
+        let compositor_directory = Directory::new();
+        let directory = Directory::new();
+        let mut compositor = Compositor::start(&compositor_directory);
+        let root = directory.0.join("browse");
+        std::fs::create_dir(&root).unwrap();
+        let victim = root.join(std::ffi::OsString::from_vec(b"a-\xff".to_vec()));
+        let keep = root.join("z-keep");
+        let document = directory.0.join("document");
+        let dictionary = directory.0.join("dictionary");
+        std::fs::write(&victim, b"victim").unwrap();
+        std::fs::write(&keep, b"keep").unwrap();
+        std::fs::write(&document, b"document").unwrap();
+        std::fs::write(&dictionary, b"document\n").unwrap();
+        let mut editor = EditorProcess::start_with_profile(
+            &directory,
+            &compositor.directory.join("wayland-0"),
+            &document,
+            &dictionary,
+            profile,
+        );
+        editor.wait_keyboard(profile);
+        let window = compositor.window();
+        assert_eq!(compositor.request("fullscreen", 1024), b"ok\n");
+        editor.wait_field("state", "window", "800,576,1");
+        editor.job(&format!(
+            "open\t{}",
+            td_editor::control::hex(root.as_os_str().as_encoded_bytes())
+        ));
+        compositor.chord(None, 32); // d
+        editor.wait_field("state", "directory-marks", "2,1");
+        // Marking advances; return to the first row before unmarking.
+        editor.ok("select-range\t2\t1\t0\t0");
+        compositor.chord(None, 22); // u
+        editor.wait_field("state", "directory-marks", "2,0");
+        editor.ok("select-range\t2\t2\t0\t0");
+        compositor.chord(None, 32);
+        editor.wait_field("state", "directory-marks", "2,1");
+        compositor.click(270, 32);
+        editor.wait_field("state", "modal", "0,0,0,0,1,0,0,0,0");
+        compositor.click(270, 252); // Directory > Delete Marked Entries.
+        editor.wait_field("prompt-state", "prompt", "path-delete");
+        let state = editor.ok("state");
+        let id = field(&state, "dialog").unwrap().split(',').next().unwrap();
+        editor.ok(&format!("dialog-answer\t{id}\t2\t3\tcancel"));
+        assert_eq!(std::fs::read(&victim).unwrap(), b"victim");
+        let state = editor.ok("state");
+        editor.ok(&format!(
+            "key\t2\t3\t{}\t78",
+            field(&state, "input-generation").unwrap()
+        ));
+        editor.wait_field("prompt-state", "prompt", "path-delete");
+        let state = editor.ok("state");
+        let next = field(&state, "dialog").unwrap().split(',').next().unwrap();
+        assert_ne!(id, next);
+        assert!(
+            editor
+                .request(&format!("dialog-answer\t{id}\t2\t3\tpath\t44454c455445"))
+                .unwrap()
+                .starts_with("error\tinvalid-argument")
+        );
+        let before = compositor.observe(&window);
+        assert!(
+            editor
+                .job(&format!("dialog-answer\t{next}\t2\t3\tpath\t44454c455445"))
+                .contains(",delete,2,3,0,complete,-")
+        );
+        let listing = wait_directory_rows(&mut editor, 2, 4, &["z-keep"]);
+        compositor.rendered_tab_text(&mut editor, &window, (2, 4), before, &listing[..10], 0);
+        assert!(std::fs::symlink_metadata(victim).is_err());
+        assert_eq!(std::fs::read(keep).unwrap(), b"keep");
+        assert_eq!(std::fs::read(document).unwrap(), b"document");
+        editor.quit();
+        compositor.stop();
+    }
 }
 
 #[test]
@@ -167,7 +271,7 @@ fn native_directory_details_sort_and_copy_selected_entry() {
         editor.wait_field("state", "window", "800,576,1");
         let listing = wait_directory_rows(&mut editor, 1, 0, &["child/", "a", "z"]);
         let meta = std::fs::metadata(root.join("a")).unwrap();
-        let expected = format!("-rw-r-----   1 {:>5} {:>5}          3 1970-01-01 00:00Z a", meta.uid(), meta.gid());
+        let expected = format!("  -rw-r-----   1 {:>5} {:>5}          3 1970-01-01 00:00Z a", meta.uid(), meta.gid());
         assert_eq!(listing.lines().nth(1).unwrap(), expected);
         assert!(listing.lines().nth(2).unwrap().contains("14 2000-02-29 00:00Z z"));
         editor.rendered_at(800, 576);
@@ -428,7 +532,7 @@ fn native_directory_tabs_reuse_shift_open_refresh_and_copy_path() {
 #[test]
 #[ignore = "ready supplies the disposable native compositor"]
 fn native_path_completion_lists_cycles_and_opens_literal_relative_file() {
-    use td_editor::render::{Draw, Geometry, GlyphStyle, Primitive, Raster, Scale, CHROME, INK};
+    use td_editor::render::{CHROME, Draw, Geometry, GlyphStyle, INK, Primitive, Raster, Scale};
     for profile in ["windows", "emacs"] {
         let compositor_directory = Directory::new();
         let directory = Directory::new();
@@ -480,29 +584,43 @@ fn native_path_completion_lists_cycles_and_opens_literal_relative_file() {
         let mut raster = Raster::new(&mut expected, &font, geometry, 64 * 4).unwrap();
         for (row, text) in ["  alpha", "  alpine"].into_iter().enumerate() {
             for (column, scalar) in text.chars().enumerate() {
-                raster.draw(Draw { clip: geometry.bounds(), primitive: Primitive::Glyph {
-                    x: (column * 8) as i64, y: (row * 16) as i64, scalar,
-                    style: GlyphStyle::medium(INK, CHROME),
-                }});
+                raster.draw(Draw {
+                    clip: geometry.bounds(),
+                    primitive: Primitive::Glyph {
+                        x: (column * 8) as i64,
+                        y: (row * 16) as i64,
+                        scalar,
+                        style: GlyphStyle::medium(INK, CHROME),
+                    },
+                });
             }
         }
         let deadline = Instant::now() + TIMEOUT;
         loop {
             assert!(Instant::now() < deadline, "completion list pixel deadline");
             let first = compositor.observe(&window);
-            if !first.current || first.commit <= before.commit { continue; }
+            if !first.current || first.commit <= before.commit {
+                continue;
+            }
             let capture = compositor.request("capture", FRAME_BYTES + 128);
             let (output, pixels) = ppm(&capture, &compositor.session).unwrap();
             let second = compositor.observe(&window);
-            if !second.current || second.commit != first.commit { continue; }
+            if !second.current || second.commit != first.commit {
+                continue;
+            }
             assert_eq!(first.client, before.client);
             assert_eq!(second.client, first.client);
             assert!(output > first.output && output <= second.output);
-            if (0..32).all(|y| (0..64).all(|x| {
+            if (0..32).all(|y| {
+                (0..64).all(|x| {
                     let source = ((y + 96) * 800 + x + 8) * 3;
-                let target = (y * 64 + x) * 4;
-                pixels[source..source + 3] == [expected[target + 2], expected[target + 1], expected[target]]
-            })) { break; }
+                    let target = (y * 64 + x) * 4;
+                    pixels[source..source + 3]
+                        == [expected[target + 2], expected[target + 1], expected[target]]
+                })
+            }) {
+                break;
+            }
         }
         compositor.chord(Some(KEY_LEFT_SHIFT), 15); // Shift+Tab selects last.
         editor.wait_field("prompt-state", "text", "616c70696e65");
@@ -674,29 +792,58 @@ fn ppm<'a>(reply: &'a [u8], session: &str) -> Result<(u64, &'a [u8])> {
 }
 
 impl Compositor {
-    fn rendered_rows(&self, window: &str, after: Observation, top: usize, lines: &[&str], background: u32) {
-        let expected: Vec<_> = lines.iter().map(|line| text_pixels_on(line, background)).collect();
+    fn rendered_rows(
+        &self,
+        window: &str,
+        after: Observation,
+        top: usize,
+        lines: &[&str],
+        background: u32,
+    ) {
+        let expected: Vec<_> = lines
+            .iter()
+            .map(|line| text_pixels_on(line, background))
+            .collect();
         let deadline = Instant::now() + TIMEOUT;
         loop {
-            assert!(Instant::now() < deadline, "minibuffer covered document pixel deadline");
+            assert!(
+                Instant::now() < deadline,
+                "minibuffer covered document pixel deadline"
+            );
             let first = self.observe(window);
-            if !first.current || first.commit <= after.commit { continue; }
+            if !first.current || first.commit <= after.commit {
+                continue;
+            }
             let capture = self.request("capture", FRAME_BYTES + 128);
             let (output, pixels) = ppm(&capture, &self.session).unwrap();
             let second = self.observe(window);
-            if !second.current || first.commit != second.commit { continue; }
+            if !second.current || first.commit != second.commit {
+                continue;
+            }
             assert_eq!(first.client, after.client);
             assert_eq!(second.client, first.client);
             assert!(output > first.output && output <= second.output);
-            if lines.iter().zip(&expected).enumerate().all(|(row, (line, glyphs))| {
-                let width = line.len() * 8;
-                (0..16).all(|y| (0..width).all(|x| {
-                    if row == 0 && x == 0 { return true; } // blinking caret only
-                    let source = ((top + row * 16 + y) * 800 + 8 + x) * 3;
-                    let target = (y * width + x) * 4;
-                    pixels[source..source + 3] == [glyphs[target + 2], glyphs[target + 1], glyphs[target]]
-                }))
-            }) { break; }
+            if lines
+                .iter()
+                .zip(&expected)
+                .enumerate()
+                .all(|(row, (line, glyphs))| {
+                    let width = line.len() * 8;
+                    (0..16).all(|y| {
+                        (0..width).all(|x| {
+                            if row == 0 && x == 0 {
+                                return true;
+                            } // blinking caret only
+                            let source = ((top + row * 16 + y) * 800 + 8 + x) * 3;
+                            let target = (y * width + x) * 4;
+                            pixels[source..source + 3]
+                                == [glyphs[target + 2], glyphs[target + 1], glyphs[target]]
+                        })
+                    })
+                })
+            {
+                break;
+            }
         }
     }
 
@@ -1021,7 +1168,7 @@ fn numbered_pixels(
     enabled: bool,
 ) {
     use td_editor::render::{
-        Draw, Geometry, GlyphStyle, Primitive, Raster, Scale, INK, LINE_NUMBER, PAPER,
+        Draw, Geometry, GlyphStyle, INK, LINE_NUMBER, PAPER, Primitive, Raster, Scale,
     };
     let state = editor.ok("state");
     let frame = editor.ok(&format!(
@@ -1587,14 +1734,20 @@ fn clipboard_between_editors(profile: &str, operation: ClipboardOperation) {
     destination.wait_tab(0, ""); // An offer is not an insertion.
     let before_paste = compositor.observe(destination_window);
     assert_ne!(before_paste.client, before.client);
-    let hold_reply = |state: &str| format!(
-        "ok\ntd-clipboard-v1 session={} hold=1 window={destination_window} state={state}\n",
-        compositor.session,
-    );
+    let hold_reply = |state: &str| {
+        format!(
+            "ok\ntd-clipboard-v1 session={} hold=1 window={destination_window} state={state}\n",
+            compositor.session,
+        )
+    };
     // Pin the first hold in this fresh compositor; do not accept arbitrary IDs.
-    assert_eq!(compositor.request(&format!(
-        "clipboard-arm {} {destination_window}", compositor.session,
-    ), 1024), hold_reply("armed").as_bytes());
+    assert_eq!(
+        compositor.request(
+            &format!("clipboard-arm {} {destination_window}", compositor.session,),
+            1024
+        ),
+        hold_reply("armed").as_bytes()
+    );
     let held = hold_reply("held");
     let armed = hold_reply("armed");
     let released = hold_reply("released");
@@ -1679,14 +1832,20 @@ fn clipboard_between_editors(profile: &str, operation: ClipboardOperation) {
     // invalidation closes its endpoint, so EOF may race the keyboard leave;
     // this checks the settled native state, not which cancellation wins.
     let hold_id = 2;
-    let hold_reply = |state: &str| format!(
-        "ok\ntd-clipboard-v1 session={} hold={hold_id} window={destination_window} state={state}\n",
-        compositor.session,
-    );
+    let hold_reply = |state: &str| {
+        format!(
+            "ok\ntd-clipboard-v1 session={} hold={hold_id} window={destination_window} state={state}\n",
+            compositor.session,
+        )
+    };
     let armed = hold_reply("armed");
-    assert_eq!(compositor.request(&format!(
-        "clipboard-arm {} {destination_window}", compositor.session,
-    ), 1024), armed.as_bytes());
+    assert_eq!(
+        compositor.request(
+            &format!("clipboard-arm {} {destination_window}", compositor.session,),
+            1024
+        ),
+        armed.as_bytes()
+    );
     let held = hold_reply("held");
     let invalidated = hold_reply("invalidated");
     let focus_paste_started = Instant::now();
@@ -1776,14 +1935,20 @@ fn clipboard_between_editors(profile: &str, operation: ClipboardOperation) {
     destination.wait_field("state", "tab", &saved_destination);
     source.wait_field("state", "tab", &collapsed);
     let hold_id = 3;
-    let hold_reply = |state: &str| format!(
-        "ok\ntd-clipboard-v1 session={} hold={hold_id} window={destination_window} state={state}\n",
-        compositor.session,
-    );
+    let hold_reply = |state: &str| {
+        format!(
+            "ok\ntd-clipboard-v1 session={} hold={hold_id} window={destination_window} state={state}\n",
+            compositor.session,
+        )
+    };
     let armed = hold_reply("armed");
-    assert_eq!(compositor.request(&format!(
-        "clipboard-arm {} {destination_window}", compositor.session,
-    ), 1024), armed.as_bytes());
+    assert_eq!(
+        compositor.request(
+            &format!("clipboard-arm {} {destination_window}", compositor.session,),
+            1024
+        ),
+        armed.as_bytes()
+    );
     let held = hold_reply("held");
     let invalidated = hold_reply("invalidated");
     let owner_exit_paste_started = Instant::now();

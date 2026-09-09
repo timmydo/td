@@ -2,7 +2,7 @@
 
 use crate::dialog::Target;
 use crate::keys::Profile;
-use crate::render::{Draw, Geometry, GlyphStyle, Primitive, Raster, Rect, CHROME, INK};
+use crate::render::{CHROME, Draw, Geometry, GlyphStyle, INK, Primitive, Raster, Rect};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Group {
@@ -62,6 +62,9 @@ impl Group {
                 SortModified,
                 SortReverse,
                 RenameEntry,
+                MarkDelete,
+                UnmarkDelete,
+                DeleteMarked,
             ],
         }
     }
@@ -77,6 +80,9 @@ pub(crate) enum Item {
     CopyPath,
     CopyEntryPath,
     RenameEntry,
+    MarkDelete,
+    UnmarkDelete,
+    DeleteMarked,
     SortName,
     SortSize,
     SortModified,
@@ -124,6 +130,9 @@ impl Item {
             Self::CopyPath => "Copy Full File Path",
             Self::CopyEntryPath => "Copy Entry Full Path",
             Self::RenameEntry => "Rename Entry",
+            Self::MarkDelete => "Mark for Deletion",
+            Self::UnmarkDelete => "Unmark Deletion",
+            Self::DeleteMarked => "Delete Marked Entries...",
             Self::SortName => "Sort by Name",
             Self::SortSize => "Sort by Size",
             Self::SortModified => "Sort by Modified",
@@ -154,6 +163,9 @@ impl Item {
         match (self, profile) {
             (Self::CopyEntryPath, _) => "w",
             (Self::RenameEntry, _) => "R",
+            (Self::MarkDelete, _) => "d",
+            (Self::UnmarkDelete, _) => "u",
+            (Self::DeleteMarked, _) => "x",
             (Self::SortReverse, _) => "S",
             (Self::Command, Profile::Emacs) => "M-x",
             (Self::New, Profile::Windows) => "Ctrl+N",
@@ -235,7 +247,11 @@ impl Menu {
         match item {
             Item::CopyEntryPath => self.directory_entry && self.copy_path,
             Item::RenameEntry => self.directory_entry && self.file_window,
-            Item::SortName | Item::SortSize | Item::SortModified | Item::SortReverse => self.directory,
+            Item::MarkDelete | Item::UnmarkDelete => self.directory_entry && self.file_window,
+            Item::DeleteMarked => self.directory && self.file_window,
+            Item::SortName | Item::SortSize | Item::SortModified | Item::SortReverse => {
+                self.directory
+            }
             Item::Cut | Item::Copy => self.copy,
             Item::CopyPath => self.copy_path,
             Item::Paste => self.paste,
@@ -249,7 +265,9 @@ impl Menu {
         match item {
             Item::SortName => self.directory && self.directory_sort == crate::directory::Sort::Name,
             Item::SortSize => self.directory && self.directory_sort == crate::directory::Sort::Size,
-            Item::SortModified => self.directory && self.directory_sort == crate::directory::Sort::Modified,
+            Item::SortModified => {
+                self.directory && self.directory_sort == crate::directory::Sort::Modified
+            }
             Item::SortReverse => self.directory && self.directory_reverse,
             Item::Windows => self.profile == Profile::Windows,
             Item::Emacs => self.profile == Profile::Emacs,

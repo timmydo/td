@@ -26,10 +26,14 @@ Directories also open through File > Open or a command-line path, for example
 - File > Copy Full File Path copies the directory's own absolute path.
 - `R` or Directory > Rename Entry renames within the current directory,
   without overwriting existing names; open tabs follow without losing edits.
+- `d` marks for deletion, `u` unmarks, and `x` reviews the marked entries.
+  PageUp/PageDown shows full paths; type `DELETE` and Return to confirm.
+  Deletion is permanent (no trash or Undo), never recursive, and refuses
+  open files/directories. Escape cancels before submission.
 
 Already-open files select their existing tab and preserve edits. Listings
 include dotfiles and escape unusual filename bytes; symlink activation is
-refused. Confirmed deletion is not implemented yet. See DESIGN.md
+refused. See DESIGN.md
 for sorting, resource limits, navigation failure and tab-reuse guarantees.
 
 ### Text editing
@@ -289,6 +293,14 @@ or undo history. Escape cancels the prompt; submission cannot be cancelled.
 Refresh stale listings with `g`. Remote `path-rename` answers use literal
 OS-byte basenames and report a `rename` job; inspect notices for any
 post-publication durability or listing-refresh warning.
+
+Deletion marks belong to each directory view. Sorting keeps them; refresh,
+navigation and completed filesystem rescans clear them. At most 64 entries
+can be marked. The worker checks the captured entries and stops on the first
+failure; earlier removals remain permanent and are counted in the notice.
+Non-empty directories and special devices are refused. A failed or lost
+reply is not proof that nothing was removed: inspect disk state before
+retrying. No batch is automatically retried.
 
 The file adapter also exposes a prepared Reload: dropping it keeps the old
 baseline, while accepting it adopts validated replacement bytes under a new

@@ -37,6 +37,8 @@ revision-bound remote answers; Dictionary jobs report bounded outcomes.
 Directory tabs provide metadata listings, sorting, path copy and same-parent
 no-overwrite rename. Rename has a pinned path prompt and remote job outcome;
 open tabs follow renamed paths without losing unsaved text or history.
+Directory deletion uses bounded marks and an explicit permanent-deletion
+confirmation, with live remote answers and historical job outcomes.
 Decoded key control drives editing, menus, Find, Replace, numeric and command
 entry with an exact native input-context fence. It requires real input
 readiness and cannot answer file/close/conflict flows. Decoded pointer
@@ -566,7 +568,7 @@ In the explicit feature build, an unset variable leaves scheduling ordinary.
 When set, it names a fixture-owned Unix listener. The file worker connects
 once and exchanges `td-file-v1 N KIND\n` / `continue N\n` before each job's
 I/O, including initial Open and Dictionary. KIND is `open`, `dictionary`,
-`reload`, `rename` or `save`; Save As shares `save`. N starts at 1 and is
+`reload`, `rename`, `delete` or `save`; Save As shares `save`. N starts at 1 and is
 checked for exhaustion. The channel carries no path, document bytes or
 model authority.
 The fixture automatically continues startup and unrelated jobs and may hold
@@ -1185,7 +1187,8 @@ Replace, text formatting and spelling. Selection, Find, Go To Line and
 navigation remain available. Directory views suppress the line-number gutter
 and soft wrapping without changing other tabs or the window preference.
 
-Each entry occupies one logical row with ls-style symbolic type/permissions,
+Each entry occupies one logical row with a two-character deletion mark
+column (`D ` or two spaces), ls-style symbolic type/permissions,
 link count, numeric UID/GID, byte size, UTC modification date/time, and an
 escaped basename (trailing slash for directories). Types are `d`, `-`, `l`,
 `b`, `c`, `p`, `s`, or `?`; permissions include set-ID and sticky `s/S/t/T`.
@@ -1209,8 +1212,8 @@ the current directory. Activation/refresh do not auto-repeat. Clicks below
 the last entry do nothing; directory clicks do not start text drags. Existing
 modifier readiness and decoded-input fences remain required. Back/Forward
 history, watchers, recursive traversal and background refresh are not
-implemented. Confirmed deletion is a subsequent increment, not an editable
-text command against a listing.
+implemented. Deletion is a separate confirmed filesystem action, never an
+editable text command against a listing.
 
 Directory > Sort by Name/Size/Modified and Reverse Sort change the cached
 listing without filesystem I/O. `s` cycles name, size, modified; `S`
@@ -1333,6 +1336,75 @@ or model admission does not undo rename:
 paths remain updated, old listing rows remain stale, and the notice asks for
 `g` refresh. Source observations add one fixed-size metadata stamp per cached
 entry and one parent identity per snapshot, still within the 4096-entry cap.
+
+#### Marked deletion
+
+Both profiles use `d` to mark the selected entry, `u` to unmark it, and `x`
+to review the marks. Directory menu items expose the same actions. Mark and
+unmark advance one row, capped at the last entry, and replace the clean
+listing at revision + 1. At most 64 entries per directory tab may be marked;
+sorting retains marks with their raw names and metadata. Refresh, navigation
+and successful post-operation rescans clear marks; duplicate tabs have
+independent marks. Failed rescan/admission leaves the old listing stale.
+These keys ignore repeat and pending Emacs prefixes.
+
+Review captures one immutable ordered batch of no-follow source
+observations from the listing, not from confirmation-time disk reads or
+display parsing. All names must be unique children of one observed
+parent, within 4096 bytes per resolved path. The revision/owner-bound
+`path-delete` prompt pages full escaped paths with PageUp/PageDown (also
+Tab/Shift-Tab and Down/Up). Each page shows at most two path lines at
+the current window's column width. Only two lines and one at-most-16-KiB
+escaped pathname plus its four-byte ordinal prefix are needed while
+paging; the batch retains at most 64 paths and fixed-size stamps.
+`DELETE` followed by Return explicitly confirms permanent removal, with
+no trash or Undo. Empty or other answers do not submit. Escape/C-g
+cancels without I/O. Physical confirmation additionally requires 32 path
+columns and room for all six prompt rows; a clipped question asks the
+user to enlarge the window. Captions fit those 32 columns even for the
+maximum escaped batch. Resizing clamps the review page before the next
+forward/backward navigation. Semantic confirmation remains independent
+of window size and exposes the complete captured batch through the
+separate read-only prompt response. Semantic `dialog-answer ... path
+44454c455445` confirms the same captured batch; decoded keys cannot
+answer a file dialog. There is no cancellation after submission, retry
+on disconnect, or rollback.
+
+The file worker refuses a batch containing an associated file pathname,
+ancestor, or retained device/inode alias. The coordinator additionally
+refuses open directory tabs at or beneath a requested entry. Closing a tab
+does not implicitly save or grant deletion: the user must explicitly close
+it and submit a new confirmation. Other tabs may still be edited/selected
+while the admitted batch runs; no new file job can join the exclusive slot.
+
+In captured order, each removal resolves/checks its parent, opens a safe
+std `O_PATH | O_NOFOLLOW` handle and compares the complete cached metadata
+stamp and named object immediately before removal. Regular files and links
+use safe `std::fs::remove_file`; directories use nonrecursive
+`std::fs::remove_dir`, which refuses non-empty directories. Other entry types
+refuse. Final links are removed themselves, never followed. This adds no raw
+syscall surface. As with existing path-based saves, these checks are not
+atomic with removal: same-authority ancestor/name replacement remains outside
+the guarantee. No claim is made that an inode comparison is unlink-by-handle.
+
+Removing one hard-link name can change another marked alias's cached
+stamp; that alias then refuses and requires a fresh scan and
+confirmation. The worker stops at the first refusal, removal error, sync
+error or readback uncertainty; remaining entries are unattempted.
+Earlier successful removals are counted and never reverted. Each
+successful syscall is followed by parent sync/identity check and
+no-follow absence readback. A reappearing name is not removed again. A
+syscall error can still follow a removal on a remote filesystem, so
+diagnostics explicitly require inspection before retrying. The returned
+count is successful kernel removals, not a durable atomic-batch claim.
+Full success produces a complete `delete` job; partial/failing batches
+produce an error job and a counted notice. Attempt status, the captured
+entry ordinal and failure reason precede a bounded escaped basename, so
+a long path cannot push the diagnostic out of the 512-scalar notice. A
+worker disconnect remains uncertain. The parent is rescanned even after
+partial completion; matching directory tabs refresh without changing
+unrelated focus, views or Emacs input. A failed rescan never undoes
+removal or erases its warning.
 
 ### Literal path completion
 

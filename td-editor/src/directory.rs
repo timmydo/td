@@ -46,6 +46,7 @@ impl Sort {
 
 #[derive(Clone)]
 struct Entry {
+    delete: bool,
     name: OsString,
     kind: char,
     mode: u32,
@@ -58,6 +59,35 @@ struct Entry {
 }
 
 impl Snapshot {
+    pub(crate) fn marked(&self) -> usize {
+        self.entries.iter().filter(|entry| entry.delete).count()
+    }
+
+    pub(crate) fn mark(&mut self, row: usize, delete: bool) -> Result<(), String> {
+        if delete && self.marked() >= 64 && !self.entries.get(row).is_some_and(|entry| entry.delete)
+        {
+            return Err("At most 64 deletion marks are allowed".into());
+        }
+        let entry = self
+            .entries
+            .get_mut(row)
+            .ok_or("No directory entry selected")?;
+        entry.delete = delete;
+        self.arrange(self.sort, self.reverse);
+        Ok(())
+    }
+
+    pub(crate) fn delete_plan(&self) -> Result<crate::files::DeletePlan, String> {
+        let sources = self
+            .entries
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| entry.delete)
+            .filter_map(|(row, _)| self.rename_source(row))
+            .collect();
+        crate::files::DeletePlan::new(sources).map_err(|e| e.to_string())
+    }
+
     pub(crate) fn rename_source(&self, row: usize) -> Option<crate::files::RenameSource> {
         let entry = self.entries.get(row)?;
         Some(crate::files::RenameSource::observed(
@@ -104,7 +134,8 @@ impl Snapshot {
                 self.text.push('\n');
             }
             self.text.push_str(&format!(
-                "{} {:>3} {:>5} {:>5} {:>10} {} ",
+                "{}{} {:>3} {:>5} {:>5} {:>10} {} ",
+                if entry.delete { "D " } else { "  " },
                 permissions(entry.kind, entry.mode),
                 entry.links,
                 entry.uid,
@@ -226,6 +257,7 @@ pub(crate) fn read(path: &Path) -> Result<Option<Snapshot>, String> {
             .map_err(|e| format!("Cannot inspect directory entry: {e}"))?;
         let kind = metadata.file_type();
         entries.push(Entry {
+            delete: false,
             name,
             kind: if kind.is_dir() {
                 'd'
@@ -300,6 +332,7 @@ mod tests {
     fn metadata_rows_sort_without_parsing_names_and_keep_directories_first() {
         let stamp = crate::files::Stamp::read(&std::fs::metadata(file!()).unwrap());
         let entry = |name: &[u8], kind, size, modified| Entry {
+            delete: false,
             name: std::ffi::OsStr::from_bytes(name).to_owned(),
             kind,
             mode: 0o640,

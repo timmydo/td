@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use std::fs::{self, File, Metadata, OpenOptions, Permissions};
 use std::io::{self, Write};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{fchown, FileExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt, PermissionsExt, fchown};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -193,7 +193,7 @@ struct Entry {
     rename_uncertain: bool,
 }
 
-/// A no-follow source observation. A rename refuses if this observation is
+/// A no-follow source observation. A mutation refuses if this observation is
 /// stale; callers must capture it when selecting the entry, not on approval.
 #[derive(Clone)]
 pub struct RenameSource {
@@ -235,11 +235,67 @@ impl RenameSource {
         {
             return Err(Failure::new(
                 Kind::Conflict,
-                "rename source changed; refresh and retry",
+                "directory entry changed; refresh and retry",
             ));
         }
         Ok(())
     }
+}
+
+/// Immutable, ordered observations captured before deletion confirmation.
+/// Shared rename observations pin names and metadata, not display strings.
+#[derive(Clone)]
+pub struct DeletePlan {
+    sources: Vec<RenameSource>,
+}
+
+impl DeletePlan {
+    pub fn new(sources: Vec<RenameSource>) -> Result<Self> {
+        let first = sources
+            .first()
+            .ok_or_else(|| Failure::new(Kind::InvalidPath, "No entries marked"))?;
+        if sources.len() > 64 {
+            return Err(Failure::new(
+                Kind::Limit,
+                "At most 64 deletion marks are allowed",
+            ));
+        }
+        let mut names = std::collections::BTreeSet::new();
+        for source in &sources {
+            if source.path.parent() != first.path.parent()
+                || source.parent_identity != first.parent_identity
+                || source.path.as_os_str().as_bytes().len() > 4096
+                || !names.insert(source.path.clone())
+            {
+                return Err(Failure::new(
+                    Kind::InvalidPath,
+                    "Deletion needs unique entries in one observed directory",
+                ));
+            }
+        }
+        Ok(Self { sources })
+    }
+
+    pub fn paths(&self) -> impl Iterator<Item = &Path> {
+        self.sources.iter().map(RenameSource::path)
+    }
+
+    pub fn len(&self) -> usize {
+        self.sources.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.sources.is_empty()
+    }
+}
+
+pub struct Deleted {
+    pub removed: usize,
+    pub requested: usize,
+    pub parent: PathBuf,
+    /// Stops at the first refusal, syscall error or durability uncertainty.
+    /// Earlier successful removals are not rolled back or retried.
+    pub failure: Option<String>,
 }
 
 /// Kernel publication succeeded. Even when durability/readback cannot be
@@ -352,6 +408,102 @@ impl Default for Session {
 }
 
 impl Session {
+    /// Permanently remove a confirmed batch, stopping on the first failure.
+    /// Open associations are protected; directories are never recursive.
+    pub fn delete(&mut self, plan: DeletePlan) -> Result<Deleted> {
+        self.delete_with(plan, &mut |_, _| Ok(()))
+    }
+
+    fn delete_with(
+        &mut self,
+        plan: DeletePlan,
+        hook: &mut dyn FnMut(Stage, &Path) -> io::Result<()>,
+    ) -> Result<Deleted> {
+        let parent = plan
+            .paths()
+            .next()
+            .and_then(Path::parent)
+            .ok_or_else(|| Failure::new(Kind::InvalidPath, "Deletion needs a parent"))?
+            .to_owned();
+        // Refuse the entire batch if any association could be affected.
+        for source in &plan.sources {
+            if self.entries.values().any(|entry| {
+                entry.location.path.starts_with(&source.path)
+                    || entry
+                        .stamp
+                        .as_ref()
+                        .is_some_and(|stamp| stamp.identity() == source.stamp.identity())
+            }) {
+                return Err(Failure::new(
+                    Kind::Exists,
+                    "Deletion includes an open file or its parent; close that tab first",
+                ));
+            }
+        }
+        let mut result = Deleted {
+            removed: 0,
+            requested: plan.len(),
+            parent,
+            failure: None,
+        };
+        for (index, source) in plan.sources.iter().enumerate() {
+            let mut attempted = false;
+            let removal = (|| -> Result<()> {
+                let location = Location::resolve(&source.path)?;
+                let node = OpenOptions::new()
+                    .read(true)
+                    .custom_flags(O_PATH | O_NOFOLLOW)
+                    .open(&location.path)?;
+                source.check(&location, &node)?;
+                let meta = node.metadata()?;
+                if !meta.is_file() && !meta.is_dir() && !meta.is_symlink() {
+                    return Err(Failure::new(
+                        Kind::NotRegular,
+                        "Deletion supports files, symlinks and empty directories only",
+                    ));
+                }
+                hook(Stage::Publish, &location.path)?;
+                source.check(&location, &node)?;
+                attempted = true;
+                if meta.is_dir() {
+                    fs::remove_dir(&location.path)?;
+                } else {
+                    fs::remove_file(&location.path)?;
+                }
+                result.removed += 1;
+                hook(Stage::SyncParent, &location.path)?;
+                location.parent.sync_all()?;
+                location.check_parent()?;
+                hook(Stage::Readback, &location.path)?;
+                match fs::symlink_metadata(&location.path) {
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+                    Err(e) => Err(e.into()),
+                    Ok(_) => Err(Failure::new(
+                        Kind::Conflict,
+                        "Name exists again after removal; not retried",
+                    )),
+                }
+            })();
+            if let Err(error) = removal {
+                let quoted = format!("{:?}", source.path.file_name().unwrap_or(source.path.as_os_str()));
+                let mut chars = quoted.chars();
+                let mut label: String = chars.by_ref().take(96).collect();
+                if chars.next().is_some() { label.push_str("..."); }
+                result.failure = Some(format!(
+                    "{}; entry {}/{}: {error}; name {label}",
+                    if attempted {
+                        "removal attempted; verify disk state before retrying"
+                    } else {
+                        "this removal was not attempted"
+                    },
+                    index + 1, plan.len()
+                ));
+                break;
+            }
+        }
+        Ok(result)
+    }
+
     /// Rename within the same directory, preserving the inode and all bytes.
     /// Existing destinations and paths reserved by other tabs are refused.
     pub fn rename(&mut self, source: RenameSource, name: &std::ffi::OsStr) -> Result<Renamed> {
@@ -959,7 +1111,7 @@ fn verify_destination(
                 return Err(Failure::new(
                     Kind::Exists,
                     "Save As/new-file save never overwrites an existing path",
-                ))
+                ));
             }
         }
     }
@@ -1009,7 +1161,7 @@ impl Temporary {
                         path,
                         file,
                         named: true,
-                    })
+                    });
                 }
                 Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
                 Err(e) => return Err(e.into()),
@@ -1109,6 +1261,89 @@ mod tests {
     impl Drop for Directory {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn deletion_is_nofollow_nonrecursive_and_reports_partial_results() {
+        let dir = Directory::new();
+        let keep = dir.write("keep", b"keep");
+        let link = dir.path("link");
+        symlink(&keep, &link).unwrap();
+        let empty = dir.path("empty");
+        fs::create_dir(&empty).unwrap();
+        let nonempty = dir.path("full");
+        fs::create_dir(&nonempty).unwrap();
+        fs::write(nonempty.join("child"), b"child").unwrap();
+        let later = dir.write("later", b"later");
+        let plan = DeletePlan::new(
+            [&link, &empty, &nonempty, &later]
+                .into_iter()
+                .map(|path| RenameSource::inspect(path).unwrap())
+                .collect(),
+        )
+        .unwrap();
+        let result = Session::default().delete(plan).unwrap();
+        assert_eq!((result.removed, result.requested), (2, 4));
+        assert!(result.failure.unwrap().contains("removal attempted"));
+        assert!(fs::symlink_metadata(link).is_err());
+        assert!(!empty.exists());
+        assert_eq!(fs::read(keep).unwrap(), b"keep");
+        assert_eq!(fs::read(nonempty.join("child")).unwrap(), b"child");
+        assert_eq!(fs::read(later).unwrap(), b"later");
+        dir.no_temporaries();
+    }
+
+    #[test]
+    fn deletion_refuses_open_aliases_stale_observations_and_invalid_batches() {
+        let dir = Directory::new();
+        let path = dir.write("file", b"disk");
+        let alias = dir.path("alias");
+        fs::hard_link(&path, &alias).unwrap();
+        let mut files = Session::default();
+        files.open(&path).unwrap();
+        let plan = DeletePlan::new(vec![RenameSource::inspect(&alias).unwrap()]).unwrap();
+        assert_eq!(files.delete(plan).err().unwrap().kind, Kind::Exists);
+        assert_eq!(fs::read(&alias).unwrap(), b"disk");
+        let source = RenameSource::inspect(&path).unwrap();
+        assert!(DeletePlan::new(vec![]).is_err());
+        assert!(DeletePlan::new(vec![source.clone(), source.clone()]).is_err());
+        assert!(DeletePlan::new(vec![source.clone(); 65]).is_err());
+        fs::write(&path, b"changed").unwrap();
+        let result = Session::default()
+            .delete(DeletePlan::new(vec![source]).unwrap())
+            .unwrap();
+        assert_eq!(result.removed, 0);
+        assert!(result.failure.unwrap().contains("not attempted"));
+        assert_eq!(fs::read(path).unwrap(), b"changed");
+    }
+
+    #[test]
+    fn deletion_rechecks_before_removal_and_never_retries_uncertain_results() {
+        for fail in [Stage::Publish, Stage::SyncParent, Stage::Readback] {
+            let dir = Directory::new();
+            let path = dir.write("file", b"disk");
+            let later = dir.write("later", b"untouched");
+            let plan = DeletePlan::new(vec![
+                RenameSource::inspect(&path).unwrap(),
+                RenameSource::inspect(&later).unwrap(),
+            ])
+            .unwrap();
+            let result = Session::default()
+                .delete_with(plan, &mut |stage, path| {
+                    if stage == fail {
+                        fs::write(path, b"external replacement")?;
+                        if stage == Stage::SyncParent {
+                            return Err(io::Error::other("injected sync failure"));
+                        }
+                    }
+                    Ok(())
+                })
+                .unwrap();
+            assert_eq!(result.removed, usize::from(fail != Stage::Publish));
+            assert!(result.failure.is_some());
+            assert_eq!(fs::read(path).unwrap(), b"external replacement");
+            assert_eq!(fs::read(later).unwrap(), b"untouched");
         }
     }
 
