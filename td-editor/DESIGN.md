@@ -1174,10 +1174,16 @@ Replace, text formatting and spelling. Selection, Find, Go To Line and
 navigation remain available. Directory views suppress the line-number gutter
 and soft wrapping without changing other tabs or the window preference.
 
-Each entry occupies one logical row: `d ` plus an escaped basename and
-trailing slash for directories, `f ` for regular files, `l ` for symlinks,
-and `? ` for other types. Directories sort first, then other entries; each
-group uses raw Unix-byte basename order, including dotfiles. Names use ASCII
+Each entry occupies one logical row with ls-style symbolic type/permissions,
+link count, numeric UID/GID, byte size, UTC modification date/time, and an
+escaped basename (trailing slash for directories). Types are `d`, `-`, `l`,
+`b`, `c`, `p`, `s`, or `?`; permissions include set-ID and sticky `s/S/t/T`.
+Each entry uses no-follow metadata: symlinks describe the link, not its
+target. ACLs, xattrs, user/group name lookup and symlink target text are not
+displayed. Dates use `YYYY-MM-DD HH:MMZ`, including dates before 1970;
+years outside 0000..9999 display `????-??-?? ??:??Z` while sorting still
+uses the exact signed seconds/nanoseconds. This uses no host timezone or
+account database. Names use ASCII
 byte escapes for non-ASCII bytes, controls and backslashes. Activation uses
 retained literal `OsString` names, never parsed display text. Empty listings
 have no activatable row. Final symlinks are not followed on activation, even
@@ -1195,6 +1201,21 @@ history, watchers, recursive traversal and background refresh are not
 implemented. Rename and confirmed deletion are subsequent increments, not
 editable text commands against a listing.
 
+Directory > Sort by Name/Size/Modified and Reverse Sort change the cached
+listing without filesystem I/O. `s` cycles name, size, modified; `S`
+reverses order. Directories remain first in either direction. Default name
+sort is ascending raw Unix bytes, including dotfiles; size is largest first,
+modified is newest first (nanosecond precision). Equal size/time uses
+ascending raw names; reverse reverses that tie-break as well. The menu
+checks the current choices; native state also reports them. Sorting requires
+an idle file worker, keeps the TabId, replaces the clean read-only listing
+at revision + 1 and preserves the selected basename, collapsing selection
+to its row start. It resets the viewport and reveals that entry. Revision,
+text budgets and both controller dispatch slots are checked before mutation.
+In-place directory navigation and refresh retain sort preferences; new
+directory tabs start with name order. Sorting does not refresh metadata.
+All single-key directory actions ignore auto-repeat and pending Emacs prefixes.
+
 Reads occupy the existing file worker's exclusive slot. Scans admit at most
 4096 entries and 1 MiB of raw basename bytes; any read/type error or exceeded
 bound refuses the whole result. Input/resolved paths and activated child
@@ -1203,7 +1224,7 @@ scan, but this is not an atomic filesystem snapshot or protection against
 same-authority pathname races. Entries can become stale immediately; each
 activation performs ordinary file/directory admission again. The worker
 retains its existing unbounded syscall-duration limitation.
-Display expansion is bounded by four bytes per name byte plus four bytes
+Display expansion is bounded by four bytes per name byte plus 128 bytes
 per entry and charged to the model's live-text budget. Each admitted
 directory additionally retains at most 1 MiB of raw names and 4096 fixed-size
 entry records, with no duplicate listing string, baseline, file handle or
@@ -1227,6 +1248,16 @@ without an added slash, quotes or newline (root remains `/`). It uses the
 same physical activation serial, UTF-8 bound and immutable clipboard offer
 as file paths, not the selected entry's pathname. Control state exposes
 directory kind, raw path and entry count; text pages expose escaped rows.
+Directory > Copy Entry Full Path or `w` offers the selected row's absolute
+literal path, without resolving a symlink target or appending a slash. It
+does not copy the displayed metadata or escaped name. Empty directories,
+non-UTF-8 paths, stale tab/revision and missing physical clipboard authority
+refuse without replacing the previous offer. The path is a cached pathname,
+not a promise that the entry still exists. Both profiles share this action.
+Decoded input cannot manufacture the physical serial; selected raw paths
+for the active directory are available through read-only directory-entry
+state. Only one selected path is emitted, retaining the one-MiB state-frame
+bound even with 64 maximum-length directory paths.
 Open jobs and fenced decoded input use the same navigation/worker path as
 physical input, with no filesystem mutation shortcut.
 

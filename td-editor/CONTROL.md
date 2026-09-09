@@ -1281,6 +1281,16 @@ physical readiness.
 Directory Open uses the ordinary `open` job protocol and returns its tab and
 revision. Native state additionally includes one
 `directory=TAB,ENTRY_COUNT,PATH_HEX` field per directory tab, before `adapter`.
+Each also adds `directory-sort=TAB,name|size|modified,REVERSED`, with a 0/1
+reverse flag. Only the active directory adds `directory-entry=TAB,PATH_HEX`
+for its caret row, if one exists, keeping state within its one-MiB frame
+even at 64 tabs with maximum-length paths. This is the cached absolute
+literal OS-byte pathname, not display
+text, a symlink target, current filesystem identity or clipboard authority.
+Text pages contain the metadata columns documented in DESIGN.md. Fenced
+decoded `s`/`S` and Directory-menu input change sort through the same native
+path; revision changes invalidate old entry coordinates. Physical `w` or
+Directory > Copy Entry Full Path uses the existing clipboard authority.
 The path is the resolved absolute literal Unix pathname, at most 4096 bytes;
 there are at most 64 rows. These fields are read-only metadata. Decoded
 Enter/click reuses a directory tab, Shift+Enter or pointer `extend=1` opens a

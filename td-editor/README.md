@@ -382,6 +382,15 @@ Active prompts reserve space above the tabs. The tabs and document move
 down while the minibuffer is open, so Find, Replace and Open no longer
 cover the beginning of the visible buffer. Escape removes this space.
 
+Directory tabs show an ls-style long listing: permissions, link count,
+numeric owner/group IDs, size in bytes, modification time in UTC, and name.
+The Directory menu sorts by name, size or modification time and can reverse
+the order; directories stay first. `s` cycles the sort and `S` reverses it.
+Sorting keeps the selected entry; `g` refreshes metadata with the same sort.
+Use arrow keys to choose an entry, then `w` or Directory > Copy Entry Full
+Path to copy its absolute path. File > Copy Full File Path still copies the
+directory tab's own path. Click/Enter opens here; Shift opens a new tab.
+
 Switch tabs with Ctrl+Tab. An existing file opened again selects its current
 tab without reloading it. External disk changes refuse Save and offer Ctrl+R
 Reload, Ctrl+S Save As to a new name, or Escape/Ctrl+G Cancel. These dialog

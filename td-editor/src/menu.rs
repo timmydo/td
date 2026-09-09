@@ -10,16 +10,18 @@ pub(crate) enum Group {
     Edit,
     Format,
     Help,
+    Directory,
 }
 
 impl Group {
-    pub(crate) const ALL: [Self; 4] = [Self::File, Self::Edit, Self::Format, Self::Help];
+    pub(crate) const ALL: [Self; 5] = [Self::File, Self::Edit, Self::Format, Self::Help, Self::Directory];
     pub(crate) fn index(self) -> usize {
         match self {
             Self::File => 0,
             Self::Edit => 1,
             Self::Format => 2,
             Self::Help => 3,
+            Self::Directory => 4,
         }
     }
     pub(crate) fn items(self) -> &'static [Item] {
@@ -53,6 +55,7 @@ impl Group {
                 LineNumbers,
             ],
             Self::Help => &[About, Command],
+            Self::Directory => &[CopyEntryPath, SortName, SortSize, SortModified, SortReverse],
         }
     }
 }
@@ -65,6 +68,11 @@ pub(crate) enum Item {
     SaveAs,
     Close,
     CopyPath,
+    CopyEntryPath,
+    SortName,
+    SortSize,
+    SortModified,
+    SortReverse,
     Quit,
     Undo,
     Redo,
@@ -106,6 +114,11 @@ impl Item {
             Self::Cut => "Cut",
             Self::Copy => "Copy",
             Self::CopyPath => "Copy Full File Path",
+            Self::CopyEntryPath => "Copy Entry Full Path",
+            Self::SortName => "Sort by Name",
+            Self::SortSize => "Sort by Size",
+            Self::SortModified => "Sort by Modified",
+            Self::SortReverse => "Reverse Sort",
             Self::Paste => "Paste",
             Self::SelectAll => "Select All",
             Self::Windows => "Windows key bindings",
@@ -130,6 +143,8 @@ impl Item {
     }
     pub(crate) fn shortcut(self, profile: Profile) -> &'static str {
         match (self, profile) {
+            (Self::CopyEntryPath, _) => "w",
+            (Self::SortReverse, _) => "S",
             (Self::Command, Profile::Emacs) => "M-x",
             (Self::New, Profile::Windows) => "Ctrl+N",
             (Self::Open, Profile::Windows) => "Ctrl+O",
@@ -171,6 +186,9 @@ pub(crate) struct Menu {
     pub(crate) profile: Profile,
     pub(crate) file_window: bool,
     pub(crate) directory: bool,
+    pub(crate) directory_entry: bool,
+    pub(crate) directory_sort: crate::directory::Sort,
+    pub(crate) directory_reverse: bool,
     pub(crate) undo: bool,
     pub(crate) redo: bool,
     pub(crate) wrap: bool,
@@ -205,6 +223,8 @@ impl Menu {
             return false;
         }
         match item {
+            Item::CopyEntryPath => self.directory_entry && self.copy_path,
+            Item::SortName | Item::SortSize | Item::SortModified | Item::SortReverse => self.directory,
             Item::Cut | Item::Copy => self.copy,
             Item::CopyPath => self.copy_path,
             Item::Paste => self.paste,
@@ -216,6 +236,10 @@ impl Menu {
     }
     fn checked(&self, item: Item) -> bool {
         match item {
+            Item::SortName => self.directory && self.directory_sort == crate::directory::Sort::Name,
+            Item::SortSize => self.directory && self.directory_sort == crate::directory::Sort::Size,
+            Item::SortModified => self.directory && self.directory_sort == crate::directory::Sort::Modified,
+            Item::SortReverse => self.directory && self.directory_reverse,
             Item::Windows => self.profile == Profile::Windows,
             Item::Emacs => self.profile == Profile::Emacs,
             Item::Wrap => self.wrap,
@@ -346,6 +370,9 @@ mod tests {
     fn menu(group: Group) -> Menu {
         Menu {
             directory: false,
+            directory_entry: false,
+            directory_sort: crate::directory::Sort::Name,
+            directory_reverse: false,
             group,
             selected: 0,
             target: Target {
@@ -496,9 +523,9 @@ mod tests {
             );
             assert_eq!(header(geometry, rect.x, 24), None);
         }
-        assert!(geometry.menu(4).is_none());
+        assert!(geometry.menu(5).is_none());
         assert!(geometry.menu(usize::MAX).is_none());
         let help = geometry.menu(Group::Help.index()).unwrap();
-        assert_eq!(help.x + i64::from(help.width), 224);
+        assert_eq!(help.x + i64::from(help.width), 248);
     }
 }

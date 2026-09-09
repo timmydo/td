@@ -1401,8 +1401,26 @@ impl Window {
         let Some(tab) = self.ui.editor().active() else {
             return Ok(false);
         };
-        let revision = self.ui.editor().document(tab).map_err(error)?.revision();
-        if self.ui.editor().document(tab).map_err(error)?.directory()
+        let doc = self.ui.editor().document(tab).map_err(error)?;
+        let revision = doc.revision();
+        let directory = doc.directory();
+        if directory
+            && !self.ui.keys().pending() && matches!(chord, "w" | "s" | "S")
+        {
+            if !repeated {
+                if chord == "w" { self.clipboard_request("copy-entry-path", tab, revision)?; }
+                else {
+                    let directory = self.files.as_ref().and_then(|files| files.directory(tab));
+                    if let Some(directory) = directory {
+                        let sort = if chord == "s" { directory.sort.next() } else { directory.sort };
+                        let reverse = if chord == "S" { !directory.reverse } else { directory.reverse };
+                        self.sort_directory(tab, revision, sort, reverse);
+                    }
+                }
+            }
+            return Ok(false);
+        }
+        if directory
             && !self.ui.keys().pending()
             && matches!(chord, "Return" | "S-Return" | "^" | "g")
         {
@@ -2957,6 +2975,13 @@ impl Window {
                             directory.len(),
                             crate::control::hex(directory.path.as_os_str().as_encoded_bytes())
                         ));
+                        response.push_str(&format!("\tdirectory-sort={tab},{},{}",
+                            directory.sort.label(), u8::from(directory.reverse)));
+                        if let Some(path) = (self.ui.editor().active() == Some(tab))
+                            .then(|| self.directory_entry_path(tab)).flatten() {
+                            response.push_str(&format!("\tdirectory-entry={tab},{}",
+                                crate::control::hex(path.as_os_str().as_encoded_bytes())));
+                        }
                     }
                 }
             }
@@ -3284,6 +3309,10 @@ impl Window {
             profile: self.ui.keys().profile(),
             file_window: self.files.is_some(),
             directory: doc.directory(),
+            directory_entry: self.directory_entry_path(tab).is_some(),
+            directory_sort: self.files.as_ref().and_then(|f| f.directory(tab)).map_or(
+                crate::directory::Sort::Name, |d| d.sort),
+            directory_reverse: self.files.as_ref().and_then(|f| f.directory(tab)).is_some_and(|d| d.reverse),
             undo: undo != 0,
             redo: redo != 0,
             auto_fill: doc.auto_fill(),
@@ -3473,12 +3502,26 @@ impl Window {
                 self.close();
                 return Ok(());
             }
-            Item::Cut | Item::Copy | Item::CopyPath | Item::Paste => {
+            Item::SortName | Item::SortSize | Item::SortModified | Item::SortReverse => {
+                if let Some(directory) = self.files.as_ref().and_then(|f| f.directory(tab)) {
+                    let sort = match item {
+                        Item::SortName => crate::directory::Sort::Name,
+                        Item::SortSize => crate::directory::Sort::Size,
+                        Item::SortModified => crate::directory::Sort::Modified,
+                        _ => directory.sort,
+                    };
+                    let reverse = if item == Item::SortReverse { !directory.reverse } else { directory.reverse };
+                    self.sort_directory(tab, revision, sort, reverse);
+                }
+                return Ok(());
+            }
+            Item::Cut | Item::Copy | Item::CopyPath | Item::CopyEntryPath | Item::Paste => {
                 self.clipboard_request(
                     match item {
                         Item::Cut => "cut",
                         Item::Copy => "copy",
                         Item::CopyPath => "copy-path",
+                        Item::CopyEntryPath => "copy-entry-path",
                         Item::Paste => "paste",
                         _ => return Err("non-clipboard menu item".into()),
                     },
@@ -4021,6 +4064,27 @@ impl Window {
         self.frames.invalidate(true);
         self.cancel_stale_paste();
         Ok(())
+    }
+
+    fn directory_entry_path(&self, tab: crate::model::TabId) -> Option<PathBuf> {
+        let doc = self.ui.editor().document(tab).ok()?;
+        let row = doc.text().get(..doc.selection().caret)?.bytes().filter(|b| *b == b'\n').count();
+        self.files.as_ref()?.directory(tab)?.entry(row)
+    }
+
+    fn sort_directory(&mut self, tab: crate::model::TabId, revision: u64,
+        sort: crate::directory::Sort, reverse: bool) {
+        let result = self.files.as_mut().ok_or_else(|| "Not a file window".to_string())
+            .and_then(|files| files.sort_directory(&mut self.ui, tab, revision, sort, reverse));
+        match result {
+            Ok(()) => {
+                self.stop_pointer();
+                self.input.cancel_repeat();
+                self.notify(format!("Directory sort: {}{}; directories first; dates UTC", sort.label(),
+                    if reverse { " (reversed)" } else { "" }));
+            }
+            Err(detail) => self.notify(format!("Sort refused: {detail}")),
+        }
     }
 
     fn browse_directory(
@@ -4924,15 +4988,20 @@ impl Window {
             self.notify("Clipboard is being sent; retry the clipboard action after it completes.");
             return Ok(());
         }
-        if name == "copy-path" {
+        if matches!(name, "copy-path" | "copy-entry-path") {
             if self.ui.editor().active() != Some(tab)
                 || self.ui.editor().revision_point(tab, revision).is_err()
             {
                 self.notify("Copy path refused: document changed.");
                 return Ok(());
             }
-            let Some(path) = self.files.as_ref().and_then(|files| files.path(tab)) else {
-                self.notify("Copy path unavailable: this tab has no file path.");
+            let entry = if name == "copy-entry-path" { self.directory_entry_path(tab) } else { None };
+            let path = if name == "copy-entry-path" { entry.as_deref() }
+                else { self.files.as_ref().and_then(|files| files.path(tab)) };
+            let Some(path) = path else {
+                self.notify(if name == "copy-entry-path" {
+                    "Copy entry path unavailable: no directory entry selected."
+                } else { "Copy path unavailable: this tab has no file path." });
                 return Ok(());
             };
             let Some(text) = path
@@ -6179,6 +6248,31 @@ mod tests {
     }
 
     #[test]
+    fn directory_state_fits_frame_with_sixty_four_maximum_length_paths() {
+        let directory = DialogDirectory::new();
+        let mut path = directory.0.clone();
+        while path.as_os_str().as_encoded_bytes().len() < 4090 {
+            let remaining = 4090 - path.as_os_str().as_encoded_bytes().len();
+            let length = if remaining == 257 { 254 } else { (remaining - 1).min(255) };
+            path.push("a".repeat(length));
+            std::fs::create_dir(&path).unwrap();
+        }
+        std::fs::write(path.join("x"), b"x").unwrap();
+        let (mut w, _peer) = file_dialog_fixture();
+        w.ui = Controller::default();
+        for _ in 0..64 {
+            w.files.as_mut().unwrap().initial_open(&mut w.ui, path.clone()).unwrap();
+        }
+        let request = crate::control::Request::parse(b"1\t0\tstate").unwrap();
+        let state = w.control_response(&request);
+        assert!(state.len() < crate::control::MAX_FRAME, "{}", state.len());
+        assert_eq!(state.matches("\tdirectory=").count(), 64);
+        assert_eq!(state.matches("\tdirectory-entry=").count(), 1);
+        assert!(state.contains(&format!("directory-entry=64,{}",
+            crate::control::hex(path.join("x").as_os_str().as_encoded_bytes()))));
+    }
+
+    #[test]
     fn directory_copy_path_menu_and_scaled_pointer_navigation() {
         for scale in 1..=4 {
             let directory = DialogDirectory::new();
@@ -6207,6 +6301,12 @@ mod tests {
             assert!(drain(&peer)
                 .0
                 .contains(&message(device, 1, &[*source, 7788])));
+            let previous = w.clipboard.source.as_ref().unwrap().0;
+            w.chord("w", false).unwrap(); // No current physical activation.
+            assert_eq!(w.clipboard.source.as_ref().unwrap().0, previous);
+            w.event(message(keyboard, 3, &[9900, 0, 17, 1])).unwrap(); // w
+            w.event(message(keyboard, 3, &[9901, 0, 17, 0])).unwrap();
+            assert_eq!(w.clipboard.source.as_ref().unwrap().1.as_ref(), directory.path("child").to_str().unwrap());
             assert!(w.spelling_request(1, 0).is_err());
             assert!(!w.file_request("save-as", 1, 0));
             assert!(w.prompt.is_none());
@@ -6219,7 +6319,7 @@ mod tests {
             .unwrap();
             finish_file(&mut w);
             assert_eq!(w.ui.editor().active(), Some(2));
-            assert_eq!(w.ui.editor().document(2).unwrap().text(), "f note");
+            assert!(w.ui.editor().document(2).unwrap().text().ends_with(" note"));
             assert_eq!(
                 w.files.as_ref().unwrap().path(1),
                 Some(directory.0.as_path())
@@ -12359,7 +12459,7 @@ mod tests {
         let pointer = w.pointer.device.unwrap();
         w.chord("F10", false).unwrap();
         w.chord("Left", false).unwrap();
-        assert_eq!(w.menu.as_ref().unwrap().group, Group::Help);
+        assert_eq!(w.menu.as_ref().unwrap().group, Group::Directory);
         w.chord("Right", false).unwrap();
         assert_eq!(w.menu.as_ref().unwrap().group, Group::File);
         w.chord("Right", false).unwrap();

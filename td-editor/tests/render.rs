@@ -734,7 +734,8 @@ fn the_real_binary_exposes_a_deterministic_preview_and_its_font_notices() {
         .fold(0xcbf29ce484222325u64, |hash, byte| {
             (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
         });
-    assert_eq!(hash, 0xd83cb0c8983b1d96, "preview checksum: {hash:016x}");
+    // The fifth header is Directory; document pixels are unchanged.
+    assert_eq!(hash, 0xa29d7836c9624a04, "preview checksum: {hash:016x}");
     let output = std::process::Command::new(exe)
         .arg("--font-license")
         .output()

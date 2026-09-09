@@ -180,6 +180,65 @@ impl Session {
         self.directories.get(&tab)
     }
 
+    pub(crate) fn sort_directory(
+        &mut self,
+        ui: &mut Controller,
+        tab: TabId,
+        revision: u64,
+        sort: crate::directory::Sort,
+        reverse: bool,
+    ) -> Result<()> {
+        self.available()?;
+        let point = ui
+            .editor()
+            .revision_point(tab, revision)
+            .map_err(|e| e.to_string())?;
+        let doc = ui.editor().document(tab).map_err(|e| e.to_string())?;
+        let row = doc
+            .text()
+            .get(..doc.selection().caret)
+            .ok_or("Invalid directory selection")?
+            .bytes()
+            .filter(|b| *b == b'\n')
+            .count();
+        let old = self.directory(tab).ok_or("Not a directory tab")?;
+        if old.sort == sort && old.reverse == reverse {
+            return Ok(());
+        }
+        ui.generation()
+            .checked_add(2)
+            .ok_or("Directory layout counter exhausted")?;
+        let next = revision
+            .checked_add(1)
+            .ok_or("Directory revision exhausted")?;
+        let selected = old.entry(row);
+        let mut snapshot = old.clone();
+        snapshot.arrange(sort, reverse);
+        let caret = selected.as_ref().map_or(0, |path| snapshot.offset(path));
+        ui.dispatch(Event::Open(crate::model::Open {
+            source: Some(point),
+            bytes: snapshot.text.as_bytes(),
+            missing: false,
+            directory: true,
+            existing: None,
+        }))
+        .map_err(|e| e.to_string())?;
+        // Both generations were reserved; caret is a boundary in this exact
+        // admitted ASCII listing, so selection cannot fail after replacement.
+        ui.dispatch(Event::Edit {
+            tab,
+            revision: next,
+            command: crate::model::Command::Select(crate::model::Selection {
+                anchor: caret,
+                caret,
+            }),
+        })
+        .map_err(|e| e.to_string())?;
+        snapshot.text = String::new();
+        self.directories.insert(tab, snapshot);
+        Ok(())
+    }
+
     pub(crate) fn dictionary(&mut self, path: PathBuf) -> Result<()> {
         let bytes = path.as_os_str().as_bytes();
         if bytes.is_empty() || bytes.len() > 4096 || bytes.contains(&0) {
@@ -418,13 +477,16 @@ impl Session {
             }
             (
                 Some(pending @ (Pending::Open | Pending::Browse(_))),
-                completion @ (Completion::Open(_) | Completion::Directory(_)),
+                mut completion @ (Completion::Open(_) | Completion::Directory(_)),
             ) => {
                 let source = match pending {
                     Pending::Browse(point) => Some(point),
                     _ => None,
                 };
                 let replaced = source.as_ref().map(|point| point.tab);
+                if let (Some(tab), Completion::Directory(snapshot)) = (replaced, &mut completion) {
+                    if let Some(old) = self.directory(tab) { snapshot.arrange(old.sort, old.reverse); }
+                }
                 let (bytes, missing, directory, existing) = match &completion {
                     Completion::Directory(snapshot) => {
                         (snapshot.text.as_bytes(), false, true, None)
@@ -466,7 +528,7 @@ impl Session {
                     Completion::Directory(mut snapshot) => {
                         snapshot.text = String::new();
                         self.directories.insert(tab, snapshot);
-                        return Ok("Directory: Enter/click opens here; Shift opens a new tab; ^ parent; g refresh".into());
+                        return Ok("Directory: Enter/click opens; Shift new tab; ^ parent; g refresh; w copy path; s sort; S reverse".into());
                     }
                     _ => return Err("Invalid Open completion".into()),
                 };
@@ -914,7 +976,7 @@ mod tests {
         let mut h = Harness::new();
         let tab = h.open(dir.0.clone());
         assert!(h.ui.editor().document(tab).unwrap().directory());
-        assert_eq!(h.ui.editor().document(tab).unwrap().text(), "d child/");
+        assert!(h.ui.editor().document(tab).unwrap().text().ends_with(" child/"));
         assert!(!h.ui.tab_view(tab).unwrap().soft_wrap);
         assert_eq!(h.session.path(tab), Some(dir.0.as_path()));
         h.session
@@ -1002,7 +1064,7 @@ mod tests {
             .unwrap();
         assert!(h.complete().is_err());
         assert_eq!(h.ui.generation(), generation);
-        assert_eq!(h.ui.editor().document(tab).unwrap().text(), "f bad");
+        assert!(h.ui.editor().document(tab).unwrap().text().ends_with(" bad"));
         assert_eq!(h.session.path(tab), Some(dir.0.as_path()));
         assert!(!dir.path("output").exists());
         h.session
@@ -1054,6 +1116,45 @@ mod tests {
     }
 
     #[test]
+    fn directory_sort_preserves_selected_name_readonly_state_and_refresh_order() {
+        use crate::directory::Sort;
+        let dir = Directory::new();
+        fs::create_dir(dir.path("child")).unwrap();
+        fs::write(dir.path("a"), "a").unwrap();
+        fs::write(dir.path("z"), "largest").unwrap();
+        let mut h = Harness::new();
+        let tab = h.open(dir.0.clone());
+        let caret = h.ui.editor().document(tab).unwrap().text().lines().next().unwrap().len() + 1;
+        h.ui.dispatch(Event::Edit { tab, revision: 0, command: Command::Select(
+            crate::model::Selection { anchor: caret, caret }) }).unwrap();
+        h.session.sort_directory(&mut h.ui, tab, 0, Sort::Size, false).unwrap();
+        let doc = h.ui.editor().document(tab).unwrap();
+        assert_eq!(doc.revision(), 1);
+        assert!(doc.directory() && !doc.dirty());
+        assert_eq!(doc.history_depth(), (0, 0));
+        assert_eq!(doc.text().get(doc.selection().caret..).unwrap().split_whitespace().last(), Some("a"));
+        assert_eq!(h.session.directory(tab).unwrap().entry(1), Some(dir.path("z")));
+        let before = format!("{:?}", h.ui.editor());
+        assert!(h.session.sort_directory(&mut h.ui, tab, 0, Sort::Name, false).is_err());
+        assert_eq!(format!("{:?}", h.ui.editor()), before);
+        let generation = h.ui.generation();
+        h.ui.generation_for_test(u64::MAX - 1);
+        assert!(h.session.sort_directory(&mut h.ui, tab, 1, Sort::Name, false).is_err());
+        assert_eq!(format!("{:?}", h.ui.editor()), before);
+        assert_eq!(h.session.directory(tab).unwrap().sort, Sort::Size);
+        h.ui.generation_for_test(generation);
+        h.session.browse(&h.ui, tab, 1, dir.0.clone(), false).unwrap();
+        assert!(h.session.sort_directory(&mut h.ui, tab, 1, Sort::Name, false).is_err());
+        h.complete().unwrap();
+        assert_eq!(h.session.directory(tab).unwrap().sort, Sort::Size);
+        assert_eq!(h.session.directory(tab).unwrap().entry(1), Some(dir.path("z")));
+        h.session.sort_directory(&mut h.ui, tab, 2, Sort::Size, true).unwrap();
+        assert_eq!(h.session.directory(tab).unwrap().entry(0), Some(dir.path("child")));
+        assert_eq!(h.session.directory(tab).unwrap().entry(1), Some(dir.path("a")));
+        assert_eq!(fs::read(dir.path("z")).unwrap(), b"largest");
+    }
+
+    #[test]
     fn directory_raw_names_bounds_empty_and_symlink_policy() {
         use std::os::unix::ffi::OsStringExt;
         let dir = Directory::new();
@@ -1062,7 +1163,9 @@ mod tests {
         fs::create_dir(dir.path("z")).unwrap();
         std::os::unix::fs::symlink(dir.path("z"), dir.path("link")).unwrap();
         let snapshot = crate::directory::read(&dir.0).unwrap().unwrap();
-        assert_eq!(snapshot.text, "d z/\nf bad\\xff\\n\\\\name\nl link");
+        assert_eq!(snapshot.text.lines().map(|line| line.split_whitespace().last().unwrap()).collect::<Vec<_>>(),
+            ["z/", "bad\\xff\\n\\\\name", "link"]);
+        assert_eq!(snapshot.text.lines().map(|line| line.chars().next().unwrap()).collect::<Vec<_>>(), ['d', '-', 'l']);
         assert_eq!(snapshot.entry(1), Some(dir.0.join(raw)));
         assert_eq!(snapshot.entry(3), None);
         assert!(crate::directory::read(&dir.path("link/"))

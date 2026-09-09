@@ -142,7 +142,7 @@ pub struct Geometry {
 
 pub const MAX_PROMPT_ROWS: usize = 15;
 
-const MENU_BAR: &str = "File   Edit   Format   Help";
+const MENU_BAR: &str = "File   Edit   Format   Help   Directory";
 
 impl Default for Geometry {
     fn default() -> Self {
