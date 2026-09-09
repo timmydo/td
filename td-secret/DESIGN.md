@@ -774,7 +774,7 @@ normal cargo pass with those tests ignored is not TPM integration evidence.
 
 `td-recipe-eval qemu-secret --tpm /absolute/path/to/swtpm` requires the
 same pinned host swtpm described above and adds four cold TPM guest boots
-and the two HID guests below to the authority checks. The host starts a
+and the four HID guests below to the authority checks. The host starts a
 private software TPM control socket and attaches QEMU's emulated TIS device; there is no host TPM
 passthrough. The source-built test executable calls the unchanged
 `Device::open` and `Client` implementations through `/dev/tpmrm0`.
@@ -802,7 +802,7 @@ credential-store write. The stock deployment remains unenrolled.
 
 ### HID through the QEMU guest kernel
 
-The same optional command runs two further isolated guests using a
+The same optional command runs four further isolated guests using a
 test-only virtual token created through Linux
 [UHID](https://docs.kernel.org/hid/uhid.html). The fixture requires its
 kernel opt-in and exact case selector before opening `/dev/uhid`, then
@@ -840,9 +840,52 @@ passing-summary requirement. The FIDO guests have no persistent disk.
 This is evidence for kernel HID transport, production worker ownership,
 assertion verification and deadline refusal. The USB metadata and presence
 bit are software fixtures: this does not test a USB controller, establish
-physical presence, enroll recovery tokens, release a session, or authorize
+physical presence, enroll physical recovery tokens, release a session, or authorize
 a credential write. Ordinary crate tests leave these guest-only cases
 explicitly ignored. UHID device creation remains a trusted-root operation.
+
+
+### Fresh virtual-token enrollment and recovery
+
+Two of those HID guests compose the production enrollment and metadata APIs
+with the guest TPM: `fido-enroll-single` chooses explicit unrecoverability,
+and `fido-enroll-recovery` proves distinct primary and recovery credentials.
+Each virtual credential has a fresh TPM-generated, null-hierarchy P-256
+signing key. A test-only helper sends CreatePrimary and Sign through the
+existing safe TPM transport, checks the returned template and Name, and
+encodes the ECDSA result as minimal DER. The existing client owns and flushes
+the transient handle. No private key is exported or persisted, and no
+signing command or helper is compiled into the production program. This is
+a software authenticator using the same emulated TPM as the verifier, not
+independent hardware or an additional production cryptographic dependency.
+The earlier fixed OpenSSL signature oracle remains an independent vector.
+
+The virtual token supplies getInfo, none-format makeCredential, and signed
+getAssertion replies over UHID and the production HID worker. Every complete
+request must match the fixture's ordered expected bytes before any reply or
+signature. Creation, proof and release use fresh guest kernel randomness.
+The assertion responder also checks the complete canonical RP, credential
+allow list, challenge and options before signing the received challenge.
+The enrollment API must verify a separate proof before yielding a credential;
+recovery creation excludes the proved primary ID. Reconnecting the original
+virtual credential produces the specific credential-excluded CTAP status.
+
+The fixture roundtrips canonical metadata and its PCR-7-bound sealed key,
+then requires a fresh assertion to unseal the original random master through
+each enrolled role. An unrecoverable record refuses recovery selection.
+Replaying each role's prior assertion with a fresh challenge must reach the
+specific TPM VerifySignature refusal. A recovery key signing the primary
+credential's exact request must reach the same refusal; an unrelated
+transport or parsing failure cannot count as either negative result.
+
+Each exchange closes its Session and removes its virtual HID node before the
+next registration. These responder threads have a sixty-second cooperative
+lifetime; their Drop stops and joins them. TPM I/O can delay thread teardown,
+so the guest's existing 180-second outer bound remains the final backstop.
+These cases use no persistent disk and publish no store or session key.
+They prove fresh credential/proof/recovery protocol composition and
+assertion-before-unseal, not the private enrollment/unlock workers, trusted
+presentation, physical presence, portal release or authorized writes.
 
 ## Portal evidence
 

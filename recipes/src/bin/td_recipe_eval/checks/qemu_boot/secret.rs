@@ -158,6 +158,7 @@ pub(crate) fn run(runner: &RecipeCheckRunner, tpm: Option<&Path>) -> Result<(), 
     println!("PASS: secret authority VM cases ({} fresh guests); credential intake, inspection and relocking; no token or TPM release claim", fixture::CASES.len());
     if tpm.is_some() {
         println!("PASS: TPM guest device, persistent sealed key, cold reopen, changed PCR and different TPM refusal; fixture measurements only, no FIDO2 or measured-deployment claim");
+        println!("PASS: virtual credential creation, proof, recovery exclusion and both recovery policies; fresh assertion before TPM unseal, replay and wrong-key refusal; no physical presence or session-release claim");
         println!("PASS: guest HID discovery, production worker, signed fixture assertion and challenge refusal through the TPM, keepalive deadline and worker cleanup; no physical USB or token presence claim");
     }
     Ok(())

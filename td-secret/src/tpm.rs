@@ -747,6 +747,100 @@ pub(crate) mod tests {
     use std::process::{Child, Command, Stdio};
     use std::time::{Duration, Instant};
 
+    // Disposable virtual-token signer, compiled only into the test harness.
+    pub(crate) struct SigningKey {
+        client: Client<Device>,
+        handle: u32,
+        pub(crate) cose: Vec<u8>,
+    }
+
+    impl SigningKey {
+        pub(crate) fn new() -> Self {
+            let mut client = Client::new(Device::open().unwrap());
+            let mut public = Vec::new();
+            put16(&mut public, 0x23);
+            put16(&mut public, SHA256);
+            put32(&mut public, 0x40072); // fixed, generated, unrestricted signer
+            put_blob(&mut public, &[]).unwrap();
+            for value in [ALG_NULL, 0x18, SHA256, 3, ALG_NULL] {
+                put16(&mut public, value);
+            }
+            let prefix = public.len();
+            put_blob(&mut public, &random().unwrap()).unwrap();
+            put_blob(&mut public, &[]).unwrap();
+            let mut parameters = Vec::new();
+            put_blob(&mut parameters, &[0; 4]).unwrap();
+            put_blob(&mut parameters, &public).unwrap();
+            put_blob(&mut parameters, &[]).unwrap();
+            put32(&mut parameters, 0);
+            let (handle, out) = client
+                .call(CREATE_PRIMARY, &[NULL], Some(PASSWORD), &parameters, true)
+                .unwrap();
+            let mut reader = Reader(&out);
+            let returned = reader.blob().unwrap();
+            assert_eq!(&returned[..prefix], &public[..prefix]);
+            let mut unique = Reader(&returned[prefix..]);
+            let mut cose = vec![0xa5, 1, 2, 3, 0x26, 0x20, 1, 0x21, 0x58, 0x20];
+            for coordinate in 0..2 {
+                let value = unique.blob().unwrap();
+                assert!((1..=32).contains(&value.len()));
+                if coordinate == 1 {
+                    cose.extend_from_slice(&[0x22, 0x58, 0x20]);
+                }
+                // COSE coordinates are fixed-width, big-endian integers.
+                cose.resize(cose.len() + 32 - value.len(), 0);
+                cose.extend_from_slice(value);
+            }
+            unique.end().unwrap();
+            let creation_data = reader.blob().unwrap();
+            assert_eq!(reader.blob().unwrap(), crypto::digest(creation_data));
+            assert_eq!(reader.u16().unwrap(), 0x8021);
+            assert_eq!(reader.u32().unwrap(), NULL);
+            assert!(matches!(reader.blob().unwrap().len(), 20 | 32 | 48 | 64));
+            check_name(returned, reader.blob().unwrap()).unwrap();
+            reader.end().unwrap();
+            Self {
+                client,
+                handle: handle.unwrap(),
+                cose,
+            }
+        }
+
+        pub(crate) fn sign(&mut self, digest: &[u8; 32]) -> Vec<u8> {
+            let mut parameters = Vec::new();
+            put_blob(&mut parameters, digest).unwrap();
+            put16(&mut parameters, ALG_NULL);
+            put16(&mut parameters, 0x8024); // empty HASHCHECK ticket: unrestricted key
+            put32(&mut parameters, NULL);
+            put_blob(&mut parameters, &[]).unwrap();
+            let (_, out) = self
+                .client
+                .call(0x15d, &[self.handle], Some(PASSWORD), &parameters, false) // Sign
+                .unwrap();
+            let mut reader = Reader(&out);
+            assert_eq!(reader.u16().unwrap(), 0x18);
+            assert_eq!(reader.u16().unwrap(), SHA256);
+            let mut integers = Vec::new();
+            for _ in 0..2 {
+                let value = reader.blob().unwrap();
+                assert!((1..=32).contains(&value.len()));
+                let first = value.iter().position(|byte| *byte != 0)
+                    .expect("TPM returned a zero ECDSA component");
+                let value = &value[first..];
+                let pad = usize::from(value[0] & 0x80 != 0);
+                integers.extend_from_slice(&[2, (value.len() + pad) as u8]);
+                if pad != 0 {
+                    integers.push(0);
+                }
+                integers.extend_from_slice(value);
+            }
+            reader.end().unwrap();
+            let mut der = vec![0x30, integers.len() as u8];
+            der.extend_from_slice(&integers);
+            der
+        }
+    }
+
     pub(crate) struct Socket(UnixStream);
     impl Transport for Socket {
         fn exchange(&mut self, command: &[u8]) -> Result<Vec<u8>, String> {
@@ -1330,7 +1424,7 @@ pub(crate) mod tests {
         Client::new(Device::open().unwrap())
     }
 
-    fn qemu_extend(digest: &[u8; 32]) {
+    pub(crate) fn qemu_extend(digest: &[u8; 32]) {
         let mut parameters = 1u32.to_be_bytes().to_vec();
         put16(&mut parameters, SHA256);
         parameters.extend_from_slice(digest);

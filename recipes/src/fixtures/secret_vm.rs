@@ -44,6 +44,14 @@ pub const FIDO_CASES: &[(&str, &str)] = &[
         "fido-deadline",
         "fido_device::vm_tests::qemu_hid_keepalives_cannot_extend_the_worker_deadline",
     ),
+    (
+        "fido-enroll-single",
+        "fido_device::vm_tests::qemu_hid_enrolls_unrecoverable_and_unseals_with_a_fresh_assertion",
+    ),
+    (
+        "fido-enroll-recovery",
+        "fido_device::vm_tests::qemu_hid_enrolls_recovery_and_refuses_replays_and_wrong_keys",
+    ),
 ];
 pub const PASS: &str = "TD-SECRET-VM-PASS";
 pub const FAIL: &str = "TD-SECRET-VM-FAIL";
