@@ -1196,7 +1196,16 @@ fn weston_test_timed_requests_use_integer_pixels_and_nanosecond_timestamps() {
 #[test]
 #[ignore = "requires explicit Weston executable and matching upstream test-plugin; see README"]
 fn disposable_weston_delivers_pointer_selection_and_menu_events() {
+    for line_numbers in [true, false] {
+        weston_pointer_line_numbers(line_numbers);
+    }
+}
+
+fn weston_pointer_line_numbers(line_numbers: bool) {
     const EDIT_X: i32 = 68;
+    const FORMAT_X: i32 = 136;
+    const GUTTER_X: i32 = 16;
+    const LINE_NUMBERS_ROW: i32 = 8;
     const PANEL_TOP: i32 = 24;
     const MENU_ROW_HEIGHT: i32 = 24;
     const FIND_ROW: i32 = 8;
@@ -1210,23 +1219,45 @@ fn disposable_weston_delivers_pointer_selection_and_menu_events() {
     let mut editor = EditorProcess::start(&directory, &display, &file, &dictionary);
     editor.rendered_at(1024, 768);
     editor.wait_keyboard("windows");
+    editor.wait_field("state", "line-numbers", "1");
     let mut input = WestonInput::connect(&display);
-    // Kiosk fills the output; scale-one text starts at (8,48), 8px cells.
+    if !line_numbers {
+        input.motion(FORMAT_X, 8);
+        editor.wait_field("state", "pointer-ready", "1");
+        input.click(FORMAT_X, 8); // Format.
+        editor.wait_field("state", "modal", "0,0,0,0,1,0,0,0,0");
+        input.click(
+            FORMAT_X,
+            PANEL_TOP + LINE_NUMBERS_ROW * MENU_ROW_HEIGHT + MENU_ROW_HEIGHT / 2,
+        );
+        editor.wait_field("state", "line-numbers", "0");
+        editor.wait_field("state", "modal", "0,0,0,0,0,0,0,0,0");
+    }
+    // Kiosk fills the output; the default gutter adds three 8px cells.
     // Use explicit pixel expectations, independent of the hit-test code.
-    input.motion(9, 56);
+    let text_x = if line_numbers { 32 } else { 8 };
+    input.motion(text_x + 1, 56);
+    // Readiness requires enter, not this motion; the same input stream orders
+    // motion before button, and the exact selection below fences consumption.
     editor.wait_field("state", "pointer-ready", "1");
     input.left_button(true);
-    input.motion(33, 56);
+    input.motion(text_x + 25, 56);
     editor.wait_field("state", "tab", "1,0,0,8,0,3,0,72,0,lf");
     input.left_button(false);
     // A later unheld motion must not extend the selected range.
-    input.motion(65, 56);
+    input.motion(text_x + 57, 56);
     input.chord(None, KEY_B); // Native lowercase b replaces exactly "one".
     editor.wait_tab(1, "b two\n");
     input.chord(Some(KEY_LEFT_CTRL), KEY_Z); // Native Windows undo.
     editor.wait_tab(2, "one two\n");
+    editor.wait_field("state", "tab", "1,2,0,8,0,3,0,72,0,lf");
+    if line_numbers {
+        input.click(GUTTER_X, 56); // The gutter must not collapse the selection.
+    }
     input.click(EDIT_X, 8); // Edit header.
     editor.wait_field("state", "modal", "0,0,0,0,1,0,0,0,0");
+    // The later menu-open observation fences consumption of the gutter click.
+    editor.wait_field("state", "tab", "1,2,0,8,0,3,0,72,0,lf");
     input.click(
         EDIT_X,
         PANEL_TOP + FIND_ROW * MENU_ROW_HEIGHT + MENU_ROW_HEIGHT / 2,

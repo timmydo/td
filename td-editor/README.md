@@ -522,8 +522,11 @@ keyboard events. This still does not prove hardware input, repeat timing,
 pointer/clipboard interoperability or additional keyboard layouts.
 
 The pointer case delivers motion and left-button events through Weston,
-checks drag selection and button release by native replacement/undo, and
-opens Edit → Find with real pointer events before native Escape cancellation.
+with fresh instances for default line numbers and native-menu gutter-off.
+It checks both text origins and an ignored gutter click, fenced by a later
+menu opening. Drag selection and button release use native replacement/undo.
+The test also opens Edit → Find with real pointer events before native Escape
+cancellation.
 Read-only state/prompt observations fence input delivery; exact text/revisions
 and saved bytes verify the result. It does not prove wheel, touch, clipboard,
 hardware input, cursor pixels or multi-output/scaling behavior.

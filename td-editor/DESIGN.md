@@ -2509,6 +2509,11 @@ repeat timing, pointer, clipboard or comprehensive keyboard-layout coverage.
 
 The opt-in `disposable_weston_delivers_pointer_selection_and_menu_events`
 test uses the same owned compositor and its test-seat motion/button requests.
+It runs fresh pairs with default line numbers on and with line numbers
+toggled off via the native Format menu. Text begins at x=32 or x=8,
+independently
+specified by this fixture. A gutter click must preserve the restored
+selection; a later native Edit-menu opening fences its consumption.
 At scale one it drags an exact three-byte selection using independent pixel
 coordinates, releases the button and moves away, then uses native keyboard
 replacement/undo to verify both selection and release behavior. Native clicks
