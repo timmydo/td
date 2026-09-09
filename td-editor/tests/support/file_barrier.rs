@@ -50,7 +50,10 @@ impl Barrier {
                 sequence += 1;
                 assert_eq!(fields.next(), Some(sequence.to_string().as_str()));
                 let kind = fields.next().unwrap();
-                assert!(matches!(kind, "open" | "dictionary" | "save" | "reload"));
+                assert!(matches!(
+                    kind,
+                    "open" | "dictionary" | "save" | "reload" | "queued-save"
+                ));
                 assert_eq!(fields.next(), None);
                 let hold = {
                     let mut armed = worker_armed.lock().unwrap();
@@ -128,6 +131,95 @@ fn admitted_save_survives_unread_reply_edits_and_tab_switch() {
 #[ignore = "ready builds the isolated test-file-barrier editor"]
 fn admitted_save_as_survives_unread_reply_edits_and_tab_switch() {
     admitted_save(true);
+}
+
+#[test]
+#[ignore = "ready builds the isolated test-file-barrier editor"]
+fn queued_save_rejects_edit_undo_before_snapshot_handoff() {
+    queued_save(false);
+}
+
+#[test]
+#[ignore = "ready builds the isolated test-file-barrier editor"]
+fn queued_save_as_rejects_edit_undo_before_snapshot_handoff() {
+    queued_save(true);
+}
+
+fn queued_save(save_as: bool) {
+    let compositor_directory = Directory::new();
+    let directory = Directory::new();
+    let mut compositor = Compositor::start(&compositor_directory);
+    let mut barrier = Barrier::start(&directory);
+    let file = directory.0.join("draft");
+    let destination = directory.0.join("saved copy");
+    let dictionary = directory.0.join("dictionary");
+    std::fs::write(&file, b"disk").unwrap();
+    std::fs::write(&dictionary, b"disk\n").unwrap();
+    let display = compositor.directory.join("wayland-0");
+    let mut editor = EditorProcess::start_with_barriers(
+        &directory,
+        &display,
+        &file,
+        &dictionary,
+        "windows",
+        None,
+        Some(&barrier.path),
+    );
+    editor.legacy_keyboard("windows");
+    let window = compositor.window();
+    assert_eq!(compositor.request("fullscreen", 1024), b"ok\n");
+    editor.wait_field("state", "window", "800,576,1");
+    editor.rendered_at(800, 576);
+    editor.ok("insert\t1\t0\t0\t0\t61");
+    let kind = if save_as { "save-as" } else { "save" };
+    let request = if save_as {
+        format!(
+            "save-as\t1\t1\t{}",
+            td_editor::control::hex(destination.as_os_str().as_encoded_bytes())
+        )
+    } else {
+        "save\t1\t1".into()
+    };
+    barrier.arm("queued-save");
+    let started = Instant::now();
+    assert_eq!(editor.request(&request).unwrap(), "pending\t1");
+    let held = barrier.held();
+    editor.wait_field("state", "job", &format!("1,{kind},1,1,0,pending,-"));
+    editor.wait_field("state", "native", "1,1,1,0");
+    editor.ok("insert\t1\t1\t1\t1\t62");
+    editor.ok("undo\t1\t2");
+    // Identical bytes must not make a revision-stale queued Save valid again.
+    editor.wait_tab(3, "adisk");
+    editor.wait_field("state", "tab", "1,3,1,5,1,1,0,72,0,lf");
+    editor.wait_field("state", "native", "1,1,1,0");
+    assert_eq!(std::fs::read(&file).unwrap(), b"disk");
+    assert!(!destination.exists());
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(4),
+        "queued evidence: {elapsed:?}"
+    );
+    let before = compositor.observe(&window);
+    barrier.release(held);
+    assert_eq!(
+        editor.wait_job_outcome("1", ",error,stale-revision"),
+        format!("job=1,{kind},1,1,0,error,stale-revision")
+    );
+    editor.wait_field("state", "native", "1,1,0,0");
+    editor.wait_field("state", "dialog", "-");
+    editor.wait_field("state", "dialog-last", "0");
+    editor.wait_field("state", "tab", "1,3,1,5,1,1,0,72,0,lf");
+    compositor.rendered_text(&mut editor, &window, 3, before, "adisk", 1);
+    assert_eq!(std::fs::read(&file).unwrap(), b"disk");
+    assert!(!destination.exists());
+    // The consumed gate can admit another revision; the old association remains.
+    assert_eq!(editor.job("save\t1\t3"), "job=2,save,1,3,0,complete,-");
+    editor.wait_field("state", "tab", "1,3,0,5,1,1,0,72,0,lf");
+    assert_eq!(std::fs::read(&file).unwrap(), b"adisk");
+    assert!(!destination.exists());
+    editor.quit();
+    barrier.finish();
+    compositor.stop();
 }
 
 #[test]

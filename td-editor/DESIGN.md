@@ -550,8 +550,9 @@ content state. The scratch-window warning remains unchanged.
 
 The non-default `test-file-barrier` Cargo feature is for test binaries only.
 Normal builds contain neither the barrier module nor its worker calls and
-never read `TD_EDITOR_TEST_FILE_BARRIER`. An ignored native test verifies
-that the normal binary ignores that variable even when it names no socket.
+never read `TD_EDITOR_TEST_FILE_BARRIER` or `TD_EDITOR_TEST_QUEUE_BARRIER`.
+An ignored native test verifies that the normal binary ignores both
+variables even when they name no socket.
 There is no barrier command in the editor control protocol and no new
 filesystem authority, production startup option, syscall or dependency.
 
@@ -600,8 +601,8 @@ match the earlier snapshot, both tabs retain their later dirty states, and
 a correlated capture still shows the newly active tab. A subsequent plain
 Save proves the association belongs to the original tab, including after
 Save As. This is lost-client-reply and post-handoff isolation evidence, not
-a pre-admission cancellation, queued-before-handoff or kernel-stalled-I/O
-oracle. Those boundaries remain outside these process cases.
+a pre-admission cancellation or kernel-stalled-I/O oracle. The separate
+queued-before-handoff cases below cover that earlier Save boundary.
 
 A separate Save As race starts with an absent destination, holds the
 captured snapshot, then creates that destination with external bytes before
@@ -623,6 +624,32 @@ pending; further edits, their rendered text and explicit close-discard still
 work. This does not prove that no worker restart was attempted. It proves
 the test barrier's pre-I/O fail-closed behavior, not that
 arbitrary worker death after publication leaves the destination unchanged.
+
+The same non-default feature optionally reads `TD_EDITOR_TEST_QUEUE_BARRIER`.
+It names a second fixture listener using the same framed line exchange,
+with kind `queued-save` and its own checked sequence. A separate helper
+thread owns that socket; one-slot request/reply channels are the UI's only
+access. Queued Save admission reserves the ordinary global file slot. The
+gate independently retains an in-flight flag until its reply is polled.
+Admission requests a checkpoint without capturing bytes. File polling
+returns immediately while the checkpoint is held. Only a valid reply permits
+the ordinary revision recheck and snapshot handoff; malformed replies, EOF or
+timeout fail the queued job unavailable without a handoff. Other ordinary
+file operations continue to use the file worker, not this helper. There
+is no automatic reconnect or disabling of a failed queue gate: subsequent
+queued saves refuse too. A failed fixture is not a recovery command. There
+is no production control command or extra authority. Helper startup/connect
+and process teardown have the same parent-fixture bounds as the file barrier;
+each exchange has the same ten-second deadline, never an automatic release.
+
+Native Save and Save As cases hold this queued checkpoint, edit and Undo,
+then release it. Even though bytes again match the submitted revision,
+the newer revision must produce a historical stale-revision outcome without
+writing, clearing dirty state or opening a dialog. Held-state evidence
+finishes within four seconds of submission. Exact disk bytes, missing
+Save As destination, dirty text and correlated pixels pin the result.
+A subsequent plain Save proves the slot and original association remain
+usable. These cases complement the worker's post-handoff snapshot tests.
 
 ## Line-number display
 

@@ -534,6 +534,17 @@ impl EditorProcess {
         profile: &str,
         barrier: Option<&Path>,
     ) -> Self {
+        Self::start_with_barriers(directory, display, file, dictionary, profile, barrier, None)
+    }
+    fn start_with_barriers(
+        directory: &Directory,
+        display: &Path,
+        file: &Path,
+        dictionary: &Path,
+        profile: &str,
+        file_barrier: Option<&Path>,
+        queue_barrier: Option<&Path>,
+    ) -> Self {
         let socket = directory.0.join("control");
         let log = directory.0.join("stderr");
         let mut command = Command::new(env!("CARGO_BIN_EXE_td-editor"));
@@ -551,8 +562,11 @@ impl EditorProcess {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(std::fs::File::create(&log).unwrap());
-        if let Some(barrier) = barrier {
+        if let Some(barrier) = file_barrier {
             command.env("TD_EDITOR_TEST_FILE_BARRIER", barrier);
+        }
+        if let Some(barrier) = queue_barrier {
+            command.env("TD_EDITOR_TEST_QUEUE_BARRIER", barrier);
         }
         let child = command.spawn().unwrap();
         Self {

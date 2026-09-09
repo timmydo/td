@@ -12,6 +12,12 @@ fn file_barrier_is_excluded_from_default_builds() {
     assert!(worker.contains("#[cfg(feature = \"test-file-barrier\")]\n    let mut barrier ="));
     assert!(worker.contains("#[cfg(feature = \"test-file-barrier\")]\n        if let Some(barrier)"));
     assert_eq!(worker.matches("barrier.checkpoint(").count(), 1);
+    assert!(worker.contains("#[cfg(feature = \"test-file-barrier\")]\n    queue_gate:"));
+    assert!(worker.contains("#[cfg(feature = \"test-file-barrier\")]\n        let queue_gate ="));
+    assert!(worker.contains("#[cfg(feature = \"test-file-barrier\")]\n        if let Some(gate)"));
+    assert!(worker.contains("#[cfg(feature = \"test-file-barrier\")]\n        if matches!(self.pending"));
+    assert_eq!(worker.matches("gate.begin(").count(), 1);
+    assert_eq!(worker.matches("gate.poll(").count(), 1);
     assert!(manifest.contains("[features]\ntest-file-barrier = []"));
     assert!(!manifest.contains("default ="));
 }

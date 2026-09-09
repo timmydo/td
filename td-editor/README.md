@@ -66,6 +66,9 @@ association. Historical job rows, disk bytes and active-tab pixels agree.
 A Save As destination created while the worker is held must remain intact;
 the failed operation leaves the draft dirty and its original association
 usable for a subsequent plain Save.
+The feature also has a separate nonblocking queued-save checkpoint: native
+Save and Save As tests edit and Undo before snapshot handoff, proving that
+identical bytes do not revive an obsolete revision or authorize a write.
 
 Disconnecting the held test barrier fails the save before I/O; it neither
 releases the write nor prevents later editing and explicit discard.

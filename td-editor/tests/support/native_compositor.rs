@@ -1507,8 +1507,9 @@ fn ordinary_editor_ignores_file_barrier_environment() {
     std::fs::write(&dictionary, b"ordinary\n").unwrap();
     let display = compositor.directory.join("wayland-0");
     let missing_barrier = directory.0.join("must-not-connect");
-    let mut editor = EditorProcess::start_with_barrier(
-        &directory, &display, &file, &dictionary, "windows", Some(&missing_barrier),
+    let mut editor = EditorProcess::start_with_barriers(
+        &directory, &display, &file, &dictionary, "windows",
+        Some(&missing_barrier), Some(&missing_barrier),
     );
     editor.wait_keyboard("windows");
     editor.wait_tab(0, "ordinary");

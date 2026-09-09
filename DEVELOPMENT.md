@@ -295,8 +295,9 @@ target directory for that feature's library tests, ignored
 `native_compositor::fixture::` process cases, and strict all-target Clippy.
 Both process legs require positive passing summaries. This is a test-build
 declaration, not a shipping feature or a broader affected-path mapping.
-The runner removes ambient `TD_EDITOR_TEST_FILE_BARRIER`; only the owned
-process fixture may give that scheduling endpoint to its child editor.
+The runner removes ambient `TD_EDITOR_TEST_FILE_BARRIER` and
+`TD_EDITOR_TEST_QUEUE_BARRIER`; only the owned process fixture may give
+those scheduling endpoints to its child editor.
 
 ## Trusted filesystem roots for permission tests
 

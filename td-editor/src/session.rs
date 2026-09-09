@@ -73,6 +73,8 @@ struct Association {
 }
 
 pub(crate) struct Session {
+    #[cfg(feature = "test-file-barrier")]
+    queue_gate: Option<crate::test_file_barrier::QueueGate>,
     sender: SyncSender<Job>,
     receiver: Receiver<Result<Completion>>,
     pending: Option<Pending>,
@@ -84,6 +86,8 @@ pub(crate) struct Session {
 
 impl Session {
     pub(crate) fn start() -> Result<Self> {
+        #[cfg(feature = "test-file-barrier")]
+        let queue_gate = crate::test_file_barrier::QueueGate::start()?;
         let (sender, jobs) = mpsc::sync_channel(1);
         let (results, receiver) = mpsc::sync_channel(1);
         std::thread::Builder::new()
@@ -91,6 +95,8 @@ impl Session {
             .spawn(move || worker(jobs, results))
             .map_err(|e| e.to_string())?;
         Ok(Self {
+            #[cfg(feature = "test-file-barrier")]
+            queue_gate,
             sender,
             receiver,
             pending: None,
@@ -228,6 +234,10 @@ impl Session {
             .editor()
             .revision_point(tab, revision)
             .map_err(|e| e.to_string())?;
+        #[cfg(feature = "test-file-barrier")]
+        if let Some(gate) = self.queue_gate.as_mut() {
+            gate.begin()?;
+        }
         self.pending = Some(Pending::QueuedSave { point, path });
         Ok(())
     }
@@ -264,6 +274,16 @@ impl Session {
         &mut self,
         ui: &mut Controller,
     ) -> Option<std::result::Result<String, PollFailure>> {
+        #[cfg(feature = "test-file-barrier")]
+        if matches!(self.pending, Some(Pending::QueuedSave { .. })) {
+            if let Some(gate) = self.queue_gate.as_mut() {
+                // No reply returns immediately without consuming the queued Save.
+                if let Err(detail) = gate.poll()? {
+                    self.pending.take();
+                    return Some(Err(PollFailure::unavailable(detail)));
+                }
+            }
+        }
         if let Some(Pending::QueuedSave { point, path }) = self
             .pending
             .take_if(|pending| matches!(pending, Pending::QueuedSave { .. }))
@@ -599,6 +619,8 @@ impl Session {
         let (sender, _jobs) = mpsc::sync_channel(1);
         let (_results, receiver) = mpsc::sync_channel(1);
         Self {
+            #[cfg(feature = "test-file-barrier")]
+            queue_gate: None,
             sender,
             receiver,
             pending: None,
@@ -798,6 +820,8 @@ mod tests {
             let (results, receiver) = mpsc::sync_channel(1);
             Self {
                 session: Session {
+                    #[cfg(feature = "test-file-barrier")]
+                    queue_gate: None,
                     sender,
                     receiver,
                     pending: None,
@@ -879,6 +903,44 @@ mod tests {
             );
             assert_eq!(h.ui.editor().document(tab).unwrap().text(), "acdisk");
             assert!(h.ui.editor().document(tab).unwrap().dirty());
+        }
+    }
+
+    #[cfg(feature = "test-file-barrier")]
+    #[test]
+    fn queued_gate_error_clears_the_slot_without_submitting_file_work() {
+        for disconnect in [false, true] {
+            let directory = Directory::new();
+            let path = directory.path("draft");
+            fs::write(&path, b"disk").unwrap();
+            let mut h = Harness::new();
+            let tab = h.open(path.clone());
+            h.edit(tab, Command::Insert("a".into()));
+            let (requests, incoming) = mpsc::sync_channel(1);
+            let (outgoing, replies) = mpsc::sync_channel(1);
+            h.session.queue_gate = Some(crate::test_file_barrier::QueueGate::from_channels(
+                requests, replies,
+            ));
+            h.session.queue_save(&h.ui, tab, 1, None).unwrap();
+            incoming.try_recv().unwrap();
+            assert!(h.session.poll(&mut h.ui).is_none());
+            assert!(h.session.busy());
+            assert!(matches!(h.jobs.try_recv(), Err(TryRecvError::Empty)));
+            if !disconnect {
+                outgoing.send(Err("refused checkpoint".into())).unwrap();
+            }
+            drop(outgoing);
+            let error = h.session.poll(&mut h.ui).unwrap().unwrap_err();
+            assert_eq!(error.code, crate::Error::Unavailable);
+            assert!(!h.session.busy());
+            assert!(matches!(h.jobs.try_recv(), Err(TryRecvError::Empty)));
+            assert_eq!(h.ui.editor().document(tab).unwrap().text(), "adisk");
+            assert!(h.ui.editor().document(tab).unwrap().dirty());
+            assert_eq!(fs::read(&path).unwrap(), b"disk");
+            // The ordinary, nonqueued path still uses the unaffected file worker.
+            h.session.save(&h.ui, tab, 1, None).unwrap();
+            h.complete().unwrap();
+            assert_eq!(fs::read(&path).unwrap(), b"adisk");
         }
     }
 

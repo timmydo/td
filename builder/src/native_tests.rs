@@ -82,6 +82,7 @@ fn test_command(
         .env_remove("TD_TEST_COMPOSITOR")
         .env_remove("TD_TEST_TRUSTED_ROOT")
         .env_remove("TD_EDITOR_TEST_FILE_BARRIER")
+        .env_remove("TD_EDITOR_TEST_QUEUE_BARRIER")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit());
@@ -299,6 +300,8 @@ mod tests {
             assert!(args.contains(&"env.TD_TEST_TRUSTED_ROOT.force=true"));
             assert!(fixture.get_envs().any(|(key, value)|
                 key == "TD_EDITOR_TEST_FILE_BARRIER" && value.is_none()));
+            assert!(fixture.get_envs().any(|(key, value)|
+                key == "TD_EDITOR_TEST_QUEUE_BARRIER" && value.is_none()));
         }
         let cmd = test_command(
             Path::new("/repo"),
