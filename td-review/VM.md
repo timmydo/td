@@ -870,14 +870,80 @@ revocation can terminate that instance's sessions too; removing a key alone
 is not termination of an already authenticated connection. Posted Git branches
 remain in the bare origin. Stopping and later booting a VM retains its key.
 
+### Implemented local Git registrar
+
+`td-review` also builds the host-only `td-vm-registrar`. Host setup starts it
+as `test` with four fixed configuration values: socket directory, private
+registry file, installed `td-vm-git` executable, and operator UID. For this
+host the operator is `timmy` (UID 1000) and Git account is `test` (UID 1001):
+
+```text
+td-vm-registrar serve /home/test/.td-vm-registrar /home/test/.td-vm-git/policy /usr/local/libexec/td-vm-git 1000
+td-vm-registrar request /home/test/.td-vm-registrar 1001 ping
+td-vm-registrar request /home/test/.td-vm-registrar 1001 enroll INSTANCE_ID TASK_BRANCH ED25519_BASE64
+td-vm-registrar request /home/test/.td-vm-registrar 1001 reserve INSTANCE_ID TASK_BRANCH
+td-vm-registrar request /home/test/.td-vm-registrar 1001 revoke INSTANCE_ID
+```
+
+The server runs in the foreground under the host's existing service manager;
+it does not elevate credentials or install itself. The client verifies the
+server's exact UID before sending data. The server verifies the operator's
+exact UID before reading data. Both use Linux `SO_PEERCRED`, through the
+single fixed syscall documented in `UNSAFE.md` H1. Authority belongs to the
+configured account, including any process it delegates a connected socket
+to; this is not process identity or isolation from a compromised operator.
+The shared host group does not authenticate requests.
+
+The server creates only the final socket directory, mode 0711, beneath
+trusted root/account-owned ancestors; an existing directory must have that
+exact owner/mode. Its `control` socket is mode 0666 so the other account can
+connect, and UID authentication is the gate. The stable private
+`registrar.lock` inode serializes servers. Only its lock owner may remove a
+stale caller-owned socket and rebind after a crash. Unexpected entries,
+symlinks, untrusted writable ancestors, and another live server are refused.
+The registry stays in its separate private directory; the operator never
+gains filesystem write access to it.
+
+One connection carries one bounded UTF-8 frame, at most 512 bytes, starting
+with `TDVM-REGISTRAR-1` and a newline, then one space-delimited request and a
+final newline. The client must shut down its write half; trailing bytes or
+extra operations are refused. Requests contain only an instance ID, exact
+branch and ordinary public-key base64 bytes as applicable, never a path,
+command, SSH option or environment. `td-vm-git` enforces the final key/branch
+and ownership policy. The registrar writes an enrollment public key to a
+private temporary file, invokes the fixed dispatcher with fixed argv and an
+empty environment, then removes its scratch directory. No private key or
+provider credential is accepted. A hard-killed registrar may leave a private
+scratch directory containing only public data.
+
+The listener serves requests serially. Reading a request and writing its
+response each have a five-second absolute deadline, including interrupted
+I/O; malformed or stalled clients cannot hold that I/O indefinitely. The
+client waits at most thirty seconds for a reply after sending its request.
+Filesystem lookup, connecting a Unix socket, and trusted Git/backend execution
+have no hard elapsed-time bound in this increment. A timed-out/disconnected
+client does not cancel a started registry operation: its outcome is unknown
+and the caller must retry the same idempotent operation or inspect host state.
+The host supervisor owns service and descendant teardown. Automatic guest
+provisioning must not treat a failed or absent reply as enrollment success.
+
+The response is the same version header followed by `OK` or a generic
+`ERROR` line. Detailed failures go to the host service's stderr, not the
+operator protocol. `ping` invokes `td-vm-git check POLICY`, checking the live
+registry grammar and bare repository through the configured backend. It
+proves neither SSH reachability nor guest readiness. No VM lifecycle,
+firstboot, manager configuration, sshd installation, or active-session
+termination is inferred from this local health check.
+
 ### Implemented host Git dispatcher
 
 `td-review` builds the dependency-free host binary `td-vm-git`. Its host-account
 administrative commands initialize a registry, enroll an instance's public key
 and first branch together, reserve additional branches, and revoke an instance.
 The SSH lookup and Git-only dispatcher consume that same registry. The
-operator-authenticated registrar socket, guest provisioning, and tracking or
-terminating active sessions remain unimplemented. These commands run as `test`;
+local registrar below exposes those operations to the configured operator.
+Guest provisioning and tracking or terminating active sessions remain
+unimplemented. These administrative commands run as `test`;
 they do not let `timmy` or a guest become that account. Building the binary
 changes no live account, SSH configuration, or repository.
 

@@ -1,4 +1,6 @@
 //! Git-only forced-command endpoint for individually reserved VM branches.
+#![forbid(unsafe_code)]
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs::{self, DirBuilder, File};
@@ -471,7 +473,7 @@ fn run() -> Result<bool> {
         return Ok(hook_command(name, &remaining)?.status()?.success());
     }
     Err(
-        "usage: td-vm-git init|enroll|reserve|revoke|authorized-keys|serve (see td-review/VM.md)"
+        "usage: td-vm-git check|init|enroll|reserve|revoke|authorized-keys|serve (see td-review/VM.md)"
             .into(),
     )
 }

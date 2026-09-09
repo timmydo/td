@@ -339,6 +339,16 @@ fn authorized_keys(args: &[OsString]) -> Result<bool> {
 pub(super) fn cli(args: &[OsString]) -> Option<Result<bool>> {
     let (verb, remaining) = args.split_first()?;
     match verb.to_str()? {
+        "check" => Some((|| {
+            let [path] = remaining else {
+                return Err("usage: td-vm-git check POLICY".into());
+            };
+            let policy = Policy::load(Path::new(path))?;
+            if policy.query(&["rev-parse", "--is-bare-repository"])? != "true" {
+                return Err("VM origin must be bare".into());
+            }
+            Ok(true)
+        })()),
         "init" => Some(init(remaining)),
         "enroll" | "reserve" | "revoke" => Some(change(verb.to_str()?, remaining)),
         "authorized-keys" => Some(authorized_keys(remaining)),
