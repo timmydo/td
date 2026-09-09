@@ -1141,3 +1141,10 @@ they do not claim token presence, a presented compositor prompt, TPM
 unseal, or a credential-store write. The public intake fixture explicitly
 stands in for the completion reply. Pinned-emulator tests in
 `td-secret/DESIGN.md` cover the separate cryptographic store operations.
+
+
+The optional `qemu-secret --tpm /absolute/path/to/swtpm` mode adds four
+TPM device cases to those authority checks. It uses the existing pinned
+host emulator and a private raw fixture disk, with cold reopen and changed
+PCR/different-TPM refusals specified in `td-secret/DESIGN.md`. These
+additional tests do not replace the authority's token-consent boundary.

@@ -350,9 +350,7 @@ fn reject_unsafe_clear_target(lw: &Path) -> Result<(), String> {
 
 /// Run the explicitly selected credential authority cases in fresh root VMs.
 pub fn qemu_secret_cli(args: &[String]) -> Result<(), String> {
-    if !args.is_empty() {
-        return Err("usage: td-recipe-eval qemu-secret".into());
-    }
+    let tpm = crate::checks::qemu_boot::secret::options(args)?;
     let targets = crate::checks::qemu_boot::secret::TARGETS;
     ensure_targets_provenance(targets)?;
     let root = env::current_dir().map_err(|e| format!("current dir: {e}"))?;
@@ -360,7 +358,7 @@ pub fn qemu_secret_cli(args: &[String]) -> Result<(), String> {
     let runner = RecipeCheckRunner::new(root, &name)?.with_streamed_progress();
     warm_operator_inputs(&runner, targets);
     let _lock = lock_ladder_for_run(&runner)?;
-    crate::checks::qemu_boot::secret::run(&runner)
+    crate::checks::qemu_boot::secret::run(&runner, tpm.as_deref())
 }
 
 /// Host-side qemu boot validation (re #529). This is deliberately NOT a gated

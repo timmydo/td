@@ -1,7 +1,7 @@
 use crate::ladder::split_target_debug;
 use crate::types::{Recipe, Step};
 
-// Reuses td-authd/ source embeds, including td-firstboot/src/principals.rs.
+// Reuses td-authd/ and td-secret/ embeds, including td-firstboot/ and td-busd/.
 use super::td_authd as producer;
 
 pub fn recipe() -> Recipe {
@@ -41,10 +41,19 @@ pub fn recipe() -> Recipe {
         to: "{out}/bin/td-authd-tests".into(),
         exec: true,
     });
+    let mut secret_steps = super::td_secret::recipe().steps.unwrap_or_default();
+    secret_steps.retain(|step| !matches!(step, Step::SplitDebugTree { .. }));
+    steps.extend(secret_steps);
+    steps.push(Step::CopyFile {
+        file: "{root}/secret-tests".into(),
+        to: "{out}/bin/td-secret-tests".into(),
+        exec: true,
+    });
     steps.push(Step::Require {
         paths: vec![
             "{out}/bin/secret-vm-init".into(),
             "{out}/bin/td-authd-tests".into(),
+            "{out}/bin/td-secret-tests".into(),
         ],
         exec: true,
     });
@@ -52,6 +61,7 @@ pub fn recipe() -> Recipe {
     steps.push(Step::assert_static(&[
         "{out}/bin/secret-vm-init",
         "{out}/bin/td-authd-tests",
+        "{out}/bin/td-secret-tests",
     ]));
     recipe.steps = Some(steps);
     recipe

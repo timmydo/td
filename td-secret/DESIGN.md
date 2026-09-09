@@ -768,6 +768,36 @@ Ordinary tests also exercise malformed envelopes and replies, backend
 selection, failed enrollment, master rotation and interrupted cleanup. A
 normal cargo pass with those tests ignored is not TPM integration evidence.
 
+### TPM through the QEMU guest device
+
+`td-recipe-eval qemu-secret --tpm /absolute/path/to/swtpm` requires the
+same pinned host swtpm described above and adds four cold guest boots to
+the authority checks. The host starts a private software TPM control
+socket and attaches QEMU's emulated TIS device; there is no host TPM
+passthrough. The source-built test executable calls the unchanged
+`Device::open` and `Client` implementations through `/dev/tpmrm0`.
+
+The sealing guest extends SHA-256 PCR 7 with a fixed fixture measurement,
+seals a known fixture key with a metadata binding, verifies immediate
+unseal, and persists only the encoded sealed object on a fresh one-MiB
+raw disk. Subsequent guests receive that disk read-only. Both QEMU and
+swtpm restart between cases; the next two cases retain the first TPM's
+state directory. Cold reopen must reproduce the fixture PCR state and
+recover the key. The PCR-change case first recovers it, then extends PCR
+7 again and requires a TPM PolicyPCR refusal. The final case uses a fresh
+TPM state directory, proves the PCR state still matches, and requires a
+TPM Load refusal for the transplanted object. Transport errors cannot
+stand in for those expected TPM command refusals.
+
+Every guest requires its one-test passing summary, fixture marker, and
+clean exit within 180 seconds. Emulator startup and shutdown each have a
+ten-second deadline; failure includes bounded emulator diagnostics.
+Private disk, sockets and TPM state are removed on ordinary completion or
+failure. This proves the guest device transport, sealed-object persistence
+and TPM/PCR binding. The key and measurements are fixtures; it does not
+prove a measured deployment, FIDO2 presence, session authorization or a
+credential-store write. The stock deployment remains unenrolled.
+
 ## Portal evidence
 
 Tests include RFC HKDF and AEAD vectors, Poly1305, bytewise ciphertext/tag

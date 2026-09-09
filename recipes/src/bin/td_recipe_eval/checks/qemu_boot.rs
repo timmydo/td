@@ -653,6 +653,7 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
             audio: false,
             physical_input: false,
             capture_firefox_audio: false,
+            tpm_socket: None,
         },
         runner.scratch_dir(),
     )?;
@@ -709,6 +710,7 @@ pub(crate) fn run_erofs(runner: &RecipeCheckRunner) -> Result<(), String> {
             audio: false,
             physical_input: false,
             capture_firefox_audio: false,
+            tpm_socket: None,
         },
         runner.scratch_dir(),
     )?;
@@ -843,6 +845,7 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
             audio: false,
             physical_input: false,
             capture_firefox_audio: false,
+            tpm_socket: None,
         },
         runner.scratch_dir(),
     )?;
@@ -1386,6 +1389,7 @@ fn boot_system_once(
             audio: true,
             physical_input,
             capture_firefox_audio,
+            tpm_socket: None,
         },
         scratch,
     )?;
@@ -1422,6 +1426,7 @@ fn boot_failed_target_once(
             audio: true,
             physical_input: false,
             capture_firefox_audio: false,
+            tpm_socket: None,
         },
         scratch,
     )?;
@@ -2781,6 +2786,7 @@ pub(crate) fn run_net(runner: &RecipeCheckRunner) -> Result<(), String> {
             audio: true,
             physical_input: false,
             capture_firefox_audio: false,
+            tpm_socket: None,
         },
         runner.scratch_dir(),
     )?;
@@ -2923,6 +2929,7 @@ pub(crate) fn run_kexec(runner: &RecipeCheckRunner) -> Result<(), String> {
             audio: false,
             physical_input: false,
             capture_firefox_audio: false,
+            tpm_socket: None,
         },
         runner.scratch_dir(),
     )?;
@@ -4085,6 +4092,8 @@ struct BootPlan<'a> {
     /// audit workload remains real physical input but uses the host-silent
     /// backend so audit scheduling cannot invalidate the HDA timing oracle.
     capture_firefox_audio: bool,
+    /// Private swtpm control socket; never a host TPM passthrough.
+    tpm_socket: Option<&'a Path>,
 }
 
 /// Boot `bzImage` + `initramfs` under qemu per `plan` (see `BootPlan`), capturing ttyS0 to
@@ -4208,6 +4217,11 @@ fn boot_with_timeout(
         .arg("-initrd")
         .arg(initramfs)
         .args(["-append", &append]);
+    if let Some(path) = plan.tpm_socket {
+        cmd.arg("-chardev").arg(tpm_chardev_arg(path));
+        cmd.args(["-tpmdev", "emulator,id=secret-tpm,chardev=secret-tpm"]);
+        cmd.args(["-device", "tpm-tis,tpmdev=secret-tpm"]);
+    }
     if let Some(path) = qmp_path.as_deref() {
         cmd.arg("-qmp").arg(qmp_arg(path));
     }
@@ -6427,6 +6441,17 @@ pub(crate) fn drive_arg(disk: &Path, read_only: bool) -> OsString {
             escaped.push(b',');
         }
         escaped.push(b);
+    }
+    out.push(OsString::from_vec(escaped));
+    out
+}
+
+fn tpm_chardev_arg(path: &Path) -> OsString {
+    let mut out = OsString::from("socket,id=secret-tpm,path=");
+    let mut escaped = Vec::new();
+    for byte in path.as_os_str().as_bytes() {
+        if *byte == b',' { escaped.push(b','); }
+        escaped.push(*byte);
     }
     out.push(OsString::from_vec(escaped));
     out

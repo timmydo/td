@@ -23,6 +23,18 @@ pub const CASES: &[(&str, &str)] = &[
         "unlock::tests::root_supervisor_relocks_after_the_production_worker_refuses",
     ),
 ];
+pub const TPM_CASES: &[(&str, &str)] = &[
+    (
+        "tpm-seal",
+        "tpm::tests::qemu_device_seals_to_persistent_state",
+    ),
+    (
+        "tpm-reopen",
+        "tpm::tests::qemu_device_reopens_after_cold_boot",
+    ),
+    ("tpm-pcr", "tpm::tests::qemu_device_refuses_changed_pcr"),
+    ("tpm-other", "tpm::tests::qemu_device_refuses_another_tpm"),
+];
 pub const PASS: &str = "TD-SECRET-VM-PASS";
 pub const FAIL: &str = "TD-SECRET-VM-FAIL";
 
@@ -68,15 +80,21 @@ fn run() -> Result<(), String> {
     fs::set_permissions("/tmp", fs::Permissions::from_mode(0o1777))
         .map_err(|e| format!("chmod /tmp: {e}"))?;
     let selected = fs::read_to_string("/case").map_err(|e| format!("read case: {e}"))?;
-    let (_, test) = CASES
+    let (_, test, executable) = CASES
         .iter()
-        .find(|(name, _)| *name == selected)
+        .map(|(name, test)| (*name, *test, "/bin/td-authd-tests"))
+        .chain(
+            TPM_CASES
+                .iter()
+                .map(|(name, test)| (*name, *test, "/bin/td-secret-tests")),
+        )
+        .find(|(name, _, _)| *name == selected)
         .ok_or_else(|| "unknown VM case".to_string())?;
     let log = File::create("/run/test.log").map_err(|e| format!("test log: {e}"))?;
     let errors = log
         .try_clone()
         .map_err(|e| format!("clone test log: {e}"))?;
-    let status = Command::new("/bin/td-authd-tests")
+    let status = Command::new(executable)
         .args(["--exact", test, "--ignored", "--test-threads=1"])
         .env_clear()
         .current_dir("/")
