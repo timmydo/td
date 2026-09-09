@@ -130,6 +130,84 @@ fn admitted_save_as_survives_unread_reply_edits_and_tab_switch() {
     admitted_save(true);
 }
 
+#[test]
+#[ignore = "ready builds the isolated test-file-barrier editor"]
+fn save_as_destination_created_after_handoff_is_not_overwritten() {
+    let compositor_directory = Directory::new();
+    let directory = Directory::new();
+    let mut compositor = Compositor::start(&compositor_directory);
+    let mut barrier = Barrier::start(&directory);
+    let file = directory.0.join("draft");
+    let destination = directory.0.join("contested copy");
+    let dictionary = directory.0.join("dictionary");
+    std::fs::write(&file, b"disk").unwrap();
+    std::fs::write(&dictionary, b"disk\n").unwrap();
+    let display = compositor.directory.join("wayland-0");
+    let mut editor = EditorProcess::start_with_barrier(
+        &directory,
+        &display,
+        &file,
+        &dictionary,
+        "windows",
+        Some(&barrier.path),
+    );
+    editor.legacy_keyboard("windows");
+    let window = compositor.window();
+    assert_eq!(compositor.request("fullscreen", 1024), b"ok\n");
+    editor.wait_field("state", "window", "800,576,1");
+    editor.rendered_at(800, 576);
+    editor.ok("insert\t1\t0\t0\t0\t61");
+    assert!(!destination.exists());
+    barrier.arm("save");
+    let started = Instant::now();
+    let response = editor
+        .request(&format!(
+            "save-as\t1\t1\t{}",
+            td_editor::control::hex(destination.as_os_str().as_encoded_bytes())
+        ))
+        .unwrap();
+    assert_eq!(response, "pending\t1");
+    let held = barrier.held();
+    editor.wait_field("state", "job", "1,save-as,1,1,0,pending,-");
+    editor.wait_field("state", "native", "1,1,1,0");
+    // Creation is ordered after handoff but before any worker filesystem I/O.
+    let mut external = std::fs::File::create_new(&destination).unwrap();
+    external.write_all(b"external").unwrap();
+    drop(external);
+    editor.ok("insert\t1\t1\t1\t1\t62");
+    editor.wait_tab(2, "abdisk");
+    editor.wait_field("state", "tab", "1,2,1,6,2,2,0,72,0,lf");
+    assert_eq!(std::fs::read(&file).unwrap(), b"disk");
+    assert_eq!(std::fs::read(&destination).unwrap(), b"external");
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(4),
+        "destination-race evidence exceeded four seconds: {elapsed:?}"
+    );
+    let before = compositor.observe(&window);
+    barrier.release(held);
+    assert_eq!(
+        editor.wait_job_outcome("1", ",error,unavailable"),
+        "job=1,save-as,1,1,0,error,unavailable"
+    );
+    editor.wait_field("state", "native", "1,1,0,0");
+    editor.wait_field("state", "dialog", "-");
+    editor.wait_field("state", "dialog-last", "0");
+    editor.wait_field("state", "tab", "1,2,1,6,2,2,0,72,0,lf");
+    editor.wait_tab(2, "abdisk");
+    compositor.rendered_text(&mut editor, &window, 2, before, "abdisk", 2);
+    assert_eq!(std::fs::read(&file).unwrap(), b"disk");
+    assert_eq!(std::fs::read(&destination).unwrap(), b"external");
+    // A failed Save As must not adopt the contested destination or baseline.
+    assert_eq!(editor.job("save\t1\t2"), "job=2,save,1,2,0,complete,-");
+    editor.wait_field("state", "tab", "1,2,0,6,2,2,0,72,0,lf");
+    assert_eq!(std::fs::read(&file).unwrap(), b"abdisk");
+    assert_eq!(std::fs::read(&destination).unwrap(), b"external");
+    editor.quit();
+    barrier.finish();
+    compositor.stop();
+}
+
 fn admitted_save(save_as: bool) {
     let compositor_directory = Directory::new();
     let directory = Directory::new();

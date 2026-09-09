@@ -603,6 +603,15 @@ Save As. This is lost-client-reply and post-handoff isolation evidence, not
 a pre-admission cancellation, queued-before-handoff or kernel-stalled-I/O
 oracle. Those boundaries remain outside these process cases.
 
+A separate Save As race starts with an absent destination, holds the
+captured snapshot, then creates that destination with external bytes before
+releasing the worker. The job must fail without overwriting either file,
+marking later edits saved, adopting the destination or opening a Reload
+dialog. Exact dirty text and correlated pixels remain available. A plain
+Save then writes the later draft to its original path while the contested
+destination remains intact. This orders creation before worker I/O; it is
+not a race injection inside filesystem publication itself.
+
 ## Line-number display
 
 Line numbers are on by default, a window-wide view preference shared by all

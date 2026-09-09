@@ -63,6 +63,9 @@ It also verifies admitted remote Save/Save As after an unread reply is
 discarded: later edits and tab switches cannot retarget the write, competing
 file operations refuse while busy, and Save As retains the original tab's
 association. Historical job rows, disk bytes and active-tab pixels agree.
+A Save As destination created while the worker is held must remain intact;
+the failed operation leaves the draft dirty and its original association
+usable for a subsequent plain Save.
 
 Line numbers are on by default. Use **Format > Line Numbers** to toggle
 them, or the `display-line-numbers-mode` named command in either key profile.
