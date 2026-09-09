@@ -25,6 +25,7 @@ pub mod layout;
 pub mod model;
 mod menu;
 mod number;
+mod path_completion;
 mod pointer;
 pub mod render;
 mod replace;

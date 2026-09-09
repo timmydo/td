@@ -175,6 +175,21 @@ Success is `1 ID ok` followed by these fields, in order:
 | `key-ready=0\|1` | Existing decoded-key availability, not target/value validation. |
 | `dialog-last=N` | Existing shared close/conflict/path ID counter. |
 | `dialog=...` | Existing close/conflict/path identity/phase/answers from `state`. |
+| `completion=idle\|pending\|ready\|error` | Path-completion state; idle without a path entry. |
+
+Completion adds state-specific fields after `completion`: pending includes
+`completion-id=N`, a checked scan ID, not answer authority. Error includes
+`completion-error=HEX`, a UTF-8 diagnostic limited to 160 characters. Ready
+includes `completion-count=N`, `completion-skipped=N` (non-UTF-8 basenames),
+`completion-selected=INDEX|-`, then up to three repeated
+`completion-item=INDEX,HEX` fields for the currently displayed page. Indices
+are zero-based sorted match indices; values are full literal UTF-8 paths,
+not escaped display labels. Each path is at most 4096 bytes and the list at
+most 128 paths; only the current three-row page is returned. These bounded
+fields fit the existing one-MiB frame. Inspecting them never starts or polls
+a scan. Physical Tab/Shift+Tab/Up/Down uses the path entry's keyboard path;
+semantic dialog answers still supply explicit OS-byte paths and do not
+gain a completion mutation verb or physical clipboard authority.
 
 Kinds are `none`, `path-open`, `path-save-as`, `path-dictionary`,
 `close-save-as`, `find-forward`, `find-backward`, `replace`, `go-to-line`,

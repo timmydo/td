@@ -347,6 +347,18 @@ Return submits, Escape/Ctrl+G cancels, Backspace deletes, Ctrl+U clears. Save
 As requires a new pathname. Use `--` before dash-prefixed command-line paths.
 The older leading `--window` flag remains an optional alias.
 
+In a path entry, Tab completes the literal filename and lists matches.
+Tab/Shift+Tab or Down/Up cycles them; Enter submits the selected path.
+Directory matches end in `/`; once a directory is the sole match, Tab
+again lists its contents. Typing or Backspace clears the old completion;
+press Tab again to scan the changed entry.
+The list shows three names per page and follows the selected match.
+Completion runs off the UI thread and does not open or modify files.
+It includes dotfiles, does no shell or `~` expansion, and uses the startup
+working directory for relative paths. Non-UTF-8 names are omitted with a
+count; large directories or more than 128 matches refuse explicitly.
+Open, Save As and Dictionary use the same keys in both profiles.
+
 Switch tabs with Ctrl+Tab. An existing file opened again selects its current
 tab without reloading it. External disk changes refuse Save and offer Ctrl+R
 Reload, Ctrl+S Save As to a new name, or Escape/Ctrl+G Cancel. These dialog

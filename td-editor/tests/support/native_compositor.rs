@@ -18,6 +18,100 @@ const KEY_END: u32 = 107;
 
 #[test]
 #[ignore = "ready supplies the disposable native compositor"]
+fn native_path_completion_lists_cycles_and_opens_literal_relative_file() {
+    use td_editor::render::{Draw, Geometry, GlyphStyle, Primitive, Raster, Scale, CHROME, INK};
+    for profile in ["windows", "emacs"] {
+        let compositor_directory = Directory::new();
+        let directory = Directory::new();
+        let mut compositor = Compositor::start(&compositor_directory);
+        for (name, bytes) in [("draft", "keep"), ("alpha", "one"), ("alpine", "two")] {
+            std::fs::write(directory.0.join(name), bytes).unwrap();
+        }
+        let socket = directory.0.join("control");
+        let log = directory.0.join("stderr");
+        let child = Command::new(env!("CARGO_BIN_EXE_td-editor"))
+            .arg("--control-socket").arg(&socket)
+            .arg(format!("--keys={profile}")).arg("draft")
+            .current_dir(&directory.0)
+            .env_clear()
+            .env("WAYLAND_DISPLAY", compositor.directory.join("wayland-0"))
+            .env("XDG_RUNTIME_DIR", &directory.0)
+            .env("TMPDIR", &directory.0)
+            .stdin(Stdio::null()).stdout(Stdio::null())
+            .stderr(Stdio::from(std::fs::File::create(&log).unwrap()))
+            .spawn().unwrap();
+        let mut editor = EditorProcess { child, socket, log, next: 0 };
+        editor.legacy_keyboard(profile);
+        let window = compositor.window();
+        assert_eq!(compositor.request("fullscreen", 1024), b"ok\n");
+        editor.wait_field("state", "window", "800,576,1");
+        editor.rendered_at(800, 576);
+        if profile == "emacs" {
+            compositor.chord(Some(KEY_LEFT_CTRL), KEY_X);
+            compositor.chord(Some(KEY_LEFT_CTRL), 33); // C-f
+        } else {
+            compositor.chord(Some(KEY_LEFT_CTRL), 24); // C-o
+        }
+        editor.wait_field("prompt-state", "prompt", "path-open");
+        compositor.chord(None, KEY_A);
+        compositor.chord(None, 38); // l
+        editor.wait_field("prompt-state", "text", "616c");
+        let before = compositor.observe(&window);
+        compositor.chord(None, 15); // Tab
+        editor.wait_field("prompt-state", "completion", "ready");
+        editor.wait_field("prompt-state", "text", "616c70");
+        let state = editor.ok("prompt-state");
+        assert_eq!(field(&state, "completion-count"), Some("2"));
+        assert!(state.contains("completion-item=0,616c706861"));
+        assert!(state.contains("completion-item=1,616c70696e65"));
+        editor.rendered_at(800, 576);
+        let font = td_editor::font::pinned().unwrap();
+        let geometry = Geometry::new(64, 32, Scale::new(1).unwrap()).unwrap();
+        let mut expected = CHROME.to_le_bytes().repeat(64 * 32);
+        let mut raster = Raster::new(&mut expected, &font, geometry, 64 * 4).unwrap();
+        for (row, text) in ["  alpha", "  alpine"].into_iter().enumerate() {
+            for (column, scalar) in text.chars().enumerate() {
+                raster.draw(Draw { clip: geometry.bounds(), primitive: Primitive::Glyph {
+                    x: (column * 8) as i64, y: (row * 16) as i64, scalar,
+                    style: GlyphStyle::medium(INK, CHROME),
+                }});
+            }
+        }
+        let deadline = Instant::now() + TIMEOUT;
+        loop {
+            assert!(Instant::now() < deadline, "completion list pixel deadline");
+            let first = compositor.observe(&window);
+            if !first.current || first.commit <= before.commit { continue; }
+            let capture = compositor.request("capture", FRAME_BYTES + 128);
+            let (output, pixels) = ppm(&capture, &compositor.session).unwrap();
+            let second = compositor.observe(&window);
+            if !second.current || second.commit != first.commit { continue; }
+            assert_eq!(first.client, before.client);
+            assert_eq!(second.client, first.client);
+            assert!(output > first.output && output <= second.output);
+            if (0..32).all(|y| (0..64).all(|x| {
+                let source = ((y + 120) * 800 + x + 8) * 3;
+                let target = (y * 64 + x) * 4;
+                pixels[source..source + 3] == [expected[target + 2], expected[target + 1], expected[target]]
+            })) { break; }
+        }
+        compositor.chord(Some(KEY_LEFT_SHIFT), 15); // Shift+Tab selects last.
+        editor.wait_field("prompt-state", "text", "616c70696e65");
+        compositor.chord(None, 108); // Down wraps to first.
+        editor.wait_field("prompt-state", "text", "616c706861");
+        editor.wait_tab(0, "keep");
+        compositor.chord(None, 28); // Return opens, never inserts path text.
+        editor.wait_field("state", "active", "2");
+        assert_eq!(editor.ok("text\t2\t0\t0\t100"), "3\t6f6e65");
+        assert_eq!(std::fs::read(directory.0.join("draft")).unwrap(), b"keep");
+        assert_eq!(std::fs::read(directory.0.join("alpha")).unwrap(), b"one");
+        editor.quit();
+        compositor.stop();
+    }
+}
+
+#[test]
+#[ignore = "ready supplies the disposable native compositor"]
 fn ordinary_invocation_keeps_foreground_lifetime_and_inherited_stdin() {
     use std::io::Seek;
     let compositor_directory = Directory::new();

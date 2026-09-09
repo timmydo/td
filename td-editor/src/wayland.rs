@@ -345,6 +345,8 @@ struct Window {
     quitting: bool,
     files: Option<crate::session::Session>,
     prompt: Option<PathPrompt>,
+    path_completion: Option<crate::path_completion::Worker>,
+    last_completion: u64,
     closing: Option<Close>,
     last_dialog_id: u64,
     closing_save: bool,
@@ -392,12 +394,44 @@ struct PathPrompt {
     action: PathAction,
     text: String,
     identity: Option<PathIdentity>,
+    completion: crate::path_completion::State,
 }
 struct PathIdentity {
     id: u64,
     point: crate::model::RevisionPoint,
 }
 impl PathPrompt {
+    fn completion_notice(&self, columns: usize, paused: &str, closing: bool) -> String {
+        let columns = columns.clamp(1, 72);
+        let action = match self.action {
+            PathAction::Open => "Open",
+            PathAction::Dictionary => "Dictionary",
+            PathAction::Save { .. } => "Save As",
+        };
+        let header = if !paused.is_empty() {
+            paused.to_string()
+        } else if closing {
+            "Save before close; Esc/C-g cancels ALL closing".into()
+        } else {
+            format!("{action}: Enter submits; Esc cancels; Tab/Up/Down chooses")
+        };
+        let escaped: String = self.text.chars().flat_map(char::escape_debug).collect();
+        let start = escaped
+            .char_indices()
+            .rev()
+            .nth(columns.saturating_sub(2))
+            .map_or(0, |(i, _)| i);
+        let entry = if columns == 1 { "|".into() } else {
+            format!("{}|", escaped.get(start..).unwrap_or_default())
+        };
+        format!("{header}\n{entry}\n{}", self.completion.notice())
+            .lines()
+            .take(6)
+            .map(|line| line.chars().take(columns).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     fn notice(&self) -> String {
         let action = match self.action {
             PathAction::Open => "Open",
@@ -413,7 +447,7 @@ impl PathPrompt {
             .nth(159)
             .map_or(0, |(i, _)| i);
         let tail = self.text.get(start..).unwrap_or_default();
-        format!("{action}: literal path, no shell expansion\nReturn: submit; Escape/Ctrl+G: cancel; Ctrl+U: clear\n{}{}|", if tail.len() < self.text.len() { "..." } else { "" }, tail)
+        format!("{action}: literal path; Tab completes; no shell expansion\nReturn: submit; Escape/Ctrl+G: cancel; Ctrl+U: clear\n{}{}|", if tail.len() < self.text.len() { "..." } else { "" }, tail)
     }
 }
 
@@ -467,6 +501,8 @@ impl Window {
             quitting: false,
             files: None,
             prompt: None,
+            path_completion: None,
+            last_completion: 0,
             closing: None,
             last_dialog_id: 0,
             closing_save: false,
@@ -1447,6 +1483,9 @@ impl Window {
     }
 
     fn tick(&mut self, now: u64, repeat: bool) -> Result<()> {
+        if let Some((id, result)) = self.path_completion.as_mut().and_then(|worker| worker.poll()) {
+            self.completed_path(id, result);
+        }
         let active = self.ui.editor().active();
         if let Some(result) = self
             .files
@@ -1563,7 +1602,10 @@ impl Window {
             }
         }
         self.connection.wait = Duration::from_millis(self.input.wait_ms(now));
-        if self.clipboard.incoming.is_some() || self.clipboard.outgoing.is_some() {
+        if self.clipboard.incoming.is_some()
+            || self.clipboard.outgoing.is_some()
+            || self.path_completion.as_ref().is_some_and(|worker| worker.pending())
+        {
             self.connection.wait = self.connection.wait.min(Duration::from_millis(10));
         }
         self.cancel_stale_paste();
@@ -2803,6 +2845,11 @@ impl Window {
             u8::from(self.control_key_available())
         ));
         fields.push_str(&self.control_dialog_fields());
+        fields.push('\t');
+        fields.push_str(&self.prompt.as_ref().map_or_else(
+            || crate::path_completion::State::Idle.fields(),
+            |prompt| prompt.completion.fields(),
+        ));
         Ok(fields)
     }
 
@@ -3749,6 +3796,21 @@ impl Window {
 
     fn path_notice(&self) -> Option<String> {
         let prompt = self.prompt.as_ref()?;
+        if !matches!(prompt.completion, crate::path_completion::State::Idle) {
+            let paused = if self.device.is_none() || self.input.map.is_none() {
+                "Path entry paused: restore keyboard/keymap"
+            } else if !self.input.focused || !self.input.synchronized {
+                "Path entry paused: focus editor; tap/release Shift"
+            } else {
+                ""
+            };
+            return Some(prompt.completion_notice(
+                self.ui.geometry().dimensions().0.saturating_sub(16 * self.ui.geometry().scale().value())
+                    / (8 * self.ui.geometry().scale().value()),
+                paused,
+                self.closing.is_some(),
+            ));
+        }
         let readiness = if self.device.is_none() || self.input.map.is_none() {
             "Path entry paused: keyboard unavailable; restore the seat/keymap.\n"
         } else if !self.input.focused || !self.input.synchronized {
@@ -3882,6 +3944,7 @@ impl Window {
                 },
                 text: String::new(),
                 identity,
+                completion: crate::path_completion::State::Idle,
             });
             self.frames.invalidate(true);
             true
@@ -3937,19 +4000,76 @@ impl Window {
             }
             "Backspace" => {
                 prompt.text.pop();
+                prompt.completion = crate::path_completion::State::Idle;
             }
-            "C-u" => prompt.text.clear(),
+            "C-u" => {
+                prompt.text.clear();
+                prompt.completion = crate::path_completion::State::Idle;
+            }
+            "Tab" | "S-Tab" | "Up" | "Down" => {
+                let backward = matches!(chord, "S-Tab" | "Up");
+                match &mut prompt.completion {
+                    crate::path_completion::State::Pending(_) => {}
+                    crate::path_completion::State::Ready(matches)
+                        if chord != "Tab" || !matches.descend(&prompt.text) =>
+                    {
+                        if let Some(path) = matches.cycle(backward) {
+                            prompt.text = path.to_string();
+                        }
+                    }
+                    _ if matches!(chord, "Tab" | "S-Tab") => {
+                        if let Err(detail) = self.request_path_completion(&mut prompt) {
+                            prompt.completion = crate::path_completion::State::Failed(detail);
+                        }
+                    }
+                    _ => {}
+                }
+            }
             _ => {
                 let text = if chord == "Space" { " " } else { chord };
                 let mut chars = text.chars();
                 if let (Some(c), None) = (chars.next(), chars.next()) {
                     if !c.is_control() && prompt.text.len() + c.len_utf8() <= 4096 {
                         prompt.text.push(c);
+                        prompt.completion = crate::path_completion::State::Idle;
                     }
                 }
             }
         }
         self.prompt = Some(prompt);
+    }
+
+    fn request_path_completion(&mut self, prompt: &mut PathPrompt) -> Result<()> {
+        let id = self.last_completion.checked_add(1).ok_or("completion counter exhausted")?;
+        if self.path_completion.is_none() {
+            self.path_completion = Some(crate::path_completion::Worker::start()?);
+        }
+        self.path_completion.as_mut().ok_or("completion worker unavailable")?
+            .request(id, prompt.text.clone())?;
+        self.last_completion = id;
+        prompt.completion = crate::path_completion::State::Pending(id);
+        Ok(())
+    }
+
+    fn completed_path(&mut self, id: u64, result: Result<crate::path_completion::Matches>) {
+        let Some(prompt) = &mut self.prompt else { return };
+        if !matches!(prompt.completion, crate::path_completion::State::Pending(pending) if pending == id) {
+            return;
+        }
+        let current = if let Some(identity) = &prompt.identity {
+            self.ui.editor().check_revision(&identity.point).is_ok()
+        } else {
+            self.closing.as_ref().is_some_and(|closing| matches!(closing.next(self.ui.editor()), Ok(Some(_))))
+        };
+        prompt.completion = match result {
+            Ok(matches) if current => {
+                prompt.text = matches.prefix().to_string();
+                crate::path_completion::State::Ready(matches)
+            }
+            Ok(_) => crate::path_completion::State::Failed("document changed; reopen the path prompt".into()),
+            Err(detail) => crate::path_completion::State::Failed(detail),
+        };
+        self.frames.invalidate(true);
     }
 
     fn close_notice(&self) -> &'static str {
@@ -4857,12 +4977,13 @@ fn read_keymap(fd: OwnedFd, format: u32, size: u32) -> Result<Keymap> {
 
 fn paint_prompt(raster: &mut Raster<'_, '_>, geometry: Geometry, text: &str) {
     let (width, height) = geometry.dimensions();
-    let y = if height >= 160 { 48 } else { 0 };
+    let scale = geometry.scale().value();
+    let y = if height >= 160 * scale { 48 * scale } else { 0 };
     let clip = Rect {
         x: 0,
-        y,
+        y: y as i64,
         width: width as u32,
-        height: (height as u32).saturating_sub(y as u32).min(96),
+        height: (height as u32).saturating_sub(y as u32).min((96 * scale) as u32),
     };
     raster.draw(Draw {
         clip,
@@ -4871,7 +4992,7 @@ fn paint_prompt(raster: &mut Raster<'_, '_>, geometry: Geometry, text: &str) {
             color: CHROME,
         },
     });
-    let columns = width.saturating_sub(16).checked_div(8).unwrap_or(0).max(1);
+    let columns = width.saturating_sub(16 * scale).checked_div(8 * scale).unwrap_or(0).max(1);
     let mut column = 0;
     let mut row = 0;
     for scalar in text.chars().take(512) {
@@ -4888,8 +5009,8 @@ fn paint_prompt(raster: &mut Raster<'_, '_>, geometry: Geometry, text: &str) {
         raster.draw(Draw {
             clip,
             primitive: Primitive::Glyph {
-                x: 8 + column as i64 * 8,
-                y: y + row * 16,
+                x: ((8 + column * 8) * scale) as i64,
+                y: (y + row * 16 * scale) as i64,
                 scalar,
                 style: GlyphStyle::medium(INK, CHROME),
             },
@@ -7345,7 +7466,7 @@ mod tests {
             assert!(answer.contains(&format!("\tprompt={kind}\ttarget=1,0\t")));
             assert!(answer.contains("\ttext=cebb\t"));
             assert!(answer.contains("\tkey-ready=0\t"));
-            assert!(answer.ends_with(&w.control_dialog_fields()));
+            assert!(answer.ends_with(&format!("{}\tcompletion=idle", w.control_dialog_fields())));
             let cancel = crate::control::Request::parse(
                 format!("1\t1\tdialog-answer\t{}\t1\t0\tcancel", w.last_dialog_id).as_bytes(),
             )
@@ -7363,7 +7484,7 @@ mod tests {
         let answer = prompt_snapshot(&mut w);
         assert!(answer.contains("\tprompt=close-save-as\ttarget=1,1\t"));
         assert!(answer.contains("\ttext=70\t"));
-        assert!(answer.ends_with(&w.control_dialog_fields()));
+        assert!(answer.ends_with(&format!("{}\tcompletion=idle", w.control_dialog_fields())));
         assert_eq!(w.ui.editor().document(1).unwrap().text(), "x");
     }
 
@@ -7384,7 +7505,7 @@ mod tests {
         let answer = prompt_snapshot(&mut w);
         assert!(answer.contains("\tprompt=find-forward\ttarget=2,0\t"));
         assert!(answer.contains("\ttext=78\t") && answer.contains("\tkey-ready=0\t"));
-        assert!(answer.ends_with(&w.control_dialog_fields()));
+        assert!(answer.ends_with(&format!("{}\tcompletion=idle", w.control_dialog_fields())));
         assert!(answer.contains(",conflict,question,2,0,"));
         w.chord("x", false).unwrap();
         assert_eq!(w.search.as_ref().unwrap().text, "x");
@@ -12006,6 +12127,149 @@ mod tests {
             w.chord(&c.to_string(), false).unwrap();
         }
         w.chord("Return", false).unwrap();
+    }
+
+    fn finish_completion(w: &mut Window) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while w.path_completion.as_ref().is_some_and(|worker| worker.pending()) {
+            assert!(Instant::now() < deadline, "completion deadline");
+            w.tick(w.clock + 1, false).unwrap();
+            std::thread::yield_now();
+        }
+    }
+
+    #[test]
+    fn path_completion_extends_lists_cycles_descends_and_submits_without_editing() {
+        for profile in [Profile::Windows, Profile::Emacs] {
+            let directory = DialogDirectory::new();
+            std::fs::create_dir(directory.path("folder")).unwrap();
+            std::fs::write(directory.path("folder/apple"), b"one").unwrap();
+            std::fs::write(directory.path("folder/apricot"), b"two").unwrap();
+            let (mut w, peer) = file_dialog_fixture();
+            w.ui.dispatch(Event::Profile(profile)).unwrap();
+            configure(&mut w, 800, 600);
+            assert!(w.file_request("open", 1, 0));
+            w.prompt.as_mut().unwrap().text = directory.path("fo").to_str().unwrap().into();
+            let before = format!("{:?}", w.ui.editor());
+            w.chord("Tab", true).unwrap();
+            w.chord("Down", false).unwrap();
+            w.chord("Up", false).unwrap();
+            assert!(w.path_completion.is_none());
+            w.chord("Tab", false).unwrap();
+            finish_completion(&mut w);
+            assert!(w.prompt.as_ref().unwrap().text.ends_with("folder/"));
+            w.chord("Tab", false).unwrap();
+            finish_completion(&mut w);
+            assert!(w.prompt.as_ref().unwrap().text.ends_with("folder/ap"));
+            let snapshot = prompt_snapshot(&mut w);
+            assert!(snapshot.contains("completion=ready\tcompletion-count=2\t"));
+            assert_eq!(snapshot.matches("completion-item=").count(), 2);
+            let notice = w.path_notice().unwrap();
+            assert!(notice.contains("apple") && notice.contains("apricot"));
+            assert!(notice.lines().count() <= 6);
+            assert!(notice.lines().all(|line| line.chars().count() <= 72));
+            w.chord("S-Tab", false).unwrap();
+            assert!(w.prompt.as_ref().unwrap().text.ends_with("apricot"));
+            w.chord("Down", false).unwrap();
+            assert!(w.prompt.as_ref().unwrap().text.ends_with("apple"));
+            w.chord("Up", false).unwrap();
+            assert!(w.prompt.as_ref().unwrap().text.ends_with("apricot"));
+            assert_eq!(format!("{:?}", w.ui.editor()), before);
+            w.chord("Return", false).unwrap();
+            finish_file(&mut w);
+            assert!(w.prompt.is_none());
+            assert_eq!(w.ui.editor().document(2).unwrap().text(), "two");
+            assert_eq!(std::fs::read(directory.path("folder/apricot")).unwrap(), b"two");
+            drain(&peer);
+        }
+    }
+
+    #[test]
+    fn completion_results_cannot_revive_edited_cancelled_replaced_or_stale_prompts() {
+        use crate::path_completion::{scan, State};
+        let directory = DialogDirectory::new();
+        std::fs::write(directory.path("file"), b"keep").unwrap();
+        let prefix = directory.path("fi").to_str().unwrap().to_string();
+        for change in ["edit-away-back", "cancel", "replace", "stale"] {
+            let (mut w, _peer) = file_dialog_fixture();
+            assert!(w.file_request("open", 1, 0));
+            w.prompt.as_mut().unwrap().text = prefix.clone();
+            w.prompt.as_mut().unwrap().completion = State::Pending(11);
+            match change {
+                "edit-away-back" => {
+                    w.path_chord("x", false);
+                    w.path_chord("Backspace", false);
+                }
+                "cancel" => w.path_chord("Escape", false),
+                "replace" => {
+                    w.path_chord("Escape", false);
+                    assert!(w.file_request("open", 1, 0));
+                    w.prompt.as_mut().unwrap().text = prefix.clone();
+                    w.prompt.as_mut().unwrap().completion = State::Pending(12);
+                }
+                _ => {
+                    w.ui.dispatch(Event::Edit { tab: 1, revision: 0,
+                        command: crate::model::Command::Insert("changed".into()) }).unwrap();
+                }
+            }
+            w.completed_path(11, scan(&prefix));
+            if let Some(prompt) = &w.prompt {
+                assert_eq!(prompt.text, prefix);
+                assert!(!matches!(prompt.completion, State::Ready(_)));
+                if change == "stale" { assert!(matches!(prompt.completion, State::Failed(_))); }
+            } else { assert_eq!(change, "cancel"); }
+            assert!(!w.files.as_ref().unwrap().busy());
+        }
+    }
+
+    #[test]
+    fn path_prompt_grid_scales_without_overlapping_six_rows() {
+        use crate::render::Scale;
+        let font = crate::font::pinned().unwrap();
+        let draw = |scale: u8| {
+            let s = usize::from(scale);
+            let geometry = Geometry::new(320 * s, 200 * s, Scale::new(scale).unwrap()).unwrap();
+            let mut pixels = vec![0; 320 * 200 * 4 * s * s];
+            let mut raster = Raster::new(&mut pixels, &font, geometry, 320 * 4 * s).unwrap();
+            paint_prompt(&mut raster, geometry, "A\nB\nC\nD\nE\nF");
+            pixels
+        };
+        let base = draw(1);
+        for scale in 2..=4 {
+            let s = usize::from(scale);
+            let actual = draw(scale);
+            for y in 0..200 * s {
+                for x in 0..320 * s {
+                    let source = ((y / s) * 320 + x / s) * 4;
+                    let target = (y * 320 * s + x) * 4;
+                    assert_eq!(&actual[target..target + 4], &base[source..source + 4],
+                        "scale={scale}, x={x}, y={y}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn completion_errors_counter_exhaustion_and_narrow_notice_preserve_entry() {
+        let (mut w, _peer) = file_dialog_fixture();
+        assert!(w.file_request("save-as", 1, 0));
+        w.prompt.as_mut().unwrap().text = "literal".into();
+        w.last_completion = u64::MAX;
+        w.path_chord("Tab", false);
+        let prompt = w.prompt.as_ref().unwrap();
+        assert_eq!(prompt.text, "literal");
+        assert!(prompt.completion.fields().contains("completion=error"));
+        for columns in 1..=100 {
+            let notice = prompt.completion_notice(columns, "Paused: restore keyboard", false);
+            assert!(notice.lines().all(|line| line.chars().count() <= columns.min(72)));
+            assert!(notice.chars().count() < 512);
+            assert!(notice.lines().nth(1).unwrap().ends_with('|'));
+        }
+        w.path_chord("C-u", false);
+        assert!(matches!(w.prompt.as_ref().unwrap().completion, crate::path_completion::State::Idle));
+        assert!(w.prompt.as_ref().unwrap().text.is_empty());
+        w.path_chord("Escape", false);
+        assert!(!w.files.as_ref().unwrap().busy());
     }
 
     #[test]

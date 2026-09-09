@@ -56,6 +56,7 @@ fn source_inventory_and_allowances_are_closed() {
         "menu.rs",
         "model.rs",
         "number.rs",
+        "path_completion.rs",
         "pointer.rs",
         "render.rs",
         "replace.rs",

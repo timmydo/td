@@ -1127,6 +1127,53 @@ non-modal notices use the bottom status row as specified below; routine
 feedback does not cover editable text.
 When input is unavailable or not synchronized, the prompt instead prefixes
 readiness instructions without erasing the entered path.
+
+### Literal path completion
+
+Open, Save As (including close-initiated Save As) and Dictionary entries
+support the same completion keys in both profiles. Tab scans the literal
+directory prefix, extends to the common UTF-8 prefix and shows matching
+names. Tab/Shift+Tab and Down/Up then cycle the sorted results, wrapping at
+either end. With a single completed directory ending in slash, another
+Tab scans inside it. Typing, Backspace or Ctrl+U clears the old list; Enter
+submits the full literal entry through the ordinary file worker. Completion
+never opens, saves, creates or deletes anything by itself. No shell, tilde
+or environment expansion is performed; relative paths use the editor's
+startup working directory. Dotfiles participate and comparison is literal
+case-sensitive UTF-8 order. Symlinks are listed but not followed to decide
+whether to append a directory slash; file admission retains its own policy.
+
+One lazily started pure-std worker owns directory scans, using capacity-one
+request/reply channels and only one in-flight request. The UI polls at most
+every 10ms while a scan is outstanding, never waits or joins. A blocking
+filesystem call can delay that worker; cancel drops its result authority,
+not the syscall. Further requests while an old scan remains outstanding
+refuse visibly and may be retried. No unbounded queue or new worker is
+created to evade a stalled filesystem. A checked request counter, current
+prompt state and revision-bound owner prevent cancelled, edited-away-and-
+back, replaced or stale entries from adopting late results.
+
+Scans visit at most 4096 directory entries and charge at most 1 MiB of raw
+basename bytes. They retain at most 128 matching paths, each at most 4096
+UTF-8 bytes. Any scan error or exceeded bound refuses the whole result,
+never a truncated set that could falsely imply a unique completion.
+Non-UTF-8 basenames are omitted with a reported count; argv and semantic
+file-control requests still preserve arbitrary OS paths. Listings escape
+control characters only for display and keep the literal completion bytes.
+
+Completion feedback uses the existing six-row path overlay: action or
+paused-input header, tail of entry plus caret, status/count, and three
+candidate rows. Cycling changes the displayed page. Every line is clipped
+to available scaled font columns, capped at 72. The shared modal painter
+scales its origin, row/column spacing and clip with glyphs, preventing
+overlapping rows at integer scales 2-4. The full literal paths remain
+available from prompt-state. Completion has no independent modal or answer
+authority. Tests cover bounds, Unicode prefix boundaries, stale/cancelled
+results, both key profiles and compositor-correlated pixels for the actual
+listing followed by a physical-key open and exact file bytes.
+
+### File worker and path interaction
+
 Path and confirmation dialogs remain keyboard-only for physical interaction;
 trusted semantic control answers use their live IDs. Native pointer selection,
 tab clicks and scrolling follow the pointer contract below. Menus use the
