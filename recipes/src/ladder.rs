@@ -1810,7 +1810,7 @@ mod tests {
     ];
     const SELF_HOSTED_PHASE_MARKERS: [&str; 3] =
         ["rust-toolchain", "gcc-x86-64-self", "binutils-x86-64-self"];
-    const POST_BOOTSTRAP_PROTECTED_INPUT_EXCEPTIONS: [(&str, &str); 7] = [
+    const POST_BOOTSTRAP_PROTECTED_INPUT_EXCEPTIONS: [(&str, &str); 8] = [
         // Identity/codegen audits deliberately look back across the boundary.
         ("rust-userland-auto-test", "rust-stage0"),
         ("gcc-x86-64-self-test", "gcc-x86-64-native"),
@@ -1818,6 +1818,7 @@ mod tests {
         // Later boot artifacts consume the pre-self kernel and its cpio packer.
         ("kexec-spike-x86-64", "linux-x86-64"),
         ("system-x86-64", "linux-x86-64"),
+        ("system-secret-vm-test", "linux-x86-64"),
         // ...and the installer consumes the pre-self FILESYSTEM tool, for the
         // same reason: `td-install/DESIGN.md`'s D7 approves `mkfs.btrfs` as the
         // one third-party program on the install path, because writing a Btrfs
@@ -2491,7 +2492,11 @@ mod tests {
     fn executable_write_files_use_declared_shebangs() {
         let mut seen_guest_shebangs = HashSet::new();
         let expected_guest_shebangs: HashSet<(String, String)> = GUEST_LITERAL_SHEBANGS
-            .iter()
+            .iter().copied()
+            // The secret fixture derives the exact stock guest scripts.
+            .chain(GUEST_LITERAL_SHEBANGS.iter().filter_map(|(stem, path)| {
+                (*stem == "system-x86-64").then_some(("system-secret-vm-test", *path))
+            }))
             .map(|(stem, path)| (stem.to_string(), path.to_string()))
             .collect();
         let mut bad = Vec::new();

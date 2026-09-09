@@ -81,6 +81,9 @@ pub const FIDO_CASES: &[(&str, &str)] = &[
         "fido_device::vm_tests::desktop::qemu_desktop_recovers_persistent_store_without_primary",
     ),
 ];
+pub const SYSTEM_TEST: &str = "fido_device::vm_tests::desktop::system::qemu_installed_system_secret_lifecycle";
+pub const SYSTEM_PASS: &str = "TD-SECRET-SYSTEM-PASS";
+
 pub const PASS: &str = "TD-SECRET-VM-PASS";
 pub const FAIL: &str = "TD-SECRET-VM-FAIL";
 
@@ -168,7 +171,43 @@ fn run() -> Result<(), String> {
     Ok(())
 }
 
+fn system() -> Result<(), String> {
+    if std::process::id() == 1 {
+        return Err("system fixture must run beneath the stock supervisor".into());
+    }
+    let cmdline = fs::read_to_string("/proc/cmdline").map_err(|e| format!("read command line: {e}"))?;
+    let tokens: Vec<_> = cmdline.split_ascii_whitespace().collect();
+    if !tokens.contains(&"td.hid-fixture=1")
+        || tokens.iter().filter(|token| matches!(**token, "td.secret-system=create" | "td.secret-system=recover")).count() != 1
+        || fs::read("/case").map_err(|e| format!("read image fixture marker: {e}"))? != b"fido-system"
+    {
+        return Err("system secret fixture was not explicitly selected".into());
+    }
+    let log = File::create("/run/td-secret-system-test.log").map_err(|e| format!("create system test log: {e}"))?;
+    let errors = log.try_clone().map_err(|e| format!("clone system test log: {e}"))?;
+    let status = Command::new("/bin/td-secret-tests")
+        .args(["--exact", SYSTEM_TEST, "--ignored", "--test-threads=1", "--nocapture"])
+        .env_clear().current_dir("/").stdin(Stdio::null()).stdout(log).stderr(errors).status()
+        .map_err(|e| format!("run system secret test: {e}"))?;
+    let mut bytes = Vec::new();
+    File::open("/run/td-secret-system-test.log").and_then(|file| file.take(1_048_577).read_to_end(&mut bytes))
+        .map_err(|e| format!("read system test log: {e}"))?;
+    print!("{}", String::from_utf8_lossy(&bytes));
+    if bytes.len() > 1_048_576 || !test_passed(status.success(), &String::from_utf8_lossy(&bytes)) {
+        return Err(format!("system secret test failed or exceeded its log ceiling: {status}"));
+    }
+    println!("{SYSTEM_PASS}");
+    Ok(())
+}
+
 fn main() -> std::process::ExitCode {
+    if std::env::args().skip(1).eq(["--system"]) {
+        if let Err(error) = system() { eprintln!("{FAIL}: {error}"); }
+        match Command::new("/bin/td-svc").arg("poweroff").status() {
+            Ok(status) if status.success() => return std::process::ExitCode::SUCCESS,
+            result => { eprintln!("{FAIL}: system shutdown: {result:?}"); return std::process::ExitCode::FAILURE; }
+        }
+    }
     if std::process::id() != 1 {
         eprintln!("{FAIL}: fixture must be guest PID 1");
         return std::process::ExitCode::FAILURE;

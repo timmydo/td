@@ -1063,6 +1063,60 @@ migration, rollback resistance or abrupt power-loss behavior. The independent
 worker guests continue to cover both recovery policies.
 
 
+### Full deployment QEMU lifecycle
+
+`td-recipe-eval qemu-secret-system --tpm /absolute/path/to/swtpm` uses the
+same pinned emulator and a separate `system-secret-vm-test` image. That
+recipe derives the stock system recipe, adds the source-built test output
+with its debug companions before object indexing, and adds one fixture
+service. The only change to an existing service is ordering seat assignment
+after the fixture keyboard is enumerated. The shipping system closure has
+no test executable, fixture service or synthetic PCR writer.
+
+Two fresh QEMU processes boot the same signed deployment through the normal
+selector, verified kexec, read-only EROFS root and persistent Btrfs @var.
+The fixture runs beneath stock td-svc after successful firstboot, without
+rewriting account tables, application configuration, store setup, broker,
+portal or authority services. Its initial keyboard-ready barrier precedes
+stock seat assignment; all token activity waits for the normal service
+readiness and jailed mail's locked refusal. Only this selected test image
+and explicit command-line opt-ins admit the fixture. Its PCR extension is
+synthetic evidence, not a measured-deployment policy.
+
+The creation boot requires firstboot's file-backed mail placeholder and
+portal-mode configuration without an application password file. E enrolls
+primary and recovery devices, U unlocks, and the public one-operation writer
+queues mail/main for W and a fresh assertion. Restarting the stock mail unit
+must produce fresh portal receipt acknowledgements from its jailed helper;
+the store's exact credential bytes are checked separately. Restarting the
+stock compositor/authority pair must relock and make a fresh mail launch
+receive the locked refusal again.
+
+The fixture checks its fixed 1280x800, 32-bit framebuffer geometry and
+matches independent bitmap expectations for the visible attention menu,
+enrollment, unlock and stored notices. It waits for the overlay to disappear
+before a new chord, and verifies the keyboard remains enumerated. Store
+publication alone is not a completion-screen barrier. Key publication
+precedes test-side store admission so observation cannot steal the worker's
+exclusive store lock. Only this root test reads the private framebuffer;
+no application capture or consent shortcut is added.
+
+The recovery boot connects only the enrolled second device, requires the
+same encrypted bundle, mail configuration, durable identity ledger and
+machine identity after stock firstboot, and proves a different kernel boot
+ID. R performs exactly one fresh recovery assertion before mail retrieval.
+Both boots require exact CTAP sequences and nonzero, globally fresh
+challenges; each cold boot starts with no release. The runner requires one
+successful ignored test, the exact supervised result line, the selected
+signed deployment ID, clean QEMU exit, stock persistent shutdown and an
+offline Btrfs check. The private disposable volume and TPM state live under
+`TMPDIR` (the ordinary temporary directory by default), separate from the
+persistent build cache. The owner removes that scratch on completion or
+error. Each guest has a 600-second outer limit. This is a
+full-system credential lifecycle fixture; it does not substitute for the
+separate general system, Firefox, abrupt-power-loss or physical-device gates.
+
+
 ## Portal evidence
 
 Tests include RFC HKDF and AEAD vectors, Poly1305, bytewise ciphertext/tag

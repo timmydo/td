@@ -7,6 +7,60 @@ mod fixture;
 
 pub(crate) const TARGETS: &[&str] = &["linux-x86-64", "td-secret-vm-test", "td-secret", "td-init", "td-firstboot", "td-login", "td-compositor", "td-busd", "td-portal", "td-jail", "btrfs-progs-x86-64"];
 
+pub(crate) const SYSTEM_TARGETS: &[&str] = &["system-secret-vm-test", "btrfs-progs-x86-64"];
+
+pub(crate) fn run_system(runner: &RecipeCheckRunner, tpm: &Path) -> Result<(), String> {
+    verify_swtpm(tpm)?;
+    let qemu = find_qemu()?;
+    let system = output(runner, "system-secret-vm-test")?;
+    let deployment = system.join("deployment");
+    let (kernel, _, _) = verify_deployment(&deployment)?;
+    let selector = verify_selector(&system.join("boot"))?;
+    let trust = RunTrust::generate()?;
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    // Keep large disposable disks with the private TPM scratch. TMPDIR can
+    // place this runtime-only fixture on a roomier filesystem than the cache.
+    let scratch = Scratch { dir: create_qmp_scratch_dir(&env::temp_dir(), &SEQ)? };
+    let initramfs = provision_selector(&selector, &scratch.dir, &trust)?;
+    let (mkfs, btrfs) = build_btrfs_tools(runner)?;
+    let volume = scratch.dir.join("secret-system.btrfs");
+    create_persistent_volume(&deployment, &mkfs, &btrfs, &volume, &trust, VolumePurpose::Fixture)?;
+    let id = crate::sha256::sha256_file(&deployment.join("manifest"))
+        .map_err(|e| format!("hash system fixture manifest: {e}"))?;
+    for phase in ["create", "recover"] {
+        let emulator = Emulator::start(tpm, &scratch.dir, phase)?;
+        let tokens = format!("td.hid-fixture=1 td.secret-system={phase}");
+        let marker = format!("secret-fixture: {}", fixture::SYSTEM_PASS);
+        println!("[qemu-secret-system] {phase}: stock firstboot and supervised desktop");
+        let result = boot_with_timeout(&qemu, &kernel, &initramfs, BootPlan {
+            disk: Some(BootDisk { path: &volume, read_only: false }),
+            mem: SYSTEM_GUEST_MEMORY_MIB,
+            target_marker: &marker,
+            kill_on_marker: false,
+            extra_append: &tokens,
+            user_net: false,
+            audio: true,
+            physical_input: false,
+            capture_firefox_audio: false,
+            tpm_socket: Some(&emulator.socket),
+        }, runner.scratch_dir(), Duration::from_secs(600))
+            .map_err(|e| emulator.diagnostic(&e))?;
+        fs::write(runner.scratch_dir().join(format!("secret-system-{phase}.log")), &result.console)
+            .map_err(|e| format!("save system fixture console: {e}"))?;
+        if !result.evidence.target || !result.exited_clean || result.evidence.kernel_panic
+            || result.console.lines().any(|line| line.starts_with(&format!("secret-fixture: {}", fixture::FAIL))) {
+            return Err(emulator.diagnostic(&format!("system secret {phase} failed: {}\n{}", result.reason, tail(&result.console, 160))));
+        }
+        require_selected_deployment(&result, td_boot_protocol::SELECTED_CURRENT_MARKER, &id, phase)?;
+        validate_persistent_shutdown(&result, phase)?;
+        emulator.finish()?;
+        check_persistent_volume(&btrfs, &volume)?;
+        println!("[qemu-secret-system] {phase} passed in {:.2}s", result.elapsed.as_secs_f64());
+    }
+    println!("PASS: full deployment firstboot, secure-attention enrollment and named write, jailed mail receipt, generation relocking, and cold recovery with only the second token; synthetic PCR and UHID fixtures, no measured-boot or physical-presence claim");
+    Ok(())
+}
+
 fn output(runner: &RecipeCheckRunner, name: &str) -> Result<PathBuf, String> {
     runner.prepare_recipe_target(name)?;
     let log = runner.build_plan(name)?;

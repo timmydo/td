@@ -9421,6 +9421,13 @@ policy: a token left available to a walk-up attacker remains usable by
 that attacker. This is distinct from the hardware PIN disk/session policy
 in `td-install/ENCRYPTION.md`.
 
+The optional `qemu-secret-system --tpm` oracle boots a test-only system
+variant through signed selection and verified kexec, using stock firstboot,
+service supervision and jailed mail for enrollment, credential replacement,
+cold second-token recovery and relocking. Its synthetic PCR extension and
+UHID devices remain absent from the shipping system; see
+`td-secret/DESIGN.md` for the exact proof and limits.
+
 The store, TPM protector, FIDO2 enrollment/release and typed one-operation
 writer are connected. The stock direct-kernel VM remains unenrolled;
 software and emulator checks do not certify a physical platform's PCR

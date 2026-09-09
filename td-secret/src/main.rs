@@ -192,6 +192,7 @@ mod confinement {
             ("fido_metadata.rs", include_str!("fido_metadata.rs")),
             ("store.rs", include_str!("store.rs")),
             ("sys.rs", include_str!("sys.rs")),
+            ("system_vm.rs", include_str!("system_vm.rs")),
             ("tpm.rs", include_str!("tpm.rs")),
         ];
         for (name, source) in sources {
@@ -260,6 +261,7 @@ pub fn take_received(fd: RawFd) -> Result<File, String> {
                 "set_client.rs",
                 "store.rs",
                 "sys.rs",
+                "system_vm.rs",
                 "tpm.rs",
                 "write_operation.rs"
             ]

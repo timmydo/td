@@ -2032,6 +2032,7 @@ mod vm_tests {
 
     mod desktop {
         use super::*;
+        mod system { include!("system_vm.rs"); }
         use std::os::unix::fs::{chown, PermissionsExt};
         use std::path::Path;
         use std::sync::atomic::AtomicUsize;
