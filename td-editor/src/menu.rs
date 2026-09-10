@@ -133,7 +133,7 @@ impl Item {
             Self::Copy => "Copy",
             Self::CopyPath => "Copy Full File Path",
             Self::CopyEntryPath => "Copy Entry Full Path",
-            Self::RenameEntry => "Rename Entry",
+            Self::RenameEntry => "Rename / Move",
             Self::MarkDelete => "Mark for Deletion",
             Self::UnmarkDelete => "Unmark Deletion",
             Self::DeleteMarked => "Delete Marked Entries...",

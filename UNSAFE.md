@@ -84,7 +84,7 @@ an ioctl) the amendment is made here first rather than found in a diff.
 | 11 | `td-profiler` | `close(2)`, `mmap(2)`, `munmap(2)`, `ioctl(2)` with four pinned requests, `setgroups(2)`, `setgid(2)`, `setuid(2)`, `clock_gettime(2)`, `perf_event_open(2)`, `socket(2)`, `bind(2)`, `recvfrom(2)` for fixed kernel CPU notifications |
 | 12 | `td-portal` | `recvmsg(2)`, `sendmsg(2)`, `close(2)` for bounded Wayland transfer and credential replies; one scoped received-descriptor adoption |
 | 13 | `td-audio` | `ioctl(2)` with eleven value-pinned PCM requests, `poll(2)`, `getsockopt(2)` pinned to `SOL_SOCKET`/`SO_PEERCRED` |
-| 14 | `td-editor` | `recvmsg(2)`, `sendmsg(2)`, `fcntl(2)` pinned to `F_DUPFD_CLOEXEC`, `F_GETFL` and `F_SETFL`, `flistxattr(2)` pinned to a size-only query, `renameat2(2)` pinned to same-parent `RENAME_NOREPLACE`; plus one scoped descriptor adoption |
+| 14 | `td-editor` | `recvmsg(2)`, `sendmsg(2)`, `fcntl(2)` pinned to `F_DUPFD_CLOEXEC`, `F_GETFL` and `F_SETFL`, `flistxattr(2)` pinned to a size-only query, `renameat2(2)` pinned to two borrowed parents and `RENAME_NOREPLACE`; plus one scoped descriptor adoption |
 | 15 | `td-secret` | shared `recvmsg(2)`, `sendmsg(2)`, `close(2)` transport and scoped adoption for bounded credential replies; plus the named credential intake module of §16 |
 | 16 | `td-authd` | `recvmsg(2)`, `setsockopt(2)` with fixed `SO_PASSCRED`/`SO_PASSPIDFD`, `getsockopt(2)` with fixed `SO_PEERCRED`, and `poll(2)` on the peer pidfd; one scoped descriptor adoption; a separate mount instruction/adoption for `unshare(2)`, `open_tree(2)`, `mount_setattr(2)`, and `move_mount(2)` with the fixed portal file-grant values below; plus the separate named credential intake module below |
 | 17 | `td-mail` | `ioctl(2)` (three pinned requests), `poll(2)` — td-sh's terminal half, in `term_sys.rs` |
@@ -2219,12 +2219,15 @@ An unsupported query refuses saving, not just replacement. Attributes hidden
 from the calling credentials are not proven absent by Linux's listing API;
 the exact supported-file boundary is recorded in `td-editor/DESIGN.md`.
 
-`files.rs` alone also calls `rename_entry`, borrowing one opened directory
-and two literal Unix basenames. The wrapper rejects empty, dot, dot-dot,
+`files.rs` alone also calls `rename_entry`, borrowing opened source and
+destination directories and two literal Unix basenames. The wrapper rejects empty, dot, dot-dot,
 slash-containing, NUL-containing and over-4096-byte names, owns both C
-strings across the call, fixes both directory arguments to the same borrowed
-descriptor, and fixes flags to `RENAME_NOREPLACE` (1). It cannot overwrite,
-exchange, move across parents, follow a final symlink, or adopt a descriptor.
+strings across the call, pins the first and third arguments to those borrowed
+descriptors, and fixes flags to `RENAME_NOREPLACE` (1). It cannot overwrite,
+exchange, follow a final symlink, or adopt a descriptor. The file adapter
+permits cross-parent moves only for regular files; cross-filesystem moves
+fail without copying or deleting anything as a fallback. Both parent handles
+are checked before publication and synced and checked afterward.
 The one instruction now accepts five arguments (r10/r8 for the last two);
 the existing three-argument callers pass zero for both extra registers.
 Unsupported kernels/filesystems return an error; there is no fallback to

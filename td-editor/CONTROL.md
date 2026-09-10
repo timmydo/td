@@ -684,33 +684,41 @@ edits or tab changes cannot retarget the supplied path, but do not cancel
 an already accepted read. The Save As job independently rechecks its queued
 point at handoff. A lost reply or disconnect is not job cancellation.
 
-Rename answers use `path HEX_PATH` to supply one literal new basename, not
-an absolute/relative path with slashes. The live prompt pins the originally
-selected directory entry's raw path and metadata observation. Worker-side
-stale-source, invalid-name and existing-destination checks refuse before
-publication. Physical Return and semantic answers both create
-`job=JOB,rename,TAB,REVISION,0,STATUS,CODE`; TAB/REVISION describe the directory
-at admission, not its refreshed listing revision. `complete,-` means kernel
-publication succeeded and open-tab paths followed it, even if the native
-notice reports failed durability/readback or listing refresh. `error` means
-the operation did not confirm success (worker disconnect remains uncertain).
-Read the notice for details. Syscall errors report publication attempted:
-inspect both names before retrying (not all remote filesystems guarantee
-that an error means no rename occurred). There is no cancellation after
-submission, implicit save, overwrite or cross-directory move. Unsaved text
-and history remain intact.
+Rename answers use `path HEX_PATH` to supply a destination filename,
+absolute or relative to the captured directory tab. Parent components
+resolve normally; the final name stays literal. Trailing slash, empty,
+dot/dot-dot final names and NUL refuse. No tilde expansion or directory
+shorthand occurs. The live prompt pins the originally selected directory
+entry's raw path and metadata observation. Worker-side stale-source,
+invalid-name and existing-destination checks refuse before publication.
+Physical Return and semantic answers both create
+`job=JOB,rename,TAB,REVISION,0,STATUS,CODE`; TAB/REVISION describe the
+directory at admission, not its refreshed listing revision. `complete,-`
+means kernel publication succeeded and open-tab paths followed it, even
+if the native notice reports failed durability/readback or listing
+refresh. `error` means the operation did not confirm success (worker
+disconnect remains uncertain). Read the notice for details. Syscall
+errors report publication attempted: inspect both names before retrying
+(not all remote filesystems guarantee that an error means no rename
+occurred). There is no cancellation after submission, implicit save or
+overwrite. Cross-directory moves accept regular files on the same
+filesystem only, with no copy/delete fallback. Unsaved text and history
+remain intact.
 
-File copy uses scope `path-copy`; `path HEX_PATH` supplies one literal new
-sibling basename under the captured source/parent observation. It accepts
-regular files up to 16 MiB, including binary bytes. Links/directories and
-existing/reserved destinations refuse. Ordinary permission bits honor umask;
-special bits are stripped. No unsaved buffer, association or baseline is
-changed. Admission records `job=JOB,copy,TAB,REVISION,0,STATUS,CODE`.
-`complete,-` means kernel publication succeeded, potentially with a notice
-warning about confirmation/cleanup/refresh. Errors or disconnects do not
-prove absence. No overwrite, recursion, rollback or automatic retry occurs.
-Successful rescans refresh matching views without stealing focus. Read the
-notice and inspect disk state before retrying an uncertain operation.
+File copy uses scope `path-copy`; `path HEX_PATH` supplies a destination
+filename under the same absolute/source-relative path rules as Rename,
+retaining the captured source/parent observation. It accepts regular
+files up to 16 MiB, including binary bytes. Links/directories and
+existing/reserved destinations refuse. Ordinary permission bits honor
+umask; special bits are stripped. No unsaved buffer, association or
+baseline is changed. Admission records
+`job=JOB,copy,TAB,REVISION,0,STATUS,CODE`. `complete,-` means kernel
+publication succeeded, potentially with a notice warning about
+confirmation/cleanup/refresh. Errors or disconnects do not prove
+absence. Cross-filesystem copy stages in the destination parent. No
+overwrite, recursion, rollback or automatic retry occurs. Successful
+rescans refresh matching views without stealing focus. Read the notice
+and inspect disk state before retrying an uncertain operation.
 
 Directory creation uses scope `path-mkdir`. `path HEX_PATH` supplies one
 literal new basename, including non-UTF-8 bytes, under the captured directory

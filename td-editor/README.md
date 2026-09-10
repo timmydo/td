@@ -24,11 +24,12 @@ Directories also open through File > Open or a command-line path, for example
 - Shift-click or Shift+Enter opens it in a new foreground tab.
 - `^` goes to the parent; `g` refreshes; arrow/Emacs movement keys navigate.
 - File > Copy Full File Path copies the directory's own absolute path.
-- `R` or Directory > Rename Entry renames within the current directory,
-  without overwriting existing names; open tabs follow without losing edits.
+- `R` or Directory > Rename / Move accepts a destination filename, with
+  Tab completion. Regular files can move across directories on one filesystem;
+  existing names are protected and open tabs follow without losing edits.
 - `+` or Directory > New Directory creates a private directory with one
   literal new basename. Existing names are refused; Escape cancels.
-- `C` or Directory > Copy File copies on-disk bytes to a new basename,
+- `C` or Directory > Copy File copies on-disk bytes to a destination filename,
   preserving ordinary permissions with umask applied. It strips special
   permission bits, never overwrites, and does not save unsaved edits.
 - `d` marks for deletion, `u` unmarks, and `x` reviews the marked entries.
@@ -290,13 +291,18 @@ a time; additional requests are visibly refused, not queued. Saves acknowledge
 only the snapshot written, so typing during a save leaves newer edits dirty.
 See DESIGN's file-safety section for metadata restrictions and race limits.
 
-Directory `R` or Directory > Rename Entry asks for a new basename in the
-same directory. Existing destinations are never overwritten. Files, links
-and directories retain their contents; open tabs follow the new path,
-including descendants of a renamed directory, without losing unsaved edits
-or undo history. Escape cancels the prompt; submission cannot be cancelled.
-Refresh stale listings with `g`. Remote `path-rename` answers use literal
-OS-byte basenames and report a `rename` job; inspect notices for any
+Directory `R` or Directory > Rename / Move asks for a destination
+filename. Use an absolute path or a path relative to the current
+directory tab; Tab completes paths. Include the new filename, not just a
+directory with a trailing slash. Existing destinations are never
+overwritten. Regular files can move between directories on the same
+filesystem; there is no cross-filesystem copy-and-delete fallback.
+Within one directory, files, links and directories retain their
+contents; open tabs follow the new path, including descendants of a
+renamed directory, without losing unsaved edits or undo history. Escape
+cancels the prompt; submission cannot be cancelled. Refresh stale
+listings with `g`. Remote `path-rename` answers use literal OS-byte
+paths and report a `rename` job; inspect notices for any
 post-publication durability or listing-refresh warning.
 
 New Directory (`+`) also works in an empty listing. Enter a single basename,
@@ -307,15 +313,18 @@ a `mkdir` job. A confirmation warning does not undo creation: inspect disk
 state before retrying. Successful listing refresh selects the new entry in
 the originating tab without stealing focus from another tab.
 
-Copy File (`C`) copies one regular file within its directory, at most 16 MiB,
-including binary bytes. Links/directories and existing destinations refuse.
-It preserves rwx bits with umask applied, strips set-ID/sticky bits, and does
-not copy ownership, timestamps or xattrs. New-file owner/group rules apply.
-The destination must fit the same attribute-free profile as new saves;
-parent attributes and inherited ACLs/labels refuse rather than being
-silently lost or overriding umask. Remote
-`path-copy` answers supply raw basenames and report a `copy` job. Inspect any
-publication or refresh warning before retrying.
+Copy File (`C`) copies one regular file to a destination filename, at
+most 16 MiB, including binary bytes. Links/directories and existing
+destinations refuse. It preserves rwx bits with umask applied, strips
+set-ID/sticky bits, and does not copy ownership, timestamps or xattrs.
+New-file owner/group rules apply. The destination must fit the same
+attribute-free profile as new saves; parent attributes and inherited
+ACLs/labels refuse rather than being silently lost or overriding umask.
+Remote `path-copy` answers supply raw paths and report a `copy` job.
+Copy uses the same relative/absolute paths and Tab completion as Move,
+and can cross filesystems. These are single-entry conveniences for
+finding and opening editor files, not recursive or batch file
+management. Inspect any publication or refresh warning before retrying.
 
 Deletion marks belong to each directory view. Sorting keeps them; refresh,
 navigation and completed filesystem rescans clear them. At most 64 entries

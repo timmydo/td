@@ -237,13 +237,21 @@ fn barrier_finish_stops_a_live_idle_peer_and_drop_stops_accept() {
 #[test]
 #[ignore = "ready builds the isolated test-file-barrier editor"]
 fn admitted_file_copy_preserves_dirty_source_and_incidental_directory_views() {
+    for cross in [false, true] {
+        admitted_file_copy(cross);
+    }
+}
+
+fn admitted_file_copy(cross: bool) {
     let compositor_directory = Directory::new();
     let directory = Directory::new();
     let mut compositor = Compositor::start(&compositor_directory);
     let mut barrier = Barrier::start(&directory);
     let root = directory.0.join("browse");
     std::fs::create_dir(&root).unwrap();
-    let created = root.join("new");
+    let other = directory.0.join("destination");
+    std::fs::create_dir(&other).unwrap();
+    let created = if cross { &other } else { &root }.join("new");
     let file = root.join("keep");
     std::fs::write(&file, b"disk").unwrap();
     let dictionary = directory.0.join("dictionary");
@@ -261,10 +269,10 @@ fn admitted_file_copy_preserves_dirty_source_and_incidental_directory_views() {
     assert_eq!(compositor.request("fullscreen", 1024), b"ok\n");
     editor.wait_field("state", "window", "800,576,1");
     editor.ok("insert\t1\t0\t0\t0\t61");
-    for _ in 0..2 {
+    for path in [&root, if cross { &other } else { &root }] {
         editor.job(&format!(
             "open\t{}",
-            td_editor::control::hex(root.as_os_str().as_encoded_bytes())
+            td_editor::control::hex(path.as_os_str().as_encoded_bytes())
         ));
     }
     editor.ok("select-tab\t2\t0");
@@ -275,7 +283,10 @@ fn admitted_file_copy_preserves_dirty_source_and_incidental_directory_views() {
     barrier.arm("copy");
     let started = Instant::now();
     let response = editor
-        .request(&format!("dialog-answer\t{dialog}\t2\t0\tpath\t6e6577"))
+        .request(&format!(
+            "dialog-answer\t{dialog}\t2\t0\tpath\t{}",
+            td_editor::control::hex(created.as_os_str().as_encoded_bytes())
+        ))
         .unwrap();
     let job = response.strip_prefix("pending\t").unwrap();
     let held = barrier.held();
@@ -300,8 +311,18 @@ fn admitted_file_copy_preserves_dirty_source_and_incidental_directory_views() {
     editor.wait_field("state", "active", "1");
     editor.wait_field("state", "prefix", "1");
     editor.wait_field("state", "view", &view);
-    wait_directory_rows(&mut editor, 2, 1, &["keep", "new"]);
-    wait_directory_rows(&mut editor, 3, 1, &["keep", "new"]);
+    wait_directory_rows(
+        &mut editor,
+        2,
+        u64::from(!cross),
+        if cross { &["keep"] } else { &["keep", "new"] },
+    );
+    wait_directory_rows(
+        &mut editor,
+        3,
+        1,
+        if cross { &["new"] } else { &["keep", "new"] },
+    );
     compositor.rendered_tab_text_at(&mut editor, &window, (1, 2, 32), before, "abdisk", 2);
     assert!(created.is_file());
     assert_eq!(std::fs::read(&created).unwrap(), b"disk");
@@ -310,8 +331,11 @@ fn admitted_file_copy_preserves_dirty_source_and_incidental_directory_views() {
     editor.job("save\t1\t2");
     assert_eq!(std::fs::read(&file).unwrap(), b"abdisk");
     assert_eq!(std::fs::read(&created).unwrap(), b"disk");
-    for (tab, path) in [(2, &created), (3, &file)] {
-        editor.ok(&format!("select-tab\t{tab}\t1"));
+    for (tab, revision, path) in [
+        (2, u64::from(!cross), if cross { &file } else { &created }),
+        (3, 1, if cross { &created } else { &file }),
+    ] {
+        editor.ok(&format!("select-tab\t{tab}\t{revision}"));
         editor.wait_field(
             "state",
             "directory-entry",
@@ -511,6 +535,12 @@ fn admitted_deletion_preserves_edits_and_incidental_directory_views() {
 #[test]
 #[ignore = "ready builds the isolated test-file-barrier editor"]
 fn admitted_rename_preserves_edits_focus_and_duplicate_directory_views() {
+    for cross in [false, true] {
+        admitted_rename(cross);
+    }
+}
+
+fn admitted_rename(cross: bool) {
     let compositor_directory = Directory::new();
     let directory = Directory::new();
     let mut compositor = Compositor::start(&compositor_directory);
@@ -518,7 +548,9 @@ fn admitted_rename_preserves_edits_focus_and_duplicate_directory_views() {
     let root = directory.0.join("browse");
     std::fs::create_dir(&root).unwrap();
     let file = root.join("draft");
-    let destination = root.join("renamed");
+    let other = directory.0.join("destination");
+    std::fs::create_dir(&other).unwrap();
+    let destination = if cross { &other } else { &root }.join("renamed");
     let dictionary = directory.0.join("dictionary");
     std::fs::write(&file, b"disk").unwrap();
     std::fs::write(&dictionary, b"disk\n").unwrap();
@@ -535,10 +567,10 @@ fn admitted_rename_preserves_edits_focus_and_duplicate_directory_views() {
     assert_eq!(compositor.request("fullscreen", 1024), b"ok\n");
     editor.wait_field("state", "window", "800,576,1");
     editor.ok("insert\t1\t0\t0\t0\t61");
-    for _ in 0..2 {
+    for path in [&root, if cross { &other } else { &root }] {
         editor.job(&format!(
             "open\t{}",
-            td_editor::control::hex(root.as_os_str().as_encoded_bytes())
+            td_editor::control::hex(path.as_os_str().as_encoded_bytes())
         ));
     }
     editor.ok("select-tab\t2\t0");
@@ -550,7 +582,8 @@ fn admitted_rename_preserves_edits_focus_and_duplicate_directory_views() {
     let started = Instant::now();
     let response = editor
         .request(&format!(
-            "dialog-answer\t{dialog}\t2\t0\tpath\t72656e616d6564"
+            "dialog-answer\t{dialog}\t2\t0\tpath\t{}",
+            td_editor::control::hex(destination.as_os_str().as_encoded_bytes())
         ))
         .unwrap();
     let job = response.strip_prefix("pending\t").unwrap();
@@ -581,7 +614,7 @@ fn admitted_rename_preserves_edits_focus_and_duplicate_directory_views() {
     editor.wait_field("state", "prefix", "1");
     editor.wait_field("state", "view", &view);
     editor.wait_field("state", "tab", "1,2,1,6,2,2,0,72,0,lf");
-    wait_directory_rows(&mut editor, 2, 1, &["renamed"]);
+    wait_directory_rows(&mut editor, 2, 1, if cross { &[] } else { &["renamed"] });
     wait_directory_rows(&mut editor, 3, 1, &["renamed"]);
     // The default two-digit gutter plus gap moves text 24px right.
     compositor.rendered_tab_text_at(&mut editor, &window, (1, 2, 32), before, "abdisk", 2);

@@ -470,7 +470,7 @@ impl PathPrompt {
             PathAction::Open => "Open",
             PathAction::Dictionary => "Dictionary",
             PathAction::Save { .. } => "Save As",
-            PathAction::Rename(_) => "Rename",
+            PathAction::Rename(_) => "Rename / Move",
             PathAction::Delete(_) => "Delete",
             PathAction::Mkdir(_) => "New Directory",
             PathAction::Copy(_) => "Copy File",
@@ -533,10 +533,10 @@ impl PathPrompt {
                 let action = if matches!(self.action, PathAction::Copy(_)) {
                     "Copy on-disk file"
                 } else {
-                    "Rename"
+                    "Rename / Move"
                 };
                 return format!(
-                    "{action} {label}\nNew basename only; existing names refused\nReturn: submit; Escape/Ctrl+G: cancel; Ctrl+U: clear\n{tail}|"
+                    "{action} {label}\nAbsolute or directory-relative filename; never overwrites\nTab: complete; Return: submit; Esc/C-g: cancel\n{tail}|"
                 );
             }
         };
@@ -4873,11 +4873,26 @@ impl Window {
                     return;
                 }
                 if let PathAction::Rename(source) = &prompt.action {
+                    if let Err(detail) = source.copy_destination(std::ffi::OsStr::new(&prompt.text)) {
+                        self.prompt = Some(prompt);
+                        self.notify(format!("Rename refused: {detail}; name retained"));
+                        return;
+                    }
+                    if self.files.as_ref().is_some_and(|files| files.busy())
+                        || self.control_file_job.is_some()
+                    {
+                        self.prompt = Some(prompt);
+                        self.notify(
+                            "File operation pending; move name retained. Try Return again.",
+                        );
+                        return;
+                    }
                     let result = prompt
                         .identity
                         .as_ref()
                         .ok_or(crate::Error::Unavailable)
                         .and_then(|identity| {
+                            self.ui.editor().check_revision(&identity.point)?;
                             self.control_rename_job(
                                 Target {
                                     tab: identity.point.tab,
@@ -4938,10 +4953,7 @@ impl Window {
                     self.prompt = Some(prompt);
                     return;
                 }
-                if matches!(
-                    prompt.action,
-                    PathAction::Rename(_) | PathAction::Mkdir(_) | PathAction::Copy(_)
-                ) {
+                if matches!(prompt.action, PathAction::Mkdir(_)) {
                     self.prompt = Some(prompt);
                     return;
                 }
@@ -4983,12 +4995,28 @@ impl Window {
     }
 
     fn request_path_completion(&mut self, prompt: &mut PathPrompt) -> Result<()> {
-        let id = self.last_completion.checked_add(1).ok_or("completion counter exhausted")?;
+        let text = match &prompt.action {
+            PathAction::Copy(source) | PathAction::Rename(source) => source
+                .path()
+                .parent()
+                .ok_or("Source has no parent")?
+                .join(&prompt.text)
+                .into_os_string()
+                .into_string()
+                .map_err(|_| "Completion needs a UTF-8 parent; literal names still work")?,
+            _ => prompt.text.clone(),
+        };
+        let id = self
+            .last_completion
+            .checked_add(1)
+            .ok_or("completion counter exhausted")?;
         if self.path_completion.is_none() {
             self.path_completion = Some(crate::path_completion::Worker::start()?);
         }
-        self.path_completion.as_mut().ok_or("completion worker unavailable")?
-            .request(id, prompt.text.clone())?;
+        self.path_completion
+            .as_mut()
+            .ok_or("completion worker unavailable")?
+            .request(id, text)?;
         self.last_completion = id;
         prompt.completion = crate::path_completion::State::Pending(id);
         Ok(())
@@ -10079,7 +10107,7 @@ mod tests {
             assert!(w.path_notice().unwrap().contains("on-disk file"));
             w.path_chord("n", false);
             w.path_chord("Tab", false);
-            assert!(w.path_completion.is_none());
+            finish_completion(&mut w);
             let answer = crate::control::DialogAnswer::Path("copy".into());
             assert_eq!(
                 w.control_path_answer(
@@ -10120,7 +10148,7 @@ mod tests {
             w.path_chord("n", false);
             w.path_chord("Return", true);
             assert!(w.prompt.is_some());
-            for invalid in [".", "..", "a/b"] {
+            for invalid in [".", "..", "a/"] {
                 w.prompt.as_mut().unwrap().text = invalid.into();
                 w.path_chord("Return", false);
                 assert_eq!(w.prompt.as_ref().unwrap().text, invalid);
@@ -10175,7 +10203,7 @@ mod tests {
         w.chord("g", false).unwrap();
         finish_file(&mut w);
         w.chord("Down", false).unwrap();
-        for name in ["", ".", "..", "/", "a/b", "nul\0name"] {
+        for name in ["", ".", "..", "/", "a/", "nul\0name"] {
             w.chord("C", false).unwrap();
             let id = w.last_dialog_id;
             w.control_path_answer(
@@ -10187,7 +10215,7 @@ mod tests {
                 &crate::control::DialogAnswer::Path(name.into()),
             )
             .unwrap();
-            assert!(w.notice.as_ref().unwrap().contains("new basename"));
+            assert!(w.notice.as_ref().unwrap().contains("new filename"));
             assert!(!w.files.as_ref().unwrap().busy());
             assert!(w.control_file_job.is_none());
             assert!(w
@@ -10341,7 +10369,7 @@ mod tests {
     }
 
     #[test]
-    fn rename_native_immediate_refusal_does_not_claim_a_pending_job() {
+    fn rename_native_invalid_destination_retains_prompt_without_a_job() {
         let dir = DialogDirectory::new();
         std::fs::create_dir(dir.path("child")).unwrap();
         let (mut w, _peer) = file_dialog_fixture();
@@ -10355,10 +10383,10 @@ mod tests {
         w.path_chord("Return", false);
         assert!(!w.files.as_ref().unwrap().busy());
         assert!(w.control_file_job.is_none());
-        assert!(w.prompt.is_none());
+        assert_eq!(w.prompt.as_ref().unwrap().text, "x".repeat(4096));
         assert!(w.notice.as_ref().unwrap().starts_with("Rename refused:"));
         assert!(!w.notice.as_ref().unwrap().contains("pending"));
-        assert!(w.control_jobs.fields().unwrap().contains("job=1,rename,3,0,0,error,unavailable"));
+        assert!(!w.control_jobs.fields().unwrap().contains("job="));
         assert!(dir.path("child").is_dir());
     }
 
@@ -10378,7 +10406,7 @@ mod tests {
             let id = w.last_dialog_id;
             w.path_chord("n", false);
             w.path_chord("Tab", false);
-            assert!(w.path_completion.is_none());
+            finish_completion(&mut w);
             assert_eq!(
                 w.control_path_answer(
                     id,
@@ -10418,6 +10446,20 @@ mod tests {
             w.path_chord("n", false);
             w.path_chord("Return", true);
             assert!(w.prompt.is_some());
+            for invalid in ["", ".", "..", "a/"] {
+                w.prompt.as_mut().unwrap().text = invalid.into();
+                w.path_chord("Return", false);
+                assert_eq!(w.prompt.as_ref().unwrap().text, invalid);
+                assert!(!w.files.as_ref().unwrap().busy());
+                assert!(!w.control_jobs.fields().unwrap().contains("job="));
+            }
+            w.prompt.as_mut().unwrap().text = "n".into();
+            w.control_file_job = Some(ControlFile::Rename(99));
+            w.path_chord("Return", false);
+            assert_eq!(w.prompt.as_ref().unwrap().text, "n");
+            assert_eq!(w.prompt.as_ref().unwrap().identity.as_ref().unwrap().id, w.last_dialog_id);
+            assert!(!dir.path("n").exists());
+            w.control_file_job = None;
             w.path_chord("Return", false);
             assert!(w.prompt.is_none());
             finish_file(&mut w);
@@ -13829,10 +13871,54 @@ mod tests {
 
     fn finish_completion(w: &mut Window) {
         let deadline = Instant::now() + Duration::from_secs(5);
-        while w.path_completion.as_ref().is_some_and(|worker| worker.pending()) {
+        while w
+            .path_completion
+            .as_ref()
+            .is_some_and(|worker| worker.pending())
+        {
             assert!(Instant::now() < deadline, "completion deadline");
             w.tick(w.clock + 1, false).unwrap();
             std::thread::yield_now();
+        }
+    }
+
+    #[test]
+    fn copy_and_move_completion_uses_the_captured_directory_not_process_cwd() {
+        for profile in [Profile::Windows, Profile::Emacs] {
+            for key in ["C", "R"] {
+                let directory = DialogDirectory::new();
+                std::fs::create_dir(directory.path("source")).unwrap();
+                std::fs::create_dir(directory.path("destination")).unwrap();
+                std::fs::write(directory.path("source/file"), b"disk").unwrap();
+                let (mut w, _peer) = file_dialog_fixture();
+                configure(&mut w, 800, 600);
+                w.ui.dispatch(Event::Profile(profile)).unwrap();
+                w.files
+                    .as_mut()
+                    .unwrap()
+                    .open(directory.path("source"))
+                    .unwrap();
+                finish_file(&mut w);
+                w.chord(key, false).unwrap();
+                let id = w.last_dialog_id;
+                w.prompt.as_mut().unwrap().text = "../dest".into();
+                w.path_chord("Tab", false);
+                finish_completion(&mut w);
+                assert!(w.prompt.as_ref().unwrap().text.ends_with("/destination/"));
+                assert_eq!(w.prompt.as_ref().unwrap().identity.as_ref().unwrap().id, id);
+                assert_eq!(w.ui.editor().document(2).unwrap().revision(), 0);
+                for c in "new".chars() {
+                    w.path_chord(&c.to_string(), false);
+                }
+                w.path_chord("Return", false);
+                finish_file(&mut w);
+                assert!(w.prompt.is_none());
+                assert_eq!(
+                    std::fs::read(directory.path("destination/new")).unwrap(),
+                    b"disk"
+                );
+                assert_eq!(directory.path("source/file").exists(), key == "C");
+            }
         }
     }
 

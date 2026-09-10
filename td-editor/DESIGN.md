@@ -34,8 +34,9 @@ answers use the ordinary close coordinator. Conflict Cancel/Reload/Save As
 and explicit second-stage discard-before-Reload are connected, with bounded
 Reload outcomes. Ordinary Open/Save As/Dictionary path prompts also have
 revision-bound remote answers; Dictionary jobs report bounded outcomes.
-Directory tabs provide metadata listings, sorting, path copy and same-parent
-no-overwrite rename. Rename has a pinned path prompt and remote job outcome;
+Directory tabs provide metadata listings, sorting, path copy and no-overwrite
+rename/move. Cross-directory moves accept regular files on one filesystem.
+Rename has a pinned path prompt and remote job outcome;
 open tabs follow renamed paths without losing unsaved text or history.
 Directory deletion uses bounded marks and an explicit permanent-deletion
 confirmation, with live remote answers and historical job outcomes.
@@ -1270,101 +1271,131 @@ cursor and saved-file baseline survive. Directories may have separate tabs
 for the same path. Replacement cancels held-key repeat even if TabId stays
 unchanged. Selecting a different tab while I/O runs does not retarget it.
 
-File > Copy Full File Path copies the directory tab's resolved absolute path,
-without an added slash, quotes or newline (root remains `/`). It uses the
-same physical activation serial, UTF-8 bound and immutable clipboard offer
-as file paths, not the selected entry's pathname. Control state exposes
-directory kind, raw path and entry count; text pages expose escaped rows.
-Directory > Copy Entry Full Path or `w` offers the selected row's absolute
-literal path, without resolving a symlink target or appending a slash. It
-does not copy the displayed metadata or escaped name. Empty directories,
-non-UTF-8 paths, stale tab/revision and missing physical clipboard authority
-refuse without replacing the previous offer. The path is a cached pathname,
-not a promise that the entry still exists. Both profiles share this action.
+File > Copy Full File Path copies the directory tab's resolved absolute
+path, without an added slash, quotes or newline (root remains `/`). It
+uses the same physical activation serial, UTF-8 bound and immutable
+clipboard offer as file paths, not the selected entry's pathname.
+Control state exposes directory kind, raw path and entry count; text
+pages expose escaped rows. Directory > Copy Entry Full Path or `w`
+offers the selected row's absolute literal path, without resolving a
+symlink target or appending a slash. It does not copy the displayed
+metadata or escaped name. Empty directories, non-UTF-8 paths, stale
+tab/revision and missing physical clipboard authority refuse without
+replacing the previous offer. The path is a cached pathname, not a
+promise that the entry still exists. Both profiles share this action.
 Decoded input cannot manufacture the physical serial; selected raw paths
 for the active directory are available through read-only directory-entry
-state. Only one selected path is emitted, retaining the one-MiB state-frame
-bound even with 64 maximum-length directory paths.
-Open jobs and fenced decoded input use the same navigation/worker path as
-physical input, with no filesystem mutation shortcut.
+state. Only one selected path is emitted, retaining the one-MiB
+state-frame bound even with 64 maximum-length directory paths. Open jobs
+and fenced decoded input use the same navigation/worker path as physical
+input, with no filesystem mutation shortcut.
 
 #### Rename
 
-`R` in either profile or Directory > Rename Entry opens a revision-bound
-minibuffer for the selected entry. It retains that snapshot's literal name,
-parent device/inode and full no-follow metadata observation, not parsed
-display text or a later caret position. Enter submits a new basename;
-Escape/C-g cancels before submission. C-u clears. Rename has no path
-completion: it does not choose an existing destination. Slash, NUL, empty,
-dot and dot-dot names are refused. Moving across directories is not yet
-implemented. Remote `dialog-answer ... path HEX` answers the same
-`path-rename` dialog with literal OS bytes, including non-UTF-8 basenames.
-Both physical and remote submission create a historical `rename` job.
-Submission is final: there is no cancellation or rollback after admission.
+`R` in either profile or Directory > Rename / Move opens a
+revision-bound minibuffer for the selected entry. It retains that
+snapshot's literal name, parent device/inode and full no-follow metadata
+observation, not parsed display text or a later caret position. Enter
+submits a destination filename; Escape/C-g cancels before submission.
+C-u clears. Copy and Rename / Move accept absolute paths or paths
+relative to the captured directory tab, not the process working
+directory. Existing parents are canonicalized on the worker, but the
+final name is literal. No shell or tilde expansion occurs. NUL, empty
+names, trailing slash and final dot/dot-dot refuse. Supply the new
+filename explicitly: a directory path is not shorthand for keeping the
+old basename. Tab completes paths using the captured parent and the same
+bounded, fenced listing as Open. A non-UTF-8 parent cannot be completed
+in the native text prompt; literal basename entry still works. Remote
+`dialog-answer ... path HEX` supports literal OS bytes throughout the
+path, including non-UTF-8 components, under the same `path-rename`
+authority. Both physical and remote submission create a historical
+`rename` job. Submission is final: there is no cancellation or rollback
+after admission.
 
-The exclusive file worker re-resolves and checks the observed parent, opens
-the source with safe std `O_PATH | O_NOFOLLOW`, and compares device/inode,
-mode, owner/group, link count, size and mtime/ctime to the selected snapshot.
-Stale observations refuse with a refresh instruction. Symlinks rename the
-link itself; directories and other entry types rename without reading their
-contents. Renaming preserves the inode, data and metadata (except normal
-kernel ctime/parent changes), so the save replacement profile does not limit
-rename. An exactly associated open file must still match its saved metadata
-and complete encoded baseline; dirty model text is never written by rename.
+Before native admission, an invalid destination or busy file worker
+retains the entered path and original prompt identity for retry, as for
+Copy. Semantic answers retain their consume-once terminal-error job
+contract.
 
-Publication uses the private audited Linux x86-64 `renameat2` (316) wrapper,
-with both directory descriptors pinned to the same opened parent and flags
-fixed to `RENAME_NOREPLACE` (1). No existing destination is replaced, even
-when created concurrently. Existing names reserved by another open file
-also refuse. Unsupported kernels/filesystems refuse; no copy/unlink or
-overwriting fallback exists. Parent/name prechecks do not make the source
-comparison atomic; the existing same-authority race limitation applies.
-Syscall errors retain associations and report publication attempted; verify
-both names before retrying, since a remote filesystem can return an error
-after performing the rename. No automatic retry or rollback is performed.
+The exclusive file worker re-resolves and checks the observed parent,
+opens the source with safe std `O_PATH | O_NOFOLLOW`, and compares
+device/inode, mode, owner/group, link count, size and mtime/ctime to the
+selected snapshot. Stale observations refuse with a refresh instruction.
+Symlinks rename the link itself; directories and other entry types
+rename without reading their contents within the same parent. Across
+parents only regular files may move, and only on the same filesystem.
+Renaming preserves the inode, data and metadata (except normal kernel
+ctime/parent changes), so the save replacement profile does not limit
+rename. An exactly associated open file must still match its saved
+metadata and complete encoded baseline; dirty model text is never
+written by rename.
 
-On kernel success, paths and labels for open file and directory tabs at or
-beneath the old name follow the new name. Model text, revision, dirty state,
-cursor, undo/redo and saved content state are untouched. New paths must fit
-4096 bytes, including descendant tabs, before publication. Baseline file and
-parent handles stay pinned. The renamed file's baseline ctime is adopted
-only after parent sync, no-follow name/metadata readback and complete-byte
-comparison; descendant-file baselines are not refreshed. A sync/readback
-failure still reports a published rename and updates paths, retaining the
-old baseline stamp and an explicit uncertainty bit so later Save refuses
-until Reload or Save As, even on coarse-timestamp filesystems. No rename-back
-is tried.
-The job's `complete` means publication succeeded; the notice explicitly
-reports any durability/readback warning, not an unchanged-filesystem claim.
+Publication uses the private audited Linux x86-64 `renameat2` (316)
+wrapper, with directory descriptors pinned to the opened
+source/destination parents and flags fixed to `RENAME_NOREPLACE` (1). No
+existing destination is replaced, even when created concurrently.
+Existing names reserved by another open file also refuse, including
+canonical destinations reserved by directory tabs. Unsupported
+kernels/filesystems and cross-filesystem moves refuse; no copy/unlink or
+overwriting fallback exists. Parent/name prechecks do not make the
+source comparison atomic; the existing same-authority race limitation
+applies. Syscall errors retain associations and report publication
+attempted; verify both names before retrying, since a remote filesystem
+can return an error after performing the rename. No automatic retry or
+rollback is performed.
 
-The worker then tries to reread the source parent. Matching directory tabs
-refresh their listing, keep sort choices and select the renamed basename
-when it was selected. Incidental refresh preserves the active tab, including
-when duplicate directory views exist or the user switches tabs during I/O.
-One controller operation replaces the escaped-ASCII listing and caret,
-restores model focus before any geometry refresh, and leaves unrelated
-viewport, Emacs prefix/mark and drag state untouched. It admits generation,
-caret boundary and model counters/budgets before replacement. A failed scan
-or model admission does not undo rename:
-paths remain updated, old listing rows remain stale, and the notice asks for
-`g` refresh. Source observations add one fixed-size metadata stamp per cached
-entry and one parent identity per snapshot, still within the 4096-entry cap.
+On kernel success, paths and labels for open file and directory tabs at
+or beneath the old name follow the new name. Model text, revision, dirty
+state, cursor, undo/redo and saved content state are untouched. New
+paths must fit 4096 bytes, including descendant tabs, before
+publication. Baseline files stay pinned; a directly moved file adopts
+its destination parent handle, prepared before publication. Descendants
+retain their existing parent handles. The renamed file's baseline ctime
+is adopted only after syncing/checking both parents, no-follow
+name/metadata readback and complete-byte comparison; descendant-file
+baselines are not refreshed. A sync/readback failure still reports a
+published rename and updates paths, retaining the old baseline stamp and
+an explicit uncertainty bit so later Save refuses until Reload or Save
+As, even on coarse-timestamp filesystems. No rename-back is tried. The
+job's `complete` means publication succeeded; the notice explicitly
+reports any durability/readback warning, not an unchanged-filesystem
+claim.
+
+The worker then tries to reread both parents (once if identical).
+Matching directory tabs refresh their listing and keep sort choices. A
+same-parent rename follows the selected basename. After moving a
+selected entry out, the source view selects the adjacent row at the old
+position, clamped to the last row (or the empty listing). Destination
+views retain their own selected entries. Incidental refresh preserves
+the active tab, including when duplicate directory views exist or the
+user switches tabs during I/O. One controller operation replaces the
+escaped-ASCII listing and caret, restores model focus before any
+geometry refresh, and leaves unrelated viewport, Emacs prefix/mark and
+drag state untouched. It admits generation, caret boundary and model
+counters/budgets before replacement. A failed scan or model admission
+does not undo rename: paths remain updated, old listing rows remain
+stale, and the notice asks for `g` refresh. Source observations add one
+fixed-size metadata stamp per cached entry and one parent identity per
+snapshot, still within the 4096-entry cap.
 
 #### Copy file
 
 `C` in either profile or Directory > Copy File opens `path-copy`, a
-revision/owner-bound prompt capturing the selected regular file's raw name,
-parent identity and no-follow metadata. Link/directory/special selections
-refuse. Return submits one new sibling basename; Escape/C-g cancels and C-u
-clears. There is no completion, recursion, cross-directory copy, overwrite
-or implicit save. Repeat and pending Emacs prefixes do not invoke it.
-Semantic `dialog-answer ... path HEX` accepts non-UTF-8 names through the
-same prompt, exclusive worker and historical `copy` job. Invalid basenames
-refuse before reservation checks; open file/directory destinations refuse.
-Interactive Return while the worker slot is busy retains the basename and
-original prompt identity for retry; it does not refresh stale authority.
-Invalid interactive basenames also retain the prompt before job admission.
-Semantic answers retain their terminal-error job and consume-once contract.
+revision/owner-bound prompt capturing the selected regular file's raw
+name, parent identity and no-follow metadata. Link/directory/special
+selections refuse. Return submits one destination filename using the
+path/completion rules above; Escape/C-g cancels and C-u clears.
+Cross-directory and cross-filesystem copies stage in the destination
+parent. There is no recursion, overwrite or implicit save. Repeat and
+pending Emacs prefixes do not invoke it. Semantic `dialog-answer ...
+path HEX` accepts non-UTF-8 names through the same prompt, exclusive
+worker and historical `copy` job. Invalid filenames refuse before
+reservation checks; open file/directory destinations refuse. Interactive
+Return while the worker slot is busy retains the filename and original
+prompt identity for retry; it does not refresh stale authority. Invalid
+interactive filenames also retain the prompt before job admission.
+Semantic answers retain their terminal-error job and consume-once
+contract.
 
 The worker rechecks source/parent identity, opens with the existing regular
 no-follow/nonblocking adapter and reads at most 16 MiB. Empty and binary
@@ -1388,21 +1419,30 @@ the existing no-listable-xattr profile: inherited ACLs/automatic labels
 refuse without removal or unmasked fallback. Failed probe cleanup reports
 its residual path and never proceeds to payload staging.
 
-Publish the complete synced inode through the same no-overwrite hard-link
-operation as new saves, remove its temporary name, sync the parent and
-verify named metadata and complete bytes. Hard-link support is required.
-Source/parent checks are not atomic with publication; the documented
-same-authority pathname-race boundary applies. Pre-publication errors may
-leave cleanup warnings; syscall errors on remote filesystems remain
-uncertain. Kernel success is a complete job even if confirmation/cleanup
-warns. No target rollback, automatic retry or association is performed.
+Publish the complete synced inode through the same no-overwrite
+hard-link operation as new saves, remove its temporary name, sync the
+parent and verify named metadata and complete bytes. Hard-link support
+is required. Source/parent checks are not atomic with publication; the
+documented same-authority pathname-race boundary applies.
+Pre-publication errors may leave cleanup warnings; syscall errors on
+remote filesystems remain uncertain. Kernel success is a complete job
+even if confirmation/cleanup warns. No target rollback, automatic retry
+or association is performed.
 
-The shared post-creation refresh keeps sort choices and unrelated editing,
-selects the new entry only in the origin, and retains duplicate views'
-selected basenames. Admitted refresh clears deletion marks; failed refresh
-leaves stale rows and asks for `g`, never undoing publication. The held-worker
-oracle edits an open source while copying and then saves it, checking the
-copy still contains disk bytes, independent selections and retained views.
+The shared post-creation refresh keeps sort choices and unrelated
+editing, selects the new entry only when the origin shows the
+destination parent, and retains other destination views' selected
+basenames. Admitted refresh clears deletion marks; failed refresh leaves
+stale rows and asks for `g`, never undoing publication. The held-worker
+oracle edits an open source while copying and then saves it, checking
+the copy still contains disk bytes, independent selections and retained
+views.
+
+Directory tabs are an editor file-discovery surface, not a full file
+manager. Copy/Move act on one selected entry; no recursive operations,
+transfer queues or batch copy/move are planned here. Native tests cover
+both profiles and held-worker tests cover incidental source/destination
+refresh while editing.
 
 #### Create directory
 

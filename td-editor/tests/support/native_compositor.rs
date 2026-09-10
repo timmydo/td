@@ -7,6 +7,7 @@ use std::sync::mpsc;
 
 const FRAME_BYTES: usize = 800 * 600 * 3;
 const KEY_W: u32 = 17;
+const KEY_R: u32 = 19;
 const KEY_Y: u32 = 21;
 const KEY_G: u32 = 34;
 const KEY_C: u32 = 46;
@@ -35,6 +36,11 @@ fn wait_directory_rows(
     }
     let reply = editor.ok(&format!("text\t{tab}\t{revision}\t0\t4096"));
     let (length, hex) = reply.split_once('\t').unwrap();
+    if length == "0" {
+        assert_eq!(hex, "-");
+        assert!(names.is_empty());
+        return String::new();
+    }
     let (pairs, remainder) = hex.as_bytes().as_chunks::<2>();
     assert!(remainder.is_empty());
     let text = String::from_utf8(
@@ -55,6 +61,76 @@ fn wait_directory_rows(
         .lines()
         .all(|line| line.split_whitespace().count() == 8));
     text
+}
+
+#[test]
+#[ignore = "ready supplies the disposable native compositor"]
+fn native_cross_directory_copy_move_refresh_and_later_save() {
+    for profile in ["windows", "emacs"] {
+        let compositor_directory = Directory::new();
+        let directory = Directory::new();
+        let mut compositor = Compositor::start(&compositor_directory);
+        let source = directory.0.join("source");
+        let destination = directory.0.join("destination");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::create_dir(&destination).unwrap();
+        let file = source.join("file");
+        std::fs::write(&file, b"disk").unwrap();
+        let dictionary = directory.0.join("dictionary");
+        std::fs::write(&dictionary, b"disk\n").unwrap();
+        let mut editor = EditorProcess::start_with_profile(
+            &directory,
+            &compositor.directory.join("wayland-0"),
+            &file,
+            &dictionary,
+            profile,
+        );
+        editor.wait_keyboard(profile);
+        let window = compositor.window();
+        assert_eq!(compositor.request("fullscreen", 1024), b"ok\n");
+        editor.wait_field("state", "window", "800,576,1");
+        editor.ok("insert\t1\t0\t0\t0\t65646974");
+        for path in [&source, &destination] {
+            editor.job(&format!(
+                "open\t{}",
+                td_editor::control::hex(path.as_os_str().as_encoded_bytes())
+            ));
+        }
+        editor.ok("select-tab\t2\t0");
+        for (key, scope, name) in [(KEY_C, "copy", "copy"), (KEY_R, "rename", "moved")] {
+            compositor.chord(Some(KEY_LEFT_SHIFT), key);
+            editor.wait_field("prompt-state", "prompt", &format!("path-{scope}"));
+            let state = editor.ok("state");
+            let dialog = field(&state, "dialog").unwrap().split(',').next().unwrap();
+            let relative = format!("../destination/{name}");
+            assert!(editor
+                .job(&format!(
+                    "dialog-answer\t{dialog}\t2\t0\tpath\t{}",
+                    td_editor::control::hex(relative.as_bytes())
+                ))
+                .contains(&format!(",{scope},2,0,0,complete,-")));
+            assert_eq!(std::fs::read(destination.join(name)).unwrap(), b"disk");
+        }
+        wait_directory_rows(&mut editor, 2, 1, &[]);
+        let listing = wait_directory_rows(&mut editor, 3, 2, &["copy", "moved"]);
+        let before = compositor.observe(&window);
+        editor.ok("select-tab\t3\t2");
+        compositor.rendered_tab_text(&mut editor, &window, (3, 2), before, &listing[..10], 0);
+        assert!(!file.exists());
+        assert_eq!(editor.ok("text\t1\t1\t0\t100"), "8\t656469746469736b");
+        editor.ok("select-tab\t1\t1");
+        editor.ok("undo\t1\t1");
+        editor.ok("redo\t1\t2");
+        editor.job("save\t1\t3");
+        assert_eq!(
+            std::fs::read(destination.join("moved")).unwrap(),
+            b"editdisk"
+        );
+        assert_eq!(std::fs::read(destination.join("copy")).unwrap(), b"disk");
+        assert!(!file.exists());
+        editor.quit();
+        compositor.stop();
+    }
 }
 
 #[test]

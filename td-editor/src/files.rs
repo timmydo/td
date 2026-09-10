@@ -206,11 +206,26 @@ pub struct RenameSource {
 
 impl RenameSource {
     pub(crate) fn copy_destination(&self, name: &std::ffi::OsStr) -> Result<PathBuf> {
+        let raw = name.as_bytes();
+        let leaf = raw.rsplit(|b| *b == b'/').next().unwrap_or_default();
+        if raw.len() > 4096 || raw.contains(&0) || matches!(leaf, b"" | b"." | b"..") {
+            return Err(Failure::new(
+                Kind::InvalidPath,
+                "destination requires a new filename, not a trailing slash or dot basename",
+            ));
+        }
         let parent = self
             .path
             .parent()
             .ok_or_else(|| Failure::new(Kind::InvalidPath, "copy source has no parent"))?;
-        DirectorySource::observed(parent.to_path_buf(), self.parent_identity).destination(name)
+        let path = parent.join(name);
+        if path.as_os_str().as_bytes().len() > 4096 {
+            return Err(Failure::new(
+                Kind::InvalidPath,
+                "destination path exceeds 4096 bytes",
+            ));
+        }
+        Ok(path)
     }
 
     pub fn inspect(path: &Path) -> Result<Self> {
@@ -587,7 +602,7 @@ impl Session {
         Ok(result)
     }
 
-    /// Copy on-disk regular-file bytes to a new sibling name, without
+    /// Copy on-disk regular-file bytes to a new destination filename, without
     /// overwriting or saving any open buffer. Ordinary mode honors umask.
     pub fn copy(&mut self, source: RenameSource, name: &std::ffi::OsStr) -> Result<Copied> {
         self.copy_with(source, name, |_| Ok(()))
@@ -597,6 +612,25 @@ impl Session {
         &mut self,
         source: RenameSource,
         name: &std::ffi::OsStr,
+        step: impl FnMut(Stage) -> io::Result<()>,
+    ) -> Result<Copied> {
+        self.copy_impl(source, name, &[], step)
+    }
+
+    pub(crate) fn copy_reserved(
+        &mut self,
+        source: RenameSource,
+        name: &std::ffi::OsStr,
+        reserved: &[PathBuf],
+    ) -> Result<Copied> {
+        self.copy_impl(source, name, reserved, |_| Ok(()))
+    }
+
+    fn copy_impl(
+        &mut self,
+        source: RenameSource,
+        name: &std::ffi::OsStr,
+        reserved: &[PathBuf],
         mut step: impl FnMut(Stage) -> io::Result<()>,
     ) -> Result<Copied> {
         let path = source.copy_destination(name)?;
@@ -605,16 +639,12 @@ impl Session {
             .ok_or_else(|| Failure::new(Kind::Conflict, "copy source disappeared"))?;
         source.check(&origin, &node)?;
         let destination = Location::resolve(&path)?;
-        if destination.path != path || destination.parent_identity != source.parent_identity {
-            return Err(Failure::new(
-                Kind::Conflict,
-                "copy parent changed; refresh and retry",
-            ));
-        }
+        let path = destination.path.clone();
         if self
             .entries
             .values()
             .any(|entry| entry.location.path == path)
+            || reserved.iter().any(|reserved| reserved.starts_with(&path))
         {
             return Err(Failure::new(
                 Kind::Exists,
@@ -783,7 +813,7 @@ impl Session {
         })
     }
 
-    /// Rename within the same directory, preserving the inode and all bytes.
+    /// Rename an entry, or move a regular file, preserving its inode and bytes.
     /// Existing destinations and paths reserved by other tabs are refused.
     pub fn rename(&mut self, source: RenameSource, name: &std::ffi::OsStr) -> Result<Renamed> {
         self.rename_with(source, name, |_| Ok(()))
@@ -793,37 +823,38 @@ impl Session {
         &mut self,
         source: RenameSource,
         name: &std::ffi::OsStr,
+        step: impl FnMut(Stage) -> io::Result<()>,
+    ) -> Result<Renamed> {
+        self.rename_impl(source, name, &[], step)
+    }
+
+    pub(crate) fn rename_reserved(
+        &mut self,
+        source: RenameSource,
+        name: &std::ffi::OsStr,
+        reserved: &[PathBuf],
+    ) -> Result<Renamed> {
+        self.rename_impl(source, name, reserved, |_| Ok(()))
+    }
+
+    fn rename_impl(
+        &mut self,
+        source: RenameSource,
+        name: &std::ffi::OsStr,
+        reserved: &[PathBuf],
         mut step: impl FnMut(Stage) -> io::Result<()>,
     ) -> Result<Renamed> {
-        let raw = name.as_bytes();
-        if raw.is_empty()
-            || raw.len() > 4096
-            || raw == b"."
-            || raw == b".."
-            || raw.contains(&b'/')
-            || raw.contains(&0)
-        {
-            return Err(Failure::new(
-                Kind::InvalidPath,
-                "rename requires a new basename, not a path",
-            ));
-        }
+        let requested = source.copy_destination(name)?;
         let location = Location::resolve(&source.path)?;
-        let parent = location
-            .path
-            .parent()
-            .ok_or_else(|| Failure::new(Kind::InvalidPath, "rename source has no parent"))?;
+        let destination = Location::resolve(&requested)?;
+        let to = destination.path.clone();
         let from_name = location
             .path
             .file_name()
             .ok_or_else(|| Failure::new(Kind::InvalidPath, "rename source has no basename"))?;
-        let to = parent.join(name);
-        if to.as_os_str().as_bytes().len() > 4096 {
-            return Err(Failure::new(
-                Kind::InvalidPath,
-                "renamed path exceeds 4096 bytes",
-            ));
-        }
+        let to_name = to
+            .file_name()
+            .ok_or_else(|| Failure::new(Kind::InvalidPath, "move destination has no basename"))?;
         if to == source.path {
             return Err(Failure::new(
                 Kind::Exists,
@@ -835,6 +866,29 @@ impl Session {
             .custom_flags(O_PATH | O_NOFOLLOW)
             .open(&location.path)?;
         source.check(&location, &node)?;
+        let cross_parent = location.parent_identity != destination.parent_identity;
+        if cross_parent && source.stamp.mode & 0o170000 != 0o100000 {
+            return Err(Failure::new(
+                Kind::NotRegular,
+                "moving across directories requires a regular file",
+            ));
+        }
+        if reserved.iter().any(|path| path.starts_with(&to)) {
+            return Err(Failure::new(
+                Kind::Exists,
+                "move destination belongs to an open directory",
+            ));
+        }
+        for path in reserved {
+            if let Ok(suffix) = path.strip_prefix(&source.path) {
+                if to.join(suffix).as_os_str().as_bytes().len() > 4096 {
+                    return Err(Failure::new(
+                        Kind::Limit,
+                        "renamed directory-tab path exceeds 4096 bytes",
+                    ));
+                }
+            }
+        }
         let directory = source.stamp.mode & 0o170000 == 0o040000;
         let mut paths = BTreeMap::new();
         for (&id, entry) in &self.entries {
@@ -872,32 +926,50 @@ impl Session {
                     ));
                 }
                 entry.location.check_parent()?;
-                paths.insert(id, moved);
+                let parent = if path == &source.path {
+                    &destination
+                } else {
+                    &entry.location
+                };
+                paths.insert(
+                    id,
+                    Location {
+                        path: moved,
+                        parent: parent.parent.try_clone()?,
+                        parent_identity: parent.parent_identity,
+                    },
+                );
             }
         }
         step(Stage::Recheck)?;
         source.check(&location, &node)?;
+        destination.check_parent()?;
         step(Stage::Publish)?;
-        crate::sys::rename_entry(&location.parent, from_name, name).map_err(|error| {
-            let mut failure = if error.kind() == io::ErrorKind::AlreadyExists {
-                Failure::new(
-                    Kind::Exists,
-                    "rename never overwrites an existing destination",
-                )
-            } else {
-                Failure::from(error)
-            };
-            failure.publication_attempted = true;
-            failure
-        })?;
+        crate::sys::rename_entry(&location.parent, from_name, &destination.parent, to_name)
+            .map_err(|error| {
+                let mut failure = if error.kind() == io::ErrorKind::AlreadyExists {
+                    Failure::new(
+                        Kind::Exists,
+                        "rename never overwrites an existing destination",
+                    )
+                } else {
+                    Failure::from(error)
+                };
+                failure.publication_attempted = true;
+                failure
+            })?;
 
         // Once published, every outcome carries the new path. A failed
         // readback retains the old baseline stamp so Save detects conflict.
         let confirmed = (|| -> Result<Stamp> {
             step(Stage::SyncParent)?;
             location.parent.sync_all()?;
+            if cross_parent {
+                destination.parent.sync_all()?;
+            }
             step(Stage::Readback)?;
             location.check_parent()?;
+            destination.check_parent()?;
             let stamp = Stamp::read(&node.metadata()?);
             let mut expected = source.stamp.clone();
             expected.ctime = stamp.ctime;
@@ -919,7 +991,7 @@ impl Session {
             }
             Ok(stamp)
         })();
-        for (id, path) in paths {
+        for (id, location) in paths {
             if let Some(entry) = self.entries.get_mut(&id) {
                 if entry.location.path == source.path {
                     entry.rename_uncertain = confirmed.is_err();
@@ -927,7 +999,7 @@ impl Session {
                         entry.stamp = Some(stamp.clone());
                     }
                 }
-                entry.location.path = path;
+                entry.location = location;
             }
         }
         Ok(Renamed {
@@ -1702,7 +1774,7 @@ mod tests {
                 .kind,
             Kind::Exists
         );
-        for name in ["", ".", "..", "a/b", "/absolute", "nul\0name"] {
+        for name in ["", ".", "..", "a/", "/absolute/", "nul\0name"] {
             let error = files
                 .copy(RenameSource::inspect(&old).unwrap(), name.as_ref())
                 .err()
@@ -1966,9 +2038,12 @@ mod tests {
     struct Directory(PathBuf);
     impl Directory {
         fn new() -> Self {
+            Self::new_in(&std::env::temp_dir())
+        }
+        fn new_in(parent: &Path) -> Self {
             for _ in 0..64 {
                 let n = TEMP_SERIAL.fetch_add(1, Ordering::Relaxed);
-                let path = std::env::temp_dir()
+                let path = parent
                     .join(format!("td-editor-files-test-{}-{n}", std::process::id()));
                 match fs::create_dir(&path) {
                     Ok(()) => return Self(path),
@@ -2085,6 +2160,206 @@ mod tests {
             assert!(result.failure.is_some());
             assert_eq!(fs::read(path).unwrap(), b"external replacement");
             assert_eq!(fs::read(later).unwrap(), b"untouched");
+        }
+    }
+
+    #[test]
+    fn cross_filesystem_copy_succeeds_but_move_never_copies_or_deletes() {
+        // The trusted-root runner supplies a separately mounted /dev/shm.
+        let source = Directory::new();
+        let destination = Directory::new_in(Path::new("/dev/shm"));
+        assert_ne!(fs::metadata(&source.0).unwrap().dev(),
+            fs::metadata(&destination.0).unwrap().dev(),
+            "run with TD_TEST_TRUSTED_ROOT=1 for distinct fixture filesystems");
+        let old = source.write("source", b"disk");
+        let mut files = Session::default();
+        let id = files.open(&old).unwrap();
+        let before = Stamp::read(&fs::metadata(&old).unwrap());
+        let copied = files.copy(RenameSource::inspect(&old).unwrap(),
+            destination.path("copy").as_os_str()).unwrap();
+        assert!(copied.warning.is_none());
+        assert_eq!(fs::read(&copied.path).unwrap(), b"disk");
+        let error = files.rename(RenameSource::inspect(&old).unwrap(),
+            destination.path("move").as_os_str()).err().unwrap();
+        assert_eq!(error.kind, Kind::Io);
+        assert!(error.publication_attempted && !error.published);
+        assert_eq!(Stamp::read(&fs::metadata(&old).unwrap()), before);
+        assert!(!destination.path("move").exists());
+        assert_eq!(files.path(id).unwrap(), old);
+        assert_eq!(files.bytes(id).unwrap(), b"disk");
+        files.save(id, b"edited".to_vec()).unwrap();
+        assert_eq!(fs::read(old).unwrap(), b"edited");
+        assert_eq!(fs::read(copied.path).unwrap(), b"disk");
+        source.no_temporaries();
+        destination.no_temporaries();
+    }
+
+    #[test]
+    fn cross_directory_copy_and_move_preserve_bytes_and_rebind_save_parent() {
+        let dir = Directory::new();
+        fs::create_dir(dir.path("source")).unwrap();
+        fs::create_dir(dir.path("destination")).unwrap();
+        let old = dir.write("source/file", b"disk\n");
+        fs::set_permissions(&old, Permissions::from_mode(0o640)).unwrap();
+        let mut files = Session::default();
+        let id = files.open(&old).unwrap();
+        let before = fs::metadata(&old).unwrap();
+        let copied = files
+            .copy(
+                RenameSource::inspect(&old).unwrap(),
+                "../destination/copy".as_ref(),
+            )
+            .unwrap();
+        assert!(copied.warning.is_none());
+        assert_eq!(copied.path, dir.path("destination/copy"));
+        assert_eq!(fs::read(&copied.path).unwrap(), b"disk\n");
+        assert_eq!(files.path(id).unwrap(), old);
+        assert_eq!(files.bytes(id).unwrap(), b"disk\n");
+        assert_ne!(fs::metadata(&copied.path).unwrap().ino(), before.ino());
+        let raw = std::ffi::OsString::from_vec(b"moved-\xff".to_vec());
+        let target = dir.path("destination").join(raw);
+        let moved = files
+            .rename(RenameSource::inspect(&old).unwrap(), target.as_os_str())
+            .unwrap();
+        assert!(moved.warning.is_none());
+        assert_eq!(moved.to, target);
+        assert_eq!(fs::metadata(&target).unwrap().ino(), before.ino());
+        assert_eq!(fs::metadata(&target).unwrap().mode(), before.mode());
+        assert!(!old.exists());
+        assert_eq!(files.path(id).unwrap(), target);
+        files.save(id, b"edited".to_vec()).unwrap();
+        assert_eq!(fs::read(target).unwrap(), b"edited");
+        assert_eq!(fs::read(copied.path).unwrap(), b"disk\n");
+        assert!(!old.exists());
+        dir.no_temporaries();
+    }
+
+    #[test]
+    fn cross_directory_destinations_resolve_aliases_and_respect_reservations() {
+        let dir = Directory::new();
+        fs::create_dir(dir.path("destination")).unwrap();
+        symlink(dir.path("destination"), dir.path("alias")).unwrap();
+        let old = dir.write("source", b"disk");
+        let mut files = Session::default();
+        files.open(&dir.path("destination/reserved")).unwrap();
+        for copying in [true, false] {
+            for (name, reserved) in [
+                ("alias/reserved", vec![]),
+                ("alias/stale", vec![dir.path("destination/stale/child")]),
+            ] {
+                let source = RenameSource::inspect(&old).unwrap();
+                let result = if copying {
+                    files
+                        .copy_reserved(source, name.as_ref(), &reserved)
+                        .map(|r| r.path)
+                } else {
+                    files
+                        .rename_reserved(source, name.as_ref(), &reserved)
+                        .map(|r| r.to)
+                };
+                assert_eq!(result.err().unwrap().kind, Kind::Exists);
+                assert_eq!(fs::read(&old).unwrap(), b"disk");
+            }
+        }
+        let copied = files
+            .copy(RenameSource::inspect(&old).unwrap(), "alias/copy".as_ref())
+            .unwrap();
+        assert_eq!(copied.path, dir.path("destination/copy"));
+        let moved = files
+            .rename(RenameSource::inspect(&old).unwrap(), "alias/moved".as_ref())
+            .unwrap();
+        assert_eq!(moved.to, dir.path("destination/moved"));
+    }
+
+    #[test]
+    fn cross_directory_move_refuses_nonregular_and_changed_destination_parents() {
+        let dir = Directory::new();
+        fs::create_dir(dir.path("destination")).unwrap();
+        fs::create_dir(dir.path("tree")).unwrap();
+        let old = dir.write("source", b"disk");
+        symlink(&old, dir.path("link")).unwrap();
+        let mut files = Session::default();
+        for name in ["tree", "link"] {
+            assert_eq!(
+                files
+                    .rename(
+                        RenameSource::inspect(&dir.path(name)).unwrap(),
+                        "destination/out".as_ref()
+                    )
+                    .err()
+                    .unwrap()
+                    .kind,
+                Kind::NotRegular
+            );
+            assert!(fs::symlink_metadata(dir.path(name)).is_ok());
+        }
+        for copying in [true, false] {
+            let source = RenameSource::inspect(&old).unwrap();
+            let mut hook = |stage| {
+                if stage == Stage::Recheck {
+                    fs::rename(dir.path("destination"), dir.path("displaced"))?;
+                    fs::create_dir(dir.path("destination"))?;
+                }
+                Ok(())
+            };
+            let result = if copying {
+                files
+                    .copy_with(source, "destination/out".as_ref(), &mut hook)
+                    .map(|r| r.path)
+            } else {
+                files
+                    .rename_with(source, "destination/out".as_ref(), &mut hook)
+                    .map(|r| r.to)
+            };
+            assert_eq!(result.err().unwrap().kind, Kind::Conflict);
+            assert_eq!(fs::read(&old).unwrap(), b"disk");
+            assert!(!dir.path("destination/out").exists());
+            assert!(!dir.path("displaced/out").exists());
+            fs::remove_dir(dir.path("destination")).unwrap();
+            // Copy cleanup names may remain after parent replacement; the
+            // owned test directory removes them when the fixture is dropped.
+            fs::rename(dir.path("displaced"), dir.path("destination")).unwrap();
+        }
+    }
+
+    #[test]
+    fn cross_directory_move_never_overwrites_and_uncertain_success_blocks_save() {
+        for fail in [Stage::Publish, Stage::SyncParent, Stage::Readback] {
+            let dir = Directory::new();
+            fs::create_dir(dir.path("destination")).unwrap();
+            let old = dir.write("source", b"disk");
+            let target = dir.path("destination/out");
+            let mut files = Session::default();
+            let id = files.open(&old).unwrap();
+            let result = files.rename_with(
+                RenameSource::inspect(&old).unwrap(),
+                target.as_os_str(),
+                |stage| {
+                    if stage == fail {
+                        if fail == Stage::Publish {
+                            fs::write(&target, b"racer")?;
+                        } else {
+                            return Err(io::Error::other("injected confirmation failure"));
+                        }
+                    }
+                    Ok(())
+                },
+            );
+            if fail == Stage::Publish {
+                assert_eq!(result.err().unwrap().kind, Kind::Exists);
+                assert_eq!(files.path(id).unwrap(), old);
+                assert_eq!(fs::read(target).unwrap(), b"racer");
+                assert_eq!(fs::read(old).unwrap(), b"disk");
+            } else {
+                assert!(result.unwrap().warning.is_some());
+                assert_eq!(files.path(id).unwrap(), target);
+                assert_eq!(
+                    files.save(id, b"edited".to_vec()).err().unwrap().kind,
+                    Kind::Conflict
+                );
+                assert_eq!(fs::read(target).unwrap(), b"disk");
+                assert!(!old.exists());
+            }
         }
     }
 

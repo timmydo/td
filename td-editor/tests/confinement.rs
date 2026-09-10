@@ -231,7 +231,7 @@ fn complete_raw_layer_and_production_callers_are_pinned() {
         (h ^ u64::from(b)).wrapping_mul(0x100000001b3)
     });
     assert_eq!(
-        hash, 0x8026c52796f74e05,
+        hash, 0x3c3c3618124426d4,
         "review the complete raw layer before updating its fingerprint"
     );
     for pin in [
@@ -280,7 +280,7 @@ fn complete_raw_layer_and_production_callers_are_pinned() {
     assert_eq!(files.matches("crate::sys::").count(), 2);
     assert_eq!(
         files
-            .matches("crate::sys::rename_entry(&location.parent, from_name, name)")
+            .matches("crate::sys::rename_entry(&location.parent, from_name, &destination.parent, to_name)")
             .count(),
         1
     );

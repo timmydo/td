@@ -77,10 +77,11 @@ fn syscall3(number: usize, a1: usize, a2: usize, a3: usize) -> isize {
     syscall5(number, a1, a2, a3, 0, 0)
 }
 
-/// Move one literal basename within a borrowed directory, never replacing.
+/// Move between two borrowed directories with literal basenames, never replacing.
 pub(super) fn rename_entry(
     parent: &File,
     from: &std::ffi::OsStr,
+    destination: &File,
     to: &std::ffi::OsStr,
 ) -> io::Result<()> {
     use std::os::unix::ffi::OsStrExt;
@@ -102,7 +103,7 @@ pub(super) fn rename_entry(
         SYS_RENAMEAT2,
         parent.as_raw_fd() as usize,
         from.as_ptr() as usize,
-        parent.as_raw_fd() as usize,
+        destination.as_raw_fd() as usize,
         to.as_ptr() as usize,
         RENAME_NOREPLACE,
     ))

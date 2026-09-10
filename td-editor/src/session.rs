@@ -29,6 +29,7 @@ enum Operation {
     Copy {
         source: crate::files::RenameSource,
         name: std::ffi::OsString,
+        reserved: Vec<PathBuf>,
     },
     Mkdir {
         source: crate::files::DirectorySource,
@@ -40,6 +41,7 @@ enum Operation {
     Rename {
         source: crate::files::RenameSource,
         name: std::ffi::OsString,
+        reserved: Vec<PathBuf>,
     },
     Reload(FileId),
     Save {
@@ -73,7 +75,7 @@ enum Completion {
     Directory(crate::directory::Snapshot),
     Renamed {
         result: crate::files::Renamed,
-        listing: Result<Option<crate::directory::Snapshot>>,
+        listings: Vec<Result<Option<crate::directory::Snapshot>>>,
     },
     Reload(Loaded),
     Conflict(String),
@@ -268,7 +270,19 @@ impl Session {
         {
             return Err("Copy destination belongs to an open directory tab".into());
         }
-        self.submit(Operation::Copy { source, name }, Pending::Copy(tab))
+        let reserved = self
+            .directories
+            .values()
+            .map(|snapshot| snapshot.path.clone())
+            .collect();
+        self.submit(
+            Operation::Copy {
+                source,
+                name,
+                reserved,
+            },
+            Pending::Copy(tab),
+        )
     }
 
     pub(crate) fn create_directory(
@@ -341,14 +355,11 @@ impl Session {
         ui.editor()
             .revision_point(tab, revision)
             .map_err(|e| e.to_string())?;
-        if self.directory(tab).is_none() {
-            return Err("Rename needs a directory tab".into());
+        let directory = self.directory(tab).ok_or("Rename needs a directory tab")?;
+        if source.path().parent() != Some(directory.path.as_path()) {
+            return Err("Rename source belongs to a different directory".into());
         }
-        let to = source
-            .path()
-            .parent()
-            .ok_or("Rename source has no parent")?
-            .join(&name);
+        let to = source.copy_destination(&name).map_err(|e| e.to_string())?;
         // Cached directory paths are not owned by the file worker. Admit
         // their rebasing before it can publish any filesystem change.
         for snapshot in self.directories.values() {
@@ -358,7 +369,19 @@ impl Session {
                 }
             }
         }
-        self.submit(Operation::Rename { source, name }, Pending::Rename)
+        let reserved = self
+            .directories
+            .values()
+            .map(|snapshot| snapshot.path.clone())
+            .collect();
+        self.submit(
+            Operation::Rename {
+                source,
+                name,
+                reserved,
+            },
+            Pending::Rename,
+        )
     }
 
     pub(crate) fn sort_directory(
@@ -725,7 +748,7 @@ impl Session {
                     Ok(notice)
                 }
             }
-            (Some(Pending::Rename), Completion::Renamed { result, listing }) => {
+            (Some(Pending::Rename), Completion::Renamed { result, listings }) => {
                 for association in self.associations.values_mut() {
                     if let Some(path) = result.relocated(&association.path) {
                         association.path = path;
@@ -752,48 +775,53 @@ impl Session {
                         result.to
                     )
                 });
-                match listing {
-                    Ok(Some(fresh)) => {
-                        for (&tab, old) in &mut self.directories {
-                            if old.path != fresh.path {
-                                continue;
-                            }
-                            let replaced = (|| -> Result<crate::directory::Snapshot> {
-                                let doc = ui.editor().document(tab).map_err(|e| e.to_string())?;
-                                let revision = doc.revision();
-                                let point = ui
-                                    .editor()
-                                    .revision_point(tab, revision)
-                                    .map_err(|e| e.to_string())?;
-                                let row = doc
-                                    .text()
-                                    .get(..doc.selection().caret)
-                                    .ok_or("Invalid selection")?
-                                    .bytes()
-                                    .filter(|b| *b == b'\n')
-                                    .count();
-                                let selected = old.entry(row).map(|path| {
-                                    if path == result.from {
-                                        result.to.clone()
-                                    } else {
-                                        path
+                for listing in listings {
+                    match listing {
+                        Ok(Some(fresh)) => {
+                            for (&tab, old) in &mut self.directories {
+                                if old.path != fresh.path {
+                                    continue;
+                                }
+                                let replaced = (|| -> Result<crate::directory::Snapshot> {
+                                    let doc =
+                                        ui.editor().document(tab).map_err(|e| e.to_string())?;
+                                    let revision = doc.revision();
+                                    let point = ui
+                                        .editor()
+                                        .revision_point(tab, revision)
+                                        .map_err(|e| e.to_string())?;
+                                    let row = doc
+                                        .text()
+                                        .get(..doc.selection().caret)
+                                        .ok_or("Invalid selection")?
+                                        .bytes()
+                                        .filter(|b| *b == b'\n')
+                                        .count();
+                                    let mut selected = old.entry(row);
+                                    let mut next = fresh.clone();
+                                    next.arrange(old.sort, old.reverse);
+                                    if selected.as_ref() == Some(&result.from) {
+                                        selected = if result.to.parent() == Some(next.path.as_path()) {
+                                            Some(result.to.clone())
+                                        } else {
+                                            next.entry(row.min(next.len().saturating_sub(1)))
+                                        };
                                     }
-                                });
-                                let mut next = fresh.clone();
-                                next.arrange(old.sort, old.reverse);
-                                let caret = selected.as_ref().map_or(0, |path| next.offset(path));
-                                ui.refresh_directory(point, next.text.as_bytes(), caret)
-                                    .map_err(|e| e.to_string())?;
-                                next.text = String::new();
-                                Ok(next)
-                            })();
-                            match replaced {
-                                Ok(next) => *old = next,
-                                Err(_) => notice.push_str("; listing not refreshed: use g"),
+                                    let caret =
+                                        selected.as_ref().map_or(0, |path| next.offset(path));
+                                    ui.refresh_directory(point, next.text.as_bytes(), caret)
+                                        .map_err(|e| e.to_string())?;
+                                    next.text = String::new();
+                                    Ok(next)
+                                })();
+                                match replaced {
+                                    Ok(next) => *old = next,
+                                    Err(_) => notice.push_str("; listing not refreshed: use g"),
+                                }
                             }
                         }
+                        _ => notice.push_str("; directory read failed: use g to refresh"),
                     }
-                    _ => notice.push_str("; directory read failed: use g to refresh"),
                 }
                 Ok(notice)
             }
@@ -1024,9 +1052,13 @@ fn execute(files: &mut Files, known: &mut BTreeSet<FileId>, job: Job) -> Result<
     // Release closed tabs and rejected Open admissions before the next job.
     retain_files(files, known, &job.keep);
     match job.operation {
-        Operation::Copy { source, name } => {
+        Operation::Copy {
+            source,
+            name,
+            reserved,
+        } => {
             let result = files
-                .copy(source, &name)
+                .copy_reserved(source, &name, &reserved)
                 .map_err(|e| format!("Copy failed: {e}"))?;
             let listing = result
                 .path
@@ -1058,16 +1090,29 @@ fn execute(files: &mut Files, known: &mut BTreeSet<FileId>, job: Job) -> Result<
             let listing = crate::directory::read(&result.parent);
             Ok(Completion::Deleted { result, listing })
         }
-        Operation::Rename { source, name } => {
+        Operation::Rename {
+            source,
+            name,
+            reserved,
+        } => {
             let result = files
-                .rename(source, &name)
+                .rename_reserved(source, &name, &reserved)
                 .map_err(|e| format!("Rename failed: {e}"))?;
-            let listing = result
+            let mut listings = vec![result
                 .to
                 .parent()
                 .ok_or_else(|| "Rename path has no parent".to_string())
-                .and_then(crate::directory::read);
-            Ok(Completion::Renamed { result, listing })
+                .and_then(crate::directory::read)];
+            if result.from.parent() != result.to.parent() {
+                listings.push(
+                    result
+                        .from
+                        .parent()
+                        .ok_or_else(|| "Rename source has no parent".to_string())
+                        .and_then(crate::directory::read),
+                );
+            }
+            Ok(Completion::Renamed { result, listings })
         }
         Operation::Dictionary(path) => crate::files::read_dictionary(&path)
             .map(Completion::Dictionary)
@@ -1519,6 +1564,38 @@ mod tests {
             Err(crate::Error::InvalidArgument)
         );
         assert_eq!(h.ui.editor().document(tab).unwrap().text(), "body");
+    }
+
+    #[test]
+    fn moving_selected_entry_keeps_adjacent_source_row_and_incidental_destination() {
+        let dir = Directory::new();
+        fs::create_dir(dir.path("source")).unwrap();
+        fs::create_dir(dir.path("destination")).unwrap();
+        for name in ["a", "b", "c", "d"] {
+            fs::write(dir.path("source").join(name), b"disk").unwrap();
+        }
+        fs::write(dir.path("destination/z"), b"keep").unwrap();
+        let mut h = Harness::new();
+        let source_tab = h.open(dir.path("source"));
+        let destination_tab = h.open(dir.path("destination"));
+        h.ui.dispatch(Event::SelectTab(source_tab)).unwrap();
+        for (revision, row, name) in [(0, 1, "b"), (1, 2, "d")] {
+            let snapshot = h.session.directory(source_tab).unwrap();
+            let source = snapshot.rename_source(row).unwrap();
+            let caret = h.ui.editor().document(source_tab).unwrap().text()
+                .lines().take(row).map(|line| line.len() + 1).sum();
+            h.ui.dispatch(Event::Edit { tab: source_tab, revision,
+                command: Command::Select(crate::model::Selection { anchor: caret, caret }) }).unwrap();
+            h.session.rename(&h.ui, source_tab, revision, source,
+                dir.path("destination").join(name).into_os_string()).unwrap();
+            h.complete().unwrap();
+            assert_eq!(h.ui.editor().active(), Some(source_tab));
+            for (tab, selected) in [(source_tab, "c"), (destination_tab, "z")] {
+                let doc = h.ui.editor().document(tab).unwrap();
+                let line = doc.text().get(doc.selection().caret..).unwrap().lines().next().unwrap();
+                assert_eq!(line.split_whitespace().last(), Some(selected));
+            }
+        }
     }
 
     #[test]
