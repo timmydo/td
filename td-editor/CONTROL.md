@@ -195,8 +195,9 @@ semantic dialog answers still supply explicit OS-byte paths and do not
 gain a completion mutation verb or physical clipboard authority.
 
 Kinds are `none`, `path-open`, `path-save-as`, `path-dictionary`,
-`path-rename`, `path-delete`, `path-mkdir`, `close-save-as`, `find-forward`,
-`find-backward`, `replace`, `go-to-line`, `fill-column`, and `command`.
+`path-rename`, `path-delete`, `path-mkdir`, `path-copy`, `close-save-as`,
+`find-forward`, `find-backward`, `replace`, `go-to-line`, `fill-column`,
+and `command`.
 `close-save-as` is Save As answered through the close dialog's ID rather
 than an independent path ID, including after a save conflict during
 close. Other ordinary paths always have their own revision-bound
@@ -644,12 +645,12 @@ path ID under the following contract.
 
 ## Ordinary path answers and Dictionary jobs
 
-Opening a native Open, Save As, Dictionary, Rename, New Directory or deletion
-review mints a fresh checked dialog ID and captures an editor-bound
+Opening a native Open, Save As, Dictionary, Rename, New Directory, Copy File
+or deletion review mints a checked dialog ID and captures an editor-bound
 tab/revision point. State reports
 `ID,SCOPE,path,TAB,REVISION,cancel+path`, with scope `path-open`,
-`path-save-as`, `path-dictionary`, `path-rename`, `path-delete` or
-`path-mkdir`. Save As reached through a conflict gets a fresh path ID;
+`path-save-as`, `path-dictionary`, `path-rename`, `path-delete`, `path-mkdir`
+or `path-copy`. Save As reached through a conflict gets a fresh path ID;
 its target can remain inactive. Close-driven Save As retains its close
 ID and close scope. Typing, empty Return and input loss keep the current
 ID. Cancelling and reopening never reuse it. Counter exhaustion refuses
@@ -698,6 +699,18 @@ inspect both names before retrying (not all remote filesystems guarantee
 that an error means no rename occurred). There is no cancellation after
 submission, implicit save, overwrite or cross-directory move. Unsaved text
 and history remain intact.
+
+File copy uses scope `path-copy`; `path HEX_PATH` supplies one literal new
+sibling basename under the captured source/parent observation. It accepts
+regular files up to 16 MiB, including binary bytes. Links/directories and
+existing/reserved destinations refuse. Ordinary permission bits honor umask;
+special bits are stripped. No unsaved buffer, association or baseline is
+changed. Admission records `job=JOB,copy,TAB,REVISION,0,STATUS,CODE`.
+`complete,-` means kernel publication succeeded, potentially with a notice
+warning about confirmation/cleanup/refresh. Errors or disconnects do not
+prove absence. No overwrite, recursion, rollback or automatic retry occurs.
+Successful rescans refresh matching views without stealing focus. Read the
+notice and inspect disk state before retrying an uncertain operation.
 
 Directory creation uses scope `path-mkdir`. `path HEX_PATH` supplies one
 literal new basename, including non-UTF-8 bytes, under the captured directory

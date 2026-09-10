@@ -26,6 +26,10 @@ impl PollFailure {
 }
 
 enum Operation {
+    Copy {
+        source: crate::files::RenameSource,
+        name: std::ffi::OsString,
+    },
     Mkdir {
         source: crate::files::DirectorySource,
         name: std::ffi::OsString,
@@ -55,8 +59,9 @@ struct Loaded {
     missing: bool,
 }
 enum Completion {
-    CreatedDirectory {
-        result: crate::files::CreatedDirectory,
+    CreatedPath {
+        path: PathBuf,
+        notice: String,
         listing: Result<Option<crate::directory::Snapshot>>,
     },
     Deleted {
@@ -78,6 +83,7 @@ enum Completion {
     },
 }
 enum Pending {
+    Copy(TabId),
     Mkdir(TabId),
     Delete,
     Dictionary,
@@ -237,6 +243,32 @@ impl Session {
         next.text = String::new();
         self.directories.insert(tab, next);
         Ok(())
+    }
+
+    pub(crate) fn copy(
+        &mut self,
+        ui: &Controller,
+        tab: TabId,
+        revision: u64,
+        source: crate::files::RenameSource,
+        name: std::ffi::OsString,
+    ) -> Result<()> {
+        ui.editor()
+            .revision_point(tab, revision)
+            .map_err(|e| e.to_string())?;
+        let directory = self.directory(tab).ok_or("Copy needs a directory tab")?;
+        if source.path().parent() != Some(directory.path.as_path()) {
+            return Err("Copy source belongs to a different directory".into());
+        }
+        let path = source.copy_destination(&name).map_err(|e| e.to_string())?;
+        if self
+            .directories
+            .values()
+            .any(|snapshot| snapshot.path.starts_with(&path))
+        {
+            return Err("Copy destination belongs to an open directory tab".into());
+        }
+        self.submit(Operation::Copy { source, name }, Pending::Copy(tab))
     }
 
     pub(crate) fn create_directory(
@@ -589,8 +621,14 @@ impl Session {
         result: Result<Completion>,
     ) -> Result<String> {
         match (pending, result?) {
-            (Some(Pending::Mkdir(origin)), Completion::CreatedDirectory { result, listing }) => {
-                let mut notice = result.warning.unwrap_or_else(|| "Directory created".into());
+            (
+                Some(Pending::Mkdir(origin) | Pending::Copy(origin)),
+                Completion::CreatedPath {
+                    path,
+                    mut notice,
+                    listing,
+                },
+            ) => {
                 let mut stale = false;
                 match listing {
                     Ok(Some(fresh)) => {
@@ -612,7 +650,7 @@ impl Session {
                                     .filter(|b| *b == b'\n')
                                     .count();
                                 let selected = if tab == origin {
-                                    Some(result.path.clone())
+                                    Some(path.clone())
                                 } else {
                                     old.entry(row)
                                 };
@@ -927,6 +965,7 @@ fn worker(jobs: Receiver<Job>, results: SyncSender<Result<Completion>>) {
                 Operation::Rename { .. } => "rename",
                 Operation::Delete(_) => "delete",
                 Operation::Mkdir { .. } => "mkdir",
+                Operation::Copy { .. } => "copy",
             };
             if let Err(detail) = barrier.checkpoint(kind) {
                 let _ = results.send(Err(detail));
@@ -985,13 +1024,32 @@ fn execute(files: &mut Files, known: &mut BTreeSet<FileId>, job: Job) -> Result<
     // Release closed tabs and rejected Open admissions before the next job.
     retain_files(files, known, &job.keep);
     match job.operation {
+        Operation::Copy { source, name } => {
+            let result = files
+                .copy(source, &name)
+                .map_err(|e| format!("Copy failed: {e}"))?;
+            let listing = result
+                .path
+                .parent()
+                .ok_or_else(|| "Copy has no parent".to_string())
+                .and_then(crate::directory::read);
+            Ok(Completion::CreatedPath {
+                path: result.path,
+                notice: result.warning.unwrap_or_else(|| "File copied".into()),
+                listing,
+            })
+        }
         Operation::Mkdir { source, name } => {
             let parent = source.path().to_path_buf();
             let result = files
                 .create_directory(source, &name)
                 .map_err(|e| format!("Directory creation failed: {e}"))?;
             let listing = crate::directory::read(&parent);
-            Ok(Completion::CreatedDirectory { result, listing })
+            Ok(Completion::CreatedPath {
+                path: result.path,
+                notice: result.warning.unwrap_or_else(|| "Directory created".into()),
+                listing,
+            })
         }
         Operation::Delete(plan) => {
             let result = files

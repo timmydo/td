@@ -39,6 +39,8 @@ no-overwrite rename. Rename has a pinned path prompt and remote job outcome;
 open tabs follow renamed paths without losing unsaved text or history.
 Directory deletion uses bounded marks and an explicit permanent-deletion
 confirmation, with live remote answers and historical job outcomes.
+Directory `C` copies on-disk regular files without overwriting, preserving
+ordinary permissions with umask applied and special permission bits stripped.
 Decoded key control drives editing, menus, Find, Replace, numeric and command
 entry with an exact native input-context fence. It requires real input
 readiness and cannot answer file/close/conflict flows. Decoded pointer
@@ -568,7 +570,7 @@ In the explicit feature build, an unset variable leaves scheduling ordinary.
 When set, it names a fixture-owned Unix listener. The file worker connects
 once and exchanges `td-file-v1 N KIND\n` / `continue N\n` before each job's
 I/O, including initial Open and Dictionary. KIND is `open`, `dictionary`,
-`reload`, `rename`, `delete`, `mkdir` or `save`; Save As shares `save`.
+`reload`, `rename`, `delete`, `mkdir`, `copy` or `save`; Save As shares `save`.
 N starts at 1 and is checked for exhaustion. The channel carries no path,
 document bytes or model authority.
 The fixture automatically continues startup and unrelated jobs and may hold
@@ -1336,6 +1338,60 @@ or model admission does not undo rename:
 paths remain updated, old listing rows remain stale, and the notice asks for
 `g` refresh. Source observations add one fixed-size metadata stamp per cached
 entry and one parent identity per snapshot, still within the 4096-entry cap.
+
+#### Copy file
+
+`C` in either profile or Directory > Copy File opens `path-copy`, a
+revision/owner-bound prompt capturing the selected regular file's raw name,
+parent identity and no-follow metadata. Link/directory/special selections
+refuse. Return submits one new sibling basename; Escape/C-g cancels and C-u
+clears. There is no completion, recursion, cross-directory copy, overwrite
+or implicit save. Repeat and pending Emacs prefixes do not invoke it.
+Semantic `dialog-answer ... path HEX` accepts non-UTF-8 names through the
+same prompt, exclusive worker and historical `copy` job. Invalid basenames
+refuse before reservation checks; open file/directory destinations refuse.
+Interactive Return while the worker slot is busy retains the basename and
+original prompt identity for retry; it does not refresh stale authority.
+Invalid interactive basenames also retain the prompt before job admission.
+Semantic answers retain their terminal-error job and consume-once contract.
+
+The worker rechecks source/parent identity, opens with the existing regular
+no-follow/nonblocking adapter and reads at most 16 MiB. Empty and binary
+files are copied byte-for-byte, without text decoding. The transient copy
+snapshot does not become an association or saved baseline. Reread/compare
+the full source bytes and metadata before publication. Reads may update
+atime; source bytes/mode and open-tab paths, text, history, dirty state and
+baselines are unchanged. Unsaved edits are deliberately not copied.
+
+Preserve ordinary rwx bits with kernel umask applied; strip setuid, setgid
+and sticky bits. Ownership/group follow new-file rules; timestamps and
+xattrs are not copied. A never-written empty temporary probe observes the
+kernel-masked mode and is removed with an identity check. A different
+mode-0600 temporary inode stages the payload privately; apply the observed
+final mode after the complete write. This avoids process-global umask
+changes and procfs dependence. The same size-only attribute query now
+inspects the already-opened parent before and after probing: a minimal
+default ACL can override umask yet leave no access ACL on a child. Any
+listable parent attribute or query error refuses Copy. Both inodes require
+the existing no-listable-xattr profile: inherited ACLs/automatic labels
+refuse without removal or unmasked fallback. Failed probe cleanup reports
+its residual path and never proceeds to payload staging.
+
+Publish the complete synced inode through the same no-overwrite hard-link
+operation as new saves, remove its temporary name, sync the parent and
+verify named metadata and complete bytes. Hard-link support is required.
+Source/parent checks are not atomic with publication; the documented
+same-authority pathname-race boundary applies. Pre-publication errors may
+leave cleanup warnings; syscall errors on remote filesystems remain
+uncertain. Kernel success is a complete job even if confirmation/cleanup
+warns. No target rollback, automatic retry or association is performed.
+
+The shared post-creation refresh keeps sort choices and unrelated editing,
+selects the new entry only in the origin, and retains duplicate views'
+selected basenames. Admitted refresh clears deletion marks; failed refresh
+leaves stale rows and asks for `g`, never undoing publication. The held-worker
+oracle edits an open source while copying and then saves it, checking the
+copy still contains disk bytes, independent selections and retained views.
 
 #### Create directory
 

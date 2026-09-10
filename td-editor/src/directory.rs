@@ -92,6 +92,13 @@ impl Snapshot {
         crate::files::DeletePlan::new(sources).map_err(|e| e.to_string())
     }
 
+    pub(crate) fn copy_source(&self, row: usize) -> Option<crate::files::RenameSource> {
+        if self.entries.get(row)?.kind != '-' {
+            return None;
+        }
+        self.rename_source(row)
+    }
+
     pub(crate) fn rename_source(&self, row: usize) -> Option<crate::files::RenameSource> {
         let entry = self.entries.get(row)?;
         Some(crate::files::RenameSource::observed(

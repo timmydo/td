@@ -59,6 +59,102 @@ fn wait_directory_rows(
 
 #[test]
 #[ignore = "ready supplies the disposable native compositor"]
+fn native_directory_file_copy_menu_keys_and_literal_remote_completion() {
+    use std::os::unix::ffi::OsStringExt;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    for profile in ["windows", "emacs"] {
+        let compositor_directory = Directory::new();
+        let directory = Directory::new();
+        let mut compositor = Compositor::start(&compositor_directory);
+        let root = directory.0.join("browse");
+        std::fs::create_dir(&root).unwrap();
+        let source = root.join("a-source");
+        std::fs::write(&source, b"disk\0\xff").unwrap();
+        std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o6751)).unwrap();
+        let expected = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o751)
+            .open(directory.0.join("expected-mode"))
+            .unwrap()
+            .metadata()
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        let document = directory.0.join("document");
+        let dictionary = directory.0.join("dictionary");
+        std::fs::write(&document, b"document").unwrap();
+        std::fs::write(&dictionary, b"document\n").unwrap();
+        let mut editor = EditorProcess::start_with_profile(
+            &directory,
+            &compositor.directory.join("wayland-0"),
+            &document,
+            &dictionary,
+            profile,
+        );
+        editor.wait_keyboard(profile);
+        let window = compositor.window();
+        assert_eq!(compositor.request("fullscreen", 1024), b"ok\n");
+        editor.wait_field("state", "window", "800,576,1");
+        editor.job(&format!(
+            "open\t{}",
+            td_editor::control::hex(root.as_os_str().as_encoded_bytes())
+        ));
+        compositor.click(270, 32);
+        editor.wait_field("state", "modal", "0,0,0,0,1,0,0,0,0");
+        compositor.click(270, 300); // Directory > Copy File.
+        editor.wait_field("prompt-state", "prompt", "path-copy");
+        let state = editor.ok("state");
+        let id = field(&state, "dialog").unwrap().split(',').next().unwrap();
+        editor.ok(&format!("dialog-answer\t{id}\t2\t0\tcancel"));
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1);
+        compositor.chord(Some(KEY_LEFT_SHIFT), KEY_C); // C
+        editor.wait_field("prompt-state", "prompt", "path-copy");
+        let state = editor.ok("state");
+        let next = field(&state, "dialog").unwrap().split(',').next().unwrap();
+        assert_ne!(id, next);
+        assert!(editor
+            .request(&format!("dialog-answer\t{id}\t2\t0\tpath\t6e2dff"))
+            .unwrap()
+            .starts_with("error\tinvalid-argument"));
+        let before = compositor.observe(&window);
+        assert!(editor
+            .job(&format!("dialog-answer\t{next}\t2\t0\tpath\t6e2dff"))
+            .contains(",copy,2,0,0,complete,-"));
+        let path = root.join(std::ffi::OsString::from_vec(b"n-\xff".to_vec()));
+        let meta = std::fs::symlink_metadata(&path).unwrap();
+        assert!(meta.is_file());
+        assert_eq!(std::fs::read(&path).unwrap(), b"disk\0\xff");
+        assert_eq!(std::fs::read(&source).unwrap(), b"disk\0\xff");
+        assert_eq!(meta.permissions().mode() & 0o7777, expected);
+        let listing = wait_directory_rows(&mut editor, 2, 1, &["a-source", "n-\\xff"]);
+        compositor.rendered_tab_text(&mut editor, &window, (2, 1), before, &listing[..10], 0);
+        let state = editor.ok("state");
+        editor.ok(&format!(
+            "key\t2\t1\t{}\t43",
+            field(&state, "input-generation").unwrap()
+        ));
+        editor.wait_field("prompt-state", "prompt", "path-copy");
+        let state = editor.ok("state");
+        let id = field(&state, "dialog").unwrap().split(',').next().unwrap();
+        let response = editor
+            .request(&format!("dialog-answer\t{id}\t2\t1\tpath\t6e2dff"))
+            .unwrap();
+        let job = response.strip_prefix("pending\t").unwrap();
+        assert_eq!(
+            editor.wait_job_outcome(job, ",error,unavailable"),
+            format!("job={job},copy,2,1,0,error,unavailable")
+        );
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 2);
+        assert_eq!(std::fs::read(document).unwrap(), b"document");
+        editor.quit();
+        compositor.stop();
+    }
+}
+
+#[test]
+#[ignore = "ready supplies the disposable native compositor"]
 fn native_directory_mkdir_menu_keys_and_literal_remote_completion() {
     use std::os::unix::ffi::OsStringExt;
     use std::os::unix::fs::PermissionsExt;

@@ -66,6 +66,7 @@ impl Group {
                 UnmarkDelete,
                 DeleteMarked,
                 NewDirectory,
+                CopyFile,
             ],
         }
     }
@@ -85,6 +86,7 @@ pub(crate) enum Item {
     UnmarkDelete,
     DeleteMarked,
     NewDirectory,
+    CopyFile,
     SortName,
     SortSize,
     SortModified,
@@ -136,6 +138,7 @@ impl Item {
             Self::UnmarkDelete => "Unmark Deletion",
             Self::DeleteMarked => "Delete Marked Entries...",
             Self::NewDirectory => "New Directory...",
+            Self::CopyFile => "Copy File...",
             Self::SortName => "Sort by Name",
             Self::SortSize => "Sort by Size",
             Self::SortModified => "Sort by Modified",
@@ -170,6 +173,7 @@ impl Item {
             (Self::UnmarkDelete, _) => "u",
             (Self::DeleteMarked, _) => "x",
             (Self::NewDirectory, _) => "+",
+            (Self::CopyFile, _) => "C",
             (Self::SortReverse, _) => "S",
             (Self::Command, Profile::Emacs) => "M-x",
             (Self::New, Profile::Windows) => "Ctrl+N",
@@ -254,6 +258,7 @@ impl Menu {
             Item::MarkDelete | Item::UnmarkDelete => self.directory_entry && self.file_window,
             Item::DeleteMarked => self.directory && self.file_window,
             Item::NewDirectory => self.directory && self.file_window,
+            Item::CopyFile => self.directory_entry && self.file_window,
             Item::SortName | Item::SortSize | Item::SortModified | Item::SortReverse => {
                 self.directory
             }

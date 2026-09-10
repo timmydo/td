@@ -2203,7 +2203,12 @@ ABI. The core, layout, renderer and controller still have no raw boundary.
 
 `flistxattr` is the file adapter's attribute query. `files.rs` alone calls
 `has_attributes` with a borrowed, opened regular file: the destination before
-replacement and the prepared/published temporary inode. The wrapper fixes
+replacement and the prepared/published temporary inode. Copy also queries
+its already-opened parent directory before and after its permission probe.
+A minimal default ACL can override umask and collapse into ordinary mode
+bits on the child, so inspecting only that child cannot exclude inheritance.
+Confinement pins both parent inspections and the shared query helper.
+The wrapper fixes
 both list pointer and size to zero, returns whether the kernel reports any
 listable names, and propagates every query error. No name, value, allocation,
 attribute mutation, descriptor adoption or caller-selected pointer crosses

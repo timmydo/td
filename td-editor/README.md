@@ -28,6 +28,9 @@ Directories also open through File > Open or a command-line path, for example
   without overwriting existing names; open tabs follow without losing edits.
 - `+` or Directory > New Directory creates a private directory with one
   literal new basename. Existing names are refused; Escape cancels.
+- `C` or Directory > Copy File copies on-disk bytes to a new basename,
+  preserving ordinary permissions with umask applied. It strips special
+  permission bits, never overwrites, and does not save unsaved edits.
 - `d` marks for deletion, `u` unmarks, and `x` reviews the marked entries.
   PageUp/PageDown shows full paths; type `DELETE` and Return to confirm.
   Deletion is permanent (no trash or Undo), never recursive, and refuses
@@ -303,6 +306,16 @@ worker and remote prompt authority as rename, with `path-mkdir` scope and
 a `mkdir` job. A confirmation warning does not undo creation: inspect disk
 state before retrying. Successful listing refresh selects the new entry in
 the originating tab without stealing focus from another tab.
+
+Copy File (`C`) copies one regular file within its directory, at most 16 MiB,
+including binary bytes. Links/directories and existing destinations refuse.
+It preserves rwx bits with umask applied, strips set-ID/sticky bits, and does
+not copy ownership, timestamps or xattrs. New-file owner/group rules apply.
+The destination must fit the same attribute-free profile as new saves;
+parent attributes and inherited ACLs/labels refuse rather than being
+silently lost or overriding umask. Remote
+`path-copy` answers supply raw basenames and report a `copy` job. Inspect any
+publication or refresh warning before retrying.
 
 Deletion marks belong to each directory view. Sorting keeps them; refresh,
 navigation and completed filesystem rescans clear them. At most 64 entries

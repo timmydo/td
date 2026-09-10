@@ -205,6 +205,14 @@ pub struct RenameSource {
 }
 
 impl RenameSource {
+    pub(crate) fn copy_destination(&self, name: &std::ffi::OsStr) -> Result<PathBuf> {
+        let parent = self
+            .path
+            .parent()
+            .ok_or_else(|| Failure::new(Kind::InvalidPath, "copy source has no parent"))?;
+        DirectorySource::observed(parent.to_path_buf(), self.parent_identity).destination(name)
+    }
+
     pub fn inspect(path: &Path) -> Result<Self> {
         let location = Location::resolve(path)?;
         let stamp = Stamp::read(&fs::symlink_metadata(&location.path)?);
@@ -301,6 +309,12 @@ impl DirectorySource {
 
 /// Kernel creation succeeded; warnings never trigger cleanup or retry.
 pub struct CreatedDirectory {
+    pub path: PathBuf,
+    pub warning: Option<String>,
+}
+
+/// Kernel publication succeeded. No association or saved baseline changes.
+pub struct Copied {
     pub path: PathBuf,
     pub warning: Option<String>,
 }
@@ -571,6 +585,121 @@ impl Session {
             }
         }
         Ok(result)
+    }
+
+    /// Copy on-disk regular-file bytes to a new sibling name, without
+    /// overwriting or saving any open buffer. Ordinary mode honors umask.
+    pub fn copy(&mut self, source: RenameSource, name: &std::ffi::OsStr) -> Result<Copied> {
+        self.copy_with(source, name, |_| Ok(()))
+    }
+
+    fn copy_with(
+        &mut self,
+        source: RenameSource,
+        name: &std::ffi::OsStr,
+        mut step: impl FnMut(Stage) -> io::Result<()>,
+    ) -> Result<Copied> {
+        let path = source.copy_destination(name)?;
+        let origin = Location::resolve(&source.path)?;
+        let (node, _) = open_regular(&origin.path)?
+            .ok_or_else(|| Failure::new(Kind::Conflict, "copy source disappeared"))?;
+        source.check(&origin, &node)?;
+        let destination = Location::resolve(&path)?;
+        if destination.path != path || destination.parent_identity != source.parent_identity {
+            return Err(Failure::new(
+                Kind::Conflict,
+                "copy parent changed; refresh and retry",
+            ));
+        }
+        if self
+            .entries
+            .values()
+            .any(|entry| entry.location.path == path)
+        {
+            return Err(Failure::new(
+                Kind::Exists,
+                "copy destination belongs to an open association",
+            ));
+        }
+        verify_destination(&destination, None, &[])?;
+        let bytes = read_stable(&node, &source.stamp)?;
+        source.check(&origin, &node)?;
+        step(Stage::Metadata)?;
+        let mode = copy_mode(&destination, source.stamp.mode & 0o777)?;
+        let mut temporary = Temporary::create(&destination)?;
+        let mut published = false;
+        let mut attempted = false;
+        let result = (|| -> Result<()> {
+            require_no_attributes(&temporary.file)?;
+            step(Stage::Write)?;
+            temporary.file.write_all(&bytes)?;
+            temporary
+                .file
+                .set_permissions(Permissions::from_mode(mode))?;
+            let prepared = Stamp::read(&temporary.file.metadata()?);
+            if prepared.mode & 0o7777 != mode {
+                return Err(Failure::new(
+                    Kind::Metadata,
+                    "copy permissions did not match",
+                ));
+            }
+            require_no_attributes(&temporary.file)?;
+            step(Stage::SyncFile)?;
+            temporary.file.sync_all()?;
+            step(Stage::Recheck)?;
+            compare_stable(&node, &source.stamp, &bytes)?;
+            source.check(&origin, &node)?;
+            verify_destination(&destination, None, &[])?;
+            check_temporary(&temporary)?;
+            step(Stage::Publish)?;
+            attempted = true;
+            fs::hard_link(&temporary.path, &destination.path).map_err(|error| {
+                if error.kind() == io::ErrorKind::AlreadyExists {
+                    Failure::new(Kind::Exists, "copy destination was created concurrently")
+                } else {
+                    Failure::from(error)
+                }
+            })?;
+            published = true;
+            step(Stage::Unlink)?;
+            temporary.cleanup()?;
+            step(Stage::SyncParent)?;
+            destination.parent.sync_all()?;
+            step(Stage::Readback)?;
+            let stamp = Stamp::read(&temporary.file.metadata()?);
+            stamp.replaceable()?;
+            if stamp.uid != prepared.uid || stamp.gid != prepared.gid || stamp.mode != prepared.mode
+            {
+                return Err(Failure::new(
+                    Kind::Conflict,
+                    "published copy metadata changed",
+                ));
+            }
+            require_no_attributes(&temporary.file)?;
+            compare_stable(&temporary.file, &stamp, &bytes)?;
+            check_name(&destination, &stamp)?;
+            Ok(())
+        })();
+        let mut failure = result.err();
+        if let Err(cleanup) = temporary.cleanup() {
+            let error =
+                failure.get_or_insert_with(|| Failure::new(Kind::Io, "copy cleanup failed"));
+            error
+                .detail
+                .push_str(&format!("; temporary cleanup failed: {cleanup}"));
+            error.residual = Some(temporary.path.clone());
+        }
+        if published {
+            return Ok(Copied {
+                path,
+                warning: failure
+                    .map(|error| format!("Copy published; confirmation failed: {error}")),
+            });
+        }
+        let mut failure =
+            failure.unwrap_or_else(|| Failure::new(Kind::Io, "copy was not published"));
+        failure.publication_attempted = attempted;
+        Err(failure)
     }
 
     /// Create one private directory under the captured parent, without
@@ -1228,7 +1357,7 @@ fn require_no_attributes(file: &File) -> Result<()> {
         Ok(false) => Ok(()),
         Ok(true) => Err(Failure::new(
             Kind::Metadata,
-            "extended attributes are not replaceable; use Save As",
+            "extended attributes are unsupported for this write",
         )),
         Err(e) => Err(Failure::new(
             Kind::Metadata,
@@ -1260,7 +1389,7 @@ fn verify_destination(
             Ok(_) => {
                 return Err(Failure::new(
                     Kind::Exists,
-                    "Save As/new-file save never overwrites an existing path",
+                    "creating a new file never overwrites an existing path",
                 ));
             }
         }
@@ -1287,6 +1416,10 @@ struct Temporary {
 }
 impl Temporary {
     fn create(location: &Location) -> Result<Self> {
+        Self::create_with_mode(location, 0o600)
+    }
+
+    fn create_with_mode(location: &Location, mode: u32) -> Result<Self> {
         let parent = location
             .path
             .parent()
@@ -1303,7 +1436,7 @@ impl Temporary {
                 .read(true)
                 .write(true)
                 .create_new(true)
-                .mode(0o600)
+                .mode(mode)
                 .open(&path)
             {
                 Ok(file) => {
@@ -1346,6 +1479,41 @@ impl Temporary {
     }
 }
 
+// An empty, never-written probe lets the kernel apply umask. Payload bytes
+// are staged in a different private inode, never in a broadly readable probe.
+fn copy_mode(location: &Location, requested: u32) -> Result<u32> {
+    copy_mode_with(location, requested, require_no_attributes)
+}
+
+fn copy_mode_with(
+    location: &Location,
+    requested: u32,
+    mut inspect: impl FnMut(&File) -> Result<()>,
+) -> Result<u32> {
+    location.check_parent()?;
+    // A minimal default ACL can override umask without leaving an access ACL
+    // on the child. Inspect the parent, not only the resulting probe inode.
+    inspect(&location.parent)?;
+    let mut probe = Temporary::create_with_mode(location, requested)?;
+    let result = (|| -> Result<u32> {
+        check_temporary(&probe)?;
+        inspect(&probe.file)?;
+        Ok(probe.file.metadata()?.mode() & 0o777)
+    })();
+    if let Err(cleanup) = probe.cleanup() {
+        let mut failure = Failure::new(
+            Kind::Io,
+            format!("empty permission probe cleanup failed: {cleanup}"),
+        );
+        failure.residual = Some(probe.path.clone());
+        return Err(failure);
+    }
+    let mode = result?;
+    location.check_parent()?;
+    inspect(&location.parent)?;
+    Ok(mode)
+}
+
 fn check_temporary(temporary: &Temporary) -> Result<()> {
     let meta = temporary.file.metadata()?;
     let named = fs::symlink_metadata(&temporary.path)?;
@@ -1371,6 +1539,309 @@ mod tests {
     use crate::model::{Command, Editor};
     use std::os::unix::ffi::OsStringExt;
     use std::os::unix::fs::symlink;
+
+    #[test]
+    fn file_copy_permission_probe_refuses_parent_attributes_and_query_errors() {
+        for failure_at in 1..=3 {
+            let dir = Directory::new();
+            let destination = Location::resolve(&dir.path("copy")).unwrap();
+            let mut inspections = 0;
+            let error = copy_mode_with(&destination, 0o644, |file| {
+                inspections += 1;
+                assert_eq!(file.metadata().unwrap().is_dir(), inspections != 2);
+                if inspections == failure_at {
+                    return Err(Failure::new(Kind::Metadata, "attribute query refused"));
+                }
+                require_no_attributes(file)
+            })
+            .unwrap_err();
+            assert_eq!(error.kind, Kind::Metadata);
+            assert!(!error.publication_attempted);
+            assert!(!dir.path("copy").exists());
+            dir.no_temporaries();
+        }
+    }
+
+    #[test]
+    fn file_copy_preserves_read_only_permissions() {
+        let dir = Directory::new();
+        let source = dir.write("source", b"read only");
+        fs::set_permissions(&source, Permissions::from_mode(0o444)).unwrap();
+        let result = Session::default()
+            .copy(RenameSource::inspect(&source).unwrap(), "copy".as_ref())
+            .unwrap();
+        assert!(result.warning.is_none());
+        assert_eq!(fs::read(&result.path).unwrap(), b"read only");
+        assert_eq!(fs::metadata(&result.path).unwrap().mode() & 0o333, 0);
+        assert_eq!(fs::metadata(&source).unwrap().mode() & 0o7777, 0o444);
+        dir.no_temporaries();
+    }
+
+    #[test]
+    fn file_copy_preserves_disk_bytes_ordinary_mode_and_kernel_umask() {
+        let dir = Directory::new();
+        let old = dir.write("source", b"#!/bin/example\nraw\0\xff\r\n");
+        fs::set_permissions(&old, Permissions::from_mode(0o6751)).unwrap();
+        let expected = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o751)
+            .open(dir.path("expected-mode"))
+            .unwrap()
+            .metadata()
+            .unwrap()
+            .mode()
+            & 0o777;
+        let before = Stamp::read(&fs::metadata(&old).unwrap());
+        let mut files = Session::default();
+        let raw = std::ffi::OsString::from_vec(b"copy-\xff".to_vec());
+        let copied = files
+            .copy_with(RenameSource::inspect(&old).unwrap(), &raw, |stage| {
+                if stage == Stage::Write {
+                    let temporaries: Vec<_> = fs::read_dir(&dir.0)?
+                        .map(|entry| entry.unwrap())
+                        .filter(|entry| entry.file_name().as_bytes().starts_with(b".td-editor-"))
+                        .collect();
+                    assert_eq!(
+                        temporaries.len(),
+                        1,
+                        "empty mode probe must already be removed"
+                    );
+                    let meta = temporaries[0].metadata()?;
+                    assert_eq!(meta.len(), 0);
+                    assert_eq!(
+                        meta.mode() & 0o077,
+                        0,
+                        "payload must be private while writing"
+                    );
+                }
+                Ok(())
+            })
+            .unwrap();
+        assert!(copied.warning.is_none());
+        assert_eq!(copied.path, dir.0.join(&raw));
+        assert_eq!(fs::read(&copied.path).unwrap(), fs::read(&old).unwrap());
+        let meta = fs::metadata(&copied.path).unwrap();
+        assert_eq!(meta.mode() & 0o7777, expected);
+        assert_eq!(meta.nlink(), 1);
+        assert_ne!(meta.ino(), before.ino);
+        assert_eq!(Stamp::read(&fs::metadata(&old).unwrap()), before);
+        assert_eq!(files.baseline_bytes(), 0);
+        assert!(files.entries.is_empty());
+        dir.no_temporaries();
+        let text = dir.write("text", b"disk");
+        let id = files.open(&text).unwrap();
+        files
+            .copy(RenameSource::inspect(&text).unwrap(), "text-copy".as_ref())
+            .unwrap();
+        assert_eq!(files.path(id).unwrap(), text);
+        assert_eq!(files.bytes(id).unwrap(), b"disk");
+        files.save(id, b"new".to_vec()).unwrap();
+        assert_eq!(fs::read(dir.path("text-copy")).unwrap(), b"disk");
+        assert_eq!(fs::read(text).unwrap(), b"new");
+    }
+
+    #[test]
+    fn file_copy_accepts_empty_and_exact_byte_limit_without_text_decoding() {
+        let dir = Directory::new();
+        let mut files = Session::default();
+        for size in [0, text::MAX_FILE_BYTES as u64] {
+            let old = dir.path("source");
+            File::create(&old).unwrap().set_len(size).unwrap();
+            let name = format!("copy-{size}");
+            let copied = files
+                .copy(RenameSource::inspect(&old).unwrap(), name.as_ref())
+                .unwrap();
+            assert!(copied.warning.is_none());
+            assert_eq!(fs::metadata(copied.path).unwrap().len(), size);
+            assert_eq!(files.baseline_bytes(), 0);
+            dir.no_temporaries();
+        }
+    }
+
+    #[test]
+    fn file_copy_refuses_replaced_parents_before_any_temporary_creation() {
+        let dir = Directory::new();
+        let parent = dir.path("parent");
+        fs::create_dir(&parent).unwrap();
+        let old = parent.join("source");
+        fs::write(&old, b"disk").unwrap();
+        let source = RenameSource::inspect(&old).unwrap();
+        let result = Session::default().copy_with(source, "copy".as_ref(), |stage| {
+            if stage == Stage::Metadata {
+                fs::rename(&parent, dir.path("moved"))?;
+                fs::create_dir(&parent)?;
+            }
+            Ok(())
+        });
+        assert_eq!(result.err().unwrap().kind, Kind::Conflict);
+        assert_eq!(fs::read(dir.path("moved/source")).unwrap(), b"disk");
+        assert_eq!(fs::read_dir(&parent).unwrap().count(), 0);
+        dir.no_temporaries();
+    }
+
+    #[test]
+    fn file_copy_refuses_existing_reserved_nonregular_stale_and_large_sources() {
+        let dir = Directory::new();
+        let old = dir.write("source", b"disk");
+        let mut files = Session::default();
+        fs::create_dir(dir.path("tree")).unwrap();
+        symlink(&old, dir.path("link")).unwrap();
+        symlink(dir.path("absent"), dir.path("broken")).unwrap();
+        for name in ["source", "tree", "link", "broken"] {
+            assert!(files
+                .copy(RenameSource::inspect(&old).unwrap(), name.as_ref())
+                .is_err());
+        }
+        files.open(&dir.path("reserved")).unwrap();
+        assert_eq!(
+            files
+                .copy(RenameSource::inspect(&old).unwrap(), "reserved".as_ref())
+                .err()
+                .unwrap()
+                .kind,
+            Kind::Exists
+        );
+        for name in ["", ".", "..", "a/b", "/absolute", "nul\0name"] {
+            let error = files
+                .copy(RenameSource::inspect(&old).unwrap(), name.as_ref())
+                .err()
+                .unwrap();
+            assert_eq!(error.kind, Kind::InvalidPath);
+            assert!(!error.publication_attempted);
+        }
+        for name in ["tree", "link", "broken"] {
+            let error = files
+                .copy(
+                    RenameSource::inspect(&dir.path(name)).unwrap(),
+                    "out".as_ref(),
+                )
+                .err()
+                .unwrap();
+            assert_eq!(error.kind, Kind::NotRegular);
+        }
+        let stale = RenameSource::inspect(&old).unwrap();
+        fs::write(&old, b"different").unwrap();
+        assert_eq!(
+            files.copy(stale, "out".as_ref()).err().unwrap().kind,
+            Kind::Conflict
+        );
+        let large = File::create(dir.path("large")).unwrap();
+        large.set_len(text::MAX_FILE_BYTES as u64 + 1).unwrap();
+        assert_eq!(
+            files
+                .copy(
+                    RenameSource::inspect(&dir.path("large")).unwrap(),
+                    "out".as_ref()
+                )
+                .err()
+                .unwrap()
+                .kind,
+            Kind::Limit
+        );
+        assert!(!dir.path("out").exists());
+        assert!(!dir.path("reserved").exists());
+        dir.no_temporaries();
+    }
+
+    #[test]
+    fn file_copy_refuses_source_changes_and_concurrent_destination_creation() {
+        let dir = Directory::new();
+        let old = dir.write("source", b"disk");
+        let mut files = Session::default();
+        let error = files
+            .copy_with(
+                RenameSource::inspect(&old).unwrap(),
+                "out".as_ref(),
+                |stage| {
+                    if stage == Stage::Recheck {
+                        fs::write(&old, b"changed")?;
+                    }
+                    Ok(())
+                },
+            )
+            .err()
+            .unwrap();
+        assert_eq!(error.kind, Kind::Conflict);
+        assert!(!error.publication_attempted);
+        assert!(!dir.path("out").exists());
+        dir.no_temporaries();
+        let error = files
+            .copy_with(
+                RenameSource::inspect(&old).unwrap(),
+                "out".as_ref(),
+                |stage| {
+                    if stage == Stage::Publish {
+                        fs::write(dir.path("out"), b"winner")?;
+                    }
+                    Ok(())
+                },
+            )
+            .err()
+            .unwrap();
+        assert_eq!(error.kind, Kind::Exists);
+        assert!(error.publication_attempted);
+        assert_eq!(fs::read(dir.path("out")).unwrap(), b"winner");
+        dir.no_temporaries();
+    }
+
+    #[test]
+    fn file_copy_failures_keep_the_source_and_never_rollback_publication() {
+        for stage in [
+            Stage::Metadata,
+            Stage::Write,
+            Stage::SyncFile,
+            Stage::Recheck,
+            Stage::Publish,
+            Stage::Unlink,
+            Stage::SyncParent,
+            Stage::Readback,
+        ] {
+            let dir = Directory::new();
+            let old = dir.write("source", b"disk");
+            let mut files = Session::default();
+            let result =
+                files.copy_with(RenameSource::inspect(&old).unwrap(), "out".as_ref(), |at| {
+                    if at == stage {
+                        return Err(io::Error::other("injected copy failure"));
+                    }
+                    Ok(())
+                });
+            if matches!(stage, Stage::Unlink | Stage::SyncParent | Stage::Readback) {
+                assert!(result
+                    .unwrap()
+                    .warning
+                    .unwrap()
+                    .contains("injected copy failure"));
+                assert_eq!(fs::read(dir.path("out")).unwrap(), b"disk");
+            } else {
+                assert!(result.is_err());
+                assert!(!dir.path("out").exists());
+            }
+            assert_eq!(fs::read(old).unwrap(), b"disk");
+            dir.no_temporaries();
+        }
+        let dir = Directory::new();
+        let old = dir.write("source", b"disk");
+        let copied = Session::default()
+            .copy_with(
+                RenameSource::inspect(&old).unwrap(),
+                "out".as_ref(),
+                |stage| {
+                    if stage == Stage::Readback {
+                        fs::rename(dir.path("out"), dir.path("moved"))?;
+                        fs::write(dir.path("out"), b"winner")?;
+                    }
+                    Ok(())
+                },
+            )
+            .unwrap();
+        assert!(copied.warning.is_some());
+        assert_eq!(fs::read(dir.path("out")).unwrap(), b"winner");
+        assert_eq!(fs::read(dir.path("moved")).unwrap(), b"disk");
+        assert_eq!(fs::read(old).unwrap(), b"disk");
+        dir.no_temporaries();
+    }
 
     #[test]
     fn mkdir_is_private_literal_nonrecursive_and_never_overwrites() {

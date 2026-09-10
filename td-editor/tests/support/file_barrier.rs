@@ -59,6 +59,7 @@ impl Barrier {
                         | "rename"
                         | "delete"
                         | "mkdir"
+                        | "copy"
                         | "queued-save"
                 ));
                 assert_eq!(fields.next(), None);
@@ -114,6 +115,98 @@ impl Drop for Barrier {
             let _ = thread.join();
         }
     }
+}
+
+#[test]
+#[ignore = "ready builds the isolated test-file-barrier editor"]
+fn admitted_file_copy_preserves_dirty_source_and_incidental_directory_views() {
+    let compositor_directory = Directory::new();
+    let directory = Directory::new();
+    let mut compositor = Compositor::start(&compositor_directory);
+    let mut barrier = Barrier::start(&directory);
+    let root = directory.0.join("browse");
+    std::fs::create_dir(&root).unwrap();
+    let created = root.join("new");
+    let file = root.join("keep");
+    std::fs::write(&file, b"disk").unwrap();
+    let dictionary = directory.0.join("dictionary");
+    std::fs::write(&dictionary, b"disk\n").unwrap();
+    let mut editor = EditorProcess::start_with_barrier(
+        &directory,
+        &compositor.directory.join("wayland-0"),
+        &file,
+        &dictionary,
+        "emacs",
+        Some(&barrier.path),
+    );
+    editor.wait_keyboard("emacs");
+    let window = compositor.window();
+    assert_eq!(compositor.request("fullscreen", 1024), b"ok\n");
+    editor.wait_field("state", "window", "800,576,1");
+    editor.ok("insert\t1\t0\t0\t0\t61");
+    for _ in 0..2 {
+        editor.job(&format!(
+            "open\t{}",
+            td_editor::control::hex(root.as_os_str().as_encoded_bytes())
+        ));
+    }
+    editor.ok("select-tab\t2\t0");
+    compositor.chord(Some(KEY_LEFT_SHIFT), KEY_C); // C
+    editor.wait_field("prompt-state", "prompt", "path-copy");
+    let state = editor.ok("state");
+    let dialog = field(&state, "dialog").unwrap().split(',').next().unwrap();
+    barrier.arm("copy");
+    let started = Instant::now();
+    let response = editor
+        .request(&format!("dialog-answer\t{dialog}\t2\t0\tpath\t6e6577"))
+        .unwrap();
+    let job = response.strip_prefix("pending\t").unwrap();
+    let held = barrier.held();
+    assert!(editor
+        .ok("state")
+        .contains(&format!("job={job},copy,2,0,0,pending,-")));
+    editor.ok("select-tab\t1\t1");
+    editor.ok("insert\t1\t1\t1\t1\t62");
+    compositor.chord(Some(KEY_LEFT_CTRL), KEY_SPACE);
+    compositor.chord(Some(KEY_LEFT_CTRL), 45);
+    editor.wait_field("state", "prefix", "1");
+    let state = editor.ok("state");
+    let view = field(&state, "view").unwrap().to_owned();
+    assert!(!created.exists());
+    assert!(started.elapsed() < Duration::from_secs(4));
+    let before = compositor.observe(&window);
+    barrier.release(held);
+    assert_eq!(
+        editor.wait_job(job),
+        format!("job={job},copy,2,0,0,complete,-")
+    );
+    editor.wait_field("state", "active", "1");
+    editor.wait_field("state", "prefix", "1");
+    editor.wait_field("state", "view", &view);
+    wait_directory_rows(&mut editor, 2, 1, &["keep", "new"]);
+    wait_directory_rows(&mut editor, 3, 1, &["keep", "new"]);
+    compositor.rendered_tab_text_at(&mut editor, &window, (1, 2, 32), before, "abdisk", 2);
+    assert!(created.is_file());
+    assert_eq!(std::fs::read(&created).unwrap(), b"disk");
+    assert_eq!(std::fs::read(&file).unwrap(), b"disk");
+    compositor.chord(Some(KEY_LEFT_CTRL), KEY_G);
+    editor.job("save\t1\t2");
+    assert_eq!(std::fs::read(&file).unwrap(), b"abdisk");
+    assert_eq!(std::fs::read(&created).unwrap(), b"disk");
+    for (tab, path) in [(2, &created), (3, &file)] {
+        editor.ok(&format!("select-tab\t{tab}\t1"));
+        editor.wait_field(
+            "state",
+            "directory-entry",
+            &format!(
+                "{tab},{}",
+                td_editor::control::hex(path.as_os_str().as_encoded_bytes())
+            ),
+        );
+    }
+    editor.quit();
+    barrier.finish();
+    compositor.stop();
 }
 
 #[test]

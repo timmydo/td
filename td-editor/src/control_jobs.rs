@@ -33,6 +33,7 @@ enum Kind {
     Rename,
     Delete,
     Mkdir,
+    Copy,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -79,6 +80,26 @@ impl Jobs {
 
     pub(crate) fn begin_rename(&mut self, tab: TabId, revision: u64) -> Result<u64> {
         self.reserve(Kind::Rename, tab, revision)
+    }
+
+    pub(crate) fn begin_copy(&mut self, tab: TabId, revision: u64) -> Result<u64> {
+        self.reserve(Kind::Copy, tab, revision)
+    }
+
+    pub(crate) fn copied(&mut self, id: u64, result: Result<()>) -> Result<()> {
+        let record = self
+            .records
+            .iter_mut()
+            .find(|record| record.id == id)
+            .ok_or(Error::InvalidArgument)?;
+        if record.kind != Kind::Copy || record.status != Status::Pending {
+            return Err(Error::InvalidArgument);
+        }
+        record.status = match result {
+            Ok(()) => Status::Complete,
+            Err(error) => Status::Failed(error),
+        };
+        Ok(())
     }
 
     pub(crate) fn begin_mkdir(&mut self, tab: TabId, revision: u64) -> Result<u64> {
@@ -307,6 +328,7 @@ impl Jobs {
                     Kind::Rename => "rename",
                     Kind::Delete => "delete",
                     Kind::Mkdir => "mkdir",
+                    Kind::Copy => "copy",
                 },
                 record.tab,
                 record.revision,

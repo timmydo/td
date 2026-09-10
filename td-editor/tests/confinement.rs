@@ -274,6 +274,9 @@ fn complete_raw_layer_and_production_callers_are_pinned() {
     );
     let files = include_str!("../src/files.rs");
     assert_eq!(files.matches("crate::sys::has_attributes(file)").count(), 1);
+    assert!(files.contains("copy_mode_with(location, requested, require_no_attributes)"));
+    assert_eq!(files.matches("inspect(&location.parent)?;").count(), 2);
+    assert!(files.contains("inspect(&probe.file)?;"));
     assert_eq!(files.matches("crate::sys::").count(), 2);
     assert_eq!(
         files
