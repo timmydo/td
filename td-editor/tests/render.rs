@@ -48,6 +48,50 @@ fn inside(rect: Rect, x: usize, y: usize) -> bool {
 }
 
 #[test]
+#[allow(clippy::unwrap_used, reason = "bounded scrollbar fixtures")]
+fn scrollbar_geometry_and_pixels_are_bounded_at_every_scale() {
+    for scale in 1..=4 {
+        let s = usize::from(scale);
+        let geometry = geometry(400 * s, 240 * s, scale);
+        let rows = geometry.grid().1;
+        for total in [0, 1, rows, rows + 1, 1000, usize::MAX] {
+            for origin in [0, 1, usize::MAX] {
+                let bar = geometry.scrollbar(total, origin).unwrap();
+                assert_eq!(bar.track.intersection(geometry.bounds()), Some(bar.track));
+                assert_eq!(bar.thumb.intersection(bar.track), Some(bar.thumb));
+                assert_eq!(bar.track.intersection(geometry.document()), None);
+                assert_eq!(bar.enabled(), total > rows);
+                if origin == usize::MAX {
+                    assert_eq!(
+                        bar.thumb.y + i64::from(bar.thumb.height),
+                        bar.track.y + i64::from(bar.track.height)
+                    );
+                }
+            }
+        }
+        let doc = editor(&"row\n".repeat(99), Selection::default());
+        let pixels = pixels(&doc, geometry, View::default());
+        let bar = geometry.scrollbar(100, 0).unwrap();
+        assert_eq!(
+            color(&pixels, 400 * s, bar.thumb.x as usize, bar.thumb.y as usize),
+            render::LINE_NUMBER | 0xff000000
+        );
+        assert_eq!(
+            color(
+                &pixels,
+                400 * s,
+                bar.track.x as usize,
+                (bar.track.y + i64::from(bar.track.height) - 1) as usize
+            ),
+            render::CHROME | 0xff000000
+        );
+    }
+    for width in 1..40 {
+        assert!(geometry(width, 70, 1).scrollbar(100, 0).is_none());
+    }
+}
+
+#[test]
 #[allow(clippy::unwrap_used, reason = "validated renderer fixtures")]
 fn notices_change_only_status_pixels_at_every_scale_and_restore_cleanly() {
     let font = font::pinned().unwrap();
@@ -309,7 +353,7 @@ fn status_columns_reset_after_newlines_and_expand_tabs() {
 fn newline_selection_requires_a_full_visible_cell() {
     for scale in 1..=4 {
         let s = usize::from(scale);
-        let width = 48 * s + 8 * s - 1;
+        let width = 64 * s + 8 * s - 1;
         let geometry = geometry(width, 96 * s, scale);
         for (source, left, soft_wrap) in [("abcd\n", 0, true), ("abcdefghi\n", 5, false)] {
             let editor = editor(
@@ -333,7 +377,7 @@ fn newline_selection_requires_a_full_visible_cell() {
                 },
             );
             for y in 48 * s..64 * s {
-                for x in 40 * s..width - 8 * s {
+                for x in 40 * s..width - 24 * s {
                     assert_eq!(color(&data, width, x, y), 0xff000000 | render::PAPER);
                 }
             }
@@ -350,16 +394,16 @@ fn tabs_and_logical_newlines_have_exact_selection_backgrounds() {
             caret: 4,
         },
     );
-    let geometry = geometry(96, 136, 1);
+    let geometry = geometry(112, 136, 1);
     let view = View {
         caret_visible: false,
         ..View::default()
     };
     let focused = pixels(&editor, geometry, view);
     for (x, y) in [(17, 49), (70, 49), (73, 49), (9, 65)] {
-        assert_eq!(color(&focused, 96, x, y), 0xff000000 | render::SELECTED);
+        assert_eq!(color(&focused, 112, x, y), 0xff000000 | render::SELECTED);
     }
-    assert_eq!(color(&focused, 96, 81, 49), 0xff000000 | render::PAPER);
+    assert_eq!(color(&focused, 112, 81, 49), 0xff000000 | render::PAPER);
     let inactive = pixels(
         &editor,
         geometry,
@@ -369,7 +413,7 @@ fn tabs_and_logical_newlines_have_exact_selection_backgrounds() {
         },
     );
     assert_eq!(
-        color(&inactive, 96, 17, 49),
+        color(&inactive, 112, 17, 49),
         0xff000000 | render::INACTIVE_SELECTION
     );
     let doc = editor.document(editor.active().unwrap()).unwrap();
@@ -394,7 +438,7 @@ fn wrapping_scrolling_and_partial_tabs_use_layout_cell_intervals() {
             caret: 0,
         },
     );
-    let geometry = geometry(48, 136, 1);
+    let geometry = geometry(64, 136, 1);
     let view = View {
         origin: Position {
             row: 1,
@@ -429,15 +473,15 @@ fn wrapping_scrolling_and_partial_tabs_use_layout_cell_intervals() {
         },
     );
     // The tab's left endpoint is offscreen; its remaining span is selected.
-    assert_eq!(color(&actual, 48, 8, 48), 0xff000000 | render::SELECTED);
-    assert_eq!(color(&actual, 48, 39, 48), 0xff000000 | render::SELECTED);
+    assert_eq!(color(&actual, 64, 8, 48), 0xff000000 | render::SELECTED);
+    assert_eq!(color(&actual, 64, 39, 48), 0xff000000 | render::SELECTED);
 }
 
 #[test]
 fn caret_affinity_and_oversized_tabs_stay_visible_at_each_scale() {
     for scale in 1..=4 {
         let s = usize::from(scale);
-        let geometry = geometry(32 * s, 120 * s, scale);
+        let geometry = geometry(48 * s, 120 * s, scale);
         let editor = editor(
             "abx",
             Selection {
@@ -456,7 +500,7 @@ fn caret_affinity_and_oversized_tabs_stay_visible_at_each_scale() {
             );
             for offset in 0..s {
                 assert_eq!(
-                    color(&actual, 32 * s, x * s + offset, y * s),
+                    color(&actual, 48 * s, x * s + offset, y * s),
                     0xff000000 | render::INK
                 );
             }
@@ -470,11 +514,11 @@ fn caret_affinity_and_oversized_tabs_stay_visible_at_each_scale() {
         );
         let actual = pixels(
             &editor,
-            self::geometry(24 * s, 120 * s, scale),
+            self::geometry(40 * s, 120 * s, scale),
             View::default(),
         );
         assert_eq!(
-            color(&actual, 24 * s, 15 * s, 48 * s),
+            color(&actual, 40 * s, 15 * s, 48 * s),
             0xff000000 | render::INK
         );
     }
@@ -734,8 +778,8 @@ fn the_real_binary_exposes_a_deterministic_preview_and_its_font_notices() {
         .fold(0xcbf29ce484222325u64, |hash, byte| {
             (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
         });
-    // The fifth header is Directory; document pixels are unchanged.
-    assert_eq!(hash, 0xa29d7836c9624a04, "preview checksum: {hash:016x}");
+    // The scrollbar reserves two text columns and changes the frame layout.
+    assert_eq!(hash, 0xba167a6cba06d304, "preview checksum: {hash:016x}");
     let output = std::process::Command::new(exe)
         .arg("--font-license")
         .output()

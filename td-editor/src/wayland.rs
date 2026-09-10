@@ -1242,10 +1242,13 @@ impl Window {
             && x < area.x + i64::from(area.width)
             && y >= area.y
             && y < area.y + i64::from(area.height);
-        if text && self.ui.editor().document(tab).map_err(error)?.directory() {
+        if text
+            && phase == crate::ui::PointerPhase::Press
+            && self.ui.editor().document(tab).map_err(error)?.directory()
+        {
             let (columns, rows) = geometry.grid();
             let full_row = ((y - area.y) as usize) < rows * 16 * geometry.scale().value();
-            if phase == crate::ui::PointerPhase::Press && columns != 0 && full_row {
+            if columns != 0 && full_row {
                 let row = self.ui.tab_view(tab).map_err(error)?.viewport.origin().row
                     + (y - area.y) as usize / (16 * geometry.scale().value());
                 let path = self
@@ -9100,6 +9103,75 @@ mod tests {
         );
         remote_pointer(&mut remote, "release", 8_388_607, 8_388_607, false);
         assert!(remote.control_pointer.is_none());
+    }
+
+    #[test]
+    fn scrollbar_native_and_remote_drags_preserve_text_and_directory_selection() {
+        for profile in [Profile::Windows, Profile::Emacs] {
+            for directory in [false, true] {
+                let fixture = DialogDirectory::new();
+                for row in 0..80 {
+                    std::fs::write(fixture.path(&format!("file{row:02}")), b"body").unwrap();
+                }
+                let (mut remote, _peer) = file_dialog_fixture();
+                let (mut native, _native_peer) = file_dialog_fixture();
+                for w in [&mut remote, &mut native] {
+                    configure(w, 800, 600);
+                    w.ui.dispatch(Event::Profile(profile)).unwrap();
+                    if directory {
+                        w.files
+                            .as_mut()
+                            .unwrap()
+                            .initial_open(&mut w.ui, fixture.0.clone())
+                            .unwrap();
+                    } else {
+                        w.ui.dispatch(Event::Load("row\n".repeat(80).as_bytes()))
+                            .unwrap();
+                    }
+                    let device = w.device.unwrap();
+                    w.event(message(device, 2, &[99, SURFACE])).unwrap();
+                    pointer_enter(w);
+                }
+                let tab = remote.ui.editor().active().unwrap();
+                let before = format!("{:?}", remote.ui.editor().document(tab).unwrap());
+                let state = remote.ui.tab_view(tab).unwrap();
+                let bar = remote
+                    .ui
+                    .geometry()
+                    .scrollbar(state.metrics.rows, 0)
+                    .unwrap();
+                for (phase, x, y) in [
+                    ("press", bar.thumb.x + 2, bar.thumb.y + 2),
+                    ("move", 50, 400), // Crossing directory entries must not activate one.
+                    ("release", 50, 800),
+                ] {
+                    remote_pointer(&mut remote, phase, x, y, false);
+                    pointer_move(&mut native, x, y);
+                    if phase != "move" {
+                        pointer_button(&mut native, phase == "press");
+                    }
+                    assert_eq!(
+                        remote.ui.tab_view(tab).unwrap().viewport,
+                        native.ui.tab_view(tab).unwrap().viewport
+                    );
+                    for w in [&remote, &native] {
+                        assert_eq!(w.ui.editor().active(), Some(tab));
+                        assert_eq!(
+                            format!("{:?}", w.ui.editor().document(tab).unwrap()),
+                            before
+                        );
+                        assert!(!w.files.as_ref().unwrap().busy());
+                    }
+                }
+                assert_eq!(
+                    remote.ui.tab_view(tab).unwrap().viewport.origin().row,
+                    state.metrics.rows - remote.ui.geometry().grid().1
+                );
+                assert!(remote.control_pointer.is_none() && remote.ui.pointer_drag().is_none());
+                assert_eq!((remote.pointer.x, remote.pointer.y), (0, 0));
+                assert!(!remote.pointer.held && remote.activation_serial.is_none());
+            }
+        }
     }
 
     #[test]

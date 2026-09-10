@@ -4,7 +4,7 @@
 use crate::keys::{Action, Keymap, Profile};
 use crate::layout::{Affinity, Caret, Metrics, Viewport, CELL_HEIGHT, CELL_WIDTH};
 use crate::model::{Command, Editor, Selection, TabId};
-use crate::render::{Geometry, Label, Scale, Scene, View};
+use crate::render::{Geometry, Label, Scale, Scene, Scrollbar, View};
 use crate::{Error, Result};
 use std::collections::BTreeMap;
 
@@ -113,6 +113,17 @@ pub struct TabView {
     pub revision: u64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Drag {
+    Text(TabId, usize),
+    Scrollbar {
+        tab: TabId,
+        grab: i64,
+        bar: Scrollbar,
+        origin: usize,
+    },
+}
+
 pub struct Controller {
     editor: Editor,
     keys: Keymap,
@@ -121,7 +132,7 @@ pub struct Controller {
     line_numbers: bool,
     line_count: Option<(TabId, u64, usize)>,
     mark: Option<TabId>,
-    drag: Option<(TabId, usize)>,
+    drag: Option<Drag>,
     focused: bool,
     caret_visible: bool,
     clock: u64,
@@ -177,18 +188,21 @@ impl Controller {
             caret_visible: self.caret_visible,
             ..View::default()
         };
+        let mut cached_rows = None;
         if let Some(tab) = self.editor.active() {
             let state = self.tab_view(tab)?;
             view.origin = state.viewport.origin();
             view.soft_wrap = state.soft_wrap;
             view.affinity = state.affinity;
+            cached_rows = Some(state.metrics.rows);
         }
-        Scene::new(
+        Scene::with_rows(
             &self.editor,
             self.geometry,
             view,
             labels,
             self.keys.profile(),
+            cached_rows,
         )
     }
 
@@ -265,7 +279,9 @@ impl Controller {
     }
 
     pub(crate) fn pointer_drag(&self) -> Option<TabId> {
-        self.drag.map(|(tab, _)| tab)
+        self.drag.map(|drag| match drag {
+            Drag::Text(tab, _) | Drag::Scrollbar { tab, .. } => tab,
+        })
     }
 
     fn reset_input(&mut self) {
@@ -766,6 +782,63 @@ impl Controller {
         if columns == 0 || rows == 0 {
             return Ok(Outcome::Ignored);
         }
+        let state = self.tab_view(tab)?;
+        if let Some(bar) = self
+            .geometry
+            .scrollbar(state.metrics.rows, state.viewport.origin().row)
+        {
+            if phase == PointerPhase::Press && bar.track.contains(x, y) {
+                self.reset_input();
+                if !bar.enabled() {
+                    return Ok(Outcome::Changed);
+                }
+                if bar.thumb.contains(x, y) {
+                    self.drag = Some(Drag::Scrollbar {
+                        tab,
+                        grab: y - bar.thumb.y,
+                        bar,
+                        origin: state.viewport.origin().row,
+                    });
+                } else {
+                    let delta = if y < bar.thumb.y {
+                        -(rows as isize)
+                    } else {
+                        rows as isize
+                    };
+                    self.tabs
+                        .get_mut(&tab)
+                        .ok_or(Error::MissingTab)?
+                        .viewport
+                        .scroll(delta, state.metrics.rows);
+                }
+                return Ok(Outcome::Changed);
+            }
+            if let (
+                PointerPhase::Move | PointerPhase::Release,
+                Some(Drag::Scrollbar {
+                    tab: owner,
+                    grab,
+                    bar,
+                    origin,
+                }),
+            ) = (phase, self.drag)
+            {
+                if owner != tab {
+                    return Err(Error::InvalidArgument);
+                }
+                let row = bar.row_at(y, grab, origin);
+                let delta = row as isize - state.viewport.origin().row as isize;
+                self.tabs
+                    .get_mut(&tab)
+                    .ok_or(Error::MissingTab)?
+                    .viewport
+                    .scroll(delta, state.metrics.rows);
+                if phase == PointerPhase::Release {
+                    self.drag = None;
+                }
+                return Ok(Outcome::Changed);
+            }
+        }
         let s = self.geometry.scale().value();
         let mut area = self.geometry.document();
         area.width = (columns * CELL_WIDTH * s) as u32;
@@ -800,7 +873,9 @@ impl Controller {
                 caret.byte
             }
         } else {
-            let (id, anchor) = self.drag.ok_or(Error::InvalidArgument)?;
+            let Some(Drag::Text(id, anchor)) = self.drag else {
+                return Err(Error::InvalidArgument);
+            };
             if id != tab {
                 return Err(Error::InvalidArgument);
             }
@@ -818,7 +893,7 @@ impl Controller {
         self.drag = if phase == PointerPhase::Release {
             None
         } else {
-            Some((tab, anchor))
+            Some(Drag::Text(tab, anchor))
         };
         let state = self.tabs.get_mut(&tab).ok_or(Error::MissingTab)?;
         state.affinity = caret.affinity;
@@ -885,7 +960,7 @@ mod clipboard_admission_tests {
             })
             .unwrap();
         }
-        ui.drag = Some((1, 200));
+        ui.drag = Some(Drag::Text(1, 200));
         assert!(ui.keys.pending());
         assert_eq!(ui.mark, Some(1));
         let view = ui.tab_view(1).unwrap();
@@ -901,7 +976,7 @@ mod clipboard_admission_tests {
         assert_eq!(format!("{:?}", ui.editor.document(1).unwrap()), doc);
         assert!(ui.keys.pending());
         assert_eq!(ui.mark, Some(1));
-        assert_eq!(ui.drag, Some((1, 200)));
+        assert_eq!(ui.drag, Some(Drag::Text(1, 200)));
         assert_eq!(ui.generation, generation + 1);
         assert_eq!(ui.editor.document(2).unwrap().selection().caret, 3);
         for bytes in [b"\xc3\xa9".as_slice(), b"x\r\n", b"\0"] {

@@ -1,5 +1,8 @@
 # td-editor
 
+Text and directory tabs have a vertical scrollbar: drag its thumb or click
+the track to page up/down without moving the caret or selecting a file.
+
 A Wayland-native, dependency-free Rust text editor under construction, with a simple
 tabbed interface, Windows-like and Emacs key profiles, paragraph filling,
 and on-demand whole-document spell checking. It is intended to run both on

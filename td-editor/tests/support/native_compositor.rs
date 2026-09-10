@@ -1675,7 +1675,7 @@ fn native_vertical_wheel_scrolls_without_editing() {
     ] {
         let before = compositor.observe(&window);
         compositor.pointer_frame(400, 80, 0, detents, 0);
-        editor.wait_field("state", "view", &format!("1,{row},0,98,31,1,downstream,-"));
+        editor.wait_field("state", "view", &format!("1,{row},0,96,31,1,downstream,-"));
         editor.wait_field("state", "tab", "1,0,0,384,0,0,0,72,0,lf");
         assert_eq!(
             editor.ok("text\t1\t0\t0\t384"),
@@ -1698,6 +1698,26 @@ fn native_vertical_wheel_scrolls_without_editing() {
             compositor.pointer_frame(400, 80, 0, detents, 0);
         }
     }
+    // Drag the visible scrollbar through the real pointer path; the caret
+    // remains on row zero while the frame shows the bottom of the document.
+    compositor.pointer_frame(400, 80, 0, 120, 0);
+    editor.wait_field("state", "view", "1,0,0,96,31,1,downstream,-");
+    let before = compositor.observe(&window);
+    compositor.pointer(786, 74, 1);
+    compositor.pointer(100, 575, 1);
+    compositor.pointer(100, 575, 0);
+    editor.wait_field("state", "view", "1,34,0,96,31,1,downstream,-");
+    editor.wait_field("state", "tab", "1,0,0,384,0,0,0,72,0,lf");
+    compositor.rendered_text(&mut editor, &window, 0, before, "row34", 5);
+    // Decoded control owns its own thumb gesture and can return to the top.
+    for (phase, x, y) in [("press", 786, 314), ("move", 100, 0), ("release", 100, 0)] {
+        let state = editor.ok("state");
+        let generation = field(&state, "input-generation").unwrap();
+        editor.ok(&format!(
+            "pointer\t1\t0\t{generation}\t{phase}\t{x}\t{y}\t0"
+        ));
+    }
+    editor.wait_field("state", "view", "1,0,0,96,31,1,downstream,-");
     assert_eq!(std::fs::read(&file).unwrap(), text.as_bytes());
     editor.quit();
     compositor.stop();
@@ -1727,22 +1747,22 @@ fn native_horizontal_wheel_respects_wrap_and_clamps_columns() {
     compositor.click(140, 32); // Format header.
     editor.wait_field("state", "modal", "0,0,0,0,1,0,0,0,0");
     // Menu admission follows the wheel frame on the same native pointer stream.
-    editor.wait_field("state", "view", "1,0,0,98,31,1,downstream,-");
+    editor.wait_field("state", "view", "1,0,0,96,31,1,downstream,-");
     compositor.click(140, 60); // Soft Wrap, first row.
-    editor.wait_field("state", "view", "1,0,0,98,31,0,downstream,-");
+    editor.wait_field("state", "view", "1,0,0,96,31,0,downstream,-");
     editor.wait_field("state", "modal", "0,0,0,0,0,0,0,0,0");
     compositor.pointer(400, 80, 0);
     for (columns, left, prefix, repeat) in [
         (1, 3, "defgh", false),
-        (120, 33, "hijkl", true),
-        (-1, 30, "efghi", false),
+        (120, 35, "jklmn", true),
+        (-1, 32, "ghijk", false),
         (-120, 0, "abcde", true),
         (1, 3, "defgh", false),
     ] {
         let before = compositor.observe(&window);
         // Both axes in one report: the single logical row cannot scroll down.
         compositor.pointer_frame(400, 80, 0, -1, columns);
-        editor.wait_field("state", "view", &format!("1,0,{left},98,31,0,downstream,-"));
+        editor.wait_field("state", "view", &format!("1,0,{left},96,31,0,downstream,-"));
         editor.wait_field("state", "tab", "1,0,0,130,0,0,0,72,0,lf");
         assert_eq!(
             editor.ok("text\t1\t0\t0\t130"),

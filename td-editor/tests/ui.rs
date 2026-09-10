@@ -18,6 +18,177 @@ fn loaded(text: &str) -> Controller {
     ui.dispatch(Event::Load(text.as_bytes())).unwrap();
     ui
 }
+
+#[test]
+fn scrollbar_pages_drags_and_cancels_without_editing() {
+    for scale in 1..=4 {
+        let mut ui = loaded(&"line\n".repeat(200));
+        resize(&mut ui, 400 * scale as usize, 240 * scale as usize, scale);
+        select(&mut ui, 1, 3);
+        let before = format!("{:?}", ui.editor().document(1).unwrap());
+        let bar = ui.geometry().scrollbar(201, 0).unwrap();
+        let rows = ui.geometry().grid().1;
+        pointer(
+            &mut ui,
+            PointerPhase::Press,
+            bar.track.x,
+            bar.track.y + i64::from(bar.track.height) - 1,
+            false,
+        );
+        assert_eq!(ui.tab_view(1).unwrap().viewport.origin().row, rows);
+        assert_eq!(
+            pointer(
+                &mut ui,
+                PointerPhase::Release,
+                bar.track.x,
+                bar.track.y + i64::from(bar.track.height) - 1,
+                false
+            ),
+            Outcome::Ignored
+        );
+        assert_eq!(
+            pointer(&mut ui, PointerPhase::Move, 0, 0, false),
+            Outcome::Ignored
+        );
+        let bar = ui.geometry().scrollbar(201, rows).unwrap();
+        pointer(
+            &mut ui,
+            PointerPhase::Press,
+            bar.thumb.x,
+            bar.thumb.y + 2,
+            true,
+        );
+        pointer(&mut ui, PointerPhase::Move, -100, i64::MAX, false);
+        assert_eq!(ui.tab_view(1).unwrap().viewport.origin().row, 201 - rows);
+        pointer(&mut ui, PointerPhase::Release, -100, i64::MIN, false);
+        assert_eq!(ui.tab_view(1).unwrap().viewport.origin().row, 0);
+        assert_eq!(
+            pointer(&mut ui, PointerPhase::Move, 0, 200, false),
+            Outcome::Ignored
+        );
+        assert_eq!(format!("{:?}", ui.editor().document(1).unwrap()), before);
+        for event in [
+            Event::CancelPointer,
+            Event::Focus(false),
+            Event::PromptRows(2),
+            Event::LineNumbers(true),
+        ] {
+            let bar = ui.geometry().scrollbar(201, 0).unwrap();
+            pointer(
+                &mut ui,
+                PointerPhase::Press,
+                bar.thumb.x,
+                bar.thumb.y,
+                false,
+            );
+            ui.dispatch(event).unwrap();
+            assert_eq!(
+                pointer(&mut ui, PointerPhase::Move, 0, 200, false),
+                Outcome::Ignored
+            );
+        }
+    }
+}
+
+#[test]
+fn scrollbar_click_does_not_quantize_origin_and_tiny_tracks_still_drag() {
+    let mut ui = loaded(&"x\n".repeat(10_000));
+    for height in [88, 240] {
+        resize(&mut ui, 400, height, 1);
+        ui.dispatch(Event::Scroll {
+            tab: 1,
+            revision: 0,
+            rows: 137,
+            columns: 0,
+        })
+        .unwrap();
+        let origin = ui.tab_view(1).unwrap().viewport.origin().row;
+        let bar = ui.geometry().scrollbar(10_001, origin).unwrap();
+        assert!(bar.thumb.height < bar.track.height);
+        pointer(
+            &mut ui,
+            PointerPhase::Press,
+            bar.thumb.x,
+            bar.thumb.y + 2,
+            false,
+        );
+        pointer(
+            &mut ui,
+            PointerPhase::Release,
+            bar.thumb.x,
+            bar.thumb.y + 2,
+            false,
+        );
+        assert_eq!(ui.tab_view(1).unwrap().viewport.origin().row, origin);
+        pointer(
+            &mut ui,
+            PointerPhase::Press,
+            bar.thumb.x,
+            bar.thumb.y + 2,
+            false,
+        );
+        pointer(&mut ui, PointerPhase::Release, bar.thumb.x, 10_000, false);
+        assert_eq!(
+            ui.tab_view(1).unwrap().viewport.origin().row,
+            10_001 - ui.geometry().grid().1
+        );
+    }
+}
+
+#[test]
+fn scrollbar_interior_drag_rounds_from_the_exact_original_row() {
+    let mut ui = loaded(&"row\n".repeat(1000));
+    resize(&mut ui, 400, 240, 1);
+    ui.dispatch(Event::Scroll {
+        tab: 1,
+        revision: 0,
+        rows: 137,
+        columns: 0,
+    })
+    .unwrap();
+    let bar = ui.geometry().scrollbar(1001, 137).unwrap();
+    assert_eq!(
+        (bar.track.height, bar.thumb.height, bar.thumb.y),
+        (168, 24, 67)
+    );
+    let y = bar.thumb.y + 3;
+    pointer(&mut ui, PointerPhase::Press, bar.thumb.x, y, false);
+    // 991 rows over 144 pixels: round each signed delta from row 137,
+    // independently of the quantized thumb position and earlier moves.
+    for (delta, row) in [(0, 137), (1, 144), (7, 185), (8, 192), (72, 633), (-1, 130)] {
+        pointer(&mut ui, PointerPhase::Move, 100, y + delta, false);
+        assert_eq!(ui.tab_view(1).unwrap().viewport.origin().row, row);
+    }
+    pointer(&mut ui, PointerPhase::Release, 100, y, false);
+    assert_eq!(ui.tab_view(1).unwrap().viewport.origin().row, 137);
+    assert_eq!(selection(&ui), Selection::default());
+}
+
+#[test]
+fn disabled_scrollbar_release_is_ignored_without_selection_or_error() {
+    let mut ui = loaded("short");
+    let before = format!("{:?}", ui.editor());
+    let bar = ui.geometry().scrollbar(1, 0).unwrap();
+    assert!(!bar.enabled());
+    pointer(
+        &mut ui,
+        PointerPhase::Press,
+        bar.thumb.x,
+        bar.thumb.y,
+        false,
+    );
+    assert_eq!(
+        pointer(
+            &mut ui,
+            PointerPhase::Release,
+            bar.thumb.x,
+            bar.thumb.y,
+            false
+        ),
+        Outcome::Ignored
+    );
+    assert_eq!(format!("{:?}", ui.editor()), before);
+}
 fn active(ui: &Controller) -> (u64, u64) {
     let id = ui.editor().active().unwrap();
     (id, ui.editor().document(id).unwrap().revision())
@@ -217,7 +388,7 @@ fn line_number_glyphs_skip_wrapped_rows_and_partial_damage_matches_full_frame() 
     for scale in 1..=4 {
         let mut ui = Controller::default();
         ui.dispatch(Event::Load(b"abcde\nx\n")).unwrap();
-        resize(&mut ui, 72 * scale, 168 * scale, scale as u8); // Four text cells.
+        resize(&mut ui, 88 * scale, 168 * scale, scale as u8); // Four text cells.
         let mut numbers = Vec::new();
         ui.scene(&[])
             .unwrap()
@@ -262,7 +433,7 @@ fn line_number_glyphs_skip_wrapped_rows_and_partial_damage_matches_full_frame() 
                 .unwrap();
         }
         assert_eq!(tiled, full);
-        resize(&mut ui, 72 * scale, 104 * scale, scale as u8);
+        resize(&mut ui, 88 * scale, 104 * scale, scale as u8);
         ui.dispatch(Event::Scroll {
             tab: 1,
             revision: 0,
@@ -458,7 +629,7 @@ fn pointer_scaling_soft_affinity_and_vertical_motion_use_one_layout() {
     for scale in 1..=4 {
         let s = i64::from(scale);
         let mut ui = loaded("abcdefgh");
-        resize(&mut ui, 48 * scale as usize, 104 * scale as usize, scale);
+        resize(&mut ui, 64 * scale as usize, 104 * scale as usize, scale);
         pointer(&mut ui, PointerPhase::Press, 39 * s, 49 * s, false);
         assert_eq!(selection(&ui).caret, 4);
         assert_eq!(ui.tab_view(1).unwrap().affinity, Affinity::Upstream);
@@ -478,7 +649,7 @@ fn scaled_pointer_midpoints_use_physical_pixels_without_rounding_bias() {
     for scale in 1..=4 {
         let mut ui = loaded("a\tλ\n");
         let s = i64::from(scale);
-        resize(&mut ui, 96 * scale as usize, 104 * scale as usize, scale);
+        resize(&mut ui, 112 * scale as usize, 104 * scale as usize, scale);
         for (midpoint, before, after) in [(12, 0, 1), (44, 1, 2), (76, 2, 4)] {
             pointer(&mut ui, PointerPhase::Press, midpoint * s, 49 * s, false);
             assert_eq!(selection(&ui).caret, before);
@@ -558,7 +729,7 @@ fn dragging_is_scalar_aligned_clamped_and_cancelled_by_edits_and_focus() {
 #[test]
 fn scrolling_preserves_selection_and_tab_origins_until_a_caret_reveal() {
     let mut ui = loaded("0123456789\nabcdefghij\nklmnopqrst\nuvwxyz\nlast");
-    resize(&mut ui, 48, 104, 1);
+    resize(&mut ui, 64, 104, 1);
     ui.dispatch(Event::Wrap {
         tab: 1,
         revision: 0,

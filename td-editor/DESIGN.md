@@ -982,7 +982,28 @@ the 24-pixel tab strip. The status strip occupies the bottom 24 pixels.
 The gutter starts at (8, 48); document text
 starts immediately after it, or at (8, 48) when disabled. An active
 minibuffer adds its height to tab, gutter and document y coordinates.
-Text has eight pixels of right margin and uses only full 8x16 cells.
+Text uses only full 8x16 cells and reserves 24 pixels on its right:
+eight pixels of separation, a 12-pixel vertical scrollbar and four pixels
+of outer margin. The scrollbar spans the document height and is absent
+when no full document row or column fits. It is present for both text and
+directory tabs, including when the entire buffer fits (a disabled thumb).
+Its thumb is proportional to visible full rows / total visual rows, at
+least 24 pixels tall, clipped to leave one logical pixel of travel when
+scrolling is possible. Its position is the clamped
+first row / maximum first row, rounded down in pixels. Dragging preserves
+the grab offset and exact initial row, rounds signed movement to the
+nearest visual row (halfway away from zero), and clamps outside the
+track. Clicking above/below the thumb scrolls one viewport page, without
+hold repeat. It uses chrome for the track, line-number ink for enabled
+thumbs and border color for disabled thumbs.
+
+Scrollbar input changes only the viewport, not selection, revision, undo
+history or directory activation. A press cancels key prefixes and marks.
+Thumb drags use the same tab/revision, focus, geometry and ownership fences
+as selection drags, including decoded remote pointer events; track clicks
+do not establish a drag. The controller supplies cached layout row counts
+to the scene; standalone reference scenes calculate their own. Horizontal
+scrolling remains wheel/remote-command only in this increment.
 Tabs are 160 pixels
 wide with 24 pixels reserved for the close mark. A contiguous slice of tabs
 is shown, keeping the active tab visible; a surface narrower than one tab

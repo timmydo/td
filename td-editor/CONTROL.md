@@ -1373,6 +1373,10 @@ there are at most 64 rows. These fields are read-only metadata. Decoded
 Enter/click retains the directory when opening a file, selecting an existing
 file tab when available. Opening a directory reuses its source tab;
 Shift+Enter or pointer `extend=1` opens another directory tab instead.
+The vertical scrollbar accepts the same fenced pointer press/move/release
+events as text selection. Thumb dragging and track paging change only the
+viewport, including in directory tabs; moving a held thumb over an entry
+does not open that entry. Track clicks do not own a continuing drag.
 `q` closes only the current directory tab, `^` opens its parent and `g`
 refreshes, under the existing input fences. Delivery is not completion: poll
 the native file-busy flag,
