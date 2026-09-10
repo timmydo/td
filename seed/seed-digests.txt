@@ -83,9 +83,9 @@ sed-mesboot-source 331jp1sj5iyjhnb35391k2sjjkqrawk1-sed-mesboot-source
 sed-mesboot0-source i6y1c09pssxjdc60wmdf96vf11hxa56c-sed-mesboot0-source
 stage0-source ma16im40lnb5dldxwglzzs7iqpzfiz4m-stage0-source
 tcc-source mhwyc6lcd16pxbln8kwvc4ia5zisf8fn-tcc-source
-td-mail-source rr5vq22300xva1x3899c12jldr085xxq-td-mail-source
+td-mail-source ax2l49641vrrc9p76m7fbj1xya0qyqw1-td-mail-source
 td-net-source y4a7qgmm2w5yz1qxjdp0nqr1wvs7yk63-td-net-source
-td-news-source 6zdjqv7kd9r7kll9f8zc5gdifzxvm8kq-td-news-source
+td-news-source r5cycw0wjyg12vydavg0s4fp9dfs35ss-td-news-source
 util-linux-libs-x86-64-source 06vhdikawhfyswkhrxs905cm3qbpqj4r-util-linux-libs-x86-64-source
 uutils-source rkmjdm6nicq3js0xhdyqk4rl3r9ki4xv-uutils-source
 zlib-x86-64-source bpbym1fyb9bbzs3398h55hqnj4lxp47c-zlib-x86-64-source

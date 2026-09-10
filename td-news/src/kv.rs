@@ -1,8 +1,10 @@
 //! kv: a small crash-safe, single-writer key/value store.
 //!
 //! The store is an append-only log of commit records held open by one process
-//! at a time (an exclusive file lock). Every committed record is fsynced, so a
-//! crash loses at most the commit that was in flight. The whole live state is
+//! at a time (an exclusive file lock). Each acquired lock is explicitly
+//! released on drop, including when a spawning child retains an inherited
+//! descriptor before exec. Every committed record is fsynced, so a crash loses
+//! at most the commit that was in flight. The whole live state is
 //! kept in memory as ordered tables; readers take a cheap `Arc` snapshot that
 //! a concurrent commit cannot disturb.
 //!
@@ -441,7 +443,7 @@ fn names_this_inode(file: &File, path: &Path) -> io::Result<bool> {
 
 /// Open `path` and take its lock, again if the locked inode turns out
 /// not to be the one the path names any more.
-fn open_locked(path: &Path) -> Result<File, Error> {
+fn open_locked(path: &Path) -> Result<LockedFile, Error> {
     for _ in 0..REOPEN_ATTEMPTS {
         let file = OpenOptions::new()
             .read(true)
@@ -450,6 +452,7 @@ fn open_locked(path: &Path) -> Result<File, Error> {
             .truncate(false)
             .open(path)?;
         file.try_lock().map_err(lock_err)?;
+        let file = LockedFile(file);
         match names_this_inode(&file, path) {
             Ok(true) => return Ok(file),
             Ok(false) => {}
@@ -470,9 +473,34 @@ fn tmp_path_for(path: &Path) -> PathBuf {
     PathBuf::from(name)
 }
 
+/// Own a lock from acquisition through recovery, compaction and teardown.
+struct LockedFile(File);
+
+impl std::ops::Deref for LockedFile {
+    type Target = File;
+
+    fn deref(&self) -> &File {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for LockedFile {
+    fn deref_mut(&mut self) -> &mut File {
+        &mut self.0
+    }
+}
+
+impl Drop for LockedFile {
+    fn drop(&mut self) {
+        // A concurrent fork can retain this open file description until exec.
+        // Closing our descriptor alone would leave its flock held meanwhile.
+        let _ = self.0.unlock();
+    }
+}
+
 /// The log file plus the bookkeeping only a writer needs.
 struct Writer {
-    file: File,
+    file: LockedFile,
     end: u64,
     live: u64,
     /// A compaction's rename whose directory sync failed: until it is
@@ -541,14 +569,15 @@ impl Writer {
         }
     }
 
-    fn write_snapshot(tables: &Tables, tmp: &Path) -> Result<(File, u64, u64), Error> {
-        let mut file = OpenOptions::new()
+    fn write_snapshot(tables: &Tables, tmp: &Path) -> Result<(LockedFile, u64, u64), Error> {
+        let file = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .truncate(true)
             .open(tmp)?;
         file.try_lock().map_err(lock_err)?;
+        let mut file = LockedFile(file);
 
         let mut end = 0u64;
         let mut live = 0u64;
@@ -968,6 +997,55 @@ mod tests {
         assert!(Key::from_u64(2) > Key::from_u64(1));
         assert!(Key::from_u64(256) > Key::from_u64(255));
         assert_eq!(Key::as_u64(b"short"), None);
+    }
+
+    #[test]
+    fn dropping_store_unlocks_while_a_duplicate_descriptor_survives() {
+        for compact in [false, true] {
+            let dir = TempDir::new("duplicate-lock");
+            let store = Store::open(dir.db()).expect("open");
+            put(&store, "t", b"k", b"value");
+            if compact {
+                store.compact().expect("compact");
+            }
+            // dup and fork retain the same open file description. Keep one
+            // alive deterministically instead of racing another test's spawn.
+            let duplicate = store
+                .writer
+                .lock()
+                .expect("writer")
+                .file
+                .try_clone()
+                .expect("duplicate");
+            assert!(matches!(Store::open(dir.db()), Err(Error::Locked)));
+            drop(store);
+            let reopened = Store::open(dir.db()).expect("reopen with duplicate alive");
+            assert_eq!(get(&reopened, "t", b"k").as_deref(), Some(&b"value"[..]));
+            drop(duplicate);
+            // Closing an old duplicate cannot release the new writer's lock.
+            assert!(matches!(Store::open(dir.db()), Err(Error::Locked)));
+            drop(reopened);
+            assert!(Store::open(dir.db()).is_ok());
+        }
+    }
+
+    #[test]
+    fn failed_replay_unlocks_while_a_duplicate_descriptor_survives() {
+        let dir = TempDir::new("failed-replay-lock");
+        fs::write(dir.db(), [0u8; HEADER_LEN]).expect("corrupt header");
+        let mut duplicate = None;
+        let result = (|| -> Result<(), Error> {
+            let file = open_locked(&dir.db())?;
+            duplicate = Some(file.try_clone()?);
+            replay(&file)?;
+            Ok(())
+        })();
+        assert!(matches!(result, Err(Error::Corrupt(_))));
+        let file = open_locked(&dir.db()).expect("relock after failed replay");
+        drop(duplicate);
+        assert!(matches!(open_locked(&dir.db()), Err(Error::Locked)));
+        drop(file);
+        assert!(open_locked(&dir.db()).is_ok());
     }
 
     #[test]
