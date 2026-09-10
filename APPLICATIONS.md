@@ -641,8 +641,8 @@ so the process selected by `/bin/<name>` cannot safely issue it itself. It
 spawns a child that cannot yet be that leader, passes its own pid, and waits.
 The child first sets `PR_SET_PDEATHSIG=SIGKILL`, proves that exact parent through
 procfs, then reads its containment before it resolves authority or creates
-application state. A child already in a no-terminal process group led by that
-exact parent stays there and reads the group back; this is the dedicated group
+application state. A child with non-terminal stdin already in a no-terminal process group
+led by that exact parent stays there and reads the group back; this is the dedicated group
 td-svc records and later drains. Every other child creates and reads back a new
 session with no controlling terminal. Killing the waiting launcher therefore
 kills stage 1; the existing proof pipe then kills stage 2, and the independent
@@ -3011,8 +3011,8 @@ application-containment bootstrap fixes the signal and future-reacquisition
 path.
 
 The remaining third is now closed before authority resolution. A later-born
-stage 1 first recognizes one special safe input: a no-terminal process group
-whose id is the exact waiting parent's pid. It stays in and reads back that
+stage 1 first recognizes one special safe input: non-terminal stdin and a
+no-terminal process group whose id is the exact waiting parent's pid. It stays in and reads back that
 group so td-svc's recorded stop containment continues to cover stage 1, stage
 2 and the application. Otherwise it enters and proves its own session while
 its waiting parent keeps the launch lifecycle. Terminal-generated signals and
@@ -3021,6 +3021,15 @@ console snapshot that names stage 1 before detachment may still deliver its
 already-selected signal, and the parent-death/cleanup path handles it.
 `CommandExt`'s stable `process_group` is only `setpgid` and would not provide
 the terminal boundary.
+
+The human shell's `claude` entry uses the fixed application-UID launcher
+specified in `td-authd/DESIGN.md` under Claude shell launch. Its listener
+is bound by root and served only after the service credential drop. A
+fresh slave reaches this same jail transition; the human retains only its
+master. Claude keeps UID 65539, private state and the existing idmapped
+workspace grant. Shell cwd beneath the human's `src` is translated into
+that grant; file ownership on the human's view remains unchanged. The boot
+oracle also requires a human-UID shell launch of `claude --version`.
 
 **`devices=tty` — the fresh-terminal grant.** The containment bootstrap
 prevents accidental access; this grant defines deliberate acquisition, and
@@ -3041,8 +3050,8 @@ produces a session-less pty for exactly this purpose
 (`td-compositor/DESIGN.md` §12). "Never the operator's" therefore rests on
 that wrapper: a shell started with `--command /bin/sh` leads no session, its
 pty is unowned, and an application launched from it would acquire and share
-that terminal. The supervised-group path, which is no session leader, is
-refused the same way. It happens before registration, namespaces and the
+that terminal. Terminal stdin always selects the new-session path, even
+when inherited from a supervisor group. It happens before registration, namespaces and the
 cgroup, so a refusal costs nothing to unwind, and the cgroup cleanup tree,
 which outlives the jail, gets no duplicate of the terminal. The terminal
 reaches stage 2 as its stdout, a clone of the stdin `TIOCSCTTY` acted on

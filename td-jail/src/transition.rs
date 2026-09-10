@@ -4006,7 +4006,11 @@ pub fn contain_application_session(expected_parent: u32) -> io::Result<()> {
     let before = fs::read_to_string("/proc/self/stat")?;
     require_direct_parent(expected_parent, &before)?;
     let containment = process_containment(&before)?;
-    if containment.terminal == 0 && containment.process_group == expected_parent {
+    // A fresh slave needs this child to lead its own session before TIOCSCTTY.
+    if containment.terminal == 0
+        && containment.process_group == expected_parent
+        && !std::io::IsTerminal::is_terminal(&std::io::stdin())
+    {
         let after = fs::read_to_string("/proc/self/stat")?;
         return require_supervised_group("application launcher", expected_parent, &after);
     }

@@ -29,6 +29,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
         [
             "application.rs",
             "application_files.rs",
+            "application_shell.rs",
             "channel.rs",
             "consent.rs",
             "inspection.rs",
@@ -40,13 +41,20 @@ fn the_production_source_and_raw_boundary_are_closed() {
             "secret_request.rs",
             "secret_sys.rs",
             "session.rs",
+            "shell_channel.rs",
             "sys.rs",
+            "terminal.rs",
+            "terminal_sys.rs",
             "unlock.rs"
         ]
     );
     for (name, count) in [
         ("application.rs", 0),
         ("application_files.rs", 0),
+        ("application_shell.rs", 0),
+        ("shell_channel.rs", 0),
+        ("terminal.rs", 0),
+        ("terminal_sys.rs", 4),
         ("main.rs", 1),
         ("channel.rs", 0),
         ("consent.rs", 0),
@@ -81,7 +89,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
         ] {
             let child_api = matches!(
                 name,
-                "launch.rs" | "application.rs" | "unlock.rs" | "session.rs" | "inspection.rs"
+                "launch.rs" | "application.rs" | "unlock.rs" | "session.rs" | "inspection.rs" | "application_shell.rs" | "shell_channel.rs" | "terminal.rs"
             ) && ["::Command", "::thread", ".spawn(", ".exec("]
                 .contains(&forbidden);
             let mapping_child_api = matches!(name, "portal_files.rs" | "application_files.rs")
@@ -152,7 +160,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
         .unwrap();
     assert_eq!(
         fingerprint(application),
-        0xc0abac3ae244ab3c,
+        0x273ae2cfcd07f646,
         "application launch controller changed"
     );
     for forbidden in [
@@ -171,7 +179,8 @@ fn the_production_source_and_raw_boundary_are_closed() {
     }
     assert_eq!(application.matches(".spawn(").count(), 1);
     assert_eq!(application.matches(".exec()").count(), 2);
-    assert_eq!(application.matches(".stdin(Stdio::null())").count(), 2);
+    assert_eq!(application.matches(".stdin(Stdio::null())").count(), 1);
+    assert_eq!(application.matches(".stdin(input)").count(), 1);
     assert_eq!(application.matches(".stderr(Stdio::null())").count(), 2);
     assert_eq!(application.matches(".stdout(Stdio::null())").count(), 1);
     let launch = include_str!("../src/launch.rs");
@@ -295,6 +304,17 @@ fn the_production_source_and_raw_boundary_are_closed() {
             .count(),
         1
     );
+    assert_eq!(fingerprint(include_str!("../src/application_shell.rs").split("#[cfg(test)]").next().unwrap()), 0x96b87ab192ae992d, "application_shell.rs: production boundary changed");
+    assert_eq!(fingerprint(include_str!("../src/shell_channel.rs").split("#[cfg(test)]").next().unwrap()), 0x8cf83d4d6ed3f6a7, "shell_channel.rs: production boundary changed");
+    assert_eq!(fingerprint(include_str!("../src/terminal.rs").split("#[cfg(test)]").next().unwrap()), 0x06cfa9e717caa1e0, "terminal.rs: production boundary changed");
+    assert_eq!(fingerprint(include_str!("../src/terminal_sys.rs").split("#[cfg(test)]").next().unwrap()), 0xdbf1730949a19a6b, "terminal_sys.rs: production boundary changed");
+    let terminal_raw = include_str!("../src/terminal_sys.rs");
+    assert_eq!(terminal_raw.matches("#[allow(unsafe_code)]").count(), 2);
+    assert_eq!(terminal_raw.matches("core::arch::asm!").count(), 1);
+    assert_eq!(terminal_raw.matches("File::from_raw_fd").count(), 1);
+    assert_eq!(terminal_raw.matches("const SYS_").count(), 2);
+    assert_eq!(terminal_raw.matches("const TIOC").count(), 4);
+    assert_eq!(terminal_raw.matches("const TC").count(), 2);
     let channel = include_str!("../src/channel.rs");
     assert_eq!(channel.matches("sys::prepare(").count(), 1);
     assert_eq!(channel.matches("sys::receive(").count(), 1);
@@ -312,7 +332,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
     // Pin startup as well as raw code: aliases can evade API-name scans.
     assert_eq!(
         fingerprint(main),
-        0x504d62fd7b79c4c0,
+        0xd94d49486e0dfec7,
         "main.rs: production startup changed"
     );
     assert_eq!(

@@ -42,6 +42,15 @@ fn run() -> std::io::Result<()> {
     })?;
     let name = authority::application_name(&argv0)?;
     let mut arguments = arguments.peekable();
+    if name == "claude"
+        && std::os::unix::fs::MetadataExt::uid(&std::fs::metadata("/proc/self")?) == 1000
+    {
+        use std::os::unix::process::CommandExt;
+        return Err(std::process::Command::new("/bin/td-authd")
+            .arg("application-client")
+            .args(arguments)
+            .exec());
+    }
     if application_launch_kind(name, arguments.peek()).is_some() {
         return transition::spawn_application_session(argv0, arguments);
     }

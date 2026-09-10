@@ -1,6 +1,10 @@
 #![deny(unsafe_code)]
 
 mod application;
+mod application_shell;
+mod shell_channel;
+mod terminal;
+mod terminal_sys;
 mod application_files;
 mod channel;
 #[allow(
@@ -29,8 +33,9 @@ const USAGE: &str = "usage: td-authd channel-check --peer-uid UID | \
     td-authd terminal-exec UID GENERATION HANDLE | td-authd prepare-portal-files | \
     td-authd release-portal-files | td-authd prepare-application-files APP | \
     td-authd release-application-files APP | \
-    td-authd application-start OWNER APP direct|terminal -- ARG... | \
-     td-authd application-exec UID OWNER APP direct|terminal -- ARG...";
+    td-authd application-start OWNER APP direct|terminal|shell -- ARG... | \
+     td-authd application-exec UID OWNER APP direct|terminal|shell -- ARG... | \
+     td-authd application-client ARG... | td-authd application-probe";
 
 fn run(arguments: &[String]) -> Result<(), String> {
     if arguments == ["prepare-portal-files"] {
@@ -97,10 +102,25 @@ fn run(arguments: &[String]) -> Result<(), String> {
     }
 }
 
+fn entry() -> Result<u8, String> {
+    let mut arguments = std::env::args_os().skip(1).peekable();
+    if arguments
+        .peek()
+        .is_some_and(|s| s == "application-client" || s == "application-probe")
+    {
+        let probe = arguments.next().is_some_and(|s| s == "application-probe");
+        return application_shell::client(arguments.collect(), probe).map_err(|e| e.to_string());
+    }
+    let arguments = arguments
+        .map(|s| s.into_string().map_err(|_| "invalid argument encoding"))
+        .collect::<Result<Vec<_>, _>>()?;
+    run(&arguments).map(|()| 0)
+}
+
 fn main() -> ExitCode {
-    let arguments: Vec<String> = std::env::args().skip(1).collect();
-    match run(&arguments) {
-        Ok(()) => ExitCode::SUCCESS,
+    let result = entry();
+    match result {
+        Ok(code) => ExitCode::from(code),
         Err(why) => {
             let _ = writeln!(std::io::stderr().lock(), "td-authd: {why}");
             ExitCode::FAILURE

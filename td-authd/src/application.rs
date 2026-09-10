@@ -17,6 +17,7 @@ const REPLY: &str = "TD-LAUNCH-APPLICATION-CHECK-OK\t";
 enum Presentation {
     Direct,
     Terminal,
+    Shell,
 }
 
 struct Request {
@@ -42,7 +43,7 @@ fn decimal(text: &str, range: std::ops::RangeInclusive<u32>) -> Result<u32, Stri
 impl Request {
     fn parse(arguments: &[String]) -> Result<Self, String> {
         let [owner, name, mode, separator, rest @ ..] = arguments else {
-            return Err("application launch requires OWNER APP direct|terminal -- ARG...".into());
+            return Err("application launch requires OWNER APP direct|terminal|shell -- ARG...".into());
         };
         let owner = decimal(owner, 1000..=1000)?;
         if separator != "--"
@@ -61,7 +62,8 @@ impl Request {
         let presentation = match mode.as_str() {
             "direct" => Presentation::Direct,
             "terminal" => Presentation::Terminal,
-            _ => return Err("application launch presentation must be direct or terminal".into()),
+            "shell" if name == "claude" && rest.is_empty() => Presentation::Shell,
+            _ => return Err("application launch presentation must be direct, terminal, or argument-free Claude shell".into()),
         };
         Ok(Self {
             owner,
@@ -94,13 +96,14 @@ impl Request {
         match self.presentation {
             Presentation::Direct => "direct",
             Presentation::Terminal => "terminal",
+            Presentation::Shell => "shell",
         }
     }
 
     fn application(&self, uid: u32) -> Command {
         let executable = format!("/bin/{}", self.name);
         let mut command = match self.presentation {
-            Presentation::Direct => Command::new(executable),
+            Presentation::Direct | Presentation::Shell => Command::new(executable),
             Presentation::Terminal => {
                 let mut command = Command::new("/bin/td-term");
                 command.args([
@@ -224,13 +227,21 @@ pub(crate) fn start(arguments: &[String]) -> Result<(), String> {
     let request = Request::parse(arguments)?;
     launch::require_launch_startup().map_err(|e| format!("application startup: {e}"))?;
     let uid = admit(request.owner, &request.name)?;
-    // The validator's endpoint is gone. No root log or inherited descriptor
-    // reaches the credential helper, terminal or application.
+    let input = if request.presentation == Presentation::Shell {
+        if uid != crate::application_shell::UID {
+            return Err("unexpected Claude assignment".into());
+        }
+        crate::application_shell::bind().map_err(|e| e.to_string())?
+    } else {
+        Stdio::null()
+    };
+    // Only the newly bound shell listener can cross this handoff; no root
+    // log or ambient descriptor reaches the credential helper.
     let error = request
         .helper(uid)
         .env_clear()
         .current_dir("/")
-        .stdin(Stdio::null())
+        .stdin(input)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .exec();
@@ -295,6 +306,12 @@ pub(crate) fn exec(arguments: &[String]) -> Result<(), String> {
         &bounded("/proc/self/status")?,
         &bounded("/proc/self/cgroup")?,
     )?;
+    if request.presentation == Presentation::Shell {
+        if uid != crate::application_shell::UID {
+            return Err("unexpected Claude assignment".into());
+        }
+        return crate::application_shell::serve().map_err(|e| e.to_string());
+    }
     Err(format!(
         "exec application: {}",
         request.application(uid).exec()

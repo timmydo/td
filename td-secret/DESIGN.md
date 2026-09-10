@@ -1561,6 +1561,12 @@ while preserving a seeded runtime key. Adding the canonical application
 account/group/service-shadow entries makes the same description admissible.
 The pre-fix source-built binary fails this oracle at the admission result.
 
+The unchanged `td-authd/src/secret_sys.rs` transport also serves the
+unprivileged Claude shell launch channel described in `td-authd/DESIGN.md`.
+That channel's named consumer transfers a fresh PTY master, never a
+credential. Named-write intake continues to require a sealed regular file
+and cannot accept that descriptor. See `UNSAFE.md` section 16.
+
 ## Named-write intake and physical selection
 
 The public command is `td-secret set [--recovery] APPLICATION/NAME` in the

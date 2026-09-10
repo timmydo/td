@@ -1240,7 +1240,7 @@ fn td_portal_settings_etc_name() -> &'static str {
 /// on a table it cannot parse, but a unit SILENTLY dropped from the plan — skipped for
 /// an unsatisfiable dependency — is a clean exit with a shorter list, and that is the
 /// regression this catches: the boot comes up missing a service and says nothing.
-const TD_SVC_UNITS: [&str; 45] = [
+const TD_SVC_UNITS: [&str; 46] = [
     "hostname",
     "td-firstboot",
     "rootcheck",
@@ -1258,6 +1258,7 @@ const TD_SVC_UNITS: [&str; 45] = [
     "firefox-files",
     "mail-files",
     "claude-files",
+    "claude-launch",
     "fetch-evidence",
     "portal-files",
     "portal",
@@ -1563,6 +1564,16 @@ fn build_td_svc_conf() -> String {
          after=td-firstboot\n\
          requires=td-firstboot\n\
          timeout=30\n\
+         \n\
+         [claude-launch]\n\
+         type=daemon\n\
+         cgroup=session\n\
+         exec=/bin/td-authd application-start {ui_uid} {claude_name} shell --\n\
+         after=claude-files,busd\n\
+         requires=td-firstboot,claude-files,busd\n\
+         ready=/bin/td-login exec-as {ui_user} -- /bin/td-authd application-probe\n\
+         ready-timeout=30\n\
+         restart=on-failure\n\
          \n\
          # Boot evidence under the autotest token only: the probe, as the UI\n\
          # user, asks the service for a loopback URL and gets the policy's exact\n\
@@ -1895,9 +1906,9 @@ fn build_td_svc_conf() -> String {
          # for.\n\
          [claude-evidence]\n\
          type=daemon\n\
-         exec=/bin/sh -c 'case \" $(/bin/cat /proc/cmdline) \" in *\" {autotest_cmdline_token} \"*) :;; *) exit 0;; esac; n=0; while [ \"$n\" -lt {claude_pre_run_wait} ]; do firefox=$(/bin/td-util cat {firefox_completion_path} 2>/dev/null); if [ \"$firefox\" = {firefox_completion} ]; then case \" $(/bin/cat /proc/cmdline) \" in *\" {firefox_input_cmdline_token} \"*) input=$(/bin/td-util cat {firefox_input_completion_path} 2>/dev/null); [ \"$input\" = {firefox_input_final_completion} ] && break;; *) break;; esac; fi; n=$((n+1)); /bin/td-util sleep 1; done; [ \"$n\" -lt {claude_pre_run_wait} ] || exit 1; /bin/rm -f {claude_error_path} {claude_completion_tmp_path} || exit 1; process_before=$(/bin/td-login exec-service-as tda65536 -- /bin/td-jail --probe-process-token {firefox_name} --marionette) || exit 1; bus_before=$(/bin/td-login exec-as {ui_user} -- /bin/td-busd application {bus_socket} {firefox_name}) || exit 1; if refused=$(/bin/td-login exec-service-as tda65539 -- /bin/env TERM=td-term /bin/{claude_name} --version 2>&1 </dev/null); then /bin/echo \"td-claude-evidence: a launch with no terminal of its own ran\"; exit 1; fi; if [ \"$refused\" = \"{claude_refused_line}\" ]; then :; else /bin/td-util printf \"%s\\n\" \"$refused\" > {claude_error_path}; /bin/echo \"td-claude-evidence: the launch with no terminal was refused for another reason, kept in {claude_error_path}\"; exit 1; fi; ran=$(/bin/td-login exec-service-as tda65539 -- /bin/td-term run --socket {wayland_socket} --ready-socket /run/user/65539/td-claude-evidence-ready --command /bin/{claude_name} --version 2>&1 </dev/null); if /bin/td-util printf \"%s\\n\" \"$ran\" | /bin/rg --quiet --line-regexp \"td-term: the terminal.s child exited with status 0\"; then :; else /bin/td-util printf \"%s\\n\" \"$ran\" > {claude_error_path}; /bin/echo \"td-claude-evidence: the launch inside a terminal did not report its child at status 0, kept in {claude_error_path}\"; exit 1; fi; process_after=$(/bin/td-login exec-service-as tda65536 -- /bin/td-jail --probe-process-token {firefox_name} --marionette) || exit 1; [ \"$process_after\" = \"$process_before\" ] || exit 1; bus_after=$(/bin/td-login exec-as {ui_user} -- /bin/td-busd application {bus_socket} {firefox_name}) || exit 1; [ \"$bus_after\" = \"$bus_before\" ] || exit 1; /bin/echo \"{claude_marker}\" && /bin/td-util printf \"%s\\n\" {claude_completion} > {claude_completion_tmp_path} && /bin/td-util chmod 0644 {claude_completion_tmp_path} && /bin/mv {claude_completion_tmp_path} {claude_completion_path} && exit 0; exit 1'\n\
-         after=firefox-soak,claude-files\n\
-         requires=td-firstboot,claude-files\n\
+         exec=/bin/sh -c 'case \" $(/bin/cat /proc/cmdline) \" in *\" {autotest_cmdline_token} \"*) :;; *) exit 0;; esac; n=0; while [ \"$n\" -lt {claude_pre_run_wait} ]; do firefox=$(/bin/td-util cat {firefox_completion_path} 2>/dev/null); if [ \"$firefox\" = {firefox_completion} ]; then case \" $(/bin/cat /proc/cmdline) \" in *\" {firefox_input_cmdline_token} \"*) input=$(/bin/td-util cat {firefox_input_completion_path} 2>/dev/null); [ \"$input\" = {firefox_input_final_completion} ] && break;; *) break;; esac; fi; n=$((n+1)); /bin/td-util sleep 1; done; [ \"$n\" -lt {claude_pre_run_wait} ] || exit 1; /bin/rm -f {claude_error_path} {claude_completion_tmp_path} || exit 1; process_before=$(/bin/td-login exec-service-as tda65536 -- /bin/td-jail --probe-process-token {firefox_name} --marionette) || exit 1; bus_before=$(/bin/td-login exec-as {ui_user} -- /bin/td-busd application {bus_socket} {firefox_name}) || exit 1; if refused=$(/bin/td-login exec-service-as tda65539 -- /bin/env TERM=td-term /bin/{claude_name} --version 2>&1 </dev/null); then /bin/echo \"td-claude-evidence: a launch with no terminal of its own ran\"; exit 1; fi; if [ \"$refused\" = \"{claude_refused_line}\" ]; then :; else /bin/td-util printf \"%s\\n\" \"$refused\" > {claude_error_path}; /bin/echo \"td-claude-evidence: the launch with no terminal was refused for another reason, kept in {claude_error_path}\"; exit 1; fi; ran=$(/bin/td-login exec-service-as tda65539 -- /bin/td-term run --socket {wayland_socket} --ready-socket /run/user/65539/td-claude-evidence-ready --command /bin/{claude_name} --version 2>&1 </dev/null); if /bin/td-util printf \"%s\\n\" \"$ran\" | /bin/rg --quiet --line-regexp \"td-term: the terminal.s child exited with status 0\"; then :; else /bin/td-util printf \"%s\\n\" \"$ran\" > {claude_error_path}; /bin/echo \"td-claude-evidence: the launch inside a terminal did not report its child at status 0, kept in {claude_error_path}\"; exit 1; fi; if shell_ran=$(/bin/td-login exec-as {ui_user} -- /bin/env TERM=td-term /bin/{claude_name} --version 2>&1 </dev/null); then :; else /bin/td-util printf \"%s\\n\" \"$shell_ran\" > {claude_error_path}; /bin/echo \"td-claude-evidence: human shell launch failed, kept in {claude_error_path}\"; exit 1; fi; process_after=$(/bin/td-login exec-service-as tda65536 -- /bin/td-jail --probe-process-token {firefox_name} --marionette) || exit 1; [ \"$process_after\" = \"$process_before\" ] || exit 1; bus_after=$(/bin/td-login exec-as {ui_user} -- /bin/td-busd application {bus_socket} {firefox_name}) || exit 1; [ \"$bus_after\" = \"$bus_before\" ] || exit 1; /bin/echo \"{claude_marker}\" && /bin/td-util printf \"%s\\n\" {claude_completion} > {claude_completion_tmp_path} && /bin/td-util chmod 0644 {claude_completion_tmp_path} && /bin/mv {claude_completion_tmp_path} {claude_completion_path} && exit 0; exit 1'\n\
+         after=firefox-soak,claude-files,claude-launch\n\
+         requires=td-firstboot,claude-files,claude-launch\n\
          restart=never\n\
          \n\
          [bootsuccess]\n\
@@ -7114,6 +7125,7 @@ news\tnews-0.1\tsource\tempty-runtime-1\tsource\n"
             ("firefox-files", vec!["td-firstboot"]),
             ("mail-files", vec!["td-firstboot", "firefox-files"]),
             ("claude-files", vec!["td-firstboot"]),
+            ("claude-launch", vec!["claude-files", "busd"]),
             ("fetch-evidence", vec!["fetchd", "firefox-tls-setup"]),
             ("portal-files", vec!["td-firstboot"]),
             ("portal", vec!["busd", "portal-files"]),
@@ -7160,7 +7172,7 @@ news\tnews-0.1\tsource\tempty-runtime-1\tsource\n"
             ),
             ("firefox-input", vec!["terminal-authority-evidence"]),
             ("firefox-soak", vec!["firefox-input"]),
-            ("claude-evidence", vec!["firefox-soak", "claude-files"]),
+            ("claude-evidence", vec!["firefox-soak", "claude-files", "claude-launch"]),
             (
                 "bootsuccess",
                 sysinit
@@ -7303,8 +7315,8 @@ news\tnews-0.1\tsource\tempty-runtime-1\tsource\n"
     #[test]
     fn claude_evidence_refuses_without_a_terminal_and_runs_inside_one() {
         let exec = unit_key("claude-evidence", "exec").unwrap_or_default();
-        assert_eq!(unit_after("claude-evidence"), vec!["firefox-soak", "claude-files"]);
-        assert_eq!(unit_key("claude-evidence", "requires").as_deref(), Some("td-firstboot,claude-files"));
+        assert_eq!(unit_after("claude-evidence"), vec!["firefox-soak", "claude-files", "claude-launch"]);
+        assert_eq!(unit_key("claude-evidence", "requires").as_deref(), Some("td-firstboot,claude-files,claude-launch"));
         assert!(unit_key("claude-evidence", "timeout").is_none());
         for needle in [
             format!("*\" {AUTOTEST_CMDLINE_TOKEN} \"*) :;; *) exit 0;; esac"),
@@ -7367,7 +7379,8 @@ news\tnews-0.1\tsource\tempty-runtime-1\tsource\n"
         assert!(before < refused && refused < ran && ran < after);
         assert!(after < marker && marker < published);
         assert_eq!(exec.matches("--command").count(), 1);
-        assert_eq!(exec.matches("--version").count(), 2);
+        assert_eq!(exec.matches("--version").count(), 3);
+        assert!(exec.contains("if shell_ran=$(/bin/td-login exec-as tester -- /bin/env TERM=td-term /bin/claude --version"));
         assert_eq!(exec.matches("--probe-process-token").count(), 2);
         assert_eq!(exec.matches("/bin/td-busd application").count(), 2);
         // Nothing but this unit publishes the completion, and the greeter

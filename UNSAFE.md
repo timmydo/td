@@ -86,7 +86,7 @@ an ioctl) the amendment is made here first rather than found in a diff.
 | 13 | `td-audio` | `ioctl(2)` with eleven value-pinned PCM requests, `poll(2)`, `getsockopt(2)` pinned to `SOL_SOCKET`/`SO_PEERCRED` |
 | 14 | `td-editor` | `recvmsg(2)`, `sendmsg(2)`, `fcntl(2)` pinned to `F_DUPFD_CLOEXEC`, `F_GETFL` and `F_SETFL`, `flistxattr(2)` pinned to a size-only query, `renameat2(2)` pinned to two borrowed parents and `RENAME_NOREPLACE`; plus one scoped descriptor adoption |
 | 15 | `td-secret` | shared `recvmsg(2)`, `sendmsg(2)`, `close(2)` transport and scoped adoption for bounded credential replies; plus the named credential intake module of §16 |
-| 16 | `td-authd` | `recvmsg(2)`, `setsockopt(2)` with fixed `SO_PASSCRED`/`SO_PASSPIDFD`, `getsockopt(2)` with fixed `SO_PEERCRED`, and `poll(2)` on the peer pidfd; one scoped descriptor adoption; a separate mount instruction/adoption for `unshare(2)`, `open_tree(2)`, `mount_setattr(2)`, and `move_mount(2)` with the fixed portal file-grant values below; plus the separate named credential intake module below |
+| 16 | `td-authd` | `recvmsg(2)`, `setsockopt(2)` with fixed `SO_PASSCRED`/`SO_PASSPIDFD`, `getsockopt(2)` with fixed `SO_PEERCRED`, and `poll(2)` on the peer pidfd; one scoped descriptor adoption; a separate mount instruction/adoption for `unshare(2)`, `open_tree(2)`, `mount_setattr(2)`, and `move_mount(2)` with the fixed portal file-grant values below; plus the separate named credential intake and six-request terminal ioctl/poll modules below |
 | 17 | `td-mail` | `ioctl(2)` (three pinned requests), `poll(2)` — td-sh's terminal half, in `term_sys.rs` |
 | 18 | `td-news` | the same `term_sys.rs`, byte for byte — see [§18](#18-td-news--the-same-terminal-surface) |
 
@@ -1461,7 +1461,8 @@ The argv0-selected launch parent first spawns and waits on a later-born stage
 1, because that child cannot already be a process-group leader. Stage 1 sets
 `PR_SET_PDEATHSIG=SIGKILL` and reads its exact parent back from procfs to close
 the death-before-set race. A child whose controlling-terminal field is zero
-and whose process group is that exact parent's pid preserves and reads back
+whose stdin is not a terminal, and whose process group is that exact
+parent's pid preserves and reads back
 the group, keeping a supervisor's stop containment intact. Every other child
 issues `setsid(2)` and requires its process group and session to equal the
 returned id while the controlling-terminal field is zero. This happens before
@@ -2459,6 +2460,33 @@ oracles cover sealed-descriptor immutability and transfer, sender identity,
 refused ancillary cleanup and descriptor-count limits. New commands,
 options, syscalls, descriptor consumers or allowances amend this section
 and both `td-authd/DESIGN.md` and `td-secret/DESIGN.md` in the same landing.
+
+### Claude shell terminal boundary
+
+The Claude shell launcher is another unprivileged consumer of the unchanged
+`secret_sys.rs` credentials/pidfd transport. It refuses incoming rights on
+requests and ordinary replies. Its one descriptor reply transfers only the
+fresh PTY master created by the application-UID server. The human client
+requires the authenticated live application sender and a character device
+with devpts master device 5:2. Credential intake still requires its sealed
+regular-file descriptor; no secret API admits terminals.
+
+The separate `td-authd/src/terminal_sys.rs` has one scoped x86-64 syscall
+instruction and one scoped adoption of the freshly returned PTY slave.
+It adds ioctl(16) with exactly six requests: TIOCSPTLCK(0x40045431), argument
+pointer to i32 zero; TIOCGPTPEER(0x5441), flags RDWR|NOCTTY|CLOEXEC(0x80102);
+TIOCGWINSZ(0x5413)/TIOCSWINSZ(0x5414), four u16 words; and
+TCGETS(0x5401)/TCSETS(0x5402), the 36-byte x86-64 kernel termios layout.
+A closed private enum selects requests. No arbitrary ioctl is exposed.
+Poll(7) has exactly two eight-byte descriptors, stdin (or -1) and the owned
+master, POLLIN and optionally POLLOUT, with a 100 ms timeout. Invalid
+FD events refuse; EINTR retries through the relay loop. Safe std owns PTY
+open, I/O and close. The raw-mode guard restores the saved termios on normal
+return and ordinary errors. Abrupt process death can bypass restoration.
+Neither the client nor server calls a credential-changing syscall here.
+The compositor's shared private-channel sys module remains unchanged.
+Confinement pins this complete module, request values and its safe callers;
+real-PTY tests cover descriptor identity, I/O, window size and restoration.
 
 ### Portal file-grant mount boundary
 
