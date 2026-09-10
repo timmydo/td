@@ -1370,9 +1370,12 @@ path; revision changes invalidate old entry coordinates. Physical `w` or
 Directory > Copy Entry Full Path uses the existing clipboard authority.
 The path is the resolved absolute literal Unix pathname, at most 4096 bytes;
 there are at most 64 rows. These fields are read-only metadata. Decoded
-Enter/click reuses a directory tab, Shift+Enter or pointer `extend=1` opens a
-foreground tab, `^` opens its parent and `g` refreshes, under the existing
-input fences. Delivery is not completion: poll the native file-busy flag,
+Enter/click retains the directory when opening a file, selecting an existing
+file tab when available. Opening a directory reuses its source tab;
+Shift+Enter or pointer `extend=1` opens another directory tab instead.
+`q` closes only the current directory tab, `^` opens its parent and `g`
+refreshes, under the existing input fences. Delivery is not completion: poll
+the native file-busy flag,
 then inspect tab revision/path/text. Semantic Open always adds/selects a tab
 and retains normal job history. DESIGN.md specifies stale-result refusal,
 read-only mutation errors and existing-file deduplication.

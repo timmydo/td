@@ -1218,9 +1218,15 @@ have no activatable row. Final symlinks are not followed on activation, even
 with trailing slashes. Parent components may follow links, as for file paths;
 explicit `.` and `..` directory paths are supported.
 
-Click or Enter opens an entry in the current tab. Shift-click or Shift+Enter
-opens a new foreground tab, retaining the source. Both profiles use these
-bindings. Arrow/Page keys and Emacs movement keys move the caret between
+Click or Enter opens a file in a foreground tab while retaining the source
+directory tab, including its selection, viewport, sort and deletion marks.
+An already-open file selects its existing tab without removing the directory.
+Opening a directory reuses the current tab; Shift-click or Shift+Enter
+opens it in a new foreground tab instead. Both profiles use these bindings.
+`q` closes only the current directory tab through the ordinary close path;
+it ignores repeat and pending Emacs prefixes and refuses while file work is
+busy. In text buffers `q` remains ordinary text input.
+Arrow/Page keys and Emacs movement keys move the caret between
 entries. `^` opens the parent in place (root refreshes root); `g` refreshes
 the current directory. Activation/refresh do not auto-repeat. Clicks below
 the last entry do nothing; directory clicks do not start text drags. Existing
@@ -1263,10 +1269,10 @@ decoding, budgets and counters are checked before replacement. Success keeps
 the TabId, increments revision, resets selection/viewport and adopts the new
 path/type. File views start with ordinary wrap/format defaults. Failed,
 stale, closed-origin or over-budget admission leaves existing tabs unchanged.
-Replacement consumes no new tab slot and works at the 64-tab ceiling.
-File deduplication is preserved: normal activation of an already-open file
-atomically removes the source directory and selects that file; Shift
-activation selects it without removing the source. Existing edits, history,
+Directory replacement consumes no new tab slot and works at the 64-tab
+ceiling. Opening a new file needs a free slot, but selecting an already-open
+file does not. Non-Shift file completions still check the captured source
+identity/revision before adding/selecting the file. Existing edits, history,
 cursor and saved-file baseline survive. Directories may have separate tabs
 for the same path. Replacement cancels held-key repeat even if TabId stays
 unchanged. Selecting a different tab while I/O runs does not retarget it.

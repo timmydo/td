@@ -865,7 +865,10 @@ impl Session {
                 mut completion @ (Completion::Open(_) | Completion::Directory(_)),
             ) => {
                 let source = match pending {
-                    Pending::Browse(point) => Some(point),
+                    Pending::Browse(point) => {
+                        ui.editor().check_revision(&point).map_err(|e| e.to_string())?;
+                        matches!(completion, Completion::Directory(_)).then_some(point)
+                    }
                     _ => None,
                 };
                 let replaced = source.as_ref().map(|point| point.tab);
@@ -913,7 +916,7 @@ impl Session {
                     Completion::Directory(mut snapshot) => {
                         snapshot.text = String::new();
                         self.directories.insert(tab, snapshot);
-                        return Ok("Directory: Enter/click opens; Shift new tab; ^ parent; g refresh; w copy path; s sort; S reverse".into());
+                        return Ok("Directory: Enter/click opens; files keep this tab; Shift new directory tab; q close; ^ parent; g refresh".into());
                     }
                     _ => return Err("Invalid Open completion".into()),
                 };
@@ -1438,7 +1441,7 @@ mod tests {
         assert_eq!(h.ui.editor().tabs().count(), 1);
         assert_eq!(h.ui.editor().document(tab).unwrap().revision(), 1);
         h.session
-            .browse(&h.ui, tab, 1, dir.path("child/file"), true)
+            .browse(&h.ui, tab, 1, dir.path("child/file"), false)
             .unwrap();
         h.complete().unwrap();
         let file = h.ui.editor().active().unwrap();
@@ -1455,9 +1458,10 @@ mod tests {
             .unwrap();
         h.complete().unwrap();
         assert_eq!(h.ui.editor().active(), Some(file));
-        assert_eq!(h.ui.editor().tabs().count(), 1);
-        assert!(h.session.directory(tab).is_none());
-        assert!(h.ui.tab_view(tab).is_err());
+        assert_eq!(h.ui.editor().tabs().count(), 2);
+        assert!(h.session.directory(tab).is_some());
+        assert!(h.ui.tab_view(tab).is_ok());
+        assert_eq!(h.ui.editor().document(tab).unwrap().revision(), 1);
         assert!(h.ui.editor().document(file).unwrap().dirty());
         assert_eq!(
             h.ui.editor().document(file).unwrap().text(),
@@ -1542,17 +1546,15 @@ mod tests {
         h.session
             .browse(&h.ui, tab, 0, dir.path("file"), false)
             .unwrap();
-        h.complete().unwrap();
-        assert_eq!(h.ui.editor().active(), Some(tab));
+        assert!(h.complete().is_err());
         assert_eq!(h.ui.editor().tabs().count(), 64);
-        assert!(!h.ui.editor().document(tab).unwrap().directory());
+        assert!(h.ui.editor().document(tab).unwrap().directory());
+        assert_eq!(h.ui.editor().document(tab).unwrap().revision(), 0);
+        h.session.browse(&h.ui, tab, 0, dir.0.clone(), false).unwrap();
+        h.complete().unwrap();
         assert_eq!(h.ui.editor().document(tab).unwrap().revision(), 1);
-        assert!(h.ui.tab_view(tab).unwrap().soft_wrap);
-        assert!(h
-            .session
-            .browse(&h.ui, tab, 1, dir.0.clone(), false)
-            .is_err());
-        let source = Some(h.ui.editor().revision_point(tab, 1).unwrap());
+        let editable = h.ui.editor().tabs().map(|(id, _)| id).find(|&id| id != tab).unwrap();
+        let source = Some(h.ui.editor().revision_point(editable, 0).unwrap());
         assert_eq!(
             h.ui.dispatch(Event::Open(crate::model::Open {
                 source,
@@ -1563,7 +1565,40 @@ mod tests {
             })),
             Err(crate::Error::InvalidArgument)
         );
-        assert_eq!(h.ui.editor().document(tab).unwrap().text(), "body");
+        assert_eq!(h.ui.editor().document(editable).unwrap().text(), "");
+    }
+
+    #[test]
+    fn directory_file_completion_refuses_closed_source_and_deduplicates_at_limit() {
+        let dir = Directory::new();
+        fs::write(dir.path("file"), "body").unwrap();
+        for existing in [false, true] {
+            let mut h = Harness::new();
+            let source = h.open(dir.0.clone());
+            if existing {
+                let file = h.open(dir.path("file"));
+                h.ui.dispatch(Event::Edit { tab: file, revision: 0,
+                    command: Command::Insert("dirty".into()) }).unwrap();
+            }
+            h.session.browse(&h.ui, source, 0, dir.path("file"), false).unwrap();
+            h.ui.dispatch(Event::Close { tab: source, revision: 0 }).unwrap();
+            let before = format!("{:?}", h.ui.editor());
+            assert!(h.complete().is_err());
+            assert_eq!(format!("{:?}", h.ui.editor()), before);
+        }
+        let mut h = Harness::new();
+        let source = h.open(dir.0.clone());
+        let file = h.open(dir.path("file"));
+        h.ui.dispatch(Event::Edit { tab: file, revision: 0,
+            command: Command::Insert("dirty".into()) }).unwrap();
+        let before = format!("{:?}", h.ui.editor().document(file).unwrap());
+        for _ in 2..64 { h.ui.dispatch(Event::New).unwrap(); }
+        h.session.browse(&h.ui, source, 0, dir.path("file"), false).unwrap();
+        h.complete().unwrap();
+        assert_eq!(h.ui.editor().active(), Some(file));
+        assert_eq!(h.ui.editor().tabs().count(), 64);
+        assert!(h.ui.editor().document(source).unwrap().directory());
+        assert_eq!(format!("{:?}", h.ui.editor().document(file).unwrap()), before);
     }
 
     #[test]

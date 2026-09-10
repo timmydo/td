@@ -6,6 +6,7 @@ use std::io::{BufRead, BufReader};
 use std::sync::mpsc;
 
 const FRAME_BYTES: usize = 800 * 600 * 3;
+const KEY_Q: u32 = 16;
 const KEY_W: u32 = 17;
 const KEY_R: u32 = 19;
 const KEY_Y: u32 = 21;
@@ -705,7 +706,7 @@ fn native_directory_tabs_reuse_shift_open_refresh_and_copy_path() {
                 .as_str()
             )
         );
-        compositor.chord(Some(KEY_LEFT_SHIFT), 28); // Shift+Enter keeps origin.
+        compositor.chord(None, 28); // Opening a file always keeps origin.
         editor.wait_field("state", "active", "2");
         assert_eq!(editor.ok("text\t2\t0\t0\t100"), "4\t626f6479");
         editor.ok("select-tab\t1\t1");
@@ -716,8 +717,12 @@ fn native_directory_tabs_reuse_shift_open_refresh_and_copy_path() {
         compositor.key(KEY_LEFT_SHIFT, false);
         editor.wait_field("state", "active", "3");
         wait_directory_rows(&mut editor, 3, 0, &["note"]);
-        compositor.click(40, 80); // Already-open note selects tab 2 and retires 3.
+        compositor.click(40, 80); // Already-open note selects tab 2 and keeps 3.
         editor.wait_field("state", "active", "2");
+        assert_eq!(editor.ok("state").matches("\ttab=").count(), 3);
+        editor.ok("select-tab\t3\t0");
+        compositor.chord(None, KEY_Q); // q closes only the directory tab.
+        editor.wait_field("state", "active", "1");
         assert_eq!(editor.ok("state").matches("\ttab=").count(), 2);
         editor.ok("select-tab\t1\t2");
         std::fs::write(root.join("added"), b"new").unwrap();

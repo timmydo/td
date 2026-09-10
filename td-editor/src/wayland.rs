@@ -1507,10 +1507,12 @@ impl Window {
         let directory = doc.directory();
         if directory
             && !self.ui.keys().pending()
-            && matches!(chord, "w" | "s" | "S" | "R" | "C" | "d" | "u" | "x" | "+")
+            && matches!(chord, "w" | "s" | "S" | "R" | "C" | "d" | "u" | "x" | "+" | "q")
         {
             if !repeated {
-                if chord == "w" {
+                if chord == "q" {
+                    self.close_tab(tab, revision);
+                } else if chord == "w" {
                     self.clipboard_request("copy-entry-path", tab, revision)?;
                 } else if chord == "R" {
                     self.rename_request(tab, revision);
@@ -7025,6 +7027,41 @@ mod tests {
     }
 
     #[test]
+    fn directory_q_closes_only_the_directory_and_refuses_repeat_and_busy_work() {
+        for profile in [Profile::Windows, Profile::Emacs] {
+            let directory = DialogDirectory::new();
+            let (mut w, _peer) = file_dialog_fixture();
+            configure(&mut w, 800, 600);
+            w.ui.dispatch(Event::Profile(profile)).unwrap();
+            w.chord("q", false).unwrap();
+            let before = format!("{:?}", w.ui.editor().document(1).unwrap());
+            assert!(w.ui.editor().document(1).unwrap().dirty());
+            w.files.as_mut().unwrap().open(directory.0.clone()).unwrap();
+            finish_file(&mut w);
+            w.chord("q", true).unwrap();
+            assert!(w.ui.editor().document(2).unwrap().directory());
+            if profile == Profile::Emacs {
+                w.chord("C-x", false).unwrap();
+                assert!(w.ui.keys().pending());
+                w.chord("q", false).unwrap();
+                assert!(w.ui.editor().document(2).unwrap().directory());
+                w.ui.dispatch(Event::CancelInput).unwrap();
+            }
+            w.files.as_mut().unwrap().open(directory.0.clone()).unwrap();
+            w.chord("q", false).unwrap();
+            assert!(w.ui.editor().document(2).is_ok());
+            finish_file(&mut w);
+            w.ui.dispatch(Event::SelectTab(2)).unwrap();
+            w.chord("q", false).unwrap();
+            assert!(w.ui.editor().document(2).is_err());
+            assert!(w.files.as_ref().unwrap().directory(2).is_none());
+            assert_eq!(format!("{:?}", w.ui.editor().document(1).unwrap()), before);
+            assert!(w.ui.editor().document(3).unwrap().directory());
+            assert!(!w.closed);
+        }
+    }
+
+    #[test]
     fn directory_copy_path_menu_and_scaled_pointer_navigation() {
         for scale in 1..=4 {
             let directory = DialogDirectory::new();
@@ -7084,10 +7121,11 @@ mod tests {
             )
             .unwrap();
             finish_file(&mut w);
-            assert_eq!(w.ui.editor().active(), Some(2));
-            assert_eq!(w.ui.editor().document(2).unwrap().text(), "body");
-            assert!(!w.ui.editor().document(2).unwrap().directory());
-            assert_eq!(w.ui.editor().document(2).unwrap().revision(), 1);
+            assert_eq!(w.ui.editor().active(), Some(3));
+            assert_eq!(w.ui.editor().document(3).unwrap().text(), "body");
+            assert!(!w.ui.editor().document(3).unwrap().directory());
+            assert_eq!(w.ui.editor().document(3).unwrap().revision(), 0);
+            assert!(w.ui.editor().document(2).unwrap().directory());
         }
     }
 

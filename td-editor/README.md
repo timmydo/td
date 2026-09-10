@@ -20,8 +20,10 @@ library and native F7/Format controls are implemented.
 Directories also open through File > Open or a command-line path, for example
 `td-editor .`. Their `[dir]` tabs are read-only listings:
 
-- Click or Enter opens an entry in the current tab.
-- Shift-click or Shift+Enter opens it in a new foreground tab.
+- Click or Enter opens a file and leaves the directory tab open.
+- Opening a directory reuses the tab; Shift-click or Shift+Enter opens
+  another directory tab instead.
+- `q` closes the current directory tab without closing your file tabs.
 - `^` goes to the parent; `g` refreshes; arrow/Emacs movement keys navigate.
 - File > Copy Full File Path copies the directory's own absolute path.
 - `R` or Directory > Rename / Move accepts a destination filename, with
