@@ -39,6 +39,8 @@ mod vm_git_origin;
 mod vm_git_names;
 #[path = "../vm_workspace.rs"]
 mod vm_workspace;
+#[path = "../vm_provision.rs"]
+mod vm_provision;
 
 type Result<T> = std::result::Result<T, String>;
 const TABLE_HEADER: &str = "NAME                             STATE    ACCEL    TEMPLATE         CPU RAM MiB HOST MiB  CAP MiB";
@@ -77,7 +79,7 @@ const HELP: &str = "td-vm: manage persistent graphical td instances
 TD_VM_HOME defaults to ~/.local/share/td-vm. Requires host QEMU, qemu-img and qemu-io.
 Reuse dist/td-vm-x86-64 from ./build-qcow; no image rebuild on create/open.
 Clipboard and feed actions require a bridge-capable system image. Workspace
-clone provisioning uses the updated image. Terminal launch, build-store setup
+automatic provisioning on Open uses the updated image. Terminal launch, build-store setup
 and login integration remain pending. Shut down from inside td;
 Stop requests guest poweroff; --force explicitly cuts power.";
 
@@ -492,6 +494,10 @@ fn disk_usage(path: &Path) -> Result<(u64, u64)> {
 }
 
 fn lock_file(path: &Path, key: &str, retry: bool) -> Result<File> {
+    optional_lock(path, key, retry)?.ok_or_else(|| format!("another operation holds {key}"))
+}
+
+fn optional_lock(path: &Path, key: &str, retry: bool) -> Result<Option<File>> {
     if path.is_symlink() {
         return Err("lock path is a symlink".into());
     }
@@ -519,10 +525,11 @@ fn lock_file(path: &Path, key: &str, retry: bool) -> Result<File> {
             Err(std::fs::TryLockError::WouldBlock) if Instant::now() < deadline => {
                 thread::sleep(Duration::from_millis(5));
             }
-            Err(e) => return Err(format!("another operation holds {key}: {e}")),
+            Err(std::fs::TryLockError::WouldBlock) => return Ok(None),
+            Err(e) => return Err(format!("lock {key}: {e}")),
         }
     }
-    Ok(file)
+    Ok(Some(file))
 }
 
 impl Manager {
@@ -578,27 +585,30 @@ impl Manager {
 
     fn enroll_workspace(&self, value: &str) -> Result<String> {
         name(value)?;
-        let _lock = self.lock(&format!("instance-{value}"))?;
-        let dir = self.instance(value)?;
-        let mut workspace = vm_workspace::load(&dir)?.ok_or("instance has no workspace plan")?;
+        let lock = self.lock(&format!("instance-{value}"))?;
+        self.enroll_locked(&self.instance(value)?, &lock)?.summary()
+    }
+
+    fn enroll_locked(&self, dir: &Path, lock: &File) -> Result<vm_workspace::Workspace> {
+        let mut workspace = vm_workspace::load(dir)?.ok_or("instance has no workspace plan")?;
         if workspace.enrollment.as_ref().is_some_and(|state| state.phase == vm_workspace::Phase::Revoking) {
             return Err("cannot enroll a revoking workspace; retry deletion, then create a fresh instance".into());
         }
         workspace.profile.check()?;
-        let reply = vm_bridge::ask(&dir, vm_wire::KEY, workspace.id.as_bytes().to_vec())?;
+        let reply = vm_bridge::ask(dir, vm_wire::KEY, workspace.id.as_bytes().to_vec())?;
         let key = vm_wire::git_key::parse(&reply, &workspace.id)?;
         if let Some(state) = &workspace.enrollment {
             if state.key != key { return Err("guest key differs from the saved enrollment; refusing replacement".into()); }
         }
         let phase = workspace.enrollment.as_ref().map_or(vm_workspace::Phase::Pending, |state| state.phase);
-        workspace.transition(&dir, phase, &key)?;
-        workspace.profile.enroll(&workspace.id, &workspace.branch, &key, &_lock)
+        workspace.transition(dir, phase, &key)?;
+        workspace.profile.enroll(&workspace.id, &workspace.branch, &key, lock)
             .map_err(|error| format!("Git enrollment is unconfirmed; retry with this same instance: {error}"))?;
-        workspace.transition(&dir, vm_workspace::Phase::Enrolled, &key)?;
-        let start = workspace.profile.start(&workspace.id, &workspace.branch, workspace.start.as_deref(), &_lock)
+        workspace.transition(dir, vm_workspace::Phase::Enrolled, &key)?;
+        let start = workspace.profile.start(&workspace.id, &workspace.branch, workspace.start.as_deref(), lock)
             .map_err(|error| format!("Git key enrolled; starting commit unconfirmed. Retry enrollment: {error}"))?;
-        workspace.record_start(&dir, &start)?;
-        workspace.summary()
+        workspace.record_start(dir, &start)?;
+        Ok(workspace)
     }
 
     fn clone_workspace(&self, value: &str) -> Result<String> {
@@ -822,7 +832,7 @@ impl Manager {
 
     fn workspace(&self, value: &str) -> Result<String> {
         match vm_workspace::load(&self.instance(value)?)? {
-            Some(workspace) => Ok(format!("{}\n\n{}", workspace.summary()?, workspace.profile.encode())),
+            Some(workspace) => Ok(format!("{}\n\n{}\n\n{}", workspace.summary()?, workspace.profile.encode(), provisioning_observation(&self.instance(value)?)?)),
             None => Ok("Workspace is unconfigured; prepare it while the instance is stopped.".into()),
         }
     }
@@ -994,10 +1004,12 @@ impl Manager {
         let deadline = Instant::now() + Duration::from_secs(15);
         loop {
             if running(&dir)? && dir.join("accel").is_file() {
-                println!(
-                    "opened {value} ({}); workspace integration pending",
-                    text(&dir.join("accel"))?.trim()
-                );
+                let workspace = match vm_workspace::load(&dir) {
+                    Ok(Some(_)) => "saved workspace provisioning continues in the background (w / workspace show)",
+                    Ok(None) => "workspace unconfigured; prepare it while stopped",
+                    Err(_) => "workspace plan unavailable; inspect logs",
+                };
+                println!("opened {value} ({}); {workspace}", text(&dir.join("accel"))?.trim());
                 return Ok(());
             }
             match completion.try_recv() {
@@ -1041,7 +1053,7 @@ impl Manager {
         verify_template(&self.template(&config.template)?)?;
         disk_available(&dir)?;
         cleanup_runtime(&dir)?;
-        let _bridge = vm_bridge::Supervisor::start(&dir)?;
+        let bridge = vm_bridge::Supervisor::start(&dir)?;
         // QEMU never reads stdin (serial goes to a file). Keeping the same
         // locked open-file description on fd 0 preserves exclusion even if
         // the supervisor dies before QEMU publishes its monitor or pidfile.
@@ -1083,7 +1095,14 @@ impl Manager {
             }
             thread::sleep(Duration::from_millis(100));
         }
-        let status = io(child.wait(), "wait for QEMU")?;
+        let provision = vm_provision::Worker::start(self.root.clone(), value.into(),
+            io(lifetime.try_clone(), "retain provisioning lifetime lock")?);
+        let status = child.wait();
+        provision.cancel();
+        // Closing the listener also releases a worker queued in connect.
+        drop(bridge);
+        drop(provision);
+        let status = io(status, "wait for QEMU")?;
         println!("QEMU ended: {status}; disks retained");
         if status.success() {
             Ok(())
@@ -1248,8 +1267,53 @@ impl Config {
     }
 }
 
+struct ProvisionHost<'a> {
+    manager: &'a Manager,
+    dir: &'a Path,
+    lock: &'a File,
+}
+impl vm_provision::Host for ProvisionHost<'_> {
+    fn key(&mut self) -> Result<()> {
+        let workspace = vm_workspace::load(self.dir)?.ok_or("instance has no workspace plan")?;
+        let reply = vm_bridge::ask(self.dir, vm_wire::KEY, workspace.id.as_bytes().to_vec())?;
+        vm_wire::git_key::parse(&reply, &workspace.id).map(|_| ())
+    }
+    fn enroll(&mut self) -> Result<vm_wire::workspace::Plan> {
+        let workspace = self.manager.enroll_locked(self.dir, self.lock)?;
+        let enrollment = workspace.enrollment.as_ref()
+            .filter(|state| state.phase == vm_workspace::Phase::Enrolled)
+            .ok_or("workspace is not enrolled")?;
+        workspace.profile.clone_plan(&workspace.id, &workspace.branch,
+            workspace.start.as_deref().ok_or("starting commit is not retained")?, &enrollment.key)
+    }
+    fn ensure(&mut self, plan: &vm_wire::workspace::Plan) -> Result<vm_wire::workspace::Progress> {
+        let reply = vm_bridge::ask(self.dir, vm_wire::WORKSPACE_ENSURE, plan.encode())?;
+        vm_wire::workspace::progress(&reply, plan)
+    }
+    fn report(&mut self, message: &str) {
+        let message: String = term::scrub_lines(message).chars().take(768).collect();
+        println!("workspace: {message}");
+        if let Err(error) = vm_bridge::publish(self.dir, "provisioning", message.as_bytes()) {
+            eprintln!("save workspace observation: {error}");
+        }
+    }
+}
+
+fn provisioning_observation(dir: &Path) -> Result<String> {
+    match File::open(dir.join("provisioning")) {
+        Ok(file) => {
+            let mut message = String::new();
+            io(file.take(4097).read_to_string(&mut message), "read provisioning observation")?;
+            if message.len() > 4096 { return Err("provisioning observation exceeds limit".into()); }
+            Ok(format!("Last Open provisioning observation (not a live check):\n{message}"))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok("Open provisioning has no recorded observation.".into()),
+        Err(error) => Err(format!("read provisioning observation: {error}")),
+    }
+}
+
 fn cleanup_runtime(dir: &Path) -> Result<()> {
-    for file in ["qmp", "pid", "accel", "guest", "bridge"] {
+    for file in ["qmp", "pid", "accel", "guest", "bridge", "provisioning"] {
         match fs::remove_file(dir.join(file)) {
             Ok(()) => (),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
@@ -1912,6 +1976,27 @@ mod tests {
     use std::os::unix::fs::symlink;
     use std::os::unix::net::UnixListener;
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    #[test]
+    fn automatic_worker_defers_contention_and_retains_only_its_own_lifetime() {
+        let scratch = Scratch::new(); let manager = Manager::new(&scratch.0).unwrap();
+        let dir = scratch.0.join("instances/worker"); private_dir(&dir).unwrap();
+        let key = vm_wire::workspace::example().host_key;
+        let profile = vm_git_profile::Profile::parse(&format!("TDVM-GIT-PROFILE-1\nrepository=/srv/git/td.git\naddress=10.0.2.2\nport=22\nuser=test\nserver-uid=1001\nsocket=/home/test/.td-vm-registrar\nregistrar=/usr/local/libexec/td-vm-registrar\ngit=/bin/git\nhost-key={key}\nauthor-name=Fixture\nauthor-email=fixture@example.invalid\n")).unwrap();
+        vm_workspace::Workspace::new("task", profile).unwrap().publish(&dir).unwrap();
+        let operation = manager.lock("instance-worker").unwrap();
+        let worker = vm_provision::Worker::start(scratch.0.clone(), "worker".into(), manager.lock("run-worker").unwrap());
+        thread::sleep(Duration::from_millis(250));
+        assert!(manager.active("worker").unwrap());
+        assert!(!dir.join("provisioning").exists(), "no attempt while another operation owns the instance");
+        drop(operation);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !dir.join("provisioning").exists() && Instant::now() < deadline { thread::sleep(Duration::from_millis(10)); }
+        assert!(fs::read_to_string(dir.join("provisioning")).unwrap().starts_with("Waiting for"));
+        drop(worker);
+        while manager.active("worker").unwrap() && Instant::now() < deadline { thread::sleep(Duration::from_millis(10)); }
+        assert!(!manager.active("worker").unwrap());
+    }
 
     struct Scratch(PathBuf);
     impl Scratch {

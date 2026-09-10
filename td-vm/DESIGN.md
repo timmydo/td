@@ -84,8 +84,9 @@ listing does not create manager state or take catalog locks.
 
 The stock desktop supports per-instance Git keys, enrollment and explicit
 clone provisioning and orderly poweroff through the guest helpers below.
-Private writable development stores, automatic launch
-provisioning, task-terminal launch and account linking remain pending. The
+Open automatically enrolls and prepares a saved workspace in the background.
+Private writable development stores, task-terminal launch and account linking
+remain pending. The
 td-owned clipboard, feed and workspace bridges require a matching updated
 system image. `stop NAME` or TUI S queues orderly guest poweroff;
 `stop NAME --force` or TUI X explicitly cuts power. Disk deletion requires `--yes` or
@@ -1468,8 +1469,8 @@ reply alone must never be displayed as an enrolled or ready workspace.
 `td-vm workspace enroll NAME` (E in the TUI) authenticates the instance's
 saved Git profile, requests its guest public key, and enrolls that exact key
 and task branch through the host registrar. The instance lock spans the
-identity read and every request. This is an explicit provisioning step;
-Open does not yet enroll or clone automatically. Successful enrollment
+identity read and every request. The Open supervisor also uses this same
+operation after the guest key becomes available. Successful enrollment
 reserves the branch at origin's HEAD through the existing registry operation.
 It then requests and records the retained starting commit described below.
 It does not establish a guest clone.
@@ -1537,7 +1538,8 @@ Git profile, each separated by LF. The existing 8960-byte bound and private
 atomic publication rules apply. Version 3 requires enrolled or revoking
 state. The starting commit cannot change and survives revocation retries.
 Existing v1/v2 records acquire a start on their next successful enrollment;
-there is no implicit migration on inspection or boot. Older managers refuse
+there is no implicit migration on inspection. Automatic Open enrollment also
+records the retained start. Older managers refuse
 v3, including deletion. The display reports the saved commit separately
 from enrollment and directs the user to explicit clone provisioning.
 
@@ -1576,9 +1578,9 @@ private Git workspace through the td-owned carrier. It rechecks the saved
 origin and exact retained commit before sending a typed public clone plan.
 The instance lock covers the request, just as it covers enrollment. A pending
 reply means provisioning may be running; repeat Clone to inspect completion.
-Open does not yet enroll or clone automatically. The local workspace view
-reports its saved enrollment and starting commit without claiming live clone
-status. A successful clone reply reports only workspace preparation, not
+Automatic Open provisioning uses the non-retrying operation below. The local
+workspace view reports its saved enrollment, starting commit, and last Open
+observation without claiming live clone status. A successful clone reply reports only workspace preparation, not
 terminal launch, build-store readiness, tests, or provider authentication.
 
 The `workspace` request has revision zero and contains `TDVM-CLONE-1`, then
@@ -1674,3 +1676,60 @@ remains a distinct power cut. Templates predating this helper must be updated
 before orderly Stop is available. The standard-image proof must write without
 an explicit guest sync, stop through this route, require the teardown marker,
 then reopen and verify the write and the sibling VM's continued operation.
+
+
+## Automatic workspace provisioning on Open
+
+For an instance with a saved workspace plan, each QEMU supervisor attempts
+provisioning automatically. It waits for the guest-generated public key, uses
+exactly the explicit enrollment/retention path, and then ensures the private
+clone and worktree. Instances without a Git profile/plan still open an ordinary
+desktop. Open never waits for a clone to finish, and leaving the TUI does not
+cancel provisioning. Opening an already running instance identifies its window;
+it does not start another provisioning attempt or terminal.
+
+A worker thread advances one step at a time while the main supervisor reaps
+its owned QEMU independently. Individual operations use the existing instance
+lock; contention defers the attempt without changing its phase. Enrollment
+holds that same lock through clone-plan construction. Waiting between attempts
+holds no operation lock. Each Git profile/registrar subprocess has a fifteen-
+second deadline covering connection, bounded output, and observed exit; timeout
+kills and reaps that recorded child and leaves uncertain mutations recoverable. No global
+catalog lock spans enrollment or cloning. The QEMU lifetime lock still excludes
+deletion throughout. Registrar subprocesses retain the operation lock even if
+the supervisor dies. The worker retains a clone of the QEMU lifetime lease while any step remains
+in flight; cancellation does not delay reaping QEMU or release that exclusion
+early. After reaping QEMU, the supervisor cancels the worker, closes its bridge and
+joins the worker before exiting. An in-flight bounded profile capture therefore
+keeps its deadline and child cleanup owner through ordinary VM shutdown. The
+instance can remain finishing shutdown while those bounded calls return; hard
+supervisor death retains the existing orphan-client exclusion limitation.
+There is no separate provisioning process to survive the QEMU supervisor. Loss of the supervisor still requires the existing
+QEMU-lifetime recovery; another Open cannot launch a second VM.
+
+The new revision-zero `workspace-ensure` operation carries the exact same public
+plan. It publishes a missing or changed request, but preserves a matching safe
+request inode, including after a failed attempt. Repeated progress requests
+therefore do not repeatedly invoke Git. It returns typed pending, ready or
+failed status, each bound to the entire plan and validated at both relays.
+Pending is `TDVM-CLONE-PENDING-1` followed by the canonical plan; ready and
+failed retain the existing forms. Missing helper status means pending; a
+malformed, mismatched or untrusted response is an error, never readiness.
+This operation needs an updated standard image; an older guest is not silently
+provisioned through repeated explicit Clone calls.
+
+Polling is spaced by at least two seconds. Missing keys or unavailable carrier
+progress stop the automatic attempt after ten minutes of unavailability. Valid
+pending clone progress refreshes that allowance, so a slow clone has no absolute
+completion deadline. Failed or unconfirmed enrollment and a reported clone
+failure stop the automatic attempt. Repair the cause and use E/enroll and
+C/clone for explicit recovery; a later fresh boot attempts again with the same
+identity, key, branch and retained start. A timeout never cancels guest Git,
+reclaims its staging, revokes a possibly enrolled key, or resets user work.
+
+The supervisor atomically saves bounded progress observations in its private
+`provisioning` file and logs changes. `workspace show` / TUI w displays the last
+Open observation, explicitly separate from live guest state and durable
+registration. Starting a new QEMU clears the previous observation. Manual
+recovery can supersede it; it is neither continuous workspace inspection nor a
+claim that a terminal, private writable build store, or agent login is ready.

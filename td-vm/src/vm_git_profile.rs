@@ -6,6 +6,9 @@ use std::io::{Read, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::os::unix::net::UnixStream;
+use std::time::{Duration, Instant};
+use std::thread;
 
 const LIMIT: u64 = 8192;
 const FILE: &str = "git-profile";
@@ -309,39 +312,46 @@ fn capture(command: Command) -> Result<Vec<u8>> {
     capture_input(command, Stdio::null())
 }
 
-fn capture_input(mut command: Command, input: Stdio) -> Result<Vec<u8>> {
-    let mut child = io(
-        command
-            .stdin(input)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .spawn(),
-        "start Git profile probe",
-    )?;
+fn capture_input(command: Command, input: Stdio) -> Result<Vec<u8>> {
+    capture_until(command, input, Duration::from_secs(15))
+}
+
+pub(crate) fn capture_until(mut command: Command, input: Stdio, timeout: Duration) -> Result<Vec<u8>> {
+    let (mut output, writer) = io(UnixStream::pair(), "create profile output channel")?;
+    io(output.set_nonblocking(true), "set profile output nonblocking")?;
+    let deadline = Instant::now() + timeout;
+    let mut child = io(command.stdin(input).stdout(Stdio::from(std::os::fd::OwnedFd::from(writer)))
+        .stderr(Stdio::inherit()).spawn(), "start Git profile probe")?;
+    // Command retains its Stdio socket; EOF requires releasing that copy.
+    drop(command);
     let result = (|| {
         let mut bytes = Vec::new();
-        let stdout = child.stdout.take().ok_or("missing probe output")?;
-        io(
-            stdout.take(LIMIT + 1).read_to_end(&mut bytes),
-            "read profile probe",
-        )?;
-        if bytes.len() as u64 > LIMIT {
-            return Err("profile probe output exceeds limit".into());
+        let mut buffer = [0; 1024];
+        let mut eof = false;
+        loop {
+            if Instant::now() >= deadline { return Err("Git profile probe timed out; mutation outcome may be unconfirmed".into()); }
+            if !eof {
+                match output.read(&mut buffer) {
+                    Ok(0) => eof = true,
+                    Ok(count) => {
+                        if bytes.len().saturating_add(count) as u64 > LIMIT {
+                            return Err("profile probe output exceeds limit".into());
+                        }
+                        bytes.extend_from_slice(buffer.get(..count).ok_or("invalid profile read length")?);
+                    }
+                    Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted) => {}
+                    Err(e) => return Err(format!("read profile probe: {e}")),
+                }
+            }
+            if let Some(status) = io(child.try_wait(), "inspect profile probe")? {
+                if !status.success() { return Err("Git profile probe failed; inspect its diagnostics".into()); }
+                if eof { return Ok(bytes); }
+            }
+            thread::sleep(Duration::from_millis(5));
         }
-        Ok(bytes)
     })();
-    let bytes = match result {
-        Ok(bytes) => bytes,
-        Err(error) => {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(error);
-        }
-    };
-    if !io(child.wait(), "wait for profile probe")?.success() {
-        return Err("Git profile probe failed; inspect its diagnostics".into());
-    }
-    Ok(bytes)
+    if result.is_err() { let _ = child.kill(); let _ = child.wait(); }
+    result
 }
 
 pub fn read(path: &Path, private: bool) -> Result<Profile> {
@@ -431,6 +441,43 @@ pub fn configure(root: &Path, input: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    #[ignore = "subprocess fixture, invoked by bounded_capture"]
+    fn profile_child() {
+        let Ok(mode) = std::env::var("TD_VM_PROFILE_CHILD") else { return; };
+        fs::write(std::env::var("TD_VM_PROFILE_PID").unwrap(), std::process::id().to_string()).unwrap();
+        match mode.as_str() {
+            "ok" => { std::io::stdout().write_all(b"profile-ok").unwrap(); }
+            "large" => { std::io::stdout().write_all(&[b'x'; 8193]).unwrap(); }
+            "backlog" => {
+                let mut streams = Vec::new();
+                for _ in 0..10000 { streams.push(UnixStream::connect(std::env::var("TD_VM_PROFILE_SOCKET").unwrap()).unwrap()); }
+            }
+            _ => thread::sleep(Duration::from_secs(60)),
+        }
+    }
+    #[test]
+    #[ignore = "host process fixture"]
+    fn bounded_capture_covers_connection_output_exit_and_reaps_the_client() {
+        let root = std::env::temp_dir().join(format!("td-vm-capture-{}", std::process::id()));
+        fs::create_dir(&root).unwrap();
+        let listener = std::os::unix::net::UnixListener::bind(root.join("socket")).unwrap();
+        for mode in ["ok", "large", "sleep", "backlog"] {
+            let mut command = Command::new(std::env::current_exe().unwrap());
+            command.args(["--exact", "vm_git_profile::tests::profile_child", "--ignored", "--nocapture"])
+                .env("TD_VM_PROFILE_CHILD", mode).env("TD_VM_PROFILE_PID", root.join("pid"))
+                .env("TD_VM_PROFILE_SOCKET", root.join("socket"));
+            let start = Instant::now();
+            let result = capture_until(command, Stdio::null(), Duration::from_millis(500));
+            assert_eq!(result.is_ok(), mode == "ok", "{mode}: {result:?}");
+            if mode == "ok" { assert!(String::from_utf8(result.unwrap()).unwrap().contains("profile-ok")); }
+            assert!(start.elapsed() < Duration::from_secs(3));
+            let pid = fs::read_to_string(root.join("pid")).unwrap();
+            assert!(!Path::new("/proc").join(pid).exists(), "child must be reaped");
+        }
+        drop(listener);
+        fs::remove_dir_all(root).unwrap();
+    }
     const KEY: &str =
         "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEB";
     fn example() -> String {

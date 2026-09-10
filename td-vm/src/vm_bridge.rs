@@ -40,6 +40,10 @@ fn reply(
             let shape = match request.verb.as_str() {
                 wire::SNAPSHOT => reply.revision != 0 && reply.data == b"clipboard-v1 feed-v1",
                 wire::POWEROFF => reply.revision == 0 && reply.data == wire::POWER_QUEUED,
+                wire::WORKSPACE_ENSURE => {
+                    reply.revision == 0 && wire::workspace::Plan::parse(&request.data)
+                        .is_ok_and(|plan| wire::workspace::progress(&reply.data, &plan).is_ok())
+                }
                 wire::WORKSPACE => {
                     reply.revision == 0 && wire::workspace::Plan::parse(&request.data)
                         .is_ok_and(|plan| wire::workspace::parse_ready(&reply.data, &plan).is_ok())
@@ -115,7 +119,7 @@ fn enabled(dir: &Path) -> Result<bool> {
     }
 }
 
-fn publish(dir: &Path, name: &str, bytes: &[u8]) -> Result<()> {
+pub(crate) fn publish(dir: &Path, name: &str, bytes: &[u8]) -> Result<()> {
     let temp = dir.join(format!("{name}-{:x}.tmp", request_id()?));
     let mut file = OpenOptions::new()
         .write(true)
@@ -259,7 +263,7 @@ fn forward(dir: &Path, request: wire::Message, deadline: Instant) -> Result<wire
         }
         wire::GET | wire::SNAPSHOT | wire::POWEROFF if request.data.is_empty() => {}
         wire::KEY => { wire::git_key::identity(&request.data)?; }
-        wire::WORKSPACE => { wire::workspace::Plan::parse(&request.data)?; }
+        wire::WORKSPACE | wire::WORKSPACE_ENSURE => { wire::workspace::Plan::parse(&request.data)?; }
         wire::FEED => {
             wire::feed(&request.data)?;
         }
@@ -304,6 +308,31 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn automatic_progress_crosses_both_relays_without_clipboard_permission() {
+        let temp = Temp::new(); sharing(&temp.0, "off").unwrap();
+        let listener = UnixListener::bind(temp.0.join("guest")).unwrap();
+        let plan = wire::workspace::example();
+        let response_plan = plan.clone();
+        let server = thread::spawn(move || {
+            for data in [wire::workspace::pending(&response_plan), wire::workspace::failure(&response_plan, "SSH refused"), wire::workspace::ready(&response_plan)] {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream.set_nonblocking(true).unwrap();
+                let deadline = Instant::now() + wire::TIMEOUT;
+                let request = wire::receive(&mut stream, None, deadline).unwrap();
+                assert_eq!(request.verb, wire::WORKSPACE_ENSURE);
+                assert_eq!(request.data, response_plan.encode());
+                wire::write_all(&mut stream, &wire::Message::new(request.id, wire::OK, 0, data).encode().unwrap(), deadline).unwrap();
+            }
+        });
+        let _supervisor = Supervisor::start(&temp.0).unwrap();
+        for expected in [wire::workspace::Progress::Pending, wire::workspace::Progress::Failed("SSH refused".into()), wire::workspace::Progress::Ready] {
+            let reply = ask(&temp.0, wire::WORKSPACE_ENSURE, plan.encode()).unwrap();
+            assert_eq!(wire::workspace::progress(&reply, &plan).unwrap(), expected);
+        }
+        server.join().unwrap();
     }
 
     #[test]

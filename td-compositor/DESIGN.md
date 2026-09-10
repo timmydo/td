@@ -6577,6 +6577,17 @@ inspection of human edits or agent readiness. Public Wayland/control clients
 cannot invoke this operation, and neither clipboard sharing nor focus gates it.
 
 
+The revision-zero `workspace-ensure` variant accepts the same public plan and
+endpoint checks. It preserves a matching safe request inode, even after a
+failed clone, so supervisor polling does not trigger retries. A missing status
+returns the typed pending record bound to that entire plan; existing ready and
+failed records cross only after full-plan validation. Explicit `workspace`
+continues to replace the inode for operator-requested retries. No terminal or
+host action is added. The shared publication helper compares at most the known
+request length plus one byte, including plans longer than the clipboard/feed
+configuration bound.
+
+
 The empty revision-zero `poweroff` carrier operation cancels clipboard leases
 and atomically replaces `vm-poweroff` with the fixed `TDVM-POWEROFF-1\n`
 record. Its `poweroff queued` reply means only publication. A separate root

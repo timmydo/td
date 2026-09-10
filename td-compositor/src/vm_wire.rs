@@ -17,6 +17,7 @@ pub const GET: &str = "get";
 pub const FEED: &str = "feed";
 pub const KEY: &str = "git-key";
 pub const WORKSPACE: &str = "workspace";
+pub const WORKSPACE_ENSURE: &str = "workspace-ensure";
 pub const POWEROFF: &str = "poweroff";
 #[allow(dead_code)] // Shared with the root guest power worker.
 pub const POWER_REQUEST: &str = "/run/td-compositor/1000/vm-poweroff";
@@ -104,7 +105,7 @@ impl Message {
 }
 
 fn valid_verb(verb: &str) -> bool {
-    matches!(verb, SNAPSHOT | PUT | GET | FEED | KEY | WORKSPACE | POWEROFF | OK | ERROR)
+    matches!(verb, SNAPSHOT | PUT | GET | FEED | KEY | WORKSPACE | WORKSPACE_ENSURE | POWEROFF | OK | ERROR)
 }
 
 fn decimal(value: Option<&str>) -> Result<u64, String> {
@@ -613,7 +614,23 @@ pub mod workspace {
         ]
         .concat()
     }
-    pub fn status(bytes: &[u8], expected: &Plan) -> Result<(), String> {
+    #[derive(Debug, PartialEq, Eq)]
+    pub enum Progress {
+        Pending,
+        Ready,
+        Failed(String),
+    }
+    pub fn pending(plan: &Plan) -> Vec<u8> {
+        [b"TDVM-CLONE-PENDING-1\n".as_slice(), plan.encode().as_slice()].concat()
+    }
+    pub fn progress(bytes: &[u8], expected: &Plan) -> Result<Progress, String> {
+        if bytes.len() > 4096 { return Err("workspace response exceeds limit".into()); }
+        if let Some(rest) = bytes.strip_prefix(b"TDVM-CLONE-PENDING-1\n") {
+            if Plan::parse(rest)? != *expected {
+                return Err("workspace pending reply differs from this request".into());
+            }
+            return Ok(Progress::Pending);
+        }
         if let Some(rest) = bytes.strip_prefix(b"TDVM-CLONE-FAILED-1\n") {
             let text = std::str::from_utf8(rest).map_err(|_| "invalid workspace failure")?;
             let (message, encoded) = text.split_once('\n').ok_or("invalid workspace failure")?;
@@ -623,11 +640,19 @@ pub mod workspace {
             {
                 return Err("workspace failure differs from this request".into());
             }
-            return Err(format!(
-                "Previous guest clone attempt failed: {message}. A retry was requested; run clone again to inspect completion"
-            ));
+            return Ok(Progress::Failed(message.into()));
         }
-        parse_ready(bytes, expected)
+        parse_ready(bytes, expected)?;
+        Ok(Progress::Ready)
+    }
+    pub fn status(bytes: &[u8], expected: &Plan) -> Result<(), String> {
+        match progress(bytes, expected)? {
+            Progress::Ready => Ok(()),
+            Progress::Pending => Err("workspace is not ready".into()),
+            Progress::Failed(message) => Err(format!(
+                "Previous guest clone attempt failed: {message}. A retry was requested; run clone again to inspect completion"
+            )),
+        }
     }
     #[cfg(test)]
     pub fn example() -> Plan {
@@ -640,6 +665,18 @@ pub mod workspace {
     mod tests {
         #![allow(clippy::unwrap_used)]
         use super::*;
+        #[test]
+        fn automatic_progress_is_typed_bounded_and_binds_the_full_plan() {
+            let plan = example();
+            for (bytes, expected) in [(pending(&plan), Progress::Pending), (ready(&plan), Progress::Ready),
+                (failure(&plan, "failed"), Progress::Failed("failed".into()))] {
+                assert_eq!(progress(&bytes, &plan).unwrap(), expected);
+                let mut other = plan.clone(); other.author_email = "other@example.invalid".into();
+                assert!(progress(&bytes, &other).is_err());
+                assert!(progress(&[bytes, b"extra\n".to_vec()].concat(), &plan).is_err());
+            }
+            assert!(progress(&vec![b'x'; 4097], &plan).is_err());
+        }
         #[test]
         fn plans_and_status_bind_every_field_and_refuse_injection() {
             let plan = example();
