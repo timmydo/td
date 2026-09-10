@@ -92,6 +92,71 @@ fn scrollbar_geometry_and_pixels_are_bounded_at_every_scale() {
 }
 
 #[test]
+#[allow(clippy::unwrap_used, reason = "bounded horizontal scrollbar fixtures")]
+fn horizontal_scrollbar_has_its_own_pixels_and_never_overlaps_other_regions() {
+    for scale in 1..=4 {
+        let s = usize::from(scale);
+        for (w, h) in [(1, 1), (40 * s, 104 * s), (400 * s, 240 * s)] {
+            let geometry = geometry(w, h, scale).with_horizontal_scrollbar(true);
+            for total in [0, 1, 1001, usize::MAX] {
+                for origin in [0, usize::MAX] {
+                    if let Some(bar) = geometry.horizontal_scrollbar(total, origin) {
+                        assert_eq!(bar.track.intersection(geometry.bounds()), Some(bar.track));
+                        assert_eq!(bar.thumb.intersection(bar.track), Some(bar.thumb));
+                        assert_eq!(bar.track.intersection(geometry.document()), None);
+                        assert_eq!(bar.track.intersection(geometry.status()), None);
+                        assert_eq!(
+                            bar.track
+                                .intersection(geometry.scrollbar(100, 0).unwrap().track),
+                            None
+                        );
+                    }
+                }
+            }
+        }
+        let geometry = geometry(400 * s, 240 * s, scale).with_horizontal_scrollbar(true);
+        let doc = editor(&"x".repeat(1000), Selection::default());
+        let view = View {
+            soft_wrap: false,
+            ..View::default()
+        };
+        let full = pixels(&doc, geometry, view);
+        let bar = geometry.horizontal_scrollbar(1001, 0).unwrap();
+        assert_eq!(
+            color(&full, 400 * s, bar.thumb.x as usize, bar.thumb.y as usize),
+            render::LINE_NUMBER | 0xff000000
+        );
+        assert_eq!(
+            color(
+                &full,
+                400 * s,
+                (bar.track.x + i64::from(bar.track.width) - 1) as usize,
+                bar.track.y as usize
+            ),
+            render::CHROME | 0xff000000
+        );
+        let font = font::pinned().unwrap();
+        let scene = Scene::new(&doc, geometry, view, &[], Profile::Windows).unwrap();
+        let mut damaged = vec![0; full.len()];
+        let mut raster = Raster::new(&mut damaged, &font, geometry, 400 * s * 4).unwrap();
+        for x in (0..400 * s).step_by(13) {
+            raster
+                .paint(
+                    &scene,
+                    Rect {
+                        x: x as i64,
+                        y: 0,
+                        width: 13,
+                        height: (240 * s) as u32,
+                    },
+                )
+                .unwrap();
+        }
+        assert_eq!(damaged, full);
+    }
+}
+
+#[test]
 #[allow(clippy::unwrap_used, reason = "validated renderer fixtures")]
 fn notices_change_only_status_pixels_at_every_scale_and_restore_cleanly() {
     let font = font::pinned().unwrap();

@@ -188,21 +188,21 @@ impl Controller {
             caret_visible: self.caret_visible,
             ..View::default()
         };
-        let mut cached_rows = None;
+        let mut cached_metrics = None;
         if let Some(tab) = self.editor.active() {
             let state = self.tab_view(tab)?;
             view.origin = state.viewport.origin();
             view.soft_wrap = state.soft_wrap;
             view.affinity = state.affinity;
-            cached_rows = Some(state.metrics.rows);
+            cached_metrics = Some(state.metrics);
         }
-        Scene::with_rows(
+        Scene::with_metrics(
             &self.editor,
             self.geometry,
             view,
             labels,
             self.keys.profile(),
-            cached_rows,
+            cached_metrics,
         )
     }
 
@@ -289,6 +289,9 @@ impl Controller {
         self.mark = None;
         self.drag = None;
     }
+    pub(crate) fn scrollbar_drag(&self) -> bool {
+        matches!(self.drag, Some(Drag::Scrollbar { .. }))
+    }
     fn wake_caret(&mut self) {
         self.blink_start = self.clock;
         self.caret_visible = self.focused;
@@ -321,17 +324,31 @@ impl Controller {
             1
         };
         self.geometry = self.geometry.with_line_numbers(numbers.then_some(lines));
-        let (columns, rows) = self.geometry.grid();
-        let columns = columns.max(1);
-        let rows = rows.max(1);
+        let horizontal = if let Some(tab) = self.editor.active() {
+            let doc = self.editor.document(tab)?;
+            !self
+                .tabs
+                .get(&tab)
+                .map_or(!doc.directory(), |state| state.soft_wrap)
+        } else {
+            false
+        };
+        self.geometry = self.geometry.with_horizontal_scrollbar(horizontal);
         self.tabs.retain(|id, _| self.editor.document(*id).is_ok());
         for (id, doc) in self.editor.tabs() {
+            let soft_wrap = self
+                .tabs
+                .get(&id)
+                .map_or(!doc.directory(), |state| state.soft_wrap);
+            let (columns, rows) = self.geometry.with_horizontal_scrollbar(!soft_wrap).grid();
+            let columns = columns.max(1);
+            let rows = rows.max(1);
             let new_view = Viewport::new(columns, rows)?;
             let state = self.tabs.entry(id).or_insert(TabView {
                 viewport: new_view,
                 affinity: Affinity::Downstream,
                 desired_column: None,
-                soft_wrap: !doc.directory(),
+                soft_wrap,
                 metrics: Metrics {
                     rows: 0,
                     columns: 0,
@@ -783,10 +800,13 @@ impl Controller {
             return Ok(Outcome::Ignored);
         }
         let state = self.tab_view(tab)?;
-        if let Some(bar) = self
-            .geometry
-            .scrollbar(state.metrics.rows, state.viewport.origin().row)
-        {
+        let origin = state.viewport.origin();
+        let bars = [
+            self.geometry.scrollbar(state.metrics.rows, origin.row),
+            self.geometry
+                .horizontal_scrollbar(state.metrics.columns, origin.column),
+        ];
+        for bar in bars.into_iter().flatten() {
             if phase == PointerPhase::Press && bar.track.contains(x, y) {
                 self.reset_input();
                 if !bar.enabled() {
@@ -795,21 +815,26 @@ impl Controller {
                 if bar.thumb.contains(x, y) {
                     self.drag = Some(Drag::Scrollbar {
                         tab,
-                        grab: y - bar.thumb.y,
+                        grab: bar.coordinate(x, y) - bar.coordinate(bar.thumb.x, bar.thumb.y),
                         bar,
-                        origin: state.viewport.origin().row,
+                        origin: if bar.horizontal() {
+                            origin.column
+                        } else {
+                            origin.row
+                        },
                     });
                 } else {
-                    let delta = if y < bar.thumb.y {
-                        -(rows as isize)
+                    let page = if bar.horizontal() {
+                        columns as isize
                     } else {
                         rows as isize
                     };
-                    self.tabs
-                        .get_mut(&tab)
-                        .ok_or(Error::MissingTab)?
-                        .viewport
-                        .scroll(delta, state.metrics.rows);
+                    let delta = if bar.coordinate(x, y) < bar.coordinate(bar.thumb.x, bar.thumb.y) {
+                        -page
+                    } else {
+                        page
+                    };
+                    self.scrollbar_scroll(tab, bar, delta)?;
                 }
                 return Ok(Outcome::Changed);
             }
@@ -826,13 +851,14 @@ impl Controller {
                 if owner != tab {
                     return Err(Error::InvalidArgument);
                 }
-                let row = bar.row_at(y, grab, origin);
-                let delta = row as isize - state.viewport.origin().row as isize;
-                self.tabs
-                    .get_mut(&tab)
-                    .ok_or(Error::MissingTab)?
-                    .viewport
-                    .scroll(delta, state.metrics.rows);
+                let position = bar.position_at(bar.coordinate(x, y), grab, origin);
+                let current = state.viewport.origin();
+                let current = if bar.horizontal() {
+                    current.column
+                } else {
+                    current.row
+                };
+                self.scrollbar_scroll(tab, bar, position as isize - current as isize)?;
                 if phase == PointerPhase::Release {
                     self.drag = None;
                 }
@@ -900,6 +926,18 @@ impl Controller {
         state.desired_column = None;
         self.wake_caret();
         Ok(Outcome::Changed)
+    }
+
+    fn scrollbar_scroll(&mut self, tab: TabId, bar: Scrollbar, delta: isize) -> Result<()> {
+        let state = self.tabs.get_mut(&tab).ok_or(Error::MissingTab)?;
+        if bar.horizontal() {
+            state
+                .viewport
+                .scroll_horizontal(delta, state.metrics.columns, state.soft_wrap);
+        } else {
+            state.viewport.scroll(delta, state.metrics.rows);
+        }
+        Ok(())
     }
 }
 

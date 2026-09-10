@@ -1001,9 +1001,27 @@ Scrollbar input changes only the viewport, not selection, revision, undo
 history or directory activation. A press cancels key prefixes and marks.
 Thumb drags use the same tab/revision, focus, geometry and ownership fences
 as selection drags, including decoded remote pointer events; track clicks
-do not establish a drag. The controller supplies cached layout row counts
-to the scene; standalone reference scenes calculate their own. Horizontal
-scrolling remains wheel/remote-command only in this increment.
+do not establish a drag. The controller supplies cached layout metrics
+to the scene; standalone reference scenes calculate their own.
+
+Unwrapped text and directory tabs also reserve 16 logical pixels above
+the status strip for a horizontal scrollbar: four pixels of separation,
+then a 12-pixel track spanning the document width. Wrapped tabs reserve
+no bottom track. The vertical track and gutter end at the shortened
+document bottom; the lower-right corner is inert paper, not a hit target.
+Both bars are hidden if no full document row or column fits. A fitting
+unwrapped buffer has a disabled horizontal thumb. Horizontal geometry,
+page clicks and drag rounding use columns in place of rows, including
+the layout's final caret column; both axes share one thumb algorithm.
+Horizontal movement does not change vertical origin. Per-tab viewport
+heights follow each tab's wrap mode, so switching tabs does not clamp an
+inactive unwrapped tab using a wrapped tab's taller document area.
+Changing wrap mode cancels a drag and recomputes the usable grid; enabling
+wrap also resets horizontal origin. Native scrollbar coordinates use
+floor rounding on both axes, including move/release outside the track,
+so a stationary subpixel click/release does not move the viewport.
+Standalone scene callers opt into the reserved horizontal strip with
+`Geometry::with_horizontal_scrollbar(true)` and an unwrapped `View`.
 Tabs are 160 pixels
 wide with 24 pixels reserved for the close mark. A contiguous slice of tabs
 is shown, keeping the active tab visible; a surface narrower than one tab

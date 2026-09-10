@@ -2,7 +2,7 @@
 
 use crate::font::Font;
 use crate::keys::Profile;
-use crate::layout::{Affinity, Break, Caret, Layout, Position, CELL_HEIGHT, CELL_WIDTH};
+use crate::layout::{Affinity, Break, Caret, Layout, Metrics, Position, CELL_HEIGHT, CELL_WIDTH};
 use crate::model::{Editor, Limits, TabId};
 use crate::{text, Error, Result};
 
@@ -138,6 +138,7 @@ pub struct Geometry {
     scale: Scale,
     gutter_columns: usize,
     prompt_rows: usize,
+    horizontal_scrollbar: bool,
 }
 
 pub const MAX_PROMPT_ROWS: usize = 15;
@@ -152,6 +153,7 @@ impl Default for Geometry {
             scale: Scale(1),
             gutter_columns: 0,
             prompt_rows: 0,
+            horizontal_scrollbar: false,
         }
     }
 }
@@ -174,10 +176,21 @@ impl Geometry {
             scale,
             gutter_columns: 0,
             prompt_rows: 0,
+            horizontal_scrollbar: false,
         })
     }
     pub fn dimensions(self) -> (usize, usize) {
         (self.width, self.height)
+    }
+    pub fn with_horizontal_scrollbar(mut self, enabled: bool) -> Self {
+        self.horizontal_scrollbar = enabled;
+        self
+    }
+    fn document_height(self) -> u32 {
+        let chrome = 72 + if self.horizontal_scrollbar { 16 } else { 0 };
+        self.height
+            .saturating_sub(chrome * self.scale.value() + self.prompt().height as usize)
+            as u32
     }
     pub fn with_prompt_rows(mut self, rows: usize) -> Result<Self> {
         if rows > MAX_PROMPT_ROWS { return Err(Error::Limit); }
@@ -202,7 +215,7 @@ impl Geometry {
             y: (48 * s + self.prompt().height as usize) as i64,
             width: (self.gutter_columns * CELL_WIDTH * s).min(self.width.saturating_sub(16 * s))
                 as u32,
-            height: self.height.saturating_sub(72 * s + self.prompt().height as usize) as u32,
+            height: self.document_height(),
         }
     }
     pub fn scale(self) -> Scale {
@@ -240,7 +253,7 @@ impl Geometry {
             x: gutter.x + i64::from(gutter.width),
             y: (48 * s + self.prompt().height as usize) as i64,
             width: self.width.saturating_sub(32 * s + gutter.width as usize) as u32,
-            height: self.height.saturating_sub(72 * s + self.prompt().height as usize) as u32,
+            height: self.document_height(),
         }
     }
     pub fn grid(self) -> (usize, usize) {
@@ -263,23 +276,33 @@ impl Geometry {
             width: (12 * s) as u32,
             height: document.height,
         };
-        let maximum = total_rows.saturating_sub(rows);
-        let height =
-            ((u128::from(track.height) * rows as u128) / total_rows.max(rows) as u128) as u32;
-        let ceiling = track.height - if maximum == 0 { 0 } else { s as u32 };
-        let height = height.max((24 * s) as u32).min(ceiling);
-        let travel = track.height - height;
-        let offset =
-            (u128::from(travel) * first_row.min(maximum) as u128 / maximum.max(1) as u128) as i64;
-        Some(Scrollbar {
+        Some(Scrollbar::new(track, rows, total_rows, first_row, s, false))
+    }
+    pub fn horizontal_scrollbar(
+        self,
+        total_columns: usize,
+        first_column: usize,
+    ) -> Option<Scrollbar> {
+        let (columns, rows) = self.grid();
+        if !self.horizontal_scrollbar || columns == 0 || rows == 0 {
+            return None;
+        }
+        let s = self.scale.value();
+        let document = self.document();
+        let track = Rect {
+            x: document.x,
+            y: document.y + i64::from(document.height) + (4 * s) as i64,
+            width: document.width,
+            height: (12 * s) as u32,
+        };
+        Some(Scrollbar::new(
             track,
-            thumb: Rect {
-                y: track.y + offset,
-                height,
-                ..track
-            },
-            maximum,
-        })
+            columns,
+            total_columns,
+            first_column,
+            s,
+            true,
+        ))
     }
     pub fn status(self) -> Rect {
         let height = 24 * self.scale.value();
@@ -325,31 +348,88 @@ pub struct Scrollbar {
     pub track: Rect,
     pub thumb: Rect,
     maximum: usize,
+    horizontal: bool,
 }
 
 impl Scrollbar {
+    fn new(
+        track: Rect,
+        visible: usize,
+        total: usize,
+        first: usize,
+        scale: usize,
+        horizontal: bool,
+    ) -> Self {
+        let maximum = total.saturating_sub(visible);
+        let length = if horizontal {
+            track.width
+        } else {
+            track.height
+        };
+        let size = (u128::from(length) * visible as u128 / total.max(visible) as u128) as u32;
+        // Both callers require a full cell, so length is at least 8 * scale.
+        let ceiling = length - if maximum == 0 { 0 } else { scale as u32 };
+        let size = size.max((24 * scale) as u32).min(ceiling);
+        let travel = length - size;
+        let offset =
+            (u128::from(travel) * first.min(maximum) as u128 / maximum.max(1) as u128) as i64;
+        let thumb = if horizontal {
+            Rect {
+                x: track.x + offset,
+                width: size,
+                ..track
+            }
+        } else {
+            Rect {
+                y: track.y + offset,
+                height: size,
+                ..track
+            }
+        };
+        Self {
+            track,
+            thumb,
+            maximum,
+            horizontal,
+        }
+    }
+    pub(crate) fn horizontal(self) -> bool {
+        self.horizontal
+    }
+    pub(crate) fn coordinate(self, x: i64, y: i64) -> i64 {
+        if self.horizontal {
+            x
+        } else {
+            y
+        }
+    }
     pub fn enabled(self) -> bool {
         self.maximum != 0
     }
 
-    pub(crate) fn row_at(self, y: i64, grab: i64, origin: usize) -> usize {
-        let travel = self.track.height - self.thumb.height;
-        let top = y.saturating_sub(grab);
-        let delta = top.saturating_sub(self.thumb.y);
-        // Anchor to the exact original row: a click/release must not jump
-        // by the rows lost when the thumb position was rounded to pixels.
+    pub(crate) fn position_at(self, coordinate: i64, grab: i64, origin: usize) -> usize {
+        let travel = if self.horizontal {
+            self.track.width - self.thumb.width
+        } else {
+            self.track.height - self.thumb.height
+        };
+        let start = self.coordinate(self.track.x, self.track.y);
+        let leading_edge = coordinate.saturating_sub(grab);
+        let delta = leading_edge.saturating_sub(self.coordinate(self.thumb.x, self.thumb.y));
+        // Anchor to the exact original position: a click/release must not
+        // jump by the units lost when the thumb was rounded to pixels.
         if delta == 0 {
             return origin.min(self.maximum);
         }
-        if top <= self.track.y {
+        if leading_edge <= start {
             return 0;
         }
-        if top >= self.track.y + i64::from(travel) {
+        if leading_edge >= start + i64::from(travel) {
             return self.maximum;
         }
         let distance = i128::from(delta) * self.maximum as i128;
-        let rows = (distance.abs() + i128::from(travel / 2)) / i128::from(travel.max(1));
-        (origin as i128 + rows * distance.signum()).clamp(0, self.maximum as i128) as usize
+        let units = (distance.abs() + i128::from(travel / 2)) / i128::from(travel.max(1));
+        (origin as i128 + units * distance.signum()).clamp(0, self.maximum as i128) as usize
     }
 }
 
@@ -500,7 +580,7 @@ pub struct Scene<'a> {
     spelling: &'a [std::ops::Range<usize>],
     spelling_status: Option<String>,
     notice: Option<&'a str>,
-    scrollbar: Option<Scrollbar>,
+    scrollbars: [Option<Scrollbar>; 2],
 }
 
 impl<'a> Scene<'a> {
@@ -511,16 +591,16 @@ impl<'a> Scene<'a> {
         labels: &'a [Label<'a>],
         profile: Profile,
     ) -> Result<Self> {
-        Self::with_rows(editor, geometry, view, labels, profile, None)
+        Self::with_metrics(editor, geometry, view, labels, profile, None)
     }
 
-    pub(crate) fn with_rows(
+    pub(crate) fn with_metrics(
         editor: &'a Editor,
         geometry: Geometry,
         view: View,
         labels: &'a [Label<'a>],
         profile: Profile,
-        cached_rows: Option<usize>,
+        cached_metrics: Option<Metrics>,
     ) -> Result<Self> {
         if labels.len() > Limits::default().tabs
             || labels.iter().any(|label| label.title.len() > 4096)
@@ -540,7 +620,7 @@ impl<'a> Scene<'a> {
             }
         }
         let mut caret = None;
-        let mut scrollbar = None;
+        let mut scrollbars = [None; 2];
         let mut status = String::from("No document");
         if let Some(id) = editor.active() {
             let doc = editor.document(id)?;
@@ -566,11 +646,18 @@ impl<'a> Scene<'a> {
             let (columns, rows) = geometry.grid();
             if columns != 0 && rows != 0 {
                 let layout = Layout::for_document(doc, columns, view.soft_wrap)?;
-                let total = match cached_rows {
-                    Some(rows) => rows,
-                    None => layout.metrics().rows,
+                let total = match cached_metrics {
+                    Some(metrics) => metrics,
+                    None => layout.metrics(),
                 };
-                scrollbar = geometry.scrollbar(total, view.origin.row);
+                scrollbars = [
+                    geometry.scrollbar(total.rows, view.origin.row),
+                    if view.soft_wrap {
+                        None
+                    } else {
+                        geometry.horizontal_scrollbar(total.columns, view.origin.column)
+                    },
+                ];
                 if view.focused && view.caret_visible {
                     caret = Some(layout.position(Caret {
                         byte,
@@ -589,7 +676,7 @@ impl<'a> Scene<'a> {
             spelling: &[],
             spelling_status: None,
             notice: None,
-            scrollbar,
+            scrollbars,
         })
     }
 
@@ -716,7 +803,7 @@ impl<'a> Scene<'a> {
             );
         }
         self.document(clip, sink);
-        if let Some(bar) = self.scrollbar {
+        for bar in self.scrollbars.iter().flatten() {
             fill(bar.track, CHROME, sink);
             fill(
                 bar.thumb,

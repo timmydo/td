@@ -193,6 +193,116 @@ fn active(ui: &Controller) -> (u64, u64) {
     let id = ui.editor().active().unwrap();
     (id, ui.editor().document(id).unwrap().revision())
 }
+
+#[test]
+fn horizontal_scrollbar_pages_drags_and_preserves_wrap_and_tab_state() {
+    for scale in 1..=4 {
+        let mut ui = loaded(&"x".repeat(1000));
+        resize(&mut ui, 400 * scale as usize, 240 * scale as usize, scale);
+        assert!(ui.geometry().horizontal_scrollbar(1001, 0).is_none());
+        let rows = ui.geometry().grid().1;
+        ui.dispatch(Event::Wrap {
+            tab: 1,
+            revision: 0,
+            enabled: false,
+        })
+        .unwrap();
+        assert_eq!(ui.geometry().grid().1 + 1, rows);
+        let before = format!("{:?}", ui.editor().document(1).unwrap());
+        let columns = ui.geometry().grid().0;
+        let bar = ui.geometry().horizontal_scrollbar(1001, 0).unwrap();
+        pointer(
+            &mut ui,
+            PointerPhase::Press,
+            bar.track.x + i64::from(bar.track.width) - 1,
+            bar.track.y,
+            false,
+        );
+        assert_eq!(ui.tab_view(1).unwrap().viewport.origin().column, columns);
+        assert_eq!(
+            pointer(&mut ui, PointerPhase::Release, 0, 0, false),
+            Outcome::Ignored
+        );
+        let bar = ui.geometry().horizontal_scrollbar(1001, columns).unwrap();
+        pointer(
+            &mut ui,
+            PointerPhase::Press,
+            bar.thumb.x + 2,
+            bar.thumb.y,
+            false,
+        );
+        pointer(&mut ui, PointerPhase::Move, i64::MAX, -100, false);
+        assert_eq!(
+            ui.tab_view(1).unwrap().viewport.origin().column,
+            1001 - columns
+        );
+        pointer(&mut ui, PointerPhase::Release, i64::MIN, -100, false);
+        assert_eq!(ui.tab_view(1).unwrap().viewport.origin().column, 0);
+        assert_eq!(format!("{:?}", ui.editor().document(1).unwrap()), before);
+        let state = ui.tab_view(1).unwrap();
+        ui.dispatch(Event::Load(b"wrapped")).unwrap();
+        assert!(ui.geometry().horizontal_scrollbar(1001, 0).is_none());
+        assert_eq!(ui.tab_view(1).unwrap(), state);
+        ui.dispatch(Event::SelectTab(1)).unwrap();
+        assert_eq!(ui.tab_view(1).unwrap(), state);
+        let bar = ui.geometry().horizontal_scrollbar(1001, 0).unwrap();
+        pointer(
+            &mut ui,
+            PointerPhase::Press,
+            bar.thumb.x + 2,
+            bar.thumb.y,
+            false,
+        );
+        assert_eq!(
+            pointer(&mut ui, PointerPhase::Move, bar.thumb.x + 2, bar.thumb.y, false),
+            Outcome::Changed
+        );
+        ui.dispatch(Event::Wrap {
+            tab: 1,
+            revision: 0,
+            enabled: true,
+        })
+        .unwrap();
+        assert_eq!(
+            pointer(&mut ui, PointerPhase::Move, 999, 0, false),
+            Outcome::Ignored
+        );
+        assert!(ui.geometry().horizontal_scrollbar(1001, 0).is_none());
+    }
+}
+
+#[test]
+fn horizontal_scrollbar_uses_exact_column_origin_and_independent_rounding() {
+    let mut ui = loaded(&"x".repeat(1000));
+    resize(&mut ui, 400, 240, 1);
+    ui.dispatch(Event::Wrap {
+        tab: 1,
+        revision: 0,
+        enabled: false,
+    })
+    .unwrap();
+    ui.dispatch(Event::Scroll {
+        tab: 1,
+        revision: 0,
+        rows: 0,
+        columns: 137,
+    })
+    .unwrap();
+    let bar = ui.geometry().horizontal_scrollbar(1001, 137).unwrap();
+    assert_eq!(
+        (bar.track.width, bar.thumb.width, bar.thumb.x),
+        (368, 24, 57)
+    );
+    let x = bar.thumb.x + 3;
+    pointer(&mut ui, PointerPhase::Press, x, bar.thumb.y, false);
+    // 955 columns over 344 pixels, signed deltas anchored at column 137.
+    for (delta, column) in [(0, 137), (1, 140), (7, 156), (172, 615), (-1, 134)] {
+        pointer(&mut ui, PointerPhase::Move, x + delta, 0, false);
+        assert_eq!(ui.tab_view(1).unwrap().viewport.origin().column, column);
+    }
+    pointer(&mut ui, PointerPhase::Release, x, 0, false);
+    assert_eq!(ui.tab_view(1).unwrap().viewport.origin().column, 137);
+}
 fn edit(ui: &mut Controller, command: Command) {
     let (tab, revision) = active(ui);
     ui.dispatch(Event::Edit {
@@ -744,7 +854,7 @@ fn scrolling_preserves_selection_and_tab_origins_until_a_caret_reveal() {
     })
     .unwrap();
     let state = ui.tab_view(1).unwrap();
-    assert_eq!(state.viewport.origin().row, 3);
+    assert_eq!(state.viewport.origin().row, 4);
     assert_eq!(state.viewport.origin().column, 7);
     assert_eq!(selection(&ui), Selection::default());
     ui.dispatch(Event::Load(b"second")).unwrap();

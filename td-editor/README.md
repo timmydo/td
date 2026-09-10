@@ -1,7 +1,8 @@
 # td-editor
 
-Text and directory tabs have a vertical scrollbar: drag its thumb or click
-the track to page up/down without moving the caret or selecting a file.
+Text and directory tabs have a vertical scrollbar; unwrapped text and
+directory listings also have a horizontal scrollbar. Drag a thumb or click
+a track to page without moving the caret or selecting a file.
 
 A Wayland-native, dependency-free Rust text editor under construction, with a simple
 tabbed interface, Windows-like and Emacs key profiles, paragraph filling,

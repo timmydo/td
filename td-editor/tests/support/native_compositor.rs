@@ -1749,7 +1749,7 @@ fn native_horizontal_wheel_respects_wrap_and_clamps_columns() {
     // Menu admission follows the wheel frame on the same native pointer stream.
     editor.wait_field("state", "view", "1,0,0,96,31,1,downstream,-");
     compositor.click(140, 60); // Soft Wrap, first row.
-    editor.wait_field("state", "view", "1,0,0,96,31,0,downstream,-");
+    editor.wait_field("state", "view", "1,0,0,96,30,0,downstream,-");
     editor.wait_field("state", "modal", "0,0,0,0,0,0,0,0,0");
     compositor.pointer(400, 80, 0);
     for (columns, left, prefix, repeat) in [
@@ -1762,7 +1762,7 @@ fn native_horizontal_wheel_respects_wrap_and_clamps_columns() {
         let before = compositor.observe(&window);
         // Both axes in one report: the single logical row cannot scroll down.
         compositor.pointer_frame(400, 80, 0, -1, columns);
-        editor.wait_field("state", "view", &format!("1,0,{left},96,31,0,downstream,-"));
+        editor.wait_field("state", "view", &format!("1,0,{left},96,30,0,downstream,-"));
         editor.wait_field("state", "tab", "1,0,0,130,0,0,0,72,0,lf");
         assert_eq!(
             editor.ok("text\t1\t0\t0\t130"),
@@ -1781,6 +1781,23 @@ fn native_horizontal_wheel_respects_wrap_and_clamps_columns() {
             compositor.pointer_frame(400, 80, 0, -1, columns);
         }
     }
+    compositor.pointer_frame(400, 80, 0, 0, -120);
+    editor.wait_field("state", "view", "1,0,0,96,30,0,downstream,-");
+    let before = compositor.observe(&window);
+    compositor.pointer(10, 566, 1);
+    compositor.pointer(775, 100, 1);
+    compositor.pointer(775, 100, 0);
+    editor.wait_field("state", "view", "1,0,35,96,30,0,downstream,-");
+    editor.wait_field("state", "tab", "1,0,0,130,0,0,0,72,0,lf");
+    compositor.rendered_text(&mut editor, &window, 0, before, "jklmn", 5);
+    for (phase, x, y) in [("press", 216, 542), ("move", 0, 100), ("release", 0, 100)] {
+        let state = editor.ok("state");
+        let generation = field(&state, "input-generation").unwrap();
+        editor.ok(&format!(
+            "pointer\t1\t0\t{generation}\t{phase}\t{x}\t{y}\t0"
+        ));
+    }
+    editor.wait_field("state", "view", "1,0,0,96,30,0,downstream,-");
     assert_eq!(std::fs::read(&file).unwrap(), text.as_bytes());
     editor.quit();
     compositor.stop();
