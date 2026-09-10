@@ -47,6 +47,20 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner, tpm: &Path, powercuts: bool
     // place this runtime-only fixture on a roomier filesystem than the cache.
     let scratch = Scratch { dir: create_qmp_scratch_dir(&env::temp_dir(), &SEQ)? };
     let initramfs = provision_selector(&selector, &scratch.dir, &trust)?;
+    // This provisioned selector is private host fixture input, like its trust
+    // key. The shipping selector remains without a measurement policy.
+    let policy = cpio::build(&[Entry {
+        name: "etc/td/boot-measurement", mode: 0o644,
+        kind: Kind::File(b"td-selector-pcr11-v1\n"),
+    }])?;
+    let length = fs::metadata(&initramfs).map_err(|e| format!("stat selector: {e}"))?.len();
+    let length = usize::try_from(length).map_err(|_| "selector is too large")?;
+    let mut appendix = vec![0; cpio::alignment_padding(length)];
+    appendix.extend_from_slice(&policy);
+    OpenOptions::new().append(true).open(&initramfs)
+        .and_then(|mut file| file.write_all(&appendix))
+        .map_err(|e| format!("append selector measurement policy: {e}"))?;
+
     let (mkfs, btrfs) = build_btrfs_tools(runner)?;
     let volume = scratch.dir.join("secret-system.btrfs");
     create_persistent_volume(&deployment, &mkfs, &btrfs, &volume, &trust, VolumePurpose::Fixture)?;
@@ -78,12 +92,17 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner, tpm: &Path, powercuts: bool
             .map_err(|e| format!("save system fixture console: {e}"))?;
         system_result(&result, phase, cut).map_err(|error| emulator.diagnostic(&error))?;
         require_selected_deployment(&result, td_boot_protocol::SELECTED_CURRENT_MARKER, &id, phase)?;
+        if result.console.lines().filter(|line| line.starts_with("td-boot: TD-BOOT-MEASURED-PCR11 ")).count() != 1
+            || result.console.lines().filter(|line| *line == "secret-fixture: system selector PCR verified after kexec").count() != 1 {
+            return Err(format!("system secret {phase} lacks selector measurement/readback evidence"));
+        }
+
         if !cut { validate_persistent_shutdown(&result, phase)?; }
         emulator.finish()?;
         if !cut { check_persistent_volume(&btrfs, &volume)?; }
         println!("[qemu-secret-system] {phase} passed in {:.2}s", result.elapsed.as_secs_f64());
     }
-    println!("PASS: full deployment firstboot, secure-attention enrollment and named write, jailed mail receipt, generation relocking, and cold recovery with only the second token; synthetic PCR and UHID fixtures, no measured-boot or physical-presence claim");
+    println!("PASS: full deployment firstboot, secure-attention enrollment and named write, jailed mail receipt, generation relocking, and cold recovery with only the second token; verified selector PCR 11 across kexec; synthetic enrollment PCR 7 and UHID fixtures, no authenticated-firmware or physical-presence claim");
     if powercuts {
         println!("PASS: abrupt QEMU cuts with an unconsented submitted write and an acknowledged write; cold locked startup, no ready request, old/new credential preservation and fresh recovery consent; host storage and TPM emulator retained, no host-power-loss or torn-sector claim");
     }

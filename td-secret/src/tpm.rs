@@ -1432,6 +1432,10 @@ pub(crate) mod tests {
         Client::new(Device::open().unwrap())
     }
 
+    pub(crate) fn qemu_boot_pcr_digest() -> [u8; 32] {
+        qemu_client().snapshot(Pcrs::parse("11").unwrap()).unwrap()
+    }
+
     pub(crate) fn qemu_extend(digest: &[u8; 32]) {
         let mut parameters = 1u32.to_be_bytes().to_vec();
         put16(&mut parameters, SHA256);

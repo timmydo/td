@@ -217,8 +217,8 @@ refused. The fingerprint rejects a release for another enrolled key.
 Updates rewrite the encrypted bundle atomically and never persist a
 plaintext key. There is no additional daemon or external service.
 
-This release is **automatic at boot and has no human authentication**.
-The portal service can read the released key and credentials. Each
+Release requires the presented FIDO2 operation described below. The portal
+service can read the released key and credentials. Each
 application registers only from its assigned external UID and reads its
 private state; human-UID launchers cannot impersonate it through the
 broker. TPM possession is not user identity. PCR
@@ -1080,8 +1080,16 @@ rewriting account tables, application configuration, store setup, broker,
 portal or authority services. Its initial keyboard-ready barrier precedes
 stock seat assignment; all token activity waits for the normal service
 readiness and jailed mail's locked refusal. Only this selected test image
-and explicit command-line opt-ins admit the fixture. Its PCR extension is
-synthetic evidence, not a measured-deployment policy.
+and explicit command-line opt-ins admit the fixture. Its selector is explicitly provisioned with the PCR 11 policy specified in
+`td-install/DESIGN.md`. Before token setup the second kernel independently
+encodes its actual deployment ID and `/proc/cmdline` and checks the resulting
+PCR through the TPM. The host requires exactly one selector measurement
+receipt and one successful post-kexec check per boot. The fixture never
+extends PCR 11; the real verified selector owns that extension. Different
+phase arguments yield different expected PCR values across cold boots.
+Application-secret enrollment still uses the separate synthetic PCR 7
+extension, so this does not activate a measured-deployment release policy.
+Authenticated firmware entry and update authorization remain unimplemented.
 
 The creation boot requires firstboot's file-backed mail placeholder and
 portal-mode configuration without an application password file. E enrolls

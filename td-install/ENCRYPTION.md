@@ -72,6 +72,13 @@ Firmware/key provisioning and TPM policy-authorized updates must preserve
 both `current` and the approved `previous` fallback. Exact-PCR enrollment
 without an update/recovery policy cannot ship as the default.
 
+The [selector measurement prerequisite](DESIGN.md#selector-deployment-measurement-prerequisite)
+now records the verified deployment and exact handoff arguments in PCR 11
+when configured in the selector itself. The full-system QEMU oracle verifies
+that PCR after kexec. Its direct-kernel entry remains host-trusted; it does
+not establish authenticated firmware entry, authorize updates, or enable any
+disk/application protector. PCR 11 alone cannot satisfy this boot contract.
+
 The selector must unlock before reading a deployment. Its dm-crypt mapping
 does not survive `kexec`: the deployment initramfs must create it again.
 Before enabling encrypted boot, specify and prove either re-release under

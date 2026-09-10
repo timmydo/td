@@ -9433,7 +9433,10 @@ in `td-install/ENCRYPTION.md`.
 The optional `qemu-secret-system --tpm` oracle boots a test-only system
 variant through signed selection and verified kexec, using stock firstboot,
 service supervision and jailed mail for enrollment, credential replacement,
-cold second-token recovery and relocking. Its synthetic PCR extension and
+cold second-token recovery and relocking. The test selector also measures the verified deployment and exact boot
+arguments in PCR 11; the second kernel independently verifies that value.
+Enrollment still uses synthetic PCR 7, and authenticated firmware entry and
+update-safe release are not yet provided. The synthetic extension and
 UHID devices remain absent from the shipping system; see
 `td-secret/DESIGN.md` for the exact proof and limits.
 Its `--powercuts` mode kills QEMU with a submitted write awaiting consent and

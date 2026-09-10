@@ -8,6 +8,8 @@
 #![forbid(unsafe_code)]
 
 mod protocol;
+#[path = "measurement.rs"]
+mod measurement;
 // The real-regular-bounded file rule, shared with `td-install` for
 // `protocol.rs`'s reason — and with the same redundant `#[path]` the fixture
 // carries below, so the staging guard sees it. Unlike the fixture this one IS
@@ -2622,6 +2624,7 @@ fn kexec_boot_decision(
     deployment: Deployment,
     decision: &BootDecision,
     base_cmdline: &OsStr,
+    measured: bool,
 ) -> io::Result<()> {
     report_boot_decision(decision)?;
     let cmdline = kernel_cmdline(
@@ -2629,6 +2632,10 @@ fn kexec_boot_decision(
         &decision.deployment_id,
         decision.bookkeeping_error.is_some(),
     )?;
+    if measured {
+        let pcr = measurement::measure(&deployment.id, cmdline.as_bytes())?;
+        writeln!(io::stderr(), "td-boot: TD-BOOT-MEASURED-PCR11 {}", sha256::to_base16(&pcr))?;
+    }
     let Deployment {
         kernel, initramfs, ..
     } = deployment;
@@ -2648,6 +2655,7 @@ fn run_boot(device: &Path, mountpoint: &Path, base_cmdline: &OsStr) -> io::Resul
     // be chosen, so the failure should name the missing key rather than
     // whatever the first slot happens to be wrong about.
     let key = read_boot_trust_root(Path::new(BOOT_ROOTFS))?;
+    let measured = measurement::enabled(Path::new(BOOT_ROOTFS))?;
     let (_transaction_lock, _device_lock, device_id) = acquire_update_locks(device)?;
     prepare_update_mountpoint(mountpoint, device_id)?;
     run_command(
@@ -2655,7 +2663,7 @@ fn run_boot(device: &Path, mountpoint: &Path, base_cmdline: &OsStr) -> io::Resul
         "read-only Btrfs mount",
     )?;
     if let Some((decision, deployment)) = read_only_current(mountpoint, &key) {
-        let result = kexec_boot_decision(deployment, &decision, base_cmdline);
+        let result = kexec_boot_decision(deployment, &decision, base_cmdline, measured);
         best_effort_unmount(mountpoint);
         return result;
     }
@@ -2664,7 +2672,7 @@ fn run_boot(device: &Path, mountpoint: &Path, base_cmdline: &OsStr) -> io::Resul
     {
         let result = (|| {
             let (decision, deployment) = read_only_recovery(mountpoint, &transaction_error, &key)?;
-            kexec_boot_decision(deployment, &decision, base_cmdline)
+            kexec_boot_decision(deployment, &decision, base_cmdline, measured)
         })();
         best_effort_unmount(mountpoint);
         return result;
@@ -2687,7 +2695,7 @@ fn run_boot(device: &Path, mountpoint: &Path, base_cmdline: &OsStr) -> io::Resul
                     )?;
                     let deployment =
                         authenticated_deployment(mountpoint, &decision.deployment_id, &key)?;
-                    kexec_boot_decision(deployment, &decision, base_cmdline)
+                    kexec_boot_decision(deployment, &decision, base_cmdline, measured)
                 })();
                 best_effort_unmount(mountpoint);
                 return result;
@@ -2696,7 +2704,7 @@ fn run_boot(device: &Path, mountpoint: &Path, base_cmdline: &OsStr) -> io::Resul
                 let result = (|| {
                     let (decision, deployment) =
                         read_only_recovery(mountpoint, &transaction_error, &key)?;
-                    kexec_boot_decision(deployment, &decision, base_cmdline)
+                    kexec_boot_decision(deployment, &decision, base_cmdline, measured)
                 })();
                 best_effort_unmount(mountpoint);
                 return result;
@@ -2713,7 +2721,7 @@ fn run_boot(device: &Path, mountpoint: &Path, base_cmdline: &OsStr) -> io::Resul
                 let result = (|| {
                     let (decision, deployment) =
                         read_only_recovery(mountpoint, &transaction_error, &key)?;
-                    kexec_boot_decision(deployment, &decision, base_cmdline)
+                    kexec_boot_decision(deployment, &decision, base_cmdline, measured)
                 })();
                 best_effort_unmount(mountpoint);
                 return result;
@@ -2730,7 +2738,7 @@ fn run_boot(device: &Path, mountpoint: &Path, base_cmdline: &OsStr) -> io::Resul
         // The writable transaction closed its payload handles before unmounting.
         // Reverify under the mount whose handles are passed to kexec.
         let deployment = authenticated_deployment(mountpoint, &decision.deployment_id, &key)?;
-        kexec_boot_decision(deployment, &decision, base_cmdline)
+        kexec_boot_decision(deployment, &decision, base_cmdline, measured)
     })();
     best_effort_unmount(mountpoint);
     result
@@ -5527,6 +5535,39 @@ mod tests {
             arm.contains("let _ = warn_unverifiable_resign"),
             "the warning must not fail a publish whose signature is already replaced"
         );
+    }
+
+    #[test]
+    fn measurement_policy_is_explicit_bounded_and_never_a_symlink() {
+        let fixture = Fixture::new();
+        let path = fixture.root.join(measurement::POLICY_PATH);
+        assert!(!measurement::enabled(&fixture.root).unwrap());
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        for bytes in [b"".as_slice(), b"td-selector-pcr11-v2\n", b"td-selector-pcr11-v1\nextra"] {
+            fs::write(&path, bytes).unwrap();
+            assert!(measurement::enabled(&fixture.root).is_err());
+        }
+        fs::write(&path, b"td-selector-pcr11-v1\n").unwrap();
+        assert!(measurement::enabled(&fixture.root).unwrap());
+        fs::remove_file(&path).unwrap();
+        std::os::unix::fs::symlink("missing", &path).unwrap();
+        assert!(measurement::enabled(&fixture.root).is_err());
+    }
+
+    #[test]
+    fn measurement_stays_between_authenticated_selection_and_kexec() {
+        let source = include_str!("main.rs");
+        let boot = source.split_once("\nfn run_boot(").unwrap().1.split_once("\n}\n").unwrap().0;
+        assert!(boot.contains("measurement::enabled(Path::new(BOOT_ROOTFS))?"));
+        for call in boot.split("kexec_boot_decision(").skip(1) {
+            assert!(call.split_once(')').unwrap().0.ends_with(", measured"));
+        }
+        let handoff = source.split_once("\nfn kexec_boot_decision(").unwrap().1.split_once("\n}\n").unwrap().0;
+        let arguments = handoff.find("let cmdline = kernel_cmdline(").unwrap();
+        let measure = handoff.find("measurement::measure(&deployment.id, cmdline.as_bytes())?").unwrap();
+        let execute = handoff.find("&mut kexec_command(kernel, initramfs, cmdline.as_os_str())").unwrap();
+        assert!(arguments < measure && measure < execute);
+        assert!(handoff.contains("if measured {"));
     }
 
     /// Nothing `run_boot` hands to kexec was read by an unauthenticated

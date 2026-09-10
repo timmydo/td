@@ -219,6 +219,23 @@ fn qemu_installed_system_secret_lifecycle() {
     guard("fido-system");
     let _diagnostics = SystemDiagnostics;
     let cmdline = fs::read_to_string("/proc/cmdline").unwrap();
+    // Independently encode the selector event from the booted kernel's own
+    // arguments. No fixture extends PCR 11 or imports the producer codec.
+    let measured_cmdline = cmdline.strip_suffix('\n').unwrap();
+    let deployments: Vec<_> = measured_cmdline.split_ascii_whitespace()
+        .filter_map(|token| token.strip_prefix("td.deployment=")).collect();
+    assert_eq!(deployments.len(), 1);
+    assert_eq!(deployments[0].len(), 64);
+    let mut event = b"td/selector-deployment/v1\0".to_vec();
+    event.extend_from_slice(deployments[0].as_bytes());
+    event.extend_from_slice(&(measured_cmdline.len() as u32).to_be_bytes());
+    event.extend_from_slice(measured_cmdline.as_bytes());
+    let mut extension = vec![0; 32];
+    extension.extend_from_slice(&crate::crypto::digest(&event));
+    let expected_pcr = crate::crypto::digest(&extension);
+    assert_eq!(crate::tpm::tests::qemu_boot_pcr_digest(), crate::crypto::digest(&expected_pcr),
+        "booted arguments/deployment do not match selector PCR 11");
+    eprintln!("\nsystem selector PCR verified after kexec");
     let phases: Vec<_> = cmdline.split_ascii_whitespace().filter_map(|token| token.strip_prefix("td.secret-system=")).collect();
     assert_eq!(phases.len(), 1);
     let phase = phases[0];

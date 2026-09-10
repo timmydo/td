@@ -7,6 +7,7 @@ use crate::types::{Recipe, Step};
 // arrive as a pair or the build does not link. `ed25519_sign.rs` is NOT here
 // and must not be: this binary verifies and never signs.
 const MAIN_RS: &str = include_str!("../../../td-boot/src/main.rs");
+const MEASUREMENT_RS: &str = include_str!("../../../td-boot/src/measurement.rs");
 const PROTOCOL_RS: &str = include_str!("../../../td-boot/src/protocol.rs");
 const REALFILE_RS: &str = include_str!("../../../td-boot/src/realfile.rs");
 const SHA256_RS: &str = include_str!("../../../engine/src/sha256.rs");
@@ -47,6 +48,11 @@ pub fn recipe() -> Recipe {
         Step::WriteFile {
             path: "{src}/td-boot/src/main.rs".into(),
             content: MAIN_RS.into(),
+            exec: false,
+        },
+        Step::WriteFile {
+            path: "{src}/td-boot/src/measurement.rs".into(),
+            content: MEASUREMENT_RS.into(),
             exec: false,
         },
         Step::WriteFile {

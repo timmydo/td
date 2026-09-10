@@ -316,6 +316,46 @@ command line is the one `td-boot` already builds for its kexec. The ESP
 therefore never changes when a deployment does, which is D5 restated as a
 property of the boot flow rather than as a rule.
 
+### Selector deployment measurement prerequisite
+
+The selector can require one SHA-256 PCR 11 extension before its verified
+kexec handoff. Its own rootfs must contain the regular, bounded file
+`/etc/td/boot-measurement` with exactly `td-selector-pcr11-v1` plus a newline.
+Absent configuration preserves the unenrolled development profile; malformed
+or unreadable configuration refuses boot. Neither the deployment volume nor
+a kernel command-line token enables or disables this policy. The stock
+selector has no such file. The full-system secret QEMU oracle provisions it
+in its private selector alongside the deployment trust key.
+
+The version-1 event is the concatenation of `td/selector-deployment/v1`,
+one zero byte, the 64 lowercase ASCII bytes of the authenticated manifest ID,
+a big-endian u32 byte count, and the exact final kexec command line without
+its terminating NUL. The ID binds kernel, initramfs and root payload hashes;
+the command line includes the chosen deployment and any bookkeeping warning.
+Whitespace and argument order are significant. All boot decisions, including
+read-only recovery, pass through this same handoff with already authenticated
+and verified kernel/initramfs descriptors. No payload pathname is reopened
+for measurement or kexec.
+
+The selector reads PCR 11 through root's `/dev/tpmrm0` and requires zero,
+extends the event's SHA-256 digest once, then requires exact readback of
+`SHA256(zero32 || event_digest)`. Packets admit only the SHA-256 bank and
+three-byte selection naming PCR 11. An unsupported TPM, malformed reply,
+nonzero initial PCR, uncertain extension or readback mismatch refuses kexec.
+It never resets a PCR or retries an extension. A failed handoff requires a
+cold boot; it cannot measure another candidate on the already-used PCR.
+The ordinary verified selection and fallback happen before measurement.
+
+This follows TPM2 PCR_Read/PCR_Extend's wire operations in the
+[TCG TPM command specification](https://trustedcomputinggroup.org/wp-content/uploads/Trusted-Platform-Module-2.0-Library-Part-3_Commands-V185-RC4_12Dec2025.pdf).
+It is a td selector event, not a firmware TCG event log or an attestation.
+The QEMU host still supplies the first kernel and selector. Authentication
+and measurement of that entry, its trust key and policy remain prerequisites
+for using PCR 11 in a shipped release policy. Root and the running kernel
+remain trusted. This adds no key release, enrollment or authorization for a
+changed deployment. Update authorization for approved current/previous
+states remains governed by [ENCRYPTION.md](ENCRYPTION.md).
+
 ## 6. Signing and keys
 
 **A dedicated deployment-signing key**, separate from the `td-subst` cache
