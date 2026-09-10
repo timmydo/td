@@ -1132,7 +1132,12 @@ and `/etc/bootfail` — the two things that decide a boot is over — each
 `exec /bin/td-svc reboot`, and the `reboots_run_the_teardown_first` recipe
 test holds that over every generated `/etc` file: no direct
 `/bin/{reboot,poweroff,halt}`, no inlined `/etc/shutdown`, and exactly two
-initiators. Before td-svc they inlined `{ /etc/shutdown; exec /bin/reboot; }`
+initiators in generated `/etc` scripts. The separate `vm-power` root unit
+also requests only `poweroff` through this existing control socket, after
+validating the compositor-owned fixed VM request. It runs after and requires
+seat setup, uses ordinary process-group supervision, and has no authority
+channel exposed to the human UID. See [td-vm-guest](../td-vm-guest/DESIGN.md#fixed-root-power-worker).
+Before td-svc they inlined `{ /etc/shutdown; exec /bin/reboot; }`
 themselves, which was right when nothing was supervised and resets a machine
 with live services now that something is.
 

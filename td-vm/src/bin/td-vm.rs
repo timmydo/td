@@ -55,6 +55,7 @@ const HELP: &str = "td-vm: manage persistent graphical td instances
   td-vm status NAME                  inspect QEMU execution and disk I/O state
   td-vm resume NAME                  resume an explicitly paused guest
   td-vm open NAME [--accel auto|kvm|tcg] [--display gtk|sdl]
+  td-vm stop NAME                     request orderly guest poweroff
   td-vm stop NAME --force             cut power (guest work may be lost)
   td-vm delete NAME --yes             delete a stopped instance and its work
   td-vm logs NAME
@@ -78,7 +79,7 @@ Reuse dist/td-vm-x86-64 from ./build-qcow; no image rebuild on create/open.
 Clipboard and feed actions require a bridge-capable system image. Workspace
 clone provisioning uses the updated image. Terminal launch, build-store setup
 and login integration remain pending. Shut down from inside td;
-only explicit force-stop is available until the guest power bridge lands.";
+Stop requests guest poweroff; --force explicitly cuts power.";
 
 fn main() -> ExitCode {
     match run(env::args().skip(1).collect()) {
@@ -183,6 +184,10 @@ fn run(args: Vec<String>) -> Result<()> {
             name,
             Launch::parse(&["--accel", accel, "--display", display])?,
         ),
+        ["stop", name] => {
+            println!("{}", manager.poweroff(name)?);
+            Ok(())
+        },
         ["stop", name, "--force"] => manager.stop(name),
         ["clipboard", "put", name] => {
             let mut bytes = Vec::new();
@@ -1115,6 +1120,18 @@ impl Manager {
             .map_err(|e| format!("{value}: resume failed: {e}"))
     }
 
+    fn poweroff(&self, value: &str) -> Result<String> {
+        name(value)?;
+        let _lock = self.lock(&format!("instance-{value}"))?;
+        let dir = self.instance(value)?;
+        if !running(&dir)? {
+            return Err("instance has no reachable running QEMU; inspect its logs".into());
+        }
+        vm_bridge::ask(&dir, vm_wire::POWEROFF, Vec::new())
+            .map_err(|e| format!("Guest poweroff confirmation unavailable: {e}. Inspect status; no forced stop was sent."))?;
+        Ok(format!("Orderly guest poweroff queued for {value}; refresh status to observe exit."))
+    }
+
     fn stop(&self, value: &str) -> Result<()> {
         name(value)?;
         let _lock = self.lock(&format!("instance-{value}"))?;
@@ -1629,7 +1646,7 @@ fn tui(manager: &Manager) -> Result<()> {
         selected = selected.min(rows.len().saturating_sub(1));
         let (height, width) = terminal.size();
         let mut frame = term::Frame::new(height, width);
-        frame.push_text("td-vm  Enter open · n new · i import · t templates · D delete · X cut power", term::Style::bar(term::CYAN));
+        frame.push_text("td-vm  Enter open · n new · i import · t templates · S stop · D delete · X cut power", term::Style::bar(term::CYAN));
         frame.push_text("h status · R resume · w workspace · W prepare · E enroll · C clone · l logs · v paste · c copy · f feed · s sharing · r refresh · q quit", term::Style::bar(term::CYAN));
         frame.push_text(TABLE_HEADER, term::Style::bold());
         let page = height.saturating_sub(8).max(1);
@@ -1745,6 +1762,18 @@ fn tui(manager: &Manager) -> Result<()> {
                     terminal
                         .suspend(|| manager.start(name, Launch::parse(&[])?))
                         .map_err(|e| e.to_string())?
+                }
+                term::Key::Char('S') if current.is_some() => {
+                    let name = current.ok_or("no instance selected")?;
+                    if prompt(&mut terminal, &format!("Shut down {name}? Running tasks will stop. Type yes"))?.as_deref() != Some("yes") {
+                        status = "Cancelled".into();
+                    } else {
+                        status = match manager.poweroff(name) {
+                            Ok(message) => message,
+                            Err(error) => error,
+                        };
+                    }
+                    break;
                 }
                 term::Key::Char('D' | 'X') if current.is_some() => {
                     let name = current.ok_or("no instance selected")?;

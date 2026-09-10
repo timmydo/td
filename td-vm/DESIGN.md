@@ -83,12 +83,12 @@ reusable instance/template lock inodes remain stable. Referenced templates canno
 listing does not create manager state or take catalog locks.
 
 The stock desktop supports per-instance Git keys, enrollment and explicit
-clone provisioning through the guest helper below. Orderly host power
-operations, private writable development stores, automatic launch
+clone provisioning and orderly poweroff through the guest helpers below.
+Private writable development stores, automatic launch
 provisioning, task-terminal launch and account linking remain pending. The
 td-owned clipboard, feed and workspace bridges require a matching updated
-system image. Stop from the guest; host
-`stop NAME --force` explicitly cuts power. Disk deletion requires `--yes` or
+system image. `stop NAME` or TUI S queues orderly guest poweroff;
+`stop NAME --force` or TUI X explicitly cuts power. Disk deletion requires `--yes` or
 typing the instance name in the TUI and reports unsubmitted work as unknown.
 The table reports allocated overlay space (`HOST MiB`) and virtual disk
 capacity (`CAP MiB`), rounded down to whole MiB. Allocation excludes the shared
@@ -1648,3 +1648,29 @@ An explicit Clone action can briefly return the previous failed attempt's
 message while the helper observes the new request. That diagnostic explicitly
 says a retry was requested and directs the operator to inspect completion;
 it does not attribute the old failure to the new attempt.
+
+
+## Orderly development VM poweroff
+
+`td-vm stop NAME` and TUI S send the empty, revision-zero `poweroff`
+operation over the td-owned carrier. TUI S confirms stopping running tasks.
+The compositor invalidates any clipboard lease and atomically replaces its
+volatile `vm-poweroff` request with exactly `TDVM-POWEROFF-1\n`. The reply
+`poweroff queued` acknowledges publication only. It does not claim supervisor
+acceptance, service exit, successful unmount, or durable user writes. Status
+observes QEMU exit separately. Clipboard sharing and keyboard focus do not
+gate this lifecycle operation; public Wayland and control clients cannot send
+it. The protocol accepts no action name, executable, path, or argument.
+
+A separate root `td-vm-guest power-serve` service consumes that one fixed
+request. Its identity, endpoint ownership checks and bounded supervisor
+handoff are specified in [the guest helper design](../td-vm-guest/DESIGN.md).
+The ordinary identity/clone helper remains unprivileged. The existing td-svc
+poweroff path stops services, runs the standard shutdown teardown, then
+powers off. No QMP power command, keyboard shortcut or guest login is used.
+A missing bridge/helper, refused handoff or timeout never falls back to QMP
+quit. Repeating Stop republishes the request for explicit retry; X/`--force`
+remains a distinct power cut. Templates predating this helper must be updated
+before orderly Stop is available. The standard-image proof must write without
+an explicit guest sync, stop through this route, require the teardown marker,
+then reopen and verify the write and the sibling VM's continued operation.

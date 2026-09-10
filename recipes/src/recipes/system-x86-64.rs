@@ -1240,13 +1240,14 @@ fn td_portal_settings_etc_name() -> &'static str {
 /// on a table it cannot parse, but a unit SILENTLY dropped from the plan — skipped for
 /// an unsatisfiable dependency — is a clean exit with a shorter list, and that is the
 /// regression this catches: the boot comes up missing a service and says nothing.
-const TD_SVC_UNITS: [&str; 44] = [
+const TD_SVC_UNITS: [&str; 45] = [
     "hostname",
     "td-firstboot",
     "rootcheck",
     "profiler",
     "profiler-evidence",
     "seat",
+    "vm-power",
     "vm-guest",
     "audio",
     "netup",
@@ -1453,6 +1454,14 @@ fn build_td_svc_conf() -> String {
          exec=/bin/td-seatd assign --uid {ui_uid} --gid {ui_gid} --compositor-uid {compositor_uid} --audio-uid {audio_uid} --audio-gid {audio_gid}\n\
          after=rootcheck\n\
          timeout={seat}\n\
+         \n\
+         [vm-power]\n\
+         type=daemon\n\
+         exec=/bin/td-vm-guest power-serve\n\
+         after=seat\n\
+         requires=seat\n\
+         restart=always\n\
+         log=/var/log/svc/td-vm-power.log\n\
          \n\
          # Guest Git keys belong to the human; no private key crosses the bridge.\n\
          [vm-guest]\n\
@@ -7055,6 +7064,10 @@ news\tnews-0.1\tsource\tempty-runtime-1\tsource\n"
     #[test]
     fn vm_guest_helper_runs_without_root_in_the_standard_image() {
         assert_eq!(unit_key("vm-guest", "exec").as_deref(), Some("/bin/td-login exec-as tester -- /bin/td-vm-guest serve"));
+        assert_eq!(unit_key("vm-power", "exec").as_deref(), Some("/bin/td-vm-guest power-serve"));
+        assert_eq!(unit_key("vm-power", "requires").as_deref(), Some("seat"));
+        assert_eq!(unit_key("vm-power", "restart").as_deref(), Some("always"));
+        assert!(ordered_before("seat", "vm-power"));
         assert_eq!(unit_key("vm-guest", "cgroup").as_deref(), Some("session"));
         assert_eq!(unit_key("vm-guest", "requires").as_deref(), Some("seat,td-firstboot"));
         assert_eq!(unit_key("vm-guest", "restart").as_deref(), Some("always"));
@@ -7091,6 +7104,7 @@ news\tnews-0.1\tsource\tempty-runtime-1\tsource\n"
             ("rootcheck", vec!["td-firstboot"]),
             ("seat", vec!["rootcheck"]),
             ("vm-guest", vec!["seat", "netup"]),
+            ("vm-power", vec!["seat"]),
             ("audio", vec!["seat"]),
             ("netup", vec!["rootcheck"]),
             ("busd", vec!["seat"]),

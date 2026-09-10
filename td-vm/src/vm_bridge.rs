@@ -39,6 +39,7 @@ fn reply(
         wire::OK => {
             let shape = match request.verb.as_str() {
                 wire::SNAPSHOT => reply.revision != 0 && reply.data == b"clipboard-v1 feed-v1",
+                wire::POWEROFF => reply.revision == 0 && reply.data == wire::POWER_QUEUED,
                 wire::WORKSPACE => {
                     reply.revision == 0 && wire::workspace::Plan::parse(&request.data)
                         .is_ok_and(|plan| wire::workspace::parse_ready(&reply.data, &plan).is_ok())
@@ -256,7 +257,7 @@ fn forward(dir: &Path, request: wire::Message, deadline: Instant) -> Result<wire
                 return Err("clipboard import needs nonempty text".into());
             }
         }
-        wire::GET | wire::SNAPSHOT if request.data.is_empty() => {}
+        wire::GET | wire::SNAPSHOT | wire::POWEROFF if request.data.is_empty() => {}
         wire::KEY => { wire::git_key::identity(&request.data)?; }
         wire::WORKSPACE => { wire::workspace::Plan::parse(&request.data)?; }
         wire::FEED => {
@@ -303,6 +304,27 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn poweroff_crosses_disabled_sharing_without_other_verbs() {
+        let temp = Temp::new();
+        sharing(&temp.0, "off").unwrap();
+        let listener = UnixListener::bind(temp.0.join("guest")).unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream.set_nonblocking(true).unwrap();
+            let deadline = Instant::now() + wire::TIMEOUT;
+            let request = wire::receive(&mut stream, None, deadline).unwrap();
+            assert_eq!(request.verb, wire::POWEROFF);
+            assert!(request.data.is_empty());
+            wire::write_all(&mut stream, &wire::Message::new(request.id, wire::OK, 0, wire::POWER_QUEUED.to_vec()).encode().unwrap(), deadline).unwrap();
+        });
+        for data in [b"reboot".to_vec(), b"/bin/poweroff".to_vec()] {
+            assert!(forward(&temp.0, wire::Message::new(1, wire::POWEROFF, 0, data), Instant::now() + wire::TIMEOUT).is_err());
+        }
+        assert_eq!(forward(&temp.0, wire::Message::new(2, wire::POWEROFF, 0, Vec::new()), Instant::now() + wire::TIMEOUT).unwrap().data, wire::POWER_QUEUED);
+        server.join().unwrap();
     }
 
     #[test]

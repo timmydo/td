@@ -6575,3 +6575,14 @@ private configuration and staging; only the complete public plan and status
 cross the carrier. Success is recorded workspace preparation, not live
 inspection of human edits or agent readiness. Public Wayland/control clients
 cannot invoke this operation, and neither clipboard sharing nor focus gates it.
+
+
+The empty revision-zero `poweroff` carrier operation cancels clipboard leases
+and atomically replaces `vm-poweroff` with the fixed `TDVM-POWEROFF-1\n`
+record. Its `poweroff queued` reply means only publication. A separate root
+[guest power worker](../td-vm-guest/DESIGN.md#fixed-root-power-worker) validates
+that request and asks td-svc for orderly poweroff. No public Wayland or control
+operation reaches it; focus and clipboard sharing do not gate host lifecycle
+authority. The compositor receives no root socket, executable selection or
+arbitrary service operation. Repeating Stop replaces the inode for explicit
+retry. QEMU exit and successful filesystem teardown are separate observations.

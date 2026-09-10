@@ -3,8 +3,8 @@
 `td-vm-guest serve` is a dependency-free, source-built service in the standard
 image. `td-svc` launches it with the existing `td-login exec-as tester` path,
 after seat setup and networking, requiring seat setup and firstboot. It runs
-as UID 1000 in the session cgroup. It has no root operation and adds no unsafe
-surface. A running process is not a claim that a workspace is ready.
+as UID 1000 in the session cgroup. This mode has no root operation and adds no unsafe
+surface. The separate root power mode below has no Git or credential job. A running process is not a claim that a workspace is ready.
 
 The compositor owns the VM carrier and writes one public 32-digit lowercase
 hexadecimal instance ID to `/run/td-compositor/1000/vm-git-identity`. The helper
@@ -155,3 +155,49 @@ key's signature self-test failure. Each job attempts once, then remains idle
 while the other job's temporary proof/response writes change directory
 metadata. An explicit clone request retries that job without waking the key
 job; a tracked private-key permission change remains observable.
+
+
+## Fixed root power worker
+
+`td-svc` starts `td-vm-guest power-serve` as a separate root `vm-power` unit
+after successful seat setup. It has no arguments beyond that mode and opens
+no private home or key state. It holds a lifetime lock in root-only
+`/run/td-vm-power`; the ordinary tester helper cannot acquire that lock.
+It additionally requires the kernel-owned `/sys/class/virtio-ports` to name
+`org.td.vm.1`, scanning at most 64 entries and 129 bytes per name. Unnamed
+ports and concurrently removed name attributes are skipped; other discovery
+errors refuse the attempt. Without
+that carrier or a compositor request it idles, including on non-VM boots.
+
+The root worker validates root-owned, non-writable `/run` and
+`/run/td-compositor`, the compositor-owned non-writable runtime directory,
+and the opened request's regular-file type, UID 993, single link and absence
+of group/other write permission. Final symlinks and blocking special files
+are refused; reads are bounded to the fixed record plus one byte. Only exact
+`TDVM-POWEROFF-1\n` is accepted. A compromised compositor can request VM
+poweroff; the human UID and confined applications cannot author the request.
+This is host lifecycle authority on its own VM, not a general elevation or
+human authentication interface. No arbitrary service command is exposed.
+
+The worker validates the private root-owned td-svc runtime and launches only
+`/bin/td-svc poweroff`, with a cleared environment, cwd `/`, and an inherited
+lifetime lease on stdin. It captures at most 128 bytes of stdout and discards
+stderr. The source-built client connects to its existing fixed control socket;
+the worker's three-second deadline covers connection, reply, and client exit.
+On error or timeout it kills and reaps that recorded child. If the worker dies,
+the client retains the lease so another worker cannot overlap it. The fixed
+client creates no descendants. Only successful exit with exact poweroff
+acceptance or already-running poweroff counts as confirmation. No child
+command, environment, executable, path or credential comes from the request.
+Each observed request inode is attempted once per worker lifetime; an explicit
+Stop replaces it to retry. A supervisor/helper restart can replay the request,
+which td-svc's monotonic shutdown makes idempotent. Errors are logged; the
+compositor's reply acknowledges publication, not this result. The worker stays
+supervised and shutdown stops it through the ordinary unit path. No unsafe
+surface or dependency is added.
+
+Host fixtures compile a tiny Rust control-client adapter and prove the exact
+argument, accepted/rejected/oversized replies, nonzero exit, a client that holds
+stdout open, and a real Unix socket connect stalled behind a full backlog.
+Timeout reaps the recorded client. The standard image uses the actual shipped
+td-svc client. These host-tool fixtures stay out of the compiler-only gate.

@@ -17,6 +17,12 @@ pub const GET: &str = "get";
 pub const FEED: &str = "feed";
 pub const KEY: &str = "git-key";
 pub const WORKSPACE: &str = "workspace";
+pub const POWEROFF: &str = "poweroff";
+#[allow(dead_code)] // Shared with the root guest power worker.
+pub const POWER_REQUEST: &str = "/run/td-compositor/1000/vm-poweroff";
+#[allow(dead_code)] // Guest publication is absent from the host runner.
+pub const POWER_RECORD: &[u8] = b"TDVM-POWEROFF-1\n";
+pub const POWER_QUEUED: &[u8] = b"poweroff queued";
 pub const OK: &str = "ok";
 pub const ERROR: &str = "error";
 
@@ -98,7 +104,7 @@ impl Message {
 }
 
 fn valid_verb(verb: &str) -> bool {
-    matches!(verb, SNAPSHOT | PUT | GET | FEED | KEY | WORKSPACE | OK | ERROR)
+    matches!(verb, SNAPSHOT | PUT | GET | FEED | KEY | WORKSPACE | POWEROFF | OK | ERROR)
 }
 
 fn decimal(value: Option<&str>) -> Result<u64, String> {

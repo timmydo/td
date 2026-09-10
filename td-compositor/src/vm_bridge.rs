@@ -163,6 +163,11 @@ impl Session {
                     Path::new(wire::workspace::RESPONSE), &request.data, uid, 1000)
                     .map(|data| (0, data))
             }
+            wire::POWEROFF if request.revision == 0 && request.data.is_empty() => {
+                self.lease = None;
+                publish_request(&feed_path.with_file_name("vm-poweroff"), wire::POWER_RECORD, false)?;
+                Ok((0, wire::POWER_QUEUED.to_vec()))
+            }
             wire::FEED if request.revision == 0 => {
                 self.lease = None;
                 publish_feed(feed_path, &request.data)?;
@@ -441,6 +446,26 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.dir);
         }
+    }
+
+    #[test]
+    fn poweroff_is_explicit_empty_and_replaces_only_its_request() {
+        let f = Fixture::new();
+        let mut session = Session::default();
+        let request = f.dir.join("vm-poweroff");
+        for (revision, data) in [(1, &b""[..]), (0, &b"reboot"[..])] {
+            assert_eq!(f.request(&mut session, 1, wire::POWEROFF, revision, data).verb, wire::ERROR);
+            assert!(!request.exists());
+        }
+        let reply = f.request(&mut session, 2, wire::POWEROFF, 0, b"");
+        assert_eq!(reply.verb, wire::OK);
+        assert_eq!(reply.data, wire::POWER_QUEUED);
+        assert_eq!(fs::read(&request).unwrap(), wire::POWER_RECORD);
+        let held = File::open(&request).unwrap();
+        let previous = held.metadata().unwrap().ino();
+        assert_eq!(f.request(&mut session, 3, wire::POWEROFF, 0, b"").verb, wire::OK);
+        assert_ne!(fs::metadata(&request).unwrap().ino(), previous);
+        assert!(!f.dir.join("vm-workspace").exists());
     }
 
     #[test]

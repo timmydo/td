@@ -36,6 +36,11 @@ pub fn recipe() -> Recipe {
             content: include_str!("../../../td-vm-guest/src/workspace.rs").into(),
             exec: false,
         },
+        Step::WriteFile {
+            path: "{src}/power.rs".into(),
+            content: include_str!("../../../td-vm-guest/src/power.rs").into(),
+            exec: false,
+        },
         Step::MkDir {
             path: "{root}/eh".into(),
         },

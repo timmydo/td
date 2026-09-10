@@ -8,6 +8,7 @@
 )]
 mod vm_wire;
 mod workspace;
+mod power;
 use std::fs::{self, DirBuilder, File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::fd::OwnedFd;
@@ -522,12 +523,14 @@ fn main() -> ExitCode {
     }
     let args: Vec<_> = std::env::args().skip(1).collect();
     let result = if args.as_slice() == ["--help"] {
-        println!("usage: td-vm-guest serve");
+        println!("usage: td-vm-guest <serve|power-serve>");
         Ok(())
+    } else if args.as_slice() == ["power-serve"] {
+        power::serve()
     } else if args.as_slice() == ["serve"] {
         serve()
     } else {
-        Err("usage: td-vm-guest serve".into())
+        Err("usage: td-vm-guest <serve|power-serve>".into())
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
