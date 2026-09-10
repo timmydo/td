@@ -579,6 +579,17 @@ it cannot prove queued-before-handoff rejection. A Reload checkpoint precedes
 the candidate read; cancellation does not cancel the worker operation, but
 its eventual result must not replace text or adopt the candidate baseline.
 
+The fixture listener keeps an idle connection between requests: a read
+timeout with zero frame bytes does not reset the sequence or armed job.
+A partial frame still fails on timeout, EOF or malformed framing. Teardown
+signals the listener to stop accepting and shuts down its retained socket
+clone to wake an idle read; dropping the release sender wakes a held
+request. Socket publication checks the stop flag under the same lock as
+shutdown, and a worker-local guard removes the clone on exit or panic.
+Short-timeout fixture tests cover idle reuse and partial-frame refusal.
+The normal ten-second timeout is used to check live-peer shutdown within
+two seconds and drop before accept.
+
 Each exchange has a ten-second total write/read budget. A reply ends at its
 newline: bytes after a valid reply belong to the next exchange, whose
 validation cannot retroactively revoke an already released job. EOF before

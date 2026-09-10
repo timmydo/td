@@ -1,26 +1,49 @@
 use super::*;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
+
+struct BarrierPeer(Arc<Mutex<Option<UnixStream>>>);
+
+impl Drop for BarrierPeer {
+    fn drop(&mut self) {
+        if let Ok(mut peer) = self.0.lock() {
+            peer.take();
+        }
+    }
+}
 
 struct Barrier {
     path: PathBuf,
     armed: Arc<Mutex<Option<&'static str>>>,
     held: mpsc::Receiver<u64>,
     release: Option<mpsc::Sender<u64>>,
+    stopping: Arc<AtomicBool>,
+    connection: Arc<Mutex<Option<UnixStream>>>,
     thread: Option<JoinHandle<()>>,
 }
 
 impl Barrier {
     fn start(directory: &Directory) -> Self {
+        Self::start_with_timeout(directory, TIMEOUT)
+    }
+    fn start_with_timeout(directory: &Directory, read_timeout: Duration) -> Self {
         let path = directory.0.join("file-barrier");
         let listener = UnixListener::bind(&path).unwrap();
         listener.set_nonblocking(true).unwrap();
         let armed = Arc::new(Mutex::new(None));
         let worker_armed = armed.clone();
+        let stopping = Arc::new(AtomicBool::new(false));
+        let worker_stopping = stopping.clone();
+        let connection = Arc::new(Mutex::new(None));
+        let worker_connection = connection.clone();
         let (held_tx, held) = mpsc::channel();
         let (release, released) = mpsc::channel();
         let thread = std::thread::spawn(move || {
             let deadline = Instant::now() + TIMEOUT;
             let mut stream = loop {
+                if worker_stopping.load(Ordering::Relaxed) {
+                    return;
+                }
                 let accepted = listener.accept();
                 if matches!(&accepted, Err(e) if e.kind() == io::ErrorKind::WouldBlock) {
                     assert!(Instant::now() < deadline);
@@ -29,17 +52,39 @@ impl Barrier {
                 }
                 break accepted.expect("barrier accept").0;
             };
-            stream.set_read_timeout(Some(TIMEOUT)).unwrap();
+            stream.set_read_timeout(Some(read_timeout)).unwrap();
             stream.set_write_timeout(Some(TIMEOUT)).unwrap();
+            let shutdown = stream.try_clone().unwrap();
+            {
+                let mut peer = worker_connection.lock().unwrap();
+                if worker_stopping.load(Ordering::Relaxed) {
+                    return;
+                }
+                *peer = Some(shutdown);
+            }
+            let _connection = BarrierPeer(worker_connection);
             let mut reader = BufReader::new(stream.try_clone().unwrap());
             let mut sequence = 0;
             loop {
+                if worker_stopping.load(Ordering::Relaxed) {
+                    break;
+                }
                 let mut line = Vec::new();
-                let count = reader
+                let read = reader
                     .by_ref()
                     .take(65)
-                    .read_until(b'\n', &mut line)
-                    .unwrap();
+                    .read_until(b'\n', &mut line);
+                // No request is expected while the editor is idle. A partial
+                // frame must still fail instead of losing its consumed bytes.
+                let count = match read {
+                    Err(error)
+                        if line.is_empty()
+                            && matches!(
+                                error.kind(),
+                                io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                            ) => continue,
+                    result => result.expect("barrier request frame"),
+                };
                 if count == 0 {
                     break;
                 }
@@ -91,6 +136,8 @@ impl Barrier {
             armed,
             held,
             release: Some(release),
+            stopping,
+            connection,
             thread: Some(thread),
         }
     }
@@ -103,18 +150,88 @@ impl Barrier {
     fn release(&self, id: u64) {
         self.release.as_ref().unwrap().send(id).unwrap();
     }
-    fn finish(&mut self) {
+    fn stop(&mut self) {
+        self.stopping.store(true, Ordering::Relaxed);
         self.release.take();
+        if let Ok(mut peer) = self.connection.lock() {
+            if let Some(stream) = peer.take() {
+                let _ = stream.shutdown(std::net::Shutdown::Both);
+            }
+        }
+    }
+    fn finish(&mut self) {
+        self.stop();
         self.thread.take().unwrap().join().unwrap();
     }
 }
 impl Drop for Barrier {
     fn drop(&mut self) {
-        self.release.take();
+        self.stop();
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
     }
+}
+
+#[test]
+#[ignore = "ready builds the isolated test-file-barrier editor"]
+fn barrier_idle_intervals_preserve_sequence_and_armed_request() {
+    let directory = Directory::new();
+    let mut barrier = Barrier::start_with_timeout(&directory, Duration::from_millis(50));
+    let stream = UnixStream::connect(&barrier.path).unwrap();
+    stream.set_read_timeout(Some(TIMEOUT)).unwrap();
+    let mut peer = BufReader::new(stream);
+    peer.get_mut().write_all(b"td-file-v1 1 open\n").unwrap();
+    let mut response = String::new();
+    peer.read_line(&mut response).unwrap();
+    assert_eq!(response, "continue 1\n");
+    barrier.arm("copy");
+    std::thread::sleep(Duration::from_millis(300));
+    peer.get_mut().write_all(b"td-file-v1 2 copy\n").unwrap();
+    let held = barrier.held();
+    assert_eq!(held, 2);
+    barrier.release(held);
+    response.clear();
+    peer.read_line(&mut response).unwrap();
+    assert_eq!(response, "continue 2\n");
+    drop(peer);
+    barrier.finish();
+}
+
+#[test]
+#[ignore = "ready builds the isolated test-file-barrier editor"]
+fn barrier_partial_request_timeout_still_fails_closed() {
+    let directory = Directory::new();
+    let mut barrier = Barrier::start_with_timeout(&directory, Duration::from_millis(50));
+    let mut peer = UnixStream::connect(&barrier.path).unwrap();
+    peer.set_read_timeout(Some(TIMEOUT)).unwrap();
+    peer.write_all(b"td-file-v1 1 op").unwrap();
+    let mut response = Vec::new();
+    peer.read_to_end(&mut response).unwrap();
+    assert!(response.is_empty());
+    assert!(barrier.thread.take().unwrap().join().is_err());
+}
+
+#[test]
+#[ignore = "ready builds the isolated test-file-barrier editor"]
+fn barrier_finish_stops_a_live_idle_peer_and_drop_stops_accept() {
+    let directory = Directory::new();
+    let mut barrier = Barrier::start(&directory);
+    let stream = UnixStream::connect(&barrier.path).unwrap();
+    stream.set_read_timeout(Some(TIMEOUT)).unwrap();
+    let mut peer = BufReader::new(stream);
+    peer.get_mut().write_all(b"td-file-v1 1 open\n").unwrap();
+    let mut response = String::new();
+    peer.read_line(&mut response).unwrap();
+    assert_eq!(response, "continue 1\n");
+    std::thread::sleep(Duration::from_millis(100));
+    let started = Instant::now();
+    barrier.finish();
+    assert!(started.elapsed() < Duration::from_secs(2));
+    response.clear();
+    assert_eq!(peer.read_line(&mut response).unwrap(), 0);
+    let directory = Directory::new();
+    drop(Barrier::start(&directory));
 }
 
 #[test]
