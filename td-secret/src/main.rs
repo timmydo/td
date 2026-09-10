@@ -209,8 +209,8 @@ mod confinement {
         let fingerprint = |source: &str| source.bytes().fold(0xcbf29ce484222325u64,
             |hash, byte| (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3));
         assert_eq!(fingerprint(include_str!("../../td-authd/src/secret_sys.rs").split("#[cfg(test)]").next().unwrap()), 0x320c8b6ddbfe29af, "intake raw source changed");
-        assert_eq!(fingerprint(include_str!("../../td-authd/src/secret_request.rs").split("#[cfg(test)]").next().unwrap()), 0x97c108f58f24869a, "intake request source changed");
-        assert_eq!(fingerprint(include_str!("set_client.rs").split("#[cfg(test)]").next().unwrap()), 0x544ec4d9d10e2ada, "credential client changed");
+        assert_eq!(fingerprint(include_str!("../../td-authd/src/secret_request.rs").split("#[cfg(test)]").next().unwrap()), 0x188c619caba6ceb8, "intake request source changed");
+        assert_eq!(fingerprint(include_str!("set_client.rs").split("#[cfg(test)]").next().unwrap()), 0xf402e082e7175844, "credential client changed");
         let sys = include_str!("sys.rs");
         assert_eq!(sys.matches("core::arch::asm!").count(), 1);
         assert_eq!(sys.matches("const SYS_").count(), 3);

@@ -1118,11 +1118,11 @@ separate general system, Firefox, abrupt-power-loss or physical-device gates.
 
 Adding `--powercuts` selects four boots on the same disposable deployment,
 volume and TPM state. The creation boot establishes and orderly-shuts-down
-the baseline above. A recovery boot submits `td-secret set --recovery`
+the baseline above. A recovery boot queues `td-secret set --recovery`
 without selecting W, verifies the live pending client, unchanged bundle and
-no write assertion, then parks for a host cut. The client prompt proves
-descriptor submission, not asynchronous authority admission; this boundary
-may occur before or after intake validates the request. The next boot must preserve
+no write assertion, then parks for a host cut. The client prompt requires root's admission acknowledgement, so the cut
+follows validation of the pending target and sealed descriptor. The next
+boot must preserve
 the exact baseline bundle and credential, start locked, and display no
 ready write when W is selected before unlocking. It then uses fresh recovery
 assertions to unlock and authorize a replacement. Only after the public
@@ -1575,7 +1575,7 @@ specified in UNSAFE.md §16. Owned buffers use best-effort clearing; a sealed
 memfd cannot be overwritten and disappears when its final owner closes it.
 
 The client connects only to `/run/td-authd/1000/set`, requires a root peer,
-and waits for the exact `TDSET01` newline greeting before transfer. It sends
+and waits for the exact `TDSET02` newline greeting before transfer. It sends
 one u16 big-endian frame length, a version-1 typed target, and exactly one
 SCM_RIGHTS descriptor. The target contains a one-byte role (1 primary or
 2 recovery), then separately length-prefixed application and secret names,
@@ -1586,6 +1586,19 @@ It retains the exact sealed descriptor; there is no pathname reopen or
 shared-offset read. A root-owned parent prevents endpoint replacement by
 unprivileged clients. The public intake is separate from the private
 compositor channel, which still refuses received rights.
+
+After validating the sender, target and sealed descriptor, root returns
+one byte `02` acknowledging an admitted queue slot. Until this byte is
+sent, the request retains its five-second admission deadline and cannot
+be selected. A nonblocking send failure or expiry refuses the request;
+backpressure never starts or extends the queue lifetime. A successful
+send starts the sixty-second queue deadline. The client requires exactly
+`02` within a bounded five-second wait after submission before printing
+the attention instructions. EOF, timeout, rejection or an early completion
+byte cannot be mistaken for readiness. This acknowledges admission only;
+expiry, peer loss or later refusal may still invalidate the slot.
+The greeting version changes atomically with both endpoints; the prior
+protocol is refused rather than interpreted as an admission receipt.
 
 Submission never opens a prompt. Pressing physical Ctrl+Alt+Esc and then a
 fresh W selects at most one complete pending write. The root controller

@@ -1,7 +1,7 @@
 //! Human-side submission of one immutable credential descriptor.
 
 use crate::consent::Role;
-use crate::secret_request::{self, Credential, Target, GREETING, MAX_SECRET, SOCKET};
+use crate::secret_request::{self, Credential, Target, ADMITTED, GREETING, MAX_SECRET, SOCKET};
 use crate::secret_sys;
 use std::io::{self, IsTerminal, Read, Write};
 use std::os::unix::net::UnixStream;
@@ -54,6 +54,12 @@ pub(crate) fn set(target: &str, role: Role) -> Result<(), String> {
     frame.extend_from_slice(&description);
     secret_sys::send_descriptor(&stream, &frame, &file).map_err(|e| e.to_string())?;
     drop(file);
+    await_admission(
+        &mut stream,
+        Instant::now()
+            .checked_add(Duration::from_secs(5))
+            .ok_or("credential admission deadline overflow")?,
+    )?;
     eprintln!("td-secret: press Ctrl+Alt+Esc, then W, and check the credential target before touching the token");
     let deadline = Instant::now()
         .checked_add(Duration::from_secs(185))
@@ -84,5 +90,43 @@ pub(crate) fn set(target: &str, role: Role) -> Result<(), String> {
                 )
             }
         }
+    }
+}
+
+fn await_admission(stream: &mut UnixStream, deadline: Instant) -> Result<(), String> {
+    let mut reply = [0];
+    loop {
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .filter(|time| !time.is_zero())
+            .ok_or("credential admission expired; request was not confirmed ready")?;
+        stream
+            .set_read_timeout(Some(remaining))
+            .map_err(|e| e.to_string())?;
+        match stream.read(&mut reply) {
+            Ok(1) if reply == [ADMITTED] => return Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            _ => return Err("credential request was not confirmed ready; authority refused or became unavailable".into()),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_the_admission_reply_allows_the_attention_instruction() {
+        for bytes in [&[ADMITTED][..], &[0], &[1], &[3], &[]] {
+            let (mut client, mut server) = UnixStream::pair().unwrap();
+            server.write_all(bytes).unwrap();
+            drop(server);
+            assert_eq!(
+                await_admission(&mut client, Instant::now() + Duration::from_secs(1)).is_ok(),
+                bytes == [ADMITTED]
+            );
+        }
+        let (mut client, _server) = UnixStream::pair().unwrap();
+        assert!(await_admission(&mut client, Instant::now() + Duration::from_millis(20)).is_err());
     }
 }

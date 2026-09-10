@@ -32,11 +32,21 @@ fn credential(bytes: &[u8]) -> File {
 
 #[test]
 fn capture_retains_exact_bytes_and_selection_is_one_shot() {
-    let (client, mut pending) = pair();
+    let (mut client, mut pending) = pair();
     let mut file = credential(&vec![0xa5; MAX_SECRET]);
     sys::send_descriptor(&client, &frame(), &file).unwrap();
     pending.poll_with(admit).unwrap();
     assert!(!pending.selected);
+    assert!(!pending.acknowledged);
+    assert!(pending.capture().is_err());
+    pending.poll().unwrap();
+    assert!(pending.acknowledged);
+    let mut reply = [0];
+    client.read_exact(&mut reply).unwrap();
+    assert_eq!(reply, [ADMITTED]);
+    pending.poll().unwrap();
+    client.set_nonblocking(true).unwrap();
+    assert_eq!(client.read(&mut reply).unwrap_err().kind(), io::ErrorKind::WouldBlock);
     assert!(file.write_all(b"replacement").is_err());
     let (operation, captured) = pending.capture().unwrap();
     assert_eq!(operation, Target::parse("mail/main", Role::Recovery).unwrap().operation(1000, 65537).unwrap());
@@ -96,6 +106,7 @@ fn identity_and_expiration_are_checked_before_capture() {
     let (client, mut pending) = pair();
     sys::send_descriptor(&client, &frame(), &credential(b"secret")).unwrap();
     pending.poll_with(admit).unwrap();
+    pending.poll().unwrap();
     pending.deadline = Instant::now();
     assert!(pending.capture().is_err());
     assert!(pending.poll().is_err());
@@ -163,15 +174,24 @@ fn root_public_client_uses_the_human_identity_and_immutable_descriptor() {
         command.arg("set");
         if recovery { command.arg("--recovery"); }
         let mut child = command.arg("mail/main").uid(uid).gid(uid).env_clear().current_dir("/")
-            .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+            .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::from(File::create("/run/intake-client.log").unwrap())).spawn().unwrap();
         let mut stdin = child.stdin.take().unwrap();
         let _ = stdin.write_all(b"exact credential\nbytes\0");
         drop(stdin);
         let until = Instant::now() + Duration::from_secs(10);
         let mut captured = false;
+        let mut admission_seen = false;
         loop {
             intake.tick();
-            if intake.pending.as_ref().is_some_and(|pending| pending.operation.is_some()) {
+            if intake.pending.as_ref().is_some_and(|pending| pending.operation.is_some() && !pending.acknowledged) {
+                admission_seen = true;
+                assert!(intake.pending.as_mut().unwrap().capture().is_err());
+                assert!(!fs::read_to_string("/run/intake-client.log").unwrap().contains("then W"));
+            }
+            let log = fs::read_to_string("/run/intake-client.log").unwrap();
+            if log.contains("then W") && !captured {
+                assert!(admission_seen);
+                assert!(intake.pending.as_ref().is_some_and(|pending| pending.acknowledged));
                 assert_eq!(uid, 1000, "nonhuman requester reached admission");
                 assert!(!captured);
                 let (operation, credential) = intake.select().unwrap();
@@ -190,11 +210,60 @@ fn root_public_client_uses_the_human_identity_and_immutable_descriptor() {
             std::thread::sleep(Duration::from_millis(1));
         }
         let output = child.wait_with_output().unwrap();
-        assert_eq!(captured, uid == 1000, "client uid {uid}: {}", String::from_utf8_lossy(&output.stderr));
-        assert_eq!(output.status.success(), uid == 1000, "client uid {uid}: {}", String::from_utf8_lossy(&output.stderr));
+        let log = fs::read_to_string("/run/intake-client.log").unwrap();
+        assert_eq!(captured, uid == 1000, "client uid {uid}: {log}");
+        assert_eq!(output.status.success(), uid == 1000, "client uid {uid}: {log}");
         assert!(output.stdout.is_empty());
-        assert!(!output.stderr.windows(16).any(|bytes| bytes == b"exact credential"));
+        assert!(!log.contains("exact credential"));
+        assert_eq!(log.contains("then W"), uid == 1000);
+        assert_eq!(log.contains("credential stored"), uid == 1000);
     }
     drop(intake);
     assert!(!std::path::Path::new(SOCKET).exists());
+}
+
+#[test]
+fn admission_acknowledgement_is_bounded_and_follows_validation() {
+    let (mut client, mut pending) = pair();
+    sys::send_descriptor(&client, &frame(), &credential(b"secret")).unwrap();
+    pending.poll_with(admit).unwrap();
+    let deadline = pending.deadline;
+    let bytes = [0xa5; 4096];
+    let mut filled = 0;
+    loop {
+        match pending.stream.write(&bytes) {
+            Ok(n) => { filled += n; assert!(filled < 4 * 1024 * 1024); }
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+            other => panic!("fill send buffer: {other:?}"),
+        }
+    }
+    pending.poll().unwrap();
+    assert!(!pending.acknowledged);
+    assert_eq!(pending.deadline, deadline);
+    assert!(pending.capture().is_err());
+    client.set_nonblocking(true).unwrap();
+    let mut bytes = [0; 4096];
+    let mut drained = 0;
+    loop {
+        match client.read(&mut bytes) {
+            Ok(n) => { assert!(n > 0); drained += n; }
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+            other => panic!("drain send buffer: {other:?}"),
+        }
+    }
+    assert_eq!(drained, filled);
+    pending.poll().unwrap();
+    assert!(pending.acknowledged);
+    assert!(pending.deadline > deadline);
+    let mut ack = [0];
+    client.read_exact(&mut ack).unwrap();
+    assert_eq!(ack, [ADMITTED]);
+
+    let (mut client, mut pending) = pair();
+    sys::send_descriptor(&client, &frame(), &credential(b"secret")).unwrap();
+    assert!(pending.poll_with(|_, _| Err(io::Error::other("not installed"))).is_err());
+    assert!(pending.operation.is_none());
+    client.set_nonblocking(true).unwrap();
+    assert_eq!(client.read(&mut ack).unwrap_err().kind(), io::ErrorKind::WouldBlock);
+    assert!(pending.capture().is_err());
 }

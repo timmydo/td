@@ -1086,7 +1086,11 @@ acquire public submission authority. The named raw module is separate from
 
 The versioned greeting, exact typed frame, single sealed descriptor and
 bounded deadlines follow `td-secret/DESIGN.md`. There is no unsolicited
-prompt and no public acknowledgement verb. One accept and at most four
+prompt and no public consent verb. Root sends the public `02` admission
+receipt only after sender, target and descriptor validation; it is not
+consent or completion. The request is unselectable until that receipt is
+sent. Backpressure remains under the original admission deadline; a
+successful send starts the queue lifetime. One accept and at most four
 nonblocking I/O attempts run per terminal heartbeat. Extra connections are
 closed while one pending client exists. Only the private peer's exact `18`
 request selects a ready write. Busy, absent, expired or refused intake

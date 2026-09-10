@@ -3,7 +3,8 @@
 use crate::consent::{Operation, Request, Role};
 
 pub(crate) const SOCKET: &str = "/run/td-authd/1000/set";
-pub(crate) const GREETING: &[u8; 8] = b"TDSET01\n";
+pub(crate) const GREETING: &[u8; 8] = b"TDSET02\n";
+pub(crate) const ADMITTED: u8 = 2;
 pub(crate) const LIMIT: usize = 132;
 pub(crate) const MAX_SECRET: usize = 4096;
 

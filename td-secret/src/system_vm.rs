@@ -122,15 +122,15 @@ fn released(expected: &[u8]) {
     });
 }
 
-fn submit_write(recovery: bool, value: &[u8]) -> Process {
+fn queue_write(recovery: bool, value: &[u8]) -> Process {
     let mut command = Command::new("/bin/td-login");
     command.args(["exec-as", "tester", "--", "/bin/td-secret", "set"]);
     if recovery { command.arg("--recovery"); }
     command.arg("mail/main").stdin(Stdio::piped());
     let mut client = Process::start(command, "/run/desktop-set.log");
-    // The client confirms descriptor submission, not authority admission.
+    // The client prints attention instructions only after root admits the slot.
     client.0.stdin.take().unwrap().write_all(value).unwrap();
-    wait("system write submitted", || {
+    wait("system write admitted", || {
         assert!(client.exited().is_none());
         fs::read_to_string("/run/desktop-set.log").unwrap().contains("then W")
     });
@@ -304,7 +304,7 @@ fn qemu_installed_system_secret_lifecycle() {
     if !recover {
         close(&mut keyboard);
         let before = sealed_bytes();
-        let mut client = submit_write(false, VALUE);
+        let mut client = queue_write(false, VALUE);
         assert_eq!(sealed_bytes(), before);
         assert_eq!(requests.load(Ordering::SeqCst), 5);
         finish_write(&mut client, &mut keyboard);
@@ -315,7 +315,7 @@ fn qemu_installed_system_secret_lifecycle() {
         assert_eq!(sealed_bytes(), initial, "recovery changed the persistent bundle");
         assert_eq!(requests.load(Ordering::SeqCst), 2);
         close(&mut keyboard);
-        let mut client = submit_write(true, REPLACEMENT);
+        let mut client = queue_write(true, REPLACEMENT);
         assert_eq!(sealed_bytes(), initial);
         assert_eq!(requests.load(Ordering::SeqCst), 2);
         if phase == "cut-written" {

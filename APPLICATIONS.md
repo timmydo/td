@@ -9430,7 +9430,8 @@ UHID devices remain absent from the shipping system; see
 Its `--powercuts` mode kills QEMU with a submitted write awaiting consent and
 after an acknowledged replacement, then requires cold locked startup,
 no ready request, fresh recovery consent and the correct old/new credential.
-The first cut does not assert that authority intake has admitted the request.
+The first cut follows the authority admission receipt; the public client
+prints attention instructions only after root validates the queued request.
 The host backing storage and TPM emulator stay alive; this is guest-crash
 evidence at those boundaries, not a host-power-loss or torn-sector model.
 

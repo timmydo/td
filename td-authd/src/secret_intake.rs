@@ -1,7 +1,7 @@
 //! One immutable human request, selected only by the private attention peer.
 
 use crate::consent::Operation;
-use crate::secret_request::{Credential, Target, GREETING, LIMIT, MAX_SECRET, SOCKET};
+use crate::secret_request::{Credential, Target, ADMITTED, GREETING, LIMIT, MAX_SECRET, SOCKET};
 use crate::secret_sys as sys;
 use std::fs::{self, File};
 use std::io::{self, Write};
@@ -32,6 +32,7 @@ struct Pending {
     peer: Option<Peer>,
     descriptor: Option<File>,
     operation: Option<Operation>,
+    acknowledged: bool,
     selected: bool,
     deadline: Instant,
 }
@@ -53,6 +54,7 @@ impl Pending {
             peer: None,
             descriptor: None,
             operation: None,
+            acknowledged: false,
             selected: false,
             deadline: expires(ADMISSION_TIME)?,
         })
@@ -125,6 +127,19 @@ impl Pending {
                 continue;
             }
             if self.operation.is_some() {
+                if !self.acknowledged {
+                    match self.stream.write(&[ADMITTED]) {
+                        Ok(1) => {
+                            self.acknowledged = true;
+                            self.deadline = expires(QUEUE_TIME)?;
+                        }
+                        Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                        Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(()),
+                        Err(e) => return Err(e),
+                        _ => return Err(io::Error::other("credential admission reply failed")),
+                    }
+                    continue;
+                }
                 // No traffic follows the one request. Reading solely detects
                 // disconnect or extra data; neither can alter the snapshot.
                 let mut byte = [0];
@@ -166,7 +181,6 @@ impl Pending {
                         .ok_or_else(|| io::Error::other("missing credential descriptor"))?,
                 )?;
                 self.operation = Some(admit(&target, self.owner)?);
-                self.deadline = expires(QUEUE_TIME)?;
                 return self.live();
             }
             let mut bytes = [0; LIMIT + 2];
@@ -196,6 +210,9 @@ impl Pending {
 
 impl Pending {
     fn capture(&mut self) -> Result<(Operation, Credential), String> {
+        if !self.acknowledged {
+            return Err("credential admission is not acknowledged".into());
+        }
         if self.selected {
             return Err("credential request already selected".into());
         }
