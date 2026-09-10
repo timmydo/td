@@ -9,7 +9,32 @@ pub(crate) const TARGETS: &[&str] = &["linux-x86-64", "td-secret-vm-test", "td-s
 
 pub(crate) const SYSTEM_TARGETS: &[&str] = &["system-secret-vm-test", "btrfs-progs-x86-64"];
 
-pub(crate) fn run_system(runner: &RecipeCheckRunner, tpm: &Path) -> Result<(), String> {
+pub(crate) fn system_options(args: &[String]) -> Result<(PathBuf, bool), String> {
+    let (args, powercuts) = match args.split_last() {
+        Some((flag, rest)) if flag == "--powercuts" => (rest, true),
+        _ => (args, false),
+    };
+    options(args).ok().flatten().map(|path| (path, powercuts))
+        .ok_or_else(|| "usage: td-recipe-eval qemu-secret-system --tpm /absolute/path/to/swtpm [--powercuts]".into())
+}
+
+fn system_result(result: &BootResult, phase: &str, cut: bool) -> Result<(), String> {
+    let cut_marker = format!("{} {phase}", fixture::SYSTEM_CUT);
+    let ended = if cut {
+        result.marker_killed && !result.exited_clean
+            && result.console.lines().filter(|line| *line == cut_marker).count() == 1
+            && !result.console.lines().any(|line| line == SYSTEM_SHUTDOWN_MARKER
+                || line == format!("secret-fixture: {}", fixture::SYSTEM_PASS)
+                || line.starts_with("secret-fixture: test result:"))
+    } else { result.exited_clean && !result.marker_killed };
+    if !result.evidence.target || !ended || result.evidence.kernel_panic
+        || result.console.lines().any(|line| line.starts_with(&format!("secret-fixture: {}", fixture::FAIL))) {
+        return Err(format!("system secret {phase} failed: {}\n{}", result.reason, tail(&result.console, 160)));
+    }
+    Ok(())
+}
+
+pub(crate) fn run_system(runner: &RecipeCheckRunner, tpm: &Path, powercuts: bool) -> Result<(), String> {
     verify_swtpm(tpm)?;
     let qemu = find_qemu()?;
     let system = output(runner, "system-secret-vm-test")?;
@@ -27,16 +52,20 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner, tpm: &Path) -> Result<(), S
     create_persistent_volume(&deployment, &mkfs, &btrfs, &volume, &trust, VolumePurpose::Fixture)?;
     let id = crate::sha256::sha256_file(&deployment.join("manifest"))
         .map_err(|e| format!("hash system fixture manifest: {e}"))?;
-    for phase in ["create", "recover"] {
+    let phases: &[&str] = if powercuts { &["create", "cut-queued", "cut-written", "recover-written"] }
+        else { &["create", "recover"] };
+    for phase in phases {
+        let cut = phase.starts_with("cut-");
         let emulator = Emulator::start(tpm, &scratch.dir, phase)?;
         let tokens = format!("td.hid-fixture=1 td.secret-system={phase}");
-        let marker = format!("secret-fixture: {}", fixture::SYSTEM_PASS);
+        let marker = if cut { format!("{} {phase}", fixture::SYSTEM_CUT) }
+            else { format!("secret-fixture: {}", fixture::SYSTEM_PASS) };
         println!("[qemu-secret-system] {phase}: stock firstboot and supervised desktop");
         let result = boot_with_timeout(&qemu, &kernel, &initramfs, BootPlan {
             disk: Some(BootDisk { path: &volume, read_only: false }),
             mem: SYSTEM_GUEST_MEMORY_MIB,
             target_marker: &marker,
-            kill_on_marker: false,
+            kill_on_marker: cut,
             extra_append: &tokens,
             user_net: false,
             audio: true,
@@ -47,17 +76,17 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner, tpm: &Path) -> Result<(), S
             .map_err(|e| emulator.diagnostic(&e))?;
         fs::write(runner.scratch_dir().join(format!("secret-system-{phase}.log")), &result.console)
             .map_err(|e| format!("save system fixture console: {e}"))?;
-        if !result.evidence.target || !result.exited_clean || result.evidence.kernel_panic
-            || result.console.lines().any(|line| line.starts_with(&format!("secret-fixture: {}", fixture::FAIL))) {
-            return Err(emulator.diagnostic(&format!("system secret {phase} failed: {}\n{}", result.reason, tail(&result.console, 160))));
-        }
+        system_result(&result, phase, cut).map_err(|error| emulator.diagnostic(&error))?;
         require_selected_deployment(&result, td_boot_protocol::SELECTED_CURRENT_MARKER, &id, phase)?;
-        validate_persistent_shutdown(&result, phase)?;
+        if !cut { validate_persistent_shutdown(&result, phase)?; }
         emulator.finish()?;
-        check_persistent_volume(&btrfs, &volume)?;
+        if !cut { check_persistent_volume(&btrfs, &volume)?; }
         println!("[qemu-secret-system] {phase} passed in {:.2}s", result.elapsed.as_secs_f64());
     }
     println!("PASS: full deployment firstboot, secure-attention enrollment and named write, jailed mail receipt, generation relocking, and cold recovery with only the second token; synthetic PCR and UHID fixtures, no measured-boot or physical-presence claim");
+    if powercuts {
+        println!("PASS: abrupt QEMU cuts with an unconsented submitted write and an acknowledged write; cold locked startup, no ready request, old/new credential preservation and fresh recovery consent; host storage and TPM emulator retained, no host-power-loss or torn-sector claim");
+    }
     Ok(())
 }
 
@@ -394,6 +423,56 @@ impl Drop for Emulator {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn system_options_and_guest_phases_reject_ambiguous_cuts() {
+        let args = |values: &[&str]| values.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(system_options(&args(&["--tpm", "/tmp/swtpm"])).unwrap(), (PathBuf::from("/tmp/swtpm"), false));
+        assert_eq!(system_options(&args(&["--tpm", "/tmp/swtpm", "--powercuts"])).unwrap(), (PathBuf::from("/tmp/swtpm"), true));
+        for values in [vec![], vec!["--powercuts"], vec!["--tpm", "relative", "--powercuts"],
+            vec!["--tpm", "/tmp/swtpm", "--powercuts", "--powercuts"]] {
+            assert!(system_options(&args(&values)).is_err());
+        }
+        for phase in fixture::SYSTEM_PHASES {
+            assert_eq!(fixture::system_phase(&format!("console=ttyS0 td.secret-system={phase}")).unwrap(), *phase);
+        }
+        for cmdline in ["", "td.secret-system=unknown", "td.secret-system=create td.secret-system=create",
+            "td.secret-system=cut-queued td.secret-system=recover", "td.secret-system=create td.secret-system="] {
+            assert!(fixture::system_phase(cmdline).is_err());
+        }
+    }
+
+    #[test]
+    fn system_cut_requires_an_observed_kill_at_one_exact_boundary() {
+        let valid = || BootResult {
+            evidence: ConsoleEvidence { target: true, ..ConsoleEvidence::default() },
+            exited_clean: false,
+            marker_killed: true,
+            reason: String::new(),
+            console: format!("{} cut-queued\n", fixture::SYSTEM_CUT),
+            elapsed: Duration::from_secs(1),
+            firefox_audio: FirefoxAudioCapture::NotRequested,
+        };
+        assert!(system_result(&valid(), "cut-queued", true).is_ok());
+        for case in 0..10 {
+            let mut result = valid();
+            match case {
+                0 => result.evidence.target = false,
+                1 => result.marker_killed = false,
+                2 => result.exited_clean = true,
+                3 => result.evidence.kernel_panic = true,
+                4 => result.console.clear(),
+                5 => result.console.push_str(&result.console.clone()),
+                6 => result.console.push_str(&format!("{SYSTEM_SHUTDOWN_MARKER}\n")),
+                7 => result.console.push_str(&format!("secret-fixture: {}\n", fixture::SYSTEM_PASS)),
+                8 => result.console.push_str("secret-fixture: test result: ok. 1 passed; 0 failed;\n"),
+                _ => result.console.push_str(&format!("secret-fixture: {}: refused\n", fixture::FAIL)),
+            }
+            assert!(system_result(&result, "cut-queued", true).is_err(), "case {case}");
+        }
+        assert!(system_result(&valid(), "cut-written", true).is_err());
+        assert!(system_result(&valid(), "cut-queued", false).is_err());
+    }
 
     #[test]
     fn tpm_options_require_an_explicit_absolute_emulator() {

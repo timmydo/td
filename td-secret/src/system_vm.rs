@@ -3,6 +3,7 @@ use super::*;
 
 const INPUT_READY: &str = "/run/td-secret-system-input-ready";
 const VALUE: &[u8] = b"system fixture credential";
+const REPLACEMENT: &[u8] = b"acknowledged replacement credential";
 const CONFIG: &str = "/var/lib/td/applications/65537/.td/app/mail/config/td-mail/config.toml";
 const STRIDE: usize = 1280 * 4;
 const ATTENTION_BACKGROUND: &[u8] = &[0x28, 0x20, 0x18];
@@ -33,6 +34,7 @@ fn notice(text: &str) {
         b'S' => [15, 16, 16, 14, 1, 1, 30],
         b'T' => [31, 4, 4, 4, 4, 4, 4],
         b'U' => [17, 17, 17, 17, 17, 17, 14],
+        b'Y' => [17, 17, 10, 4, 4, 4, 4],
         _ => panic!("unsupported notice glyph"),
     }).collect();
     wait(&format!("visible attention notice {text}"), || {
@@ -120,6 +122,38 @@ fn released(expected: &[u8]) {
     });
 }
 
+fn submit_write(recovery: bool, value: &[u8]) -> Process {
+    let mut command = Command::new("/bin/td-login");
+    command.args(["exec-as", "tester", "--", "/bin/td-secret", "set"]);
+    if recovery { command.arg("--recovery"); }
+    command.arg("mail/main").stdin(Stdio::piped());
+    let mut client = Process::start(command, "/run/desktop-set.log");
+    // The client confirms descriptor submission, not authority admission.
+    client.0.stdin.take().unwrap().write_all(value).unwrap();
+    wait("system write submitted", || {
+        assert!(client.exited().is_none());
+        fs::read_to_string("/run/desktop-set.log").unwrap().contains("then W")
+    });
+    client
+}
+
+fn finish_write(client: &mut Process, keyboard: &mut Keyboard) {
+    select(keyboard, 0x1a); // W.
+    let mut status = None;
+    wait("system write finished", || { status = client.exited(); status.is_some() });
+    assert!(status.unwrap().success());
+    notice("CREDENTIAL STORED");
+}
+
+fn cut(phase: &str) -> ! {
+    // This exact boundary goes straight to the host; libtest must never finish.
+    // No sync/unmount after the acknowledged store write can mask its durability.
+    let mut console = OpenOptions::new().write(true).open("/dev/console").unwrap();
+    writeln!(console, "TD-SECRET-SYSTEM-CUT {phase}").unwrap();
+    console.flush().unwrap();
+    loop { thread::sleep(Duration::from_secs(1)); }
+}
+
 fn checked_token(token: &VirtualCredential, expected: &'static [u8], requests: Arc<AtomicUsize>, recovery: bool) -> Token {
     token.checked(move |request, index| {
         use crate::fido_cbor::{self, Value};
@@ -145,7 +179,11 @@ fn checked_token(token: &VirtualCredential, expected: &'static [u8], requests: A
             let prior = fs::read(&path).unwrap_or_default();
             assert!(prior.len().is_multiple_of(32));
             assert!(!prior.as_chunks::<32>().0.contains(&hash), "reused token challenge");
-            OpenOptions::new().append(true).create(true).mode(0o600).open(path).unwrap().write_all(&hash).unwrap();
+            let mut ledger = OpenOptions::new().append(true).create(true).mode(0o600).open(path).unwrap();
+            ledger.write_all(&hash).unwrap();
+            // Retain freshness evidence across cuts before the token response,
+            // never by flushing unrelated persistent files after a store commit.
+            ledger.sync_all().unwrap();
         }
         requests.store(index + 1, Ordering::SeqCst);
     })
@@ -181,8 +219,12 @@ fn qemu_installed_system_secret_lifecycle() {
     guard("fido-system");
     let _diagnostics = SystemDiagnostics;
     let cmdline = fs::read_to_string("/proc/cmdline").unwrap();
-    let recover = cmdline.split_ascii_whitespace().any(|token| token == "td.secret-system=recover");
-    assert!(recover || cmdline.split_ascii_whitespace().any(|token| token == "td.secret-system=create"));
+    let phases: Vec<_> = cmdline.split_ascii_whitespace().filter_map(|token| token.strip_prefix("td.secret-system=")).collect();
+    assert_eq!(phases.len(), 1);
+    let phase = phases[0];
+    assert!(["create", "recover", "cut-queued", "cut-written", "recover-written"].contains(&phase));
+    let recover = phase != "create";
+    let written = phase == "recover-written";
     let mounts = fs::read_to_string("/proc/mounts").unwrap();
     for (mount, kind, flags) in [("/", "erofs", &["ro"][..]), ("/var", "btrfs", &["rw", "nosuid", "nodev"][..])] {
         assert!(mounts.lines().any(|line| {
@@ -193,7 +235,9 @@ fn qemu_installed_system_secret_lifecycle() {
     }
     let initial = if recover {
         let bytes = sealed_bytes();
-        assert_eq!(crate::crypto::digest(&bytes).as_slice(), fs::read(format!("{COLD_STATE}/bundle-hash")).unwrap());
+        let baseline = fs::read(format!("{COLD_STATE}/bundle-hash")).unwrap();
+        if written { assert_ne!(crate::crypto::digest(&bytes).as_slice(), baseline); }
+        else { assert_eq!(crate::crypto::digest(&bytes).as_slice(), baseline); }
         assert_ne!(fs::read("/proc/sys/kernel/random/boot_id").unwrap(), fs::read(format!("{COLD_STATE}/boot-id")).unwrap());
         for (path, saved) in [(CONFIG, "config"), ("/var/lib/td/principals.tsv", "principals"), ("/var/lib/td/machine-id", "machine-id")] {
             assert_eq!(fs::read(path).unwrap(), fs::read(format!("{COLD_STATE}/{saved}")).unwrap(), "firstboot changed {path}");
@@ -225,7 +269,9 @@ fn qemu_installed_system_secret_lifecycle() {
     crate::tpm::tests::qemu_extend(&[9; 32]);
     let token = persistent_token(!recover, recover);
     let requests = Arc::new(AtomicUsize::new(0));
-    let hid = checked_token(&token, if recover { &[4, 2] } else { &[4, 1, 2, 4, 2, 4, 2] }, Arc::clone(&requests), false);
+    let expected: &[u8] = if phase == "cut-written" { &[4, 2, 4, 2] }
+        else if recover { &[4, 2] } else { &[4, 1, 2, 4, 2, 4, 2] };
+    let hid = checked_token(&token, expected, Arc::clone(&requests), false);
     discover_one();
     restart_mail(true);
     assert_eq!(requests.load(Ordering::SeqCst), 0);
@@ -243,32 +289,44 @@ fn qemu_installed_system_secret_lifecycle() {
         wait("second token removal", || Device::discover().unwrap().len() == 1);
         close(&mut keyboard);
     } else {
-        assert_eq!(fs::read(format!("{COLD_STATE}/challenges")).unwrap().len(), 6 * 32);
+        let hashes = match phase { "cut-written" => 7, "recover-written" => 9, _ => 6 };
+        assert_eq!(fs::read(format!("{COLD_STATE}/challenges")).unwrap().len(), hashes * 32);
+        select(&mut keyboard, 0x1a); // A previous boot's request cannot survive.
+        notice("NO READY");
+        assert_eq!(requests.load(Ordering::SeqCst), 0);
+        no_release();
+        close(&mut keyboard);
     }
     select(&mut keyboard, if recover { 0x15 } else { 0x18 }); // R or U.
-    released(if recover { VALUE } else { b"replace-me\n" });
+    released(if written { REPLACEMENT } else if recover { VALUE } else { b"replace-me\n" });
     notice("SECRETS UNLOCKED");
     restart_mail(false);
     if !recover {
         close(&mut keyboard);
         let before = sealed_bytes();
-        let mut command = Command::new("/bin/td-login");
-        command.args(["exec-as", "tester", "--", "/bin/td-secret", "set", "mail/main"]).stdin(Stdio::piped());
-        let mut client = Process::start(command, "/run/desktop-set.log");
-        client.0.stdin.take().unwrap().write_all(VALUE).unwrap();
-        wait("system write queued", || {
-            assert!(client.exited().is_none());
-            fs::read_to_string("/run/desktop-set.log").unwrap().contains("then W")
-        });
+        let mut client = submit_write(false, VALUE);
         assert_eq!(sealed_bytes(), before);
         assert_eq!(requests.load(Ordering::SeqCst), 5);
-        select(&mut keyboard, 0x1a); // W.
-        let mut status = None;
-        wait("system write finished", || { status = client.exited(); status.is_some() });
-        assert!(status.unwrap().success());
-        notice("CREDENTIAL STORED");
+        finish_write(&mut client, &mut keyboard);
         released(VALUE);
         restart_mail(false);
+    }
+    if phase.starts_with("cut-") {
+        assert_eq!(sealed_bytes(), initial, "recovery changed the persistent bundle");
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
+        close(&mut keyboard);
+        let mut client = submit_write(true, REPLACEMENT);
+        assert_eq!(sealed_bytes(), initial);
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
+        if phase == "cut-written" {
+            finish_write(&mut client, &mut keyboard);
+            released(REPLACEMENT);
+            assert_ne!(sealed_bytes(), initial);
+        } else {
+            assert!(client.exited().is_none());
+        }
+        assert_eq!(hid.finish(), (expected.len(), 0));
+        cut(phase);
     }
     let bundle = sealed_bytes();
     close(&mut keyboard);

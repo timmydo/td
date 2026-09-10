@@ -83,6 +83,16 @@ pub const FIDO_CASES: &[(&str, &str)] = &[
 ];
 pub const SYSTEM_TEST: &str = "fido_device::vm_tests::desktop::system::qemu_installed_system_secret_lifecycle";
 pub const SYSTEM_PASS: &str = "TD-SECRET-SYSTEM-PASS";
+pub const SYSTEM_CUT: &str = "TD-SECRET-SYSTEM-CUT";
+pub const SYSTEM_PHASES: &[&str] = &["create", "recover", "cut-queued", "cut-written", "recover-written"];
+
+pub fn system_phase(cmdline: &str) -> Result<&str, String> {
+    let mut phases = cmdline.split_ascii_whitespace().filter_map(|token| token.strip_prefix("td.secret-system="));
+    let phase = phases.next().filter(|phase| SYSTEM_PHASES.contains(phase))
+        .ok_or("unknown or missing system secret phase")?;
+    if phases.next().is_some() { return Err("duplicate system secret phase".into()); }
+    Ok(phase)
+}
 
 pub const PASS: &str = "TD-SECRET-VM-PASS";
 pub const FAIL: &str = "TD-SECRET-VM-FAIL";
@@ -178,7 +188,7 @@ fn system() -> Result<(), String> {
     let cmdline = fs::read_to_string("/proc/cmdline").map_err(|e| format!("read command line: {e}"))?;
     let tokens: Vec<_> = cmdline.split_ascii_whitespace().collect();
     if !tokens.contains(&"td.hid-fixture=1")
-        || tokens.iter().filter(|token| matches!(**token, "td.secret-system=create" | "td.secret-system=recover")).count() != 1
+        || system_phase(&cmdline).is_err()
         || fs::read("/case").map_err(|e| format!("read image fixture marker: {e}"))? != b"fido-system"
     {
         return Err("system secret fixture was not explicitly selected".into());

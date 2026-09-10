@@ -363,8 +363,7 @@ pub fn qemu_secret_cli(args: &[String]) -> Result<(), String> {
 
 /// Exercise credentials through the full test-only deployment and stock services.
 pub fn qemu_secret_system_cli(args: &[String]) -> Result<(), String> {
-    let tpm = crate::checks::qemu_boot::secret::options(args)?
-        .ok_or_else(|| "usage: td-recipe-eval qemu-secret-system --tpm /absolute/path/to/swtpm".to_string())?;
+    let (tpm, powercuts) = crate::checks::qemu_boot::secret::system_options(args)?;
     let targets = crate::checks::qemu_boot::secret::SYSTEM_TARGETS;
     ensure_targets_provenance(targets)?;
     let root = env::current_dir().map_err(|e| format!("current dir: {e}"))?;
@@ -372,7 +371,7 @@ pub fn qemu_secret_system_cli(args: &[String]) -> Result<(), String> {
     let runner = RecipeCheckRunner::new(root, &name)?.with_streamed_progress();
     warm_operator_inputs(&runner, targets);
     let _lock = lock_ladder_for_run(&runner)?;
-    crate::checks::qemu_boot::secret::run_system(&runner, &tpm)
+    crate::checks::qemu_boot::secret::run_system(&runner, &tpm, powercuts)
 }
 
 /// Host-side qemu boot validation (re #529). This is deliberately NOT a gated

@@ -1116,6 +1116,40 @@ error. Each guest has a 600-second outer limit. This is a
 full-system credential lifecycle fixture; it does not substitute for the
 separate general system, Firefox, abrupt-power-loss or physical-device gates.
 
+Adding `--powercuts` selects four boots on the same disposable deployment,
+volume and TPM state. The creation boot establishes and orderly-shuts-down
+the baseline above. A recovery boot submits `td-secret set --recovery`
+without selecting W, verifies the live pending client, unchanged bundle and
+no write assertion, then parks for a host cut. The client prompt proves
+descriptor submission, not asynchronous authority admission; this boundary
+may occur before or after intake validates the request. The next boot must preserve
+the exact baseline bundle and credential, start locked, and display no
+ready write when W is selected before unlocking. It then uses fresh recovery
+assertions to unlock and authorize a replacement. Only after the public
+client succeeds, the stored notice is visible and exact readback succeeds
+does it park for the second cut. The final boot starts locked, refuses a
+stale queued request, and requires fresh recovery consent before retrieving
+the replacement; normal generation teardown must still relock it.
+
+The two cut boundaries emit exact root-fixture console lines and never
+return from libtest. The host requires successful marker-triggered SIGKILL
+and a reaped SIGKILL status, one exact boundary line, selected deployment
+identity, and no panic, fixture failure, normal result or orderly shutdown.
+A marker seen only after natural exit or timeout cannot prove a cut.
+Only the normal creation and final recovery guests require libtest success,
+stock shutdown and offline Btrfs checks. Intermediate boots recover the dirty
+volume through its normal Btrfs mount; the host does not repair it.
+
+The challenge ledger is fsynced before each token response so freshness
+evidence survives the cuts. No test-side persistent sync, fixture metadata
+update, or shutdown follows the acknowledged replacement: its durability
+depends on the store's existing file-fsync/rename/directory-fsync path.
+Host storage and the TPM emulator remain alive across QEMU termination.
+This proves those two guest-crash boundaries, not host power loss, torn
+sectors, interruption inside publication, lost-success-reply reconciliation,
+or durable authentication-policy rollback resistance. No shipped worker
+acquires a fault switch and the shipping image still contains no fixture.
+
 
 ## Portal evidence
 

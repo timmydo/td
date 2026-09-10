@@ -37,6 +37,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{symlink, DirBuilderExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
+use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -585,6 +586,8 @@ struct BootResult {
     /// reap qemu themselves and leave this false. `qemu-boot-system` asserts it — "exit
     /// powers off" means the VM terminated cleanly, not that the oracle killed it.
     exited_clean: bool,
+    /// This runner successfully sent SIGKILL at the marker and reaped that signal.
+    marker_killed: bool,
     /// How the boot loop ended, for a FAILED boot's error message.
     reason: String,
     /// Bounded, lossily-decoded tail of ttyS0 (or qemu's own diagnostics if ttyS0
@@ -4262,6 +4265,7 @@ fn boot_with_timeout(
     let mut evidence = ConsoleEvidence::default();
     let mut physical_input = qmp_path.map(PhysicalInputController::new);
     let mut end;
+    let mut marker_killed = false;
     loop {
         if let Err(error) = drain_console(
             &console_path,
@@ -4291,8 +4295,8 @@ fn boot_with_timeout(
             }
         }
         if evidence.target && plan.kill_on_marker {
-            let _ = child.kill();
-            let _ = child.wait();
+            let sent = child.kill().is_ok();
+            marker_killed = child.wait().is_ok_and(|status| sent && status.signal() == Some(9));
             end = EndReason::MarkerSeen;
             break;
         }
@@ -4414,6 +4418,7 @@ fn boot_with_timeout(
     Ok(BootResult {
         evidence,
         exited_clean,
+        marker_killed,
         reason,
         console,
         elapsed: start.elapsed(),
@@ -8112,6 +8117,7 @@ mod tests {
         let mut result = BootResult {
             evidence: ConsoleEvidence::default(),
             exited_clean: true,
+            marker_killed: false,
             reason: String::new(),
             console: String::new(),
             elapsed: Duration::from_secs(1),
@@ -9827,6 +9833,7 @@ mod tests {
         let result = BootResult {
             evidence,
             exited_clean: true,
+            marker_killed: false,
             reason: String::new(),
             console: String::new(),
             elapsed: Duration::from_secs(1),
@@ -9866,6 +9873,7 @@ mod tests {
         let mut result = BootResult {
             evidence: healthy_evidence(),
             exited_clean: true,
+            marker_killed: false,
             reason: String::new(),
             console: String::new(),
             elapsed: Duration::from_secs(1),
@@ -10488,6 +10496,7 @@ mod tests {
         let result = BootResult {
             evidence,
             exited_clean: true,
+            marker_killed: false,
             reason: String::new(),
             console: String::new(),
             elapsed: Duration::from_secs(1),
@@ -10512,6 +10521,7 @@ mod tests {
         let boot = |evidence: ConsoleEvidence| BootResult {
             evidence,
             exited_clean: true,
+            marker_killed: false,
             reason: String::new(),
             console: String::new(),
             elapsed: Duration::from_secs(1),

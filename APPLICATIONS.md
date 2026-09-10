@@ -9427,6 +9427,12 @@ service supervision and jailed mail for enrollment, credential replacement,
 cold second-token recovery and relocking. Its synthetic PCR extension and
 UHID devices remain absent from the shipping system; see
 `td-secret/DESIGN.md` for the exact proof and limits.
+Its `--powercuts` mode kills QEMU with a submitted write awaiting consent and
+after an acknowledged replacement, then requires cold locked startup,
+no ready request, fresh recovery consent and the correct old/new credential.
+The first cut does not assert that authority intake has admitted the request.
+The host backing storage and TPM emulator stay alive; this is guest-crash
+evidence at those boundaries, not a host-power-loss or torn-sector model.
 
 The store, TPM protector, FIDO2 enrollment/release and typed one-operation
 writer are connected. The stock direct-kernel VM remains unenrolled;
