@@ -373,6 +373,7 @@ const TARGET_STATIC_RECIPES: &[(&str, &str)] = &[
     ("td-profiler/src", "recipes/src/recipes/td-profiler.rs"),
     ("td-seatd/src", "recipes/src/recipes/td-seatd.rs"),
     ("td-vm-guest/src", "recipes/src/recipes/td-vm-guest.rs"),
+    ("td-update/src", "recipes/src/recipes/td-update.rs"),
     ("td-sh/src", "recipes/src/recipes/td-sh.rs"),
     ("td-svc/src", "recipes/src/recipes/td-svc.rs"),
     ("td-txt/src", "recipes/src/recipes/td-txt.rs"),

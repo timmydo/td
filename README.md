@@ -96,10 +96,20 @@ Published bundles also carry the checkout's committed Git history on the disk,
 at `/run/td-volume/td/source/repository.bundle` inside the guest. The adjacent
 `revision` file names the exported commit. `./build-qcow` requires a clean,
 complete Git checkout and checks that its commit remains unchanged through
-publication. The bundle README explains how to clone this source offline into
-a writable home directory. The source is companion data outside the signed
-deployment; automatic workspace creation and local update signing are not yet
-provided.
+publication. First boot clones this source offline into `~/src/td` as the
+login user. Subsequent boots preserve that checkout. Configure a reachable
+Git origin before pulling changes, then prepare a system build from inside
+the running td release with:
+
+```sh
+cd ~/src/td
+./update build
+```
+
+The source is companion data outside the signed deployment. The build command
+uses the installed toolchain and the normal source-bootstrap graph; signing,
+installation authorization, and reboot are not yet connected. Preserve the
+VM's writable disk to retain the checkout and build cache across boots.
 
 ## Filesystem layout
 

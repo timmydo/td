@@ -1240,9 +1240,10 @@ fn td_portal_settings_etc_name() -> &'static str {
 /// on a table it cannot parse, but a unit SILENTLY dropped from the plan — skipped for
 /// an unsatisfiable dependency — is a clean exit with a shorter list, and that is the
 /// regression this catches: the boot comes up missing a service and says nothing.
-const TD_SVC_UNITS: [&str; 46] = [
+const TD_SVC_UNITS: [&str; 47] = [
     "hostname",
     "td-firstboot",
+    "release-source",
     "rootcheck",
     "profiler",
     "profiler-evidence",
@@ -1415,6 +1416,16 @@ fn build_td_svc_conf() -> String {
          exec=/bin/td-firstboot provision --application-home {ui_home} --application-owner {ui_uid}:{ui_gid} --enroll-principals\n\
          after=hostname\n\
          timeout={firstboot}\n\
+         \n\
+         [release-source]\n\
+         type=oneshot\n\
+         cgroup=session\n\
+         exec=/bin/td-login exec-as {ui_user} -- /bin/td-update init\n\
+         after=td-firstboot\n\
+         requires=td-firstboot\n\
+         timeout=180\n\
+         log=/var/log/svc/release-source.log\n\
+         console=yes\n\
          \n\
          # Asserts the identity is readable through the MUTABLE_ETC symlinks.\n\
          [rootcheck]\n\
@@ -4185,6 +4196,14 @@ fn real_root_steps(sys: &SystemDef) -> Result<Vec<Step>, String> {
         from: "{in:td-jail}".into(),
         dest: "{root}/real-root{in:td-jail}".into(),
     });
+    steps.push(Step::CopyTree {
+        from: "{in:td-update}".into(),
+        dest: "{root}/real-root{in:td-update}".into(),
+    });
+    steps.push(Step::Symlink {
+        target: "{in:td-update}/bin/td-update".into(),
+        link: "{root}/real-root/bin/td-update".into(),
+    });
     // The software UI is static and owns no dynamic runtime closure.
     steps.push(Step::CopyTree {
         from: "{in:td-vm-guest}".into(),
@@ -5199,6 +5218,7 @@ pub fn recipe() -> Recipe {
             "td-jail",
             "td-seatd",
             "td-vm-guest",
+            "td-update",
             "td-audio",
             "td-compositor",
             "td-busd",
@@ -7070,6 +7090,25 @@ news\tnews-0.1\tsource\tempty-runtime-1\tsource\n"
                  REJECTED by `td-svc check`, failing the image build"
             );
         }
+    }
+
+    #[test]
+    fn release_source_initialization_is_unprivileged_and_optional() {
+        assert_eq!(unit_key("release-source", "exec").as_deref(),
+            Some("/bin/td-login exec-as tester -- /bin/td-update init"));
+        assert_eq!(unit_key("release-source", "type").as_deref(), Some("oneshot"));
+        assert_eq!(unit_key("release-source", "cgroup").as_deref(), Some("session"));
+        assert_eq!(unit_key("release-source", "requires").as_deref(), Some("td-firstboot"));
+        assert_eq!(unit_key("release-source", "after").as_deref(), Some("td-firstboot"));
+        for unit in TD_SVC_UNITS {
+            assert!(!unit_key(unit, "requires").unwrap_or_default()
+                .split(',').any(|dependency| dependency == "release-source"));
+        }
+        let steps = recipe().steps.unwrap();
+        assert!(steps.iter().any(|step| matches!(step, Step::Symlink { target, link }
+            if target == "{in:td-update}/bin/td-update" && link == "{root}/real-root/bin/td-update")));
+        assert!(steps.iter().any(|step| matches!(step, Step::CopyTree { from, dest }
+            if from == "{in:td-update}" && dest == "{root}/real-root{in:td-update}")));
     }
 
     #[test]

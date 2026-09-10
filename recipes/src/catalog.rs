@@ -191,6 +191,7 @@ mod tests {
             "td-sh",
             "td-svc",
             "td-txt",
+            "td-update",
             "td-util",
             "td-vm-guest",
         ];

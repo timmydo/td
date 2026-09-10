@@ -902,16 +902,17 @@ fn readme(deployment_id: &str, format: DiskFormat) -> String {
          \n\
          The disk includes the published commit and its Git history at\n\
          `/run/td-volume/td/source/repository.bundle`, with its commit ID in\n\
-         the adjacent `revision` file. Create a writable checkout offline:\n\
+         the adjacent `revision` file. First boot creates `~/src/td` offline,\n\
+         preserving any existing checkout. Build from that checkout with:\n\
          \n\
          ```\n\
-         mkdir -p ~/src\n\
-         git clone /run/td-volume/td/source/repository.bundle ~/src/td\n\
          cd ~/src/td\n\
-         git switch -c main\n\
+         ./update build\n\
          ```\n\
          \n\
          Configure your project's Git remote before pulling future changes.\n\
+         `td-update init` retries initialization. Building does not yet sign\n\
+         or activate a deployment.\n\
          Use a persistent VM disk to retain your checkout across restarts.\n\
          Source is companion data covered by this download's disk checksum;\n\
          it is outside the signed deployment and is never executed at boot.\n\

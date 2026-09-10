@@ -267,8 +267,11 @@ do not lock out a concurrent editor or establish a snapshot of build reads.
 The source files have mode 0644 and their volume directories have mode 0755,
 independent of the publisher's umask. They count against the volume payload
 budget. The published disk checksum covers these bytes; the deployment
-signature does not. Boot never executes them. A user may clone the bundle into
-their persistent home, where ordinary Git owns subsequent edits and pulls.
+signature does not. Boot never executes them. The unprivileged `release-source`
+oneshot clones the bundle into the human's persistent `~/src/td` if absent,
+where ordinary Git owns subsequent edits and pulls. It preserves an existing
+checkout and never makes console startup depend on cloning. The initializer
+and native build command are specified in `td-update/DESIGN.md`.
 Update activation preserves this initial source companion and the user's
 checkout. Future source provenance and signing integration must not treat
 this mutable volume metadata as a boot trust root.
