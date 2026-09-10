@@ -92,6 +92,15 @@ The bundle is a convenience for people evaluating td, not a distribution
 channel: nothing in the recipe graph names it, no build fetches it, and td
 updates remain a `git pull` and a rebuild.
 
+Published bundles also carry the checkout's committed Git history on the disk,
+at `/run/td-volume/td/source/repository.bundle` inside the guest. The adjacent
+`revision` file names the exported commit. `./build-qcow` requires a clean,
+complete Git checkout and checks that its commit remains unchanged through
+publication. The bundle README explains how to clone this source offline into
+a writable home directory. The source is companion data outside the signed
+deployment; automatic workspace creation and local update signing are not yet
+provided.
+
 ## Filesystem layout
 
 ```

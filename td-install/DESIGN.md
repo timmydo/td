@@ -255,6 +255,24 @@ exist and why its rule is written down before it does.
 
 ## 4. Disk layout
 
+Published VM volumes additionally carry `td/source/repository.bundle` and
+`td/source/revision`. These are source companion data, outside the deployment
+and target artifact graph. The VM producer exports only the selected Git
+HEAD's reachable history, never host Git configuration, hooks, untracked files
+or unrelated refs. It requires a clean, complete checkout before preparation
+and checks the same clean commit again during export and before publication.
+The operator must keep the checkout stable throughout the build; these checks
+do not lock out a concurrent editor or establish a snapshot of build reads.
+
+The source files have mode 0644 and their volume directories have mode 0755,
+independent of the publisher's umask. They count against the volume payload
+budget. The published disk checksum covers these bytes; the deployment
+signature does not. Boot never executes them. A user may clone the bundle into
+their persistent home, where ordinary Git owns subsequent edits and pulls.
+Update activation preserves this initial source companion and the user's
+checkout. Future source provenance and signing integration must not treat
+this mutable volume metadata as a boot trust root.
+
 Positions are in SECTORS of the destination's own logical size, not in
 512-byte units. The entry array is 16 KiB and the first partition starts at
 1 MiB whatever that size is, so the LBA numbers below differ between a 512e

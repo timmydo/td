@@ -28,14 +28,15 @@ use std::process::Command;
 
 use crate::check_runner::RecipeCheckRunner;
 use crate::checks::qemu_boot::{
-    build_btrfs_tools, create_persistent_volume, find_qemu_tool, provision_selector,
-    verify_deployment, verify_selector, RunTrust, VolumePurpose, PUBLISHED_VOLUME_BYTES,
+    build_btrfs_tools, create_release_volume, find_qemu_tool, provision_selector,
+    verify_deployment, verify_selector, RunTrust, PUBLISHED_VOLUME_BYTES,
     SYSTEM_GUEST_MEMORY_MIB,
 };
 use crate::checks::vm_profile::{
     self, Compression, DiskFormat, CHECKSUMS_NAME, INITRD_NAME, KERNEL_NAME, LAUNCHER_NAME,
     README_NAME,
 };
+use crate::checks::release_source::ReleaseSource;
 
 /// The distro image recipe a bundle ships; its closure pulls in the kernel.
 const SYSTEM: &str = "system-x86-64";
@@ -97,6 +98,7 @@ pub(crate) fn run(
     runner: &RecipeCheckRunner,
     lock: std::fs::File,
     options: &BundleOptions,
+    source: &ReleaseSource,
 ) -> Result<(), String> {
     // Settled before the build: a destination that can never receive a bundle
     // is refused now rather than after the climb. This may CREATE `out` —
@@ -140,6 +142,9 @@ pub(crate) fn run(
     // A scratch directory this run owns outright cannot collide with an
     // operator's data.
     let scratch = Scratch::new(runner.ladder_work_dir())?;
+    let source_directory = scratch.dir.join("release-source");
+    source.stage(runner.repo_root(), &source_directory)?;
+    println!("   [bundle] including source commit {}", source.revision());
 
     println!("   [bundle] staging boot payloads");
     let staged_kernel = scratch.dir.join(KERNEL_NAME);
@@ -165,14 +170,13 @@ pub(crate) fn run(
 
     println!("   [bundle] creating the persistent Btrfs volume (this writes several GiB)");
     let raw_volume = scratch.dir.join(DiskFormat::Raw.file_name());
-    create_persistent_volume(
+    create_release_volume(
         &deployment,
         &mkfs,
         &btrfs,
         &raw_volume,
         &trust,
-        // Handed to strangers: no oracle scaffolding, nothing about this host.
-        VolumePurpose::Published,
+        &source_directory,
     )?;
 
     // The ladder is no longer needed: everything below reads only the scratch.
@@ -207,6 +211,7 @@ pub(crate) fn run(
     .map_err(|e| format!("write the bundle marker: {e}"))?;
     verify_staged(&scratch.dir, format)?;
     write_checksums(&scratch.dir, format)?;
+    source.verify_checkout(runner.repo_root())?;
 
     // `out` was created before the build, so that an uncreatable one failed
     // fast. Only now, with every file finished, is it CLEARED and filled —
@@ -892,6 +897,24 @@ fn readme(deployment_id: &str, format: DiskFormat) -> String {
          ```\n\
          sha256sum -c {CHECKSUMS_NAME}\n\
          ```\n\
+         \n\
+         ## Source checkout\n\
+         \n\
+         The disk includes the published commit and its Git history at\n\
+         `/run/td-volume/td/source/repository.bundle`, with its commit ID in\n\
+         the adjacent `revision` file. Create a writable checkout offline:\n\
+         \n\
+         ```\n\
+         mkdir -p ~/src\n\
+         git clone /run/td-volume/td/source/repository.bundle ~/src/td\n\
+         cd ~/src/td\n\
+         git switch -c main\n\
+         ```\n\
+         \n\
+         Configure your project's Git remote before pulling future changes.\n\
+         Use a persistent VM disk to retain your checkout across restarts.\n\
+         Source is companion data covered by this download's disk checksum;\n\
+         it is outside the signed deployment and is never executed at boot.\n\
          \n\
          ## What actually happens when you boot it\n\
          \n\

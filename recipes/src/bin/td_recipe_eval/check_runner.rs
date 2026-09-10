@@ -612,6 +612,7 @@ pub fn bundle_cli(args: &[String]) -> Result<(), String> {
     ensure_targets_provenance(&targets)?;
 
     let root = env::current_dir().map_err(|e| format!("current dir: {e}"))?;
+    let source = crate::checks::release_source::ReleaseSource::inspect(&root)?;
     let scratch_name = scratch_name("bundle", &[STEM]);
     let runner = RecipeCheckRunner::new(root, &scratch_name)?.with_streamed_progress();
     // Settle the destination before the warm, for the same reason the warm
@@ -645,7 +646,7 @@ pub fn bundle_cli(args: &[String]) -> Result<(), String> {
     // The lock goes to the callee: it releases it once the volume is built and
     // before the qcow2 conversion, which reads only the private TMPDIR scratch
     // the bundle staged out, guarded against the ladder as `run`'s is.
-    crate::checks::bundle::run(&runner, lock, &options)
+    crate::checks::bundle::run(&runner, lock, &options, &source)
 }
 
 fn bundle_usage() -> String {

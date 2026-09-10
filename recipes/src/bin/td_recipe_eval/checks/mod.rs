@@ -7,6 +7,7 @@ mod basic;
 // redistributable demo VM, which needs host qemu-img and a writable destination.
 // Exposed as `td-recipe-eval bundle` (check_runner::bundle_cli).
 pub(crate) mod bundle;
+pub(crate) mod release_source;
 mod codex;
 // qemu_boot is NOT a CheckRunner variant: booting the kernel needs HOST qemu,
 // which the gate's host-free sandbox hides, so it can't run as a sandboxed

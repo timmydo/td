@@ -761,6 +761,7 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
         &trust,
         Some(&seccomp_probe),
         VolumePurpose::Fixture,
+        None,
     )?;
     if fixture.initial_id == fixture.alternate_id {
         return Err("transaction fixture candidate did not change the deployment id".to_string());
@@ -1017,6 +1018,7 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
         &trust,
         Some(&seccomp_probe),
         VolumePurpose::Fixture,
+        None,
     )?;
     if failure_fixture.initial_id != fixture.initial_id
         || failure_fixture.alternate_id != fixture.alternate_id
@@ -1200,6 +1202,7 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
         &trust,
         Some(&seccomp_probe),
         VolumePurpose::Fixture,
+        None,
     )?;
     if fallback_fixture.initial_id != failure_fixture.initial_id
         || fallback_fixture.alternate_id == fallback_fixture.initial_id
@@ -3181,6 +3184,7 @@ fn build_persistent_system(
         &trust,
         Some(&seccomp_probe),
         VolumePurpose::Fixture,
+        None,
     )?;
     Ok((bzimage, initramfs, volume, btrfs))
 }
@@ -3265,6 +3269,31 @@ pub(crate) fn create_persistent_volume(
         trust,
         None,
         purpose,
+        None,
+    )
+    .map(|_| ())
+}
+
+/// Publish the source alongside the deployment, without making it a recipe tool.
+pub(crate) fn create_release_volume(
+    deployment: &Path,
+    mkfs: &Path,
+    btrfs: &Path,
+    output: &Path,
+    trust: &RunTrust,
+    source: &Path,
+) -> Result<(), String> {
+    create_persistent_volume_layout(
+        deployment,
+        mkfs,
+        btrfs,
+        output,
+        VolumeLayout::Basic,
+        false,
+        trust,
+        None,
+        VolumePurpose::Published,
+        Some(source),
     )
     .map(|_| ())
 }
@@ -3319,6 +3348,7 @@ fn create_persistent_volume_layout(
     trust: &RunTrust,
     seccomp_probe: Option<&Path>,
     purpose: VolumePurpose,
+    source: Option<&Path>,
 ) -> Result<VolumeFixture, String> {
     let manifest = deployment.join("manifest");
     let deployment_id = crate::sha256::sha256_file(&manifest)
@@ -3328,8 +3358,13 @@ fn create_persistent_volume_layout(
         VolumeLayout::Transactional => 3,
         VolumeLayout::CorruptCurrent => 2,
     };
-    let fixture_payload_bytes =
+    let mut fixture_payload_bytes =
         persistent_fixture_payload_bytes(deployment, copies, seccomp_probe)?;
+    if let Some(source) = source {
+        fixture_payload_bytes = fixture_payload_bytes
+            .checked_add(super::release_source::payload_bytes(source)?)
+            .ok_or("persistent volume payload size overflow")?;
+    }
     let volume_bytes = purpose.volume_bytes();
     let payload_limit = volume_bytes.saturating_sub(PERSISTENT_VOLUME_HEADROOM);
     if fixture_payload_bytes > payload_limit {
@@ -3358,6 +3393,9 @@ fn create_persistent_volume_layout(
     let _seed_cleanup = Scratch { dir: seed.clone() };
 
     populate_persistent_seed(deployment, &seed, &deployment_id, trust, purpose)?;
+    if let Some(source) = source {
+        super::release_source::copy_to_volume(source, &seed)?;
+    }
     if system_runtime_fixtures {
         stage_openssh_admin_fixture(&seed)?;
     }
