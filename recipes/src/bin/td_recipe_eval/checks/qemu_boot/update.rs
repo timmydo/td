@@ -8,9 +8,10 @@ use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
+use td_recipe::{ladder, td_boot_protocol};
 
 type Result<T> = std::result::Result<T, String>;
-const USAGE: &str = "usage: qemu-update --kernel FILE --selector FILE --disk FILE --format raw|qcow2 --work NEW-DIR [--timeout SECONDS]";
+const USAGE: &str = "usage: qemu-update --kernel FILE --selector FILE --disk FILE --format raw|qcow2 --work NEW-DIR [--timeout SECONDS] [--rollback yes|no]";
 const READY_NOTICE: &str = " is ready. Press Ctrl+Alt+Escape, then I to review it.";
 const LINE_LIMIT: usize = 1024 * 1024;
 const LOG_LIMIT: u64 = 256 * 1024 * 1024;
@@ -22,6 +23,7 @@ struct Options {
     format: String,
     work: PathBuf,
     timeout: Duration,
+    rollback: bool,
 }
 
 fn options(args: &[String]) -> Result<Options> {
@@ -32,7 +34,13 @@ fn options(args: &[String]) -> Result<Options> {
         };
         if !matches!(
             key.as_str(),
-            "--kernel" | "--selector" | "--disk" | "--format" | "--work" | "--timeout"
+            "--kernel"
+                | "--selector"
+                | "--disk"
+                | "--format"
+                | "--work"
+                | "--timeout"
+                | "--rollback"
         ) || values.insert(key.as_str(), value.as_str()).is_some()
         {
             return Err(USAGE.into());
@@ -63,6 +71,11 @@ fn options(args: &[String]) -> Result<Options> {
     if !(60..=604800).contains(&timeout) {
         return Err(USAGE.into());
     }
+    let rollback = match values.get("--rollback").copied().unwrap_or("no") {
+        "yes" => true,
+        "no" => false,
+        _ => return Err(USAGE.into()),
+    };
     Ok(Options {
         kernel: input("--kernel")?,
         selector: input("--selector")?,
@@ -70,6 +83,7 @@ fn options(args: &[String]) -> Result<Options> {
         format: format.into(),
         work: PathBuf::from(get("--work")?),
         timeout: Duration::from_secs(timeout),
+        rollback,
     })
 }
 
@@ -149,10 +163,45 @@ fn serial_lines(
 
 impl Guest {
     fn start(options: &Options, pass: u64, deadline: Instant) -> Result<Self> {
+        Self::healthy(
+            options,
+            pass,
+            deadline,
+            &options.work.join("disk.qcow2"),
+            |_| Ok(()),
+        )
+    }
+
+    fn healthy(
+        options: &Options,
+        pass: u64,
+        deadline: Instant,
+        disk: &Path,
+        mut observe: impl FnMut(&str) -> Result<()>,
+    ) -> Result<Self> {
+        let mut guest = Self::spawn(options, pass, deadline, disk, "")?;
+        guest.until(Duration::from_secs(1800), |line| {
+            observe(line)?;
+            Ok((line == ladder::SYSTEM_BOOT_SUCCESS_MARKER).then_some(()))
+        })?;
+        guest.qmp = Some(Qmp::connect_until(
+            &options.work.join(format!("qmp-{pass}.sock")),
+            deadline.min(Instant::now() + Duration::from_secs(10)),
+        )?);
+        println!("[qemu-update] boot {pass} healthy");
+        Ok(guest)
+    }
+
+    fn spawn(
+        options: &Options,
+        pass: u64,
+        deadline: Instant,
+        disk: &Path,
+        extra: &str,
+    ) -> Result<Self> {
         let socket = options.work.join(format!("qmp-{pass}.sock"));
         let log = private_file(&options.work.join(format!("serial-{pass}.log")))?;
         let error = private_file(&options.work.join(format!("qemu-{pass}.log")))?;
-        let disk = options.work.join("disk.qcow2");
         let mut command = Command::new(find_qemu()?);
         command
             .args([
@@ -195,7 +244,9 @@ impl Guest {
             .arg(&options.kernel)
             .arg("-initrd")
             .arg(&options.selector)
-            .args(["-append", "console=ttyS0 rdinit=/init", "-drive"])
+            .arg("-append")
+            .arg(format!("console=ttyS0 rdinit=/init {extra}"))
+            .arg("-drive")
             .arg(format!(
                 "if=none,format=qcow2,id=disk0,file={}",
                 disk.display().to_string().replace(',', ",,")
@@ -222,7 +273,7 @@ impl Guest {
         };
         let (send, lines) = mpsc::sync_channel(64);
         let reader = thread::spawn(move || serial_lines(output, log, send));
-        let mut guest = Self {
+        let guest = Self {
             child,
             input,
             lines: Some(lines),
@@ -231,17 +282,51 @@ impl Guest {
             deadline,
             sequence: 0,
         };
-        // Consume boot output immediately. The monitor does not block boot
-        // (wait=off), so negotiate it only after reaching boot health.
-        guest.until(Duration::from_secs(1800), |line| {
-            Ok((line == "TD-BOOT-SUCCESS-OK").then_some(()))
-        })?;
-        guest.qmp = Some(Qmp::connect_until(
-            &socket,
-            deadline.min(Instant::now() + Duration::from_secs(10)),
-        )?);
-        println!("[qemu-update] boot {pass} healthy");
         Ok(guest)
+    }
+
+    fn failed_boot(mut self, expected: &str, remaining: u8) -> Result<()> {
+        let end = self
+            .deadline
+            .min(Instant::now() + Duration::from_secs(1800));
+        let mut evidence = FailureEvidence::default();
+        loop {
+            let budget = end
+                .checked_duration_since(Instant::now())
+                .ok_or("failed boot did not shut down before its deadline")?;
+            match self
+                .lines
+                .as_ref()
+                .ok_or("VM serial receiver closed")?
+                .recv_timeout(budget.min(Duration::from_secs(1)))
+            {
+                Ok(line) => evidence.observe(&line, expected, remaining)?,
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+        self.lines.take();
+        if let Some(reader) = self.reader.take() {
+            reader
+                .join()
+                .map_err(|_| "failed-boot serial reader failed")??;
+        }
+        loop {
+            if let Some(status) = self
+                .child
+                .try_wait()
+                .map_err(|e| format!("wait for failed boot: {e}"))?
+            {
+                if !status.success() {
+                    return Err(format!("failed boot did not exit cleanly: {status}"));
+                }
+                return evidence.finish();
+            }
+            if Instant::now() >= end {
+                return Err("failed boot closed serial without exiting".into());
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
     }
 
     fn until<T>(
@@ -472,6 +557,209 @@ fn selector(guest: &mut Guest, slot: &str) -> Result<String> {
         .map(|line| line.trim_start_matches("../deployments/").to_string())
 }
 
+fn once(flag: &mut bool, matches: bool, action: &str) -> Result<()> {
+    if *flag || !matches {
+        return Err(format!("unexpected or duplicate {action}"));
+    }
+    *flag = true;
+    Ok(())
+}
+
+#[derive(Default)]
+struct FailureEvidence {
+    selected: bool,
+    consumed: bool,
+    markers: std::collections::BTreeSet<&'static str>,
+}
+
+const FAILURE_MARKERS: [&str; 5] = [
+    ladder::SYSTEM_ROOT_RO_MARKER,
+    ladder::SYSTEM_ETC_RO_MARKER,
+    ladder::SYSTEM_STATE_WRITABLE_MARKER,
+    ladder::SYSTEM_STATE_OWNER_MARKER,
+    ladder::SYSTEM_SHUTDOWN_MARKER,
+];
+
+impl FailureEvidence {
+    fn observe(&mut self, line: &str, id: &str, remaining: u8) -> Result<()> {
+        if line.starts_with("TD-BOOT-SELECTED-") {
+            once(
+                &mut self.selected,
+                line == format!("{} {id}", td_boot_protocol::SELECTED_CURRENT_MARKER),
+                "failed-boot selection",
+            )?;
+        }
+        if line.starts_with(td_boot_protocol::ATTEMPT_CONSUMED_MARKER) {
+            once(
+                &mut self.consumed,
+                line == format!(
+                    "{} {id} remaining={remaining}",
+                    td_boot_protocol::ATTEMPT_CONSUMED_MARKER
+                ),
+                "failed-boot attempt",
+            )?;
+        }
+        if line.starts_with(td_boot_protocol::ATTEMPTS_EXHAUSTED_MARKER)
+            || line == ladder::SYSTEM_BOOT_SUCCESS_MARKER
+            || line == ladder::GREETER_MARKER
+            || line.contains("Kernel panic")
+        {
+            return Err(format!(
+                "failed candidate unexpectedly reached health or fallback: {line}"
+            ));
+        }
+        for marker in FAILURE_MARKERS {
+            if line == marker {
+                self.markers.insert(marker);
+            }
+        }
+        Ok(())
+    }
+
+    fn finish(&self) -> Result<()> {
+        if !self.selected || !self.consumed || self.markers.len() != FAILURE_MARKERS.len() {
+            return Err(
+                "failed boot lacks selection, durable attempt, root/state or shutdown evidence"
+                    .into(),
+            );
+        }
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+struct RollbackEvidence {
+    selected: bool,
+    exhausted: bool,
+}
+
+impl RollbackEvidence {
+    fn observe(&mut self, line: &str, failed: &str, previous: &str, first: bool) -> Result<()> {
+        if line.starts_with("TD-BOOT-SELECTED-") {
+            let marker = if first {
+                td_boot_protocol::SELECTED_PREVIOUS_MARKER
+            } else {
+                td_boot_protocol::SELECTED_CURRENT_MARKER
+            };
+            once(
+                &mut self.selected,
+                line == format!("{marker} {previous}"),
+                "rollback selection",
+            )?;
+        }
+        if line.starts_with(td_boot_protocol::ATTEMPTS_EXHAUSTED_MARKER) {
+            once(
+                &mut self.exhausted,
+                first
+                    && line
+                        == format!(
+                            "{} {failed} -> {previous}",
+                            td_boot_protocol::ATTEMPTS_EXHAUSTED_MARKER
+                        ),
+                "attempt exhaustion",
+            )?;
+        }
+        if line.starts_with(td_boot_protocol::ATTEMPT_CONSUMED_MARKER)
+            || line.contains("Kernel panic")
+        {
+            return Err(format!(
+                "rollback boot consumed an attempt or panicked: {line}"
+            ));
+        }
+        Ok(())
+    }
+
+    fn finish(&self, first: bool) -> Result<()> {
+        if !self.selected || self.exhausted != first {
+            return Err("rollback selection evidence is incomplete".into());
+        }
+        Ok(())
+    }
+}
+
+fn overlay(backing: &Path, format: &str, disk: &Path) -> Result<()> {
+    let image = find_qemu_tool("qemu-img").ok_or("qemu-img is required")?;
+    let status = Command::new(image)
+        .args(["create", "-f", "qcow2", "-F", format, "-b"])
+        .arg(backing)
+        .arg(disk)
+        .stdin(Stdio::null())
+        .status()
+        .map_err(|e| format!("create test overlay: {e}"))?;
+    if !status.success() {
+        return Err(format!("qemu-img create failed: {status}"));
+    }
+    Ok(())
+}
+
+fn verify_persistence(
+    guest: &mut Guest,
+    expected: &str,
+    public: &str,
+    source: &str,
+    token: &str,
+) -> Result<()> {
+    let cmdline = guest.scalar("cat /proc/cmdline", |line| kernel_id(line).is_some())?;
+    if kernel_id(&cmdline) != Some(expected) {
+        return Err("reboot selected a different deployment".into());
+    }
+    guest.command(&format!("test \"$(cat /var/home/tester/{token})\" = {token} && test ! -r /var/lib/td-deploy/deployment.pk8"))?;
+    if guest.scalar("cat /run/td-volume/td/trusted.pub", canonical_id)? != public {
+        return Err("installation changed its public signing identity".into());
+    }
+    guest.command("cd /var/home/tester/src/td")?;
+    if guest.scalar("git hash-object td-update/src/main.rs", git_id)? != source {
+        return Err("reboot changed the user's source edit".into());
+    }
+    Ok(())
+}
+
+fn rollback(
+    options: &Options,
+    deadline: Instant,
+    initial: &str,
+    successor: &str,
+    public: &str,
+    source: &str,
+    token: &str,
+) -> Result<()> {
+    let disk = options.work.join("rollback.qcow2");
+    for attempt in 0..td_boot_protocol::DEFAULT_BOOT_ATTEMPTS {
+        let pass = u64::from(attempt) + 3;
+        let guest = Guest::spawn(
+            options,
+            pass,
+            deadline,
+            &disk,
+            ladder::BOOT_FAIL_TARGET_CMDLINE_TOKEN,
+        )?;
+        guest.failed_boot(
+            successor,
+            td_boot_protocol::DEFAULT_BOOT_ATTEMPTS - attempt - 1,
+        )?;
+        println!(
+            "[qemu-update] failed successor boot {} consumed its durable attempt",
+            attempt + 1
+        );
+    }
+    for (offset, first) in [true, false].into_iter().enumerate() {
+        let pass = u64::from(td_boot_protocol::DEFAULT_BOOT_ATTEMPTS) + 3 + offset as u64;
+        let mut evidence = RollbackEvidence::default();
+        let mut guest = Guest::healthy(options, pass, deadline, &disk, |line| {
+            evidence.observe(line, successor, initial, first)
+        })?;
+        evidence.finish(first)?;
+        verify_persistence(&mut guest, initial, public, source, token)?;
+        if selector(&mut guest, "current")? != initial {
+            return Err("automatic rollback did not persist current".into());
+        }
+        guest.command("sync")?;
+        guest.stop()?;
+    }
+    println!("[qemu-update] automatic rollback and its next boot preserved user state and signing identity");
+    Ok(())
+}
+
 pub(crate) fn run_cli(args: &[String]) -> Result<()> {
     let mut options = options(args)?;
     let name = options
@@ -499,17 +787,11 @@ pub(crate) fn run_cli(args: &[String]) -> Result<()> {
         .mode(0o700)
         .create(&options.work)
         .map_err(|e| format!("create new oracle directory: {e}"))?;
-    let image = find_qemu_tool("qemu-img").ok_or("qemu-img is required")?;
-    let status = Command::new(image)
-        .args(["create", "-f", "qcow2", "-F", &options.format, "-b"])
-        .arg(&options.disk)
-        .arg(options.work.join("disk.qcow2"))
-        .stdin(Stdio::null())
-        .status()
-        .map_err(|e| format!("create test overlay: {e}"))?;
-    if !status.success() {
-        return Err(format!("qemu-img create failed: {status}"));
-    }
+    overlay(
+        &options.disk,
+        &options.format,
+        &options.work.join("disk.qcow2"),
+    )?;
     let deadline = Instant::now()
         .checked_add(options.timeout)
         .ok_or("oracle deadline overflow")?;
@@ -559,23 +841,24 @@ pub(crate) fn run_cli(args: &[String]) -> Result<()> {
     }
     guest.command("sync")?;
     guest.stop()?;
+    if options.rollback {
+        let pending = options.work.join("pending.qcow2");
+        fs::rename(options.work.join("disk.qcow2"), &pending)
+            .map_err(|e| format!("preserve the stopped pending installation: {e}"))?;
+        overlay(&pending, "qcow2", &options.work.join("disk.qcow2"))?;
+        overlay(&pending, "qcow2", &options.work.join("rollback.qcow2"))?;
+    }
     let mut guest = Guest::start(&options, 2, deadline)?;
-    let cmdline = guest.scalar("cat /proc/cmdline", |line| kernel_id(line).is_some())?;
-    if kernel_id(&cmdline) != Some(successor.as_str()) {
-        return Err("reboot selected a different deployment".into());
-    }
+    verify_persistence(&mut guest, &successor, &public, &source, &token)?;
     guest.command(&format!("/bin/td-update --help | grep -q {token}"))?;
-    guest.command(&format!("test \"$(cat /var/home/tester/{token})\" = {token} && test ! -r /var/lib/td-deploy/deployment.pk8"))?;
-    if guest.scalar("cat /run/td-volume/td/trusted.pub", canonical_id)? != public {
-        return Err("installation changed its public signing identity".into());
-    }
-    guest.command("cd /var/home/tester/src/td")?;
-    if guest.scalar("git hash-object td-update/src/main.rs", git_id)? != source {
-        return Err("reboot changed the user's source edit".into());
-    }
     guest.command("sync")?;
     guest.stop()?;
-    let report = format!("initial={initial}\nsuccessor={successor}\npublic={public}\nsource={source}\ncancel_preserved_selectors=true\nphysical_prompt_verified=true\ninstalled_and_booted=true\nuser_data_preserved=true\n");
+    if options.rollback {
+        rollback(
+            &options, deadline, &initial, &successor, &public, &source, &token,
+        )?;
+    }
+    let report = format!("initial={initial}\nsuccessor={successor}\npublic={public}\nsource={source}\ncancel_preserved_selectors=true\nphysical_prompt_verified=true\ninstalled_and_booted=true\nuser_data_preserved=true\nautomatic_rollback_verified={}\n", options.rollback);
     private_file(&options.work.join("result.txt"))?
         .write_all(report.as_bytes())
         .map_err(|e| format!("write oracle result: {e}"))?;
@@ -748,12 +1031,138 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::indexing_slicing)]
     use super::*;
 
+    fn failure_lines(id: &str) -> Vec<String> {
+        let mut lines = FAILURE_MARKERS.map(str::to_string).to_vec();
+        lines.push(format!(
+            "{} {id}",
+            td_boot_protocol::SELECTED_CURRENT_MARKER
+        ));
+        lines.push(format!(
+            "{} {id} remaining=1",
+            td_boot_protocol::ATTEMPT_CONSUMED_MARKER
+        ));
+        lines
+    }
+
+    #[test]
+    fn failed_boot_requires_complete_evidence_and_refuses_success_or_wrong_attempts() {
+        let id = "a".repeat(64);
+        let lines = failure_lines(&id);
+        let mut good = FailureEvidence::default();
+        for line in &lines {
+            good.observe(line, &id, 1).unwrap();
+        }
+        good.finish().unwrap();
+        for omitted in 0..lines.len() {
+            let mut evidence = FailureEvidence::default();
+            for (index, line) in lines.iter().enumerate() {
+                if index != omitted {
+                    evidence.observe(line, &id, 1).unwrap();
+                }
+            }
+            assert!(evidence.finish().is_err());
+        }
+        for line in [
+            ladder::SYSTEM_BOOT_SUCCESS_MARKER.to_string(),
+            "TD-GREETER-OK".into(),
+            "Kernel panic - not syncing".into(),
+            format!(
+                "{} {id} remaining=2",
+                td_boot_protocol::ATTEMPT_CONSUMED_MARKER
+            ),
+            format!(
+                "{} {}",
+                td_boot_protocol::SELECTED_CURRENT_MARKER,
+                "b".repeat(64)
+            ),
+            format!("{} {id}", td_boot_protocol::SELECTED_PREVIOUS_MARKER),
+            td_boot_protocol::ATTEMPTS_EXHAUSTED_MARKER.into(),
+        ] {
+            assert!(
+                FailureEvidence::default().observe(&line, &id, 1).is_err(),
+                "{line}"
+            );
+        }
+        assert!(good
+            .observe(
+                &format!(
+                    "{} {id} remaining=1",
+                    td_boot_protocol::ATTEMPT_CONSUMED_MARKER
+                ),
+                &id,
+                1
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn rollback_requires_exact_exhaustion_then_attempt_free_persisted_current() {
+        let failed = "a".repeat(64);
+        let previous = "b".repeat(64);
+        for first in [true, false] {
+            let mut evidence = RollbackEvidence::default();
+            assert!(evidence.finish(first).is_err());
+            let marker = if first {
+                td_boot_protocol::SELECTED_PREVIOUS_MARKER
+            } else {
+                td_boot_protocol::SELECTED_CURRENT_MARKER
+            };
+            evidence
+                .observe(&format!("{marker} {previous}"), &failed, &previous, first)
+                .unwrap();
+            if first {
+                assert!(evidence.finish(first).is_err());
+                evidence
+                    .observe(
+                        &format!(
+                            "{} {failed} -> {previous}",
+                            td_boot_protocol::ATTEMPTS_EXHAUSTED_MARKER
+                        ),
+                        &failed,
+                        &previous,
+                        first,
+                    )
+                    .unwrap();
+            }
+            evidence.finish(first).unwrap();
+            assert!(evidence
+                .observe(&format!("{marker} {previous}"), &failed, &previous, first)
+                .is_err());
+            assert!(RollbackEvidence::default()
+                .observe(&format!("{marker} {failed}"), &failed, &previous, first)
+                .is_err());
+            assert!(RollbackEvidence::default()
+                .observe(
+                    td_boot_protocol::ATTEMPT_CONSUMED_MARKER,
+                    &failed,
+                    &previous,
+                    first
+                )
+                .is_err());
+        }
+        assert!(RollbackEvidence::default()
+            .observe(
+                &format!(
+                    "{} {failed} -> {previous}",
+                    td_boot_protocol::ATTEMPTS_EXHAUSTED_MARKER
+                ),
+                &failed,
+                &previous,
+                false
+            )
+            .is_err());
+    }
+
     #[test]
     fn ascii_oracle_matches_the_pinned_face_and_unicode_table() {
         let source = include_str!("../../../../../../td-compositor/src/font_data.rs");
-        let face = source.lines().find_map(|line| {
-            line.strip_prefix("pub const UNIFONT_HEX: &str = \"")?.strip_suffix("\";")
-        }).unwrap();
+        let face = source
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix("pub const UNIFONT_HEX: &str = \"")?
+                    .strip_suffix("\";")
+            })
+            .unwrap();
         assert!(
             face.starts_with("72b54a86000000002000000001000000c1500000100000001000000008000000")
         );

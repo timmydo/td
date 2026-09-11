@@ -223,6 +223,22 @@ QEMU exit so its block driver can flush and close the overlay. This is a
 host-directed restart, not a guest filesystem unmount. Failure teardown
 kills only its owned child; source disks and selectors are never rewritten.
 
-This command does not yet inject a failed successor boot or drive rollback;
-the existing deployment oracle owns those separate checks. Their integration
-into this native release cycle remains a following increment.
+Add `--rollback yes` to exercise automatic recovery as part of the same
+native release cycle. The default is `--rollback no`. After installation
+and QEMU's successful exit, the oracle freezes the pending disk as
+`pending.qcow2` and creates two children. `disk.qcow2` performs the healthy
+successor boot above. `rollback.qcow2` exercises failed boots independently;
+neither child modifies the frozen backing file, so acknowledging the healthy
+branch cannot clear the failure branch's pending attempt state.
+
+The failure branch uses the existing `td.boot-fail-target=1` fixture token.
+Every configured attempt must select the successor, report the exact
+remaining durable budget, establish read-only root and writable owned state,
+then shut down with a successful QEMU exit before greeter or boot health.
+Missing, duplicate, wrong-deployment or premature exhaustion evidence fails.
+The next ordinary boot must report exhausted attempts and select the initial
+deployment as previous, reach health and persist it as current. Another boot
+must select it as current without consuming or exhausting an attempt. Both
+recovery boots verify the user file, edited source and signing identity.
+The result records `automatic_rollback_verified=true` only after both pass.
+Keep all three overlays with their backing files when retaining this evidence.
