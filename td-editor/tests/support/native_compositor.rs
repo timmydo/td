@@ -1629,6 +1629,14 @@ fn native_pointer_selection_and_menus() {
     compositor.click(65, 80); // Collapse Undo's restored selection after "two".
     editor.wait_field("state", "tab", "1,2,0,8,7,7,0,72,0,lf");
     compositor.rendered_text(&mut editor, &window, 2, before, "one two", 7);
+    compositor.click(42, 80);
+    compositor.pointer(100, 80, 0);
+    compositor.pointer(42, 80, 0);
+    compositor.click(42, 80);
+    compositor.click(42, 80);
+    editor.wait_field("state", "tab", "1,2,0,8,4,7,0,72,0,lf");
+    compositor.click(65, 80);
+    editor.wait_field("state", "tab", "1,2,0,8,7,7,0,72,0,lf");
     compositor.click(68, 32); // Edit header: surface y=8 plus desktop bar.
     editor.wait_field("state", "modal", "0,0,0,0,1,0,0,0,0");
     compositor.click(68, 252); // Find: panel y=24, zero-based row eight.

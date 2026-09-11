@@ -5,8 +5,11 @@ use crate::keys::{Action, Keymap, Profile};
 use crate::layout::{Affinity, Caret, Metrics, Viewport, CELL_HEIGHT, CELL_WIDTH};
 use crate::model::{Command, Editor, Selection, TabId};
 use crate::render::{Geometry, Label, Scale, Scene, Scrollbar, View};
-use crate::{Error, Result};
+use crate::{text, Error, Result};
 use std::collections::BTreeMap;
+
+const MULTI_CLICK_MILLIS: u64 = 500;
+const MULTI_CLICK_SLOP: u64 = 4;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PointerPhase {
@@ -75,7 +78,10 @@ pub enum Event<'a> {
         tab: TabId,
         revision: u64,
         phase: PointerPhase,
+        /// Caret coordinate; native fractional positions round up.
         x: i64,
+        /// Containing-cell coordinate; native fractional positions round down.
+        cell_x: i64,
         y: i64,
         extend: bool,
     },
@@ -124,6 +130,31 @@ enum Drag {
     },
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct Click {
+    tab: TabId,
+    revision: u64,
+    x: i64,
+    y: i64,
+    at: u64,
+    count: u8,
+    pressed: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PointerPosition {
+    x: i64,
+    cell_x: i64,
+    y: i64,
+}
+
+impl Click {
+    fn near(self, x: i64, y: i64, scale: usize) -> bool {
+        let slop = MULTI_CLICK_SLOP.saturating_mul(scale as u64);
+        self.x.abs_diff(x) <= slop && self.y.abs_diff(y) <= slop
+    }
+}
+
 pub struct Controller {
     editor: Editor,
     keys: Keymap,
@@ -133,6 +164,7 @@ pub struct Controller {
     line_count: Option<(TabId, u64, usize)>,
     mark: Option<TabId>,
     drag: Option<Drag>,
+    click: Option<Click>,
     focused: bool,
     caret_visible: bool,
     clock: u64,
@@ -151,6 +183,7 @@ impl Default for Controller {
             line_count: None,
             mark: None,
             drag: None,
+            click: None,
             focused: true,
             caret_visible: true,
             clock: 0,
@@ -285,6 +318,10 @@ impl Controller {
     }
 
     fn reset_input(&mut self) {
+        self.reset_pointer_input();
+        self.click = None;
+    }
+    fn reset_pointer_input(&mut self) {
         self.keys.reset();
         self.mark = None;
         self.drag = None;
@@ -485,6 +522,7 @@ impl Controller {
                 }
                 self.geometry = geometry;
                 self.drag = None;
+                self.click = None;
                 self.refresh(None)?;
                 Ok(Outcome::Changed)
             }
@@ -509,6 +547,7 @@ impl Controller {
                 }
                 self.geometry = geometry;
                 self.drag = None;
+                self.click = None;
                 self.refresh(None)?;
                 Ok(Outcome::Changed)
             }
@@ -529,6 +568,7 @@ impl Controller {
                 state.metrics.rows = 0;
                 state.affinity = Affinity::Downstream;
                 self.drag = None;
+                self.click = None;
                 self.refresh(Some(tab))?;
                 Ok(Outcome::Changed)
             }
@@ -549,6 +589,7 @@ impl Controller {
                     return Ok(Outcome::Ignored);
                 }
                 self.drag = None;
+                self.click = None;
                 Ok(Outcome::Changed)
             }
             Event::Pointer {
@@ -556,16 +597,29 @@ impl Controller {
                 revision,
                 phase,
                 x,
+                cell_x,
                 y,
                 extend,
-            } => self.pointer(tab, revision, phase, x, y, extend),
-            Event::CancelPointer => Ok(if self.drag.take().is_some() {
-                Outcome::Changed
-            } else {
-                Outcome::Ignored
-            }),
+            } => self.pointer(
+                tab,
+                revision,
+                phase,
+                PointerPosition { x, cell_x, y },
+                extend,
+            ),
+            Event::CancelPointer => {
+                let changed = self.drag.take().is_some();
+                self.click = None;
+                Ok(if changed {
+                    Outcome::Changed
+                } else {
+                    Outcome::Ignored
+                })
+            }
             Event::CancelInput => {
-                let changed = self.keys.pending() || self.mark.is_some() || self.drag.is_some();
+                let changed = self.keys.pending()
+                    || self.mark.is_some()
+                    || self.drag.is_some();
                 self.reset_input();
                 Ok(if changed {
                     Outcome::Changed
@@ -606,6 +660,7 @@ impl Controller {
         state.affinity = Affinity::Downstream;
         state.desired_column = None;
         self.drag = None;
+        self.click = None;
         self.refresh(Some(tab))?;
         self.wake_caret();
         Ok(())
@@ -705,6 +760,7 @@ impl Controller {
         };
         self.keys = keys;
         self.drag = None;
+        self.click = None;
         self.wake_caret();
         Ok(result)
     }
@@ -750,11 +806,31 @@ impl Controller {
         tab: TabId,
         revision: u64,
         phase: PointerPhase,
-        x: i64,
-        y: i64,
+        position: PointerPosition,
         extend: bool,
     ) -> Result<Outcome> {
+        let PointerPosition { x, cell_x, y } = position;
         self.checked(tab, revision, true)?;
+        let pointer_x = x;
+        let pointer_y = y;
+        let scale = self.geometry.scale().value();
+        let prior_click = if phase == PointerPhase::Press {
+            self.click.take()
+        } else {
+            None
+        };
+        if phase != PointerPhase::Press {
+            if let Some(click) = self.click.filter(|click| click.tab == tab) {
+                if !click.near(x, y, scale) {
+                    self.click = None;
+                } else if phase == PointerPhase::Release && click.pressed {
+                    self.click = Some(Click {
+                        pressed: false,
+                        ..click
+                    });
+                }
+            }
+        }
         if phase == PointerPhase::Press {
             if !self.geometry.bounds().contains(x, y) {
                 return Ok(Outcome::Ignored);
@@ -865,17 +941,21 @@ impl Controller {
                 return Ok(Outcome::Changed);
             }
         }
-        let s = self.geometry.scale().value();
+        let s = scale;
         let mut area = self.geometry.document();
         area.width = (columns * CELL_WIDTH * s) as u32;
         area.height = (rows * CELL_HEIGHT * s) as u32;
-        if phase == PointerPhase::Press && !area.contains(x, y) {
+        if phase == PointerPhase::Press && !area.contains(cell_x, y) {
             return Ok(Outcome::Ignored);
         }
         // All cell midpoints are integral font pixels. Ceiling preserves the
         // strict "past midpoint" decision for scaled subpixel coordinates.
-        let px =
-            (x.saturating_sub(area.x).clamp(0, i64::from(area.width) - 1) as usize).div_ceil(s);
+        let physical_x =
+            x.saturating_sub(area.x).clamp(0, i64::from(area.width) - 1) as usize;
+        let cell_physical_x = cell_x
+            .saturating_sub(area.x)
+            .clamp(0, i64::from(area.width) - 1) as usize;
+        let px = physical_x.div_ceil(s);
         let py = y
             .saturating_sub(area.y)
             .clamp(0, i64::from(area.height) - 1) as usize
@@ -885,18 +965,68 @@ impl Controller {
         let layout = state.viewport.layout(doc, state.soft_wrap)?;
         let row = state.viewport.origin().row + py / CELL_HEIGHT;
         let x = state.viewport.origin().column * CELL_WIDTH + px;
-        let caret = layout.rows().nth(row).map_or(
+        let cell_x = state.viewport.origin().column * CELL_WIDTH + cell_physical_x / s;
+        let visual = layout.rows().nth(row);
+        let clicked = visual.as_ref().and_then(|row| {
+            row.cells().find(|cell| {
+                let left = cell.column.saturating_mul(CELL_WIDTH);
+                let right = cell
+                    .column
+                    .saturating_add(cell.width)
+                    .saturating_mul(CELL_WIDTH);
+                cell_x >= left && cell_x < right
+            })
+        });
+        let caret = visual.as_ref().map_or(
             Caret {
                 byte: doc.text().len(),
                 affinity: Affinity::Downstream,
             },
             |row| row.hit_test(x),
         );
-        let anchor = if phase == PointerPhase::Press {
-            if extend {
-                doc.selection().anchor
-            } else {
-                caret.byte
+        let clicks = if phase == PointerPhase::Press && !extend && !doc.directory() {
+            let count = prior_click
+                .filter(|click| {
+                    !click.pressed
+                        && click.tab == tab
+                        && click.revision == revision
+                        && self.clock.saturating_sub(click.at) <= MULTI_CLICK_MILLIS
+                        && click.near(pointer_x, pointer_y, scale)
+                })
+                .map_or(1, |click| if click.count == 3 { 1 } else { click.count + 1 });
+            self.click = Some(Click {
+                tab,
+                revision,
+                x: pointer_x,
+                y: pointer_y,
+                at: self.clock,
+                count,
+                pressed: true,
+            });
+            count
+        } else {
+            1
+        };
+        let selected = if clicks == 2 {
+            clicked
+                .filter(|cell| cell.scalar.is_alphanumeric())
+                .map(|cell| word_selection(doc.text(), cell.bytes.start))
+                .transpose()?
+        } else if clicks == 3 {
+            Some(line_selection(doc.text(), caret.byte)?)
+        } else {
+            None
+        };
+        let selection = if let Some(selection) = selected {
+            selection
+        } else if phase == PointerPhase::Press {
+            Selection {
+                anchor: if extend {
+                    doc.selection().anchor
+                } else {
+                    caret.byte
+                },
+                caret: caret.byte,
             }
         } else {
             let Some(Drag::Text(id, anchor)) = self.drag else {
@@ -905,24 +1035,25 @@ impl Controller {
             if id != tab {
                 return Err(Error::InvalidArgument);
             }
-            anchor
-        };
-        self.editor.dispatch(
-            tab,
-            revision,
-            Command::Select(Selection {
+            Selection {
                 anchor,
                 caret: caret.byte,
-            }),
-        )?;
-        self.reset_input();
-        self.drag = if phase == PointerPhase::Release {
+            }
+        };
+        self.editor
+            .dispatch(tab, revision, Command::Select(selection))?;
+        self.reset_pointer_input();
+        self.drag = if phase == PointerPhase::Release || selected.is_some() {
             None
         } else {
-            Some(Drag::Text(tab, anchor))
+            Some(Drag::Text(tab, selection.anchor))
         };
         let state = self.tabs.get_mut(&tab).ok_or(Error::MissingTab)?;
-        state.affinity = caret.affinity;
+        state.affinity = if selected.is_some() {
+            Affinity::Downstream
+        } else {
+            caret.affinity
+        };
         state.desired_column = None;
         self.wake_caret();
         Ok(Outcome::Changed)
@@ -939,6 +1070,48 @@ impl Controller {
         }
         Ok(())
     }
+}
+
+fn word_selection(text: &str, at: usize) -> Result<Selection> {
+    let before = text.get(..at).ok_or(Error::InvalidPosition)?;
+    let after = text.get(at..).ok_or(Error::InvalidPosition)?;
+    if !after.chars().next().is_some_and(char::is_alphanumeric) {
+        return Ok(Selection {
+            anchor: at,
+            caret: at,
+        });
+    }
+    let mut start = at;
+    for (offset, scalar) in before.char_indices().rev() {
+        if !scalar.is_alphanumeric() {
+            break;
+        }
+        start = offset;
+    }
+    let mut end = at;
+    for (offset, scalar) in after.char_indices() {
+        if !scalar.is_alphanumeric() {
+            break;
+        }
+        end = at
+            .checked_add(offset)
+            .and_then(|byte| byte.checked_add(scalar.len_utf8()))
+            .ok_or(Error::Exhausted)?;
+    }
+    Ok(Selection { anchor: start, caret: end })
+}
+
+fn line_selection(text: &str, at: usize) -> Result<Selection> {
+    let range = text::line(text, at)?;
+    let caret = if text.as_bytes().get(range.end) == Some(&b'\n') {
+        range.end.checked_add(1).ok_or(Error::Exhausted)?
+    } else {
+        range.end
+    };
+    Ok(Selection {
+        anchor: range.start,
+        caret,
+    })
 }
 
 #[cfg(test)]

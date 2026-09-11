@@ -2038,15 +2038,24 @@ pending wheel motion without changing keyboard focus.
 Mouse input works before keyboard focus. Shift extends selection only when
 the compiled map validates the focused, synchronized modifier snapshot and
 its declared Shift role is active. Otherwise a press starts a fresh anchor.
-Chrome uses floor-rounded signed 24.8 coordinates. Text x coordinates round
-up within their already-hit region, preserving strict midpoint ties; y rounds
-down. Out-of-surface presses stay outside and drag endpoints clamp through
-the controller. Native presentation is still scale 1. Selection, tab switching
+Chrome uses floor-rounded signed 24.8 coordinates. Text caret x coordinates
+round up within their already-hit region, preserving strict midpoint ties;
+occupied-cell identity retains the floor coordinate and y rounds down.
+Out-of-surface presses stay outside and drag endpoints clamp through the
+controller. Native presentation is still scale 1. Selection, tab switching
 and close-mark hit testing use the same controller as headless replay. A tab
 close request goes through the revision-bound file close dialog, including
 when the clicked tab was not active. Scratch dirty-tab close still refuses.
-Accepted pointer actions cancel keyboard repeat. No double-click word select,
-drag autoscroll, selection clipboard or context menu is implemented.
+Accepted pointer actions cancel keyboard repeat. Consecutive left clicks
+without Shift in editable text form one controller-owned sequence when their
+presses are no more than 500 milliseconds and four scale-adjusted surface
+pixels apart. The second click selects the maximal Unicode-alphanumeric word
+under the pointer. The third selects the whole logical line, including its
+trailing LF when present; soft wrapping does not change that boundary. A
+fourth click starts a new sequence. Moving beyond the distance limit while
+held or between presses, or cancelling or superseding the gesture, ends the
+sequence. No multi-click drag, drag autoscroll, selection clipboard or context
+menu is implemented.
 
 Path, close, conflict and pending-Reload modals consume pointer actions:
 clicks cannot answer a question, activate obscured tabs or edit text. Starting

@@ -334,10 +334,14 @@ fn pointer(ui: &mut Controller, phase: PointerPhase, x: i64, y: i64, extend: boo
         revision,
         phase,
         x,
+        cell_x: x,
         y,
         extend,
     })
     .unwrap()
+}
+fn tick(ui: &mut Controller, now: u64) {
+    ui.dispatch(Event::Tick(now)).unwrap();
 }
 fn resize(ui: &mut Controller, width: usize, height: usize, scale: u8) {
     ui.dispatch(Event::Resize {
@@ -780,6 +784,120 @@ fn scaled_pointer_midpoints_use_physical_pixels_without_rounding_bias() {
 }
 
 #[test]
+fn repeated_clicks_select_unicode_words_then_logical_lines() {
+    let mut ui = loaded("alpha βeta!\nnext");
+    resize(&mut ui, 160, 104, 1);
+    let x = 58;
+    let y = 49;
+
+    pointer(&mut ui, PointerPhase::Press, x, y, false);
+    pointer(&mut ui, PointerPhase::Release, x, y, false);
+    assert_eq!(
+        selection(&ui),
+        Selection {
+            anchor: 6,
+            caret: 6
+        }
+    );
+
+    tick(&mut ui, 100);
+    pointer(&mut ui, PointerPhase::Press, x, y, false);
+    assert_eq!(
+        selection(&ui),
+        Selection {
+            anchor: 6,
+            caret: 11
+        }
+    );
+    pointer(&mut ui, PointerPhase::Release, x, y, false);
+
+    tick(&mut ui, 200);
+    pointer(&mut ui, PointerPhase::Press, x, y, false);
+    assert_eq!(
+        selection(&ui),
+        Selection {
+            anchor: 0,
+            caret: 13
+        }
+    );
+    pointer(&mut ui, PointerPhase::Release, x, y, false);
+
+    // A fourth click starts a new sequence, and the timeout does too.
+    tick(&mut ui, 300);
+    pointer(&mut ui, PointerPhase::Press, x, y, false);
+    pointer(&mut ui, PointerPhase::Release, x, y, false);
+    assert_eq!(
+        selection(&ui),
+        Selection {
+            anchor: 6,
+            caret: 6
+        }
+    );
+    tick(&mut ui, 801);
+    pointer(&mut ui, PointerPhase::Press, x, y, false);
+    assert_eq!(
+        selection(&ui),
+        Selection {
+            anchor: 6,
+            caret: 6
+        }
+    );
+}
+
+#[test]
+fn click_sequences_use_cell_pixels_and_end_on_motion_or_other_presses() {
+    let mut ui = loaded("a b");
+    resize(&mut ui, 224, 208, 2);
+    pointer(&mut ui, PointerPhase::Press, 31, 98, false);
+    pointer(&mut ui, PointerPhase::Release, 31, 98, false);
+    tick(&mut ui, 100);
+    pointer(&mut ui, PointerPhase::Press, 31, 98, false);
+    assert_eq!(
+        selection(&ui),
+        Selection {
+            anchor: 0,
+            caret: 1
+        }
+    );
+
+    let mut ui = loaded("alpha beta");
+    pointer(&mut ui, PointerPhase::Press, 10, 49, false);
+    pointer(&mut ui, PointerPhase::Release, 10, 49, false);
+    pointer(&mut ui, PointerPhase::Move, 100, 49, false);
+    pointer(&mut ui, PointerPhase::Move, 10, 49, false);
+    tick(&mut ui, 100);
+    pointer(&mut ui, PointerPhase::Press, 10, 49, false);
+    assert_eq!(
+        selection(&ui),
+        Selection {
+            anchor: 0,
+            caret: 0
+        }
+    );
+
+    let mut ui = Controller::default();
+    ui.dispatch(Event::Load(b"alpha")).unwrap();
+    let area = ui.geometry().document();
+    pointer(&mut ui, PointerPhase::Press, area.x, area.y, false);
+    pointer(&mut ui, PointerPhase::Release, area.x, area.y, false);
+    pointer(
+        &mut ui,
+        PointerPhase::Press,
+        area.x.saturating_sub(1),
+        area.y,
+        false,
+    );
+    pointer(&mut ui, PointerPhase::Press, area.x, area.y, false);
+    assert_eq!(
+        selection(&ui),
+        Selection {
+            anchor: 0,
+            caret: 0
+        }
+    );
+}
+
+#[test]
 fn dragging_is_scalar_aligned_clamped_and_cancelled_by_edits_and_focus() {
     let mut ui = loaded("éλxyz\nlast");
     resize(&mut ui, 96, 104, 1);
@@ -1049,6 +1167,7 @@ fn stale_failed_and_unfocused_events_leave_document_and_prefix_intact() {
             revision: 1,
             phase: PointerPhase::Press,
             x: 8,
+            cell_x: 8,
             y: 49,
             extend: false,
         },
@@ -1171,6 +1290,7 @@ fn replay_and_typed_events_produce_identical_state_and_pixels() {
             revision: 0,
             phase: PointerPhase::Press,
             x: 8,
+            cell_x: 8,
             y: 49,
             extend: false,
         },
@@ -1179,6 +1299,7 @@ fn replay_and_typed_events_produce_identical_state_and_pixels() {
             revision: 0,
             phase: PointerPhase::Release,
             x: 32,
+            cell_x: 32,
             y: 65,
             extend: false,
         },
@@ -1187,6 +1308,7 @@ fn replay_and_typed_events_produce_identical_state_and_pixels() {
             revision: 0,
             phase: PointerPhase::Press,
             x: 24,
+            cell_x: 24,
             y: 49,
             extend: false,
         },
@@ -1195,6 +1317,7 @@ fn replay_and_typed_events_produce_identical_state_and_pixels() {
             revision: 0,
             phase: PointerPhase::Release,
             x: i64::MIN,
+            cell_x: i64::MIN,
             y: i64::MIN,
             extend: false,
         },

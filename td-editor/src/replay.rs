@@ -133,6 +133,7 @@ impl Session {
                     revision: number(rev)?,
                     phase,
                     x,
+                    cell_x: x,
                     y,
                     extend: boolean(extend)?,
                 })?)

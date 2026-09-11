@@ -1104,7 +1104,7 @@ impl Window {
             P::Motion(x, y) => {
                 self.pointer.x = x;
                 self.pointer.y = y;
-                if !self.menu_hover(x, y) && self.pointer.held {
+                if !self.menu_hover(x, y) {
                     self.pointer_action(crate::ui::PointerPhase::Move)?;
                 }
             }
@@ -1279,6 +1279,7 @@ impl Window {
             revision,
             phase,
             x,
+            cell_x: raw_x,
             y,
             extend,
         }) {
@@ -6142,6 +6143,7 @@ pub fn file_window(options: FileWindowOptions) -> io::Result<()> {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 mod tests {
     use super::*;
+    use crate::layout::CELL_WIDTH;
     use std::io::Read;
     use std::os::unix::fs::MetadataExt;
 
@@ -6314,6 +6316,7 @@ mod tests {
         pointer_button(&mut w, true);
         assert_eq!(w.ui.editor().document(tab).unwrap().selection().caret, 0);
         pointer_button(&mut w, false);
+        w.ui.dispatch(Event::Tick(501)).unwrap();
         w.event(message(
             pointer,
             2,
@@ -6353,6 +6356,38 @@ mod tests {
         assert_eq!(w.ui.editor().document(tab).unwrap().selection(), selection);
         assert!(!w.ui.focused());
         assert_eq!(w.ui.editor().document(tab).unwrap().text(), "abé中z\nnext");
+    }
+
+    #[test]
+    fn fractional_pointer_word_selection_uses_the_containing_cell() {
+        let (mut w, _peer, _) = seat_fixture();
+        w.ui = Controller::default();
+        w.ui.dispatch(Event::Resize {
+            width: 801,
+            height: 576,
+            scale: 1,
+        })
+        .unwrap();
+        let columns = w.ui.geometry().grid().0;
+        let text = format!("{}a", " ".repeat(columns.saturating_sub(1)));
+        w.ui.dispatch(Event::Load(text.as_bytes())).unwrap();
+        let tab = w.ui.editor().active().unwrap();
+        let area = w.ui.geometry().document();
+        pointer_enter(&mut w);
+        let pointer = w.pointer.device.unwrap();
+        let x = ((area.x + (columns * CELL_WIDTH) as i64) * 256 - 1) as u32;
+        let y = (area.y * 256) as u32;
+        w.event(message(pointer, 2, &[0, x, y])).unwrap();
+        pointer_button(&mut w, true);
+        pointer_button(&mut w, false);
+        pointer_button(&mut w, true);
+        assert_eq!(
+            w.ui.editor().document(tab).unwrap().selection(),
+            crate::model::Selection {
+                anchor: text.len().saturating_sub(1),
+                caret: text.len()
+            }
+        );
     }
 
     #[test]
@@ -6535,6 +6570,7 @@ mod tests {
                 revision,
                 phase: crate::ui::PointerPhase::Move,
                 x: 799,
+                cell_x: 799,
                 y: 599,
                 extend: false,
             })
