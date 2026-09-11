@@ -35,7 +35,7 @@ use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
-use std::os::unix::fs::{symlink, DirBuilderExt, PermissionsExt};
+use std::os::unix::fs::{symlink, DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
@@ -439,6 +439,7 @@ const PERSISTENT_VOLUME_BYTES: u64 = td_engine::target_profile::DEPLOYMENT_DEBUG
 // Published desktops need room for private development stores and checkouts.
 // This is virtual capacity; untouched space remains sparse on the host.
 pub(crate) const PUBLISHED_VOLUME_BYTES: u64 = 256 * 1024 * 1024 * 1024;
+pub(crate) const INSTALLATION_VOLUME_BYTES: u64 = 2 * 1024 * 1024 * 1024 * 1024;
 // A 64 MiB console needs 17 passes including EOF; allow seven EINTR retries.
 const FINAL_DRAIN_PASSES: usize = 24;
 
@@ -3236,10 +3237,13 @@ pub(crate) fn build_btrfs_tools(runner: &RecipeCheckRunner) -> Result<(PathBuf, 
 /// oracle input on the build host and may carry whatever scaffolding makes an
 /// assertion mean something. A `Published` one is handed to strangers, so it
 /// carries no scaffolding and leaks nothing about the machine that built it.
+/// An `Installation` retains its own private key and gives a local build graph
+/// two TiB of sparse virtual capacity; it is never a redistributable template.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum VolumePurpose {
     Fixture,
     Published,
+    Installation,
 }
 
 impl VolumePurpose {
@@ -3247,6 +3251,7 @@ impl VolumePurpose {
         match self {
             Self::Fixture => PERSISTENT_VOLUME_BYTES,
             Self::Published => PUBLISHED_VOLUME_BYTES,
+            Self::Installation => INSTALLATION_VOLUME_BYTES,
         }
     }
 }
@@ -3292,7 +3297,11 @@ pub(crate) fn create_release_volume(
         false,
         trust,
         None,
-        VolumePurpose::Published,
+        if matches!(&trust.signing, SigningIdentity::Installation { .. }) {
+            VolumePurpose::Installation
+        } else {
+            VolumePurpose::Published
+        },
         Some(source),
     )
     .map(|_| ())
@@ -3350,6 +3359,11 @@ fn create_persistent_volume_layout(
     purpose: VolumePurpose,
     source: Option<&Path>,
 ) -> Result<VolumeFixture, String> {
+    if matches!(&trust.signing, SigningIdentity::Installation { .. })
+        != (purpose == VolumePurpose::Installation)
+    {
+        return Err("installation volume and signing identity must agree".into());
+    }
     let manifest = deployment.join("manifest");
     let deployment_id = crate::sha256::sha256_file(&manifest)
         .map_err(|e| format!("hash deployment manifest {}: {e}", manifest.display()))?;
@@ -3393,6 +3407,7 @@ fn create_persistent_volume_layout(
     let _seed_cleanup = Scratch { dir: seed.clone() };
 
     populate_persistent_seed(deployment, &seed, &deployment_id, trust, purpose)?;
+    trust.stage_installation_identity(&seed)?;
     if let Some(source) = source {
         super::release_source::copy_to_volume(source, &seed)?;
     }
@@ -3437,8 +3452,18 @@ fn create_persistent_volume_layout(
 
     // mkfs.btrfs grows this regular-file target to --byte-count; creating it
     // first keeps path and permission failures in this control plane.
-    File::create(output)
-        .map_err(|e| format!("create persistent volume {}: {e}", output.display()))?;
+    if purpose == VolumePurpose::Installation {
+        OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(output)
+            .and_then(|file| file.set_permissions(fs::Permissions::from_mode(0o600)))
+            .map_err(|e| format!("create private installation volume: {e}"))?;
+    } else {
+        File::create(output)
+            .map_err(|e| format!("create persistent volume {}: {e}", output.display()))?;
+    }
     // A fixture's UUID must differ between concurrent volumes on one host, so
     // it mixes in the pid. A PUBLISHED volume must not: the pid is recoverable
     // with a `>> 16` and says which process on whose machine built the
@@ -3456,8 +3481,10 @@ fn create_persistent_volume_layout(
             let digits: String = deployment_id.chars().take(12).collect();
             format!("12345678-1234-4234-8234-{digits}")
         }
+        VolumePurpose::Installation => installation_uuid(&trust.public),
     };
-    let status = Command::new(mkfs)
+    let status = trust
+        .mkfs_command(mkfs)
         .args(["--rootdir"])
         .arg(&seed)
         .args(["--subvol", "rw:@var", "--byte-count"])
@@ -3595,7 +3622,8 @@ fn copy_candidate_payload(source: &Path, destination: &Path) -> Result<(), Strin
     Ok(())
 }
 
-/// One run's trust root, generated per run and never stored.
+/// A deployment signing context. Fixtures discard their seed; an installation
+/// retains its source-built ring signer's key in private writable state.
 ///
 /// The public half goes into the SELECTOR initramfs — the artifact firmware
 /// loads, and the rootfs `td-boot boot` is running from when it selects and
@@ -3608,8 +3636,17 @@ fn copy_candidate_payload(source: &Path, destination: &Path) -> Result<(), Strin
 /// is the Btrfs-volume weakening §6 forbids by name. Putting it in the selector
 /// also keeps D3 intact — rotating the key changes the selector rather than any
 /// deployment's initramfs digest, so a re-signed deployment keeps its id.
+enum SigningIdentity {
+    Throwaway([u8; 32]),
+    Installation {
+        signer: PathBuf,
+        key: PathBuf,
+        builder: PathBuf,
+    },
+}
+
 pub(crate) struct RunTrust {
-    seed: [u8; 32],
+    signing: SigningIdentity,
     public: [u8; 32],
 }
 
@@ -3623,7 +3660,87 @@ impl RunTrust {
             .map_err(|e| format!("read /dev/urandom for a throwaway signing seed: {e}"))?;
         let public = td_engine::ed25519_sign::public_key(&seed)
             .ok_or_else(|| "derive a public key from the throwaway seed".to_string())?;
-        Ok(Self { seed, public })
+        Ok(Self {
+            signing: SigningIdentity::Throwaway(seed),
+            public,
+        })
+    }
+
+    /// Provision one private installation outside the artifact graph.
+    pub(crate) fn installation(
+        signer: PathBuf,
+        state: &Path,
+        builder: PathBuf,
+    ) -> Result<Self, String> {
+        let output = Command::new(&signer)
+            .env_clear()
+            .args(["deploy", "identity"])
+            .arg(state)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .map_err(|e| format!("provision installation signing identity: {e}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "installation signer failed ({}): {}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
+        let public = canonical_hex::<32>(&output.stdout)?;
+        Ok(Self {
+            signing: SigningIdentity::Installation {
+                signer,
+                key: state.join("deployment.pk8"),
+                builder,
+            },
+            public,
+        })
+    }
+
+    fn stage_installation_identity(&self, seed: &Path) -> Result<(), String> {
+        let SigningIdentity::Installation { key, .. } = &self.signing else {
+            return Ok(());
+        };
+        let lib = seed.join("@var/lib");
+        let state = lib.join("td-deploy");
+        fs::create_dir_all(&state).map_err(|e| format!("create installation state seed: {e}"))?;
+        fs::set_permissions(&lib, fs::Permissions::from_mode(0o755))
+            .and_then(|()| fs::set_permissions(&state, fs::Permissions::from_mode(0o700)))
+            .map_err(|e| format!("protect installation state seed: {e}"))?;
+        let mut input =
+            File::open(key).map_err(|e| format!("open retained installation key: {e}"))?;
+        let mut bytes = Vec::new();
+        (&mut input)
+            .take(16385)
+            .read_to_end(&mut bytes)
+            .map_err(|e| format!("read retained installation key: {e}"))?;
+        if bytes.is_empty() || bytes.len() > 16384 {
+            return Err("retained installation key has an invalid size".into());
+        }
+        let mut output = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(state.join("deployment.pk8"))
+            .map_err(|e| format!("create installation key seed: {e}"))?;
+        output
+            .set_permissions(fs::Permissions::from_mode(0o600))
+            .and_then(|()| output.write_all(&bytes))
+            .and_then(|()| output.sync_all())
+            .map_err(|e| format!("persist installation key seed: {e}"))
+    }
+
+    fn mkfs_command(&self, mkfs: &Path) -> Command {
+        match &self.signing {
+            SigningIdentity::Throwaway(_) => Command::new(mkfs),
+            SigningIdentity::Installation { builder, .. } => {
+                // mkfs records numeric owners. Map the private seed's owner to
+                // guest root without host privilege or a first-boot chown.
+                let mut command = Command::new(builder);
+                command.args(["userns-private", "--"]).arg(mkfs);
+                command
+            }
+        }
     }
 
     /// The public half in the wire format td-boot reads: lowercase hex, one
@@ -3643,12 +3760,76 @@ impl RunTrust {
         let manifest_path = directory.join(td_boot_protocol::MANIFEST_NAME);
         let manifest = fs::read(&manifest_path)
             .map_err(|e| format!("read manifest {}: {e}", manifest_path.display()))?;
-        let signature = td_engine::ed25519_sign::sign(&self.seed, &manifest)
-            .ok_or_else(|| format!("sign manifest {}", manifest_path.display()))?;
         let path = directory.join(td_boot_protocol::MANIFEST_SIG_NAME);
-        fs::write(&path, hex_line(&signature))
-            .map_err(|e| format!("write signature {}: {e}", path.display()))
+        match &self.signing {
+            SigningIdentity::Throwaway(seed) => {
+                let signature = td_engine::ed25519_sign::sign(seed, &manifest)
+                    .ok_or_else(|| format!("sign manifest {}", manifest_path.display()))?;
+                fs::write(&path, hex_line(&signature))
+                    .map_err(|e| format!("write signature {}: {e}", path.display()))?;
+            }
+            SigningIdentity::Installation { signer, key, .. } => {
+                let status = Command::new(signer)
+                    .env_clear()
+                    .args(["deploy", "sign"])
+                    .arg(&manifest_path)
+                    .arg(key)
+                    .arg(&path)
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .status()
+                    .map_err(|e| format!("sign installation deployment: {e}"))?;
+                if !status.success() {
+                    return Err(format!("installation signing failed ({status})"));
+                }
+                let signature = canonical_hex::<64>(
+                    &fs::read(&path).map_err(|e| format!("read installation signature: {e}"))?,
+                )?;
+                if !td_engine::ed25519::verify(&self.public, &manifest, &signature) {
+                    return Err("installation signature does not match its selector key".into());
+                }
+            }
+        }
+        Ok(())
     }
+}
+
+fn installation_uuid(public: &[u8; 32]) -> String {
+    let mut uuid = String::with_capacity(36);
+    for (index, byte) in public.iter().take(16).enumerate() {
+        if matches!(index, 4 | 6 | 8 | 10) {
+            uuid.push('-');
+        }
+        let byte = match index {
+            6 => (byte & 0x0f) | 0x40,
+            8 => (byte & 0x3f) | 0x80,
+            _ => *byte,
+        };
+        uuid.push(char::from(hex_nibble(byte >> 4)));
+        uuid.push(char::from(hex_nibble(byte & 0xf)));
+    }
+    uuid
+}
+
+fn canonical_hex<const N: usize>(bytes: &[u8]) -> Result<[u8; N], String> {
+    if bytes.len() != N.saturating_mul(2).saturating_add(1) || bytes.last() != Some(&b'\n') {
+        return Err("signer did not return canonical hex".into());
+    }
+    let digits = bytes
+        .get(..N.saturating_mul(2))
+        .ok_or("missing signer hex")?;
+    if !digits
+        .iter()
+        .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(c))
+    {
+        return Err("signer did not return lowercase hex".into());
+    }
+    let nibble = |c: u8| if c <= b'9' { c - b'0' } else { c - b'a' + 10 };
+    let mut result = [0; N];
+    for (output, [hi, lo]) in result.iter_mut().zip(digits.as_chunks::<2>().0) {
+        *output = (nibble(*hi) << 4) | nibble(*lo);
+    }
+    Ok(result)
 }
 
 /// Copy the verified selector initramfs into scratch and append this run's
@@ -7411,6 +7592,54 @@ mod tests {
     use super::*;
     use std::io::{BufRead, BufReader};
     use std::os::unix::net::UnixListener;
+
+    #[test]
+    fn installation_uuid_uses_all_fields_and_retains_the_identity() {
+        let a = installation_uuid(&[0; 32]);
+        let b = installation_uuid(&[255; 32]);
+        assert_eq!(a, "00000000-0000-4000-8000-000000000000");
+        assert_eq!(b, "ffffffff-ffff-4fff-bfff-ffffffffffff");
+        assert!(a
+            .split('-')
+            .zip(b.split('-'))
+            .all(|(left, right)| left != right));
+        assert_eq!(a, installation_uuid(&[0; 32]));
+    }
+
+    #[test]
+    fn installation_signer_output_requires_exact_canonical_bytes() {
+        assert_eq!(canonical_hex::<2>(b"01af\n").unwrap(), [1, 175]);
+        for wrong in [b"01AF\n".as_slice(), b"01af", b"01af\n\n", b"01ag\n", b"\n"] {
+            assert!(canonical_hex::<2>(wrong).is_err());
+        }
+    }
+
+    #[test]
+    fn only_an_installation_stages_a_private_key_in_writable_state() {
+        let dir = create_scratch_dir(&env::temp_dir(), &AtomicU64::new(2100)).unwrap();
+        let _guard = Scratch { dir: dir.clone() };
+        let demo = dir.join("demo");
+        fs::create_dir(&demo).unwrap();
+        RunTrust::generate().unwrap().stage_installation_identity(&demo).unwrap();
+        assert_eq!(fs::read_dir(&demo).unwrap().count(), 0);
+        let key = dir.join("source.pk8");
+        fs::write(&key, b"private fixture bytes").unwrap();
+        let trust = RunTrust {
+            signing: SigningIdentity::Installation {
+                signer: dir.join("signer"), key, builder: dir.join("builder"),
+            },
+            public: [3; 32],
+        };
+        let seed = dir.join("installed");
+        trust.stage_installation_identity(&seed).unwrap();
+        let state = seed.join("@var/lib/td-deploy");
+        assert_eq!(fs::metadata(&state).unwrap().permissions().mode() & 0o7777, 0o700);
+        assert_eq!(fs::metadata(state.join("deployment.pk8")).unwrap().permissions().mode() & 0o7777, 0o600);
+        assert_eq!(fs::read(state.join("deployment.pk8")).unwrap(), b"private fixture bytes");
+        assert!(!seed.join("td/store").exists());
+        assert!(trust.stage_installation_identity(&seed).is_err());
+        assert_eq!(fs::read(state.join("deployment.pk8")).unwrap(), b"private fixture bytes");
+    }
 
     #[test]
     fn system_audio_uses_one_explicit_silent_backend_and_hda_codec() {

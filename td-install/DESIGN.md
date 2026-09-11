@@ -290,9 +290,34 @@ This primitive uses td-net's existing reviewed ring signer and never executes
 inside a target derivation. `/bin/td-deploy` exposes the installed source-built
 multicall. The primitive supplies no elevation, installation consent, hardware
 sealing or application credential storage. The future installer operation
-owns those boundaries and must not rely on `su`. Enabling this primitive
-alone does not turn a demo bundle into an installation: demo selectors still
-carry their disposable build key, and no boot service generates identities.
+owns those boundaries and must not rely on `su`. `td-recipe-eval bundle --installation --out DIR` creates a private VM
+installation. It builds the source-built signer along with the system,
+generates a fresh key outside the artifact graph, signs the initial
+deployment, provisions the matching selector and volume public keys, and
+retains the PKCS#8 key at `/var/lib/td-deploy/deployment.pk8` in writable
+`@var`. The directory and key are root-owned 0700 and 0600 in the guest.
+The existing builder `userns-private` operation maps the seed's owner to
+numeric root while `mkfs.btrfs` reads it; no host privilege or first-boot
+ownership repair is required. Each installation receives a UUID derived
+from 128 bits of its own public key, with UUID version/variant bits set,
+and 2 TiB of sparse virtual capacity for local builds.
+
+The installation output directory is pinned by descriptor, caller-owned 0700
+and empty apart from its private publication lease; the disk is 0600.
+The output's parent must already exist. One nonblocking lease covers path
+settlement, warming, building and publication. Publication rechecks emptiness,
+refuses existing destination files or a moved directory, and syncs its
+completed files and directory entries. This mode requires explicit
+`--out`, refuses `--force`, uses a distinct marker that demo replacement does
+not recognize, and generates a launcher that persists guest writes by
+default. Copying this output copies the installation identity. It is not a
+redistributable release template. The default `bundle` remains a demo with
+disposable trust and no retained signing key.
+
+VM provisioning establishes trust before first activation; it never trusts
+a replacement public key supplied by an update volume. It does not install
+an EFI boot stub, provide disk encryption, or authorize successor activation.
+The named, consent-bound update operation remains the next integration step.
 
 
 ## 4. Disk layout

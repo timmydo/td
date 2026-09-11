@@ -624,7 +624,7 @@ pub fn bundle_cli(args: &[String]) -> Result<(), String> {
     // would delete a good previous bundle and then spend the build
     // discovering the replacement is impossible, leaving the operator with
     // neither.
-    crate::checks::bundle::ensure_out_dir(&runner, &options)?;
+    let private_out = crate::checks::bundle::ensure_out_dir(&runner, &options)?;
     // Warm UNCONDITIONALLY, not through `warm_operator_inputs`, and treat a
     // failure as this command's failure.
     //
@@ -646,12 +646,14 @@ pub fn bundle_cli(args: &[String]) -> Result<(), String> {
     // The lock goes to the callee: it releases it once the volume is built and
     // before the qcow2 conversion, which reads only the private TMPDIR scratch
     // the bundle staged out, guarded against the ladder as `run`'s is.
-    crate::checks::bundle::run(&runner, lock, &options, &source)
+    crate::checks::bundle::run(&runner, lock, &options, &source, private_out)
 }
 
 fn bundle_usage() -> String {
     format!(
-        "usage: bundle [--out DIR] [--raw] [--zlib] [--force]\n       \
+        "usage: bundle [--out DIR] [--raw] [--zlib] [--force] [--installation]\n       \
+         --installation  create a private VM with its own signing key; requires --out\n\
+       \
          --out DIR   where to write the bundle (default {})\n       \
          --raw       ship the raw volume instead of converting it to qcow2\n       \
          --zlib      compress with zlib, not zstd: ~14% larger, but readable\n       \
@@ -673,12 +675,14 @@ fn parse_bundle_args(args: &[String]) -> Result<crate::checks::bundle::BundleOpt
     let mut raw = false;
     let mut zlib = false;
     let mut force = false;
+    let mut installation = false;
     let mut rest = args.iter();
     while let Some(argument) = rest.next() {
         match argument.as_str() {
             "--raw" => raw = true,
             "--zlib" => zlib = true,
             "--force" => force = true,
+            "--installation" => installation = true,
             "--out" => {
                 let value = rest
                     .next()
@@ -703,11 +707,17 @@ fn parse_bundle_args(args: &[String]) -> Result<crate::checks::bundle::BundleOpt
             bundle_usage()
         ));
     }
+    if installation && (force || out.is_none()) {
+        return Err(
+            "--installation requires an explicit empty --out DIR and refuses --force".into(),
+        );
+    }
     Ok(crate::checks::bundle::BundleOptions {
         out: out.unwrap_or_else(|| PathBuf::from(crate::checks::bundle::DEFAULT_OUT)),
         raw,
         zlib,
         force,
+        installation,
     })
 }
 
@@ -5585,7 +5595,11 @@ mod tests {
         };
 
         let default = parse(&[]).expect("no arguments is the ordinary invocation");
-        assert_eq!(default.out, PathBuf::from(crate::checks::bundle::DEFAULT_OUT));
+        assert_eq!(
+            default.out,
+            PathBuf::from(crate::checks::bundle::DEFAULT_OUT)
+        );
+        assert!(!default.installation);
         assert!(!default.raw);
         assert!(!default.force);
 
@@ -5595,6 +5609,11 @@ mod tests {
         assert_eq!(full.out, PathBuf::from("/tmp/td-vm"));
         assert!(full.raw);
         assert!(full.force);
+
+        let installation = parse(&["--installation", "--out", "/tmp/private-vm"]).unwrap();
+        assert!(installation.installation);
+        assert!(parse(&["--installation"]).is_err());
+        assert!(parse(&["--installation", "--out", "/tmp/private-vm", "--force"]).is_err());
 
         let compat = parse(&["--zlib"]).expect("the compatibility codec");
         assert!(compat.zlib);

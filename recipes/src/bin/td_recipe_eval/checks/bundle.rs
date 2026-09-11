@@ -7,6 +7,9 @@
 //! somebody with qemu and no td checkout can try the system in the time it
 //! takes to download it.
 //!
+//! `--installation` creates a private VM with a retained signing identity and
+//! persistent writes; it is separate from the redistributable demo default.
+//!
 //! Sibling of `checks/run.rs`: identical build, identical verification,
 //! identical trust root, and — through `checks/vm_profile.rs` — literally the
 //! same qemu argv. The difference is only where the boot happens. `run` boots
@@ -22,21 +25,21 @@
 
 use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::check_runner::RecipeCheckRunner;
 use crate::checks::qemu_boot::{
     build_btrfs_tools, create_release_volume, find_qemu_tool, provision_selector,
-    verify_deployment, verify_selector, RunTrust, PUBLISHED_VOLUME_BYTES,
-    SYSTEM_GUEST_MEMORY_MIB,
+    verify_deployment, verify_selector, RunTrust, PUBLISHED_VOLUME_BYTES, SYSTEM_GUEST_MEMORY_MIB,
 };
+use crate::checks::release_source::ReleaseSource;
 use crate::checks::vm_profile::{
     self, Compression, DiskFormat, CHECKSUMS_NAME, INITRD_NAME, KERNEL_NAME, LAUNCHER_NAME,
     README_NAME,
 };
-use crate::checks::release_source::ReleaseSource;
 
 /// The distro image recipe a bundle ships; its closure pulls in the kernel.
 const SYSTEM: &str = "system-x86-64";
@@ -70,6 +73,8 @@ pub(crate) struct BundleOptions {
     pub(crate) zlib: bool,
     /// Overwrite a bundle already in `out`.
     pub(crate) force: bool,
+    /// A private VM disk with a unique retained installation signing identity.
+    pub(crate) installation: bool,
 }
 
 /// Every file a bundle owns, newest first in the order they are written.
@@ -99,19 +104,19 @@ pub(crate) fn run(
     lock: std::fs::File,
     options: &BundleOptions,
     source: &ReleaseSource,
+    private_out: Option<PrivateOutput>,
 ) -> Result<(), String> {
-    // Settled before the build: a destination that can never receive a bundle
-    // is refused now rather than after the climb. This may CREATE `out` —
-    // that is how an uncreatable path is detected — but removes nothing; the
-    // clearing waits for `open_out_dir` below.
-    ensure_out_dir(runner, options)?;
-
     println!(
         "   [bundle] building the td distro ({SYSTEM}); its closure pulls in the kernel.\n            \
          An unchanged tree is reused whole and returns at once; a cold tree climbs the\n            \
          whole ladder from stage0 and can take a long time. Per-rung progress streams below.\n"
     );
-    let trees = runner.build_and_stage(SYSTEM, &[SYSTEM])?;
+    let outputs = if options.installation {
+        vec![SYSTEM, "td-net"]
+    } else {
+        vec![SYSTEM]
+    };
+    let trees = runner.build_and_stage(SYSTEM, &outputs)?;
     let system_tree = trees
         .first()
         .cloned()
@@ -150,10 +155,18 @@ pub(crate) fn run(
     let staged_kernel = scratch.dir.join(KERNEL_NAME);
     copy_into(&bzimage, &staged_kernel)?;
 
-    // This bundle's trust root. The private half is generated here, used to
-    // sign the deployment that goes into the volume, and dropped when this
-    // function returns; only the public half ships, inside the selector.
-    let trust = RunTrust::generate()?;
+    // Installation keys enter private writable state after signing; demo
+    // seeds are discarded. Both selectors carry only their public key.
+    let trust = if options.installation {
+        let signer = trees
+            .get(1)
+            .ok_or("missing source-built installation signer")?
+            .join("bin/td-net");
+        let builder = PathBuf::from(runner.builder_command().get_program());
+        RunTrust::installation(signer, &scratch.dir.join("installation-identity"), builder)?
+    } else {
+        RunTrust::generate()?
+    };
     // `provision_selector` names its output for the boot fixture that first
     // needed it. The bundle publishes it under the name its launcher passes to
     // `-initrd`, so rename rather than teach every reader two names for one
@@ -194,19 +207,42 @@ pub(crate) fn run(
     };
 
     let staged_disk = scratch.dir.join(format.file_name());
+    if options.installation {
+        fs::set_permissions(&staged_disk, fs::Permissions::from_mode(0o600))
+            .map_err(|e| format!("protect installation disk: {e}"))?;
+    }
     write_executable(
         &scratch.dir.join(LAUNCHER_NAME),
-        vm_profile::launcher_script(format).as_bytes(),
+        (if options.installation {
+            vm_profile::launcher_script_mode(format, true)
+        } else {
+            vm_profile::launcher_script(format)
+        })
+        .as_bytes(),
     )?;
-    fs::write(scratch.dir.join(README_NAME), readme(&deployment_id, format))
-        .map_err(|e| format!("write the bundle README: {e}"))?;
+    fs::write(
+        scratch.dir.join(README_NAME),
+        if options.installation {
+            installation_readme(&deployment_id, format)
+        } else {
+            readme(&deployment_id, format)
+        },
+    )
+    .map_err(|e| format!("write the bundle README: {e}"))?;
     // Before `write_checksums` because `verify_staged` requires it, NOT because
     // it is checksummed — `checksum_targets` deliberately excludes it, so that
     // `sha256sum -c` succeeds for a downloader who fetched the files the README
     // documents.
     fs::write(
         scratch.dir.join(MARKER_NAME),
-        format!("{MARKER_FORMAT}\ndeployment={deployment_id}\n"),
+        format!(
+            "{}\ndeployment={deployment_id}\n",
+            if options.installation {
+                "td-installation-v1"
+            } else {
+                MARKER_FORMAT
+            }
+        ),
     )
     .map_err(|e| format!("write the bundle marker: {e}"))?;
     verify_staged(&scratch.dir, format)?;
@@ -216,13 +252,36 @@ pub(crate) fn run(
     // `out` was created before the build, so that an uncreatable one failed
     // fast. Only now, with every file finished, is it CLEARED and filled —
     // and re-created first if something removed it while the build ran.
-    let out = open_out_dir(&options.out, options.force, runner.ladder_work_dir())?;
+    let out = match &private_out {
+        Some(private) => {
+            private.check()?;
+            private.check_empty()?;
+            private.path()
+        }
+        None => open_out_dir(&options.out, options.force, runner.ladder_work_dir())?,
+    };
     for name in published_names(format) {
-        move_into_place(&scratch.dir.join(name), &out.join(name))?;
+        if options.installation {
+            publish_private_file(&scratch.dir.join(name), &out.join(name))?;
+        } else {
+            move_into_place(&scratch.dir.join(name), &out.join(name))?;
+        }
     }
     let _ = (staged_kernel, staged_initrd, staged_disk);
 
-    report(&out, format, &deployment_id)
+    if let Some(private) = private_out {
+        for name in published_names(format) {
+            fs::File::open(out.join(name))
+                .and_then(|f| f.sync_all())
+                .map_err(|e| format!("sync installation output {name}: {e}"))?;
+        }
+        private.finish()?;
+        println!("\n   [installation] wrote private VM {}\n                  run: {}/start\n                  deployment: {deployment_id}",
+            options.out.display(), options.out.display());
+        Ok(())
+    } else {
+        report(&out, format, &deployment_id)
+    }
 }
 
 /// Settle the destination: refuse one that cannot receive a bundle, and create
@@ -243,17 +302,215 @@ pub(crate) fn run(
 pub(crate) fn ensure_out_dir(
     runner: &RecipeCheckRunner,
     options: &BundleOptions,
-) -> Result<(), String> {
-    ensure_out_dir_under(&options.out, options.force, runner.ladder_work_dir())
+) -> Result<Option<PrivateOutput>, String> {
+    if options.installation {
+        check_outside_ladder(&options.out, runner.ladder_work_dir())?;
+        PrivateOutput::open(&options.out).map(Some)
+    } else {
+        ensure_out_dir_under(&options.out, options.force, runner.ladder_work_dir())?;
+        Ok(None)
+    }
+}
+
+/// Keep private publication bound to the owned directory across a long build.
+pub(crate) struct PrivateOutput {
+    directory: fs::File,
+    original: PathBuf,
+    _lease: fs::File,
+}
+const INSTALLATION_LEASE: &str = ".td-installation.lock";
+impl PrivateOutput {
+    fn open(path: &Path) -> Result<Self, String> {
+        // Linux x86-64 safe-std open flags.
+        const PATH_ONLY: i32 = 0x200000;
+        const NONBLOCK: i32 = 0x800;
+        const NOFOLLOW: i32 = 0x20000;
+        let original: PathBuf = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            std::env::current_dir()
+                .map_err(|e| format!("current directory: {e}"))?
+                .join(path)
+        }
+        .components()
+        .collect();
+        let created = match fs::DirBuilder::new().mode(0o700).create(&original) {
+            Ok(()) => true,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => false,
+            Err(e) => {
+                return Err(format!(
+                    "create private installation output {} (its parent must exist): {e}",
+                    original.display()
+                ))
+            }
+        };
+        let pinned = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(PATH_ONLY | NOFOLLOW)
+            .open(&original)
+            .map_err(|e| format!("pin installation output: {e}"))?;
+        let metadata = pinned
+            .metadata()
+            .map_err(|e| format!("inspect installation output: {e}"))?;
+        let uid = fs::metadata("/proc/self")
+            .map_err(|e| format!("read installer UID: {e}"))?
+            .uid();
+        if !metadata.is_dir()
+            || metadata.uid() != uid
+            || (!created && metadata.mode() & 0o7777 != 0o700)
+        {
+            return Err("installation output must be an owned 0700 directory".into());
+        }
+        let descriptor = PathBuf::from(format!("/proc/self/fd/{}", pinned.as_raw_fd()));
+        if created {
+            fs::set_permissions(&descriptor, fs::Permissions::from_mode(0o700))
+                .map_err(|e| format!("protect installation output: {e}"))?;
+        }
+        let directory =
+            fs::File::open(descriptor).map_err(|e| format!("open installation output: {e}"))?;
+        let root = PathBuf::from(format!("/proc/self/fd/{}", directory.as_raw_fd()));
+        let lease_path = root.join(INSTALLATION_LEASE);
+        let mut options = fs::OpenOptions::new();
+        options
+            .read(true)
+            .write(true)
+            .mode(0o600)
+            .custom_flags(NOFOLLOW | NONBLOCK);
+        let lease = match options.create_new(true).open(&lease_path) {
+            Ok(file) => {
+                file.set_permissions(fs::Permissions::from_mode(0o600))
+                    .map_err(|e| format!("protect installation lease: {e}"))?;
+                file
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => options
+                .create_new(false)
+                .open(&lease_path)
+                .map_err(|e| format!("open installation lease: {e}"))?,
+            Err(e) => return Err(format!("create installation lease: {e}")),
+        };
+        let metadata = lease
+            .metadata()
+            .map_err(|e| format!("inspect installation lease: {e}"))?;
+        if !metadata.is_file()
+            || metadata.uid() != uid
+            || metadata.nlink() != 1
+            || metadata.mode() & 0o7777 != 0o600
+        {
+            return Err("installation lease must be an owned single-link 0600 file".into());
+        }
+        lease
+            .try_lock()
+            .map_err(|e| format!("installation output is already in use: {e}"))?;
+        let output = Self {
+            directory,
+            original,
+            _lease: lease,
+        };
+        output.check()?;
+        output.check_empty()?;
+        Ok(output)
+    }
+    fn path(&self) -> PathBuf {
+        PathBuf::from(format!("/proc/self/fd/{}", self.directory.as_raw_fd()))
+    }
+    fn check(&self) -> Result<(), String> {
+        let held = self
+            .directory
+            .metadata()
+            .map_err(|e| format!("inspect held installation output: {e}"))?;
+        let now = fs::symlink_metadata(&self.original)
+            .map_err(|e| format!("inspect installation output name: {e}"))?;
+        if !now.is_dir()
+            || (now.dev(), now.ino()) != (held.dev(), held.ino())
+            || held.mode() & 0o7777 != 0o700
+        {
+            return Err("private installation output moved or changed permissions".into());
+        }
+        Ok(())
+    }
+    fn check_empty(&self) -> Result<(), String> {
+        for entry in
+            fs::read_dir(self.path()).map_err(|e| format!("read installation output: {e}"))?
+        {
+            let entry = entry.map_err(|e| format!("read installation output entry: {e}"))?;
+            if entry.file_name() != INSTALLATION_LEASE {
+                return Err(
+                    "installation output must be empty; choose a new --out directory".into(),
+                );
+            }
+        }
+        Ok(())
+    }
+    fn finish(&self) -> Result<(), String> {
+        self.check()?;
+        self.directory
+            .sync_all()
+            .map_err(|e| format!("sync installation output: {e}"))?;
+        let parent = self
+            .original
+            .parent()
+            .ok_or("installation output has no parent")?;
+        fs::File::open(parent)
+            .and_then(|f| f.sync_all())
+            .map_err(|e| format!("sync installation output parent: {e}"))
+    }
 }
 
 /// `ensure_out_dir` with the ladder path passed in rather than read off a
 /// runner, so the guards are reachable from a test.
-fn ensure_out_dir_under(
-    out: &Path,
-    force: bool,
-    ladder_work_dir: &Path,
-) -> Result<(), String> {
+fn ensure_out_dir_under(out: &Path, force: bool, ladder_work_dir: &Path) -> Result<(), String> {
+    check_outside_ladder(out, ladder_work_dir)?;
+
+    if out.is_dir() {
+        // `symlink_metadata`, not `exists`: a BROKEN symlink at a bundle name
+        // is invisible to `exists()`, so it was never listed, never cleared,
+        // and `move_into_place`'s copy fallback would then follow it and write
+        // the bundle's bytes to whatever it pointed at, outside `out`.
+        let existing: Vec<&str> = bundle_files()
+            .into_iter()
+            .filter(|name| out.join(name).symlink_metadata().is_ok())
+            .collect();
+        if !existing.is_empty() {
+            // A directory is replaceable only if THIS tool wrote it. Bundle
+            // file names are ordinary names — `README.md` and `start` are both
+            // repository files — so name collisions alone must never license a
+            // delete: `--force --out .` in a checkout would otherwise remove
+            // the tracked copies of both.
+            if !is_bundle_directory(out) {
+                return Err(format!(
+                    "{} holds files a bundle would overwrite ({}) but no {MARKER_NAME} \
+                     marker, so it was not written by `bundle` and will not be \
+                     replaced — even with --force. Choose an empty --out DIR.",
+                    out.display(),
+                    existing.join(", ")
+                ));
+            }
+            if !force {
+                return Err(format!(
+                    "{} already holds a bundle; pass --force to replace it, or \
+                     --out DIR to write elsewhere",
+                    out.display()
+                ));
+            }
+        }
+    } else if out.exists() {
+        return Err(format!("{} exists and is not a directory", out.display()));
+    } else {
+        // CREATED here, not in `open_out_dir`. Only the clearing had to move
+        // late; creating is not destructive, and it is what makes this check
+        // worth running early. Without it, `--out /mnt/usb/td-vm` with nothing
+        // mounted, or a directory the operator cannot write, returned Ok here
+        // and failed at `create_dir_all` after the ladder climb and the
+        // several-GiB volume build — the precise failure this ordering exists
+        // to prevent. An empty directory left behind by a later failure is a
+        // far smaller cost than the hours.
+        fs::create_dir_all(out)
+            .map_err(|e| format!("create bundle directory {}: {e}", out.display()))?;
+    }
+    Ok(())
+}
+
+fn check_outside_ladder(out: &Path, ladder_work_dir: &Path) -> Result<(), String> {
     // A bundle inside the ladder work tree is deleted by the next
     // `clear-store`, which is a surprising way to lose a finished release
     // artifact. The same guard `run.rs` puts on its private image dir, for the
@@ -289,55 +546,6 @@ fn ensure_out_dir_under(
         }
     }
 
-    if out.is_dir() {
-        // `symlink_metadata`, not `exists`: a BROKEN symlink at a bundle name
-        // is invisible to `exists()`, so it was never listed, never cleared,
-        // and `move_into_place`'s copy fallback would then follow it and write
-        // the bundle's bytes to whatever it pointed at, outside `out`.
-        let existing: Vec<&str> = bundle_files()
-            .into_iter()
-            .filter(|name| out.join(name).symlink_metadata().is_ok())
-            .collect();
-        if !existing.is_empty() {
-            // A directory is replaceable only if THIS tool wrote it. Bundle
-            // file names are ordinary names — `README.md` and `start` are both
-            // repository files — so name collisions alone must never license a
-            // delete: `--force --out .` in a checkout would otherwise remove
-            // the tracked copies of both.
-            if !is_bundle_directory(out) {
-                return Err(format!(
-                    "{} holds files a bundle would overwrite ({}) but no {MARKER_NAME} \
-                     marker, so it was not written by `bundle` and will not be \
-                     replaced — even with --force. Choose an empty --out DIR.",
-                    out.display(),
-                    existing.join(", ")
-                ));
-            }
-            if !force {
-                return Err(format!(
-                    "{} already holds a bundle; pass --force to replace it, or \
-                     --out DIR to write elsewhere",
-                    out.display()
-                ));
-            }
-        }
-    } else if out.exists() {
-        return Err(format!(
-            "{} exists and is not a directory",
-            out.display()
-        ));
-    } else {
-        // CREATED here, not in `open_out_dir`. Only the clearing had to move
-        // late; creating is not destructive, and it is what makes this check
-        // worth running early. Without it, `--out /mnt/usb/td-vm` with nothing
-        // mounted, or a directory the operator cannot write, returned Ok here
-        // and failed at `create_dir_all` after the ladder climb and the
-        // several-GiB volume build — the precise failure this ordering exists
-        // to prevent. An empty directory left behind by a later failure is a
-        // far smaller cost than the hours.
-        fs::create_dir_all(out)
-            .map_err(|e| format!("create bundle directory {}: {e}", out.display()))?;
-    }
     Ok(())
 }
 
@@ -348,11 +556,7 @@ fn ensure_out_dir_under(
 /// gone" and "the new one is complete" is the move loop rather than the whole
 /// build. Re-checks rather than trusting the earlier `ensure_out_dir`, because
 /// the destination is operator-supplied and an hour has passed.
-fn open_out_dir(
-    out: &Path,
-    force: bool,
-    ladder_work_dir: &Path,
-) -> Result<PathBuf, String> {
+fn open_out_dir(out: &Path, force: bool, ladder_work_dir: &Path) -> Result<PathBuf, String> {
     // Re-settles rather than trusting the earlier call: the destination is
     // operator-supplied and the build took hours, so it may have become a
     // file, filled with somebody else's data, or been removed — the last of
@@ -407,9 +611,9 @@ impl Scratch {
         // `ensure_out_dir_under`: an `if let (Ok, Ok)` skips the guard in
         // silence when either side fails, and one such skip in this file was
         // already a finding.
-        let canonical_base = base.canonicalize().map_err(|e| {
-            format!("resolve the system temp dir {}: {e}", base.display())
-        })?;
+        let canonical_base = base
+            .canonicalize()
+            .map_err(|e| format!("resolve the system temp dir {}: {e}", base.display()))?;
         let ladder = match ladder_work_dir.canonicalize() {
             Ok(ladder) => Some(ladder),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
@@ -484,6 +688,24 @@ fn move_into_place(from: &Path, to: &Path) -> Result<(), String> {
     fs::remove_file(from).map_err(|e| format!("remove staged {}: {e}", from.display()))
 }
 
+fn publish_private_file(from: &Path, to: &Path) -> Result<(), String> {
+    // Both hard-link and exclusive-copy publication refuse an existing name.
+    match fs::hard_link(from, to) {
+        Ok(()) => {}
+        Err(error) if error.raw_os_error() == Some(18) => {
+            copy_sparse_new(from, to)
+                .map_err(|e| format!("copy private installation file: {e}"))?;
+        }
+        Err(error) => {
+            return Err(format!(
+                "publish private installation file {}: {error}",
+                to.display()
+            ))
+        }
+    }
+    fs::remove_file(from).map_err(|e| format!("remove staged installation file: {e}"))
+}
+
 /// Scan the private staged file, leaving all-zero chunks unallocated. This
 /// still reads its full logical length; it bounds writes, not read time.
 fn copy_sparse_new(from: &Path, to: &Path) -> std::io::Result<()> {
@@ -504,14 +726,14 @@ fn copy_sparse_new(from: &Path, to: &Path) -> std::io::Result<()> {
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(error) => return Err(error),
         };
-        let chunk = buffer.get(..count).ok_or_else(|| {
-            std::io::Error::other("sparse copy read exceeded its buffer")
-        })?;
+        let chunk = buffer
+            .get(..count)
+            .ok_or_else(|| std::io::Error::other("sparse copy read exceeded its buffer"))?;
         // Small metadata islands should not allocate a whole read buffer.
         for block in chunk.chunks(64 * 1024) {
-            let end = length.checked_add(block.len() as u64).ok_or_else(|| {
-                std::io::Error::other("sparse copy length overflow")
-            })?;
+            let end = length
+                .checked_add(block.len() as u64)
+                .ok_or_else(|| std::io::Error::other("sparse copy length overflow"))?;
             if block.iter().any(|byte| *byte != 0) {
                 if written_position != length {
                     destination.seek(SeekFrom::Start(length))?;
@@ -566,11 +788,7 @@ fn canonical_parent(path: &Path) -> Result<PathBuf, String> {
 /// optional tool, and a raw bundle boots identically — just larger. Report the
 /// fallback rather than refusing, because the operator asked for a bundle and
 /// this still is one.
-fn compress_volume(
-    raw: &Path,
-    out: &Path,
-    preferred: Compression,
-) -> Result<DiskFormat, String> {
+fn compress_volume(raw: &Path, out: &Path, preferred: Compression) -> Result<DiskFormat, String> {
     let Some(qemu_img) = find_qemu_tool("qemu-img") else {
         println!(
             "   [bundle] qemu-img not found; shipping the raw {} volume. It boots the same \
@@ -613,8 +831,7 @@ fn compress_volume(
             Compression::Zlib
         }
     };
-    fs::remove_file(raw)
-        .map_err(|e| format!("remove the raw volume {}: {e}", raw.display()))?;
+    fs::remove_file(raw).map_err(|e| format!("remove the raw volume {}: {e}", raw.display()))?;
     Ok(DiskFormat::Qcow2(compression))
 }
 
@@ -690,8 +907,7 @@ fn copy_into(source: &Path, destination: &Path) -> Result<(), String> {
 
 /// Write `contents` to `path` as an executable file.
 fn write_executable(path: &Path, contents: &[u8]) -> Result<(), String> {
-    let mut file = fs::File::create(path)
-        .map_err(|e| format!("create {}: {e}", path.display()))?;
+    let mut file = fs::File::create(path).map_err(|e| format!("create {}: {e}", path.display()))?;
     file.write_all(contents)
         .map_err(|e| format!("write {}: {e}", path.display()))?;
     // Mode set AFTER the write, so a partially written launcher is never
@@ -773,8 +989,7 @@ fn write_checksums(out: &Path, format: DiskFormat) -> Result<(), String> {
         text.push_str(name);
         text.push('\n');
     }
-    fs::write(out.join(CHECKSUMS_NAME), text)
-        .map_err(|e| format!("write {CHECKSUMS_NAME}: {e}"))
+    fs::write(out.join(CHECKSUMS_NAME), text).map_err(|e| format!("write {CHECKSUMS_NAME}: {e}"))
 }
 
 /// Bytes as a short human figure for the summary. Nothing branches on it.
@@ -800,6 +1015,11 @@ fn human_bytes(bytes: u64) -> String {
 }
 
 /// The README that ships beside the images.
+fn installation_readme(deployment_id: &str, format: DiskFormat) -> String {
+    let disk = format.file_name();
+    format!("# td VM installation\n\nRun `./start` to boot. Guest writes persist in `{disk}`. The Btrfs volume\nprovides 2 TiB of sparse virtual capacity for local builds; physical disk\nusage grows as the guest writes.\n\nThis disk owns a unique deployment signing key in `/var/lib/td-deploy`.\nIts public key is installed in the accompanying boot selector and volume.\nKeep this directory private: copying the disk also copies the identity.\nCreate another installation to obtain a new identity.\n\nDeployment: `{deployment_id}`\n\nThe source checkout is initialized at `~/src/td`. Configure its Git remote,\nthen run `./update build` from that checkout. Signing and activating a\nsuccessor through authorized `./update` integration is still forthcoming.\n\n`SHA256SUMS` records the initial files; the disk changes after first boot.\nQEMU {} or newer is required. Use `TD_QEMU_ACCEL=tcg` for software emulation\nand `TD_VM_MEMORY` to set guest RAM in MiB.\n", format.minimum_qemu())
+}
+
 fn readme(deployment_id: &str, format: DiskFormat) -> String {
     let disk = format.file_name();
     let minimum_qemu = format.minimum_qemu();
@@ -986,10 +1206,7 @@ fn readme(deployment_id: &str, format: DiskFormat) -> String {
 fn report(out: &Path, format: DiskFormat, deployment_id: &str) -> Result<(), String> {
     let mut total = 0u64;
     println!("\n   [bundle] wrote {}", out.display());
-    for name in checksum_targets(format)
-        .into_iter()
-        .chain([CHECKSUMS_NAME])
-    {
+    for name in checksum_targets(format).into_iter().chain([CHECKSUMS_NAME]) {
         let path = out.join(name);
         let size = fs::metadata(&path)
             .map_err(|e| format!("stat {}: {e}", path.display()))?
@@ -1039,6 +1256,70 @@ mod tests {
         ));
         fs::create_dir_all(&base).expect("scratch");
         base
+    }
+
+    #[test]
+    fn private_publication_refuses_files_that_appear_during_build() {
+        let base = scratch("private-appeared");
+        let output = PrivateOutput::open(&base.join("private")).unwrap();
+        let destination = output.path().join("td-system.qcow2");
+        fs::write(&destination, b"owned disk").unwrap();
+        assert!(output.check_empty().is_err());
+        let staged = base.join("new-disk");
+        fs::write(&staged, b"new disk").unwrap();
+        assert!(publish_private_file(&staged, &destination).is_err());
+        assert_eq!(fs::read(destination).unwrap(), b"owned disk");
+        assert_eq!(fs::read(staged).unwrap(), b"new disk");
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn concurrent_private_installations_cannot_admit_the_same_output() {
+        let base = scratch("private-concurrent");
+        let path = base.join("private");
+        let first = PrivateOutput::open(&path).unwrap();
+        assert!(PrivateOutput::open(&path).is_err());
+        drop(first);
+        let _retry = PrivateOutput::open(&path).unwrap();
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn private_output_refuses_exposed_nonempty_and_symlinked_destinations() {
+        use std::os::unix::fs::symlink;
+        let base = scratch("private-output");
+        let path = base.join("private");
+        let output = PrivateOutput::open(&path).unwrap();
+        assert_eq!(fs::metadata(&path).unwrap().mode() & 0o7777, 0o700);
+        fs::write(output.path().join("owned"), b"retain").unwrap();
+        drop(output);
+        assert!(PrivateOutput::open(&path).is_err());
+        assert_eq!(fs::read(path.join("owned")).unwrap(), b"retain");
+        let link = base.join("link");
+        symlink(&path, &link).unwrap();
+        for suffix in ["", "/", "/."] {
+            let mut spelling = link.as_os_str().to_os_string();
+            spelling.push(suffix);
+            assert!(PrivateOutput::open(Path::new(&spelling)).is_err());
+        }
+        fs::remove_file(path.join("owned")).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(PrivateOutput::open(&path).is_err());
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn private_publication_keeps_its_directory_when_the_name_is_replaced() {
+        let base = scratch("private-moved");
+        let path = base.join("private");
+        let output = PrivateOutput::open(&path).unwrap();
+        fs::rename(&path, base.join("moved")).unwrap();
+        fs::create_dir(&path).unwrap();
+        assert!(output.check().is_err());
+        fs::write(output.path().join("private-data"), b"held").unwrap();
+        assert_eq!(fs::read(base.join("moved/private-data")).unwrap(), b"held");
+        assert_eq!(fs::read_dir(&path).unwrap().count(), 0);
+        fs::remove_dir_all(base).unwrap();
     }
 
     #[test]
@@ -1334,10 +1615,17 @@ mod tests {
             "td-system.qcow2",
             "td-system.img",
         ] {
-            assert!(owned.contains(&name), "{name} is written but never replaced");
+            assert!(
+                owned.contains(&name),
+                "{name} is written but never replaced"
+            );
         }
         assert!(owned.contains(&MARKER_NAME));
-        assert_eq!(owned.len(), 8, "a name was added without a decision about --force");
+        assert_eq!(
+            owned.len(),
+            8,
+            "a name was added without a decision about --force"
+        );
     }
 
     /// Both volume names are removable regardless of which one is being
@@ -1403,7 +1691,10 @@ mod tests {
                 !text.contains(other.file_name()),
                 "{format:?} README mentions the format that did not ship"
             );
-            assert!(text.contains("abc123"), "the deployment id is the release's name");
+            assert!(
+                text.contains("abc123"),
+                "the deployment id is the release's name"
+            );
         }
     }
 
@@ -1417,7 +1708,6 @@ mod tests {
         assert!(text.contains("not a distribution channel"));
         assert!(text.contains("git pull"));
     }
-
 
     /// The README's stated qemu floor must match the image beside it. A bundle
     /// that ships zstd and asks for 2.4 sends the reader to a qemu that opens
@@ -1482,8 +1772,8 @@ mod tests {
             DEFAULT_OUT,
             "td-bundle-nonexistent/deeper/still",
         ] {
-            let resolved = canonical_parent(Path::new(relative))
-                .unwrap_or_else(|e| panic!("{relative}: {e}"));
+            let resolved =
+                canonical_parent(Path::new(relative)).unwrap_or_else(|e| panic!("{relative}: {e}"));
             assert!(
                 resolved.starts_with(&here) || resolved == here,
                 "{relative} resolved to {}, outside {}",
@@ -1497,8 +1787,7 @@ mod tests {
     /// rather than erroring: the guard has to have something to compare.
     #[test]
     fn an_entirely_missing_absolute_path_walks_to_the_root() {
-        let resolved =
-            canonical_parent(Path::new("/td-bundle-nonexistent/a/b/c")).unwrap();
+        let resolved = canonical_parent(Path::new("/td-bundle-nonexistent/a/b/c")).unwrap();
         assert_eq!(resolved, Path::new("/"));
     }
 }
