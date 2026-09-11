@@ -2064,15 +2064,16 @@ fn detach_from_workspace(manifest: &Path) -> Result<(), String> {
         out.push('\n');
     }
     out.push_str("\n[workspace]\n");
-    std::fs::write(manifest, out).map_err(|e| format!("write {}: {e}", manifest.display()))
+    write_atomic(manifest, out.as_bytes())
 }
 
-/// warm crate CRATE VERSION [DEST] — provision a crates.io package's SOURCE tree + its FULL
+/// warm crate CRATE VERSION [DEST] — provision a crates.io package's metadata + its FULL
 /// locked registry closure through td's verifying egress (each `.crate` sha256 must equal
 /// both the Cargo.lock checksum and crates.io sparse-index cksum). Git entries are counted
 /// but never fetched; their recipe-owned fixed-output archives use `warm sources`. Leaves, for the
 /// offline gate to intern + build via TD_VENDOR_DIR:
-///   .td-build-cache/crate-vendor/<dest>/src/<crate>-<ver>/  the extracted source tree
+///   .td-build-cache/crate-vendor/<dest>/src/<crate>-<ver>/  Cargo metadata only
+///   .td-build-cache/crate-vendor/<dest>/work/<crate>-<ver>.crate  original source
 ///   .td-build-cache/crate-vendor/<dest>/vendor/*.crate      the locked dep closure
 fn warm_crate(root: &Path, krate: &str, ver: &str, dest: &str) {
     let _preparation_lock = match vendor::lock_job(root, dest) {
@@ -2100,11 +2101,6 @@ fn warm_crate(root: &Path, krate: &str, ver: &str, dest: &str) {
         );
         return;
     }
-    if !have_cmd("tar") {
-        eprintln!("td-feed warm crate: no tar — skipping {krate}-{ver}");
-        return;
-    }
-
     let _ = std::fs::remove_dir_all(&work);
     let proxy_store = work.join("proxy-store");
     let addr = match start_cargo_proxy(&proxy_store) {
@@ -2132,35 +2128,31 @@ fn warm_crate(root: &Path, krate: &str, ver: &str, dest: &str) {
         return;
     }
 
-    // 2) Extract the source crate -> the source tree.
-    let _ = std::fs::remove_dir_all(&srcparent);
-    if std::fs::create_dir_all(&srcparent).is_err()
-        || !run_quiet(
-            Command::new("tar")
-                .arg("-xzf")
-                .arg(&srccrate)
-                .arg("-C")
-                .arg(&srcparent),
+    // Retain the checksum from the proxy's registry index. The bounded
+    // metadata reader must authenticate the downloaded file independently;
+    // build admission additionally requires the recipe's compiled pin.
+    let prepared = (|| {
+        let index = index_path(krate).ok_or("invalid crate name")?;
+        let mut text = String::new();
+        File::open(proxy_store.join("index").join(index))
+            .and_then(|file| file.take(MAX_INDEX_BYTES + 1).read_to_string(&mut text))
+            .map_err(|e| format!("read authenticated registry metadata: {e}"))?;
+        if text.len() as u64 > MAX_INDEX_BYTES {
+            return Err("registry metadata exceeds its byte limit".into());
+        }
+        let checksum = cksum_for(&text, ver).ok_or("registry metadata has no package checksum")?;
+        if srcparent.exists() {
+            std::fs::remove_dir_all(&srcparent).map_err(|e| e.to_string())?;
+        }
+        vendor::prepare_package_metadata(
+            &srccrate,
+            &checksum,
+            &format!("{krate}-{ver}"),
+            &srcdir,
         )
-    {
-        eprintln!("td-feed warm crate: could not extract the source crate for {krate}-{ver}");
-        return;
-    }
-    if !srcdir.join("Cargo.toml").is_file() {
-        eprintln!(
-            "td-feed warm crate: extracted source has no Cargo.toml at {}",
-            srcdir.display()
-        );
-        return;
-    }
-    if !srcdir.join("Cargo.lock").is_file() {
-        eprintln!(
-            "td-feed warm crate: source {krate}-{ver} ships no Cargo.lock — cannot pin the closure"
-        );
-        return;
-    }
-    if let Err(e) = detach_from_workspace(&srcdir.join("Cargo.toml")) {
-        eprintln!("td-feed warm crate: {e} — skipping {krate}-{ver}");
+    })();
+    if let Err(error) = prepared {
+        eprintln!("td-feed warm crate: prepare {krate}-{ver} metadata: {error}");
         return;
     }
 

@@ -3,6 +3,7 @@ use super::*;
 
 const MAX_COMPRESSED_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_HEADERS: usize = 32_768;
+const MAX_GNU_NAME_BYTES: usize = 4096;
 const BLOCK: usize = 512;
 
 pub(super) struct Metadata {
@@ -104,6 +105,7 @@ fn read_tar(bytes: &[u8], package: &str) -> Result<Metadata, String> {
     let mut manifest = None;
     let mut position = 0usize;
     let mut headers = 0usize;
+    let mut long_name: Option<String> = None;
     loop {
         let end = position
             .checked_add(BLOCK)
@@ -112,6 +114,9 @@ fn read_tar(bytes: &[u8], package: &str) -> Result<Metadata, String> {
             .get(position..end)
             .ok_or("truncated crate tar header")?;
         if header.iter().all(|b| *b == 0) {
+            if long_name.is_some() {
+                return Err("crate tar ends with an unapplied GNU long name".into());
+            }
             let second_end = end.checked_add(BLOCK).ok_or("crate tar offset overflow")?;
             let second = bytes
                 .get(end..second_end)
@@ -152,24 +157,7 @@ fn read_tar(bytes: &[u8], package: &str) -> Result<Metadata, String> {
         if format != b"ustar\x0000" && format != b"ustar  \0" {
             return Err("unsupported crate tar header format".into());
         }
-        let name = text_field(field(header, 0, 100)?)?;
-        let prefix = if format == b"ustar\x0000" {
-            text_field(field(header, 345, 155)?)?
-        } else {
-            ""
-        };
-        let path = if prefix.is_empty() {
-            std::borrow::Cow::Borrowed(name)
-        } else {
-            std::borrow::Cow::Owned(format!("{prefix}/{name}"))
-        };
-        if !relative(&path) {
-            return Err("crate tar path is not a plain relative path".into());
-        }
         let kind = *header.get(156).ok_or("missing crate tar entry kind")?;
-        if !matches!(kind, 0 | b'0' | b'5') {
-            return Err(format!("unsupported crate tar entry kind 0x{kind:02x} at {path:?}; metadata requires ordinary files/directories"));
-        }
         let size = usize::try_from(octal(field(header, 124, 12)?)?)
             .map_err(|_| "crate tar member size exceeds address space")?;
         if kind == b'5' && size != 0 {
@@ -179,6 +167,56 @@ fn read_tar(bytes: &[u8], package: &str) -> Result<Metadata, String> {
         let data = bytes
             .get(end..data_end)
             .ok_or("truncated crate tar member")?;
+        let padding_len = (BLOCK - size % BLOCK) % BLOCK;
+        position = data_end
+            .checked_add(padding_len)
+            .ok_or("crate tar offset overflow")?;
+        let padding = bytes
+            .get(data_end..position)
+            .ok_or("truncated crate tar member padding")?;
+        if padding.iter().any(|byte| *byte != 0) {
+            return Err("nonzero crate tar member padding".into());
+        }
+        if kind == b'L' {
+            if format != b"ustar  \0"
+                || text_field(field(header, 0, 100)?)? != "././@LongLink"
+                || long_name.is_some()
+                || data.len() > MAX_GNU_NAME_BYTES
+            {
+                return Err("invalid or repeated GNU crate long-name record".into());
+            }
+            let name = data.strip_suffix(&[0]).ok_or("GNU crate long name is not terminated")?;
+            let name = std::str::from_utf8(name).map_err(|_| "GNU crate long name is not UTF-8")?;
+            if name.contains('\0') || !relative(name) {
+                return Err("GNU crate long name is not a plain relative path".into());
+            }
+            long_name = Some(name.to_string());
+            continue;
+        }
+        if !matches!(kind, 0 | b'0' | b'5') {
+            return Err(format!("unsupported crate tar entry kind 0x{kind:02x}; metadata requires ordinary files/directories"));
+        }
+        let path = if let Some(name) = long_name.take() {
+            if format != b"ustar  \0" {
+                return Err("GNU long name precedes a non-GNU crate member".into());
+            }
+            std::borrow::Cow::Owned(name)
+        } else {
+            let name = text_field(field(header, 0, 100)?)?;
+            let prefix = if format == b"ustar\x0000" {
+                text_field(field(header, 345, 155)?)?
+            } else {
+                ""
+            };
+            if prefix.is_empty() {
+                std::borrow::Cow::Borrowed(name)
+            } else {
+                std::borrow::Cow::Owned(format!("{prefix}/{name}"))
+            }
+        };
+        if !relative(&path) {
+            return Err("crate tar path is not a plain relative path".into());
+        }
         let slot = if path == lock_name {
             Some((&mut lock, MAX_CARGO_LOCK_BYTES))
         } else if path == manifest_name {
@@ -191,16 +229,6 @@ fn read_tar(bytes: &[u8], package: &str) -> Result<Metadata, String> {
                 return Err("crate metadata member is repeated or not a regular file".into());
             }
             *slot = Some(member_text(data, limit)?);
-        }
-        let padding = (BLOCK - size % BLOCK) % BLOCK;
-        position = data_end
-            .checked_add(padding)
-            .ok_or("crate tar offset overflow")?;
-        let padding = bytes
-            .get(data_end..position)
-            .ok_or("truncated crate tar member padding")?;
-        if padding.iter().any(|byte| *byte != 0) {
-            return Err("nonzero crate tar member padding".into());
         }
     }
     Ok(Metadata {
@@ -288,6 +316,75 @@ pub(super) mod tests {
             .unwrap();
         assert!(read_pinned(&source, "unused", "p").is_err());
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    fn gnu_entry(out: &mut Vec<u8>, name: &str, kind: u8, data: &[u8]) {
+        let at = out.len();
+        entry(out, name, kind, data);
+        out[at + 257..at + 265].copy_from_slice(b"ustar  \0");
+        seal(&mut out[at..at + BLOCK]);
+    }
+
+    #[test]
+    fn gnu_long_names_select_the_following_member_without_extracting_paths() {
+        let mut bytes = archive();
+        bytes.truncate(bytes.len() - BLOCK * 2);
+        let name = format!("p/tests/{}\0", "long".repeat(35));
+        gnu_entry(&mut bytes, "././@LongLink", b'L', name.as_bytes());
+        let next = bytes.len();
+        gnu_entry(&mut bytes, "truncated", b'0', b"ignored source");
+        // GNU's fallback field can end in a partial UTF-8 codepoint.
+        bytes[next] = 0xff;
+        seal(&mut bytes[next..next + BLOCK]);
+        bytes.resize(bytes.len() + BLOCK * 2, 0);
+        let selected = read_tar(&bytes, "p").unwrap();
+        assert_eq!(selected.lock, "the selected lock");
+        assert_eq!(selected.manifest, "the selected manifest");
+    }
+
+    #[test]
+    fn selected_metadata_can_use_gnu_long_names() {
+        let package = "p".repeat(100);
+        let mut bytes = Vec::new();
+        for (name, data) in [("Cargo.lock", "selected lock"), ("Cargo.toml", "selected manifest")] {
+            let full = format!("{package}/{name}\0");
+            gnu_entry(&mut bytes, "././@LongLink", b'L', full.as_bytes());
+            gnu_entry(&mut bytes, "truncated", b'0', data.as_bytes());
+        }
+        bytes.resize(bytes.len() + BLOCK * 2, 0);
+        let selected = read_tar(&bytes, &package).unwrap();
+        assert_eq!(selected.lock, "selected lock");
+        assert_eq!(selected.manifest, "selected manifest");
+    }
+
+    #[test]
+    fn ambiguous_and_malformed_gnu_long_names_are_refused() {
+        for data in [b"no terminator".to_vec(), b"../escape\0".to_vec(),
+            b"/absolute\0".to_vec(), b"p/inner\0hidden\0".to_vec(), format!("{}\0", "x".repeat(4096)).into_bytes()] {
+            let mut bytes = archive();
+            bytes.truncate(bytes.len() - BLOCK * 2);
+            gnu_entry(&mut bytes, "././@LongLink", b'L', &data);
+            gnu_entry(&mut bytes, "fallback", b'0', b"ignored");
+            bytes.resize(bytes.len() + BLOCK * 2, 0);
+            assert!(read_tar(&bytes, "p").is_err());
+        }
+        for (case, has_member) in [("orphaned name", false), ("duplicate metadata", true)] {
+            let mut bytes = archive();
+            bytes.truncate(bytes.len() - BLOCK * 2);
+            gnu_entry(&mut bytes, "././@LongLink", b'L', b"p/Cargo.lock\0");
+            if has_member {
+                gnu_entry(&mut bytes, "fallback", b'0', b"duplicate metadata");
+            }
+            bytes.resize(bytes.len() + BLOCK * 2, 0);
+            assert!(read_tar(&bytes, "p").is_err(), "{case}");
+        }
+        let mut bytes = archive();
+        bytes.truncate(bytes.len() - BLOCK * 2);
+        gnu_entry(&mut bytes, "././@LongLink", b'L', b"p/first\0");
+        gnu_entry(&mut bytes, "././@LongLink", b'L', b"p/second\0");
+        gnu_entry(&mut bytes, "fallback", b'0', b"ignored");
+        bytes.resize(bytes.len() + BLOCK * 2, 0);
+        assert!(read_tar(&bytes, "p").is_err());
     }
 
     #[test]

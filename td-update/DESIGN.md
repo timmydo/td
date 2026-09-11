@@ -90,6 +90,18 @@ retained across builds, so Cargo can reuse unchanged dependency compilation.
 Cargo still decides invalidation for compiler, flags and checkout changes.
 This is a cooperating same-user cache, not a same-UID isolation boundary.
 
+Packaged Cargo sources warm through td-feed's bounded native gzip and tar
+metadata reader, shared with feed consumption. Preparation writes only
+Cargo.lock and Cargo.toml, retains the original source archive for the
+build, and requires no host tar or gzip executable. The package's shipped
+lock still selects preparation; the build separately checks the recipe's
+pinned archive and committed lock before compiling.
+GNU long-name records are bounded to 4096 bytes and apply to exactly one
+following ordinary GNU member. Orphaned or repeated name records, invalid
+paths, duplicate selected metadata, link records and PAX extensions are
+refused. Only the two selected metadata strings become filesystem writes;
+archive paths are never extracted during this preparation.
+
 The new evaluator warms declared fixed-output inputs for `system-x86-64`,
 then invokes `build-run` through the existing sandbox and source-bootstrap
 graph. It receives the exact builder just compiled through

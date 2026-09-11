@@ -105,6 +105,22 @@ fn parse_jobs(text: &str) -> Result<Vec<Job>, String> {
     Ok(jobs)
 }
 
+pub(super) fn prepare_package_metadata(
+    archive: &Path,
+    checksum: &str,
+    package: &str,
+    source: &Path,
+) -> Result<PathBuf, String> {
+    let selected = metadata::read_pinned(archive, checksum, package)?;
+    std::fs::create_dir_all(source).map_err(|e| e.to_string())?;
+    let lock = source.join("Cargo.lock");
+    let manifest = source.join("Cargo.toml");
+    write_atomic(&lock, selected.lock.as_bytes())?;
+    write_atomic(&manifest, selected.manifest.as_bytes())?;
+    detach_from_workspace(&manifest)?;
+    Ok(lock)
+}
+
 pub(super) fn command_text(command: Command, label: &str, limit: u64) -> Result<String, String> {
     command_text_before(
         command,
@@ -343,15 +359,7 @@ fn consume_job(
                 consume_source_pins(std::slice::from_ref(pin), &work, base)?;
                 let package = format!("{name}-{version}");
                 let src = stage.join("src").join(&package);
-                std::fs::create_dir_all(&src).map_err(|e| e.to_string())?;
-                let archive = work.join(&pin.file);
-                let selected = metadata::read_pinned(&archive, &pin.sha256, &package)?;
-                let lock_path = src.join("Cargo.lock");
-                let manifest = src.join("Cargo.toml");
-                write_atomic(&lock_path, selected.lock.as_bytes())?;
-                write_atomic(&manifest, selected.manifest.as_bytes())?;
-                detach_from_workspace(&manifest)?;
-                lock_path
+                prepare_package_metadata(&work.join(&pin.file), &pin.sha256, &package, &src)?
             }
             Source::Archive { .. } => {
                 consume_source_pins(
@@ -796,6 +804,43 @@ mod tests {
         std::os::unix::fs::symlink(&current, &previous).unwrap();
         assert!(recover(&current, &stage, &previous).is_err());
         assert_eq!(std::fs::read(current.join("value")).unwrap(), b"complete");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn package_preparation_materializes_only_metadata_and_retains_the_archive() {
+        let dir = scratch("metadata-only");
+        let package = "fixture-1.0.0";
+        let source = dir.join("src").join(package);
+        let archive = dir.join("work/fixture-1.0.0.crate");
+        std::fs::create_dir_all(archive.parent().unwrap()).unwrap();
+        let lock = lock_text(b"dependency");
+        let mut tar = Vec::new();
+        for (name, bytes) in [
+            ("Cargo.lock", lock.as_bytes()),
+            ("Cargo.toml", b"[package]\nname = \"fixture\"\nversion = \"1.0.0\"\n".as_slice()),
+            ("unselected-source", b"do not materialize".as_slice()),
+        ] {
+            let start = tar.len();
+            metadata::tests::entry(&mut tar, &format!("{package}/{name}"), b'0', bytes);
+            let header = &mut tar[start..start + 512];
+            header[100..108].copy_from_slice(b"0000644\0");
+            header[148..156].fill(b' ');
+            let sum: u64 = header.iter().map(|byte| u64::from(*byte)).sum();
+            header[148..156].copy_from_slice(format!("{sum:06o}\0 ").as_bytes());
+        }
+        tar.resize(tar.len() + 1024, 0);
+        let original = metadata::tests::gzip(&tar);
+        std::fs::write(&archive, &original).unwrap();
+        let checksum = hex_sha256(&original);
+        let selected = prepare_package_metadata(&archive, &checksum, package, &source).unwrap();
+        assert_eq!(std::fs::read_to_string(selected).unwrap(), lock);
+        assert_eq!(std::fs::read(&archive).unwrap(), original);
+        assert!(!source.join("unselected-source").exists());
+        assert!(std::fs::read_to_string(source.join("Cargo.toml")).unwrap().contains("[workspace]"));
+        let refused = dir.join("refused");
+        assert!(prepare_package_metadata(&archive, &"0".repeat(64), package, &refused).is_err());
+        assert!(!refused.exists());
         std::fs::remove_dir_all(dir).unwrap();
     }
 
