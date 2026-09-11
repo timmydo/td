@@ -225,6 +225,28 @@ static int require_status(void) {
     return 0;
 }
 
+static int prove_i386_boundary(int confined) {
+    pid_t child = fork();
+    int status;
+    if (child < 0)
+        return fail("fork i386 ABI probe");
+    if (child == 0) {
+        /* i386 exit(0): no pointers cross the compatibility boundary. */
+        long number = 1;
+        __asm__ volatile ("int $0x80" : "+a"(number) : "b"(0) : "memory", "cc");
+        _exit(1);
+    }
+    if (waitpid(child, &status, 0) != child)
+        return fail("wait for i386 ABI probe");
+    if (confined) {
+        if (!WIFSIGNALED(status) || WTERMSIG(status) != SIGSYS)
+            return fail("i386 syscall was not killed with SIGSYS");
+    } else if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        return fail("kernel cannot execute the source bootstrap i386 ABI");
+    }
+    return 0;
+}
+
 static int expect_x32_kill(void) {
     pid_t child = fork();
     int status;
@@ -393,6 +415,8 @@ int main(int argc, char **argv) {
     }
     if (initial_seccomp != 0)
         return fail("initial seccomp state prevented an isolated policy probe");
+    if (prove_i386_boundary(0) != 0)
+        return 1;
     if (prove_nnp_is_required(&program, initial_nnp,
                               allow_inherited_confinement) != 0)
         return 1;
@@ -418,7 +442,7 @@ int main(int argc, char **argv) {
     if (fd < 0)
         return fail("allowed AF_UNIX socket");
     close(fd);
-    if (prove_denied_calls() != 0)
+    if (prove_denied_calls() != 0 || prove_i386_boundary(1) != 0)
         return 1;
 
     puts(TD_PROBE_MARKER);
@@ -472,6 +496,21 @@ mod tests {
         assert_eq!(denied.matches("SYS_ioctl").count(), 3);
         assert_eq!(denied.matches("expect_errno(").count(), 16);
         assert_eq!(denied.matches("return expect_x32_kill();").count(), 1);
+    }
+
+    #[test]
+    fn standalone_probe_requires_i386_execution_before_filter_and_kill_after() {
+        let source = source();
+        let main = source.split("int main(int argc").nth(1).unwrap();
+        let before = main.find("prove_i386_boundary(0)").unwrap();
+        let install = main.find("syscall(SYS_seccomp, SECCOMP_SET_MODE_FILTER, 0").unwrap();
+        let after = main.find("prove_i386_boundary(1)").unwrap();
+        assert!(before < install && install < after);
+        assert!(source.contains("WIFEXITED(status) || WEXITSTATUS(status) != 0"));
+        assert!(source.contains("WIFSIGNALED(status) || WTERMSIG(status) != SIGSYS"));
+        let inherited = source.split("if (argc >= 3").nth(1).unwrap()
+            .split("if (argc == 3").next().unwrap();
+        assert!(!inherited.contains("prove_i386_boundary"));
     }
 
     #[test]

@@ -584,6 +584,7 @@ pub fn recipe() -> Recipe {
                   /^#? *CONFIG_NET_NS[ =]/d; \
                   /^#? *CONFIG_AUDIT[ =]/d; \
                   /^#? *CONFIG_IA32_EMULATION[ =]/d; \
+                  /^#? *CONFIG_IA32_EMULATION_DEFAULT_DISABLED[ =]/d; \
                   /^#? *CONFIG_X86_X32_ABI[ =]/d; \
                   /^#? *CONFIG_SECCOMP[ =]/d; \
                   /^#? *CONFIG_INOTIFY_USER[ =]/d; \
@@ -699,7 +700,8 @@ pub fn recipe() -> Recipe {
                    'CONFIG_UTS_NS=y' \
                    'CONFIG_NET_NS=y' \
                    'CONFIG_AUDIT=y' \
-                   '# CONFIG_IA32_EMULATION is not set' \
+                   'CONFIG_IA32_EMULATION=y' \
+                   '# CONFIG_IA32_EMULATION_DEFAULT_DISABLED is not set' \
                    '# CONFIG_X86_X32_ABI is not set' \
                    'CONFIG_SECCOMP=y' \
                    'CONFIG_INOTIFY_USER=y' \
@@ -811,7 +813,8 @@ pub fn recipe() -> Recipe {
                  grep -q '^CONFIG_NET_NS=y' .config || { echo 'NET_NS off — a jail without shared=network could not be cut off from the network stack' >&2; exit 1; }; \
                  grep -q '^CONFIG_AUDIT=y' .config || { echo 'AUDIT off — the physical Firefox proof cannot account for outer seccomp denials' >&2; exit 1; }; \
                  grep -q '^CONFIG_AUDITSYSCALL=y' .config || { echo 'AUDITSYSCALL off — x86 seccomp audit records cannot carry syscall identity' >&2; exit 1; }; \
-                 grep -q '^# CONFIG_IA32_EMULATION is not set$' .config || { echo 'IA32_EMULATION on — the Firefox audit proof has no i386 syscall roster' >&2; exit 1; }; \
+                 grep -q '^CONFIG_IA32_EMULATION=y$' .config || { echo 'IA32_EMULATION off — the source bootstrap cannot execute its i386 Mes and GNU ladder' >&2; exit 1; }; \
+                 grep -q '^# CONFIG_IA32_EMULATION_DEFAULT_DISABLED is not set$' .config || { echo 'IA32 emulation disabled at boot — the source bootstrap needs compatibility execution' >&2; exit 1; }; \
                  grep -q '^# CONFIG_X86_X32_ABI is not set$' .config || { echo 'X86_X32_ABI on — x32 calls could reach an unmodelled compatibility ABI instead of the deliberate kill probe' >&2; exit 1; }; \
                  grep -q '^CONFIG_SECCOMP=y' .config || { echo 'SECCOMP off — seccomp(2) returns ENOSYS, so td-jail ships namespaces with no syscall filter' >&2; exit 1; }; \
                  grep -q '^CONFIG_SECCOMP_FILTER=y' .config || { echo 'SECCOMP_FILTER off — no BPF syscall filtering. It is unprompted (def_bool y on HAVE_ARCH_SECCOMP_FILTER && SECCOMP && NET), so it cannot be pinned: something took SECCOMP or NET away' >&2; exit 1; }; \
@@ -1147,8 +1150,11 @@ mod tests {
             "grep -q '^CONFIG_AUDIT=y' .config",
             "grep -q '^CONFIG_AUDITSYSCALL=y' .config",
             "/^#? *CONFIG_IA32_EMULATION[ =]/d",
-            "# CONFIG_IA32_EMULATION is not set",
-            "grep -q '^# CONFIG_IA32_EMULATION is not set$' .config",
+            "CONFIG_IA32_EMULATION=y",
+            "grep -q '^CONFIG_IA32_EMULATION=y$' .config",
+            "/^#? *CONFIG_IA32_EMULATION_DEFAULT_DISABLED[ =]/d",
+            "# CONFIG_IA32_EMULATION_DEFAULT_DISABLED is not set",
+            "grep -q '^# CONFIG_IA32_EMULATION_DEFAULT_DISABLED is not set$' .config",
             "/^#? *CONFIG_X86_X32_ABI[ =]/d",
             "# CONFIG_X86_X32_ABI is not set",
             "grep -q '^# CONFIG_X86_X32_ABI is not set$' .config",

@@ -3389,9 +3389,16 @@ two ioctls the truncation *is* the point.
    rejects audit loss/suppression anywhere in the bounded snapshot, including
    a direct loss notice printed before the asynchronously queued begin record,
    plus malformed records, a uid other than 1000, and every syscall/action
-   class outside the compiled deny roster. The target kernel pins both i386
-   emulation and the x32 ABI off, so a compatibility-ABI record is impossible
-   and is refused rather than interpreted against an incomplete roster. Linux omits
+   class outside the compiled deny roster. The target kernel enables i386
+   execution for the source bootstrap's Mes and GNU ladder; x32 stays off.
+   The unchanged outer filter kills a non-x86-64 audit architecture before
+   examining syscall numbers. The standalone kernel probe requires i386
+   exit(0) to work before filtering and to die with SIGSYS afterward.
+   Its exact root-owned executable's i386-exit kill, like its x32-write kill,
+   is excluded from Firefox evidence only with the fixed human UID, distinct
+   child PID, exact ABI, syscall, signal and action. Firefox's own
+   compatibility-ABI records remain refused rather than interpreted against
+   an incomplete syscall roster. Linux omits
    `SECCOMP_RET_DATA` from the audit action, so the C helper proves each exact
    returned errno while this parser proves the logged action class. All 17
    expected records must appear, including three records for ioctl and the x32
@@ -7143,12 +7150,12 @@ and image commits — showing:
     `TD-FIREFOX-SECCOMP-OK probes=17` result described there. This proves the
     probes are blocked in the real outer application process and that every
     audited non-allow decision during the workload belongs to the compiled
-    roster. The concurrent standalone boot-health probe's one x32 kill is
-    recognized only by its human UID 1000, distinct positive PID, fixed
-    root-owned `/run/td-jail-seccomp-probe/probe` executable, x86-64 ABI and
-    exact syscall/action/signal. It contributes no Firefox probe evidence;
-    every other record still requires the assigned external Firefox UID.
-    Missing Firefox probes cannot be replaced by this standalone record. An earlier wording asked for "zero EPERMs for syscalls outside the
+    roster. The concurrent standalone boot-health probe's x32-write and
+    i386-exit kills are excluded only under the exact identity, ABI, syscall,
+    signal and action requirements in §C. They contribute no Firefox probe
+    evidence; every other record still requires the assigned external
+    Firefox UID. Missing Firefox probes cannot be replaced by these
+    standalone records. An earlier wording asked for "zero EPERMs for syscalls outside the
     roster", which is vacuous: a deny list permits those calls. A false hit is
     instead a call wrongly placed *inside* the roster; audit cannot distinguish
     that policy mistake from an intended denial. Firefox completing the real

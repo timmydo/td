@@ -1617,7 +1617,15 @@ Its test interpreter executes the exact
 array over every rostered syscall and the argument-sensitive rules. A separate
 td-GCC-built, non-shipped C probe recipe consumes a bounded serialized copy and
 checks the real kernel's errno and kill behavior on an unconstrained build host
-and in the QEMU target fixture. QEMU builds that helper directly, so host-policy
+and in the QEMU target fixture. Its standalone mode additionally forks an
+unconfined i386 exit(0) through int 0x80, requiring normal exit, then repeats
+that pointer-free call after installing the filter and requires SIGSYS.
+The kernel enables this ABI for source-bootstrap execution; the filter
+still kills every non-x86-64 architecture before decoding syscall numbers.
+Only that exact standalone helper's i386-exit kill joins its existing x32
+kill as excluded concurrent activity in the Firefox audit parser. It never
+counts toward Firefox's unchanged 17-probe evidence set.
+QEMU builds that helper directly, so host-policy
 smoke tests cannot prevent the target oracle from booting. A host with no
 filter but inherited no-new-privileges
 may skip the impossible pre-install negative leg. One with an inherited filter

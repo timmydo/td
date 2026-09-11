@@ -129,6 +129,12 @@ active staging. Only a successful producer and synced temporary archive
 can be renamed into the source cache. The target seed check remains the
 authority for admitting the resulting data into the bootstrap graph.
 
+The running kernel must support i386 execution: the source bootstrap builds
+32-bit Mes and an early GNU toolchain before reaching native x86-64 tools.
+The standard kernel enables that ABI. Application confinement still kills
+non-x86-64 syscall architectures, with the independent target probe checking
+both unconfined compatibility execution and confined rejection.
+
 The new evaluator warms declared fixed-output inputs for `system-x86-64`,
 then invokes `build-run` through the existing sandbox and source-bootstrap
 graph. It receives the exact builder just compiled through

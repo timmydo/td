@@ -4,6 +4,7 @@ use crate::sys::{self, SockFilter};
 use std::io::{self, Write};
 
 pub(crate) const AUDIT_ARCH_X86_64: u32 = 0xc000_003e;
+const AUDIT_ARCH_I386: u32 = 0x4000_0003;
 pub(crate) const SECCOMP_RET_KILL_PROCESS: u32 = 0x8000_0000;
 pub(crate) const SECCOMP_RET_ALLOW: u32 = 0x7fff_0000;
 const SECCOMP_RET_ERRNO: u32 = 0x0005_0000;
@@ -427,13 +428,13 @@ pub(crate) fn verify_firefox_audit(log: &str, firefox_pid: u32, firefox_uid: u32
         let signal = parse_decimal_field(line, "sig")?;
         let code = parse_hex_field(line, "code")?;
         // The independent boot-health probe runs concurrently under the human
-        // UID. Its fixed root-owned executable's x32 kill is not Firefox data.
+        // UID. Its fixed root-owned executable's ABI kills are not Firefox data.
         if uid == 1000
             && pid != 0
             && pid != firefox_pid
-            && arch == AUDIT_ARCH_X86_64
-            && compat == 0
-            && syscall == X32_SYSCALL_BIT | 1
+            && ((arch == AUDIT_ARCH_X86_64 && compat == 0
+                && syscall == X32_SYSCALL_BIT | 1)
+                || (arch == AUDIT_ARCH_I386 && compat == 1 && syscall == 1))
             && signal == 31
             && code == SECCOMP_RET_KILL_PROCESS
             && audit_field(line, "exe")? == "\"/run/td-jail-seccomp-probe/probe\""
@@ -952,6 +953,33 @@ mod tests {
             standalone.replace("0x80000000", "0x50000"),
         ] {
             assert!(verify_firefox_audit(&before_end(complete_audit(), &bad)).is_err());
+        }
+    }
+
+    #[test]
+    fn firefox_audit_excludes_only_the_exact_standalone_i386_exit_kill() {
+        let standalone = audit_line_for_pid(1000, FIREFOX_PID + 200,
+            1, SECCOMP_RET_KILL_PROCESS, 31,
+            "/run/td-jail-seccomp-probe/probe")
+            .replace("arch=c000003e", "arch=40000003")
+            .replace("compat=0", "compat=1");
+        assert_eq!(verify_firefox_audit(&before_end(complete_audit(), &standalone)).unwrap(), 18);
+        let missing = complete_audit().replace(
+            &audit_line(65536, X32_SYSCALL_BIT | 1, SECCOMP_RET_KILL_PROCESS, 31, FIREFOX_PROBE_PATH), "");
+        assert!(verify_firefox_audit(&before_end(missing, &standalone)).is_err());
+        for bad in [
+            standalone.replace("uid=1000", "uid=65536"),
+            standalone.replace("uid=1000", "uid=0"),
+            standalone.replace(&format!("pid={}", FIREFOX_PID + 200), "pid=0"),
+            standalone.replace(&format!("pid={}", FIREFOX_PID + 200), &format!("pid={FIREFOX_PID}")),
+            standalone.replace("/run/td-jail-seccomp-probe/probe", FIREFOX_PROBE_PATH),
+            standalone.replace("sig=31", "sig=0"),
+            standalone.replace("syscall=1 ", "syscall=2 "),
+            standalone.replace("compat=1", "compat=0"),
+            standalone.replace("arch=40000003", "arch=c000003e"),
+            standalone.replace("0x80000000", "0x50000"),
+        ] {
+            assert!(verify_firefox_audit(&before_end(complete_audit(), &bad)).is_err(), "{bad}");
         }
     }
 

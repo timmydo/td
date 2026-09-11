@@ -32,7 +32,10 @@ save review work: the commit is the review and checkpoint unit.
 ## Host kernel
 
 The builder requires Linux 5.12 or newer with `mount_setattr` available to
-its namespace sandbox. Read-only binds add restrictions without clearing
+its namespace sandbox. The source-bootstrap ladder also executes i386 Mes
+and GNU intermediates, so x86-64 build hosts and installed td kernels need
+`CONFIG_IA32_EMULATION=y` with compatibility execution enabled at boot;
+x32 is not required. Read-only binds add restrictions without clearing
 locked source flags; td's writable `/var` is mounted nosuid,nodev. A blocked
 operation is a sandbox setup failure, with no writable-bind fallback. The
 value-pinned syscall boundary is recorded in `UNSAFE.md`.
