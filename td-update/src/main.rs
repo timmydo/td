@@ -337,6 +337,7 @@ fn build_with_tools(root: &Path, home: &Path, cargo: &Path, feed: &Path) -> Resu
         }
     }
     let target = root.join(".td-build-cache/update-tools");
+    eprintln!("td-update: preparing build tools from this checkout");
     success(
         command(cargo, root, home)
             .args([
@@ -360,6 +361,7 @@ fn build_with_tools(root: &Path, home: &Path, cargo: &Path, feed: &Path) -> Resu
     )?;
     let bin = target.join(TARGET).join("release");
     // The new fetch tool needs its locked sources before it can warm the graph.
+    eprintln!("td-update: fetching build-tool dependencies");
     success(
         command(feed, root, home)
             .args(["warm", "crate-local", "net", "td-net"])
@@ -367,12 +369,14 @@ fn build_with_tools(root: &Path, home: &Path, cargo: &Path, feed: &Path) -> Resu
             .env("TD_BUILDER_SELF", bin.join("td-builder")),
         "fetch native td-net dependencies",
     )?;
+    eprintln!("td-update: preparing system sources and the fetch tool");
     success(
         command(&bin.join("td-recipe-eval"), root, home)
             .args(["warm", "system-x86-64"])
             .env("TD_BUILDER_SELF", bin.join("td-builder")),
         "warm system",
     )?;
+    eprintln!("td-update: building the system image");
     let mut child = io(command(&bin.join("td-recipe-eval"), root, home)
         .args(["build-run", "system-x86-64"])
         .env("TD_BUILDER_SELF", bin.join("td-builder"))
@@ -422,6 +426,7 @@ fn install(root: &Path, home: &Path) -> Result<()> {
     io(manifest.take(4097).read_to_end(&mut bytes), "read built manifest")?;
     if bytes.len() > 4096 { return Err("built manifest grew while reading".into()); }
     let deployment = sha256::hex_digest(&bytes);
+    eprintln!("td-update: requesting installation of {deployment}");
     success(command(Path::new("/bin/td-authd"), root, home)
         .arg("request-update").arg(source).arg(deployment), "request system installation")
 }

@@ -85,6 +85,11 @@ the result. The evaluator's successful build must emit a complete bounded
 `TD_RECIPE_RUN_OUT system-x86-64` receipt with an absolute output path;
 logs stream to the terminal with a 64 KiB line ceiling. Missing or malformed
 receipts, duplicate receipts and a failed process refuse installation.
+Before each build phase, the updater names the work beginning on stderr:
+checkout tools, their dependencies, system-source preparation (including
+the fetch helper), and image construction. It names the deployment when
+requesting installation. These messages report phase entry, not completion
+or an estimate; the child process output and exit status remain authoritative.
 
 The default command and explicit `install` take that output's deployment,
 hash its bounded regular manifest and invoke only installed
