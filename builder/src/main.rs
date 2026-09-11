@@ -45,6 +45,7 @@ mod gate_timing;
 mod gates;
 use td_engine::gzip;
 mod host_bin;
+mod kernel_headers;
 mod lock;
 mod mes_boot;
 mod nar;
@@ -8548,6 +8549,13 @@ fn main() -> ExitCode {
         // toolchain-recipe <name> — build a /td/store toolchain rung as a structured Rust
         // recipe (see toolchain_x86_64.rs).
         Some("toolchain-recipe") => toolchain_x86_64::cli(&args),
+        Some("kernel-headers") => match kernel_headers::run_cli(args.get(2..).unwrap_or(&[])) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("td-builder: kernel-headers: {error}");
+                ExitCode::FAILURE
+            }
+        },
         Some("nar-hash") if args.len() == 3 => match nar_hash(&args[2]) {
             Ok(h) => {
                 println!("{h}");

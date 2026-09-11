@@ -102,6 +102,33 @@ paths, duplicate selected metadata, link records and PAX extensions are
 refused. Only the two selected metadata strings become filesystem writes;
 archive paths are never extracted during this preparation.
 
+Linux UAPI preparation uses `td-builder kernel-headers` with the recipe's
+source path and SHA-256, x86 architecture, and a new private work directory.
+Both accepted architectures emit identical headers under this pinned x86
+policy; other architectures are refused. It supports Linux 4.14.67,
+checking the eight upstream selection and transformation scripts before
+proceeding. Rust handles xz/tar
+extraction, header selection, syscall constants, textual sanitization and
+canonical uncompressed GNU tar output. The installed C compiler builds the
+pinned source's `unifdef.c` as a temporary control-plane helper. `HOSTCC`
+selects one executable, defaulting to `gcc`; it is never parsed as a shell
+command or split into arguments. The helper and its compiler never become
+target recipe inputs through this operation.
+No make, shell, sed, tar or xz executable participates in header preparation.
+The generated i386 and x86_64 archives retain their existing seed digests.
+A future selection-policy change requires updating this implementation.
+
+The input archive is bounded to 512 MiB and verified before extraction;
+the existing archive reader also bounds expanded bytes and entries.
+Header traversal allows 32 levels, 2048 files, 2 MiB per header and 64 MiB
+of header content. Output fixes order, permissions, timestamps, owners and
+block padding independently of the working directory and umask. The source
+cache's shared header lease travels on stdin through the builder, compiler
+and sanitizer, so orphaned producers keep crash recovery from removing
+active staging. Only a successful producer and synced temporary archive
+can be renamed into the source cache. The target seed check remains the
+authority for admitting the resulting data into the bootstrap graph.
+
 The new evaluator warms declared fixed-output inputs for `system-x86-64`,
 then invokes `build-run` through the existing sandbox and source-bootstrap
 graph. It receives the exact builder just compiled through

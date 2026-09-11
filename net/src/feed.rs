@@ -1492,20 +1492,6 @@ fn repo_root() -> PathBuf {
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
 }
 
-/// Is `cmd` an executable on PATH? (best-effort `command -v` equivalent).
-fn have_cmd(cmd: &str) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    let Ok(path) = std::env::var("PATH") else {
-        return false;
-    };
-    path.split(':').filter(|d| !d.is_empty()).any(|dir| {
-        let p = Path::new(dir).join(cmd);
-        std::fs::metadata(&p)
-            .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
-            .unwrap_or(false)
-    })
-}
-
 fn is_executable_file(path: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
     std::fs::metadata(path)
@@ -1612,15 +1598,6 @@ fn read_marker(path: &Path) -> Option<String> {
         return None;
     }
     std::fs::read_to_string(path).ok()
-}
-
-/// Run `cmd` with stdio discarded; true on a zero exit (best-effort, never panics).
-fn run_quiet(cmd: &mut Command) -> bool {
-    cmd.stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
 }
 
 /// Start the cargo-proxy on an OS-picked loopback port IN THIS PROCESS; returns its
@@ -2431,14 +2408,7 @@ fn recipe_eval_path_from_output(root: &Path, text: &str) -> Result<PathBuf, Stri
     }
 }
 
-fn recipe_eval_tool(root: &Path) -> Result<PathBuf, String> {
-    let script = root.join("tests/recipe-eval-tool.sh");
-    if !script.is_file() {
-        return Err(format!(
-            "no tests/recipe-eval-tool.sh under {} to resolve recipe source pins",
-            root.display()
-        ));
-    }
+fn control_builder(root: &Path) -> Result<PathBuf, String> {
     let builder = match std::env::var_os("TD_BUILDER_SELF").filter(|value| !value.is_empty()) {
         Some(path) => PathBuf::from(path),
         None => {
@@ -2449,10 +2419,22 @@ fn recipe_eval_tool(root: &Path) -> Result<PathBuf, String> {
                 std::env::var_os("PATH").and_then(|paths| {
                     std::env::split_paths(&paths).map(|dir| dir.join("td-builder"))
                         .find(|path| is_executable_file(path))
-                }).ok_or("source pin resolution requires td-builder; build it with cargo build --release --manifest-path builder/Cargo.toml or install it on PATH")?
+                }).ok_or("source preparation requires td-builder; build it with cargo build --release --manifest-path builder/Cargo.toml or install it on PATH")?
             }
         }
     };
+    Ok(builder)
+}
+
+fn recipe_eval_tool(root: &Path) -> Result<PathBuf, String> {
+    let script = root.join("tests/recipe-eval-tool.sh");
+    if !script.is_file() {
+        return Err(format!(
+            "no tests/recipe-eval-tool.sh under {} to resolve recipe source pins",
+            root.display()
+        ));
+    }
+    let builder = control_builder(root)?;
     let out = Command::new("sh")
         .env("TD_BUILDER_SELF", builder)
         .arg(&script)
@@ -2824,8 +2806,8 @@ fn consume_sources(root: &Path) -> Result<(), String> {
     let base = configured_consumer_feed_base()?;
     let pins = recipe_source_pins_result(root)?;
     consume_source_pins(&pins, &sources_dir(), &base)?;
-    warm_kernel_headers_from_pins("i386", &pins);
-    warm_kernel_headers_from_pins("x86_64", &pins);
+    warm_kernel_headers_from_pins(root, "i386", &pins);
+    warm_kernel_headers_from_pins(root, "x86_64", &pins);
     Ok(())
 }
 
@@ -2893,179 +2875,33 @@ fn warm_sources(root: &Path) -> Result<(), String> {
 
     // Derived inputs: the sanitized Linux UAPI headers for the glibc rungs, produced FROM the
     // pinned linux source (the sandbox can't run the kernel build). Both lanes, best-effort.
-    warm_kernel_headers_from_pins("i386", &pins);
-    warm_kernel_headers_from_pins("x86_64", &pins);
+    warm_kernel_headers_from_pins(root, "i386", &pins);
+    warm_kernel_headers_from_pins(root, "x86_64", &pins);
     Ok(())
 }
 
 /// `LINUX_VERSION_CODE` for a `maj.min.sub` version (e.g. 4.14.67 -> 265795).
-fn linux_version_code(ver: &str) -> u64 {
-    let mut it = ver.split('.').map(|p| p.parse::<u64>().unwrap_or(0));
-    let maj = it.next().unwrap_or(0);
-    let min = it.next().unwrap_or(0);
-    let sub = it.next().unwrap_or(0);
-    maj * 65536 + min * 256 + sub
-}
-
-/// The hand-written `linux/version.h` body (`headers_install` does NOT emit it, but glibc's
-/// configure checks LINUX_VERSION_CODE >= 2.0.10, else "kernel header files TOO OLD!").
-fn version_h(code: u64) -> String {
-    format!("#define LINUX_VERSION_CODE {code}\n#define KERNEL_VERSION(a,b,c) (((a) << 16) + ((b) << 8) + (c))\n")
-}
-
-/// `linux-<ver>.tar.<ext>` -> `<ver>`.
 fn linux_ver_from_file(file: &str) -> Option<String> {
     let s = file.strip_prefix("linux-")?;
     let i = s.find(".tar.")?;
     Some(s[..i].to_string())
 }
 
-/// `xz -dc src | tar -xf - -C dest --strip-components=1` (don't rely on tar's xz support).
-fn extract_xz_tar(src: &Path, dest: &Path) -> bool {
-    let mut xz = match Command::new("xz")
-        .arg("-dc")
-        .arg(src)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-    {
-        Ok(c) => c,
-        Err(_) => return false,
-    };
-    let Some(xzout) = xz.stdout.take() else {
-        return false;
-    };
-    let tar_ok = Command::new("tar")
-        .arg("-xf")
-        .arg("-")
-        .arg("-C")
-        .arg(dest)
-        .arg("--strip-components=1")
-        // Scrub the ambient TAR_OPTIONS: GNU tar prepends it, and e.g. `TAR_OPTIONS=-z`
-        // would make this xz-piped `-xf` try to gunzip an already-decompressed stream and
-        // fail, aborting the whole host-free warm on such a host. Removing it keeps the
-        // extraction (and therefore the warm) host-env-independent, like the pack step.
-        .env_remove("TAR_OPTIONS")
-        .stdin(Stdio::from(xzout))
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
-    let xz_ok = xz.wait().map(|s| s.success()).unwrap_or(false);
-    tar_ok && xz_ok
-}
-
-/// True for a Kbuild byproduct — an install marker (`.install`) or a command
-/// record (`*.cmd`, e.g. `..install.cmd`). Never true for a real UAPI header (no
-/// header is named `.install` or ends in `.cmd`).
-fn is_kbuild_byproduct(p: &Path) -> bool {
-    match p.file_name().and_then(|n| n.to_str()) {
-        Some(name) => name == ".install" || name.ends_with(".cmd"),
-        None => false,
-    }
-}
-
-/// Recursively delete the Kbuild byproducts `make headers_install` scatters
-/// through the header tree (per-dir `.install` markers and `..install.cmd`
-/// command records). They are NOT UAPI headers: each `..install.cmd` embeds the
-/// absolute build path — a PID-bearing temp dir AND the host `sh` store path — so
-/// leaving them in the packed seed makes its digest non-reproducible both
-/// run-to-run (the PID) and across hosts (the store path), defeating the entire
-/// point of a host-free seed. Only the sanitized `*.h` headers (plus the
-/// generated version.h) are real, host-free content. Fails closed (Err) so an
-/// un-removable byproduct aborts the warm rather than blessing an unstable
-/// tarball.
-fn strip_kbuild_byproducts(dir: &Path) -> std::io::Result<()> {
-    for entry in std::fs::read_dir(dir)? {
-        let entry = entry?;
-        let p = entry.path();
-        if entry.file_type()?.is_dir() {
-            strip_kbuild_byproducts(&p)?;
-        } else if is_kbuild_byproduct(&p) {
-            std::fs::remove_file(&p)?;
-        }
-    }
-    Ok(())
-}
-
-/// Force fixed permission bits across the header tree — directories 0755, regular
-/// files 0644 — so the packed seed is a pure function of the header CONTENT and does
-/// NOT depend on the warming host's umask. `make headers_install` creates its dirs
-/// (`mkdir -p`) and files (shell redirection), and the generated `version.h` write,
-/// all honor the ambient umask: 0022 yields 0755/0644 but 0077 yields 0700/0600, and
-/// `tar` records those mode bits — so without this the SAME header bytes would hash to
-/// a DIFFERENT seed digest on a host with a different umask (re #469). Every UAPI
-/// header is non-executable text, so 0644 (files) / 0755 (dirs) is the canonical set.
-/// Symlinks (if any) are skipped: `file_type()` does not follow them and their mode is
-/// not meaningful to tar. Fails closed (Err) so an un-chmod-able entry aborts the warm
-/// rather than blessing a umask-dependent tarball.
-fn normalize_header_modes(dir: &Path) -> std::io::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755))?;
-    for entry in std::fs::read_dir(dir)? {
-        let entry = entry?;
-        let p = entry.path();
-        let ft = entry.file_type()?;
-        if ft.is_dir() {
-            normalize_header_modes(&p)?;
-        } else if ft.is_file() {
-            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o644))?;
-        }
-    }
-    Ok(())
-}
-
-/// Reproducible, UNCOMPRESSED tar flags for the generated kernel-headers seed.
-/// The committed digest in seed/seed-digests.txt binds the packed bytes, so they
-/// must be a host-free function of the header content: `--sort=name` +
-/// `--mtime=@0` + zeroed numeric owner + GNU format fix the layout, and `-cf`
-/// (NOT `-czf`) keeps out the gzip layer, whose DEFLATE stream varies by zlib
-/// version and would re-key the digest per host (re #469).
-const KERNEL_HEADERS_TAR_FLAGS: &[&str] = &[
-    "--format=gnu",
-    "--sort=name",
-    "--mtime=@0",
-    "--owner=0",
-    "--group=0",
-    "--numeric-owner",
-    "-cf",
-];
-
-/// Build the `tar` command that packs the normalized, uncompressed kernel-headers
-/// seed (`KERNEL_HEADERS_TAR_FLAGS` into `out`, from the tree at `include_dir`).
-/// `TAR_OPTIONS` is scrubbed from the child environment: GNU tar reads that variable
-/// and PREPENDS its contents to every invocation, so an ambient `TAR_OPTIONS=-z`
-/// (silently re-adds gzip) or `--blocking-factor=N` (changes archive padding) on the
-/// warming host would re-key the seed digest despite the fixed flags above (re #469).
-/// `LC_ALL=C` pins byte-order sorting/formatting so a host locale cannot reorder or
-/// reformat the archive either.
-fn kernel_headers_pack_command(out: &Path, include_dir: &Path) -> Command {
-    let mut c = Command::new("tar");
-    c.args(KERNEL_HEADERS_TAR_FLAGS)
-        .arg(out)
-        .arg("-C")
-        .arg(include_dir)
-        .arg(".")
-        .env_remove("TAR_OPTIONS")
-        .env("LC_ALL", "C");
-    c
-}
-
-/// warm kernel-headers ARCH — produce the sanitized Linux UAPI headers for `ARCH` (i386 /
-/// x86_64) FROM the pinned linux source via `make headers_install`, into the shared sources
-/// cache as `linux-headers-<ver>-<ARCH>.tar` (+ a hand-written version.h). guix ships a
-/// prebuilt header BLOB; td produces the same headers FROM canonical source.
+/// Prepare the pinned x86 UAPI seed through the native control-plane builder.
 fn warm_kernel_headers(root: &Path, arch: &str) {
     match recipe_source_pins_result(root) {
-        Ok(pins) => warm_kernel_headers_from_pins(arch, &pins),
+        Ok(pins) => warm_kernel_headers_from_pins(root, arch, &pins),
         Err(e) => eprintln!(
             ">> td-feed warm kernel-headers ({arch}): cannot read recipe source pins: {e}"
         ),
     }
 }
 
-fn warm_kernel_headers_from_pins(arch: &str, pins: &[SourcePin]) {
+fn warm_kernel_headers_from_pins(root: &Path, arch: &str, pins: &[SourcePin]) {
+    prepare_kernel_headers(root, arch, pins, &sources_dir());
+}
+
+fn prepare_kernel_headers(root: &Path, arch: &str, pins: &[SourcePin], cache: &Path) {
     static NEXT_KERNEL_HEADERS: AtomicU64 = AtomicU64::new(0);
     let Some(pin) = pins.iter().find(|pin| pin.key == "linux-source") else {
         return;
@@ -3077,25 +2913,24 @@ fn warm_kernel_headers_from_pins(arch: &str, pins: &[SourcePin]) {
         );
         return;
     };
-    let cache = sources_dir();
     let src = cache.join(file);
     let out = cache.join(format!("linux-headers-{ver}-{arch}.tar"));
-    if let Err(e) = std::fs::create_dir_all(&cache) {
+    if let Err(e) = std::fs::create_dir_all(cache) {
         eprintln!(
             ">> td-feed warm kernel-headers ({arch}): cannot create {} ({e}) — skipping",
             cache.display()
         );
         return;
     }
-    if let Err(e) = require_disk_backed(&cache) {
+    if let Err(e) = require_disk_backed(cache) {
         eprintln!(
             ">> td-feed warm kernel-headers ({arch}): shared scratch is not disk-backed ({e}) — skipping"
         );
         return;
     }
     // One shared lock covers output publication and crash recovery for both
-    // architectures. A killed hosted check releases it; the next warm then
-    // removes every named partial before extracting another large Linux tree.
+    // architectures. The producer inherits this lease, so recovery waits for
+    // its descendants before removing abandoned staging.
     let lock_path = cache.join(".td-feed-kernel-headers.lock");
     let lock = match OpenOptions::new()
         .create(true)
@@ -3120,7 +2955,7 @@ fn warm_kernel_headers_from_pins(arch: &str, pins: &[SourcePin]) {
         );
         return;
     }
-    sweep_kernel_header_temps(&cache);
+    sweep_kernel_header_temps(cache);
     if out.exists() {
         return;
     }
@@ -3128,56 +2963,19 @@ fn warm_kernel_headers_from_pins(arch: &str, pins: &[SourcePin]) {
         eprintln!(">> td-feed warm kernel-headers ({arch}): linux source not warm ({}) — skipping (PREP best-effort)", src.display());
         return;
     }
-    if !(have_cmd("make") && have_cmd("gcc") && have_cmd("xz")) {
-        eprintln!(">> td-feed warm kernel-headers ({arch}): need host make+gcc+xz to produce headers — skipping (best-effort)");
-        return;
-    }
+    let builder = match control_builder(root) {
+        Ok(builder) => builder,
+        Err(error) => {
+            eprintln!(">> td-feed warm kernel-headers ({arch}): {error}");
+            return;
+        }
+    };
     let nonce = NEXT_KERNEL_HEADERS.fetch_add(1, Ordering::Relaxed);
     let work = cache.join(format!(
         ".td-feed-kh-work-{arch}-{}-{nonce}",
         std::process::id()
     ));
-    if std::fs::create_dir(&work).is_err() {
-        return;
-    }
     let cleanup = RemoveDirOnDrop(work.clone());
-    if !extract_xz_tar(&src, &work) {
-        eprintln!(">> td-feed warm kernel-headers ({arch}): could not extract {file} — skipping");
-        return;
-    }
-    let hdr = work.join("hdr");
-    if !run_quiet(
-        Command::new("make")
-            .current_dir(&work)
-            .arg(format!("ARCH={arch}"))
-            .arg(format!("INSTALL_HDR_PATH={}", hdr.display()))
-            .arg("headers_install"),
-    ) {
-        eprintln!(">> td-feed warm kernel-headers ({arch}): headers_install failed — skipping");
-        return;
-    }
-    let code = linux_version_code(&ver);
-    let vdir = hdr.join("include/linux");
-    let _ = std::fs::create_dir_all(&vdir);
-    if std::fs::write(vdir.join("version.h"), version_h(code)).is_err() {
-        return;
-    }
-    // Drop Kbuild byproducts before packing — they embed the PID-bearing build
-    // path and the host `sh` store path, which would re-key the seed digest on
-    // every run and every host (re #469). Only the sanitized headers survive.
-    if let Err(e) = strip_kbuild_byproducts(&hdr.join("include")) {
-        eprintln!(">> td-feed warm kernel-headers ({arch}): could not strip Kbuild byproducts ({e}) — skipping");
-        return;
-    }
-    // Force fixed 0755/0644 modes so the seed digest is umask-independent — the tar
-    // flags below zero mtime/owner but NOT the permission bits, which headers_install
-    // inherits from the ambient umask (re #469).
-    if let Err(e) = normalize_header_modes(&hdr.join("include")) {
-        eprintln!(">> td-feed warm kernel-headers ({arch}): could not normalize header modes ({e}) — skipping");
-        return;
-    }
-    // PID-unique temp: the shared cache may be warmed by concurrent worktrees, and a fixed
-    // `.tmp` would let two of them write the same inode before the atomic rename below.
     let tmp = cache.join(format!(
         ".td-feed-kh-output-{ver}-{arch}-{}-{nonce}.tmp",
         std::process::id()
@@ -3201,34 +2999,35 @@ fn warm_kernel_headers_from_pins(arch: &str, pins: &[SourcePin]) {
             }
         },
     };
-    // NORMALIZED, UNCOMPRESSED packing (KERNEL_HEADERS_TAR_FLAGS): sorted names,
-    // zeroed mtimes, no ownership, GNU format — plus the fixed 0755/0644 modes forced
-    // above (tar records mode bits but these flags do not normalize them). Together the
-    // tar bytes are a pure function of the header CONTENT, so the same pinned linux
-    // source yields the same tarball on any host and under any umask, and the runner's
-    // compiled expected digest (seed/seed-digests.txt) can vouch for it (re #469). NO gzip: a `-z`
-    // DEFLATE stream is NOT reproducible across zlib/gzip versions, so a
-    // compressed tarball hashed to a DIFFERENT seed digest on every host whose
-    // gzip differed from the one that blessed the table — reddening the
-    // seed-provenance gate off that host (any dev box) even
-    // though the header content was identical. The uncompressed tar has no such
-    // layer; the seed universe unpacks it via magic-byte sniffing (builder
-    // tar::unpack_archive falls through to plain-tar for a non-gzip/xz/bzip2
-    // magic), so no consumer changes. Unnormalized host-tar output embeds
-    // build-time mtimes and never reproduces either. kernel_headers_pack_command also
-    // scrubs the ambient TAR_OPTIONS (and pins LC_ALL=C) so host env cannot re-key it.
-    let ok = run_quiet(&mut kernel_headers_pack_command(&tmp, &hdr.join("include")));
-    if ok && std::fs::rename(&tmp, &out).is_ok() {
-        eprintln!(">> td-feed warm kernel-headers ({arch}): produced {} (LINUX_VERSION_CODE={code}) from the pinned {file}", out.display());
-    } else {
-        eprintln!(">> td-feed warm kernel-headers ({arch}): could not pack the headers tarball — skipping");
+    let produced = (|| -> Result<(), String> {
+        let lease = tmp_cleanup._directory_lock.try_clone().map_err(|e| e.to_string())?;
+        let output = tmp_cleanup._reservation.try_clone().map_err(|e| e.to_string())?;
+        let status = Command::new(builder)
+            .arg("kernel-headers")
+            .arg(&src)
+            .arg(&pin.sha256)
+            .arg(arch)
+            .arg(&work)
+            .stdin(Stdio::from(lease))
+            .stdout(Stdio::from(output))
+            .status()
+            .map_err(|e| format!("start native header preparation: {e}"))?;
+        if !status.success() {
+            return Err(format!("native header preparation: {status}"));
+        }
+        tmp_cleanup._reservation.sync_all().map_err(|e| e.to_string())?;
+        std::fs::rename(&tmp, &out).map_err(|e| e.to_string())
+    })();
+    match produced {
+        Ok(()) => eprintln!(">> td-feed warm kernel-headers ({arch}): produced {} from the pinned {file}", out.display()),
+        Err(error) => eprintln!(">> td-feed warm kernel-headers ({arch}): {error} — skipping"),
     }
     drop(tmp_cleanup);
     drop(cleanup);
 }
 
 /// Hermetic OFFLINE selftest of the warm orchestration's pure + in-process legs (the parts
-/// that need NO cargo/make/network). The cargo/make/network legs stay best-effort host PREP,
+/// that need no compiler or network). The remaining legs stay best-effort host PREP,
 /// proven by the consuming heavy gates (as the shell scripts were). std::net loopback only.
 fn warm_selftest() {
     // 1) parse_source_pins: well-formed recipe TSV parses; malformed input reds.
@@ -3262,18 +3061,9 @@ fn warm_selftest() {
         die("warm-selftest: strip_scheme wrong".into());
     }
 
-    // 2) linux_version_code + version.h (the glibc "TOO OLD!" guard).
-    if linux_version_code("4.14.67") != 265795 {
-        die(format!(
-            "warm-selftest: linux_version_code(4.14.67)={} != 265795",
-            linux_version_code("4.14.67")
-        ));
-    }
+    // 2) Kernel source filename selection.
     if linux_ver_from_file("linux-4.14.67.tar.xz").as_deref() != Some("4.14.67") {
         die("warm-selftest: linux_ver_from_file wrong".into());
-    }
-    if !version_h(265795).contains("#define LINUX_VERSION_CODE 265795") {
-        die("warm-selftest: version_h missing LINUX_VERSION_CODE".into());
     }
 
     // 3) cargo_config: routes crates.io at the proxy via sparse source replacement.
@@ -3359,8 +3149,8 @@ fn warm_selftest() {
     let _ = std::fs::remove_dir_all(&store);
 
     println!(
-        "td-feed: warm selftest OK — parse_source_pins (+malformed reject), linux_version_code/version.h \
-         (the glibc TOO-OLD guard), cargo_config (sparse source replacement), and the IN-PROCESS cargo-proxy \
+        "td-feed: warm selftest OK — parse_source_pins (+malformed reject), kernel source filename, \
+         cargo_config (sparse source replacement), and the IN-PROCESS cargo-proxy \
          round-trip a verifying source-crate GET over loopback (mock upstream 127.0.0.1:{uport}); a crate whose \
          bytes mismatch its index cksum is refused; lock-driven warming fetched its registry crate while never \
          contacting the counted Git source (the verifying egress and no-Git boundary are load-bearing)"
@@ -4805,154 +4595,31 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn kernel_headers_tar_is_uncompressed_and_normalized() {
-        // The kernel-headers seed is GENERATED (no upstream sha256 pin): its
-        // committed row in seed/seed-digests.txt binds the packed bytes, so the
-        // bytes must be a host-free function of the header CONTENT. A gzip layer
-        // is NOT host-free — its DEFLATE stream varies by zlib/gzip version — so
-        // a compressed tarball re-keyed the seed digest on every host whose gzip
-        // differed from the one that blessed the table, reddening the seed
-        // provenance gate off that host (re #469). Lock both invariants so a
-        // future edit cannot silently reintroduce compression or drop a
-        // normalization flag.
-        let flags = super::KERNEL_HEADERS_TAR_FLAGS;
-        assert!(
-            flags.contains(&"-cf"),
-            "must create an UNCOMPRESSED tar (-cf), got {flags:?}"
-        );
-        for bad in [
-            "-z", "-czf", "-cJf", "-cjf", "--gzip", "--xz", "--bzip2", "--zstd",
-        ] {
-            assert!(
-                !flags.contains(&bad),
-                "compression flag {bad} reintroduces host-dependent (non-reproducible) bytes"
-            );
+    #[ignore = "requires the pinned Linux source and a built native builder"]
+    fn native_kernel_header_preparation_preserves_both_seed_archives() {
+        let root = PathBuf::from(std::env::var_os("TD_HEADER_FIXTURE_ROOT").unwrap());
+        let source = PathBuf::from(std::env::var_os("TD_HEADER_FIXTURE_SOURCE").unwrap());
+        let scratch = PathBuf::from(std::env::var_os("TD_HEADER_FIXTURE_SCRATCH").unwrap());
+        let cache = scratch.join(format!("native-header-feed-{}", std::process::id()));
+        std::fs::create_dir(&cache).unwrap();
+        let _cleanup = super::RemoveDirOnDrop(cache.clone());
+        let file = "linux-4.14.67.tar.xz";
+        std::fs::copy(source, cache.join(file)).unwrap();
+        let pins = vec![super::SourcePin {
+            key: "linux-source".into(),
+            url: "https://cdn.kernel.org/pub/linux/kernel/v4.x/linux-4.14.67.tar.xz".into(),
+            sha256: "3f4b056dc27233a78f7a4a35ed6fdcfd0a9680ec40b611a898bb6c8b905070ba".into(),
+            file: file.into(),
+        }];
+        for arch in ["i386", "x86_64"] {
+            super::prepare_kernel_headers(&root, arch, &pins, &cache);
+            let bytes = std::fs::read(cache.join(format!("linux-headers-4.14.67-{arch}.tar"))).unwrap();
+            assert_eq!(bytes.len(), 5160960);
+            assert_eq!(super::hex_sha256(&bytes), "e395d859211f8924fdf19a2ef7ee37e2d92bb1fdbc5fa083a2bdf03f6fd04ce0");
         }
-        for need in [
-            "--sort=name",
-            "--mtime=@0",
-            "--owner=0",
-            "--group=0",
-            "--numeric-owner",
-        ] {
-            assert!(flags.contains(&need), "missing normalization flag {need}");
-        }
-    }
-
-    #[test]
-    fn pack_command_scrubs_host_tar_env_and_stays_uncompressed() {
-        use std::path::Path;
-        // GNU tar PREPENDS $TAR_OPTIONS to every run, so an ambient `TAR_OPTIONS=-z`
-        // or `--blocking-factor=N` on the warming host would re-key the seed digest
-        // despite KERNEL_HEADERS_TAR_FLAGS. Lock that the packing command removes it
-        // (and pins LC_ALL=C), and still carries the uncompressed normalized flags.
-        let cmd = super::kernel_headers_pack_command(Path::new("/x/out.tar"), Path::new("/x/inc"));
-        let removes_tar_options = cmd
-            .get_envs()
-            .any(|(k, v)| k == "TAR_OPTIONS" && v.is_none());
-        assert!(
-            removes_tar_options,
-            "packing must scrub ambient TAR_OPTIONS"
-        );
-        let pins_c_locale = cmd
-            .get_envs()
-            .any(|(k, v)| k == "LC_ALL" && v == Some(std::ffi::OsStr::new("C")));
-        assert!(pins_c_locale, "packing must pin LC_ALL=C");
-        let args: Vec<String> = cmd
-            .get_args()
-            .map(|a| a.to_string_lossy().into_owned())
-            .collect();
-        assert!(
-            args.contains(&"-cf".to_string()),
-            "must stay uncompressed (-cf)"
-        );
-        for bad in ["-z", "--gzip", "-czf"] {
-            assert!(!args.iter().any(|a| a == bad), "must not pack with {bad}");
-        }
-    }
-
-    #[test]
-    fn strips_kbuild_byproducts_but_keeps_headers() {
-        use std::fs;
-        use std::path::Path;
-        // Classification: markers/command-records are byproducts; headers are not.
-        assert!(super::is_kbuild_byproduct(Path::new("/k/asm/.install")));
-        assert!(super::is_kbuild_byproduct(Path::new(
-            "/k/asm/..install.cmd"
-        )));
-        assert!(!super::is_kbuild_byproduct(Path::new("/k/asm/types.h")));
-        assert!(!super::is_kbuild_byproduct(Path::new("/k/linux/version.h")));
-
-        // Recursive strip on a mock headers_install tree: byproducts (which carry
-        // the non-reproducible build/store paths) go; the headers stay.
-        let root = unique_tmp_dir("strip");
-        let _ = fs::remove_dir_all(&root);
-        let asm = root.join("asm");
-        fs::create_dir_all(&asm).unwrap();
-        fs::write(asm.join("types.h"), b"typedef int x;").unwrap();
-        fs::write(asm.join(".install"), b"asm/types.h\n").unwrap();
-        fs::write(
-            asm.join("..install.cmd"),
-            b"cmd_/tmp/td-feed-kh-i386-27905/hdr := /gnu/store/abc-bash/bin/sh ...",
-        )
-        .unwrap();
-        fs::write(root.join("version.h"), b"#define LINUX_VERSION_CODE 265795").unwrap();
-
-        super::strip_kbuild_byproducts(&root).unwrap();
-
-        // Collect results, clean up, THEN assert — so a failing assertion cannot leak
-        // the temp tree (the cleanup runs before any panic unwinds the test).
-        let kept_header = asm.join("types.h").is_file();
-        let kept_version = root.join("version.h").is_file();
-        let dropped_install = !asm.join(".install").exists();
-        let dropped_cmd = !asm.join("..install.cmd").exists();
-        let _ = fs::remove_dir_all(&root);
-
-        assert!(kept_header, "must keep a real UAPI header");
-        assert!(kept_version, "must keep version.h");
-        assert!(dropped_install, "must remove the .install marker");
-        assert!(dropped_cmd, "must remove the ..install.cmd command record");
-    }
-
-    #[test]
-    fn normalize_header_modes_forces_umask_independent_bits() {
-        use std::fs;
-        use std::os::unix::fs::PermissionsExt;
-        use std::path::Path;
-        // headers_install honors the ambient umask, so a restrictive warm (umask 0077)
-        // yields 0700 dirs / 0600 files, and tar records those bits — re-keying the seed
-        // digest per host even for identical header CONTENT (re #469). Simulate that
-        // restrictive tree and assert normalize_header_modes rewrites EVERY dir to 0755
-        // and EVERY file to 0644, the canonical umask-independent set.
-        let root = unique_tmp_dir("mode");
-        let _ = fs::remove_dir_all(&root);
-        let asm = root.join("asm");
-        fs::create_dir_all(&asm).unwrap();
-        fs::write(asm.join("types.h"), b"typedef int x;").unwrap();
-        fs::write(root.join("version.h"), b"#define V 1").unwrap();
-        for (p, mode) in [
-            (root.as_path(), 0o700),
-            (asm.as_path(), 0o700),
-            (asm.join("types.h").as_path(), 0o600),
-            (root.join("version.h").as_path(), 0o600),
-        ] {
-            fs::set_permissions(p, fs::Permissions::from_mode(mode)).unwrap();
-        }
-
-        super::normalize_header_modes(&root).unwrap();
-
-        // Read modes, clean up, THEN assert (no temp-tree leak on a failing assertion).
-        let mode_of = |p: &Path| fs::symlink_metadata(p).unwrap().permissions().mode() & 0o777;
-        let root_mode = mode_of(&root);
-        let asm_mode = mode_of(&asm);
-        let header_mode = mode_of(&asm.join("types.h"));
-        let version_mode = mode_of(&root.join("version.h"));
-        let _ = fs::remove_dir_all(&root);
-
-        assert_eq!(root_mode, 0o755, "root dir must be forced to 0755");
-        assert_eq!(asm_mode, 0o755, "subdir must be forced to 0755");
-        assert_eq!(header_mode, 0o644, "header file must be forced to 0644");
-        assert_eq!(version_mode, 0o644, "version.h must be forced to 0644");
+        assert!(std::fs::read_dir(&cache).unwrap().all(|entry| {
+            !entry.unwrap().file_name().to_string_lossy().starts_with(".td-feed-kh-")
+        }));
     }
 
     #[test]
