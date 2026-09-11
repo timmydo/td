@@ -320,6 +320,41 @@ an EFI boot stub, provide disk encryption, or authorize successor activation.
 The named, consent-bound update operation remains the next integration step.
 
 
+### Privileged local installation mechanism
+
+`td-update apply-operation DEPLOYMENT-ID` is an internal root-only
+mechanism for the stock VM's installation authority. Its stdin is a held
+source directory descriptor owned by the configured requester (UID 1000),
+not a pathname. It is not an elevation command or a user consent flow.
+The authority must admit and present the exact manifest ID before invoking
+it; connecting that authority and `./update install` remains pending.
+
+The helper requires the existing root-owned 0700 installation signing
+state and single-link 0600 key. It never creates or replaces an identity.
+It reads a bounded manifest through the supplied directory, compares its
+SHA-256 with the approved ID, and pins all three regular payload files,
+which must also belong to the requester. Symlinks and special files refuse.
+The staging bounds are 256 MiB for the kernel, 512 MiB for the initramfs,
+and 128 GiB for the root image. A size change during copying refuses;
+content changes remain subject to the boot verifier's payload hashes.
+
+A fresh root-private directory beneath the signing state receives copies
+of those four files, with each file synced at mode 0600. The installed
+source-built signer signs that manifest, and `td-boot authenticate` checks
+the signature and manifest under the running volume's provisioned key.
+Only then does `td-boot install` verify all payloads and enter its existing
+transaction, publishing current/previous on `/dev/vda` through the private
+`/run/td-update` mountpoint. No requester-selected command, key, device,
+mountpoint, or signature crosses this interface. This device selection is
+the current stock VM profile, not a hardware installer discovery policy.
+
+Ordinary completion or refusal removes the helper's private staging.
+Process death can retain a root-private `.update-*` orphan but cannot
+publish an unverified deployment; the boot transaction owns crash recovery
+once installation begins. There is no signing-key rotation or implicit
+reboot in this mechanism.
+
+
 ## 4. Disk layout
 
 Published VM volumes additionally carry `td/source/repository.bundle` and

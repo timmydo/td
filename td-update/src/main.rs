@@ -6,6 +6,14 @@ use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
 
+mod apply;
+#[path = "../../td-boot/src/protocol.rs"]
+#[allow(dead_code, reason = "shared boot deployment contract")]
+mod protocol;
+#[path = "../../engine/src/sha256.rs"]
+#[allow(dead_code, reason = "shared streaming SHA-256 implementation")]
+mod sha256;
+
 type Result<T> = std::result::Result<T, String>;
 const SOURCE: &str = "/run/td-volume/td/source";
 // Linux x86_64; std opens File descriptors close-on-exec.
@@ -371,6 +379,12 @@ fn build_with_tools(root: &Path, home: &Path, cargo: &Path, feed: &Path) -> Resu
 }
 
 fn run(args: &[String]) -> Result<()> {
+    if args.first().map(String::as_str) == Some("apply-operation") {
+        let [_, expected] = args else {
+            return Err("apply-operation requires exactly one approved deployment ID".into());
+        };
+        return apply::run(expected);
+    }
     if matches!(args.first().map(String::as_str), Some("--help" | "-h")) && args.len() == 1 {
         return io(std::io::stdout().write_all(HELP.as_bytes()), "write help");
     }
@@ -566,6 +580,19 @@ fn main() {
             let result = build_with_tools(&fixture.0, &fixture.0, &cargo, &feed);
             assert_eq!(result.is_ok(), failure.is_empty(), "{result:?}");
             assert_eq!(fs::read_to_string(fixture.0.join("calls")).unwrap(), calls);
+        }
+    }
+
+    #[test]
+    fn internal_apply_arity_refuses_before_resolving_home_or_opening_state() {
+        for args in [
+            vec!["apply-operation".into()],
+            vec!["apply-operation".into(), "id".into(), "extra".into()],
+        ] {
+            assert_eq!(
+                run(&args),
+                Err("apply-operation requires exactly one approved deployment ID".into())
+            );
         }
     }
 

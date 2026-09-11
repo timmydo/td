@@ -307,7 +307,7 @@ const TARGET_INCLUDED_ENGINE_SOURCES: &[(&str, &str)] = &[
     ),
     (
         "engine/src/sha256.rs",
-        "td-builder, td-recipe-eval, target-static td-boot, and the td-compositor terminal corpus verifier/importer",
+        "td-builder, td-recipe-eval, target-static td-boot and td-update, and the td-compositor terminal corpus verifier/importer",
     ),
     (
         "engine/src/crc32.rs",
@@ -4495,7 +4495,7 @@ mod tests {
         // read at all: the edge only widens, and pinning it pins the rule that
         // a name is a name wherever it is spelled.
         assert_eq!(readers_of("td-busd"), ["td-audio", "td-compositor", "td-jail", "td-login", "td-portal", "td-secret"]);
-        assert_eq!(readers_of("td-boot"), ["td-install"]);
+        assert_eq!(readers_of("td-boot"), ["td-install", "td-update"]);
         assert!(readers_of("td-review").is_empty(), "{readers:?}");
         // Public VM retention-ref and guest workspace paths also spell td-vm/.
         // As with runtime directory names above, these widen the textual graph.
@@ -6630,7 +6630,7 @@ mod tests {
         );
         assert_eq!(
             names(&one("td-boot/src/protocol.rs")),
-            ["td-boot", "td-install"]
+            ["td-boot", "td-install", "td-update"]
         );
         // The order holds within a narrowed list: every test before any clippy,
         // the workspace first.

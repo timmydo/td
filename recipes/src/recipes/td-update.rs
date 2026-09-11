@@ -1,6 +1,10 @@
 use crate::ladder::{split_target_debug, target_rustc};
 use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 
+const APPLY_RS: &str = include_str!("../../../td-update/src/apply.rs");
+const SHA256_RS: &str = include_str!("../../../engine/src/sha256.rs");
+const PROTOCOL_RS: &str = include_str!("../../../td-boot/src/protocol.rs");
+
 const MAIN_RS: &str = include_str!("../../../td-update/src/main.rs");
 
 pub fn recipe() -> Recipe {
@@ -22,8 +26,23 @@ pub fn recipe() -> Recipe {
             path: "{out}/bin".into(),
         },
         Step::WriteFile {
-            path: "{src}/main.rs".into(),
+            path: "{src}/td-update/src/main.rs".into(),
             content: MAIN_RS.into(),
+            exec: false,
+        },
+        Step::WriteFile {
+            path: "{src}/td-update/src/apply.rs".into(),
+            content: APPLY_RS.into(),
+            exec: false,
+        },
+        Step::WriteFile {
+            path: "{src}/engine/src/sha256.rs".into(),
+            content: SHA256_RS.into(),
+            exec: false,
+        },
+        Step::WriteFile {
+            path: "{src}/td-boot/src/protocol.rs".into(),
+            content: PROTOCOL_RS.into(),
             exec: false,
         },
         Step::MkDir {
@@ -56,7 +75,7 @@ pub fn recipe() -> Recipe {
                 "-Clink-arg=-static-libgcc",
                 "-o",
                 "{out}/bin/td-update",
-                "{src}/main.rs",
+                "{src}/td-update/src/main.rs",
             ],
         )
         .env("PATH", &path)

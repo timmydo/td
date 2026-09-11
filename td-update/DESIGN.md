@@ -2,10 +2,13 @@
 
 `td-update` is a dependency-free, source-built Rust program. The standard
 image supplies it at `/bin/td-update`; the checkout's `./update` points there.
-It never changes credentials, writes an installed deployment, signs a
-manifest, or requests reboot in this increment. Installation remains the
-single writer's job in `td-boot`; a later authorized operation must connect
-the prepared build to that transaction.
+The ordinary `init` and `build` commands never change credentials, sign or
+install a deployment, or request reboot. The internal root-only
+`apply-operation DEPLOYMENT-ID` entry is the installation mechanism
+specified in `td-install/DESIGN.md`: it takes a held source directory on
+stdin, signs only the approved manifest with the existing installation key,
+and calls the single deployment writer in `td-boot`. It cannot elevate its
+caller. The typed authority and public installation command remain pending.
 
 ## Initial checkout
 
