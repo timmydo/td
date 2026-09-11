@@ -131,3 +131,59 @@ assembly boundary, alongside the standard glibc and libgcc boundaries.
 Standard-image validation must prove the service actually initializes the
 checkout as the human and preserves it on another boot; successful cloning
 alone does not prove a complete system build or installation.
+
+
+## Native release regression
+
+`td-recipe-eval qemu-update --kernel FILE --selector FILE --disk FILE
+--format raw|qcow2 --work NEW-DIR [--timeout SECONDS]` runs the complete
+update path on a disposable qcow2 overlay of a stopped private installation.
+The supplied kernel and selector must match that installation. This is a
+host-side QEMU oracle over operator-selected inputs, outside recipe gates;
+it does not establish those inputs' source provenance. Keep the backing
+files stable for the run and while retaining its overlay. A demo without a
+retained signing key cannot satisfy this test.
+
+The oracle uses four TCG CPUs and 12 GiB of guest memory. Its new private
+work directory retains the overlay, serial logs and prompt captures. The
+path must fit a Unix socket name: at most 70 bytes, with no comma. The
+six-hour default deadline can be set explicitly between 60 seconds and
+seven days. Every boot has an additional 30-minute health deadline.
+Serial output is bounded to 256 MiB per boot and one MiB per line. A
+64-line queue applies backpressure; teardown closes it before joining the
+reader, so a blocked producer cannot prevent cleanup.
+
+The guest uses its own source checkout, source-built compilers and local
+caches. No host executable or store output is imported by this command.
+An existing warm installation provides a bounded regression; a fresh
+installation exercises upstream fetching and the cold build path. Reports
+must identify which fixture was supplied rather than imply that a warm
+pass rebuilt the entire bootstrap ladder.
+
+Inside the disposable overlay, the oracle changes the updater's HELP text
+to a unique marker and leaves a unique user file. It runs `./update`,
+waits for the installation request, uses QMP physical keys to open secure
+attention and select I, then checks the complete expected deployment ID,
+owner, operation, rollback/restart notice and confirmation choices against
+the actual 1280x800 framebuffer. The expected text is independent of the
+compositor's description builder; ASCII pixels are bound to its pinned
+font. The preceding attention menu is checked against its separate small
+chrome font before I is sent. The variable countdown and cursor are excluded. It cancels this
+request and requires both deployment selectors to remain unchanged.
+
+A second `./update` must request the same successor. Only after the full
+prompt matches does the oracle send Enter. Success must publish that
+successor as current and the initial deployment as previous. After an
+explicit VM restart, boot health, kernel deployment ID, installed HELP
+marker, user file, source edit and unchanged public signing identity must
+all agree. The private key must remain unreadable to the human account.
+This proves continued signing with the installation identity, not a
+byte-for-byte comparison of the inaccessible private key. `result.txt`
+exists only after the complete sequence succeeds. Normal restarts sync the guest, request QMP quit and require a successful
+QEMU exit so its block driver can flush and close the overlay. This is a
+host-directed restart, not a guest filesystem unmount. Failure teardown
+kills only its owned child; source disks and selectors are never rewritten.
+
+This command does not yet inject a failed successor boot or drive rollback;
+the existing deployment oracle owns those separate checks. Their integration
+into this native release cycle remains a following increment.

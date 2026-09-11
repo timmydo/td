@@ -29,6 +29,7 @@
 //! is absent the tool FAILS loudly rather than silently passing, so a green result
 //! always means a real boot happened.
 pub(crate) mod secret;
+pub(crate) mod update;
 
 use std::env;
 use std::ffi::OsString;
@@ -7134,6 +7135,9 @@ impl Qmp {
                 !matches!(
                     *key,
                     "ctrl"
+                        | "alt"
+                        | "esc"
+                        | "i"
                         | "shift"
                         | "meta_l"
                         | "c"
