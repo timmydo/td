@@ -63,6 +63,17 @@ fetch tool offline only after that verified vendor closure exists. A warm
 that reports success without complete inputs still fails the evaluator's
 native vendor verification before any system build starts.
 
+The native fetch-helper build keeps extracted dependency sources at a stable
+content-addressed path under `.td-build-cache/native-vendor`. Each invocation
+still copies and verifies the full archive set against `net/Cargo.lock`,
+extracts private sources and computes their NAR digest. An existing cache
+entry must match that freshly reconstructed tree, including names, bytes,
+executable bits and symlink targets; no persisted marker authenticates it.
+Corrupt entries are refused. Complete trees are published by rename and
+retained across builds, so Cargo can reuse unchanged dependency compilation.
+Cargo still decides invalidation for compiler, flags and checkout changes.
+This is a cooperating same-user cache, not a same-UID isolation boundary.
+
 The new evaluator warms declared fixed-output inputs for `system-x86-64`,
 then invokes `build-run` through the existing sandbox and source-bootstrap
 graph. It receives the exact builder just compiled through

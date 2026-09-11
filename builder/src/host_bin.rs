@@ -82,7 +82,7 @@ impl NativeVendor {
     }
 }
 
-fn prepare_native_vendor(root: &Path) -> Result<NativeVendor, String> {
+fn extract_native_vendor(root: &Path) -> Result<NativeVendor, String> {
     use std::os::unix::fs::DirBuilderExt;
     use std::sync::atomic::{AtomicU64, Ordering};
     static SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -153,6 +153,55 @@ fn prepare_native_vendor(root: &Path) -> Result<NativeVendor, String> {
             .map_err(|e| format!("publish private crate {nv}: {e}"))?;
     }
     Ok(prepared)
+}
+
+/// Keep Cargo's source identity stable without trusting a persisted digest.
+/// Reconstruct from lock-verified archives, then compare the complete cached
+/// tree before reuse. Same-UID concurrent mutation is not an isolation boundary.
+fn prepare_native_vendor(root: &Path) -> Result<PathBuf, String> {
+    use std::os::unix::fs::DirBuilderExt;
+    let prepared = extract_native_vendor(root)?;
+    let sources = prepared.directory();
+    let digest = crate::sandbox::nar_hash_of(&sources)
+        .map_err(|e| format!("hash verified native Cargo sources: {e}"))?;
+    let digest = digest
+        .strip_prefix("sha256:")
+        .ok_or("native Cargo sources digest has no SHA-256 prefix")?;
+    let cache = root.join(".td-build-cache/native-vendor");
+    match std::fs::DirBuilder::new().mode(0o700).create(&cache) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(format!("create native Cargo cache: {e}")),
+    }
+    if !std::fs::symlink_metadata(&cache)
+        .map_err(|e| format!("inspect native Cargo cache: {e}"))?
+        .is_dir()
+    {
+        return Err("native Cargo cache must be a directory, not a symlink".into());
+    }
+    let destination = cache.join(digest);
+    match std::fs::symlink_metadata(&destination) {
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // A competing publisher may win; only an identical complete tree
+            // below can turn that rename failure into success.
+            if let Err(e) = std::fs::rename(&sources, &destination) {
+                if !destination.exists() {
+                    return Err(format!("publish native Cargo cache: {e}"));
+                }
+            }
+        }
+        Err(e) => return Err(format!("inspect cached native Cargo sources: {e}")),
+    }
+    let actual = crate::sandbox::nar_hash_of(&destination)
+        .map_err(|e| format!("verify cached native Cargo sources: {e}"))?;
+    if actual.strip_prefix("sha256:") != Some(digest) {
+        return Err(format!(
+            "cached native Cargo sources differ from verified archives: {}; remove this cache entry and retry",
+            destination.display()
+        ));
+    }
+    Ok(destination)
 }
 
 /// Build the network preparation helper with the provisioned toolchain.
@@ -275,7 +324,7 @@ pub(crate) fn host_cargo_bin(
         .env("CARGO_ENCODED_RUSTFLAGS", &encoded_rustflags)
         .stdin(Stdio::null());
     if let Some(prepared) = &native_vendor {
-        let path = match prepared.directory().canonicalize() {
+        let path = match prepared.canonicalize() {
             Ok(path) => path,
             Err(e) => {
                 eprintln!("td-builder check: static {bin}: resolve native vendor: {e}");
@@ -445,7 +494,7 @@ mod native_vendor_tests {
     #[test]
     fn prepared_archives_resolve_in_cargo_offline_and_cleanup() {
         let fixture = fixture("resolve");
-        let prepared = prepare_native_vendor(&fixture.0).unwrap();
+        let prepared = extract_native_vendor(&fixture.0).unwrap();
         let path = prepared.directory();
         assert!(path.join("tinydep-0.1.0/src/lib.rs").is_file());
         let cargo_home = fixture.0.join("cargo-home");
@@ -474,6 +523,91 @@ mod native_vendor_tests {
         assert!(String::from_utf8_lossy(&output.stdout).contains("tinydep"));
         drop(prepared);
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn stable_verified_sources_keep_cargo_dependencies_fresh() {
+        let fixture = fixture("fresh");
+        let first = prepare_native_vendor(&fixture.0).unwrap();
+        let build = |sources: &Path| {
+            let directory =
+                td_engine::json::Json::Str(sources.to_str().unwrap().into()).to_json_string();
+            let output = Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()))
+                .args([
+                    "build",
+                    "--offline",
+                    "--frozen",
+                    "--verbose",
+                    "--config",
+                    "source.crates-io.replace-with=\"td-vendor\"",
+                    "--config",
+                    &format!("source.td-vendor.directory={directory}"),
+                ])
+                .current_dir(fixture.0.join("net"))
+                .env("CARGO_HOME", fixture.0.join("cargo-home"))
+                .env("CARGO_TARGET_DIR", fixture.0.join("target"))
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8(output.stderr).unwrap()
+        };
+        assert!(build(&first).contains("Compiling tinydep"));
+        let source = first.join("tinydep-0.1.0/src/lib.rs");
+        let before = fs::metadata(&source).unwrap().modified().unwrap();
+        let second = prepare_native_vendor(&fixture.0).unwrap();
+        assert_eq!(first, second);
+        assert_eq!(before, fs::metadata(&source).unwrap().modified().unwrap());
+        assert!(build(&second).contains("Fresh tinydep"));
+        fs::write(
+            fixture.0.join("net/src/lib.rs"),
+            "pub fn value() -> u8 { tinydep::value() + 1 }\n",
+        )
+        .unwrap();
+        let changed = build(&second);
+        assert!(changed.contains("Compiling consumer"));
+        assert!(changed.contains("Fresh tinydep"));
+    }
+
+    #[test]
+    fn stable_cache_never_authenticates_corrupt_archives_or_sources() {
+        let fixture = fixture("corrupt-cache");
+        let sources = prepare_native_vendor(&fixture.0).unwrap();
+        let archive_path = fixture
+            .0
+            .join(".td-build-cache/crate-vendor/td-net/vendor/tinydep-0.1.0.crate");
+        fs::write(&archive_path, b"corrupt").unwrap();
+        assert!(prepare_native_vendor(&fixture.0)
+            .unwrap_err()
+            .contains("committed-lock"));
+        fs::write(&archive_path, archive()).unwrap();
+        fs::write(sources.join("tinydep-0.1.0/src/lib.rs"), "corrupt").unwrap();
+        assert!(prepare_native_vendor(&fixture.0)
+            .unwrap_err()
+            .contains("differ from verified"));
+        fs::remove_dir_all(&sources).unwrap();
+        assert_eq!(prepare_native_vendor(&fixture.0).unwrap(), sources);
+        fs::write(sources.join("extra"), "corrupt").unwrap();
+        assert!(prepare_native_vendor(&fixture.0).is_err());
+        fs::remove_dir_all(&sources).unwrap();
+        std::os::unix::fs::symlink(fixture.0.join("net"), &sources).unwrap();
+        assert!(prepare_native_vendor(&fixture.0).is_err());
+    }
+
+    #[test]
+    fn concurrent_preparations_publish_one_complete_tree() {
+        let fixture = fixture("concurrent");
+        let first_root = fixture.0.clone();
+        let second_root = fixture.0.clone();
+        let first = std::thread::spawn(move || prepare_native_vendor(&first_root));
+        let second = std::thread::spawn(move || prepare_native_vendor(&second_root));
+        assert_eq!(
+            first.join().unwrap().unwrap(),
+            second.join().unwrap().unwrap()
+        );
     }
 
     #[test]
