@@ -15,7 +15,10 @@ pub(crate) struct ClipboardWrite {
     pub bytes: Arc<Vec<u8>>,
 }
 
-pub(crate) fn start(runtime: Arc<Mutex<Runtime>>) -> Result<(), String> {
+pub(crate) fn start(
+    runtime: Arc<Mutex<Runtime>>,
+    task_launcher: Option<crate::authority::Launcher>,
+) -> Result<(), String> {
     let record = Path::new("/run/td-compositor/1000/vm-port");
     let file = match OpenOptions::new()
         .read(true)
@@ -78,7 +81,7 @@ pub(crate) fn start(runtime: Arc<Mutex<Runtime>>) -> Result<(), String> {
     let worker_runtime = Arc::clone(&runtime);
     if let Err(error) = thread::Builder::new()
         .name("td-vm-bridge".into())
-        .spawn(move || serve(port, worker_runtime))
+        .spawn(move || serve(port, worker_runtime, task_launcher))
     {
         runtime
             .lock()
@@ -101,9 +104,10 @@ impl Session {
         request: wire::Message,
         runtime: &Arc<Mutex<Runtime>>,
         feed_path: &Path,
+        task_launch: &mut impl FnMut() -> Result<(), String>,
     ) -> wire::Message {
         let id = request.id;
-        let result = self.dispatch(request, runtime, feed_path);
+        let result = self.dispatch(request, runtime, feed_path, task_launch);
         match result {
             Ok((revision, data)) => wire::Message::new(id, wire::OK, revision, data),
             Err(error) => wire::Message::new(id, wire::ERROR, 0, error.into_bytes()),
@@ -115,6 +119,7 @@ impl Session {
         request: wire::Message,
         runtime: &Arc<Mutex<Runtime>>,
         feed_path: &Path,
+        task_launch: &mut impl FnMut() -> Result<(), String>,
     ) -> Result<(u64, Vec<u8>), String> {
         match request.verb.as_str() {
             wire::SNAPSHOT if request.data.is_empty() && request.revision == 0 => {
@@ -164,6 +169,21 @@ impl Session {
                     request.verb == wire::WORKSPACE_ENSURE)
                     .map(|data| (0, data))
             }
+            wire::WORKSPACE_TERMINAL if request.revision == 0 => {
+                self.lease = None;
+                let plan = wire::workspace::Plan::parse(&request.data)?;
+                let uid = fs::metadata("/proc/self").map_err(|e| e.to_string())?.uid();
+                let ready = ready_workspace(
+                    &feed_path.with_file_name("vm-workspace"),
+                    Path::new(wire::workspace::RESPONSE),
+                    &request.data,
+                    &plan,
+                    uid,
+                    1000,
+                )?;
+                launch_task_terminal(&ready, &plan, task_launch)?;
+                Ok((0, wire::TASK_TERMINAL_QUEUED.to_vec()))
+            }
             wire::POWEROFF if request.revision == 0 && request.data.is_empty() => {
                 self.lease = None;
                 publish_request(&feed_path.with_file_name("vm-poweroff"), wire::POWER_RECORD, false)?;
@@ -179,7 +199,20 @@ impl Session {
     }
 }
 
-fn serve(mut port: File, runtime: Arc<Mutex<Runtime>>) {
+fn launch_task_terminal(
+    status: &[u8],
+    plan: &wire::workspace::Plan,
+    task_launch: &mut impl FnMut() -> Result<(), String>,
+) -> Result<(), String> {
+    wire::workspace::parse_ready(status, plan)?;
+    task_launch()
+}
+
+fn serve(
+    mut port: File,
+    runtime: Arc<Mutex<Runtime>>,
+    task_launcher: Option<crate::authority::Launcher>,
+) {
     let mut decoder = wire::Decoder::default();
     let mut session = Session::default();
     let mut buffer = [0; 4096];
@@ -204,8 +237,20 @@ fn serve(mut port: File, runtime: Arc<Mutex<Runtime>>) {
                             session.lease = None;
                             continue;
                         };
-                        let response =
-                            session.handle(request, &runtime, Path::new(wire::FEED_FILE));
+                        let mut task_launch = || {
+                            task_launcher
+                                .as_ref()
+                                .ok_or_else(|| {
+                                    "task terminal requires the paired authority".to_string()
+                                })?
+                                .launch_task()
+                        };
+                        let response = session.handle(
+                            request,
+                            &runtime,
+                            Path::new(wire::FEED_FILE),
+                            &mut task_launch,
+                        );
                         let Ok(bytes) = response.encode() else {
                             session.lease = None;
                             continue;
@@ -359,13 +404,7 @@ fn guest_key(request: &Path, response: &Path, bytes: &[u8], compositor: u32, hum
 
 fn guest_workspace(request: &Path, response: &Path, bytes: &[u8], compositor: u32, human: u32, ensure: bool) -> Result<Vec<u8>, String> {
     let plan = wire::workspace::Plan::parse(bytes)?;
-    for (path, owner) in [(request, compositor), (response, human)] {
-        let meta = fs::symlink_metadata(path.parent().ok_or("workspace endpoint has no parent")?)
-            .map_err(|e| e.to_string())?;
-        if !meta.is_dir() || meta.uid() != owner || meta.mode() & 0o022 != 0 {
-            return Err("untrusted workspace endpoint directory".into());
-        }
-    }
+    trusted_workspace_directories(request, response, compositor, human)?;
     // Replacing the request allows an explicit retry after a failed clone.
     publish_request(request, bytes, ensure)?;
     let file = match OpenOptions::new().read(true).custom_flags(0x20000 | 0x800).open(response) {
@@ -388,6 +427,77 @@ fn guest_workspace(request: &Path, response: &Path, bytes: &[u8], compositor: u3
     if ensure { wire::workspace::progress(&reply, &plan)?; }
     else { wire::workspace::status(&reply, &plan)?; }
     Ok(reply)
+}
+
+/// Observe a completed workspace without publishing or repairing anything.
+/// Terminal launch is downstream of preparation: a launch request must not
+/// itself become a retry, nor replace the inode the guest worker watches.
+fn ready_workspace(
+    request: &Path,
+    response: &Path,
+    bytes: &[u8],
+    plan: &wire::workspace::Plan,
+    compositor: u32,
+    human: u32,
+) -> Result<Vec<u8>, String> {
+    trusted_workspace_directories(request, response, compositor, human)?;
+    let current = read_workspace_endpoint(request, compositor, bytes.len(), "request")?;
+    if current != bytes {
+        return Err("workspace request does not match terminal plan".into());
+    }
+    let reply = read_workspace_endpoint(response, human, 4096, "response")?;
+    wire::workspace::parse_ready(&reply, plan)?;
+    // Notice a concurrent explicit retry before handing the already-read
+    // status to the launcher. Replacement with identical safe bytes is the
+    // same plan; any semantically different replacement is refused here.
+    if read_workspace_endpoint(request, compositor, bytes.len(), "request")? != bytes {
+        return Err("workspace request changed during terminal launch".into());
+    }
+    Ok(reply)
+}
+
+fn trusted_workspace_directories(
+    request: &Path,
+    response: &Path,
+    compositor: u32,
+    human: u32,
+) -> Result<(), String> {
+    for (path, owner) in [(request, compositor), (response, human)] {
+        let meta = fs::symlink_metadata(
+            path.parent()
+                .ok_or("workspace endpoint has no parent")?,
+        )
+        .map_err(|e| e.to_string())?;
+        if !meta.is_dir() || meta.uid() != owner || meta.mode() & 0o022 != 0 {
+            return Err("untrusted workspace endpoint directory".into());
+        }
+    }
+    Ok(())
+}
+
+fn read_workspace_endpoint(
+    path: &Path,
+    owner: u32,
+    limit: usize,
+    endpoint: &str,
+) -> Result<Vec<u8>, String> {
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(0x20000 | 0x800)
+        .open(path)
+        .map_err(|e| format!("open workspace {endpoint}: {e}"))?;
+    let meta = file.metadata().map_err(|e| e.to_string())?;
+    if !meta.is_file() || meta.uid() != owner || meta.nlink() != 1 || meta.mode() & 0o022 != 0 {
+        return Err(format!("untrusted workspace {endpoint}"));
+    }
+    let mut bytes = Vec::new();
+    file.take((limit + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|e| format!("read workspace {endpoint}: {e}"))?;
+    if bytes.len() > limit {
+        return Err(format!("workspace {endpoint} exceeds limit"));
+    }
+    Ok(bytes)
 }
 
 #[cfg(test)]
@@ -447,8 +557,70 @@ mod tests {
                 wire::Message::new(id, verb, revision, data.to_vec()),
                 &self.runtime,
                 &self.dir.join("feed"),
+                &mut || Ok(()),
             )
         }
+    }
+
+    #[test]
+    fn task_terminal_requires_the_exact_ready_plan_before_launching() {
+        let plan = wire::workspace::example();
+        let different = wire::workspace::Plan {
+            branch: "different".into(),
+            ..plan.clone()
+        };
+        let launches = std::cell::Cell::new(0usize);
+        for status in [
+            wire::workspace::pending(&plan),
+            wire::workspace::failure(&plan, "failed"),
+            wire::workspace::ready(&different),
+        ] {
+            assert!(launch_task_terminal(&status, &plan, &mut || {
+                launches.set(launches.get().saturating_add(1));
+                Ok(())
+            })
+            .is_err());
+        }
+        assert_eq!(launches.get(), 0);
+        launch_task_terminal(&wire::workspace::ready(&plan), &plan, &mut || {
+            launches.set(launches.get().saturating_add(1));
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(launches.get(), 1);
+    }
+
+    #[test]
+    fn task_terminal_observes_a_ready_workspace_without_publishing() {
+        let f = Fixture::new();
+        let uid = fs::metadata(&f.dir).unwrap().uid();
+        let request = f.dir.join("vm-workspace");
+        let response = f.dir.join("workspace-reply");
+        let plan = wire::workspace::example();
+        let encoded = plan.encode();
+        fs::write(&response, wire::workspace::ready(&plan)).unwrap();
+        assert!(ready_workspace(&request, &response, &encoded, &plan, uid, uid).is_err());
+        assert!(!request.exists(), "terminal launch published a missing request");
+
+        let mut different = plan.clone();
+        different.branch = "different".into();
+        fs::write(&request, different.encode()).unwrap();
+        let original = fs::metadata(&request).unwrap().ino();
+        assert!(ready_workspace(&request, &response, &encoded, &plan, uid, uid).is_err());
+        assert_eq!(fs::metadata(&request).unwrap().ino(), original);
+        assert_eq!(fs::read(&request).unwrap(), different.encode());
+
+        fs::write(&request, &encoded).unwrap();
+        let original = fs::metadata(&request).unwrap().ino();
+        fs::write(&response, wire::workspace::pending(&plan)).unwrap();
+        assert!(ready_workspace(&request, &response, &encoded, &plan, uid, uid).is_err());
+        assert_eq!(fs::metadata(&request).unwrap().ino(), original);
+        fs::write(&response, wire::workspace::ready(&plan)).unwrap();
+        assert_eq!(
+            ready_workspace(&request, &response, &encoded, &plan, uid, uid).unwrap(),
+            wire::workspace::ready(&plan)
+        );
+        assert_eq!(fs::metadata(&request).unwrap().ino(), original);
     }
     impl Drop for Fixture {
         fn drop(&mut self) {

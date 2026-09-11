@@ -75,6 +75,7 @@ const HELP: &str = "td-vm: manage persistent graphical td instances
   td-vm workspace key NAME            request the guest-generated SSH public key
   td-vm workspace enroll NAME         enroll its Git key, branch and starting commit
   td-vm workspace clone NAME          provision its private guest clone and worktree
+  td-vm workspace terminal NAME       open a terminal in its prepared task worktree
 
 TD_VM_HOME defaults to ~/.local/share/td-vm. Requires host QEMU, qemu-img and qemu-io.
 Reuse dist/td-vm-x86-64 from ./build-qcow; no image rebuild on create/open.
@@ -149,6 +150,10 @@ fn run(args: Vec<String>) -> Result<()> {
         }
         ["workspace", "clone", name] => {
             println!("{}", term::scrub_lines(&manager.clone_workspace(name)?));
+            Ok(())
+        }
+        ["workspace", "terminal", name] => {
+            println!("{}", term::scrub_lines(&manager.workspace_terminal(name)?));
             Ok(())
         }
         ["workspace", "key", name] => {
@@ -625,6 +630,40 @@ impl Manager {
         let reply = vm_bridge::ask(&dir, vm_wire::WORKSPACE, plan.encode())?;
         vm_wire::workspace::parse_ready(&reply, &plan)?;
         Ok(format!("Guest workspace prepared on {} at /home/tester/src/td-vm/work. Terminal launch and agent setup remain pending.", workspace.branch))
+    }
+
+    fn workspace_terminal(&self, value: &str) -> Result<String> {
+        let name = name(value)?;
+        let dir = self.instance(name)?;
+        let lock = self.lock(&format!("instance-{name}"))?;
+        let workspace = vm_workspace::load(&dir)?.ok_or("instance has no workspace plan")?;
+        let enrollment = workspace
+            .enrollment
+            .as_ref()
+            .filter(|state| state.phase == vm_workspace::Phase::Enrolled)
+            .ok_or("enroll this workspace before opening its task terminal")?;
+        let start = workspace
+            .start
+            .as_deref()
+            .ok_or("enroll again to retain a starting commit")?;
+        workspace.profile.check()?;
+        workspace
+            .profile
+            .start(&workspace.id, &workspace.branch, Some(start), &lock)?;
+        let plan = workspace.profile.clone_plan(
+            &workspace.id,
+            &workspace.branch,
+            start,
+            &enrollment.key,
+        )?;
+        let reply = vm_bridge::ask(&dir, vm_wire::WORKSPACE_TERMINAL, plan.encode())?;
+        if reply != vm_wire::TASK_TERMINAL_QUEUED {
+            return Err("guest did not confirm the task terminal launch".into());
+        }
+        Ok(format!(
+            "Task terminal queued on {} in /home/tester/src/td-vm/work.",
+            workspace.branch
+        ))
     }
 
     fn workspace_key(&self, value: &str) -> Result<String> {
@@ -1290,6 +1329,13 @@ impl vm_provision::Host for ProvisionHost<'_> {
         let reply = vm_bridge::ask(self.dir, vm_wire::WORKSPACE_ENSURE, plan.encode())?;
         vm_wire::workspace::progress(&reply, plan)
     }
+    fn launch(&mut self, plan: &vm_wire::workspace::Plan) -> Result<()> {
+        let reply = vm_bridge::ask(self.dir, vm_wire::WORKSPACE_TERMINAL, plan.encode())?;
+        if reply != vm_wire::TASK_TERMINAL_QUEUED {
+            return Err("guest did not confirm the task terminal launch".into());
+        }
+        Ok(())
+    }
     fn report(&mut self, message: &str) {
         let message: String = term::scrub_lines(message).chars().take(768).collect();
         println!("workspace: {message}");
@@ -1711,7 +1757,7 @@ fn tui(manager: &Manager) -> Result<()> {
         let (height, width) = terminal.size();
         let mut frame = term::Frame::new(height, width);
         frame.push_text("td-vm  Enter open · n new · i import · t templates · S stop · D delete · X cut power", term::Style::bar(term::CYAN));
-        frame.push_text("h status · R resume · w workspace · W prepare · E enroll · C clone · l logs · v paste · c copy · f feed · s sharing · r refresh · q quit", term::Style::bar(term::CYAN));
+        frame.push_text("h status · R resume · w workspace · W prepare · E enroll · C clone · T task terminal · l logs · v paste · c copy · f feed · s sharing · r refresh · q quit", term::Style::bar(term::CYAN));
         frame.push_text(TABLE_HEADER, term::Style::bold());
         let page = height.saturating_sub(8).max(1);
         let offset = selected.saturating_sub(page - 1);
@@ -1809,6 +1855,13 @@ fn tui(manager: &Manager) -> Result<()> {
                 }
                 term::Key::Char('C') if current.is_some() => {
                     status = match manager.clone_workspace(current.ok_or("no instance selected")?) {
+                        Ok(message) => message,
+                        Err(error) => error,
+                    };
+                    break;
+                }
+                term::Key::Char('T') if current.is_some() => {
+                    status = match manager.workspace_terminal(current.ok_or("no instance selected")?) {
                         Ok(message) => message,
                         Err(error) => error,
                     };

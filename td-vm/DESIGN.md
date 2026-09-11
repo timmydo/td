@@ -85,8 +85,8 @@ listing does not create manager state or take catalog locks.
 The stock desktop supports per-instance Git keys, enrollment and explicit
 clone provisioning and orderly poweroff through the guest helpers below.
 Open automatically enrolls and prepares a saved workspace in the background.
-Private writable development stores, task-terminal launch and account linking
-remain pending. The
+It then queues a terminal in the selected task worktree. Private writable
+development stores, agent launch and account linking remain pending. The
 td-owned clipboard, feed and workspace bridges require a matching updated
 system image. `stop NAME` or TUI S queues orderly guest poweroff;
 `stop NAME --force` or TUI X explicitly cuts power. Disk deletion requires `--yes` or
@@ -1248,8 +1248,8 @@ commit until VM revocation so concurrent origin updates or GC cannot remove
 the source while the guest clones it. The guest must fetch the internal ref
 explicitly and check its object ID against the saved starting commit.
 
-The explicit workspace clone operation performs the equivalent of the
-following inside the guest; automatic provisioning on Open remains pending. These
+The workspace clone operation performs the equivalent of the following inside
+the guest; Open invokes its non-retrying ensure variant automatically. These
 commands illustrate the provisioner's fixed argv operations, not manual setup
 or a generated shell script:
 
@@ -1580,8 +1580,18 @@ The instance lock covers the request, just as it covers enrollment. A pending
 reply means provisioning may be running; repeat Clone to inspect completion.
 Automatic Open provisioning uses the non-retrying operation below. The local
 workspace view reports its saved enrollment, starting commit, and last Open
-observation without claiming live clone status. A successful clone reply reports only workspace preparation, not
-terminal launch, build-store readiness, tests, or provider authentication.
+observation without claiming live clone status. A successful clone reply
+reports only workspace preparation, not terminal launch, build-store readiness,
+tests, or provider authentication.
+
+`td-vm workspace terminal NAME` or T in the TUI is the explicit terminal
+action. It rechecks the saved profile, branch reservation, retained commit and
+complete clone plan, then sends `workspace-terminal`. The compositor requires
+the matching guest status to be ready before it queues one fresh td-term whose
+child starts in `/home/tester/src/td-vm/work`. The fixed reply is `task terminal
+queued`; it proves queue admission only, not process exec, Wayland mapping or
+terminal readiness. A missing reply may follow admission, so the manager never
+describes that outcome as a safe automatic retry.
 
 The `workspace` request has revision zero and contains `TDVM-CLONE-1`, then
 exactly eleven LF-separated fields with a final LF: instance ID, task branch,
@@ -1682,8 +1692,9 @@ then reopen and verify the write and the sibling VM's continued operation.
 
 For an instance with a saved workspace plan, each QEMU supervisor attempts
 provisioning automatically. It waits for the guest-generated public key, uses
-exactly the explicit enrollment/retention path, and then ensures the private
-clone and worktree. Instances without a Git profile/plan still open an ordinary
+exactly the explicit enrollment/retention path, ensures the private clone and
+worktree, then submits the fixed task-terminal request. Instances without a
+Git profile/plan still open an ordinary
 desktop. Open never waits for a clone to finish, and leaving the TUI does not
 cancel provisioning. Opening an already running instance identifies its window;
 it does not start another provisioning attempt or terminal.
@@ -1727,9 +1738,17 @@ C/clone for explicit recovery; a later fresh boot attempts again with the same
 identity, key, branch and retained start. A timeout never cancels guest Git,
 reclaims its staging, revokes a possibly enrolled key, or resets user work.
 
+Ready clone status advances once to terminal launch. A successful reply records
+that the task terminal was queued and completes the attempt. Any launch error
+has an uncertain delivery outcome and stops immediately without automatic
+retry; inspect the guest before using T/`workspace terminal` explicitly. The
+host supplies no path, executable, shell command or environment in that
+request.
+
 The supervisor atomically saves bounded progress observations in its private
 `provisioning` file and logs changes. `workspace show` / TUI w displays the last
 Open observation, explicitly separate from live guest state and durable
 registration. Starting a new QEMU clears the previous observation. Manual
 recovery can supersede it; it is neither continuous workspace inspection nor a
-claim that a terminal, private writable build store, or agent login is ready.
+claim that a queued terminal mapped successfully or that a private writable
+build store or agent login is ready.

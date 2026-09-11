@@ -4498,8 +4498,12 @@ mod tests {
         assert_eq!(readers_of("td-boot"), ["td-install", "td-update"]);
         assert!(readers_of("td-review").is_empty(), "{readers:?}");
         // Public VM retention-ref and guest workspace paths also spell td-vm/.
-        // As with runtime directory names above, these widen the textual graph.
-        assert_eq!(readers_of("td-vm"), ["td-compositor", "td-vm-guest"]);
+        // Authd's fixed task-terminal directory joins the compositor and guest
+        // helper as a conservative textual reader of the VM crate.
+        assert_eq!(
+            readers_of("td-vm"),
+            ["td-authd", "td-compositor", "td-vm-guest"]
+        );
         assert!(readers_of("td-sh").is_empty(), "{readers:?}");
         for (read, its_readers) in &readers {
             assert!(!its_readers.contains(read), "{read} reads itself");

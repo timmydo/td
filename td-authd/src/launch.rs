@@ -12,7 +12,8 @@ use std::time::{Duration, Instant};
 
 const LIMIT: usize = 16;
 const CHECK_TIMEOUT: Duration = Duration::from_secs(2);
-const VERSION: &[u8] = b"TDLA001\n";
+const VERSION: &[u8] = b"TDLA002\n";
+const TASK_DIRECTORY: &str = "/home/tester/src/td-vm/work";
 
 pub(crate) struct Config {
     user: String,
@@ -60,10 +61,9 @@ impl Config {
         command
     }
 
-    fn terminal(&self, generation: &str, handle: u64) -> Command {
+    fn terminal(&self, generation: &str, handle: u64, terminal: Terminal) -> Command {
         let mut command = Command::new("/bin/td-login");
-        command
-            .args([
+        command.args([
                 "exec-as",
                 &self.user,
                 "--",
@@ -72,8 +72,11 @@ impl Config {
                 &self.owner.to_string(),
                 generation,
                 &handle.to_string(),
-            ])
-            .process_group(0);
+            ]);
+        if terminal == Terminal::Task {
+            command.arg("task");
+        }
+        command.process_group(0);
         command
     }
 }
@@ -195,7 +198,7 @@ fn require_session_process(uid: u32, status: &str, cgroup: &str) -> Result<(), S
     Ok(())
 }
 
-fn terminal_command(uid: u32, generation: &str, handle: u64) -> Command {
+fn terminal_command(uid: u32, generation: &str, handle: u64, terminal: Terminal) -> Command {
     let mut command = Command::new("/bin/td-term");
     command.env(
         "TD_CONTROL_SOCKET",
@@ -208,13 +211,20 @@ fn terminal_command(uid: u32, generation: &str, handle: u64) -> Command {
         "--ready-socket",
         &format!("/run/user/{uid}/td-auth-terminal-{generation}-{handle}.ready"),
     ]);
+    if terminal == Terminal::Task {
+        command.args(["--working-directory", TASK_DIRECTORY]);
+    }
     command
 }
 
 /// Runs only after td-login dropped credentials, before any terminal code.
 pub(crate) fn terminal_exec(arguments: &[String]) -> Result<(), String> {
-    let [uid, generation, handle] = arguments else {
-        return Err("terminal-exec requires UID GENERATION HANDLE".into());
+    let (uid, generation, handle, terminal) = match arguments {
+        [uid, generation, handle] => (uid, generation, handle, Terminal::Home),
+        [uid, generation, handle, task] if task == "task" => {
+            (uid, generation, handle, Terminal::Task)
+        }
+        _ => return Err("terminal-exec requires UID GENERATION HANDLE [task]".into()),
     };
     let uid = number(uid, 1000..=1000)?;
     if generation.len() != 32
@@ -237,7 +247,7 @@ pub(crate) fn terminal_exec(arguments: &[String]) -> Result<(), String> {
     )?;
     Err(format!(
         "exec session terminal: {}",
-        terminal_command(uid, generation, value).exec()
+        terminal_command(uid, generation, value, terminal).exec()
     ))
 }
 
@@ -303,15 +313,22 @@ fn wait_check(child: &mut Child, deadline: Instant) -> Result<(), String> {
 
 #[derive(Debug, PartialEq, Eq)]
 enum Request {
-    Start,
+    Start(Terminal),
     Poll(u64),
     Heartbeat,
     Secret(crate::session::Request),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Terminal {
+    Home,
+    Task,
+}
+
 fn request(bytes: &[u8]) -> Result<Request, String> {
     match bytes {
-        [1] => Ok(Request::Start),
+        [1] => Ok(Request::Start(Terminal::Home)),
+        [4] => Ok(Request::Start(Terminal::Task)),
         [2, rest @ ..] if rest.len() == 8 => {
             let handle =
                 u64::from_be_bytes(rest.try_into().map_err(|_| "invalid terminal handle")?);
@@ -345,7 +362,7 @@ impl Launches {
         match request {
             Request::Secret(_) => Err("secret request reached terminal dispatcher".into()),
             Request::Heartbeat => Ok(vec![0x83]),
-            Request::Start => {
+            Request::Start(terminal) => {
                 if self.children.len() >= LIMIT {
                     return Ok(vec![0xff, 1]);
                 }
@@ -354,7 +371,7 @@ impl Launches {
                     .next
                     .checked_add(1)
                     .ok_or("terminal handle space exhausted")?;
-                let child = match spawn(&mut config.terminal(&self.generation, handle)) {
+                let child = match spawn(&mut config.terminal(&self.generation, handle, terminal)) {
                     Ok(child) => child,
                     Err(why) => {
                         let _ = writeln!(std::io::stderr().lock(), "td-authd: {why}");

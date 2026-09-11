@@ -41,7 +41,8 @@ fn only_canonical_disjoint_session_identities_are_configurable() {
 
 #[test]
 fn the_caller_can_only_start_poll_or_keep_the_channel_alive() {
-    assert_eq!(request(&[1]).unwrap(), Request::Start);
+    assert_eq!(request(&[1]).unwrap(), Request::Start(Terminal::Home));
+    assert_eq!(request(&[4]).unwrap(), Request::Start(Terminal::Task));
     assert_eq!(request(&[3]).unwrap(), Request::Heartbeat);
     let mut poll = vec![2];
     poll.extend_from_slice(&17u64.to_be_bytes());
@@ -72,7 +73,11 @@ fn fixed_commands_select_the_account_and_all_terminal_arguments() {
         check.get_args().collect::<Vec<_>>(),
         ["check-launch-session", "tester", "1000", "993"]
     );
-    let terminal = config.terminal("000102030405060708090a0b0c0d0e0f", 17);
+    let terminal = config.terminal(
+        "000102030405060708090a0b0c0d0e0f",
+        17,
+        Terminal::Home,
+    );
     assert_eq!(terminal.get_program(), "/bin/td-login");
     assert_eq!(
         terminal.get_args().collect::<Vec<_>>(),
@@ -87,7 +92,12 @@ fn fixed_commands_select_the_account_and_all_terminal_arguments() {
             "17",
         ]
     );
-    let terminal = terminal_command(1000, "000102030405060708090a0b0c0d0e0f", 17);
+    let terminal = terminal_command(
+        1000,
+        "000102030405060708090a0b0c0d0e0f",
+        17,
+        Terminal::Home,
+    );
     assert_eq!(terminal.get_program(), "/bin/td-term");
     assert_eq!(
         terminal.get_envs().collect::<Vec<_>>(),
@@ -96,6 +106,24 @@ fn fixed_commands_select_the_account_and_all_terminal_arguments() {
             Some(std::ffi::OsStr::new("/run/td-compositor/1000/td-control")),
         )]
     );
+    let task = config.terminal(
+        "000102030405060708090a0b0c0d0e0f",
+        18,
+        Terminal::Task,
+    );
+    assert_eq!(task.get_args().last(), Some(std::ffi::OsStr::new("task")));
+    let task = terminal_command(
+        1000,
+        "000102030405060708090a0b0c0d0e0f",
+        18,
+        Terminal::Task,
+    );
+    assert!(task.get_args().collect::<Vec<_>>().windows(2).any(|pair| {
+        pair == [
+            std::ffi::OsStr::new("--working-directory"),
+            std::ffi::OsStr::new(TASK_DIRECTORY),
+        ]
+    }));
     assert_eq!(
         terminal.get_args().collect::<Vec<_>>(),
         [
@@ -219,7 +247,9 @@ fn capacity_counts_unacknowledged_completions_and_cannot_spawn_over_the_limit() 
         launches.children.insert(handle, child);
     }
     assert_eq!(
-        launches.answer(&config(), Request::Start).unwrap(),
+        launches
+            .answer(&config(), Request::Start(Terminal::Home))
+            .unwrap(),
         [0xff, 1]
     );
     assert_eq!(launches.next, 1);
@@ -230,7 +260,7 @@ fn handle_exhaustion_fails_before_a_child_can_start() {
     let mut launches = Launches::new("000102030405060708090a0b0c0d0e0f".into());
     launches.next = u64::MAX;
     assert!(launches
-        .answer(&config(), Request::Start)
+        .answer(&config(), Request::Start(Terminal::Home))
         .unwrap_err()
         .contains("exhausted"));
     assert!(launches.children.is_empty());
@@ -298,8 +328,8 @@ fn readiness_names_include_fresh_generations_and_fit_unix_socket_bounds() {
     assert_ne!(a, b);
     assert_eq!(a.len(), 32);
     assert_eq!(b.len(), 32);
-    let first = terminal_command(1000, &a, u64::MAX);
-    let second = terminal_command(1000, &b, u64::MAX);
+    let first = terminal_command(1000, &a, u64::MAX, Terminal::Home);
+    let second = terminal_command(1000, &b, u64::MAX, Terminal::Home);
     assert_ne!(first.get_args().last(), second.get_args().last());
     assert!(first.get_args().last().unwrap().len() < 108);
 }

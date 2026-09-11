@@ -343,7 +343,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
     // Pin startup as well as raw code: aliases can evade API-name scans.
     assert_eq!(
         fingerprint(main),
-        0x840c9d920a87c430,
+        0x4d7dcc0809699555,
         "main.rs: production startup changed"
     );
     assert_eq!(
@@ -361,7 +361,7 @@ fn fingerprint(source: &str) -> u64 {
     })
 }
 
-const LAUNCH_FINGERPRINT: u64 = 0x95486409583cc028;
+const LAUNCH_FINGERPRINT: u64 = 0x9a5336be34b5a89a;
 
 const INTAKE_RAW_FINGERPRINT: u64 = 0x320c8b6ddbfe29af;
 const INTAKE_FINGERPRINT: u64 = 0xe2f50441f71b4c76;

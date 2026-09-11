@@ -468,14 +468,18 @@ launch; startup validation does not pin later account edits.
 The validator has a two-second observed completion deadline, measured before
 spawn and shorter than the channel frame deadline. Failure kills and reaps
 the trusted validator and closes the channel. There is no caller-provided
-executable, environment, directory, account, uid or argument vector. All
-children replace stdin, stdout and stderr with `/dev/null`, clear the
-environment, and start from `/`. This also replaces the original private
-endpoint on fd 0: relying only on Channel's CLOEXEC clone would leak
-authority. All subsequently created channel descriptors are CLOEXEC. The
-daemon never passes an inherited root log descriptor to a user program.
+executable, environment, directory path, account, uid or argument vector. A
+typed terminal kind selects either the account home or td's fixed task
+worktree. All
+authority-spawned credential-helper children replace stdin, stdout and stderr
+with `/dev/null`, clear the environment, and start from `/`. The task variant's
+eventual td-term child enters only the fixed worktree described below. Replacing
+stdin also replaces the original private endpoint on fd 0: relying only on
+Channel's CLOEXEC clone would leak authority. All subsequently created channel
+descriptors are CLOEXEC. The daemon never passes an inherited root log
+descriptor to a user program.
 
-Before validation both ends exchange the framed `TDLA001` protocol greeting
+Before validation both ends exchange the framed `TDLA002` protocol greeting
 with a final newline. After successful validation the authority sends `80`;
 only then may the peer submit requests. The earlier transport greeting in
 Channel pins the sender before the protocol greeting or any spawn.
@@ -486,6 +490,7 @@ Subsequent payloads are exact byte records:
 | `01` | `81` plus a nonzero big-endian u64 process handle |
 | `02` plus that u64 handle | `82 00` running, `82 01` successful exit, or `82 02` failed exit |
 | `03` | `83` heartbeat |
+| `04` | `81` plus a process handle for a terminal in the fixed task worktree |
 
 A full table returns `ff 01`; a spawn failure returns `ff 02`. Every other
 request, trailing byte, unknown handle, wait error, timeout or transport
@@ -508,7 +513,9 @@ increase without reuse; exhaustion fails before spawn. The peer must send a
 request or heartbeat within each five-second receive deadline.
 
 The authority runs `/bin/td-login exec-as USER -- /bin/td-authd
-terminal-exec UID GENERATION HANDLE` in a new process group. td-login checks
+terminal-exec UID GENERATION HANDLE [task]` in a new process group. The
+optional literal is present only for request `04`; it is not a pathname.
+td-login checks
 the human account policy and drops and verifies credentials. Its exact
 environment is `HOME`, `SHELL`, `USER`, `LOGNAME` from the account and
 `PATH=/bin`, with no inherited `LANG`, `XDG_RUNTIME_DIR` or
@@ -521,7 +528,9 @@ configured by td-login.
 
 After that check it execs `/bin/td-term run --socket
 /run/td-compositor/UID/wayland-0 --ready-socket
-/run/user/UID/td-auth-terminal-GENERATION-HANDLE.ready`. No shell command or
+/run/user/UID/td-auth-terminal-GENERATION-HANDLE.ready`. The task variant adds
+`--working-directory /home/tester/src/td-vm/work`; the ordinary variant keeps
+the verified account home. No shell command or
 consent operation is involved. Directly invoking terminal-exec cannot change
 credentials or enter a different session. Its membership check verifies
 placement after the trusted credential helper; it is not human
@@ -933,7 +942,7 @@ runtime key.
 
 After root startup, sender-pidfd greeting and the existing immutable
 account/ledger admission, the paired authority owns exactly one Session
-for the configured human UID 1000. Its TDLA001 protocol gains the exact
+for the configured human UID 1000. Its TDLA002 protocol has the exact
 requests below; the existing terminal client does not send them yet.
 No new socket or public listener is created. Only the pinned compositor
 process may send these records. None contains a credential, token

@@ -12,6 +12,7 @@ const MAX_APPLICATION_NAME_BYTES: usize = 32;
 const RESERVED_APPLICATION_NAMES: &[&str] = &["td-jail", "td-jail-reaper-probe"];
 const UI_ENTRY_INDEX: usize = 1;
 const ENTRY_COUNT: usize = 3;
+pub(crate) const TASK_DIRECTORY: &str = "/home/tester/src/td-vm/work";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LauncherAction {
@@ -28,6 +29,7 @@ pub enum LauncherAction {
 pub enum LaunchRequest {
     UiDemo,
     Terminal,
+    TaskTerminal,
 }
 
 #[derive(Clone, Copy)]
@@ -135,6 +137,13 @@ pub(crate) enum LaunchBackend {
 }
 
 impl LaunchBackend {
+    pub(crate) fn task_launcher(&self) -> Option<crate::authority::Launcher> {
+        match self {
+            Self::Authority(authority) => Some(authority.clone()),
+            Self::Direct(_) => None,
+        }
+    }
+
     pub fn unlock(&self, attempt: std::sync::Arc<crate::secret_client::Attempt>) -> Result<(), String> {
         match self {
             Self::Authority(authority) => authority.unlock(attempt),
@@ -154,6 +163,10 @@ impl LaunchBackend {
             Self::Direct(processes) => processes.launch(request),
             Self::Authority(authority) if request == LaunchRequest::Terminal => {
                 authority.launch()?;
+                Ok(Vec::new())
+            }
+            Self::Authority(authority) if request == LaunchRequest::TaskTerminal => {
+                authority.launch_task()?;
                 Ok(Vec::new())
             }
             // LiveInputTarget activates the configured scene before calling us.
@@ -593,15 +606,23 @@ pub(crate) fn launch_command(
             ready.clone(),
             ready,
         ),
-        (LaunchRequest::Terminal, _) => (options.terminal.clone(), ready.clone(), ready),
+        (LaunchRequest::Terminal | LaunchRequest::TaskTerminal, _) => {
+            (options.terminal.clone(), ready.clone(), ready)
+        }
     };
-    let arguments = vec![
+    let mut arguments = vec![
         OsString::from("run"),
         OsString::from("--socket"),
         options.socket.as_os_str().to_os_string(),
         OsString::from("--ready-socket"),
         published_ready.as_os_str().to_os_string(),
     ];
+    if request == LaunchRequest::TaskTerminal {
+        arguments.extend([
+            OsString::from("--working-directory"),
+            OsString::from(TASK_DIRECTORY),
+        ]);
+    }
     Ok((program, arguments, tracked_ready))
 }
 
@@ -855,6 +876,12 @@ mod tests {
             launch_command(&options, LaunchRequest::Terminal, 9).unwrap();
         assert_eq!(terminal, PathBuf::from("/bin/td-term"));
         assert_eq!(terminal_arguments.first(), Some(&OsString::from("run")));
+        let (_, task_arguments, _) =
+            launch_command(&options, LaunchRequest::TaskTerminal, 10).unwrap();
+        assert!(task_arguments.windows(2).any(|pair| pair == [
+            OsString::from("--working-directory"),
+            OsString::from("/home/tester/src/td-vm/work"),
+        ]));
 
         let direct = LaunchOptions {
             socket: options.socket.clone(),

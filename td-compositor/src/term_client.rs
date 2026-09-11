@@ -36,6 +36,7 @@ use std::time::{Duration, Instant};
 pub struct Options {
     pub socket: PathBuf,
     pub ready_socket: PathBuf,
+    pub working_directory: Option<PathBuf>,
     /// The child's literal argv, or empty for the default shell. See
     /// `pty::child_command` for what each means. Bytes rather than text: a
     /// filename argument is whatever the filesystem holds.
@@ -2453,12 +2454,17 @@ fn settle(
 /// not have. The slave is consumed by the spawn and every parent-side clone
 /// of it is dropped there, so the master is the only handle left and closing
 /// it is the kernel's ordinary hangup.
+struct ChildSession<'a> {
+    account: &'a pty::Account,
+    directory: &'a Path,
+}
+
 fn start_child(
     pty: &Pty,
     events: &SyncSender<Event>,
     command: &pty::ChildCommand,
     program: Option<String>,
-    account: &pty::Account,
+    session: ChildSession<'_>,
     wayland_socket: &Path,
     input: Arc<pty::Input>,
 ) -> Result<Started, String> {
@@ -2477,13 +2483,13 @@ fn start_child(
         // from the same recipe constant the compositor binds. Read here rather
         // than inside `environment` so that one stays a pure function.
         &pty::environment(
-            account,
+            session.account,
             std::env::var("TD_CONTROL_SOCKET").ok().as_deref(),
             wayland_socket
                 .to_str()
                 .ok_or("Wayland socket path is not UTF-8")?,
         ),
-        Path::new(&account.home),
+        session.directory,
         slave,
     )?;
 
@@ -2550,12 +2556,21 @@ fn start(
     let account = pty::current_account(inputs.status, inputs.passwd)?;
     let command = pty::child_command(Path::new(pty::CTTYHACK), inputs.command)?;
     let program = launched_program_name(inputs.command);
+    let directory = inputs
+        .working_directory
+        .unwrap_or_else(|| Path::new(&account.home));
+    if !directory.is_absolute() {
+        return Err("terminal working directory is not absolute".into());
+    }
     let (children, child) = start_child(
         pty,
         events,
         &command,
         program,
-        &account,
+        ChildSession {
+            account: &account,
+            directory,
+        },
         inputs.wayland_socket,
         input,
     )?;
@@ -2572,6 +2587,7 @@ struct StartInputs<'a> {
     passwd: &'a Path,
     ready_socket: &'a Path,
     command: &'a [OsString],
+    working_directory: Option<&'a Path>,
 }
 
 /// A child ending ends the session: a terminal outliving its shell is a
@@ -2898,6 +2914,7 @@ pub fn run(options: &Options) -> Result<(), String> {
             passwd: Path::new(ETC_PASSWD),
             ready_socket: &options.ready_socket,
             command: &options.command,
+            working_directory: options.working_directory.as_deref(),
         },
         (rows, columns),
         input,
@@ -3026,6 +3043,7 @@ mod tests {
         let mut options = Options {
             socket: "/run/td-compositor/1000/wayland-0".into(),
             ready_socket: "/run/user/1000/terminal.ready".into(),
+            working_directory: None,
             command: Vec::new(),
         };
         assert_eq!(
@@ -5824,6 +5842,7 @@ mod tests {
                 passwd: &missing,
                 ready_socket: &ready_socket,
                 command: &[],
+                working_directory: None,
             },
             (22, 74),
             pty::Input::new(),
@@ -5878,6 +5897,7 @@ mod tests {
                 passwd: &passwd,
                 ready_socket: &ready_socket,
                 command: &[OsString::from("mail")],
+                working_directory: None,
             },
             (22, 74),
             pty::Input::new(),
@@ -5940,6 +5960,7 @@ mod tests {
                 passwd: &passwd,
                 ready_socket: &ready_socket,
                 command: &command,
+                working_directory: None,
             },
             (22, 74),
             pty::Input::new(),
@@ -5956,6 +5977,87 @@ mod tests {
             include_str!("term_client.rs").contains(&exit_site),
             "the exit site reports the child's program"
         );
+    }
+
+    /// The task launcher gives td-term a directory rather than changing the
+    /// authority helper's own cwd. This crosses the whole remaining boundary:
+    /// `StartInputs` selects the override, `start_child` hands it to the PTY
+    /// spawn, and the actual child reports the cwd it inherited.
+    #[test]
+    fn the_working_directory_in_the_start_inputs_reaches_the_child() {
+        let pty = Pty::open(Path::new(pty::DEV_PTMX)).unwrap();
+        let (sender, events) = sync_channel(MAX_PENDING_EVENTS);
+        let directory = std::env::temp_dir();
+        let unique = format!(
+            "{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        );
+        let ready_socket = directory.join(format!("td-term-task-cwd-ready-{unique}"));
+        let task = directory.join(format!("td-term-task-cwd-{unique}"));
+        std::fs::create_dir(&task).unwrap();
+        let status = std::fs::read_to_string(PROC_STATUS).unwrap();
+        let uid = status
+            .lines()
+            .find_map(|line| line.strip_prefix("Uid:"))
+            .and_then(|rest| rest.split_whitespace().nth(1))
+            .unwrap();
+        let passwd = directory.join(format!("td-term-task-cwd-passwd-{unique}"));
+        std::fs::write(
+            &passwd,
+            format!("td:x:{uid}:{uid}::{}:/bin/sh\n", directory.display()),
+        )
+        .unwrap();
+        let fixture = fixture_command("term_client_cwd_fixture");
+        let mut command = vec![fixture.program.into_os_string()];
+        command.extend(fixture.arguments);
+        let input = pty::Input::new();
+
+        let (threads, _child, ready) = start(
+            &pty,
+            &sender,
+            &StartInputs {
+                wayland_socket: Path::new("/run/td-compositor/1000/wayland-0"),
+                status: Path::new(PROC_STATUS),
+                passwd: &passwd,
+                ready_socket: &ready_socket,
+                command: &command,
+                working_directory: Some(&task),
+            },
+            (22, 74),
+            Arc::clone(&input),
+        )
+        .unwrap();
+        input.close().unwrap();
+        drop(sender);
+
+        let mut output = Vec::new();
+        let mut status = None;
+        let mut drained = false;
+        while status.is_none() || !drained {
+            match events.recv_timeout(Duration::from_secs(30)).unwrap() {
+                Event::Output(bytes) => output.extend(bytes),
+                Event::Exit(value) => status = Some(value),
+                Event::Drained => drained = true,
+                Event::Closed(error) => panic!("terminal producer failed: {error}"),
+                other => panic!("the child produced {}", named(&other)),
+            }
+        }
+        for thread in threads {
+            thread.join().unwrap().unwrap();
+        }
+        assert!(status.unwrap().success(), "the cwd fixture failed");
+        let task = task.canonicalize().unwrap();
+        assert!(
+            String::from_utf8_lossy(&output)
+                .contains(&format!("TD-TERM-CHILD-CWD {}", task.display())),
+            "the child did not report the task directory: {:?}",
+            String::from_utf8_lossy(&output)
+        );
+
+        drop(ready);
+        std::fs::remove_file(&passwd).unwrap();
+        std::fs::remove_dir(&task).unwrap();
     }
 
     /// The BELL is deliberately kept where a reply is consumed: §10 says the
@@ -6435,7 +6537,10 @@ mod tests {
             &sender,
             &fixture_command("term_client_abort_fixture"),
             None,
-            &account,
+            ChildSession {
+                account: &account,
+                directory: &directory,
+            },
             Path::new("/run/td-compositor/1000/wayland-0"),
             pty::Input::new(),
         )
@@ -7894,6 +7999,15 @@ mod tests {
         std::io::stdout().flush().unwrap();
     }
 
+    #[test]
+    #[ignore = "spawned as the child of the task-working-directory test"]
+    fn term_client_cwd_fixture() {
+        println!(
+            "TD-TERM-CHILD-CWD {}",
+            std::env::current_dir().unwrap().display()
+        );
+    }
+
     /// The same, and then a LINE READ: it says what it was told, which is what
     /// makes the writer's absence visible from the parent. A whole line,
     /// because the slave is in the kernel's canonical mode and a read there
@@ -7965,7 +8079,10 @@ mod tests {
             &sender,
             &fixture_command("term_client_echo_fixture"),
             None,
-            &account,
+            ChildSession {
+                account: &account,
+                directory: &directory,
+            },
             Path::new("/run/td-compositor/1000/wayland-0"),
             Arc::clone(&queued),
         )
@@ -8075,7 +8192,10 @@ mod tests {
             &sender,
             &fixture_command("term_client_child_fixture"),
             None,
-            &account,
+            ChildSession {
+                account: &account,
+                directory: &directory,
+            },
             Path::new("/run/td-compositor/1000/wayland-0"),
             pty::Input::new(),
         )

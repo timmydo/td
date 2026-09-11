@@ -368,10 +368,10 @@ pub fn child_command(wrapper: &Path, command: &[OsString]) -> Result<ChildComman
 /// consumed here and dropped before this returns, so only the master remains
 /// and closing it produces the kernel's normal hangup.
 ///
-/// `directory` is the account's verified home. Setting `HOME` does not move the
-/// child, so without this the shell would start in whatever directory td-svc
-/// left the graphical service in and disagree with its own environment. A home
-/// the child cannot enter fails the spawn rather than silently landing in `/`.
+/// `directory` is the account's verified home unless the typed launcher chose
+/// a fixed task directory. Setting `HOME` does not move the child, so without
+/// this the shell would start wherever td-svc left the graphical service. A
+/// directory the child cannot enter fails rather than silently landing in `/`.
 pub fn spawn(
     command: &ChildCommand,
     environment: &[(String, String)],

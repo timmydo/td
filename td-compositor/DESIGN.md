@@ -5226,11 +5226,14 @@ system integration tests assert that the staged td-init advertises and
 exercises this exact flag, tying the absolute path to the declared runtime
 input. Ordinary rescue-console behavior remains unchanged.
 
-The child starts in the verified account home: setting `HOME` does not move a
-process, so without an explicit working directory the shell would start
-wherever td-svc left the graphical service and disagree with its own
-environment. A home the child cannot enter fails the spawn rather than silently
-landing in `/`. Immediately after a successful spawn, td-term drops the original
+The child starts in the verified account home by default: setting `HOME` does
+not move a process, so without an explicit working directory the shell would
+start wherever td-svc left the graphical service and disagree with its own
+environment. `--working-directory PATH` accepts one absolute path before
+`--command`; failure to enter it fails the spawn rather than silently landing
+in `/`. The paired authority never accepts that path from its caller: its typed
+task-terminal request supplies the fixed `/home/tester/src/td-vm/work` value.
+Immediately after a successful spawn, td-term drops the original
 slave and all three parent-side `Stdio` clones, retaining only the master.
 Closing that master produces the kernel's normal PTY hangup; child exit unmaps
 the surface and terminates the client.
@@ -6178,8 +6181,9 @@ kernel sender-pinning greeting before this process starts a worker or could
 delegate an endpoint. The application protocol then completes its version and
 session-admission handshake before graphical startup proceeds.
 
-One worker owns the channel and every process handle. Input submits terminal
-launches or private physical secret attempts through a capacity-one
+One worker owns the channel and every process handle. Input submits ordinary
+terminal launches, the private VM bridge may submit a fixed task-terminal
+launch, and physical input submits secret attempts through a capacity-one
 nonblocking queue; an
 already-pending request is a reported refusal, never an input-thread wait.
 The worker serializes starts and polls one retained handle per loop iteration.
@@ -6195,6 +6199,8 @@ the compositor unsuccessfully so paired supervision replaces the generation.
 The original stdin remains open and private for the compositor's lifetime.
 Authority-mode launch requests never reach CommandSpawner; all ordinary
 terminal processes are created by the root authority through td-login. The
+task variant is a distinct `TDLA002` request and carries no directory bytes.
+The root authority alone maps it to `/home/tester/src/td-vm/work`. The
 compositor neither reads nor removes human-owned readiness paths. It observes
 new terminals as ordinary Wayland surfaces. The paired secret extension
 carries only typed operation descriptions and acknowledgements; no master or
@@ -6613,6 +6619,18 @@ continues to replace the inode for operator-requested retries. No terminal or
 host action is added. The shared publication helper compares at most the known
 request length plus one byte, including plans longer than the clipboard/feed
 configuration bound.
+
+The revision-zero `workspace-terminal` operation accepts that same complete
+plan, preserves its request inode, and requires the matching status to be
+ready before it queues a terminal. Pending, failed, malformed, mismatched or
+untrusted status never reaches the launcher. The private bridge then submits
+only the typed task-terminal request to the paired authority and answers
+`task terminal queued`; this acknowledges queue admission, not process exec,
+Wayland mapping or readiness. It carries no executable, directory, command or
+environment from the host and is absent from public Wayland and the control
+socket. A lost reply can follow queue admission, so automatic provisioning
+does not retry an unconfirmed launch. Clipboard sharing and focus do not gate
+the operation.
 
 
 The empty revision-zero `poweroff` carrier operation cancels clipboard leases

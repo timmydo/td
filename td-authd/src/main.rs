@@ -34,7 +34,7 @@ use std::process::ExitCode;
 
 const USAGE: &str = "usage: td-authd channel-check --peer-uid UID | \
     td-authd terminal-serve --user USER --uid UID --peer-uid UID | \
-    td-authd terminal-exec UID GENERATION HANDLE | td-authd prepare-portal-files | \
+    td-authd terminal-exec UID GENERATION HANDLE [task] | td-authd prepare-portal-files | \
     td-authd release-portal-files | td-authd prepare-application-files APP | \
     td-authd release-application-files APP | \
     td-authd application-start OWNER APP direct|terminal|shell -- ARG... | \

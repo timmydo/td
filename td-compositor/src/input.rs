@@ -3673,6 +3673,7 @@ mod tests {
                 Bound::Command(Command::ToggleFullscreen) => "TOGGLE FULLSCREEN",
                 Bound::Command(Command::ToggleGrouped) => "GROUP A COLUMN",
                 Bound::Launch(LaunchRequest::Terminal) => "NEW TERMINAL",
+                Bound::Launch(LaunchRequest::TaskTerminal) => "NEW TERMINAL",
                 Bound::Launch(LaunchRequest::UiDemo) => "OPEN UI CLIENT",
                 Bound::Launcher(_) => "OPEN LAUNCHER",
                 Bound::Help(_) => "THIS HELP",

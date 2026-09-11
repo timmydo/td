@@ -9,6 +9,7 @@ pub trait Host {
     fn key(&mut self) -> Result<(), String>;
     fn enroll(&mut self) -> Result<Plan, String>;
     fn ensure(&mut self, plan: &Plan) -> Result<Progress, String>;
+    fn launch(&mut self, plan: &Plan) -> Result<(), String>;
     fn report(&mut self, message: &str);
 }
 
@@ -16,6 +17,7 @@ enum Phase {
     Key,
     Enroll,
     Clone(Box<Plan>),
+    Launch(Box<Plan>),
     Done,
 }
 
@@ -79,14 +81,25 @@ impl Provision {
                     self.report(host, "Preparing the private guest clone and task worktree.".into());
                 }
                 Ok(Progress::Ready) => {
-                    self.phase = Phase::Done;
-                    self.report(host, "Prepared: /home/tester/src/td-vm/work. Terminal launch, private build-store setup and agent login remain pending.".into());
+                    self.phase = Phase::Launch(plan.clone());
+                    self.unavailable_until = now + UNAVAILABLE;
+                    self.report(host, "Opening a task terminal in /home/tester/src/td-vm/work.".into());
                 }
                 Ok(Progress::Failed(error)) => {
                     self.phase = Phase::Done;
                     self.report(host, format!("Blocked: guest workspace preparation failed: {error}. Repair the cause and use workspace clone to request a retry."));
                 }
                 Err(error) => self.unavailable(host, now, "guest workspace progress", error),
+            },
+            Phase::Launch(plan) => match host.launch(plan) {
+                Ok(()) => {
+                    self.phase = Phase::Done;
+                    self.report(host, "Prepared: task terminal queued in /home/tester/src/td-vm/work. Private build-store setup and agent login remain pending.".into());
+                }
+                Err(error) => {
+                    self.phase = Phase::Done;
+                    self.report(host, format!("Blocked: task terminal launch outcome unconfirmed: {error}. Inspect the guest before using workspace terminal to retry."));
+                }
             },
             Phase::Done => {}
         }
@@ -152,6 +165,7 @@ mod tests {
         key: VecDeque<Result<(), String>>,
         enrollment_error: Option<String>,
         replies: VecDeque<Result<Progress, String>>,
+        launches: VecDeque<Result<(), String>>,
         calls: Vec<&'static str>,
         reports: Vec<String>,
     }
@@ -166,6 +180,11 @@ mod tests {
         fn ensure(&mut self, plan: &Plan) -> Result<Progress, String> {
             assert_eq!(*plan, crate::vm_wire::workspace::example());
             self.calls.push("ensure"); self.replies.pop_front().unwrap_or(Ok(Progress::Pending))
+        }
+        fn launch(&mut self, plan: &Plan) -> Result<(), String> {
+            assert_eq!(*plan, crate::vm_wire::workspace::example());
+            self.calls.push("launch");
+            self.launches.pop_front().unwrap_or(Ok(()))
         }
         fn report(&mut self, value: &str) { self.reports.push(value.into()); }
     }
@@ -209,7 +228,7 @@ mod tests {
         for seconds in [0, 1, 2, 4, 6, 8, 10, 900, 1800] {
             run.poll(&mut host, now + Duration::from_secs(seconds));
         }
-        assert_eq!(host.calls, ["key", "key", "enroll", "ensure", "ensure", "ensure", "ensure"]);
+        assert_eq!(host.calls, ["key", "key", "enroll", "ensure", "ensure", "ensure", "ensure", "launch"]);
         assert!(host.reports.last().unwrap().starts_with("Prepared:"));
     }
     #[test]
@@ -223,6 +242,21 @@ mod tests {
             assert_eq!(host.calls, expected);
             assert!(host.reports.last().unwrap().starts_with("Blocked:"));
         }
+    }
+    #[test]
+    fn uncertain_task_launch_is_not_retried_automatically() {
+        let now = Instant::now();
+        let mut run = Provision::new(now);
+        let mut host = Fixture {
+            replies: [Ok(Progress::Ready)].into(),
+            launches: [Err("authority reply lost".into()), Ok(())].into(),
+            ..Fixture::default()
+        };
+        for seconds in [0, 2, 4, 6, 8] {
+            run.poll(&mut host, now + Duration::from_secs(seconds));
+        }
+        assert_eq!(host.calls, ["key", "enroll", "ensure", "launch"]);
+        assert!(host.reports.last().unwrap().contains("outcome unconfirmed"));
     }
     #[test]
     fn missing_guest_times_out_but_a_new_supervisor_can_resume() {

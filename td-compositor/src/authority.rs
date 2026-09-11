@@ -23,16 +23,17 @@ use std::os::unix::fs::MetadataExt;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TrySendError};
 use std::time::{Duration, Instant};
 
-const VERSION: &[u8] = b"TDLA001\n";
+const VERSION: &[u8] = b"TDLA002\n";
 const CAPACITY: usize = 16;
 const QUEUE_CAPACITY: usize = 1;
 const TICK: Duration = Duration::from_millis(250);
 
 enum Work {
-    Terminal,
+    Terminal(Terminal),
     Secret(std::sync::Arc<crate::secret_client::Attempt>),
 }
 
+#[derive(Clone)]
 pub(crate) struct Launcher {
     send: SyncSender<Work>,
 }
@@ -79,12 +80,26 @@ impl Launcher {
     }
 
     pub fn launch(&self) -> Result<(), String> {
-        match self.send.try_send(Work::Terminal) {
+        match self.send.try_send(Work::Terminal(Terminal::Home)) {
             Ok(()) => Ok(()),
             Err(TrySendError::Full(_)) => Err("terminal launch is already pending".into()),
             Err(TrySendError::Disconnected(_)) => Err("terminal authority is unavailable".into()),
         }
     }
+
+    pub fn launch_task(&self) -> Result<(), String> {
+        match self.send.try_send(Work::Terminal(Terminal::Task)) {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Full(_)) => Err("terminal launch is already pending".into()),
+            Err(TrySendError::Disconnected(_)) => Err("terminal authority is unavailable".into()),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum Terminal {
+    Home,
+    Task,
 }
 
 fn startup() -> Result<(), String> {
@@ -209,11 +224,19 @@ impl Processes {
         }
     }
 
-    fn start(&mut self, wire: &mut impl Exchange) -> Result<Option<&'static str>, String> {
+    fn start(
+        &mut self,
+        wire: &mut impl Exchange,
+        terminal: Terminal,
+    ) -> Result<Option<&'static str>, String> {
         if self.handles.len() >= CAPACITY {
             return Ok(Some("terminal launch limit reached"));
         }
-        match wire.exchange(&[1])?.as_slice() {
+        let request = match terminal {
+            Terminal::Home => [1],
+            Terminal::Task => [4],
+        };
+        match wire.exchange(&request)?.as_slice() {
             [0xff, 1] => Ok(Some("terminal authority process table is full")),
             [0xff, 2] => Ok(Some("terminal authority could not start the helper")),
             [0x81, handle @ ..] if handle.len() == 8 => {
@@ -262,8 +285,8 @@ fn worker(mut wire: impl Exchange, receive: Receiver<Work>) -> Result<(), String
     loop {
         match receive.recv_timeout(TICK) {
             Ok(Work::Secret(attempt)) => secrets.start(&mut wire, attempt)?,
-            Ok(Work::Terminal) => {
-                if let Some(error) = processes.start(&mut wire)? {
+            Ok(Work::Terminal(terminal)) => {
+                if let Some(error) = processes.start(&mut wire, terminal)? {
                     let _ = writeln!(std::io::stderr().lock(), "td-compositor: {error}");
                 }
             }
@@ -387,8 +410,10 @@ mod tests {
             vec![0x82, 1],
             vec![0x83],
         ]);
-        assert_eq!(p.start(&mut w).unwrap(), None);
-        assert_eq!(p.start(&mut w).unwrap(), None);
+        assert_eq!(p.start(&mut w, Terminal::Home).unwrap(), None);
+        assert_eq!(p.start(&mut w, Terminal::Task).unwrap(), None);
+        assert_eq!(w.requests[0], [1]);
+        assert_eq!(w.requests[1], [4]);
         assert_eq!(p.poll(&mut w).unwrap(), None);
         assert_eq!(p.poll(&mut w).unwrap(), Some("launched terminal failed"));
         assert_eq!(p.poll(&mut w).unwrap(), None);
@@ -408,19 +433,21 @@ mod tests {
             vec![0xff, 3],
             vec![0xff, 1, 0],
         ] {
-            assert!(Processes::new().start(&mut wire(vec![answer])).is_err());
+            assert!(Processes::new()
+                .start(&mut wire(vec![answer]), Terminal::Home)
+                .is_err());
         }
         let mut p = Processes::new();
         let mut w = wire(vec![handle(1), vec![0x82, 1], handle(1)]);
-        p.start(&mut w).unwrap();
+        p.start(&mut w, Terminal::Home).unwrap();
         p.poll(&mut w).unwrap();
-        assert!(p.start(&mut w).is_err());
+        assert!(p.start(&mut w, Terminal::Home).is_err());
         let mut p = Processes::new();
         let mut w = wire((1..=16).map(handle).collect());
         for _ in 0..16 {
-            assert_eq!(p.start(&mut w).unwrap(), None);
+            assert_eq!(p.start(&mut w, Terminal::Home).unwrap(), None);
         }
-        assert!(p.start(&mut w).unwrap().is_some());
+        assert!(p.start(&mut w, Terminal::Home).unwrap().is_some());
         assert_eq!(w.requests.len(), 16);
     }
 
@@ -435,7 +462,7 @@ mod tests {
         ] {
             let mut processes = Processes::new();
             let mut wire = wire(vec![handle(1), status]);
-            processes.start(&mut wire).unwrap();
+            processes.start(&mut wire, Terminal::Home).unwrap();
             assert!(processes.poll(&mut wire).is_err());
         }
         for status in [vec![], vec![0x83, 0], vec![0x82, 1]] {
@@ -444,7 +471,7 @@ mod tests {
         for response in [vec![0xff, 1], vec![0xff, 2]] {
             let mut processes = Processes::new();
             assert!(processes
-                .start(&mut wire(vec![response]))
+                .start(&mut wire(vec![response]), Terminal::Home)
                 .unwrap()
                 .is_some());
             assert!(processes.handles.is_empty());
@@ -462,7 +489,7 @@ mod tests {
             }
         }
         let (send, receive) = mpsc::sync_channel(QUEUE_CAPACITY);
-        assert!(send.try_send(Work::Terminal).is_ok());
+        assert!(send.try_send(Work::Terminal(Terminal::Home)).is_ok());
         drop(send);
         let calls = std::rc::Rc::new(std::cell::Cell::new(0));
         assert!(worker(Broken(calls.clone()), receive).is_err());
@@ -475,7 +502,9 @@ mod tests {
         let launcher = Launcher { send };
         assert!(launcher.launch().is_ok());
         assert!(launcher.launch().is_err());
-        assert!(matches!(receive.try_recv(), Ok(Work::Terminal)));
+        assert!(matches!(receive.try_recv(), Ok(Work::Terminal(Terminal::Home))));
+        assert!(launcher.launch_task().is_ok());
+        assert!(matches!(receive.try_recv(), Ok(Work::Terminal(Terminal::Task))));
         assert!(receive.try_recv().is_err());
         drop(receive);
         assert!(launcher.launch().is_err());

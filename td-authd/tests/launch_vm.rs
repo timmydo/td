@@ -28,7 +28,7 @@ fn park() -> ! {
 
 fn terminal() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    assert_eq!(args.len(), 5);
+    assert!(matches!(args.len(), 5 | 7));
     assert_eq!(
         &args[..4],
         [
@@ -39,7 +39,18 @@ fn terminal() {
         ]
     );
     assert!(args[4].starts_with("/run/user/1000/td-auth-terminal-"));
-    assert!(args[4].ends_with("-1.ready"));
+    let task = args.len() == 7;
+    assert!(args[4].ends_with(if task { "-2.ready" } else { "-1.ready" }));
+    if task {
+        assert_eq!(
+            &args[5..],
+            ["--working-directory", "/home/tester/src/td-vm/work"]
+        );
+    }
+    // td-authd starts td-term itself in the authority's fixed neutral
+    // directory. The real td-term applies --working-directory only when it
+    // spawns the shell; this stand-in never reaches that child-spawn layer.
+    assert_eq!(std::env::current_dir().unwrap(), Path::new("/"));
     assert_eq!(
         fs::read_to_string("/proc/self/cgroup").unwrap(),
         "0::/td-user-1000/session\n"
@@ -102,7 +113,11 @@ fn terminal() {
         "/run/td-compositor/1000/td-control"
     );
     fs::write(
-        "/run/user/1000/terminal-evidence",
+        if task {
+            "/run/user/1000/task-terminal-evidence"
+        } else {
+            "/run/user/1000/terminal-evidence"
+        },
         "uid 1000; null stdio; no authority descriptor\n",
     )
     .unwrap();
@@ -113,16 +128,16 @@ fn peer(denied: bool, placement_denied: bool) {
     if denied {
         if let Ok(mut connection) = connection {
             if let Ok(version) = connection.receive() {
-                assert_eq!(version, b"TDLA001\n");
-                let _ = connection.send(b"TDLA001\n");
+                assert_eq!(version, b"TDLA002\n");
+                let _ = connection.send(b"TDLA002\n");
                 assert!(connection.receive().is_err());
             }
         }
         return;
     }
     let mut connection = connection.unwrap();
-    assert_eq!(connection.receive().unwrap(), b"TDLA001\n");
-    connection.send(b"TDLA001\n").unwrap();
+    assert_eq!(connection.receive().unwrap(), b"TDLA002\n");
+    connection.send(b"TDLA002\n").unwrap();
     assert_eq!(connection.receive().unwrap(), [0x80]);
     connection.send(&[3]).unwrap();
     assert_eq!(connection.receive().unwrap(), [0x83]);
@@ -137,6 +152,19 @@ fn peer(denied: bool, placement_denied: bool) {
             break;
         }
         assert_eq!(status, [0x82, 0], "terminal failed: {status:?}");
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    connection.send(&[4]).unwrap();
+    let started = connection.receive().unwrap();
+    assert_eq!(started, [0x81, 0, 0, 0, 0, 0, 0, 0, 2]);
+    loop {
+        connection.send(&[2, 0, 0, 0, 0, 0, 0, 0, 2]).unwrap();
+        let status = connection.receive().unwrap();
+        if status == [0x82, if placement_denied { 2 } else { 1 }] {
+            break;
+        }
+        assert_eq!(status, [0x82, 0], "task terminal failed: {status:?}");
         assert!(Instant::now() < deadline);
         std::thread::sleep(Duration::from_millis(10));
     }
@@ -217,7 +245,11 @@ fn init() {
         .unwrap()
         .success());
     fs::create_dir_all("/sys/fs/cgroup/td-user-1000/session").unwrap();
-    for path in ["/var/lib/td", "/run/user/1000", "/home/tester"] {
+    for path in [
+        "/var/lib/td",
+        "/run/user/1000",
+        "/home/tester/src/td-vm/work",
+    ] {
         fs::create_dir_all(path).unwrap();
     }
     for path in ["/run/user/1000", "/home/tester"] {
@@ -241,7 +273,12 @@ fn init() {
         fs::read_to_string("/run/user/1000/terminal-evidence").unwrap(),
         "uid 1000; null stdio; no authority descriptor\n"
     );
+    assert_eq!(
+        fs::read_to_string("/run/user/1000/task-terminal-evidence").unwrap(),
+        "uid 1000; null stdio; no authority descriptor\n"
+    );
     fs::remove_file("/run/user/1000/terminal-evidence").unwrap();
+    fs::remove_file("/run/user/1000/task-terminal-evidence").unwrap();
     attempt(true, true, false);
     assert!(!Path::new("/run/user/1000/terminal-evidence").exists());
     fs::remove_dir("/sys/fs/cgroup/td-user-1000/session").unwrap();

@@ -93,7 +93,7 @@ fn client_usage() -> String {
 }
 
 fn term_usage() -> String {
-    "usage: td-term run --socket PATH --ready-socket PATH [--command PROGRAM [ARG...]] \
+    "usage: td-term run --socket PATH --ready-socket PATH [--working-directory PATH] [--command PROGRAM [ARG...]] \
 | td-term probe READY_SOCKET | td-term selftest"
         .into()
 }
@@ -202,10 +202,11 @@ fn run_term(args: &[OsString]) -> Result<(), String> {
         "run" => {
             let args = args.get(1..).ok_or_else(term_usage)?;
             let (flags, command) = split_term_command(args)?;
-            let (socket, ready_socket) = parse_run_flags(&flags)?;
+            let (socket, ready_socket, working_directory) = parse_term_run_flags(&flags)?;
             term_client::run(&term_client::Options {
                 socket,
                 ready_socket,
+                working_directory,
                 command,
             })
         }
@@ -446,6 +447,7 @@ fn run_compositor(options: RunOptions) -> Result<(), String> {
                 .map(|name| launcher::ApplicationLaunch { name }),
         })?)
     };
+    let task_launcher = launches.task_launcher();
     let framebuffer = Framebuffer::open(&options.framebuffer)?;
     let size = framebuffer.dimensions();
     let geometry = (size.width, size.height, framebuffer.stride());
@@ -504,7 +506,7 @@ fn run_compositor(options: RunOptions) -> Result<(), String> {
     if let Some(path) = options.control_socket.as_deref() {
         control::serve(path, Arc::clone(&runtime), socket_policy)?;
     }
-    if let Err(error) = vm_bridge::start(Arc::clone(&runtime)) {
+    if let Err(error) = vm_bridge::start(Arc::clone(&runtime), task_launcher) {
         eprintln!("td-compositor: VM bridge unavailable: {error}");
     }
     // Reported, never fatal: a compositor without a clock is worth more
@@ -852,6 +854,37 @@ fn parse_run_flags(args: &[String]) -> Result<(PathBuf, PathBuf), String> {
     ))
 }
 
+fn parse_term_run_flags(
+    args: &[String],
+) -> Result<(PathBuf, PathBuf, Option<PathBuf>), String> {
+    let mut common = Vec::new();
+    let mut working_directory = None;
+    let mut index = 0;
+    while index < args.len() {
+        let flag = args
+            .get(index)
+            .ok_or_else(|| "missing terminal run flag".to_string())?;
+        let value = args
+            .get(index + 1)
+            .ok_or_else(|| format!("{flag} requires a value"))?;
+        if flag == "--working-directory" {
+            if working_directory.is_some() {
+                return Err("duplicate flag '--working-directory'".into());
+            }
+            let path = PathBuf::from(value);
+            if !path.is_absolute() {
+                return Err("terminal working directory is not absolute".into());
+            }
+            working_directory = Some(path);
+        } else {
+            common.extend([flag.clone(), value.clone()]);
+        }
+        index += 2;
+    }
+    let (socket, ready_socket) = parse_run_flags(&common)?;
+    Ok((socket, ready_socket, working_directory))
+}
+
 fn parse_client_run(args: &[String]) -> Result<client::Options, String> {
     let (socket, ready_socket) = parse_run_flags(args)?;
     Ok(client::Options {
@@ -1155,7 +1188,27 @@ mod tests {
             assert!(!error.contains("/s"), "{error}");
             assert!(error.contains("--command") || error.contains("not absolute"), "{error}");
         }
+        assert!(term_usage().contains("[--working-directory PATH]"));
         assert!(term_usage().contains("[--command PROGRAM [ARG...]]"));
+        let parsed = parse_term_run_flags(&text(&[
+            "--socket",
+            "/s",
+            "--ready-socket",
+            "/r",
+            "--working-directory",
+            "/home/tester/src/td-vm/work",
+        ]))
+        .unwrap();
+        assert_eq!(parsed.2, Some(PathBuf::from("/home/tester/src/td-vm/work")));
+        assert!(parse_term_run_flags(&text(&[
+            "--socket",
+            "/s",
+            "--ready-socket",
+            "/r",
+            "--working-directory",
+            "relative",
+        ]))
+        .is_err());
     }
 
     #[test]
@@ -1188,9 +1241,8 @@ mod tests {
         assert!(ready_name.starts_with("td-launcher-"));
         assert!(ready_name.ends_with("-7.ready"));
 
-        // The terminal rides the same `parse_run_flags`, reached here through
-        // the demo's wrapper — the shared parser is what makes one set of run
-        // flags a property rather than a coincidence.
+        // An ordinary terminal keeps the two common flags, and the task
+        // terminal adds one terminal-only absolute directory.
         let (program, arguments, ready_socket) =
             launcher::launch_command(&launch, launcher::LaunchRequest::Terminal, 8).unwrap();
         assert_eq!(program, launch.terminal);
@@ -1202,6 +1254,21 @@ mod tests {
         let parsed = parse_client_run(arguments.get(1..).unwrap()).unwrap();
         assert_eq!(parsed.socket, launch.socket);
         assert_eq!(parsed.ready_socket, ready_socket);
+        let (program, arguments, task_ready) = launcher::launch_command(
+            &launch,
+            launcher::LaunchRequest::TaskTerminal,
+            9,
+        )
+        .unwrap();
+        assert_eq!(program, launch.terminal);
+        let arguments: Vec<String> = arguments
+            .into_iter()
+            .map(|argument| argument.into_string().unwrap())
+            .collect();
+        let parsed = parse_term_run_flags(arguments.get(1..).unwrap()).unwrap();
+        assert_eq!(parsed.0, launch.socket);
+        assert_eq!(parsed.1, task_ready);
+        assert_eq!(parsed.2.as_deref(), Some(Path::new(launcher::TASK_DIRECTORY)));
         // The two usage strings are hand-written and the parser is not, so the
         // thing that can drift is what each TELLS an operator. Both must spell
         // the shared flags identically, or one personality documents a
@@ -1223,7 +1290,7 @@ mod confinement {
     const SHARED_SHA256: &str = include_str!("../../engine/src/sha256.rs");
     const SYS: &str = include_str!("sys.rs");
     const DRM: &str = include_str!("drm.rs");
-    const AUTHORITY_FINGERPRINT: u64 = 0x197670d040323c76;
+    const AUTHORITY_FINGERPRINT: u64 = 0xecef032b97345353;
     const AUTH_SYS_FINGERPRINT: u64 = 0x42363c39df98214d;
     const AUTH_CHANNEL_FINGERPRINT: u64 = 0xbad9a1ce43bb1449;
     const AUTHORITY: &str = include_str!("authority.rs");
