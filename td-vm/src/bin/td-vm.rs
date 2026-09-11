@@ -32,6 +32,8 @@ mod vm_wire;
 
 #[path = "../vm_git_profile.rs"]
 mod vm_git_profile;
+#[path = "../vm_settings_profile.rs"]
+mod vm_settings_profile;
 #[path = "../vm_git_origin.rs"]
 #[allow(dead_code)]
 mod vm_git_origin;
@@ -70,6 +72,9 @@ const HELP: &str = "td-vm: manage persistent graphical td instances
   td-vm git-profile set FILE          save a host Git profile
   td-vm git-profile show              display configured profile
   td-vm git-profile check             authenticate registrar and verify origin
+  td-vm settings-profile set FILE     save selected host agent/settings sources
+  td-vm settings-profile show         display the selected settings generation
+  td-vm settings-profile check        verify settings bytes and CLI versions
   td-vm workspace prepare NAME BRANCH save a private workspace plan
   td-vm workspace show NAME           inspect saved identity and Git profile
   td-vm workspace key NAME            request the guest-generated SSH public key
@@ -80,8 +85,8 @@ const HELP: &str = "td-vm: manage persistent graphical td instances
 TD_VM_HOME defaults to ~/.local/share/td-vm. Requires host QEMU, qemu-img and qemu-io.
 Reuse dist/td-vm-x86-64 from ./build-qcow; no image rebuild on create/open.
 Clipboard and feed actions require a bridge-capable system image. Workspace
-automatic provisioning on Open uses the updated image. Agent launch and login
-integration remain pending. Shut down from inside td;
+automatic provisioning on Open uses the updated image. Settings translation,
+agent launch and login integration remain pending. Shut down from inside td;
 Stop requests guest poweroff; --force explicitly cuts power.";
 
 fn main() -> ExitCode {
@@ -110,7 +115,7 @@ fn run(args: Vec<String>) -> Result<()> {
     };
     let words: Vec<&str> = args.iter().map(String::as_str).collect();
     let read_only = matches!(words.first(), Some(&"list" | &"templates" | &"logs" | &"status"))
-        || matches!(words.as_slice(), ["git-profile", "show" | "check"] | ["workspace", "show", _]);
+        || matches!(words.as_slice(), ["git-profile" | "settings-profile", "show" | "check"] | ["workspace", "show", _]);
     let manager = if read_only {
         if !home.exists() && matches!(words.as_slice(), ["list"] | ["templates"]) {
             println!("No managed instances or templates yet.");
@@ -137,6 +142,21 @@ fn run(args: Vec<String>) -> Result<()> {
             let profile = vm_git_profile::load(&manager.root)?;
             let origin = profile.check()?;
             println!("Git profile {}: registrar authenticated; origin {} at main {}. Guest SSH and workspace readiness remain unverified.", profile.fingerprint(), origin.repository, origin.head);
+            Ok(())
+        }
+        ["settings-profile", "set", file] => {
+            let _lock = manager.lock("settings-profile")?;
+            vm_settings_profile::configure(&manager.root, Path::new(file))?;
+            println!("Settings source profile saved; run td-vm settings-profile check before mapping it into guests");
+            Ok(())
+        }
+        ["settings-profile", "show"] => {
+            println!("{}", term::scrub_lines(&vm_settings_profile::load(&manager.root)?.summary()?));
+            Ok(())
+        }
+        ["settings-profile", "check"] => {
+            let profile = vm_settings_profile::load(&manager.root)?;
+            println!("{}", term::scrub_lines(&profile.check()?));
             Ok(())
         }
         ["import", name, bundle] => manager.import(name, Path::new(bundle)),

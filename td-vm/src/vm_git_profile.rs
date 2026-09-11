@@ -282,7 +282,14 @@ impl Profile {
     }
 }
 
-fn trusted_program(value: &str) -> Result<PathBuf> {
+pub(crate) fn trusted_program(value: &str) -> Result<PathBuf> {
+    trusted_program_with_boundary(value, None)
+}
+
+fn trusted_program_with_boundary(
+    value: &str,
+    boundary: Option<&Path>,
+) -> Result<PathBuf> {
     let uid = io(fs::metadata("/proc/self"), "inspect current UID")?.uid();
     let path = io(
         fs::canonicalize(absolute(value)?),
@@ -296,6 +303,7 @@ fn trusted_program(value: &str) -> Result<PathBuf> {
     {
         return Err("profile executable must be a trusted executable file".into());
     }
+    let mut reached_boundary = boundary.is_none();
     for parent in path.ancestors().skip(1) {
         let metadata = io(fs::symlink_metadata(parent), "inspect executable ancestor")?;
         if !metadata.is_dir()
@@ -304,11 +312,23 @@ fn trusted_program(value: &str) -> Result<PathBuf> {
         {
             return Err("untrusted profile executable ancestor".into());
         }
+        if boundary == Some(parent) {
+            reached_boundary = true;
+            break;
+        }
+    }
+    if !reached_boundary {
+        return Err("profile executable is outside its trust boundary".into());
     }
     Ok(path)
 }
 
-fn capture(command: Command) -> Result<Vec<u8>> {
+#[cfg(test)]
+pub(crate) fn trusted_program_beneath(value: &str, boundary: &Path) -> Result<PathBuf> {
+    trusted_program_with_boundary(value, Some(boundary))
+}
+
+pub(crate) fn capture(command: Command) -> Result<Vec<u8>> {
     capture_input(command, Stdio::null())
 }
 

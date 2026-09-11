@@ -624,6 +624,42 @@ Synchronize settings explicitly for an existing instance, showing conflicts
 with guest edits. Boot does not overwrite its changed settings, and guest
 changes are not silently written back to the host profile.
 
+### Implemented host settings source profile
+
+The manager now stores one operator-selected source profile under its private
+state root. Configure it with `td-vm settings-profile set FILE`, inspect it with
+`td-vm settings-profile show`, and revalidate it with
+`td-vm settings-profile check`. This is the settings equivalent of the host Git
+profile: it establishes exactly which host material a later schema adapter may
+read; it does not yet translate or send that material to a guest.
+
+The canonical `TDVM-SETTINGS-PROFILE-1` input has exactly these fields:
+`default-agent`, `workspace`, `path`, `codex-home`, `codex`, `codex-version`,
+`codex-sha256`, `codex-config-sha256`, `claude-home`, `claude`,
+`claude-sha256`, `claude-version`, and `claude-settings-sha256`. Paths are
+bounded canonical-shaped absolute paths.
+The selected default is exactly `codex` or `claude`; versions are bounded
+single lines; settings fingerprints are lowercase SHA-256. The private stored
+copy is mode 0600 and replaced by a synced rename under a stable profile lock.
+
+`check` resolves and validates the workspace, both CLI homes, every configured
+`PATH` entry, their ancestors, and both executables under caller-or-root
+ownership without group/other writes. It opens `config.toml`, `settings.json`,
+and both executable entry files without following their final links, compares
+their exact fingerprints, bounds each settings file at 64 KiB, and runs each
+exact executable's `--version` with a cleared environment plus scoped `HOME`,
+only its `CODEX_HOME` or `CLAUDE_CONFIG_DIR`, and the configured PATH.
+A settings or executable change requires an explicit reviewed profile
+replacement instead of silently changing later guests.
+
+The profile deliberately has no field for Codex `auth.json`, Claude
+`.credentials.json`, keyring contents, session databases, caches, transcripts,
+or project trust databases. A settings fingerprint is public configuration
+identity, not a credential. The next increment owns schema classification,
+host-path remapping, an instance-local generation and explicit conflict-aware
+guest synchronization. Until then `check` says those capabilities and login
+reuse remain pending; a matching hash/version is not an agent-ready claim.
+
 ## Login reuse and refresh ownership
 
 The desired UX is automatic reuse of an already linked host identity for each
