@@ -175,7 +175,8 @@ alone does not prove a complete system build or installation.
 ## Native release regression
 
 `td-recipe-eval qemu-update --kernel FILE --selector FILE --disk FILE
---format raw|qcow2 --work NEW-DIR [--timeout SECONDS]` runs the complete
+--format raw|qcow2 --work NEW-DIR [--timeout SECONDS] [--accel tcg|kvm]`
+runs the complete
 update path on a disposable qcow2 overlay of a stopped private installation.
 The supplied kernel and selector must match that installation. This is a
 host-side QEMU oracle over operator-selected inputs, outside recipe gates;
@@ -183,8 +184,15 @@ it does not establish those inputs' source provenance. Keep the backing
 files stable for the run and while retaining its overlay. A demo without a
 retained signing key cannot satisfy this test.
 
-The oracle uses four TCG CPUs and 12 GiB of guest memory. Its new private
-work directory retains the overlay, serial logs and prompt captures. The
+The oracle uses four CPUs and 12 GiB of guest memory. TCG is the default;
+`--accel kvm` selects hardware virtualization explicitly. KVM must be
+available to the invoking process; QEMU failure is fatal, with no TCG
+fallback. Each boot log and the completed result name the accelerator.
+On a host where the account has just joined the kvm group, invoke through
+`sg kvm -c 'COMMAND'` or a fresh login; querying `id USER` does not change
+an existing process's group membership.
+
+The new private work directory retains the overlay, serial logs and prompt captures. The
 path must fit a Unix socket name: at most 70 bytes, with no comma. The
 six-hour default deadline can be set explicitly between 60 seconds and
 seven days. Every boot has an additional 30-minute health deadline.

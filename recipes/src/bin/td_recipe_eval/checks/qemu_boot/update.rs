@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use td_recipe::{ladder, td_boot_protocol};
 
 type Result<T> = std::result::Result<T, String>;
-const USAGE: &str = "usage: qemu-update --kernel FILE --selector FILE --disk FILE --format raw|qcow2 --work NEW-DIR [--timeout SECONDS] [--rollback yes|no]";
+const USAGE: &str = "usage: qemu-update --kernel FILE --selector FILE --disk FILE --format raw|qcow2 --work NEW-DIR [--timeout SECONDS] [--rollback yes|no] [--accel tcg|kvm]";
 const READY_NOTICE: &str = " is ready. Press Ctrl+Alt+Escape, then I to review it.";
 const LINE_LIMIT: usize = 1024 * 1024;
 const LOG_LIMIT: u64 = 256 * 1024 * 1024;
@@ -24,6 +24,7 @@ struct Options {
     work: PathBuf,
     timeout: Duration,
     rollback: bool,
+    accel: &'static str,
 }
 
 fn options(args: &[String]) -> Result<Options> {
@@ -41,6 +42,7 @@ fn options(args: &[String]) -> Result<Options> {
                 | "--work"
                 | "--timeout"
                 | "--rollback"
+                | "--accel"
         ) || values.insert(key.as_str(), value.as_str()).is_some()
         {
             return Err(USAGE.into());
@@ -76,6 +78,11 @@ fn options(args: &[String]) -> Result<Options> {
         "no" => false,
         _ => return Err(USAGE.into()),
     };
+    let accel = match values.get("--accel").copied().unwrap_or("tcg") {
+        "tcg" => "tcg",
+        "kvm" => "kvm",
+        _ => return Err(USAGE.into()),
+    };
     Ok(Options {
         kernel: input("--kernel")?,
         selector: input("--selector")?,
@@ -84,6 +91,7 @@ fn options(args: &[String]) -> Result<Options> {
         work: PathBuf::from(get("--work")?),
         timeout: Duration::from_secs(timeout),
         rollback,
+        accel,
     })
 }
 
@@ -201,14 +209,24 @@ impl Guest {
     ) -> Result<Self> {
         let socket = options.work.join(format!("qmp-{pass}.sock"));
         let log = private_file(&options.work.join(format!("serial-{pass}.log")))?;
-        let error = private_file(&options.work.join(format!("qemu-{pass}.log")))?;
+        let mut error = private_file(&options.work.join(format!("qemu-{pass}.log")))?;
+        writeln!(
+            error,
+            "[qemu-update] boot {pass} accelerator={}",
+            options.accel
+        )
+        .map_err(|e| format!("record update VM accelerator: {e}"))?;
         let mut command = Command::new(find_qemu()?);
         command
             .args([
                 "-M",
                 "pc",
                 "-accel",
-                "tcg,thread=multi",
+                if options.accel == "tcg" {
+                    "tcg,thread=multi"
+                } else {
+                    "kvm"
+                },
                 "-smp",
                 "4",
                 "-m",
@@ -255,6 +273,7 @@ impl Guest {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(error);
+        println!("[qemu-update] boot {pass} accelerator={}", options.accel);
         let mut child = command
             .spawn()
             .map_err(|e| format!("start update VM: {e}"))?;
@@ -858,7 +877,7 @@ pub(crate) fn run_cli(args: &[String]) -> Result<()> {
             &options, deadline, &initial, &successor, &public, &source, &token,
         )?;
     }
-    let report = format!("initial={initial}\nsuccessor={successor}\npublic={public}\nsource={source}\ncancel_preserved_selectors=true\nphysical_prompt_verified=true\ninstalled_and_booted=true\nuser_data_preserved=true\nautomatic_rollback_verified={}\n", options.rollback);
+    let report = format!("initial={initial}\nsuccessor={successor}\npublic={public}\nsource={source}\ncancel_preserved_selectors=true\nphysical_prompt_verified=true\ninstalled_and_booted=true\nuser_data_preserved=true\nautomatic_rollback_verified={}\naccelerator={}\n", options.rollback, options.accel);
     private_file(&options.work.join("result.txt"))?
         .write_all(report.as_bytes())
         .map_err(|e| format!("write oracle result: {e}"))?;
@@ -1324,6 +1343,32 @@ mod tests {
             vec!["--kernel", "missing", "--kernel", "missing"],
         ] {
             let args = args.into_iter().map(str::to_string).collect::<Vec<_>>();
+            assert_eq!(options(&args).err().unwrap(), USAGE);
+        }
+    }
+
+    #[test]
+    fn accelerator_defaults_to_tcg_and_refuses_implicit_fallbacks() {
+        let input = std::env::current_exe().unwrap().display().to_string();
+        let mut args = vec![
+            "--kernel".into(),
+            input.clone(),
+            "--selector".into(),
+            input.clone(),
+            "--disk".into(),
+            input,
+            "--format".into(),
+            "qcow2".into(),
+            "--work".into(),
+            "unused".into(),
+        ];
+        assert_eq!(options(&args).unwrap().accel, "tcg");
+        args.extend(["--accel".into(), "kvm".into()]);
+        assert_eq!(options(&args).unwrap().accel, "kvm");
+        *args.last_mut().unwrap() = "tcg".into();
+        assert_eq!(options(&args).unwrap().accel, "tcg");
+        for invalid in ["kvm:tcg", "tcg,thread=multi", "auto", ""] {
+            *args.last_mut().unwrap() = invalid.into();
             assert_eq!(options(&args).err().unwrap(), USAGE);
         }
     }
