@@ -4473,6 +4473,10 @@ fn real_root_steps(sys: &SystemDef) -> Result<Vec<Step>, String> {
         link: "{root}/real-root/bin/td-feed".into(),
     });
     steps.push(Step::Symlink {
+        target: "{in:td-net}/bin/td-net".into(),
+        link: "{root}/real-root/bin/td-deploy".into(),
+    });
+    steps.push(Step::Symlink {
         target: "{in:td-portal}/bin/td-portal".into(),
         link: "{root}/real-root/bin/td-portal".into(),
     });
@@ -12948,11 +12952,13 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
     #[test]
     fn td_net_is_packed_and_not_merely_symlinked() {
         let steps = real_root_steps(&SYSTEM).unwrap();
-        assert!(steps.iter().any(|step| matches!(step,
-            Step::Symlink { target, link }
-                if target == "{in:td-net}/bin/td-net"
-                    && link == "{root}/real-root/bin/td-feed"
-        )), "the VM source consumer must be available as /bin/td-feed");
+        for applet in ["td-feed", "td-deploy"] {
+            assert!(steps.iter().any(|step| matches!(step,
+                Step::Symlink { target, link }
+                    if target == "{in:td-net}/bin/td-net"
+                        && link == &format!("{{root}}/real-root/bin/{applet}")
+            )), "the installed control-plane applet must be available: {applet}");
+        }
         assert!(
             steps.iter().any(|s| matches!(
                 s,

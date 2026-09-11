@@ -162,9 +162,10 @@ rootfs that has none.
 
 **D4. Signing happens outside the derivation.** A signing key inside a build
 would break both reproducibility (the output depends on a secret) and offline
-purity (the key is an undeclared input). Signing is a host-side `td-net`
+purity (the key is an undeclared input). Signing is a control-plane `td-net`
 operation over an already-built bundle, exactly as `td-subst sign` is over
-narinfos. A private key never enters the target graph, never enters a recipe,
+narinfos. It runs outside derivations, on either the build host or an
+installed system using its source-built signer. A private key never enters the target graph, never enters a recipe,
 and never appears in a store path.
 
 **D5. The ESP is not the system.** The EFI System Partition holds a *fixed*
@@ -252,6 +253,47 @@ as a path, so an entry for it would warn once and refuse nothing. A
 directory on each entry's error rather than hand a bare `ReadDir` back.
 This crate reads no directory today, which is why that wrapper does not
 exist and why its rule is written down before it does.
+
+### Installation signing identity
+
+Each installation generates its own deployment signing key during
+provisioning. A redistributable image contains no installation private key.
+The installer must provision the matching public key into the selector and
+the volume before first activation, then retain the private key in protected
+installation state outside deployments, recipes and `/td/store`. Updates and
+rollback retain that identity. Copying an installed disk copies its identity;
+creating another installation requires new state.
+
+The source-built `td-deploy identity STATE` primitive creates or reopens that
+identity. `STATE` is an absolute, caller-owned 0700 directory beneath trusted
+directory ancestors. Ancestors may be root-owned or caller-owned; shared
+writable ancestors require the sticky bit. Symlinks are refused, including a
+state path ending in a slash or dot. The parent must be readable for the
+durability barrier. New directories and files receive exact private modes
+through pinned descriptors regardless of the caller's umask; existing modes
+are never repaired. Special permission bits are refused on retained state.
+The command requires procfs, pins the state directory by descriptor, and
+serializes cooperating callers with its private `identity.lock`. Both the
+lock and `deployment.pk8` must be owned regular files with one link and mode
+0600. The caller's UID is the cooperation boundary, not an adversarial peer.
+
+The private PKCS#8 key is the only persisted key authority. The command
+derives and prints its canonical public key after syncing the key, its
+directory, and the directory's parent. Publication is a synced temporary file
+renamed under the lease. A crash before publication permits retry; a crash
+after publication preserves the same identity. An existing malformed,
+oversized, symlinked, hardlinked or exposed key is refused rather than
+replaced. There is no automatic key rotation or recovery from key loss:
+recovery requires explicit reprovisioning of both the identity and selector.
+
+This primitive uses td-net's existing reviewed ring signer and never executes
+inside a target derivation. `/bin/td-deploy` exposes the installed source-built
+multicall. The primitive supplies no elevation, installation consent, hardware
+sealing or application credential storage. The future installer operation
+owns those boundaries and must not rely on `su`. Enabling this primitive
+alone does not turn a demo bundle into an installation: demo selectors still
+carry their disposable build key, and no boot service generates identities.
+
 
 ## 4. Disk layout
 
@@ -386,8 +428,10 @@ may boot". Sharing one key would mean a compromise of the substituter's
 signing key is also a compromise of every machine's boot chain, and the two
 have different lifetimes and different exposure.
 
-Signing is host-side in `td-net`, where `ring` already signs: **`td-deploy`**,
-its own applet rather than a verb on `td-subst`, because the two are the
+Signing uses `td-net` outside derivations, where `ring` already signs:
+**`td-deploy`**, supplied by the host control plane or the installed
+source-built multicall. It is its own applet rather than a verb on
+`td-subst`, because the two are the
 different trust domains named above and one tool serving both invites one key
 serving both. `td-deploy sign MANIFEST PRIV OUT` signs the manifest's exact
 bytes — no canonicalisation, since the verifier hashes that same file to

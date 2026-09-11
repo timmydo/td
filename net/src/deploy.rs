@@ -1,4 +1,4 @@
-// td-deploy — the HOST half of authenticated deployments.
+// td-deploy — the control-plane signer for authenticated deployments.
 //
 // A deployment bundle's `manifest` already proves INTEGRITY: it carries a
 // SHA-256 per payload, and the deployment id is the sha256 of the manifest
@@ -15,9 +15,10 @@
 // in would make every re-signing a new id, and rollback would stop finding
 // what it rolled back to.
 //
-// Signing is host-side and OUTSIDE any derivation: a key inside a build breaks
+// Signing is OUTSIDE any derivation: a key inside a build breaks
 // reproducibility (the output depends on a secret) and offline purity (the key
-// is an undeclared input). Nothing here ever runs on a target.
+// is an undeclared input). The installed source-built multicall may provision
+// an installation identity; the host-seeded copy never enters the target graph.
 //
 // WHERE THIS RUNS: no target gate embeds td-net, but affected-checks runs the
 // host `net-test` preflight for net and td-engine changes (see the net rule in
@@ -35,8 +36,11 @@
 // check and the failure would surface at boot rather than at signing.
 use crate::protocol::{MANIFEST_HEADER, MAX_MANIFEST_BYTES};
 use crate::sig::{from_hex, keygen, sign_msg, to_hex, verify_msg, write_keypair};
+use std::io::Write;
 use std::os::unix::fs::DirBuilderExt;
 use std::path::Path;
+
+mod identity;
 
 fn die(msg: String) -> ! {
     eprintln!("td-deploy: {msg}");
@@ -124,6 +128,15 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
 // pattern, so the arguments cannot be read out of step with the guard.
 pub fn run(a: &[String]) {
     match a {
+        [_, verb, state] if verb == "identity" => {
+            let public = match identity::provision(Path::new(state)) {
+                Ok(public) => public,
+                Err(error) => die(error),
+            };
+            if let Err(error) = std::io::stdout().write_all(public.as_bytes()) {
+                die(format!("write installation public key: {error}"));
+            }
+        }
         [_, verb, priv_path, pub_path] if verb == "keygen" => {
             let (pkcs8, pubkey) = keygen().unwrap_or_else(|e| die(e));
             write_keypair(priv_path, &pkcs8, pub_path, &pubkey).unwrap_or_else(|e| die(e));
@@ -149,7 +162,7 @@ pub fn run(a: &[String]) {
         [_, verb] if verb == "selftest" => selftest(),
         _ => {
             eprintln!(
-                "usage:\n  td-deploy keygen PRIV PUB\n  \
+                "usage:\n  td-deploy identity STATE\n  td-deploy keygen PRIV PUB\n  \
                  td-deploy sign MANIFEST PRIV OUT\n  td-deploy selftest"
             );
             std::process::exit(2);
