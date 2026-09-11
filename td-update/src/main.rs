@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 
 use std::fs::{self, DirBuilder, File, OpenOptions};
-use std::io::{Read, Seek, Write};
+use std::io::{BufRead, BufReader, Read, Seek, Write};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
@@ -20,7 +20,7 @@ const SOURCE: &str = "/run/td-volume/td/source";
 const O_NOFOLLOW: i32 = 0x20000;
 const O_NONBLOCK: i32 = 0x800;
 const TARGET: &str = "x86_64-unknown-linux-gnu";
-const HELP: &str = "usage: td-update init | build\n\n  init   Clone the bundled release into ~/src/td if absent.\n  build  Build the current checkout's system using the installed toolchain.\n\nBuild preparation does not yet sign, install, or reboot a deployment.\n";
+const HELP: &str = "usage: td-update [install | build | init]\n\n  install  Build this checkout and request installation (the default).\n  build    Build without installing.\n  init     Clone the bundled release into ~/src/td if absent.\n\nInstallation requires secure-attention confirmation. Restart afterwards to boot it.\n";
 
 fn io<T>(result: std::io::Result<T>, action: &str) -> Result<T> {
     result.map_err(|e| format!("{action}: {e}"))
@@ -315,7 +315,7 @@ fn success(command: &mut Command, action: &str) -> Result<()> {
     }
 }
 
-fn build(root: &Path, home: &Path) -> Result<()> {
+fn build(root: &Path, home: &Path) -> Result<PathBuf> {
     build_with_tools(
         root,
         home,
@@ -324,7 +324,7 @@ fn build(root: &Path, home: &Path) -> Result<()> {
     )
 }
 
-fn build_with_tools(root: &Path, home: &Path, cargo: &Path, feed: &Path) -> Result<()> {
+fn build_with_tools(root: &Path, home: &Path, cargo: &Path, feed: &Path) -> Result<PathBuf> {
     for path in [
         "builder/Cargo.toml",
         "recipes/Cargo.toml",
@@ -367,15 +367,63 @@ fn build_with_tools(root: &Path, home: &Path, cargo: &Path, feed: &Path) -> Resu
             .env("TD_BUILDER_SELF", bin.join("td-builder")),
         "fetch native td-net dependencies",
     )?;
-    for verb in ["warm", "build-run"] {
-        success(
-            command(&bin.join("td-recipe-eval"), root, home)
-                .args([verb, "system-x86-64"])
-                .env("TD_BUILDER_SELF", bin.join("td-builder")),
-            &format!("{verb} system"),
-        )?;
+    success(
+        command(&bin.join("td-recipe-eval"), root, home)
+            .args(["warm", "system-x86-64"])
+            .env("TD_BUILDER_SELF", bin.join("td-builder")),
+        "warm system",
+    )?;
+    let mut child = io(command(&bin.join("td-recipe-eval"), root, home)
+        .args(["build-run", "system-x86-64"])
+        .env("TD_BUILDER_SELF", bin.join("td-builder"))
+        .stdout(Stdio::piped()).spawn(), "build system")?;
+    let result = child.stdout.take().ok_or("missing build output".into())
+        .and_then(|stdout| build_output(BufReader::new(stdout), &mut std::io::stdout().lock()));
+    if result.is_err() { let _ = child.kill(); }
+    let status = io(child.wait(), "wait for system build")?;
+    let output = result.map_err(|error| format!("{error} (system build status: {status})"))?;
+    if !status.success() { return Err(format!("build system failed ({status})")); }
+    Ok(output.join("deployment"))
+}
+
+fn build_output(mut input: impl BufRead, output: &mut impl Write) -> Result<PathBuf> {
+    const PREFIX: &[u8] = b"TD_RECIPE_RUN_OUT system-x86-64 ";
+    let mut deployment = None;
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        let count = io(input.by_ref().take(65537).read_until(b'\n', &mut line), "read build output")?;
+        if count == 0 { break; }
+        if count > 65536 { return Err("system build emitted an oversized output line".into()); }
+        io(output.write_all(&line), "display build output")?;
+        if let Some(path) = line.strip_prefix(PREFIX) {
+            if deployment.is_some() { return Err("system build returned duplicate output receipts".into()); }
+            let text = std::str::from_utf8(path).map_err(|_| "build output path is not UTF-8")?;
+            let text = text.strip_suffix('\n').ok_or("incomplete build output receipt")?;
+            let path = Path::new(text);
+            if !path.is_absolute() || text.contains('\0') || path.components().any(|part| matches!(part, std::path::Component::ParentDir)) {
+                return Err("invalid system build output path".into());
+            }
+            deployment = Some(path.to_path_buf());
+        }
     }
-    Ok(())
+    deployment.ok_or_else(|| "system build returned no output receipt".into())
+}
+
+fn install(root: &Path, home: &Path) -> Result<()> {
+    let source = build(root, home)?;
+    let manifest = io(OpenOptions::new().read(true).custom_flags(O_NOFOLLOW | O_NONBLOCK)
+        .open(source.join("manifest")), "open built manifest")?;
+    let metadata = io(manifest.metadata(), "inspect built manifest")?;
+    if !metadata.is_file() || metadata.len() == 0 || metadata.len() > 4096 {
+        return Err("built manifest is not a bounded regular file".into());
+    }
+    let mut bytes = Vec::new();
+    io(manifest.take(4097).read_to_end(&mut bytes), "read built manifest")?;
+    if bytes.len() > 4096 { return Err("built manifest grew while reading".into()); }
+    let deployment = sha256::hex_digest(&bytes);
+    success(command(Path::new("/bin/td-authd"), root, home)
+        .arg("request-update").arg(source).arg(deployment), "request system installation")
 }
 
 fn run(args: &[String]) -> Result<()> {
@@ -388,7 +436,7 @@ fn run(args: &[String]) -> Result<()> {
     if matches!(args.first().map(String::as_str), Some("--help" | "-h")) && args.len() == 1 {
         return io(std::io::stdout().write_all(HELP.as_bytes()), "write help");
     }
-    if args.len() != 1 || !matches!(args.first().map(String::as_str), Some("init" | "build")) {
+    if args.len() > 1 || !matches!(args.first().map(String::as_str), None | Some("init" | "build" | "install")) {
         return Err(HELP.into());
     }
     let home = PathBuf::from(std::env::var_os("HOME").ok_or("HOME is not set")?);
@@ -405,7 +453,8 @@ fn run(args: &[String]) -> Result<()> {
         Some("build") if args.len() == 1 => build(
             &io(std::env::current_dir(), "read current directory")?,
             &home,
-        ),
+        ).map(|_| ()),
+        None | Some("install") => install(&io(std::env::current_dir(), "read current directory")?, &home),
         _ => Err(HELP.into()),
     }
 }
@@ -555,6 +604,7 @@ fn main() {
     if fs::read_to_string(root.join("fail-phase")).unwrap_or_default() == phase {
         std::process::exit(7);
     }
+    if phase == "build-run" { println!("TD_RECIPE_RUN_OUT system-x86-64 {}", root.join("result").display()); }
 }
 "#).unwrap();
         let cargo = fixture.0.join("cargo");
@@ -579,8 +629,25 @@ fn main() {
             fs::write(fixture.0.join("fail-phase"), failure).unwrap();
             let result = build_with_tools(&fixture.0, &fixture.0, &cargo, &feed);
             assert_eq!(result.is_ok(), failure.is_empty(), "{result:?}");
+            if failure == "build-run" {
+                let error = result.as_ref().unwrap_err();
+                assert!(error.contains("no output receipt"), "{error}");
+                assert!(error.contains("exit status: 7"), "{error}");
+            }
             assert_eq!(fs::read_to_string(fixture.0.join("calls")).unwrap(), calls);
         }
+    }
+
+    #[test]
+    fn build_receipt_is_bounded_complete_and_required() {
+        for bytes in [b"ordinary log\n".as_slice(), b"TD_RECIPE_RUN_OUT system-x86-64 relative\n", b"TD_RECIPE_RUN_OUT system-x86-64 /tmp/../other\n", b"TD_RECIPE_RUN_OUT system-x86-64 /output", b"TD_RECIPE_RUN_OUT system-x86-64 /one\nTD_RECIPE_RUN_OUT system-x86-64 /two\n"] {
+            assert!(build_output(std::io::Cursor::new(bytes), &mut Vec::new()).is_err());
+        }
+        assert!(build_output(std::io::Cursor::new(vec![b'x'; 65537]), &mut Vec::new()).is_err());
+        let input = b"working\nTD_RECIPE_RUN_OUT system-x86-64 /output with spaces\n";
+        let mut output = Vec::new();
+        assert_eq!(build_output(std::io::Cursor::new(input), &mut output).unwrap(), PathBuf::from("/output with spaces"));
+        assert_eq!(output, input);
     }
 
     #[test]
@@ -599,7 +666,6 @@ fn main() {
     #[test]
     fn invalid_arguments_report_usage_without_resolving_home() {
         for args in [
-            vec![],
             vec!["unknown".to_string()],
             vec!["init".into(), "extra".into()],
         ] {

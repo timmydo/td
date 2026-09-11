@@ -364,6 +364,16 @@ physical W selection of one queued request; one presented token assertion
 authorizes that operation. There is no root-console write bypass. No login, `su` or keyboard-consent
 behavior substitutes for that authorization.
 
+Local system installation is a separate named root operation. The paired
+compositor selects one queued build with physical I and presents its full
+manifest ID; a fresh Enter after complete presentation authorizes only that
+installation. td-authd passes its pinned source directory to the fixed
+installed helper, which signs with the already-provisioned installation key
+and uses the existing boot transaction. Neither td-login nor su elevates the
+caller. This does not change human login, hardware authentication, credential
+release or sensitive protector policy. See td-authd/DESIGN.md and
+td-install/DESIGN.md for admission and lifetime limits.
+
 ## 4. Privilege can only be dropped, never gained
 
 td-login is **never installed setuid-root**. `system-x86-64` packs it as

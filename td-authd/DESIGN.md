@@ -1219,3 +1219,61 @@ TPM device cases to those authority checks. It uses the existing pinned
 host emulator and a private raw fixture disk, with cold reopen and changed
 PCR/different-TPM refusals specified in `td-secret/DESIGN.md`. These
 additional tests do not replace the authority's token-consent boundary.
+
+## Consent for a locally built system
+
+`deployment.rs` owns the sole stock installation intake at
+`/run/td-authd/1000/install`. Prepare creates it after the credential intake
+has checked the root-owned runtime parents. It has the same protected-parent,
+mode-0600 human socket, per-fragment UID and live sender-pidfd policy, but
+refuses every incoming SCM_RIGHTS descriptor. It uses the unchanged named
+transport in UNSAFE.md section 16. No public message grants consent.
+
+The client `td-authd request-update SOURCE DEPLOYMENT-ID` requires a root
+peer and the exact eight-byte `TDUPD01` newline greeting. Its u16 big-endian
+body length covers exactly 64 lowercase hexadecimal ID bytes followed by a
+UTF-8 absolute path of at most 4096 bytes. NUL and parent traversal refuse.
+Root pins the final directory without following a symlink, requires its
+owner to be UID 1000, and checks a bounded requester-owned regular manifest
+through that descriptor against the ID before sending admission byte 02.
+Intermediate path lookup and regular-file reads are synchronous filesystem
+operations; the byte/deadline bounds do not promise latency on a stalled
+filesystem. This queue cannot execute the source or open an arbitrary root
+command. One client, one accept and four nonblocking attempts per heartbeat
+bound socket work. Admission expires in five seconds; a sent admission
+receipt starts a sixty-second selection window. Extra traffic, foreign
+senders, descriptors, disconnect or expiry retire the pending request.
+
+Only private request 19 selects a queued installation; no ready request or
+a busy operation slot answers 99 00. A selection holds the directory File,
+generates a fresh 32-byte nonce and answers 92 DESCRIPTION. The description
+is consent tag 5: owner, nonce, requester UID and full deployment ID. It
+shares one operation slot with secret operations and read-only inspection.
+The root installation controller accepts exact presentation (13) and then
+one exact commit (14), within 120 seconds of selection. The compositor must
+obtain a fresh physical Enter after presenting the whole description before
+sending commit. Root rechecks the submitting process immediately beforehand.
+Keyboard confirmation authorizes this installation only; it cannot release
+secrets or authorize protector changes.
+
+After commit, root spawns only `/bin/td-update apply-operation ID`, with an
+empty environment, cwd `/`, the held directory File on stdin, null stdout
+and authority stderr. The helper's independent admission and transaction are
+specified in td-install/DESIGN.md. No key, command, device or mountpoint is
+selected by a requester. The confirmation is consumed even if spawn fails.
+Closing the screen or losing the public client after commit cannot revoke
+an installation that may already have published. The controller retains its
+single operation slot until the helper exits; it does not impose the consent
+deadline on filesystem publication. The public client waits at most an hour
+for its completion read. Only a successful helper exit permits public byte 01
+and private completion; failure returns byte 00. Missing completion is an
+uncertain result and never causes automatic retry. Restart is explicit.
+
+Before commit, Escape, requester loss or expiry cancels without launching.
+On failed-generation teardown, the controller kills and reaps its direct
+helper before secret-session cleanup. This alone cannot prove that the
+helper's boot-transaction descendant is gone. td-svc's existing authority
+cgroup owns every descendant and forbids a replacement generation until the
+entire previous cgroup is empty; helpers never detach from that containment.
+The boot transaction owns recovery of interrupted publication. No privileged
+shell, setuid entry, remembered consent or new credential switch is added.

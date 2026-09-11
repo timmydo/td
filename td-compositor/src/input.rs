@@ -154,6 +154,7 @@ struct KeyBindings {
 struct KeyDecision {
     attention: Option<bool>,
     secret: Option<crate::secret_client::Selection>,
+    confirm_install: Option<u128>,
     draining: bool,
     command: Option<Command>,
     launcher: Option<LauncherAction>,
@@ -173,6 +174,7 @@ impl KeyBindings {
         let mut decision = KeyDecision {
             attention: None,
             secret: None,
+            confirm_install: None,
             draining: false,
             command: None,
             launcher: None,
@@ -203,6 +205,7 @@ impl KeyBindings {
             if self.attention == AttentionState::Open && !self.secret_selected && !logical_pressed && event.value == KEY_PRESS {
                 decision.secret = match event.code {
                     KEY_W => Some(crate::secret_client::Selection::Write),
+                    KEY_I => Some(crate::secret_client::Selection::Install),
                     KEY_U => Some(crate::secret_client::Selection::Unlock(crate::authority::consent::Role::Primary)),
                     KEY_R => Some(crate::secret_client::Selection::Unlock(crate::authority::consent::Role::Recovery)),
                     KEY_E => Some(crate::secret_client::Selection::Enroll(crate::authority::consent::Recovery::SecondToken)),
@@ -210,6 +213,10 @@ impl KeyBindings {
                     _ => None,
                 };
                 self.secret_selected |= decision.secret.is_some();
+            }
+            if self.attention == AttentionState::Open && self.secret_selected && !logical_pressed
+                && event.value == KEY_PRESS && event.code == KEY_ENTER {
+                decision.confirm_install = Some(event.timestamp);
             }
             if self.attention == AttentionState::Open
                 && event.code == KEY_ESC
@@ -699,6 +706,7 @@ struct PointerFrame {
 }
 
 trait InputTarget {
+    fn confirm_install(&mut self, _timestamp: u128) -> Result<(), String> { Ok(()) }
     fn secret_request(&mut self, _role: crate::secret_client::Selection) -> Result<(), String> {
         Err("secret requests unavailable on this input target".into())
     }
@@ -992,6 +1000,10 @@ impl LiveInputTarget {
 }
 
 impl InputTarget for LiveInputTarget {
+    fn confirm_install(&mut self, timestamp: u128) -> Result<(), String> {
+        if let Some(attempt) = &self.secret_attempt { attempt.confirm_install(&EvdevOrigin { _private: () }, timestamp)?; }
+        Ok(())
+    }
     fn secret_request(&mut self, role: crate::secret_client::Selection) -> Result<(), String> {
         if self.secret_attempt.is_some() { return Err("physical attention already consumed a request".into()); }
         let attempt = crate::secret_client::Attempt::new(EvdevOrigin { _private: () }, Arc::clone(&self.runtime), role);
@@ -1484,6 +1496,7 @@ fn apply_locked<T: InputTarget>(
     if !decision.draining
         && decision.attention.is_none()
         && decision.secret.is_none()
+        && decision.confirm_install.is_none()
         && decision.command.is_none()
         && decision.launcher.is_none()
         && decision.help.is_none()
@@ -1559,6 +1572,7 @@ fn deliver_key_decision<T: InputTarget>(
             finish_attention(runtime, bindings)?;
         }
     }
+    if let Some(timestamp) = decision.confirm_install { runtime.confirm_install(timestamp)?; }
     if let Some(role) = decision.secret {
         runtime.secret_request(role)?;
     }
@@ -5634,6 +5648,7 @@ mod tests {
             (KEY_E, Selection::Enroll(Recovery::SecondToken)),
             (KEY_X, Selection::Enroll(Recovery::Unrecoverable)),
             (KEY_W, Selection::Write),
+            (KEY_I, Selection::Install),
         ] {
             let target = Mutex::new(RecordingTarget::default());
             let bindings = Mutex::new(KeyBindings {
@@ -5665,7 +5680,7 @@ mod tests {
     fn physical_attention_requires_a_fresh_explicit_enrollment_choice() {
         use crate::authority::consent::Recovery;
         use crate::secret_client::Selection;
-        for (code, selection) in [(KEY_E, Selection::Enroll(Recovery::SecondToken)), (KEY_X, Selection::Enroll(Recovery::Unrecoverable)), (KEY_W, Selection::Write)] {
+        for (code, selection) in [(KEY_E, Selection::Enroll(Recovery::SecondToken)), (KEY_X, Selection::Enroll(Recovery::Unrecoverable)), (KEY_W, Selection::Write), (KEY_I, Selection::Install)] {
             let mut bindings = KeyBindings { attention_enabled: true, ..KeyBindings::default() };
             let mut target = RecordingTarget::default();
             assert!(bindings.feed(key(code, KEY_PRESS)).secret.is_none());

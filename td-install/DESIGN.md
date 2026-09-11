@@ -317,7 +317,7 @@ disposable trust and no retained signing key.
 VM provisioning establishes trust before first activation; it never trusts
 a replacement public key supplied by an update volume. It does not install
 an EFI boot stub, provide disk encryption, or authorize successor activation.
-The named, consent-bound update operation remains the next integration step.
+The named, consent-bound update operation below authorizes successor activation.
 
 
 ### Privileged local installation mechanism
@@ -327,7 +327,9 @@ mechanism for the stock VM's installation authority. Its stdin is a held
 source directory descriptor owned by the configured requester (UID 1000),
 not a pathname. It is not an elevation command or a user consent flow.
 The authority must admit and present the exact manifest ID before invoking
-it; connecting that authority and `./update install` remains pending.
+it. `./update` (or `./update install`) builds the current checkout and queues
+that operation through td-authd. Physical I selects it and a fresh Enter
+after complete presentation confirms it, as specified in td-authd/DESIGN.md.
 
 The helper requires the existing root-owned 0700 installation signing
 state and single-link 0600 key. It never creates or replaces an identity.

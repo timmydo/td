@@ -1,14 +1,12 @@
-# Release source and build preparation
+# Release source, builds and local installation
 
 `td-update` is a dependency-free, source-built Rust program. The standard
 image supplies it at `/bin/td-update`; the checkout's `./update` points there.
-The ordinary `init` and `build` commands never change credentials, sign or
-install a deployment, or request reboot. The internal root-only
-`apply-operation DEPLOYMENT-ID` entry is the installation mechanism
-specified in `td-install/DESIGN.md`: it takes a held source directory on
-stdin, signs only the approved manifest with the existing installation key,
-and calls the single deployment writer in `td-boot`. It cannot elevate its
-caller. The typed authority and public installation command remain pending.
+It does not change credentials. `./update` builds the checkout and requests
+one installation through the paired authority; explicit `build` stops after
+building. The root-only `apply-operation` helper signs with the retained
+installation key and calls the single writer in `td-boot`, as specified in
+`td-install/DESIGN.md`. Restart remains explicit.
 
 ## Initial checkout
 
@@ -71,9 +69,20 @@ graph. It receives the exact builder just compiled through
 `TD_BUILDER_SELF`. No host cache is imported, no application payload becomes
 a compilation input, and the logical target prefix remains `/td/store`.
 The first build therefore needs the graph's local build space and upstream
-source downloads. This command does not pull Git implicitly or activate the
-result; those operations must remain distinguishable until signing and
-installation authorization are connected.
+source downloads. No command pulls Git implicitly. `build` does not activate
+the result. The evaluator's successful build must emit a complete bounded
+`TD_RECIPE_RUN_OUT system-x86-64` receipt with an absolute output path;
+logs stream to the terminal with a 64 KiB line ceiling. Missing or malformed
+receipts, duplicate receipts and a failed process refuse installation.
+
+The default command and explicit `install` take that output's deployment,
+hash its bounded regular manifest and invoke only installed
+`/bin/td-authd request-update SOURCE ID`. The root intake independently pins
+and checks the source before acknowledging it. The user then presses
+Ctrl+Alt+Escape, I and, after reviewing the full ID, Enter. Escape cancels
+before commitment. The installation state machine and its uncertain-result
+policy are normative in `td-authd/DESIGN.md`; no automatic retry or reboot
+follows. Demo images without a retained matching key cannot install.
 
 ## Evidence
 

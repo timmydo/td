@@ -371,10 +371,12 @@ const POINTER_BUTTON_LEFT: u32 = 272;
 #[allow(dead_code, reason = "trusted authority request consumer follows")]
 pub(crate) struct PresentedRequest {
     request: crate::authority::consent::Request,
+    completed: u128,
 }
 
 #[allow(dead_code, reason = "trusted authority request consumer follows")]
 impl PresentedRequest {
+    pub fn completed(&self) -> u128 { self.completed }
     pub fn into_request(self) -> crate::authority::consent::Request {
         self.request
     }
@@ -2107,7 +2109,13 @@ impl Runtime {
             .attention_request()
             .ok_or("trusted prompt was cancelled")?
             .clone();
-        Ok(PresentedRequest { request })
+        let completed = crate::sys::monotonic_time()?;
+        Ok(PresentedRequest { request, completed })
+    }
+
+    pub(crate) fn attention_request_visible(&self, request: &crate::authority::consent::Request) -> bool {
+        self.attention_enabled && self.scene.attention_visible() && !self.scene.attention_draining()
+            && self.scene.attention_request() == Some(request)
     }
 
     pub(crate) fn attention_notice(

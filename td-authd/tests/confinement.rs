@@ -32,6 +32,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
             "application_shell.rs",
             "channel.rs",
             "consent.rs",
+            "deployment.rs",
             "inspection.rs",
             "launch.rs",
             "main.rs",
@@ -58,6 +59,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
         ("main.rs", 1),
         ("channel.rs", 0),
         ("consent.rs", 0),
+        ("deployment.rs", 0),
         ("sys.rs", 4),
         ("launch.rs", 0),
         ("unlock.rs", 0),
@@ -89,7 +91,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
         ] {
             let child_api = matches!(
                 name,
-                "launch.rs" | "application.rs" | "unlock.rs" | "session.rs" | "inspection.rs" | "application_shell.rs" | "shell_channel.rs" | "terminal.rs"
+                "deployment.rs" | "launch.rs" | "application.rs" | "unlock.rs" | "session.rs" | "inspection.rs" | "application_shell.rs" | "shell_channel.rs" | "terminal.rs"
             ) && ["::Command", "::thread", ".spawn(", ".exec("]
                 .contains(&forbidden);
             let mapping_child_api = matches!(name, "portal_files.rs" | "application_files.rs")
@@ -101,7 +103,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
     }
     assert_eq!(
         fingerprint(include_str!("../src/consent.rs")),
-        0x8105ec9fbaf8b219,
+        0x60d62ec39aea1d04,
         "shared consent changed: reconcile td-secret/src/main.rs, compositor confinement and this pin"
     );
     assert_eq!(
@@ -121,7 +123,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
                 .next()
                 .unwrap()
         ),
-        0x70b54b8756abcb88,
+        0x4bfbf8bacebc9e8a,
         "paired secret controller changed"
     );
     assert_eq!(
@@ -134,6 +136,15 @@ fn the_production_source_and_raw_boundary_are_closed() {
         0x13e77bb9effa0802,
         "read-only store controller changed"
     );
+    let installation = include_str!("../src/deployment.rs").split("#[cfg(test)]").next().unwrap();
+    assert_eq!(fingerprint(installation), INSTALLATION_FINGERPRINT);
+    assert_eq!(installation.matches("Command::new(").count(), 1);
+    assert!(installation.contains("Command::new(\"/bin/td-update\")"));
+    assert!(installation.contains(".args([\"apply-operation\", deployment])"));
+    assert!(installation.contains("sender.descriptor.is_some()"));
+    for forbidden in ["send_descriptor(", "create_credential(", "seal_credential(", "pre_exec", "CommandExt", "setsid", "process_group"] {
+        assert!(!installation.contains(forbidden), "installation: {forbidden}");
+    }
     let intake_raw = include_str!("../src/secret_sys.rs").split("#[cfg(test)]").next().unwrap();
     assert_eq!(intake_raw.matches("#[allow(unsafe_code)]").count(), 2);
     assert_eq!(intake_raw.matches("core::arch::asm!").count(), 1);
@@ -332,7 +343,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
     // Pin startup as well as raw code: aliases can evade API-name scans.
     assert_eq!(
         fingerprint(main),
-        0xd94d49486e0dfec7,
+        0x840c9d920a87c430,
         "main.rs: production startup changed"
     );
     assert_eq!(
@@ -350,8 +361,10 @@ fn fingerprint(source: &str) -> u64 {
     })
 }
 
-const LAUNCH_FINGERPRINT: u64 = 0x67f04d92df199317;
+const LAUNCH_FINGERPRINT: u64 = 0x95486409583cc028;
 
 const INTAKE_RAW_FINGERPRINT: u64 = 0x320c8b6ddbfe29af;
 const INTAKE_FINGERPRINT: u64 = 0xe2f50441f71b4c76;
 const WRITE_REQUEST_FINGERPRINT: u64 = 0x188c619caba6ceb8;
+
+const INSTALLATION_FINGERPRINT: u64 = 0xc43ac63c23006af1;

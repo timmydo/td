@@ -12,6 +12,10 @@ mod channel;
     reason = "immutable trusted-prompt contract; authority consumer follows"
 )]
 mod consent;
+mod deployment;
+#[allow(dead_code, reason = "shared dependency-free SHA-256 implementation")]
+#[path = "../../engine/src/sha256.rs"]
+mod sha256;
 mod launch;
 mod unlock;
 mod secret_intake;
@@ -35,9 +39,13 @@ const USAGE: &str = "usage: td-authd channel-check --peer-uid UID | \
     td-authd release-application-files APP | \
     td-authd application-start OWNER APP direct|terminal|shell -- ARG... | \
      td-authd application-exec UID OWNER APP direct|terminal|shell -- ARG... | \
-     td-authd application-client ARG... | td-authd application-probe";
+     td-authd application-client ARG... | td-authd application-probe | \
+     td-authd request-update SOURCE DEPLOYMENT-ID";
 
 fn run(arguments: &[String]) -> Result<(), String> {
+    if let [verb, source, deployment] = arguments {
+        if verb == "request-update" { return deployment::request(source, deployment); }
+    }
     if arguments == ["prepare-portal-files"] {
         return portal_files::prepare();
     }

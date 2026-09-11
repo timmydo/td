@@ -6350,7 +6350,8 @@ capture or synthetic-input portal is implemented by this increment.
 
 A fresh physical U selects primary unlock, R recovery unlock, E enrollment
 with a second recovery token, X explicit unrecoverability, and W the ready
-credential write queued through `td-secret set`. Only one
+credential write queued through `td-secret set`; I selects a queued system
+installation. Only one
 selection is allowed per successfully opened and closed attention lifetime.
 Held keys, repeats and a second device pressing an already-held logical key
 cannot select an operation. Ordinary control, Wayland and portal input APIs
@@ -6363,7 +6364,7 @@ automatic enrollment/unlock. Success displays CREDENTIAL STORED.
 
 The device dispatcher treats a secret selection as work even when that
 key produces no ordinary key, modifier or pointer delivery. Its device-event
-regression exercises all five selections through the complete adapter,
+regression exercises all six selections through the complete adapter,
 including refusal outside attention and one selection per lifetime.
 The optional `qemu-secret --tpm` desktop case in `td-secret/DESIGN.md`
 executes this dispatcher with a UHID keyboard and the real paired authority,
@@ -6438,6 +6439,32 @@ fixed device roster requires compositor restart to add a replacement.
 Direct-profile readers retain their per-device partial-report fast path;
 they never claim secure attention or use the trusted timestamp cutoff.
 
+
+### Physical installation confirmation
+
+I selects the root installation request queued by `./update`. The returned
+description must be Install for requester and session owner 1000. No ready
+request displays a notice. The complete prompt names the full deployment ID,
+retention of the previous system and the need to restart, with Enter to
+install and Escape to cancel. The public requester cannot open this screen.
+
+A completed presentation also carries a CLOCK_MONOTONIC sample taken after
+successful full-frame submission. Only the evdev adapter can offer a fresh
+Enter press to the selected Attempt. Its timestamp must be strictly later
+than that sample, the exact request must still be visible outside drain,
+and the 120-second attention lifetime must remain active. Repeats, held
+logical keys, queued earlier events, Enter before presentation, ordinary
+control/input APIs and a replaced or hidden prompt cannot confirm. Failed
+clock sampling returns no presentation receipt. Runtime retains the sole
+monotonic syscall caller role; secret_client consumes the returned sample.
+
+The existing atomic cancellation/commit transition consumes that confirmation
+before sending the exact private commit. Repeated status invitations without
+Enter only wait. Success displays SYSTEM INSTALLED and a restart instruction.
+After commit, Escape can close the screen but cannot promise to undo an
+installation; the root controller retains the transaction until completion.
+This confirmation does not authorize any secret-store operation or enroll or
+rotate a signing key. The installation protocol is in td-authd/DESIGN.md.
 
 ### Immutable prompt presentation
 

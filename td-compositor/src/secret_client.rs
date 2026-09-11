@@ -4,7 +4,7 @@ use crate::authority::consent::{Enrollment, Operation, Platform, Recovery, Reque
 use crate::authority::Exchange;
 use crate::input::EvdevOrigin;
 use crate::runtime::Runtime;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -17,6 +17,7 @@ pub(crate) enum Selection {
     Unlock(Role),
     Enroll(Recovery),
     Write,
+    Install,
 }
 impl From<Role> for Selection {
     fn from(role: Role) -> Self {
@@ -26,7 +27,7 @@ impl From<Role> for Selection {
 impl Selection {
     fn operation(self) -> Option<Operation> {
         Some(match self {
-            Self::Write => return None,
+            Self::Write | Self::Install => return None,
             Self::Unlock(role) => Operation::Unlock { role },
             Self::Enroll(recovery) => Operation::Enroll {
                 platform: Platform::TpmPcr7,
@@ -38,6 +39,7 @@ impl Selection {
     fn request(self) -> Vec<u8> {
         match self {
             Self::Write => vec![0x18],
+            Self::Install => vec![0x19],
             Self::Unlock(Role::Primary) => vec![0x12, 1],
             Self::Unlock(Role::Recovery) => vec![0x12, 2],
             Self::Enroll(Recovery::Unrecoverable) => vec![0x16, 0],
@@ -52,6 +54,8 @@ pub(crate) struct Attempt {
     selection: Selection,
     state: AtomicU8,
     deadline: Option<Instant>,
+    presentation: Mutex<Option<(Request, u128)>>,
+    confirmed: AtomicBool,
 }
 
 impl Attempt {
@@ -66,6 +70,8 @@ impl Attempt {
             selection: selection.into(),
             state: AtomicU8::new(ACTIVE),
             deadline: Instant::now().checked_add(Duration::from_secs(120)),
+            presentation: Mutex::new(None),
+            confirmed: AtomicBool::new(false),
         })
     }
 
@@ -82,7 +88,7 @@ impl Attempt {
     }
 
     fn commit(&self) -> bool {
-        if !self.active() {
+        if !self.active() || (self.selection == Selection::Install && !self.confirmed.load(Ordering::SeqCst)) {
             return false;
         }
         self.state
@@ -109,7 +115,25 @@ impl Attempt {
         if !self.active() {
             return Err("physical attention was cancelled during presentation".into());
         }
-        Ok(receipt.into_request())
+        let completed = receipt.completed();
+        let request = receipt.into_request();
+        if self.selection == Selection::Install {
+            *self.presentation.lock().map_err(|_| "installation receipt lock poisoned")? = Some((request.clone(), completed));
+        }
+        Ok(request)
+    }
+
+    /// Only the physical evdev adapter can offer a confirmation key.
+    pub fn confirm_install(&self, _origin: &EvdevOrigin, timestamp: u128) -> Result<(), String> {
+        if self.selection != Selection::Install || !self.active() { return Ok(()); }
+        let runtime = self.runtime.lock().map_err(|_| "runtime lock poisoned")?;
+        let presentation = self.presentation.lock().map_err(|_| "installation receipt lock poisoned")?;
+        if let Some((request, completed)) = &*presentation {
+            if timestamp > *completed && self.active() && runtime.attention_request_visible(request) {
+                self.confirmed.store(true, Ordering::SeqCst);
+            }
+        }
+        Ok(())
     }
 
     pub fn notice(&self, notice: crate::attention::Notice) -> Result<(), String> {
@@ -179,13 +203,20 @@ impl Client {
         if attempt.selection == Selection::Write && response == [0x98, 0] {
             return attempt.notice(crate::attention::Notice::NoWrite);
         }
+        if attempt.selection == Selection::Install && response == [0x99, 0] {
+            return attempt.notice(crate::attention::Notice::NoInstall);
+        }
         let Some((&0x92, bytes)) = response.split_first() else {
             return Err("invalid secret operation start response".into());
         };
         let request = Request::decode(bytes)?;
         let selected = match attempt.selection.operation() {
             Some(operation) => request.operation() == &operation,
-            None => matches!(request.operation(), Operation::Set { requester: 1000, .. }),
+            None => match attempt.selection {
+                Selection::Write => matches!(request.operation(), Operation::Set { requester: 1000, .. }),
+                Selection::Install => matches!(request.operation(), Operation::Install { requester: 1000, .. }),
+                _ => false,
+            },
         };
         if request.owner() != 1000 || !selected {
             return Err("root secret request changed the selected operation".into());
@@ -246,6 +277,8 @@ impl Client {
                 && !pending.committed
                 && !pending.cancelled =>
             {
+                if pending.attempt.selection == Selection::Install && pending.attempt.active()
+                    && !pending.attempt.confirmed.load(Ordering::SeqCst) { return Ok(()); }
                 // This CAS chooses between physical cancellation and consent.
                 // No runtime lock spans the subsequent bounded exchange.
                 if pending.attempt.commit() {
@@ -263,6 +296,8 @@ impl Client {
                 pending.attempt.notice(
                     if matches!(pending.attempt.selection, Selection::Enroll(_)) {
                         crate::attention::Notice::Enrolled
+                    } else if pending.attempt.selection == Selection::Install {
+                        crate::attention::Notice::Installed
                     } else if pending.attempt.selection == Selection::Write {
                         crate::attention::Notice::Stored
                     } else {
@@ -389,6 +424,45 @@ mod tests {
         Wire {
             replies: replies.into(),
             calls: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn installation_waits_for_fresh_enter_after_complete_presentation() {
+        let mut screen = Screen::new();
+        Arc::get_mut(&mut screen.attempt).unwrap().selection = Selection::Install;
+        let request = Request::new([42; 32], 1000, Operation::Install { deployment: "ab".repeat(32), requester: 1000 }).unwrap();
+        let tagged = |tag: &[u8]| [tag, request.encode().as_slice()].concat();
+        let mut wire = wire(vec![tagged(&[0x92]), tagged(&[0x91, 4]), vec![0x93],
+            tagged(&[0x91, 5]), tagged(&[0x91, 5]), vec![0x94], tagged(&[0x91, 6])]);
+        let mut client = Client::default();
+        client.start(&mut wire, Arc::clone(&screen.attempt)).unwrap();
+        screen.attempt.confirm_install(&crate::input::test_origin(), u128::MAX).unwrap();
+        assert!(!screen.attempt.confirmed.load(Ordering::SeqCst));
+        client.tick(&mut wire).unwrap();
+        let completed = screen.attempt.presentation.lock().unwrap().as_ref().unwrap().1;
+        screen.attempt.confirm_install(&crate::input::test_origin(), completed).unwrap();
+        client.tick(&mut wire).unwrap();
+        assert!(!wire.calls.iter().any(|call| call.first() == Some(&0x14)));
+        screen.attempt.confirm_install(&crate::input::test_origin(), completed + 1).unwrap();
+        client.tick(&mut wire).unwrap();
+        screen.attempt.confirm_install(&crate::input::test_origin(), completed + 2).unwrap();
+        client.tick(&mut wire).unwrap();
+        assert!(client.pending.is_none());
+        assert_eq!(wire.calls.iter().filter(|call| call.first() == Some(&0x14)).count(), 1);
+    }
+
+    #[test]
+    fn installation_escape_or_hidden_prompt_cannot_be_confirmed() {
+        for cancel in [false, true] {
+            let mut screen = Screen::new();
+            Arc::get_mut(&mut screen.attempt).unwrap().selection = Selection::Install;
+            let request = Request::new([42; 32], 1000, Operation::Install { deployment: "ab".repeat(32), requester: 1000 }).unwrap();
+            screen.attempt.present(request).unwrap();
+            if cancel { screen.attempt.cancel(); }
+            else { screen.attempt.runtime.lock().unwrap().attention_notice(&crate::input::test_origin(), crate::attention::Notice::Failed).unwrap(); }
+            screen.attempt.confirm_install(&crate::input::test_origin(), u128::MAX).unwrap();
+            assert!(!screen.attempt.commit());
         }
     }
 

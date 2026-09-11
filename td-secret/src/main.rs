@@ -158,7 +158,7 @@ mod confinement {
         assert_eq!(fingerprint(include_str!("operation.rs")), 0x9e52120007bef08f);
         assert_eq!(fingerprint(include_str!("write_operation.rs")), 0x2f5050ddd2493660);
         assert_eq!(fingerprint(include_str!("enrollment_operation.rs")), 0x30dcb428ed75a535);
-        assert_eq!(fingerprint(include_str!("../../td-authd/src/consent.rs")), 0x8105ec9fbaf8b219, "shared consent changed: reconcile td-authd/tests/confinement.rs and td-compositor/src/main.rs pins");
+        assert_eq!(fingerprint(include_str!("../../td-authd/src/consent.rs")), 0x60d62ec39aea1d04, "shared consent changed: reconcile td-authd/tests/confinement.rs and td-compositor/src/main.rs pins");
     }
 
     #[test]

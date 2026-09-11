@@ -1640,3 +1640,10 @@ uncertain and must never trigger automatic retry.
 The app receives only its decrypted credential through `.Secret`. This
 local authority adds no remote store, synchronization service, account
 password, remembered consent, privileged shell or crypto dependency in apps.
+
+The shared named transport also serves td-authd's local installation intake,
+specified in its design and UNSAFE.md section 16. That consumer rejects all
+incoming rights and retains only sender pidfds. It adds no raw operations or
+credential access. Consent tag 5 describes a system installation; secret
+workers reject it, and physical Enter for installation cannot substitute for
+a token-bound secret operation.

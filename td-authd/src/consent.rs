@@ -30,6 +30,10 @@ pub enum Platform {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Operation {
+    Install {
+        deployment: String,
+        requester: u32,
+    },
     Enroll {
         platform: Platform,
         recovery: Recovery,
@@ -62,6 +66,11 @@ impl Request {
             return Err("invalid consent request identity".into());
         }
         match &operation {
+            Operation::Install { deployment, requester }
+                if !deployment_id(deployment) || *requester != owner =>
+            {
+                return Err("invalid consent installation target".into());
+            }
             Operation::Enroll {
                 platform: _,
                 recovery: Recovery::Unrecoverable,
@@ -135,6 +144,11 @@ impl Request {
         bytes.extend_from_slice(&self.nonce);
         bytes.extend_from_slice(&self.owner.to_be_bytes());
         match &self.operation {
+            Operation::Install { deployment, requester } => {
+                bytes.push(5);
+                bytes.extend_from_slice(&requester.to_be_bytes());
+                bytes.extend_from_slice(deployment.as_bytes());
+            }
             Operation::Enroll {
                 platform,
                 recovery,
@@ -200,6 +214,11 @@ impl Request {
             .map_err(|_| "invalid consent nonce")?;
         let owner = input.number()?;
         let operation = match input.byte()? {
+            5 => Operation::Install {
+                requester: input.number()?,
+                deployment: String::from_utf8(input.take(64)?.to_vec())
+                    .map_err(|_| "invalid deployment ID encoding")?,
+            },
             1 => {
                 let platform = match input.byte()? {
                     1 => Platform::TpmPcr7,
@@ -261,6 +280,13 @@ impl Request {
             format!("SESSION USER {}", self.owner),
         ];
         match &self.operation {
+            Operation::Install { deployment, .. } => {
+                lines.push("INSTALL BUILT SYSTEM".into());
+                lines.push(format!("DEPLOYMENT: {deployment}"));
+                lines.push("PREVIOUS SYSTEM KEPT FOR ROLLBACK".into());
+                lines.push("RESTART REQUIRED TO USE THIS SYSTEM".into());
+                lines.push("ENTER: INSTALL   ESC: CANCEL".into());
+            }
             Operation::Enroll {
                 platform,
                 recovery,
@@ -332,7 +358,7 @@ impl Request {
                 );
             }
         }
-        lines.push("ESC TO CANCEL".into());
+        if !matches!(self.operation, Operation::Install { .. }) { lines.push("ESC TO CANCEL".into()); }
         lines
     }
 }
@@ -381,6 +407,10 @@ impl<'a> Input<'a> {
         let length = usize::from(self.byte()?);
         String::from_utf8(self.take(length)?.to_vec()).map_err(|_| "invalid consent text".into())
     }
+}
+
+pub(crate) fn deployment_id(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 #[cfg(test)]
@@ -435,8 +465,23 @@ mod tests {
     }
 
     #[test]
+    fn installation_has_one_canonical_id_and_the_requester_must_be_its_owner() {
+        for id in ["a".repeat(63), "a".repeat(65), "A".repeat(64), "g".repeat(64), format!("{}\n", "a".repeat(63))] {
+            assert!(Request::new([1; 32], 1000, Operation::Install { deployment: id, requester: 1000 }).is_err());
+        }
+        assert!(Request::new([1; 32], 1000, Operation::Install { deployment: "a".repeat(64), requester: 1001 }).is_err());
+        let request = Request::new([1; 32], 1000, Operation::Install { deployment: "a".repeat(64), requester: 1000 }).unwrap();
+        let mut literal = b"TDCONS01".to_vec();
+        literal.extend([1; 32]); literal.extend([0, 0, 3, 232, 5, 0, 0, 3, 232]); literal.extend([b'a'; 64]);
+        assert_eq!(request.encode(), literal);
+        assert!(request.lines().iter().any(|line| line == &format!("DEPLOYMENT: {}", "a".repeat(64))));
+        assert!(request.lines().iter().any(|line| line == "ENTER: INSTALL   ESC: CANCEL"));
+    }
+
+    #[test]
     fn every_operation_roundtrips_and_refuses_truncation_or_trailing_bytes() {
         let mut operations = vec![
+            Operation::Install { deployment: "ab".repeat(32), requester: 1000 },
             Operation::Unlock {
                 role: Role::Primary,
             },

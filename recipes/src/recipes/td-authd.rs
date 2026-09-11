@@ -2,6 +2,8 @@ use crate::ladder::{split_target_debug, target_rustc};
 use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 
 const SOURCES: &[(&str, &str)] = &[
+    ("tests/deployment.rs", include_str!("../../../td-authd/tests/deployment.rs")),
+    ("src/deployment.rs", include_str!("../../../td-authd/src/deployment.rs")),
     ("tests/secret_intake.rs", include_str!("../../../td-authd/tests/secret_intake.rs")),
     ("tests/secret_sys.rs", include_str!("../../../td-authd/tests/secret_sys.rs")),
     ("src/secret_sys.rs", include_str!("../../../td-authd/src/secret_sys.rs")),
@@ -95,6 +97,7 @@ pub fn recipe() -> Recipe {
     for (path, source) in [
         ("{src}/td-firstboot/src/principals.rs", include_str!("../../../td-firstboot/src/principals.rs")),
         ("{src}/td-firstboot/src/principals_tests.rs", include_str!("../../../td-firstboot/src/principals_tests.rs")),
+        ("{src}/engine/src/sha256.rs", include_str!("../../../engine/src/sha256.rs")),
         ("{src}/engine/src/principals.rs", include_str!("../../../engine/src/principals.rs")),
     ] {
         steps.push(Step::WriteFile { path: path.into(), content: source.into(), exec: false });

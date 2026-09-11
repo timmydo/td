@@ -658,8 +658,10 @@ syscall families are pinned to their modules: transport to
 `client.rs`/`conn.rs`/`server.rs`, terminal control to `pty.rs`, absolute
 axis queries and evdev clock selection to `input.rs`, peer authentication
 to `server.rs` and `session.rs`, DRM to `drm.rs`, and the monotonic cutoff
-to `runtime.rs`. The runtime and session policy each have one total
-`sys::` reference, whose exact wrapper is pinned. No other module may
+to `runtime.rs`. The runtime has two total `sys::` references to the same monotonic-clock
+wrapper: one after ordinary-screen restoration and one after complete
+trusted-prompt presentation. Session policy has one pinned peer-UID
+reference. No other module may
 reach a syscall wrapper.
 `conn.rs` is the client
 transport itself, extracted from `client.rs` so the terminal is a second
@@ -816,7 +818,9 @@ nonwrapping nanoseconds. Both operations reuse the existing syscall body
 and add no scoped allow. Source confinement pins the clock, operand widths,
 request, syscall, and caller modules. Input selects the clock; runtime
 orders its cutoff sample after ordinary-screen restoration, exercised by
-its transition tests.
+its transition tests. The presentation sample bounds installation Enter
+confirmation: only a later physical evdev timestamp can confirm the
+still-visible exact request. No clock or request value changes.
 
 
 ## 7. `td-util` — the diagnostics multicall
@@ -2460,6 +2464,20 @@ oracles cover sealed-descriptor immutability and transfer, sender identity,
 refused ancillary cleanup and descriptor-count limits. New commands,
 options, syscalls, descriptor consumers or allowances amend this section
 and both `td-authd/DESIGN.md` and `td-secret/DESIGN.md` in the same landing.
+
+### Local installation intake
+
+`td-authd/src/deployment.rs` is an additional safe consumer of the unchanged
+`secret_sys.rs` transport. Its root receiver and human client use the fixed
+peer-UID query; every request fragment uses the existing credentials/pidfd
+receive and liveness wrappers. It refuses all received SCM_RIGHTS owners,
+closing them by drop. No memfd, seal, send-descriptor or arbitrary descriptor
+forwarding API is used. The request contains a bounded source path and
+manifest ID. Root opens and pins that requester-owned directory through safe
+std and later transfers only its own directory File as the fixed installation
+helper's stdin. The private compositor channel still transfers no descriptors.
+The complete controller source and fixed child argv are pinned by confinement
+and behavioral tests. No instruction, syscall, option or allowance is added.
 
 ### Claude shell terminal boundary
 

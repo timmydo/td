@@ -9,6 +9,8 @@ pub(crate) enum Notice {
     Unlocked,
     Stored,
     NoWrite,
+    NoInstall,
+    Installed,
     Enrolled,
     Unenrolled,
     Unavailable,
@@ -163,7 +165,7 @@ pub(crate) fn paint(
 ) {
     let bounds = (0, 0, width, height);
     ui::fill(frame, width, height, stride, bounds, [0x28, 0x20, 0x18, 0]);
-    let top = height.saturating_sub(212) / 2;
+    let top = height.saturating_sub(248) / 2;
     for (index, text) in [
         "TD SECURE ATTENTION",
         if draining {
@@ -171,20 +173,23 @@ pub(crate) fn paint(
         } else {
             match notice {
                 Notice::Menu => "U: UNLOCK  R: RECOVERY TOKEN",
-                Notice::Pending => "PREPARING SECRET REQUEST",
+                Notice::Pending => "PREPARING REQUEST",
+                Notice::NoInstall => "NO READY UPDATE - RUN ./UPDATE FIRST",
+                Notice::Installed => "SYSTEM INSTALLED - RESTART TO BOOT IT",
                 Notice::Stored => "CREDENTIAL STORED",
                 Notice::NoWrite => "NO READY CREDENTIAL WRITE - RUN TD-SECRET SET FIRST",
                 Notice::Unlocked => "SECRETS UNLOCKED",
                 Notice::Enrolled => "STORE ENROLLED - REOPEN AND PRESS U TO UNLOCK",
                 Notice::Unenrolled => "STORE NOT ENROLLED - REOPEN TO TRY AGAIN",
                 Notice::Unavailable => "STORE STATE UNAVAILABLE",
-                Notice::Failed => "SECRET REQUEST FAILED",
+                Notice::Failed => "REQUEST FAILED",
                 Notice::Busy => "PREVIOUS REQUEST IS STILL FINISHING",
             }
         },
         if notice == Notice::Menu && !draining { "E: ENROLL TWO TOKENS (HAVE BOTH READY)" } else { "" },
         if notice == Notice::Menu && !draining { "X: ENROLL WITHOUT RECOVERY - LOSS IS FINAL" } else { "" },
         if notice == Notice::Menu && !draining { "W: REVIEW PENDING CREDENTIAL WRITE" } else { "" },
+        if notice == Notice::Menu && !draining { "I: REVIEW PENDING SYSTEM INSTALLATION" } else { "" },
         if draining {
             "RELEASE KEYS AND BUTTONS"
         } else {

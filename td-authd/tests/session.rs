@@ -368,7 +368,7 @@ fn generation_cleanup_runs_after_an_internal_cleanup_error() {
     let mut session = Session::new(1000).unwrap();
     prepare(&mut session);
     session.operation =
-        Some(Unlock::fixture(description(), fixture("silent_unlock_child")).unwrap());
+        Some(Active::Secret(Box::new(Unlock::fixture(description(), fixture("silent_unlock_child")).unwrap())));
     session.event = Some(Event::Waiting);
     assert_eq!(
         session.answer(Request::Cancel([42; 32])).unwrap(),
@@ -402,8 +402,8 @@ fn generation_exit_reaps_a_live_worker_before_cleanup() {
     let mut session = Session::new(1000).unwrap();
     prepare(&mut session);
     session.operation =
-        Some(Unlock::fixture(description(), fixture("silent_unlock_child")).unwrap());
-    let pid = session.operation.as_ref().unwrap().fixture_pid().unwrap();
+        Some(Active::Secret(Box::new(Unlock::fixture(description(), fixture("silent_unlock_child")).unwrap())));
+    let pid = match session.operation.as_ref().unwrap() { Active::Secret(op) => op.fixture_pid().unwrap(), _ => panic!("expected secret worker") };
     let started = Instant::now();
     session
         .close_with(|_| {
@@ -615,7 +615,7 @@ fn invalid_enrollment_receipts_require_generation_teardown() {
             session.answer(Request::Commit(initial))
         };
         assert!(rejected.is_err());
-        let pid = session.operation.as_ref().unwrap().fixture_pid().unwrap();
+        let pid = match session.operation.as_ref().unwrap() { Active::Secret(op) => op.fixture_pid().unwrap(), _ => panic!("expected secret worker") };
         session
             .close_with(|_| {
                 assert!(!std::path::Path::new(&format!("/proc/{pid}")).exists());

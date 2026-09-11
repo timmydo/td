@@ -14,6 +14,7 @@ pub(crate) enum Request {
     Poll,
     Inspect,
     Write,
+    Install,
     Begin(Role),
     Enroll(Recovery),
     Presented(Description),
@@ -28,6 +29,7 @@ impl Request {
             [0x11] => Ok(Self::Poll),
             [0x17] => Ok(Self::Inspect),
             [0x18] => Ok(Self::Write),
+            [0x19] => Ok(Self::Install),
             [0x12, 1] => Ok(Self::Begin(Role::Primary)),
             [0x12, 2] => Ok(Self::Begin(Role::Recovery)),
             [0x16, 0] => Ok(Self::Enroll(Recovery::Unrecoverable)),
@@ -59,6 +61,19 @@ impl Start {
             Self::Enroll(recovery) => Unlock::start_enrollment(owner, recovery),
         }
     }
+}
+
+enum Active {
+    Secret(Box<Unlock>),
+    Install(crate::deployment::Installation),
+}
+impl Active {
+    fn request(&self) -> &Description { match self { Self::Secret(op) => op.request(), Self::Install(op) => op.request() } }
+    fn presented(&mut self, request: &Description) -> Result<(), String> { match self { Self::Secret(op) => op.presented(request), Self::Install(op) => op.presented(request) } }
+    fn commit(&mut self, request: &Description) -> Result<(), String> { match self { Self::Secret(op) => op.commit(request), Self::Install(op) => op.commit(request) } }
+    fn cancel(&mut self, reason: &str) -> Result<(), String> { match self { Self::Secret(op) => op.cancel(reason), Self::Install(op) => op.cancel(reason) } }
+    fn poll(&mut self) -> Result<Event, String> { match self { Self::Secret(op) => op.poll(), Self::Install(op) => op.poll() } }
+    fn reap_for_teardown(self) -> Result<(), String> { match self { Self::Secret(op) => op.reap_for_teardown(), Self::Install(op) => op.reap_for_teardown() } }
 }
 
 struct Cleanup {
@@ -137,10 +152,12 @@ pub(crate) struct Session {
     owner: u32,
     intake: Option<crate::secret_intake::Intake>,
     writing: bool,
+    installations: Option<crate::deployment::Intake>,
+    installing: bool,
     activated: bool,
     prepared: bool,
     cleanup: Option<Cleanup>,
-    operation: Option<Unlock>,
+    operation: Option<Active>,
     event: Option<Event>,
     inspection: Option<Inspection>,
     inspection_event: Option<InspectionEvent>,
@@ -156,6 +173,8 @@ impl Session {
             owner,
             intake: None,
             writing: false,
+            installations: None,
+            installing: false,
             activated: false,
             prepared: false,
             cleanup: None,
@@ -170,6 +189,7 @@ impl Session {
         if request == Request::Prepare {
             if self.activated { return Err("secret session already prepared or preparing".into()); }
             self.intake = Some(crate::secret_intake::Intake::bind(self.owner)?);
+            self.installations = Some(crate::deployment::Intake::bind(self.owner)?);
         }
         self.answer_with(request, cleanup_command, Start::begin)
     }
@@ -196,17 +216,27 @@ impl Session {
             }
             Request::Inspect => self.inspect_with(Inspection::start),
             Request::Write => self.begin_write(),
+            Request::Install => self.begin_install(),
             Request::Begin(role) => self.begin(Start::Unlock(role), begin),
             Request::Enroll(recovery) => self.begin(Start::Enroll(recovery), begin),
             Request::Presented(description) => {
                 self.operation
                     .as_mut()
-                    .ok_or("no secret operation")?
+                    .ok_or("no active operation")?
                     .presented(&description)?;
                 self.event = Some(Event::Waiting);
                 Ok(vec![0x93])
             }
             Request::Commit(description) => {
+                if self.installing {
+                    let intake = self.installations.as_mut().ok_or("missing installation intake")?;
+                    intake.tick();
+                    if !intake.selected_alive() {
+                        self.operation.as_mut().ok_or("no installation")?.cancel("installation requester disappeared")?;
+                        self.event = Some(Event::Waiting);
+                        return Ok(vec![0x94]);
+                    }
+                }
                 if self.writing {
                     self.intake.as_mut().ok_or("missing credential intake")?.tick();
                     if !self.intake.as_ref().is_some_and(|intake| intake.selected_alive()) {
@@ -217,15 +247,16 @@ impl Session {
                 }
                 self.operation
                     .as_mut()
-                    .ok_or("no secret operation")?
+                    .ok_or("no active operation")?
                     .commit(&description)?;
+                if self.installing { self.installations.as_mut().ok_or("missing installation intake")?.committed(); }
                 self.event = Some(Event::Waiting);
                 Ok(vec![0x94])
             }
             Request::Cancel(nonce) => {
-                let operation = self.operation.as_mut().ok_or("no secret operation")?;
+                let operation = self.operation.as_mut().ok_or("no active operation")?;
                 if operation.request().nonce() != &nonce {
-                    return Err("stale secret cancellation".into());
+                    return Err("stale consent cancellation".into());
                 }
                 match &self.event {
                     Some(Event::Complete) => Ok(vec![0x95, 1]),
@@ -238,6 +269,24 @@ impl Session {
                 }
             }
         }
+    }
+
+    fn begin_install(&mut self) -> Result<Vec<u8>, String> {
+        if !self.prepared || self.cleanup.is_some() || self.operation.is_some() || self.inspection.is_some() {
+            return Ok(vec![0x99, 0]);
+        }
+        let intake = self.installations.as_mut().ok_or("missing installation intake")?;
+        let ready = match intake.select() { Ok(ready) => ready, Err(_) => return Ok(vec![0x99, 0]) };
+        let operation = match crate::deployment::Installation::start(self.owner, ready) {
+            Ok(operation) => operation,
+            Err(_) => { intake.finish(false); return Ok(vec![0x99, 0]); }
+        };
+        let mut answer = vec![0x92];
+        answer.extend_from_slice(&operation.request().encode());
+        self.operation = Some(Active::Install(operation));
+        self.installing = true;
+        self.event = Some(Event::Waiting);
+        Ok(answer)
     }
 
     fn begin_write(&mut self) -> Result<Vec<u8>, String> {
@@ -255,7 +304,7 @@ impl Session {
         };
         let mut answer = vec![0x92];
         answer.extend_from_slice(&operation.request().encode());
-        self.operation = Some(operation);
+        self.operation = Some(Active::Secret(Box::new(operation)));
         self.writing = true;
         self.event = Some(Event::Waiting);
         Ok(answer)
@@ -292,7 +341,7 @@ impl Session {
         let operation = begin(self.owner, start)?;
         let mut answer = vec![0x92];
         answer.extend_from_slice(&operation.request().encode());
-        self.operation = Some(operation);
+        self.operation = Some(Active::Secret(Box::new(operation)));
         self.event = Some(Event::Waiting);
         Ok(answer)
     }
@@ -300,6 +349,10 @@ impl Session {
     /// Terminal traffic also advances watchdogs without consuming events.
     pub fn tick(&mut self) -> Result<(), String> {
         if let Some(intake) = &mut self.intake { intake.tick(); }
+        if let Some(intake) = &mut self.installations { intake.tick(); }
+        if self.installing && !self.installations.as_ref().is_some_and(|intake| intake.selected_alive()) {
+            if let Some(operation) = &mut self.operation { operation.cancel("installation requester disappeared")?; }
+        }
         if self.writing && !self.intake.as_ref().is_some_and(|intake| intake.selected_alive()) {
             if let Some(operation) = &mut self.operation { operation.cancel("credential requester disappeared")?; }
         }
@@ -362,6 +415,10 @@ impl Session {
                 if let Some(intake) = &mut self.intake { intake.finish(matches!(event, Event::Complete)); }
                 self.writing = false;
             }
+            if self.installing {
+                if let Some(intake) = &mut self.installations { intake.finish(matches!(event, Event::Complete)); }
+                self.installing = false;
+            }
             self.operation = None;
             self.event = None;
         }
@@ -383,6 +440,7 @@ impl Session {
             operation.reap_for_teardown()?;
         }
         self.intake = None;
+        self.installations = None;
         self.inspection = None;
         self.inspection_event = None;
         // Dropping pending generation cleanup also reaps before replacement.

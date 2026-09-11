@@ -1338,7 +1338,7 @@ mod confinement {
         };
         assert_eq!(
             fingerprint(include_str!("../../td-authd/src/consent.rs")),
-            0x8105ec9fbaf8b219,
+            0x60d62ec39aea1d04,
             "shared consent changed: reconcile td-secret/src/main.rs, td-authd/tests/confinement.rs and this pin"
         );
         assert_eq!(fingerprint(AUTHORITY), AUTHORITY_FINGERPRINT);
@@ -2200,7 +2200,7 @@ pub struct MappedRegion {
             };
             assert_eq!(
                 occurrences(module, "sys::monotonic_time"),
-                usize::from(*name == "runtime.rs"),
+                2 * usize::from(*name == "runtime.rs"),
                 "{name}"
             );
             assert_eq!(
@@ -2235,7 +2235,7 @@ pub struct MappedRegion {
                 production(include_str!("runtime.rs")),
                 "crate::sys::monotonic_time()"
             ),
-            1
+            2
         );
         assert_eq!(
             occurrences(
@@ -2249,7 +2249,7 @@ pub struct MappedRegion {
         ));
         assert_eq!(
             occurrences(production(include_str!("runtime.rs")), "sys::"),
-            1
+            2
         );
         const PEER_AUTH: &[&str] = &["sys::peer_uid("];
         assert!(production(MAIN)
