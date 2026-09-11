@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
 
 mod apply;
+mod upstream;
 #[path = "../../td-boot/src/protocol.rs"]
 #[allow(dead_code, reason = "shared boot deployment contract")]
 mod protocol;
@@ -214,6 +215,7 @@ fn initialize(source: &Path, home: &Path, tool: &Path) -> Result<Initialization>
         return Ok(Initialization::Existing);
     }
     let commit = revision(source)?;
+    let upstream = upstream::read(source)?;
     let bundle = source.join("repository.bundle");
     if !io(fs::symlink_metadata(&bundle), "inspect release bundle")?.is_file() {
         return Err("release bundle must be a regular file".into());
@@ -255,8 +257,9 @@ fn initialize(source: &Path, home: &Path, tool: &Path) -> Result<Initialization>
         &lease,
         "clone bundled source",
     )?;
+    let branch = upstream.as_ref().map(|value| value.branch.as_str()).unwrap_or("main");
     run_git(
-        git(tool, &staging).args(["switch", "--create", "main", &commit]),
+        git(tool, &staging).args(["switch", "--create", branch, &commit]),
         &lease,
         "check out release source",
     )?;
@@ -265,6 +268,19 @@ fn initialize(source: &Path, home: &Path, tool: &Path) -> Result<Initialization>
         &lease,
         "remove bootstrap-only Git remote",
     )?;
+    if let Some(upstream) = &upstream {
+        run_git(
+            git(tool, &staging).args(["remote", "add", "origin", &upstream.origin]),
+            &lease, "configure source origin",
+        )?;
+        for (key, value) in [
+            (format!("branch.{branch}.remote"), "origin".to_string()),
+            (format!("branch.{branch}.merge"), format!("refs/heads/{branch}")),
+        ] {
+            run_git(git(tool, &staging).args(["config", "--local", &key, &value]),
+                &lease, "configure source tracking branch")?;
+        }
+    }
     let actual = run_git(
         git(tool, &staging).args(["rev-parse", "HEAD"]),
         &lease,
@@ -451,7 +467,7 @@ fn run(args: &[String]) -> Result<()> {
             match initialize(Path::new(SOURCE), &home, Path::new("/bin/git"))? {
                 Initialization::Unavailable => println!("td-update: no bundled source on this volume"),
                 Initialization::Existing => println!("td-update: preserving ~/src/td"),
-                Initialization::Created => println!("td-update: release source ready in ~/src/td; configure origin before pulling updates"),
+                Initialization::Created => println!("td-update: release source ready in ~/src/td; use git remote -v to inspect its update origin"),
             }
             Ok(())
         }
@@ -776,6 +792,37 @@ fn main() {
         )
         .unwrap();
         assert!(source_lock(&fixture.0).is_err());
+    }
+
+    #[test]
+    #[ignore = "requires host Git"]
+    fn bundled_upstream_configures_tracking_without_fetching_and_preserves_user_settings() {
+        let repository = Fixture::new();
+        let source = repository.export("sha1");
+        let settings = upstream::Upstream::new("https://example.invalid/td.git", "releases/stable").unwrap();
+        fs::write(source.join(upstream::NAME), settings.encode()).unwrap();
+        let home = Fixture::new();
+        assert_eq!(initialize(&source, &home.0, &host_git()).unwrap(), Initialization::Created);
+        let checkout = Fixture(home.0.join("src/td"));
+        assert_eq!(checkout.git(&["branch", "--show-current"]), "releases/stable\n");
+        assert_eq!(checkout.git(&["config", "remote.origin.url"]), format!("{}\n", settings.origin));
+        assert_eq!(checkout.git(&["config", "branch.releases/stable.remote"]), "origin\n");
+        assert_eq!(checkout.git(&["config", "branch.releases/stable.merge"]), "refs/heads/releases/stable\n");
+        assert_eq!(checkout.git(&["rev-parse", "HEAD"]), repository.git(&["rev-parse", "HEAD"]));
+        assert!(!checkout.0.join(".git/FETCH_HEAD").exists());
+        checkout.git(&["remote", "set-url", "origin", "https://example.invalid/my-fork.git"]);
+        fs::write(source.join(upstream::NAME), "invalid replacement").unwrap();
+        assert_eq!(initialize(&source, &home.0, Path::new("/absent/git")).unwrap(), Initialization::Existing);
+        assert_eq!(checkout.git(&["config", "remote.origin.url"]), "https://example.invalid/my-fork.git\n");
+        let other = Fixture::new();
+        assert!(initialize(&source, &other.0, Path::new("/absent/git")).is_err());
+        assert!(!other.0.join("src/td").exists());
+        fs::remove_file(source.join(upstream::NAME)).unwrap();
+        symlink("repository.bundle", source.join(upstream::NAME)).unwrap();
+        assert!(upstream::read(&source).is_err());
+        fs::remove_file(source.join(upstream::NAME)).unwrap();
+        fs::write(source.join(upstream::NAME), vec![b'x'; 4097]).unwrap();
+        assert!(upstream::read(&source).is_err());
     }
 
     #[test]

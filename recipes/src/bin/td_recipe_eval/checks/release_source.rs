@@ -5,13 +5,25 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
 
+pub(crate) use td_recipe::release_upstream as upstream;
+
 pub(crate) const VOLUME_DIRECTORY: &str = "td/source";
 pub(crate) const BUNDLE_NAME: &str = "repository.bundle";
 pub(crate) const REVISION_NAME: &str = "revision";
+pub(crate) const DEFAULT_ORIGIN: &str = "https://github.com/timmydo/td.git";
+pub(crate) const DEFAULT_BRANCH: &str = "main";
+
+fn source_names(source: &Path) -> Result<Vec<&'static str>, String> {
+    let mut names = vec![BUNDLE_NAME, REVISION_NAME];
+    if upstream::read(source)?.is_some() {
+        names.push(upstream::NAME);
+    }
+    Ok(names)
+}
 
 pub(crate) fn payload_bytes(source: &Path) -> Result<u64, String> {
     let mut total = 0u64;
-    for name in [BUNDLE_NAME, REVISION_NAME] {
+    for name in source_names(source)? {
         let path = source.join(name);
         let metadata = fs::symlink_metadata(&path)
             .map_err(|e| format!("inspect release source {}: {e}", path.display()))?;
@@ -37,7 +49,7 @@ pub(crate) fn copy_to_volume(source: &Path, volume: &Path) -> Result<(), String>
             destination.display()
         )
     })?;
-    for name in [BUNDLE_NAME, REVISION_NAME] {
+    for name in source_names(source)? {
         let from = source.join(name);
         let to = destination.join(name);
         fs::copy(&from, &to).map_err(|e| {
@@ -156,7 +168,12 @@ impl ReleaseSource {
     }
 
     /// Only HEAD's reachable history is exported, never local refs or configuration.
+    #[cfg(test)]
     pub(crate) fn stage(&self, root: &Path, directory: &Path) -> Result<(), String> {
+        self.stage_with_upstream(root, directory, None)
+    }
+
+    pub(crate) fn stage_with_upstream(&self, root: &Path, directory: &Path, upstream: Option<&upstream::Upstream>) -> Result<(), String> {
         self.verify_checkout(root)?;
         fs::create_dir(directory)
             .map_err(|e| format!("create release source {}: {e}", directory.display()))?;
@@ -184,7 +201,12 @@ impl ReleaseSource {
             directory.join(REVISION_NAME),
             format!("{}\n", self.revision),
         )
-        .map_err(|e| format!("write release source revision {}: {e}", directory.display()))
+        .map_err(|e| format!("write release source revision {}: {e}", directory.display()))?;
+        if let Some(upstream) = upstream {
+            fs::write(directory.join(upstream::NAME), upstream.encode())
+                .map_err(|e| format!("write source upstream: {e}"))?;
+        }
+        Ok(())
     }
 }
 
@@ -247,6 +269,29 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    #[ignore = "requires host Git; run release_source tests with --ignored"]
+    fn explicit_upstream_survives_export_and_volume_copy() {
+        let repository = Fixture::new();
+        output(git(&repository.0).args(["remote", "add", "origin", "/publisher/private"]), "fixture remote").unwrap();
+        let source = ReleaseSource::inspect(&repository.0).unwrap();
+        let scratch = Fixture::directory();
+        let export = scratch.0.join("export");
+        let settings = upstream::Upstream::new("https://example.invalid/td.git", "release/rolling").unwrap();
+        source.stage_with_upstream(&repository.0, &export, Some(&settings)).unwrap();
+        assert_eq!(upstream::read(&export).unwrap(), Some(settings.clone()));
+        let volume = scratch.0.join("volume");
+        fs::create_dir_all(volume.join("td")).unwrap();
+        copy_to_volume(&export, &volume).unwrap();
+        let installed = volume.join(VOLUME_DIRECTORY);
+        assert_eq!(upstream::read(&installed).unwrap(), Some(settings));
+        assert_eq!(fs::read_dir(&installed).unwrap().count(), 3);
+        let expected: u64 = [BUNDLE_NAME, REVISION_NAME, upstream::NAME].iter()
+            .map(|name| fs::metadata(export.join(name)).unwrap().len()).sum();
+        assert_eq!(payload_bytes(&export).unwrap(), expected);
+        assert_eq!(fs::metadata(installed.join(upstream::NAME)).unwrap().permissions().mode() & 0o777, 0o644);
     }
 
     #[test]

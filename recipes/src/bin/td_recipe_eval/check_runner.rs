@@ -651,7 +651,9 @@ pub fn bundle_cli(args: &[String]) -> Result<(), String> {
 
 fn bundle_usage() -> String {
     format!(
-        "usage: bundle [--out DIR] [--raw] [--zlib] [--force] [--installation]\n       \
+        "usage: bundle [--out DIR] [--raw] [--zlib] [--force] [--installation] [--source-origin URL] [--source-branch BRANCH]\n       \
+         --source-origin URL  HTTPS origin (default https://github.com/timmydo/td.git)\n       \
+         --source-branch BRANCH  select its tracking branch (default main)\n       \
          --installation  create a private VM with its own signing key; requires --out\n\
        \
          --out DIR   where to write the bundle (default {})\n       \
@@ -676,6 +678,8 @@ fn parse_bundle_args(args: &[String]) -> Result<crate::checks::bundle::BundleOpt
     let mut zlib = false;
     let mut force = false;
     let mut installation = false;
+    let mut source_origin = None;
+    let mut source_branch = None;
     let mut rest = args.iter();
     while let Some(argument) = rest.next() {
         match argument.as_str() {
@@ -683,6 +687,13 @@ fn parse_bundle_args(args: &[String]) -> Result<crate::checks::bundle::BundleOpt
             "--zlib" => zlib = true,
             "--force" => force = true,
             "--installation" => installation = true,
+            "--source-origin" | "--source-branch" => {
+                let value = rest.next().ok_or_else(|| format!("{argument} needs a value"))?;
+                let slot = if argument == "--source-origin" { &mut source_origin } else { &mut source_branch };
+                if slot.replace(value.as_str()).is_some() {
+                    return Err(format!("{argument} given twice"));
+                }
+            }
             "--out" => {
                 let value = rest
                     .next()
@@ -712,12 +723,16 @@ fn parse_bundle_args(args: &[String]) -> Result<crate::checks::bundle::BundleOpt
             "--installation requires an explicit empty --out DIR and refuses --force".into(),
         );
     }
+    use crate::checks::release_source::{upstream::Upstream, DEFAULT_BRANCH, DEFAULT_ORIGIN};
+    let source_upstream = Upstream::new(source_origin.unwrap_or(DEFAULT_ORIGIN),
+        source_branch.unwrap_or(DEFAULT_BRANCH))?;
     Ok(crate::checks::bundle::BundleOptions {
         out: out.unwrap_or_else(|| PathBuf::from(crate::checks::bundle::DEFAULT_OUT)),
         raw,
         zlib,
         force,
         installation,
+        source_upstream,
     })
 }
 
@@ -5587,6 +5602,27 @@ mod tests {
     /// `--out` is how an operator sends a multi-hundred-MiB bundle somewhere
     /// other than the default, so a swallowed or duplicated one writes a large
     /// artifact to the wrong place after a long build.
+    #[test]
+    fn source_upstream_options_are_explicit_and_bounded() {
+        let parse = |args: &[&str]| parse_bundle_args(&args.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        let built_in = parse(&[]).unwrap().source_upstream;
+        assert_eq!(built_in.origin, "https://github.com/timmydo/td.git");
+        assert_eq!(built_in.branch, "main");
+        assert_eq!(parse(&["--source-branch", "release/stable"]).unwrap().source_upstream.branch, "release/stable");
+        let default = parse(&["--source-origin", "https://example.invalid/td.git"]).unwrap().source_upstream;
+        assert_eq!(default.branch, "main");
+        let selected = parse(&["--source-origin", "https://example.invalid/td.git", "--source-branch", "release/rolling"]).unwrap().source_upstream;
+        assert_eq!(selected.branch, "release/rolling");
+        for args in [
+            vec!["--source-origin"], vec!["--source-branch"],
+            vec!["--source-origin", "/srv/git/td.git"],
+            vec!["--source-origin", "https://example.invalid/td.git", "--source-origin", "https://example.invalid/other.git"],
+            vec!["--source-origin", "https://example.invalid/td.git", "--source-branch", "main", "--source-branch", "other"],
+        ] {
+            assert!(parse(&args).is_err(), "{args:?}");
+        }
+    }
+
     #[test]
     fn bundle_arguments_parse_into_the_documented_options() {
         let parse = |args: &[&str]| {

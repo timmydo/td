@@ -2,6 +2,7 @@ use crate::ladder::{split_target_debug, target_rustc};
 use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 
 const APPLY_RS: &str = include_str!("../../../td-update/src/apply.rs");
+const UPSTREAM_RS: &str = include_str!("../../../td-update/src/upstream.rs");
 const SHA256_RS: &str = include_str!("../../../engine/src/sha256.rs");
 const PROTOCOL_RS: &str = include_str!("../../../td-boot/src/protocol.rs");
 
@@ -33,6 +34,11 @@ pub fn recipe() -> Recipe {
         Step::WriteFile {
             path: "{src}/td-update/src/apply.rs".into(),
             content: APPLY_RS.into(),
+            exec: false,
+        },
+        Step::WriteFile {
+            path: "{src}/td-update/src/upstream.rs".into(),
+            content: UPSTREAM_RS.into(),
             exec: false,
         },
         Step::WriteFile {
@@ -108,4 +114,35 @@ pub fn recipe() -> Recipe {
             "exec \"$TD_RECIPE_EVAL\" check-run td-update 1\n",
         )
         .with_runner(CheckRunner::BuildOnly)])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "requires host rustc"]
+    fn the_recipe_stages_a_complete_compilable_source_tree() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+        let root = std::env::temp_dir().join(format!("td-update-recipe-{}-{}",
+            std::process::id(), SEQUENCE.fetch_add(1, Ordering::Relaxed)));
+        std::fs::create_dir(&root).unwrap();
+        for step in recipe().steps.unwrap() {
+            if let Step::WriteFile { path, content, .. } = step {
+                if let Some(relative) = path.strip_prefix("{src}/") {
+                    let path = root.join(relative);
+                    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                    std::fs::write(path, content).unwrap();
+                }
+            }
+        }
+        let result = std::process::Command::new("rustc")
+            .current_dir(&root)
+            .args(["--edition=2021", "--emit=metadata", "td-update/src/main.rs", "-o", "update.rmeta"])
+            .output();
+        let _ = std::fs::remove_dir_all(root);
+        let result = result.unwrap();
+        assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stderr));
+    }
 }

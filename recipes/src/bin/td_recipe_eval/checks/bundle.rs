@@ -75,6 +75,7 @@ pub(crate) struct BundleOptions {
     pub(crate) force: bool,
     /// A private VM disk with a unique retained installation signing identity.
     pub(crate) installation: bool,
+    pub(crate) source_upstream: super::release_source::upstream::Upstream,
 }
 
 /// Every file a bundle owns, newest first in the order they are written.
@@ -148,7 +149,7 @@ pub(crate) fn run(
     // operator's data.
     let scratch = Scratch::new(runner.ladder_work_dir())?;
     let source_directory = scratch.dir.join("release-source");
-    source.stage(runner.repo_root(), &source_directory)?;
+    source.stage_with_upstream(runner.repo_root(), &source_directory, Some(&options.source_upstream))?;
     println!("   [bundle] including source commit {}", source.revision());
 
     println!("   [bundle] staging boot payloads");
@@ -1017,7 +1018,7 @@ fn human_bytes(bytes: u64) -> String {
 /// The README that ships beside the images.
 fn installation_readme(deployment_id: &str, format: DiskFormat) -> String {
     let disk = format.file_name();
-    format!("# td VM installation\n\nRun `./start` to boot. Guest writes persist in `{disk}`. The Btrfs volume\nprovides 2 TiB of sparse virtual capacity for local builds; physical disk\nusage grows as the guest writes.\n\nThis disk owns a unique deployment signing key in `/var/lib/td-deploy`.\nIts public key is installed in the accompanying boot selector and volume.\nKeep this directory private: copying the disk also copies the identity.\nCreate another installation to obtain a new identity.\n\nDeployment: `{deployment_id}`\n\nThe source checkout is initialized at `~/src/td`. Configure its Git remote,\nthen run `./update` from that checkout to build a successor. When prompted,\npress Ctrl+Alt+Escape, I, and Enter after reviewing its deployment ID.\nRestart to boot the installed system; the previous system is retained.\nUse `./update build` to build without installing.\n\n`SHA256SUMS` records the initial files; the disk changes after first boot.\nQEMU {} or newer is required. Use `TD_QEMU_ACCEL=tcg` for software emulation\nand `TD_VM_MEMORY` to set guest RAM in MiB.\n", format.minimum_qemu())
+    format!("# td VM installation\n\nRun `./start` to boot. Guest writes persist in `{disk}`. The Btrfs volume\nprovides 2 TiB of sparse virtual capacity for local builds; physical disk\nusage grows as the guest writes.\n\nThis disk owns a unique deployment signing key in `/var/lib/td-deploy`.\nIts public key is installed in the accompanying boot selector and volume.\nKeep this directory private: copying the disk also copies the identity.\nCreate another installation to obtain a new identity.\n\nDeployment: `{deployment_id}`\n\nThe source checkout is initialized at `~/src/td`. Inspect `git remote -v`\nand configure origin if absent. Run `git pull --ff-only` for new source,\nthen `./update` to build a successor. When prompted,\npress Ctrl+Alt+Escape, I, and Enter after reviewing its deployment ID.\nRestart to boot the installed system; the previous system is retained.\nUse `./update build` to build without installing.\n\n`SHA256SUMS` records the initial files; the disk changes after first boot.\nQEMU {} or newer is required. Use `TD_QEMU_ACCEL=tcg` for software emulation\nand `TD_VM_MEMORY` to set guest RAM in MiB.\n", format.minimum_qemu())
 }
 
 fn readme(deployment_id: &str, format: DiskFormat) -> String {
@@ -1130,7 +1131,8 @@ fn readme(deployment_id: &str, format: DiskFormat) -> String {
          ./update build\n\
          ```\n\
          \n\
-         Configure your project's Git remote before pulling future changes.\n\
+         Inspect `git remote -v`; configure origin if absent, then use\n\
+         `git pull --ff-only` to get future changes.\n\
          `td-update init` retries initialization. Building does not yet sign\n\
          or activate a deployment.\n\
          Use a persistent VM disk to retain your checkout across restarts.\n\

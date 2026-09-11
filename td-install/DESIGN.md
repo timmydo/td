@@ -360,7 +360,11 @@ reboot in this mechanism.
 ## 4. Disk layout
 
 Published VM volumes additionally carry `td/source/repository.bundle` and
-`td/source/revision`. These are source companion data, outside the deployment
+`td/source/revision`, with `td/source/upstream` naming
+`https://github.com/timmydo/td.git` and branch `main` by default. Explicit
+`--source-origin` and `--source-branch` publishing options override these;
+older source companions may omit the upstream file. These
+are source companion data, outside the deployment
 and target artifact graph. The VM producer exports only the selected Git
 HEAD's reachable history, never host Git configuration, hooks, untracked files
 or unrelated refs. It requires a clean, complete checkout before preparation

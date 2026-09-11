@@ -20,10 +20,26 @@ to establish the current UID without an additional syscall surface.
 
 Initialization clones `/run/td-volume/td/source/repository.bundle` into
 `~/src/td`, verifying its sole advertised HEAD against the adjacent canonical
-40- or 64-character revision. It creates a local `main` branch and removes
-the bootstrap bundle's `origin`: that local file is not an update remote.
-The user configures a reachable Git origin before subsequent pulls. Source
-remains the unsigned companion described by `td-install/DESIGN.md`, never
+40- or 64-character revision. It removes the bootstrap bundle's `origin`:
+that local file is not an update remote.
+New bundles configure `https://github.com/timmydo/td.git` and branch `main`.
+The publisher may override these with `--source-origin https://HOST/REPOSITORY`
+and `--source-branch BRANCH`. The optional
+`upstream` companion contains exactly three newline-terminated lines:
+`td-source-upstream-v1`, the origin, and the branch. It is a regular file
+of at most 4096 bytes. The shared parser accepts a credential-free HTTPS
+origin and a plain Git branch name; helper URLs, local paths, embedded
+credentials, query strings and fragments are refused. No ambient remote
+or branch configuration is copied from the publisher.
+
+With those settings, initialization creates that local branch at the
+bundled commit, adds `origin`, and configures its remote and merge branch
+without fetching. Otherwise it creates `main` with no remote. The human
+can inspect `git remote -v` and use `git pull --ff-only` before `./update`;
+divergent local work remains for the human to reconcile. Existing checkouts
+retain their own settings even if the companion changes. An installation
+without these settings needs a reachable origin configured before pulling.
+Source remains the unsigned companion described by `td-install/DESIGN.md`, never
 a boot trust root or evidence authorizing an installation.
 
 A newly created `~/src` has mode 0700, matching the human workspace grant.
