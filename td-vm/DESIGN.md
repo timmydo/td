@@ -85,8 +85,8 @@ listing does not create manager state or take catalog locks.
 The stock desktop supports per-instance Git keys, enrollment and explicit
 clone provisioning and orderly poweroff through the guest helpers below.
 Open automatically enrolls and prepares a saved workspace in the background.
-It then queues a terminal in the selected task worktree. Private writable
-development stores, agent launch and account linking remain pending. The
+It then prepares private writable build state and queues a terminal in the
+selected task worktree. Agent launch and account linking remain pending. The
 td-owned clipboard, feed and workspace bridges require a matching updated
 system image. `stop NAME` or TUI S queues orderly guest poweroff;
 `stop NAME --force` or TUI X explicitly cuts power. Disk deletion requires `--yes` or
@@ -271,9 +271,10 @@ filesystems preserves zero chunks as holes, while still reading the full
 logical length. Boot/update fixtures retain their separate 10 GiB budget for
 three deployments with debug companions. Existing bundles and instances keep
 their original size; importing a new bundle does not resize them. This is
-working space, not a claim that every cold distribution build fits. Private
-development-store placement and capacity management remain required before
-reporting the complete repository workflow ready. The standard
+working space, not a claim that every cold distribution build fits. The guest
+workspace helper now pins private development-store placement; concurrent
+full-check capacity and the complete round trip remain to be accepted before
+reporting the repository workflow ready. The standard
 kernel enables upstream SMP and CPU hotplug, with up to 256 possible CPUs.
 Assigned VM CPUs come online at boot. The profiler observes kernel CPU
 notifications and restarts with a new baseline after a topology change,
@@ -568,10 +569,10 @@ HOME cache before graph acquisition. An interrupted export can leave verified
 objects in the feed; retry completes it, and no partial guest graph is
 published. The later materializer still reauthenticates objects and owns foreign-payload admission.
 
-These commands do not claim a complete development image, private build-store
-setup, or an upstream-disabled full system build. The stock image still needs
-development toolchain and evaluator integration before checkout-based
-preparation is a complete guest workflow.
+These commands do not claim an upstream-disabled full system build. The stock
+image's development toolchain, evaluator preparation and private build layout
+are separate capabilities; the complete checkout workflow still requires the
+concurrent full-check and Git round-trip acceptance below.
 
 Warm the selected repository revision's declared inputs on the host once.
 Guests have read access to the resulting artifacts, not a general cache upload
@@ -1581,8 +1582,8 @@ reply means provisioning may be running; repeat Clone to inspect completion.
 Automatic Open provisioning uses the non-retrying operation below. The local
 workspace view reports its saved enrollment, starting commit, and last Open
 observation without claiming live clone status. A successful clone reply
-reports only workspace preparation, not terminal launch, build-store readiness,
-tests, or provider authentication.
+reports workspace and private build-state preparation, not terminal launch,
+completed tests, or provider authentication.
 
 `td-vm workspace terminal NAME` or T in the TUI is the explicit terminal
 action. It rechecks the saved profile, branch reservation, retained commit and
@@ -1729,6 +1730,14 @@ malformed, mismatched or untrusted response is an error, never readiness.
 This operation needs an updated standard image; an older guest is not silently
 provisioned through repeated explicit Clone calls.
 
+The guest publishes ready only after checking the standard image's exact mount
+arrangement and preparing the builder's physical home/worktree state described
+above. The builder continues to expose the logical `/td/store` prefix only
+inside its build sandboxes. The persistent stores, databases, sources and
+scratch remain below the instance's `/var`-backed private home; the deployed
+EROFS `/td/store` remains read-only. A mount or directory mismatch is a failed
+clone attempt, so automatic Open does not queue a terminal over unproven state.
+
 Polling is spaced by at least two seconds. Missing keys or unavailable carrier
 progress stop the automatic attempt after ten minutes of unavailability. Valid
 pending clone progress refreshes that allowance, so a slow clone has no absolute
@@ -1750,5 +1759,5 @@ The supervisor atomically saves bounded progress observations in its private
 Open observation, explicitly separate from live guest state and durable
 registration. Starting a new QEMU clears the previous observation. Manual
 recovery can supersede it; it is neither continuous workspace inspection nor a
-claim that a queued terminal mapped successfully or that a private writable
-build store or agent login is ready.
+claim that a queued terminal mapped successfully or that a private build
+completed or agent login is ready.

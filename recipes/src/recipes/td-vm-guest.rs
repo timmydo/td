@@ -37,6 +37,11 @@ pub fn recipe() -> Recipe {
             exec: false,
         },
         Step::WriteFile {
+            path: "{src}/development.rs".into(),
+            content: include_str!("../../../td-vm-guest/src/development.rs").into(),
+            exec: false,
+        },
+        Step::WriteFile {
             path: "{src}/power.rs".into(),
             content: include_str!("../../../td-vm-guest/src/power.rs").into(),
             exec: false,

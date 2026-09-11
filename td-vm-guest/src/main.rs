@@ -7,6 +7,7 @@
     path = "../../td-compositor/src/vm_wire.rs"
 )]
 mod vm_wire;
+mod development;
 mod workspace;
 mod power;
 use std::fs::{self, DirBuilder, File, OpenOptions};

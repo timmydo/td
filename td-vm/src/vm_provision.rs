@@ -94,7 +94,7 @@ impl Provision {
             Phase::Launch(plan) => match host.launch(plan) {
                 Ok(()) => {
                     self.phase = Phase::Done;
-                    self.report(host, "Prepared: task terminal queued in /home/tester/src/td-vm/work. Private build-store setup and agent login remain pending.".into());
+                    self.report(host, "Prepared: private build state is ready and a task terminal is queued in /home/tester/src/td-vm/work. Agent login remains pending.".into());
                 }
                 Err(error) => {
                     self.phase = Phase::Done;

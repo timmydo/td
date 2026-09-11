@@ -80,8 +80,8 @@ const HELP: &str = "td-vm: manage persistent graphical td instances
 TD_VM_HOME defaults to ~/.local/share/td-vm. Requires host QEMU, qemu-img and qemu-io.
 Reuse dist/td-vm-x86-64 from ./build-qcow; no image rebuild on create/open.
 Clipboard and feed actions require a bridge-capable system image. Workspace
-automatic provisioning on Open uses the updated image. Terminal launch, build-store setup
-and login integration remain pending. Shut down from inside td;
+automatic provisioning on Open uses the updated image. Agent launch and login
+integration remain pending. Shut down from inside td;
 Stop requests guest poweroff; --force explicitly cuts power.";
 
 fn main() -> ExitCode {
@@ -629,7 +629,7 @@ impl Manager {
         let plan = workspace.profile.clone_plan(&workspace.id, &workspace.branch, start, &enrollment.key)?;
         let reply = vm_bridge::ask(&dir, vm_wire::WORKSPACE, plan.encode())?;
         vm_wire::workspace::parse_ready(&reply, &plan)?;
-        Ok(format!("Guest workspace prepared on {} at /home/tester/src/td-vm/work. Terminal launch and agent setup remain pending.", workspace.branch))
+        Ok(format!("Guest workspace and private build state prepared on {} at /home/tester/src/td-vm/work. Terminal launch and agent setup remain pending.", workspace.branch))
     }
 
     fn workspace_terminal(&self, value: &str) -> Result<String> {

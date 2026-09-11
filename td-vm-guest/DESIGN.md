@@ -128,8 +128,27 @@ the helper; failed/interrupted unpublished work there may be removed on retry.
 Published work is never removed, recloned, reset or silently rebased. A later
 request validates its plan and Git common-directory link and preserves the
 human's commits, dirty files, untracked files and other local Git settings.
-Clone completion is not proof of an agent-ready toolchain or writable build
-store, and it does not yet launch td-term in the task directory.
+
+Before publishing ready status, the target helper requires the fixed task
+worktree to resolve below `/var/home/tester`, with writable executable Btrfs
+mounted at `/var` using `nodev,nosuid`. It separately requires `/td/store` to
+remain part of the read-only EROFS root. It prepares mode-0700, tester-owned
+physical state at `~/.td/build-daemon/ladder-shared-v1`, including separate
+seed and build-output stores, plus `~/.td/{sources,ostree}` and the worktree's
+ignored `.td-build-cache`. These are the existing evaluator and builder paths;
+the logical store prefix seen inside a derivation remains `/td/store`. The
+helper does not bind, redirect or write the deployed store. Existing owned
+directories are tightened to 0700 for upgrades; links, wrong owners, a
+volatile/readonly home, a `noexec` private mount, or a writable deployed store
+refuse readiness. A same-plan retry only validates and completes private
+directories; it does not reset build outputs.
+
+Host tests use disposable roots and therefore skip the standard-image pathname
+and mount assertion while exercising the same directory preparation. Pure
+mount-table tests pin that assertion and concurrent independent roots. The
+target recipe compiles the fixed assertion into the shipped helper. Clone and
+build-state completion is not proof that checks passed, a terminal mapped, or
+an agent/provider is ready.
 
 The service reports each failed observed request/state once and waits for a
 changed request/state before retrying. The compositor replaces the request

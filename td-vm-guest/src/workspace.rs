@@ -317,6 +317,7 @@ pub fn prepare(
     match fs::symlink_metadata(&active) {
         Ok(_) => {
             validate(&active, plan, uid, tools, &empty, lock)?;
+            super::development::prepare(home, &active.join("work"), uid)?;
             for path in [&src, home] {
                 io(
                     File::open(path).and_then(|f| f.sync_all()),
@@ -410,7 +411,8 @@ pub fn prepare(
             "sync workspace parent",
         )?;
     }
-    validate(&active, plan, uid, tools, &empty, lock)
+    validate(&active, plan, uid, tools, &empty, lock)?;
+    super::development::prepare(home, &active.join("work"), uid)
 }
 
 pub fn ssh(args: &[OsString]) -> Result<()> {
