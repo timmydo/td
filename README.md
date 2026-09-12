@@ -107,8 +107,13 @@ Create a private installation in a new directory whose parent exists:
 
 ```sh
 ./build-qcow --installation --out "$HOME/td-installation"
-"$HOME/td-installation/start"
+TD_VM_MEMORY=12288 "$HOME/td-installation/start"
 ```
+
+This gives the guest 12 GiB, matching the native update regression's memory
+allocation. The launcher's default 2 GiB is for booting and exploring the
+system. A first build reconstructs the bootstrap graph and can take many
+hours; subsequent updates reuse the retained build cache.
 
 This launcher keeps guest writes in the installation disk across boots.
 Each installation generates its own signing key, retained in root-only
