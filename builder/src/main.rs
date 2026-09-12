@@ -28,6 +28,7 @@ mod check_host;
 mod check_loop;
 mod check_memory;
 mod drv;
+mod efi;
 mod elf;
 // The build script compiles it in by path and the tests read it; the binary
 // itself never does.

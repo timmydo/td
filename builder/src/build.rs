@@ -5567,6 +5567,9 @@ pub fn run_mesboot() -> Result<(), String> {
                     return Err(err(format!("required product not an executable file: {p}")));
                 }
             }
+        } else if let Some(o) = step.get("assertEfiApplication") {
+            let path = ctx.expand(&field(o, "path").map_err(err)?).map_err(err)?;
+            crate::efi::assert_application(Path::new(&path)).map_err(err)?;
         } else if let Some(o) = step.get("assertStatic") {
             // Runtime-provenance gate (re #469): each product must be a fully
             // static ELF -- no host loader (PT_INTERP), no host libc (DT_NEEDED),

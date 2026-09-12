@@ -470,6 +470,10 @@ pub fn recipe() -> Recipe {
     //    COMPAT_32BIT_TIME has a visible prompt, so allnoconfig turns it off.
     //    IA32_EMULATION alone leaves old glibc without futex/time syscalls.
     //
+    //    EFI needs ACPI; EFI_STUB selects the already enabled RELOCATABLE.
+    //    Runtime-map support follows KEXEC_CORE. Other EFI menu symbols retain
+    //    upstream defaults except the pinned-off efivarfs/handover/mixed modes.
+    //
     //    SECURITY_DMESG_RESTRICT (pinned OFF): with it on, an unprivileged
     //    /dev/kmsg open is EPERM, so the /bin/dmesg system-x86-64 ships from
     //    TD_UTIL_APPLETS breaks for ordinary users. Its `menu "Security options"`
@@ -560,6 +564,11 @@ pub fn recipe() -> Recipe {
                   /^#? *CONFIG_DRM_CLIENT_DEFAULT_FBDEV[ =]/d; \
                   /^#? *CONFIG_SECURITY_DMESG_RESTRICT[ =]/d; \
                   /^#? *CONFIG_ACPI[ =]/d; \
+                  /^#? *CONFIG_EFI[ =]/d; \
+                  /^#? *CONFIG_EFI_STUB[ =]/d; \
+                  /^#? *CONFIG_EFI_HANDOVER_PROTOCOL[ =]/d; \
+                  /^#? *CONFIG_EFI_MIXED[ =]/d; \
+                  /^#? *CONFIG_EFIVAR_FS[ =]/d; \
                   /^#? *CONFIG_PNP[ =]/d; \
                   /^#? *CONFIG_PNPACPI[ =]/d; \
                   /^#? *CONFIG_USB_SUPPORT[ =]/d; \
@@ -678,6 +687,11 @@ pub fn recipe() -> Recipe {
                    'CONFIG_DRM_CLIENT_DEFAULT_FBDEV=y' \
                    '# CONFIG_SECURITY_DMESG_RESTRICT is not set' \
                    'CONFIG_ACPI=y' \
+                   'CONFIG_EFI=y' \
+                   'CONFIG_EFI_STUB=y' \
+                   '# CONFIG_EFI_HANDOVER_PROTOCOL is not set' \
+                   '# CONFIG_EFI_MIXED is not set' \
+                   '# CONFIG_EFIVAR_FS is not set' \
                    'CONFIG_PNP=y' \
                    'CONFIG_PNPACPI=y' \
                    'CONFIG_USB_SUPPORT=y' \
@@ -792,6 +806,11 @@ pub fn recipe() -> Recipe {
                  if grep -q '^CONFIG_DEBUG_INFO_BTF=y' .config; then echo 'BTF on (would need pahole)' >&2; exit 1; fi; \
                  if grep -q '^CONFIG_SECURITY_DMESG_RESTRICT=y' .config; then echo 'SECURITY_DMESG_RESTRICT on — unprivileged /dev/kmsg reads become EPERM, so the shipped /bin/dmesg breaks for ordinary users' >&2; exit 1; fi; \
                  grep -q '^CONFIG_ACPI=y' .config || { echo 'ACPI off - TPM enrollment requires ACPI discovery and TPM2 device support' >&2; exit 1; }; \
+                 grep -q '^CONFIG_EFI=y$' .config || { echo 'EFI off - firmware entry requires EFI runtime support' >&2; exit 1; }; \
+                 grep -q '^CONFIG_EFI_STUB=y$' .config || { echo 'EFI_STUB off - bzImage cannot be loaded by UEFI' >&2; exit 1; }; \
+                 grep -q '^# CONFIG_EFI_HANDOVER_PROTOCOL is not set$' .config || { echo 'deprecated EFI handover disabled policy missing' >&2; exit 1; }; \
+                 grep -q '^# CONFIG_EFI_MIXED is not set$' .config || { echo '32-bit EFI firmware disabled policy missing' >&2; exit 1; }; \
+                 grep -q '^# CONFIG_EFIVAR_FS is not set$' .config || { echo 'EFI variable filesystem disabled policy missing' >&2; exit 1; }; \
                  grep -q '^CONFIG_PNP=y' .config || { echo 'PNP off - TPM enrollment requires ACPI discovery and TPM2 device support' >&2; exit 1; }; \
                  grep -q '^CONFIG_PNPACPI=y' .config || { echo 'PNPACPI off - TPM enrollment requires ACPI discovery and TPM2 device support' >&2; exit 1; }; \
                  grep -q '^CONFIG_USB_SUPPORT=y' .config || { echo 'USB_SUPPORT off - FIDO USB transport requires built-in xHCI and hidraw' >&2; exit 1; }; \
@@ -1040,6 +1059,9 @@ pub fn recipe() -> Recipe {
         )
         .env("PATH", &mesboot0_path()),
     );
+    steps.push(Step::AssertEfiApplication {
+        path: "{out}/bzImage".into(),
+    });
     // [initramfs] the packed userland must be a real, COMPLETE newc cpio carrying
     // the whole bootable userland — not merely a well-formed header. The shared
     // `initramfs_cpio_shape_check` helper (recipes/src/ladder.rs) parses the archive

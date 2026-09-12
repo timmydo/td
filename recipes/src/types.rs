@@ -254,6 +254,10 @@ pub enum Step {
     AssertStatic {
         paths: Vec<String>,
     },
+    /// Check bounded PE32+ x86-64 EFI headers and a file-backed executable entry.
+    AssertEfiApplication {
+        path: String,
+    },
     /// Validate the complete `files/` tree of a static seeded application.
     /// `entry` is the manifest's `/app/...` path and `runtime` is the declared
     /// payload name, not a template: the builder resolves it only through the
@@ -555,6 +559,10 @@ impl Step {
                     ("paths".into(), arr(paths)),
                     ("exec".into(), Json::Bool(*exec)),
                 ]),
+            )]),
+            Step::AssertEfiApplication { path } => Json::Obj(vec![(
+                "assertEfiApplication".into(),
+                Json::Obj(vec![("path".into(), Json::Str(path.clone()))]),
             )]),
             Step::AssertStatic { paths } => Json::Obj(vec![(
                 "assertStatic".into(),

@@ -437,10 +437,18 @@ optimisation, not a prerequisite.
 
 `BOOTX64.EFI` is an **EFI-stub kernel**: `CONFIG_EFI` + `CONFIG_EFI_STUB`, so
 the kernel image is itself a PE executable the firmware can load, and no
-third-party bootloader exists on the path. td's kernel does not have this
-today — `linux-x86-64.rs` builds from `allnoconfig`, so both are off, and on
-x86 `CONFIG_EFI` pulls ACPI in; that dependency is to be confirmed against
-the pinned tree rather than taken from this file.
+third-party bootloader exists on the path. `linux-x86-64.rs` enables both,
+with their ACPI prerequisite confirmed in Linux 7.1.4's `arch/x86/Kconfig`.
+The deprecated handover entry points and mixed 32-bit firmware mode are
+explicitly disabled, as is the EFI variable filesystem. EFI runtime-map
+support follows KEXEC_CORE; other symbols under the EFI menu retain
+upstream defaults. Producer and consumer recipes use `AssertEfiApplication`
+to require MZ/PE signatures, x86-64 PE32+ EFI application identity, bounded
+headers/sections and a nonzero file-backed executable entry point. The Rust
+reader admits at most 96 sections, 64 KiB of headers and a 256 MiB file. It
+is a format check, not a complete PE loader or signature verifier.
+This is only the kernel entry-point increment: fixed-stub packaging,
+built-in boot arguments and the firmware boot oracle remain required.
 
 Firmware passes **no command line**, so the stub's must be built in
 (`CONFIG_CMDLINE`). That costs nothing under this design and is the reason
@@ -1382,9 +1390,10 @@ Ordered by dependency, not by size. Each is one landing with its own tests.
    machine's benefit, and a later decision to make THAT work by shipping the
    key would flip install silently. Whoever makes it should change this
    paragraph in the same landing.
-8. **The EFI-stub kernel** (§5): `CONFIG_EFI`, `CONFIG_EFI_STUB`,
-   `CONFIG_CMDLINE` in `linux-x86-64.rs`, having first confirmed what
-   `CONFIG_EFI` drags in on the pinned tree.
+8. **The EFI-stub kernel** (§5): the EFI/EFI_STUB configuration and
+   realized PE format checks are present. The pinned tree requires ACPI,
+   already enabled for TPM discovery. Fixed-stub initramfs packaging and
+   built-in boot arguments are still required before firmware boot.
 9. **The OVMF oracle** (§8), beside the `-kernel` one, not replacing it.
 10. **`td-update` and its local channel**: fetch a signed bundle, verify it,
    delegate the publish (D1 again), and roll back on a failed boot. This is

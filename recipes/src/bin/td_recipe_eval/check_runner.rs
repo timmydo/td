@@ -4036,6 +4036,7 @@ fn visit_step_templates(
         Step::SubstituteText { file, edits: _ } => {
             visit("substituteText.file", file, false)?;
         }
+        Step::AssertEfiApplication { path } => visit("assertEfiApplication.path", path, false)?,
         Step::AssertStatic { paths } => {
             for path in paths {
                 visit("assertStatic.paths", path, false)?;
@@ -5884,8 +5885,9 @@ mod tests {
             ("require.paths", Step::Require { paths: vec![bad(BAD)], exec: true }),
             ("substituteText.file", Step::SubstituteText { file: bad(BAD), edits: Vec::new() }),
             ("assertStatic.paths", Step::AssertStatic { paths: vec![bad(BAD)] }),
+            ("assertEfiApplication.path", Step::AssertEfiApplication { path: bad(BAD) }),
         ];
-        assert_eq!(cases.len(), 38, "every expanded, non-data field is listed");
+        assert_eq!(cases.len(), 39, "every expanded, non-data field is listed");
         let mut expected: HashSet<(&'static str, bool)> =
             cases.iter().map(|(field, _)| (*field, false)).collect();
         assert_eq!(expected.len(), cases.len(), "field labels must be distinct");
