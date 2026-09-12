@@ -44,7 +44,7 @@ fn reply(
                     reply.revision == 0 && wire::workspace::Plan::parse(&request.data)
                         .is_ok_and(|plan| wire::workspace::progress(&reply.data, &plan).is_ok())
                 }
-                wire::WORKSPACE_TERMINAL => {
+                wire::WORKSPACE_TERMINAL | wire::WORKSPACE_CODEX | wire::WORKSPACE_CLAUDE => {
                     reply.revision == 0
                         && reply.data == wire::TASK_TERMINAL_QUEUED
                         && wire::workspace::Plan::parse(&request.data).is_ok()
@@ -268,7 +268,8 @@ fn forward(dir: &Path, request: wire::Message, deadline: Instant) -> Result<wire
         }
         wire::GET | wire::SNAPSHOT | wire::POWEROFF if request.data.is_empty() => {}
         wire::KEY => { wire::git_key::identity(&request.data)?; }
-        wire::WORKSPACE | wire::WORKSPACE_ENSURE | wire::WORKSPACE_TERMINAL => {
+        wire::WORKSPACE | wire::WORKSPACE_ENSURE | wire::WORKSPACE_TERMINAL
+        | wire::WORKSPACE_CODEX | wire::WORKSPACE_CLAUDE => {
             wire::workspace::Plan::parse(&request.data)?;
         }
         wire::FEED => {
@@ -344,32 +345,34 @@ mod tests {
 
     #[test]
     fn task_terminal_crosses_both_relays_with_its_exact_plan_and_reply() {
-        let temp = Temp::new();
-        sharing(&temp.0, "off").unwrap();
-        let listener = UnixListener::bind(temp.0.join("guest")).unwrap();
-        let plan = wire::workspace::example();
-        let expected = plan.clone();
-        let server = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            stream.set_nonblocking(true).unwrap();
-            let deadline = Instant::now() + wire::TIMEOUT;
-            let request = wire::receive(&mut stream, None, deadline).unwrap();
-            assert_eq!(request.verb, wire::WORKSPACE_TERMINAL);
-            assert_eq!(request.data, expected.encode());
-            let reply = wire::Message::new(
-                request.id,
-                wire::OK,
-                0,
-                wire::TASK_TERMINAL_QUEUED.to_vec(),
+        for verb in [wire::WORKSPACE_TERMINAL, wire::WORKSPACE_CODEX, wire::WORKSPACE_CLAUDE] {
+            let temp = Temp::new();
+            sharing(&temp.0, "off").unwrap();
+            let listener = UnixListener::bind(temp.0.join("guest")).unwrap();
+            let plan = wire::workspace::example();
+            let expected = plan.clone();
+            let server = thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream.set_nonblocking(true).unwrap();
+                let deadline = Instant::now() + wire::TIMEOUT;
+                let request = wire::receive(&mut stream, None, deadline).unwrap();
+                assert_eq!(request.verb, verb);
+                assert_eq!(request.data, expected.encode());
+                let reply = wire::Message::new(
+                    request.id,
+                    wire::OK,
+                    0,
+                    wire::TASK_TERMINAL_QUEUED.to_vec(),
+                );
+                wire::write_all(&mut stream, &reply.encode().unwrap(), deadline).unwrap();
+            });
+            let _supervisor = Supervisor::start(&temp.0).unwrap();
+            assert_eq!(
+                ask(&temp.0, verb, plan.encode()).unwrap(),
+                wire::TASK_TERMINAL_QUEUED
             );
-            wire::write_all(&mut stream, &reply.encode().unwrap(), deadline).unwrap();
-        });
-        let _supervisor = Supervisor::start(&temp.0).unwrap();
-        assert_eq!(
-            ask(&temp.0, wire::WORKSPACE_TERMINAL, plan.encode()).unwrap(),
-            wire::TASK_TERMINAL_QUEUED
-        );
-        server.join().unwrap();
+            server.join().unwrap();
+        }
     }
 
     #[test]

@@ -43,6 +43,8 @@ fn only_canonical_disjoint_session_identities_are_configurable() {
 fn the_caller_can_only_start_poll_or_keep_the_channel_alive() {
     assert_eq!(request(&[1]).unwrap(), Request::Start(Terminal::Home));
     assert_eq!(request(&[4]).unwrap(), Request::Start(Terminal::Task));
+    assert_eq!(request(&[5]).unwrap(), Request::Start(Terminal::Codex));
+    assert_eq!(request(&[6]).unwrap(), Request::Start(Terminal::Claude));
     assert_eq!(request(&[3]).unwrap(), Request::Heartbeat);
     let mut poll = vec![2];
     poll.extend_from_slice(&17u64.to_be_bytes());
@@ -52,6 +54,10 @@ fn the_caller_can_only_start_poll_or_keep_the_channel_alive() {
         vec![0],
         vec![1, 0],
         vec![3, 0],
+        vec![4, 0],
+        vec![5, 0],
+        vec![6, 0],
+        vec![7],
         vec![2],
         vec![2, 0],
         vec![2; 10],
@@ -134,6 +140,23 @@ fn fixed_commands_select_the_account_and_all_terminal_arguments() {
             "/run/user/1000/td-auth-terminal-000102030405060708090a0b0c0d0e0f-17.ready",
         ]
     );
+}
+
+#[test]
+fn task_agents_use_fixed_human_entry_points_and_a_controlling_terminal() {
+    for (terminal, selection, program) in [
+        (Terminal::Codex, "codex", "/bin/codex"),
+        (Terminal::Claude, "claude", "/bin/claude"),
+    ] {
+        let helper = config().terminal("000102030405060708090a0b0c0d0e0f", 1, terminal);
+        assert_eq!(helper.get_args().last(), Some(std::ffi::OsStr::new(selection)));
+        let command = terminal_command(1000, "000102030405060708090a0b0c0d0e0f", 1, terminal);
+        assert_eq!(command.get_program(), "/bin/td-term");
+        assert_eq!(command.get_args().skip(5).collect::<Vec<_>>(), [
+            "--working-directory", TASK_DIRECTORY,
+            "--command", "/bin/cttyhack", "--stdin", program,
+        ]);
+    }
 }
 
 fn probe_command() -> Command {

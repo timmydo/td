@@ -491,6 +491,8 @@ Subsequent payloads are exact byte records:
 | `02` plus that u64 handle | `82 00` running, `82 01` successful exit, or `82 02` failed exit |
 | `03` | `83` heartbeat |
 | `04` | `81` plus a process handle for a terminal in the fixed task worktree |
+| `05` | `81` plus a process handle for Codex in the fixed task worktree |
+| `06` | `81` plus a process handle for Claude in the fixed task worktree |
 
 A full table returns `ff 01`; a spawn failure returns `ff 02`. Every other
 request, trailing byte, unknown handle, wait error, timeout or transport
@@ -513,8 +515,8 @@ increase without reuse; exhaustion fails before spawn. The peer must send a
 request or heartbeat within each five-second receive deadline.
 
 The authority runs `/bin/td-login exec-as USER -- /bin/td-authd
-terminal-exec UID GENERATION HANDLE [task]` in a new process group. The
-optional literal is present only for request `04`; it is not a pathname.
+terminal-exec UID GENERATION HANDLE [task|codex|claude]` in a new process group.
+The optional literal selects requests `04`, `05`, or `06`; it is not a pathname.
 td-login checks
 the human account policy and drops and verifies credentials. Its exact
 environment is `HOME`, `SHELL`, `USER`, `LOGNAME` from the account and
@@ -537,6 +539,15 @@ placement after the trusted credential helper; it is not human
 authorization. Opening one's ordinary terminal is session behavior and opens
 an ordinary shell with the human account's existing authority; it grants
 neither store access nor an elevated shell.
+
+Both agent variants enter the same fixed task directory and append exactly
+`--command /bin/cttyhack --stdin /bin/codex` or its `/bin/claude` counterpart.
+The wrapper claims the human terminal so interactive signals work. Codex uses
+its installed source-built entry point without sandbox overrides. Claude's
+human entry point invokes the application client described below: that service
+creates a separate fresh slave for the private-UID jail. The human terminal
+is never passed into the jail, and the wrapper does not bypass confinement.
+Launch is not authentication, settings synchronization, or build readiness.
 
 The compositor-owned runtime directory permits human traversal and socket
 access, with kernel peer admission before protocol handling. The image uses

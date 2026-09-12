@@ -73,8 +73,8 @@ impl Config {
                 generation,
                 &handle.to_string(),
             ]);
-        if terminal == Terminal::Task {
-            command.arg("task");
+        if let Some(selection) = terminal.selection() {
+            command.arg(selection);
         }
         command.process_group(0);
         command
@@ -211,8 +211,17 @@ fn terminal_command(uid: u32, generation: &str, handle: u64, terminal: Terminal)
         "--ready-socket",
         &format!("/run/user/{uid}/td-auth-terminal-{generation}-{handle}.ready"),
     ]);
-    if terminal == Terminal::Task {
+    if terminal != Terminal::Home {
         command.args(["--working-directory", TASK_DIRECTORY]);
+    }
+    match terminal {
+        Terminal::Codex => {
+            command.args(["--command", "/bin/cttyhack", "--stdin", "/bin/codex"]);
+        }
+        Terminal::Claude => {
+            command.args(["--command", "/bin/cttyhack", "--stdin", "/bin/claude"]);
+        }
+        Terminal::Home | Terminal::Task => {}
     }
     command
 }
@@ -224,7 +233,13 @@ pub(crate) fn terminal_exec(arguments: &[String]) -> Result<(), String> {
         [uid, generation, handle, task] if task == "task" => {
             (uid, generation, handle, Terminal::Task)
         }
-        _ => return Err("terminal-exec requires UID GENERATION HANDLE [task]".into()),
+        [uid, generation, handle, agent] if agent == "codex" => {
+            (uid, generation, handle, Terminal::Codex)
+        }
+        [uid, generation, handle, agent] if agent == "claude" => {
+            (uid, generation, handle, Terminal::Claude)
+        }
+        _ => return Err("terminal-exec requires UID GENERATION HANDLE [task|codex|claude]".into()),
     };
     let uid = number(uid, 1000..=1000)?;
     if generation.len() != 32
@@ -323,12 +338,27 @@ enum Request {
 enum Terminal {
     Home,
     Task,
+    Codex,
+    Claude,
+}
+
+impl Terminal {
+    fn selection(self) -> Option<&'static str> {
+        match self {
+            Self::Home => None,
+            Self::Task => Some("task"),
+            Self::Codex => Some("codex"),
+            Self::Claude => Some("claude"),
+        }
+    }
 }
 
 fn request(bytes: &[u8]) -> Result<Request, String> {
     match bytes {
         [1] => Ok(Request::Start(Terminal::Home)),
         [4] => Ok(Request::Start(Terminal::Task)),
+        [5] => Ok(Request::Start(Terminal::Codex)),
+        [6] => Ok(Request::Start(Terminal::Claude)),
         [2, rest @ ..] if rest.len() == 8 => {
             let handle =
                 u64::from_be_bytes(rest.try_into().map_err(|_| "invalid terminal handle")?);

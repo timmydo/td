@@ -86,7 +86,8 @@ The stock desktop supports per-instance Git keys, enrollment and explicit
 clone provisioning and orderly poweroff through the guest helpers below.
 Open automatically enrolls and prepares a saved workspace in the background.
 It then prepares private writable build state and queues a terminal in the
-selected task worktree. Agent launch and account linking remain pending. The
+selected task worktree. Explicit agent launch is available; automatic agent
+selection and account linking remain pending. The
 td-owned clipboard, feed and workspace bridges require a matching updated
 system image. `stop NAME` or TUI S queues orderly guest poweroff;
 `stop NAME --force` or TUI X explicitly cuts power. Disk deletion requires `--yes` or
@@ -1398,6 +1399,16 @@ integrator key; a VM-restricted key cannot publish main. Codex/Claude account
 credentials remain separate from these Git SSH keys.
 
 ## Working through td-term and td-compositor
+
+`td-vm workspace agent NAME codex|claude` (TUI `a`, then the agent name)
+explicitly queues the selected CLI
+in the prepared task worktree. Like `workspace terminal`, it requires the
+exact retained clone plan and guest-ready record. It uses typed private bridge
+operations and the paired authority's fixed human-session launch commands.
+Claude enters its existing application-UID shell launcher and jail; Codex uses
+its installed source-built entry point without weakening its sandbox. Queue
+admission is not successful exec or authentication. Open still queues a shell;
+automatic agent selection, settings delivery and login reuse remain pending.
 
 Use the compositor's supported launcher/control path to open each agent in a
 fresh td-term PTY. Claude retains its foreign-application marking and confinement;

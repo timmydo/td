@@ -88,7 +88,11 @@ impl Launcher {
     }
 
     pub fn launch_task(&self) -> Result<(), String> {
-        match self.send.try_send(Work::Terminal(Terminal::Task)) {
+        self.launch_selected(Terminal::Task)
+    }
+
+    pub fn launch_selected(&self, terminal: Terminal) -> Result<(), String> {
+        match self.send.try_send(Work::Terminal(terminal)) {
             Ok(()) => Ok(()),
             Err(TrySendError::Full(_)) => Err("terminal launch is already pending".into()),
             Err(TrySendError::Disconnected(_)) => Err("terminal authority is unavailable".into()),
@@ -97,9 +101,11 @@ impl Launcher {
 }
 
 #[derive(Clone, Copy)]
-enum Terminal {
+pub(crate) enum Terminal {
     Home,
     Task,
+    Codex,
+    Claude,
 }
 
 fn startup() -> Result<(), String> {
@@ -235,6 +241,8 @@ impl Processes {
         let request = match terminal {
             Terminal::Home => [1],
             Terminal::Task => [4],
+            Terminal::Codex => [5],
+            Terminal::Claude => [6],
         };
         match wire.exchange(&request)?.as_slice() {
             [0xff, 1] => Ok(Some("terminal authority process table is full")),
@@ -422,6 +430,16 @@ mod tests {
         assert_eq!(w.requests[3], [2, 0, 0, 0, 0, 0, 0, 0, 3]);
         assert_eq!(w.requests[4], w.requests[2]);
         assert_eq!(w.requests[5], [3]);
+    }
+
+    #[test]
+    fn selected_agents_send_only_their_fixed_authority_request() {
+        for (terminal, expected) in [(Terminal::Codex, 5), (Terminal::Claude, 6)] {
+            let mut processes = Processes::new();
+            let mut wire = wire(vec![handle(1)]);
+            assert_eq!(processes.start(&mut wire, terminal).unwrap(), None);
+            assert_eq!(wire.requests, [vec![expected]]);
+        }
     }
 
     #[test]

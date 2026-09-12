@@ -6633,6 +6633,13 @@ does not retry an unconfirmed launch. Clipboard sharing and focus do not gate
 the operation.
 
 
+The revision-zero `workspace-codex` and `workspace-claude` operations apply
+the identical complete-plan readiness gate and queue acknowledgement. They
+select only fixed authority requests `05` and `06`, respectively. The authority
+chooses the executable and worktree; no host argument vector crosses the bridge.
+These explicit launches do not establish settings or login readiness. An older
+image refuses the unknown operation rather than falling back to a shell.
+
 The empty revision-zero `poweroff` carrier operation cancels clipboard leases
 and atomically replaces `vm-poweroff` with the fixed `TDVM-POWEROFF-1\n`
 record. Its `poweroff queued` reply means only publication. A separate root

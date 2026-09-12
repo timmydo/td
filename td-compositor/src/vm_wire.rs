@@ -19,6 +19,8 @@ pub const KEY: &str = "git-key";
 pub const WORKSPACE: &str = "workspace";
 pub const WORKSPACE_ENSURE: &str = "workspace-ensure";
 pub const WORKSPACE_TERMINAL: &str = "workspace-terminal";
+pub const WORKSPACE_CODEX: &str = "workspace-codex";
+pub const WORKSPACE_CLAUDE: &str = "workspace-claude";
 pub const POWEROFF: &str = "poweroff";
 #[allow(dead_code)] // Shared with the root guest power worker.
 pub const POWER_REQUEST: &str = "/run/td-compositor/1000/vm-poweroff";
@@ -108,7 +110,7 @@ impl Message {
 
 fn valid_verb(verb: &str) -> bool {
     matches!(verb, SNAPSHOT | PUT | GET | FEED | KEY | WORKSPACE | WORKSPACE_ENSURE
-        | WORKSPACE_TERMINAL | POWEROFF | OK | ERROR)
+        | WORKSPACE_TERMINAL | WORKSPACE_CODEX | WORKSPACE_CLAUDE | POWEROFF | OK | ERROR)
 }
 
 fn decimal(value: Option<&str>) -> Result<u64, String> {
