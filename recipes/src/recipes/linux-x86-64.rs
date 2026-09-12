@@ -487,7 +487,7 @@ pub fn recipe() -> Recipe {
             &[
                 SH,
                 "-c",
-                "{in:sed-mesboot0}/bin/sed -i -r \
+                &"{in:sed-mesboot0}/bin/sed -i -r \
                  '/^#? *CONFIG_UNWINDER_ORC[ =]/d; \
                   /^#? *CONFIG_UNWINDER_FRAME_POINTER[ =]/d; \
                   /^#? *CONFIG_MODULES[ =]/d; \
@@ -564,6 +564,9 @@ pub fn recipe() -> Recipe {
                   /^#? *CONFIG_DRM_CLIENT_DEFAULT_FBDEV[ =]/d; \
                   /^#? *CONFIG_SECURITY_DMESG_RESTRICT[ =]/d; \
                   /^#? *CONFIG_ACPI[ =]/d; \
+                  /^#? *CONFIG_CMDLINE_BOOL[ =]/d; \
+                  /^#? *CONFIG_CMDLINE[ =]/d; \
+                  /^#? *CONFIG_CMDLINE_OVERRIDE[ =]/d; \
                   /^#? *CONFIG_EFI[ =]/d; \
                   /^#? *CONFIG_EFI_STUB[ =]/d; \
                   /^#? *CONFIG_EFI_HANDOVER_PROTOCOL[ =]/d; \
@@ -689,6 +692,9 @@ pub fn recipe() -> Recipe {
                    'CONFIG_ACPI=y' \
                    'CONFIG_EFI=y' \
                    'CONFIG_EFI_STUB=y' \
+                   'CONFIG_CMDLINE_BOOL=y' \
+                   'CONFIG_CMDLINE=@EFI_CMDLINE@' \
+                   '# CONFIG_CMDLINE_OVERRIDE is not set' \
                    '# CONFIG_EFI_HANDOVER_PROTOCOL is not set' \
                    '# CONFIG_EFI_MIXED is not set' \
                    '# CONFIG_EFIVAR_FS is not set' \
@@ -738,7 +744,7 @@ pub fn recipe() -> Recipe {
                    'CONFIG_SND_PCI=y' \
                    'CONFIG_SND_HDA_INTEL=y' \
                    'CONFIG_SND_HDA_GENERIC=y' \
-                   'CONFIG_SND_ALOOP=y' >> .config",
+                   'CONFIG_SND_ALOOP=y' >> .config".replace("@EFI_CMDLINE@", &format!("{:?}", crate::ladder::efi_default_cmdline())),
             ],
         )
         .env("PATH", &mesboot0_path()),
@@ -757,7 +763,7 @@ pub fn recipe() -> Recipe {
             &[
                 SH,
                 "-c",
-                "grep -q '^CONFIG_UNWINDER_FRAME_POINTER=y' .config || { echo 'frame-pointer unwinder not selected' >&2; exit 1; }; \
+                &"grep -q '^CONFIG_UNWINDER_FRAME_POINTER=y' .config || { echo 'frame-pointer unwinder not selected' >&2; exit 1; }; \
                  grep -q '^CONFIG_KERNEL_GZIP=y' .config || { echo 'gzip kernel compression not selected (bzImage would need another compressor)' >&2; exit 1; }; \
                  grep -q '^CONFIG_BINFMT_ELF=y' .config || { echo 'BINFMT_ELF off — the kernel could not exec the busybox userland' >&2; exit 1; }; \
                  grep -q '^CONFIG_BINFMT_SCRIPT=y' .config || { echo 'BINFMT_SCRIPT off — the kernel could not exec the #! /init script' >&2; exit 1; }; \
@@ -807,6 +813,9 @@ pub fn recipe() -> Recipe {
                  if grep -q '^CONFIG_SECURITY_DMESG_RESTRICT=y' .config; then echo 'SECURITY_DMESG_RESTRICT on — unprivileged /dev/kmsg reads become EPERM, so the shipped /bin/dmesg breaks for ordinary users' >&2; exit 1; fi; \
                  grep -q '^CONFIG_ACPI=y' .config || { echo 'ACPI off - TPM enrollment requires ACPI discovery and TPM2 device support' >&2; exit 1; }; \
                  grep -q '^CONFIG_EFI=y$' .config || { echo 'EFI off - firmware entry requires EFI runtime support' >&2; exit 1; }; \
+                 grep -q '^CONFIG_CMDLINE_BOOL=y$' .config || { echo 'EFI built-in command line missing' >&2; exit 1; }; \
+                 grep -Fxq 'CONFIG_CMDLINE=@EFI_CMDLINE@' .config || { echo 'EFI initrd command line mismatch' >&2; exit 1; }; \
+                 grep -q '^# CONFIG_CMDLINE_OVERRIDE is not set$' .config || { echo 'firmware command line must remain usable' >&2; exit 1; }; \
                  grep -q '^CONFIG_EFI_STUB=y$' .config || { echo 'EFI_STUB off - bzImage cannot be loaded by UEFI' >&2; exit 1; }; \
                  grep -q '^# CONFIG_EFI_HANDOVER_PROTOCOL is not set$' .config || { echo 'deprecated EFI handover disabled policy missing' >&2; exit 1; }; \
                  grep -q '^# CONFIG_EFI_MIXED is not set$' .config || { echo '32-bit EFI firmware disabled policy missing' >&2; exit 1; }; \
@@ -857,7 +866,7 @@ pub fn recipe() -> Recipe {
                  grep -q '^CONFIG_SND_ALOOP=y' .config || { echo 'SND_ALOOP off — nothing can capture what was played, so the tone fixture has no in-image oracle' >&2; exit 1; }; \
                  grep -q '^CONFIG_PROC_FS=y' .config || { echo 'PROC_FS off — td-audio discovers devices through /proc/asound/pcm' >&2; exit 1; }; \
                  if grep -q '^CONFIG_SND_PCM_OSS=y' .config; then echo 'SND_PCM_OSS on — APPLICATIONS.md K.4 refuses the deprecated OSS emulation layer on the merits, and olddefconfig must not bring it back as a default' >&2; exit 1; fi; \
-                 if grep -q '^CONFIG_IPC_NS=y' .config; then echo 'IPC_NS on — it is default y behind SYSVIPC||POSIX_MQUEUE, so pinning either brings it along unasked; td-jail omits CLONE_NEWIPC and APPLICATIONS.md §0 defers it deliberately' >&2; exit 1; fi",
+                 if grep -q '^CONFIG_IPC_NS=y' .config; then echo 'IPC_NS on — it is default y behind SYSVIPC||POSIX_MQUEUE, so pinning either brings it along unasked; td-jail omits CLONE_NEWIPC and APPLICATIONS.md §0 defers it deliberately' >&2; exit 1; fi".replace("@EFI_CMDLINE@", &format!("{:?}", crate::ladder::efi_default_cmdline())),
             ],
         )
         .env("PATH", &mesboot0_path()),

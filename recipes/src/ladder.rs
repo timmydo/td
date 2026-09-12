@@ -14,6 +14,15 @@
 
 use crate::types::{Recipe, Step, TextEdit};
 
+/// Removable-media EFI stub loads this 8.3 path on its own filesystem.
+pub const EFI_INITRD_PATH: &str = r"\EFI\BOOT\INITRD";
+pub const EFI_BOOT_FILE: &str = "BOOTX64.EFI";
+pub fn efi_default_cmdline() -> String {
+    // Linux's EFI loader normalizes slashes; td-boot refuses backslashes.
+    let path = EFI_INITRD_PATH.replace('\\', "/");
+    format!("initrd={path} console=ttyS0,115200 rdinit=/init panic=-1 audit=0")
+}
+
 pub const TD_APPLICATION_PACKAGE_ROOT: &str = "/td/store";
 pub const TD_APPLICATION_STATE_ROOT: &str = ".td/app";
 pub const TD_APPLICATION_RUNTIME_ROOT: &str = "td-app";
@@ -3456,6 +3465,14 @@ mod tests {
             "payload_inputs requires mesboot typed data steps or an application spec compiler \
              (APPLICATIONS.md section B.8): {misplaced:?}"
         );
+    }
+
+    #[test]
+    fn efi_defaults_fit_the_selector_command_line_grammar() {
+        let line = super::efi_default_cmdline();
+        // td-boot receives /proc/cmdline verbatim and refuses quotes/backslashes.
+        assert!(line.bytes().all(|b| (b' '..=b'~').contains(&b)
+            && !matches!(b, b'\\' | b'\"' | b'\'')), "{line}");
     }
 
     #[test]

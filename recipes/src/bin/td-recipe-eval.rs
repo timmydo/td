@@ -330,6 +330,11 @@ fn main() {
                 die_runner(&e);
             }
         }
+        Some("qemu-boot-uefi") => {
+            if let Err(error) = check_runner::qemu_boot_uefi_cli(args.get(2..).unwrap_or(&[])) {
+                die_runner(&error);
+            }
+        }
         Some("qemu-boot-erofs") => {
             let rest = args.get(2..).unwrap_or(&[]);
             if let Err(e) = check_runner::qemu_boot_erofs_cli(rest) {
@@ -450,7 +455,7 @@ fn main() {
                 die(&e);
             }
         }
-        _ => die("usage: td-recipe-eval list|emit|check-list|check-count|check-script|check-run|build-run|clear-store|qemu-secret|qemu-secret-system|qemu-boot|qemu-boot-erofs|qemu-boot-system|qemu-update|qemu-boot-net|qemu-boot-kexec|run|bundle|warm|verify-store|payload-closure|application-closure|vendor-warm-args|source-pins|source-pin|ostree-pins|ostree-pin|seed-digests|local-source-digests ..."),
+        _ => die("usage: td-recipe-eval list|emit|check-list|check-count|check-script|check-run|build-run|clear-store|qemu-secret|qemu-secret-system|qemu-boot|qemu-boot-uefi|qemu-boot-erofs|qemu-boot-system|qemu-update|qemu-boot-net|qemu-boot-kexec|run|bundle|warm|verify-store|payload-closure|application-closure|vendor-warm-args|source-pins|source-pin|ostree-pins|ostree-pin|seed-digests|local-source-digests ..."),
     }
 }
 

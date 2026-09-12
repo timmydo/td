@@ -447,8 +447,24 @@ to require MZ/PE signatures, x86-64 PE32+ EFI application identity, bounded
 headers/sections and a nonzero file-backed executable entry point. The Rust
 reader admits at most 96 sections, 64 KiB of headers and a 256 MiB file. It
 is a format check, not a complete PE loader or signature verifier.
-This is only the kernel entry-point increment: fixed-stub packaging,
-built-in boot arguments and the firmware boot oracle remain required.
+The signed selector packaging and full system firmware oracle remain
+required. The stub has a built-in command line naming
+`initrd=/EFI/BOOT/INITRD`, `console=ttyS0,115200`, `rdinit=/init`,
+`panic=-1` and `audit=0`. `CONFIG_CMDLINE_OVERRIDE` stays off so firmware,
+direct-kernel tests and kexec can supplement those defaults. `INITRD` is
+an 8.3 name on the same FAT filesystem as `BOOTX64.EFI`. Linux's EFI
+loader converts these forward slashes to FAT separators; forward slashes
+also satisfy td-boot's unquoted printable command-line grammar.
+
+These are v1 QEMU product defaults, including serial diagnostics, immediate
+panic reboot and auditing disabled unless explicitly enabled by the caller.
+They apply to direct boots and kexec too. A hardware console policy is a
+v2 requirement before claiming support on machines without a serial port.
+Each kernel entry prepends the built-in prefix; selector-to-deployment
+kexec therefore adds a second copy. The current short profile arguments
+fit, but this consumes part of both td-boot's 2048-byte command-line bound
+and the kernel's 2048-byte buffer. Future argument expansion must reserve
+room for that second prefix rather than relying on kernel truncation.
 
 Firmware passes **no command line**, so the stub's must be built in
 (`CONFIG_CMDLINE`). That costs nothing under this design and is the reason
@@ -934,7 +950,25 @@ code/vars pair, the vars a writable per-run copy. It needs no new host
 dependency — the qemu that `find_qemu()` already locates ships
 `edk2-x86_64-code.fd` and `edk2-i386-vars.fd` under its own `share/qemu` — so
 the firmware is located relative to that binary and its absence is a loud
-failure, as `find_qemu`'s is.
+failure, as `find_qemu`'s is. This bundling is host-package-specific;
+matching distro OVMF paths are also tried;
+`TD_QEMU_EFI_CODE` and `TD_QEMU_EFI_VARS` can select an explicit pair
+(both or neither). The pair must have Secure Boot disabled and emit the
+EDK II BdsDxe disk-lookup diagnostic used by the negative control. The tool
+checks bounded regular files; it cannot infer those firmware policies from
+the bytes. Firmware is solely a host test input.
+
+The initial `td-recipe-eval qemu-boot-uefi [linux-x86-64]` increment
+proves the firmware entry and initrd handoff with the recipe's tiny
+BusyBox initramfs. It writes a private, disposable GPT/FAT32 disk using
+td's existing writers, starts q35/TCG with cold per-run variables and a
+read-only disk, and requires the real userspace marker without `-kernel`,
+`-initrd` or `-append`. A disk missing `BOOTX64.EFI` must remain without
+that marker for the bounded negative observation and emit BdsDxe's
+`Not Found` refusal for the `UEFI Misc Device` boot attempt. The positive
+leg runs first to reject a broken firmware pair promptly. No disk destination is
+accepted from the operator. This is a kernel oracle; the signed selector
+and full deployment oracle described below remain required.
 
 The oracle signs with a **per-run throwaway key**: generate a keypair, sign
 the staged bundle, build `td-boot` pinned to that run's public key, boot, and
@@ -1392,8 +1426,8 @@ Ordered by dependency, not by size. Each is one landing with its own tests.
    paragraph in the same landing.
 8. **The EFI-stub kernel** (§5): the EFI/EFI_STUB configuration and
    realized PE format checks are present. The pinned tree requires ACPI,
-   already enabled for TPM discovery. Fixed-stub initramfs packaging and
-   built-in boot arguments are still required before firmware boot.
+   already enabled for TPM discovery. Signed selector initramfs
+   packaging remains required for full system firmware boot.
 9. **The OVMF oracle** (§8), beside the `-kernel` one, not replacing it.
 10. **`td-update` and its local channel**: fetch a signed bundle, verify it,
    delegate the publish (D1 again), and roll back on a failed boot. This is

@@ -28,6 +28,7 @@
 //! host-side TEST tool — it never enters the target artifact graph. If host qemu
 //! is absent the tool FAILS loudly rather than silently passing, so a green result
 //! always means a real boot happened.
+pub(crate) mod efi;
 pub(crate) mod secret;
 pub(crate) mod update;
 
@@ -4336,6 +4337,12 @@ fn boot(
     )
 }
 
+/// Firmware reads its kernel/initrd from the disk carried by BootPlan.
+enum BootSource<'a> {
+    Direct { kernel: &'a Path, initramfs: &'a Path },
+    Firmware { code: &'a Path, vars: &'a Path },
+}
+
 fn boot_with_timeout(
     qemu: &str,
     bzimage: &Path,
@@ -4344,6 +4351,24 @@ fn boot_with_timeout(
     scratch_base: &Path,
     timeout: Duration,
 ) -> Result<BootResult, String> {
+    boot_source(
+        qemu, BootSource::Direct { kernel: bzimage, initramfs },
+        plan, scratch_base, timeout,
+    )
+}
+
+fn boot_source(
+    qemu: &str,
+    source: BootSource<'_>,
+    plan: BootPlan<'_>,
+    scratch_base: &Path,
+    timeout: Duration,
+) -> Result<BootResult, String> {
+    if matches!(source, BootSource::Firmware { .. })
+        && (!plan.extra_append.is_empty() || plan.disk.is_none())
+    {
+        return Err("firmware boot requires a disk and cannot inject a command line".into());
+    }
     validate_boot_plan_tokens(plan.extra_append)?;
     if plan.capture_firefox_audio && (!plan.audio || !plan.physical_input) {
         return Err(
@@ -4429,17 +4454,23 @@ fn boot_with_timeout(
     // kill records to reach printk when CONFIG_AUDIT is compiled in.
     let append = kernel_append(plan.extra_append);
     let mut cmd = Command::new(qemu);
-    cmd.args(["-M", "pc", "-accel", "tcg", "-cpu", "Nehalem", "-m", plan.mem, "-no-reboot"])
+    let machine = if matches!(source, BootSource::Firmware { .. }) { "q35" } else { "pc" };
+    cmd.args(["-M", machine, "-accel", "tcg", "-cpu", "Nehalem", "-m", plan.mem, "-no-reboot"])
         .args(["-display", "none", "-monitor", "none"])
         .args(["-no-user-config", "-vga", "none"])
         .args(["-device", "virtio-vga"])
         .args(["-device", "virtio-tablet-pci"])
-        .args(["-serial", &serial])
-        .arg("-kernel")
-        .arg(bzimage)
-        .arg("-initrd")
-        .arg(initramfs)
-        .args(["-append", &append]);
+        .args(["-serial", &serial]);
+    match source {
+        BootSource::Direct { kernel, initramfs } => {
+            cmd.arg("-kernel").arg(kernel).arg("-initrd").arg(initramfs)
+                .args(["-append", &append]);
+        }
+        BootSource::Firmware { code, vars } => {
+            cmd.arg("-drive").arg(efi::pflash_arg(code, 0, true));
+            cmd.arg("-drive").arg(efi::pflash_arg(vars, 1, false));
+        }
+    }
     if let Some(path) = plan.tpm_socket {
         cmd.arg("-chardev").arg(tpm_chardev_arg(path));
         cmd.args(["-tpmdev", "emulator,id=secret-tpm,chardev=secret-tpm"]);

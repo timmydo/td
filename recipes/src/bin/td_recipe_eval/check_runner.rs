@@ -384,15 +384,25 @@ pub fn qemu_secret_system_cli(args: &[String]) -> Result<(), String> {
 /// the sandbox: it builds linux-x86-64 (bzImage + initramfs) and boots it under
 /// host qemu, asserting the userland marker reaches ttyS0.
 pub fn qemu_boot_cli(args: &[String]) -> Result<(), String> {
+    qemu_kernel_cli(args, false)
+}
+
+/// Cold host-firmware oracle; no direct kernel or initrd injection.
+pub fn qemu_boot_uefi_cli(args: &[String]) -> Result<(), String> {
+    qemu_kernel_cli(args, true)
+}
+
+fn qemu_kernel_cli(args: &[String], firmware: bool) -> Result<(), String> {
+    let command = if firmware { "qemu-boot-uefi" } else { "qemu-boot" };
     const STEM: &str = "linux-x86-64";
     let stem = args.first().map(String::as_str).unwrap_or(STEM);
     if stem != STEM {
         return Err(format!(
-            "qemu-boot only supports {STEM} (got '{stem}'); usage: qemu-boot [{STEM}]"
+            "{command} only supports {STEM} (got '{stem}'); usage: {command} [{STEM}]"
         ));
     }
     if args.get(1).is_some() {
-        return Err(format!("usage: qemu-boot [{STEM}]"));
+        return Err(format!("usage: {command} [{STEM}]"));
     }
     // Provenance planning FIRST — before the runner exists, so a rejected graph
     // spawns no subprocess at all (re #469), matching `cli`/`build_cli`.
@@ -404,7 +414,11 @@ pub fn qemu_boot_cli(args: &[String]) -> Result<(), String> {
     let runner = RecipeCheckRunner::new(root, &scratch_name)?.with_streamed_progress();
     warm_operator_inputs(&runner, &targets);
     let _lock = lock_ladder_for_run(&runner)?;
-    crate::checks::qemu_boot::run(&runner)
+    if firmware {
+        crate::checks::qemu_boot::efi::run(&runner)
+    } else {
+        crate::checks::qemu_boot::run(&runner)
+    }
 }
 
 /// `td-recipe-eval qemu-boot-erofs [linux-x86-64]` — the read-only-root boot proof
@@ -7896,6 +7910,7 @@ chmod 755 '{}'
         let mut exclusive = std::collections::BTreeSet::new();
         let mut through_run = std::collections::BTreeSet::new();
         let mut direct = std::collections::BTreeSet::new();
+        let mut kernel_delegates = std::collections::BTreeSet::new();
         for line in shipped.lines().map(str::trim) {
             if line.starts_with("//") {
                 continue;
@@ -7922,6 +7937,9 @@ chmod 755 '{}'
             if calls(line, "lock_ladder_for_run(") {
                 through_run.insert(current);
             }
+            if name.is_none() && calls(line, "qemu_kernel_cli(") {
+                kernel_delegates.insert(current);
+            }
             // A second acquisition beside the shared one would hold the ladder
             // exclusively without spelling the literal: `lock_file` has no mode.
             if calls(line, "lock_ladder(") || calls(line, "lock_file(") {
@@ -7942,7 +7960,7 @@ chmod 755 '{}'
             "only a whole-ladder operation may spell LadderLock::Exclusive"
         );
         for harness in [
-            "qemu_boot_cli",
+            "qemu_kernel_cli",
             "qemu_boot_erofs_cli",
             "qemu_boot_system_cli",
             "qemu_boot_net_cli",
@@ -7959,6 +7977,14 @@ chmod 755 '{}'
                 !direct.contains(harness),
                 "{harness} must not take the ladder or a lock file directly"
             );
+        }
+        assert_eq!(
+            kernel_delegates,
+            ["qemu_boot_cli", "qemu_boot_uefi_cli"].into_iter().collect()
+        );
+        for delegate in kernel_delegates {
+            assert!(!direct.contains(delegate) && !through_run.contains(delegate),
+                "{delegate} must leave the single ladder acquisition to qemu_kernel_cli");
         }
     }
 
