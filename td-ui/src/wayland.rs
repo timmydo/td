@@ -2,10 +2,10 @@
 //! endpoint, a connection that frames requests, carries at most one
 //! descriptor per send and owns every received right until an event's
 //! consumer takes it, the unlinked private file a SHM pool is built on,
-//! and the pointer image every consumer shows. The object table, surface
-//! lifecycle and turn loop follow in the next increment; until then each
-//! consumer drives the connection from its own loop. Errors are strings,
-//! as the wire codec's are; a consumer maps them into its own diagnostic.
+//! and the pointer image every consumer shows. `client` builds the object
+//! table, the surface lifecycle and the turn loop over it. Errors are
+//! strings, as the wire codec's are; a consumer maps them into its own
+//! diagnostic.
 
 use crate::sys;
 use crate::wire::{self, Builder, Message};
@@ -37,7 +37,7 @@ pub const CONNECT_DEADLINE: Duration = Duration::from_secs(5);
 pub const IDLE_WAIT: Duration = Duration::from_millis(100);
 static NEXT_FILE: AtomicU64 = AtomicU64::new(0);
 
-fn error(value: impl std::fmt::Display) -> String {
+pub(crate) fn error(value: impl std::fmt::Display) -> String {
     value.to_string()
 }
 

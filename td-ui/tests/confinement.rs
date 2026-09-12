@@ -41,7 +41,7 @@ fn source_inventory_and_shared_mounts_are_closed() {
     assert!(!root.join("build.rs").exists());
     let expected: BTreeSet<String> = PURE
         .iter()
-        .chain(["lib.rs", "notices.rs", "sys.rs", "wayland.rs"].iter())
+        .chain(["client.rs", "lib.rs", "notices.rs", "sys.rs", "wayland.rs"].iter())
         .map(|name| name.to_string())
         .collect();
     let mut actual = BTreeSet::new();
@@ -85,6 +85,11 @@ fn source_inventory_and_shared_mounts_are_closed() {
             compact.matches("#[path=").count(),
             if name == "lib.rs" { 3 } else { 0 },
             "source paths in {name}"
+        );
+        assert_eq!(
+            text.matches(".unconfigure(").count(),
+            0,
+            "the client's test support is not called in {name}"
         );
         if name == "lib.rs" {
             assert!(compact.starts_with("#![deny(unsafe_code)]"));

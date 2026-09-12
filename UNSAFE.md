@@ -2223,9 +2223,9 @@ function-scoped instruction: `fcntl` (72) pinned to `F_GETFL` and
 descriptor: the Wayland transport — `recvmsg`, `sendmsg`, `fcntl` pinned
 to `F_DUPFD_CLOEXEC` and the one adoption site — is td-ui's (§19), which
 the editor depends on by path and reaches only through the toolkit's
-connection. Safe `std` owns file creation/unlinking, positional pixel
-writes and every close. No raw pointer escapes this private module. Other
-architectures are refused at compile time rather than inheriting its ABI.
+connection. Safe `std` owns file creation/unlinking and every close. No
+raw pointer escapes this private module. Other architectures are refused
+at compile time rather than inheriting its ABI.
 The core, layout, renderer and controller still have no raw boundary.
 
 `flistxattr` is the file adapter's attribute query. `files.rs` alone calls
@@ -2311,9 +2311,9 @@ consume arbitrary queued rights. No clipboard endpoint is reopened through
 procfs or admitted as a regular file. Destination writes use std and assume
 Rust's ignored SIGPIPE disposition, as documented by the transfer API.
 
-The editor hands td-ui's descriptor send (§19) only its unlinked 0600
-regular SHM backing file, or the producer side of a fresh private
-UnixStream pair for `wl_data_offer.receive`. The receiving side uses safe
+The editor hands td-ui's descriptor send (§19) only the producer side of
+a fresh private UnixStream pair for `wl_data_offer.receive`; the SHM
+backing files are td-ui's client's. The receiving side uses safe
 std nonblocking mode, is bounded to 1 MiB and is never mapped or written to
 disk. The local producer owner is dropped after the request is sent.
 
@@ -2624,21 +2624,23 @@ function-scoped instruction: `recvmsg` (47), `sendmsg` (46) and `fcntl`
 (72) pinned to `F_DUPFD_CLOEXEC` (1030). A second function-scoped
 allowance adopts newly installed nonnegative descriptors into `OwnedFd`.
 Safe `std` owns connection setup, byte-only sends, timeouts, pool file
-creation and unlinking, and every close. No raw
+creation and unlinking, positional pixel writes, and every close. No raw
 pointer or unowned received descriptor escapes the private module; the
 crate root denies `unsafe`, and the two allowances are the module's only
 ones. Other architectures are refused at compile time rather than
-inheriting its ABI. The rest of the toolkit — the raster, the keymap
-compiler, the repeat policy, the pointer decoder and the mounted font and
-wire sources — has no raw boundary.
+inheriting its ABI. The rest of the toolkit — the client over the
+transport, the raster, the keymap compiler, the repeat policy, the
+pointer decoder and the mounted font and wire sources — has no raw
+boundary.
 
 This surface is the editor's transport subset, moved here so that every
 td-owned graphical program shares one client, with one change: the
 ancillary length is written as the 8-byte `size_t` it is; §14 records
 what the editor kept. Reusing this module does not transfer its
 authorization to a new consumer: a program that depends on td-ui
-inherits the transport through `wayland::Connection` and nothing else,
-and one that needs a raw surface of its own gets its own roster entry.
+inherits the transport through `wayland::Connection`, alone or beneath
+`client::Client`, and nothing else, and one that needs a raw surface of
+its own gets its own roster entry.
 
 The inherited-stream `fcntl` caller is pinned to `F_DUPFD_CLOEXEC`,
 minimum descriptor 3. It duplicates the borrowed `WAYLAND_SOCKET`
@@ -2675,14 +2677,13 @@ editor's keymap and data-source events).
 
 The only send caller is the connection's descriptor-send path. `sendmsg`
 carries exactly one borrowed `File` in a 24-byte ancillary extent,
-`cmsg_len=20`, and fixed `SOL_SOCKET`/`SCM_RIGHTS`. The caller supplies
-only its unlinked 0600 regular SHM backing file, or a fresh private
-endpoint a consumer's clipboard hands it. `MSG_NOSIGNAL` (0x4000) makes
-peer loss an error. A successful short write transfers the descriptor
-once; only the remaining ordinary bytes are retried. Interrupted calls
-transfer nothing. The complete message has one five-second write
-deadline, including retries, capped by the startup deadline while the
-consumer holds one.
+`cmsg_len=20`, and fixed `SOL_SOCKET`/`SCM_RIGHTS`. The caller supplies only
+the client's unlinked 0600 regular SHM backing files, or a fresh private
+endpoint a consumer's clipboard hands it. `MSG_NOSIGNAL` (0x4000) makes peer
+loss an error. A successful short write transfers the descriptor once; only
+the remaining ordinary bytes are retried. Interrupted calls transfer
+nothing. The complete message has one five-second write deadline, including
+retries, capped by the startup deadline while the consumer holds one.
 
 Confinement tests pin the complete raw source fingerprint, the syscall
 and flag values, the two function-only allowances, the single

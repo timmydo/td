@@ -8,73 +8,63 @@ use crate::keys::Profile;
 use crate::render::{Geometry, Label};
 use td_ui::raster::{Draw, GlyphStyle, Primitive, Raster, CHROME, INK};
 use td_ui::repeat::Input;
-use td_ui::wayland::{backing_file, connect, cursor_pixels, endpoint, Connection, WRITE_DEADLINE};
+use td_ui::client::{
+    run, App, Client, Handled, Kind as ClientKind, Tag, DISPLAY, REGISTRY, SURFACE,
+};
+use td_ui::wayland::{connect, endpoint};
 use crate::ui::{Controller, Event, Outcome};
 use crate::wire::{Builder, Cursor, Message};
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::VecDeque;
 use std::fs::File;
 use std::io;
 use std::os::fd::OwnedFd;
 use std::os::unix::fs::FileExt;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 type Result<T> = std::result::Result<T, String>;
-const DISPLAY: u32 = 1;
-const REGISTRY: u32 = 2;
-const SYNC: u32 = 3;
-const COMPOSITOR: u32 = 4;
-const SHM: u32 = 5;
-const WM: u32 = 6;
-const SURFACE: u32 = 7;
-const XDG_SURFACE: u32 = 8;
-const TOPLEVEL: u32 = 9;
-const OBJECTS: usize = 128;
 const CONTROL_JOBS_PER_TURN: usize = 2;
-const INITIAL_DEADLINE: Duration = Duration::from_secs(20);
 
 fn error(value: impl std::fmt::Display) -> String {
     value.to_string()
 }
 
+/// The editor's own objects in the client's table: the seat, its input
+/// devices, and the clipboard manager, device, sources and sync barriers,
+/// with the retired states that wait for `delete_id`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum Kind {
-    Free,
-    Fixed,
-    Pool,
-    Buffer,
-    Frame,
-    Retired,
-    RetiredBuffer,
+enum Object {
     Seat,
+    RetiredSeat,
     Keyboard,
     RetiredKeyboard,
-    RetiredSeat,
     Pointer,
     RetiredPointer,
-    CursorSurface,
-    CursorBuffer,
     ClipboardManager,
     ClipboardDevice,
     RetiredClipboardDevice,
     ClipboardSource,
     RetiredClipboardSource,
     ClipboardSync,
+    RetiredClipboardSync,
 }
 
-struct Buffer {
-    id: u32,
-    file: File,
-    geometry: Geometry,
-    busy: bool,
+impl Tag for Object {
+    fn retired(self) -> bool {
+        matches!(
+            self,
+            Self::RetiredSeat
+                | Self::RetiredKeyboard
+                | Self::RetiredPointer
+                | Self::RetiredClipboardDevice
+                | Self::RetiredClipboardSource
+                | Self::RetiredClipboardSync
+        )
+    }
 }
 
-struct CursorImage {
-    surface: u32,
-    buffer: u32,
-    busy: bool,
-}
+type Kind = ClientKind<Object>;
 
 #[derive(Default)]
 struct Pointer {
@@ -89,27 +79,13 @@ struct Pointer {
 }
 
 struct Window {
-    connection: Connection,
-    globals: BTreeMap<u32, (String, u32)>,
-    required: Vec<u32>,
-    objects: [Kind; OBJECTS],
+    client: Client<Object>,
     ui: Controller,
     font: Font,
     labels: Vec<(crate::model::TabId, &'static str)>,
-    buffers: Vec<Buffer>,
-    pixels: Vec<u8>,
-    configured: bool,
-    pending_size: Option<(i32, i32)>,
-    xrgb: bool,
-    argb: bool,
     pointer: Pointer,
     control_pointer: Option<crate::model::RevisionPoint>,
-    cursor_image: Option<CursorImage>,
     frames: crate::control_frame::Frames,
-    callback: Option<u32>,
-    bound: bool,
-    closed: bool,
-    temporary: PathBuf,
     seat: Option<u32>,
     device: Option<u32>,
     input: Input,
@@ -340,33 +316,14 @@ impl Window {
         };
         ui.dispatch(Event::SelectTab(first)).map_err(error)?;
         ui.dispatch(Event::Focus(false)).map_err(error)?;
-        let mut objects = [Kind::Free; OBJECTS];
-        objects
-            .get_mut(..10)
-            .ok_or("object table")?
-            .fill(Kind::Fixed);
         Ok(Self {
-            connection: Connection::new(stream)?,
-            globals: BTreeMap::new(),
-            required: Vec::new(),
-            objects,
+            client: Client::new(stream, temporary)?,
             ui,
             font: crate::font::pinned()?,
             labels: vec![(first, "Scratch (no save)"), (second, "Second tab")],
-            buffers: Vec::with_capacity(3),
-            pixels: Vec::new(),
-            configured: false,
-            pending_size: None,
-            xrgb: false,
-            argb: false,
             pointer: Pointer::default(),
             control_pointer: None,
-            cursor_image: None,
             frames: crate::control_frame::Frames::default(),
-            callback: None,
-            bound: false,
-            closed: false,
-            temporary,
             seat: None,
             device: None,
             input: Input::default(),
@@ -400,66 +357,10 @@ impl Window {
         })
     }
 
-    fn allocate(&mut self, kind: Kind) -> Result<u32> {
-        let (id, slot) = self
-            .objects
-            .iter_mut()
-            .enumerate()
-            .skip(10)
-            .find(|(_, k)| **k == Kind::Free)
-            .ok_or("Wayland object budget (waiting for delete_id)")?;
-        *slot = kind;
-        u32::try_from(id).map_err(error)
-    }
-
-    fn kind(&self, id: u32) -> Result<Kind> {
-        self.objects
-            .get(id as usize)
-            .copied()
-            .ok_or("unknown Wayland object".into())
-    }
-    fn set_kind(&mut self, id: u32, kind: Kind) -> Result<()> {
-        *self
-            .objects
-            .get_mut(id as usize)
-            .ok_or("unknown Wayland object")? = kind;
-        Ok(())
-    }
-
-    fn bind(&mut self, name: &str, version: u32, id: u32) -> Result<()> {
-        let global = self
-            .globals
-            .iter()
-            .find(|(_, (n, v))| n == name && *v >= version)
-            .map(|(id, _)| *id)
-            .ok_or_else(|| format!("required Wayland global {name} v{version} is missing"))?;
-        let mut body = Builder::new();
-        body.u32(global);
-        body.string(name)?;
-        body.u32(version);
-        body.u32(id);
-        self.connection.send(REGISTRY, 0, body, None)?;
-        self.required.push(global);
-        Ok(())
-    }
-
     fn initialize(&mut self) -> Result<()> {
-        self.bind("wl_compositor", 4, COMPOSITOR)?;
-        self.bind("wl_shm", 1, SHM)?;
-        self.bind("xdg_wm_base", 1, WM)?;
-        // Fill fixed IDs 7..9 before publishing dynamic IDs starting at 10.
-        // libwayland's server object map refuses gaps in new client IDs.
-        self.connection.words(COMPOSITOR, 0, &[SURFACE])?;
-        self.connection.words(WM, 2, &[XDG_SURFACE, SURFACE])?;
-        self.connection.words(XDG_SURFACE, 1, &[TOPLEVEL])?;
-        if let Some(version) = self
-            .globals
-            .values()
-            .find(|(name, version)| name == "wl_seat" && *version >= 5)
-            .map(|(_, version)| (*version).min(7))
-        {
-            let seat = self.allocate(Kind::Seat)?;
-            self.bind("wl_seat", version, seat)?;
+        if let Some((_, version)) = self.client.find_global("wl_seat", 5) {
+            let seat = self.client.allocate(Object::Seat)?;
+            self.client.bind("wl_seat", version.min(7), seat)?;
             self.seat = Some(seat);
         } else {
             if self.files.is_some() {
@@ -468,24 +369,13 @@ impl Window {
             self.notify("No wl_seat v5+; scratch input unavailable");
         }
         self.initialize_clipboard()?;
-        for (opcode, value) in [
-            (
-                2,
-                if self.files.is_some() {
-                    "td-editor — experimental file window"
-                } else {
-                    "td-editor — scratch preview (NO SAVE)"
-                },
-            ),
-            (3, "td-editor"),
-        ] {
-            let mut body = Builder::new();
-            body.string(value)?;
-            self.connection.send(TOPLEVEL, opcode, body, None)?;
-        }
-        self.connection.words(SURFACE, 6, &[])?;
-        self.bound = true;
-        Ok(())
+        self.client.set_title(if self.files.is_some() {
+            "td-editor — experimental file window"
+        } else {
+            "td-editor — scratch preview (NO SAVE)"
+        })?;
+        self.client.set_app_id("td-editor")?;
+        self.client.commit()
     }
 
     fn event(&mut self, message: Message) -> Result<()> {
@@ -503,119 +393,18 @@ impl Window {
         if self.clipboard.offers.contains_key(&message.object) {
             return self.clipboard_offer(message);
         }
-        let mut cursor = Cursor::new(&message.payload);
-        match (message.object, message.opcode) {
-            (DISPLAY, 0) => {
-                let object = cursor.u32()?;
-                let code = cursor.u32()?;
-                let detail = cursor.string()?;
-                return Err(format!(
-                    "Wayland protocol error on object {object}, code {code}: {detail:?}"
-                ));
-            }
-            (DISPLAY, 1) => {
-                let id = cursor.u32()?;
-                if !matches!(
-                    self.kind(id)?,
-                    Kind::Retired
-                        | Kind::RetiredBuffer
-                        | Kind::RetiredKeyboard
-                        | Kind::RetiredSeat
-                        | Kind::RetiredPointer
-                        | Kind::RetiredClipboardDevice
-                        | Kind::RetiredClipboardSource
-                ) {
-                    return Err("unexpected delete_id".into());
-                }
-                self.set_kind(id, Kind::Free)?;
-            }
-            (REGISTRY, 0) => {
-                let id = cursor.u32()?;
-                let name = cursor.string()?;
-                let version = cursor.u32()?;
-                if id == 0
-                    || name.len() > 256
-                    || name.contains('\0')
-                    || version == 0
-                    || self.globals.len() >= 128
-                    || self.globals.contains_key(&id)
-                {
-                    return Err("invalid or excessive Wayland globals".into());
-                }
-                self.globals.insert(id, (name, version));
-            }
-            (REGISTRY, 1) => {
-                let id = cursor.u32()?;
-                cursor.finish()?;
-                if self.clipboard.manager.is_some_and(|(name, _)| name == id) {
-                    self.release_clipboard()?;
-                    self.clipboard.manager = None;
-                }
-                if self
-                    .globals
-                    .get(&id)
-                    .is_some_and(|(name, _)| name == "wl_seat")
-                    && self.required.contains(&id)
-                {
-                    self.release_keyboard()?;
-                    self.release_pointer()?;
-                    self.release_clipboard()?;
-                    if let Some(seat) = self.seat.take() {
-                        self.connection.words(seat, 3, &[])?;
-                        self.set_kind(seat, Kind::RetiredSeat)?;
-                    }
-                    self.required.retain(|global| *global != id);
-                    self.globals.remove(&id);
-                    self.notify("Seat removed; scratch text retained");
-                    return Ok(());
-                }
-                if self.required.contains(&id) {
-                    return Err("required Wayland global was removed".into());
-                }
-                self.globals.remove(&id);
-                return Ok(());
-            }
-            (SYNC, 0) if !self.bound => {
-                cursor.u32()?;
-                self.set_kind(SYNC, Kind::Retired)?;
-                cursor.finish()?;
-                return self.initialize();
-            }
-            (WM, 0) if self.bound => {
-                let serial = cursor.u32()?;
-                self.connection.words(WM, 3, &[serial])?;
-            }
-            (SHM, 0) if self.bound => {
-                let format = cursor.u32()?;
-                cursor.finish()?;
-                self.xrgb |= format == 1;
-                self.argb |= format == 0;
+        match self.client.handle(&message)? {
+            Handled::Done => Ok(()),
+            Handled::Bound => self.initialize(),
+            Handled::Format(format) => {
                 if format == 0 {
-                    return self.show_cursor();
+                    self.show_cursor()?;
                 }
-                return Ok(());
+                Ok(())
             }
-            (TOPLEVEL, 0) if self.bound => {
-                let width = cursor.i32()?;
-                let height = cursor.i32()?;
-                let length = cursor.u32()?;
-                if width < 0 || height < 0 || length > 256 || length % 4 != 0 {
-                    return Err("invalid toplevel configure".into());
-                }
-                for _ in 0..length / 4 {
-                    cursor.u32()?;
-                }
-                self.pending_size = Some((width, height));
-            }
-            (TOPLEVEL, 1) if self.bound => {
-                cursor.finish()?;
-                self.close();
-                return Ok(());
-            }
-            (XDG_SURFACE, 0) if self.bound => {
+            Handled::Configure { size, serial } => {
                 self.menu = None;
-                let serial = cursor.u32()?;
-                if let Some((width, height)) = self.pending_size.take() {
+                if let Some((width, height)) = size {
                     let current = self.ui.geometry();
                     self.ui
                         .dispatch(Event::Resize {
@@ -633,14 +422,52 @@ impl Window {
                         })
                         .map_err(|e| format!("Wayland configure geometry: {e}"))?;
                 }
-                self.connection.words(XDG_SURFACE, 4, &[serial])?;
-                self.configured = true;
+                self.client.acknowledge(serial)?;
                 self.frames.invalidate(true);
+                Ok(())
             }
-            (SURFACE, 0 | 1) if self.bound => {
-                cursor.u32()?;
+            Handled::CloseRequested => {
+                self.close();
+                Ok(())
             }
-            (id, opcode) if self.seat == Some(id) || self.kind(id)? == Kind::RetiredSeat => {
+            Handled::FrameDone => self.frames.complete().map_err(error),
+            Handled::GlobalRemoved { id, required } => self.global_removed(id, required),
+            Handled::Unhandled => self.device_event(message),
+        }
+    }
+
+    fn global_removed(&mut self, id: u32, required: bool) -> Result<()> {
+        if self.clipboard.manager.is_some_and(|(name, _)| name == id) {
+            self.release_clipboard()?;
+            self.clipboard.manager = None;
+        }
+        if !required {
+            return Ok(());
+        }
+        if self.client.global_name(id) != Some("wl_seat") {
+            return Err("required Wayland global was removed".into());
+        }
+        self.release_keyboard()?;
+        self.release_pointer()?;
+        self.release_clipboard()?;
+        if let Some(seat) = self.seat.take() {
+            self.client.words(seat, 3, &[])?;
+            self.client.set_tag(seat, Object::RetiredSeat)?;
+        }
+        self.client.forget_global(id);
+        self.notify("Seat removed; scratch text retained");
+        Ok(())
+    }
+
+    /// Events for the editor's own objects: the seat, its devices and the
+    /// clipboard, which the client hands back untouched.
+    fn device_event(&mut self, message: Message) -> Result<()> {
+        let mut cursor = Cursor::new(&message.payload);
+        match (message.object, message.opcode) {
+            (id, opcode)
+                if self.seat == Some(id)
+                    || self.client.kind(id)? == Kind::App(Object::RetiredSeat) =>
+            {
                 match opcode {
                     0 => {
                         let capabilities = cursor.u32()?;
@@ -651,16 +478,16 @@ impl Window {
                         if capabilities & 1 == 0 {
                             self.release_pointer()?;
                         } else if self.pointer.device.is_none() {
-                            let device = self.allocate(Kind::Pointer)?;
-                            self.connection.words(id, 0, &[device])?;
+                            let device = self.client.allocate(Object::Pointer)?;
+                            self.client.words(id, 0, &[device])?;
                             self.pointer.device = Some(device);
                         }
                         if capabilities & 2 == 0 {
                             self.release_keyboard()?;
                             self.notify("Seat has no keyboard; scratch text retained");
                         } else if self.device.is_none() {
-                            let device = self.allocate(Kind::Keyboard)?;
-                            self.connection.words(id, 1, &[device])?;
+                            let device = self.client.allocate(Object::Keyboard)?;
+                            self.client.words(id, 1, &[device])?;
                             self.device = Some(device);
                         }
                         return Ok(());
@@ -673,29 +500,39 @@ impl Window {
                     _ => return Err("unknown seat event".into()),
                 }
             }
-            (id, _) if matches!(self.kind(id)?, Kind::Keyboard | Kind::RetiredKeyboard) => {
+            (id, _)
+                if matches!(
+                    self.client.kind(id)?,
+                    Kind::App(Object::Keyboard | Object::RetiredKeyboard)
+                ) =>
+            {
                 return self.keyboard_event(message);
             }
-            (id, _) if matches!(self.kind(id)?, Kind::Pointer | Kind::RetiredPointer) => {
+            (id, _)
+                if matches!(
+                    self.client.kind(id)?,
+                    Kind::App(Object::Pointer | Object::RetiredPointer)
+                ) =>
+            {
                 return self.pointer_event(message);
             }
             (id, _)
                 if matches!(
-                    self.kind(id)?,
-                    Kind::ClipboardDevice | Kind::RetiredClipboardDevice
+                    self.client.kind(id)?,
+                    Kind::App(Object::ClipboardDevice | Object::RetiredClipboardDevice)
                 ) =>
             {
                 return self.clipboard_device(message);
             }
             (id, _)
                 if matches!(
-                    self.kind(id)?,
-                    Kind::ClipboardSource | Kind::RetiredClipboardSource
+                    self.client.kind(id)?,
+                    Kind::App(Object::ClipboardSource | Object::RetiredClipboardSource)
                 ) =>
             {
                 return self.clipboard_source(message);
             }
-            (id, 0) if self.kind(id)? == Kind::ClipboardSync => {
+            (id, 0) if self.client.kind(id)? == Kind::App(Object::ClipboardSync) => {
                 cursor.u32()?;
                 cursor.finish()?;
                 let retired = self
@@ -713,40 +550,9 @@ impl Window {
                         self.clipboard.offers.remove(&offer);
                     }
                 }
-                self.set_kind(id, Kind::Retired)?;
+                self.client.set_tag(id, Object::RetiredClipboardSync)?;
                 return self.queue_offer_barrier();
             }
-            (id, 0 | 1) if self.kind(id)? == Kind::CursorSurface => {
-                cursor.u32()?;
-            }
-            (id, 0) if self.kind(id)? == Kind::CursorBuffer => {
-                cursor.finish()?;
-                let image = self
-                    .cursor_image
-                    .as_mut()
-                    .filter(|image| image.buffer == id && image.busy)
-                    .ok_or("unexpected cursor buffer release")?;
-                image.busy = false;
-                return Ok(());
-            }
-            (id, 0) if self.kind(id)? == Kind::Frame && self.callback == Some(id) => {
-                cursor.u32()?;
-                self.frames.complete().map_err(error)?;
-                self.callback = None;
-                self.set_kind(id, Kind::Retired)?;
-            }
-            (id, 0) if self.kind(id)? == Kind::Buffer => {
-                let buffer = self
-                    .buffers
-                    .iter_mut()
-                    .find(|b| b.id == id)
-                    .ok_or("missing buffer")?;
-                if !buffer.busy {
-                    return Err("duplicate buffer release".into());
-                }
-                buffer.busy = false;
-            }
-            (id, 0) if self.kind(id)? == Kind::RetiredBuffer => {}
             _ => {
                 return Err(format!(
                     "unexpected Wayland event {}:{}",
@@ -788,7 +594,7 @@ impl Window {
             self.quitting = true;
             self.frames.invalidate(true);
         } else {
-            self.closed = true;
+            self.client.close();
         }
     }
 
@@ -797,8 +603,8 @@ impl Window {
         self.clipboard_focus_lost()?;
         self.menu = None;
         if let Some(device) = self.device.take() {
-            self.connection.words(device, 0, &[])?;
-            self.set_kind(device, Kind::RetiredKeyboard)?;
+            self.client.words(device, 0, &[])?;
+            self.client.set_tag(device, Object::RetiredKeyboard)?;
         }
         self.input = Input::default();
         self.ui.dispatch(Event::Focus(false)).map_err(error)?;
@@ -808,8 +614,8 @@ impl Window {
 
     fn release_pointer(&mut self) -> Result<()> {
         if let Some(device) = self.pointer.device {
-            self.connection.words(device, 1, &[])?;
-            self.set_kind(device, Kind::RetiredPointer)?;
+            self.client.words(device, 1, &[])?;
+            self.client.set_tag(device, Object::RetiredPointer)?;
         }
         self.pointer = Pointer::default();
         self.control_pointer = None;
@@ -1082,39 +888,7 @@ impl Window {
         let (Some(device), Some(serial)) = (self.pointer.device, self.pointer.enter) else {
             return Ok(());
         };
-        if !self.argb {
-            return Ok(());
-        }
-        if self.cursor_image.is_none() {
-            let file = backing_file(&self.temporary, 16 * 24 * 4)?;
-            file.write_all_at(&cursor_pixels(), 0).map_err(error)?;
-            let surface = self.allocate(Kind::CursorSurface)?;
-            let pool = self.allocate(Kind::Pool)?;
-            let buffer = self.allocate(Kind::CursorBuffer)?;
-            self.connection.words(COMPOSITOR, 0, &[surface])?;
-            let mut body = Builder::new();
-            body.u32(pool);
-            body.u32(16 * 24 * 4);
-            self.connection.send(SHM, 0, body, Some(&file))?;
-            self.connection
-                .words(pool, 0, &[buffer, 0, 16, 24, 64, 0])?;
-            self.connection.words(pool, 1, &[])?;
-            self.set_kind(pool, Kind::Retired)?;
-            // Establish the cursor role before publishing its first buffer.
-            self.connection.words(device, 0, &[serial, surface, 0, 0])?;
-            self.connection.words(surface, 1, &[buffer, 0, 0])?;
-            self.connection.words(surface, 2, &[0, 0, 16, 24])?;
-            self.connection.words(surface, 6, &[])?;
-            self.cursor_image = Some(CursorImage {
-                surface,
-                buffer,
-                busy: true,
-            });
-            return Ok(());
-        }
-        let image = self.cursor_image.as_ref().ok_or("cursor image missing")?;
-        self.connection
-            .words(device, 0, &[serial, image.surface, 0, 0])
+        self.client.show_cursor(device, serial)
     }
 
     fn keyboard_event(&mut self, message: Message) -> Result<()> {
@@ -1124,7 +898,7 @@ impl Window {
         // their exact schema until delete_id without activating a new map.
         if let KeyboardEvent::Map(format, size) = event {
             let fd = self
-                .connection
+                .client
                 .pop_descriptor()
                 .ok_or("missing keymap descriptor")?;
             if !active {
@@ -1224,7 +998,7 @@ impl Window {
         if self.quitting {
             if !repeated {
                 match chord {
-                    "C-d" => self.closed = true,
+                    "C-d" => self.client.close(),
                     "Escape" | "C-g" => {
                         self.quitting = false;
                         self.frames.invalidate(true);
@@ -1608,14 +1382,14 @@ impl Window {
                 }
             }
         }
-        self.connection
-            .set_wait(Duration::from_millis(self.input.wait_ms(now)));
+        let wait = Duration::from_millis(self.input.wait_ms(now));
+        self.client.connection().set_wait(wait);
         if self.clipboard.incoming.is_some()
             || self.clipboard.outgoing.is_some()
             || self.path_completion.as_ref().is_some_and(|worker| worker.pending())
         {
-            self.connection
-                .set_wait(self.connection.wait().min(Duration::from_millis(10)));
+            let connection = self.client.connection();
+            connection.set_wait(connection.wait().min(Duration::from_millis(10)));
         }
         self.cancel_stale_paste();
         self.searches.observe(self.ui.editor());
@@ -1633,8 +1407,8 @@ impl Window {
             Err(detail) => self.notify(format!("Spelling cancelled: {detail}")),
         }
         if self.spelling.running() {
-            self.connection
-                .set_wait(self.connection.wait().min(Duration::from_millis(1)));
+            let connection = self.client.connection();
+            connection.set_wait(connection.wait().min(Duration::from_millis(1)));
         }
         self.observe_control_jobs();
         self.control_tick();
@@ -1644,12 +1418,12 @@ impl Window {
     }
 
     fn control_tick(&mut self) {
-        if self.closed || self.control_input_error.is_some() {
+        if self.client.closed() || self.control_input_error.is_some() {
             return;
         }
         if self.control.is_some() {
-            self.connection
-                .set_wait(self.connection.wait().min(Duration::from_millis(10)));
+            let connection = self.client.connection();
+            connection.set_wait(connection.wait().min(Duration::from_millis(10)));
         }
         let mut budget = CONTROL_JOBS_PER_TURN;
         // Inspect each held job once. Replies share the ordinary admission budget.
@@ -1845,7 +1619,9 @@ impl Window {
                 .response(),
             };
         }
-        if request.is_mutating() && (self.closed || self.pointer_modal() || self.menu.is_some()) {
+        if request.is_mutating()
+            && (self.client.closed() || self.pointer_modal() || self.menu.is_some())
+        {
             return crate::control::Refusal {
                 id: request.id,
                 error: crate::Error::Unavailable,
@@ -2047,10 +1823,10 @@ impl Window {
     }
 
     fn control_pointer_available(&self) -> bool {
-        !self.closed
+        !self.client.closed()
             && self.control_input_error.is_none()
             && !self.pointer_modal()
-            && self.configured
+            && self.client.configured()
             && self.pointer.device.is_some()
             && self.pointer.enter.is_some()
             && self.activation_serial.is_none()
@@ -2191,7 +1967,7 @@ impl Window {
         else {
             return Err(crate::Error::InvalidArgument);
         };
-        if self.closed
+        if self.client.closed()
             || self.control_input_error.is_some()
             || self.quitting
             || self.prompt.is_some()
@@ -2314,14 +2090,14 @@ impl Window {
     }
 
     fn control_key_available(&self) -> bool {
-        !self.closed
+        !self.client.closed()
             && self.control_input_error.is_none()
             && !self.quitting
             && self.prompt.is_none()
             && self.closing.is_none()
             && self.conflict.is_none()
             && self.reloading.is_none()
-            && self.configured
+            && self.client.configured()
             && self.device.is_some()
             && self.input.map.is_some()
             && self.input.focused
@@ -2600,7 +2376,7 @@ impl Window {
         target: Target,
         answer: &crate::control::DialogAnswer,
     ) -> crate::Result<ControlAnswer> {
-        if self.closed || self.files.is_none() {
+        if self.client.closed() || self.files.is_none() {
             return Err(crate::Error::Unavailable);
         }
         let Some(close) = self.closing.as_ref() else {
@@ -3114,7 +2890,7 @@ impl Window {
                         && self.ui.editor().active() == Some(point.tab)
                         && self.ui.editor().check_revision(point).is_ok()
                 }).map_or_else(|| "-".into(), |point| format!("{},{}", point.tab, point.revision)),
-                flag(self.configured),
+                flag(self.client.configured()),
                 flag(self.files.is_some()),
                 flag(self.files.as_ref().is_some_and(|files| files.busy())),
                 flag(self.quitting),
@@ -3195,39 +2971,12 @@ impl Window {
         self.sync_prompt_layout()?;
         self.control_input_health()?;
         self.frames.generation().map_err(error)?;
-        if self.closed
-            || !self.frames.is_dirty()
-            || !self.configured
-            || !self.xrgb
-            || self.callback.is_some()
-        {
+        if !self.frames.is_dirty() || !self.client.can_present() {
             return Ok(());
         }
         let geometry = self.ui.geometry();
         let stamp = self.frames.capture(&self.ui).map_err(error)?;
-        let free = self
-            .buffers
-            .iter()
-            .position(|b| !b.busy && b.geometry == geometry)
-            .or_else(|| self.buffers.iter().position(|b| !b.busy));
-        if free.is_none() && self.buffers.len() == 3 {
-            return Ok(());
-        }
-        let index = if let Some(index) = free {
-            if self.buffers.get(index).ok_or("buffer slot")?.geometry != geometry {
-                let old = self.buffers.remove(index);
-                self.connection.words(old.id, 0, &[])?;
-                self.set_kind(old.id, Kind::RetiredBuffer)?;
-                self.create_buffer(geometry)?
-            } else {
-                index
-            }
-        } else {
-            self.create_buffer(geometry)?
-        };
         let (width, height) = geometry.dimensions();
-        let size = width * height * 4;
-        self.pixels.resize(size, 0);
         let labels: Vec<_> = self
             .labels
             .iter()
@@ -3271,137 +3020,70 @@ impl Window {
         } else {
             None
         };
-        let mut raster =
-            Raster::new(&mut self.pixels, &self.font, geometry.surface(), width * 4).map_err(error)?;
-        raster
-            .paint(
-                &self
-                    .ui
-                    .scene(&labels)
-                    .map_err(error)?
-                    .spelling(&self.spelling)
-                    .notice(status_notice),
-                geometry.bounds(),
-            )
-            .map_err(error)?;
-        if let Some(prompt) = prompt {
-            paint_prompt(&mut raster, geometry, prompt);
+        let Window {
+            client,
+            ui,
+            font,
+            spelling,
+            menu,
+            ..
+        } = self;
+        let presented = client.present(width, height, &mut |pixels| {
+            let mut raster =
+                Raster::new(pixels, font, geometry.surface(), width * 4).map_err(error)?;
+            raster
+                .paint(
+                    &ui.scene(&labels)
+                        .map_err(error)?
+                        .spelling(spelling)
+                        .notice(status_notice),
+                    geometry.bounds(),
+                )
+                .map_err(error)?;
+            if let Some(prompt) = prompt {
+                paint_prompt(&mut raster, geometry, prompt);
+            }
+            if let Some(menu) = menu {
+                menu.paint(&mut raster, geometry);
+            }
+            Ok(())
+        })?;
+        if presented {
+            self.frames.submit(stamp).map_err(error)?;
         }
-        if let Some(menu) = &self.menu {
-            menu.paint(&mut raster, geometry);
-        }
-        let buffer = self.buffers.get(index).ok_or("buffer slot")?;
-        buffer.file.write_all_at(&self.pixels, 0).map_err(error)?;
-        let id = buffer.id;
-        let callback = self.allocate(Kind::Frame)?;
-        self.connection
-            .words(XDG_SURFACE, 3, &[0, 0, width as u32, height as u32])?;
-        self.connection.words(SURFACE, 1, &[id, 0, 0])?;
-        self.connection
-            .words(SURFACE, 9, &[0, 0, width as u32, height as u32])?;
-        self.connection.words(SURFACE, 3, &[callback])?;
-        self.connection.words(SURFACE, 6, &[])?;
-        self.buffers.get_mut(index).ok_or("buffer slot")?.busy = true;
-        // Occluded surfaces may receive no callback until visible. Only the
-        // initial handshake/submission has a deadline.
-        self.connection.set_startup_deadline(None);
-        self.callback = Some(callback);
-        self.frames.submit(stamp).map_err(error)?;
         Ok(())
     }
+}
 
-    fn create_buffer(&mut self, geometry: Geometry) -> Result<usize> {
-        let (width, height) = geometry.dimensions();
-        let size = width * height * 4;
-        let file = backing_file(&self.temporary, size)?;
-        let pool = self.allocate(Kind::Pool)?;
-        let buffer = self.allocate(Kind::Buffer)?;
-        let mut body = Builder::new();
-        body.u32(pool);
-        body.u32(size as u32);
-        self.connection.send(SHM, 0, body, Some(&file))?;
-        self.connection.words(
-            pool,
-            0,
-            &[
-                buffer,
-                0,
-                width as u32,
-                height as u32,
-                (width * 4) as u32,
-                1,
-            ],
-        )?;
-        self.connection.words(pool, 1, &[])?;
-        self.set_kind(pool, Kind::Retired)?;
-        let index = self.buffers.len();
-        self.buffers.push(Buffer {
-            id: buffer,
-            file,
-            geometry,
-            busy: false,
-        });
-        Ok(index)
+impl App for Window {
+    type Tag = Object;
+
+    fn client(&mut self) -> &mut Client<Object> {
+        &mut self.client
     }
 
-    fn run(&mut self) -> Result<()> {
-        let started = Instant::now();
-        let now = || u64::try_from(started.elapsed().as_millis()).map_err(error);
-        let mut waiting: Option<(Message, Instant)> = None;
-        self.connection
-            .set_startup_deadline(Some(Instant::now() + INITIAL_DEADLINE));
-        self.connection.words(DISPLAY, 1, &[REGISTRY])?;
-        self.connection.words(DISPLAY, 0, &[SYNC])?;
-        while !self.closed {
-            self.connection.budget(WRITE_DEADLINE)?;
-            let mut processed = 0;
-            while processed < 256 {
-                let next = match waiting.take() {
-                    Some((message, deadline)) => {
-                        if Instant::now() >= deadline {
-                            return Err("Wayland descriptor deadline".into());
-                        }
-                        Some((message, deadline))
-                    }
-                    None => self.connection.take()?
-                        .map(|m| (m, Instant::now() + WRITE_DEADLINE)),
-                };
-                let Some((message, deadline)) = next else {
-                    break;
-                };
-                if self.message_needs_descriptor(&message)?
-                    && self.connection.descriptors() == 0
-                {
-                    if Instant::now() >= deadline {
-                        return Err("Wayland descriptor deadline".into());
-                    }
-                    self.input.cancel_repeat();
-                    waiting = Some((message, deadline));
-                    break;
-                }
-                self.tick(now()?, false)?;
-                self.event(message)?;
-                processed += 1;
-                if self.closed {
-                    break;
-                }
-            }
-            // Process queued releases/focus changes before a repeat can fire.
-            self.end_turn(now()?, processed < 256 && waiting.is_none())?;
-            self.draw()?;
-            if !self.closed && processed < 256 {
-                if let Some((_, deadline)) = &waiting {
-                    let remaining = deadline
-                        .checked_duration_since(Instant::now())
-                        .filter(|d| !d.is_zero())
-                        .ok_or("Wayland descriptor deadline")?;
-                    self.connection
-                        .set_wait(self.connection.wait().min(remaining));
-                }
-                self.connection.read_more()?;
-            }
-        }
-        Ok(())
+    fn needs_descriptor(&self, message: &Message) -> Result<bool> {
+        self.message_needs_descriptor(message)
+    }
+
+    fn descriptor_wait(&mut self) {
+        self.input.cancel_repeat();
+    }
+
+    fn tick(&mut self, now: u64) -> Result<()> {
+        Window::tick(self, now, false)
+    }
+
+    fn event(&mut self, message: Message) -> Result<()> {
+        Window::event(self, message)
+    }
+
+    fn end_turn(&mut self, now: u64, idle: bool) -> Result<()> {
+        Window::end_turn(self, now, idle)
+    }
+
+    fn draw(&mut self) -> Result<()> {
+        Window::draw(self)
     }
 }
 
@@ -3762,7 +3444,9 @@ impl Window {
         match self.ui.dispatch(Event::Close { tab, revision }) {
             Ok(_) => {
                 self.labels.retain(|(id, _)| *id != tab);
-                self.closed |= self.ui.editor().active().is_none();
+                if self.ui.editor().active().is_none() {
+                    self.client.close();
+                }
                 self.frames.invalidate(true);
             }
             Err(crate::Error::Dirty) => self.notify(
@@ -3832,13 +3516,15 @@ impl Window {
             return Ok(());
         };
         match close.complete(&mut self.ui) {
-            Ok(Closed::Window) => self.closed = true,
+            Ok(Closed::Window) => self.client.close(),
             Ok(Closed::Tab(tab)) => {
                 self.labels.retain(|(id, _)| *id != tab);
                 if let Some(files) = &mut self.files {
                     files.forget(tab);
                 }
-                self.closed = self.ui.editor().active().is_none();
+                if self.ui.editor().active().is_none() {
+                    self.client.close();
+                }
             }
             Err(detail) => {
                 self.notify(format!("Close cancelled: {detail}"));
@@ -5208,23 +4894,18 @@ impl Window {
 
     fn initialize_clipboard(&mut self) -> Result<()> {
         let Some(seat) = self.seat else { return Ok(()) };
-        let Some(name) = self
-            .globals
-            .iter()
-            .find(|(_, (name, version))| name == "wl_data_device_manager" && *version >= 3)
-            .map(|(id, _)| *id)
-        else {
+        let Some((name, _)) = self.client.find_global("wl_data_device_manager", 3) else {
             return Ok(());
         };
-        let manager = self.allocate(Kind::ClipboardManager)?;
-        let device = self.allocate(Kind::ClipboardDevice)?;
+        let manager = self.client.allocate(Object::ClipboardManager)?;
+        let device = self.client.allocate(Object::ClipboardDevice)?;
         let mut body = Builder::new();
         body.u32(name);
         body.string("wl_data_device_manager")?;
         body.u32(3);
         body.u32(manager);
-        self.connection.send(REGISTRY, 0, body, None)?;
-        self.connection.words(manager, 1, &[device, seat])?;
+        self.client.send(REGISTRY, 0, body, None)?;
+        self.client.words(manager, 1, &[device, seat])?;
         self.clipboard.manager = Some((name, manager));
         self.clipboard.device = Some(device);
         Ok(())
@@ -5237,12 +4918,12 @@ impl Window {
             crate::data::offer(message)?;
             return Ok(false);
         }
-        match (self.kind(message.object)?, message.opcode) {
-            (Kind::Keyboard | Kind::RetiredKeyboard, 0) => {
+        match (self.client.kind(message.object)?, message.opcode) {
+            (Kind::App(Object::Keyboard) | Kind::App(Object::RetiredKeyboard), 0) => {
                 keyboard_event(message)?;
                 Ok(true)
             }
-            (Kind::ClipboardSource | Kind::RetiredClipboardSource, 1) => {
+            (Kind::App(Object::ClipboardSource) | Kind::App(Object::RetiredClipboardSource), 1) => {
                 crate::data::source(message)?;
                 Ok(true)
             }
@@ -5260,7 +4941,7 @@ impl Window {
             return Ok(());
         }
         offer.retired = true;
-        self.connection.words(id, 2, &[])?;
+        self.client.words(id, 2, &[])?;
         self.queue_offer_barrier()
     }
 
@@ -5278,9 +4959,9 @@ impl Window {
         if retired.is_empty() {
             return Ok(());
         }
-        let barrier = self.allocate(Kind::ClipboardSync)?;
+        let barrier = self.client.allocate(Object::ClipboardSync)?;
         self.clipboard.barriers.insert(barrier, retired);
-        self.connection.words(DISPLAY, 0, &[barrier])
+        self.client.words(DISPLAY, 0, &[barrier])
     }
 
     fn clipboard_focus_lost(&mut self) -> Result<()> {
@@ -5296,8 +4977,8 @@ impl Window {
     }
 
     fn retire_source(&mut self, id: u32) -> Result<()> {
-        self.connection.words(id, 1, &[])?;
-        self.set_kind(id, Kind::RetiredClipboardSource)
+        self.client.words(id, 1, &[])?;
+        self.client.set_tag(id, Object::RetiredClipboardSource)
     }
 
     fn release_clipboard(&mut self) -> Result<()> {
@@ -5311,8 +4992,8 @@ impl Window {
             self.retire_source(source)?;
         }
         if let Some(device) = self.clipboard.device.take() {
-            self.connection.words(device, 2, &[])?;
-            self.set_kind(device, Kind::RetiredClipboardDevice)?;
+            self.client.words(device, 2, &[])?;
+            self.client.set_tag(device, Object::RetiredClipboardDevice)?;
         }
         self.menu = None;
         self.frames.invalidate(true);
@@ -5433,7 +5114,7 @@ impl Window {
         match event {
             crate::data::SourceEvent::Send(mime) => {
                 let fd = self
-                    .connection
+                    .client
                     .pop_descriptor()
                     .ok_or("missing clipboard destination")?;
                 if active
@@ -5499,7 +5180,7 @@ impl Window {
                 };
             let mut body = Builder::new();
             body.string(mime)?;
-            self.connection.send(offer, 1, body, Some(&peer))?;
+            self.client.send(offer, 1, body, Some(&peer))?;
             drop(peer);
             self.clipboard.incoming = Some(transfer);
             self.clipboard.incoming_target = Some((
@@ -5571,14 +5252,14 @@ impl Window {
     fn offer_clipboard(&mut self, text: std::sync::Arc<str>, serial: u32) -> Result<()> {
         let (_, manager) = self.clipboard.manager.ok_or("missing clipboard manager")?;
         let device = self.clipboard.device.ok_or("missing clipboard device")?;
-        let source = self.allocate(Kind::ClipboardSource)?;
-        self.connection.words(manager, 0, &[source])?;
+        let source = self.client.allocate(Object::ClipboardSource)?;
+        self.client.words(manager, 0, &[source])?;
         for mime in [crate::data::UTF8, crate::data::PLAIN] {
             let mut body = Builder::new();
             body.string(mime)?;
-            self.connection.send(source, 0, body, None)?;
+            self.client.send(source, 0, body, None)?;
         }
-        self.connection.words(device, 1, &[source, serial])?;
+        self.client.words(device, 1, &[source, serial])?;
         if let Some((old, _)) = self.clipboard.source.replace((source, text)) {
             self.retire_source(old)?;
         }
@@ -5795,7 +5476,7 @@ pub fn preview_with_profile(profile: Profile) -> io::Result<()> {
         let stream = connect(endpoint)?;
         let mut window = Window::new(stream, std::env::temp_dir())?;
         window.ui.dispatch(Event::Profile(profile)).map_err(error)?;
-        window.run()
+        run(&mut window)
     };
     work().map_err(io::Error::other)
 }
@@ -5873,7 +5554,7 @@ pub fn file_window(options: FileWindowOptions) -> io::Result<()> {
             .transpose()
             .map_err(error)?;
         window.notify(format!("{dictionary_notice}UTF-8 clipboard needs data-device v3. F7 checks spelling; Format > Dictionary selects a local word list. Experimental software rendering; no crash recovery."));
-        let result = window.run();
+        let result = run(&mut window);
         match window.finish_control(result) {
             Err(detail) if window.files.as_ref().is_some_and(|files| files.busy()) => Err(format!(
                 "{detail}; file operation was pending and may have published. Verify the destination; unsaved edits are not recovered."
@@ -5891,10 +5572,11 @@ mod tests {
     use crate::layout::CELL_WIDTH;
     use crate::wire;
     use std::io::{Read, Write};
-    use std::os::unix::fs::MetadataExt;
     use std::path::Path;
     use std::sync::atomic::{AtomicU64, Ordering};
-    use td_ui::wayland::Endpoint;
+    use std::time::Instant;
+    use td_ui::client::{COMPOSITOR, INITIAL_DEADLINE, SHM, SYNC, TOPLEVEL, WM, XDG_SURFACE};
+    use td_ui::wayland::{backing_file, cursor_pixels, Connection, Endpoint};
 
     static NEXT_FILE: AtomicU64 = AtomicU64::new(0);
 
@@ -5946,7 +5628,7 @@ mod tests {
     }
 
     fn done(w: &mut Window) {
-        let id = w.callback.unwrap();
+        let id = w.client.frame_callback().unwrap();
         w.event(message(id, 0, &[0])).unwrap();
         w.event(message(DISPLAY, 1, &[id])).unwrap();
     }
@@ -6119,10 +5801,9 @@ mod tests {
     fn pointer_cursor_is_one_immutable_argb_pool_and_reuses_enter_serials() {
         let (mut w, peer, _) = seat_fixture();
         pointer_enter(&mut w);
-        assert!(w.cursor_image.is_none());
+        assert!(w.client.cursor().is_none());
         w.event(message(SHM, 0, &[0])).unwrap();
-        let image = w.cursor_image.as_ref().unwrap();
-        let (surface, buffer) = (image.surface, image.buffer);
+        let (surface, buffer) = w.client.cursor().unwrap();
         let pointer = w.pointer.device.unwrap();
         let (requests, files) = drain(&peer);
         assert_eq!(files.len(), 1);
@@ -6148,7 +5829,7 @@ mod tests {
         assert_eq!(bytes, cursor_pixels());
         assert!(bytes.as_chunks::<4>().0.contains(&[0, 0, 0, 0]));
         assert!(bytes.as_chunks::<4>().0.contains(&[0x3f, 0x45, 0x48, 0xff]));
-        assert!(w.buffers.is_empty());
+        assert!(w.client.buffers().is_empty());
         w.event(message(SHM, 0, &[1])).unwrap();
         w.event(message(SHM, 0, &[0x34325258])).unwrap();
         assert!(drain(&peer).0.is_empty());
@@ -6232,7 +5913,7 @@ mod tests {
         w.event(message(seat, 0, &[3])).unwrap();
         assert_ne!(w.pointer.device, Some(old));
         w.event(message(DISPLAY, 1, &[old])).unwrap();
-        assert_eq!(w.kind(old).unwrap(), Kind::Free);
+        assert_eq!(w.client.kind(old).unwrap(), Kind::Free);
         assert!(drain(&peer).0.iter().any(|m| *m == message(old, 1, &[])));
         pointer_enter(&mut w);
         w.input.synchronized = false;
@@ -6273,7 +5954,7 @@ mod tests {
         pointer_button(&mut w, false);
         pointer_button(&mut w, true);
         assert_eq!(format!("{:?}", w.ui.editor()), before);
-        assert!(!w.closed);
+        assert!(!w.client.closed());
         w.chord("Escape", false).unwrap();
         pointer_move(&mut w, 799, 599);
         assert_eq!(format!("{:?}", w.ui.editor()), before);
@@ -6338,7 +6019,7 @@ mod tests {
             w.chord("C-d", false).unwrap();
             assert_eq!(w.ui.editor().active(), Some(second));
             assert!(w.ui.editor().document(first).is_err());
-            assert!(!w.closed);
+            assert!(!w.client.closed());
         }
     }
 
@@ -6348,8 +6029,8 @@ mod tests {
         body.u32(1);
         body.u32(file.metadata().unwrap().len() as u32);
         sender.send(device, 0, body, Some(file)).unwrap();
-        w.connection.read_more().unwrap();
-        while let Some(event) = w.connection.take().unwrap() {
+        w.client.connection().read_more().unwrap();
+        while let Some(event) = w.client.connection().take().unwrap() {
             w.event(event).unwrap();
         }
     }
@@ -6483,7 +6164,7 @@ mod tests {
         configure(&mut w, 800, 600);
         w.event(message(SHM, 0, &[1])).unwrap();
         w.draw().unwrap();
-        let original = w.pixels.clone();
+        let original = w.client.pixels().to_vec();
         done(&mut w);
         drain(&peer);
         w.open_menu(crate::menu::Group::Edit).unwrap();
@@ -6495,12 +6176,12 @@ mod tests {
         w.activate_menu(index).unwrap();
         assert!(w.search.is_some());
         w.draw().unwrap();
-        assert!(w.pixels != original);
+        assert!(w.client.pixels() != original);
         done(&mut w);
         drain(&peer);
         w.chord("Escape", false).unwrap();
         w.draw().unwrap();
-        assert!(w.pixels == original);
+        assert!(w.client.pixels() == original);
         assert_eq!(w.ui.editor().document(1).unwrap().history_depth(), (0, 0));
     }
 
@@ -6667,19 +6348,19 @@ mod tests {
         configure(&mut w, 800, 600);
         w.event(message(SHM, 0, &[1])).unwrap();
         w.draw().unwrap();
-        let baseline = w.pixels.clone();
+        let baseline = w.client.pixels().to_vec();
         done(&mut w);
         drain(&peer);
         w.search_request("find", 1, 0).unwrap();
         w.number_request(1, 0, crate::number::Kind::Line).unwrap();
         assert!(w.search.is_none());
         w.draw().unwrap();
-        assert!(w.pixels != baseline);
+        assert!(w.client.pixels() != baseline);
         done(&mut w);
         drain(&peer);
         w.chord("Escape", false).unwrap();
         w.draw().unwrap();
-        assert!(w.pixels == baseline);
+        assert!(w.client.pixels() == baseline);
         done(&mut w);
         drain(&peer);
         w.number_request(1, 0, crate::number::Kind::Line).unwrap();
@@ -6695,7 +6376,7 @@ mod tests {
         w.number_request(2, 0, crate::number::Kind::Line).unwrap();
         w.close();
         assert!(w.number.is_none());
-        assert!(w.closed);
+        assert!(w.client.closed());
     }
 
     #[test]
@@ -6715,7 +6396,7 @@ mod tests {
             w.event(message(keyboard, 2, &[0, SURFACE])).unwrap();
             w.event(message(SHM, 0, &[1])).unwrap();
             w.draw().unwrap();
-            let error_pixels = w.pixels.clone();
+            let error_pixels = w.client.pixels().to_vec();
             done(&mut w);
             drain(&peer);
             let prompt = w.number.as_mut().unwrap();
@@ -6723,7 +6404,7 @@ mod tests {
             prompt.type_chord("0"); // same digits/focus, only invalid feedback removed
             w.frames.invalidate(true);
             w.draw().unwrap();
-            assert!(w.pixels != error_pixels);
+            assert!(w.client.pixels() != error_pixels);
             assert_eq!(w.ui.editor().document(1).unwrap().selection().range(), 0..0);
         }
     }
@@ -6738,7 +6419,7 @@ mod tests {
         assert_eq!(c.u32().unwrap(), 8);
         assert_eq!(c.string().unwrap(), "wl_data_device_manager");
         assert_eq!(c.u32().unwrap(), 3);
-        assert!(!w.required.contains(&8));
+        assert!(!w.client.is_required(8));
         w.ui = Controller::default();
         w.ui.dispatch(Event::Load("é abc\n".as_bytes())).unwrap();
         w.ui.dispatch(Event::Profile(Profile::Windows)).unwrap();
@@ -6821,7 +6502,7 @@ mod tests {
             assert!(w.files.as_ref().unwrap().directory(2).is_none());
             assert_eq!(format!("{:?}", w.ui.editor().document(1).unwrap()), before);
             assert!(w.ui.editor().document(3).unwrap().directory());
-            assert!(!w.closed);
+            assert!(!w.client.closed());
         }
     }
 
@@ -7025,8 +6706,8 @@ mod tests {
         let mut body = Builder::new();
         body.string(mime).unwrap();
         sender.send(source, 1, body, Some(file)).unwrap();
-        w.connection.read_more().unwrap();
-        let event = w.connection.take().unwrap().unwrap();
+        w.client.connection().read_more().unwrap();
+        let event = w.client.connection().take().unwrap().unwrap();
         assert!(w.message_needs_descriptor(&event).unwrap());
         w.event(event).unwrap();
     }
@@ -7059,7 +6740,7 @@ mod tests {
             );
             assert_eq!(w.ui.editor().document(1).unwrap().text(), " abc\n");
             assert_eq!(w.ui.editor().document(1).unwrap().history_depth(), (1, 0));
-            assert_eq!(w.kind(source).unwrap(), Kind::RetiredClipboardSource);
+            assert_eq!(w.client.kind(source).unwrap(), Kind::App(Object::RetiredClipboardSource));
             assert!(w.input.repeat(1000).unwrap().is_none());
             w.ui.dispatch(Event::Edit {
                 tab: 1,
@@ -7090,7 +6771,7 @@ mod tests {
         w.event(message(REGISTRY, 1, &[8])).unwrap();
         assert!(w.clipboard.manager.is_none());
         assert!(w.clipboard.device.is_none());
-        assert!(!w.closed);
+        assert!(!w.client.closed());
         w.open_menu(crate::menu::Group::Edit).unwrap();
         assert!(!w.menu.as_ref().unwrap().enabled(crate::menu::Item::Copy));
     }
@@ -7128,7 +6809,13 @@ mod tests {
     fn ordinary_notices_and_completed_paste_never_cover_document_pixels() {
         let finish_frame = |w: &mut Window, peer: &UnixStream| {
             done(w);
-            let buffers: Vec<_> = w.buffers.iter().filter(|b| b.busy).map(|b| b.id).collect();
+            let buffers: Vec<_> = w
+                .client
+                .buffers()
+                .iter()
+                .filter(|b| b.busy())
+                .map(|b| b.id())
+                .collect();
             for id in buffers {
                 w.event(message(id, 0, &[])).unwrap();
             }
@@ -7141,17 +6828,17 @@ mod tests {
             configure(&mut w, 800, 600);
             w.event(message(SHM, 0, &[1])).unwrap();
             w.draw().unwrap();
-            let original = w.pixels.clone();
+            let original = w.client.pixels().to_vec();
             finish_frame(&mut w, &peer);
             w.notify("Keymap ready.");
             w.draw().unwrap();
             let status_start = 800 * (600 - 24) * 4;
             assert!(
-                w.pixels[..status_start] == original[..status_start],
+                w.client.pixels()[..status_start] == original[..status_start],
                 "notice covered document"
             );
             assert!(
-                w.pixels[status_start..] != original[status_start..],
+                w.client.pixels()[status_start..] != original[status_start..],
                 "notice absent from status"
             );
             finish_frame(&mut w, &peer);
@@ -7172,17 +6859,17 @@ mod tests {
             assert_eq!(w.ui.editor().document(1).unwrap().text(), "pasted abc\n");
             assert_eq!(w.notice.as_deref(), Some("Paste complete."));
             w.draw().unwrap();
-            let pasted = w.pixels.clone();
+            let pasted = w.client.pixels().to_vec();
             finish_frame(&mut w, &peer);
             w.chord("Escape", false).unwrap();
             w.draw().unwrap();
             assert!(w.notice.is_none());
             assert!(
-                w.pixels[..status_start] == pasted[..status_start],
+                w.client.pixels()[..status_start] == pasted[..status_start],
                 "paste notice covered document"
             );
             assert!(
-                w.pixels[status_start..] != pasted[status_start..],
+                w.client.pixels()[status_start..] != pasted[status_start..],
                 "status was not restored"
             );
         }
@@ -7343,16 +7030,16 @@ mod tests {
             .unwrap();
         assert_eq!(w.clipboard.selection, Some(0xff00_0010));
         assert!(w.clipboard.offers.get(&0xff00_0011).unwrap().retired);
-        let source = w.allocate(Kind::RetiredClipboardSource).unwrap();
+        let source = w.client.allocate(Object::RetiredClipboardSource).unwrap();
         let (_reader, writer) = std::io::pipe().unwrap();
-        td_ui::wayland::peer::push_descriptor(&mut w.connection, writer.into()).unwrap();
+        td_ui::wayland::peer::push_descriptor(w.client.connection(), writer.into()).unwrap();
         let mut malformed = text_event(source, 1, crate::data::PLAIN);
         malformed.payload.extend_from_slice(&[0; 4]);
         assert!(w.message_needs_descriptor(&malformed).is_err());
         assert!(w.event(malformed).is_err());
-        assert_eq!(w.connection.descriptors(), 1);
+        assert_eq!(w.client.descriptors(), 1);
         w.event(text_event(source, 1, crate::data::PLAIN)).unwrap();
-        assert_eq!(w.connection.descriptors(), 0);
+        assert_eq!(w.client.descriptors(), 0);
         assert!(w.clipboard.outgoing.is_none());
         w.event(message(DISPLAY, 1, &[source])).unwrap();
     }
@@ -7391,7 +7078,7 @@ mod tests {
             source_send(&mut w, &peer, source, mime, &writer);
             drop(writer);
             assert_eq!(reader.read(&mut [0]).unwrap(), 0);
-            assert_eq!(w.connection.descriptors(), 0);
+            assert_eq!(w.client.descriptors(), 0);
         }
         assert!(w.clipboard.source.is_none());
         w.tick(1, true).unwrap();
@@ -7456,7 +7143,7 @@ mod tests {
         w.event(message(device, 5, &[0xff00_0100])).unwrap();
         assert!(w.clipboard.offers.get(&0xff00_0100).unwrap().retired);
         assert!(w.clipboard.selection.is_none());
-        assert_eq!(w.kind(device).unwrap(), Kind::RetiredClipboardDevice);
+        assert_eq!(w.client.kind(device).unwrap(), Kind::App(Object::RetiredClipboardDevice));
         w.event(message(DISPLAY, 1, &[device])).unwrap();
     }
 
@@ -7537,7 +7224,7 @@ mod tests {
         assert!(w.clipboard.offers.is_empty());
         w.event(message(device, 1, &[0, SURFACE, 0, 0, 0xff00_0010]))
             .unwrap();
-        assert!(!w.closed);
+        assert!(!w.client.closed());
         focus(&mut w, keyboard);
         w.event(message(keyboard, 4, &[0, 4, 0, 0, 0])).unwrap();
         key(&mut w, keyboard, 46);
@@ -7551,8 +7238,8 @@ mod tests {
         source_send(&mut w, &peer, source, &"x".repeat(257), &writer);
         drop(writer);
         assert_eq!(reader.read(&mut [0]).unwrap(), 0);
-        assert!(!w.closed);
-        assert_eq!(w.connection.descriptors(), 0);
+        assert!(!w.client.closed());
+        assert_eq!(w.client.descriptors(), 0);
         assert_eq!(w.ui.editor().document(1).unwrap().text(), "é abc\n");
     }
 
@@ -7568,7 +7255,7 @@ mod tests {
             w.event(message(SHM, 0, &[1])).unwrap();
             configure(&mut w, 800, 600);
             w.draw().unwrap();
-            let before = w.pixels.clone();
+            let before = w.client.pixels().to_vec();
             drain(&peer);
             let tab = w.ui.editor().active().unwrap();
             let original = w.ui.editor().document(tab).unwrap().text().to_owned();
@@ -7578,7 +7265,7 @@ mod tests {
             assert!(w.ui.editor().document(tab).unwrap().dirty());
             done(&mut w);
             w.draw().unwrap();
-            assert_ne!(w.pixels, before);
+            assert_ne!(w.client.pixels(), before);
             drain(&peer);
             w.event(message(device, 4, &[0, 4, 0, 0, 0])).unwrap(); // Control
             key(
@@ -7636,12 +7323,12 @@ mod tests {
             w.event(message(SHM, 0, &[1])).unwrap();
             configure(&mut w, 800, 600);
             w.draw().unwrap();
-            let prompt_pixels = w.pixels.clone();
+            let prompt_pixels = w.client.pixels().to_vec();
             drain(&peer);
             w.chord("Return", false).unwrap();
             assert!(w.files.as_ref().unwrap().busy());
             w.close();
-            assert!(!w.closed && !w.quitting);
+            assert!(!w.client.closed() && !w.quitting);
             w.chord(
                 if profile == Profile::Emacs {
                     "C-x"
@@ -7677,21 +7364,21 @@ mod tests {
                 .contains("newer edits remain unsaved"));
             done(&mut w);
             w.draw().unwrap();
-            assert_ne!(w.pixels, prompt_pixels);
+            assert_ne!(w.client.pixels(), prompt_pixels);
             drain(&peer);
             w.close();
-            assert!(w.closing.is_some() && !w.closed);
+            assert!(w.closing.is_some() && !w.client.closed());
             assert!(w
                 .closing_notice()
                 .unwrap()
                 .contains("completed saves stay saved"));
             w.chord("C-d", true).unwrap();
-            assert!(!w.closed);
+            assert!(!w.client.closed());
             w.chord("Escape", false).unwrap();
             assert!(w.closing.is_none());
             w.close();
             w.chord("C-d", false).unwrap();
-            assert!(w.closed);
+            assert!(w.client.closed());
             assert_eq!(std::fs::read(&path).unwrap(), b"a");
             std::fs::remove_file(path).unwrap();
             std::fs::remove_dir(directory).unwrap();
@@ -7734,7 +7421,7 @@ mod tests {
         w.device = None;
         w.input.focused = false;
         w.input.synchronized = false;
-        w.configured = false;
+        w.client.unconfigure();
         assert!(!w.control_key_available());
         prompt_answer(&mut w, K::FindForward, A::Entry("λ".into()));
         prompt_answer(&mut w, K::FindForward, A::Submit);
@@ -7750,7 +7437,7 @@ mod tests {
         prompt_answer(&mut w, K::Replace, A::Cancel);
         assert!(w.replace.is_none());
         assert_eq!(w.ui.editor().document(2).unwrap().history_depth(), (2, 0));
-        assert!(!w.input.focused && !w.configured && w.device.is_none());
+        assert!(!w.input.focused && !w.client.configured() && w.device.is_none());
     }
 
     #[test]
@@ -7921,7 +7608,7 @@ mod tests {
             .control_response(&request)
             .contains("\terror\tunavailable\t"));
         assert_eq!(w.control_dialog_fields(), before);
-        assert!(!w.closed && w.closing.is_some());
+        assert!(!w.client.closed() && w.closing.is_some());
     }
 
     #[test]
@@ -8036,7 +7723,7 @@ mod tests {
                     })
                 }
                 "serial" => w.activation_serial = Some(1),
-                "closed" => w.closed = true,
+                "closed" => w.client.close(),
                 _ => w.control_input_error = Some("transport".into()),
             }
             let request = prompt_answer_request(&w, K::FindForward, A::Cancel);
@@ -8439,7 +8126,7 @@ mod tests {
         assert!(answer.contains("\ttext=78\t"));
         assert!(w.search.is_some());
         w.input.focused = false;
-        w.configured = false;
+        w.client.unconfigure();
         let answer = prompt_snapshot(&mut w);
         assert!(answer.contains("\tkey-ready=0\t") && answer.contains("\ttext=78\t"));
         assert!(w.search.is_some());
@@ -8684,10 +8371,10 @@ mod tests {
                 "search" => {
                     w.chord("C-f", false).unwrap();
                 }
-                "configured" => w.configured = false,
+                "configured" => w.client.unconfigure(),
                 "enter" => w.pointer.enter = None,
                 "device" => w.pointer.device = None,
-                "closed" => w.closed = true,
+                "closed" => w.client.close(),
                 _ => w.activation_serial = Some(9),
             }
             let state = crate::control::Request::parse(b"1\t0\tstate").unwrap();
@@ -9197,11 +8884,11 @@ mod tests {
             configure(&mut w, 800, 600);
             pointer_enter(&mut w);
             match guard {
-                "configure" => w.configured = false,
+                "configure" => w.client.unconfigure(),
                 "device" => w.pointer.device = None,
                 "enter" => w.pointer.enter = None,
                 "serial" => w.activation_serial = Some(11),
-                "closed" => w.closed = true,
+                "closed" => w.client.close(),
                 _ => {
                     w.chord("C-f", false).unwrap();
                 }
@@ -9547,13 +9234,13 @@ mod tests {
             let (mut w, _peer) = file_dialog_fixture();
             configure(&mut w, 800, 600);
             match guard {
-                "configure" => w.configured = false,
+                "configure" => w.client.unconfigure(),
                 "device" => w.device = None,
                 "map" => w.input.map = None,
                 "focus" => w.input.focused = false,
                 "synchronized" => w.input.synchronized = false,
                 "serial" => w.activation_serial = Some(12),
-                "closed" => w.closed = true,
+                "closed" => w.client.close(),
                 _ => panic!("unknown guard"),
             }
             let request = decoded_key_request(&w, "a");
@@ -10544,7 +10231,7 @@ mod tests {
             let (mut w, _peer) = file_dialog_fixture();
             match guard {
                 "scratch" => w.files = None,
-                "closed" => w.closed = true,
+                "closed" => w.client.close(),
                 "counter" => w.ui.generation_for_test(u64::MAX),
                 "jobs" => w.control_jobs.exhaust_for_test(),
                 _ => panic!("unknown guard"),
@@ -10798,7 +10485,7 @@ mod tests {
                 "scratch" => w.files = None,
                 "counter" => w.ui.generation_for_test(u64::MAX),
                 "jobs" => w.control_jobs.exhaust_for_test(),
-                "closed" => w.closed = true,
+                "closed" => w.client.close(),
                 _ => panic!("unknown guard"),
             }
             let before = w.control_response(&state);
@@ -10887,7 +10574,7 @@ mod tests {
                     assert_eq!(w.frames.input_generation().unwrap(), generation);
                     assert!(w.control_input_error.is_none());
                     assert!(!w.files.as_ref().unwrap().busy());
-                    assert!(!w.closed);
+                    assert!(!w.client.closed());
                 }
             }
         }
@@ -11678,14 +11365,14 @@ mod tests {
             assert_eq!(std::fs::read(destination).unwrap(), bytes);
             assert_eq!(w.last_dialog_id, 1);
             if tab == 2 {
-                assert!(!w.closed);
+                assert!(!w.client.closed());
                 assert!(!w.ui.editor().document(2).unwrap().dirty());
                 assert!(w
                     .control_dialog_fields()
                     .contains("1,close-window,question,1,1,cancel+discard+save"));
             }
         }
-        assert!(w.closed);
+        assert!(w.client.closed());
         // Whole-window exit retains the model until the Window owner drops.
         assert_eq!(w.ui.editor().tabs().count(), 2);
         assert!(w.ui.editor().tabs().all(|(_, doc)| !doc.dirty()));
@@ -11723,7 +11410,7 @@ mod tests {
             let doc = w.ui.editor().document(2).unwrap();
             assert_eq!(doc.text(), if edit { "abdisk" } else { "adisk" });
             assert_eq!(doc.dirty(), edit);
-            assert!(!w.closed);
+            assert!(!w.client.closed());
             let stale = !handoff && edit;
             assert_eq!(
                 std::fs::read(file).unwrap(),
@@ -11810,7 +11497,8 @@ mod tests {
                 assert_eq!(w.control_response(&request(&path)), "1\t1\tpending\t1");
             }
             finish_file(&mut w);
-            assert!(w.closing.is_none() && w.prompt.is_none() && !w.closing_save && !w.closed);
+            assert!(w.closing.is_none() && w.prompt.is_none());
+            assert!(!w.closing_save && !w.client.closed());
             assert_eq!(w.conflict.is_some(), associated);
             assert!(w.ui.editor().document(tab).unwrap().dirty());
             assert_eq!(
@@ -11977,7 +11665,7 @@ mod tests {
             "1\t1\tok\t"
         );
         assert_eq!(format!("{:?}", w.ui.editor()), before);
-        assert!(!w.closed);
+        assert!(!w.client.closed());
         w.close();
         assert_eq!(w.last_dialog_id, 2);
         w.close_chord("C-d", false); // Physical approval advances the remotely visible target.
@@ -11988,7 +11676,7 @@ mod tests {
             w.control_response(&request("2\t1\t1\tdiscard")),
             "1\t1\tok\t"
         );
-        assert!(w.closed);
+        assert!(w.client.closed());
     }
 
     #[test]
@@ -12025,7 +11713,7 @@ mod tests {
         assert_eq!(w.notice, notice);
         let (mut last, _peer) = file_dialog_fixture();
         assert_eq!(last.control_response(&request("1\t0")), "1\t1\tok\tclosed");
-        assert!(last.closed);
+        assert!(last.client.closed());
     }
 
     #[test]
@@ -12037,7 +11725,7 @@ mod tests {
         w.chord("a", false).unwrap();
         w.close_tab(1, 1);
         // A closed-adapter fixture retains the live token to isolate this guard.
-        w.closed = true;
+        w.client.close();
         let before = w.control_response(&state);
         let notice = w.notice.clone();
         assert!(w
@@ -12089,7 +11777,7 @@ mod tests {
         w.ui.generation_for_test(u64::MAX);
         w.close_chord("C-d", false);
         assert!(w.closing.is_none());
-        assert!(!w.closed);
+        assert!(!w.client.closed());
         assert_eq!(w.notice.as_deref(), Some("Close cancelled: exhausted"));
         assert_eq!(w.ui.editor().document(1).unwrap().text(), "a");
         assert!(w.ui.editor().document(1).unwrap().dirty());
@@ -12152,7 +11840,7 @@ mod tests {
         assert_eq!(std::fs::read(&path).unwrap(), b"adisk");
         assert_eq!(w.ui.editor().document(2).unwrap().text(), "abdisk");
         assert!(w.ui.editor().document(2).unwrap().dirty());
-        assert!(!w.closed);
+        assert!(!w.client.closed());
     }
 
     #[test]
@@ -12207,7 +11895,7 @@ mod tests {
             .control_response(&discard)
             .contains("\terror\tstale-revision\t"));
         assert_eq!(w.control_response(&state), before);
-        assert!(!w.closed);
+        assert!(!w.client.closed());
     }
 
     #[test]
@@ -12270,7 +11958,7 @@ mod tests {
         configure(&mut w, 800, 600);
         w.draw().unwrap();
         drain(&peer);
-        let pixels = w.pixels.clone();
+        let pixels = w.client.pixels().to_vec();
         let generation = w.frames.generation().unwrap();
         w.control = Some(
             crate::control_worker::Worker::start(
@@ -12304,7 +11992,7 @@ mod tests {
         done(&mut w);
         w.draw().unwrap();
         drain(&peer);
-        assert_ne!(w.pixels, pixels);
+        assert_ne!(w.client.pixels(), pixels);
         assert_eq!(w.files.as_ref().unwrap().labels().count(), 0);
         let marks = w.spelling.snapshot(w.ui.editor(), 1, 1).unwrap();
         assert_eq!(marks.status, crate::spelling::ScanStatus::Complete);
@@ -12582,7 +12270,7 @@ mod tests {
             }
             drain(&peer);
             drain(&local_peer);
-            let before = remote.pixels.clone();
+            let before = remote.client.pixels().to_vec();
             remote.control = Some(
                 crate::control_worker::Worker::start(
                     crate::control_socket::Socket::bind(&path).unwrap(),
@@ -12605,8 +12293,8 @@ mod tests {
                 w.draw().unwrap();
                 drain(p);
             }
-            assert_ne!(remote.pixels, before);
-            assert_eq!(remote.pixels, local.pixels);
+            assert_ne!(remote.client.pixels(), before);
+            assert_eq!(remote.client.pixels(), local.client.pixels());
             // A remote Undo must restore the same saved state as a logical key.
             let mut client = control_client(&path, b"1\t2\tundo\t1\t1");
             assert_eq!(
@@ -12756,7 +12444,7 @@ mod tests {
         focus(&mut w, device);
         key(&mut w, device, 30);
         w.close(); // Scratch's real dirty-close path sets quitting, not closing.
-        assert!(w.quitting && !w.closed && w.closing.is_none());
+        assert!(w.quitting && !w.client.closed() && w.closing.is_none());
         let tab = w.ui.editor().active().unwrap();
         let revision = w.ui.editor().document(tab).unwrap().revision();
         let state = crate::control::Request::parse(b"1\t0\tstate").unwrap();
@@ -12773,7 +12461,7 @@ mod tests {
                 .contains("\terror\tunavailable\t"));
             assert_eq!(w.control_response(&state), before);
         }
-        assert!(w.quitting && !w.closed);
+        assert!(w.quitting && !w.client.closed());
     }
 
     #[test]
@@ -12827,7 +12515,7 @@ mod tests {
         configure(&mut w, 800, 600);
         w.draw().unwrap();
         drain(&peer);
-        let pixels = w.pixels.clone();
+        let pixels = w.client.pixels().to_vec();
         let generation = w.frames.generation().unwrap();
         for (id, command, value) in [
             (1, "set-auto-fill", "1"),
@@ -12862,7 +12550,7 @@ mod tests {
         done(&mut w);
         w.draw().unwrap();
         drain(&peer);
-        assert_ne!(w.pixels, pixels); // No physical chord has intervened.
+        assert_ne!(w.client.pixels(), pixels); // No physical chord has intervened.
         w.chord("Right", false).unwrap();
         w.chord("Right", false).unwrap();
         assert_eq!(w.ui.editor().document(tab).unwrap().selection().caret, 26);
@@ -12966,7 +12654,7 @@ mod tests {
         configure(&mut w, 800, 600);
         w.draw().unwrap();
         drain(&peer);
-        let pixels = w.pixels.clone();
+        let pixels = w.client.pixels().to_vec();
         for (id, command) in [
             (1, "find\t2\t0\t0\t0\t626164\t0\t0"),
             (2, "find\t2\t0\t3\t6\t626164\t0\t0"),
@@ -12997,7 +12685,7 @@ mod tests {
         done(&mut w);
         w.draw().unwrap();
         drain(&peer);
-        assert_ne!(w.pixels, pixels); // Selection-only redraw retains marks.
+        assert_ne!(w.client.pixels(), pixels); // Selection-only redraw retains marks.
         let mut replace = control_client(&path, b"1\t5\treplace\t2\t0\t626164\t676f6f64");
         assert_eq!(control_answer(&mut w, &mut replace, &peer), "1\t5\tok\t");
         let doc = w.ui.editor().document(2).unwrap();
@@ -13144,7 +12832,7 @@ mod tests {
         w.draw().unwrap();
         drain(&peer);
         let old = w.frames.capture(&w.ui).unwrap();
-        let pixels = w.pixels.clone();
+        let pixels = w.client.pixels().to_vec();
         let state = crate::control::Request::parse(b"1\t90\tstate").unwrap();
         let before = w.control_response(&state);
         for (id, target) in [(80, 0), (81, u64::MAX)] {
@@ -13176,11 +12864,11 @@ mod tests {
             first.read(&mut byte).unwrap_err().kind(),
             io::ErrorKind::WouldBlock
         );
-        let buffer = w.buffers.first().unwrap().id;
+        let buffer = w.client.buffers().first().unwrap().id();
         w.event(message(buffer, 0, &[])).unwrap(); // Release alone cannot satisfy either fence.
         w.control_tick();
         assert_eq!(w.frame_waiters.len(), 2);
-        assert_eq!(w.pixels, pixels);
+        assert_eq!(w.client.pixels(), pixels);
         done(&mut w);
         w.control_tick();
         assert_eq!(w.frame_waiters.len(), 1);
@@ -13199,7 +12887,7 @@ mod tests {
         drain(&peer);
         let new = w.frames.capture(&w.ui).unwrap();
         assert!(new.generation() >= target);
-        assert_ne!(w.pixels, pixels);
+        assert_ne!(w.client.pixels(), pixels);
         assert_eq!(w.frames.wait(target), Ok(None));
         done(&mut w);
         assert_eq!(
@@ -13212,7 +12900,7 @@ mod tests {
             new.fields(),
             new.fields()
         )));
-        assert!(w.buffers.iter().any(|buffer| buffer.busy)); // Callback is not release.
+        assert!(w.client.buffers().iter().any(|buffer| buffer.busy())); // Callback is not release.
         w.stop_control();
         assert!(!path.exists());
     }
@@ -13346,7 +13034,7 @@ mod tests {
         assert_eq!(client.read(&mut [0]).unwrap(), 0);
         assert_eq!(crate::control::state(&w.ui).unwrap(), before);
         assert_eq!(w.frames.generation().unwrap(), target);
-        assert!(w.callback.is_none());
+        assert!(w.client.frame_callback().is_none());
         w.stop_control();
     }
 
@@ -13369,7 +13057,7 @@ mod tests {
         assert_eq!(control_answer(&mut w, &mut client, &peer), before);
         assert!(w.search.is_some());
         assert_eq!(w.control_response(&state), before);
-        assert_eq!(w.connection.wait(), Duration::from_millis(10));
+        assert_eq!(w.client.connection().wait(), Duration::from_millis(10));
 
         let text = format!("1\t11\ttext\t{tab}\t{revision}\t0\t4");
         let mut client = control_client(&path, text.as_bytes());
@@ -13633,7 +13321,7 @@ mod tests {
         menu_click(&mut w, Group::File, 6);
         assert!(w.closing.is_some());
         w.chord("C-d", false).unwrap();
-        assert!(w.closed);
+        assert!(w.client.closed());
         assert_eq!(std::fs::read(path).unwrap(), b"x");
     }
 
@@ -13685,19 +13373,19 @@ mod tests {
         w.event(message(SHM, 0, &[1])).unwrap();
         w.draw().unwrap();
         drain(&peer);
-        let pixels = w.pixels.clone();
+        let pixels = w.client.pixels().to_vec();
         let before = format!("{:?}", w.ui.editor());
         done(&mut w);
         w.open_menu(crate::menu::Group::Edit).unwrap();
         w.draw().unwrap();
         drain(&peer);
-        assert!(w.pixels != pixels);
+        assert!(w.client.pixels() != pixels);
         assert_eq!(format!("{:?}", w.ui.editor()), before);
         done(&mut w);
         w.chord("Escape", false).unwrap();
         w.draw().unwrap();
         drain(&peer);
-        assert!(w.pixels == pixels);
+        assert!(w.client.pixels() == pixels);
         assert_eq!(format!("{:?}", w.ui.editor()), before);
     }
 
@@ -14390,7 +14078,7 @@ mod tests {
             let area = w.ui.geometry().document();
             let offset = ((area.y as usize + 15) * 800 + area.x as usize + 6 * 8) * 4;
             assert_eq!(
-                w.pixels.get(offset..offset + 4).unwrap(),
+                w.client.pixels().get(offset..offset + 4).unwrap(),
                 (td_ui::raster::MISSPELLED | 0xff000000).to_le_bytes()
             );
             for expected in [6..11, 12..17] {
@@ -14445,7 +14133,7 @@ mod tests {
                 assert!(w.spelling.running());
             }
             assert!(w.spelling.view(w.ui.editor()).1.is_empty());
-            assert!(w.connection.wait() <= Duration::from_millis(1));
+            assert!(w.client.connection().wait() <= Duration::from_millis(1));
             w.chord(cancel, false).unwrap();
             w.end_turn(2, false).unwrap();
             assert!(!w.spelling.running());
@@ -14527,12 +14215,12 @@ mod tests {
             w.chord("C-d", false).unwrap();
             w.chord("x", false).unwrap();
             assert_eq!(w.ui.editor().document(first).unwrap().text(), "a");
-            assert!(!w.closed);
+            assert!(!w.client.closed());
             finish_file(&mut w);
             assert_eq!(std::fs::read(path).unwrap(), b"a");
             assert!(w.ui.editor().document(first).is_err());
             assert_eq!(w.ui.editor().active(), Some(other));
-            assert!(!w.closed && w.closing.is_none());
+            assert!(!w.client.closed() && w.closing.is_none());
             assert!(!w.files.as_ref().unwrap().associated(first));
         }
     }
@@ -14554,7 +14242,7 @@ mod tests {
             .contains("tap and release Shift"));
         w.input.synchronized = true;
         w.chord("C-d", false).unwrap();
-        assert!(!w.closed);
+        assert!(!w.client.closed());
         assert_eq!(
             w.closing
                 .as_ref()
@@ -14567,7 +14255,7 @@ mod tests {
         );
         assert!(w.ui.editor().document(second).unwrap().dirty());
         w.chord("C-d", true).unwrap();
-        assert!(!w.closed);
+        assert!(!w.client.closed());
         w.chord("C-g", false).unwrap();
         assert!(w.closing.is_none());
         assert_eq!(w.ui.editor().active(), Some(second));
@@ -14577,7 +14265,7 @@ mod tests {
         w.close();
         w.chord("C-d", false).unwrap();
         w.chord("C-d", false).unwrap();
-        assert!(w.closed);
+        assert!(w.client.closed());
     }
 
     #[test]
@@ -14599,7 +14287,7 @@ mod tests {
                 .starts_with(&format!("Tab {tab}\n")));
             w.chord("C-d", false).unwrap();
             w.chord("C-s", false).unwrap();
-            assert!(!w.closed && w.closing.is_some() && w.prompt.is_none());
+            assert!(!w.client.closed() && w.closing.is_some() && w.prompt.is_none());
             assert!(!w.files.as_ref().unwrap().busy());
         }
         w.ui.dispatch(Event::Resize {
@@ -14616,7 +14304,7 @@ mod tests {
         assert!(w.closing.is_some() && w.device.is_none());
         assert!(w.closing_notice().unwrap().contains("Input unavailable"));
         w.chord("C-d", false).unwrap();
-        assert!(!w.closed);
+        assert!(!w.client.closed());
         w.event(message(seat, 0, &[3])).unwrap();
         let device = w.device.unwrap();
         send_map(&mut w, &peer, device, &map_file());
@@ -14624,7 +14312,7 @@ mod tests {
         focus(&mut w, device);
         assert!(w.closing_notice().unwrap().contains("Ctrl+D"));
         w.chord("Escape", false).unwrap();
-        assert!(w.closing.is_none() && !w.closed);
+        assert!(w.closing.is_none() && !w.client.closed());
         assert_eq!(w.ui.editor().document(tab).unwrap().text(), "a");
     }
 
@@ -14654,13 +14342,13 @@ mod tests {
         w.close();
         w.chord("C-s", false).unwrap();
         finish_file(&mut w);
-        assert!(!w.closed && w.closing.is_some());
+        assert!(!w.client.closed() && w.closing.is_some());
         assert_eq!(std::fs::read(&first_path).unwrap(), b"afirst");
         assert_eq!(w.ui.editor().tabs().count(), 3);
         std::fs::write(&second_path, b"external").unwrap();
         w.chord("C-s", false).unwrap();
         finish_file(&mut w);
-        assert!(!w.closed && w.closing.is_none());
+        assert!(!w.client.closed() && w.closing.is_none());
         assert!(!w.ui.editor().document(first).unwrap().dirty());
         assert!(w.ui.editor().document(second).unwrap().dirty());
         assert_eq!(w.ui.editor().document(second).unwrap().text(), "bsecond");
@@ -14679,7 +14367,7 @@ mod tests {
         w.chord("C-r", false).unwrap();
         w.chord("C-d", false).unwrap();
         finish_file(&mut w);
-        assert!(w.closing.is_none() && !w.closed);
+        assert!(w.closing.is_none() && !w.client.closed());
         assert_eq!(w.ui.editor().active(), Some(first));
         assert_eq!(w.ui.editor().document(second).unwrap().text(), "external");
         assert!(!w.ui.editor().document(second).unwrap().dirty());
@@ -14861,7 +14549,7 @@ mod tests {
         w.chord("C-d", false).unwrap();
         assert!(w.reloading.is_some());
         w.close();
-        assert!(w.closing.is_none() && !w.closed);
+        assert!(w.closing.is_none() && !w.client.closed());
         w.chord("Escape", false).unwrap();
         assert!(w.reloading.is_none());
         w.chord("b", false).unwrap();
@@ -14893,7 +14581,7 @@ mod tests {
         assert!(w.files.as_ref().unwrap().busy());
         w.chord("x", false).unwrap();
         finish_file(&mut w);
-        assert!(!w.closed);
+        assert!(!w.client.closed());
         assert_eq!(std::fs::read(path).unwrap(), b"");
         assert_eq!(w.ui.editor().document(tab).unwrap().text(), "x");
         assert!(w.ui.editor().document(tab).unwrap().dirty());
@@ -14956,7 +14644,8 @@ mod tests {
                 assert!(result
                     .unwrap_err()
                     .contains("file window requires wl_seat v5+"));
-                assert!(!w.bound);
+                assert!(w.seat.is_none());
+                assert!(drain(&peer).0.iter().all(|m| m.object != TOPLEVEL));
             } else {
                 result.unwrap();
                 assert!(w.seat.is_some());
@@ -15095,7 +14784,7 @@ mod tests {
         assert!(w.device.is_none());
         send_map(&mut w, &peer, device, &map_file()); // in-flight retired event
         assert!(w.input.map.is_none());
-        assert_eq!(w.connection.descriptors(), 0);
+        assert_eq!(w.client.descriptors(), 0);
         w.event(message(seat, 0, &[3])).unwrap();
         assert_ne!(
             w.device,
@@ -15103,7 +14792,7 @@ mod tests {
             "ID cannot be reused before delete_id"
         );
         w.event(message(DISPLAY, 1, &[device])).unwrap();
-        assert_eq!(w.kind(device).unwrap(), Kind::Free);
+        assert_eq!(w.client.kind(device).unwrap(), Kind::Free);
     }
 
     #[test]
@@ -15120,12 +14809,12 @@ mod tests {
         w.chord("C-w", false).unwrap();
         assert!(w.ui.editor().document(tab).unwrap().dirty());
         w.event(message(TOPLEVEL, 1, &[])).unwrap();
-        assert!(!w.closed && w.quitting);
+        assert!(!w.client.closed() && w.quitting);
         w.chord("C-d", true).unwrap();
-        assert!(!w.closed);
+        assert!(!w.client.closed());
         key(&mut w, device, 48); // modal blocks editing
         w.chord("Escape", false).unwrap();
-        assert!(!w.quitting && !w.closed);
+        assert!(!w.quitting && !w.client.closed());
         let doc = w.ui.editor().document(tab).unwrap();
         assert_eq!(doc.text(), before);
         assert_eq!(doc.revision(), revision);
@@ -15134,7 +14823,7 @@ mod tests {
         assert_eq!(drain(&peer).0, [message(WM, 3, &[77])]);
         w.event(message(device, 4, &[0, 4, 0, 0, 0])).unwrap();
         key(&mut w, device, 32); // Ctrl+D
-        assert!(w.closed);
+        assert!(w.client.closed());
     }
 
     #[test]
@@ -15181,7 +14870,7 @@ mod tests {
                 let notice = w.notice.clone();
                 w.close();
                 w.chord(cancel, false).unwrap();
-                assert!(!w.quitting && !w.closed);
+                assert!(!w.quitting && !w.client.closed());
                 assert_eq!(w.ui.generation(), generation, "{profile:?}/{cancel}");
                 assert_eq!(w.ui.tab_view(tab).unwrap(), view);
                 assert_eq!(w.notice, notice);
@@ -15232,7 +14921,7 @@ mod tests {
         let seat = w.seat.unwrap();
         let pointer = w.pointer.device.unwrap();
         w.event(message(REGISTRY, 1, &[4])).unwrap();
-        assert!(w.seat.is_none() && w.device.is_none() && !w.closed);
+        assert!(w.seat.is_none() && w.device.is_none() && !w.client.closed());
         assert_eq!(
             drain(&peer).0,
             [
@@ -15266,7 +14955,7 @@ mod tests {
             w.event(event).unwrap();
         }
         w.event(message(SYNC, 0, &[0])).unwrap();
-        assert_eq!(w.required, [1, 2, 3, 5]);
+        assert_eq!(w.client.required(), [1, 2, 3, 5]);
         let (messages, _) = drain(&peer);
         let binding = messages.iter().rfind(|m| m.object == REGISTRY).unwrap();
         let mut cursor = Cursor::new(&binding.payload);
@@ -15299,7 +14988,7 @@ mod tests {
         assert!(w.close_notice().contains("loses ALL scratch text"));
         assert!(!w.close_notice().contains("Ctrl+D"));
         w.close();
-        assert!(!w.closed);
+        assert!(!w.client.closed());
         send_map(&mut w, &peer, device, &map_file());
         assert!(w.close_notice().contains("input not ready"));
         assert!(w
@@ -15313,7 +15002,7 @@ mod tests {
         assert!(w.notice.as_ref().unwrap().starts_with("Keymap ready"));
         assert!(w.close_notice().contains("Ctrl+D: Discard and quit"));
         key(&mut w, device, 1);
-        assert!(!w.quitting && !w.closed);
+        assert!(!w.quitting && !w.client.closed());
         assert_eq!(w.ui.editor().document(tab).unwrap().text(), text);
     }
 
@@ -15323,7 +15012,7 @@ mod tests {
         peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
         let worker = std::thread::spawn(move || {
             let mut w = Window::new(client, std::env::temp_dir()).unwrap();
-            let result = w.run();
+            let result = run(&mut w);
             (result, w)
         });
         let mut handshake = [0; 24];
@@ -15401,7 +15090,7 @@ mod tests {
         }
         let (result, w) = worker.join().unwrap();
         result.unwrap();
-        assert!(w.closed && w.quitting);
+        assert!(w.client.closed() && w.quitting);
         assert!(w
             .ui
             .editor()
@@ -15409,8 +15098,22 @@ mod tests {
             .unwrap()
             .text()
             .starts_with("atd-editor"));
-        assert_eq!(w.connection.descriptors(), 0);
+        assert_eq!(w.client.descriptors(), 0);
         assert!(drain(&peer).0.contains(&message(WM, 3, &[987])));
+    }
+
+    #[test]
+    fn an_oversize_configure_is_refused_before_acknowledgement() {
+        let (mut w, peer) = fixture();
+        configure(&mut w, 1, 1);
+        drain(&peer);
+        w.event(message(TOPLEVEL, 0, &[8193, 1, 0])).unwrap();
+        assert!(w
+            .event(message(XDG_SURFACE, 0, &[1]))
+            .unwrap_err()
+            .contains("Wayland configure geometry"));
+        assert_eq!(w.ui.geometry().dimensions(), (1, 1));
+        assert!(drain(&peer).0.is_empty(), "no acknowledgement");
     }
 
     #[test]
@@ -15472,255 +15175,6 @@ mod tests {
     }
 
     #[test]
-    fn pools_cross_the_socket_unlinked_private_and_pixel_exact() {
-        let (mut w, peer) = fixture();
-        w.draw().unwrap();
-        assert!(w.buffers.is_empty(), "no buffer before configure");
-        configure(&mut w, 800, 600);
-        w.draw().unwrap();
-        let (messages, mut files) = drain(&peer);
-        assert_eq!(files.len(), 1);
-        let mut file = files.remove(0);
-        let metadata = file.metadata().unwrap();
-        assert_eq!(metadata.nlink(), 0);
-        assert_eq!(metadata.mode() & 0o777, 0o600);
-        let mut pixels = Vec::new();
-        file.read_to_end(&mut pixels).unwrap();
-        assert_eq!(pixels.len(), 800 * 600 * 4);
-        assert_eq!(pixels, w.pixels);
-        assert_eq!(&pixels[..4], &[0xcf, 0xdb, 0xe1, 0xff]);
-        assert!(
-            pixels
-                .as_chunks::<4>()
-                .0
-                .contains(&[0x3f, 0x45, 0x48, 0xff]),
-            "glyph ink"
-        );
-        let binds: Vec<_> = messages.iter().filter(|m| m.object == REGISTRY).collect();
-        assert_eq!(binds.len(), 3);
-        for (m, expected) in
-            binds
-                .iter()
-                .zip([("wl_compositor", 4), ("wl_shm", 1), ("xdg_wm_base", 1)])
-        {
-            let mut c = Cursor::new(&m.payload);
-            c.u32().unwrap();
-            assert_eq!(c.string().unwrap(), expected.0);
-            assert_eq!(c.u32().unwrap(), expected.1);
-        }
-        assert_eq!(messages.last().unwrap(), &message(SURFACE, 6, &[]));
-        assert!(w.ui.editor().tabs().all(|(_, doc)| !doc.dirty()));
-    }
-
-    #[test]
-    fn callback_is_not_release_and_three_busy_buffers_bound_resize_storms() {
-        let (mut w, peer) = fixture();
-        configure(&mut w, 400, 200);
-        w.draw().unwrap();
-        let first = w.buffers[0].id;
-        let (_, files) = drain(&peer);
-        let mut original = vec![0; 400 * 200 * 4];
-        files[0].read_exact_at(&mut original, 0).unwrap();
-        configure(&mut w, 500, 200);
-        w.draw().unwrap();
-        assert_eq!(w.buffers.len(), 1, "callback throttles");
-        done(&mut w);
-        w.draw().unwrap();
-        assert_eq!(w.buffers.len(), 2);
-        drain(&peer);
-        done(&mut w);
-        configure(&mut w, 600, 200);
-        w.draw().unwrap();
-        assert_eq!(w.buffers.len(), 3);
-        drain(&peer);
-        done(&mut w);
-        configure(&mut w, 700, 200);
-        configure(&mut w, 0, 240);
-        w.draw().unwrap();
-        assert!(w.frames.is_dirty());
-        assert!(w.callback.is_none());
-        assert_eq!(w.buffers.len(), 3);
-        assert_eq!(w.ui.geometry().dimensions(), (700, 240));
-        let mut still_original = vec![0; original.len()];
-        files[0].read_exact_at(&mut still_original, 0).unwrap();
-        assert_eq!(still_original, original);
-        w.event(message(first, 0, &[])).unwrap();
-        w.draw().unwrap();
-        assert!(!w.frames.is_dirty());
-        assert_eq!(w.buffers.len(), 3);
-        assert_eq!(w.buffers.last().unwrap().geometry.dimensions(), (700, 240));
-        assert_eq!(w.kind(first).unwrap(), Kind::RetiredBuffer);
-        drain(&peer);
-        w.event(message(DISPLAY, 1, &[first])).unwrap();
-        assert_eq!(w.kind(first).unwrap(), Kind::Free);
-    }
-
-    #[test]
-    fn release_before_done_still_waits_and_matching_buffer_is_reused() {
-        let (mut w, peer) = fixture();
-        configure(&mut w, 100, 100);
-        w.draw().unwrap();
-        drain(&peer);
-        let id = w.buffers[0].id;
-        w.event(message(id, 0, &[])).unwrap();
-        configure(&mut w, 100, 100);
-        w.draw().unwrap();
-        assert!(w.frames.is_dirty());
-        done(&mut w);
-        w.draw().unwrap();
-        let (_, files) = drain(&peer);
-        assert!(files.is_empty());
-        assert_eq!(w.buffers.len(), 1);
-        assert_eq!(w.buffers[0].id, id);
-    }
-
-    #[test]
-    fn invalid_events_are_errors_and_ids_wait_for_delete() {
-        let (mut w, peer) = fixture();
-        drain(&peer);
-        assert!(w.event(message(DISPLAY, 1, &[SHM])).is_err());
-        assert!(w.event(message(127, 0, &[])).is_err());
-        assert!(w.event(message(u32::MAX, 0, &[])).is_err());
-        assert!(w.event(message(TOPLEVEL, 0, &[u32::MAX, 1, 0])).is_err());
-        assert!(w.event(message(TOPLEVEL, 0, &[1, 1, 3])).is_err());
-        configure(&mut w, 1, 1);
-        assert_eq!(w.ui.geometry().dimensions(), (1, 1));
-        w.event(message(TOPLEVEL, 0, &[8193, 1, 0])).unwrap();
-        assert!(w.event(message(XDG_SURFACE, 0, &[1])).is_err());
-        assert_eq!(w.ui.geometry().dimensions(), (1, 1));
-        let id = w.allocate(Kind::Frame).unwrap();
-        w.set_kind(id, Kind::Retired).unwrap();
-        assert_ne!(w.allocate(Kind::Frame).unwrap(), id);
-        w.event(message(DISPLAY, 1, &[id])).unwrap();
-        assert_eq!(w.allocate(Kind::Frame).unwrap(), id);
-        while w.allocate(Kind::Frame).is_ok() {}
-        assert!(w.allocate(Kind::Frame).is_err());
-    }
-
-    #[test]
-    fn missing_low_version_removed_and_excessive_globals_are_named() {
-        let (a, _b) = UnixStream::pair().unwrap();
-        let mut w = Window::new(a, std::env::temp_dir()).unwrap();
-        w.event(global(1, "wl_compositor", 3)).unwrap();
-        assert!(w
-            .event(message(SYNC, 0, &[0]))
-            .unwrap_err()
-            .contains("wl_compositor v4"));
-        let (mut w, _b) = fixture();
-        assert!(w
-            .event(message(REGISTRY, 1, &[30]))
-            .unwrap_err()
-            .contains("removed"));
-        assert!(w.event(global(20, "duplicate", 1)).is_err());
-        for n in 1000..1124 {
-            w.event(global(n, "optional", 1)).unwrap();
-        }
-        assert!(w.event(global(2000, "one too many", 1)).is_err());
-    }
-
-    #[test]
-    fn ping_is_serviced_while_frame_waits_and_close_never_needs_discard() {
-        let (mut w, peer) = fixture();
-        configure(&mut w, 80, 80);
-        w.draw().unwrap();
-        drain(&peer);
-        w.event(message(WM, 0, &[1234])).unwrap();
-        let (messages, _) = drain(&peer);
-        assert_eq!(messages, [message(WM, 3, &[1234])]);
-        w.event(message(TOPLEVEL, 1, &[])).unwrap();
-        w.frames.invalidate(true);
-        w.draw().unwrap();
-        assert!(w.closed);
-        assert!(drain(&peer).0.is_empty());
-    }
-
-    #[test]
-    fn a_later_free_matching_buffer_is_preferred_over_replacing_the_first() {
-        let (mut w, peer) = fixture();
-        configure(&mut w, 100, 100);
-        w.draw().unwrap();
-        drain(&peer);
-        done(&mut w);
-        configure(&mut w, 200, 100);
-        w.draw().unwrap();
-        drain(&peer);
-        done(&mut w);
-        let first = w.buffers[0].id;
-        let matching = w.buffers[1].id;
-        w.event(message(first, 0, &[])).unwrap();
-        w.event(message(matching, 0, &[])).unwrap();
-        configure(&mut w, 200, 100);
-        w.draw().unwrap();
-        let (messages, files) = drain(&peer);
-        assert!(files.is_empty());
-        assert!(messages.contains(&message(SURFACE, 1, &[matching, 0, 0])));
-        assert!(!w.buffers[0].busy);
-        assert!(w.buffers[1].busy);
-    }
-
-    #[test]
-    fn hidden_surface_waits_for_visibility_without_a_callback_deadline() {
-        let (mut w, peer) = fixture();
-        w.connection
-            .set_startup_deadline(Some(Instant::now() + INITIAL_DEADLINE));
-        configure(&mut w, 100, 100);
-        w.draw().unwrap();
-        drain(&peer);
-        assert!(w.connection.startup_deadline().is_none());
-        assert!(w.callback.is_some());
-        assert_eq!(w.frames.wait(1), Ok(None));
-        assert_eq!(w.connection.budget(WRITE_DEADLINE).unwrap(), WRITE_DEADLINE);
-        w.event(message(WM, 0, &[9])).unwrap();
-        assert_eq!(drain(&peer).0, [message(WM, 3, &[9])]);
-        w.event(message(TOPLEVEL, 1, &[])).unwrap();
-        assert!(w.closed);
-    }
-
-    #[test]
-    fn complete_loop_accepts_split_events_and_closes_cleanly() {
-        let (client, mut peer) = UnixStream::pair().unwrap();
-        peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
-        let worker =
-            std::thread::spawn(move || Window::new(client, std::env::temp_dir()).unwrap().run());
-        let mut handshake = [0; 24];
-        peer.read_exact(&mut handshake).unwrap();
-        let mut events = Vec::new();
-        for event in [
-            global(1, "wl_compositor", 4),
-            global(2, "wl_shm", 1),
-            global(3, "xdg_wm_base", 1),
-            message(SYNC, 0, &[0]),
-        ] {
-            let mut body = Builder::new();
-            for word in event.payload.as_chunks::<4>().0 {
-                body.u32(u32::from_ne_bytes(*word));
-            }
-            events.extend(body.message(event.object, event.opcode).unwrap());
-        }
-        for chunk in events.chunks(3) {
-            peer.write_all(chunk).unwrap();
-        }
-        // Wait for the initial empty surface commit, then close before a draw.
-        let mut pending = Vec::new();
-        loop {
-            let mut buf = [0; 1024];
-            let n = peer.read(&mut buf).unwrap();
-            assert_ne!(n, 0);
-            pending.extend_from_slice(&buf[..n]);
-            let mut committed = false;
-            while let Some(m) = wire::take(&mut pending).unwrap() {
-                committed |= m.object == SURFACE && m.opcode == 6;
-            }
-            if committed {
-                break;
-            }
-        }
-        peer.write_all(&Builder::new().message(TOPLEVEL, 1).unwrap())
-            .unwrap();
-        worker.join().unwrap().unwrap();
-    }
-
-    #[test]
     #[ignore = "requires an independently launched Weston; set TD_EDITOR_TEST_WAYLAND to its absolute socket"]
     fn weston_presents_the_reference_buffer() {
         let path = std::env::var_os("TD_EDITOR_TEST_WAYLAND").expect("explicit Weston test socket");
@@ -15729,23 +15183,23 @@ mod tests {
             std::env::temp_dir(),
         )
         .unwrap();
-        w.connection.words(DISPLAY, 1, &[REGISTRY]).unwrap();
-        w.connection.words(DISPLAY, 0, &[SYNC]).unwrap();
+        w.client.words(DISPLAY, 1, &[REGISTRY]).unwrap();
+        w.client.words(DISPLAY, 0, &[SYNC]).unwrap();
         let start = Instant::now();
         while w.frames.wait(1).unwrap().is_none() {
             assert!(
                 start.elapsed() < INITIAL_DEADLINE,
                 "Weston presentation timeout"
             );
-            while let Some(m) = w.connection.take().unwrap() {
+            while let Some(m) = w.client.connection().take().unwrap() {
                 w.event(m).unwrap();
             }
             w.draw().unwrap();
             if w.frames.wait(1).unwrap().is_none() {
-                w.connection.read_more().unwrap();
+                w.client.connection().read_more().unwrap();
             }
         }
-        assert!(!w.buffers.is_empty());
-        assert!(!w.pixels.is_empty());
+        assert!(!w.client.buffers().is_empty());
+        assert!(!w.client.pixels().is_empty());
     }
 }

@@ -274,21 +274,42 @@ fn complete_raw_layer_and_production_callers_are_pinned() {
     assert_eq!(adapter.matches("File::from(fd)").count(), 1);
     assert_eq!(adapter.matches("read_keymap(fd, format, size)").count(), 1);
     assert!(adapter.contains("file.read_exact_at(&mut bytes, 0)"));
-    // The transport is td-ui's (UNSAFE.md §19): production code reaches it
-    // through one import and nothing else, the tests add the shared peer
-    // support, and nothing names the editor's own raw module.
+    // The transport and the client over it are td-ui's (UNSAFE.md §19):
+    // production code reaches each through one import, owns no connection
+    // or object table of its own, touches the connection only for the four
+    // schedule inputs, and dispatches every event through the client; the
+    // tests add the shared peer support, and nothing names the editor's own
+    // raw module.
     assert_eq!(adapter.matches("crate::sys::").count(), 0);
     assert!(!adapter.contains("from_raw_fd"));
     let production = adapter.split("#[cfg(test)]").next().unwrap();
     assert_eq!(production.matches("td_ui::wayland").count(), 1);
     assert_eq!(
         production
-            .matches("use td_ui::wayland::{backing_file, connect, cursor_pixels, endpoint, Connection, WRITE_DEADLINE};")
+            .matches("use td_ui::wayland::{connect, endpoint};")
             .count(),
         1
     );
-    assert_eq!(production.matches("Connection::new(stream)?").count(), 1);
+    assert_eq!(production.matches("td_ui::client").count(), 1);
+    assert_eq!(
+        production
+            .matches(concat!(
+                "use td_ui::client::{\n",
+                "    run, App, Client, Handled, Kind as ClientKind, Tag, ",
+                "DISPLAY, REGISTRY, SURFACE,\n",
+                "};",
+            ))
+            .count(),
+        1
+    );
+    assert!(!production.contains("Connection"));
+    assert_eq!(production.matches("Client::new(stream, temporary)?").count(), 1);
+    assert_eq!(production.matches("self.client.connection()").count(), 4);
     assert_eq!(production.matches(".pop_descriptor()").count(), 2);
+    assert_eq!(production.matches(".unconfigure(").count(), 0);
+    assert_eq!(production.matches("self.client.handle(&message)?").count(), 1);
+    assert_eq!(production.matches("client.present(").count(), 1);
+    assert_eq!(production.matches("run(&mut window)").count(), 2);
     assert_eq!(
         adapter.matches("td_ui::wayland::peer::drain(peer)").count(),
         1
@@ -401,7 +422,7 @@ fn native_prompt_inspection_is_borrow_only_and_cannot_dispatch_or_poll() {
         ".step(",
         ".repeat(",
         "invalidate(",
-        "self.connection",
+        "self.client",
         "self.control_mutation_accepted",
         "self.notify(",
     ] {
@@ -441,7 +462,7 @@ fn native_prompt_answers_pin_context_before_cleanup_and_never_route_global_keys(
     let answer = answer.split("\n    fn ").next().unwrap();
     let cleanup = answer.find("self.stop_pointer()").unwrap();
     for guard in [
-        "self.closed",
+        "self.client.closed()",
         "self.quitting",
         "self.prompt.is_some()",
         "self.closing.is_some()",
@@ -466,7 +487,7 @@ fn native_prompt_answers_pin_context_before_cleanup_and_never_route_global_keys(
         "close_chord(",
         "conflict_chord(",
         "self.input.focused",
-        "self.configured",
+        "self.client.configured()",
         "self.input.key(",
     ] {
         assert!(!answer.contains(forbidden), "{forbidden}");
@@ -474,7 +495,7 @@ fn native_prompt_answers_pin_context_before_cleanup_and_never_route_global_keys(
     }
     for forbidden in [
         ".dispatch(",
-        "self.connection",
+        "self.client",
         "self.frames.",
         "self.find(",
     ] {
@@ -594,7 +615,7 @@ fn remote_wheel_reuses_native_scroll_after_all_input_guards() {
         "self.pointer.x =",
         "self.pointer.y =",
         "activation_serial =",
-        "self.connection",
+        "self.client",
         "wheel.update",
     ] {
         assert!(!wheel.contains(forbidden), "{forbidden}");
@@ -680,12 +701,12 @@ fn native_control_is_opt_in_and_liveness_checked_with_bounded_outer_turns() {
         .split("\n    fn ")
         .next()
         .unwrap();
-    assert!(draw.contains("self.callback.is_some()"));
+    assert!(draw.contains("!self.client.can_present()"));
     assert!(draw.contains("self.frames.generation().map_err(error)?"));
     assert!(draw.find("self.frames.capture").unwrap() < draw.find("Raster::new").unwrap());
-    assert!(draw.find("words(SURFACE, 6").unwrap() < draw.find("self.frames.submit").unwrap());
+    assert!(draw.find("client.present(").unwrap() < draw.find("self.frames.submit").unwrap());
     for pin in [
-        "if self.closed",
+        "if self.client.closed()",
         "Duration::from_millis(10)",
         "for _ in 0..CONTROL_JOBS_PER_TURN",
         "worker.try_request()",
@@ -705,7 +726,9 @@ fn native_control_is_opt_in_and_liveness_checked_with_bounded_outer_turns() {
         dispatch.find("self.frames.generation()").unwrap()
             < dispatch.find("request.is_mutating()").unwrap()
     );
-    assert!(dispatch.contains("self.closed || self.pointer_modal() || self.menu.is_some()"));
+    assert!(dispatch.contains(
+        "self.client.closed() || self.pointer_modal() || self.menu.is_some()"
+    ));
     assert!(
         dispatch.find("request.is_mutating()").unwrap()
             < dispatch.find("Operation::CloseTab").unwrap()
@@ -878,7 +901,7 @@ fn native_control_is_opt_in_and_liveness_checked_with_bounded_outer_turns() {
         .nth(1)
         .unwrap();
     let answer = answer.split("\n    fn ").next().unwrap();
-    assert!(answer.contains("self.closed || self.files.is_none()"));
+    assert!(answer.contains("self.client.closed() || self.files.is_none()"));
     assert!(answer.contains("dialog != self.last_dialog_id"));
     assert!(answer.contains(".next(self.ui.editor())?"));
     assert!(answer.contains("current.tab != target.tab"));

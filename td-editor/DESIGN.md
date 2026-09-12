@@ -1165,18 +1165,20 @@ as `td_ui::raster` and `td_ui::notices`, while `render.rs` keeps the
 editor's `Geometry` and `Scene`, which implements
 `td_ui::raster::Composition`; the Wayland connection (endpoint resolution,
 connect, request framing, the received-right FIFO, pool files and the
-pointer image) followed with its syscall module and is used as
-`td_ui::wayland`, while `wayland.rs` keeps the editor's object table,
-surfaces, buffers, devices and turn loop. The source bundle is the td git
-checkout;
-`cargo build --manifest-path td-editor/Cargo.toml` builds the standalone
-binary without an installed td system, resolving td-ui offline from the
-checkout. The target recipe must stage the td-ui tree beside this one (the
-cargo `local_source_trees` shape td-net uses; a flat direct-rustc staging
-cannot link a second crate) with the shared sources and licenses td-ui
-mounts, and td-ui and shared-source changes must select editor tests in
-affected-checks, which they do through the reader graph. A future move of a
-shared file updates staging, check mappings and all consumers atomically.
+pointer image's pixels) followed with its syscall module and is used as
+`td_ui::wayland`; the client over it (object table, registry, toplevel
+surface with its buffers and frame callback, the pointer image's surface and
+the turn loop) followed and is used as `td_ui::client`, while `wayland.rs`
+keeps the editor's seat, keyboard, pointer and clipboard devices, its `App`
+implementation and the editor state. The source bundle is the td git
+checkout; `cargo build --manifest-path td-editor/Cargo.toml` builds the
+standalone binary without an installed td system, resolving td-ui offline
+from the checkout. The target recipe must stage the td-ui tree beside this
+one (the cargo `local_source_trees` shape td-net uses; a flat direct-rustc
+staging cannot link a second crate) with the shared sources and licenses
+td-ui mounts, and td-ui and shared-source changes must select editor tests
+in affected-checks, which they do through the reader graph. A future move of
+a shared file updates staging, check mappings and all consumers atomically.
 
 ## Wayland and host compatibility
 
@@ -1927,65 +1929,48 @@ and resize continue during the question. Process termination, transport
 failure and keyboard failure are not recovery mechanisms: scratch text is
 memory-only and may be lost. Users must not keep important text here.
 
-The adapter frames requests and events with `td_ui::wire` (the
-compositor's `wire.rs`, mounted by td-ui and never copied) and drives
-td-ui's `wayland::Connection` from its own loop; both are staged with the
-td-ui tree beside the five font/license inputs when the future source
-recipe is added. This adapter owns display environment and clock access,
-passing the environment values it reads to td-ui's `endpoint` explicitly;
-`files::Session` separately owns document file I/O. The core's
-explicit-input contract is unchanged.
+The adapter frames requests and events with `td_ui::wire` (the compositor's
+`wire.rs`, mounted by td-ui and never copied) and is td-ui's `client::App`:
+`td_ui::client::run` drives the connection, and the client owns the object
+table, the toplevel surface, its buffers and the pointer image; the codec
+and the client are staged with the td-ui tree beside the five font/license
+inputs when the future source recipe is added. This adapter owns display
+environment access, passing the environment values it reads to td-ui's
+`endpoint` explicitly, and the loop's clock is td-ui's; `files::Session`
+separately owns document file I/O. The core's explicit-input contract is
+unchanged.
 
-It binds compositor v4, SHM v1 and xdg shell v1, requiring those minimum
-versions and capping higher advertisements. At startup it also binds the
-lowest-global-ID seat offering v5 or newer, capped to v7, and requests its
-keyboard and pointer only after their capability events. A missing/old seat
-leaves a presentation-only window with a notice; this scratch-mode exception does not
-weaken the version-1 required-seat contract below. Other globals are ignored,
-subject to 128 live registry entries and 256 bytes per interface name.
-Client IDs are dense in a 128-slot table and are reused only after delete_id;
-object exhaustion produces a diagnostic.
-Initial constructors publish the fixed IDs 4 through 9 in order before
-dynamic seat and clipboard IDs starting at 10. Reserving a slot locally does
-not create it in libwayland's server object map: a fresh-ID gap is refused.
-A 16 KiB read buffer feeds a 128 KiB pending-byte budget and at most 256
-messages are processed before checking
-redraw/close again. Invalid events and removal of the bound compositor, SHM
-or xdg-shell global disconnect
-with a diagnostic. The first buffer must be submitted within 20 seconds of
-the initial registry requests; connect separately has a five-second deadline.
-After submission a hidden surface may wait indefinitely for a frame callback;
-callback delivery is not a compositor-liveness requirement.
-td-ui's `connect` gives a path connection attempt one bounded worker and
-drops any late result. Each outgoing message has a five-second absolute
-write deadline, capped by the remaining startup deadline until the first
-commit. Temporary
-backpressure retries within that deadline. Reads also use the remaining
-startup budget. The idle reader uses a 100 ms socket timeout or elapsed-time
-backoff for an inherited nonblocking socket, without changing shared flags.
-An armed repeat shortens that wait to its next due time. Caret ticks use
-monotonic milliseconds since the loop starts, immediately before each event
-and on timer wakes; server timestamps are never compared to this clock.
+The client binds compositor v4, SHM v1 and xdg shell v1, requiring those
+minimum versions and capping higher advertisements, and enforces the
+registry, object-table, per-turn message and startup budgets, the
+disconnects and the buffer rules that `td-ui/DESIGN.md` records under
+`client`. On the initial roundtrip the editor binds the lowest-global-ID
+seat offering v5 or newer, capped to v7, and requests its keyboard and
+pointer only after their capability events. A missing/old seat leaves a
+presentation-only window with a notice; this scratch-mode exception does
+not weaken the version-1 required-seat contract below. Other globals are
+ignored, except the data-device manager the clipboard section binds by
+hand. The editor's seat, device and clipboard objects live in the
+client's table under its `Object` tag: the client hands their events back
+untouched and retires their slots through the tag, and their dynamic IDs
+follow the client's fixed IDs from 10. An armed repeat shortens the idle
+wait to its next due time. Caret ticks use monotonic milliseconds since
+the loop starts, immediately before each event and on timer wakes; server
+timestamps are never compared to this clock.
 
 The controller receives complete acknowledged configure sizes: zero axes
 retain the previous configured axis even while a frame is outstanding.
-Dimensions must fit `Geometry`'s 8192-axis/32 MiB limits. Configure batches
-are coalesced before painting; a complete repaint is sent behind at most one
-frame callback. Callback completion does not release a buffer. Three backing
-files at most remain live, each at most 32 MiB. A free matching buffer is
-preferred; otherwise a free wrong-size buffer is destroyed and replaced.
-Busy old-size buffers
-remain immutable until release. When all three are busy, only the latest
-configured geometry is retained for the next free slot. One scratch raster
-allocation is reused. The immutable pointer image has a separate 1536-byte
-ARGB8888 pool, described below. This is CPU SHM presentation, not GPU rendering.
+Dimensions must fit `Geometry`'s 8192-axis/32 MiB limits. Configure
+batches are coalesced before painting; a complete repaint is painted into
+the client's reused raster and submitted through `Client::present` behind
+at most one frame callback, under the client's three-buffer rule. The
+immutable pointer image is the client's 1536-byte ARGB8888 pool; the
+native pointer contract below says when the editor shows it. This is CPU
+SHM presentation, not GPU rendering.
 
-Pool files come from td-ui's `backing_file`: `create_new`, mode 0600, in
-Rust's temporary directory (TMPDIR or `/tmp`); a checked process-local
-serial and 64 collision attempts bound name creation. They are unlinked
-immediately, then sized and written only
-through the owned `File`. An unlink failure reports the exact residual name.
-No mmap, host library or persistent font/file lookup is involved.
+Pool files are td-ui's `backing_file`, under the creation rules
+`td-ui/DESIGN.md` records. No mmap, host library or persistent font/file
+lookup is involved.
 
 The descriptor transport (sendmsg, recvmsg and F_DUPFD_CLOEXEC, one syscall
 site and one owned-descriptor adoption site) is td-ui's, recorded as
@@ -1993,21 +1978,16 @@ site and one owned-descriptor adoption site) is td-ui's, recorded as
 size-only flistxattr query and renameat2 and the clipboard destination's
 fcntl status commands, through one syscall site that adopts no descriptor
 and changes no transport authorization.
-`WAYLAND_SOCKET` takes precedence and is duplicated close-on-exec, not adopted
-directly; its borrowed original is never closed by the adapter and stays open
-until its owner or process exit closes it. The caller must give the adapter
-exclusive use of the stream because socket timeouts are shared. Otherwise an
-absolute WAYLAND_DISPLAY works without XDG_RUNTIME_DIR, and a relative display
-(default `wayland-0`) is joined to an absolute XDG_RUNTIME_DIR. Invalid explicit
-socket values fail without trying another display. Incoming descriptors are
-immediately owned and queued in a bounded FIFO, independent of byte-message
-boundaries. `wl_keyboard.keymap` and `wl_data_source.send` each consume
-one. An event waiting for its descriptor has a five-second deadline and
-retains wire order. Waiting cancels
-repeat and uses the ordinary idle wait, capped to that deadline. Overflow,
-malformed control data, protocol failure and disconnect close all retained
-owners. Retired keyboard events are schema-validated and their keymap rights
-dropped until delete_id, never applied to the replacement keyboard.
+Endpoint resolution, the borrowed `WAYLAND_SOCKET` and the bounded FIFO
+that owns every incoming descriptor are td-ui's `endpoint`, `connect` and
+`Connection`, under the rules `td-ui/DESIGN.md` records; the adapter
+passes the three environment values it reads and gives the transport
+exclusive use of the stream. `wl_keyboard.keymap` and
+`wl_data_source.send` each consume one right. The client's loop parks an
+event whose right has not arrived, under the write deadline and in wire
+order; waiting cancels repeat. Retired keyboard events are
+schema-validated and their keymap rights dropped until delete_id, never
+applied to the replacement keyboard.
 
 Keymap format must be text-v1; the file must be regular and cover the declared
 1..=1 MiB extent. Positioned reads copy exactly that extent without advancing
@@ -2110,20 +2090,14 @@ The first axis event pins the active tab/revision: a changed tab/revision
 before frame prevents applying that frame to a different document. Fractional
 carry resets when the next frame targets a different tab or revision.
 
-On enter, after ARGB8888 is advertised, one code-defined 16x24 charcoal/warm
-arrow is installed with that enter's serial and hotspot (0,0). It uses a
-separate surface and one unlinked 0600 backing file through the existing
-SHM pool request. Send `set_cursor` before the first buffer
-attach/damage/commit, including when ARGB support arrives after enter.
-The local file closes after transfer; the server-owned
-pool/buffer retains its bytes. Its 1536 bytes are immutable for the connection
-lifetime, never rewritten while busy or reattached on enter. A release is
-accepted exactly once for the sole attachment; subsequent enters reuse the
-surface with the new enter serial. This relies on core wl_surface content
-remaining attached across pointer leave/unmapping: enter makes the pointer
-image association undefined, not the cursor surface's committed contents.
-No cursor theme, font, host library,
-frame callback, raw syscall or incoming descriptor consumer is added.
+On enter, after ARGB8888 is advertised, the editor asks td-ui's
+`Client::show_cursor` for the one code-defined 16x24 charcoal/warm arrow
+with that enter's serial and hotspot (0,0), including when ARGB support
+arrives after enter; the pool, the surface, the `set_cursor` ordering, the
+single release, the reuse of the surface on later enters and what that
+reuse relies on are the client's contract in `td-ui/DESIGN.md`. No cursor
+theme, font, host library, frame callback, raw syscall or incoming
+descriptor consumer is added.
 
 Controller pointer/scroll refusals show a notice instead of being classified
 as malformed Wayland transport. Protocol/schema failures still disconnect.
