@@ -78,6 +78,9 @@ boot artifacts, and settings publication. A queued request is not success.
 
 ## Media, boot and persistence
 
+[MEDIA.md](MEDIA.md) specifies the hybrid format and its current formatter
+boundary.
+
 Use source-built target executables and declared inputs throughout image
 composition. Host-seeded control-plane executables never enter the image.
 Any marked foreign application payload remains subject to AGENTS.md and

@@ -52,6 +52,7 @@ pub mod exit;
 pub mod fat;
 pub mod gpt;
 pub mod gzip;
+pub mod iso9660;
 pub mod json;
 pub mod sha256;
 pub mod sha512;
