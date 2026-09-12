@@ -467,6 +467,9 @@ pub fn recipe() -> Recipe {
     //    while every td-audio ioctl kept using the native interface. FUSE_FS is
     //    still deliberately absent: it lands with the Documents portal.
     //
+    //    COMPAT_32BIT_TIME has a visible prompt, so allnoconfig turns it off.
+    //    IA32_EMULATION alone leaves old glibc without futex/time syscalls.
+    //
     //    SECURITY_DMESG_RESTRICT (pinned OFF): with it on, an unprivileged
     //    /dev/kmsg open is EPERM, so the /bin/dmesg system-x86-64 ships from
     //    TD_UTIL_APPLETS breaks for ordinary users. Its `menu "Security options"`
@@ -583,6 +586,7 @@ pub fn recipe() -> Recipe {
                   /^#? *CONFIG_UTS_NS[ =]/d; \
                   /^#? *CONFIG_NET_NS[ =]/d; \
                   /^#? *CONFIG_AUDIT[ =]/d; \
+                  /^#? *CONFIG_COMPAT_32BIT_TIME[ =]/d; \
                   /^#? *CONFIG_IA32_EMULATION[ =]/d; \
                   /^#? *CONFIG_IA32_EMULATION_DEFAULT_DISABLED[ =]/d; \
                   /^#? *CONFIG_X86_X32_ABI[ =]/d; \
@@ -700,6 +704,7 @@ pub fn recipe() -> Recipe {
                    'CONFIG_UTS_NS=y' \
                    'CONFIG_NET_NS=y' \
                    'CONFIG_AUDIT=y' \
+                   'CONFIG_COMPAT_32BIT_TIME=y' \
                    'CONFIG_IA32_EMULATION=y' \
                    '# CONFIG_IA32_EMULATION_DEFAULT_DISABLED is not set' \
                    '# CONFIG_X86_X32_ABI is not set' \
@@ -813,6 +818,7 @@ pub fn recipe() -> Recipe {
                  grep -q '^CONFIG_NET_NS=y' .config || { echo 'NET_NS off — a jail without shared=network could not be cut off from the network stack' >&2; exit 1; }; \
                  grep -q '^CONFIG_AUDIT=y' .config || { echo 'AUDIT off — the physical Firefox proof cannot account for outer seccomp denials' >&2; exit 1; }; \
                  grep -q '^CONFIG_AUDITSYSCALL=y' .config || { echo 'AUDITSYSCALL off — x86 seccomp audit records cannot carry syscall identity' >&2; exit 1; }; \
+                 grep -q '^CONFIG_COMPAT_32BIT_TIME=y$' .config || { echo 'COMPAT_32BIT_TIME off — bootstrap glibc needs legacy i386 futex and clock syscalls' >&2; exit 1; }; \
                  grep -q '^CONFIG_IA32_EMULATION=y$' .config || { echo 'IA32_EMULATION off — the source bootstrap cannot execute its i386 Mes and GNU ladder' >&2; exit 1; }; \
                  grep -q '^# CONFIG_IA32_EMULATION_DEFAULT_DISABLED is not set$' .config || { echo 'IA32 emulation disabled at boot — the source bootstrap needs compatibility execution' >&2; exit 1; }; \
                  grep -q '^# CONFIG_X86_X32_ABI is not set$' .config || { echo 'X86_X32_ABI on — x32 calls could reach an unmodelled compatibility ABI instead of the deliberate kill probe' >&2; exit 1; }; \
@@ -1149,6 +1155,9 @@ mod tests {
             "CONFIG_AUDIT=y",
             "grep -q '^CONFIG_AUDIT=y' .config",
             "grep -q '^CONFIG_AUDITSYSCALL=y' .config",
+            "/^#? *CONFIG_COMPAT_32BIT_TIME[ =]/d",
+            "CONFIG_COMPAT_32BIT_TIME=y",
+            "grep -q '^CONFIG_COMPAT_32BIT_TIME=y$' .config",
             "/^#? *CONFIG_IA32_EMULATION[ =]/d",
             "CONFIG_IA32_EMULATION=y",
             "grep -q '^CONFIG_IA32_EMULATION=y$' .config",
