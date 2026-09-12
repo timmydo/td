@@ -97,19 +97,47 @@ at `/run/td-volume/td/source/repository.bundle` inside the guest. The adjacent
 `revision` file names the exported commit. `./build-qcow` requires a clean,
 complete Git checkout and checks that its commit remains unchanged through
 publication. First boot clones this source offline into `~/src/td` as the
-login user. Subsequent boots preserve that checkout. Configure a reachable
-Git origin before pulling changes, then prepare a system build from inside
-the running td release with:
+login user. New checkouts track `main` at `https://github.com/timmydo/td.git`;
+`--source-origin` and `--source-branch` select other upstream settings when
+building a bundle. Existing checkouts retain their edits and Git settings.
+
+### Keep a VM and update it from within td
+
+Create a private installation in a new directory whose parent exists:
+
+```sh
+./build-qcow --installation --out "$HOME/td-installation"
+"$HOME/td-installation/start"
+```
+
+This launcher keeps guest writes in the installation disk across boots.
+Each installation generates its own signing key, retained in root-only
+state outside the recipe graph. Keep the installation directory private:
+copying its disk also copies that identity. Create another installation for
+a separate identity. The default evaluation bundle discards its signing
+key and cannot install locally built updates.
+
+Once first boot has initialized the checkout, run inside td:
 
 ```sh
 cd ~/src/td
-./update build
+git pull --ff-only
+./update
 ```
 
-The source is companion data outside the signed deployment. The build command
-uses the installed toolchain and the normal source-bootstrap graph; signing,
-installation authorization, and reboot are not yet connected. Preserve the
-VM's writable disk to retain the checkout and build cache across boots.
+The updater builds with the installed toolchain and the source-bootstrap
+graph. The first build fetches declared sources and builds the graph locally;
+later builds reuse local outputs. When installation is requested, press
+Ctrl+Alt+Escape, then I. Review the deployment ID and press Enter to approve,
+or Escape to cancel. The authorized operation signs with this installation's
+key and installs the successor. Restart explicitly to boot it; the previous
+deployment remains available for recovery. Use `./update build` to stop after
+building without requesting installation.
+
+The checkout, build cache and other user state persist across updates and
+rollback. The source bundle is companion data outside the signed deployment;
+it does not authorize installation. See [td-update/DESIGN.md](td-update/DESIGN.md)
+for the source, build and installation contract and native VM regression.
 
 ## Filesystem layout
 
