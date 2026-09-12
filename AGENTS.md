@@ -295,7 +295,19 @@ message.
   cannot express.
 - `builder`, `recipes`, and `engine` are one zero-external-dependency workspace.
   Target crates and the host tools `td-review` and `td-vm` have standalone
-  one-package locks. The `td-net`
+  locks that list their own package and, at most, other `td-*` roster crates
+  they depend on by path: no registry or git crate, and no path outside the
+  roster, so engine sources reach a target crate only as shared source. A
+  sibling is declared only as `NAME = { path = "../NAME" }` on its own line
+  under a bare `[dependencies]` or `[dev-dependencies]` header (`cargo add`
+  also writes a `version`; remove it). The manifest is where the guard
+  establishes what a path points at, since a lock cannot say; the lock is then
+  held to exactly the declared closure. So that a line reader can be exact, a
+  roster manifest keeps its table headers bare and its values on one line and
+  carries no `[target]`, `[patch]` or `[replace]` table; a roster crate
+  carries no `.cargo` directory of its own, the repository's `.cargo` config
+  carries no `paths`, `[patch]`, `[source]` or `include` key, and a declared
+  `test-args` or `gate-test-args` carries no `--config` or `-Z`. The `td-net`
   multicall is the sole external-dependency tier and may use only its existing
   reviewed vendored closure. Any new dependency needs principle-2 sign-off.
 - A new standalone crate joins the gate by EXISTING: `builder/src/affected.rs`

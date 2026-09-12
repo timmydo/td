@@ -40,9 +40,11 @@ and one descriptor-adoption site. The seventeenth and eighteenth, `td-mail`
 and `td-news`, are ONE surface recorded twice: each carries a byte-identical
 copy of `term_sys.rs`, the terminal half of td-sh's surface — `ioctl(2)`
 with the same three value-pinned requests, and `poll(2)` — because the
-one-package locks the gate requires of a root crate leave no shared crate to
-put it in. §17 argues it once; §18 records only that the copy is the same
-bytes.
+one-package locks the gate required of a root crate when they were imported
+left no shared crate to put it in. The gate now admits a path dependency on
+a sibling roster crate (AGENTS.md 'Rust code'), so folding the copies into
+one crate is possible and is its own reviewed change; until it lands, §17
+argues it once and §18 records only that the copy is the same bytes.
 
 The host-only `td-vm-registrar` binary in `td-vm` has one separately
 recorded account-authentication surface, H1 below. The existing `td-review`,
@@ -2616,9 +2618,11 @@ file is copied, to §18 in the same landing.
 td-news, td's feed reader, carries `src/term_sys.rs` byte for byte as
 td-mail does, under the same crate-root deny and the same single
 function-level allowance, with the same confinement tests, and nothing
-else. The surface is §17's; this entry exists because the gate holds every
-root crate to a one-package lock, so the shared file is a copy rather than
-a dependency, and a copy that drifted would be a second surface. The
+else. The surface is §17's; this entry exists because the gate held every
+root crate to a one-package lock when td-news was imported, so the shared
+file is a copy rather than a dependency, and a copy that drifted would be a
+second surface. The gate now admits a sibling path dependency; retiring the
+copy for one is a separate reviewed change to §17 and this entry. The
 import's rule is that the two copies stay identical: a change to either is
 a change to both, reviewed once and recorded in §17.
 

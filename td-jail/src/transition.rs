@@ -6403,8 +6403,10 @@ mod tests {
     /// The ceiling `td-busd` declares for one of the two names this module
     /// sends it, read out of that crate's own source.
     ///
-    /// The two crates are separate dependency-free locks, so neither can name
-    /// the other's constant. Restating the number here would be the same
+    /// The two crates were separate one-package locks when this was written,
+    /// so neither could name the other's constant; the gate now admits a
+    /// sibling roster crate by path, and folding the copy is its own reviewed
+    /// change. Restating the number here would be the same
     /// assumption with a comment on it; reading it is a check. The file is
     /// reached under `#[cfg(test)]` only, so the recipe — which stages
     /// `src/*.rs` and nothing else — never expands it into the target build.

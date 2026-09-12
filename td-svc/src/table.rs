@@ -168,9 +168,11 @@ impl Unit {
 /// This mirrors td-init's `split_argv_marked` minus the per-word "a shell
 /// would have left this alone" marking, which exists only for `init
 /// --dry-run`'s divergence note and has no meaning here. It is a COPY, not a
-/// reuse: the build model gives each standalone target crate its own
-/// 1-package lock, so there is no shared library to put it in. Drift between
-/// the two is a real hazard and is covered by a test that runs the same cases
+/// reuse: when it was written the build model gave each standalone target
+/// crate a 1-package lock, so there was no shared library to put it in. The
+/// gate now admits a sibling roster crate by path (AGENTS.md 'Rust code');
+/// folding the copy into one is its own reviewed change. Drift between the
+/// two is a real hazard and is covered by a test that runs the same cases
 /// through both spellings.
 pub fn split_argv(text: &str) -> Result<Vec<String>, String> {
     let mut out: Vec<String> = Vec::new();

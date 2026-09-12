@@ -35,8 +35,9 @@
 //! `the_workspace_lock_count_follows_the_members_list`. The `source = ` half
 //! went the other way: the old script applied it to the root lock alone, and
 //! it now runs over every lock in the roster. Every
-//! roster crate keeps a 1-package lock, checked the same two ways over the
-//! derived list by `gate-crates locks`. Most are TARGET-built programs — the
+//! roster crate keeps a lock listing only itself and the sibling roster
+//! crates its manifest depends on by path, checked over the derived list by
+//! `gate-crates locks`. Most are TARGET-built programs — the
 //! shipped userland, from the boot shim and installer up to the compositor and
 //! session broker; `td-builder gate-crates names` prints the current set, and
 //! each crate's own manifest says what it is. (This paragraph used to

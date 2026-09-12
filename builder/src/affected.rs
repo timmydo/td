@@ -1388,8 +1388,8 @@ fn map_path(root: &Path, roster: &Result<Vec<GateCrate>, String>, p: &str, sel: 
     //
     // `cargo-test` is the one gate that reaches td-review at all —
     // clippy --all-targets, its tests, and
-    // its 1-package lock, now through the derived roster rather than a name in
-    // its body — and the preflight above covers all three and then
+    // its dependency-free lock, now through the derived roster rather than a
+    // name in its body — and the preflight above covers all three and then
     // some: it runs the tests with --include-ignored where the gate runs
     // --bins. The lock guard is now the SAME code in both tiers
     // (`dependency_free_locks` -> `assert_dependency_free`), so that half is
@@ -2794,8 +2794,8 @@ pub(crate) fn gate_crates_cli(args: &[String]) -> ExitCode {
             if locks.is_empty() {
                 return fail("the derived roster is empty — it cannot be");
             }
-            for (lock, packages) in &locks {
-                if let Err(e) = assert_dependency_free(&root, lock, *packages) {
+            for (lock, members) in &locks {
+                if let Err(e) = assert_dependency_free(&root, lock, members) {
                     return fail(&e);
                 }
             }
@@ -3069,11 +3069,29 @@ fn shell_quote(p: &Path) -> Option<String> {
     Some(format!("'{s}'"))
 }
 
-/// Exactly one `[[package]]` and no external `source = `, as gate 325 spells
-/// the AGENTS.md dependency-free rule. Both, because they catch different
-/// things: the count catches a new crate, the source line catches a registry
-/// one that a stale count would miss.
-pub(crate) fn assert_dependency_free(root: &Path, lock: &str, packages: usize) -> Result<(), String> {
+/// What a guarded lock must list. The workspace root carries one `[[package]]`
+/// per member. A standalone `td-*` crate carries exactly its own package plus
+/// the roster crates its manifest depends on by path, transitively: never a
+/// registry or git crate, and never a path outside the roster, so the engine
+/// workspace's members still reach a target crate only as shared source.
+/// Names here are roster DIRECTORY names, for `own` and `allowed` alike. A
+/// lock spells package names, so every roster crate's package name must equal
+/// its directory; one that differed would red loudly on either side.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum LockMembers {
+    Count(usize),
+    Roster { own: String, allowed: Vec<String> },
+}
+
+/// The lock guard: no `source` line and exactly the package set `LockMembers`
+/// expects, as gate 325 spells the AGENTS.md dependency-free rule. Both,
+/// because they catch different things: the membership catches a new crate,
+/// the source line catches a registry one hiding under a roster name.
+pub(crate) fn assert_dependency_free(
+    root: &Path,
+    lock: &str,
+    members: &LockMembers,
+) -> Result<(), String> {
     // An unreadable lock is a failure, not a pass: a guard that answers OK when
     // it cannot see the file is a guard that has silently stopped guarding.
     // Gate 325 reaches this through `gate-crates locks`, so both tiers fail an
@@ -3081,27 +3099,147 @@ pub(crate) fn assert_dependency_free(root: &Path, lock: &str, packages: usize) -
     // `text count-line-exact`, which no gate calls any more.
     let text = std::fs::read_to_string(root.join(lock))
         .map_err(|e| format!("{lock} could not be read: {e}"))?;
-    dependency_free(lock, &text, packages)
+    dependency_free(lock, &text, members)
 }
 
 /// The check itself, over the lock's TEXT — no filesystem, so its cases are
 /// literals in the test rather than a fixture tree.
-fn dependency_free(lock: &str, text: &str, expected: usize) -> Result<(), String> {
-    let found = text.lines().filter(|l| l.trim() == "[[package]]").count();
-    if found != expected {
-        return Err(format!(
-            "{lock} lists {found} packages, expected exactly {expected} (its own path \
-             members) — it must carry ZERO external crates (AGENTS.md 'Rust code'); \
-             adding one is a reviewed decision"
-        ));
-    }
-    if text.lines().any(|l| l.trim_start().starts_with("source = \"")) {
-        return Err(format!(
-            "{lock} carries an external `source = ` — it must carry ZERO external crates \
-             (AGENTS.md 'Rust code'); adding one is a reviewed decision"
-        ));
+fn dependency_free(lock: &str, text: &str, expected: &LockMembers) -> Result<(), String> {
+    let names = lock_package_names(lock, text)?;
+    match expected {
+        LockMembers::Count(expected) => {
+            let found = names.len();
+            if found != *expected {
+                return Err(format!(
+                    "{lock} lists {found} packages, expected exactly {expected} (its own path \
+                     members) — it must carry ZERO external crates (AGENTS.md 'Rust code'); \
+                     adding one is a reviewed decision"
+                ));
+            }
+        }
+        LockMembers::Roster { own, allowed } => {
+            if !names.contains(own) {
+                return Err(format!("{lock} does not list its own package `{own}`"));
+            }
+            for name in &names {
+                if name != own && !allowed.contains(name) {
+                    return Err(format!(
+                        "{lock} lists package `{name}`, which is neither `{own}` nor a `td-*` \
+                         roster crate its manifest depends on by path — it must carry ZERO \
+                         external crates (AGENTS.md 'Rust code'); a dependency outside the \
+                         roster is a reviewed decision"
+                    ));
+                }
+            }
+            for dep in allowed {
+                if !names.contains(dep) {
+                    return Err(format!(
+                        "{lock} does not list `{dep}`, which its manifest depends on by \
+                         path — the committed lock is stale"
+                    ));
+                }
+            }
+        }
     }
     Ok(())
+}
+
+/// The `name` of every `[[package]]` in a lock's text, in order, refusing any
+/// `source` line on the way. Headers are read as cargo reads them
+/// (`normalize_header`) and values as TOML strings (`toml_string`), so a
+/// spelling cargo accepts but never writes cannot read as silence. A
+/// dependency-free lock has nothing but `[[package]]` tables — `[metadata]`
+/// carries registry checksums and `[[patch.unused]]` a patch — so any other
+/// table is refused. A package without a name, a second name in one block, or
+/// a name listed twice is malformed rather than absent: a guard that reads
+/// nothing out of a lock it cannot parse has stopped guarding.
+fn lock_package_names(lock: &str, text: &str) -> Result<Vec<String>, String> {
+    let mut names: Vec<String> = Vec::new();
+    let mut open = false;
+    let mut named = false;
+    for raw in text.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if line.starts_with('[') {
+            if open && !named {
+                return Err(format!("{lock} has a [[package]] entry with no name"));
+            }
+            match normalize_header(line) {
+                Some((header, true)) if header == "package" => {
+                    open = true;
+                    named = false;
+                }
+                Some((header, _)) => {
+                    return Err(format!(
+                        "{lock} carries a `[{header}]` table — a dependency-free lock lists \
+                         only [[package]] entries (AGENTS.md 'Rust code')"
+                    ));
+                }
+                None => return Err(format!("{lock}: `{line}` is not a table header")),
+            }
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        // A quoted key is the same key to TOML: `"source"` reds like `source`.
+        // An escaped one spells a key the eye does not see (`"source"`
+        // is `source`); cargo writes none, so it is refused unread.
+        let key = key.trim();
+        if key.contains('\\') {
+            return Err(format!(
+                "{lock}: `{line}` spells a key with an escape — a lock's keys are bare"
+            ));
+        }
+        let key = key.trim_matches(['"', '\'']);
+        if key == "source" {
+            return Err(format!(
+                "{lock} carries an external `source = ` — it must carry ZERO external crates \
+                 (AGENTS.md 'Rust code'); adding one is a reviewed decision"
+            ));
+        }
+        if !open || key != "name" {
+            continue;
+        }
+        if named {
+            return Err(format!("{lock} has a [[package]] entry with two names"));
+        }
+        let Some(name) = toml_string(value) else {
+            return Err(format!("{lock}: `{line}` is not a quoted package name"));
+        };
+        if names.iter().any(|seen| seen == name) {
+            return Err(format!("{lock} lists package `{name}` twice"));
+        }
+        names.push(name.to_string());
+        named = true;
+    }
+    if open && !named {
+        return Err(format!("{lock} has a [[package]] entry with no name"));
+    }
+    if names.is_empty() {
+        return Err(format!("{lock} lists no packages"));
+    }
+    Ok(names)
+}
+
+/// A TOML basic or literal string as the value of a `key = value` line, with
+/// a trailing comment dropped: `"td-ui"`, `'td-ui'`, `"td-ui" # note`. An
+/// escape inside the quotes, or anything else after them, is not a string
+/// this guard reads; it refuses rather than guesses.
+fn toml_string(value: &str) -> Option<&str> {
+    let value = value.trim();
+    let quote = value.chars().next().filter(|c| matches!(c, '"' | '\''))?;
+    let inner = value.get(1..)?;
+    let end = inner.find(quote)?;
+    let rest = inner.get(end.checked_add(1)?..)?.trim();
+    if !rest.is_empty() && !rest.starts_with('#') {
+        return None;
+    }
+    inner
+        .get(..end)
+        .filter(|name| !name.is_empty() && !name.contains('\\'))
 }
 
 /// A standalone target crate the `cargo-test` preflight gates, discovered from
@@ -3128,6 +3266,17 @@ struct GateCrate {
     /// The directory name, which is also the crate name and the manifest path
     /// the commands are spelled with: `td-sh`.
     name: String,
+    /// Sibling roster crates the manifest depends on by path under
+    /// `[dependencies]`, in declaration order, each admitted only in the one
+    /// spelling `manifest_path_dependencies` accepts. The lock cannot say
+    /// where a path dependency came from, so this is where "no path outside
+    /// the roster" is established.
+    path_dependencies: Vec<String>,
+    /// The same under `[dev-dependencies]`. Kept apart because cargo resolves
+    /// a crate's own dev-dependencies into its lock but never a dependency's,
+    /// so a closure that followed them would expect packages cargo refuses
+    /// to write.
+    path_dev_dependencies: Vec<String>,
     /// Whether clippy lints test and bench targets too. DECLARED rather than
     /// assumed in either direction: turning it on repo-wide is more lint
     /// coverage and a separate reviewed change, and defaulting it on would red
@@ -3175,9 +3324,33 @@ fn discover_gate_crates(root: &Path) -> Result<Vec<GateCrate>, String> {
         // questions come BEFORE any judgement of the name. `read_dir` yields
         // plain files too, so asking about the name first makes a stray
         // `td-notes.txt` — or a `td-sh.orig` backup with no manifest in it —
-        // red every check on the branch. `metadata` rather than `is_dir()`, so
-        // "not a directory" and "could not tell" stay different answers.
-        match std::fs::metadata(&path) {
+        // red every check on the branch. `symlink_metadata` rather than
+        // `is_dir()`, so "not a directory" and "could not tell" stay different
+        // answers, and a linked directory is refused rather than followed: a
+        // roster name is what a sibling `path = "../NAME"` dependency
+        // resolves to, so a `td-*` link into another tree would put that
+        // tree on the roster under a name the lock guard admits. A link to a
+        // plain file is as stray as the file, and a dangling one is nothing;
+        // a target that cannot be told apart is refused, as the entry itself
+        // would be.
+        match std::fs::symlink_metadata(&path) {
+            Ok(meta) if meta.file_type().is_symlink() => match std::fs::metadata(&path) {
+                Ok(target) if target.is_dir() => {
+                    return Err(format!(
+                        "{}: a symlink cannot be a roster crate — a sibling dependency \
+                         must resolve to a real directory in this tree",
+                        path.display()
+                    ));
+                }
+                Ok(_) => continue,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => {
+                    return Err(format!(
+                        "{}: the symlink's target could not be inspected: {e}",
+                        path.display()
+                    ));
+                }
+            },
             Ok(meta) if meta.is_dir() => {}
             Ok(_) => continue,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
@@ -3233,6 +3406,269 @@ fn discover_gate_crates(root: &Path) -> Result<Vec<GateCrate>, String> {
     Ok(out)
 }
 
+/// The roster crates a manifest depends on by path, in the one admitted
+/// spelling: `NAME = { path = "../NAME" }` on its own line under
+/// `[dependencies]` or `[dev-dependencies]`. Anything else in a dependency
+/// table is an error rather than an unrelated line: a version, a git or
+/// registry source, a feature list, a rename, a path that is not the sibling
+/// directory of the same name, a `[build-dependencies]` or
+/// `[workspace.dependencies]` table, or the multi-line `[dependencies.NAME]`
+/// form. The manifest's shape is held narrow enough for a line reader to be
+/// exact: headers are bare, so a quoted or escaped spelling cannot name the
+/// admitted table another way; values stay on one line, so no multi-line
+/// string can carry header-looking text; and `[target.…]`, `[patch]` and
+/// `[replace]` tables, which place or redirect dependencies under keys this
+/// reader never enters, are refused wherever they appear. The lock cannot
+/// show where a path dependency came from — an outside copy under a roster
+/// name resolves to the same `[[package]]` line — so the manifest is where
+/// "no path outside the roster" is established, and the lock guard then
+/// holds the lock to what the manifests declare. Whether the name is on the
+/// roster is the caller's check; this reads one manifest.
+fn manifest_path_dependencies(
+    name: &str,
+    manifest: &str,
+) -> Result<(Vec<String>, Vec<String>), String> {
+    let mut deps: Vec<String> = Vec::new();
+    let mut dev: Vec<String> = Vec::new();
+    let mut inside: Option<bool> = None;
+    let mut seen_header = false;
+    for raw in manifest.lines() {
+        // A line reader cannot see through a multi-line string, inside which
+        // a `[dependencies]` line is text rather than a table. Refuse the
+        // form rather than guess; every roster manifest keeps values on one
+        // line.
+        if raw.contains("\"\"\"") || raw.contains("'''") {
+            return Err(format!(
+                "{name}: multi-line string `{}` — a roster manifest keeps every value on \
+                 one line so its tables can be read line by line",
+                raw.trim()
+            ));
+        }
+        // A header is a bare dotted path. `normalize_header` folds quoted
+        // segments for the gate table's near-miss check, so `[" dependencies "]`
+        // — a different table to TOML — would read as the admitted one, and an
+        // escape spells the admitted table unrecognisably: `["dependencies"]`
+        // IS `[dependencies]`. The raw line is tested up to its first `]`,
+        // before the comment strip below, since a `#` inside a quoted segment
+        // would otherwise hide the rest of the header; a quoted segment opens
+        // before any `]` it contains, and a comment after the header may say
+        // what it likes. No roster manifest quotes a header.
+        if let Some(rest) = raw.trim_start().strip_prefix('[') {
+            let head = rest.split(']').next().unwrap_or(rest);
+            if head.contains(['"', '\'', '\\']) {
+                return Err(format!(
+                    "{name}: header `{}` is quoted — a roster manifest's table headers \
+                     are bare, so each can be read for what it is (AGENTS.md 'Rust code')",
+                    raw.trim()
+                ));
+            }
+        }
+        let line = raw.split('#').next().unwrap_or(raw).trim();
+        if line.is_empty() {
+            continue;
+        }
+        if line.starts_with('[') {
+            // A continued array element such as `[1, 2],` lands here too; the
+            // gate-table reader over the same text refuses it as well.
+            let Some((header, array)) = normalize_header(line) else {
+                return Err(format!("{name}: `{line}` is not a section header"));
+            };
+            seen_header = true;
+            inside = match header.as_str() {
+                "dependencies" if !array => Some(false),
+                "dev-dependencies" if !array => Some(true),
+                _ => None,
+            };
+            if inside.is_none() && header.contains("dependencies") {
+                return Err(format!(
+                    "{name}: `{line}` is not an admitted dependency table — a roster \
+                     crate depends on a sibling only as `NAME = {{ path = \"../NAME\" }}` \
+                     under a bare [dependencies] or [dev-dependencies] header \
+                     (AGENTS.md 'Rust code')"
+                ));
+            }
+            // A `[target.…]` table exists to hold dependencies under a key of
+            // its own (`dependencies = { … }` beneath it is that target's
+            // dependency table), and `[patch]` and `[replace]` to redirect
+            // what a name resolves to. None has a place in a roster manifest.
+            let table = header.split('.').next().unwrap_or(&header);
+            if matches!(table, "target" | "patch" | "replace") {
+                return Err(format!(
+                    "{name}: `{line}` places or redirects dependencies outside the \
+                     admitted tables — a roster manifest carries no target, patch or \
+                     replace table (AGENTS.md 'Rust code')"
+                ));
+            }
+            continue;
+        }
+        if !seen_header {
+            // A key before the first table is top level: `dependencies = { … }`
+            // or `dependencies.NAME = { … }` there IS the dependency table in a
+            // spelling this reader would otherwise never enter. Every roster
+            // manifest opens with [package], so nothing legitimate is here.
+            return Err(format!(
+                "{name}: top-level key `{line}` precedes the first table — a roster \
+                 manifest opens with [package] and declares dependencies only under \
+                 a bare [dependencies] or [dev-dependencies] header"
+            ));
+        }
+        let Some(is_dev) = inside else {
+            // No other table may carry a dependency key of its own: under
+            // `[workspace]`, `dependencies = { … }` is a table this reader
+            // never enters. The target tables that would make one live are
+            // refused above; this holds the remaining ones to the same line.
+            // A continued value has no `=` and is passed over, and the key is
+            // matched whole, so a `no-dependencies` feature is not one.
+            if let Some((key, _)) = line.split_once('=') {
+                let key = key.trim().trim_matches(['"', '\'']);
+                let base = key.split('.').next().unwrap_or(key).trim().trim_matches(['"', '\'']);
+                if matches!(base, "dependencies" | "dev-dependencies" | "build-dependencies") {
+                    return Err(format!(
+                        "{name}: `{line}` names a dependency table outside the admitted \
+                         headers — a roster crate declares dependencies only under a \
+                         bare [dependencies] or [dev-dependencies] header (AGENTS.md \
+                         'Rust code')"
+                    ));
+                }
+            }
+            continue;
+        };
+        let admitted = line
+            .split_once(" = ")
+            .filter(|(key, _)| !key.is_empty() && key.chars().all(is_name_char))
+            .filter(|(key, value)| *value == format!("{{ path = \"../{key}\" }}"))
+            .map(|(key, _)| key);
+        let Some(dep) = admitted else {
+            return Err(format!(
+                "{name}: dependency line `{line}` is not `NAME = {{ path = \"../NAME\" }}` — \
+                 a roster crate may depend only on a sibling roster crate, by that exact \
+                 spelling; anything else is a reviewed decision (AGENTS.md 'Rust code')"
+            ));
+        };
+        if dep == name {
+            return Err(format!("{name}: depends on itself"));
+        }
+        if deps.iter().chain(dev.iter()).any(|seen| seen == dep) {
+            return Err(format!("{name}: names dependency `{dep}` twice"));
+        }
+        if is_dev { &mut dev } else { &mut deps }.push(dep.to_string());
+    }
+    Ok((deps, dev))
+}
+
+/// A cargo config may not redirect a dependency behind the manifests' backs:
+/// a `paths` override substitutes a directory for a dependency by name, and
+/// `[patch]` or `[source]` tables replace what a name resolves to, all
+/// without touching a manifest or writing a `source` line into a lock. The
+/// repository config carries the test runner and nothing else, so any of
+/// those keys is refused, not interpreted, under either file name cargo
+/// reads and however the header is spelled. Cargo also walks up from the
+/// working directory, so a roster crate may carry no `.cargo` directory of
+/// its own: the repository's is the only one.
+fn refuse_cargo_config_overrides(root: &Path, roster: &[GateCrate]) -> Result<(), String> {
+    for krate in roster {
+        let local = root.join(&krate.name).join(".cargo");
+        match std::fs::symlink_metadata(&local) {
+            Ok(_) => {
+                return Err(format!(
+                    "{}: a roster crate carries no .cargo directory — the repository's \
+                     config is the only cargo config (AGENTS.md 'Rust code')",
+                    local.display()
+                ));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(format!("{} could not be inspected: {e}", local.display())),
+        }
+    }
+    for name in [".cargo/config.toml", ".cargo/config"] {
+        let config = root.join(name);
+        let text = match std::fs::read_to_string(&config) {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(format!("{} could not be read: {e}", config.display())),
+        };
+        for raw in text.lines() {
+            let line = raw.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            if line.contains("\"\"\"") || line.contains("'''") {
+                return Err(format!(
+                    "{name}: multi-line string `{line}` — the cargo config keeps every \
+                     value on one line so it can be read line by line"
+                ));
+            }
+            // The first dotted segment of a header or key names the table:
+            // `[ patch.crates-io ]`, `["patch".crates-io]`, `[[patch.unused]]`,
+            // `[paths]`, `paths = […]` and `patch.crates-io.NAME = …` all
+            // read as what they are. Comments are not stripped first, since
+            // a `#` inside a quoted segment would hide the rest of a header.
+            // A line that is neither — a value continued from an array's
+            // opening line — is passed over: the key that opened it was read.
+            let head = if line.starts_with('[') {
+                line.trim_start_matches('[')
+            } else if let Some((key, _)) = line.split_once('=') {
+                key
+            } else {
+                continue;
+            };
+            let segment = head.split(['.', ']']).next().unwrap_or(head).trim();
+            // An escape spells a table name the eye does not see:
+            // `"paths"` is `paths`. No key here needs one.
+            if segment.contains('\\') {
+                return Err(format!(
+                    "{name} spells a key with an escape (`{line}`) — the cargo \
+                     config's keys are bare, so each can be read for what it is \
+                     (AGENTS.md 'Rust code')"
+                ));
+            }
+            // `include` loads further config files this guard would never
+            // read; it is refused with the redirects.
+            let table = segment.trim_matches(['"', '\'']).trim();
+            if matches!(table, "paths" | "patch" | "source" | "include") {
+                return Err(format!(
+                    "{name} redirects dependency resolution (`{line}`) — the roster's \
+                     manifests are the only place a dependency may point, and this \
+                     file the only cargo config (AGENTS.md 'Rust code')"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Every roster crate `name`'s lock lists beyond itself, sorted: its own
+/// dependencies and dev-dependencies, then transitively the dependencies —
+/// never the dev-dependencies — of what those reach, which is what cargo
+/// resolves. Cargo cannot resolve a cycle, and a name already collected is
+/// not revisited here.
+fn roster_closure(roster: &[GateCrate], name: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut pending: Vec<String> = roster
+        .iter()
+        .find(|krate| krate.name == name)
+        .map(|krate| {
+            krate
+                .path_dependencies
+                .iter()
+                .chain(krate.path_dev_dependencies.iter())
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default();
+    while let Some(next) = pending.pop() {
+        if next == name || out.contains(&next) {
+            continue;
+        }
+        if let Some(krate) = roster.iter().find(|krate| krate.name == next) {
+            pending.extend(krate.path_dependencies.iter().cloned());
+        }
+        out.push(next);
+    }
+    out.sort();
+    out
+}
+
 /// The table a crate declares its gating in, normalized (no brackets).
 const GATE_SECTION: &str = "package.metadata.td-gate";
 
@@ -3286,11 +3722,14 @@ fn resembles_gate_section(header: &str) -> bool {
 /// shrug: a mistyped `clippy-all-targets` that parsed as nothing would silently
 /// drop lint coverage, which is the failure this whole roster exists to stop.
 fn parse_gate_crate(name: &str, manifest: &str) -> Result<GateCrate, String> {
+    let (path_dependencies, path_dev_dependencies) = manifest_path_dependencies(name, manifest)?;
     let mut out = GateCrate {
         trusted_test_root: false,
         native_compositor_tests: false,
         native_fixture_feature: None,
         name: name.to_string(),
+        path_dependencies,
+        path_dev_dependencies,
         clippy_all_targets: false,
         test_args: None,
         gate_test_args: None,
@@ -3427,6 +3866,18 @@ fn gate_string(krate: &str, key: &str, value: &str) -> Result<String, String> {
              into a shell command"
         ));
     }
+    // `--config` hands cargo a config file or key the lock guard never reads,
+    // and `-Z` unlocks unstable behaviour of the same reach; neither is a
+    // test argument. Tokens are matched whole, on either side of `--`.
+    if inner
+        .split(' ')
+        .any(|token| token == "--config" || token.starts_with("--config=") || token.starts_with("-Z"))
+    {
+        return Err(format!(
+            "{krate}: `{key}` may not carry `--config` or `-Z` — the repository's \
+             cargo config is the only one a gate command reads (AGENTS.md 'Rust code')"
+        ));
+    }
     Ok(inner.to_string())
 }
 
@@ -3470,19 +3921,51 @@ fn workspace_member_count(root: &Path) -> Result<usize, String> {
     Err("root Cargo.toml has no `members =` line".to_string())
 }
 
-/// Every lock this preflight answers for, and the `[[package]]` count it must
-/// carry: one per member for the workspace root, one apiece for the standalone
-/// crates.
+/// Every lock this preflight answers for, and what it must carry: one
+/// `[[package]]` per member for the workspace root; for a standalone crate,
+/// exactly its own package plus the closure of roster crates its manifest
+/// depends on by path. Both halves are derived, so a crate that gains a
+/// sibling dependency edits no list here. A declared dependency that is not a
+/// roster crate is refused before any lock is read: the manifests establish
+/// where a path dependency points, the lock guard holds each lock to them, and
+/// `--frozen` holds cargo to the lock.
 ///
 /// Gate 325 asserts these too, but it degrades to a tolerated Unprovisioned
 /// SKIP on every host today (re #469) and names this preflight the authoritative
 /// enforcement — so in the only tier that executes, this is where the
 /// dependency-free claim is actually checked. `--frozen` does not stand in: it
 /// demands that the committed lock RESOLVE, not that it be empty.
-pub(crate) fn dependency_free_locks(root: &Path) -> Result<Vec<(String, usize)>, String> {
-    let mut out = vec![("Cargo.lock".to_string(), workspace_member_count(root)?)];
-    for krate in discover_gate_crates(root)? {
-        out.push((format!("{}/Cargo.lock", krate.name), 1));
+pub(crate) fn dependency_free_locks(root: &Path) -> Result<Vec<(String, LockMembers)>, String> {
+    let mut out = vec![(
+        "Cargo.lock".to_string(),
+        LockMembers::Count(workspace_member_count(root)?),
+    )];
+    let roster = discover_gate_crates(root)?;
+    refuse_cargo_config_overrides(root, &roster)?;
+    for krate in &roster {
+        for dep in krate
+            .path_dependencies
+            .iter()
+            .chain(krate.path_dev_dependencies.iter())
+        {
+            if !roster.iter().any(|other| other.name == *dep) {
+                return Err(format!(
+                    "{}/Cargo.toml depends on `{dep}`, which is not a `td-*` roster crate — \
+                     a roster crate may depend only on a sibling roster crate by path \
+                     (AGENTS.md 'Rust code'); anything else is a reviewed decision",
+                    krate.name
+                ));
+            }
+        }
+    }
+    for krate in &roster {
+        out.push((
+            format!("{}/Cargo.lock", krate.name),
+            LockMembers::Roster {
+                own: krate.name.clone(),
+                allowed: roster_closure(&roster, &krate.name),
+            },
+        ));
     }
     Ok(out)
 }
@@ -3937,8 +4420,8 @@ fn run_preflight(root: &Path, name: &str, changed: &[String]) -> i32 {
                     return 1;
                 }
             };
-            for (lock, packages) in locks {
-                if let Err(e) = assert_dependency_free(root, &lock, packages) {
+            for (lock, members) in locks {
+                if let Err(e) = assert_dependency_free(root, &lock, &members) {
                     eprintln!("affected-checks: {e}");
                     return 1;
                 }
@@ -4321,7 +4804,7 @@ mod tests {
         cargo_test_cmds_all(&repo_root()).expect("cargo command list")
     }
 
-    fn gate_locks() -> Vec<(String, usize)> {
+    fn gate_locks() -> Vec<(String, LockMembers)> {
         dependency_free_locks(&repo_root()).expect("lock roster")
     }
 
@@ -4592,6 +5075,8 @@ mod tests {
             native_compositor_tests: false,
             native_fixture_feature: None,
             name: name.to_string(),
+            path_dependencies: Vec::new(),
+            path_dev_dependencies: Vec::new(),
             clippy_all_targets: false,
             test_args: None,
             gate_test_args: None,
@@ -6717,7 +7202,10 @@ mod tests {
         assert!(commands.iter().any(|c| {
             c.starts_with("cargo clippy --frozen ") && c.contains("--all-targets")
         }));
-        assert!(gate_locks().contains(&("td-editor/Cargo.lock".to_string(), 1)));
+        assert!(gate_locks().iter().any(|(lock, members)| {
+            lock == "td-editor/Cargo.lock"
+                && matches!(members, LockMembers::Roster { own, .. } if own == "td-editor")
+        }));
         paths.push("builder/src/affected.rs".to_string());
         assert_eq!(cargo_test_cmds(&root, &paths).unwrap(), gate_cmds());
         assert!(compute_selection(&root, &paths).targets.contains(&"check".to_string()));
@@ -7172,13 +7660,21 @@ mod tests {
         for ok in [
             "[package.metadata.td-gate] # how this crate is gated\nclippy-all-targets = true\n",
             "[ package.metadata.td-gate ]\nclippy-all-targets = true\n",
-            "[package.metadata.\"td-gate\"]\nclippy-all-targets = true\n",
         ] {
             assert!(
                 parse_gate_crate("td-x", ok).expect("accepted spelling").clippy_all_targets,
                 "{ok:?} declares the flag and must be read"
             );
         }
+        // A quoted segment names the same table to cargo, and used to be
+        // folded here for that reason. Roster manifests now keep headers
+        // bare so the dependency reader can be exact, so the spelling reds by
+        // name rather than being read or silently dropped.
+        assert!(
+            parse_gate_crate("td-x", "[package.metadata.\"td-gate\"]\nclippy-all-targets = true\n")
+                .is_err_and(|e| e.contains("bare")),
+            "a quoted header is refused, not folded"
+        );
         // …and every NEAR MISS reds rather than declaring nothing, including the
         // dotted and inline-table spellings this parser does not read.
         for miss in [
@@ -7220,6 +7716,19 @@ mod tests {
             "[package.metadata.td-gate]\ntest-args = \"--x && id\"\n",
         ] {
             assert!(parse_gate_crate("td-x", evil).is_err(), "{evil:?} must red");
+        }
+        // …and so is a cargo config or unstable flag, which would reach past
+        // the lock guard from inside a gate command (the subagent's channel).
+        for reach in [
+            "[package.metadata.td-gate]\ntest-args = \"--config some/file.toml\"\n",
+            "[package.metadata.td-gate]\ntest-args = \"--config=paths.x\"\n",
+            "[package.metadata.td-gate]\ngate-test-args = \"--bins -Zconfig-include\"\n",
+            "[package.metadata.td-gate]\ngate-test-args = \"-Z unstable-options\"\n",
+        ] {
+            assert!(
+                parse_gate_crate("td-x", reach).is_err_and(|e| e.contains("--config")),
+                "{reach:?} must red"
+            );
         }
 
         // A trailing comment on the HEADER does not hide the block…
@@ -7468,28 +7977,114 @@ mod tests {
     #[test]
     fn the_dependency_free_guard_reds_on_a_crate_and_on_a_source_line() {
         let lock = "td-review/Cargo.lock";
-        assert!(dependency_free(lock, "[[package]]\nname = \"td-review\"\n", 1).is_ok());
+        let own = |allowed: &[&str]| LockMembers::Roster {
+            own: "td-review".to_string(),
+            allowed: allowed.iter().map(|s| s.to_string()).collect(),
+        };
+        assert!(dependency_free(lock, "[[package]]\nname = \"td-review\"\n", &own(&[])).is_ok());
         let two = dependency_free(
             lock,
             "[[package]]\nname = \"td-review\"\n\n[[package]]\nname = \"ureq\"\n",
-            1,
+            &own(&["td-vm"]),
         );
-        assert!(two.is_err_and(|e| e.contains("lists 2 packages")), "a second crate must red");
+        assert!(
+            two.is_err_and(|e| e.contains("lists package `ureq`")),
+            "a second crate must red"
+        );
+        // A path dependency on another roster crate is the one shape admitted
+        // beyond the crate's own package, and only while that crate is on the
+        // roster: the same text reds against a roster that lacks it.
+        let sibling = "[[package]]\nname = \"td-review\"\nversion = \"0.1.0\"\n\
+                       dependencies = [\n \"td-vm\",\n]\n\n\
+                       [[package]]\nname = \"td-vm\"\nversion = \"0.1.0\"\n";
+        assert!(dependency_free(lock, sibling, &own(&["td-vm"])).is_ok());
+        assert!(dependency_free(lock, sibling, &own(&[])).is_err_and(|e| e.contains("`td-vm`")));
+        // The engine workspace's members are shared SOURCE to a target crate,
+        // never a package in its lock.
+        let engine = "[[package]]\nname = \"td-engine\"\n\n[[package]]\nname = \"td-review\"\n";
+        assert!(dependency_free(lock, engine, &own(&["td-vm"]))
+            .is_err_and(|e| e.contains("`td-engine`")));
         let sourced = dependency_free(
             lock,
             "[[package]]\nname = \"ureq\"\nsource = \"registry+https://example.invalid\"\n",
-            1,
+            &own(&[]),
         );
         assert!(
             sourced.is_err_and(|e| e.contains("external `source = `")),
-            "a registry crate must red even when the count still reads 1"
+            "a registry crate must red on its source line, before any name check"
         );
-        assert!(dependency_free(lock, "", 1).is_err(), "an empty lock is not a pass");
+        assert!(dependency_free(lock, "", &own(&[])).is_err(), "an empty lock is not a pass");
+        assert!(
+            dependency_free(lock, "[[package]]\nname = \"td-vm\"\n", &own(&["td-vm"]))
+                .is_err_and(|e| e.contains("its own package")),
+            "a lock that omits the crate itself is not that crate's lock"
+        );
+        assert!(
+            dependency_free(lock, "[[package]]\nversion = \"0.1.0\"\n", &own(&[])).is_err(),
+            "a nameless package is malformed, not absent"
+        );
+        assert!(
+            dependency_free(lock, "[[package]]\nname = \"\"\n", &LockMembers::Count(1))
+                .is_err_and(|e| e.contains("not a quoted package name")),
+            "an empty name is not a package"
+        );
+        assert!(
+            dependency_free(
+                lock,
+                "[[package]]\nname = \"td-vm\"\n\"sou\\u0072ce\" = \"registry+https://x\"\n",
+                &own(&[])
+            )
+            .is_err_and(|e| e.contains("escape")),
+            "an escaped key is refused unread"
+        );
+        assert!(
+            dependency_free(lock, "[[package]]\nname = \"td-review\"\n", &own(&["td-vm"]))
+                .is_err_and(|e| e.contains("does not list `td-vm`")),
+            "a lock missing a declared sibling is stale, not a pass"
+        );
+        assert!(
+            dependency_free(
+                lock,
+                "[[package]]\nname = \"td-review\"\n[[package]]\nname = \"td-review\"\n",
+                &own(&[])
+            )
+            .is_err_and(|e| e.contains("twice")),
+            "a name listed twice is malformed"
+        );
+        // Spellings cargo accepts but never writes read the same as cargo's
+        // own, rather than as silence.
+        assert!(dependency_free(lock, "[[ package ]] # note\nname='td-review' # note\n", &own(&[])).is_ok());
+        assert!(
+            dependency_free(lock, "[[package]]\nname = \"td-review\"\nsource='registry+x'\n", &own(&[]))
+                .is_err_and(|e| e.contains("external `source = `")),
+            "a literal-string source line is a source line"
+        );
+        assert!(
+            dependency_free(lock, "[[package]]\nname = \"td-review\"\n\"source\" = \"registry+x\"\n", &own(&[]))
+                .is_err_and(|e| e.contains("external `source = `")),
+            "a quoted source key is a source key"
+        );
+        assert!(
+            dependency_free(lock, "[[package]]\nname = \"td-review\"\nname = \"td-vm\"\n", &own(&["td-vm"]))
+                .is_err_and(|e| e.contains("two names")),
+            "a second name in one block is malformed, not a second package"
+        );
+        for table in ["[metadata]\n", "[[patch.unused]]\nname = \"td-vm\"\n"] {
+            let text = format!("[[package]]\nname = \"td-review\"\n\n{table}");
+            assert!(
+                dependency_free(lock, &text, &own(&[])).is_err_and(|e| e.contains("table")),
+                "a dependency-free lock has no `{table}`"
+            );
+        }
+        assert!(
+            dependency_free(lock, "[[package]]\nname = \"td-review\" trailing\n", &own(&[])).is_err(),
+            "a name line with trailing text is refused, not truncated"
+        );
         // The workspace root carries three path members, and a fourth is the
         // shape that must red there.
-        let three = "[[package]]\na\n[[package]]\nb\n[[package]]\nc\n";
-        assert!(dependency_free("Cargo.lock", three, 3).is_ok());
-        assert!(dependency_free("Cargo.lock", three, 1).is_err());
+        let three = "[[package]]\nname = \"a\"\n[[package]]\nname = \"b\"\n[[package]]\nname = \"c\"\n";
+        assert!(dependency_free("Cargo.lock", three, &LockMembers::Count(3)).is_ok());
+        assert!(dependency_free("Cargo.lock", three, &LockMembers::Count(1)).is_err());
 
         // Every roster entry against the real guard, including the read. This
         // is the enforcement of AGENTS.md's dependency-free rule over every td
@@ -7497,16 +8092,234 @@ mod tests {
         // its `cargo test` copy was skipping for the same six weeks.
         let root = repo_root();
         require_sibling_locks(&root);
-        for (lock, packages) in gate_locks() {
+        let roster: Vec<String> = gate_roster().into_iter().map(|k| k.name).collect();
+        for (lock, members) in gate_locks() {
             assert!(
-                assert_dependency_free(&root, &lock, packages).is_ok(),
+                assert_dependency_free(&root, &lock, &members).is_ok(),
                 "the committed {lock} must pass its own guard"
             );
+            // The derived expectation names only roster crates: never a
+            // workspace member, td-net, or a name outside the tree.
+            if let LockMembers::Roster { own, allowed } = &members {
+                assert_eq!(lock, format!("{own}/Cargo.lock"));
+                assert!(roster.contains(own), "{own} is off the roster");
+                for dep in allowed {
+                    assert!(roster.contains(dep), "{lock} expects off-roster `{dep}`");
+                    assert!(
+                        !matches!(dep.as_str(), "td-engine" | "td-net" | "td-builder" | "td-recipe"),
+                        "{lock} expects the engine or net tier as a package"
+                    );
+                }
+            }
         }
         assert!(
-            assert_dependency_free(&root, "td-review/nope.lock", 1).is_err(),
+            assert_dependency_free(&root, "td-review/nope.lock", &own(&[])).is_err(),
             "an unreadable lock reds rather than passing"
         );
+    }
+
+    /// The manifest grammar admits exactly one spelling of a sibling path
+    /// dependency. Every other shape a dependency table can take is refused
+    /// with a reason, because a lock cannot distinguish an outside copy under
+    /// a roster name from the roster crate itself.
+    #[test]
+    fn a_manifest_admits_only_the_sibling_path_spelling() {
+        let deps = |text: &str| manifest_path_dependencies("td-aa", text);
+        assert_eq!(
+            deps("[package]\nname = \"td-aa\"\n\n[workspace]\n").unwrap(),
+            (Vec::<String>::new(), Vec::<String>::new())
+        );
+        assert_eq!(
+            deps("[dependencies]\ntd-bb = { path = \"../td-bb\" }\n\n[dev-dependencies]\ntd-cc = { path = \"../td-cc\" } # note\n").unwrap(),
+            (vec!["td-bb".to_string()], vec!["td-cc".to_string()])
+        );
+        assert!(
+            deps("[[dependencies]]\ntd-bb = { path = \"../td-bb\" }\n")
+                .is_err_and(|e| e.contains("`[[dependencies]]`")),
+            "an array-of-tables header is named as one"
+        );
+        // A crate's `parse_gate_crate` carries both lists; nothing else fills them.
+        let parsed = parse_gate_crate("td-aa", "[dependencies]\ntd-bb = { path = \"../td-bb\" }\n\n[dev-dependencies]\ntd-cc = { path = \"../td-cc\" }\n\n[workspace]\n").unwrap();
+        assert_eq!(parsed.path_dependencies, ["td-bb"]);
+        assert_eq!(parsed.path_dev_dependencies, ["td-cc"]);
+        for (bad, why) in [
+            ("[dependencies]\ntd-bb = { path = \"../vendor/td-bb\" }\n", "an outside copy under a roster name"),
+            ("[dependencies]\ntd-bb = { path = \"../td-bb\", features = [\"x\"] }\n", "a feature list"),
+            ("[dependencies]\ntd-bb = \"0.1\"\n", "a registry version"),
+            ("[dependencies]\ntd-bb = { git = \"https://example.invalid\" }\n", "a git source"),
+            ("[dependencies]\nbb = { package = \"td-bb\", path = \"../td-bb\" }\n", "a rename"),
+            ("[dependencies]\ntd-aa = { path = \"../td-aa\" }\n", "a self dependency"),
+            ("[dependencies]\ntd-bb = { path = \"../td-bb\" }\ntd-bb = { path = \"../td-bb\" }\n", "a duplicate"),
+            ("[dependencies.td-bb]\npath = \"../td-bb\"\n", "the multi-line table form"),
+            ("[build-dependencies]\ntd-bb = { path = \"../td-bb\" }\n", "a build dependency"),
+            ("[target.'cfg(unix)'.dependencies]\ntd-bb = { path = \"../td-bb\" }\n", "a target-specific table"),
+            ("[workspace.dependencies]\ntd-bb = { path = \"../td-bb\" }\n", "a workspace dependency table"),
+            ("[\"dependencies\"]\ntd-bb = { path = \"../td-bb\" }\n", "a quoted header"),
+            ("[\" dependencies \"]\ntd-bb = { path = \"../td-bb\" }\n", "a quoted header naming another table"),
+            ("dependencies = { td-bb = { path = \"../vendor/td-bb\" } }\n[package]\nname = \"td-aa\"\n", "a top-level inline dependency table"),
+            ("dependencies.td-bb = { path = \"../vendor/td-bb\" }\n[package]\nname = \"td-aa\"\n", "a top-level dotted dependency key"),
+            // Codex's decoy: the outside copy at top level, a roster-named
+            // table under a quoted header the folded reading would admit.
+            ("dependencies = { td-bb = { path = \"../vendor/td-bb\" } }\n[package]\nname = \"td-aa\"\n[workspace]\n[\" dependencies \"]\ntd-bb = { path = \"../td-bb\" }\n", "a decoy table beside a top-level outside copy"),
+            ("[package]\ndescription = \"\"\"\n[dependencies]\n\"\"\"\n", "a multi-line string a line reader cannot see through"),
+            // Codex's second decoy: the real edge under a target table, as an
+            // inline key this reader would never enter.
+            ("[package]\nname = \"td-aa\"\n[target.'cfg(unix)']\ndependencies = { td-bb = { path = \"../vendor/td-bb\" } }\n", "an inline dependency table under a target table"),
+            ("[package]\nname = \"td-aa\"\n[target.x86_64-unknown-linux-gnu]\n", "a bare target table"),
+            ("[package]\nname = \"td-aa\"\n[target.\"cfg(unix) # x\"]\ndependencies = { td-bb = { path = \"../vendor/td-bb\" } }\n", "a target header hiding behind a comment mark"),
+            ("[package]\nname = \"td-aa\"\n[\"dep\\u0065ndencies\"]\ntd-bb = { path = \"../vendor/td-bb\" }\n", "an escaped header spelling the admitted table"),
+            ("[package]\nname = \"td-aa\"\n[patch.crates-io]\ntd-bb = { path = \"../vendor/td-bb\" }\n", "a patch table"),
+            ("[package]\nname = \"td-aa\"\n[replace]\n\"td-bb:0.1.0\" = { path = \"../vendor/td-bb\" }\n", "a replace table"),
+            ("[package]\nname = \"td-aa\"\n[workspace]\ndependencies = { td-bb = { path = \"../vendor/td-bb\" } }\n", "a dependency key under another table"),
+            ("[package]\nname = \"td-aa\"\n[workspace]\n\"dependencies\".td-bb = { path = \"../vendor/td-bb\" }\n", "a quoted dotted dependency key under another table"),
+            ("[package]\nname = \"td-aa\"\nkeywords = [\n  [1, 2],\n]\n", "a continued array element the gate-table reader refuses too"),
+        ] {
+            assert!(deps(bad).is_err(), "{why} must red: {bad:?}");
+        }
+        // The same admitted table with a comment beside its header is fine,
+        // whatever the comment quotes; so is a feature or continued value
+        // that merely mentions dependencies under another table.
+        assert_eq!(
+            deps("[package] # don't edit the \"name\"\nname = \"td-aa\"\n[dependencies] # the crate's siblings\ntd-bb = { path = \"../td-bb\" }\n").unwrap(),
+            (vec!["td-bb".to_string()], Vec::new())
+        );
+        assert_eq!(
+            deps("[package]\nname = \"td-aa\"\n[features]\nno-dependencies = []\nall = [\n  \"no-dependencies\",\n]\n").unwrap(),
+            (Vec::new(), Vec::new())
+        );
+        // The closure a lock must list follows declared edges transitively,
+        // a crate's own dev-dependencies included and a dependency's own
+        // dev-dependencies excluded, as cargo resolves them.
+        let krate = |name: &str, deps: &[&str], dev: &[&str]| GateCrate {
+            trusted_test_root: false,
+            native_compositor_tests: false,
+            native_fixture_feature: None,
+            name: name.to_string(),
+            path_dependencies: deps.iter().map(|d| d.to_string()).collect(),
+            path_dev_dependencies: dev.iter().map(|d| d.to_string()).collect(),
+            clippy_all_targets: false,
+            test_args: None,
+            gate_test_args: None,
+        };
+        let roster = [
+            krate("td-aa", &["td-bb"], &["td-ee"]),
+            krate("td-bb", &["td-cc"], &["td-dd"]),
+            krate("td-cc", &[], &[]),
+            krate("td-dd", &[], &[]),
+            krate("td-ee", &[], &[]),
+        ];
+        assert_eq!(roster_closure(&roster, "td-aa"), ["td-bb", "td-cc", "td-ee"]);
+        assert_eq!(roster_closure(&roster, "td-bb"), ["td-cc", "td-dd"]);
+        assert!(roster_closure(&roster, "td-cc").is_empty());
+    }
+
+    /// Codex's review case, end to end over a fixture tree: a manifest that
+    /// points a roster name at an outside copy is refused by the roster itself,
+    /// before any lock is read, and a declared sibling's lock is held to the
+    /// closure.
+    #[test]
+    fn an_outside_copy_under_a_roster_name_is_refused_by_the_roster() {
+        let root = std::env::temp_dir().join(format!("td-gate-siblings-{}", std::process::id()));
+        std::fs::remove_dir_all(&root).ok();
+        let write = |rel: &str, text: &str| {
+            let p = root.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, text).unwrap();
+        };
+        write("Cargo.toml", "[workspace]\nmembers = [\"engine\"]\n");
+        write("Cargo.lock", "[[package]]\nname = \"td-engine\"\n");
+        write("td-aa/Cargo.toml", "[package]\nname = \"td-aa\"\n\n[dependencies]\ntd-bb = { path = \"../td-bb\" }\n\n[workspace]\n");
+        write("td-aa/Cargo.lock", "[[package]]\nname = \"td-aa\"\ndependencies = [\n \"td-bb\",\n]\n\n[[package]]\nname = \"td-bb\"\n");
+        write("td-bb/Cargo.toml", "[package]\nname = \"td-bb\"\n\n[workspace]\n");
+        write("td-bb/Cargo.lock", "[[package]]\nname = \"td-bb\"\n");
+        let locks = dependency_free_locks(&root).expect("a sibling dependency is admitted");
+        for (lock, members) in &locks {
+            assert!(assert_dependency_free(&root, lock, members).is_ok(), "{lock}");
+        }
+        assert!(locks.iter().any(|(lock, members)| {
+            lock == "td-aa/Cargo.lock"
+                && *members == LockMembers::Roster { own: "td-aa".into(), allowed: vec!["td-bb".into()] }
+        }));
+        // The same lock text, from a manifest that reaches an outside copy.
+        write("td-aa/Cargo.toml", "[package]\nname = \"td-aa\"\n\n[dependencies]\ntd-bb = { path = \"../vendor/td-bb\" }\n\n[workspace]\n");
+        assert!(dependency_free_locks(&root).is_err_and(|e| e.contains("td-aa") && e.contains("../vendor/td-bb")));
+        // A declared name that is not on the roster at all.
+        write("td-aa/Cargo.toml", "[package]\nname = \"td-aa\"\n\n[dependencies]\ntd-zz = { path = \"../td-zz\" }\n\n[workspace]\n");
+        assert!(dependency_free_locks(&root).is_err_and(|e| e.contains("`td-zz`")));
+        // Back to the admitted manifest: the two side channels that could
+        // redirect an admitted name are refused before any lock is read.
+        write("td-aa/Cargo.toml", "[package]\nname = \"td-aa\"\n\n[dependencies]\ntd-bb = { path = \"../td-bb\" }\n\n[workspace]\n");
+        assert!(dependency_free_locks(&root).is_ok());
+        write(".cargo/config.toml", "[target.x86_64-unknown-linux-gnu]\nrunner = [\"x\"]\n");
+        assert!(dependency_free_locks(&root).is_ok(), "the runner config is not a redirect");
+        for redirect in [
+            "paths = [\"../vendor/td-bb\"]\n",
+            "\"paths\" = [\"../vendor/td-bb\"]\n",
+            "[paths]\n",
+            "[patch.crates-io]\ntd-bb = { path = \"../vendor/td-bb\" }\n",
+            "[ patch.crates-io ] # spaced\ntd-bb = { path = \"../vendor/td-bb\" }\n",
+            "[\"patch\".crates-io]\ntd-bb = { path = \"../vendor/td-bb\" }\n",
+            "[[patch.unused]]\nname = \"td-bb\"\n",
+            "[patch.\"crates#io\"]\ntd-bb = { path = \"../vendor/td-bb\" }\n",
+            "patch.crates-io.td-bb = { path = \"../vendor/td-bb\" }\n",
+            "[source.crates-io]\nreplace-with = \"vendored\"\n",
+            "include = [\"overrides.toml\"]\n",
+        ] {
+            for name in [".cargo/config.toml", ".cargo/config"] {
+                write(name, redirect);
+                assert!(
+                    dependency_free_locks(&root).is_err_and(|e| e.contains("redirects")),
+                    "{name} {redirect:?} must red"
+                );
+                std::fs::remove_file(root.join(name)).unwrap();
+            }
+        }
+        // Codex's escape: `"paths"` is `paths` once TOML decodes it.
+        write(".cargo/config.toml", "\"pa\\u0074hs\" = [\"../vendor/td-bb\"]\n");
+        assert!(
+            dependency_free_locks(&root).is_err_and(|e| e.contains("escape")),
+            "an escaped key is refused unread"
+        );
+        write(".cargo/config.toml", "[build]\nrustdocflags = \"\"\"\npaths\n\"\"\"\n");
+        assert!(
+            dependency_free_locks(&root).is_err_and(|e| e.contains("multi-line")),
+            "a multi-line string is refused unread"
+        );
+        // A continued array element that happens to say `paths` is a value.
+        write(".cargo/config.toml", "[build]\nrustflags = [\n  \"paths\",\n  \"source\",\n]\n");
+        assert!(dependency_free_locks(&root).is_ok(), "array items are not keys");
+        std::fs::remove_file(root.join(".cargo/config.toml")).unwrap();
+        write("td-aa/.cargo/config.toml", "[build]\n");
+        assert!(
+            dependency_free_locks(&root).is_err_and(|e| e.contains("no .cargo directory")),
+            "a crate-local cargo config is refused"
+        );
+        std::fs::remove_dir_all(root.join("td-aa/.cargo")).unwrap();
+        assert!(dependency_free_locks(&root).is_ok());
+        // A linked FILE is as stray as a plain one, and a dangling link is
+        // nothing; only a linked directory could be rostered, and only under
+        // a roster name — a link elsewhere at the root is not looked at.
+        write("notes.txt", "");
+        write("vendor/keep", "");
+        std::os::unix::fs::symlink("notes.txt", root.join("td-notes.txt")).unwrap();
+        std::os::unix::fs::symlink("missing", root.join("td-missing")).unwrap();
+        std::os::unix::fs::symlink("vendor", root.join("scratch")).unwrap();
+        assert!(root.join("scratch").is_dir(), "the outside link resolves to a directory");
+        assert!(dependency_free_locks(&root).is_ok(), "linked files are skipped");
+        // A link whose target cannot be told apart is refused, not skipped.
+        std::os::unix::fs::symlink("td-loop", root.join("td-loop")).unwrap();
+        assert!(
+            dependency_free_locks(&root).is_err_and(|e| e.contains("could not be inspected")),
+            "a symlink loop is an error"
+        );
+        std::fs::remove_file(root.join("td-loop")).unwrap();
+        write("vendor/td-cc/Cargo.toml", "[package]\nname = \"td-cc\"\n\n[workspace]\n");
+        std::os::unix::fs::symlink("vendor/td-cc", root.join("td-cc")).unwrap();
+        assert!(
+            discover_gate_crates(&root).is_err_and(|e| e.contains("symlink")),
+            "a linked td-* directory is refused, not rostered"
+        );
+        std::fs::remove_dir_all(&root).ok();
     }
 
     /// The roster and the command list are one derived set, and this holds the

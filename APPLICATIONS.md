@@ -4852,8 +4852,10 @@ register only its own assigned identity.
 the application controls.** The **app id is the application's td name** —
 already the launcher key, the store path shape and the state directory —
 so the bus credential names the same thing the rest of §B does instead of
-introducing a second identity. The two crates cannot share a constant,
-being separate dependency-free locks, so td-jail's
+introducing a second identity. The two crates could not share a constant
+when this was written, each being a standalone one-package lock (the gate
+now admits a sibling roster crate by path; folding the copy is its own
+reviewed change), so td-jail's
 `validate_application_name` and td-busd's `valid_application_id` are the
 same language written twice; a td-jail test reads BOTH of td-busd's
 ceilings out of that crate's source rather than restating them, because
@@ -6852,7 +6854,7 @@ packaged selftest, boot oracle — with **network never in the gate**.
    These prove live routed portal exchanges, not that Firefox made them.
 7. **Recipe tests**: every new crate — `td-jail`, `td-busd`, `td-portal`,
    `td-audio` —
-   stays a one-package dependency-free crate and is picked up by
+   stays a dependency-free roster crate and is picked up by
    `builder/src/affected.rs`'s tree-derived gate roster — which happens by
    existing as a `td-*/Cargo.toml`, with its `Cargo.lock` committed; the
    kernel config contains every required option; the real system-image launch
@@ -9616,8 +9618,8 @@ one quality trade, and it can grow. Dates: a civil-date formatter over
 effect. Cache: files under the cache directory, one per item keyed by
 hash, and one state file, in place of `redb`. Terminal: the surface
 td-sh records in UNSAFE.md, raw mode, window size, a readable poll and
-signal dispositions over opaque termios bytes, copied into each crate as
-td's one-package locks require and recorded twice. Patterns: td-txt's
+signal dispositions over opaque termios bytes, copied into each crate, as
+td's then one-package locks required, and recorded twice. Patterns: td-txt's
 engine where tmc's rules take user-written expressions, so that
 configuration contract does not narrow. Base64 by hand; `tempfile`
 replaced by a unique name under the std temporary directory. The

@@ -1048,8 +1048,10 @@ mod tests {
 
     /// Comments out, so that commenting a check out is not a way to pass the
     /// test that pins it. Lifted from `td-jail/src/main.rs`, which arrived at
-    /// it the same way; the two crates are separate dependency-free locks and
-    /// cannot share the helper.
+    /// it the same way; the two crates were separate one-package locks when
+    /// this was written and could not share the helper (the gate now admits a
+    /// sibling roster crate by path; folding the copy is its own reviewed
+    /// change).
     fn without_block_comments(source: &str) -> String {
         let mut out = String::with_capacity(source.len());
         let mut rest = source;

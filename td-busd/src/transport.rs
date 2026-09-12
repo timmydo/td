@@ -3603,9 +3603,10 @@ const MAX_APPLICATION_ID: usize = 32;
 /// wrong in both directions here: it refuses every real td identity, because
 /// a bus name needs a `.` and these do not have one, and it accepts `:1.7`,
 /// which is a unique connection name the broker hands out. td-jail carries
-/// this same grammar in `validate_application_name`; the crates are separate
-/// dependency-free locks, so this is a second copy of one normative rule
-/// rather than a second rule.
+/// this same grammar in `validate_application_name`; the crates were separate
+/// one-package locks when this was written, so this is a second copy of one
+/// normative rule rather than a second rule (the gate now admits a sibling
+/// roster crate by path; folding the copy is its own reviewed change).
 fn valid_application_id(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= MAX_APPLICATION_ID

@@ -3402,8 +3402,9 @@ Host protocol proof must include td-compositor and at least one independent
 Wayland compositor with its real keymap. Distinguish headless model tests,
 fake-server protocol tests, independent-compositor tests, and the full td
 jail/image oracle in every readiness claim. A new standalone crate joins
-td-builder's automatic cargo test/clippy gate and commits its one-package
-`Cargo.lock`. Target recipe/image work also owes the profiler contract.
+td-builder's automatic cargo test/clippy gate and commits a `Cargo.lock`
+listing itself and, at most, the sibling roster crates it depends on by
+path. Target recipe/image work also owes the profiler contract.
 
 ## Independently landable increments
 
