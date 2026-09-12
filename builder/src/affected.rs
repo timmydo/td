@@ -141,7 +141,7 @@ fn local_source_crate(p: &str) -> Option<&'static str> {
     if p.contains("..") {
         return None;
     }
-    ["td-mail", "td-news"]
+    ["td-install-qemu-test", "td-mail", "td-news"]
         .into_iter()
         .find(|name| p.strip_prefix(name).is_some_and(|rest| rest.starts_with('/')))
 }
@@ -2359,7 +2359,7 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     // own seeds, so every path in the tree — tests, documents, the manifest —
     // moves the digest row, and the source paths also take the static-link
     // proof through recipe-checks.
-    for crate_dir in ["td-mail", "td-news"] {
+    for crate_dir in ["td-install-qemu-test", "td-mail", "td-news"] {
         assert_target!(&format!("{crate_dir}/src/main.rs"), "check");
         assert_target!(&format!("{crate_dir}/src/main.rs"), "recipe-checks");
         assert_target!(&format!("{crate_dir}/src/tui/mod.rs"), "recipe-checks");

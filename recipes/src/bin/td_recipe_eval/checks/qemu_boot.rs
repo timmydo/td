@@ -29,6 +29,7 @@
 //! is absent the tool FAILS loudly rather than silently passing, so a green result
 //! always means a real boot happened.
 pub(crate) mod efi;
+pub(crate) mod install;
 pub(crate) mod media;
 pub(crate) mod secret;
 pub(crate) mod update;
@@ -4341,6 +4342,8 @@ fn boot(
 #[derive(Clone, Copy)]
 enum FirmwareAttachment {
     Virtio,
+    /// The ordinary virtio disk carries the native installer fixture serial.
+    InstalledFixture,
     Optical,
     Usb,
 }
@@ -4353,6 +4356,7 @@ enum BootSource<'a> {
         code: &'a Path,
         vars: &'a Path,
         attachment: FirmwareAttachment,
+        installation_target: Option<&'a install::TargetDisk>,
     },
 }
 
@@ -4386,6 +4390,12 @@ fn boot_source(
         attachment: FirmwareAttachment::Optical | FirmwareAttachment::Usb, ..
     }) && plan.disk.as_ref().is_some_and(|disk| !disk.read_only) {
         return Err("optical and USB media oracles require read-only disks".into());
+    }
+    if matches!(source, BootSource::Firmware {
+        installation_target: Some(_),
+        attachment: FirmwareAttachment::Virtio | FirmwareAttachment::InstalledFixture, ..
+    }) {
+        return Err("an installation target requires optical or USB source media".into());
     }
     validate_boot_plan_tokens(plan.extra_append)?;
     if plan.capture_firefox_audio && (!plan.audio || !plan.physical_input) {
@@ -4535,9 +4545,24 @@ fn boot_source(
             }
             _ => {
                 cmd.arg("-drive").arg(drive_arg(disk.path, disk.read_only));
-                cmd.args(["-device", crate::checks::vm_profile::DISK_DEVICE]);
+                if matches!(source, BootSource::Firmware { attachment: FirmwareAttachment::InstalledFixture, .. }) {
+                    cmd.arg("-device").arg(format!("{},serial={}",
+                        crate::checks::vm_profile::DISK_DEVICE, install::protocol::TARGET_SERIAL));
+                } else {
+                    cmd.args(["-device", crate::checks::vm_profile::DISK_DEVICE]);
+                }
             }
         }
+    }
+    if let BootSource::Firmware { installation_target: Some(target), .. } = source {
+        cmd.arg("-drive").arg(install::target_drive_arg(target));
+        cmd.arg("-device").arg(format!(
+            "{}{},serial={}",
+            crate::checks::vm_profile::DISK_DEVICE
+                .trim_end_matches(crate::checks::vm_profile::DRIVE_ID),
+            install::TARGET_DRIVE_ID,
+            install::protocol::TARGET_SERIAL,
+        ));
     }
     let mut child = cmd
         .stdin(Stdio::null())

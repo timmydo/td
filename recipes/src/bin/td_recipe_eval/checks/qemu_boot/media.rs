@@ -32,6 +32,7 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
                 code: &code,
                 vars: &vars,
                 attachment,
+                installation_target: None,
             },
             BootPlan {
                 disk: Some(BootDisk {
@@ -63,7 +64,7 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
     Ok(())
 }
 
-fn write_image(path: &Path, kernel: &Path, initramfs: &Path) -> Result<(), String> {
+pub(super) fn write_image(path: &Path, kernel: &Path, initramfs: &Path) -> Result<(), String> {
     let (kernel, kernel_len) = efi::input(kernel)?;
     let (initramfs, initramfs_len) = efi::input(initramfs)?;
     let image = iso9660::build(&iso9660::Volume {
@@ -183,6 +184,7 @@ mod tests {
                     code: absent,
                     vars: absent,
                     attachment,
+                    installation_target: None,
                 },
                 BootPlan {
                     disk: Some(BootDisk {

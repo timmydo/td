@@ -1817,7 +1817,7 @@ mod tests {
     ];
     const SELF_HOSTED_PHASE_MARKERS: [&str; 3] =
         ["rust-toolchain", "gcc-x86-64-self", "binutils-x86-64-self"];
-    const POST_BOOTSTRAP_PROTECTED_INPUT_EXCEPTIONS: [(&str, &str); 8] = [
+    const POST_BOOTSTRAP_PROTECTED_INPUT_EXCEPTIONS: [(&str, &str); 10] = [
         // Identity/codegen audits deliberately look back across the boundary.
         ("rust-userland-auto-test", "rust-stage0"),
         ("gcc-x86-64-self-test", "gcc-x86-64-native"),
@@ -1834,6 +1834,10 @@ mod tests {
         // belongs on the bootstrap side; nothing about it moves post-boundary,
         // so the consumer declares the edge instead.
         ("td-install-test", "btrfs-progs-x86-64"),
+        // The native installation oracle boots this kernel and exercises the
+        // same approved formatter inside its disposable guest.
+        ("td-install-qemu-test", "linux-x86-64"),
+        ("td-install-qemu-test", "btrfs-progs-x86-64"),
         // Rebuild GNU Make once with the final compiler. The preceding Make is
         // only the build driver; later packages consume make-x86-64-self.
         // The frozen UAPI input is a fixed-output source governed by the seed

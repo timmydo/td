@@ -397,6 +397,11 @@ pub fn qemu_boot_media_cli(args: &[String]) -> Result<(), String> {
     qemu_kernel_cli(args, "qemu-boot-media", &[], crate::checks::qemu_boot::media::run)
 }
 
+/// Install a signed tiny fixture inside QEMU, then boot without its media.
+pub fn qemu_install_cli(args: &[String]) -> Result<(), String> {
+    qemu_kernel_cli(args, "qemu-install", &["td-install-qemu-test"], crate::checks::qemu_boot::install::run)
+}
+
 fn qemu_kernel_cli(
     args: &[String],
     command: &str,
@@ -7986,7 +7991,7 @@ chmod 755 '{}'
         }
         assert_eq!(
             kernel_delegates,
-            ["qemu_boot_cli", "qemu_boot_uefi_cli", "qemu_boot_media_cli"].into_iter().collect()
+            ["qemu_boot_cli", "qemu_boot_uefi_cli", "qemu_boot_media_cli", "qemu_install_cli"].into_iter().collect()
         );
         for delegate in kernel_delegates {
             assert!(!direct.contains(delegate) && !through_run.contains(delegate),

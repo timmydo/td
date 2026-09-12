@@ -35,6 +35,7 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
                 code: &code,
                 vars: &vars,
                 attachment: FirmwareAttachment::Virtio,
+                installation_target: None,
             },
             BootPlan {
                 disk: Some(BootDisk {

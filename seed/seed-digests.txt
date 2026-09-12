@@ -83,8 +83,9 @@ sed-mesboot-source 331jp1sj5iyjhnb35391k2sjjkqrawk1-sed-mesboot-source
 sed-mesboot0-source i6y1c09pssxjdc60wmdf96vf11hxa56c-sed-mesboot0-source
 stage0-source ma16im40lnb5dldxwglzzs7iqpzfiz4m-stage0-source
 tcc-source mhwyc6lcd16pxbln8kwvc4ia5zisf8fn-tcc-source
+td-install-qemu-test-source 6da69m0s2w7vrp7ds3bi83cjwkyddv7d-td-install-qemu-test-source
 td-mail-source ax2l49641vrrc9p76m7fbj1xya0qyqw1-td-mail-source
-td-net-source i1k23i24vdln9k8yivzg93f37x0vp088-td-net-source
+td-net-source ykh2gp64rajm3yn1gl77ly54788j3776-td-net-source
 td-news-source r5cycw0wjyg12vydavg0s4fp9dfs35ss-td-news-source
 util-linux-libs-x86-64-source 06vhdikawhfyswkhrxs905cm3qbpqj4r-util-linux-libs-x86-64-source
 uutils-source rkmjdm6nicq3js0xhdyqk4rl3r9ki4xv-uutils-source

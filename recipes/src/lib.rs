@@ -32,6 +32,9 @@ pub mod permissions {
 #[path = "../../td-boot/src/protocol.rs"]
 #[allow(dead_code)]
 pub mod td_boot_protocol;
+// Keep the native guest oracle contract inside the catalog dependency scan.
+#[path = "../../td-install-qemu-test/src/protocol.rs"]
+pub mod td_install_qemu_protocol;
 // The boot oracle and target evidence command consume one literal; loading the
 // crate-owned file here keeps the image and host check from drifting.
 pub mod source_pins;

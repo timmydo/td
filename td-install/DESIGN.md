@@ -1001,6 +1001,25 @@ format Btrfs, run installation inside a guest, or boot a signed system
 deployment. The signed selector and full deployment oracle described
 below remain required.
 
+`td-recipe-eval qemu-install` adds a native guest installation fixture,
+[td-install-qemu-test](../td-install-qemu-test/DESIGN.md). Its source-built
+PID 1 runs td-install layout and signed volume publication on an exclusively
+created QEMU virtio target. The same private ISO is exercised as optical and
+USB media. After installation, the host detaches media and cold-boots only
+the destination, requiring authenticated selector kexec, a read from the
+installed EROFS payload, persistent Btrfs state across two boots, and
+successful deployment acknowledgement. A second public key must refuse the
+otherwise identical signed source without an installation-success marker.
+The private signing key never enters the guest or a derivation.
+
+The fixture accepts no operator destination and is absent from system and
+installer profiles. Its serial-based device identification and partition-two
+convention are diagnostic scaffolding, not production volume discovery or
+consent. Its payload fits in the initramfs: Linux ISO9660 mounting, full
+system installation, machine settings and compositor evidence remain
+required by INSTALLER.md. This fixture does not enforce selector/volume key
+agreement for arbitrary caller-provided inputs.
+
 The oracle signs with a **per-run throwaway key**: generate a keypair, sign
 the staged bundle, build `td-boot` pinned to that run's public key, boot, and
 require the machine to reach its target. This exercises the entire
