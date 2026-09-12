@@ -213,6 +213,13 @@ installation exercises upstream fetching and the cold build path. Reports
 must identify which fixture was supplied rather than imply that a warm
 pass rebuilt the entire bootstrap ladder.
 
+On the first boot, the oracle waits up to ten minutes for the initializer
+to publish the checkout's `update` symlink. This wait also respects the
+overall deadline: boot health does not require source initialization.
+Existing checkouts are immediately eligible; missing source companions or
+failed initialization time out. The oracle does not retry initialization,
+change service ordering, or reset existing source.
+
 Inside the disposable overlay, the oracle changes the updater's HELP text
 to a unique marker and leaves a unique user file. It runs `./update`,
 waits for the installation request, uses QMP physical keys to open secure

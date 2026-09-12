@@ -411,6 +411,28 @@ impl Guest {
         Ok(output)
     }
 
+    fn wait_for_source(&mut self) -> Result<()> {
+        let original_deadline = self.deadline;
+        self.deadline = original_deadline.min(Instant::now() + Duration::from_secs(600));
+        let result: Result<()> = (|| {
+            loop {
+                if Instant::now() >= self.deadline {
+                    return Err("release source initialization timed out".into());
+                }
+                let state = self.scalar(
+                    "if test -L /var/home/tester/src/td/update; then echo source-ready; else echo source-pending; fi",
+                    |line| matches!(line, "source-ready" | "source-pending"),
+                )?;
+                if state == "source-ready" {
+                    return Ok(());
+                }
+                thread::sleep(Duration::from_secs(1));
+            }
+        })();
+        self.deadline = original_deadline;
+        result.map_err(|error| format!("wait for release source initialization: {error}"))
+    }
+
     fn scalar(&mut self, command: &str, valid: impl Fn(&str) -> bool) -> Result<String> {
         let mut output = self
             .command(command)?
@@ -824,6 +846,13 @@ pub(crate) fn run_cli(args: &[String]) -> Result<()> {
         .collect::<String>();
     let token = format!("td-update-oracle-{nonce}");
     let mut guest = Guest::start(&options, 1, deadline)?;
+    println!("[qemu-update] waiting for the guest source checkout");
+    let source_wait = Instant::now();
+    guest.wait_for_source()?;
+    println!(
+        "[qemu-update] guest source checkout ready after {}s",
+        source_wait.elapsed().as_secs()
+    );
     guest.command("cd /var/home/tester/src/td && test -L update && test ! -r /var/lib/td-deploy/deployment.pk8")?;
     let initial = selector(&mut guest, "current")?;
     let previous = selector(&mut guest, "previous")?;
