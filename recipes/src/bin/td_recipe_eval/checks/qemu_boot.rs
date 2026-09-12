@@ -29,6 +29,7 @@
 //! is absent the tool FAILS loudly rather than silently passing, so a green result
 //! always means a real boot happened.
 pub(crate) mod efi;
+pub(crate) mod media;
 pub(crate) mod secret;
 pub(crate) mod update;
 
@@ -4337,10 +4338,22 @@ fn boot(
     )
 }
 
+#[derive(Clone, Copy)]
+enum FirmwareAttachment {
+    Virtio,
+    Optical,
+    Usb,
+}
+
 /// Firmware reads its kernel/initrd from the disk carried by BootPlan.
+#[derive(Clone, Copy)]
 enum BootSource<'a> {
     Direct { kernel: &'a Path, initramfs: &'a Path },
-    Firmware { code: &'a Path, vars: &'a Path },
+    Firmware {
+        code: &'a Path,
+        vars: &'a Path,
+        attachment: FirmwareAttachment,
+    },
 }
 
 fn boot_with_timeout(
@@ -4368,6 +4381,11 @@ fn boot_source(
         && (!plan.extra_append.is_empty() || plan.disk.is_none())
     {
         return Err("firmware boot requires a disk and cannot inject a command line".into());
+    }
+    if matches!(source, BootSource::Firmware {
+        attachment: FirmwareAttachment::Optical | FirmwareAttachment::Usb, ..
+    }) && plan.disk.as_ref().is_some_and(|disk| !disk.read_only) {
+        return Err("optical and USB media oracles require read-only disks".into());
     }
     validate_boot_plan_tokens(plan.extra_append)?;
     if plan.capture_firefox_audio && (!plan.audio || !plan.physical_input) {
@@ -4466,7 +4484,7 @@ fn boot_source(
             cmd.arg("-kernel").arg(kernel).arg("-initrd").arg(initramfs)
                 .args(["-append", &append]);
         }
-        BootSource::Firmware { code, vars } => {
+        BootSource::Firmware { code, vars, .. } => {
             cmd.arg("-drive").arg(efi::pflash_arg(code, 0, true));
             cmd.arg("-drive").arg(efi::pflash_arg(vars, 1, false));
         }
@@ -4499,8 +4517,27 @@ fn boot_source(
     // drive_arg comma-doubles the image path so a scratch dir with a literal comma in
     // its path can't be misparsed as an extra -drive key=value pair.
     if let Some(disk) = plan.disk {
-        cmd.arg("-drive").arg(drive_arg(disk.path, disk.read_only));
-        cmd.args(["-device", crate::checks::vm_profile::DISK_DEVICE]);
+        match source {
+            BootSource::Firmware {
+                attachment: FirmwareAttachment::Optical, ..
+            } => {
+                cmd.arg("-drive").arg(media::optical_drive_arg(disk.path));
+            }
+            BootSource::Firmware {
+                attachment: FirmwareAttachment::Usb, ..
+            } => {
+                cmd.args(["-device", "qemu-xhci,id=media-xhci"]);
+                cmd.arg("-drive").arg(drive_arg(disk.path, true));
+                cmd.arg("-device").arg(format!(
+                    "usb-storage,bus=media-xhci.0,drive={},removable=on",
+                    crate::checks::vm_profile::DRIVE_ID,
+                ));
+            }
+            _ => {
+                cmd.arg("-drive").arg(drive_arg(disk.path, disk.read_only));
+                cmd.args(["-device", crate::checks::vm_profile::DISK_DEVICE]);
+            }
+        }
     }
     let mut child = cmd
         .stdin(Stdio::null())

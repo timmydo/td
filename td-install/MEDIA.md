@@ -50,3 +50,23 @@ short reads and synchronize publication. These format APIs grant no device
 access or erase authorization. A flashed image on a larger physical device
 has a backup GPT at the image boundary; v1's QEMU attachment uses the image's
 exact size, and hardware compatibility remains a separate milestone.
+
+## Repeatable firmware oracle
+
+`td-recipe-eval qemu-boot-media` builds the declared source-built kernel
+and tiny diagnostic initramfs and assembles one disposable hybrid image
+with the Rust ISO and FAT writers. It boots those same bytes first as
+optical media, then as USB mass storage behind an xHCI controller. Both
+boots use cold private firmware variables and read-only media. Networking
+is disabled; firmware loads the kernel and initrd from the image without
+QEMU kernel injection or a command-line override. The
+firmware discovery and configuration requirements are the same as
+`qemu-boot-uefi` in DESIGN.md.
+
+Both attachments must reach the diagnostic initramfs's actual userspace
+marker. This proves firmware loading of the shared ESP, kernel and initrd;
+it does not prove the kernel can mount the ISO, authenticate a deployment,
+run the compositor or boot an installed disk. Those remain live-profile
+and installed-session activation requirements. The command accepts no
+output or device destination; exclusive files in its private scratch
+directory are removed on completion.

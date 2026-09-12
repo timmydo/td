@@ -36,6 +36,7 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
             BootSource::Firmware {
                 code: &code,
                 vars: &vars,
+                attachment: FirmwareAttachment::Virtio,
             },
             BootPlan {
                 disk: Some(BootDisk {
@@ -89,7 +90,7 @@ fn missing_entry_observed(console: &str) -> bool {
     })
 }
 
-fn firmware(qemu: &str) -> Result<(PathBuf, PathBuf), String> {
+pub(super) fn firmware(qemu: &str) -> Result<(PathBuf, PathBuf), String> {
     match (
         env::var_os("TD_QEMU_EFI_CODE"),
         env::var_os("TD_QEMU_EFI_VARS"),
@@ -133,7 +134,7 @@ fn checked_firmware(code: PathBuf, vars: PathBuf) -> Result<(PathBuf, PathBuf), 
     Ok((code, vars))
 }
 
-fn input(path: &Path) -> Result<(File, u64), String> {
+pub(super) fn input(path: &Path) -> Result<(File, u64), String> {
     let file = File::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
     let meta = file
         .metadata()
@@ -147,7 +148,7 @@ fn input(path: &Path) -> Result<(File, u64), String> {
     Ok((file, meta.len()))
 }
 
-fn copy_input(source: &Path, destination: &Path) -> Result<(), String> {
+pub(super) fn copy_input(source: &Path, destination: &Path) -> Result<(), String> {
     let (file, len) = input(source)?;
     let mut out = OpenOptions::new()
         .write(true)

@@ -384,16 +384,24 @@ pub fn qemu_secret_system_cli(args: &[String]) -> Result<(), String> {
 /// the sandbox: it builds linux-x86-64 (bzImage + initramfs) and boots it under
 /// host qemu, asserting the userland marker reaches ttyS0.
 pub fn qemu_boot_cli(args: &[String]) -> Result<(), String> {
-    qemu_kernel_cli(args, false)
+    qemu_kernel_cli(args, "qemu-boot", crate::checks::qemu_boot::run)
 }
 
 /// Cold host-firmware oracle; no direct kernel or initrd injection.
 pub fn qemu_boot_uefi_cli(args: &[String]) -> Result<(), String> {
-    qemu_kernel_cli(args, true)
+    qemu_kernel_cli(args, "qemu-boot-uefi", crate::checks::qemu_boot::efi::run)
 }
 
-fn qemu_kernel_cli(args: &[String], firmware: bool) -> Result<(), String> {
-    let command = if firmware { "qemu-boot-uefi" } else { "qemu-boot" };
+/// Boot one unchanged ISO through optical and USB firmware discovery.
+pub fn qemu_boot_media_cli(args: &[String]) -> Result<(), String> {
+    qemu_kernel_cli(args, "qemu-boot-media", crate::checks::qemu_boot::media::run)
+}
+
+fn qemu_kernel_cli(
+    args: &[String],
+    command: &str,
+    run: fn(&RecipeCheckRunner) -> Result<(), String>,
+) -> Result<(), String> {
     const STEM: &str = "linux-x86-64";
     let stem = args.first().map(String::as_str).unwrap_or(STEM);
     if stem != STEM {
@@ -414,11 +422,7 @@ fn qemu_kernel_cli(args: &[String], firmware: bool) -> Result<(), String> {
     let runner = RecipeCheckRunner::new(root, &scratch_name)?.with_streamed_progress();
     warm_operator_inputs(&runner, &targets);
     let _lock = lock_ladder_for_run(&runner)?;
-    if firmware {
-        crate::checks::qemu_boot::efi::run(&runner)
-    } else {
-        crate::checks::qemu_boot::run(&runner)
-    }
+    run(&runner)
 }
 
 /// `td-recipe-eval qemu-boot-erofs [linux-x86-64]` — the read-only-root boot proof
@@ -7980,7 +7984,7 @@ chmod 755 '{}'
         }
         assert_eq!(
             kernel_delegates,
-            ["qemu_boot_cli", "qemu_boot_uefi_cli"].into_iter().collect()
+            ["qemu_boot_cli", "qemu_boot_uefi_cli", "qemu_boot_media_cli"].into_iter().collect()
         );
         for delegate in kernel_delegates {
             assert!(!direct.contains(delegate) && !through_run.contains(delegate),
