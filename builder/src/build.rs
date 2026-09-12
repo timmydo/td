@@ -207,8 +207,8 @@ fn single_subdir(dir: &str) -> Result<String, String> {
 ///     It trips only when the identical line is STILL ARRIVING after this much
 ///     wall-clock (the run of consecutive identical lines has lasted the window),
 ///     which distinguishes a chatty spin from legit high-volume output: a healthy
-///     phase PROGRESSES (different lines reset the run) or COMPLETES (the burst
-///     ends) long before the window — `tar xf` finishes, a verbose `make` prints
+///     phase PROGRESSES (a changed line on either stream resets the window) or
+///     COMPLETES (the burst ends) — `tar xf` finishes, a verbose `make` prints
 ///     varied lines — whereas a broken tool keeps emitting the one line forever.
 ///     This closes the #339 residual: a #292-shape spin nested INSIDE a `make`
 ///     phase (a bundled sub-`./configure` the Makefile re-runs) that spins
@@ -309,10 +309,12 @@ struct StreamWatch {
     last_line: Vec<u8>,
     repeats: u32,
     /// ms (relative to the supervise `start`) when the CURRENT run of consecutive
-    /// identical lines began — reset whenever the line changes. Feeds the
-    /// `repeat_secs` duration bound: `now - run_start_ms` is how long the same
-    /// line has been arriving without interruption.
+    /// identical lines began — reset whenever this stream's line changes.
     run_start_ms: u64,
+    /// Arrival of the latest complete line; silence alone cannot trip repeats.
+    last_line_ms: u64,
+    /// First repeat observation after the latest progress on either stream.
+    duration_start_ms: Option<u64>,
     /// Last few DISTINCT lines, clipped, for the kill diagnostic (a repeat is
     /// already quoted by the trip reason; duplicating it 5x buries context).
     tail: std::collections::VecDeque<String>,
@@ -324,6 +326,8 @@ impl StreamWatch {
             last_line: Vec::new(),
             repeats: 0,
             run_start_ms: 0,
+            last_line_ms: 0,
+            duration_start_ms: None,
             tail: std::collections::VecDeque::new(),
         }
     }
@@ -351,20 +355,10 @@ fn record_why(why: &Mutex<Option<String>>, reason: impl FnOnce() -> String) {
     }
 }
 
-/// Account one complete line: repeat counting + the distinct-line tail, then the
-/// two same-line spin bounds. `now_ms` is ms since the supervise `start` (the
-/// time this line arrived). A trip reason is recorded (once); the poll loop does
-/// the killing, so kill and reap stay ordered in one thread and a stale pgid is
-/// never signalled.
-///
-///   * COUNT bound (`count_limit`, configure): `count_limit` identical lines in
-///     a row. Fast — a healthy configure never emits that many.
-///   * DURATION bound (`repeat_ms`, `make` phase): the identical line is STILL
-///     arriving `repeat_ms` after the run began. Robust to legit high-volume
-///     output (`tar xf`'s per-member warning) because that COMPLETES — the line
-///     stops arriving — long before the window; only a real spin keeps the one
-///     line coming for the whole duration. `repeats >= 2` gates out a lone line
-///     (a single line that then goes silent is the silence bound's job).
+/// Account one complete line and the configure count bound. Duration is checked
+/// by the poll loop against both streams' latest state, so progress observed
+/// after a warning cannot leave a stale, irreversible duration trip behind.
+/// `now_ms` is the chunk's arrival time relative to the supervise start.
 ///
 /// `keep_tail` records the distinct-line diagnostic tail; only the stderr
 /// watcher's tail is ever read (it feeds the kill diagnostic), so stdout passes
@@ -373,12 +367,12 @@ fn account_line(
     st: &mut StreamWatch,
     line: &[u8],
     count_limit: u32,
-    repeat_ms: u64,
     now_ms: u64,
     keep_tail: bool,
     stream: &str,
     why: &Mutex<Option<String>>,
 ) {
+    st.last_line_ms = now_ms;
     // `repeats == 0` is the initial state (no line accounted yet); force the
     // first line down the run-start path so its `run_start_ms` is seeded — an
     // empty first line must not be mistaken for a repeat of the empty sentinel.
@@ -389,6 +383,7 @@ fn account_line(
         st.last_line.extend_from_slice(line);
         st.repeats = 1;
         st.run_start_ms = now_ms;
+        st.duration_start_ms = Some(now_ms);
         if keep_tail {
             if st.tail.len() >= 5 {
                 st.tail.pop_front();
@@ -404,18 +399,47 @@ fn account_line(
                 clip_line(line)
             )
         });
-        return;
     }
-    if repeat_ms > 0 && st.repeats >= 2 && now_ms.saturating_sub(st.run_start_ms) >= repeat_ms {
-        let repeats = st.repeats;
-        record_why(why, || {
-            format!(
-                "the same {stream} line kept arriving for {} ({repeats}x — a chatty spin, likely a persistently-failing tool in a make-nested retry loop): {}",
-                fmt_ms(repeat_ms),
-                clip_line(line)
-            )
-        });
+}
+
+/// A repeating line must arrive a full window after the last changed line on
+/// EITHER stream. Two constant streams still trip; varied output is progress.
+/// This is a same-line heuristic, not detection of arbitrary repeating cycles.
+fn duration_reason(st: &mut StreamWatch, progress_ms: u64, repeat_ms: u64, stream: &str) -> Option<String> {
+    if repeat_ms == 0 {
+        return None;
     }
+    let start = match st.duration_start_ms {
+        Some(start) if start >= progress_ms => start,
+        _ => {
+            // Old warnings cannot span progress on the other stream. Start a
+            // fresh window at the first post-progress observation, even when
+            // that warning arrives after a long, quiet compilation.
+            st.duration_start_ms = (st.repeats > 0 && st.last_line_ms >= progress_ms)
+                .then_some(st.last_line_ms);
+            return None;
+        }
+    };
+    if st.repeats < 2 || st.last_line_ms.saturating_sub(start) < repeat_ms {
+        return None;
+    }
+    Some(format!(
+        "the same {stream} line kept arriving for {} without changed lines on either stream (a possible retry loop): {}",
+        fmt_ms(repeat_ms), clip_line(&st.last_line)
+    ))
+}
+
+fn repeat_reason(sup: &Supervise, repeat_ms: u64) -> Option<String> {
+    if repeat_ms == 0 {
+        return None;
+    }
+    // Readers take only their own stream lock. One snapshot avoids combining
+    // an old progress clock with newer repeated output from the other stream.
+    let mut out = sup.out_watch.lock().ok()?;
+    let mut err = sup.err_watch.lock().ok()?;
+    let progress_ms = out.run_start_ms.max(err.run_start_ms);
+    duration_reason(&mut out, progress_ms, repeat_ms, "stdout")
+        .or_else(|| duration_reason(&mut err, progress_ms, repeat_ms, "stderr"))
 }
 
 /// Tee one child stream to `sink`, updating the shared activity clock; when
@@ -423,14 +447,14 @@ fn account_line(
 /// always — its tail feeds the silence-kill diagnostic — and stdout too when
 /// either repeat bound is set, so a retry spin printing to stdout cannot escape
 /// the watchdog by resetting the silence clock). `watch` carries `(state,
-/// count_limit, repeat_ms, keep_tail, stream)`. Chunk-based (not read_until): a
+/// count_limit, keep_tail, stream)`. Chunk-based (not read_until): a
 /// `\r`-progress stream with no newline still counts as activity, and an
 /// unterminated line cannot grow unboundedly.
 fn tee_stream(
     mut src: impl std::io::Read,
     mut sink: impl std::io::Write,
     sup: &Supervise,
-    watch: Option<(&Mutex<StreamWatch>, u32, u64, bool, &str)>,
+    watch: Option<(&Mutex<StreamWatch>, u32, bool, &str)>,
 ) {
     let mut buf = [0u8; 8192];
     let mut pending: Vec<u8> = Vec::new();
@@ -447,9 +471,7 @@ fn tee_stream(
         let elapsed = u64::try_from(sup.start.elapsed().as_millis()).unwrap_or(u64::MAX);
         sup.last_activity_ms.store(elapsed, Ordering::Relaxed);
         let chunk = buf.get(..n).unwrap_or(&buf);
-        let _ = sink.write_all(chunk);
-        let _ = sink.flush();
-        if let Some((watch, count_limit, repeat_ms, keep_tail, stream)) = watch {
+        if let Some((watch, count_limit, keep_tail, stream)) = watch {
             if let Ok(mut st) = watch.lock() {
                 // Linear scan of the chunk; only a trailing partial line is
                 // carried over (no per-line allocation, no re-scan). `elapsed`
@@ -458,10 +480,10 @@ fn tee_stream(
                 while let Some(nl) = rest.iter().position(|&b| b == b'\n') {
                     let line = rest.get(..nl).unwrap_or_default();
                     if pending.is_empty() {
-                        account_line(&mut st, line, count_limit, repeat_ms, elapsed, keep_tail, stream, &sup.why);
+                        account_line(&mut st, line, count_limit, elapsed, keep_tail, stream, &sup.why);
                     } else {
                         pending.extend_from_slice(line);
-                        account_line(&mut st, &pending, count_limit, repeat_ms, elapsed, keep_tail, stream, &sup.why);
+                        account_line(&mut st, &pending, count_limit, elapsed, keep_tail, stream, &sup.why);
                         pending.clear();
                     }
                     rest = rest.get(nl.saturating_add(1)..).unwrap_or_default();
@@ -475,6 +497,8 @@ fn tee_stream(
                 }
             }
         }
+        let _ = sink.write_all(chunk);
+        let _ = sink.flush();
     }
 }
 
@@ -547,7 +571,7 @@ fn run_cmd(
             // spin printing to stdout must not escape by resetting the silence
             // clock. No tail kept: only err_watch.tail feeds the diagnostic.
             let w = if count_limit > 0 || repeat_ms > 0 {
-                Some((&sup.out_watch, count_limit, repeat_ms, false, "stdout"))
+                Some((&sup.out_watch, count_limit, false, "stdout"))
             } else {
                 None
             };
@@ -563,7 +587,7 @@ fn run_cmd(
                 child_err,
                 std::io::stderr(),
                 &sup,
-                Some((&sup.err_watch, count_limit, repeat_ms, true, "stderr")),
+                Some((&sup.err_watch, count_limit, true, "stderr")),
             );
             sup.err_done.store(true, Ordering::Relaxed);
         })
@@ -665,6 +689,9 @@ fn run_cmd(
                             }
                         }
                     }
+                }
+                if let Some(reason) = repeat_reason(&sup, repeat_ms) {
+                    record_why(&sup.why, || reason);
                 }
                 let why = sup.why.lock().ok().and_then(|w| w.clone());
                 if let Some(why) = why {
@@ -7784,6 +7811,70 @@ mod tests {
     }
 
     #[test]
+    fn watchdog_spares_repeated_warnings_while_the_other_stream_progresses() {
+        let (sh, envs) = sh_and_env();
+        for redirect in ["", " >&2"] {
+            let warning_redirect = if redirect.is_empty() { " >&2" } else { "" };
+            let script = format!(
+                "i=0; while [ \"$i\" -lt 20 ]; do \
+                 echo compiling-$i{redirect}; echo 'ar: u modifier ignored'{warning_redirect}; \
+                 i=$((i+1)); sleep 0.05; done"
+            );
+            run_cmd(&sh, &["-c", &script], ".", &envs, &w(0, 0, 400))
+                .expect("changing output on either stream must spare repeated warnings");
+        }
+    }
+
+    #[test]
+    fn watchdog_duration_resumes_after_cross_stream_progress_stops() {
+        let (sh, envs) = sh_and_env();
+        let script = "i=0; while [ \"$i\" -lt 12 ]; do \
+                      echo compiling-$i; echo warning >&2; i=$((i+1)); sleep 0.05; done; \
+                      while :; do echo compiling-stuck; echo warning >&2; sleep 0.05; done";
+        let start = Instant::now();
+        let err = run_cmd(&sh, &["-c", script], ".", &envs, &w(0, 0, 400))
+            .expect_err("two constant streams must trip once progress stops");
+        assert!(start.elapsed() < Duration::from_secs(30), "{err}");
+        assert!(err.contains("kept arriving for 400ms"), "{err}");
+        assert!(err.contains("without changed lines on either stream"), "{err}");
+    }
+
+    #[test]
+    fn duration_window_uses_recent_progress_and_requires_new_repeats() {
+        let why = Mutex::new(None);
+        let mut err = StreamWatch::new();
+        account_line(&mut err, b"warning", 0, 0, true, "stderr", &why);
+        account_line(&mut err, b"warning", 0, 500, true, "stderr", &why);
+        assert!(duration_reason(&mut err, 0, 300, "stderr").is_some());
+        // Progress after a repeat clears its candidate before the poll acts.
+        assert!(duration_reason(&mut err, 600, 300, "stderr").is_none());
+        account_line(&mut err, b"warning", 0, 899, true, "stderr", &why);
+        assert!(duration_reason(&mut err, 600, 300, "stderr").is_none());
+        account_line(&mut err, b"warning", 0, 900, true, "stderr", &why);
+        assert!(duration_reason(&mut err, 600, 300, "stderr").is_none());
+        account_line(&mut err, b"warning", 0, 1199, true, "stderr", &why);
+        assert!(duration_reason(&mut err, 600, 300, "stderr").is_some());
+        assert!(duration_reason(&mut err, 600, 0, "stderr").is_none());
+        assert!(why.lock().unwrap().is_none(), "readers must not latch duration trips");
+    }
+
+    #[test]
+    fn duration_window_does_not_count_warnings_before_cross_stream_progress() {
+        let why = Mutex::new(None);
+        let mut err = StreamWatch::new();
+        account_line(&mut err, b"warning", 0, 0, true, "stderr", &why);
+        account_line(&mut err, b"warning", 0, 100, true, "stderr", &why);
+        // Other-stream progress at 200, then a long quiet compile. Its first
+        // warning and a short burst must not inherit the pre-progress window.
+        account_line(&mut err, b"warning", 0, 2000, true, "stderr", &why);
+        assert!(duration_reason(&mut err, 200, 300, "stderr").is_none());
+        account_line(&mut err, b"warning", 0, 2299, true, "stderr", &why);
+        assert!(duration_reason(&mut err, 200, 300, "stderr").is_none());
+        account_line(&mut err, b"warning", 0, 2300, true, "stderr", &why);
+        assert!(duration_reason(&mut err, 200, 300, "stderr").is_some());
+    }
+
+    #[test]
     fn watchdog_spares_a_healthy_high_volume_repeating_phase() {
         // The false-kill guard (#339): a healthy phase may print the SAME line at
         // high volume — `tar xf` of a many-member pax tarball emits an identical
@@ -7825,15 +7916,17 @@ mod tests {
         //     line at t=1100 (1100 - 0 >= 300) trips.
         let why = Mutex::new(None);
         let mut st = StreamWatch::new();
-        account_line(&mut st, b"", 0, 300, 1000, true, "stderr", &why);
+        account_line(&mut st, b"", 0, 1000, true, "stderr", &why);
         assert_eq!(
             (st.repeats, st.run_start_ms),
             (1, 1000),
             "empty first line starts a run seeded at its arrival, not t=0"
         );
-        account_line(&mut st, b"", 0, 300, 1100, true, "stderr", &why);
+        account_line(&mut st, b"", 0, 1100, true, "stderr", &why);
         assert_eq!(st.repeats, 2);
-        assert!(why.lock().unwrap().is_none(), "100ms < 300ms window must not trip");
+        assert!(duration_reason(&mut st, 0, 300, "stderr").is_none());
+        account_line(&mut st, b"", 0, 1300, true, "stderr", &why);
+        assert!(duration_reason(&mut st, 0, 300, "stderr").is_some());
 
         // (2) keep_tail gates the distinct-line tail: the stdout watcher passes
         //     false, so a verbose build allocates no clip_line String per line;
@@ -7841,12 +7934,12 @@ mod tests {
         //     Verified red: without the gate stdout would keep a 2-entry tail.
         let why2 = Mutex::new(None);
         let mut sout = StreamWatch::new();
-        account_line(&mut sout, b"line-a", 0, 300, 0, false, "stdout", &why2);
-        account_line(&mut sout, b"line-b", 0, 300, 0, false, "stdout", &why2);
+        account_line(&mut sout, b"line-a", 0, 0, false, "stdout", &why2);
+        account_line(&mut sout, b"line-b", 0, 0, false, "stdout", &why2);
         assert!(sout.tail.is_empty(), "keep_tail=false keeps no diagnostic tail");
         let mut serr = StreamWatch::new();
-        account_line(&mut serr, b"e-a", 0, 300, 0, true, "stderr", &why2);
-        account_line(&mut serr, b"e-b", 0, 300, 0, true, "stderr", &why2);
+        account_line(&mut serr, b"e-a", 0, 0, true, "stderr", &why2);
+        account_line(&mut serr, b"e-b", 0, 0, true, "stderr", &why2);
         assert_eq!(serr.tail.len(), 2, "keep_tail=true records the distinct-line tail");
     }
 
