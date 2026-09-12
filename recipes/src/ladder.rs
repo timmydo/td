@@ -14,9 +14,7 @@
 
 use crate::types::{Recipe, Step, TextEdit};
 
-/// Removable-media EFI stub loads this 8.3 path on its own filesystem.
-pub const EFI_INITRD_PATH: &str = r"\EFI\BOOT\INITRD";
-pub const EFI_BOOT_FILE: &str = "BOOTX64.EFI";
+pub use crate::td_boot_protocol::{EFI_BOOT_FILE, EFI_INITRD_PATH};
 pub fn efi_default_cmdline() -> String {
     // Linux's EFI loader normalizes slashes; td-boot refuses backslashes.
     let path = EFI_INITRD_PATH.replace('\\', "/");

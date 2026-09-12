@@ -86,6 +86,12 @@ pub const VOLUME_CHANNEL_DIR: &str = "td/incoming";
 pub const CURRENT_SLOT: &str = "current";
 #[allow(dead_code)]
 pub const PREVIOUS_SLOT: &str = "previous";
+// Fixed removable-media entry shared by the kernel recipe and installer.
+#[allow(dead_code)]
+pub const EFI_BOOT_FILE: &str = "BOOTX64.EFI";
+#[allow(dead_code)]
+pub const EFI_INITRD_PATH: &str = "\\EFI\\BOOT\\INITRD";
+
 // The DISK layout, stated here for D1's reason: `td-install` writes it and
 // td-boot reads what sits inside it, and a layout stated twice is a layout that
 // can disagree with itself — at the first boot after an install rather than at

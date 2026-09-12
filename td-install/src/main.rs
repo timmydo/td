@@ -53,7 +53,8 @@ fn invalid(message: String) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
 }
 
-const USAGE: &str = "usage: td-install layout <destination>\n       \
+const USAGE: &str =
+    "usage: td-install layout <destination> [<efi-kernel> <selector-initramfs>]\n       \
                      td-install volume <destination> <mkfs.btrfs> <scratch-dir> \
                      [<td-boot> <deployment> <trusted-key>]";
 
@@ -61,6 +62,7 @@ const USAGE: &str = "usage: td-install layout <destination>\n       \
 enum Mode {
     Layout {
         destination: PathBuf,
+        boot: Option<BootFiles>,
     },
     /// `mkfs` is passed rather than looked up: this crate execs exactly what it
     /// is told to and never resolves a program through an ambient `PATH`, which
@@ -87,6 +89,75 @@ enum Mode {
     },
 }
 
+/// Fixed firmware entry, independent of the deployment selected on Btrfs.
+#[derive(Debug, Eq, PartialEq)]
+struct BootFiles {
+    kernel: PathBuf,
+    initramfs: PathBuf,
+}
+
+const MAX_BOOT_FILE: u64 = 256 * 1024 * 1024;
+
+struct BootInput {
+    path: PathBuf,
+    file: File,
+    len: u64,
+}
+
+impl BootInput {
+    fn open(path: &Path, destination: &File) -> io::Result<Self> {
+        use std::os::unix::fs::MetadataExt;
+        let (file, metadata) = realfile::open_real_file(path, "EFI input")?;
+        let target = destination.metadata()?;
+        if metadata.dev() == target.dev() && metadata.ino() == target.ino() {
+            return Err(invalid(format!(
+                "EFI input is the destination: {}",
+                path.display()
+            )));
+        }
+        if metadata.len() == 0 || metadata.len() > MAX_BOOT_FILE {
+            return Err(invalid(format!(
+                "EFI input must contain 1..={MAX_BOOT_FILE} bytes: {}",
+                path.display()
+            )));
+        }
+        Ok(Self {
+            path: path.into(),
+            file,
+            len: metadata.len(),
+        })
+    }
+
+    fn copy_to(&mut self, destination: &mut File, destination_path: &Path) -> io::Result<()> {
+        let copied =
+            io::copy(&mut (&mut self.file).take(self.len), destination).map_err(|error| {
+                io::Error::new(
+                    error.kind(),
+                    format!(
+                        "copy EFI input {} to {}: {error}",
+                        self.path.display(),
+                        destination_path.display()
+                    ),
+                )
+            })?;
+        let mut extra = [0u8; 1];
+        if copied != self.len
+            || self.file.read(&mut extra).map_err(|error| io::Error::new(
+                error.kind(), format!("check EFI input {}: {error}", self.path.display())
+            ))? != 0
+            || self.file.metadata().map_err(|error| io::Error::new(
+                error.kind(), format!("stat EFI input {}: {error}", self.path.display())
+            ))?.len() != self.len
+        {
+            return Err(invalid(format!(
+                "EFI input changed size: {}",
+                self.path.display()
+            )));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Eq, PartialEq)]
 struct Publish {
     /// Where `td-boot` is. Passed, never resolved: this crate execs what it is
@@ -107,6 +178,14 @@ fn parse_args(mut args: impl Iterator<Item = OsString>) -> io::Result<Mode> {
     match (verb.to_str(), rest.as_slice()) {
         (Some("layout"), [destination]) => Ok(Mode::Layout {
             destination: destination.clone(),
+            boot: None,
+        }),
+        (Some("layout"), [destination, kernel, initramfs]) => Ok(Mode::Layout {
+            destination: destination.clone(),
+            boot: Some(BootFiles {
+                kernel: kernel.clone(),
+                initramfs: initramfs.clone(),
+            }),
         }),
         (Some("volume"), [destination, mkfs, scratch, td_boot, deployment, trusted_key]) => {
             Ok(Mode::Volume {
@@ -539,25 +618,11 @@ fn zero_at(file: &mut File, offset: u64, len: u64) -> io::Result<()> {
     Ok(())
 }
 
-/// How much of the ESP must be zeroed before `fat::build`'s extents land on it.
-///
-/// `fat.rs` states the precondition and cannot check it: it emits only what must
-/// be non-zero, so the FAT is written as a live PREFIX and everything past it is
-/// whatever the destination already held. Over a device with a previous
-/// filesystem on it those bytes read as ALLOCATED clusters — lost chains, a free
-/// count that disagrees with the table, and a later write handing out a cluster
-/// that already holds something.
-///
-/// Zeroing the whole ESP would satisfy it and cost half a gigabyte of writes on
-/// every install. The METADATA region is enough: reserved sectors, both FATs,
-/// and the root directory's cluster. Past that the FATs read as all clusters
-/// free, so no directory entry and no chain reaches the stale data — and the
-/// first write to a cluster overwrites what was there.
-///
-/// The root cluster is in the region even though `fat::build` currently emits it
-/// whole, so this does not depend on it continuing to: one cluster of zeroing is
-/// cheaper than a precondition that holds only while an extent happens to cover
-/// it.
+/// Empty-ESP zeroing minimum: reserved sectors, both FATs and the root cluster.
+/// The emitter may omit zero FAT suffixes, which must not retain old chains.
+/// Populated layouts extend this through every directory cluster, then stream
+/// all live file bytes and clear their final-cluster padding. Free data
+/// clusters stay unreferenced; they are not erased by formatting.
 fn metadata_bytes(image: &fat::Image) -> Option<u64> {
     let sector = u64::from(image.bytes_per_sector);
     let reserved = u64::from(fat::RESERVED_SECTORS);
@@ -588,11 +653,49 @@ fn invalidate_table(file: &mut File, table: &gpt::Image) -> io::Result<()> {
 }
 
 fn run_layout(destination: &Path, out: &mut dyn Write) -> io::Result<()> {
+    run_layout_with_boot(destination, None, out)
+}
+
+fn run_layout_with_boot(
+    destination: &Path,
+    boot: Option<&BootFiles>,
+    out: &mut dyn Write,
+) -> io::Result<()> {
     let mut file = paths::open_read_write(destination)?;
     let disk_bytes = destination_bytes(&mut file)?;
     let sector_size = logical_sector_size(&file)?;
     let plan = plan(sector_size, disk_bytes).map_err(invalid)?;
 
+    // Pin and size both sources before any destructive write. The caller owns
+    // their content and must keep it stable throughout the operation.
+    let mut inputs = match boot {
+        Some(boot) => Some((
+            BootInput::open(&boot.kernel, &file)?,
+            BootInput::open(&boot.initramfs, &file)?,
+        )),
+        None => None,
+    };
+    let initrd_name = protocol::EFI_INITRD_PATH
+        .rsplit('\\')
+        .next()
+        .ok_or_else(|| invalid("missing EFI initrd filename".into()))?;
+    let kernel_path = format!("\\EFI\\BOOT\\{}", protocol::EFI_BOOT_FILE);
+    let root = match &inputs {
+        Some((kernel, initramfs)) => vec![(
+            "EFI".into(),
+            fat::Node::Dir(vec![(
+                "BOOT".into(),
+                fat::Node::Dir(vec![
+                    (
+                        protocol::EFI_BOOT_FILE.into(),
+                        fat::Node::Stream(kernel.len),
+                    ),
+                    (initrd_name.into(), fat::Node::Stream(initramfs.len)),
+                ]),
+            )]),
+        )],
+        None => Vec::new(),
+    };
     let layout = gpt::Layout {
         sector_size,
         disk_sectors: plan.disk_sectors,
@@ -625,9 +728,8 @@ fn run_layout(destination: &Path, out: &mut dyn Write) -> io::Result<()> {
     let esp_sectors = plan
         .esp_sectors()
         .ok_or_else(|| invalid("the ESP length overflowed".to_string()))?;
-    let esp_start_lba = u32::try_from(plan.esp_start).map_err(|_| {
-        invalid("the ESP starts past what a FAT32 BPB can record".to_string())
-    })?;
+    let esp_start_lba = u32::try_from(plan.esp_start)
+        .map_err(|_| invalid("the ESP starts past what a FAT32 BPB can record".to_string()))?;
     let volume = fat::Volume {
         bytes_per_sector: u32::try_from(sector_size)
             .map_err(|_| invalid("sector size exceeds a FAT32 BPB".to_string()))?,
@@ -638,31 +740,68 @@ fn run_layout(destination: &Path, out: &mut dyn Write) -> io::Result<()> {
         volume_id: volume_serial(&layout)?,
         label: protocol::ESP_VOLUME_LABEL.to_string(),
         sectors_per_cluster: None,
-        root: Vec::new(),
+        root,
     };
     let esp = fat::build(&volume).map_err(invalid)?;
-    let metadata = metadata_bytes(&esp)
-        .ok_or_else(|| invalid("the ESP metadata region overflowed".to_string()))?;
-    // The region is exactly tight — today's last extent ENDS on it — so this is
-    // the invariant the comment on `metadata_bytes` is really claiming, checked
-    // rather than reasoned. A root directory needing a second cluster (item 8
-    // puts `\EFI\BOOT\BOOTX64.EFI` on this volume) moves that end past the
-    // zeroed region, and the result would be a volume with lost chains that
-    // nothing reports. Failing the install is the right answer to that.
-    let written = esp
-        .extents
-        .iter()
-        .try_fold(0u64, |high, extent| {
-            let end = extent.offset.checked_add(extent.bytes.len() as u64)?;
-            Some(high.max(end))
-        })
-        .ok_or_else(|| invalid("an ESP extent overflowed".to_string()))?;
-    if written > metadata {
-        return Err(invalid(format!(
-            "the ESP zeroes {metadata} bytes but fat::build writes up \
-             to {written} — the zeroed region no longer covers the metadata it \
-             must (see metadata_bytes)"
-        )));
+    // Clear the reserved sectors, FATs and every directory cluster, including
+    // gaps between emitted metadata extents. Free data clusters stay untouched.
+    let metadata = esp.extents.iter().try_fold(
+        metadata_bytes(&esp).ok_or_else(|| invalid("ESP metadata overflow".into()))?,
+        |high, extent| {
+            extent
+                .offset
+                .checked_add(extent.bytes.len() as u64)
+                .map(|end| high.max(end))
+                .ok_or_else(|| invalid("ESP extent overflow".into()))
+        },
+    )?;
+
+    let cluster_bytes = u64::from(esp.bytes_per_sector)
+        .checked_mul(u64::from(esp.sectors_per_cluster)).filter(|bytes| *bytes != 0)
+        .ok_or_else(|| invalid("invalid EFI cluster size".into()))?;
+    let data_start = metadata_bytes(&esp).and_then(|end| end.checked_sub(cluster_bytes))
+        .ok_or_else(|| invalid("EFI data offset overflow".into()))?;
+    // Round relative to the data area, not the start of the FAT filesystem.
+    let metadata = metadata.checked_sub(data_start)
+        .and_then(|span| span.checked_add(cluster_bytes - 1))
+        .and_then(|span| (span / cluster_bytes).checked_mul(cluster_bytes))
+        .and_then(|span| data_start.checked_add(span))
+        .filter(|end| *end <= esp.total_bytes)
+        .ok_or_else(|| invalid("EFI metadata exceeds the ESP".into()))?;
+    let esp_end = esp_offset.checked_add(esp.total_bytes)
+        .ok_or_else(|| invalid("EFI partition end overflow".into()))?;
+
+    // Resolve every placement and offset before invalidating the old GPT.
+    let mut payloads = Vec::new();
+    if let Some((kernel, initramfs)) = &mut inputs {
+        for (name, input) in [
+            (kernel_path.as_str(), kernel),
+            (protocol::EFI_INITRD_PATH, initramfs),
+        ] {
+            let matching: Vec<_> = esp.placements.iter().filter(|p| p.path == name).collect();
+            let [placement] = matching.as_slice() else {
+                return Err(invalid(format!(
+                    "EFI file must have exactly one placement: {name}"
+                )));
+            };
+            if placement.len != input.len {
+                return Err(invalid(format!("EFI placement length disagrees with input: {name}")));
+            }
+            let offset = esp_offset
+                .checked_add(placement.offset)
+                .ok_or_else(|| invalid("EFI file offset overflow".into()))?;
+            let end = offset
+                .checked_add(placement.len)
+                .ok_or_else(|| invalid("EFI file padding offset overflow".into()))?;
+            let padding = (cluster_bytes - placement.len % cluster_bytes) % cluster_bytes;
+            if end.checked_add(padding).is_none_or(|padded_end| padded_end > esp_end) {
+                return Err(invalid(format!("EFI file padding exceeds the ESP: {name}")));
+            }
+            payloads.push((input, offset, end, padding));
+        }
+    }
+    if payloads.len() != esp.placements.len() {
+        return Err(invalid("unexpected EFI file placement".into()));
     }
 
     // A REINSTALL is the case this order exists for. On a disk that already
@@ -687,6 +826,12 @@ fn run_layout(destination: &Path, out: &mut dyn Write) -> io::Result<()> {
             .checked_add(extent.offset)
             .ok_or_else(|| invalid("an ESP extent overflowed".to_string()))?;
         write_at(&mut file, at, &extent.bytes)?;
+    }
+    for (input, offset, end, padding) in payloads {
+        file.seek(SeekFrom::Start(offset))?;
+        input.copy_to(&mut file, destination)?;
+        // A partial final cluster must not disclose bytes from a previous ESP.
+        zero_at(&mut file, end, padding)?;
     }
     file.sync_all()?;
 
@@ -1382,7 +1527,10 @@ fn main() -> ExitCode {
         }
     };
     let result = match mode {
-        Mode::Layout { destination } => run_layout(&destination, &mut io::stdout()),
+        Mode::Layout { destination, boot } => match boot {
+            Some(boot) => run_layout_with_boot(&destination, Some(&boot), &mut io::stdout()),
+            None => run_layout(&destination, &mut io::stdout()),
+        },
         Mode::Volume {
             destination,
             mkfs,
@@ -1485,11 +1633,153 @@ mod tests {
     }
 
     #[test]
+    fn efi_inputs_are_a_pair_and_bad_inputs_preserve_the_disk() {
+        assert!(parse_args(args(&["layout", "disk", "kernel", "initrd"])).is_ok());
+        assert!(parse_args(args(&["layout", "disk", "kernel", "initrd", "extra"])).is_err());
+        let disk = Scratch::disk(DISK);
+        run_layout(&disk.path, &mut Vec::new()).unwrap();
+        let snapshot = || {
+            let mut file = File::open(&disk.path).unwrap();
+            let mut bytes = Vec::new();
+            for (offset, len) in table_ranges(512, DISK / 512).unwrap().into_iter()
+                .chain([(MIB, 16 * MIB)]) {
+                bytes.extend_from_slice(&read_at(&mut file, offset, len).unwrap());
+            }
+            bytes
+        };
+        let before = snapshot();
+        let kernel = Scratch::disk(1);
+        let initramfs = Scratch::disk(0);
+        let boot = BootFiles {
+            kernel: kernel.path.clone(),
+            initramfs: initramfs.path.clone(),
+        };
+        assert!(run_layout_with_boot(&disk.path, Some(&boot), &mut Vec::new()).is_err());
+        assert_eq!(before, snapshot());
+        File::options()
+            .write(true)
+            .open(&initramfs.path)
+            .unwrap()
+            .set_len(MAX_BOOT_FILE)
+            .unwrap();
+        File::options()
+            .write(true)
+            .open(&kernel.path)
+            .unwrap()
+            .set_len(MAX_BOOT_FILE)
+            .unwrap();
+        // Each source meets its bound, but together they cannot fit this ESP.
+        assert!(run_layout_with_boot(&disk.path, Some(&boot), &mut Vec::new()).is_err());
+        assert_eq!(before, snapshot());
+        let alias = scratch::path("efi-alias");
+        std::fs::hard_link(&disk.path, &alias).unwrap();
+        let boot = BootFiles {
+            kernel: alias.clone(),
+            initramfs: initramfs.path.clone(),
+        };
+        let error = run_layout_with_boot(&disk.path, Some(&boot), &mut Vec::new()).unwrap_err();
+        assert!(error.to_string().contains("is the destination"), "{error}");
+        assert_eq!(before, snapshot());
+        std::fs::remove_file(alias).unwrap();
+    }
+
+    #[test]
+    fn efi_stream_refuses_growth_and_shortening_after_open() {
+        for len in [2, 4] {
+            let source = Scratch::disk(3);
+            let destination = Scratch::disk(0);
+            let mut out = File::options().write(true).open(&destination.path).unwrap();
+            let mut input = BootInput::open(&source.path, &out).unwrap();
+            File::options()
+                .write(true)
+                .open(&source.path)
+                .unwrap()
+                .set_len(len)
+                .unwrap();
+            assert!(input
+                .copy_to(&mut out, &destination.path)
+                .unwrap_err()
+                .to_string()
+                .contains("changed size"));
+        }
+    }
+
+    #[test]
+    fn efi_files_and_cluster_padding_replace_old_esp_bytes() {
+        let disk = Scratch::disk(DISK);
+        let kernel = Scratch::disk(0);
+        let initramfs = Scratch::disk(0);
+        let kernel_bytes = vec![0x4b; 9001];
+        let initrd_bytes = vec![0x49; 5003];
+        std::fs::write(&kernel.path, &kernel_bytes).unwrap();
+        std::fs::write(&initramfs.path, &initrd_bytes).unwrap();
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&disk.path)
+            .unwrap();
+        // Dirty enough of the old ESP to cover metadata and both file chains.
+        write_at(&mut file, MIB, &vec![0xa5; 16 * MIB as usize]).unwrap();
+        let boot = BootFiles {
+            kernel: kernel.path.clone(),
+            initramfs: initramfs.path.clone(),
+        };
+        let mut output = Vec::new();
+        run_layout_with_boot(&disk.path, Some(&boot), &mut output).unwrap();
+        assert_eq!(String::from_utf8(output).unwrap(), "1048576 537919488\n");
+        let bpb = read_at(&mut file, MIB, 512).unwrap();
+        let u16le = |bytes: &[u8]| u16::from_le_bytes(bytes.try_into().unwrap()) as u64;
+        let u32le = |bytes: &[u8]| u32::from_le_bytes(bytes.try_into().unwrap()) as u64;
+        let sector = u16le(&bpb[11..13]);
+        let cluster = sector * u64::from(bpb[13]);
+        let data = MIB + sector * (u16le(&bpb[14..16]) + u64::from(bpb[16]) * u32le(&bpb[36..40]));
+        let at = |cluster_no| data + (cluster_no - 2) * cluster;
+        let entry = |file: &mut File, parent, name: &[u8]| {
+            let directory = read_at(file, at(parent), cluster).unwrap();
+            let index = directory
+                .chunks_exact(32)
+                .position(|entry| &entry[..11] == name)
+                .unwrap();
+            let entry = &directory[index * 32..(index + 1) * 32];
+            (
+                u16le(&entry[20..22]) << 16 | u16le(&entry[26..28]),
+                u32le(&entry[28..32]),
+            )
+        };
+        // Read FAT directory entries independently of the formatter's placements.
+        let (efi, _) = entry(&mut file, u32le(&bpb[44..48]), b"EFI        ");
+        let (boot, _) = entry(&mut file, efi, b"BOOT       ");
+        for (name, expected) in [
+            (b"BOOTX64 EFI", &kernel_bytes),
+            (b"INITRD     ", &initrd_bytes),
+        ] {
+            let (first, len) = entry(&mut file, boot, name);
+            assert_eq!(len, expected.len() as u64);
+            assert_eq!(read_at(&mut file, at(first), len).unwrap(), *expected);
+            let padding = (cluster - len % cluster) % cluster;
+            assert_eq!(
+                read_at(&mut file, at(first) + len, padding).unwrap(),
+                vec![0; padding as usize]
+            );
+        }
+        let directory = read_at(&mut file, at(boot), cluster).unwrap();
+        // Dot, dotdot and the two files occupy four entries; the rest terminates
+        // the directory and must not retain the old 0xa5 entries.
+        assert!(directory
+            .get(4 * 32..)
+            .unwrap()
+            .iter()
+            .all(|byte| *byte == 0));
+        assert_eq!(disk.table(DISK).partitions.len(), 2);
+    }
+
+    #[test]
     fn the_verb_and_its_arity_are_exact() {
         assert_eq!(
             parse_args(args(&["layout", "/dev/sda"])).unwrap(),
             Mode::Layout {
-                destination: PathBuf::from("/dev/sda")
+                destination: PathBuf::from("/dev/sda"),
+                boot: None,
             }
         );
         assert!(parse_args(args(&["layout"])).is_err(), "missing destination");

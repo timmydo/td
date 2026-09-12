@@ -384,22 +384,23 @@ pub fn qemu_secret_system_cli(args: &[String]) -> Result<(), String> {
 /// the sandbox: it builds linux-x86-64 (bzImage + initramfs) and boots it under
 /// host qemu, asserting the userland marker reaches ttyS0.
 pub fn qemu_boot_cli(args: &[String]) -> Result<(), String> {
-    qemu_kernel_cli(args, "qemu-boot", crate::checks::qemu_boot::run)
+    qemu_kernel_cli(args, "qemu-boot", &[], crate::checks::qemu_boot::run)
 }
 
 /// Cold host-firmware oracle; no direct kernel or initrd injection.
 pub fn qemu_boot_uefi_cli(args: &[String]) -> Result<(), String> {
-    qemu_kernel_cli(args, "qemu-boot-uefi", crate::checks::qemu_boot::efi::run)
+    qemu_kernel_cli(args, "qemu-boot-uefi", &["td-install"], crate::checks::qemu_boot::efi::run)
 }
 
 /// Boot one unchanged ISO through optical and USB firmware discovery.
 pub fn qemu_boot_media_cli(args: &[String]) -> Result<(), String> {
-    qemu_kernel_cli(args, "qemu-boot-media", crate::checks::qemu_boot::media::run)
+    qemu_kernel_cli(args, "qemu-boot-media", &[], crate::checks::qemu_boot::media::run)
 }
 
 fn qemu_kernel_cli(
     args: &[String],
     command: &str,
+    additional_targets: &[&str],
     run: fn(&RecipeCheckRunner) -> Result<(), String>,
 ) -> Result<(), String> {
     const STEM: &str = "linux-x86-64";
@@ -414,7 +415,8 @@ fn qemu_kernel_cli(
     }
     // Provenance planning FIRST — before the runner exists, so a rejected graph
     // spawns no subprocess at all (re #469), matching `cli`/`build_cli`.
-    let targets = [stem];
+    let mut targets = vec![stem];
+    targets.extend_from_slice(additional_targets);
     ensure_targets_provenance(&targets)?;
 
     let root = env::current_dir().map_err(|e| format!("current dir: {e}"))?;

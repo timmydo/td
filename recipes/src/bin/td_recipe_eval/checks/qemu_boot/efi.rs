@@ -1,11 +1,6 @@
 //! Host firmware oracle; its disposable disk never names an operator device.
 use super::*;
-use td_engine::{fat, gpt};
-
-const SECTOR: u64 = 512;
-const ESP_START: u64 = 2048;
-const ESP_SECTORS: u64 = 512 * 1024 * 1024 / SECTOR;
-const DISK_SECTORS: u64 = ESP_START + ESP_SECTORS + 2048;
+const DISK_BYTES: u64 = 6 * 1024 * 1024 * 1024;
 const NEGATIVE_SECONDS: u64 = 20;
 const MAX_INPUT: u64 = 256 * 1024 * 1024;
 
@@ -13,24 +8,27 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
     let qemu = find_qemu()?;
     let (code, vars_template) = firmware(&qemu)?;
     let (kernel, initramfs) = build_kernel(runner)?;
+    runner.prepare_recipe_target("td-install")?;
+    let build_out = runner.build_plan("td-install")?;
+    let installer = runner
+        .ladder_out_from(&build_out, "td-install")?
+        .join("bin/td-install");
     static SEQ: AtomicU64 = AtomicU64::new(0);
     let scratch = Scratch {
         dir: create_scratch_dir(runner.scratch_dir(), &SEQ)?,
     };
     println!("   [qemu-boot-uefi] kernel: {}\n      initramfs: {}\n      firmware: {}\n      vars template: {}",
         kernel.display(), initramfs.display(), code.display(), vars_template.display());
-    for present in [true, false] {
+    for (phase, present) in [("boot", true), ("reboot", true), ("missing", false)] {
         let disk = scratch
             .dir
             .join(if present { "boot.img" } else { "missing.img" });
-        write_disk(&disk, &kernel, &initramfs, present)?;
-        let vars = scratch.dir.join(if present {
-            "boot-vars.fd"
-        } else {
-            "missing-vars.fd"
-        });
+        if phase != "reboot" {
+            write_disk(&installer, &disk, &kernel, &initramfs, present)?;
+        }
+        let vars = scratch.dir.join(format!("{phase}-vars.fd"));
         copy_input(&vars_template, &vars)?;
-        println!("   [qemu-boot-uefi] cold firmware boot, EFI entry present: {present}");
+        println!("   [qemu-boot-uefi] {phase}: cold firmware boot, EFI entry present: {present}");
         let result = boot_source(
             &qemu,
             BootSource::Firmware {
@@ -41,7 +39,7 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
             BootPlan {
                 disk: Some(BootDisk {
                     path: &disk,
-                    read_only: true,
+                    read_only: phase != "boot",
                 }),
                 mem: "512",
                 target_marker: MARKER,
@@ -78,7 +76,7 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
                 result.elapsed, result.reason, tail(&result.console, 60)));
         }
     }
-    println!("PASS: x86-64 UEFI boots GPT/FAT BOOTX64.EFI and INITRD to {MARKER}; missing-entry control has no userspace marker");
+    println!("PASS: x86-64 UEFI boots td-install's GPT/FAT BOOTX64.EFI and INITRD twice to {MARKER}; missing-entry control has no userspace marker");
     Ok(())
 }
 
@@ -163,76 +161,40 @@ pub(super) fn copy_input(source: &Path, destination: &Path) -> Result<(), String
     out.sync_all().map_err(|e| e.to_string())
 }
 
-fn write_disk(path: &Path, kernel: &Path, initramfs: &Path, present: bool) -> Result<(), String> {
-    let (kernel, kernel_len) = input(kernel)?;
-    let (initramfs, initramfs_len) = input(initramfs)?;
-    let table = gpt::build(&gpt::Layout {
-        sector_size: SECTOR,
-        disk_sectors: DISK_SECTORS,
-        disk_guid: gpt::Guid([0x31; 16]),
-        align_sectors: ESP_START,
-        partitions: vec![gpt::Partition {
-            type_guid: gpt::TYPE_ESP,
-            unique_guid: gpt::Guid([0x32; 16]),
-            start_lba: ESP_START,
-            end_lba: ESP_START + ESP_SECTORS - 1,
-            attributes: 0,
-            name: "td EFI oracle".into(),
-        }],
-    })?;
-    let mut files = vec![("INITRD".into(), fat::Node::Stream(initramfs_len))];
-    if present {
-        files.push((
-            td_recipe::ladder::EFI_BOOT_FILE.into(),
-            fat::Node::Stream(kernel_len),
-        ));
-    }
-    let esp = fat::build(&fat::Volume {
-        bytes_per_sector: SECTOR as u32,
-        total_sectors: ESP_SECTORS,
-        hidden_sectors: ESP_START as u32,
-        volume_id: 0x54444546,
-        label: "TD EFI TEST".into(),
-        sectors_per_cluster: None,
-        root: vec![(
-            "EFI".into(),
-            fat::Node::Dir(vec![("BOOT".into(), fat::Node::Dir(files))]),
-        )],
-    })?;
-    let mut out = OpenOptions::new()
+fn write_disk(
+    installer: &Path,
+    path: &Path,
+    kernel: &Path,
+    initramfs: &Path,
+    present: bool,
+) -> Result<(), String> {
+    // The source-built installer receives only an exclusively created scratch
+    // file. Firmware subsequently reads exactly those bytes, with no media.
+    let out = OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(0o600)
         .open(path)
         .map_err(|e| format!("create {}: {e}", path.display()))?;
-    let write = |out: &mut File, offset: u64, bytes: &[u8]| -> Result<(), String> {
-        out.seek(SeekFrom::Start(offset))
-            .map_err(|e| e.to_string())?;
-        out.write_all(bytes).map_err(|e| e.to_string())
-    };
-    out.set_len(DISK_SECTORS * SECTOR)
-        .map_err(|e| e.to_string())?;
-    write(&mut out, table.primary_offset, &table.primary)?;
-    write(&mut out, table.backup_offset, &table.backup)?;
-    for extent in &esp.extents {
-        write(&mut out, ESP_START * SECTOR + extent.offset, &extent.bytes)?;
+    out.set_len(DISK_BYTES)
+        .map_err(|e| format!("size {}: {e}", path.display()))?;
+    drop(out);
+    let mut command = Command::new(installer);
+    command
+        .arg("layout")
+        .arg(path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null());
+    if present {
+        command.arg(kernel).arg(initramfs);
     }
-    let boot_path = format!(r"\EFI\BOOT\{}", td_recipe::ladder::EFI_BOOT_FILE);
-    for placement in &esp.placements {
-        let source = match placement.path.as_str() {
-            td_recipe::ladder::EFI_INITRD_PATH => &initramfs,
-            name if name == boot_path => &kernel,
-            _ => return Err(format!("unexpected ESP file {}", placement.path)),
-        };
-        out.seek(SeekFrom::Start(ESP_START * SECTOR + placement.offset))
-            .map_err(|e| e.to_string())?;
-        let count =
-            std::io::copy(&mut source.take(placement.len), &mut out).map_err(|e| e.to_string())?;
-        if count != placement.len {
-            return Err("EFI input shortened during copy".into());
-        }
+    let status = command
+        .status()
+        .map_err(|e| format!("run {}: {e}", installer.display()))?;
+    if !status.success() {
+        return Err(format!("td-install EFI layout failed: {status}"));
     }
-    out.sync_all().map_err(|e| e.to_string())
+    Ok(())
 }
 
 pub(super) fn pflash_arg(path: &Path, unit: u8, read_only: bool) -> OsString {
@@ -286,7 +248,14 @@ mod tests {
         let disk = scratch.dir.join("disk");
         fs::write(&source, b"input").unwrap();
         fs::write(&disk, b"preserve").unwrap();
-        assert!(write_disk(&disk, &source, &source, true).is_err());
+        assert!(write_disk(
+            Path::new("/does-not-exist/td-install"),
+            &disk,
+            &source,
+            &source,
+            true
+        )
+        .is_err());
         assert_eq!(fs::read(&disk).unwrap(), b"preserve");
     }
 }

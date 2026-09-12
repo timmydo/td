@@ -474,6 +474,28 @@ command line is the one `td-boot` already builds for its kexec. The ESP
 therefore never changes when a deployment does, which is D5 restated as a
 property of the boot flow rather than as a rule.
 
+`td-install layout DESTINATION [EFI-KERNEL SELECTOR-INITRAMFS]` can
+populate both fixed boot files while creating the GPT and ESP. Supply both
+inputs or neither; the latter retains the empty-ESP layout operation. The
+inputs are nonempty real regular files, each bounded at 256 MiB, opened
+once before erasure, and must fit together with FAT metadata. An input
+with the destination's device/inode identity is refused. This detects
+regular-image aliases; it does not detect files on a partition of a block
+destination. The caller must keep sources off the destination disk and
+supply stable, validated boot artifacts. This low-level writer does not
+authenticate a selector or verify PE format. It detects source length
+changes during streaming, but does not snapshot concurrent content writes.
+
+The old GPT is invalidated and synced first. Reserved sectors, both FATs
+and all directory clusters are cleared before writing metadata. File data
+is streamed and final-cluster padding is zeroed; unallocated clusters are
+not erased. All ESP writes are synced before the backup and then primary
+GPT are published with their existing barriers. A streaming failure leaves
+no published GPT. This is a destructive layout primitive, not the complete
+installation transaction: the Btrfs volume still needs formatting and
+verified deployment publication. There is no new consent or device
+admission interface here.
+
 ### Selector deployment measurement prerequisite
 
 The selector can require one SHA-256 PCR 11 extension before its verified
@@ -639,14 +661,15 @@ missing key becomes a runtime branch, where the tempting branch is the
 fail-open D2 forbids, so absence must be a refusal; and the trust root
 becomes per-machine state that the reproducible artifact does not record.
 
-The first of those has a concrete form waiting for item 8. A machine will
-eventually carry TWO copies of this key — the selector initramfs's
-`etc/td/deployment.pub` and the volume's `td/trusted.pub` — and nothing
-checks that they agree. They cannot disagree today only because no machine
-has both: `td-install` writes an EMPTY ESP, and item 8 is what would put a
-selector on it. When it lands, td-install becomes the writer of both and
-that check becomes its to make, because a disk whose volume key is not its
-selector's is a disk that accepts an update it then refuses to boot.
+An installation can carry two copies of this key: the selector initramfs's
+`etc/td/deployment.pub` and the volume's `td/trusted.pub`. The layout and
+volume primitives do not check their agreement. Layout treats the selector
+as opaque bytes, while volume authenticates under its explicitly supplied
+key. The installation coordinator must provision and verify their agreement
+before activating a complete installation; that coordinator is still
+required. A mismatch can accept an update that the selector refuses to
+boot. The diagnostic EFI oracle carries no signed deployment or volume key
+and does not claim to test this integration boundary.
 
 Against the threat this signature exists for — a hostile or compromised
 update source — the two are equivalent: that attacker supplies bytes and
@@ -960,15 +983,23 @@ the bytes. Firmware is solely a host test input.
 
 The initial `td-recipe-eval qemu-boot-uefi [linux-x86-64]` increment
 proves the firmware entry and initrd handoff with the recipe's tiny
-BusyBox initramfs. It writes a private, disposable GPT/FAT32 disk using
-td's existing writers, starts q35/TCG with cold per-run variables and a
-read-only disk, and requires the real userspace marker without `-kernel`,
-`-initrd` or `-append`. A disk missing `BOOTX64.EFI` must remain without
-that marker for the bounded negative observation and emit BdsDxe's
-`Not Found` refusal for the `UEFI Misc Device` boot attempt. The positive
-leg runs first to reject a broken firmware pair promptly. No disk destination is
-accepted from the operator. This is a kernel oracle; the signed selector
-and full deployment oracle described below remain required.
+BusyBox initramfs. It builds and runs the source-built `td-install` on
+an exclusively created private 6 GiB sparse disk, populating the ESP
+from the kernel recipe. It starts q35/TCG with cold per-run variables
+and the disk writable, and requires the real userspace marker without
+`-kernel`, `-initrd` or `-append`. The same disk must pass a second cold
+boot with another fresh variables copy and the disk read-only. A second
+disk laid out with an empty ESP must remain without that marker for the
+bounded negative observation and emit BdsDxe's `Not Found` refusal for
+the `UEFI Misc Device` boot attempt. The positive leg runs first to
+reject a broken firmware pair promptly. The pair-or-none layout
+interface makes the negative control an empty ESP, rather than an ESP
+containing only INITRD. No disk destination is accepted from the
+operator. Only the installed disk is attached. This proves the
+installer's EFI file path with a tiny diagnostic initramfs; it does not
+format Btrfs, run installation inside a guest, or boot a signed system
+deployment. The signed selector and full deployment oracle described
+below remain required.
 
 The oracle signs with a **per-run throwaway key**: generate a keypair, sign
 the staged bundle, build `td-boot` pinned to that run's public key, boot, and
