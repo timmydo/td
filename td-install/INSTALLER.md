@@ -1,0 +1,148 @@
+# Offline graphical installation
+
+This is the target contract for the `installer-rolling` workstream. It
+extends [DESIGN.md](DESIGN.md), which owns the disk layout and the single
+deployment publisher. Nothing in this document alone activates a new boot
+profile or claims that an installation image exists.
+
+## Version 1
+
+Produce one hybrid ISO that boots through x86-64 UEFI both as optical media
+and when flashed byte-for-byte to a USB drive. Boot into td-compositor and
+an automatically opened native Rust installer. Installation uses the
+deployment carried on that media, with no downloads, package selection,
+network setup, or source compilation on the destination machine.
+
+The first supported test platform is QEMU with UEFI firmware. ThinkPad
+T430s hardware validation is the next milestone, not a v1 hardware claim.
+Legacy BIOS, partition preservation, resizing, dual boot, RAID, and
+installation into an existing filesystem are outside v1. One selected
+whole disk is erased and receives GPT, a FAT32 ESP and the td Btrfs volume.
+
+The wizard collects one human username, hostname, keyboard layout and
+timezone. Storage is unencrypted and the installed account automatically
+enters the desktop. The welcome and final review screens disclose those
+facts. There is no PIN field, password substitute or inert enrollment
+screen. [ENCRYPTION.md](ENCRYPTION.md) owns the later complete encrypted
+boot, hardware-backed PIN, recovery and session-authentication cutover.
+No account secret is needed to install. Networking can be configured after
+booting the installed system.
+
+## User flow and authority
+
+The sequence is welcome, destination disk, account and regional settings,
+review, installation progress, and completion. Back preserves valid input.
+Errors remain visible and explain the failed operation. The review includes
+the exact disk identity and capacity, the selected settings, and an explicit
+confirmation that all data on that disk will be lost. Success offers an
+orderly reboot with an instruction to remove the installation media.
+
+The UI is a td-owned, dependency-free Rust Wayland client. Follow td-editor's
+software rendering, font and input conventions where useful; a general UI
+toolkit and GPU renderer are not prerequisites. Shared source reuse must
+retain its owners' contracts, and any syscall boundary needs its own
+UNSAFE.md authorization. No browser, webview or HTTP service is required.
+
+The UI runs without disk-writing privileges. A root-owned installation
+service admits only typed installation operations over a private local
+channel. The UI cannot select executables, shell commands, arbitrary paths,
+mount options or a different deployment source. The live profile grants
+only the paired installer session access to this service. This authority
+does not depend on `su`, empty passwords, or a reusable elevation grant.
+Compositor-owned trusted consent must bind destructive execution to the
+exact reviewed request under the existing elevation contract; ordinary
+client pixels or synthetic input are not authorization evidence.
+
+Disk enumeration is read-only and bounded. Show model, serial when supplied
+by the device, capacity and a distinguishing device identifier. These are
+descriptions, not proof of device authenticity. Exclude the installation
+medium and every disk backing its mounted files, mounted/in-use targets,
+read-only devices, partitions and unsupported device topologies. Failure
+to resolve backing devices refuses installation rather than guessing.
+
+Review produces one immutable installation plan. Before any destructive
+write, the service validates its opened destination against that plan,
+rechecks eligibility and size, and retains the destination identity for the
+entire operation. Hot removal, replacement, a changed plan or lost consent
+requires a new review. A stale device pathname never identifies permission
+to erase whatever later appears there. Descriptor pinning alone does not
+prove that an unrelated process cannot mount the device; the implementation
+must specify exclusive admission before activating disk writes.
+
+No write occurs while navigating the wizard. Once destructive execution
+starts, cancellation or UI loss cannot promise restoration of old contents.
+The service retains bounded progress and an explicit outcome and never
+automatically retries a destructive operation after reconnect or restart.
+Completion requires durable filesystem and deployment publication, verified
+boot artifacts, and settings publication. A queued request is not success.
+
+## Media, boot and persistence
+
+Use source-built target executables and declared inputs throughout image
+composition. Host-seeded control-plane executables never enter the image.
+Any marked foreign application payload remains subject to AGENTS.md and
+APPLICATIONS.md, including the dedicated read-only payload-input channel.
+No new external dependency is approved by this document.
+
+The media's reproducible content is built without signing secrets. As in
+DESIGN.md D4, deployment signing occurs outside derivations. The assembly
+interface must explicitly bind the signed deployment and trusted public
+key; development fixture keys must not become an implicit distribution key.
+Neither installer nor installed boot silently accepts unsigned deployments.
+UEFI bootability does not claim Secure Boot authentication.
+
+Optical and USB boots enter the same live profile, with the installation
+source read-only and live mutable state volatile. The installed profile
+uses persistent Btrfs state. Installed boot must select the destination's
+volume without assuming `/dev/vda`, and continue working when device order
+changes or installation media is absent. Selector and deployment initramfs
+must agree on volume identity across kexec. The fixed ESP stub retains the
+deployment-selection boundary in DESIGN.md D5.
+
+Publish the bundled deployment through td-boot, preserving signature
+verification and transactional current/previous bookkeeping. Reuse the
+td-install GPT/FAT32 implementation and its file-image test path. Check
+scratch-space requirements before erasure; the current formatter stages
+deployment contents and a filesystem image, so free destination capacity
+alone cannot establish that a live session has enough temporary space.
+
+Machine settings are bounded, validated persistent data outside immutable
+deployment bytes. The installed account retains the existing single-human
+UID/GID allocation; user-selected names must not collide with system or
+application accounts. Account databases, home paths, application grants,
+service configuration and automatic login must agree before the session
+starts. Existing `/home/tester` assumptions need an atomic cutover in the
+installed profile. Updates must retain the installed identity and settings.
+Keyboard and timezone choices must actually affect the installed session;
+only supported choices with available data may be offered.
+
+## Independently landable increments and evidence
+
+1. Record the agreed v1 scope and its activation boundaries here.
+2. Add EFI-capable kernel artifacts and verify their realized format. Finish
+   fixed-stub/initramfs packaging and a firmware boot oracle; keep the
+   existing direct-kernel oracle as a separate test.
+3. Implement deterministic hybrid media composition and the read-only live
+   boot profile. Boot the same artifact as optical media and USB mass
+   storage, without QEMU `-kernel` or a supplied initrd.
+4. Add validated persistent machine configuration and its installed-profile
+   consumers, including volume discovery across selector and deployment
+   boots. Test settings retention across a deployment update.
+5. Add bounded device discovery, immutable plans, trusted destructive
+   consent and the service's installation execution. Prove refusal of
+   installation media, in-use targets, stale identities, unsupported
+   destinations and invalid plans without modifying their bytes.
+6. Add the native wizard, target recipe and live startup integration. Use
+   native compositor tests for navigation, rendering, input, errors and
+   progress; fixtures cannot grant ordinary clients trusted consent.
+7. Activate the complete profile only after the end-to-end QEMU evidence:
+   boot the ISO, complete the UI flow onto a disposable disk, detach the
+   media, boot that disk through firmware, and observe the configured
+   account in the compositor with its settings and persistent home.
+
+Use per-run disposable disks and firmware variables. No test discovers or
+opens an operator's real disk for writing. Exercise both supported media
+attachments, wrong deployment signatures, insufficient capacity and scratch,
+interrupted installation, changed disk ordering and a second installed boot.
+Require actual rendered/input and installed-session evidence, not only
+serial markers printed before the relevant operation completes.

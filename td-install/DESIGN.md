@@ -1,5 +1,10 @@
 # td-install — the deployment path
 
+[INSTALLER.md](INSTALLER.md) specifies the offline graphical installer and
+hybrid installation media workstream. Its v1 deliberately defers the
+encrypted profile in [ENCRYPTION.md](ENCRYPTION.md). The contracts below
+continue to own disk layout, deployment publication and signature checks.
+
 This file is the normative specification for td's **deployment path**: how a
 disk is laid out, how a deployment bundle is published onto it, how that
 bundle's authenticity is established, and how a machine moves from one
