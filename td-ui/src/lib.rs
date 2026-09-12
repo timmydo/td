@@ -1,11 +1,13 @@
 #![forbid(unsafe_code)]
 
 //! td's dependency-free UI toolkit, shared by td-owned graphical programs as
-//! a Cargo path dependency (td-editor first). This increment carries the
-//! display-independent input layer and the shared font and wire codecs; the
-//! raster primitives, Wayland client transport and chrome widgets follow in
-//! the order DESIGN.md schedules. Nothing here reads the environment, a
-//! clock, a descriptor or the filesystem: adapters supply explicit inputs.
+//! a Cargo path dependency (td-editor first). It carries the
+//! display-independent input layer, the shared font and wire codecs and the
+//! clipped XRGB raster with its palette and scrollbar geometry; the Wayland
+//! client transport and chrome widgets follow in the order DESIGN.md
+//! schedules. Nothing here reads the environment, a clock, a descriptor or
+//! the filesystem: adapters supply explicit inputs, and `notices` embeds
+//! the face's licence texts at compile time.
 
 /// The bitmap cell every consumer lays text out on. The pinned Unifont face
 /// is 8x16 and `font::pinned` is held to these by a test, so pointer hit
@@ -18,7 +20,9 @@ pub mod font;
 #[path = "../../td-compositor/src/font_data.rs"]
 mod font_data;
 pub mod keyboard;
+pub mod notices;
 pub mod pointer;
+pub mod raster;
 pub mod repeat;
 #[allow(clippy::new_without_default)]
 #[path = "../../td-compositor/src/wire.rs"]

@@ -7,7 +7,7 @@
 use td_editor::keys::Profile;
 use td_editor::layout::{Affinity, Caret};
 use td_editor::model::{Command, Selection};
-use td_editor::render::Raster;
+use td_ui::raster::Raster;
 use td_editor::ui::{Controller, Event, Outcome, PointerPhase};
 use td_editor::{font, replay, Error};
 
@@ -356,7 +356,7 @@ fn pixels(ui: &Controller) -> Vec<u8> {
     let (w, h) = geometry.dimensions();
     let mut pixels = vec![0; w * h * 4];
     let font = font::pinned().unwrap();
-    Raster::new(&mut pixels, &font, geometry, w * 4)
+    Raster::new(&mut pixels, &font, geometry.surface(), w * 4)
         .unwrap()
         .paint(&ui.scene(&[]).unwrap(), geometry.bounds())
         .unwrap();
@@ -498,7 +498,7 @@ fn line_numbers_default_toggle_digit_growth_and_hits_share_geometry() {
 
 #[test]
 fn line_number_glyphs_skip_wrapped_rows_and_partial_damage_matches_full_frame() {
-    use td_editor::render::{Draw, Primitive, Rect, LINE_NUMBER};
+    use td_ui::raster::{Draw, Primitive, Rect, LINE_NUMBER};
     for scale in 1..=4 {
         let mut ui = Controller::default();
         ui.dispatch(Event::Load(b"abcde\nx\n")).unwrap();
@@ -532,7 +532,7 @@ fn line_number_glyphs_skip_wrapped_rows_and_partial_damage_matches_full_frame() 
         let (width, height) = geometry.dimensions();
         let font = font::pinned().unwrap();
         let mut tiled = vec![0; full.len()];
-        let mut raster = Raster::new(&mut tiled, &font, geometry, width * 4).unwrap();
+        let mut raster = Raster::new(&mut tiled, &font, geometry.surface(), width * 4).unwrap();
         for x in (0..width).step_by(13) {
             raster
                 .paint(
@@ -1061,7 +1061,8 @@ fn clamped_scroll_does_not_cancel_a_selection_drag() {
 #[test]
 fn every_admitted_width_and_maximum_height_fit_the_layout_limits() {
     use td_editor::layout::{Viewport, MAX_COLUMNS, MAX_ROWS};
-    use td_editor::render::{Geometry, Scale, MAX_AXIS, MAX_FRAME_BYTES};
+    use td_editor::render::Geometry;
+    use td_ui::raster::{Scale, MAX_AXIS, MAX_FRAME_BYTES};
     let ui = loaded("a\nb");
     let doc = ui.editor().document(1).unwrap();
     for scale in 1..=4 {

@@ -2,7 +2,8 @@
 
 use crate::dialog::Target;
 use crate::keys::Profile;
-use crate::render::{CHROME, Draw, Geometry, GlyphStyle, INK, Primitive, Raster, Rect};
+use crate::render::Geometry;
+use td_ui::raster::{Draw, GlyphStyle, Primitive, Raster, Rect, CHROME, INK};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Group {
@@ -404,7 +405,7 @@ pub(crate) fn header(geometry: Geometry, x: i64, y: i64) -> Option<Group> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::render::Scale;
+    use td_ui::raster::Scale;
 
     fn menu(group: Group) -> Menu {
         Menu {

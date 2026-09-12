@@ -9484,16 +9484,18 @@ Wayland client: the mail jail already carries `sockets=wayland`, so the
 editor opens its own toplevel beside the terminal, and td-mail waits for it
 to exit as it does for any editor.
 
-**Rendering.** Section 11 of `td-compositor/DESIGN.md` pins a Unifont
-PSF2 face and a pure renderer over it; td-term draws with it. The editor
-borrows exactly that: the PSF2 reader and pinned face are shared source
-the compositor embeds and `td-ui`, the shared UI toolkit
-(`td-ui/DESIGN.md`), mounts once for every program that depends on it by
-path — the editor first (the way `engine/src/permissions.rs` is shared
-with td-jail); the glyph raster the editor paints that face with joins
-td-ui in its raster increment, so the editor renders the same cells,
-the same six renditions and the same cursor from one face. No second
-font, and no second rasterizer once that increment lands.
+**Rendering.** Section 11 of `td-compositor/DESIGN.md` pins a Unifont PSF2
+face and a pure renderer over it; td-term draws with it. The editor borrows
+the face exactly: the PSF2 reader and pinned face are shared source the
+compositor embeds and `td-ui`, the shared UI toolkit (`td-ui/DESIGN.md`),
+mounts once for every program that depends on it by path — the editor first
+(the way `engine/src/permissions.rs` is shared with td-jail) — and paints
+with td-ui's raster, the editor's bounded glyph painter moved into the
+toolkit, so every td-ui consumer renders the same cells from one face with
+one painter. No second font; the compositor keeps its own painters over
+that face (the terminal renderer and the attention sheet), td-ui's raster
+is the one every toolkit consumer shares, and td-portal's private copy
+goes when its chooser moves to td-ui.
 
 **Behaviour, in landing order.** (1) A buffer model and an Emacs keymap
 as pure data with tests: movement (`C-a`, `C-e`, `C-f`, `C-b`, `M-f`,

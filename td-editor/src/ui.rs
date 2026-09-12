@@ -4,7 +4,8 @@
 use crate::keys::{Action, Keymap, Profile};
 use crate::layout::{Affinity, Caret, Metrics, Viewport, CELL_HEIGHT, CELL_WIDTH};
 use crate::model::{Command, Editor, Selection, TabId};
-use crate::render::{Geometry, Label, Scale, Scene, Scrollbar, View};
+use crate::render::{Geometry, Label, Scene, View};
+use td_ui::raster::{Scale, Scrollbar};
 use crate::{text, Error, Result};
 use std::collections::BTreeMap;
 

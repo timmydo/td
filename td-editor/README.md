@@ -370,15 +370,16 @@ caret affinity and desired vertical column. `tests/ui.rs` exercises keyboard,
 drag, resize, focus and clock sequences, including identical pixels from
 typed events and replay. No display is needed for those interaction tests.
 
-`src/render.rs` supplies the safe software reference backend. A borrowed
-`Scene` streams clipped rectangle/glyph operations; `Raster` writes them into
-a caller-owned, stride-checked XRGB8888 buffer. The renderer uses the existing
-compositor Unifont data and decoder directly, with no copied font or new
-dependency. It draws tabs, bounded display labels, menu/status chrome,
-selection, and a caret, at integer scales 1–4. Pixel-oracle tests cover clipping,
-damage, padding, fallback glyphs, scrolling and extreme geometry. Menus remain
-drawing only. Tab presses select tabs; close marks emit typed requests for the
-clicked tab without discarding it.
+`src/render.rs` supplies the safe software reference backend over td-ui's
+raster. A borrowed `Scene` streams clipped rectangle/glyph operations;
+td-ui's `Raster` writes them into a caller-owned, stride-checked XRGB8888
+buffer. The renderer uses the existing compositor Unifont data and decoder
+through td-ui, with no copied font or new external dependency. It draws
+tabs, bounded display labels, menu/status chrome, selection, and a caret, at
+integer scales 1–4. Pixel-oracle tests cover clipping, damage, padding,
+fallback glyphs, scrolling and extreme geometry. Menus remain drawing only.
+Tab presses select tabs; close marks emit typed requests for the clicked tab
+without discarding it.
 
 The default appearance uses warm off-white paper and charcoal text, with
 muted chrome and blue-grey selection. A synthetic medium bitmap weight adds

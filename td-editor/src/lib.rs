@@ -79,4 +79,15 @@ impl std::fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
+/// The toolkit's raster refusals are the editor's own: an argument outside
+/// the contract, or a size past a ceiling.
+impl From<td_ui::raster::Error> for Error {
+    fn from(error: td_ui::raster::Error) -> Self {
+        match error {
+            td_ui::raster::Error::InvalidArgument => Self::InvalidArgument,
+            td_ui::raster::Error::Limit => Self::Limit,
+        }
+    }
+}
+
 pub type Result<T> = std::result::Result<T, Error>;

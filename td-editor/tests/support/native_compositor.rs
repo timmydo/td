@@ -527,7 +527,7 @@ fn native_directory_details_sort_and_copy_selected_entry() {
         assert_eq!(listing.lines().nth(1).unwrap(), expected);
         assert!(listing.lines().nth(2).unwrap().contains("14 2000-02-29 00:00Z z"));
         editor.rendered_at(800, 576);
-        compositor.rendered_rows(&window, before, 88, &[&expected], td_editor::render::PAPER);
+        compositor.rendered_rows(&window, before, 88, &[&expected], td_ui::raster::PAPER);
         compositor.chord(None, 31); // s: size
         wait_directory_rows(&mut editor, 1, 1, &["child/", "z", "a"]);
         editor.wait_field("state", "directory-sort", "1,size,0");
@@ -626,7 +626,7 @@ fn native_minibuffer_keeps_document_visible_and_pages_large_completions() {
             editor.wait_field("prompt-state", "prompt", prompt);
             editor.wait_field("state", "minibuffer", "6,96");
             editor.rendered_at(800, 576);
-            compositor.rendered_rows(&window, before, 168, &lines, td_editor::render::PAPER);
+            compositor.rendered_rows(&window, before, 168, &lines, td_ui::raster::PAPER);
             editor.wait_tab(0, &contents);
             if prompt != "path-open" {
                 compositor.chord(None, KEY_ESCAPE);
@@ -643,8 +643,8 @@ fn native_minibuffer_keeps_document_visible_and_pages_large_completions() {
         assert_eq!(field(&page, "completion-page-size"), Some("12"));
         assert_eq!(page.matches("completion-item=").count(), 12);
         editor.rendered_at(800, 576);
-        compositor.rendered_rows(&window, before, 312, &lines, td_editor::render::PAPER);
-        compositor.rendered_rows(&window, before, 272, &["  item0011"], td_editor::render::CHROME);
+        compositor.rendered_rows(&window, before, 312, &lines, td_ui::raster::PAPER);
+        compositor.rendered_rows(&window, before, 272, &["  item0011"], td_ui::raster::CHROME);
         for _ in 0..26 { compositor.chord(None, 109); } // PageDown
         editor.wait_field("prompt-state", "completion-selected", "312");
         let page = editor.ok("prompt-state");
@@ -788,7 +788,8 @@ fn native_directory_tabs_reuse_shift_open_refresh_and_copy_path() {
 #[test]
 #[ignore = "ready supplies the disposable native compositor"]
 fn native_path_completion_lists_cycles_and_opens_literal_relative_file() {
-    use td_editor::render::{CHROME, Draw, Geometry, GlyphStyle, INK, Primitive, Raster, Scale};
+    use td_editor::render::Geometry;
+    use td_ui::raster::{Draw, GlyphStyle, Primitive, Raster, Scale, CHROME, INK};
     for profile in ["windows", "emacs"] {
         let compositor_directory = Directory::new();
         let directory = Directory::new();
@@ -837,7 +838,7 @@ fn native_path_completion_lists_cycles_and_opens_literal_relative_file() {
         let font = td_editor::font::pinned().unwrap();
         let geometry = Geometry::new(64, 32, Scale::new(1).unwrap()).unwrap();
         let mut expected = CHROME.to_le_bytes().repeat(64 * 32);
-        let mut raster = Raster::new(&mut expected, &font, geometry, 64 * 4).unwrap();
+        let mut raster = Raster::new(&mut expected, &font, geometry.surface(), 64 * 4).unwrap();
         for (row, text) in ["  alpha", "  alpine"].into_iter().enumerate() {
             for (column, scalar) in text.chars().enumerate() {
                 raster.draw(Draw {
@@ -1391,17 +1392,18 @@ impl Drop for Compositor {
 }
 
 fn text_pixels(text: &str) -> Vec<u8> {
-    text_pixels_on(text, td_editor::render::PAPER)
+    text_pixels_on(text, td_ui::raster::PAPER)
 }
 
 fn text_pixels_on(text: &str, background: u32) -> Vec<u8> {
-    use td_editor::render::{Draw, Geometry, GlyphStyle, INK, Primitive, Raster, Scale};
+    use td_editor::render::Geometry;
+    use td_ui::raster::{Draw, GlyphStyle, Primitive, Raster, Scale, INK};
     assert!(text.is_ascii() && !text.is_empty() && text.len() <= 98);
     let font = td_editor::font::pinned().unwrap();
     let width = text.len() * 8;
     let geometry = Geometry::new(width, 16, Scale::new(1).unwrap()).unwrap();
     let mut pixels = background.to_le_bytes().repeat(width * 16);
-    let mut raster = Raster::new(&mut pixels, &font, geometry, width * 4).unwrap();
+    let mut raster = Raster::new(&mut pixels, &font, geometry.surface(), width * 4).unwrap();
     for (column, scalar) in text.chars().enumerate() {
         raster.draw(Draw {
             clip: geometry.bounds(),
@@ -1423,9 +1425,8 @@ fn numbered_pixels(
     after: Observation,
     enabled: bool,
 ) {
-    use td_editor::render::{
-        Draw, Geometry, GlyphStyle, INK, LINE_NUMBER, PAPER, Primitive, Raster, Scale,
-    };
+    use td_editor::render::Geometry;
+    use td_ui::raster::{Draw, GlyphStyle, Primitive, Raster, Scale, INK, LINE_NUMBER, PAPER};
     let state = editor.ok("state");
     let frame = editor.ok(&format!(
         "wait-frame\t{}",
@@ -1435,7 +1436,7 @@ fn numbered_pixels(
     let font = td_editor::font::pinned().unwrap();
     let geometry = Geometry::new(56, 48, Scale::new(1).unwrap()).unwrap();
     let mut expected = PAPER.to_le_bytes().repeat(56 * 48);
-    let mut raster = Raster::new(&mut expected, &font, geometry, 56 * 4).unwrap();
+    let mut raster = Raster::new(&mut expected, &font, geometry.surface(), 56 * 4).unwrap();
     for (row, text) in ["abc", "x", ""].into_iter().enumerate() {
         let digits = (row + 1).to_string();
         for (text, x, ink) in [

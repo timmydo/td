@@ -5,7 +5,8 @@ use crate::dialog::{Close, Closed, Conflict, Scope, Target};
 use crate::font::Font;
 use td_ui::keyboard::{Keymap, Modifiers};
 use crate::keys::Profile;
-use crate::render::{CHROME, Draw, Geometry, GlyphStyle, INK, Label, Primitive, Raster};
+use crate::render::{Geometry, Label};
+use td_ui::raster::{Draw, GlyphStyle, Primitive, Raster, CHROME, INK};
 use td_ui::repeat::Input;
 use crate::ui::{Controller, Event, Outcome};
 use crate::wire::{self, Builder, Cursor, Message};
@@ -3496,7 +3497,7 @@ impl Window {
             None
         };
         let mut raster =
-            Raster::new(&mut self.pixels, &self.font, geometry, width * 4).map_err(error)?;
+            Raster::new(&mut self.pixels, &self.font, geometry.surface(), width * 4).map_err(error)?;
         raster
             .paint(
                 &self
@@ -14217,14 +14218,14 @@ mod tests {
 
     #[test]
     fn path_prompt_grid_scales_without_overlapping_six_rows() {
-        use crate::render::Scale;
+        use td_ui::raster::Scale;
         let font = crate::font::pinned().unwrap();
         let draw = |scale: u8| {
             let s = usize::from(scale);
             let geometry = Geometry::new(320 * s, 200 * s, Scale::new(scale).unwrap()).unwrap()
                 .with_prompt_rows(6).unwrap();
             let mut pixels = vec![0; 320 * 200 * 4 * s * s];
-            let mut raster = Raster::new(&mut pixels, &font, geometry, 320 * 4 * s).unwrap();
+            let mut raster = Raster::new(&mut pixels, &font, geometry.surface(), 320 * 4 * s).unwrap();
             paint_prompt(&mut raster, geometry, "A\nB\nC\nD\nE\nF");
             pixels
         };
@@ -14666,7 +14667,7 @@ mod tests {
             let offset = ((area.y as usize + 15) * 800 + area.x as usize + 6 * 8) * 4;
             assert_eq!(
                 w.pixels.get(offset..offset + 4).unwrap(),
-                (crate::render::MISSPELLED | 0xff000000).to_le_bytes()
+                (td_ui::raster::MISSPELLED | 0xff000000).to_le_bytes()
             );
             for expected in [6..11, 12..17] {
                 w.open_menu(crate::menu::Group::Format).unwrap();

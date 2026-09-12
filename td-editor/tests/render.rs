@@ -1,11 +1,10 @@
-use td_editor::font::{self, Font};
+use td_editor::font;
 use td_editor::keys::Profile;
 use td_editor::layout::{Affinity, Position};
 use td_editor::model::{Command, Editor, Selection};
-use td_editor::render::{
-    self, Draw, Geometry, GlyphStyle, Label, Primitive, Raster, Rect, Scale, Scene, View, Weight,
-};
+use td_editor::render::{self, Geometry, Label, Scene, View};
 use td_editor::Error;
+use td_ui::raster::{self as raster, Primitive, Raster, Rect, Scale, Surface, Weight};
 
 #[allow(clippy::unwrap_used, reason = "bounded test geometry")]
 fn geometry(width: usize, height: usize, scale: u8) -> Geometry {
@@ -26,7 +25,7 @@ fn pixels(editor: &Editor, geometry: Geometry, view: View) -> Vec<u8> {
     let (w, h) = geometry.dimensions();
     let mut pixels = vec![0xaa; w * h * 4];
     let scene = Scene::new(editor, geometry, view, &[], Profile::Windows).unwrap();
-    Raster::new(&mut pixels, &font, geometry, w * 4)
+    Raster::new(&mut pixels, &font, geometry.surface(), w * 4)
         .unwrap()
         .paint(&scene, geometry.bounds())
         .unwrap();
@@ -74,7 +73,7 @@ fn scrollbar_geometry_and_pixels_are_bounded_at_every_scale() {
         let bar = geometry.scrollbar(100, 0).unwrap();
         assert_eq!(
             color(&pixels, 400 * s, bar.thumb.x as usize, bar.thumb.y as usize),
-            render::LINE_NUMBER | 0xff000000
+            raster::LINE_NUMBER | 0xff000000
         );
         assert_eq!(
             color(
@@ -83,7 +82,7 @@ fn scrollbar_geometry_and_pixels_are_bounded_at_every_scale() {
                 bar.track.x as usize,
                 (bar.track.y + i64::from(bar.track.height) - 1) as usize
             ),
-            render::CHROME | 0xff000000
+            raster::CHROME | 0xff000000
         );
     }
     for width in 1..40 {
@@ -124,7 +123,7 @@ fn horizontal_scrollbar_has_its_own_pixels_and_never_overlaps_other_regions() {
         let bar = geometry.horizontal_scrollbar(1001, 0).unwrap();
         assert_eq!(
             color(&full, 400 * s, bar.thumb.x as usize, bar.thumb.y as usize),
-            render::LINE_NUMBER | 0xff000000
+            raster::LINE_NUMBER | 0xff000000
         );
         assert_eq!(
             color(
@@ -133,12 +132,12 @@ fn horizontal_scrollbar_has_its_own_pixels_and_never_overlaps_other_regions() {
                 (bar.track.x + i64::from(bar.track.width) - 1) as usize,
                 bar.track.y as usize
             ),
-            render::CHROME | 0xff000000
+            raster::CHROME | 0xff000000
         );
         let font = font::pinned().unwrap();
         let scene = Scene::new(&doc, geometry, view, &[], Profile::Windows).unwrap();
         let mut damaged = vec![0; full.len()];
-        let mut raster = Raster::new(&mut damaged, &font, geometry, 400 * s * 4).unwrap();
+        let mut raster = Raster::new(&mut damaged, &font, geometry.surface(), 400 * s * 4).unwrap();
         for x in (0..400 * s).step_by(13) {
             raster
                 .paint(
@@ -167,7 +166,7 @@ fn notices_change_only_status_pixels_at_every_scale_and_restore_cleanly() {
             let scene =
                 Scene::new(&editor, geometry, View::default(), &[], Profile::Windows).unwrap();
             let mut original = vec![0u8; width * height * 4];
-            Raster::new(&mut original, &font, geometry, width * 4)
+            Raster::new(&mut original, &font, geometry.surface(), width * 4)
                 .unwrap()
                 .paint(&scene, geometry.bounds())
                 .unwrap();
@@ -175,7 +174,7 @@ fn notices_change_only_status_pixels_at_every_scale_and_restore_cleanly() {
                 "Paste completed. This feedback must never cover the text.",
             ));
             let mut actual = original.clone();
-            Raster::new(&mut actual, &font, geometry, width * 4)
+            Raster::new(&mut actual, &font, geometry.surface(), width * 4)
                 .unwrap()
                 .paint(&scene, geometry.bounds())
                 .unwrap();
@@ -191,7 +190,7 @@ fn notices_change_only_status_pixels_at_every_scale_and_restore_cleanly() {
             if width > 7 {
                 assert_ne!(actual, original, "status feedback was not drawn");
             }
-            Raster::new(&mut actual, &font, geometry, width * 4)
+            Raster::new(&mut actual, &font, geometry.surface(), width * 4)
                 .unwrap()
                 .paint(&scene.notice(None), geometry.bounds())
                 .unwrap();
@@ -233,138 +232,7 @@ fn notice_status_uses_whole_cells_and_marks_truncation() {
 }
 
 #[test]
-fn fills_match_a_pixel_reference_and_leave_padding_and_tail_untouched() {
-    let font = font::pinned().unwrap();
-    let geometry = geometry(17, 13, 1);
-    let stride = 80;
-    let positions = [i64::MIN, -19, -1, 0, 7, 17, i64::MAX];
-    for x in positions {
-        for y in positions {
-            for width in [0, 1, 12, u32::MAX] {
-                let rect = Rect {
-                    x,
-                    y,
-                    width,
-                    height: width,
-                };
-                let clip = Rect {
-                    x: 2,
-                    y: -2,
-                    width: 10,
-                    height: 12,
-                };
-                let mut actual = vec![0xaa; stride * 13 + 24];
-                Raster::new(&mut actual, &font, geometry, stride)
-                    .unwrap()
-                    .draw(Draw {
-                        clip,
-                        primitive: Primitive::Fill {
-                            rect,
-                            color: 0x00345678,
-                        },
-                    });
-                let mut expected = vec![0xaa; actual.len()];
-                for row in 0..13 {
-                    for column in 0..17 {
-                        if inside(rect, column, row) && inside(clip, column, row) {
-                            let at = row * stride + column * 4;
-                            expected
-                                .get_mut(at..at + 4)
-                                .unwrap()
-                                .copy_from_slice(&[0x78, 0x56, 0x34, 0xff]);
-                        }
-                    }
-                }
-                assert_eq!(actual, expected, "{rect:?}");
-            }
-        }
-    }
-}
-
-#[test]
-fn glyph_scaling_clipping_and_fallback_match_font_row_bits() {
-    let font = font::pinned().unwrap();
-    let clip = Rect {
-        x: 1,
-        y: 2,
-        width: 42,
-        height: 30,
-    };
-    for scale in 1..=4 {
-        for weight in [Weight::Regular, Weight::Medium] {
-            for scalar in ['A', ' ', 'λ', '漢', '█', '\u{10ffff}'] {
-                for x in [i64::MIN, -5, 0, 31, i64::MAX] {
-                    for y in [-3, 0, 28] {
-                        let geometry = geometry(49, 35, scale);
-                        let mut actual = vec![0xaa; 49 * 35 * 4];
-                        Raster::new(&mut actual, &font, geometry, 49 * 4)
-                            .unwrap()
-                            .draw(Draw {
-                                clip,
-                                primitive: Primitive::Glyph {
-                                    x,
-                                    y,
-                                    scalar,
-                                    style: GlyphStyle {
-                                        ink: 0xabcdef,
-                                        // Blue is 413/3: the oracle distinguishes floor from rounding.
-                                        background: 0x123457,
-                                        weight,
-                                    },
-                                },
-                            });
-                        let mut expected = vec![0xaa; actual.len()];
-                        for row in 0..35 {
-                            for col in 0..49 {
-                                let dx = col as i128 - i128::from(x);
-                                let dy = row as i128 - i128::from(y);
-                                if !inside(clip, col, row)
-                                    || dx < 0
-                                    || dy < 0
-                                    || dx >= 8 * i128::from(scale)
-                                    || dy >= 16 * i128::from(scale)
-                                {
-                                    continue;
-                                }
-                                let bits = font
-                                    .row(font.index(scalar), dy as usize / usize::from(scale))
-                                    .unwrap();
-                                let set = bits.first().unwrap()
-                                    & (0x80 >> (dx as usize / usize::from(scale)))
-                                    != 0;
-                                let column = dx as usize / usize::from(scale);
-                                let fringe = weight == Weight::Medium
-                                    && column > 0
-                                    && bits.first().unwrap() & (0x80 >> (column - 1)) != 0;
-                                if set || fringe {
-                                    let at = (row * 49 + col) * 4;
-                                    expected
-                                        .get_mut(at..at + 4)
-                                        .unwrap()
-                                        .copy_from_slice(if set {
-                                            &[0xef, 0xcd, 0xab, 0xff]
-                                        } else {
-                                            &[0x89, 0x67, 0x45, 0xff]
-                                        });
-                                }
-                            }
-                        }
-                        assert_eq!(
-                            actual, expected,
-                            "{scalar}, scale {scale}, {weight:?}, ({x},{y})"
-                        );
-                    }
-                }
-            }
-        }
-    }
-}
-
-#[test]
-fn frame_scale_stride_font_and_size_errors_precede_all_writes() {
-    for scale in [0, 5, 255] {
-        assert_eq!(Scale::new(scale), Err(Error::InvalidArgument));
-    }
+fn geometry_axis_and_frame_errors_are_the_toolkits_before_any_layout() {
     for (w, h) in [(0, 1), (1, 0), (8193, 1), (1, 8193), (usize::MAX, 1)] {
         assert_eq!(
             Geometry::new(w, h, Scale::new(1).unwrap()),
@@ -375,22 +243,16 @@ fn frame_scale_stride_font_and_size_errors_precede_all_writes() {
         Geometry::new(8192, 8192, Scale::new(1).unwrap()),
         Err(Error::Limit)
     );
-    assert!(Geometry::new(4096, 2048, Scale::new(4).unwrap()).is_ok());
-    let font = font::pinned().unwrap();
-    let geometry = geometry(4, 4, 1);
-    let mut data = vec![0xaa; 64];
-    for stride in [0, 15, 17, 20, usize::MAX - 3] {
-        assert!(Raster::new(&mut data, &font, geometry, stride).is_err());
-        assert!(data.iter().all(|b| *b == 0xaa));
-    }
-    let mut face = vec![0x72, 0xb5, 0x4a, 0x86];
-    for word in [0u32, 32, 1, 1, 1, 1, 1] {
-        face.extend_from_slice(&word.to_le_bytes());
-    }
-    face.extend_from_slice(b"\0 \xff");
-    let wrong_font = Font::parse(&face).unwrap();
-    assert!(Raster::new(&mut data, &wrong_font, geometry, 16).is_err());
-    assert!(data.iter().all(|b| *b == 0xaa));
+    let geometry = Geometry::new(4096, 2048, Scale::new(4).unwrap()).unwrap();
+    assert_eq!(
+        geometry.surface(),
+        Surface::new(4096, 2048, Scale::new(4).unwrap()).unwrap()
+    );
+    assert_eq!(geometry.bounds(), geometry.surface().bounds());
+    assert_eq!(
+        Geometry::default().surface(),
+        Surface::new(800, 600, Scale::default()).unwrap()
+    );
 }
 
 #[test]
@@ -443,7 +305,7 @@ fn newline_selection_requires_a_full_visible_cell() {
             );
             for y in 48 * s..64 * s {
                 for x in 40 * s..width - 24 * s {
-                    assert_eq!(color(&data, width, x, y), 0xff000000 | render::PAPER);
+                    assert_eq!(color(&data, width, x, y), 0xff000000 | raster::PAPER);
                 }
             }
         }
@@ -466,9 +328,9 @@ fn tabs_and_logical_newlines_have_exact_selection_backgrounds() {
     };
     let focused = pixels(&editor, geometry, view);
     for (x, y) in [(17, 49), (70, 49), (73, 49), (9, 65)] {
-        assert_eq!(color(&focused, 112, x, y), 0xff000000 | render::SELECTED);
+        assert_eq!(color(&focused, 112, x, y), 0xff000000 | raster::SELECTED);
     }
-    assert_eq!(color(&focused, 112, 81, 49), 0xff000000 | render::PAPER);
+    assert_eq!(color(&focused, 112, 81, 49), 0xff000000 | raster::PAPER);
     let inactive = pixels(
         &editor,
         geometry,
@@ -479,7 +341,7 @@ fn tabs_and_logical_newlines_have_exact_selection_backgrounds() {
     );
     assert_eq!(
         color(&inactive, 112, 17, 49),
-        0xff000000 | render::INACTIVE_SELECTION
+        0xff000000 | raster::INACTIVE_SELECTION
     );
     let doc = editor.document(editor.active().unwrap()).unwrap();
     assert_eq!(doc.text(), "a\t\n\n漢z");
@@ -538,8 +400,8 @@ fn wrapping_scrolling_and_partial_tabs_use_layout_cell_intervals() {
         },
     );
     // The tab's left endpoint is offscreen; its remaining span is selected.
-    assert_eq!(color(&actual, 64, 8, 48), 0xff000000 | render::SELECTED);
-    assert_eq!(color(&actual, 64, 39, 48), 0xff000000 | render::SELECTED);
+    assert_eq!(color(&actual, 64, 8, 48), 0xff000000 | raster::SELECTED);
+    assert_eq!(color(&actual, 64, 39, 48), 0xff000000 | raster::SELECTED);
 }
 
 #[test]
@@ -566,7 +428,7 @@ fn caret_affinity_and_oversized_tabs_stay_visible_at_each_scale() {
             for offset in 0..s {
                 assert_eq!(
                     color(&actual, 48 * s, x * s + offset, y * s),
-                    0xff000000 | render::INK
+                    0xff000000 | raster::INK
                 );
             }
         }
@@ -584,7 +446,7 @@ fn caret_affinity_and_oversized_tabs_stay_visible_at_each_scale() {
         );
         assert_eq!(
             color(&actual, 40 * s, 15 * s, 48 * s),
-            0xff000000 | render::INK
+            0xff000000 | raster::INK
         );
     }
 }
@@ -603,7 +465,7 @@ fn damage_repainting_is_identical_to_a_full_frame() {
     let font = font::pinned().unwrap();
     let scene = Scene::new(&editor, geometry, View::default(), &[], Profile::Windows).unwrap();
     let mut damaged = vec![0xaa; full.len()];
-    let mut raster = Raster::new(&mut damaged, &font, geometry, 177 * 4).unwrap();
+    let mut raster = Raster::new(&mut damaged, &font, geometry.surface(), 177 * 4).unwrap();
     for rect in [
         Rect {
             x: 0,
@@ -637,10 +499,10 @@ fn damage_repainting_is_identical_to_a_full_frame() {
     )
     .unwrap();
     assert_eq!(
-        Raster::new(&mut damaged, &font, geometry, 177 * 4)
+        Raster::new(&mut damaged, &font, geometry.surface(), 177 * 4)
             .unwrap()
             .paint(&wrong, geometry.bounds()),
-        Err(Error::InvalidArgument)
+        Err(td_ui::raster::Error::InvalidArgument)
     );
     assert_eq!(damaged, before);
 }
@@ -664,7 +526,7 @@ fn extreme_resizes_and_empty_sessions_only_touch_visible_frame_bytes() {
             let mut data = vec![0xaa; stride * h + 16];
             let scene =
                 Scene::new(&editor, geometry, View::default(), &[], Profile::Windows).unwrap();
-            Raster::new(&mut data, &font, geometry, stride)
+            Raster::new(&mut data, &font, geometry.surface(), stride)
                 .unwrap()
                 .paint(&scene, geometry.bounds())
                 .unwrap();
@@ -882,8 +744,8 @@ fn scene_weight_uses_each_surfaces_own_background_and_keeps_original_ink() {
         .unwrap();
         let mut medium = vec![0xaa; 400 * 120 * 4];
         let mut regular = medium.clone();
-        let mut weighted = Raster::new(&mut medium, &font, geometry, 400 * 4).unwrap();
-        let mut original = Raster::new(&mut regular, &font, geometry, 400 * 4).unwrap();
+        let mut weighted = Raster::new(&mut medium, &font, geometry.surface(), 400 * 4).unwrap();
+        let mut original = Raster::new(&mut regular, &font, geometry.surface(), 400 * 4).unwrap();
         let mut selected = 0;
         scene.emit(geometry.bounds(), &mut |draw| {
             weighted.draw(draw);
@@ -891,13 +753,13 @@ fn scene_weight_uses_each_surfaces_own_background_and_keeps_original_ink() {
             if let Primitive::Glyph { x, y, style, .. } = &mut plain.primitive {
                 assert_eq!(style.weight, Weight::Medium);
                 if *y == 48 && *x == 16 {
-                    assert_eq!(style.ink, if focused { render::PAPER } else { render::INK });
+                    assert_eq!(style.ink, if focused { raster::PAPER } else { raster::INK });
                     assert_eq!(
                         style.background,
                         if focused {
-                            render::SELECTED
+                            raster::SELECTED
                         } else {
-                            render::INACTIVE_SELECTION
+                            raster::INACTIVE_SELECTION
                         }
                     );
                     selected += 1;
@@ -918,10 +780,10 @@ fn scene_weight_uses_each_surfaces_own_background_and_keeps_original_ink() {
             let old = u32::from_le_bytes(*old) & 0xffffff;
             let new = u32::from_le_bytes(*new) & 0xffffff;
             let selected_ink = focused
-                && old == render::PAPER
+                && old == raster::PAPER
                 && (16..24).contains(&(position % 400))
                 && (48..64).contains(&(position / 400));
-            if old == render::INK || selected_ink {
+            if old == raster::INK || selected_ink {
                 assert_eq!(new, old);
             }
             if new != old {
@@ -955,7 +817,7 @@ fn medium_weight_partial_repaints_are_idempotent_at_all_scales_and_focus_states(
             let full = pixels(&editor, geometry, view);
             let scene = Scene::new(&editor, geometry, view, &[], Profile::Windows).unwrap();
             let mut actual = vec![0xaa; full.len()];
-            let mut raster = Raster::new(&mut actual, &font, geometry, w * 4).unwrap();
+            let mut raster = Raster::new(&mut actual, &font, geometry.surface(), w * 4).unwrap();
             // Boundaries deliberately cut through source pixels and glyph fringes.
             for x in (0..w).step_by(13) {
                 let damage = Rect {

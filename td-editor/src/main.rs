@@ -77,9 +77,9 @@ fn main() -> ExitCode {
         [arg] if arg == "--font-license" => {
             let mut output = io::stdout().lock();
             [
-                td_editor::render::FONT_PROVENANCE,
-                td_editor::render::FONT_COPYING,
-                td_editor::render::FONT_LICENSE,
+                td_ui::notices::FONT_PROVENANCE,
+                td_ui::notices::FONT_COPYING,
+                td_ui::notices::FONT_LICENSE,
             ]
             .iter()
             .try_for_each(|notice| output.write_all(notice.as_bytes()))

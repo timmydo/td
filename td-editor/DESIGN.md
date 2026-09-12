@@ -953,19 +953,21 @@ when the document or geometry changes; an admitted origin beyond the text
 draws a blank document area.
 
 `Geometry` admits nonzero axes through 8192 and at most 32 MiB of tight
-four-byte pixels. `Raster` additionally validates the supplied byte stride:
-it must be a multiple of four, at least width times four, with stride times
-height at most 32 MiB and within the borrowed buffer. Validation happens
-before writes. Pixels are B, G, R, 0xff bytes; row padding and any trailing
-allocation bytes are untouched. The backend accepts only 8x16 fonts and
-integer scales 1–4. The font is decoded once by the caller and borrowed;
-the production face and parser are the compositor's existing source modules.
-`--font-license` prints embedded provenance, COPYING and OFL notices from the
-same assets directory. No host font search or new font input is introduced.
-The source recipe must stage these five repository-relative inputs, keeping
-their paths exactly as in the checkout — the two sources relative to
-`td-ui/src`, where td-ui mounts them, and the three notices relative to
-`td-editor/src`, where `render.rs` embeds them:
+four-byte pixels; those ceilings are td-ui's `raster::Surface`, which
+`Geometry::new` constructs and `Geometry::surface` reports. td-ui's `Raster`
+additionally validates the supplied byte stride: it must be a multiple of
+four, at least width times four, with stride times height at most 32 MiB and
+within the borrowed buffer. Validation happens before writes. Pixels are B,
+G, R, 0xff bytes; row padding and any trailing allocation bytes are
+untouched. The backend accepts only 8x16 fonts and integer scales 1–4. The
+font is decoded once by the caller and borrowed; the production face and
+parser are the compositor's existing source modules, reached through td-ui.
+`--font-license` prints the provenance, COPYING and OFL notices
+`td_ui::notices` embeds from the same assets directory. No host font search
+or new font input is introduced. The source recipe must stage these five
+repository-relative inputs, keeping their paths exactly as in the checkout —
+all five relative to `td-ui/src`, where td-ui mounts the two sources and
+embeds the three notices:
 
 ```text
 td-compositor/src/font.rs
@@ -1023,18 +1025,18 @@ wrap also resets horizontal origin. Native scrollbar coordinates use
 floor rounding on both axes, including move/release outside the track,
 so a stationary subpixel click/release does not move the viewport.
 Standalone scene callers opt into the reserved horizontal strip with
-`Geometry::with_horizontal_scrollbar(true)` and an unwrapped `View`.
-Tabs are 160 pixels
-wide with 24 pixels reserved for the close mark. A contiguous slice of tabs
-is shown, keeping the active tab visible; a surface narrower than one tab
-clips that tab. Tiny surfaces may have no document cells; status paints last
-and wins any chrome overlap. The default palette is warm #eee8dc paper,
-#48453f charcoal ink, #e1dbcf chrome, #b5ada0 borders, #536b73 focused
-selection with paper-colored ink, and #c8c4bb unfocused selection with
-ordinary ink. It avoids white backgrounds and near-black text, including
-in the menu, tabs and status bar. These are fixed defaults, not an OS theme
-lookup or a user-configurable theme system. The caret is one logical pixel
-wide; an upstream soft-wrap caret remains inside the row's right edge.
+`Geometry::with_horizontal_scrollbar(true)` and an unwrapped `View`. Tabs
+are 160 pixels wide with 24 pixels reserved for the close mark. A contiguous
+slice of tabs is shown, keeping the active tab visible; a surface narrower
+than one tab clips that tab. Tiny surfaces may have no document cells;
+status paints last and wins any chrome overlap. The default palette is warm
+#eee8dc paper, #48453f charcoal ink, #e1dbcf chrome, #b5ada0 borders,
+#536b73 focused selection with paper-colored ink, and #c8c4bb unfocused
+selection with ordinary ink. It avoids white backgrounds and near-black
+text, including in the menu, tabs and status bar. These are fixed defaults,
+td-ui's `raster` palette, not an OS theme lookup or a user-configurable
+theme system. The caret is one logical pixel wide; an upstream soft-wrap
+caret remains inside the row's right edge.
 
 Every glyph draw carries a `GlyphStyle`: ink, the already-painted background
 and `Regular` or `Medium` weight. Scene text uses Medium. Regular paints
@@ -1061,17 +1063,19 @@ span. A selected logical newline paints one trailing cell only where a full
 visible cell remains, never a sliver in the unused partial-column space;
 soft-wrap boundaries do not invent a newline cell. The renderer emits glyph
 operations only for visible cells. It traverses layout to reach the first
-visible row, then scans each visible row from its start to reach the horizontal
-origin. A selected newline also needs the row's full width. This is not a
-random-access row cache: scene construction and seeking may scan text.
-`Scene::emit` streams solid fills and transparent glyphs without a retained
-operation list. Each draw carries a signed-origin, bounded-size clip;
-`Raster::draw` intersects it with the surface and primitive before writing.
-`Raster::paint` refuses a geometry/scale mismatch before writing. A damage
-rectangle replays the same scene clipped to that region; the caller owns
-damage accumulation and persistent buffer validity. It must repaint newly
-allocated buffers completely. Frame callbacks and release events are not
-implemented by these APIs.
+visible row, then scans each visible row from its start to reach the
+horizontal origin. A selected newline also needs the row's full width. This
+is not a random-access row cache: scene construction and seeking may scan
+text. `Scene::emit` streams solid fills and transparent glyphs without a
+retained operation list; `Scene` implements td-ui's `raster::Composition`,
+so td-ui's `Raster` paints it. Each draw carries a signed-origin,
+bounded-size clip; `Raster::draw` intersects it with the surface and
+primitive before writing. `Raster::paint` refuses a scene laid out for
+another surface or scale before writing. A damage rectangle replays the same
+scene clipped to that region; the caller owns damage accumulation and
+persistent buffer validity. It must repaint newly allocated buffers
+completely. Frame callbacks and release events are not implemented by these
+APIs.
 
 The headless `--preview` command uses these production APIs with a fixed
 800x600, scale-1 two-tab fixture and writes binary P6 PPM to stdout. It does
@@ -1155,16 +1159,19 @@ re-exports `td_ui::font` and `td_ui::wire`, so the editor neither copies
 those modules nor depends on the compositor binary, and mounts no source of
 its own. The keymap compiler, the held-key repeat policy and the pointer
 decoder moved there with them and are used as `td_ui::keyboard`,
-`td_ui::repeat` and `td_ui::pointer`. The source bundle is the td git
-checkout; `cargo build --manifest-path td-editor/Cargo.toml` builds the
-standalone binary without an installed td system, resolving td-ui offline
-from the checkout. The target recipe must stage the td-ui tree beside this
-one (the cargo `local_source_trees` shape td-net uses; a flat direct-rustc
-staging cannot link a second crate) with the shared sources and licenses
-td-ui mounts, and td-ui and shared-source changes must select editor tests
-in affected-checks, which they do through the reader graph. A future move
-of a shared file updates staging, check mappings and all consumers
-atomically.
+`td_ui::repeat` and `td_ui::pointer`; the raster primitives, scrollbar
+geometry, text-run painter, palette and font notices followed and are used
+as `td_ui::raster` and `td_ui::notices`, while `render.rs` keeps the
+editor's `Geometry` and `Scene`, which implements
+`td_ui::raster::Composition`. The source bundle is the td git checkout;
+`cargo build --manifest-path td-editor/Cargo.toml` builds the standalone
+binary without an installed td system, resolving td-ui offline from the
+checkout. The target recipe must stage the td-ui tree beside this one (the
+cargo `local_source_trees` shape td-net uses; a flat direct-rustc staging
+cannot link a second crate) with the shared sources and licenses td-ui
+mounts, and td-ui and shared-source changes must select editor tests in
+affected-checks, which they do through the reader graph. A future move of a
+shared file updates staging, check mappings and all consumers atomically.
 
 ## Wayland and host compatibility
 

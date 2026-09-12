@@ -667,7 +667,7 @@ impl EditorProcess {
     }
     fn menu(&mut self, tab: u64, revision: u64, group: usize, row: usize) {
         let geometry =
-            td_editor::render::Geometry::new(640, 480, td_editor::render::Scale::new(1).unwrap())
+            td_editor::render::Geometry::new(640, 480, td_ui::raster::Scale::new(1).unwrap())
                 .unwrap();
         let header = geometry.menu(group).unwrap();
         self.press(tab, revision, header.x + 4, 8);

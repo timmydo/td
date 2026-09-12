@@ -1,33 +1,37 @@
 # td-ui
 
 td-ui is the dependency-free Rust toolkit that td-owned graphical programs
-share. Today it carries the pinned Unifont face and wire codec and the XKB
-keyboard translation, repeat policy and pointer decoding moved out of
-td-editor; the glyph raster, the Wayland client transport and the chrome
-widgets (menus, prompts, lists, tabs, status rows) that td-editor draws
-follow by the increments below. td-editor is its first consumer; the
-installer front end `td-setup` and td-portal's file chooser follow. This
-document is the component contract and the starting point for successive
-agents; the root `AGENTS.md` and `DEVELOPMENT.md` still govern changes and
-submission.
+share. Today it carries the pinned Unifont face and wire codec, the XKB
+keyboard translation, repeat policy and pointer decoding, and the clipped
+XRGB raster with its palette and scrollbar geometry, all moved out of
+td-editor; the Wayland client transport and the chrome widgets (menus,
+prompts, lists, tabs, status rows) that td-editor draws follow by the
+increments below. td-editor is its first consumer; the installer front end
+`td-setup` and td-portal's file chooser follow. This document is the
+component contract and the starting point for successive agents; the root
+`AGENTS.md` and `DEVELOPMENT.md` still govern changes and submission.
 
 ## Status and scope
 
-The crate exists and carries the display-independent input layer moved out
-of td-editor unchanged in behaviour: the bounded XKB text-v1 keymap compiler
-(`keyboard`, `xkb`), the explicit-clock held-key and repeat policy
-(`repeat`), and `wl_pointer` event decoding with axis-frame accumulation
-(`pointer`). It re-mounts the compositor's `font`, `font_data` and `wire`
-sources exactly as td-editor did, so there is still one Unifont face and one
-wire codec in the tree, and it owns the 8x16 cell constants every consumer
-lays text out on. td-editor depends on it by path and uses those modules
-through the crate's public surface.
+The crate exists and carries, unchanged in behaviour, what has moved out of
+td-editor so far: the bounded XKB text-v1 keymap compiler (`keyboard`,
+`xkb`), the explicit-clock held-key and repeat policy (`repeat`),
+`wl_pointer` event decoding with axis-frame accumulation (`pointer`), and
+the clipped, allocation-free XRGB painter over the pinned face (`raster`):
+rectangle and glyph primitives, the integer scale, the warm palette,
+scrollbar geometry, the text-run painter and the `Raster` that writes a
+`Composition`'s draws into a caller-owned buffer, with the face's provenance
+and licence texts embedded in `notices`. It re-mounts the compositor's
+`font`, `font_data` and `wire` sources exactly as td-editor did, so there is
+still one Unifont face and one wire codec in the tree, and it owns the 8x16
+cell constants every consumer lays text out on. td-editor depends on it by
+path and uses those modules through the crate's public surface.
 
-Not yet moved: the raster primitives and scrollbar, the Wayland client
-transport with its syscall boundary, the seat, keyboard, pointer and
-clipboard device lifecycle, the widgets, and the second and third consumers.
-The increments below schedule them. Until the transport increment lands,
-td-ui has no `unsafe` and forbids it at the crate root.
+Not yet moved: the Wayland client transport with its syscall boundary, the
+seat, keyboard, pointer and clipboard device lifecycle, the widgets, and the
+second and third consumers. The increments below schedule them. Until the
+transport increment lands, td-ui has no `unsafe` and forbids it at the crate
+root.
 
 ## Purpose and trust position
 
@@ -75,11 +79,31 @@ of its own files may name each module.
 - `pointer`: `Event`, `decode` for `wl_pointer` v5 through v7 events and
   `Wheel`, which accumulates axis, axis-discrete and axis-value120 input
   into whole cell rows and columns per frame.
+- `raster`: `Rect`, `Scale` (1 through 4), `Weight`, `GlyphStyle`,
+  `Primitive`, `Draw`, `Surface`, the `Composition` trait, `Scrollbar`,
+  `text_run`, `Raster`, `Error`, the axis and frame-byte ceilings and the
+  palette constants. A composition reports the surface it was laid out for
+  and streams the draws inside a damage rectangle; `Raster::new` validates
+  surface, font, stride and buffer before any write, and `Raster::paint`
+  refuses a composition laid out for another surface. The behavioural
+  contract (clipping, the medium fringe, scrollbar proportions and drag
+  rounding) is the one td-editor/DESIGN.md records under "Implemented
+  reference-renderer contract"; that text moves here with the
+  documentation increment.
+- `notices`: `FONT_PROVENANCE`, `FONT_COPYING` and `FONT_LICENSE`, the
+  texts beside the face in `td-compositor/assets`, embedded at compile
+  time for a program's `--font-license` output.
 
 ## Invariants
 
 - Pure modules read no environment, clock, descriptor or filesystem.
   Adapters pass explicit ticks in milliseconds and explicit byte inputs.
+  `notices` is the one module outside the pure set: three `include_str!`
+  constants and nothing else.
+- The raster writes only inside the validated surface and each draw's
+  clip; row padding and bytes beyond the frame are untouched, and every
+  refusal precedes every write. Medium-weight fringe colours derive from
+  the explicit background a caller paints, never from buffer bytes.
 - Every budget carries over from td-editor unchanged: 1 MiB keymaps, the
   parser's token, depth, keycode, type, virtual-modifier, level,
   interpretation and modifier-map ceilings, and a 768-key held set.
@@ -105,10 +129,19 @@ map, the independent type and key oracles, and the retained
 reproduction. td-editor's in-file window tests read the same fixture by
 relative path rather than carrying a copy.
 
+`tests/raster.rs` holds the pixel oracles moved from td-editor's render
+suite (fills and glyphs at every scale and weight against per-pixel
+references), the validation order, a literal surface's ceilings, a
+composition for another surface refused unpainted, and scrollbar
+proportions along both axes. td-editor's render suite keeps the
+scene-level oracles and the `--preview` checksum, which is byte-identical
+across the move.
+
 `tests/confinement.rs` pins the source inventory, the exact three shared
-source mounts, the absence of ambient I/O in pure modules, the absence of
-`unsafe`, `include!`, `cfg_attr` and any dependency declaration, and that
-the shared sources bind no input interface.
+source mounts, the absence of ambient I/O in pure modules, that `notices`
+is three embedded texts and nothing else, the absence of `unsafe`,
+`include!`, `cfg_attr` and any dependency declaration, and that the shared
+sources bind no input interface.
 
 The builder discovers the crate by existing. Its gate runs `cargo test` and
 all-target Clippy; a change under `td-ui/` selects td-editor's tests through
@@ -120,9 +153,10 @@ the reader graph, because td-editor's manifest names the crate.
    crate exists with the input layer, the shared codecs and the cell
    constants. Landed.
 2. Raster: `Rect`, `Scale`, `Weight`, `GlyphStyle`, `Primitive`, `Draw`,
-   `Raster`, the scrollbar geometry, the text-run and text-block painters,
-   the palette and the font-licence strings. td-editor's `Geometry` and
-   `Scene` compose them and `--preview` stays byte-identical.
+   `Surface`, `Composition`, `Raster`, the scrollbar geometry, the text-run
+   painter, the palette and the font-licence strings. td-editor's
+   `Geometry` and `Scene` compose them and `--preview` stays
+   byte-identical. Landed.
 3. Transport: `sys` (sendmsg, recvmsg, the pinned fcntl requests) with an
    `UNSAFE.md` section, and `wayland::Client` with the connection, object
    table, registry, shm buffers, frame callback, cursor and turn loop

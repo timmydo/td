@@ -97,10 +97,7 @@ fn source_inventory_and_allowances_are_closed() {
         }
         // The keymap compiler, repeat policy and pointer decoder are td-ui's
         // now (`td_ui::keyboard`, `td_ui::repeat`, `td_ui::pointer`); the
-        // input adapter is still the sole file that names them, and the crate
-        // reaches the toolkit only there, in `layout`, which re-exports the
-        // shared cell constants, and at the crate root, which re-exports the
-        // shared font and wire modules.
+        // input adapter is still the sole file that names them.
         if name != "wayland.rs" {
             for module in [
                 "keyboard",
@@ -123,10 +120,32 @@ fn source_inventory_and_allowances_are_closed() {
                 );
             }
         }
+        // The crate reaches the toolkit in a closed set of files: the input
+        // adapter; `layout`, which re-exports the shared cell constants; the
+        // crate root, which re-exports the shared font and wire modules and
+        // maps the raster's errors; the scene, controller and menu, which
+        // compose `td_ui::raster`; and `main`, which prints `td_ui::notices`.
         assert!(
             identifier_count(&text, "td_ui") == 0
-                || matches!(name.as_str(), "wayland.rs" | "layout.rs" | "lib.rs"),
-            "toolkit access outside the adapter, layout and crate root: {name}"
+                || matches!(
+                    name.as_str(),
+                    "wayland.rs" | "layout.rs" | "lib.rs" | "render.rs" | "ui.rs" | "menu.rs"
+                        | "main.rs"
+                ),
+            "toolkit access outside its roster: {name}"
+        );
+        // Naming the toolkit is one thing; re-exporting it is the crate
+        // root's (font, wire) and `layout`'s (the cell constants) alone, so
+        // every other file names `td_ui::` paths directly.
+        let compact: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+        assert_eq!(
+            compact.matches("pubusetd_ui").count() + compact.matches(")usetd_ui").count(),
+            match name.as_str() {
+                "lib.rs" => 2,
+                "layout.rs" => 1,
+                _ => 0,
+            },
+            "toolkit re-export in {name}"
         );
         let budget = match name.as_str() {
             "lib.rs" | "main.rs" => 1,
@@ -142,7 +161,6 @@ fn source_inventory_and_allowances_are_closed() {
             !text.contains("cfg_attr"),
             "conditional allowance in {name}"
         );
-        let compact: String = text.chars().filter(|c| !c.is_whitespace()).collect();
         assert!(!compact.contains("include!("), "generated source in {name}");
         // The compositor's font and wire sources reach this crate only
         // through td-ui, which mounts them by repository path and pins their
