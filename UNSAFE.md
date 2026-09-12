@@ -14,7 +14,7 @@ in `builder/src/sys.rs` and the low-level conversions in `nar.rs` and
 can stay `libc`-free. `ostree.rs` calls one safe syscall wrapper and carries
 no unsafe allowance. Every other
 engine crate (the shared `engine` lib and
-`recipes`/`fetch`/`feed`/`subst`) `forbid`s `unsafe_code`. There are EIGHTEEN
+`recipes`/`fetch`/`feed`/`subst`) `forbid`s `unsafe_code`. There are NINETEEN
 target-side exceptions, each a standalone crate OUTSIDE the
 `builder`/`recipes`/`engine` workspace with a scoped `#[allow]` around its
 recorded raw Linux boundary (the crate itself `#![deny(unsafe_code)]`s).
@@ -32,8 +32,10 @@ layer, no descriptor adoption and no mapping, because the ALSA transfer mode
 it uses is `SNDRV_PCM_ACCESS_RW_INTERLEAVED` and that mode has none. It is
 the first surface to pin its allowance to the entry point rather than the
 module — see §13 for the escape a module-level one permits. The fourteenth,
-`td-editor`, also uses function-level allowances: one syscall instruction and
-one adoption site for freshly installed descriptors, with no mapping. The
+`td-editor`, also uses a function-level allowance: one syscall instruction,
+with no descriptor adoption and no mapping since its Wayland transport
+moved to the nineteenth, `td-ui`, which has one instruction and one
+adoption site for freshly installed descriptors. The
 fifteenth, `td-secret`, shares the portal transport. The sixteenth,
 `td-authd`, confines kernel sender credentials and pidfds to one instruction
 and one descriptor-adoption site. The seventeenth and eighteenth, `td-mail`
@@ -68,12 +70,14 @@ size is a `seek`, and its sector size is a file under `/sys` — so
 `td-install/DESIGN.md`'s D8 asks for that to stay true, and where a later
 increment cannot keep it (rereading a partition table needs `BLKRRPART`,
 an ioctl) the amendment is made here first rather than found in a diff.
-`td-ui`, the shared UI toolkit that td-editor depends on by path, forbids
-`unsafe` at its crate root: the keymap compiler, repeat policy, pointer
-decoder, raster and the font and wire sources it mounts need none. The
-transport increment `td-ui/DESIGN.md` schedules brings the editor's
-`sendmsg`, `recvmsg` and pinned `fcntl` surface with it, and that move is
-an amendment here before it lands, not after.
+
+`td-ui`, the shared UI toolkit that td-editor depends on by path, joined
+the roster when the editor's Wayland transport moved into it (§19). It
+denies `unsafe` at its crate root; the keymap compiler, repeat policy,
+pointer decoder, raster and the font and wire sources it mounts need none.
+A consumer inherits that surface through the toolkit's connection and
+nothing else; reusing the module does not transfer its authorization to a
+raw boundary of the consumer's own, which gets its own entry.
 
 ## Roster
 
@@ -92,11 +96,12 @@ an amendment here before it lands, not after.
 | 11 | `td-profiler` | `close(2)`, `mmap(2)`, `munmap(2)`, `ioctl(2)` with four pinned requests, `setgroups(2)`, `setgid(2)`, `setuid(2)`, `clock_gettime(2)`, `perf_event_open(2)`, `socket(2)`, `bind(2)`, `recvfrom(2)` for fixed kernel CPU notifications |
 | 12 | `td-portal` | `recvmsg(2)`, `sendmsg(2)`, `close(2)` for bounded Wayland transfer and credential replies; one scoped received-descriptor adoption |
 | 13 | `td-audio` | `ioctl(2)` with eleven value-pinned PCM requests, `poll(2)`, `getsockopt(2)` pinned to `SOL_SOCKET`/`SO_PEERCRED` |
-| 14 | `td-editor` | `recvmsg(2)`, `sendmsg(2)`, `fcntl(2)` pinned to `F_DUPFD_CLOEXEC`, `F_GETFL` and `F_SETFL`, `flistxattr(2)` pinned to a size-only query, `renameat2(2)` pinned to two borrowed parents and `RENAME_NOREPLACE`; plus one scoped descriptor adoption |
+| 14 | `td-editor` | `fcntl(2)` pinned to `F_GETFL` and `F_SETFL`, `flistxattr(2)` pinned to a size-only query, `renameat2(2)` pinned to two borrowed parents and `RENAME_NOREPLACE`; no descriptor adoption |
 | 15 | `td-secret` | shared `recvmsg(2)`, `sendmsg(2)`, `close(2)` transport and scoped adoption for bounded credential replies; plus the named credential intake module of §16 |
 | 16 | `td-authd` | `recvmsg(2)`, `setsockopt(2)` with fixed `SO_PASSCRED`/`SO_PASSPIDFD`, `getsockopt(2)` with fixed `SO_PEERCRED`, and `poll(2)` on the peer pidfd; one scoped descriptor adoption; a separate mount instruction/adoption for `unshare(2)`, `open_tree(2)`, `mount_setattr(2)`, and `move_mount(2)` with the fixed portal file-grant values below; plus the separate named credential intake and six-request terminal ioctl/poll modules below |
 | 17 | `td-mail` | `ioctl(2)` (three pinned requests), `poll(2)` — td-sh's terminal half, in `term_sys.rs` |
 | 18 | `td-news` | the same `term_sys.rs`, byte for byte — see [§18](#18-td-news--the-same-terminal-surface) |
+| 19 | `td-ui` | `recvmsg(2)`, `sendmsg(2)`, `fcntl(2)` pinned to `F_DUPFD_CLOEXEC`, the shared Wayland client transport; plus one scoped descriptor adoption — see [§19](#19-td-ui--the-shared-wayland-client-transport) |
 
 The control-plane exception (`builder/src/sys.rs`) is described under The
 rule above and is not part of this numbering. This is a program-role boundary,
@@ -2212,15 +2217,16 @@ amendment here and in `APPLICATIONS.md` §K in the same landing.
 
 ## 14. `td-editor` — the Wayland scratch editor
 
-The editor's `sys.rs` carries exactly FIVE x86-64 Linux syscalls through one
-function-scoped instruction: `recvmsg` (47), `sendmsg` (46), `fcntl` (72),
-`flistxattr` (196), and `renameat2` (316).
-A second function-scoped allowance adopts newly installed nonnegative
-descriptors into `OwnedFd`. Safe `std` owns connection setup, byte-only sends,
-timeouts, file creation/unlinking, positional pixel writes, and every close.
-No raw pointer or unowned received descriptor escapes this private module.
-Other architectures are refused at compile time rather than inheriting its
-ABI. The core, layout, renderer and controller still have no raw boundary.
+The editor's `sys.rs` carries exactly THREE x86-64 Linux syscalls through one
+function-scoped instruction: `fcntl` (72) pinned to `F_GETFL` and
+`F_SETFL`, `flistxattr` (196), and `renameat2` (316). It adopts no
+descriptor: the Wayland transport — `recvmsg`, `sendmsg`, `fcntl` pinned
+to `F_DUPFD_CLOEXEC` and the one adoption site — is td-ui's (§19), which
+the editor depends on by path and reaches only through the toolkit's
+connection. Safe `std` owns file creation/unlinking, positional pixel
+writes and every close. No raw pointer escapes this private module. Other
+architectures are refused at compile time rather than inheriting its ABI.
+The core, layout, renderer and controller still have no raw boundary.
 
 `flistxattr` is the file adapter's attribute query. `files.rs` alone calls
 `has_attributes` with a borrowed, opened regular file: the destination before
@@ -2258,17 +2264,9 @@ provide a source-inode compare-and-swap against a same-authority racer.
 After kernel success the worker always reports publication and updates file
 paths, even when sync/readback fails. See the editor rename contract.
 
-The inherited-stream `fcntl` caller is pinned to `F_DUPFD_CLOEXEC` (1030),
-minimum descriptor 3. It duplicates the borrowed `WAYLAND_SOCKET` descriptor;
-it never adopts or closes that original. The kernel's successful returned
-descriptor is adopted once and converted to `UnixStream`, then checked with
-safe `peer_addr`. Duplication works for sockets, where reopening procfs does
-not. The original remains open until its existing owner or process exit
-closes it. This mode requires exclusive use of the inherited stream; socket
-timeouts are shared with the original. Failed duplication adopts nothing.
-
-Clipboard destinations add only `F_GETFL` (3) and `F_SETFL` (4) to this
-surface. The private `Destination` owner converts a supplied `OwnedFd` into
+The `fcntl` caller is the clipboard destination owner, pinned to `F_GETFL`
+(3) and `F_SETFL` (4). The private `Destination` owner converts a supplied
+`OwnedFd` into
 a safe File, refuses anything but a pipe/socket and writable access mode,
 captures the original status word, adds only `O_NONBLOCK` (0o4000), and reads
 the exact status back before writing. Safe File writes are bounded by the
@@ -2277,7 +2275,7 @@ caller-selected command or flags word escapes the raw module. Only
 `transfer.rs` constructs and uses this owner. Explicit completion and Cancel
 restore the original word with readback and report restoration failures;
 Drop does the same best-effort cleanup on teardown. The owned File remains
-live until restoration has been attempted, then std closes it. No extra
+live until restoration has been attempted, then std closes it. No
 adoption site or close syscall is needed. Flags are shared with the sender's
 open-file description; the caller must supply an exclusively used write
 endpoint, not one concurrently used or reconfigured by another writer.
@@ -2285,22 +2283,12 @@ The public `transfer` module exposes bounded transport owners. The window
 binds its descriptor FIFO to the exact data-source send schema below and
 passes a fresh private socket endpoint for receiving selected UTF-8 text.
 
-The one receive caller is the window connection. `recvmsg` always requests
-`MSG_CMSG_CLOEXEC` (0x40000000), with one borrowed byte slice and 128 aligned
-ancillary bytes. The bounded walk adopts every recognizable nonnegative
-`SOL_SOCKET` (1) / `SCM_RIGHTS` (1) descriptor before checking truncation or
-policy, continuing past unknown records and invalid descriptor entries while
-record boundaries remain trustworthy. A broken boundary stops the walk;
-Linux supplies conforming framing and closes rights that do not fit.
-Truncation, unknown control kinds, invalid entries and broken framing are
-refused after ownership has been established, so drops close all delivered
-descriptors. Valid rights move into the window connection's FIFO, bounded to
-eight pending descriptors independently of its byte queue. Queue overflow,
-parse failure, disconnect and window teardown drop all remaining owners.
-
-The keymap production consumer is `wayland::read_keymap`: one descriptor per
-`wl_keyboard.keymap`, including unsupported formats and events queued on a
-retired keyboard. Retired events drop their descriptor without reading it.
+Received rights reach the editor only through td-ui's connection FIFO
+(§19), which owns every delivered descriptor until one of the two consumers
+below pops it. The keymap consumer is `wayland::read_keymap`: one right
+popped per `wl_keyboard.keymap`, including unsupported formats and events
+queued on a retired keyboard. Retired events drop their descriptor without
+reading it.
 Active text-v1 maps convert the owner to `File` with safe `From`, require a
 regular file covering the advertised 1..=1 MiB extent, and read exactly that
 extent with `FileExt::read_exact_at` at offset zero. This does not move the
@@ -2312,7 +2300,7 @@ hard latency claim is made for a stalled filesystem. A failed replacement
 map disables input and cancels repeat, but leaves scratch text accessible
 if a subsequent map succeeds. A missing descriptor waits at most five seconds
 without assuming ancillary boundaries coincide with wire-message boundaries.
-A test-only reader uses the same ownership path to inspect sent SHM pools.
+Tests inspect sent SHM pools through td-ui's `peer::drain` (§19).
 
 The second production consumer is a data-source send event: exactly one
 descriptor moves to `transfer::Outgoing`, or is dropped on unsupported MIME,
@@ -2323,30 +2311,27 @@ consume arbitrary queued rights. No clipboard endpoint is reopened through
 procfs or admitted as a regular file. Destination writes use std and assume
 Rust's ignored SIGPIPE disposition, as documented by the transfer API.
 
-The only production send caller is the connection's descriptor-send path.
-`sendmsg` carries exactly one borrowed `File` in a 24-byte ancillary extent,
-`cmsg_len=20`, and fixed `SOL_SOCKET`/`SCM_RIGHTS`. The caller supplies only its
-unlinked 0600 regular SHM backing file, or the producer side of a fresh
-private UnixStream pair for `wl_data_offer.receive`. The receiving side uses
-safe std nonblocking mode, is bounded to 1 MiB and is never mapped or written
-to disk. The local producer owner is dropped after the request is sent.
-`MSG_NOSIGNAL` (0x4000) makes peer loss
-an error. A successful short write transfers the descriptor once; only the
-remaining ordinary bytes are retried. Interrupted calls transfer nothing.
-The complete message has one five-second write deadline, including retries.
+The editor hands td-ui's descriptor send (§19) only its unlinked 0600
+regular SHM backing file, or the producer side of a fresh private
+UnixStream pair for `wl_data_offer.receive`. The receiving side uses safe
+std nonblocking mode, is bounded to 1 MiB and is never mapped or written to
+disk. The local producer owner is dropped after the request is sent.
 
 Confinement tests derive the local source inventory from the directory and
-pin the only three shared paths (font, font data, wire codec), per-file keyword
-counts without prose slack, function-only allowances, the complete raw source
-fingerprint, syscall values and all production wrapper call sites. Conditional
-allowances, additional include paths, nested source directories and generated
-source includes are refused. Kernel tests exercise transfer, close-on-exec
-duplication, refusal cleanup and truncated rights; a byte-level synthetic
-control test checks cleanup beyond unrecognized records and invalid entries.
+pin that no source is mounted by path (the shared font, font data and wire
+sources are reached through td-ui), per-file keyword counts without prose
+slack, the function-only allowance, the complete raw source fingerprint,
+syscall values, all production wrapper call sites, that no file adopts a
+descriptor and that the Wayland adapter never names the raw module.
+Conditional allowances, include paths, nested source directories and
+generated source includes are refused. Kernel tests of the transport are
+td-ui's (§19); the editor's exercise the clipboard destination owner over
+real pipes and sockets, the file transaction and the keymap consumer
+against a scripted peer.
 
 No mmap, ioctl, GPU access, poll, close syscall, credential call, child exec,
 raw environment-fd adoption or other received-fd consumer is authorized here. A
-sixth syscall, fourth fcntl command, another caller, incoming descriptor
+fourth syscall, third fcntl command, another caller, incoming descriptor
 consumer, or additional allowance amends this section and
 `td-editor/DESIGN.md` in the same landing.
 
@@ -2631,6 +2616,89 @@ second surface. The gate now admits a sibling path dependency; retiring the
 copy for one is a separate reviewed change to §17 and this entry. The
 import's rule is that the two copies stay identical: a change to either is
 a change to both, reviewed once and recorded in §17.
+
+## 19. `td-ui` — the shared Wayland client transport
+
+td-ui's `sys.rs` carries exactly THREE x86-64 Linux syscalls through one
+function-scoped instruction: `recvmsg` (47), `sendmsg` (46) and `fcntl`
+(72) pinned to `F_DUPFD_CLOEXEC` (1030). A second function-scoped
+allowance adopts newly installed nonnegative descriptors into `OwnedFd`.
+Safe `std` owns connection setup, byte-only sends, timeouts, pool file
+creation and unlinking, and every close. No raw
+pointer or unowned received descriptor escapes the private module; the
+crate root denies `unsafe`, and the two allowances are the module's only
+ones. Other architectures are refused at compile time rather than
+inheriting its ABI. The rest of the toolkit — the raster, the keymap
+compiler, the repeat policy, the pointer decoder and the mounted font and
+wire sources — has no raw boundary.
+
+This surface is the editor's transport subset, moved here so that every
+td-owned graphical program shares one client, with one change: the
+ancillary length is written as the 8-byte `size_t` it is; §14 records
+what the editor kept. Reusing this module does not transfer its
+authorization to a new consumer: a program that depends on td-ui
+inherits the transport through `wayland::Connection` and nothing else,
+and one that needs a raw surface of its own gets its own roster entry.
+
+The inherited-stream `fcntl` caller is pinned to `F_DUPFD_CLOEXEC`,
+minimum descriptor 3. It duplicates the borrowed `WAYLAND_SOCKET`
+descriptor; it never adopts or closes that original. The kernel's
+successful returned descriptor is adopted once and converted to
+`UnixStream`, then checked with safe `peer_addr`. Duplication works for
+sockets, where reopening procfs does not. The original remains open until
+its existing owner or process exit closes it. This mode requires exclusive
+use of the inherited stream; socket timeouts are shared with the original.
+Failed duplication adopts nothing.
+
+The receive callers are the connection's reader, `Connection::read_more`,
+and `peer::drain`, which reads the far end of a socket pair a consumer's
+tests own and hands the rights it adopts to the test as `File`s; it is
+public because those tests are another crate, and it is held to the
+connection's own byte and right budgets. `recvmsg` always requests
+`MSG_CMSG_CLOEXEC` (0x40000000), with one borrowed byte slice and 128
+aligned ancillary bytes. The bounded walk adopts every recognizable
+nonnegative `SOL_SOCKET` (1) / `SCM_RIGHTS` (1) descriptor before checking
+truncation or policy, continuing past unknown records and invalid
+descriptor entries while
+record boundaries remain trustworthy. A broken boundary stops the walk;
+Linux supplies conforming framing and closes rights that do not fit.
+Truncation, unknown control kinds, invalid entries and broken framing are
+refused after ownership has been established, so drops close all
+delivered descriptors. Valid rights move into the connection's FIFO,
+bounded to eight pending descriptors independently of its byte queue.
+Queue overflow, parse failure, disconnect and connection teardown drop all
+remaining owners. The FIFO is never lent out: a consumer's event handler
+pops one right at a time in arrival order, and its only other writer is
+the test-support `peer::push_descriptor`, held to the same bound. Which
+events consume a right, and how, is the consumer's contract (§14 for the
+editor's keymap and data-source events).
+
+The only send caller is the connection's descriptor-send path. `sendmsg`
+carries exactly one borrowed `File` in a 24-byte ancillary extent,
+`cmsg_len=20`, and fixed `SOL_SOCKET`/`SCM_RIGHTS`. The caller supplies
+only its unlinked 0600 regular SHM backing file, or a fresh private
+endpoint a consumer's clipboard hands it. `MSG_NOSIGNAL` (0x4000) makes
+peer loss an error. A successful short write transfers the descriptor
+once; only the remaining ordinary bytes are retried. Interrupted calls
+transfer nothing. The complete message has one five-second write
+deadline, including retries, capped by the startup deadline while the
+consumer holds one.
+
+Confinement tests pin the complete raw source fingerprint, the syscall
+and flag values, the two function-only allowances, the single
+instruction and adoption sites, that no other td-ui module names the
+raw module and that only `wayland.rs` calls its three wrappers, and that
+the crate root denies `unsafe`. Kernel tests exercise transfer,
+close-on-exec duplication, refusal cleanup and truncated rights; a
+byte-level synthetic control test checks cleanup beyond unrecognized
+records and invalid entries.
+
+No mmap, ioctl, GPU access, poll, close syscall, credential call, child
+exec, raw environment-fd adoption or other received-fd consumer is
+authorized here. A fourth syscall, second fcntl command, another caller,
+or additional allowance amends this section and `td-ui/DESIGN.md` in the
+same landing; a consumer that takes a right from the FIFO records that
+consumer in its own section.
 
 ## H1. `td-vm-registrar` — host Git account enrollment
 

@@ -149,7 +149,7 @@ fn source_inventory_and_allowances_are_closed() {
         );
         let budget = match name.as_str() {
             "lib.rs" | "main.rs" => 1,
-            "sys.rs" => 4,
+            "sys.rs" => 2,
             _ => 0,
         };
         assert_eq!(
@@ -191,7 +191,6 @@ fn source_inventory_and_allowances_are_closed() {
             match name.as_str() {
                 "lib.rs" => 1,
                 "files.rs" => 2,
-                "wayland.rs" => 4,
                 "transfer.rs" => 2,
                 _ => 0,
             },
@@ -208,12 +207,10 @@ fn complete_raw_layer_and_production_callers_are_pinned() {
         (h ^ u64::from(b)).wrapping_mul(0x100000001b3)
     });
     assert_eq!(
-        hash, 0x3c3c3618124426d4,
+        hash, 0x2ff5fc90a0b399e4,
         "review the complete raw layer before updating its fingerprint"
     );
     for pin in [
-        "const SYS_SENDMSG: usize = 46;",
-        "const SYS_RECVMSG: usize = 47;",
         "const SYS_FCNTL: usize = 72;",
         "const SYS_FLISTXATTR: usize = 196;",
         "const SYS_RENAMEAT2: usize = 316;",
@@ -222,19 +219,18 @@ fn complete_raw_layer_and_production_callers_are_pinned() {
         "in(\"r8\") a5,",
         "syscall5(number, a1, a2, a3, 0, 0)",
         "syscall3(SYS_FLISTXATTR, file.as_raw_fd() as usize, 0, 0)",
-        "const F_DUPFD_CLOEXEC: usize = 1030;",
         "const F_GETFL: usize = 3;",
         "const F_SETFL: usize = 4;",
         "const O_NONBLOCK: usize = 0o4000;",
         "const O_ACCMODE: usize = 3;",
         "#[allow(unsafe_code)]\nfn syscall5(",
-        "#[allow(unsafe_code)]\nfn adopt(",
     ] {
         assert!(raw.contains(pin), "{pin}");
     }
     assert!(!raw.contains("#![allow("));
     assert_eq!(raw.matches("core::arch::asm!").count(), 1);
-    assert_eq!(raw.matches("OwnedFd::from_raw_fd").count(), 1);
+    assert_eq!(raw.matches("from_raw_fd").count(), 0, "no adoption");
+    assert_eq!(raw.matches("#[allow(unsafe_code)]").count(), 1);
     let transfer = include_str!("../src/transfer.rs");
     assert_eq!(transfer.matches("crate::sys::").count(), 2);
     assert_eq!(
@@ -278,15 +274,31 @@ fn complete_raw_layer_and_production_callers_are_pinned() {
     assert_eq!(adapter.matches("File::from(fd)").count(), 1);
     assert_eq!(adapter.matches("read_keymap(fd, format, size)").count(), 1);
     assert!(adapter.contains("file.read_exact_at(&mut bytes, 0)"));
-    assert_eq!(adapter.matches("crate::sys::").count(), 4);
-    for call in [
-        "crate::sys::inherited(fd)",
-        "crate::sys::send_file(&self.stream, suffix, file)",
-        "crate::sys::receive(&self.stream, &mut self.read)",
-        "crate::sys::receive_for_test(peer, &mut buf)",
-    ] {
-        assert_eq!(adapter.matches(call).count(), 1, "{call}");
-    }
+    // The transport is td-ui's (UNSAFE.md §19): production code reaches it
+    // through one import and nothing else, the tests add the shared peer
+    // support, and nothing names the editor's own raw module.
+    assert_eq!(adapter.matches("crate::sys::").count(), 0);
+    assert!(!adapter.contains("from_raw_fd"));
+    let production = adapter.split("#[cfg(test)]").next().unwrap();
+    assert_eq!(production.matches("td_ui::wayland").count(), 1);
+    assert_eq!(
+        production
+            .matches("use td_ui::wayland::{backing_file, connect, cursor_pixels, endpoint, Connection, WRITE_DEADLINE};")
+            .count(),
+        1
+    );
+    assert_eq!(production.matches("Connection::new(stream)?").count(), 1);
+    assert_eq!(production.matches(".pop_descriptor()").count(), 2);
+    assert_eq!(
+        adapter.matches("td_ui::wayland::peer::drain(peer)").count(),
+        1
+    );
+    assert_eq!(
+        adapter
+            .matches("td_ui::wayland::peer::push_descriptor(")
+            .count(),
+        1
+    );
 }
 
 #[test]

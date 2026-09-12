@@ -1143,7 +1143,7 @@ Relevant code in `td-compositor/src`:
 | --- | --- |
 | `font.rs`, `font_data.rs` | Reuse the checked PSF2 decoder and pinned Unifont face; carry font provenance and license into standalone packaging. |
 | `wire.rs` | Reuse the existing framing codec as shared source, including its malformed-input tests. |
-| `conn.rs` | Reference for object allocation and descriptor lifetime; keep the editor connection adapter separate because this module imports terminal rendering and td's exact keymap. |
+| `conn.rs` | Reference for object allocation and descriptor lifetime; the editor's connection is td-ui's `wayland::Connection`, kept separate from this module because it imports terminal rendering and td's exact keymap. |
 | `term_client.rs` | Reference for configure/ack, release, resize, clipboard and focus lifecycle; do not fork the terminal loop into the editor. |
 | `render.rs` | Reuse bounded glyph drawing and pixel-oracle approach, not terminal `Snapshot`/SGR data structures. |
 | `socket.rs` | Reference for explicit socket lifecycle and refusal of live endpoints; editor control must enforce its own path ownership. |
@@ -1163,7 +1163,12 @@ decoder moved there with them and are used as `td_ui::keyboard`,
 geometry, text-run painter, palette and font notices followed and are used
 as `td_ui::raster` and `td_ui::notices`, while `render.rs` keeps the
 editor's `Geometry` and `Scene`, which implements
-`td_ui::raster::Composition`. The source bundle is the td git checkout;
+`td_ui::raster::Composition`; the Wayland connection (endpoint resolution,
+connect, request framing, the received-right FIFO, pool files and the
+pointer image) followed with its syscall module and is used as
+`td_ui::wayland`, while `wayland.rs` keeps the editor's object table,
+surfaces, buffers, devices and turn loop. The source bundle is the td git
+checkout;
 `cargo build --manifest-path td-editor/Cargo.toml` builds the standalone
 binary without an installed td system, resolving td-ui offline from the
 checkout. The target recipe must stage the td-ui tree beside this one (the
@@ -1922,11 +1927,13 @@ and resize continue during the question. Process termination, transport
 failure and keyboard failure are not recovery mechanisms: scratch text is
 memory-only and may be lost. Users must not keep important text here.
 
-The adapter uses `td-compositor/src/wire.rs` without copying it, through
-`td_ui::wire`. That sixth shared input is staged with the td-ui tree beside
-the five font/license inputs when the future source recipe is added. This
-adapter owns display environment and
-clock access; `files::Session` separately owns document file I/O. The core's
+The adapter frames requests and events with `td_ui::wire` (the
+compositor's `wire.rs`, mounted by td-ui and never copied) and drives
+td-ui's `wayland::Connection` from its own loop; both are staged with the
+td-ui tree beside the five font/license inputs when the future source
+recipe is added. This adapter owns display environment and clock access,
+passing the environment values it reads to td-ui's `endpoint` explicitly;
+`files::Session` separately owns document file I/O. The core's
 explicit-input contract is unchanged.
 
 It binds compositor v4, SHM v1 and xdg shell v1, requiring those minimum
@@ -1949,9 +1956,10 @@ with a diagnostic. The first buffer must be submitted within 20 seconds of
 the initial registry requests; connect separately has a five-second deadline.
 After submission a hidden surface may wait indefinitely for a frame callback;
 callback delivery is not a compositor-liveness requirement.
-One bounded connect worker owns a path connection attempt and drops any late
-result. Each outgoing message has a five-second absolute write deadline,
-capped by the remaining startup deadline until the first commit. Temporary
+td-ui's `connect` gives a path connection attempt one bounded worker and
+drops any late result. Each outgoing message has a five-second absolute
+write deadline, capped by the remaining startup deadline until the first
+commit. Temporary
 backpressure retries within that deadline. Reads also use the remaining
 startup budget. The idle reader uses a 100 ms socket timeout or elapsed-time
 backoff for an inherited nonblocking socket, without changing shared flags.
@@ -1972,16 +1980,19 @@ configured geometry is retained for the next free slot. One scratch raster
 allocation is reused. The immutable pointer image has a separate 1536-byte
 ARGB8888 pool, described below. This is CPU SHM presentation, not GPU rendering.
 
-Pool files use `create_new`, mode 0600, in Rust's temporary directory (TMPDIR
-or `/tmp`); a checked process-local serial and 64 collision attempts bound
-name creation. They are unlinked immediately, then sized and written only
+Pool files come from td-ui's `backing_file`: `create_new`, mode 0600, in
+Rust's temporary directory (TMPDIR or `/tmp`); a checked process-local
+serial and 64 collision attempts bound name creation. They are unlinked
+immediately, then sized and written only
 through the owned `File`. An unlink failure reports the exact residual name.
 No mmap, host library or persistent font/file lookup is involved.
 
-The transport subset of `UNSAFE.md` §14 uses sendmsg, recvmsg and
-F_DUPFD_CLOEXEC, with one syscall site and one owned-descriptor adoption site.
-The file adapter adds a size-only flistxattr query through the same syscall
-site; it neither adopts descriptors nor changes transport authorization.
+The descriptor transport (sendmsg, recvmsg and F_DUPFD_CLOEXEC, one syscall
+site and one owned-descriptor adoption site) is td-ui's, recorded as
+`UNSAFE.md` §19; the editor's own surface, §14, is the file adapter's
+size-only flistxattr query and renameat2 and the clipboard destination's
+fcntl status commands, through one syscall site that adopts no descriptor
+and changes no transport authorization.
 `WAYLAND_SOCKET` takes precedence and is duplicated close-on-exec, not adopted
 directly; its borrowed original is never closed by the adapter and stays open
 until its owner or process exit closes it. The caller must give the adapter
@@ -1990,8 +2001,9 @@ absolute WAYLAND_DISPLAY works without XDG_RUNTIME_DIR, and a relative display
 (default `wayland-0`) is joined to an absolute XDG_RUNTIME_DIR. Invalid explicit
 socket values fail without trying another display. Incoming descriptors are
 immediately owned and queued in a bounded FIFO, independent of byte-message
-boundaries. Only `wl_keyboard.keymap` consumes one. An event waiting for its
-descriptor has a five-second deadline and retains wire order. Waiting cancels
+boundaries. `wl_keyboard.keymap` and `wl_data_source.send` each consume
+one. An event waiting for its descriptor has a five-second deadline and
+retains wire order. Waiting cancels
 repeat and uses the ordinary idle wait, capped to that deadline. Overflow,
 malformed control data, protocol failure and disconnect close all retained
 owners. Retired keyboard events are schema-validated and their keymap rights

@@ -2,14 +2,16 @@
 
 td-ui is the dependency-free Rust toolkit that td-owned graphical programs
 share. Today it carries the pinned Unifont face and wire codec, the XKB
-keyboard translation, repeat policy and pointer decoding, and the clipped
-XRGB raster with its palette and scrollbar geometry, all moved out of
-td-editor; the Wayland client transport and the chrome widgets (menus,
-prompts, lists, tabs, status rows) that td-editor draws follow by the
-increments below. td-editor is its first consumer; the installer front end
-`td-setup` and td-portal's file chooser follow. This document is the
-component contract and the starting point for successive agents; the root
-`AGENTS.md` and `DEVELOPMENT.md` still govern changes and submission.
+keyboard translation, repeat policy and pointer decoding, the clipped XRGB
+raster with its palette and scrollbar geometry, and the Wayland client
+connection over its own raw descriptor transport, all moved out of
+td-editor; the client's object table and turn loop, the device lifecycle
+and the chrome widgets (menus, prompts, lists, tabs, status rows) that
+td-editor draws follow by the increments below. td-editor is its first
+consumer; the installer front end `td-setup` and td-portal's file chooser
+follow. This document is the component contract and the starting point for
+successive agents; the root `AGENTS.md` and `DEVELOPMENT.md` still govern
+changes and submission.
 
 ## Status and scope
 
@@ -21,17 +23,23 @@ the clipped, allocation-free XRGB painter over the pinned face (`raster`):
 rectangle and glyph primitives, the integer scale, the warm palette,
 scrollbar geometry, the text-run painter and the `Raster` that writes a
 `Composition`'s draws into a caller-owned buffer, with the face's provenance
-and licence texts embedded in `notices`. It re-mounts the compositor's
+and licence texts embedded in `notices`; and the Wayland client connection
+(`wayland`): display endpoint resolution from explicit environment values,
+the bounded connect, request framing with at most one descriptor per send,
+the receive path that owns every delivered right until an event's consumer
+takes it, the startup and write deadlines, the unlinked private pool file
+and the pointer image, over the private raw module `sys` that `UNSAFE.md`
+§19 records. It re-mounts the compositor's
 `font`, `font_data` and `wire` sources exactly as td-editor did, so there is
 still one Unifont face and one wire codec in the tree, and it owns the 8x16
 cell constants every consumer lays text out on. td-editor depends on it by
 path and uses those modules through the crate's public surface.
 
-Not yet moved: the Wayland client transport with its syscall boundary, the
-seat, keyboard, pointer and clipboard device lifecycle, the widgets, and the
-second and third consumers. The increments below schedule them. Until the
-transport increment lands, td-ui has no `unsafe` and forbids it at the crate
-root.
+Not yet moved: the client's object table, registry, SHM buffers, frame
+callback, cursor surface and turn loop, the seat, keyboard, pointer and
+clipboard device lifecycle, the widgets, and the second and third
+consumers. The increments below schedule them. td-editor's window drives
+the connection from its own loop until the client lands.
 
 ## Purpose and trust position
 
@@ -93,13 +101,40 @@ of its own files may name each module.
 - `notices`: `FONT_PROVENANCE`, `FONT_COPYING` and `FONT_LICENSE`, the
   texts beside the face in `td-compositor/assets`, embedded at compile
   time for a program's `--font-license` output.
+- `wayland`: `Endpoint` and `endpoint` (from the `WAYLAND_SOCKET`,
+  `WAYLAND_DISPLAY` and `XDG_RUNTIME_DIR` values a consumer passes),
+  `connect`, `Connection` (`new`, `send` with at most one borrowed file,
+  `words`, `take`, `read_more`, `budget`, `pop_descriptor` with the
+  pending `descriptors` count, and the `wait` and `startup_deadline`
+  accessors), the budgets `READ_BYTES`,
+  `PENDING_BYTES`, `DESCRIPTORS`, `WRITE_DEADLINE`, `CONNECT_DEADLINE` and
+  `IDLE_WAIT`, `backing_file`, `CURSOR_WIDTH`, `CURSOR_HEIGHT` and
+  `cursor_pixels`, and `peer`, the test support: `drain` reads the far
+  end of a socket pair a consumer's tests own (giving a blocking end the
+  idle wait as its read timeout when it has none), and `push_descriptor`
+  queues a right under the reader's bound without a socket; both are
+  public because a consumer's tests are another crate, and `drain` is
+  held to the connection's byte and right budgets. The FIFO itself is
+  never lent out: a consumer pops rights one at a time in arrival order
+  and cannot reorder or extend them. Errors are strings under the
+  module's own `Result` alias, as the wire codec's are; a consumer that
+  glob-imports the module shadows `std::result::Result`. The behavioural
+  contract (environment precedence, the
+  deadlines, the byte and right budgets, pool-file creation, the shared
+  status flags of an inherited socket) is the one td-editor/DESIGN.md
+  records under "Implemented scratch-window adapter"; that text moves here
+  with the documentation increment. `sys`, the raw module beneath it, is
+  private to the crate.
 
 ## Invariants
 
 - Pure modules read no environment, clock, descriptor or filesystem.
   Adapters pass explicit ticks in milliseconds and explicit byte inputs.
-  `notices` is the one module outside the pure set: three `include_str!`
-  constants and nothing else.
+  Outside the pure set are `notices` (three `include_str!` constants and
+  nothing else) and the transport pair `wayland` and `sys`, which own the
+  stream, its deadlines and the pool files in the directory a consumer
+  names; even they read no environment variable, taking the display
+  values as explicit arguments.
 - The raster writes only inside the validated surface and each draw's
   clip; row padding and bytes beyond the frame are untouched, and every
   refusal precedes every write. Medium-weight fringe colours derive from
@@ -109,8 +144,11 @@ of its own files may name each module.
   interpretation and modifier-map ceilings, and a 768-key held set.
 - Production code has no `unwrap`, `expect`, panics or panicking indexing;
   invalid input returns a diagnostic or error naming the item.
-- `unsafe` is absent until the transport increment adds `sys` with its own
-  `UNSAFE.md` section; reusing that module does not transfer authorization
+- `unsafe` is confined to `sys`, the transport's raw module, under
+  `UNSAFE.md` §19: two function-scoped allowances, one syscall instruction
+  carrying `recvmsg`, `sendmsg` and `fcntl` pinned to `F_DUPFD_CLOEXEC`,
+  one descriptor adoption site, and a crate root that denies it. Only
+  `wayland` names the module. Reusing it does not transfer authorization
   to a new consumer, which gets its own roster entry.
 - The shared font and wire sources are mounted here by exact repository
   path and nowhere else among td-ui's consumers. A future move of their
@@ -137,11 +175,25 @@ proportions along both axes. td-editor's render suite keeps the
 scene-level oracles and the `--preview` checksum, which is byte-identical
 across the move.
 
+`src/sys.rs` and `src/wayland.rs` carry the kernel tests moved from
+td-editor's adapter: close-on-exec duplication of an inherited stream,
+owned and closed received rights, the ancillary walk past unknown records
+and invalid entries, kernel truncation, byte-only EOF, the eight-right
+FIFO budget with disconnect closing every owner, the idle wait on an
+inherited nonblocking socket without touching its shared flags, write
+backpressure under the startup deadline, environment precedence, and the
+peer reader draining requests with their rights from a pool file that is
+private, unlinked and exactly sized.
+
 `tests/confinement.rs` pins the source inventory, the exact three shared
 source mounts, the absence of ambient I/O in pure modules, that `notices`
-is three embedded texts and nothing else, the absence of `unsafe`,
-`include!`, `cfg_attr` and any dependency declaration, and that the shared
-sources bind no input interface.
+is three embedded texts and nothing else, the absence of `include!`,
+`cfg_attr` and any dependency declaration, that the shared sources bind no
+input interface, and the raw layer: the complete fingerprint of `sys.rs`,
+its syscall and flag values, its two function-only allowances, the single
+instruction and adoption sites, that the crate root denies `unsafe` and
+declares the module private, and that `wayland` is its only caller,
+through exactly four wrapper calls.
 
 The builder discovers the crate by existing. Its gate runs `cargo test` and
 all-target Clippy; a change under `td-ui/` selects td-editor's tests through
@@ -157,10 +209,14 @@ the reader graph, because td-editor's manifest names the crate.
    painter, the palette and the font-licence strings. td-editor's
    `Geometry` and `Scene` compose them and `--preview` stays
    byte-identical. Landed.
-3. Transport: `sys` (sendmsg, recvmsg, the pinned fcntl requests) with an
-   `UNSAFE.md` section, and `wayland::Client` with the connection, object
-   table, registry, shm buffers, frame callback, cursor and turn loop
-   behind an `App` trait. The scripted peer becomes shared test support.
+3. Transport, in two landings. (a) `sys` (sendmsg, recvmsg, the pinned
+   fcntl request) with `UNSAFE.md` §19, and `wayland` with the endpoint,
+   connect, `Connection`, pool files, the pointer image and `peer::drain`;
+   td-editor's window drives the connection from its own loop and its
+   transport tests moved. Landed. (b) `wayland::Client` with the object
+   table, registry, shm buffers, frame callback, cursor surface and turn
+   loop behind an `App` trait; the scripted peer fixture becomes shared
+   test support.
 4. Devices: seat, keyboard, pointer and clipboard device lifecycle inside
    the client, delivered as a typed event stream with serials.
 5. Widgets: text entry, wrapped text block, menu bar and panel, paged list,

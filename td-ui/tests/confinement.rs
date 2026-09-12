@@ -7,8 +7,8 @@
 )]
 
 //! Source-level contracts the compiler cannot express: what the crate is
-//! made of, what it mounts or embeds from elsewhere, and what its pure
-//! modules never touch.
+//! made of, what it mounts or embeds from elsewhere, what its pure modules
+//! never touch, and the complete raw layer beneath the Wayland transport.
 
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -41,7 +41,7 @@ fn source_inventory_and_shared_mounts_are_closed() {
     assert!(!root.join("build.rs").exists());
     let expected: BTreeSet<String> = PURE
         .iter()
-        .chain(["lib.rs", "notices.rs"].iter())
+        .chain(["lib.rs", "notices.rs", "sys.rs", "wayland.rs"].iter())
         .map(|name| name.to_string())
         .collect();
     let mut actual = BTreeSet::new();
@@ -56,11 +56,30 @@ fn source_inventory_and_shared_mounts_are_closed() {
         let text = std::fs::read_to_string(entry.path()).unwrap();
         let compact = compact(&text);
         assert!(!compact.contains("include!("), "generated source in {name}");
-        assert!(!compact.contains("cfg_attr"), "conditional allowance in {name}");
+        assert!(
+            !compact.contains("cfg_attr"),
+            "conditional allowance in {name}"
+        );
         assert_eq!(
             text.matches("unsafe").count(),
-            usize::from(name == "lib.rs"),
+            match name.as_str() {
+                "lib.rs" => 1,
+                "sys.rs" => 4,
+                _ => 0,
+            },
             "unsafe keyword in {name}"
+        );
+        // The raw module is named by the crate root's private declaration
+        // and by the transport's two imports and four wrapper calls; no
+        // other module, shared source or test-support reader reaches it.
+        assert_eq!(
+            identifier_count(&text, "sys"),
+            match name.as_str() {
+                "lib.rs" => 1,
+                "wayland.rs" => 6,
+                _ => 0,
+            },
+            "raw-module access in {name}"
         );
         assert_eq!(
             compact.matches("#[path=").count(),
@@ -68,7 +87,11 @@ fn source_inventory_and_shared_mounts_are_closed() {
             "source paths in {name}"
         );
         if name == "lib.rs" {
-            assert!(compact.starts_with("#![forbid(unsafe_code)]"));
+            assert!(compact.starts_with("#![deny(unsafe_code)]"));
+            assert!(!compact.contains("#![allow("));
+            assert!(compact.contains("modsys;"), "the raw module is declared");
+            assert!(!compact.contains("pubmodsys"), "the raw module is private");
+            assert!(compact.contains("pubmodwayland;"));
             for (file, declaration) in [
                 ("font.rs", "pubmodfont;"),
                 ("font_data.rs", "modfont_data;"),
@@ -82,7 +105,10 @@ fn source_inventory_and_shared_mounts_are_closed() {
                 );
                 let shared =
                     std::fs::read_to_string(root.join("../td-compositor/src").join(file)).unwrap();
-                assert!(!shared.contains("unsafe"), "unsafe through shared source: {file}");
+                assert!(
+                    !shared.contains("unsafe"),
+                    "unsafe through shared source: {file}"
+                );
                 for interface in ["wl_seat", "wl_keyboard", "wl_pointer"] {
                     assert!(
                         !shared.contains(interface),
@@ -184,6 +210,94 @@ fn source_inventory_and_shared_mounts_are_closed() {
 }
 
 #[test]
+fn complete_raw_layer_and_its_sole_caller_are_pinned() {
+    let raw = include_str!("../src/sys.rs");
+    let hash = raw.bytes().fold(0xcbf29ce484222325u64, |h, b| {
+        (h ^ u64::from(b)).wrapping_mul(0x100000001b3)
+    });
+    assert_eq!(
+        hash, 0xf41fcb5886e6e922,
+        "review the complete raw layer before updating its fingerprint"
+    );
+    for pin in [
+        "const SYS_SENDMSG: usize = 46;",
+        "const SYS_RECVMSG: usize = 47;",
+        "const SYS_FCNTL: usize = 72;",
+        "const F_DUPFD_CLOEXEC: usize = 1030;",
+        "const SOL_SOCKET: i32 = 1;",
+        "const SCM_RIGHTS: i32 = 1;",
+        "const MSG_CTRUNC: i32 = 8;",
+        "const MSG_NOSIGNAL: usize = 0x4000;",
+        "const MSG_CMSG_CLOEXEC: usize = 0x4000_0000;",
+        "const HEADER: usize = 16;",
+        "const CONTROL: usize = 128;",
+        "in(\"r10\") a4,",
+        "in(\"r8\") a5,",
+        "syscall5(number, a1, a2, a3, 0, 0)",
+        "syscall3(SYS_FCNTL, fd as usize, F_DUPFD_CLOEXEC, 3)",
+        "#[allow(unsafe_code)]\nfn syscall5(",
+        "#[allow(unsafe_code)]\nfn adopt(",
+        "pub(crate) fn inherited(fd: i32) -> io::Result<UnixStream>",
+        "pub(crate) fn receive(stream: &UnixStream, bytes: &mut [u8])",
+        "pub(crate) fn send_file(stream: &UnixStream, bytes: &[u8], file: &File)",
+    ] {
+        assert!(raw.contains(pin), "{pin}");
+    }
+    assert!(!raw.contains("#![allow("));
+    assert_eq!(raw.matches("core::arch::asm!").count(), 1);
+    assert_eq!(raw.matches("from_raw_fd").count(), 1);
+    let production = raw.split("#[cfg(test)]").next().unwrap();
+    assert!(!production.contains("pub fn"), "nothing raw is public");
+    assert!(!production.contains("pub struct"));
+    assert!(!production.contains("pub(crate) struct"));
+    // The transport is the only caller, through exactly these wrappers.
+    let transport = include_str!("../src/wayland.rs");
+    assert_eq!(transport.matches("sys::").count(), 4);
+    for call in [
+        "sys::inherited(fd)",
+        "sys::send_file(&self.stream, suffix, right)",
+        "sys::receive(&self.stream, &mut self.read)",
+        "sys::receive(stream, &mut buffer)",
+    ] {
+        assert_eq!(transport.matches(call).count(), 1, "{call}");
+    }
+    assert_eq!(transport.matches("use crate::sys;").count(), 1);
+    assert_eq!(
+        transport
+            .matches("use super::{sys, wire, Connection, Message, Result, DESCRIPTORS, PENDING_BYTES, READ_BYTES};")
+            .count(),
+        1
+    );
+    assert!(!transport.contains("from_raw_fd"));
+    assert!(
+        !transport.contains("&mut VecDeque"),
+        "the FIFO is never lent out"
+    );
+    let production = transport.split("#[cfg(test)]").next().unwrap();
+    assert!(
+        !production.contains("as_raw_fd"),
+        "no raw number leaves sys"
+    );
+    for pin in [
+        "pub const DESCRIPTORS: usize = 8;",
+        "pub fn pop_descriptor(&mut self) -> Option<OwnedFd>",
+        "pub fn descriptors(&self) -> usize",
+        "if connection.descriptors.len() >= DESCRIPTORS {",
+        "if bytes.len().saturating_add(count) > PENDING_BYTES",
+        "|| files.len().saturating_add(fds.len()) > DESCRIPTORS",
+        "pub const PENDING_BYTES: usize = 128 * 1024;",
+        "pub const READ_BYTES: usize = 16 * 1024;",
+        "pub const WRITE_DEADLINE: Duration = Duration::from_secs(5);",
+        "pub const CONNECT_DEADLINE: Duration = Duration::from_secs(5);",
+        ".create_new(true)",
+        ".mode(0o600)",
+        "std::fs::remove_file(&path)",
+    ] {
+        assert!(transport.contains(pin), "{pin}");
+    }
+}
+
+#[test]
 fn the_crate_depends_on_nothing_and_declares_its_gate() {
     let manifest =
         std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml")).unwrap();
@@ -208,12 +322,17 @@ fn the_crate_depends_on_nothing_and_declares_its_gate() {
         "unimplemented",
         "indexing_slicing",
     ] {
-        assert!(code.contains(&format!("{lint} = \"deny\"")), "{lint} denied");
+        assert!(
+            code.contains(&format!("{lint} = \"deny\"")),
+            "{lint} denied"
+        );
     }
     let lock =
         std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.lock")).unwrap();
     assert_eq!(
-        lock.lines().filter(|line| line.trim() == "[[package]]").count(),
+        lock.lines()
+            .filter(|line| line.trim() == "[[package]]")
+            .count(),
         1,
         "the leaf's lock lists only itself"
     );

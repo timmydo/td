@@ -8,17 +8,16 @@ use crate::keys::Profile;
 use crate::render::{Geometry, Label};
 use td_ui::raster::{Draw, GlyphStyle, Primitive, Raster, CHROME, INK};
 use td_ui::repeat::Input;
+use td_ui::wayland::{backing_file, connect, cursor_pixels, endpoint, Connection, WRITE_DEADLINE};
 use crate::ui::{Controller, Event, Outcome};
-use crate::wire::{self, Builder, Cursor, Message};
+use crate::wire::{Builder, Cursor, Message};
 use std::collections::{BTreeMap, VecDeque};
-use std::ffi::OsString;
-use std::fs::{File, OpenOptions};
-use std::io::{self, Write};
+use std::fs::File;
+use std::io;
 use std::os::fd::OwnedFd;
-use std::os::unix::fs::{FileExt, OpenOptionsExt};
+use std::os::unix::fs::FileExt;
 use std::os::unix::net::UnixStream;
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 type Result<T> = std::result::Result<T, String>;
@@ -32,238 +31,11 @@ const SURFACE: u32 = 7;
 const XDG_SURFACE: u32 = 8;
 const TOPLEVEL: u32 = 9;
 const OBJECTS: usize = 128;
-const READ_BYTES: usize = 16 * 1024;
-const PENDING_BYTES: usize = 128 * 1024;
 const CONTROL_JOBS_PER_TURN: usize = 2;
 const INITIAL_DEADLINE: Duration = Duration::from_secs(20);
-const WRITE_DEADLINE: Duration = Duration::from_secs(5);
-static NEXT_FILE: AtomicU64 = AtomicU64::new(0);
-
-fn cursor_pixels() -> [u8; 16 * 24 * 4] {
-    let rows = [
-        "#",
-        "##",
-        "#+#",
-        "#++#",
-        "#+++#",
-        "#++++#",
-        "#+++++#",
-        "#++++++#",
-        "#+++++++#",
-        "#++++++++#",
-        "#+++++++++#",
-        "#++++++++++#",
-        "#+++++++#####",
-        "#++++#++#",
-        "#+++# #++#",
-        "#++#  #++#",
-        "#+#    #++#",
-        "##     #++#",
-        "#      ####",
-        "",
-        "",
-        "",
-        "",
-        "",
-    ];
-    let mut pixels = [0; 16 * 24 * 4];
-    for (row, output) in rows.iter().zip(pixels.as_chunks_mut::<64>().0) {
-        for (cell, pixel) in row.bytes().zip(output.as_chunks_mut::<4>().0) {
-            let value: u32 = match cell {
-                b'#' => 0xff48453f,
-                b'+' => 0xfff0eadf,
-                _ => 0,
-            };
-            pixel.copy_from_slice(&value.to_le_bytes());
-        }
-    }
-    pixels
-}
 
 fn error(value: impl std::fmt::Display) -> String {
     value.to_string()
-}
-
-#[derive(Debug, Eq, PartialEq)]
-enum Endpoint {
-    Path(PathBuf),
-    Inherited(i32),
-}
-
-fn endpoint(
-    socket: Option<OsString>,
-    display: Option<OsString>,
-    runtime: Option<OsString>,
-) -> Result<Endpoint> {
-    if let Some(socket) = socket {
-        let value = socket
-            .to_str()
-            .filter(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
-            .ok_or("invalid WAYLAND_SOCKET")?
-            .parse::<i32>()
-            .map_err(error)?;
-        if value < 3 {
-            return Err("WAYLAND_SOCKET must name a descriptor >= 3".into());
-        }
-        return Ok(Endpoint::Inherited(value));
-    }
-    let display = PathBuf::from(display.unwrap_or_else(|| "wayland-0".into()));
-    if display.as_os_str().is_empty() {
-        return Err("empty WAYLAND_DISPLAY".into());
-    }
-    if display.is_absolute() {
-        return Ok(Endpoint::Path(display));
-    }
-    let runtime =
-        PathBuf::from(runtime.ok_or("relative WAYLAND_DISPLAY requires XDG_RUNTIME_DIR")?);
-    if !runtime.is_absolute() {
-        return Err("XDG_RUNTIME_DIR must be absolute".into());
-    }
-    Ok(Endpoint::Path(runtime.join(display)))
-}
-
-fn connect(endpoint: Endpoint) -> Result<UnixStream> {
-    match endpoint {
-        Endpoint::Inherited(fd) => crate::sys::inherited(fd).map_err(error),
-        Endpoint::Path(path) => {
-            // A full Unix listen queue can block connect. One worker owns the
-            // attempt; if the deadline wins, any eventual stream is dropped.
-            let (sender, receiver) = std::sync::mpsc::sync_channel(1);
-            std::thread::Builder::new()
-                .name("editor-connect".into())
-                .spawn(move || {
-                    let _ = sender.send(UnixStream::connect(path));
-                })
-                .map_err(error)?;
-            receiver
-                .recv_timeout(Duration::from_secs(5))
-                .map_err(|e| format!("Wayland connect: {e}"))?
-                .map_err(error)
-        }
-    }
-}
-
-struct Connection {
-    stream: UnixStream,
-    pending: Vec<u8>,
-    read: [u8; READ_BYTES],
-    startup_deadline: Option<Instant>,
-    descriptors: VecDeque<OwnedFd>,
-    wait: Duration,
-}
-
-impl Connection {
-    fn new(stream: UnixStream) -> Result<Self> {
-        stream
-            .set_read_timeout(Some(Duration::from_millis(100)))
-            .map_err(error)?;
-        Ok(Self {
-            stream,
-            pending: Vec::with_capacity(PENDING_BYTES),
-            read: [0; READ_BYTES],
-            startup_deadline: None,
-            descriptors: VecDeque::with_capacity(8),
-            wait: Duration::from_millis(100),
-        })
-    }
-
-    fn send(&mut self, object: u32, opcode: u16, body: Builder, pool: Option<&File>) -> Result<()> {
-        let bytes = body.message(object, opcode)?;
-        let deadline = Instant::now() + self.budget(WRITE_DEADLINE)?;
-        let mut offset = 0;
-        let mut pool = pool;
-        while offset < bytes.len() {
-            let remaining = deadline
-                .checked_duration_since(Instant::now())
-                .filter(|d| !d.is_zero())
-                .ok_or("Wayland write deadline")?;
-            self.stream
-                .set_write_timeout(Some(remaining))
-                .map_err(error)?;
-            let suffix = bytes.get(offset..).ok_or("Wayland write offset")?;
-            let sent = if let Some(file) = pool {
-                crate::sys::send_file(&self.stream, suffix, file)
-            } else {
-                self.stream.write(suffix)
-            };
-            match sent {
-                Ok(0) => return Err("Wayland write returned zero".into()),
-                Ok(count) if count <= suffix.len() => {
-                    offset += count;
-                    pool = None;
-                }
-                Ok(_) => return Err("Wayland write exceeded its buffer".into()),
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                Err(e)
-                    if matches!(
-                        e.kind(),
-                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
-                    ) =>
-                {
-                    std::thread::sleep(
-                        Duration::from_millis(5)
-                            .min(deadline.saturating_duration_since(Instant::now())),
-                    );
-                }
-                Err(e) => return Err(format!("Wayland write: {e}")),
-            }
-        }
-        Ok(())
-    }
-
-    fn words(&mut self, object: u32, opcode: u16, words: &[u32]) -> Result<()> {
-        let mut body = Builder::new();
-        for word in words {
-            body.u32(*word);
-        }
-        self.send(object, opcode, body, None)
-    }
-
-    fn read_more(&mut self) -> Result<()> {
-        let wait = self.budget(self.wait)?;
-        self.stream.set_read_timeout(Some(wait)).map_err(error)?;
-        let start = Instant::now();
-        match crate::sys::receive(&self.stream, &mut self.read) {
-            Ok((0, _)) => Err("Wayland compositor disconnected".into()),
-            Ok((count, fds)) => {
-                if self.pending.len().saturating_add(count) > PENDING_BYTES
-                    || self.descriptors.len().saturating_add(fds.len()) > 8
-                {
-                    return Err("Wayland receive budget".into());
-                }
-                self.descriptors.extend(fds);
-                self.pending
-                    .extend_from_slice(self.read.get(..count).ok_or("Wayland receive length")?);
-                Ok(())
-            }
-            Err(e)
-                if matches!(
-                    e.kind(),
-                    io::ErrorKind::WouldBlock
-                        | io::ErrorKind::TimedOut
-                        | io::ErrorKind::Interrupted
-                ) =>
-            {
-                // Inherited nonblocking sockets do not honor SO_RCVTIMEO.
-                if e.kind() == io::ErrorKind::WouldBlock {
-                    std::thread::sleep(wait.saturating_sub(start.elapsed()));
-                }
-                Ok(())
-            }
-            Err(e) => Err(format!("Wayland receive: {e}")),
-        }
-    }
-
-    fn budget(&self, limit: Duration) -> Result<Duration> {
-        match self.startup_deadline {
-            Some(deadline) => deadline
-                .checked_duration_since(Instant::now())
-                .filter(|d| !d.is_zero())
-                .map(|d| d.min(limit))
-                .ok_or("Wayland initial commit deadline".into()),
-            None => Ok(limit),
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1353,8 +1125,7 @@ impl Window {
         if let KeyboardEvent::Map(format, size) = event {
             let fd = self
                 .connection
-                .descriptors
-                .pop_front()
+                .pop_descriptor()
                 .ok_or("missing keymap descriptor")?;
             if !active {
                 return Ok(());
@@ -1837,12 +1608,14 @@ impl Window {
                 }
             }
         }
-        self.connection.wait = Duration::from_millis(self.input.wait_ms(now));
+        self.connection
+            .set_wait(Duration::from_millis(self.input.wait_ms(now)));
         if self.clipboard.incoming.is_some()
             || self.clipboard.outgoing.is_some()
             || self.path_completion.as_ref().is_some_and(|worker| worker.pending())
         {
-            self.connection.wait = self.connection.wait.min(Duration::from_millis(10));
+            self.connection
+                .set_wait(self.connection.wait().min(Duration::from_millis(10)));
         }
         self.cancel_stale_paste();
         self.searches.observe(self.ui.editor());
@@ -1860,7 +1633,8 @@ impl Window {
             Err(detail) => self.notify(format!("Spelling cancelled: {detail}")),
         }
         if self.spelling.running() {
-            self.connection.wait = self.connection.wait.min(Duration::from_millis(1));
+            self.connection
+                .set_wait(self.connection.wait().min(Duration::from_millis(1)));
         }
         self.observe_control_jobs();
         self.control_tick();
@@ -1874,7 +1648,8 @@ impl Window {
             return;
         }
         if self.control.is_some() {
-            self.connection.wait = self.connection.wait.min(Duration::from_millis(10));
+            self.connection
+                .set_wait(self.connection.wait().min(Duration::from_millis(10)));
         }
         let mut budget = CONTROL_JOBS_PER_TURN;
         // Inspect each held job once. Replies share the ordinary admission budget.
@@ -3529,7 +3304,7 @@ impl Window {
         self.buffers.get_mut(index).ok_or("buffer slot")?.busy = true;
         // Occluded surfaces may receive no callback until visible. Only the
         // initial handshake/submission has a deadline.
-        self.connection.startup_deadline = None;
+        self.connection.set_startup_deadline(None);
         self.callback = Some(callback);
         self.frames.submit(stamp).map_err(error)?;
         Ok(())
@@ -3573,7 +3348,8 @@ impl Window {
         let started = Instant::now();
         let now = || u64::try_from(started.elapsed().as_millis()).map_err(error);
         let mut waiting: Option<(Message, Instant)> = None;
-        self.connection.startup_deadline = Some(Instant::now() + INITIAL_DEADLINE);
+        self.connection
+            .set_startup_deadline(Some(Instant::now() + INITIAL_DEADLINE));
         self.connection.words(DISPLAY, 1, &[REGISTRY])?;
         self.connection.words(DISPLAY, 0, &[SYNC])?;
         while !self.closed {
@@ -3587,14 +3363,14 @@ impl Window {
                         }
                         Some((message, deadline))
                     }
-                    None => wire::take(&mut self.connection.pending)?
+                    None => self.connection.take()?
                         .map(|m| (m, Instant::now() + WRITE_DEADLINE)),
                 };
                 let Some((message, deadline)) = next else {
                     break;
                 };
                 if self.message_needs_descriptor(&message)?
-                    && self.connection.descriptors.is_empty()
+                    && self.connection.descriptors() == 0
                 {
                     if Instant::now() >= deadline {
                         return Err("Wayland descriptor deadline".into());
@@ -3615,12 +3391,12 @@ impl Window {
             self.draw()?;
             if !self.closed && processed < 256 {
                 if let Some((_, deadline)) = &waiting {
-                    self.connection.wait = self.connection.wait.min(
-                        deadline
-                            .checked_duration_since(Instant::now())
-                            .filter(|d| !d.is_zero())
-                            .ok_or("Wayland descriptor deadline")?,
-                    );
+                    let remaining = deadline
+                        .checked_duration_since(Instant::now())
+                        .filter(|d| !d.is_zero())
+                        .ok_or("Wayland descriptor deadline")?;
+                    self.connection
+                        .set_wait(self.connection.wait().min(remaining));
                 }
                 self.connection.read_more()?;
             }
@@ -5658,8 +5434,7 @@ impl Window {
             crate::data::SourceEvent::Send(mime) => {
                 let fd = self
                     .connection
-                    .descriptors
-                    .pop_front()
+                    .pop_descriptor()
                     .ok_or("missing clipboard destination")?;
                 if active
                     && matches!(mime.as_str(), crate::data::UTF8 | crate::data::PLAIN)
@@ -6005,37 +5780,6 @@ fn paint_prompt(raster: &mut Raster<'_, '_>, geometry: Geometry, text: &str) {
     }
 }
 
-fn backing_file(directory: &Path, size: usize) -> Result<File> {
-    for _ in 0..64 {
-        let serial = NEXT_FILE
-            .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
-            .map_err(|_| "pool name counter exhausted")?;
-        let path = directory.join(format!(".td-editor-shm-{}-{serial}", std::process::id()));
-        match OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&path)
-        {
-            Ok(file) => {
-                std::fs::remove_file(&path)
-                    .map_err(|e| format!("unlink pool {}: {e}", path.display()))?;
-                file.set_len(size as u64).map_err(error)?;
-                return Ok(file);
-            }
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
-            Err(e) => {
-                return Err(format!(
-                    "create Wayland pool in {}: {e}",
-                    directory.display()
-                ));
-            }
-        }
-    }
-    Err("Wayland pool filename collision budget".into())
-}
-
 /// Run the scratch fixture using the normal Wayland environment.
 pub fn preview() -> io::Result<()> {
     preview_with_profile(Profile::Windows)
@@ -6145,8 +5889,14 @@ pub fn file_window(options: FileWindowOptions) -> io::Result<()> {
 mod tests {
     use super::*;
     use crate::layout::CELL_WIDTH;
-    use std::io::Read;
+    use crate::wire;
+    use std::io::{Read, Write};
     use std::os::unix::fs::MetadataExt;
+    use std::path::Path;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use td_ui::wayland::Endpoint;
+
+    static NEXT_FILE: AtomicU64 = AtomicU64::new(0);
 
     fn message(object: u32, opcode: u16, words: &[u32]) -> Message {
         let mut b = Builder::new();
@@ -6192,33 +5942,7 @@ mod tests {
     }
 
     fn drain(peer: &UnixStream) -> (Vec<Message>, Vec<File>) {
-        let mut bytes = Vec::new();
-        let mut files = Vec::new();
-        loop {
-            let mut buf = [0; 16384];
-            match crate::sys::receive_for_test(peer, &mut buf) {
-                Ok((0, _)) => break,
-                Ok((n, fds)) => {
-                    bytes.extend_from_slice(&buf[..n]);
-                    files.extend(fds.into_iter().map(File::from));
-                }
-                Err(e)
-                    if matches!(
-                        e.kind(),
-                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
-                    ) =>
-                {
-                    break;
-                }
-                Err(e) => panic!("{e}"),
-            }
-        }
-        let mut messages = Vec::new();
-        while let Some(m) = wire::take(&mut bytes).unwrap() {
-            messages.push(m);
-        }
-        assert!(bytes.is_empty());
-        (messages, files)
+        td_ui::wayland::peer::drain(peer).unwrap()
     }
 
     fn done(w: &mut Window) {
@@ -6625,7 +6349,7 @@ mod tests {
         body.u32(file.metadata().unwrap().len() as u32);
         sender.send(device, 0, body, Some(file)).unwrap();
         w.connection.read_more().unwrap();
-        while let Some(event) = wire::take(&mut w.connection.pending).unwrap() {
+        while let Some(event) = w.connection.take().unwrap() {
             w.event(event).unwrap();
         }
     }
@@ -7302,7 +7026,7 @@ mod tests {
         body.string(mime).unwrap();
         sender.send(source, 1, body, Some(file)).unwrap();
         w.connection.read_more().unwrap();
-        let event = wire::take(&mut w.connection.pending).unwrap().unwrap();
+        let event = w.connection.take().unwrap().unwrap();
         assert!(w.message_needs_descriptor(&event).unwrap());
         w.event(event).unwrap();
     }
@@ -7621,14 +7345,14 @@ mod tests {
         assert!(w.clipboard.offers.get(&0xff00_0011).unwrap().retired);
         let source = w.allocate(Kind::RetiredClipboardSource).unwrap();
         let (_reader, writer) = std::io::pipe().unwrap();
-        w.connection.descriptors.push_back(writer.into());
+        td_ui::wayland::peer::push_descriptor(&mut w.connection, writer.into()).unwrap();
         let mut malformed = text_event(source, 1, crate::data::PLAIN);
         malformed.payload.extend_from_slice(&[0; 4]);
         assert!(w.message_needs_descriptor(&malformed).is_err());
         assert!(w.event(malformed).is_err());
-        assert_eq!(w.connection.descriptors.len(), 1);
+        assert_eq!(w.connection.descriptors(), 1);
         w.event(text_event(source, 1, crate::data::PLAIN)).unwrap();
-        assert!(w.connection.descriptors.is_empty());
+        assert_eq!(w.connection.descriptors(), 0);
         assert!(w.clipboard.outgoing.is_none());
         w.event(message(DISPLAY, 1, &[source])).unwrap();
     }
@@ -7667,7 +7391,7 @@ mod tests {
             source_send(&mut w, &peer, source, mime, &writer);
             drop(writer);
             assert_eq!(reader.read(&mut [0]).unwrap(), 0);
-            assert!(w.connection.descriptors.is_empty());
+            assert_eq!(w.connection.descriptors(), 0);
         }
         assert!(w.clipboard.source.is_none());
         w.tick(1, true).unwrap();
@@ -7828,7 +7552,7 @@ mod tests {
         drop(writer);
         assert_eq!(reader.read(&mut [0]).unwrap(), 0);
         assert!(!w.closed);
-        assert!(w.connection.descriptors.is_empty());
+        assert_eq!(w.connection.descriptors(), 0);
         assert_eq!(w.ui.editor().document(1).unwrap().text(), "é abc\n");
     }
 
@@ -13645,7 +13369,7 @@ mod tests {
         assert_eq!(control_answer(&mut w, &mut client, &peer), before);
         assert!(w.search.is_some());
         assert_eq!(w.control_response(&state), before);
-        assert_eq!(w.connection.wait, Duration::from_millis(10));
+        assert_eq!(w.connection.wait(), Duration::from_millis(10));
 
         let text = format!("1\t11\ttext\t{tab}\t{revision}\t0\t4");
         let mut client = control_client(&path, text.as_bytes());
@@ -14721,7 +14445,7 @@ mod tests {
                 assert!(w.spelling.running());
             }
             assert!(w.spelling.view(w.ui.editor()).1.is_empty());
-            assert!(w.connection.wait <= Duration::from_millis(1));
+            assert!(w.connection.wait() <= Duration::from_millis(1));
             w.chord(cancel, false).unwrap();
             w.end_turn(2, false).unwrap();
             assert!(!w.spelling.running());
@@ -15371,7 +15095,7 @@ mod tests {
         assert!(w.device.is_none());
         send_map(&mut w, &peer, device, &map_file()); // in-flight retired event
         assert!(w.input.map.is_none());
-        assert!(w.connection.descriptors.is_empty());
+        assert_eq!(w.connection.descriptors(), 0);
         w.event(message(seat, 0, &[3])).unwrap();
         assert_ne!(
             w.device,
@@ -15594,32 +15318,6 @@ mod tests {
     }
 
     #[test]
-    fn descriptor_queue_overflow_and_disconnect_drop_every_owner() {
-        let (a, b) = UnixStream::pair().unwrap();
-        let mut sender = Connection::new(a).unwrap();
-        let mut receiver = Connection::new(b).unwrap();
-        let mut endpoints = Vec::new();
-        for n in 0..9 {
-            let (peer, endpoint) = UnixStream::pair().unwrap();
-            peer.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
-            let file = File::from(OwnedFd::from(endpoint));
-            sender.send(99, 0, Builder::new(), Some(&file)).unwrap();
-            drop(file);
-            if n < 8 {
-                receiver.read_more().unwrap();
-            } else {
-                assert!(receiver.read_more().unwrap_err().contains("budget"));
-            }
-            endpoints.push(peer);
-        }
-        assert_eq!(receiver.descriptors.len(), 8);
-        drop(receiver);
-        for mut peer in endpoints {
-            assert_eq!(peer.read(&mut [0]).unwrap(), 0);
-        }
-    }
-
-    #[test]
     fn full_loop_waits_for_rights_sent_after_the_complete_keymap_event() {
         let (client, mut peer) = UnixStream::pair().unwrap();
         peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
@@ -15711,37 +15409,8 @@ mod tests {
             .unwrap()
             .text()
             .starts_with("atd-editor"));
-        assert!(w.connection.descriptors.is_empty());
+        assert_eq!(w.connection.descriptors(), 0);
         assert!(drain(&peer).0.contains(&message(WM, 3, &[987])));
-    }
-
-    #[test]
-    fn wayland_environment_precedence_and_invalid_inherited_values() {
-        let ep = |s: Option<&str>, d: Option<&str>, r: Option<&str>| {
-            endpoint(s.map(Into::into), d.map(Into::into), r.map(Into::into))
-        };
-        assert_eq!(
-            ep(Some("12"), Some("/ignored"), None).unwrap(),
-            Endpoint::Inherited(12)
-        );
-        for value in ["", "-1", "+3", "0", "2", "3x", "9999999999999"] {
-            assert!(ep(Some(value), Some("/valid"), None).is_err());
-        }
-        assert_eq!(
-            ep(None, Some("/run/other"), None).unwrap(),
-            Endpoint::Path("/run/other".into())
-        );
-        assert_eq!(
-            ep(None, None, Some("/run/user/123")).unwrap(),
-            Endpoint::Path("/run/user/123/wayland-0".into())
-        );
-        assert_eq!(
-            ep(None, Some("nested/socket"), Some("/tmp/runtime")).unwrap(),
-            Endpoint::Path("/tmp/runtime/nested/socket".into())
-        );
-        assert!(ep(None, Some("relative"), None).is_err());
-        assert!(ep(None, None, Some("relative")).is_err());
-        assert!(ep(None, Some(""), Some("/tmp")).is_err());
     }
 
     #[test]
@@ -15966,82 +15635,6 @@ mod tests {
     }
 
     #[test]
-    fn nonblocking_idle_receive_waits_without_changing_shared_flags() {
-        use std::os::fd::AsRawFd;
-        let (stream, _peer) = UnixStream::pair().unwrap();
-        stream.set_nonblocking(true).unwrap();
-        let original = stream.try_clone().unwrap();
-        let mut connection = Connection::new(stream).unwrap();
-        let start = Instant::now();
-        connection.read_more().unwrap();
-        assert!(start.elapsed() >= Duration::from_millis(90));
-        let status =
-            std::fs::read_to_string(format!("/proc/self/fdinfo/{}", original.as_raw_fd())).unwrap();
-        let flags = status
-            .lines()
-            .find_map(|line| line.strip_prefix("flags:\t"))
-            .unwrap();
-        assert_ne!(
-            u32::from_str_radix(flags, 8).unwrap() & 0o4000,
-            0,
-            "shared nonblocking flag was changed"
-        );
-    }
-
-    fn saturated_socket() -> (UnixStream, UnixStream, usize) {
-        let (mut stream, peer) = UnixStream::pair().unwrap();
-        stream.set_nonblocking(true).unwrap();
-        peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
-        let mut filled = 0;
-        loop {
-            match stream.write(&[0xab; 4096]) {
-                Ok(n) => {
-                    assert_ne!(n, 0);
-                    filled += n;
-                    assert!(filled <= 4 * 1024 * 1024);
-                }
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                Err(e) => panic!("{e}"),
-            }
-        }
-        (stream, peer, filled)
-    }
-
-    #[test]
-    fn temporary_write_backpressure_retries_and_startup_caps_the_deadline() {
-        let (stream, mut peer, filled) = saturated_socket();
-        let reader = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(30));
-            let mut bytes = vec![0; filled];
-            peer.read_exact(&mut bytes).unwrap();
-            assert!(bytes.iter().all(|b| *b == 0xab));
-            let mut request = vec![0; 12];
-            peer.read_exact(&mut request).unwrap();
-            assert_eq!(
-                wire::take(&mut request).unwrap().unwrap(),
-                message(WM, 3, &[77])
-            );
-        });
-        let mut connection = Connection::new(stream).unwrap();
-        connection.words(WM, 3, &[77]).unwrap();
-        reader.join().unwrap();
-
-        let (stream, _peer, _) = saturated_socket();
-        let mut connection = Connection::new(stream).unwrap();
-        connection.startup_deadline = Some(Instant::now() + Duration::from_millis(25));
-        let start = Instant::now();
-        assert!(connection
-            .words(WM, 3, &[77])
-            .unwrap_err()
-            .contains("deadline"));
-        assert!(start.elapsed() >= Duration::from_millis(20));
-        assert!(connection
-            .read_more()
-            .unwrap_err()
-            .contains("initial commit deadline"));
-    }
-
-    #[test]
     fn a_later_free_matching_buffer_is_preferred_over_replacing_the_first() {
         let (mut w, peer) = fixture();
         configure(&mut w, 100, 100);
@@ -16068,11 +15661,12 @@ mod tests {
     #[test]
     fn hidden_surface_waits_for_visibility_without_a_callback_deadline() {
         let (mut w, peer) = fixture();
-        w.connection.startup_deadline = Some(Instant::now() + INITIAL_DEADLINE);
+        w.connection
+            .set_startup_deadline(Some(Instant::now() + INITIAL_DEADLINE));
         configure(&mut w, 100, 100);
         w.draw().unwrap();
         drain(&peer);
-        assert!(w.connection.startup_deadline.is_none());
+        assert!(w.connection.startup_deadline().is_none());
         assert!(w.callback.is_some());
         assert_eq!(w.frames.wait(1), Ok(None));
         assert_eq!(w.connection.budget(WRITE_DEADLINE).unwrap(), WRITE_DEADLINE);
@@ -16143,7 +15737,7 @@ mod tests {
                 start.elapsed() < INITIAL_DEADLINE,
                 "Weston presentation timeout"
             );
-            while let Some(m) = wire::take(&mut w.connection.pending).unwrap() {
+            while let Some(m) = w.connection.take().unwrap() {
                 w.event(m).unwrap();
             }
             w.draw().unwrap();
