@@ -1,0 +1,137 @@
+# td-ui
+
+td-ui is the dependency-free Rust toolkit that td-owned graphical programs
+share. Today it carries the pinned Unifont face and wire codec and the XKB
+keyboard translation, repeat policy and pointer decoding moved out of
+td-editor; the glyph raster, the Wayland client transport and the chrome
+widgets (menus, prompts, lists, tabs, status rows) that td-editor draws
+follow by the increments below. td-editor is its first consumer; the
+installer front end `td-setup` and td-portal's file chooser follow. This
+document is the component contract and the starting point for successive
+agents; the root `AGENTS.md` and `DEVELOPMENT.md` still govern changes and
+submission.
+
+## Status and scope
+
+The crate exists and carries the display-independent input layer moved out
+of td-editor unchanged in behaviour: the bounded XKB text-v1 keymap compiler
+(`keyboard`, `xkb`), the explicit-clock held-key and repeat policy
+(`repeat`), and `wl_pointer` event decoding with axis-frame accumulation
+(`pointer`). It re-mounts the compositor's `font`, `font_data` and `wire`
+sources exactly as td-editor did, so there is still one Unifont face and one
+wire codec in the tree, and it owns the 8x16 cell constants every consumer
+lays text out on. td-editor depends on it by path and uses those modules
+through the crate's public surface.
+
+Not yet moved: the raster primitives and scrollbar, the Wayland client
+transport with its syscall boundary, the seat, keyboard, pointer and
+clipboard device lifecycle, the widgets, and the second and third consumers.
+The increments below schedule them. Until the transport increment lands,
+td-ui has no `unsafe` and forbids it at the crate root.
+
+## Purpose and trust position
+
+td-ui is target-zone source: it ships only inside the programs that embed
+it, as a Cargo path dependency resolved offline from the checkout. It is not
+a runtime library, a plugin host, a theme system or a general Wayland
+toolkit, and it does not claim third-party toolkit compatibility. It carries
+no foreign payload and no external crate; its lock lists exactly its own
+package, and its confinement tests pin that its manifest declares no
+dependency at all.
+
+A consumer names it as `td-ui = { path = "../td-ui" }`. That is the one
+sibling-dependency spelling `builder/src/affected.rs` admits, and the
+consumer's lock then lists exactly its own package plus td-ui. A program
+that depends on td-ui is built by a cargo recipe that stages sibling source
+trees (`local_source_trees`, the td-net shape); a flat-staged direct-rustc
+recipe cannot link a second crate. td-editor has no recipe yet, so nothing
+changes for packaging until one exists.
+
+## Public surface
+
+The crate's `pub` items are the whole contract. Consumers use them through
+`td_ui::` paths and nothing else; a consumer's confinement tests pin which
+of its own files may name each module.
+
+- `CELL_WIDTH`, `CELL_HEIGHT`: the 8x16 bitmap cell. `font::pinned` is held
+  to them by a test.
+- `font`: the compositor's PSF2 reader and pinned Unifont face, unchanged.
+  Provenance and licences stay in `td-compositor/assets`.
+- `wire`: the compositor's Wayland framing codec, unchanged.
+- `keyboard`: `Keymap::parse` over an XKB text-v1 map, `Modifiers`,
+  `Stroke`, `InputError`, `Selected`, and translation from evdev keycodes
+  plus a compositor modifier snapshot to logical chords. No display,
+  descriptor, environment, action execution or clock is accessed. The
+  bounded lexical envelope and the compatibility target are the ones
+  td-editor/DESIGN.md records under "Implemented keyboard compiler"; that
+  text remains the behavioural specification and moves here with the next
+  documentation increment.
+- `xkb`: `TypeCatalog`, `VirtualBinding`, `Selection`, `ResolvedType`,
+  `Diagnostic`, the type-table half of the compiler that the keyboard
+  compiler builds on.
+- `repeat`: `Input`, the held-key set and repeat policy over an explicit
+  millisecond clock: focus with held keys, modifier snapshots, timing,
+  key press and release, arming, repeat and next-wake computation.
+- `pointer`: `Event`, `decode` for `wl_pointer` v5 through v7 events and
+  `Wheel`, which accumulates axis, axis-discrete and axis-value120 input
+  into whole cell rows and columns per frame.
+
+## Invariants
+
+- Pure modules read no environment, clock, descriptor or filesystem.
+  Adapters pass explicit ticks in milliseconds and explicit byte inputs.
+- Every budget carries over from td-editor unchanged: 1 MiB keymaps, the
+  parser's token, depth, keycode, type, virtual-modifier, level,
+  interpretation and modifier-map ceilings, and a 768-key held set.
+- Production code has no `unwrap`, `expect`, panics or panicking indexing;
+  invalid input returns a diagnostic or error naming the item.
+- `unsafe` is absent until the transport increment adds `sys` with its own
+  `UNSAFE.md` section; reusing that module does not transfer authorization
+  to a new consumer, which gets its own roster entry.
+- The shared font and wire sources are mounted here by exact repository
+  path and nowhere else among td-ui's consumers. A future move of their
+  canonical home updates staging, check mappings and every consumer
+  atomically, as td-editor/DESIGN.md already requires.
+- No secret-entry widget. A text field that looks trusted but is not is
+  what `td-install/ENCRYPTION.md` forbids; PIN and passphrase entry belong
+  to the compositor's secure-attention path.
+
+## Test contract
+
+`tests/keyboard.rs` and `tests/xkb.rs` are td-editor's suites moved intact,
+with the `tests/fixtures` directory: the libxkbcommon-generated `us.xkb`
+map, the independent type and key oracles, and the retained
+`XKB-COPYING`. `tests/fixtures/README.md` records their provenance and
+reproduction. td-editor's in-file window tests read the same fixture by
+relative path rather than carrying a copy.
+
+`tests/confinement.rs` pins the source inventory, the exact three shared
+source mounts, the absence of ambient I/O in pure modules, the absence of
+`unsafe`, `include!`, `cfg_attr` and any dependency declaration, and that
+the shared sources bind no input interface.
+
+The builder discovers the crate by existing. Its gate runs `cargo test` and
+all-target Clippy; a change under `td-ui/` selects td-editor's tests through
+the reader graph, because td-editor's manifest names the crate.
+
+## Independently landable increments
+
+1. Rule and crate: the lock guard admits sibling roster dependencies; the
+   crate exists with the input layer, the shared codecs and the cell
+   constants. Landed.
+2. Raster: `Rect`, `Scale`, `Weight`, `GlyphStyle`, `Primitive`, `Draw`,
+   `Raster`, the scrollbar geometry, the text-run and text-block painters,
+   the palette and the font-licence strings. td-editor's `Geometry` and
+   `Scene` compose them and `--preview` stays byte-identical.
+3. Transport: `sys` (sendmsg, recvmsg, the pinned fcntl requests) with an
+   `UNSAFE.md` section, and `wayland::Client` with the connection, object
+   table, registry, shm buffers, frame callback, cursor and turn loop
+   behind an `App` trait. The scripted peer becomes shared test support.
+4. Devices: seat, keyboard, pointer and clipboard device lifecycle inside
+   the client, delivered as a typed event stream with serials.
+5. Widgets: text entry, wrapped text block, menu bar and panel, paged list,
+   tab strip and status row, each with a pixel oracle.
+6. `td-setup`: the installer front end's first page as the second consumer,
+   under the native compositor harness shared from td-editor's tests.
+7. td-portal: the file chooser on td-ui, its private handshake and second
+   rasterizer deleted, and its recipe converted to stage sibling trees.

@@ -3,10 +3,9 @@
 use crate::{text, Error, Result};
 use std::ops::Range;
 
-/// Unscaled bitmap-cell geometry shared with the future raster/pointer adapter.
-pub const CELL_WIDTH: usize = 8;
-/// Row height in unscaled font pixels; viewport geometry itself is in cells.
-pub const CELL_HEIGHT: usize = 16;
+/// Unscaled bitmap-cell geometry, td-ui's: the pointer decoder and the
+/// pinned face agree on it there, and layout lays rows out on the same grid.
+pub use td_ui::{CELL_HEIGHT, CELL_WIDTH};
 pub const MAX_COLUMNS: usize = 1024;
 pub const MAX_ROWS: usize = 512;
 

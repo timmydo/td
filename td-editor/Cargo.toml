@@ -7,6 +7,12 @@ license = "GPL-3.0-or-later"
 
 [workspace]
 
+# The shared UI toolkit, by the one sibling-dependency spelling the lock
+# guard admits (AGENTS.md 'Rust code'): its input layer, and the font and
+# wire codecs it mounts, reach this crate only through `td_ui::`.
+[dependencies]
+td-ui = { path = "../td-ui" }
+
 [features]
 test-file-barrier = []
 

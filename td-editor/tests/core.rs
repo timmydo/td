@@ -789,3 +789,35 @@ fn framed_replay_handles_split_reads_and_rejects_truncation_and_oversize() {
         assert!(replay::run(&mut bad.as_slice(), &mut Vec::new()).is_err());
     }
 }
+
+/// The consumer half of td-ui's modifier-snapshot case: the profiles
+/// translate the chords the shared keymap spells, so a chord named by the
+/// toolkit and a chord named in the profile table are one language.
+#[test]
+fn profiles_translate_the_chords_the_shared_keymap_spells() {
+    let map = td_ui::keyboard::Keymap::parse(include_str!("../../td-ui/tests/fixtures/us.xkb"))
+        .unwrap();
+    let chord = |code: u32, mask: u32| {
+        let modifiers = td_ui::keyboard::Modifiers {
+            depressed: mask,
+            ..Default::default()
+        };
+        map.translate(code, modifiers)
+            .unwrap()
+            .map(|stroke| stroke.chord)
+    };
+    let mut profile = Keymap::default();
+    assert!(matches!(
+        profile.translate(&chord(31, 4).unwrap()).unwrap(),
+        Action::Request("save")
+    ));
+    profile.set_profile(Profile::Emacs);
+    assert!(matches!(
+        profile.translate(&chord(45, 4).unwrap()).unwrap(),
+        Action::Prefix
+    ));
+    assert!(matches!(
+        profile.translate(&chord(31, 4).unwrap()).unwrap(),
+        Action::Request("save")
+    ));
+}

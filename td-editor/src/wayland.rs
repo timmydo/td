@@ -3,10 +3,10 @@
 use crate::control_jobs::ReloadOutcome;
 use crate::dialog::{Close, Closed, Conflict, Scope, Target};
 use crate::font::Font;
-use crate::keyboard::{Keymap, Modifiers};
+use td_ui::keyboard::{Keymap, Modifiers};
 use crate::keys::Profile;
 use crate::render::{CHROME, Draw, Geometry, GlyphStyle, INK, Label, Primitive, Raster};
-use crate::seat::Input;
+use td_ui::repeat::Input;
 use crate::ui::{Controller, Event, Outcome};
 use crate::wire::{self, Builder, Cursor, Message};
 use std::collections::{BTreeMap, VecDeque};
@@ -310,7 +310,7 @@ struct Pointer {
     x: i32,
     y: i32,
     held: bool,
-    wheel: crate::pointer::Wheel,
+    wheel: td_ui::pointer::Wheel,
     wheel_target: Option<Target>,
     wheel_context: Option<Target>,
 }
@@ -1059,7 +1059,7 @@ impl Window {
     fn clear_pointer_gesture(&mut self) {
         self.control_pointer = None;
         self.pointer.held = false;
-        self.pointer.wheel = crate::pointer::Wheel::default();
+        self.pointer.wheel = td_ui::pointer::Wheel::default();
         self.pointer.wheel_target = None;
         self.pointer.wheel_context = None;
     }
@@ -1072,8 +1072,8 @@ impl Window {
     }
 
     fn pointer_event(&mut self, message: Message) -> Result<()> {
-        use crate::pointer::Event as P;
-        let event = crate::pointer::decode(&message)?;
+        use td_ui::pointer::Event as P;
+        let event = td_ui::pointer::decode(&message)?;
         if self.pointer.device != Some(message.object) {
             return Ok(());
         }
@@ -1135,7 +1135,7 @@ impl Window {
                         })
                     });
                     if target != self.pointer.wheel_context {
-                        self.pointer.wheel = crate::pointer::Wheel::default();
+                        self.pointer.wheel = td_ui::pointer::Wheel::default();
                         self.pointer.wheel_context = target;
                     }
                     self.pointer.wheel_target = target;
@@ -6269,7 +6269,7 @@ mod tests {
     }
 
     fn map_file() -> File {
-        let source = include_str!("../tests/fixtures/us.xkb");
+        let source = include_str!("../../td-ui/tests/fixtures/us.xkb");
         let file = backing_file(&std::env::temp_dir(), source.len() + 1).unwrap();
         file.write_all_at(source.as_bytes(), 0).unwrap();
         file

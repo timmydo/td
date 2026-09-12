@@ -1,10 +1,10 @@
 //! Bounded wl_pointer v5-v7 decoding and axis-frame accumulation.
 
-use crate::layout::{CELL_HEIGHT, CELL_WIDTH};
+use crate::{CELL_HEIGHT, CELL_WIDTH};
 use crate::wire::{Cursor, Message};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum Event {
+pub enum Event {
     Enter {
         serial: u32,
         surface: u32,
@@ -25,7 +25,7 @@ pub(crate) enum Event {
     Discrete(usize, i32),
 }
 
-pub(crate) fn decode(message: &Message) -> Result<Event, String> {
+pub fn decode(message: &Message) -> Result<Event, String> {
     let mut c = Cursor::new(&message.payload);
     let event = match message.opcode {
         0 => Event::Enter {
@@ -97,14 +97,14 @@ struct Axis {
 }
 
 #[derive(Debug, Default)]
-pub(crate) struct Wheel {
+pub struct Wheel {
     axes: [Axis; 2],
     source: Option<u32>,
     events: usize,
 }
 
 impl Wheel {
-    pub(crate) fn update(&mut self, event: Event) -> Result<(), String> {
+    pub fn update(&mut self, event: Event) -> Result<(), String> {
         if self.events >= 256 {
             return Err("pointer axis frame budget".into());
         }
@@ -132,7 +132,7 @@ impl Wheel {
         Ok(())
     }
 
-    pub(crate) fn frame(&mut self) -> (isize, isize) {
+    pub fn frame(&mut self) -> (isize, isize) {
         let mut result = [0; 2];
         for ((axis, unit), output) in self
             .axes

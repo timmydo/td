@@ -6,7 +6,7 @@
     clippy::indexing_slicing
 )]
 
-use td_editor::xkb::{Selection, TypeCatalog, VirtualBinding};
+use td_ui::xkb::{Selection, TypeCatalog, VirtualBinding};
 
 const US: &str = include_str!("fixtures/us.xkb");
 const BINDINGS: &[VirtualBinding<'_>] = &[

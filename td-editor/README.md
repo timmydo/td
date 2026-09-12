@@ -693,16 +693,19 @@ protocol callbacks but does not map the SHM descriptors: this is production
 process/event-loop coverage, not real-compositor presentation or pixel proof.
 It does not prove td-jail, `$EDITOR` caller lifetime or GPU integration.
 
-`src/keyboard.rs` and the `xkb*` modules compile bounded, self-contained XKB
+`td-ui/src/keyboard.rs` and the `xkb*` modules beside it, used here as
+`td_ui::keyboard`, compile bounded, self-contained XKB
 text-v1 maps into deterministic logical chords. Keycode aliases, symbols,
 table-driven types, modifier maps and compatibility interpretations supply
 level selection, virtual masks, consumed/preserved modifiers and repeat
 eligibility. Tests cover the td map, all 26 types of a compiled ordinary US
 map across 256 real-modifier combinations, and 106 US keys across the 32
 supported states using independent libxkbcommon results. Fixture provenance
-and oracle procedures are in [tests/fixtures/README.md](tests/fixtures/README.md).
+and oracle procedures are in
+[../td-ui/tests/fixtures/README.md](../td-ui/tests/fixtures/README.md).
 The window now consumes keymap descriptors and calls this compiler before
-accepting input. `seat.rs` supplies explicit-clock held-key and repeat policy.
+accepting input. `td_ui::repeat` supplies explicit-clock held-key and repeat
+policy.
 Focus loss, modifier changes, map replacement and capability withdrawal cancel
 repeat. Enter's already-held keys never synthesize presses. Protocol tests
 send real descriptors and key events through both profiles, then check model

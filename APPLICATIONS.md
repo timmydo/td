@@ -9486,11 +9486,14 @@ to exit as it does for any editor.
 
 **Rendering.** Section 11 of `td-compositor/DESIGN.md` pins a Unifont
 PSF2 face and a pure renderer over it; td-term draws with it. The editor
-borrows exactly that: the PSF2 reader and glyph renderer move to a
-shared source module the compositor and the editor both embed (the way
-`engine/src/permissions.rs` is shared with td-jail), so the editor
-renders the same cells, the same six renditions and the same cursor. No
-second font, no second rasterizer.
+borrows exactly that: the PSF2 reader and pinned face are shared source
+the compositor embeds and `td-ui`, the shared UI toolkit
+(`td-ui/DESIGN.md`), mounts once for every program that depends on it by
+path — the editor first (the way `engine/src/permissions.rs` is shared
+with td-jail); the glyph raster the editor paints that face with joins
+td-ui in its raster increment, so the editor renders the same cells,
+the same six renditions and the same cursor from one face. No second
+font, and no second rasterizer once that increment lands.
 
 **Behaviour, in landing order.** (1) A buffer model and an Emacs keymap
 as pure data with tests: movement (`C-a`, `C-e`, `C-f`, `C-b`, `M-f`,

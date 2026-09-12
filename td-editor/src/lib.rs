@@ -16,22 +16,18 @@ mod directory;
 pub use dialog::{Discard, Reload};
 pub mod files;
 pub mod fill;
-#[path = "../../td-compositor/src/font.rs"]
-pub mod font;
-#[path = "../../td-compositor/src/font_data.rs"]
-mod font_data;
-pub mod keyboard;
+// The compositor's font and wire sources reach this crate through td-ui,
+// which mounts them by repository path; nothing here mounts a source.
+pub use td_ui::font;
 pub mod keys;
 pub mod layout;
 pub mod model;
 mod menu;
 mod number;
 mod path_completion;
-mod pointer;
 pub mod render;
 mod replace;
 pub mod replay;
-mod seat;
 mod search;
 mod session;
 #[cfg(feature = "test-file-barrier")]
@@ -42,14 +38,7 @@ pub mod text;
 pub mod transfer;
 pub mod ui;
 pub mod wayland;
-#[allow(dead_code, clippy::new_without_default)]
-#[path = "../../td-compositor/src/wire.rs"]
-mod wire;
-pub mod xkb;
-mod xkb_compat;
-mod xkb_keys;
-mod xkb_symbols;
-mod xkb_syntax;
+pub(crate) use td_ui::wire;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {

@@ -1,0 +1,25 @@
+[package]
+name = "td-ui"
+version = "0.1.0"
+edition = "2021"
+description = "td's dependency-free UI toolkit: the shared Unifont face and Wayland wire codec, XKB keyboard translation, held-key repeat and pointer decoding, for td-owned graphical programs"
+license = "GPL-3.0-or-later"
+
+# Own workspace root, so cargo behaves the same from the main checkout as from
+# a worktree nested under it (see the root Cargo.toml). A consumer names this
+# crate as `td-ui = { path = "../td-ui" }`, the one sibling-dependency spelling
+# the lock guard admits (AGENTS.md 'Rust code'); this crate itself depends on
+# nothing, and its confinement tests pin that.
+[workspace]
+
+[package.metadata.td-gate]
+clippy-all-targets = true
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+unreachable = "deny"
+todo = "deny"
+unimplemented = "deny"
+indexing_slicing = "deny"

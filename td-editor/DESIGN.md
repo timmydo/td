@@ -963,7 +963,9 @@ the production face and parser are the compositor's existing source modules.
 `--font-license` prints embedded provenance, COPYING and OFL notices from the
 same assets directory. No host font search or new font input is introduced.
 The source recipe must stage these five repository-relative inputs, keeping
-their paths relative to `td-editor/src` exactly as in the checkout:
+their paths exactly as in the checkout — the two sources relative to
+`td-ui/src`, where td-ui mounts them, and the three notices relative to
+`td-editor/src`, where `render.rs` embeds them:
 
 ```text
 td-compositor/src/font.rs
@@ -1141,18 +1143,28 @@ Relevant code in `td-compositor/src`:
 | `term_client.rs` | Reference for configure/ack, release, resize, clipboard and focus lifecycle; do not fork the terminal loop into the editor. |
 | `render.rs` | Reuse bounded glyph drawing and pixel-oracle approach, not terminal `Snapshot`/SGR data structures. |
 | `socket.rs` | Reference for explicit socket lifecycle and refusal of live endpoints; editor control must enforce its own path ownership. |
-| `keys.rs`, `keyboard.rs` | Reuse repeat/chord concepts and td test fixtures; terminal escape sequences and the fixed US keymap are not portable editor input. |
+| `keys.rs`, `keyboard.rs` | Reuse repeat/chord concepts and td test fixtures; terminal escape sequences and the fixed US keymap are not portable editor input. The editor's own XKB compiler and repeat policy now live in `td-ui`. |
 | `buffer.rs` | Compositor surface-storage and accounting design reference, not an editable text buffer. |
 | `ui.rs` | Reference for pure rendering and input models, not a toolkit or the editor's state model. |
 
-Version 1 shares `font.rs`, `font_data.rs` and `wire.rs` through explicit
-source-module paths, as td-portal already does. It neither copies those
-modules nor depends on the compositor binary. The source bundle is the td git
-checkout; `cargo build --manifest-path td-editor/Cargo.toml` will build the
-standalone binary without an installed td system. The target recipe must
-stage those exact shared sources and licenses, and shared-source changes
-must select editor tests in affected-checks. A future move of a shared file
-updates staging, check mappings and all consumers atomically.
+Version 1 shared `font.rs`, `font_data.rs` and `wire.rs` through explicit
+source-module paths, as td-portal still does. Those mounts now live in
+`td-ui`, the shared UI toolkit (`td-ui/DESIGN.md`), which td-editor names as
+the sibling path dependency `td-ui = { path = "../td-ui" }`; the crate root
+re-exports `td_ui::font` and `td_ui::wire`, so the editor neither copies
+those modules nor depends on the compositor binary, and mounts no source of
+its own. The keymap compiler, the held-key repeat policy and the pointer
+decoder moved there with them and are used as `td_ui::keyboard`,
+`td_ui::repeat` and `td_ui::pointer`. The source bundle is the td git
+checkout; `cargo build --manifest-path td-editor/Cargo.toml` builds the
+standalone binary without an installed td system, resolving td-ui offline
+from the checkout. The target recipe must stage the td-ui tree beside this
+one (the cargo `local_source_trees` shape td-net uses; a flat direct-rustc
+staging cannot link a second crate) with the shared sources and licenses
+td-ui mounts, and td-ui and shared-source changes must select editor tests
+in affected-checks, which they do through the reader graph. A future move
+of a shared file updates staging, check mappings and all consumers
+atomically.
 
 ## Wayland and host compatibility
 
@@ -1903,9 +1915,10 @@ and resize continue during the question. Process termination, transport
 failure and keyboard failure are not recovery mechanisms: scratch text is
 memory-only and may be lost. Users must not keep important text here.
 
-The adapter shares `td-compositor/src/wire.rs` without copying it. That sixth
-shared input must be staged beside the five font/license inputs when the
-future source recipe is added. This adapter owns display environment and
+The adapter uses `td-compositor/src/wire.rs` without copying it, through
+`td_ui::wire`. That sixth shared input is staged with the td-ui tree beside
+the five font/license inputs when the future source recipe is added. This
+adapter owns display environment and
 clock access; `files::Session` separately owns document file I/O. The core's
 explicit-input contract is unchanged.
 
@@ -1992,8 +2005,9 @@ provide it); compilation alone is not announced as ready input.
 Event-local translation refusals show a
 notice and ignore that event without invalidating the map.
 
-`seat::Input` retains at most 768 held key numbers. Enter installs held keys
-without typing or arming repeat; presses wait for enter's modifier snapshot.
+`td_ui::repeat::Input` retains at most 768 held key numbers. Enter installs
+held keys without typing or arming repeat; presses wait for enter's
+modifier snapshot.
 Duplicate presses and unmatched releases are ignored. Focus loss clears held
 state, modifiers, prefixes and repeat. Modifier changes and any new press
 cancel the old repeat; a release cancels only its matching repeat. Map changes
@@ -2769,12 +2783,16 @@ are diagnosed on use, never substituted with physical US text.
 `TypeCatalog::parse` alone remains insufficient for keyboard activation.
 The scratch-window adapter calls the whole compiler at its sole descriptor
 consumer. Confinement tests pin that consumer, the raw boundary, and the
-compiler/seat access roster. `seat::Input` owns repeat scheduling separately;
-the compiler's repeat metadata alone is not a timer or held-key state.
+compiler/seat access roster: the compiler and the repeat policy are td-ui's
+(`td_ui::keyboard`, `td_ui::repeat`), and the window adapter is the sole
+editor file that names them. `td_ui::repeat::Input` owns repeat scheduling
+separately; the compiler's repeat metadata alone is not a timer or held-key
+state.
 
-`tests/fixtures/us.xkb` is a complete libxkbcommon-compiled evdev/pc105/US map
-with upstream license/provenance, not a captured Weston keymap. All 26 type
-tables are checked against independently generated libxkbcommon level and
+`td-ui/tests/fixtures/us.xkb` is a complete libxkbcommon-compiled
+evdev/pc105/US map with upstream license/provenance, not a captured Weston
+keymap. All 26 type tables are checked against independently generated
+libxkbcommon level and
 consumed-mask results for every real-mask combination. Another independent
 oracle checks 106 US keys' levels, keysyms, consumed masks and repeat flags
 across all 32 supported real-mask states. The td map is also

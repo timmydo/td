@@ -50,7 +50,6 @@ fn source_inventory_and_allowances_are_closed() {
         "files.rs",
         "fill.rs",
         "keys.rs",
-        "keyboard.rs",
         "layout.rs",
         "lib.rs",
         "main.rs",
@@ -58,11 +57,9 @@ fn source_inventory_and_allowances_are_closed() {
         "model.rs",
         "number.rs",
         "path_completion.rs",
-        "pointer.rs",
         "render.rs",
         "replace.rs",
         "replay.rs",
-        "seat.rs",
         "search.rs",
         "session.rs",
         "spelling.rs",
@@ -72,11 +69,6 @@ fn source_inventory_and_allowances_are_closed() {
         "transfer.rs",
         "ui.rs",
         "wayland.rs",
-        "xkb.rs",
-        "xkb_compat.rs",
-        "xkb_keys.rs",
-        "xkb_symbols.rs",
-        "xkb_syntax.rs",
     ]
     .into_iter()
     .map(str::to_string)
@@ -103,17 +95,13 @@ fn source_inventory_and_allowances_are_closed() {
                 "caret bypass in {name}"
             );
         }
-        if !matches!(
-            name.as_str(),
-            "keyboard.rs"
-                | "xkb.rs"
-                | "xkb_syntax.rs"
-                | "xkb_keys.rs"
-                | "xkb_symbols.rs"
-                | "xkb_compat.rs"
-                | "seat.rs"
-                | "wayland.rs"
-        ) {
+        // The keymap compiler, repeat policy and pointer decoder are td-ui's
+        // now (`td_ui::keyboard`, `td_ui::repeat`, `td_ui::pointer`); the
+        // input adapter is still the sole file that names them, and the crate
+        // reaches the toolkit only there, in `layout`, which re-exports the
+        // shared cell constants, and at the crate root, which re-exports the
+        // shared font and wire modules.
+        if name != "wayland.rs" {
             for module in [
                 "keyboard",
                 "xkb",
@@ -124,7 +112,7 @@ fn source_inventory_and_allowances_are_closed() {
             ] {
                 assert_eq!(
                     identifier_count(&text, module),
-                    usize::from(name == "lib.rs"),
+                    0,
                     "compiler access outside input adapter: {name}"
                 );
             }
@@ -135,6 +123,11 @@ fn source_inventory_and_allowances_are_closed() {
                 );
             }
         }
+        assert!(
+            identifier_count(&text, "td_ui") == 0
+                || matches!(name.as_str(), "wayland.rs" | "layout.rs" | "lib.rs"),
+            "toolkit access outside the adapter, layout and crate root: {name}"
+        );
         let budget = match name.as_str() {
             "lib.rs" | "main.rs" => 1,
             "sys.rs" => 4,
@@ -151,55 +144,21 @@ fn source_inventory_and_allowances_are_closed() {
         );
         let compact: String = text.chars().filter(|c| !c.is_whitespace()).collect();
         assert!(!compact.contains("include!("), "generated source in {name}");
-        let paths = compact.matches("#[path=").count();
+        // The compositor's font and wire sources reach this crate only
+        // through td-ui, which mounts them by repository path and pins their
+        // contents in its own confinement test; no file here mounts a source.
         assert_eq!(
-            paths,
-            if name == "lib.rs" { 3 } else { 0 },
+            compact.matches("#[path=").count(),
+            0,
             "source paths in {name}"
         );
         if name == "lib.rs" {
             assert!(compact.starts_with("#![deny(unsafe_code)]"));
-            for (file, declaration) in [
-                ("font.rs", "pubmodfont;"),
-                ("font_data.rs", "modfont_data;"),
-                ("wire.rs", "modwire;"),
-            ] {
-                assert!(compact.contains(&format!(
-                    "#[path=\"../../td-compositor/src/{file}\"]{declaration}"
-                )));
-                let shared =
-                    std::fs::read_to_string(root.join("../td-compositor/src").join(file)).unwrap();
-                for module in [
-                    "keyboard",
-                    "xkb",
-                    "xkb_syntax",
-                    "xkb_keys",
-                    "xkb_symbols",
-                    "xkb_compat",
-                ] {
-                    assert_eq!(
-                        identifier_count(&shared, module),
-                        0,
-                        "partial type validation through shared source: {file}"
-                    );
-                }
-                for interface in ["wl_seat", "wl_keyboard"] {
-                    assert!(
-                        !shared.contains(interface),
-                        "input binding through shared source: {file}"
-                    );
-                }
-                assert!(!shared.contains("unsafe"));
-                assert_eq!(
-                    raw_module_tokens(&shared),
-                    0,
-                    "shared raw-module access in {file}"
-                );
-                let shared: String = shared.chars().filter(|c| !c.is_whitespace()).collect();
-                assert!(!shared.contains("#[path="));
-                assert!(!shared.contains("include!("));
-                assert!(!shared.contains("cfg_attr"));
-            }
+            assert!(compact.contains("pubusetd_ui::font;"), "font through td-ui");
+            assert!(
+                compact.contains("pub(crate)usetd_ui::wire;"),
+                "wire through td-ui"
+            );
         }
         // The pinned procfs pathname's sys segment is not raw-module access.
         let raw_tokens = if name == "control_socket.rs" {
@@ -532,9 +491,45 @@ fn native_prompt_answers_pin_context_before_cleanup_and_never_route_global_keys(
     );
 }
 
+/// The source inventory above walks `src`; a test file could still mount a
+/// sibling crate's source by path — a second `wire.rs` would be a second
+/// `Message` type — so the test tree is held to the same line: no `#[path]`
+/// reaching outside this crate. Fixtures are read by `include_str!`, which
+/// is data, not a module.
+#[test]
+fn test_files_mount_no_sibling_source() {
+    fn walk(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                walk(&path, out);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                out.push(path);
+            }
+        }
+    }
+    let mut files = Vec::new();
+    walk(&Path::new(env!("CARGO_MANIFEST_DIR")).join("tests"), &mut files);
+    assert!(files.len() > 5, "{files:?}");
+    for file in files {
+        let text = std::fs::read_to_string(&file).unwrap();
+        let compact: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+        // Every mount's value, wherever `..` sits in it: `support/../../x`
+        // reaches as far as `../../x`.
+        for mount in compact.split("#[path=\"").skip(1) {
+            let value = mount.split('"').next().unwrap_or(mount);
+            assert!(
+                !value.contains("..") && !value.starts_with('/'),
+                "source mounted from outside the test tree: {} ({value})",
+                file.display()
+            );
+        }
+    }
+}
+
 #[test]
 fn remote_wheel_reuses_native_scroll_after_all_input_guards() {
-    let native = include_str!("../src/pointer.rs");
+    let native = include_str!("../../td-ui/src/pointer.rs");
     let control = include_str!("../src/control.rs");
     assert!(native.contains("delta.clamp(-16_777_216, 16_777_216) as isize"));
     assert!(control.contains("!(-16_777_216..=16_777_216).contains(&value)"));

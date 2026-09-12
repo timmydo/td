@@ -4,7 +4,7 @@ use crate::keyboard::{Keymap, Modifiers, Stroke};
 use std::collections::BTreeSet;
 
 #[derive(Default)]
-pub(super) struct Input {
+pub struct Input {
     pub map: Option<Keymap>,
     pub modifiers: Modifiers,
     pub focused: bool,

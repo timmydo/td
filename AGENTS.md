@@ -18,7 +18,9 @@ needs them:
 - For login or credentials, read `td-login/THREAT-MODEL.md`.
 - For disk encryption or session unlock, read `td-install/ENCRYPTION.md`.
 - For compositor/UI, service supervision, or installation, read the matching
-  `td-compositor/DESIGN.md`, `td-svc/DESIGN.md`, or `td-install/DESIGN.md`.
+  `td-compositor/DESIGN.md`, `td-svc/DESIGN.md`, or `td-install/DESIGN.md`;
+  for the shared UI toolkit td-owned graphical programs depend on, read
+  `td-ui/DESIGN.md`.
 - Before changing target compiler flags, ELF debug handling, profiler code, or
   profiler image integration, read `td-profiler/DESIGN.md`.
 

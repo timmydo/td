@@ -68,6 +68,12 @@ size is a `seek`, and its sector size is a file under `/sys` — so
 `td-install/DESIGN.md`'s D8 asks for that to stay true, and where a later
 increment cannot keep it (rereading a partition table needs `BLKRRPART`,
 an ioctl) the amendment is made here first rather than found in a diff.
+`td-ui`, the shared UI toolkit that td-editor depends on by path, forbids
+`unsafe` at its crate root: the keymap compiler, repeat policy, pointer
+decoder and the font and wire sources it mounts need none. The transport
+increment `td-ui/DESIGN.md` schedules brings the editor's `sendmsg`,
+`recvmsg` and pinned `fcntl` surface with it, and that move is an
+amendment here before it lands, not after.
 
 ## Roster
 

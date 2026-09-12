@@ -6,7 +6,7 @@
     clippy::indexing_slicing
 )]
 
-use td_editor::keyboard::{InputError, Keymap, Modifiers};
+use td_ui::keyboard::{InputError, Keymap, Modifiers};
 
 const US: &str = include_str!("fixtures/us.xkb");
 
@@ -433,7 +433,7 @@ fn unused_properties_and_symbols_never_become_physical_us_text() {
 }
 
 #[test]
-fn modifier_snapshots_union_without_mutating_map_and_profiles_share_chords() {
+fn modifier_snapshots_union_without_mutating_map() {
     let map = Keymap::parse(US).unwrap();
     let modifiers = Modifiers {
         depressed: 1,
@@ -445,20 +445,11 @@ fn modifier_snapshots_union_without_mutating_map_and_profiles_share_chords() {
         map.translate(31, modifiers).unwrap().unwrap().chord,
         "C-S-s"
     );
-    let mut profile = td_editor::keys::Keymap::default();
-    assert!(matches!(
-        profile.translate(&chord(&map, 31, 4).unwrap()).unwrap(),
-        td_editor::keys::Action::Request("save")
-    ));
-    profile.set_profile(td_editor::keys::Profile::Emacs);
-    assert!(matches!(
-        profile.translate(&chord(&map, 45, 4).unwrap()).unwrap(),
-        td_editor::keys::Action::Prefix
-    ));
-    assert!(matches!(
-        profile.translate(&chord(&map, 31, 4).unwrap()).unwrap(),
-        td_editor::keys::Action::Request("save")
-    ));
+    // The consumer half of this case — that td-editor's key profiles
+    // translate the chords this map produces — lives in td-editor's
+    // tests/core.rs, beside the profiles.
+    assert_eq!(chord(&map, 31, 4).as_deref(), Some("C-s"));
+    assert_eq!(chord(&map, 45, 4).as_deref(), Some("C-x"));
 }
 
 #[test]

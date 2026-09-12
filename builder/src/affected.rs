@@ -1415,6 +1415,17 @@ fn map_path(root: &Path, roster: &Result<Vec<GateCrate>, String>, p: &str, sel: 
         return;
     }
 
+    // td-ui, the shared UI toolkit, is the editor's path dependency and, like
+    // the editor, has no recipe consumer yet, so the same arm: the host
+    // preflight covers its own lock/test/clippy obligations, and the cargo
+    // narrowing carries a change here to every crate whose manifest names
+    // it. Packaging a consumer replaces this arm with target-artifact
+    // coverage together with the editor's.
+    if p.starts_with("td-ui/") && !p.contains("..") {
+        sel.add_preflight("cargo-test");
+        return;
+    }
+
     // td-init: the target-built static boot-glue multicall (init/reboot/poweroff/
     // halt/switch_root/cttyhack/hostname), a standalone std-only crate OUTSIDE the
     // engine workspace — same routing as td-util, which it complements. Its unit
@@ -4971,7 +4982,7 @@ mod tests {
         // The conservative textual edge widens checks even without a read.
         assert_eq!(
             readers_of("td-compositor"),
-            ["td-authd", "td-editor", "td-jail", "td-portal", "td-seatd", "td-secret", "td-vm", "td-vm-guest"]
+            ["td-authd", "td-editor", "td-jail", "td-portal", "td-seatd", "td-secret", "td-ui", "td-vm", "td-vm-guest"]
         );
         assert_eq!(readers_of("td-authd"), ["td-compositor", "td-secret"]);
         // td-login is here for a test's argument string `/bin/td-busd/`, no
@@ -5022,6 +5033,7 @@ mod tests {
                 "td-portal",
                 "td-seatd",
                 "td-secret",
+                "td-ui",
                 "td-vm",
                 "td-vm-guest"
             ]))
@@ -7092,11 +7104,12 @@ mod tests {
                 "td-portal",
                 "td-seatd",
                 "td-secret",
+                "td-ui",
                 "td-vm",
                 "td-vm-guest"
             ]
         );
-        assert_eq!(comp.len(), 23, "{comp:?}");
+        assert_eq!(comp.len(), 25, "{comp:?}");
         // Runtime td-vm/ spellings conservatively connect the same reader set.
         assert_eq!(vm, comp);
         assert_eq!(
@@ -7113,6 +7126,7 @@ mod tests {
                 "td-portal",
                 "td-seatd",
                 "td-secret",
+                "td-ui",
                 "td-vm",
                 "td-vm-guest"
             ]
@@ -7209,9 +7223,27 @@ mod tests {
         paths.push("builder/src/affected.rs".to_string());
         assert_eq!(cargo_test_cmds(&root, &paths).unwrap(), gate_cmds());
         assert!(compute_selection(&root, &paths).targets.contains(&"check".to_string()));
+        // The toolkit routes like the editor, and a change to it carries the
+        // editor's commands along: td-editor's manifest names td-ui by path,
+        // so the reader graph puts the editor beside the toolkit and the
+        // workspace suite, and nothing else.
+        for path in ["td-ui/src/keyboard.rs", "td-ui/Cargo.toml", "td-ui/tests/xkb.rs"] {
+            let toolkit = [path.to_string()];
+            assert!(compute_selection(&root, &toolkit).targets.is_empty(), "{path}");
+            let commands = cargo_test_cmds(&root, &toolkit).unwrap();
+            assert_eq!(commands.len(), 7, "{path}: {commands:?}");
+            assert!(commands.iter().all(|c| {
+                c.contains("--workspace")
+                    || c.contains("--manifest-path td-ui/Cargo.toml")
+                    || c.contains("--manifest-path td-editor/Cargo.toml")
+            }));
+            assert!(commands.iter().any(|c| c.contains("--manifest-path td-editor/Cargo.toml")));
+        }
         for path in [
             "td-editor-extra/src/main.rs",
             "td-editor/../td-sh/src/main.rs",
+            "td-ui-extra/src/lib.rs",
+            "td-ui/../td-sh/src/main.rs",
         ] {
             assert_eq!(cargo_test_cmds(&root, &[path.to_string()]).unwrap(), gate_cmds());
             assert!(path_output(&root, path).contains("td-builder check check"));
