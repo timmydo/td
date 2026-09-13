@@ -1167,18 +1167,19 @@ editor's `Geometry` and `Scene`, which implements
 connect, request framing, the received-right FIFO, pool files and the
 pointer image's pixels) followed with its syscall module and is used as
 `td_ui::wayland`; the client over it (object table, registry, toplevel
-surface with its buffers and frame callback, the pointer image's surface and
-the turn loop) followed and is used as `td_ui::client`, while `wayland.rs`
-keeps the editor's seat, keyboard, pointer and clipboard devices, its `App`
-implementation and the editor state. The source bundle is the td git
-checkout; `cargo build --manifest-path td-editor/Cargo.toml` builds the
-standalone binary without an installed td system, resolving td-ui offline
-from the checkout. The target recipe must stage the td-ui tree beside this
-one (the cargo `local_source_trees` shape td-net uses; a flat direct-rustc
-staging cannot link a second crate) with the shared sources and licenses
-td-ui mounts, and td-ui and shared-source changes must select editor tests
-in affected-checks, which they do through the reader graph. A future move of
-a shared file updates staging, check mappings and all consumers atomically.
+surface with its buffers and frame callback, the seat with its keyboard and
+pointer, the pointer image's surface and the turn loop) followed and is used
+as `td_ui::client`, while `wayland.rs` keeps the editor's clipboard device,
+its `App` implementation, its gestures over the client's devices and the
+editor state. The source bundle is the td git checkout; `cargo build
+--manifest-path td-editor/Cargo.toml` builds the standalone binary without
+an installed td system, resolving td-ui offline from the checkout. The
+target recipe must stage the td-ui tree beside this one (the cargo
+`local_source_trees` shape td-net uses; a flat direct-rustc staging cannot
+link a second crate) with the shared sources and licenses td-ui mounts, and
+td-ui and shared-source changes must select editor tests in affected-checks,
+which they do through the reader graph. A future move of a shared file
+updates staging, check mappings and all consumers atomically.
 
 ## Wayland and host compatibility
 
@@ -1932,31 +1933,31 @@ memory-only and may be lost. Users must not keep important text here.
 The adapter frames requests and events with `td_ui::wire` (the compositor's
 `wire.rs`, mounted by td-ui and never copied) and is td-ui's `client::App`:
 `td_ui::client::run` drives the connection, and the client owns the object
-table, the toplevel surface, its buffers and the pointer image; the codec
-and the client are staged with the td-ui tree beside the five font/license
-inputs when the future source recipe is added. This adapter owns display
-environment access, passing the environment values it reads to td-ui's
-`endpoint` explicitly, and the loop's clock is td-ui's; `files::Session`
-separately owns document file I/O. The core's explicit-input contract is
-unchanged.
+table, the toplevel surface, its buffers, the seat with its keyboard and
+pointer, and the pointer image; the codec and the client are staged with the
+td-ui tree beside the five font/license inputs when the future source recipe
+is added. This adapter owns display environment access, passing the
+environment values it reads to td-ui's `endpoint` explicitly, and the loop's
+clock is td-ui's; `files::Session` separately owns document file I/O. The
+core's explicit-input contract is unchanged.
 
 The client binds compositor v4, SHM v1 and xdg shell v1, requiring those
-minimum versions and capping higher advertisements, and enforces the
-registry, object-table, per-turn message and startup budgets, the
-disconnects and the buffer rules that `td-ui/DESIGN.md` records under
-`client`. On the initial roundtrip the editor binds the lowest-global-ID
-seat offering v5 or newer, capped to v7, and requests its keyboard and
-pointer only after their capability events. A missing/old seat leaves a
-presentation-only window with a notice; this scratch-mode exception does
-not weaken the version-1 required-seat contract below. Other globals are
-ignored, except the data-device manager the clipboard section binds by
-hand. The editor's seat, device and clipboard objects live in the
-client's table under its `Object` tag: the client hands their events back
-untouched and retires their slots through the tag, and their dynamic IDs
-follow the client's fixed IDs from 10. An armed repeat shortens the idle
-wait to its next due time. Caret ticks use monotonic milliseconds since
+minimum versions and capping higher advertisements, binds the seat and
+creates its devices, and enforces the registry, object-table, per-turn
+message and startup budgets, the disconnects, the buffer rules and the
+device rules that `td-ui/DESIGN.md` records under `client`. When the client
+reports itself bound without a seat, the editor leaves a presentation-only
+window with a notice (the file window refuses to start); this scratch-mode
+exception does not weaken the version-1 required-seat contract below. Other
+globals are ignored, except the data-device manager the clipboard section
+binds by hand. The editor's clipboard objects live in the client's table
+under its `Object` tag: the client hands their events back untouched and
+retires their slots through the tag, and their dynamic IDs follow the
+client's fixed IDs, its seat and its devices. An armed repeat shortens the
+idle wait to its next due time. Caret ticks use monotonic milliseconds since
 the loop starts, immediately before each event and on timer wakes; server
-timestamps are never compared to this clock.
+timestamps are never compared to this clock, which the client is handed with
+each event for the keyboard's repeat timing.
 
 The controller receives complete acknowledged configure sizes: zero axes
 retain the previous configured axis even while a frame is outstanding.
@@ -1964,9 +1965,9 @@ Dimensions must fit `Geometry`'s 8192-axis/32 MiB limits. Configure
 batches are coalesced before painting; a complete repaint is painted into
 the client's reused raster and submitted through `Client::present` behind
 at most one frame callback, under the client's three-buffer rule. The
-immutable pointer image is the client's 1536-byte ARGB8888 pool; the
-native pointer contract below says when the editor shows it. This is CPU
-SHM presentation, not GPU rendering.
+immutable pointer image is the client's 1536-byte ARGB8888 pool, which
+the client shows on pointer enter and on ARGB's arrival while the
+pointer is inside. This is CPU SHM presentation, not GPU rendering.
 
 Pool files are td-ui's `backing_file`, under the creation rules
 `td-ui/DESIGN.md` records. No mmap, host library or persistent font/file
@@ -1982,70 +1983,58 @@ Endpoint resolution, the borrowed `WAYLAND_SOCKET` and the bounded FIFO
 that owns every incoming descriptor are td-ui's `endpoint`, `connect` and
 `Connection`, under the rules `td-ui/DESIGN.md` records; the adapter
 passes the three environment values it reads and gives the transport
-exclusive use of the stream. `wl_keyboard.keymap` and
-`wl_data_source.send` each consume one right. The client's loop parks an
-event whose right has not arrived, under the write deadline and in wire
-order; waiting cancels repeat. Retired keyboard events are
-schema-validated and their keymap rights dropped until delete_id, never
-applied to the replacement keyboard.
+exclusive use of the stream. The client consumes the `wl_keyboard.keymap`
+right itself and drains a retired keyboard's events; `wl_data_source.send`
+is the editor's one right consumer, parked by the client's loop under its
+rules until the right arrives.
 
-Keymap format must be text-v1; the file must be regular and cover the declared
-1..=1 MiB extent. Positioned reads copy exactly that extent without advancing
-the compositor's shared file offset. The wire payload requires a trailing
-NUL (the standalone compiler's optional-NUL API is unchanged), valid UTF-8
-and successful whole-map compilation. There is no mmap, host include lookup,
-or fallback physical US translation. Regular-file reads and compilation are
-synchronous and bounded in bytes/work, not a hard filesystem-latency promise.
-A refused initial or replacement map disables input and cancels prefixes and
-repeat, retaining all text. A valid later map restores keyboard access after
-the authoritative modifier snapshot. The notice reports waiting until that
+Keymap admission is the client's, under the rules `td-ui/DESIGN.md`
+records and `UNSAFE.md` §19 rosters; there is no fallback physical US
+translation. The editor acts on the outcome: a refused initial or
+replacement map disables input and cancels prefixes and repeat, retaining
+all text, and a valid later map restores keyboard access after the
+authoritative modifier snapshot. The notice reports waiting until that
 snapshot arrives (a focus transition or pressing/releasing a modifier can
 provide it); compilation alone is not announced as ready input.
-Event-local translation refusals show a
-notice and ignore that event without invalidating the map.
+Event-local translation refusals show a notice and ignore that event
+without invalidating the map.
 
-`td_ui::repeat::Input` retains at most 768 held key numbers. Enter installs
-held keys without typing or arming repeat; presses wait for enter's
-modifier snapshot.
-Duplicate presses and unmatched releases are ignored. Focus loss clears held
-state, modifiers, prefixes and repeat. Modifier changes and any new press
-cancel the old repeat; a release cancels only its matching repeat. Map changes
-cancel repeat and require a new modifier snapshot. Only a repeatable stroke
-accepted as a controller change arms repeat; requests, prefixes, ignored or
-rejected strokes do not. Negative rate/delay is malformed; zero disables
-repeat. Rates above 1000 Hz clamp, intervals round upward to milliseconds,
-and a new positive rate/delay retimes the current repeat from the current
-tick. At most one repetition is dispatched per loop turn; missed repetitions
-are dropped, never burst after a stall. Buffered release/focus events run
-before timer repeats. Timer arithmetic is checked; exhaustion disarms repeat.
+The keyboard's state is the client's `Input`, under the repeat policy
+`td-ui/DESIGN.md` records. The editor's half: focus loss also clears
+prefixes; only a repeatable stroke accepted as a controller change arms
+repeat, which requests, prefixes, ignored or rejected strokes do not; the
+editor asks for at most one repetition per loop turn, after the turn's
+buffered release and focus events, and the timing event carries the
+editor's current tick.
 
-Keyboard capability loss releases the keyboard, clears input, and retains
-text. Reacquisition creates a fresh object, waiting for delete_id before ID
-reuse. Bound-seat removal also releases the seat and leaves a notice, without
-disconnecting or silently moving to another seat. Dynamic new-seat selection
-and multi-seat editing are deferred. The clipboard descriptor consumer is
-separately rostered under this crate's data-device contract below.
+Keyboard capability loss, which the client reports, drops what focus and
+a map allowed and retains text; reacquisition is the client's fresh
+object. Bound-seat removal, which the client reports, also releases the
+editor's clipboard and leaves a notice, without disconnecting or silently
+moving to another seat. Dynamic new-seat selection and multi-seat editing
+are deferred. The clipboard descriptor consumer is separately rostered
+under this crate's data-device contract below.
 
 Automated socket tests inspect the actual received pool descriptor and pixels,
 exercise fragmented events, ping/close, version/ID limits, both release/callback
 orders and resize storms. The opt-in Weston test waits for a callback from the
 real compositor after the real reference buffer commit. It proves presentation,
 not live keyboard delivery, compositor screenshots, GPU rendering or td-jail
-integration. Socket tests separately exercise real keymap transfers, both
-profiles' edits/undo and changed raster pixels, map replacement and rejection,
-held/focus/modifier/repeat state, and dirty-window discard/cancel.
+integration. Socket tests separately exercise real keymap transfers through
+the client, both profiles' edits/undo and changed raster pixels, map
+replacement and rejection, held/focus/modifier/repeat state, and
+dirty-window discard/cancel; the keymap reader's own shared-offset and
+bad-source oracle is td-ui's.
 
 ### Implemented native pointer contract
 
-The bound v5-v7 seat independently supplies a pointer. Capability loss sends
-release, clears pointer state and ends the controller drag without changing
-keyboard focus or selection. In-flight retired events are schema-checked but
-not applied; IDs wait for delete_id. Seat removal releases both devices.
-Pointer enter/leave must name the main surface. Unknown opcodes, truncated or
-trailing payloads, invalid axis/source numbers and invalid button states are
-errors. Right/middle/unknown buttons are otherwise ignored; only BTN_LEFT
-press/move/release is connected. Duplicate presses and unmatched releases
-do nothing. Enter never invents a held button; leave cancels dragging and
+The bound v5-v7 seat independently supplies a pointer, which the client
+creates, releases, decodes and validates under the rules `td-ui/DESIGN.md`
+records. When the client reports capability loss, the editor clears its
+gesture state and ends the controller drag without changing keyboard focus
+or selection. Right/middle/unknown buttons are ignored; only BTN_LEFT
+press/move/release is connected. Duplicate presses and unmatched releases do
+nothing. Enter never invents a held button; leave cancels dragging and
 pending wheel motion without changing keyboard focus.
 
 Mouse input works before keyboard focus. Shift extends selection only when
@@ -2774,13 +2763,14 @@ function-key system-action levels are ignored. Other out-of-profile symbols
 are diagnosed on use, never substituted with physical US text.
 
 `TypeCatalog::parse` alone remains insufficient for keyboard activation.
-The scratch-window adapter calls the whole compiler at its sole descriptor
-consumer. Confinement tests pin that consumer, the raw boundary, and the
-compiler/seat access roster: the compiler and the repeat policy are td-ui's
-(`td_ui::keyboard`, `td_ui::repeat`), and the window adapter is the sole
-editor file that names them. `td_ui::repeat::Input` owns repeat scheduling
-separately; the compiler's repeat metadata alone is not a timer or held-key
-state.
+td-ui's client calls the whole compiler at its keymap consumer
+(`UNSAFE.md` §19). Confinement tests pin the raw boundary and the
+compiler/seat access roster: the compiler, the repeat policy and the
+keyboard's state are td-ui's (`td_ui::keyboard`, `td_ui::repeat`, the
+client's `Input`), reached only through the client's typed outcomes and
+accessors, and no editor file names the compiler or the repeat policy.
+The client's `Input` owns repeat scheduling separately; the compiler's
+repeat metadata alone is not a timer or held-key state.
 
 `td-ui/tests/fixtures/us.xkb` is a complete libxkbcommon-compiled
 evdev/pc105/US map with upstream license/provenance, not a captured Weston

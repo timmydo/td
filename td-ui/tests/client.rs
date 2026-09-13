@@ -7,9 +7,10 @@
 )]
 
 //! The shared client against a scripted peer: the object table and
-//! registry, the toplevel's buffers and frame callback, the pointer image,
-//! and the turn loop, driven by the smallest consumer. The presentation and
-//! loop tests moved here from td-editor's window tests.
+//! registry, the toplevel's buffers and frame callback, the seat with its
+//! keyboard and pointer, the pointer image, and the turn loop, driven by
+//! the smallest consumer. The presentation, loop and device tests moved
+//! here from td-editor's window tests.
 
 use std::fs::File;
 use std::io::{Read, Write};
@@ -17,10 +18,11 @@ use std::os::unix::fs::{FileExt, MetadataExt};
 use std::os::unix::net::UnixStream;
 use std::time::{Duration, Instant};
 use td_ui::client::{
-    run, App, Client, Handled, Kind, Tag, BUFFERS, COMPOSITOR, DISPLAY, GLOBALS, INITIAL_DEADLINE,
-    MESSAGES_PER_TURN, NAME_BYTES, OBJECTS, REGISTRY, SHM, SURFACE, SYNC, TOPLEVEL, WM,
-    XDG_SURFACE,
+    run, App, Client, Handled, KeyboardEvent, Kind, Tag, BUFFERS, COMPOSITOR, DISPLAY, GLOBALS,
+    INITIAL_DEADLINE, MESSAGES_PER_TURN, NAME_BYTES, OBJECTS, REGISTRY, SHM, SURFACE, SYNC,
+    TOPLEVEL, WM, XDG_SURFACE,
 };
+use td_ui::pointer;
 use td_ui::wayland::{backing_file, cursor_pixels, peer, Connection, IDLE_WAIT, WRITE_DEADLINE};
 use td_ui::wire::{self, Builder, Cursor, Message};
 
@@ -39,11 +41,16 @@ impl Tag for Mark {
     }
 }
 
-/// The smallest consumer: one flat colour behind a marker pixel, a count
-/// of what the client hands back, and optionally one object of its own
+/// The smallest consumer: one flat colour behind a marker pixel, a log of
+/// what the client hands back, and optionally one object of its own
 /// whose opcode 0 carries a right.
 struct Probe {
     client: Client<Mark>,
+    clock: u64,
+    keyboard: Vec<KeyboardEvent>,
+    pointer: Vec<pointer::Event>,
+    capabilities: Vec<(bool, bool)>,
+    seat_removed: usize,
     size: (usize, usize),
     dirty: bool,
     frames: usize,
@@ -63,6 +70,11 @@ impl Probe {
     fn new(stream: UnixStream) -> Self {
         Self {
             client: Client::new(stream, std::env::temp_dir()).unwrap(),
+            clock: 0,
+            keyboard: Vec::new(),
+            pointer: Vec::new(),
+            capabilities: Vec::new(),
+            seat_removed: 0,
             size: (0, 0),
             dirty: false,
             frames: 0,
@@ -98,7 +110,7 @@ impl App for Probe {
 
     fn event(&mut self, message: Message) -> Result<()> {
         self.log.push((message.object, message.opcode));
-        match self.client.handle(&message)? {
+        match self.client.handle(&message, self.clock)? {
             Handled::Bound => {
                 self.client.set_title("probe")?;
                 self.client.set_app_id("td-ui-probe")?;
@@ -147,7 +159,23 @@ impl App for Probe {
                 self.unhandled += 1;
                 Ok(())
             }
-            Handled::Done | Handled::Format(_) | Handled::GlobalRemoved { .. } => Ok(()),
+            Handled::Keyboard(event) => {
+                self.keyboard.push(event);
+                Ok(())
+            }
+            Handled::Pointer(event) => {
+                self.pointer.push(event);
+                Ok(())
+            }
+            Handled::Capabilities { keyboard, pointer } => {
+                self.capabilities.push((keyboard, pointer));
+                Ok(())
+            }
+            Handled::SeatRemoved => {
+                self.seat_removed += 1;
+                Ok(())
+            }
+            Handled::Done | Handled::GlobalRemoved { .. } => Ok(()),
         }
     }
 
@@ -248,6 +276,76 @@ fn bind_target(request: &Message) -> (String, u32, u32) {
     let id = c.u32().unwrap();
     c.finish().unwrap();
     (name, version, id)
+}
+
+fn text_event(object: u32, opcode: u16, text: &str) -> Message {
+    let mut body = Builder::new();
+    body.string(text).unwrap();
+    wire::take(&mut body.message(object, opcode).unwrap())
+        .unwrap()
+        .unwrap()
+}
+
+/// A bound probe whose compositor advertises XRGB and one v10 seat, with
+/// its pointer and keyboard already created: `(probe, peer, seat,
+/// keyboard, pointer)`, the requests so far drained.
+fn seat_fixture() -> (Probe, UnixStream, u32, u32, u32) {
+    let (a, b) = pair();
+    let mut p = Probe::new(a);
+    for event in [
+        global(1, "wl_compositor", 4),
+        global(2, "wl_shm", 1),
+        global(3, "xdg_wm_base", 1),
+        global(4, "wl_seat", 10),
+    ] {
+        p.event(event).unwrap();
+    }
+    p.event(message(SYNC, 0, &[0])).unwrap();
+    p.event(message(DISPLAY, 1, &[SYNC])).unwrap();
+    p.event(message(SHM, 0, &[1])).unwrap();
+    let seat = p.client.seat().unwrap();
+    let (requests, _) = drain(&b);
+    let binding = requests.iter().rfind(|m| m.object == REGISTRY).unwrap();
+    assert_eq!(
+        bind_target(binding),
+        ("wl_seat".into(), 7, seat),
+        "a v10 seat binds at the v7 cap"
+    );
+    p.event(message(seat, 0, &[3])).unwrap();
+    let keyboard = p.client.keyboard().unwrap();
+    let pointer = p.client.pointer().unwrap();
+    drain(&b);
+    (p, b, seat, keyboard, pointer)
+}
+
+/// The libxkbcommon US map in an unlinked file with its trailing NUL.
+fn map_file() -> File {
+    let source = include_str!("fixtures/us.xkb");
+    let file = backing_file(&std::env::temp_dir(), source.len() + 1).unwrap();
+    file.write_all_at(source.as_bytes(), 0).unwrap();
+    file
+}
+
+/// Sends `file` as `keyboard`'s keymap of `format` through the socket and
+/// dispatches everything the probe reads back.
+fn send_map(p: &mut Probe, peer: &UnixStream, keyboard: u32, format: u32, file: &File) {
+    let mut sender = Connection::new(peer.try_clone().unwrap()).unwrap();
+    let mut body = Builder::new();
+    body.u32(format);
+    body.u32(file.metadata().unwrap().len() as u32);
+    sender.send(keyboard, 0, body, Some(file)).unwrap();
+    p.client.connection().read_more().unwrap();
+    while let Some(event) = p.client.connection().take().unwrap() {
+        p.event(event).unwrap();
+    }
+}
+
+fn press(p: &mut Probe, keyboard: u32, serial: u32, key: u32) {
+    p.event(message(keyboard, 3, &[serial, 0, key, 1])).unwrap();
+}
+
+fn release(p: &mut Probe, keyboard: u32, serial: u32, key: u32) {
+    p.event(message(keyboard, 3, &[serial, 0, key, 0])).unwrap();
 }
 
 #[test]
@@ -482,7 +580,7 @@ fn registry_lookups_name_the_lowest_global_and_removal_reports_requirement() {
         .unwrap_err()
         .contains("ignored_optional v44"));
     assert_eq!(
-        p.client.handle(&message(REGISTRY, 1, &[70])).unwrap(),
+        p.client.handle(&message(REGISTRY, 1, &[70]), 0).unwrap(),
         Handled::GlobalRemoved {
             id: 70,
             required: false
@@ -490,7 +588,7 @@ fn registry_lookups_name_the_lowest_global_and_removal_reports_requirement() {
     );
     assert_eq!(p.client.global_name(70), None);
     assert_eq!(
-        p.client.handle(&message(REGISTRY, 1, &[60])).unwrap(),
+        p.client.handle(&message(REGISTRY, 1, &[60]), 0).unwrap(),
         Handled::GlobalRemoved {
             id: 60,
             required: true
@@ -510,7 +608,7 @@ fn consumer_objects_are_handed_back_untouched_and_retire_through_their_tag() {
     let live = p.client.allocate(Mark::Live).unwrap();
     assert_eq!(live, 10, "the first dynamic id");
     assert_eq!(
-        p.client.handle(&message(live, 3, &[1, 2])).unwrap(),
+        p.client.handle(&message(live, 3, &[1, 2]), 0).unwrap(),
         Handled::Unhandled
     );
     p.event(message(live, 3, &[1, 2])).unwrap();
@@ -654,14 +752,24 @@ fn hidden_surface_waits_for_visibility_without_a_callback_deadline() {
 
 #[test]
 fn pointer_image_is_one_immutable_argb_pool_and_follows_enter_serials() {
-    let (mut p, peer) = fixture();
-    drain(&peer);
-    let pointer = p.client.allocate(Mark::Live).unwrap();
-    p.client.show_cursor(pointer, 19).unwrap();
+    let (mut p, peer, _, _, pointer) = seat_fixture();
+    p.event(message(pointer, 0, &[19, SURFACE, 512, 768]))
+        .unwrap();
+    assert_eq!(
+        p.pointer,
+        [pointer::Event::Enter {
+            serial: 19,
+            surface: SURFACE,
+            x: 512,
+            y: 768
+        }]
+    );
+    assert_eq!(p.client.entered(), Some(19));
     assert!(p.client.cursor().is_none(), "nothing without ARGB");
     assert!(drain(&peer).0.is_empty());
+    // ARGB advertised while the pointer is inside shows the image at the
+    // enter serial.
     p.event(message(SHM, 0, &[0])).unwrap();
-    p.client.show_cursor(pointer, 19).unwrap();
     let (surface, buffer) = p.client.cursor().unwrap();
     let (requests, files) = drain(&peer);
     assert_eq!(files.len(), 1);
@@ -703,11 +811,372 @@ fn pointer_image_is_one_immutable_argb_pool_and_follows_enter_serials() {
     assert!(p.event(message(buffer, 0, &[])).is_err());
     p.event(message(DISPLAY, 1, &[pool])).unwrap();
     assert_eq!(p.client.kind(pool).unwrap(), Kind::Free);
-    p.client.show_cursor(pointer, 21).unwrap();
+    // Leave clears the serial; re-entering only re-sends `set_cursor`.
+    p.event(message(pointer, 1, &[20, SURFACE])).unwrap();
+    assert_eq!(p.client.entered(), None);
+    assert_eq!(p.pointer.last(), Some(&pointer::Event::Leave(SURFACE)));
+    p.event(message(pointer, 0, &[21, SURFACE, 0, 0])).unwrap();
+    assert_eq!(p.client.entered(), Some(21));
     let (requests, files) = drain(&peer);
     assert!(files.is_empty());
     assert_eq!(requests, [message(pointer, 0, &[21, surface, 0, 0])]);
     assert_eq!(p.client.cursor(), Some((surface, buffer)));
+    // Motion, buttons, axes and frames are handed on decoded; enter and
+    // leave for another surface end the connection.
+    p.event(message(pointer, 2, &[0, 256, 512])).unwrap();
+    p.event(message(pointer, 3, &[22, 0, 0x110, 1])).unwrap();
+    p.event(message(pointer, 4, &[0, 0, 768])).unwrap();
+    p.event(message(pointer, 5, &[])).unwrap();
+    assert_eq!(
+        &p.pointer[3..],
+        [
+            pointer::Event::Motion(256, 512),
+            pointer::Event::Button {
+                serial: 22,
+                button: 0x110,
+                pressed: true
+            },
+            pointer::Event::Axis(0, 768),
+            pointer::Event::Frame,
+        ]
+    );
+    assert!(p.event(message(pointer, 1, &[23, 99])).is_err());
+    assert!(p.event(message(pointer, 0, &[24, 99, 0, 0])).is_err());
+    assert_eq!(
+        p.client.entered(),
+        Some(21),
+        "a refused event changes nothing"
+    );
+}
+
+#[test]
+fn the_seat_is_the_lowest_v5_global_capped_at_v7_and_its_devices_follow_capabilities() {
+    let (a, peer) = pair();
+    let mut p = Probe::new(a);
+    for event in [
+        global(1, "wl_compositor", 4),
+        global(2, "wl_shm", 1),
+        global(3, "xdg_wm_base", 1),
+        global(4, "wl_seat", 4),
+        global(5, "wl_seat", 6),
+        global(6, "wl_seat", 10),
+    ] {
+        p.event(event).unwrap();
+    }
+    p.event(message(SYNC, 0, &[0])).unwrap();
+    let seat = p.client.seat().unwrap();
+    assert_eq!(seat, 10, "the seat is the first dynamic id");
+    assert_eq!(p.client.required(), [1, 2, 3, 5]);
+    let (requests, _) = drain(&peer);
+    let binding = requests.iter().rposition(|m| m.object == REGISTRY).unwrap();
+    assert_eq!(bind_target(&requests[binding]), ("wl_seat".into(), 6, seat));
+    let toplevel = requests
+        .iter()
+        .position(|m| *m == message(XDG_SURFACE, 1, &[TOPLEVEL]))
+        .unwrap();
+    assert!(toplevel < binding, "the fixed ids come first");
+    assert!(p.client.keyboard().is_none() && p.client.pointer().is_none());
+    // Capabilities create the pointer, then the keyboard, once each.
+    p.event(message(seat, 0, &[3])).unwrap();
+    let (keyboard, pointer) = (p.client.keyboard().unwrap(), p.client.pointer().unwrap());
+    assert_eq!((pointer, keyboard), (11, 12));
+    assert_eq!(
+        drain(&peer).0,
+        [message(seat, 0, &[pointer]), message(seat, 1, &[keyboard])]
+    );
+    assert_eq!(p.capabilities, [(true, true)]);
+    p.event(message(seat, 0, &[3])).unwrap();
+    assert!(drain(&peer).0.is_empty());
+    assert_eq!(
+        (p.client.keyboard(), p.client.pointer()),
+        (Some(keyboard), Some(pointer))
+    );
+    assert_eq!(p.capabilities, [(true, true), (true, true)]);
+    // A name within the registry's name budget is accepted; over it, or an
+    // unknown opcode, ends the connection.
+    p.event(text_event(seat, 1, &"s".repeat(NAME_BYTES)))
+        .unwrap();
+    assert!(p
+        .event(text_event(seat, 1, &"s".repeat(NAME_BYTES + 1)))
+        .is_err());
+    assert!(p.event(message(seat, 2, &[])).is_err());
+    // Trailing payload bytes are refused on the seat's name and on a
+    // registry removal, before any release.
+    let mut trailing = text_event(seat, 1, "seat0");
+    trailing.payload.extend_from_slice(&[0; 4]);
+    assert!(p.event(trailing).is_err(), "trailing bytes");
+    assert!(
+        p.event(message(REGISTRY, 1, &[5, 0])).is_err(),
+        "a removal with trailing bytes"
+    );
+    assert!(p.client.seat().is_some(), "refused before any release");
+    // Without a v5 seat there is no seat, and the probe is still bound.
+    let (a, _peer) = pair();
+    let mut p = Probe::new(a);
+    for event in [
+        global(1, "wl_compositor", 4),
+        global(2, "wl_shm", 1),
+        global(3, "xdg_wm_base", 1),
+        global(4, "wl_seat", 4),
+    ] {
+        p.event(event).unwrap();
+    }
+    p.event(message(SYNC, 0, &[0])).unwrap();
+    assert!(p.client.seat().is_none() && p.client.bound());
+    assert_eq!(p.client.required(), [1, 2, 3]);
+}
+
+#[test]
+fn a_keymap_crosses_the_socket_and_presses_translate_after_focus_and_the_snapshot() {
+    let (mut p, peer, _, keyboard, _) = seat_fixture();
+    assert!(p
+        .client
+        .needs_descriptor(&message(keyboard, 0, &[1, 4]))
+        .unwrap());
+    assert!(!p
+        .client
+        .needs_descriptor(&message(keyboard, 3, &[1, 0, 30, 1]))
+        .unwrap());
+    assert!(p
+        .client
+        .needs_descriptor(&message(keyboard, 0, &[1]))
+        .is_err());
+    assert!(!p
+        .client
+        .needs_descriptor(&message(0xff00_0000, 0, &[]))
+        .unwrap());
+    send_map(&mut p, &peer, keyboard, 1, &map_file());
+    assert_eq!(p.keyboard, [KeyboardEvent::Keymap(Ok(()))]);
+    assert!(p.client.input().map.is_some() && !p.client.input().focused);
+    assert_eq!(p.client.descriptors(), 0);
+    // A press before focus, a held key installed by enter, and a press
+    // before the modifier snapshot type nothing.
+    press(&mut p, keyboard, 1, 30);
+    release(&mut p, keyboard, 2, 30);
+    p.event(message(keyboard, 1, &[3, SURFACE, 4, 30])).unwrap();
+    assert_eq!(p.keyboard.last(), Some(&KeyboardEvent::Focus(true)));
+    assert!(p.client.input().focused && !p.client.input().synchronized);
+    press(&mut p, keyboard, 4, 48);
+    assert_eq!(p.keyboard.len(), 2);
+    release(&mut p, keyboard, 4, 48);
+    p.event(message(keyboard, 4, &[5, 0, 0, 0, 0])).unwrap();
+    assert_eq!(p.keyboard.last(), Some(&KeyboardEvent::Ready));
+    p.event(message(keyboard, 4, &[6, 0, 0, 0, 0])).unwrap();
+    assert_eq!(p.keyboard.len(), 3, "later snapshots are silent");
+    p.event(message(keyboard, 5, &[25, 600])).unwrap();
+    press(&mut p, keyboard, 7, 30);
+    assert_eq!(p.keyboard.len(), 3, "the key held at enter is still down");
+    release(&mut p, keyboard, 8, 30);
+    press(&mut p, keyboard, 9, 30);
+    assert_eq!(
+        p.keyboard.last(),
+        Some(&KeyboardEvent::Key {
+            serial: 9,
+            key: 30,
+            stroke: td_ui::keyboard::Stroke {
+                chord: "a".into(),
+                repeat: true
+            }
+        })
+    );
+    // The consumer arms repeat at its clock; the wait follows the due time.
+    p.client.arm(30, 100);
+    assert_eq!(p.client.wait_ms(650), 50);
+    assert!(p.client.repeat(699).unwrap().is_none());
+    assert_eq!(p.client.repeat(700).unwrap().unwrap().chord, "a");
+    assert_eq!(p.client.wait_ms(700), 40);
+    p.client.cancel_repeat();
+    assert!(p.client.repeat(5000).unwrap().is_none());
+    // A changed snapshot translates the next press under it, and the
+    // timing event retimes an armed repeat from the consumer's clock.
+    p.event(message(keyboard, 4, &[10, 1, 0, 0, 0])).unwrap();
+    release(&mut p, keyboard, 11, 30);
+    press(&mut p, keyboard, 12, 48);
+    let Some(KeyboardEvent::Key {
+        key: 48, stroke, ..
+    }) = p.keyboard.last()
+    else {
+        panic!("{:?}", p.keyboard.last());
+    };
+    assert_eq!(stroke.chord, "B");
+    p.client.arm(48, 1000);
+    p.clock = 1000;
+    p.event(message(keyboard, 5, &[10, 200])).unwrap();
+    assert!(p.client.repeat(1199).unwrap().is_none());
+    assert_eq!(p.client.repeat(1200).unwrap().unwrap().chord, "B");
+    // Leave clears focus, the held keys and the repeat; presses wait for
+    // the next enter and snapshot.
+    p.event(message(keyboard, 2, &[13, SURFACE])).unwrap();
+    assert_eq!(p.keyboard.last(), Some(&KeyboardEvent::Focus(false)));
+    assert!(!p.client.input().focused && !p.client.input().synchronized);
+    assert!(p.client.repeat(9000).unwrap().is_none());
+    let seen = p.keyboard.len();
+    press(&mut p, keyboard, 14, 30);
+    assert_eq!(p.keyboard.len(), seen);
+    p.event(message(keyboard, 1, &[15, SURFACE, 0])).unwrap();
+    p.event(message(keyboard, 4, &[16, 0, 0, 0, 0])).unwrap();
+    assert_eq!(p.keyboard.last(), Some(&KeyboardEvent::Ready));
+}
+
+#[test]
+fn a_refused_keymap_disables_input_and_keyboard_events_are_schema_checked() {
+    let (mut p, peer, _, keyboard, _) = seat_fixture();
+    send_map(&mut p, &peer, keyboard, 1, &map_file());
+    p.event(message(keyboard, 1, &[1, SURFACE, 0])).unwrap();
+    p.event(message(keyboard, 4, &[2, 0, 0, 0, 0])).unwrap();
+    assert_eq!(p.keyboard.last(), Some(&KeyboardEvent::Ready));
+    // A map the compiler refuses replaces the old one with none; focus
+    // stays, the snapshot is awaited again.
+    let invalid = backing_file(&std::env::temp_dir(), 4).unwrap();
+    send_map(&mut p, &peer, keyboard, 1, &invalid);
+    let Some(KeyboardEvent::Keymap(Err(_))) = p.keyboard.last() else {
+        panic!("{:?}", p.keyboard.last());
+    };
+    assert!(p.client.input().map.is_none());
+    assert!(p.client.input().focused && !p.client.input().synchronized);
+    assert_eq!(p.client.descriptors(), 0);
+    press(&mut p, keyboard, 3, 30);
+    p.event(message(keyboard, 4, &[4, 0, 0, 0, 0])).unwrap();
+    let seen = p.keyboard.len();
+    release(&mut p, keyboard, 5, 30);
+    press(&mut p, keyboard, 6, 30);
+    assert_eq!(p.keyboard.len(), seen, "no map, no strokes");
+    // An unsupported format drops its right unread and names the format.
+    send_map(&mut p, &peer, keyboard, 2, &map_file());
+    let Some(KeyboardEvent::Keymap(Err(detail))) = p.keyboard.last() else {
+        panic!("{:?}", p.keyboard.last());
+    };
+    assert_eq!(detail, "unsupported keymap format 2");
+    assert_eq!(p.client.descriptors(), 0);
+    // A valid map restores input after the snapshot.
+    send_map(&mut p, &peer, keyboard, 1, &map_file());
+    assert_eq!(p.keyboard.last(), Some(&KeyboardEvent::Keymap(Ok(()))));
+    p.event(message(keyboard, 4, &[7, 0, 0, 0, 0])).unwrap();
+    assert_eq!(p.keyboard.last(), Some(&KeyboardEvent::Ready));
+    release(&mut p, keyboard, 8, 30);
+    press(&mut p, keyboard, 9, 30);
+    let Some(KeyboardEvent::Key { key: 30, .. }) = p.keyboard.last() else {
+        panic!("{:?}", p.keyboard.last());
+    };
+    // A keymap without its right is a parked event, never a guess.
+    assert!(p.event(message(keyboard, 0, &[1, 4])).is_err());
+    // Schema refusals: another surface, a held-key array over budget, a
+    // key state past released, a negative rate and an unknown opcode.
+    assert!(p.event(message(keyboard, 1, &[1, 99, 0])).is_err());
+    assert!(p.event(message(keyboard, 2, &[1, 99])).is_err());
+    let mut body = Builder::new();
+    body.u32(1);
+    body.u32(SURFACE);
+    body.u32(769 * 4);
+    for _ in 0..769 {
+        body.u32(1);
+    }
+    let crowded = wire::take(&mut body.message(keyboard, 1).unwrap())
+        .unwrap()
+        .unwrap();
+    assert!(p.event(crowded).is_err());
+    assert!(p.event(message(keyboard, 3, &[1, 0, 30, 2])).is_err());
+    assert!(p.event(message(keyboard, 5, &[u32::MAX, 0])).is_err());
+    assert!(p.event(message(keyboard, 6, &[])).is_err());
+    assert!(p.event(message(keyboard, 3, &[1, 0, 30])).is_err());
+    assert!(p.client.input().map.is_some(), "refusals change nothing");
+}
+
+#[test]
+fn capability_loss_releases_a_device_and_retired_devices_drain_until_delete_id() {
+    let (mut p, peer, seat, keyboard, pointer) = seat_fixture();
+    p.event(message(pointer, 0, &[19, SURFACE, 0, 0])).unwrap();
+    assert_eq!(p.client.entered(), Some(19));
+    p.event(message(seat, 0, &[2])).unwrap();
+    assert_eq!(drain(&peer).0, [message(pointer, 1, &[])]);
+    assert_eq!(p.capabilities.last(), Some(&(true, false)));
+    assert!(p.client.pointer().is_none() && p.client.entered().is_none());
+    assert_eq!(p.client.kind(pointer).unwrap(), Kind::RetiredPointer);
+    let seen = p.pointer.len();
+    p.event(message(pointer, 2, &[0, 256, 256])).unwrap();
+    assert_eq!(p.pointer.len(), seen, "retired events are drained");
+    assert!(
+        p.event(message(pointer, 3, &[0, 0, 0x110, 2])).is_err(),
+        "and still schema-checked"
+    );
+    p.event(message(seat, 0, &[3])).unwrap();
+    let replacement = p.client.pointer().unwrap();
+    assert_ne!(replacement, pointer, "no reuse before delete_id");
+    assert_eq!(drain(&peer).0, [message(seat, 0, &[replacement])]);
+    p.event(message(DISPLAY, 1, &[pointer])).unwrap();
+    assert_eq!(p.client.kind(pointer).unwrap(), Kind::Free);
+    // Keyboard loss releases it, forgets its state and drops the right of
+    // a keymap still in flight.
+    send_map(&mut p, &peer, keyboard, 1, &map_file());
+    p.event(message(keyboard, 1, &[1, SURFACE, 0])).unwrap();
+    assert!(p.client.input().map.is_some() && p.client.input().focused);
+    p.event(message(seat, 0, &[1])).unwrap();
+    assert_eq!(drain(&peer).0, [message(keyboard, 0, &[])]);
+    assert_eq!(p.capabilities.last(), Some(&(false, true)));
+    assert!(p.client.keyboard().is_none());
+    assert!(p.client.input().map.is_none() && !p.client.input().focused);
+    let seen = p.keyboard.len();
+    send_map(&mut p, &peer, keyboard, 1, &map_file());
+    assert_eq!(p.keyboard.len(), seen);
+    assert_eq!(p.client.descriptors(), 0);
+    assert!(p.client.input().map.is_none());
+    p.event(message(seat, 0, &[3])).unwrap();
+    assert_ne!(p.client.keyboard(), Some(keyboard));
+    p.event(message(DISPLAY, 1, &[keyboard])).unwrap();
+    assert_eq!(p.client.kind(keyboard).unwrap(), Kind::Free);
+    assert!(p.event(message(keyboard, 0, &[1, 4])).is_err());
+    // Losing a device that was never created is silent.
+    let (mut p, peer, seat, _, _) = seat_fixture();
+    p.event(message(seat, 0, &[0])).unwrap();
+    p.event(message(seat, 0, &[0])).unwrap();
+    let (requests, _) = drain(&peer);
+    assert_eq!(requests.len(), 2, "one release each, once");
+    assert_eq!(
+        p.capabilities,
+        [(true, true), (false, false), (false, false)]
+    );
+}
+
+#[test]
+fn seat_removal_releases_both_devices_and_the_seat_and_forgets_the_global() {
+    let (mut p, peer, seat, keyboard, pointer) = seat_fixture();
+    send_map(&mut p, &peer, keyboard, 1, &map_file());
+    p.event(message(pointer, 0, &[19, SURFACE, 0, 0])).unwrap();
+    p.event(message(REGISTRY, 1, &[4])).unwrap();
+    assert_eq!(p.seat_removed, 1);
+    assert_eq!(
+        drain(&peer).0,
+        [
+            message(keyboard, 0, &[]),
+            message(pointer, 1, &[]),
+            message(seat, 3, &[])
+        ]
+    );
+    assert!(p.client.seat().is_none());
+    assert!(p.client.keyboard().is_none() && p.client.pointer().is_none());
+    assert!(p.client.input().map.is_none() && p.client.entered().is_none());
+    assert!(!p.client.is_required(4) && p.client.global_name(4).is_none());
+    assert_eq!(p.client.required(), [1, 2, 3]);
+    assert!(!p.client.closed());
+    // Retired objects drain their events, a keymap's right included, until
+    // delete_id frees them.
+    p.event(message(seat, 0, &[2])).unwrap();
+    p.event(text_event(seat, 1, "seat0")).unwrap();
+    assert_eq!(p.capabilities.len(), 1);
+    send_map(&mut p, &peer, keyboard, 1, &map_file());
+    assert_eq!(p.client.descriptors(), 0);
+    assert!(p.client.input().map.is_none());
+    assert!(drain(&peer).0.is_empty());
+    for id in [keyboard, pointer, seat] {
+        p.event(message(DISPLAY, 1, &[id])).unwrap();
+        assert_eq!(p.client.kind(id).unwrap(), Kind::Free);
+    }
+    // A seat the client never bound is an ordinary removal, and another
+    // required global's removal is still the consumer's error.
+    p.event(global(40, "wl_seat", 9)).unwrap();
+    p.event(message(REGISTRY, 1, &[40])).unwrap();
+    assert_eq!(p.seat_removed, 1);
+    assert!(p.event(message(REGISTRY, 1, &[1])).is_err());
 }
 
 #[test]

@@ -1,7 +1,7 @@
 //! Bounded wl_pointer v5-v7 decoding and axis-frame accumulation.
 
-use crate::{CELL_HEIGHT, CELL_WIDTH};
 use crate::wire::{Cursor, Message};
+use crate::{CELL_HEIGHT, CELL_WIDTH};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Event {

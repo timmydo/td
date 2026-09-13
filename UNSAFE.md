@@ -2284,31 +2284,19 @@ binds its descriptor FIFO to the exact data-source send schema below and
 passes a fresh private socket endpoint for receiving selected UTF-8 text.
 
 Received rights reach the editor only through td-ui's connection FIFO
-(§19), which owns every delivered descriptor until one of the two consumers
-below pops it. The keymap consumer is `wayland::read_keymap`: one right
-popped per `wl_keyboard.keymap`, including unsupported formats and events
-queued on a retired keyboard. Retired events drop their descriptor without
-reading it.
-Active text-v1 maps convert the owner to `File` with safe `From`, require a
-regular file covering the advertised 1..=1 MiB extent, and read exactly that
-extent with `FileExt::read_exact_at` at offset zero. This does not move the
-compositor's shared offset. The payload must be UTF-8 with one trailing NUL;
-the complete bounded compiler must accept it before text input is activated.
-No mapping or procfs reopen is used; a concurrent truncation returns an I/O
-error, not SIGBUS. Reads of an admitted regular file are synchronous; no
-hard latency claim is made for a stalled filesystem. A failed replacement
-map disables input and cancels repeat, but leaves scratch text accessible
-if a subsequent map succeeds. A missing descriptor waits at most five seconds
-without assuming ancillary boundaries coincide with wire-message boundaries.
-Tests inspect sent SHM pools through td-ui's `peer::drain` (§19).
+(§19), which owns every delivered descriptor until its consumer pops it.
+The keymap consumer is td-ui's client (§19); the editor acts on the
+compiled or refused outcome and never sees the descriptor. Tests inspect
+sent SHM pools through td-ui's `peer::drain` (§19).
 
-The second production consumer is a data-source send event: exactly one
-descriptor moves to `transfer::Outgoing`, or is dropped on unsupported MIME,
-stale/retired source or an occupied outgoing slot. Complete event schemas
-are validated before waiting for or consuming a descriptor. Missing rights
-use the same five-second FIFO wait as keymap events; unknown events never
-consume arbitrary queued rights. No clipboard endpoint is reopened through
-procfs or admitted as a regular file. Destination writes use std and assume
+The editor's one production consumer is a data-source send event: exactly
+one descriptor moves to `transfer::Outgoing`, or is dropped on unsupported
+MIME, stale/retired source or an occupied outgoing slot. Complete event
+schemas are validated before waiting for or consuming a descriptor.
+Missing rights wait in the client's loop for at most its five-second write
+deadline, as the client's keymap events do; unknown events never consume
+arbitrary queued rights. No clipboard endpoint is reopened through procfs
+or admitted as a regular file. Destination writes use std and assume
 Rust's ignored SIGPIPE disposition, as documented by the transfer API.
 
 The editor hands td-ui's descriptor send (§19) only the producer side of
@@ -2326,8 +2314,7 @@ descriptor and that the Wayland adapter never names the raw module.
 Conditional allowances, include paths, nested source directories and
 generated source includes are refused. Kernel tests of the transport are
 td-ui's (§19); the editor's exercise the clipboard destination owner over
-real pipes and sockets, the file transaction and the keymap consumer
-against a scripted peer.
+real pipes and sockets and the file transaction against a scripted peer.
 
 No mmap, ioctl, GPU access, poll, close syscall, credential call, child exec,
 raw environment-fd adoption or other received-fd consumer is authorized here. A
@@ -2620,18 +2607,17 @@ a change to both, reviewed once and recorded in §17.
 ## 19. `td-ui` — the shared Wayland client transport
 
 td-ui's `sys.rs` carries exactly THREE x86-64 Linux syscalls through one
-function-scoped instruction: `recvmsg` (47), `sendmsg` (46) and `fcntl`
-(72) pinned to `F_DUPFD_CLOEXEC` (1030). A second function-scoped
-allowance adopts newly installed nonnegative descriptors into `OwnedFd`.
-Safe `std` owns connection setup, byte-only sends, timeouts, pool file
-creation and unlinking, positional pixel writes, and every close. No raw
-pointer or unowned received descriptor escapes the private module; the
-crate root denies `unsafe`, and the two allowances are the module's only
-ones. Other architectures are refused at compile time rather than
-inheriting its ABI. The rest of the toolkit — the client over the
-transport, the raster, the keymap compiler, the repeat policy, the
-pointer decoder and the mounted font and wire sources — has no raw
-boundary.
+function-scoped instruction: `recvmsg` (47), `sendmsg` (46) and `fcntl` (72)
+pinned to `F_DUPFD_CLOEXEC` (1030). A second function-scoped allowance
+adopts newly installed nonnegative descriptors into `OwnedFd`. Safe `std`
+owns connection setup, byte-only sends, timeouts, pool file creation and
+unlinking, positional pixel writes and keymap reads, and every close. No raw
+pointer or unowned received descriptor escapes the private module; the crate
+root denies `unsafe`, and the two allowances are the module's only ones.
+Other architectures are refused at compile time rather than inheriting its
+ABI. The rest of the toolkit — the client over the transport, the raster,
+the keymap compiler, the repeat policy, the pointer decoder and the mounted
+font and wire sources — has no raw boundary.
 
 This surface is the editor's transport subset, moved here so that every
 td-owned graphical program shares one client, with one change: the
@@ -2660,20 +2646,19 @@ connection's own byte and right budgets. `recvmsg` always requests
 `MSG_CMSG_CLOEXEC` (0x40000000), with one borrowed byte slice and 128
 aligned ancillary bytes. The bounded walk adopts every recognizable
 nonnegative `SOL_SOCKET` (1) / `SCM_RIGHTS` (1) descriptor before checking
-truncation or policy, continuing past unknown records and invalid
-descriptor entries while
-record boundaries remain trustworthy. A broken boundary stops the walk;
-Linux supplies conforming framing and closes rights that do not fit.
-Truncation, unknown control kinds, invalid entries and broken framing are
-refused after ownership has been established, so drops close all
-delivered descriptors. Valid rights move into the connection's FIFO,
-bounded to eight pending descriptors independently of its byte queue.
-Queue overflow, parse failure, disconnect and connection teardown drop all
+truncation or policy, continuing past unknown records and invalid descriptor
+entries while record boundaries remain trustworthy. A broken boundary stops
+the walk; Linux supplies conforming framing and closes rights that do not
+fit. Truncation, unknown control kinds, invalid entries and broken framing
+are refused after ownership has been established, so drops close all
+delivered descriptors. Valid rights move into the connection's FIFO, bounded
+to eight pending descriptors independently of its byte queue. Queue
+overflow, parse failure, disconnect and connection teardown drop all
 remaining owners. The FIFO is never lent out: a consumer's event handler
-pops one right at a time in arrival order, and its only other writer is
-the test-support `peer::push_descriptor`, held to the same bound. Which
-events consume a right, and how, is the consumer's contract (§14 for the
-editor's keymap and data-source events).
+pops one right at a time in arrival order, and its only other writer is the
+test-support `peer::push_descriptor`, held to the same bound. The client's
+keymap consumer is recorded below; which other events consume a right, and
+how, is the consumer's contract (§14 for the editor's data-source event).
 
 The only send caller is the connection's descriptor-send path. `sendmsg`
 carries exactly one borrowed `File` in a 24-byte ancillary extent,
@@ -2685,21 +2670,38 @@ the remaining ordinary bytes are retried. Interrupted calls transfer
 nothing. The complete message has one five-second write deadline, including
 retries, capped by the startup deadline while the consumer holds one.
 
-Confinement tests pin the complete raw source fingerprint, the syscall
-and flag values, the two function-only allowances, the single
-instruction and adoption sites, that no other td-ui module names the
-raw module and that only `wayland.rs` calls its three wrappers, and that
-the crate root denies `unsafe`. Kernel tests exercise transfer,
-close-on-exec duplication, refusal cleanup and truncated rights; a
-byte-level synthetic control test checks cleanup beyond unrecognized
-records and invalid entries.
+The client is the toolkit's one consumer of a received right.
+`client::read_keymap` pops exactly one per `wl_keyboard.keymap`,
+including unsupported formats and events queued on a retired keyboard,
+whose descriptor is dropped without reading it. An active text-v1 map
+converts the owner to `File` with safe `From`, requires a regular file
+covering the advertised 1..=1 MiB extent, and reads exactly that extent
+with `FileExt::read_exact_at` at offset zero, so the compositor's shared
+offset never moves. The payload must be UTF-8 with one trailing NUL, and
+the complete bounded compiler must accept it before any press translates.
+No mapping or procfs reopen is used; a concurrent truncation returns an
+I/O error, not SIGBUS. Reads of an admitted regular file are synchronous;
+no hard latency claim is made for a stalled filesystem. A refused map
+leaves the keyboard without one until a later map succeeds. A missing
+descriptor waits in the loop for at most the write deadline, without
+assuming ancillary boundaries coincide with wire-message boundaries.
+
+Confinement tests pin the complete raw source fingerprint, the syscall and
+flag values, the two function-only allowances, the single instruction and
+adoption sites, that no other td-ui module names the raw module and that
+only `wayland.rs` calls its three wrappers, that the crate root denies
+`unsafe`, and that the keymap reader is the one pop beyond the FIFO's own
+accessor, with its format, size and regular-file checks. Kernel tests
+exercise transfer, close-on-exec duplication, refusal cleanup and truncated
+rights; a byte-level synthetic control test checks cleanup beyond
+unrecognized records and invalid entries.
 
 No mmap, ioctl, GPU access, poll, close syscall, credential call, child
-exec, raw environment-fd adoption or other received-fd consumer is
-authorized here. A fourth syscall, second fcntl command, another caller,
-or additional allowance amends this section and `td-ui/DESIGN.md` in the
-same landing; a consumer that takes a right from the FIFO records that
-consumer in its own section.
+exec, raw environment-fd adoption or received-fd consumer beyond the
+keymap reader is authorized here. A fourth syscall, second fcntl command,
+another caller, or additional allowance amends this section and
+`td-ui/DESIGN.md` in the same landing; a consumer that takes a right from
+the FIFO records that consumer in its own section.
 
 ## H1. `td-vm-registrar` — host Git account enrollment
 

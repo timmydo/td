@@ -96,8 +96,9 @@ fn source_inventory_and_allowances_are_closed() {
             );
         }
         // The keymap compiler, repeat policy and pointer decoder are td-ui's
-        // now (`td_ui::keyboard`, `td_ui::repeat`, `td_ui::pointer`); the
-        // input adapter is still the sole file that names them.
+        // (`td_ui::keyboard`, `td_ui::repeat`, `td_ui::pointer`), and the
+        // client owns the keyboard's state, so no editor file names the
+        // compiler or the seat interfaces; the input adapter alone may.
         if name != "wayland.rs" {
             for module in [
                 "keyboard",
@@ -270,16 +271,15 @@ fn complete_raw_layer_and_production_callers_are_pinned() {
         assert!(files.contains(pin), "file transaction pin: {pin}");
     }
     let adapter = include_str!("../src/wayland.rs");
-    assert_eq!(adapter.matches("Keymap::parse(source)").count(), 1);
-    assert_eq!(adapter.matches("File::from(fd)").count(), 1);
-    assert_eq!(adapter.matches("read_keymap(fd, format, size)").count(), 1);
-    assert!(adapter.contains("file.read_exact_at(&mut bytes, 0)"));
-    // The transport and the client over it are td-ui's (UNSAFE.md §19):
-    // production code reaches each through one import, owns no connection
-    // or object table of its own, touches the connection only for the four
-    // schedule inputs, and dispatches every event through the client; the
-    // tests add the shared peer support, and nothing names the editor's own
-    // raw module.
+    // The transport and the client over it are td-ui's (UNSAFE.md §19),
+    // the keymap consumer with them: production code reaches each through
+    // one import, owns no connection, object table or keyboard state of
+    // its own, touches the connection only for the four schedule inputs,
+    // dispatches every event through the client and pops exactly one
+    // right, the data source's; the tests add the shared peer support,
+    // and nothing names the editor's own raw module.
+    assert!(!adapter.contains("read_keymap") && !adapter.contains("read_exact_at"));
+    assert!(!adapter.contains("Keymap::parse") && !adapter.contains("File::from(fd)"));
     assert_eq!(adapter.matches("crate::sys::").count(), 0);
     assert!(!adapter.contains("from_raw_fd"));
     let production = adapter.split("#[cfg(test)]").next().unwrap();
@@ -295,7 +295,7 @@ fn complete_raw_layer_and_production_callers_are_pinned() {
         production
             .matches(concat!(
                 "use td_ui::client::{\n",
-                "    run, App, Client, Handled, Kind as ClientKind, Tag, ",
+                "    run, App, Client, Handled, KeyboardEvent, Kind as ClientKind, Tag, ",
                 "DISPLAY, REGISTRY, SURFACE,\n",
                 "};",
             ))
@@ -305,9 +305,18 @@ fn complete_raw_layer_and_production_callers_are_pinned() {
     assert!(!production.contains("Connection"));
     assert_eq!(production.matches("Client::new(stream, temporary)?").count(), 1);
     assert_eq!(production.matches("self.client.connection()").count(), 4);
-    assert_eq!(production.matches(".pop_descriptor()").count(), 2);
+    assert_eq!(production.matches(".pop_descriptor()").count(), 1);
     assert_eq!(production.matches(".unconfigure(").count(), 0);
-    assert_eq!(production.matches("self.client.handle(&message)?").count(), 1);
+    assert_eq!(production.matches(".input_mut(").count(), 0);
+    assert_eq!(
+        production
+            .matches("self.client.handle(&message, self.clock)?")
+            .count(),
+        1
+    );
+    // The two seat mentions are the scratch notice and the file window's
+    // refusal; the seat and its devices are the client's.
+    assert_eq!(production.matches("wl_seat").count(), 2);
     assert_eq!(production.matches("client.present(").count(), 1);
     assert_eq!(production.matches("run(&mut window)").count(), 2);
     assert_eq!(
@@ -486,9 +495,10 @@ fn native_prompt_answers_pin_context_before_cleanup_and_never_route_global_keys(
         "path_chord(",
         "close_chord(",
         "conflict_chord(",
-        "self.input.focused",
+        "self.client.input()",
+        "self.client.keyboard()",
         "self.client.configured()",
-        "self.input.key(",
+        "self.client.arm(",
     ] {
         assert!(!answer.contains(forbidden), "{forbidden}");
         assert!(!entry.contains(forbidden), "entry: {forbidden}");
@@ -778,7 +788,7 @@ fn native_control_is_opt_in_and_liveness_checked_with_bounded_outer_turns() {
             < key.find("self.chord(chord, false)").unwrap()
     );
     assert!(!key.contains("Event::") && !key.contains("activation_serial ="));
-    assert!(!key.contains("self.input.arm(") && !key.contains("self.clipboard_request("));
+    assert!(!key.contains("self.client.arm(") && !key.contains("self.clipboard_request("));
     let ready = production
         .split("fn control_key_available(")
         .nth(1)
@@ -791,12 +801,31 @@ fn native_control_is_opt_in_and_liveness_checked_with_bounded_outer_turns() {
         "self.closing.is_none()",
         "self.conflict.is_none()",
         "self.reloading.is_none()",
-        "self.input.focused",
-        "self.input.synchronized",
-        "self.input.map.is_some()",
+        "self.client.keyboard().is_some()",
+        "self.client.input().focused",
+        "self.client.input().synchronized",
+        "self.client.input().map.is_some()",
         "self.activation_serial.is_none()",
     ] {
         assert!(ready.contains(guard));
+    }
+    // The pointer's readiness reads the client's pointer and enter serial;
+    // the tests drop both through one capability event, so the pin keeps
+    // each guard on its own.
+    let pointer_ready = production
+        .split("fn control_pointer_available(")
+        .nth(1)
+        .unwrap()
+        .split("\n    fn ")
+        .next()
+        .unwrap();
+    for guard in [
+        "self.client.configured()",
+        "self.client.pointer().is_some()",
+        "self.client.entered().is_some()",
+        "self.activation_serial.is_none()",
+    ] {
+        assert!(pointer_ready.contains(guard), "{guard}");
     }
     let open = production
         .split("fn control_open_job(")

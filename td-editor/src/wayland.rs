@@ -3,22 +3,17 @@
 use crate::control_jobs::ReloadOutcome;
 use crate::dialog::{Close, Closed, Conflict, Scope, Target};
 use crate::font::Font;
-use td_ui::keyboard::{Keymap, Modifiers};
 use crate::keys::Profile;
 use crate::render::{Geometry, Label};
 use td_ui::raster::{Draw, GlyphStyle, Primitive, Raster, CHROME, INK};
-use td_ui::repeat::Input;
 use td_ui::client::{
-    run, App, Client, Handled, Kind as ClientKind, Tag, DISPLAY, REGISTRY, SURFACE,
+    run, App, Client, Handled, KeyboardEvent, Kind as ClientKind, Tag, DISPLAY, REGISTRY, SURFACE,
 };
 use td_ui::wayland::{connect, endpoint};
 use crate::ui::{Controller, Event, Outcome};
 use crate::wire::{Builder, Cursor, Message};
 use std::collections::VecDeque;
-use std::fs::File;
 use std::io;
-use std::os::fd::OwnedFd;
-use std::os::unix::fs::FileExt;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -30,17 +25,11 @@ fn error(value: impl std::fmt::Display) -> String {
     value.to_string()
 }
 
-/// The editor's own objects in the client's table: the seat, its input
-/// devices, and the clipboard manager, device, sources and sync barriers,
-/// with the retired states that wait for `delete_id`.
+/// The editor's own objects in the client's table: the clipboard manager,
+/// device, sources and sync barriers, with the retired states that wait
+/// for `delete_id`. The seat and its devices are the client's.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Object {
-    Seat,
-    RetiredSeat,
-    Keyboard,
-    RetiredKeyboard,
-    Pointer,
-    RetiredPointer,
     ClipboardManager,
     ClipboardDevice,
     RetiredClipboardDevice,
@@ -54,10 +43,7 @@ impl Tag for Object {
     fn retired(self) -> bool {
         matches!(
             self,
-            Self::RetiredSeat
-                | Self::RetiredKeyboard
-                | Self::RetiredPointer
-                | Self::RetiredClipboardDevice
+            Self::RetiredClipboardDevice
                 | Self::RetiredClipboardSource
                 | Self::RetiredClipboardSync
         )
@@ -66,10 +52,10 @@ impl Tag for Object {
 
 type Kind = ClientKind<Object>;
 
+/// The editor's pointer gesture over the client's pointer: the last
+/// position, the held left button and the wheel accumulator.
 #[derive(Default)]
 struct Pointer {
-    device: Option<u32>,
-    enter: Option<u32>,
     x: i32,
     y: i32,
     held: bool,
@@ -86,9 +72,6 @@ struct Window {
     pointer: Pointer,
     control_pointer: Option<crate::model::RevisionPoint>,
     frames: crate::control_frame::Frames,
-    seat: Option<u32>,
-    device: Option<u32>,
-    input: Input,
     clock: u64,
     notice: Option<String>,
     quitting: bool,
@@ -324,9 +307,6 @@ impl Window {
             pointer: Pointer::default(),
             control_pointer: None,
             frames: crate::control_frame::Frames::default(),
-            seat: None,
-            device: None,
-            input: Input::default(),
             clock: 0,
             notice: None,
             quitting: false,
@@ -358,11 +338,7 @@ impl Window {
     }
 
     fn initialize(&mut self) -> Result<()> {
-        if let Some((_, version)) = self.client.find_global("wl_seat", 5) {
-            let seat = self.client.allocate(Object::Seat)?;
-            self.client.bind("wl_seat", version.min(7), seat)?;
-            self.seat = Some(seat);
-        } else {
+        if self.client.seat().is_none() {
             if self.files.is_some() {
                 return Err("file window requires wl_seat v5+".into());
             }
@@ -393,15 +369,9 @@ impl Window {
         if self.clipboard.offers.contains_key(&message.object) {
             return self.clipboard_offer(message);
         }
-        match self.client.handle(&message)? {
+        match self.client.handle(&message, self.clock)? {
             Handled::Done => Ok(()),
             Handled::Bound => self.initialize(),
-            Handled::Format(format) => {
-                if format == 0 {
-                    self.show_cursor()?;
-                }
-                Ok(())
-            }
             Handled::Configure { size, serial } => {
                 self.menu = None;
                 if let Some((width, height)) = size {
@@ -432,7 +402,26 @@ impl Window {
             }
             Handled::FrameDone => self.frames.complete().map_err(error),
             Handled::GlobalRemoved { id, required } => self.global_removed(id, required),
-            Handled::Unhandled => self.device_event(message),
+            Handled::Capabilities { keyboard, pointer } => {
+                if !pointer {
+                    self.pointer_lost()?;
+                }
+                if !keyboard {
+                    self.keyboard_lost()?;
+                    self.notify("Seat has no keyboard; scratch text retained");
+                }
+                Ok(())
+            }
+            Handled::SeatRemoved => {
+                self.keyboard_lost()?;
+                self.pointer_lost()?;
+                self.release_clipboard()?;
+                self.notify("Seat removed; scratch text retained");
+                Ok(())
+            }
+            Handled::Keyboard(event) => self.keyboard_event(event),
+            Handled::Pointer(event) => self.pointer_event(event),
+            Handled::Unhandled => self.clipboard_event(message),
         }
     }
 
@@ -441,100 +430,27 @@ impl Window {
             self.release_clipboard()?;
             self.clipboard.manager = None;
         }
-        if !required {
-            return Ok(());
-        }
-        if self.client.global_name(id) != Some("wl_seat") {
+        if required {
             return Err("required Wayland global was removed".into());
         }
-        self.release_keyboard()?;
-        self.release_pointer()?;
-        self.release_clipboard()?;
-        if let Some(seat) = self.seat.take() {
-            self.client.words(seat, 3, &[])?;
-            self.client.set_tag(seat, Object::RetiredSeat)?;
-        }
-        self.client.forget_global(id);
-        self.notify("Seat removed; scratch text retained");
         Ok(())
     }
 
-    /// Events for the editor's own objects: the seat, its devices and the
-    /// clipboard, which the client hands back untouched.
-    fn device_event(&mut self, message: Message) -> Result<()> {
-        let mut cursor = Cursor::new(&message.payload);
-        match (message.object, message.opcode) {
-            (id, opcode)
-                if self.seat == Some(id)
-                    || self.client.kind(id)? == Kind::App(Object::RetiredSeat) =>
-            {
-                match opcode {
-                    0 => {
-                        let capabilities = cursor.u32()?;
-                        cursor.finish()?;
-                        if self.seat != Some(id) {
-                            return Ok(());
-                        }
-                        if capabilities & 1 == 0 {
-                            self.release_pointer()?;
-                        } else if self.pointer.device.is_none() {
-                            let device = self.client.allocate(Object::Pointer)?;
-                            self.client.words(id, 0, &[device])?;
-                            self.pointer.device = Some(device);
-                        }
-                        if capabilities & 2 == 0 {
-                            self.release_keyboard()?;
-                            self.notify("Seat has no keyboard; scratch text retained");
-                        } else if self.device.is_none() {
-                            let device = self.client.allocate(Object::Keyboard)?;
-                            self.client.words(id, 1, &[device])?;
-                            self.device = Some(device);
-                        }
-                        return Ok(());
-                    }
-                    1 => {
-                        if cursor.string()?.len() > 256 {
-                            return Err("seat name budget".into());
-                        }
-                    }
-                    _ => return Err("unknown seat event".into()),
-                }
+    /// Events for the editor's own objects: the clipboard device, sources
+    /// and sync barriers, which the client hands back untouched.
+    fn clipboard_event(&mut self, message: Message) -> Result<()> {
+        match (self.client.kind(message.object)?, message.opcode) {
+            (Kind::App(Object::ClipboardDevice | Object::RetiredClipboardDevice), _) => {
+                self.clipboard_device(message)
             }
-            (id, _)
-                if matches!(
-                    self.client.kind(id)?,
-                    Kind::App(Object::Keyboard | Object::RetiredKeyboard)
-                ) =>
-            {
-                return self.keyboard_event(message);
+            (Kind::App(Object::ClipboardSource | Object::RetiredClipboardSource), _) => {
+                self.clipboard_source(message)
             }
-            (id, _)
-                if matches!(
-                    self.client.kind(id)?,
-                    Kind::App(Object::Pointer | Object::RetiredPointer)
-                ) =>
-            {
-                return self.pointer_event(message);
-            }
-            (id, _)
-                if matches!(
-                    self.client.kind(id)?,
-                    Kind::App(Object::ClipboardDevice | Object::RetiredClipboardDevice)
-                ) =>
-            {
-                return self.clipboard_device(message);
-            }
-            (id, _)
-                if matches!(
-                    self.client.kind(id)?,
-                    Kind::App(Object::ClipboardSource | Object::RetiredClipboardSource)
-                ) =>
-            {
-                return self.clipboard_source(message);
-            }
-            (id, 0) if self.client.kind(id)? == Kind::App(Object::ClipboardSync) => {
+            (Kind::App(Object::ClipboardSync), 0) => {
+                let mut cursor = Cursor::new(&message.payload);
                 cursor.u32()?;
                 cursor.finish()?;
+                let id = message.object;
                 let retired = self
                     .clipboard
                     .barriers
@@ -551,16 +467,13 @@ impl Window {
                     }
                 }
                 self.client.set_tag(id, Object::RetiredClipboardSync)?;
-                return self.queue_offer_barrier();
+                self.queue_offer_barrier()
             }
-            _ => {
-                return Err(format!(
-                    "unexpected Wayland event {}:{}",
-                    message.object, message.opcode
-                ));
-            }
+            _ => Err(format!(
+                "unexpected Wayland event {}:{}",
+                message.object, message.opcode
+            )),
         }
-        cursor.finish()
     }
 
     fn notify(&mut self, detail: impl AsRef<str>) {
@@ -584,7 +497,7 @@ impl Window {
         self.clipboard.incoming = None;
         self.menu = None;
         self.stop_pointer();
-        self.input.cancel_repeat();
+        self.client.cancel_repeat();
         if self.files.is_some() {
             let _ = self.start_close(Scope::Window);
             return;
@@ -598,25 +511,20 @@ impl Window {
         }
     }
 
-    fn release_keyboard(&mut self) -> Result<()> {
+    /// The client released the keyboard, or the seat with it: the editor
+    /// drops what focus and a map allowed and keeps every document.
+    fn keyboard_lost(&mut self) -> Result<()> {
         self.searches.cancel_wrap();
         self.clipboard_focus_lost()?;
         self.menu = None;
-        if let Some(device) = self.device.take() {
-            self.client.words(device, 0, &[])?;
-            self.client.set_tag(device, Object::RetiredKeyboard)?;
-        }
-        self.input = Input::default();
         self.ui.dispatch(Event::Focus(false)).map_err(error)?;
         self.frames.invalidate(true);
         Ok(())
     }
 
-    fn release_pointer(&mut self) -> Result<()> {
-        if let Some(device) = self.pointer.device {
-            self.client.words(device, 1, &[])?;
-            self.client.set_tag(device, Object::RetiredPointer)?;
-        }
+    /// The client released the pointer: the gesture ends without touching
+    /// keyboard focus or the selection.
+    fn pointer_lost(&mut self) -> Result<()> {
         self.pointer = Pointer::default();
         self.control_pointer = None;
         self.ui.dispatch(Event::CancelPointer).map_err(error)?;
@@ -650,34 +558,24 @@ impl Window {
         }
     }
 
-    fn pointer_event(&mut self, message: Message) -> Result<()> {
+    /// The live pointer's event, decoded by the client, which showed the
+    /// pointer image on enter and keeps the enter serial.
+    fn pointer_event(&mut self, event: td_ui::pointer::Event) -> Result<()> {
         use td_ui::pointer::Event as P;
-        let event = td_ui::pointer::decode(&message)?;
-        if self.pointer.device != Some(message.object) {
-            return Ok(());
-        }
         if self.control_pointer.is_some() {
             self.stop_pointer();
-        }
-        if let P::Enter { surface, .. } | P::Leave(surface) = event {
-            if surface != SURFACE {
-                return Err("pointer event for unknown surface".into());
-            }
         }
         if self.pointer_modal() {
             self.stop_pointer();
         }
         match event {
-            P::Enter { serial, x, y, .. } => {
-                self.pointer.enter = Some(serial);
+            P::Enter { x, y, .. } => {
                 self.pointer.x = x;
                 self.pointer.y = y;
                 self.stop_pointer();
-                self.show_cursor()?;
             }
             P::Leave(_) => {
                 self.frames.invalidate(self.menu.take().is_some());
-                self.pointer.enter = None;
                 self.stop_pointer();
             }
             P::Motion(x, y) => {
@@ -691,7 +589,7 @@ impl Window {
                 button: 0x110,
                 pressed,
                 serial,
-            } if self.pointer.enter.is_some() && !self.pointer_modal() => {
+            } if self.client.entered().is_some() && !self.pointer_modal() => {
                 if pressed != self.pointer.held {
                     self.pointer.held = pressed;
                     self.activation_serial = pressed.then_some(serial);
@@ -704,7 +602,9 @@ impl Window {
                 }
             }
             P::Axis(..) | P::Source(_) | P::Stop(_) | P::Discrete(..)
-                if self.pointer.enter.is_some() && !self.pointer_modal() && self.menu.is_none() =>
+                if self.client.entered().is_some()
+                    && !self.pointer_modal()
+                    && self.menu.is_none() =>
             {
                 if self.pointer.wheel_target.is_none() {
                     let target = self.ui.editor().active().and_then(|tab| {
@@ -781,13 +681,14 @@ impl Window {
     }
 
     fn pointer_action(&mut self, phase: crate::ui::PointerPhase) -> Result<()> {
-        let extend = self.input.focused
-            && self.input.synchronized
+        let extend = self.client.input().focused
+            && self.client.input().synchronized
             && self
-                .input
+                .client
+                .input()
                 .map
                 .as_ref()
-                .is_some_and(|map| map.pointer_extend(self.input.modifiers));
+                .is_some_and(|map| map.pointer_extend(self.client.input().modifiers));
         self.decoded_pointer_action(phase, self.pointer.x, self.pointer.y, extend)
     }
 
@@ -871,7 +772,7 @@ impl Window {
         };
         self.frames.invalidate(before != self.ui.generation());
         if !matches!(outcome, Outcome::Ignored) {
-            self.input.cancel_repeat();
+            self.client.cancel_repeat();
         }
         if let Outcome::Request {
             name: "close-tab",
@@ -884,98 +785,55 @@ impl Window {
         Ok(())
     }
 
-    fn show_cursor(&mut self) -> Result<()> {
-        let (Some(device), Some(serial)) = (self.pointer.device, self.pointer.enter) else {
-            return Ok(());
-        };
-        self.client.show_cursor(device, serial)
-    }
-
-    fn keyboard_event(&mut self, message: Message) -> Result<()> {
-        let event = keyboard_event(&message)?;
-        let active = self.device == Some(message.object);
-        // Retired objects can have events in flight, including rights. Drain
-        // their exact schema until delete_id without activating a new map.
-        if let KeyboardEvent::Map(format, size) = event {
-            let fd = self
-                .client
-                .pop_descriptor()
-                .ok_or("missing keymap descriptor")?;
-            if !active {
-                return Ok(());
-            }
-            self.menu = None;
-            self.clipboard.incoming = None;
-            self.input.map = None;
-            self.searches.cancel_wrap();
-            self.input.cancel_repeat();
-            self.input.synchronized = false;
-            self.ui.dispatch(Event::Focus(false)).map_err(error)?;
-            match read_keymap(fd, format, size) {
-                Ok(map) => {
-                    self.input.map = Some(map);
-                    self.ui
-                        .dispatch(Event::Focus(self.input.focused))
-                        .map_err(error)?;
-                    self.notify(
-                        "Keymap compiled; waiting for focus/modifier snapshot. Tap and release Shift if needed.",
-                    );
-                }
-                Err(detail) => self.notify(format!("Keyboard disabled: {detail}")),
-            }
-            self.frames.invalidate(true);
-            return Ok(());
-        }
-        if !active {
-            return Ok(());
-        }
+    /// The live keyboard's event, which the client already applied to its
+    /// map, focus, snapshot and held keys.
+    fn keyboard_event(&mut self, event: KeyboardEvent) -> Result<()> {
         match event {
-            KeyboardEvent::Map(_, _) => {}
-            KeyboardEvent::Enter(surface, keys) => {
-                if surface != SURFACE {
-                    return Err("keyboard enter for unknown surface".into());
+            KeyboardEvent::Keymap(result) => {
+                self.menu = None;
+                self.clipboard.incoming = None;
+                self.searches.cancel_wrap();
+                self.ui.dispatch(Event::Focus(false)).map_err(error)?;
+                match result {
+                    Ok(()) => {
+                        self.ui
+                            .dispatch(Event::Focus(self.client.input().focused))
+                            .map_err(error)?;
+                        self.notify(
+                            "Keymap compiled; waiting for focus/modifier snapshot. \
+                             Tap and release Shift if needed.",
+                        );
+                    }
+                    Err(detail) => self.notify(format!("Keyboard disabled: {detail}")),
                 }
-                self.input.focus(&keys, true)?;
+                self.frames.invalidate(true);
+            }
+            KeyboardEvent::Focus(true) => {
                 self.ui
-                    .dispatch(Event::Focus(self.input.map.is_some()))
+                    .dispatch(Event::Focus(self.client.input().map.is_some()))
                     .map_err(error)?;
                 self.frames.invalidate(true);
             }
-            KeyboardEvent::Leave(surface) => {
-                if surface != SURFACE {
-                    return Err("keyboard leave for unknown surface".into());
-                }
-                self.input.focus(&[], false)?;
+            KeyboardEvent::Focus(false) => {
                 self.searches.cancel_wrap();
                 self.clipboard_focus_lost()?;
                 self.menu = None;
                 self.ui.dispatch(Event::Focus(false)).map_err(error)?;
                 self.frames.invalidate(true);
             }
-            KeyboardEvent::Modifiers(modifiers) => {
-                let ready =
-                    !self.input.synchronized && self.input.focused && self.input.map.is_some();
-                self.input.modifiers(modifiers);
-                if ready {
-                    self.notify(if self.files.is_some() {
-                        "Keymap ready. Experimental file window."
-                    } else {
-                        "Keymap ready. Scratch only: no Save."
-                    });
+            KeyboardEvent::Ready => self.notify(if self.files.is_some() {
+                "Keymap ready. Experimental file window."
+            } else {
+                "Keymap ready. Scratch only: no Save."
+            }),
+            KeyboardEvent::Key { serial, key, stroke } => {
+                self.activation_serial = Some(serial);
+                if self.chord(&stroke.chord, false)? && stroke.repeat {
+                    self.client.arm(key, self.clock);
                 }
+                self.activation_serial = None;
             }
-            KeyboardEvent::Timing(rate, delay) => self.input.timing(rate, delay, self.clock)?,
-            KeyboardEvent::Key(serial, key, pressed) => match self.input.key(key, pressed) {
-                Ok(Some(stroke)) => {
-                    self.activation_serial = Some(serial);
-                    if self.chord(&stroke.chord, false)? && stroke.repeat {
-                        self.input.arm(key, self.clock);
-                    }
-                    self.activation_serial = None;
-                }
-                Ok(None) => {}
-                Err(detail) => self.notify(detail),
-            },
+            KeyboardEvent::Refused(detail) => self.notify(detail),
         }
         Ok(())
     }
@@ -1314,7 +1172,7 @@ impl Window {
                     .map(|doc| (tab, doc.revision()))
             }) != active
             {
-                self.input.cancel_repeat();
+                self.client.cancel_repeat();
             }
             let succeeded = result.is_ok();
             if let Some(dictionary) = self
@@ -1343,7 +1201,7 @@ impl Window {
             }
             self.reloading = None;
             if let Some(target) = self.files.as_mut().and_then(|files| files.take_conflict()) {
-                self.input.cancel_repeat();
+                self.client.cancel_repeat();
                 let prepared = self
                     .last_dialog_id
                     .checked_add(1)
@@ -1369,20 +1227,20 @@ impl Window {
         self.clipboard_tick(now, repeat)?;
         self.frames.invalidate(self.ui.generation() != before);
         if repeat {
-            match self.input.repeat(now) {
+            match self.client.repeat(now) {
                 Ok(Some(stroke)) => {
                     if !self.chord(&stroke.chord, true)? {
-                        self.input.cancel_repeat();
+                        self.client.cancel_repeat();
                     }
                 }
                 Ok(None) => {}
                 Err(detail) => {
-                    self.input.cancel_repeat();
+                    self.client.cancel_repeat();
                     self.notify(detail);
                 }
             }
         }
-        let wait = Duration::from_millis(self.input.wait_ms(now));
+        let wait = Duration::from_millis(self.client.wait_ms(now));
         self.client.connection().set_wait(wait);
         if self.clipboard.incoming.is_some()
             || self.clipboard.outgoing.is_some()
@@ -1827,8 +1685,8 @@ impl Window {
             && self.control_input_error.is_none()
             && !self.pointer_modal()
             && self.client.configured()
-            && self.pointer.device.is_some()
-            && self.pointer.enter.is_some()
+            && self.client.pointer().is_some()
+            && self.client.entered().is_some()
             && self.activation_serial.is_none()
     }
 
@@ -2098,10 +1956,10 @@ impl Window {
             && self.conflict.is_none()
             && self.reloading.is_none()
             && self.client.configured()
-            && self.device.is_some()
-            && self.input.map.is_some()
-            && self.input.focused
-            && self.input.synchronized
+            && self.client.keyboard().is_some()
+            && self.client.input().map.is_some()
+            && self.client.input().focused
+            && self.client.input().synchronized
             && self.activation_serial.is_none()
     }
 
@@ -2709,7 +2567,7 @@ impl Window {
     }
 
     fn control_mutation_accepted(&mut self) {
-        self.input.cancel_repeat();
+        self.client.cancel_repeat();
         // Controller admission already cancelled its own drag.
         self.clear_pointer_gesture();
         if self.clipboard.incoming.take().is_some() {
@@ -2744,7 +2602,7 @@ impl Window {
             "input-generation={}\tdevice={}\tfocus={}\tselection={selection}\tsource-bytes={source}\tincoming={}\toutgoing={}",
             self.frames.input_generation()?,
             u8::from(self.clipboard.device.is_some()),
-            u8::from(self.input.focused),
+            u8::from(self.client.input().focused),
             u8::from(self.clipboard.incoming.is_some()),
             u8::from(self.clipboard.outgoing.is_some()),
         ))
@@ -3066,9 +2924,7 @@ impl App for Window {
         self.message_needs_descriptor(message)
     }
 
-    fn descriptor_wait(&mut self) {
-        self.input.cancel_repeat();
-    }
+    fn descriptor_wait(&mut self) {}
 
     fn tick(&mut self, now: u64) -> Result<()> {
         Window::tick(self, now, false)
@@ -3116,18 +2972,18 @@ impl Window {
             auto_fill: doc.auto_fill(),
             wrap: self.ui.tab_view(tab).map_err(error)?.soft_wrap,
             line_numbers: self.ui.line_numbers(),
-            copy: self.input.focused
+            copy: self.client.input().focused
                 && self.clipboard.device.is_some()
                 && self.clipboard.outgoing.is_none()
                 && !doc.selection().range().is_empty(),
-            copy_path: self.input.focused
+            copy_path: self.client.input().focused
                 && self.clipboard.device.is_some()
                 && self.clipboard.outgoing.is_none()
                 && self
                     .files
                     .as_ref()
                     .is_some_and(|files| files.path(tab).is_some()),
-            paste: self.input.focused
+            paste: self.client.input().focused
                 && self.clipboard.device.is_some()
                 && self.clipboard.incoming.is_none()
                 && self
@@ -3148,7 +3004,7 @@ impl Window {
             return Ok(());
         }
         self.stop_pointer();
-        self.input.cancel_repeat();
+        self.client.cancel_repeat();
         if menu
             .group
             .items()
@@ -3272,7 +3128,7 @@ impl Window {
         use crate::menu::Item;
         self.menu = None;
         self.stop_pointer();
-        self.input.cancel_repeat();
+        self.client.cancel_repeat();
         self.frames.invalidate(true);
         let event = match item {
             Item::Command => {
@@ -3459,7 +3315,7 @@ impl Window {
     fn start_close(&mut self, scope: Scope) -> crate::Result<()> {
         self.menu = None;
         self.stop_pointer();
-        self.input.cancel_repeat();
+        self.client.cancel_repeat();
         if self.closing.is_some() {
             return Ok(());
         }
@@ -3708,12 +3564,12 @@ impl Window {
             }
         };
         let identity = format!("Tab {}", target.tab);
-        if self.device.is_none() || self.input.map.is_none() {
+        if self.client.keyboard().is_none() || self.client.input().map.is_none() {
             return Some(format!(
                 "{identity}\nInput unavailable.\nRestore the seat/keymap."
             ));
         }
-        if !self.input.focused || !self.input.synchronized {
+        if !self.client.input().focused || !self.client.input().synchronized {
             return Some(format!("{identity}\nFocus editor.\nTap and release Shift."));
         }
         if !self.close_answer_visible() {
@@ -3754,17 +3610,17 @@ impl Window {
         let scale = self.ui.geometry().scale().value();
         width >= 272 * scale
             && height >= 168 * scale
-            && self.device.is_some()
-            && self.input.map.is_some()
-            && self.input.focused
-            && self.input.synchronized
+            && self.client.keyboard().is_some()
+            && self.client.input().map.is_some()
+            && self.client.input().focused
+            && self.client.input().synchronized
     }
 
     fn closing_notice(&self) -> Option<String> {
         let close = self.closing.as_ref()?;
-        let readiness = if self.device.is_none() || self.input.map.is_none() {
+        let readiness = if self.client.keyboard().is_none() || self.client.input().map.is_none() {
             "Input unavailable: restore the seat/keymap to resolve close.\n"
-        } else if !self.input.focused || !self.input.synchronized {
+        } else if !self.client.input().focused || !self.client.input().synchronized {
             "Input pending: focus the editor; tap and release Shift.\n"
         } else {
             ""
@@ -3816,9 +3672,9 @@ impl Window {
             return Some(review.notice(&prompt.text, self.path_columns()));
         }
         if !matches!(prompt.completion, crate::path_completion::State::Idle) {
-            let paused = if self.device.is_none() || self.input.map.is_none() {
+            let paused = if self.client.keyboard().is_none() || self.client.input().map.is_none() {
                 "Path entry paused: restore keyboard/keymap"
-            } else if !self.input.focused || !self.input.synchronized {
+            } else if !self.client.input().focused || !self.client.input().synchronized {
                 "Path entry paused: focus editor; tap/release Shift"
             } else {
                 ""
@@ -3831,9 +3687,9 @@ impl Window {
                 self.closing.is_some(),
             ));
         }
-        let readiness = if self.device.is_none() || self.input.map.is_none() {
+        let readiness = if self.client.keyboard().is_none() || self.client.input().map.is_none() {
             "Path entry paused: keyboard unavailable; restore the seat/keymap.\n"
-        } else if !self.input.focused || !self.input.synchronized {
+        } else if !self.client.input().focused || !self.client.input().synchronized {
             "Path entry paused: focus the editor; tap and release Shift.\n"
         } else {
             ""
@@ -3857,7 +3713,7 @@ impl Window {
         }
         self.menu = None;
         self.stop_pointer();
-        self.input.cancel_repeat();
+        self.client.cancel_repeat();
         self.clipboard.incoming = None;
         self.searches.cancel_wrap();
         if let Err(detail) = self.ui.dispatch(Event::CancelInput) {
@@ -3973,7 +3829,7 @@ impl Window {
                 self.menu = None;
                 self.notice = None;
                 self.stop_pointer();
-                self.input.cancel_repeat();
+                self.client.cancel_repeat();
                 self.prompt = Some(PathPrompt {
                     action: PathAction::Delete(DeletePrompt { plan, page: 0 }),
                     text: String::new(),
@@ -4021,7 +3877,7 @@ impl Window {
                 self.menu = None;
                 self.notice = None;
                 self.stop_pointer();
-                self.input.cancel_repeat();
+                self.client.cancel_repeat();
                 self.prompt = Some(PathPrompt {
                     action: PathAction::Copy(source),
                     text: String::new(),
@@ -4061,7 +3917,7 @@ impl Window {
                 self.menu = None;
                 self.notice = None;
                 self.stop_pointer();
-                self.input.cancel_repeat();
+                self.client.cancel_repeat();
                 self.prompt = Some(PathPrompt {
                     action: PathAction::Mkdir(source),
                     text: String::new(),
@@ -4109,7 +3965,7 @@ impl Window {
                 self.menu = None;
                 self.notice = None;
                 self.stop_pointer();
-                self.input.cancel_repeat();
+                self.client.cancel_repeat();
                 self.prompt = Some(PathPrompt {
                     action: PathAction::Rename(source),
                     text: String::new(),
@@ -4129,7 +3985,7 @@ impl Window {
         match result {
             Ok(()) => {
                 self.stop_pointer();
-                self.input.cancel_repeat();
+                self.client.cancel_repeat();
                 self.notify(format!("Directory sort: {}{}; directories first; dates UTC", sort.label(),
                     if reverse { " (reversed)" } else { "" }));
             }
@@ -4145,7 +4001,7 @@ impl Window {
         new_tab: bool,
     ) {
         self.stop_pointer();
-        self.input.cancel_repeat();
+        self.client.cancel_repeat();
         let result = self
             .files
             .as_mut()
@@ -4173,7 +4029,7 @@ impl Window {
         let Some(files) = &mut self.files else {
             return false;
         };
-        self.input.cancel_repeat();
+        self.client.cancel_repeat();
         if files.busy() {
             self.notify("File operation pending; wait before trying again.");
             false
@@ -4520,9 +4376,9 @@ impl Window {
     }
 
     fn close_notice(&self) -> &'static str {
-        if self.device.is_none() || self.input.map.is_none() {
+        if self.client.keyboard().is_none() || self.client.input().map.is_none() {
             "Cannot confirm discard: keyboard unavailable.\nScratch text is retained in memory.\nRestore keyboard/map to cancel or discard.\nTerminating this process loses ALL scratch text."
-        } else if !self.input.focused || !self.input.synchronized {
+        } else if !self.client.input().focused || !self.client.input().synchronized {
             "Discard pending; input not ready.\nFocus the editor; tap and release Shift.\nThen Ctrl+D: Discard ALL; Escape/Ctrl+G: Cancel.\nSave is unavailable in this scratch preview."
         } else {
             "Discard ALL unsaved scratch text?\nSave is unavailable in this preview.\nCtrl+D: Discard and quit\nEscape / Ctrl+G: Cancel"
@@ -4533,9 +4389,9 @@ impl Window {
 impl Window {
     fn command_notice(&self) -> Option<String> {
         self.command.as_ref().map(|prompt| {
-            let paused = if self.device.is_none() || self.input.map.is_none() {
+            let paused = if self.client.keyboard().is_none() || self.client.input().map.is_none() {
                 "Command paused: keyboard unavailable; restore the seat/keymap.\n"
-            } else if !self.input.focused || !self.input.synchronized {
+            } else if !self.client.input().focused || !self.client.input().synchronized {
                 "Command paused: focus the editor; tap and release Shift.\n"
             } else {
                 ""
@@ -4546,9 +4402,9 @@ impl Window {
 
     fn replace_notice(&self) -> Option<String> {
         self.replace.as_ref().map(|prompt| {
-            let paused = if self.device.is_none() || self.input.map.is_none() {
+            let paused = if self.client.keyboard().is_none() || self.client.input().map.is_none() {
                 Some("Replace paused: restore seat/keymap.")
-            } else if !self.input.focused || !self.input.synchronized {
+            } else if !self.client.input().focused || !self.client.input().synchronized {
                 Some("Replace paused: focus; tap Shift.")
             } else {
                 None
@@ -4568,7 +4424,7 @@ impl Window {
             };
         self.ui.dispatch(Event::CancelInput).map_err(error)?;
         self.stop_pointer();
-        self.input.cancel_repeat();
+        self.client.cancel_repeat();
         self.clipboard.incoming = None;
         self.searches.cancel_wrap();
         self.menu = None;
@@ -4626,7 +4482,7 @@ impl Window {
         };
         self.ui.dispatch(Event::CancelInput).map_err(error)?;
         self.stop_pointer();
-        self.input.cancel_repeat();
+        self.client.cancel_repeat();
         self.clipboard.incoming = None;
         self.searches.cancel_wrap();
         self.menu = None;
@@ -4677,9 +4533,9 @@ impl Window {
 
     fn number_notice(&self) -> Option<String> {
         self.number.as_ref().map(|prompt| {
-            let paused = if self.device.is_none() || self.input.map.is_none() {
+            let paused = if self.client.keyboard().is_none() || self.client.input().map.is_none() {
                 "keyboard unavailable; restore the seat/keymap.\n"
-            } else if !self.input.focused || !self.input.synchronized {
+            } else if !self.client.input().focused || !self.client.input().synchronized {
                 "focus the editor; tap and release Shift.\n"
             } else {
                 ""
@@ -4704,7 +4560,7 @@ impl Window {
     ) -> Result<()> {
         self.menu = None;
         self.stop_pointer();
-        self.input.cancel_repeat();
+        self.client.cancel_repeat();
         let prompt = match crate::number::Prompt::new(self.ui.editor(), tab, revision, kind) {
             Ok(prompt) => prompt,
             Err(e) => {
@@ -4778,9 +4634,9 @@ impl Window {
 
     fn search_notice(&self) -> Option<String> {
         self.search.as_ref().map(|prompt| {
-            let paused = if self.device.is_none() || self.input.map.is_none() {
+            let paused = if self.client.keyboard().is_none() || self.client.input().map.is_none() {
                 "Find paused: keyboard unavailable; restore the seat/keymap.\n"
-            } else if !self.input.focused || !self.input.synchronized {
+            } else if !self.client.input().focused || !self.client.input().synchronized {
                 "Find paused: focus the editor; tap and release Shift.\n"
             } else {
                 ""
@@ -4797,7 +4653,7 @@ impl Window {
     ) -> Result<()> {
         self.menu = None;
         self.stop_pointer();
-        self.input.cancel_repeat();
+        self.client.cancel_repeat();
         let backward = matches!(name, "find-backward" | "find-previous");
         if matches!(name, "find-next" | "find-previous") && !self.searches.query().is_empty() {
             let query = self.searches.query().to_owned();
@@ -4893,7 +4749,7 @@ impl Window {
     }
 
     fn initialize_clipboard(&mut self) -> Result<()> {
-        let Some(seat) = self.seat else { return Ok(()) };
+        let Some(seat) = self.client.seat() else { return Ok(()) };
         let Some((name, _)) = self.client.find_global("wl_data_device_manager", 3) else {
             return Ok(());
         };
@@ -4919,10 +4775,6 @@ impl Window {
             return Ok(false);
         }
         match (self.client.kind(message.object)?, message.opcode) {
-            (Kind::App(Object::Keyboard) | Kind::App(Object::RetiredKeyboard), 0) => {
-                keyboard_event(message)?;
-                Ok(true)
-            }
             (Kind::App(Object::ClipboardSource) | Kind::App(Object::RetiredClipboardSource), 1) => {
                 crate::data::source(message)?;
                 Ok(true)
@@ -5150,7 +5002,7 @@ impl Window {
         tab: crate::model::TabId,
         revision: u64,
     ) -> Result<()> {
-        if !self.input.focused || self.pointer_modal() || self.clipboard.device.is_none() {
+        if !self.client.input().focused || self.pointer_modal() || self.clipboard.device.is_none() {
             self.notify("Clipboard unavailable: focus the window and require data-device v3.");
             return Ok(());
         }
@@ -5322,7 +5174,7 @@ impl Window {
     fn cancel_stale_paste(&mut self) {
         if self.clipboard.incoming.is_some()
             && (self.pointer_modal()
-                || !self.input.focused
+                || !self.client.input().focused
                 || !self
                     .clipboard
                     .incoming_target
@@ -5340,85 +5192,6 @@ impl Window {
             self.clipboard.incoming_target = None;
         }
     }
-}
-
-enum KeyboardEvent {
-    Map(u32, u32),
-    Enter(u32, Vec<u32>),
-    Leave(u32),
-    Key(u32, u32, bool),
-    Modifiers(Modifiers),
-    Timing(i32, i32),
-}
-
-fn keyboard_event(message: &Message) -> Result<KeyboardEvent> {
-    let mut cursor = Cursor::new(&message.payload);
-    let event = match message.opcode {
-        0 => KeyboardEvent::Map(cursor.u32()?, cursor.u32()?),
-        1 => {
-            cursor.u32()?;
-            let surface = cursor.u32()?;
-            let bytes = cursor.u32()?;
-            if bytes % 4 != 0 || bytes > 768 * 4 {
-                return Err("keyboard enter array budget".into());
-            }
-            let mut keys = Vec::with_capacity(bytes as usize / 4);
-            for _ in 0..bytes / 4 {
-                keys.push(cursor.u32()?);
-            }
-            KeyboardEvent::Enter(surface, keys)
-        }
-        2 => {
-            cursor.u32()?;
-            KeyboardEvent::Leave(cursor.u32()?)
-        }
-        3 => {
-            let serial = cursor.u32()?;
-            cursor.u32()?; // Server timestamps have an unrelated, wrapping epoch.
-            let key = cursor.u32()?;
-            let state = cursor.u32()?;
-            if state > 1 {
-                return Err("invalid keyboard state for v5-v7".into());
-            }
-            KeyboardEvent::Key(serial, key, state == 1)
-        }
-        4 => {
-            cursor.u32()?;
-            KeyboardEvent::Modifiers(Modifiers {
-                depressed: cursor.u32()?,
-                latched: cursor.u32()?,
-                locked: cursor.u32()?,
-                group: cursor.u32()?,
-            })
-        }
-        5 => KeyboardEvent::Timing(cursor.i32()?, cursor.i32()?),
-        _ => return Err("unknown keyboard event".into()),
-    };
-    cursor.finish()?;
-    Ok(event)
-}
-
-fn read_keymap(fd: OwnedFd, format: u32, size: u32) -> Result<Keymap> {
-    if format != 1 {
-        return Err(format!("unsupported keymap format {format}"));
-    }
-    if size == 0 || size > 1024 * 1024 {
-        return Err("keymap byte budget".into());
-    }
-    let file = File::from(fd);
-    let metadata = file.metadata().map_err(error)?;
-    if !metadata.is_file() || metadata.len() < u64::from(size) {
-        return Err("keymap must be a regular file covering its advertised size".into());
-    }
-    let mut bytes = vec![0; size as usize];
-    // Positioned reads do not move the compositor's shared file offset, and
-    // truncation is an I/O error rather than a mapped-file SIGBUS.
-    file.read_exact_at(&mut bytes, 0).map_err(error)?;
-    if bytes.last() != Some(&0) {
-        return Err("keymap requires a trailing NUL".into());
-    }
-    let source = std::str::from_utf8(&bytes).map_err(error)?;
-    Keymap::parse(source).map_err(error)
 }
 
 fn paint_prompt(raster: &mut Raster<'_, '_>, geometry: Geometry, text: &str) {
@@ -5571,12 +5344,15 @@ mod tests {
     use super::*;
     use crate::layout::CELL_WIDTH;
     use crate::wire;
+    use std::fs::File;
     use std::io::{Read, Write};
+    use std::os::fd::OwnedFd;
+    use std::os::unix::fs::FileExt;
     use std::path::Path;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Instant;
     use td_ui::client::{COMPOSITOR, INITIAL_DEADLINE, SHM, SYNC, TOPLEVEL, WM, XDG_SURFACE};
-    use td_ui::wayland::{backing_file, cursor_pixels, Connection, Endpoint};
+    use td_ui::wayland::{backing_file, Connection, Endpoint};
 
     static NEXT_FILE: AtomicU64 = AtomicU64::new(0);
 
@@ -5646,7 +5422,7 @@ mod tests {
             w.event(event).unwrap();
         }
         w.event(message(SYNC, 0, &[0])).unwrap();
-        let seat = w.seat.unwrap();
+        let seat = w.client.seat().unwrap();
         let (binds, _) = drain(&b);
         let binding = binds
             .iter()
@@ -5662,13 +5438,13 @@ mod tests {
         assert_eq!(c.string().unwrap(), "wl_seat");
         assert_eq!(c.u32().unwrap(), 7);
         assert_eq!(c.u32().unwrap(), seat);
-        assert!(w.device.is_none());
+        assert!(w.client.keyboard().is_none());
         w.event(message(seat, 0, &[3])).unwrap();
-        let device = w.device.unwrap();
+        let device = w.client.keyboard().unwrap();
         assert_eq!(
             drain(&b).0,
             [
-                message(seat, 0, &[w.pointer.device.unwrap()]),
+                message(seat, 0, &[w.client.pointer().unwrap()]),
                 message(seat, 1, &[device])
             ]
         );
@@ -5683,7 +5459,7 @@ mod tests {
     }
 
     fn pointer_move(w: &mut Window, x: i64, y: i64) {
-        let pointer = w.pointer.device.unwrap();
+        let pointer = w.client.pointer().unwrap();
         w.event(message(
             pointer,
             2,
@@ -5692,12 +5468,12 @@ mod tests {
         .unwrap();
     }
     fn pointer_button(w: &mut Window, pressed: bool) {
-        let pointer = w.pointer.device.unwrap();
+        let pointer = w.client.pointer().unwrap();
         w.event(message(pointer, 3, &[1, 0, 0x110, u32::from(pressed)]))
             .unwrap();
     }
     fn pointer_enter(w: &mut Window) {
-        let pointer = w.pointer.device.unwrap();
+        let pointer = w.client.pointer().unwrap();
         w.event(message(pointer, 0, &[19, SURFACE, 0, 0])).unwrap();
     }
 
@@ -5711,7 +5487,7 @@ mod tests {
         let tab = w.ui.editor().active().unwrap();
         let area = w.ui.geometry().document();
         pointer_enter(&mut w);
-        let pointer = w.pointer.device.unwrap();
+        let pointer = w.client.pointer().unwrap();
         // Exact midpoint chooses the preceding boundary; one 24.8 unit past
         // it chooses the following boundary without waiting for keyboard focus.
         w.event(message(
@@ -5781,7 +5557,7 @@ mod tests {
         let tab = w.ui.editor().active().unwrap();
         let area = w.ui.geometry().document();
         pointer_enter(&mut w);
-        let pointer = w.pointer.device.unwrap();
+        let pointer = w.client.pointer().unwrap();
         let x = ((area.x + (columns * CELL_WIDTH) as i64) * 256 - 1) as u32;
         let y = (area.y * 256) as u32;
         w.event(message(pointer, 2, &[0, x, y])).unwrap();
@@ -5795,51 +5571,6 @@ mod tests {
                 caret: text.len()
             }
         );
-    }
-
-    #[test]
-    fn pointer_cursor_is_one_immutable_argb_pool_and_reuses_enter_serials() {
-        let (mut w, peer, _) = seat_fixture();
-        pointer_enter(&mut w);
-        assert!(w.client.cursor().is_none());
-        w.event(message(SHM, 0, &[0])).unwrap();
-        let (surface, buffer) = w.client.cursor().unwrap();
-        let pointer = w.pointer.device.unwrap();
-        let (requests, files) = drain(&peer);
-        assert_eq!(files.len(), 1);
-        let role = requests
-            .iter()
-            .position(|request| *request == message(pointer, 0, &[19, surface, 0, 0]))
-            .unwrap();
-        assert_eq!(
-            &requests[role..],
-            &[
-                message(pointer, 0, &[19, surface, 0, 0]),
-                message(surface, 1, &[buffer, 0, 0]),
-                message(surface, 2, &[0, 0, 16, 24]),
-                message(surface, 6, &[]),
-            ]
-        );
-        let file = &files[0];
-        use std::os::unix::fs::MetadataExt;
-        assert_eq!(file.metadata().unwrap().mode() & 0o777, 0o600);
-        assert_eq!(file.metadata().unwrap().nlink(), 0);
-        let mut bytes = [0; 1536];
-        file.read_exact_at(&mut bytes, 0).unwrap();
-        assert_eq!(bytes, cursor_pixels());
-        assert!(bytes.as_chunks::<4>().0.contains(&[0, 0, 0, 0]));
-        assert!(bytes.as_chunks::<4>().0.contains(&[0x3f, 0x45, 0x48, 0xff]));
-        assert!(w.client.buffers().is_empty());
-        w.event(message(SHM, 0, &[1])).unwrap();
-        w.event(message(SHM, 0, &[0x34325258])).unwrap();
-        assert!(drain(&peer).0.is_empty());
-        w.event(message(buffer, 0, &[])).unwrap();
-        assert!(w.event(message(buffer, 0, &[])).is_err());
-        w.event(message(pointer, 1, &[20, SURFACE])).unwrap();
-        w.event(message(pointer, 0, &[21, SURFACE, 0, 0])).unwrap();
-        let (requests, files) = drain(&peer);
-        assert!(files.is_empty());
-        assert_eq!(requests, [message(pointer, 0, &[21, surface, 0, 0])]);
     }
 
     #[test]
@@ -5858,7 +5589,7 @@ mod tests {
         })
         .unwrap();
         pointer_enter(&mut w);
-        let pointer = w.pointer.device.unwrap();
+        let pointer = w.client.pointer().unwrap();
         w.event(message(pointer, 8, &[0, 1])).unwrap();
         w.event(message(pointer, 4, &[0, 0, 10000])).unwrap();
         assert_eq!(w.ui.tab_view(second).unwrap().viewport.origin().row, 0);
@@ -5900,23 +5631,23 @@ mod tests {
                 caret: 4
             }
         );
-        let old = w.pointer.device.unwrap();
-        let seat = w.seat.unwrap();
+        let old = w.client.pointer().unwrap();
+        let seat = w.client.seat().unwrap();
         w.event(message(seat, 0, &[2])).unwrap();
-        assert!(w.pointer.device.is_none());
+        assert!(w.client.pointer().is_none());
         assert!(w.ui.focused());
-        assert!(w.input.focused && w.input.synchronized);
+        assert!(w.client.input().focused && w.client.input().synchronized);
         let selection = w.ui.editor().document(tab).unwrap().selection();
         w.event(message(old, 2, &[0, 0, 0])).unwrap();
         assert_eq!(w.ui.editor().document(tab).unwrap().selection(), selection);
         assert!(w.event(message(old, 3, &[0, 0, 0x110, 2])).is_err());
         w.event(message(seat, 0, &[3])).unwrap();
-        assert_ne!(w.pointer.device, Some(old));
+        assert_ne!(w.client.pointer(), Some(old));
         w.event(message(DISPLAY, 1, &[old])).unwrap();
         assert_eq!(w.client.kind(old).unwrap(), Kind::Free);
         assert!(drain(&peer).0.iter().any(|m| *m == message(old, 1, &[])));
         pointer_enter(&mut w);
-        w.input.synchronized = false;
+        w.client.input_mut().synchronized = false;
         pointer_move(&mut w, area.x + 16, area.y);
         pointer_button(&mut w, true);
         assert_eq!(
@@ -6126,7 +5857,7 @@ mod tests {
             }
             assert!(!w.ui.editor().document(1).unwrap().dirty());
             assert_eq!(w.ui.editor().document(1).unwrap().history_depth(), (0, 0));
-            assert!(w.input.repeat(1000).unwrap().is_none());
+            assert!(w.client.repeat(1000).unwrap().is_none());
         }
     }
 
@@ -6218,7 +5949,10 @@ mod tests {
                     focus(&mut w, keyboard);
                 }
                 "keymap" => send_map(&mut w, &peer, keyboard, &map_file()),
-                "seat" => w.release_keyboard().unwrap(),
+                "seat" => {
+                    let seat = w.client.seat().unwrap();
+                    w.event(message(seat, 0, &[1])).unwrap();
+                }
                 "cancel" => {
                     w.chord("Escape", false).unwrap();
                 }
@@ -6273,15 +6007,15 @@ mod tests {
         })
         .unwrap();
         assert!(w.ui.keys().pending());
-        w.input.key(106, true).unwrap();
-        w.input.arm(106, 0);
+        w.client.input_mut().key(106, true).unwrap();
+        w.client.arm(106, 0);
         let (incoming, _producer) =
             crate::transfer::Incoming::begin(w.ui.editor(), 1, 0, 0).unwrap();
         w.clipboard.incoming = Some(incoming);
         w.search_request("find", 1, 0).unwrap();
         assert!(!w.ui.keys().pending());
         assert!(!w.pointer.held);
-        assert!(w.input.repeat(1000).unwrap().is_none());
+        assert!(w.client.repeat(1000).unwrap().is_none());
         assert!(w.clipboard.incoming.is_none());
         w.chord("Escape", false).unwrap();
         w.ui.dispatch(Event::Load(b"one\ntwo")).unwrap();
@@ -6741,7 +6475,7 @@ mod tests {
             assert_eq!(w.ui.editor().document(1).unwrap().text(), " abc\n");
             assert_eq!(w.ui.editor().document(1).unwrap().history_depth(), (1, 0));
             assert_eq!(w.client.kind(source).unwrap(), Kind::App(Object::RetiredClipboardSource));
-            assert!(w.input.repeat(1000).unwrap().is_none());
+            assert!(w.client.repeat(1000).unwrap().is_none());
             w.ui.dispatch(Event::Edit {
                 tab: 1,
                 revision: 1,
@@ -6764,7 +6498,7 @@ mod tests {
         assert!(menu.enabled(crate::menu::Item::Copy));
         let panel = menu.panel(w.ui.geometry()).unwrap();
         pointer_move(&mut w, panel.x + 5, panel.y + 3 * 24 + 5);
-        let pointer = w.pointer.device.unwrap();
+        let pointer = w.client.pointer().unwrap();
         w.event(message(pointer, 3, &[777, 0, 0x110, 1])).unwrap();
         let source = w.clipboard.source.as_ref().unwrap().0;
         assert!(drain(&peer).0.contains(&message(device, 1, &[source, 777])));
@@ -7355,7 +7089,7 @@ mod tests {
             }
             assert_eq!(std::fs::read(&path).unwrap(), b"a");
             assert_eq!(w.ui.editor().document(tab).unwrap().text(), "ab");
-            assert!(w.input.repeat(w.clock + 1000).unwrap().is_some());
+            assert!(w.client.repeat(w.clock + 1000).unwrap().is_some());
             assert!(w.ui.editor().document(tab).unwrap().dirty());
             assert!(w
                 .notice
@@ -7418,9 +7152,8 @@ mod tests {
         let (mut w, _peer) = file_dialog_fixture();
         w.ui.dispatch(Event::Load("λ a λ".as_bytes())).unwrap();
         w.search_request("find", 2, 0).unwrap();
-        w.device = None;
-        w.input.focused = false;
-        w.input.synchronized = false;
+        let seat = w.client.seat().unwrap();
+        w.event(message(seat, 0, &[1])).unwrap();
         w.client.unconfigure();
         assert!(!w.control_key_available());
         prompt_answer(&mut w, K::FindForward, A::Entry("λ".into()));
@@ -7437,7 +7170,8 @@ mod tests {
         prompt_answer(&mut w, K::Replace, A::Cancel);
         assert!(w.replace.is_none());
         assert_eq!(w.ui.editor().document(2).unwrap().history_depth(), (2, 0));
-        assert!(!w.input.focused && !w.client.configured() && w.device.is_none());
+        assert!(!w.client.input().focused && !w.client.configured());
+        assert!(w.client.keyboard().is_none());
     }
 
     #[test]
@@ -7622,8 +7356,8 @@ mod tests {
         let (incoming, _producer) =
             crate::transfer::Incoming::begin(w.ui.editor(), 1, 0, 0).unwrap();
         w.clipboard.incoming = Some(incoming);
-        w.input.key(106, true).unwrap();
-        w.input.arm(106, 0);
+        w.client.input_mut().key(106, true).unwrap();
+        w.client.arm(106, 0);
         w.pointer.held = true;
         let invalid = prompt_answer_request(&w, K::FindForward, A::Entry("x\ny".into()));
         let before = prompt_snapshot(&mut w);
@@ -7632,12 +7366,12 @@ mod tests {
             .contains("\terror\tinvalid-argument\t"));
         assert_eq!(prompt_snapshot(&mut w), before);
         assert!(w.clipboard.incoming.is_some() && w.pointer.held);
-        assert!(w.input.repeat(1000).unwrap().is_some());
+        assert!(w.client.repeat(1000).unwrap().is_some());
         let request = prompt_answer_request(&w, K::FindForward, A::Entry(full.clone()));
         assert_eq!(w.control_response(&request), "1\t41\tok\t");
         assert_eq!(w.search.as_ref().unwrap().text, full);
         assert!(w.clipboard.incoming.is_none() && !w.pointer.held);
-        assert!(w.input.repeat(2000).unwrap().is_none());
+        assert!(w.client.repeat(2000).unwrap().is_none());
         assert!(w
             .control_response(&request)
             .contains("\terror\tstale-revision\t"));
@@ -7752,7 +7486,7 @@ mod tests {
         let (mut w, peer) = file_dialog_fixture();
         w.ui.dispatch(Event::Load("a λ".as_bytes())).unwrap();
         w.search_request("find", 2, 0).unwrap();
-        w.input.focused = false;
+        w.client.input_mut().focused = false;
         w.control = Some(
             crate::control_worker::Worker::start(
                 crate::control_socket::Socket::bind(&socket).unwrap(),
@@ -7832,7 +7566,7 @@ mod tests {
         );
         assert!(clipboard_snapshot(&mut w).contains("\tselection=utf8\t"));
         w.clipboard.source = Some((99, std::sync::Arc::from("private λ")));
-        w.input.focused = false;
+        w.client.input_mut().focused = false;
         w.clipboard.device = None;
         w.search_request("find", 1, 0).unwrap();
         let snapshot = clipboard_snapshot(&mut w);
@@ -7900,12 +7634,12 @@ mod tests {
         selection_offer(&mut w, device, 0xff00_0010, &[crate::data::UTF8]);
         w.clipboard_request("paste", 1, 0).unwrap();
         let (_, _writers) = drain(&peer);
-        w.input.key(106, true).unwrap();
-        w.input.arm(106, w.clock);
+        w.client.input_mut().key(106, true).unwrap();
+        w.client.arm(106, w.clock);
         w.clock = 5000;
         w.frames.clear_damage_for_test();
         assert!(clipboard_snapshot(&mut w).ends_with("\tincoming=1\toutgoing=0"));
-        assert!(w.input.repeat(w.clock).unwrap().is_some());
+        assert!(w.client.repeat(w.clock).unwrap().is_some());
         assert!(!w.frames.is_dirty());
         assert!(drain(&peer).0.is_empty());
         w.tick(5000, false).unwrap();
@@ -8125,7 +7859,7 @@ mod tests {
         assert!(answer.contains("\ttarget=-\ttarget-error=stale-revision\t"));
         assert!(answer.contains("\ttext=78\t"));
         assert!(w.search.is_some());
-        w.input.focused = false;
+        w.client.input_mut().focused = false;
         w.client.unconfigure();
         let answer = prompt_snapshot(&mut w);
         assert!(answer.contains("\tkey-ready=0\t") && answer.contains("\ttext=78\t"));
@@ -8140,12 +7874,12 @@ mod tests {
         selection_offer(&mut w, device, 0xff00_0010, &[crate::data::UTF8]);
         decoded_key(&mut w, "C-v");
         let (_, _writers) = drain(&peer);
-        w.input.key(106, true).unwrap();
-        w.input.arm(106, w.clock);
+        w.client.input_mut().key(106, true).unwrap();
+        w.client.arm(106, w.clock);
         let answer = prompt_snapshot(&mut w);
         assert!(answer.contains("\tprompt=none\t"));
         assert!(w.clipboard.incoming.is_some());
-        assert!(w.input.repeat(w.clock + 1000).unwrap().is_some());
+        assert!(w.client.repeat(w.clock + 1000).unwrap().is_some());
         let query = crate::control::Request::parse(b"1\t33\tprompt-state").unwrap();
         w.notice = Some("x".repeat(crate::control::PROMPT_BYTES + 1));
         let frames = w.frames.fields().unwrap();
@@ -8252,13 +7986,13 @@ mod tests {
                 })
                 .unwrap();
                 pointer_enter(w);
-                w.input.focused = false;
+                w.client.input_mut().focused = false;
             }
             let selection = remote.ui.editor().document(2).unwrap().selection();
             for (rows, columns) in [(1i32, 1i32), (-1, 0), (0, -1), (100, 100), (-100, -100)] {
                 let request = remote_wheel_request(&remote, rows * 3, columns * 3);
                 assert_eq!(remote.control_response(&request), "1\t12\tok\t");
-                let pointer = native.pointer.device.unwrap();
+                let pointer = native.client.pointer().unwrap();
                 native
                     .event(message(pointer, 8, &[0, rows as u32]))
                     .unwrap();
@@ -8372,8 +8106,14 @@ mod tests {
                     w.chord("C-f", false).unwrap();
                 }
                 "configured" => w.client.unconfigure(),
-                "enter" => w.pointer.enter = None,
-                "device" => w.pointer.device = None,
+                "enter" => {
+                    let pointer = w.client.pointer().unwrap();
+                    w.event(message(pointer, 1, &[1, SURFACE])).unwrap();
+                }
+                "device" => {
+                    let seat = w.client.seat().unwrap();
+                    w.event(message(seat, 0, &[2])).unwrap();
+                }
                 "closed" => w.client.close(),
                 _ => w.activation_serial = Some(9),
             }
@@ -8407,19 +8147,19 @@ mod tests {
         assert!(w.control_pointer.is_none() && w.ui.pointer_drag().is_none());
         pointer_move(&mut w, area.x, area.y);
         pointer_button(&mut w, true);
-        let pointer = w.pointer.device.unwrap();
+        let pointer = w.client.pointer().unwrap();
         w.event(message(pointer, 4, &[0, 0, 15 * 256])).unwrap();
         w.event(message(pointer, 5, &[])).unwrap();
-        w.input.key(106, true).unwrap();
-        w.input.arm(106, w.clock);
+        w.client.input_mut().key(106, true).unwrap();
+        w.client.arm(106, w.clock);
         let request = remote_wheel_request(&w, 0, 0);
         let before = w.ui.tab_view(2).unwrap().viewport;
         let coordinates = (w.pointer.x, w.pointer.y);
         assert_eq!(w.control_response(&request), "1\t12\tok\t");
         assert!(!w.pointer.held && w.ui.pointer_drag().is_none());
-        assert!(w.input.repeat(w.clock + 1000).unwrap().is_none());
+        assert!(w.client.repeat(w.clock + 1000).unwrap().is_none());
         assert_eq!((w.pointer.x, w.pointer.y), coordinates);
-        assert!(w.pointer.enter.is_some() && w.activation_serial.is_none());
+        assert!(w.client.entered().is_some() && w.activation_serial.is_none());
         w.event(message(pointer, 4, &[0, 0, 256])).unwrap();
         w.event(message(pointer, 5, &[])).unwrap();
         assert_eq!(w.ui.tab_view(2).unwrap().viewport, before);
@@ -8517,7 +8257,7 @@ mod tests {
             configure(w, 800, 600);
             w.ui.dispatch(Event::Load("abé中z\nnext".as_bytes()))
                 .unwrap();
-            let device = w.device.unwrap();
+            let device = w.client.keyboard().unwrap();
             w.event(message(device, 2, &[99, SURFACE])).unwrap();
             pointer_enter(w);
         }
@@ -8591,7 +8331,7 @@ mod tests {
                                 .unwrap();
                             }
                         }
-                        let device = w.device.unwrap();
+                        let device = w.client.keyboard().unwrap();
                         w.event(message(device, 2, &[99, SURFACE])).unwrap();
                         pointer_enter(w);
                     }
@@ -8834,9 +8574,9 @@ mod tests {
         let area = w.ui.geometry().document();
         remote_pointer(&mut w, "press", area.x, area.y, false);
         assert!(w.control_pointer.is_some() && w.ui.pointer_drag().is_some());
-        let seat = w.seat.unwrap();
+        let seat = w.client.seat().unwrap();
         w.event(message(seat, 0, &[2])).unwrap();
-        assert!(w.pointer.device.is_none());
+        assert!(w.client.pointer().is_none());
         assert!(w.control_pointer.is_none() && w.ui.pointer_drag().is_none());
     }
 
@@ -8885,8 +8625,14 @@ mod tests {
             pointer_enter(&mut w);
             match guard {
                 "configure" => w.client.unconfigure(),
-                "device" => w.pointer.device = None,
-                "enter" => w.pointer.enter = None,
+                "device" => {
+                    let seat = w.client.seat().unwrap();
+                    w.event(message(seat, 0, &[2])).unwrap();
+                }
+                "enter" => {
+                    let pointer = w.client.pointer().unwrap();
+                    w.event(message(pointer, 1, &[1, SURFACE])).unwrap();
+                }
                 "serial" => w.activation_serial = Some(11),
                 "closed" => w.client.close(),
                 _ => {
@@ -9235,10 +8981,13 @@ mod tests {
             configure(&mut w, 800, 600);
             match guard {
                 "configure" => w.client.unconfigure(),
-                "device" => w.device = None,
-                "map" => w.input.map = None,
-                "focus" => w.input.focused = false,
-                "synchronized" => w.input.synchronized = false,
+                "device" => {
+                    let seat = w.client.seat().unwrap();
+                    w.event(message(seat, 0, &[1])).unwrap();
+                }
+                "map" => w.client.input_mut().map = None,
+                "focus" => w.client.input_mut().focused = false,
+                "synchronized" => w.client.input_mut().synchronized = false,
                 "serial" => w.activation_serial = Some(12),
                 "closed" => w.client.close(),
                 _ => panic!("unknown guard"),
@@ -9345,8 +9094,8 @@ mod tests {
         assert_eq!(w.ui.editor().document(1).unwrap().text(), "pasted abc\n");
         decoded_key(&mut w, "C-v");
         let (_, _writer) = drain(&peer);
-        w.input.key(106, true).unwrap();
-        w.input.arm(106, w.clock);
+        w.client.input_mut().key(106, true).unwrap();
+        w.client.arm(106, w.clock);
         let old = decoded_key_request(&w, "x");
         w.frames.invalidate(true);
         assert!(w
@@ -9355,7 +9104,7 @@ mod tests {
         assert!(w.clipboard.incoming.is_some());
         decoded_key(&mut w, "Left");
         assert!(w.clipboard.incoming.is_none());
-        assert!(w.input.repeat(w.clock + 1000).unwrap().is_none());
+        assert!(w.client.repeat(w.clock + 1000).unwrap().is_none());
     }
 
     #[test]
@@ -10615,7 +10364,7 @@ mod tests {
         w.chord("C-o", false).unwrap();
         w.path_chord("s", false);
         configure(&mut w, 100, 80);
-        let device = w.device.unwrap();
+        let device = w.client.keyboard().unwrap();
         w.event(message(device, 2, &[99, SURFACE])).unwrap();
         let before = job_request(&mut w, &peer, &socket, "1\t0\tstate");
         for (args, code) in [
@@ -10897,7 +10646,7 @@ mod tests {
         let directory = DialogDirectory::new();
         let (mut w, peer, socket, file) = remote_conflict_fixture(&directory, true);
         configure(&mut w, 100, 80);
-        let device = w.device.unwrap();
+        let device = w.client.keyboard().unwrap();
         w.event(message(device, 2, &[99, SURFACE])).unwrap();
         w.conflict_chord("C-r", false);
         assert!(!w.conflict.as_ref().unwrap().needs_discard());
@@ -11239,9 +10988,9 @@ mod tests {
         w.chord("a", false).unwrap();
         w.close_tab(2, 1);
         configure(&mut w, 100, 80);
-        let device = w.device.unwrap();
+        let device = w.client.keyboard().unwrap();
         w.event(message(device, 2, &[99, SURFACE])).unwrap();
-        assert!(!w.input.focused && !w.close_answer_visible());
+        assert!(!w.client.input().focused && !w.close_answer_visible());
         w.close_chord("C-s", false);
         assert!(!w.files.as_ref().unwrap().busy());
         w.control = Some(
@@ -11311,7 +11060,7 @@ mod tests {
         w.chord("b", false).unwrap();
         w.close();
         configure(&mut w, 100, 80);
-        let device = w.device.unwrap();
+        let device = w.client.keyboard().unwrap();
         w.event(message(device, 2, &[99, SURFACE])).unwrap();
         w.control = Some(
             crate::control_worker::Worker::start(
@@ -11584,9 +11333,9 @@ mod tests {
             "1\t3\tok\tdialog\t2"
         );
         configure(&mut w, 100, 80);
-        let device = w.device.unwrap();
+        let device = w.client.keyboard().unwrap();
         w.event(message(device, 2, &[99, SURFACE])).unwrap();
-        assert!(!w.input.focused);
+        assert!(!w.client.input().focused);
         assert!(!w.close_answer_visible());
         w.close_chord("C-d", false); // Physical confirmation is still refused.
         assert_eq!(w.ui.editor().tabs().count(), 2);
@@ -12282,7 +12031,7 @@ mod tests {
                 control_answer(&mut remote, &mut client, &peer),
                 "1\t1\tok\t"
             );
-            let device = local.device.unwrap();
+            let device = local.client.keyboard().unwrap();
             key(&mut local, device, 30); // Real translated 'a', not a direct edit.
             assert_eq!(
                 crate::control::state(&remote.ui),
@@ -12382,13 +12131,13 @@ mod tests {
         );
         w.event(message(keyboard, 5, &[20, 10])).unwrap();
         w.event(message(keyboard, 3, &[1, 0, 30, 1])).unwrap();
-        assert!(w.input.repeat(w.clock + 20).unwrap().is_some());
+        assert!(w.client.repeat(w.clock + 20).unwrap().is_some());
         let revision = w.ui.editor().document(1).unwrap().revision();
         let request =
             crate::control::Request::parse(format!("1\t3\tselect-tab\t1\t{revision}").as_bytes())
                 .unwrap();
         assert_eq!(w.control_response(&request), "1\t3\tok\t");
-        assert!(w.input.repeat(w.clock + 100).unwrap().is_none());
+        assert!(w.client.repeat(w.clock + 100).unwrap().is_none());
     }
 
     #[test]
@@ -13219,7 +12968,7 @@ mod tests {
             if profile == Profile::Emacs {
                 w.chord("C-x", false).unwrap();
             }
-            let device = w.device.unwrap();
+            let device = w.client.keyboard().unwrap();
             key(&mut w, device, 68); // F10 through the real keymap.
             assert_eq!(w.menu.as_ref().unwrap().group, Group::File);
             assert!(!w.ui.keys().pending());
@@ -13394,7 +13143,7 @@ mod tests {
         let (mut w, peer) = file_dialog_fixture();
         w.open_menu(crate::menu::Group::Edit).unwrap();
         w.frames.clear_damage_for_test();
-        let device = w.device.unwrap();
+        let device = w.client.keyboard().unwrap();
         send_map(&mut w, &peer, device, &map_file());
         assert!(w.menu.is_none());
         assert!(w.frames.is_dirty());
@@ -13427,7 +13176,7 @@ mod tests {
         use crate::menu::Group;
         let (mut w, _peer) = file_dialog_fixture();
         pointer_enter(&mut w);
-        let pointer = w.pointer.device.unwrap();
+        let pointer = w.client.pointer().unwrap();
         w.chord("F10", false).unwrap();
         w.chord("Left", false).unwrap();
         assert_eq!(w.menu.as_ref().unwrap().group, Group::Directory);
@@ -13724,7 +13473,7 @@ mod tests {
         let (mut w, peer) = file_dialog_fixture();
         w.ui.dispatch(Event::Profile(Profile::Emacs)).unwrap();
         let tab = w.ui.editor().active().unwrap();
-        let device = w.device.unwrap();
+        let device = w.client.keyboard().unwrap();
         w.chord("M-x", true).unwrap();
         assert!(w.command.is_none());
         w.event(message(device, 4, &[0, 8, 0, 0, 0])).unwrap(); // Mod1/Alt
@@ -13772,7 +13521,7 @@ mod tests {
             w.ui.dispatch(Event::Load(b"red red")).unwrap();
             w.ui.dispatch(Event::Profile(profile)).unwrap();
             let tab = w.ui.editor().active().unwrap();
-            let device = w.device.unwrap();
+            let device = w.client.keyboard().unwrap();
             w.open_menu(crate::menu::Group::Edit).unwrap();
             let index = crate::menu::Group::Edit
                 .items()
@@ -13842,7 +13591,7 @@ mod tests {
         let (mut w, peer) = file_dialog_fixture();
         w.replace_request(1, 0).unwrap();
         w.chord("x", false).unwrap();
-        let device = w.device.unwrap();
+        let device = w.client.keyboard().unwrap();
         w.event(message(device, 2, &[2, SURFACE])).unwrap();
         assert!(w.replace_notice().unwrap().contains("Replace paused"));
         assert!(w.replace_notice().unwrap().contains("Find > x"));
@@ -13869,7 +13618,7 @@ mod tests {
             for chord in ["a", "Tab"] {
                 w.chord(chord, false).unwrap();
             }
-            let device = w.device.unwrap();
+            let device = w.client.keyboard().unwrap();
             w.event(message(device, 2, &[2, SURFACE])).unwrap();
             assert!(w.command_notice().unwrap().contains("Command paused"));
             assert!(w.command_notice().unwrap().contains("auto-fill-mode|"));
@@ -13970,7 +13719,7 @@ mod tests {
             w.chord("C-u", false).unwrap();
             w.chord("4", false).unwrap();
             w.chord("0", false).unwrap();
-            let device = w.device.unwrap();
+            let device = w.client.keyboard().unwrap();
             w.event(message(device, 2, &[2, SURFACE])).unwrap();
             assert!(w.number_notice().unwrap().contains("Fill Column paused"));
             focus(&mut w, device);
@@ -14063,7 +13812,7 @@ mod tests {
             let tab = w.ui.editor().active().unwrap();
             w.spelling
                 .install(crate::spelling::Dictionary::parse(b"known").unwrap());
-            let device = w.device.unwrap();
+            let device = w.client.keyboard().unwrap();
             configure(&mut w, 800, 600);
             w.event(message(SHM, 0, &[1])).unwrap();
             w.chord("F7", true).unwrap();
@@ -14235,12 +13984,12 @@ mod tests {
         let second = w.ui.editor().active().unwrap();
         w.close();
         assert!(w.closing_notice().unwrap().contains("Ctrl+S: Save"));
-        w.input.synchronized = false;
+        w.client.input_mut().synchronized = false;
         assert!(w
             .closing_notice()
             .unwrap()
             .contains("tap and release Shift"));
-        w.input.synchronized = true;
+        w.client.input_mut().synchronized = true;
         w.chord("C-d", false).unwrap();
         assert!(!w.client.closed());
         assert_eq!(
@@ -14299,14 +14048,14 @@ mod tests {
         let notice = w.closing_notice().unwrap();
         assert_eq!(notice.lines().count(), 6);
         assert!(notice.lines().all(|line| line.chars().count() <= 32));
-        let seat = w.seat.unwrap();
+        let seat = w.client.seat().unwrap();
         w.event(message(seat, 0, &[0])).unwrap();
-        assert!(w.closing.is_some() && w.device.is_none());
+        assert!(w.closing.is_some() && w.client.keyboard().is_none());
         assert!(w.closing_notice().unwrap().contains("Input unavailable"));
         w.chord("C-d", false).unwrap();
         assert!(!w.client.closed());
         w.event(message(seat, 0, &[3])).unwrap();
-        let device = w.device.unwrap();
+        let device = w.client.keyboard().unwrap();
         send_map(&mut w, &peer, device, &map_file());
         assert!(w.closing_notice().unwrap().contains("Input pending"));
         focus(&mut w, device);
@@ -14445,7 +14194,7 @@ mod tests {
 
     #[test]
     fn conflict_captions_fit_and_unready_or_stale_questions_never_confirm() {
-        let (mut w, _peer) = file_dialog_fixture();
+        let (mut w, peer) = file_dialog_fixture();
         w.chord("a", false).unwrap();
         let tab = w.ui.editor().active().unwrap();
         let target = Target { tab, revision: 1 };
@@ -14465,26 +14214,30 @@ mod tests {
         });
         caption(&w);
         w.reloading = None;
-        w.input.synchronized = false;
+        w.client.input_mut().synchronized = false;
         caption(&w);
         w.chord("C-r", false).unwrap();
         assert!(!w.conflict.as_ref().unwrap().needs_discard());
-        w.input.synchronized = true;
-        w.input.focused = false;
+        w.client.input_mut().synchronized = true;
+        w.client.input_mut().focused = false;
         caption(&w);
         w.chord("C-r", false).unwrap();
         assert!(!w.conflict.as_ref().unwrap().needs_discard());
-        w.input.focused = true;
-        let device = w.device.take();
+        w.client.input_mut().focused = true;
+        let seat = w.client.seat().unwrap();
+        w.event(message(seat, 0, &[1])).unwrap();
         caption(&w);
         w.chord("C-r", false).unwrap();
         assert!(!w.conflict.as_ref().unwrap().needs_discard());
-        w.device = device;
-        let map = w.input.map.take();
+        w.event(message(seat, 0, &[3])).unwrap();
+        let device = w.client.keyboard().unwrap();
+        send_map(&mut w, &peer, device, &map_file());
+        focus(&mut w, device);
+        let map = w.client.input_mut().map.take();
         caption(&w);
         w.chord("C-r", false).unwrap();
         assert!(!w.conflict.as_ref().unwrap().needs_discard());
-        w.input.map = map;
+        w.client.input_mut().map = map;
         w.ui.dispatch(Event::Resize {
             width: 208,
             height: 480,
@@ -14644,11 +14397,11 @@ mod tests {
                 assert!(result
                     .unwrap_err()
                     .contains("file window requires wl_seat v5+"));
-                assert!(w.seat.is_none());
+                assert!(w.client.seat().is_none());
                 assert!(drain(&peer).0.iter().all(|m| m.object != TOPLEVEL));
             } else {
                 result.unwrap();
-                assert!(w.seat.is_some());
+                assert!(w.client.seat().is_some());
                 let (messages, _) = drain(&peer);
                 let title = messages
                     .iter()
@@ -14673,9 +14426,9 @@ mod tests {
         w.chord("C-o", false).unwrap();
         w.chord("x", false).unwrap();
         assert!(!w.path_notice().unwrap().contains("paused"));
-        w.input.synchronized = false;
+        w.client.input_mut().synchronized = false;
         assert!(w.path_notice().unwrap().contains("tap and release Shift"));
-        w.input.map = None;
+        w.client.input_mut().map = None;
         assert!(w.path_notice().unwrap().contains("keyboard unavailable"));
         assert_eq!(w.prompt.as_ref().unwrap().text, "x");
         w.chord("Escape", false).unwrap();
@@ -14706,7 +14459,7 @@ mod tests {
                 w.ui.dispatch(Event::SelectTab(old)).unwrap();
             }
             w.files.as_mut().unwrap().open(path).unwrap();
-            w.input.timing(1000, 0, w.clock).unwrap();
+            w.client.input_mut().timing(1000, 0, w.clock).unwrap();
             // No event-loop tick between submission and this held physical press.
             w.event(message(device, 3, &[0, 0, 30, 1])).unwrap();
             let deadline = Instant::now() + Duration::from_secs(5);
@@ -14731,34 +14484,6 @@ mod tests {
     }
 
     #[test]
-    fn keymap_reads_do_not_move_shared_offsets_and_refuse_bad_sources() {
-        use std::io::{Seek, SeekFrom};
-        let mut file = map_file();
-        file.seek(SeekFrom::Start(9)).unwrap();
-        let size = file.metadata().unwrap().len() as u32;
-        for _ in 0..2 {
-            assert!(read_keymap(file.try_clone().unwrap().into(), 1, size).is_ok());
-            assert_eq!(file.stream_position().unwrap(), 9);
-        }
-        for (format, size) in [
-            (0, size),
-            (1, 0),
-            (1, 1024 * 1024 + 1),
-            (1, size + 1),
-            (1, size - 1),
-        ] {
-            assert!(read_keymap(file.try_clone().unwrap().into(), format, size).is_err());
-        }
-        let (mut a, b) = UnixStream::pair().unwrap();
-        assert!(read_keymap(b.into(), 1, 1)
-            .unwrap_err()
-            .contains("regular file"));
-        assert_eq!(a.read(&mut [0]).unwrap(), 0);
-        file.write_all_at(b"\0", 100).unwrap();
-        assert!(read_keymap(file.into(), 1, size).is_err());
-    }
-
-    #[test]
     fn replacement_map_and_capability_loss_cancel_input_without_losing_text() {
         let (mut w, peer, device) = seat_fixture();
         send_map(&mut w, &peer, device, &map_file());
@@ -14768,7 +14493,7 @@ mod tests {
         let text = w.ui.editor().document(tab).unwrap().text().to_owned();
         let invalid = backing_file(&std::env::temp_dir(), 4).unwrap();
         send_map(&mut w, &peer, device, &invalid);
-        assert!(w.input.map.is_none());
+        assert!(w.client.input().map.is_none());
         assert!(!w.ui.focused());
         w.tick(1000, true).unwrap();
         key(&mut w, device, 48);
@@ -14777,17 +14502,17 @@ mod tests {
         w.event(message(device, 4, &[0, 0, 0, 0, 0])).unwrap();
         key(&mut w, device, 48);
         assert_ne!(w.ui.editor().document(tab).unwrap().text(), text);
-        let seat = w.seat.unwrap();
+        let seat = w.client.seat().unwrap();
         w.event(message(seat, 0, &[1])).unwrap();
         assert_eq!(drain(&peer).0, [message(device, 0, &[])]);
         assert!(!w.ui.focused());
-        assert!(w.device.is_none());
+        assert!(w.client.keyboard().is_none());
         send_map(&mut w, &peer, device, &map_file()); // in-flight retired event
-        assert!(w.input.map.is_none());
+        assert!(w.client.input().map.is_none());
         assert_eq!(w.client.descriptors(), 0);
         w.event(message(seat, 0, &[3])).unwrap();
         assert_ne!(
-            w.device,
+            w.client.keyboard(),
             Some(device),
             "ID cannot be reused before delete_id"
         );
@@ -14918,10 +14643,10 @@ mod tests {
         key(&mut w, device, 30);
         let tab = w.ui.editor().active().unwrap();
         let text = w.ui.editor().document(tab).unwrap().text().to_owned();
-        let seat = w.seat.unwrap();
-        let pointer = w.pointer.device.unwrap();
+        let seat = w.client.seat().unwrap();
+        let pointer = w.client.pointer().unwrap();
         w.event(message(REGISTRY, 1, &[4])).unwrap();
-        assert!(w.seat.is_none() && w.device.is_none() && !w.client.closed());
+        assert!(w.client.seat().is_none() && w.client.keyboard().is_none() && !w.client.closed());
         assert_eq!(
             drain(&peer).0,
             [
@@ -14932,38 +14657,10 @@ mod tests {
         );
         w.event(message(seat, 0, &[2])).unwrap();
         send_map(&mut w, &peer, device, &map_file());
-        assert!(w.device.is_none() && w.input.map.is_none());
+        assert!(w.client.keyboard().is_none() && w.client.input().map.is_none());
         assert_eq!(w.ui.editor().document(tab).unwrap().text(), text);
         w.event(message(DISPLAY, 1, &[device])).unwrap();
         w.event(message(DISPLAY, 1, &[seat])).unwrap();
-    }
-
-    #[test]
-    fn seat_binding_skips_old_versions_and_selects_lowest_compatible_global() {
-        let (client, peer) = UnixStream::pair().unwrap();
-        peer.set_read_timeout(Some(Duration::from_millis(10)))
-            .unwrap();
-        let mut w = Window::new(client, std::env::temp_dir()).unwrap();
-        for event in [
-            global(1, "wl_compositor", 4),
-            global(2, "wl_shm", 1),
-            global(3, "xdg_wm_base", 1),
-            global(4, "wl_seat", 4),
-            global(5, "wl_seat", 6),
-            global(6, "wl_seat", 7),
-        ] {
-            w.event(event).unwrap();
-        }
-        w.event(message(SYNC, 0, &[0])).unwrap();
-        assert_eq!(w.client.required(), [1, 2, 3, 5]);
-        let (messages, _) = drain(&peer);
-        let binding = messages.iter().rfind(|m| m.object == REGISTRY).unwrap();
-        let mut cursor = Cursor::new(&binding.payload);
-        assert_eq!(cursor.u32().unwrap(), 5);
-        assert_eq!(cursor.string().unwrap(), "wl_seat");
-        assert_eq!(cursor.u32().unwrap(), 6);
-        assert_eq!(cursor.u32().unwrap(), w.seat.unwrap());
-        cursor.finish().unwrap();
     }
 
     #[test]

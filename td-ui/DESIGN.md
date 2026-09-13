@@ -6,13 +6,14 @@ keyboard translation, repeat policy and pointer decoding, the clipped XRGB
 raster with its palette and scrollbar geometry, the Wayland client
 connection over its own raw descriptor transport, and the client over it
 (object table, registry, one toplevel surface with its buffers and frame
-callback, the pointer image and the turn loop), all moved out of
-td-editor; the device lifecycle and the chrome widgets (menus, prompts,
-lists, tabs, status rows) that td-editor draws follow by the increments
-below. td-editor is its first consumer; the installer front end `td-setup`
-and td-portal's file chooser follow. This document is the component
-contract and the starting point for successive agents; the root
-`AGENTS.md` and `DEVELOPMENT.md` still govern changes and submission.
+callback, the seat with its keyboard and pointer, the pointer image and the
+turn loop), all moved out of td-editor; the clipboard's device lifecycle and
+the chrome widgets (menus, prompts, lists, tabs, status rows) that td-editor
+draws follow by the increments below. td-editor is its first consumer; the
+installer front end `td-setup` and td-portal's file chooser follow. This
+document is the component contract and the starting point for successive
+agents; the root `AGENTS.md` and `DEVELOPMENT.md` still govern changes and
+submission.
 
 ## Status and scope
 
@@ -33,18 +34,21 @@ and the pointer image, over the private raw module `sys` that `UNSAFE.md`
 §19 records; and the client over that connection (`client`): the object
 table with its fixed and dynamic ids, the registry with its budgets, the
 three globals every consumer binds, one toplevel surface with its SHM
-buffers and frame callback, the pointer image, and the turn loop that
-drives a consumer's `App` under the startup deadline. It re-mounts the
-compositor's
+buffers and frame callback, the seat with the keyboard and pointer its
+capabilities give (the keymap right consumed and compiled, focus, held keys,
+the modifier snapshot and repeat timing applied, pointer events decoded and
+the pointer image shown on enter), and the turn loop that drives a
+consumer's `App` under the startup deadline. It re-mounts the compositor's
 `font`, `font_data` and `wire` sources exactly as td-editor did, so there is
 still one Unifont face and one wire codec in the tree, and it owns the 8x16
 cell constants every consumer lays text out on. td-editor depends on it by
 path and uses those modules through the crate's public surface.
 
-Not yet moved: the seat, keyboard, pointer and clipboard device lifecycle,
-the widgets, and the second and third consumers. The increments below
-schedule them. td-editor's window is the first `App`; its devices live in
-the client's table under the editor's own tag until the device increment.
+Not yet moved: the clipboard's device lifecycle (the data-device manager,
+device, offers, sources and sync barriers), the widgets, and the second
+and third consumers. The increments below schedule them. td-editor's
+window is the first `App`; its clipboard objects live in the client's
+table under the editor's own tag until the clipboard increment.
 
 ## Purpose and trust position
 
@@ -88,7 +92,11 @@ of its own files may name each module.
   compiler builds on.
 - `repeat`: `Input`, the held-key set and repeat policy over an explicit
   millisecond clock: focus with held keys, modifier snapshots, timing,
-  key press and release, arming, repeat and next-wake computation.
+  key press and release, arming, repeat and next-wake computation. The
+  client owns one for its keyboard and applies the lifecycle half (map,
+  focus, snapshot, timing, presses) itself, lending a consumer a read of
+  the state and the repeat half: `arm`, `repeat`, `wait_ms` and
+  `cancel_repeat`.
 - `pointer`: `Event`, `decode` for `wl_pointer` v5 through v7 events and
   `Wheel`, which accumulates axis, axis-discrete and axis-value120 input
   into whole cell rows and columns per frame.
@@ -128,31 +136,40 @@ of its own files may name each module.
   beneath it, is private to the crate.
 - `client`: `Client<T>` over one `Connection`, with the consumer's own
   object kinds as `T: Tag` (`retired` says which of them wait for
-  `delete_id`) inside `Kind<T>`; the fixed ids `DISPLAY` through
-  `TOPLEVEL` and the budgets `OBJECTS`, `GLOBALS`, `NAME_BYTES`,
-  `BUFFERS`, `MESSAGES_PER_TURN` and `INITIAL_DEADLINE`; `new`, the table
-  (`allocate` and `set_tag` for the consumer's own objects, `kind` for
-  any slot), the registry (`find_global`,
-  `global_name`, `bind`, `required`, `is_required`, `forget_global`), the
-  toplevel (`set_title`, `set_app_id`, `commit`, `acknowledge`, `close`),
-  presentation (`can_present` and `present`, which refuses an extent the
-  raster could not paint, then paints through the caller's closure into
-  the reused raster and submits under the three-buffer rule; `buffers`,
-  `pixels`, `frame_callback`), the pointer
-  image (`show_cursor`, `cursor`), the state accessors `bound`,
-  `configured` and `closed`, `words`, `send` and `pop_descriptor` with
-  the pending `descriptors` count, `connection` for the schedule inputs,
-  and `handle`, which consumes what is the client's in an event and
-  returns `Handled`: `Done`, `Bound`, `Format`, `Configure`,
-  `CloseRequested`, `FrameDone`, `GlobalRemoved`, or `Unhandled` for the
-  consumer's own objects. `App` (`client`, `needs_descriptor`,
-  `descriptor_wait`, `tick`, `event`, `end_turn`, `draw`) is what `run`
-  drives: the registry request and initial sync under the startup
-  deadline, then, until the client is closed, at most `MESSAGES_PER_TURN`
-  events per turn with one event parked while its right has not arrived,
-  the consumer's end of turn and draw, and the transport's wait.
-  `unconfigure` is test support, public because a consumer's tests are
-  another crate.
+  `delete_id`) inside `Kind<T>`, beside the client's own (the fixed slots,
+  pools, buffers, frames, the pointer image's, and the seat, keyboard and
+  pointer with their retired states); the fixed ids `DISPLAY` through
+  `TOPLEVEL` and the budgets `OBJECTS`, `GLOBALS`, `NAME_BYTES`, `BUFFERS`,
+  `MESSAGES_PER_TURN` and `INITIAL_DEADLINE`; `new`, the table (`allocate`
+  and `set_tag` for the consumer's own objects, `kind` for any slot), the
+  registry (`find_global`, `global_name`, `bind`, `required`, `is_required`,
+  `forget_global`), the toplevel (`set_title`, `set_app_id`, `commit`,
+  `acknowledge`, `close`), presentation (`can_present` and `present`, which
+  refuses an extent the raster could not paint, then paints through the
+  caller's closure into the reused raster and submits under the three-buffer
+  rule; `buffers`, `pixels`, `frame_callback`), the devices (`seat`,
+  `keyboard`, `pointer`, `entered` for the pointer's enter serial, `input`
+  for the keyboard's state, and the repeat half of that state a consumer
+  drives: `cancel_repeat`, `arm`, `repeat` and `wait_ms`), the pointer
+  image's `cursor`, the state accessors `bound`, `configured` and `closed`,
+  `words`, `send` and `pop_descriptor` with the pending `descriptors` count,
+  `needs_descriptor` for the keymap right the client consumes, `connection`
+  for the schedule inputs, and `handle`, which takes the consumer's clock,
+  consumes what is the client's in an event and returns `Handled`: `Done`,
+  `Bound`, `Configure`, `CloseRequested`, `FrameDone`, `GlobalRemoved`,
+  `Capabilities`, `SeatRemoved`, `Keyboard` with a `KeyboardEvent`
+  (`Keymap`, `Focus`, `Ready`, `Key` with its serial, key and `Stroke`,
+  `Refused`), `Pointer` with the decoded `pointer::Event`, or `Unhandled`
+  for the consumer's own objects. `App` (`client`, `needs_descriptor` for
+  the consumer's own rights, `descriptor_wait`, `tick`, `event`, `end_turn`,
+  `draw`) is what `run` drives: the registry request and initial sync under
+  the startup deadline, then, until the client is closed, at most
+  `MESSAGES_PER_TURN` events per turn with one event parked while its right
+  has not arrived (the client's keymaps and the consumer's rights alike,
+  cancelling repeat), the consumer's end of turn and draw, and the
+  transport's wait. `unconfigure` and `input_mut` are test support, public
+  because a consumer's tests are another crate and hidden from the crate's
+  documentation.
 
 ## Invariants
 
@@ -217,6 +234,45 @@ of its own files may name each module.
   wait; an event whose right has not arrived is parked in wire order,
   capping the wait by its remaining write deadline, and the consumer's
   `descriptor_wait` is told each turn it waits.
+- The seat is bound on the initial roundtrip, after the toplevel: the lowest
+  global offering `wl_seat` v5 or newer, at the lesser of its version and 7,
+  and marked required; without one the client is still bound and the
+  consumer decides. The keyboard and pointer are created only after their
+  capability bits, the pointer first, and released when a bit clears; a seat
+  name over `NAME_BYTES` and an unknown seat event end the connection. A
+  released device's events are schema-checked and drained until `delete_id`,
+  a keymap's right dropped unread, and its replacement is a fresh id.
+  Removal of the bound seat's global releases the keyboard, the pointer and
+  the seat, forgets the global and is reported as `SeatRemoved`, not as a
+  fatal required removal. Keymaps are the client's one right consumer
+  (`UNSAFE.md` §19): format 1 only, a regular file covering the advertised
+  1..=1 MiB extent read positionally at zero, so the compositor's shared
+  offset never moves, UTF-8 with one trailing NUL, compiled whole by
+  `keyboard` before any press translates (the compiler's own `parse` takes
+  the NUL as optional); a refused map leaves none, and every map cancels
+  repeat and awaits a modifier snapshot. Keyboard enter and leave must name
+  the surface and are the repeat policy's focus gain, with the held keys,
+  and loss; the modifiers event is its snapshot, and the first after a map
+  and focus is `Ready`, from which presses translate; the timing event is
+  its rate and delay, at the consumer's clock. The pointer's events are
+  decoded by `pointer`, which refuses unknown opcodes, truncated or trailing
+  payloads, invalid axis and source numbers and invalid button states; its
+  enter must name the surface, is remembered as `entered` until leave, and
+  shows the pointer image at its serial, or on ARGB's arrival while inside;
+  the image is built once, and later enters only re-send `set_cursor`.
+- The repeat policy (`repeat`): held keys up to the held-set budget;
+  focus gain installs its held keys without typing or arming repeat, and
+  presses wait for the modifier snapshot that follows; duplicate presses
+  and unmatched releases are ignored; focus loss clears the held keys,
+  the modifiers and the repeat; a modifier change and any new press
+  cancel the old repeat, a release only its matching one; a map change
+  cancels repeat and requires a new snapshot; a negative rate or delay is
+  malformed and a zero rate disables repeat; rates above 1000 Hz clamp,
+  intervals round upward to whole milliseconds, and a new positive rate
+  and delay retime the current repeat from the clock they arrive with; at
+  most one repetition fires per `repeat` call, missed repetitions are
+  dropped, never burst after a stall, and timer arithmetic is checked,
+  with exhaustion disarming the repeat.
 - The raster writes only inside the validated surface and each draw's
   clip; row padding and bytes beyond the frame are untouched, and every
   refusal precedes every write. Medium-weight fringe colours derive from
@@ -267,26 +323,37 @@ backpressure under the startup deadline, environment precedence, and the
 peer reader draining requests with their rights from a pool file that is
 private, unlinked and exactly sized.
 
-`tests/client.rs` drives the client with the smallest consumer, a probe
-that fills one colour behind a marker pixel: the fixed ids and budgets
-by value; the fixed ids in order and a
-pool crossing the socket private, unlinked and pixel-exact; the frame
-callback not releasing a buffer and three busy buffers bounding a resize
-storm; a release before done still waiting and a matching buffer reused;
-invalid events, a protocol error, ids waiting for `delete_id` and an
-oversize surface refused before any request; missing, low-version,
-removed and excessive
-globals named; registry lookups binding the lowest global and removal
-reporting whether it was required; a consumer's objects handed back
-untouched and retired through their tag; pings serviced while a frame
-waits and close stopping presentation; a later free matching buffer
-preferred; presentation waiting for configure, XRGB and the callback; a
-hidden surface without a callback deadline; the pointer image's one pool
-and serial reuse; the complete loop on a thread accepting split events
-and closing cleanly; and the loop parking an event until its right
-arrives, in wire order, with the idle wait restored. Nine of these moved
-from td-editor's window tests, which keep the editor's own seat,
-clipboard and control coverage.
+`tests/client.rs` drives the client with the smallest consumer, a probe that
+fills one colour behind a marker pixel: the fixed ids and budgets by value;
+the fixed ids in order and a pool crossing the socket private, unlinked and
+pixel-exact; the frame callback not releasing a buffer and three busy
+buffers bounding a resize storm; a release before done still waiting and a
+matching buffer reused; invalid events, a protocol error, ids waiting for
+`delete_id` and an oversize surface refused before any request; missing,
+low-version, removed and excessive globals named; registry lookups binding
+the lowest global and removal reporting whether it was required; a
+consumer's objects handed back untouched and retired through their tag;
+pings serviced while a frame waits and close stopping presentation; a later
+free matching buffer preferred; presentation waiting for configure, XRGB and
+the callback; a hidden surface without a callback deadline; the pointer
+image's one pool, serial reuse and late arrival on ARGB, with decoded
+motion, buttons, axes and frames handed on and another surface refused; the
+seat bound from the lowest v5 global capped at v7 after the toplevel, its
+devices created in order once and a name over budget refused; a keymap
+crossing the socket and presses translating only after focus and the
+snapshot, with arming, repeat, the timing retime and leave clearing
+everything; a refused map disabling input, an unsupported format dropping
+its right unread and every keyboard schema refusal; capability loss
+releasing a device, retired devices drained until `delete_id` and a lost
+keyboard's in-flight keymap dropped; seat removal releasing both devices and
+the seat and forgetting the global; the complete loop on a thread accepting
+split events and closing cleanly; and the loop parking an event until its
+right arrives, in wire order, with the idle wait restored. Twelve of these
+moved from td-editor's window tests (the presentation nine, the pointer
+image, the seat binding and the keymap reader's shared-offset and bad-source
+oracle, the last a unit test beside `read_keymap`); the editor keeps its
+clipboard and control coverage and its reactions to the client's device
+outcomes.
 
 `tests/confinement.rs` pins the source inventory, the exact three shared
 source mounts, the absence of ambient I/O in pure modules, that `notices`
@@ -296,8 +363,10 @@ input interface, and the raw layer: the complete fingerprint of `sys.rs`,
 its syscall and flag values, its two function-only allowances, the single
 instruction and adoption sites, that the crate root denies `unsafe` and
 declares the module private, that `wayland` is its only caller, through
-exactly four wrapper calls, and that no production module calls the
-client's `unconfigure`.
+exactly four wrapper calls, that no production module calls the
+client's test support (`unconfigure`, `input_mut`), and that the client
+is the toolkit's one consumer of a received right, through the pinned
+keymap reader with its format, size and regular-file checks.
 
 The builder discovers the crate by existing. Its gate runs `cargo test` and
 all-target Clippy; a change under `td-ui/` selects td-editor's tests through
@@ -323,8 +392,13 @@ the reader graph, because td-editor's manifest names the crate.
    in the table under its `Tag`; td-editor is the first `App`, its nine
    presentation tests moved, and the probe consumer in `tests/client.rs`
    drives the client. Landed.
-4. Devices: seat, keyboard, pointer and clipboard device lifecycle inside
-   the client, delivered as a typed event stream with serials.
+4. Devices, in two landings. (a) The seat, keyboard and pointer inside
+   the client: bound and created there, the keymap right consumed there,
+   the keyboard's state owned there and its events delivered typed with
+   their serials; td-editor acts on the outcomes and keeps its gestures.
+   Landed. (b) The clipboard's data-device lifecycle: manager, device,
+   offers with their budgets and retirement barriers, and sources,
+   delivered typed; td-editor keeps its transfers.
 5. Widgets: text entry, wrapped text block, menu bar and panel, paged list,
    tab strip and status row, each with a pixel oracle.
 6. `td-setup`: the installer front end's first page as the second consumer,

@@ -1,12 +1,16 @@
 //! The Wayland client td-owned programs share: the object table, the
 //! registry, one xdg toplevel surface with its SHM buffers and frame
-//! callback, the pointer image, and the turn loop that drives a consumer's
-//! `App` over the connection. Device objects (seat, keyboard, pointer,
-//! clipboard) are the consumer's own for now: it names them with its `Tag`,
-//! the client keeps their slots in the one table, and `handle` hands their
-//! events back untouched. Errors are strings, as the transport's are.
+//! callback, the seat with its keyboard and pointer, the pointer image,
+//! and the turn loop that drives a consumer's `App` over the connection.
+//! The clipboard's objects are the consumer's own for now: it names them
+//! with its `Tag`, the client keeps their slots in the one table, and
+//! `handle` hands their events back untouched. Errors are strings, as the
+//! transport's are.
 
+use crate::keyboard::{Keymap, Modifiers, Stroke};
+use crate::pointer;
 use crate::raster::{MAX_AXIS, MAX_FRAME_BYTES};
+use crate::repeat::Input;
 use crate::wayland::{
     backing_file, cursor_pixels, error, Connection, Result, CURSOR_HEIGHT, CURSOR_WIDTH, IDLE_WAIT,
     WRITE_DEADLINE,
@@ -65,6 +69,12 @@ pub enum Kind<T> {
     RetiredBuffer,
     CursorSurface,
     CursorBuffer,
+    Seat,
+    RetiredSeat,
+    Keyboard,
+    RetiredKeyboard,
+    Pointer,
+    RetiredPointer,
     App(T),
 }
 
@@ -98,6 +108,31 @@ struct CursorImage {
     busy: bool,
 }
 
+/// What the live keyboard did, after the client applied it to its `Input`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum KeyboardEvent {
+    /// A keymap arrived and its right was consumed: compiled and installed,
+    /// or refused with the reason. Either way the old map is gone, repeat
+    /// is cancelled and a modifier snapshot is awaited.
+    Keymap(Result<()>),
+    /// Keyboard focus entered the surface, installing its held keys without
+    /// typing, or left it, clearing them.
+    Focus(bool),
+    /// The first modifier snapshot after a map and focus: presses translate
+    /// from now on.
+    Ready,
+    /// A press translated under the map and snapshot, with its serial for
+    /// activation; the consumer arms repeat for `key` when it accepted the
+    /// stroke.
+    Key {
+        serial: u32,
+        key: u32,
+        stroke: Stroke,
+    },
+    /// A press the map refused; the map stays.
+    Refused(String),
+}
+
 /// What `Client::handle` did with an event, and what the consumer does next.
 #[derive(Debug, Eq, PartialEq)]
 pub enum Handled {
@@ -107,9 +142,6 @@ pub enum Handled {
     /// fixed ids published. Bind the consumer's globals, set the title and
     /// app id, then `commit` the initial surface state.
     Bound,
-    /// `wl_shm.format`: the client records XRGB and ARGB; a consumer whose
-    /// pointer has entered shows its cursor on ARGB (format 0).
-    Format(u32),
     /// `xdg_surface.configure`: apply the pending toplevel size, where a
     /// zero axis keeps the current one, then `acknowledge` the serial.
     Configure {
@@ -123,12 +155,25 @@ pub enum Handled {
     /// A registry global went away. A required one is still known to the
     /// client: `forget_global` to recover, or return the error.
     GlobalRemoved { id: u32, required: bool },
+    /// `wl_seat.capabilities`: the client now holds a keyboard and a
+    /// pointer as flagged, having created or released each. A consumer
+    /// drops what it kept for a device that went away.
+    Capabilities { keyboard: bool, pointer: bool },
+    /// The bound seat's global went away: its devices and the seat are
+    /// released and the global forgotten. A consumer releases what it
+    /// bound through the seat.
+    SeatRemoved,
+    /// The live keyboard's event, already applied to the keyboard state.
+    Keyboard(KeyboardEvent),
+    /// The live pointer's event; enter and leave named this surface, and
+    /// the pointer image follows enter serials.
+    Pointer(pointer::Event),
     /// The object is the consumer's (`Kind::App`); dispatch it yourself.
     Unhandled,
 }
 
 /// One display connection with its object table, registry, surface,
-/// buffers and pointer image.
+/// buffers, seat and pointer image.
 pub struct Client<T: Tag> {
     connection: Connection,
     globals: BTreeMap<u32, (String, u32)>,
@@ -142,6 +187,11 @@ pub struct Client<T: Tag> {
     argb: bool,
     cursor_image: Option<CursorImage>,
     callback: Option<u32>,
+    seat: Option<u32>,
+    keyboard: Option<u32>,
+    pointer: Option<u32>,
+    input: Input,
+    enter: Option<u32>,
     bound: bool,
     closed: bool,
     temporary: PathBuf,
@@ -168,6 +218,11 @@ impl<T: Tag> Client<T> {
             argb: false,
             cursor_image: None,
             callback: None,
+            seat: None,
+            keyboard: None,
+            pointer: None,
+            input: Input::default(),
+            enter: None,
             bound: false,
             closed: false,
             temporary,
@@ -204,6 +259,74 @@ impl<T: Tag> Client<T> {
     /// Received rights waiting for their consumer.
     pub fn descriptors(&self) -> usize {
         self.connection.descriptors()
+    }
+
+    /// Whether `message` carries a right the client consumes: a keymap.
+    /// The complete schema is checked here, before any wait; an object
+    /// the table does not know is not the client's.
+    pub fn needs_descriptor(&self, message: &Message) -> Result<bool> {
+        match (self.objects.get(message.object as usize), message.opcode) {
+            (Some(Kind::Keyboard | Kind::RetiredKeyboard), 0) => {
+                keyboard_message(message)?;
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    /// The seat bound on the initial roundtrip: the lowest global offering
+    /// `wl_seat` v5 or newer, capped to v7. None when the registry had no
+    /// such seat, and after its removal.
+    pub fn seat(&self) -> Option<u32> {
+        self.seat
+    }
+
+    /// The live keyboard and pointer the seat's capabilities gave.
+    pub fn keyboard(&self) -> Option<u32> {
+        self.keyboard
+    }
+
+    pub fn pointer(&self) -> Option<u32> {
+        self.pointer
+    }
+
+    /// The serial of the pointer's enter while it is inside the surface.
+    pub fn entered(&self) -> Option<u32> {
+        self.enter
+    }
+
+    /// The keyboard's state: its map, focus, modifier snapshot, held keys
+    /// and armed repeat.
+    pub fn input(&self) -> &Input {
+        &self.input
+    }
+
+    /// Test support, public because a consumer's tests are another crate:
+    /// production drives the repeat through `cancel_repeat`, `arm`,
+    /// `repeat` and `wait_ms` and leaves the map, focus and snapshot to
+    /// `handle`.
+    #[doc(hidden)]
+    pub fn input_mut(&mut self) -> &mut Input {
+        &mut self.input
+    }
+
+    pub fn cancel_repeat(&mut self) {
+        self.input.cancel_repeat();
+    }
+
+    /// Arms repeat at `now` for `key`, whose stroke the consumer accepted.
+    pub fn arm(&mut self, key: u32, now: u64) {
+        self.input.arm(key, now);
+    }
+
+    /// The repeated stroke due at `now`, at most one per call.
+    pub fn repeat(&mut self, now: u64) -> Result<Option<Stroke>> {
+        self.input.repeat(now)
+    }
+
+    /// Milliseconds until the armed repeat is due, between 1 and 100.
+    pub fn wait_ms(&self, now: u64) -> u64 {
+        self.input.wait_ms(now)
     }
 
     /// The first free dynamic id, given to one of the consumer's own
@@ -312,8 +435,161 @@ impl<T: Tag> Client<T> {
         self.connection.words(COMPOSITOR, 0, &[SURFACE])?;
         self.connection.words(WM, 2, &[XDG_SURFACE, SURFACE])?;
         self.connection.words(XDG_SURFACE, 1, &[TOPLEVEL])?;
+        // The lowest seat offering v5, capped to v7; a consumer that needs
+        // one checks `seat` when it is told `Bound`.
+        if let Some((_, version)) = self.find_global("wl_seat", 5) {
+            let seat = self.allocate_kind(Kind::Seat)?;
+            self.bind("wl_seat", version.min(7), seat)?;
+            self.seat = Some(seat);
+        }
         self.bound = true;
         Ok(())
+    }
+
+    /// Creates or releases the seat's devices as `capabilities` says: the
+    /// pointer first, then the keyboard, as the editor did.
+    fn capabilities(&mut self, seat: u32, capabilities: u32) -> Result<Handled> {
+        let pointer = capabilities & 1 != 0;
+        let keyboard = capabilities & 2 != 0;
+        if !pointer {
+            self.release_pointer()?;
+        } else if self.pointer.is_none() {
+            let device = self.allocate_kind(Kind::Pointer)?;
+            self.connection.words(seat, 0, &[device])?;
+            self.pointer = Some(device);
+        }
+        if !keyboard {
+            self.release_keyboard()?;
+        } else if self.keyboard.is_none() {
+            let device = self.allocate_kind(Kind::Keyboard)?;
+            self.connection.words(seat, 1, &[device])?;
+            self.keyboard = Some(device);
+        }
+        Ok(Handled::Capabilities { keyboard, pointer })
+    }
+
+    /// Releases the keyboard, if any, and forgets its map, focus, snapshot,
+    /// held keys and repeat.
+    fn release_keyboard(&mut self) -> Result<()> {
+        if let Some(device) = self.keyboard.take() {
+            self.connection.words(device, 0, &[])?;
+            self.set_kind(device, Kind::RetiredKeyboard)?;
+        }
+        self.input = Input::default();
+        Ok(())
+    }
+
+    /// Releases the pointer, if any; the pointer image stays for the next.
+    fn release_pointer(&mut self) -> Result<()> {
+        if let Some(device) = self.pointer.take() {
+            self.connection.words(device, 1, &[])?;
+            self.set_kind(device, Kind::RetiredPointer)?;
+        }
+        self.enter = None;
+        Ok(())
+    }
+
+    /// Releases both devices, then the seat.
+    fn release_seat(&mut self) -> Result<()> {
+        self.release_keyboard()?;
+        self.release_pointer()?;
+        if let Some(seat) = self.seat.take() {
+            self.connection.words(seat, 3, &[])?;
+            self.set_kind(seat, Kind::RetiredSeat)?;
+        }
+        Ok(())
+    }
+
+    /// The live keyboard's events are applied to its state; a retired
+    /// keyboard's are schema-checked and drained, a keymap's right dropped
+    /// unread. `now` retimes an armed repeat when the timing changes.
+    fn keyboard_event(&mut self, id: u32, message: &Message, now: u64) -> Result<Handled> {
+        let event = keyboard_message(message)?;
+        let active = self.keyboard == Some(id);
+        Ok(match event {
+            KeyboardMessage::Map(format, size) => {
+                let fd = self
+                    .connection
+                    .pop_descriptor()
+                    .ok_or("missing keymap descriptor")?;
+                if !active {
+                    return Ok(Handled::Done);
+                }
+                self.input.map = None;
+                self.input.cancel_repeat();
+                self.input.synchronized = false;
+                let result = read_keymap(fd, format, size).map(|map| self.input.map = Some(map));
+                Handled::Keyboard(KeyboardEvent::Keymap(result))
+            }
+            _ if !active => Handled::Done,
+            KeyboardMessage::Enter(surface, keys) => {
+                if surface != SURFACE {
+                    return Err("keyboard enter for unknown surface".into());
+                }
+                self.input.focus(&keys, true)?;
+                Handled::Keyboard(KeyboardEvent::Focus(true))
+            }
+            KeyboardMessage::Leave(surface) => {
+                if surface != SURFACE {
+                    return Err("keyboard leave for unknown surface".into());
+                }
+                self.input.focus(&[], false)?;
+                Handled::Keyboard(KeyboardEvent::Focus(false))
+            }
+            KeyboardMessage::Modifiers(modifiers) => {
+                let ready =
+                    !self.input.synchronized && self.input.focused && self.input.map.is_some();
+                self.input.modifiers(modifiers);
+                if ready {
+                    Handled::Keyboard(KeyboardEvent::Ready)
+                } else {
+                    Handled::Done
+                }
+            }
+            KeyboardMessage::Timing(rate, delay) => {
+                self.input.timing(rate, delay, now)?;
+                Handled::Done
+            }
+            KeyboardMessage::Key(serial, key, pressed) => match self.input.key(key, pressed) {
+                Ok(Some(stroke)) => Handled::Keyboard(KeyboardEvent::Key {
+                    serial,
+                    key,
+                    stroke,
+                }),
+                Ok(None) => Handled::Done,
+                Err(detail) => Handled::Keyboard(KeyboardEvent::Refused(detail)),
+            },
+        })
+    }
+
+    /// The live pointer's events are decoded and handed on; enter and
+    /// leave must name this surface, and enter shows the pointer image at
+    /// its serial. A retired pointer's events are schema-checked and
+    /// drained.
+    fn pointer_event(&mut self, id: u32, message: &Message) -> Result<Handled> {
+        let event = pointer::decode(message)?;
+        if self.pointer != Some(id) {
+            return Ok(Handled::Done);
+        }
+        match event {
+            pointer::Event::Enter {
+                serial, surface, ..
+            } => {
+                if surface != SURFACE {
+                    return Err("pointer enter for unknown surface".into());
+                }
+                self.enter = Some(serial);
+                self.show_cursor()?;
+            }
+            pointer::Event::Leave(surface) => {
+                if surface != SURFACE {
+                    return Err("pointer leave for unknown surface".into());
+                }
+                self.enter = None;
+            }
+            _ => {}
+        }
+        Ok(Handled::Pointer(event))
     }
 
     fn toplevel_string(&mut self, opcode: u16, value: &str) -> Result<()> {
@@ -355,6 +631,7 @@ impl<T: Tag> Client<T> {
     /// Test support, public because a consumer's tests are another crate:
     /// back to the state before the first configure was acknowledged, so a
     /// consumer's tests can check what it refuses until then.
+    #[doc(hidden)]
     pub fn unconfigure(&mut self) {
         self.configured = false;
     }
@@ -389,13 +666,13 @@ impl<T: Tag> Client<T> {
             .map(|image| (image.surface, image.buffer))
     }
 
-    /// Sets the pointer image for `device` at the entering `serial`, building
-    /// the one immutable ARGB pool on the first call. Nothing happens until
-    /// ARGB was advertised.
-    pub fn show_cursor(&mut self, device: u32, serial: u32) -> Result<()> {
-        if !self.argb {
+    /// Sets the pointer image at the pointer's enter serial, building the
+    /// one immutable ARGB pool on the first call. Nothing happens until
+    /// the pointer is inside and ARGB was advertised.
+    fn show_cursor(&mut self) -> Result<()> {
+        let (Some(device), Some(serial), true) = (self.pointer, self.enter, self.argb) else {
             return Ok(());
-        }
+        };
         if let Some(image) = &self.cursor_image {
             let surface = image.surface;
             return self.connection.words(device, 0, &[serial, surface, 0, 0]);
@@ -543,8 +820,10 @@ impl<T: Tag> Client<T> {
 
     /// Handles what is the client's in `message` and says what remains for
     /// the consumer: events for its own objects are its to dispatch. An
-    /// event for an object the table does not know is an error.
-    pub fn handle(&mut self, message: &Message) -> Result<Handled> {
+    /// event for an object the table does not know is an error. `now` is
+    /// the consumer's clock, the millisecond its `tick` last saw, which
+    /// retimes an armed repeat when the keyboard's timing changes.
+    pub fn handle(&mut self, message: &Message, now: u64) -> Result<Handled> {
         let mut cursor = Cursor::new(&message.payload);
         let handled = match (message.object, message.opcode) {
             (DISPLAY, 0) => {
@@ -558,7 +837,11 @@ impl<T: Tag> Client<T> {
             (DISPLAY, 1) => {
                 let id = cursor.u32()?;
                 let retired = match self.kind(id)? {
-                    Kind::Retired | Kind::RetiredBuffer => true,
+                    Kind::Retired
+                    | Kind::RetiredBuffer
+                    | Kind::RetiredSeat
+                    | Kind::RetiredKeyboard
+                    | Kind::RetiredPointer => true,
                     Kind::App(tag) => tag.retired(),
                     _ => false,
                 };
@@ -586,11 +869,16 @@ impl<T: Tag> Client<T> {
             }
             (REGISTRY, 1) => {
                 let id = cursor.u32()?;
+                cursor.finish()?;
                 let required = self.required.contains(&id);
                 if !required {
                     self.globals.remove(&id);
+                } else if self.seat.is_some() && self.global_name(id) == Some("wl_seat") {
+                    self.release_seat()?;
+                    self.forget_global(id);
+                    return Ok(Handled::SeatRemoved);
                 }
-                Handled::GlobalRemoved { id, required }
+                return Ok(Handled::GlobalRemoved { id, required });
             }
             (SYNC, 0) if !self.bound => {
                 cursor.u32()?;
@@ -606,9 +894,14 @@ impl<T: Tag> Client<T> {
             }
             (SHM, 0) if self.bound => {
                 let format = cursor.u32()?;
+                cursor.finish()?;
                 self.xrgb |= format == 1;
-                self.argb |= format == 0;
-                Handled::Format(format)
+                if format == 0 && !self.argb {
+                    self.argb = true;
+                    // A pointer already inside gets its image now.
+                    self.show_cursor()?;
+                }
+                return Ok(Handled::Done);
             }
             (TOPLEVEL, 0) if self.bound => {
                 let width = cursor.i32()?;
@@ -667,6 +960,31 @@ impl<T: Tag> Client<T> {
                 Handled::Done
             }
             (id, 0) if self.kind(id)? == Kind::RetiredBuffer => Handled::Done,
+            (id, opcode) if self.seat == Some(id) || self.kind(id)? == Kind::RetiredSeat => {
+                match opcode {
+                    0 => {
+                        let capabilities = cursor.u32()?;
+                        cursor.finish()?;
+                        if self.seat != Some(id) {
+                            return Ok(Handled::Done);
+                        }
+                        return self.capabilities(id, capabilities);
+                    }
+                    1 => {
+                        if cursor.string()?.len() > NAME_BYTES {
+                            return Err("seat name budget".into());
+                        }
+                        Handled::Done
+                    }
+                    _ => return Err("unknown seat event".into()),
+                }
+            }
+            (id, _) if matches!(self.kind(id)?, Kind::Keyboard | Kind::RetiredKeyboard) => {
+                return self.keyboard_event(id, message, now);
+            }
+            (id, _) if matches!(self.kind(id)?, Kind::Pointer | Kind::RetiredPointer) => {
+                return self.pointer_event(id, message);
+            }
             (id, _) if matches!(self.kind(id)?, Kind::App(_)) => return Ok(Handled::Unhandled),
             _ => {
                 return Err(format!(
@@ -680,18 +998,103 @@ impl<T: Tag> Client<T> {
     }
 }
 
+enum KeyboardMessage {
+    Map(u32, u32),
+    Enter(u32, Vec<u32>),
+    Leave(u32),
+    Key(u32, u32, bool),
+    Modifiers(Modifiers),
+    Timing(i32, i32),
+}
+
+/// The complete `wl_keyboard` v5 through v7 event schema.
+fn keyboard_message(message: &Message) -> Result<KeyboardMessage> {
+    let mut cursor = Cursor::new(&message.payload);
+    let event = match message.opcode {
+        0 => KeyboardMessage::Map(cursor.u32()?, cursor.u32()?),
+        1 => {
+            cursor.u32()?;
+            let surface = cursor.u32()?;
+            let bytes = cursor.u32()?;
+            if bytes % 4 != 0 || bytes > 768 * 4 {
+                return Err("keyboard enter array budget".into());
+            }
+            let mut keys = Vec::with_capacity(bytes as usize / 4);
+            for _ in 0..bytes / 4 {
+                keys.push(cursor.u32()?);
+            }
+            KeyboardMessage::Enter(surface, keys)
+        }
+        2 => {
+            cursor.u32()?;
+            KeyboardMessage::Leave(cursor.u32()?)
+        }
+        3 => {
+            let serial = cursor.u32()?;
+            cursor.u32()?; // Server timestamps have an unrelated, wrapping epoch.
+            let key = cursor.u32()?;
+            let state = cursor.u32()?;
+            if state > 1 {
+                return Err("invalid keyboard state for v5-v7".into());
+            }
+            KeyboardMessage::Key(serial, key, state == 1)
+        }
+        4 => {
+            cursor.u32()?;
+            KeyboardMessage::Modifiers(Modifiers {
+                depressed: cursor.u32()?,
+                latched: cursor.u32()?,
+                locked: cursor.u32()?,
+                group: cursor.u32()?,
+            })
+        }
+        5 => KeyboardMessage::Timing(cursor.i32()?, cursor.i32()?),
+        _ => return Err("unknown keyboard event".into()),
+    };
+    cursor.finish()?;
+    Ok(event)
+}
+
+/// The keymap consumer `UNSAFE.md` §19 records: the one right of a
+/// `wl_keyboard.keymap`, read positionally from a regular file covering
+/// its advertised extent and compiled whole.
+fn read_keymap(fd: OwnedFd, format: u32, size: u32) -> Result<Keymap> {
+    if format != 1 {
+        return Err(format!("unsupported keymap format {format}"));
+    }
+    if size == 0 || size > 1024 * 1024 {
+        return Err("keymap byte budget".into());
+    }
+    let file = File::from(fd);
+    let metadata = file.metadata().map_err(error)?;
+    if !metadata.is_file() || metadata.len() < u64::from(size) {
+        return Err("keymap must be a regular file covering its advertised size".into());
+    }
+    let mut bytes = vec![0; size as usize];
+    // Positioned reads do not move the compositor's shared file offset, and
+    // truncation is an I/O error rather than a mapped-file SIGBUS.
+    file.read_exact_at(&mut bytes, 0).map_err(error)?;
+    if bytes.last() != Some(&0) {
+        return Err("keymap requires a trailing NUL".into());
+    }
+    let source = std::str::from_utf8(&bytes).map_err(error)?;
+    Keymap::parse(source).map_err(error)
+}
+
 /// What `run` drives: a program holding one `Client`.
 pub trait App {
     type Tag: Tag;
 
     fn client(&mut self) -> &mut Client<Self::Tag>;
 
-    /// Whether this event carries a right that must have arrived before it
-    /// is dispatched; the complete schema is checked here, before waiting.
+    /// Whether this event carries a right, for one of the consumer's own
+    /// objects, that must have arrived before it is dispatched; the complete
+    /// schema is checked here, before waiting. The client answers for its
+    /// keymaps itself.
     fn needs_descriptor(&self, message: &Message) -> Result<bool>;
 
-    /// The next event waits for its right; timers that would fire meanwhile
-    /// are cancelled.
+    /// The next event waits for its right. The client cancelled its repeat;
+    /// a consumer's own timers that would fire meanwhile are cancelled here.
     fn descriptor_wait(&mut self);
 
     /// Before each event, with monotonic milliseconds since `run` began.
@@ -745,10 +1148,15 @@ pub fn run<A: App>(app: &mut A) -> Result<()> {
             let Some((message, deadline)) = next else {
                 break;
             };
-            if app.needs_descriptor(&message)? && app.client().descriptors() == 0 {
+            let wants_right =
+                app.client().needs_descriptor(&message)? || app.needs_descriptor(&message)?;
+            if wants_right && app.client().descriptors() == 0 {
                 if Instant::now() >= deadline {
                     return Err("Wayland descriptor deadline".into());
                 }
+                // A repeat must not fire ahead of the event it was queued
+                // behind.
+                app.client().cancel_repeat();
                 app.descriptor_wait();
                 waiting = Some((message, deadline));
                 break;
@@ -776,4 +1184,40 @@ pub fn run<A: App>(app: &mut A) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+mod tests {
+    use super::*;
+    use std::io::{Read, Seek, SeekFrom};
+
+    #[test]
+    fn keymap_reads_do_not_move_shared_offsets_and_refuse_bad_sources() {
+        let source = include_str!("../tests/fixtures/us.xkb");
+        let mut file = backing_file(&std::env::temp_dir(), source.len() + 1).unwrap();
+        file.write_all_at(source.as_bytes(), 0).unwrap();
+        file.seek(SeekFrom::Start(9)).unwrap();
+        let size = file.metadata().unwrap().len() as u32;
+        for _ in 0..2 {
+            assert!(read_keymap(file.try_clone().unwrap().into(), 1, size).is_ok());
+            assert_eq!(file.stream_position().unwrap(), 9);
+        }
+        for (format, size) in [
+            (0, size),
+            (1, 0),
+            (1, 1024 * 1024 + 1),
+            (1, size + 1),
+            (1, size - 1),
+        ] {
+            assert!(read_keymap(file.try_clone().unwrap().into(), format, size).is_err());
+        }
+        let (mut a, b) = UnixStream::pair().unwrap();
+        assert!(read_keymap(b.into(), 1, 1)
+            .unwrap_err()
+            .contains("regular file"));
+        assert_eq!(a.read(&mut [0]).unwrap(), 0);
+        file.write_all_at(b"\0", 100).unwrap();
+        assert!(read_keymap(file.into(), 1, size).is_err());
+    }
 }

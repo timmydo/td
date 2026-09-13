@@ -87,10 +87,21 @@ fn source_inventory_and_shared_mounts_are_closed() {
             "source paths in {name}"
         );
         assert_eq!(
-            text.matches(".unconfigure(").count(),
-            0,
-            "the client's test support is not called in {name}"
+            text.matches(".pop_descriptor()").count(),
+            match name.as_str() {
+                "client.rs" => 2,
+                "wayland.rs" => 1,
+                _ => 0,
+            },
+            "pops: the transport's own test, the client's accessor and its keymap reader: {name}"
         );
+        for support in [".unconfigure(", ".input_mut("] {
+            assert_eq!(
+                text.matches(support).count(),
+                0,
+                "the client's test support {support} is not called in {name}"
+            );
+        }
         if name == "lib.rs" {
             assert!(compact.starts_with("#![deny(unsafe_code)]"));
             assert!(!compact.contains("#![allow("));
@@ -256,6 +267,24 @@ fn complete_raw_layer_and_its_sole_caller_are_pinned() {
     assert!(!production.contains("pub struct"));
     assert!(!production.contains("pub(crate) struct"));
     // The transport is the only caller, through exactly these wrappers.
+    // The client is the toolkit's one consumer of a received right: the
+    // keymap reader pops exactly one per `wl_keyboard.keymap`, reads a
+    // regular file positionally and compiles it whole (UNSAFE.md §19).
+    let client = include_str!("../src/client.rs");
+    let client = client.split("#[cfg(test)]").next().unwrap();
+    assert_eq!(
+        client.matches(".pop_descriptor()").count(),
+        2,
+        "the consumer's pop and the keymap consumer"
+    );
+    assert_eq!(client.matches("read_keymap(fd, format, size)").count(), 1);
+    assert_eq!(client.matches("File::from(fd)").count(), 1);
+    assert_eq!(client.matches("Keymap::parse(source)").count(), 1);
+    assert!(client.contains("file.read_exact_at(&mut bytes, 0)"));
+    assert!(client.contains("if size == 0 || size > 1024 * 1024 {"));
+    assert!(client.contains("!metadata.is_file() || metadata.len() < u64::from(size)"));
+    assert!(!client.contains("from_raw_fd") && !client.contains("as_raw_fd"));
+    assert!(!client.contains("mmap"));
     let transport = include_str!("../src/wayland.rs");
     assert_eq!(transport.matches("sys::").count(), 4);
     for call in [
