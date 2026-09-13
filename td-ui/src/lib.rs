@@ -1,18 +1,18 @@
 #![deny(unsafe_code)]
 
-//! td's dependency-free UI toolkit, shared by td-owned graphical programs as
-//! a Cargo path dependency (td-editor first). It carries the
+//! td's dependency-free UI toolkit, shared by td-owned graphical programs
+//! as a Cargo path dependency (td-editor first). It carries the
 //! display-independent input layer, the shared font and wire codecs and the
-//! clipped XRGB raster with its palette and scrollbar geometry, the
-//! Wayland client connection over its own raw descriptor transport
-//! (UNSAFE.md §19) and the client over it (`client`: the object table,
-//! one toplevel surface with its buffers and pointer image, and the turn
-//! loop that drives a consumer's `App`); the device lifecycle, then the
-//! chrome widgets, follow in the order DESIGN.md schedules. Outside
-//! `wayland`, `client` and the private raw module beneath them nothing
-//! reads the environment, a clock, a descriptor or the filesystem:
-//! adapters supply explicit inputs, and `notices` embeds the face's
-//! licence texts at compile time.
+//! clipped XRGB raster with its palette and scrollbar geometry, the Wayland
+//! client connection over its own raw descriptor transport (UNSAFE.md §19)
+//! and the client over it (`client`: the object table, one toplevel surface
+//! with its buffers and pointer image, the seat with its devices and the
+//! clipboard, and the turn loop that drives a consumer's `App`); the chrome
+//! widgets follow in the order DESIGN.md schedules. Outside `wayland`,
+//! `client` and the private raw module beneath them nothing reads the
+//! environment, a clock, a descriptor or the filesystem: adapters supply
+//! explicit inputs, and `notices` embeds the face's licence texts at
+//! compile time.
 
 /// The bitmap cell every consumer lays text out on. The pinned Unifont face
 /// is 8x16 and `font::pinned` is held to these by a test, so pointer hit
@@ -21,6 +21,7 @@ pub const CELL_WIDTH: usize = 8;
 pub const CELL_HEIGHT: usize = 16;
 
 pub mod client;
+pub mod data;
 #[path = "../../td-compositor/src/font.rs"]
 pub mod font;
 #[path = "../../td-compositor/src/font_data.rs"]

@@ -1949,15 +1949,12 @@ device rules that `td-ui/DESIGN.md` records under `client`. When the client
 reports itself bound without a seat, the editor leaves a presentation-only
 window with a notice (the file window refuses to start); this scratch-mode
 exception does not weaken the version-1 required-seat contract below. Other
-globals are ignored, except the data-device manager the clipboard section
-binds by hand. The editor's clipboard objects live in the client's table
-under its `Object` tag: the client hands their events back untouched and
-retires their slots through the tag, and their dynamic IDs follow the
-client's fixed IDs, its seat and its devices. An armed repeat shortens the
-idle wait to its next due time. Caret ticks use monotonic milliseconds since
-the loop starts, immediately before each event and on timer wakes; server
-timestamps are never compared to this clock, which the client is handed with
-each event for the keyboard's repeat timing.
+globals are ignored; the data-device manager is the client's. The editor
+owns no Wayland objects of its own: its `Object` tag is uninhabited. An
+armed repeat shortens the idle wait to its next due time. Caret ticks use
+monotonic milliseconds since the loop starts, immediately before each event
+and on timer wakes; server timestamps are never compared to this clock,
+which the client is handed with each event for the keyboard's repeat timing.
 
 The controller receives complete acknowledged configure sizes: zero axes
 retain the previous configured axis even while a frame is outstanding.
@@ -1978,15 +1975,14 @@ site and one owned-descriptor adoption site) is td-ui's, recorded as
 `UNSAFE.md` §19; the editor's own surface, §14, is the file adapter's
 size-only flistxattr query and renameat2 and the clipboard destination's
 fcntl status commands, through one syscall site that adopts no descriptor
-and changes no transport authorization.
-Endpoint resolution, the borrowed `WAYLAND_SOCKET` and the bounded FIFO
-that owns every incoming descriptor are td-ui's `endpoint`, `connect` and
-`Connection`, under the rules `td-ui/DESIGN.md` records; the adapter
-passes the three environment values it reads and gives the transport
-exclusive use of the stream. The client consumes the `wl_keyboard.keymap`
-right itself and drains a retired keyboard's events; `wl_data_source.send`
-is the editor's one right consumer, parked by the client's loop under its
-rules until the right arrives.
+and changes no transport authorization. Endpoint resolution, the borrowed
+`WAYLAND_SOCKET` and the bounded FIFO that owns every incoming descriptor
+are td-ui's `endpoint`, `connect` and `Connection`, under the rules
+`td-ui/DESIGN.md` records; the adapter passes the three environment values
+it reads and gives the transport exclusive use of the stream. The client
+consumes the `wl_keyboard.keymap` and `wl_data_source.send` rights itself,
+parked by its loop under its rules until they arrive, and hands the editor a
+send's right typed; the editor pops none.
 
 Keymap admission is the client's, under the rules `td-ui/DESIGN.md`
 records and `UNSAFE.md` §19 rosters; there is no fallback physical US
@@ -2007,13 +2003,13 @@ editor asks for at most one repetition per loop turn, after the turn's
 buffered release and focus events, and the timing event carries the
 editor's current tick.
 
-Keyboard capability loss, which the client reports, drops what focus and
-a map allowed and retains text; reacquisition is the client's fresh
-object. Bound-seat removal, which the client reports, also releases the
-editor's clipboard and leaves a notice, without disconnecting or silently
-moving to another seat. Dynamic new-seat selection and multi-seat editing
-are deferred. The clipboard descriptor consumer is separately rostered
-under this crate's data-device contract below.
+Keyboard capability loss, which the client reports, drops what focus and a
+map allowed and retains text; reacquisition is the client's fresh object.
+Bound-seat removal, which the client reports, also releases the editor's
+clipboard and leaves a notice, without disconnecting or silently moving to
+another seat. Dynamic new-seat selection and multi-seat editing are
+deferred. The clipboard destination owner is separately rostered under this
+crate's data-device contract below.
 
 Automated socket tests inspect the actual received pool descriptor and pixels,
 exercise fragmented events, ping/close, version/ID limits, both release/callback
@@ -2319,77 +2315,58 @@ modals. These are observations, not ownership acknowledgements, transfer
 receipts or action authority; no progress, target or terminal history is
 reported. CONTROL.md defines the exact bounded fields and refusal rules.
 
-At initial registry synchronization, a seat plus optional core
-wl_data_device_manager v3 enables one seat-bound data device. Higher versions
-are capped at 3; missing/older globals leave clipboard commands disabled.
-Late-added globals are not rebound. Removing the manager or seat releases
-the device and retained source, cancels I/O and preserves documents. A
-removed manager object has no destructor and remains inert until disconnect.
+The data device is the client's, bound and released under the rules
+`td-ui/DESIGN.md` records; without one, clipboard commands are disabled.
+When the client reports the device released with its manager's global, the
+editor cancels its I/O, drops the retained text and preserves documents, as
+on seat removal above.
 
 Windows Ctrl+C/Ctrl+X/Ctrl+V, Emacs M-w/C-w/C-y and Edit menu Copy/Cut/Paste
 reach the same adapter. Copy/Cut require keyboard focus and the serial from
 the current actual translated key press or left-button menu press. Synthetic
 requests without that serial refuse ownership changes. Repeats never acquire
 ownership or start transfers. Empty selection preserves the existing source;
-oversized selection refuses before copying. A fresh source advertises only
-`text/plain;charset=utf-8` and `text/plain`, both UTF-8. After sending
-set_selection with that input serial, retain the immutable snapshot and then
-admit Cut through the controller. Wayland provides no ownership acknowledgement;
-feedback says the selection was offered. Undo restores a successful Cut.
+oversized selection refuses before copying. The client's fresh source
+becomes the selection at that input serial; the editor retains the immutable
+snapshot behind it and then admits Cut through the controller. Wayland
+provides no ownership acknowledgement; feedback says the selection was
+offered. Undo restores a successful Cut.
 
 The window owns at most one source snapshot, one outgoing writer and one
-incoming transfer. Copy/Cut refuse while a writer is pending, bounding retained
-copy bytes to 1 MiB even when ownership changes. Cancellation of a source
-retires that object while an already-started writer may finish its retained
-snapshot. Busy, unsupported-MIME and retired source sends consume and drop
-exactly their descriptor. Device/source v3 schemas, including unused drag
-events, are fully validated; retired client IDs drain until delete_id.
+incoming transfer. Copy/Cut refuse while a writer is pending, bounding
+retained copy bytes to 1 MiB even when ownership changes. The client reports
+a cancelled source; the editor drops its snapshot while an already-started
+writer may finish. A send the client hands on while a writer is pending
+drops exactly its descriptor.
 
-Server-created offers use a separate bounded map, never the client ID array.
-There are at most 32 retained offers. Inspect only the first 64 MIME
-announcements per offer and retain at most two supported strings, each at
-most 256 bytes. Extra or longer valid MIME announcements are drained and
-ignored rather than disconnecting the editor. Unsupported source sends,
-including long MIME strings, drop their exact descriptor; transient decoded
-strings remain bounded by the wire-frame budget. There is one outstanding
-retirement barrier covering at
-most 32 ID/generation pairs. Retirements after that barrier was sent coalesce
-until its callback, then receive the next barrier. Prefer the explicit UTF-8
-MIME; accept text/plain only as UTF-8. ASCII case variants of these two
-spellings are accepted, preserving the exact offered spelling in receive.
-Unknown encodings or other parameter forms are not guessed.
-Selection replacement, null selection and focus loss cancel incoming Paste
-and destroy obsolete offers. Destroyed server IDs retain schema tombstones
-through a display-sync barrier; a generation tag prevents an old barrier
-from deleting a new offer that reuses the same ID. Drag offers are destroyed
-without accepting or finishing a drop and cannot replace the clipboard.
-There is no PRIMARY selection, middle-click paste or drag-and-drop editing.
-Selection may arrive immediately before keyboard enter, as the protocol
-specifies: retain that offer while unfocused, but refuse Paste until focus.
-Keyboard leave still invalidates and retires the previous selection.
+Offers, their budgets, the selection and its retirement are the client's
+(`td-ui/DESIGN.md`): the editor pastes from the selection's preferred text
+type only, reading the bytes as UTF-8. There is no PRIMARY selection,
+middle-click paste or drag-and-drop editing. A selection the client retained
+while unfocused cannot be pasted until focus.
 
-Paste passes the fresh socket producer endpoint to offer.receive, drops its
-local copy and collects through Incoming. It checks queued protocol events
-before admitting EOF, then uses the same revision/selection-bound controller
-Paste as headless tests. Focus loss, keymap replacement, target/selection
-change, file/discard modal entry, offer replacement and Escape/Ctrl+G cancel.
-Cancellation is checked after each native event, so selection-away-and-back
-events cannot revive a pending paste. Empty EOF leaves the selection intact;
-malformed, oversized and timed-out input never inserts a prefix. Nonempty
-paste is one ordinary Insert transaction, with the documented identical-text
-exception; no Auto Fill or file-format change is applied.
+Paste hands the fresh socket producer endpoint to the client's receive,
+drops its local copy and collects through Incoming. It checks queued
+protocol events before admitting EOF, then uses the same
+revision/selection-bound controller Paste as headless tests. Focus loss,
+keymap replacement, target/selection change, file/discard modal entry, the
+selection's replacement or removal and Escape/Ctrl+G cancel. Cancellation is
+checked after each native event, so selection-away-and-back events cannot
+revive a pending paste. Empty EOF leaves the selection intact; malformed,
+oversized and timed-out input never inserts a prefix. Nonempty paste is one
+ordinary Insert transaction, with the documented identical-text exception;
+no Auto Fill or file-format change is applied.
 
 The event loop services pings/input while bounded transfers are pending and
 caps its receive wait at 10 ms. Transfers retain their absolute five-second
-clock and four-I/O-attempt step budgets. Missing keymap or source-send rights
-use one five-second descriptor deadline after full-schema validation, not
-assumptions about ancillary-message boundaries. Socketpair producers are an
+clock and four-I/O-attempt step budgets. Socketpair producers are an
 experimental compatibility boundary: FIFO-specific writers are unsupported.
 Tests use actual SCM_RIGHTS and pipe/socket endpoints, exact native input
-serials in both key profiles, menu activation, fragmented UTF-8/CRLF, terminal
-cancellation, immutable source data and repeated offer-ID retirement/reuse.
-This does not claim live third-party toolkit clipboard interoperability yet.
-The default software window remains experimental and has no crash recovery.
+serials in both key profiles, menu activation, fragmented UTF-8/CRLF,
+terminal cancellation, and immutable source data; offer retirement and reuse
+are td-ui's tests. This does not claim live third-party toolkit clipboard
+interoperability yet. The default software window remains experimental and
+has no crash recovery.
 
 ### Implemented native Find
 

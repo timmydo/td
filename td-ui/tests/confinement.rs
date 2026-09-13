@@ -23,7 +23,8 @@ fn compact(text: &str) -> String {
     text.chars().filter(|c| !c.is_whitespace()).collect()
 }
 
-const PURE: [&str; 9] = [
+const PURE: [&str; 10] = [
+    "data.rs",
     "keyboard.rs",
     "pointer.rs",
     "raster.rs",
@@ -89,11 +90,11 @@ fn source_inventory_and_shared_mounts_are_closed() {
         assert_eq!(
             text.matches(".pop_descriptor()").count(),
             match name.as_str() {
-                "client.rs" => 2,
+                "client.rs" => 3,
                 "wayland.rs" => 1,
                 _ => 0,
             },
-            "pops: the transport's own test, the client's accessor and its keymap reader: {name}"
+            "pops: the transport's own test, the client's accessor, keymap reader and send: {name}"
         );
         for support in [".unconfigure(", ".input_mut("] {
             assert_eq!(
@@ -267,15 +268,22 @@ fn complete_raw_layer_and_its_sole_caller_are_pinned() {
     assert!(!production.contains("pub struct"));
     assert!(!production.contains("pub(crate) struct"));
     // The transport is the only caller, through exactly these wrappers.
-    // The client is the toolkit's one consumer of a received right: the
-    // keymap reader pops exactly one per `wl_keyboard.keymap`, reads a
-    // regular file positionally and compiles it whole (UNSAFE.md §19).
+    // The client is the toolkit's one consumer of a received right, through
+    // two pops: the keymap reader's, exactly one per `wl_keyboard.keymap`,
+    // reading a regular file positionally and compiling it whole, and the
+    // send's, handed on typed or dropped (UNSAFE.md §19).
     let client = include_str!("../src/client.rs");
     let client = client.split("#[cfg(test)]").next().unwrap();
     assert_eq!(
         client.matches(".pop_descriptor()").count(),
-        2,
-        "the consumer's pop and the keymap consumer"
+        3,
+        "the consumer's pop, the keymap consumer and the send"
+    );
+    assert_eq!(
+        client
+            .matches("Handled::Clipboard(ClipboardEvent::Send(right))")
+            .count(),
+        1
     );
     assert_eq!(client.matches("read_keymap(fd, format, size)").count(), 1);
     assert_eq!(client.matches("File::from(fd)").count(), 1);

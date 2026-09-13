@@ -44,7 +44,6 @@ fn source_inventory_and_allowances_are_closed() {
         "control_jobs.rs",
         "control_socket.rs",
         "control_worker.rs",
-        "data.rs",
         "dialog.rs",
         "directory.rs",
         "files.rs",
@@ -272,12 +271,12 @@ fn complete_raw_layer_and_production_callers_are_pinned() {
     }
     let adapter = include_str!("../src/wayland.rs");
     // The transport and the client over it are td-ui's (UNSAFE.md §19),
-    // the keymap consumer with them: production code reaches each through
-    // one import, owns no connection, object table or keyboard state of
-    // its own, touches the connection only for the four schedule inputs,
-    // dispatches every event through the client and pops exactly one
-    // right, the data source's; the tests add the shared peer support,
-    // and nothing names the editor's own raw module.
+    // both right consumers with them: production code reaches each
+    // through one import, owns no connection, object table, keyboard or
+    // clipboard state of its own, touches the connection only for the
+    // four schedule inputs, dispatches every event through the client and
+    // pops no right; the tests add the shared peer support, and nothing
+    // names the editor's own raw module.
     assert!(!adapter.contains("read_keymap") && !adapter.contains("read_exact_at"));
     assert!(!adapter.contains("Keymap::parse") && !adapter.contains("File::from(fd)"));
     assert_eq!(adapter.matches("crate::sys::").count(), 0);
@@ -294,18 +293,24 @@ fn complete_raw_layer_and_production_callers_are_pinned() {
     assert_eq!(
         production
             .matches(concat!(
-                "use td_ui::client::{\n",
-                "    run, App, Client, Handled, KeyboardEvent, Kind as ClientKind, Tag, ",
-                "DISPLAY, REGISTRY, SURFACE,\n",
-                "};",
+                "use td_ui::client::{run, App, Client, ClipboardEvent, Handled, ",
+                "KeyboardEvent, Tag};",
             ))
+            .count(),
+        1
+    );
+    assert_eq!(
+        production
+            .matches("use td_ui::data::{PLAIN, UTF8};")
             .count(),
         1
     );
     assert!(!production.contains("Connection"));
     assert_eq!(production.matches("Client::new(stream, temporary)?").count(), 1);
     assert_eq!(production.matches("self.client.connection()").count(), 4);
-    assert_eq!(production.matches(".pop_descriptor()").count(), 1);
+    assert_eq!(production.matches(".pop_descriptor()").count(), 0);
+    assert_eq!(production.matches("self.client.receive(").count(), 1);
+    assert_eq!(production.matches("self.client.offer_selection(").count(), 1);
     assert_eq!(production.matches(".unconfigure(").count(), 0);
     assert_eq!(production.matches(".input_mut(").count(), 0);
     assert_eq!(
@@ -323,11 +328,13 @@ fn complete_raw_layer_and_production_callers_are_pinned() {
         adapter.matches("td_ui::wayland::peer::drain(peer)").count(),
         1
     );
+    // The FIFO-order oracle for a malformed send is td-ui's; the editor's
+    // tests push no right by hand.
     assert_eq!(
         adapter
             .matches("td_ui::wayland::peer::push_descriptor(")
             .count(),
-        1
+        0
     );
 }
 

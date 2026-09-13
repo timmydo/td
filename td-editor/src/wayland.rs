@@ -6,12 +6,11 @@ use crate::font::Font;
 use crate::keys::Profile;
 use crate::render::{Geometry, Label};
 use td_ui::raster::{Draw, GlyphStyle, Primitive, Raster, CHROME, INK};
-use td_ui::client::{
-    run, App, Client, Handled, KeyboardEvent, Kind as ClientKind, Tag, DISPLAY, REGISTRY, SURFACE,
-};
+use td_ui::client::{run, App, Client, ClipboardEvent, Handled, KeyboardEvent, Tag};
+use td_ui::data::{PLAIN, UTF8};
 use td_ui::wayland::{connect, endpoint};
 use crate::ui::{Controller, Event, Outcome};
-use crate::wire::{Builder, Cursor, Message};
+use crate::wire::Message;
 use std::collections::VecDeque;
 use std::io;
 use std::os::unix::net::UnixStream;
@@ -25,32 +24,26 @@ fn error(value: impl std::fmt::Display) -> String {
     value.to_string()
 }
 
-/// The editor's own objects in the client's table: the clipboard manager,
-/// device, sources and sync barriers, with the retired states that wait
-/// for `delete_id`. The seat and its devices are the client's.
+/// The editor owns no Wayland objects of its own: the seat's devices and
+/// the clipboard's are the client's.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum Object {
-    ClipboardManager,
-    ClipboardDevice,
-    RetiredClipboardDevice,
-    ClipboardSource,
-    RetiredClipboardSource,
-    ClipboardSync,
-    RetiredClipboardSync,
-}
+enum Object {}
 
 impl Tag for Object {
     fn retired(self) -> bool {
-        matches!(
-            self,
-            Self::RetiredClipboardDevice
-                | Self::RetiredClipboardSource
-                | Self::RetiredClipboardSync
-        )
+        match self {}
     }
 }
 
-type Kind = ClientKind<Object>;
+/// The editor's half of the clipboard: the text behind the client's live
+/// source, and the transfers in flight.
+#[derive(Default)]
+struct Clipboard {
+    text: Option<std::sync::Arc<str>>,
+    incoming: Option<crate::transfer::Incoming>,
+    incoming_target: Option<(crate::model::TabId, u64, crate::model::Selection)>,
+    outgoing: Option<crate::transfer::Outgoing>,
+}
 
 /// The editor's pointer gesture over the client's pointer: the last
 /// position, the held left button and the wheel accumulator.
@@ -85,7 +78,7 @@ struct Window {
     conflict: Option<Conflict>,
     reloading: Option<Target>,
     menu: Option<crate::menu::Menu>,
-    clipboard: crate::data::Clipboard,
+    clipboard: Clipboard,
     activation_serial: Option<u32>,
     search: Option<crate::search::Prompt>,
     number: Option<crate::number::Prompt>,
@@ -320,7 +313,7 @@ impl Window {
             conflict: None,
             reloading: None,
             menu: None,
-            clipboard: crate::data::Clipboard::default(),
+            clipboard: Clipboard::default(),
             activation_serial: None,
             search: None,
             number: None,
@@ -344,7 +337,6 @@ impl Window {
             }
             self.notify("No wl_seat v5+; scratch input unavailable");
         }
-        self.initialize_clipboard()?;
         self.client.set_title(if self.files.is_some() {
             "td-editor — experimental file window"
         } else {
@@ -366,9 +358,6 @@ impl Window {
     }
 
     fn event_inner(&mut self, message: Message) -> Result<()> {
-        if self.clipboard.offers.contains_key(&message.object) {
-            return self.clipboard_offer(message);
-        }
         match self.client.handle(&message, self.clock)? {
             Handled::Done => Ok(()),
             Handled::Bound => self.initialize(),
@@ -401,7 +390,10 @@ impl Window {
                 Ok(())
             }
             Handled::FrameDone => self.frames.complete().map_err(error),
-            Handled::GlobalRemoved { id, required } => self.global_removed(id, required),
+            Handled::GlobalRemoved { required: true, .. } => {
+                Err("required Wayland global was removed".into())
+            }
+            Handled::GlobalRemoved { .. } => Ok(()),
             Handled::Capabilities { keyboard, pointer } => {
                 if !pointer {
                     self.pointer_lost()?;
@@ -415,65 +407,54 @@ impl Window {
             Handled::SeatRemoved => {
                 self.keyboard_lost()?;
                 self.pointer_lost()?;
-                self.release_clipboard()?;
+                self.release_clipboard();
                 self.notify("Seat removed; scratch text retained");
                 Ok(())
             }
             Handled::Keyboard(event) => self.keyboard_event(event),
             Handled::Pointer(event) => self.pointer_event(event),
-            Handled::Unhandled => self.clipboard_event(message),
-        }
-    }
-
-    fn global_removed(&mut self, id: u32, required: bool) -> Result<()> {
-        if self.clipboard.manager.is_some_and(|(name, _)| name == id) {
-            self.release_clipboard()?;
-            self.clipboard.manager = None;
-        }
-        if required {
-            return Err("required Wayland global was removed".into());
-        }
-        Ok(())
-    }
-
-    /// Events for the editor's own objects: the clipboard device, sources
-    /// and sync barriers, which the client hands back untouched.
-    fn clipboard_event(&mut self, message: Message) -> Result<()> {
-        match (self.client.kind(message.object)?, message.opcode) {
-            (Kind::App(Object::ClipboardDevice | Object::RetiredClipboardDevice), _) => {
-                self.clipboard_device(message)
-            }
-            (Kind::App(Object::ClipboardSource | Object::RetiredClipboardSource), _) => {
-                self.clipboard_source(message)
-            }
-            (Kind::App(Object::ClipboardSync), 0) => {
-                let mut cursor = Cursor::new(&message.payload);
-                cursor.u32()?;
-                cursor.finish()?;
-                let id = message.object;
-                let retired = self
-                    .clipboard
-                    .barriers
-                    .remove(&id)
-                    .ok_or("missing clipboard barrier")?;
-                for (offer, sequence) in retired {
-                    if self
-                        .clipboard
-                        .offers
-                        .get(&offer)
-                        .is_some_and(|o| o.retired && o.sequence == sequence)
-                    {
-                        self.clipboard.offers.remove(&offer);
-                    }
-                }
-                self.client.set_tag(id, Object::RetiredClipboardSync)?;
-                self.queue_offer_barrier()
-            }
-            _ => Err(format!(
+            Handled::Clipboard(event) => self.clipboard_event(event),
+            Handled::Unhandled => Err(format!(
                 "unexpected Wayland event {}:{}",
                 message.object, message.opcode
             )),
         }
+    }
+
+    /// The client's clipboard outcomes: the editor's half of each.
+    fn clipboard_event(&mut self, event: ClipboardEvent) -> Result<()> {
+        match event {
+            ClipboardEvent::Selection => {
+                if self.clipboard.incoming.take().is_some() {
+                    self.notify("Paste cancelled: clipboard offer changed.");
+                }
+                self.menu = None;
+                self.frames.invalidate(true);
+            }
+            ClipboardEvent::Send(right) => {
+                if self.clipboard.outgoing.is_some() {
+                    // A busy send drops exactly its right.
+                    drop(right);
+                    return Ok(());
+                }
+                // The client's live source and this text are set together by
+                // `offer_clipboard` and cleared together on `Cancelled` and
+                // release, so a send without text is the editor's own fault.
+                let text = self
+                    .clipboard
+                    .text
+                    .clone()
+                    .ok_or("clipboard source disappeared")?;
+                match crate::transfer::Outgoing::begin(right, text, self.clock) {
+                    Ok(transfer) => self.clipboard.outgoing = Some(transfer),
+                    Err(e) => self.notify(format!("Clipboard send refused: {e}")),
+                }
+            }
+            // An already-started send retains its immutable snapshot.
+            ClipboardEvent::Cancelled => self.clipboard.text = None,
+            ClipboardEvent::Released => self.release_clipboard(),
+        }
+        Ok(())
     }
 
     fn notify(&mut self, detail: impl AsRef<str>) {
@@ -515,7 +496,7 @@ impl Window {
     /// drops what focus and a map allowed and keeps every document.
     fn keyboard_lost(&mut self) -> Result<()> {
         self.searches.cancel_wrap();
-        self.clipboard_focus_lost()?;
+        self.clipboard_focus_lost();
         self.menu = None;
         self.ui.dispatch(Event::Focus(false)).map_err(error)?;
         self.frames.invalidate(true);
@@ -816,7 +797,7 @@ impl Window {
             }
             KeyboardEvent::Focus(false) => {
                 self.searches.cancel_wrap();
-                self.clipboard_focus_lost()?;
+                self.clipboard_focus_lost();
                 self.menu = None;
                 self.ui.dispatch(Event::Focus(false)).map_err(error)?;
                 self.frames.invalidate(true);
@@ -2581,27 +2562,23 @@ impl Window {
     }
 
     fn control_clipboard_state(&self) -> crate::Result<String> {
-        let selection = match self.clipboard.selection {
+        let selection = match self.client.selection() {
             None => "none",
-            Some(id) => match self
-                .clipboard
-                .offers
-                .get(&id)
-                .and_then(crate::data::Offer::mime)
-            {
-                Some(mime) if mime.eq_ignore_ascii_case(crate::data::UTF8) => "utf8",
-                Some(mime) if mime.eq_ignore_ascii_case(crate::data::PLAIN) => "plain",
+            Some(_) => match self.client.selection_mime() {
+                Some(mime) if mime.eq_ignore_ascii_case(UTF8) => "utf8",
+                Some(mime) if mime.eq_ignore_ascii_case(PLAIN) => "plain",
                 _ => "unsupported",
             },
         };
-        let source = self.clipboard.source.as_ref().map_or_else(
-            || "-".to_string(),
-            |(_, text)| text.len().to_string(),
-        );
+        let source = self
+            .clipboard
+            .text
+            .as_ref()
+            .map_or_else(|| "-".to_string(), |text| text.len().to_string());
         Ok(format!(
             "input-generation={}\tdevice={}\tfocus={}\tselection={selection}\tsource-bytes={source}\tincoming={}\toutgoing={}",
             self.frames.input_generation()?,
-            u8::from(self.clipboard.device.is_some()),
+            u8::from(self.client.clipboard()),
             u8::from(self.client.input().focused),
             u8::from(self.clipboard.incoming.is_some()),
             u8::from(self.clipboard.outgoing.is_some()),
@@ -2920,8 +2897,8 @@ impl App for Window {
         &mut self.client
     }
 
-    fn needs_descriptor(&self, message: &Message) -> Result<bool> {
-        self.message_needs_descriptor(message)
+    fn needs_descriptor(&self, _: &Message) -> Result<bool> {
+        Ok(false)
     }
 
     fn descriptor_wait(&mut self) {}
@@ -2973,24 +2950,20 @@ impl Window {
             wrap: self.ui.tab_view(tab).map_err(error)?.soft_wrap,
             line_numbers: self.ui.line_numbers(),
             copy: self.client.input().focused
-                && self.clipboard.device.is_some()
+                && self.client.clipboard()
                 && self.clipboard.outgoing.is_none()
                 && !doc.selection().range().is_empty(),
             copy_path: self.client.input().focused
-                && self.clipboard.device.is_some()
+                && self.client.clipboard()
                 && self.clipboard.outgoing.is_none()
                 && self
                     .files
                     .as_ref()
                     .is_some_and(|files| files.path(tab).is_some()),
             paste: self.client.input().focused
-                && self.clipboard.device.is_some()
+                && self.client.clipboard()
                 && self.clipboard.incoming.is_none()
-                && self
-                    .clipboard
-                    .selection
-                    .and_then(|id| self.clipboard.offers.get(&id).and_then(|o| o.mime()))
-                    .is_some(),
+                && self.client.selection_mime().is_some(),
         };
         if menu.panel(self.ui.geometry()).is_none() {
             self.menu = None;
@@ -4748,252 +4721,27 @@ impl Window {
         Ok(())
     }
 
-    fn initialize_clipboard(&mut self) -> Result<()> {
-        let Some(seat) = self.client.seat() else { return Ok(()) };
-        let Some((name, _)) = self.client.find_global("wl_data_device_manager", 3) else {
-            return Ok(());
-        };
-        let manager = self.client.allocate(Object::ClipboardManager)?;
-        let device = self.client.allocate(Object::ClipboardDevice)?;
-        let mut body = Builder::new();
-        body.u32(name);
-        body.string("wl_data_device_manager")?;
-        body.u32(3);
-        body.u32(manager);
-        self.client.send(REGISTRY, 0, body, None)?;
-        self.client.words(manager, 1, &[device, seat])?;
-        self.clipboard.manager = Some((name, manager));
-        self.clipboard.device = Some(device);
-        Ok(())
-    }
-
-    fn message_needs_descriptor(&self, message: &Message) -> Result<bool> {
-        // Validate the complete schema before deciding to wait for or consume
-        // a right. Server-created offer IDs do not index the client table.
-        if self.clipboard.offers.contains_key(&message.object) {
-            crate::data::offer(message)?;
-            return Ok(false);
-        }
-        match (self.client.kind(message.object)?, message.opcode) {
-            (Kind::App(Object::ClipboardSource) | Kind::App(Object::RetiredClipboardSource), 1) => {
-                crate::data::source(message)?;
-                Ok(true)
-            }
-            _ => Ok(false),
-        }
-    }
-
-    fn retire_offer(&mut self, id: u32) -> Result<()> {
-        let offer = self
-            .clipboard
-            .offers
-            .get_mut(&id)
-            .ok_or("unknown clipboard offer")?;
-        if offer.retired {
-            return Ok(());
-        }
-        offer.retired = true;
-        self.client.words(id, 2, &[])?;
-        self.queue_offer_barrier()
-    }
-
-    fn queue_offer_barrier(&mut self) -> Result<()> {
-        if !self.clipboard.barriers.is_empty() {
-            return Ok(());
-        }
-        let retired: Vec<_> = self
-            .clipboard
-            .offers
-            .iter()
-            .filter(|(_, offer)| offer.retired)
-            .map(|(id, offer)| (*id, offer.sequence))
-            .collect();
-        if retired.is_empty() {
-            return Ok(());
-        }
-        let barrier = self.client.allocate(Object::ClipboardSync)?;
-        self.clipboard.barriers.insert(barrier, retired);
-        self.client.words(DISPLAY, 0, &[barrier])
-    }
-
-    fn clipboard_focus_lost(&mut self) -> Result<()> {
+    /// Focus loss: the client retired the selection; a paste in flight
+    /// is cancelled.
+    fn clipboard_focus_lost(&mut self) {
         if self.clipboard.incoming.take().is_some() {
             self.notify("Paste cancelled: clipboard focus lost.");
         }
-        self.clipboard.selection = None;
-        let offers: Vec<_> = self.clipboard.offers.keys().copied().collect();
-        for offer in offers {
-            self.retire_offer(offer)?;
-        }
-        Ok(())
     }
 
-    fn retire_source(&mut self, id: u32) -> Result<()> {
-        self.client.words(id, 1, &[])?;
-        self.client.set_tag(id, Object::RetiredClipboardSource)
-    }
-
-    fn release_clipboard(&mut self) -> Result<()> {
-        self.clipboard_focus_lost()?;
+    /// The client released the data device, with its seat or its
+    /// manager: the transfers end, the text behind the source is dropped
+    /// and the menu closes.
+    fn release_clipboard(&mut self) {
+        self.clipboard_focus_lost();
         if let Some(transfer) = self.clipboard.outgoing.take() {
             if let Err(e) = transfer.cancel() {
                 self.notify(format!("Clipboard close: {e}"));
             }
         }
-        if let Some((source, _)) = self.clipboard.source.take() {
-            self.retire_source(source)?;
-        }
-        if let Some(device) = self.clipboard.device.take() {
-            self.client.words(device, 2, &[])?;
-            self.client.set_tag(device, Object::RetiredClipboardDevice)?;
-        }
+        self.clipboard.text = None;
         self.menu = None;
         self.frames.invalidate(true);
-        Ok(())
-    }
-
-    fn clipboard_offer(&mut self, message: Message) -> Result<()> {
-        let mime = crate::data::offer(&message)?;
-        let offer = self
-            .clipboard
-            .offers
-            .get_mut(&message.object)
-            .ok_or("unknown clipboard offer")?;
-        if let Some(mime) = mime {
-            if offer.count >= 64 {
-                return Ok(());
-            }
-            offer.count += 1;
-            if mime.len() > 256 {
-                return Ok(());
-            }
-            if !offer.retired {
-                if mime.eq_ignore_ascii_case(crate::data::UTF8) && offer.utf8.is_none() {
-                    offer.utf8 = Some(mime);
-                } else if mime.eq_ignore_ascii_case(crate::data::PLAIN) && offer.plain.is_none() {
-                    offer.plain = Some(mime);
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn clipboard_device(&mut self, message: Message) -> Result<()> {
-        use crate::data::DeviceEvent as D;
-        let event = crate::data::device(&message)?;
-        let active = self.clipboard.device == Some(message.object);
-        if let D::Offer(id) = event {
-            if id < 0xff00_0000 || self.clipboard.offers.get(&id).is_some_and(|o| !o.retired) {
-                return Err("invalid server clipboard offer ID".into());
-            }
-            if !self.clipboard.offers.contains_key(&id)
-                && self.clipboard.offers.len() >= crate::data::OFFER_LIMIT
-            {
-                return Err("clipboard offer budget".into());
-            }
-            self.clipboard.sequence = self
-                .clipboard
-                .sequence
-                .checked_add(1)
-                .ok_or("clipboard offer sequence exhausted")?;
-            self.clipboard.offers.insert(
-                id,
-                crate::data::Offer {
-                    sequence: self.clipboard.sequence,
-                    retired: false,
-                    utf8: None,
-                    plain: None,
-                    count: 0,
-                },
-            );
-            if !active {
-                self.retire_offer(id)?;
-            }
-            return Ok(());
-        }
-        if !active {
-            return Ok(());
-        }
-        match event {
-            D::Selection(id) => {
-                if id != 0 && !self.clipboard.offers.get(&id).is_some_and(|o| !o.retired) {
-                    return Err("selection names unknown or retired offer".into());
-                }
-                if self.clipboard.incoming.take().is_some() {
-                    self.notify("Paste cancelled: clipboard offer changed.");
-                }
-                self.clipboard.selection = (id != 0).then_some(id);
-                let offers: Vec<_> = self
-                    .clipboard
-                    .offers
-                    .keys()
-                    .copied()
-                    .filter(|id| Some(*id) != self.clipboard.selection)
-                    .collect();
-                for offer in offers {
-                    self.retire_offer(offer)?;
-                }
-                self.menu = None;
-                self.frames.invalidate(true);
-            }
-            D::Enter { surface, offer } => {
-                if surface != SURFACE {
-                    return Err("data-device enter for unknown surface".into());
-                }
-                // No drag-and-drop support: refuse the offer without accepting,
-                // finishing or treating it as the clipboard selection.
-                if offer != 0 {
-                    if self.clipboard.selection == Some(offer) {
-                        return Err("drag reused selection offer".into());
-                    }
-                    if self.clipboard.offers.contains_key(&offer) {
-                        self.retire_offer(offer)?;
-                    }
-                }
-            }
-            D::Drag | D::Offer(_) => {}
-        }
-        Ok(())
-    }
-
-    fn clipboard_source(&mut self, message: Message) -> Result<()> {
-        let event = crate::data::source(&message)?;
-        let active = self
-            .clipboard
-            .source
-            .as_ref()
-            .is_some_and(|(id, _)| *id == message.object);
-        match event {
-            crate::data::SourceEvent::Send(mime) => {
-                let fd = self
-                    .client
-                    .pop_descriptor()
-                    .ok_or("missing clipboard destination")?;
-                if active
-                    && matches!(mime.as_str(), crate::data::UTF8 | crate::data::PLAIN)
-                    && self.clipboard.outgoing.is_none()
-                {
-                    let text = self
-                        .clipboard
-                        .source
-                        .as_ref()
-                        .map(|(_, text)| text.clone())
-                        .ok_or("clipboard source disappeared")?;
-                    match crate::transfer::Outgoing::begin(fd, text, self.clock) {
-                        Ok(transfer) => self.clipboard.outgoing = Some(transfer),
-                        Err(e) => self.notify(format!("Clipboard send refused: {e}")),
-                    }
-                }
-                // Unsupported, busy and retired sends drop exactly their fd.
-            }
-            crate::data::SourceEvent::Cancel if active => {
-                self.clipboard.source = None;
-                self.retire_source(message.object)?;
-                // An already-started send retains its immutable snapshot.
-            }
-            _ => {}
-        }
-        Ok(())
     }
 
     fn clipboard_request(
@@ -5002,7 +4750,7 @@ impl Window {
         tab: crate::model::TabId,
         revision: u64,
     ) -> Result<()> {
-        if !self.client.input().focused || self.pointer_modal() || self.clipboard.device.is_none() {
+        if !self.client.input().focused || self.pointer_modal() || !self.client.clipboard() {
             self.notify("Clipboard unavailable: focus the window and require data-device v3.");
             return Ok(());
         }
@@ -5011,16 +4759,10 @@ impl Window {
                 self.notify("Paste already in progress; Escape cancels.");
                 return Ok(());
             }
-            let Some((offer, mime)) = self.clipboard.selection.and_then(|id| {
-                self.clipboard
-                    .offers
-                    .get(&id)
-                    .and_then(|offer| offer.mime())
-                    .map(|mime| (id, mime))
-            }) else {
+            if self.client.selection_mime().is_none() {
                 self.notify("Clipboard has no supported UTF-8 text offer.");
                 return Ok(());
-            };
+            }
             let (transfer, peer) =
                 match crate::transfer::Incoming::begin(self.ui.editor(), tab, revision, self.clock)
                 {
@@ -5030,9 +4772,7 @@ impl Window {
                         return Ok(());
                     }
                 };
-            let mut body = Builder::new();
-            body.string(mime)?;
-            self.client.send(offer, 1, body, Some(&peer))?;
+            self.client.receive(&peer)?;
             drop(peer);
             self.clipboard.incoming = Some(transfer);
             self.clipboard.incoming_target = Some((
@@ -5101,20 +4841,11 @@ impl Window {
         Ok(())
     }
 
+    /// A fresh source becomes the selection at `serial`; the text behind
+    /// it is retained for the sends, and a paste in flight is dropped.
     fn offer_clipboard(&mut self, text: std::sync::Arc<str>, serial: u32) -> Result<()> {
-        let (_, manager) = self.clipboard.manager.ok_or("missing clipboard manager")?;
-        let device = self.clipboard.device.ok_or("missing clipboard device")?;
-        let source = self.client.allocate(Object::ClipboardSource)?;
-        self.client.words(manager, 0, &[source])?;
-        for mime in [crate::data::UTF8, crate::data::PLAIN] {
-            let mut body = Builder::new();
-            body.string(mime)?;
-            self.client.send(source, 0, body, None)?;
-        }
-        self.client.words(device, 1, &[source, serial])?;
-        if let Some((old, _)) = self.clipboard.source.replace((source, text)) {
-            self.retire_source(old)?;
-        }
+        self.client.offer_selection(serial)?;
+        self.clipboard.text = Some(text);
         self.clipboard.incoming = None;
         Ok(())
     }
@@ -5342,8 +5073,9 @@ pub fn file_window(options: FileWindowOptions) -> io::Result<()> {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 mod tests {
     use super::*;
+    type Kind = td_ui::client::Kind<Object>;
     use crate::layout::CELL_WIDTH;
-    use crate::wire;
+    use crate::wire::{self, Builder, Cursor};
     use std::fs::File;
     use std::io::{Read, Write};
     use std::os::fd::OwnedFd;
@@ -5351,7 +5083,10 @@ mod tests {
     use std::path::Path;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Instant;
-    use td_ui::client::{COMPOSITOR, INITIAL_DEADLINE, SHM, SYNC, TOPLEVEL, WM, XDG_SURFACE};
+    use td_ui::client::{
+        COMPOSITOR, DISPLAY, INITIAL_DEADLINE, REGISTRY, SHM, SURFACE, SYNC, TOPLEVEL, WM,
+        XDG_SURFACE,
+    };
     use td_ui::wayland::{backing_file, Connection, Endpoint};
 
     static NEXT_FILE: AtomicU64 = AtomicU64::new(0);
@@ -6143,17 +5878,29 @@ mod tests {
         }
     }
 
+    /// A window whose registry offers a v9 data-device manager beside the
+    /// seat: `(window, peer, keyboard, device)`, focused with the US map.
     fn clipboard_fixture() -> (Window, UnixStream, u32, u32) {
-        let (mut w, peer, keyboard) = seat_fixture();
-        w.event(global(8, "wl_data_device_manager", 9)).unwrap();
-        w.initialize_clipboard().unwrap();
-        let device = w.clipboard.device.unwrap();
-        let (requests, _) = drain(&peer);
-        let mut c = Cursor::new(&requests[0].payload);
-        assert_eq!(c.u32().unwrap(), 8);
-        assert_eq!(c.string().unwrap(), "wl_data_device_manager");
-        assert_eq!(c.u32().unwrap(), 3);
-        assert!(!w.client.is_required(8));
+        let (a, peer) = UnixStream::pair().unwrap();
+        peer.set_read_timeout(Some(Duration::from_millis(10))).unwrap();
+        let mut w = Window::new(a, std::env::temp_dir()).unwrap();
+        for event in [
+            global(1, "wl_compositor", 4),
+            global(2, "wl_shm", 1),
+            global(3, "xdg_wm_base", 1),
+            global(4, "wl_seat", 10),
+            global(8, "wl_data_device_manager", 9),
+        ] {
+            w.event(event).unwrap();
+        }
+        w.event(message(SYNC, 0, &[0])).unwrap();
+        let seat = w.client.seat().unwrap();
+        assert!(w.client.clipboard() && !w.client.is_required(8));
+        let device = 12;
+        assert!(drain(&peer).0.contains(&message(11, 1, &[device, seat])));
+        w.event(message(seat, 0, &[3])).unwrap();
+        let keyboard = w.client.keyboard().unwrap();
+        drain(&peer);
         w.ui = Controller::default();
         w.ui.dispatch(Event::Load("é abc\n".as_bytes())).unwrap();
         w.ui.dispatch(Event::Profile(Profile::Windows)).unwrap();
@@ -6264,17 +6011,21 @@ mod tests {
             menu.selected = 5;
             w.event(message(keyboard, 3, &[7788, 0, 28, 1])).unwrap();
             w.event(message(keyboard, 3, &[8899, 0, 28, 0])).unwrap();
-            let (source, text) = w.clipboard.source.as_ref().unwrap();
+            let source = w.client.source().unwrap();
+            let text = w.clipboard.text.clone().unwrap();
             assert_eq!(text.as_ref(), directory.0.to_str().unwrap());
             assert!(drain(&peer)
                 .0
-                .contains(&message(device, 1, &[*source, 7788])));
-            let previous = w.clipboard.source.as_ref().unwrap().0;
+                .contains(&message(device, 1, &[source, 7788])));
+            let previous = w.client.source().unwrap();
             w.chord("w", false).unwrap(); // No current physical activation.
-            assert_eq!(w.clipboard.source.as_ref().unwrap().0, previous);
+            assert_eq!(w.client.source().unwrap(), previous);
             w.event(message(keyboard, 3, &[9900, 0, 17, 1])).unwrap(); // w
             w.event(message(keyboard, 3, &[9901, 0, 17, 0])).unwrap();
-            assert_eq!(w.clipboard.source.as_ref().unwrap().1.as_ref(), directory.path("child").to_str().unwrap());
+            assert_eq!(
+                w.clipboard.text.as_deref().unwrap(),
+                directory.path("child").to_str().unwrap()
+            );
             assert!(w.spelling_request(1, 0).is_err());
             assert!(!w.file_request("save-as", 1, 0));
             assert!(w.prompt.is_none());
@@ -6339,11 +6090,12 @@ mod tests {
                 w.event(message(keyboard, 3, &[7788, 0, 28, 1])).unwrap();
                 w.event(message(keyboard, 3, &[8899, 0, 28, 0])).unwrap();
                 assert!(w.activation_serial.is_none());
-                let (source, text) = w.clipboard.source.as_ref().unwrap();
+                let source = w.client.source().unwrap();
+                let text = w.clipboard.text.clone().unwrap();
                 assert_eq!(text.as_ref(), expected.to_str().unwrap());
                 assert!(drain(&peer)
                     .0
-                    .contains(&message(device, 1, &[*source, 7788])));
+                    .contains(&message(device, 1, &[source, 7788])));
                 assert_eq!(format!("{:?}", w.ui.editor()), before);
                 w.clipboard_request("copy-path", 1, 0).unwrap();
                 assert!(w.notice.as_deref().unwrap().contains("physical"));
@@ -6381,7 +6133,7 @@ mod tests {
             .position(|item| *item == crate::menu::Item::CopyPath)
             .unwrap();
         key(&mut w, keyboard, 28);
-        assert_eq!(w.clipboard.source.as_ref().unwrap().1.as_ref(), path.to_str().unwrap());
+        assert_eq!(w.clipboard.text.as_deref().unwrap(), path.to_str().unwrap());
         assert!(w.activation_serial.is_none());
         assert_eq!(format!("{:?}", w.ui.editor()), before);
         assert!(!path.exists());
@@ -6399,7 +6151,7 @@ mod tests {
         let (mut w, peer, keyboard, _) = clipboard_fixture();
         w.event(message(keyboard, 4, &[0, 4, 0, 0, 0])).unwrap();
         key(&mut w, keyboard, 46);
-        let old = w.clipboard.source.clone();
+        let old = (w.client.source(), w.clipboard.text.clone());
         drain(&peer);
         w.activation_serial = Some(999);
         w.clipboard_request("copy-path", 1, 0).unwrap();
@@ -6412,7 +6164,7 @@ mod tests {
         assert!(w.notice.as_deref().unwrap().contains("UTF-8"));
         w.clipboard_request("copy-path", 1, 1).unwrap();
         assert!(w.notice.as_deref().unwrap().contains("document changed"));
-        assert_eq!(w.clipboard.source, old);
+        assert_eq!((w.client.source(), w.clipboard.text.clone()), old);
         assert!(drain(&peer).0.is_empty());
         assert_eq!(w.ui.editor().document(1).unwrap().text(), "keep");
         assert!(!w.ui.editor().document(1).unwrap().dirty());
@@ -6429,7 +6181,7 @@ mod tests {
         key(&mut w, keyboard, 28);
         assert!(w.notice.as_deref().unwrap().contains("UTF-8"));
         assert!(w.activation_serial.is_none());
-        assert_eq!(w.clipboard.source, old);
+        assert_eq!((w.client.source(), w.clipboard.text.clone()), old);
         w.clipboard_request("copy-path", 1, 0).unwrap();
         assert!(w.notice.as_deref().unwrap().contains("physical"));
         assert!(drain(&peer).0.is_empty());
@@ -6442,7 +6194,7 @@ mod tests {
         sender.send(source, 1, body, Some(file)).unwrap();
         w.client.connection().read_more().unwrap();
         let event = w.client.connection().take().unwrap().unwrap();
-        assert!(w.message_needs_descriptor(&event).unwrap());
+        assert!(w.client.needs_descriptor(&event).unwrap());
         w.event(event).unwrap();
     }
 
@@ -6460,8 +6212,8 @@ mod tests {
             let code = if profile == Profile::Windows { 46 } else { 17 };
             w.event(message(keyboard, 3, &[1234, 0, code, 1])).unwrap();
             w.event(message(keyboard, 3, &[999, 0, code, 0])).unwrap();
-            let source = w.clipboard.source.as_ref().unwrap().0;
-            assert_eq!(&*w.clipboard.source.as_ref().unwrap().1, "é");
+            let source = w.client.source().unwrap();
+            assert_eq!(w.clipboard.text.as_deref().unwrap(), "é");
             let (requests, _) = drain(&peer);
             assert!(requests.contains(&message(device, 1, &[source, 1234])));
             assert!(w.activation_serial.is_none());
@@ -6474,7 +6226,7 @@ mod tests {
             );
             assert_eq!(w.ui.editor().document(1).unwrap().text(), " abc\n");
             assert_eq!(w.ui.editor().document(1).unwrap().history_depth(), (1, 0));
-            assert_eq!(w.client.kind(source).unwrap(), Kind::App(Object::RetiredClipboardSource));
+            assert_eq!(w.client.kind(source).unwrap(), Kind::RetiredDataSource);
             assert!(w.client.repeat(1000).unwrap().is_none());
             w.ui.dispatch(Event::Edit {
                 tab: 1,
@@ -6490,7 +6242,7 @@ mod tests {
     fn clipboard_copy_requires_serial_and_optional_global_and_pointer_menu_uses_press() {
         let (mut w, peer, _keyboard, device) = clipboard_fixture();
         w.clipboard_request("cut", 1, 0).unwrap();
-        assert!(w.clipboard.source.is_none());
+        assert!(w.client.source().is_none());
         assert_eq!(w.ui.editor().document(1).unwrap().text(), "é abc\n");
         pointer_enter(&mut w);
         w.open_menu(crate::menu::Group::Edit).unwrap();
@@ -6500,11 +6252,10 @@ mod tests {
         pointer_move(&mut w, panel.x + 5, panel.y + 3 * 24 + 5);
         let pointer = w.client.pointer().unwrap();
         w.event(message(pointer, 3, &[777, 0, 0x110, 1])).unwrap();
-        let source = w.clipboard.source.as_ref().unwrap().0;
+        let source = w.client.source().unwrap();
         assert!(drain(&peer).0.contains(&message(device, 1, &[source, 777])));
         w.event(message(REGISTRY, 1, &[8])).unwrap();
-        assert!(w.clipboard.manager.is_none());
-        assert!(w.clipboard.device.is_none());
+        assert!(!w.client.clipboard());
         assert!(!w.client.closed());
         w.open_menu(crate::menu::Group::Edit).unwrap();
         assert!(!w.menu.as_ref().unwrap().enabled(crate::menu::Item::Copy));
@@ -6515,7 +6266,7 @@ mod tests {
         let (mut w, peer, keyboard, _device) = clipboard_fixture();
         w.event(message(keyboard, 4, &[0, 4, 0, 0, 0])).unwrap();
         key(&mut w, keyboard, 46);
-        let source = w.clipboard.source.as_ref().unwrap().0;
+        let source = w.client.source().unwrap();
         drain(&peer);
         w.ui.dispatch(Event::Edit {
             tab: 1,
@@ -6528,7 +6279,7 @@ mod tests {
             .set_read_timeout(Some(Duration::from_secs(1)))
             .unwrap();
         let writer = File::from(OwnedFd::from(writer));
-        source_send(&mut w, &peer, source, crate::data::UTF8, &writer);
+        source_send(&mut w, &peer, source, UTF8, &writer);
         drop(writer);
         assert!(w.clipboard.outgoing.is_some());
         w.tick(1, true).unwrap();
@@ -6578,7 +6329,7 @@ mod tests {
             finish_frame(&mut w, &peer);
 
             // Do not dismiss the notice before a real clipboard transfer.
-            selection_offer(&mut w, device, 0xff00_0010, &[crate::data::UTF8]);
+            selection_offer(&mut w, device, 0xff00_0010, &[UTF8]);
             w.event(message(keyboard, 4, &[0, 4, 0, 0, 0])).unwrap();
             key(
                 &mut w,
@@ -6616,11 +6367,11 @@ mod tests {
             &mut w,
             device,
             0xff00_0010,
-            &[crate::data::PLAIN, crate::data::UTF8],
+            &[PLAIN, UTF8],
         );
         w.clipboard_request("paste", 1, 0).unwrap();
         let (requests, mut files) = drain(&peer);
-        assert_eq!(requests, [text_event(0xff00_0010, 1, crate::data::UTF8)]);
+        assert_eq!(requests, [text_event(0xff00_0010, 1, UTF8)]);
         let mut writer = files.pop().unwrap();
         assert!(files.is_empty());
         writer.write_all(&[0xe4, 0xb8]).unwrap();
@@ -6644,7 +6395,7 @@ mod tests {
     fn clipboard_paste_cancels_on_focus_escape_edit_selection_and_deadline() {
         for action in 0..5 {
             let (mut w, peer, keyboard, device) = clipboard_fixture();
-            selection_offer(&mut w, device, 0xff00_0010, &[crate::data::PLAIN]);
+            selection_offer(&mut w, device, 0xff00_0010, &[PLAIN]);
             w.clipboard_request("paste", 1, 0).unwrap();
             let (_, mut files) = drain(&peer);
             let mut writer = files.pop().unwrap();
@@ -6685,33 +6436,6 @@ mod tests {
     }
 
     #[test]
-    fn clipboard_offer_retirement_barriers_allow_reuse_without_old_barrier_aliasing() {
-        let (mut w, peer, _keyboard, device) = clipboard_fixture();
-        let id = 0xff00_0010;
-        selection_offer(&mut w, device, id, &[crate::data::PLAIN]);
-        w.event(message(device, 5, &[0])).unwrap();
-        let old_barrier = *w.clipboard.barriers.keys().next().unwrap();
-        w.event(text_event(id, 0, crate::data::UTF8)).unwrap(); // retired event drains
-        selection_offer(&mut w, device, id, &[crate::data::PLAIN]);
-        w.event(message(old_barrier, 0, &[0])).unwrap();
-        w.event(message(DISPLAY, 1, &[old_barrier])).unwrap();
-        assert_eq!(
-            w.clipboard.offers.get(&id).unwrap().mime(),
-            Some(crate::data::PLAIN)
-        );
-        for _ in 0..150 {
-            w.event(message(device, 5, &[0])).unwrap();
-            let barrier = *w.clipboard.barriers.keys().next().unwrap();
-            w.event(message(barrier, 0, &[0])).unwrap();
-            w.event(message(DISPLAY, 1, &[barrier])).unwrap();
-            assert!(w.clipboard.offers.is_empty());
-            selection_offer(&mut w, device, id, &[crate::data::PLAIN]);
-            drain(&peer);
-        }
-        assert_eq!(w.clipboard.offers.len(), 1);
-    }
-
-    #[test]
     fn clipboard_selection_before_keyboard_enter_is_retained_but_cannot_paste_unfocused() {
         let (mut w, peer, keyboard, device) = clipboard_fixture();
         w.event(message(keyboard, 2, &[0, SURFACE])).unwrap();
@@ -6719,8 +6443,8 @@ mod tests {
         w.clipboard_request("paste", 1, 0).unwrap();
         assert!(w.clipboard.incoming.is_none());
         assert!(drain(&peer).0.is_empty());
-        assert_eq!(w.clipboard.selection, Some(0xff00_0010));
-        assert!(!w.clipboard.offers.get(&0xff00_0010).unwrap().retired);
+        assert_eq!(w.client.selection(), Some(0xff00_0010));
+        assert!(w.client.selection_mime().is_some());
         focus(&mut w, keyboard);
         w.clipboard_request("paste", 1, 0).unwrap();
         let (requests, files) = drain(&peer);
@@ -6732,72 +6456,25 @@ mod tests {
     }
 
     #[test]
-    fn clipboard_rapid_offer_reuse_coalesces_retirements_behind_one_barrier() {
-        let (mut w, peer, _keyboard, device) = clipboard_fixture();
-        let id = 0xff00_0010;
-        for _ in 0..100 {
-            selection_offer(&mut w, device, id, &[crate::data::PLAIN]);
-            w.event(message(device, 5, &[0])).unwrap();
-            assert_eq!(w.clipboard.barriers.len(), 1);
-            assert_eq!(w.clipboard.offers.len(), 1);
-            drain(&peer); // deliberately withhold callback acknowledgements
-        }
-        let first = *w.clipboard.barriers.keys().next().unwrap();
-        w.event(message(first, 0, &[0])).unwrap();
-        w.event(message(DISPLAY, 1, &[first])).unwrap();
-        assert_eq!(w.clipboard.offers.len(), 1); // first generation cannot remove last
-        let last = *w.clipboard.barriers.keys().next().unwrap();
-        w.event(message(last, 0, &[0])).unwrap();
-        w.event(message(DISPLAY, 1, &[last])).unwrap();
-        assert!(w.clipboard.offers.is_empty());
-        assert!(w.clipboard.barriers.is_empty());
-    }
-
-    #[test]
-    fn clipboard_drag_offer_is_never_the_selection_and_malformed_sends_keep_fd_fifo() {
-        let (mut w, _peer, _keyboard, device) = clipboard_fixture();
-        selection_offer(&mut w, device, 0xff00_0010, &[crate::data::PLAIN]);
-        w.event(message(device, 0, &[0xff00_0011])).unwrap();
-        w.event(text_event(0xff00_0011, 0, crate::data::UTF8))
-            .unwrap();
-        w.event(message(device, 1, &[0, SURFACE, 0, 0, 0xff00_0011]))
-            .unwrap();
-        assert_eq!(w.clipboard.selection, Some(0xff00_0010));
-        assert!(w.clipboard.offers.get(&0xff00_0011).unwrap().retired);
-        let source = w.client.allocate(Object::RetiredClipboardSource).unwrap();
-        let (_reader, writer) = std::io::pipe().unwrap();
-        td_ui::wayland::peer::push_descriptor(w.client.connection(), writer.into()).unwrap();
-        let mut malformed = text_event(source, 1, crate::data::PLAIN);
-        malformed.payload.extend_from_slice(&[0; 4]);
-        assert!(w.message_needs_descriptor(&malformed).is_err());
-        assert!(w.event(malformed).is_err());
-        assert_eq!(w.client.descriptors(), 1);
-        w.event(text_event(source, 1, crate::data::PLAIN)).unwrap();
-        assert_eq!(w.client.descriptors(), 0);
-        assert!(w.clipboard.outgoing.is_none());
-        w.event(message(DISPLAY, 1, &[source])).unwrap();
-    }
-
-    #[test]
     fn clipboard_busy_unsupported_and_retired_sends_close_their_own_rights() {
         let (mut w, peer, keyboard, _device) = clipboard_fixture();
         w.event(message(keyboard, 4, &[0, 4, 0, 0, 0])).unwrap();
         key(&mut w, keyboard, 46);
-        let source = w.clipboard.source.as_ref().unwrap().0;
+        let source = w.client.source().unwrap();
         drain(&peer);
         let (mut first_reader, first_writer) = UnixStream::pair().unwrap();
         first_reader
             .set_read_timeout(Some(Duration::from_secs(1)))
             .unwrap();
         let first_writer = File::from(OwnedFd::from(first_writer));
-        source_send(&mut w, &peer, source, crate::data::PLAIN, &first_writer);
+        source_send(&mut w, &peer, source, PLAIN, &first_writer);
         drop(first_writer);
         assert!(w.clipboard.outgoing.is_some());
         // Busy Copy does not replace the retained source snapshot.
         key(&mut w, keyboard, 46);
-        assert_eq!(w.clipboard.source.as_ref().unwrap().0, source);
+        assert_eq!(w.client.source().unwrap(), source);
         assert!(drain(&peer).0.is_empty());
-        for (index, mime) in [crate::data::UTF8, "image/png", crate::data::PLAIN]
+        for (index, mime) in [UTF8, "image/png", PLAIN]
             .into_iter()
             .enumerate()
         {
@@ -6814,7 +6491,7 @@ mod tests {
             assert_eq!(reader.read(&mut [0]).unwrap(), 0);
             assert_eq!(w.client.descriptors(), 0);
         }
-        assert!(w.clipboard.source.is_none());
+        assert!(w.client.source().is_none());
         w.tick(1, true).unwrap();
         let mut text = String::new();
         first_reader.read_to_string(&mut text).unwrap();
@@ -6825,7 +6502,7 @@ mod tests {
     #[test]
     fn clipboard_deadlines_expire_even_while_protocol_queue_defers_admission() {
         let (mut w, peer, _keyboard, device) = clipboard_fixture();
-        selection_offer(&mut w, device, 0xff00_0010, &[crate::data::UTF8]);
+        selection_offer(&mut w, device, 0xff00_0010, &[UTF8]);
         w.clipboard_request("paste", 1, 0).unwrap();
         let (_, mut files) = drain(&peer);
         let mut writer = files.pop().unwrap();
@@ -6842,51 +6519,11 @@ mod tests {
     }
 
     #[test]
-    fn clipboard_offer_budgets_unknown_ids_and_retired_device_events_are_bounded() {
-        let (mut w, peer, _keyboard, device) = clipboard_fixture();
-        assert!(w.event(message(device, 0, &[31])).is_err());
-        assert!(w.event(message(device, 5, &[0xff00_0000])).is_err());
-        w.event(message(device, 0, &[0xff00_0000])).unwrap();
-        assert!(w.event(message(device, 0, &[0xff00_0000])).is_err());
-        for _ in 0..64 {
-            w.event(text_event(0xff00_0000, 0, "image/png")).unwrap();
-        }
-        w.event(text_event(0xff00_0000, 0, crate::data::UTF8))
-            .unwrap();
-        assert!(w
-            .clipboard
-            .offers
-            .get(&0xff00_0000)
-            .unwrap()
-            .mime()
-            .is_none());
-        for id in 1..32 {
-            w.event(message(device, 0, &[0xff00_0000 + id])).unwrap();
-        }
-        assert!(w.event(message(device, 0, &[0xff00_0100])).is_err());
-        w.release_clipboard().unwrap();
-        drain(&peer);
-        let barriers: Vec<_> = w.clipboard.barriers.keys().copied().collect();
-        for barrier in barriers {
-            w.event(message(barrier, 0, &[0])).unwrap();
-            w.event(message(DISPLAY, 1, &[barrier])).unwrap();
-        }
-        w.event(message(device, 0, &[0xff00_0100])).unwrap();
-        w.event(text_event(0xff00_0100, 0, crate::data::PLAIN))
-            .unwrap();
-        w.event(message(device, 5, &[0xff00_0100])).unwrap();
-        assert!(w.clipboard.offers.get(&0xff00_0100).unwrap().retired);
-        assert!(w.clipboard.selection.is_none());
-        assert_eq!(w.client.kind(device).unwrap(), Kind::App(Object::RetiredClipboardDevice));
-        w.event(message(DISPLAY, 1, &[device])).unwrap();
-    }
-
-    #[test]
     fn clipboard_empty_or_oversized_copy_preserves_the_existing_source() {
         let (mut w, peer, keyboard, _) = clipboard_fixture();
         w.event(message(keyboard, 4, &[0, 4, 0, 0, 0])).unwrap();
         key(&mut w, keyboard, 46);
-        let source = w.clipboard.source.as_ref().unwrap().0;
+        let source = w.client.source().unwrap();
         drain(&peer);
         w.ui.dispatch(Event::Edit {
             tab: 1,
@@ -6896,7 +6533,7 @@ mod tests {
         .unwrap();
         key(&mut w, keyboard, 46);
         assert!(w.notice.as_ref().unwrap().contains("Nothing selected"));
-        assert_eq!(w.clipboard.source.as_ref().unwrap().0, source);
+        assert_eq!(w.client.source().unwrap(), source);
         let large = vec![b'x'; crate::clipboard::MAX_BYTES + 1];
         w.ui.dispatch(Event::Load(&large)).unwrap();
         w.ui.dispatch(Event::Edit {
@@ -6910,8 +6547,8 @@ mod tests {
         .unwrap();
         key(&mut w, keyboard, 46);
         assert!(w.notice.as_ref().unwrap().contains("Copy refused: limit"));
-        assert_eq!(w.clipboard.source.as_ref().unwrap().0, source);
-        assert_eq!(&*w.clipboard.source.as_ref().unwrap().1, "é");
+        assert_eq!(w.client.source().unwrap(), source);
+        assert_eq!(w.clipboard.text.as_deref().unwrap(), "é");
         assert!(drain(&peer).0.is_empty());
         assert_eq!(w.ui.editor().document(2).unwrap().text().as_bytes(), large);
     }
@@ -6920,7 +6557,7 @@ mod tests {
     fn clipboard_empty_eof_reports_ignored_and_preserves_selection() {
         let (mut w, peer, _, device) = clipboard_fixture();
         let selected = w.ui.editor().document(1).unwrap().selection();
-        selection_offer(&mut w, device, 0xff00_0010, &[crate::data::UTF8]);
+        selection_offer(&mut w, device, 0xff00_0010, &[UTF8]);
         w.clipboard_request("paste", 1, 0).unwrap();
         let (_, files) = drain(&peer);
         drop(files);
@@ -6936,33 +6573,11 @@ mod tests {
     }
 
     #[test]
-    fn clipboard_refuses_expired_drag_and_long_or_excessive_mimes_without_disconnecting() {
-        let (mut w, peer, keyboard, device) = clipboard_fixture();
-        w.event(message(device, 0, &[0xff00_0010])).unwrap();
-        w.event(text_event(0xff00_0010, 0, &"x".repeat(257)))
-            .unwrap();
-        w.event(text_event(0xff00_0010, 0, crate::data::UTF8))
-            .unwrap();
-        assert_eq!(
-            w.clipboard.offers.get(&0xff00_0010).unwrap().mime(),
-            Some(crate::data::UTF8)
-        );
-        for _ in 0..100 {
-            w.event(text_event(0xff00_0010, 0, "image/png")).unwrap();
-        }
-        assert_eq!(w.clipboard.offers.get(&0xff00_0010).unwrap().count, 64);
-        w.event(message(keyboard, 2, &[0, SURFACE])).unwrap();
-        let barrier = *w.clipboard.barriers.keys().next().unwrap();
-        w.event(message(barrier, 0, &[0])).unwrap();
-        w.event(message(DISPLAY, 1, &[barrier])).unwrap();
-        assert!(w.clipboard.offers.is_empty());
-        w.event(message(device, 1, &[0, SURFACE, 0, 0, 0xff00_0010]))
-            .unwrap();
-        assert!(!w.client.closed());
-        focus(&mut w, keyboard);
+    fn clipboard_over_long_send_mime_drops_its_right_without_disconnecting() {
+        let (mut w, peer, keyboard, _device) = clipboard_fixture();
         w.event(message(keyboard, 4, &[0, 4, 0, 0, 0])).unwrap();
         key(&mut w, keyboard, 46);
-        let source = w.clipboard.source.as_ref().unwrap().0;
+        let source = w.client.source().unwrap();
         drain(&peer);
         let (mut reader, writer) = UnixStream::pair().unwrap();
         reader
@@ -7562,22 +7177,20 @@ mod tests {
             &mut w,
             device,
             0xff00_0013,
-            &[crate::data::PLAIN, crate::data::UTF8],
+            &[PLAIN, UTF8],
         );
         assert!(clipboard_snapshot(&mut w).contains("\tselection=utf8\t"));
-        w.clipboard.source = Some((99, std::sync::Arc::from("private λ")));
+        // The device's release retires the selection and drops the text
+        // behind the source; the query reports what remains, unread.
+        w.event(message(REGISTRY, 1, &[8])).unwrap();
+        w.clipboard.text = Some(std::sync::Arc::from("private λ"));
         w.client.input_mut().focused = false;
-        w.clipboard.device = None;
         w.search_request("find", 1, 0).unwrap();
         let snapshot = clipboard_snapshot(&mut w);
-        assert!(snapshot.contains("\tdevice=0\tfocus=0\t"));
+        assert!(snapshot.contains("\tdevice=0\tfocus=0\tselection=none\t"));
         assert!(snapshot.contains("\tsource-bytes=10\t"));
         assert!(!snapshot.contains("private"));
         assert!(w.search.is_some());
-        w.clipboard.offers.get_mut(&0xff00_0013).unwrap().retired = true;
-        assert!(clipboard_snapshot(&mut w).contains("\tselection=unsupported\t"));
-        w.clipboard.offers.clear();
-        assert!(clipboard_snapshot(&mut w).contains("\tselection=unsupported\t"));
     }
 
     #[test]
@@ -7587,7 +7200,7 @@ mod tests {
         std::fs::set_permissions(&directory.0, std::fs::Permissions::from_mode(0o700)).unwrap();
         let socket = directory.path("control");
         let (mut w, peer, _keyboard, device) = clipboard_fixture();
-        selection_offer(&mut w, device, 0xff00_0010, &[crate::data::UTF8]);
+        selection_offer(&mut w, device, 0xff00_0010, &[UTF8]);
         w.clipboard_request("paste", 1, 0).unwrap();
         let (_, mut files) = drain(&peer);
         let mut writer = files.pop().unwrap();
@@ -7631,7 +7244,7 @@ mod tests {
     #[test]
     fn clipboard_state_preserves_repeat_and_expired_transfer_until_normal_tick() {
         let (mut w, peer, _keyboard, device) = clipboard_fixture();
-        selection_offer(&mut w, device, 0xff00_0010, &[crate::data::UTF8]);
+        selection_offer(&mut w, device, 0xff00_0010, &[UTF8]);
         w.clipboard_request("paste", 1, 0).unwrap();
         let (_, _writers) = drain(&peer);
         w.client.input_mut().key(106, true).unwrap();
@@ -7871,7 +7484,7 @@ mod tests {
         let (mut w, peer, _keyboard, device) = clipboard_fixture();
         configure(&mut w, 800, 600);
         drain(&peer);
-        selection_offer(&mut w, device, 0xff00_0010, &[crate::data::UTF8]);
+        selection_offer(&mut w, device, 0xff00_0010, &[UTF8]);
         decoded_key(&mut w, "C-v");
         let (_, _writers) = drain(&peer);
         w.client.input_mut().key(106, true).unwrap();
@@ -8171,7 +7784,7 @@ mod tests {
         configure(&mut w, 800, 600);
         pointer_enter(&mut w);
         drain(&peer);
-        selection_offer(&mut w, device, 0xff00_0010, &[crate::data::UTF8]);
+        selection_offer(&mut w, device, 0xff00_0010, &[UTF8]);
         decoded_key(&mut w, "C-v");
         let (_, _writers) = drain(&peer);
         assert!(w.clipboard.incoming.is_some());
@@ -8586,7 +8199,7 @@ mod tests {
         let (mut w, peer, _keyboard, device) = clipboard_fixture();
         configure(&mut w, 800, 600);
         pointer_enter(&mut w);
-        selection_offer(&mut w, device, 0xff00_0010, &[crate::data::UTF8]);
+        selection_offer(&mut w, device, 0xff00_0010, &[UTF8]);
         drain(&peer);
         for index in [2, 3, 4] {
             let header = w.ui.geometry().menu(Group::Edit.index()).unwrap();
@@ -8597,7 +8210,7 @@ mod tests {
             assert_eq!(w.menu.as_ref().unwrap().selected, index as usize);
             remote_pointer(&mut w, "press", x, y, false);
             assert!(w.menu.is_none());
-            assert!(w.clipboard.source.is_none() && w.activation_serial.is_none());
+            assert!(w.client.source().is_none() && w.activation_serial.is_none());
             assert_eq!(w.ui.editor().document(1).unwrap().text(), "é abc\n");
             if index == 4 {
                 assert!(w.clipboard.incoming.is_some());
@@ -8686,7 +8299,7 @@ mod tests {
         let (mut w, peer, _keyboard, device) = clipboard_fixture();
         configure(&mut w, 800, 600);
         pointer_enter(&mut w);
-        selection_offer(&mut w, device, 0xff00_0010, &[crate::data::UTF8]);
+        selection_offer(&mut w, device, 0xff00_0010, &[UTF8]);
         let header = w.ui.geometry().menu(Group::Edit.index()).unwrap();
         remote_pointer(&mut w, "press", header.x, header.y, false);
         let panel = w.menu.as_ref().unwrap().panel(w.ui.geometry()).unwrap();
@@ -8788,7 +8401,7 @@ mod tests {
         let (mut w, peer, _keyboard, device) = clipboard_fixture();
         configure(&mut w, 800, 600);
         drain(&peer);
-        selection_offer(&mut w, device, 0xff00_0010, &[crate::data::UTF8]);
+        selection_offer(&mut w, device, 0xff00_0010, &[UTF8]);
         decoded_key(&mut w, "C-v");
         let (_, mut files) = drain(&peer);
         let mut writer = files.pop().unwrap();
@@ -9077,13 +8690,13 @@ mod tests {
         drain(&peer);
         for chord in ["C-c", "C-x"] {
             decoded_key(&mut w, chord);
-            assert!(w.clipboard.source.is_none());
+            assert!(w.client.source().is_none());
             assert!(w.activation_serial.is_none());
             assert_eq!(w.ui.editor().document(1).unwrap().text(), "é abc\n");
             assert!(w.notice.as_ref().unwrap().contains("physical"));
             assert!(drain(&peer).0.is_empty());
         }
-        selection_offer(&mut w, device, 0xff00_0010, &[crate::data::UTF8]);
+        selection_offer(&mut w, device, 0xff00_0010, &[UTF8]);
         decoded_key(&mut w, "C-v");
         let (_, mut files) = drain(&peer);
         let mut writer = files.pop().unwrap();
@@ -9111,7 +8724,7 @@ mod tests {
     fn remote_key_transport_failure_stops_native_dispatch_and_drawing() {
         let (mut w, peer, _keyboard, device) = clipboard_fixture();
         configure(&mut w, 800, 600);
-        selection_offer(&mut w, device, 0xff00_0010, &[crate::data::UTF8]);
+        selection_offer(&mut w, device, 0xff00_0010, &[UTF8]);
         drain(&peer);
         drop(peer);
         let request = decoded_key_request(&w, "C-v");
@@ -12111,7 +11724,7 @@ mod tests {
     #[test]
     fn remote_selection_cancels_paste_and_repeat_only_after_success() {
         let (mut w, peer, keyboard, device) = clipboard_fixture();
-        selection_offer(&mut w, device, 0xff00_0010, &[crate::data::UTF8]);
+        selection_offer(&mut w, device, 0xff00_0010, &[UTF8]);
         w.clipboard_request("paste", 1, 0).unwrap();
         let (_, _writer) = drain(&peer);
         let before = crate::control::state(&w.ui);
@@ -12349,7 +11962,7 @@ mod tests {
     fn native_idempotent_mode_admission_cancels_paste_and_requests_redraw() {
         let (mut w, peer, _keyboard, device) = clipboard_fixture();
         assert!(!w.ui.editor().document(1).unwrap().auto_fill());
-        selection_offer(&mut w, device, 0xff00_0010, &[crate::data::UTF8]);
+        selection_offer(&mut w, device, 0xff00_0010, &[UTF8]);
         w.clipboard_request("paste", 1, 0).unwrap();
         let (_, _writer) = drain(&peer);
         assert!(w.clipboard.incoming.is_some());
@@ -14830,8 +14443,19 @@ mod tests {
             w.event(event).unwrap();
         }
         w.event(message(SYNC, 0, &[0])).unwrap();
-        let manager = w.clipboard.manager.unwrap().1;
         let (requests, descriptors) = drain(&peer);
+        let manager = requests
+            .iter()
+            .filter(|request| request.object == REGISTRY)
+            .find_map(|request| {
+                let mut payload = Cursor::new(&request.payload);
+                payload.u32().unwrap();
+                (payload.string().unwrap() == "wl_data_device_manager").then(|| {
+                    payload.u32().unwrap();
+                    payload.u32().unwrap()
+                })
+            })
+            .unwrap();
         assert!(descriptors.is_empty());
         let mut created = Vec::new();
         for request in requests {

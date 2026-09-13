@@ -1,28 +1,27 @@
-//! Bounded core data-device v3 state and exact event decoding.
+//! Bounded core data-device v3 decoding and the offer record the client
+//! keeps per server-created `wl_data_offer`: exact schemas for the device,
+//! source and offer events, the two text MIME spellings a consumer offers
+//! and accepts, and the budgets on offers and their announcements. No
+//! display, descriptor, environment or clock is accessed.
 
 use crate::wire::{Cursor, Message};
-use std::collections::BTreeMap;
-use std::sync::Arc;
 
-pub(crate) const UTF8: &str = "text/plain;charset=utf-8";
-pub(crate) const PLAIN: &str = "text/plain";
-pub(crate) const OFFER_LIMIT: usize = 32;
+/// The explicit UTF-8 text MIME, preferred when an offer carries both.
+pub const UTF8: &str = "text/plain;charset=utf-8";
+/// Plain text, accepted as UTF-8 only.
+pub const PLAIN: &str = "text/plain";
+/// Retained offers, live and retired, at most.
+pub const OFFER_LIMIT: usize = 32;
+/// MIME announcements inspected per offer; later ones are drained.
+pub const ANNOUNCEMENTS: usize = 64;
+/// The longest MIME announcement retained.
+pub const MIME_BYTES: usize = 256;
 
-#[derive(Default)]
-pub(crate) struct Clipboard {
-    pub manager: Option<(u32, u32)>, // registry name, client object
-    pub device: Option<u32>,
-    pub source: Option<(u32, Arc<str>)>,
-    pub selection: Option<u32>,
-    pub offers: BTreeMap<u32, Offer>,
-    pub barriers: BTreeMap<u32, Vec<(u32, u64)>>,
-    pub sequence: u64,
-    pub incoming: Option<crate::transfer::Incoming>,
-    pub incoming_target: Option<(crate::model::TabId, u64, crate::model::Selection)>,
-    pub outgoing: Option<crate::transfer::Outgoing>,
-}
-
-pub(crate) struct Offer {
+/// One server-created offer: its generation, whether it was destroyed
+/// (and waits for its barrier), the exact spellings of the two supported
+/// MIMEs it announced, and how many announcements were inspected.
+#[derive(Debug, Eq, PartialEq)]
+pub struct Offer {
     pub sequence: u64,
     pub retired: bool,
     pub utf8: Option<String>,
@@ -31,6 +30,8 @@ pub(crate) struct Offer {
 }
 
 impl Offer {
+    /// The MIME to receive with, the explicit UTF-8 spelling preferred;
+    /// none for a retired offer or one without a supported text type.
     pub fn mime(&self) -> Option<&str> {
         if self.retired {
             None
@@ -38,17 +39,35 @@ impl Offer {
             self.utf8.as_deref().or(self.plain.as_deref())
         }
     }
+
+    /// Records one announcement under the budgets: at most
+    /// `ANNOUNCEMENTS` inspected, longer ones and later duplicates ignored,
+    /// nothing retained on a retired offer.
+    pub fn announce(&mut self, mime: String) {
+        if self.count >= ANNOUNCEMENTS {
+            return;
+        }
+        self.count += 1;
+        if mime.len() > MIME_BYTES || self.retired {
+            return;
+        }
+        if mime.eq_ignore_ascii_case(UTF8) && self.utf8.is_none() {
+            self.utf8 = Some(mime);
+        } else if mime.eq_ignore_ascii_case(PLAIN) && self.plain.is_none() {
+            self.plain = Some(mime);
+        }
+    }
 }
 
 #[derive(Debug, Eq, PartialEq)]
-pub(crate) enum DeviceEvent {
+pub enum DeviceEvent {
     Offer(u32),
     Enter { surface: u32, offer: u32 },
     Selection(u32),
     Drag,
 }
 
-pub(crate) fn device(message: &Message) -> Result<DeviceEvent, String> {
+pub fn device(message: &Message) -> Result<DeviceEvent, String> {
     let mut c = Cursor::new(&message.payload);
     let event = match message.opcode {
         0 => DeviceEvent::Offer(c.u32()?),
@@ -77,7 +96,7 @@ pub(crate) fn device(message: &Message) -> Result<DeviceEvent, String> {
 }
 
 #[derive(Debug, Eq, PartialEq)]
-pub(crate) enum SourceEvent {
+pub enum SourceEvent {
     Send(String),
     Cancel,
     Other,
@@ -92,12 +111,12 @@ fn mime(value: String) -> Result<String, String> {
 
 fn action(value: u32) -> Result<(), String> {
     if !matches!(value, 0 | 1 | 2 | 4) {
-        return Err("invalid data-device action".into());
+        return Err("invalid data action".into());
     }
     Ok(())
 }
 
-pub(crate) fn source(message: &Message) -> Result<SourceEvent, String> {
+pub fn source(message: &Message) -> Result<SourceEvent, String> {
     let mut c = Cursor::new(&message.payload);
     let event = match message.opcode {
         0 => {
@@ -119,7 +138,7 @@ pub(crate) fn source(message: &Message) -> Result<SourceEvent, String> {
     Ok(event)
 }
 
-pub(crate) fn offer(message: &Message) -> Result<Option<String>, String> {
+pub fn offer(message: &Message) -> Result<Option<String>, String> {
     let mut c = Cursor::new(&message.payload);
     let result = match message.opcode {
         0 => Some(mime(c.string()?)?),
@@ -238,5 +257,40 @@ mod tests {
         }
         assert!(source(&text(1, &"x".repeat(257))).is_ok());
         assert!(offer(&text(0, &"x".repeat(257))).is_ok());
+    }
+
+    #[test]
+    fn announcements_are_budgeted_and_the_explicit_utf8_spelling_is_preferred() {
+        let mut offer = Offer {
+            sequence: 1,
+            retired: false,
+            utf8: None,
+            plain: None,
+            count: 0,
+        };
+        offer.announce("x".repeat(MIME_BYTES + 1));
+        offer.announce("Text/Plain".into());
+        offer.announce(PLAIN.into());
+        assert_eq!((offer.mime(), offer.count), (Some("Text/Plain"), 3));
+        for _ in 0..ANNOUNCEMENTS {
+            offer.announce("image/png".into());
+        }
+        assert_eq!(offer.count, ANNOUNCEMENTS);
+        offer.announce("TEXT/PLAIN;CHARSET=UTF-8".into());
+        assert_eq!(offer.mime(), Some("Text/Plain"), "over budget: ignored");
+        let mut offer = Offer {
+            sequence: 2,
+            retired: false,
+            utf8: None,
+            plain: None,
+            count: 0,
+        };
+        offer.announce(PLAIN.into());
+        offer.announce("TEXT/PLAIN;CHARSET=UTF-8".into());
+        assert_eq!(offer.mime(), Some("TEXT/PLAIN;CHARSET=UTF-8"));
+        offer.retired = true;
+        assert_eq!(offer.mime(), None);
+        offer.announce(UTF8.into());
+        assert_eq!(offer.count, 3, "retired offers drain their announcements");
     }
 }

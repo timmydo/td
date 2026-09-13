@@ -6,49 +6,50 @@ keyboard translation, repeat policy and pointer decoding, the clipped XRGB
 raster with its palette and scrollbar geometry, the Wayland client
 connection over its own raw descriptor transport, and the client over it
 (object table, registry, one toplevel surface with its buffers and frame
-callback, the seat with its keyboard and pointer, the pointer image and the
-turn loop), all moved out of td-editor; the clipboard's device lifecycle and
-the chrome widgets (menus, prompts, lists, tabs, status rows) that td-editor
-draws follow by the increments below. td-editor is its first consumer; the
-installer front end `td-setup` and td-portal's file chooser follow. This
-document is the component contract and the starting point for successive
-agents; the root `AGENTS.md` and `DEVELOPMENT.md` still govern changes and
-submission.
+callback, the seat with its keyboard and pointer, the clipboard's data
+device with its offers and sources, the pointer image and the turn loop),
+all moved out of td-editor; the chrome widgets (menus, prompts, lists, tabs,
+status rows) that td-editor draws follow by the increments below. td-editor
+is its first consumer; the installer front end `td-setup` and td-portal's
+file chooser follow. This document is the component contract and the
+starting point for successive agents; the root `AGENTS.md` and
+`DEVELOPMENT.md` still govern changes and submission.
 
 ## Status and scope
 
 The crate exists and carries, unchanged in behaviour, what has moved out of
 td-editor so far: the bounded XKB text-v1 keymap compiler (`keyboard`,
 `xkb`), the explicit-clock held-key and repeat policy (`repeat`),
-`wl_pointer` event decoding with axis-frame accumulation (`pointer`), and
-the clipped, allocation-free XRGB painter over the pinned face (`raster`):
-rectangle and glyph primitives, the integer scale, the warm palette,
-scrollbar geometry, the text-run painter and the `Raster` that writes a
-`Composition`'s draws into a caller-owned buffer, with the face's provenance
-and licence texts embedded in `notices`; and the Wayland client connection
-(`wayland`): display endpoint resolution from explicit environment values,
-the bounded connect, request framing with at most one descriptor per send,
-the receive path that owns every delivered right until an event's consumer
-takes it, the startup and write deadlines, the unlinked private pool file
-and the pointer image, over the private raw module `sys` that `UNSAFE.md`
-§19 records; and the client over that connection (`client`): the object
-table with its fixed and dynamic ids, the registry with its budgets, the
-three globals every consumer binds, one toplevel surface with its SHM
-buffers and frame callback, the seat with the keyboard and pointer its
-capabilities give (the keymap right consumed and compiled, focus, held keys,
-the modifier snapshot and repeat timing applied, pointer events decoded and
-the pointer image shown on enter), and the turn loop that drives a
-consumer's `App` under the startup deadline. It re-mounts the compositor's
-`font`, `font_data` and `wire` sources exactly as td-editor did, so there is
-still one Unifont face and one wire codec in the tree, and it owns the 8x16
-cell constants every consumer lays text out on. td-editor depends on it by
-path and uses those modules through the crate's public surface.
+`wl_pointer` event decoding with axis-frame accumulation (`pointer`), the
+core data-device decoding with the offer record and its budgets (`data`),
+and the clipped, allocation-free XRGB painter over the pinned face
+(`raster`): rectangle and glyph primitives, the integer scale, the warm
+palette, scrollbar geometry, the text-run painter and the `Raster` that
+writes a `Composition`'s draws into a caller-owned buffer, with the face's
+provenance and licence texts embedded in `notices`; and the Wayland client
+connection (`wayland`): display endpoint resolution from explicit
+environment values, the bounded connect, request framing with at most one
+descriptor per send, the receive path that owns every delivered right until
+an event's consumer takes it, the startup and write deadlines, the unlinked
+private pool file and the pointer image, over the private raw module `sys`
+that `UNSAFE.md` §19 records; and the client over that connection
+(`client`): the object table with its fixed and dynamic ids, the registry
+with its budgets, the three globals every consumer binds, one toplevel
+surface with its SHM buffers and frame callback, the seat with the keyboard
+and pointer its capabilities give (the keymap right consumed and compiled,
+focus, held keys, the modifier snapshot and repeat timing applied, pointer
+events decoded and the pointer image shown on enter), the clipboard's data
+device with its offers, barriers and sources (the send right consumed and
+handed on), and the turn loop that drives a consumer's `App` under the
+startup deadline. It re-mounts the compositor's `font`, `font_data` and
+`wire` sources exactly as td-editor did, so there is still one Unifont face
+and one wire codec in the tree, and it owns the 8x16 cell constants every
+consumer lays text out on. td-editor depends on it by path and uses those
+modules through the crate's public surface.
 
-Not yet moved: the clipboard's device lifecycle (the data-device manager,
-device, offers, sources and sync barriers), the widgets, and the second
-and third consumers. The increments below schedule them. td-editor's
-window is the first `App`; its clipboard objects live in the client's
-table under the editor's own tag until the clipboard increment.
+Not yet moved: the widgets, and the second and third consumers. The
+increments below schedule them. td-editor's window is the first `App`; it
+owns no Wayland objects of its own.
 
 ## Purpose and trust position
 
@@ -100,6 +101,12 @@ of its own files may name each module.
 - `pointer`: `Event`, `decode` for `wl_pointer` v5 through v7 events and
   `Wheel`, which accumulates axis, axis-discrete and axis-value120 input
   into whole cell rows and columns per frame.
+- `data`: `DeviceEvent`, `SourceEvent`, `device`, `source` and `offer`, the
+  exact core data-device v3 schemas; `Offer`, the record the client keeps
+  per server offer, with `mime`, its preferred supported text type, and
+  `announce` under the budgets; `UTF8` and `PLAIN`, the two text MIMEs a
+  consumer offers and accepts; `OFFER_LIMIT`, `ANNOUNCEMENTS` and
+  `MIME_BYTES`.
 - `raster`: `Rect`, `Scale` (1 through 4), `Weight`, `GlyphStyle`,
   `Primitive`, `Draw`, `Surface`, the `Composition` trait, `Scrollbar`,
   `text_run`, `Raster`, `Error`, the axis and frame-byte ceilings and the
@@ -137,9 +144,10 @@ of its own files may name each module.
 - `client`: `Client<T>` over one `Connection`, with the consumer's own
   object kinds as `T: Tag` (`retired` says which of them wait for
   `delete_id`) inside `Kind<T>`, beside the client's own (the fixed slots,
-  pools, buffers, frames, the pointer image's, and the seat, keyboard and
-  pointer with their retired states); the fixed ids `DISPLAY` through
-  `TOPLEVEL` and the budgets `OBJECTS`, `GLOBALS`, `NAME_BYTES`, `BUFFERS`,
+  pools, buffers, frames, the pointer image's, the seat, keyboard and
+  pointer, and the data-device manager, device, sources and sync barriers,
+  with their retired states); the fixed ids `DISPLAY` through `TOPLEVEL` and
+  the budgets `OBJECTS`, `GLOBALS`, `NAME_BYTES`, `BUFFERS`,
   `MESSAGES_PER_TURN` and `INITIAL_DEADLINE`; `new`, the table (`allocate`
   and `set_tag` for the consumer's own objects, `kind` for any slot), the
   registry (`find_global`, `global_name`, `bind`, `required`, `is_required`,
@@ -150,26 +158,32 @@ of its own files may name each module.
   rule; `buffers`, `pixels`, `frame_callback`), the devices (`seat`,
   `keyboard`, `pointer`, `entered` for the pointer's enter serial, `input`
   for the keyboard's state, and the repeat half of that state a consumer
-  drives: `cancel_repeat`, `arm`, `repeat` and `wait_ms`), the pointer
-  image's `cursor`, the state accessors `bound`, `configured` and `closed`,
-  `words`, `send` and `pop_descriptor` with the pending `descriptors` count,
-  `needs_descriptor` for the keymap right the client consumes, `connection`
-  for the schedule inputs, and `handle`, which takes the consumer's clock,
-  consumes what is the client's in an event and returns `Handled`: `Done`,
-  `Bound`, `Configure`, `CloseRequested`, `FrameDone`, `GlobalRemoved`,
-  `Capabilities`, `SeatRemoved`, `Keyboard` with a `KeyboardEvent`
-  (`Keymap`, `Focus`, `Ready`, `Key` with its serial, key and `Stroke`,
-  `Refused`), `Pointer` with the decoded `pointer::Event`, or `Unhandled`
-  for the consumer's own objects. `App` (`client`, `needs_descriptor` for
-  the consumer's own rights, `descriptor_wait`, `tick`, `event`, `end_turn`,
-  `draw`) is what `run` drives: the registry request and initial sync under
-  the startup deadline, then, until the client is closed, at most
-  `MESSAGES_PER_TURN` events per turn with one event parked while its right
-  has not arrived (the client's keymaps and the consumer's rights alike,
-  cancelling repeat), the consumer's end of turn and draw, and the
-  transport's wait. `unconfigure` and `input_mut` are test support, public
-  because a consumer's tests are another crate and hidden from the crate's
-  documentation.
+  drives: `cancel_repeat`, `arm`, `repeat` and `wait_ms`), the clipboard
+  (`clipboard` for a live data device, `selection` and `selection_mime` for
+  the seat's selection and its preferred text type, `receive` to ask it for
+  its text over a consumer's endpoint, `offer_selection` to offer text at a
+  serial, and `source` for the live source whose text the consumer keeps),
+  the pointer image's `cursor`, the state accessors `bound`, `configured`
+  and `closed`, `words`, `send` and `pop_descriptor` with the pending
+  `descriptors` count, `needs_descriptor` for the keymap and send rights the
+  client consumes, `connection` for the schedule inputs, and `handle`, which
+  takes the consumer's clock, consumes what is the client's in an event and
+  returns `Handled`: `Done`, `Bound`, `Configure`, `CloseRequested`,
+  `FrameDone`, `GlobalRemoved`, `Capabilities`, `SeatRemoved`, `Keyboard`
+  with a `KeyboardEvent` (`Keymap`, `Focus`, `Ready`, `Key` with its serial,
+  key and `Stroke`, `Refused`), `Pointer` with the decoded `pointer::Event`,
+  `Clipboard` with a `ClipboardEvent` (`Selection`, `Send` carrying the
+  right to write the offered text to, `Cancelled`, `Released`), or
+  `Unhandled` for the consumer's own objects. `App` (`client`,
+  `needs_descriptor` for the consumer's own rights, `descriptor_wait`,
+  `tick`, `event`, `end_turn`, `draw`) is what `run` drives: the registry
+  request and initial sync under the startup deadline, then, until the
+  client is closed, at most `MESSAGES_PER_TURN` events per turn with one
+  event parked while its right has not arrived (the client's keymaps and
+  sends and the consumer's rights alike, cancelling repeat), the consumer's
+  end of turn and draw, and the transport's wait. `unconfigure` and
+  `input_mut` are test support, public because a consumer's tests are
+  another crate and hidden from the crate's documentation.
 
 ## Invariants
 
@@ -260,6 +274,36 @@ of its own files may name each module.
   enter must name the surface, is remembered as `entered` until leave, and
   shows the pointer image at its serial, or on ARGB's arrival while inside;
   the image is built once, and later enters only re-send `set_cursor`.
+- The clipboard: one seat-bound data device over core v3, bound after the
+  seat at the v3 cap and not required, only when the initial registry offers
+  both, its manager and device taking the two ids after the seat's; a
+  manager advertised later is not bound. Offers are the server's ids at or
+  above 0xff000000, at most `OFFER_LIMIT` retained, live and retired
+  together, and a live id never reoffered, either an error; each offer's
+  first `ANNOUNCEMENTS` MIMEs are inspected and later ones drained and
+  ignored, of which the two text spellings, in any ASCII case and up to
+  `MIME_BYTES`, are kept as announced, the explicit UTF-8 one preferred and
+  no other encoding or parameter form considered. The selection names a live
+  offer or nothing and retires every other; keyboard leave, keyboard loss
+  and the device's release retire every offer and clear the selection; a
+  drag's offer is retired without accepting, finishing or selecting it, a
+  drag naming the selection's offer is an error, and a retired device's
+  offers are retired at once. A retired offer is destroyed once and its id
+  dropped behind one outstanding `wl_display.sync`, a batch of retirements
+  sharing one, by id and generation, so an id reused before the callback
+  survives it; retirements while one is outstanding coalesce behind the
+  next. `offer_selection` creates a source advertising `UTF8` then `PLAIN`
+  and sets the selection at the consumer's serial, destroying the previous
+  source; a send on the live source for either MIME, in any ASCII case, pops
+  its right and hands it on as `Send`, any other send (a retired source's,
+  another MIME's) pops and drops exactly its right, and the compositor's
+  cancel destroys the live source and is `Cancelled`. Removal of the
+  manager's global releases the source and device and is `Released`; seat
+  removal retires the offers with the keyboard, then releases the pointer,
+  the source and the device, then the seat; the manager has no destructor
+  and stays inert, and a retired device's events are schema-checked and
+  drained until `delete_id`. Every event schema is checked whole before a
+  right is waited for or consumed.
 - The repeat policy (`repeat`): held keys up to the held-set budget;
   focus gain installs its held keys without typing or arming repeat, and
   presses wait for the modifier snapshot that follows; duplicate presses
@@ -346,27 +390,36 @@ everything; a refused map disabling input, an unsupported format dropping
 its right unread and every keyboard schema refusal; capability loss
 releasing a device, retired devices drained until `delete_id` and a lost
 keyboard's in-flight keymap dropped; seat removal releasing both devices and
-the seat and forgetting the global; the complete loop on a thread accepting
-split events and closing cleanly; and the loop parking an event until its
-right arrives, in wire order, with the idle wait restored. Twelve of these
-moved from td-editor's window tests (the presentation nine, the pointer
-image, the seat binding and the keymap reader's shared-offset and bad-source
-oracle, the last a unit test beside `read_keymap`); the editor keeps its
-clipboard and control coverage and its reactions to the client's device
-outcomes.
+the seat and forgetting the global; the data device bound after the seat at
+v3 or not at all; offers budgeted, selected and retired behind one barrier
+by generation; focus loss, drags and a retired device retiring offers and
+the selection; a source offering both text MIMEs, its sends handed on or
+dropped with their rights, a malformed send leaving the FIFO alone, and its
+retirement on cancel or replacement; manager and seat removal releasing the
+source and device in order; the complete loop on a thread accepting split
+events and closing cleanly; and the loop parking an event until its right
+arrives, in wire order, with the idle wait restored. Sixteen of these moved
+from td-editor's window tests (the presentation nine, the pointer image, the
+seat binding, the keymap reader's shared-offset and bad-source oracle, the
+last a unit test beside `read_keymap`, and the clipboard lifecycle four:
+offer retirement and reuse, coalesced barriers, drag offers with the
+malformed-send FIFO oracle, and offer budgets with a retired device); the
+editor keeps its transfer, request and control coverage and its reactions to
+the client's device and clipboard outcomes.
 
 `tests/confinement.rs` pins the source inventory, the exact three shared
-source mounts, the absence of ambient I/O in pure modules, that `notices`
-is three embedded texts and nothing else, the absence of `include!`,
-`cfg_attr` and any dependency declaration, that the shared sources bind no
-input interface, and the raw layer: the complete fingerprint of `sys.rs`,
-its syscall and flag values, its two function-only allowances, the single
+source mounts, the absence of ambient I/O in pure modules, that `notices` is
+three embedded texts and nothing else, the absence of `include!`, `cfg_attr`
+and any dependency declaration, that the shared sources bind no input
+interface, and the raw layer: the complete fingerprint of `sys.rs`, its
+syscall and flag values, its two function-only allowances, the single
 instruction and adoption sites, that the crate root denies `unsafe` and
 declares the module private, that `wayland` is its only caller, through
-exactly four wrapper calls, that no production module calls the
-client's test support (`unconfigure`, `input_mut`), and that the client
-is the toolkit's one consumer of a received right, through the pinned
-keymap reader with its format, size and regular-file checks.
+exactly four wrapper calls, that no production module calls the client's
+test support (`unconfigure`, `input_mut`), and that the client is the
+toolkit's one consumer of a received right, through the pinned keymap reader
+with its format, size and regular-file checks and the send that hands its
+right on.
 
 The builder discovers the crate by existing. Its gate runs `cargo test` and
 all-target Clippy; a change under `td-ui/` selects td-editor's tests through
@@ -392,13 +445,13 @@ the reader graph, because td-editor's manifest names the crate.
    in the table under its `Tag`; td-editor is the first `App`, its nine
    presentation tests moved, and the probe consumer in `tests/client.rs`
    drives the client. Landed.
-4. Devices, in two landings. (a) The seat, keyboard and pointer inside
-   the client: bound and created there, the keymap right consumed there,
-   the keyboard's state owned there and its events delivered typed with
-   their serials; td-editor acts on the outcomes and keeps its gestures.
-   Landed. (b) The clipboard's data-device lifecycle: manager, device,
-   offers with their budgets and retirement barriers, and sources,
-   delivered typed; td-editor keeps its transfers.
+4. Devices, in two landings. (a) The seat, keyboard and pointer inside the
+   client: bound and created there, the keymap right consumed there, the
+   keyboard's state owned there and its events delivered typed with their
+   serials; td-editor acts on the outcomes and keeps its gestures. Landed.
+   (b) The clipboard's data-device lifecycle: manager, device, offers with
+   their budgets and retirement barriers, and sources, delivered typed;
+   td-editor keeps its transfers. Landed.
 5. Widgets: text entry, wrapped text block, menu bar and panel, paged list,
    tab strip and status row, each with a pixel oracle.
 6. `td-setup`: the installer front end's first page as the second consumer,

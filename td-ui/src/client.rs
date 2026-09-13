@@ -7,6 +7,7 @@
 //! `handle` hands their events back untouched. Errors are strings, as the
 //! transport's are.
 
+use crate::data::{self, DeviceEvent, Offer, SourceEvent, OFFER_LIMIT, PLAIN, UTF8};
 use crate::keyboard::{Keymap, Modifiers, Stroke};
 use crate::pointer;
 use crate::raster::{MAX_AXIS, MAX_FRAME_BYTES};
@@ -75,6 +76,13 @@ pub enum Kind<T> {
     RetiredKeyboard,
     Pointer,
     RetiredPointer,
+    DataManager,
+    DataDevice,
+    RetiredDataDevice,
+    DataSource,
+    RetiredDataSource,
+    DataSync,
+    RetiredDataSync,
     App(T),
 }
 
@@ -133,8 +141,27 @@ pub enum KeyboardEvent {
     Refused(String),
 }
 
-/// What `Client::handle` did with an event, and what the consumer does next.
-#[derive(Debug, Eq, PartialEq)]
+/// What the clipboard hands the consumer.
+#[derive(Debug)]
+pub enum ClipboardEvent {
+    /// `wl_data_device.selection`: `selection` now names the offer to
+    /// receive from, or nothing; every other offer is retired.
+    Selection,
+    /// `wl_data_source.send` on the live source for a supported text
+    /// MIME: the consumer writes the text it offered to this right and
+    /// closes it, or drops it while another send is in progress.
+    Send(OwnedFd),
+    /// The compositor cancelled the live source, now retired; the
+    /// consumer drops the text it kept for it.
+    Cancelled,
+    /// The data-device manager's global went away: the source and the
+    /// device are released, and the consumer ends its transfers.
+    Released,
+}
+
+/// What `Client::handle` did with an event, and what the consumer does
+/// next. A send's right makes this incomparable; tests match on it.
+#[derive(Debug)]
 pub enum Handled {
     /// Consumed by the client; nothing to do.
     Done,
@@ -168,6 +195,10 @@ pub enum Handled {
     /// The live pointer's event; enter and leave named this surface, and
     /// the pointer image follows enter serials.
     Pointer(pointer::Event),
+    /// The clipboard's outcome: the seat's selection changed, the live
+    /// source must send its text, the live source was cancelled, or the
+    /// data device went with its manager's global.
+    Clipboard(ClipboardEvent),
     /// The object is the consumer's (`Kind::App`); dispatch it yourself.
     Unhandled,
 }
@@ -192,10 +223,30 @@ pub struct Client<T: Tag> {
     pointer: Option<u32>,
     input: Input,
     enter: Option<u32>,
+    data: Option<Data>,
     bound: bool,
     closed: bool,
     temporary: PathBuf,
 }
+
+/// The clipboard: one seat-bound data device over core v3, its live
+/// source, the seat's selection among the server-created offers, and the
+/// barriers behind which destroyed offers' ids are dropped. It outlives
+/// the device's release, because a retired device's offers still arrive
+/// and must be destroyed.
+struct Data {
+    global: u32,
+    manager: u32,
+    device: Option<u32>,
+    source: Option<u32>,
+    selection: Option<u32>,
+    offers: BTreeMap<u32, Offer>,
+    barriers: BTreeMap<u32, Vec<(u32, u64)>>,
+    sequence: u64,
+}
+
+/// Server-created ids start here; an offer below is refused.
+const SERVER_IDS: u32 = 0xff00_0000;
 
 impl<T: Tag> Client<T> {
     /// Pool files are created in `temporary`, unlinked before use.
@@ -223,6 +274,7 @@ impl<T: Tag> Client<T> {
             pointer: None,
             input: Input::default(),
             enter: None,
+            data: None,
             bound: false,
             closed: false,
             temporary,
@@ -261,13 +313,22 @@ impl<T: Tag> Client<T> {
         self.connection.descriptors()
     }
 
-    /// Whether `message` carries a right the client consumes: a keymap.
-    /// The complete schema is checked here, before any wait; an object
-    /// the table does not know is not the client's.
+    /// Whether `message` carries a right the client consumes: a keymap,
+    /// or a data source's send. The complete schema is checked here,
+    /// before any wait, a server offer's included; another object the
+    /// table does not know is not the client's.
     pub fn needs_descriptor(&self, message: &Message) -> Result<bool> {
+        if self.is_offer(message.object) {
+            data::offer(message)?;
+            return Ok(false);
+        }
         match (self.objects.get(message.object as usize), message.opcode) {
             (Some(Kind::Keyboard | Kind::RetiredKeyboard), 0) => {
                 keyboard_message(message)?;
+                Ok(true)
+            }
+            (Some(Kind::DataSource | Kind::RetiredDataSource), 1) => {
+                data::source(message)?;
                 Ok(true)
             }
             _ => Ok(false),
@@ -417,14 +478,19 @@ impl<T: Tag> Client<T> {
             .find(|(_, (n, v))| n == name && *v >= version)
             .map(|(id, _)| *id)
             .ok_or_else(|| format!("required Wayland global {name} v{version} is missing"))?;
+        self.bind_global(global, name, version, id)?;
+        self.required.push(global);
+        Ok(())
+    }
+
+    /// Sends `wl_registry.bind` for `global` as `name` v`version` at `id`.
+    fn bind_global(&mut self, global: u32, name: &str, version: u32, id: u32) -> Result<()> {
         let mut body = Builder::new();
         body.u32(global);
         body.string(name)?;
         body.u32(version);
         body.u32(id);
-        self.connection.send(REGISTRY, 0, body, None)?;
-        self.required.push(global);
-        Ok(())
+        self.connection.send(REGISTRY, 0, body, None)
     }
 
     fn initialize(&mut self) -> Result<()> {
@@ -441,6 +507,26 @@ impl<T: Tag> Client<T> {
             let seat = self.allocate_kind(Kind::Seat)?;
             self.bind("wl_seat", version.min(7), seat)?;
             self.seat = Some(seat);
+        }
+        // One seat-bound data device over core v3, capped there and not
+        // required; a manager advertised later is not bound.
+        if let (Some(seat), Some((global, _))) =
+            (self.seat, self.find_global("wl_data_device_manager", 3))
+        {
+            let manager = self.allocate_kind(Kind::DataManager)?;
+            let device = self.allocate_kind(Kind::DataDevice)?;
+            self.bind_global(global, "wl_data_device_manager", 3, manager)?;
+            self.connection.words(manager, 1, &[device, seat])?;
+            self.data = Some(Data {
+                global,
+                manager,
+                device: Some(device),
+                source: None,
+                selection: None,
+                offers: BTreeMap::new(),
+                barriers: BTreeMap::new(),
+                sequence: 0,
+            });
         }
         self.bound = true;
         Ok(())
@@ -469,14 +555,14 @@ impl<T: Tag> Client<T> {
     }
 
     /// Releases the keyboard, if any, and forgets its map, focus, snapshot,
-    /// held keys and repeat.
+    /// held keys and repeat; the clipboard selection goes with focus.
     fn release_keyboard(&mut self) -> Result<()> {
         if let Some(device) = self.keyboard.take() {
             self.connection.words(device, 0, &[])?;
             self.set_kind(device, Kind::RetiredKeyboard)?;
         }
         self.input = Input::default();
-        Ok(())
+        self.clear_selection()
     }
 
     /// Releases the pointer, if any; the pointer image stays for the next.
@@ -489,15 +575,311 @@ impl<T: Tag> Client<T> {
         Ok(())
     }
 
-    /// Releases both devices, then the seat.
+    /// Releases both devices and the data device, then the seat.
     fn release_seat(&mut self) -> Result<()> {
         self.release_keyboard()?;
         self.release_pointer()?;
+        self.release_data()?;
         if let Some(seat) = self.seat.take() {
             self.connection.words(seat, 3, &[])?;
             self.set_kind(seat, Kind::RetiredSeat)?;
         }
         Ok(())
+    }
+
+    /// Whether a clipboard is available: a live data device on the seat.
+    pub fn clipboard(&self) -> bool {
+        self.data.as_ref().is_some_and(|d| d.device.is_some())
+    }
+
+    /// The seat's selection: the server offer to receive from, kept while
+    /// focus lasts, or nothing.
+    pub fn selection(&self) -> Option<u32> {
+        self.data.as_ref().and_then(|d| d.selection)
+    }
+
+    /// The selection's supported text MIME in the spelling it was
+    /// announced with, the explicit UTF-8 one preferred; none when the
+    /// selection announced neither.
+    pub fn selection_mime(&self) -> Option<&str> {
+        let data = self.data.as_ref()?;
+        data.offers.get(&data.selection?).and_then(Offer::mime)
+    }
+
+    /// The live source, whose text the consumer keeps, until `Cancelled`
+    /// or the next `offer_selection`.
+    pub fn source(&self) -> Option<u32> {
+        self.data.as_ref().and_then(|d| d.source)
+    }
+
+    /// Asks the selection's offer for its text over `endpoint`, the
+    /// producer side of a socket pair the consumer reads from; the
+    /// request names the selection's preferred MIME.
+    pub fn receive(&mut self, endpoint: &File) -> Result<()> {
+        let offer = self.selection().ok_or("no clipboard selection")?;
+        let mime = self
+            .selection_mime()
+            .ok_or("no supported clipboard offer")?
+            .to_string();
+        let mut body = Builder::new();
+        body.string(&mime)?;
+        self.connection.send(offer, 1, body, Some(endpoint))
+    }
+
+    /// Offers text on the clipboard: a fresh source advertising both text
+    /// MIMEs becomes the seat's selection at `serial`, and the previous
+    /// source is destroyed. The text is the consumer's, keyed to the
+    /// returned id and written when `Send` asks for it.
+    pub fn offer_selection(&mut self, serial: u32) -> Result<u32> {
+        let (manager, device) = match self.data.as_ref() {
+            Some(Data {
+                manager,
+                device: Some(device),
+                ..
+            }) => (*manager, *device),
+            _ => return Err("no clipboard device".into()),
+        };
+        let source = self.allocate_kind(Kind::DataSource)?;
+        self.connection.words(manager, 0, &[source])?;
+        for mime in [UTF8, PLAIN] {
+            let mut body = Builder::new();
+            body.string(mime)?;
+            self.connection.send(source, 0, body, None)?;
+        }
+        self.connection.words(device, 1, &[source, serial])?;
+        let previous = self.data.as_mut().and_then(|d| d.source.replace(source));
+        if let Some(previous) = previous {
+            self.destroy_source(previous)?;
+        }
+        Ok(source)
+    }
+
+    /// Destroys a source; its id waits for `delete_id`.
+    fn destroy_source(&mut self, id: u32) -> Result<()> {
+        self.connection.words(id, 1, &[])?;
+        self.set_kind(id, Kind::RetiredDataSource)
+    }
+
+    /// Destroys a server offer once; the caller queues the barrier its id
+    /// is dropped behind, once per batch.
+    fn destroy_offer(&mut self, id: u32) -> Result<()> {
+        let offer = self
+            .data
+            .as_mut()
+            .and_then(|d| d.offers.get_mut(&id))
+            .ok_or("unknown clipboard offer")?;
+        if offer.retired {
+            return Ok(());
+        }
+        offer.retired = true;
+        self.connection.words(id, 2, &[])
+    }
+
+    /// Destroys one offer behind its own barrier.
+    fn retire_offer(&mut self, id: u32) -> Result<()> {
+        self.destroy_offer(id)?;
+        self.queue_barrier()
+    }
+
+    /// One outstanding `wl_display.sync` covers every offer retired so
+    /// far, by id and generation; later retirements wait for its callback.
+    fn queue_barrier(&mut self) -> Result<()> {
+        let Some(data) = self.data.as_ref() else {
+            return Ok(());
+        };
+        if !data.barriers.is_empty() {
+            return Ok(());
+        }
+        let retired: Vec<(u32, u64)> = data
+            .offers
+            .iter()
+            .filter(|(_, offer)| offer.retired)
+            .map(|(id, offer)| (*id, offer.sequence))
+            .collect();
+        if retired.is_empty() {
+            return Ok(());
+        }
+        let barrier = self.allocate_kind(Kind::DataSync)?;
+        if let Some(data) = self.data.as_mut() {
+            data.barriers.insert(barrier, retired);
+        }
+        self.connection.words(DISPLAY, 0, &[barrier])
+    }
+
+    /// The barrier's callback: the offers it covered are dropped, unless
+    /// a newer generation reused the id, and the next barrier goes out.
+    fn barrier_done(&mut self, id: u32) -> Result<()> {
+        let data = self
+            .data
+            .as_mut()
+            .ok_or("clipboard barrier without a device")?;
+        let retired = data
+            .barriers
+            .remove(&id)
+            .ok_or("missing clipboard barrier")?;
+        for (offer, sequence) in retired {
+            if data
+                .offers
+                .get(&offer)
+                .is_some_and(|o| o.retired && o.sequence == sequence)
+            {
+                data.offers.remove(&offer);
+            }
+        }
+        self.set_kind(id, Kind::RetiredDataSync)?;
+        self.queue_barrier()
+    }
+
+    /// Focus loss invalidates the selection: every offer is retired.
+    fn clear_selection(&mut self) -> Result<()> {
+        let Some(data) = self.data.as_mut() else {
+            return Ok(());
+        };
+        data.selection = None;
+        let offers: Vec<u32> = data.offers.keys().copied().collect();
+        for offer in offers {
+            self.destroy_offer(offer)?;
+        }
+        self.queue_barrier()
+    }
+
+    /// Releases the data device and its source; the manager has no
+    /// destructor and stays inert, and the offers still drain.
+    fn release_data(&mut self) -> Result<()> {
+        self.clear_selection()?;
+        let source = self.data.as_mut().and_then(|d| d.source.take());
+        if let Some(source) = source {
+            self.destroy_source(source)?;
+        }
+        let device = self.data.as_mut().and_then(|d| d.device.take());
+        if let Some(device) = device {
+            self.connection.words(device, 2, &[])?;
+            self.set_kind(device, Kind::RetiredDataDevice)?;
+        }
+        Ok(())
+    }
+
+    fn is_offer(&self, id: u32) -> bool {
+        self.data
+            .as_ref()
+            .is_some_and(|d| d.offers.contains_key(&id))
+    }
+
+    /// A server offer's events: its MIME announcements under the budgets;
+    /// its actions are validated and ignored.
+    fn offer_event(&mut self, message: &Message) -> Result<Handled> {
+        let mime = data::offer(message)?;
+        let offer = self
+            .data
+            .as_mut()
+            .and_then(|d| d.offers.get_mut(&message.object))
+            .ok_or("unknown clipboard offer")?;
+        if let Some(mime) = mime {
+            offer.announce(mime);
+        }
+        Ok(Handled::Done)
+    }
+
+    /// The data device's events, live or retired: an offer is recorded
+    /// under the budgets, and retired at once on a retired device; the
+    /// selection retires every other offer; a drag's offer is retired
+    /// without accepting or finishing it and is never the selection.
+    fn device_event(&mut self, id: u32, message: &Message) -> Result<Handled> {
+        let event = data::device(message)?;
+        let data = self.data.as_mut().ok_or("data device without a manager")?;
+        let active = data.device == Some(id);
+        match event {
+            DeviceEvent::Offer(offer) => {
+                if offer < SERVER_IDS || data.offers.get(&offer).is_some_and(|o| !o.retired) {
+                    return Err("invalid server clipboard offer id".into());
+                }
+                if !data.offers.contains_key(&offer) && data.offers.len() >= OFFER_LIMIT {
+                    return Err("clipboard offer budget".into());
+                }
+                data.sequence = data
+                    .sequence
+                    .checked_add(1)
+                    .ok_or("clipboard offer sequence exhausted")?;
+                data.offers.insert(
+                    offer,
+                    Offer {
+                        sequence: data.sequence,
+                        retired: false,
+                        utf8: None,
+                        plain: None,
+                        count: 0,
+                    },
+                );
+                if !active {
+                    self.retire_offer(offer)?;
+                }
+                Ok(Handled::Done)
+            }
+            _ if !active => Ok(Handled::Done),
+            DeviceEvent::Selection(offer) => {
+                if offer != 0 && !data.offers.get(&offer).is_some_and(|o| !o.retired) {
+                    return Err("selection names unknown or retired offer".into());
+                }
+                data.selection = (offer != 0).then_some(offer);
+                let others: Vec<u32> = data
+                    .offers
+                    .keys()
+                    .copied()
+                    .filter(|other| Some(*other) != data.selection)
+                    .collect();
+                for other in others {
+                    self.destroy_offer(other)?;
+                }
+                self.queue_barrier()?;
+                Ok(Handled::Clipboard(ClipboardEvent::Selection))
+            }
+            DeviceEvent::Enter { surface, offer } => {
+                if surface != SURFACE {
+                    return Err("data-device enter for unknown surface".into());
+                }
+                if offer != 0 {
+                    if data.selection == Some(offer) {
+                        return Err("drag reused selection offer".into());
+                    }
+                    if data.offers.contains_key(&offer) {
+                        self.retire_offer(offer)?;
+                    }
+                }
+                Ok(Handled::Done)
+            }
+            DeviceEvent::Drag => Ok(Handled::Done),
+        }
+    }
+
+    /// A source's events: a send pops its right and hands it on when the
+    /// source is live and the MIME supported, in any ASCII case, or drops
+    /// exactly it; cancellation destroys the live source. A retired
+    /// source's sends drop their rights.
+    fn source_event(&mut self, id: u32, message: &Message) -> Result<Handled> {
+        let event = data::source(message)?;
+        let active = self.source() == Some(id);
+        Ok(match event {
+            SourceEvent::Send(mime) => {
+                let right = self
+                    .connection
+                    .pop_descriptor()
+                    .ok_or("missing clipboard destination")?;
+                let supported = mime.eq_ignore_ascii_case(UTF8) || mime.eq_ignore_ascii_case(PLAIN);
+                if active && supported {
+                    Handled::Clipboard(ClipboardEvent::Send(right))
+                } else {
+                    Handled::Done
+                }
+            }
+            SourceEvent::Cancel if active => {
+                let source = self.data.as_mut().and_then(|d| d.source.take());
+                if let Some(source) = source {
+                    self.destroy_source(source)?;
+                }
+                Handled::Clipboard(ClipboardEvent::Cancelled)
+            }
+            _ => Handled::Done,
+        })
     }
 
     /// The live keyboard's events are applied to its state; a retired
@@ -534,6 +916,7 @@ impl<T: Tag> Client<T> {
                     return Err("keyboard leave for unknown surface".into());
                 }
                 self.input.focus(&[], false)?;
+                self.clear_selection()?;
                 Handled::Keyboard(KeyboardEvent::Focus(false))
             }
             KeyboardMessage::Modifiers(modifiers) => {
@@ -824,6 +1207,9 @@ impl<T: Tag> Client<T> {
     /// the consumer's clock, the millisecond its `tick` last saw, which
     /// retimes an armed repeat when the keyboard's timing changes.
     pub fn handle(&mut self, message: &Message, now: u64) -> Result<Handled> {
+        if self.is_offer(message.object) {
+            return self.offer_event(message);
+        }
         let mut cursor = Cursor::new(&message.payload);
         let handled = match (message.object, message.opcode) {
             (DISPLAY, 0) => {
@@ -841,7 +1227,10 @@ impl<T: Tag> Client<T> {
                     | Kind::RetiredBuffer
                     | Kind::RetiredSeat
                     | Kind::RetiredKeyboard
-                    | Kind::RetiredPointer => true,
+                    | Kind::RetiredPointer
+                    | Kind::RetiredDataDevice
+                    | Kind::RetiredDataSource
+                    | Kind::RetiredDataSync => true,
                     Kind::App(tag) => tag.retired(),
                     _ => false,
                 };
@@ -873,6 +1262,14 @@ impl<T: Tag> Client<T> {
                 let required = self.required.contains(&id);
                 if !required {
                     self.globals.remove(&id);
+                    if self
+                        .data
+                        .as_ref()
+                        .is_some_and(|d| d.global == id && d.device.is_some())
+                    {
+                        self.release_data()?;
+                        return Ok(Handled::Clipboard(ClipboardEvent::Released));
+                    }
                 } else if self.seat.is_some() && self.global_name(id) == Some("wl_seat") {
                     self.release_seat()?;
                     self.forget_global(id);
@@ -984,6 +1381,18 @@ impl<T: Tag> Client<T> {
             }
             (id, _) if matches!(self.kind(id)?, Kind::Pointer | Kind::RetiredPointer) => {
                 return self.pointer_event(id, message);
+            }
+            (id, _) if matches!(self.kind(id)?, Kind::DataDevice | Kind::RetiredDataDevice) => {
+                return self.device_event(id, message);
+            }
+            (id, _) if matches!(self.kind(id)?, Kind::DataSource | Kind::RetiredDataSource) => {
+                return self.source_event(id, message);
+            }
+            (id, 0) if self.kind(id)? == Kind::DataSync => {
+                cursor.u32()?;
+                cursor.finish()?;
+                self.barrier_done(id)?;
+                return Ok(Handled::Done);
             }
             (id, _) if matches!(self.kind(id)?, Kind::App(_)) => return Ok(Handled::Unhandled),
             _ => {

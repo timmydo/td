@@ -10,7 +10,6 @@ mod control_frame;
 mod control_jobs;
 pub mod control_socket;
 pub mod control_worker;
-mod data;
 mod dialog;
 mod directory;
 pub use dialog::{Discard, Reload};
