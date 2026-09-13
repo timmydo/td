@@ -5,10 +5,12 @@ use std::io::{Read, Write};
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 mod protocol;
 use protocol::*;
+
+const ENOMEDIUM: i32 = 123; // Linux: an optical drive with no readable medium.
 
 fn command(program: &str, args: &[&str]) -> Result<(), String> {
     let status = Command::new(program)
@@ -86,6 +88,8 @@ fn directories() -> Result<(), String> {
         "/state",
         "/root-image",
         "/ack",
+        "/media",
+        "/source",
     ] {
         fs::DirBuilder::new()
             .recursive(true)
@@ -98,9 +102,92 @@ fn directories() -> Result<(), String> {
     applet(&["mount", "-t", "sysfs", "sysfs", "/sys"])
 }
 
+fn media_device() -> Result<&'static str, String> {
+    let started = Instant::now();
+    loop {
+        let mut found = None;
+        // Exactly one source in this fixed QEMU profile: SATA optical or USB.
+        // USB mass-storage probing can finish after PID 1 starts.
+        for path in ["/dev/sr0", "/dev/sda"] {
+            match fs::metadata(path) {
+                Ok(meta) if meta.file_type().is_block_device() => {
+                    // sr can publish a placeholder capacity for an empty tray.
+                    // Opening read-only asks the block driver to check media.
+                    let _medium = match File::open(path) {
+                        Ok(file) => file,
+                        Err(error) if error.raw_os_error() == Some(ENOMEDIUM) => continue,
+                        Err(error) => return Err(format!("open media {path}: {error}")),
+                    };
+                    let name = path.strip_prefix("/dev/").ok_or("invalid fixture device")?;
+                    let capacity = read(Path::new(&format!("/sys/class/block/{name}/size")), 32)?;
+                    let capacity = std::str::from_utf8(&capacity)
+                        .map_err(|_| format!("non-ASCII capacity for {path}"))?
+                        .trim_end()
+                        .parse::<u64>()
+                        .map_err(|error| format!("invalid capacity for {path}: {error}"))?;
+                    if capacity == 0 {
+                        continue;
+                    }
+                    if found.replace(path).is_some() {
+                        return Err("ambiguous fixture installation media".into());
+                    }
+                }
+                Ok(_) => return Err(format!("{path} is not a block device")),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(format!("stat {path}: {error}")),
+            }
+        }
+        if let Some(path) = found {
+            return Ok(path);
+        }
+        if started.elapsed() >= Duration::from_secs(30) {
+            return Err("fixture installation media did not appear".into());
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn mount_source() -> Result<(), String> {
+    let device = media_device()?;
+    applet(&[
+        "mount",
+        "-t",
+        "iso9660",
+        "-o",
+        "ro,nodev,nosuid,noexec,map=normal",
+        device,
+        "/media",
+    ])?;
+    for (iso_name, name) in MEDIA_FILES {
+        let source = format!("/media/{}", iso_name.to_ascii_lowercase());
+        let destination = format!("/{name}");
+        // File binds adapt ISO spelling without duplicating payloads into RAM
+        // or passing symlinks to td-boot's real-file verifier.
+        fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&destination)
+            .map_err(|error| format!("create {destination}: {error}"))?;
+        applet(&["mount", "-o", "bind", &source, &destination])?;
+        applet(&[
+            "mount",
+            "-o",
+            "remount,bind,ro,nodev,nosuid,noexec",
+            &destination,
+        ])?;
+        match fs::OpenOptions::new().write(true).open(&destination) {
+            Err(error) if error.kind() == std::io::ErrorKind::ReadOnlyFilesystem => {}
+            Err(error) => return Err(format!("check read-only {destination}: {error}")),
+            Ok(_) => return Err(format!("media payload is writable: {destination}")),
+        }
+    }
+    writeln!(std::io::stdout(), "{MEDIA_MARKER} {device}").map_err(|error| error.to_string())
+}
+
 fn install(device: &str) -> Result<(), String> {
-    // Every path is fixture-owned. The ISO already contains the signed source
-    // and public trust root; no private key enters the guest.
+    // The ISO carries the signed payloads and the live initramfs's public key.
+    // Every path is fixture-owned; no private key enters the guest.
+    mount_source()?;
     command(
         "/bin/td-install",
         &["layout", device, "/source/bzImage", "/selector.cpio"],

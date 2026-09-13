@@ -20,11 +20,37 @@ The complete crate tree is a local_source input pinned by
 seed/seed-digests.txt. The catalog and affected-check routing include it in
 local-source verification; it is not a production system input.
 
-The live initramfs holds source-built tools, a tiny deployment signed under a
-per-run throwaway key, the public trust root and the fixed selector. The
-private key remains on the host outside derivations. The fixture calls the
+The live initramfs holds source-built tools and the public trust root. The
+tiny signed deployment and fixed selector are streamed into separate ISO
+files. Each diagnostic input is bounded at 256 MiB; this remains a small
+fixture rather than a full-system media assembler. The private key remains
+on the host outside derivations. The fixture calls the
 actual td-install layout and volume primitives, including td-boot's verified
 publication. Its success marker follows both successful commands and sync.
+
+Before any layout write, the guest polls for thirty seconds among exactly
+two fixed candidate paths: /dev/sr0 (SATA optical) and /dev/sda (USB). QEMU
+adds an empty default CD-ROM in both attachments: /dev/sr1 during optical
+boots (outside this candidate list) and /dev/sr0 during USB boots. A read-only
+block-device open must succeed; Linux ENOMEDIUM (123) skips an empty drive
+even when the driver publishes a placeholder capacity. Other open errors
+refuse. Zero-capacity
+devices are ignored. Malformed or unreadable capacities refuse. The host's
+VM deadline also bounds time spent in kernel operations during discovery.
+Absent, ambiguous or non-block candidates refuse. This convention applies
+only to this disposable QEMU profile, not production media discovery. Linux
+mounts ISO9660 read-only, nodev, nosuid and noexec. Individual read-only file
+binds adapt ISO filename case to td-boot's canonical payload names without
+copying the source into RAM or introducing symlinks. Every file must refuse
+a write-open with ReadOnlyFilesystem before the media-access marker prints
+the selected device. The host requires that device to match its attachment.
+The write-open check proves payloads are unwritable, not each individual
+bind-mount flag; all mount commands must independently succeed.
+The fixed selector is bound outside /source, which holds only the signed
+deployment bundle. Discovery checks only currently visible candidates;
+it does not establish exclusive admission against later hotplug.
+Missing payloads refuse before layout; no initramfs copy is available as a
+fallback. The formatter still stages the deployment and Btrfs image in RAM.
 
 The host then detaches media and cold-boots only the destination through
 firmware. The fixed selector authenticates and kexecs the installed tiny
@@ -39,8 +65,7 @@ use the same ISO bytes and fresh destination disks.
 
 The fixture's serial and partition-two convention do not implement production
 volume discovery. It does not launch the compositor, configure an account,
-retain an installation signing key, or test a full desktop deployment. Live
-media payloads fit in RAM; this does not prove mounting ISO9660 from Linux.
+retain an installation signing key, or test a full desktop deployment.
 The final installer still needs the activation evidence in
 ../td-install/INSTALLER.md, including stable volume identity and settings.
 

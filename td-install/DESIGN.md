@@ -466,6 +466,14 @@ fit, but this consumes part of both td-boot's 2048-byte command-line bound
 and the kernel's 2048-byte buffer. Future argument expansion must reserve
 room for that second prefix rather than relying on kernel truncation.
 
+The x86 kernel recipe discards the inherited EFI initrd configuration-table
+entry before parsing tables on a kexec boot. Its one-shot loader allocation
+can have been reused for the incoming kernel; reading and clearing that
+old table can corrupt the new kernel. The selected initramfs arrives through
+the new kernel's `boot_params`. Table invalidation also runs without an
+SMBIOS pointer. Normal firmware entry still consumes its initrd table,
+and EFI runtime services remain enabled across the selector handoff.
+
 Firmware passes **no command line**, so the stub's must be built in
 (`CONFIG_CMDLINE`). That costs nothing under this design and is the reason
 the design is shaped this way: the kernel on the ESP is a *fixed* stub whose
@@ -1015,9 +1023,10 @@ The private signing key never enters the guest or a derivation.
 The fixture accepts no operator destination and is absent from system and
 installer profiles. Its serial-based device identification and partition-two
 convention are diagnostic scaffolding, not production volume discovery or
-consent. Its payload fits in the initramfs: Linux ISO9660 mounting, full
-system installation, machine settings and compositor evidence remain
-required by INSTALLER.md. This fixture does not enforce selector/volume key
+consent. Linux mounts its ISO payload files read-only before installation;
+the live initramfs holds tools and the public trust root. Full system
+installation, machine settings and compositor evidence remain required by
+INSTALLER.md. This fixture does not enforce selector/volume key
 agreement for arbitrary caller-provided inputs.
 
 The oracle signs with a **per-run throwaway key**: generate a keypair, sign

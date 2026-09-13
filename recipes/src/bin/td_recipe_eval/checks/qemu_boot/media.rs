@@ -14,8 +14,13 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
     };
     let disk = scratch.dir.join("boot.iso");
     write_image(&disk, &kernel, &initramfs)?;
-    println!("   [qemu-boot-media] kernel: {}\n      initramfs: {}\n      firmware: {}\n      vars template: {}",
-        kernel.display(), initramfs.display(), code.display(), template.display());
+    println!(
+        "   [qemu-boot-media] kernel: {}\n      initramfs: {}\n      firmware: {}\n      vars template: {}",
+        kernel.display(),
+        initramfs.display(),
+        code.display(),
+        template.display()
+    );
     for (name, attachment) in [
         ("optical", FirmwareAttachment::Optical),
         ("usb", FirmwareAttachment::Usb),
@@ -65,13 +70,33 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
 }
 
 pub(super) fn write_image(path: &Path, kernel: &Path, initramfs: &Path) -> Result<(), String> {
+    write_image_with_payloads(path, kernel, initramfs, &[])
+}
+
+/// Sources belong to the host oracle's private staging tree and remain stable.
+pub(super) fn write_image_with_payloads(
+    path: &Path,
+    kernel: &Path,
+    initramfs: &Path,
+    payloads: &[(&str, PathBuf)],
+) -> Result<(), String> {
     let (kernel, kernel_len) = efi::input(kernel)?;
     let (initramfs, initramfs_len) = efi::input(initramfs)?;
+    let mut files = Vec::new();
+    let mut inputs = Vec::new();
+    for (name, payload_path) in payloads {
+        let (file, len) = efi::input(payload_path)?;
+        files.push(iso9660::FileSpec {
+            name: (*name).into(),
+            len,
+        });
+        inputs.push((*name, file));
+    }
     let image = iso9660::build(&iso9660::Volume {
         disk_guid: gpt::Guid([0x41; 16]),
         esp_guid: gpt::Guid([0x42; 16]),
         esp_bytes: ESP_BYTES,
-        files: Vec::new(),
+        files,
     })?;
     let esp = fat::build(&fat::Volume {
         bytes_per_sector: 512,
@@ -126,6 +151,15 @@ pub(super) fn write_image(path: &Path, kernel: &Path, initramfs: &Path) -> Resul
             .map_err(|e| e.to_string())?;
         copy_exact(source, &mut out, placement.len)?;
     }
+    for placement in &image.placements {
+        let (_, source) = inputs
+            .iter()
+            .find(|(name, _)| *name == placement.name)
+            .ok_or_else(|| format!("missing ISO source {}", placement.name))?;
+        out.seek(SeekFrom::Start(placement.offset))
+            .map_err(|e| e.to_string())?;
+        copy_exact(source, &mut out, placement.len)?;
+    }
     out.sync_all()
         .map_err(|e| format!("sync {}: {e}", path.display()))
 }
@@ -155,6 +189,80 @@ pub(super) fn optical_drive_arg(path: &Path) -> OsString {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn iso_payloads_stream_to_their_named_extents_with_zero_padding() {
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let scratch = Scratch {
+            dir: create_scratch_dir(&env::temp_dir(), &SEQ).unwrap(),
+        };
+        let source = scratch.dir.join("boot");
+        fs::write(&source, b"boot bytes").unwrap();
+        let mut payloads = Vec::new();
+        for (name, bytes) in [
+            ("Z.IMG", vec![0x5a; 4097]),
+            ("A.IMG", vec![0x41; 1300]),
+            ("M.IMG", vec![0x4d; 2048]),
+        ] {
+            let path = scratch.dir.join(name);
+            fs::write(&path, bytes).unwrap();
+            payloads.push((name, path));
+        }
+        let disk = scratch.dir.join("payload.iso");
+        write_image_with_payloads(&disk, &source, &source, &payloads).unwrap();
+        let metadata = iso9660::build(&iso9660::Volume {
+            disk_guid: gpt::Guid([0x41; 16]),
+            esp_guid: gpt::Guid([0x42; 16]),
+            esp_bytes: ESP_BYTES,
+            files: vec![
+                iso9660::FileSpec {
+                    name: "A.IMG".into(),
+                    len: 1300,
+                },
+                iso9660::FileSpec {
+                    name: "Z.IMG".into(),
+                    len: 4097,
+                },
+                iso9660::FileSpec {
+                    name: "M.IMG".into(),
+                    len: 2048,
+                },
+            ],
+        })
+        .unwrap();
+        let mut file = File::open(&disk).unwrap();
+        assert_eq!(file.metadata().unwrap().len(), metadata.total_bytes);
+        for placement in metadata.placements {
+            let expected = fs::read(scratch.dir.join(&placement.name)).unwrap();
+            file.seek(SeekFrom::Start(placement.offset)).unwrap();
+            let mut got = vec![0; expected.len()];
+            file.read_exact(&mut got).unwrap();
+            assert_eq!(got, expected);
+            let padding_len = (iso9660::BLOCK - placement.len % iso9660::BLOCK) % iso9660::BLOCK;
+            let mut padding = vec![1; padding_len as usize];
+            file.read_exact(&mut padding).unwrap();
+            assert!(padding.iter().all(|byte| *byte == 0));
+        }
+    }
+
+    #[test]
+    fn invalid_or_missing_payload_refuses_before_output_creation() {
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let scratch = Scratch {
+            dir: create_scratch_dir(&env::temp_dir(), &SEQ).unwrap(),
+        };
+        let source = scratch.dir.join("source");
+        fs::write(&source, b"input").unwrap();
+        let disk = scratch.dir.join("never-created.iso");
+        for payloads in [
+            vec![("ABSENT", scratch.dir.join("absent"))],
+            vec![("EFI.IMG", source.clone())],
+            vec![("DUP", source.clone()), ("DUP.", source.clone())],
+        ] {
+            assert!(write_image_with_payloads(&disk, &source, &source, &payloads).is_err());
+            assert!(!disk.exists());
+        }
+    }
 
     #[test]
     fn streams_refuse_short_inputs_and_copy_only_declared_bytes() {

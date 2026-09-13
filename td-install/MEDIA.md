@@ -70,3 +70,14 @@ run the compositor or boot an installed disk. Those remain live-profile
 and installed-session activation requirements. The command accepts no
 output or device destination; exclusive files in its private scratch
 directory are removed on completion.
+
+## Linux payload access
+
+The source-built kernel enables ISO9660, SCSI disk and CD-ROM, AHCI SATA,
+and USB mass-storage support as built-ins. The recipe checks the resolved
+configuration so media access needs no modules from the media it must read.
+The native `qemu-install` diagnostic extends the firmware evidence by
+mounting the ISO read-only in Linux and installing its signed payload files.
+It exercises both attachments with the same image and then boots the
+destination with media detached. Its exact bounds and fixture-only device
+conventions are specified in [the fixture design](../td-install-qemu-test/DESIGN.md).

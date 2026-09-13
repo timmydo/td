@@ -82,7 +82,7 @@ fn initramfs(
     extra: &[PackedFile],
 ) -> Result<Vec<u8>, String> {
     let mut entries = Vec::new();
-    for name in key_path_parents().into_iter().chain(["source"]) {
+    for name in key_path_parents() {
         entries.push(Entry {
             name,
             mode: 0o755,
@@ -138,7 +138,7 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
     }
     let trust = RunTrust::generate()?;
     let installed = initramfs(&base, &common, "installed\n", &[])?;
-    let deployment = scratch.dir.join("deployment");
+    let deployment = scratch.dir.join("source");
     fs::create_dir(&deployment).map_err(|e| format!("create deployment: {e}"))?;
     write(&deployment.join("bzImage"), &read(&kernel)?)?;
     write(&deployment.join("initramfs.cpio"), &installed)?;
@@ -177,6 +177,7 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
             key.clone(),
         )],
     )?;
+    write(&scratch.dir.join("selector.cpio"), &selector)?;
     let mut extra = vec![
         (
             "bin/td-install".into(),
@@ -188,29 +189,19 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
             0o755,
             read(&btrfs.join("bin/mkfs.btrfs"))?,
         ),
-        ("selector.cpio".into(), 0o644, selector),
         ("trusted.pub".into(), 0o644, key),
     ];
-    for name in [
-        "bzImage",
-        "initramfs.cpio",
-        "root.erofs",
-        "manifest",
-        "manifest.sig",
-    ] {
-        extra.push((
-            format!("source/{name}"),
-            0o644,
-            read(&deployment.join(name))?,
-        ));
-    }
+    let payloads: Vec<_> = protocol::MEDIA_FILES
+        .iter()
+        .map(|(iso_name, name)| (*iso_name, scratch.dir.join(name)))
+        .collect();
     let live = scratch.dir.join("installer.cpio");
     write(&live, &initramfs(&base, &common, "install\n", &extra)?)?;
     let iso = scratch.dir.join("installer.iso");
-    media::write_image(&iso, &kernel, &live)?;
-    for (name, attachment) in [
-        ("optical", FirmwareAttachment::Optical),
-        ("usb", FirmwareAttachment::Usb),
+    media::write_image_with_payloads(&iso, &kernel, &live, &payloads)?;
+    for (name, attachment, source_device) in [
+        ("optical", FirmwareAttachment::Optical, "/dev/sr0"),
+        ("usb", FirmwareAttachment::Usb, "/dev/sda"),
     ] {
         let target = TargetDisk::create(&scratch.dir, &format!("{name}.img"))?;
         let vars = scratch.dir.join(format!("{name}-install-vars.fd"));
@@ -229,6 +220,14 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
             timeout,
         )?;
         require(&result, protocol::INSTALL_MARKER, "guest installation")?;
+        let media_evidence = format!("{} {source_device}", protocol::MEDIA_MARKER);
+        if !result
+            .console
+            .lines()
+            .any(|line| line.trim_end() == media_evidence)
+        {
+            return Err("guest did not prove read-only ISO payload access".into());
+        }
         for (count, marker) in [
             (1, protocol::FIRST_BOOT_MARKER),
             (2, protocol::SECOND_BOOT_MARKER),
@@ -283,7 +282,7 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
     let bad_live = scratch.dir.join("wrong-key.cpio");
     write(&bad_live, &initramfs(&base, &common, "install\n", &extra)?)?;
     let bad_iso = scratch.dir.join("wrong-key.iso");
-    media::write_image(&bad_iso, &kernel, &bad_live)?;
+    media::write_image_with_payloads(&bad_iso, &kernel, &bad_live, &payloads)?;
     let target = TargetDisk::create(&scratch.dir, "wrong-key.img")?;
     let vars = scratch.dir.join("wrong-key-vars.fd");
     efi::copy_input(&vars_template, &vars)?;
@@ -310,7 +309,9 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
             tail(&refused.console, 80)
         ));
     }
-    println!("PASS: native guest installation from optical and USB ISO; detached-media verified kexec and two persistent installed boots; wrong-key installation refused");
+    println!(
+        "PASS: native guest installation from read-only optical and USB ISO payloads; detached-media verified kexec and two persistent installed boots; wrong-key installation refused"
+    );
     Ok(())
 }
 
@@ -342,9 +343,11 @@ fn require(result: &BootResult, marker: &str, phase: &str) -> Result<(), String>
         Ok(())
     } else {
         Err(format!(
-            "{phase} did not reach {marker}: {}\n{}",
+            "{phase} did not reach {marker}: {}; selected current={:?}, previous={}\n{}",
             result.reason,
-            tail(&result.console, 80)
+            result.evidence.selected_current_id,
+            result.evidence.selected_previous,
+            tail(&result.console, 160)
         ))
     }
 }

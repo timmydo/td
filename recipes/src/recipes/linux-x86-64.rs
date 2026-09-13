@@ -128,6 +128,29 @@ pub fn recipe() -> Recipe {
     // pin key stays on `.source_input(...)` below, which is what gates/fetches the bytes.
     let mut steps = unpack_into("linux-x86-64-source", "{src}");
 
+    // The EFI initrd table is one-shot loader data; its storage can become
+    // kernel text after kexec. Discard it before the common EFI parser clears it.
+    steps.push(Step::substitute_text(
+        "{src}/arch/x86/platform/efi/quirks.c",
+        vec![
+            TextEdit::new(
+                "\tif (!data->smbios)\n\t\tgoto out_memremap;\n\n",
+                "",
+                1,
+            ),
+            TextEdit::new(
+                "\t\tif (!efi_guidcmp(guid, SMBIOS_TABLE_GUID))",
+                "\t\tif (data->smbios && !efi_guidcmp(guid, SMBIOS_TABLE_GUID))",
+                1,
+            ),
+            TextEdit::new(
+                "\t\t/* Do not bother to play with mem attr table across kexec */\n\t\tif (!efi_guidcmp(guid, EFI_MEMORY_ATTRIBUTES_TABLE_GUID))",
+                "\t\t/* Neither table survives kexec; the initrd uses boot_params. */\n\t\tif (!efi_guidcmp(guid, EFI_MEMORY_ATTRIBUTES_TABLE_GUID) ||\n\t\t    !efi_guidcmp(guid, LINUX_EFI_INITRD_MEDIA_GUID))",
+                1,
+            ),
+        ],
+    ));
+
     // The embedded cpio must share the external archive's fixed epoch. Upstream
     // swallows a missing date command and otherwise falls back to wall time.
     steps.push(Step::substitute_text(
@@ -534,6 +557,13 @@ pub fn recipe() -> Recipe {
                   /^#? *CONFIG_RANDOMIZE_BASE[ =]/d; \
                   /^#? *CONFIG_BLK_DEV_LOOP[ =]/d; \
                   /^#? *CONFIG_BTRFS_FS[ =]/d; \
+                  /^#? *CONFIG_SCSI[ =]/d; \
+                  /^#? *CONFIG_BLK_DEV_SD[ =]/d; \
+                  /^#? *CONFIG_BLK_DEV_SR[ =]/d; \
+                  /^#? *CONFIG_ATA[ =]/d; \
+                  /^#? *CONFIG_SATA_AHCI[ =]/d; \
+                  /^#? *CONFIG_USB_STORAGE[ =]/d; \
+                  /^#? *CONFIG_ISO9660_FS[ =]/d; \
                   /^#? *CONFIG_NET[ =]/d; \
                   /^#? *CONFIG_PACKET[ =]/d; \
                   /^#? *CONFIG_UNIX[ =]/d; \
@@ -660,6 +690,13 @@ pub fn recipe() -> Recipe {
                    '# CONFIG_RANDOMIZE_BASE is not set' \
                    'CONFIG_BLK_DEV_LOOP=y' \
                    'CONFIG_BTRFS_FS=y' \
+                   'CONFIG_SCSI=y' \
+                   'CONFIG_BLK_DEV_SD=y' \
+                   'CONFIG_BLK_DEV_SR=y' \
+                   'CONFIG_ATA=y' \
+                   'CONFIG_SATA_AHCI=y' \
+                   'CONFIG_USB_STORAGE=y' \
+                   'CONFIG_ISO9660_FS=y' \
                    'CONFIG_NET=y' \
                    'CONFIG_PACKET=y' \
                    'CONFIG_UNIX=y' \
@@ -787,6 +824,13 @@ pub fn recipe() -> Recipe {
                  grep -q '^CONFIG_RELOCATABLE=y' .config || { echo 'RELOCATABLE off — a non-relocatable bzImage is rejected by the x86 kexec_file_load loader (boots via -kernel, fails via kexec)' >&2; exit 1; }; \
                  grep -q '^CONFIG_BTRFS_FS=y' .config || { echo 'BTRFS_FS off — the persistent volume is one btrfs filesystem (@var plus the loop-mounted EROFS root blobs)' >&2; exit 1; }; \
                  grep -q '^CONFIG_BLK_DEV_LOOP=y' .config || { echo 'BLK_DEV_LOOP off — the immutable EROFS root is a file inside btrfs, loop-mounted read-only' >&2; exit 1; }; \
+                 grep -q '^CONFIG_SCSI=y' .config || { echo 'SCSI off - offline optical/USB installation requires built-in media support' >&2; exit 1; }; \
+                 grep -q '^CONFIG_BLK_DEV_SD=y' .config || { echo 'BLK_DEV_SD off - offline optical/USB installation requires built-in media support' >&2; exit 1; }; \
+                 grep -q '^CONFIG_BLK_DEV_SR=y' .config || { echo 'BLK_DEV_SR off - offline optical/USB installation requires built-in media support' >&2; exit 1; }; \
+                 grep -q '^CONFIG_ATA=y' .config || { echo 'ATA off - offline optical/USB installation requires built-in media support' >&2; exit 1; }; \
+                 grep -q '^CONFIG_SATA_AHCI=y' .config || { echo 'SATA_AHCI off - offline optical/USB installation requires built-in media support' >&2; exit 1; }; \
+                 grep -q '^CONFIG_USB_STORAGE=y' .config || { echo 'USB_STORAGE off - offline optical/USB installation requires built-in media support' >&2; exit 1; }; \
+                 grep -q '^CONFIG_ISO9660_FS=y' .config || { echo 'ISO9660_FS off - offline optical/USB installation requires built-in media support' >&2; exit 1; }; \
                  grep -q '^CONFIG_NET=y' .config || { echo 'NET off — no networking stack for td-netd link-up/DHCP' >&2; exit 1; }; \
                  grep -q '^CONFIG_INET=y' .config || { echo 'INET off — no IPv4/TCP/UDP for DHCP or resolve/reach' >&2; exit 1; }; \
                  grep -q '^CONFIG_PACKET=y' .config || { echo 'PACKET off — AF_PACKET raw-socket family unavailable' >&2; exit 1; }; \
@@ -1115,6 +1159,27 @@ pub fn recipe() -> Recipe {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn installation_media_drivers_are_builtin_after_config_resolution() {
+        let text = recipe()
+            .steps
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|step| match step {
+                Step::Run { argv, .. } => Some(argv.join("\n")),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        for symbol in [
+            "SCSI", "BLK_DEV_SD", "BLK_DEV_SR", "ATA", "SATA_AHCI",
+            "USB_STORAGE", "ISO9660_FS",
+        ] {
+            assert!(text.contains(&format!("'CONFIG_{symbol}=y'")));
+            assert!(text.contains(&format!("grep -q '^CONFIG_{symbol}=y' .config")));
+        }
+    }
 
     #[test]
     fn tpm_discovery_and_drivers_are_pinned_and_checked_after_resolution() {
