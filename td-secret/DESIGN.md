@@ -1,5 +1,10 @@
 # Local credential manager
 
+The portable personal-vault workstream for td-pass is specified separately
+in [PORTABLE.md](PORTABLE.md). It targets TPM-independent primary/backup
+FIDO2 protection and supported foreign-Linux use. Its staged prerequisites
+do not change the application credential interfaces or protection below.
+
 ## File-backed stores before enrollment
 
 This is a dependency-free Rust implementation of APPLICATIONS.md §W.4.

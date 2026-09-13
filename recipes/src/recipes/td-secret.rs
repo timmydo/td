@@ -11,6 +11,7 @@ const MODULES: &[(&str, &str)] = &[
     ("consent", include_str!("../../../td-authd/src/consent.rs")),
     ("client", include_str!("../../../td-secret/src/client.rs")),
     ("crypto", include_str!("../../../td-secret/src/crypto.rs")),
+    ("portable", include_str!("../../../td-secret/src/portable.rs")),
     ("fido_cbor", include_str!("../../../td-secret/src/fido_cbor.rs")),
     ("fido_ctap", include_str!("../../../td-secret/src/fido_ctap.rs")),
     ("fido_device", include_str!("../../../td-secret/src/fido_device.rs")),

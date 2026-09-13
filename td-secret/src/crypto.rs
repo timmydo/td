@@ -68,7 +68,7 @@ pub fn derive(master: &[u8; 32], app: &str) -> [u8; 32] {
     hkdf(master, b"td-secret/store/v1", app.as_bytes())
 }
 
-fn hkdf(ikm: &[u8], salt: &[u8], info: &[u8]) -> [u8; 32] {
+pub(super) fn hkdf(ikm: &[u8], salt: &[u8], info: &[u8]) -> [u8; 32] {
     let prk = hmac(salt, ikm);
     let mut input = info.to_vec();
     input.push(1);
@@ -142,7 +142,7 @@ fn block(key: &[u8; 32], nonce: &[u8; 12], counter: u32) -> [u8; 64] {
 
 fn crypt(key: &[u8; 32], nonce: &[u8; 12], data: &mut [u8]) {
     for (index, chunk) in data.chunks_mut(64).enumerate() {
-        // Store records are bounded to 4096 bytes before entering this module.
+        // Callers bound records to 4 KiB and portable notebooks to 4 MiB.
         let stream = block(key, nonce, (index as u32).wrapping_add(1));
         for (byte, pad) in chunk.iter_mut().zip(stream) {
             *byte ^= pad;

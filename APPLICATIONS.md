@@ -9309,6 +9309,11 @@ package lives rather than of how many copies of it exist.
 
 ### W.4 The credential manager
 
+The personal password notebook td-pass and its portable protector workstream
+are specified by `td-pass/DESIGN.md` and `td-secret/PORTABLE.md`. They extend
+td-secret in independently tested increments; the current application
+credential service described here acquires no personal-vault authority.
+
 Unenrolled stores use the increment-(a) backend: one per-user store at
 `/var/lib/td/secrets/<uid>` beside the machine identity. `td-firstboot`
 creates the master and the initial `mail/main` placeholder. The
@@ -9782,6 +9787,12 @@ review found in them is fixed in the commit that follows the rename, and
 the trees' home is td from there on.
 
 ## X. Host mode — development only
+
+The separately specified td-pass standalone product is an explicit exception
+to this section's development-only scope. `td-secret/PORTABLE.md` owns its
+host authentication and storage contract; this does not promote td-jail's
+host fixture to a supported general application platform or extend td-authd
+authority to a foreign desktop.
 
 **The application layer runs on an ordinary Linux host, and that mode is
 a development tool rather than a product.** It exists so this work can be

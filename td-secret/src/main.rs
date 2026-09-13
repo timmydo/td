@@ -40,6 +40,8 @@ mod fido_enroll;
 mod principals;
 #[allow(dead_code, reason = "the portal shares the authenticated store reader")]
 mod crypto;
+#[allow(dead_code, reason = "portable envelope prerequisite; no public unlock yet")]
+mod portable;
 #[path = "../../td-busd/src/message.rs"]
 #[allow(dead_code, reason = "shared bounded D-Bus codec")]
 mod message;
@@ -184,6 +186,7 @@ mod confinement {
             ("enrollment_operation.rs", include_str!("enrollment_operation.rs")),
             ("write_operation.rs", include_str!("write_operation.rs")),
             ("crypto.rs", include_str!("crypto.rs")),
+            ("portable.rs", include_str!("portable.rs")),
             ("fido_cbor.rs", include_str!("fido_cbor.rs")),
             ("fido_ctap.rs", include_str!("fido_ctap.rs")),
             ("fido_device.rs", include_str!("fido_device.rs")),
@@ -258,6 +261,7 @@ pub fn take_received(fd: RawFd) -> Result<File, String> {
                 "fido_metadata.rs",
                 "main.rs",
                 "operation.rs",
+                "portable.rs",
                 "set_client.rs",
                 "store.rs",
                 "sys.rs",
