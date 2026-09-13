@@ -12,6 +12,33 @@ pub(super) struct TargetDisk {
 }
 
 impl TargetDisk {
+    fn copy_volume_identity(&self, source: &TargetDisk) -> Result<(), String> {
+        let mut input = File::open(&source.path).map_err(|error| error.to_string())?;
+        // The formatter's fixed GPT profile places the volume after the ESP.
+        let offset = td_boot_protocol::PARTITION_ALIGN_BYTES + td_boot_protocol::ESP_BYTES + 65536;
+        input
+            .seek(SeekFrom::Start(offset))
+            .map_err(|error| error.to_string())?;
+        let mut superblock = [0; 4096];
+        input
+            .read_exact(&mut superblock)
+            .map_err(|error| error.to_string())?;
+        if superblock.get(64..72) != Some(b"_BHRfS_M".as_slice()) {
+            return Err("fixture did not find the installed Btrfs superblock".into());
+        }
+        let mut output = OpenOptions::new()
+            .write(true)
+            .open(&self.path)
+            .map_err(|error| error.to_string())?;
+        output
+            .seek(SeekFrom::Start(65536))
+            .map_err(|error| error.to_string())?;
+        output
+            .write_all(&superblock)
+            .and_then(|()| output.sync_all())
+            .map_err(|error| error.to_string())
+    }
+
     fn create(scratch: &Path, name: &str) -> Result<Self, String> {
         let path = scratch.join(name);
         let file = OpenOptions::new()
@@ -228,10 +255,42 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
         {
             return Err("guest did not prove read-only ISO payload access".into());
         }
+        let duplicate = TargetDisk::create(&scratch.dir, &format!("{name}-duplicate.img"))?;
+        duplicate.copy_volume_identity(&target)?;
+        let vars = scratch.dir.join(format!("{name}-duplicate-vars.fd"));
+        efi::copy_input(&vars_template, &vars)?;
+        let refused =
+            "TD-INSTALL-REFUSED: volume resolution failed: td-boot: ambiguous td volume identity";
+        println!("   [qemu-install] refusing duplicate volume identity before selection");
+        let result = boot_source(
+            &qemu,
+            BootSource::Firmware {
+                code: &code,
+                vars: &vars,
+                attachment: FirmwareAttachment::InstalledFixtureReordered,
+                installation_target: Some(&duplicate),
+            },
+            plan(&target.path, false, refused),
+            &scratch.dir,
+            timeout,
+        )?;
+        require(&result, refused, "duplicate volume refusal")?;
+        if result.evidence.selected_current || result.evidence.selected_previous {
+            return Err("ambiguous volume reached deployment selection".into());
+        }
+        let mut previous_identity = None;
         for (count, marker) in [
             (1, protocol::FIRST_BOOT_MARKER),
             (2, protocol::SECOND_BOOT_MARKER),
         ] {
+            let decoy = if count == 2 {
+                Some(TargetDisk::create(
+                    &scratch.dir,
+                    &format!("{name}-decoy.img"),
+                )?)
+            } else {
+                None
+            };
             let vars = scratch.dir.join(format!("{name}-boot-{count}-vars.fd"));
             efi::copy_input(&vars_template, &vars)?;
             println!("   [qemu-install] cold installed boot {count}, {name} media detached");
@@ -241,14 +300,47 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
                 BootSource::Firmware {
                     code: &code,
                     vars: &vars,
-                    attachment: FirmwareAttachment::InstalledFixture,
-                    installation_target: None,
+                    attachment: if count == 2 {
+                        FirmwareAttachment::InstalledFixtureReordered
+                    } else {
+                        FirmwareAttachment::InstalledFixture
+                    },
+                    installation_target: decoy.as_ref(),
                 },
                 plan(&target.path, false, &expected),
                 &scratch.dir,
                 timeout,
             )?;
             require(&result, marker, "installed boot")?;
+            let expected_device = if count == 2 { "/dev/vdb2" } else { "/dev/vda2" };
+            let discovered: Vec<_> = result
+                .console
+                .lines()
+                .map(str::trim_end)
+                .filter_map(|line| line.strip_prefix("TD-INSTALL-VOLUME "))
+                .collect();
+            if discovered.len() != 2
+                || discovered.first() != discovered.last()
+                || !discovered
+                    .first()
+                    .is_some_and(|line| line.ends_with(expected_device))
+            {
+                return Err(format!(
+                    "selector/deployment did not resolve the same UUID on {expected_device}"
+                ));
+            }
+            let identity = discovered
+                .first()
+                .and_then(|line| line.split_once(' '))
+                .map(|(uuid, _)| uuid.to_owned())
+                .ok_or("missing resolved UUID")?;
+            if previous_identity
+                .as_ref()
+                .is_some_and(|previous| previous != &identity)
+            {
+                return Err("volume UUID changed across cold boots".into());
+            }
+            previous_identity = Some(identity);
             if !result.evidence.selected_current
                 || result.evidence.selected_previous
                 || result.evidence.bookkeeping_unavailable
@@ -310,7 +402,7 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
         ));
     }
     println!(
-        "PASS: native guest installation from read-only optical and USB ISO payloads; detached-media verified kexec and two persistent installed boots; wrong-key installation refused"
+        "PASS: native optical/USB installation; UUID discovery across verified kexec and reordered disks; duplicate identity and wrong-key refusals; two persistent installed boots"
     );
     Ok(())
 }

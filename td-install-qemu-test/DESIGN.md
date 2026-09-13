@@ -8,8 +8,8 @@ admission, destructive consent, account configuration or signing identity.
 The host oracle exclusively creates each sparse target inside its private
 scratch directory and exposes it as a writable virtio disk with the fixture
 serial. The ISO stays read-only. The fixture refuses outside PID 1 and admits
-exactly one whole virtio disk with that serial; it accepts no command-line
-destination. This is test identification, not a real installer authorization
+exactly one whole virtio installation target with that serial; it accepts
+no command-line destination. This is test identification, not a real installer authorization
 mechanism. Firmware variables are private copies, networking is disabled,
 and the host boot runner owns deadlines and QEMU teardown. Each boot defaults
 to 180 seconds; a positive TD_QEMU_BOOT_TIMEOUT_SECS overrides that limit.
@@ -24,8 +24,8 @@ The live initramfs holds source-built tools and the public trust root. The
 tiny signed deployment and fixed selector are streamed into separate ISO
 files. Boot files and tools read into the fixture initramfs are bounded at
 256 MiB. The shared composer accepts larger ISO payloads under MEDIA.md,
-but this diagnostic still constructs only a small deployment. The private key remains
-on the host outside derivations. The fixture calls the
+but this diagnostic still constructs only a small deployment. The private
+key remains on the host outside derivations. The fixture calls the
 actual td-install layout and volume primitives, including td-boot's verified
 publication. Its success marker follows both successful commands and sync.
 
@@ -53,9 +53,25 @@ it does not establish exclusive admission against later hotplug.
 Missing payloads refuse before layout; no initramfs copy is available as a
 fallback. The formatter still stages the deployment and Btrfs image in RAM.
 
-The host then detaches media and cold-boots only the destination through
-firmware. The fixed selector authenticates and kexecs the installed tiny
-deployment. Its init verifies and loop-mounts the installed EROFS payload,
+The host then detaches media and cold-boots the destination through
+firmware. The selector calls `td-boot volume` to discover exactly one
+labelled td Btrfs volume and passes its UUID through `td.volume=` in the
+verified kexec command line. It refuses an existing handoff token. The
+selected fixture requires exactly one UUID token and resolves that UUID
+again, using the returned device for root, @var and acknowledgement.
+Neither installed phase uses the fixture serial or partition suffix.
+The host requires identical UUID/device evidence from both phases.
+
+Before successful boots, a private decoy gets a copy of the installed
+primary superblock at its own whole-disk superblock offset. The duplicate
+identity must refuse before deployment selection. This is an identity
+collision fixture, not a second mountable filesystem. First normal boot
+uses the destination alone; the second attaches a fresh blank virtio disk
+first, moving the destination from /dev/vda2 to /dev/vdb2. Firmware still
+boots the destination by explicit boot index. Both phases must report the
+expected device and preserve the same UUID across those cold boots.
+
+The fixed selector authenticates and kexecs the installed tiny deployment. Its init verifies and loop-mounts the installed EROFS payload,
 reads its sentinel, and writes a synced count in Btrfs @var. A second cold
 boot must observe and advance that count. The reported deployment ID must
 match the host's signed manifest. Successful installed boots also acknowledge
@@ -64,11 +80,14 @@ a second public key must produce an authentication refusal and no installation
 success marker. Both optical and USB installation boots
 use the same ISO bytes and fresh destination disks.
 
-The fixture's serial and partition-two convention do not implement production
-volume discovery. It does not launch the compositor, configure an account,
-retain an installation signing key, or test a full desktop deployment.
+The fixture's serial convention does not implement production installation
+admission. Volume discovery uses the production read-only primitive under
+the oracle's fixed topology; it does not establish exclusive admission.
+It does not launch the compositor, configure an account, retain an
+installation signing key, or test a full desktop deployment.
 The final installer still needs the activation evidence in
-../td-install/INSTALLER.md, including stable volume identity and settings.
+../td-install/INSTALLER.md, including the full-system volume-consumer
+cutover and settings.
 
 All operations use safe Rust and existing td-init/td-boot applets. No syscall
 surface or external dependency is added. Unit tests cover refusal outside

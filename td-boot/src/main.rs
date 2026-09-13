@@ -10,6 +10,8 @@
 mod protocol;
 #[path = "measurement.rs"]
 mod measurement;
+#[path = "volume.rs"]
+mod volume;
 // The real-regular-bounded file rule, shared with `td-install` for
 // `protocol.rs`'s reason — and with the same redundant `#[path]` the fixture
 // carries below, so the staging guard sees it. Unlike the fixture this one IS
@@ -80,6 +82,7 @@ const MAX_MOUNTINFO_BYTES: u64 = 1024 * 1024;
 const UPDATE_LOCK_DIR: &str = "/run/td-boot-locks";
 
 enum Mode {
+    Volume { uuid: Option<volume::Uuid> },
     Verify {
         root: PathBuf,
     },
@@ -231,7 +234,7 @@ fn invalid(message: impl Into<String>) -> io::Error {
 fn usage_error() -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidInput,
-        "usage: td-boot verify <volume-root>\n       td-boot root-loop <volume-root> <deployment-id> <loop-device>\n       td-boot boot <device> <mountpoint> <cmdline>\n       td-boot install <device> <mountpoint> <deployment-directory> [trusted-key]\n       td-boot update <device> <mountpoint> <volume> <channel> <trusted-key>\n       td-boot publish <volume-root> <deployment-directory> [trusted-key]\n       td-boot rollback <device> <mountpoint>\n       td-boot success <device> <mountpoint> <deployment-id>\n       td-boot authenticate <deployment-directory> [trusted-key]",
+        "usage: td-boot volume [UUID]\n       td-boot verify <volume-root>\n       td-boot root-loop <volume-root> <deployment-id> <loop-device>\n       td-boot boot <device> <mountpoint> <cmdline>\n       td-boot install <device> <mountpoint> <deployment-directory> [trusted-key]\n       td-boot update <device> <mountpoint> <volume> <channel> <trusted-key>\n       td-boot publish <volume-root> <deployment-directory> [trusted-key]\n       td-boot rollback <device> <mountpoint>\n       td-boot success <device> <mountpoint> <deployment-id>\n       td-boot authenticate <deployment-directory> [trusted-key]",
     )
 }
 
@@ -248,6 +251,21 @@ fn parse_deployment_id(value: OsString) -> io::Result<String> {
 
 fn parse_args<I: Iterator<Item = OsString>>(mut args: I) -> io::Result<Mode> {
     match args.next().as_deref() {
+        Some(mode) if mode == OsStr::new("volume") => {
+            let uuid = args
+                .next()
+                .map(|value| {
+                    let text = value
+                        .to_str()
+                        .ok_or_else(|| invalid("non-ASCII volume UUID"))?;
+                    volume::Uuid::parse(text)
+                })
+                .transpose()?;
+            if args.next().is_some() {
+                return Err(usage_error());
+            }
+            Ok(Mode::Volume { uuid })
+        }
         Some(mode) if mode == OsStr::new("verify") => {
             let root = args.next().ok_or_else(usage_error)?;
             if args.next().is_some() {
@@ -3107,6 +3125,10 @@ fn run() -> io::Result<()> {
 /// drives this function rather than `run_install` for exactly that reason.
 fn dispatch(mode: Mode) -> io::Result<()> {
     match mode {
+        Mode::Volume { uuid } => {
+            let (uuid, path) = volume::resolve(uuid.as_ref())?;
+            writeln!(io::stdout(), "{uuid} {}", path.display())
+        }
         Mode::Verify { root } => run_verify(&root),
         Mode::RootLoop {
             root,

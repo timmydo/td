@@ -426,6 +426,58 @@ The Btrfs partition takes the remainder and carries `@var` plus
 
 ## 5. Firmware entry
 
+### Read-only volume discovery primitive
+
+`td-boot volume [UUID]` prints one canonical lowercase filesystem UUID and
+one `/dev` path, separated by a space and terminated by a newline. Without
+an argument it requires exactly one visible `td-system` Btrfs volume. With
+a UUID it requires exactly one matching volume. Multiple eligible volumes,
+including two devices carrying a cloned UUID, refuse rather than selecting
+by enumeration order. UUIDs and labels identify bytes; they do not
+authenticate a deployment or authorize a write.
+
+The resolver refuses more than 4096 `/sys/class/block` entries and probes only
+direct virtio, SCSI/SATA and NVMe disk/partition names (`vd*`, `sd*`, and
+`nvme*n*`, with their numeric partition suffixes). Loop, device-mapper,
+mdraid and optical devices are outside this primitive. Each candidate's
+bounded sysfs device number must match its real block node before and after
+a read-only `O_NOFOLLOW|O_NONBLOCK` open, including inode identity across
+the open. The same device and inode checks follow the read. Unreadable
+candidates or malformed sysfs values refuse; small devices cannot contain
+a primary superblock and are skipped.
+
+One 4096-byte primary superblock at byte 65536 is read through the held
+descriptor. The layout follows btrfs-progs v7.0's
+[`btrfs_super_block`](https://github.com/kdave/btrfs-progs/blob/v7.0/kernel-shared/uapi/btrfs_tree.h).
+Non-Btrfs and differently labelled volumes are ignored. Matching labels
+require CRC32C, the primary offset, a nonzero UUID, one device, and ordinary
+superblock flags. Unsupported checksums, seed/metadump/changing/error flags,
+and corrupt matching superblocks refuse. This is a narrow identity probe,
+not a complete filesystem validator; the kernel still validates mounts.
+
+No match is polled against a thirty-second wall-clock deadline checked
+between scans. One scan can overrun it: block I/O may wait despite
+`O_NONBLOCK`. A missing candidate node
+or sysfs value invalidates the entire partial scan and retries within that
+deadline, allowing cold-boot devtmpfs publication to finish. An ambiguity or
+other error is not retried. A successful scan describes currently visible
+devices, not devices that might appear after it, and closes its descriptors before
+returning. The caller must keep the topology stable and revalidate identity
+at a later use. Root-owned devtmpfs/sysfs and their ancestors are trusted;
+this is neither exclusive device admission nor protection from hostile
+hotplug or a privileged namespace writer.
+
+The native installation oracle uses the resolver on both sides of kexec:
+the selector passes the UUID as one `td.volume=` token, and the selected
+fixture requires exactly that UUID. Installation target admission remains
+the fixture's private serial convention. The full-system selector, init,
+boot acknowledgement and update authority still use the stock VM device;
+their atomic cutover and stable-use binding are the next integration step.
+That selector must obtain its expected UUID from its boot source instead
+of adopting the fixture's unfiltered single-volume convention, so another
+valid td disk can coexist without making boot ambiguous.
+This command alone does not activate physical-device installation.
+
 td boots by the **removable-media path**: `\EFI\BOOT\BOOTX64.EFI` on the ESP,
 which every UEFI implementation boots when no NVRAM boot entry names anything
 else. That path needs no `efivarfs` write at all, which is why it comes
@@ -1021,9 +1073,10 @@ otherwise identical signed source without an installation-success marker.
 The private signing key never enters the guest or a derivation.
 
 The fixture accepts no operator destination and is absent from system and
-installer profiles. Its serial-based device identification and partition-two
-convention are diagnostic scaffolding, not production volume discovery or
-consent. Linux mounts its ISO payload files read-only before installation;
+installer profiles. Its serial-based installation target identification is
+diagnostic scaffolding, not production consent. Installed boots exercise
+the read-only resolver above, including changed disk ordering and duplicate
+identity refusal before selection. Linux mounts its ISO payload files read-only before installation;
 the live initramfs holds tools and the public trust root. Full system
 installation, machine settings and compositor evidence remain required by
 INSTALLER.md. This fixture does not enforce selector/volume key

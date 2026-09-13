@@ -4332,6 +4332,8 @@ enum FirmwareAttachment {
     Virtio,
     /// The ordinary virtio disk carries the native installer fixture serial.
     InstalledFixture,
+    /// A private decoy precedes the installed disk in virtio discovery order.
+    InstalledFixtureReordered,
     Optical,
     Usb,
 }
@@ -4386,6 +4388,12 @@ fn boot_source(
         return Err("an installation target requires optical or USB source media".into());
     }
     validate_boot_plan_tokens(plan.extra_append)?;
+    if matches!(source, BootSource::Firmware {
+        attachment: FirmwareAttachment::InstalledFixtureReordered,
+        installation_target: None, ..
+    }) {
+        return Err("reordered fixture requires a private decoy disk".into());
+    }
     if plan.capture_firefox_audio && (!plan.audio || !plan.physical_input) {
         return Err(
             "Firefox audio capture requires both system audio and physical input".to_string(),
@@ -4515,6 +4523,19 @@ fn boot_source(
     // drive_arg comma-doubles the image path so a scratch dir with a literal comma in
     // its path can't be misparsed as an extra -drive key=value pair.
     if let Some(disk) = plan.disk {
+        if let BootSource::Firmware {
+            attachment: FirmwareAttachment::InstalledFixtureReordered,
+            installation_target: Some(decoy), ..
+        } = source {
+            cmd.arg("-drive").arg(install::target_drive_arg(decoy));
+            let device_prefix = crate::checks::vm_profile::DISK_DEVICE
+                .strip_suffix(crate::checks::vm_profile::DRIVE_ID)
+                .ok_or("VM disk device must end with its drive ID")?;
+            cmd.arg("-device").arg(format!(
+                "{device_prefix}{},serial=td-install-decoy,bootindex=9",
+                install::TARGET_DRIVE_ID
+            ));
+        }
         match source {
             BootSource::Firmware {
                 attachment: FirmwareAttachment::Optical, ..
@@ -4533,8 +4554,8 @@ fn boot_source(
             }
             _ => {
                 cmd.arg("-drive").arg(drive_arg(disk.path, disk.read_only));
-                if matches!(source, BootSource::Firmware { attachment: FirmwareAttachment::InstalledFixture, .. }) {
-                    cmd.arg("-device").arg(format!("{},serial={}",
+                if matches!(source, BootSource::Firmware { attachment: FirmwareAttachment::InstalledFixture | FirmwareAttachment::InstalledFixtureReordered, .. }) {
+                    cmd.arg("-device").arg(format!("{},serial={},bootindex=1",
                         crate::checks::vm_profile::DISK_DEVICE, install::protocol::TARGET_SERIAL));
                 } else {
                     cmd.args(["-device", crate::checks::vm_profile::DISK_DEVICE]);
@@ -4542,7 +4563,10 @@ fn boot_source(
             }
         }
     }
-    if let BootSource::Firmware { installation_target: Some(target), .. } = source {
+    if let BootSource::Firmware {
+        attachment: FirmwareAttachment::Optical | FirmwareAttachment::Usb,
+        installation_target: Some(target), ..
+    } = source {
         cmd.arg("-drive").arg(install::target_drive_arg(target));
         cmd.arg("-device").arg(format!(
             "{}{},serial={}",

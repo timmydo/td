@@ -208,16 +208,49 @@ fn install(device: &str) -> Result<(), String> {
     writeln!(std::io::stdout(), "{INSTALL_MARKER}").map_err(|error| error.to_string())
 }
 
-fn selector(device: &str) -> Result<(), String> {
-    let cmdline = String::from_utf8(read(Path::new("/proc/cmdline"), 2048)?)
-        .map_err(|_| "non-UTF-8 command line")?;
-    command(
-        "/bin/td-boot",
-        &["boot", &format!("{device}2"), "/volume", cmdline.trim_end()],
-    )
+fn volume(uuid: Option<&str>) -> Result<(String, String), String> {
+    let mut cmd = Command::new("/bin/td-boot");
+    cmd.arg("volume");
+    if let Some(uuid) = uuid {
+        cmd.arg(uuid);
+    }
+    let output = cmd
+        .output()
+        .map_err(|error| format!("resolve volume: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "volume resolution failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim_end()
+        ));
+    }
+    let text = String::from_utf8(output.stdout).map_err(|_| "non-ASCII volume result")?;
+    let fields: Vec<_> = text.split_ascii_whitespace().collect();
+    let [found, path] = fields.as_slice() else {
+        return Err("invalid volume result".into());
+    };
+    if uuid.is_some_and(|uuid| uuid != *found) {
+        return Err("resolved wrong volume UUID".into());
+    }
+    writeln!(std::io::stdout(), "TD-INSTALL-VOLUME {found} {path}")
+        .map_err(|error| error.to_string())?;
+    Ok(((*found).into(), (*path).into()))
 }
 
-fn installed(device: &str) -> Result<(), String> {
+fn selector() -> Result<(), String> {
+    let cmdline = String::from_utf8(read(Path::new("/proc/cmdline"), 2048)?)
+        .map_err(|_| "non-UTF-8 command line")?;
+    if cmdline
+        .split_ascii_whitespace()
+        .any(|word| word.starts_with("td.volume="))
+    {
+        return Err("selector refuses a preexisting volume handoff".into());
+    }
+    let (uuid, device) = volume(None)?;
+    let cmdline = format!("{} td.volume={uuid}", cmdline.trim_end());
+    command("/bin/td-boot", &["boot", &device, "/volume", &cmdline])
+}
+
+fn installed() -> Result<(), String> {
     let cmdline = String::from_utf8(read(Path::new("/proc/cmdline"), 2048)?)
         .map_err(|_| "non-UTF-8 command line")?;
     let ids: Vec<&str> = cmdline
@@ -227,7 +260,14 @@ fn installed(device: &str) -> Result<(), String> {
     let [id] = ids.as_slice() else {
         return Err("missing or duplicate selected deployment".into());
     };
-    let partition = format!("{device}2");
+    let volumes: Vec<_> = cmdline
+        .split_ascii_whitespace()
+        .filter_map(|word| word.strip_prefix("td.volume="))
+        .collect();
+    let [uuid] = volumes.as_slice() else {
+        return Err("missing or duplicate volume handoff".into());
+    };
+    let (_, partition) = volume(Some(uuid))?;
     applet(&[
         "mount",
         "-t",
@@ -291,11 +331,10 @@ fn run() -> Result<(), String> {
         return Err("installation fixture must be guest PID 1".into());
     }
     directories()?;
-    let device = target()?;
     match read(Path::new("/fixture-phase"), 32)?.as_slice() {
-        b"install\n" => install(&device),
-        b"selector\n" => selector(&device),
-        b"installed\n" => installed(&device),
+        b"install\n" => install(&target()?),
+        b"selector\n" => selector(),
+        b"installed\n" => installed(),
         _ => Err("invalid fixture phase".into()),
     }
 }
