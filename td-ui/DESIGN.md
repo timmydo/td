@@ -56,11 +56,13 @@ surface.
 Newly built: `td-setup`, the second consumer, is a new crate whose
 `welcome` page renders from the toolkit and whose Wayland turn loop
 presents it as a live `App`, proven under the native compositor harness
-(increment 6). Partly moved: td-portal's file chooser, the third consumer,
-now renders from the toolkit's raster and chrome bands (increment 7(c)); its
-transport becomes a live `App` in 7(d). The increments below schedule the rest.
-td-editor's window is the first `App` and td-setup's the second; each owns
-no Wayland objects of its own.
+(increment 6). Moved: td-portal's file chooser, the third consumer, renders
+from the toolkit's raster and chrome bands (increment 7(c)) and its private
+transport is now a live `App` over the shared client (increment 7(d)), the
+old hand-rolled Wayland transport deleted. Its dialog is the first `App` to
+own a Wayland object of its own, the privileged `td_portal_manager_v1` it
+binds through its `Tag`. td-editor's window is the first `App` and
+td-setup's the second; each of those owns no Wayland objects of its own.
 
 ## Purpose and trust position
 
@@ -204,8 +206,10 @@ of its own files may name each module.
   the budgets `OBJECTS`, `GLOBALS`, `NAME_BYTES`, `BUFFERS`,
   `MESSAGES_PER_TURN` and `INITIAL_DEADLINE`; `new`, the table (`allocate`
   and `set_tag` for the consumer's own objects, `kind` for any slot), the
-  registry (`find_global`, `global_name`, `bind`, `required`, `is_required`,
-  `forget_global`), the toplevel (`set_title`, `set_app_id`, `commit`,
+  registry (`find_global`, `global_name`, `globals` for a consumer that must
+  assert the compositor advertised an exact global set, `bind`, `required`,
+  `is_required`, `forget_global`), the toplevel (`set_title`, `set_app_id`,
+  `commit`,
   `acknowledge`, `close`), presentation (`can_present` and `present`, which
   refuses an extent the raster could not paint, then paints through the
   caller's closure into the reused raster and submits under the three-buffer

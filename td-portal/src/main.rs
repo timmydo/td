@@ -37,16 +37,7 @@ mod fido_hid;
 mod fido_metadata;
 #[path = "../../td-secret/src/crypto.rs"]
 mod crypto;
-mod file_chooser;
 mod handles;
-#[path = "../../td-compositor/src/keyboard.rs"]
-#[allow(
-    dead_code,
-    reason = "the shared keyboard profile is broader than one chooser"
-)]
-mod keyboard;
-#[path = "../../td-compositor/src/filter.rs"]
-mod list_filter;
 #[path = "../../td-busd/src/message.rs"]
 #[allow(
     dead_code,
@@ -64,14 +55,11 @@ mod secret_store;
 mod tpm;
 mod settings;
 #[path = "../../td-secret/src/sys.rs"]
-mod sys;
-mod wayland_dialog;
-#[path = "../../td-compositor/src/wire.rs"]
 #[allow(
     dead_code,
-    reason = "the shared compositor codec is broader than one registry probe"
+    reason = "the shared syscall surface is broader than the secret store's use"
 )]
-mod wayland_wire;
+mod sys;
 #[path = "../../td-busd/src/wire.rs"]
 #[allow(
     dead_code,
@@ -79,13 +67,9 @@ mod wayland_wire;
 )]
 mod wire;
 
-mod scene {
-    #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-    pub struct SurfaceKey {
-        pub client: u64,
-        pub object: u32,
-    }
-}
+// The file chooser and its private-Wayland dialog live in the crate library
+// (`lib.rs`), shared with the integration tests; the binary drives them.
+use td_portal::{dialog, file_chooser};
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
@@ -1210,7 +1194,7 @@ enum ServiceEvent {
     Audit,
     Dialog {
         path: String,
-        notice: wayland_dialog::Notice,
+        notice: dialog::Notice,
     },
 }
 
@@ -1624,7 +1608,7 @@ fn consume_identity_reply(
             filter: pending.filter.clone(),
         },
     );
-    let config = wayland_dialog::DialogConfig {
+    let config = dialog::DialogConfig {
         socket: PathBuf::from(FILE_CHOOSER_SOCKET),
         runtime_directory: PathBuf::from(FILE_CHOOSER_RUNTIME),
         title: pending.title,
@@ -1639,7 +1623,7 @@ fn consume_identity_reply(
     };
     let event_sender = events.clone();
     let event_path = path.clone();
-    if let Err(error) = wayland_dialog::spawn(config, move |notice| {
+    if let Err(error) = dialog::spawn(config, move |notice| {
         event_sender
             .send(ServiceEvent::Dialog {
                 path: event_path.clone(),
@@ -1670,10 +1654,10 @@ fn consume_dialog_notice(
     connection: &mut Connection,
     state: &mut ServiceState,
     path: &str,
-    notice: wayland_dialog::Notice,
+    notice: dialog::Notice,
 ) -> io::Result<()> {
     match notice {
-        wayland_dialog::Notice::Connected(stream) => {
+        dialog::Notice::Connected(stream) => {
             if let Some(active) = state.active.get_mut(path) {
                 if active.cancelled {
                     shutdown_dialog_stream(&stream)?;
@@ -1688,7 +1672,7 @@ fn consume_dialog_notice(
                 shutdown_dialog_stream(&stream)?;
             }
         }
-        wayland_dialog::Notice::Presented {
+        dialog::Notice::Presented {
             width,
             height,
             checksum,
@@ -1710,7 +1694,7 @@ fn consume_dialog_notice(
             );
             io::stdout().flush()?;
         }
-        wayland_dialog::Notice::Completed(outcome) => {
+        dialog::Notice::Completed(outcome) => {
             let Some(active) = state.active.remove(path) else {
                 return Ok(());
             };
@@ -3596,17 +3580,20 @@ mod confinement {
         ("file_chooser.rs", include_str!("file_chooser.rs")),
         ("handles.rs", include_str!("handles.rs")),
         ("main.rs", include_str!("main.rs")),
+        ("dialog.rs", include_str!("dialog.rs")),
+        ("lib.rs", include_str!("lib.rs")),
         ("settings.rs", include_str!("settings.rs")),
         ("secret.rs", include_str!("secret.rs")),
         ("sys.rs", include_str!("../../td-secret/src/sys.rs")),
-        ("wayland_dialog.rs", include_str!("wayland_dialog.rs")),
         ("app_policy.rs", include_str!("../../td-busd/src/app_policy.rs")),
     ];
     const SYS: &str = include_str!("../../td-secret/src/sys.rs");
-    const DIALOG: &str = include_str!("wayland_dialog.rs");
 
     fn production(source: &str) -> &str {
-        source.split_once("#[cfg(test)]").unwrap().0
+        // A source with no test section (lib.rs) is all production.
+        source
+            .split_once("#[cfg(test)]")
+            .map_or(source, |(before, _)| before)
     }
 
     #[test]
@@ -3667,13 +3654,38 @@ pub fn take_received(fd: RawFd) -> Result<File, String> {
     Ok(unsafe { File::from_raw_fd(fd) })
 }"#
         ));
-        assert_eq!(production(DIALOG).matches("sys::send_with_fd(").count(), 1);
-        assert_eq!(production(DIALOG).matches("sys::recv_with_fds(").count(), 1);
-        assert_eq!(production(DIALOG).matches("sys::take_received(").count(), 1);
-        assert_eq!(
-            production(DIALOG).matches("sys::discard_received(").count(),
-            4
-        );
+        // The dialog no longer passes Wayland descriptors itself: the shared
+        // client owns the keymap fd and the SHM pool over its own recvmsg /
+        // sendmsg surface (UNSAFE.md §19). The portal's remaining descriptor
+        // discipline is the secret store's, pinned in secret.rs's own tests.
+    }
+
+    #[test]
+    fn only_the_dialog_reaches_the_toolkit_transport() {
+        // td-ui/DESIGN.md requires each consumer to pin which files may name
+        // the toolkit's transport and turn loop. Only `dialog.rs` is a Wayland
+        // client; `file_chooser.rs` renders over the raster and chrome bands
+        // and never reaches the client, so the chooser cannot quietly open a
+        // second connection or drive the loop.
+        // Scan production code only, so this test's own mention of the module
+        // paths (and any in a doc comment) is not mistaken for a use.
+        for (name, source) in SOURCES {
+            if *name == "dialog.rs" {
+                continue;
+            }
+            for module in ["td_ui::client", "td_ui::wayland"] {
+                assert!(
+                    !production(source).contains(module),
+                    "{name} names {module}; only dialog.rs may"
+                );
+            }
+        }
+        let prod = |name: &str| production(SOURCES.iter().find(|(n, _)| *n == name).unwrap().1);
+        // The boundary is real: dialog.rs names the client, so removing it
+        // would be caught here; file_chooser renders without the transport.
+        assert!(prod("dialog.rs").contains("td_ui::client"));
+        assert!(prod("file_chooser.rs").contains("td_ui::raster"));
+        assert!(!prod("file_chooser.rs").contains("td_ui::client"));
     }
 
     #[test]

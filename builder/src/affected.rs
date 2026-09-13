@@ -7179,7 +7179,7 @@ mod tests {
                 "td-vm-guest"
             ]
         );
-        assert_eq!(comp.len(), 28, "{comp:?}");
+        assert_eq!(comp.len(), 29, "{comp:?}");
         // Runtime td-vm/ spellings conservatively connect the same reader set.
         assert_eq!(vm, comp);
         assert_eq!(
@@ -7305,11 +7305,10 @@ mod tests {
             let commands = cargo_test_cmds(&root, &toolkit).unwrap();
             // td-editor, td-setup and td-portal all name td-ui by path, so a
             // change to the toolkit carries the three consumers' commands
-            // beside the workspace suite. td-editor and td-setup each add a
-            // native compositor command; td-portal declares no native tests, so
-            // it adds only its test and clippy: 2 workspace + 2 td-ui + 3 + 3 +
-            // 2 = 12.
-            assert_eq!(commands.len(), 12, "{path}: {commands:?}");
+            // beside the workspace suite. Each of the three adds a native
+            // compositor command beside its test and clippy: 2 workspace + 2
+            // td-ui + 3 + 3 + 3 = 13.
+            assert_eq!(commands.len(), 13, "{path}: {commands:?}");
             assert!(commands.iter().all(|c| {
                 c.contains("--workspace")
                     || c.contains("--manifest-path td-ui/Cargo.toml")

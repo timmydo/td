@@ -14,6 +14,11 @@ td-ui = { path = "../td-ui" }
 # How builder/src/affected.rs gates this crate; absent keys take the defaults.
 [package.metadata.td-gate]
 clippy-all-targets = true
+# The file chooser's dialog is a live Wayland client; its one native case maps a
+# minimal client under the real headless td-compositor and captures the chooser
+# it presents (tests/control_process.rs). This opt-in builds that compositor for
+# the gate and adds it as a test-only reader dependency.
+native-compositor-tests = true
 
 [workspace]
 

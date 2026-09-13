@@ -5987,34 +5987,54 @@ detached-thread growth. Worker failures before presentation retain their exact
 diagnostic rather than being overwritten by the generic missing-frame error.
 No response 0 or 1 is emitted unless the compositor has acknowledged the
 portal manager's initial standalone/parented state, delivered keyboard focus,
-released the first buffer, and retired its frame callback. The worker's
-connect retry schedule and all registry, keymap, configure, first-buffer transfer, and
-first-presentation work after connection share one 20-second deadline. An
-initial `0x0` xdg-toplevel configure selects the client's bounded 640x432
-default; later nonzero compositor sizes replace it exactly. Rust's
-blocking AF_UNIX connect cannot itself be interrupted. A dedicated connector
-worker is waited through the same deadline, and its one service-wide lane stays
-occupied until the underlying connect returns; later requests cannot accumulate
-connector threads while it is stalled. After that trusted local channel has
-presented, one outstanding `wl_display.sync` at a time pulses after ten
-seconds without a client write, regardless of incoming input traffic. The
-compositor's finite private-peer timeout therefore does not bound user
-think-time; a peer that stops retiring callbacks still fails closed.
-Dismissal starts a new 20-second deadline for the manager acknowledgement.
+released the first buffer, and retired its frame callback. The connect retry
+schedule shares one 20-second deadline; the registry, configure, first-buffer
+transfer and first-presentation work after connection is bounded by a second
+20-second deadline, so a peer that admits the connection but never makes the
+dialog interactive cannot hang the worker. An initial `0x0` xdg-toplevel
+configure selects the client's bounded 640x432 default; later nonzero
+compositor sizes replace it exactly. Rust's blocking AF_UNIX connect cannot
+itself be interrupted. A dedicated connector worker is waited through the
+connect deadline, and its one service-wide lane stays occupied until the
+underlying connect returns; later requests cannot accumulate connector threads
+while it is stalled. The shared client owns the connection; the portal keeps it
+alive by pulsing one outstanding `wl_display.sync` at a time, about every ten
+seconds. The compositor's finite private-peer timeout therefore does not bound
+user think-time, and the worker does not rely on that timeout for its own
+liveness: a pulse resets the compositor's receive timer, so a peer that answers
+nothing yet holds the socket would not be caught by it; instead, if a pulse
+goes a full interval unanswered the dialog fails closed itself. Dismissal
+starts a new 20-second deadline for the manager acknowledgement.
 
-The Wayland client requires the private registry's exact eleven ordered
-globals and rejects the twelfth before retaining it, binds only compositor,
-shm, xdg-shell, seat, and portal-manager
-objects, creates one xdg-toplevel, and associates it through
-`td_portal_manager_v1`. It verifies the compositor's exact shared XKB keymap
-before accepting keyboard input and requires a matching keyboard enter before
-each pressed key. `Escape`, all four arrows, Backspace, letters, Space, Enter,
-keypad Enter, and Control+either Enter form the closed interaction vocabulary.
-Each frame is
-an unlinked mode-0600 file sent as one SCM_RIGHTS descriptor; received keymap
-descriptors are bounded and adopted into exact File ownership through the
-confined surface recorded in `UNSAFE.md` §12. Positional keymap reads preserve
-the shared open-file offset and work across the compositor/human UID boundary.
+The dialog runs as an `App` over the shared `td_ui::client`, which binds the
+compositor, shm, xdg-shell and seat globals, creates the one xdg-toplevel, and
+owns the frame and keymap descriptor passing (its SCM_RIGHTS use is recorded
+under td-ui in `UNSAFE.md`). The portal asserts the private registry advertises
+exactly the eleven globals as a set at fixed versions — a twelfth, a missing,
+or a version-shifted one is refused — then binds only `td_portal_manager_v1`
+and associates the toplevel through it. It maps every chooser action and filter
+character from the raw evdev keycode, never from the compositor's keymap
+symbols, so no keymap the compositor installs can REDIRECT an action onto an
+unexpected physical key; a keymap that will not compile is still fatal, and a
+matching keyboard enter is required before each pressed key. `Escape`, all four
+arrows, Backspace, letters, Space, Enter, keypad Enter, and Control+either
+Enter form the closed interaction vocabulary. The earlier transport
+byte-compared the compositor's keymap against td's pinned one; that comparison
+is not re-added, because the shared client compiles and discards the keymap and
+raw-keycode mapping already denies redirection. The residual is narrower but
+real: because the shared client delivers only a key that translates to a
+symbol, a substituted keymap can SUPPRESS a physical key (map it to NoSymbol)
+or relabel which key is Control — so it can deny Escape, deny Return, or, by
+suppressing a navigation key, leave the selection on an item the user did not
+mean to land on, which a later Accept then takes. These are availability and
+integrity effects within the compositor's already-trusted input role
+(Principle 7): a compositor can forge arbitrary key and modifier events
+regardless of any keymap, so the byte pin never guarded against a hostile
+compositor. Peer authenticity rests on the private socket the compositor alone
+serves (`require_portal_peer` gates it by uid); the exact-registry check is a
+protocol-compatibility assertion that refuses a foreign or misconfigured
+surface, not an authentication. The private descriptor discipline that remains
+in td-portal is the secret store's.
 
 Host tests retain the pure model coverage and add an actual Unix-socket peer
 that advertises the exact shared registry, sends the real keymap and keyboard

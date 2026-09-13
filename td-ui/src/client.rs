@@ -452,6 +452,19 @@ impl<T: Tag> Client<T> {
         self.globals.get(&id).map(|(name, _)| name.as_str())
     }
 
+    /// Every advertised global as `(interface, version)`, in registry-name
+    /// order (a server names them as it announces them), whether or not the
+    /// client bound it. For a consumer that must assert the compositor
+    /// advertised an exact global set, which `find_global` cannot express:
+    /// it finds one by name at a minimum version and sees neither an extra
+    /// global nor an unexpected version. td-portal's private registry check
+    /// is the one caller.
+    pub fn globals(&self) -> impl Iterator<Item = (&str, u32)> + '_ {
+        self.globals
+            .values()
+            .map(|(name, version)| (name.as_str(), *version))
+    }
+
     /// The bound globals whose removal is fatal unless the consumer
     /// recovers.
     pub fn required(&self) -> &[u32] {
@@ -1600,6 +1613,54 @@ pub fn run<A: App>(app: &mut A) -> Result<()> {
 mod tests {
     use super::*;
     use std::io::{Read, Seek, SeekFrom};
+
+    #[test]
+    fn globals_reports_every_advertised_global_in_registry_order() {
+        let (stream, _peer) = UnixStream::pair().unwrap();
+        let mut client: Client<Never> = Client::new(stream, std::env::temp_dir()).unwrap();
+        // Announce out of name order; the accessor yields name order, so an
+        // exact-registry check sees the server's announcement sequence.
+        for (name, interface, version) in [
+            (20u32, "wl_shm", 1u32),
+            (10, "wl_compositor", 4),
+            (30, "td_portal_manager_v1", 1),
+        ] {
+            let mut body = Builder::new();
+            body.u32(name);
+            body.string(interface).unwrap();
+            body.u32(version);
+            let mut bytes = body.message(REGISTRY, 0).unwrap();
+            let message = crate::wire::take(&mut bytes).unwrap().unwrap();
+            assert!(matches!(client.handle(&message, 0).unwrap(), Handled::Done));
+        }
+        let advertised: Vec<(&str, u32)> = client.globals().collect();
+        assert_eq!(
+            advertised,
+            [("wl_compositor", 4), ("wl_shm", 1), ("td_portal_manager_v1", 1)]
+        );
+        // Removing an unbound global drops it from the view.
+        let mut body = Builder::new();
+        body.u32(20);
+        let mut bytes = body.message(REGISTRY, 1).unwrap();
+        let message = crate::wire::take(&mut bytes).unwrap().unwrap();
+        assert!(matches!(
+            client.handle(&message, 0).unwrap(),
+            Handled::GlobalRemoved { required: false, .. }
+        ));
+        let advertised: Vec<(&str, u32)> = client.globals().collect();
+        assert_eq!(
+            advertised,
+            [("wl_compositor", 4), ("td_portal_manager_v1", 1)]
+        );
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum Never {}
+    impl Tag for Never {
+        fn retired(self) -> bool {
+            match self {}
+        }
+    }
 
     #[test]
     fn keymap_reads_do_not_move_shared_offsets_and_refuse_bad_sources() {

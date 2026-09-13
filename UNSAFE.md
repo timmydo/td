@@ -24,9 +24,11 @@ scoped allow. The tenth, `td-busd`,
 carries the same different shape for general descriptor forwarding. Sections
 6 and 10 argue the two separately. The eleventh, `td-profiler`, also owns the
 pointer accesses into the perf ring mapping whose lifetime and bounds that
-same module controls. The twelfth, `td-portal`, confines descriptor-carrying
-Wayland I/O to one raw-syscall module with one additional scoped adoption
-of freshly received descriptors into File ownership. The
+same module controls. The twelfth, `td-portal`, is the canonical record of the
+shared credential-descriptor syscall module (also compiled by td-secret, §15)
+and its one additional scoped adoption of freshly received descriptors into
+File ownership; the private Wayland dialog that once drove it now runs over
+td-ui's transport (§19). The
 thirteenth, `td-audio`, is back to the plain shape: one syscall-instruction
 layer, no descriptor adoption and no mapping, because the ALSA transfer mode
 it uses is `SNDRV_PCM_ACCESS_RW_INTERLEAVED` and that mode has none. It is
@@ -95,7 +97,7 @@ raw boundary of the consumer's own, which gets its own entry.
 | 9 | `td-jail` | `close(2)`, `ioctl(2)` with three value-pinned requests, `wait4(2)`, `kill(2)` with two fixed signals, `setsid(2)`, `capget(2)`, `capset(2)`, `pivot_root(2)`, `prctl(2)`, `mount(2)`, `umount2(2)`, `unshare(2)` with two value-pinned namespace sets, `prlimit64(2)` with one value-pinned resource, `seccomp(2)` with one value-pinned operation and two exact flag values |
 | 10 | `td-busd` | `recvmsg(2)`, `sendmsg(2)`, `getsockopt(2)` with two value-pinned options; plus a SECOND scoped allow for descriptor adoption — see [§10](#10-td-busd--the-session-bus-broker) |
 | 11 | `td-profiler` | `close(2)`, `mmap(2)`, `munmap(2)`, `ioctl(2)` with four pinned requests, `setgroups(2)`, `setgid(2)`, `setuid(2)`, `clock_gettime(2)`, `perf_event_open(2)`, `socket(2)`, `bind(2)`, `recvfrom(2)` for fixed kernel CPU notifications |
-| 12 | `td-portal` | `recvmsg(2)`, `sendmsg(2)`, `close(2)` for bounded Wayland transfer and credential replies; one scoped received-descriptor adoption |
+| 12 | `td-portal` | `recvmsg(2)`, `sendmsg(2)`, `close(2)` for the shared credential-descriptor module (also compiled by td-secret, §15); one scoped received-descriptor adoption. The Wayland dialog's descriptor passing moved to td-ui (§19) |
 | 13 | `td-audio` | `ioctl(2)` with eleven value-pinned PCM requests, `poll(2)`, `getsockopt(2)` pinned to `SOL_SOCKET`/`SO_PEERCRED` |
 | 14 | `td-editor` | `fcntl(2)` pinned to `F_GETFL` and `F_SETFL`, `flistxattr(2)` pinned to a size-only query, `renameat2(2)` pinned to two borrowed parents and `RENAME_NOREPLACE`; no descriptor adoption |
 | 15 | `td-secret` | shared `recvmsg(2)`, `sendmsg(2)`, `close(2)` transport and scoped adoption for bounded credential replies; plus the named credential intake module of §16 |
@@ -1996,15 +1998,26 @@ family/protocol/group or receive flag, another event layout, a second
 scoped unsafe allowance, or any pointer escape from `sys.rs` is an amendment
 here and in `td-profiler/DESIGN.md`.
 
-## 12. `td-portal` — the private Wayland dialog client
+## 12. `td-portal` — the shared credential-descriptor module
 
-The FileChooser client carries exactly THREE syscalls through one x86-64
-`syscall5` instruction in `td-secret/src/sys.rs`: `recvmsg(2)`, `sendmsg(2)`,
-and `close(2)`. Safe `UnixStream` carries descriptor-free Wayland messages.
-The raw layer carries the Wayland descriptors and the credential-transfer
-uses recorded in §15.
-It borrows the stream and the descriptor it sends; no socket creation,
-connection, path lookup, or caller-selected ancillary type enters the surface.
+`td-secret/src/sys.rs` carries exactly THREE syscalls through one x86-64
+`syscall5` instruction: `recvmsg(2)`, `sendmsg(2)`, and `close(2)`, plus one
+function-scoped `File::from_raw_fd` adoption. Safe `UnixStream` carries every
+descriptor-free message; the raw layer carries only descriptors. §12 is this
+module's canonical record: td-portal and td-secret (§15) both compile the same
+physical source with `#[path = "../../td-secret/src/sys.rs"]` and neither has
+an independent copy. It borrows the stream and the descriptor it sends; no
+socket creation, connection, path lookup, or caller-selected ancillary type
+enters the surface.
+
+The private Wayland dialog that was this module's original consumer no longer
+uses it. The FileChooser dialog runs over the shared `td_ui::client`, whose own
+transport module owns the keymap fd and the SHM pool descriptor passing (§19).
+So td-portal passes no Wayland descriptor and adopts none in its own code; the
+adoption function stays in the shared source for td-secret's client (§15),
+behind a dead-code allow in td-portal. td-portal's remaining use of the module
+is the secret store in `td-portal/src/secret.rs` — one send caller and one
+receive-and-discard pair — whose exact provenance §15 details.
 
 Every receive requests `MSG_CMSG_CLOEXEC`, parses at most 128 ancillary bytes,
 accepts only `SOL_SOCKET`/`SCM_RIGHTS`, and records a content or policy refusal
@@ -2012,42 +2025,33 @@ while valid framing remains walkable. It closes every recognizable installed
 descriptor before returning that refusal. A structural framing error closes
 everything collected through the last trusted boundary and returns because
 later records cannot be identified; Linux closes descriptors that do not fit
-the supplied control buffer. The dialog connection admits at most
-eight queued descriptors. Its only consumer removes one exact descriptor for
-`wl_keyboard.keymap`, then consumes that exact number through `take_received`.
-The portal includes this same physical source with
-`#[path = "../../td-secret/src/sys.rs"]`; it has no independent transport copy.
-One additional function-scoped allowance calls `File::from_raw_fd` after
-refusing a negative number. Callers remove the descriptor from its sole raw
-disposal queue before adoption; File owns every subsequent close. This is a
-source-pinned provenance contract, not authority conveyed by a raw integer.
-It avoids a procfs reopen and its second inode permission check across UIDs.
-The exact regular-file keymap size and contents are checked with positional
-reads before input is accepted; no shared offset is moved.
+the supplied control buffer. The one adoption allowance calls `File::from_raw_fd`
+after refusing a negative number; its caller removes the descriptor from its
+sole raw disposal queue before adoption, and File owns every subsequent close.
+This is a source-pinned provenance contract, not authority conveyed by a raw
+integer, and it avoids a procfs reopen and its second inode permission check
+across UIDs.
 
 The send path emits exactly one descriptor with a 24-byte control buffer and
-fixed `SOL_SOCKET`/`SCM_RIGHTS`; the FileChooser caller sends its unlinked
-0600 regular backing file in `wl_shm.create_pool`; §15 adds credential replies.
-`sendmsg` pins `MSG_NOSIGNAL` so a compositor departure is an error rather than
-a process-wide signal, and carries the first bytes and descriptor atomically.
-A short body write continues through safe `UnixStream`; the descriptor is not
-sent a second time.
-`close_raw` is private to the raw module. Its crate-visible disposal helper
-still takes descriptor numbers for refused or unused ancillary data. The four
-production call sites pass only numbers returned in that connection's
-`Received` value or moved into its bounded pending queue; confinement tests pin
-those call sites. That provenance is a source-level contract, not something
-the helper's raw-fd type can express.
+fixed `SOL_SOCKET`/`SCM_RIGHTS`. `sendmsg` pins `MSG_NOSIGNAL` so a peer
+departure is an error rather than a process-wide signal, and carries the first
+bytes and descriptor atomically; a short body write continues through safe
+`UnixStream` and the descriptor is not sent a second time. `close_raw` is
+private to the raw module; its crate-visible disposal helper takes descriptor
+numbers for refused or unused ancillary data, and its callers pass only numbers
+returned in a connection's `Received` value or moved into its bounded pending
+queue. That provenance is a source-level contract, not something the helper's
+raw-fd type can express.
 
-Confinement tests inventory every portal source file, pin the three syscall
+Confinement tests inventory every portal source file and pin the three syscall
 numbers, the instruction and exact adoption body with two scoped allowances,
-both ancillary constants, `MSG_CMSG_CLOEXEC`/`MSG_NOSIGNAL`, the one send,
-receive, and adoption call site, and all four refusal/drop routes.
+both ancillary constants, and `MSG_CMSG_CLOEXEC`/`MSG_NOSIGNAL`; the secret
+store's own send, receive, and discard call sites are pinned in `secret.rs`.
 There is no general descriptor-forwarding API, raw descriptor owner, mmap,
-fcntl, ioctl, credential call, or network socket. A fourth syscall, a second
-ancillary kind, a third scoped allowance, another production caller, or
-another raw descriptor adoption is an amendment here and in `APPLICATIONS.md`
-in the same landing.
+fcntl, ioctl, credential call, or network socket in td-portal beyond this. A
+fourth syscall, a second ancillary kind, a third scoped allowance, another
+production caller, or another raw descriptor adoption is an amendment here and
+in `APPLICATIONS.md` in the same landing.
 
 ## 13. `td-audio` — the ALSA playback back end
 
