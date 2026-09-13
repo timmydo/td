@@ -17,6 +17,10 @@ td-ui = { path = "../td-ui" }
 
 [package.metadata.td-gate]
 clippy-all-targets = true
+# The installer is a live Wayland client; its one native case launches it
+# under the real headless td-compositor (tests/control_process.rs). This opt-in
+# builds that binary for the gate and adds it as a test-only reader dependency.
+native-compositor-tests = true
 
 [lints.clippy]
 unwrap_used = "deny"

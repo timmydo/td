@@ -4991,9 +4991,11 @@ mod tests {
         // authd, jail and seatd name the compositor runtime directory in
         // fixed argv, resolution tests and seat assignment.
         // The conservative textual edge widens checks even without a read.
+        // td-setup declares native-compositor-tests, a tool edge (not a source
+        // read) that the native runner discovers the same way.
         assert_eq!(
             readers_of("td-compositor"),
-            ["td-authd", "td-editor", "td-jail", "td-portal", "td-seatd", "td-secret", "td-ui", "td-vm", "td-vm-guest"]
+            ["td-authd", "td-editor", "td-jail", "td-portal", "td-seatd", "td-secret", "td-setup", "td-ui", "td-vm", "td-vm-guest"]
         );
         assert_eq!(readers_of("td-authd"), ["td-compositor", "td-secret"]);
         // td-login is here for a test's argument string `/bin/td-busd/`, no
@@ -7102,9 +7104,10 @@ mod tests {
         assert_eq!(sh.len(), 4, "{sh:?}");
         assert_eq!(names(&sh), ["td-sh"]);
         // td-setup, the installer front end: read by nobody, so its own
-        // commands and the workspace suite, like any leaf crate.
+        // commands and the workspace suite, like any leaf crate — plus the
+        // native compositor command its native-compositor-tests opt-in adds.
         let setup = one("td-setup/src/welcome.rs");
-        assert_eq!(setup.len(), 4, "{setup:?}");
+        assert_eq!(setup.len(), 5, "{setup:?}");
         assert_eq!(names(&setup), ["td-setup"]);
         // A crate others read brings its readers: td-portal and td-editor build
         // modules out of td-compositor sources, so a change there is a change
@@ -7127,7 +7130,7 @@ mod tests {
                 "td-vm-guest"
             ]
         );
-        assert_eq!(comp.len(), 27, "{comp:?}");
+        assert_eq!(comp.len(), 28, "{comp:?}");
         // Runtime td-vm/ spellings conservatively connect the same reader set.
         assert_eq!(vm, comp);
         assert_eq!(
@@ -7252,8 +7255,8 @@ mod tests {
             let commands = cargo_test_cmds(&root, &toolkit).unwrap();
             // td-editor and td-setup both name td-ui by path, so a change to
             // the toolkit carries both consumers' commands beside the
-            // workspace suite.
-            assert_eq!(commands.len(), 9, "{path}: {commands:?}");
+            // workspace suite, each with its own native compositor command.
+            assert_eq!(commands.len(), 10, "{path}: {commands:?}");
             assert!(commands.iter().all(|c| {
                 c.contains("--workspace")
                     || c.contains("--manifest-path td-ui/Cargo.toml")

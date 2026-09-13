@@ -5,13 +5,15 @@
 //! wizard as a dependency-free Rust Wayland client over the shared
 //! toolkit's raster and chrome bands, following td-install/INSTALLER.md.
 //!
-//! So far this crate carries the wizard's pages and their rendering. The
+//! So far this crate carries the wizard's pages and their rendering, and
+//! the `window` turn loop that presents them as a live client. The
 //! privileged disk writer stays in td-install; the front end holds no
 //! disk-writing authority (INSTALLER.md). The first page is `welcome`; the
-//! wizard's remaining pages, its model and the Wayland turn loop that makes
-//! it a live client follow in later increments.
+//! wizard's remaining pages, its model and the input that advances them
+//! follow in later increments.
 
 pub mod welcome;
+pub mod window;
 
 use td_ui::raster::{Raster, Scale, Surface};
 use welcome::Welcome;

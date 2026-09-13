@@ -53,12 +53,13 @@ it owns the 8x16 cell constants every consumer lays text out on. td-editor
 depends on it by path and uses those modules through the crate's public
 surface.
 
-Newly built: `td-setup`, the second consumer, is a new crate with its
-`welcome` page rendered from the toolkit (increment 6(a)); its Wayland turn
-loop and native compositor test follow. Not yet moved: td-portal's file
-chooser, the third consumer, still on its own rasterizer. The increments
-below schedule the rest. td-editor's window is the first `App`; it owns no
-Wayland objects of its own.
+Newly built: `td-setup`, the second consumer, is a new crate whose
+`welcome` page renders from the toolkit and whose Wayland turn loop
+presents it as a live `App`, proven under the native compositor harness
+(increment 6). Not yet moved: td-portal's file chooser, the third consumer,
+still on its own rasterizer. The increments below schedule the rest.
+td-editor's window is the first `App` and td-setup's the second; each owns
+no Wayland objects of its own.
 
 ## Purpose and trust position
 
@@ -577,7 +578,9 @@ the reader graph, because td-editor's manifest names the crate.
    automatically with no password or PIN field, per
    td-install/INSTALLER.md; the prose is word-wrapped in the crate, with
    draw-stream and pixel oracles and no live compositor. Landed. (b) The
-   Wayland turn loop making it a live `App`, under the native compositor
-   harness shared from td-editor's tests.
+   Wayland turn loop making it a live `App`. A minimal copy of td-editor's
+   native compositor harness launches the client against the real headless
+   compositor, reads the tile it is placed in and asserts the captured
+   pixels equal the crate's own `preview` of that surface. Landed.
 7. td-portal: the file chooser on td-ui, its private handshake and second
    rasterizer deleted, and its recipe converted to stage sibling trees.
