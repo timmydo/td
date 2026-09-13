@@ -59,7 +59,12 @@ labelled td Btrfs volume and passes its UUID through `td.volume=` in the
 verified kexec command line. It refuses an existing handoff token. The
 selected fixture requires exactly one UUID token and resolves that UUID
 again, using the returned device for root, @var and acknowledgement.
-Neither installed phase uses the fixture serial or partition suffix.
+The selected fixture uses `td-boot on-volume` for both mounts and
+acknowledgement. Before acknowledgement it deliberately leaves a writable
+mount sourced through a descriptor it then closes. Success must recover
+that stale mount and leave no mount at `/ack`; the host requires the
+post-recovery marker on every normal boot. Neither installed phase uses
+the fixture serial or partition suffix.
 The host requires identical UUID/device evidence from both phases.
 
 Before successful boots, a private decoy gets a copy of the installed

@@ -18,7 +18,8 @@ pub use crate::td_boot_protocol::{EFI_BOOT_FILE, EFI_INITRD_PATH};
 pub fn efi_default_cmdline() -> String {
     // Linux's EFI loader normalizes slashes; td-boot refuses backslashes.
     let path = EFI_INITRD_PATH.replace('\\', "/");
-    format!("initrd={path} console=ttyS0,115200 rdinit=/init panic=-1 audit=0")
+    // A built-in audit=0 would permanently defeat a caller's later audit=1.
+    format!("initrd={path} console=ttyS0,115200 rdinit=/init panic=-1")
 }
 
 pub const TD_APPLICATION_PACKAGE_ROOT: &str = "/td/store";
@@ -3466,6 +3467,13 @@ mod tests {
         // td-boot receives /proc/cmdline verbatim and refuses quotes/backslashes.
         assert!(line.bytes().all(|b| (b' '..=b'~').contains(&b)
             && !matches!(b, b'\\' | b'\"' | b'\'')), "{line}");
+    }
+
+    #[test]
+    fn efi_defaults_leave_audit_policy_to_the_boot_caller() {
+        // Linux permanently disables audit initialization on any earlier audit=0.
+        assert!(!super::efi_default_cmdline().split_ascii_whitespace()
+            .any(|token| token.starts_with("audit=")));
     }
 
     #[test]

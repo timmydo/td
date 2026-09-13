@@ -2,6 +2,7 @@
 #![forbid(unsafe_code)]
 use std::fs::{self, File};
 use std::io::{Read, Write};
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
@@ -268,15 +269,7 @@ fn installed() -> Result<(), String> {
         return Err("missing or duplicate volume handoff".into());
     };
     let (_, partition) = volume(Some(uuid))?;
-    applet(&[
-        "mount",
-        "-t",
-        "btrfs",
-        "-o",
-        "ro,nodev,nosuid,noexec",
-        &partition,
-        "/volume",
-    ])?;
+    command("/bin/td-boot", &["on-volume", "mount-root", "/volume"])?;
     if !Path::new("/dev/loop0").exists() {
         applet(&["mknod", "/dev/loop0", "b", "7", "0"])?;
     }
@@ -293,15 +286,7 @@ fn installed() -> Result<(), String> {
     if read(Path::new("/root-image/installed.txt"), 128)? != b"td installation fixture\n" {
         return Err("wrong installed EROFS payload".into());
     }
-    applet(&[
-        "mount",
-        "-t",
-        "btrfs",
-        "-o",
-        "rw,nodev,nosuid,subvol=@var",
-        &partition,
-        "/state",
-    ])?;
+    command("/bin/td-boot", &["on-volume", "mount-var", "/state"])?;
     let path = PathBuf::from("/state/installation-count");
     let count = match File::open(&path) {
         Ok(file) => match read_file(file, &path, 8)?.as_slice() {
@@ -317,7 +302,32 @@ fn installed() -> Result<(), String> {
         .and_then(|()| file.sync_all())
         .map_err(|error| error.to_string())?;
     applet(&["sync"])?;
-    command("/bin/td-boot", &["success", &partition, "/ack", id])?;
+    // Simulate a dead writer whose mount table still names its closed descriptor.
+    let held =
+        File::open(&partition).map_err(|error| format!("open stale-mount fixture: {error}"))?;
+    let descriptor = format!("/proc/{}/fd/{}", std::process::id(), held.as_raw_fd());
+    applet(&[
+        "mount",
+        "-t",
+        "btrfs",
+        "-o",
+        "rw,nodev,nosuid,noexec",
+        &descriptor,
+        "/ack",
+    ])?;
+    drop(held);
+    if Path::new(&descriptor).exists() {
+        return Err("stale-mount fixture retained its descriptor".into());
+    }
+    command("/bin/td-boot", &["on-volume", "success", "/ack", id])?;
+    let mounts = read(Path::new("/proc/self/mountinfo"), 1024 * 1024)?;
+    if mounts
+        .split(|byte| *byte == b'\n')
+        .any(|line| line.split(|byte| *byte == b' ').nth(4) == Some(b"/ack".as_slice()))
+    {
+        return Err("acknowledgement left its stale mount active".into());
+    }
+    println!("TD-INSTALL-STALE-MOUNT-RECOVERED");
     let marker = if count == 1 {
         FIRST_BOOT_MARKER
     } else {

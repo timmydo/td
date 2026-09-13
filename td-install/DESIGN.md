@@ -350,7 +350,7 @@ of those four files, with each file synced at mode 0600. The installed
 source-built signer signs that manifest, and `td-boot authenticate` checks
 the signature and manifest under the running volume's provisioned key.
 Only then does `td-boot install` verify all payloads and enter its existing
-transaction, publishing current/previous on `/dev/vda` through the private
+transaction, publishing current/previous on the running volume UUID through the private
 `/run/td-update` mountpoint. No requester-selected command, key, device,
 mountpoint, or signature crosses this interface. This device selection is
 the current stock VM profile, not a hardware installer discovery policy.
@@ -467,16 +467,68 @@ at a later use. Root-owned devtmpfs/sysfs and their ancestors are trusted;
 this is neither exclusive device admission nor protection from hostile
 hotplug or a privileged namespace writer.
 
-The native installation oracle uses the resolver on both sides of kexec:
-the selector passes the UUID as one `td.volume=` token, and the selected
-fixture requires exactly that UUID. Installation target admission remains
-the fixture's private serial convention. The full-system selector, init,
-boot acknowledgement and update authority still use the stock VM device;
-their atomic cutover and stable-use binding are the next integration step.
-That selector must obtain its expected UUID from its boot source instead
-of adopting the fixture's unfiltered single-volume convention, so another
-valid td disk can coexist without making boot ambiguous.
-This command alone does not activate physical-device installation.
+### Full-system volume consumers
+
+`td-boot on-volume OPERATION ARGS...` supplies the device operand to
+`boot`, `install`, `update`, `rollback`, `success`, `mount-root` or `mount-var`.
+The operation keeps the existing authentication, transaction locking and
+publication semantics. Other verbs and nested `on-volume` are refused.
+Explicit-device verbs remain low-level interfaces for formatting and
+controlled diagnostics; the full-system profile uses `on-volume` throughout.
+The explicit mount forms are `td-boot mount-root DEVICE MOUNTPOINT` and
+`td-boot mount-var DEVICE MOUNTPOINT`; both paths must be absolute.
+
+For `boot`, the expected UUID comes from the selector's own
+`/etc/td/volume-uuid`, a real regular file containing exactly the canonical
+UUID and one newline. Missing or malformed configuration refuses. The
+selector does not discover an arbitrary sole td disk. It rejects any
+existing `td.volume=` command-line token and appends its configured UUID
+before the ordinary verified kexec builds and measures the final handoff.
+Other operations require exactly one canonical `td.volume=` token from
+`/proc/cmdline`. Thus deployment mounts, boot acknowledgement and update
+installation retain the identity chosen by the selector.
+
+VM provisioning puts the same UUID in the selector and Btrfs formatter.
+All VM profiles derive it from their provisioning public key using the
+installation UUID rule above. Independent provisioning keys yield distinct
+volumes; the test run's alternate disk fixtures intentionally retain that
+run's UUID and must not be attached together. The private installation
+profile retains its UUID across updates. Selector configuration is boot-source
+data, outside deployments and the writable volume's authority; this is not
+Secure Boot authentication of that source.
+
+After a complete uniqueness scan, `on-volume` reopens and validates the
+selected node and UUID, retaining its read-only descriptor through every
+mount, child command and transaction. Mounts use `/proc/PID/fd/N` naming
+that held parent descriptor, so replacing a devtmpfs pathname cannot
+redirect the mount. Procfs, sysfs, root and the kernel remain trusted.
+This is not exclusive physical-device admission or protection against
+hot removal, device-number reuse or changes by a privileged kernel/device
+administrator. Discovery precedes the existing transaction locks; a
+concurrent superblock change can cause a conservative refusal.
+
+Btrfs may retain the descriptor pathname after its owner exits. A stale
+update mount is therefore verified by mounting the expected held device
+read-only at a fresh private directory under the transaction lock and
+comparing the mounted top-level filesystem device identities. The existing
+mount-table check still requires one top-level Btrfs mount with exactly the
+required writable/restriction flags before recovery unmounts it. A mismatch
+or failed probe/unmount refuses. Cleanup never recursively removes a probe
+path; process death may leave a probe mount until reboot. Reused PID/fd
+names do not authenticate a stale mount.
+
+The selector and deployment initramfs mount sysfs before discovery.
+`on-volume mount-root` uses `ro,nodev,nosuid,noexec`; `mount-var` uses
+`rw,nodev,nosuid,subvol=@var`. The verified EROFS root and existing persistent
+state setup are unchanged. The full-system oracle moves an installed
+pending candidate to `/dev/vdb` behind a blank disk, then requires its
+UUID evidence, persistent state, greeter and successful acknowledgement.
+
+The native installation oracle also resolves on both sides of kexec, but
+its tiny selector still uses unfiltered discovery under a fixed private
+single-volume topology. Installation target admission remains that fixture's
+private serial convention. Neither path activates a physical-device
+installer, machine settings or destructive user consent.
 
 td boots by the **removable-media path**: `\EFI\BOOT\BOOTX64.EFI` on the ESP,
 which every UEFI implementation boots when no NVRAM boot entry names anything
@@ -502,15 +554,20 @@ is a format check, not a complete PE loader or signature verifier.
 The signed selector packaging and full system firmware oracle remain
 required. The stub has a built-in command line naming
 `initrd=/EFI/BOOT/INITRD`, `console=ttyS0,115200`, `rdinit=/init`,
-`panic=-1` and `audit=0`. `CONFIG_CMDLINE_OVERRIDE` stays off so firmware,
+and `panic=-1`. `CONFIG_CMDLINE_OVERRIDE` stays off so firmware,
 direct-kernel tests and kexec can supplement those defaults. `INITRD` is
 an 8.3 name on the same FAT filesystem as `BOOTX64.EFI`. Linux's EFI
 loader converts these forward slashes to FAT separators; forward slashes
 also satisfy td-boot's unquoted printable command-line grammar.
 
-These are v1 QEMU product defaults, including serial diagnostics, immediate
-panic reboot and auditing disabled unless explicitly enabled by the caller.
-They apply to direct boots and kexec too. A hardware console policy is a
+These are v1 QEMU product defaults, including serial diagnostics and immediate
+panic reboot. They apply to direct boots and kexec too. Audit policy remains
+with the caller: non-audit direct-kernel tests pass `audit=0`, while the audit
+oracle passes `audit=1`. Linux permanently disables audit initialization on
+any earlier `audit=0`; a later `audit=1` cannot restore it. The built-in
+prefix therefore contains no audit token. Firmware boots without an explicit
+policy retain Linux's initialized but disabled audit default; initialization
+can still permit unconditional seccomp diagnostics. A hardware console policy is a
 v2 requirement before claiming support on machines without a serial port.
 Each kernel entry prepends the built-in prefix; selector-to-deployment
 kexec therefore adds a second copy. The current short profile arguments

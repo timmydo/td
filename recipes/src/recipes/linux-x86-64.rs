@@ -464,8 +464,10 @@ pub fn recipe() -> Recipe {
     //
     //    AUDIT is compiled in for one test-only use: the physical-input Firefox
     //    audit boot passes audit=1 and asks td-jail's outer filter to log its
-    //    denials. Every other QEMU oracle passes audit=0, which prevents audit
+    //    denials. Other direct-kernel QEMU oracles pass audit=0, which prevents
     //    initialization and even unconditional seccomp-kill printk records.
+    //    Firmware defaults omit audit policy: an earlier audit=0 cannot be undone
+    //    by a caller's later audit=1, even with CMDLINE_OVERRIDE disabled.
     //    AUDITSYSCALL is the x86-derived child that gives those records syscall
     //    identity; like SECCOMP_FILTER it has no independent policy choice and is
     //    guarded only after olddefconfig resolves the dependency graph.

@@ -5,7 +5,8 @@ image supplies it at `/bin/td-update`; the checkout's `./update` points there.
 It does not change credentials. `./update` builds the checkout and requests
 one installation through the paired authority; explicit `build` stops after
 building. The root-only `apply-operation` helper signs with the retained
-installation key and calls the single writer in `td-boot`, as specified in
+installation key and calls `td-boot on-volume install`, which resolves the
+running kernel's UUID handoff inside the single writer, as specified in
 `td-install/DESIGN.md`. Restart remains explicit.
 
 ## Initial checkout

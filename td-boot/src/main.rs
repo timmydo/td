@@ -82,6 +82,8 @@ const MAX_MOUNTINFO_BYTES: u64 = 1024 * 1024;
 const UPDATE_LOCK_DIR: &str = "/run/td-boot-locks";
 
 enum Mode {
+    OnVolume { operation: Box<Mode> },
+    MountVolume { device: PathBuf, mountpoint: PathBuf, var: bool },
     Volume { uuid: Option<volume::Uuid> },
     Verify {
         root: PathBuf,
@@ -234,7 +236,7 @@ fn invalid(message: impl Into<String>) -> io::Error {
 fn usage_error() -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidInput,
-        "usage: td-boot volume [UUID]\n       td-boot verify <volume-root>\n       td-boot root-loop <volume-root> <deployment-id> <loop-device>\n       td-boot boot <device> <mountpoint> <cmdline>\n       td-boot install <device> <mountpoint> <deployment-directory> [trusted-key]\n       td-boot update <device> <mountpoint> <volume> <channel> <trusted-key>\n       td-boot publish <volume-root> <deployment-directory> [trusted-key]\n       td-boot rollback <device> <mountpoint>\n       td-boot success <device> <mountpoint> <deployment-id>\n       td-boot authenticate <deployment-directory> [trusted-key]",
+        "usage: td-boot on-volume <boot|install|update|rollback|success|mount-root|mount-var> <arguments without device>\n       td-boot volume [UUID]\n       td-boot verify <volume-root>\n       td-boot root-loop <volume-root> <deployment-id> <loop-device>\n       td-boot boot <device> <mountpoint> <cmdline>\n       td-boot install <device> <mountpoint> <deployment-directory> [trusted-key]\n       td-boot update <device> <mountpoint> <volume> <channel> <trusted-key>\n       td-boot publish <volume-root> <deployment-directory> [trusted-key]\n       td-boot rollback <device> <mountpoint>\n       td-boot success <device> <mountpoint> <deployment-id>\n       td-boot authenticate <deployment-directory> [trusted-key]",
     )
 }
 
@@ -251,6 +253,21 @@ fn parse_deployment_id(value: OsString) -> io::Result<String> {
 
 fn parse_args<I: Iterator<Item = OsString>>(mut args: I) -> io::Result<Mode> {
     match args.next().as_deref() {
+        Some(mode) if mode == OsStr::new("on-volume") => {
+            let verb = args.next().ok_or_else(usage_error)?;
+            if !matches!(verb.to_str(), Some("boot" | "install" | "update" | "rollback" | "success" | "mount-root" | "mount-var")) {
+                return Err(usage_error());
+            }
+            let mut inner = vec![verb, OsString::from("/volume-device")];
+            inner.extend(args);
+            Ok(Mode::OnVolume { operation: Box::new(parse_args(inner.into_iter())?) })
+        }
+        Some(mode) if mode == OsStr::new("mount-root") || mode == OsStr::new("mount-var") => {
+            let device = PathBuf::from(args.next().ok_or_else(usage_error)?);
+            let mountpoint = PathBuf::from(args.next().ok_or_else(usage_error)?);
+            if args.next().is_some() { return Err(usage_error()); }
+            Ok(Mode::MountVolume { device, mountpoint, var: mode == OsStr::new("mount-var") })
+        }
         Some(mode) if mode == OsStr::new("volume") => {
             let uuid = args
                 .next()
@@ -2432,7 +2449,54 @@ fn mounted_btrfs_source(
     Ok(found)
 }
 
-fn prepare_update_mountpoint(mountpoint: &Path, device_id: u64) -> io::Result<()> {
+// A Btrfs mount can retain a now-closed /proc/PID/fd/N source name. Bind
+// recovery to the filesystem itself, not to a reusable pid or descriptor name.
+fn same_mounted_volume(device: &Path, mounted_dev: u64) -> io::Result<bool> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+    let base = update_lock_directory()?;
+    let mut probe = None;
+    for _ in 0..16 {
+        let path = base.join(format!(
+            "volume-probe-{}-{}",
+            std::process::id(),
+            SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        match fs::DirBuilder::new().mode(0o700).create(&path) {
+            Ok(()) => {
+                probe = Some(path);
+                break;
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error),
+        }
+    }
+    let path = probe.ok_or_else(|| invalid("no private volume probe directory available"))?;
+    let result = (|| {
+        run_command(
+            &mut mount_command(device, &path),
+            "read-only volume identity mount",
+        )?;
+        let result = fs::metadata(&path).map(|metadata| metadata.dev() == mounted_dev);
+        let unmounted = run_command(&mut unmount_command(&path), "volume identity unmount");
+        match (result, unmounted) {
+            (Ok(same), Ok(())) => Ok(same),
+            (Err(error), _) | (_, Err(error)) => Err(error),
+        }
+    })();
+    // Never recursively remove this path: a failed unmount may still expose a volume.
+    let removed = fs::remove_dir(&path);
+    match (result, removed) {
+        (Ok(same), Ok(())) => Ok(same),
+        (Err(error), _) | (_, Err(error)) => Err(error),
+    }
+}
+
+fn prepare_update_mountpoint(mountpoint: &Path, device: &Path, device_id: u64) -> io::Result<()> {
+    let current = fs::metadata(device)?;
+    if !current.file_type().is_block_device() || current.rdev() != device_id {
+        return Err(invalid("locked volume device changed"));
+    }
     let mut builder = fs::DirBuilder::new();
     builder.recursive(true).mode(0o700);
     match builder.create(mountpoint) {
@@ -2460,15 +2524,13 @@ fn prepare_update_mountpoint(mountpoint: &Path, device_id: u64) -> io::Result<()
             "process mount table",
             MAX_MOUNTINFO_BYTES,
         )?;
-        let source = mounted_btrfs_source(&mountinfo, mountpoint)?.ok_or_else(|| {
+        mounted_btrfs_source(&mountinfo, mountpoint)?.ok_or_else(|| {
             invalid(format!(
                 "update mountpoint is mounted but absent from mountinfo: {}",
                 mountpoint.display()
             ))
         })?;
-        let source_path = Path::new(&source);
-        let source_metadata = fs::metadata(source_path)?;
-        if !source_metadata.file_type().is_block_device() || source_metadata.rdev() != device_id {
+        if !same_mounted_volume(device, metadata.dev())? {
             return Err(invalid(format!(
                 "update mountpoint is mounted from a different device: {}",
                 mountpoint.display()
@@ -2540,7 +2602,7 @@ fn run_on_prelocked_writable_volume<T>(
     device_id: u64,
     operation: impl FnOnce(&Path) -> io::Result<T>,
 ) -> Result<T, WritableVolumeFailure<T>> {
-    prepare_update_mountpoint(mountpoint, device_id).map_err(WritableVolumeFailure::Transaction)?;
+    prepare_update_mountpoint(mountpoint, device, device_id).map_err(WritableVolumeFailure::Transaction)?;
     run_command(
         &mut writable_mount_command(device, mountpoint),
         "read-write Btrfs mount",
@@ -2675,7 +2737,7 @@ fn run_boot(device: &Path, mountpoint: &Path, base_cmdline: &OsStr) -> io::Resul
     let key = read_boot_trust_root(Path::new(BOOT_ROOTFS))?;
     let measured = measurement::enabled(Path::new(BOOT_ROOTFS))?;
     let (_transaction_lock, _device_lock, device_id) = acquire_update_locks(device)?;
-    prepare_update_mountpoint(mountpoint, device_id)?;
+    prepare_update_mountpoint(mountpoint, device, device_id)?;
     run_command(
         &mut mount_command(device, mountpoint),
         "read-only Btrfs mount",
@@ -2731,7 +2793,7 @@ fn run_boot(device: &Path, mountpoint: &Path, base_cmdline: &OsStr) -> io::Resul
                 // Update APIs fail closed on semantic errors; PID 1 still tries the
                 // verified payload-only recovery path before giving up.
                 best_effort_unmount(mountpoint);
-                prepare_update_mountpoint(mountpoint, device_id)?;
+                prepare_update_mountpoint(mountpoint, device, device_id)?;
                 run_command(
                     &mut mount_command(device, mountpoint),
                     "read-only Btrfs recovery mount",
@@ -2746,7 +2808,7 @@ fn run_boot(device: &Path, mountpoint: &Path, base_cmdline: &OsStr) -> io::Resul
             }
         };
 
-    prepare_update_mountpoint(mountpoint, device_id)?;
+    prepare_update_mountpoint(mountpoint, device, device_id)?;
     run_command(
         &mut mount_command(device, mountpoint),
         "read-only Btrfs mount",
@@ -3058,7 +3120,7 @@ fn run_success(device: &Path, mountpoint: &Path, deployment_id: &str) -> io::Res
     require_absolute(device, "volume device")?;
     require_absolute(mountpoint, "mountpoint")?;
     let (_transaction_lock, _device_lock, device_id) = acquire_update_locks(device)?;
-    prepare_update_mountpoint(mountpoint, device_id)?;
+    prepare_update_mountpoint(mountpoint, device, device_id)?;
     run_command(
         &mut mount_command(device, mountpoint),
         "read-only Btrfs mount",
@@ -3117,6 +3179,56 @@ fn run() -> io::Result<()> {
     dispatch(parse_args(std::env::args_os().skip(1))?)
 }
 
+fn on_volume(mut operation: Mode) -> io::Result<()> {
+    let uuid = if let Mode::Boot { cmdline, .. } = &mut operation {
+        let bytes = read_bounded_real_file(
+            &Path::new("/").join(protocol::VOLUME_UUID_PATH),
+            "selector volume UUID",
+            37,
+        )?;
+        let uuid = volume::configured(&bytes)?;
+        *cmdline = volume::command_line(cmdline.as_bytes(), &uuid)?;
+        uuid
+    } else {
+        volume::handoff(&read_bounded_real_file(
+            Path::new("/proc/cmdline"),
+            "kernel command line",
+            MAX_CMDLINE_BYTES as u64,
+        )?)?
+    };
+    let pinned = volume::Pinned::open(&uuid)?;
+    writeln!(
+        io::stderr(),
+        "TD-BOOT-VOLUME {uuid} {}",
+        pinned.device.display()
+    )?;
+    let device = match &mut operation {
+        Mode::Boot { device, .. }
+        | Mode::Install { device, .. }
+        | Mode::Update { device, .. }
+        | Mode::Rollback { device, .. }
+        | Mode::Success { device, .. }
+        | Mode::MountVolume { device, .. } => device,
+        _ => return Err(usage_error()),
+    };
+    *device = pinned.path();
+    dispatch(operation)
+}
+
+fn mount_volume(device: &Path, mountpoint: &Path, var: bool) -> io::Result<()> {
+    require_absolute(device, "volume device")?;
+    require_absolute(mountpoint, "mountpoint")?;
+    let options = if var {
+        "rw,nodev,nosuid,subvol=@var"
+    } else {
+        "ro,nodev,nosuid,noexec"
+    };
+    run_command(
+        &mut btrfs_mount_command(device, mountpoint, options),
+        "Btrfs volume mount",
+    )
+}
+
 /// The verb table, split from `run` so a test can reach it without argv.
 ///
 /// Each arm is a hop nothing else pins: an arm that drops a field compiles, and
@@ -3125,6 +3237,8 @@ fn run() -> io::Result<()> {
 /// drives this function rather than `run_install` for exactly that reason.
 fn dispatch(mode: Mode) -> io::Result<()> {
     match mode {
+        Mode::OnVolume { operation } => on_volume(*operation),
+        Mode::MountVolume { device, mountpoint, var } => mount_volume(&device, &mountpoint, var),
         Mode::Volume { uuid } => {
             let (uuid, path) = volume::resolve(uuid.as_ref())?;
             writeln!(io::stdout(), "{uuid} {}", path.display())

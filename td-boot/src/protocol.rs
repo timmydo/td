@@ -90,6 +90,10 @@ pub const PREVIOUS_SLOT: &str = "previous";
 #[allow(dead_code)]
 pub const EFI_BOOT_FILE: &str = "BOOTX64.EFI";
 #[allow(dead_code)]
+pub const VOLUME_UUID_PATH: &str = "etc/td/volume-uuid";
+#[allow(dead_code)]
+pub const VOLUME_CMDLINE_PREFIX: &str = "td.volume=";
+#[allow(dead_code)]
 pub const EFI_INITRD_PATH: &str = "\\EFI\\BOOT\\INITRD";
 
 // The DISK layout, stated here for D1's reason: `td-install` writes it and

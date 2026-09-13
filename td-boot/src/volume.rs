@@ -1,6 +1,7 @@
 //! Read-only identity discovery; a match grants neither trust nor write authority.
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read};
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::{FileExt, FileTypeExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -167,7 +168,7 @@ fn matches_device(meta: &fs::Metadata, expected: (u64, u64)) -> bool {
     meta.file_type().is_block_device() && (major, minor) == expected
 }
 
-fn probe(sys: &Path, path: &Path) -> io::Result<Option<Uuid>> {
+fn probe_open(sys: &Path, path: &Path) -> io::Result<Option<(Uuid, File)>> {
     let expected = device_number(&text(&sys.join("dev"))?)?;
     let sectors = text(&sys.join("size"))?;
     let sectors: u64 = sectors
@@ -202,7 +203,75 @@ fn probe(sys: &Path, path: &Path) -> io::Result<Option<Uuid>> {
     {
         return Err(invalid("volume device changed during probe"));
     }
-    Ok(result)
+    Ok(result.map(|uuid| (uuid, file)))
+}
+
+fn probe(sys: &Path, path: &Path) -> io::Result<Option<Uuid>> {
+    Ok(probe_open(sys, path)?.map(|(uuid, _)| uuid))
+}
+
+pub(crate) struct Pinned {
+    file: File,
+    pub(crate) device: PathBuf,
+}
+
+impl Pinned {
+    pub(crate) fn open(uuid: &Uuid) -> io::Result<Self> {
+        let (_, path) = resolve(Some(uuid))?;
+        let name = path
+            .file_name()
+            .ok_or_else(|| invalid("missing volume name"))?;
+        let (found, file) = probe_open(&Path::new("/sys/class/block").join(name), &path)?
+            .ok_or_else(|| invalid("resolved volume disappeared"))?;
+        if &found != uuid {
+            return Err(invalid("resolved volume UUID changed"));
+        }
+        Ok(Self { file, device: path })
+    }
+
+    // The parent retains this descriptor across every child mount and transaction.
+    pub(crate) fn path(&self) -> PathBuf {
+        PathBuf::from(format!(
+            "/proc/{}/fd/{}",
+            std::process::id(),
+            self.file.as_raw_fd()
+        ))
+    }
+}
+
+pub(crate) fn configured(bytes: &[u8]) -> io::Result<Uuid> {
+    let text = std::str::from_utf8(bytes).map_err(|_| invalid("non-ASCII volume UUID"))?;
+    Uuid::parse(
+        text.strip_suffix('\n')
+            .ok_or_else(|| invalid("volume UUID needs a newline"))?,
+    )
+}
+
+pub(crate) fn handoff(bytes: &[u8]) -> io::Result<Uuid> {
+    let text = std::str::from_utf8(bytes).map_err(|_| invalid("non-ASCII kernel command line"))?;
+    let mut found = None;
+    for word in text.split_ascii_whitespace() {
+        if let Some(uuid) = word.strip_prefix(protocol::VOLUME_CMDLINE_PREFIX) {
+            if found.is_some() {
+                return Err(invalid("duplicate td.volume handoff"));
+            }
+            found = Some(Uuid::parse(uuid)?);
+        }
+    }
+    found.ok_or_else(|| invalid("missing td.volume handoff"))
+}
+
+pub(crate) fn command_line(bytes: &[u8], uuid: &Uuid) -> io::Result<std::ffi::OsString> {
+    use std::os::unix::ffi::OsStringExt;
+    if bytes
+        .split(u8::is_ascii_whitespace)
+        .any(|word| word.starts_with(protocol::VOLUME_CMDLINE_PREFIX.as_bytes()))
+    {
+        return Err(invalid("selector command line already has td.volume"));
+    }
+    let mut result = bytes.to_vec();
+    result.extend_from_slice(format!(" {}{uuid}", protocol::VOLUME_CMDLINE_PREFIX).as_bytes());
+    Ok(std::ffi::OsString::from_vec(result))
 }
 
 fn choose(
@@ -286,6 +355,81 @@ pub(crate) fn resolve(expected: Option<&Uuid>) -> io::Result<(Uuid, PathBuf)> {
 #[allow(clippy::unwrap_used, clippy::indexing_slicing)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn provisioning_and_handoff_require_one_exact_uuid() {
+        let text = "12345678-90ab-cdef-1234-567890abcdef";
+        let uuid = Uuid::parse(text).unwrap();
+        assert_eq!(configured(format!("{text}\n").as_bytes()).unwrap(), uuid);
+        for bad in [text.to_owned(), format!("{text}\n\n"), format!("{text} \n")] {
+            assert!(configured(bad.as_bytes()).is_err());
+        }
+        assert_eq!(
+            handoff(format!("quiet td.volume={text}\n").as_bytes()).unwrap(),
+            uuid
+        );
+        for bad in [
+            "quiet".to_owned(),
+            "td.volume=".to_owned(),
+            format!("td.volume={text} td.volume={text}"),
+            format!("td.volume={} ", text.to_uppercase()),
+        ] {
+            assert!(handoff(bad.as_bytes()).is_err(), "{bad}");
+        }
+        let line = command_line(b"quiet", &uuid).unwrap();
+        assert_eq!(handoff(line.as_encoded_bytes()).unwrap(), uuid);
+        for bad in [
+            b"td.volume=".as_slice(),
+            b"quiet td.volume=bad",
+            line.as_encoded_bytes(),
+        ] {
+            assert!(command_line(bad, &uuid).is_err());
+        }
+    }
+
+    #[test]
+    fn on_volume_accepts_only_operations_without_a_device_operand() {
+        let parse =
+            |values: &[&str]| crate::parse_args(values.iter().map(std::ffi::OsString::from));
+        for good in [
+            vec!["on-volume", "boot", "/volume", "quiet"],
+            vec!["on-volume", "mount-root", "/volume"],
+            vec!["on-volume", "mount-var", "/sysroot/var"],
+            vec!["on-volume", "install", "/update", "/source", "/key"],
+            vec!["on-volume", "rollback", "/update"],
+        ] {
+            assert!(matches!(
+                parse(&good).unwrap(),
+                crate::Mode::OnVolume { .. }
+            ));
+        }
+        for bad in [
+            vec!["on-volume", "volume"],
+            vec!["on-volume", "on-volume", "boot", "/volume", "quiet"],
+            vec!["on-volume", "boot", "/dev/vda", "/volume", "quiet"],
+            vec!["on-volume", "mount-var", "/var", "extra"],
+            vec!["on-volume", "success", "/update", "invalid-id"],
+        ] {
+            assert!(parse(&bad).is_err());
+        }
+    }
+
+    #[test]
+    fn held_descriptor_keeps_the_original_node_when_a_name_is_replaced() {
+        let directory = std::env::temp_dir().join(format!("td-volume-pin-{}", std::process::id()));
+        fs::create_dir(&directory).unwrap();
+        let path = directory.join("node");
+        fs::write(&path, b"original").unwrap();
+        let pinned = Pinned {
+            file: File::open(&path).unwrap(),
+            device: path.clone(),
+        };
+        fs::rename(&path, directory.join("old")).unwrap();
+        fs::write(&path, b"replacement").unwrap();
+        assert_eq!(fs::read(pinned.path()).unwrap(), b"original");
+        assert_eq!(fs::read(&path).unwrap(), b"replacement");
+        fs::remove_dir_all(&directory).unwrap();
+    }
 
     fn checksum(bytes: &mut [u8]) {
         let sum = crc32c(&bytes[32..]);
@@ -441,14 +585,12 @@ mod tests {
             crate::Mode::Volume { uuid: Some(_) }
         ));
         assert!(crate::parse_args(args(&["volume", "/dev/vda"])).is_err());
-        assert!(
-            crate::parse_args(args(&[
-                "volume",
-                "12345678-90ab-cdef-1234-567890abcdef",
-                "extra"
-            ]))
-            .is_err()
-        );
+        assert!(crate::parse_args(args(&[
+            "volume",
+            "12345678-90ab-cdef-1234-567890abcdef",
+            "extra"
+        ]))
+        .is_err());
     }
     #[test]
     fn an_incomplete_scan_cannot_select_a_partial_match() {
@@ -456,16 +598,14 @@ mod tests {
         let missing = || Err(io::Error::from(io::ErrorKind::NotFound));
         assert_eq!(select_scan([good(), missing()], None).unwrap(), None);
         assert_eq!(select_scan([missing(), good()], None).unwrap(), None);
-        assert!(
-            select_scan(
-                [
-                    good(),
-                    Err(io::Error::from(io::ErrorKind::PermissionDenied))
-                ],
-                None
-            )
-            .is_err()
-        );
+        assert!(select_scan(
+            [
+                good(),
+                Err(io::Error::from(io::ErrorKind::PermissionDenied))
+            ],
+            None
+        )
+        .is_err());
         assert!(select_scan([good(), good()], None).is_err());
         assert_eq!(
             select_scan([good(), Ok(None)], None).unwrap(),

@@ -796,6 +796,7 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
         &first_tokens,
         "install",
         runner.scratch_dir(),
+        false,
     )?;
     validate_system_boot(
         &first,
@@ -896,7 +897,12 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
         &healthy_tokens,
         "healthy pending candidate",
         runner.scratch_dir(),
+        true,
     )?;
+    let moved = format!("TD-BOOT-VOLUME {} /dev/vdb", installation_uuid(&trust.public));
+    if !healthy_candidate.console.lines().any(|line| line.trim_end() == moved) {
+        return Err("reordered system boot did not resolve its UUID on /dev/vdb".into());
+    }
     validate_system_boot(
         &healthy_candidate,
         PersistencePhase::Read,
@@ -942,6 +948,7 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
         &healthy_tokens,
         "acknowledged candidate",
         runner.scratch_dir(),
+        false,
     )?;
     validate_system_boot(
         &stable_candidate,
@@ -985,6 +992,7 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
         &audit_tokens,
         "outer-seccomp audit",
         runner.scratch_dir(),
+        false,
     )?;
     validate_system_boot(
         &seccomp_audit,
@@ -1039,6 +1047,7 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
         &install_tokens,
         "failure-sequence install",
         runner.scratch_dir(),
+        false,
     )?;
     validate_system_boot(
         &failure_install,
@@ -1130,6 +1139,7 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
         &rollback_tokens,
         "automatic rollback",
         runner.scratch_dir(),
+        false,
     )?;
     validate_system_boot(
         &automatic_rollback,
@@ -1166,6 +1176,7 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
         &rollback_tokens,
         "persisted automatic rollback",
         runner.scratch_dir(),
+        false,
     )?;
     validate_system_boot(
         &stable_rollback,
@@ -1224,6 +1235,7 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
         &fallback_tokens,
         "corrupt-current fallback",
         runner.scratch_dir(),
+        false,
     )?;
     validate_system_boot(
         &fallback,
@@ -1379,12 +1391,23 @@ fn boot_system_once(
     tokens: &str,
     label: &str,
     scratch: &Path,
+    reordered: bool,
 ) -> Result<BootResult, String> {
     let (physical_input, capture_firefox_audio) = firefox_boot_oracles(tokens);
-    let result = boot(
+    let source = if reordered {
+        BootSource::DirectReordered {
+            kernel: bzimage,
+            initramfs: init_cpio,
+        }
+    } else {
+        BootSource::Direct {
+            kernel: bzimage,
+            initramfs: init_cpio,
+        }
+    };
+    let result = boot_source(
         qemu,
-        bzimage,
-        init_cpio,
+        source,
         BootPlan {
             disk: Some(BootDisk {
                 path: volume,
@@ -1401,6 +1424,7 @@ fn boot_system_once(
             tpm_socket: None,
         },
         scratch,
+        boot_timeout(),
     )?;
     println!(
         "   [qemu-boot-system] {label} elapsed: {:.2}s",
@@ -3456,25 +3480,9 @@ fn create_persistent_volume_layout(
         File::create(output)
             .map_err(|e| format!("create persistent volume {}: {e}", output.display()))?;
     }
-    // A fixture's UUID must differ between concurrent volumes on one host, so
-    // it mixes in the pid. A PUBLISHED volume must not: the pid is recoverable
-    // with a `>> 16` and says which process on whose machine built the
-    // download. Deriving it from the deployment id instead keeps distinct
-    // deployments distinct — which is all the uniqueness a shipped volume
-    // needs, since only one is ever mounted — and leaks nothing.
-    let fixture_uuid = match purpose {
-        VolumePurpose::Fixture => {
-            static UUID_SEQ: AtomicU64 = AtomicU64::new(0);
-            let sequence = UUID_SEQ.fetch_add(1, Ordering::Relaxed) & 0xffff;
-            let fixture_id = (u64::from(std::process::id()) << 16) | sequence;
-            format!("12345678-1234-4234-8234-{fixture_id:012x}")
-        }
-        VolumePurpose::Published => {
-            let digits: String = deployment_id.chars().take(12).collect();
-            format!("12345678-1234-4234-8234-{digits}")
-        }
-        VolumePurpose::Installation => installation_uuid(&trust.public),
-    };
+    // One provisioning identity binds selector and volume for every profile.
+    // Independent installations/runs have independent public keys.
+    let fixture_uuid = installation_uuid(&trust.public);
     let status = trust
         .mkfs_command(mkfs)
         .args(["--rootdir"])
@@ -3854,11 +3862,11 @@ pub(crate) fn provision_selector(
             provisioned.display()
         )
     })?;
-    append_trusted_key(&provisioned, &trust.trusted_key_line())?;
+    append_selector_identity(&provisioned, &trust.trusted_key_line(), Some(&installation_uuid(&trust.public)))?;
     Ok(provisioned)
 }
 
-/// Append `key` to `initramfs` as a second, concatenated cpio archive.
+/// Append the key and optional volume UUID as a concatenated cpio archive.
 ///
 /// The alignment is the whole of this function's correctness and is NOT
 /// backstopped by the kernel. A misaligned appendix makes `do_reset` error
@@ -3871,14 +3879,14 @@ pub(crate) fn provision_selector(
 /// The directory entries are emitted rather than assumed: neither phase of
 /// `build_initramfs_spec` creates `/etc`, and a missing parent is silent too —
 /// `filp_open` failing is `return 0` (`init/initramfs.c:385-387`).
-pub(crate) fn append_trusted_key(initramfs: &Path, key: &[u8]) -> Result<(), String> {
+fn append_selector_identity(initramfs: &Path, key: &[u8], uuid: Option<&str>) -> Result<(), String> {
     use td_engine::cpio::{Entry, Kind};
 
     // The caller's copy came from a store output, and `fs::copy` preserves the
     // source's mode — which `copy_canonical` fixed at 0444 for a non-executable
     // file (`builder/src/main.rs:806-807`). So the copy is read-only and the
     // append below is EACCES for any non-root runner. Widened here rather than
-    // at each caller because both of them copy, and because a private scratch
+    // at each caller because callers copy, and because a private scratch
     // file is the only thing this is ever handed.
     let mode = fs::metadata(initramfs)
         .map_err(|e| format!("stat staged initramfs {}: {e}", initramfs.display()))?
@@ -3910,6 +3918,15 @@ pub(crate) fn append_trusted_key(initramfs: &Path, key: &[u8]) -> Result<(), Str
         mode: 0o644,
         kind: Kind::File(key),
     });
+
+    let uuid_line = uuid.map(|uuid| format!("{uuid}\n"));
+    if let Some(uuid) = &uuid_line {
+        entries.push(Entry {
+            name: td_boot_protocol::VOLUME_UUID_PATH,
+            mode: 0o644,
+            kind: Kind::File(uuid.as_bytes()),
+        });
+    }
 
     let mut appendix = vec![0u8; td_engine::cpio::alignment_padding(length)];
     appendix.extend_from_slice(&td_engine::cpio::build(&entries)?);
@@ -4342,6 +4359,7 @@ enum FirmwareAttachment {
 #[derive(Clone, Copy)]
 enum BootSource<'a> {
     Direct { kernel: &'a Path, initramfs: &'a Path },
+    DirectReordered { kernel: &'a Path, initramfs: &'a Path },
     Firmware {
         code: &'a Path,
         vars: &'a Path,
@@ -4375,6 +4393,9 @@ fn boot_source(
         && (!plan.extra_append.is_empty() || plan.disk.is_none())
     {
         return Err("firmware boot requires a disk and cannot inject a command line".into());
+    }
+    if matches!(source, BootSource::DirectReordered { .. }) && plan.disk.is_none() {
+        return Err("reordered direct boot requires a destination disk".into());
     }
     if matches!(source, BootSource::Firmware {
         attachment: FirmwareAttachment::Optical | FirmwareAttachment::Usb, ..
@@ -4486,7 +4507,7 @@ fn boot_source(
         .args(["-device", "virtio-tablet-pci"])
         .args(["-serial", &serial]);
     match source {
-        BootSource::Direct { kernel, initramfs } => {
+        BootSource::Direct { kernel, initramfs } | BootSource::DirectReordered { kernel, initramfs } => {
             cmd.arg("-kernel").arg(kernel).arg("-initrd").arg(initramfs)
                 .args(["-append", &append]);
         }
@@ -4523,6 +4544,17 @@ fn boot_source(
     // drive_arg comma-doubles the image path so a scratch dir with a literal comma in
     // its path can't be misparsed as an extra -drive key=value pair.
     if let Some(disk) = plan.disk {
+        if matches!(source, BootSource::DirectReordered { .. }) {
+            let decoy = dir.join("preceding-disk.raw");
+            OpenOptions::new().write(true).create_new(true).mode(0o600)
+                .open(&decoy).and_then(|file| file.set_len(1024 * 1024))
+                .map_err(|error| format!("create private preceding disk: {error}"))?;
+            cmd.arg("-drive").arg(drive_arg_with_id(&decoy, false, "preceding"));
+            let prefix = crate::checks::vm_profile::DISK_DEVICE
+                .strip_suffix(crate::checks::vm_profile::DRIVE_ID)
+                .ok_or("VM disk device must end with its drive ID")?;
+            cmd.arg("-device").arg(format!("{prefix}preceding"));
+        }
         if let BootSource::Firmware {
             attachment: FirmwareAttachment::InstalledFixtureReordered,
             installation_target: Some(decoy), ..
@@ -6749,10 +6781,11 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
 /// survives without a lossy round-trip. Shared with the interactive `run` tool
 /// (checks/run.rs), which attaches the same persistent volume over virtio-blk.
 pub(crate) fn drive_arg(disk: &Path, read_only: bool) -> OsString {
-    let mut out = OsString::from(format!(
-        "if=none,format=raw,id={}",
-        crate::checks::vm_profile::DRIVE_ID
-    ));
+    drive_arg_with_id(disk, read_only, crate::checks::vm_profile::DRIVE_ID)
+}
+
+fn drive_arg_with_id(disk: &Path, read_only: bool, id: &str) -> OsString {
+    let mut out = OsString::from(format!("if=none,format=raw,id={id}"));
     if read_only {
         out.push(",readonly=on");
     }
@@ -9344,7 +9377,7 @@ mod tests {
         fs::set_permissions(&initramfs, fs::Permissions::from_mode(0o444)).unwrap();
 
         let trust = RunTrust::generate().unwrap();
-        append_trusted_key(&initramfs, &trust.trusted_key_line()).unwrap();
+        append_selector_identity(&initramfs, &trust.trusted_key_line(), None).unwrap();
         let bytes = fs::read(&initramfs).unwrap();
 
         let members = appendix_members(&bytes, BASE_LEN);
@@ -9465,7 +9498,9 @@ mod tests {
         );
         let members = appendix_members(&bytes, BASE_LEN);
         let names: Vec<&str> = members.iter().map(|(n, _, _)| n.as_str()).collect();
-        assert_eq!(names, vec!["etc", "etc/td", "etc/td/deployment.pub"]);
+        assert_eq!(names, vec!["etc", "etc/td", "etc/td/deployment.pub", "etc/td/volume-uuid"]);
+        let (_, _, uuid) = members.iter().find(|(n, _, _)| n == "etc/td/volume-uuid").unwrap();
+        assert_eq!(uuid, format!("{}\n", installation_uuid(&trust.public)).as_bytes());
         let (_, _, key) = members
             .iter()
             .find(|(n, _, _)| n == "etc/td/deployment.pub")

@@ -312,6 +312,7 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
                 timeout,
             )?;
             require(&result, marker, "installed boot")?;
+            require(&result, "TD-INSTALL-STALE-MOUNT-RECOVERED", "closed-descriptor mount recovery")?;
             let expected_device = if count == 2 { "/dev/vdb2" } else { "/dev/vda2" };
             let discovered: Vec<_> = result
                 .console

@@ -268,7 +268,7 @@ fn execute(step: Step, source: &Path, state: &Path) -> Result<()> {
         Step::Install => {
             let mut command = Command::new("/bin/td-boot");
             command
-                .args(["install", "/dev/vda", "/run/td-update"])
+                .args(["on-volume", "install", "/run/td-update"])
                 .arg(source)
                 .arg(TRUST);
             command

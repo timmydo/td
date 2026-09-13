@@ -2065,9 +2065,8 @@ fn build_selector_init() -> String {
      set -f\n\
      /bin/mount -t devtmpfs dev /dev\n\
      /bin/mount -t proc proc /proc\n\
-     n=0\n\
-     while /bin/td-util test \"$n\" -lt 5 && ! /bin/td-util test -b /dev/vda; do /bin/td-util sleep 1; n=$((n+1)); done\n\
-     exec /bin/td-boot boot /dev/vda /volume \"$(/bin/td-util cat /proc/cmdline)\"\n"
+     /bin/mount -t sysfs sysfs /sys\n\
+     exec /bin/td-boot on-volume boot /volume \"$(/bin/td-util cat /proc/cmdline)\"\n"
         .into()
 }
 
@@ -2080,7 +2079,7 @@ fn build_deployment_init(sys: &SystemDef) -> String {
     // has to be made at all, because the kernel only populates loop0 there when the
     // loop driver registered it, which is a config away from not happening.
     //
-    // /dev/vda is one Btrfs filesystem. The top-level vfsmount stays read-only,
+    // The selected UUID names one Btrfs filesystem. The top-level vfsmount stays read-only,
     // while the shared Btrfs superblock becomes writable for the @var mount. The
     // mount flag prevents accidental writes, not a privileged remount by root.
     // The verified loop keeps root.erofs open, so the top-level mount cannot be
@@ -2091,8 +2090,6 @@ fn build_deployment_init(sys: &SystemDef) -> String {
      /bin/mount -t devtmpfs dev /dev\n\
      /bin/mount -t proc proc /proc\n\
      /bin/mount -t sysfs sysfs /sys\n\
-     n=0\n\
-     while /bin/td-util test \"$n\" -lt 5 && ! /bin/td-util test -b /dev/vda; do /bin/td-util sleep 1; n=$((n+1)); done\n\
      deployment=\n\
      deployment_seen=\n\
      for word in $(/bin/td-util cat /proc/cmdline); do\n\
@@ -2103,11 +2100,11 @@ fn build_deployment_init(sys: &SystemDef) -> String {
        esac\n\
      done\n\
      /bin/td-util test -n \"$deployment\" || { echo 'td-init: missing td.deployment handoff' >&2; exit 1; }\n\
-     /bin/mount -t btrfs -o ro,nodev,nosuid,noexec /dev/vda /volume\n\
+     /bin/td-boot on-volume mount-root /volume\n\
      if ! /bin/td-util test -b /dev/loop0; then /bin/mknod /dev/loop0 b 7 0; fi\n\
      /bin/td-boot root-loop /volume \"$deployment\" /dev/loop0\n\
      /bin/mount -t erofs -o ro /dev/loop0 /sysroot\n\
-     /bin/mount -t btrfs -o rw,nodev,nosuid,subvol=@var /dev/vda /sysroot/var\n\
+     /bin/td-boot on-volume mount-var /sysroot/var\n\
      /bin/td-util printf '%s\\n' 2 > /proc/sys/kernel/perf_event_paranoid\n\
      /bin/td-util test \"$(/bin/td-util cat /proc/sys/kernel/perf_event_paranoid)\" = 2 || { echo 'td-init: kernel.perf_event_paranoid did not realize the pinned value 2' >&2; exit 1; }\n\
      /bin/umount /proc\n\
@@ -3196,22 +3193,22 @@ fn build_bootsuccess(sys: &SystemDef) -> String {
          [ \"$mts\" = 1 ] || healthy=0; \
          if [ \"$healthy\" = 1 ] \
          && {{ [ \"$mtb\" = 1 ] || [ \"$btb\" -ge \"$bg\" ]; }} \
-         && /bin/td-boot success /dev/vda /run/td-update \"$deployment\" >/run/td-success-id; then \
+         && /bin/td-boot on-volume success /run/td-update \"$deployment\" >/run/td-success-id; then \
          if /bin/grep -q -F '{DEPLOY_INSTALL_CMDLINE_TOKEN}' /proc/cmdline; then \
-         if /bin/td-boot {update} /dev/vda /run/td-update /run/td-volume \
+         if /bin/td-boot on-volume {update} /run/td-update /run/td-volume \
          /run/td-volume/{channel} /run/td-volume/{wrong_key} \
          >/run/td-refused-id 2>/run/td-refused-err; then \
          echo 'td-boot update accepted a bundle under the wrong key'; healthy=0; \
          elif ! /bin/grep -q -F '{unauthenticated}' /run/td-refused-err; then \
          echo 'td-boot update refused under the wrong key for another reason'; \
          healthy=0; \
-         elif ! /bin/td-boot {update} /dev/vda /run/td-update /run/td-volume \
+         elif ! /bin/td-boot on-volume {update} /run/td-update /run/td-volume \
          /run/td-volume/{idle_channel} /run/td-volume/{trusted_key} \
          >/run/td-idle-id; then \
          echo 'td-boot update failed on a channel with nothing in it'; healthy=0; \
          elif [ -s /run/td-idle-id ]; then \
          echo 'td-boot update named a deployment for an empty channel'; healthy=0; \
-         elif ! /bin/td-boot {update} /dev/vda /run/td-update /run/td-volume \
+         elif ! /bin/td-boot on-volume {update} /run/td-update /run/td-volume \
          /run/td-volume/{channel} /run/td-volume/{trusted_key} \
          >/run/td-installed-id; then \
          echo 'td-boot update failed on the channel holding a bundle'; healthy=0; \
@@ -3219,16 +3216,16 @@ fn build_bootsuccess(sys: &SystemDef) -> String {
          echo 'td-boot update installed nothing from the channel holding a bundle'; \
          healthy=0; \
          else echo {SYSTEM_DEPLOY_INSTALL_MARKER}; \
-         if ! /bin/td-boot rollback /dev/vda /run/td-update >/run/td-rolled-id; then \
+         if ! /bin/td-boot on-volume rollback /run/td-update >/run/td-rolled-id; then \
          echo 'td-boot rollback failed after the update installed a deployment'; \
          healthy=0; \
          elif ! /bin/grep -q -x -F \"$deployment\" /run/td-rolled-id; then \
          echo 'td-boot rollback did not return to the deployment that booted'; \
          healthy=0; \
-         elif ! /bin/td-boot success /dev/vda /run/td-update \"$deployment\" \
+         elif ! /bin/td-boot on-volume success /run/td-update \"$deployment\" \
          >/run/td-rolled-current; then \
          echo 'td-boot rollback printed an id without making it current'; healthy=0; \
-         elif ! /bin/td-boot {update} /dev/vda /run/td-update /run/td-volume \
+         elif ! /bin/td-boot on-volume {update} /run/td-update /run/td-volume \
          /run/td-volume/{channel} /run/td-volume/{trusted_key} \
          >/run/td-reinstalled-id; then \
          echo 'td-boot update could not reinstall the deployment after a rollback'; \
@@ -3991,12 +3988,8 @@ enum Phase {
 /// A gen_init_cpio spec for one of the two structurally distinct boot phases.
 fn build_initramfs_spec(init: &str, phase: Phase) -> String {
     let mut s = String::new();
-    // /sys is here for one reason: td-init's `losetup` reads
-    // /sys/dev/block/<major>:<minor>/ro back to confirm the kernel really made
-    // the root loop read-only. Without it the attach cannot be checked, and an
-    // unchecked attach is a writable loop over a verified root. Only the
-    // deployment /init mounts anything on it — the selector binds no loop — but
-    // the directory list is shared, as it already is for /sysroot.
+    // Both phases discover the volume through sysfs. The selected phase also
+    // reads back the root loop's read-only state through sysfs.
     for d in ["/dev", "/proc", "/run", "/sys", "/sysroot", "/td", "/td/store"] {
         s.push_str(&format!("dir {d} 0755 0 0\n"));
     }
@@ -10053,7 +10046,8 @@ news\tnews-0.1\tsource\tempty-runtime-1\tsource\n"
         let selector = build_selector_init();
         let init = build_deployment_init(&SYSTEM);
         assert!(
-            selector.contains("exec /bin/td-boot boot /dev/vda /volume")
+            selector.contains("exec /bin/td-boot on-volume boot /volume")
+                && selector.contains("mount -t sysfs sysfs /sys")
                 && !selector.contains("root-loop")
                 && init.contains("root-loop")
                 && !init.contains("td-boot boot"),
@@ -10078,7 +10072,10 @@ news\tnews-0.1\tsource\tempty-runtime-1\tsource\n"
             "the selected pass must bind the reverified root to a read-only loop device"
         );
         assert!(
-            init.contains("subvol=@var /dev/vda /sysroot/var")
+            init.contains("td-boot on-volume mount-var /sysroot/var")
+                && init.contains("td-boot on-volume mount-root /volume")
+                && !init.contains("/dev/vda")
+                && !selector.contains("/dev/vda")
                 && init.contains("mount -t tmpfs -o mode=0755 tmpfs /sysroot/run")
                 && init.contains("tmpfs /sysroot/tmp")
                 && init.contains("rm -rf /sysroot/var/run")
@@ -10461,7 +10458,7 @@ news\tnews-0.1\tsource\tempty-runtime-1\tsource\n"
                 ))
                 && bootsuccess.contains(
                     "&& { [ \"$mtb\" = 1 ] || [ \"$btb\" -ge \"$bg\" ]; } \
-                     && /bin/td-boot success"
+                     && /bin/td-boot on-volume success"
                 )
                 // And the two lines that make that gate a RETRY. The
                 // initialiser, because an unset `bg` makes the comparison
@@ -10488,7 +10485,7 @@ news\tnews-0.1\tsource\tempty-runtime-1\tsource\n"
                 && bootsuccess.contains("[ \"$mtk\" = 1 ] || healthy=0")
                 && bootsuccess.contains("[ \"$mts\" = 1 ] || healthy=0")
                 && bootsuccess
-                    .contains("td-boot success /dev/vda /run/td-update \"$deployment\"")
+                    .contains("td-boot on-volume success /run/td-update \"$deployment\"")
                 && bootsuccess.contains(SYSTEM_BOOT_SUCCESS_MARKER)
                 && bootsuccess.contains("test -n \"$deployment\" || fail")
                 && bootsuccess.contains(&format!("wait={BOOT_SUCCESS_RETRY_SECS}"))
@@ -10543,31 +10540,31 @@ news\tnews-0.1\tsource\tempty-runtime-1\tsource\n"
         assert!(
             bootsuccess.find("/bin/cat /etc/os-release").unwrap()
                 < bootsuccess
-                    .find("&& /bin/td-boot success /dev/vda")
+                    .find("&& /bin/td-boot on-volume success")
                     .unwrap()
                 && bootsuccess.find("/bin/rg --color never").unwrap()
                     < bootsuccess
-                        .find("&& /bin/td-boot success /dev/vda")
+                        .find("&& /bin/td-boot on-volume success")
                         .unwrap()
                 && bootsuccess.find("/bin/fd --color never").unwrap()
                     < bootsuccess
-                        .find("&& /bin/td-boot success /dev/vda")
+                        .find("&& /bin/td-boot on-volume success")
                         .unwrap()
                 && bootsuccess.find("/bin/git init --bare").unwrap()
                     < bootsuccess
-                        .find("&& /bin/td-boot success /dev/vda")
+                        .find("&& /bin/td-boot on-volume success")
                         .unwrap()
                 && bootsuccess.find("/bin/codex --version").unwrap()
                     < bootsuccess
-                        .find("&& /bin/td-boot success /dev/vda")
+                        .find("&& /bin/td-boot on-volume success")
                         .unwrap()
                 && bootsuccess.find("/bin/bwrap --version").unwrap()
                     < bootsuccess
-                        .find("&& /bin/td-boot success /dev/vda")
+                        .find("&& /bin/td-boot on-volume success")
                         .unwrap()
                 && bootsuccess.find("TD-OPENSSH-ROUNDTRIP").unwrap()
                     < bootsuccess
-                        .find("&& /bin/td-boot success /dev/vda")
+                        .find("&& /bin/td-boot on-volume success")
                         .unwrap()
                 && bootsuccess.find("/bin/td-util --list").unwrap()
                     < bootsuccess
@@ -10621,7 +10618,7 @@ news\tnews-0.1\tsource\tempty-runtime-1\tsource\n"
         assert!(
             bootsuccess.contains(DEPLOY_INSTALL_CMDLINE_TOKEN)
                 && bootsuccess.contains(&format!(
-                    "td-boot {} /dev/vda /run/td-update",
+                    "td-boot on-volume {} /run/td-update",
                     td_boot_protocol::UPDATE_VERB
                 ))
                 && bootsuccess.contains(SYSTEM_DEPLOY_INSTALL_MARKER),
@@ -10679,7 +10676,7 @@ news\tnews-0.1\tsource\tempty-runtime-1\tsource\n"
         // false forever, and the pass would fall through to the install having
         // asserted nothing at all.
         let idle_branch = format!(
-            "elif ! /bin/td-boot {update} /dev/vda /run/td-update {volume} {volume}/{idle} \
+            "elif ! /bin/td-boot on-volume {update} /run/td-update {volume} {volume}/{idle} \
 {volume}/{key} >{out}; then echo 'td-boot update failed on a channel with nothing \
 in it'; healthy=0; elif [ -s {out} ]; then",
             update = td_boot_protocol::UPDATE_VERB,
@@ -10707,7 +10704,7 @@ in it'; healthy=0; elif [ -s {out} ]; then",
         // `contains` on the channel — or a `find` for it — is satisfied by the
         // IDLE pass and says nothing about this one.
         let real_branch = format!(
-            "elif ! /bin/td-boot {update} /dev/vda /run/td-update {volume} {volume}/{channel} \
+            "elif ! /bin/td-boot on-volume {update} /run/td-update {volume} {volume}/{channel} \
 {volume}/{key} >{out}; then echo 'td-boot update failed on the channel holding a \
 bundle'; healthy=0; elif ! [ -s {out} ]; then echo 'td-boot update installed nothing \
 from the channel holding a bundle'; healthy=0; else echo {marker};",
@@ -10742,12 +10739,12 @@ from the channel holding a bundle'; healthy=0; else echo {marker};",
         // deployment already marked successful it returns before doing anything
         // else, so it is only that.
         let rollback_branch = format!(
-            "else echo {install}; if ! /bin/td-boot rollback /dev/vda /run/td-update >{rolled}; \
+            "else echo {install}; if ! /bin/td-boot on-volume rollback /run/td-update >{rolled}; \
 then echo 'td-boot rollback failed after the update installed a deployment'; healthy=0; \
 elif ! /bin/grep -q -x -F \"$deployment\" {rolled}; then echo 'td-boot rollback did not \
-return to the deployment that booted'; healthy=0; elif ! /bin/td-boot success /dev/vda \
+return to the deployment that booted'; healthy=0; elif ! /bin/td-boot on-volume success \
 /run/td-update \"$deployment\" >{current}; then echo 'td-boot rollback printed an id \
-without making it current'; healthy=0; elif ! /bin/td-boot {update} /dev/vda \
+without making it current'; healthy=0; elif ! /bin/td-boot on-volume {update} \
 /run/td-update {volume} {volume}/{channel} {volume}/{key} >{again}; then echo 'td-boot \
 update could not reinstall the deployment after a rollback'; healthy=0; elif ! /bin/grep \
 -q -x -F -f {installed} {again}; then echo 'the reinstall after a rollback named a \
@@ -11377,9 +11374,7 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
         // rather than an assumed one reads /sys/dev/block/<maj>:<min>/ro, so sysfs
         // has to be mounted before `td-boot root-loop` runs. Asserted here because
         // the symptom otherwise is an ENOENT that stops the boot, a layer away from
-        // this decision. Deployment only: the selector never binds a loop, so it
-        // mounts no sysfs and the pair is pinned together — a sysfs that reappeared
-        // there would be a mount nothing reads.
+        // this decision. Both phases also require sysfs for UUID discovery.
         assert!(
             deployment.contains("dir /sys 0755 0 0"),
             "the deployment initramfs has no /sys for sysfs to be mounted on"
@@ -11411,7 +11406,7 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
             "/init must mount devtmpfs and create the loop node"
         );
         assert!(
-            devtmpfs < mknod && mknod < boot,
+            devtmpfs < mknod && mknod < init.find("/bin/td-boot root-loop"),
             "mknod must run AFTER the devtmpfs mount and BEFORE td-boot binds the loop"
         );
         // ...and released before the pivot, with /proc and /dev. switch_root MOVES
@@ -11430,8 +11425,8 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
             );
         }
         assert!(
-            !build_selector_init().contains("sysfs"),
-            "the selector binds no loop, so it must mount no sysfs"
+            build_selector_init().contains("mount -t sysfs sysfs /sys"),
+            "the selector needs sysfs for UUID volume discovery"
         );
         assert!(
             deployment.contains("slink /bin/switch_root {in:td-init}/bin/td-init 0777 0 0")
