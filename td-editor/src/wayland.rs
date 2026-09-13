@@ -5,7 +5,7 @@ use crate::dialog::{Close, Closed, Conflict, Scope, Target};
 use crate::font::Font;
 use crate::keys::Profile;
 use crate::render::{Geometry, Label};
-use td_ui::raster::{Draw, GlyphStyle, Primitive, Raster, CHROME, INK};
+use td_ui::raster::Raster;
 use td_ui::client::{run, App, Client, ClipboardEvent, Handled, KeyboardEvent, Tag};
 use td_ui::data::{PLAIN, UTF8};
 use td_ui::wayland::{connect, endpoint};
@@ -4926,42 +4926,10 @@ impl Window {
 }
 
 fn paint_prompt(raster: &mut Raster<'_, '_>, geometry: Geometry, text: &str) {
-    let (width, _) = geometry.dimensions();
-    let scale = geometry.scale().value();
-    let clip = geometry.prompt();
-    let y = clip.y as usize;
-    let rows = clip.height as usize / (16 * scale);
-    raster.draw(Draw {
-        clip,
-        primitive: Primitive::Fill {
-            rect: clip,
-            color: CHROME,
-        },
-    });
-    let columns = width.saturating_sub(16 * scale).checked_div(8 * scale).unwrap_or(0).max(1);
-    let mut column = 0;
-    let mut row = 0;
-    for scalar in text.chars().take(crate::render::MAX_PROMPT_ROWS * 73) {
-        if scalar == '\n' || column == columns {
-            row += 1;
-            column = 0;
-        }
-        if row >= rows {
-            break;
-        }
-        if scalar == '\n' {
-            continue;
-        }
-        raster.draw(Draw {
-            clip,
-            primitive: Primitive::Glyph {
-                x: ((8 + column * 8) * scale) as i64,
-                y: (y + row * 16 * scale) as i64,
-                scalar,
-                style: GlyphStyle::medium(INK, CHROME),
-            },
-        });
-        column += 1;
+    let prompt = geometry.prompt();
+    let rows = prompt.height as usize / (crate::layout::CELL_HEIGHT * geometry.scale().value());
+    if let Some(block) = td_ui::chrome::Block::new(geometry.surface(), prompt.y, rows) {
+        block.emit(text, geometry.bounds(), &mut |draw| raster.draw(draw));
     }
 }
 

@@ -1025,11 +1025,12 @@ wrap also resets horizontal origin. Native scrollbar coordinates use
 floor rounding on both axes, including move/release outside the track,
 so a stationary subpixel click/release does not move the viewport.
 Standalone scene callers opt into the reserved horizontal strip with
-`Geometry::with_horizontal_scrollbar(true)` and an unwrapped `View`. Tabs
-are 160 pixels wide with 24 pixels reserved for the close mark. A contiguous
-slice of tabs is shown, keeping the active tab visible; a surface narrower
-than one tab clips that tab. Tiny surfaces may have no document cells;
-status paints last and wins any chrome overlap. The default palette is warm
+`Geometry::with_horizontal_scrollbar(true)` and an unwrapped `View`. The
+tabs are td-ui's `chrome::Strip` and the status row its `chrome::Status`
+(`td-ui/DESIGN.md`): the tabs with their close mark and the active one kept
+in view, and the status line's whole-cell truncation. Tiny
+surfaces may have no document cells; the status paints last and wins any
+chrome overlap. The default palette is warm
 #eee8dc paper, #48453f charcoal ink, #e1dbcf chrome, #b5ada0 borders,
 #536b73 focused selection with paper-colored ink, and #c8c4bb unfocused
 selection with ordinary ink. It avoids white backgrounds and near-black
@@ -1246,8 +1247,9 @@ reveal and hit testing agree. Opening/closing/resizing a prompt recomputes
 the view without editing text or changing selection; its origin is retained
 unless normal viewport clamping requires a change. Cancelling removes the
 inset, not any search/replace changes already explicitly applied. Ordinary
-status feedback remains at the bottom and reserves no inset. Drawing clips
-to the reserved area and visits at most 1095 caption scalars; path lines are
+status feedback remains at the bottom and reserves no inset. The caption is
+drawn by td-ui's `chrome::Block` (`td-ui/DESIGN.md`), wrapping to the
+inset's columns and visiting at most its scalar budget; path lines are
 additionally clipped to 72 scaled font columns. Prompt layout changes fence
 native input/render generations; read-only queries and refused remote
 commands do not synchronize or mutate layout. Control exposes the requested
@@ -1901,8 +1903,9 @@ Unavailable commands produce a visible, bounded notice,
 retained until Escape/C-g or another explicit notice-producing action.
 Non-modal notices replace the bottom status text without changing document
 geometry, scrolling, hit testing or pixels. They use the warm chrome and
-medium ink, showing one line of whole font cells with an ellipsis when the
-message exceeds the available width or 512-scalar drawing budget. Control
+medium ink, painted by td-ui's `chrome::Status` (`td-ui/DESIGN.md`): one
+line of whole font cells with an ellipsis when the message exceeds the
+available width or the band's `STATUS_COLUMNS` budget. Control
 characters display as spaces. Very narrow windows may show no complete cell.
 The retained notice is unchanged by clipping and remains available through
 the read-only control `prompt-state` query. Escape/C-g dismisses it and
@@ -2145,19 +2148,18 @@ Activation uses a separate press on an item after opening the header;
 press-drag-release menu selection is not implemented. Release cannot
 activate a row or resume a document drag behind the dismissed popup.
 
-Each popup is 320 font pixels wide with 24-pixel rows, scaled by Geometry's
-integer scale. The complete menu must fit above the status row: the minimum
-size is 320 by (48 + 24 times item count), multiplied by scale. Horizontal
-placement clamps to the right edge. A too-small surface refuses to open the
-popup and displays an enlargement notice; invisible/clipped rows can never
-be activated. A clipped-menu refusal does not reset pending prefix/mark/drag.
+The popup is td-ui's `chrome::Panel` under the menu bar's header
+(`td-ui/DESIGN.md`): its width, its rows, the right-edge clamp and its row
+cap are the toolkit's, and the complete menu exists only
+above the status row. A too-small surface refuses to open the popup and
+displays an enlargement notice; invisible/clipped rows can never be
+activated. A clipped-menu refusal does not reset pending prefix/mark/drag.
 A new physical key press still cancels native repeat before menu admission,
 as it does for every key. Escape/C-g with a menu open dismisses both the
-menu and any underlying notice; F10 only toggles the menu. At most thirteen
-rows exist, with static bounded labels, and painting and hit tests use the
-same panel geometry. Header geometry derives
-from the reference renderer's single menu-bar string. Colors remain warm
-and muted, with dim disabled text and a highlighted selected row. The core
+menu and any underlying notice; F10 only toggles the menu. Labels are
+static and bounded, painting and hit tests are the one panel, and the
+header geometry is the menu bar's `chrome::Bar`. Colors remain warm and
+muted, with dim disabled text and a highlighted selected row. The core
 headless preview's closed menu bar has unchanged pixels.
 
 Pure tests pin panel bounds and row hits at scales 1-4, disabled navigation,

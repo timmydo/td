@@ -2,8 +2,9 @@
 
 use crate::dialog::Target;
 use crate::keys::Profile;
-use crate::render::Geometry;
-use td_ui::raster::{Draw, GlyphStyle, Primitive, Raster, Rect, CHROME, INK};
+use crate::render::{Geometry, MENU_LABELS};
+use td_ui::chrome::{self, Bar};
+use td_ui::raster::{Raster, Rect};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Group {
@@ -288,118 +289,44 @@ impl Menu {
             _ => false,
         }
     }
-    pub(crate) fn panel(&self, geometry: Geometry) -> Option<Rect> {
-        let scale = geometry.scale().value();
-        let width = 320 * scale;
-        let height = self.group.items().len() * 24 * scale;
-        let (w, h) = geometry.dimensions();
-        if w < width || h < height + 48 * scale {
-            return None;
-        }
+    fn chrome_panel(&self, geometry: Geometry) -> Option<chrome::Panel> {
         let header = geometry.menu(self.group.index())?;
-        Some(Rect {
-            x: header.x.min((w - width) as i64),
-            y: (24 * scale) as i64,
-            width: width as u32,
-            height: height as u32,
-        })
+        chrome::Panel::new(geometry.surface(), header, self.group.items().len())
+    }
+    pub(crate) fn panel(&self, geometry: Geometry) -> Option<Rect> {
+        self.chrome_panel(geometry).map(chrome::Panel::rect)
     }
     pub(crate) fn hit(&self, geometry: Geometry, x: i64, y: i64) -> Option<usize> {
-        let panel = self.panel(geometry)?;
-        if !panel.contains(x, y) {
-            return None;
-        }
-        Some((y - panel.y) as usize / (24 * geometry.scale().value()))
+        self.chrome_panel(geometry)?.hit(x, y)
     }
     pub(crate) fn step(&mut self, backward: bool) {
-        let count = self.group.items().len();
-        for _ in 0..count {
-            self.selected = if backward {
-                (self.selected + count - 1) % count
-            } else {
-                (self.selected + 1) % count
-            };
-            if self
-                .group
+        let next = chrome::step(self.group.items().len(), self.selected, backward, |index| {
+            self.group
                 .items()
-                .get(self.selected)
+                .get(index)
                 .is_some_and(|item| self.enabled(*item))
-            {
-                break;
-            }
-        }
+        });
+        self.selected = next;
     }
     pub(crate) fn paint(&self, raster: &mut Raster<'_, '_>, geometry: Geometry) {
-        let Some(panel) = self.panel(geometry) else {
+        let Some(panel) = self.chrome_panel(geometry) else {
             return;
         };
-        let scale = geometry.scale().value() as i64;
-        for (index, item) in self.group.items().iter().enumerate() {
-            let row = Rect {
-                y: panel.y + index as i64 * 24 * scale,
-                height: (24 * scale) as u32,
-                ..panel
-            };
-            let bg = if index == self.selected {
-                0xffc9c1b2
-            } else {
-                CHROME
-            };
-            let ink = if self.enabled(*item) { INK } else { 0xff827a6d };
-            raster.draw(Draw {
-                clip: row,
-                primitive: Primitive::Fill {
-                    rect: row,
-                    color: bg,
-                },
-            });
-            let prefix = if self.checked(*item) { "+ " } else { "  " };
-            for (column, scalar) in prefix.chars().chain(item.label().chars()).enumerate() {
-                glyph(
-                    raster,
-                    row,
-                    panel.x + (8 + column as i64 * 8) * scale,
-                    row.y + 4 * scale,
-                    scalar,
-                    ink,
-                    bg,
-                );
-            }
-            let shortcut = item.shortcut(self.profile);
-            let start = panel.x + i64::from(panel.width) - (8 + shortcut.len() as i64 * 8) * scale;
-            for (column, scalar) in shortcut.chars().enumerate() {
-                glyph(
-                    raster,
-                    row,
-                    start + column as i64 * 8 * scale,
-                    row.y + 4 * scale,
-                    scalar,
-                    ink,
-                    bg,
-                );
-            }
-        }
+        let rows = self.group.items().iter().map(|&item| chrome::Row {
+            label: item.label(),
+            shortcut: item.shortcut(self.profile),
+            enabled: self.enabled(item),
+            checked: self.checked(item),
+        });
+        panel.emit(rows, self.selected, geometry.bounds(), &mut |draw| {
+            raster.draw(draw)
+        });
     }
-}
-
-fn glyph(raster: &mut Raster<'_, '_>, clip: Rect, x: i64, y: i64, scalar: char, ink: u32, bg: u32) {
-    raster.draw(Draw {
-        clip,
-        primitive: Primitive::Glyph {
-            x,
-            y,
-            scalar,
-            style: GlyphStyle::medium(ink, bg),
-        },
-    });
 }
 
 pub(crate) fn header(geometry: Geometry, x: i64, y: i64) -> Option<Group> {
-    Group::ALL.into_iter().find(|group| {
-        geometry
-            .menu(group.index())
-            .is_some_and(|rect| rect.contains(x, y))
-    })
+    let index = Bar::new(geometry.surface(), &MENU_LABELS).hit(x, y)?;
+    Group::ALL.get(index).copied()
 }
 
 #[cfg(test)]

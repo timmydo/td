@@ -5,6 +5,7 @@ use crate::keys::Profile;
 use crate::layout::{Affinity, Break, Caret, Layout, Metrics, Position, CELL_HEIGHT, CELL_WIDTH};
 use crate::model::{Editor, Limits, TabId};
 use crate::{text, Error, Result};
+use td_ui::chrome::{self, Bar, Block, Status, Strip};
 use td_ui::raster::{
     text_run, Composition, Draw, GlyphStyle, Primitive, Raster, Rect, Scale, Scrollbar, Surface,
     BORDER, CHROME, INACTIVE_SELECTION, INK, LINE_NUMBER, MISSPELLED, PAPER, SELECTED,
@@ -20,9 +21,9 @@ pub struct Geometry {
     horizontal_scrollbar: bool,
 }
 
-pub const MAX_PROMPT_ROWS: usize = 15;
+pub const MAX_PROMPT_ROWS: usize = chrome::BLOCK_ROWS;
 
-const MENU_BAR: &str = "File   Edit   Format   Help   Directory";
+pub(crate) const MENU_LABELS: [&str; 5] = ["File", "Edit", "Format", "Help", "Directory"];
 
 impl Default for Geometry {
     fn default() -> Self {
@@ -97,21 +98,7 @@ impl Geometry {
         self.scale
     }
     pub fn menu(self, index: usize) -> Option<Rect> {
-        let scale = self.scale.value();
-        let mut column = 1;
-        for (i, label) in MENU_BAR.split_inclusive("   ").enumerate() {
-            let columns = label.len();
-            if i == index {
-                return Some(Rect {
-                    x: (column * 8 * scale) as i64,
-                    y: 0,
-                    width: (columns * 8 * scale) as u32,
-                    height: (24 * scale) as u32,
-                });
-            }
-            column += columns;
-        }
-        None
+        Bar::new(self.surface(), &MENU_LABELS).header(index)
     }
     /// The surface the scene is laid out for: what `Raster::new` takes and
     /// `Raster::paint` holds a scene to.
@@ -191,41 +178,29 @@ impl Geometry {
         ))
     }
     pub fn status(self) -> Rect {
-        let height = 24 * self.scale.value();
+        Status::new(self.surface()).rect()
+    }
+    /// The tab strip's row, below the menu bar and the minibuffer inset.
+    fn strip(self) -> Rect {
         Rect {
             x: 0,
-            y: self.height.saturating_sub(height) as i64,
+            y: 24 * self.scale.value() as i64 + i64::from(self.prompt().height),
             width: self.width as u32,
-            height: height as u32,
+            height: (24 * self.scale.value()) as u32,
         }
     }
     pub fn tab_close(self, index: usize, active: usize, count: usize) -> Option<Rect> {
-        let tab = self.tab(index, active, count)?;
-        let width = (24 * self.scale.value()) as u32;
-        Some(Rect {
-            x: tab.x + i64::from(tab.width - width),
-            width,
-            ..tab
-        })
+        if count > Limits::default().tabs {
+            return None;
+        }
+        Strip::new(self.surface(), self.strip().y, active, count)?.close(index)
     }
     /// The active tab is always in the strip. Narrow surfaces clip one tab.
     pub fn tab(self, index: usize, active: usize, count: usize) -> Option<Rect> {
-        if index >= count || count > Limits::default().tabs || active >= count {
+        if count > Limits::default().tabs {
             return None;
         }
-        let width = 160 * self.scale.value();
-        let visible = (self.width / width).max(1);
-        let first = active.saturating_sub(visible - 1);
-        let slot = index.checked_sub(first)?;
-        if slot >= visible {
-            return None;
-        }
-        Some(Rect {
-            x: (slot * width) as i64,
-            y: (24 * self.scale.value() + self.prompt().height as usize) as i64,
-            width: width as u32,
-            height: (24 * self.scale.value()) as u32,
-        })
+        Strip::new(self.surface(), self.strip().y, active, count)?.tab(index)
     }
 }
 
@@ -387,7 +362,6 @@ impl<'a> Scene<'a> {
         let Some(clip) = damage.intersection(self.geometry.bounds()) else {
             return;
         };
-        let s = self.geometry.scale.value() as i64;
         let fill = |rect: Rect, color, sink: &mut dyn FnMut(Draw)| {
             if let Some(area) = rect.intersection(clip) {
                 sink(Draw {
@@ -397,93 +371,32 @@ impl<'a> Scene<'a> {
             }
         };
         fill(self.geometry.bounds(), PAPER, sink);
-        fill(
-            Rect {
-                x: 0,
-                y: 0,
-                width: self.geometry.width as u32,
-                height: (48 * s) as u32 + self.geometry.prompt().height,
-            },
-            CHROME,
-            sink,
-        );
-        self.label(
-            MENU_BAR.chars(),
-            (8 * s, 4 * s),
-            Rect {
-                x: 0,
-                y: 0,
-                width: self.geometry.width as u32,
-                height: (24 * s) as u32,
-            },
-            GlyphStyle::medium(INK, CHROME),
-            clip,
-            sink,
-        );
+        let surface = self.geometry.surface();
+        // The three bands tile [0, 48*scale + prompt height): the menu bar,
+        // the minibuffer inset (filled empty; the window paints its caption),
+        // and the tab strip.
+        Bar::new(surface, &MENU_LABELS).emit(clip, sink);
+        let prompt = self.geometry.prompt();
+        let prompt_rows = prompt.height as usize / (CELL_HEIGHT * self.geometry.scale.value());
+        if let Some(block) = Block::new(surface, prompt.y, prompt_rows) {
+            block.emit("", clip, sink);
+        }
         let count = self.editor.tabs().count();
         let active = self
             .editor
             .tabs()
             .position(|(id, _)| Some(id) == self.editor.active())
             .unwrap_or(0);
-        for (index, (id, doc)) in self.editor.tabs().enumerate() {
-            let Some(rect) = self.geometry.tab(index, active, count) else {
-                continue;
-            };
-            let background = if Some(id) == self.editor.active() {
-                PAPER
-            } else {
-                CHROME
-            };
-            let style = GlyphStyle::medium(INK, background);
-            fill(rect, background, sink);
-            fill(
-                Rect {
-                    x: rect.x,
-                    y: rect.y,
-                    width: rect.width,
-                    height: s as u32,
-                },
-                BORDER,
-                sink,
-            );
-            fill(
-                Rect {
-                    x: rect.x + i64::from(rect.width) - s,
-                    y: rect.y,
-                    width: s as u32,
-                    height: rect.height,
-                },
-                BORDER,
-                sink,
-            );
-            let title = self
-                .labels
-                .iter()
-                .find(|label| label.tab == id)
-                .map_or("Untitled", |label| label.title);
-            let Some(close) = self.geometry.tab_close(index, active, count) else {
-                continue;
-            };
-            let title_rect = Rect {
-                width: rect.width.saturating_sub(close.width),
-                ..rect
-            };
-            self.label(
-                if doc.dirty() { "*" } else { "" }
-                    .chars()
-                    .chain(title.chars()),
-                (rect.x + 8 * s, rect.y + 4 * s),
-                title_rect,
-                style,
-                clip,
-                sink,
-            );
-            self.label(
-                "x".chars(),
-                (close.x + 8 * s, close.y + 4 * s),
-                close,
-                style,
+        if let Some(strip) = Strip::new(surface, self.geometry.strip().y, active, count) {
+            let labels = self.labels;
+            strip.emit(
+                self.editor.tabs().map(|(id, doc)| {
+                    let title = labels
+                        .iter()
+                        .find(|label| label.tab == id)
+                        .map_or("Untitled", |label| label.title);
+                    (title, doc.dirty())
+                }),
                 clip,
                 sink,
             );
@@ -497,39 +410,9 @@ impl<'a> Scene<'a> {
                 sink,
             );
         }
-        let status_rect = self.geometry.status();
-        fill(status_rect, CHROME, sink);
-        fill(
-            Rect {
-                height: s as u32,
-                ..status_rect
-            },
-            BORDER,
-            sink,
-        );
+        let status = Status::new(surface);
         if let Some(notice) = self.notice {
-            let scale = self.geometry.scale.value();
-            let columns = self.geometry.width.saturating_sub(16 * scale) / (CELL_WIDTH * scale);
-            let columns = columns.min(512);
-            let mut chars = notice.chars().peekable();
-            let shown = (0..columns).map_while(|column| {
-                let scalar = chars.next()?;
-                Some(if column + 1 == columns && chars.peek().is_some() {
-                    '…'
-                } else if scalar.is_control() {
-                    ' '
-                } else {
-                    scalar
-                })
-            });
-            self.label(
-                shown,
-                (8 * s, status_rect.y + 4 * s),
-                status_rect,
-                GlyphStyle::medium(INK, CHROME),
-                clip,
-                sink,
-            );
+            status.emit(notice.chars(), clip, sink);
             return;
         }
         let spelling = if self.editor.active().is_some() {
@@ -539,13 +422,18 @@ impl<'a> Scene<'a> {
         } else {
             ""
         };
+        // The ordinary status is the editor's metrics line, painted plain
+        // through the band's frame; `Status::emit`'s ellipsis is for notices.
+        status.frame(clip, sink);
+        let rect = status.rect();
+        let s = self.geometry.scale.value() as i64;
         self.label(
             self.status
                 .chars()
                 .chain(if spelling.is_empty() { "" } else { "   " }.chars())
                 .chain(spelling.chars()),
-            (8 * s, status_rect.y + 4 * s),
-            status_rect,
+            (8 * s, rect.y + 4 * s),
+            rect,
             GlyphStyle::medium(INK, CHROME),
             clip,
             sink,

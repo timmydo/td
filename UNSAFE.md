@@ -74,7 +74,8 @@ an ioctl) the amendment is made here first rather than found in a diff.
 `td-ui`, the shared UI toolkit that td-editor depends on by path, joined
 the roster when the editor's Wayland transport moved into it (§19). It
 denies `unsafe` at its crate root; the keymap compiler, repeat policy,
-pointer decoder, raster and the font and wire sources it mounts need none.
+pointer decoder, raster, the chrome bands and the font and wire sources
+it mounts need none.
 A consumer inherits that surface through the toolkit's connection and
 nothing else; reusing the module does not transfer its authorization to a
 raw boundary of the consumer's own, which gets its own entry.
@@ -2616,8 +2617,9 @@ pointer or unowned received descriptor escapes the private module; the crate
 root denies `unsafe`, and the two allowances are the module's only ones.
 Other architectures are refused at compile time rather than inheriting its
 ABI. The rest of the toolkit — the client over the transport, the raster,
-the keymap compiler, the repeat policy, the pointer and data-device decoders
-and the mounted font and wire sources — has no raw boundary.
+the chrome bands, the keymap compiler, the repeat policy, the pointer and
+data-device decoders and the mounted font and wire sources — has no raw
+boundary.
 
 This surface is the editor's transport subset, moved here so that every
 td-owned graphical program shares one client, with one change: the

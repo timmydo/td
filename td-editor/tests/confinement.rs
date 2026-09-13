@@ -121,10 +121,12 @@ fn source_inventory_and_allowances_are_closed() {
             }
         }
         // The crate reaches the toolkit in a closed set of files: the input
-        // adapter; `layout`, which re-exports the shared cell constants; the
-        // crate root, which re-exports the shared font and wire modules and
-        // maps the raster's errors; the scene, controller and menu, which
-        // compose `td_ui::raster`; and `main`, which prints `td_ui::notices`.
+        // adapter, which also paints the minibuffer through `td_ui::chrome`;
+        // `layout`, which re-exports the shared cell constants; the crate
+        // root, which re-exports the shared font and wire modules and maps
+        // the raster's errors; the scene, controller and menu, which compose
+        // `td_ui::raster`, the scene and menu also `td_ui::chrome`; and
+        // `main`, which prints `td_ui::notices`.
         assert!(
             identifier_count(&text, "td_ui") == 0
                 || matches!(
