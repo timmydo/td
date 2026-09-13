@@ -9,23 +9,27 @@ const MAIN_RS: &str = include_str!("../../../td-portal/src/main.rs");
 
 /// td-portal, the supervised desktop portal service, built as a TARGET recipe
 /// from the checkout's own trees. Its `main.rs` reaches the broker codec, the
-/// token-protected secret store, the compositor's wire/keyboard/font modules,
-/// and the engine's sha256 by relative `#[path]`, so those sibling trees are
-/// staged beside it and cargo compiles exactly what the crate names. The lock
-/// is the crate's own committed one — td-portal declares no external crate —
-/// and the binary is linked fully static, as every td-owned program on the
-/// image, so the system tree's `/bin/td-portal` needs no loader.
+/// token-protected secret store, and the compositor's wire and keyboard
+/// modules by relative `#[path]`, and the engine's sha256 through td-secret;
+/// the file chooser depends on the shared UI toolkit `td-ui` by path, which
+/// itself mounts the compositor's font and wire. Those sibling trees are
+/// staged beside td-portal so cargo compiles exactly what the crate names.
+/// td-portal's one dependency is the roster sibling `td-ui`, so its lock lists
+/// only itself and td-ui; the binary is linked fully static, as every td-owned
+/// program on the image, so the system tree's `/bin/td-portal` needs no loader.
 ///
 /// The former hand-rolled rustc recipe vendored those modules file by file
 /// with `include_str!`; this stages the sibling trees whole, the same shape
-/// td-net uses, so 7c can add the shared UI toolkit to the roster by naming
-/// one more tree. The shipped binary's static-shape assertion and target-side
-/// selftest, which the hand-rolled recipe ran inline, move to the td-portal-test
-/// companion recipe, the same split td-ui-test makes for the compositor.
+/// td-net uses. 7(c) added `td-ui` to the roster and moved the file chooser's
+/// render onto its raster and chrome bands, retiring td-portal's own font
+/// mount and second rasterizer. The shipped binary's static-shape assertion
+/// and target-side selftest, which the hand-rolled recipe ran inline, moved to
+/// the td-portal-test companion, the same split td-ui-test makes for the
+/// compositor.
 pub fn recipe() -> Recipe {
     Recipe::rust("td-portal", "0.1.0")
         .local_source("td-portal")
-        .local_source_trees(&["td-secret", "td-busd", "td-compositor", "engine"])
+        .local_source_trees(&["td-secret", "td-busd", "td-compositor", "engine", "td-ui"])
         .native_inputs(&[
             "rust-toolchain",
             "gcc-x86-64-self",
@@ -59,6 +63,7 @@ mod tests {
                 "td-busd".to_string(),
                 "td-compositor".to_string(),
                 "engine".to_string(),
+                "td-ui".to_string(),
             ])
         );
         assert_eq!(recipe.cargo_subdir.as_deref(), Some("td-portal"));

@@ -38,10 +38,6 @@ mod fido_metadata;
 #[path = "../../td-secret/src/crypto.rs"]
 mod crypto;
 mod file_chooser;
-#[path = "../../td-compositor/src/font.rs"]
-mod font;
-#[path = "../../td-compositor/src/font_data.rs"]
-mod font_data;
 mod handles;
 #[path = "../../td-compositor/src/keyboard.rs"]
 #[allow(

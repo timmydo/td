@@ -399,7 +399,16 @@ mod tests {
         trees.dedup();
         assert_eq!(
             trees,
-            ["engine", "net", "td-boot", "td-busd", "td-compositor", "td-portal", "td-secret"]
+            [
+                "engine",
+                "net",
+                "td-boot",
+                "td-busd",
+                "td-compositor",
+                "td-portal",
+                "td-secret",
+                "td-ui"
+            ]
         );
         lone.sort_unstable();
         lone.dedup();

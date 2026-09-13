@@ -1,6 +1,6 @@
 //! Bounded filesystem model and software pixels for the FileChooser dialog.
 
-use crate::{font, list_filter};
+use crate::list_filter;
 use std::collections::BTreeSet;
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
@@ -8,7 +8,13 @@ use std::os::fd::AsRawFd;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Component, Path, PathBuf};
-use std::sync::OnceLock;
+use td_ui::chrome::{Field, Item, List, Status, TextEntry, ROW};
+use td_ui::raster::{
+    text_run, Composition, Draw, GlyphStyle, Primitive, Raster, Rect, Scale, Surface, BORDER,
+    CHROME, INK, LINE_NUMBER,
+};
+use td_ui::font::Font;
+use td_ui::{CELL_HEIGHT, CELL_WIDTH};
 
 pub const WIDTH: usize = 640;
 pub const HEIGHT: usize = 432;
@@ -23,19 +29,22 @@ pub const MAX_FRAME_BYTES: usize = 32 * 1024 * 1024;
 pub const MAX_RENDERED_TITLE_BYTES: usize = 320;
 pub const MAX_ACCEPT_LABEL_BYTES: usize = 64;
 const MAX_DISPLAY_NAME_CHARS: usize = 64;
-const HEADER_ROWS: usize = 6;
-const FOOTER_ROWS: usize = 2;
-const ROW_GAP: usize = 4;
 
-const BACKGROUND: [u8; 4] = [0x28, 0x20, 0x18, 0];
-const PANEL: [u8; 4] = [0x3c, 0x30, 0x28, 0];
-const HIGHLIGHT: [u8; 4] = [0x78, 0x48, 0x28, 0];
-const TEXT: [u8; 4] = [0xf0, 0xe8, 0xd8, 0];
-const MUTED: [u8; 4] = [0xb0, 0xa0, 0x90, 0];
+// The file chooser renders as a `Composition` over the shared raster at
+// scale 1: a chrome ground, a title heading over a hairline rule, the guest
+// path and selection-status lines, the filter as a `TextEntry`, the entries
+// as a `List`, and a `Status` footer. These are the band tops in font pixels;
+// the list fills from `LIST_TOP` to one `ROW` above the bottom (the footer).
+const INSET_X: usize = CELL_WIDTH;
+const TITLE_Y: usize = 4;
+const RULE_Y: usize = ROW;
+const PATH_Y: usize = ROW + 4;
+const STATUS_Y: usize = 2 * ROW + 4;
+const FILTER_TOP: usize = 3 * ROW;
+const LIST_TOP: usize = 4 * ROW;
+
 const O_DIRECTORY: i32 = 0x0001_0000;
 const O_NOFOLLOW: i32 = 0x0002_0000;
-
-static CHOOSER_FONT: OnceLock<Result<font::Font, String>> = OnceLock::new();
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FileFilter {
@@ -126,6 +135,10 @@ pub struct Chooser {
     directory_truncated: bool,
     selection_limit_hit: bool,
     finished: bool,
+    // The pinned face is built once here, not per repaint: `pinned()` parses
+    // the whole glyph table, so rebuilding it on every keystroke-driven frame
+    // is wasted work. td-editor and td-setup cache it the same way.
+    font: Font,
 }
 
 impl Chooser {
@@ -168,7 +181,7 @@ impl Chooser {
                 host_root.display()
             )
         })?;
-        let row_capacity = visible_rows(HEIGHT, chooser_font()?);
+        let row_capacity = visible_rows(HEIGHT);
         let (entries, directory_truncated) = read_entries(&root)?;
         let mut chooser = Self {
             title: title.to_string(),
@@ -188,6 +201,7 @@ impl Chooser {
             directory_truncated,
             selection_limit_hit: false,
             finished: false,
+            font: td_ui::font::pinned()?,
         };
         chooser.refresh_matches();
         Ok(chooser)
@@ -248,110 +262,58 @@ impl Chooser {
 
     pub fn set_viewport(&mut self, width: usize, height: usize) -> Result<(), String> {
         frame_bytes(width, height)?;
-        self.visible_rows = visible_rows(height, chooser_font()?);
+        self.visible_rows = visible_rows(height);
         self.keep_selected_visible();
         Ok(())
     }
 
     pub fn render_sized(&self, width: usize, height: usize) -> Result<Vec<u8>, String> {
-        let font = chooser_font()?;
-        let bytes = frame_bytes(width, height)?;
-        let mut frame = vec![0u8; bytes];
-        let dimensions = (width, height);
-        fill(&mut frame, dimensions, 0, 0, width, height, BACKGROUND);
-        fill(
-            &mut frame,
-            dimensions,
-            font.width(),
-            font.height(),
-            width.saturating_sub(font.width().saturating_mul(2)),
-            height.saturating_sub(font.height().saturating_mul(2)),
-            PANEL,
-        );
-        draw_text(&mut frame, dimensions, font, 3, 2, &self.title, TEXT);
-        draw_text(
-            &mut frame,
-            dimensions,
-            font,
-            3,
-            3,
-            &format!("PATH  {}", file_uri(&self.guest_directory())?),
-            MUTED,
-        );
-        draw_text(
-            &mut frame,
-            dimensions,
-            font,
-            3,
-            4,
-            &self.status_line(),
-            TEXT,
-        );
-        draw_text(
-            &mut frame,
-            dimensions,
-            font,
-            3,
-            5,
-            &format!("FILTER  {}", self.query),
-            TEXT,
-        );
-        for (row, (match_index, entry_index)) in self
-            .matches
-            .iter()
-            .enumerate()
-            .skip(self.scroll_start)
-            .take(self.visible_rows)
-            .enumerate()
-        {
+        let scale = Scale::new(1).map_err(|error| format!("file chooser scale: {error}"))?;
+        let surface = Surface::new(width, height, scale)
+            .map_err(|error| format!("file chooser surface {width}x{height}: {error}"))?;
+        let rows = visible_rows(height);
+        let mut items = Vec::with_capacity(rows);
+        for entry_index in self.matches.iter().skip(self.scroll_start).take(rows) {
             let Some(entry) = self.entries.get(*entry_index) else {
                 continue;
             };
-            let grid_row = HEADER_ROWS.saturating_add(row);
-            if match_index == self.selected {
-                fill(
-                    &mut frame,
-                    dimensions,
-                    font.width().saturating_mul(2),
-                    grid_row.saturating_mul(font.height().saturating_add(ROW_GAP)),
-                    width.saturating_sub(font.width().saturating_mul(4)),
-                    font.height(),
-                    HIGHLIGHT,
-                );
-            }
-            let key = selection_key(&self.relative, &entry.name);
-            let mark = if self.chosen.contains(&key) { "*" } else { " " };
             let suffix = if entry.kind == EntryKind::Directory {
                 "/"
             } else {
                 ""
             };
-            draw_text(
-                &mut frame,
-                dimensions,
-                font,
-                3,
-                grid_row,
-                &row_label(*entry_index, mark, entry, suffix),
-                TEXT,
-            );
+            let marked = self
+                .chosen
+                .contains(&selection_key(&self.relative, &entry.name));
+            items.push(ListRow {
+                label: item_label(*entry_index, entry, suffix),
+                marked,
+            });
         }
-        if self.matches.is_empty() {
-            draw_text(
-                &mut frame,
-                dimensions,
-                font,
-                3,
-                HEADER_ROWS,
-                "NO MATCHES",
-                MUTED,
-            );
-        }
-        let help_row =
-            (height / font.height().saturating_add(ROW_GAP).max(1)).saturating_sub(FOOTER_ROWS);
-        let help = self.help_line();
-        draw_text(&mut frame, dimensions, font, 3, help_row, &help, MUTED);
-        Ok(frame)
+        let view = ChooserView {
+            surface,
+            rows,
+            title: self.title.clone(),
+            path: format!("PATH  {}", file_uri(&self.guest_directory())?),
+            status: self.status_line(),
+            query: self.query.clone(),
+            help: self.help_line(),
+            items,
+            first: self.scroll_start,
+            selected: self.selected,
+            total: self.matches.len(),
+        };
+        let mut pixels = vec![0u8; frame_bytes(width, height)?];
+        Raster::new(
+            &mut pixels,
+            &self.font,
+            surface,
+            width.saturating_mul(BYTES_PER_PIXEL),
+        )
+        .map_err(|error| format!("file chooser raster: {error}"))?
+        .paint(&view, surface.bounds())
+        .map_err(|error| format!("file chooser paint: {error}"))?;
+        Ok(pixels)
     }
 
     pub fn query(&self) -> &str {
@@ -556,13 +518,6 @@ impl Chooser {
     }
 }
 
-fn chooser_font() -> Result<&'static font::Font, String> {
-    match CHOOSER_FONT.get_or_init(font::pinned) {
-        Ok(font) => Ok(font),
-        Err(error) => Err(error.clone()),
-    }
-}
-
 fn open_directory(path: &Path) -> std::io::Result<File> {
     OpenOptions::new()
         .read(true)
@@ -708,8 +663,8 @@ fn display_name(name: &OsStr) -> String {
     display
 }
 
-fn row_label(index: usize, mark: &str, entry: &Entry, suffix: &str) -> String {
-    format!("{index:03} {mark} {}{suffix}", entry.display)
+fn item_label(index: usize, entry: &Entry, suffix: &str) -> String {
+    format!("{index:03} {}{suffix}", entry.display)
 }
 
 fn push_hex_escape(text: &mut String, byte: u8) {
@@ -740,10 +695,12 @@ pub fn file_uri(path: &Path) -> Result<String, String> {
     Ok(uri)
 }
 
-fn visible_rows(height: usize, font: &font::Font) -> usize {
-    let rows = height / font.height().saturating_add(ROW_GAP).max(1);
-    rows.saturating_sub(HEADER_ROWS.saturating_add(FOOTER_ROWS))
-        .max(1)
+/// The `List` rows the surface shows: the height less the header bands and
+/// the footer row, divided by the chrome row, at least one. `render_sized`
+/// lays the `List` out at exactly this many rows, so the caller-owned scroll
+/// window and the list's own row count agree.
+fn visible_rows(height: usize) -> usize {
+    (height.saturating_sub(LIST_TOP.saturating_add(ROW)) / ROW).max(1)
 }
 
 fn frame_bytes(width: usize, height: usize) -> Result<usize, String> {
@@ -764,69 +721,151 @@ fn frame_bytes(width: usize, height: usize) -> Result<usize, String> {
     Ok(bytes)
 }
 
-fn fill(
-    frame: &mut [u8],
-    dimensions: (usize, usize),
-    left: usize,
-    top: usize,
-    width: usize,
-    height: usize,
-    color: [u8; 4],
-) {
-    let (frame_width, frame_height) = dimensions;
-    let bottom = top.saturating_add(height).min(frame_height);
-    let right = left.saturating_add(width).min(frame_width);
-    for y in top.min(frame_height)..bottom {
-        for x in left.min(frame_width)..right {
-            let Some(at) = y
-                .checked_mul(frame_width)
-                .and_then(|row| row.checked_add(x))
-                .and_then(|pixel| pixel.checked_mul(BYTES_PER_PIXEL))
-            else {
-                continue;
-            };
-            let Some(slot) = frame.get_mut(at..at.saturating_add(BYTES_PER_PIXEL)) else {
-                continue;
-            };
-            slot.copy_from_slice(&color);
-        }
+/// One `List` row built from an entry: its label and whether it carries the
+/// multi-select mark. The list paints the mark prefix and the selection.
+struct ListRow {
+    label: String,
+    marked: bool,
+}
+
+/// The file chooser laid out over one surface as a `Composition`: a chrome
+/// ground, the title heading over a hairline rule, the guest path and
+/// selection-status lines, the filter field, the entry list and the status
+/// footer. It owns the strings and the visible window `render_sized` built
+/// from the model, and reads nothing but its own fields.
+struct ChooserView {
+    surface: Surface,
+    rows: usize,
+    title: String,
+    path: String,
+    status: String,
+    query: String,
+    help: String,
+    items: Vec<ListRow>,
+    first: usize,
+    selected: usize,
+    total: usize,
+}
+
+/// Streams a filled rectangle clipped to the damage, like the chrome bands.
+fn fill(rect: Rect, color: u32, damage: Rect, sink: &mut dyn FnMut(Draw)) {
+    if let Some(area) = rect.intersection(damage) {
+        sink(Draw {
+            clip: area,
+            primitive: Primitive::Fill { rect: area, color },
+        });
     }
 }
 
-fn draw_text(
-    frame: &mut [u8],
-    dimensions: (usize, usize),
-    font: &font::Font,
-    column: usize,
-    row: usize,
-    text: &str,
-    color: [u8; 4],
-) {
-    let (frame_width, _) = dimensions;
-    let origin_x = column.saturating_mul(font.width());
-    let origin_y = row.saturating_mul(font.height().saturating_add(ROW_GAP));
-    for (offset, scalar) in text.chars().enumerate() {
-        let x = origin_x.saturating_add(offset.saturating_mul(font.width()));
-        if x >= frame_width {
-            break;
+impl Composition for ChooserView {
+    fn surface(&self) -> Surface {
+        self.surface
+    }
+
+    fn emit(&self, damage: Rect, sink: &mut dyn FnMut(Draw)) {
+        let s = self.surface.scale.value();
+        let inset = (INSET_X * s) as i64;
+        let content = self.surface.width.saturating_sub(2 * INSET_X * s) as u32;
+        let band = |top: usize| Rect {
+            x: inset,
+            y: (top * s) as i64,
+            width: content,
+            height: (CELL_HEIGHT * s) as u32,
+        };
+        // The chrome ground under everything, so no pixel is left unpainted.
+        fill(self.surface.bounds(), CHROME, damage, sink);
+        let title = band(TITLE_Y);
+        text_run(
+            self.surface.scale,
+            self.title.chars(),
+            (title.x, title.y),
+            title,
+            GlyphStyle::medium(INK, CHROME),
+            damage,
+            sink,
+        );
+        // A hairline rule separates the heading from the path and status.
+        fill(
+            Rect {
+                x: inset,
+                y: (RULE_Y * s) as i64,
+                width: content,
+                height: s as u32,
+            },
+            BORDER,
+            damage,
+            sink,
+        );
+        for (line, top) in [(&self.path, PATH_Y), (&self.status, STATUS_Y)] {
+            let at = band(top);
+            text_run(
+                self.surface.scale,
+                line.chars(),
+                (at.x, at.y),
+                at,
+                GlyphStyle::medium(LINE_NUMBER, CHROME),
+                damage,
+                sink,
+            );
         }
-        let glyph = font.index(scalar);
-        for glyph_y in 0..font.height() {
-            for glyph_x in 0..font.width() {
-                if !font.pixel(glyph, glyph_x, glyph_y) {
-                    continue;
-                }
-                fill(
-                    frame,
-                    dimensions,
-                    x.saturating_add(glyph_x),
-                    origin_y.saturating_add(glyph_y),
-                    1,
-                    1,
-                    color,
+        let filter = Rect {
+            x: inset,
+            y: (FILTER_TOP * s) as i64,
+            width: content,
+            height: (ROW * s) as u32,
+        };
+        if let Some(entry) = TextEntry::new(self.surface, filter) {
+            let caret = self.query.chars().count();
+            let first = entry.reveal(caret, caret, 0);
+            entry.emit(
+                Field {
+                    text: &self.query,
+                    placeholder: "Filter",
+                    caret,
+                    anchor: None,
+                    first,
+                    masked: false,
+                    focused: true,
+                    caret_visible: true,
+                },
+                damage,
+                sink,
+            );
+        }
+        let list_rect = Rect {
+            x: inset,
+            y: (LIST_TOP * s) as i64,
+            width: content,
+            height: (self.rows * ROW * s) as u32,
+        };
+        if let Some(list) = List::new(self.surface, list_rect) {
+            list.emit(
+                self.items.iter().map(|row| Item {
+                    label: row.label.as_str(),
+                    meta: "",
+                    enabled: true,
+                    marked: row.marked,
+                }),
+                self.first,
+                self.selected,
+                self.total,
+                damage,
+                sink,
+            );
+            if self.total == 0 {
+                let body = list.body();
+                text_run(
+                    self.surface.scale,
+                    "No matches".chars(),
+                    (body.x + (INSET_X * s) as i64, body.y + (TITLE_Y * s) as i64),
+                    body,
+                    GlyphStyle::medium(LINE_NUMBER, CHROME),
+                    damage,
+                    sink,
                 );
             }
         }
+        Status::new(self.surface).emit(self.help.chars(), damage, sink);
     }
 }
 
@@ -896,8 +935,9 @@ pub fn selftest() -> Result<(), String> {
             return Err("file chooser selftest directory selection differed".into());
         }
         let frame = chooser.render()?;
+        let ink = (INK | 0xff00_0000).to_le_bytes();
         if frame.len() != WIDTH * HEIGHT * BYTES_PER_PIXEL
-            || !frame.as_chunks::<BYTES_PER_PIXEL>().0.contains(&TEXT)
+            || !frame.as_chunks::<BYTES_PER_PIXEL>().0.contains(&ink)
         {
             return Err("file chooser selftest rendered no bounded text frame".into());
         }
@@ -932,6 +972,23 @@ fn create_selftest_directory() -> Result<PathBuf, String> {
 mod tests {
     use super::*;
     use std::os::unix::fs::symlink;
+    use td_ui::chrome::SELECTED_ROW;
+
+    /// A rendered pixel's RGB, the opaque X byte the raster writes masked off.
+    fn pixel_rgb(frame: &[u8], width: usize, x: usize, y: usize) -> u32 {
+        let at = (y * width + x) * BYTES_PER_PIXEL;
+        u32::from_le_bytes(frame[at..at + BYTES_PER_PIXEL].try_into().unwrap()) & 0xff_ffff
+    }
+
+    /// Whether any rendered pixel carries `color`, comparing RGB so the opaque
+    /// alpha the raster writes (and any alpha in a chrome constant) is ignored.
+    fn contains_rgb(frame: &[u8], color: u32) -> bool {
+        frame
+            .as_chunks::<BYTES_PER_PIXEL>()
+            .0
+            .iter()
+            .any(|pixel| u32::from_le_bytes(*pixel) & 0xff_ffff == color & 0xff_ffff)
+    }
 
     struct Temp(PathBuf);
 
@@ -1140,12 +1197,14 @@ mod tests {
         let second = chooser.render().unwrap();
         assert_eq!(first, second);
         assert_eq!(first.len(), WIDTH * HEIGHT * BYTES_PER_PIXEL);
-        let fingerprint = first.iter().fold(0xcbf2_9ce4_8422_2325u64, |hash, byte| {
-            (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
-        });
-        assert_eq!(fingerprint, 0x4ad2_cb6a_c1f4_3eb9);
-        assert!(first.as_chunks::<BYTES_PER_PIXEL>().0.contains(&HIGHLIGHT));
-        assert!(first.as_chunks::<BYTES_PER_PIXEL>().0.contains(&TEXT));
+        // The page renders on the shared light palette: a chrome ground, the
+        // selected row's highlight, ink text and the hairline rule/footer
+        // border. Named colours, not a byte fingerprint, so the oracle says
+        // what changed when the layout does (the td-setup welcome pattern).
+        assert_eq!(pixel_rgb(&first, WIDTH, 0, 0), CHROME);
+        assert!(contains_rgb(&first, SELECTED_ROW));
+        assert!(contains_rgb(&first, INK));
+        assert!(contains_rgb(&first, BORDER));
     }
 
     #[test]
@@ -1170,12 +1229,7 @@ mod tests {
         chooser.apply(Action::Previous).unwrap();
         assert_eq!(chooser.selected, rows.saturating_add(2));
         assert_eq!(chooser.scroll_start, 4);
-        assert!(chooser
-            .render()
-            .unwrap()
-            .as_chunks::<BYTES_PER_PIXEL>()
-            .0
-            .contains(&HIGHLIGHT));
+        assert!(contains_rgb(&chooser.render().unwrap(), SELECTED_ROW));
     }
 
     #[test]
@@ -1297,11 +1351,11 @@ mod tests {
         let left = entry(&long_left);
         let right = entry(&long_right);
         assert_eq!(left.display, right.display);
-        assert_ne!(row_label(1, " ", &left, ""), row_label(2, " ", &right, ""));
+        assert_ne!(item_label(1, &left, ""), item_label(2, &right, ""));
     }
 
     #[test]
-    fn path_result_font_and_completion_bounds_are_live() {
+    fn path_result_and_completion_bounds_are_live() {
         assert!(require_absolute_clean(Path::new("/"), "grant")
             .unwrap_err()
             .contains("not a clean absolute path"));
@@ -1314,11 +1368,6 @@ mod tests {
             accepted_uris(vec!["x".repeat(MAX_PATH_BYTES * 3); MAX_SELECTIONS]),
             Ok(Outcome::Accepted(_))
         ));
-        assert!(std::ptr::eq(
-            chooser_font().unwrap(),
-            chooser_font().unwrap()
-        ));
-
         let deep = Temp::new("depth");
         let mut directory = deep.0.clone();
         for index in 0..MAX_DIRECTORY_DEPTH {

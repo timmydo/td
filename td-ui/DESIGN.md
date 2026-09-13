@@ -56,8 +56,9 @@ surface.
 Newly built: `td-setup`, the second consumer, is a new crate whose
 `welcome` page renders from the toolkit and whose Wayland turn loop
 presents it as a live `App`, proven under the native compositor harness
-(increment 6). Not yet moved: td-portal's file chooser, the third consumer,
-still on its own rasterizer. The increments below schedule the rest.
+(increment 6). Partly moved: td-portal's file chooser, the third consumer,
+now renders from the toolkit's raster and chrome bands (increment 7(c)); its
+transport becomes a live `App` in 7(d). The increments below schedule the rest.
 td-editor's window is the first `App` and td-setup's the second; each owns
 no Wayland objects of its own.
 
@@ -594,6 +595,10 @@ the reader graph, because td-editor's manifest names the crate.
    and its `TD-PORTAL-CHANNEL-READY` marker, boot-evidence service unit and
    boot assertion retired; the private registry it pinned moves to the
    surviving dialog. Landed. (c) The file chooser's render on td-ui's raster
-   and chrome bands,
-   its own rasterizer deleted. (d) Its transport a td-ui `App`, the private
-   dialog client deleted, under the native compositor harness.
+   and chrome bands — a `Composition` with a chrome ground, the title over a
+   hairline rule, the guest path and selection-status lines, the filter as a
+   `TextEntry` and the entries as a `List`, on the shared light palette — its
+   own second rasterizer and font mount deleted and its render oracles regolded
+   from a byte fingerprint to named palette colours. Landed. (d) Its transport
+   a td-ui `App`, the private dialog client deleted, under the native
+   compositor harness.

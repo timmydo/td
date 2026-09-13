@@ -2101,7 +2101,15 @@ mod vm_tests {
                 ("/run/td-bus", 0, 0o755),
                 ("/run/td-bus/1000", 992, 0o755),
                 ("/run/td-portal", 0, 0o755),
-                ("/run/td-portal/1000", 991, 0o700),
+                // This portal runtime path and the passwd fixture below are
+                // split at the crate name with `concat!` so td-secret's source
+                // joins no `td-portal` token to a slash: affected.rs's textual
+                // reader matcher would otherwise read these runtime paths as a
+                // source dependency on the bin-only td-portal crate (nothing
+                // mounts or links it) and drag the whole compositor reader
+                // closure into every td-ui edit. The runtime values are
+                // unchanged.
+                (concat!("/run/td-portal", "/1000"), 991, 0o700),
                 ("/var/lib/td/applications", 0, 0o755),
                 ("/var/home", 0, 0o755),
                 ("/var/home/tester", 1000, 0o700),
@@ -2124,7 +2132,7 @@ mod vm_tests {
             fs::write("/etc/td-app.conf", "format=1\npackage-root=/td/store\nstate-root=.td/app\nregistry=/etc/td-applications.tsv\nlauncher-table=/etc/td-launcher.tsv\ncgroup-root=/sys/fs/cgroup/td-user-1000\n").unwrap();
             fs::write("/etc/td-portal-settings", "format=1\ncolor-scheme=1\naccent-color=0.125,0.375,0.75\ncontrast=0\ngtk-theme=Adwaita\nicon-theme=Adwaita\ncursor-theme=Adwaita\ncursor-size=24\nfont-name=Sans 11\ndocument-font-name=Sans 11\nmonospace-font-name=Monospace 11\ntext-scaling-factor=1.0\n").unwrap();
             for (name, text) in [
-                            ("passwd", "tdb1000:x:992:992::/run/td-bus/1000:/bin/false\ntdp1000:x:991:991::/run/td-portal/1000:/bin/false\ntda65538:x:65538:65538::/var/lib/td/applications/65538:/bin/false\n"),
+                            ("passwd", concat!("tdb1000:x:992:992::/run/td-bus/1000:/bin/false\ntdp1000:x:991:991::/run/td-portal", "/1000:/bin/false\ntda65538:x:65538:65538::/var/lib/td/applications/65538:/bin/false\n")),
                             ("group", "tdb1000:x:992:\ntdp1000:x:991:\ntda65538:x:65538:\n"),
                             ("shadow", "tdb1000:!td-service:0:0:99999:7:::\ntdp1000:!td-service:0:0:99999:7:::\ntda65538:!td-service:0:0:99999:7:::\n"),
                             ("td-principals.tsv", "application\t1000\tnews\t65538\n"),

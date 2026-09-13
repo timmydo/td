@@ -586,18 +586,22 @@ fn map_path(root: &Path, roster: &Result<Vec<GateCrate>, String>, p: &str, sel: 
 
     // Every file under a td-portal seed tree moves the `td-portal-source`
     // digest row. `td-portal` builds from `Recipe::rust` with
-    // `local_source_trees(&["td-secret", "td-busd", "td-compositor", "engine"])`,
-    // each staged WHOLE, so a change anywhere in one of those checkouts —
-    // source, spec, tool, doc, or manifest — re-hashes the seed (re #469). The
-    // digest preflight is cheap (a tree copy and a NAR hash, no ladder), so this
-    // AUGMENTS and does not return: the path still reaches its own crate arm
-    // below for cargo-test/check/recipe-checks. `engine/` keeps its existing
-    // per-arm digest routing (it was already a td-net seed tree); `td-seatd/`,
-    // which shares the compositor's crate arm, is NOT a portal seed tree and is
-    // excluded here. The roster of trees is pinned by the recipes catalog test
+    // `local_source_trees(&["td-secret", "td-busd", "td-compositor", "engine",
+    // "td-ui"])`, each staged WHOLE, so a change anywhere in one of those
+    // checkouts — source, spec, tool, doc, or manifest — re-hashes the seed (re
+    // #469). The digest preflight is cheap (a tree copy and a NAR hash, no
+    // ladder), so this AUGMENTS and does not return: the path still reaches its
+    // own crate arm below for cargo-test/check/recipe-checks. `engine/` and
+    // `td-ui/` keep their existing per-arm routing too (each is also a reader
+    // crate arm); `td-seatd/`, which shares the compositor's crate arm, is NOT
+    // a portal seed tree and is excluded here. The roster of trees is pinned by
+    // the recipes catalog test
     // `local_source_trees_are_staged_by_basename_and_routed_by_the_builder`, so
     // this literal and that one must agree.
-    if pattern_matches("td-portal/*|td-busd/*|td-compositor/*|td-secret/*", p) {
+    if pattern_matches(
+        "td-portal/*|td-busd/*|td-compositor/*|td-secret/*|td-ui/*",
+        p,
+    ) {
         sel.add_preflight("local-source-digests");
     }
 
@@ -2365,18 +2369,26 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     assert_target!("td-portal/Cargo.lock", "check");
     assert_target!("td-portal/Cargo.lock", "recipe-checks");
     // td-portal builds from `local_source_trees(&["td-secret", "td-busd",
-    // "td-compositor", "engine"])`, each staged whole, so a change anywhere in
-    // the portal tree or in a sibling seed tree moves the `td-portal-source`
-    // digest row and must reach the digest preflight — source, manifest, and
-    // documentation alike (engine already carries its own rows above). td-seatd
-    // shares the compositor's crate arm but is NOT a portal seed tree, so its
-    // edits must NOT select the digest preflight.
+    // "td-compositor", "engine", "td-ui"])`, each staged whole, so a change
+    // anywhere in the portal tree or in a sibling seed tree moves the
+    // `td-portal-source` digest row and must reach the digest preflight —
+    // source, manifest, and documentation alike (engine and td-ui already carry
+    // their own reader arms above). td-seatd shares the compositor's crate arm
+    // but is NOT a portal seed tree, so its edits must NOT select the digest
+    // preflight.
     assert_preflight!("td-portal/src/main.rs", "local-source-digests");
     assert_preflight!("td-portal/Cargo.lock", "local-source-digests");
     assert_preflight!("td-busd/src/wire.rs", "local-source-digests");
     assert_preflight!("td-compositor/src/font.rs", "local-source-digests");
     assert_preflight!("td-compositor/DESIGN.md", "local-source-digests");
     assert_preflight!("td-secret/src/sys.rs", "local-source-digests");
+    // td-ui joined the portal seed trees in 7(c): the file chooser depends on
+    // the toolkit by path, so any td-ui/ edit re-hashes the td-portal-source
+    // row and reaches the digest preflight, on top of its own reader arm.
+    assert_preflight!("td-ui/src/raster.rs", "local-source-digests");
+    assert_preflight!("td-ui/src/chrome.rs", "local-source-digests");
+    assert_preflight!("td-ui/Cargo.toml", "local-source-digests");
+    assert_preflight!("td-ui/DESIGN.md", "local-source-digests");
     assert_no_preflight!("td-seatd/src/main.rs", "local-source-digests");
     assert_preflight!("td-audio/src/main.rs", "cargo-test");
     assert_preflight!("td-audio/src/sys.rs", "cargo-test");
@@ -7282,26 +7294,32 @@ mod tests {
         paths.push("builder/src/affected.rs".to_string());
         assert_eq!(cargo_test_cmds(&root, &paths).unwrap(), gate_cmds());
         assert!(compute_selection(&root, &paths).targets.contains(&"check".to_string()));
-        // The toolkit routes like the editor, and a change to it carries the
-        // editor's commands along: td-editor's manifest names td-ui by path,
-        // so the reader graph puts the editor beside the toolkit and the
-        // workspace suite, and nothing else.
+        // The toolkit routes to its consumers and nothing else: td-editor,
+        // td-setup and (as of 7c) td-portal each name td-ui by path, so the
+        // reader graph puts the three consumers beside the toolkit and the
+        // workspace suite. td-portal is a leaf binary nothing reads, so it adds
+        // only itself.
         for path in ["td-ui/src/keyboard.rs", "td-ui/Cargo.toml", "td-ui/tests/xkb.rs"] {
             let toolkit = [path.to_string()];
             assert!(compute_selection(&root, &toolkit).targets.is_empty(), "{path}");
             let commands = cargo_test_cmds(&root, &toolkit).unwrap();
-            // td-editor and td-setup both name td-ui by path, so a change to
-            // the toolkit carries both consumers' commands beside the
-            // workspace suite, each with its own native compositor command.
-            assert_eq!(commands.len(), 10, "{path}: {commands:?}");
+            // td-editor, td-setup and td-portal all name td-ui by path, so a
+            // change to the toolkit carries the three consumers' commands
+            // beside the workspace suite. td-editor and td-setup each add a
+            // native compositor command; td-portal declares no native tests, so
+            // it adds only its test and clippy: 2 workspace + 2 td-ui + 3 + 3 +
+            // 2 = 12.
+            assert_eq!(commands.len(), 12, "{path}: {commands:?}");
             assert!(commands.iter().all(|c| {
                 c.contains("--workspace")
                     || c.contains("--manifest-path td-ui/Cargo.toml")
                     || c.contains("--manifest-path td-editor/Cargo.toml")
                     || c.contains("--manifest-path td-setup/Cargo.toml")
+                    || c.contains("--manifest-path td-portal/Cargo.toml")
             }));
             assert!(commands.iter().any(|c| c.contains("--manifest-path td-editor/Cargo.toml")));
             assert!(commands.iter().any(|c| c.contains("--manifest-path td-setup/Cargo.toml")));
+            assert!(commands.iter().any(|c| c.contains("--manifest-path td-portal/Cargo.toml")));
         }
         for path in [
             "td-editor-extra/src/main.rs",

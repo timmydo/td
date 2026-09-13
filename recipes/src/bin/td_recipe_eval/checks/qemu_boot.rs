@@ -393,9 +393,14 @@ const PORTAL_CLIENT_X: usize = 160;
 const PORTAL_CLIENT_Y: usize = 141;
 const PORTAL_CLIENT_WIDTH: usize = 640;
 const PORTAL_CLIENT_HEIGHT: usize = 432;
-const PORTAL_BACKGROUND_RGB: [u8; 3] = [0x18, 0x20, 0x28];
-const PORTAL_PANEL_RGB: [u8; 3] = [0x28, 0x30, 0x3c];
-const PORTAL_HIGHLIGHT_RGB: [u8; 3] = [0x28, 0x48, 0x78];
+// The file chooser renders on td-ui's light palette (increment 7c): a chrome
+// ground, the filter field on paper, and the selected list row highlighted.
+// These are `td_ui::raster::{CHROME, PAPER}` and `td_ui::chrome::SELECTED_ROW`
+// in the screenshot's RGB order; the source cross-check test pins them to the
+// toolkit constants so a palette change reaches this scanner.
+const PORTAL_GROUND_RGB: [u8; 3] = [0xe1, 0xdb, 0xcf];
+const PORTAL_FIELD_RGB: [u8; 3] = [0xee, 0xe8, 0xdc];
+const PORTAL_SELECTED_RGB: [u8; 3] = [0xc9, 0xc1, 0xb2];
 const MAX_SCREENSHOT_HEADER_BYTES: usize = 4096;
 const MAX_SCREENSHOT_BYTES: usize =
     QMP_OUTPUT_WIDTH as usize * QMP_OUTPUT_HEIGHT as usize * 3 + MAX_SCREENSHOT_HEADER_BYTES;
@@ -7407,36 +7412,50 @@ fn validate_portal_screenshot(path: &Path, presentation: PortalPresentation) -> 
     if presentation.width != PORTAL_CLIENT_WIDTH || presentation.height != PORTAL_CLIENT_HEIGHT {
         return Err("portal presentation dimensions escaped the configured client".to_string());
     }
+    // The chooser fills its window with the chrome ground, floats the filter
+    // field on paper three rows down, and highlights the first list row a row
+    // below that. Sample the client-local origin for the ground, (300, 94) for
+    // the filter field, and (300, 118) for the selected row.
     let corner = ppm_pixel(pixels, width, PORTAL_CLIENT_X, PORTAL_CLIENT_Y)?;
-    let panel = ppm_pixel(pixels, width, 640, 173)?;
-    let highlight = ppm_pixel(pixels, width, 640, 269)?;
-    if corner != PORTAL_BACKGROUND_RGB
-        || panel != PORTAL_PANEL_RGB
-        || highlight != PORTAL_HIGHLIGHT_RGB
+    let field = ppm_pixel(
+        pixels,
+        width,
+        PORTAL_CLIENT_X.saturating_add(300),
+        PORTAL_CLIENT_Y.saturating_add(94),
+    )?;
+    let selected = ppm_pixel(
+        pixels,
+        width,
+        PORTAL_CLIENT_X.saturating_add(300),
+        PORTAL_CLIENT_Y.saturating_add(118),
+    )?;
+    if corner != PORTAL_GROUND_RGB
+        || field != PORTAL_FIELD_RGB
+        || selected != PORTAL_SELECTED_RGB
     {
         return Err(format!(
-            "QMP portal screenshot missed its centred palette: corner={corner:02x?} panel={panel:02x?} highlight={highlight:02x?}"
+            "QMP portal screenshot missed its centred palette: corner={corner:02x?} field={field:02x?} selected={selected:02x?}"
         ));
     }
-    let mut background = 0usize;
-    let mut panels = 0usize;
-    let mut highlights = 0usize;
+    let mut ground = 0usize;
+    let mut fields = 0usize;
+    let mut selections = 0usize;
     let (pixel_rows, remainder) = pixels.as_chunks::<3>();
     if !remainder.is_empty() {
         return Err("QMP portal screenshot has a partial pixel".to_string());
     }
     for pixel in pixel_rows {
-        if *pixel == PORTAL_BACKGROUND_RGB {
-            background = background.saturating_add(1);
-        } else if *pixel == PORTAL_PANEL_RGB {
-            panels = panels.saturating_add(1);
-        } else if *pixel == PORTAL_HIGHLIGHT_RGB {
-            highlights = highlights.saturating_add(1);
+        if *pixel == PORTAL_GROUND_RGB {
+            ground = ground.saturating_add(1);
+        } else if *pixel == PORTAL_FIELD_RGB {
+            fields = fields.saturating_add(1);
+        } else if *pixel == PORTAL_SELECTED_RGB {
+            selections = selections.saturating_add(1);
         }
     }
-    if background < 20_000 || panels < 180_000 || highlights < 5_000 {
+    if ground < 150_000 || fields < 10_000 || selections < 5_000 {
         return Err(format!(
-            "QMP portal screenshot has too few chooser pixels: background={background} panel={panels} highlight={highlights}"
+            "QMP portal screenshot has too few chooser pixels: ground={ground} field={fields} selected={selections}"
         ));
     }
     let checksum = portal_client_checksum(pixels, width)?;
@@ -7454,7 +7473,10 @@ fn portal_client_checksum(pixels: &[u8], stride: usize) -> Result<u64, String> {
     for y in PORTAL_CLIENT_Y..PORTAL_CLIENT_Y.saturating_add(PORTAL_CLIENT_HEIGHT) {
         for x in PORTAL_CLIENT_X..PORTAL_CLIENT_X.saturating_add(PORTAL_CLIENT_WIDTH) {
             let [red, green, blue] = ppm_pixel(pixels, stride, x, y)?;
-            for byte in [blue, green, red, 0] {
+            // td-ui's raster writes each pixel opaque as [B, G, R, 0xff]; the
+            // dialog's self-reported checksum folds every buffer byte, so the
+            // alpha lane the PPM drops back is 0xff, not zero.
+            for byte in [blue, green, red, 0xff] {
                 checksum = (checksum ^ u64::from(byte)).wrapping_mul(0x100_0000_01b3);
             }
         }
@@ -8256,26 +8278,29 @@ mod tests {
                     }
                 }
             };
+        // Ground fills the whole client; the filter field floats on paper over
+        // the third row and the selected list row is highlighted a row below,
+        // matching the client-local sample points the validator reads.
         fill(
             PORTAL_CLIENT_X,
             PORTAL_CLIENT_Y,
             PORTAL_CLIENT_WIDTH,
             PORTAL_CLIENT_HEIGHT,
-            PORTAL_BACKGROUND_RGB,
+            PORTAL_GROUND_RGB,
         );
         fill(
             PORTAL_CLIENT_X.saturating_add(8),
-            PORTAL_CLIENT_Y.saturating_add(16),
-            PORTAL_CLIENT_WIDTH.saturating_sub(16),
-            PORTAL_CLIENT_HEIGHT.saturating_sub(32),
-            PORTAL_PANEL_RGB,
+            PORTAL_CLIENT_Y.saturating_add(80),
+            PORTAL_CLIENT_WIDTH.saturating_sub(32),
+            24,
+            PORTAL_FIELD_RGB,
         );
         fill(
-            PORTAL_CLIENT_X.saturating_add(16),
-            PORTAL_CLIENT_Y.saturating_add(120),
+            PORTAL_CLIENT_X.saturating_add(8),
+            PORTAL_CLIENT_Y.saturating_add(108),
             PORTAL_CLIENT_WIDTH.saturating_sub(32),
-            16,
-            PORTAL_HIGHLIGHT_RGB,
+            24,
+            PORTAL_SELECTED_RGB,
         );
         let mut ppm = format!("P6\n# qmp fixture\n{width} {height}\n255\n").into_bytes();
         ppm.extend_from_slice(&pixels);
@@ -8833,9 +8858,26 @@ mod tests {
         assert!(chooser.contains(&format!(
             "pub const HEIGHT: usize = {PORTAL_CLIENT_HEIGHT};"
         )));
-        assert!(chooser.contains("const BACKGROUND: [u8; 4] = [0x28, 0x20, 0x18, 0];"));
-        assert!(chooser.contains("const PANEL: [u8; 4] = [0x3c, 0x30, 0x28, 0];"));
-        assert!(chooser.contains("const HIGHLIGHT: [u8; 4] = [0x78, 0x48, 0x28, 0];"));
+        // The chooser no longer owns a palette; it renders on td-ui's shared
+        // constants. Pin those source-of-truth values and prove the scanner's
+        // sample colours are their exact RGB, so a palette change in td-ui
+        // fails this boot check until the scanner is retuned to match.
+        const CHROME_ARGB: u32 = 0xe1_dbcf;
+        const PAPER_ARGB: u32 = 0xee_e8dc;
+        const SELECTED_ARGB: u32 = 0xffc9_c1b2;
+        let raster = include_str!("../../../../../td-ui/src/raster.rs");
+        assert!(raster.contains(&format!("pub const CHROME: u32 = {CHROME_ARGB:#08x};")));
+        assert!(raster.contains(&format!("pub const PAPER: u32 = {PAPER_ARGB:#08x};")));
+        let chrome = include_str!("../../../../../td-ui/src/chrome.rs");
+        assert!(chrome.contains(&format!(
+            "pub const SELECTED_ROW: u32 = {SELECTED_ARGB:#010x};"
+        )));
+        let [_, gr, gg, gb] = CHROME_ARGB.to_be_bytes();
+        assert_eq!(PORTAL_GROUND_RGB, [gr, gg, gb]);
+        let [_, fr, fg, fb] = PAPER_ARGB.to_be_bytes();
+        assert_eq!(PORTAL_FIELD_RGB, [fr, fg, fb]);
+        let [_, sr, sg, sb] = SELECTED_ARGB.to_be_bytes();
+        assert_eq!(PORTAL_SELECTED_RGB, [sr, sg, sb]);
         let firefox = include_str!("../../../../../td-jail/src/firefox.rs");
         assert!(firefox.contains("Focus Firefox for its native Open File command"));
         assert!(firefox.contains("focus.style.width = \"100%\";"));

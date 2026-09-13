@@ -5,6 +5,12 @@ edition = "2021"
 description = "td's desktop portal service"
 license = "GPL-3.0-or-later"
 
+# The shared UI toolkit, by the one sibling-dependency spelling the lock guard
+# admits (AGENTS.md 'Rust code'): the file chooser's raster and chrome bands
+# reach this crate only through `td_ui::`.
+[dependencies]
+td-ui = { path = "../td-ui" }
+
 # How builder/src/affected.rs gates this crate; absent keys take the defaults.
 [package.metadata.td-gate]
 clippy-all-targets = true
