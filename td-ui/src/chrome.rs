@@ -1,13 +1,14 @@
 //! The chrome bands td-owned windows share, over `raster`: the menu bar
-//! with its panel, a wrapped text block, a tab strip, a status row and a
-//! scrolling list. Each is a geometry over a `Surface` in the reference
-//! renderer's units (24-pixel rows of 8x16 cells, scaled by the surface)
-//! and a painter that streams the complete band inside a damage
-//! rectangle. Nothing here reads a clock, a file or the environment.
+//! with its panel, a wrapped text block, a tab strip, a status row, a
+//! scrolling list and a single-line text entry. Each is a geometry over a
+//! `Surface` in the reference renderer's units (24-pixel rows of 8x16
+//! cells, scaled by the surface) and a painter that streams the complete
+//! band inside a damage rectangle. Nothing here reads a clock, a file or
+//! the environment.
 
 use crate::raster::{
-    text_run, Draw, GlyphStyle, Primitive, Rect, Scale, Scrollbar, Surface, BORDER, CHROME, INK,
-    LINE_NUMBER, PAPER,
+    text_run, Draw, GlyphStyle, Primitive, Rect, Scale, Scrollbar, Surface, BORDER, CHROME,
+    INACTIVE_SELECTION, INK, LINE_NUMBER, PAPER, SELECTED,
 };
 use crate::{CELL_HEIGHT, CELL_WIDTH};
 
@@ -430,6 +431,254 @@ impl List {
         fill(
             bar.thumb,
             if bar.enabled() { LINE_NUMBER } else { BORDER },
+            damage,
+            sink,
+        );
+    }
+}
+
+/// The glyph a masked field shows in place of each of its characters.
+const MASK: char = '\u{2022}';
+
+/// What a `TextEntry` paints: the plaintext, the caret and an optional
+/// selection anchor in character columns, the first shown column, and the
+/// display options. Masking is a display choice the caller makes; the
+/// widget draws `MASK` for each character and asserts nothing about the
+/// field's trust, which is the consumer's to establish (see DESIGN.md).
+#[derive(Clone, Copy, Debug)]
+pub struct Field<'a> {
+    /// The field's whole value; the caller owns and clamps it.
+    pub text: &'a str,
+    /// Shown dim when `text` is empty; `""` for none. Never masked.
+    pub placeholder: &'a str,
+    /// The caret's character column, `0..=text.chars().count()`.
+    pub caret: usize,
+    /// The selection's other end; the range is `anchor..caret`. `None`, or
+    /// equal to `caret`, is no selection.
+    pub anchor: Option<usize>,
+    /// The first shown character column; `reveal` keeps the caret in view.
+    pub first: usize,
+    /// Draw `MASK` for each character instead of the character itself.
+    pub masked: bool,
+    /// The active-window selection colour and caret; the caller's focus.
+    pub focused: bool,
+    /// Whether the caret shows; the caller owns the blink and hides it
+    /// when unfocused.
+    pub caret_visible: bool,
+}
+
+/// A single-line text field over one chrome row: a paper ground, the text
+/// from the first shown column, an optional selection and a one-pixel
+/// caret. The caller owns the text, the caret, the selection and the first
+/// shown column; the field holds no state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TextEntry {
+    rect: Rect,
+    scale: Scale,
+}
+
+impl TextEntry {
+    /// The field filling `rect`; `None` when `rect` lies outside the
+    /// surface or cannot hold a text cell between the insets on one `ROW`.
+    pub fn new(surface: Surface, rect: Rect) -> Option<Self> {
+        let s = surface.scale.value();
+        if rect.intersection(surface.bounds()) != Some(rect) {
+            return None;
+        }
+        if (rect.width as usize) < (2 * INSET.0 as usize + CELL_WIDTH) * s
+            || (rect.height as usize) < ROW * s
+        {
+            return None;
+        }
+        Some(Self {
+            rect,
+            scale: surface.scale,
+        })
+    }
+
+    pub fn rect(self) -> Rect {
+        self.rect
+    }
+
+    /// The text cells the field shows at once, the width less a cell inset
+    /// each side.
+    pub fn columns(self) -> usize {
+        let s = self.scale.value();
+        (self.rect.width as usize).saturating_sub(2 * INSET.0 as usize * s) / (CELL_WIDTH * s)
+    }
+
+    fn cell(self) -> i64 {
+        (CELL_WIDTH * self.scale.value()) as i64
+    }
+
+    fn text_x(self) -> i64 {
+        self.rect.x + INSET.0 * self.scale.value() as i64
+    }
+
+    fn text_y(self) -> i64 {
+        self.rect.y + INSET.1 * self.scale.value() as i64
+    }
+
+    fn glyph_h(self) -> u32 {
+        (CELL_HEIGHT * self.scale.value()) as u32
+    }
+
+    /// `first` moved as little as possible so column `caret` shows, given
+    /// the text length.
+    pub fn reveal(self, len: usize, caret: usize, first: usize) -> usize {
+        let cols = self.columns();
+        if cols == 0 {
+            return 0;
+        }
+        let caret = caret.min(len);
+        // The caret is a boundary between cells with `cols + 1` shown
+        // positions, `first..=first + cols`; the last sits in the right
+        // inset, so `caret == first + cols` is shown and does not scroll.
+        let first = first.min(len.saturating_sub(cols));
+        if caret < first {
+            caret
+        } else if caret > first + cols {
+            caret - cols
+        } else {
+            first
+        }
+    }
+
+    /// The caret column a point falls on, clamped to the text, given the
+    /// first shown column and the text length; `None` outside the field.
+    pub fn hit(self, x: i64, y: i64, first: usize, len: usize) -> Option<usize> {
+        if !self.rect.contains(x, y) {
+            return None;
+        }
+        // Clamp to the last shown column so the right inset maps to the
+        // rightmost visible caret, not an off-window one, then to the text.
+        let column = ((x - self.text_x()).max(0) / self.cell()) as usize;
+        Some(first.saturating_add(column.min(self.columns())).min(len))
+    }
+
+    /// Paints the field: the paper ground, the selection, the visible text
+    /// or the placeholder, and the caret.
+    pub fn emit(&self, field: Field, damage: Rect, sink: &mut dyn FnMut(Draw)) {
+        fill(self.rect, PAPER, damage, sink);
+        let len = field.text.chars().count();
+        // A stale caret, anchor or first is clamped to the text so the
+        // field renders and cannot overflow; the caller drives `first`
+        // with `reveal`.
+        let field = Field {
+            caret: field.caret.min(len),
+            anchor: field.anchor.map(|a| a.min(len)),
+            first: field.first.min(len),
+            ..field
+        };
+        if len == 0 {
+            if !field.placeholder.is_empty() {
+                text_run(
+                    self.scale,
+                    field.placeholder.chars().take(self.columns()),
+                    (self.text_x(), self.text_y()),
+                    self.rect,
+                    GlyphStyle::medium(LINE_NUMBER, PAPER),
+                    damage,
+                    sink,
+                );
+            }
+            self.caret(field, damage, sink);
+            return;
+        }
+        let cols = self.columns();
+        let end = field.first.saturating_add(cols).min(len);
+        let start = field.first.min(end);
+        // The selection's visible columns; no selection is no split.
+        let (lo, hi) = match field.anchor {
+            Some(anchor) if anchor != field.caret => (
+                anchor.min(field.caret).clamp(start, end),
+                anchor.max(field.caret).clamp(start, end),
+            ),
+            _ => (start, start),
+        };
+        if hi > lo {
+            fill(
+                Rect {
+                    x: self.text_x() + (lo - field.first) as i64 * self.cell(),
+                    y: self.text_y(),
+                    width: ((hi - lo) as i64 * self.cell()) as u32,
+                    height: self.glyph_h(),
+                },
+                self.selection(field.focused).0,
+                damage,
+                sink,
+            );
+        }
+        self.run(field, start, lo, false, damage, sink);
+        self.run(field, lo, hi, true, damage, sink);
+        self.run(field, hi, end, false, damage, sink);
+        self.caret(field, damage, sink);
+    }
+
+    /// A selection's background and its ink, by focus.
+    fn selection(self, focused: bool) -> (u32, u32) {
+        if focused {
+            (SELECTED, PAPER)
+        } else {
+            (INACTIVE_SELECTION, INK)
+        }
+    }
+
+    /// One glyph run of columns `from..to`, selected or not.
+    fn run(
+        self,
+        field: Field,
+        from: usize,
+        to: usize,
+        selected: bool,
+        damage: Rect,
+        sink: &mut dyn FnMut(Draw),
+    ) {
+        if to <= from {
+            return;
+        }
+        let (background, ink) = if selected {
+            self.selection(field.focused)
+        } else {
+            (PAPER, INK)
+        };
+        let style = GlyphStyle::medium(ink, background);
+        let at = (
+            self.text_x() + (from - field.first) as i64 * self.cell(),
+            self.text_y(),
+        );
+        let chars = field.text.chars().skip(from).take(to - from);
+        if field.masked {
+            text_run(
+                self.scale,
+                chars.map(|_| MASK),
+                at,
+                self.rect,
+                style,
+                damage,
+                sink,
+            );
+        } else {
+            text_run(self.scale, chars, at, self.rect, style, damage, sink);
+        }
+    }
+
+    /// The one-pixel caret, when shown and inside the window.
+    fn caret(self, field: Field, damage: Rect, sink: &mut dyn FnMut(Draw)) {
+        if !field.caret_visible
+            || field.caret < field.first
+            || field.caret > field.first + self.columns()
+        {
+            return;
+        }
+        fill(
+            Rect {
+                x: self.text_x() + (field.caret - field.first) as i64 * self.cell(),
+                y: self.text_y(),
+                width: self.scale.value() as u32,
+                height: self.glyph_h(),
+            },
+            INK,
             damage,
             sink,
         );

@@ -13,11 +13,13 @@
 //! and paint one band whole to a buffer to confirm the pixels.
 
 use td_ui::chrome::{
-    step, Bar, Block, Item, List, Panel, Row, Status, Strip, DISABLED, SELECTED_ROW, STATUS_COLUMNS,
+    step, Bar, Block, Field, Item, List, Panel, Row, Status, Strip, TextEntry, DISABLED,
+    SELECTED_ROW, STATUS_COLUMNS,
 };
 use td_ui::font;
 use td_ui::raster::{
-    Draw, Primitive, Raster, Rect, Scale, Surface, Weight, BORDER, CHROME, INK, LINE_NUMBER, PAPER,
+    Draw, Primitive, Raster, Rect, Scale, Surface, Weight, BORDER, CHROME, INACTIVE_SELECTION, INK,
+    LINE_NUMBER, PAPER, SELECTED,
 };
 
 const LABELS: [&str; 5] = ["File", "Edit", "Format", "Help", "Directory"];
@@ -825,4 +827,713 @@ fn the_scrollbar_disables_when_nothing_scrolls() {
     assert!(!list.scrollbar(0, 0).enabled());
     // More items than rows enables it.
     assert!(list.scrollbar(6, 0).enabled());
+}
+
+/// A focused field at its default: caret at the end, no selection, shown.
+fn field(text: &str) -> Field<'_> {
+    Field {
+        text,
+        placeholder: "",
+        caret: text.chars().count(),
+        anchor: None,
+        first: 0,
+        masked: false,
+        focused: true,
+        caret_visible: true,
+    }
+}
+
+#[test]
+fn a_text_entry_paints_paper_the_text_and_a_one_pixel_caret() {
+    let surface = surface(320, 200, 1);
+    let entry = TextEntry::new(
+        surface,
+        Rect {
+            x: 0,
+            y: 0,
+            width: 320,
+            height: 24,
+        },
+    )
+    .unwrap();
+    assert_eq!(entry.columns(), 38); // (320 - 16) / 8
+    let draws = run(surface, |damage, sink| {
+        entry.emit(field("hello"), damage, sink)
+    });
+    let filled = fills(&draws);
+    let painted = glyphs(&draws);
+    // The paper ground fills the whole field.
+    assert!(filled.contains(&(entry.rect(), PAPER)));
+    // The caret is a one-pixel ink column after the last character.
+    assert!(filled.contains(&(
+        Rect {
+            x: 48,
+            y: 4,
+            width: 1,
+            height: 16
+        },
+        INK
+    )));
+    // The characters sit one cell in, medium ink.
+    assert!(painted
+        .iter()
+        .any(|&(x, y, ch, ink, _)| x == 8 && y == 4 && ch == 'h' && ink == INK));
+    assert!(painted.iter().any(|&(x, _, ch, _, _)| x == 40 && ch == 'o'));
+}
+
+#[test]
+fn a_masked_field_shows_the_mask_not_the_characters() {
+    let surface = surface(320, 200, 1);
+    let entry = TextEntry::new(
+        surface,
+        Rect {
+            x: 0,
+            y: 0,
+            width: 320,
+            height: 24,
+        },
+    )
+    .unwrap();
+    let draws = run(surface, |damage, sink| {
+        entry.emit(
+            Field {
+                masked: true,
+                ..field("secret")
+            },
+            damage,
+            sink,
+        )
+    });
+    let painted = glyphs(&draws);
+    // Every glyph is the mask, and none is a character of "secret".
+    assert_eq!(painted.len(), 6);
+    assert!(painted.iter().all(|&(_, _, ch, _, _)| ch == '\u{2022}'));
+    assert!(!painted
+        .iter()
+        .any(|&(_, _, ch, _, _)| "secret".contains(ch)));
+    // The masks advance one cell each from the first.
+    assert!(painted.iter().any(|&(x, _, _, _, _)| x == 8));
+    assert!(painted.iter().any(|&(x, _, _, _, _)| x == 8 + 5 * 8));
+}
+
+#[test]
+fn a_selection_fills_its_cells_and_flips_the_ink() {
+    let surface = surface(320, 200, 1);
+    let entry = TextEntry::new(
+        surface,
+        Rect {
+            x: 0,
+            y: 0,
+            width: 320,
+            height: 24,
+        },
+    )
+    .unwrap();
+    for (focused, bg, sel_ink) in [(true, SELECTED, PAPER), (false, INACTIVE_SELECTION, INK)] {
+        let draws = run(surface, |damage, sink| {
+            entry.emit(
+                Field {
+                    anchor: Some(1),
+                    caret: 4,
+                    focused,
+                    ..field("abcdef")
+                },
+                damage,
+                sink,
+            )
+        });
+        let filled = fills(&draws);
+        let painted = glyphs(&draws);
+        // Columns 1..4 (b, c, d) are one selection fill.
+        assert!(filled.contains(&(
+            Rect {
+                x: 16,
+                y: 4,
+                width: 24,
+                height: 16
+            },
+            bg
+        )));
+        // The selected glyphs take the selection ink; the rest ordinary ink.
+        assert!(painted
+            .iter()
+            .any(|&(x, _, ch, ink, _)| x == 16 && ch == 'b' && ink == sel_ink));
+        assert!(painted
+            .iter()
+            .any(|&(x, _, ch, ink, _)| x == 8 && ch == 'a' && ink == INK));
+        assert!(painted
+            .iter()
+            .any(|&(x, _, ch, ink, _)| x == 40 && ch == 'e' && ink == INK));
+    }
+}
+
+#[test]
+fn reveal_scrolls_the_least_to_show_the_caret() {
+    let surface = surface(320, 200, 1);
+    // A five-column field: width = two insets plus five cells.
+    let entry = TextEntry::new(
+        surface,
+        Rect {
+            x: 0,
+            y: 0,
+            width: 56,
+            height: 24,
+        },
+    )
+    .unwrap();
+    assert_eq!(entry.columns(), 5);
+    assert_eq!(entry.reveal(20, 0, 10), 0); // caret left of the window
+    assert_eq!(entry.reveal(20, 19, 0), 14); // caret past the right: least move
+    assert_eq!(entry.reveal(20, 3, 0), 0); // already shown: unchanged
+    assert_eq!(entry.reveal(5, 5, 0), 0); // caret at the end of an exactly-filling value: no scroll
+    assert_eq!(entry.reveal(6, 6, 0), 1); // one longer: scroll by one, caret in the inset
+    assert_eq!(entry.reveal(20, 20, 99), 15); // caret at the end, stale first clamped to the tail
+    assert_eq!(entry.reveal(3, 3, 0), 0); // a short value at its end
+    assert_eq!(
+        entry.reveal(usize::MAX, usize::MAX, usize::MAX),
+        usize::MAX - 5
+    ); // no overflow
+    assert_eq!(entry.reveal(0, 0, 0), 0); // an empty value
+}
+
+#[test]
+fn the_field_maps_a_point_to_a_caret_column() {
+    let surface = surface(320, 200, 1);
+    let entry = TextEntry::new(
+        surface,
+        Rect {
+            x: 0,
+            y: 0,
+            width: 320,
+            height: 24,
+        },
+    )
+    .unwrap();
+    assert_eq!(entry.columns(), 38);
+    assert_eq!(entry.hit(8, 4, 0, 10), Some(0)); // the first cell
+    assert_eq!(entry.hit(20, 4, 0, 10), Some(1)); // (20 - 8) / 8
+    assert_eq!(entry.hit(4, 4, 0, 10), Some(0)); // the left inset clamps to 0
+    assert_eq!(entry.hit(300, 4, 0, 10), Some(10)); // inside but past the text clamps to len
+    assert_eq!(entry.hit(20, 4, 3, 10), Some(4)); // first shifts the column
+    assert_eq!(entry.hit(315, 4, 0, 99), Some(38)); // right inset: last shown column
+    assert_eq!(entry.hit(20, 4, usize::MAX, 10), Some(10)); // a hostile first is safe
+    assert_eq!(entry.hit(1000, 4, 0, 10), None); // right of the field
+    assert_eq!(entry.hit(10, 30, 0, 10), None); // below the field
+
+    // At scale 2 and an offset the mapping scales.
+    let s2 = Surface::new(400, 200, Scale::new(2).unwrap()).unwrap();
+    let big = TextEntry::new(
+        s2,
+        Rect {
+            x: 16,
+            y: 16,
+            width: 240,
+            height: 48,
+        },
+    )
+    .unwrap();
+    assert_eq!(big.columns(), 13);
+    assert_eq!(big.hit(16 + 16, 24, 0, 20), Some(0)); // one scaled cell in
+    assert_eq!(big.hit(16 + 16 + 32, 24, 0, 20), Some(2)); // two scaled cells over
+    assert_eq!(big.hit(16, 16, 0, 20), Some(0)); // the left inset
+    assert_eq!(big.hit(10, 24, 0, 20), None); // left of the field
+}
+
+#[test]
+fn a_placeholder_shows_dim_only_when_empty() {
+    let surface = surface(320, 200, 1);
+    let entry = TextEntry::new(
+        surface,
+        Rect {
+            x: 0,
+            y: 0,
+            width: 320,
+            height: 24,
+        },
+    )
+    .unwrap();
+    // Empty: the placeholder shows in the dim line-number ink.
+    let empty = run(surface, |damage, sink| {
+        entry.emit(
+            Field {
+                placeholder: "name",
+                ..field("")
+            },
+            damage,
+            sink,
+        )
+    });
+    let hint = glyphs(&empty);
+    assert!(hint
+        .iter()
+        .any(|&(x, y, ch, ink, _)| x == 8 && y == 4 && ch == 'n' && ink == LINE_NUMBER));
+    assert_eq!(hint.len(), 4);
+    // The caret still shows at the start.
+    assert!(fills(&empty).contains(&(
+        Rect {
+            x: 8,
+            y: 4,
+            width: 1,
+            height: 16
+        },
+        INK
+    )));
+    // Non-empty: the placeholder is not drawn; the text is, in ordinary ink.
+    let typed = run(surface, |damage, sink| {
+        entry.emit(
+            Field {
+                placeholder: "name",
+                ..field("bob")
+            },
+            damage,
+            sink,
+        )
+    });
+    let shown = glyphs(&typed);
+    assert!(shown.iter().all(|&(_, _, _, ink, _)| ink == INK));
+    assert!(shown.iter().any(|&(_, _, ch, _, _)| ch == 'b'));
+}
+
+#[test]
+fn text_entry_new_refuses_a_rect_the_surface_or_the_insets_cannot_hold() {
+    let surface = surface(320, 200, 1);
+    assert!(TextEntry::new(
+        surface,
+        Rect {
+            x: 0,
+            y: 0,
+            width: 321,
+            height: 24
+        }
+    )
+    .is_none());
+    assert!(TextEntry::new(
+        surface,
+        Rect {
+            x: 0,
+            y: 190,
+            width: 320,
+            height: 24
+        }
+    )
+    .is_none());
+    // Narrower than two insets plus one text cell (24px), or shorter than a row.
+    assert!(TextEntry::new(
+        surface,
+        Rect {
+            x: 0,
+            y: 0,
+            width: 23,
+            height: 24
+        }
+    )
+    .is_none());
+    assert!(TextEntry::new(
+        surface,
+        Rect {
+            x: 0,
+            y: 0,
+            width: 320,
+            height: 23
+        }
+    )
+    .is_none());
+    // The minimum that holds: one text cell between the insets on one row.
+    let min = TextEntry::new(
+        surface,
+        Rect {
+            x: 0,
+            y: 0,
+            width: 24,
+            height: 24,
+        },
+    )
+    .unwrap();
+    assert_eq!(min.columns(), 1);
+    // The guard scales: at scale 2 the minimum width is 48 and a row is 48.
+    let s2 = Surface::new(320, 200, Scale::new(2).unwrap()).unwrap();
+    assert!(TextEntry::new(
+        s2,
+        Rect {
+            x: 0,
+            y: 0,
+            width: 47,
+            height: 48
+        }
+    )
+    .is_none());
+    assert!(TextEntry::new(
+        s2,
+        Rect {
+            x: 0,
+            y: 0,
+            width: 48,
+            height: 47
+        }
+    )
+    .is_none());
+    assert_eq!(
+        TextEntry::new(
+            s2,
+            Rect {
+                x: 0,
+                y: 0,
+                width: 48,
+                height: 48
+            }
+        )
+        .unwrap()
+        .columns(),
+        1
+    );
+}
+
+#[test]
+fn a_text_entry_at_scale_two_and_an_offset_places_its_text_and_caret() {
+    let surface = surface(400, 200, 2);
+    let rect = Rect {
+        x: 16,
+        y: 16,
+        width: 240,
+        height: 48,
+    };
+    let entry = TextEntry::new(surface, rect).unwrap();
+    assert_eq!(entry.columns(), 13); // (240 - 2*16) / 16
+    let draws = run(surface, |damage, sink| {
+        entry.emit(
+            Field {
+                caret: 2,
+                ..field("hi")
+            },
+            damage,
+            sink,
+        )
+    });
+    let filled = fills(&draws);
+    let painted = glyphs(&draws);
+    assert!(filled.contains(&(rect, PAPER)));
+    // Text one scaled cell in (x=32), one scaled inset down (y=24).
+    assert!(painted
+        .iter()
+        .any(|&(x, y, ch, _, _)| x == 32 && y == 24 && ch == 'h'));
+    assert!(painted.iter().any(|&(x, _, ch, _, _)| x == 48 && ch == 'i'));
+    // The caret after "hi" is two scaled pixels wide.
+    assert!(filled.contains(&(
+        Rect {
+            x: 64,
+            y: 24,
+            width: 2,
+            height: 32
+        },
+        INK
+    )));
+}
+
+#[test]
+fn a_field_paints_its_selection_caret_and_text_to_pixels() {
+    let font = font::pinned().unwrap();
+    let (width, height) = (360usize, 48usize);
+    let surface = surface(width, height, 1);
+    let entry = TextEntry::new(
+        surface,
+        Rect {
+            x: 0,
+            y: 0,
+            width: 320,
+            height: 24,
+        },
+    )
+    .unwrap();
+    let mut pixels = vec![0u8; width * height * 4];
+    let mut raster = Raster::new(&mut pixels, &font, surface, width * 4).unwrap();
+    entry.emit(
+        Field {
+            anchor: Some(0),
+            caret: 3,
+            ..field("abc")
+        },
+        surface.bounds(),
+        &mut |draw| raster.draw(draw),
+    );
+    let pixel = |x: usize, y: usize| -> u32 {
+        let base = (y * width + x) * 4;
+        u32::from_le_bytes([
+            pixels[base],
+            pixels[base + 1],
+            pixels[base + 2],
+            pixels[base + 3],
+        ])
+    };
+    // The selection over "abc" shows the selection ground with paper ink.
+    let has = |c: u32| (4..20).any(|y| (8..32).any(|x| pixel(x, y) & 0xff_ffff == c));
+    assert!(has(SELECTED), "the selection ground");
+    assert!(has(PAPER), "the selected glyph ink");
+    // The caret after "abc" is a clean ink column with no glyph under it.
+    assert_eq!(pixel(32, 12) & 0xff_ffff, INK);
+    // The field ground past the text is paper.
+    assert_eq!(pixel(300, 12) & 0xff_ffff, PAPER);
+    // The field leaves the rest of the surface untouched.
+    assert_eq!(pixel(340, 12), 0, "right of the field stays untouched");
+    assert_eq!(pixel(8, 30), 0, "below the field stays untouched");
+}
+
+#[test]
+fn a_masked_field_renders_the_mask_glyph_to_pixels() {
+    let font = font::pinned().unwrap();
+    let (width, height) = (320usize, 24usize);
+    let surface = surface(width, height, 1);
+    let entry = TextEntry::new(
+        surface,
+        Rect {
+            x: 0,
+            y: 0,
+            width: 320,
+            height: 24,
+        },
+    )
+    .unwrap();
+    // Render one field's value to a buffer.
+    let paint = |text: &str, masked: bool| -> Vec<u8> {
+        let mut pixels = vec![0u8; width * height * 4];
+        let mut raster = Raster::new(&mut pixels, &font, surface, width * 4).unwrap();
+        entry.emit(
+            Field {
+                masked,
+                caret_visible: false,
+                ..field(text)
+            },
+            surface.bounds(),
+            &mut |draw| raster.draw(draw),
+        );
+        pixels
+    };
+    let masked_x = paint("x", true);
+    // Masking "x" paints exactly the bullet, not the letter.
+    assert_eq!(
+        masked_x,
+        paint("\u{2022}", false),
+        "masked 'x' renders the bullet"
+    );
+    assert_ne!(masked_x, paint("x", false), "the bullet differs from 'x'");
+    // And the bullet is a real glyph, not blank.
+    let ink = (4..20).any(|y| {
+        (8..16).any(|x| {
+            let base = (y * width + x) * 4;
+            u32::from_le_bytes([
+                masked_x[base],
+                masked_x[base + 1],
+                masked_x[base + 2],
+                masked_x[base + 3],
+            ]) & 0xff_ffff
+                == INK
+        })
+    });
+    assert!(ink, "the mask glyph renders ink");
+}
+
+#[test]
+fn a_scrolled_field_shows_its_window_and_places_the_caret_and_selection() {
+    let surface = surface(320, 200, 1);
+    // A five-column field scrolled to first = 3 over a ten-character value.
+    let entry = TextEntry::new(
+        surface,
+        Rect {
+            x: 0,
+            y: 0,
+            width: 56,
+            height: 24,
+        },
+    )
+    .unwrap();
+    assert_eq!(entry.columns(), 5);
+    let draws = run(surface, |damage, sink| {
+        entry.emit(
+            Field {
+                first: 3,
+                anchor: Some(4),
+                caret: 6,
+                ..field("abcdefghij")
+            },
+            damage,
+            sink,
+        )
+    });
+    let filled = fills(&draws);
+    let painted = glyphs(&draws);
+    // The window shows exactly the five characters from column three.
+    assert_eq!(painted.len(), 5);
+    assert!(painted
+        .iter()
+        .all(|&(_, _, ch, _, _)| ch != 'a' && ch != 'c'));
+    assert!(painted
+        .iter()
+        .any(|&(x, _, ch, ink, _)| x == 8 && ch == 'd' && ink == INK));
+    assert!(painted
+        .iter()
+        .any(|&(x, _, ch, ink, _)| x == 16 && ch == 'e' && ink == PAPER));
+    assert!(painted
+        .iter()
+        .any(|&(x, _, ch, ink, _)| x == 40 && ch == 'h' && ink == INK));
+    // The selection over columns 4..6 sits shifted by first.
+    assert!(filled.contains(&(
+        Rect {
+            x: 16,
+            y: 4,
+            width: 16,
+            height: 16
+        },
+        SELECTED
+    )));
+    // The caret at column 6 is three cells into the window.
+    assert!(filled.contains(&(
+        Rect {
+            x: 32,
+            y: 4,
+            width: 1,
+            height: 16
+        },
+        INK
+    )));
+}
+
+#[test]
+fn an_unfocused_selection_paints_its_inactive_ground_to_pixels() {
+    let font = font::pinned().unwrap();
+    let (width, height) = (320usize, 24usize);
+    let surface = surface(width, height, 1);
+    let entry = TextEntry::new(
+        surface,
+        Rect {
+            x: 0,
+            y: 0,
+            width: 320,
+            height: 24,
+        },
+    )
+    .unwrap();
+    let mut pixels = vec![0u8; width * height * 4];
+    let mut raster = Raster::new(&mut pixels, &font, surface, width * 4).unwrap();
+    entry.emit(
+        Field {
+            anchor: Some(0),
+            caret: 3,
+            focused: false,
+            caret_visible: false,
+            ..field("abc")
+        },
+        surface.bounds(),
+        &mut |draw| raster.draw(draw),
+    );
+    let pixel = |x: usize, y: usize| -> u32 {
+        let base = (y * width + x) * 4;
+        u32::from_le_bytes([
+            pixels[base],
+            pixels[base + 1],
+            pixels[base + 2],
+            pixels[base + 3],
+        ])
+    };
+    // The unfocused selection is the inactive ground with ordinary ink over it.
+    let has = |c: u32| (4..20).any(|y| (8..32).any(|x| pixel(x, y) & 0xff_ffff == c));
+    assert!(has(INACTIVE_SELECTION), "the inactive selection ground");
+    assert!(has(INK), "ordinary ink over the inactive ground");
+}
+
+#[test]
+fn a_stale_first_cannot_panic_the_field_and_keeps_the_caret() {
+    let surface = surface(320, 200, 1);
+    let entry = TextEntry::new(
+        surface,
+        Rect {
+            x: 0,
+            y: 0,
+            width: 320,
+            height: 24,
+        },
+    )
+    .unwrap();
+    // An empty field with a first left over from a scrolled value still
+    // shows the caret at the start.
+    let empty = run(surface, |damage, sink| {
+        entry.emit(
+            Field {
+                first: usize::MAX,
+                ..field("")
+            },
+            damage,
+            sink,
+        )
+    });
+    assert!(fills(&empty).contains(&(
+        Rect {
+            x: 8,
+            y: 4,
+            width: 1,
+            height: 16
+        },
+        INK
+    )));
+    // A non-empty field with a hostile first paints the paper and does not
+    // panic (overflow-safe arithmetic).
+    let stale = run(surface, |damage, sink| {
+        entry.emit(
+            Field {
+                first: usize::MAX,
+                caret: usize::MAX,
+                anchor: Some(usize::MAX),
+                ..field("abc")
+            },
+            damage,
+            sink,
+        )
+    });
+    assert!(fills(&stale).contains(&(entry.rect(), PAPER)));
+}
+
+#[test]
+fn the_caret_shows_only_when_visible_and_inside_the_window() {
+    let surface = surface(320, 200, 1);
+    let entry = TextEntry::new(
+        surface,
+        Rect {
+            x: 0,
+            y: 0,
+            width: 56,
+            height: 24,
+        },
+    )
+    .unwrap();
+    assert_eq!(entry.columns(), 5);
+    let carets = |f: Field| {
+        let draws = run(surface, |damage, sink| entry.emit(f, damage, sink));
+        fills(&draws)
+            .into_iter()
+            .filter(|&(r, c)| c == INK && r.width == 1)
+            .count()
+    };
+    // Hidden when the caller says so.
+    assert_eq!(
+        carets(Field {
+            caret_visible: false,
+            ..field("abc")
+        }),
+        0
+    );
+    // Hidden when the caret is scrolled out of the window (caret 9, first 0).
+    assert_eq!(
+        carets(Field {
+            caret: 9,
+            first: 0,
+            ..field("abcdefghij")
+        }),
+        0
+    );
+    // Shown when visible and inside the window.
+    assert_eq!(
+        carets(Field {
+            caret: 2,
+            ..field("abc")
+        }),
+        1
+    );
 }

@@ -10,9 +10,9 @@ callback, the seat with its keyboard and pointer, the clipboard's data
 device with its offers and sources, the pointer image and the turn loop),
 all moved out of td-editor, with the chrome bands (`chrome`: the menu bar
 and its panel, the wrapped text block, the tab strip and the status row)
-that td-editor draws, and the paged list `List` built on the panel's
-row painter; the single-line text entry follows by the increments
-below. td-editor is its first consumer; the installer front end
+that td-editor draws, the paged list `List` built on the panel's row
+painter and the single-line text entry `TextEntry`, the new widgets no
+scene drew. td-editor is its first consumer; the installer front end
 `td-setup` and td-portal's file chooser follow. This document is the
 component contract and the starting point for successive agents; the root
 `AGENTS.md` and `DEVELOPMENT.md` still govern changes and submission.
@@ -52,9 +52,9 @@ it owns the 8x16 cell constants every consumer lays text out on. td-editor
 depends on it by path and uses those modules through the crate's public
 surface.
 
-Not yet moved: the single-line text entry, and the second and third
-consumers. The increments below schedule them. td-editor's window is
-the first `App`; it owns no Wayland objects of its own.
+Not yet moved: the second and third consumers, `td-setup` and td-portal.
+The increments below schedule them. td-editor's window is the first
+`App`; it owns no Wayland objects of its own.
 
 ## Purpose and trust position
 
@@ -123,9 +123,10 @@ of its own files may name each module.
   rounding) is the one td-editor/DESIGN.md records under "Implemented
   reference-renderer contract"; that text moves here with the
   documentation increment.
-- `chrome`: `Bar` with its `Panel`, `Block`, `Strip`, `Status`, `List`,
-  the `Row` a panel paints, the `Item` a list paints and `step`, the
-  bands and the paged list a td-owned window shares, over `raster` and
+- `chrome`: `Bar` with its `Panel`, `Block`, `Strip`, `Status`, `List`
+  and `TextEntry`, the `Row` a panel paints, the `Item` a list paints,
+  the `Field` a text entry paints and `step`, the bands, the paged list
+  and the text entry a td-owned window shares, over `raster` and
   independent of any scene. The bar, a panel's rows, the tab
   strip and the status row are each `ROW` (24) reference-renderer pixels
   tall, of 8x16 cells, scaled by the surface; the text block wraps in
@@ -154,11 +155,17 @@ of its own files may name each module.
   and at most `STATUS_COLUMNS` (512), a control scalar blank and the last
   cell an ellipsis when the line is longer, under a top border; `frame`
   paints the row without a line for a consumer laying out its own status.
-  Each streams its fills and glyphs inside a damage rectangle and reads
-  nothing but its inputs; a draw-stream oracle pins each, and the
-  status band and the list are rasterized whole to pixels. td-editor's
-  `Geometry` and `Scene` compose the bands and its `--preview` stays
-  byte-identical.
+  `TextEntry` is one `ROW`-tall paper field the caller drives with a
+  `Field`: the text from the first shown column, an optional selection
+  filled `SELECTED` focused or `INACTIVE_SELECTION` not with the ink
+  flipped over it, a one-pixel `INK` caret the caller blinks, a dim
+  placeholder when empty, and a masked mode drawing a fixed mask glyph
+  per character; `reveal` keeps the caret shown and `hit` maps a point to
+  a caret column. Each streams its fills and glyphs inside a damage
+  rectangle and reads nothing but its inputs; a draw-stream oracle pins
+  each, and the status band, the list and the text entry are rasterized
+  whole to pixels. td-editor's `Geometry` and `Scene` compose the bands
+  and its `--preview` stays byte-identical.
 - `notices`: `FONT_PROVENANCE`, `FONT_COPYING` and `FONT_LICENSE`, the
   texts beside the face in `td-compositor/assets`, embedded at compile
   time for a program's `--font-license` output.
@@ -392,9 +399,15 @@ of its own files may name each module.
   path and nowhere else among td-ui's consumers. A future move of their
   canonical home updates staging, check mappings and every consumer
   atomically, as td-editor/DESIGN.md already requires.
-- No secret-entry widget. A text field that looks trusted but is not is
-  what `td-install/ENCRYPTION.md` forbids; PIN and passphrase entry belong
-  to the compositor's secure-attention path.
+- The text entry's masked mode is a plain rendering option, not a trust
+  boundary. It draws a fixed mask glyph for each of the field's
+  characters instead of the characters, so a consumer can collect a PIN
+  or passphrase; the widget asserts nothing about whether the field is
+  trusted, and td-ui does not gate its use. Anti-spoofing is the
+  consumer's: a field collecting a secret must be presented only within
+  the compositor's secure-attention and trusted-input path, which
+  `td-install/ENCRYPTION.md` and Principle 7 require. td-ui provides the
+  primitive; the consumer verifies it is used appropriately.
 
 ## Test contract
 
@@ -430,8 +443,19 @@ window, the scrollbar thumb tracking it and a disabled bar's border
 thumb, `hit` mapping a point to a row, `new` refusing a rect the surface
 or the gutter cannot hold, all at more than one scale, and a
 whole-surface pixel oracle for its selection, its scrollbar and the
-pixels around it left untouched. td-editor keeps its scene-level render,
-ui and menu oracles.
+pixels around it left untouched. The text entry adds its own: the paper
+ground, the one-pixel caret after the text, the mask glyph shown in
+place of each character, a selection filled and its ink flipped focused
+and unfocused, a dim placeholder only when empty, a scrolled window from
+a non-zero first with the caret and selection shifted, `reveal`'s
+least-move window keeping the caret at the inset without a needless
+scroll, `hit`'s point-to-column clamped to the shown columns, `new`'s
+refusals, a stale first that cannot panic, the geometry, caret and `hit`
+at a second scale and an offset, and pixel oracles that show the
+selection ground focused and unfocused with the ink over it, a clean
+caret column, the mask glyph rasterized to exactly the bullet, and the
+pixels around the field left untouched. td-editor keeps its scene-level
+render, ui and menu oracles.
 
 `src/sys.rs` and `src/wayland.rs` carry the kernel tests moved from
 td-editor's adapter: close-on-exec duplication of an inherited stream,
@@ -537,9 +561,10 @@ the reader graph, because td-editor's manifest names the crate.
    panel's row painter over a scrolling, selectable window with a
    scrollbar and an optional right-aligned column, for the file chooser
    and choice lists, with a draw-stream and a pixel oracle. Landed.
-   (ii) The single-line text entry, with a caret, selection and a
-   masked mode a consumer applies under its own trust rules, for the
-   second and third consumers.
+   (ii) `TextEntry`, the single-line field with a caret, selection,
+   placeholder, right-scrolling window and a masked mode a consumer
+   applies under its own trust rules, for the second and third
+   consumers, with a draw-stream and a pixel oracle. Landed.
 6. `td-setup`: the installer front end's first page as the second consumer,
    under the native compositor harness shared from td-editor's tests.
 7. td-portal: the file chooser on td-ui, its private handshake and second
