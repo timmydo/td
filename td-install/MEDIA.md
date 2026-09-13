@@ -51,6 +51,73 @@ access or erase authorization. A flashed image on a larger physical device
 has a backup GPT at the image boundary; v1's QEMU attachment uses the image's
 exact size, and hardware compatibility remains a separate milestone.
 
+## Retained image composition
+
+The host control-plane command consumes already-built, stable inputs:
+
+```text
+td-recipe-eval compose-iso OUTPUT KERNEL INITRAMFS [ISO-NAME=FILE ...]
+```
+
+It writes the kernel to `EFI/BOOT/BOOTX64.EFI` and the supplied live
+initramfs to `EFI/BOOT/INITRD`. Optional named payloads occupy the ISO root.
+The boot inputs are nonempty regular files, each at most 256 MiB. The FAT32
+ESP uses the smallest of 64, 128, 256 and 512 MiB that fits both files and
+metadata; their combined size must fit 512 MiB less FAT metadata. Each of at
+most 64 payloads is a nonempty regular file of at most 64 GiB. Level-3
+sections permit files larger than four GiB. Files stream
+through held descriptors; composition does not buffer the deployment in RAM.
+
+For example, after building and provisioning a live initramfs and signing a
+deployment outside derivations, its assembly inputs can be named explicitly:
+
+```text
+td-recipe-eval compose-iso installer.iso bzImage live.cpio \
+  BZIMAGE=deployment/bzImage INITRAMFS.CPIO=deployment/initramfs.cpio \
+  ROOT.EROFS=deployment/root.erofs MANIFEST=deployment/manifest \
+  MANIFEST.SIG=deployment/manifest.sig SELECTOR.CPIO=selector.cpio
+```
+
+This is a byte-composition primitive, not a build/profile selector or an
+installer release command. It does not sign, parse deployment manifests,
+authenticate payloads, provision keys, validate PE executability or create a
+live environment. The profile producer must supply the validated source-built
+boot artifacts, signed deployment, and matching public trust roots required
+by INSTALLER.md. Arbitrary command-line files carry no source-bootstrap claim.
+No host executable is added to the image by this tool. The same writer is
+used by the optical/USB boot and native installation oracles; those callers
+own their diagnostic profiles and signing. A complete desktop installation
+profile remains an independent activation requirement.
+
+The output parent must exist and support hard links and directory sync.
+The caller controls its writable ancestors and keeps the namespace and
+input contents stable during composition. Symlink and special-file inputs
+are refused using td-boot's shared real-file opener; input lengths are
+checked again after streaming. This pins the opened files, not a snapshot
+against in-place writes, and inherits the opener's documented device-swap
+residual. Same-sized concurrent content changes are outside the contract.
+
+Input admission and layout construction precede staging. Internal placement
+checks and input-length rechecks also guard streaming. The writer creates a
+private sibling directory and an exclusive file with permissions no broader than
+0600, initially sparse and zero-filled. A private hard-link probe checks
+filesystem support before streaming; later publication can still fail.
+It syncs the complete image, then publishes it with a no-replacement hard
+link and syncs the parent directory.
+Existing destinations, including dangling symlinks and block devices, are
+never overwritten. A failed copy publishes no output. A failure of the last
+directory sync reports an error even though the complete output may exist.
+Ordinary cleanup removes only the owned temporary file and directory;
+process death can leave a private `.td-iso-*` staging directory. There is no
+replace or flash-device option. Flashing onto physical media and selecting a
+physical installation target remain separate operations.
+
+The metadata GUIDs and timestamps are fixed for reproducible media bytes;
+these GUIDs are template identifiers, not unique installation or disk
+identities. Identical stable inputs produce identical ISO contents. Firmware
+and filesystem hardware compatibility still require the v2 device tests,
+including simultaneous attachment of two media with these template GUIDs.
+
 ## Repeatable firmware oracle
 
 `td-recipe-eval qemu-boot-media` builds the declared source-built kernel

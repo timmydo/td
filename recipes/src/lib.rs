@@ -32,6 +32,9 @@ pub mod permissions {
 #[path = "../../td-boot/src/protocol.rs"]
 #[allow(dead_code)]
 pub mod td_boot_protocol;
+// Keep the ISO composer's shared file admission inside the catalog scan.
+#[path = "../../td-boot/src/realfile.rs"]
+pub mod td_boot_realfile;
 // Keep the native guest oracle contract inside the catalog dependency scan.
 #[path = "../../td-install-qemu-test/src/protocol.rs"]
 pub mod td_install_qemu_protocol;

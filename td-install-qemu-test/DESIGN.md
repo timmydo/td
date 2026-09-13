@@ -22,8 +22,9 @@ local-source verification; it is not a production system input.
 
 The live initramfs holds source-built tools and the public trust root. The
 tiny signed deployment and fixed selector are streamed into separate ISO
-files. Each diagnostic input is bounded at 256 MiB; this remains a small
-fixture rather than a full-system media assembler. The private key remains
+files. Boot files and tools read into the fixture initramfs are bounded at
+256 MiB. The shared composer accepts larger ISO payloads under MEDIA.md,
+but this diagnostic still constructs only a small deployment. The private key remains
 on the host outside derivations. The fixture calls the
 actual td-install layout and volume primitives, including td-boot's verified
 publication. Its success marker follows both successful commands and sync.

@@ -18,6 +18,9 @@
 //!   clear-store           reset the ladder work dir (seed store/db + shared
 //!                         build-cache); the next build re-derives seeds and
 //!                         cold-climbs. The only path that clears persisted state
+//!   compose-iso OUTPUT KERNEL INITRAMFS [ISO-NAME=FILE ...]
+//!                         stream built inputs into a retained hybrid ISO;
+//!                         no build, signing, device access or live-profile creation
 //!   bundle [--out DIR] [--raw] [--zlib] [--force]
 //!                         build system-x86-64 and write a redistributable demo
 //!                         VM — the boot payloads plus a POSIX-sh `start`
@@ -63,6 +66,8 @@ use td_recipe::catalog;
 mod check_runner;
 #[path = "td_recipe_eval/checks/mod.rs"]
 mod checks;
+#[path = "td_recipe_eval/iso_image.rs"]
+mod iso_image;
 #[path = "td_recipe_eval/seed_digests.rs"]
 mod seed_digests;
 #[path = "td_recipe_eval/warm.rs"]
@@ -330,6 +335,11 @@ fn main() {
                 die_runner(&e);
             }
         }
+        Some("compose-iso") => {
+            if let Err(error) = iso_image::cli(args.get(2..).unwrap_or(&[])) {
+                die(&error);
+            }
+        }
         Some("qemu-install") => {
             if let Err(error) = check_runner::qemu_install_cli(args.get(2..).unwrap_or(&[])) {
                 die_runner(&error);
@@ -465,7 +475,7 @@ fn main() {
                 die(&e);
             }
         }
-        _ => die("usage: td-recipe-eval list|emit|check-list|check-count|check-script|check-run|build-run|clear-store|qemu-secret|qemu-secret-system|qemu-boot|qemu-boot-uefi|qemu-boot-media|qemu-install|qemu-boot-erofs|qemu-boot-system|qemu-update|qemu-boot-net|qemu-boot-kexec|run|bundle|warm|verify-store|payload-closure|application-closure|vendor-warm-args|source-pins|source-pin|ostree-pins|ostree-pin|seed-digests|local-source-digests ..."),
+        _ => die("usage: td-recipe-eval list|emit|check-list|check-count|check-script|check-run|build-run|clear-store|qemu-secret|qemu-secret-system|qemu-boot|qemu-boot-uefi|qemu-boot-media|qemu-install|compose-iso|qemu-boot-erofs|qemu-boot-system|qemu-update|qemu-boot-net|qemu-boot-kexec|run|bundle|warm|verify-store|payload-closure|application-closure|vendor-warm-args|source-pins|source-pin|ostree-pins|ostree-pin|seed-digests|local-source-digests ..."),
     }
 }
 

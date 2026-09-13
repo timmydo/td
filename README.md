@@ -186,7 +186,14 @@ pub fn recipe() -> Recipe {
 td-recipe-eval list                  # list every recipe
 td-recipe-eval build-run <name>      # build one recipe into /td/store
 td-recipe-eval qemu-boot-system      # headless boot proof (pass/fail)
+td-recipe-eval qemu-install          # disposable offline ISO installation test
 ```
+
+To compose a retained optical/USB ISO from prepared boot files and optional
+payloads, use `td-recipe-eval compose-iso OUTPUT KERNEL INITRAMFS
+[ISO-NAME=FILE ...]`. See [the media contract](td-install/MEDIA.md) for its
+input and publication rules. The command assembles bytes; the complete live
+installer profile and physical-device installation flow are still in progress.
 
 ## License
 
