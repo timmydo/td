@@ -65,7 +65,8 @@ declares no dependency (td-ui only, from the window increment on).
 ## Workflow
 
 One window, three modes, all keyboard-first; the pointer does the same
-things. The modes are the photographer's order of work.
+things, and so does an agent, through the same actions (see Driving). The
+modes are the photographer's order of work.
 
 1. **Import** copies raw files from a source folder (a mounted card) into
    the library. `td-photo import SRC DEST` does the same headless.
@@ -86,6 +87,63 @@ things. The modes are the photographer's order of work.
 Export renders the full-resolution raw through the same pipeline and writes
 an sRGB image into the roll's `exported/` folder, never overwriting: a
 second export of the same name takes a numbered suffix.
+
+## Driving
+
+td-photo is operated by a person at the keyboard and by an agent acting
+for that person, and the design makes those one thing seen from two
+sides. The shape is td-editor's, the tree's precedent for a driven UI: a
+display-independent dispatcher, a headless replay of it, and a control
+socket on the live window, all speaking one vocabulary.
+
+- **One dispatcher.** Everything the window can do is an `Action`, a
+  closed enum in `ui` (open a roll, select, next, previous, flag, filter,
+  change mode, exposure, crop and its aspect, look, reset, export, delete
+  rejected, scroll, resize, quit). `ui::Controller::dispatch(Event) ->
+  Outcome` turns an input event into actions and applies them to the
+  model; the keyboard bindings, the pointer hit-testing, the replay stream
+  and the control socket are four adapters over that one dispatcher, and
+  nothing reaches the model around it. The controller reads no file, clock
+  or descriptor: its adapters feed it events, including job results, and
+  carry out the requests it returns (decode this, write that).
+- **A headless verb for every durable effect.** Whatever an action does to
+  files is also a command-line verb: `import`, `list`, `flag`, `edit`
+  (get and set of a sidecar's values), `develop`, `export`, `thumb`,
+  `looks` and `cache clear`. Verbs are the batch face: they read the same
+  sidecars and write through the same publication, and an agent that does
+  not need to see pixels never opens a window.
+- **`--replay`: the window without a display.** `td-photo --replay [--size
+  WxH] [ROLL]` reads requests on stdin and answers on stdout in the
+  envelope td-editor's CONTROL.md defines: a four-byte big-endian length,
+  then one tab-separated ASCII line `1 ID verb args...`, answered by `1 ID
+  ok ...` or `1 ID error CODE HEX`. The same controller runs, jobs run on
+  the same pool, and the frame is painted through the toolkit's raster
+  into memory. The vocabulary: `state` (mode, roll, count, cursor, filter,
+  the selected photo's name, flag and edit, the outstanding job count and
+  the frame generation); `photo N` (one photo's facts); `action NAME
+  ARGS...` for every action by its table name; `key HEX_CHORD`, `pointer
+  PHASE X Y` and `wheel ROWS` for the input path through the same
+  bindings; `wait-idle MS` (returns when no job is outstanding or the
+  deadline passes, saying which); `wait-frame GENERATION`; `frame` (the
+  last painted frame as a PPM in hex); `quit`. Error codes are stable
+  (`unknown-verb`, `bad-argument`, `no-roll`, `no-photo`, `busy`,
+  `refused`) and the message is hex.
+- **`--control-socket PATH`: the same vocabulary on the live window,**
+  served from a private (0600) Unix socket by a bounded worker in
+  td-editor's `control_socket` and `control_worker` shape: one request
+  per connection, a deadline per request, and a response that reflects
+  the state after the turn that applied it. Pixels of the live window are
+  evidence only through the compositor's capture channel, observed
+  before and after as td-compositor/AUTOMATION.md prescribes; `frame`
+  over the socket returns the app's own last frame for correlation.
+- **Determinism.** The same requests over the same roll give the same
+  `state`, and with `wait-idle` between them the same `frame`; the tests
+  hold a scripted session to a pixel oracle.
+- **One table.** The vocabulary lives in one table in `ui`: action name,
+  key binding, replay name and argument shape, verb where one exists, and
+  a help line. `tests/ui.rs` pins that every action has a keyboard or
+  pointer path, a replay name and a help line, and `td-photo --help
+  actions` prints the table so an agent can read it instead of guessing.
 
 ## Files
 
@@ -351,7 +409,10 @@ increment and is a translation the user runs, not a runtime dependency.
 ## Window
 
 The window is a `td_ui::client::App` in the shape td-editor and td-setup
-use: it owns no Wayland objects of its own, paints chrome through the
+use, and it is one adapter over `ui::Controller` (see Driving): its
+`event` maps keys and pointer to the controller's events and its
+`end_turn` feeds the controller the job results. It owns no Wayland
+objects of its own, paints chrome through the
 toolkit's raster and bands (the menu bar, the status row, the paged list
 for looks and rolls), and paints photo pixels itself with a clipped XRGB
 blitter into the same frame inside `present`'s closure, because the
@@ -437,6 +498,13 @@ sRGB table's endpoints and monotonicity), the superpixel demosaic on a
 known quad, the area resampler on constant and step images, and a complete
 development of a synthetic frame to expected 8-bit values.
 
+From the window increment on, `tests/ui.rs` drives `ui::Controller`
+in-process (the action table's completeness, scripted sessions held to
+`state` and pixel oracles through the replay path) and
+`tests/control_process.rs` runs the built binary against the native
+compositor harness the sibling crates use, with the observe, capture,
+observe rule for pixel evidence.
+
 The builder discovers the crate by existing; its gate runs `cargo test` and
 all-target Clippy.
 
@@ -448,14 +516,19 @@ all-target Clippy.
    headless. Landed with this document.
 2. Previews: the baseline JPEG decoder with reduced-IDCT scaling, the
    thumbnail format and cache, and `td-photo thumb FILE OUT.ppm`.
-3. Library: rolls, the sidecar reader and writer, `import`, `list` and
-   `flag` headless, with the never-overwrite and never-unlink oracles.
-4. Window, cull mode: the td-ui dependency, the worker pool, the grid with
-   flags, filters and the single-photo view, under the native compositor
-   harness the sibling crates use.
+3. Library: rolls, the sidecar reader and writer, `import`, `list`,
+   `flag` and `edit` headless, with the never-overwrite and never-unlink
+   oracles.
+4. Window, cull mode: the td-ui dependency, `ui::Controller` with its
+   action table and `--help actions`, `--replay` with the whole
+   vocabulary over the cull actions, `--preview`, the worker pool, the
+   grid with flags, filters and the single-photo view, `tests/ui.rs`, and
+   `tests/control_process.rs` under the native compositor harness the
+   sibling crates use.
 5. Window, develop mode: levels 0 through 3 with their memoization,
    exposure, crop with the drag contract, the look list and the look
-   format with the built-in set.
+   format with the built-in set, the develop actions in the table and
+   the replay, and `--control-socket` on the live window.
 6. Export: banded full-resolution bilinear demosaic, the JPEG encoder,
    `exported/` naming, and `td-photo export`.
 7. Packaging: the cargo recipe staging td-ui, the image entry, and the
