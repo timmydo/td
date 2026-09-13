@@ -9,8 +9,8 @@
 //! with its buffers and pointer image, the seat with its devices and the
 //! clipboard, and the turn loop that drives a consumer's `App`), and the
 //! chrome bands over the raster (`chrome`: the menu bar and its panel, the
-//! wrapped text block, the tab strip and the status row); the text entry
-//! and paged list follow in the order DESIGN.md schedules. Outside
+//! wrapped text block, the tab strip, the status row and the paged list);
+//! the text entry follows in the order DESIGN.md schedules. Outside
 //! `wayland`, `client` and the private raw module beneath them nothing
 //! reads the environment, a clock, a descriptor or the filesystem:
 //! adapters supply explicit inputs, and `notices` embeds the face's

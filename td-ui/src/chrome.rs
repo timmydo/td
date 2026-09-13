@@ -1,12 +1,13 @@
 //! The chrome bands td-owned windows share, over `raster`: the menu bar
-//! with its panel, a wrapped text block, a tab strip and a status row.
-//! Each is a geometry over a `Surface` in the reference renderer's units
-//! (24-pixel rows of 8x16 cells, scaled by the surface) and a painter
-//! that streams the complete band inside a damage rectangle. Nothing
-//! here reads a clock, a file or the environment.
+//! with its panel, a wrapped text block, a tab strip, a status row and a
+//! scrolling list. Each is a geometry over a `Surface` in the reference
+//! renderer's units (24-pixel rows of 8x16 cells, scaled by the surface)
+//! and a painter that streams the complete band inside a damage
+//! rectangle. Nothing here reads a clock, a file or the environment.
 
 use crate::raster::{
-    text_run, Draw, GlyphStyle, Primitive, Rect, Scale, Surface, BORDER, CHROME, INK, PAPER,
+    text_run, Draw, GlyphStyle, Primitive, Rect, Scale, Scrollbar, Surface, BORDER, CHROME, INK,
+    LINE_NUMBER, PAPER,
 };
 use crate::{CELL_HEIGHT, CELL_WIDTH};
 
@@ -33,6 +34,11 @@ pub const DISABLED: u32 = 0xff827a6d;
 /// The text inset inside a chrome row: one cell in, four pixels down.
 const INSET: (i64, i64) = (8, 4);
 
+/// A `List`'s scrollbar: the gutter reserved at its right and the track's
+/// width within it, in font pixels, matching the editor's document bar.
+const SCROLL_GUTTER: usize = 16;
+const SCROLL_TRACK: usize = 12;
+
 fn fill(rect: Rect, color: u32, damage: Rect, sink: &mut dyn FnMut(Draw)) {
     if let Some(area) = rect.intersection(damage) {
         sink(Draw {
@@ -40,6 +46,52 @@ fn fill(rect: Rect, color: u32, damage: Rect, sink: &mut dyn FnMut(Draw)) {
             primitive: Primitive::Fill { rect: area, color },
         });
     }
+}
+
+/// One list row as painted, the shared model behind `Panel` and `List`:
+/// its background chosen by `selected`, its ink by `enabled`, `prefix`
+/// then `label` from the row's first cell and `trailing` at its right.
+struct RowPaint<'a> {
+    rect: Rect,
+    selected: bool,
+    enabled: bool,
+    prefix: &'a str,
+    label: &'a str,
+    trailing: &'a str,
+}
+
+fn paint_row(scale: Scale, row: RowPaint, damage: Rect, sink: &mut dyn FnMut(Draw)) {
+    let s = scale.value() as i64;
+    let background = if row.selected { SELECTED_ROW } else { CHROME };
+    let ink = if row.enabled { INK } else { DISABLED };
+    let style = GlyphStyle::medium(ink, background);
+    fill(row.rect, background, damage, sink);
+    let cells = row.trailing.chars().count() as i64;
+    let start = row.rect.x + i64::from(row.rect.width) - (INSET.0 + cells * CELL_WIDTH as i64) * s;
+    // The label stops at the trailing column so a long label cannot
+    // overpaint it; the menu's labels never reach it, so its pixels hold.
+    let label_bounds = Rect {
+        width: (start - row.rect.x).max(0) as u32,
+        ..row.rect
+    };
+    text_run(
+        scale,
+        row.prefix.chars().chain(row.label.chars()),
+        (row.rect.x + INSET.0 * s, row.rect.y + INSET.1 * s),
+        label_bounds,
+        style,
+        damage,
+        sink,
+    );
+    text_run(
+        scale,
+        row.trailing.chars(),
+        (start, row.rect.y + INSET.1 * s),
+        row.rect,
+        style,
+        damage,
+        sink,
+    );
 }
 
 /// The menu bar: `labels` on the first row from cell column one, three
@@ -206,41 +258,181 @@ impl Panel {
         damage: Rect,
         sink: &mut dyn FnMut(Draw),
     ) {
-        let s = self.scale.value() as i64;
         for (index, row) in rows.into_iter().enumerate() {
             let Some(rect) = self.row(index) else {
                 break;
             };
-            let background = if index == selected {
-                SELECTED_ROW
-            } else {
-                CHROME
-            };
-            let ink = if row.enabled { INK } else { DISABLED };
-            let style = GlyphStyle::medium(ink, background);
-            fill(rect, background, damage, sink);
-            let prefix = if row.checked { "+ " } else { "  " };
-            text_run(
+            paint_row(
                 self.scale,
-                prefix.chars().chain(row.label.chars()),
-                (rect.x + INSET.0 * s, rect.y + INSET.1 * s),
-                rect,
-                style,
-                damage,
-                sink,
-            );
-            let cells = row.shortcut.chars().count() as i64;
-            let start = rect.x + i64::from(rect.width) - (INSET.0 + cells * CELL_WIDTH as i64) * s;
-            text_run(
-                self.scale,
-                row.shortcut.chars(),
-                (start, rect.y + INSET.1 * s),
-                rect,
-                style,
+                RowPaint {
+                    rect,
+                    selected: index == selected,
+                    enabled: row.enabled,
+                    prefix: if row.checked { "+ " } else { "  " },
+                    label: row.label,
+                    trailing: row.shortcut,
+                },
                 damage,
                 sink,
             );
         }
+    }
+}
+
+/// One list row: its label, an optional right-aligned column, whether it
+/// can be chosen and whether it carries the multi-select mark.
+#[derive(Clone, Copy, Debug)]
+pub struct Item<'a> {
+    pub label: &'a str,
+    pub meta: &'a str,
+    pub enabled: bool,
+    pub marked: bool,
+}
+
+/// A scrolling list filling a rectangle: `ROW`-tall rows painted by the
+/// panel's row painter, a marked row prefixed, an optional right-aligned
+/// column, and a scrollbar in the gutter at its right. The caller owns the
+/// selection and the first shown item; the list holds no state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct List {
+    rect: Rect,
+    scale: Scale,
+}
+
+impl List {
+    /// The list filling `rect`; `None` when `rect` lies outside the surface
+    /// or cannot hold one `ROW` beside the scrollbar gutter.
+    pub fn new(surface: Surface, rect: Rect) -> Option<Self> {
+        let s = surface.scale.value();
+        if rect.intersection(surface.bounds()) != Some(rect) {
+            return None;
+        }
+        if rect.width as usize <= SCROLL_GUTTER * s || (rect.height as usize) < ROW * s {
+            return None;
+        }
+        Some(Self {
+            rect,
+            scale: surface.scale,
+        })
+    }
+
+    pub fn rect(self) -> Rect {
+        self.rect
+    }
+
+    /// The rows the list shows at once.
+    pub fn rows(self) -> usize {
+        self.rect.height as usize / (ROW * self.scale.value())
+    }
+
+    /// The row area: the rect less the scrollbar gutter and any remainder
+    /// below the last whole row, for a caller clipping its own content to
+    /// the rows.
+    pub fn body(self) -> Rect {
+        let s = self.scale.value();
+        let gutter = (SCROLL_GUTTER * s) as u32;
+        Rect {
+            width: self.rect.width.saturating_sub(gutter),
+            height: (self.rows() * ROW * s) as u32,
+            ..self.rect
+        }
+    }
+
+    /// Visible row `index`'s rectangle.
+    pub fn row(self, index: usize) -> Option<Rect> {
+        if index >= self.rows() {
+            return None;
+        }
+        let height = (ROW * self.scale.value()) as i64;
+        let body = self.body();
+        Some(Rect {
+            y: body.y + index as i64 * height,
+            height: height as u32,
+            ..body
+        })
+    }
+
+    /// The visible row holding the point, among the shown rows.
+    pub fn hit(self, x: i64, y: i64) -> Option<usize> {
+        let body = self.body();
+        if !body.contains(x, y) {
+            return None;
+        }
+        let row = (y - body.y) as usize / (ROW * self.scale.value());
+        (row < self.rows()).then_some(row)
+    }
+
+    /// The scrollbar for `total` items scrolled to `first`.
+    pub fn scrollbar(self, total: usize, first: usize) -> Scrollbar {
+        let s = self.scale.value();
+        let track = Rect {
+            x: self.rect.x + i64::from(self.rect.width) - (SCROLL_GUTTER * s) as i64,
+            y: self.rect.y,
+            width: (SCROLL_TRACK * s) as u32,
+            height: (self.rows() * ROW * s) as u32,
+        };
+        Scrollbar::new(track, self.rows(), total, first, self.scale, false)
+    }
+
+    /// `first` moved as little as possible so `selected` is a shown row.
+    pub fn reveal(self, total: usize, selected: usize, first: usize) -> usize {
+        let rows = self.rows();
+        if rows == 0 || total == 0 {
+            return 0;
+        }
+        let selected = selected.min(total - 1);
+        let first = first.min(total.saturating_sub(rows));
+        if selected < first {
+            selected
+        } else if selected >= first + rows {
+            selected + 1 - rows
+        } else {
+            first
+        }
+    }
+
+    /// Paints the window `first..` given by `items`, the item at `selected`
+    /// highlighted, a marked one prefixed, empty rows below left chrome, and
+    /// the scrollbar for `total` items; items past the shown rows are not
+    /// painted.
+    pub fn emit<'a>(
+        &self,
+        items: impl IntoIterator<Item = Item<'a>>,
+        first: usize,
+        selected: usize,
+        total: usize,
+        damage: Rect,
+        sink: &mut dyn FnMut(Draw),
+    ) {
+        // The whole rect is chrome first, like the other bands, so the
+        // gutter, its margin and any remainder below the last row are
+        // painted; the rows and thumb draw over it.
+        fill(self.rect, CHROME, damage, sink);
+        for (i, item) in items.into_iter().enumerate() {
+            let Some(rect) = self.row(i) else {
+                break;
+            };
+            paint_row(
+                self.scale,
+                RowPaint {
+                    rect,
+                    selected: selected.checked_sub(first) == Some(i),
+                    enabled: item.enabled,
+                    prefix: if item.marked { "* " } else { "  " },
+                    label: item.label,
+                    trailing: item.meta,
+                },
+                damage,
+                sink,
+            );
+        }
+        let bar = self.scrollbar(total, first);
+        fill(
+            bar.thumb,
+            if bar.enabled() { LINE_NUMBER } else { BORDER },
+            damage,
+            sink,
+        );
     }
 }
 

@@ -10,8 +10,9 @@ callback, the seat with its keyboard and pointer, the clipboard's data
 device with its offers and sources, the pointer image and the turn loop),
 all moved out of td-editor, with the chrome bands (`chrome`: the menu bar
 and its panel, the wrapped text block, the tab strip and the status row)
-that td-editor draws; the text entry and paged list follow by the
-increments below. td-editor is its first consumer; the installer front end
+that td-editor draws, and the paged list `List` built on the panel's
+row painter; the single-line text entry follows by the increments
+below. td-editor is its first consumer; the installer front end
 `td-setup` and td-portal's file chooser follow. This document is the
 component contract and the starting point for successive agents; the root
 `AGENTS.md` and `DEVELOPMENT.md` still govern changes and submission.
@@ -51,8 +52,8 @@ it owns the 8x16 cell constants every consumer lays text out on. td-editor
 depends on it by path and uses those modules through the crate's public
 surface.
 
-Not yet moved: the text entry and paged list widgets, and the second and
-third consumers. The increments below schedule them. td-editor's window is
+Not yet moved: the single-line text entry, and the second and third
+consumers. The increments below schedule them. td-editor's window is
 the first `App`; it owns no Wayland objects of its own.
 
 ## Purpose and trust position
@@ -122,9 +123,10 @@ of its own files may name each module.
   rounding) is the one td-editor/DESIGN.md records under "Implemented
   reference-renderer contract"; that text moves here with the
   documentation increment.
-- `chrome`: `Bar` with its `Panel`, `Block`, `Strip`, `Status`, the `Row`
-  a panel paints and `step`, the bands a td-owned window shares, over
-  `raster` and independent of any scene. The bar, a panel's rows, the tab
+- `chrome`: `Bar` with its `Panel`, `Block`, `Strip`, `Status`, `List`,
+  the `Row` a panel paints, the `Item` a list paints and `step`, the
+  bands and the paged list a td-owned window shares, over `raster` and
+  independent of any scene. The bar, a panel's rows, the tab
   strip and the status row are each `ROW` (24) reference-renderer pixels
   tall, of 8x16 cells, scaled by the surface; the text block wraps in
   16-pixel cell rows. `Bar` fills the first row and lays its labels from
@@ -134,7 +136,13 @@ of its own files may name each module.
   exists only with a status row's height below it; it paints each `Row`
   with the selected one highlighted, a disabled one dim, a checked one
   prefixed and the shortcut at the right edge, and `step` walks the
-  enabled rows with wrap. `Block` wraps a caption at its columns, the
+  enabled rows with wrap. `List` shares that row painter over a
+  scrolling window the caller owns: `ROW`-tall rows filling a
+  rectangle, the same highlight, dim and prefix, a marked row starred
+  and an optional right-aligned `Item` column, empty rows below left
+  chrome, and a scrollbar in a `SCROLL_GUTTER` (16)-pixel gutter at its
+  right; `reveal` keeps the selection shown and `hit` maps a point to a
+  row. `Block` wraps a caption at its columns, the
   width less a cell each side, over up to `BLOCK_ROWS` (15) rows, a
   newline starting the next, at most `BLOCK_SCALARS` (`BLOCK_ROWS` * 73)
   scalars visited. `Strip` lays `TAB_WIDTH` (160)-pixel tabs from the left
@@ -146,10 +154,11 @@ of its own files may name each module.
   and at most `STATUS_COLUMNS` (512), a control scalar blank and the last
   cell an ellipsis when the line is longer, under a top border; `frame`
   paints the row without a line for a consumer laying out its own status.
-  Each band streams its fills and glyphs inside a damage rectangle and
-  reads nothing but its inputs; a draw-stream oracle pins each band and
-  the status band is rasterized whole to pixels. td-editor's `Geometry`
-  and `Scene` compose them and its `--preview` stays byte-identical.
+  Each streams its fills and glyphs inside a damage rectangle and reads
+  nothing but its inputs; a draw-stream oracle pins each, and the
+  status band and the list are rasterized whole to pixels. td-editor's
+  `Geometry` and `Scene` compose the bands and its `--preview` stays
+  byte-identical.
 - `notices`: `FONT_PROVENANCE`, `FONT_COPYING` and `FONT_LICENSE`, the
   texts beside the face in `td-compositor/assets`, embedded at compile
   time for a program's `--font-license` output.
@@ -353,6 +362,21 @@ of its own files may name each module.
   clip; row padding and bytes beyond the frame are untouched, and every
   refusal precedes every write. Medium-weight fringe colours derive from
   the explicit background a caller paints, never from buffer bytes.
+- The pixel backend is a seam. Every widget and scene emits a semantic
+  draw stream, `Fill` rectangles and `Glyph` scalars in a `GlyphStyle`,
+  into a sink; none reads or writes buffer pixels. A `Glyph` names a
+  Unicode scalar and a style, never a bitmap, so the glyph source is the
+  font mount's alone. `Raster` executes that stream into a software XRGB
+  buffer today; because the stream, not the buffer, is the toolkit's
+  contract, a backend that keeps the cell model is a swap below this seam,
+  executing the same draws at the same scalar positions: a GPU or
+  glyph-atlas executor, or antialiasing that shades a glyph's coverage
+  within its cell. Only proportional or variable-advance layout, which
+  moves the scalar positions the widgets emit, is a remodel above the
+  seam. td-editor/DESIGN.md owns the reference backend's operation set and
+  lists the version-1 exclusions, antialiasing among them. Draw-stream
+  oracles are the portable contract every backend keeps; the exact-pixel
+  oracles and the `--preview` checksum pin the current software backend.
 - Every budget carries over from td-editor unchanged: 1 MiB keymaps, the
   parser's token, depth, keycode, type, virtual-modifier, level,
   interpretation and modifier-map ceilings, and a 768-key held set.
@@ -398,8 +422,16 @@ border with a dirty star, and an empty strip still filling its row with no
 tab; the text block wrapping at its columns across a newline; and the status
 row truncating a long line to an ellipsis in the last cell; and one
 whole-surface pixel oracle rasterizing the status band to confirm its
-border and fill land and the rows above stay untouched. td-editor keeps
-its scene-level render, ui and menu oracles.
+border and fill land and the rows above stay untouched. The list adds
+its own: the selection highlight, disabled dim, star mark and
+right-aligned column, the whole rect painted chrome behind the rows, a
+selection off the window drawing no highlight, `reveal`'s least-move
+window, the scrollbar thumb tracking it and a disabled bar's border
+thumb, `hit` mapping a point to a row, `new` refusing a rect the surface
+or the gutter cannot hold, all at more than one scale, and a
+whole-surface pixel oracle for its selection, its scrollbar and the
+pixels around it left untouched. td-editor keeps its scene-level render,
+ui and menu oracles.
 
 `src/sys.rs` and `src/wayland.rs` carry the kernel tests moved from
 td-editor's adapter: close-on-exec duplication of an inherited stream,
@@ -496,13 +528,18 @@ the reader graph, because td-editor's manifest names the crate.
    (b) The clipboard's data-device lifecycle: manager, device, offers with
    their budgets and retirement barriers, and sources, delivered typed;
    td-editor keeps its transfers. Landed.
-5. Widgets, in two landings. (a) The chrome bands td-editor already draws,
-   as `chrome`: the menu bar and its panel, the wrapped text block, the tab
-   strip and the status row, each with a draw-stream oracle and the
-   status band rasterized whole to pixels; td-editor's `Geometry` and
-   `Scene` delegate and `--preview` stays byte-identical.
-   Landed. (b) The text entry and the paged list, new, for the second and
-   third consumers, each with a pixel oracle.
+5. Widgets. (a) The chrome bands td-editor already draws, as `chrome`:
+   the menu bar and its panel, the wrapped text block, the tab strip
+   and the status row, each with a draw-stream oracle and the status
+   band rasterized whole to pixels; td-editor's `Geometry` and `Scene`
+   delegate and `--preview` stays byte-identical. Landed. (b) The new
+   widgets a scene did not draw, in two landings. (i) `List`, the
+   panel's row painter over a scrolling, selectable window with a
+   scrollbar and an optional right-aligned column, for the file chooser
+   and choice lists, with a draw-stream and a pixel oracle. Landed.
+   (ii) The single-line text entry, with a caret, selection and a
+   masked mode a consumer applies under its own trust rules, for the
+   second and third consumers.
 6. `td-setup`: the installer front end's first page as the second consumer,
    under the native compositor harness shared from td-editor's tests.
 7. td-portal: the file chooser on td-ui, its private handshake and second

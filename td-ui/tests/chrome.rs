@@ -13,11 +13,11 @@
 //! and paint one band whole to a buffer to confirm the pixels.
 
 use td_ui::chrome::{
-    step, Bar, Block, Panel, Row, Status, Strip, DISABLED, SELECTED_ROW, STATUS_COLUMNS,
+    step, Bar, Block, Item, List, Panel, Row, Status, Strip, DISABLED, SELECTED_ROW, STATUS_COLUMNS,
 };
 use td_ui::font;
 use td_ui::raster::{
-    Draw, Primitive, Raster, Rect, Scale, Surface, Weight, BORDER, CHROME, INK, PAPER,
+    Draw, Primitive, Raster, Rect, Scale, Surface, Weight, BORDER, CHROME, INK, LINE_NUMBER, PAPER,
 };
 
 const LABELS: [&str; 5] = ["File", "Edit", "Format", "Help", "Directory"];
@@ -326,4 +326,503 @@ fn a_band_paints_its_pixels_and_leaves_the_rest_of_the_surface_alone() {
     assert_eq!(pixel(40, y) & 0xff_ffff, BORDER);
     assert_eq!(pixel(300, y + 4) & 0xff_ffff, CHROME);
     assert_eq!(pixel(40, y - 1), 0, "above the status stays untouched");
+}
+
+// ---- the paged list ----
+
+fn items<'a>(specs: &'a [(&'a str, &'a str, bool, bool)]) -> Vec<Item<'a>> {
+    specs
+        .iter()
+        .map(|&(label, meta, enabled, marked)| Item {
+            label,
+            meta,
+            enabled,
+            marked,
+        })
+        .collect()
+}
+
+#[test]
+fn a_list_highlights_the_selection_dims_the_disabled_and_marks_and_right_aligns() {
+    let surface = surface(320, 200, 1);
+    let list = List::new(
+        surface,
+        Rect {
+            x: 0,
+            y: 0,
+            width: 320,
+            height: 120,
+        },
+    )
+    .unwrap();
+    assert_eq!(list.rows(), 5);
+    let rows = items(&[
+        ("alpha", "", true, false),
+        ("bravo", "", true, false),     // selected
+        ("charlie", "", true, true),    // marked
+        ("delta", "off", false, false), // disabled, with a meta column
+        ("echo", "", true, false),
+    ]);
+    let draws = run(surface, |damage, sink| {
+        list.emit(rows, 0, 1, 5, damage, sink)
+    });
+    let filled = fills(&draws);
+    let painted = glyphs(&draws);
+    // Row 1 is the selection; row 0 is ordinary chrome.
+    assert!(filled.contains(&(
+        Rect {
+            x: 0,
+            y: 24,
+            width: 304,
+            height: 24
+        },
+        SELECTED_ROW
+    )));
+    assert!(filled.contains(&(
+        Rect {
+            x: 0,
+            y: 0,
+            width: 304,
+            height: 24
+        },
+        CHROME
+    )));
+    // The whole rect is painted chrome first, covering the gutter and its
+    // margin; with nothing to scroll the thumb is a border block.
+    assert!(filled.contains(&(list.rect(), CHROME)));
+    assert!(filled.iter().any(|&(_, c)| c == BORDER));
+    // The marked row is prefixed with a star at its first cell.
+    assert!(painted
+        .iter()
+        .any(|&(x, y, ch, _, _)| x == 8 && y == 2 * 24 + 4 && ch == '*'));
+    // The selection paints ordinary ink; a disabled row is dim.
+    assert!(painted
+        .iter()
+        .any(|&(_, y, ch, ink, _)| y == 24 + 4 && ch == 'b' && ink == INK));
+    assert!(painted
+        .iter()
+        .any(|&(_, y, ch, ink, _)| y == 3 * 24 + 4 && ch == 'd' && ink == DISABLED));
+    // The meta column is right-aligned within the body: "off" ends at its edge.
+    assert!(painted
+        .iter()
+        .any(|&(x, y, ch, _, _)| x == 304 - (8 + 3 * 8) && y == 3 * 24 + 4 && ch == 'o'));
+}
+
+#[test]
+fn a_short_list_fills_the_whole_rect_with_chrome_behind_its_rows() {
+    let surface = surface(320, 200, 1);
+    let list = List::new(
+        surface,
+        Rect {
+            x: 0,
+            y: 0,
+            width: 320,
+            height: 120,
+        },
+    )
+    .unwrap();
+    let rows = items(&[("one", "", true, false), ("two", "", true, false)]);
+    let draws = run(surface, |damage, sink| {
+        list.emit(rows, 0, 0, 2, damage, sink)
+    });
+    // The whole rect is one chrome fill, so the empty rows below the two
+    // items — and the gutter and its margin — show chrome.
+    assert!(fills(&draws).contains(&(list.rect(), CHROME)));
+    // No glyph is painted below the last item.
+    assert!(glyphs(&draws).iter().all(|&(_, y, _, _, _)| y < 48));
+}
+
+#[test]
+fn reveal_moves_the_window_the_least_to_show_the_selection() {
+    let surface = surface(320, 200, 1);
+    let list = List::new(
+        surface,
+        Rect {
+            x: 0,
+            y: 0,
+            width: 320,
+            height: 120,
+        },
+    )
+    .unwrap();
+    assert_eq!(list.reveal(20, 0, 10), 0); // above the window: to its top
+    assert_eq!(list.reveal(20, 19, 0), 15); // below: the last page
+    assert_eq!(list.reveal(20, 3, 0), 0); // already shown: unchanged
+    assert_eq!(list.reveal(20, 7, 0), 3); // just past: scroll by the overshoot
+    assert_eq!(list.reveal(0, 0, 0), 0); // an empty list
+}
+
+#[test]
+fn the_scrollbar_thumb_tracks_the_window() {
+    let surface = surface(320, 200, 1);
+    let list = List::new(
+        surface,
+        Rect {
+            x: 0,
+            y: 0,
+            width: 320,
+            height: 120,
+        },
+    )
+    .unwrap();
+    let top = list.scrollbar(20, 0);
+    assert!(top.enabled());
+    assert_eq!(top.thumb.y, top.track.y); // at the top
+    assert!(top.thumb.height < top.track.height); // shorter than the track
+    let bottom = list.scrollbar(20, 15);
+    assert!(bottom.thumb.y > top.thumb.y); // scrolled down
+}
+
+#[test]
+fn the_list_maps_points_to_visible_rows_and_ignores_the_gutter() {
+    let surface = surface(320, 200, 1);
+    let list = List::new(
+        surface,
+        Rect {
+            x: 0,
+            y: 0,
+            width: 320,
+            height: 120,
+        },
+    )
+    .unwrap();
+    assert_eq!(list.hit(10, 0), Some(0));
+    assert_eq!(list.hit(10, 25), Some(1));
+    assert_eq!(list.hit(10, 119), Some(4));
+    assert_eq!(list.hit(10, 120), None); // below the rows
+    assert_eq!(list.hit(310, 10), None); // in the scrollbar gutter
+}
+
+#[test]
+fn a_list_paints_its_selection_and_scrollbar_to_pixels() {
+    let font = font::pinned().unwrap();
+    // A surface larger than the list, so the pixels around it must stay 0.
+    let (width, height) = (360usize, 128usize);
+    let surface = surface(width, height, 1);
+    let list = List::new(
+        surface,
+        Rect {
+            x: 0,
+            y: 0,
+            width: 320,
+            height: 96,
+        },
+    )
+    .unwrap();
+    let rows = items(&[
+        ("a", "", true, false),
+        ("b", "", true, false), // selected
+        ("c", "", true, false),
+        ("d", "", true, false),
+    ]);
+    let mut pixels = vec![0u8; width * height * 4];
+    let mut raster = Raster::new(&mut pixels, &font, surface, width * 4).unwrap();
+    list.emit(rows, 0, 1, 20, surface.bounds(), &mut |draw| {
+        raster.draw(draw)
+    });
+    let pixel = |x: usize, y: usize| -> u32 {
+        let base = (y * width + x) * 4;
+        u32::from_le_bytes([
+            pixels[base],
+            pixels[base + 1],
+            pixels[base + 2],
+            pixels[base + 3],
+        ])
+    };
+    // Row 1 is the selection; row 0 stays chrome.
+    assert_eq!(pixel(200, 24 + 8) & 0xff_ffff, SELECTED_ROW & 0xff_ffff);
+    assert_eq!(pixel(200, 8) & 0xff_ffff, CHROME);
+    // The selection paints its label ink over the highlight.
+    let selection_has_ink = (24..48).any(|y| (0..304).any(|x| pixel(x, y) & 0xff_ffff == INK));
+    assert!(selection_has_ink, "the selection row paints label ink");
+    // The scrollbar thumb is line-number ink because twenty items scroll.
+    assert_eq!(pixel(308, 8) & 0xff_ffff, LINE_NUMBER);
+    // Below the thumb the track is chrome.
+    assert_eq!(pixel(308, 90) & 0xff_ffff, CHROME);
+    // The 4px margin past the 12px track is chrome now, not stale.
+    assert_eq!(pixel(318, 8) & 0xff_ffff, CHROME);
+    // The list leaves the rest of the surface untouched.
+    assert_eq!(pixel(340, 8), 0, "right of the list stays untouched");
+    assert_eq!(pixel(8, 100), 0, "below the list stays untouched");
+}
+
+#[test]
+fn a_list_at_scale_two_and_an_offset_places_its_rows_and_gutter() {
+    let surface = surface(400, 300, 2);
+    let rect = Rect {
+        x: 16,
+        y: 16,
+        width: 320,
+        height: 144,
+    };
+    let list = List::new(surface, rect).unwrap();
+    // 3 = 144 / (24 * 2); body drops the 32px gutter, a row is 48px tall.
+    assert_eq!(list.rows(), 3);
+    assert_eq!(
+        list.body(),
+        Rect {
+            x: 16,
+            y: 16,
+            width: 288,
+            height: 144
+        }
+    );
+    assert_eq!(
+        list.row(1),
+        Some(Rect {
+            x: 16,
+            y: 64,
+            width: 288,
+            height: 48
+        })
+    );
+    assert_eq!(list.row(3), None);
+    let rows = items(&[
+        ("one", "", true, false),
+        ("two", "", true, false), // selected
+        ("three", "", true, false),
+    ]);
+    let draws = run(surface, |damage, sink| {
+        list.emit(rows, 0, 1, 3, damage, sink)
+    });
+    let filled = fills(&draws);
+    // The whole rect is chrome; row 1 is the selection at the scaled offset.
+    assert!(filled.contains(&(rect, CHROME)));
+    assert!(filled.contains(&(
+        Rect {
+            x: 16,
+            y: 64,
+            width: 288,
+            height: 48
+        },
+        SELECTED_ROW
+    )));
+    // The first label's 'o' sits two scaled cells in, past the "  " prefix.
+    assert!(glyphs(&draws)
+        .iter()
+        .any(|&(x, y, ch, _, _)| x == 64 && y == 24 && ch == 'o'));
+}
+
+#[test]
+fn a_selection_off_the_window_draws_no_highlight() {
+    let surface = surface(320, 200, 1);
+    let list = List::new(
+        surface,
+        Rect {
+            x: 0,
+            y: 0,
+            width: 320,
+            height: 72,
+        },
+    )
+    .unwrap();
+    assert_eq!(list.rows(), 3);
+    // Window first=5 shows items 5..8; item 6 is the middle shown row.
+    let shown = run(surface, |damage, sink| {
+        list.emit(
+            items(&[
+                ("f", "", true, false),
+                ("g", "", true, false),
+                ("h", "", true, false),
+            ]),
+            5,
+            6,
+            20,
+            damage,
+            sink,
+        )
+    });
+    assert!(fills(&shown).contains(&(
+        Rect {
+            x: 0,
+            y: 24,
+            width: 304,
+            height: 24
+        },
+        SELECTED_ROW
+    )));
+    // A selection above the window paints no highlight at all.
+    let off = run(surface, |damage, sink| {
+        list.emit(
+            items(&[
+                ("f", "", true, false),
+                ("g", "", true, false),
+                ("h", "", true, false),
+            ]),
+            5,
+            1,
+            20,
+            damage,
+            sink,
+        )
+    });
+    assert!(fills(&off).iter().all(|&(_, c)| c != SELECTED_ROW));
+}
+
+#[test]
+fn a_list_with_a_remainder_fills_the_bottom_and_reports_exact_body() {
+    let font = font::pinned().unwrap();
+    let (width, height) = (320usize, 121usize); // 5 rows of 24 plus a 1px remainder
+    let surface = surface(width, height, 1);
+    let list = List::new(
+        surface,
+        Rect {
+            x: 0,
+            y: 0,
+            width: 320,
+            height: 121,
+        },
+    )
+    .unwrap();
+    assert_eq!(list.rows(), 5);
+    // body reports the exact row area, not the 1px dead strip below it.
+    assert_eq!(
+        list.body(),
+        Rect {
+            x: 0,
+            y: 0,
+            width: 304,
+            height: 120
+        }
+    );
+    let rows = items(&[("only", "", true, false)]);
+    let mut pixels = vec![0u8; width * height * 4];
+    let mut raster = Raster::new(&mut pixels, &font, surface, width * 4).unwrap();
+    list.emit(rows, 0, 0, 1, surface.bounds(), &mut |draw| {
+        raster.draw(draw)
+    });
+    let pixel = |x: usize, y: usize| -> u32 {
+        let base = (y * width + x) * 4;
+        u32::from_le_bytes([
+            pixels[base],
+            pixels[base + 1],
+            pixels[base + 2],
+            pixels[base + 3],
+        ])
+    };
+    // The 1px remainder row at the bottom is chrome, not stale.
+    assert_eq!(pixel(100, 120) & 0xff_ffff, CHROME);
+    assert_eq!(pixel(318, 120) & 0xff_ffff, CHROME);
+}
+
+#[test]
+fn an_empty_list_paints_only_chrome_and_a_border_thumb() {
+    let surface = surface(320, 200, 1);
+    let rect = Rect {
+        x: 0,
+        y: 0,
+        width: 320,
+        height: 120,
+    };
+    let list = List::new(surface, rect).unwrap();
+    let draws = run(surface, |damage, sink| {
+        list.emit(items(&[]), 0, 0, 0, damage, sink)
+    });
+    // The whole rect is chrome and the disabled bar shows a border thumb.
+    assert!(fills(&draws).contains(&(rect, CHROME)));
+    assert!(fills(&draws).iter().any(|&(_, c)| c == BORDER));
+    assert!(glyphs(&draws).is_empty());
+    assert!(!list.scrollbar(0, 0).enabled());
+}
+
+#[test]
+fn list_new_refuses_a_rect_the_surface_or_the_gutter_cannot_hold() {
+    let surface = surface(320, 200, 1);
+    // A rect reaching past the surface, sideways or below.
+    assert!(List::new(
+        surface,
+        Rect {
+            x: 0,
+            y: 0,
+            width: 321,
+            height: 24
+        }
+    )
+    .is_none());
+    assert!(List::new(
+        surface,
+        Rect {
+            x: 0,
+            y: 190,
+            width: 320,
+            height: 24
+        }
+    )
+    .is_none());
+    // Too narrow to hold a row beside the 16px gutter.
+    assert!(List::new(
+        surface,
+        Rect {
+            x: 0,
+            y: 0,
+            width: 16,
+            height: 24
+        }
+    )
+    .is_none());
+    // Shorter than one row.
+    assert!(List::new(
+        surface,
+        Rect {
+            x: 0,
+            y: 0,
+            width: 320,
+            height: 23
+        }
+    )
+    .is_none());
+    // The minimum that holds: one row and a cell beside the gutter.
+    assert!(List::new(
+        surface,
+        Rect {
+            x: 0,
+            y: 0,
+            width: 17,
+            height: 24
+        }
+    )
+    .is_some());
+}
+
+#[test]
+fn reveal_clamps_a_stale_first_and_a_selection_past_the_end() {
+    let surface = surface(320, 200, 1);
+    let list = List::new(
+        surface,
+        Rect {
+            x: 0,
+            y: 0,
+            width: 320,
+            height: 120,
+        },
+    )
+    .unwrap();
+    assert_eq!(list.rows(), 5);
+    // Fewer items than rows: the window stays at the top.
+    assert_eq!(list.reveal(3, 2, 0), 0);
+    // A first past the last page is clamped before the selection check.
+    assert_eq!(list.reveal(20, 17, 99), 15);
+    // A selection past the end is clamped to the last item.
+    assert_eq!(list.reveal(20, 99, 0), 15);
+}
+
+#[test]
+fn the_scrollbar_disables_when_nothing_scrolls() {
+    let surface = surface(320, 200, 1);
+    let list = List::new(
+        surface,
+        Rect {
+            x: 0,
+            y: 0,
+            width: 320,
+            height: 120,
+        },
+    )
+    .unwrap();
+    assert_eq!(list.rows(), 5);
+    // Fewer items than rows, and none at all, both disable the bar.
+    assert!(!list.scrollbar(5, 0).enabled());
+    assert!(!list.scrollbar(0, 0).enabled());
+    // More items than rows enables it.
+    assert!(list.scrollbar(6, 0).enabled());
 }
