@@ -1,0 +1,192 @@
+#![forbid(unsafe_code)]
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+//! Source-level contracts the compiler cannot express: the crate's file
+//! inventory, that it forbids `unsafe` and declares no dependency, that its
+//! pure modules reach no file, environment, clock, network or process, and
+//! the budgets DESIGN.md names, by value.
+
+use std::collections::BTreeSet;
+use std::path::Path;
+
+fn root() -> &'static Path {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+}
+
+fn read(relative: &str) -> String {
+    std::fs::read_to_string(root().join(relative)).unwrap_or_else(|e| panic!("{relative}: {e}"))
+}
+
+fn names(dir: &str, extension: &str) -> BTreeSet<String> {
+    std::fs::read_dir(root().join(dir))
+        .unwrap()
+        .map(|e| e.unwrap())
+        .filter(|e| e.path().extension().is_some_and(|x| x == extension))
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect()
+}
+
+const PURE: &[&str] = &[
+    "camera.rs",
+    "color.rs",
+    "develop.rs",
+    "image.rs",
+    "nef.rs",
+    "tiff.rs",
+];
+
+#[test]
+fn source_inventory_is_closed() {
+    assert!(!root().join("build.rs").exists(), "no build script");
+    let expected: BTreeSet<String> = PURE
+        .iter()
+        .chain(["lib.rs", "main.rs"].iter())
+        .map(|s| s.to_string())
+        .collect();
+    assert_eq!(names("src", "rs"), expected);
+    let tests: BTreeSet<String> = ["confinement.rs", "develop.rs", "nef.rs"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    assert_eq!(names("tests", "rs"), tests);
+    let fixtures: BTreeSet<String> = ["README.md", "nikon_ref.py", "z8-rows.bin"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    let actual: BTreeSet<String> = std::fs::read_dir(root().join("tests/fixtures"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(actual, fixtures);
+}
+
+#[test]
+fn the_crate_forbids_unsafe_and_includes_nothing() {
+    assert!(read("src/lib.rs").starts_with("#![forbid(unsafe_code)]"));
+    assert!(read("src/main.rs").starts_with("#![forbid(unsafe_code)]"));
+    for name in PURE.iter().chain(["lib.rs", "main.rs"].iter()) {
+        let text = read(&format!("src/{name}")).replace("#![forbid(unsafe_code)]", "");
+        assert!(!text.contains("unsafe"), "{name} names unsafe");
+        assert!(!text.contains("include!"), "{name} uses include!");
+        assert!(!text.contains("include_bytes!"), "{name} embeds bytes");
+        assert!(!text.contains("include_str!"), "{name} embeds text");
+        assert!(!text.contains("cfg_attr"), "{name} uses cfg_attr");
+    }
+}
+
+#[test]
+fn the_manifest_declares_no_dependency_and_joins_the_gate() {
+    let manifest = read("Cargo.toml");
+    assert!(manifest.contains("[workspace]\n"), "own workspace root");
+    assert!(!manifest.contains("[dependencies]"), "no dependency yet");
+    assert!(!manifest.contains("[dev-dependencies]"));
+    assert!(!manifest.contains("[build-dependencies]"));
+    assert!(!manifest.contains("[target"));
+    assert!(!manifest.contains("[patch"));
+    assert!(!manifest.contains("[replace"));
+    assert!(manifest.contains("[package.metadata.td-gate]\nclippy-all-targets = true\n"));
+    for lint in [
+        "unwrap_used",
+        "expect_used",
+        "panic",
+        "unreachable",
+        "todo",
+        "unimplemented",
+        "indexing_slicing",
+    ] {
+        assert!(manifest.contains(&format!("{lint} = \"deny\"")), "{lint}");
+    }
+    let lock = read("Cargo.lock");
+    assert_eq!(lock.matches("[[package]]").count(), 1);
+    assert!(lock.contains("name = \"td-photo\""));
+    assert!(!lock.contains("source ="), "no registry or git source");
+    assert!(
+        !root().join(".cargo").exists(),
+        "no crate-local cargo config"
+    );
+    assert_eq!(read(".gitignore"), "/target/\n");
+}
+
+#[test]
+fn pure_modules_reach_no_file_environment_clock_network_or_process() {
+    for name in PURE {
+        let text = read(&format!("src/{name}"));
+        for forbidden in [
+            "std::fs",
+            "std::env",
+            "std::time",
+            "std::net",
+            "std::process",
+            "std::thread::available_parallelism",
+            "File::",
+            "env::var",
+            "Instant::",
+            "SystemTime",
+        ] {
+            assert!(!text.contains(forbidden), "{name} names {forbidden}");
+        }
+    }
+    // `main` is the one module that opens files and reads the clock, and it
+    // bounds the read itself rather than trusting the length it was told.
+    let main = read("src/main.rs");
+    assert!(main.contains("fs::File::open(path)"));
+    assert!(main.contains(".take(ceiling + 1)"));
+    assert!(!main.contains("fs::read("), "an unbounded read");
+    assert!(main.contains("Instant::now"));
+    // Output is created exclusively and nothing existing is replaced.
+    assert!(main.contains(".create_new(true)"));
+    assert!(main.contains("fs::symlink_metadata(out).is_ok()"));
+    assert!(!main.contains("File::create("), "a truncating create");
+    // Publication is a link, which cannot replace; the rename is only the
+    // fallback for a file system without links.
+    assert!(main.contains("fs::hard_link(temporary, out)"));
+    assert_eq!(main.matches("fs::rename(").count(), 1);
+    assert!(!main.contains("println!"), "a panicking print");
+    // Only `develop` spreads work across threads, with scoped threads
+    // that cannot outlive the call.
+    for name in PURE {
+        let text = read(&format!("src/{name}"));
+        let spawns = text.matches("thread::").count();
+        if *name == "develop.rs" {
+            assert!(spawns > 0);
+            assert!(!text.contains("thread::spawn("), "unscoped spawn");
+            assert!(text.contains("thread::scope"));
+        } else {
+            assert_eq!(spawns, 0, "{name} uses threads");
+        }
+    }
+}
+
+#[test]
+fn budgets_are_the_documented_values() {
+    assert_eq!(td_photo::tiff::MAX_FILE_BYTES, 512 << 20);
+    assert_eq!(td_photo::tiff::MAX_IFDS, 64);
+    assert_eq!(td_photo::tiff::MAX_CHAIN, 16);
+    assert_eq!(td_photo::tiff::MAX_ENTRIES, 4096);
+    assert_eq!(td_photo::nef::MAX_AXIS, 16384);
+    assert_eq!(td_photo::image::MAX_AXIS, td_photo::nef::MAX_AXIS);
+    assert_eq!(td_photo::image::MAX_IMAGE_PIXELS, 64 << 20);
+    assert_eq!(td_photo::nef::MAX_RANGE, 32768);
+    assert_eq!(td_photo::nef::MAX_RAW_SAMPLES, 128 << 20);
+    assert_eq!(td_photo::nef::MAX_SUB_IFDS, 16);
+    assert_eq!(td_photo::develop::MAX_THREADS, 16);
+    assert_eq!(td_photo::nef::COMPRESSION_NIKON, 34713);
+    assert_eq!(td_photo::nef::COMPRESSION_NONE, 1);
+    assert_eq!(td_photo::nef::PHOTOMETRIC_CFA, 32803);
+    // The design's table is the one the crate carries.
+    let design = read("DESIGN.md");
+    for line in ["11423 -4564 -1123", "-4816 12895  2119", "-210  1061  7282"] {
+        assert!(design.contains(line), "DESIGN.md matrix row {line}");
+    }
+    assert!(design.contains("black\n1008, white 15892"));
+}
+
+#[test]
+fn the_fixture_is_the_documented_slice() {
+    let bytes = std::fs::read(root().join("tests/fixtures/z8-rows.bin")).unwrap();
+    assert_eq!(bytes.len(), 18192);
+    let readme = read("tests/fixtures/README.md");
+    assert!(readme.contains("0x44df96cc9a8684a0"));
+    assert!(readme.contains("0xe09ae870943b71be"));
+    assert!(readme.contains("18192"));
+}
