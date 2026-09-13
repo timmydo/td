@@ -367,7 +367,6 @@ const TARGET_STATIC_RECIPES: &[(&str, &str)] = &[
     ("td-kexec/src", "recipes/src/recipes/td-kexec.rs"),
     ("td-login/src", "recipes/src/recipes/td-login.rs"),
     ("td-netd/src", "recipes/src/recipes/td-netd.rs"),
-    ("td-portal/src", "recipes/src/recipes/td-portal.rs"),
     ("td-secret/src", "recipes/src/recipes/td-secret.rs"),
     ("recipes/src/fixtures", "recipes/src/recipes/td-secret-vm-test.rs"),
     ("td-profiler/src", "recipes/src/recipes/td-profiler.rs"),
@@ -583,6 +582,23 @@ fn map_path(root: &Path, roster: &Result<Vec<GateCrate>, String>, p: &str, sel: 
     // (builder/recipes/engine); `*` crosses `/`, so this covers target/release/…
     if pattern_matches(".claude/*|.td-build-cache/*|target/*", p) {
         return;
+    }
+
+    // Every file under a td-portal seed tree moves the `td-portal-source`
+    // digest row. `td-portal` builds from `Recipe::rust` with
+    // `local_source_trees(&["td-secret", "td-busd", "td-compositor", "engine"])`,
+    // each staged WHOLE, so a change anywhere in one of those checkouts —
+    // source, spec, tool, doc, or manifest — re-hashes the seed (re #469). The
+    // digest preflight is cheap (a tree copy and a NAR hash, no ladder), so this
+    // AUGMENTS and does not return: the path still reaches its own crate arm
+    // below for cargo-test/check/recipe-checks. `engine/` keeps its existing
+    // per-arm digest routing (it was already a td-net seed tree); `td-seatd/`,
+    // which shares the compositor's crate arm, is NOT a portal seed tree and is
+    // excluded here. The roster of trees is pinned by the recipes catalog test
+    // `local_source_trees_are_staged_by_basename_and_routed_by_the_builder`, so
+    // this literal and that one must agree.
+    if pattern_matches("td-portal/*|td-busd/*|td-compositor/*|td-secret/*", p) {
+        sel.add_preflight("local-source-digests");
     }
 
     if pattern_matches(
@@ -1879,6 +1895,13 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
             }
         };
     }
+    macro_rules! assert_no_preflight {
+        ($path:expr, $preflight:expr) => {
+            if selects_preflight($path, $preflight) {
+                fail(format!("{}: must NOT select preflight '{}'", $path, $preflight));
+            }
+        };
+    }
     macro_rules! assert_no_target {
         ($path:expr, $target:expr) => {
             if has_target($path, $target) {
@@ -2341,6 +2364,20 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     assert_preflight!("td-portal/default-settings.conf", "cargo-test");
     assert_target!("td-portal/Cargo.lock", "check");
     assert_target!("td-portal/Cargo.lock", "recipe-checks");
+    // td-portal builds from `local_source_trees(&["td-secret", "td-busd",
+    // "td-compositor", "engine"])`, each staged whole, so a change anywhere in
+    // the portal tree or in a sibling seed tree moves the `td-portal-source`
+    // digest row and must reach the digest preflight — source, manifest, and
+    // documentation alike (engine already carries its own rows above). td-seatd
+    // shares the compositor's crate arm but is NOT a portal seed tree, so its
+    // edits must NOT select the digest preflight.
+    assert_preflight!("td-portal/src/main.rs", "local-source-digests");
+    assert_preflight!("td-portal/Cargo.lock", "local-source-digests");
+    assert_preflight!("td-busd/src/wire.rs", "local-source-digests");
+    assert_preflight!("td-compositor/src/font.rs", "local-source-digests");
+    assert_preflight!("td-compositor/DESIGN.md", "local-source-digests");
+    assert_preflight!("td-secret/src/sys.rs", "local-source-digests");
+    assert_no_preflight!("td-seatd/src/main.rs", "local-source-digests");
     assert_preflight!("td-audio/src/main.rs", "cargo-test");
     assert_preflight!("td-audio/src/sys.rs", "cargo-test");
     assert_preflight!("td-audio/src/pcm.rs", "cargo-test");

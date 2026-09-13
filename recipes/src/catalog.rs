@@ -184,7 +184,6 @@ mod tests {
             "td-mail",
             "td-netd",
             "td-news",
-            "td-portal",
             "td-profiler",
             "td-seatd",
             "td-secret",
@@ -398,7 +397,10 @@ mod tests {
         }
         trees.sort_unstable();
         trees.dedup();
-        assert_eq!(trees, ["engine", "net", "td-boot"]);
+        assert_eq!(
+            trees,
+            ["engine", "net", "td-boot", "td-busd", "td-compositor", "td-portal", "td-secret"]
+        );
         lone.sort_unstable();
         lone.dedup();
         assert_eq!(
@@ -547,16 +549,30 @@ mod tests {
 mod named_dirs_tests {
     use super::*;
 
-    /// The table carries the embeds the tree has: td-portal builds out of
-    /// td-compositor and td-busd, and every recipe may reach td-boot's
-    /// protocol through the crate's shared module. Each list is sorted, names
-    /// only `td-*` directories, and an unknown stem has none.
+    /// The table carries the `td-*` dirs each recipe file spells with a slash,
+    /// plus what the crate's shared modules embed. td-portal's own file now
+    /// names only td-portal (its lock, and the source lines its tests read) and
+    /// td-authd (the download-grant parity test's `include_str!`); its build
+    /// siblings move to `local_source_trees`, routed by the digest preflight, so
+    /// td-compositor and td-secret leave the embed scan. td-busd stays, but not
+    /// because td-portal names it: a shared module (lib.rs) embeds
+    /// td-busd/src/app_policy.rs, so every recipe carries it, td-boot and
+    /// td-profiler alike. Each list is sorted, names only `td-*` directories,
+    /// and an unknown stem has none.
     #[test]
     fn named_dirs_carry_the_embeds_the_recipes_spell() {
         let portal = named_dirs("td-portal");
-        for dir in ["td-busd", "td-compositor", "td-portal"] {
+        for dir in ["td-authd", "td-portal"] {
             assert!(portal.contains(&dir), "td-portal: {portal:?}");
         }
+        // td-compositor and td-secret were named ONLY by the recipe's former
+        // `include_str!` vendoring; staging them as local_source_trees drops
+        // them from the embed scan. td-busd is not checked here: lib.rs embeds
+        // it into every recipe (see the doc comment).
+        for dir in ["td-compositor", "td-secret"] {
+            assert!(!portal.contains(&dir), "td-portal still embeds {dir}: {portal:?}");
+        }
+        assert!(named_dirs("td-sh").contains(&"td-busd"), "lib.rs embeds td-busd everywhere");
         assert!(named_dirs("td-sh").contains(&"td-sh"));
         assert!(!named_dirs("td-sh").contains(&"td-compositor"));
         for (stem, _) in all() {

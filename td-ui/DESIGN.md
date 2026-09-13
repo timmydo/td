@@ -584,3 +584,13 @@ the reader graph, because td-editor's manifest names the crate.
    pixels equal the crate's own `preview` of that surface. Landed.
 7. td-portal: the file chooser on td-ui, its private handshake and second
    rasterizer deleted, and its recipe converted to stage sibling trees.
+   (a) The recipe becomes a generic `Recipe::rust` cargo build that stages
+   td-portal beside the sibling trees its `#[path]` modules name — td-secret,
+   td-busd, td-compositor, and (through td-secret's sha256) engine — the same
+   shape td-net uses, so (c) can add the toolkit by naming one more tree. The
+   static-shape and selftest proofs the hand-rolled recipe ran inline move to
+   a td-portal-test companion, the split td-ui-test makes for the compositor.
+   Landed. (b) The second private Wayland client and its runtime marker
+   retired. (c) The file chooser's render on td-ui's raster and chrome bands,
+   its own rasterizer deleted. (d) Its transport a td-ui `App`, the private
+   dialog client deleted, under the native compositor harness.

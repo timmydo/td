@@ -1,229 +1,44 @@
-use crate::ladder::{split_target_debug, target_rustc};
-use crate::types::{Recipe, Step};
+use crate::types::Recipe;
 
 #[cfg(test)]
 use crate::ladder::TD_JAIL_FIXTURE_DOWNLOAD_TARGET;
 #[cfg(test)]
 const SYSTEM_X86_64_RS: &str = include_str!("system-x86-64.rs");
-
+#[cfg(test)]
 const MAIN_RS: &str = include_str!("../../../td-portal/src/main.rs");
-const FILE_CHOOSER_RS: &str = include_str!("../../../td-portal/src/file_chooser.rs");
-const HANDLES_RS: &str = include_str!("../../../td-portal/src/handles.rs");
-const SETTINGS_RS: &str = include_str!("../../../td-portal/src/settings.rs");
-const SYS_RS: &str = include_str!("../../../td-secret/src/sys.rs");
+#[cfg(test)]
 const WAYLAND_CHANNEL_RS: &str = include_str!("../../../td-portal/src/wayland_channel.rs");
-const WAYLAND_DIALOG_RS: &str = include_str!("../../../td-portal/src/wayland_dialog.rs");
-const COMPOSITOR_WIRE_RS: &str = include_str!("../../../td-compositor/src/wire.rs");
-const COMPOSITOR_FILTER_RS: &str = include_str!("../../../td-compositor/src/filter.rs");
-const COMPOSITOR_FONT_RS: &str = include_str!("../../../td-compositor/src/font.rs");
-const COMPOSITOR_FONT_DATA_RS: &str = include_str!("../../../td-compositor/src/font_data.rs");
-const COMPOSITOR_KEYBOARD_RS: &str = include_str!("../../../td-compositor/src/keyboard.rs");
-const DEFAULT_SETTINGS: &str = include_str!("../../../td-portal/default-settings.conf");
-const SHARED_DBUS: &[(&str, &str)] = &[
-    ("{src}/td-busd/src/app_policy.rs", include_str!("../../../td-busd/src/app_policy.rs")),
-    (
-        "{src}/td-busd/src/message.rs",
-        include_str!("../../../td-busd/src/message.rs"),
-    ),
-    (
-        "{src}/td-busd/src/name.rs",
-        include_str!("../../../td-busd/src/name.rs"),
-    ),
-    (
-        "{src}/td-busd/src/wire.rs",
-        include_str!("../../../td-busd/src/wire.rs"),
-    ),
-];
 
+/// td-portal, the supervised desktop portal service, built as a TARGET recipe
+/// from the checkout's own trees. Its `main.rs` reaches the broker codec, the
+/// token-protected secret store, the compositor's wire/keyboard/font modules,
+/// and the engine's sha256 by relative `#[path]`, so those sibling trees are
+/// staged beside it and cargo compiles exactly what the crate names. The lock
+/// is the crate's own committed one — td-portal declares no external crate —
+/// and the binary is linked fully static, as every td-owned program on the
+/// image, so the system tree's `/bin/td-portal` needs no loader.
+///
+/// The former hand-rolled rustc recipe vendored those modules file by file
+/// with `include_str!`; this stages the sibling trees whole, the same shape
+/// td-net uses, so 7c can add the shared UI toolkit to the roster by naming
+/// one more tree. The shipped binary's static-shape assertion and target-side
+/// selftest, which the hand-rolled recipe ran inline, move to the td-portal-test
+/// companion recipe, the same split td-ui-test makes for the compositor.
 pub fn recipe() -> Recipe {
-    let rustc = "{in:rust-toolchain}/bin/rustc";
-    let gcc = "{in:gcc-x86-64-self}/stage/td/store/gcc-14.3.0-x86_64-self/bin/gcc";
-    let gccbin = "{in:gcc-x86-64-self}/stage/td/store/gcc-14.3.0-x86_64-self/bin";
-    let bbin = "{in:binutils-x86-64-self}/bin";
-    let glib = "{in:glibc-x86-64}/stage/td/store/glibc-2.41-x86_64/lib";
-    let objcopy = "{in:binutils-x86-64-self}/bin/objcopy";
-    let ranlib = "{in:binutils-x86-64-self}/bin/ranlib";
-    let libgcc_a = "{in:gcc-x86-64-self}/stage/td/store/gcc-14.3.0-x86_64-self/lib/gcc/x86_64-pc-linux-gnu/14.3.0/libgcc.a";
-    let linker = format!("-Clinker={gcc}");
-    let lib_b = format!("-Clink-arg=-B{glib}");
-    let bin_b = format!("-Clink-arg=-B{bbin}");
-    let path = format!("{bbin}:{gccbin}");
-
-    let mut steps = vec![
-        Step::MkDir {
-            path: "{out}/bin".into(),
-        },
-        Step::MkDir {
-            path: "{src}/td-portal/src".into(),
-        },
-        Step::MkDir {
-            path: "{src}/td-busd/src".into(),
-        },
-        Step::MkDir {
-            path: "{src}/td-compositor/src".into(),
-        },
-        Step::WriteFile {
-            path: "{src}/td-portal/src/main.rs".into(),
-            content: MAIN_RS.into(),
-            exec: false,
-        },
-        Step::WriteFile {
-            path: "{src}/td-portal/src/file_chooser.rs".into(),
-            content: FILE_CHOOSER_RS.into(),
-            exec: false,
-        },
-        Step::WriteFile {
-            path: "{src}/td-portal/src/handles.rs".into(),
-            content: HANDLES_RS.into(),
-            exec: false,
-        },
-        Step::WriteFile {
-            path: "{src}/td-portal/src/settings.rs".into(),
-            content: SETTINGS_RS.into(),
-            exec: false,
-        },
-        Step::WriteFile {
-            path: "{src}/td-secret/src/sys.rs".into(),
-            content: SYS_RS.into(),
-            exec: false,
-        },
-        Step::WriteFile {
-            path: "{src}/td-portal/src/wayland_channel.rs".into(),
-            content: WAYLAND_CHANNEL_RS.into(),
-            exec: false,
-        },
-        Step::WriteFile {
-            path: "{src}/td-portal/src/wayland_dialog.rs".into(),
-            content: WAYLAND_DIALOG_RS.into(),
-            exec: false,
-        },
-        Step::WriteFile {
-            path: "{src}/td-compositor/src/wire.rs".into(),
-            content: COMPOSITOR_WIRE_RS.into(),
-            exec: false,
-        },
-        Step::WriteFile {
-            path: "{src}/td-compositor/src/filter.rs".into(),
-            content: COMPOSITOR_FILTER_RS.into(),
-            exec: false,
-        },
-        Step::WriteFile {
-            path: "{src}/td-compositor/src/font.rs".into(),
-            content: COMPOSITOR_FONT_RS.into(),
-            exec: false,
-        },
-        Step::WriteFile {
-            path: "{src}/td-compositor/src/font_data.rs".into(),
-            content: COMPOSITOR_FONT_DATA_RS.into(),
-            exec: false,
-        },
-        Step::WriteFile {
-            path: "{src}/td-compositor/src/keyboard.rs".into(),
-            content: COMPOSITOR_KEYBOARD_RS.into(),
-            exec: false,
-        },
-        Step::WriteFile {
-            path: "{src}/td-portal/default-settings.conf".into(),
-            content: DEFAULT_SETTINGS.into(),
-            exec: false,
-        },
-    ];
-    for (staged_path, source) in SHARED_DBUS {
-        steps.push(Step::WriteFile {
-            path: (*staged_path).into(),
-            content: (*source).into(),
-            exec: false,
-        });
-    }
-    for directory in ["{src}/td-secret/src", "{src}/engine/src"] {
-        steps.push(Step::MkDir {
-            path: directory.into(),
-        });
-    }
-
-    for (path, source) in [
-        ("{src}/td-secret/src/fido_cbor.rs", include_str!("../../../td-secret/src/fido_cbor.rs")),
-        ("{src}/td-secret/src/fido_ctap.rs", include_str!("../../../td-secret/src/fido_ctap.rs")),
-        ("{src}/td-secret/src/fido_enroll.rs", include_str!("../../../td-secret/src/fido_enroll.rs")),
-        ("{src}/td-secret/src/fido_hid.rs", include_str!("../../../td-secret/src/fido_hid.rs")),
-        ("{src}/td-secret/src/fido_metadata.rs", include_str!("../../../td-secret/src/fido_metadata.rs")),
-        ("{src}/td-secret/src/tpm.rs", include_str!("../../../td-secret/src/tpm.rs")),
-        (
-            "{src}/td-portal/src/secret.rs",
-            include_str!("../../../td-portal/src/secret.rs"),
-        ),
-        (
-            "{src}/td-secret/src/crypto.rs",
-            include_str!("../../../td-secret/src/crypto.rs"),
-        ),
-        (
-            "{src}/td-secret/src/store.rs",
-            include_str!("../../../td-secret/src/store.rs"),
-        ),
-        (
-            "{src}/engine/src/sha256.rs",
-            include_str!("../../../engine/src/sha256.rs"),
-        ),
-    ] {
-        steps.push(Step::WriteFile {
-            path: path.into(),
-            content: source.into(),
-            exec: false,
-        });
-    }
-    steps.extend([
-        Step::MkDir {
-            path: "{root}/eh".into(),
-        },
-        Step::run("{root}", &[objcopy, libgcc_a, "{root}/eh/libgcc_eh.a"]).env("PATH", &path),
-        Step::run("{root}", &[ranlib, "{root}/eh/libgcc_eh.a"]).env("PATH", &path),
-        target_rustc(
-            "{src}/td-portal/src",
-            rustc,
-            &[
-                "--edition",
-                "2021",
-                "-C",
-                "opt-level=s",
-                "--target",
-                "x86_64-unknown-linux-gnu",
-                "-C",
-                "target-feature=+crt-static",
-                "-C",
-                "relocation-model=static",
-                "-C",
-                "panic=abort",
-                &linker,
-                "-L",
-                glib,
-                &lib_b,
-                &bin_b,
-                "-Clink-arg=-L{root}/eh",
-                "-Clink-arg=-static-libgcc",
-                "-o",
-                "{out}/bin/td-portal",
-                "{src}/td-portal/src/main.rs",
-            ],
-        )
-        .env("PATH", &path)
-        .env("SOURCE_DATE_EPOCH", "1"),
-        Step::Require {
-            paths: vec!["{out}/bin/td-portal".into()],
-            exec: true,
-        },
-        Step::run("{out}", &["{out}/bin/td-portal", "selftest"]),
-        split_target_debug("{out}"),
-        Step::assert_static(&["{out}/bin/td-portal"]),
-    ]);
-
-    Recipe::mesboot("td-portal", "0.1")
+    Recipe::rust("td-portal", "0.1.0")
+        .local_source("td-portal")
+        .local_source_trees(&["td-secret", "td-busd", "td-compositor", "engine"])
         .native_inputs(&[
             "rust-toolchain",
             "gcc-x86-64-self",
             "binutils-x86-64-self",
             "glibc-x86-64",
+            "busybox-x86-64",
         ])
-        .steps(steps)
+        .cargo_subdir("td-portal")
+        .cargo_lock("td-portal/Cargo.lock")
+        .static_link()
+        .bins(&["td-portal"])
 }
 
 #[cfg(test)]
@@ -235,102 +50,30 @@ mod tests {
     };
 
     #[test]
-    fn recipe_stages_the_portal_and_the_canonical_broker_codec() {
-        let steps = recipe().steps.expect("td-portal steps");
-        for (path, source) in [
-            ("{src}/td-portal/src/main.rs", MAIN_RS),
-            ("{src}/td-portal/src/file_chooser.rs", FILE_CHOOSER_RS),
-            ("{src}/td-portal/src/handles.rs", HANDLES_RS),
-            ("{src}/td-portal/src/settings.rs", SETTINGS_RS),
-            ("{src}/td-secret/src/sys.rs", SYS_RS),
-            ("{src}/td-portal/src/wayland_channel.rs", WAYLAND_CHANNEL_RS),
-            ("{src}/td-portal/src/wayland_dialog.rs", WAYLAND_DIALOG_RS),
-            ("{src}/td-compositor/src/wire.rs", COMPOSITOR_WIRE_RS),
-            ("{src}/td-compositor/src/filter.rs", COMPOSITOR_FILTER_RS),
-            ("{src}/td-compositor/src/font.rs", COMPOSITOR_FONT_RS),
-            (
-                "{src}/td-compositor/src/font_data.rs",
-                COMPOSITOR_FONT_DATA_RS,
-            ),
-            (
-                "{src}/td-compositor/src/keyboard.rs",
-                COMPOSITOR_KEYBOARD_RS,
-            ),
-            ("{src}/td-portal/default-settings.conf", DEFAULT_SETTINGS),
-        ] {
-            assert!(steps.iter().any(|step| {
-                matches!(step, Step::WriteFile { path: got, content, .. }
-                    if got == path && content == source)
-            }));
-        }
-        for (path, source) in SHARED_DBUS {
-            assert!(steps.iter().any(|step| {
-                matches!(step, Step::WriteFile { path: got, content, .. }
-                    if got == path && content == *source)
-            }));
-        }
+    fn td_portal_is_built_from_the_checkout_with_its_siblings_staged() {
+        let recipe = recipe();
+        assert_eq!(recipe.source_input.as_deref(), Some("td-portal-source"));
+        assert_eq!(recipe.local_source.as_deref(), Some("td-portal"));
+        assert_eq!(
+            recipe.local_source_trees,
+            Some(vec![
+                "td-secret".to_string(),
+                "td-busd".to_string(),
+                "td-compositor".to_string(),
+                "engine".to_string(),
+            ])
+        );
+        assert_eq!(recipe.cargo_subdir.as_deref(), Some("td-portal"));
+        assert_eq!(recipe.cargo_lock.as_deref(), Some("td-portal/Cargo.lock"));
+        assert_eq!(recipe.bins, Some(vec!["td-portal".to_string()]));
+        assert_eq!(recipe.static_link, Some(true));
+        // No fetch pin: the bytes are the committed trees, pinned by the
+        // compiled seed-digest table.
+        assert!(crate::source_pins::by_key("td-portal-source").is_none());
     }
 
     #[test]
-    fn every_declared_portal_module_is_staged() {
-        let declared = MAIN_RS.lines().filter_map(|line| {
-            let line = line.trim();
-            line.strip_prefix("mod ")
-                .and_then(|tail| tail.strip_suffix(';'))
-        });
-        let steps = recipe().steps.expect("td-portal steps");
-        let staged: Vec<&str> = steps
-            .iter()
-            .filter_map(|step| match step {
-                Step::WriteFile { path, .. } => path
-                    .rsplit('/')
-                    .next()
-                    .and_then(|path| path.strip_suffix(".rs")),
-                _ => None,
-            })
-            .collect();
-        for module in declared {
-            if matches!(
-                module,
-                "sys"
-                    | "tpm"
-                    | "secret_store"
-                    | "wayland_wire"
-                    | "font"
-                    | "font_data"
-                    | "keyboard"
-                    | "list_filter"
-            ) {
-                let path = match module {
-                    "sys" => "../../td-secret/src/sys.rs",
-                    "tpm" => "../../td-secret/src/tpm.rs",
-                    "secret_store" => "../../td-secret/src/store.rs",
-                    "wayland_wire" => "../../td-compositor/src/wire.rs",
-                    "font" => "../../td-compositor/src/font.rs",
-                    "font_data" => "../../td-compositor/src/font_data.rs",
-                    "keyboard" => "../../td-compositor/src/keyboard.rs",
-                    "list_filter" => "../../td-compositor/src/filter.rs",
-                    _ => "",
-                };
-                assert!(MAIN_RS.contains(&format!("#[path = \"{path}\"]")));
-                assert!(MAIN_RS.contains(&format!("mod {module};")));
-                continue;
-            }
-            assert!(staged.contains(&module), "module {module} is not staged");
-        }
-    }
-
-    #[test]
-    fn target_selftest_and_static_assertion_cover_the_shipped_binary() {
-        let steps = recipe().steps.expect("td-portal steps");
-        assert!(steps.iter().any(|step| {
-            matches!(step, Step::Run { argv, .. }
-                if argv == &vec!["{out}/bin/td-portal".to_string(), "selftest".to_string()])
-        }));
-        assert!(steps.iter().any(|step| {
-            matches!(step, Step::AssertStatic { paths }
-                if paths == &vec!["{out}/bin/td-portal".to_string()])
-        }));
+    fn the_shipped_binary_prints_the_runtime_evidence_the_qemu_scanner_greps() {
         assert!(
             MAIN_RS.contains(&format!(
                 "pub const READY_MARKER: &str = \"{TD_PORTAL_RUNTIME_MARKER}\";"
