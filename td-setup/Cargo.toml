@@ -1,0 +1,28 @@
+[package]
+name = "td-setup"
+version = "0.1.0"
+edition = "2021"
+description = "The offline graphical installer front end: the installation wizard's pages, rendered over the shared td-ui toolkit"
+license = "GPL-3.0-or-later"
+
+# Own workspace root, so cargo behaves the same from the main checkout as from
+# a worktree nested under it (see the root Cargo.toml).
+[workspace]
+
+# The shared UI toolkit, by the one sibling-dependency spelling the lock guard
+# admits (AGENTS.md 'Rust code'): the raster, the chrome bands and the client
+# reach this crate only through `td_ui::`.
+[dependencies]
+td-ui = { path = "../td-ui" }
+
+[package.metadata.td-gate]
+clippy-all-targets = true
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+unreachable = "deny"
+todo = "deny"
+unimplemented = "deny"
+indexing_slicing = "deny"

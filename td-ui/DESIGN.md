@@ -13,9 +13,10 @@ and its panel, the wrapped text block, the tab strip and the status row)
 that td-editor draws, the paged list `List` built on the panel's row
 painter and the single-line text entry `TextEntry`, the new widgets no
 scene drew. td-editor is its first consumer; the installer front end
-`td-setup` and td-portal's file chooser follow. This document is the
-component contract and the starting point for successive agents; the root
-`AGENTS.md` and `DEVELOPMENT.md` still govern changes and submission.
+`td-setup` (its welcome page landed) and td-portal's file chooser follow.
+This document is the component contract and the starting point for
+successive agents; the root `AGENTS.md` and `DEVELOPMENT.md` still govern
+changes and submission.
 
 ## Status and scope
 
@@ -52,9 +53,12 @@ it owns the 8x16 cell constants every consumer lays text out on. td-editor
 depends on it by path and uses those modules through the crate's public
 surface.
 
-Not yet moved: the second and third consumers, `td-setup` and td-portal.
-The increments below schedule them. td-editor's window is the first
-`App`; it owns no Wayland objects of its own.
+Newly built: `td-setup`, the second consumer, is a new crate with its
+`welcome` page rendered from the toolkit (increment 6(a)); its Wayland turn
+loop and native compositor test follow. Not yet moved: td-portal's file
+chooser, the third consumer, still on its own rasterizer. The increments
+below schedule the rest. td-editor's window is the first `App`; it owns no
+Wayland objects of its own.
 
 ## Purpose and trust position
 
@@ -565,7 +569,15 @@ the reader graph, because td-editor's manifest names the crate.
    placeholder, right-scrolling window and a masked mode a consumer
    applies under its own trust rules, for the second and third
    consumers, with a draw-stream and a pixel oracle. Landed.
-6. `td-setup`: the installer front end's first page as the second consumer,
-   under the native compositor harness shared from td-editor's tests.
+6. `td-setup`: the installer front end's first page as the second
+   consumer, in two landings. (a) The crate, and its `welcome` page built
+   from the raster and the chrome bands: a chrome ground, a heading over a
+   hairline rule, the wrapped disclosure prose in a `Block` and a `Status`
+   footer, disclosing that storage is unencrypted and the account signs in
+   automatically with no password or PIN field, per
+   td-install/INSTALLER.md; the prose is word-wrapped in the crate, with
+   draw-stream and pixel oracles and no live compositor. Landed. (b) The
+   Wayland turn loop making it a live `App`, under the native compositor
+   harness shared from td-editor's tests.
 7. td-portal: the file chooser on td-ui, its private handshake and second
    rasterizer deleted, and its recipe converted to stage sibling trees.

@@ -1426,6 +1426,17 @@ fn map_path(root: &Path, roster: &Result<Vec<GateCrate>, String>, p: &str, sel: 
         return;
     }
 
+    // td-setup, the installer front end, is a td-ui consumer with no recipe
+    // consumer yet, so the same arm as the editor and td-ui: the host
+    // preflight covers its own lock/test/clippy obligations, and the cargo
+    // narrowing carries the change to every crate whose manifest names it
+    // (nobody yet). Packaging the installer replaces this arm with
+    // target-artifact coverage.
+    if p.starts_with("td-setup/") && !p.contains("..") {
+        sel.add_preflight("cargo-test");
+        return;
+    }
+
     // td-init: the target-built static boot-glue multicall (init/reboot/poweroff/
     // halt/switch_root/cttyhack/hostname), a standalone std-only crate OUTSIDE the
     // engine workspace — same routing as td-util, which it complements. Its unit
@@ -5033,6 +5044,7 @@ mod tests {
                 "td-portal",
                 "td-seatd",
                 "td-secret",
+                "td-setup",
                 "td-ui",
                 "td-vm",
                 "td-vm-guest"
@@ -7089,6 +7101,11 @@ mod tests {
         let sh = one("td-sh/src/main.rs");
         assert_eq!(sh.len(), 4, "{sh:?}");
         assert_eq!(names(&sh), ["td-sh"]);
+        // td-setup, the installer front end: read by nobody, so its own
+        // commands and the workspace suite, like any leaf crate.
+        let setup = one("td-setup/src/welcome.rs");
+        assert_eq!(setup.len(), 4, "{setup:?}");
+        assert_eq!(names(&setup), ["td-setup"]);
         // A crate others read brings its readers: td-portal and td-editor build
         // modules out of td-compositor sources, so a change there is a change
         // to what they compile; td-busd is read by three.
@@ -7104,12 +7121,13 @@ mod tests {
                 "td-portal",
                 "td-seatd",
                 "td-secret",
+                "td-setup",
                 "td-ui",
                 "td-vm",
                 "td-vm-guest"
             ]
         );
-        assert_eq!(comp.len(), 25, "{comp:?}");
+        assert_eq!(comp.len(), 27, "{comp:?}");
         // Runtime td-vm/ spellings conservatively connect the same reader set.
         assert_eq!(vm, comp);
         assert_eq!(
@@ -7126,6 +7144,7 @@ mod tests {
                 "td-portal",
                 "td-seatd",
                 "td-secret",
+                "td-setup",
                 "td-ui",
                 "td-vm",
                 "td-vm-guest"
@@ -7231,13 +7250,18 @@ mod tests {
             let toolkit = [path.to_string()];
             assert!(compute_selection(&root, &toolkit).targets.is_empty(), "{path}");
             let commands = cargo_test_cmds(&root, &toolkit).unwrap();
-            assert_eq!(commands.len(), 7, "{path}: {commands:?}");
+            // td-editor and td-setup both name td-ui by path, so a change to
+            // the toolkit carries both consumers' commands beside the
+            // workspace suite.
+            assert_eq!(commands.len(), 9, "{path}: {commands:?}");
             assert!(commands.iter().all(|c| {
                 c.contains("--workspace")
                     || c.contains("--manifest-path td-ui/Cargo.toml")
                     || c.contains("--manifest-path td-editor/Cargo.toml")
+                    || c.contains("--manifest-path td-setup/Cargo.toml")
             }));
             assert!(commands.iter().any(|c| c.contains("--manifest-path td-editor/Cargo.toml")));
+            assert!(commands.iter().any(|c| c.contains("--manifest-path td-setup/Cargo.toml")));
         }
         for path in [
             "td-editor-extra/src/main.rs",
