@@ -2,7 +2,6 @@
 
 use crate::file_chooser::{self, Action, Chooser, FileFilter, Mode, Outcome};
 use crate::keyboard::{MOD_ALT, MOD_CAPS, MOD_CONTROL, MOD_LOGO, MOD_SHIFT, XKB_KEYMAP};
-use crate::wayland_channel::EXPECTED_GLOBALS;
 use crate::{sys, wayland_wire as wire};
 use std::collections::{BTreeSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
@@ -15,6 +14,24 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 use std::thread;
 use std::time::{Duration, Instant};
+
+/// The private portal registry the compositor advertises, in the exact order
+/// and version the dialog binds: ten desktop interfaces plus the single
+/// privileged `td_portal_manager_v1`. Relocated here when the standalone
+/// channel probe was retired; the dialog is now its sole owner.
+const EXPECTED_GLOBALS: [(&str, u32); 11] = [
+    ("wl_compositor", 4),
+    ("wl_subcompositor", 1),
+    ("wl_shm", 1),
+    ("wl_output", 4),
+    ("xdg_wm_base", 1),
+    ("zxdg_decoration_manager_v1", 1),
+    ("wl_data_device_manager", 3),
+    ("zxdg_exporter_v2", 1),
+    ("zxdg_importer_v2", 1),
+    ("wl_seat", 7),
+    ("td_portal_manager_v1", 1),
+];
 
 const DISPLAY: u32 = 1;
 const REGISTRY: u32 = 2;

@@ -69,7 +69,6 @@ mod tpm;
 mod settings;
 #[path = "../../td-secret/src/sys.rs"]
 mod sys;
-mod wayland_channel;
 mod wayland_dialog;
 #[path = "../../td-compositor/src/wire.rs"]
 #[allow(
@@ -275,22 +274,8 @@ const SESSION_INTROSPECTION_XML: &str = r#"<node>
 fn usage() -> String {
     "usage: td-portal supervise --bus PATH --settings PATH | \
      td-portal run --bus PATH --settings PATH --activation-token TOKEN | \
-     td-portal probe --bus PATH --settings PATH | \
-     td-portal channel-probe --wayland PATH | td-portal selftest"
+     td-portal probe --bus PATH --settings PATH | td-portal selftest"
         .into()
-}
-
-fn parse_channel_path(args: &[String]) -> Result<PathBuf, String> {
-    match args {
-        [flag, value] if flag == "--wayland" => {
-            let path = PathBuf::from(value);
-            if !path.is_absolute() {
-                return Err("private portal Wayland socket path must be absolute".into());
-            }
-            Ok(path)
-        }
-        _ => Err(usage()),
-    }
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -3594,12 +3579,6 @@ fn run_main(args: &[String]) -> Result<(), String> {
         "supervise" => supervise(&parse_paths(args.get(1..).ok_or_else(usage)?, false)?),
         "run" => run(&parse_paths(args.get(1..).ok_or_else(usage)?, true)?),
         "probe" => probe(&parse_paths(args.get(1..).ok_or_else(usage)?, false)?),
-        "channel-probe" => {
-            let path = parse_channel_path(args.get(1..).ok_or_else(usage)?)?;
-            wayland_channel::probe(&path)?;
-            println!("{}", wayland_channel::ready_marker());
-            Ok(())
-        }
         "selftest" if args.get(1).is_none() => selftest(),
         _ => Err(usage()),
     }
@@ -3624,7 +3603,6 @@ mod confinement {
         ("settings.rs", include_str!("settings.rs")),
         ("secret.rs", include_str!("secret.rs")),
         ("sys.rs", include_str!("../../td-secret/src/sys.rs")),
-        ("wayland_channel.rs", include_str!("wayland_channel.rs")),
         ("wayland_dialog.rs", include_str!("wayland_dialog.rs")),
         ("app_policy.rs", include_str!("../../td-busd/src/app_policy.rs")),
     ];
@@ -3892,7 +3870,7 @@ mod tests {
     }
 
     #[test]
-    fn the_four_commands_have_closed_flag_grammars() {
+    fn the_three_commands_have_closed_flag_grammars() {
         let base = strings(&[
             "--bus",
             "/run/user/1000/bus",
@@ -3920,21 +3898,6 @@ mod tests {
             strings(&["--bus", "/run/bus", "--settings", "/etc/x", "--extra", "x"]),
         ] {
             assert!(parse_paths(&bad, false).is_err(), "accepted {bad:?}");
-        }
-        assert_eq!(
-            parse_channel_path(&strings(&[
-                "--wayland",
-                "/run/td-compositor/1000/td-portal-wayland-0"
-            ])),
-            Ok(PathBuf::from("/run/td-compositor/1000/td-portal-wayland-0"))
-        );
-        for bad in [
-            strings(&["--wayland", "relative"]),
-            strings(&["--wayland"]),
-            strings(&["--wayland", "/run/portal", "extra"]),
-            strings(&["--wayland", "/run/portal", "--wayland", "/run/other"]),
-        ] {
-            assert!(parse_channel_path(&bad).is_err(), "accepted {bad:?}");
         }
     }
 

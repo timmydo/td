@@ -590,7 +590,10 @@ the reader graph, because td-editor's manifest names the crate.
    shape td-net uses, so (c) can add the toolkit by naming one more tree. The
    static-shape and selftest proofs the hand-rolled recipe ran inline move to
    a td-portal-test companion, the split td-ui-test makes for the compositor.
-   Landed. (b) The second private Wayland client and its runtime marker
-   retired. (c) The file chooser's render on td-ui's raster and chrome bands,
+   Landed. (b) The second private Wayland client — the boot channel probe —
+   and its `TD-PORTAL-CHANNEL-READY` marker, boot-evidence service unit and
+   boot assertion retired; the private registry it pinned moves to the
+   surviving dialog. Landed. (c) The file chooser's render on td-ui's raster
+   and chrome bands,
    its own rasterizer deleted. (d) Its transport a td-ui `App`, the private
    dialog client deleted, under the native compositor harness.

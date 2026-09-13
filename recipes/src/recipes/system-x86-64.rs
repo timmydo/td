@@ -27,7 +27,6 @@ use crate::ladder::{
     TD_FETCH_BOOT_MARKER, TD_JAIL_TRANSITION_MARKER, TD_LOGIN_RUNTIME_MARKER,
     TD_MAIL_BOOT_MARKER,
     TD_MAIL_ENTRY, TD_MAIL_NAME, TD_NEWS_BOOT_MARKER, TD_NEWS_ENTRY, TD_NEWS_NAME,
-    TD_PORTAL_CHANNEL_RUNTIME_MARKER,
     TD_PORTAL_REQUEST_RUNTIME_MARKER, TD_PORTAL_RUNTIME_MARKER,
     TD_PORTAL_UNAVAILABLE_RUNTIME_MARKER, TD_SANDBOX_KERNEL_MARKER, TD_TXT_RUNTIME_MARKER,
     TD_UTIL_RUNTIME_MARKER, UUTILS_RUNTIME_MARKER,
@@ -1240,7 +1239,7 @@ fn td_portal_settings_etc_name() -> &'static str {
 /// on a table it cannot parse, but a unit SILENTLY dropped from the plan — skipped for
 /// an unsatisfiable dependency — is a clean exit with a shorter list, and that is the
 /// regression this catches: the boot comes up missing a service and says nothing.
-const TD_SVC_UNITS: [&str; 47] = [
+const TD_SVC_UNITS: [&str; 46] = [
     "hostname",
     "td-firstboot",
     "release-source",
@@ -1266,7 +1265,6 @@ const TD_SVC_UNITS: [&str; 47] = [
     "portal-evidence",
     "wayland",
     "seat-access-evidence",
-    "portal-channel-evidence",
     "terminal",
     "applications-workspace",
     "mail",
@@ -1661,21 +1659,6 @@ fn build_td_svc_conf() -> String {
          requires=wayland\n\
          timeout=30\n\
          \n\
-         # The private path is the privileged portal transport boundary. This\n\
-         # separate portal-UID client proves its exact eleven-global registry and\n\
-         # exercises td_portal_manager_v1 standalone and dismissal acknowledgements.\n\
-         # Wait for TLS setup for the same line-framing reason as portal-evidence:\n\
-         # its key generator writes raw progress dots to the shared console.\n\
-         # td-recipe-eval requires the exact {portal_channel_runtime_marker} line.\n\
-         [portal-channel-evidence]\n\
-         type=oneshot\n\
-         exec=/bin/td-login exec-service-as {portal_user} -- /bin/td-portal channel-probe --wayland {portal_wayland_socket}\n\
-         after=wayland,firefox-tls-setup\n\
-         requires=wayland\n\
-         timeout=30\n\
-         log=/var/log/svc/td-portal-channel-evidence.log\n\
-         console=yes\n\
-         \n\
          # The first td-native client stays mapped, and it is the TERMINAL: the\n\
          # machine boots to a shell prompt rather than to a demo. Its readiness\n\
          # probe is exposed only after a frame presented at a size the compositor\n\
@@ -1979,7 +1962,6 @@ fn build_td_svc_conf() -> String {
         ui_uid = UI_UID,
         ui_home = UI_HOME,
         broker_user = BROKER_USER,
-        portal_user = PORTAL_USER,
         compositor_uid = COMPOSITOR_RESERVED_UID,
         compositor_user = COMPOSITOR_USER,
         wayland_socket = WAYLAND_SOCKET,
@@ -1991,7 +1973,6 @@ fn build_td_svc_conf() -> String {
         portal_runtime_marker = TD_PORTAL_RUNTIME_MARKER,
         portal_request_runtime_marker = TD_PORTAL_REQUEST_RUNTIME_MARKER,
         portal_unavailable_runtime_marker = TD_PORTAL_UNAVAILABLE_RUNTIME_MARKER,
-        portal_channel_runtime_marker = TD_PORTAL_CHANNEL_RUNTIME_MARKER,
         portal_wayland_socket = PORTAL_WAYLAND_SOCKET,
         control_socket = CONTROL_SOCKET,
         portal_service_log = PORTAL_SERVICE_LOG,
@@ -4800,7 +4781,7 @@ fn shape_check() -> String {
      : 'the plan identical. the_declared_edges_are_exactly_these pins the edge set on'; \
      : 'the host; this pins that td-svc itself still resolves them this way.'; \
      svcpos() { printf '%s\\n' \"$tdsplan\" | grep -n -E \"^[0-9]+\\. $1\\$\" | cut -d: -f1; }; \
-     hn=$(svcpos hostname); fb=$(svcpos td-firstboot); rc=$(svcpos rootcheck); pf=$(svcpos profiler); pe=$(svcpos profiler-evidence); st=$(svcpos seat); au=$(svcpos audio); nu=$(svcpos netup); wl=$(svcpos wayland); ts=$(svcpos firefox-tls-setup); pc=$(svcpos portal-channel-evidence); tm=$(svcpos terminal); ff=$(svcpos firefox); fe=$(svcpos firefox-evidence); bs=$(svcpos bootsuccess); sd=$(svcpos sshd); gr=$(svcpos greeter); bd=$(svcpos busd); po=$(svcpos portal); pv=$(svcpos portal-evidence); \
+     hn=$(svcpos hostname); fb=$(svcpos td-firstboot); rc=$(svcpos rootcheck); pf=$(svcpos profiler); pe=$(svcpos profiler-evidence); st=$(svcpos seat); au=$(svcpos audio); nu=$(svcpos netup); wl=$(svcpos wayland); tm=$(svcpos terminal); ff=$(svcpos firefox); fe=$(svcpos firefox-evidence); bs=$(svcpos bootsuccess); sd=$(svcpos sshd); gr=$(svcpos greeter); bd=$(svcpos busd); po=$(svcpos portal); pv=$(svcpos portal-evidence); \
      [ \"$hn\" -lt \"$fb\" ] || { echo 'td-svc would not serialize hostname before td-firstboot - init ran every sysinit line to completion before the next, and td-svc starts settled units in the same pass' >&2; exit 1; }; \
      [ \"$fb\" -lt \"$rc\" ] || { echo 'td-svc would start rootcheck before td-firstboot - rootcheck asserts the identity td-firstboot mints is readable' >&2; exit 1; }; \
      [ \"$rc\" -lt \"$pf\" ] && [ \"$pf\" -lt \"$pe\" ] || { echo 'td-svc would not serialize rootcheck -> profiler -> profiler evidence' >&2; exit 1; }; \
@@ -4808,7 +4789,7 @@ fn shape_check() -> String {
      [ \"$nu\" -lt \"$sd\" ] || { echo 'td-svc would start sshd before netup - sshd binds loopback, which netup brings up' >&2; exit 1; }; \
      [ \"$fb\" -lt \"$sd\" ] || { echo 'td-svc would start sshd before td-firstboot - sshd is fail-closed on the host key td-firstboot mints, so it would refuse to start on every boot' >&2; exit 1; }; \
      [ \"$nu\" -lt \"$gr\" ] || { echo 'td-svc would start the greeter before netup' >&2; exit 1; }; \
-     [ \"$rc\" -lt \"$st\" ] && [ \"$st\" -lt \"$wl\" ] && [ \"$wl\" -lt \"$pc\" ] && [ \"$ts\" -lt \"$pc\" ] && [ \"$wl\" -lt \"$tm\" ] && [ \"$wl\" -lt \"$ff\" ] && [ \"$ff\" -lt \"$fe\" ] && [ \"$tm\" -lt \"$bs\" ] && [ \"$pe\" -lt \"$bs\" ] || { echo 'td-svc would not serialize rootcheck -> seat -> wayland plus TLS setup -> private portal-channel evidence, wayland -> terminal + Firefox evidence, and profiler evidence -> independent bootsuccess' >&2; exit 1; }; \
+     [ \"$rc\" -lt \"$st\" ] && [ \"$st\" -lt \"$wl\" ] && [ \"$wl\" -lt \"$tm\" ] && [ \"$wl\" -lt \"$ff\" ] && [ \"$ff\" -lt \"$fe\" ] && [ \"$tm\" -lt \"$bs\" ] && [ \"$pe\" -lt \"$bs\" ] || { echo 'td-svc would not serialize rootcheck -> seat -> wayland, wayland -> terminal + Firefox evidence, and profiler evidence -> independent bootsuccess' >&2; exit 1; }; \
      [ \"$st\" -lt \"$au\" ] && [ \"$au\" -lt \"$ff\" ] || { echo 'td-svc would not serialize seat -> audio -> Firefox' >&2; exit 1; }; \
      [ \"$st\" -lt \"$bd\" ] && [ \"$bd\" -lt \"$bs\" ] || { echo 'td-svc would not serialize seat -> busd -> bootsuccess - the broker binds in the UID-992 runtime td-firstboot publishes, and /etc/bootsuccess probes the RUNNING broker rather than a selftest' >&2; exit 1; }; \
      [ \"$bd\" -lt \"$po\" ] && [ \"$po\" -lt \"$pv\" ] && [ \"$po\" -lt \"$ff\" ] || { echo 'td-svc would not serialize busd -> portal -> live portal evidence and Firefox' >&2; exit 1; }; \
@@ -7174,10 +7155,6 @@ news\tnews-0.1\tsource\tempty-runtime-1\tsource\n"
             ("portal", vec!["busd", "portal-files"]),
             ("portal-evidence", vec!["portal", "firefox-tls-setup"]),
             ("wayland", vec!["seat"]),
-            (
-                "portal-channel-evidence",
-                vec!["wayland", "firefox-tls-setup"],
-            ),
             ("terminal", vec!["wayland"]),
             ("applications-workspace", vec!["terminal"]),
             (
@@ -7544,61 +7521,6 @@ news\tnews-0.1\tsource\tempty-runtime-1\tsource\n"
                 .split(',')
                 .any(|dependency| dependency == "portal"),
             "Settings availability is application evidence, not deployment health"
-        );
-    }
-
-    #[test]
-    fn private_portal_channel_evidence_is_exact_and_separate() {
-        assert_eq!(
-            unit_key("wayland", "pair-exec"),
-            Some(format!(
-                "/bin/td-login exec-service-as {COMPOSITOR_USER} -- /bin/td-compositor run \
-                 --framebuffer /dev/fb0 --input /dev/input \
-                 --socket {WAYLAND_SOCKET} \
-                 --portal-socket {PORTAL_WAYLAND_SOCKET} \
-                 --control-socket {CONTROL_SOCKET} \
-                 --launcher-application {FIREFOX_NAME} --terminal-authority stdin \
-                 --application-ready-socket {FIREFOX_WINDOW_READY_SOCKET} \
-                 --application-app-id {FIREFOX_APP_ID} \
-                 --application-content-rgb-a {FIREFOX_CONTENT_RGB_A} \
-                 --application-content-rgb-b {FIREFOX_CONTENT_RGB_B}"
-            ))
-        );
-        assert_eq!(
-            unit_key("portal-channel-evidence", "exec"),
-            Some(format!(
-                "/bin/td-login exec-service-as {PORTAL_USER} -- /bin/td-portal \
-                 channel-probe --wayland {PORTAL_WAYLAND_SOCKET}"
-            ))
-        );
-        assert_eq!(
-            unit_key("portal-channel-evidence", "after").as_deref(),
-            Some("wayland,firefox-tls-setup")
-        );
-        assert_eq!(
-            unit_key("portal-channel-evidence", "requires").as_deref(),
-            Some("wayland")
-        );
-        assert_eq!(
-            unit_key("portal-channel-evidence", "type").as_deref(),
-            Some("oneshot")
-        );
-        assert_eq!(
-            unit_key("portal-channel-evidence", "timeout").as_deref(),
-            Some("30")
-        );
-        assert_eq!(
-            unit_key("portal-channel-evidence", "log").as_deref(),
-            Some("/var/log/svc/td-portal-channel-evidence.log")
-        );
-        assert_eq!(
-            unit_key("portal-channel-evidence", "console").as_deref(),
-            Some("yes")
-        );
-        assert!(
-            !unit_after("bootsuccess")
-                .contains(&"portal-channel-evidence".to_string()),
-            "private portal evidence must not gain deployment-health authority"
         );
     }
 

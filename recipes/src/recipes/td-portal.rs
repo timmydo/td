@@ -6,8 +6,6 @@ use crate::ladder::TD_JAIL_FIXTURE_DOWNLOAD_TARGET;
 const SYSTEM_X86_64_RS: &str = include_str!("system-x86-64.rs");
 #[cfg(test)]
 const MAIN_RS: &str = include_str!("../../../td-portal/src/main.rs");
-#[cfg(test)]
-const WAYLAND_CHANNEL_RS: &str = include_str!("../../../td-portal/src/wayland_channel.rs");
 
 /// td-portal, the supervised desktop portal service, built as a TARGET recipe
 /// from the checkout's own trees. Its `main.rs` reaches the broker codec, the
@@ -45,8 +43,8 @@ pub fn recipe() -> Recipe {
 mod tests {
     use super::*;
     use crate::ladder::{
-        TD_PORTAL_CHANNEL_RUNTIME_MARKER, TD_PORTAL_REQUEST_RUNTIME_MARKER,
-        TD_PORTAL_RUNTIME_MARKER, TD_PORTAL_UNAVAILABLE_RUNTIME_MARKER,
+        TD_PORTAL_REQUEST_RUNTIME_MARKER, TD_PORTAL_RUNTIME_MARKER,
+        TD_PORTAL_UNAVAILABLE_RUNTIME_MARKER,
     };
 
     #[test]
@@ -87,18 +85,9 @@ mod tests {
             "pub const UNAVAILABLE_READY_MARKER: &str =\n    \
              \"{TD_PORTAL_UNAVAILABLE_RUNTIME_MARKER}\";"
         )));
-        assert!(WAYLAND_CHANNEL_RS.contains("EXPECTED_GLOBALS.len()"));
-        assert!(
-            WAYLAND_CHANNEL_RS.contains("TD-PORTAL-CHANNEL-READY globals={} privileged=1 dialog=2")
-        );
-        assert_eq!(
-            TD_PORTAL_CHANNEL_RUNTIME_MARKER,
-            "TD-PORTAL-CHANNEL-READY globals=11 privileged=1 dialog=2"
-        );
         assert!(MAIN_RS.contains("println!(\"{READY_MARKER}\");"));
         assert!(MAIN_RS.contains("println!(\"{REQUEST_READY_MARKER}\");"));
         assert!(MAIN_RS.contains("println!(\"{UNAVAILABLE_READY_MARKER}\");"));
-        assert!(MAIN_RS.contains("println!(\"{}\", wayland_channel::ready_marker());"));
     }
 
     #[test]

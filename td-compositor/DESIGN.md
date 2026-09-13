@@ -994,21 +994,6 @@ and return a live toplevel to the tiling tree without erasing a later local or
 ordinary xdg-foreign parent. Screenshots, notifications, and inhibitors remain
 outside this manager version.
 
-A separate portal-uid-991 `td-portal channel-probe` sends `get_registry` plus
-`sync`, validates the ordered eleven names and versions through this crate's
-safe framing codec, binds the compositor, xdg shell, and private manager,
-constructs an unmapped toplevel, and requires exact standalone and dismissed
-events before a second sync. Only then does it emit
-`TD-PORTAL-CHANNEL-READY globals=11 privileged=1 dialog=2`. Its 20-second
-deadline starts before the Unix connect and includes both exchanges; 32
-messages and 256 KiB cumulatively bound all input, including decoded registry
-entries. A following `delete_id` for the first callback may be split at any
-byte without changing the proof. This target path intentionally uses an empty
-handle and proves standalone association plus dismissal acknowledgement; a
-host wire regression proves a mapped relationship, revocation notification,
-re-association, and removal. The probe does not use `conn.rs`, SCM_RIGHTS, or
-another unsafe surface.
-
 The E2 application-compatibility experiment on 2026-08-25 fixes the priority
 of the next globals without changing that current-state list. GTK 4.22.1's
 `gtk4-demo`, run against Weston through a registry-listener filter, completed
@@ -4046,9 +4031,9 @@ The landing must prove:
 - the compositor resolves and refuses aliases among its public, private
   portal, and application-readiness endpoints, binds the private then public
   session-admitted Wayland listeners before readiness with independent ceilings
-  of 30 public and two private clients, authenticates private peers as uid 1000,
-  and the shipped portal probe accepts only the exact private registry before
-  completing the manager's standalone and dismissed dialog states;
+  of 30 public and two private clients, authenticates public peers as uid 1000
+  and private portal peers as uid 991, and advertises the exact private
+  registry with the privileged `td_portal_manager_v1` the portal dialog binds;
 - wire parsing rejects truncation, overflow, invalid object use, and a
   descriptor-less wl_shm request;
 - an SCM_RIGHTS-backed wl_shm buffer commits and is copied into the scene;

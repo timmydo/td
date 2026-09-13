@@ -5811,27 +5811,6 @@ dependency of `bootsuccess`, so absence makes application evidence red
 without granting mutable user service state authority over deployment
 acknowledgement.
 
-A second, likewise non-health-authoritative evidence unit exercises the
-private compositor channel described below. As portal uid 991 it
-performs `wl_display.get_registry` followed by `wl_display.sync`,
-requires the private registry's exact eleven globals in their pinned
-order and versions, binds the private-only `td_portal_manager_v1`,
-constructs an xdg-toplevel, and requires the exact standalone and
-dismissal acknowledgements for an intentionally empty parent handle
-before a second sync. Only then does it emit `TD-PORTAL-CHANNEL-READY
-globals=11 privileged=1 dialog=2`; QEMU accepts only the exact
-td-svc-prefixed `portal-channel-evidence:` line. This composes the
-shipped socket, compositor server, uid-991 peer check, shared safe
-Wayland codec, manager dispatch, portal binary, service argv, and uid.
-One 20-second deadline begins before the Unix connect, so an unavailable
-or backlog-stalled endpoint cannot leave this diagnostic client waiting
-forever; 32 messages and 256 KiB bound the exchange. The byte bound is
-cumulative across both exchanges, including messages already decoded
-into the retained global table. This target probe proves the shipped
-private transport and standalone request lifecycle; a host wire
-regression uses a live mapped export to prove parent association,
-asynchronous revocation, re-association, and dismissal.
-
 ### Request — landed core; Session — staged core
 
 A portal method returns a handle and the answer arrives as
@@ -6180,9 +6159,7 @@ for the manager's dismissal acknowledgement before completing the Request.
 Screenshots, notifications, and inhibitors remain outside this manager
 version.
 
-`td-portal channel-probe` uses only the compositor's safe framing codec — not
-`conn.rs` or SCM_RIGHTS — to pin the exact private registry and both dialog
-states on the system image. The normal portal's separate dialog client retains
+The normal portal's separate dialog client retains
 one private connection per active FileChooser and uses only the confined
 descriptor transport in `UNSAFE.md` §12 for keymap and shared-memory messages.
 
