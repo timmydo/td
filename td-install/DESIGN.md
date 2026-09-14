@@ -215,6 +215,10 @@ file, then boots that file under OVMF. An installer whose tested path and
 shipped path differ is an installer tested somewhere other than where it
 runs.
 
+`layout-preview` uses the same layout calculation without a destination
+operand or any filesystem access. Its geometry-only contract and output
+schema live in INSTALLER.md; it does not admit a disk or authorize writes.
+
 **D10. Every filesystem call goes through a choke point that names its
 path.** `io::Error` carries an errno and no filename, and one command line
 here names as many as five paths — so `No such file or directory` alone is

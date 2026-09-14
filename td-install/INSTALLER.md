@@ -213,3 +213,32 @@ oracle-owned optical/USB images and writable, read-only, undersized and
 successful/recovery installations; refusals must have no post-format
 report and retain the existing whole-disk byte preservation proof. These
 are observations under a disposable topology, not destination eligibility.
+
+## Read-only layout preview
+
+`td-install layout-preview <logical-sector-bytes> <capacity-bytes>`
+takes two unsigned decimal byte counts, each at most twenty ASCII digits
+and within u64. Leading zero padding is allowed within that length
+bound; output numbers have no padding. It computes the same GPT
+partition layout that `layout` writes, for v1's supported 512-byte or
+4096-byte logical sectors. Invalid geometry, unaligned capacity or
+insufficient space for the fixed ESP and minimum system volume refuses
+before output. It opens no files or devices, reads no sysfs attributes,
+generates no identities and starts no child process.
+
+Success prints one version-1 JSON object with `scope: "layout-preview"`,
+`logical_sector_bytes`, `capacity_bytes` and exactly two `partitions` in
+disk order. Each partition has `number`, `purpose` (`efi-system` or
+`system-volume`), inclusive `start_lba` and `end_lba`, `offset_bytes` and
+`capacity_bytes`. Integer fields require exact unsigned integer handling;
+consumers must not round large capacities through floating-point numbers.
+The output is deterministic and newline-terminated. Invalid inputs produce
+no partial report; output/flush errors return failure and may leave partial
+bytes, so consumers require both complete JSON and successful exit.
+
+This is a geometry preview for a future disk-review page, not an immutable
+installation plan or a destination eligibility decision. It describes the
+numbers supplied by its caller and does not bind a device identity. It
+does not establish source authenticity, boot-file fit, payload capacity,
+scratch availability, settings validity, exclusive admission or trusted
+destructive consent. Those checks remain required before installation.

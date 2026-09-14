@@ -42,7 +42,7 @@ mod scratch;
 #[path = "inventory.rs"]
 mod inventory;
 
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -57,13 +57,17 @@ fn invalid(message: String) -> io::Error {
 }
 
 const USAGE: &str =
-    "usage: td-install inventory\n       td-install layout <destination> [<efi-kernel> <selector-initramfs>]\n       \
+    "usage: td-install inventory\n       td-install layout-preview <logical-sector-bytes> <capacity-bytes>\n       td-install layout <destination> [<efi-kernel> <selector-initramfs>]\n       \
                      td-install volume [--uuid <uuid>] <destination> <mkfs.btrfs> <scratch-dir> \
                      [<td-boot> <deployment> <trusted-key> | --trusted-key <trusted-key>]";
 
 #[derive(Debug, Eq, PartialEq)]
 enum Mode {
     Inventory,
+    LayoutPreview {
+        sector_bytes: u64,
+        capacity_bytes: u64,
+    },
     Layout {
         destination: PathBuf,
         boot: Option<BootFiles>,
@@ -254,6 +258,10 @@ fn parse_args(mut args: impl Iterator<Item = OsString>) -> io::Result<Mode> {
     }
     match (verb.to_str(), rest) {
         (Some("inventory"), []) => Ok(Mode::Inventory),
+        (Some("layout-preview"), [sector, capacity]) => Ok(Mode::LayoutPreview {
+            sector_bytes: preview_number(sector.as_os_str(), "logical sector bytes")?,
+            capacity_bytes: preview_number(capacity.as_os_str(), "capacity bytes")?,
+        }),
         (Some("layout"), [destination]) => Ok(Mode::Layout {
             destination: destination.clone(),
             boot: None,
@@ -295,6 +303,19 @@ fn parse_args(mut args: impl Iterator<Item = OsString>) -> io::Result<Mode> {
         }),
         _ => Err(invalid(USAGE.to_string())),
     }
+}
+
+fn preview_number(value: &OsStr, label: &str) -> io::Result<u64> {
+    let text = value
+        .to_str()
+        .ok_or_else(|| invalid(format!("{label}: expected 1..=20 ASCII decimal digits")))?;
+    if text.is_empty() || text.len() > 20 || !text.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(invalid(format!(
+            "{label}: expected 1..=20 ASCII decimal digits"
+        )));
+    }
+    text.parse()
+        .map_err(|_| invalid(format!("{label}: byte count exceeds u64")))
 }
 
 /// The destination's size in bytes, asked of the destination itself.
@@ -490,6 +511,37 @@ fn plan(sector_size: u64, disk_bytes: u64) -> Result<Plan, String> {
         volume_start,
         volume_end: last_usable,
     })
+}
+
+/// Pure geometry for a future review page; no disk identity or write authority.
+fn layout_preview(sector_bytes: u64, capacity_bytes: u64, out: &mut dyn Write) -> io::Result<()> {
+    if !matches!(sector_bytes, 512 | 4096) {
+        return Err(invalid(
+            "layout preview supports 512-byte and 4096-byte logical sectors".into(),
+        ));
+    }
+    let layout = plan(sector_bytes, capacity_bytes)
+        .map_err(|error| invalid(format!("layout preview: {error}")))?;
+    let byte_range = |start: u64, end: u64| -> io::Result<(u64, u64)> {
+        let offset = start
+            .checked_mul(sector_bytes)
+            .ok_or_else(|| invalid("preview partition offset overflow".into()))?;
+        let length = end
+            .checked_sub(start)
+            .and_then(|sectors| sectors.checked_add(1))
+            .and_then(|sectors| sectors.checked_mul(sector_bytes))
+            .ok_or_else(|| invalid("invalid or overflowing preview partition range".into()))?;
+        Ok((offset, length))
+    };
+    let (esp_offset, esp_bytes) = byte_range(layout.esp_start, layout.esp_end)?;
+    let (volume_offset, volume_bytes) = byte_range(layout.volume_start, layout.volume_end)?;
+    writeln!(out, concat!(
+        "{{\"version\":1,\"scope\":\"layout-preview\",\"logical_sector_bytes\":{},\"capacity_bytes\":{},",
+        "\"partitions\":[{{\"number\":1,\"purpose\":\"efi-system\",\"start_lba\":{},\"end_lba\":{},\"offset_bytes\":{},\"capacity_bytes\":{}}},",
+        "{{\"number\":2,\"purpose\":\"system-volume\",\"start_lba\":{},\"end_lba\":{},\"offset_bytes\":{},\"capacity_bytes\":{}}}]}}"
+    ), sector_bytes, capacity_bytes,
+        layout.esp_start, layout.esp_end, esp_offset, esp_bytes,
+        layout.volume_start, layout.volume_end, volume_offset, volume_bytes)
 }
 
 /// 16 bytes from `/dev/urandom`, as an RFC 4122 version-4 GUID.
@@ -1679,6 +1731,15 @@ fn main() -> ExitCode {
             inventory::run(Path::new("/sys/class/block"), &mut output)
                 .and_then(|()| output.flush())
         },
+        Mode::LayoutPreview {
+            sector_bytes,
+            capacity_bytes,
+        } => {
+            let stdout = io::stdout();
+            let mut output = io::BufWriter::new(stdout.lock());
+            layout_preview(sector_bytes, capacity_bytes, &mut output)
+                .and_then(|()| output.flush())
+        },
         Mode::Layout { destination, boot } => match boot {
             Some(boot) => run_layout_with_boot(&destination, Some(&boot), &mut io::stdout()),
             None => run_layout(&destination, &mut io::stdout()),
@@ -1784,6 +1845,124 @@ mod tests {
             .map(|value| OsString::from(*value))
             .collect::<Vec<_>>()
             .into_iter()
+    }
+
+    #[test]
+    fn layout_preview_accepts_only_two_bounded_decimal_counts() {
+        assert_eq!(
+            parse_args(args(&[
+                "layout-preview",
+                "00000000000000000512",
+                "18446744073709551615"
+            ]))
+            .unwrap(),
+            Mode::LayoutPreview {
+                sector_bytes: 512,
+                capacity_bytes: u64::MAX
+            }
+        );
+        assert_eq!(
+            parse_args(args(&["layout-preview", "512", "6442450944"])).unwrap(),
+            Mode::LayoutPreview {
+                sector_bytes: 512,
+                capacity_bytes: DISK
+            }
+        );
+        for bad in [
+            "",
+            "+512",
+            "-1",
+            " 512",
+            "512 ",
+            "5.12",
+            "1e9",
+            "/dev/sda",
+            "18446744073709551616",
+            "000000000000000000001",
+            "５１２",
+        ] {
+            assert!(parse_args(args(&["layout-preview", bad, "6442450944"])).is_err());
+            assert!(parse_args(args(&["layout-preview", "512", bad])).is_err());
+        }
+        for bad in [
+            vec!["layout-preview"],
+            vec!["layout-preview", "512"],
+            vec!["layout-preview", "512", "6442450944", "disk"],
+            vec!["layout-preview", "--uuid", "512", "6442450944"],
+        ] {
+            assert!(parse_args(args(&bad)).is_err(), "{bad:?}");
+        }
+        use std::os::unix::ffi::OsStringExt;
+        assert!(parse_args(
+            [
+                OsString::from("layout-preview"),
+                OsString::from("512"),
+                OsString::from_vec(vec![0xff])
+            ]
+            .into_iter()
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn layout_preview_reports_exact_512_and_4kn_ranges() {
+        for (sector, esp_start, esp_end, volume_start, volume_end, volume_bytes) in [
+            (512, 2048, 1050623, 1050624, 12582878, 5904514560u64),
+            (4096, 256, 131327, 131328, 1572858, 5904510976u64),
+        ] {
+            let expected = format!(concat!(
+                "{{\"version\":1,\"scope\":\"layout-preview\",\"logical_sector_bytes\":{},\"capacity_bytes\":6442450944,",
+                "\"partitions\":[{{\"number\":1,\"purpose\":\"efi-system\",\"start_lba\":{},\"end_lba\":{},\"offset_bytes\":1048576,\"capacity_bytes\":536870912}},",
+                "{{\"number\":2,\"purpose\":\"system-volume\",\"start_lba\":{},\"end_lba\":{},\"offset_bytes\":537919488,\"capacity_bytes\":{}}}]}}\n"
+            ), sector, esp_start, esp_end, volume_start, volume_end, volume_bytes);
+            let mut output = Vec::new();
+            layout_preview(sector, DISK, &mut output).unwrap();
+            assert_eq!(String::from_utf8(output).unwrap(), expected);
+        }
+        let disk = Scratch::disk(DISK);
+        run_layout(&disk.path, &mut Vec::new()).unwrap();
+        let table = disk.table(DISK);
+        let ranges: Vec<_> = table
+            .partitions
+            .iter()
+            .map(|part| (part.start_lba, part.end_lba))
+            .collect();
+        assert_eq!(ranges, [(2048, 1050623), (1050624, 12582878)]);
+    }
+
+    #[test]
+    fn layout_preview_refuses_bad_geometry_before_output_and_propagates_io_errors() {
+        assert!(layout_preview(512, 0, &mut Vec::new())
+            .unwrap_err()
+            .to_string()
+            .contains("layout preview:"));
+        for (sector, capacity) in [
+            (0, DISK),
+            (1024, DISK),
+            (8192, DISK),
+            (u64::MAX, DISK),
+            (512, 0),
+            (512, protocol::ESP_BYTES),
+            (512, DISK + 1),
+            (4096, u64::MAX),
+        ] {
+            let mut output = Vec::new();
+            assert!(layout_preview(sector, capacity, &mut output).is_err());
+            assert!(output.is_empty());
+        }
+        struct Closed;
+        impl Write for Closed {
+            fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+                Err(io::ErrorKind::BrokenPipe.into())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        assert_eq!(
+            layout_preview(512, DISK, &mut Closed).unwrap_err().kind(),
+            io::ErrorKind::BrokenPipe
+        );
     }
 
     #[test]
