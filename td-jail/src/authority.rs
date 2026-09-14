@@ -284,10 +284,9 @@ pub(crate) struct ResolvedFile {
 /// `/etc/localtime` when `TZ` is unset, so a bind is the whole mechanism and
 /// no application has to be told anything.
 ///
-/// The name cannot be spelled the way an ordinary distribution spells it — an
-/// `/etc/localtime` symlink into `/usr/share/zoneinfo` — because td's own root
-/// carries no zoneinfo at all for that symlink to name. The zone data exists
-/// only inside a jail, which is where this resolves it.
+/// The name is independent of native-system zoneinfo: an application's
+/// compiled file must come from its own runtime, even when td's root carries
+/// a file for the same name. This resolver never imports native-system zone data.
 #[derive(Debug)]
 pub(crate) struct ResolvedTimezone {
     pub(crate) name: String,

@@ -135,9 +135,17 @@ history. This data does not claim complete local histories before 1970.
 The recipe does not install a second libc or timezone compiler. Its
 native recipe check reads the realized geographic tables and requires
 their named zones to exist, then uses td's `zdump` to verify exact 2026
-Canadian and 2027 UTC, daylight-saving and fixed-offset behavior. This
-recipe supplies data for later image and settings integration; it does
-not yet select a timezone or change an installed session.
+Canadian and 2027 UTC, daylight-saving and fixed-offset behavior.
+
+The complete data output ships at its canonical store path in the system
+deployment, including live and installed profiles. The immutable
+`/etc/zoneinfo` link exposes compiled zones and geographic tables for
+offline selection. This does not yet select a timezone or change an
+installed session. Source-built td glibc's compiled `TZDIR` is
+`/td/store/glibc-2.41-x86_64/share/zoneinfo` and its `TZDEFAULT` is
+`/td/store/glibc-2.41-x86_64/etc/localtime`. Later settings consumers
+must explicitly connect the selected data to native readers; libc does
+not discover `/etc/zoneinfo` automatically.
 
 ## Independently landable increments and evidence
 

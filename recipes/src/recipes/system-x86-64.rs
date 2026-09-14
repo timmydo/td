@@ -3498,6 +3498,12 @@ struct ImmutableEtc {
 
 const IMMUTABLE_ETC: &[ImmutableEtc] = &[
     ImmutableEtc {
+        etc: "zoneinfo",
+        target: "{in:tzdata}/share/zoneinfo",
+        why: "The pending installer settings consumer needs a stable zoneinfo \
+              path because its binary cannot name a content-addressed data hash",
+    },
+    ImmutableEtc {
         etc: "terminfo",
         target: "{in:td-compositor}/share/terminfo",
         why: "ncurses resolves TERM through TERMINFO, and td-term hands its child \
@@ -4235,6 +4241,27 @@ fn real_root_steps(sys: &SystemDef) -> Result<Vec<Step>, String> {
     steps.push(Step::CopyTree {
         from: "{in:ca-certificates}".into(),
         dest: "{root}/real-root{in:ca-certificates}".into(),
+    });
+    // Timezone data is an immutable package with no ELF runtime closure.
+    steps.push(Step::CopyTree {
+        from: "{in:tzdata}".into(),
+        dest: "{root}/real-root{in:tzdata}".into(),
+    });
+    steps.push(Step::Require {
+        paths: [
+            "share/zoneinfo/Etc/UTC",
+            "share/zoneinfo/America/Vancouver",
+            "share/zoneinfo/iso3166.tab",
+            "share/zoneinfo/zone.tab",
+            "share/zoneinfo/zone1970.tab",
+            "share/zoneinfo/zonenow.tab",
+            "share/doc/tzdata/version",
+            "share/doc/tzdata/LICENSE",
+        ]
+        .iter()
+        .map(|path| format!("{{root}}/real-root{{in:tzdata}}/{path}"))
+        .collect(),
+        exec: false,
     });
     // The QEMU HTTPS origin needs only LibreSSL's static command and its debug
     // companion. Keep the development archives and headers out of the image.
@@ -5136,6 +5163,7 @@ pub fn recipe() -> Recipe {
         // Git: the source-built local and HTTP(S) client plus its executable helpers.
         // Codex: the source-built dynamic CLI plus its source-built static Bubblewrap helper.
         // ca-certificates: immutable Mozilla trust data at curl's conventional path.
+        // tzdata: immutable compiled zones and geographic tables at /etc/zoneinfo.
         // OpenSSH: the source-built client, key generator, daemon, and mandatory split
         //   helpers. Its deliberately libcrypto-free closure is reached by
         //   StageRuntimeClosure.
@@ -5178,6 +5206,7 @@ pub fn recipe() -> Recipe {
             "codex",
             "codex-bwrap",
             "ca-certificates",
+            "tzdata",
             "libressl-x86-64",
             "glibc-x86-64",
             "openssh-x86-64",
@@ -11256,6 +11285,7 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
             let paths: Vec<String> = match step {
                 Step::Symlink { target, link } => vec![target, link],
                 Step::CopyTree { from, dest } => vec![from, dest],
+                Step::Require { paths, .. } => paths,
                 Step::CopyFiles { files, dest } => {
                     files.into_iter().chain(std::iter::once(dest)).collect()
                 }

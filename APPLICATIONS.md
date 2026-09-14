@@ -6587,13 +6587,12 @@ of memory bandwidth. **"Draws a window" does not imply watchable video.**
   row, nothing an application has to be told, and `LC_ALL`-style
   overrides still work because `TZ` is left alone.
   The name comes from the system's **`/etc/timezone`** — a bounded IANA
-  zone name, every component capitalised, at most three deep. It cannot
-  be spelled the ordinary way, as an `/etc/localtime` symlink into
-  `/usr/share/zoneinfo`, because **td's own root carries no zoneinfo for
-  such a symlink to name**. The `tzdata` recipe is not wired
-  into the image. Future native-system timezone data must preserve this
-  application boundary: the system chooses a name, and each application's
-  runtime supplies and validates its own compiled file for that name.
+  zone name, every component capitalised, at most three deep. The name is
+  read from `/etc/timezone`, not derived from a native `/etc/localtime`
+  symlink. The native system carries source-built timezone data at
+  `/etc/zoneinfo`, independent of each application runtime. The system chooses
+  a name, and each application's runtime supplies and validates its own
+  compiled file for that name.
   **Unset is not a zone**, and that is the whole of the first case.
   When `/etc/timezone` is absent — or is the reviewed link out to state
   nothing has minted yet, which is the same "nobody has said" — there is
@@ -7360,8 +7359,8 @@ turned out not to be a td input at all: §O's own answer reads the
 *runtime's* zoneinfo. The application mount plan carries the zone NAME
 and binds the runtime's compiled file. Separately, the installer has
 an approved IANA `tzdata` source recipe compiled with td's existing
-source-built glibc `zic`; it is data for future native-system image and
-settings integration, not an application runtime input. What remains is
+source-built glibc `zic`; its data ships in the native-system image through
+`/etc/zoneinfo`, not as an application runtime input. What remains is
 the writer for that name and td's own clock, which are rungs 12k and 29
 rather than an unscheduled gap.
 Accessibility is unchanged: it belongs **after** M28 and before "daily
