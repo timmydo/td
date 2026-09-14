@@ -1,11 +1,13 @@
 #![forbid(unsafe_code)]
 
 //! The command line: `probe` prints what a file's container says and
-//! optionally decodes its raw strip; `develop` renders it to a PPM. This is
-//! the one place in the crate that opens files, reads the clock or asks
-//! for the thread count; the library modules take bytes and buffers.
+//! optionally decodes its raw strip; `develop` renders it to a PPM;
+//! `import`, `list`, `flag` and `edit` are the library's headless verbs.
+//! This is the one place in the crate that opens files, reads the clock
+//! or asks for the thread count; the library modules take bytes and
+//! buffers.
 
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::{self, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
@@ -15,6 +17,7 @@ use std::time::Instant;
 use td_photo::color::{camera_color, Transfer};
 use td_photo::develop::{self, Params, MAX_THREADS};
 use td_photo::image::{read_ppm, write_ppm, Rgb8};
+use td_photo::library::{self, Filter, Flag, Key, Sidecar};
 use td_photo::nef::{self, Nef};
 use td_photo::{camera, jpeg, tiff};
 
@@ -39,6 +42,25 @@ const HELP: &str = concat!(
     "td-photo cache path | clear\n",
     "  Prints the cache directory ($XDG_CACHE_HOME/td-photo when that is\n",
     "  absolute, else ~/.cache/td-photo), or removes every thumbnail.\n",
+    "td-photo import SRC DEST\n",
+    "  Copies every NEF under SRC (eight folders deep, links under SRC\n",
+    "  not followed) into DEST/YYYY/YYYY-MM-DD/ by its capture time, or\n",
+    "  into DEST/undated/, through NAME.part linked into place. A copy\n",
+    "  already there with the same bytes is skipped; one that differs, or\n",
+    "  anything else at that name, is a conflict, and a source that\n",
+    "  cannot be read is unread: each is reported with why and left\n",
+    "  alone, and the run fails after the rest. SRC is never written.\n",
+    "td-photo list ROLL [--picks | --rejects | --unflagged]\n",
+    "  One line per original in ROLL: name, flag, exposure, crop, look and\n",
+    "  the sidecar's state (none, ok, or error and why), tab-separated.\n",
+    "td-photo flag FILE pick | reject | clear\n",
+    "  Sets or clears the cull flag in FILE's sidecar.\n",
+    "td-photo edit FILE [KEY VALUE ... | reset]\n",
+    "  Prints FILE's sidecar, or sets exposure STOPS (-5.00 to 5.00), crop\n",
+    "  X Y W H (fractions to four decimals), look STEM or flag pick|reject;\n",
+    "  a VALUE of - clears the key; reset clears all but the flag. The\n",
+    "  sidecar is written through NAME.edit.tmp and renamed into place,\n",
+    "  the one file td-photo replaces, since it is its own.\n",
     "Other: --help\n",
     "Supported: Nikon Z 8 14-bit lossless-compressed NEF (see DESIGN.md).\n",
 );
@@ -68,6 +90,16 @@ fn main() -> ExitCode {
         [verb, sub] if verb == "cache" && sub == "path" => cache_path(),
         [verb, sub] if verb == "cache" && sub == "clear" => cache_clear(),
         [verb, ..] if verb == "cache" => Err("cache needs path or clear; see --help".to_string()),
+        [verb, src, dest] if verb == "import" => import(Path::new(src), Path::new(dest)),
+        [verb, ..] if verb == "import" => Err("import needs SRC and DEST; see --help".to_string()),
+        [verb, roll, rest @ ..] if verb == "list" => list(Path::new(roll), rest),
+        [verb] if verb == "list" => Err("list needs ROLL; see --help".to_string()),
+        [verb, file, word] if verb == "flag" => flag(Path::new(file), word),
+        [verb, ..] if verb == "flag" => {
+            Err("flag needs FILE and pick, reject or clear; see --help".to_string())
+        }
+        [verb, file, rest @ ..] if verb == "edit" => edit(Path::new(file), rest),
+        [verb] if verb == "edit" => Err("edit needs FILE; see --help".to_string()),
         _ => Err("unrecognized arguments; see --help".to_string()),
     };
     match result {
@@ -867,4 +899,423 @@ fn cache_clear() -> Result<(), String> {
         dir.display()
     )
     .map_err(|e| e.to_string())
+}
+
+// ---------------------------------------------------------------- library
+
+/// How deep under SRC an import looks (cards keep photos a few folders
+/// down), and how many directory entries an import or a listing reads
+/// before giving up.
+const IMPORT_DEPTH: usize = 8;
+const MAX_ENTRIES: usize = 100_000;
+
+/// The sidecar beside an original.
+fn sidecar_path(original: &Path) -> PathBuf {
+    let mut name = original.as_os_str().to_owned();
+    name.push(library::SIDECAR_SUFFIX);
+    PathBuf::from(name)
+}
+
+/// A sidecar as found beside an original.
+enum Loaded {
+    /// No sidecar: the camera's defaults.
+    None,
+    Sidecar(Sidecar),
+    /// A sidecar refused as a whole, and why: not a regular file, not
+    /// readable, or outside the grammar.
+    Refused(String),
+}
+
+/// Reads a sidecar, bounded a byte past its ceiling so an oversize one is
+/// refused by the grammar, not truncated into a valid one. Only a regular
+/// file is opened: a link, a fifo or a folder at the sidecar's name is
+/// refused before anything follows it or blocks on it.
+fn load_sidecar(original: &Path) -> Loaded {
+    let path = sidecar_path(original);
+    let read = || -> io::Result<Vec<u8>> {
+        if !fs::symlink_metadata(&path)?.is_file() {
+            return Err(io::Error::other("not a regular file"));
+        }
+        let mut bytes = Vec::new();
+        fs::File::open(&path)?
+            .take(library::MAX_SIDECAR_BYTES as u64 + 1)
+            .read_to_end(&mut bytes)?;
+        Ok(bytes)
+    };
+    match read() {
+        Ok(bytes) => match Sidecar::parse(&bytes) {
+            Ok(sidecar) => Loaded::Sidecar(sidecar),
+            Err(error) => Loaded::Refused(error.to_string()),
+        },
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Loaded::None,
+        Err(e) => Loaded::Refused(e.to_string()),
+    }
+}
+
+/// The sidecar a verb edits: absent is the defaults, refused is an error,
+/// so half a sidecar's edits are never rewritten as the whole.
+fn read_sidecar(original: &Path) -> Result<Sidecar, String> {
+    match load_sidecar(original) {
+        Loaded::None => Ok(Sidecar::default()),
+        Loaded::Sidecar(sidecar) => Ok(sidecar),
+        Loaded::Refused(why) => Err(format!("{}: {why}", sidecar_path(original).display())),
+    }
+}
+
+/// Writes the sidecar through `NAME.edit.tmp`, synced, then renamed into
+/// place: the one file td-photo replaces, since the sidecar is its own.
+/// The temporary is created exclusively, so a stale one is reported, not
+/// reused or removed; and a sidecar the reader would refuse is not
+/// written, so what td-photo writes it reads.
+fn write_sidecar(original: &Path, sidecar: &Sidecar) -> Result<(), String> {
+    let path = sidecar_path(original);
+    let text = sidecar.text();
+    // An edit is the one way a sidecar grows, so the reader's ceilings are
+    // held here too.
+    if let Err(e) = Sidecar::parse(text.as_bytes()) {
+        return Err(format!(
+            "{}: not written, the reader would refuse it: {e}",
+            path.display()
+        ));
+    }
+    let mut temporary = path.as_os_str().to_owned();
+    temporary.push(".tmp");
+    let temporary = PathBuf::from(temporary);
+    let file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)
+        .map_err(|e| format!("{}: {e}", temporary.display()))?;
+    let write = |mut file: fs::File| -> io::Result<()> {
+        file.write_all(text.as_bytes())?;
+        file.sync_all()?;
+        fs::rename(&temporary, &path)
+    };
+    write(file).map_err(|e| {
+        // Ours to remove: created exclusively above.
+        let _ = fs::remove_file(&temporary);
+        format!("{}: {e}", path.display())
+    })
+}
+
+/// The original a sidecar verb acts on: a regular file a roll would list.
+fn original(path: &Path) -> Result<(), String> {
+    let listed = path
+        .file_name()
+        .and_then(OsStr::to_str)
+        .is_some_and(library::is_original);
+    if !listed {
+        return Err(format!("{}: not a NEF original", path.display()));
+    }
+    let meta = fs::symlink_metadata(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    if !meta.is_file() {
+        return Err(format!("{}: not a regular file", path.display()));
+    }
+    Ok(())
+}
+
+fn flag(path: &Path, word: &OsStr) -> Result<(), String> {
+    let word = word.to_str().ok_or("flag word is not UTF-8")?;
+    let value = match word {
+        "clear" => None,
+        other => Some(
+            Flag::parse(other)
+                .ok_or_else(|| format!("{other:?} is not pick, reject or clear"))?
+                .word(),
+        ),
+    };
+    original(path)?;
+    let mut sidecar = read_sidecar(path)?;
+    sidecar
+        .set(Key::Flag, value)
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    write_sidecar(path, &sidecar)
+}
+
+fn edit(path: &Path, rest: &[OsString]) -> Result<(), String> {
+    original(path)?;
+    let mut sidecar = read_sidecar(path)?;
+    if rest.is_empty() {
+        return io::stdout()
+            .lock()
+            .write_all(sidecar.text().as_bytes())
+            .map_err(|e| e.to_string());
+    }
+    let words = rest
+        .iter()
+        .map(|word| {
+            word.to_str()
+                .ok_or_else(|| "arguments must be UTF-8".to_string())
+        })
+        .collect::<Result<Vec<&str>, String>>()?;
+    if words == ["reset"] {
+        sidecar.reset();
+        return write_sidecar(path, &sidecar);
+    }
+    let mut words = words.as_slice();
+    while let Some((name, tail)) = words.split_first() {
+        let key = Key::parse(name)
+            .ok_or_else(|| format!("{name}: not a sidecar key (flag, exposure, crop, look)"))?;
+        let take = match key {
+            Key::Crop if tail.first() != Some(&"-") => 4,
+            _ => 1,
+        };
+        let values = tail
+            .get(..take)
+            .ok_or_else(|| format!("{name} needs {take} value(s); see --help"))?;
+        let value = if values == ["-"] {
+            None
+        } else {
+            Some(values.join(" "))
+        };
+        sidecar
+            .set(key, value.as_deref())
+            .map_err(|e| format!("{}: {e}", path.display()))?;
+        words = tail.get(take..).unwrap_or(&[]);
+    }
+    write_sidecar(path, &sidecar)
+}
+
+fn list(roll: &Path, rest: &[OsString]) -> Result<(), String> {
+    check_flags(rest, &[], &["--picks", "--rejects", "--unflagged"])?;
+    let switches: Vec<&str> = rest.iter().filter_map(|arg| arg.to_str()).collect();
+    let filter = match switches.as_slice() {
+        [] => Filter::All,
+        ["--picks"] => Filter::Picks,
+        ["--rejects"] => Filter::Rejects,
+        ["--unflagged"] => Filter::Unflagged,
+        _ => return Err("list takes at most one of --picks, --rejects, --unflagged".to_string()),
+    };
+    let named = |e: io::Error| format!("{}: {e}", roll.display());
+    let mut names: Vec<String> = Vec::new();
+    for (seen, entry) in fs::read_dir(roll).map_err(named)?.enumerate() {
+        if seen >= MAX_ENTRIES {
+            return Err(format!(
+                "{}: more than {MAX_ENTRIES} entries",
+                roll.display()
+            ));
+        }
+        let entry = entry.map_err(named)?;
+        let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        // `file_type` does not follow a link, so a link is not an original.
+        if library::is_original(&name) && entry.file_type().map_err(named)?.is_file() {
+            names.push(name);
+        }
+    }
+    names.sort();
+    let stdout = io::stdout();
+    let mut out = stdout.lock();
+    for name in names {
+        let (values, status) = match load_sidecar(&roll.join(&name)) {
+            Loaded::None => (Sidecar::default(), "none".to_string()),
+            Loaded::Sidecar(sidecar) => (sidecar, "ok".to_string()),
+            Loaded::Refused(why) => (Sidecar::default(), format!("error {why}")),
+        };
+        if !filter.admits(values.flag()) {
+            continue;
+        }
+        let column = |key: Key| values.value(key).unwrap_or("-").to_string();
+        writeln!(
+            out,
+            "{name}\t{}\t{}\t{}\t{}\t{status}",
+            column(Key::Flag),
+            column(Key::Exposure),
+            column(Key::Crop),
+            column(Key::Look)
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+fn import(src: &Path, dest: &Path) -> Result<(), String> {
+    // SRC itself may be a link, as a mounted card often is; nothing under
+    // it is followed.
+    let meta = fs::metadata(src).map_err(|e| format!("{}: {e}", src.display()))?;
+    if !meta.is_dir() {
+        return Err(format!("{}: not a directory", src.display()));
+    }
+    let mut sources = Vec::new();
+    collect_originals(src, 0, &mut sources, &mut 0)?;
+    sources.sort();
+    let (mut imported, mut skipped, mut conflicts, mut unread) = (0usize, 0usize, 0usize, 0usize);
+    let stdout = io::stdout();
+    let mut out = stdout.lock();
+    for source in sources {
+        // A source that cannot be read is reported and the rest go on; the
+        // run fails at the end for it as for a conflict.
+        let data = match read_file(&source) {
+            Ok(data) => data,
+            Err(why) => {
+                unread += 1;
+                writeln!(out, "unread {why}").map_err(|e| e.to_string())?;
+                continue;
+            }
+        };
+        let folder = library::roll_folder(library::taken(&data).as_deref());
+        let name = source
+            .file_name()
+            .ok_or_else(|| format!("{}: no file name", source.display()))?;
+        let dir = dest.join(folder);
+        let target = dir.join(name);
+        let (word, why) = match fs::symlink_metadata(&target) {
+            Ok(meta) => match conflict(&meta, &target, &data) {
+                None => {
+                    skipped += 1;
+                    ("skipped", None)
+                }
+                Some(why) => {
+                    conflicts += 1;
+                    ("conflict", Some(why))
+                }
+            },
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+                match copy_in(&data, &target)? {
+                    None => {
+                        imported += 1;
+                        ("imported", None)
+                    }
+                    Some(why) => {
+                        conflicts += 1;
+                        ("conflict", Some(why))
+                    }
+                }
+            }
+            Err(e) => return Err(format!("{}: {e}", target.display())),
+        };
+        match why {
+            None => writeln!(out, "{word} {}", target.display()),
+            Some(why) => writeln!(
+                out,
+                "{word} {}: {why}; source {}",
+                target.display(),
+                source.display()
+            ),
+        }
+        .map_err(|e| e.to_string())?;
+    }
+    writeln!(
+        out,
+        "imported {imported}, skipped {skipped}, conflicts {conflicts}, unread {unread}"
+    )
+    .map_err(|e| e.to_string())?;
+    if conflicts > 0 || unread > 0 {
+        return Err(format!(
+            "{conflicts} conflict(s) left alone, {unread} source(s) unread; see the list above"
+        ));
+    }
+    Ok(())
+}
+
+/// Why a `target` that exists is a conflict, or `None` when it is a regular
+/// file holding exactly `data`: not a regular file, a different length or
+/// different bytes, or unreadable, which is reported rather than assumed
+/// either way.
+fn conflict(meta: &fs::Metadata, target: &Path, data: &[u8]) -> Option<String> {
+    if !meta.is_file() {
+        return Some("not a regular file".to_string());
+    }
+    if meta.len() != data.len() as u64 {
+        return Some("differs".to_string());
+    }
+    match holds(target, data) {
+        Ok(true) => None,
+        Ok(false) => Some("differs".to_string()),
+        Err(e) => Some(format!("cannot be compared: {e}")),
+    }
+}
+
+/// Whether `target` holds exactly `data`, compared a piece at a time so a
+/// second copy of the file is never in memory and no more than `data` and
+/// a piece is read.
+fn holds(target: &Path, data: &[u8]) -> io::Result<bool> {
+    let mut file = fs::File::open(target)?;
+    let mut piece = vec![0u8; 1 << 16];
+    let mut rest = data;
+    loop {
+        let read = match file.read(&mut piece) {
+            Ok(read) => read,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
+        if read == 0 {
+            return Ok(rest.is_empty());
+        }
+        match rest.split_at_checked(read) {
+            Some((head, tail)) if Some(head) == piece.get(..read) => rest = tail,
+            _ => return Ok(false),
+        }
+    }
+}
+
+/// Copies through `NAME.part`, synced, linked into place and the temporary
+/// unlinked: the publication every write but the sidecar's uses, which
+/// cannot replace. A name in the way is a conflict, returned as its reason
+/// rather than failing the run: a `NAME.part` already there is a previous
+/// run's and is neither reused nor removed, and a `NAME` that appeared
+/// since the check is left as it is. Any other failure is the run's.
+fn copy_in(data: &[u8], target: &Path) -> Result<Option<String>, String> {
+    let mut part = target.as_os_str().to_owned();
+    part.push(".part");
+    let part = PathBuf::from(part);
+    let file = match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&part)
+    {
+        Ok(file) => file,
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+            return Ok(Some(format!("{} is in the way", part.display())));
+        }
+        Err(e) => return Err(format!("{}: {e}", part.display())),
+    };
+    let write = |mut file: fs::File| -> io::Result<()> {
+        file.write_all(data)?;
+        file.sync_all()?;
+        publish(&part, target)
+    };
+    match write(file) {
+        Ok(()) => Ok(None),
+        Err(e) => {
+            // Ours to remove: created exclusively above.
+            let _ = fs::remove_file(&part);
+            if e.kind() == io::ErrorKind::AlreadyExists {
+                Ok(Some("appeared meanwhile".to_string()))
+            } else {
+                Err(format!("{}: {e}", target.display()))
+            }
+        }
+    }
+}
+
+/// Every original under `dir`, to `IMPORT_DEPTH`, links not followed.
+fn collect_originals(
+    dir: &Path,
+    depth: usize,
+    files: &mut Vec<PathBuf>,
+    seen: &mut usize,
+) -> Result<(), String> {
+    let named = |e: io::Error| format!("{}: {e}", dir.display());
+    for entry in fs::read_dir(dir).map_err(named)? {
+        let entry = entry.map_err(named)?;
+        *seen += 1;
+        if *seen > MAX_ENTRIES {
+            return Err(format!(
+                "{}: more than {MAX_ENTRIES} entries under the source",
+                dir.display()
+            ));
+        }
+        let kind = entry.file_type().map_err(named)?;
+        if kind.is_dir() {
+            if depth < IMPORT_DEPTH {
+                collect_originals(&entry.path(), depth + 1, files, seen)?;
+            }
+        } else if kind.is_file() && entry.file_name().to_str().is_some_and(library::is_original) {
+            files.push(entry.path());
+        }
+    }
+    Ok(())
 }

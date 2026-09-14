@@ -32,6 +32,7 @@ const PURE: &[&str] = &[
     "develop.rs",
     "image.rs",
     "jpeg.rs",
+    "library.rs",
     "nef.rs",
     "tiff.rs",
 ];
@@ -45,10 +46,16 @@ fn source_inventory_is_closed() {
         .map(|s| s.to_string())
         .collect();
     assert_eq!(names("src", "rs"), expected);
-    let tests: BTreeSet<String> = ["confinement.rs", "develop.rs", "jpeg.rs", "nef.rs"]
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
+    let tests: BTreeSet<String> = [
+        "confinement.rs",
+        "develop.rs",
+        "jpeg.rs",
+        "library.rs",
+        "nef.rs",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
     assert_eq!(names("tests", "rs"), tests);
     let fixtures: BTreeSet<String> = [
         "README.md",
@@ -144,10 +151,14 @@ fn pure_modules_reach_no_file_environment_clock_network_or_process() {
     assert!(main.contains(".create_new(true)"));
     assert!(main.contains("fs::symlink_metadata(out).is_ok()"));
     assert!(!main.contains("File::create("), "a truncating create");
-    // Publication is a link, which cannot replace; the rename is only the
-    // fallback for a file system without links.
+    // Publication is a link, which cannot replace. A rename is the fallback
+    // for a file system without links, and the sidecar's write: the one
+    // file td-photo replaces, through a temporary of its own (DESIGN.md,
+    // Files). No third.
     assert!(main.contains("fs::hard_link(temporary, out)"));
-    assert_eq!(main.matches("fs::rename(").count(), 1);
+    assert!(main.contains("fs::rename(temporary, out)"));
+    assert!(main.contains("fs::rename(&temporary, &path)"));
+    assert_eq!(main.matches("fs::rename(").count(), 2);
     assert!(!main.contains("println!"), "a panicking print");
     // Only `develop` spreads work across threads, with scoped threads
     // that cannot outlive the call.

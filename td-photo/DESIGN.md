@@ -19,27 +19,29 @@ Efficiency codec are later increments, not silent partial support.
 
 ## Status and scope
 
-Implemented: the bounded TIFF container reader (`tiff`), the NEF reader
-over it (`nef`: the raw sub-image, the embedded previews, the exposure
-facts, and the maker-note white balance, black level, sensor crop and
-linearization table), the Nikon Huffman decoder for every tree dcraw names
-with the 14-bit lossless tree verified against a real Z 8 frame and the
-others against the test encoder only, the camera table with the Z 8's
-colour matrix (`camera`), the linear colour math and the sRGB transfer
-(`color`), the superpixel demosaic, area resampler and headless development
-pipeline (`develop`), the RGB image buffers and PPM writer and reader
-(`image`), the baseline JPEG decoder for the embedded previews with its
-reduced-transform scaling (`jpeg`), the thumbnail rule and the thumbnail
-cache, and the command line `td-photo probe FILE`, `td-photo develop
-FILE OUT.ppm`, `td-photo thumb FILE OUT.ppm` and `td-photo cache`.
-Every verb reads the file through a read bounded by `MAX_FILE_BYTES` that
-does not trust the length the file system reported, and `develop` and
-`thumb` refuse an `OUT.ppm` (or `OUT.ppm.tmp`) that already exists rather
-than replace it, publishing the finished temporary by a hard link so a
-name that appeared meanwhile is not replaced either.
-No window, no sidecar, no import and no look yet: the increments at the
-end schedule them in order. Nothing in this crate depends
-on td-ui until the window increment adds the path dependency.
+Implemented: the bounded TIFF container reader (`tiff`), the NEF reader over it
+(`nef`: the raw sub-image, the embedded previews, the exposure facts, and the
+maker-note white balance, black level, sensor crop and linearization table), the
+Nikon Huffman decoder for every tree dcraw names with the 14-bit lossless tree
+verified against a real Z 8 frame and the others against the test encoder only,
+the camera table with the Z 8's colour matrix (`camera`), the linear colour math
+and the sRGB transfer (`color`), the superpixel demosaic, area resampler and
+headless development pipeline (`develop`), the RGB image buffers and PPM writer
+and reader (`image`), the baseline JPEG decoder for the embedded previews with
+its reduced-transform scaling (`jpeg`), the thumbnail rule and the thumbnail
+cache, the library's sidecar grammar, roll rules and dating rule (`library`),
+and the command line `td-photo probe FILE`, `td-photo develop FILE OUT.ppm`,
+`td-photo thumb FILE OUT.ppm`, `td-photo cache`, `td-photo import SRC DEST`,
+`td-photo list ROLL`, `td-photo flag FILE` and `td-photo edit FILE`. Every read
+of a camera file is bounded by `MAX_FILE_BYTES` and of a sidecar by
+`MAX_SIDECAR_BYTES`, trusting neither the length the file system reported;
+`develop` and `thumb` refuse an `OUT.ppm` (or `OUT.ppm.tmp`) that already exists
+rather than replace it, and `import` a copy that differs, publishing the
+finished temporary by a hard link so a name that appeared meanwhile is not
+replaced either; the sidecar is the one file td-photo replaces, and only through
+its own temporary. No window and no look yet: the increments at the end schedule
+them in order. Nothing in this crate depends on td-ui until the window increment
+adds the path dependency.
 
 The rules below define version 1; the increments identify the order of
 implementation, not choices left to each implementing agent.
@@ -54,7 +56,9 @@ original: import copies, culling moves rejects into a subfolder, export
 writes new files beside the roll, and every write is a temporary file
 given its final name by a hard link, which cannot replace an existing
 name; a rename, which can, is the fallback only on a file system without
-links, after a second check. It opens no network connection and runs no
+links, after a second check. The sidecar, td-photo's own file, is the one
+exception: its temporary is renamed over it, and only after the old one
+was read whole and accepted. It opens no network connection and runs no
 subprocess. A camera
 file is untrusted input: every offset, count and dimension is checked
 against a ceiling before it sizes an allocation or indexes a buffer, and a
@@ -113,8 +117,8 @@ socket on the live window, all speaking one vocabulary.
   files is also a command-line verb: `import`, `list`, `flag`, `edit`
   (get and set of a sidecar's values), `develop`, `export`, `thumb`,
   `looks` and `cache clear`. Verbs are the batch face: they read the same
-  sidecars and write through the same publication, and an agent that does
-  not need to see pixels never opens a window.
+  sidecars and write them the same way, and an agent that does not need
+  to see pixels never opens a window.
 - **`--replay`: the window without a display.** `td-photo --replay [--size
   WxH] [ROLL]` reads requests on stdin and answers on stdout in the
   envelope td-editor's CONTROL.md defines: a four-byte big-endian length,
@@ -153,16 +157,27 @@ socket on the live window, all speaking one vocabulary.
 The library is folders of originals; there is no database.
 
 - **Roll**: one folder of originals. Import files a photo under
-  `DEST/YYYY/YYYY-MM-DD/NAME` by its `DateTimeOriginal`, or under
-  `DEST/undated/` when the file has none. A roll is listed by name; a
-  supported file is one whose extension is `nef` or `NEF` (JPEG and DNG are
-  later increments).
-- **Import** copies through `NAME.part` in the destination folder,
-  syncs, then links it to `NAME` and unlinks `NAME.part` (the publication
-  every write uses). A destination that already exists with
-  the same length and identical bytes is skipped and counted; one that
-  differs is reported and left alone, never overwritten. The source is
-  never written.
+  `DEST/YYYY/YYYY-MM-DD/NAME` by its `DateTimeOriginal`, read from the Exif IFD
+  alone so a file that is not a whole NEF still dates itself, or under
+  `DEST/undated/` when it has none or the value is not exactly `YYYY:MM:DD
+  HH:MM:SS` naming a calendar date and a time of day (a camera whose clock was
+  never set writes blanks in that shape). Import looks eight folders deep under
+  the source (a card keeps its photos a few folders down) and follows no link
+  under it; the source itself may be one, as a mounted card often is. A roll is
+  listed by name, regular files only, and a folder of more than 100,000 entries
+  is refused; a supported file is one whose extension is `nef` or `NEF` (JPEG
+  and DNG are later increments), and `NAME.part`, a dotfile or a name with a
+  control character in it is not one.
+- **Import** copies through `NAME.part` in the destination folder, syncs, then
+  links it to `NAME` and unlinks `NAME.part` (the publication every write but
+  the sidecar's uses, with the same fallback on a file system without links). A
+  destination that already exists with the same length and identical bytes,
+  compared a piece at a time, is skipped and counted; one that differs, is not a
+  regular file or cannot be read, a `NAME.part` left by an earlier run, and a
+  `NAME` that appears between the check and the link are each reported as a
+  conflict with why, left alone, never overwritten; a source that cannot be read
+  is reported as unread; and the run fails once the rest is done, so a script
+  notices and nothing is lost. The source is never written.
 - **Sidecar**: `NAME.ext.edit` beside the original, UTF-8 text, one
   `key value` pair per line:
 
@@ -174,16 +189,28 @@ The library is folders of originals; there is no database.
   look classic-chrome
   ```
 
-  `flag` is `pick` or `reject`, absent when unflagged; `exposure` is stops
-  with two decimals in -5.00..=5.00; `crop` is `x y w h` as fractions of the
-  oriented image with four decimals, all in 0..=1, `w` and `h` at least
-  0.05; `look` is a look's file stem. A line whose key is unknown is
-  preserved verbatim and rewritten in place, so a later version's keys
-  survive an earlier one's edit. A sidecar over 64 KiB or 1024 lines, a
-  first line other than `td-photo edit 1`, or a malformed known value is
-  refused as a whole and the photo is shown with camera defaults and an
-  error, never with half its edits. Writes go through `NAME.ext.edit.tmp`
-  and the same link-then-unlink publication.
+  `flag` is `pick` or `reject`, absent when unflagged; `exposure` is stops with
+  two decimals in -5.00..=5.00, `-0.00` not a spelling of zero; `crop` is `x y w
+  h` as fractions of the oriented image with four decimals, all in 0..=1, `w`
+  and `h` at least 0.05; `look` is a look's file stem, 1 to 64 bytes of ASCII
+  letters, digits, `-`, `_` and `.`, not starting with `.`. A key is 1 to 32
+  bytes of lowercase ASCII letters, digits and `-`, starting with a letter, and
+  a value is one or more characters with no control character and no space at
+  either end: the grammar a later version's keys must keep. A line whose key is
+  unknown is preserved verbatim and rewritten in place, so a later version's
+  keys survive an earlier one's edit; a known key given twice, a blank line, or
+  a line that is not `key value` is a fault. A sidecar over 64 KiB or 1024
+  lines, a first line other than `td-photo edit 1`, or a malformed known value
+  is refused as a whole and the photo is shown with camera defaults and an
+  error, never with half its edits; `list` shows the error, and `flag` and
+  `edit` refuse to rewrite it. A name at the sidecar's place that is not a
+  regular file (a link, a fifo, a folder) is refused the same way, checked by
+  name before the open, with the window between the two that the Cache bullet
+  names. Writes go through `NAME.ext.edit.tmp`, synced and renamed into place:
+  the sidecar is td-photo's own file and the one it replaces, and the temporary
+  is created exclusively, so a stale one is reported rather than reused or
+  removed; an edit that would take the sidecar past the ceilings above is
+  refused before anything is written, so what td-photo writes it reads.
 - **Rejected** originals move, with their sidecars, into `rejected/`
   under the roll. Export writes into `exported/`. Neither folder is
   listed as part of the roll.
@@ -525,12 +552,14 @@ not ready paints a neutral placeholder and its name, never blocks.
 
 - No original is ever modified, renamed or unlinked by td-photo. Import
   copies; culling moves into `rejected/`; export writes new names.
-- No existing name is ever replaced: a destination is refused by name
-  before any work, and the final step of every write is a hard link,
-  which fails on a name that appeared meanwhile; only a file system that
-  refuses links falls back to a second check and a rename.
+- No existing name but a sidecar's is ever replaced: a destination is
+  refused by name before any work, and the final step of every write is a
+  hard link, which fails on a name that appeared meanwhile; only a file
+  system that refuses links falls back to a second check and a rename.
+  The sidecar is td-photo's own file, read whole and accepted before its
+  temporary is renamed over it.
 - Pure modules (`tiff`, `nef`, `camera`, `color`, `develop`, `image`,
-  `jpeg`, and later `look`, `edit`) read no file, environment, clock or
+  `jpeg`, `library`, and later `look`) read no file, environment, clock or
   descriptor. `main` and the library adapter own I/O.
 - Every ceiling above is checked before the allocation or index it
   guards; a refused input names the item.
@@ -586,6 +615,19 @@ wrong or out-of-sequence restart marker and an unread byte before one, a
 code no table holds, a reserved AC symbol, a predictor past 16 bits, a
 run or a ZRL past the block, and anything but EOI after the scan).
 
+`tests/library.rs` holds the sidecar grammar to its refusals by name and to
+in-place rewriting around an unknown line, the canonical value spellings, and
+the roll and dating rules with a two-IFD TIFF carrying only a capture time; and
+runs the built binary over a temporary library: an import dated and undated,
+eight folders deep and not nine, through a linked source and past a linked
+folder and file, skipped when identical, refused as a conflict when a copy
+differs, a folder stands in its place or a `NAME.part` is in the way, with the
+card unchanged and no temporary left; `list` with each filter; and `flag` and
+`edit` writing through the sidecar, keeping an unknown line, refusing a bad
+value before writing, refusing a malformed sidecar, a stale temporary, a linked
+sidecar, a sidecar past either ceiling and an edit that would take one past, and
+unlinking nothing.
+
 From the window increment on, `tests/ui.rs` drives `ui::Controller`
 in-process (the action table's completeness, scripted sessions held to
 `state` and pixel oracles through the replay path) and
@@ -607,7 +649,7 @@ all-target Clippy.
    `td-photo cache`, and preview facts and hashes in `probe`. Landed.
 3. Library: rolls, the sidecar reader and writer, `import`, `list`,
    `flag` and `edit` headless, with the never-overwrite and never-unlink
-   oracles.
+   oracles. Landed.
 4. Window, cull mode: the td-ui dependency, `ui::Controller` with its
    action table and `--help actions`, `--replay` with the whole
    vocabulary over the cull actions, `--preview`, the worker pool, the

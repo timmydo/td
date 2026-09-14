@@ -4,8 +4,9 @@
 //! the container, `nef` the Nikon layout and codec over it, `camera` is the
 //! table of supported bodies, `color` the linear colour math and transfer,
 //! `develop` the demosaic, resampler and pipeline, `jpeg` the baseline
-//! decoder for the camera's embedded previews, and `image` the RGB buffers
-//! and PPM writer. None of these reads a file, the environment, a clock or
+//! decoder for the camera's embedded previews, `image` the RGB buffers
+//! and PPM writer, and `library` the sidecar grammar, roll rules and
+//! dating rule. None of these reads a file, the environment, a clock or
 //! a descriptor: `main` and, later, the library adapter own I/O. DESIGN.md
 //! is the contract.
 
@@ -14,5 +15,6 @@ pub mod color;
 pub mod develop;
 pub mod image;
 pub mod jpeg;
+pub mod library;
 pub mod nef;
 pub mod tiff;
