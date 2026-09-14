@@ -10,6 +10,7 @@
 //! modules take bytes and buffers, and the window takes its thumbnails
 //! from here.
 
+use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::{self, BufWriter, Read, Write};
@@ -25,6 +26,7 @@ use td_photo::color::{camera_color, Transfer};
 use td_photo::develop::{self, Params, MAX_THREADS};
 use td_photo::image::{read_ppm, write_ppm, Rgb8};
 use td_photo::library::{self, Filter, Flag, Key, Sidecar};
+use td_photo::look::{self, Look};
 use td_photo::nef::{self, Nef};
 use td_photo::ui::{self, Effect, Photo};
 use td_photo::{camera, jpeg, tiff};
@@ -38,10 +40,12 @@ const HELP: &str = concat!(
     "  with their geometry. --decode also decodes the raw strip and every\n",
     "  preview and prints their statistics and hashes.\n",
     "td-photo develop FILE OUT.ppm [--long-edge N] [--exposure STOPS]\n",
+    "                 [--look STEM]\n",
     "  Develops the raw to 8-bit sRGB at most N pixels on the long side\n",
-    "  (default 1600) with an exposure offset in stops (default 0), written\n",
-    "  through a fresh OUT.ppm.tmp and linked into place. OUT.ppm must not\n",
-    "  exist: td-photo never overwrites a file.\n",
+    "  (default 1600) with an exposure offset in stops (default 0) and the\n",
+    "  look STEM (see looks; default none), written through a fresh\n",
+    "  OUT.ppm.tmp and linked into place. OUT.ppm must not exist: td-photo\n",
+    "  never overwrites a file.\n",
     "td-photo thumb FILE OUT.ppm [--long-edge N] [--cache]\n",
     "  Writes the thumbnail: the smallest embedded preview that covers N\n",
     "  pixels on the long side (default 400), decoded at the coarsest\n",
@@ -52,6 +56,12 @@ const HELP: &str = concat!(
     "td-photo cache path | clear\n",
     "  Prints the cache directory ($XDG_CACHE_HOME/td-photo when that is\n",
     "  absolute, else ~/.cache/td-photo), or removes every thumbnail.\n",
+    "td-photo looks [STEM]\n",
+    "  Lists the looks, one per line: stem, user or built-in, and its name\n",
+    "  or why the file is refused, tab-separated. User looks are\n",
+    "  $XDG_CONFIG_HOME/td-photo/looks/STEM.look (~/.config/td-photo/looks/\n",
+    "  when that is not absolute) and shadow built-in ones of the same\n",
+    "  stem. With STEM, prints that look's text.\n",
     "td-photo import SRC DEST\n",
     "  Copies every NEF under SRC (eight folders deep, links under SRC\n",
     "  not followed) into DEST/YYYY/YYYY-MM-DD/ by its capture time, or\n",
@@ -119,6 +129,9 @@ fn main() -> ExitCode {
         [verb, sub] if verb == "cache" && sub == "path" => cache_path(),
         [verb, sub] if verb == "cache" && sub == "clear" => cache_clear(),
         [verb, ..] if verb == "cache" => Err("cache needs path or clear; see --help".to_string()),
+        [verb] if verb == "looks" => looks(None),
+        [verb, stem] if verb == "looks" => looks(Some(stem)),
+        [verb, ..] if verb == "looks" => Err("looks takes at most STEM; see --help".to_string()),
         [verb, src, dest] if verb == "import" => import(Path::new(src), Path::new(dest)),
         [verb, ..] if verb == "import" => Err("import needs SRC and DEST; see --help".to_string()),
         [verb, roll, rest @ ..] if verb == "list" => list(Path::new(roll), rest),
@@ -455,7 +468,7 @@ fn fnv1a64(bytes: &[u8]) -> u64 {
 }
 
 fn develop_file(path: &Path, out: &Path, rest: &[OsString]) -> Result<(), String> {
-    check_flags(rest, &["--long-edge", "--exposure"], &[])?;
+    check_flags(rest, &["--long-edge", "--exposure", "--look"], &[])?;
     let long_edge = match option(rest, "--long-edge")? {
         Some(text) => text
             .parse::<usize>()
@@ -471,6 +484,12 @@ fn develop_file(path: &Path, out: &Path, rest: &[OsString]) -> Result<(), String
             .filter(|v| v.is_finite() && (-5.0..=5.0).contains(v))
             .ok_or_else(|| format!("--exposure {text:?} is not -5..=5 stops"))?,
         None => 0.0,
+    };
+    // The look, like a bad option, is refused before the camera file is
+    // read; a user look that does not parse is an error, not the built-in.
+    let look = match option(rest, "--look")? {
+        Some(stem) => Some(find_look(&stem)?),
+        None => None,
     };
     // Refused before the decode, not only before the write.
     refuse_existing(out)?;
@@ -510,7 +529,11 @@ fn develop_file(path: &Path, out: &Path, rest: &[OsString]) -> Result<(), String
         wb,
         &color,
         &Transfer::srgb(),
-        &Params { exposure, threads },
+        &Params {
+            exposure,
+            threads,
+            look: look.as_ref(),
+        },
     )
     .map_err(|e| e.to_string())?;
     write_atomically(out, &image)?;
@@ -973,6 +996,178 @@ fn cache_clear() -> Result<(), String> {
         dir.display()
     )
     .map_err(|e| e.to_string())
+}
+
+// ------------------------------------------------------------------ looks
+
+/// `$XDG_CONFIG_HOME/td-photo/looks`, or `$HOME/.config/td-photo/looks`.
+fn looks_dir() -> Result<PathBuf, String> {
+    let base = match std::env::var_os("XDG_CONFIG_HOME").filter(|v| Path::new(v).is_absolute()) {
+        Some(v) => PathBuf::from(v),
+        None => {
+            let home = std::env::var_os("HOME")
+                .filter(|v| Path::new(v).is_absolute())
+                .ok_or("neither XDG_CONFIG_HOME nor HOME names an absolute directory")?;
+            PathBuf::from(home).join(".config")
+        }
+    };
+    Ok(base.join("td-photo").join("looks"))
+}
+
+/// Reads a look file, bounded a byte past its ceiling so an oversize one
+/// is refused by the format, not truncated into a valid one. A link is
+/// followed (the directory is the user's configuration, often linked from
+/// elsewhere), but a link to nothing is the user's file and unreadable,
+/// not a stem the user has no look for; a fifo or a folder at the name is
+/// refused before it is opened. The window between that check and the
+/// open is the one every read of a user directory here has (DESIGN.md,
+/// Files): the directory is the user's own configuration.
+fn read_look(path: &Path) -> io::Result<Vec<u8>> {
+    let meta = match fs::metadata(path) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == io::ErrorKind::NotFound && fs::symlink_metadata(path).is_ok() => {
+            return Err(io::Error::other("a link to nothing"));
+        }
+        Err(e) => return Err(e),
+    };
+    if !meta.is_file() {
+        return Err(io::Error::other("not a regular file"));
+    }
+    let mut bytes = Vec::new();
+    fs::File::open(path)?
+        .take(look::MAX_LOOK_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
+/// The text of the look of `stem` and what to call it in an error: the
+/// user's file when there is one, else the built-in. A user file that
+/// cannot be read is an error, not a fall back to the built-in it shadows;
+/// without a user directory (no absolute `XDG_CONFIG_HOME` or `HOME`) the
+/// built-in set is all there is.
+fn look_text(stem: &str) -> Result<(Vec<u8>, String), String> {
+    if !library::valid_look(stem) {
+        return Err(format!(
+            "look {stem:?} is not a look stem (1 to 64 of letters, digits, - _ and ., not starting with .)"
+        ));
+    }
+    let dir = looks_dir();
+    if let Ok(dir) = &dir {
+        let path = dir.join(format!("{stem}.look"));
+        match read_look(&path) {
+            Ok(bytes) => return Ok((bytes, path.display().to_string())),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(format!("{}: {e}", path.display())),
+        }
+    }
+    match (look::builtin(stem), dir) {
+        (Some(text), _) => Ok((text.as_bytes().to_vec(), format!("built-in look {stem}"))),
+        (None, Ok(dir)) => Err(format!(
+            "look {stem}: not built in and not at {}",
+            dir.join(format!("{stem}.look")).display()
+        )),
+        (None, Err(why)) => Err(format!(
+            "look {stem}: not built in, and no user looks directory ({why})"
+        )),
+    }
+}
+
+/// The look of `stem`, parsed; a refusal names the file and the line.
+fn find_look(stem: &str) -> Result<Look, String> {
+    let (bytes, what) = look_text(stem)?;
+    Look::parse(&bytes).map_err(|e| format!("{what}: {e}"))
+}
+
+/// `looks`: one line per look, by stem, or with a stem that look's text.
+fn looks(stem: Option<&OsStr>) -> Result<(), String> {
+    let stdout = io::stdout();
+    let mut out = stdout.lock();
+    if let Some(stem) = stem {
+        let stem = stem.to_str().ok_or("STEM is not UTF-8")?;
+        let (bytes, what) = look_text(stem)?;
+        Look::parse(&bytes).map_err(|e| format!("{what}: {e}"))?;
+        return out.write_all(&bytes).map_err(|e| e.to_string());
+    }
+    // Stem to source and note; a user look replaces the built-in's row.
+    let mut rows: BTreeMap<String, (&str, String)> = BTreeMap::new();
+    for (stem, text) in look::BUILTIN {
+        let name = Look::parse(text.as_bytes())
+            .map_err(|e| format!("built-in look {stem}: {e}"))?
+            .name()
+            .unwrap_or("-")
+            .to_string();
+        rows.insert(stem.to_string(), ("built-in", name));
+    }
+    match looks_dir().and_then(|dir| user_looks(&dir)) {
+        Ok(user) => {
+            for (stem, note) in user {
+                rows.insert(stem, ("user", note));
+            }
+        }
+        Err(why) => {
+            // The built-in set is still worth listing; the user's is not
+            // reachable (no directory to resolve, or one that cannot be
+            // read) and that is said, as `thumb --cache` says of a cache
+            // it cannot use.
+            let _ = writeln!(
+                io::stderr().lock(),
+                "td-photo: user looks not listed: {why}"
+            );
+        }
+    }
+    for (stem, (source, note)) in rows {
+        writeln!(out, "{stem}\t{source}\t{note}").map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+/// Every `STEM.look` in `dir` with its name, or `error` and why it is
+/// refused; a stem the sidecar grammar cannot hold is listed quoted and
+/// escaped, so a name with a tab or a newline in it is still one record
+/// of three columns; a directory that is not there is empty, and one of
+/// more than `MAX_ENTRIES` entries is refused.
+fn user_looks(dir: &Path) -> Result<Vec<(String, String)>, String> {
+    let named = |e: io::Error| format!("{}: {e}", dir.display());
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(named(e)),
+    };
+    let mut looks = Vec::new();
+    for (seen, entry) in entries.enumerate() {
+        if seen >= MAX_ENTRIES {
+            return Err(format!(
+                "{}: more than {MAX_ENTRIES} entries",
+                dir.display()
+            ));
+        }
+        let entry = entry.map_err(named)?;
+        let Some(stem) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.strip_suffix(".look"))
+            .map(str::to_string)
+        else {
+            continue;
+        };
+        if !library::valid_look(&stem) {
+            looks.push((
+                format!("{stem:?}"),
+                "error not a look stem (1 to 64 of letters, digits, - _ and ., not starting with .)"
+                    .to_string(),
+            ));
+            continue;
+        }
+        let note = match read_look(&entry.path()) {
+            Ok(bytes) => match Look::parse(&bytes) {
+                Ok(look) => look.name().unwrap_or("-").to_string(),
+                Err(e) => format!("error {e}"),
+            },
+            Err(why) => format!("error {why}"),
+        };
+        looks.push((stem, note));
+    }
+    Ok(looks)
 }
 
 // ---------------------------------------------------------------- library

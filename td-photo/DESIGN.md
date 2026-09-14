@@ -25,27 +25,28 @@ maker-note white balance, black level, sensor crop and linearization table), the
 Nikon Huffman decoder for every tree dcraw names with the 14-bit lossless tree
 verified against a real Z 8 frame and the others against the test encoder only,
 the camera table with the Z 8's colour matrix (`camera`), the linear colour math
-and the sRGB transfer (`color`), the superpixel demosaic, area resampler and
-headless development pipeline (`develop`), the RGB image buffers and PPM writer
-and reader (`image`), the baseline JPEG decoder for the embedded previews with
-its reduced-transform scaling (`jpeg`), the thumbnail rule and the thumbnail
-cache, the library's sidecar grammar, roll rules and dating rule (`library`),
-the cull controller over td-ui's driven seam with its action table and scene
-(`ui`), the window over it with its thumbnail pool and control socket
-(`window`), and the command line `td-photo probe FILE`, `td-photo develop FILE
-OUT.ppm`, `td-photo thumb FILE OUT.ppm`, `td-photo cache`, `td-photo import SRC
+and the sRGB transfer (`color`), the look format with its built-in set (`look`),
+the superpixel demosaic, area resampler and headless development pipeline with
+the look in it (`develop`), the RGB image buffers and PPM writer and reader
+(`image`), the baseline JPEG decoder for the embedded previews with its
+reduced-transform scaling (`jpeg`), the thumbnail rule and the thumbnail cache,
+the library's sidecar grammar, roll rules and dating rule (`library`), the cull
+controller over td-ui's driven seam with its action table and scene (`ui`), the
+window over it with its thumbnail pool and control socket (`window`), and the
+command line `td-photo probe FILE`, `td-photo develop FILE OUT.ppm`, `td-photo
+thumb FILE OUT.ppm`, `td-photo cache`, `td-photo looks`, `td-photo import SRC
 DEST`, `td-photo list ROLL`, `td-photo flag FILE`, `td-photo edit FILE`,
 `td-photo open ROLL`, `td-photo --replay`, `td-photo --preview` and `td-photo
---help actions`. Every read of a camera file is bounded by `MAX_FILE_BYTES` and
-of a sidecar by `MAX_SIDECAR_BYTES`, trusting neither the length the file system
-reported; `develop` and `thumb` refuse an `OUT.ppm` (or `OUT.ppm.tmp`) that
-already exists rather than replace it, and `import` a copy that differs,
-publishing the finished temporary by a hard link so a name that appeared
-meanwhile is not replaced either; the sidecar is the one file td-photo replaces,
-and only through its own temporary. The crate depends on td-ui, by path, for the
-driven seam, the raster and bands the scene is laid out with and the Wayland
-client the window runs on; no look yet: the increments at the end schedule the
-rest in order.
+--help actions`. Every read of a camera file is bounded by `MAX_FILE_BYTES`, of
+a sidecar by `MAX_SIDECAR_BYTES` and of a look by `MAX_LOOK_BYTES`, trusting
+neither the length the file system reported; `develop` and `thumb` refuse an
+`OUT.ppm` (or `OUT.ppm.tmp`) that already exists rather than replace it, and
+`import` a copy that differs, publishing the finished temporary by a hard link
+so a name that appeared meanwhile is not replaced either; the sidecar is the one
+file td-photo replaces, and only through its own temporary. The crate depends on
+td-ui, by path, for the driven seam, the raster and bands the scene is laid out
+with and the Wayland client the window runs on; the window has no develop mode
+yet: the increments at the end schedule the rest in order.
 
 The rules below define version 1; the increments identify the order of
 implementation, not choices left to each implementing agent.
@@ -243,7 +244,7 @@ The library is folders of originals; there is no database.
   flag pick
   exposure -0.33
   crop 0.1000 0.0500 0.8000 0.9000
-  look classic-chrome
+  look classic-chrome-like
   ```
 
   `flag` is `pick` or `reject`, absent when unflagged; `exposure` is stops with
@@ -299,11 +300,17 @@ The library is folders of originals; there is no database.
   nothing in the library changes; `td-photo cache path` prints the directory as
   the bytes it is. The windows between a check and the operation it guards are
   those of any program without directory descriptors: the directories are the
-  user's own cache, and the only name ever unlinked is one of the cache's own
-  shape.
+  user's own cache and configuration, and the only name ever unlinked is one
+  of the cache's own shape.
 - **Looks** are read from `$XDG_CONFIG_HOME/td-photo/looks/*.look`
-  (`~/.config/td-photo/looks/` without it) on top of the built-in set the
-  binary carries; a user look of the same stem shadows the built-in one.
+  (`~/.config/td-photo/looks/` without it) on top of the built-in set the binary
+  carries; a user look of the same stem shadows the built-in one. A link in the
+  directory is followed, since a configuration directory is often linked from
+  elsewhere, and a link to nothing is an unreadable look of the user's, not an
+  absent one; a fifo or a folder at a look's name is refused before it is
+  opened, with the window between that check and the open the one above; a
+  directory that cannot be resolved or read is reported on stderr and the
+  built-in set is what there is.
 
 ## Decoding
 
@@ -486,12 +493,15 @@ In order, per pixel, all linear `f32` until the last step:
 5. the look, when one is applied (below), otherwise nothing;
 6. clip to `0..=1` and the sRGB transfer to 8 bits.
 
-Steps 2 through 4 are linear and fold into one 3x3 matrix and one clip;
-step 5 is a per-channel curve table over a log-spaced domain plus one
-saturation step; step 6 is the table. The cost per pixel is nine multiplies,
-six table loads and a few adds, which is what makes the preview redraw at
-frame cadence over a whole canvas on one core and in a few milliseconds
-across the pool.
+Steps 3 and 4 fold into one 3x3 matrix; step 5 is the look's operations in file
+order, each a 3x3 matrix, a curve as a table over a log-spaced domain or a
+luminance mix (Looks, below); step 6 is the table. The cost per pixel without a
+look is twelve multiplies (three for the white balance, nine for the matrix), a
+clip, three table loads and a few adds; a look adds nine multiplies per matrix,
+six loads and a few multiplies per tone or three-channel curve, and a few
+multiplies (one division for a luminance curve) per mix or luminance step; which
+is what makes the preview redraw at frame cadence over a whole canvas on one
+core and in a few milliseconds across the pool.
 
 ### Levels and memoization
 
@@ -526,8 +536,15 @@ level directly so level 2 is the only `f32` buffer.
 
 ## Looks
 
-A look is a text file, `stem.look`, UTF-8, one operation per line, applied
-in file order after step 4 of the pipeline:
+A look is a text file, `stem.look`, one operation per line, applied in file
+order after step 4 of the pipeline. A file over 4 KiB is refused before it is
+read as text; a byte that is not UTF-8 or a control character other than the
+newline is refused by the line it is on; a first line other than `td-photo look
+1` is refused as such, with no line; then, by line, a blank or indented line, an
+unknown word, a number outside `-?D+(.D+)?` (at most 24 characters), a second or
+empty or over-long `name` (1 to 64 characters, for the look list), or a value
+outside its range below. `look` parses the bytes and builds the tables; `main`
+reads the files.
 
 ```text
 td-photo look 1
@@ -539,27 +556,77 @@ saturation 0.85
 monochrome 0.30 0.59 0.11
 ```
 
-- `primaries` is a 3x3 matrix, row-major, each row renormalized to sum
-  to one so neutral stays neutral;
-- `tone` is the sigmoid `y = x^c / (x^c + k)` with `k` chosen so middle
-  grey (0.1845) is fixed, `contrast` the exponent in 0.5..=3.0, `toe` and
-  `shoulder` in -1..=1 skewing the curve below and above grey;
-- `curve` is a monotone cubic through at most 16 points in `0..=1` for
-  `r`, `g`, `b` or `luma`;
-- `saturation` scales chroma about Rec. 709 luminance in 0..=2;
-- `monochrome` collapses to the weighted sum, weights renormalized.
+- `primaries` is a 3x3 matrix, row-major, each row summing above zero and
+  divided by its sum so neutral stays neutral, its entries then within -4..=4
+  (checked after the division, so a row's gain on a channel is at most 12
+  whatever scale it was written at);
+- `tone` is the sigmoid `y = (1 + k) x^c / (x^c + k)` with `k = g^c (1 - g) /
+  (g - g^c)` for middle grey `g` (0.1845), so black, grey and white are fixed
+  and `contrast` (`c`, in 0.5..=3.0; 1 is the identity) steepens or flattens the
+  curve about grey; then `toe` and `shoulder` (each in -1..=1) reshape the
+  halves about the same fixed points: below grey `y' = g (y / g)^p`, above grey
+  `y' = 1 - (1 - g) u^q` for `u = (1 - y) / (1 - g)`, the exponents easing
+  quadratically from 1 at grey to `2^toe` at black and `2^shoulder` at white (`1
+  + (2^t - 1) v^2` for `v` the distance from grey as a share of the half), so a
+  positive toe deepens the shadows and is flat at black, a positive shoulder
+  lifts the highlights into white and is flat there, a negative one does the
+  reverse, the join at grey is smooth whatever the two are (slope 1 on both
+  sides), and each half is monotone throughout the ranges;
+- `curve` is a monotone cubic (Fritsch and Carlson's tangents) through 2 to 16
+  points in `0..=1` with strictly ascending `x`, holding the first and last
+  value outside them, for one of `r`, `g`, `b`, or `luma`, which moves the
+  pixel's Rec. 709 luminance `Y` to `f(Y)` with its chroma scaled by `f(Y) / Y`
+  when that darkens it and kept when it brightens it, `rgb' = f(Y) + (rgb - Y)
+  min(f(Y) / Y, 1)`: a highlight keeps its hue as it rolls off, a lifted black
+  takes black to the grey `f(0)` and a near-black hue to nearly that grey rather
+  than to a vivid colour, and the rule is continuous, with no case at zero;
+- `saturation` scales chroma about Rec. 709 luminance, `rgb' = Y + s (rgb -
+  Y)`, in 0..=2;
+- `monochrome` collapses to the weighted sum of non-negative weights summing
+  above zero, renormalized.
 
-At most 16 operations, a 4 KiB file; an unknown operation or an
-out-of-range value refuses the whole look by line number. The built-in set
-is `contrast-boost`, `contrast-soft`, `mono` and a Fujifilm-inspired family
-(`provia-like`, `velvia-like`, `astia-like`, `classic-chrome-like`,
-`classic-neg-like`, `eterna-like`, `acros-like`), each authored by hand in
-this format. The jssfr.de darktable styles that motivated them are built
-from darktable's `primaries`, `colorcontrast`, `colorbalancergb`, `agx`
-and `monochrome` modules; td-photo does not execute darktable's pipeline
-and does not claim to reproduce those styles. A converter that reads a
-`.dtstyle` and emits the nearest `.look` for that module subset is a later
-increment and is a translation the user runs, not a runtime dependency.
+`tone` and `curve` clamp their input to `0..=1` (exposure can have taken a
+channel past 1 before them) and are tabulated once when the look is parsed, in
+f64, over a log-spaced domain: 16 octaves below 1 with 128 nodes each, keyed by
+the float's exponent and top mantissa bits, linear between nodes and from zero
+to the first, so a pixel costs two loads and a few multiplies per channel and no
+call. The table is the curve's resolution: it passes its points to within the
+node interval, and a feature narrower than that (two knots closer than 1/128 of
+an octave, under one percent of the value) is smoothed over the interval. A
+table that is not finite refuses the look; with the knots the grammar admits (a
+secant near 1e22 beside one near 1e-22) f64 keeps every tangent finite, so that
+refusal is a guard. Matrices and mixes are applied as they are. Every operation
+is bounded (a matrix's gain on a channel by 12, a saturation's by 3, a
+per-channel curve's and a mix's by 1, and a luminance curve's output by 1 plus
+twice the pixel's largest channel), so sixteen of them keep any pixel the
+pipeline can produce finite in f32, and step 6 clips.
+
+At most 16 operations, a 4 KiB file. The built-in set is `contrast-boost`,
+`contrast-soft`, `mono` and a Fujifilm-inspired family (`provia-like`,
+`velvia-like`, `astia-like`, `classic-chrome-like`, `classic-neg-like`,
+`eterna-like`, `acros-like`), each authored by hand in this format and carried
+as a constant of `look` (no `include_str!`). The jssfr.de darktable styles that
+motivated them are built from darktable's `primaries`, `colorcontrast`,
+`colorbalancergb`, `agx` and `monochrome` modules; td-photo does not execute
+darktable's pipeline and does not claim to reproduce those styles. A converter
+that reads a `.dtstyle` and emits the nearest `.look` for that module subset is
+a later increment and is a translation the user runs, not a runtime dependency.
+
+`td-photo looks` lists every look, one per line, tab-separated: the stem, `user`
+or `built-in`, and the name (`-` without one) or `error` and why a user file is
+refused (a `.look` whose stem the sidecar grammar cannot hold is listed quoted
+and escaped, so a tab or a newline in a file name is still one record); the
+user's directory is the one Files names, a user look shadowing the built-in of
+its stem, and a directory that cannot be resolved (no absolute `XDG_CONFIG_HOME`
+or `HOME`) or read, or that holds more than `MAX_ENTRIES` entries, is reported
+on stderr and the built-in set listed. A link in the directory is followed, and
+a link to nothing is the user's file, unreadable, not a stem the user has no
+look for. `td-photo looks STEM` prints that look's text, so a built-in is copied
+into the user's directory to start from. `td-photo develop FILE OUT.ppm --look
+STEM` develops with it, resolved the same way: a user look that cannot be read
+or does not parse refuses the develop by file and line and does not fall back to
+the built-in it shadows, and a stem outside the sidecar's look grammar is
+refused before anything is read.
 
 ## Window
 
@@ -671,8 +738,8 @@ thumbnail is not ready paints a neutral placeholder and its name, never blocks.
   The sidecar is td-photo's own file, read whole and accepted before its
   temporary is renamed over it.
 - Pure modules (`tiff`, `nef`, `camera`, `color`, `develop`, `image`,
-  `jpeg`, `library`, and later `look`) read no file, environment, clock or
-  descriptor. `main` and the library adapter own I/O.
+  `jpeg`, `library`, `look`) read no file, environment, clock or descriptor.
+  `main` and the library adapter own I/O.
 - Every ceiling above is checked before the allocation or index it
   guards; a refused input names the item.
 - The colour of an unknown body is refused, not guessed.
@@ -713,6 +780,27 @@ of the reference file's header values.
 sRGB table's endpoints and monotonicity), the superpixel demosaic on a
 known quad, the area resampler on constant and step images, and a complete
 development of a synthetic frame to expected 8-bit values.
+
+`tests/look.rs` holds the look format to its refusals by line (the header, a
+blank line, an unknown word, a second or over-long name, every arity and range,
+a curve out of order or over the point budget, the operation budget, the size
+ceiling, and a control character or a byte that is not UTF-8 on its line) and to
+the number grammar; the arithmetic to hand-computed values: the identity tone
+and curve within the tables' precision, the fixed points and monotonicity of
+sampled contrasts, what a toe and a shoulder do to their side of grey, a curve
+through its points and flat outside them, the luminance rule darkening,
+brightening and lifting black, saturation at zero and two, a mix and a matrix
+renormalized at any scale, sixteen of the widest operations and the steepest
+admitted knots staying finite, and the file order; every built-in parsing,
+within both budgets, keeping a neutral ramp neutral, monotone and pinned at
+black and white; middle grey through the whole pipeline with a tone at the plain
+value and a mix making a colour grey; and runs the built binary: `looks` over a
+user directory with a shadowing, a nameless, a refused, a linked and a stray
+file, a stem with a tab, a folder and a link to nothing at a built-in's stem,
+without a resolvable directory, and with a stem, and `develop --look` refusing a
+bad stem, an unknown one, an unparseable user file and a link to nothing before
+reading anything. `tests/nef.rs`'s command case develops its synthetic frame
+with `--look mono` to a grey image.
 
 `tests/jpeg.rs` carries a synthetic baseline JPEG writer (fixed complete
 DC and incomplete AC tables, byte stuffing, restart markers, 8- and
@@ -821,10 +909,11 @@ all-target Clippy.
    the grid, `wait-idle`, `--preview`, `--control-socket`, and
    `tests/control_process.rs` under the native compositor harness the
    sibling crates use. Landed.
-5. Window, develop mode: levels 0 through 3 with their memoization,
-   exposure, crop with the drag contract, the look list and the look
-   format with the built-in set, and the develop actions in the table,
-   the replay and the control socket.
+5. Develop mode, in two landings. (a) The look format with the built-in
+   set (`look`), the look in the headless pipeline, `td-photo looks` and
+   `develop --look`. Landed. (b) Levels 0 through 3 with their
+   memoization, exposure, crop with the drag contract, the look list, and
+   the develop actions in the table, the replay and the control socket.
 6. Export: banded full-resolution bilinear demosaic, the JPEG encoder,
    `exported/` naming, and `td-photo export`; and `delete-rejected`, the
    action and its verb that move rejects and their sidecars into

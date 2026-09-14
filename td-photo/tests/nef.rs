@@ -1522,6 +1522,25 @@ fn the_command_line_probes_and_develops_without_overwriting() {
     assert!(std::fs::read(&third)
         .unwrap()
         .starts_with(b"P6\n16 7\n255\n"));
+    // A look: `--look` takes the built-in set, and `mono` collapses
+    // every pixel to one value through the whole pipeline.
+    let mono = dir.join("mono.ppm");
+    let (ok, _, stderr) = run(&[
+        OsStr::new("develop"),
+        file.as_os_str(),
+        mono.as_os_str(),
+        OsStr::new("--long-edge"),
+        OsStr::new("16"),
+        OsStr::new("--look"),
+        OsStr::new("mono"),
+    ]);
+    assert!(ok, "{stderr}");
+    let ppm = std::fs::read(&mono).unwrap();
+    let header = "P6\n16 7\n255\n";
+    assert!(ppm.starts_with(header.as_bytes()));
+    let pixels = &ppm[header.len()..];
+    assert_eq!(pixels.len(), 16 * 7 * 3);
+    assert!(pixels.chunks(3).all(|p| p[0] == p[1] && p[1] == p[2]));
     let x = dir.join("x.ppm");
     let (ok, _, stderr) = run(&[
         OsStr::new("develop"),

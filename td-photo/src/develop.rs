@@ -12,6 +12,7 @@ use std::sync::Mutex;
 
 use crate::color::{apply, CameraColor, Matrix, Transfer};
 use crate::image::{Rgb8, MAX_AXIS, MAX_IMAGE_PIXELS};
+use crate::look::Look;
 use crate::nef::{Cfa, Channel, Crop, Decoded, MAX_RAW_SAMPLES};
 
 /// The most threads any step spreads over.
@@ -297,10 +298,12 @@ pub fn resample(
 
 /// What the pipeline takes beyond the camera's facts.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct Params {
+pub struct Params<'a> {
     /// Exposure in stops.
     pub exposure: f32,
     pub threads: usize,
+    /// Applied after the matrix and before the transfer, when given.
+    pub look: Option<&'a Look>,
 }
 
 /// The axes that fit `long_edge` without enlarging, keeping aspect.
@@ -362,7 +365,8 @@ pub fn shrink(image: Rgb8, width: usize, height: usize, threads: usize) -> Resul
 
 /// Develops level 1 to 8-bit sRGB at most `long_edge` on its long side:
 /// resample, then per pixel white balance and clip at the camera white,
-/// exposure, the camera matrix, the transfer; then orientation.
+/// exposure, the camera matrix, the look when there is one, the transfer;
+/// then orientation.
 pub fn render(
     level1: &Level1,
     long_edge: usize,
@@ -370,7 +374,7 @@ pub fn render(
     wb: [f32; 3],
     color: &CameraColor,
     transfer: &Transfer,
-    params: &Params,
+    params: &Params<'_>,
 ) -> Result<Rgb8, Error> {
     let (w, h) = (level1.width, level1.height);
     if !pixels_ok(w, h) || level1.rgb.len() != w * h * 3 {
@@ -391,6 +395,7 @@ pub fn render(
     let band = band_rows(dh, threads);
     let small_ref = &small;
     let matrix_ref = &matrix;
+    let look = params.look;
     let items: Vec<(usize, &mut [u8])> = out.chunks_mut(band * dw * 3).enumerate().collect();
     bands(items, threads, |(band_index, chunk)| {
         let start = band_index * band * dw * 3;
@@ -408,7 +413,12 @@ pub fn render(
                 (g * wb[1]).min(1.0),
                 (b * wb[2]).min(1.0),
             ];
-            *out_px = apply(matrix_ref, cam).map(|v| transfer.encode(v));
+            let rgb = apply(matrix_ref, cam);
+            let rgb = match look {
+                Some(look) => look.apply(rgb),
+                None => rgb,
+            };
+            *out_px = rgb.map(|v| transfer.encode(v));
         }
     });
     Ok(orient(

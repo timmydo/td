@@ -35,6 +35,7 @@ const PURE: &[&str] = &[
     "image.rs",
     "jpeg.rs",
     "library.rs",
+    "look.rs",
     "nef.rs",
     "tiff.rs",
     "ui.rs",
@@ -55,6 +56,7 @@ fn source_inventory_is_closed() {
         "develop.rs",
         "jpeg.rs",
         "library.rs",
+        "look.rs",
         "nef.rs",
         "ui.rs",
     ]
@@ -289,6 +291,11 @@ fn budgets_are_the_documented_values() {
     assert_eq!(td_photo::ui::MAX_SIDECAR_TOTAL, 64 << 20);
     assert_eq!(td_photo::ui::THUMB_CACHE_BYTES, 256 << 20);
     assert_eq!(td_photo::ui::MAX_WAIT_MS, 4_000);
+    assert_eq!(td_photo::look::MAX_LOOK_BYTES, 4096);
+    assert_eq!(td_photo::look::MAX_OPERATIONS, 16);
+    assert_eq!(td_photo::look::MAX_CURVE_POINTS, 16);
+    assert_eq!(td_photo::look::MAX_NAME, 64);
+    assert_eq!(td_photo::look::HEADER, "td-photo look 1");
     assert_eq!(td_photo::ui::CONTROL_JOBS_PER_TURN, 8);
     assert_eq!(
         (td_photo::ui::THUMB_WIDTH, td_photo::ui::THUMB_HEIGHT),

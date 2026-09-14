@@ -384,6 +384,7 @@ fn render_develops_neutral_patches_to_expected_values() {
         &Params {
             exposure: 0.0,
             threads: 2,
+            look: None,
         },
     )
     .unwrap();
@@ -411,6 +412,7 @@ fn render_develops_neutral_patches_to_expected_values() {
         &Params {
             exposure: 1.0,
             threads: 1,
+            look: None,
         },
     )
     .unwrap();
@@ -430,6 +432,7 @@ fn render_develops_neutral_patches_to_expected_values() {
         &Params {
             exposure: 0.0,
             threads: 1,
+            look: None,
         },
     )
     .unwrap();
@@ -451,6 +454,7 @@ fn render_reduces_orients_and_refuses_bad_buffers() {
     let params = Params {
         exposure: 0.0,
         threads: 3,
+        look: None,
     };
     let small = develop::render(&level1, 3, 1, color.daylight, &color, &transfer, &params).unwrap();
     assert_eq!((small.width, small.height), (3, 2));
@@ -618,6 +622,7 @@ fn resampler_and_demosaic_refuse_oversize_and_overflowing_axes() {
     let params = Params {
         exposure: 0.0,
         threads: 1,
+        look: None,
     };
     for (width, height) in [(usize::MAX, 1), (1, usize::MAX), (16385, 1), (0, 4)] {
         let bad = Level1 {
@@ -671,6 +676,7 @@ fn work_is_the_same_on_one_thread_and_many() {
         let params = Params {
             exposure: 0.7,
             threads,
+            look: None,
         };
         develop::render(&one, 17, 8, wb, &color, &transfer, &params).unwrap()
     };
