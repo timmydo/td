@@ -1038,7 +1038,83 @@ The builder discovers the crate by existing. Its gate runs `cargo test` and
 all-target Clippy; a change under `td-ui/` selects td-editor's tests through
 the reader graph, because td-editor's manifest names the crate.
 
+## Planned task-manager widgets
+
+[td-taskmgr](../td-taskmgr/DESIGN.md) is a planned consumer. The following
+are target contracts, not existing public APIs. Add them as reusable td-ui
+widgets before the task manager depends on them; process collection,
+history retention and signal execution stay in the consumer. The menu
+increment extends Bar/Panel and moves td-editor's existing menu admission,
+header switching and open-panel controller onto the shared state machine
+in the same landing, deleting the old mechanism. Preserve its user-visible
+behavior and scene oracles; other consumers retain their current behavior.
+
+- Menus with nested submenus, shared by menu-bar and context-menu entry
+  points. td-ui owns open-panel state, focus, placement, pointer and keyboard
+  navigation, disabled rows, hit testing and dismissal. Consumers provide
+  bounded menu data and stable action IDs and receive typed activation;
+  they neither draw private submenus nor execute actions inside the widget.
+  Right/Enter opens a submenu, Left closes one level, Up/Down walks enabled
+  rows, and Escape closes the innermost panel. Pointer movement into a child
+  keeps its ancestor path open. Fit children rightward or leftward within
+  the surface, with scrolling when needed; at narrow widths replace the
+  parent panel with a child panel and a Back entry. No off-surface hit
+  regions. Outside clicks dismiss and are consumed; focus loss dismisses
+  every level and cancels pending activation. Model revision invalidates
+  stale action IDs, and key repeat cannot activate an action twice. Limit
+  nesting to eight panels and data to 256 entries, with an explicit error
+  on excess rather than a silently missing action.
+- Nonclosable tabs as an explicit option of the shared strip. Preserve the
+  existing document-tab default; a nonclosable tab reserves no close hit
+  region. Keyboard selection and overflow keep the active tab visible.
+- Confirmation dialogs composed from the shared text, list and action
+  primitives. The consumer supplies immutable request details and action
+  IDs; td-ui confines focus and input to the dialog, initially focuses
+  Cancel, supports Escape cancellation, consumes outside clicks and
+  provides scrolling for a bounded detail list. A focus loss cancels
+  pending activation without confirming. Explicit confirm/cancel produces
+  one typed outcome; repeat, stale IDs or a second click cannot confirm
+  twice. Dismissal restores the prior focus when that control still exists.
+- Time-series line and stacked-area graphs with explicit timestamps,
+  gaps, axes, units, legends,
+  series IDs, a selected time and a selected series. Drawing and hit testing
+  use the same clipped geometry. Emit typed time/series selection with
+  keyboard equivalents and textual values. The consumer chooses series,
+  aggregation and downsampling; the widget never invents a process identity
+  from a pixel or connects across an absent sample. Bound input samples and
+  draw work explicitly in the implementing API and pin those limits in tests.
+- A resizable split pane with explicit child minima, a visible focusable
+  divider, pointer capture and keyboard adjustment. Resize and focus loss
+  end a drag safely. An extent too small for both children has an explicit
+  fallback supplied by the consumer, never overlapping hit regions.
+- A tree table with stable opaque row IDs, disclosure controls, sortable
+  column headings, selection, scroll anchors and visible-row rendering.
+  Column definitions carry explicit minimum and preferred widths; the first
+  column includes indentation and disclosure geometry. Horizontal scrolling
+  moves headings and cells together, with matching clipped hit regions and
+  a horizontal scrollbar when the columns exceed the viewport. The consumer
+  chooses column values and widths within the widget's validated bounds.
+  The consumer supplies validated hierarchy and sibling ordering; td-ui
+  emits expand/collapse, sort and selection intents without flattening away
+  parentage or deciding application policy. Reuse list, scrollbar and text
+  primitives. Refresh does not retarget an in-flight pointer gesture by row
+  index, and keyboard navigation can reveal a selected row.
+
+All these widgets preserve the pure-input and semantic draw-stream seams
+above. They introduce no filesystem access, process authority, external
+crate or direct pixel writes. State-machine and draw-stream tests cover
+their interaction contracts, with software pixel oracles at multiple
+scales, clipped/narrow surfaces, focus loss and stale consumer data. Extend
+shared primitives atomically where necessary; no temporary application
+copy of a widget is an acceptable completion of this work.
+
 ## Independently landable increments
+
+The task-manager widget sequence is tracked in
+[td-taskmgr's delivery plan](../td-taskmgr/DESIGN.md#validation-and-delivery):
+menus, confirmations and resource tabs, followed by charts, a split pane
+and a tree table, each with shared-widget oracles and existing consumer
+regressions. Those planned increments extend the original sequence below.
 
 1. Rule and crate: the lock guard admits sibling roster dependencies; the
    crate exists with the input layer, the shared codecs and the cell
