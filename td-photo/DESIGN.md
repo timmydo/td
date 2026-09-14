@@ -31,20 +31,21 @@ and reader (`image`), the baseline JPEG decoder for the embedded previews with
 its reduced-transform scaling (`jpeg`), the thumbnail rule and the thumbnail
 cache, the library's sidecar grammar, roll rules and dating rule (`library`),
 the cull controller over td-ui's driven seam with its action table and scene
-(`ui`), and the command line `td-photo probe FILE`, `td-photo develop FILE
+(`ui`), the window over it with its thumbnail pool and control socket
+(`window`), and the command line `td-photo probe FILE`, `td-photo develop FILE
 OUT.ppm`, `td-photo thumb FILE OUT.ppm`, `td-photo cache`, `td-photo import SRC
 DEST`, `td-photo list ROLL`, `td-photo flag FILE`, `td-photo edit FILE`,
-`td-photo --replay` and `td-photo --help actions`. Every read of a camera file
-is bounded by `MAX_FILE_BYTES` and of a sidecar by `MAX_SIDECAR_BYTES`, trusting
-neither the length the file system reported; `develop` and `thumb` refuse an
-`OUT.ppm` (or `OUT.ppm.tmp`) that already exists rather than replace it, and
-`import` a copy that differs, publishing the finished temporary by a hard link
-so a name that appeared meanwhile is not replaced either; the sidecar is the one
-file td-photo replaces, and only through its own temporary. The crate depends on
-td-ui, by path, for the driven seam and the raster and bands the scene is laid
-out with; the window itself, the thumbnail pool, `--preview` and the control
-socket are the next increment, and no look yet: the increments at the end
-schedule them in order.
+`td-photo open ROLL`, `td-photo --replay`, `td-photo --preview` and `td-photo
+--help actions`. Every read of a camera file is bounded by `MAX_FILE_BYTES` and
+of a sidecar by `MAX_SIDECAR_BYTES`, trusting neither the length the file system
+reported; `develop` and `thumb` refuse an `OUT.ppm` (or `OUT.ppm.tmp`) that
+already exists rather than replace it, and `import` a copy that differs,
+publishing the finished temporary by a hard link so a name that appeared
+meanwhile is not replaced either; the sidecar is the one file td-photo replaces,
+and only through its own temporary. The crate depends on td-ui, by path, for the
+driven seam, the raster and bands the scene is laid out with and the Wayland
+client the window runs on; no look yet: the increments at the end schedule the
+rest in order.
 
 The rules below define version 1; the increments identify the order of
 implementation, not choices left to each implementing agent.
@@ -156,30 +157,47 @@ window, all speaking the toolkit's one vocabulary.
   scene read back as a cell grid), `frame` (the frame's size and digest) and
   `frame-page` (its pixels in pages); and td-photo's own `photo N` (the Nth
   shown photo's name in hex, flag, exposure, crop, look, sidecar state and, for
-  a refused sidecar, the reason in hex) and, from the window increment,
-  `wait-idle MS`. `state` is `cull`, the roll's path in hex, the photo count,
-  the shown count, the cursor's position among the shown, the filter, the view
-  (`grid` or `single`), then the photo under the cursor (its name in hex, since
-  the envelope is ASCII and a file name need not be, then flag, exposure, crop,
-  look, sidecar state), the outstanding job count and the frame generation, `-`
-  for what is absent. The generation moves on a change and on nothing else: not
-  on a step at an end, a filter, view or size already set, a refused open, or a
-  refused flag that leaves the file as the model held it; a settle that brings a
-  file changed meanwhile is a change. A flag the adapter wrote answers `changed`
-  whether or not the model moved, since the file did. Error codes are stable
-  (`no-roll`, `no-photo`, `bad-argument`, `refused`, and the transport's
-  `protocol` and `limit`); a refusal's reason goes to stderr, since the line
-  carries the code. `action quit` answers `quit` and the runner keeps answering;
-  the window closes on it.
+  a refused sidecar, the reason in hex) and `wait-idle MS`: `ok idle` once no
+  job is outstanding, the wants are computed for the model as it stands and
+  the frame the compositor acknowledged (its frame callback) is the model's,
+  `ok busy` at the deadline, `MS` at most `MAX_WAIT_MS` (4,000, under the
+  transport's five-second deadline per request, so the reply is written before
+  the connection expires); the replay, with nothing outstanding, is idle at
+  once. `state` is `cull`, the roll's path in hex, the
+  photo count, the shown count, the cursor's position among the shown, the
+  filter, the view (`grid` or `single`), then the photo under the cursor (its
+  name in hex, since the envelope is ASCII and a file name need not be, then
+  flag, exposure, crop, look, sidecar state), the outstanding job count as the
+  window last reported it (the turn before) and the frame generation, `-` for
+  what is absent. The generation moves on a change and
+  on nothing else: not on a step at an end, a filter, view or size already set,
+  a refused open, or a refused flag that leaves the file as the model held it; a
+  settle that brings a file changed meanwhile is a change. A flag the adapter
+  wrote answers `changed` whether or not the model moved, since the file did.
+  Error codes are stable (`no-roll`, `no-photo`, `bad-argument`, `refused`, and
+  the transport's `protocol` and `limit`); a refusal's reason goes to stderr,
+  since the line carries the code. `action quit` answers `quit` and the runner
+  keeps answering; the window closes on it.
 - **`--control-socket PATH`: the same vocabulary on the live window,** served
   from a private (0600) Unix socket by td-ui's bounded worker over
-  `driven::Payload`: one request per connection, a deadline per request, and a
-  response that reflects the state after the turn that applied it. Pixels of the
-  live window are evidence only through the compositor's capture channel,
-  observed before and after as td-compositor/AUTOMATION.md prescribes; `frame`
-  over the socket paints the scene as the seam paints it, fills and glyphs, so
-  the thumbnails the window blits are not in its digest until an image primitive
-  is promoted into the toolkit (see Window).
+  `driven::Payload`, bound before the display is connected so a bad path fails
+  before a window appears: one request per connection, a deadline per request,
+  at most `CONTROL_JOBS_PER_TURN` (8) requests admitted per turn, and a response
+  that reflects the state after the turn that applied it; a `wait-idle` not yet
+  idle is held, `MAX_WAITERS` (7) at most, one of the worker's eight connections
+  kept free so that an eighth is admitted and answered `limit` at once, and
+  answered when idle or at its deadline (`wait-idle 0` while busy is `busy` at
+  once); `action quit` closes the window a grace (`QUIT_GRACE_MS`, 500 ms of the
+  turn clock, enough for the seam's largest reply, a `frame-page` of 256 KiB in
+  hex, at the pace the worker writes) after its reply, admitting nothing more
+  meanwhile and answering the waits it holds, since the toolkit's worker drops a
+  reply still in flight when it closes. Pixels of the live window are evidence
+  only through the
+  compositor's capture channel, observed before and after as
+  td-compositor/AUTOMATION.md prescribes; `frame` over the socket paints the
+  scene as the seam paints it, fills and glyphs, so the thumbnails the window
+  blits are not in its digest until an image primitive is promoted into the
+  toolkit (see Window).
 - **Determinism.** The same requests over the same roll give the same
   `state`, and with `wait-idle` between them the same `frame`; the tests
   hold a scripted session to a pixel oracle.
@@ -254,34 +272,35 @@ The library is folders of originals; there is no database.
   under the roll. Export writes into `exported/`. Neither folder is
   listed as part of the roll.
 - **Cache**: `$XDG_CACHE_HOME/td-photo` when that variable is absolute
-  (`~/.cache/td-photo` otherwise), holding `thumbs/` and nothing else in
-  version 1. The base directory is the user's and may be a symlink;
-  `td-photo` and `thumbs` are the cache's own and must be real directories,
-  since `cache clear` unlinks inside them, so a symlink in either place is
-  refused rather than followed. A thumbnail is `thumbs/KEY-N.ppm`: `KEY` is
-  the FNV-1a-64 hex of the original's resolved path, byte length and
-  modification time, `N` the long edge, and the file is the PPM
-  `image::write_ppm` writes, published by the link rule through a temporary
-  named for the filling process (`KEY-N.ppm.PID.tmp`), so two processes
-  filling one entry never contend for a name and the first to publish wins.
-  The stamp is taken before the lookup and again from the open file after
-  the read, and an entry is stored only if the two agree, so the bytes
-  cached are the file the key describes (a stamp that differs or cannot be
-  taken stores nothing and says nothing: the next run keys the file as it
-  now is); an original edited or replaced, as far as length and modification
-  time tell, keys itself anew. Reading back accepts only a regular file of
-  that exact shape under 64 MiB with a long edge of at most `N`; a symlink,
-  directory or device in an entry's place is a miss and left alone, and an
-  entry of the right kind with the wrong content is unlinked so the miss
-  refills it. The cache is an optimisation: whatever it cannot do (a refused
-  directory, a full disk, a permission) is a note on stderr and the
-  thumbnail is still written from the original. `td-photo cache clear`
+  (`~/.cache/td-photo` otherwise), holding `thumbs/` and nothing else in version
+  1. The base directory is the user's and may be a symlink; `td-photo` and
+  `thumbs` are the cache's own and must be real directories, since `cache clear`
+  unlinks inside them, so a symlink in either place is refused rather than
+  followed. A thumbnail is `thumbs/KEY-N.ppm`: `KEY` is the FNV-1a-64 hex of the
+  original's resolved path, byte length and modification time, `N` the long
+  edge, and the file is the PPM `image::write_ppm` writes, published by the link
+  rule through a temporary named for the filling process (`KEY-N.ppm.PID.tmp`),
+  so two processes filling one entry never contend for a name and the first to
+  publish wins. The stamp is taken before the lookup and again from the open
+  file after the read, and an entry is stored only if the two agree, so the
+  bytes cached are the file the key describes (a stamp that differs or cannot be
+  taken stores nothing and says nothing: the next run keys the file as it now
+  is); an original edited or replaced, as far as length and modification time
+  tell, keys itself anew. Reading back accepts only a regular file of that exact
+  shape under 64 MiB with a long edge of at most `N`; a symlink, directory or
+  device in an entry's place is a miss and left alone, and an entry of the right
+  kind with the wrong content is unlinked so the miss refills it. The cache is
+  an optimisation: whatever it cannot do (a refused directory, a full disk, a
+  permission) is a note on stderr and the thumbnail is still written from the
+  original; the window fills and reads it the same way, at `THUMB_WIDTH` by the
+  surface's scale for the long edge, so a roll culled once opens from the cache.
+  `td-photo cache clear`
   unlinks the entries and temporaries named that way (and only those) and
-  nothing in the library changes; `td-photo cache path` prints the directory
-  as the bytes it is. The windows between a check and the operation it
-  guards are those of any program without directory descriptors: the
-  directories are the user's own cache, and the only name ever unlinked is
-  one of the cache's own shape.
+  nothing in the library changes; `td-photo cache path` prints the directory as
+  the bytes it is. The windows between a check and the operation it guards are
+  those of any program without directory descriptors: the directories are the
+  user's own cache, and the only name ever unlinked is one of the cache's own
+  shape.
 - **Looks** are read from `$XDG_CONFIG_HOME/td-photo/looks/*.look`
   (`~/.config/td-photo/looks/` without it) on top of the built-in set the
   binary carries; a user look of the same stem shadows the built-in one.
@@ -416,11 +435,13 @@ long edge covers N (else the largest), decode it at the coarsest covering
 scale, area-resample in the encoded domain to exactly N, never enlarging,
 and turn the result by the file's orientation as `develop` turns the raw,
 so a portrait frame is a portrait thumbnail. The cull grid asks for N =
-400, which on the Z 8 is the
-1620x1080 preview at 1/4 (405x270) resampled to 400x267 in 80 ms; the
-single-photo cull view asks for N = 1600, which the same rule answers
-with that preview at 1/1. `td-photo thumb FILE OUT.ppm [--long-edge N]
-[--cache]` is the rule headless, and `td-photo probe FILE` prints every
+`THUMB_WIDTH` (160) at the surface's scale, which on the Z 8 is its 160x120
+thumbnail as it is; the single-photo view's preview is the develop
+increment's and asks for N = 1600, which the same rule answers with the
+1620x1080 preview at 1/1. `td-photo thumb FILE OUT.ppm [--long-edge N]
+[--cache]` is the rule headless (N defaults to 400: on the Z 8 the
+1620x1080 preview at 1/4, 405x270, resampled to 400x267 in 80 ms), and
+`td-photo probe FILE` prints every
 preview's geometry (`--decode` also its full-scale pixel hash, the number
 the oracle prints for the same bytes).
 
@@ -542,58 +563,85 @@ increment and is a translation the user runs, not a runtime dependency.
 
 ## Window
 
-The scene is `ui::Scene`, a td-ui `Composition` the controller builds
-over its model per request: the filter bar (`chrome::Bar`, the active
-filter in brackets and the others padded to its width, so the headers
-keep their places), the grid or the single view, and the status row
-(`chrome::Status`: the roll's folder, the counts, the filter, the photo
-under the cursor with its flag, `(sidecar refused)` when it was,
-`single` in that view). A grid cell is `CELL_W` by `CELL_H` (176 by 152)
-reference pixels at the surface's scale: a 160 by 120 thumbnail box
-under `CELL_PAD` (8) of padding, a `P` or `X` badge at its corner for a
-flagged photo, and the name under it, a reject's dimmed; the cursor's
-cell wears a two-pixel selected frame. Cells fill whole rows from the
-top-left, as many columns as the width holds and as many rows as the
-height between the bands holds, at least one of each, so a surface too
-small for a cell clips one rather than shows none, and the grid scrolls
-by rows, keeping the cursor's row shown. The single view shows the name,
-the facts and the largest 3:2 box under them. A press on a bar header
-sets the filter, on a cell selects it, and in the single view anywhere
-in the area between the bands returns to the grid; the status row, and
-anything off the surface, is not a target, and the bands are hit-tested
-last painted first, so on a surface too short for both the status row
-covers the bar's headers as it covers their pixels. Until the window
-increment blits thumbnails, the boxes are a neutral placeholder, which
-is what `frame` digests.
+The scene is `ui::Scene`, a td-ui `Composition` the controller builds over its
+model per request: the filter bar (`chrome::Bar`, the active filter in brackets
+and the others padded to its width, so the headers keep their places), the grid
+or the single view, and the status row (`chrome::Status`: the roll's folder, the
+counts, the filter, the photo under the cursor with its flag, `(sidecar
+refused)` when it was, `single` in that view). A grid cell is `CELL_W` by
+`CELL_H` (176 by 152) reference pixels at the surface's scale: a 160 by 120
+thumbnail box under `CELL_PAD` (8) of padding, a `P` or `X` badge at its corner
+for a flagged photo, and the name under it, a reject's dimmed; the cursor's cell
+wears a two-pixel selected frame. Cells fill whole rows from the top-left, as
+many columns as the width holds and as many rows as the height between the bands
+holds, at least one of each, so a surface too small for a cell clips one rather
+than shows none, and the grid scrolls by rows, keeping the cursor's row shown.
+The single view shows the name, the facts and the largest 3:2 box under them. A
+press on a bar header sets the filter, on a cell selects it, and in the single
+view anywhere in the area between the bands returns to the grid; the status row,
+and anything off the surface, is not a target, and the bands are hit-tested last
+painted first, so on a surface too short for both the status row covers the
+bar's headers as it covers their pixels. A box whose thumbnail is not held is a
+neutral placeholder, which is what `frame` digests either way; the single view's
+box stays one until develop mode's preview.
 
-The window is a `td_ui::client::App` in the shape td-editor and td-setup
-use, and it is one adapter over `ui::Controller` (see Driving): its
-`event` maps keys and pointer to the controller's events and its
-`end_turn` feeds the controller the job results. It owns no Wayland
-objects of its own, paints chrome through the
-toolkit's raster and bands (the menu bar, the status row, the paged list
-for looks and rolls), and paints photo pixels itself with a clipped XRGB
-blitter into the same frame inside `present`'s closure, because the
-toolkit's raster is fills and glyphs. When a second consumer needs an image
-primitive it is promoted into `td_ui::raster` with a pixel oracle; until
-then the blitter is this crate's and its confinement test pins it as the
-only code that writes frame bytes outside the raster.
+`td-photo open [ROLL] [--control-socket PATH]` runs the window (`window`), a
+`td_ui::client::App` in the shape td-setup's is, and one adapter over the same
+`Session` the replay drives (see Driving): `event` maps the compositor's
+configure to a resize, a key to its chord (a held move or page repeats through
+the toolkit's repeat; a flag, a filter, a view or quit fires once), a left press
+to the pointer path and the wheel's frames to `scroll`, and `end_turn` takes the
+pool's results, asks for the thumbnails the model wants and serves the socket.
+It owns no Wayland objects of its own. A frame is presented whenever the
+generation submitted is not the model's: the scene through the toolkit's raster,
+then each held thumbnail centred in its box through `ui::blit`, a clipped XRGB
+blitter into the same frame inside `present`'s closure, because the toolkit's
+raster is fills and glyphs, clipped to the grid's area so a box that runs under
+the status band on a short surface leaves the band alone, then the flag badges
+again (`Controller::badges`, the scene's badge draws alone, painted within the
+grid's area as the blits are, so over the scene's own frame they change
+nothing), since a thumbnail covers the corner the scene painted its badge in.
+The generation on screen is the one the compositor
+acknowledged with its frame callback, which is what `wait-idle` waits for; a
+generation is submitted once. When a second consumer needs an image primitive it
+is promoted into `td_ui::raster` with a pixel oracle; until then the blitter is
+this crate's, in `ui` where its pixel oracle is, and the confinement test pins
+that the window writes frame bytes through nothing else. `td-photo --preview WxH
+[ROLL]` is the same frame without a display, its thumbnails made on the calling
+thread: the oracle the native test holds a capture to.
 
-Performance contract: no decode, resample or file read runs on the turn
-loop's thread. Workers post results; `end_turn` drains them, marks damage
-and, while any job is outstanding, sets the transport wait to at most 16
-ms so results appear within a frame of arriving; with nothing outstanding
-the wait is the toolkit's idle wait. Thumbnails are requested for the
-visible rows first, then one screen ahead and behind; a scroll that makes
-a request stale drops it before it starts. A grid cell whose thumbnail is
-not ready paints a neutral placeholder and its name, never blocks.
+Performance contract: no decode or resample runs on the turn loop's thread. The
+roll's listing and its sidecars' reads and writes do, as they do in the replay,
+bounded by `MAX_PHOTOS` and `MAX_SIDECAR_TOTAL`; a worker for them is a later
+increment's if a roll shows the need. Workers post results; `end_turn` drains
+them, marks damage and, while
+any job is outstanding, sets the transport wait to at most 16 ms so results
+appear within a frame of arriving; with nothing outstanding the wait is the
+toolkit's idle wait. Thumbnails are requested for the rows on screen first, then
+the screen below and the one above; a scroll that makes a request stale drops it
+before it starts. A thumbnail is asked for at the box's width by the rule `thumb
+--cache` applies, so the disk cache is the verb's exactly, and shrunk in memory
+to the box for a shape taller than it (`develop::shrink`). A grid cell whose
+thumbnail is not ready paints a neutral placeholder and its name, never blocks.
 
 ## Concurrency and memory
 
-- One pool of `available_parallelism` workers, at most 16, started at
-  window open and joined at close; jobs are `Thumbnail`, `Preview`,
-  `RawDecode`, `Level1` and `Export`, each carrying a generation the pool
-  compares before starting and the turn loop compares before applying.
+- One pool of `available_parallelism` workers, at most 16
+  (`develop::MAX_THREADS`), started at window open and joined at close, over one
+  queue the turn loop replaces under its lock whenever the model's generation
+  moves, so a request the model no longer wants is dropped before it starts;
+  jobs are `Thumbnail` now, and `Preview`, `RawDecode`, `Level1` and `Export` in
+  their increments. A job stays outstanding, in the pool's running set, until
+  the turn loop collects its result, so the job count never reads zero with a
+  thumbnail made and not yet held. A finished thumbnail is kept whichever wants
+  asked for it, since it is the file's; the later jobs' results the turn loop
+  compares before applying. Thumbnails are held in memory by name for the roll
+  that is open at the surface's scale (a job is keyed by roll, name and scale,
+  so another roll's file of the same name is another thumbnail; the held set is
+  let go when either changes), `THUMB_CACHE_BYTES` between them, one that could
+  not be made charged its name and slot alone, the least recently shown that is
+  not on screen evicted first; an eviction recomputes the wants, so a thumbnail
+  let go while still wanted off screen is asked for again.
 - At most one `RawDecode` runs at a time (the codec is sequential); demosaic
   and resampling split rows into bands on one shared queue that the calling
   thread and its scoped helper threads drain together, so no thread
@@ -603,13 +651,14 @@ not ready paints a neutral placeholder and its name, never blocks.
   `MAX_RAW_SAMPLES` 128 Mi, `MAX_PREVIEW_SAMPLES` 128 Mi over a preview's padded
   component planes, `MAX_TABLE_DEFINITIONS` 32, `MAX_IFDS` 64, `MAX_ENTRIES`
   4096, `MAX_PHOTOS` 100,000 originals in an open roll and `MAX_SIDECAR_TOTAL`
-  64 MiB of sidecar text between them, `MAX_AXIS` 16384 for raw and image axes
-  alike, `MAX_IMAGE_PIXELS` 64 Mi for any one image buffer (768 MiB as `f32`
-  RGB, under a 32-bit target's allocation limit), `MAX_RANGE` 32768 for a
-  decoder parameter set's sample range. Eviction is least recently shown.
+  64 MiB of sidecar text between them, `MAX_WAIT_MS` 4,000 ms for one
+  `wait-idle`, `CONTROL_JOBS_PER_TURN` 8 requests a turn, `MAX_AXIS` 16384 for
+  raw and image axes alike, `MAX_IMAGE_PIXELS` 64 Mi for any one image buffer
+  (768 MiB as `f32` RGB, under a 32-bit target's allocation limit), `MAX_RANGE`
+  32768 for a decoder parameter set's sample range. Eviction is least recently
+  shown.
 - Buffers are allocated once per size and reused: the level-2 and level-3
-  buffers per canvas size, the decoder's output per raw geometry, the
-  thumbnail scratch per worker.
+  buffers per canvas size, the decoder's output per raw geometry.
 
 ## Invariants
 
@@ -635,11 +684,17 @@ not ready paints a neutral placeholder and its name, never blocks.
 
 ## Test contract
 
-`tests/confinement.rs` pins the source inventory, that the crate root
-forbids `unsafe`, that the manifest declares no dependency (td-ui only,
-from the window increment), no build script and no `include!`, and that
-the pure modules name no `std::fs`, `std::env`, `std::time`, `std::net` or
-`std::process` path.
+`tests/confinement.rs` pins the source inventory, that the crate root forbids
+`unsafe`, that the manifest declares td-ui as its one dependency, the native
+case and the trusted test root (the window binds its control socket under the
+harness's directory in `/tmp`, and td-ui's socket refuses an ancestor the gate's
+rootless namespace shows as owned by no one, so the gate's cargo-test runs take
+the builder's caller-owned sticky root, as td-editor's do), no build script and
+no `include!`, that the pure modules name no
+`std::fs`, `std::env`, `std::time`, `std::net` or `std::process` path and the
+window no file, which files name which toolkit modules, that photo pixels reach
+a frame through `ui::blit` alone and the verb and the window share one thumbnail
+rule, and the budgets by value.
 
 `tests/nef.rs` carries a synthetic NEF writer and a Nikon Huffman encoder
 for all six trees, and pins: round trips of random and edge-valued frames
@@ -714,10 +769,33 @@ one, keeping an edit made meanwhile and refusing a sidecar that became
 malformed, reporting a stale temporary and settling the model from the file with
 the cursor and the generation unmoved, a name that is not ASCII in hex,
 answering after `quit`, and refusing a roll that is not there, a bad size and a
-stray argument before the session starts. From the window increment on,
-`tests/control_process.rs` runs the built binary against the native compositor
-harness the sibling crates use, with the observe, capture, observe rule for
-pixel evidence.
+stray argument before the session starts; holds the window's helpers (the boxes
+on screen and the wants in order under a scroll, a filter and the single view,
+the job count as a fact and a touch as a change, which keys repeat, the
+blitter's pixels centred, clipped to the surface, the box and the area, and in
+BGRX order, the badges painted back over a thumbnail that covered one and
+changing nothing over the scene's own frame, on a tall surface and on one too
+short for a cell where only the area's clip keeps them off the status band, and
+the in-memory shrink by the thumbnail rule), `wait-idle` over the replay idle at
+once with its argument
+judged, `--preview` equal to the seam's frame of the empty window and of a roll
+and refused for a bad size or roll, and `open` refusing a bad socket path, a
+second roll or a stray flag before it looks for a display and leaving no socket
+behind when the display is not there; `src/window.rs`'s own tests hold
+`wait_ms`'s grammar, the envelope's ID, the charge of a held entry, the queue's
+replacement skipping what runs and the pool's count staying outstanding until a
+result is collected. `tests/control_process.rs` runs the built binary under the
+native compositor harness the sibling crates use (`ready`
+builds the compositor; the case is ignored without it): the window on a roll of
+originals no decoder accepts, so the frame is the scene's, mapped with its app
+id, idle over the socket, its state, its captured tile equal to `--preview` of
+the roll at the tile's size under the observe, capture, observe rule, a pick
+over the socket written through the sidecar and shown, a click from the seat on
+the second cell and `End` from the seat each moving the cursor (repeated until
+one lands, each the same cell however many land; the pointer then parked in the
+desktop bar, since the seat draws the client's cursor over the tile), `first`
+over the socket restoring the frame, and `quit` closing the window with its
+socket gone.
 
 The builder discovers the crate by existing; its gate runs `cargo test` and
 all-target Clippy.
@@ -742,7 +820,7 @@ all-target Clippy.
    `td_ui::client::App`, the worker pool and the thumbnails blitted into
    the grid, `wait-idle`, `--preview`, `--control-socket`, and
    `tests/control_process.rs` under the native compositor harness the
-   sibling crates use.
+   sibling crates use. Landed.
 5. Window, develop mode: levels 0 through 3 with their memoization,
    exposure, crop with the drag contract, the look list and the look
    format with the built-in set, and the develop actions in the table,

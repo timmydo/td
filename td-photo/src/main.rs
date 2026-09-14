@@ -4,9 +4,11 @@
 //! optionally decodes its raw strip; `develop` renders it to a PPM;
 //! `import`, `list`, `flag` and `edit` are the library's headless verbs;
 //! `--replay` is the window without a display, the cull controller behind
-//! td-ui's driven seam. This is the one place in the crate that opens
-//! files, reads the clock or asks for the thread count; the library
-//! modules take bytes and buffers.
+//! td-ui's driven seam, and `open` the window itself (`window`), the same
+//! controller on the display. This is the one place in the crate that
+//! opens files, reads the clock or asks for the thread count; the library
+//! modules take bytes and buffers, and the window takes its thumbnails
+//! from here.
 
 use std::ffi::{OsStr, OsString};
 use std::fs;
@@ -26,6 +28,8 @@ use td_photo::library::{self, Filter, Flag, Key, Sidecar};
 use td_photo::nef::{self, Nef};
 use td_photo::ui::{self, Effect, Photo};
 use td_photo::{camera, jpeg, tiff};
+
+mod window;
 
 const HELP: &str = concat!(
     "td-photo probe FILE [--decode]\n",
@@ -67,10 +71,19 @@ const HELP: &str = concat!(
     "  a VALUE of - clears the key; reset clears all but the flag. The\n",
     "  sidecar is written through NAME.edit.tmp and renamed into place,\n",
     "  the one file td-photo replaces, since it is its own.\n",
+    "td-photo open [ROLL] [--control-socket PATH]\n",
+    "  Opens the window on the Wayland display, on ROLL if given: the\n",
+    "  roll as a grid of thumbnails from the camera's embedded previews,\n",
+    "  culled with the keys --help actions lists. --control-socket serves\n",
+    "  the --replay vocabulary on a private socket at PATH (absolute, at\n",
+    "  most 107 bytes) for an agent driving the live window.\n",
     "td-photo --replay [--size WxH] [ROLL]\n",
     "  The window without a display: requests on stdin, answers on\n",
     "  stdout in td-ui's driving envelope, over the cull actions; ROLL is\n",
     "  opened at the start. See DESIGN.md, Driving.\n",
+    "td-photo --preview WxH [ROLL]\n",
+    "  Writes what the window would show for ROLL at WxH once every\n",
+    "  thumbnail it wants is in, as a PPM on stdout.\n",
     "td-photo --help actions\n",
     "  Prints the action table: name, key, arguments and what it does.\n",
     "Other: --help\n",
@@ -87,6 +100,8 @@ fn main() -> ExitCode {
         [flag] if flag == "--help" => help(),
         [_, flag, ..] if flag == "--help" => help(),
         [flag, rest @ ..] if flag == "--replay" => replay(rest),
+        [flag, rest @ ..] if flag == "--preview" => window::preview(rest),
+        [verb, rest @ ..] if verb == "open" => window::open(rest),
         [verb, file, rest @ ..] if verb == "probe" => probe(Path::new(file), rest),
         [verb] if verb == "probe" => Err("probe needs FILE; see --help".to_string()),
         [verb, file, out, rest @ ..] if verb == "develop" => {
@@ -650,8 +665,63 @@ fn thumb_file(path: &Path, out: &Path, rest: &[OsString]) -> Result<(), String> 
     let cached = rest.iter().any(|a| a == "--cache");
     refuse_existing(out)?;
     let started = Instant::now();
-    // The cache is an optimisation: whatever it cannot do is a note on
-    // stderr, and the thumbnail is written from the original regardless.
+    let made = make_thumbnail(path, long_edge, cached, threads())?;
+    write_atomically(out, &made.image)?;
+    let mut stdout = io::stdout().lock();
+    match made.source {
+        Source::Cached => writeln!(
+            stdout,
+            "thumbnail {}x{} into {} (cached; {} ms)",
+            made.image.width,
+            made.image.height,
+            out.display(),
+            started.elapsed().as_millis()
+        ),
+        Source::Preview {
+            index,
+            width,
+            height,
+        } => writeln!(
+            stdout,
+            "thumbnail {}x{} from preview {index} ({width}x{height}) into {} ({} ms)",
+            made.image.width,
+            made.image.height,
+            out.display(),
+            started.elapsed().as_millis()
+        ),
+    }
+    .map_err(|e| e.to_string())
+}
+
+/// Where a thumbnail came from, for the verb's report.
+enum Source {
+    Cached,
+    Preview {
+        index: usize,
+        width: usize,
+        height: usize,
+    },
+}
+
+struct Made {
+    image: Rgb8,
+    source: Source,
+}
+
+/// The thumbnail rule, with the cache when `cached`: the smallest embedded
+/// preview covering `long_edge`, decoded at the coarsest scale that still
+/// covers it, resampled to exactly `long_edge` and turned the way the
+/// camera was held. The cache is an optimisation: whatever it cannot do is
+/// a note on stderr and the thumbnail is made from the original regardless,
+/// and an entry is stored only if the bytes read are the file the key
+/// describes. The verb and the window share this one path, so the cache
+/// holds one thing under one key.
+fn make_thumbnail(
+    path: &Path,
+    long_edge: usize,
+    cached: bool,
+    threads: usize,
+) -> Result<Made, String> {
     let mut cache = if cached {
         let before = stamp_of(path)?;
         Some((cache_key(&before, long_edge), before))
@@ -661,16 +731,10 @@ fn thumb_file(path: &Path, out: &Path, rest: &[OsString]) -> Result<(), String> 
     if let Some((key, _)) = &cache {
         match cache_lookup(key, long_edge) {
             Ok(Some(image)) => {
-                write_atomically(out, &image)?;
-                return writeln!(
-                    io::stdout().lock(),
-                    "thumbnail {}x{} into {} (cached; {} ms)",
-                    image.width,
-                    image.height,
-                    out.display(),
-                    started.elapsed().as_millis()
-                )
-                .map_err(|e| e.to_string());
+                return Ok(Made {
+                    image,
+                    source: Source::Cached,
+                })
             }
             Ok(None) => {}
             Err(note) => {
@@ -683,7 +747,7 @@ fn thumb_file(path: &Path, out: &Path, rest: &[OsString]) -> Result<(), String> 
     let nef = nef::parse(&data).map_err(|e| format!("{}: {e}", path.display()))?;
     let (index, bytes, header) = choose_preview(&nef, &data, long_edge)
         .ok_or_else(|| format!("{}: no baseline JPEG preview", path.display()))?;
-    let image = jpeg::thumbnail(bytes, long_edge, threads())
+    let image = jpeg::thumbnail(bytes, long_edge, threads)
         .map_err(|e| format!("{}: preview {index}: {e}", path.display()))?;
     let image = develop::orient(image, nef.orientation);
     // Stored only if the bytes are the file the key describes: an
@@ -695,18 +759,14 @@ fn thumb_file(path: &Path, out: &Path, rest: &[OsString]) -> Result<(), String> 
             }
         }
     }
-    write_atomically(out, &image)?;
-    writeln!(
-        io::stdout().lock(),
-        "thumbnail {}x{} from preview {index} ({}x{}) into {} ({} ms)",
-        image.width,
-        image.height,
-        header.width,
-        header.height,
-        out.display(),
-        started.elapsed().as_millis()
-    )
-    .map_err(|e| e.to_string())
+    Ok(Made {
+        image,
+        source: Source::Preview {
+            index,
+            width: header.width,
+            height: header.height,
+        },
+    })
 }
 
 // ------------------------------------------------------------------ cache
@@ -1349,6 +1409,12 @@ fn collect_originals(
 /// share one dispatcher and one file path.
 struct Session {
     ui: ui::Controller,
+    /// What `wait-idle` answers: the window sets it before the reply; the
+    /// replay has nothing outstanding, so it is always idle.
+    idle: bool,
+    /// Set when a dispatch answered `quit`: the window closes on it, the
+    /// replay keeps answering.
+    quit: bool,
 }
 
 /// One photo as the model takes it, from a sidecar as found.
@@ -1381,6 +1447,8 @@ impl Session {
     fn new(surface: Surface) -> Session {
         Session {
             ui: ui::Controller::new(surface),
+            idle: true,
+            quit: false,
         }
     }
 
@@ -1510,12 +1578,16 @@ impl driven::Controller for Session {
 
     fn action(&mut self, name: &str, arguments: &[&str]) -> Result<Outcome, ui::Error> {
         let (outcome, effects) = self.ui.action(name, arguments)?;
-        self.carry_out(effects, outcome)
+        let outcome = self.carry_out(effects, outcome)?;
+        self.quit |= outcome == Outcome::Quit;
+        Ok(outcome)
     }
 
     fn input(&mut self, input: Input<'_>) -> Result<Outcome, ui::Error> {
         let (outcome, effects) = self.ui.input(input)?;
-        self.carry_out(effects, outcome)
+        let outcome = self.carry_out(effects, outcome)?;
+        self.quit |= outcome == Outcome::Quit;
+        Ok(outcome)
     }
 
     fn state(&self) -> Result<String, ui::Error> {
@@ -1526,13 +1598,22 @@ impl driven::Controller for Session {
         Ok(view(&self.ui.scene()))
     }
 
-    /// `photo N`: the Nth shown photo's facts.
+    /// `photo N`: the Nth shown photo's facts. `wait-idle MS`: `idle` or
+    /// `busy` as the adapter set it, for `MS` up to `MAX_WAIT_MS`; the
+    /// window holds the request until one is true, the replay answers at
+    /// once.
     fn request(&mut self, name: &str, arguments: &[&str]) -> Result<String, ui::Error> {
         match (name, arguments) {
             ("photo", [position]) => {
                 let position = usize::try_from(td_ui::control::decimal(position)?)
                     .map_err(|_| ui::Error::BadArgument)?;
                 self.ui.photo(position)
+            }
+            ("wait-idle", [ms]) => {
+                if td_ui::control::decimal(ms)? > ui::MAX_WAIT_MS {
+                    return Err(ui::Error::BadArgument);
+                }
+                Ok(if self.idle { "idle" } else { "busy" }.to_string())
             }
             _ => Err(td_ui::control::Error::Protocol.into()),
         }

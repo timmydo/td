@@ -5040,11 +5040,11 @@ mod tests {
         // authd, jail and seatd name the compositor runtime directory in
         // fixed argv, resolution tests and seat assignment.
         // The conservative textual edge widens checks even without a read.
-        // td-setup declares native-compositor-tests, a tool edge (not a source
-        // read) that the native runner discovers the same way.
+        // td-setup and td-photo declare native-compositor-tests, a tool edge
+        // (not a source read) that the native runner discovers the same way.
         assert_eq!(
             readers_of("td-compositor"),
-            ["td-authd", "td-editor", "td-jail", "td-portal", "td-seatd", "td-secret", "td-setup", "td-ui", "td-vm", "td-vm-guest"]
+            ["td-authd", "td-editor", "td-jail", "td-photo", "td-portal", "td-seatd", "td-secret", "td-setup", "td-ui", "td-vm", "td-vm-guest"]
         );
         assert_eq!(readers_of("td-authd"), ["td-compositor", "td-secret"]);
         // td-login is here for a test's argument string `/bin/td-busd/`, no
@@ -7182,7 +7182,8 @@ mod tests {
                 "td-vm-guest"
             ]
         );
-        assert_eq!(comp.len(), 31, "{comp:?}");
+        // td-photo's native case makes its commands three, as td-setup's are.
+        assert_eq!(comp.len(), 32, "{comp:?}");
         // Runtime td-vm/ spellings conservatively connect the same reader set.
         assert_eq!(vm, comp);
         assert_eq!(
@@ -7309,11 +7310,10 @@ mod tests {
             let commands = cargo_test_cmds(&root, &toolkit).unwrap();
             // td-editor, td-setup, td-portal and td-photo all name td-ui by
             // path, so a change to the toolkit carries the four consumers'
-            // commands beside the workspace suite. td-editor, td-setup and
-            // td-portal each add a native compositor command beside their
-            // test and clippy; td-photo has no native suite yet: 2 workspace
-            // + 2 td-ui + 3 + 3 + 3 + 2 = 15.
-            assert_eq!(commands.len(), 15, "{path}: {commands:?}");
+            // commands beside the workspace suite, and each of the four adds
+            // a native compositor command beside its test and clippy: 2
+            // workspace + 2 td-ui + 3 + 3 + 3 + 3 = 16.
+            assert_eq!(commands.len(), 16, "{path}: {commands:?}");
             assert!(commands.iter().all(|c| {
                 c.contains("--workspace")
                     || c.contains("--manifest-path td-ui/Cargo.toml")

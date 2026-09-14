@@ -1171,3 +1171,514 @@ fn the_binary_replays_the_cull_over_a_roll_and_writes_through_the_sidecar() {
     assert!(!help.stdout.is_empty());
     assert_eq!(output.stdout, help.stdout);
 }
+
+#[test]
+fn the_window_helpers_place_thumbnails_and_report_jobs() {
+    use td_photo::image::Rgb8;
+    use td_ui::raster::Rect;
+    // 800 by 600 holds four columns and three rows: twelve cells a screen.
+    let mut c = Controller::new(surface(800, 600));
+    assert!(c.visible().is_empty() && c.wanted().is_empty());
+    c.open("roll", b"/r", photos(30)).unwrap();
+    assert_eq!((c.layout().columns, c.layout().rows), (4, 3));
+    let visible = c.visible();
+    let indices = |visible: &[(usize, Rect)]| visible.iter().map(|(i, _)| *i).collect::<Vec<_>>();
+    assert_eq!(indices(&visible), (0..12).collect::<Vec<_>>());
+    // The box sits under the bar and the cell's padding; the fifth cell
+    // begins the second row, the second the second column.
+    let first = Rect {
+        x: 8,
+        y: 32,
+        width: 160,
+        height: 120,
+    };
+    assert_eq!(visible[0].1, first);
+    assert_eq!(
+        visible[1].1,
+        Rect {
+            x: 8 + 176,
+            ..first
+        }
+    );
+    assert_eq!(
+        visible[4].1,
+        Rect {
+            y: 32 + 152,
+            ..first
+        }
+    );
+    // Two screens from the top row, then the screen above it.
+    assert_eq!(c.wanted(), (0..24).collect::<Vec<_>>());
+    act(&mut c, "scroll", &["2"]);
+    assert_eq!(c.first_row(), 2);
+    assert_eq!(indices(&c.visible()), (8..20).collect::<Vec<_>>());
+    let wanted = c.wanted();
+    assert_eq!(wanted[..22], (8..30).collect::<Vec<_>>()[..]);
+    assert_eq!(wanted[22..], (0..8).collect::<Vec<_>>()[..]);
+    // The single view paints no thumbnail and wants the grid's.
+    act(&mut c, "select", &["9"]);
+    act(&mut c, "view", &[]);
+    assert!(c.visible().is_empty());
+    assert_eq!(c.wanted(), wanted);
+    act(&mut c, "grid", &[]);
+    // Under a filter the boxes follow the shown positions, not the indices.
+    let (_, effects) = c.action("pick", &[]).unwrap();
+    apply(&mut c, &effects).unwrap();
+    act(&mut c, "picks", &[]);
+    assert_eq!(
+        c.visible(),
+        [
+            (1, first),
+            (
+                9,
+                Rect {
+                    x: 8 + 176,
+                    ..first
+                }
+            )
+        ]
+    );
+    assert_eq!(c.wanted(), [1, 9]);
+    act(&mut c, "all", &[]);
+    // The job count is a fact for `state`, not a change; a touch is one.
+    let generation = c.generation();
+    c.set_jobs(3);
+    assert_eq!(c.jobs(), 3);
+    assert_eq!(fields(&c)[13], "3");
+    assert_eq!(c.generation(), generation);
+    c.touch();
+    assert_eq!(c.generation(), generation + 1);
+    assert_eq!(fields(&c)[14], (generation + 1).to_string());
+    // A held key repeats the moves and the pages, nothing else.
+    for action in td_photo::ui::Action::ALL {
+        let moves = matches!(
+            action.name(),
+            "next" | "previous" | "down" | "up" | "page-down" | "page-up"
+        );
+        assert_eq!(action.repeats(), moves, "{}", action.name());
+    }
+
+    // The blitter: centred in the box, BGRX, clipped to the box and the
+    // surface, the middle of an image larger than its box.
+    let surface = surface(20, 10);
+    let stride = 20 * 4;
+    let image = Rgb8 {
+        width: 4,
+        height: 2,
+        data: (0..24).collect(),
+    };
+    let mut pixels = vec![0xAAu8; stride * 10];
+    let at = |pixels: &[u8], x: usize, y: usize| {
+        pixels[y * stride + x * 4..y * stride + x * 4 + 4].to_vec()
+    };
+    let r#box = Rect {
+        x: 2,
+        y: 1,
+        width: 8,
+        height: 4,
+    };
+    ui::blit(
+        &mut pixels,
+        surface,
+        stride,
+        surface.bounds(),
+        r#box,
+        &image,
+    )
+    .unwrap();
+    assert_eq!(at(&pixels, 4, 2), [2, 1, 0, 0]);
+    assert_eq!(at(&pixels, 5, 2), [5, 4, 3, 0]);
+    assert_eq!(at(&pixels, 7, 3), [23, 22, 21, 0]);
+    for (x, y) in [(3, 2), (8, 2), (4, 1), (4, 4)] {
+        assert_eq!(at(&pixels, x, y), [0xAA; 4], "({x}, {y})");
+    }
+    let mut pixels = vec![0u8; stride * 10];
+    let r#box = Rect {
+        x: -2,
+        y: -1,
+        width: 4,
+        height: 2,
+    };
+    ui::blit(
+        &mut pixels,
+        surface,
+        stride,
+        surface.bounds(),
+        r#box,
+        &image,
+    )
+    .unwrap();
+    assert_eq!(at(&pixels, 0, 0), [20, 19, 18, 0]);
+    assert_eq!(at(&pixels, 1, 0), [23, 22, 21, 0]);
+    assert_eq!(at(&pixels, 2, 0), [0; 4]);
+    assert_eq!(at(&pixels, 0, 1), [0; 4]);
+    let r#box = Rect {
+        x: 5,
+        y: 5,
+        width: 2,
+        height: 2,
+    };
+    ui::blit(
+        &mut pixels,
+        surface,
+        stride,
+        surface.bounds(),
+        r#box,
+        &image,
+    )
+    .unwrap();
+    assert_eq!(at(&pixels, 5, 5), [5, 4, 3, 0]);
+    assert_eq!(at(&pixels, 6, 6), [20, 19, 18, 0]);
+    assert_eq!(at(&pixels, 4, 5), [0; 4]);
+    assert_eq!(at(&pixels, 7, 6), [0; 4]);
+    let r#box = Rect {
+        x: 30,
+        y: 30,
+        width: 4,
+        height: 4,
+    };
+    ui::blit(
+        &mut pixels,
+        surface,
+        stride,
+        surface.bounds(),
+        r#box,
+        &image,
+    )
+    .unwrap();
+    // Clipped to the given area as well: a box that runs under it leaves
+    // the rows past it alone; a box at an axis's end is nothing to paint.
+    let mut pixels = vec![0u8; stride * 10];
+    let r#box = Rect {
+        x: 0,
+        y: 6,
+        width: 4,
+        height: 2,
+    };
+    let clip = Rect {
+        x: 0,
+        y: 0,
+        width: 20,
+        height: 7,
+    };
+    ui::blit(&mut pixels, surface, stride, clip, r#box, &image).unwrap();
+    assert_eq!(at(&pixels, 0, 6), [2, 1, 0, 0]);
+    assert_eq!(at(&pixels, 3, 6), [11, 10, 9, 0]);
+    assert!(pixels[stride * 7..].iter().all(|b| *b == 0));
+    let far = Rect {
+        x: i64::MIN,
+        y: 0,
+        width: 1,
+        height: 1,
+    };
+    let line = Rgb8 {
+        width: 3,
+        height: 1,
+        data: vec![9; 9],
+    };
+    ui::blit(&mut pixels, surface, stride, surface.bounds(), far, &line).unwrap();
+    assert!(pixels[..stride * 6].iter().all(|b| *b == 0));
+    // A stride or a frame short of the surface, or an image not its size.
+    assert!(matches!(
+        ui::blit(
+            &mut pixels,
+            surface,
+            stride - 4,
+            surface.bounds(),
+            r#box,
+            &image
+        ),
+        Err(ui::Error::BadArgument)
+    ));
+    assert!(matches!(
+        ui::blit(
+            &mut pixels[..stride * 9],
+            surface,
+            stride,
+            surface.bounds(),
+            r#box,
+            &image
+        ),
+        Err(ui::Error::BadArgument)
+    ));
+    let short = Rgb8 {
+        width: 4,
+        height: 2,
+        data: vec![0; 23],
+    };
+    assert!(matches!(
+        ui::blit(
+            &mut pixels,
+            surface,
+            stride,
+            surface.bounds(),
+            r#box,
+            &short
+        ),
+        Err(ui::Error::BadArgument)
+    ));
+
+    // The in-memory shrink keeps what fits and fits the rest by the
+    // thumbnail rule's rounding, never enlarging.
+    let same = Rgb8 {
+        width: 160,
+        height: 107,
+        data: vec![7; 160 * 107 * 3],
+    };
+    assert_eq!(
+        td_photo::develop::shrink(same.clone(), 160, 120, 1).unwrap(),
+        same
+    );
+    let tall = Rgb8 {
+        width: 107,
+        height: 160,
+        data: vec![9; 107 * 160 * 3],
+    };
+    let fitted = td_photo::develop::shrink(tall, 160, 120, 1).unwrap();
+    assert_eq!((fitted.width, fitted.height), (80, 120));
+    assert!(fitted.data.iter().all(|v| *v == 9));
+    let wide = Rgb8 {
+        width: 400,
+        height: 100,
+        data: vec![0; 400 * 100 * 3],
+    };
+    let fitted = td_photo::develop::shrink(wide, 160, 120, 1).unwrap();
+    assert_eq!((fitted.width, fitted.height), (160, 40));
+    let square = Rgb8 {
+        width: 300,
+        height: 300,
+        data: vec![0; 300 * 300 * 3],
+    };
+    let fitted = td_photo::develop::shrink(square, 160, 120, 1).unwrap();
+    assert_eq!((fitted.width, fitted.height), (120, 120));
+    let odd = Rgb8 {
+        width: 2,
+        height: 2,
+        data: vec![0; 3],
+    };
+    assert!(td_photo::develop::shrink(odd, 1, 1, 1).is_err());
+    // A box axis past the image ceiling is the ceiling, not an overflow.
+    let tiny = Rgb8 {
+        width: 2,
+        height: 2,
+        data: vec![0; 12],
+    };
+    let fitted = td_photo::develop::shrink(tiny, usize::MAX, 1, 1).unwrap();
+    assert_eq!((fitted.width, fitted.height), (1, 1));
+
+    // The badges alone: over the scene's own frame they change nothing;
+    // over a thumbnail that covered one they paint it back and leave the
+    // rest of the thumbnail as blitted.
+    use td_ui::raster::{Raster, Scale, Surface};
+    let big = Surface::new(400, 300, Scale::default()).unwrap();
+    let mut c = Controller::new(big);
+    c.open("roll", b"/r", photos(3)).unwrap();
+    let big_stride = 400 * 4;
+    let font = td_ui::font::pinned().unwrap();
+    let mut pixels = vec![0u8; big_stride * 300];
+    Raster::new(&mut pixels, &font, big, big_stride)
+        .unwrap()
+        .paint(&c.scene(), big.bounds())
+        .unwrap();
+    let scene_only = pixels.clone();
+    Raster::new(&mut pixels, &font, big, big_stride)
+        .unwrap()
+        .paint(&c.badges(), c.layout().area)
+        .unwrap();
+    assert_eq!(pixels, scene_only);
+    let (index, r#box) = c.visible()[1];
+    assert_eq!(index, 1, "the pick is the second cell");
+    let pixel = |pixels: &[u8], x: i64, y: i64| {
+        let at = y as usize * big_stride + x as usize * 4;
+        pixels[at..at + 4].to_vec()
+    };
+    let corner = pixel(&scene_only, r#box.x, r#box.y);
+    assert_ne!(corner, [0xc7, 0xd1, 0xd6, 0], "the badge is at the corner");
+    let flat = Rgb8 {
+        width: 160,
+        height: 120,
+        data: vec![0x40; 160 * 120 * 3],
+    };
+    ui::blit(&mut pixels, big, big_stride, big.bounds(), r#box, &flat).unwrap();
+    assert_eq!(pixel(&pixels, r#box.x, r#box.y), [0x40, 0x40, 0x40, 0]);
+    Raster::new(&mut pixels, &font, big, big_stride)
+        .unwrap()
+        .paint(&c.badges(), c.layout().area)
+        .unwrap();
+    // The badge's glyph cell is back and the thumbnail past it stays.
+    let (bw, bh) = ((td_ui::CELL_WIDTH + 2) as i64, td_ui::CELL_HEIGHT as i64);
+    for y in r#box.y..r#box.y + i64::from(r#box.height) {
+        for x in r#box.x..r#box.x + i64::from(r#box.width) {
+            let expected = if x < r#box.x + bw && y < r#box.y + bh {
+                pixel(&scene_only, x, y)
+            } else {
+                vec![0x40, 0x40, 0x40, 0]
+            };
+            assert_eq!(pixel(&pixels, x, y), expected, "({x}, {y})");
+        }
+    }
+    // On a surface too short for a cell the status band covers the badge's
+    // lower rows; painted within the grid's area, as the window paints
+    // them, the badges leave the band as the scene left it, and painted
+    // over the whole surface they would not.
+    let short = Surface::new(400, 60, Scale::default()).unwrap();
+    let mut c = Controller::new(short);
+    c.open("roll", b"/r", photos(3)).unwrap();
+    let area = c.layout().area;
+    assert_eq!((area.y, area.height), (24, 12));
+    assert_eq!(c.visible()[1].0, 1, "the pick is on the one row");
+    let mut pixels = vec![0u8; big_stride * 60];
+    Raster::new(&mut pixels, &font, short, big_stride)
+        .unwrap()
+        .paint(&c.scene(), short.bounds())
+        .unwrap();
+    let scene_only = pixels.clone();
+    Raster::new(&mut pixels, &font, short, big_stride)
+        .unwrap()
+        .paint(&c.badges(), area)
+        .unwrap();
+    assert_eq!(pixels, scene_only);
+    Raster::new(&mut pixels, &font, short, big_stride)
+        .unwrap()
+        .paint(&c.badges(), short.bounds())
+        .unwrap();
+    assert_ne!(pixels, scene_only, "unclipped, the badge takes the band");
+}
+
+#[test]
+fn the_binary_waits_previews_and_refuses_a_bad_socket() {
+    use std::os::unix::fs::PermissionsExt;
+    let temp = Temp::new("window");
+    fs::set_permissions(&temp.0, fs::Permissions::from_mode(0o700)).unwrap();
+    let roll = temp.0.join("roll");
+    fs::create_dir_all(&roll).unwrap();
+    for name in ["DSC_0001.NEF", "DSC_0002.NEF"] {
+        fs::write(roll.join(name), b"not really a nef").unwrap();
+    }
+    fs::write(
+        roll.join("DSC_0002.NEF.edit"),
+        "td-photo edit 1\nflag pick\n",
+    )
+    .unwrap();
+    let roll_s = roll.to_str().unwrap();
+    // The replay has nothing outstanding: `wait-idle` is idle at once, its
+    // argument judged all the same.
+    let requests = [
+        request(1, &["wait-idle", "0"]),
+        request(2, &["wait-idle", "4000"]),
+        request(3, &["wait-idle", "4001"]),
+        request(4, &["wait-idle"]),
+        request(5, &["wait-idle", "1", "2"]),
+        request(6, &["wait-idle", "soon"]),
+        request(7, &["state"]),
+    ];
+    let (ok, replies, err) = replay(&["--size", "400x300", roll_s], &requests);
+    assert!(ok, "{err}");
+    assert_eq!(replies.len(), requests.len());
+    let reply = |id: usize| -> &[String] { &replies[id - 1][1..] };
+    assert_eq!(reply(1), ["ok", "idle"]);
+    assert_eq!(reply(2), ["ok", "idle"]);
+    assert_eq!(&reply(3)[..2], ["error", "bad-argument"]);
+    assert_eq!(&reply(4)[..2], ["error", "protocol"]);
+    assert_eq!(&reply(5)[..2], ["error", "protocol"]);
+    assert_eq!(reply(6)[0], "error");
+    assert_eq!(reply(7)[14], "0");
+
+    // `--preview` without a roll is the seam's frame of the empty window;
+    // with one, the scene over it, a thumbnail that cannot be made noted
+    // and its box left the placeholder.
+    let bin = env!("CARGO_BIN_EXE_td-photo");
+    let output = Command::new(bin)
+        .args(["--preview", "400x300"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert_eq!(
+        output.stdout,
+        driven::paint(&Controller::new(surface(400, 300)).scene())
+            .unwrap()
+            .ppm()
+    );
+    let output = Command::new(bin)
+        .args(["--preview", "400x300", roll_s])
+        .env("XDG_CACHE_HOME", temp.0.join("cache"))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let mut c = Controller::new(surface(400, 300));
+    c.open(
+        "roll",
+        roll_s.as_bytes(),
+        vec![
+            Photo {
+                name: "DSC_0001.NEF".to_string(),
+                ..Photo::default()
+            },
+            Photo {
+                name: "DSC_0002.NEF".to_string(),
+                sidecar: Some(edits("td-photo edit 1\nflag pick\n")),
+                error: None,
+            },
+        ],
+    )
+    .unwrap();
+    assert_eq!(output.stdout, driven::paint(&c.scene()).unwrap().ppm());
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        err.contains("DSC_0001.NEF") && err.contains("DSC_0002.NEF"),
+        "{err}"
+    );
+    let missing = temp.0.join("missing");
+    let missing = missing.to_str().unwrap();
+    for args in [
+        &["--preview"][..],
+        &["--preview", "0x0"],
+        &["--preview", "wide"],
+        &["--preview", "400x300", roll_s, roll_s],
+        &["--preview", "400x300", missing],
+    ] {
+        let output = Command::new(bin).args(args).output().unwrap();
+        assert!(
+            !output.status.success() && output.stdout.is_empty(),
+            "{args:?}"
+        );
+    }
+
+    // `open` refuses a socket path that is relative, missing or given
+    // twice, a second roll and a stray flag before it looks for a display;
+    // a good path is bound, then taken away when the display is not there.
+    let socket = temp.0.join("control");
+    let socket_s = socket.to_str().unwrap();
+    for args in [
+        &["open", "--control-socket", "relative"][..],
+        &["open", "--control-socket"],
+        &[
+            "open",
+            roll_s,
+            "--control-socket",
+            socket_s,
+            "--control-socket",
+            socket_s,
+        ],
+        &["open", roll_s, roll_s],
+        &["open", "--bogus"],
+        &["open", missing],
+    ] {
+        let output = Command::new(bin).args(args).env_clear().output().unwrap();
+        assert!(!output.status.success(), "{args:?}");
+        assert!(!socket.exists(), "{args:?}");
+    }
+    let output = Command::new(bin)
+        .args(["open", roll_s, "--control-socket", socket_s])
+        .env_clear()
+        .env("XDG_RUNTIME_DIR", &temp.0)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(!output.stderr.is_empty());
+    assert!(!socket.exists(), "the socket was left behind");
+}

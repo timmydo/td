@@ -16,6 +16,15 @@ td-ui = { path = "../td-ui" }
 
 [package.metadata.td-gate]
 clippy-all-targets = true
+# The native case binds the window's control socket under the harness's
+# directory in /tmp, and td-ui's socket refuses an ancestor the gate's
+# rootless namespace shows as owned by no one; the gate's cargo-test runs
+# then take the builder's caller-owned sticky root, as td-editor's do.
+trusted-test-root = true
+# The window is a live Wayland client; its native case launches it under the
+# real headless td-compositor (tests/control_process.rs). This opt-in builds
+# that binary for the gate and adds it as a test-only reader dependency.
+native-compositor-tests = true
 
 [lints.clippy]
 unwrap_used = "deny"

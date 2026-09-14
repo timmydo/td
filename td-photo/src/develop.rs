@@ -319,6 +319,47 @@ pub fn fit(width: usize, height: usize, long_edge: usize) -> (usize, usize) {
     }
 }
 
+/// Shrinks an image to fit within `width` by `height` without enlarging,
+/// keeping its shape, by the thumbnail rule's resampler and rounding; an
+/// image that fits is returned as it came. A zero axis, or a buffer that is
+/// not its axes' size, is `Size`; a box axis past `MAX_AXIS` is taken as
+/// `MAX_AXIS`, which no image exceeds.
+pub fn shrink(image: Rgb8, width: usize, height: usize, threads: usize) -> Result<Rgb8, Error> {
+    if !pixels_ok(image.width, image.height)
+        || width == 0
+        || height == 0
+        || image.data.len() != image.width * image.height * 3
+    {
+        return Err(Error::Size);
+    }
+    // All four axes within `MAX_AXIS`, so the products below cannot
+    // overflow.
+    let (width, height) = (width.min(MAX_AXIS), height.min(MAX_AXIS));
+    if image.width <= width && image.height <= height {
+        return Ok(image);
+    }
+    // The axis the box limits gives the target; the other is rounded from
+    // the shape, as `fit` rounds, and falls within the box.
+    let (dw, dh) = if image.width * height >= image.height * width {
+        (
+            width,
+            ((image.height * width + image.width / 2) / image.width).max(1),
+        )
+    } else {
+        (
+            ((image.width * height + image.height / 2) / image.height).max(1),
+            height,
+        )
+    };
+    let linear: Vec<f32> = image.data.iter().map(|v| f32::from(*v) / 255.0).collect();
+    let small = resample(&linear, image.width, image.height, dw, dh, threads)?;
+    let mut out = Rgb8::new(dw, dh).ok_or(Error::Size)?;
+    for (dst, src) in out.data.iter_mut().zip(small) {
+        *dst = (src * 255.0 + 0.5).floor().clamp(0.0, 255.0) as u8;
+    }
+    Ok(out)
+}
+
 /// Develops level 1 to 8-bit sRGB at most `long_edge` on its long side:
 /// resample, then per pixel white balance and clip at the camera white,
 /// exposure, the camera matrix, the transfer; then orientation.

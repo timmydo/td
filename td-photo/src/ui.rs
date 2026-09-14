@@ -19,6 +19,7 @@ use td_ui::raster::{
 use td_ui::CELL_HEIGHT;
 use td_ui::CELL_WIDTH;
 
+use crate::image::Rgb8;
 use crate::library::{Filter, Flag, Key, Sidecar};
 
 /// The surface a session starts on until it is resized.
@@ -39,6 +40,15 @@ pub const MAX_SIDECAR_TOTAL: usize = 64 << 20;
 /// The reason a photo is shown as refused when its sidecar would take the
 /// roll past `MAX_SIDECAR_TOTAL`.
 pub const OVER_BUDGET: &str = "over the roll's sidecar budget";
+/// What the window holds of thumbnails in memory between them; past it the
+/// least recently shown that is not on screen goes first.
+pub const THUMB_CACHE_BYTES: usize = 256 << 20;
+/// The longest `wait-idle`, in milliseconds: under the transport's deadline
+/// per request (five seconds), so a held wait's reply is written before its
+/// connection expires.
+pub const MAX_WAIT_MS: u64 = 4_000;
+/// Control requests the window admits per turn, td-editor's figure.
+pub const CONTROL_JOBS_PER_TURN: usize = 8;
 /// Where a thumbnail goes until it is painted: a neutral ground.
 pub const PLACEHOLDER: u32 = 0xd6d1c7;
 /// The mode word `state` leads with; develop mode is a later increment.
@@ -226,6 +236,16 @@ impl Action {
 
     pub fn parse(name: &str) -> Option<Action> {
         Self::ALL.into_iter().find(|action| action.name() == name)
+    }
+
+    /// Whether holding the key repeats the action: the cursor moves and the
+    /// pages do, so a held arrow walks the grid; a flag, a filter, a view
+    /// or quit fires once.
+    pub fn repeats(self) -> bool {
+        matches!(
+            self,
+            Self::Next | Self::Previous | Self::Down | Self::Up | Self::PageDown | Self::PageUp
+        )
     }
 }
 
@@ -441,6 +461,19 @@ impl Layout {
         })
     }
 
+    /// The thumbnail box inside a cell: `THUMB_WIDTH` by `THUMB_HEIGHT` at
+    /// the scale, under `CELL_PAD` of padding.
+    pub fn thumb(&self, cell: Rect) -> Rect {
+        let s = self.surface.scale.value();
+        let pad = (CELL_PAD * s) as i64;
+        Rect {
+            x: cell.x + pad,
+            y: cell.y + pad,
+            width: (THUMB_WIDTH * s) as u32,
+            height: (THUMB_HEIGHT * s) as u32,
+        }
+    }
+
     /// The position under a point, scrolled to `first_row`, whether or not
     /// a photo is there.
     pub fn position_at(&self, x: i64, y: i64, first_row: usize) -> Option<usize> {
@@ -472,6 +505,8 @@ pub struct Controller {
     /// What the photos' sidecars take between them, held under
     /// `MAX_SIDECAR_TOTAL` at open and at every settle.
     bytes: usize,
+    /// The jobs the adapter has outstanding, as it last said.
+    jobs: usize,
 }
 
 impl Controller {
@@ -487,6 +522,7 @@ impl Controller {
             generation: 0,
             shown: Vec::new(),
             bytes: 0,
+            jobs: 0,
         }
     }
 
@@ -593,6 +629,23 @@ impl Controller {
         self.generation
     }
 
+    /// The outstanding job count the adapter last reported.
+    pub fn jobs(&self) -> usize {
+        self.jobs
+    }
+
+    /// The adapter's outstanding job count: a fact `state` reports, not a
+    /// change to the frame, so the generation stays.
+    pub fn set_jobs(&mut self, jobs: usize) {
+        self.jobs = jobs;
+    }
+
+    /// Something the adapter paints into the frame changed (a thumbnail
+    /// arrived for a photo on screen): a new generation.
+    pub fn touch(&mut self) {
+        self.bump();
+    }
+
     /// The indices the filter admits, in roll order.
     pub fn shown(&self) -> &[usize] {
         &self.shown
@@ -612,6 +665,50 @@ impl Controller {
 
     pub fn layout(&self) -> Layout {
         Layout::new(self.surface)
+    }
+
+    /// The shown photos on screen and the boxes their thumbnails go in, in
+    /// the grid; nothing in the single view, whose box is the develop
+    /// increment's preview, and nothing before a roll.
+    pub fn visible(&self) -> Vec<(usize, Rect)> {
+        if self.roll.is_none() || self.view != View::Grid {
+            return Vec::new();
+        }
+        let layout = self.layout();
+        let first = self.first_row * layout.columns;
+        self.shown
+            .iter()
+            .skip(first)
+            .take(layout.rows * layout.columns)
+            .enumerate()
+            .filter_map(|(offset, index)| {
+                let cell = layout.cell(first + offset, self.first_row)?;
+                Some((*index, layout.thumb(cell)))
+            })
+            .collect()
+    }
+
+    /// The photos whose thumbnails the window wants, in the order it wants
+    /// them: the grid's screen, then the screen below it, then the one
+    /// above, whichever view is showing, so the grid is ready when the
+    /// single view returns to it.
+    pub fn wanted(&self) -> Vec<usize> {
+        if self.roll.is_none() {
+            return Vec::new();
+        }
+        let layout = self.layout();
+        let screen = layout.rows * layout.columns;
+        let first = self.first_row * layout.columns;
+        let mut wanted: Vec<usize> = self
+            .shown
+            .iter()
+            .skip(first)
+            .take(2 * screen)
+            .copied()
+            .collect();
+        let above = first.saturating_sub(screen);
+        wanted.extend(self.shown.iter().skip(above).take(first - above));
+        wanted
     }
 
     /// One named action with the fields the request carried.
@@ -681,8 +778,7 @@ impl Controller {
             photo.map_or_else(dash, |p| p.value(Key::Crop).to_string()),
             photo.map_or_else(dash, |p| p.value(Key::Look).to_string()),
             photo.map_or_else(dash, |p| p.status().to_string()),
-            // No job runs before the window increment's thumbnail pool.
-            "0".to_string(),
+            self.jobs.to_string(),
             self.generation.to_string(),
         ]
         .join("\t")
@@ -717,6 +813,13 @@ impl Controller {
     /// What the window shows now, borrowing the model.
     pub fn scene(&self) -> Scene<'_> {
         Scene { model: self }
+    }
+
+    /// The flag badges of the photos on screen, alone: what the window
+    /// paints again after the thumbnails, which cover the corner the scene
+    /// painted them in.
+    pub fn badges(&self) -> Badges<'_> {
+        Badges { model: self }
     }
 
     fn bump(&mut self) {
@@ -1098,35 +1201,9 @@ impl Scene<'_> {
             );
         }
         let pad = (CELL_PAD * s) as i64;
-        let thumb = Rect {
-            x: rect.x + pad,
-            y: rect.y + pad,
-            width: (THUMB_WIDTH * s) as u32,
-            height: (THUMB_HEIGHT * s) as u32,
-        };
+        let thumb = layout.thumb(rect);
         fill(thumb, PLACEHOLDER, damage, sink);
-        if let Some(flag) = photo.flag() {
-            let (mark, color) = match flag {
-                Flag::Pick => ('P', SELECTED),
-                Flag::Reject => ('X', MISSPELLED),
-            };
-            let badge = Rect {
-                x: thumb.x,
-                y: thumb.y,
-                width: ((CELL_WIDTH + 2) * s) as u32,
-                height: (CELL_HEIGHT * s) as u32,
-            };
-            fill(badge, color, damage, sink);
-            text_run(
-                scale,
-                std::iter::once(mark),
-                (badge.x + s as i64, badge.y),
-                badge,
-                GlyphStyle::medium(PAPER, color),
-                damage,
-                sink,
-            );
-        }
+        badge(layout, thumb, photo, damage, sink);
         let ink = if photo.flag() == Some(Flag::Reject) {
             DISABLED & 0x00ff_ffff
         } else {
@@ -1286,4 +1363,143 @@ impl Composition for Scene<'_> {
         }
         Status::new(layout.surface).emit(self.status_line().chars(), damage, sink);
     }
+}
+
+/// A flagged photo's badge at its box's corner: `P` for a pick, `X` for a
+/// reject, in a glyph cell of the flag's colour.
+fn badge(layout: &Layout, thumb: Rect, photo: &Photo, damage: Rect, sink: &mut dyn FnMut(Draw)) {
+    let Some(flag) = photo.flag() else {
+        return;
+    };
+    let s = layout.surface.scale.value();
+    let (mark, color) = match flag {
+        Flag::Pick => ('P', SELECTED),
+        Flag::Reject => ('X', MISSPELLED),
+    };
+    let badge = Rect {
+        x: thumb.x,
+        y: thumb.y,
+        width: ((CELL_WIDTH + 2) * s) as u32,
+        height: (CELL_HEIGHT * s) as u32,
+    };
+    fill(badge, color, damage, sink);
+    text_run(
+        layout.surface.scale,
+        std::iter::once(mark),
+        (badge.x + s as i64, badge.y),
+        badge,
+        GlyphStyle::medium(PAPER, color),
+        damage,
+        sink,
+    );
+}
+
+/// The badges of the photos on screen and nothing else, a composition the
+/// window paints over the thumbnails it blitted, with the grid's area as
+/// its damage as the blits are clipped to it, since the scene's status
+/// band covers a badge that runs under it. So painted, over the scene's
+/// own frame it changes nothing: the draws are the scene's, at the same
+/// places.
+pub struct Badges<'a> {
+    model: &'a Controller,
+}
+
+impl Composition for Badges<'_> {
+    fn surface(&self) -> Surface {
+        self.model.surface
+    }
+
+    fn emit(&self, damage: Rect, sink: &mut dyn FnMut(Draw)) {
+        let layout = self.model.layout();
+        for (index, thumb) in self.model.visible() {
+            if let Some(photo) = self.model.photos.get(index) {
+                badge(&layout, thumb, photo, damage, sink);
+            }
+        }
+    }
+}
+
+/// Paints `image` centred in `r#box`, clipped to `clip`, the box and the
+/// surface, into an XRGB frame of `stride` bytes per row: the one place
+/// photo pixels reach a frame, since the toolkit's raster paints fills and
+/// glyphs. An image larger than the box shows its middle. A frame or stride
+/// too small for the surface, or an image whose buffer is not its size, is
+/// refused.
+pub fn blit(
+    pixels: &mut [u8],
+    surface: Surface,
+    stride: usize,
+    clip: Rect,
+    r#box: Rect,
+    image: &Rgb8,
+) -> Result<(), Error> {
+    let bad = |_| Error::BadArgument;
+    let needed = stride
+        .checked_mul(surface.height)
+        .ok_or(Error::BadArgument)?;
+    let samples = image
+        .width
+        .checked_mul(image.height)
+        .and_then(|n| n.checked_mul(3))
+        .ok_or(Error::BadArgument)?;
+    if stride < surface.width.saturating_mul(4)
+        || pixels.len() < needed
+        || image.data.len() != samples
+    {
+        return Err(Error::BadArgument);
+    }
+    // Nothing of the box on the surface within the clip is nothing to
+    // paint, and spares the centring a box at an axis's end.
+    let Some(clip) = clip
+        .intersection(surface.bounds())
+        .and_then(|clip| clip.intersection(r#box))
+    else {
+        return Ok(());
+    };
+    let (width, height) = (
+        i64::try_from(image.width).map_err(bad)?,
+        i64::try_from(image.height).map_err(bad)?,
+    );
+    let x = r#box
+        .x
+        .checked_add((i64::from(r#box.width) - width) / 2)
+        .ok_or(Error::BadArgument)?;
+    let y = r#box
+        .y
+        .checked_add((i64::from(r#box.height) - height) / 2)
+        .ok_or(Error::BadArgument)?;
+    let target = Rect {
+        x,
+        y,
+        width: u32::try_from(image.width).map_err(bad)?,
+        height: u32::try_from(image.height).map_err(bad)?,
+    };
+    let Some(clip) = clip.intersection(target) else {
+        return Ok(());
+    };
+    let columns = clip.width as usize;
+    let source_x = usize::try_from(clip.x - x).map_err(bad)?;
+    let source_y = usize::try_from(clip.y - y).map_err(bad)?;
+    let target_x = usize::try_from(clip.x).map_err(bad)?;
+    let target_y = usize::try_from(clip.y).map_err(bad)?;
+    for row in 0..clip.height as usize {
+        let from = ((source_y + row) * image.width + source_x) * 3;
+        let to = (target_y + row) * stride + target_x * 4;
+        let source = image
+            .data
+            .get(from..from + columns * 3)
+            .ok_or(Error::BadArgument)?;
+        let target = pixels
+            .get_mut(to..to + columns * 4)
+            .ok_or(Error::BadArgument)?;
+        let (targets, _) = target.as_chunks_mut::<4>();
+        let (sources, _) = source.as_chunks::<3>();
+        for ([b, g, r, pad], [red, green, blue]) in targets.iter_mut().zip(sources) {
+            *b = *blue;
+            *g = *green;
+            *r = *red;
+            *pad = 0;
+        }
+    }
+    Ok(())
 }

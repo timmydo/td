@@ -4,8 +4,9 @@
 //! Source-level contracts the compiler cannot express: the crate's file
 //! inventory, that it forbids `unsafe` and declares the toolkit as its one
 //! dependency, that its pure modules reach no file, environment, clock,
-//! network or process, which files name which toolkit modules, and the
-//! budgets DESIGN.md names, by value.
+//! network or process and the window opens no file, which files name which
+//! toolkit modules, that photo pixels reach a frame through one blitter,
+//! and the budgets DESIGN.md names, by value.
 
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -44,12 +45,13 @@ fn source_inventory_is_closed() {
     assert!(!root().join("build.rs").exists(), "no build script");
     let expected: BTreeSet<String> = PURE
         .iter()
-        .chain(["lib.rs", "main.rs"].iter())
+        .chain(["lib.rs", "main.rs", "window.rs"].iter())
         .map(|s| s.to_string())
         .collect();
     assert_eq!(names("src", "rs"), expected);
     let tests: BTreeSet<String> = [
         "confinement.rs",
+        "control_process.rs",
         "develop.rs",
         "jpeg.rs",
         "library.rs",
@@ -60,6 +62,8 @@ fn source_inventory_is_closed() {
     .map(|s| s.to_string())
     .collect();
     assert_eq!(names("tests", "rs"), tests);
+    let support: BTreeSet<String> = ["native_compositor.rs".to_string()].into_iter().collect();
+    assert_eq!(names("tests/support", "rs"), support);
     let fixtures: BTreeSet<String> = [
         "README.md",
         "jpeg_ref.py",
@@ -81,7 +85,7 @@ fn source_inventory_is_closed() {
 fn the_crate_forbids_unsafe_and_includes_nothing() {
     assert!(read("src/lib.rs").starts_with("#![forbid(unsafe_code)]"));
     assert!(read("src/main.rs").starts_with("#![forbid(unsafe_code)]"));
-    for name in PURE.iter().chain(["lib.rs", "main.rs"].iter()) {
+    for name in PURE.iter().chain(["lib.rs", "main.rs", "window.rs"].iter()) {
         let text = read(&format!("src/{name}")).replace("#![forbid(unsafe_code)]", "");
         assert!(!text.contains("unsafe"), "{name} names unsafe");
         assert!(!text.contains("include!"), "{name} uses include!");
@@ -108,6 +112,11 @@ fn the_manifest_declares_the_toolkit_alone_and_joins_the_gate() {
     assert!(!manifest.contains("[patch"));
     assert!(!manifest.contains("[replace"));
     assert!(manifest.contains("[package.metadata.td-gate]\nclippy-all-targets = true\n"));
+    // The window's native case runs under the compositor `ready` builds, and
+    // binds its control socket under a root the gate's namespace must show
+    // as the caller's, which the builder's trusted-root fixture supplies.
+    assert!(manifest.contains("\nnative-compositor-tests = true\n"));
+    assert!(manifest.contains("\ntrusted-test-root = true\n"));
     for lint in [
         "unwrap_used",
         "expect_used",
@@ -170,6 +179,29 @@ fn pure_modules_reach_no_file_environment_clock_network_or_process() {
     assert!(main.contains("fs::rename(&temporary, &path)"));
     assert_eq!(main.matches("fs::rename(").count(), 2);
     assert!(!main.contains("println!"), "a panicking print");
+    // The window opens no file and reads no clock of its own: its
+    // thumbnails come from `main`'s rule on the pool's threads, its time is
+    // the turn clock the toolkit hands it, and its threads are named and
+    // joined when it closes; `main` spawns none of its own.
+    let window = read("src/window.rs");
+    for forbidden in [
+        "std::fs",
+        "fs::",
+        "File::",
+        "std::process",
+        "Instant::",
+        "SystemTime",
+        "println!",
+    ] {
+        assert!(!window.contains(forbidden), "window.rs names {forbidden}");
+    }
+    assert!(window.contains("thread::Builder::new()"));
+    assert!(window.contains("thread.join()"));
+    assert!(!window.contains("thread::spawn("), "an unnamed spawn");
+    assert!(
+        !main.contains("thread::spawn") && !main.contains("thread::Builder"),
+        "main.rs spawns"
+    );
     // Only `develop` spreads work across threads, with scoped threads
     // that cannot outlive the call.
     for name in PURE {
@@ -188,9 +220,10 @@ fn pure_modules_reach_no_file_environment_clock_network_or_process() {
 /// Which files may name which toolkit modules (td-ui/DESIGN.md, Public
 /// surface): the controller the pure seam, raster, chrome and control;
 /// `main` the seam, the replay runner, the raster's surface and control;
-/// nothing yet the window, the wire or the socket, which the window
-/// increment brings. A braced group after the crate's path would read as
-/// no name, so the scanner refuses one: name one item per line.
+/// `window` the client, the wire, the display, the font, the pointer, the
+/// socket and its worker, the seam, the raster and control. A braced group
+/// after the crate's path would read as no name, so the scanner refuses
+/// one: name one item per line.
 #[test]
 fn the_toolkit_is_named_only_where_the_design_says() {
     fn modules(text: &str) -> BTreeSet<String> {
@@ -229,6 +262,21 @@ fn the_toolkit_is_named_only_where_the_design_says() {
         modules(&read("src/main.rs")),
         set(&["control", "driven", "raster", "replay"])
     );
+    assert_eq!(
+        modules(&read("src/window.rs")),
+        set(&[
+            "client",
+            "control",
+            "control_socket",
+            "control_worker",
+            "driven",
+            "font",
+            "pointer",
+            "raster",
+            "wayland",
+            "wire",
+        ])
+    );
 }
 
 #[test]
@@ -239,6 +287,13 @@ fn budgets_are_the_documented_values() {
     assert_eq!(td_photo::tiff::MAX_ENTRIES, 4096);
     assert_eq!(td_photo::ui::MAX_PHOTOS, 100_000);
     assert_eq!(td_photo::ui::MAX_SIDECAR_TOTAL, 64 << 20);
+    assert_eq!(td_photo::ui::THUMB_CACHE_BYTES, 256 << 20);
+    assert_eq!(td_photo::ui::MAX_WAIT_MS, 4_000);
+    assert_eq!(td_photo::ui::CONTROL_JOBS_PER_TURN, 8);
+    assert_eq!(
+        (td_photo::ui::THUMB_WIDTH, td_photo::ui::THUMB_HEIGHT),
+        (160, 120)
+    );
     assert_eq!(td_photo::nef::MAX_AXIS, 16384);
     assert_eq!(td_photo::image::MAX_AXIS, td_photo::nef::MAX_AXIS);
     assert_eq!(td_photo::image::MAX_IMAGE_PIXELS, 64 << 20);
@@ -258,6 +313,26 @@ fn budgets_are_the_documented_values() {
     assert!(main.contains("fn write_via("));
     assert!(main.contains(".ppm.{}.tmp\", std::process::id()"));
     assert!(main.contains("develop::orient(image, nef.orientation)"));
+    // Photo pixels reach a frame through `ui::blit` alone: the window names
+    // it and writes no frame bytes itself; the verb and the window share
+    // one thumbnail rule, so the cache holds one thing under one key.
+    assert_eq!(read("src/ui.rs").matches("pub fn blit(").count(), 1);
+    let window = read("src/window.rs");
+    assert!(window.contains("ui::blit("));
+    // The wait ceiling (pinned above) sits under the transport's five-second
+    // deadline per request, the quit grace covers the seam's largest reply,
+    // and one of the worker's connections stays free of held waits.
+    assert!(window.contains("const QUIT_GRACE_MS: u64 = 500;"));
+    assert!(window.contains("const MAX_WAITERS: usize = CONNECTIONS - 1;"));
+    for write in ["copy_from_slice", "as_chunks", "chunks_exact", "pixels["] {
+        assert!(
+            !window.contains(write),
+            "window.rs writes frame bytes: {write}"
+        );
+    }
+    assert_eq!(main.matches("fn make_thumbnail(").count(), 1);
+    assert_eq!(main.matches("jpeg::thumbnail(").count(), 1);
+    assert!(window.contains("make_thumbnail(") && !window.contains("jpeg::"));
     assert_eq!(td_photo::nef::MAX_RAW_SAMPLES, 128 << 20);
     assert_eq!(td_photo::nef::MAX_SUB_IFDS, 16);
     assert_eq!(td_photo::develop::MAX_THREADS, 16);
