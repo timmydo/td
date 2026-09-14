@@ -347,6 +347,7 @@ fn budgets_are_the_documented_values() {
     assert_eq!(td_photo::nef::MAX_RAW_SAMPLES, 128 << 20);
     assert_eq!(td_photo::nef::MAX_SUB_IFDS, 16);
     assert_eq!(td_photo::develop::MAX_THREADS, 16);
+    assert_eq!(td_photo::develop::RAW_CACHE_BYTES, 512 << 20);
     assert_eq!(td_photo::nef::COMPRESSION_NIKON, 34713);
     assert_eq!(td_photo::nef::COMPRESSION_NONE, 1);
     assert_eq!(td_photo::nef::PHOTOMETRIC_CFA, 32803);

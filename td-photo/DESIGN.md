@@ -556,10 +556,12 @@ row bands from level 0 so peak memory stays bounded by the band, never by
 the frame.
 
 The resampler is separable area averaging for reduction and bilinear for
-enlargement, over `f32` rows, and is shared with thumbnails. The headless
-`develop` verb converts the whole of level 1 to `f32` before resampling
-it, one frame at a time; the window increment resamples from the `u16`
-level directly so level 2 is the only `f32` buffer.
+enlargement, over `f32` rows, and is shared with thumbnails. It reads the
+`u16` level 1 directly, each sample scaled to `f32` as it is read (the same
+value the whole-frame conversion would give, in the same order), so level 2
+is the only retained `f32` image buffer, for the headless verb and the
+window alike (the resampler's middle pass and the orient hold transient
+`f32` buffers).
 
 ## Looks
 
@@ -946,9 +948,15 @@ all-target Clippy.
    out coarse and fine, `look`, `crop` by fractions, `reset`), their gating
    to the mode, exposure as a file-relative delta and `look` and `crop`
    absolute, over `--replay` and the control socket, with `tests/ui.rs`.
-   Landed. (c) Levels 0 through 3 with their memoization and the developed
-   preview in the develop view, over the window, `--preview` and the native
-   test. (d) The crop drag contract and the look list overlay.
+   Landed. (c) The develop pipeline as reusable levels in `develop`: level
+   2 (the `u16` level 1 resampled to the canvas directly, then oriented,
+   the one `f32` buffer) and level 3 (the per-pixel tail), and
+   `RAW_CACHE_BYTES`, with `render` their composition. Landed. (d) The
+   developed preview in the develop view over the window: the level
+   memoization and the level-0 cache, the preview job off the turn thread,
+   `--preview` of a developed frame and the native test. (e) The crop
+   applied to level 2 (the crop of level 1) in the preview and the headless
+   verb, the crop drag contract, and the look list overlay.
 6. Export: banded full-resolution bilinear demosaic, the JPEG encoder,
    `exported/` naming, and `td-photo export`; and `delete-rejected`, the
    action and its verb that move rejects and their sidecars into

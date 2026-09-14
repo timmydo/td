@@ -18,6 +18,11 @@ use crate::nef::{Cfa, Channel, Crop, Decoded, MAX_RAW_SAMPLES};
 /// The most threads any step spreads over.
 pub const MAX_THREADS: usize = 16;
 
+/// Level-0 CFA frames the window holds in memory at once: the current
+/// photo and its prefetched neighbours, evicted least-recently-shown
+/// first. A budget the tests pin, not enforced in this pure module.
+pub const RAW_CACHE_BYTES: usize = 512 << 20;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
     /// The crop does not lie inside the frame.
@@ -48,6 +53,18 @@ pub struct Level1 {
     pub width: usize,
     pub height: usize,
     pub rgb: Vec<u16>,
+}
+
+/// Level 2: level 1 resampled to the canvas and oriented, interleaved
+/// linear `f32` per channel, camera-native and un-balanced. The only
+/// `f32` image buffer the pipeline retains; the display pixels (level 3)
+/// are made from it per exposure and look edit without touching it. The
+/// resampler's middle pass and the orient hold transient `f32` buffers.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Level2 {
+    pub width: usize,
+    pub height: usize,
+    pub rgb: Vec<f32>,
 }
 
 fn thread_count(requested: usize, rows: usize) -> usize {
@@ -227,16 +244,18 @@ fn pixels_ok(width: usize, height: usize) -> bool {
     axis_ok(width) && axis_ok(height) && width * height <= MAX_IMAGE_PIXELS
 }
 
-/// Resamples interleaved three-channel `f32` rows from `sw`x`sh` to
-/// `dw`x`dh`, horizontal pass then vertical, rows split across threads.
-/// Every axis is nonzero and at most `image::MAX_AXIS`.
-pub fn resample(
-    src: &[f32],
+/// The resampler over any interleaved three-channel source, each sample
+/// mapped to `f32` as it is read, so a `u16` level is resampled to `f32`
+/// without a whole-frame copy. Horizontal pass then vertical, rows split
+/// across threads; every axis is nonzero and at most `image::MAX_AXIS`.
+fn resample_core<T: Copy + Sync>(
+    src: &[T],
     sw: usize,
     sh: usize,
     dw: usize,
     dh: usize,
     threads: usize,
+    to_f32: impl Fn(T) -> f32 + Sync,
 ) -> Result<Vec<f32>, Error> {
     // Source, destination and the middle (destination width by source
     // height) buffers all stay under the pixel budget.
@@ -249,6 +268,7 @@ pub fn resample(
     let threads_h = thread_count(threads, sh);
     let band_h = band_rows(sh, threads_h);
     let xs_ref = &xs;
+    let to = &to_f32;
     let items: Vec<(usize, &mut [f32])> = middle.chunks_mut(band_h * dw * 3).enumerate().collect();
     bands(items, threads_h, |(band_index, chunk)| {
         for (r, out_row) in chunk.chunks_exact_mut(dw * 3).enumerate() {
@@ -260,10 +280,10 @@ pub fn resample(
             for (out_px, span) in out_row.as_chunks_mut::<3>().0.iter_mut().zip(xs_ref.iter()) {
                 let mut acc = [0.0f32; 3];
                 for (k, w) in span.weights.iter().enumerate() {
-                    if let Some([r, g, b]) = in_px.get(span.first + k) {
-                        acc[0] += r * w;
-                        acc[1] += g * w;
-                        acc[2] += b * w;
+                    if let Some(&[r, g, b]) = in_px.get(span.first + k) {
+                        acc[0] += to(r) * w;
+                        acc[1] += to(g) * w;
+                        acc[2] += to(b) * w;
                     }
                 }
                 *out_px = acc;
@@ -294,6 +314,35 @@ pub fn resample(
         }
     });
     Ok(out)
+}
+
+/// Resamples interleaved three-channel `f32` rows from `sw`x`sh` to
+/// `dw`x`dh`. Shared with the thumbnail rule.
+pub fn resample(
+    src: &[f32],
+    sw: usize,
+    sh: usize,
+    dw: usize,
+    dh: usize,
+    threads: usize,
+) -> Result<Vec<f32>, Error> {
+    resample_core(src, sw, sh, dw, dh, threads, |v| v)
+}
+
+/// Resamples an interleaved three-channel `u16` level directly to `f32`,
+/// each sample scaled to `0..=1` by 65535 as it is read (the same value
+/// the whole-frame conversion would give, in the same order), so no
+/// whole-frame `f32` copy of level 1 is retained (a `dw` by `sh` middle
+/// pass is held transiently, as the vertical pass needs it).
+pub fn resample_u16(
+    src: &[u16],
+    sw: usize,
+    sh: usize,
+    dw: usize,
+    dh: usize,
+    threads: usize,
+) -> Result<Vec<f32>, Error> {
+    resample_core(src, sw, sh, dw, dh, threads, |v| f32::from(v) / 65535.0)
 }
 
 /// What the pipeline takes beyond the camera's facts.
@@ -363,26 +412,45 @@ pub fn shrink(image: Rgb8, width: usize, height: usize, threads: usize) -> Resul
     Ok(out)
 }
 
-/// Develops level 1 to 8-bit sRGB at most `long_edge` on its long side:
-/// resample, then per pixel white balance and clip at the camera white,
-/// exposure, the camera matrix, the look when there is one, the transfer;
-/// then orientation.
-pub fn render(
+/// Level 1 to level 2: resample the `u16` level directly to the canvas
+/// that fits `long_edge` on the long side, then orient. Level 2 is the
+/// only `f32` image buffer retained, reused across exposure and look
+/// edits; the resample and the orient hold transient `f32` buffers.
+pub fn level2(
     level1: &Level1,
     long_edge: usize,
     orientation: u16,
-    wb: [f32; 3],
-    color: &CameraColor,
-    transfer: &Transfer,
-    params: &Params<'_>,
-) -> Result<Rgb8, Error> {
+    threads: usize,
+) -> Result<Level2, Error> {
     let (w, h) = (level1.width, level1.height);
     if !pixels_ok(w, h) || level1.rgb.len() != w * h * 3 {
         return Err(Error::Size);
     }
     let (dw, dh) = fit(w, h, long_edge);
-    let linear: Vec<f32> = level1.rgb.iter().map(|v| f32::from(*v) / 65535.0).collect();
-    let small = resample(&linear, w, h, dw, dh, params.threads)?;
+    let canvas = resample_u16(&level1.rgb, w, h, dw, dh, threads)?;
+    let (rgb, width, height) = match oriented3(&canvas, dw, dh, orientation) {
+        Some(turned) => turned,
+        None => (canvas, dw, dh),
+    };
+    Ok(Level2 { width, height, rgb })
+}
+
+/// Level 2 to level 3: per pixel white balance and clip at the camera
+/// white, exposure folded into the camera matrix, the look when there is
+/// one, then the sRGB transfer to 8 bits. Level 2 is already oriented, so
+/// the display buffer follows its axes. This is what an exposure or look
+/// edit reruns; level 2 is untouched.
+pub fn level3(
+    level2: &Level2,
+    wb: [f32; 3],
+    color: &CameraColor,
+    transfer: &Transfer,
+    params: &Params<'_>,
+) -> Result<Rgb8, Error> {
+    let (dw, dh) = (level2.width, level2.height);
+    if !pixels_ok(dw, dh) || level2.rgb.len() != dw * dh * 3 {
+        return Err(Error::Size);
+    }
     let gain = 2.0f32.powf(params.exposure);
     let mut matrix: Matrix = color.rgb_cam;
     for row in matrix.iter_mut() {
@@ -393,7 +461,7 @@ pub fn render(
     let mut out = vec![0u8; dw * dh * 3];
     let threads = thread_count(params.threads, dh);
     let band = band_rows(dh, threads);
-    let small_ref = &small;
+    let small_ref = &level2.rgb;
     let matrix_ref = &matrix;
     let look = params.look;
     let items: Vec<(usize, &mut [u8])> = out.chunks_mut(band * dw * 3).enumerate().collect();
@@ -421,26 +489,52 @@ pub fn render(
             *out_px = rgb.map(|v| transfer.encode(v));
         }
     });
-    Ok(orient(
-        Rgb8 {
-            width: dw,
-            height: dh,
-            data: out,
-        },
-        orientation,
-    ))
+    Ok(Rgb8 {
+        width: dw,
+        height: dh,
+        data: out,
+    })
 }
 
-/// Applies a TIFF orientation: 3 turns the image half way round, 6 a
-/// quarter turn clockwise, 8 a quarter turn anticlockwise; anything else,
-/// and an inconsistent buffer, is returned as it came.
-pub fn orient(image: Rgb8, orientation: u16) -> Rgb8 {
-    if !matches!(orientation, 3 | 6 | 8) || !image.is_consistent() {
-        return image;
+/// Develops level 1 to 8-bit sRGB at most `long_edge` on its long side, by
+/// way of level 2 (resample and orient) then level 3 (the per-pixel
+/// pipeline): what the headless verb runs, one frame at a time.
+pub fn render(
+    level1: &Level1,
+    long_edge: usize,
+    orientation: u16,
+    wb: [f32; 3],
+    color: &CameraColor,
+    transfer: &Transfer,
+    params: &Params<'_>,
+) -> Result<Rgb8, Error> {
+    let l2 = level2(level1, long_edge, orientation, params.threads)?;
+    level3(&l2, wb, color, transfer, params)
+}
+
+/// Turns an interleaved three-channel buffer by a TIFF orientation into a
+/// fresh buffer of the turned axes: 3 half way round, 6 a quarter turn
+/// clockwise, 8 a quarter the other way. Any other orientation, or a
+/// buffer that is not its axes, is `None`, left to the caller to keep as it
+/// came.
+fn oriented3<T: Copy + Default>(
+    src: &[T],
+    w: usize,
+    h: usize,
+    orientation: u16,
+) -> Option<(Vec<T>, usize, usize)> {
+    // A zero axis is left to the caller (both of ours reject it first, by
+    // `pixels_ok` and `is_consistent`); guarded here so a future caller
+    // cannot reach the zero-width `chunks_exact_mut` or the `w - 1` below.
+    if !matches!(orientation, 3 | 6 | 8)
+        || w == 0
+        || h == 0
+        || src.len() != w.checked_mul(h)?.checked_mul(3)?
+    {
+        return None;
     }
-    let (w, h) = (image.width, image.height);
     let (ow, oh) = if orientation == 3 { (w, h) } else { (h, w) };
-    let mut data = vec![0u8; image.data.len()];
+    let mut data = vec![T::default(); src.len()];
     for (oy, out_row) in data.chunks_exact_mut(ow * 3).enumerate() {
         for (ox, out_px) in out_row.as_chunks_mut::<3>().0.iter_mut().enumerate() {
             let (x, y) = match orientation {
@@ -448,14 +542,31 @@ pub fn orient(image: Rgb8, orientation: u16) -> Rgb8 {
                 6 => (oy, h - 1 - ox),
                 _ => (w - 1 - oy, ox),
             };
-            if let Some(px) = image.pixel(x, y) {
-                *out_px = px;
+            let base = (y * w + x) * 3;
+            if let Some(px) = src
+                .get(base..base + 3)
+                .and_then(|s| s.as_chunks::<3>().0.first())
+            {
+                *out_px = *px;
             }
         }
     }
-    Rgb8 {
-        width: ow,
-        height: oh,
-        data,
+    Some((data, ow, oh))
+}
+
+/// Applies a TIFF orientation to an image: 3 half way round, 6 a quarter
+/// turn clockwise, 8 a quarter anticlockwise; anything else, and an
+/// inconsistent buffer, is returned as it came.
+pub fn orient(image: Rgb8, orientation: u16) -> Rgb8 {
+    if !image.is_consistent() {
+        return image;
+    }
+    match oriented3(&image.data, image.width, image.height, orientation) {
+        Some((data, width, height)) => Rgb8 {
+            width,
+            height,
+            data,
+        },
+        None => image,
     }
 }

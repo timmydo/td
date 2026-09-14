@@ -15,8 +15,11 @@ use td_photo::camera;
 use td_photo::color::{
     self, apply, camera_color, invert, multiply, srgb_encode, Transfer, MIDDLE_GREY,
 };
-use td_photo::develop::{self, fit, orient, resample, superpixel, Level1, Params};
+use td_photo::develop::{
+    self, fit, level2, level3, orient, resample, resample_u16, superpixel, Level1, Level2, Params,
+};
 use td_photo::image::Rgb8;
+use td_photo::look::Look;
 use td_photo::nef::{Cfa, Crop, Decoded};
 
 fn close(a: f32, b: f32, tolerance: f32) -> bool {
@@ -437,6 +440,146 @@ fn render_develops_neutral_patches_to_expected_values() {
     )
     .unwrap();
     assert_eq!(out.pixel(0, 0), Some([255, 255, 255]));
+}
+
+#[test]
+fn resample_u16_matches_the_converted_f32_path() {
+    // Reading the u16 level as f32/65535 during the resample gives the same
+    // values, in the same order, as converting the whole level first, so
+    // the window's direct path and the old whole-frame path agree exactly.
+    let src: Vec<u16> = (0..7 * 5 * 3).map(|i| (i * 811 % 65536) as u16).collect();
+    let converted: Vec<f32> = src.iter().map(|v| f32::from(*v) / 65535.0).collect();
+    for (dw, dh) in [(3, 2), (7, 5), (11, 9), (1, 1)] {
+        let direct = resample_u16(&src, 7, 5, dw, dh, 4).unwrap();
+        let via_f32 = resample(&converted, 7, 5, dw, dh, 4).unwrap();
+        assert_eq!(direct, via_f32, "{dw}x{dh}");
+    }
+    assert_eq!(
+        resample_u16(&[0u16; 5], 7, 5, 3, 2, 1).unwrap_err(),
+        develop::Error::Size
+    );
+}
+
+#[test]
+fn the_levels_split_composes_to_render() {
+    let color = camera_color(&z8().xyz_to_cam).unwrap();
+    let transfer = Transfer::srgb();
+    let wb = color.daylight;
+    let grey = |v: f32| [v / wb[0], v / wb[1], v / wb[2]];
+    // A non-square frame: level 2 fits the long edge, then a quarter turn
+    // swaps the axes to what render ends on.
+    let mut pixels = Vec::new();
+    for y in 0..4 {
+        for x in 0..6 {
+            pixels.push(grey(
+                if x < 3 { 0.25 } else { 0.75 } * (1.0 - y as f32 * 0.1),
+            ));
+        }
+    }
+    let level1 = level1_of(&pixels, 6, 4);
+    let flat = level2(&level1, 3, 1, 3).unwrap();
+    assert_eq!((flat.width, flat.height), (3, 2));
+    let turned: Level2 = level2(&level1, 3, 6, 3).unwrap();
+    assert_eq!((turned.width, turned.height), (2, 3));
+    // The new ordering (orient in level 2, then the per-pixel tail) equals
+    // the old ordering (the tail on a held unturned level 2, then orient the
+    // u8 output) for every orientation, exposure and look. The two sides run
+    // different orient instantiations, f32 and u8, so this is no tautology,
+    // and it holds render against a level 3 rerun off one held level 2 (the
+    // memoization an exposure or look edit relies on).
+    let look = Look::parse(b"td-photo look 1\nsaturation 1.5\n").unwrap();
+    let held = level2(&level1, 3, 1, 3).unwrap();
+    for look_opt in [None, Some(&look)] {
+        for orientation in [1u16, 3, 6, 8] {
+            for exposure in [-1.0, 0.0, 0.4] {
+                let params = Params {
+                    exposure,
+                    threads: 3,
+                    look: look_opt,
+                };
+                let new = develop::render(&level1, 3, orientation, wb, &color, &transfer, &params)
+                    .unwrap();
+                let old = orient(
+                    level3(&held, wb, &color, &transfer, &params).unwrap(),
+                    orientation,
+                );
+                assert_eq!(
+                    new,
+                    old,
+                    "orientation {orientation} exposure {exposure} look {}",
+                    look_opt.is_some()
+                );
+            }
+        }
+    }
+    // Level 2 and level 3 refuse a buffer that is not its axes.
+    assert_eq!(
+        level2(
+            &Level1 {
+                width: 6,
+                height: 4,
+                rgb: vec![0; 5],
+            },
+            3,
+            1,
+            1
+        )
+        .unwrap_err(),
+        develop::Error::Size
+    );
+    let params = Params {
+        exposure: 0.0,
+        threads: 1,
+        look: None,
+    };
+    assert_eq!(
+        level3(
+            &Level2 {
+                width: 3,
+                height: 2,
+                rgb: vec![0.0; 5],
+            },
+            wb,
+            &color,
+            &transfer,
+            &params
+        )
+        .unwrap_err(),
+        develop::Error::Size
+    );
+}
+
+#[test]
+fn orient_leaves_a_zero_axis_or_odd_orientation_alone() {
+    // A zero axis, or an orientation that is not 3, 6 or 8, is returned as
+    // it came, never a panic: the generic orient core guards a zero axis for
+    // any caller, above what its two callers already reject.
+    for orientation in [0u16, 1, 2, 3, 6, 8, 9] {
+        let empty = Rgb8 {
+            width: 0,
+            height: 0,
+            data: Vec::new(),
+        };
+        assert_eq!(
+            orient(empty, orientation),
+            Rgb8 {
+                width: 0,
+                height: 0,
+                data: Vec::new(),
+            }
+        );
+    }
+    let img = Rgb8 {
+        width: 2,
+        height: 1,
+        data: vec![1, 2, 3, 4, 5, 6],
+    };
+    let same = Rgb8 {
+        width: 2,
+        height: 1,
+        data: vec![1, 2, 3, 4, 5, 6],
+    };
+    assert_eq!(orient(img, 1), same);
 }
 
 #[test]
