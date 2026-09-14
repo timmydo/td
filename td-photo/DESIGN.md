@@ -31,7 +31,8 @@ the look in it (`develop`), the RGB image buffers and PPM writer and reader
 (`image`), the baseline JPEG decoder for the embedded previews with its
 reduced-transform scaling (`jpeg`), the thumbnail rule and the thumbnail cache,
 the library's sidecar grammar, roll rules and dating rule (`library`), the cull
-controller over td-ui's driven seam with its action table and scene (`ui`), the
+and develop controller over td-ui's driven seam with its action table and scene
+(`ui`), the
 window over it with its thumbnail pool and control socket (`window`), and the
 command line `td-photo probe FILE`, `td-photo develop FILE OUT.ppm`, `td-photo
 thumb FILE OUT.ppm`, `td-photo cache`, `td-photo looks`, `td-photo import SRC
@@ -45,8 +46,10 @@ neither the length the file system reported; `develop` and `thumb` refuse an
 so a name that appeared meanwhile is not replaced either; the sidecar is the one
 file td-photo replaces, and only through its own temporary. The crate depends on
 td-ui, by path, for the driven seam, the raster and bands the scene is laid out
-with and the Wayland client the window runs on; the window has no develop mode
-yet: the increments at the end schedule the rest in order.
+with and the Wayland client the window runs on; the window's develop mode
+lands over its own slices: the mode, its keys and the develop edits over the
+seam and the socket are in; the developed preview, the crop drag and the look
+list follow, as the increments at the end schedule.
 
 The rules below define version 1; the increments identify the order of
 implementation, not choices left to each implementing agent.
@@ -89,12 +92,16 @@ modes are the photographer's order of work.
    `Escape` to go back, and `1` to `4` (or the bar) to show all, the picks, the
    rejects or the unflagged. `Delete rejected` moves the rejects and their
    sidecars into the roll's `rejected/` folder; nothing is unlinked.
-3. **Develop** shows one photo developed from its raw data. `+`/`-` move
-   exposure by a third of a stop and `Shift` by a tenth, `C` enters the crop
-   with drag handles and aspect presets (free, 3:2, 4:3, 1:1, 16:9), `L`
-   opens the look list, `0` resets, and `E` exports. Every change is saved
-   to the sidecar as it is made; there is no explicit save and no undo
-   stack in version 1, only reset to camera defaults.
+3. **Develop** shows one photo developed from its raw data, entered with `d`
+   on the cursor's photo and left with `Escape`. `=`/`-` move exposure by a
+   third of a stop and their shifted pair `+`/`_` by a tenth, `0` resets to
+   camera defaults, and the crop and the look are set by the `crop` and
+   `look` actions, taking the box's four fractions or a look's stem; the
+   crop's drag handles and aspect presets (free, 3:2, 4:3, 1:1, 16:9) and
+   the look list overlay are a later slice, as the developed preview and
+   `export` are. Every change is saved to the sidecar as it is made; there
+   is no explicit save and no undo stack in version 1, only reset to camera
+   defaults.
 
 Export renders the full-resolution raw through the same pipeline and writes
 an sRGB image into the roll's `exported/` folder, never overwriting: a
@@ -111,17 +118,20 @@ window, all speaking the toolkit's one vocabulary.
 
 - **One dispatcher.** Everything the window can do is an `Action`, a closed enum
   in `ui` (open a roll, the cursor moves, select, pick, reject, unflag, the four
-  filters, the single view and back, scroll, quit; develop mode's actions,
-  export and delete rejected join it in their increments). `ui::Controller`
+  filters, the single view and back, scroll, quit, enter develop and its
+  exposure, look, crop and reset; export and delete rejected join it in their
+  increments). `ui::Controller`
   holds the model (the roll's names and sidecars, the cursor, the filter, the
   view, the scroll and the surface, and the shown list the filter admits, kept
   rather than rescanned); `action(name, fields)` and `input(Input)` apply one
   action to it and return the outcome and the `Effect`s the adapter carries out
-  (`Open` this folder, `Flag` that photo). The keyboard bindings, the pointer
+  (`Open` this folder, `Flag` that photo, `Expose` by a delta, `Edit` a crop or
+  look, `Reset` to camera defaults). The keyboard bindings, the pointer
   hit-testing, the replay stream and the control socket are four adapters over
   that one dispatcher, and nothing reaches the model around it. The cursor is
   always among the shown or nowhere: a filter or a flag that hides it moves it
-  to the first shown photo, and the single view ends when there is none. The
+  to the first shown photo, and the single view ends when there is none, as
+  develop mode does, both falling back to the cull grid. The
   controller reads no file, clock or descriptor; `main`'s `Session` is the
   adapter that reads rolls and writes sidecars for it, and implements td-ui's
   `driven::Controller`, so the toolkit's generic verbs route to it. A flag is
@@ -140,6 +150,23 @@ window, all speaking the toolkit's one vocabulary.
   held, and the budget holds at every settle as at open: a flag that would take
   the roll past it is refused before anything is written, and a sidecar that
   grew past it meanwhile is not held, its photo shown as refused.
+- **Two modes.** The controller is in `cull` or `develop`; `develop` is a view
+  of one photo, the cursor's, entered with the `develop` action (`d`) and left
+  with `grid` (`Escape`), which returns to the cull grid. The develop edits are
+  that mode's alone and are `ignored` in cull; the cull filters and the
+  single-view toggle are cull's and are `ignored` in develop. Exposure is a
+  delta, `expose-in`/`expose-out` a third of a stop and
+  `expose-in-fine`/`expose-out-fine` a tenth, added by the adapter to the
+  file's exposure as it stands (concurrency-correct as a flag is, not the
+  model's copy) and clamped to `MAX_EXPOSURE`, so a step that clamps to no
+  change writes nothing and is `ignored`, unless a file changed meanwhile
+  makes the settle a change, as it does for a flag; `look` and `crop` are
+  absolute values the adapter sets,
+  their grammar judged in the dispatch so a stem that is not a look or a box
+  under the minimum edge or outside the image is `bad-argument` before any
+  write; `reset` clears the develop keys and keeps the flag. Losing the cursor,
+  when a flag hides the last shown photo, drops develop back to the cull grid as
+  it ends the single view.
 - **A headless verb for every durable effect.** Whatever an action does to
   files is also a command-line verb: `import`, `list`, `flag`, `edit`
   (get and set of a sidecar's values), `develop`, `export`, `thumb`,
@@ -164,7 +191,7 @@ window, all speaking the toolkit's one vocabulary.
   `ok busy` at the deadline, `MS` at most `MAX_WAIT_MS` (4,000, under the
   transport's five-second deadline per request, so the reply is written before
   the connection expires); the replay, with nothing outstanding, is idle at
-  once. `state` is `cull`, the roll's path in hex, the
+  once. `state` is the mode (`cull` or `develop`), the roll's path in hex, the
   photo count, the shown count, the cursor's position among the shown, the
   filter, the view (`grid` or `single`), then the photo under the cursor (its
   name in hex, since the envelope is ASCII and a file name need not be, then
@@ -635,22 +662,25 @@ model per request: the filter bar (`chrome::Bar`, the active filter in brackets
 and the others padded to its width, so the headers keep their places), the grid
 or the single view, and the status row (`chrome::Status`: the roll's folder, the
 counts, the filter, the photo under the cursor with its flag, `(sidecar
-refused)` when it was, `single` in that view). A grid cell is `CELL_W` by
-`CELL_H` (176 by 152) reference pixels at the surface's scale: a 160 by 120
+refused)` when it was, `single` in that view, `develop` in develop mode). A grid
+cell is `CELL_W` by `CELL_H` (176 by 152) reference pixels at the surface's
+scale: a 160 by 120
 thumbnail box under `CELL_PAD` (8) of padding, a `P` or `X` badge at its corner
 for a flagged photo, and the name under it, a reject's dimmed; the cursor's cell
 wears a two-pixel selected frame. Cells fill whole rows from the top-left, as
 many columns as the width holds and as many rows as the height between the bands
 holds, at least one of each, so a surface too small for a cell clips one rather
 than shows none, and the grid scrolls by rows, keeping the cursor's row shown.
-The single view shows the name, the facts and the largest 3:2 box under them. A
+The single view shows the name, the facts and the largest 3:2 box under them;
+develop mode shows the same view of the cursor's photo, its status marked
+`develop`. A
 press on a bar header sets the filter, on a cell selects it, and in the single
 view anywhere in the area between the bands returns to the grid; the status row,
 and anything off the surface, is not a target, and the bands are hit-tested last
 painted first, so on a surface too short for both the status row covers the
 bar's headers as it covers their pixels. A box whose thumbnail is not held is a
 neutral placeholder, which is what `frame` digests either way; the single view's
-box stays one until develop mode's preview.
+box stays one until the developed-preview slice.
 
 `td-photo open [ROLL] [--control-socket PATH]` runs the window (`window`), a
 `td_ui::client::App` in the shape td-setup's is, and one adapter over the same
@@ -909,11 +939,16 @@ all-target Clippy.
    the grid, `wait-idle`, `--preview`, `--control-socket`, and
    `tests/control_process.rs` under the native compositor harness the
    sibling crates use. Landed.
-5. Develop mode, in two landings. (a) The look format with the built-in
-   set (`look`), the look in the headless pipeline, `td-photo looks` and
-   `develop --look`. Landed. (b) Levels 0 through 3 with their
-   memoization, exposure, crop with the drag contract, the look list, and
-   the develop actions in the table, the replay and the control socket.
+5. Develop mode, in landings. (a) The look format with the built-in set
+   (`look`), the look in the headless pipeline, `td-photo looks` and
+   `develop --look`. Landed. (b) The develop model: the `cull`/`develop`
+   mode, the develop actions in the table (enter and leave, exposure in and
+   out coarse and fine, `look`, `crop` by fractions, `reset`), their gating
+   to the mode, exposure as a file-relative delta and `look` and `crop`
+   absolute, over `--replay` and the control socket, with `tests/ui.rs`.
+   Landed. (c) Levels 0 through 3 with their memoization and the developed
+   preview in the develop view, over the window, `--preview` and the native
+   test. (d) The crop drag contract and the look list overlay.
 6. Export: banded full-resolution bilinear demosaic, the JPEG encoder,
    `exported/` naming, and `td-photo export`; and `delete-rejected`, the
    action and its verb that move rejects and their sidecars into

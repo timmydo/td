@@ -1698,24 +1698,54 @@ impl Session {
         for effect in effects {
             match effect {
                 Effect::Open(path) => self.open(&path)?,
-                Effect::Flag { index, name, flag } => outcome = self.flag(index, name, flag)?,
+                Effect::Flag { index, name, flag } => {
+                    outcome = self.edit(index, name, |sidecar| {
+                        sidecar.set(Key::Flag, flag.map(Flag::word))
+                    })?
+                }
+                Effect::Edit {
+                    index,
+                    name,
+                    key,
+                    value,
+                } => {
+                    outcome =
+                        self.edit(index, name, |sidecar| sidecar.set(key, value.as_deref()))?
+                }
+                Effect::Expose { index, name, delta } => {
+                    outcome = self.edit(index, name, |sidecar| {
+                        let current = sidecar.exposure().unwrap_or(0);
+                        let next = current
+                            .saturating_add(delta)
+                            .clamp(-library::MAX_EXPOSURE, library::MAX_EXPOSURE);
+                        sidecar.set(Key::Exposure, Some(&library::exposure_text(next)))
+                    })?
+                }
+                Effect::Reset { index, name } => {
+                    outcome = self.edit(index, name, |sidecar| {
+                        sidecar.reset();
+                        Ok(())
+                    })?
+                }
             }
         }
         Ok(outcome)
     }
 
-    /// Sets or clears one photo's flag on its sidecar as the file holds it
-    /// now, not the model's copy, so an edit made since the roll opened is
-    /// kept, a sidecar that became malformed refuses the flag, and the flag
-    /// the file already holds is `ignored`; a flag that would take the roll
+    /// Applies one sidecar edit on the file as it holds it now, not the
+    /// model's copy, so an edit made since the roll opened is kept, a
+    /// sidecar that became malformed refuses the edit, and a mutation that
+    /// leaves the file's value unchanged writes nothing (the flag or value
+    /// the file already holds is `ignored`, or `changed` only if the file
+    /// differed from the model's copy); an edit that would take the roll
     /// past its sidecar budget is refused before anything is written. The
     /// model is settled from what was written, or from the file when the
     /// write failed, which is `refused`.
-    fn flag(
+    fn edit(
         &mut self,
         index: usize,
         name: String,
-        flag: Option<Flag>,
+        mutate: impl FnOnce(&mut Sidecar) -> Result<(), library::Error>,
     ) -> Result<Outcome, ui::Error> {
         let roll = self.ui.roll().ok_or(ui::Error::NoRoll)?;
         let original = PathBuf::from(OsStr::from_bytes(roll)).join(&name);
@@ -1730,7 +1760,14 @@ impl Session {
             Ok(sidecar) => sidecar,
             Err(why) => return refuse(self, &why),
         };
-        if sidecar.flag() == flag {
+        let before = sidecar.clone();
+        if let Err(e) = mutate(&mut sidecar) {
+            return refuse(self, &format!("{}: {e}", original.display()));
+        }
+        if sidecar == before {
+            // The value the file already holds: nothing is written, and the
+            // model takes the file's word, a change only if the file
+            // differed from the model's copy.
             let held = Photo {
                 name,
                 sidecar: Some(sidecar),
@@ -1741,9 +1778,6 @@ impl Session {
             } else {
                 Outcome::Ignored
             });
-        }
-        if let Err(e) = sidecar.set(Key::Flag, flag.map(Flag::word)) {
-            return refuse(self, &format!("{}: {e}", original.display()));
         }
         if !self.ui.fits(index, ui::sidecar_bytes(&sidecar)) {
             note(&format!("{}: {}", original.display(), ui::OVER_BUDGET));

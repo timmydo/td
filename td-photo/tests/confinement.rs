@@ -297,6 +297,10 @@ fn budgets_are_the_documented_values() {
     assert_eq!(td_photo::look::MAX_NAME, 64);
     assert_eq!(td_photo::look::HEADER, "td-photo look 1");
     assert_eq!(td_photo::ui::CONTROL_JOBS_PER_TURN, 8);
+    // The exposure steps develop mode nudges by: a third of a stop and a
+    // tenth, in hundredths.
+    assert_eq!(td_photo::ui::EXPOSURE_STEP, 33);
+    assert_eq!(td_photo::ui::EXPOSURE_FINE, 10);
     assert_eq!(
         (td_photo::ui::THUMB_WIDTH, td_photo::ui::THUMB_HEIGHT),
         (160, 120)

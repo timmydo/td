@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use td_photo::library::{Filter, Flag, Key, Sidecar};
+use td_photo::library::{self, Filter, Flag, Key, Sidecar};
 use td_photo::ui::{self, Action, Controller, Effect, Photo, View, BINDINGS};
 use td_ui::control::{frame, hex, valid_code, Decoder, ErrorCode};
 use td_ui::driven::{self, Input, Outcome, PointerPhase};
@@ -30,6 +30,9 @@ const POSITION: usize = 4;
 const VIEW: usize = 6;
 const NAME: usize = 7;
 const FLAG: usize = 8;
+const EXPOSURE: usize = 9;
+const CROP: usize = 10;
+const LOOK: usize = 11;
 const STATUS: usize = 12;
 const JOBS: usize = 13;
 const GENERATION: usize = 14;
@@ -45,6 +48,12 @@ fn fields(controller: &Controller) -> Vec<String> {
 /// The wire's spelling of the `i`th test photo's name.
 fn name(i: usize) -> String {
     hex(format!("DSC_{i:04}.NEF").as_bytes())
+}
+
+/// The `i`th test photo's file name: what an effect carries, since it
+/// names the file the adapter writes, not the wire's hex.
+fn file(i: usize) -> String {
+    format!("DSC_{i:04}.NEF")
 }
 
 fn edits(text: &str) -> Sidecar {
@@ -104,7 +113,7 @@ fn the_action_table_is_closed_aligned_and_reachable() {
         match binding.chord {
             None => {
                 assert!(
-                    ["open", "select", "scroll"].contains(&binding.name),
+                    ["open", "select", "scroll", "look", "crop"].contains(&binding.name),
                     "{} has no key",
                     binding.name
                 );
@@ -401,37 +410,68 @@ fn a_session_walks_the_grid_and_reports_its_state() {
     );
 }
 
-/// What the adapter does with flag effects when the file holds what the
-/// model does: refuses a sidecar it could not read, calls the flag the
-/// file already holds ignored, else sets it and settles the photo.
+/// The binary's adapter over the in-process model, for the tests that
+/// carry effects by hand: each effect mutates the photo's sidecar as it
+/// stands (the model's copy here stands in for the file), then settles it.
+/// A refused sidecar is never rewritten; a mutation that leaves the sidecar
+/// as it was writes nothing and is `Ignored` unless the settle itself
+/// brought a change; anything else is `Changed`. The delta and clamp of
+/// exposure live here, as they do in the binary.
 fn apply(c: &mut Controller, effects: &[Effect]) -> Result<Outcome, ui::Error> {
     let mut outcome = Outcome::Changed;
     for effect in effects {
-        let Effect::Flag { index, name, flag } = effect else {
-            panic!("{effect:?}");
+        let (index, name) = match effect {
+            Effect::Flag { index, name, .. }
+            | Effect::Edit { index, name, .. }
+            | Effect::Expose { index, name, .. }
+            | Effect::Reset { index, name } => (*index, name.clone()),
+            Effect::Open(_) => panic!("{effect:?}"),
         };
-        let photo = &c.photos()[*index];
+        let photo = &c.photos()[index];
         if photo.error.is_some() {
             return Err(ui::Error::Refused);
         }
         let mut sidecar = photo.sidecar.clone().unwrap_or_default();
-        let held = sidecar.flag() == *flag;
-        sidecar.set(Key::Flag, flag.map(Flag::word)).unwrap();
+        let before = sidecar.clone();
+        match effect {
+            Effect::Flag { flag, .. } => sidecar.set(Key::Flag, flag.map(Flag::word)).unwrap(),
+            Effect::Edit { key, value, .. } => sidecar.set(*key, value.as_deref()).unwrap(),
+            Effect::Expose { delta, .. } => {
+                let current = sidecar.exposure().unwrap_or(0);
+                let next = current
+                    .saturating_add(*delta)
+                    .clamp(-library::MAX_EXPOSURE, library::MAX_EXPOSURE);
+                sidecar
+                    .set(Key::Exposure, Some(&library::exposure_text(next)))
+                    .unwrap();
+            }
+            Effect::Reset { .. } => sidecar.reset(),
+            Effect::Open(_) => panic!("{effect:?}"),
+        }
+        let unchanged = sidecar == before;
         let changed = c.settle(
-            *index,
+            index,
             Photo {
-                name: name.clone(),
+                name,
                 sidecar: Some(sidecar),
                 error: None,
             },
         );
-        outcome = if held && !changed {
+        outcome = if unchanged && !changed {
             Outcome::Ignored
         } else {
             Outcome::Changed
         };
     }
     Ok(outcome)
+}
+
+/// Runs an action and carries its effects on the model as the adapter
+/// would, returning the settled outcome. For the actions that emit
+/// effects, where `act`, which forbids them, cannot be used.
+fn carry(c: &mut Controller, name: &str, args: &[&str]) -> Outcome {
+    let (_, effects) = c.action(name, args).unwrap();
+    apply(c, &effects).unwrap()
 }
 
 #[test]
@@ -631,6 +671,191 @@ fn flags_change_the_sidecar_through_effects_and_never_a_refused_one() {
     assert!(roll.fits(0, 32_768) && !roll.fits(0, 32_769));
     assert!(roll.settle(0, big.clone()));
     assert_eq!(roll.photos()[0], big);
+}
+
+#[test]
+fn develop_edits_act_on_the_cursor_only_in_develop_mode() {
+    let mut c = Controller::new(surface(800, 600));
+    c.open("roll", b"/r", photos(5)).unwrap();
+
+    // In the cull mode the develop edits are not this mode's: each is
+    // ignored, asks for no effect, and the generation does not move.
+    assert_eq!(c.mode(), ui::Mode::Cull);
+    let quiet = fields(&c)[GENERATION].clone();
+    for name in [
+        "expose-in",
+        "expose-out",
+        "expose-in-fine",
+        "expose-out-fine",
+        "reset",
+    ] {
+        assert_eq!(act(&mut c, name, &[]), Outcome::Ignored, "{name}");
+    }
+    assert_eq!(act(&mut c, "look", &["portra"]), Outcome::Ignored);
+    assert_eq!(
+        act(&mut c, "crop", &["0.1", "0.1", "0.5", "0.5"]),
+        Outcome::Ignored
+    );
+    assert_eq!(fields(&c)[GENERATION], quiet);
+
+    // Entering needs the cursor's photo; the mode word then leads the
+    // state, and entering again, by verb or the `d` key, is ignored.
+    assert_eq!(fields(&c)[POSITION], "0");
+    assert_eq!(act(&mut c, "develop", &[]), Outcome::Changed);
+    assert_eq!(c.mode(), ui::Mode::Develop);
+    assert_eq!(fields(&c)[MODE], "develop");
+    assert_eq!(act(&mut c, "develop", &[]), Outcome::Ignored);
+    assert_eq!(key(&mut c, "d"), Outcome::Ignored);
+
+    // Exposure is a delta the adapter adds to the file's value, not the
+    // model's copy: the effect names only the photo and the step, and the
+    // value shows once the photo is settled. The coarse step is a third of
+    // a stop, the fine a tenth, in and out.
+    let (outcome, effects) = c.action("expose-in", &[]).unwrap();
+    assert_eq!(outcome, Outcome::Changed);
+    assert_eq!(
+        effects,
+        [Effect::Expose {
+            index: 0,
+            name: file(0),
+            delta: ui::EXPOSURE_STEP,
+        }]
+    );
+    assert_eq!(fields(&c)[EXPOSURE], "-");
+    assert_eq!(apply(&mut c, &effects).unwrap(), Outcome::Changed);
+    assert_eq!(fields(&c)[EXPOSURE], "0.33");
+    assert_eq!(carry(&mut c, "expose-in-fine", &[]), Outcome::Changed);
+    assert_eq!(fields(&c)[EXPOSURE], "0.43");
+    assert_eq!(carry(&mut c, "expose-out", &[]), Outcome::Changed);
+    assert_eq!(fields(&c)[EXPOSURE], "0.10");
+    assert_eq!(carry(&mut c, "expose-out-fine", &[]), Outcome::Changed);
+    assert_eq!(fields(&c)[EXPOSURE], "0.00");
+
+    // A look is an absolute Edit; an unknown stem never reaches a write,
+    // judged bad-argument here, and `-` clears it.
+    let (_, effects) = c.action("look", &["portra"]).unwrap();
+    assert_eq!(
+        effects,
+        [Effect::Edit {
+            index: 0,
+            name: file(0),
+            key: Key::Look,
+            value: Some("portra".to_string()),
+        }]
+    );
+    assert_eq!(apply(&mut c, &effects).unwrap(), Outcome::Changed);
+    assert_eq!(fields(&c)[LOOK], "portra");
+    assert_eq!(
+        c.action("look", &["not a look"]).unwrap_err(),
+        ui::Error::BadArgument
+    );
+    assert_eq!(carry(&mut c, "look", &["-"]), Outcome::Changed);
+    assert_eq!(fields(&c)[LOOK], "-");
+
+    // A crop is an absolute Edit; a box under the minimum edge or outside
+    // the image is bad-argument, and the wrong arity is a protocol fault.
+    let (_, effects) = c
+        .action("crop", &["0.1000", "0.1000", "0.5000", "0.5000"])
+        .unwrap();
+    assert_eq!(
+        effects,
+        [Effect::Edit {
+            index: 0,
+            name: file(0),
+            key: Key::Crop,
+            value: Some("0.1000 0.1000 0.5000 0.5000".to_string()),
+        }]
+    );
+    assert_eq!(apply(&mut c, &effects).unwrap(), Outcome::Changed);
+    assert_eq!(fields(&c)[CROP], "0.1000 0.1000 0.5000 0.5000");
+    assert_eq!(
+        c.action("crop", &["0.1000", "0.1000", "0.0010", "0.5000"])
+            .unwrap_err(),
+        ui::Error::BadArgument
+    );
+    assert_eq!(
+        c.action("crop", &["0.9000", "0.1000", "0.5000", "0.5000"])
+            .unwrap_err(),
+        ui::Error::BadArgument
+    );
+    assert!(c.action("crop", &["0.1000", "0.1000", "0.5000"]).is_err());
+
+    // A flag is the cull decision still, set in develop too; reset then
+    // clears the develop keys and keeps the flag.
+    assert_eq!(carry(&mut c, "pick", &[]), Outcome::Changed);
+    assert_eq!(fields(&c)[FLAG], "pick");
+    let (_, effects) = c.action("reset", &[]).unwrap();
+    assert_eq!(
+        effects,
+        [Effect::Reset {
+            index: 0,
+            name: file(0),
+        }]
+    );
+    assert_eq!(apply(&mut c, &effects).unwrap(), Outcome::Changed);
+    assert_eq!(&fields(&c)[EXPOSURE..=LOOK], ["-", "-", "-"]);
+    assert_eq!(fields(&c)[FLAG], "pick");
+
+    // The cull filters and the single-view toggle are not develop's: each
+    // is ignored and leaves the mode and the filter where they were.
+    for name in ["all", "picks", "rejects", "unflagged", "view"] {
+        assert_eq!(act(&mut c, name, &[]), Outcome::Ignored, "{name}");
+    }
+    assert_eq!(c.mode(), ui::Mode::Develop);
+    assert_eq!(c.filter(), Filter::All);
+
+    // Escape leaves develop for the cull grid, and `d` enters it again.
+    assert_eq!(key(&mut c, "Escape"), Outcome::Changed);
+    assert_eq!(c.mode(), ui::Mode::Cull);
+    assert_eq!(fields(&c)[MODE], "cull");
+    assert_eq!(c.view(), View::Grid);
+    assert_eq!(key(&mut c, "d"), Outcome::Changed);
+    assert_eq!(c.mode(), ui::Mode::Develop);
+}
+
+#[test]
+fn losing_the_cursor_drops_develop_back_to_the_cull_grid() {
+    let mut c = Controller::new(surface(800, 600));
+    c.open("roll", b"/r", photos(5)).unwrap();
+    // photos() flags photo 1 a pick; under the picks filter it is alone,
+    // so develop it, then reject it: the filter no longer shows it, the
+    // shown set empties, the cursor is lost, and develop gives way to the
+    // cull grid.
+    assert_eq!(act(&mut c, "picks", &[]), Outcome::Changed);
+    assert_eq!(c.shown(), [1]);
+    assert_eq!(act(&mut c, "develop", &[]), Outcome::Changed);
+    assert_eq!(c.mode(), ui::Mode::Develop);
+    assert_eq!(carry(&mut c, "reject", &[]), Outcome::Changed);
+    assert_eq!(c.shown(), []);
+    assert_eq!(c.cursor(), None);
+    assert_eq!(c.mode(), ui::Mode::Cull);
+    assert_eq!(c.view(), View::Grid);
+    assert_eq!(fields(&c)[MODE], "cull");
+    // With no photo, entering is a no-photo fault and the develop edits are
+    // ignored as they are in any cull view.
+    assert_eq!(c.action("develop", &[]).unwrap_err(), ui::Error::NoPhoto);
+    assert_eq!(act(&mut c, "expose-in", &[]), Outcome::Ignored);
+    // With no roll at all, entering is a no-roll fault.
+    let mut empty = Controller::new(surface(800, 600));
+    assert_eq!(empty.action("develop", &[]).unwrap_err(), ui::Error::NoRoll);
+}
+
+#[test]
+fn develop_entered_from_the_single_view_reports_the_grid() {
+    let mut c = Controller::new(surface(800, 600));
+    c.open("roll", b"/r", photos(3)).unwrap();
+    // Enter develop from the cull single view; the reported view is the
+    // grid, since `grid`/Escape leaves develop for the grid, not the single
+    // view it was entered from.
+    assert_eq!(act(&mut c, "view", &[]), Outcome::Changed);
+    assert_eq!(fields(&c)[VIEW], "single");
+    assert_eq!(act(&mut c, "develop", &[]), Outcome::Changed);
+    assert_eq!(
+        (c.mode(), fields(&c)[VIEW].as_str()),
+        (ui::Mode::Develop, "grid")
+    );
+    assert_eq!(key(&mut c, "Escape"), Outcome::Changed);
+    assert_eq!((c.mode(), c.view()), (ui::Mode::Cull, View::Grid));
 }
 
 #[test]
@@ -949,7 +1174,7 @@ fn the_binary_replays_the_cull_over_a_roll_and_writes_through_the_sidecar() {
             "1"
         ]
     );
-    assert_eq!(&reply(2)[..2], ["ok", "21"]);
+    assert_eq!(&reply(2)[..2], ["ok", "29"]);
     assert_eq!(reply(3), ["ok", "changed"]);
     assert_eq!(reply(4), ["ok", &name(1), "pick", "-", "-", "-", "ok", "-"]);
     assert_eq!(
@@ -1170,6 +1395,143 @@ fn the_binary_replays_the_cull_over_a_roll_and_writes_through_the_sidecar() {
     assert!(help.status.success() && output.status.success());
     assert!(!help.stdout.is_empty());
     assert_eq!(output.stdout, help.stdout);
+}
+
+#[test]
+fn the_binary_develops_a_photo_over_the_effects_and_writes_the_sidecar() {
+    let temp = Temp::new("develop");
+    let roll = temp.0.join("2026/2026-09-13");
+    fs::create_dir_all(&roll).unwrap();
+    for name in ["DSC_0001.NEF", "DSC_0002.NEF"] {
+        fs::write(roll.join(name), b"not really a nef").unwrap();
+    }
+    // The second photo starts near the exposure ceiling and flagged, to
+    // show the clamp and that a reset keeps the flag.
+    fs::write(
+        roll.join("DSC_0002.NEF.edit"),
+        "td-photo edit 1\nexposure 4.90\nflag pick\n",
+    )
+    .unwrap();
+    let roll_s = roll.to_str().unwrap();
+    let edit_1 = roll.join("DSC_0001.NEF.edit");
+
+    let mut session = Replay::start(&["--size", "500x300", roll_s]);
+    let a = session.send(&[
+        request(1, &["state"]),
+        request(2, &["action", "develop"]),
+        request(3, &["state"]),
+        request(4, &["action", "expose-in"]),
+        request(5, &["action", "expose-in-fine"]),
+        request(6, &["action", "expose-out"]),
+        request(7, &["action", "look", "portra"]),
+        request(
+            8,
+            &["action", "crop", "0.1000", "0.1000", "0.5000", "0.5000"],
+        ),
+        request(9, &["state"]),
+        request(10, &["action", "look", "not a look"]),
+        request(
+            11,
+            &["action", "crop", "0.9000", "0.1000", "0.5000", "0.5000"],
+        ),
+        request(12, &["state"]),
+    ]);
+    // Cull at first, then develop: the mode word leads the state.
+    assert_eq!(
+        (a[0][2].as_str(), a[0][9].as_str()),
+        ("cull", name(1).as_str())
+    );
+    assert_eq!(&a[1][1..], ["ok", "changed"]);
+    assert_eq!((a[2][2].as_str(), a[2][11].as_str()), ("develop", "-"));
+    // Four exposure steps, a look and a crop, each a change; the value is
+    // the file's, read back in the state.
+    for reply in &a[3..8] {
+        assert_eq!(&reply[1..], ["ok", "changed"]);
+    }
+    assert_eq!(
+        &a[8][11..14],
+        ["0.10", "0.1000 0.1000 0.5000 0.5000", "portra"]
+    );
+    // An unknown look stem and a crop outside the image never reach a
+    // write; the state is what it was.
+    assert_eq!(&a[9][1..3], ["error", "bad-argument"]);
+    assert_eq!(&a[10][1..3], ["error", "bad-argument"]);
+    assert_eq!((a[11][11].as_str(), a[11][13].as_str()), ("0.10", "portra"));
+    assert_eq!(
+        fs::read_to_string(&edit_1).unwrap(),
+        "td-photo edit 1\nexposure 0.10\nlook portra\ncrop 0.1000 0.1000 0.5000 0.5000\n"
+    );
+
+    // The exposure delta is added to the file's value, not the model's: an
+    // edit made since the roll opened is added to, not overwritten.
+    fs::write(&edit_1, "td-photo edit 1\nexposure 1.00\n").unwrap();
+    let b = session.send(&[
+        request(13, &["action", "expose-in"]),
+        request(14, &["state"]),
+        request(15, &["action", "reset"]),
+        request(16, &["state"]),
+        request(17, &["action", "next"]),
+        request(18, &["state"]),
+        request(19, &["action", "expose-in"]),
+        request(20, &["state"]),
+        request(21, &["action", "expose-in"]),
+        request(22, &["state"]),
+        request(23, &["action", "reset"]),
+        request(24, &["state"]),
+        request(25, &["action", "grid"]),
+        request(26, &["state"]),
+        request(27, &["action", "expose-in"]),
+    ]);
+    // 1.00 on the file, not 0.10 in the model, is the base for the delta.
+    assert_eq!(&b[0][1..], ["ok", "changed"]);
+    assert_eq!(&b[1][11..14], ["1.33", "-", "-"]);
+    // Reset clears the develop keys and keeps the flag; here there is none.
+    assert_eq!(&b[2][1..], ["ok", "changed"]);
+    assert_eq!(&b[3][10..14], ["-", "-", "-", "-"]);
+    // Develop follows the cursor: next moves to the flagged photo.
+    assert_eq!(&b[4][1..], ["ok", "changed"]);
+    assert_eq!(
+        (
+            b[5][2].as_str(),
+            b[5][9].as_str(),
+            b[5][10].as_str(),
+            b[5][11].as_str()
+        ),
+        ("develop", name(2).as_str(), "pick", "4.90")
+    );
+    // A step over the ceiling clamps to it; a further step is no change.
+    assert_eq!(&b[6][1..], ["ok", "changed"]);
+    assert_eq!(b[7][11], "5.00");
+    assert_eq!(&b[8][1..], ["ok", "ignored"]);
+    assert_eq!(b[9][11], "5.00");
+    assert_eq!(b[9][16], b[7][16]);
+    // Reset on the flagged photo clears its exposure but keeps the flag,
+    // through the adapter onto the file.
+    assert_eq!(&b[10][1..], ["ok", "changed"]);
+    assert_eq!((b[11][10].as_str(), b[11][11].as_str()), ("pick", "-"));
+    // Escape or grid leaves develop, where the edits are ignored again.
+    assert_eq!(&b[12][1..], ["ok", "changed"]);
+    assert_eq!(b[13][2], "cull");
+    assert_eq!(&b[14][1..], ["ok", "ignored"]);
+
+    let (ok, _rest, err) = session.finish();
+    assert!(ok, "{err}");
+    // Each photo's reset cleared its develop keys; the first had no flag,
+    // the second's pick was kept; nothing else was written.
+    assert_eq!(fs::read_to_string(&edit_1).unwrap(), "td-photo edit 1\n");
+    assert_eq!(
+        fs::read_to_string(roll.join("DSC_0002.NEF.edit")).unwrap(),
+        "td-photo edit 1\nflag pick\n"
+    );
+    assert_eq!(
+        names(&roll),
+        [
+            "DSC_0001.NEF",
+            "DSC_0001.NEF.edit",
+            "DSC_0002.NEF",
+            "DSC_0002.NEF.edit",
+        ]
+    );
 }
 
 #[test]

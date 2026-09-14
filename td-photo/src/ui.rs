@@ -20,7 +20,7 @@ use td_ui::CELL_HEIGHT;
 use td_ui::CELL_WIDTH;
 
 use crate::image::Rgb8;
-use crate::library::{Filter, Flag, Key, Sidecar};
+use crate::library::{self, Crop, Filter, Flag, Key, Sidecar};
 
 /// The surface a session starts on until it is resized.
 pub const DEFAULT_WIDTH: usize = 800;
@@ -51,8 +51,28 @@ pub const MAX_WAIT_MS: u64 = 4_000;
 pub const CONTROL_JOBS_PER_TURN: usize = 8;
 /// Where a thumbnail goes until it is painted: a neutral ground.
 pub const PLACEHOLDER: u32 = 0xd6d1c7;
-/// The mode word `state` leads with; develop mode is a later increment.
-pub const MODE: &str = "cull";
+/// The coarse exposure step, a third of a stop in hundredths.
+pub const EXPOSURE_STEP: i32 = 33;
+/// The fine exposure step, a tenth of a stop in hundredths.
+pub const EXPOSURE_FINE: i32 = 10;
+
+/// The mode `state` leads with: culling the roll as a grid, or developing
+/// one photo. The develop edits act on the cursor's photo; the cull view
+/// (grid or single) is where the mode returns.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Mode {
+    Cull,
+    Develop,
+}
+
+impl Mode {
+    pub fn word(self) -> &'static str {
+        match self {
+            Self::Cull => "cull",
+            Self::Develop => "develop",
+        }
+    }
+}
 
 /// Why an action or an input is refused; the codes travel on the wire.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -153,6 +173,26 @@ pub enum Effect {
         name: String,
         flag: Option<Flag>,
     },
+    /// Set or clear one develop key (crop or look) in this photo's
+    /// sidecar, on the file as it is then, and settle the model.
+    Edit {
+        index: usize,
+        name: String,
+        key: Key,
+        value: Option<String>,
+    },
+    /// Add `delta` hundredths of a stop to this photo's exposure on the
+    /// file as it is then, clamped to the exposure range, and settle the
+    /// model: a delta, not an absolute, so a value changed meanwhile is
+    /// added to.
+    Expose {
+        index: usize,
+        name: String,
+        delta: i32,
+    },
+    /// Reset this photo's develop keys to camera defaults, keeping the
+    /// flag, on the file as it is then, and settle the model.
+    Reset { index: usize, name: String },
 }
 
 /// The closed set of things the window does. The table below is its
@@ -179,12 +219,20 @@ pub enum Action {
     Unflagged,
     View,
     Grid,
+    Develop,
+    ExposeIn,
+    ExposeOut,
+    ExposeInFine,
+    ExposeOutFine,
+    Look,
+    Crop,
+    Reset,
     Scroll,
     Quit,
 }
 
 impl Action {
-    pub const ALL: [Action; 21] = [
+    pub const ALL: [Action; 29] = [
         Action::Open,
         Action::Next,
         Action::Previous,
@@ -204,6 +252,14 @@ impl Action {
         Action::Unflagged,
         Action::View,
         Action::Grid,
+        Action::Develop,
+        Action::ExposeIn,
+        Action::ExposeOut,
+        Action::ExposeInFine,
+        Action::ExposeOutFine,
+        Action::Look,
+        Action::Crop,
+        Action::Reset,
         Action::Scroll,
         Action::Quit,
     ];
@@ -229,6 +285,14 @@ impl Action {
             Self::Unflagged => "unflagged",
             Self::View => "view",
             Self::Grid => "grid",
+            Self::Develop => "develop",
+            Self::ExposeIn => "expose-in",
+            Self::ExposeOut => "expose-out",
+            Self::ExposeInFine => "expose-in-fine",
+            Self::ExposeOutFine => "expose-out-fine",
+            Self::Look => "look",
+            Self::Crop => "crop",
+            Self::Reset => "reset",
             Self::Scroll => "scroll",
             Self::Quit => "quit",
         }
@@ -253,7 +317,7 @@ impl Action {
 /// binds, the argument shape and the help line. Actions without a chord
 /// take an argument or are the agent's (`open`); the pointer reaches
 /// `select` by pressing a cell and `scroll` by the wheel.
-pub const BINDINGS: [Binding; 21] = [
+pub const BINDINGS: [Binding; 29] = [
     Binding {
         name: "open",
         chord: None,
@@ -366,7 +430,55 @@ pub const BINDINGS: [Binding; 21] = [
         name: "grid",
         chord: Some("Escape"),
         arguments: "",
-        help: "Back to the grid.",
+        help: "Back to the grid, leaving develop mode.",
+    },
+    Binding {
+        name: "develop",
+        chord: Some("d"),
+        arguments: "",
+        help: "Develop the photo under the cursor.",
+    },
+    Binding {
+        name: "expose-in",
+        chord: Some("="),
+        arguments: "",
+        help: "Raise exposure a third of a stop (develop mode).",
+    },
+    Binding {
+        name: "expose-out",
+        chord: Some("-"),
+        arguments: "",
+        help: "Lower exposure a third of a stop (develop mode).",
+    },
+    Binding {
+        name: "expose-in-fine",
+        chord: Some("+"),
+        arguments: "",
+        help: "Raise exposure a tenth of a stop (develop mode).",
+    },
+    Binding {
+        name: "expose-out-fine",
+        chord: Some("_"),
+        arguments: "",
+        help: "Lower exposure a tenth of a stop (develop mode).",
+    },
+    Binding {
+        name: "look",
+        chord: None,
+        arguments: "STEM",
+        help: "Set the develop look to STEM, or - to clear it.",
+    },
+    Binding {
+        name: "crop",
+        chord: None,
+        arguments: "X Y W H",
+        help: "Set the develop crop to the fractions X Y W H.",
+    },
+    Binding {
+        name: "reset",
+        chord: Some("0"),
+        arguments: "",
+        help: "Reset exposure, crop and look to camera defaults (develop mode).",
     },
     Binding {
         name: "scroll",
@@ -497,6 +609,7 @@ pub struct Controller {
     cursor: Option<usize>,
     filter: Filter,
     view: View,
+    mode: Mode,
     first_row: usize,
     generation: u64,
     /// The indices the filter admits, in roll order, refreshed when the
@@ -518,6 +631,7 @@ impl Controller {
             cursor: None,
             filter: Filter::All,
             view: View::Grid,
+            mode: Mode::Cull,
             first_row: 0,
             generation: 0,
             shown: Vec::new(),
@@ -545,6 +659,7 @@ impl Controller {
         self.photos = photos;
         self.filter = Filter::All;
         self.view = View::Grid;
+        self.mode = Mode::Cull;
         self.first_row = 0;
         self.refresh_shown();
         self.cursor = self.shown.first().copied();
@@ -620,6 +735,10 @@ impl Controller {
         self.view
     }
 
+    pub fn mode(&self) -> Mode {
+        self.mode
+    }
+
     pub fn first_row(&self) -> usize {
         self.first_row
     }
@@ -668,10 +787,10 @@ impl Controller {
     }
 
     /// The shown photos on screen and the boxes their thumbnails go in, in
-    /// the grid; nothing in the single view, whose box is the develop
-    /// increment's preview, and nothing before a roll.
+    /// the cull grid; nothing in the single or develop view, whose box is
+    /// the develop increment's preview, and nothing before a roll.
     pub fn visible(&self) -> Vec<(usize, Rect)> {
-        if self.roll.is_none() || self.view != View::Grid {
+        if self.roll.is_none() || self.mode != Mode::Cull || self.view != View::Grid {
             return Vec::new();
         }
         let layout = self.layout();
@@ -689,11 +808,12 @@ impl Controller {
     }
 
     /// The photos whose thumbnails the window wants, in the order it wants
-    /// them: the grid's screen, then the screen below it, then the one
-    /// above, whichever view is showing, so the grid is ready when the
-    /// single view returns to it.
+    /// them: the cull grid's screen, then the screen below it, then the one
+    /// above, whichever cull view is showing, so the grid is ready when the
+    /// single view returns to it. Develop mode wants no grid thumbnails;
+    /// its preview is a later increment.
     pub fn wanted(&self) -> Vec<usize> {
-        if self.roll.is_none() {
+        if self.roll.is_none() || self.mode != Mode::Cull {
             return Vec::new();
         }
         let layout = self.layout();
@@ -755,17 +875,18 @@ impl Controller {
         }
     }
 
-    /// The tab-separated facts: the mode, the roll's path in hex, how many
-    /// photos and how many shown, the cursor's position among the shown,
-    /// the filter, the view, then the photo under the cursor (its name in
-    /// hex, flag, exposure, crop, look, sidecar state), the outstanding job
-    /// count and the generation. Absent values are `-`.
+    /// The tab-separated facts: the mode (`cull` or `develop`), the roll's
+    /// path in hex, how many photos and how many shown, the cursor's
+    /// position among the shown, the filter, the cull view (`grid` or
+    /// `single`, where develop mode returns), then the photo under the
+    /// cursor (its name in hex, flag, exposure, crop, look, sidecar state),
+    /// the outstanding job count and the generation. Absent values are `-`.
     pub fn state(&self) -> String {
         let position = self.position();
         let photo = self.cursor.and_then(|index| self.photos.get(index));
         let dash = || "-".to_string();
         [
-            MODE.to_string(),
+            self.mode.word().to_string(),
             self.roll.as_ref().map_or_else(dash, |roll| hex(&roll.path)),
             self.photos.len().to_string(),
             self.shown.len().to_string(),
@@ -859,7 +980,7 @@ impl Controller {
             (Action::Picks, []) => self.set_filter(Filter::Picks),
             (Action::Rejects, []) => self.set_filter(Filter::Rejects),
             (Action::Unflagged, []) => self.set_filter(Filter::Unflagged),
-            (Action::Grid, []) => self.set_view(View::Grid),
+            (Action::Grid, []) => self.back_to_grid(),
             (Action::Next, []) => self.step(1)?,
             (Action::Previous, []) => self.step(-1)?,
             (Action::Down, []) => self.step(self.layout().columns as i64)?,
@@ -879,7 +1000,7 @@ impl Controller {
                     usize::try_from(decimal(position)?).map_err(|_| Error::BadArgument)?;
                 self.select(position)?
             }
-            (Action::View, []) => {
+            (Action::View, []) if self.mode == Mode::Cull => {
                 self.need_photo()?;
                 let view = match self.view {
                     View::Grid => View::Single,
@@ -887,9 +1008,20 @@ impl Controller {
                 };
                 self.set_view(view)
             }
+            // Return is the cull grid/single toggle; in develop mode Escape
+            // is the way out.
+            (Action::View, []) => Outcome::Ignored,
             (Action::Pick, []) => return self.flag(Some(Flag::Pick), effects),
             (Action::Reject, []) => return self.flag(Some(Flag::Reject), effects),
             (Action::Unflag, []) => return self.flag(None, effects),
+            (Action::Develop, []) => self.enter_develop()?,
+            (Action::ExposeIn, []) => return self.expose(EXPOSURE_STEP, effects),
+            (Action::ExposeOut, []) => return self.expose(-EXPOSURE_STEP, effects),
+            (Action::ExposeInFine, []) => return self.expose(EXPOSURE_FINE, effects),
+            (Action::ExposeOutFine, []) => return self.expose(-EXPOSURE_FINE, effects),
+            (Action::Look, [stem]) => return self.set_look(stem, effects),
+            (Action::Crop, [x, y, w, h]) => return self.set_crop(x, y, w, h, effects),
+            (Action::Reset, []) => return self.reset_develop(effects),
             _ => return Err(control::Error::Protocol.into()),
         };
         Ok((self.finish(outcome), effects))
@@ -923,6 +1055,11 @@ impl Controller {
         if self.roll.is_none() {
             return Ok((Outcome::Ignored, Vec::new()));
         }
+        // The develop view takes no press yet: the crop drag is a later
+        // increment (DESIGN.md, increments).
+        if self.mode == Mode::Develop {
+            return Ok((Outcome::Ignored, Vec::new()));
+        }
         let outcome = match self.view {
             View::Single if self.layout().area.contains(x, y) => self.set_view(View::Grid),
             View::Single => Outcome::Ignored,
@@ -946,14 +1083,150 @@ impl Controller {
         self.cursor.ok_or(Error::NoPhoto)
     }
 
+    /// A filter is the cull grid's; in develop mode it is ignored, since
+    /// develop is scoped to the one photo. The bar is still painted, so the
+    /// keys `1`-`4` and a press on it are inert here, not absent.
     fn set_filter(&mut self, filter: Filter) -> Outcome {
-        if self.filter == filter {
+        if self.mode == Mode::Develop || self.filter == filter {
             return Outcome::Ignored;
         }
         self.filter = filter;
         self.refresh_shown();
         self.keep_cursor_shown();
         Outcome::Changed
+    }
+
+    /// `grid`/Escape: from develop, back to the cull grid; from the single
+    /// view, back to the grid; from the grid, nothing.
+    fn back_to_grid(&mut self) -> Outcome {
+        if self.mode == Mode::Develop {
+            self.mode = Mode::Cull;
+            self.view = View::Grid;
+            return Outcome::Changed;
+        }
+        self.set_view(View::Grid)
+    }
+
+    /// Enters develop mode for the cursor's photo. A roll with a cursor is
+    /// needed, as the single view is; already developing is `Ignored`.
+    fn enter_develop(&mut self) -> Result<Outcome, Error> {
+        self.need_photo()?;
+        if self.mode == Mode::Develop {
+            return Ok(Outcome::Ignored);
+        }
+        self.mode = Mode::Develop;
+        // Develop leaves for the cull grid, so the reported view is the
+        // grid throughout, not a stale `single` it will not return to.
+        self.view = View::Grid;
+        Ok(Outcome::Changed)
+    }
+
+    /// The photo a develop edit acts on: the cursor, only in develop mode.
+    /// Not developing, the edit is not this mode's and is `Ignored`; the
+    /// cursor is always set in develop mode, so its absence is `NoPhoto`.
+    fn develop_photo(&self) -> Result<Option<usize>, Error> {
+        if self.mode != Mode::Develop {
+            return Ok(None);
+        }
+        Ok(Some(self.need_photo()?))
+    }
+
+    fn develop_effect(
+        &self,
+        index: usize,
+        effect: impl FnOnce(usize, String) -> Effect,
+        mut effects: Vec<Effect>,
+    ) -> Result<(Outcome, Vec<Effect>), Error> {
+        let name = self.photos.get(index).ok_or(Error::NoPhoto)?.name.clone();
+        effects.push(effect(index, name));
+        Ok((Outcome::Changed, effects))
+    }
+
+    /// Adjusts the cursor photo's exposure by `delta` hundredths of a stop.
+    /// The delta is applied to the file's exposure at the adapter, not the
+    /// model's copy, so a value changed meanwhile is added to, and a delta
+    /// that clamps to no change settles as `Ignored`.
+    fn expose(
+        &mut self,
+        delta: i32,
+        effects: Vec<Effect>,
+    ) -> Result<(Outcome, Vec<Effect>), Error> {
+        let Some(index) = self.develop_photo()? else {
+            return Ok((Outcome::Ignored, effects));
+        };
+        self.develop_effect(
+            index,
+            |index, name| Effect::Expose { index, name, delta },
+            effects,
+        )
+    }
+
+    /// Sets the cursor photo's look to `stem`, or clears it with `-`. A
+    /// value that is not a look stem is `BadArgument`, judged here so it is
+    /// the wire's `bad-argument`, not a refused write.
+    fn set_look(
+        &mut self,
+        stem: &str,
+        effects: Vec<Effect>,
+    ) -> Result<(Outcome, Vec<Effect>), Error> {
+        let Some(index) = self.develop_photo()? else {
+            return Ok((Outcome::Ignored, effects));
+        };
+        let value = if stem == "-" {
+            None
+        } else if library::valid_look(stem) {
+            Some(stem.to_string())
+        } else {
+            return Err(Error::BadArgument);
+        };
+        self.develop_effect(
+            index,
+            |index, name| Effect::Edit {
+                index,
+                name,
+                key: Key::Look,
+                value,
+            },
+            effects,
+        )
+    }
+
+    /// Sets the cursor photo's crop to the fractions `x y w h`. A box that
+    /// is not four fractions, or is under the minimum edge or outside the
+    /// image, is `BadArgument`.
+    fn set_crop(
+        &mut self,
+        x: &str,
+        y: &str,
+        w: &str,
+        h: &str,
+        effects: Vec<Effect>,
+    ) -> Result<(Outcome, Vec<Effect>), Error> {
+        let Some(index) = self.develop_photo()? else {
+            return Ok((Outcome::Ignored, effects));
+        };
+        let value = Crop::parse(&format!("{x} {y} {w} {h}"))
+            .map_err(|_| Error::BadArgument)?
+            .text();
+        self.develop_effect(
+            index,
+            |index, name| Effect::Edit {
+                index,
+                name,
+                key: Key::Crop,
+                value: Some(value),
+            },
+            effects,
+        )
+    }
+
+    /// Resets the cursor photo's develop keys to camera defaults, keeping
+    /// the flag.
+    fn reset_develop(&mut self, effects: Vec<Effect>) -> Result<(Outcome, Vec<Effect>), Error> {
+        let Some(index) = self.develop_photo()? else {
+            return Ok((Outcome::Ignored, effects));
+        };
+        self.develop_effect(index, |index, name| Effect::Reset { index, name }, effects)
     }
 
     fn set_view(&mut self, view: View) -> Outcome {
@@ -965,14 +1238,16 @@ impl Controller {
     }
 
     /// The cursor stays where it is when the filter still shows it, else
-    /// goes to the first shown photo, else nowhere, and the single view
-    /// ends with it, since it is a view of the cursor's photo.
+    /// goes to the first shown photo, else nowhere, and the single and
+    /// develop views end with it, since each is a view of the cursor's
+    /// photo.
     fn keep_cursor_shown(&mut self) {
         if self.position().is_none() {
             self.cursor = self.shown.first().copied();
         }
         if self.cursor.is_none() {
             self.view = View::Grid;
+            self.mode = Mode::Cull;
         }
         self.reveal();
     }
@@ -1141,8 +1416,10 @@ impl Scene<'_> {
                 }
             }
         }
-        if model.view == View::Single {
-            line.push_str(" | single");
+        match model.mode {
+            Mode::Develop => line.push_str(" | develop"),
+            Mode::Cull if model.view == View::Single => line.push_str(" | single"),
+            Mode::Cull => {}
         }
         line
     }
@@ -1342,8 +1619,9 @@ impl Composition for Scene<'_> {
         let labels = labels(model.filter);
         let names = names(&labels);
         Bar::new(layout.surface, &names).emit(damage, sink);
-        match (&model.roll, model.view) {
-            (None, _) => {
+        let cursor_photo = model.cursor.and_then(|index| model.photos.get(index));
+        match (&model.roll, model.mode, model.view) {
+            (None, _, _) => {
                 fill(layout.area, PAPER, damage, sink);
                 if let Some(block) = Block::new(layout.surface, layout.area.y, 2) {
                     block.emit(
@@ -1353,13 +1631,15 @@ impl Composition for Scene<'_> {
                     );
                 }
             }
-            (Some(_), View::Grid) => self.grid(&layout, damage, sink),
-            (Some(_), View::Single) => {
-                match model.cursor.and_then(|index| model.photos.get(index)) {
-                    Some(photo) => self.single(&layout, photo, damage, sink),
-                    None => self.grid(&layout, damage, sink),
-                }
-            }
+            // The develop view shows the cursor photo's facts and a preview
+            // box, the single view's layout until the raw render lands (a
+            // later increment); the status row names the mode.
+            (Some(_), Mode::Develop, _) | (Some(_), Mode::Cull, View::Single) => match cursor_photo
+            {
+                Some(photo) => self.single(&layout, photo, damage, sink),
+                None => self.grid(&layout, damage, sink),
+            },
+            (Some(_), Mode::Cull, View::Grid) => self.grid(&layout, damage, sink),
         }
         Status::new(layout.surface).emit(self.status_line().chars(), damage, sink);
     }
