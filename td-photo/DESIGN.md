@@ -30,18 +30,21 @@ headless development pipeline (`develop`), the RGB image buffers and PPM writer
 and reader (`image`), the baseline JPEG decoder for the embedded previews with
 its reduced-transform scaling (`jpeg`), the thumbnail rule and the thumbnail
 cache, the library's sidecar grammar, roll rules and dating rule (`library`),
-and the command line `td-photo probe FILE`, `td-photo develop FILE OUT.ppm`,
-`td-photo thumb FILE OUT.ppm`, `td-photo cache`, `td-photo import SRC DEST`,
-`td-photo list ROLL`, `td-photo flag FILE` and `td-photo edit FILE`. Every read
-of a camera file is bounded by `MAX_FILE_BYTES` and of a sidecar by
-`MAX_SIDECAR_BYTES`, trusting neither the length the file system reported;
-`develop` and `thumb` refuse an `OUT.ppm` (or `OUT.ppm.tmp`) that already exists
-rather than replace it, and `import` a copy that differs, publishing the
-finished temporary by a hard link so a name that appeared meanwhile is not
-replaced either; the sidecar is the one file td-photo replaces, and only through
-its own temporary. No window and no look yet: the increments at the end schedule
-them in order. Nothing in this crate depends on td-ui until the window increment
-adds the path dependency.
+the cull controller over td-ui's driven seam with its action table and scene
+(`ui`), and the command line `td-photo probe FILE`, `td-photo develop FILE
+OUT.ppm`, `td-photo thumb FILE OUT.ppm`, `td-photo cache`, `td-photo import SRC
+DEST`, `td-photo list ROLL`, `td-photo flag FILE`, `td-photo edit FILE`,
+`td-photo --replay` and `td-photo --help actions`. Every read of a camera file
+is bounded by `MAX_FILE_BYTES` and of a sidecar by `MAX_SIDECAR_BYTES`, trusting
+neither the length the file system reported; `develop` and `thumb` refuse an
+`OUT.ppm` (or `OUT.ppm.tmp`) that already exists rather than replace it, and
+`import` a copy that differs, publishing the finished temporary by a hard link
+so a name that appeared meanwhile is not replaced either; the sidecar is the one
+file td-photo replaces, and only through its own temporary. The crate depends on
+td-ui, by path, for the driven seam and the raster and bands the scene is laid
+out with; the window itself, the thumbnail pool, `--preview` and the control
+socket are the next increment, and no look yet: the increments at the end
+schedule them in order.
 
 The rules below define version 1; the increments identify the order of
 implementation, not choices left to each implementing agent.
@@ -66,8 +69,8 @@ malformed file is an error naming what was refused, never a panic or an
 unbounded read.
 
 Production code has no `unwrap`, `expect`, panics or panicking indexing;
-the crate root forbids `unsafe`, and its confinement tests pin that it
-declares no dependency (td-ui only, from the window increment on).
+the crate root forbids `unsafe`, and its confinement tests pin that td-ui
+is its one dependency and which files name which of its modules.
 
 ## Workflow
 
@@ -77,13 +80,13 @@ modes are the photographer's order of work.
 
 1. **Import** copies raw files from a source folder (a mounted card) into
    the library. `td-photo import SRC DEST` does the same headless.
-2. **Cull** shows a roll as a grid of thumbnails made from the camera's
-   medium embedded preview. The photographer walks it with the arrows,
-   presses `P` to pick, `X` to reject and `U` to clear, `Return` to see one
-   photo at the medium preview's full size and `Return` again to go back,
-   and filters the grid to picks, rejects, unflagged or all. `Delete
-   rejected` moves the rejects and their sidecars into the roll's
-   `rejected/` folder; nothing is unlinked.
+2. **Cull** shows a roll as a grid of thumbnails made from the camera's medium
+   embedded preview. The photographer walks it with the arrows, `Home`, `End`
+   and the page keys, presses `p` to pick, `x` to reject and `u` to clear,
+   `Return` to see one photo at the medium preview's full size and `Return` or
+   `Escape` to go back, and `1` to `4` (or the bar) to show all, the picks, the
+   rejects or the unflagged. `Delete rejected` moves the rejects and their
+   sidecars into the roll's `rejected/` folder; nothing is unlinked.
 3. **Develop** shows one photo developed from its raw data. `+`/`-` move
    exposure by a third of a stop and `Shift` by a tenth, `C` enters the crop
    with drag handles and aspect presets (free, 3:2, 4:3, 1:1, 16:9), `L`
@@ -99,58 +102,94 @@ second export of the same name takes a numbered suffix.
 
 td-photo is operated by a person at the keyboard and by an agent acting
 for that person, and the design makes those one thing seen from two
-sides. The shape is td-editor's, the tree's precedent for a driven UI: a
-display-independent dispatcher, a headless replay of it, and a control
-socket on the live window, all speaking one vocabulary.
+sides. The shape is td-ui's driven seam (td-ui/DESIGN.md, "The semantic
+seam"), which td-photo is the first consumer of: a display-independent
+dispatcher, a headless replay of it, and a control socket on the live
+window, all speaking the toolkit's one vocabulary.
 
-- **One dispatcher.** Everything the window can do is an `Action`, a
-  closed enum in `ui` (open a roll, select, next, previous, flag, filter,
-  change mode, exposure, crop and its aspect, look, reset, export, delete
-  rejected, scroll, resize, quit). `ui::Controller::dispatch(Event) ->
-  Outcome` turns an input event into actions and applies them to the
-  model; the keyboard bindings, the pointer hit-testing, the replay stream
-  and the control socket are four adapters over that one dispatcher, and
-  nothing reaches the model around it. The controller reads no file, clock
-  or descriptor: its adapters feed it events, including job results, and
-  carry out the requests it returns (decode this, write that).
+- **One dispatcher.** Everything the window can do is an `Action`, a closed enum
+  in `ui` (open a roll, the cursor moves, select, pick, reject, unflag, the four
+  filters, the single view and back, scroll, quit; develop mode's actions,
+  export and delete rejected join it in their increments). `ui::Controller`
+  holds the model (the roll's names and sidecars, the cursor, the filter, the
+  view, the scroll and the surface, and the shown list the filter admits, kept
+  rather than rescanned); `action(name, fields)` and `input(Input)` apply one
+  action to it and return the outcome and the `Effect`s the adapter carries out
+  (`Open` this folder, `Flag` that photo). The keyboard bindings, the pointer
+  hit-testing, the replay stream and the control socket are four adapters over
+  that one dispatcher, and nothing reaches the model around it. The cursor is
+  always among the shown or nowhere: a filter or a flag that hides it moves it
+  to the first shown photo, and the single view ends when there is none. The
+  controller reads no file, clock or descriptor; `main`'s `Session` is the
+  adapter that reads rolls and writes sidecars for it, and implements td-ui's
+  `driven::Controller`, so the toolkit's generic verbs route to it. A flag is
+  set on the sidecar as the file holds it when the action arrives, not on the
+  copy the model took at open, so an edit made meanwhile is kept and a sidecar
+  that became malformed refuses the flag; the adapter then settles the model
+  from what it wrote, or from the file when it could not, which is `refused`;
+  the model changes when it is settled and not before, so a refused flag leaves
+  the model, the cursor and the generation as they were unless the file itself
+  had changed. The dispatch asks for every flag, even one the model thinks the
+  photo has or one whose sidecar it holds as refused, since the file may differ
+  from its copy: the adapter answers `ignored` when the file already holds the
+  flag, refuses a sidecar it cannot read, and the model takes the file's word
+  either way. A roll of more than `MAX_PHOTOS` originals, or holding more than
+  `MAX_SIDECAR_TOTAL` of sidecar text between them, is `refused` rather than
+  held, and the budget holds at every settle as at open: a flag that would take
+  the roll past it is refused before anything is written, and a sidecar that
+  grew past it meanwhile is not held, its photo shown as refused.
 - **A headless verb for every durable effect.** Whatever an action does to
   files is also a command-line verb: `import`, `list`, `flag`, `edit`
   (get and set of a sidecar's values), `develop`, `export`, `thumb`,
   `looks` and `cache clear`. Verbs are the batch face: they read the same
   sidecars and write them the same way, and an agent that does not need
   to see pixels never opens a window.
-- **`--replay`: the window without a display.** `td-photo --replay [--size
-  WxH] [ROLL]` reads requests on stdin and answers on stdout in the
-  envelope td-editor's CONTROL.md defines: a four-byte big-endian length,
-  then one tab-separated ASCII line `1 ID verb args...`, answered by `1 ID
-  ok ...` or `1 ID error CODE HEX`. The same controller runs, jobs run on
-  the same pool, and the frame is painted through the toolkit's raster
-  into memory. The vocabulary: `state` (mode, roll, count, cursor, filter,
-  the selected photo's name, flag and edit, the outstanding job count and
-  the frame generation); `photo N` (one photo's facts); `action NAME
-  ARGS...` for every action by its table name; `key HEX_CHORD`, `pointer
-  PHASE X Y` and `wheel ROWS` for the input path through the same
-  bindings; `wait-idle MS` (returns when no job is outstanding or the
-  deadline passes, saying which); `wait-frame GENERATION`; `frame` (the
-  last painted frame as a PPM in hex); `quit`. Error codes are stable
-  (`unknown-verb`, `bad-argument`, `no-roll`, `no-photo`, `busy`,
-  `refused`) and the message is hex.
-- **`--control-socket PATH`: the same vocabulary on the live window,**
-  served from a private (0600) Unix socket by a bounded worker in
-  td-editor's `control_socket` and `control_worker` shape: one request
-  per connection, a deadline per request, and a response that reflects
-  the state after the turn that applied it. Pixels of the live window are
-  evidence only through the compositor's capture channel, observed
-  before and after as td-compositor/AUTOMATION.md prescribes; `frame`
-  over the socket returns the app's own last frame for correlation.
+- **`--replay`: the window without a display.** `td-photo --replay [--size WxH]
+  [ROLL]` reads requests on stdin and answers on stdout through td-ui's replay
+  runner and `driven::request`, in the envelope td-ui/DESIGN.md defines: a
+  four-byte big-endian length, then one tab-separated ASCII line `1 ID verb
+  args...`, answered by `1 ID ok ...` or `1 ID error CODE HEX`. The same
+  controller runs and the frame is painted through the toolkit's raster into
+  memory. The vocabulary is the seam's: `state`, `actions`, `action NAME
+  ARGS...` for every action by its table name, `key HEX_CHORD`, `pointer PHASE X
+  Y`, `wheel ROWS COLUMNS`, `resize W H SCALE`, `focus`, `tick`, `text` (the
+  scene read back as a cell grid), `frame` (the frame's size and digest) and
+  `frame-page` (its pixels in pages); and td-photo's own `photo N` (the Nth
+  shown photo's name in hex, flag, exposure, crop, look, sidecar state and, for
+  a refused sidecar, the reason in hex) and, from the window increment,
+  `wait-idle MS`. `state` is `cull`, the roll's path in hex, the photo count,
+  the shown count, the cursor's position among the shown, the filter, the view
+  (`grid` or `single`), then the photo under the cursor (its name in hex, since
+  the envelope is ASCII and a file name need not be, then flag, exposure, crop,
+  look, sidecar state), the outstanding job count and the frame generation, `-`
+  for what is absent. The generation moves on a change and on nothing else: not
+  on a step at an end, a filter, view or size already set, a refused open, or a
+  refused flag that leaves the file as the model held it; a settle that brings a
+  file changed meanwhile is a change. A flag the adapter wrote answers `changed`
+  whether or not the model moved, since the file did. Error codes are stable
+  (`no-roll`, `no-photo`, `bad-argument`, `refused`, and the transport's
+  `protocol` and `limit`); a refusal's reason goes to stderr, since the line
+  carries the code. `action quit` answers `quit` and the runner keeps answering;
+  the window closes on it.
+- **`--control-socket PATH`: the same vocabulary on the live window,** served
+  from a private (0600) Unix socket by td-ui's bounded worker over
+  `driven::Payload`: one request per connection, a deadline per request, and a
+  response that reflects the state after the turn that applied it. Pixels of the
+  live window are evidence only through the compositor's capture channel,
+  observed before and after as td-compositor/AUTOMATION.md prescribes; `frame`
+  over the socket paints the scene as the seam paints it, fills and glyphs, so
+  the thumbnails the window blits are not in its digest until an image primitive
+  is promoted into the toolkit (see Window).
 - **Determinism.** The same requests over the same roll give the same
   `state`, and with `wait-idle` between them the same `frame`; the tests
   hold a scripted session to a pixel oracle.
-- **One table.** The vocabulary lives in one table in `ui`: action name,
-  key binding, replay name and argument shape, verb where one exists, and
-  a help line. `tests/ui.rs` pins that every action has a keyboard or
-  pointer path, a replay name and a help line, and `td-photo --help
-  actions` prints the table so an agent can read it instead of guessing.
+- **One table.** The vocabulary lives in `ui::BINDINGS`, td-ui `Binding` rows:
+  action name, the key it binds, argument shape and a help line, held to the
+  seam's grammar by `driven::check` in `tests/ui.rs`, which also pins that every
+  action either binds a key or takes an argument and is reached by the pointer
+  (`select` by a press on a cell, `scroll` by the wheel) or is the agent's
+  (`open`). `td-photo --help actions` prints the table so an agent can read it
+  instead of guessing.
 
 ## Files
 
@@ -503,6 +542,30 @@ increment and is a translation the user runs, not a runtime dependency.
 
 ## Window
 
+The scene is `ui::Scene`, a td-ui `Composition` the controller builds
+over its model per request: the filter bar (`chrome::Bar`, the active
+filter in brackets and the others padded to its width, so the headers
+keep their places), the grid or the single view, and the status row
+(`chrome::Status`: the roll's folder, the counts, the filter, the photo
+under the cursor with its flag, `(sidecar refused)` when it was,
+`single` in that view). A grid cell is `CELL_W` by `CELL_H` (176 by 152)
+reference pixels at the surface's scale: a 160 by 120 thumbnail box
+under `CELL_PAD` (8) of padding, a `P` or `X` badge at its corner for a
+flagged photo, and the name under it, a reject's dimmed; the cursor's
+cell wears a two-pixel selected frame. Cells fill whole rows from the
+top-left, as many columns as the width holds and as many rows as the
+height between the bands holds, at least one of each, so a surface too
+small for a cell clips one rather than shows none, and the grid scrolls
+by rows, keeping the cursor's row shown. The single view shows the name,
+the facts and the largest 3:2 box under them. A press on a bar header
+sets the filter, on a cell selects it, and in the single view anywhere
+in the area between the bands returns to the grid; the status row, and
+anything off the surface, is not a target, and the bands are hit-tested
+last painted first, so on a surface too short for both the status row
+covers the bar's headers as it covers their pixels. Until the window
+increment blits thumbnails, the boxes are a neutral placeholder, which
+is what `frame` digests.
+
 The window is a `td_ui::client::App` in the shape td-editor and td-setup
 use, and it is one adapter over `ui::Controller` (see Driving): its
 `event` maps keys and pointer to the controller's events and its
@@ -537,13 +600,13 @@ not ready paints a neutral placeholder and its name, never blocks.
   outlives the call and a band count that exceeds the threads is shared out.
 - Budgets are named constants the tests pin: `RAW_CACHE_BYTES` 512 MiB,
   `THUMB_CACHE_BYTES` 256 MiB in memory, `MAX_FILE_BYTES` 512 MiB,
-  `MAX_RAW_SAMPLES` 128 Mi, `MAX_PREVIEW_SAMPLES` 128 Mi over a preview's
-  padded component planes, `MAX_TABLE_DEFINITIONS` 32, `MAX_IFDS` 64,
-  `MAX_ENTRIES` 4096, `MAX_AXIS` 16384 for raw and image axes alike,
-  `MAX_IMAGE_PIXELS` 64 Mi for any one image buffer (768 MiB as `f32`
-  RGB, under a 32-bit target's allocation limit), `MAX_RANGE` 32768 for
-  a decoder parameter set's sample range. Eviction is least recently
-  shown.
+  `MAX_RAW_SAMPLES` 128 Mi, `MAX_PREVIEW_SAMPLES` 128 Mi over a preview's padded
+  component planes, `MAX_TABLE_DEFINITIONS` 32, `MAX_IFDS` 64, `MAX_ENTRIES`
+  4096, `MAX_PHOTOS` 100,000 originals in an open roll and `MAX_SIDECAR_TOTAL`
+  64 MiB of sidecar text between them, `MAX_AXIS` 16384 for raw and image axes
+  alike, `MAX_IMAGE_PIXELS` 64 Mi for any one image buffer (768 MiB as `f32`
+  RGB, under a 32-bit target's allocation limit), `MAX_RANGE` 32768 for a
+  decoder parameter set's sample range. Eviction is least recently shown.
 - Buffers are allocated once per size and reused: the level-2 and level-3
   buffers per canvas size, the decoder's output per raw geometry, the
   thumbnail scratch per worker.
@@ -628,12 +691,33 @@ value before writing, refusing a malformed sidecar, a stale temporary, a linked
 sidecar, a sidecar past either ceiling and an edit that would take one past, and
 unlinking nothing.
 
-From the window increment on, `tests/ui.rs` drives `ui::Controller`
-in-process (the action table's completeness, scripted sessions held to
-`state` and pixel oracles through the replay path) and
-`tests/control_process.rs` runs the built binary against the native
-compositor harness the sibling crates use, with the observe, capture,
-observe rule for pixel evidence.
+`tests/ui.rs` holds the action table to `driven::check` and to its alignment
+with `Action`, and the error codes to the code grammar; drives `ui::Controller`
+in-process (the state before a roll and after, walking with every step and page,
+`select`, the filters and the cursor they keep or move, the single view and back
+by action and by key, unbound keys, `quit`, scrolling by action and by wheel
+clamped to the roll and revealed by the cursor, resizes good and bad, the
+pointer on the bar, a cell, the status row (on a surface too short for both
+bands too), off the surface and past the last photo, a resize to the size it
+has, an empty roll and one past `MAX_PHOTOS`; the effects a flag change asks
+for, the model unchanged until they are settled and its sidecar text after, the
+flag the file already holds ignored, an unknown line kept, a refused sidecar
+never rewritten, a flag that hides the photo under a filter and ends the single
+view, a settle that brings nothing new leaving the generation and one that
+differs moving it, and the sidecar budget at open and at settle); reads the
+scene back as text (the bar with its headers in place under every filter, the
+names and badges by row, the status line, the single view, the empty and
+filtered-out messages, a scale of 2) and holds its frame digest to equality and
+to change; and runs the built binary's `--replay` over a temporary roll through
+the seam's verbs, writing a pick through the sidecar, refusing to flag a refused
+one, keeping an edit made meanwhile and refusing a sidecar that became
+malformed, reporting a stale temporary and settling the model from the file with
+the cursor and the generation unmoved, a name that is not ASCII in hex,
+answering after `quit`, and refusing a roll that is not there, a bad size and a
+stray argument before the session starts. From the window increment on,
+`tests/control_process.rs` runs the built binary against the native compositor
+harness the sibling crates use, with the observe, capture, observe rule for
+pixel evidence.
 
 The builder discovers the crate by existing; its gate runs `cargo test` and
 all-target Clippy.
@@ -650,18 +734,23 @@ all-target Clippy.
 3. Library: rolls, the sidecar reader and writer, `import`, `list`,
    `flag` and `edit` headless, with the never-overwrite and never-unlink
    oracles. Landed.
-4. Window, cull mode: the td-ui dependency, `ui::Controller` with its
-   action table and `--help actions`, `--replay` with the whole
-   vocabulary over the cull actions, `--preview`, the worker pool, the
-   grid with flags, filters and the single-photo view, `tests/ui.rs`, and
+4. Window, cull mode, in two landings. (a) The td-ui dependency,
+   `ui::Controller` over the driven seam with its action table and
+   `--help actions`, `--replay` with the seam's vocabulary over the cull
+   actions, the grid with flags, filters and the single-photo view as a
+   scene, and `tests/ui.rs`. Landed. (b) The window itself as a
+   `td_ui::client::App`, the worker pool and the thumbnails blitted into
+   the grid, `wait-idle`, `--preview`, `--control-socket`, and
    `tests/control_process.rs` under the native compositor harness the
    sibling crates use.
 5. Window, develop mode: levels 0 through 3 with their memoization,
    exposure, crop with the drag contract, the look list and the look
-   format with the built-in set, the develop actions in the table and
-   the replay, and `--control-socket` on the live window.
+   format with the built-in set, and the develop actions in the table,
+   the replay and the control socket.
 6. Export: banded full-resolution bilinear demosaic, the JPEG encoder,
-   `exported/` naming, and `td-photo export`.
+   `exported/` naming, and `td-photo export`; and `delete-rejected`, the
+   action and its verb that move rejects and their sidecars into
+   `rejected/`.
 7. Packaging: the cargo recipe staging td-ui, the image entry, and the
    recipe check that develops the synthetic frame in the built artifact.
 8. Later: the 100% loupe from level 0, DNG and JPEG rolls, the Nikon High

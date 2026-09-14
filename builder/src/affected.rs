@@ -5092,6 +5092,7 @@ mod tests {
                 "td-editor",
                 "td-firstboot",
                 "td-jail",
+                "td-photo",
                 "td-portal",
                 "td-seatd",
                 "td-secret",
@@ -7160,7 +7161,8 @@ mod tests {
         assert_eq!(names(&setup), ["td-setup"]);
         // A crate others read brings its readers: td-portal and td-editor build
         // modules out of td-compositor sources, so a change there is a change
-        // to what they compile; td-busd is read by three.
+        // to what they compile, and td-photo reads td-ui, which reads
+        // td-compositor's sources too; td-busd is read by six.
         let comp = one("td-compositor/src/pty.rs");
         assert_eq!(
             names(&comp),
@@ -7170,6 +7172,7 @@ mod tests {
                 "td-editor",
                 "td-firstboot",
                 "td-jail",
+                "td-photo",
                 "td-portal",
                 "td-seatd",
                 "td-secret",
@@ -7179,7 +7182,7 @@ mod tests {
                 "td-vm-guest"
             ]
         );
-        assert_eq!(comp.len(), 29, "{comp:?}");
+        assert_eq!(comp.len(), 31, "{comp:?}");
         // Runtime td-vm/ spellings conservatively connect the same reader set.
         assert_eq!(vm, comp);
         assert_eq!(
@@ -7193,6 +7196,7 @@ mod tests {
                 "td-firstboot",
                 "td-jail",
                 "td-login",
+                "td-photo",
                 "td-portal",
                 "td-seatd",
                 "td-secret",
@@ -7295,30 +7299,33 @@ mod tests {
         assert_eq!(cargo_test_cmds(&root, &paths).unwrap(), gate_cmds());
         assert!(compute_selection(&root, &paths).targets.contains(&"check".to_string()));
         // The toolkit routes to its consumers and nothing else: td-editor,
-        // td-setup and (as of 7c) td-portal each name td-ui by path, so the
-        // reader graph puts the three consumers beside the toolkit and the
-        // workspace suite. td-portal is a leaf binary nothing reads, so it adds
-        // only itself.
+        // td-setup, (as of 7c) td-portal and td-photo each name td-ui by
+        // path, so the reader graph puts the four consumers beside the
+        // toolkit and the workspace suite. Nothing reads any of the four,
+        // so each adds only itself.
         for path in ["td-ui/src/keyboard.rs", "td-ui/Cargo.toml", "td-ui/tests/xkb.rs"] {
             let toolkit = [path.to_string()];
             assert!(compute_selection(&root, &toolkit).targets.is_empty(), "{path}");
             let commands = cargo_test_cmds(&root, &toolkit).unwrap();
-            // td-editor, td-setup and td-portal all name td-ui by path, so a
-            // change to the toolkit carries the three consumers' commands
-            // beside the workspace suite. Each of the three adds a native
-            // compositor command beside its test and clippy: 2 workspace + 2
-            // td-ui + 3 + 3 + 3 = 13.
-            assert_eq!(commands.len(), 13, "{path}: {commands:?}");
+            // td-editor, td-setup, td-portal and td-photo all name td-ui by
+            // path, so a change to the toolkit carries the four consumers'
+            // commands beside the workspace suite. td-editor, td-setup and
+            // td-portal each add a native compositor command beside their
+            // test and clippy; td-photo has no native suite yet: 2 workspace
+            // + 2 td-ui + 3 + 3 + 3 + 2 = 15.
+            assert_eq!(commands.len(), 15, "{path}: {commands:?}");
             assert!(commands.iter().all(|c| {
                 c.contains("--workspace")
                     || c.contains("--manifest-path td-ui/Cargo.toml")
                     || c.contains("--manifest-path td-editor/Cargo.toml")
                     || c.contains("--manifest-path td-setup/Cargo.toml")
                     || c.contains("--manifest-path td-portal/Cargo.toml")
+                    || c.contains("--manifest-path td-photo/Cargo.toml")
             }));
             assert!(commands.iter().any(|c| c.contains("--manifest-path td-editor/Cargo.toml")));
             assert!(commands.iter().any(|c| c.contains("--manifest-path td-setup/Cargo.toml")));
             assert!(commands.iter().any(|c| c.contains("--manifest-path td-portal/Cargo.toml")));
+            assert!(commands.iter().any(|c| c.contains("--manifest-path td-photo/Cargo.toml")));
         }
         for path in [
             "td-editor-extra/src/main.rs",

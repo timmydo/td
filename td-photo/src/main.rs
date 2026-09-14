@@ -2,23 +2,29 @@
 
 //! The command line: `probe` prints what a file's container says and
 //! optionally decodes its raw strip; `develop` renders it to a PPM;
-//! `import`, `list`, `flag` and `edit` are the library's headless verbs.
-//! This is the one place in the crate that opens files, reads the clock
-//! or asks for the thread count; the library modules take bytes and
-//! buffers.
+//! `import`, `list`, `flag` and `edit` are the library's headless verbs;
+//! `--replay` is the window without a display, the cull controller behind
+//! td-ui's driven seam. This is the one place in the crate that opens
+//! files, reads the clock or asks for the thread count; the library
+//! modules take bytes and buffers.
 
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::{self, BufWriter, Read, Write};
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Instant;
+
+use td_ui::driven::{self, Binding, Input, Outcome};
+use td_ui::raster::{Composition, Scale, Surface};
 
 use td_photo::color::{camera_color, Transfer};
 use td_photo::develop::{self, Params, MAX_THREADS};
 use td_photo::image::{read_ppm, write_ppm, Rgb8};
 use td_photo::library::{self, Filter, Flag, Key, Sidecar};
 use td_photo::nef::{self, Nef};
+use td_photo::ui::{self, Effect, Photo};
 use td_photo::{camera, jpeg, tiff};
 
 const HELP: &str = concat!(
@@ -61,6 +67,12 @@ const HELP: &str = concat!(
     "  a VALUE of - clears the key; reset clears all but the flag. The\n",
     "  sidecar is written through NAME.edit.tmp and renamed into place,\n",
     "  the one file td-photo replaces, since it is its own.\n",
+    "td-photo --replay [--size WxH] [ROLL]\n",
+    "  The window without a display: requests on stdin, answers on\n",
+    "  stdout in td-ui's driving envelope, over the cull actions; ROLL is\n",
+    "  opened at the start. See DESIGN.md, Driving.\n",
+    "td-photo --help actions\n",
+    "  Prints the action table: name, key, arguments and what it does.\n",
     "Other: --help\n",
     "Supported: Nikon Z 8 14-bit lossless-compressed NEF (see DESIGN.md).\n",
 );
@@ -71,8 +83,10 @@ fn main() -> ExitCode {
     let args: Vec<OsString> = std::env::args_os().skip(1).collect();
     let result = match args.as_slice() {
         [] => help(),
+        [flag, sub] if flag == "--help" && sub == "actions" => help_actions(),
         [flag] if flag == "--help" => help(),
         [_, flag, ..] if flag == "--help" => help(),
+        [flag, rest @ ..] if flag == "--replay" => replay(rest),
         [verb, file, rest @ ..] if verb == "probe" => probe(Path::new(file), rest),
         [verb] if verb == "probe" => Err("probe needs FILE; see --help".to_string()),
         [verb, file, out, rest @ ..] if verb == "develop" => {
@@ -1081,33 +1095,15 @@ fn list(roll: &Path, rest: &[OsString]) -> Result<(), String> {
     let switches: Vec<&str> = rest.iter().filter_map(|arg| arg.to_str()).collect();
     let filter = match switches.as_slice() {
         [] => Filter::All,
-        ["--picks"] => Filter::Picks,
-        ["--rejects"] => Filter::Rejects,
-        ["--unflagged"] => Filter::Unflagged,
+        [switch] => [Filter::Picks, Filter::Rejects, Filter::Unflagged]
+            .into_iter()
+            .find(|filter| switch.strip_prefix("--") == Some(filter.word()))
+            .ok_or_else(|| format!("list does not take {switch}; see --help"))?,
         _ => return Err("list takes at most one of --picks, --rejects, --unflagged".to_string()),
     };
-    let named = |e: io::Error| format!("{}: {e}", roll.display());
-    let mut names: Vec<String> = Vec::new();
-    for (seen, entry) in fs::read_dir(roll).map_err(named)?.enumerate() {
-        if seen >= MAX_ENTRIES {
-            return Err(format!(
-                "{}: more than {MAX_ENTRIES} entries",
-                roll.display()
-            ));
-        }
-        let entry = entry.map_err(named)?;
-        let Some(name) = entry.file_name().to_str().map(str::to_string) else {
-            continue;
-        };
-        // `file_type` does not follow a link, so a link is not an original.
-        if library::is_original(&name) && entry.file_type().map_err(named)?.is_file() {
-            names.push(name);
-        }
-    }
-    names.sort();
     let stdout = io::stdout();
     let mut out = stdout.lock();
-    for name in names {
+    for name in read_roll(roll)? {
         let (values, status) = match load_sidecar(&roll.join(&name)) {
             Loaded::None => (Sidecar::default(), "none".to_string()),
             Loaded::Sidecar(sidecar) => (sidecar, "ok".to_string()),
@@ -1128,6 +1124,32 @@ fn list(roll: &Path, rest: &[OsString]) -> Result<(), String> {
         .map_err(|e| e.to_string())?;
     }
     Ok(())
+}
+
+/// A roll's originals by name, sorted; a folder of more than `MAX_ENTRIES`
+/// entries is refused. Sidecars are read by the caller, one at a time or
+/// under a budget, never all at once for a listing.
+fn read_roll(roll: &Path) -> Result<Vec<String>, String> {
+    let named = |e: io::Error| format!("{}: {e}", roll.display());
+    let mut names: Vec<String> = Vec::new();
+    for (seen, entry) in fs::read_dir(roll).map_err(named)?.enumerate() {
+        if seen >= MAX_ENTRIES {
+            return Err(format!(
+                "{}: more than {MAX_ENTRIES} entries",
+                roll.display()
+            ));
+        }
+        let entry = entry.map_err(named)?;
+        let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        // `file_type` does not follow a link, so a link is not an original.
+        if library::is_original(&name) && entry.file_type().map_err(named)?.is_file() {
+            names.push(name);
+        }
+    }
+    names.sort();
+    Ok(names)
 }
 
 fn import(src: &Path, dest: &Path) -> Result<(), String> {
@@ -1318,4 +1340,246 @@ fn collect_originals(
         }
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------- driving
+
+/// The cull controller behind td-ui's driven seam, with the adapter that
+/// opens rolls and writes sidecars for it, so the replay and the window
+/// share one dispatcher and one file path.
+struct Session {
+    ui: ui::Controller,
+}
+
+/// One photo as the model takes it, from a sidecar as found.
+fn photo(name: String, loaded: Loaded) -> Photo {
+    match loaded {
+        Loaded::None => Photo {
+            name,
+            ..Photo::default()
+        },
+        Loaded::Sidecar(sidecar) => Photo {
+            name,
+            sidecar: Some(sidecar),
+            error: None,
+        },
+        Loaded::Refused(why) => Photo {
+            name,
+            sidecar: None,
+            error: Some(why),
+        },
+    }
+}
+
+/// A reason that does not fit the wire: the reply carries the code, the
+/// reason goes to stderr.
+fn note(why: &str) {
+    let _ = writeln!(io::stderr().lock(), "td-photo: {why}");
+}
+
+impl Session {
+    fn new(surface: Surface) -> Session {
+        Session {
+            ui: ui::Controller::new(surface),
+        }
+    }
+
+    /// Opens the roll at `path`: its originals, sorted, each with its
+    /// sidecar as found, under the model's sidecar budget. A folder that
+    /// cannot be read, or one past the budget, is `refused`.
+    fn open(&mut self, path: &[u8]) -> Result<(), ui::Error> {
+        let roll = PathBuf::from(OsString::from_vec(path.to_vec()));
+        let names = match read_roll(&roll) {
+            Ok(names) => names,
+            Err(why) => {
+                note(&why);
+                return Err(ui::Error::Refused);
+            }
+        };
+        let mut photos = Vec::with_capacity(names.len());
+        let mut bytes = 0usize;
+        for name in names {
+            let loaded = load_sidecar(&roll.join(&name));
+            let photo = photo(name, loaded);
+            bytes = bytes.saturating_add(photo.bytes());
+            if bytes > ui::MAX_SIDECAR_TOTAL {
+                note(&format!(
+                    "{}: sidecars over {} bytes between them",
+                    roll.display(),
+                    ui::MAX_SIDECAR_TOTAL
+                ));
+                return Err(ui::Error::Refused);
+            }
+            photos.push(photo);
+        }
+        // The status row names the roll by its folder.
+        let label = roll.file_name().map_or_else(
+            || roll.display().to_string(),
+            |name| name.to_string_lossy().into_owned(),
+        );
+        // The budget was held while loading, so what is left to refuse is
+        // the count; it says so, as every refusal does.
+        self.ui.open(&label, path, photos).inspect_err(|_| {
+            note(&format!(
+                "{}: more than {} photos",
+                roll.display(),
+                ui::MAX_PHOTOS
+            ));
+        })
+    }
+
+    /// Carries out what a dispatch asked for, in order, and says what came
+    /// of it: the dispatch's outcome, or for a flag what the file said.
+    fn carry_out(&mut self, effects: Vec<Effect>, outcome: Outcome) -> Result<Outcome, ui::Error> {
+        let mut outcome = outcome;
+        for effect in effects {
+            match effect {
+                Effect::Open(path) => self.open(&path)?,
+                Effect::Flag { index, name, flag } => outcome = self.flag(index, name, flag)?,
+            }
+        }
+        Ok(outcome)
+    }
+
+    /// Sets or clears one photo's flag on its sidecar as the file holds it
+    /// now, not the model's copy, so an edit made since the roll opened is
+    /// kept, a sidecar that became malformed refuses the flag, and the flag
+    /// the file already holds is `ignored`; a flag that would take the roll
+    /// past its sidecar budget is refused before anything is written. The
+    /// model is settled from what was written, or from the file when the
+    /// write failed, which is `refused`.
+    fn flag(
+        &mut self,
+        index: usize,
+        name: String,
+        flag: Option<Flag>,
+    ) -> Result<Outcome, ui::Error> {
+        let roll = self.ui.roll().ok_or(ui::Error::NoRoll)?;
+        let original = PathBuf::from(OsStr::from_bytes(roll)).join(&name);
+        let refuse = |session: &mut Session, why: &str| {
+            note(why);
+            session
+                .ui
+                .settle(index, photo(name.clone(), load_sidecar(&original)));
+            Err(ui::Error::Refused)
+        };
+        let mut sidecar = match read_sidecar(&original) {
+            Ok(sidecar) => sidecar,
+            Err(why) => return refuse(self, &why),
+        };
+        if sidecar.flag() == flag {
+            let held = Photo {
+                name,
+                sidecar: Some(sidecar),
+                error: None,
+            };
+            return Ok(if self.ui.settle(index, held) {
+                Outcome::Changed
+            } else {
+                Outcome::Ignored
+            });
+        }
+        if let Err(e) = sidecar.set(Key::Flag, flag.map(Flag::word)) {
+            return refuse(self, &format!("{}: {e}", original.display()));
+        }
+        if !self.ui.fits(index, ui::sidecar_bytes(&sidecar)) {
+            note(&format!("{}: {}", original.display(), ui::OVER_BUDGET));
+            return Err(ui::Error::Refused);
+        }
+        if let Err(why) = write_sidecar(&original, &sidecar) {
+            return refuse(self, &why);
+        }
+        self.ui.settle(
+            index,
+            Photo {
+                name,
+                sidecar: Some(sidecar),
+                error: None,
+            },
+        );
+        Ok(Outcome::Changed)
+    }
+}
+
+impl driven::Controller for Session {
+    type Error = ui::Error;
+
+    fn bindings(&self) -> &'static [Binding] {
+        &ui::BINDINGS
+    }
+
+    fn action(&mut self, name: &str, arguments: &[&str]) -> Result<Outcome, ui::Error> {
+        let (outcome, effects) = self.ui.action(name, arguments)?;
+        self.carry_out(effects, outcome)
+    }
+
+    fn input(&mut self, input: Input<'_>) -> Result<Outcome, ui::Error> {
+        let (outcome, effects) = self.ui.input(input)?;
+        self.carry_out(effects, outcome)
+    }
+
+    fn state(&self) -> Result<String, ui::Error> {
+        Ok(self.ui.state())
+    }
+
+    fn compose<R>(&self, view: impl FnOnce(&dyn Composition) -> R) -> Result<R, ui::Error> {
+        Ok(view(&self.ui.scene()))
+    }
+
+    /// `photo N`: the Nth shown photo's facts.
+    fn request(&mut self, name: &str, arguments: &[&str]) -> Result<String, ui::Error> {
+        match (name, arguments) {
+            ("photo", [position]) => {
+                let position = usize::try_from(td_ui::control::decimal(position)?)
+                    .map_err(|_| ui::Error::BadArgument)?;
+                self.ui.photo(position)
+            }
+            _ => Err(td_ui::control::Error::Protocol.into()),
+        }
+    }
+}
+
+/// `--replay [--size WxH] [ROLL]`: the session on stdin and stdout.
+fn replay(rest: &[OsString]) -> Result<(), String> {
+    let mut size = None;
+    let mut roll: Option<PathBuf> = None;
+    let mut args = rest.iter();
+    while let Some(arg) = args.next() {
+        if arg == "--size" {
+            let value = args
+                .next()
+                .and_then(|value| value.to_str())
+                .ok_or("--size needs WxH")?;
+            let (width, height) = value
+                .split_once('x')
+                .and_then(|(w, h)| Some((w.parse::<usize>().ok()?, h.parse::<usize>().ok()?)))
+                .ok_or_else(|| format!("--size {value:?} is not WxH"))?;
+            size = Some((width, height));
+        } else if roll.is_none() && !arg.as_bytes().starts_with(b"--") {
+            roll = Some(PathBuf::from(arg));
+        } else {
+            return Err(format!("unrecognized argument {arg:?}; see --help"));
+        }
+    }
+    let (width, height) = size.unwrap_or((ui::DEFAULT_WIDTH, ui::DEFAULT_HEIGHT));
+    let surface =
+        Surface::new(width, height, Scale::default()).map_err(|e| format!("--size: {e}"))?;
+    let mut session = Session::new(surface);
+    if let Some(roll) = roll {
+        session
+            .open(roll.as_os_str().as_bytes())
+            .map_err(|e| format!("{}: {e}", roll.display()))?;
+    }
+    td_ui::replay::run(&mut io::stdin().lock(), &mut io::stdout().lock(), |bytes| {
+        driven::request(&mut session, bytes)
+    })
+    .map_err(|e| e.to_string())
+}
+
+/// `--help actions`: the table an agent reads instead of guessing.
+fn help_actions() -> Result<(), String> {
+    io::stdout()
+        .lock()
+        .write_all(driven::help(&ui::BINDINGS).as_bytes())
+        .map_err(|e| e.to_string())
 }

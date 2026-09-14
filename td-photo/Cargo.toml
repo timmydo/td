@@ -6,14 +6,13 @@ description = "td's photo tool: imports a card of Nikon raw files into dated rol
 license = "GPL-3.0-or-later"
 
 # Own workspace root, so cargo behaves the same from the main checkout as from
-# a worktree nested under it (see the root Cargo.toml). The window increment
-# adds the toolkit as a sibling path dependency in the one spelling the lock
-# guard admits (AGENTS.md 'Rust code'); until then this crate depends on
-# nothing, and its confinement tests pin that. The builder's reader graph
-# takes any whole-word `td-*` crate name outside a comment in this manifest,
-# the description included, as a read of that crate, so nothing here names
-# the toolkit's crate until the dependency exists.
+# a worktree nested under it (see the root Cargo.toml). The toolkit is the one
+# dependency, a sibling path in the one spelling the lock guard admits
+# (AGENTS.md 'Rust code'); the confinement tests pin that it is the only one.
 [workspace]
+
+[dependencies]
+td-ui = { path = "../td-ui" }
 
 [package.metadata.td-gate]
 clippy-all-targets = true

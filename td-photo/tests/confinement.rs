@@ -2,9 +2,10 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 //! Source-level contracts the compiler cannot express: the crate's file
-//! inventory, that it forbids `unsafe` and declares no dependency, that its
-//! pure modules reach no file, environment, clock, network or process, and
-//! the budgets DESIGN.md names, by value.
+//! inventory, that it forbids `unsafe` and declares the toolkit as its one
+//! dependency, that its pure modules reach no file, environment, clock,
+//! network or process, which files name which toolkit modules, and the
+//! budgets DESIGN.md names, by value.
 
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -35,6 +36,7 @@ const PURE: &[&str] = &[
     "library.rs",
     "nef.rs",
     "tiff.rs",
+    "ui.rs",
 ];
 
 #[test]
@@ -52,6 +54,7 @@ fn source_inventory_is_closed() {
         "jpeg.rs",
         "library.rs",
         "nef.rs",
+        "ui.rs",
     ]
     .iter()
     .map(|s| s.to_string())
@@ -89,10 +92,16 @@ fn the_crate_forbids_unsafe_and_includes_nothing() {
 }
 
 #[test]
-fn the_manifest_declares_no_dependency_and_joins_the_gate() {
+fn the_manifest_declares_the_toolkit_alone_and_joins_the_gate() {
     let manifest = read("Cargo.toml");
     assert!(manifest.contains("[workspace]\n"), "own workspace root");
-    assert!(!manifest.contains("[dependencies]"), "no dependency yet");
+    // The one sibling, in the one spelling the lock guard admits.
+    assert!(
+        manifest.contains("\n[dependencies]\ntd-ui = { path = \"../td-ui\" }\n"),
+        "the toolkit by path"
+    );
+    assert_eq!(manifest.matches("path =").count(), 1, "one dependency");
+    assert_eq!(manifest.matches("[dependencies]").count(), 1);
     assert!(!manifest.contains("[dev-dependencies]"));
     assert!(!manifest.contains("[build-dependencies]"));
     assert!(!manifest.contains("[target"));
@@ -111,8 +120,9 @@ fn the_manifest_declares_no_dependency_and_joins_the_gate() {
         assert!(manifest.contains(&format!("{lint} = \"deny\"")), "{lint}");
     }
     let lock = read("Cargo.lock");
-    assert_eq!(lock.matches("[[package]]").count(), 1);
+    assert_eq!(lock.matches("[[package]]").count(), 2);
     assert!(lock.contains("name = \"td-photo\""));
+    assert!(lock.contains("name = \"td-ui\""));
     assert!(!lock.contains("source ="), "no registry or git source");
     assert!(
         !root().join(".cargo").exists(),
@@ -175,12 +185,60 @@ fn pure_modules_reach_no_file_environment_clock_network_or_process() {
     }
 }
 
+/// Which files may name which toolkit modules (td-ui/DESIGN.md, Public
+/// surface): the controller the pure seam, raster, chrome and control;
+/// `main` the seam, the replay runner, the raster's surface and control;
+/// nothing yet the window, the wire or the socket, which the window
+/// increment brings. A braced group after the crate's path would read as
+/// no name, so the scanner refuses one: name one item per line.
+#[test]
+fn the_toolkit_is_named_only_where_the_design_says() {
+    fn modules(text: &str) -> BTreeSet<String> {
+        text.match_indices("td_ui::")
+            .map(|(at, _)| {
+                let name = text[at + 7..]
+                    .chars()
+                    .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                    .collect::<String>();
+                assert!(
+                    !name.is_empty(),
+                    "td_ui:: at byte {at} is followed by no name; name one item per line"
+                );
+                name
+            })
+            .collect()
+    }
+    let set = |names: &[&str]| names.iter().map(|s| s.to_string()).collect::<BTreeSet<_>>();
+    for name in PURE.iter().chain(["lib.rs"].iter()) {
+        let text = read(&format!("src/{name}"));
+        let expected = if *name == "ui.rs" {
+            set(&[
+                "CELL_HEIGHT",
+                "CELL_WIDTH",
+                "chrome",
+                "control",
+                "driven",
+                "raster",
+            ])
+        } else {
+            set(&[])
+        };
+        assert_eq!(modules(&text), expected, "{name}");
+    }
+    assert_eq!(
+        modules(&read("src/main.rs")),
+        set(&["control", "driven", "raster", "replay"])
+    );
+}
+
 #[test]
 fn budgets_are_the_documented_values() {
     assert_eq!(td_photo::tiff::MAX_FILE_BYTES, 512 << 20);
     assert_eq!(td_photo::tiff::MAX_IFDS, 64);
     assert_eq!(td_photo::tiff::MAX_CHAIN, 16);
     assert_eq!(td_photo::tiff::MAX_ENTRIES, 4096);
+    assert_eq!(td_photo::ui::MAX_PHOTOS, 100_000);
+    assert_eq!(td_photo::ui::MAX_SIDECAR_TOTAL, 64 << 20);
     assert_eq!(td_photo::nef::MAX_AXIS, 16384);
     assert_eq!(td_photo::image::MAX_AXIS, td_photo::nef::MAX_AXIS);
     assert_eq!(td_photo::image::MAX_IMAGE_PIXELS, 64 << 20);

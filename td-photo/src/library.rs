@@ -399,6 +399,17 @@ pub enum Filter {
 }
 
 impl Filter {
+    /// The filter's word, as the window's `state` and bar spell it; for
+    /// the three `list` can switch to, its switch is `--WORD`.
+    pub fn word(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::Picks => "picks",
+            Self::Rejects => "rejects",
+            Self::Unflagged => "unflagged",
+        }
+    }
+
     pub fn admits(self, flag: Option<Flag>) -> bool {
         match self {
             Self::All => true,
