@@ -2133,6 +2133,213 @@ fn validate_system_boot(
             tail(&result.console, 80)
         ));
     }
+    validate_compositor_boot(result)?;
+    if !result.evidence.td_jail_seccomp {
+        return Err(format!(
+            "td-jail completed its transition, but the non-shipped target seccomp probe marker \
+             ({TD_JAIL_SECCOMP_PROBE_MARKER:?}) was absent - the booted kernel did not load \
+             td-jail's exported constant filter or return its pinned errno/SIGSYS actions. \
+             The Rust interpreter proves the program's bytes and the build-host run is only a \
+             host-policy smoke test; this marker is the target-kernel behavior proof. Last \
+             serial output:\n{}",
+            tail(&result.console, 80)
+        ));
+    }
+    if !result.evidence.td_jail_kill_reaps {
+        return Err(format!(
+            "td-jail's transition and filter proofs passed, but the §H item 12 marker \
+             ({TD_JAIL_KILL_REAPS_MARKER:?}) was absent — killing stage 1 did not reap the \
+             whole instance or the detached cleanup watcher did not remove its populated \
+             application cgroup. What the marker attests is on \
+             `td_recipe::ladder::TD_JAIL_KILL_REAPS_MARKER`; what its ABSENCE means is one of \
+             these: the instance outlived stage 1, so a dead launcher leaves a jailed \
+             process running with no supervisor — either PID 1 did not exit, or it exited and \
+             the kernel did not tear the namespace down under it. Or both processes exited, \
+             but the production watcher did not observe the empty leaf and remove it. Or the \
+             probe never got far \
+             enough to kill anything, which needs the same transition {TD_JAIL_TRANSITION_MARKER:?} \
+             covers, and that marker passing above makes it unlikely. Or stage 1 exited on its \
+             own before the SIGKILL landed, which the probe refuses rather than counts, because \
+             a stage 1 that was already leaving proves nothing about killing one. The probe's \
+             own diagnostic line names the pids it watched and how long it waited. Last serial \
+             output:\n{}",
+            tail(&result.console, 80)
+        ));
+    }
+    if !result.evidence.td_profiler_attribution {
+        return Err(format!(
+            "the userland health checks passed, but the continuous-profiler attribution console \
+             line ({TD_PROFILER_EVIDENCE_CONSOLE_PREFIX}{TD_PROFILER_ATTRIBUTION_MARKER}) was \
+             absent — the root opener could not create \
+             per-CPU perf events, the dedicated profiler identity could not publish its \
+             bounded capture, the td-svc service name or console framing drifted, or persisted \
+             lines.jsonl did not attribute the deterministic {} workload to {} and a source \
+             line inside that function. Last serial output:\n{}",
+            td_recipe::td_profiler_contract::ATTRIBUTION_FUNCTION_FRAGMENT,
+            td_recipe::td_profiler_contract::ATTRIBUTION_SOURCE_FILE,
+            tail(&result.console, 80)
+        ));
+    }
+    if !result.evidence.td_wayland_runtime {
+        return Err(format!(
+            "the serial boot and userland health checks passed, but the graphical runtime \
+             marker ({TD_WAYLAND_RUNTIME_MARKER:?}) was absent — td-seatd did not assign \
+             /dev/fb0 and the evdev seat to uid 993, the unprivileged compositor could not \
+             paint the virtio-gpu framebuffer, or its peer-admitted Wayland socket never began \
+             listening. The serial greeter remains the recovery path. Last serial output:\n{}",
+            tail(&result.console, 80)
+        ));
+    }
+    if !result.evidence.td_pointer_absolute {
+        return Err(format!(
+            "the compositor came up, but no input device reported an absolute position \
+             ({TD_POINTER_ABSOLUTE_MARKER:?} was absent) — the guest kernel has no \
+             VIRTIO_INPUT driver, this runner's argv no longer carries \
+             -device virtio-tablet-pci, the compositor's EVIOCGABS was refused, or its \
+             answer was dropped before the reader that maps with it. Those four are what \
+             REACHES here: a qemu that cannot attach the device fails at startup, and a \
+             seat the compositor cannot open kills it before it announces, so the \
+             graphical marker above catches that one. Nothing else notices this: the \
+             compositor still runs, the PS/2 mouse still moves a cursor, and it simply \
+             cannot be pushed to the right or bottom edge of the screen. This is the ONLY \
+             check that a real device answered — the unit gate has no absolute device to \
+             ask. Last serial output:\n{}",
+            tail(&result.console, 80)
+        ));
+    }
+    if !result.evidence.td_term_runtime {
+        return Err(format!(
+            "the compositor became ready, but the TERMINAL marker \
+             ({TD_TERM_RUNTIME_MARKER:?}) was absent — registry binding, the XDG \
+             configure/ack handshake, wl_shm descriptor transfer, buffer release, the \
+             first frame callback, keymap verification, the devpts PTY, or the child \
+             shell failed. The machine \
+             booted to a compositor with nothing on it. The serial greeter remains the \
+             recovery path. \
+             Last serial output:\n{}",
+            tail(&result.console, 80)
+        ));
+    }
+    if !result.evidence.td_fetch_ok {
+        return Err(format!(
+            "the session came up, but the fetch service's marker was absent \
+             ({TD_FETCH_BOOT_MARKER:?}) — td-fetchd did not serve its socket under the \
+             UI user's runtime directory, or its probe did not get the policy's exact \
+             refusal of a loopback URL, so the terminal applications' one network \
+             client is not there (APPLICATIONS.md §W.8). Last serial output:\n{}",
+            tail(&result.console, 80)
+        ));
+    }
+    if !result.evidence.td_mail_running || !result.evidence.td_news_running {
+        return Err(format!(
+            "the terminal became ready, but a terminal application's running marker was \
+             absent ({TD_MAIL_BOOT_MARKER:?} {}, {TD_NEWS_BOOT_MARKER:?} {}) — the /bin \
+             launcher, the static package on the empty runtime, the fresh-terminal grant, \
+             td-firstboot's provisioned configuration, or the program itself failed within \
+             the settle window, or its td-term window never reported ready. \
+             Last serial output:\n{}",
+            if result.evidence.td_mail_running { "seen" } else { "absent" },
+            if result.evidence.td_news_running { "seen" } else { "absent" },
+            tail(&result.console, 80)
+        ));
+    }
+    if !result.evidence.td_applications_placed {
+        return Err(format!(
+            "the terminal applications ran, but the placement marker was absent \
+             ({TD_APPLICATIONS_PLACED_MARKER:?}) — once both had mapped and the view \
+             returned, the compositor's report did not show the first workspace \
+             active, the first and the applications' workspace occupied and no \
+             other, and the shell's window alone on the first, so the tiles the \
+             physical-input oracle binds are not where it clicks. Last serial \
+             output:\n{}",
+            tail(&result.console, 80)
+        ));
+    }
+    if !result.evidence.boot_success {
+        return Err(format!(
+            "the {ordinal} boot did not emit the deployment-success marker \
+             {SYSTEM_BOOT_SUCCESS_MARKER:?}. Last serial output:\n{}",
+            tail(&result.console, 80)
+        ));
+    }
+    if !result.evidence.td_firefox {
+        return Err(format!(
+            "the compositor and terminal became ready, but the Firefox first-window marker \
+             ({TD_FIREFOX_BOOT_MARKER:?}) was absent — package/runtime composition, argv[0] \
+             registry resolution, canonical spec parsing, the immutable /app and /usr binds, \
+             the private runtime and Downloads grant, bus registration, the exact Wayland \
+             socket, bounded live cgroup state, or matching XDG frame painting failed. \
+             Last serial output:\n{}",
+            tail(&result.console, 80)
+        ));
+    }
+    if !result.evidence.td_firefox_content {
+        return Err(format!(
+            "Firefox painted its first window, but the deterministic HTTPS-content marker \
+             ({TD_FIREFOX_CONTENT_MARKER:?}) was absent — the source-built TLS origin, exact \
+             certificate policy, NSS verification, fixed document pixel region, compositor \
+             resource high-water validation, or same-jail Firefox content-role process \
+             evidence failed. \
+             Last serial output:\n{}",
+            tail(&result.console, 80)
+        ));
+    }
+    if !result.evidence.td_firefox_support {
+        return Err(format!(
+            "Firefox painted verified HTTPS content, but the browser support marker \
+             ({TD_FIREFOX_SUPPORT_MARKER:?}) was absent — the privileged Firefox \
+             snapshot did not prove Wayland, Software WebRender, fallback sandbox \
+             level 6, or nested seccomp filters in every required process role. \
+             Last serial output:\n{}",
+            tail(&result.console, 80)
+        ));
+    }
+    if let Some((persistence_marker, persistence_seen)) = match persistence {
+        PersistencePhase::None => None,
+        PersistencePhase::Write => {
+            Some((SYSTEM_PERSIST_WRITE_MARKER, result.evidence.persist_write))
+        }
+        PersistencePhase::Read => Some((SYSTEM_PERSIST_READ_MARKER, result.evidence.persist_read)),
+    } {
+        if !persistence_seen {
+            return Err(format!(
+                "the {ordinal} boot reached the greeter but did not emit the persistence marker \
+                 {persistence_marker:?}; boot one must write+sync it and later boots must read the \
+                 same bytes from the reused @var subvolume. Last serial output:\n{}",
+                tail(&result.console, 80)
+            ));
+        }
+    }
+    validate_persistent_shutdown(result, &format!("{ordinal} persistent boot"))?;
+    // A kernel panic under `panic=-1` reboots and, with `-no-reboot`, exits qemu 0 — the
+    // SAME exit code as a clean guest power-off. So `exited_clean` alone cannot tell a
+    // genuine "exit powers off" from a panic AFTER the markers were printed (the root
+    // checks run at sysinit, before the greeter); scan the console for a panic explicitly
+    // so such a boot reds instead of false-passing as a clean shutdown (re #550, subagent
+    // review). "Kernel panic" is the leading fragment of the kernel's "Kernel panic - not
+    // syncing:" banner.
+    if result.evidence.kernel_panic {
+        return Err(format!(
+            "the markers were printed but the kernel PANICKED rather than powering off cleanly — \
+             under `panic=-1` a panic also exits qemu 0, so this would otherwise masquerade as a \
+             clean \"exit powers off\". Last serial output:\n{}",
+            tail(&result.console, 80)
+        ));
+    }
+    if !result.exited_clean {
+        return Err(format!(
+            "the greeter was reached and the root checks passed, but the VM did not power off cleanly \
+             on the autotest `exit` — {} (the `exit`-powers-off path regressed: getty/login did not \
+             return 0, or init-mediated reboot did not fire). Last serial output:\n{}",
+            result.reason,
+            tail(&result.console, 80)
+        ));
+    }
+    Ok(())
+}
+
+/// Require compatible DRM discovery, modesetting and completed page flips.
+fn validate_compositor_boot(result: &BootResult) -> Result<(), String> {
     match result.evidence.td_compositor_drm.as_deref() {
         None => {
             return Err(format!(
@@ -2392,207 +2599,6 @@ fn validate_system_boot(
                 ));
             }
         }
-    }
-    if !result.evidence.td_jail_seccomp {
-        return Err(format!(
-            "td-jail completed its transition, but the non-shipped target seccomp probe marker \
-             ({TD_JAIL_SECCOMP_PROBE_MARKER:?}) was absent - the booted kernel did not load \
-             td-jail's exported constant filter or return its pinned errno/SIGSYS actions. \
-             The Rust interpreter proves the program's bytes and the build-host run is only a \
-             host-policy smoke test; this marker is the target-kernel behavior proof. Last \
-             serial output:\n{}",
-            tail(&result.console, 80)
-        ));
-    }
-    if !result.evidence.td_jail_kill_reaps {
-        return Err(format!(
-            "td-jail's transition and filter proofs passed, but the §H item 12 marker \
-             ({TD_JAIL_KILL_REAPS_MARKER:?}) was absent — killing stage 1 did not reap the \
-             whole instance or the detached cleanup watcher did not remove its populated \
-             application cgroup. What the marker attests is on \
-             `td_recipe::ladder::TD_JAIL_KILL_REAPS_MARKER`; what its ABSENCE means is one of \
-             these: the instance outlived stage 1, so a dead launcher leaves a jailed \
-             process running with no supervisor — either PID 1 did not exit, or it exited and \
-             the kernel did not tear the namespace down under it. Or both processes exited, \
-             but the production watcher did not observe the empty leaf and remove it. Or the \
-             probe never got far \
-             enough to kill anything, which needs the same transition {TD_JAIL_TRANSITION_MARKER:?} \
-             covers, and that marker passing above makes it unlikely. Or stage 1 exited on its \
-             own before the SIGKILL landed, which the probe refuses rather than counts, because \
-             a stage 1 that was already leaving proves nothing about killing one. The probe's \
-             own diagnostic line names the pids it watched and how long it waited. Last serial \
-             output:\n{}",
-            tail(&result.console, 80)
-        ));
-    }
-    if !result.evidence.td_profiler_attribution {
-        return Err(format!(
-            "the userland health checks passed, but the continuous-profiler attribution console \
-             line ({TD_PROFILER_EVIDENCE_CONSOLE_PREFIX}{TD_PROFILER_ATTRIBUTION_MARKER}) was \
-             absent — the root opener could not create \
-             per-CPU perf events, the dedicated profiler identity could not publish its \
-             bounded capture, the td-svc service name or console framing drifted, or persisted \
-             lines.jsonl did not attribute the deterministic {} workload to {} and a source \
-             line inside that function. Last serial output:\n{}",
-            td_recipe::td_profiler_contract::ATTRIBUTION_FUNCTION_FRAGMENT,
-            td_recipe::td_profiler_contract::ATTRIBUTION_SOURCE_FILE,
-            tail(&result.console, 80)
-        ));
-    }
-    if !result.evidence.td_wayland_runtime {
-        return Err(format!(
-            "the serial boot and userland health checks passed, but the graphical runtime \
-             marker ({TD_WAYLAND_RUNTIME_MARKER:?}) was absent — td-seatd did not assign \
-             /dev/fb0 and the evdev seat to uid 993, the unprivileged compositor could not \
-             paint the virtio-gpu framebuffer, or its peer-admitted Wayland socket never began \
-             listening. The serial greeter remains the recovery path. Last serial output:\n{}",
-            tail(&result.console, 80)
-        ));
-    }
-    if !result.evidence.td_pointer_absolute {
-        return Err(format!(
-            "the compositor came up, but no input device reported an absolute position \
-             ({TD_POINTER_ABSOLUTE_MARKER:?} was absent) — the guest kernel has no \
-             VIRTIO_INPUT driver, this runner's argv no longer carries \
-             -device virtio-tablet-pci, the compositor's EVIOCGABS was refused, or its \
-             answer was dropped before the reader that maps with it. Those four are what \
-             REACHES here: a qemu that cannot attach the device fails at startup, and a \
-             seat the compositor cannot open kills it before it announces, so the \
-             graphical marker above catches that one. Nothing else notices this: the \
-             compositor still runs, the PS/2 mouse still moves a cursor, and it simply \
-             cannot be pushed to the right or bottom edge of the screen. This is the ONLY \
-             check that a real device answered — the unit gate has no absolute device to \
-             ask. Last serial output:\n{}",
-            tail(&result.console, 80)
-        ));
-    }
-    if !result.evidence.td_term_runtime {
-        return Err(format!(
-            "the compositor became ready, but the TERMINAL marker \
-             ({TD_TERM_RUNTIME_MARKER:?}) was absent — registry binding, the XDG \
-             configure/ack handshake, wl_shm descriptor transfer, buffer release, the \
-             first frame callback, keymap verification, the devpts PTY, or the child \
-             shell failed. The machine \
-             booted to a compositor with nothing on it. The serial greeter remains the \
-             recovery path. \
-             Last serial output:\n{}",
-            tail(&result.console, 80)
-        ));
-    }
-    if !result.evidence.td_fetch_ok {
-        return Err(format!(
-            "the session came up, but the fetch service's marker was absent \
-             ({TD_FETCH_BOOT_MARKER:?}) — td-fetchd did not serve its socket under the \
-             UI user's runtime directory, or its probe did not get the policy's exact \
-             refusal of a loopback URL, so the terminal applications' one network \
-             client is not there (APPLICATIONS.md §W.8). Last serial output:\n{}",
-            tail(&result.console, 80)
-        ));
-    }
-    if !result.evidence.td_mail_running || !result.evidence.td_news_running {
-        return Err(format!(
-            "the terminal became ready, but a terminal application's running marker was \
-             absent ({TD_MAIL_BOOT_MARKER:?} {}, {TD_NEWS_BOOT_MARKER:?} {}) — the /bin \
-             launcher, the static package on the empty runtime, the fresh-terminal grant, \
-             td-firstboot's provisioned configuration, or the program itself failed within \
-             the settle window, or its td-term window never reported ready. \
-             Last serial output:\n{}",
-            if result.evidence.td_mail_running { "seen" } else { "absent" },
-            if result.evidence.td_news_running { "seen" } else { "absent" },
-            tail(&result.console, 80)
-        ));
-    }
-    if !result.evidence.td_applications_placed {
-        return Err(format!(
-            "the terminal applications ran, but the placement marker was absent \
-             ({TD_APPLICATIONS_PLACED_MARKER:?}) — once both had mapped and the view \
-             returned, the compositor's report did not show the first workspace \
-             active, the first and the applications' workspace occupied and no \
-             other, and the shell's window alone on the first, so the tiles the \
-             physical-input oracle binds are not where it clicks. Last serial \
-             output:\n{}",
-            tail(&result.console, 80)
-        ));
-    }
-    if !result.evidence.boot_success {
-        return Err(format!(
-            "the {ordinal} boot did not emit the deployment-success marker \
-             {SYSTEM_BOOT_SUCCESS_MARKER:?}. Last serial output:\n{}",
-            tail(&result.console, 80)
-        ));
-    }
-    if !result.evidence.td_firefox {
-        return Err(format!(
-            "the compositor and terminal became ready, but the Firefox first-window marker \
-             ({TD_FIREFOX_BOOT_MARKER:?}) was absent — package/runtime composition, argv[0] \
-             registry resolution, canonical spec parsing, the immutable /app and /usr binds, \
-             the private runtime and Downloads grant, bus registration, the exact Wayland \
-             socket, bounded live cgroup state, or matching XDG frame painting failed. \
-             Last serial output:\n{}",
-            tail(&result.console, 80)
-        ));
-    }
-    if !result.evidence.td_firefox_content {
-        return Err(format!(
-            "Firefox painted its first window, but the deterministic HTTPS-content marker \
-             ({TD_FIREFOX_CONTENT_MARKER:?}) was absent — the source-built TLS origin, exact \
-             certificate policy, NSS verification, fixed document pixel region, compositor \
-             resource high-water validation, or same-jail Firefox content-role process \
-             evidence failed. \
-             Last serial output:\n{}",
-            tail(&result.console, 80)
-        ));
-    }
-    if !result.evidence.td_firefox_support {
-        return Err(format!(
-            "Firefox painted verified HTTPS content, but the browser support marker \
-             ({TD_FIREFOX_SUPPORT_MARKER:?}) was absent — the privileged Firefox \
-             snapshot did not prove Wayland, Software WebRender, fallback sandbox \
-             level 6, or nested seccomp filters in every required process role. \
-             Last serial output:\n{}",
-            tail(&result.console, 80)
-        ));
-    }
-    if let Some((persistence_marker, persistence_seen)) = match persistence {
-        PersistencePhase::None => None,
-        PersistencePhase::Write => {
-            Some((SYSTEM_PERSIST_WRITE_MARKER, result.evidence.persist_write))
-        }
-        PersistencePhase::Read => Some((SYSTEM_PERSIST_READ_MARKER, result.evidence.persist_read)),
-    } {
-        if !persistence_seen {
-            return Err(format!(
-                "the {ordinal} boot reached the greeter but did not emit the persistence marker \
-                 {persistence_marker:?}; boot one must write+sync it and later boots must read the \
-                 same bytes from the reused @var subvolume. Last serial output:\n{}",
-                tail(&result.console, 80)
-            ));
-        }
-    }
-    validate_persistent_shutdown(result, &format!("{ordinal} persistent boot"))?;
-    // A kernel panic under `panic=-1` reboots and, with `-no-reboot`, exits qemu 0 — the
-    // SAME exit code as a clean guest power-off. So `exited_clean` alone cannot tell a
-    // genuine "exit powers off" from a panic AFTER the markers were printed (the root
-    // checks run at sysinit, before the greeter); scan the console for a panic explicitly
-    // so such a boot reds instead of false-passing as a clean shutdown (re #550, subagent
-    // review). "Kernel panic" is the leading fragment of the kernel's "Kernel panic - not
-    // syncing:" banner.
-    if result.evidence.kernel_panic {
-        return Err(format!(
-            "the markers were printed but the kernel PANICKED rather than powering off cleanly — \
-             under `panic=-1` a panic also exits qemu 0, so this would otherwise masquerade as a \
-             clean \"exit powers off\". Last serial output:\n{}",
-            tail(&result.console, 80)
-        ));
-    }
-    if !result.exited_clean {
-        return Err(format!(
-            "the greeter was reached and the root checks passed, but the VM did not power off cleanly \
-             on the autotest `exit` — {} (the `exit`-powers-off path regressed: getty/login did not \
-             return 0, or init-mediated reboot did not fire). Last serial output:\n{}",
-            result.reason,
-            tail(&result.console, 80)
-        ));
     }
     Ok(())
 }

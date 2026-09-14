@@ -402,6 +402,25 @@ pub fn qemu_install_cli(args: &[String]) -> Result<(), String> {
     qemu_kernel_cli(args, "qemu-install", &["td-install-qemu-test"], crate::checks::qemu_boot::install::run)
 }
 
+/// Install the production system from an ISO inside a disposable QEMU machine.
+pub fn qemu_install_system_cli(args: &[String]) -> Result<(), String> {
+    const STEM: &str = "system-x86-64";
+    if args.len() > 1 || args.first().is_some_and(|value| value != STEM) {
+        return Err("usage: qemu-install-system [system-x86-64]".into());
+    }
+    let targets = [STEM, "td-install-qemu-test"];
+    ensure_targets_provenance(&targets)?;
+    let root = env::current_dir().map_err(|error| format!("current dir: {error}"))?;
+    let name = scratch_name("qemu-install-system", &[STEM]);
+    let runner = RecipeCheckRunner::new(root, &name)?.with_streamed_progress();
+    // Warm before unattended builds too; recipe admission remains authoritative.
+    if let Err(error) = crate::warm::preflight(&runner, &targets, crate::warm::WarmMode::Automatic) {
+        eprintln!("   [warm] {error} — continuing; the build reports what it cannot resolve");
+    }
+    let _lock = lock_ladder_for_run(&runner)?;
+    crate::checks::qemu_boot::install::run_system(&runner)
+}
+
 fn qemu_kernel_cli(
     args: &[String],
     command: &str,
@@ -7972,6 +7991,7 @@ chmod 755 '{}'
         );
         for harness in [
             "qemu_kernel_cli",
+            "qemu_install_system_cli",
             "qemu_boot_erofs_cli",
             "qemu_boot_system_cli",
             "qemu_boot_net_cli",

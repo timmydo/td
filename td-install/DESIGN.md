@@ -524,7 +524,9 @@ streams from read-only media onto Btrfs. The host requires the direct
 publication marker as well as successful detached boots from the expected
 deployment. Deployment-sized staging copies no longer consume guest RAM;
 the sparse formatter image still needs metadata space and scans the logical
-volume size. This is not yet a full-system RAM or target-capacity oracle.
+volume size. This small fixture alone does not establish full-system RAM
+or capacity bounds; the full-system diagnostic in §8 supplies a separate
+2 GiB guest execution check. Production capacity admission remains open.
 
 ### Full-system volume consumers
 
@@ -1246,11 +1248,36 @@ The fixture accepts no operator destination and is absent from system and
 installer profiles. Its serial-based installation target identification is
 diagnostic scaffolding, not production consent. Installed boots exercise
 the read-only resolver above, including changed disk ordering and duplicate
-identity refusal before selection. Linux mounts its ISO payload files read-only before installation;
-the live initramfs holds tools and the public trust root. Full system
-installation, machine settings and compositor evidence remain required by
+identity refusal before selection. Linux mounts its ISO payload files
+read-only before installation; the live initramfs holds tools and the public
+trust root. Machine settings and a production installer remain required by
 INSTALLER.md. This fixture does not enforce selector/volume key
 agreement for arbitrary caller-provided inputs.
+
+`td-recipe-eval qemu-install-system [system-x86-64]` uses the same live
+fixture to install the built system deployment and its verified selector.
+Both optical and USB legs cold-boot twice with the ISO detached; the second
+boot places a blank disk before the installed disk. Each boot must bind the
+planned UUID before selecting the exact signed deployment, reach the greeter,
+prove immutable root/configuration and writable owned state, complete
+compositor modesetting and page flips, and acknowledge deployment health.
+First-boot identity must become stable on the second boot, with the same SSH
+host-key fingerprint, while the independently installed optical and USB
+machines must have different fingerprints. Missing bookkeeping and
+exhausted attempts refuse. The host terminates QEMU immediately after the
+health marker, then starts a new firmware process for the next boot. This
+exercises durability before acknowledgement across abrupt termination;
+it does not exercise the installed session's orderly shutdown path.
+
+All six boots run with 2 GiB RAM and networking disabled. Private target
+capacity is at least 6 GiB, or the payload size plus 2 GiB and partition
+headroom rounded up to the partition alignment, whichever is larger. This
+is diagnostic sizing, not admission of an operator-owned disk. The default
+per-boot deadline is 900 seconds; a positive `TD_QEMU_BOOT_TIMEOUT_SECS`
+overrides it. The diagnostic accepts no destination operand, provisions a
+throwaway signing key on the host, and does not enter the shipped closure.
+It retains the stock system's account defaults: username/PIN selection,
+production consent and hardware support remain separate milestones.
 
 The oracle signs with a **per-run throwaway key**: generate a keypair, sign
 the staged bundle, build `td-boot` pinned to that run's public key, boot, and

@@ -5,6 +5,7 @@ use td_engine::cpio::{Entry, Kind};
 pub(super) use td_recipe::td_install_qemu_protocol as protocol;
 
 pub(super) const TARGET_DRIVE_ID: &str = "install-target";
+const MINIMUM_TARGET_BYTES: u64 = 6 * 1024 * 1024 * 1024;
 
 /// Only this module can create a writable installation target, in owned scratch.
 pub(super) struct TargetDisk {
@@ -75,6 +76,10 @@ impl TargetDisk {
     }
 
     fn create(scratch: &Path, name: &str) -> Result<Self, String> {
+        Self::with_capacity(scratch, name, MINIMUM_TARGET_BYTES)
+    }
+
+    fn with_capacity(scratch: &Path, name: &str, bytes: u64) -> Result<Self, String> {
         let path = scratch.join(name);
         let file = OpenOptions::new()
             .write(true)
@@ -82,7 +87,7 @@ impl TargetDisk {
             .mode(0o600)
             .open(&path)
             .map_err(|e| format!("create {}: {e}", path.display()))?;
-        file.set_len(6 * 1024 * 1024 * 1024)
+        file.set_len(bytes)
             .map_err(|e| format!("size {}: {e}", path.display()))?;
         Ok(Self { path })
     }
@@ -172,34 +177,76 @@ fn initramfs(
     Ok(image)
 }
 
+struct LiveInstaller {
+    kernel: PathBuf,
+    base: Vec<u8>,
+    common: Vec<PackedFile>,
+    extra: Vec<PackedFile>,
+    uuid: String,
+}
+
+impl LiveInstaller {
+    fn load(runner: &RecipeCheckRunner, trust: &RunTrust) -> Result<Self, String> {
+        let outputs = runner.build_and_stage("td-install-qemu-test", OUTPUTS)?;
+        let [probe, linux, installer, init, boot, kexec, btrfs] = outputs.as_slice() else {
+            return Err("installation fixture output roster mismatch".into());
+        };
+        let kernel = linux.join("bzImage");
+        let base = read(&linux.join("initramfs.cpio"))?;
+        let mut common = Vec::new();
+        for (name, source) in [
+            ("init", probe.join("bin/td-install-qemu-test")),
+            ("bin/td-init", init.join("bin/td-init")),
+            ("bin/mount", init.join("bin/td-init")),
+            ("bin/umount", init.join("bin/td-init")),
+            ("bin/losetup", init.join("bin/td-init")),
+            ("bin/td-boot", boot.join("bin/td-boot")),
+            ("bin/td-kexec", kexec.join("bin/td-kexec")),
+        ] {
+            common.push((name.to_owned(), 0o755, read(&source)?));
+        }
+        let uuid = installation_uuid(&trust.public);
+        let uuid_line = format!("{uuid}\n").into_bytes();
+        let extra = vec![
+            (
+                "bin/td-install".into(),
+                0o755,
+                read(&installer.join("bin/td-install"))?,
+            ),
+            (
+                "bin/mkfs.btrfs".into(),
+                0o755,
+                read(&btrfs.join("bin/mkfs.btrfs"))?,
+            ),
+            ("trusted.pub".into(), 0o644, trust.trusted_key_line()),
+            (td_boot_protocol::VOLUME_UUID_PATH.into(), 0o644, uuid_line),
+        ];
+        Ok(Self {
+            kernel,
+            base,
+            common,
+            extra,
+            uuid,
+        })
+    }
+}
+
 pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
     let qemu = find_qemu()?;
-    let timeout = installation_timeout(env::var("TD_QEMU_BOOT_TIMEOUT_SECS").ok().as_deref());
+    let timeout = installation_timeout(env::var("TD_QEMU_BOOT_TIMEOUT_SECS").ok().as_deref(), 180);
     let (code, vars_template) = efi::firmware(&qemu)?;
-    let outputs = runner.build_and_stage("td-install-qemu-test", OUTPUTS)?;
-    let [probe, linux, installer, init, boot, kexec, btrfs] = outputs.as_slice() else {
-        return Err("installation fixture output roster mismatch".into());
-    };
+    let trust = RunTrust::generate()?;
+    let LiveInstaller {
+        kernel,
+        base,
+        common,
+        mut extra,
+        uuid,
+    } = LiveInstaller::load(runner, &trust)?;
     static SEQ: AtomicU64 = AtomicU64::new(0);
     let scratch = Scratch {
         dir: create_scratch_dir(runner.scratch_dir(), &SEQ)?,
     };
-    let kernel = linux.join("bzImage");
-    let base = read(&linux.join("initramfs.cpio"))?;
-    let mut common = Vec::new();
-    for (name, source) in [
-        ("init", probe.join("bin/td-install-qemu-test")),
-        ("bin/td-init", init.join("bin/td-init")),
-        ("bin/mount", init.join("bin/td-init")),
-        ("bin/umount", init.join("bin/td-init")),
-        ("bin/losetup", init.join("bin/td-init")),
-        ("bin/td-boot", boot.join("bin/td-boot")),
-        ("bin/td-kexec", kexec.join("bin/td-kexec")),
-    ] {
-        common.push((name.to_owned(), 0o755, read(&source)?));
-    }
-    let trust = RunTrust::generate()?;
-    let uuid = installation_uuid(&trust.public);
     let uuid_line = format!("{uuid}\n").into_bytes();
     let installed = initramfs(&base, &common, "installed\n", &[])?;
     let deployment = scratch.dir.join("source");
@@ -236,25 +283,11 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
         &common,
         "selector\n",
         &[
-            (td_boot_protocol::TRUSTED_KEY_PATH.into(), 0o644, key.clone()),
-            (td_boot_protocol::VOLUME_UUID_PATH.into(), 0o644, uuid_line.clone()),
+            (td_boot_protocol::TRUSTED_KEY_PATH.into(), 0o644, key),
+            (td_boot_protocol::VOLUME_UUID_PATH.into(), 0o644, uuid_line),
         ],
     )?;
     write(&scratch.dir.join("selector.cpio"), &selector)?;
-    let mut extra = vec![
-        (
-            "bin/td-install".into(),
-            0o755,
-            read(&installer.join("bin/td-install"))?,
-        ),
-        (
-            "bin/mkfs.btrfs".into(),
-            0o755,
-            read(&btrfs.join("bin/mkfs.btrfs"))?,
-        ),
-        ("trusted.pub".into(), 0o644, key),
-        (td_boot_protocol::VOLUME_UUID_PATH.into(), 0o644, uuid_line),
-    ];
     let payloads: Vec<_> = protocol::MEDIA_FILES
         .iter()
         .map(|(iso_name, name)| (*iso_name, scratch.dir.join(name)))
@@ -283,22 +316,7 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
             &scratch.dir,
             timeout,
         )?;
-        require(&result, protocol::INSTALL_MARKER, "guest installation")?;
-        if !result.console.lines().any(|line| line.trim_end() == protocol::DIRECT_MARKER) {
-            return Err("guest did not report direct publication after staging checks".into());
-        }
-        let partition_evidence = format!("{} {uuid} /dev/vda2", protocol::PARTITIONS_MARKER);
-        if !result.console.lines().any(|line| line.trim_end() == partition_evidence) {
-            return Err("guest did not prove refreshed partitions and busy-disk refusal".into());
-        }
-        let media_evidence = format!("{} {source_device}", protocol::MEDIA_MARKER);
-        if !result
-            .console
-            .lines()
-            .any(|line| line.trim_end() == media_evidence)
-        {
-            return Err("guest did not prove read-only ISO payload access".into());
-        }
+        require_installation(&result, &uuid, source_device)?;
         let duplicate = TargetDisk::create(&scratch.dir, &format!("{name}-duplicate.img"))?;
         duplicate.copy_volume_identity(&target)?;
         let vars = scratch.dir.join(format!("{name}-duplicate-vars.fd"));
@@ -355,7 +373,11 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
                 timeout,
             )?;
             require(&result, &expected, "installed boot")?;
-            require(&result, "TD-INSTALL-STALE-MOUNT-RECOVERED", "closed-descriptor mount recovery")?;
+            require(
+                &result,
+                "TD-INSTALL-STALE-MOUNT-RECOVERED",
+                "closed-descriptor mount recovery",
+            )?;
             let expected_device = if count == 2 { "/dev/vdb2" } else { "/dev/vda2" };
             let discovered: Vec<_> = result
                 .console
@@ -364,9 +386,7 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
                 .filter_map(|line| line.strip_prefix("TD-INSTALL-VOLUME "))
                 .collect();
             let expected_identity = format!("{uuid} {expected_device}");
-            if discovered.len() != 2
-                || discovered.iter().any(|line| *line != expected_identity)
-            {
+            if discovered.len() != 2 || discovered.iter().any(|line| *line != expected_identity) {
                 return Err(format!(
                     "selector/deployment did not resolve {expected_identity}: {discovered:?}\n{}",
                     tail(&result.console, 80)
@@ -486,12 +506,240 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
     Ok(())
 }
 
-fn installation_timeout(value: Option<&str>) -> Duration {
+/// Install the stock system through firmware, then retain identity on a cold reboot.
+pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
+    let qemu = find_qemu()?;
+    let timeout = installation_timeout(env::var("TD_QEMU_BOOT_TIMEOUT_SECS").ok().as_deref(), 900);
+    let (code, vars_template) = efi::firmware(&qemu)?;
+    let (_, selector, source) = build_system(runner)?;
+    let trust = RunTrust::generate()?;
+    let LiveInstaller {
+        kernel,
+        base,
+        common,
+        extra,
+        uuid,
+    } = LiveInstaller::load(runner, &trust)?;
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let scratch = Scratch {
+        dir: create_scratch_dir(runner.scratch_dir(), &SEQ)?,
+    };
+    let deployment = scratch.dir.join("source");
+    fs::create_dir(&deployment).map_err(|error| format!("create system deployment: {error}"))?;
+    let mut payload_bytes = 0u64;
+    for name in ["bzImage", "initramfs.cpio", "root.erofs", "manifest"] {
+        let copied = fs::copy(source.join(name), deployment.join(name))
+            .map_err(|error| format!("stage system {name}: {error}"))?;
+        payload_bytes = payload_bytes
+            .checked_add(copied)
+            .ok_or("system payload length overflow")?;
+    }
+    trust.sign_deployment(&deployment)?;
+    verify_deployment(&deployment)?;
+    let id = crate::sha256::sha256_file(&deployment.join("manifest"))
+        .map_err(|error| format!("hash system manifest: {error}"))?;
+    let provisioned = provision_selector(&selector, &scratch.dir, &trust)?;
+    efi::copy_input(&provisioned, &scratch.dir.join("selector.cpio"))?;
+    let payloads: Vec<_> = protocol::MEDIA_FILES
+        .iter()
+        .map(|(iso_name, name)| (*iso_name, scratch.dir.join(name)))
+        .collect();
+    let live = scratch.dir.join("installer.cpio");
+    write(&live, &initramfs(&base, &common, "install\n", &extra)?)?;
+    let iso = scratch.dir.join("installer.iso");
+    media::write_image_with_payloads(&iso, &kernel, &live, &payloads)?;
+    let capacity = system_target_capacity(payload_bytes)?;
+    let mut previous_installation = None;
+    for (name, attachment, source_device) in [
+        ("optical", FirmwareAttachment::Optical, "/dev/sr0"),
+        ("usb", FirmwareAttachment::Usb, "/dev/sda"),
+    ] {
+        let target = TargetDisk::with_capacity(&scratch.dir, &format!("{name}.img"), capacity)?;
+        let vars = scratch.dir.join(format!("{name}-install-vars.fd"));
+        efi::copy_input(&vars_template, &vars)?;
+        println!("   [qemu-install-system] installing {payload_bytes} bytes through {name} media");
+        let result = boot_source(
+            &qemu,
+            BootSource::Firmware {
+                code: &code,
+                vars: &vars,
+                attachment,
+                installation_target: Some(&target),
+            },
+            plan(&iso, true, protocol::INSTALL_MARKER),
+            &scratch.dir,
+            timeout,
+        )?;
+        require_installation(&result, &uuid, source_device)?;
+        let mut first = None;
+        for count in 1..=2 {
+            let decoy = if count == 2 {
+                Some(TargetDisk::create(
+                    &scratch.dir,
+                    &format!("{name}-decoy.img"),
+                )?)
+            } else {
+                None
+            };
+            let vars = scratch.dir.join(format!("{name}-boot-{count}-vars.fd"));
+            efi::copy_input(&vars_template, &vars)?;
+            let mut boot_plan = plan(&target.path, false, SYSTEM_BOOT_SUCCESS_MARKER);
+            // Stock audio supervision needs the emulated sound device.
+            boot_plan.audio = true;
+            println!("   [qemu-install-system] cold system boot {count}, {name} media detached");
+            let result = boot_source(
+                &qemu,
+                BootSource::Firmware {
+                    code: &code,
+                    vars: &vars,
+                    attachment: if count == 2 {
+                        FirmwareAttachment::InstalledFixtureReordered
+                    } else {
+                        FirmwareAttachment::InstalledFixture
+                    },
+                    installation_target: decoy.as_ref(),
+                },
+                boot_plan,
+                &scratch.dir,
+                timeout,
+            )?;
+            let device = if count == 2 { "/dev/vdb2" } else { "/dev/vda2" };
+            validate_installed_system(&result, &uuid, device, &id, count == 1)?;
+            if let Some(first) = &first {
+                require_same_identity(
+                    first,
+                    &result,
+                    "first installed boot",
+                    "second installed boot",
+                )?;
+            } else {
+                if let Some(previous) = &previous_installation {
+                    require_distinct_identity(
+                        previous,
+                        &result,
+                        "optical installation",
+                        "USB installation",
+                    )?;
+                }
+                first = Some(result);
+            }
+        }
+        previous_installation = first;
+    }
+    println!("PASS: stock system installed offline through optical/USB ISO firmware; immutable root, compositor page flips, acknowledged deployment and stable machine identity across reordered cold boots");
+    Ok(())
+}
+
+fn system_target_capacity(payload_bytes: u64) -> Result<u64, String> {
+    let alignment = td_boot_protocol::PARTITION_ALIGN_BYTES;
+    payload_bytes
+        .checked_add(2 * 1024 * 1024 * 1024)
+        .and_then(|bytes| bytes.checked_add(td_boot_protocol::ESP_BYTES))
+        .and_then(|bytes| bytes.checked_add(2 * alignment))
+        .and_then(|bytes| bytes.checked_add(alignment - 1))
+        .map(|bytes| (bytes / alignment * alignment).max(MINIMUM_TARGET_BYTES))
+        .ok_or_else(|| "system installation capacity overflow".into())
+}
+
+fn validate_installed_system(
+    result: &BootResult,
+    uuid: &str,
+    device: &str,
+    id: &str,
+    fresh: bool,
+) -> Result<(), String> {
+    require(
+        result,
+        SYSTEM_BOOT_SUCCESS_MARKER,
+        "installed system health",
+    )?;
+    if result.evidence.kernel_panic
+        || !result.evidence.boot_success
+        || result.evidence.bookkeeping_unavailable
+        || result.evidence.attempts_exhausted
+    {
+        return Err(format!("installed system did not acknowledge a healthy deployment: panic={}, success={}, bookkeeping unavailable={}, attempts exhausted={}\n{}", result.evidence.kernel_panic, result.evidence.boot_success, result.evidence.bookkeeping_unavailable, result.evidence.attempts_exhausted, tail(&result.console, 100)));
+    }
+    validate_primary_selection(result, "installed system")?;
+    if result.evidence.selected_current_id.as_deref() != Some(id)
+        || !bound_selector_before_selection(&result.console, &format!("{uuid} {device}"), id)
+    {
+        return Err(format!(
+            "installed system did not bind {uuid} {device} and deployment {id}: selected={:?}\n{}",
+            result.evidence.selected_current_id,
+            tail(&result.console, 100)
+        ));
+    }
+    for (name, present) in [
+        ("greeter", result.evidence.greeter),
+        ("read-only root", result.evidence.root_read_only),
+        ("read-only configuration", result.evidence.etc_read_only),
+        (
+            "persistent identity configuration",
+            result.evidence.etc_mutable,
+        ),
+        ("writable state", result.evidence.state_writable),
+        ("state ownership", result.evidence.state_owner),
+        ("principals", result.evidence.principals_enrolled),
+        (
+            "private compositor devices",
+            result.evidence.compositor_devices_private,
+        ),
+    ] {
+        if !present {
+            return Err(format!(
+                "installed system lacks {name} evidence\n{}",
+                tail(&result.console, 100)
+            ));
+        }
+    }
+    if result.evidence.firstboot_new != fresh
+        || result.evidence.firstboot_stable == fresh
+        || result.evidence.host_key.is_none()
+    {
+        return Err(format!("installed system identity: expected fresh={fresh}, new={}, stable={}, host key present={}\n{}", result.evidence.firstboot_new, result.evidence.firstboot_stable, result.evidence.host_key.is_some(), tail(&result.console, 100)));
+    }
+    validate_compositor_boot(result)
+}
+
+fn require_installation(
+    result: &BootResult,
+    uuid: &str,
+    source_device: &str,
+) -> Result<(), String> {
+    require(result, protocol::INSTALL_MARKER, "guest installation")?;
+    if !result
+        .console
+        .lines()
+        .any(|line| line.trim_end() == protocol::DIRECT_MARKER)
+    {
+        return Err("guest did not report direct publication after staging checks".into());
+    }
+    let partition_evidence = format!("{} {uuid} /dev/vda2", protocol::PARTITIONS_MARKER);
+    if !result
+        .console
+        .lines()
+        .any(|line| line.trim_end() == partition_evidence)
+    {
+        return Err("guest did not prove refreshed partitions and busy-disk refusal".into());
+    }
+    let media_evidence = format!("{} {source_device}", protocol::MEDIA_MARKER);
+    if !result
+        .console
+        .lines()
+        .any(|line| line.trim_end() == media_evidence)
+    {
+        return Err("guest did not prove read-only ISO payload access".into());
+    }
+    Ok(())
+}
+
+fn installation_timeout(value: Option<&str>, default_secs: u64) -> Duration {
     value
         .and_then(|value| value.parse::<u64>().ok())
         .filter(|seconds| *seconds > 0)
         .map(Duration::from_secs)
-        .unwrap_or(Duration::from_secs(180))
+        .unwrap_or(Duration::from_secs(default_secs))
 }
 
 fn plan<'a>(path: &'a Path, read_only: bool, marker: &'a str) -> BootPlan<'a> {
@@ -536,6 +784,141 @@ mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
 
+    fn healthy_system() -> BootResult {
+        let mut evidence = ConsoleEvidence {
+            target: true,
+            boot_success: true,
+            selected_current: true,
+            selected_current_id: Some("deployment".into()),
+            greeter: true,
+            root_read_only: true,
+            etc_read_only: true,
+            etc_mutable: true,
+            state_writable: true,
+            state_owner: true,
+            principals_enrolled: true,
+            compositor_devices_private: true,
+            firstboot_new: true,
+            host_key: Some("ssh-ed25519 AAAA".into()),
+            ..ConsoleEvidence::default()
+        };
+        let display = "driver=virtio_gpu connector=Virtual-1#31 status=connected crtc=29 encoder=30 mode=1280x800@60 name=1280x800 preferred=true mm=0x0 output=1280x800";
+        evidence.td_compositor_drm = Some(format!(
+            "{display} buffer=1280x800 pitch=5120 bytes=4096000 mapping=ok"
+        ));
+        evidence.td_compositor_kms = Some(format!(
+            "{display} buffer=1280x800 pitch=5120 bytes=4096000 mapping=ok fb=7 modeset=ok"
+        ));
+        evidence.td_compositor_flip = Some(format!(
+            "{display} fb=7 modeset=ok flipfb=8 cookie=0x2 seq=41 flip=ok"
+        ));
+        BootResult {
+            evidence, exited_clean: false, marker_killed: true,
+            reason: "fixture".into(),
+            console: format!("TD-BOOT-VOLUME uuid /dev/vda2\nTD-BOOT-SELECTED-CURRENT deployment\n{SYSTEM_BOOT_SUCCESS_MARKER}\n"),
+            elapsed: Duration::ZERO, firefox_audio: FirefoxAudioCapture::NotRequested,
+        }
+    }
+
+    #[test]
+    fn installed_system_requires_bound_identity_and_complete_health() {
+        let validate = |result: &BootResult| {
+            validate_installed_system(result, "uuid", "/dev/vda2", "deployment", true)
+        };
+        assert!(validate(&healthy_system()).is_ok());
+        for mutate in [
+            |e: &mut ConsoleEvidence| e.target = false,
+            |e: &mut ConsoleEvidence| e.kernel_panic = true,
+            |e: &mut ConsoleEvidence| e.boot_success = false,
+            |e: &mut ConsoleEvidence| e.bookkeeping_unavailable = true,
+            |e: &mut ConsoleEvidence| e.attempts_exhausted = true,
+            |e: &mut ConsoleEvidence| e.selected_current = false,
+            |e: &mut ConsoleEvidence| e.selected_current_id = Some("wrong".into()),
+            |e: &mut ConsoleEvidence| e.greeter = false,
+            |e: &mut ConsoleEvidence| e.root_read_only = false,
+            |e: &mut ConsoleEvidence| e.etc_read_only = false,
+            |e: &mut ConsoleEvidence| e.etc_mutable = false,
+            |e: &mut ConsoleEvidence| e.state_writable = false,
+            |e: &mut ConsoleEvidence| e.state_owner = false,
+            |e: &mut ConsoleEvidence| e.principals_enrolled = false,
+            |e: &mut ConsoleEvidence| e.compositor_devices_private = false,
+            |e: &mut ConsoleEvidence| e.firstboot_new = false,
+            |e: &mut ConsoleEvidence| e.firstboot_stable = true,
+            |e: &mut ConsoleEvidence| e.host_key = None,
+            |e: &mut ConsoleEvidence| e.td_compositor_drm = None,
+            |e: &mut ConsoleEvidence| e.td_compositor_kms = None,
+            |e: &mut ConsoleEvidence| e.td_compositor_flip = None,
+        ] {
+            let mut result = healthy_system();
+            mutate(&mut result.evidence);
+            assert!(validate(&result).is_err());
+        }
+        for (from, to) in [
+            ("uuid", "wrong"),
+            ("/dev/vda2", "/dev/vdb2"),
+            ("CURRENT deployment", "CURRENT wrong"),
+            (
+                SYSTEM_BOOT_SUCCESS_MARKER,
+                &format!("noise{SYSTEM_BOOT_SUCCESS_MARKER}"),
+            ),
+        ] {
+            let mut result = healthy_system();
+            result.console = result.console.replace(from, to);
+            assert!(validate(&result).is_err());
+        }
+    }
+
+    #[test]
+    fn installed_system_reboot_requires_stable_matching_identity() {
+        let first = healthy_system();
+        let mut second = healthy_system();
+        assert!(
+            validate_installed_system(&second, "uuid", "/dev/vda2", "deployment", false).is_err()
+        );
+        second.evidence.firstboot_new = false;
+        second.evidence.firstboot_stable = true;
+        assert!(
+            validate_installed_system(&second, "uuid", "/dev/vda2", "deployment", false).is_ok()
+        );
+        assert!(require_same_identity(&first, &second, "first", "second").is_ok());
+        assert!(require_distinct_identity(&first, &second, "optical", "USB").is_err());
+        second.evidence.host_key = Some("ssh-ed25519 BBBB".into());
+        assert!(require_same_identity(&first, &second, "first", "second").is_err());
+        assert!(require_distinct_identity(&first, &second, "optical", "USB").is_ok());
+    }
+
+    #[test]
+    fn system_disk_capacity_is_aligned_bounded_and_checked() {
+        let gib = 1024 * 1024 * 1024;
+        assert_eq!(system_target_capacity(0).unwrap(), 6 * gib);
+        let size = system_target_capacity(7 * gib + 1).unwrap();
+        assert_eq!(size % td_boot_protocol::PARTITION_ALIGN_BYTES, 0);
+        assert!(size > 9 * gib + td_boot_protocol::ESP_BYTES);
+        assert!(system_target_capacity(u64::MAX).is_err());
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let scratch = Scratch {
+            dir: create_scratch_dir(&env::temp_dir(), &SEQ).unwrap(),
+        };
+        let target = TargetDisk::with_capacity(&scratch.dir, "sized.img", 4096).unwrap();
+        assert_eq!(fs::metadata(&target.path).unwrap().len(), 4096);
+        assert!(TargetDisk::with_capacity(&scratch.dir, "sized.img", 1).is_err());
+        assert_eq!(fs::metadata(&target.path).unwrap().len(), 4096);
+    }
+
+    #[test]
+    fn system_install_cli_refuses_operator_destinations() {
+        for args in [
+            vec!["linux-x86-64".into()],
+            vec!["/dev/sda".into()],
+            vec!["system-x86-64".into(), "/dev/sda".into()],
+        ] {
+            assert_eq!(
+                crate::check_runner::qemu_install_system_cli(&args).unwrap_err(),
+                "usage: qemu-install-system [system-x86-64]"
+            );
+        }
+    }
+
     #[test]
     fn a_later_bound_mount_cannot_stand_in_for_the_selector() {
         let binding = "TD-BOOT-VOLUME uuid /dev/vda2\n";
@@ -579,7 +962,8 @@ mod tests {
         assert!(require(&result, "TD-INSTALL-STALE-MOUNT-RECOVERED", "recovery").is_err());
         assert!(require(&result, "TD-INSTALL-PERSISTED-1 deployment", "installed").is_ok());
         result.console =
-            "noiseTD-INSTALL-STALE-MOUNT-RECOVERED\nTD-INSTALL-STALE-MOUNT-RECOVERED-extra\n".into();
+            "noiseTD-INSTALL-STALE-MOUNT-RECOVERED\nTD-INSTALL-STALE-MOUNT-RECOVERED-extra\n"
+                .into();
         assert!(require(&result, "TD-INSTALL-STALE-MOUNT-RECOVERED", "recovery").is_err());
         result.console = "TD-INSTALL-STALE-MOUNT-RECOVERED extra\n".into();
         assert!(require(&result, "TD-INSTALL-STALE-MOUNT-RECOVERED", "recovery").is_err());
@@ -589,17 +973,30 @@ mod tests {
 
     #[test]
     fn installation_deadline_defaults_and_accepts_positive_overrides() {
-        for value in [None, Some(""), Some("0"), Some("invalid"), Some("-1")] {
-            assert_eq!(installation_timeout(value), Duration::from_secs(180));
+        for default in [180, 900] {
+            for value in [None, Some(""), Some("0"), Some("invalid"), Some("-1")] {
+                assert_eq!(
+                    installation_timeout(value, default),
+                    Duration::from_secs(default)
+                );
+            }
+            assert_eq!(
+                installation_timeout(Some("60"), default),
+                Duration::from_secs(60)
+            );
+            assert_eq!(
+                installation_timeout(Some("7200"), default),
+                Duration::from_secs(7200)
+            );
         }
-        assert_eq!(installation_timeout(Some("60")), Duration::from_secs(60));
-        assert_eq!(installation_timeout(Some("7200")), Duration::from_secs(7200));
     }
 
     #[test]
     fn diagnostic_recipe_is_outside_the_system_closure() {
         let system = crate::check_runner::recipe_closure(&["system-x86-64"]).unwrap();
-        assert!(!system.iter().any(|node| node.stem == "td-install-qemu-test"));
+        assert!(!system
+            .iter()
+            .any(|node| node.stem == "td-install-qemu-test"));
         let recipe = td_recipe::catalog::lookup("td-install-qemu-test").unwrap();
         assert!(recipe.checks.is_none());
     }
