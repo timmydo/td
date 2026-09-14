@@ -101,17 +101,48 @@ pub fn preview(rest: &[OsString]) -> Result<()> {
     let [size, rest @ ..] = rest else {
         return Err("--preview needs WxH; see --help".to_string());
     };
-    let roll = match rest {
-        [] => None,
-        [roll] => Some(PathBuf::from(roll)),
-        _ => return Err("unrecognized arguments; see --help".to_string()),
-    };
+    let mut roll: Option<PathBuf> = None;
+    let mut develop: Option<usize> = None;
+    let mut args = rest.iter();
+    while let Some(arg) = args.next() {
+        if arg == "--develop" {
+            if develop.is_some() {
+                return Err("--develop may be given only once".to_string());
+            }
+            // A position follows when the next argument is a decimal;
+            // otherwise the cursor's photo, which is the first at open.
+            let position = match args.clone().next() {
+                Some(next)
+                    if next.to_str().is_some_and(|text| {
+                        !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit())
+                    }) =>
+                {
+                    args.next();
+                    next.to_str()
+                        .and_then(|text| text.parse::<usize>().ok())
+                        .ok_or("--develop POSITION is out of range")?
+                }
+                _ => 0,
+            };
+            develop = Some(position);
+        } else if roll.is_none() && !arg.as_bytes().starts_with(b"--") {
+            roll = Some(PathBuf::from(arg));
+        } else {
+            return Err(format!("unrecognized argument {arg:?}; see --help"));
+        }
+    }
+    if develop.is_some() && roll.is_none() {
+        return Err("--develop needs a ROLL to develop; see --help".to_string());
+    }
     let (width, height) = size
         .to_str()
         .and_then(|text| text.split_once('x'))
         .and_then(|(w, h)| Some((w.parse::<usize>().ok()?, h.parse::<usize>().ok()?)))
         .ok_or_else(|| format!("--preview {size:?} is not WxH"))?;
-    let session = session(width, height, roll.as_deref())?;
+    let mut session = session(width, height, roll.as_deref())?;
+    if let Some(position) = develop {
+        enter_develop(&mut session, position)?;
+    }
     let font = td_ui::font::pinned()?;
     let surface = session.ui.surface();
     let stride = surface.width * 4;
@@ -135,6 +166,13 @@ pub fn preview(rest: &[OsString]) -> Result<()> {
             {
                 ui::blit(&mut pixels, surface, stride, area, r#box, &image).map_err(error)?;
             }
+        }
+        // The developed preview, when developing: the cursor photo blitted
+        // into the develop box, the same frame the window shows there, made
+        // here on the calling thread. The grid loop above is inert in
+        // develop mode, where nothing is `visible`.
+        if let Some((r#box, image)) = developed(&session, roll) {
+            ui::blit(&mut pixels, surface, stride, area, r#box, &image).map_err(error)?;
         }
         // The badges again, over the thumbnails that covered them, within
         // the area as the blits were: the status band covers a badge that
@@ -183,6 +221,47 @@ fn thumbnail(path: &Path, scale: usize, threads: usize) -> Option<Rgb8> {
     }
 }
 
+/// Puts a `--preview` session into the develop view of the photo at
+/// `position`, so the frame is the developed preview the window shows there.
+/// Neither action writes a sidecar, so there is nothing to carry out.
+fn enter_develop(session: &mut Session, position: usize) -> Result<()> {
+    session
+        .ui
+        .action("select", &[position.to_string().as_str()])
+        .map_err(|e| format!("--develop {position}: {e}"))?;
+    session
+        .ui
+        .action("develop", &[])
+        .map_err(|e| format!("--develop: {e}"))?;
+    Ok(())
+}
+
+/// The developed preview for a `--preview --develop` session: the develop
+/// box and the cursor photo developed to fit it, at the sidecar's exposure
+/// and look, made on the calling thread; `None` when not developing or the
+/// develop cannot be made, leaving the box its placeholder.
+fn developed(session: &Session, roll: &Path) -> Option<(td_ui::raster::Rect, Rgb8)> {
+    let r#box = session.ui.develop_box()?;
+    let index = session.ui.cursor()?;
+    let photo = session.ui.photos().get(index)?;
+    let exposure = photo
+        .sidecar
+        .as_ref()
+        .and_then(|sidecar| sidecar.exposure())
+        .unwrap_or(0);
+    let look = photo.sidecar.as_ref().and_then(|sidecar| sidecar.look());
+    let image = crate::develop_preview(
+        roll,
+        &photo.name,
+        r#box.width as usize,
+        r#box.height as usize,
+        exposure,
+        look,
+        threads(),
+    )?;
+    Some((r#box, image))
+}
+
 // ------------------------------------------------------------------- pool
 
 /// What a thumbnail is asked for by: the roll, the name in it and the
@@ -201,39 +280,103 @@ impl Key {
     }
 }
 
-/// What a worker made for a key, or that it could not (said on stderr).
-struct Done {
-    key: Key,
-    image: Option<Rgb8>,
+/// What a worker develops the preview by: the roll, the photo in it, the
+/// box it fits and the sidecar's exposure and look, so the same photo at
+/// another box, exposure or look is another develop. There is no
+/// generation: two requests with the same fields yield the same pixels.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct Preview {
+    roll: PathBuf,
+    name: String,
+    box_w: usize,
+    box_h: usize,
+    exposure: i32,
+    look: Option<String>,
+}
+
+/// What a worker finished: a thumbnail for a key, or the developed preview
+/// for a request; `None` for either when it could not be made (said on
+/// stderr), which leaves the box its placeholder.
+enum Done {
+    Thumb {
+        key: Key,
+        image: Option<Rgb8>,
+    },
+    Develop {
+        preview: Preview,
+        image: Option<Rgb8>,
+    },
+}
+
+/// What a worker takes off the queue.
+enum Task {
+    Thumb(Key),
+    Develop(Preview),
 }
 
 #[derive(Default)]
 struct Queue {
     pending: VecDeque<Key>,
-    /// Taken by a worker and not yet collected by the window.
+    /// Thumbnails taken by a worker and not yet collected by the window.
     running: HashSet<Key>,
+    /// The develop the window wants and no worker has taken yet.
+    preview: Option<Preview>,
+    /// The develop a worker has taken and the window has not collected yet;
+    /// at most one, so at most one raw is decoded at a time.
+    developing: Option<Preview>,
     closing: bool,
 }
 
 impl Queue {
-    /// Replaces what is pending with `wanted`, less what is running, and
-    /// says how many are outstanding.
-    fn replace(&mut self, wanted: Vec<Key>) -> usize {
+    /// Replaces the thumbnail wants with `thumbs` (less what is running) and
+    /// the develop want with `preview`, but never re-queues the develop a
+    /// worker already holds, and says how many jobs are outstanding.
+    fn replace(&mut self, thumbs: Vec<Key>, preview: Option<Preview>) -> usize {
         let running = &self.running;
         self.pending.clear();
         self.pending
-            .extend(wanted.into_iter().filter(|key| !running.contains(key)));
-        self.pending.len() + self.running.len()
+            .extend(thumbs.into_iter().filter(|key| !running.contains(key)));
+        self.preview = match preview {
+            // The one in flight is not queued again; it is being made.
+            Some(preview) if self.developing.as_ref() == Some(&preview) => None,
+            other => other,
+        };
+        self.outstanding()
+    }
+
+    fn outstanding(&self) -> usize {
+        self.pending.len()
+            + self.running.len()
+            + usize::from(self.preview.is_some())
+            + usize::from(self.developing.is_some())
+    }
+
+    /// The next task for a worker, or `None` to wait: a thumbnail first,
+    /// then the develop when no develop is already in flight, so the one
+    /// raw decode is never run twice at once.
+    fn take(&mut self) -> Option<Task> {
+        if let Some(key) = self.pending.pop_front() {
+            self.running.insert(key.clone());
+            return Some(Task::Thumb(key));
+        }
+        if self.developing.is_none() {
+            if let Some(preview) = self.preview.take() {
+                self.developing = Some(preview.clone());
+                return Some(Task::Develop(preview));
+            }
+        }
+        None
     }
 }
 
-/// The thumbnail pool: `threads()` workers over one queue, started at
-/// window open and joined at close. The queue is replaced whenever the
-/// wants move, so a request the model no longer wants is dropped before it
-/// starts; a result stays in the running set until the window collects it,
-/// so the count outstanding never reads zero with a thumbnail made and not
-/// yet held. A finished thumbnail is kept whichever wants asked for it,
-/// since it is the file's.
+/// The pool: `threads()` workers over one queue, started at window open and
+/// joined at close. The queue is replaced whenever the wants move, so a
+/// request the model no longer wants is dropped before it starts; a result
+/// stays outstanding (in the running set, or as the develop in flight)
+/// until the window collects it, so the count never reads zero with a
+/// result made and not yet held. Thumbnails run many at once; the develop
+/// runs one at a time. A finished thumbnail is kept whichever wants asked
+/// for it, since it is the file's.
 struct Pool {
     queue: Arc<(Mutex<Queue>, Condvar)>,
     done: Receiver<Done>,
@@ -250,7 +393,7 @@ impl Pool {
             let queue = Arc::clone(&queue);
             let send = send.clone();
             let thread = std::thread::Builder::new()
-                .name("td-photo-thumb".to_string())
+                .name("td-photo-pool".to_string())
                 .spawn(move || work(&queue, &send))
                 .map_err(error)?;
             threads.push(thread);
@@ -266,30 +409,34 @@ impl Pool {
         self.queue
             .0
             .lock()
-            .map_err(|_| "thumbnail queue poisoned".to_string())
+            .map_err(|_| "pool queue poisoned".to_string())
     }
 
-    /// Replaces what is pending with `wanted`, less what is running, and
-    /// says how many are outstanding.
-    fn want(&self, wanted: Vec<Key>) -> Result<usize> {
-        let outstanding = self.lock()?.replace(wanted);
+    /// Replaces the thumbnail wants and the develop want, and says how many
+    /// jobs are outstanding.
+    fn want(&self, thumbs: Vec<Key>, preview: Option<Preview>) -> Result<usize> {
+        let outstanding = self.lock()?.replace(thumbs, preview);
         self.queue.1.notify_all();
         Ok(outstanding)
     }
 
     fn outstanding(&self) -> Result<usize> {
-        let queue = self.lock()?;
-        Ok(queue.pending.len() + queue.running.len())
+        Ok(self.lock()?.outstanding())
     }
 
-    /// Takes what the workers made, each leaving the running set as it is
-    /// taken, under the one lock, so what `outstanding` counts next is
-    /// exactly what the window does not hold.
+    /// Takes what the workers made, each leaving the running set or the
+    /// develop-in-flight slot as it is taken, under the one lock, so what
+    /// `outstanding` counts next is exactly what the window does not hold.
     fn collect(&self) -> Result<Vec<Done>> {
         let mut queue = self.lock()?;
         let done: Vec<Done> = std::iter::from_fn(|| self.done.try_recv().ok()).collect();
         for item in &done {
-            queue.running.remove(&item.key);
+            match item {
+                Done::Thumb { key, .. } => {
+                    queue.running.remove(key);
+                }
+                Done::Develop { .. } => queue.developing = None,
+            }
         }
         Ok(done)
     }
@@ -300,6 +447,7 @@ impl Drop for Pool {
         if let Ok(mut queue) = self.queue.0.lock() {
             queue.closing = true;
             queue.pending.clear();
+            queue.preview = None;
         }
         self.queue.1.notify_all();
         for thread in self.threads.drain(..) {
@@ -310,16 +458,16 @@ impl Drop for Pool {
 
 fn work(queue: &(Mutex<Queue>, Condvar), done: &Sender<Done>) {
     loop {
-        let key = {
+        let task = {
             let Ok(mut guard) = queue.0.lock() else {
                 return;
             };
-            let key = loop {
+            loop {
                 if guard.closing {
                     return;
                 }
-                match guard.pending.pop_front() {
-                    Some(key) => break key,
+                match guard.take() {
+                    Some(task) => break task,
                     None => {
                         guard = match queue.1.wait(guard) {
                             Ok(guard) => guard,
@@ -327,13 +475,29 @@ fn work(queue: &(Mutex<Queue>, Condvar), done: &Sender<Done>) {
                         };
                     }
                 }
-            };
-            guard.running.insert(key.clone());
-            key
+            }
         };
-        let image = thumbnail(&key.path(), key.scale, 1);
-        // The window takes the key out of the running set as it collects.
-        if done.send(Done { key, image }).is_err() {
+        // The window takes the key or the develop out of the count as it
+        // collects the result.
+        let result = match task {
+            Task::Thumb(key) => {
+                let image = thumbnail(&key.path(), key.scale, 1);
+                Done::Thumb { key, image }
+            }
+            Task::Develop(preview) => {
+                let image = crate::develop_preview(
+                    &preview.roll,
+                    &preview.name,
+                    preview.box_w,
+                    preview.box_h,
+                    preview.exposure,
+                    preview.look.as_deref(),
+                    threads(),
+                );
+                Done::Develop { preview, image }
+            }
+        };
+        if done.send(result).is_err() {
             return;
         }
     }
@@ -384,6 +548,10 @@ struct Window {
     /// What the held thumbnails are charged between them, under
     /// `THUMB_CACHE_BYTES`.
     thumb_bytes: usize,
+    /// The last developed preview and the request it was for (with no image
+    /// when it could not be made), shown in the develop box until the next
+    /// one lands. Let go with the thumbnails when the roll or scale changes.
+    developed: Option<(Preview, Option<Rgb8>)>,
     /// The pointer's last position on the surface, in the protocol's 24.8
     /// fixed point as the toolkit decodes it.
     pointer: (i32, i32),
@@ -457,6 +625,7 @@ impl Window {
             held: None,
             thumbs: HashMap::new(),
             thumb_bytes: 0,
+            developed: None,
             pointer: (0, 0),
             wheel: Wheel::default(),
             control,
@@ -660,55 +829,79 @@ impl Window {
         Ok(())
     }
 
-    /// Takes what the pool made. A result for a roll or a scale no longer
-    /// held is dropped; a thumbnail for a photo on screen is a new
-    /// generation; past the memory budget, the least recently shown that is
-    /// not on screen goes first.
+    /// Takes what the pool made. The developed preview replaces the one held
+    /// and, when it is the one the model wants and an image was made, is a
+    /// new generation. A thumbnail for a roll or a scale no longer held is
+    /// dropped; one for a photo on screen is a new generation; past the
+    /// memory budget, the least recently shown that is not on screen goes
+    /// first.
     fn collect(&mut self) -> Result<()> {
         let done = self.pool.collect()?;
         if done.is_empty() {
             return Ok(());
         }
-        let Some((roll, scale)) = &self.held else {
-            return Ok(());
-        };
-        let ui = &self.session.ui;
-        let on_screen: HashSet<&str> = ui
-            .visible()
-            .into_iter()
-            .filter_map(|(index, _)| ui.photos().get(index))
-            .map(|photo| photo.name.as_str())
-            .collect();
         let mut touched = false;
-        for Done { key, image } in done {
-            if key.roll != *roll || key.scale != *scale {
-                continue;
-            }
-            touched |= on_screen.contains(key.name.as_str());
-            let thumb = Thumb {
-                charge: charge(&key, image.as_ref()),
-                image,
-                shown: self.clock,
-            };
-            self.thumb_bytes = self.thumb_bytes.saturating_add(thumb.charge);
-            if let Some(old) = self.thumbs.insert(key.name, thumb) {
-                self.thumb_bytes = self.thumb_bytes.saturating_sub(old.charge);
+        let mut thumbs = Vec::new();
+        let mut developed = None;
+        for item in done {
+            match item {
+                Done::Thumb { key, image } => thumbs.push((key, image)),
+                // Only the newest develop matters; earlier ones are stale.
+                Done::Develop { preview, image } => developed = Some((preview, image)),
             }
         }
-        while self.thumb_bytes > THUMB_CACHE_BYTES {
-            let victim = self
-                .thumbs
-                .iter()
-                .filter(|(name, _)| !on_screen.contains(name.as_str()))
-                .min_by_key(|(_, thumb)| thumb.shown)
-                .map(|(name, _)| name.clone());
-            let Some(gone) = victim.and_then(|name| self.thumbs.remove(&name)) else {
-                break;
-            };
-            self.thumb_bytes = self.thumb_bytes.saturating_sub(gone.charge);
-            // What went may still be wanted off screen: the wants are
-            // recomputed.
+        if let Some((preview, image)) = developed {
+            // A develop for a roll no longer held (one from a previous roll
+            // completing after a switch) is dropped, not shown; either way the
+            // wants are recomputed, so the current roll's develop is asked for.
+            if self.held.as_ref().map(|(roll, _)| roll) == Some(&preview.roll) {
+                // A new generation whenever this is the develop the model
+                // wants now, an image or not: a made one to show it, a failed
+                // one to redraw the placeholder over any image a previous
+                // develop left in the box and to settle idle honestly.
+                touched |= self.wanted_preview().as_ref() == Some(&preview);
+                self.developed = Some((preview, image));
+            }
             self.wanted_at = None;
+        }
+        if let Some((roll, scale)) = self.held.clone() {
+            let ui = &self.session.ui;
+            let on_screen: HashSet<String> = ui
+                .visible()
+                .into_iter()
+                .filter_map(|(index, _)| ui.photos().get(index))
+                .map(|photo| photo.name.clone())
+                .collect();
+            for (key, image) in thumbs {
+                if key.roll != roll || key.scale != scale {
+                    continue;
+                }
+                touched |= on_screen.contains(&key.name);
+                let thumb = Thumb {
+                    charge: charge(&key, image.as_ref()),
+                    image,
+                    shown: self.clock,
+                };
+                self.thumb_bytes = self.thumb_bytes.saturating_add(thumb.charge);
+                if let Some(old) = self.thumbs.insert(key.name, thumb) {
+                    self.thumb_bytes = self.thumb_bytes.saturating_sub(old.charge);
+                }
+            }
+            while self.thumb_bytes > THUMB_CACHE_BYTES {
+                let victim = self
+                    .thumbs
+                    .iter()
+                    .filter(|(name, _)| !on_screen.contains(name.as_str()))
+                    .min_by_key(|(_, thumb)| thumb.shown)
+                    .map(|(name, _)| name.clone());
+                let Some(gone) = victim.and_then(|name| self.thumbs.remove(&name)) else {
+                    break;
+                };
+                self.thumb_bytes = self.thumb_bytes.saturating_sub(gone.charge);
+                // What went may still be wanted off screen: the wants are
+                // recomputed.
+                self.wanted_at = None;
+            }
         }
         if touched {
             self.session.ui.touch();
@@ -716,26 +909,57 @@ impl Window {
         Ok(())
     }
 
+    /// The develop the model wants now: the cursor photo fitted to the
+    /// develop box at its sidecar's exposure and look, or `None` outside
+    /// develop mode or before a roll.
+    fn wanted_preview(&self) -> Option<Preview> {
+        let ui = &self.session.ui;
+        let r#box = ui.develop_box()?;
+        let index = ui.cursor()?;
+        let photo = ui.photos().get(index)?;
+        let roll = ui.roll()?;
+        Some(Preview {
+            roll: PathBuf::from(OsStr::from_bytes(roll)),
+            name: photo.name.clone(),
+            box_w: r#box.width as usize,
+            box_h: r#box.height as usize,
+            exposure: photo
+                .sidecar
+                .as_ref()
+                .and_then(|sidecar| sidecar.exposure())
+                .unwrap_or(0),
+            look: photo
+                .sidecar
+                .as_ref()
+                .and_then(|sidecar| sidecar.look())
+                .map(str::to_string),
+        })
+    }
+
     /// The wants for the model as it stands, when it moved, and the count
     /// outstanding either way: the thumbnails not yet held, in the order
-    /// `Controller::wanted` gives them. What is held is the open roll's at
-    /// the surface's scale; when either changes the rest is let go.
+    /// `Controller::wanted` gives them, and the develop it wants unless the
+    /// frame already holds it. What is held is the open roll's at the
+    /// surface's scale; when either changes the rest is let go.
     fn want(&mut self) -> Result<usize> {
         let generation = self.session.ui.generation();
         if self.wanted_at == Some(generation) {
             return self.pool.outstanding();
         }
         self.wanted_at = Some(generation);
-        let ui = &self.session.ui;
-        let scale = ui.surface().scale.value();
-        let held = ui
+        let scale = self.session.ui.surface().scale.value();
+        let held = self
+            .session
+            .ui
             .roll()
             .map(|roll| (PathBuf::from(OsStr::from_bytes(roll)), scale));
         if self.held != held {
             self.thumbs.clear();
             self.thumb_bytes = 0;
+            self.developed = None;
             self.held = held;
         }
+        let ui = &self.session.ui;
         let keys = match &self.held {
             None => Vec::new(),
             Some((roll, scale)) => ui
@@ -750,7 +974,14 @@ impl Window {
                 })
                 .collect(),
         };
-        self.pool.want(keys)
+        // The develop, asked for once and not again while the frame holds it,
+        // so a settled develop is not re-run every turn.
+        let preview = self.wanted_preview();
+        let submit = match (&preview, &self.developed) {
+            (Some(want), Some((have, _))) if want == have => None,
+            _ => preview,
+        };
+        self.pool.want(keys, submit)
     }
 
     /// Nothing outstanding, the wants computed for the model as it stands
@@ -882,8 +1113,9 @@ impl Window {
 
     /// Presents the model's generation when the frame last submitted is not
     /// it: the scene through the raster, then the thumbnails held for the
-    /// photos on screen, centred in their boxes and clipped to the grid's
-    /// area, then the flag badges again over them, within the area too.
+    /// photos on screen or, in develop mode, the developed preview in the
+    /// develop box, each centred and clipped to the grid's area, then the
+    /// flag badges again over the thumbnails, within the area too.
     fn draw(&mut self) -> Result<()> {
         let generation = self.session.ui.generation();
         if self.submitted == Some(generation) || !self.client.can_present() {
@@ -896,6 +1128,7 @@ impl Window {
             font,
             session,
             thumbs,
+            developed,
             clock,
             ..
         } = self;
@@ -905,6 +1138,19 @@ impl Window {
         let scene = ui.scene();
         let badges = ui.badges();
         let photos = ui.photos();
+        // The develop box and the image to fill it: the held develop of the
+        // cursor's photo, so an exposure or look edit shows the last frame of
+        // that photo rather than a placeholder while the new one is made, but
+        // a move to another photo shows the placeholder until its own develop
+        // lands, not the previous photo's pixels.
+        let develop = ui.develop_box().and_then(|r#box| {
+            let name = &photos.get(ui.cursor()?)?.name;
+            developed
+                .as_ref()
+                .filter(|(preview, _)| preview.name == *name)
+                .and_then(|(_, image)| image.as_ref())
+                .map(|image| (r#box, image))
+        });
         let submitted = client.present(surface.width, surface.height, &mut |pixels| {
             Raster::new(pixels, font, surface, stride)
                 .map_err(error)?
@@ -921,6 +1167,9 @@ impl Window {
                 if let Some(image) = &thumb.image {
                     ui::blit(pixels, surface, stride, area, *r#box, image).map_err(error)?;
                 }
+            }
+            if let Some((r#box, image)) = develop {
+                ui::blit(pixels, surface, stride, area, r#box, image).map_err(error)?;
             }
             // Within the area as the blits were: the status band covers a
             // badge that runs under it.
@@ -1006,23 +1255,69 @@ mod tests {
         assert_eq!(envelope_id(b"\xff"), 0);
     }
 
+    fn preview(name: &str) -> Preview {
+        Preview {
+            roll: PathBuf::from("/td-photo/no-such-roll"),
+            name: name.to_string(),
+            box_w: 300,
+            box_h: 200,
+            exposure: 0,
+            look: None,
+        }
+    }
+
     #[test]
     fn the_queue_skips_what_runs_and_counts_both() {
         let mut queue = Queue::default();
-        assert_eq!(queue.replace(vec![key("a"), key("b")]), 2);
+        assert_eq!(queue.replace(vec![key("a"), key("b")], None), 2);
         let taken = queue.pending.pop_front().unwrap();
         queue.running.insert(taken);
-        assert_eq!(queue.replace(vec![key("a"), key("c")]), 2);
+        assert_eq!(queue.replace(vec![key("a"), key("c")], None), 2);
         let pending: Vec<&str> = queue.pending.iter().map(|key| key.name.as_str()).collect();
         assert_eq!(pending, ["c"]);
-        assert_eq!(queue.replace(Vec::new()), 1);
+        assert_eq!(queue.replace(Vec::new(), None), 1);
         assert!(queue.pending.is_empty());
         // Another roll's file of the same name is another key.
         let other = Key {
             roll: PathBuf::from("/td-photo/another"),
             ..key("a")
         };
-        assert_eq!(queue.replace(vec![other]), 2);
+        assert_eq!(queue.replace(vec![other], None), 2);
+    }
+
+    #[test]
+    fn the_queue_runs_one_develop_and_keeps_it_outstanding() {
+        let mut queue = Queue::default();
+        // One develop wanted; taking it moves it into the in-flight slot,
+        // where it stays outstanding until the window collects it.
+        assert_eq!(queue.replace(Vec::new(), Some(preview("a"))), 1);
+        match queue.take() {
+            Some(Task::Develop(request)) => assert_eq!(request.name, "a"),
+            _ => panic!("expected the develop"),
+        }
+        assert!(queue.developing.is_some());
+        assert_eq!(queue.outstanding(), 1);
+        // No second develop while one is in flight, and wanting the same one
+        // again does not re-queue it.
+        assert!(queue.take().is_none());
+        assert_eq!(queue.replace(Vec::new(), Some(preview("a"))), 1);
+        assert!(queue.preview.is_none());
+        // A different develop queues behind the one in flight; only once the
+        // in-flight one is collected does a worker take it.
+        assert_eq!(queue.replace(Vec::new(), Some(preview("b"))), 2);
+        assert!(queue.take().is_none());
+        queue.developing = None;
+        match queue.take() {
+            Some(Task::Develop(request)) => assert_eq!(request.name, "b"),
+            _ => panic!("expected the queued develop"),
+        }
+        // A thumbnail is taken before the develop.
+        let mut queue = Queue::default();
+        assert_eq!(queue.replace(vec![key("t")], Some(preview("a"))), 2);
+        match queue.take() {
+            Some(Task::Thumb(taken)) => assert_eq!(taken.name, "t"),
+            _ => panic!("expected the thumbnail first"),
+        }
     }
 
     #[test]
@@ -1040,7 +1335,10 @@ mod tests {
     fn the_pool_keeps_a_result_outstanding_until_it_is_collected() {
         let pool = Pool::start(1).unwrap();
         assert_eq!(pool.outstanding().unwrap(), 0);
-        assert_eq!(pool.want(vec![key("a.NEF"), key("b.NEF")]).unwrap(), 2);
+        assert_eq!(
+            pool.want(vec![key("a.NEF"), key("b.NEF")], None).unwrap(),
+            2
+        );
         // Made or not, nothing leaves the count until `collect` takes it.
         std::thread::sleep(Duration::from_millis(20));
         assert_eq!(pool.outstanding().unwrap(), 2);
@@ -1052,11 +1350,42 @@ mod tests {
             }
             std::thread::sleep(Duration::from_millis(5));
         }
-        let mut names: Vec<&str> = done.iter().map(|done| done.key.name.as_str()).collect();
+        let mut names: Vec<String> = done
+            .iter()
+            .filter_map(|done| match done {
+                Done::Thumb { key, .. } => Some(key.name.clone()),
+                Done::Develop { .. } => None,
+            })
+            .collect();
         names.sort_unstable();
         assert_eq!(names, ["a.NEF", "b.NEF"]);
         // The roll is not there, so neither could be made; each was said.
-        assert!(done.iter().all(|done| done.image.is_none()));
+        assert!(done
+            .iter()
+            .all(|done| matches!(done, Done::Thumb { image: None, .. })));
+        assert_eq!(pool.outstanding().unwrap(), 0);
+    }
+
+    #[test]
+    fn the_pool_runs_the_develop_and_keeps_it_outstanding() {
+        let pool = Pool::start(2).unwrap();
+        assert_eq!(pool.want(Vec::new(), Some(preview("x.NEF"))).unwrap(), 1);
+        let mut got = false;
+        for _ in 0..2000 {
+            for done in pool.collect().unwrap() {
+                if let Done::Develop { preview, image } = done {
+                    assert_eq!(preview.name, "x.NEF");
+                    // The roll is not there, so it could not be made.
+                    assert!(image.is_none());
+                    got = true;
+                }
+            }
+            if got {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(got, "no develop result");
         assert_eq!(pool.outstanding().unwrap(), 0);
     }
 }

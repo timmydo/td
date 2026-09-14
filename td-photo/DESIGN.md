@@ -548,7 +548,10 @@ level 2 from level 1 (tens of milliseconds across the pool) and then level
 pointer settles for one frame, so the drag never waits. Resizing the
 window recomputes level 2. Switching photo recomputes level 1 from the
 cached level 0 and prefetches the next two and previous one level-0 frames
-in the background. Level 1 is superpixel (each 2x2 CFA quad becomes one RGB
+in the background. The window holds these levels and this memoization from
+the second slice of increment 5(d); the first slice develops the preview
+correctly but reruns the whole pipeline on each edit. Level 1 is superpixel
+(each 2x2 CFA quad becomes one RGB
 pixel: exact colour, no interpolation, a quarter of the samples), which is
 the right demosaic for every on-screen size below half resolution; export
 and the 100% loupe (a later increment) run a full-resolution demosaic in
@@ -675,14 +678,17 @@ holds, at least one of each, so a surface too small for a cell clips one rather
 than shows none, and the grid scrolls by rows, keeping the cursor's row shown.
 The single view shows the name, the facts and the largest 3:2 box under them;
 develop mode shows the same view of the cursor's photo, its status marked
-`develop`. A
+`develop`, with the developed preview blitted into that box once it is made.
+The box geometry (`Layout::preview_box`) is one function the scene, the window
+and `--preview` share, so the placeholder and the image land in one place. A
 press on a bar header sets the filter, on a cell selects it, and in the single
 view anywhere in the area between the bands returns to the grid; the status row,
 and anything off the surface, is not a target, and the bands are hit-tested last
 painted first, so on a surface too short for both the status row covers the
 bar's headers as it covers their pixels. A box whose thumbnail is not held is a
-neutral placeholder, which is what `frame` digests either way; the single view's
-box stays one until the developed-preview slice.
+neutral placeholder, which is what `frame` digests either way; the develop box
+holds the developed preview once it is made, and the cull single view's box
+stays a placeholder.
 
 `td-photo open [ROLL] [--control-socket PATH]` runs the window (`window`), a
 `td_ui::client::App` in the shape td-setup's is, and one adapter over the same
@@ -706,8 +712,10 @@ generation is submitted once. When a second consumer needs an image primitive it
 is promoted into `td_ui::raster` with a pixel oracle; until then the blitter is
 this crate's, in `ui` where its pixel oracle is, and the confinement test pins
 that the window writes frame bytes through nothing else. `td-photo --preview WxH
-[ROLL]` is the same frame without a display, its thumbnails made on the calling
-thread: the oracle the native test holds a capture to.
+[ROLL] [--develop [POSITION]]` is the same frame without a display, its
+thumbnails and, with `--develop`, the developed preview of the photo at
+`POSITION` (the cursor's, the first, by default) made on the calling thread:
+the oracle the native test holds a capture to.
 
 Performance contract: no decode or resample runs on the turn loop's thread. The
 roll's listing and its sidecars' reads and writes do, as they do in the replay,
@@ -729,11 +737,14 @@ thumbnail is not ready paints a neutral placeholder and its name, never blocks.
   (`develop::MAX_THREADS`), started at window open and joined at close, over one
   queue the turn loop replaces under its lock whenever the model's generation
   moves, so a request the model no longer wants is dropped before it starts;
-  jobs are `Thumbnail` now, and `Preview`, `RawDecode`, `Level1` and `Export` in
-  their increments. A job stays outstanding, in the pool's running set, until
-  the turn loop collects its result, so the job count never reads zero with a
-  thumbnail made and not yet held. A finished thumbnail is kept whichever wants
-  asked for it, since it is the file's; the later jobs' results the turn loop
+  jobs are `Thumbnail` and `Preview` now — the develop preview, at most one at a
+  time, which runs the whole pipeline until the memoization slice splits it into
+  `RawDecode`, `Level1` and `Level2` — with `Export` in its increment. A job
+  stays outstanding — a thumbnail in the running set, the develop in its
+  in-flight slot — until the turn loop collects its result, so the job count
+  never reads zero with a result made and not yet held. A finished thumbnail is
+  kept whichever wants asked for it, since it is the file's; the later jobs'
+  results the turn loop
   compares before applying. Thumbnails are held in memory by name for the roll
   that is open at the surface's scale (a job is keyed by roll, name and scale,
   so another roll's file of the same name is another thumbnail; the held set is
@@ -741,9 +752,10 @@ thumbnail is not ready paints a neutral placeholder and its name, never blocks.
   not be made charged its name and slot alone, the least recently shown that is
   not on screen evicted first; an eviction recomputes the wants, so a thumbnail
   let go while still wanted off screen is asked for again.
-- At most one `RawDecode` runs at a time (the codec is sequential); demosaic
-  and resampling split rows into bands on one shared queue that the calling
-  thread and its scoped helper threads drain together, so no thread
+- At most one develop, and so one raw decode, runs at a time (the codec is
+  sequential): the pool hands a worker the develop only when none is in flight.
+  Demosaic and resampling split rows into bands on one shared queue that the
+  calling thread and its scoped helper threads drain together, so no thread
   outlives the call and a band count that exceeds the threads is shared out.
 - Budgets are named constants the tests pin: `RAW_CACHE_BYTES` 512 MiB,
   `THUMB_CACHE_BYTES` 256 MiB in memory, `MAX_FILE_BYTES` 512 MiB,
@@ -899,7 +911,8 @@ short for a cell where only the area's clip keeps them off the status band, and
 the in-memory shrink by the thumbnail rule), `wait-idle` over the replay idle at
 once with its argument
 judged, `--preview` equal to the seam's frame of the empty window and of a roll
-and refused for a bad size or roll, and `open` refusing a bad socket path, a
+and refused for a bad size or roll, `develop_box` the preview box only in
+develop mode, and `open` refusing a bad socket path, a
 second roll or a stray flag before it looks for a display and leaving no socket
 behind when the display is not there; `src/window.rs`'s own tests hold
 `wait_ms`'s grammar, the envelope's ID, the charge of a held entry, the queue's
@@ -915,7 +928,11 @@ the second cell and `End` from the seat each moving the cursor (repeated until
 one lands, each the same cell however many land; the pointer then parked in the
 desktop bar, since the seat draws the client's cursor over the tile), `first`
 over the socket restoring the frame, and `quit` closing the window with its
-socket gone.
+socket gone. A second native case, on a synthesized decodable NEF, develops
+the cursor photo over the socket and holds the captured tile to `--preview
+--develop` of the roll before and after an exposure edit; a headless case (no
+compositor) holds `--preview --develop` to a develop box that carries a
+developed image and changes with the sidecar's exposure.
 
 The builder discovers the crate by existing; its gate runs `cargo test` and
 all-target Clippy.
@@ -952,11 +969,17 @@ all-target Clippy.
    2 (the `u16` level 1 resampled to the canvas directly, then oriented,
    the one `f32` buffer) and level 3 (the per-pixel tail), and
    `RAW_CACHE_BYTES`, with `render` their composition. Landed. (d) The
-   developed preview in the develop view over the window: the level
-   memoization and the level-0 cache, the preview job off the turn thread,
-   `--preview` of a developed frame and the native test. (e) The crop
-   applied to level 2 (the crop of level 1) in the preview and the headless
-   verb, the crop drag contract, and the look list overlay.
+   developed preview in the develop view over the window, in two slices.
+   First: the developed preview blitted into the develop box from a
+   `Preview` pool job off the turn thread, the develop box geometry shared
+   by the scene, the window and `--preview`, `--preview --develop` of a
+   developed frame and the native test; this slice re-develops from the raw
+   on each edit, correct but not yet incremental. Landed. Second: the level
+   memoization and the level-0 cache, so an exposure or look edit reruns
+   level 3 alone, a crop or resize level 2, and a photo switch level 1 from
+   the cached level 0. (e) The crop applied to level 2 (the crop of level 1)
+   in the preview and the headless verb, the crop drag contract, and the
+   look list overlay.
 6. Export: banded full-resolution bilinear demosaic, the JPEG encoder,
    `exported/` naming, and `td-photo export`; and `delete-rejected`, the
    action and its verb that move rejects and their sidecars into

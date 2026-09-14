@@ -599,6 +599,35 @@ impl Layout {
         }
         Some((first_row + row) * self.columns + column)
     }
+
+    /// The single and develop view's preview box: the largest 3:2 rectangle
+    /// under the name and facts rows, centred in the area's width, or `None`
+    /// when the area leaves no room for one. The scene fills it with a
+    /// placeholder; the window and `--preview` blit the developed image into
+    /// it in develop mode, so all three agree on where the pixels go.
+    pub fn preview_box(&self) -> Option<Rect> {
+        let s = self.surface.scale.value();
+        let pad = (CELL_PAD * s) as i64;
+        let row = (CELL_HEIGHT * s) as i64;
+        let text_x = self.area.x + pad;
+        let text_w = (i64::from(self.area.width) - 2 * pad).max(0);
+        // The two text rows sit at `pad/2`, then `row`, then `row`; the box
+        // opens `pad/2` below them and closes `pad` above the area's foot.
+        let top = self.area.y + pad / 2 + 2 * row + pad / 2;
+        let bottom = self.area.y + i64::from(self.area.height) - pad;
+        let available_h = (bottom - top).max(0);
+        let width = text_w.min(available_h * 3 / 2);
+        let height = width * 2 / 3;
+        if width <= 0 || height <= 0 {
+            return None;
+        }
+        Some(Rect {
+            x: text_x + (text_w - width) / 2,
+            y: top,
+            width: width as u32,
+            height: height as u32,
+        })
+    }
 }
 
 /// The cull model and its dispatcher.
@@ -784,6 +813,17 @@ impl Controller {
 
     pub fn layout(&self) -> Layout {
         Layout::new(self.surface)
+    }
+
+    /// The develop preview's box: the layout's preview box when developing a
+    /// photo under the cursor, else `None`. The window and `--preview` blit
+    /// the developed image here; the cull single view keeps the placeholder,
+    /// so this is `Some` only in develop mode.
+    pub fn develop_box(&self) -> Option<Rect> {
+        if self.mode != Mode::Develop || self.cursor.is_none() {
+            return None;
+        }
+        self.layout().preview_box()
     }
 
     /// The shown photos on screen and the boxes their thumbnails go in, in
@@ -1585,25 +1625,11 @@ impl Scene<'_> {
             damage,
             sink,
         );
-        // The preview's place: the largest 3:2 box under the two rows.
-        let top = second.y + row + pad / 2;
-        let bottom = layout.area.y + i64::from(layout.area.height) - pad;
-        let available_h = (bottom - top).max(0);
-        let available_w = i64::from(text.width);
-        let width = available_w.min(available_h * 3 / 2);
-        let height = width * 2 / 3;
-        if width > 0 && height > 0 {
-            fill(
-                Rect {
-                    x: text.x + (available_w - width) / 2,
-                    y: top,
-                    width: width as u32,
-                    height: height as u32,
-                },
-                PLACEHOLDER,
-                damage,
-                sink,
-            );
+        // The preview's place: the largest 3:2 box under the two rows, the
+        // same rectangle the window and `--preview` blit the developed image
+        // into, so the placeholder and the image share one geometry.
+        if let Some(r#box) = layout.preview_box() {
+            fill(r#box, PLACEHOLDER, damage, sink);
         }
     }
 }

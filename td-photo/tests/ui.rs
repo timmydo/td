@@ -2044,3 +2044,30 @@ fn the_binary_waits_previews_and_refuses_a_bad_socket() {
     assert!(!output.stderr.is_empty());
     assert!(!socket.exists(), "the socket was left behind");
 }
+
+#[test]
+fn the_develop_box_is_the_preview_box_only_in_develop_mode() {
+    let mut c = Controller::new(surface(800, 600));
+    // No box before a roll, nor in the cull grid or single view: the develop
+    // box is the window's and preview's blit target, only while developing.
+    assert_eq!(c.develop_box(), None);
+    c.open("roll", b"/r", photos(5)).unwrap();
+    assert_eq!(c.develop_box(), None);
+    assert_eq!(act(&mut c, "view", &[]), Outcome::Changed);
+    assert_eq!(c.view(), View::Single);
+    assert_eq!(c.develop_box(), None);
+    assert_eq!(act(&mut c, "grid", &[]), Outcome::Changed);
+
+    // In develop mode it is the layout's preview box, the same rectangle the
+    // scene fills with a placeholder.
+    assert_eq!(act(&mut c, "develop", &[]), Outcome::Changed);
+    assert_eq!(c.develop_box(), c.layout().preview_box());
+    assert!(c.develop_box().is_some());
+
+    // A surface too small for a box has none, even in develop mode.
+    let mut small = Controller::new(surface(400, 40));
+    small.open("roll", b"/r", photos(1)).unwrap();
+    assert_eq!(act(&mut small, "develop", &[]), Outcome::Changed);
+    assert_eq!(small.layout().preview_box(), None);
+    assert_eq!(small.develop_box(), None);
+}

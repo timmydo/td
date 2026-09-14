@@ -632,3 +632,121 @@ fn the_window_presents_the_roll_and_answers_the_socket_over_the_native_composito
     assert!(!socket.exists(), "the control socket was left behind");
     compositor.stop();
 }
+
+#[test]
+#[ignore = "ready supplies the disposable native compositor"]
+fn the_window_develops_the_cursor_photo_over_the_native_compositor() {
+    let compositor_directory = Directory::new();
+    let mut compositor = Compositor::start(&compositor_directory);
+    let client_directory = Directory::new();
+    // One decodable synthetic NEF, a gradient so the developed frame is not
+    // uniform, so the develop box carries an image the placeholder is not.
+    let roll = client_directory.0.join("roll");
+    std::fs::create_dir(&roll).unwrap();
+    let (w, h) = (64usize, 48usize);
+    let samples: Vec<u16> = (0..w * h).map(|i| 1008 + (i as u16 % 4000)).collect();
+    std::fs::write(
+        roll.join("DSC_0001.NEF"),
+        super::synth_nef::uncompressed_nef(w, h, &samples),
+    )
+    .unwrap();
+    let client = PhotoProcess::start(
+        &client_directory,
+        &compositor.directory.join("wayland-0"),
+        &roll,
+    );
+
+    // Wait for the client to bind, set its app id, and map its one toplevel.
+    let deadline = Instant::now() + TIMEOUT;
+    let place = loop {
+        if let Some(place) = compositor.placement("td-photo") {
+            break place;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "td-photo window never mapped; client stderr: {}",
+            client.stderr()
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    };
+
+    // Develop over the socket: the cursor photo is developed into the box.
+    // Idle means the developed frame is on screen, and the captured tile
+    // equals the crate's own developed preview of that photo at that size.
+    // The pointer is never injected, so the client's cursor is not over the
+    // tile as it was not in the cull case's first capture.
+    assert_eq!(client.request(1, &["action", "develop"]), ["ok", "changed"]);
+    client.settle(2);
+    let state = client.request(3, &["state"]);
+    assert_eq!(&state[..2], ["ok", "develop"], "{state:?}");
+    let layout = td_photo::ui::Layout::new(
+        Surface::new(place.width, place.height, Scale::default()).unwrap(),
+    );
+    let r#box = layout.preview_box().expect("a develop box on the tile");
+    let developed = super::preview_develop(&client_directory, place.width, place.height, &roll, 0);
+    assert!(
+        super::varies(&developed, place.width, r#box),
+        "the develop box carries no developed image"
+    );
+    assert_eq!(compositor.tile(&place), developed, "the developed frame");
+
+    // An exposure edit over the socket re-develops: the frame changes and is
+    // the developed preview of the roll as its sidecar now is.
+    assert_eq!(
+        client.request(4, &["action", "expose-in"]),
+        ["ok", "changed"]
+    );
+    client.settle(5);
+    assert_eq!(
+        std::fs::read_to_string(roll.join("DSC_0001.NEF.edit")).unwrap(),
+        "td-photo edit 1\nexposure 0.33\n"
+    );
+    let brighter = super::preview_develop(&client_directory, place.width, place.height, &roll, 0);
+    // The develop box itself changes, not merely the facts line's exposure
+    // text, so the exposure reached the developed pixels.
+    assert_ne!(
+        super::box_pixels(&developed, place.width, r#box),
+        super::box_pixels(&brighter, place.width, r#box),
+        "the exposure did not reach the developed pixels"
+    );
+    assert_eq!(
+        compositor.tile(&place),
+        brighter,
+        "the developed frame after the exposure"
+    );
+
+    // A look the sidecar names but no file provides makes the develop for the
+    // same photo fail: the box is redrawn to the neutral placeholder, not left
+    // showing the last exposure's pixels, and `wait-idle` still settles.
+    // Without a redraw on a failed develop the box would keep the stale image
+    // and idle would be reported over it; the frame equals `--preview
+    // --develop` of the roll as its sidecar now is.
+    assert_eq!(
+        client.request(6, &["action", "look", "no-such-look"]),
+        ["ok", "changed"]
+    );
+    client.settle(7);
+    let placeholder =
+        super::preview_develop(&client_directory, place.width, place.height, &roll, 0);
+    assert!(
+        !super::varies(&placeholder, place.width, r#box),
+        "the develop box is not a placeholder after a failed develop"
+    );
+    assert_ne!(
+        super::box_pixels(&brighter, place.width, r#box),
+        super::box_pixels(&placeholder, place.width, r#box),
+        "the box still shows the last developed pixels after a failed develop"
+    );
+    assert_eq!(
+        compositor.tile(&place),
+        placeholder,
+        "the placeholder frame after a failed develop"
+    );
+
+    // `quit` closes the window, which exits well and takes its socket away.
+    assert_eq!(client.request(8, &["action", "quit"]), ["ok", "quit"]);
+    let socket = client.socket.clone();
+    assert!(client.finish(), "td-photo exited with a failure");
+    assert!(!socket.exists(), "the control socket was left behind");
+    compositor.stop();
+}

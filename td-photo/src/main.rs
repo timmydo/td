@@ -495,6 +495,47 @@ fn develop_file(path: &Path, out: &Path, rest: &[OsString]) -> Result<(), String
     refuse_existing(out)?;
     let threads = threads();
     let started = Instant::now();
+    let (image, info) = develop_raw(path, long_edge, exposure, look.as_ref(), threads)?;
+    write_atomically(out, &image)?;
+    writeln!(
+        io::stdout().lock(),
+        "developed {}x{} -> {}x{} into {} ({} corrupt samples; decode {} ms, total {} ms)",
+        info.raw_width,
+        info.raw_height,
+        image.width,
+        image.height,
+        out.display(),
+        info.corrupt,
+        info.decode_ms,
+        started.elapsed().as_millis()
+    )
+    .map_err(|e| e.to_string())
+}
+
+/// What `develop_raw` reports beside the developed frame: the raw
+/// sub-image's size, the corrupt-sample count the decoder tolerated, and the
+/// decode time (which the read and parse before it are folded into, as the
+/// verb has always reported it).
+struct DevelopInfo {
+    raw_width: usize,
+    raw_height: usize,
+    corrupt: usize,
+    decode_ms: u128,
+}
+
+/// The raw develop the `develop` verb and the window's preview share: a
+/// file's raw sub-image parsed, decoded, demosaiced and rendered to an sRGB
+/// `Rgb8` fitting `long_edge`, at `exposure` stops with `look` when one is
+/// given. The white balance is the maker note's when present, else the
+/// camera's daylight estimate. No file is written here; the caller decides.
+fn develop_raw(
+    path: &Path,
+    long_edge: usize,
+    exposure: f32,
+    look: Option<&Look>,
+    threads: usize,
+) -> Result<(Rgb8, DevelopInfo), String> {
+    let started = Instant::now();
     let data = read_file(path)?;
     let nef = nef::parse(&data).map_err(|e| format!("{}: {e}", path.display()))?;
     let camera = camera::find(&nef.make, &nef.model).ok_or_else(|| {
@@ -507,7 +548,7 @@ fn develop_file(path: &Path, out: &Path, rest: &[OsString]) -> Result<(), String
     })?;
     let color = camera_color(&camera.xyz_to_cam).map_err(|e| e.to_string())?;
     let decoded = nef::decode(&nef, &data).map_err(|e| format!("{}: {e}", path.display()))?;
-    let decoded_at = started.elapsed().as_millis();
+    let decode_ms = started.elapsed().as_millis();
     let black = nef.maker.black.unwrap_or(camera.black);
     let level1 = develop::superpixel(
         &decoded,
@@ -532,24 +573,63 @@ fn develop_file(path: &Path, out: &Path, rest: &[OsString]) -> Result<(), String
         &Params {
             exposure,
             threads,
-            look: look.as_ref(),
+            look,
         },
     )
     .map_err(|e| e.to_string())?;
-    write_atomically(out, &image)?;
-    writeln!(
-        io::stdout().lock(),
-        "developed {}x{} -> {}x{} into {} ({} corrupt samples; decode {} ms, total {} ms)",
-        nef.raw.width,
-        nef.raw.height,
-        image.width,
-        image.height,
-        out.display(),
-        decoded.corrupt,
-        decoded_at,
-        started.elapsed().as_millis()
-    )
-    .map_err(|e| e.to_string())
+    Ok((
+        image,
+        DevelopInfo {
+            raw_width: nef.raw.width,
+            raw_height: nef.raw.height,
+            corrupt: decoded.corrupt,
+            decode_ms,
+        },
+    ))
+}
+
+/// The developed preview the window blits into its box and `--preview`
+/// reproduces: the file at `roll/name` developed to fit `box_w` by `box_h`
+/// at the sidecar's `exposure` (hundredths of a stop) and `look` stem, or
+/// `None` (a note on stderr) when it cannot be made, so the box keeps its
+/// placeholder as a grid box does for a thumbnail that cannot be made. The
+/// look stem is resolved here, off the turn loop's thread. Mirrors the
+/// thumbnail rule: developed at the box's long edge, then shrunk to the box
+/// for a shape taller than it. Crop is not applied yet (increment 5(d)(e)).
+fn develop_preview(
+    roll: &Path,
+    name: &str,
+    box_w: usize,
+    box_h: usize,
+    exposure: i32,
+    look: Option<&str>,
+    threads: usize,
+) -> Option<Rgb8> {
+    let path = roll.join(name);
+    let look = match look {
+        Some(stem) => match find_look(stem) {
+            Ok(look) => Some(look),
+            Err(why) => {
+                note(&why);
+                return None;
+            }
+        },
+        None => None,
+    };
+    let long_edge = box_w.max(box_h);
+    let stops = exposure as f32 / 100.0;
+    let made =
+        develop_raw(&path, long_edge, stops, look.as_ref(), threads).and_then(|(image, _)| {
+            develop::shrink(image, box_w, box_h, threads)
+                .map_err(|e| format!("{}: {e}", path.display()))
+        });
+    match made {
+        Ok(image) => Some(image),
+        Err(why) => {
+            note(&why);
+            None
+        }
+    }
 }
 
 /// The never-overwrite rule, checked by name: anything at `out` (a file, a

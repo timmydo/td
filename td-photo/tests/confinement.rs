@@ -64,7 +64,10 @@ fn source_inventory_is_closed() {
     .map(|s| s.to_string())
     .collect();
     assert_eq!(names("tests", "rs"), tests);
-    let support: BTreeSet<String> = ["native_compositor.rs".to_string()].into_iter().collect();
+    let support: BTreeSet<String> = ["native_compositor.rs", "synth_nef.rs"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
     assert_eq!(names("tests/support", "rs"), support);
     let fixtures: BTreeSet<String> = [
         "README.md",
