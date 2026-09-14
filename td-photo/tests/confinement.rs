@@ -31,6 +31,7 @@ const PURE: &[&str] = &[
     "color.rs",
     "develop.rs",
     "image.rs",
+    "jpeg.rs",
     "nef.rs",
     "tiff.rs",
 ];
@@ -44,15 +45,21 @@ fn source_inventory_is_closed() {
         .map(|s| s.to_string())
         .collect();
     assert_eq!(names("src", "rs"), expected);
-    let tests: BTreeSet<String> = ["confinement.rs", "develop.rs", "nef.rs"]
+    let tests: BTreeSet<String> = ["confinement.rs", "develop.rs", "jpeg.rs", "nef.rs"]
         .iter()
         .map(|s| s.to_string())
         .collect();
     assert_eq!(names("tests", "rs"), tests);
-    let fixtures: BTreeSet<String> = ["README.md", "nikon_ref.py", "z8-rows.bin"]
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
+    let fixtures: BTreeSet<String> = [
+        "README.md",
+        "jpeg_ref.py",
+        "nikon_ref.py",
+        "z8-rows.bin",
+        "z8-thumb.jpg",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
     let actual: BTreeSet<String> = std::fs::read_dir(root().join("tests/fixtures"))
         .unwrap()
         .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
@@ -167,6 +174,21 @@ fn budgets_are_the_documented_values() {
     assert_eq!(td_photo::image::MAX_AXIS, td_photo::nef::MAX_AXIS);
     assert_eq!(td_photo::image::MAX_IMAGE_PIXELS, 64 << 20);
     assert_eq!(td_photo::nef::MAX_RANGE, 32768);
+    assert_eq!(td_photo::jpeg::MAX_PREVIEW_SAMPLES, 128 << 20);
+    assert_eq!(td_photo::jpeg::MAX_TABLE_DEFINITIONS, 32);
+    // The cache unlinks only names of its own shape inside directories of
+    // its own, never a tree; fills go through per-process temporaries; a
+    // thumbnail is turned like a development.
+    let main = read("src/main.rs");
+    assert!(main.contains("fn is_cache_name("));
+    assert!(main.contains("if !is_cache_name(name)"));
+    assert!(!main.contains("remove_dir"), "a directory removal");
+    assert!(main.contains("fn own_dir("));
+    assert!(main.contains("XDG_CACHE_HOME"));
+    assert!(main.contains(".take(MAX_THUMB_FILE_BYTES + 1)"));
+    assert!(main.contains("fn write_via("));
+    assert!(main.contains(".ppm.{}.tmp\", std::process::id()"));
+    assert!(main.contains("develop::orient(image, nef.orientation)"));
     assert_eq!(td_photo::nef::MAX_RAW_SAMPLES, 128 << 20);
     assert_eq!(td_photo::nef::MAX_SUB_IFDS, 16);
     assert_eq!(td_photo::develop::MAX_THREADS, 16);
@@ -189,4 +211,21 @@ fn the_fixture_is_the_documented_slice() {
     assert!(readme.contains("0x44df96cc9a8684a0"));
     assert!(readme.contains("0xe09ae870943b71be"));
     assert!(readme.contains("18192"));
+    let thumb = std::fs::read(root().join("tests/fixtures/z8-thumb.jpg")).unwrap();
+    assert_eq!(thumb.len(), 13063);
+    assert!(thumb.starts_with(&[0xFF, 0xD8]) && thumb.ends_with(&[0xFF, 0xD9]));
+    for hash in [
+        "0x4012c2335efb6bfa",
+        "0x15cf1df123ee575d",
+        "0x164a0dbefb89395d",
+        "0x7c9a6f6b601504ab",
+        "0x8e6c3e050993ae30",
+    ] {
+        assert!(readme.contains(hash), "README lacks {hash}");
+    }
+    // The oracle's contract is stated where the constants live.
+    let jpeg = read("src/jpeg.rs");
+    assert!(jpeg.contains("floor(v + 128 + 0.5)"));
+    assert!(jpeg.contains("1.402") && jpeg.contains("0.344136") && jpeg.contains("0.714136"));
+    assert!(jpeg.contains("1.772"));
 }

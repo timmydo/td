@@ -339,6 +339,9 @@ struct Synth {
     /// Added to every strip offset the file declares, to point past it.
     strip_shift: u32,
     previews: bool,
+    /// The bytes of the good preview: a bare SOI/EOI pair unless a test
+    /// wants a decodable one.
+    preview_bytes: Vec<u8>,
     exif: bool,
 }
 
@@ -375,6 +378,7 @@ impl Synth {
             strip_count: 1,
             strip_shift: 0,
             previews: true,
+            preview_bytes: vec![0xff, 0xd8, 0xff, 0xd9],
             exif: true,
         }
     }
@@ -382,7 +386,7 @@ impl Synth {
     fn build(&self) -> Vec<u8> {
         let mut b = Builder::new();
         let strip = b.blob(&self.strip);
-        let preview = b.blob(&[0xff, 0xd8, 0xff, 0xd9]);
+        let preview = b.blob(&self.preview_bytes);
         let bad_preview = b.blob(&[0x00, 0x00, 0x00, 0x00]);
         // The maker note: its own little TIFF behind the ten-byte prefix, in
         // its own byte order.
@@ -442,7 +446,10 @@ impl Synth {
         let mut small_entries = vec![(tag::NEW_SUBFILE_TYPE, Value::Long(vec![1]))];
         if self.previews {
             small_entries.push((tag::JPEG_OFFSET, Value::Long(vec![preview])));
-            small_entries.push((tag::JPEG_LENGTH, Value::Long(vec![4])));
+            small_entries.push((
+                tag::JPEG_LENGTH,
+                Value::Long(vec![self.preview_bytes.len() as u32]),
+            ));
         }
         let small = b.ifd(&small_entries);
         let mut ifd0 = vec![
@@ -1553,5 +1560,296 @@ fn the_command_line_probes_and_develops_without_overwriting() {
     let (ok, _, stderr) = run(&[OsStr::new("probe"), out.as_os_str()]);
     assert!(!ok);
     assert!(stderr.contains("not a TIFF"), "{stderr}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// FNV-1a over bytes as they lie, for PPM payloads.
+fn fnv1a64_bytes(bytes: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for b in bytes {
+        hash ^= u64::from(*b);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
+fn run_env(args: &[&std::ffi::OsStr], env: &[(&str, &std::ffi::OsStr)]) -> (bool, String, String) {
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_td-photo"));
+    command.args(args);
+    for (k, v) in env {
+        command.env(k, v);
+    }
+    let out = command.output().unwrap();
+    (
+        out.status.success(),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+#[test]
+fn the_thumb_verb_and_the_cache_follow_the_rules() {
+    use std::ffi::OsStr;
+    let dir = scratch("thumb");
+    let (w, h) = (16, 8);
+    let samples = random_frame(w, h, 14, 88);
+    let jpeg =
+        std::fs::read(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/z8-thumb.jpg"))
+            .unwrap();
+    let mut synth = Synth::lossless(w, h, &samples);
+    synth.preview_bytes = jpeg.clone();
+    let file = dir.join("DSC_0007.NEF");
+    std::fs::write(&file, synth.build()).unwrap();
+
+    // Probe names the preview's geometry, and its hash under --decode.
+    let (ok, stdout, _) = run(&[OsStr::new("probe"), file.as_os_str()]);
+    assert!(ok);
+    assert!(
+        stdout.contains(" 160x120 3 component(s) sampling 2x1\n"),
+        "{stdout}"
+    );
+    let (ok, stdout, _) = run(&[
+        OsStr::new("probe"),
+        file.as_os_str(),
+        OsStr::new("--decode"),
+    ]);
+    assert!(ok);
+    assert!(
+        stdout.contains("preview-decode: 0 160x120 fnv1a64 0x15cf1df123ee575d"),
+        "{stdout}"
+    );
+
+    // The default long edge is 400; a 160x120 preview is never enlarged.
+    let out = dir.join("t400.ppm");
+    let (ok, stdout, stderr) = run(&[OsStr::new("thumb"), file.as_os_str(), out.as_os_str()]);
+    assert!(ok, "{stderr}");
+    assert!(
+        stdout.contains("thumbnail 160x120 from preview 0 (160x120)"),
+        "{stdout}"
+    );
+    let full = std::fs::read(&out).unwrap();
+    assert!(full.starts_with(b"P6\n160 120\n255\n"));
+    assert_eq!(
+        fnv1a64_bytes(&full["P6\n160 120\n255\n".len()..]),
+        0x15cf1df123ee575d
+    );
+    // 40 is exactly the quarter scale; 50 is the half scale resampled.
+    let out40 = dir.join("t40.ppm");
+    let (ok, stdout, _) = run(&[
+        OsStr::new("thumb"),
+        file.as_os_str(),
+        out40.as_os_str(),
+        OsStr::new("--long-edge"),
+        OsStr::new("40"),
+    ]);
+    assert!(ok);
+    assert!(
+        stdout.contains("thumbnail 40x30 from preview 0"),
+        "{stdout}"
+    );
+    let quarter = std::fs::read(&out40).unwrap();
+    assert_eq!(
+        fnv1a64_bytes(&quarter["P6\n40 30\n255\n".len()..]),
+        0x7c9a6f6b601504ab
+    );
+    let out50 = dir.join("t50.ppm");
+    let (ok, stdout, _) = run(&[
+        OsStr::new("thumb"),
+        file.as_os_str(),
+        out50.as_os_str(),
+        OsStr::new("--long-edge"),
+        OsStr::new("50"),
+    ]);
+    assert!(ok);
+    assert!(
+        stdout.contains("thumbnail 50x38 from preview 0"),
+        "{stdout}"
+    );
+
+    // The cache: a miss fills it, a hit answers from it byte for byte,
+    // and clear removes exactly the entries.
+    let cache = dir.join("cache");
+    let env = [("XDG_CACHE_HOME", cache.as_os_str())];
+    let c1 = dir.join("c1.ppm");
+    let (ok, stdout, stderr) = run_env(
+        &[
+            OsStr::new("thumb"),
+            file.as_os_str(),
+            c1.as_os_str(),
+            OsStr::new("--cache"),
+        ],
+        &env,
+    );
+    assert!(ok, "{stderr}");
+    assert!(stdout.contains("from preview 0"), "{stdout}");
+    let thumbs = cache.join("td-photo").join("thumbs");
+    let entries: Vec<String> = std::fs::read_dir(&thumbs)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(entries.len(), 1, "{entries:?}");
+    assert!(
+        entries[0].ends_with("-400.ppm") && entries[0].len() == 16 + 8,
+        "{entries:?}"
+    );
+    let c2 = dir.join("c2.ppm");
+    let (ok, stdout, _) = run_env(
+        &[
+            OsStr::new("thumb"),
+            file.as_os_str(),
+            c2.as_os_str(),
+            OsStr::new("--cache"),
+        ],
+        &env,
+    );
+    assert!(ok);
+    assert!(stdout.contains("(cached;"), "{stdout}");
+    assert_eq!(std::fs::read(&c1).unwrap(), std::fs::read(&c2).unwrap());
+    assert_eq!(std::fs::read(&c1).unwrap(), full);
+    // A malformed entry, or a well-formed one past the asked edge, is a
+    // miss served from the file, never a failure, and the entry is
+    // unlinked and refilled; a stale temporary blocks nothing.
+    let mut oversize = b"P6\n401 1\n255\n".to_vec();
+    oversize.resize(oversize.len() + 401 * 3, 7);
+    let stale = thumbs.join(format!("{}.12345.tmp", entries[0]));
+    std::fs::write(&stale, b"left by a killed process").unwrap();
+    for (n, corrupt) in [&b"P6\n1 1\n255\nxy"[..], &oversize[..]].iter().enumerate() {
+        std::fs::write(thumbs.join(&entries[0]), corrupt).unwrap();
+        let c3 = dir.join(format!("c3-{n}.ppm"));
+        let (ok, stdout, _) = run_env(
+            &[
+                OsStr::new("thumb"),
+                file.as_os_str(),
+                c3.as_os_str(),
+                OsStr::new("--cache"),
+            ],
+            &env,
+        );
+        assert!(ok);
+        assert!(stdout.contains("from preview 0"), "{stdout}");
+        assert_eq!(std::fs::read(thumbs.join(&entries[0])).unwrap(), full);
+        assert_eq!(std::fs::read(&c3).unwrap(), full);
+    }
+    assert!(stale.exists());
+    // A stray file in the directory is not ours to remove.
+    std::fs::write(thumbs.join("notes.txt"), b"keep").unwrap();
+    let (ok, stdout, _) = run_env(&[OsStr::new("cache"), OsStr::new("path")], &env);
+    assert!(ok);
+    assert_eq!(stdout.trim(), cache.join("td-photo").to_string_lossy());
+    let (ok, stdout, _) = run_env(&[OsStr::new("cache"), OsStr::new("clear")], &env);
+    assert!(ok);
+    assert!(stdout.starts_with("removed 2 thumbnails from"), "{stdout}");
+    assert!(thumbs.join("notes.txt").exists());
+    assert!(!thumbs.join(&entries[0]).exists());
+    assert!(!stale.exists());
+    let (ok, stdout, _) = run_env(&[OsStr::new("cache"), OsStr::new("clear")], &env);
+    assert!(ok);
+    assert!(stdout.starts_with("removed 0 thumbnails"), "{stdout}");
+    // Without a cache directory at all, clear is a no-op that says so.
+    let empty = dir.join("nowhere");
+    let (ok, stdout, _) = run_env(
+        &[OsStr::new("cache"), OsStr::new("clear")],
+        &[("XDG_CACHE_HOME", empty.as_os_str())],
+    );
+    assert!(ok);
+    assert!(stdout.starts_with("removed 0 thumbnails"), "{stdout}");
+    // A relative XDG_CACHE_HOME is ignored in favour of HOME.
+    let (ok, stdout, _) = run_env(
+        &[OsStr::new("cache"), OsStr::new("path")],
+        &[
+            ("XDG_CACHE_HOME", OsStr::new("relative/dir")),
+            ("HOME", dir.as_os_str()),
+        ],
+    );
+    assert!(ok);
+    assert_eq!(
+        stdout.trim(),
+        dir.join(".cache").join("td-photo").to_string_lossy()
+    );
+
+    // The cache's own directories must be real directories: a symlink
+    // in their place is refused by `clear` (nothing behind it is touched)
+    // and the thumbnail is still written, with a note, by `thumb`.
+    let elsewhere = dir.join("elsewhere");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    let theirs = elsewhere.join("0123456789abcdef-400.ppm");
+    std::fs::write(&theirs, b"not ours").unwrap();
+    std::fs::remove_dir_all(&thumbs).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, &thumbs).unwrap();
+    let (ok, _, stderr) = run_env(&[OsStr::new("cache"), OsStr::new("clear")], &env);
+    assert!(!ok);
+    assert!(
+        stderr.contains("not a directory of the cache's own"),
+        "{stderr}"
+    );
+    assert_eq!(std::fs::read(&theirs).unwrap(), b"not ours");
+    let c4 = dir.join("c4.ppm");
+    let (ok, stdout, stderr) = run_env(
+        &[
+            OsStr::new("thumb"),
+            file.as_os_str(),
+            c4.as_os_str(),
+            OsStr::new("--cache"),
+        ],
+        &env,
+    );
+    assert!(ok, "{stderr}");
+    assert!(stdout.contains("from preview 0"), "{stdout}");
+    assert!(
+        stderr.contains("td-photo: cache:") && stderr.contains("written without it"),
+        "{stderr}"
+    );
+    assert_eq!(std::fs::read(&c4).unwrap(), full);
+    assert_eq!(std::fs::read_dir(&elsewhere).unwrap().count(), 1);
+
+    // The thumbnail is turned the way the camera was held.
+    let mut turned = Synth::lossless(w, h, &samples);
+    turned.preview_bytes = jpeg.clone();
+    turned.orientation = 6;
+    let portrait = dir.join("DSC_0009.NEF");
+    std::fs::write(&portrait, turned.build()).unwrap();
+    let out6 = dir.join("t6.ppm");
+    let (ok, stdout, stderr) = run(&[OsStr::new("thumb"), portrait.as_os_str(), out6.as_os_str()]);
+    assert!(ok, "{stderr}");
+    assert!(
+        stdout.contains("thumbnail 120x160 from preview 0 (160x120)"),
+        "{stdout}"
+    );
+    let expected = td_photo::develop::orient(
+        td_photo::jpeg::decode(&jpeg, td_photo::jpeg::Scale::Full).unwrap(),
+        6,
+    );
+    let got = std::fs::read(&out6).unwrap();
+    assert_eq!(&got["P6\n120 160\n255\n".len()..], &expected.data[..]);
+
+    // Refusals.
+    let (ok, _, stderr) = run(&[OsStr::new("thumb"), file.as_os_str(), out.as_os_str()]);
+    assert!(!ok);
+    assert!(stderr.contains("already exists"), "{stderr}");
+    let (ok, _, stderr) = run(&[OsStr::new("thumb"), file.as_os_str()]);
+    assert!(!ok);
+    assert!(stderr.contains("thumb needs FILE and OUT.ppm"), "{stderr}");
+    let (ok, _, stderr) = run(&[OsStr::new("cache")]);
+    assert!(!ok);
+    assert!(stderr.contains("cache needs path or clear"), "{stderr}");
+    let (ok, _, stderr) = run(&[
+        OsStr::new("thumb"),
+        file.as_os_str(),
+        dir.join("x.ppm").as_os_str(),
+        OsStr::new("--long-edge"),
+        OsStr::new("8"),
+    ]);
+    assert!(!ok);
+    assert!(stderr.contains("16..=16384"), "{stderr}");
+    // A file whose previews are not baseline JPEG has no thumbnail.
+    let plain = dir.join("DSC_0008.NEF");
+    std::fs::write(&plain, Synth::lossless(w, h, &samples).build()).unwrap();
+    let (ok, _, stderr) = run(&[
+        OsStr::new("thumb"),
+        plain.as_os_str(),
+        dir.join("p.ppm").as_os_str(),
+    ]);
+    assert!(!ok);
+    assert!(stderr.contains("no baseline JPEG preview"), "{stderr}");
     let _ = std::fs::remove_dir_all(&dir);
 }

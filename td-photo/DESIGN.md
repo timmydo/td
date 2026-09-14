@@ -27,15 +27,18 @@ with the 14-bit lossless tree verified against a real Z 8 frame and the
 others against the test encoder only, the camera table with the Z 8's
 colour matrix (`camera`), the linear colour math and the sRGB transfer
 (`color`), the superpixel demosaic, area resampler and headless development
-pipeline (`develop`), the RGB image buffers and PPM writer (`image`), and
-the command line `td-photo probe FILE` and `td-photo develop FILE OUT.ppm`.
-Both verbs read the file through a read bounded by `MAX_FILE_BYTES` that
-does not trust the length the file system reported, and `develop` refuses
-an `OUT.ppm` (or `OUT.ppm.tmp`) that already exists rather than replace it,
-publishing the finished temporary by a hard link so a name that appeared
-meanwhile is not replaced either.
-No window, no sidecar, no import, no preview decoding and no look yet: the
-increments at the end schedule them in order. Nothing in this crate depends
+pipeline (`develop`), the RGB image buffers and PPM writer and reader
+(`image`), the baseline JPEG decoder for the embedded previews with its
+reduced-transform scaling (`jpeg`), the thumbnail rule and the thumbnail
+cache, and the command line `td-photo probe FILE`, `td-photo develop
+FILE OUT.ppm`, `td-photo thumb FILE OUT.ppm` and `td-photo cache`.
+Every verb reads the file through a read bounded by `MAX_FILE_BYTES` that
+does not trust the length the file system reported, and `develop` and
+`thumb` refuse an `OUT.ppm` (or `OUT.ppm.tmp`) that already exists rather
+than replace it, publishing the finished temporary by a hard link so a
+name that appeared meanwhile is not replaced either.
+No window, no sidecar, no import and no look yet: the increments at the
+end schedule them in order. Nothing in this crate depends
 on td-ui until the window increment adds the path dependency.
 
 The rules below define version 1; the increments identify the order of
@@ -184,10 +187,35 @@ The library is folders of originals; there is no database.
 - **Rejected** originals move, with their sidecars, into `rejected/`
   under the roll. Export writes into `exported/`. Neither folder is
   listed as part of the roll.
-- **Cache**: `$XDG_CACHE_HOME/td-photo` (`~/.cache/td-photo` without it),
-  holding `thumbs/` and nothing else in version 1. Every cache file is
-  disposable: `td-photo cache clear` removes the directory's contents and
-  nothing in the library changes.
+- **Cache**: `$XDG_CACHE_HOME/td-photo` when that variable is absolute
+  (`~/.cache/td-photo` otherwise), holding `thumbs/` and nothing else in
+  version 1. The base directory is the user's and may be a symlink;
+  `td-photo` and `thumbs` are the cache's own and must be real directories,
+  since `cache clear` unlinks inside them, so a symlink in either place is
+  refused rather than followed. A thumbnail is `thumbs/KEY-N.ppm`: `KEY` is
+  the FNV-1a-64 hex of the original's resolved path, byte length and
+  modification time, `N` the long edge, and the file is the PPM
+  `image::write_ppm` writes, published by the link rule through a temporary
+  named for the filling process (`KEY-N.ppm.PID.tmp`), so two processes
+  filling one entry never contend for a name and the first to publish wins.
+  The stamp is taken before the lookup and again from the open file after
+  the read, and an entry is stored only if the two agree, so the bytes
+  cached are the file the key describes (a stamp that differs or cannot be
+  taken stores nothing and says nothing: the next run keys the file as it
+  now is); an original edited or replaced, as far as length and modification
+  time tell, keys itself anew. Reading back accepts only a regular file of
+  that exact shape under 64 MiB with a long edge of at most `N`; a symlink,
+  directory or device in an entry's place is a miss and left alone, and an
+  entry of the right kind with the wrong content is unlinked so the miss
+  refills it. The cache is an optimisation: whatever it cannot do (a refused
+  directory, a full disk, a permission) is a note on stderr and the
+  thumbnail is still written from the original. `td-photo cache clear`
+  unlinks the entries and temporaries named that way (and only those) and
+  nothing in the library changes; `td-photo cache path` prints the directory
+  as the bytes it is. The windows between a check and the operation it
+  guards are those of any program without directory descriptors: the
+  directories are the user's own cache, and the only name ever unlinked is
+  one of the cache's own shape.
 - **Looks** are read from `$XDG_CONFIG_HOME/td-photo/looks/*.look`
   (`~/.config/td-photo/looks/` without it) on top of the built-in set the
   binary carries; a user look of the same stem shadows the built-in one.
@@ -279,16 +307,56 @@ anyone holding the file; the other trees round-trip through the test
 suite's encoder only, and the design says so until a frame from such a
 camera pins them.
 
-### Embedded previews (later increment)
+### Embedded previews (`jpeg`)
 
 The preview decoder is a baseline JPEG decoder: 8-bit, one or three
 components, horizontal and vertical sampling factors 1 or 2, Huffman DC/AC
-tables and restart intervals, at most 64 Mi samples, refusing progressive,
-arithmetic and 12-bit streams by name. It decodes at 1/1, 1/2, 1/4 or 1/8
-scale by a reduced inverse DCT, choosing the coarsest scale whose long edge
-still covers what was asked, then area-resamples to the exact target. A
-thumbnail is the medium preview at a long edge of exactly 400 pixels; the
-single-photo cull view is the medium preview at 1/1.
+tables and restart intervals, one interleaved scan, component planes of at
+most 128 Mi samples together with their block padding
+(`MAX_PREVIEW_SAMPLES`, what a decode allocates), axes within `MAX_AXIS`,
+pixels within `MAX_IMAGE_PIXELS` and at most 32 table definitions
+(`MAX_TABLE_DEFINITIONS`), refusing progressive, arithmetic, lossless,
+hierarchical (a DHP, EXP or DAC marker anywhere before the scan), 12-bit and
+multi-scan streams by name. SOF1 at 8 bits and 16-bit quantisers in an SOF0
+stream are read as baseline; a lone component's sampling factors are
+ignored, one block per MCU, as T.81 A.2.2 codes it and libjpeg reads it. It
+decodes at 1/1, 1/2, 1/4 or 1/8 scale by a reduced inverse DCT over the
+first N coefficients of each axis (`Scale::covering` picks the coarsest
+scale whose long edge still covers what was asked).
+
+Its arithmetic is a contract shared with `tests/fixtures/jpeg_ref.py`, an
+independent transcription of T.81, so a decode is held to the oracle's
+hash and not to a tolerance: the transform is separable `f64` over
+literal constants, rows then columns, sums in ascending frequency; a
+sample is `floor(v + 128 + 0.5)` clamped to 0..=255; chroma is replicated
+to the luma grid, not interpolated; and the JFIF constants (1.402,
+0.344136, 0.714136, 1.772) are applied with `floor(x + 0.5)`.
+
+It is strict where leniency would hide corruption, and the oracle refuses
+the same streams: a Huffman table with an over-full tree or a code of all
+ones (T.81 C.2, which is what tells padding from a symbol), a DC category
+past 11 or an AC size past 10, a DC predictor outside 16 bits, an AC
+symbol without magnitude other than EOB and ZRL, a run or a ZRL past the
+block, a scan that lists the frame's components out of order, a restart
+marker out of sequence or preceded by more than a byte's padding, and a
+scan followed by anything but EOI (a second scan, an unread byte,
+nothing) are each refused by name; what follows EOI is not read. A stream
+that ends early decodes to its end on zero bits and is reported as
+truncated after the MCU row it ran out in, so a cut file is an error and
+not a partial picture.
+
+The thumbnail rule: for a long edge N, take the smallest preview whose
+long edge covers N (else the largest), decode it at the coarsest covering
+scale, area-resample in the encoded domain to exactly N, never enlarging,
+and turn the result by the file's orientation as `develop` turns the raw,
+so a portrait frame is a portrait thumbnail. The cull grid asks for N =
+400, which on the Z 8 is the
+1620x1080 preview at 1/4 (405x270) resampled to 400x267 in 80 ms; the
+single-photo cull view asks for N = 1600, which the same rule answers
+with that preview at 1/1. `td-photo thumb FILE OUT.ppm [--long-edge N]
+[--cache]` is the rule headless, and `td-photo probe FILE` prints every
+preview's geometry (`--decode` also its full-scale pixel hash, the number
+the oracle prints for the same bytes).
 
 ## Colour and development
 
@@ -442,7 +510,8 @@ not ready paints a neutral placeholder and its name, never blocks.
   outlives the call and a band count that exceeds the threads is shared out.
 - Budgets are named constants the tests pin: `RAW_CACHE_BYTES` 512 MiB,
   `THUMB_CACHE_BYTES` 256 MiB in memory, `MAX_FILE_BYTES` 512 MiB,
-  `MAX_RAW_SAMPLES` 128 Mi, `MAX_PREVIEW_SAMPLES` 64 Mi, `MAX_IFDS` 64,
+  `MAX_RAW_SAMPLES` 128 Mi, `MAX_PREVIEW_SAMPLES` 128 Mi over a preview's
+  padded component planes, `MAX_TABLE_DEFINITIONS` 32, `MAX_IFDS` 64,
   `MAX_ENTRIES` 4096, `MAX_AXIS` 16384 for raw and image axes alike,
   `MAX_IMAGE_PIXELS` 64 Mi for any one image buffer (768 MiB as `f32`
   RGB, under a 32-bit target's allocation limit), `MAX_RANGE` 32768 for
@@ -460,8 +529,8 @@ not ready paints a neutral placeholder and its name, never blocks.
   before any work, and the final step of every write is a hard link,
   which fails on a name that appeared meanwhile; only a file system that
   refuses links falls back to a second check and a rename.
-- Pure modules (`tiff`, `nef`, `camera`, `color`, `develop`, `image`, and
-  later `jpeg`, `look`, `edit`) read no file, environment, clock or
+- Pure modules (`tiff`, `nef`, `camera`, `color`, `develop`, `image`,
+  `jpeg`, and later `look`, `edit`) read no file, environment, clock or
   descriptor. `main` and the library adapter own I/O.
 - Every ceiling above is checked before the allocation or index it
   guards; a refused input names the item.
@@ -498,6 +567,25 @@ sRGB table's endpoints and monotonicity), the superpixel demosaic on a
 known quad, the area resampler on constant and step images, and a complete
 development of a synthetic frame to expected 8-bit values.
 
+`tests/jpeg.rs` carries a synthetic baseline JPEG writer (fixed complete
+DC and incomplete AC tables, byte stuffing, restart markers, 8- and
+16-bit quantisers) and an in-test reference of the decoder's arithmetic
+written the long way over a copy of the same literal tables, and pins:
+grey and three-component round trips of every sampling shape, chroma
+coarser and finer than luma, with and without restarts, at every scale,
+exactly; the real Z 8 thumbnail (`tests/fixtures/z8-thumb.jpg`) held
+exactly to the coefficient hash and the four pixel hashes the oracle
+recorded; the scale and thumbnail rules by value; and every refusal by
+name (a non-JPEG, a cut stream, an early EOI, every unsupported frame
+type and the hierarchical and arithmetic markers, a second frame,
+precision, component layout and sampling factor, axes zero or past the
+ceilings and planes past the sample budget, a missing, over-full,
+all-ones or zero-valued table and more definitions than the budget, a
+scan that is not the whole frame or lists it out of order, a missing,
+wrong or out-of-sequence restart marker and an unread byte before one, a
+code no table holds, a reserved AC symbol, a predictor past 16 bits, a
+run or a ZRL past the block, and anything but EOI after the scan).
+
 From the window increment on, `tests/ui.rs` drives `ui::Controller`
 in-process (the action table's completeness, scripted sessions held to
 `state` and pixel oracles through the replay path) and
@@ -514,8 +602,9 @@ all-target Clippy.
    Nikon Huffman decoder with the real-frame oracle, the camera table,
    colour math, superpixel demosaic, resampler, and `probe` and `develop`
    headless. Landed with this document.
-2. Previews: the baseline JPEG decoder with reduced-IDCT scaling, the
-   thumbnail format and cache, and `td-photo thumb FILE OUT.ppm`.
+2. Previews: the baseline JPEG decoder with reduced-IDCT scaling and its
+   oracle, the thumbnail rule and cache, `td-photo thumb FILE OUT.ppm`,
+   `td-photo cache`, and preview facts and hashes in `probe`. Landed.
 3. Library: rolls, the sidecar reader and writer, `import`, `list`,
    `flag` and `edit` headless, with the never-overwrite and never-unlink
    oracles.

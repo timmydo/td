@@ -65,6 +65,30 @@ impl Rgb8 {
     }
 }
 
+/// Reads a binary `P6` PPM with a 255 maximum in the exact shape
+/// `write_ppm` produces (single-space header, one newline after each
+/// field, no comments), refusing anything else or any size past the
+/// ceilings: the cache reads back only what this crate wrote.
+pub fn read_ppm(bytes: &[u8]) -> Option<Rgb8> {
+    let rest = bytes.strip_prefix(b"P6\n")?;
+    let newline = rest.iter().position(|b| *b == b'\n')?;
+    let (header, rest) = rest.split_at(newline);
+    let rest = rest.strip_prefix(b"\n")?.strip_prefix(b"255\n")?;
+    let header = std::str::from_utf8(header).ok()?;
+    let (w, h) = header.split_once(' ')?;
+    let width: usize = w.parse().ok()?;
+    let height: usize = h.parse().ok()?;
+    // The payload must be exactly the header's size before anything is
+    // allocated for it: a header alone buys no buffer.
+    let expected = width.checked_mul(height)?.checked_mul(3)?;
+    if rest.len() != expected {
+        return None;
+    }
+    let mut image = Rgb8::new(width, height)?;
+    image.data.copy_from_slice(rest);
+    Some(image)
+}
+
 /// Writes a binary `P6` PPM with a 255 maximum.
 pub fn write_ppm(image: &Rgb8, out: &mut dyn Write) -> io::Result<()> {
     if !image.is_consistent() {
