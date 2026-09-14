@@ -1444,6 +1444,15 @@ fn map_path(root: &Path, roster: &Result<Vec<GateCrate>, String>, p: &str, sel: 
         return;
     }
 
+    // The task-manager backend has no recipe consumer yet. Its discovered
+    // roster preflight checks the standalone lock, tests and Clippy alongside
+    // the workspace's lock guard. Image packaging must replace this arm with
+    // coverage of the recipe and its runtime consumers in the same increment.
+    if p.starts_with("td-taskmgr/") && !p.contains("..") {
+        sel.add_preflight("cargo-test");
+        return;
+    }
+
     // td-ui, the shared UI toolkit, is the editor's path dependency and, like
     // the editor, has no recipe consumer yet, so the same arm: the host
     // preflight covers its own lock/test/clippy obligations, and the cargo
@@ -7274,6 +7283,42 @@ mod tests {
             all,
             "a mixed diff must take the whole table"
         );
+    }
+
+    #[test]
+    fn taskmgr_backend_routes_to_its_discovered_roster_until_packaged() {
+        let root = repo_root();
+        for path in [
+            "td-taskmgr/Cargo.toml",
+            "td-taskmgr/Cargo.lock",
+            "td-taskmgr/src/collector.rs",
+            "td-taskmgr/tests/parsers.rs",
+        ] {
+            let output = path_output(&root, path);
+            assert!(
+                output.contains("--manifest-path td-taskmgr/Cargo.toml"),
+                "{path}: {output}"
+            );
+            assert!(
+                output.contains("--workspace (builder/recipes/engine)"),
+                "{path}: {output}"
+            );
+            assert!(!output.contains("td-builder check"), "{path}: {output}");
+        }
+        let docs = path_output(&root, "td-taskmgr/DESIGN.md");
+        assert!(docs.contains("Selected checks: none"), "{docs}");
+        assert!(gate_locks().iter().any(|(lock, members)| {
+            lock == "td-taskmgr/Cargo.lock"
+                && matches!(members, LockMembers::Roster { own, .. } if own == "td-taskmgr")
+        }));
+        let mixed = [
+            "td-taskmgr/src/collector.rs".to_string(),
+            "builder/src/affected.rs".to_string(),
+        ];
+        assert_eq!(cargo_test_cmds(&root, &mixed).unwrap(), gate_cmds());
+        assert!(compute_selection(&root, &mixed)
+            .targets
+            .contains(&"check".to_string()));
     }
 
     #[test]

@@ -6,9 +6,11 @@ lower pane across graph tabs. CPU and memory plots connect a resource spike
 to the processes observed at that time. Process actions send signals under
 the caller's existing authority.
 
-This is the version-1 target contract, not an implementation claim. There
-is no td-taskmgr crate or executable yet. Root AGENTS.md and DEVELOPMENT.md
-govern implementation and landing; [td-ui](../td-ui/DESIGN.md) owns the
+This is the version-1 target contract, not a claim that all features ship.
+The standalone collection/model crate and read-only `--sample` command are
+implemented; the graphical window, process controls and td image integration
+remain subsequent increments. Root AGENTS.md and DEVELOPMENT.md govern
+implementation and landing; [td-ui](../td-ui/DESIGN.md) owns the
 shared widget contracts. Each increment below must update its status and
 record its actual validation without claiming later increments are done.
 
@@ -24,7 +26,7 @@ a shipped td build follows the source-built target graph. Self-contained
 does not promise that a dynamically linked host build works with another
 distribution's dynamic loader: host packaging may build for its own libc.
 
-The initial host build command, once the crate exists, is:
+The host build command is:
 
 ```text
 cargo build --offline --release --manifest-path td-taskmgr/Cargo.toml
@@ -243,7 +245,8 @@ saturation for every device. These semantics follow the kernel's
 
 Select one block device by default: prefer a whole device with a sysfs
 device link, excluding loop, RAM and zram devices. Then prefer another
-whole device excluding those classes, finally any available device.
+whole device excluding those classes, then another device outside those
+classes even if topology is unknown, finally any available device.
 Break ties by major/minor number; logical dm/md devices are available but
 do not displace a physical device in the first preference class. Offer
 partitions and logical devices explicitly, and preserve user selection.
@@ -371,6 +374,72 @@ It cannot authorize a subtree action. Process counts may be unknown if
 enumeration itself fails. Reuse scratch buffers and reserve fallibly;
 enumeration, sorting and aggregation must remain bounded under churn.
 
+## Implemented backend
+
+The dependency-free crate currently offers `--sample [COUNT]` with
+`--interval 0.5|1|2|5`. The default count is two, the maximum is 240, and
+unavailable first-interval rates are printed explicitly. The command is a
+read-only backend probe. It does not open a window, send signals or claim
+td image integration. The graphical increment adds the td-ui dependency,
+compiled font and Wayland entry point.
+
+`parsers` takes bounded bytes and explicit units. `linux_read` owns one
+charged reusable source buffer, descriptor-relative process-file reads and
+native-width auxiliary-vector decoding for runtime page size/tick frequency.
+`collector` owns process/CPU baselines and reuses bounded scratch; `devices`
+owns aggregate interface/block baselines and best-effort sysfs topology.
+Unknown device continuity produces a rate gap, not a guessed delta. A
+process name arena is capped at four MiB per in-flight batch. Duplicate
+observed PIDs keep the latest read and mark coverage partial. Malformed or
+repeated CPU rows retire per-CPU detail; duplicate aggregate rows retire the
+aggregate reading. CPU-list changes reset the aggregate interval without
+changing its independently read capacity basis. Retained CPU/interface/disk
+arrays reserve the observed count, not the maximum hardware roster; reusable
+collector baselines retain their fixed ceilings. Allocation failures during
+enumeration reach memory-pressure reclamation instead of silently reducing
+the process list. Explicit row/name ceilings still produce partial coverage,
+counting remaining numeric entries within the enumeration bound. Reused
+procfs/sysfs path buffers avoid per-row path construction allocations.
+
+One shared `Budget` charges owned capacities and fixed model/control state,
+including startup Arc counters, before variable storage grows. Capacity
+accounting conservatively charges embedded container headers again and
+excludes allocator bookkeeping and thread stacks. Collection
+batches, baselines, identity strings, temporary model-construction buffers,
+retained snapshots and the inspected snapshot use this same ceiling.
+`identities` stores immutable name versions in reusable generation-checked
+slots with a sorted lookup; each batch sorts new entries once. Snapshot
+ownership releases its references automatically. The brief identity lock
+never spans filesystem I/O. Hierarchy resolution and totals are iterative;
+unknown fields, partial coverage and overflow remain explicit.
+
+`history` enforces both the selected cadence's sample count and the rolling
+120-second age limit. An older pinned inspection remains separately
+retained, still charged and counted, but does not inflate the reported
+rolling duration. `model` admits at most one pending batch and reclaims at
+most one unpinned snapshot per tick after a refused allocation. The caller
+returns to input dispatch before retrying. Live releases the pin. Process
+selection remains a key when the row is no longer observed.
+
+`worker` owns one collection thread and one replaceable pending update.
+Overwritten/missed observations are counted. Interval changes wake its
+bounded wait; it schedules a fresh interval after an overrun rather than a
+catch-up burst. Closing requests cancellation and drops the thread handle
+without waiting on a stalled filesystem read. No replacement worker is
+started. The graphical increment consumes this handoff on td-ui ticks.
+
+`contributors` chooses at most eight names by peak across the caller's
+visible samples, retains a selected observed process, breaks ties by key
+and keeps series order by key. Retained named keys keep their palette slots;
+new names take free slots. Missing observations and unknown/overflowing
+Other observed totals stay gaps. Device selection, selected-device sums,
+search/sibling ordering and the visible tree projection join the graphical
+increment; process controls remain disabled until their own landing.
+
+The affected-check mapping currently runs the discovered standalone crate
+and workspace lock/test/Clippy preflight. No recipe embeds this crate yet.
+Image packaging must add target-recipe/runtime coverage in the same landing.
+
 ## Validation and delivery
 
 The implementation must demonstrate:
@@ -410,7 +479,9 @@ Independently landable increments:
    self-contained tested landing. Reuse the existing text entry and list
    primitives.
 4. Standalone crate with bounded collection, metric model and retained
-   history fixtures, committed lock and automatically discovered gate.
+   history fixtures, committed lock and automatically discovered gate
+   (implemented). The read-only `--sample` command exercises this backend;
+   it is not the graphical version-1 deliverable.
 5. Live Wayland window with all five tabs, process tree and linked CPU/RSS
    history; native compositor and Guix/host smoke evidence. Read-only until
    the following increment, explicitly identified as incomplete version 1.
