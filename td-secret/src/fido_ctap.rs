@@ -130,7 +130,7 @@ impl AssertionRequest {
         Ok(parsed.info)
     }
 
-    fn parse(&self, response: &[u8]) -> Result<ParsedAssertion, String> {
+    pub(super) fn parse(&self, response: &[u8]) -> Result<ParsedAssertion, String> {
         if response.len() > cbor::MAX_BYTES {
             return Err("CTAP response byte limit".into());
         }
@@ -209,14 +209,14 @@ impl AssertionRequest {
     }
 }
 
-struct ParsedAssertion {
-    digest: [u8; 32],
-    r: [u8; 32],
-    s: [u8; 32],
-    info: AssertionInfo,
+pub(super) struct ParsedAssertion {
+    pub(super) digest: [u8; 32],
+    pub(super) r: [u8; 32],
+    pub(super) s: [u8; 32],
+    pub(super) info: AssertionInfo,
 }
 
-fn signature(bytes: &[u8]) -> Result<([u8; 32], [u8; 32]), String> {
+pub(super) fn signature(bytes: &[u8]) -> Result<([u8; 32], [u8; 32]), String> {
     if !(8..=72).contains(&bytes.len())
         || bytes.first() != Some(&0x30)
         || bytes.get(1).copied().map(usize::from) != Some(bytes.len() - 2)

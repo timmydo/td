@@ -246,7 +246,7 @@ validation, fixed operation schedules for secret scalars and AES, no
 secret-indexed tables, and an explicit analysis of compiler/timing and
 memory-erasure limits. It must not introduce a proprietary token protocol
 or replace the required PIN/UV policy with touch-only authentication.
-The primitives below do not supply a working token protocol.
+The private protocol flow below has no hardware consumer yet.
 Any proposal to change this boundary requires a new explicit user decision.
 
 ### Implemented CTAP AES prerequisite
@@ -301,8 +301,9 @@ committed literals. These are primitive tests, not PIN or YubiKey evidence.
 ### Implemented P-256 prerequisite
 
 `src/fido_p256.rs` supplies private P-256 public-key derivation, raw ECDH
-and ES256 verification. It has no device, entropy, protocol or notebook
-consumer. Existing TPM-backed application assertions are unchanged. The
+and ES256 verification. The private PIN flow below consumes it; it has
+no direct device, entropy or notebook consumer. Existing TPM-backed
+application assertions are unchanged. The
 curve is fixed to secp256r1/P-256 from
 [Standards for Efficient Cryptography 2 (SEC 2)](https://www.secg.org/sec2-v2.pdf).
 Operations follow [Standards for Efficient Cryptography 1 (SEC 1)](https://www.secg.org/sec1-v2.pdf)
@@ -388,6 +389,104 @@ closure. Its NIST inputs are public CAVP data, not CAVP validation:
   `5fff092551f2d72e89a3d9362711878708f9a14b502f0dfae819649105b0ea39`.
 - [ECDSA archive](https://csrc.nist.gov/CSRC/media/Projects/Cryptographic-Algorithm-Validation-Program/documents/dss/186-4ecdsatestvectors.zip):
   `fe47cc92b4cee418236125c9ffbcd9bb01c8c34e74a4ba195d954bcb72824752`.
+
+### Implemented PIN-authorized hmac-secret assertion flow
+
+`src/fido_pin.rs` implements a private, safe-Rust protocol flow for an
+already enrolled ES256 credential. It owns PIN handling, key agreement,
+PIN-token decryption, request authentication, signature verification and
+one-salt hmac-secret output. It has no device, timer, prompt, enrollment,
+persistent writer or public notebook API. It does not change the existing
+TPM-backed application assertion path. Response parsing is shared with that
+path; software verification uses the private P-256 implementation. Its
+private verification context retains a never-sent presence-only request
+for parser reuse; only the PIN-authorized request is exposed to transport.
+
+The flow follows [CTAP 2.2 sections 6.5 and 12.7](https://fidoalliance.org/specs/fido-v2.2-ps-20250714/fido-client-to-authenticator-protocol-v2.2-ps-20250714.html#authenticatorClientPIN).
+Capability admission requires FIDO_2_0, FIDO_2_1 or FIDO_2_2, hmac-secret,
+a configured client PIN, user presence, and a non-platform authenticator. It refuses a
+forced PIN change and noMcGaPermissionsWithClientPin. Unknown capabilities
+are not identity evidence. Protocol 2 is preferred when advertised; otherwise
+protocol 1 must be advertised. Duplicate, empty or malformed protocol lists
+are refused. There is no retry with another protocol after any failure.
+The first PIN input profile accepts 4 through 63 printable ASCII bytes,
+including spaces, without trimming or rewriting. This subset is already
+NFC. Existing non-ASCII PINs are unsupported until a separately reviewed
+normalization surface exists; this flow never changes a token's PIN.
+
+Before PIN processing, the backend pins the enrolled public key, single
+credential ID, fresh operation-bound client-data hash and 32-byte vault
+salt. KeyRequest, PinRequest and HmacRequest each consume themselves on
+success or failure. The backend must retain one device/channel, enforce the
+presented operation and fixed deadline, and drop all pending state on
+cancel, disconnect, lock, suspend or authority loss. Borrowed request bytes
+are for one transport submission; these types cannot stop a malicious or
+incorrect caller from copying or retransmitting them. No token I/O or
+transport-retry authority is supplied by the codec.
+
+Key agreement requires exactly the public EC2/-25/P-256 COSE parameters,
+canonical 32-byte coordinates and curve membership. The entropy callback
+must fill from kernel randomness directly into the candidate allocation.
+Invalid scalars are rejected, with at most eight candidates; entropy errors
+clear the candidate and stop immediately. One fresh ephemeral key belongs
+to this PIN/extension transaction and is never retained across operations.
+Raw ECDH is immediately derived and retired. Protocol 1 uses SHA-256, zero
+IV AES-256-CBC and 16-byte truncated HMAC-SHA256. Protocol 2 uses separate
+32-byte HKDF-SHA256 outputs with the standard CTAP2 AES/HMAC labels, a fresh
+16-byte IV for each encryption prepended to ciphertext, and full HMAC-SHA256.
+The two encryption steps request independent IVs; callback failure retires
+the pending state without producing a request.
+
+Tokens advertising pinUvAuthToken use subcommand 9 with only getAssertion
+permission and the fixed td.invalid RP ID. Others use legacy subcommand 5,
+which grants broader authenticator-side default permissions, but this codec
+consumes the returned token for exactly the pinned assertion. It accepts
+16 or 32 plaintext token bytes under protocol 1 and exactly 32 under
+protocol 2. The decrypted token is retired immediately after authenticating
+the pinned client-data hash. It is not proof of user verification by itself.
+No raw token accessor, makeCredential, reset, changePIN or setPIN path exists.
+
+The assertion requests presence, the PIN authorization and one encrypted,
+authenticated salt. Built-in uv is absent because ClientPIN supplies UV.
+Protocol 2 is explicitly named inside hmac-secret; protocol 1 uses its
+specified extension default. All command and response lengths include the
+command/status byte and respect the token limit and local CTAP ceiling.
+The final response must pass the shared allow-list, RP, presence, counter,
+DER and authenticator-data checks, carry UV, and verify against the pinned
+credential key over authenticatorData plus the exact client-data hash.
+Only then is the signed hmac-secret ciphertext decrypted. Counter admission
+is structural only; comparison and persistence against the enrolled record
+are backend duties. Missing extensions,
+wrong output lengths, malformed CBOR and signatures, and CTAP error statuses
+return no output. Status codes currently appear in fixed diagnostic strings;
+the device adapter must add typed status handling before exposing PIN retries
+or recovery actions, without parsing human-readable error text.
+The backend-only output owner contains exactly 32 bytes
+plus assertion metadata; it is not an application release or store write.
+The standard unauthenticated clientPIN response has no independent MAC; the
+final signed assertion is required even when token decryption succeeds.
+The transport and authenticator remain trust boundaries; this does not claim
+resistance to a malicious authenticator or PIN-channel interception.
+
+PIN, token, key and output allocations have no Clone or Debug and clear on
+drop with black_box barriers. PIN hashes and returned KDF/MAC work arrays
+also clear, including the HMAC normalized key and HKDF extract output.
+Other hash/HMAC internals, arithmetic temporaries, copies,
+registers and allocator behavior remain outside the best-effort erasure
+claim. The eventual hardware consumer still requires the shipped-compiler
+assembly inspection gate described above. Fixtures do not establish physical
+user verification, token interoperability or production readiness.
+
+`tests/pin_vectors.py` independently constructs four public full transcripts
+with Python hashlib/hmac and OpenSSL 3.5.7 P-256/AES. It verifies every fixture
+signature with OpenSSL, including signed negative UV/presence/RP/extension
+cases. The ordinary and td-built suites consume only committed literals in
+`tests/pin_vectors.txt`; regeneration is optional, offline and never part of
+the dependency closure. Tests compare exact request bytes, KDFs and output,
+and refuse signed-byte mutations, truncations, malformed negotiation and
+key/token responses, size violations, and failed entropy at each stage.
+Negative-policy tests first verify each fixture signature independently of
+the policy parser, then assert its exact refusal reason.
 
 ## Independently landable increments
 

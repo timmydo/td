@@ -13,7 +13,7 @@ pub fn digest(bytes: &[u8]) -> [u8; 32] {
     hash.finalize()
 }
 
-fn hmac(key: &[u8], data: &[u8]) -> [u8; 32] {
+pub(super) fn hmac(key: &[u8], data: &[u8]) -> [u8; 32] {
     let mut normalized = [0u8; 64];
     if key.len() > 64 {
         let mut hash = sha256::Sha256::new();
@@ -32,7 +32,10 @@ fn hmac(key: &[u8], data: &[u8]) -> [u8; 32] {
     let mut outer = sha256::Sha256::new();
     outer.update(&normalized.map(|byte| byte ^ 0x5c));
     outer.update(&inner.finalize());
-    outer.finalize()
+    let result = outer.finalize();
+    normalized.fill(0);
+    std::hint::black_box(&mut normalized);
+    result
 }
 
 #[allow(
@@ -69,10 +72,13 @@ pub fn derive(master: &[u8; 32], app: &str) -> [u8; 32] {
 }
 
 pub(super) fn hkdf(ikm: &[u8], salt: &[u8], info: &[u8]) -> [u8; 32] {
-    let prk = hmac(salt, ikm);
+    let mut prk = hmac(salt, ikm);
     let mut input = info.to_vec();
     input.push(1);
-    hmac(&prk, &input)
+    let result = hmac(&prk, &input);
+    prk.fill(0);
+    std::hint::black_box(&mut prk);
+    result
 }
 
 fn quarter([mut a, mut b, mut c, mut d]: [u32; 4]) -> [u32; 4] {

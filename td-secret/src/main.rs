@@ -29,7 +29,7 @@ mod fido_device;
 mod fido_hid;
 #[allow(dead_code, reason = "shared enrollment and recovery metadata")]
 mod fido_metadata;
-#[allow(dead_code, reason = "CTAP AES prerequisite; no PIN consumer yet")]
+#[allow(dead_code, reason = "private CTAP AES and PIN protocol support")]
 mod fido_aes;
 #[allow(dead_code, reason = "shared CTAP enrollment and assertion codec")]
 mod fido_cbor;
@@ -37,8 +37,10 @@ mod fido_cbor;
 mod fido_ctap;
 #[allow(dead_code, reason = "enrollment construction and verified assertion support")]
 mod fido_enroll;
-#[allow(dead_code, reason = "P-256 prerequisite; no portable protocol consumer yet")]
+#[allow(dead_code, reason = "private P-256 and portable protocol support")]
 mod fido_p256;
+#[allow(dead_code, reason = "portable PIN protocol; no device consumer yet")]
+mod fido_pin;
 #[path = "../../td-firstboot/src/principals.rs"]
 #[allow(dead_code, reason = "shared immutable session identity loader")]
 mod principals;
@@ -199,6 +201,7 @@ mod confinement {
             ("fido_hid.rs", include_str!("fido_hid.rs")),
             ("fido_metadata.rs", include_str!("fido_metadata.rs")),
             ("fido_p256.rs", include_str!("fido_p256.rs")),
+            ("fido_pin.rs", include_str!("fido_pin.rs")),
             ("store.rs", include_str!("store.rs")),
             ("sys.rs", include_str!("sys.rs")),
             ("system_vm.rs", include_str!("system_vm.rs")),
@@ -267,6 +270,7 @@ pub fn take_received(fd: RawFd) -> Result<File, String> {
                 "fido_hid.rs",
                 "fido_metadata.rs",
                 "fido_p256.rs",
+                "fido_pin.rs",
                 "main.rs",
                 "operation.rs",
                 "portable.rs",
