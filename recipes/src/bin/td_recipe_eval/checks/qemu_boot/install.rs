@@ -356,7 +356,7 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
                 timeout,
             )?;
             require_installation(&result, &uuid, source_device, &target)?;
-            require_inventory(
+            require_live_reports(
                 &result,
                 &target,
                 source_device,
@@ -475,7 +475,7 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
             protocol::INTERRUPTED_MARKER,
         )?;
         validate_interruption(&interrupted, kernel_bytes, &uuid, source_device)?;
-        require_inventory(
+        require_live_reports(
             &interrupted,
             &target,
             source_device,
@@ -501,7 +501,7 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
         );
         let repaired = boot("repair", &iso, attachment, true, protocol::INSTALL_MARKER)?;
         require_installation(&repaired, &uuid, source_device, &target)?;
-        require_inventory(
+        require_live_reports(
             &repaired,
             &target,
             source_device,
@@ -564,7 +564,7 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
                 ));
             }
             validate_target_refusal(&refused, source_device, diagnostic)?;
-            require_inventory(
+            require_live_reports(
                 &refused,
                 &target,
                 source_device,
@@ -609,7 +609,7 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
                 &format!("{} {source_device}", protocol::MEDIA_MARKER),
                 "refused media access",
             )?;
-            require_inventory(
+            require_live_reports(
                 &refused,
                 &target,
                 source_device,
@@ -696,68 +696,66 @@ struct InventoryIdentity {
     source_sequence: u64,
 }
 
-fn inventory_field<'a>(
+fn report_field<'a>(
     value: &'a td_engine::json::Json,
     name: &str,
 ) -> Result<&'a td_engine::json::Json, String> {
     let td_engine::json::Json::Obj(fields) = value else {
-        return Err("inventory value is not an object".into());
+        return Err("report value is not an object".into());
     };
     let mut found = fields.iter().filter(|(key, _)| key == name);
-    let (_, value) = found
-        .next()
-        .ok_or_else(|| format!("inventory lacks {name}"))?;
+    let (_, value) = found.next().ok_or_else(|| format!("report lacks {name}"))?;
     if found.next().is_some() {
-        return Err(format!("inventory duplicates {name}"));
+        return Err(format!("report duplicates {name}"));
     }
     Ok(value)
 }
 
-fn inventory_number(value: &td_engine::json::Json, name: &str) -> Result<u64, String> {
-    let td_engine::json::Json::Num(number) = inventory_field(value, name)? else {
-        return Err(format!("inventory {name} is not an integer"));
+fn report_number(value: &td_engine::json::Json, name: &str) -> Result<u64, String> {
+    let td_engine::json::Json::Num(number) = report_field(value, name)? else {
+        return Err(format!("report {name} is not an integer"));
     };
     number
         .parse()
-        .map_err(|_| format!("inventory {name} is not an unsigned integer"))
+        .map_err(|_| format!("report {name} is not an unsigned integer"))
 }
 
-fn inventory_expect_field(
+fn report_expect_field(
     value: &td_engine::json::Json,
-    device: &str,
+    subject: &str,
     field: &str,
     expected: &td_engine::json::Json,
 ) -> Result<(), String> {
-    let actual = inventory_field(value, field).map_err(|error| format!("{device}: {error}"))?;
+    let actual = report_field(value, field).map_err(|error| format!("{subject}: {error}"))?;
     if actual != expected {
         return Err(format!(
-            "inventory {device}.{field}: expected {expected:?}, observed {actual:?}"
+            "report {subject}.{field}: expected {expected:?}, observed {actual:?}"
         ));
     }
     Ok(())
 }
 
-fn inventory_expect_number(
+fn report_expect_number(
     value: &td_engine::json::Json,
-    device: &str,
+    subject: &str,
     field: &str,
     expected: u64,
 ) -> Result<(), String> {
-    let actual = inventory_number(value, field).map_err(|error| format!("{device}: {error}"))?;
+    let actual = report_number(value, field).map_err(|error| format!("{subject}: {error}"))?;
     if actual != expected {
         return Err(format!(
-            "inventory {device}.{field}: expected {expected}, observed {actual}"
+            "report {subject}.{field}: expected {expected}, observed {actual}"
         ));
     }
     Ok(())
 }
 
-fn inventory_document(text: &str) -> Result<td_engine::json::Json, String> {
-    if text.len() >= protocol::MAX_INVENTORY_BYTES {
-        return Err("inventory exceeds fixture byte limit".into());
+fn diagnostic_document(text: &str, limit: usize) -> Result<td_engine::json::Json, String> {
+    if text.len() >= limit {
+        return Err("report exceeds fixture byte limit".into());
     }
     // Bound nesting before entering the shared recursive JSON parser.
-    const MAX_INVENTORY_DEPTH: usize = 8;
+    const MAX_REPORT_DEPTH: usize = 8;
     let mut depth = 0usize;
     let mut quoted = false;
     let mut escaped = false;
@@ -775,16 +773,41 @@ fn inventory_document(text: &str) -> Result<td_engine::json::Json, String> {
                 b'"' => quoted = true,
                 b'{' | b'[' => {
                     depth += 1;
-                    if depth > MAX_INVENTORY_DEPTH {
-                        return Err("inventory nesting exceeds fixture limit".into());
+                    if depth > MAX_REPORT_DEPTH {
+                        return Err("report nesting exceeds fixture limit".into());
                     }
                 }
-                b'}' | b']' => depth = depth.checked_sub(1).ok_or("unbalanced inventory JSON")?,
+                b'}' | b']' => depth = depth.checked_sub(1).ok_or("unbalanced report JSON")?,
                 _ => {}
             }
         }
     }
-    td_engine::json::parse(text).map_err(|error| format!("invalid inventory JSON: {error}"))
+    td_engine::json::parse(text).map_err(|error| format!("invalid report JSON: {error}"))
+}
+
+fn diagnostic_frame(
+    console: &str,
+    marker: &str,
+    limit: usize,
+) -> Result<td_engine::json::Json, String> {
+    let prefix = format!("{marker} ");
+    let mut lines = console.lines().filter(|line| line.starts_with(marker));
+    let line = lines.next().ok_or_else(|| format!("missing {marker}"))?;
+    if lines.next().is_some() {
+        return Err(format!("duplicate {marker}"));
+    }
+    let line = line
+        .strip_prefix(&prefix)
+        .ok_or_else(|| format!("malformed {marker} prefix"))?;
+    let (length, payload) = line.split_once(' ').ok_or("report lacks byte framing")?;
+    let length = length
+        .parse::<usize>()
+        .map_err(|_| "invalid report byte length")?;
+    if length >= limit {
+        return Err("report exceeds fixture byte limit".into());
+    }
+    let json = payload.get(..length).ok_or("truncated report bytes")?;
+    diagnostic_document(json, limit)
 }
 
 fn inventory_snapshot(
@@ -794,39 +817,23 @@ fn inventory_snapshot(
     partitioned: bool,
 ) -> Result<InventoryIdentity, String> {
     use td_engine::json::Json;
-    let prefix = format!("{marker} ");
-    let mut lines = console
-        .lines()
-        .filter_map(|line| line.strip_prefix(&prefix));
-    let line = lines.next().ok_or_else(|| format!("missing {marker}"))?;
-    if lines.next().is_some() {
-        return Err(format!("duplicate {marker}"));
-    }
-    let (length, payload) = line.split_once(' ').ok_or("inventory lacks byte framing")?;
-    let length = length
-        .parse::<usize>()
-        .map_err(|_| "invalid inventory byte length")?;
-    if length >= protocol::MAX_INVENTORY_BYTES {
-        return Err("inventory exceeds fixture byte limit".into());
-    }
-    let json = payload.get(..length).ok_or("truncated inventory bytes")?;
-    let document = inventory_document(json)?;
-    if inventory_number(&document, "version")? != 1
-        || inventory_field(&document, "scope")?.as_str() != Some("inventory-only")
+    let document = diagnostic_frame(console, marker, protocol::MAX_INVENTORY_BYTES)?;
+    if report_number(&document, "version")? != 1
+        || report_field(&document, "scope")?.as_str() != Some("inventory-only")
     {
         return Err("inventory has the wrong version or scope".into());
     }
-    let devices = inventory_field(&document, "devices")?
+    let devices = report_field(&document, "devices")?
         .as_arr()
         .ok_or("inventory devices is not an array")?;
     let mut by_name = std::collections::BTreeMap::new();
     let mut numbers = std::collections::BTreeSet::new();
     let mut target_partitions = 0usize;
     for device in devices {
-        let name = inventory_field(device, "name")?
+        let name = report_field(device, "name")?
             .as_str()
             .ok_or("inventory device name is not text")?;
-        let number = inventory_field(device, "device_number")?
+        let number = report_field(device, "device_number")?
             .as_str()
             .ok_or("inventory device number is not text")?;
         if !numbers.insert(number) {
@@ -834,7 +841,7 @@ fn inventory_snapshot(
                 "inventory {name}.device_number duplicates {number}"
             ));
         }
-        match inventory_field(device, "parent")? {
+        match report_field(device, "parent")? {
             Json::Null => {}
             Json::Str(parent) => {
                 if parent == expected.target_name {
@@ -862,26 +869,26 @@ fn inventory_snapshot(
         ),
         (expected.source_name, source, expected.source_bytes, true),
     ] {
-        inventory_expect_number(device, name, "capacity_bytes", capacity)?;
-        inventory_expect_field(device, name, "read_only", &Json::Bool(read_only))?;
-        inventory_expect_field(device, name, "parent", &Json::Null)?;
-        inventory_expect_field(device, name, "partition_number", &Json::Null)?;
+        report_expect_number(device, name, "capacity_bytes", capacity)?;
+        report_expect_field(device, name, "read_only", &Json::Bool(read_only))?;
+        report_expect_field(device, name, "parent", &Json::Null)?;
+        report_expect_field(device, name, "partition_number", &Json::Null)?;
     }
-    let target_disk = inventory_field(target, "disk")?;
-    let source_disk = inventory_field(source, "disk")?;
-    inventory_expect_number(
+    let target_disk = report_field(target, "disk")?;
+    let source_disk = report_field(source, "disk")?;
+    report_expect_number(
         target_disk,
         &format!("{}.disk", expected.target_name),
         "logical_sector_bytes",
         expected.sector_bytes,
     )?;
-    inventory_expect_field(
+    report_expect_field(
         target_disk,
         &format!("{}.disk", expected.target_name),
         "serial",
         &Json::Str(protocol::TARGET_SERIAL.into()),
     )?;
-    inventory_expect_number(
+    report_expect_number(
         source_disk,
         &format!("{}.disk", expected.source_name),
         "logical_sector_bytes",
@@ -892,16 +899,16 @@ fn inventory_snapshot(
         },
     )?;
     let identity = InventoryIdentity {
-        target_number: inventory_field(target, "device_number")?
+        target_number: report_field(target, "device_number")?
             .as_str()
             .ok_or("missing target device number")?
             .into(),
-        target_sequence: inventory_number(target_disk, "sequence")?,
-        source_number: inventory_field(source, "device_number")?
+        target_sequence: report_number(target_disk, "sequence")?,
+        source_number: report_field(source, "device_number")?
             .as_str()
             .ok_or("missing source device number")?
             .into(),
-        source_sequence: inventory_number(source_disk, "sequence")?,
+        source_sequence: report_number(source_disk, "sequence")?,
     };
     if identity.target_sequence == 0
         || identity.source_sequence == 0
@@ -941,16 +948,16 @@ fn inventory_snapshot(
             let partition = by_name
                 .get(name.as_str())
                 .ok_or_else(|| format!("inventory lacks {name} after formatting"))?;
-            inventory_expect_field(
+            report_expect_field(
                 partition,
                 &name,
                 "parent",
                 &Json::Str(expected.target_name.into()),
             )?;
-            inventory_expect_number(partition, &name, "partition_number", number)?;
-            inventory_expect_field(partition, &name, "disk", &Json::Null)?;
-            inventory_expect_field(partition, &name, "read_only", &Json::Bool(false))?;
-            inventory_expect_number(
+            report_expect_number(partition, &name, "partition_number", number)?;
+            report_expect_field(partition, &name, "disk", &Json::Null)?;
+            report_expect_field(partition, &name, "read_only", &Json::Bool(false))?;
+            report_expect_number(
                 partition,
                 &name,
                 "capacity_bytes",
@@ -987,7 +994,80 @@ fn validate_inventories(
     Ok(())
 }
 
-fn require_inventory(
+fn validate_preview(
+    console: &str,
+    capacity: u64,
+    sector: u64,
+    partitioned: bool,
+) -> Result<(), String> {
+    if !partitioned {
+        if console
+            .lines()
+            .any(|line| line.starts_with(protocol::PREVIEW_MARKER))
+        {
+            return Err("refusal unexpectedly reported a layout preview".into());
+        }
+        return Ok(());
+    }
+    if !matches!(sector, 512 | 4096) || !capacity.is_multiple_of(sector) {
+        return Err("invalid preview oracle geometry".into());
+    }
+    let document = diagnostic_frame(
+        console,
+        protocol::PREVIEW_MARKER,
+        protocol::MAX_PREVIEW_BYTES,
+    )?;
+    report_expect_number(&document, "layout-preview", "version", 1)?;
+    report_expect_field(
+        &document,
+        "layout-preview",
+        "scope",
+        &td_engine::json::Json::Str("layout-preview".into()),
+    )?;
+    report_expect_number(&document, "layout-preview", "logical_sector_bytes", sector)?;
+    report_expect_number(&document, "layout-preview", "capacity_bytes", capacity)?;
+    let parts = report_field(&document, "partitions")?
+        .as_arr()
+        .ok_or("preview partitions is not an array")?;
+    if parts.len() != 2 {
+        return Err("preview must describe exactly two partitions".into());
+    }
+    let esp_start = td_boot_protocol::PARTITION_ALIGN_BYTES / sector;
+    let volume_start =
+        (td_boot_protocol::PARTITION_ALIGN_BYTES + td_boot_protocol::ESP_BYTES) / sector;
+    let last = td_engine::gpt::last_usable_lba(sector, capacity / sector)?;
+    for (part, (number, purpose, start, end)) in parts.iter().zip([
+        (1, "efi-system", esp_start, volume_start - 1),
+        (2, "system-volume", volume_start, last),
+    ]) {
+        let bytes = end
+            .checked_sub(start)
+            .and_then(|v| v.checked_add(1))
+            .and_then(|v| v.checked_mul(sector))
+            .ok_or("invalid preview oracle partition range")?;
+        report_expect_field(
+            part,
+            purpose,
+            "purpose",
+            &td_engine::json::Json::Str(purpose.into()),
+        )?;
+        let offset = start
+            .checked_mul(sector)
+            .ok_or("preview oracle offset overflow")?;
+        for (field, expected) in [
+            ("number", number),
+            ("start_lba", start),
+            ("end_lba", end),
+            ("offset_bytes", offset),
+            ("capacity_bytes", bytes),
+        ] {
+            report_expect_number(part, purpose, field, expected)?;
+        }
+    }
+    Ok(())
+}
+
+fn require_live_reports(
     result: &BootResult,
     target: &TargetDisk,
     source_device: &str,
@@ -1008,6 +1088,18 @@ fn require_inventory(
         target_name: target.bus.name(false),
         before,
     };
+    validate_preview(
+        &result.console,
+        expected.target_bytes,
+        expected.sector_bytes,
+        partitioned,
+    )
+    .map_err(|error| {
+        format!(
+            "installer layout preview: {error}\n{}",
+            tail(&result.console, 80)
+        )
+    })?;
     validate_inventories(&result.console, &expected, partitioned).map_err(|error| {
         format!(
             "installer inventory: {error}\n{}",
@@ -1284,7 +1376,7 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
                 result.elapsed.as_secs_f64()
             );
             require_installation(&result, &uuid, source_device, &target)?;
-            require_inventory(
+            require_live_reports(
                 &result,
                 &target,
                 source_device,
@@ -1978,6 +2070,95 @@ mod tests {
             "an installation target requires optical or USB source media"
         );
     }
+    const PREVIEW_512: &str = r#"{"version":1,"scope":"layout-preview","logical_sector_bytes":512,"capacity_bytes":6442450944,"partitions":[{"number":1,"purpose":"efi-system","start_lba":2048,"end_lba":1050623,"offset_bytes":1048576,"capacity_bytes":536870912},{"number":2,"purpose":"system-volume","start_lba":1050624,"end_lba":12582878,"offset_bytes":537919488,"capacity_bytes":5904514560}]}"#;
+    const PREVIEW_4KN: &str = r#"{"version":1,"scope":"layout-preview","logical_sector_bytes":4096,"capacity_bytes":6442450944,"partitions":[{"number":1,"purpose":"efi-system","start_lba":256,"end_lba":131327,"offset_bytes":1048576,"capacity_bytes":536870912},{"number":2,"purpose":"system-volume","start_lba":131328,"end_lba":1572858,"offset_bytes":537919488,"capacity_bytes":5904510976}]}"#;
+
+    fn preview_console(json: &str) -> String {
+        format!("{} {} {json}\n", protocol::PREVIEW_MARKER, json.len())
+    }
+
+    #[test]
+    fn preview_oracle_checks_geometry_and_every_partition_field() {
+        for (sector, json) in [(512, PREVIEW_512), (4096, PREVIEW_4KN)] {
+            validate_preview(&preview_console(json), MINIMUM_TARGET_BYTES, sector, true).unwrap();
+        }
+        for (old, new, field) in [
+            ("\"version\":1", "\"version\":2", "version"),
+            ("layout-preview", "install-plan", "scope"),
+            ("4096", "512", "logical_sector_bytes"),
+            ("6442450944", "6442451456", "capacity_bytes"),
+            ("\"number\":2", "\"number\":3", "number"),
+            ("system-volume", "efi-system", "purpose"),
+            ("\"start_lba\":256", "\"start_lba\":257", "start_lba"),
+            ("\"end_lba\":1572858", "\"end_lba\":1572857", "end_lba"),
+            ("537919488", "537919489", "offset_bytes"),
+            ("5904510976", "5904506880", "capacity_bytes"),
+        ] {
+            let changed = PREVIEW_4KN.replace(old, new);
+            assert_ne!(changed, PREVIEW_4KN);
+            let error =
+                validate_preview(&preview_console(&changed), MINIMUM_TARGET_BYTES, 4096, true)
+                    .unwrap_err();
+            assert!(
+                error.contains(field) && error.contains("expected") && error.contains("observed"),
+                "{error}"
+            );
+        }
+        for invalid in [
+            PREVIEW_4KN.replace("\"version\":1", "\"version\":1,\"version\":1"),
+            PREVIEW_4KN.replace("5904510976", "5904510976.0"),
+            PREVIEW_4KN.replace("5904510976", "-1"),
+            PREVIEW_4KN.replace("\"partitions\":[", "\"partitions\":[{},"),
+        ] {
+            assert!(
+                validate_preview(&preview_console(&invalid), MINIMUM_TARGET_BYTES, 4096, true)
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn preview_frames_are_bounded_unique_and_absent_on_writer_refusals() {
+        let valid = preview_console(PREVIEW_512);
+        assert!(validate_preview("", MINIMUM_TARGET_BYTES, 512, false).is_ok());
+        assert!(validate_preview(&valid, MINIMUM_TARGET_BYTES, 512, false).is_err());
+        assert!(validate_preview("", MINIMUM_TARGET_BYTES, 512, true).is_err());
+        assert!(
+            validate_preview(&format!("{valid}{valid}"), MINIMUM_TARGET_BYTES, 512, true).is_err()
+        );
+        for malformed in [
+            protocol::PREVIEW_MARKER.to_owned(),
+            format!("{}broken", protocol::PREVIEW_MARKER),
+        ] {
+            assert!(
+                validate_preview(&malformed, MINIMUM_TARGET_BYTES, 512, true)
+                    .unwrap_err()
+                    .contains("malformed")
+            );
+            assert!(validate_preview(
+                &format!("{valid}{malformed}\n"),
+                MINIMUM_TARGET_BYTES,
+                512,
+                true
+            )
+            .unwrap_err()
+            .contains("duplicate"));
+        }
+        let joined = valid.replace("}]}\n", "}]}[kernel console]\n");
+        validate_preview(&joined, MINIMUM_TARGET_BYTES, 512, true).unwrap();
+        for bad in [
+            format!("{} 1024 {{}}\n", protocol::PREVIEW_MARKER),
+            format!("{} 20 {{}}\n", protocol::PREVIEW_MARKER),
+            format!("{} nope {{}}\n", protocol::PREVIEW_MARKER),
+            preview_console(&format!("{}0{}", "[".repeat(9), "]".repeat(9))),
+            preview_console(&" ".repeat(protocol::MAX_PREVIEW_BYTES)),
+        ] {
+            assert!(validate_preview(&bad, MINIMUM_TARGET_BYTES, 512, true).is_err());
+        }
+        assert!(validate_preview(&valid, MINIMUM_TARGET_BYTES, 0, true).is_err());
+        assert!(validate_preview(&valid, MINIMUM_TARGET_BYTES + 1, 512, true).is_err());
+    }
+
     const INVENTORY_FIXTURE: &str = r#"{"version":1,"scope":"inventory-only","devices":[{"name":"vda","device_number":"252:0","capacity_bytes":6442450944,"read_only":false,"parent":null,"partition_number":null,"disk":{"sequence":11,"logical_sector_bytes":4096,"serial":"td-install-test","removable":false,"model":null,"wwid":null},"holders":[],"slaves":[]},{"name":"sr0","device_number":"11:0","capacity_bytes":1048576,"read_only":true,"parent":null,"partition_number":null,"disk":{"sequence":12,"logical_sector_bytes":2048,"removable":true,"model":null,"wwid":null,"serial":null},"holders":[],"slaves":[]},{"name":"vda1","device_number":"252:1","read_only":false,"capacity_bytes":536870912,"parent":"vda","partition_number":1,"disk":null,"holders":[],"slaves":[]},{"name":"vda2","device_number":"252:2","read_only":false,"capacity_bytes":5904510976,"parent":"vda","partition_number":2,"disk":null,"holders":[],"slaves":[]}]}"#;
 
     fn inventory_expectation() -> InventoryExpected<'static> {
@@ -2267,6 +2448,10 @@ mod tests {
         require_installation(&result, "uuid", "/dev/sdb", &target).unwrap();
         result.console = result.console.replace("/dev/sda2", "/dev/vda2");
         assert!(require_installation(&result, "uuid", "/dev/sdb", &target).is_err());
+    }
+
+    fn inventory_document(text: &str) -> Result<td_engine::json::Json, String> {
+        diagnostic_document(text, protocol::MAX_INVENTORY_BYTES)
     }
 
     #[test]

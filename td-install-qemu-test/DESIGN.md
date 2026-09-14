@@ -298,3 +298,26 @@ existing whole-target byte comparisons still establish write preservation;
 inventory alone does not. These observations cover all live
 legs of the 40-boot matrix and all four full-system ISO installations without
 adding boots or changing target admission.
+
+The live fixture also runs `td-install layout-preview` after successful
+layout and before volume formatting. It reads the target's bounded sysfs
+size in Linux 512-byte units, checks conversion to bytes and supplies that
+capacity and the observed logical sector size. This placement preserves
+the negative cases' direct exercise of the real layout writer: a preview
+refusal cannot replace an undersized or read-only formatter refusal.
+It is diagnostic sequencing, not the future wizard's review sequence.
+
+Inventory and preview share the same owned-child capture and reaping
+path. Preview stdout is bounded at 1024 bytes including its final newline.
+The host requires exactly one framed version-1 layout-preview report on
+successful, interrupted and repaired installations, and none on existing
+source or target refusal cases. It compares exact integer geometry,
+capacity and all fields of the two ordered partitions against the private
+attached disk and GPT boundaries. Malformed, truncated, duplicate, deeply
+nested or oversized reports refuse. As with inventory, trailing console
+text outside a complete frame is ignored; internal interleaving refuses.
+These checks run on both media attachments, virtio 512-byte/4Kn targets,
+AHCI 512-byte targets and the full-system installations without adding
+boots. Partition inventory, actual formatting and detached firmware boots
+retain their independent evidence. The report supplies no device identity,
+destination eligibility, immutable plan or destructive consent.

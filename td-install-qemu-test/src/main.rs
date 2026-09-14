@@ -256,49 +256,85 @@ fn configured_uuid() -> Result<String, String> {
         .ok_or_else(|| "configured volume UUID lacks its newline".into())
 }
 
-fn inventory_line(bytes: Vec<u8>) -> Result<String, String> {
-    if bytes.len() > MAX_INVENTORY_BYTES {
-        return Err("fixture inventory exceeds its byte limit".to_owned());
+fn diagnostic_line(bytes: Vec<u8>, limit: usize, label: &str) -> Result<String, String> {
+    if bytes.len() > limit {
+        return Err(format!("fixture {label} exceeds its byte limit"));
     }
-    let text = String::from_utf8(bytes).map_err(|_| "inventory is not UTF-8")?;
-    let line = text
-        .strip_suffix('\n')
-        .ok_or("inventory lacks final newline")?;
-    if line.is_empty() || line.contains(['\n', '\r']) {
-        return Err("inventory is not one complete line".into());
+    let mut text = String::from_utf8(bytes).map_err(|_| format!("{label} is not UTF-8"))?;
+    if !text.ends_with('\n') {
+        return Err(format!("{label} lacks final newline"));
     }
-    Ok(line.to_owned())
+    text.pop();
+    if text.is_empty() || text.contains(['\n', '\r']) {
+        return Err(format!("{label} is not one complete line"));
+    }
+    Ok(text)
 }
 
-fn inventory(marker: &str) -> Result<(), String> {
+fn diagnostic(marker: &str, args: &[&str], limit: usize, label: &str) -> Result<(), String> {
     let mut child = Command::new("/bin/td-install")
-        .arg("inventory")
+        .args(args)
         .stdout(Stdio::piped())
         .spawn()
-        .map_err(|error| format!("start inventory: {error}"))?;
+        .map_err(|error| format!("start {label}: {error}"))?;
     let captured = (|| {
-        let stdout = child.stdout.take().ok_or("inventory stdout is not piped")?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| format!("{label} stdout is not piped"))?;
         let mut bytes = Vec::new();
         stdout
-            .take(MAX_INVENTORY_BYTES as u64 + 1)
+            .take(limit as u64 + 1)
             .read_to_end(&mut bytes)
-            .map_err(|error| format!("read inventory: {error}"))?;
-        inventory_line(bytes)
+            .map_err(|error| format!("read {label}: {error}"))?;
+        diagnostic_line(bytes, limit, label)
     })();
     if captured.is_err() {
         let _ = child.kill();
     }
     let waited = child
         .wait()
-        .map_err(|error| format!("reap inventory: {error}"));
+        .map_err(|error| format!("reap {label}: {error}"));
     let json = captured?;
     let status = waited?;
     if !status.success() {
-        return Err(format!("inventory failed: {status}"));
+        return Err(format!("{label} failed: {status}"));
     }
     report(
         std::io::stdout(),
         format_args!("{marker} {} {json}", json.len()),
+    )
+}
+
+fn inventory(marker: &str) -> Result<(), String> {
+    diagnostic(marker, &["inventory"], MAX_INVENTORY_BYTES, "inventory")
+}
+
+fn preview(name: &str, geometry: u64) -> Result<(), String> {
+    let path = format!("/sys/class/block/{name}/size");
+    // A decimal u64 has at most twenty digits, followed by sysfs newline.
+    let bytes = read(Path::new(&path), 21)?;
+    let text = std::str::from_utf8(&bytes).map_err(|_| format!("{path}: non-ASCII capacity"))?;
+    let sectors = text
+        .strip_suffix('\n')
+        .ok_or_else(|| format!("{path}: missing newline"))?;
+    if sectors.is_empty() || !sectors.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(format!("{path}: invalid capacity"));
+    }
+    let capacity = sectors
+        .parse::<u64>()
+        .ok()
+        .and_then(|sectors| sectors.checked_mul(512))
+        .ok_or_else(|| format!("{path}: capacity overflow"))?;
+    diagnostic(
+        PREVIEW_MARKER,
+        &[
+            "layout-preview",
+            &geometry.to_string(),
+            &capacity.to_string(),
+        ],
+        MAX_PREVIEW_BYTES,
+        "layout preview",
     )
 }
 
@@ -339,6 +375,8 @@ fn install(device: &str, interrupt: bool) -> Result<(), String> {
         "/bin/td-install",
         &["layout", device, "/source/bzImage", "/selector.cpio"],
     )?;
+    // Keep negative cases testing the real writer's refusal before this report.
+    preview(name, geometry)?;
     command(
         "/bin/td-install",
         &[
@@ -732,24 +770,32 @@ mod tests {
     }
 
     #[test]
-    fn inventory_report_requires_one_bounded_complete_utf8_line() {
-        assert_eq!(inventory_line(b"{}\n".to_vec()).unwrap(), "{}");
-        for bytes in [
-            b"".to_vec(),
-            b"{}".to_vec(),
-            b"{}\n{}\n".to_vec(),
-            b"{}\r\n".to_vec(),
-            vec![0xff, b'\n'],
+    fn diagnostic_reports_require_one_bounded_complete_utf8_line() {
+        for (limit, label) in [
+            (MAX_INVENTORY_BYTES, "inventory"),
+            (MAX_PREVIEW_BYTES, "layout preview"),
         ] {
-            assert!(inventory_line(bytes).is_err());
+            assert_eq!(
+                diagnostic_line(b"{}\n".to_vec(), limit, label).unwrap(),
+                "{}"
+            );
+            for bytes in [
+                b"".to_vec(),
+                b"{}".to_vec(),
+                b"{}\n{}\n".to_vec(),
+                b"{}\r\n".to_vec(),
+                vec![0xff, b'\n'],
+            ] {
+                assert!(diagnostic_line(bytes, limit, label).is_err());
+            }
+            let mut exact = vec![b' '; limit];
+            if let Some(last) = exact.last_mut() {
+                *last = b'\n';
+            }
+            assert!(diagnostic_line(exact.clone(), limit, label).is_ok());
+            exact.insert(0, b' ');
+            assert!(diagnostic_line(exact, limit, label).is_err());
         }
-        let mut exact = vec![b' '; MAX_INVENTORY_BYTES];
-        if let Some(last) = exact.last_mut() {
-            *last = b'\n';
-        }
-        assert!(inventory_line(exact.clone()).is_ok());
-        exact.insert(0, b' ');
-        assert!(inventory_line(exact).is_err());
     }
 
     #[test]

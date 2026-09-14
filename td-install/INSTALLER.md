@@ -242,3 +242,10 @@ numbers supplied by its caller and does not bind a device identity. It
 does not establish source authenticity, boot-file fit, payload capacity,
 scratch availability, settings validity, exclusive admission or trusted
 destructive consent. Those checks remain required before installation.
+
+The QEMU installation diagnostics also invoke this command on actual
+virtio 512-byte/4Kn and AHCI 512-byte disk geometry. Their host compares
+its complete partition report against the attached private disk and GPT
+boundaries, alongside post-format inventory and detached firmware boots.
+The diagnostic queries after successful layout so negative cases still
+exercise formatter refusal; this is not the future wizard's sequencing.
