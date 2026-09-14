@@ -354,6 +354,41 @@ pub fn text_run(
     }
 }
 
+/// The tight RGB rows of a painted frame: `pixels` as a `Raster` over
+/// `surface` at `stride` left them, three bytes per pixel, row-major, for
+/// a PPM body or a page of one. Validation mirrors `Raster::new`.
+pub fn rgb(pixels: &[u8], surface: Surface, stride: usize) -> Result<Vec<u8>, Error> {
+    surface.check()?;
+    let row_bytes = surface.width * 4;
+    if stride < row_bytes || !stride.is_multiple_of(4) {
+        return Err(Error::InvalidArgument);
+    }
+    let needed = stride.checked_mul(surface.height).ok_or(Error::Limit)?;
+    if needed > MAX_FRAME_BYTES {
+        return Err(Error::Limit);
+    }
+    if pixels.len() < needed {
+        return Err(Error::InvalidArgument);
+    }
+    let mut out = Vec::with_capacity(surface.width * surface.height * 3);
+    for row in pixels.chunks(stride).take(surface.height) {
+        // The raster is XRGB little-endian ([B, G, R, X]); PPM wants RGB.
+        for [blue, green, red, _] in row.get(..row_bytes).unwrap_or(&[]).as_chunks::<4>().0 {
+            out.extend_from_slice(&[*red, *green, *blue]);
+        }
+    }
+    Ok(out)
+}
+
+/// A binary PPM (`P6`, 255 maximum) over rows `rgb` produced.
+pub fn ppm(surface: Surface, rgb: &[u8]) -> Vec<u8> {
+    let header = format!("P6\n{} {}\n255\n", surface.width, surface.height);
+    let mut out = Vec::with_capacity(header.len() + rgb.len());
+    out.extend_from_slice(header.as_bytes());
+    out.extend_from_slice(rgb);
+    out
+}
+
 pub struct Raster<'pixels, 'font> {
     pixels: &'pixels mut [u8],
     font: &'font Font,

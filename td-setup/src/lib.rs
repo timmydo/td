@@ -38,11 +38,9 @@ pub fn preview(width: usize, height: usize, scale: u8) -> Result<Vec<u8>, String
 /// at `scale`, for a still-frame preview a caller can write out or inspect.
 pub fn preview_ppm(width: usize, height: usize, scale: u8) -> Result<Vec<u8>, String> {
     let pixels = preview(width, height, scale)?;
-    let mut ppm = format!("P6\n{width} {height}\n255\n").into_bytes();
-    ppm.reserve(width * height * 3);
-    // The raster is tight XRGB little-endian ([B, G, R, X]); PPM wants RGB.
-    for [blue, green, red, _] in pixels.as_chunks::<4>().0 {
-        ppm.extend_from_slice(&[*red, *green, *blue]);
-    }
-    Ok(ppm)
+    let scale = Scale::new(scale).map_err(|error| format!("{error:?}"))?;
+    let surface = Surface::new(width, height, scale).map_err(|error| format!("{error:?}"))?;
+    let rgb =
+        td_ui::raster::rgb(&pixels, surface, width * 4).map_err(|error| format!("{error:?}"))?;
+    Ok(td_ui::raster::ppm(surface, &rgb))
 }

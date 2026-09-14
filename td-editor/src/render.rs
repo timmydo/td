@@ -715,17 +715,10 @@ pub fn preview(output: &mut impl std::io::Write) -> std::io::Result<()> {
         let mut pixels = vec![0; 800 * 600 * 4];
         Raster::new(&mut pixels, &font, geometry.surface(), 800 * 4)?
             .paint(&scene, geometry.bounds())?;
-        Ok(pixels)
+        let rgb = td_ui::raster::rgb(&pixels, geometry.surface(), 800 * 4)?;
+        Ok(td_ui::raster::ppm(geometry.surface(), &rgb))
     };
-    let pixels = fixture().map_err(std::io::Error::other)?;
-    output.write_all(b"P6\n800 600\n255\n")?;
-    let mut row = Vec::with_capacity(800 * 3);
-    for source in pixels.as_chunks::<{ 800 * 4 }>().0 {
-        row.clear();
-        for [blue, green, red, _] in source.as_chunks::<4>().0 {
-            row.extend_from_slice(&[*red, *green, *blue]);
-        }
-        output.write_all(&row)?;
-    }
+    let ppm = fixture().map_err(std::io::Error::other)?;
+    output.write_all(&ppm)?;
     Ok(())
 }

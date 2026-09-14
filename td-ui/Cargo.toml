@@ -2,7 +2,7 @@
 name = "td-ui"
 version = "0.1.0"
 edition = "2021"
-description = "td's dependency-free UI toolkit: the shared Unifont face and Wayland wire codec, XKB keyboard translation, held-key repeat and pointer decoding, the clipped XRGB raster with its palette and scrollbar geometry, the Wayland client connection over its own descriptor transport and the client over it, and the driving layer (frame and envelope codecs, private control-socket publication, the bounded request worker and the replay runner) an agent or a test operates a consumer through, for td-owned graphical programs"
+description = "td's dependency-free UI toolkit: the shared Unifont face and Wayland wire codec, XKB keyboard translation, held-key repeat and pointer decoding, the clipped XRGB raster with its palette and scrollbar geometry, the Wayland client connection over its own descriptor transport and the client over it, and the driving layer (frame and envelope codecs, private control-socket publication, the bounded request worker, the replay runner and the semantic seam: a controller over a consumer's action table, generic verbs, text read back from the draw stream and the painted frame) an agent or a test operates a consumer through, for td-owned graphical programs"
 license = "GPL-3.0-or-later"
 
 # Own workspace root, so cargo behaves the same from the main checkout as from

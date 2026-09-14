@@ -74,8 +74,12 @@ consumer's request type behind `Parse`; and `replay::run` is the
 consecutive-frame runner behind a headless `--replay`. td-editor's control
 socket, worker and replay run on them, wire-compatible with its
 CONTROL.md; what a request means, and whether it may read or act, stays
-the consumer's. The semantic half, a driven controller over an action
-table with generic verbs, is increment 8(b), below under "Driving".
+the consumer's. Newly built (increment 8(b)): `driven`, the semantic
+half, a `Controller` a consumer implements once over its own action
+table, the generic verbs routed over the envelope, the text read back
+from the draw stream and the painted frame, digested and paged; and the
+raster's one XRGB-to-PPM writer, which td-setup's and td-editor's
+previews now use. td-photo consumes the seam in its next increment.
 
 ## Purpose and trust position
 
@@ -133,17 +137,17 @@ of its own files may name each module.
   `announce` under the budgets; `UTF8` and `PLAIN`, the two text MIMEs a
   consumer offers and accepts; `OFFER_LIMIT`, `ANNOUNCEMENTS` and
   `MIME_BYTES`.
-- `raster`: `Rect`, `Scale` (1 through 4), `Weight`, `GlyphStyle`,
-  `Primitive`, `Draw`, `Surface`, the `Composition` trait, `Scrollbar`,
-  `text_run`, `Raster`, `Error`, the axis and frame-byte ceilings and the
-  palette constants. A composition reports the surface it was laid out for
-  and streams the draws inside a damage rectangle; `Raster::new` validates
-  surface, font, stride and buffer before any write, and `Raster::paint`
-  refuses a composition laid out for another surface. The behavioural
-  contract (clipping, the medium fringe, scrollbar proportions and drag
-  rounding) is the one td-editor/DESIGN.md records under "Implemented
-  reference-renderer contract"; that text moves here with the
-  documentation increment.
+- `raster`: `Rect`, `Scale` (1 through 4), `Weight`, `GlyphStyle`, `Primitive`,
+  `Draw`, `Surface`, the `Composition` trait, `Scrollbar`, `text_run`, `Raster`,
+  `Error`, the axis and frame-byte ceilings, the palette constants, and `rgb`
+  and `ppm`, a painted frame as tight RGB rows and as a binary PPM. A
+  composition reports the surface it was laid out for and streams the draws
+  inside a damage rectangle; `Raster::new` validates surface, font, stride and
+  buffer before any write, and `Raster::paint` refuses a composition laid out
+  for another surface. The behavioural contract (clipping, the medium fringe,
+  scrollbar proportions and drag rounding) is the one td-editor/DESIGN.md
+  records under "Implemented reference-renderer contract"; that text moves here
+  with the documentation increment.
 - `chrome`: `Bar` with its `Panel`, `Block`, `Strip`, `Status`, `List`
   and `TextEntry`, the `Row` a panel paints, the `Item` a list paints,
   the `Field` a text entry paints and `step`, the bands, the paged list
@@ -271,6 +275,14 @@ of its own files may name each module.
   `respond_with`, `respond`), the bounded transport under "Bounded
   worker" below.
 - `replay`: `run`, the consecutive-frame runner over a consumer's handler.
+- `driven`: `KEY_BYTES`, `ARGUMENTS`, `PAGE_BYTES` and `WHEEL_LIMIT`;
+  `PointerPhase`, `Input` and `Outcome` with its `word`; `Binding`, one
+  row of a consumer's action table, with `check`, `bound` and `help`; the
+  `Controller` trait (`bindings`, `action`, `input`, `state`,
+  `compose`, `request`); `VERBS` and `request`, the generic router;
+  `Payload`, the worker's request type for a driven consumer; `text`,
+  the read-back of a composition's draw stream; `paint` and the `Frame`
+  it returns with its `ppm`; and `fnv1a64`, the frame digest.
 
 ## Driving
 
@@ -575,28 +587,90 @@ owns no state and no descriptor: a consumer's `--replay` hands it its
 stdin and stdout and a closure over its own headless session, so the
 same parser and dispatcher answer both the socket and the replay.
 
-### The semantic seam (increment 8(b))
+### The semantic seam
 
-What the transport carries is, so far, each consumer's own. The next
-landing adds the half that lets a new consumer be driven without
-designing a protocol: `driven`, with a semantic input event (a key chord,
-a pointer phase at a position, wheel rows and columns, a resize, focus, a
-tick), an outcome, and a `Controller` trait a consumer implements over
-its own closed action type; an action table (name, chord, replay name and
-argument shape, help line) checked once for uniqueness and printed by
-`--help actions` so an agent reads it instead of guessing; a request
-router for the generic verbs `action NAME ARGS...`, `key HEX_CHORD`,
-`pointer PHASE X Y`, `wheel ROWS COLUMNS`, `resize W H`, `focus 0|1`,
-`tick MS`, `wait-frame GENERATION`, `frame` and `text`; `text` read back
-from a `Composition`'s draw stream, since every widget already emits its
-glyphs as Unicode scalars, which is the accessibility-tree question
-answered at the seam the toolkit already has; and one XRGB-to-PPM writer
-replacing the three copies in td-setup, td-editor and td-photo. A
-consumer keeps its own `state` body and its own verbs beside the generic
-ones. td-photo is the first consumer; td-editor keeps its own `Event`,
-whose tab and revision fences are its admission contract, and is not
-required to adopt the seam; td-setup and td-portal adopt it when their
-pages need driving.
+`driven` is the half a consumer implements once so an agent or a test can
+operate it without a protocol of its own; td-photo consumes it first. A consumer
+gives a `Controller`: `bindings`, its closed action table; `action`, applying a
+named action with the fields the request carried; `input`, delivering one
+semantic `Input` (a key chord, a pointer phase at a pixel position, wheel rows
+and columns, a resize, focus, a tick) through the same key and pointer paths its
+window uses; `state`, the tab-separated body of its facts; `compose`, one
+reading of what the window shows now, building a scene that borrows its model
+per request if that is how it draws; and `request`, its own verbs beyond the
+generic set, `protocol` by default. Its `Error` maps the transport's two in and
+gives its codes out through `ErrorCode`, as for the transport. td-editor keeps
+its own `Event`, whose tab and revision fences are its admission contract, and
+does not adopt the seam; td-setup and td-portal adopt it when their pages need
+driving.
+
+The action table is `Binding` rows: the name `action` takes, the chord
+the consumer's keyboard binds by default, the argument shape and a help
+line. `check` holds a table to its grammar (names in the code grammar and
+unique, chords unique and within the key bound, shapes and help printable
+ASCII, help present), and a consumer pins its table with it; `bound`
+answers which action a chord names; `help` prints the table aligned,
+which a consumer's `--help actions` shows so an agent reads the table
+instead of guessing.
+
+`request` routes one payload over `control`'s envelope, at most eight
+fields after the verb, and answers as `control` frames it (field spaces
+denote literal Tabs):
+
+- `1 ID state`: the consumer's body.
+- `1 ID actions`: `N`, then per action its name and, each in hex with
+  `-` for none, its chord, argument shape and help.
+- `1 ID action NAME ARGS...`: NAME must be in the table, else
+  `protocol`; the consumer's `action` judges the fields; the reply is the
+  outcome word, `changed`, `ignored` or `quit`.
+- `1 ID key HEX_CHORD`: the chord, 1 to 32 bytes of UTF-8 without control
+  characters, through `input`; the outcome word.
+- `1 ID pointer PHASE X Y`: `press`, `move` or `release` at pixel X, Y,
+  each a `u32`; the outcome word.
+- `1 ID wheel ROWS COLUMNS`: signed whole cells, magnitude at most
+  16,777,216; the outcome word.
+- `1 ID resize W H SCALE`: refused as the raster's `Scale` and `Surface`
+  would refuse it, before the consumer sees it; the outcome word.
+- `1 ID focus 0|1` and `1 ID tick MS`: the outcome word.
+- `1 ID text`: `ROWS COLUMNS HEX_TEXT`: the cell grid's rows and columns
+  and the read-back below, of at most ROWS lines.
+- `1 ID frame`: `W H SCALE DIGEST`, the FNV-1a 64 of the frame's RGB rows
+  in hex.
+- `1 ID frame-page OFFSET LIMIT`: `W H OFFSET HEX_BYTES` of the RGB rows,
+  LIMIT 1 to 256 KiB (`PAGE_BYTES`), an offset past the end `protocol`.
+- A generic verb (`VERBS`) with fields it does not take: `protocol`,
+  at the router. Anything else: the consumer's `request`.
+
+The reading verbs borrow the controller; `action`, `key`, `pointer`,
+`wheel`, `resize`, `focus` and `tick` go through the consumer's own
+admission, which is where reading and acting are told apart (§S). The
+digest is an equality witness for tests and agents, not a hash for
+anything adversarial; a frame of any size crosses the wire in pages under
+the frame ceiling, and `paint` repaints per request, so the pages of one
+frame are consistent only while the consumer's state is.
+
+A socket consumer runs `Worker<Payload>`: `Payload`'s `Parse` validates the
+envelope and the field count on the worker's thread, so a malformed frame is
+refused there as the transport promises, and the turn answers each job with
+`request` over the payload's bytes, where the verb and its fields are judged
+against the consumer. A replay hands `request` each frame's payload. `quit` is
+reported, not acted on: the runner keeps answering and a window closes on its
+own terms, so a consumer tracks its own quit.
+
+`text` reads the composition's draw stream onto the surface's cell grid at its
+scale: each glyph lands in the cell its origin names (an origin off the grid, a
+glyph straddling the top or left edge included, names none), a later draw over
+an earlier one, a fill clearing every cell it wholly covers, so an opaque panel
+hides what it paints over, a glyph whose clip excludes it wholly absent; rows
+are trimmed on the right and trailing blank rows dropped, so the text has at
+most ROWS lines. That is the accessibility question answered at the seam the
+toolkit already has: every widget emits its text as Unicode scalars, so nothing
+is retyped for the agent. `paint` paints the composition into a fresh buffer
+through the pinned face, parsed once per process, and returns the `Frame`, its
+surface and tight RGB rows, whose `ppm` is the binary image; `raster::rgb` and
+`raster::ppm` are the one XRGB-to-PPM writer, which td-setup's `preview_ppm` and
+td-editor's `--preview` use (td-photo's PPM writer is for its RGB thumbnails,
+not frames, and stays its own).
 
 ## Invariants
 
@@ -613,7 +687,9 @@ pages need driving.
   `replay`, which reads and writes only the streams it is handed. Even
   they read no environment variable, taking the display values and the
   socket path as explicit arguments.
-- `control` is pure: the frame, envelope and codecs touch no descriptor.
+- `control` and `driven` are pure: the frame, envelope and codecs touch
+  no descriptor, and the seam reads only the composition it is handed and
+  the embedded face.
   The decoder allocates at most one frame, after validating its length,
   and `frame` checks the ceiling before allocating its output; the
   envelope hands fields on as a bounded iterator; the codecs and `ok`
@@ -929,20 +1005,34 @@ shutdown cancellation and owned endpoint removal. `replay`'s tests drive the
 runner bytewise through consecutive frames, EOF between frames, partial
 headers, bad lengths, short bodies and a refused reply.
 
-`tests/confinement.rs` adds `control.rs` to the pure set and the three
-adapters to the inventory, and carries td-editor's pins over the moved
+`tests/driven.rs` drives the seam end to end through a toy consumer, a counter
+with a four-row action table, a two-line composition and one verb of its own:
+the table's grammar (each refusal of `check` by message, `bound`, the aligned
+`help`), every generic verb and its refusals in the envelope (the consumer's own
+codes among them, and a code of its own marking whatever reached it, so the
+router's refusals are told from the consumer's), the text read back with an
+overpainted cell, a wholly clipped glyph, a fill over a row and over one cell, a
+surface smaller than the text, one narrower than a cell and one taller than the
+text, the frame digest stable across identical states and moved by a change, its
+pages reassembling the RGB rows exactly and the largest page framing under the
+ceiling, the whole seam behind the replay runner, and `Payload` behind a live
+worker, a malformed frame refused on the worker's thread and the rest answered
+on the turn.
+
+`tests/confinement.rs` adds `control.rs` and `driven.rs` to the pure set and the
+three adapters to the inventory, and carries td-editor's pins over the moved
 modules: the socket's open flags, path and identity constants, procfs reads,
 mode and identity checks, and the absence of `connect`, environment reads,
 canonicalization, a fixed overflow number and the trusted-root variable; the
 worker's thread name, its slot, buffer and deadline constants, its bounded
-channels and nonblocking operations, `R::parse` as its sole parse site, and
-the absence of blocking reads, writes and receives; and the runner's ceiling
-check, its two exact reads and one framed reply. The socket's
+channels and nonblocking operations, `R::parse` as its sole parse site, and the
+absence of blocking reads, writes and receives; and the runner's ceiling check,
+its two exact reads and one framed reply. The socket's
 `/proc/sys/kernel/overflowuid` literal is excluded from the raw-module
 identifier count by name, as td-editor excluded it. The consumer-level
 conformance, td-editor's request grammar, refusal parity between socket and
-replay, and its window's two-jobs-per-turn polling, stays in td-editor's
-suites and confinement tests.
+replay, and its window's two-jobs-per-turn polling, stays in td-editor's suites
+and confinement tests.
 
 The builder discovers the crate by existing. Its gate runs `cargo test` and
 all-target Clippy; a change under `td-ui/` selects td-editor's tests through
@@ -1029,4 +1119,5 @@ the reader graph, because td-editor's manifest names the crate.
    "Driving": `driven` with the input event, outcome, `Controller`
    trait, action table and generic verbs, `text` read back from a
    `Composition`'s draw stream and one XRGB-to-PPM writer, proven with a
-   toy controller in the crate's tests; td-photo is its first consumer.
+   toy controller in the crate's tests. Landed; td-photo consumes it
+   next.

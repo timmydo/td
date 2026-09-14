@@ -218,6 +218,46 @@ fn surface_scale_stride_font_and_size_errors_precede_all_writes() {
     assert!(data.iter().all(|b| *b == 0xaa));
 }
 
+#[test]
+fn rgb_rows_skip_stride_padding_and_validation_precedes_the_copy() {
+    use td_ui::raster::{ppm, rgb, Error, Scale, Surface};
+    let s = surface(3, 2, 1);
+    // Two rows at a 16-byte stride: three XRGB pixels, four padding bytes.
+    let mut pixels = vec![0xaa; 32];
+    for (i, px) in [[1u8, 2, 3, 0], [4, 5, 6, 0], [7, 8, 9, 0]]
+        .iter()
+        .enumerate()
+    {
+        pixels[i * 4..i * 4 + 4].copy_from_slice(px);
+    }
+    for (i, px) in [[10u8, 11, 12, 0], [13, 14, 15, 0], [16, 17, 18, 0]]
+        .iter()
+        .enumerate()
+    {
+        pixels[16 + i * 4..16 + i * 4 + 4].copy_from_slice(px);
+    }
+    let rows = rgb(&pixels, s, 16).unwrap();
+    assert_eq!(
+        rows,
+        [3, 2, 1, 6, 5, 4, 9, 8, 7, 12, 11, 10, 15, 14, 13, 18, 17, 16]
+    );
+    assert_eq!(
+        ppm(s, &rows),
+        [b"P6\n3 2\n255\n".as_slice(), &rows].concat()
+    );
+    // Validation mirrors `Raster::new`, before any byte is copied.
+    assert_eq!(rgb(&pixels, s, 8), Err(Error::InvalidArgument));
+    assert_eq!(rgb(&pixels, s, 14), Err(Error::InvalidArgument));
+    assert_eq!(rgb(&pixels[..31], s, 16), Err(Error::InvalidArgument));
+    let empty = Surface {
+        width: 0,
+        height: 2,
+        scale: Scale::new(1).unwrap(),
+    };
+    assert_eq!(rgb(&pixels, empty, 16), Err(Error::InvalidArgument));
+    assert_eq!(rgb(&pixels, s, usize::MAX & !3), Err(Error::Limit));
+}
+
 /// A composition laid out for another surface is refused before a write.
 #[test]
 fn a_composition_for_another_surface_is_refused_unpainted() {
