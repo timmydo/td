@@ -23,7 +23,7 @@ fn compact(text: &str) -> String {
     text.chars().filter(|c| !c.is_whitespace()).collect()
 }
 
-const PURE: [&str; 17] = [
+const PURE: [&str; 21] = [
     "charts.rs",
     "chrome.rs",
     "confirmations.rs",
@@ -36,6 +36,10 @@ const PURE: [&str; 17] = [
     "raster.rs",
     "repeat.rs",
     "split.rs",
+    "tree_table.rs",
+    "tree_table_geometry.rs",
+    "tree_table_model.rs",
+    "tree_table_paint.rs",
     "xkb.rs",
     "xkb_compat.rs",
     "xkb_keys.rs",

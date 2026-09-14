@@ -52,6 +52,10 @@ pub mod repeat;
 pub mod replay;
 pub mod split;
 mod sys;
+pub mod tree_table;
+mod tree_table_geometry;
+mod tree_table_model;
+mod tree_table_paint;
 pub mod wayland;
 #[allow(clippy::new_without_default)]
 #[path = "../../td-compositor/src/wire.rs"]

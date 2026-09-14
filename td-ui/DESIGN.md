@@ -1281,27 +1281,90 @@ clamp/fallback restoration, stationary/returning clicks, invalid inputs
 and focused/partial repaint pixel oracles on both axes that leave child
 pixels untouched.
 
-## Planned task-manager widgets
+## Shared tree table
+
+`tree_table::Model` captures a validated visible preorder over opaque
+`Copy + Ord` row IDs. The consumer chooses the full hierarchy, filtering,
+expansion and sibling ordering; each visible nonroot names its nearest
+preceding ancestor, whose children must be expanded. Root rows have no
+parent and depth zero. Duplicate IDs, depth jumps, revived old ancestors
+and children beneath collapsed or leaf rows are refused. Synthetic roots
+have ordinary opaque IDs; the widget gives them no process authority.
+
+The model owns only row metadata, a sorted ID/index lookup and column
+headings. It reserves fallibly, sorts without allocation and exports
+capacity-based `storage_bytes()` including titles and inline model state,
+not allocator bookkeeping. Limits are 32768 visible rows, depth 256,
+16 columns, 128-byte nonempty control-free headings and 16 MiB of model
+storage. Columns provide logical minimum/preferred widths, at most 8192;
+minima hold their complete headings, insets, sort mark and border. The first minimum is at
+least 32 pixels; consumers can widen it to reveal deeper indentation.
+
+Cell values remain in the consumer. `Cell::new` validates control-free
+text through 4096 bytes, with an explicit empty-cell fallback. `emit`
+requests borrowed values only for rows and columns intersecting both the
+visible viewport and damage, then streams clipped draws without allocation
+or I/O. Returned text must outlive the complete emit call; a callback cannot
+return a borrow into its mutable formatting scratch. Consumers prepare
+numeric strings in a bounded visible cache before painting.
+Numeric columns align right; the first column reserves 16 logical pixels
+per hierarchy level and a disclosure slot, clipped to that column.
+
+`Controller` owns the model and stable selection. A model replacement
+preserves selection and the first visible anchor by ID when present
+(subject to viewport clamping), clamps the old position when its anchor disappears, and clears selection
+when its ID disappears. Replacement preserves widths when headings and numeric roles are unchanged,
+clamping to new minima; a changed column schema uses its new preferences.
+`width` and `set_width` let the consumer save and restore widths. Mutation,
+resize, focus changes, scroll and keys retire pending pointer capture.
+`captured()` lets a consumer defer refresh while a pointer gesture is active.
+The consumer must replace the model when row membership, ordering or
+expansion changes; editing values alone does not reinterpret row IDs.
+
+Shared geometry moves headings and cells together during horizontal
+scrolling. A vertical scrollbar has a reserved gutter; a horizontal one
+appears only when columns exceed the viewport. Captured scrollbar motion
+retains its grab offset and exact starting position, clamps beyond the
+window and ends on release or cancellation. Wheel-style scroll events
+carry rows and 16-logical-pixel horizontal steps. Invalid geometry returns
+an error after retiring old draws and hits. Extents too small for a header
+and one row yield no layout, leaving the consumer its fallback.
+
+Pointer presses capture row IDs and a role: selection, disclosure or
+column heading. Matching release emits that semantic intent once. Moving
+away, refresh, focus loss and resize prevent a later release from naming
+a new row at the old position. Moving away retains canceled capture until
+release, consuming that release without an intent even outside the table.
+Disclosure intents include the requested
+expanded state; sort intents name a column, without applying policy.
+Pointer presses give rows keyboard focus; clicking a sort heading keeps
+that row focus. Reapplying the same focus preserves capture, while changing
+focus retires it. Selected rows and keyboard-focused headings have
+contrasting feedback.
+The consumer provides an optional ascending/descending sort indicator.
+
+The adapter routes focus to rows or a validated heading. Up/Down,
+PageUp/PageDown and First/Last select and reveal rows. Up/Down without a
+selection start at the first visible row; unchanged navigation is consumed
+without repeating a selection intent. Left collapses an
+expanded branch, otherwise selects its parent; Right expands a collapsed
+branch, otherwise selects its first visible child. Activate emits a row
+activation or heading sort intent. Header Left/Right and First/Last move
+and reveal the focused heading. ScrollLeft/ScrollRight move the horizontal
+viewport. Navigation honors repeats; repeated Activate is consumed.
+The consumer owns physical key bindings and focus traversal.
+
+Tests cover bounded hierarchy and text validation, stable ID/anchor
+replacement, stale and interrupted gestures, disclosure and navigation,
+scrollbar capture, horizontal header/cell/hit alignment, visible-only
+formatting, fallback and scale 1-4 clipping/partial-repaint pixel oracles.
+
+## Task-manager widgets
 
 [td-taskmgr](../td-taskmgr/DESIGN.md) is a planned consumer. Menus and
-confirmations, nonclosable resource tabs, charts and the split pane are
-implemented. The tree table remains a target contract, not an existing
-public API. Add it as a reusable td-ui widget before the task manager
-depends on it. Process collection, history and signal execution stay in
-the consumer.
-
-- A tree table with stable opaque row IDs, disclosure controls, sortable
-  column headings, selection, scroll anchors and visible-row rendering.
-  Column definitions carry explicit minimum and preferred widths; the first
-  column includes indentation and disclosure geometry. Horizontal scrolling
-  moves headings and cells together, with matching clipped hit regions and
-  a horizontal scrollbar when the columns exceed the viewport. The consumer
-  chooses column values and widths within the widget's validated bounds.
-  The consumer supplies validated hierarchy and sibling ordering; td-ui
-  emits expand/collapse, sort and selection intents without flattening away
-  parentage or deciding application policy. Reuse list, scrollbar and text
-  primitives. Refresh does not retarget an in-flight pointer gesture by row
-  index, and keyboard navigation can reveal a selected row.
+confirmations, nonclosable resource tabs, charts, the split pane and tree
+table are implemented as shared widgets. Process collection, history and
+signal execution stay in the consumer.
 
 All these widgets preserve the pure-input and semantic draw-stream seams
 above. They introduce no filesystem access, process authority, external
@@ -1317,7 +1380,7 @@ The task-manager widget sequence is tracked in
 [td-taskmgr's delivery plan](../td-taskmgr/DESIGN.md#validation-and-delivery):
 menus, confirmations and resource tabs, followed by charts, a split pane
 and a tree table, each with shared-widget oracles and existing consumer
-regressions. Those planned increments extend the original sequence below.
+regressions. Those increments extend the original sequence below.
 
 1. Rule and crate: the lock guard admits sibling roster dependencies; the
    crate exists with the input layer, the shared codecs and the cell
