@@ -246,7 +246,7 @@ validation, fixed operation schedules for secret scalars and AES, no
 secret-indexed tables, and an explicit analysis of compiler/timing and
 memory-erasure limits. It must not introduce a proprietary token protocol
 or replace the required PIN/UV policy with touch-only authentication.
-The AES prerequisite below does not supply P-256 or a working token protocol.
+The primitives below do not supply a working token protocol.
 Any proposal to change this boundary requires a new explicit user decision.
 
 ### Implemented CTAP AES prerequisite
@@ -297,6 +297,97 @@ inputs. `tests/aes_vectors.py` regenerates the public literals in
 `tests/aes_vectors.txt`; it is an optional host fixture tool and never a
 build or test dependency. Host and td-built tests consume only those
 committed literals. These are primitive tests, not PIN or YubiKey evidence.
+
+### Implemented P-256 prerequisite
+
+`src/fido_p256.rs` supplies private P-256 public-key derivation, raw ECDH
+and ES256 verification. It has no device, entropy, protocol or notebook
+consumer. Existing TPM-backed application assertions are unchanged. The
+curve is fixed to secp256r1/P-256 from
+[Standards for Efficient Cryptography 2 (SEC 2)](https://www.secg.org/sec2-v2.pdf).
+Operations follow [Standards for Efficient Cryptography 1 (SEC 1)](https://www.secg.org/sec1-v2.pdf)
+and [FIPS 186-5](https://doi.org/10.6028/NIST.FIPS.186-5).
+
+Private-scalar admission takes ownership of exactly 32 big-endian bytes,
+accepts only `1 <= d < n`, and clears its owner on rejection or drop. The
+future protocol adapter must sample fresh kernel randomness with rejection
+of invalid candidates; reducing random bytes modulo n is not key generation.
+Fill the candidate's heap allocation directly and clear it on entropy
+failure; do not copy a plaintext stack array into the box.
+Public-key admission accepts two fixed 32-byte coordinates, rejects either
+coordinate at or above p, and checks `y^2 = x^3 - 3x + b`. It cannot encode
+infinity. For this fixed curve, cofactor one and prime group order make an
+admitted finite on-curve point a member of the required subgroup. Arbitrary
+curves, compressed-point parsing and noncanonical reduction are absent.
+
+ECDH returns the fixed-width big-endian x-coordinate in a secret owner,
+including leading zero bytes. This raw result is not a vault key or an
+authenticated peer identity. The CTAP adapter must apply the negotiated
+protocol's KDF and authenticate its messages. ES256 verification accepts an
+already computed SHA-256 digest and fixed-width r/s values, requires both in
+`1..n`, computes `u1*G + u2*Q`, rejects infinity, and compares x modulo n
+with r. Both high- and low-s forms are valid. DER, COSE, challenge, RP ID,
+UP/UV, authenticator data and extension admission remain adapter duties;
+the primitive cannot confer authorization by itself.
+
+Field and scalar arithmetic use different instantiations of a private
+Montgomery-residue type with four little-endian u64 words, radix `B=2^64`
+and `R=B^4`. Residues stay below their fixed modulus. Addition tracks the
+carry above R; subtraction conditionally adds the modulus with masks. Each
+Montgomery multiplication performs four operand-scanning iterations and a
+single final conditional subtraction. At each iteration the shifted
+accumulator is below `m+b < 2m`, where b is the second operand. Before
+shifting, the two product additions are below `B*(m+b) < 2*B*m`; six words
+retain the carry and the extra word is at most one. Each u128 product/add
+fits because `(B-1)^2 + (B-1) + (B-1) = B^2-1`. Both moduli exceed R/2,
+so one subtraction also suffices for reducing a 256-bit digest or affine x
+modulo n. Inversion uses a fixed 256-bit square/multiply schedule for the
+public exponent `m-2`; internal zero inversion maps to zero, and consumers
+reject zero denominators or signature scalars before using it.
+
+Jacobian point arithmetic implements the
+[Explicit-Formulas Database](https://www.hyperelliptic.org/EFD/g1p/auto-shortw-jacobian-3.html)
+`dbl-2001-b` and `add-2007-bl` equations. Addition always computes and masks
+the equality, inverse and infinity cases; doubling canonicalizes infinity
+with a mask. Scalar multiplication always visits 256 bits, doubles, adds,
+and selects without a secret-dependent table or source branch. Allocation
+and admission/result errors are outside that arithmetic loop. For admitted
+ECDH inputs, its final point cannot be infinity. Verification inputs and
+its validity result are public.
+
+SecretScalar and SharedSecret have private heap-backed byte owners without
+Clone or Debug. Their drops, the Montgomery accumulator, conversion buffers,
+and selected point work buffers use clears followed by `black_box` barriers.
+Arithmetic residues and points are Copy values: intermediate field elements,
+inversion state, prior accumulator copies and registers are not all cleared.
+This is the same best-effort erasure boundary as AES, not comprehensive
+memory erasure. `black_box` also discourages replacing masks with branches;
+it does not guarantee constant-time code. The actual consumer binary needs
+the shipped-compiler inspection gate before hardware integration. No
+cross-compiler timing, physical side-channel or cryptographic certification
+claim follows from these source-level schedules or test vectors.
+
+The ordinary and source-built suites consume `tests/p256_vectors.txt`:
+25 NIST ECCCDH cases, 15 NIST ES256 cases (three valid, twelve invalid),
+12 NIST public-key cases (four valid, four off-curve rejections, and four
+overwide rows refused by the fixed-width boundary before the primitive),
+16 OpenSSL boundary and patterned-scalar ECDH cases, one leading-zero ECDH
+case, 68 Python integer arithmetic cases across
+p and n, an OpenSSL-verified valid signature with verification x above n,
+and three OpenSSL-verified signatures with digests n, n+1 and 2^256-1.
+Tests also pin opposite-s acceptance, scalar/coordinate range refusal,
+infinity rejection, equal/inverse points and scaled Jacobian coordinates.
+These are primitive oracles, not physical token or user-verification proof.
+
+`tests/p256_vectors.py` is an optional offline Python 3.12/OpenSSL 3.5.7
+fixture generator. It imports no td implementation, checks the archive
+SHA-256 values below, and never enters the build/test/runtime dependency
+closure. Its NIST inputs are public CAVP data, not CAVP validation:
+
+- [ECCCDH archive](https://csrc.nist.gov/CSRC/media/Projects/Cryptographic-Algorithm-Validation-Program/documents/components/ecccdhtestvectors.zip):
+  `5fff092551f2d72e89a3d9362711878708f9a14b502f0dfae819649105b0ea39`.
+- [ECDSA archive](https://csrc.nist.gov/CSRC/media/Projects/Cryptographic-Algorithm-Validation-Program/documents/dss/186-4ecdsatestvectors.zip):
+  `fe47cc92b4cee418236125c9ffbcd9bb01c8c34e74a4ba195d954bcb72824752`.
 
 ## Independently landable increments
 

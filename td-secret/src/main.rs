@@ -37,6 +37,8 @@ mod fido_cbor;
 mod fido_ctap;
 #[allow(dead_code, reason = "enrollment construction and verified assertion support")]
 mod fido_enroll;
+#[allow(dead_code, reason = "P-256 prerequisite; no portable protocol consumer yet")]
+mod fido_p256;
 #[path = "../../td-firstboot/src/principals.rs"]
 #[allow(dead_code, reason = "shared immutable session identity loader")]
 mod principals;
@@ -196,6 +198,7 @@ mod confinement {
             ("fido_enroll.rs", include_str!("fido_enroll.rs")),
             ("fido_hid.rs", include_str!("fido_hid.rs")),
             ("fido_metadata.rs", include_str!("fido_metadata.rs")),
+            ("fido_p256.rs", include_str!("fido_p256.rs")),
             ("store.rs", include_str!("store.rs")),
             ("sys.rs", include_str!("sys.rs")),
             ("system_vm.rs", include_str!("system_vm.rs")),
@@ -263,6 +266,7 @@ pub fn take_received(fd: RawFd) -> Result<File, String> {
                 "fido_enroll.rs",
                 "fido_hid.rs",
                 "fido_metadata.rs",
+                "fido_p256.rs",
                 "main.rs",
                 "operation.rs",
                 "portable.rs",

@@ -19,6 +19,7 @@ const MODULES: &[(&str, &str)] = &[
     ("fido_enroll", include_str!("../../../td-secret/src/fido_enroll.rs")),
     ("fido_hid", include_str!("../../../td-secret/src/fido_hid.rs")),
     ("fido_metadata", include_str!("../../../td-secret/src/fido_metadata.rs")),
+    ("fido_p256", include_str!("../../../td-secret/src/fido_p256.rs")),
     ("tpm", include_str!("../../../td-secret/src/tpm.rs")),
     ("store", include_str!("../../../td-secret/src/store.rs")),
     ("sys", include_str!("../../../td-secret/src/sys.rs")),
@@ -83,6 +84,7 @@ pub fn recipe() -> Recipe {
     }
     for (path, source) in [
         ("{src}/td-secret/tests/aes_vectors.txt", include_str!("../../../td-secret/tests/aes_vectors.txt")),
+        ("{src}/td-secret/tests/p256_vectors.txt", include_str!("../../../td-secret/tests/p256_vectors.txt")),
         ("{src}/td-secret/src/system_vm.rs", include_str!("../../../td-secret/src/system_vm.rs")),
         ("{src}/td-authd/tests/secret_sys.rs", include_str!("../../../td-authd/tests/secret_sys.rs")),
         ("{src}/td-firstboot/src/principals.rs", include_str!("../../../td-firstboot/src/principals.rs")),
