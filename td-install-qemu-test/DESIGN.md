@@ -60,14 +60,16 @@ value through `td-install volume --uuid`; formatting cannot silently choose
 a different identity. Optical and USB destinations deliberately share that
 run's UUID but are never attached together.
 
-Before invoking layout, the live fixture calls `td-boot authenticate` on
+Before invoking layout, the live fixture calls `td-boot validate-source` on
 the read-only source and the provisioned public key. Missing or invalid
-signatures and malformed authenticated manifests refuse before the first
-disk-writing command. Authentication here covers the manifest; it does not
-hash its payloads. Volume publication still repeats authentication and
-verifies payload hashes. A signed manifest with corrupt payload bytes can
-therefore refuse after layout. Complete source, space and target admission
-before erasure remain requirements for the production installer service.
+signatures, malformed authenticated manifests, missing or symlinked payloads,
+and payload hash mismatches refuse before the first disk-writing command.
+The preflight uses the publisher's bundle verifier, retaining manifest-only
+`authenticate` for callers that ask only about the signing identity. Source
+bytes stay stable on the read-only ISO across preflight and publication;
+the result is not a retained snapshot. Volume publication still repeats
+authentication and verifies copied payload hashes. Space, firmware-selector
+and target admission remain requirements for the production installer service.
 
 The host then detaches media and cold-boots the destination through
 firmware. The selector emits read-only discovery evidence for its configured
@@ -109,7 +111,12 @@ the canaries and inside sparse gaps; merely observing a refusal is not enough.
 Each negative boot must independently prove read-only access to the expected
 media device. Both valid installation boots share one ISO; both wrong-key
 boots share another, with unchanged signed payloads and only a different
-live trust root. All ten boots use fresh private firmware variables.
+live trust root. A third ISO replaces only `root.erofs`, retaining its
+authentic manifest/signature and the correct trust root. Both optical and
+USB boots must report the root payload hash mismatch and preserve every
+target byte under the same whole-disk comparison. Unit tests in td-boot
+exercise corruption, missing files and symlinks for all three payloads.
+All twelve boots use fresh private firmware variables.
 
 The fixture's serial convention does not implement production installation
 admission. Volume discovery uses the production read-only primitive under

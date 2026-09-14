@@ -162,6 +162,11 @@ enum Mode {
         directory: PathBuf,
         trusted_key: PathBuf,
     },
+    /// Read-only authenticity and payload-integrity preflight; no publication.
+    ValidateSource {
+        directory: PathBuf,
+        trusted_key: PathBuf,
+    },
 }
 
 struct Manifest {
@@ -236,7 +241,7 @@ fn invalid(message: impl Into<String>) -> io::Error {
 fn usage_error() -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidInput,
-        "usage: td-boot on-volume <boot|install|update|rollback|success|mount-root|mount-var> <arguments without device>\n       td-boot volume [UUID]\n       td-boot verify <volume-root>\n       td-boot root-loop <volume-root> <deployment-id> <loop-device>\n       td-boot boot <device> <mountpoint> <cmdline>\n       td-boot install <device> <mountpoint> <deployment-directory> [trusted-key]\n       td-boot update <device> <mountpoint> <volume> <channel> <trusted-key>\n       td-boot publish <volume-root> <deployment-directory> [trusted-key]\n       td-boot rollback <device> <mountpoint>\n       td-boot success <device> <mountpoint> <deployment-id>\n       td-boot authenticate <deployment-directory> [trusted-key]",
+        "usage: td-boot on-volume <boot|install|update|rollback|success|mount-root|mount-var> <arguments without device>\n       td-boot volume [UUID]\n       td-boot verify <volume-root>\n       td-boot root-loop <volume-root> <deployment-id> <loop-device>\n       td-boot boot <device> <mountpoint> <cmdline>\n       td-boot install <device> <mountpoint> <deployment-directory> [trusted-key]\n       td-boot update <device> <mountpoint> <volume> <channel> <trusted-key>\n       td-boot publish <volume-root> <deployment-directory> [trusted-key]\n       td-boot rollback <device> <mountpoint>\n       td-boot success <device> <mountpoint> <deployment-id>\n       td-boot authenticate <deployment-directory> [trusted-key]\n       td-boot validate-source <deployment-directory> <trusted-key>",
     )
 }
 
@@ -311,6 +316,17 @@ fn parse_args<I: Iterator<Item = OsString>>(mut args: I) -> io::Result<Mode> {
             Ok(Mode::Authenticate {
                 directory: PathBuf::from(directory),
                 trusted_key,
+            })
+        }
+        Some(mode) if mode == OsStr::new("validate-source") => {
+            let directory = args.next().ok_or_else(usage_error)?;
+            let trusted_key = args.next().ok_or_else(usage_error)?;
+            if args.next().is_some() {
+                return Err(usage_error());
+            }
+            Ok(Mode::ValidateSource {
+                directory: PathBuf::from(directory),
+                trusted_key: PathBuf::from(trusted_key),
             })
         }
         Some(mode) if mode == OsStr::new("root-loop") => {
@@ -540,7 +556,7 @@ fn verify_payload(directory: &Path, name: &str, expected: &str) -> io::Result<Fi
     }
 }
 
-/// `trust` is the key a PUBLISH runs under, and `Some` makes this fail-closed.
+/// `trust` is the key for publication or source validation; `Some` fails closed.
 ///
 /// Where it is given, the manifest is authenticated between being READ and
 /// being PARSED, which is the only point that satisfies both halves of DESIGN
@@ -567,7 +583,7 @@ fn open_bundle(directory: &Path, trust: Option<&TrustRoot>) -> io::Result<Verifi
         // or the check would be escapable by deleting `manifest.sig`.
         let detached = signature.as_ref().ok_or_else(|| {
             invalid(
-                "deployment carries no signature and this publish has a trust root".to_string(),
+                "deployment carries no signature and a trust root was supplied".to_string(),
             )
         })?;
         authenticate_manifest(&manifest, detached, key)?;
@@ -3175,6 +3191,16 @@ fn run_authenticate(directory: &Path, trusted_key: &Path) -> io::Result<()> {
     writeln!(io::stdout(), "{}", sha256::hex_digest(&manifest))
 }
 
+fn run_validate_source(
+    directory: &Path,
+    trusted_key: &Path,
+    out: &mut dyn Write,
+) -> io::Result<()> {
+    let trust = read_trusted_key(trusted_key)?;
+    let bundle = open_bundle(directory, Some(&trust))?;
+    writeln!(out, "{}", bundle.id)
+}
+
 fn run() -> io::Result<()> {
     dispatch(parse_args(std::env::args_os().skip(1))?)
 }
@@ -3282,6 +3308,10 @@ fn dispatch(mode: Mode) -> io::Result<()> {
             directory,
             trusted_key,
         } => run_authenticate(&directory, &trusted_key),
+        Mode::ValidateSource {
+            directory,
+            trusted_key,
+        } => run_validate_source(&directory, &trusted_key, &mut io::stdout()),
     }
 }
 
@@ -6546,6 +6576,138 @@ mod tests {
 
         // And a directory that is not a deployment at all.
         assert!(run_authenticate(&fixture.root.join("absent"), &key).is_err());
+    }
+
+    #[test]
+    fn validate_source_reports_the_id_only_after_checking_every_payload() {
+        let fixture = Fixture::new();
+        let (directory, id) = fixture.source_bundle("source", "");
+        let key = fixture.root.join("key.pub");
+        fs::write(&key, FIXTURE_PUBLIC_KEY).unwrap();
+        let mut output = Vec::new();
+        run_validate_source(&directory, &key, &mut output).unwrap();
+        assert_eq!(output, format!("{id}\n").as_bytes());
+
+        for (name, original) in fixture_payloads("") {
+            let path = directory.join(name);
+            assert_eq!(fs::read(&path).unwrap(), original.as_bytes());
+            fs::write(&path, b"tampered").unwrap();
+            output.clear();
+            let error = run_validate_source(&directory, &key, &mut output).unwrap_err();
+            assert!(error.to_string().contains(&format!("{name} hash mismatch:")));
+            assert!(output.is_empty());
+            assert_eq!(fs::read(&path).unwrap(), b"tampered");
+            fs::write(&path, &original).unwrap();
+        }
+        assert_eq!(
+            fs::read(directory.join("manifest")).unwrap(),
+            fixture_manifest("").as_bytes()
+        );
+        assert_eq!(fs::read(&key).unwrap(), FIXTURE_PUBLIC_KEY.as_bytes());
+    }
+
+    #[test]
+    fn validate_source_refuses_missing_and_symlinked_payloads() {
+        let fixture = Fixture::new();
+        let (directory, _) = fixture.source_bundle("source", "");
+        let key = fixture.root.join("key.pub");
+        fs::write(&key, FIXTURE_PUBLIC_KEY).unwrap();
+        for (name, original) in fixture_payloads("") {
+            let path = directory.join(name);
+            let saved = directory.join(format!("{name}.saved"));
+            fs::rename(&path, &saved).unwrap();
+            let mut output = Vec::new();
+            let error = run_validate_source(&directory, &key, &mut output).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::NotFound, "{error}");
+            assert!(output.is_empty());
+            symlink(&saved, &path).unwrap();
+            let error = run_validate_source(&directory, &key, &mut output).unwrap_err();
+            assert!(
+                error.to_string().contains("must be a real regular file"),
+                "{error}"
+            );
+            assert!(output.is_empty());
+            assert_eq!(fs::read(&saved).unwrap(), original.as_bytes());
+            assert_eq!(fs::read_link(&path).unwrap(), saved);
+            fs::remove_file(&path).unwrap();
+            fs::rename(&saved, &path).unwrap();
+        }
+    }
+
+    #[test]
+    fn validate_source_refuses_relative_directories_and_special_payloads() {
+        let fixture = Fixture::new();
+        let (directory, _) = fixture.source_bundle("source", "");
+        let key = fixture.root.join("key.pub");
+        fs::write(&key, FIXTURE_PUBLIC_KEY).unwrap();
+        let mut output = Vec::new();
+        let error = run_validate_source(Path::new("relative"), &key, &mut output).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(error
+            .to_string()
+            .contains("deployment directory must be an absolute path"));
+        assert!(output.is_empty());
+        for (name, original) in fixture_payloads("") {
+            let path = directory.join(name);
+            fs::remove_file(&path).unwrap();
+            let socket = std::os::unix::net::UnixListener::bind(&path).unwrap();
+            let error = run_validate_source(&directory, &key, &mut output).unwrap_err();
+            assert!(
+                error.to_string().contains("must be a real regular file"),
+                "{error}"
+            );
+            assert!(output.is_empty());
+            drop(socket);
+            fs::remove_file(&path).unwrap();
+            fs::write(&path, original).unwrap();
+        }
+    }
+
+    #[test]
+    fn validate_source_requires_authenticity_before_payload_access() {
+        let fixture = Fixture::new();
+        let (directory, _) = fixture.source_bundle("source", "");
+        for (name, _) in fixture_payloads("") {
+            fs::remove_file(directory.join(name)).unwrap();
+        }
+        let key = fixture.root.join("key.pub");
+        fs::write(&key, FIXTURE_OTHER_PUBLIC_KEY).unwrap();
+        let mut output = Vec::new();
+        let error = run_validate_source(&directory, &key, &mut output).unwrap_err();
+        assert!(error.to_string().contains(protocol::MANIFEST_UNAUTHENTICATED));
+        assert!(output.is_empty());
+        fs::write(&key, FIXTURE_PUBLIC_KEY).unwrap();
+        fs::remove_file(directory.join(protocol::MANIFEST_SIG_NAME)).unwrap();
+        let error = run_validate_source(&directory, &key, &mut output).unwrap_err();
+        assert!(error.to_string().contains("carries no signature"));
+        assert!(output.is_empty());
+    }
+
+    #[test]
+    fn validate_source_requires_an_explicit_key_and_exact_arity() {
+        let parsed = parse_args(
+            ["validate-source", "/bundle", "/key.pub"]
+                .map(OsString::from)
+                .into_iter(),
+        )
+        .unwrap();
+        let Mode::ValidateSource {
+            directory,
+            trusted_key,
+        } = parsed
+        else {
+            panic!("validate-source must select its read-only operation");
+        };
+        assert_eq!(directory, PathBuf::from("/bundle"));
+        assert_eq!(trusted_key, PathBuf::from("/key.pub"));
+        for args in [
+            vec!["validate-source"],
+            vec!["validate-source", "/bundle"],
+            vec!["validate-source", "/bundle", "/key.pub", "extra"],
+            vec!["on-volume", "validate-source", "/bundle", "/key.pub"],
+        ] {
+            assert!(parse_args(args.into_iter().map(OsString::from)).is_err());
+        }
     }
 
     #[test]

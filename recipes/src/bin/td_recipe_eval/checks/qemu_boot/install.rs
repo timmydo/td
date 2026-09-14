@@ -389,6 +389,69 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
             }
         }
     }
+    let refuse = |case: &str, image: &Path, diagnostic: &str| -> Result<(), String> {
+        for (name, attachment, source_device) in [
+            ("optical", FirmwareAttachment::Optical, "/dev/sr0"),
+            ("usb", FirmwareAttachment::Usb, "/dev/sda"),
+        ] {
+            let target = TargetDisk::create(&scratch.dir, &format!("{case}-{name}.img"))?;
+            target.seed_preservation_canaries()?;
+            let before = target.fingerprint()?;
+            let vars = scratch.dir.join(format!("{case}-{name}-vars.fd"));
+            efi::copy_input(&vars_template, &vars)?;
+            println!("   [qemu-install] refusing {case} {name} media before disk writes");
+            let refused = boot_source(
+                &qemu,
+                BootSource::Firmware {
+                    code: &code,
+                    vars: &vars,
+                    attachment,
+                    installation_target: Some(&target),
+                },
+                plan(image, true, protocol::REFUSED_PREFIX),
+                &scratch.dir,
+                timeout,
+            )?;
+            // boot_source has reaped QEMU; compare all bytes, including sparse gaps.
+            if target.fingerprint()? != before {
+                return Err(format!(
+                    "{case} {name} installation changed the destination\n{}",
+                    tail(&refused.console, 80)
+                ));
+            }
+            require(
+                &refused,
+                &format!("{} {source_device}", protocol::MEDIA_MARKER),
+                "refused media access",
+            )?;
+            if !refused.evidence.target
+                || !refused.console.lines().any(|line| {
+                    line.strip_prefix(protocol::REFUSED_PREFIX)
+                        .is_some_and(|rest| rest.starts_with(' '))
+                })
+                || !refused.console.contains(diagnostic)
+                || refused.console.contains(protocol::INSTALL_MARKER)
+            {
+                return Err(format!(
+                    "{case} {name} fixture did not prove {diagnostic}\n{}",
+                    tail(&refused.console, 80)
+                ));
+            }
+        }
+        Ok(())
+    };
+    // Retain the authentic manifest/signature and replace only one payload.
+    let corrupt_root = scratch.dir.join("corrupt-root.erofs");
+    write(&corrupt_root, b"tampered installation payload\n")?;
+    let mut corrupt_payloads = payloads.clone();
+    let root_payload = corrupt_payloads
+        .iter_mut()
+        .find(|(name, _)| *name == "ROOT.EROFS")
+        .ok_or("installation media has no root payload")?;
+    root_payload.1 = corrupt_root;
+    let corrupt_iso = scratch.dir.join("corrupt-root.iso");
+    media::write_image_with_payloads(&corrupt_iso, &kernel, &live, &corrupt_payloads)?;
+    refuse("corrupt-root", &corrupt_iso, "root.erofs hash mismatch:")?;
     // A second public key must refuse the otherwise identical signed source.
     let wrong_key = RunTrust::generate()?.trusted_key_line();
     let mut replaced = 0;
@@ -405,58 +468,13 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
     write(&bad_live, &initramfs(&base, &common, "install\n", &extra)?)?;
     let bad_iso = scratch.dir.join("wrong-key.iso");
     media::write_image_with_payloads(&bad_iso, &kernel, &bad_live, &payloads)?;
-    for (name, attachment, source_device) in [
-        ("optical", FirmwareAttachment::Optical, "/dev/sr0"),
-        ("usb", FirmwareAttachment::Usb, "/dev/sda"),
-    ] {
-        let target = TargetDisk::create(&scratch.dir, &format!("wrong-key-{name}.img"))?;
-        target.seed_preservation_canaries()?;
-        let before = target.fingerprint()?;
-        let vars = scratch.dir.join(format!("wrong-key-{name}-vars.fd"));
-        efi::copy_input(&vars_template, &vars)?;
-        println!("   [qemu-install] refusing wrong-key {name} media before disk writes");
-        let refused = boot_source(
-            &qemu,
-            BootSource::Firmware {
-                code: &code,
-                vars: &vars,
-                attachment,
-                installation_target: Some(&target),
-            },
-            plan(&bad_iso, true, protocol::REFUSED_PREFIX),
-            &scratch.dir,
-            timeout,
-        )?;
-        // boot_source has reaped QEMU; compare all bytes, including sparse gaps.
-        if target.fingerprint()? != before {
-            return Err(format!(
-                "wrong-key {name} installation changed the destination\n{}",
-                tail(&refused.console, 80)
-            ));
-        }
-        require(
-            &refused,
-            &format!("{} {source_device}", protocol::MEDIA_MARKER),
-            "wrong-key media access",
-        )?;
-        if !refused.evidence.target
-            || !refused.console.lines().any(|line| {
-                line.strip_prefix(protocol::REFUSED_PREFIX)
-                    .is_some_and(|rest| rest.starts_with(' '))
-            })
-            || !refused
-                .console
-                .contains(td_boot_protocol::MANIFEST_UNAUTHENTICATED)
-            || refused.console.contains(protocol::INSTALL_MARKER)
-        {
-            return Err(format!(
-                "wrong-key {name} fixture did not prove authentication refusal\n{}",
-                tail(&refused.console, 80)
-            ));
-        }
-    }
+    refuse(
+        "wrong-key",
+        &bad_iso,
+        td_boot_protocol::MANIFEST_UNAUTHENTICATED,
+    )?;
     println!(
-        "PASS: native optical/USB installation; provisioned UUID binding across verified kexec and reordered disks; duplicate identity refusal; wrong-key optical/USB refusal preserves every target byte; two persistent installed boots"
+        "PASS: native optical/USB installation; provisioned UUID binding across verified kexec and reordered disks; duplicate identity refusal; wrong-key and corrupt-payload optical/USB refusals preserve every target byte; two persistent installed boots"
     );
     Ok(())
 }

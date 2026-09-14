@@ -198,9 +198,9 @@ fn install(device: &str) -> Result<(), String> {
     // Every path is fixture-owned; no private key enters the guest.
     mount_source()?;
     let uuid = configured_uuid()?;
-    // Refuse a foreign signing identity before the first destructive command.
-    // Publication below still verifies the payloads and repeats authentication.
-    command("/bin/td-boot", &["authenticate", "/source", "/trusted.pub"])?;
+    // Validate the stable read-only source before the first destructive command.
+    // Publication below still rechecks the copied payloads and signature.
+    command("/bin/td-boot", &["validate-source", "/source", "/trusted.pub"])?;
     command(
         "/bin/td-install",
         &["layout", device, "/source/bzImage", "/selector.cpio"],

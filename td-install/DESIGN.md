@@ -900,6 +900,26 @@ that lives only in the signer's code is one the verifier can disagree with.
 
 ### What the publish path carries
 
+`td-boot validate-source DEPLOYMENT TRUSTED-KEY` is a read-only preflight
+for an absolute deployment directory and an explicitly supplied public key.
+It uses the publisher's existing bundle verifier: require and authenticate
+the bounded manifest/signature, parse the same authenticated manifest bytes,
+then open and stream-hash `bzImage`, `initramfs.cpio` and `root.erofs`.
+Symlink and special-file payloads refuse. Stdout is exactly the manifest's
+deployment ID and a newline after every payload succeeds; validation failure
+emits no ID. The operation creates no staging tree, lock, selector or mount
+and has no destination argument. `authenticate` retains its manifest-only
+meaning.
+
+Validation keeps the opened payload files for the duration of the command,
+then closes them. Its result is not a snapshot or authorization for a later
+write: the caller must keep source bytes and their namespace stable. The
+native ISO fixture supplies read-only media under a fixed test topology;
+volume publication still reauthenticates and checks every copied payload.
+Preflight does not validate the separate firmware selector, its key/UUID
+agreement, scratch capacity, destination eligibility or destructive consent.
+Those remain installation-coordinator responsibilities.
+
 `td-boot install` carries the detached signature. Two things used to stop it
 reaching a machine at all, and both are closed:
 
@@ -1149,15 +1169,18 @@ USB media. After installation, the host detaches media and cold-boots only
 the destination, requiring authenticated selector kexec, a read from the
 installed EROFS payload, persistent Btrfs state across two boots, and
 successful deployment acknowledgement. Before layout, the live fixture
-authenticates the source manifest under its provisioned public key. A second
+validates the authenticated source and all three payloads under its
+provisioned public key. A second
 public key must refuse the otherwise identical signed source on both optical
 and USB boots without an installation-success marker. The host seeds each
 refusal target with nonzero canaries and compares its complete byte length
 and SHA-256 before and after QEMU exits. A refusal after changing the GPT,
-ESP, volume or sparse gaps fails the oracle. This preflight authenticates
-the manifest only; signed-but-corrupt payloads are still checked during
-volume publication, after layout. It is not a complete no-write admission
-check for arbitrary installation inputs.
+ESP, volume or sparse gaps fails the oracle. A second negative ISO retains
+the valid manifest, signature and trust root but substitutes corrupt
+`root.erofs` bytes. Both optical and USB boots must report the payload hash
+mismatch and preserve the complete destination. Unit tests exercise all
+three payloads, including missing files and symlinks. This is source
+preflight, not complete device, space or firmware-selector admission.
 The private signing key never enters the guest or a derivation.
 
 The fixture accepts no operator destination and is absent from system and
