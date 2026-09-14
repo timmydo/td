@@ -161,7 +161,13 @@ explicit installation from the normal ISO must succeed; its detached boot
 must authenticate the expected deployment and start with fresh persisted
 state. No automatic resume or preservation of the erased disk is claimed.
 Both optical and USB attachments run all four interruption/recovery boots.
-All twenty small-fixture boots use fresh private firmware variables.
+Four further boots use the valid normal ISO with undersized and read-only
+targets, through both media attachments. The host requires the specific
+layout refusal, no partition refresh or publication, and an unchanged
+whole-file length and digest after QEMU is reaped. The read-only target is
+protected by QEMU's block backend; this proves guest refusal and byte
+preservation under emulated write protection, not exclusive disk admission.
+All twenty-four small-fixture boots use fresh private firmware variables.
 
 The fixture's serial convention does not implement production installation
 admission. Volume discovery uses the production read-only primitive under

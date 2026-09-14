@@ -10,6 +10,7 @@ const MINIMUM_TARGET_BYTES: u64 = 6 * 1024 * 1024 * 1024;
 /// Only this module can create a writable installation target, in owned scratch.
 pub(super) struct TargetDisk {
     path: PathBuf,
+    read_only: bool,
 }
 
 impl TargetDisk {
@@ -89,12 +90,18 @@ impl TargetDisk {
             .map_err(|e| format!("create {}: {e}", path.display()))?;
         file.set_len(bytes)
             .map_err(|e| format!("size {}: {e}", path.display()))?;
-        Ok(Self { path })
+        Ok(Self {
+            path,
+            read_only: false,
+        })
     }
 }
 
 pub(super) fn target_drive_arg(target: &TargetDisk) -> OsString {
-    let mut arg = OsString::from(format!("if=none,format=raw,id={TARGET_DRIVE_ID},file="));
+    let protection = if target.read_only { ",readonly=on" } else { "" };
+    let mut arg = OsString::from(format!(
+        "if=none,format=raw,id={TARGET_DRIVE_ID}{protection},file="
+    ));
     let mut bytes = Vec::new();
     for &byte in target.path.as_os_str().as_bytes() {
         if byte == b',' {
@@ -446,6 +453,53 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
         )?;
         validate_fixture_boot(&installed, &expected, &uuid, "/dev/vda2", &id)?;
     }
+    for (case, bytes, read_only, diagnostic) in [
+        (
+            "undersized",
+            td_boot_protocol::ESP_BYTES,
+            false,
+            "destination is too small",
+        ),
+        (
+            "read-only",
+            MINIMUM_TARGET_BYTES,
+            true,
+            "td-install: Operation not permitted (os error 1)",
+        ),
+    ] {
+        for (name, attachment, source_device) in [
+            ("optical", FirmwareAttachment::Optical, "/dev/sr0"),
+            ("usb", FirmwareAttachment::Usb, "/dev/sda"),
+        ] {
+            let mut target =
+                TargetDisk::with_capacity(&scratch.dir, &format!("{case}-{name}.img"), bytes)?;
+            target.seed_preservation_canaries()?;
+            let before = target.fingerprint()?;
+            target.read_only = read_only;
+            let vars = scratch.dir.join(format!("{case}-{name}-vars.fd"));
+            efi::copy_input(&vars_template, &vars)?;
+            println!("   [qemu-install] refusing {case} target through {name} media");
+            let refused = boot_source(
+                &qemu,
+                BootSource::Firmware {
+                    code: &code,
+                    vars: &vars,
+                    attachment,
+                    installation_target: Some(&target),
+                },
+                plan(&iso, true, protocol::REFUSED_PREFIX),
+                &scratch.dir,
+                timeout,
+            )?;
+            if target.fingerprint()? != before {
+                return Err(format!(
+                    "{case} {name} refusal changed the target\n{}",
+                    tail(&refused.console, 80)
+                ));
+            }
+            validate_target_refusal(&refused, source_device, diagnostic)?;
+        }
+    }
     let refuse = |case: &str, image: &Path, diagnostic: &str| -> Result<(), String> {
         for (name, attachment, source_device) in [
             ("optical", FirmwareAttachment::Optical, "/dev/sr0"),
@@ -531,8 +585,49 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
         td_boot_protocol::MANIFEST_UNAUTHENTICATED,
     )?;
     println!(
-        "PASS: native optical/USB installation and interrupted-publication refusal/reinstallation; provisioned UUID binding across verified kexec and reordered disks; duplicate identity refusal; wrong-key and corrupt-payload optical/USB refusals preserve every target byte; two persistent installed boots"
+        "PASS: native optical/USB installation and interrupted-publication refusal/reinstallation; provisioned UUID binding across verified kexec and reordered disks; duplicate identity refusal; undersized/read-only targets and wrong-key/corrupt-payload optical/USB refusals preserve every target byte; two persistent installed boots"
     );
+    Ok(())
+}
+
+fn validate_target_refusal(
+    result: &BootResult,
+    source_device: &str,
+    diagnostic: &str,
+) -> Result<(), String> {
+    require(
+        result,
+        &format!("{} {source_device}", protocol::MEDIA_MARKER),
+        "target refusal media access",
+    )?;
+    require(
+        result,
+        &format!(
+            "{} /bin/td-install failed: exit status: 1",
+            protocol::REFUSED_PREFIX
+        ),
+        "td-install failure",
+    )?;
+    let missing = !result.console.contains(diagnostic);
+    let unexpected = [
+        protocol::PARTITIONS_MARKER,
+        protocol::DIRECT_MARKER,
+        protocol::INSTALL_MARKER,
+    ]
+    .into_iter()
+    .find(|marker| result.console.contains(marker));
+    if missing
+        || result.evidence.selected_current
+        || result.evidence.selected_previous
+        || unexpected.is_some()
+    {
+        return Err(format!(
+            "target refusal expected={diagnostic:?}, missing={missing}, current={}, previous={}, unexpected={unexpected:?}\n{}",
+            result.evidence.selected_current,
+            result.evidence.selected_previous,
+            tail(&result.console, 80)
+        ));
+    }
     Ok(())
 }
 
@@ -1018,6 +1113,44 @@ mod tests {
     }
 
     #[test]
+    fn target_refusal_requires_layout_failure_and_no_publication() {
+        let validate = |result: &BootResult| {
+            validate_target_refusal(result, "/dev/sr0", "destination is too small")
+        };
+        let mut result = interrupted_result();
+        result.console = format!(
+            "{} /dev/sr0\ntd-install: destination is too small\n{} /bin/td-install failed: exit status: 1\n",
+            protocol::MEDIA_MARKER, protocol::REFUSED_PREFIX
+        );
+        assert!(validate(&result).is_ok());
+        for missing in [
+            protocol::MEDIA_MARKER,
+            protocol::REFUSED_PREFIX,
+            "destination is too small",
+        ] {
+            let console = result.console.clone();
+            result.console = console.replace(missing, "wrong");
+            assert!(validate(&result).is_err());
+            result.console = console;
+        }
+        for extra in [
+            protocol::PARTITIONS_MARKER,
+            protocol::DIRECT_MARKER,
+            protocol::INSTALL_MARKER,
+        ] {
+            let console = result.console.clone();
+            result.console.push_str(extra);
+            assert!(validate(&result).is_err());
+            result.console = console;
+        }
+        result.evidence.selected_current = true;
+        assert!(validate(&result).is_err());
+        result.evidence.selected_current = false;
+        result.evidence.selected_previous = true;
+        assert!(validate(&result).is_err());
+    }
+
+    #[test]
     fn interruption_evidence_proves_a_partial_planned_payload() {
         let validate = |result: &BootResult| validate_interruption(result, 10, "uuid", "/dev/sr0");
         assert!(validate(&interrupted_result()).is_ok());
@@ -1274,13 +1407,18 @@ mod tests {
         let scratch = Scratch {
             dir: create_scratch_dir(&env::temp_dir(), &SEQ).unwrap(),
         };
-        let target = TargetDisk::create(&scratch.dir, "a,b.img").unwrap();
+        let mut target = TargetDisk::create(&scratch.dir, "a,b.img").unwrap();
         fs::write(&target.path, b"preserve").unwrap();
         assert!(TargetDisk::create(&scratch.dir, "a,b.img").is_err());
         assert_eq!(fs::read(&target.path).unwrap(), b"preserve");
         let arg = target_drive_arg(&target);
         let text = arg.to_str().unwrap();
         assert!(text.starts_with("if=none,format=raw,id=install-target,file="));
+        assert!(text.ends_with("/a,,b.img"));
+        target.read_only = true;
+        let arg = target_drive_arg(&target);
+        let text = arg.to_str().unwrap();
+        assert!(text.starts_with("if=none,format=raw,id=install-target,readonly=on,file="));
         assert!(text.ends_with("/a,,b.img"));
     }
 

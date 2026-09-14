@@ -1263,6 +1263,11 @@ reinstallation from the normal ISO must restore an authenticated boot and
 fresh state. Both media attachments exercise this sequence. The observer
 has no production pause hook; this is a controlled publisher interruption
 followed by a VM power cut, not a model of every storage power-loss window.
+The same oracle boots valid media against undersized and read-only private
+targets. Specific layout refusals and whole-target digests establish that
+neither case changed target bytes or reached partition refresh/publication.
+Both media attachments run these cases; the small oracle has 24 boots.
+QEMU block-backend write protection is not exclusive device admission.
 
 `td-recipe-eval qemu-install-system [system-x86-64]` uses the same live
 fixture to install the built system deployment and its verified selector.
