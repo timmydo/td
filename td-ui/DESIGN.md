@@ -1162,23 +1162,90 @@ request bound, malformed input and unusable geometry. Draw-stream and
 pixel checks at scales one through four keep the controls within the
 dialog, preserve pixels outside it and respect partial damage.
 
+## Shared time-series charts
+
+`charts::Chart` is a borrowed, validated view over caller-owned `Time`
+and `Series` slices. `State` owns only an optional semantic selection and
+an armed pointer gesture, so a consumer needs no self-reference or copied
+history. Construction, ordinary input and painting allocate no storage
+and perform no I/O. The caller owns collection, units, aggregation,
+series choice, downsampling and revision policy.
+
+A view admits up to 1024 strictly increasing u64 timestamps and 16
+nonempty, uniquely identified series. Each series has one optional u64
+value per timestamp. Zero samples are allowed. Labels are nonempty,
+control-free and at most 128 bytes. The caller supplies a nonzero maximum,
+its display label and units, plus a nonzero display divisor and zero
+through six decimal places. Displayed values round half up in a fixed
+stack buffer, so percentages and byte units retain integer observations
+without unreadable raw counters. Values above the maximum and overflowing or
+above-maximum stacked sums are refused. Invalid data never becomes a
+partial plot. The view must fit completely inside a valid surface and
+show its labels, legend and a plot at least two label rows high; otherwise
+`NoRoom`
+allows the consumer to show its fallback.
+
+Lines interpolate only between adjacent present observations. A stacked
+column requires every component; a missing value makes a gap in that
+column rather than an invented zero. Cumulative boundaries interpolate
+with exact integer arithmetic and consistent rounding, keeping layer
+order and the maximum intact even at u64 limits. Painting and hit testing
+share these clipped columns. Fixed input bounds and `MAX_AXIS` bound
+emission to at most 155648 draw commands (`DRAW_LIMIT`); input validation
+and the maximum-size draw oracle pin the work bound.
+
+Explicit observation markers preserve isolated readings whose timestamps
+fall between pixel columns. Markers paint after the interpolated plot;
+later timestamps and then later series paint last where their markers
+overlap. Hits use the reverse order and return the visible marker's exact
+timestamp and opaque series ID. Elsewhere a hit returns the nearest
+supplied timestamp (earlier on a tie), with a series only inside a stacked
+band or within three scaled pixels of a line. A zero-height band has no
+hit. The widget never interprets an ID as a PID or invents an identity
+for a gap. The consumer may use a typed Other series to open a ranked list.
+
+Axes, units, all legend labels, selected time and the selected series'
+value are textual. A single observation has one centered timestamp label.
+Missing selections or values show Unavailable. With no observations,
+legends remain informational and emit no selection because there is no
+timestamp to select. A selected time has a contrasting outlined plot
+marker; the selected legend and graph focus use contrasting text and
+backgrounds. A time absent from the supplied observations has no marker.
+Legend clicks select that series at the current valid time, or the newest
+time when none is retained.
+Previous/Next/First/Last time keys and Previous/Next/Clear series keys
+provide pointer equivalents. The adapter routes keys only while the
+graph has focus and supplies focus separately for painting.
+
+A primary press captures the semantic target and caller revision;
+matching release selects once. A different revision, layout or plot mode
+disarms even if a resize event was omitted; stale motion/release returns
+Stale. A fresh press or key still processes its own intent. Moving away,
+focus loss, resize, other input and keys (including repeats) cancel the
+arm. Previous/Next time keys honor repeats; other repeats are consumed.
+A consumer
+may set a selection explicitly; unavailable IDs/times are not silently
+retargeted until a new navigation intent. An explicit Resize event also
+disarms when the geometry is unchanged. Navigation from an absent time
+starts at the newest observation before applying the requested step.
+Idle motion and cancellation events return Ignored when no arm exists.
+`cancel_gesture()` retires input without a view, including before a
+relayout that may refuse with NoRoom; it preserves the selected time/ID.
+
+`tests/charts.rs` covers line/stack paint-hit agreement, gaps, isolated and
+coincident readings, timestamp and counter extremes, keyboard and pointer
+selection, refresh and interrupted gestures, input maxima/refusals and
+bounded drawing. Scale 1-4 pixel oracles preserve pixels outside the
+chart and compare partial repaint with full repaint.
+
 ## Planned task-manager widgets
 
 [td-taskmgr](../td-taskmgr/DESIGN.md) is a planned consumer. Menus and
-confirmations above and nonclosable resource tabs are implemented. The
+confirmations, nonclosable resource tabs and charts are implemented. The
 following remain target contracts, not existing public APIs. Add them as
-reusable td-ui widgets before the task manager depends
-on them. Process collection, history and signal execution stay in the
-consumer.
+reusable td-ui widgets before the task manager depends on them. Process
+collection, history and signal execution stay in the consumer.
 
-- Time-series line and stacked-area graphs with explicit timestamps,
-  gaps, axes, units, legends,
-  series IDs, a selected time and a selected series. Drawing and hit testing
-  use the same clipped geometry. Emit typed time/series selection with
-  keyboard equivalents and textual values. The consumer chooses series,
-  aggregation and downsampling; the widget never invents a process identity
-  from a pixel or connects across an absent sample. Bound input samples and
-  draw work explicitly in the implementing API and pin those limits in tests.
 - A resizable split pane with explicit child minima, a visible focusable
   divider, pointer capture and keyboard adjustment. Resize and focus loss
   end a drag safely. An extent too small for both children has an explicit

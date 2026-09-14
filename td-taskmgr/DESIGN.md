@@ -406,8 +406,8 @@ Independently landable increments:
    menus with submenus (implemented, including the atomic editor migration),
    confirmation dialogs and nonclosable resource tabs (implemented). No
    task-manager-local fork.
-3. Shared charts, split pane and tree table, each in a self-contained
-   tested landing. Reuse the existing text entry and list primitives.
+3. Shared charts (implemented), split pane and tree table, each in a
+   self-contained tested landing. Reuse the existing text entry and list primitives.
 4. Standalone crate with bounded collection, metric model and retained
    history fixtures, committed lock and automatically discovered gate.
 5. Live Wayland window with all five tabs, process tree and linked CPU/RSS

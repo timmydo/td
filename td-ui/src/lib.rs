@@ -30,6 +30,7 @@
 pub const CELL_WIDTH: usize = 8;
 pub const CELL_HEIGHT: usize = 16;
 
+pub mod charts;
 pub mod chrome;
 pub mod client;
 pub mod confirmations;
