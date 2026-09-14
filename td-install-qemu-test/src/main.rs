@@ -206,6 +206,27 @@ fn install(device: &str, interrupt: bool) -> Result<(), String> {
     // Every path is fixture-owned; no private key enters the guest.
     mount_source()?;
     let uuid = configured_uuid()?;
+    let name = device
+        .strip_prefix("/dev/")
+        .ok_or("invalid target device")?;
+    let geometry = read(
+        Path::new(&format!("/sys/class/block/{name}/queue/logical_block_size")),
+        16,
+    )?;
+    let geometry = match geometry.as_slice() {
+        b"512\n" => 512,
+        b"4096\n" => 4096,
+        _ => {
+            return Err(format!(
+                "unsupported fixture target sector size: {:?}",
+                String::from_utf8_lossy(&geometry)
+            ))
+        }
+    };
+    report(
+        std::io::stdout(),
+        format_args!("{SECTOR_BYTES_MARKER} {geometry}"),
+    )?;
     // Validate the stable read-only source before the first destructive command.
     // Publication below still rechecks the copied payloads and signature.
     command(

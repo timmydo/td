@@ -167,7 +167,17 @@ layout refusal, no partition refresh or publication, and an unchanged
 whole-file length and digest after QEMU is reaped. The read-only target is
 protected by QEMU's block backend; this proves guest refusal and byte
 preservation under emulated write protection, not exclusive disk admission.
-All twenty-four small-fixture boots use fresh private firmware variables.
+The successful installation/duplicate-identity/reboot matrix also runs
+with 4096-byte logical and physical sectors on the virtio target and its
+reordered companions. The fixture reads the target's bounded sysfs logical
+sector size and reports it; the host requires the planned value alongside
+the completed-installation evidence. The ISO attachments keep their normal
+geometry.
+Both detached boots retain the installed target's sector size, so firmware
+must interpret the GPT and ESP actually written for that geometry.
+These eight additional boots bring the small oracle to thirty-two boots,
+all with fresh private firmware variables. Interruption and refusal cases
+retain the ordinary 512-byte geometry.
 
 The fixture's serial convention does not implement production installation
 admission. Volume discovery uses the production read-only primitive under

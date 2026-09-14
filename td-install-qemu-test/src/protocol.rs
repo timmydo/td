@@ -20,3 +20,5 @@ pub const MEDIA_FILES: &[(&str, &str)] = &[
 ];
 
 pub const INTERRUPTED_MARKER: &str = "TD-INSTALL-PUBLICATION-INTERRUPTED";
+
+pub const SECTOR_BYTES_MARKER: &str = "TD-INSTALL-TARGET-SECTOR-BYTES";

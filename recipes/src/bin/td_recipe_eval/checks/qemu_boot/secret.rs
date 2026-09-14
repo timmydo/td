@@ -76,7 +76,7 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner, tpm: &Path, powercuts: bool
             else { format!("secret-fixture: {}", fixture::SYSTEM_PASS) };
         println!("[qemu-secret-system] {phase}: stock firstboot and supervised desktop");
         let result = boot_with_timeout(&qemu, &kernel, &initramfs, BootPlan {
-            disk: Some(BootDisk { path: &volume, read_only: false }),
+            disk: Some(BootDisk::new(&volume, false)),
             mem: SYSTEM_GUEST_MEMORY_MIB,
             target_marker: &marker,
             kill_on_marker: cut,
@@ -235,12 +235,12 @@ pub(crate) fn run(runner: &RecipeCheckRunner, tpm: Option<&Path>) -> Result<(), 
             &archive,
             BootPlan {
                 disk: if name.starts_with("fido-cold-recovery-") {
-                    recovery_disk.as_deref().map(|path| BootDisk { path, read_only: false })
+                    recovery_disk.as_deref().map(|path| BootDisk::new(path, false))
                 } else if name.starts_with("fido-cold-") {
-                    store_disk.as_deref().map(|path| BootDisk { path, read_only: false })
+                    store_disk.as_deref().map(|path| BootDisk::new(path, false))
                 } else {
                     tpm_disk.as_deref().filter(|_| name.starts_with("tpm-"))
-                        .map(|path| BootDisk { path, read_only: *name != "tpm-seal" })
+                        .map(|path| BootDisk::new(path, *name != "tpm-seal"))
                 },
                 mem: "512",
                 target_marker: fixture::PASS,

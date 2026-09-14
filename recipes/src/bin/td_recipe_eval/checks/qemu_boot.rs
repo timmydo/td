@@ -707,10 +707,7 @@ pub(crate) fn run_erofs(runner: &RecipeCheckRunner) -> Result<(), String> {
         &bzimage,
         &initramfs,
         BootPlan {
-            disk: Some(BootDisk {
-                path: &disk,
-                read_only: true,
-            }),
+            disk: Some(BootDisk::new(&disk, true)),
             mem: "256",
             target_marker: EROFS_MARKER,
             kill_on_marker: true,
@@ -844,10 +841,7 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
         &bzimage,
         &init_cpio,
         BootPlan {
-            disk: Some(BootDisk {
-                path: &volume,
-                read_only: true,
-            }),
+            disk: Some(BootDisk::new(&volume, true)),
             mem: SYSTEM_GUEST_MEMORY_MIB,
             target_marker: td_boot_protocol::SELECTED_PREVIOUS_MARKER,
             kill_on_marker: true,
@@ -1409,10 +1403,7 @@ fn boot_system_once(
         qemu,
         source,
         BootPlan {
-            disk: Some(BootDisk {
-                path: volume,
-                read_only: false,
-            }),
+            disk: Some(BootDisk::new(volume, false)),
             mem: SYSTEM_GUEST_MEMORY_MIB,
             target_marker: GREETER_MARKER,
             kill_on_marker: false,
@@ -1447,10 +1438,7 @@ fn boot_failed_target_once(
         bzimage,
         init_cpio,
         BootPlan {
-            disk: Some(BootDisk {
-                path: volume,
-                read_only: false,
-            }),
+            disk: Some(BootDisk::new(volume, false)),
             mem: SYSTEM_GUEST_MEMORY_MIB,
             target_marker: SYSTEM_SHUTDOWN_MARKER,
             kill_on_marker: false,
@@ -2803,10 +2791,7 @@ pub(crate) fn run_net(runner: &RecipeCheckRunner) -> Result<(), String> {
         &bzimage,
         &init_cpio,
         BootPlan {
-            disk: Some(BootDisk {
-                path: &disk,
-                read_only: false,
-            }),
+            disk: Some(BootDisk::new(&disk, false)),
             mem: SYSTEM_GUEST_MEMORY_MIB,
             target_marker: GREETER_MARKER,
             kill_on_marker: false,
@@ -4287,15 +4272,49 @@ fn parse_timeout(raw: Option<String>) -> Duration {
     Duration::from_secs(secs)
 }
 
+#[derive(Clone, Copy)]
+enum SectorSize {
+    Bytes512,
+    Bytes4096,
+}
+
+impl SectorSize {
+    fn bytes(self) -> u64 {
+        match self {
+            Self::Bytes512 => 512,
+            Self::Bytes4096 => 4096,
+        }
+    }
+
+    fn device_suffix(self) -> &'static str {
+        match self {
+            Self::Bytes512 => "",
+            Self::Bytes4096 => ",logical_block_size=4096,physical_block_size=4096",
+        }
+    }
+}
+
+/// A raw disk attachment; ordinary plans retain 512-byte device geometry.
+struct BootDisk<'a> {
+    path: &'a Path,
+    read_only: bool,
+    sector_size: SectorSize,
+}
+
+impl<'a> BootDisk<'a> {
+    fn new(path: &'a Path, read_only: bool) -> Self {
+        Self {
+            path,
+            read_only,
+            sector_size: SectorSize::Bytes512,
+        }
+    }
+}
+
 /// The per-mode boot parameters — everything that differs between the diskless kernel
 /// boot, the erofs-probe boot, and the two-stage system boot. Grouped into one struct so
 /// `boot` keeps a small, self-documenting signature: named fields at the call site
 /// (`kill_on_marker: false`) beat positional bools/strings.
-struct BootDisk<'a> {
-    path: &'a Path,
-    read_only: bool,
-}
-
 struct BootPlan<'a> {
     /// A raw image to attach over virtio-blk (/dev/vda), or none for diskless.
     /// Probe EROFS images are read-only; system volumes allow @var writes.
@@ -4570,8 +4589,9 @@ fn boot_source(
                 .strip_suffix(crate::checks::vm_profile::DRIVE_ID)
                 .ok_or("VM disk device must end with its drive ID")?;
             cmd.arg("-device").arg(format!(
-                "{device_prefix}{},serial=td-install-decoy,bootindex=9",
-                install::TARGET_DRIVE_ID
+                "{device_prefix}{},serial=td-install-decoy,bootindex=9{}",
+                install::TARGET_DRIVE_ID,
+                decoy.sector_suffix(),
             ));
         }
         match source {
@@ -4593,10 +4613,18 @@ fn boot_source(
             _ => {
                 cmd.arg("-drive").arg(drive_arg(disk.path, disk.read_only));
                 if matches!(source, BootSource::Firmware { attachment: FirmwareAttachment::InstalledFixture | FirmwareAttachment::InstalledFixtureReordered, .. }) {
-                    cmd.arg("-device").arg(format!("{},serial={},bootindex=1",
-                        crate::checks::vm_profile::DISK_DEVICE, install::protocol::TARGET_SERIAL));
+                    cmd.arg("-device").arg(format!(
+                        "{},serial={},bootindex=1{}",
+                        crate::checks::vm_profile::DISK_DEVICE,
+                        install::protocol::TARGET_SERIAL,
+                        disk.sector_size.device_suffix(),
+                    ));
                 } else {
-                    cmd.args(["-device", crate::checks::vm_profile::DISK_DEVICE]);
+                    cmd.arg("-device").arg(format!(
+                        "{}{}",
+                        crate::checks::vm_profile::DISK_DEVICE,
+                        disk.sector_size.device_suffix(),
+                    ));
                 }
             }
         }
@@ -4607,11 +4635,12 @@ fn boot_source(
     } = source {
         cmd.arg("-drive").arg(install::target_drive_arg(target));
         cmd.arg("-device").arg(format!(
-            "{}{},serial={}",
+            "{}{},serial={}{}",
             crate::checks::vm_profile::DISK_DEVICE
                 .trim_end_matches(crate::checks::vm_profile::DRIVE_ID),
             install::TARGET_DRIVE_ID,
             install::protocol::TARGET_SERIAL,
+            target.sector_suffix(),
         ));
     }
     let mut child = cmd

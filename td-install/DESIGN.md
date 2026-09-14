@@ -1266,8 +1266,17 @@ followed by a VM power cut, not a model of every storage power-loss window.
 The same oracle boots valid media against undersized and read-only private
 targets. Specific layout refusals and whole-target digests establish that
 neither case changed target bytes or reached partition refresh/publication.
-Both media attachments run these cases; the small oracle has 24 boots.
+Both media attachments run these cases.
 QEMU block-backend write protection is not exclusive device admission.
+
+The successful small installation matrix covers both 512-byte and 4096-byte
+logical sectors. The guest reports the target geometry read from sysfs;
+the host requires it to match the requested QEMU geometry. The installed
+target and duplicate/reordered companions retain that geometry through
+firmware boots. This tests GPT/FAT32 layout and detached verified boots on
+4Kn media; it is not a physical-device or 512e performance claim. Refusal
+and interruption cases remain at 512 bytes; the complete small oracle has
+32 boots.
 
 `td-recipe-eval qemu-install-system [system-x86-64]` uses the same live
 fixture to install the built system deployment and its verified selector.

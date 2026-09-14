@@ -11,9 +11,14 @@ const MINIMUM_TARGET_BYTES: u64 = 6 * 1024 * 1024 * 1024;
 pub(super) struct TargetDisk {
     path: PathBuf,
     read_only: bool,
+    sector_size: SectorSize,
 }
 
 impl TargetDisk {
+    pub(super) fn sector_suffix(&self) -> &'static str {
+        self.sector_size.device_suffix()
+    }
+
     fn fingerprint(&self) -> Result<(u64, String), String> {
         let len = fs::metadata(&self.path)
             .map_err(|error| format!("stat {}: {error}", self.path.display()))?
@@ -93,6 +98,7 @@ impl TargetDisk {
         Ok(Self {
             path,
             read_only: false,
+            sector_size: SectorSize::Bytes512,
         })
     }
 }
@@ -303,84 +309,95 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
     write(&live, &initramfs(&base, &common, "install\n", &extra)?)?;
     let iso = scratch.dir.join("installer.iso");
     media::write_image_with_payloads(&iso, &kernel, &live, &payloads)?;
-    for (name, attachment, source_device) in [
-        ("optical", FirmwareAttachment::Optical, "/dev/sr0"),
-        ("usb", FirmwareAttachment::Usb, "/dev/sda"),
-    ] {
-        let target = TargetDisk::create(&scratch.dir, &format!("{name}.img"))?;
-        let vars = scratch.dir.join(format!("{name}-install-vars.fd"));
-        efi::copy_input(&vars_template, &vars)?;
-        println!("   [qemu-install] installing through {name} media");
-        let result = boot_source(
-            &qemu,
-            BootSource::Firmware {
-                code: &code,
-                vars: &vars,
-                attachment,
-                installation_target: Some(&target),
-            },
-            plan(&iso, true, protocol::INSTALL_MARKER),
-            &scratch.dir,
-            timeout,
-        )?;
-        require_installation(&result, &uuid, source_device)?;
-        let duplicate = TargetDisk::create(&scratch.dir, &format!("{name}-duplicate.img"))?;
-        duplicate.copy_volume_identity(&target)?;
-        let vars = scratch.dir.join(format!("{name}-duplicate-vars.fd"));
-        efi::copy_input(&vars_template, &vars)?;
-        let refused =
-            "TD-INSTALL-REFUSED: volume resolution failed: td-boot: ambiguous td volume identity";
-        println!("   [qemu-install] refusing duplicate volume identity before selection");
-        let result = boot_source(
-            &qemu,
-            BootSource::Firmware {
-                code: &code,
-                vars: &vars,
-                attachment: FirmwareAttachment::InstalledFixtureReordered,
-                installation_target: Some(&duplicate),
-            },
-            plan(&target.path, false, refused),
-            &scratch.dir,
-            timeout,
-        )?;
-        require(&result, refused, "duplicate volume refusal")?;
-        if result.evidence.selected_current || result.evidence.selected_previous {
-            return Err("ambiguous volume reached deployment selection".into());
-        }
-        for (count, marker) in [
-            (1, protocol::FIRST_BOOT_MARKER),
-            (2, protocol::SECOND_BOOT_MARKER),
+    for sector_size in [SectorSize::Bytes512, SectorSize::Bytes4096] {
+        for (name, attachment, source_device) in [
+            ("optical", FirmwareAttachment::Optical, "/dev/sr0"),
+            ("usb", FirmwareAttachment::Usb, "/dev/sda"),
         ] {
-            let decoy = if count == 2 {
-                Some(TargetDisk::create(
-                    &scratch.dir,
-                    &format!("{name}-decoy.img"),
-                )?)
-            } else {
-                None
-            };
-            let vars = scratch.dir.join(format!("{name}-boot-{count}-vars.fd"));
+            let name = format!("{name}-{}", sector_size.bytes());
+            let mut target = TargetDisk::create(&scratch.dir, &format!("{name}.img"))?;
+            target.sector_size = sector_size;
+            let vars = scratch.dir.join(format!("{name}-install-vars.fd"));
             efi::copy_input(&vars_template, &vars)?;
-            println!("   [qemu-install] cold installed boot {count}, {name} media detached");
-            let expected = format!("{marker} {id}");
+            println!("   [qemu-install] installing through {name} media");
             let result = boot_source(
                 &qemu,
                 BootSource::Firmware {
                     code: &code,
                     vars: &vars,
-                    attachment: if count == 2 {
-                        FirmwareAttachment::InstalledFixtureReordered
-                    } else {
-                        FirmwareAttachment::InstalledFixture
-                    },
-                    installation_target: decoy.as_ref(),
+                    attachment,
+                    installation_target: Some(&target),
                 },
-                plan(&target.path, false, &expected),
+                plan(&iso, true, protocol::INSTALL_MARKER),
                 &scratch.dir,
                 timeout,
             )?;
-            let expected_device = if count == 2 { "/dev/vdb2" } else { "/dev/vda2" };
-            validate_fixture_boot(&result, &expected, &uuid, expected_device, &id)?;
+            require_installation(&result, &uuid, source_device)?;
+            require(
+                &result,
+                &format!("{} {}", protocol::SECTOR_BYTES_MARKER, sector_size.bytes()),
+                "target sector geometry",
+            )?;
+            let mut duplicate = TargetDisk::create(&scratch.dir, &format!("{name}-duplicate.img"))?;
+            duplicate.sector_size = sector_size;
+            duplicate.copy_volume_identity(&target)?;
+            let vars = scratch.dir.join(format!("{name}-duplicate-vars.fd"));
+            efi::copy_input(&vars_template, &vars)?;
+            let refused = concat!(
+                "TD-INSTALL-REFUSED: volume resolution failed: ",
+                "td-boot: ambiguous td volume identity"
+            );
+            println!("   [qemu-install] refusing duplicate volume identity before selection");
+            let result = boot_source(
+                &qemu,
+                BootSource::Firmware {
+                    code: &code,
+                    vars: &vars,
+                    attachment: FirmwareAttachment::InstalledFixtureReordered,
+                    installation_target: Some(&duplicate),
+                },
+                sector_plan(&target.path, refused, sector_size),
+                &scratch.dir,
+                timeout,
+            )?;
+            require(&result, refused, "duplicate volume refusal")?;
+            if result.evidence.selected_current || result.evidence.selected_previous {
+                return Err("ambiguous volume reached deployment selection".into());
+            }
+            for (count, marker) in [
+                (1, protocol::FIRST_BOOT_MARKER),
+                (2, protocol::SECOND_BOOT_MARKER),
+            ] {
+                let decoy = if count == 2 {
+                    let mut disk = TargetDisk::create(&scratch.dir, &format!("{name}-decoy.img"))?;
+                    disk.sector_size = sector_size;
+                    Some(disk)
+                } else {
+                    None
+                };
+                let vars = scratch.dir.join(format!("{name}-boot-{count}-vars.fd"));
+                efi::copy_input(&vars_template, &vars)?;
+                println!("   [qemu-install] cold installed boot {count}, {name} media detached");
+                let expected = format!("{marker} {id}");
+                let result = boot_source(
+                    &qemu,
+                    BootSource::Firmware {
+                        code: &code,
+                        vars: &vars,
+                        attachment: if count == 2 {
+                            FirmwareAttachment::InstalledFixtureReordered
+                        } else {
+                            FirmwareAttachment::InstalledFixture
+                        },
+                        installation_target: decoy.as_ref(),
+                    },
+                    sector_plan(&target.path, &expected, sector_size),
+                    &scratch.dir,
+                    timeout,
+                )?;
+                let expected_device = if count == 2 { "/dev/vdb2" } else { "/dev/vda2" };
+                validate_fixture_boot(&result, &expected, &uuid, expected_device, &id)?;
+            }
         }
     }
     let interrupted_live = scratch.dir.join("interrupted.cpio");
@@ -585,7 +602,7 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
         td_boot_protocol::MANIFEST_UNAUTHENTICATED,
     )?;
     println!(
-        "PASS: native optical/USB installation and interrupted-publication refusal/reinstallation; provisioned UUID binding across verified kexec and reordered disks; duplicate identity refusal; undersized/read-only targets and wrong-key/corrupt-payload optical/USB refusals preserve every target byte; two persistent installed boots"
+        "PASS: native optical/USB 512-byte/4Kn installation and interrupted-publication refusal/reinstallation; provisioned UUID binding across verified kexec and reordered disks; duplicate identity refusal; undersized/read-only targets and wrong-key/corrupt-payload optical/USB refusals preserve every target byte; two persistent installed boots"
     );
     Ok(())
 }
@@ -1014,9 +1031,19 @@ fn installation_timeout(value: Option<&str>, default_secs: u64) -> Duration {
         .unwrap_or(Duration::from_secs(default_secs))
 }
 
+fn sector_plan<'a>(path: &'a Path, marker: &'a str, sector_size: SectorSize) -> BootPlan<'a> {
+    let mut result = plan(path, false, marker);
+    result.disk = Some(BootDisk {
+        path,
+        read_only: false,
+        sector_size,
+    });
+    result
+}
+
 fn plan<'a>(path: &'a Path, read_only: bool, marker: &'a str) -> BootPlan<'a> {
     BootPlan {
-        disk: Some(BootDisk { path, read_only }),
+        disk: Some(BootDisk::new(path, read_only)),
         mem: "2048",
         target_marker: marker,
         kill_on_marker: true,

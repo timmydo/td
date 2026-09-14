@@ -38,10 +38,7 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
                 installation_target: None,
             },
             BootPlan {
-                disk: Some(BootDisk {
-                    path: &disk,
-                    read_only: phase != "boot",
-                }),
+                disk: Some(BootDisk::new(&disk, phase != "boot")),
                 mem: "512",
                 target_marker: MARKER,
                 kill_on_marker: true,
