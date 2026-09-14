@@ -2133,34 +2133,42 @@ still enters Save As; Quit/Close still asks about dirty text. Path and
 confirmation dialogs take precedence, so F10 and clicks cannot open a menu
 through a modal question.
 
-Menu state pins the active tab/revision and key profile at opening. Admission
-rechecks them and the popup geometry before executing an item; a stale menu
-dismisses visibly without issuing the command. File completion dismisses an
-open menu before showing its result or switching tabs. Configure, keyboard
-map replacement and keyboard-focus loss dismiss menus; pointer leave also
-dismisses without altering keyboard focus. The first press outside a popup
-only dismisses it; it cannot click through to text or tabs. Disabled entries
-do nothing and stay open. Pointer motion highlights only enabled rows; wheel
-events are consumed. Selecting another header switches menus, and selecting
-the current header closes it.
+The shared `td_ui::menus::Controller` owns menu navigation, header
+switching, selection, geometry and activation admission. The editor
+supplies an immutable model of its item IDs, availability, checks and
+shortcuts, with the active tab/revision and key profile as the model
+revision. When the controller switches headers, the adapter refreshes
+application availability, including clipboard transfers completed while
+the menu was open. Stale header input cancels the old menu; reopening is
+a fresh press. Admission rechecks them and the popup geometry before
+executing an item; a stale menu dismisses visibly without issuing the
+command. File completion dismisses an open menu before showing its
+result or switching tabs. Configure, keyboard map replacement and
+keyboard-focus loss dismiss menus; pointer leave also dismisses without
+altering keyboard focus. The first press outside a popup only dismisses
+it; it cannot click through to text or tabs. Disabled entries do nothing
+and stay open. Pointer motion highlights only enabled rows; wheel events
+are consumed. Selecting another header switches menus, and selecting the
+current header closes it.
 
 Activation uses a separate press on an item after opening the header;
 press-drag-release menu selection is not implemented. Release cannot
 activate a row or resume a document drag behind the dismissed popup.
 
-The popup is td-ui's `chrome::Panel` under the menu bar's header
-(`td-ui/DESIGN.md`): its width, its rows, the right-edge clamp and its row
-cap are the toolkit's, and the complete menu exists only
-above the status row. A too-small surface refuses to open the popup and
-displays an enlargement notice; invisible/clipped rows can never be
-activated. A clipped-menu refusal does not reset pending prefix/mark/drag.
-A new physical key press still cancels native repeat before menu admission,
-as it does for every key. Escape/C-g with a menu open dismisses both the
-menu and any underlying notice; F10 only toggles the menu. Labels are
-static and bounded, painting and hit tests are the one panel, and the
-header geometry is the menu bar's `chrome::Bar`. Colors remain warm and
-muted, with dim disabled text and a highlighted selected row. The core
-headless preview's closed menu bar has unchanged pixels.
+The controller uses `Fit::Complete` and td-ui's `chrome::Panel` under
+the menu bar's header (`td-ui/DESIGN.md`): its width, its rows, the
+right-edge clamp and its row cap are the toolkit's, and the complete
+menu exists only above the status row. A too-small surface refuses to
+open the popup and displays an enlargement notice; invisible/clipped
+rows can never be activated. A clipped-menu refusal does not reset
+pending prefix/mark/drag. A new physical key press still cancels native
+repeat before menu admission, as it does for every key. Escape/C-g with
+a menu open dismisses both the menu and any underlying notice; F10 only
+toggles the menu. Labels are static and bounded, painting and hit tests
+are the one panel, and the header geometry is the menu bar's
+`chrome::Bar`. Colors remain warm and muted, with dim disabled text and
+a highlighted selected row. The core headless preview's closed menu bar
+has unchanged pixels.
 
 Pure tests pin panel bounds and row hits at scales 1-4, disabled navigation,
 shortcut widths and header mapping. Controller tests pin prefix/mark/drag

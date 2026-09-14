@@ -1038,32 +1038,73 @@ The builder discovers the crate by existing. Its gate runs `cargo test` and
 all-target Clippy; a change under `td-ui/` selects td-editor's tests through
 the reader graph, because td-editor's manifest names the crate.
 
+## Shared menu controller
+
+`menus::Model` is an immutable, caller-revisioned tree of `Node` values.
+Each node carries a bounded `chrome::Row` and either a typed action ID
+or a submenu. Parent indices precede children; only submenus have
+children, branches cannot be empty, and bar roots are labelled submenus.
+Context roots are the first panel's rows. Construction refuses invalid
+trees, more than 256 entries, more than eight open panels,
+empty/control-bearing labels, labels over 256 bytes or shortcuts over 64
+bytes. Allocation is fallible; event handling and painting allocate no
+collections.
+
+`menus::Controller` owns the open path, enabled selection, scrolling,
+placement, keyboard and pointer navigation, and dismissal. Consumers
+feed explicit events and the current model revision and receive typed
+outcomes; the toolkit never executes an action. Right/Activate opens a
+submenu, Left/Escape closes one level, Up/Down wraps among enabled rows,
+and Dismiss closes the path. Root Left/Right switches enabled bar
+headers; a lone enabled header keeps its selection. Disabled header
+presses and zero wheel deltas do nothing. Pointer movement into a child
+retains its ancestors. An action closes the menu before emitting its ID;
+release and key repeat cannot activate it again. Outside presses dismiss
+and are consumed. Focus loss or resize closes all panels. A mismatched
+or absent revision invalidates the menu without an action; replacing
+data requires a new controller. Opening a closed menu is an explicit
+consumer action, except for a press on an enabled bar header.
+
+An open or switched panel that cannot fit returns `NoRoom`; the consumer
+can show an enlargement notice. `Other` consumes unhandled input without
+an action, subject to the same revision check.
+
+`Fit::Adaptive` places children rightward, then leftward, within the
+surface without overlapping any visible ancestor. When neither side
+fits, it replaces the parent with a child and an actionable Back row.
+Panels show at most 13 rows, scrolling within the available height, and
+keyboard selection reveals its row. Scrolling clears a selection that
+becomes hidden, so Activate cannot choose an unseen row. Width shrinks
+to the surface; fewer than three text cells or no available content row
+refuses with `NoRoom`. `chrome::Panel::within` validates the complete
+rectangle and whole rows, sharing panel rendering and hit geometry.
+`Fit::Complete` preserves document-menu admission: a root has the
+existing 320-scaled-pixel width and every row above one status row; a
+too-small surface refuses without clipped actions. A fully disabled
+complete root retains its first-row highlight for editor compatibility,
+but cannot activate. Submenus still adapt, including wheel scrolling.
+`panel` and `row_rect` expose only visible levels. Bars remain part of
+the consumer's chrome; the controller emits semantic panel draws.
+
+The editor uses this controller for its complete menus. Its immutable
+data captures application availability, checks, shortcuts and
+tab/revision/key profile. Its adapter owns document cancellation policy
+and executes typed items through existing commands; it has no private
+menu navigation state. `tests/menus.rs` covers tree and text bounds,
+disabled navigation, nested pointer paths, left/replacement placement,
+Back, scroll/reveal, revision invalidation, focus/resize, repeated input
+and complete-mode compatibility. Draw-stream and pixel oracles preserve
+the editor's existing panel output at scales one through four; its scene
+and native input regressions remain.
+
 ## Planned task-manager widgets
 
-[td-taskmgr](../td-taskmgr/DESIGN.md) is a planned consumer. The following
-are target contracts, not existing public APIs. Add them as reusable td-ui
-widgets before the task manager depends on them; process collection,
-history retention and signal execution stay in the consumer. The menu
-increment extends Bar/Panel and moves td-editor's existing menu admission,
-header switching and open-panel controller onto the shared state machine
-in the same landing, deleting the old mechanism. Preserve its user-visible
-behavior and scene oracles; other consumers retain their current behavior.
+[td-taskmgr](../td-taskmgr/DESIGN.md) is a planned consumer. Menus above are
+implemented; the following remain target contracts, not existing public
+APIs. Add them as reusable td-ui widgets before the task manager depends
+on them. Process collection, history and signal execution stay in the
+consumer.
 
-- Menus with nested submenus, shared by menu-bar and context-menu entry
-  points. td-ui owns open-panel state, focus, placement, pointer and keyboard
-  navigation, disabled rows, hit testing and dismissal. Consumers provide
-  bounded menu data and stable action IDs and receive typed activation;
-  they neither draw private submenus nor execute actions inside the widget.
-  Right/Enter opens a submenu, Left closes one level, Up/Down walks enabled
-  rows, and Escape closes the innermost panel. Pointer movement into a child
-  keeps its ancestor path open. Fit children rightward or leftward within
-  the surface, with scrolling when needed; at narrow widths replace the
-  parent panel with a child panel and a Back entry. No off-surface hit
-  regions. Outside clicks dismiss and are consumed; focus loss dismisses
-  every level and cancels pending activation. Model revision invalidates
-  stale action IDs, and key repeat cannot activate an action twice. Limit
-  nesting to eight panels and data to 256 entries, with an explicit error
-  on excess rather than a silently missing action.
 - Nonclosable tabs as an explicit option of the shared strip. Preserve the
   existing document-tab default; a nonclosable tab reserves no close hit
   region. Keyboard selection and overflow keep the active tab visible.

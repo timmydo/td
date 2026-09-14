@@ -402,8 +402,10 @@ The implementation must demonstrate:
 Independently landable increments:
 
 1. This design and the td-ui extension contract. Documentation only.
-2. Shared td-ui menus with submenus, confirmation dialogs and nonclosable
-   resource tabs, with oracles and existing consumer regressions; no task-manager-local fork.
+2. Shared td-ui widgets, each with oracles and existing consumer regressions:
+   menus with submenus (implemented, including the atomic editor migration),
+   then confirmation dialogs and nonclosable resource tabs. No
+   task-manager-local fork.
 3. Shared charts, split pane and tree table, each in a self-contained
    tested landing. Reuse the existing text entry and list primitives.
 4. Standalone crate with bounded collection, metric model and retained

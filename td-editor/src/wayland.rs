@@ -640,23 +640,15 @@ impl Window {
     }
 
     fn menu_hover(&mut self, x: i32, y: i32) -> bool {
-        let Some(menu) = &mut self.menu else {
+        if self.menu.is_none() {
             return false;
-        };
-        if let Some(index) = menu.hit(
-            self.ui.geometry(),
-            i64::from(x).div_euclid(256),
-            i64::from(y).div_euclid(256),
-        ) {
-            if menu
-                .group
-                .items()
-                .get(index)
-                .is_some_and(|item| menu.enabled(*item))
-            {
-                self.frames.invalidate(menu.selected != index);
-                menu.selected = index;
-            }
+        }
+        if let Err(error) = self.menu_event(td_ui::menus::Event::Move {
+            x: i64::from(x).div_euclid(256),
+            y: i64::from(y).div_euclid(256),
+        }) {
+            self.menu = None;
+            self.notify(format!("Menu cancelled: {error}"));
         }
         true
     }
@@ -2932,9 +2924,7 @@ impl Window {
         };
         let doc = self.ui.editor().document(tab).map_err(error)?;
         let (undo, redo) = doc.history_depth();
-        let mut menu = crate::menu::Menu {
-            group,
-            selected: 0,
+        let data = crate::menu::Data {
             target: Target {
                 tab,
                 revision: doc.revision(),
@@ -2943,9 +2933,16 @@ impl Window {
             file_window: self.files.is_some(),
             directory: doc.directory(),
             directory_entry: self.directory_entry_path(tab).is_some(),
-            directory_sort: self.files.as_ref().and_then(|f| f.directory(tab)).map_or(
-                crate::directory::Sort::Name, |d| d.sort),
-            directory_reverse: self.files.as_ref().and_then(|f| f.directory(tab)).is_some_and(|d| d.reverse),
+            directory_sort: self
+                .files
+                .as_ref()
+                .and_then(|f| f.directory(tab))
+                .map_or(crate::directory::Sort::Name, |d| d.sort),
+            directory_reverse: self
+                .files
+                .as_ref()
+                .and_then(|f| f.directory(tab))
+                .is_some_and(|d| d.reverse),
             undo: undo != 0,
             redo: redo != 0,
             auto_fill: doc.auto_fill(),
@@ -2967,130 +2964,129 @@ impl Window {
                 && self.clipboard.incoming.is_none()
                 && self.client.selection_mime().is_some(),
         };
-        if menu.panel(self.ui.geometry()).is_none() {
-            self.menu = None;
-            self.notify(
-                "Enlarge the window to show the complete menu. Keyboard commands remain available.",
-            );
-            return Ok(());
-        }
+        let menu = match crate::menu::Menu::new(data, group, self.ui.geometry()) {
+            Ok(menu) => menu,
+            Err(td_ui::menus::Error::NoRoom) => {
+                self.menu = None;
+                self.notify("Enlarge the window to show the complete menu. Keyboard commands remain available.");
+                return Ok(());
+            }
+            Err(e) => {
+                self.menu = None;
+                self.notify(format!("Menu refused: {e}"));
+                return Ok(());
+            }
+        };
         if let Err(e) = self.ui.dispatch(Event::CancelInput) {
             self.notify(format!("Menu refused: {e}"));
             return Ok(());
         }
         self.stop_pointer();
         self.client.cancel_repeat();
-        if menu
-            .group
-            .items()
-            .first()
-            .is_some_and(|item| !menu.enabled(*item))
-        {
-            menu.step(false);
-        }
         self.menu = Some(menu);
         self.frames.invalidate(true);
         Ok(())
     }
 
-    fn menu_valid(&self) -> bool {
-        self.menu.as_ref().is_some_and(|menu| {
-            self.ui.editor().active() == Some(menu.target.tab)
-                && self.ui.keys().profile() == menu.profile
-                && self
-                    .ui
-                    .editor()
-                    .document(menu.target.tab)
-                    .is_ok_and(|doc| doc.revision() == menu.target.revision)
-                && menu.panel(self.ui.geometry()).is_some()
-        })
+    fn menu_stamp(&self) -> Option<crate::menu::Stamp> {
+        let tab = self.ui.editor().active()?;
+        let doc = self.ui.editor().document(tab).ok()?;
+        Some((
+            Target {
+                tab,
+                revision: doc.revision(),
+            },
+            self.ui.keys().profile(),
+        ))
+    }
+
+    fn menu_event(&mut self, event: td_ui::menus::Event) -> Result<()> {
+        use td_ui::menus::{Event as MenuEvent, Key, Outcome};
+        let mut stamp = self.menu_stamp();
+        let Some(menu) = &mut self.menu else {
+            return Ok(());
+        };
+        // Cancellation needs no live document; it cannot execute an action.
+        if matches!(
+            event,
+            MenuEvent::Key {
+                key: Key::Dismiss | Key::Escape,
+                ..
+            }
+        ) {
+            stamp = Some(menu.stamp());
+        } else if !menu.valid(stamp, self.ui.geometry()) {
+            stamp = None;
+        }
+        let previous_group = menu.header_group();
+        let target = menu.target;
+        let wrap = menu.wrap;
+        let auto_fill = menu.auto_fill;
+        match menu.event(stamp, event) {
+            Ok(Outcome::Activated(item)) => self.activate_item(item, target, wrap, auto_fill)?,
+            Ok(Outcome::Dismissed) => {
+                self.menu = None;
+                self.frames.invalidate(true);
+            }
+            Ok(Outcome::Stale) => {
+                self.menu = None;
+                self.notify("Menu cancelled: document changed. Open the menu again.");
+            }
+            Ok(Outcome::Changed) => {
+                if let Some(group) = menu
+                    .header_group()
+                    .filter(|group| Some(*group) != previous_group)
+                {
+                    // Header navigation refreshes application availability, as at opening.
+                    self.open_menu(group)?;
+                } else {
+                    self.frames.invalidate(true);
+                }
+            }
+            Ok(Outcome::Ignored | Outcome::Consumed) => {}
+            Err(td_ui::menus::Error::NoRoom) => {
+                self.menu = None;
+                self.notify("Enlarge the window to show the complete menu. Keyboard commands remain available.");
+            }
+            Err(e) => {
+                self.menu = None;
+                self.notify(format!("Menu cancelled: {e}"));
+            }
+        }
+        Ok(())
     }
 
     fn menu_pointer(&mut self, x: i64, y: i64) -> Result<bool> {
-        if let Some(group) = crate::menu::header(self.ui.geometry(), x, y) {
-            if self.menu.as_ref().is_some_and(|menu| menu.group == group) {
-                self.menu = None;
-                self.frames.invalidate(true);
-            } else {
-                self.open_menu(group)?;
-            }
-            return Ok(true);
-        }
-        let Some(menu) = &self.menu else {
-            return Ok(false);
-        };
-        if let Some(index) = menu.hit(self.ui.geometry(), x, y) {
-            self.activate_menu(index)?;
+        if self.menu.is_none() {
+            let Some(group) = crate::menu::header(self.ui.geometry(), x, y) else {
+                return Ok(false);
+            };
+            self.open_menu(group)?;
         } else {
-            self.menu = None;
-            self.frames.invalidate(true);
+            self.menu_event(td_ui::menus::Event::Press { x, y })?;
         }
         Ok(true)
     }
 
     fn menu_chord(&mut self, chord: &str, repeated: bool) -> Result<()> {
+        use td_ui::menus::{Event, Key};
         if repeated {
             return Ok(());
         }
-        if matches!(chord, "Escape" | "C-g" | "F10") {
-            self.menu = None;
-            if chord != "F10" {
+        let key = match chord {
+            "Escape" | "C-g" => {
                 self.notice = None;
+                Some(Key::Dismiss)
             }
-            self.frames.invalidate(true);
-            return Ok(());
-        }
-        if !self.menu_valid() {
-            self.menu = None;
-            self.notify("Menu cancelled: document changed. Open the menu again.");
-            return Ok(());
-        }
-        let Some(menu) = &mut self.menu else {
-            return Ok(());
+            "F10" => Some(Key::Dismiss),
+            "Up" => Some(Key::Up),
+            "Down" => Some(Key::Down),
+            "Left" => Some(Key::Left),
+            "Right" => Some(Key::Right),
+            "Return" | "Space" => Some(Key::Activate),
+            _ => None,
         };
-        match chord {
-            "Up" | "Down" => {
-                menu.step(chord == "Up");
-                self.frames.invalidate(true);
-            }
-            "Left" | "Right" => {
-                let count = crate::menu::Group::ALL.len();
-                let index =
-                    (menu.group.index() + if chord == "Left" { count - 1 } else { 1 }) % count;
-                let group = crate::menu::Group::ALL
-                    .get(index)
-                    .copied()
-                    .ok_or("menu group")?;
-                self.open_menu(group)?;
-            }
-            "Return" | "Space" => {
-                let index = menu.selected;
-                self.activate_menu(index)?;
-            }
-            _ => {}
-        }
-        Ok(())
-    }
-
-    fn activate_menu(&mut self, index: usize) -> Result<()> {
-        if !self.menu_valid() {
-            self.menu = None;
-            self.notify("Menu cancelled: document changed. Open the menu again.");
-            return Ok(());
-        }
-        let Some(menu) = &self.menu else {
-            return Ok(());
-        };
-        let Some(item) = menu.group.items().get(index).copied() else {
-            return Ok(());
-        };
-        if !menu.enabled(item) {
-            return Ok(());
-        }
-        let Target { tab, revision } = menu.target;
-        let wrap = menu.wrap;
-        let auto_fill = menu.auto_fill;
-        self.activate_item(item, Target { tab, revision }, wrap, auto_fill)
+        self.menu_event(key.map_or(Event::Other, |key| Event::Key { key, repeated }))
     }
 
     fn activate_item(
@@ -5042,6 +5038,14 @@ pub fn file_window(options: FileWindowOptions) -> io::Result<()> {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 mod tests {
+    impl super::Window {
+        fn activate_menu(&mut self, index: usize) -> Result<()> {
+            let Some(row) = self.menu.as_ref().and_then(|menu| menu.row(index)) else {
+                return Ok(());
+            };
+            self.menu_event(td_ui::menus::Event::Press { x: row.x, y: row.y })
+        }
+    }
     use super::*;
     type Kind = td_ui::client::Kind<Object>;
     use crate::layout::CELL_WIDTH;
@@ -5978,7 +5982,7 @@ mod tests {
             let menu = w.menu.as_mut().unwrap();
             assert!(menu.enabled(crate::menu::Item::CopyPath));
             assert!(!menu.enabled(crate::menu::Item::Save));
-            menu.selected = 5;
+            menu.select(5);
             w.event(message(keyboard, 3, &[7788, 0, 28, 1])).unwrap();
             w.event(message(keyboard, 3, &[8899, 0, 28, 0])).unwrap();
             let source = w.client.source().unwrap();
@@ -6056,7 +6060,7 @@ mod tests {
                     .as_ref()
                     .unwrap()
                     .enabled(crate::menu::Item::CopyPath));
-                w.menu.as_mut().unwrap().selected = index;
+                w.menu.as_mut().unwrap().select(index);
                 w.event(message(keyboard, 3, &[7788, 0, 28, 1])).unwrap();
                 w.event(message(keyboard, 3, &[8899, 0, 28, 0])).unwrap();
                 assert!(w.activation_serial.is_none());
@@ -6097,11 +6101,11 @@ mod tests {
         configure(&mut w, 800, 600);
         let before = format!("{:?}", w.ui.editor());
         w.open_menu(crate::menu::Group::File).unwrap();
-        w.menu.as_mut().unwrap().selected = crate::menu::Group::File
+        w.menu.as_mut().unwrap().select(crate::menu::Group::File
             .items()
             .iter()
             .position(|item| *item == crate::menu::Item::CopyPath)
-            .unwrap();
+            .unwrap());
         key(&mut w, keyboard, 28);
         assert_eq!(w.clipboard.text.as_deref().unwrap(), path.to_str().unwrap());
         assert!(w.activation_serial.is_none());
@@ -6142,11 +6146,11 @@ mod tests {
         w.event(message(keyboard, 4, &[0, 0, 0, 0, 0])).unwrap();
         configure(&mut w, 800, 600);
         w.open_menu(crate::menu::Group::File).unwrap();
-        w.menu.as_mut().unwrap().selected = crate::menu::Group::File
+        w.menu.as_mut().unwrap().select(crate::menu::Group::File
             .items()
             .iter()
             .position(|item| *item == crate::menu::Item::CopyPath)
-            .unwrap();
+            .unwrap());
         drain(&peer);
         key(&mut w, keyboard, 28);
         assert!(w.notice.as_deref().unwrap().contains("UTF-8"));
@@ -8167,7 +8171,7 @@ mod tests {
             let panel = w.menu.as_ref().unwrap().panel(w.ui.geometry()).unwrap();
             let (x, y) = (panel.x + 4, panel.y + index * 24 + 4);
             remote_pointer(&mut w, "move", x, y, false);
-            assert_eq!(w.menu.as_ref().unwrap().selected, index as usize);
+            assert_eq!(w.menu.as_ref().unwrap().selected(), index as usize);
             remote_pointer(&mut w, "press", x, y, false);
             assert!(w.menu.is_none());
             assert!(w.client.source().is_none() && w.activation_serial.is_none());
@@ -12475,6 +12479,37 @@ mod tests {
     }
 
     #[test]
+    fn menu_header_navigation_refreshes_completed_clipboard_availability() {
+        use crate::menu::{Group, Item};
+        for pointer in [false, true] {
+            let (mut w, _peer, _keyboard, _device) = clipboard_fixture();
+            configure(&mut w, 800, 600);
+            let (_reader, sender) = UnixStream::pair().unwrap();
+            w.clipboard.outgoing = Some(
+                crate::transfer::Outgoing::begin(
+                    OwnedFd::from(sender),
+                    std::sync::Arc::from("clipboard"),
+                    0,
+                )
+                .unwrap(),
+            );
+            w.open_menu(Group::Edit).unwrap();
+            assert!(!w.menu.as_ref().unwrap().enabled(Item::Copy));
+            w.clipboard.outgoing = None;
+            if pointer {
+                for group in [Group::File, Group::Edit] {
+                    let header = w.ui.geometry().menu(group.index()).unwrap();
+                    w.menu_pointer(header.x, header.y).unwrap();
+                }
+            } else {
+                w.menu_chord("Right", false).unwrap();
+                w.menu_chord("Left", false).unwrap();
+            }
+            assert!(w.menu.as_ref().unwrap().enabled(Item::Copy));
+        }
+    }
+
+    #[test]
     fn menus_use_mouse_and_f10_without_editing_on_cancel_or_disabled_items() {
         use crate::menu::{Group, Item};
         for profile in [Profile::Windows, Profile::Emacs] {
@@ -12489,7 +12524,7 @@ mod tests {
             }
             let device = w.client.keyboard().unwrap();
             key(&mut w, device, 68); // F10 through the real keymap.
-            assert_eq!(w.menu.as_ref().unwrap().group, Group::File);
+            assert_eq!(w.menu.as_ref().unwrap().group(), Group::File);
             assert!(!w.ui.keys().pending());
             w.chord("Return", true).unwrap();
             assert_eq!(w.ui.editor().tabs().count(), 1);
@@ -12497,7 +12532,7 @@ mod tests {
             assert_eq!(format!("{:?}", w.ui.editor()), before);
             menu_click(&mut w, Group::Edit, 2); // Disabled Cut.
             assert!(w.menu.is_some());
-            assert_ne!(w.menu.as_ref().unwrap().selected, 2);
+            assert_ne!(w.menu.as_ref().unwrap().selected(), 2);
             assert_eq!(format!("{:?}", w.ui.editor()), before);
             // First click outside a popup only dismisses; it does not move
             // the document caret or start a drag under the old menu.
@@ -12510,7 +12545,7 @@ mod tests {
             w.chord("Down", false).unwrap(); // Redo/Cut/Copy/Paste disabled.
             let menu = w.menu.as_ref().unwrap();
             assert_eq!(
-                menu.group.items().get(menu.selected),
+                menu.group().items().get(menu.selected()),
                 Some(&Item::SelectAll)
             );
             w.chord("Return", false).unwrap();
@@ -12698,11 +12733,11 @@ mod tests {
         let pointer = w.client.pointer().unwrap();
         w.chord("F10", false).unwrap();
         w.chord("Left", false).unwrap();
-        assert_eq!(w.menu.as_ref().unwrap().group, Group::Directory);
+        assert_eq!(w.menu.as_ref().unwrap().group(), Group::Directory);
         w.chord("Right", false).unwrap();
-        assert_eq!(w.menu.as_ref().unwrap().group, Group::File);
+        assert_eq!(w.menu.as_ref().unwrap().group(), Group::File);
         w.chord("Right", false).unwrap();
-        assert_eq!(w.menu.as_ref().unwrap().group, Group::Edit);
+        assert_eq!(w.menu.as_ref().unwrap().group(), Group::Edit);
         let tab = w.ui.editor().active().unwrap();
         let before = w.ui.tab_view(tab).unwrap();
         w.event(message(pointer, 8, &[0, 100])).unwrap();

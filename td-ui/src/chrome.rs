@@ -221,6 +221,24 @@ impl Panel {
         })
     }
 
+    /// A panel in caller-selected, fully visible geometry. Menus use this
+    /// after fitting or scrolling; the legacy header constructor stays strict.
+    pub fn within(surface: Surface, rect: Rect) -> Option<Self> {
+        let row = ROW * surface.scale.value();
+        if rect.intersection(surface.bounds()) != Some(rect)
+            || rect.width == 0
+            || rect.height == 0
+            || !(rect.height as usize).is_multiple_of(row)
+            || rect.height as usize / row > PANEL_ROWS
+        {
+            return None;
+        }
+        Some(Self {
+            rect,
+            scale: surface.scale,
+        })
+    }
+
     pub fn rect(self) -> Rect {
         self.rect
     }

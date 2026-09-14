@@ -4,7 +4,10 @@ use crate::dialog::Target;
 use crate::keys::Profile;
 use crate::render::{Geometry, MENU_LABELS};
 use td_ui::chrome::{self, Bar};
-use td_ui::raster::{Raster, Rect};
+use td_ui::menus;
+use td_ui::raster::Raster;
+#[cfg(test)]
+use td_ui::raster::Rect;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Group {
@@ -16,7 +19,13 @@ pub(crate) enum Group {
 }
 
 impl Group {
-    pub(crate) const ALL: [Self; 5] = [Self::File, Self::Edit, Self::Format, Self::Help, Self::Directory];
+    pub(crate) const ALL: [Self; 5] = [
+        Self::File,
+        Self::Edit,
+        Self::Format,
+        Self::Help,
+        Self::Directory,
+    ];
     pub(crate) fn index(self) -> usize {
         match self {
             Self::File => 0,
@@ -211,9 +220,7 @@ impl Item {
     }
 }
 
-pub(crate) struct Menu {
-    pub(crate) group: Group,
-    pub(crate) selected: usize,
+pub(crate) struct Data {
     pub(crate) target: Target,
     pub(crate) profile: Profile,
     pub(crate) file_window: bool,
@@ -231,7 +238,7 @@ pub(crate) struct Menu {
     pub(crate) paste: bool,
 }
 
-impl Menu {
+impl Data {
     pub(crate) fn enabled(&self, item: Item) -> bool {
         if self.directory
             && matches!(
@@ -289,38 +296,147 @@ impl Menu {
             _ => false,
         }
     }
-    fn chrome_panel(&self, geometry: Geometry) -> Option<chrome::Panel> {
-        let header = geometry.menu(self.group.index())?;
-        chrome::Panel::new(geometry.surface(), header, self.group.items().len())
+    pub(crate) fn stamp(&self) -> Stamp {
+        (self.target, self.profile)
     }
-    pub(crate) fn panel(&self, geometry: Geometry) -> Option<Rect> {
-        self.chrome_panel(geometry).map(chrome::Panel::rect)
+}
+
+pub(crate) type Stamp = (Target, Profile);
+
+pub(crate) struct Menu {
+    data: Data,
+    controller: menus::Controller<'static, Item, Stamp>,
+}
+
+impl std::ops::Deref for Menu {
+    type Target = Data;
+    fn deref(&self) -> &Data {
+        &self.data
     }
-    pub(crate) fn hit(&self, geometry: Geometry, x: i64, y: i64) -> Option<usize> {
-        self.chrome_panel(geometry)?.hit(x, y)
+}
+
+impl Menu {
+    pub(crate) fn new(data: Data, group: Group, geometry: Geometry) -> Result<Self, menus::Error> {
+        let count = Group::ALL.iter().map(|g| g.items().len() + 1).sum();
+        let mut nodes = Vec::new();
+        nodes
+            .try_reserve_exact(count)
+            .map_err(|_| menus::Error::Allocation)?;
+        for group in Group::ALL {
+            let parent = nodes.len();
+            nodes.push(menus::Node {
+                parent: None,
+                row: chrome::Row {
+                    label: MENU_LABELS
+                        .get(group.index())
+                        .copied()
+                        .ok_or(menus::Error::InvalidModel)?,
+                    shortcut: "",
+                    enabled: true,
+                    checked: false,
+                },
+                item: menus::Item::Submenu,
+            });
+            for &item in group.items() {
+                nodes.push(menus::Node {
+                    parent: Some(parent),
+                    row: chrome::Row {
+                        label: item.label(),
+                        shortcut: item.shortcut(data.profile),
+                        enabled: data.enabled(item),
+                        checked: data.checked(item),
+                    },
+                    item: menus::Item::Action(item),
+                });
+            }
+        }
+        let model = menus::Model::new(menus::Kind::Bar, data.stamp(), &nodes)?;
+        let mut controller =
+            menus::Controller::new(model, geometry.surface(), menus::Fit::Complete)?;
+        controller.open_bar(group.index())?;
+        Ok(Self { data, controller })
     }
-    pub(crate) fn step(&mut self, backward: bool) {
-        let next = chrome::step(self.group.items().len(), self.selected, backward, |index| {
-            self.group
-                .items()
-                .get(index)
-                .is_some_and(|item| self.enabled(*item))
-        });
-        self.selected = next;
+    pub(crate) fn valid(&self, stamp: Option<Stamp>, geometry: Geometry) -> bool {
+        self.controller.valid(stamp, geometry.surface())
+    }
+    pub(crate) fn event(
+        &mut self,
+        stamp: Option<Stamp>,
+        event: menus::Event,
+    ) -> Result<menus::Outcome<Item>, menus::Error> {
+        self.controller.event(stamp, event)
     }
     pub(crate) fn paint(&self, raster: &mut Raster<'_, '_>, geometry: Geometry) {
-        let Some(panel) = self.chrome_panel(geometry) else {
-            return;
+        if self.controller.surface() == geometry.surface() {
+            self.controller
+                .emit(geometry.bounds(), &mut |draw| raster.draw(draw));
+        }
+    }
+    #[cfg(test)]
+    pub(crate) fn panel(&self, geometry: Geometry) -> Option<Rect> {
+        if self.controller.surface() != geometry.surface() {
+            return None;
+        }
+        self.controller.panel(0)
+    }
+    pub(crate) fn header_group(&self) -> Option<Group> {
+        self.controller
+            .group()
+            .and_then(|index| Group::ALL.get(index))
+            .copied()
+    }
+    #[cfg(test)]
+    pub(crate) fn group(&self) -> Group {
+        self.header_group().unwrap()
+    }
+    #[cfg(test)]
+    pub(crate) fn selected(&self) -> usize {
+        let menus::Selection::Node(index) = self.controller.selection() else {
+            panic!("no selection")
         };
-        let rows = self.group.items().iter().map(|&item| chrome::Row {
-            label: item.label(),
-            shortcut: item.shortcut(self.profile),
-            enabled: self.enabled(item),
-            checked: self.checked(item),
-        });
-        panel.emit(rows, self.selected, geometry.bounds(), &mut |draw| {
-            raster.draw(draw)
-        });
+        let menus::Item::Action(item) = self.controller.model().node(index).unwrap().item else {
+            panic!("not an action")
+        };
+        self.group()
+            .items()
+            .iter()
+            .position(|i| *i == item)
+            .unwrap()
+    }
+    #[cfg(test)]
+    pub(crate) fn row(&self, index: usize) -> Option<Rect> {
+        let item = self.group().items().get(index)?;
+        (0..menus::ENTRIES).find_map(|node| {
+            let entry = self.controller.model().node(node)?;
+            match entry.item {
+                menus::Item::Action(action) if action == *item => self.controller.row_rect(node),
+                _ => None,
+            }
+        })
+    }
+    #[cfg(test)]
+    pub(crate) fn select(&mut self, index: usize) {
+        let row = self.row(index).unwrap();
+        self.event(
+            Some(self.stamp()),
+            menus::Event::Move { x: row.x, y: row.y },
+        )
+        .unwrap();
+    }
+    #[cfg(test)]
+    fn step(&mut self, backward: bool) {
+        self.event(
+            Some(self.stamp()),
+            menus::Event::Key {
+                key: if backward {
+                    menus::Key::Up
+                } else {
+                    menus::Key::Down
+                },
+                repeated: false,
+            },
+        )
+        .unwrap();
     }
 }
 
@@ -334,14 +450,12 @@ mod tests {
     use super::*;
     use td_ui::raster::Scale;
 
-    fn menu(group: Group) -> Menu {
-        Menu {
+    fn data() -> Data {
+        Data {
             directory: false,
             directory_entry: false,
             directory_sort: crate::directory::Sort::Name,
             directory_reverse: false,
-            group,
-            selected: 0,
             target: Target {
                 tab: 1,
                 revision: 0,
@@ -360,75 +474,21 @@ mod tests {
     }
 
     #[test]
-    fn file_with_copy_path_requires_216_scaled_pixels_of_height() {
-        for scale in 1..=4 {
-            let s = scale as usize;
-            let menu = menu(Group::File);
-            assert_eq!(Group::File.items().len(), 7);
-            assert_eq!(Group::File.items().last(), Some(&Item::Quit));
-            assert!(menu
-                .panel(Geometry::new(320 * s, 215 * s, Scale::new(scale).unwrap()).unwrap())
-                .is_none());
-            assert!(menu
-                .panel(Geometry::new(320 * s, 216 * s, Scale::new(scale).unwrap()).unwrap())
-                .is_some());
-        }
-    }
-
-    #[test]
-    fn format_with_line_numbers_requires_264_scaled_pixels_of_height() {
-        for scale in 1..=4 {
-            let s = scale as usize;
-            let menu = menu(Group::Format);
-            assert_eq!(Group::Format.items().len(), 9);
-            assert!(menu.checked(Item::LineNumbers));
-            assert!(menu
-                .panel(Geometry::new(320 * s, 263 * s, Scale::new(scale).unwrap()).unwrap())
-                .is_none());
-            assert!(menu
-                .panel(Geometry::new(320 * s, 264 * s, Scale::new(scale).unwrap()).unwrap())
-                .is_some());
-        }
-    }
-
-    #[test]
-    fn edit_with_replace_requires_thirteen_complete_scaled_rows() {
-        for scale in 1..=4 {
-            let s = scale as usize;
-            let menu = menu(Group::Edit);
-            assert_eq!(Group::Edit.items().len(), 13);
-            assert!(menu
-                .panel(Geometry::new(320 * s, 359 * s, Scale::new(scale).unwrap()).unwrap())
-                .is_none());
-            assert!(menu
-                .panel(Geometry::new(320 * s, 360 * s, Scale::new(scale).unwrap()).unwrap())
-                .is_some());
-        }
-    }
-
-    #[test]
-    fn every_complete_panel_and_hit_row_fits_at_scales_one_through_four() {
+    fn complete_panels_keep_their_minima_and_row_geometry_at_all_scales() {
         for scale in 1..=4 {
             let s = scale as usize;
             for group in Group::ALL {
-                let menu = menu(group);
                 let height = group.items().len() * 24 + 48;
                 let geometry =
                     Geometry::new(320 * s, height * s, Scale::new(scale).unwrap()).unwrap();
-                let panel = menu.panel(geometry).unwrap();
+                let menu = Menu::new(data(), group, geometry).unwrap();
+                let panel = menu.controller.panel(0).unwrap();
                 assert_eq!(panel.intersection(geometry.bounds()), Some(panel));
                 assert!(panel.y + i64::from(panel.height) <= geometry.status().y);
                 for (index, item) in group.items().iter().enumerate() {
-                    let y = panel.y + index as i64 * 24 * s as i64;
-                    assert_eq!(menu.hit(geometry, panel.x, y), Some(index));
-                    assert_eq!(
-                        menu.hit(
-                            geometry,
-                            panel.x + i64::from(panel.width) - 1,
-                            y + (24 * s) as i64 - 1
-                        ),
-                        Some(index)
-                    );
+                    let rect = menu.row(index).unwrap();
+                    assert_eq!(rect.y, panel.y + (index * 24 * s) as i64);
+                    assert_eq!(rect.width, panel.width);
                     for profile in [Profile::Windows, Profile::Emacs] {
                         assert!(
                             item.label().chars().count()
@@ -438,43 +498,42 @@ mod tests {
                         );
                     }
                 }
-                assert_eq!(menu.hit(geometry, panel.x - 1, panel.y), None);
-                assert_eq!(
-                    menu.hit(geometry, panel.x, panel.y + i64::from(panel.height)),
-                    None
-                );
-                assert!(menu
-                    .panel(
-                        Geometry::new(320 * s - 1, height * s, Scale::new(scale).unwrap()).unwrap()
-                    )
-                    .is_none());
-                assert!(menu
-                    .panel(
-                        Geometry::new(320 * s, height * s - 1, Scale::new(scale).unwrap()).unwrap()
-                    )
-                    .is_none());
+                for (width, height) in [(320 * s - 1, height * s), (320 * s, height * s - 1)] {
+                    let geometry =
+                        Geometry::new(width, height, Scale::new(scale).unwrap()).unwrap();
+                    assert!(matches!(
+                        Menu::new(data(), group, geometry),
+                        Err(menus::Error::NoRoom)
+                    ));
+                }
             }
         }
+        assert_eq!(Group::File.items().len(), 7);
+        assert_eq!(Group::Format.items().len(), 9);
+        assert_eq!(Group::Edit.items().len(), 13);
     }
 
     #[test]
     fn keyboard_navigation_skips_disabled_entries_and_wraps_within_the_group() {
-        let mut menu = menu(Group::Edit);
-        menu.step(false);
+        let mut menu = Menu::new(data(), Group::Edit, Geometry::default()).unwrap();
         assert_eq!(
-            menu.group.items().get(menu.selected),
+            menu.group().items().get(menu.selected()),
             Some(&Item::SelectAll)
         );
         menu.step(true);
-        assert_eq!(menu.group.items().get(menu.selected), Some(&Item::GoToLine));
+        assert_eq!(
+            menu.group().items().get(menu.selected()),
+            Some(&Item::GoToLine)
+        );
         for _ in 0..100 {
             menu.step(false);
-            assert!(menu.enabled(*menu.group.items().get(menu.selected).unwrap()));
+            assert!(menu.enabled(*menu.group().items().get(menu.selected()).unwrap()));
         }
         assert_eq!(Item::Save.shortcut(Profile::Emacs), "C-x C-s");
         assert_eq!(Item::Save.shortcut(Profile::Windows), "Ctrl+S");
         assert!(menu.checked(Item::Windows));
         assert!(!menu.checked(Item::Emacs));
+        assert!(menu.checked(Item::LineNumbers));
     }
 
     #[test]

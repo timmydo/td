@@ -42,6 +42,7 @@ pub mod font;
 #[path = "../../td-compositor/src/font_data.rs"]
 mod font_data;
 pub mod keyboard;
+pub mod menus;
 pub mod notices;
 pub mod pointer;
 pub mod raster;

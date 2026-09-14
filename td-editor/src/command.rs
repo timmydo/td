@@ -172,13 +172,11 @@ mod tests {
         assert!(NAMES
             .windows(2)
             .all(|pair| matches!(pair, [(a, _), (b, _)] if a < b)));
-        let menu = crate::menu::Menu {
+        let menu = crate::menu::Data {
             directory: false,
             directory_entry: false,
             directory_sort: crate::directory::Sort::Name,
             directory_reverse: false,
-            group: crate::menu::Group::Help,
-            selected: 0,
             target: crate::dialog::Target {
                 tab: 1,
                 revision: 0,
