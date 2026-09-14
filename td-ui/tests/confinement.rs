@@ -23,8 +23,9 @@ fn compact(text: &str) -> String {
     text.chars().filter(|c| !c.is_whitespace()).collect()
 }
 
-const PURE: [&str; 14] = [
+const PURE: [&str; 15] = [
     "chrome.rs",
+    "confirmations.rs",
     "control.rs",
     "data.rs",
     "driven.rs",

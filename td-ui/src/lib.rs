@@ -32,6 +32,7 @@ pub const CELL_HEIGHT: usize = 16;
 
 pub mod chrome;
 pub mod client;
+pub mod confirmations;
 pub mod control;
 pub mod control_socket;
 pub mod control_worker;

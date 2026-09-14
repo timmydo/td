@@ -1097,10 +1097,67 @@ and complete-mode compatibility. Draw-stream and pixel oracles preserve
 the editor's existing panel output at scales one through four; its scene
 and native input regressions remain.
 
+## Shared confirmation dialog
+
+`confirmations::Model` captures owned immutable request text, a typed
+confirmation action and a caller revision. Construction validates before
+copying and allocates fallibly: at most 256 detail entries, 4096 bytes per
+entry and one MiB of detail text, plus nonempty title/action labels of at
+most 256 bytes each. Control characters are refused. A source change or
+drop after capture cannot change the request presented for confirmation.
+The consumer owns any authority or descriptors behind the action ID.
+
+`confirmations::Controller` composes a title panel, a scrolling detail list
+and fixed Cancel/Confirm rows inside a fully visible rectangle. Details
+wrap at scalar boundaries without loss; precomputed offsets into the
+captured strings avoid borrowed self-references and allocation while
+handling ordinary input or painting. Layout reserves at most 65,536
+wrapped rows. Insufficient width, height, label space or wrapping capacity
+refuses with `NoRoom`, without omitting an action or part of the request.
+A valid layout shows the complete title and action labels, at least one
+detail row, and both actions. Title and actions stay visible while details
+scroll, separated from the fixed controls by visible rules. Resize
+retains the selected detail and scroll anchor by entry and byte offset,
+then reflows fallibly; a refusal closes with `Unavailable` and
+never leaves an old invisible confirmation target active.
+
+Focus starts on Cancel. Tab/BackTab cycle only through the detail list,
+Cancel and Confirm. Up/Down, PageUp/PageDown and Home/End navigate details;
+Activate acts only on the focused action. Escape cancels. Primary pointer
+press arms an action and release on that same action chooses it; moving
+away or any intervening keyboard input, including repeats, cancels the arm.
+Pointer actions preserve the keyboard focus choice; abandoning a pointer
+gesture cannot move the default keyboard action to Confirm. Blank detail
+rows do not select content. Outside
+input is consumed without closing or reaching underlying controls. Other
+unhandled input is consumed. Key repeat never activates. Focus loss
+cancels; resize cancels a pending gesture and returns focus to Cancel.
+A missing or changed revision closes stale without confirmation.
+
+Confirmation, cancellation, stale data and an unavailable resized layout
+each produce one `Closed` outcome. Later events are ignored and a closed
+dialog emits no draws. The controller captures an optional opaque prior
+focus ID, exposed by `prior_focus()`; the consumer supplies whether that
+exact control still exists. Event handling returns an outcome directly;
+resize failures are represented by `Closed` with `Unavailable`.
+A close returns that ID only when valid, for the adapter to restore focus.
+The adapter routes input through the modal controller while it is open
+and executes only the typed outcome; td-ui grants no process authority.
+The adapter must not position Confirm beneath the pointer that opened the
+dialog: a second click in a double-click is otherwise a fresh gesture.
+
+`tests/confirmations.rs` pins default cancellation, focus confinement,
+press/release pairing, duplicate/repeated input, outside input, stale data,
+focus loss, resize refusal and focus restoration. It covers capture
+independence, lossless Unicode wrapping and scrolling, the full one-MiB
+request bound, malformed input and unusable geometry. Draw-stream and
+pixel checks at scales one through four keep the controls within the
+dialog, preserve pixels outside it and respect partial damage.
+
 ## Planned task-manager widgets
 
-[td-taskmgr](../td-taskmgr/DESIGN.md) is a planned consumer. Menus above are
-implemented; the following remain target contracts, not existing public
+[td-taskmgr](../td-taskmgr/DESIGN.md) is a planned consumer. Menus and
+confirmations above are implemented; the following remain target contracts, not existing public
 APIs. Add them as reusable td-ui widgets before the task manager depends
 on them. Process collection, history and signal execution stay in the
 consumer.
@@ -1108,14 +1165,6 @@ consumer.
 - Nonclosable tabs as an explicit option of the shared strip. Preserve the
   existing document-tab default; a nonclosable tab reserves no close hit
   region. Keyboard selection and overflow keep the active tab visible.
-- Confirmation dialogs composed from the shared text, list and action
-  primitives. The consumer supplies immutable request details and action
-  IDs; td-ui confines focus and input to the dialog, initially focuses
-  Cancel, supports Escape cancellation, consumes outside clicks and
-  provides scrolling for a bounded detail list. A focus loss cancels
-  pending activation without confirming. Explicit confirm/cancel produces
-  one typed outcome; repeat, stale IDs or a second click cannot confirm
-  twice. Dismissal restores the prior focus when that control still exists.
 - Time-series line and stacked-area graphs with explicit timestamps,
   gaps, axes, units, legends,
   series IDs, a selected time and a selected series. Drawing and hit testing
