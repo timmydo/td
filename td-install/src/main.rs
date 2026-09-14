@@ -56,7 +56,7 @@ fn invalid(message: String) -> io::Error {
 const USAGE: &str =
     "usage: td-install layout <destination> [<efi-kernel> <selector-initramfs>]\n       \
                      td-install volume [--uuid <uuid>] <destination> <mkfs.btrfs> <scratch-dir> \
-                     [<td-boot> <deployment> <trusted-key>]";
+                     [<td-boot> <deployment> <trusted-key> | --trusted-key <trusted-key>]";
 
 #[derive(Debug, Eq, PartialEq)]
 enum Mode {
@@ -78,15 +78,9 @@ enum Mode {
         destination: PathBuf,
         mkfs: PathBuf,
         scratch: PathBuf,
-        /// The deployment to publish into the volume as it is made, if any.
-        ///
-        /// All THREE together or none: the publish is `td-boot`'s (D1), it
-        /// needs a bundle, and the key is what makes it check that bundle
-        /// rather than take it on trust — so a caller that named two of them
-        /// asked for something this cannot do, and defaulting the third is
-        /// how a fail-open gets in. An install with nothing to publish is
-        /// this command without them.
-        publish: Option<Publish>,
+        /// Publish requires all three operands and authenticated publication.
+        /// Trust initializes only the key/layout and claims no deployment.
+        seed: Option<VolumeSeed>,
     },
 }
 
@@ -194,6 +188,29 @@ struct Publish {
     trusted_key: PathBuf,
 }
 
+/// Formatting with a trust root alone prepares for a later mounted publish.
+#[derive(Debug, Eq, PartialEq)]
+enum VolumeSeed {
+    Publish(Publish),
+    Trust(PathBuf),
+}
+
+impl VolumeSeed {
+    fn trusted_key(&self) -> &Path {
+        match self {
+            Self::Publish(publish) => &publish.trusted_key,
+            Self::Trust(key) => key,
+        }
+    }
+
+    fn publish(&self) -> Option<&Publish> {
+        match self {
+            Self::Publish(publish) => Some(publish),
+            Self::Trust(_) => None,
+        }
+    }
+}
+
 fn parse_args(mut args: impl Iterator<Item = OsString>) -> io::Result<Mode> {
     let verb = args.next().ok_or_else(|| invalid(USAGE.to_string()))?;
     let rest: Vec<PathBuf> = args.map(PathBuf::from).collect();
@@ -220,6 +237,17 @@ fn parse_args(mut args: impl Iterator<Item = OsString>) -> io::Result<Mode> {
             "--uuid is only supported by volume".into()
         }));
     }
+    if rest.iter().any(|arg| arg.as_os_str() == "--trusted-key")
+        && !(verb == "volume" && rest.len() == 5
+            && rest.get(3).is_some_and(|arg| arg.as_os_str() == "--trusted-key")
+            && rest.iter().filter(|arg| arg.as_os_str() == "--trusted-key").count() == 1)
+    {
+        return Err(invalid(if verb == "volume" {
+            "--trusted-key requires exactly one key after the volume operands".into()
+        } else {
+            "--trusted-key is only supported by volume".into()
+        }));
+    }
     match (verb.to_str(), rest) {
         (Some("layout"), [destination]) => Ok(Mode::Layout {
             destination: destination.clone(),
@@ -232,17 +260,25 @@ fn parse_args(mut args: impl Iterator<Item = OsString>) -> io::Result<Mode> {
                 initramfs: initramfs.clone(),
             }),
         }),
+        (Some("volume"), [destination, mkfs, scratch, flag, trusted_key])
+            if flag.as_os_str() == "--trusted-key" => Ok(Mode::Volume {
+                uuid,
+                destination: destination.clone(),
+                mkfs: mkfs.clone(),
+                scratch: scratch.clone(),
+                seed: Some(VolumeSeed::Trust(trusted_key.clone())),
+            }),
         (Some("volume"), [destination, mkfs, scratch, td_boot, deployment, trusted_key]) => {
             Ok(Mode::Volume {
                 uuid,
                 destination: destination.clone(),
                 mkfs: mkfs.clone(),
                 scratch: scratch.clone(),
-                publish: Some(Publish {
+                seed: Some(VolumeSeed::Publish(Publish {
                     td_boot: td_boot.clone(),
                     deployment: deployment.clone(),
                     trusted_key: trusted_key.clone(),
-                }),
+                })),
             })
         }
         (Some("volume"), [destination, mkfs, scratch]) => Ok(Mode::Volume {
@@ -250,7 +286,7 @@ fn parse_args(mut args: impl Iterator<Item = OsString>) -> io::Result<Mode> {
             destination: destination.clone(),
             mkfs: mkfs.clone(),
             scratch: scratch.clone(),
-            publish: None,
+            seed: None,
         }),
         _ => Err(invalid(USAGE.to_string())),
     }
@@ -1133,7 +1169,7 @@ fn read_trusted_key(path: &Path) -> io::Result<Vec<u8>> {
     realfile::read_bounded_real_file(path, "trusted deployment key", protocol::MAX_PUBLIC_KEY_BYTES)
 }
 
-/// Publish `deployment` into the staging tree, through `td-boot`.
+/// Initialize trust directories and optionally publish through `td-boot`.
 ///
 /// D1: this crate does not learn to write a deployment directory, update a
 /// selector, or account for attempts — it hands the whole transaction to the
@@ -1149,7 +1185,7 @@ fn read_trusted_key(path: &Path) -> io::Result<Vec<u8>> {
 /// of byte offsets, and an id is neither a byte offset nor something a caller
 /// reading by position expects to see there. It is also READ, which is the
 /// whole of what stops a successful exit standing in for a publish — see below.
-fn publish_into(staging: &Path, publish: &Publish, key: &[u8]) -> io::Result<()> {
+fn seed_into(staging: &Path, seed: &VolumeSeed, key: &[u8]) -> io::Result<()> {
     // The four `install_deployment` requires, in its order and its spelling —
     // `td` is a literal there too, and the two nested constants make it
     // redundant only for as long as they stay under it. Mirroring the check
@@ -1229,77 +1265,79 @@ fn publish_into(staging: &Path, publish: &Publish, key: &[u8]) -> io::Result<()>
         let written = file.metadata()?;
         identity = (written.st_dev(), written.st_ino());
     }
-    let output = std::process::Command::new(&publish.td_boot)
-        .arg(protocol::PUBLISH_VERB)
-        .arg(staging)
-        .arg(&publish.deployment)
-        .arg(&snapshot)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::inherit())
-        .output()
-        // A failure to SPAWN reports the errno and no path, so a mistyped or
-        // unbuilt `td-boot` says only `No such file or directory` — on a
-        // command line that names four other paths any of which a reader would
-        // suspect first.
-        .map_err(|error| {
-            invalid(format!(
-                "cannot run {}: {error}",
+    if let VolumeSeed::Publish(publish) = seed {
+        let output = std::process::Command::new(&publish.td_boot)
+            .arg(protocol::PUBLISH_VERB)
+            .arg(staging)
+            .arg(&publish.deployment)
+            .arg(&snapshot)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::inherit())
+            .output()
+            // A failure to SPAWN reports the errno and no path, so a mistyped or
+            // unbuilt `td-boot` says only `No such file or directory` — on a
+            // command line that names four other paths any of which a reader would
+            // suspect first.
+            .map_err(|error| {
+                invalid(format!(
+                    "cannot run {}: {error}",
+                    publish.td_boot.display()
+                ))
+            })?;
+        let _ = io::stderr().write_all(&output.stdout);
+        if !output.status.success() {
+            return Err(invalid(format!(
+                "{} publish failed ({})",
+                publish.td_boot.display(),
+                output.status
+            )));
+        }
+        // A SUCCESSFUL EXIT IS NOT A PUBLISH. Nothing about a zero status says a
+        // deployment landed, and the failure that hides behind one is the worst
+        // this verb has: a complete, correct, mountable volume with an empty
+        // `td/deployments` — a disk that installs, formats, reports its offsets and
+        // then cannot boot, discovered by the machine rather than by the installer.
+        // So the id the child prints is READ BACK against the tree it claims to
+        // have written, which is a fact this crate already has: it made the
+        // directory the id has to appear in.
+        //
+        // This is not the crate learning the transaction (D1) — it does not know
+        // what a deployment CONTAINS, only that the writer named one and that the
+        // name resolves. `valid_digest` is `protocol.rs`'s so the shape is stated
+        // once, and it is checked BEFORE the join rather than after: an id is
+        // otherwise a path component out of a program's stdout, and `..` in it
+        // would answer this question with a directory outside the staging tree.
+        let id = std::str::from_utf8(&output.stdout)
+            .map_err(|_| {
+                invalid(format!(
+                    "{} printed a deployment id that is not ASCII",
+                    publish.td_boot.display()
+                ))
+            })?
+            .trim();
+        if !protocol::valid_digest(id.as_bytes()) {
+            return Err(invalid(format!(
+                "{} published no deployment id ({id:?})",
                 publish.td_boot.display()
-            ))
-        })?;
-    let _ = io::stderr().write_all(&output.stdout);
-    if !output.status.success() {
-        return Err(invalid(format!(
-            "{} publish failed ({})",
-            publish.td_boot.display(),
-            output.status
-        )));
-    }
-    // A SUCCESSFUL EXIT IS NOT A PUBLISH. Nothing about a zero status says a
-    // deployment landed, and the failure that hides behind one is the worst
-    // this verb has: a complete, correct, mountable volume with an empty
-    // `td/deployments` — a disk that installs, formats, reports its offsets and
-    // then cannot boot, discovered by the machine rather than by the installer.
-    // So the id the child prints is READ BACK against the tree it claims to
-    // have written, which is a fact this crate already has: it made the
-    // directory the id has to appear in.
-    //
-    // This is not the crate learning the transaction (D1) — it does not know
-    // what a deployment CONTAINS, only that the writer named one and that the
-    // name resolves. `valid_digest` is `protocol.rs`'s so the shape is stated
-    // once, and it is checked BEFORE the join rather than after: an id is
-    // otherwise a path component out of a program's stdout, and `..` in it
-    // would answer this question with a directory outside the staging tree.
-    let id = std::str::from_utf8(&output.stdout)
-        .map_err(|_| {
-            invalid(format!(
-                "{} printed a deployment id that is not ASCII",
-                publish.td_boot.display()
-            ))
-        })?
-        .trim();
-    if !protocol::valid_digest(id.as_bytes()) {
-        return Err(invalid(format!(
-            "{} published no deployment id ({id:?})",
-            publish.td_boot.display()
-        )));
-    }
-    let published = staging.join(protocol::DEPLOYMENTS_DIR).join(id);
-    if !paths::is_dir(&published)? {
-        return Err(invalid(format!(
-            "{} reported {id} but {} is not there",
-            publish.td_boot.display(),
-            published.display()
-        )));
+            )));
+        }
+        let published = staging.join(protocol::DEPLOYMENTS_DIR).join(id);
+        if !paths::is_dir(&published)? {
+            return Err(invalid(format!(
+                "{} reported {id} but {} is not there",
+                publish.td_boot.display(),
+                published.display()
+            )));
+        }
     }
     // The volume keeps the key, so the machine this installs can authenticate
     // its own updates: it has none otherwise, since `TRUSTED_KEY_PATH` is the
     // SELECTOR initramfs's copy and `switch_root` replaces that rootfs
     // (DESIGN §10 item 10a).
     //
-    // Promoted only now, so a key that authenticated nothing never reaches a
-    // disk — and by RENAME, which neither copies the bytes again nor follows a
-    // symlink standing at the destination.
+    // A publishing seed promotes only after authentication succeeds. A trust-only
+    // seed provisions bytes for the later mounted publisher; it asserts no
+    // authenticated deployment. Rename preserves the snapshot's identity.
     //
     // A rename moves whatever the path names AT RENAME TIME, though, not the
     // file td-boot just read, so the inode is checked against the one written
@@ -1313,7 +1351,7 @@ fn publish_into(staging: &Path, publish: &Publish, key: &[u8]) -> io::Result<()>
         let now = paths::symlink_metadata(&snapshot)?;
         if !now.is_file() || (now.st_dev(), now.st_ino()) != identity {
             return Err(invalid(format!(
-                "the trusted key {} was replaced while the deployment was published",
+                "the trusted key {} was replaced while the volume was seeded",
                 snapshot.display()
             )));
         }
@@ -1328,7 +1366,7 @@ fn run_volume(
     destination: &Path,
     mkfs: &Path,
     scratch: &Path,
-    publish: Option<&Publish>,
+    seed: Option<&VolumeSeed>,
     out: &mut dyn Write,
 ) -> io::Result<()> {
     // `Command::new` SEARCHES `PATH` for a name with no separator in it, which
@@ -1337,10 +1375,11 @@ fn run_volume(
     //
     // BOTH programs, and both here, before anything is opened or removed. An
     // argv-shaped mistake should cost nothing, and the td-boot check began life
-    // inside `publish_into` — which runs after the destination is open and,
+    // inside `seed_into` — which runs after the destination is open and,
     // worse, after the caller's staging tree has been emptied. A bare name in
     // the fourth argument therefore destroyed a directory before saying it did
     // not like the fourth argument.
+    let publish = seed.and_then(VolumeSeed::publish);
     for (label, program) in [
         ("mkfs.btrfs", Some(mkfs)),
         ("td-boot", publish.map(|publish| publish.td_boot.as_path())),
@@ -1361,12 +1400,12 @@ fn run_volume(
     }
     // The KEY is read here for the same reason and in the same place. It is an
     // argv-shaped mistake like the two above — a path that is not there, or is
-    // not a key — and reading it inside `publish_into` put the refusal after
+    // not a key — and reading it inside `seed_into` put the refusal after
     // the staging tree had been emptied, so a mistyped fifth argument
     // destroyed a directory before saying it did not like the fifth argument.
     // That is verbatim the failure the paragraph above records for the fourth.
-    let key = publish
-        .map(|publish| read_trusted_key(&publish.trusted_key))
+    let key = seed
+        .map(|seed| read_trusted_key(seed.trusted_key()))
         .transpose()?;
     let mut file = paths::open_read_write(destination)?;
     let disk_bytes = destination_bytes(&mut file)?;
@@ -1420,15 +1459,9 @@ fn run_volume(
     // `--rootdir` too, so the publish and the filesystem cannot be given two
     // different names for one directory.
     let staging = paths::canonicalize(&staging)?;
-    if let Some(publish) = publish {
-        // `key` is `Some` exactly when `publish` is — both come from the one
-        // `Option` above. Asked for rather than matched alongside, because a
-        // pattern over the pair would SKIP the publish if they ever
-        // disagreed, and a skipped publish reports success and ships a volume
-        // with nothing on it: the fail-open this verb's whole read-back
-        // exists to refuse.
+    if let Some(seed) = seed {
         let key = key.ok_or_else(|| invalid("the trusted key was not read".to_string()))?;
-        publish_into(&staging, publish, &key)?;
+        seed_into(&staging, seed, &key)?;
     }
     // `File::create` TRUNCATES, so a scratch directory that puts the image on
     // top of the DESTINATION destroys the disk whose table was just read — and
@@ -1587,13 +1620,13 @@ fn main() -> ExitCode {
             destination,
             mkfs,
             scratch,
-            publish,
+            seed,
         } => run_volume(
             uuid.as_ref(),
             &destination,
             &mkfs,
             &scratch,
-            publish.as_ref(),
+            seed.as_ref(),
             &mut io::stdout(),
         ),
     };
@@ -1849,7 +1882,7 @@ mod tests {
                 destination: PathBuf::from("/dev/sda"),
                 mkfs: PathBuf::from("/bin/mkfs.btrfs"),
                 scratch: PathBuf::from("/tmp"),
-                publish: None,
+                seed: None,
             }
         );
         // Each of the three is REQUIRED, and none is defaulted: a `volume` that
@@ -2264,7 +2297,7 @@ mod tests {
             destination,
             mkfs,
             scratch: staging_scratch,
-            publish,
+            seed,
         } = mode
         else {
             panic!("preselected UUID was not retained");
@@ -2274,7 +2307,7 @@ mod tests {
             &destination,
             &mkfs,
             &staging_scratch,
-            publish.as_ref(),
+            seed.as_ref(),
             &mut Vec::new(),
         )
         .unwrap();
@@ -2347,11 +2380,11 @@ mod tests {
                 destination: PathBuf::from("/dev/sda"),
                 mkfs: PathBuf::from("/bin/mkfs.btrfs"),
                 scratch: PathBuf::from("/tmp"),
-                publish: Some(Publish {
+                seed: Some(VolumeSeed::Publish(Publish {
                     td_boot: PathBuf::from("/bin/td-boot"),
                     deployment: PathBuf::from("/media/deployment"),
                     trusted_key: PathBuf::from("/media/key.pub"),
-                }),
+                })),
             }
         );
         // Four and five arguments are a caller who asked for something this
@@ -2393,6 +2426,193 @@ mod tests {
         );
     }
 
+    #[test]
+    fn trust_only_arguments_are_explicit_and_cannot_mix_with_publish() {
+        assert_eq!(
+            parse_args(args(&[
+                "volume",
+                "disk",
+                "/mkfs",
+                "scratch",
+                "--trusted-key",
+                "key"
+            ]))
+            .unwrap(),
+            Mode::Volume {
+                uuid: None,
+                destination: PathBuf::from("disk"),
+                mkfs: PathBuf::from("/mkfs"),
+                scratch: PathBuf::from("scratch"),
+                seed: Some(VolumeSeed::Trust(PathBuf::from("key"))),
+            }
+        );
+        for bad in [
+            vec!["volume", "disk", "/mkfs", "scratch", "--trusted-key"],
+            vec![
+                "volume",
+                "disk",
+                "/mkfs",
+                "scratch",
+                "--trusted-key",
+                "key",
+                "extra",
+            ],
+            vec![
+                "volume",
+                "disk",
+                "/mkfs",
+                "scratch",
+                "--trusted-key",
+                "--trusted-key",
+            ],
+            vec!["volume", "--trusted-key", "key", "disk", "/mkfs", "scratch"],
+            vec!["layout", "disk", "--trusted-key", "key"],
+            vec![
+                "volume",
+                "disk",
+                "/mkfs",
+                "scratch",
+                "/td-boot",
+                "/deploy",
+                "--trusted-key",
+                "key",
+            ],
+            vec![
+                "volume",
+                "disk",
+                "/mkfs",
+                "scratch",
+                "/td-boot",
+                "/deploy",
+                "key1",
+                "--trusted-key",
+                "key2",
+            ],
+        ] {
+            assert!(parse_args(args(&bad)).is_err(), "accepted {bad:?}");
+        }
+    }
+
+    #[test]
+    fn trust_only_arguments_retain_the_preselected_uuid() {
+        let uuid = "12345678-1234-4234-8234-123456789abc";
+        assert_eq!(
+            parse_args(args(&[
+                "volume",
+                "--uuid",
+                uuid,
+                "disk",
+                "/mkfs",
+                "scratch",
+                "--trusted-key",
+                "key"
+            ]))
+            .unwrap(),
+            Mode::Volume {
+                uuid: Some(VolumeUuid(uuid.into())),
+                destination: PathBuf::from("disk"),
+                mkfs: PathBuf::from("/mkfs"),
+                scratch: PathBuf::from("scratch"),
+                seed: Some(VolumeSeed::Trust(PathBuf::from("key"))),
+            }
+        );
+    }
+
+    #[test]
+    fn trust_only_formatting_prepares_an_empty_publication_root() {
+        use std::os::unix::fs::PermissionsExt;
+        let scratch = Scratch::disk(DISK);
+        run_layout(&scratch.path, &mut Vec::new()).unwrap();
+        let dir = fake_mkfs(RECORDING_MKFS);
+        let key = key_file(&dir);
+        let mut out = Vec::new();
+        run_volume(
+            None,
+            &scratch.path,
+            &dir.join("mkfs.btrfs"),
+            &dir,
+            Some(&VolumeSeed::Trust(key.clone())),
+            &mut out,
+        )
+        .unwrap();
+        let root = dir.join("td-volume-root");
+        assert!(root.join("@var").is_dir());
+        for path in ["td", "td/boot", "td/deployments", "td/incoming"] {
+            let path = root.join(path);
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o755
+            );
+            if path != root.join("td") {
+                assert_eq!(std::fs::read_dir(&path).unwrap().count(), 0);
+            }
+        }
+        let mut entries: Vec<_> = std::fs::read_dir(root.join("td"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        entries.sort();
+        assert_eq!(
+            entries,
+            ["boot", "deployments", "incoming", "trusted.pub"].map(OsString::from)
+        );
+        let carried = root.join("td/trusted.pub");
+        assert_eq!(
+            std::fs::read(&carried).unwrap(),
+            std::fs::read(&key).unwrap()
+        );
+        assert_eq!(
+            std::fs::metadata(&carried).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
+        assert!(!dir.join("td-install-key/td-trusted.pub").exists());
+        assert_eq!(
+            String::from_utf8(out).unwrap().split_whitespace().count(),
+            3
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn invalid_trust_only_key_preserves_destination_and_scratch() {
+        let scratch = Scratch::disk(4096);
+        let before = std::fs::read(&scratch.path).unwrap();
+        let dir = fake_mkfs(RECORDING_MKFS);
+        let staging = dir.join("td-volume-root");
+        std::fs::create_dir(&staging).unwrap();
+        std::fs::write(staging.join("keep"), b"untouched").unwrap();
+        let missing = dir.join("missing");
+        let link = dir.join("symlink");
+        std::os::unix::fs::symlink(key_file(&dir), &link).unwrap();
+        let oversized = dir.join("oversized");
+        std::fs::write(
+            &oversized,
+            vec![b'x'; protocol::MAX_PUBLIC_KEY_BYTES as usize + 1],
+        )
+        .unwrap();
+        for key in [missing, link, oversized] {
+            let mut out = Vec::new();
+            let error = run_volume(
+                None,
+                &scratch.path,
+                &dir.join("mkfs.btrfs"),
+                &dir,
+                Some(&VolumeSeed::Trust(key)),
+                &mut out,
+            )
+            .unwrap_err();
+            assert!(
+                error.to_string().contains("trusted deployment key"),
+                "{error}"
+            );
+            assert!(out.is_empty());
+            assert_eq!(std::fs::read(&scratch.path).unwrap(), before);
+            assert_eq!(std::fs::read(staging.join("keep")).unwrap(), b"untouched");
+            assert!(!dir.join("argv").exists());
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     /// 64 lowercase hex, because that is what a deployment id is: `td-install`
     /// checks the shape before joining it onto a path, so a stand-in printing
     /// anything else is exercising the refusal.
@@ -2400,7 +2620,7 @@ mod tests {
 
     /// A trusted key on disk. Real bytes and a real file, because the key is
     /// carried onto the volume and so has to be readable — a stand-in td-boot
-    /// ignores it, but `publish_into` does not.
+    /// ignores it, but `seed_into` does not.
     fn key_file(dir: &Path) -> PathBuf {
         let path = dir.join("key.pub");
         std::fs::write(&path, format!("{}\n", "ab".repeat(32))).unwrap();
@@ -2408,7 +2628,7 @@ mod tests {
     }
 
     /// A `td-boot` stand-in that publishes: runs `body`, then does the two
-    /// things `publish_into` reads back — creates `td/deployments/<id>` and
+    /// things `seed_into` reads back — creates `td/deployments/<id>` and
     /// prints that id.
     fn publishing_td_boot(path: &Path, body: &str) {
         use std::os::unix::fs::PermissionsExt;
@@ -2441,7 +2661,7 @@ mod tests {
         );
         // A td-boot stand-in that records its argv and proves the staging tree
         // was ready when it ran: it writes into the deployments directory,
-        // which only exists if `publish_into` made it first. It also DOES what
+        // which only exists if `seed_into` made it first. It also DOES what
         // a publish does — makes `td/deployments/<id>` and names it on stdout —
         // because that is now the contract, and a stand-in that did less would
         // be testing the refusal rather than the path.
@@ -2463,7 +2683,7 @@ mod tests {
             &scratch.path,
             &dir.join("mkfs.btrfs"),
             &dir,
-            Some(&publish),
+            Some(&VolumeSeed::Publish(publish)),
             &mut out,
         )
         .unwrap();
@@ -2546,7 +2766,7 @@ mod tests {
             &scratch.path,
             &dir.join("mkfs.btrfs"),
             &dir,
-            Some(&publish),
+            Some(&VolumeSeed::Publish(publish)),
             &mut Vec::new(),
         )
         .unwrap();
@@ -4023,7 +4243,7 @@ mod tests {
     /// mistyped fifth argument destroys a directory before saying it did not
     /// like the fifth argument. That is the same failure `run_volume`'s own
     /// comment records for the fourth, which is why the read sits beside those
-    /// checks rather than in `publish_into` where it started: there it ran
+    /// checks rather than in `seed_into` where it started: there it ran
     /// after `remove_dir_all`, and this test reds.
     #[test]
     fn a_key_that_is_not_there_does_not_cost_the_staging_tree() {
@@ -4046,7 +4266,7 @@ mod tests {
             &scratch.path,
             &dir.join("mkfs.btrfs"),
             &dir,
-            Some(&publish),
+            Some(&VolumeSeed::Publish(publish)),
             &mut Vec::new(),
         )
         .unwrap_err();
@@ -4117,7 +4337,7 @@ mod tests {
                 &scratch.path,
                 &dir.join("mkfs.btrfs"),
                 &dir,
-                Some(&publish),
+                Some(&VolumeSeed::Publish(publish)),
                 &mut Vec::new(),
             );
             assert_eq!(
@@ -4129,15 +4349,11 @@ mod tests {
         }
     }
 
-    /// No publish, no key.
-    ///
-    /// Honestly labelled: with no publish `publish_into` never runs, so no
-    /// mutation of the code this names can red it. It is a GUARD against a
-    /// later change that writes the key somewhere earlier or unconditionally
-    /// — a trust root with no deployment beside it is one nothing has ever
-    /// checked — and not evidence about the code as it stands.
+    /// Bare formatting remains unprovisioned unless a seed is explicit.
+    /// This guards a future unconditional seed; it cannot red a mutation
+    /// inside seed_into because bare formatting does not call that function.
     #[test]
-    fn a_volume_with_no_deployment_carries_no_key() {
+    fn a_volume_without_an_explicit_seed_carries_no_key() {
         let scratch = Scratch::disk(DISK);
         run_layout(&scratch.path, &mut Vec::new()).unwrap();
         let dir = fake_mkfs(RECORDING_MKFS);
@@ -4201,7 +4417,7 @@ mod tests {
                 &scratch.path,
                 &dir.join("mkfs.btrfs"),
                 &dir,
-                Some(&publish),
+                Some(&VolumeSeed::Publish(publish)),
                 &mut Vec::new(),
             )
             .unwrap_err();
@@ -4258,7 +4474,7 @@ mod tests {
             &scratch.path,
             &dir.join("mkfs.btrfs"),
             &dir,
-            Some(&publish),
+            Some(&VolumeSeed::Publish(publish)),
             &mut Vec::new(),
         )
         .unwrap_err();
@@ -4305,7 +4521,7 @@ mod tests {
             &scratch.path,
             &dir.join("mkfs.btrfs"),
             &dir,
-            Some(&publish),
+            Some(&VolumeSeed::Publish(publish)),
             &mut Vec::new(),
         )
         .unwrap_err();
@@ -4339,7 +4555,7 @@ mod tests {
             &scratch.path,
             &dir.join("mkfs.btrfs"),
             &dir,
-            Some(&publish),
+            Some(&VolumeSeed::Publish(publish)),
             &mut Vec::new(),
         )
         .unwrap_err();
@@ -4383,7 +4599,7 @@ mod tests {
             &scratch.path,
             &dir.join("mkfs.btrfs"),
             &dir,
-            Some(&publish),
+            Some(&VolumeSeed::Publish(publish)),
             &mut Vec::new(),
         )
         .unwrap_err();

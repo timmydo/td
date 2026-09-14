@@ -27,7 +27,8 @@ files. Boot files and tools read into the fixture initramfs are bounded at
 but this diagnostic still constructs only a small deployment. The private
 key remains on the host outside derivations. The fixture calls the
 actual td-install layout and volume primitives, including td-boot's verified
-publication. Its success marker follows both successful commands and sync.
+publication. Its success marker follows formatting, partition refresh,
+mounted publication and sync.
 
 Before any layout write, the guest polls for thirty seconds among exactly
 two fixed candidate paths: /dev/sr0 (SATA optical) and /dev/sda (USB). QEMU
@@ -51,7 +52,8 @@ The fixed selector is bound outside /source, which holds only the signed
 deployment bundle. Discovery checks only currently visible candidates;
 it does not establish exclusive admission against later hotplug.
 Missing payloads refuse before layout; no initramfs copy is available as a
-fallback. The formatter still stages the deployment and Btrfs image in RAM.
+fallback. The formatter stages only a trust layout and sparse Btrfs metadata
+image in RAM; the deployment is published directly onto the mounted disk.
 
 The host chooses the UUID from the run's throwaway provisioning public key
 before assembling the ISO. Its canonical text is placed in the live and
@@ -76,13 +78,23 @@ partition table. It resolves the configured UUID through the production
 reader and requires the expected virtio partition, then mounts it through
 td-boot. A second reread must fail specifically with EBUSY while mounted;
 no force or unmount fallback is accepted. The guest unmounts and requires a
-final successful reread before emitting the partition-refresh evidence and
-installation-success marker. The host requires the exact configured UUID and
-/dev/vda2 in that evidence on both optical and USB installs. This exercises
+final successful reread before emitting the partition-refresh evidence.
+The host requires the exact configured UUID and /dev/vda2 in that evidence on both optical and USB installs. This exercises
 partition publication during the same boot; firmware reboot cannot mask a
-missing reread. The formatter's RAM staging remains until direct publication
-is implemented. UNSAFE.md §3 owns the new td-init request; this crate still
-has no raw syscall surface.
+missing reread. UNSAFE.md §3 owns the td-init request; this crate still has
+no raw syscall surface.
+
+The live guest supplies `--trusted-key` to `td-install volume` instead of
+the three publishing operands. The formatter initializes the publication
+directories and key without a deployment or selector. The fixture requires
+empty staged boot, deployment, incoming and @var directories, then deletes
+its entire private scratch directory after partition refresh, then calls `td-boot install` with the resolved partition,
+/source and the same read-only live public key. Successful mounted
+publication and sync precede the direct-publication and installation markers;
+the host requires both. The full cold-boot oracle still proves the expected
+deployment is installed. This removes deployment-sized staging copies but
+does not yet measure installation of the full system under a RAM ceiling or
+admit target capacity.
 
 The host then detaches media and cold-boots the destination through
 firmware. The selector emits read-only discovery evidence for its configured
@@ -143,3 +155,8 @@ All operations use safe Rust and existing td-init/td-boot applets. No syscall
 surface or external dependency is added. Unit tests cover refusal outside
 PID 1; the host oracle is the executable integration test. A serial marker is
 accepted only after its named operation and persistence barriers finish.
+
+The fixture deliberately inspects the formatter's staging layout as an
+internal regression oracle. A formatter rename requires updating that
+oracle; cleanup removes the whole fixture-owned /scratch directory rather
+than depending on the formatter's image filename or retention policy.

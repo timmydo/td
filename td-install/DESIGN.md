@@ -493,9 +493,38 @@ The QEMU diagnostic invokes it after layout and volume formatting, resolves
 the preselected UUID on the expected new partition, mounts that Btrfs volume,
 and requires EBUSY from a reread while it is mounted. It unmounts and requires
 a final successful reread before reporting installation success. Both optical
-and USB installation legs require this evidence. This is a prerequisite for
-streaming publication onto the mounted destination; the diagnostic still
-uses the existing RAM staging path until that cutover lands.
+and USB installation legs require this evidence before direct publication
+onto the mounted destination, as described below.
+
+### Trust-only initialization and mounted publication
+
+`td-install volume [--uuid UUID] DESTINATION MKFS SCRATCH --trusted-key KEY`
+formats the same Btrfs image and destination region as bare `volume`, but
+initializes the publication directories and `td/trusted.pub` without
+copying a deployment into scratch. The existing three-operand publishing
+form remains available for unmounted image production; the two forms cannot
+be combined. Bare formatting remains unprovisioned.
+
+The key is read through the shared bounded real-file reader before opening
+the destination or clearing staging. Directory modes are 0755 and the key
+is 0644, using the same private snapshot and identity-checked promotion as
+the publishing form. This mode carries bytes; it does not parse Ed25519,
+authenticate a deployment, create `current` or `previous`, or claim a
+bootable installation. The coordinator must authenticate its stable source
+before erasure, keep the selector and volume keys consistent, then complete
+verified publication through `td-boot install DEVICE MOUNTPOINT SOURCE KEY`.
+That command remains the single transaction writer and rechecks copied
+payloads. No dependency or syscall surface is added to the formatter.
+
+The diagnostic ISO uses this sequence after preflight and layout. After
+trust-only formatting it requires empty staged boot, deployment, incoming
+and @var directories, refreshes and checks the partition devices, deletes
+its entire owned scratch directory, then invokes `td-boot install` on the resolved partition. Publication
+streams from read-only media onto Btrfs. The host requires the direct
+publication marker as well as successful detached boots from the expected
+deployment. Deployment-sized staging copies no longer consume guest RAM;
+the sparse formatter image still needs metadata space and scans the logical
+volume size. This is not yet a full-system RAM or target-capacity oracle.
 
 ### Full-system volume consumers
 
@@ -1778,10 +1807,12 @@ Ordered by dependency, not by size. Each is one landing with its own tests.
    mode in verbatim, so an ambient umask would otherwise decide what a
    machine's trust root looks like.
 
-   **The key is SNAPSHOT ONCE and PROMOTED, not read twice.** `publish_into`
-   copies the operator's key to `<scratch>/td-trusted.pub`, hands td-boot THAT
-   path, and renames it into the volume on success. The obvious shape — read
-   the bytes, pass the original path to td-boot, write the bytes out
+   **The key is SNAPSHOT ONCE and PROMOTED, not read twice.** `seed_into`
+   copies the operator's key to `<scratch>/td-install-key/td-trusted.pub`,
+   hands td-boot THAT
+   path, and renames it into the volume on success. The trust-only form
+   provisions that snapshot without a deployment or authentication claim.
+   The obvious shape — read the bytes, pass the original path to td-boot, write the bytes out
    afterwards — reads one path twice, and two reads are two chances for it to
    say different things: td-boot authenticates under what its read found, the
    volume keeps what this program's read found, and an attacker able to swap
@@ -1859,7 +1890,9 @@ Ordered by dependency, not by size. Each is one landing with its own tests.
    the publish it belonged to and become the root a later, unrelated publish
    into the same scratch tree inherited. The bytes are carried rather than
    parsed: this crate has no ed25519 and should not grow one for a file it
-   only carries, and the publish is the parse.
+   only carries. In the publishing form the publish is the parse; trust-only
+   initialization defers parsing and authentication to the coordinator's
+   source preflight and mounted publisher described in §5.
 
    **10b made that rule ONE implementation, across THREE crates.** It had been
    written three times — `td-boot`'s `open_real_file`/`read_bounded_real_file`,

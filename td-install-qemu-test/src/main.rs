@@ -214,17 +214,30 @@ fn install(device: &str) -> Result<(), String> {
             device,
             "/bin/mkfs.btrfs",
             "/scratch",
-            "/bin/td-boot",
-            "/source",
+            "--trusted-key",
             "/trusted.pub",
         ],
     )?;
-    refresh_partitions(device, &uuid)?;
+    for directory in ["@var", "td/boot", "td/deployments", "td/incoming"] {
+        let staged = Path::new("/scratch/td-volume-root").join(directory);
+        let mut entries = fs::read_dir(&staged)
+            .map_err(|error| format!("inspect staging {}: {error}", staged.display()))?;
+        if let Some(entry) = entries.next() {
+            let entry = entry.map_err(|error| format!("read staging entry: {error}"))?;
+            return Err(format!("unexpected staged content in guest RAM: {}", entry.path().display()));
+        }
+    }
+    let partition = refresh_partitions(device, &uuid)?;
+    fs::remove_dir_all("/scratch").map_err(|error| format!("remove formatter scratch: {error}"))?;
+    // The volume image contains only filesystem metadata and the trust layout.
+    // Publication now streams from read-only media straight onto the disk.
+    command("/bin/td-boot", &["install", &partition, "/volume", "/source", "/trusted.pub"])?;
     applet(&["sync"])?;
+    writeln!(std::io::stdout(), "{DIRECT_MARKER}").map_err(|error| error.to_string())?;
     writeln!(std::io::stdout(), "{INSTALL_MARKER}").map_err(|error| error.to_string())
 }
 
-fn refresh_partitions(device: &str, uuid: &str) -> Result<(), String> {
+fn refresh_partitions(device: &str, uuid: &str) -> Result<String, String> {
     applet(&["reread-partitions", device])?;
     let (_, partition) = volume(uuid)?;
     if partition != format!("{device}2") {
@@ -246,7 +259,8 @@ fn refresh_partitions(device: &str, uuid: &str) -> Result<(), String> {
     applet(&["umount", "/volume"])?;
     applet(&["reread-partitions", device])?;
     writeln!(std::io::stdout(), "{PARTITIONS_MARKER} {uuid} {partition}")
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string())?;
+    Ok(partition)
 }
 
 fn volume(uuid: &str) -> Result<(String, String), String> {
