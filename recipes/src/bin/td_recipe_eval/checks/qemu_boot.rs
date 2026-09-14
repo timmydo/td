@@ -4294,11 +4294,70 @@ impl SectorSize {
     }
 }
 
-/// A raw disk attachment; ordinary plans retain 512-byte device geometry.
+#[derive(Clone, Copy)]
+enum DiskBus {
+    Virtio,
+    Ahci,
+}
+
+impl DiskBus {
+    fn name(self, reordered: bool) -> &'static str {
+        match (self, reordered) {
+            (Self::Virtio, false) => "vda",
+            (Self::Virtio, true) => "vdb",
+            (Self::Ahci, false) => "sda",
+            (Self::Ahci, true) => "sdb",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Virtio => "virtio",
+            Self::Ahci => "ahci",
+        }
+    }
+
+    fn attach(
+        self,
+        command: &mut Command,
+        drive: &str,
+        serial: &str,
+        boot_index: Option<u8>,
+        sector_size: SectorSize,
+    ) -> Result<(), String> {
+        if matches!((self, sector_size), (Self::Ahci, SectorSize::Bytes4096)) {
+            return Err("QEMU AHCI installation targets require 512-byte logical sectors".into());
+        }
+        let mut device = match self {
+            Self::Virtio => {
+                let prefix = crate::checks::vm_profile::DISK_DEVICE
+                    .strip_suffix(crate::checks::vm_profile::DRIVE_ID)
+                    .ok_or("VM disk device must end with its drive ID")?;
+                format!("{prefix}{drive}")
+            }
+            Self::Ahci => {
+                command
+                    .arg("-device")
+                    .arg(format!("ich9-ahci,id={drive}-ahci"));
+                format!("ide-hd,bus={drive}-ahci.0,drive={drive}")
+            }
+        };
+        device.push_str(&format!(",serial={serial}"));
+        if let Some(index) = boot_index {
+            device.push_str(&format!(",bootindex={index}"));
+        }
+        device.push_str(sector_size.device_suffix());
+        command.arg("-device").arg(device);
+        Ok(())
+    }
+}
+
+/// A raw disk attachment; ordinary plans retain virtio and 512-byte geometry.
 struct BootDisk<'a> {
     path: &'a Path,
     read_only: bool,
     sector_size: SectorSize,
+    bus: DiskBus,
 }
 
 impl<'a> BootDisk<'a> {
@@ -4307,6 +4366,7 @@ impl<'a> BootDisk<'a> {
             path,
             read_only,
             sector_size: SectorSize::Bytes512,
+            bus: DiskBus::Virtio,
         }
     }
 }
@@ -4316,7 +4376,8 @@ impl<'a> BootDisk<'a> {
 /// `boot` keeps a small, self-documenting signature: named fields at the call site
 /// (`kill_on_marker: false`) beat positional bools/strings.
 struct BootPlan<'a> {
-    /// A raw image to attach over virtio-blk (/dev/vda), or none for diskless.
+    /// A raw disk image, or none for diskless. Ordinary plans use virtio;
+    /// installation fixtures may select AHCI.
     /// Probe EROFS images are read-only; system volumes allow @var writes.
     disk: Option<BootDisk<'a>>,
     /// Guest RAM in MiB (qemu `-m`). Diskless/probe and standalone kexec boots use
@@ -4372,9 +4433,9 @@ fn boot(
 #[derive(Clone, Copy)]
 enum FirmwareAttachment {
     Virtio,
-    /// The ordinary virtio disk carries the native installer fixture serial.
+    /// The ordinary disk carries the native installer fixture serial.
     InstalledFixture,
-    /// A private decoy precedes the installed disk in virtio discovery order.
+    /// A private decoy precedes the installed disk on the same bus.
     InstalledFixtureReordered,
     Optical,
     Usb,
@@ -4564,8 +4625,8 @@ fn boot_source(
     if plan.audio {
         attach_system_audio(&mut cmd, firefox_audio_path.as_deref());
     }
-    // Optional raw disk: if=none defines the backing store and a separate
-    // virtio-blk-pci device attaches it as /dev/vda.
+    // Optional raw disk: if=none defines the backing store; the device selects
+    // virtio or the installation fixture's AHCI transport.
     // drive_arg comma-doubles the image path so a scratch dir with a literal comma in
     // its path can't be misparsed as an extra -drive key=value pair.
     if let Some(disk) = plan.disk {
@@ -4585,14 +4646,7 @@ fn boot_source(
             installation_target: Some(decoy), ..
         } = source {
             cmd.arg("-drive").arg(install::target_drive_arg(decoy));
-            let device_prefix = crate::checks::vm_profile::DISK_DEVICE
-                .strip_suffix(crate::checks::vm_profile::DRIVE_ID)
-                .ok_or("VM disk device must end with its drive ID")?;
-            cmd.arg("-device").arg(format!(
-                "{device_prefix}{},serial=td-install-decoy,bootindex=9{}",
-                install::TARGET_DRIVE_ID,
-                decoy.sector_suffix(),
-            ));
+            decoy.attach(&mut cmd, "td-install-decoy", Some(9))?;
         }
         match source {
             BootSource::Firmware {
@@ -4613,12 +4667,8 @@ fn boot_source(
             _ => {
                 cmd.arg("-drive").arg(drive_arg(disk.path, disk.read_only));
                 if matches!(source, BootSource::Firmware { attachment: FirmwareAttachment::InstalledFixture | FirmwareAttachment::InstalledFixtureReordered, .. }) {
-                    cmd.arg("-device").arg(format!(
-                        "{},serial={},bootindex=1{}",
-                        crate::checks::vm_profile::DISK_DEVICE,
-                        install::protocol::TARGET_SERIAL,
-                        disk.sector_size.device_suffix(),
-                    ));
+                    disk.bus.attach(&mut cmd, crate::checks::vm_profile::DRIVE_ID,
+                        install::protocol::TARGET_SERIAL, Some(1), disk.sector_size)?;
                 } else {
                     cmd.arg("-device").arg(format!(
                         "{}{}",
@@ -4634,14 +4684,7 @@ fn boot_source(
         installation_target: Some(target), ..
     } = source {
         cmd.arg("-drive").arg(install::target_drive_arg(target));
-        cmd.arg("-device").arg(format!(
-            "{}{},serial={}{}",
-            crate::checks::vm_profile::DISK_DEVICE
-                .trim_end_matches(crate::checks::vm_profile::DRIVE_ID),
-            install::TARGET_DRIVE_ID,
-            install::protocol::TARGET_SERIAL,
-            target.sector_suffix(),
-        ));
+        target.attach(&mut cmd, install::protocol::TARGET_SERIAL, None)?;
     }
     let mut child = cmd
         .stdin(Stdio::null())

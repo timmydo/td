@@ -1254,7 +1254,7 @@ below remain required.
 `td-recipe-eval qemu-install` adds a native guest installation fixture,
 [td-install-qemu-test](../td-install-qemu-test/DESIGN.md). Its source-built
 PID 1 runs td-install layout and signed volume publication on an exclusively
-created QEMU virtio target. The same private ISO is exercised as optical and
+created QEMU virtio or AHCI target. The same private ISO is exercised as optical and
 USB media. After installation, the host detaches media and cold-boots only
 the destination, requiring authenticated selector kexec, a read from the
 installed EROFS payload, persistent Btrfs state across two boots, and
@@ -1304,8 +1304,11 @@ the host requires it to match the requested QEMU geometry. The installed
 target and duplicate/reordered companions retain that geometry through
 firmware boots. This tests GPT/FAT32 layout and detached verified boots on
 4Kn media; it is not a physical-device or 512e performance claim. Refusal
-and interruption cases remain at 512 bytes; the complete small oracle has
-32 boots.
+and interruption cases remain at 512 bytes. Eight positive boots exercise AHCI targets at
+512-byte geometry through both media attachments, including duplicate
+identity refusal and reordered detached boots on that same bus. The small
+matrix totals 40 boots; full-system installation retains virtio. This tests
+the built-in SATA disk path under QEMU, not physical ThinkPad compatibility.
 
 `td-recipe-eval qemu-install-system [system-x86-64]` uses the same live
 fixture to install the built system deployment and its verified selector.

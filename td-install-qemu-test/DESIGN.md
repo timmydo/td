@@ -7,13 +7,16 @@ in the system or graphical installer profile. It adds no user-facing device
 admission, destructive consent, account configuration or signing identity.
 
 The host oracle exclusively creates each sparse target inside its private
-scratch directory and exposes it as a writable virtio disk with the fixture
+scratch directory and exposes it as a writable virtio or AHCI disk with the fixture
 serial. The ISO stays read-only. The fixture refuses outside PID 1 and admits
-exactly one whole virtio installation target with that serial; it accepts
+exactly one whole virtio or SCSI-named AHCI installation target with that serial; it accepts
 no command-line destination. This is test identification, not a real installer authorization
 mechanism. Firmware variables are private copies, networking is disabled,
 and the host boot runner owns deadlines and QEMU teardown. Each boot defaults
 to 180 seconds; a positive TD_QEMU_BOOT_TIMEOUT_SECS overrides that limit.
+Target discovery also retries a matched node that has not yet appeared in
+/dev or whose read-only open returns ENXIO, within its thirty-second
+deadline. Other metadata/open errors and non-block nodes refuse.
 A refusal keeps PID 1 alive for the host to collect its diagnostic and
 terminate the VM at the deadline.
 
@@ -32,7 +35,8 @@ publication. Its success marker follows formatting, partition refresh,
 mounted publication and sync.
 
 Before any layout write, the guest polls for thirty seconds among exactly
-two fixed candidate paths: /dev/sr0 (SATA optical) and /dev/sda (USB). QEMU
+three fixed candidate paths: /dev/sr0 (SATA optical) and /dev/sda or
+/dev/sdb (USB), excluding the selected installation target. QEMU
 adds an empty default CD-ROM in both attachments: /dev/sr1 during optical
 boots (outside this candidate list) and /dev/sr0 during USB boots. A read-only
 block-device open must succeed; Linux ENOMEDIUM (123) skips an empty drive
@@ -66,6 +70,15 @@ value through `td-install volume --uuid`; formatting cannot silently choose
 a different identity. Optical and USB destinations deliberately share that
 run's UUID but are never attached together.
 
+Target discovery waits up to thirty seconds for its fixed serial. Virtio
+uses the root serial attribute; AHCI disks use the SCSI device serial.
+Missing serial attributes and the pinned kernel's absent-VPD ENXIO are
+not matches. The selected node must also accept a read-only open; ENXIO
+retries target discovery within the same deadline. That probe descriptor
+closes before installation. Oversized serials and other errors refuse. Partition names
+and unsupported buses are excluded. This remains a private test topology,
+not discovery or admission for an operator's physical disk.
+
 Before invoking layout, the live fixture calls `td-boot validate-source` on
 the read-only source and the provisioned public key. Missing or invalid
 signatures, malformed authenticated manifests, missing or symlinked payloads,
@@ -79,7 +92,7 @@ and target admission remain requirements for the production installer service.
 
 After both formatting commands, the guest asks td-init to reread the target's
 partition table. It resolves the configured UUID through the production
-reader and requires the expected virtio partition, then mounts it through
+reader and requires the expected target partition, then mounts it through
 td-boot. Both raw formatter commands must fail their destination open with
 exit status 1, EBUSY and no stdout while that partition is mounted. An
 assertion failure terminates the installation sequence and leaves PID 1
@@ -92,7 +105,8 @@ a whole-disk hash comparison while the filesystem is active. A second reread
 must fail specifically with EBUSY while mounted;
 no force or unmount fallback is accepted. The guest unmounts and requires a
 final successful reread before emitting the partition-refresh evidence.
-The host requires the exact configured UUID and /dev/vda2 in that evidence on both optical and USB installs. This exercises
+The host requires the exact configured UUID and the planned /dev/vda2 or
+/dev/sda2 target partition in that evidence on both media attachments. This exercises
 partition publication during the same boot; firmware reboot cannot mask a
 missing reread. UNSAFE.md §3 owns the td-init request; this crate still has
 no raw syscall surface.
@@ -130,8 +144,9 @@ Before successful boots, a private decoy gets a copy of the installed
 primary superblock at its own whole-disk superblock offset. The duplicate
 identity must refuse before deployment selection. This is an identity
 collision fixture, not a second mountable filesystem. First normal boot
-uses the destination alone; the second attaches a fresh blank virtio disk
-first, moving the destination from /dev/vda2 to /dev/vdb2. Firmware still
+uses the destination alone; the second attaches a fresh blank disk on the
+same bus first, moving the destination from /dev/vda2 to /dev/vdb2 for
+virtio or /dev/sda2 to /dev/sdb2 for AHCI. Firmware still
 boots the destination by explicit boot index. Both phases must report the
 expected device and preserve the same UUID across those cold boots.
 
@@ -187,9 +202,20 @@ the completed-installation evidence. The ISO attachments keep their normal
 geometry.
 Both detached boots retain the installed target's sector size, so firmware
 must interpret the GPT and ESP actually written for that geometry.
-These eight additional boots bring the small oracle to thirty-two boots,
-all with fresh private firmware variables. Interruption and refusal cases
-retain the ordinary 512-byte geometry.
+The positive four-boot sequence also runs at 512-byte geometry with an
+AHCI target, attached as ide-hd on its own ich9-ahci controller. It retains
+that bus through detached boots and gives the reordered decoy its own
+preceding AHCI controller. Live USB media is expected at /dev/sdb beside
+the AHCI target at /dev/sda. Linux allocates SCSI disk names asynchronously;
+the oracle deliberately requires the planned order to prove changed-path
+discovery. A timing-dependent order mismatch fails this fixture and does
+not by itself demonstrate a UUID discovery defect. AHCI targets are
+restricted to 512-byte logical sectors before constructing QEMU arguments;
+QEMU ide-hd does not support the virtio 4Kn case.
+The same ISO bytes serve all target buses.
+The complete small oracle has forty boots, all with fresh private firmware
+variables. Interruption and refusal cases retain virtio/512-byte geometry;
+the full-system diagnostic also retains its virtio target.
 
 The fixture's serial convention does not implement production installation
 admission. Volume discovery uses the production read-only primitive under
@@ -266,5 +292,5 @@ require only the before report and prohibit an after report; a future
 unmountable-media case needs its own earlier failure expectation. The
 existing whole-target byte comparisons still establish write preservation;
 inventory alone does not. These observations cover all live
-legs of the 32-boot matrix and both full-system ISO installations without
+legs of the 40-boot matrix and both full-system ISO installations without
 adding boots or changing target admission.

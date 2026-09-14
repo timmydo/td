@@ -209,7 +209,7 @@ require successful exit and a complete document.
 The QEMU installation diagnostics exercise this inventory before source
 verification and after partition refresh. Their host compares it with
 oracle-owned optical/USB images and writable, read-only, undersized and
-4Kn targets. Partition parents and disk identity continuity are checked on
+4Kn targets, plus SATA/AHCI targets at 512-byte geometry. Partition parents and disk identity continuity are checked on
 successful/recovery installations; refusals must have no post-format
 report and retain the existing whole-disk byte preservation proof. These
 are observations under a disposable topology, not destination eligibility.

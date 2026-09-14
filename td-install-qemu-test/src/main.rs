@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 mod protocol;
 use protocol::*;
 
-const ENXIO: i32 = 6; // A published block node whose driver is not ready yet.
+const ENXIO: i32 = 6; // Linux: no such device or address.
 const ENOMEDIUM: i32 = 123; // Linux: an optical drive with no readable medium.
 
 fn report(mut output: impl Write, message: std::fmt::Arguments<'_>) -> Result<(), String> {
@@ -54,7 +54,7 @@ fn read_file(file: File, path: &Path, limit: u64) -> Result<Vec<u8>, String> {
     Ok(bytes)
 }
 
-fn target() -> Result<String, String> {
+fn scan_target() -> Result<Option<String>, String> {
     let mut matched = None;
     for entry in
         fs::read_dir("/sys/class/block").map_err(|error| format!("list block devices: {error}"))?
@@ -62,12 +62,36 @@ fn target() -> Result<String, String> {
         let entry = entry.map_err(|error| format!("read block device entry: {error}"))?;
         let name = entry.file_name();
         let name = name.to_str().ok_or("non-UTF-8 block device name")?;
-        // The oracle attaches only virtio targets; exclude partitions and paths.
-        if !name.starts_with("vd") || !name.bytes().all(|byte| byte.is_ascii_lowercase()) {
+        // The oracle attaches virtio or AHCI targets; exclude partitions and paths.
+        if !(name.starts_with("vd") || name.starts_with("sd"))
+            || !name.bytes().all(|byte| byte.is_ascii_lowercase())
+        {
             continue;
         }
-        let serial = entry.path().join("serial");
-        let serial = read(&serial, 128)?;
+        let serial = entry.path().join(if name.starts_with("vd") {
+            "serial"
+        } else {
+            "device/serial"
+        });
+        let serial_file = match File::open(&serial) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(format!("open target serial {}: {error}", serial.display())),
+        };
+        let mut bytes = Vec::new();
+        match serial_file.take(129).read_to_end(&mut bytes) {
+            Ok(_) => {}
+            // Pinned Linux SCSI serial attributes report absent VPD with ENXIO.
+            Err(error) if error.raw_os_error() == Some(ENXIO) => continue,
+            Err(error) => return Err(format!("read target serial {}: {error}", serial.display())),
+        }
+        if bytes.len() > 128 {
+            return Err(format!(
+                "target serial {} exceeds 128 bytes",
+                serial.display()
+            ));
+        }
+        let serial = bytes;
         if serial.strip_suffix(b"\n").unwrap_or(&serial) != TARGET_SERIAL.as_bytes() {
             continue;
         }
@@ -76,15 +100,40 @@ fn target() -> Result<String, String> {
         }
         matched = Some(format!("/dev/{name}"));
     }
-    let path = matched.ok_or("oracle target serial is absent")?;
-    if !fs::metadata(&path)
-        .map_err(|error| format!("stat {path}: {error}"))?
-        .file_type()
-        .is_block_device()
-    {
+    let Some(path) = matched else {
+        return Ok(None);
+    };
+    let metadata = match fs::metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("stat {path}: {error}")),
+    };
+    if !metadata.file_type().is_block_device() {
         return Err("oracle target is not a block device".into());
     }
-    Ok(path)
+    match File::open(&path) {
+        Ok(_) => Ok(Some(path)),
+        Err(error)
+            if error.raw_os_error() == Some(ENXIO)
+                || error.kind() == std::io::ErrorKind::NotFound =>
+        {
+            Ok(None)
+        }
+        Err(error) => Err(format!("open oracle target {path}: {error}")),
+    }
+}
+
+fn target() -> Result<String, String> {
+    let started = Instant::now();
+    loop {
+        if let Some(path) = scan_target()? {
+            return Ok(path);
+        }
+        if started.elapsed() >= Duration::from_secs(30) {
+            return Err("oracle target serial did not appear".into());
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
 }
 
 fn directories() -> Result<(), String> {
@@ -112,13 +161,16 @@ fn directories() -> Result<(), String> {
     applet(&["mount", "-t", "sysfs", "sysfs", "/sys"])
 }
 
-fn media_device() -> Result<&'static str, String> {
+fn media_device(target: &str) -> Result<&'static str, String> {
     let started = Instant::now();
     loop {
         let mut found = None;
         // Exactly one source in this fixed QEMU profile: SATA optical or USB.
         // USB mass-storage probing can finish after PID 1 starts.
-        for path in ["/dev/sr0", "/dev/sda"] {
+        for path in ["/dev/sr0", "/dev/sda", "/dev/sdb"] {
+            if path == target {
+                continue;
+            }
             match fs::metadata(path) {
                 Ok(meta) if meta.file_type().is_block_device() => {
                     // sr can publish a placeholder capacity for an empty tray.
@@ -159,8 +211,8 @@ fn media_device() -> Result<&'static str, String> {
     }
 }
 
-fn mount_source() -> Result<(), String> {
-    let device = media_device()?;
+fn mount_source(target: &str) -> Result<(), String> {
+    let device = media_device(target)?;
     applet(&[
         "mount",
         "-t",
@@ -253,7 +305,7 @@ fn inventory(marker: &str) -> Result<(), String> {
 fn install(device: &str, interrupt: bool) -> Result<(), String> {
     // The ISO carries the signed payloads and the live initramfs's public key.
     // Every path is fixture-owned; no private key enters the guest.
-    mount_source()?;
+    mount_source(device)?;
     inventory(INVENTORY_BEFORE_MARKER)?;
     let uuid = configured_uuid()?;
     let name = device

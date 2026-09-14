@@ -12,11 +12,23 @@ pub(super) struct TargetDisk {
     path: PathBuf,
     read_only: bool,
     sector_size: SectorSize,
+    bus: DiskBus,
 }
 
 impl TargetDisk {
-    pub(super) fn sector_suffix(&self) -> &'static str {
-        self.sector_size.device_suffix()
+    pub(super) fn attach(
+        &self,
+        command: &mut Command,
+        serial: &str,
+        boot_index: Option<u8>,
+    ) -> Result<(), String> {
+        self.bus.attach(
+            command,
+            TARGET_DRIVE_ID,
+            serial,
+            boot_index,
+            self.sector_size,
+        )
     }
 
     fn fingerprint(&self) -> Result<(u64, String), String> {
@@ -99,6 +111,7 @@ impl TargetDisk {
             path,
             read_only: false,
             sector_size: SectorSize::Bytes512,
+            bus: DiskBus::Virtio,
         })
     }
 }
@@ -309,14 +322,24 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
     write(&live, &initramfs(&base, &common, "install\n", &extra)?)?;
     let iso = scratch.dir.join("installer.iso");
     media::write_image_with_payloads(&iso, &kernel, &live, &payloads)?;
-    for sector_size in [SectorSize::Bytes512, SectorSize::Bytes4096] {
+    for (bus, sector_size) in [
+        (DiskBus::Virtio, SectorSize::Bytes512),
+        (DiskBus::Virtio, SectorSize::Bytes4096),
+        (DiskBus::Ahci, SectorSize::Bytes512),
+    ] {
         for (name, attachment, source_device) in [
             ("optical", FirmwareAttachment::Optical, "/dev/sr0"),
             ("usb", FirmwareAttachment::Usb, "/dev/sda"),
         ] {
-            let name = format!("{name}-{}", sector_size.bytes());
+            let source_device = if matches!(bus, DiskBus::Ahci) && name == "usb" {
+                "/dev/sdb"
+            } else {
+                source_device
+            };
+            let name = format!("{name}-{}-{}", bus.label(), sector_size.bytes());
             let mut target = TargetDisk::create(&scratch.dir, &format!("{name}.img"))?;
             target.sector_size = sector_size;
+            target.bus = bus;
             let vars = scratch.dir.join(format!("{name}-install-vars.fd"));
             efi::copy_input(&vars_template, &vars)?;
             println!("   [qemu-install] installing through {name} media");
@@ -332,7 +355,7 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
                 &scratch.dir,
                 timeout,
             )?;
-            require_installation(&result, &uuid, source_device)?;
+            require_installation(&result, &uuid, source_device, &target)?;
             require_inventory(
                 &result,
                 &target,
@@ -348,6 +371,7 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
             )?;
             let mut duplicate = TargetDisk::create(&scratch.dir, &format!("{name}-duplicate.img"))?;
             duplicate.sector_size = sector_size;
+            duplicate.bus = bus;
             duplicate.copy_volume_identity(&target)?;
             let vars = scratch.dir.join(format!("{name}-duplicate-vars.fd"));
             efi::copy_input(&vars_template, &vars)?;
@@ -364,7 +388,7 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
                     attachment: FirmwareAttachment::InstalledFixtureReordered,
                     installation_target: Some(&duplicate),
                 },
-                sector_plan(&target.path, refused, sector_size),
+                target_plan(&target, refused),
                 &scratch.dir,
                 timeout,
             )?;
@@ -379,6 +403,7 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
                 let decoy = if count == 2 {
                     let mut disk = TargetDisk::create(&scratch.dir, &format!("{name}-decoy.img"))?;
                     disk.sector_size = sector_size;
+                    disk.bus = bus;
                     Some(disk)
                 } else {
                     None
@@ -399,12 +424,12 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
                         },
                         installation_target: decoy.as_ref(),
                     },
-                    sector_plan(&target.path, &expected, sector_size),
+                    target_plan(&target, &expected),
                     &scratch.dir,
                     timeout,
                 )?;
-                let expected_device = if count == 2 { "/dev/vdb2" } else { "/dev/vda2" };
-                validate_fixture_boot(&result, &expected, &uuid, expected_device, &id)?;
+                let expected_device = format!("/dev/{}2", bus.name(count == 2));
+                validate_fixture_boot(&result, &expected, &uuid, &expected_device, &id)?;
             }
         }
     }
@@ -475,7 +500,7 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
             "   [qemu-install] reinstalling after interrupted publication through {name} media"
         );
         let repaired = boot("repair", &iso, attachment, true, protocol::INSTALL_MARKER)?;
-        require_installation(&repaired, &uuid, source_device)?;
+        require_installation(&repaired, &uuid, source_device, &target)?;
         require_inventory(
             &repaired,
             &target,
@@ -642,7 +667,7 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
         td_boot_protocol::MANIFEST_UNAUTHENTICATED,
     )?;
     println!(
-        "PASS: native optical/USB 512-byte/4Kn installation and interrupted-publication refusal/reinstallation; provisioned UUID binding across verified kexec and reordered disks; duplicate identity refusal; undersized/read-only targets and wrong-key/corrupt-payload optical/USB refusals preserve every target byte; two persistent installed boots"
+        "PASS: native optical/USB virtio 512-byte/4Kn and AHCI 512-byte installation and interrupted-publication refusal/reinstallation; provisioned UUID binding across verified kexec and reordered disks; duplicate identity refusal; undersized/read-only targets and wrong-key/corrupt-payload optical/USB refusals preserve every target byte; two persistent installed boots"
     );
     Ok(())
 }
@@ -659,6 +684,7 @@ struct InventoryExpected<'a> {
     sector_bytes: u64,
     read_only: bool,
     source_name: &'a str,
+    target_name: &'a str,
     before: InventoryBefore,
 }
 
@@ -811,7 +837,7 @@ fn inventory_snapshot(
         match inventory_field(device, "parent")? {
             Json::Null => {}
             Json::Str(parent) => {
-                if parent == "vda" {
+                if parent == expected.target_name {
                     target_partitions += 1;
                 }
             }
@@ -822,13 +848,18 @@ fn inventory_snapshot(
         }
     }
     let target = by_name
-        .get("vda")
+        .get(expected.target_name)
         .ok_or("inventory lacks the fixture target")?;
     let source = by_name
         .get(expected.source_name)
         .ok_or("inventory lacks the source media")?;
     for (name, device, capacity, read_only) in [
-        ("vda", target, expected.target_bytes, expected.read_only),
+        (
+            expected.target_name,
+            target,
+            expected.target_bytes,
+            expected.read_only,
+        ),
         (expected.source_name, source, expected.source_bytes, true),
     ] {
         inventory_expect_number(device, name, "capacity_bytes", capacity)?;
@@ -840,13 +871,13 @@ fn inventory_snapshot(
     let source_disk = inventory_field(source, "disk")?;
     inventory_expect_number(
         target_disk,
-        "vda.disk",
+        &format!("{}.disk", expected.target_name),
         "logical_sector_bytes",
         expected.sector_bytes,
     )?;
     inventory_expect_field(
         target_disk,
-        "vda.disk",
+        &format!("{}.disk", expected.target_name),
         "serial",
         &Json::Str(protocol::TARGET_SERIAL.into()),
     )?;
@@ -882,7 +913,8 @@ fn inventory_snapshot(
     }
     if !partitioned && matches!(expected.before, InventoryBefore::Fresh) && target_partitions != 0 {
         return Err(format!(
-            "inventory fresh vda has {target_partitions} partitions"
+            "inventory fresh {} has {target_partitions} partitions",
+            expected.target_name
         ));
     }
     if partitioned {
@@ -900,20 +932,27 @@ fn inventory_snapshot(
             .ok_or("invalid fixture volume capacity")?;
         if target_partitions != 2 {
             return Err(format!(
-                "inventory vda: expected two target partitions, observed {target_partitions}"
+                "inventory {}: expected two target partitions, observed {target_partitions}",
+                expected.target_name
             ));
         }
-        for (name, number) in [("vda1", 1), ("vda2", 2)] {
+        for number in 1..=2 {
+            let name = format!("{}{number}", expected.target_name);
             let partition = by_name
-                .get(name)
+                .get(name.as_str())
                 .ok_or_else(|| format!("inventory lacks {name} after formatting"))?;
-            inventory_expect_field(partition, name, "parent", &Json::Str("vda".into()))?;
-            inventory_expect_number(partition, name, "partition_number", number)?;
-            inventory_expect_field(partition, name, "disk", &Json::Null)?;
-            inventory_expect_field(partition, name, "read_only", &Json::Bool(false))?;
+            inventory_expect_field(
+                partition,
+                &name,
+                "parent",
+                &Json::Str(expected.target_name.into()),
+            )?;
+            inventory_expect_number(partition, &name, "partition_number", number)?;
+            inventory_expect_field(partition, &name, "disk", &Json::Null)?;
+            inventory_expect_field(partition, &name, "read_only", &Json::Bool(false))?;
             inventory_expect_number(
                 partition,
-                name,
+                &name,
                 "capacity_bytes",
                 if number == 1 {
                     td_boot_protocol::ESP_BYTES
@@ -966,6 +1005,7 @@ fn require_inventory(
         source_name: source_device
             .strip_prefix("/dev/")
             .ok_or("invalid fixture media path")?,
+        target_name: target.bus.name(false),
         before,
     };
     validate_inventories(&result.console, &expected, partitioned).map_err(|error| {
@@ -1228,7 +1268,7 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
             &scratch.dir,
             timeout,
         )?;
-        require_installation(&result, &uuid, source_device)?;
+        require_installation(&result, &uuid, source_device, &target)?;
         require_inventory(
             &result,
             &target,
@@ -1372,6 +1412,7 @@ fn require_installation(
     result: &BootResult,
     uuid: &str,
     source_device: &str,
+    target: &TargetDisk,
 ) -> Result<(), String> {
     require(result, protocol::INSTALL_MARKER, "guest installation")?;
     if !result
@@ -1381,7 +1422,11 @@ fn require_installation(
     {
         return Err("guest did not report direct publication after staging checks".into());
     }
-    let partition_evidence = format!("{} {uuid} /dev/vda2", protocol::PARTITIONS_MARKER);
+    let partition_evidence = format!(
+        "{} {uuid} /dev/{}2",
+        protocol::PARTITIONS_MARKER,
+        target.bus.name(false)
+    );
     if !result
         .console
         .lines()
@@ -1408,12 +1453,13 @@ fn installation_timeout(value: Option<&str>, default_secs: u64) -> Duration {
         .unwrap_or(Duration::from_secs(default_secs))
 }
 
-fn sector_plan<'a>(path: &'a Path, marker: &'a str, sector_size: SectorSize) -> BootPlan<'a> {
-    let mut result = plan(path, false, marker);
+fn target_plan<'a>(target: &'a TargetDisk, marker: &'a str) -> BootPlan<'a> {
+    let mut result = plan(&target.path, false, marker);
     result.disk = Some(BootDisk {
-        path,
+        path: &target.path,
         read_only: false,
-        sector_size,
+        sector_size: target.sector_size,
+        bus: target.bus,
     });
     result
 }
@@ -1884,6 +1930,7 @@ mod tests {
             sector_bytes: 4096,
             read_only: false,
             source_name: "sr0",
+            target_name: "vda",
             before: InventoryBefore::Reinstall,
         }
     }
@@ -2023,9 +2070,19 @@ mod tests {
             "\"logical_sector_bytes\":512",
         );
         expected.source_name = "sda";
-        assert!(
-            validate_inventories(&inventory_console(&usb, Some(&usb)), &expected, true).is_ok()
-        );
+        validate_inventories(&inventory_console(&usb, Some(&usb)), &expected, true).unwrap();
+        let mut rejected = Command::new("qemu");
+        let error = DiskBus::Ahci
+            .attach(
+                &mut rejected,
+                "fixture",
+                protocol::TARGET_SERIAL,
+                None,
+                SectorSize::Bytes4096,
+            )
+            .unwrap_err();
+        assert!(error.contains("512-byte"), "{error}");
+        assert_eq!(rejected.get_args().count(), 0);
         expected.source_name = "sr0";
         for (old, new, reason) in [
             (
@@ -2062,6 +2119,97 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.contains("vda2.read_only"), "{error}");
+    }
+
+    #[test]
+    fn ahci_attachments_and_inventory_keep_the_planned_bus_and_names() {
+        let mut command = Command::new("qemu");
+        DiskBus::Ahci
+            .attach(
+                &mut command,
+                "fixture",
+                protocol::TARGET_SERIAL,
+                Some(1),
+                SectorSize::Bytes512,
+            )
+            .unwrap();
+        let args: Vec<_> = command
+            .get_args()
+            .map(|arg| arg.to_str().unwrap())
+            .collect();
+        assert_eq!(
+            args,
+            [
+                "-device",
+                "ich9-ahci,id=fixture-ahci",
+                "-device",
+                "ide-hd,bus=fixture-ahci.0,drive=fixture,serial=td-install-test,bootindex=1"
+            ]
+        );
+        assert_eq!(DiskBus::Ahci.name(false), "sda");
+        assert_eq!(DiskBus::Ahci.name(true), "sdb");
+        assert!(matches!(
+            BootDisk::new(Path::new("image"), false).bus,
+            DiskBus::Virtio
+        ));
+        let mut expected = inventory_expectation();
+        expected.target_name = "sda";
+        expected.sector_bytes = 512;
+        let sata = INVENTORY_FIXTURE
+            .replace("vda", "sda")
+            .replace("252:", "8:")
+            .replace(
+                "\"logical_sector_bytes\":4096",
+                "\"logical_sector_bytes\":512",
+            )
+            .replace("5904510976", "5904514560");
+        validate_inventories(&inventory_console(&sata, Some(&sata)), &expected, true).unwrap();
+        expected.source_name = "sdb";
+        let usb = sata.replace("sr0", "sdb").replace("11:0", "8:16").replace(
+            "\"logical_sector_bytes\":2048",
+            "\"logical_sector_bytes\":512",
+        );
+        validate_inventories(&inventory_console(&usb, Some(&usb)), &expected, true).unwrap();
+        let mut rejected = Command::new("qemu");
+        let error = DiskBus::Ahci
+            .attach(
+                &mut rejected,
+                "fixture",
+                protocol::TARGET_SERIAL,
+                None,
+                SectorSize::Bytes4096,
+            )
+            .unwrap_err();
+        assert!(error.contains("512-byte"), "{error}");
+        assert_eq!(rejected.get_args().count(), 0);
+    }
+
+    #[test]
+    fn ahci_installation_evidence_and_cold_plan_retain_the_bus() {
+        let target = TargetDisk {
+            path: PathBuf::from("owned-fixture.img"),
+            read_only: false,
+            sector_size: SectorSize::Bytes512,
+            bus: DiskBus::Ahci,
+        };
+        let plan = target_plan(&target, "cold-marker");
+        let disk = plan.disk.as_ref().unwrap();
+        assert!(matches!(disk.bus, DiskBus::Ahci));
+        assert_eq!(disk.sector_size.bytes(), 512);
+        assert_eq!(disk.path, target.path.as_path());
+        assert!(!disk.read_only);
+        assert_eq!(plan.target_marker, "cold-marker");
+        let mut result = healthy_system();
+        result.console = format!(
+            "{}\n{}\n{} uuid /dev/sda2\n{} /dev/sdb\n",
+            protocol::INSTALL_MARKER,
+            protocol::DIRECT_MARKER,
+            protocol::PARTITIONS_MARKER,
+            protocol::MEDIA_MARKER
+        );
+        require_installation(&result, "uuid", "/dev/sdb", &target).unwrap();
+        result.console = result.console.replace("/dev/sda2", "/dev/vda2");
+        assert!(require_installation(&result, "uuid", "/dev/sdb", &target).is_err());
     }
 
     #[test]
