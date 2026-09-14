@@ -71,6 +71,7 @@ const MODULES: &[(&str, &str)] = &[
     ("losetup", include_str!("../../../td-init/src/losetup.rs")),
     ("mknod", include_str!("../../../td-init/src/mknod.rs")),
     ("mount", include_str!("../../../td-init/src/mount.rs")),
+    ("partitions", include_str!("../../../td-init/src/partitions.rs")),
     ("switchroot", include_str!("../../../td-init/src/switchroot.rs")),
     ("syncfs", include_str!("../../../td-init/src/syncfs.rs")),
     ("sys", include_str!("../../../td-init/src/sys.rs")),

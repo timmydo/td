@@ -219,8 +219,34 @@ fn install(device: &str) -> Result<(), String> {
             "/trusted.pub",
         ],
     )?;
+    refresh_partitions(device, &uuid)?;
     applet(&["sync"])?;
     writeln!(std::io::stdout(), "{INSTALL_MARKER}").map_err(|error| error.to_string())
+}
+
+fn refresh_partitions(device: &str, uuid: &str) -> Result<(), String> {
+    applet(&["reread-partitions", device])?;
+    let (_, partition) = volume(uuid)?;
+    if partition != format!("{device}2") {
+        return Err("partition reread resolved an unexpected fixture device".into());
+    }
+    command("/bin/td-boot", &["mount-root", &partition, "/volume"])?;
+    let refused = Command::new("/bin/td-init")
+        .args(["reread-partitions", device])
+        .output()
+        .map_err(|error| format!("execute busy partition reread: {error}"))?;
+    let diagnostic = String::from_utf8_lossy(&refused.stderr);
+    if refused.status.success()
+        || !refused.stdout.is_empty()
+        || !diagnostic.contains(&format!("reread partitions on {device}:"))
+        || !diagnostic.contains("(os error 16)")
+    {
+        return Err(format!("mounted disk reread did not refuse as busy: {diagnostic}"));
+    }
+    applet(&["umount", "/volume"])?;
+    applet(&["reread-partitions", device])?;
+    writeln!(std::io::stdout(), "{PARTITIONS_MARKER} {uuid} {partition}")
+        .map_err(|error| error.to_string())
 }
 
 fn volume(uuid: &str) -> Result<(String, String), String> {

@@ -88,7 +88,7 @@ raw boundary of the consumer's own, which gets its own entry.
 |---|-------|----------|
 | 1 | `td-kexec` | `kexec_file_load(2)`, `reboot(2)` |
 | 2 | `td-netd` | `ioctl(2)` |
-| 3 | `td-init` | ten — see [§3](#3-td-init--the-boot-glue-multicall); `ioctl` has four pinned requests |
+| 3 | `td-init` | ten — see [§3](#3-td-init--the-boot-glue-multicall); `ioctl` has five pinned requests |
 | 4 | `td-login` | `setgroups(2)`, `setgid(2)`, `setuid(2)` |
 | 5 | `td-svc` | `kill(2)` |
 | 6 | `td-compositor` | `recvmsg(2)`, `close(2)`, `sendmsg(2)`, `getsockopt(2)` with fixed `SO_PEERCRED`, `fcntl(2)` with two value-pinned commands, `ioctl(2)` with twenty-one value-pinned requests, `clock_gettime(2)` fixed to `CLOCK_MONOTONIC`, `mmap(2)`/`munmap(2)` pinned to one dumb buffer this crate created; plus one scoped received-descriptor adoption and one lifetime-carrying mapped region; also the shared private-channel instruction and adoption of §16 |
@@ -231,15 +231,16 @@ asserted like `mount`'s and `attach_loop`'s, because `mode`'s top bits are
 the node type and so choose the driver class. Only BLOCK nodes are served;
 `c`/`u`/`p` are refused, since nothing on td's boot path creates one and
 the type is the part of `mode` that picks the driver. An ELEVENTH syscall
-is an amendment here. `ioctl(2)` is the one with FOUR permitted requests —
+is an amendment here. `ioctl(2)` is the one with FIVE permitted requests —
 `TIOCSCTTY` for cttyhack and getty, `LOOP_SET_FD` for the `losetup` applet,
-and `TCGETS`/`TCSETS` for the line settings getty applies — each pinned by
+`TCGETS`/`TCSETS` for the line settings getty applies, and `BLKRRPART` for
+partition rereads — each pinned by
 value, so widening that roster is as reviewable as adding a syscall to it.
 Unlike the two-request form this replaced, the roster is now ENFORCED IN
 CODE (td-sh's shape, not td-util's per-wrapper one): a single `ioctl` entry
 point in `sys.rs` refuses anything outside `IOCTL_REQUESTS` before issuing,
-so a fifth request is an edit to a named array rather than a new call site
-somebody has to notice. The four wrappers are pinned whole in turn, because
+so a sixth request is an edit to a named array rather than a new call site
+somebody has to notice. The five wrappers are pinned whole in turn, because
 with one entry point the syscall-argument pin no longer sees a request
 number: `TIOCSCTTY` reads its third register as the steal flag,
 `LOOP_SET_FD` as a descriptor, and the two termios calls as a pointer the
@@ -248,6 +249,32 @@ termios` (four flag words, `c_line`, NCCS=19 slots) and NOT glibc's 60-byte
 one, pinned for td-compositor's `WINSIZE_LEN` reason: the copy has no length
 negotiation, so a buffer sized from the wrong header is an out-of-bounds
 kernel write from code the compiler reads as safe.
+
+The fifth request is `BLKRRPART` (0x125f, Linux `_IO(0x12,95)`).
+`sys::reread_partitions` borrows one live File and fixes the third argument
+to zero; no pointer, request or flag is supplied by its caller. Only
+`partitions.rs`, through `td-init reread-partitions DEVICE`, may call it.
+The applet accepts exactly one absolute path, refuses symlinks and non-block
+nodes before opening, opens read-only with x86-64 `O_NOFOLLOW|O_NONBLOCK`,
+and compares block type, device/inode and rdev across the open. The held
+File owns the descriptor through the one request. Linux requires
+CAP_SYS_ADMIN and rejects partition operands and a disk with open partitions.
+Errors propagate; there is no forced unmount, retry, table write or fallback.
+
+This is a privileged mechanism, not device admission or erase consent. The
+caller owns the namespace, stable device topology and exclusion of other
+users. The final-component checks cannot protect against hostile ancestor
+replacement, hot removal or device-number reuse. Successful return reports
+only the kernel's scan result, not agreement with a planned table; the caller
+must read back the expected partitions before using them. The native
+installation oracle checks its configured Btrfs UUID on the newly visible
+partition, mounts it, requires EBUSY on a second scan while mounted, then
+unmounts before a final successful scan. No host disk is used in these tests.
+Confinement pins the fifth request's value, zero argument, borrowed-file
+wrapper, sole caller and unchanged single instruction/allowance; harmless
+non-block kernel tests require ENOTTY. The td-install formatter remains safe
+and continues to write through its whole-disk descriptor for both destination
+kinds. This applet prepares the later direct-to-volume publication path.
 
 `TCGETS`/`TCSETS` arrived with the `getty` applet, which is what took the
 LAST busybox name off the image — the tty setup half of the login chain,

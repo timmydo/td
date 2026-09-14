@@ -71,6 +71,19 @@ the result is not a retained snapshot. Volume publication still repeats
 authentication and verifies copied payload hashes. Space, firmware-selector
 and target admission remain requirements for the production installer service.
 
+After both formatting commands, the guest asks td-init to reread the target's
+partition table. It resolves the configured UUID through the production
+reader and requires the expected virtio partition, then mounts it through
+td-boot. A second reread must fail specifically with EBUSY while mounted;
+no force or unmount fallback is accepted. The guest unmounts and requires a
+final successful reread before emitting the partition-refresh evidence and
+installation-success marker. The host requires the exact configured UUID and
+/dev/vda2 in that evidence on both optical and USB installs. This exercises
+partition publication during the same boot; firmware reboot cannot mask a
+missing reread. The formatter's RAM staging remains until direct publication
+is implemented. UNSAFE.md §3 owns the new td-init request; this crate still
+has no raw syscall surface.
+
 The host then detaches media and cold-boots the destination through
 firmware. The selector emits read-only discovery evidence for its configured
 UUID and invokes production `td-boot on-volume boot`. That entry reads the

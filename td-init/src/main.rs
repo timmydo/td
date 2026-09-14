@@ -36,6 +36,7 @@ mod init;
 mod losetup;
 mod mknod;
 mod mount;
+mod partitions;
 mod switchroot;
 mod syncfs;
 mod sys;
@@ -61,6 +62,7 @@ const APPLETS: &[(&str, Applet)] = &[
     ("mount", mount::mount),
     ("poweroff", halt::poweroff),
     ("reboot", halt::reboot),
+    ("reread-partitions", partitions::run),
     ("switch_root", switchroot::run),
     ("sync", syncfs::run),
     ("umount", mount::umount),
@@ -386,7 +388,7 @@ mod tests {
     /// The roster is the shipped /bin symlink farm, so a rename is a visible
     /// change to the image, not an internal one.
     #[test]
-    fn the_roster_is_the_amended_fourteen() {
+    fn the_roster_is_the_amended_fifteen() {
         assert_eq!(
             names(),
             vec![
@@ -401,6 +403,7 @@ mod tests {
                 "mount",
                 "poweroff",
                 "reboot",
+                "reread-partitions",
                 "switch_root",
                 "sync",
                 "umount"
@@ -839,7 +842,7 @@ mod confinement {
                 declared.push(target);
             }
         }
-        assert_eq!(declared.len(), 14, "expected fourteen modules beside the crate root");
+        assert_eq!(declared.len(), 15, "expected fifteen modules beside the crate root");
         // ...and nothing scanned is orphaned: a file present but declared by no
         // `mod` line is either dead or reached a way this scan does not model,
         // and either way the counts above stop meaning what they say. Matching on
@@ -866,7 +869,7 @@ mod confinement {
     /// skipping them: `src/sys.inc` is invisible to a `.rs`-only scan and
     /// compiles perfectly well through the constructs refused below.
     #[test]
-    fn src_holds_exactly_the_fifteen_scanned_modules() {
+    fn src_holds_exactly_the_sixteen_scanned_modules() {
         let (rs, other) = walk();
         let paths: Vec<&str> = rs.iter().map(|(p, _)| p.as_str()).collect();
         assert_eq!(
@@ -883,6 +886,7 @@ mod confinement {
                 "main.rs",
                 "mknod.rs",
                 "mount.rs",
+                "partitions.rs",
                 "switchroot.rs",
                 "syncfs.rs",
                 "sys.rs",
@@ -1101,7 +1105,7 @@ mod confinement {
     #[test]
     fn no_ioctl_request_can_be_shadowed() {
         let sys = code_only(&source("sys.rs"));
-        for request in ["TIOCSCTTY", "LOOP_SET_FD", "TCGETS", "TCSETS"] {
+        for request in ["TIOCSCTTY", "LOOP_SET_FD", "TCGETS", "TCSETS", "BLKRRPART"] {
             assert_eq!(
                 sys.matches(request).count(),
                 3,
@@ -1111,32 +1115,33 @@ mod confinement {
         }
     }
 
-    /// The ioctl roster is exactly the amended four, by VALUE, and the entry
+    /// The ioctl roster is exactly the amended five, by VALUE, and the entry
     /// point actually consults it.
     ///
     /// `ioctl(2)` is one syscall onto an unbounded space of operations, so the
     /// number in `rax` is not this surface — the request in `rsi` is. Pinning
     /// the four numbers is half of it; the other half is that they are checked
-    /// BEFORE the syscall, which is what makes a fifth request an edit to this
+    /// BEFORE the syscall, which is what makes a sixth request an edit to this
     /// array rather than a new call site somebody has to notice. `TCSETS`
     /// mistyped as `0x5404` is `TCSETSF`, which DISCARDS pending terminal I/O
     /// another process may own, and the array alone cannot tell them apart.
     #[test]
-    fn the_ioctl_requests_are_the_amended_four() {
+    fn the_ioctl_requests_are_the_amended_five() {
         let sys = squeeze(&code_only(&source("sys.rs")));
         for decl in [
             "constTIOCSCTTY:usize=0x540e;",
             "constLOOP_SET_FD:usize=0x4c00;",
             "constTCGETS:usize=0x5401;",
             "constTCSETS:usize=0x5402;",
+            "constBLKRRPART:usize=0x125f;",
         ] {
             assert_eq!(sys.matches(decl).count(), 1, "the pinned request {decl} changed");
         }
         assert_eq!(
-            sys.matches("constIOCTL_REQUESTS:[usize;4]=[TIOCSCTTY,LOOP_SET_FD,TCGETS,TCSETS];")
+            sys.matches("constIOCTL_REQUESTS:[usize;5]=[TIOCSCTTY,LOOP_SET_FD,TCGETS,TCSETS,BLKRRPART];")
                 .count(),
             1,
-            "the ioctl roster changed; a fifth request is an UNSAFE.md amendment"
+            "the ioctl roster changed; a sixth request is an UNSAFE.md amendment"
         );
         assert_eq!(
             sys.matches("if!IOCTL_REQUESTS.contains(&request){").count(),
@@ -1184,13 +1189,13 @@ mod confinement {
             "(SYS_IOCTL,fdasusize,request,arg,0,0)",
             "(SYS_WAIT4,PID_ANY,ptr::addr_of_mut!(status)asusize,opts,0,0,)",
         ];
-        // One pin per SYSCALL now: the four ioctl requests share a single entry
+        // One pin per SYSCALL now: the five ioctl requests share a single entry
         // point, so what each one passes is pinned at its wrapper instead —
         // `the_ioctl_wrappers_pass_the_request_they_are_named_for`, below.
         assert_eq!(
             ARGUMENTS.len(),
             AMENDED.len(),
-            "one pin per call site; ioctl's four requests share one"
+            "one pin per call site; ioctl's five requests share one"
         );
         let sys = squeeze(&source("sys.rs"));
         for arguments in ARGUMENTS {
@@ -1206,7 +1211,7 @@ mod confinement {
     /// that request expects.
     ///
     /// With one entry point the pin above no longer sees a request number, so
-    /// this is where "restricted to these four" becomes a claim about what is
+    /// this is where "restricted to these five" becomes a claim about what is
     /// actually issued. The arguments matter as much as the requests:
     /// `TIOCSCTTY` reads its third register as the STEAL flag, `LOOP_SET_FD`
     /// reads it as a descriptor, and the two termios calls read it as a pointer
@@ -1218,6 +1223,7 @@ mod confinement {
             "ioctl(loop_fd,LOOP_SET_FD,backing_fdasusize)",
             "ioctl(fd,TCGETS,out.as_mut_ptr()asusize)",
             "ioctl(fd,TCSETS,termios.as_ptr()asusize)",
+            "ioctl(device.as_raw_fd(),BLKRRPART,0)",
         ];
         let sys = squeeze(&source("sys.rs"));
         for call in CALLS {
@@ -1238,7 +1244,7 @@ mod confinement {
         assert_eq!(
             Some(CALLS.len()),
             declared,
-            "one wrapper per permitted request; a fifth is an UNSAFE.md amendment"
+            "one wrapper per permitted request; a sixth is an UNSAFE.md amendment"
         );
     }
 
@@ -1374,6 +1380,7 @@ mod confinement {
             // call it can bind an arbitrary open file to an arbitrary loop
             // device. One caller is what keeps the read-back below meaningful.
             (concat!("sys::", "attach_loop"), &["losetup.rs"][..]),
+            (concat!("sys::", "reread_partitions"), &["partitions.rs"][..]),
             // `mknod` takes `mode`, whose top bits are the node TYPE and so choose
             // the driver class. A caller outside `mknod.rs` could compose a
             // character node and skip the readback that makes this applet safe.
@@ -1577,9 +1584,9 @@ mod confinement {
             );
             selected.push(selector);
         }
-        // Each of the ten exactly once, ioctl included: its four permitted
+        // Each of the ten exactly once, ioctl included: its five permitted
         // requests share ONE entry point, so the request register is pinned at
-        // the four wrappers rather than here. Membership alone would let every
+        // the five wrappers rather than here. Membership alone would let every
         // site name SYS_REBOOT while a wrapper quietly issued a different call
         // than the one it is named for; spelling the expected multiset out
         // keeps that closed while the roster widens.
@@ -1603,11 +1610,24 @@ mod confinement {
         );
     }
 
-    /// The ioctl entry point has EXACTLY the four call sites pinned above, and
+    #[test]
+    fn partition_reread_borrows_the_opened_device_and_has_one_applet_caller() {
+        let sys = squeeze(&code_only(&source("sys.rs")));
+        assert!(sys.contains("pubfnreread_partitions(device:&File)->io::Result<()>{ioctl(device.as_raw_fd(),BLKRRPART,0)}"));
+        let applet = squeeze(&code_only(&source("partitions.rs")));
+        assert_eq!(applet.matches(concat!("sys::", "reread_partitions(&disk)")).count(), 1);
+        assert!(applet.contains("constO_NONBLOCK:i32=0o4000;"));
+        assert!(applet.contains("constO_NOFOLLOW:i32=0o400000;"));
+        assert!(applet.contains("OpenOptions::new().read(true).custom_flags(O_NONBLOCK|O_NOFOLLOW).open(path)?"));
+        assert!(applet.contains("letbefore=fs::symlink_metadata(path)?;if!before.file_type().is_block_device()"));
+        assert!(applet.contains("letopened=file.metadata()?;if!opened.file_type().is_block_device()||(before.dev(),before.ino(),before.rdev())!=(opened.dev(),opened.ino(),opened.rdev())"));
+    }
+
+    /// The ioctl entry point has EXACTLY the five call sites pinned above, and
     /// the roster it checks against has exactly one binding.
     ///
-    /// Without this the "four value-pinned requests" claim is not held by
-    /// anything, and a reviewer demonstrated it: redeclare `IOCTL_REQUESTS`
+    /// This guards the value-pinned request claim. When the roster had four
+    /// entries, a reviewer demonstrated the escape: redeclare `IOCTL_REQUESTS`
     /// INSIDE `fn ioctl` with a fifth entry `0x5404`, add a fifth wrapper
     /// passing that literal, and the whole crate stayed green — the outer
     /// roster line is still present, each of the four names still appears three
@@ -1624,9 +1644,9 @@ mod confinement {
         let sys = squeeze(&code_only(&source("sys.rs")));
         assert_eq!(
             sys.matches("ioctl(").count(),
-            5,
-            "sys.rs must hold the ioctl definition and exactly four calls — one \
-             per permitted request, each pinned whole above; a fifth call site \
+            6,
+            "sys.rs must hold the ioctl definition and exactly five calls — one \
+             per permitted request, each pinned whole above; a sixth call site \
              can pass a literal the name-based pins cannot see"
         );
         assert_eq!(

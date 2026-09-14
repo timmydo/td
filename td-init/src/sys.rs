@@ -16,19 +16,20 @@
 //! The amended surface is exactly the ten syscalls below, one per boot-glue
 //! applet requirement that safe `std` does not expose. An ELEVENTH is a reviewed
 //! amendment, not an edit; `main.rs`'s confinement test asserts the roster.
-//! `ioctl(2)` is the one with FOUR permitted requests — `TIOCSCTTY` for
+//! `ioctl(2)` is the one with FIVE permitted requests — `TIOCSCTTY` for
 //! cttyhack and getty, `LOOP_SET_FD` for losetup, and `TCGETS`/`TCSETS` for the
-//! line settings getty applies — each pinned by value and checked against the
-//! roster by the one `ioctl` entry point below, so widening it is as reviewable
-//! as adding a syscall.
+//! line settings getty applies, plus BLKRRPART for partition rereads. Each is
+//! pinned by value and checked against the roster by the one `ioctl` entry
+//! point below, so widening it is as reviewable as adding a syscall.
 //! Notably absent: `pivot_root(2)` (it fails on the initramfs rootfs, so
 //! switch_root moves the mount instead, as util-linux and busybox do),
 //! `fork`/`execve` (`Command` plus the SAFE `CommandExt::exec` cover both), and
 //! `dup2` (`Stdio::from(File)` makes exec wire the console onto 0/1/2).
 
 use std::ffi::CStr;
+use std::fs::File;
 use std::io;
-use std::os::fd::RawFd;
+use std::os::fd::{AsRawFd, RawFd};
 use std::ptr;
 
 #[cfg(not(all(target_arch = "x86_64", target_os = "linux")))]
@@ -230,7 +231,7 @@ pub fn setsid() -> io::Result<i32> {
 
 // ── the ioctl roster ────────────────────────────────────────────────────────
 
-/// The FOUR requests this crate's `ioctl` may issue, pinned by value.
+/// The FIVE requests this crate's `ioctl` may issue, pinned by value.
 ///
 /// `ioctl(2)` is one syscall onto an unbounded space of operations, so the
 /// number in `rax` is not the surface — the request in `rsi` is. The roster is
@@ -242,7 +243,8 @@ const TIOCSCTTY: usize = 0x540e;
 const LOOP_SET_FD: usize = 0x4c00;
 const TCGETS: usize = 0x5401;
 const TCSETS: usize = 0x5402;
-const IOCTL_REQUESTS: [usize; 4] = [TIOCSCTTY, LOOP_SET_FD, TCGETS, TCSETS];
+const BLKRRPART: usize = 0x125f;
+const IOCTL_REQUESTS: [usize; 5] = [TIOCSCTTY, LOOP_SET_FD, TCGETS, TCSETS, BLKRRPART];
 
 /// The only path to `ioctl(2)` in this crate. `request` is checked against the
 /// roster before the syscall, so an unlisted number cannot reach the kernel even
@@ -296,6 +298,11 @@ const NO_STEAL: usize = 0;
 /// of sysfs and refuses rather than trusting that.
 pub fn attach_loop(loop_fd: RawFd, backing_fd: RawFd) -> io::Result<()> {
     ioctl(loop_fd, LOOP_SET_FD, backing_fd as usize)
+}
+
+/// Reread the table on one held whole-disk descriptor; the request has no payload.
+pub fn reread_partitions(device: &File) -> io::Result<()> {
+    ioctl(device.as_raw_fd(), BLKRRPART, 0)
 }
 
 // ── getty's two requests ────────────────────────────────────────────────────
@@ -453,9 +460,9 @@ mod tests {
     /// worth proving cannot leave this module.
     ///
     /// Note what this is and is not. It proves ONE value of the roster's
-    /// complement is refused and that all four on it get through — not that the
-    /// roster is the right four, which is `main.rs`'s job. A fifth entry added
-    /// beside the four would satisfy every line here.
+    /// complement is refused and that all five on it get through — not that the
+    /// roster is the right five, which is `main.rs`'s job. A sixth entry added
+    /// beside the five would satisfy every line here.
     #[test]
     fn an_off_roster_request_never_reaches_the_kernel() {
         // 0x5412 is the terminal input-injection request, deliberately off the
@@ -467,7 +474,7 @@ mod tests {
         let fd = std::os::fd::AsRawFd::as_raw_fd(&file);
         let refused = ioctl(fd, OFF_ROSTER, 0).unwrap_err();
         assert_eq!(refused.raw_os_error(), Some(EINVAL_ERRNO));
-        // ...and the four on the roster get past the check, reaching a kernel
+        // ...and the five on the roster get past the check, reaching a kernel
         // that answers for the device rather than the request.
         for request in IOCTL_REQUESTS {
             let err = ioctl(fd, request, 0).unwrap_err();
@@ -477,6 +484,13 @@ mod tests {
                 "request {request:#x} is on the roster but was refused by the check"
             );
         }
+    }
+
+    #[test]
+    fn partition_reread_reaches_the_kernel() {
+        let file = File::open("/dev/null").unwrap();
+        let error = reread_partitions(&file).unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(25));
     }
 
     /// The raw encodings the kernel actually hands back: `status >> 8` for a

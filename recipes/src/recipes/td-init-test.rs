@@ -102,11 +102,11 @@ pub fn recipe() -> Recipe {
                 "-c",
                 &format!(
                     "l=$('{bin}' --list) || {{ echo 'td-init --list failed' >&2; exit 1; }}; \
-                     for a in cttyhack devpts getty halt hostname init losetup mknod mount poweroff reboot switch_root sync umount; do \
+                     for a in cttyhack devpts getty halt hostname init losetup mknod mount poweroff reboot reread-partitions switch_root sync umount; do \
                          printf '%s\\n' \"$l\" | grep -q -x -F \"$a\" || {{ echo \"td-init does not serve applet '$a'\" >&2; exit 1; }}; \
                      done; \
                      n=$(printf '%s\\n' \"$l\" | wc -l); \
-                     [ \"$n\" -eq 14 ] || {{ echo \"td-init serves $n applets, expected exactly 14 — update this check deliberately when adding one\" >&2; exit 1; }}"
+                     [ \"$n\" -eq 15 ] || {{ echo \"td-init serves $n applets, expected exactly 15 — update this check deliberately when adding one\" >&2; exit 1; }}"
                 ),
             ],
         )
@@ -349,7 +349,7 @@ pub fn recipe() -> Recipe {
     });
     steps.push(Step::WriteFile {
         path: "{out}/result".into(),
-        content: "PASS: td-init is a statically-linked ELF64 x86-64 executable (ET_EXEC) with no PT_INTERP and no dynamic NEEDED entry; it serves exactly the fourteen applets cttyhack/devpts/getty/halt/hostname/init/losetup/mknod/mount/poweroff/reboot/switch_root/sync/umount, dispatches through both the argv[0] and `td-init <applet>` forms, rejects an unknown reboot option before reaching reboot(2), validates an inittab through `init --dry-run` (exit 1 on a rejected line), refuses a switch_root into a new root with no executable init, refuses a non-block or unencodable mknod before reaching mknod(2), refuses an unknown mount/umount argument before reaching mount(2)/umount2(2) and a lone mount operand td has no fstab to resolve, and prints the mount table and the hostname where /proc is mounted\n".into(),
+        content: "PASS: td-init is a statically-linked ELF64 x86-64 executable (ET_EXEC) with no PT_INTERP and no dynamic NEEDED entry; it serves exactly the fifteen applets cttyhack/devpts/getty/halt/hostname/init/losetup/mknod/mount/poweroff/reboot/reread-partitions/switch_root/sync/umount, dispatches through both the argv[0] and `td-init <applet>` forms, rejects an unknown reboot option before reaching reboot(2), validates an inittab through `init --dry-run` (exit 1 on a rejected line), refuses a switch_root into a new root with no executable init, refuses a non-block or unencodable mknod before reaching mknod(2), refuses an unknown mount/umount argument before reaching mount(2)/umount2(2) and a lone mount operand td has no fstab to resolve, and prints the mount table and the hostname where /proc is mounted\n".into(),
         exec: false,
     });
     steps.push(Step::Require {

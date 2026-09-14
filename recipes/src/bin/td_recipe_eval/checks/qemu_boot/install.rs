@@ -284,6 +284,10 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
             timeout,
         )?;
         require(&result, protocol::INSTALL_MARKER, "guest installation")?;
+        let partition_evidence = format!("{} {uuid} /dev/vda2", protocol::PARTITIONS_MARKER);
+        if !result.console.lines().any(|line| line.trim_end() == partition_evidence) {
+            return Err("guest did not prove refreshed partitions and busy-disk refusal".into());
+        }
         let media_evidence = format!("{} {source_device}", protocol::MEDIA_MARKER);
         if !result
             .console

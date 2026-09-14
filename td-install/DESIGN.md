@@ -467,6 +467,36 @@ at a later use. Root-owned devtmpfs/sysfs and their ancestors are trusted;
 this is neither exclusive device admission nor protection from hostile
 hotplug or a privileged namespace writer.
 
+### Refreshing partitions after formatting
+
+`td-init reread-partitions DEVICE` is the explicit kernel refresh between
+whole-disk formatting and using the new partition nodes. It accepts one
+absolute real block-device path and issues the value-pinned BLKRRPART
+request through td-init's existing syscall boundary (UNSAFE.md §3). Linux
+requires CAP_SYS_ADMIN, rejects a partition operand, and refuses a disk
+whose partitions remain open. A scan error stops the operation; no unmount,
+force, retry or regular-file fallback occurs. It emits no stdout on success.
+
+The formatter's existing regular-file and block-device path remains one
+implementation with no raw syscall. A caller needing only a completed disk
+image still needs no kernel refresh. A live coordinator wanting to mount a
+new partition must sync its table first, invoke the refresh, and validate the
+result against its plan. The applet does not parse GPT, prove complete
+partition publication, authorize erasure or provide exclusive admission.
+Its read-only descriptor stays held across the request; namespace and device
+stability remain caller obligations. The kernel may block during the scan,
+so the caller owns the operation's outer deadline.
+
+Both formatter commands sync their destination before returning success;
+the diagnostic relies on those explicit barriers before requesting a reread.
+The QEMU diagnostic invokes it after layout and volume formatting, resolves
+the preselected UUID on the expected new partition, mounts that Btrfs volume,
+and requires EBUSY from a reread while it is mounted. It unmounts and requires
+a final successful reread before reporting installation success. Both optical
+and USB installation legs require this evidence. This is a prerequisite for
+streaming publication onto the mounted destination; the diagnostic still
+uses the existing RAM staging path until that cutover lands.
+
 ### Full-system volume consumers
 
 `td-boot on-volume OPERATION ARGS...` supplies the device operand to
@@ -1410,17 +1440,18 @@ Ordered by dependency, not by size. Each is one landing with its own tests.
    the only place a test can EXEC `mkfs.btrfs`, since no host is required to
    have one. `recipe-checks` joins td-install's route with that recipe.
 
-   **SETTLED, and the granted permission is not spent: 7b uses no partition
-   device.** `mkfs.btrfs` writes a scratch image sized to the volume
+   **The formatter itself uses no partition device.** `mkfs.btrfs` writes a scratch image sized to the volume
    partition, and td-install copies that image into the partition through the
    whole-disk descriptor it already holds — which is exactly how it writes the
-   ESP today. `BLKRRPART` was authorised as an `UNSAFE.md` amendment and is
-   not needed, because it does not answer the question for BOTH destinations:
+   ESP today. A kernel reread is not needed for formatting, because it does
+   not answer the question for BOTH destinations:
    a regular file has no partition device to rescan, so the scratch-image path
    has to exist regardless, and once it exists the ioctl buys a second code
    path for the one destination the tests cannot reach. D9 settles it — an
    installer whose tested path and shipped path differ is an installer tested
    somewhere other than where it runs — and D8 survives intact.
+   A live coordinator can separately refresh partitions through td-init, as
+   specified in §5, before direct publication; the formatter remains one path.
 
    Three properties of that copy belong here rather than only in the code. It
    writes only the chunks of the image that are not entirely zero, because a
