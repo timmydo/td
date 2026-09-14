@@ -87,7 +87,7 @@ td-install-qemu-test-source dms3pcwywbs56b79jrmhxfpka2k4mfk9-td-install-qemu-tes
 td-mail-source ax2l49641vrrc9p76m7fbj1xya0qyqw1-td-mail-source
 td-net-source fy06xc8zwc5jlkqj21sjzzki28gvasnh-td-net-source
 td-news-source r5cycw0wjyg12vydavg0s4fp9dfs35ss-td-news-source
-td-portal-source 8n1kipi2gghq90m10n847znaj3a9qchf-td-portal-source
+td-portal-source y829z62cjpnxxcd4v4fh2a5j5rqwaajl-td-portal-source
 util-linux-libs-x86-64-source 06vhdikawhfyswkhrxs905cm3qbpqj4r-util-linux-libs-x86-64-source
 uutils-source rkmjdm6nicq3js0xhdyqk4rl3r9ki4xv-uutils-source
 zlib-x86-64-source bpbym1fyb9bbzs3398h55hqnj4lxp47c-zlib-x86-64-source

@@ -239,15 +239,64 @@ dynamic loading, subprocess crypto and vendoring external implementations
 do not evade this requirement. Host reference implementations may generate
 public test vectors, but do not enter the shipped closure.
 
-The remaining implementation decision is a separately reviewed safe-Rust
-implementation of the standard primitives. Before device integration it
-must have independent positive and negative vectors, canonical field/point
+The missing primitives are being implemented in separately reviewed safe-Rust
+increments. Before device integration they must have independent positive
+and negative vectors, canonical field/point
 validation, fixed operation schedules for secret scalars and AES, no
 secret-indexed tables, and an explicit analysis of compiler/timing and
 memory-erasure limits. It must not introduce a proprietary token protocol
 or replace the required PIN/UV policy with touch-only authentication.
-The envelope prerequisite does not claim those primitives exist. Any
-proposal to change this boundary requires a new explicit user decision.
+The AES prerequisite below does not supply P-256 or a working token protocol.
+Any proposal to change this boundary requires a new explicit user decision.
+
+### Implemented CTAP AES prerequisite
+
+`src/fido_aes.rs` supplies private AES-256-CBC encryption and decryption for
+one through eight 16-byte blocks. It accepts an explicit 32-byte key and
+16-byte IV and transforms the caller's buffer in place. Length admission
+precedes key expansion and mutation; empty, partial-block and oversized
+inputs return an error without changing any input byte. The upper bound is
+a local resource policy, not a universal CTAP message-size claim.
+
+This is the block-cipher prerequisite for
+[CTAP PIN/UV protocols](https://fidoalliance.org/specs/fido-v2.2-ps-20250714/fido-client-to-authenticator-protocol-v2.2-ps-20250714.html#pinProto1).
+It adds no padding, IV generation, integrity check, protocol negotiation,
+device I/O, command or application API. The future protocol adapter must
+enforce the selected protocol's message lengths, IV rules, authentication,
+signature checks and plaintext lifetime. CBC is not authenticated encryption
+and must not replace the portable envelope's ChaCha20-Poly1305.
+
+AES follows [FIPS 197](https://doi.org/10.6028/NIST.FIPS.197-upd1).
+The S-box and inverse use a fixed exponentiation chain in GF(2^8), with
+eight fixed mask-and-shift steps per multiplication. No secret byte indexes
+a table or selects a branch. The key schedule's branches depend only on the
+public round index; rounds, row permutations and column transforms use
+fixed layouts. CBC iteration depends on the admitted public message length.
+The implementation deliberately favors a small arithmetic surface over
+bulk-encryption speed. No AES-NI, foreign crypto library or raw surface is
+introduced.
+
+The 240-byte expanded schedule has a private heap owner without Clone or
+Debug. Its destructor clears the schedule; expansion clears its rolling
+word buffer. Each clear is followed by `std::hint::black_box` as a
+best-effort optimizer barrier. This does not guarantee erasure: temporary
+register/stack copies, allocator behavior, aborts and compiler transformations
+remain outside that claim. The caller retains and must retire the input
+key and any decrypted buffer. Fixed source operation schedules are not a
+Rust language guarantee of constant time, a complete CPU side-channel
+analysis, or cryptographic certification. PIN/hmac-secret integration must
+review generated code for the actual shipped compiler/options as an
+acceptance gate before admitting a hardware consumer.
+
+Tests compare both directions against the NIST AES-256 block and
+[CBC example](https://csrc.nist.gov/CSRC/media/Projects/Cryptographic-Standards-and-Guidelines/documents/examples/AES_ModesA_All.pdf),
+check all 256 S-box values, and refuse every invalid length through the
+first two blocks beyond the bound. Ten independent OpenSSL 3.5.7 fixtures
+cover every admitted block count, zero and nonzero IVs, and all-zero/all-one
+inputs. `tests/aes_vectors.py` regenerates the public literals in
+`tests/aes_vectors.txt`; it is an optional host fixture tool and never a
+build or test dependency. Host and td-built tests consume only those
+committed literals. These are primitive tests, not PIN or YubiKey evidence.
 
 ## Independently landable increments
 

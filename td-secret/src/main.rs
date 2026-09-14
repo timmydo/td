@@ -29,6 +29,8 @@ mod fido_device;
 mod fido_hid;
 #[allow(dead_code, reason = "shared enrollment and recovery metadata")]
 mod fido_metadata;
+#[allow(dead_code, reason = "CTAP AES prerequisite; no PIN consumer yet")]
+mod fido_aes;
 #[allow(dead_code, reason = "shared CTAP enrollment and assertion codec")]
 mod fido_cbor;
 #[allow(dead_code, reason = "shared CTAP enrollment and assertion codec")]
@@ -187,6 +189,7 @@ mod confinement {
             ("write_operation.rs", include_str!("write_operation.rs")),
             ("crypto.rs", include_str!("crypto.rs")),
             ("portable.rs", include_str!("portable.rs")),
+            ("fido_aes.rs", include_str!("fido_aes.rs")),
             ("fido_cbor.rs", include_str!("fido_cbor.rs")),
             ("fido_ctap.rs", include_str!("fido_ctap.rs")),
             ("fido_device.rs", include_str!("fido_device.rs")),
@@ -253,6 +256,7 @@ pub fn take_received(fd: RawFd) -> Result<File, String> {
                 "client.rs",
                 "crypto.rs",
                 "enrollment_operation.rs",
+                "fido_aes.rs",
                 "fido_cbor.rs",
                 "fido_ctap.rs",
                 "fido_device.rs",

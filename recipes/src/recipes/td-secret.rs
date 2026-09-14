@@ -12,6 +12,7 @@ const MODULES: &[(&str, &str)] = &[
     ("client", include_str!("../../../td-secret/src/client.rs")),
     ("crypto", include_str!("../../../td-secret/src/crypto.rs")),
     ("portable", include_str!("../../../td-secret/src/portable.rs")),
+    ("fido_aes", include_str!("../../../td-secret/src/fido_aes.rs")),
     ("fido_cbor", include_str!("../../../td-secret/src/fido_cbor.rs")),
     ("fido_ctap", include_str!("../../../td-secret/src/fido_ctap.rs")),
     ("fido_device", include_str!("../../../td-secret/src/fido_device.rs")),
@@ -44,6 +45,7 @@ pub fn recipe() -> Recipe {
     let mut steps = Vec::new();
     for directory in [
         "{src}/td-secret/src",
+        "{src}/td-secret/tests",
         "{src}/td-firstboot/src",
         "{src}/td-busd/src",
         "{src}/td-authd/src",
@@ -80,6 +82,7 @@ pub fn recipe() -> Recipe {
         });
     }
     for (path, source) in [
+        ("{src}/td-secret/tests/aes_vectors.txt", include_str!("../../../td-secret/tests/aes_vectors.txt")),
         ("{src}/td-secret/src/system_vm.rs", include_str!("../../../td-secret/src/system_vm.rs")),
         ("{src}/td-authd/tests/secret_sys.rs", include_str!("../../../td-authd/tests/secret_sys.rs")),
         ("{src}/td-firstboot/src/principals.rs", include_str!("../../../td-firstboot/src/principals.rs")),
