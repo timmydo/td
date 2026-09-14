@@ -176,6 +176,14 @@ of its own files may name each module.
   surface cannot hold, painting the active one paper and the rest chrome
   under a top and right border, a dirty tab starred and a `CLOSE_WIDTH`
   (24)-pixel close mark at its right; with no tabs it still fills its row.
+  Document tabs retain that default. `with_close_buttons(false)` gives
+  resource tabs the close-mark space for their labels and removes the
+  close hit region. `hit` returns typed `Select`/`Close` intents only on
+  the visible surface, including when a tab is partly clipped.
+  `selection` handles `Previous`, `Next`, `First` and `Last`, wrapping
+  previous/next and returning no selection for an empty strip. The caller
+  stores the returned active index and chooses keyboard bindings; the
+  strip's overflow layout keeps that active tab visible.
   `Status` shows one line in whole cells, the width less a cell each side
   and at most `STATUS_COLUMNS` (512), a control scalar blank and the last
   cell an ellipsis when the line is longer, under a top border; `frame`
@@ -1157,14 +1165,12 @@ dialog, preserve pixels outside it and respect partial damage.
 ## Planned task-manager widgets
 
 [td-taskmgr](../td-taskmgr/DESIGN.md) is a planned consumer. Menus and
-confirmations above are implemented; the following remain target contracts, not existing public
-APIs. Add them as reusable td-ui widgets before the task manager depends
+confirmations above and nonclosable resource tabs are implemented. The
+following remain target contracts, not existing public APIs. Add them as
+reusable td-ui widgets before the task manager depends
 on them. Process collection, history and signal execution stay in the
 consumer.
 
-- Nonclosable tabs as an explicit option of the shared strip. Preserve the
-  existing document-tab default; a nonclosable tab reserves no close hit
-  region. Keyboard selection and overflow keep the active tab visible.
 - Time-series line and stacked-area graphs with explicit timestamps,
   gaps, axes, units, legends,
   series IDs, a selected time and a selected series. Drawing and hit testing

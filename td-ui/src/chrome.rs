@@ -726,6 +726,22 @@ pub fn step(
     next
 }
 
+/// Keyboard selection among tabs, independent of document key bindings.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TabNavigation {
+    Previous,
+    Next,
+    First,
+    Last,
+}
+
+/// A visible tab selection or its optional close control.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TabHit {
+    Select(usize),
+    Close(usize),
+}
+
 /// A tab strip on one row: `count` tabs `TAB_WIDTH` wide from the left,
 /// the active one always in the strip; a surface narrower than one tab
 /// clips that tab.
@@ -735,6 +751,7 @@ pub struct Strip {
     y: i64,
     active: usize,
     count: usize,
+    closable: bool,
 }
 
 impl Strip {
@@ -746,7 +763,62 @@ impl Strip {
             y,
             active,
             count,
+            closable: true,
         })
+    }
+
+    /// Document tabs show close buttons by default. Resource tabs opt out;
+    /// their labels use that space and cannot produce a Close hit.
+    pub fn with_close_buttons(mut self, closable: bool) -> Self {
+        self.closable = closable;
+        self
+    }
+
+    pub fn selection(self, navigation: TabNavigation) -> Option<usize> {
+        if self.count == 0 {
+            return None;
+        }
+        Some(match navigation {
+            TabNavigation::First => 0,
+            TabNavigation::Last => self.count - 1,
+            TabNavigation::Previous => {
+                if self.active == 0 {
+                    self.count - 1
+                } else {
+                    self.active - 1
+                }
+            }
+            TabNavigation::Next => self
+                .active
+                .checked_add(1)
+                .filter(|index| *index < self.count)
+                .unwrap_or(0),
+        })
+    }
+
+    /// A hit in the visible part of this row. A clipped tab has no hit
+    /// outside the surface, including its off-screen close button.
+    pub fn hit(self, x: i64, y: i64) -> Option<TabHit> {
+        self.surface.check().ok()?;
+        if !self.surface.bounds().contains(x, y) || !self.rect().contains(x, y) {
+            return None;
+        }
+        let (width, _, first) = self.visible_layout();
+        let index = first.checked_add(x as usize / width)?;
+        self.tab(index)?;
+        Some(
+            if self.close(index).is_some_and(|rect| rect.contains(x, y)) {
+                TabHit::Close(index)
+            } else {
+                TabHit::Select(index)
+            },
+        )
+    }
+
+    fn visible_layout(self) -> (usize, usize, usize) {
+        let width = TAB_WIDTH * self.scale();
+        let visible = (self.surface.width / width).max(1);
+        (width, visible, self.active.saturating_sub(visible - 1))
     }
 
     fn scale(self) -> usize {
@@ -770,9 +842,7 @@ impl Strip {
             return None;
         }
         let s = self.scale();
-        let width = TAB_WIDTH * s;
-        let visible = (self.surface.width / width).max(1);
-        let first = self.active.saturating_sub(visible - 1);
+        let (width, visible, first) = self.visible_layout();
         let slot = index.checked_sub(first)?;
         if slot >= visible {
             return None;
@@ -787,6 +857,9 @@ impl Strip {
 
     /// Tab `index`'s close mark, its rightmost `CLOSE_WIDTH`.
     pub fn close(self, index: usize) -> Option<Rect> {
+        if !self.closable {
+            return None;
+        }
         let tab = self.tab(index)?;
         let width = (CLOSE_WIDTH * self.scale()) as u32;
         Some(Rect {
@@ -813,9 +886,10 @@ impl Strip {
         let s = self.scale() as i64;
         fill(self.rect(), CHROME, damage, sink);
         for (index, (title, dirty)) in tabs.into_iter().enumerate() {
-            let (Some(rect), Some(close)) = (self.tab(index), self.close(index)) else {
+            let Some(rect) = self.tab(index) else {
                 continue;
             };
+            let close = self.close(index);
             let background = if index == self.active { PAPER } else { CHROME };
             let style = GlyphStyle::medium(INK, background);
             fill(rect, background, damage, sink);
@@ -839,7 +913,9 @@ impl Strip {
                 sink,
             );
             let title_rect = Rect {
-                width: rect.width.saturating_sub(close.width),
+                width: rect
+                    .width
+                    .saturating_sub(close.map_or(s as u32, |close| close.width)),
                 ..rect
             };
             text_run(
@@ -851,15 +927,17 @@ impl Strip {
                 damage,
                 sink,
             );
-            text_run(
-                self.surface.scale,
-                "x".chars(),
-                (close.x + INSET.0 * s, close.y + INSET.1 * s),
-                close,
-                style,
-                damage,
-                sink,
-            );
+            if let Some(close) = close {
+                text_run(
+                    self.surface.scale,
+                    "x".chars(),
+                    (close.x + INSET.0 * s, close.y + INSET.1 * s),
+                    close,
+                    style,
+                    damage,
+                    sink,
+                );
+            }
         }
     }
 }
