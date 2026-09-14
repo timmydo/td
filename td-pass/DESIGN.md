@@ -2,7 +2,7 @@
 
 td-pass is a two-pane encrypted notebook for legacy passwords, account
 details and recovery notes. Its production target is one x86-64 Linux
-executable usable on td and a supported foreign Wayland desktop. This
+executable usable on td and Guix System with a Wayland desktop. This
 contract starts the workstream; no td-pass executable is implemented yet.
 [td-secret/PORTABLE.md](../td-secret/PORTABLE.md) owns storage, primary and
 backup YubiKeys, authentication, migration and recovery.
@@ -70,6 +70,35 @@ trusted authentication widget. Protocol state, device paths, key material
 and cryptographic details stay out of the notebook flow.
 
 ## Delivery and proof
+
+### First foreign host: Guix System
+
+Guix System is the first supported-host target. Use Sway as the initial
+desktop baseline, matching the running desktop on the user's machine;
+elogind is also present there. Weston fixtures can exercise client behavior
+but do not prove the Sway session's lock or suspend integration. Record the
+Guix system generation, kernel, compositor and session configuration with
+the acceptance results instead of inferring them from the distro name.
+
+Run the same td-built executable as the ordinary desktop user. USB access
+comes from the host's declared device policy. This host already has FIDO
+udev rules using `uaccess` and `plugdev`; the observed token node is mode
+0660, owned by root and plugdev. The development agent runs under a separate
+account and its denied HID open is not a test of the desktop user's access.
+Acceptance must exercise both permitted access and a denied open, hotplug,
+removal during authentication, and capability negotiation on both keys.
+A permission error must remain distinct from an unsupported authenticator.
+Device indices and numeric user/group IDs are not configuration identities.
+
+Establish the Sway lock path and elogind suspend notifications explicitly,
+including lock during editing or authentication, suspend/resume, and loss or
+restart of the event source. Merely finding elogind or a Wayland socket is
+not evidence that these events reach td-secret. Real-secret support still
+requires the portable-vault contract's dump, swap, clipboard and plaintext
+lifetime checks. No host configuration change or successful hardware unlock
+is implied by naming this first target.
+
+### Artifact and acceptance
 
 The executable must have a portable runtime closure and a declared
 architecture/kernel/Wayland baseline; compiling the source separately on two
