@@ -60,6 +60,15 @@ value through `td-install volume --uuid`; formatting cannot silently choose
 a different identity. Optical and USB destinations deliberately share that
 run's UUID but are never attached together.
 
+Before invoking layout, the live fixture calls `td-boot authenticate` on
+the read-only source and the provisioned public key. Missing or invalid
+signatures and malformed authenticated manifests refuse before the first
+disk-writing command. Authentication here covers the manifest; it does not
+hash its payloads. Volume publication still repeats authentication and
+verifies payload hashes. A signed manifest with corrupt payload bytes can
+therefore refuse after layout. Complete source, space and target admission
+before erasure remain requirements for the production installer service.
+
 The host then detaches media and cold-boots the destination through
 firmware. The selector emits read-only discovery evidence for its configured
 UUID and invokes production `td-boot on-volume boot`. That entry reads the
@@ -92,8 +101,15 @@ boot must observe and advance that count. The reported deployment ID must
 match the host's signed manifest. Successful installed boots also acknowledge
 that deployment through td-boot. An otherwise identical source offered under
 a second public key must produce an authentication refusal and no installation
-success marker. Both optical and USB installation boots
-use the same ISO bytes and fresh destination disks.
+success marker on both optical and USB boots. The host exclusively creates
+each wrong-key target, seeds nonzero canaries at its beginning, middle and
+end, and records its byte length and a SHA-256 over the entire disk. After
+QEMU exits, both must remain identical. This also detects changes between
+the canaries and inside sparse gaps; merely observing a refusal is not enough.
+Each negative boot must independently prove read-only access to the expected
+media device. Both valid installation boots share one ISO; both wrong-key
+boots share another, with unchanged signed payloads and only a different
+live trust root. All ten boots use fresh private firmware variables.
 
 The fixture's serial convention does not implement production installation
 admission. Volume discovery uses the production read-only primitive under

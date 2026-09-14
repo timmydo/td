@@ -12,6 +12,41 @@ pub(super) struct TargetDisk {
 }
 
 impl TargetDisk {
+    fn fingerprint(&self) -> Result<(u64, String), String> {
+        let len = fs::metadata(&self.path)
+            .map_err(|error| format!("stat {}: {error}", self.path.display()))?
+            .len();
+        let digest = crate::sha256::sha256_file(&self.path)
+            .map_err(|error| format!("hash {}: {error}", self.path.display()))?;
+        Ok((len, digest))
+    }
+
+    fn seed_preservation_canaries(&self) -> Result<(), String> {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .open(&self.path)
+            .map_err(|error| format!("open {}: {error}", self.path.display()))?;
+        let bytes = b"existing installation target contents\n";
+        let len = file
+            .metadata()
+            .map_err(|error| format!("stat {}: {error}", self.path.display()))?
+            .len();
+        let end = len.checked_sub(bytes.len() as u64).ok_or_else(|| {
+            format!(
+                "{} has {len} bytes; canaries require at least {}",
+                self.path.display(),
+                bytes.len()
+            )
+        })?;
+        for offset in [0, end / 2, end] {
+            file.seek(SeekFrom::Start(offset))
+                .and_then(|_| file.write_all(bytes))
+                .map_err(|error| format!("seed {} at {offset}: {error}", self.path.display()))?;
+        }
+        file.sync_all()
+            .map_err(|error| format!("sync {}: {error}", self.path.display()))
+    }
+
     fn copy_volume_identity(&self, source: &TargetDisk) -> Result<(), String> {
         let mut input = File::open(&source.path).map_err(|error| error.to_string())?;
         // The formatter's fixed GPT profile places the volume after the ESP.
@@ -370,36 +405,58 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
     write(&bad_live, &initramfs(&base, &common, "install\n", &extra)?)?;
     let bad_iso = scratch.dir.join("wrong-key.iso");
     media::write_image_with_payloads(&bad_iso, &kernel, &bad_live, &payloads)?;
-    let target = TargetDisk::create(&scratch.dir, "wrong-key.img")?;
-    let vars = scratch.dir.join("wrong-key-vars.fd");
-    efi::copy_input(&vars_template, &vars)?;
-    let refused = boot_source(
-        &qemu,
-        BootSource::Firmware {
-            code: &code,
-            vars: &vars,
-            attachment: FirmwareAttachment::Optical,
-            installation_target: Some(&target),
-        },
-        plan(&bad_iso, true, protocol::REFUSED_PREFIX),
-        &scratch.dir,
-        timeout,
-    )?;
-    if !refused.evidence.target
-        || !refused.console.lines().any(|line| {
-            line.strip_prefix(protocol::REFUSED_PREFIX)
-                .is_some_and(|rest| rest.starts_with(' '))
-        })
-        || !refused.console.contains(td_boot_protocol::MANIFEST_UNAUTHENTICATED)
-        || refused.console.contains(protocol::INSTALL_MARKER)
-    {
-        return Err(format!(
-            "wrong-key fixture did not prove authentication refusal\n{}",
-            tail(&refused.console, 80)
-        ));
+    for (name, attachment, source_device) in [
+        ("optical", FirmwareAttachment::Optical, "/dev/sr0"),
+        ("usb", FirmwareAttachment::Usb, "/dev/sda"),
+    ] {
+        let target = TargetDisk::create(&scratch.dir, &format!("wrong-key-{name}.img"))?;
+        target.seed_preservation_canaries()?;
+        let before = target.fingerprint()?;
+        let vars = scratch.dir.join(format!("wrong-key-{name}-vars.fd"));
+        efi::copy_input(&vars_template, &vars)?;
+        println!("   [qemu-install] refusing wrong-key {name} media before disk writes");
+        let refused = boot_source(
+            &qemu,
+            BootSource::Firmware {
+                code: &code,
+                vars: &vars,
+                attachment,
+                installation_target: Some(&target),
+            },
+            plan(&bad_iso, true, protocol::REFUSED_PREFIX),
+            &scratch.dir,
+            timeout,
+        )?;
+        // boot_source has reaped QEMU; compare all bytes, including sparse gaps.
+        if target.fingerprint()? != before {
+            return Err(format!(
+                "wrong-key {name} installation changed the destination\n{}",
+                tail(&refused.console, 80)
+            ));
+        }
+        require(
+            &refused,
+            &format!("{} {source_device}", protocol::MEDIA_MARKER),
+            "wrong-key media access",
+        )?;
+        if !refused.evidence.target
+            || !refused.console.lines().any(|line| {
+                line.strip_prefix(protocol::REFUSED_PREFIX)
+                    .is_some_and(|rest| rest.starts_with(' '))
+            })
+            || !refused
+                .console
+                .contains(td_boot_protocol::MANIFEST_UNAUTHENTICATED)
+            || refused.console.contains(protocol::INSTALL_MARKER)
+        {
+            return Err(format!(
+                "wrong-key {name} fixture did not prove authentication refusal\n{}",
+                tail(&refused.console, 80)
+            ));
+        }
     }
     println!(
-        "PASS: native optical/USB installation; provisioned UUID binding across verified kexec and reordered disks; duplicate identity and wrong-key refusals; two persistent installed boots"
+        "PASS: native optical/USB installation; provisioned UUID binding across verified kexec and reordered disks; duplicate identity refusal; wrong-key optical/USB refusal preserves every target byte; two persistent installed boots"
     );
     Ok(())
 }
@@ -536,6 +593,30 @@ mod tests {
         let text = arg.to_str().unwrap();
         assert!(text.starts_with("if=none,format=raw,id=install-target,file="));
         assert!(text.ends_with("/a,,b.img"));
+    }
+
+    #[test]
+    fn refusal_fingerprints_cover_canaries_sparse_gaps_and_length() {
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let scratch = Scratch {
+            dir: create_scratch_dir(&env::temp_dir(), &SEQ).unwrap(),
+        };
+        let target = TargetDisk::create(&scratch.dir, "preservation.img").unwrap();
+        let mut file = OpenOptions::new().write(true).open(&target.path).unwrap();
+        file.set_len(1024 * 1024).unwrap();
+        target.seed_preservation_canaries().unwrap();
+        let before = target.fingerprint().unwrap();
+        for offset in [0, 32768, 512 * 1024, 768 * 1024, 1024 * 1024 - 1] {
+            file.seek(SeekFrom::Start(offset)).unwrap();
+            file.write_all(b"!").unwrap();
+            assert_ne!(target.fingerprint().unwrap(), before, "offset {offset}");
+            file.set_len(0).unwrap();
+            file.set_len(1024 * 1024).unwrap();
+            target.seed_preservation_canaries().unwrap();
+            assert_eq!(target.fingerprint().unwrap(), before);
+        }
+        file.set_len(1024 * 1024 + 1).unwrap();
+        assert_ne!(target.fingerprint().unwrap(), before);
     }
 
     #[test]

@@ -1148,8 +1148,16 @@ created QEMU virtio target. The same private ISO is exercised as optical and
 USB media. After installation, the host detaches media and cold-boots only
 the destination, requiring authenticated selector kexec, a read from the
 installed EROFS payload, persistent Btrfs state across two boots, and
-successful deployment acknowledgement. A second public key must refuse the
-otherwise identical signed source without an installation-success marker.
+successful deployment acknowledgement. Before layout, the live fixture
+authenticates the source manifest under its provisioned public key. A second
+public key must refuse the otherwise identical signed source on both optical
+and USB boots without an installation-success marker. The host seeds each
+refusal target with nonzero canaries and compares its complete byte length
+and SHA-256 before and after QEMU exits. A refusal after changing the GPT,
+ESP, volume or sparse gaps fails the oracle. This preflight authenticates
+the manifest only; signed-but-corrupt payloads are still checked during
+volume publication, after layout. It is not a complete no-write admission
+check for arbitrary installation inputs.
 The private signing key never enters the guest or a derivation.
 
 The fixture accepts no operator destination and is absent from system and
