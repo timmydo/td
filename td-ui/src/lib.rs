@@ -50,6 +50,7 @@ pub mod pointer;
 pub mod raster;
 pub mod repeat;
 pub mod replay;
+pub mod split;
 mod sys;
 pub mod wayland;
 #[allow(clippy::new_without_default)]

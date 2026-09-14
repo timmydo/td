@@ -1238,18 +1238,58 @@ selection, refresh and interrupted gestures, input maxima/refusals and
 bounded drawing. Scale 1-4 pixel oracles preserve pixels outside the
 chart and compare partial repaint with full repaint.
 
+## Shared split pane
+
+`split::Controller` partitions a fully visible rectangle horizontally or
+vertically into two children and an eight-pixel logical divider. Config
+supplies nonzero logical child minima, each bounded by `MAX_AXIS`;
+Surface scale converts them once into device pixels. `Share` stores an
+exact nonzero-denominator fraction for the preferred first-child extent.
+Layout clamps to both minima without changing that preference, so a
+temporary small window cannot permanently move the divider. A stationary
+click/release leaves that exact preference intact, including while
+clamped. A drag released back at its initial position restores the
+captured preference too.
+
+A valid `Layout` contains three disjoint rectangles covering the entire
+input rectangle. If the extent cannot hold both minima and the divider,
+`layout()` returns None, emits no draws and supplies no hit targets. An
+empty rectangle contained in the surface uses this same fallback. The
+consumer owns the fallback and retains its content state. Invalid
+surface or out-of-surface resize returns an error after retiring old
+geometry and pointer capture. No child receives overlapping or invisible
+hit regions. Focus gained during fallback is retained when useful
+geometry returns.
+
+A primary press on the divider takes local pointer capture, preserving
+the offset within the handle. Motion and release adjust the split even
+outside the window, clamping safely. A focused divider accepts decrease,
+increase, first-minimum and last-maximum keys; the consumer maps
+physical keys for the chosen axis. Keys, resize and focus loss end a
+drag. A release without capture does nothing. A new press outside the
+divider retires old capture and returns Ignored so a child can handle
+that press. Repeated focus assignment is consumed without claiming a
+visual change. The preferred share is exposed for the application; the
+widget neither persists it nor owns child content.
+
+Painting emits only the divider and its grip, with a distinct focused
+background, through the clipped semantic draw stream. Geometry, input
+and painting allocate no storage and use no I/O. Twelve tests cover both
+axes and scales 1-4, exact partition/minima, extreme pointer
+coordinates, keyboard movement, capture cancellation, temporary
+clamp/fallback restoration, stationary/returning clicks, invalid inputs
+and focused/partial repaint pixel oracles on both axes that leave child
+pixels untouched.
+
 ## Planned task-manager widgets
 
 [td-taskmgr](../td-taskmgr/DESIGN.md) is a planned consumer. Menus and
-confirmations, nonclosable resource tabs and charts are implemented. The
-following remain target contracts, not existing public APIs. Add them as
-reusable td-ui widgets before the task manager depends on them. Process
-collection, history and signal execution stay in the consumer.
+confirmations, nonclosable resource tabs, charts and the split pane are
+implemented. The tree table remains a target contract, not an existing
+public API. Add it as a reusable td-ui widget before the task manager
+depends on it. Process collection, history and signal execution stay in
+the consumer.
 
-- A resizable split pane with explicit child minima, a visible focusable
-  divider, pointer capture and keyboard adjustment. Resize and focus loss
-  end a drag safely. An extent too small for both children has an explicit
-  fallback supplied by the consumer, never overlapping hit regions.
 - A tree table with stable opaque row IDs, disclosure controls, sortable
   column headings, selection, scroll anchors and visible-row rendering.
   Column definitions carry explicit minimum and preferred widths; the first
