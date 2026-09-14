@@ -52,6 +52,21 @@ impl Model {
     pub fn history(&self) -> &History<Sample> {
         &self.history
     }
+    /// Reclaim one older unpinned snapshot for the visible UI working set.
+    /// Preserve the newest observation as well as an explicit inspection.
+    pub fn reclaim_for_view(&mut self) -> bool {
+        let last = self.history.samples().len().saturating_sub(1);
+        let eligible = self
+            .history
+            .samples()
+            .iter()
+            .take(last)
+            .any(|sample| Some(sample.id) != self.history.pinned());
+        eligible && self.history.reclaim_one()
+    }
+    pub fn clear_selection(&mut self) {
+        self.selected = None;
+    }
     pub fn selected(&self) -> Option<ProcessKey> {
         self.selected
     }
@@ -92,7 +107,8 @@ impl Model {
                     return Admission::Idle;
                 };
                 let time = batch.ended_ns;
-                let sample = batch.finish(processes);
+                let mut sample = batch.finish(processes);
+                sample.previous = self.history.samples().last().map(|sample| sample.id);
                 match self.history.admit(time, self.skipped, sample) {
                     Ok(id) => {
                         self.skipped = 0;

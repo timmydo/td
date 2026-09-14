@@ -37,6 +37,7 @@ struct Shared {
 pub struct Worker {
     shared: Arc<Shared>,
     handle: Option<JoinHandle<()>>,
+    origin: Instant,
 }
 fn missed_intervals(elapsed: Duration, previous: Option<Interval>, current: Interval) -> u64 {
     if previous != Some(current) {
@@ -132,8 +133,12 @@ fn run(shared: &Shared, mut sample: impl FnMut(&AtomicBool) -> io::Result<Batch>
 impl Worker {
     pub fn start(budget: &Arc<Budget>, generation: u64, interval: Interval) -> io::Result<Self> {
         let collector = Collector::new(budget, generation)?;
+        let origin = collector.origin();
         let mut collector = collector;
-        Self::start_with(budget, interval, move |cancel| collector.sample(cancel))
+        let mut worker =
+            Self::start_with(budget, interval, move |cancel| collector.sample(cancel))?;
+        worker.origin = origin;
+        Ok(worker)
     }
     fn start_with(
         budget: &Arc<Budget>,
@@ -167,7 +172,11 @@ impl Worker {
         Ok(Self {
             shared,
             handle: Some(handle),
+            origin: Instant::now(),
         })
+    }
+    pub fn elapsed_ns(&self) -> io::Result<u64> {
+        u64::try_from(self.origin.elapsed().as_nanos()).map_err(io::Error::other)
     }
     pub fn interval(&self, interval: Interval) -> io::Result<()> {
         self.shared

@@ -2,13 +2,15 @@
 name = "td-taskmgr"
 version = "0.1.0"
 edition = "2021"
-description = "Bounded Linux resource and process observations for td's task manager"
+description = "A hierarchical Linux task manager for Wayland"
 license = "GPL-3.0-or-later"
 
 [workspace]
 
 [package.metadata.td-gate]
 clippy-all-targets = true
+native-compositor-tests = true
+trusted-test-root = true
 
 [lints.clippy]
 unwrap_used = "deny"
@@ -18,3 +20,6 @@ unreachable = "deny"
 todo = "deny"
 unimplemented = "deny"
 indexing_slicing = "deny"
+
+[dependencies]
+td-ui = { path = "../td-ui" }

@@ -20,6 +20,16 @@ fn source_inventory_and_parser_boundary_are_closed() {
         "parsers.rs",
         "snapshot.rs",
         "worker.rs",
+        "projection.rs",
+        "format.rs",
+        "view.rs",
+        "plots.rs",
+        "device_selection.rs",
+        "search.rs",
+        "ui.rs",
+        "window.rs",
+        "ranking.rs",
+        "control.rs",
     ]
     .into_iter()
     .collect::<BTreeSet<_>>();
@@ -38,7 +48,20 @@ fn source_inventory_and_parser_boundary_are_closed() {
             .unwrap()
             .contains("#![forbid(unsafe_code)]"));
     }
-    for name in ["parsers.rs", "hierarchy.rs", "contributors.rs"] {
+    for name in [
+        "parsers.rs",
+        "hierarchy.rs",
+        "contributors.rs",
+        "projection.rs",
+        "format.rs",
+        "view.rs",
+        "plots.rs",
+        "device_selection.rs",
+        "search.rs",
+        "ui.rs",
+        "ranking.rs",
+        "control.rs",
+    ] {
         let source = std::fs::read_to_string(root.join("src").join(name)).unwrap();
         for denied in [
             "std::fs",
@@ -51,6 +74,10 @@ fn source_inventory_and_parser_boundary_are_closed() {
             "#[path",
             "include!(",
             "include_str!(",
+            "td_ui::wayland",
+            "td_ui::client",
+            "td_ui::control_socket",
+            "td_ui::control_worker",
         ] {
             assert!(!source.contains(denied), "{name}: {denied}");
         }

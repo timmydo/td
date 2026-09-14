@@ -108,6 +108,7 @@ impl Batch {
     }
     pub(crate) fn finish(self, processes: Snapshot) -> Sample {
         Sample {
+            previous: None,
             processes,
             cpu: self.cpu,
             memory: self.memory,
@@ -217,6 +218,9 @@ impl Collector {
             name,
             _charge: charge,
         })
+    }
+    pub(crate) fn origin(&self) -> Instant {
+        self.origin
     }
     pub fn elapsed_ns(&self) -> io::Result<u64> {
         u64::try_from(self.origin.elapsed().as_nanos()).map_err(io::Error::other)
@@ -414,6 +418,7 @@ impl Collector {
 
 #[derive(Debug)]
 pub struct Sample {
+    pub(crate) previous: Option<crate::history::SampleId>,
     pub processes: Snapshot,
     pub cpu: Option<CpuUsage>,
     pub memory: Option<Memory>,

@@ -5074,11 +5074,11 @@ mod tests {
         // authd, jail and seatd name the compositor runtime directory in
         // fixed argv, resolution tests and seat assignment.
         // The conservative textual edge widens checks even without a read.
-        // td-setup and td-photo declare native-compositor-tests, a tool edge
-        // (not a source read) that the native runner discovers the same way.
+        // UI consumers including taskmgr declare native-compositor-tests,
+        // a tool edge (not a source read) discovered by the native runner.
         assert_eq!(
             readers_of("td-compositor"),
-            ["td-authd", "td-editor", "td-jail", "td-photo", "td-portal", "td-seatd", "td-secret", "td-setup", "td-ui", "td-vm", "td-vm-guest"]
+            ["td-authd", "td-editor", "td-jail", "td-photo", "td-portal", "td-seatd", "td-secret", "td-setup", "td-taskmgr", "td-ui", "td-vm", "td-vm-guest"]
         );
         assert_eq!(readers_of("td-authd"), ["td-compositor", "td-secret"]);
         // td-login is here for a test's argument string `/bin/td-busd/`, no
@@ -5131,6 +5131,7 @@ mod tests {
                 "td-seatd",
                 "td-secret",
                 "td-setup",
+                "td-taskmgr",
                 "td-ui",
                 "td-vm",
                 "td-vm-guest"
@@ -7211,13 +7212,14 @@ mod tests {
                 "td-seatd",
                 "td-secret",
                 "td-setup",
+                "td-taskmgr",
                 "td-ui",
                 "td-vm",
                 "td-vm-guest"
             ]
         );
         // td-photo's native case makes its commands three, as td-setup's are.
-        assert_eq!(comp.len(), 32, "{comp:?}");
+        assert_eq!(comp.len(), 35, "{comp:?}");
         // Runtime td-vm/ spellings conservatively connect the same reader set.
         assert_eq!(vm, comp);
         assert_eq!(
@@ -7236,6 +7238,7 @@ mod tests {
                 "td-seatd",
                 "td-secret",
                 "td-setup",
+                "td-taskmgr",
                 "td-ui",
                 "td-vm",
                 "td-vm-guest"
@@ -7369,21 +7372,13 @@ mod tests {
         paths.push("builder/src/affected.rs".to_string());
         assert_eq!(cargo_test_cmds(&root, &paths).unwrap(), gate_cmds());
         assert!(compute_selection(&root, &paths).targets.contains(&"check".to_string()));
-        // The toolkit routes to its consumers and nothing else: td-editor,
-        // td-setup, (as of 7c) td-portal and td-photo each name td-ui by
-        // path, so the reader graph puts the four consumers beside the
-        // toolkit and the workspace suite. Nothing reads any of the four,
-        // so each adds only itself.
+        // The toolkit brings its five leaf consumers and their native fixtures.
         for path in ["td-ui/src/keyboard.rs", "td-ui/Cargo.toml", "td-ui/tests/xkb.rs"] {
             let toolkit = [path.to_string()];
             assert!(compute_selection(&root, &toolkit).targets.is_empty(), "{path}");
             let commands = cargo_test_cmds(&root, &toolkit).unwrap();
-            // td-editor, td-setup, td-portal and td-photo all name td-ui by
-            // path, so a change to the toolkit carries the four consumers'
-            // commands beside the workspace suite, and each of the four adds
-            // a native compositor command beside its test and clippy: 2
-            // workspace + 2 td-ui + 3 + 3 + 3 + 3 = 16.
-            assert_eq!(commands.len(), 16, "{path}: {commands:?}");
+            // Two workspace checks, two toolkit checks, and three per consumer.
+            assert_eq!(commands.len(), 19, "{path}: {commands:?}");
             assert!(commands.iter().all(|c| {
                 c.contains("--workspace")
                     || c.contains("--manifest-path td-ui/Cargo.toml")
@@ -7391,6 +7386,7 @@ mod tests {
                     || c.contains("--manifest-path td-setup/Cargo.toml")
                     || c.contains("--manifest-path td-portal/Cargo.toml")
                     || c.contains("--manifest-path td-photo/Cargo.toml")
+                    || c.contains("--manifest-path td-taskmgr/Cargo.toml")
             }));
             assert!(commands.iter().any(|c| c.contains("--manifest-path td-editor/Cargo.toml")));
             assert!(commands.iter().any(|c| c.contains("--manifest-path td-setup/Cargo.toml")));

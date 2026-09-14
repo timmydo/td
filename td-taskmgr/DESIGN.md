@@ -7,8 +7,8 @@ to the processes observed at that time. Process actions send signals under
 the caller's existing authority.
 
 This is the version-1 target contract, not a claim that all features ship.
-The standalone collection/model crate and read-only `--sample` command are
-implemented; the graphical window, process controls and td image integration
+The standalone collection/model crate, read-only `--sample` command and
+Wayland window are implemented. Process controls and td image integration
 remain subsequent increments. Root AGENTS.md and DEVELOPMENT.md govern
 implementation and landing; [td-ui](../td-ui/DESIGN.md) owns the
 shared widget contracts. Each increment below must update its status and
@@ -117,6 +117,8 @@ series reveals and selects its process row, expanding recorded ancestors.
 Search cannot hide a graph-selected row: reveal it and its ancestors as an
 explicit selection exception without discarding the query. Clicking a time
 outside a particular series opens a ranked contributor list for that time.
+Selecting a named system series inspects that metric without replacing the
+graphs; clearing the series (Space) opens contributors on CPU/Memory.
 The list uses the same metric and sample as the graph and can reveal any
 retained process, including one now exited. Network and Disk clicks inspect
 device/interface values at that time and never invent a process selection.
@@ -176,8 +178,9 @@ until their last snapshot is evicted. Record monotonic collection start/end
 and actual elapsed time;
 wall-clock labels do not determine rates. A scan is an observation interval,
 not an atomic kernel snapshot. Counter regression, reset, a new identity,
-missing predecessor, zero elapsed time, or changed device membership starts
-a fresh baseline and a gap. Do not interpolate across gaps or catch up with
+missing predecessor or zero elapsed time starts a fresh baseline and a gap.
+Changing the explicit device selection recomputes the plotted history with
+that membership; missing selected members remain gaps. Do not interpolate across gaps or catch up with
 a burst of scans after a stall. Stale readings display their age.
 
 ### CPU
@@ -285,8 +288,10 @@ that retained directory, and hold it through confirmation and delivery.
 Linux permits that descriptor as the target of pidfd_send_signal. Never
 reopen a numeric PID at delivery time or fall back to kill(PID). A retained
 directory cannot retarget a reused PID, even though it does not prevent PID
-reuse. See [pidfd_send_signal(2)](https://man7.org/linux/man-pages/man2/pidfd_send_signal.2.html)
-and the [procfs descriptor contract](https://docs.kernel.org/filesystems/proc.html).
+reuse. See
+[pidfd_send_signal(2)](https://man7.org/linux/man-pages/man2/pidfd_send_signal.2.html)
+and the [procfs descriptor
+contract](https://docs.kernel.org/filesystems/proc.html).
 
 Preparing an action is a fresh observation: compare its display key with
 the selected live row, refuse a mismatch, and show the descriptor-bound
@@ -379,9 +384,10 @@ enumeration, sorting and aggregation must remain bounded under churn.
 The dependency-free crate currently offers `--sample [COUNT]` with
 `--interval 0.5|1|2|5`. The default count is two, the maximum is 240, and
 unavailable first-interval rates are printed explicitly. The command is a
-read-only backend probe. It does not open a window, send signals or claim
-td image integration. The graphical increment adds the td-ui dependency,
-compiled font and Wayland entry point.
+read-only backend probe. It does not open a window, send signals or claim td
+image integration. The default invocation opens the Wayland window using
+td-ui and its compiled font. The executable remains read-only until the
+controls increment.
 
 `parsers` takes bounded bytes and explicit units. `linux_read` owns one
 charged reusable source buffer, descriptor-relative process-file reads and
@@ -426,19 +432,101 @@ Overwritten/missed observations are counted. Interval changes wake its
 bounded wait; it schedules a fresh interval after an overrun rather than a
 catch-up burst. Closing requests cancellation and drops the thread handle
 without waiting on a stalled filesystem read. No replacement worker is
-started. The graphical increment consumes this handoff on td-ui ticks.
+started. The window consumes this handoff on td-ui ticks, with the
+collector's own monotonic origin for sample-age calculations.
 
 `contributors` chooses at most eight names by peak across the caller's
-visible samples, retains a selected observed process, breaks ties by key
-and keeps series order by key. Retained named keys keep their palette slots;
-new names take free slots. Missing observations and unknown/overflowing
-Other observed totals stay gaps. Device selection, selected-device sums,
-search/sibling ordering and the visible tree projection join the graphical
-increment; process controls remain disabled until their own landing.
+visible samples, retains a selected observed process, breaks ties by key and
+keeps series order by key. Retained named keys keep their palette slots; new
+names take free slots. Missing observations and unknown/overflowing Other
+observed totals stay gaps. The window implements device selection, checked
+selected-device sums, search/sibling ordering and the visible tree
+projection. Process controls remain disabled until their own landing.
 
 The affected-check mapping currently runs the discovered standalone crate
 and workspace lock/test/Clippy preflight. No recipe embeds this crate yet.
 Image packaging must add target-recipe/runtime coverage in the same landing.
+
+## Implemented window
+
+`projection` constructs the sibling-sorted visible parent/child rows with
+search ancestors and selected-row exceptions. Explicit labels identify both
+kinds of context without changing the query. `view` adapts those rows to
+td-ui's tree table, charging its storage and reusable visible cell cache to
+the model budget before painting. A failed working-set allocation pauses
+history admission and retries on ticks, reclaiming at most one older
+unpinned sample per tick while preserving the newest observation and the
+inspection. Painting reuses reserved cells and cannot grow model storage.
+The toolkit permits 32,769 visible rows so the 32,768-process ceiling also
+fits a synthetic Parent unavailable root. Column widths preserve the
+CPU-per-core and shared-RSS basis labels.
+
+`plots` borrows the rolling history into charged visible chart caches.
+Missed handoffs insert an explicit gap between real observations rather
+than drawing a line across the missed interval. Each observation retains its
+original predecessor ID, so eviction holes also break the line without
+inferring gaps from the current sampling cadence.
+`ranking` exposes every retained contributor at an inspected time and
+reveals the selected row through the same projection. Its visible formatting
+cache is reserved before painting, sharing the view-recovery policy.
+`device_selection` retains explicit interface/block membership, including an empty selection;
+checked sums become unavailable on overflow or missing members. Device
+cards show cumulative counters, interface scope and block IOPS/busy detail.
+Busy time is labelled independently of saturation. The list is keyboard
+reachable even when a narrow pane displays only one card at a time.
+
+`ui` owns focus, search, split ratio, graph navigation and captures. Its
+single dispatcher serves physical input, preview composition and optional
+local driving. Synthetic-root selection survives refresh and disclosure.
+Pointer-leave gesture cancellation preserves keyboard focus; real keyboard
+focus loss removes highlights and focus return restores the active control.
+Divider movement updates geometry immediately and coalesces chart-data
+rebuilding on ticks; unheld hover movement does not rebuild chart adapters.
+Admission pauses during pointer capture; canceled releases outside the
+original pane cannot activate a later row or graph. A failed view refresh
+releases old plot caches before constructing replacements. If replacement
+still fails, it releases the old projection and retries once before painting;
+continuing pressure enters the bounded tick-recovery path. An unavailable
+view never presents old data as the newly selected sample. The status reports age, partial coverage, actual history duration,
+absent selections and inspections older than the plot. Process actions
+currently report unavailable; F10/context menus and command detail arrive
+with descriptor-bound controls.
+
+`window` owns the Wayland transport, compiled font, collection worker and
+optional control transport. It polls the latest collection handoff at most
+once per 50 ms dispatch interval, independently of presentation callbacks;
+one dirty flag coalesces paints and td-ui enforces buffer/frame bounds.
+Failure to start collection leaves a usable diagnostic window. Closing
+drops the worker without joining a stalled read. The optional local endpoint
+is enabled only by `--control-socket ABSOLUTE-PATH`, using td-ui's existing
+private-socket, bounded-worker and driven protocol contracts. It exposes
+state, shared key/pointer/wheel input, composition and four semantic actions
+(live, interval, search, quit); no process-signal action exists yet. Remote
+resize/tick injection is refused. Transport failure disables the optional
+endpoint; a remote quit allows a bounded reply-drain interval. Transport and
+surface buffers retain td-ui's separate ceilings.
+
+`--preview [WIDTHxHEIGHT]` emits a PPM from two actual observations.
+`--help` and `--font-license` require no display. Ctrl+L returns to Live,
+Ctrl+I cycles cadence and Ctrl+Q closes; graph Page Up/Down scrolls cards,
+Ctrl+Tab selects another visible graph and arrows inspect times/series.
+Network/Disk add a device-list stop to the Tab focus cycle; Space toggles
+membership. Escape closes the ranked contributors before changing focus.
+
+The native fixture uses the repository trusted-root test wrapper so the
+private endpoint keeps its ordinary ancestor-ownership checks inside the
+check host. The native process fixture uses an explicitly built
+td-compositor, validates input receipts and correlates capture with client/commit/output counters. It
+drives a graph through ranked contributors into the persistent tree, proves
+search and tab retention, and checks continuing collection on another
+workspace. td-compositor currently completes hidden-client callbacks, so
+that case bounds updates rather than assuming callbacks stop. The separately
+opt-in Weston fixture requires `TD_TEST_WESTON`, scopes protocol evidence to
+the client that set our app ID, and checks configure, repeated attachments,
+frame callbacks, buffer releases, navigation, continuing observations and
+clean remote quit. The host smoke passed with Guix Weston 10.0.2 on x86-64
+Linux 7.0.14. These are host compatibility observations, not td target-image
+evidence.
 
 ## Validation and delivery
 
@@ -483,8 +571,9 @@ Independently landable increments:
    (implemented). The read-only `--sample` command exercises this backend;
    it is not the graphical version-1 deliverable.
 5. Live Wayland window with all five tabs, process tree and linked CPU/RSS
-   history; native compositor and Guix/host smoke evidence. Read-only until
-   the following increment, explicitly identified as incomplete version 1.
+   history (implemented); native compositor and Guix/Weston smoke evidence.
+   Read-only until the following increment, explicitly identified as
+   incomplete version 1.
 6. Descriptor-bound process and subtree controls, reviewed unsafe surface,
    kernel tests and real menu interaction, completing the standalone v1.
 7. td recipe and image/launcher integration with declared sibling trees,

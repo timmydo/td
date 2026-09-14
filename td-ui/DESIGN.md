@@ -1294,8 +1294,9 @@ have ordinary opaque IDs; the widget gives them no process authority.
 The model owns only row metadata, a sorted ID/index lookup and column
 headings. It reserves fallibly, sorts without allocation and exports
 capacity-based `storage_bytes()` including titles and inline model state,
-not allocator bookkeeping. Limits are 32768 visible rows, depth 256,
-16 columns, 128-byte nonempty control-free headings and 16 MiB of model
+not allocator bookkeeping. Limits are 32769 visible rows, accommodating
+32768 processes plus a synthetic root, depth 256, 16 columns, 128-byte
+nonempty control-free headings and 16 MiB of model
 storage. Columns provide logical minimum/preferred widths, at most 8192;
 minima hold their complete headings, insets, sort mark and border. The first minimum is at
 least 32 pixels; consumers can widen it to reveal deeper indentation.

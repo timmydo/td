@@ -659,3 +659,20 @@ fn numeric_cells_align_right_and_track_press_captures_scroll() {
     assert_eq!(c.event(Event::Release { x, y }), Outcome::Consumed);
     assert!(!c.captured());
 }
+
+#[test]
+fn roster_ceiling_leaves_room_for_one_synthetic_root() {
+    let mut rows = (0..32769).map(row).collect::<Vec<_>>();
+    assert_eq!(model(&rows).rows().len(), 32769);
+    rows.push(row(32769));
+    assert!(Model::new(
+        &rows,
+        &[Column {
+            title: "Name",
+            minimum: 64,
+            preferred: 100,
+            numeric: false
+        }]
+    )
+    .is_err());
+}

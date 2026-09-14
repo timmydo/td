@@ -1,4 +1,5 @@
 #![forbid(unsafe_code)]
+mod window;
 use std::io::{self, Write};
 use std::process::ExitCode;
 use std::sync::atomic::AtomicBool;
@@ -16,16 +17,54 @@ fn unavailable(value: Option<u64>) -> String {
 fn run() -> io::Result<()> {
     let mut args = std::env::args().skip(1);
     let command = args.next();
+    if command.is_none() {
+        return window::open(None);
+    }
+    if command.as_deref() == Some("--control-socket") {
+        let path = args
+            .next()
+            .ok_or_else(|| io::Error::other("--control-socket requires an absolute path"))?;
+        if args.next().is_some() {
+            return Err(io::Error::other("unexpected argument"));
+        }
+        return window::open(Some(std::path::PathBuf::from(path)));
+    }
+    if command.as_deref() == Some("--font-license") {
+        if args.next().is_some() {
+            return Err(io::Error::other("unexpected argument"));
+        }
+        return writeln!(
+            io::stdout().lock(),
+            "{}\n{}\n{}",
+            td_ui::notices::FONT_PROVENANCE,
+            td_ui::notices::FONT_COPYING,
+            td_ui::notices::FONT_LICENSE
+        );
+    }
+    if command.as_deref() == Some("--preview") {
+        let size = args.next().unwrap_or_else(|| "1280x960".into());
+        let (width, height) = size
+            .split_once('x')
+            .and_then(|(w, h)| Some((w.parse::<usize>().ok()?, h.parse::<usize>().ok()?)))
+            .ok_or_else(|| io::Error::other("preview expects WIDTHxHEIGHT"))?;
+        if args.next().is_some() {
+            return Err(io::Error::other("unexpected preview argument"));
+        }
+        return window::preview(width, height);
+    }
     if command
         .as_deref()
         .is_none_or(|arg| matches!(arg, "--help" | "-h"))
     {
-        return writeln!(io::stdout().lock(),"td-taskmgr --sample [COUNT] [--interval 0.5|1|2|5]\n\nPrint bounded read-only resource snapshots. COUNT defaults to 2 (maximum 240).\nThe graphical task manager and process controls are not available yet.");
+        if args.next().is_some() {
+            return Err(io::Error::other("unexpected argument"));
+        }
+        return writeln!(io::stdout().lock(), "td-taskmgr [--control-socket ABSOLUTE-PATH]\n  Open the Wayland task manager. Controls are read-only in this increment.\n\ntd-taskmgr --sample [COUNT] [--interval 0.5|1|2|5]\n  Print bounded resource snapshots; COUNT defaults to 2, maximum 240.\ntd-taskmgr --preview [WIDTHxHEIGHT]\n  Write a PPM preview of live observations (default 1280x960).\ntd-taskmgr --font-license\n  Print embedded font notices.\n\nTab/Shift+Tab: focus controls. Arrows: navigate. Ctrl+F: search.\nCtrl+L: return to Live. Ctrl+I: interval. Ctrl+Q: quit.\nGraphs: arrows inspect; Ctrl+Tab changes plot; Page Up/Down scroll.\nDevice list: Space toggles a member. Tree: Left/Right collapse/expand.\nThe optional local socket uses the td-ui driven protocol.");
     }
     if command.as_deref() != Some("--sample") {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "expected --sample or --help",
+            "unknown argument; use --help",
         ));
     }
     let mut count = 2;

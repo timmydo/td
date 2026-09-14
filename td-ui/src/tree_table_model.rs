@@ -1,6 +1,6 @@
 //! Stable visible hierarchy and column inputs for the shared tree table.
 use crate::CELL_WIDTH;
-pub const ROWS: usize = 32_768;
+pub const ROWS: usize = 32_769;
 pub const DEPTH: usize = 256;
 pub const COLUMNS: usize = 16;
 pub const LABEL_BYTES: usize = 128;
