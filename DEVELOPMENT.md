@@ -93,7 +93,7 @@ dir.
 
 A recipe built from the checkout's own trees (a `local_source`, with any
 sibling `local_source_trees`) is pinned by the seed digest table the
-evaluator compiles in, so an edit to one of those trees moves its row and
+evaluator compiles in, so an edit to a staged input moves its row and
 the provenance gate refuses the build, naming the row, until the table is
 regenerated:
 
@@ -101,9 +101,18 @@ regenerated:
 td-recipe-eval seed-digests > seed/seed-digests.txt
 ```
 
-Regenerate after the last edit to the trees and commit the table with the
-change. Today `td-net` is built this way, from `net/`, `engine/` and
-`td-boot/`, and `td-mail` and `td-news` from their own trees.
+Regenerate after the last edit to the staged inputs and commit the table
+with the change. The recipe catalog declares the local-source roster,
+including each recipe's sibling trees.
+
+Local-source staging excludes entries named `target`, `.git`, or
+`DESIGN.md` at every depth, including sibling trees. Those entries are
+absent from the staged build input, its content address, and the
+recipe-check memo fingerprint. Design documents must not be consumed by
+these builds. Other files, including README documents and licenses,
+remain pinned inputs. Editing `DESIGN.md` alone selects no checks; the
+profiler design is the exception and retains its runtime-contract
+checks.
 
 When every changed path lies under `td-*` crates, `ready` also scopes the
 recipe-checks gate: the crates and their readers travel to the gate in

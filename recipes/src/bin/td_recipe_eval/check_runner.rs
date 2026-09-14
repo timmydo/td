@@ -1485,8 +1485,9 @@ fn hash_repo_inputs(
 }
 
 /// Hash a local-source tree into `h` exactly the way `copy_source_tree` interns it
-/// — skip `target`/`.git`, sorted entries, symlink targets verbatim, file contents
-/// plus the executable bit (`mode & 0o100`, the only mode bit the NAR records) — so
+/// — skip build/VCS artifacts and design documents, sort entries, hash symlink
+/// targets verbatim and file contents plus the executable bit (`mode & 0o100`,
+/// the only mode bit the NAR records) — so
 /// the build-run memo fingerprint co-varies with the store content address without
 /// recomputing the NAR. Fails closed on any I/O error or an unrepresentable node.
 fn hash_source_tree(dir: &Path, h: &mut crate::sha256::Sha256) -> Result<(), String> {
@@ -1512,7 +1513,7 @@ fn hash_source_tree(dir: &Path, h: &mut crate::sha256::Sha256) -> Result<(), Str
             let Some(name) = child.file_name().map(|n| n.to_owned()) else {
                 continue;
             };
-            if matches!(name.to_str(), Some("target") | Some(".git")) {
+            if excluded_local_source_entry(&name) {
                 continue;
             }
             let nb = name.as_bytes();
@@ -1925,7 +1926,7 @@ fn resolve_local_source_dir_at(root: &Path, rel: &str) -> Result<PathBuf, String
     Ok(canon_dir)
 }
 
-/// Copy a validated `local_source` tree (minus `target`/`.git`) to `dest`. The
+/// Copy a validated `local_source` tree with staging exclusions to `dest`. The
 /// staged tree is what BOTH the content-address computation and the intern read,
 /// so the address that is gated and the bytes that are interned cannot diverge.
 ///
@@ -5581,17 +5582,20 @@ fn copy_tree(src: &Path, dst: &Path) -> io::Result<()> {
     Ok(())
 }
 
-/// Copy a source tree, skipping build/VCS artifacts (`target`, `.git`) at every
-/// level so the interned bytes are the committed source only — a content address
-/// that does not depend on a prior host `cargo build` or the local git dir.
-// Recursively copy a source tree (skipping `target`/`.git`), preserving symlinks,
-// executable bits, and a deterministic (sorted) directory order for a stable
-// content address. This interns the WORKING tree, not a git snapshot: any other
-// untracked or locally-modified file under the dir folds into the address and, if
-// it does not match the compiled seed-digest pin, reds the gate. That is
-// fail-closed (a dirty checkout can never silently swap the interned source), so
-// the pin builds from a clean tree; git-tracked filtering would need a git
-// subprocess, which the zero-shell recipe runner deliberately avoids.
+/// Keep staging and memo hashing on the same input boundary. Excluded entries
+/// never reach the build: ignoring only their hashes would admit unpinned data.
+fn excluded_local_source_entry(name: &std::ffi::OsStr) -> bool {
+    matches!(
+        name.to_str(),
+        Some("target") | Some(".git") | Some("DESIGN.md")
+    )
+}
+
+/// Copy the working source tree, excluding build/VCS artifacts and `DESIGN.md`
+/// at every depth. Preserve symlinks and executable bits in sorted entry order.
+/// Other untracked or modified files enter the content address and must match
+/// the compiled seed pin. A git-tracked-file filter would require a git
+/// subprocess, which the dependency-free recipe runner avoids.
 fn copy_source_tree(src: &Path, dst: &Path) -> io::Result<()> {
     let meta = fs::symlink_metadata(src)?;
     let ftype = meta.file_type();
@@ -5615,7 +5619,7 @@ fn copy_source_tree(src: &Path, dst: &Path) -> io::Result<()> {
             let Some(name) = child.file_name() else {
                 continue;
             };
-            if matches!(name.to_str(), Some("target") | Some(".git")) {
+            if excluded_local_source_entry(name) {
                 continue;
             }
             copy_source_tree(&child, &dst.join(name))?;
@@ -7199,8 +7203,111 @@ chmod 755 '{}'
         let _ = fs::remove_dir_all(&lw);
     }
 
+    #[test]
+    fn design_documents_do_not_enter_local_sources_or_fingerprints() {
+        let tmp = env::temp_dir().join(format!("td-design-source-{}", process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        let root = tmp.join("root");
+        for dir in ["app/src", "sibling/src"] {
+            fs::create_dir_all(root.join(dir)).unwrap();
+        }
+        fs::write(root.join("app/Cargo.toml"), b"[package]\nname = \"app\"\n").unwrap();
+        fs::write(root.join("app/Cargo.lock"), b"version = 4\n").unwrap();
+        fs::write(root.join("app/src/main.rs"), b"fn main() {}\n").unwrap();
+        fs::write(root.join("app/README.md"), b"included documentation").unwrap();
+        fs::write(root.join("sibling/LICENSE"), b"included license").unwrap();
+        let fingerprint = || {
+            let mut h = crate::sha256::Sha256::new();
+            for dir in ["app", "sibling"] {
+                hash_source_tree(&root.join(dir), &mut h).unwrap();
+            }
+            h.finalize()
+        };
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        let tb = repo.join("target/release/td-builder");
+        assert!(
+            is_executable(&tb),
+            "build the required td-builder runner first"
+        );
+        let staged_address = |siblings: &[String]| {
+            let dest = tmp.join("staged");
+            stage_local_source_at(&root, "test-source", "app", siblings, &dest).unwrap();
+            store_path_recursive_with(&tb, &root, "test-source", &dest).unwrap()
+        };
+        let siblings = vec!["sibling".to_string()];
+        let alone_address = staged_address(&[]);
+        let sibling_address = staged_address(&siblings);
+        let base = fingerprint();
+        let designs = ["app/DESIGN.md", "app/src/DESIGN.md", "sibling/DESIGN.md"];
+        for text in ["initial design", "revised design"] {
+            for path in designs {
+                fs::write(root.join(path), text).unwrap();
+            }
+            assert_eq!(
+                base,
+                fingerprint(),
+                "design edits must not invalidate memos"
+            );
+            assert_eq!(alone_address, staged_address(&[]));
+            assert_eq!(sibling_address, staged_address(&siblings));
+            for roster in [vec![], siblings.clone()] {
+                let dest = tmp.join("staged");
+                stage_local_source_at(&root, "test-source", "app", &roster, &dest).unwrap();
+                let app = if roster.is_empty() {
+                    dest.clone()
+                } else {
+                    dest.join("app")
+                };
+                assert!(fs::symlink_metadata(app.join("DESIGN.md")).is_err());
+                assert!(fs::symlink_metadata(app.join("src/DESIGN.md")).is_err());
+                assert_eq!(
+                    fs::read(app.join("src/main.rs")).unwrap(),
+                    b"fn main() {}\n"
+                );
+                assert_eq!(
+                    fs::read(app.join("README.md")).unwrap(),
+                    b"included documentation"
+                );
+                if !roster.is_empty() {
+                    assert!(fs::symlink_metadata(dest.join("sibling/DESIGN.md")).is_err());
+                    assert_eq!(
+                        fs::read(dest.join("sibling/LICENSE")).unwrap(),
+                        b"included license"
+                    );
+                }
+            }
+        }
+        for path in designs {
+            fs::remove_file(root.join(path)).unwrap();
+        }
+        assert_eq!(base, fingerprint());
+        assert_eq!(alone_address, staged_address(&[]));
+        assert_eq!(sibling_address, staged_address(&siblings));
+        symlink("missing", root.join("app/DESIGN.md")).unwrap();
+        assert_eq!(
+            base,
+            fingerprint(),
+            "excluded symlinks must not enter the memo"
+        );
+        let dest = tmp.join("staged");
+        stage_local_source_at(&root, "test-source", "app", &[], &dest).unwrap();
+        assert!(fs::symlink_metadata(dest.join("DESIGN.md")).is_err());
+        for path in ["app/src/main.rs", "app/README.md", "sibling/LICENSE"] {
+            let before = fingerprint();
+            let address_before = staged_address(&siblings);
+            fs::write(root.join(path), b"changed build input").unwrap();
+            assert_ne!(before, fingerprint(), "{path} must still invalidate memos");
+            assert_ne!(
+                address_before,
+                staged_address(&siblings),
+                "{path} must still move the source pin"
+            );
+        }
+        fs::remove_dir_all(tmp).unwrap();
+    }
+
     // Sibling trees are staged beside the crate under their basenames, minus
-    // `target` and `.git`, every tree resolved and named before any is copied;
+    // build/VCS artifacts and designs, each tree resolved before any is copied;
     // a duplicate basename, a missing tree, one that escapes the checkout and
     // one that is not repo-relative are refused and leave the previous staging
     // as it was, and without trees the crate itself is the staged directory.

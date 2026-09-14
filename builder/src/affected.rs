@@ -584,11 +584,22 @@ fn map_path(root: &Path, roster: &Result<Vec<GateCrate>, String>, p: &str, sel: 
         return;
     }
 
-    // Every file under a td-portal seed tree moves the `td-portal-source`
+    // Local-source staging omits DESIGN.md at every depth. A design consumed
+    // by tests needs explicit routing, as the profiler contract has below;
+    // such checks are independent of source pins.
+    if Path::new(p)
+        .file_name()
+        .is_some_and(|name| name == "DESIGN.md")
+        && p != "td-profiler/DESIGN.md"
+    {
+        return;
+    }
+
+    // Every staged file under a td-portal seed tree moves the `td-portal-source`
     // digest row. `td-portal` builds from `Recipe::rust` with
     // `local_source_trees(&["td-secret", "td-busd", "td-compositor", "engine",
-    // "td-ui"])`, each staged WHOLE, so a change anywhere in one of those
-    // checkouts — source, spec, tool, doc, or manifest — re-hashes the seed (re
+    // "td-ui"])`, each staged with local-source exclusions, so a change in those
+    // inputs — source, spec, tool, retained doc, or manifest — re-hashes the seed (re
     // #469). The digest preflight is cheap (a tree copy and a NAR hash, no
     // ladder), so this AUGMENTS and does not return: the path still reaches its
     // own crate arm below for cargo-test/check/recipe-checks. `engine/` and
@@ -1093,11 +1104,9 @@ fn map_path(root: &Path, roster: &Result<Vec<GateCrate>, String>, p: &str, sel: 
         return;
     }
 
-    if pattern_matches("*.md|DESIGN.md|CLAUDE.md|.gitignore", p) {
-        // A document under a tree staged into the td-net seed is staged with
-        // it (copy_source_tree skips target/ and .git alone), so it moves the
-        // `td-net-source` digest row like any other file there. net/ never
-        // gets here, its own arm above catching every path beneath it.
+    if pattern_matches("*.md|.gitignore", p) {
+        // Retained prose under a td-net source tree moves its digest row.
+        // net/ never gets here: its own arm above catches its retained paths.
         if p.starts_with("engine/") || p.starts_with("td-boot/") {
             sel.add_preflight("local-source-digests");
             sel.add_note(&format!(
@@ -1105,12 +1114,12 @@ fn map_path(root: &Path, roster: &Result<Vec<GateCrate>, String>, p: &str, sel: 
             ));
             return;
         }
-        // The terminal applications' trees are their own seeds, whole
-        // (APPLICATIONS.md §W.8), so a document in one moves that row too.
+        // Retained prose in a terminal application's source tree moves its
+        // own seed row (APPLICATIONS.md §W.8).
         if let Some(seed) = local_source_crate(p) {
             sel.add_preflight("local-source-digests");
             sel.add_note(&format!(
-                "{p} is a document inside the {seed} tree, which is staged whole as the {seed}-source seed, so it moves that digest row: the digest preflight is the one check."
+                "{p} is a document inside the {seed} tree, which contributes retained inputs to the {seed}-source seed, so it moves that digest row: the digest preflight is the one check."
             ));
             return;
         }
@@ -1152,7 +1161,7 @@ fn map_path(root: &Path, roster: &Result<Vec<GateCrate>, String>, p: &str, sel: 
     ) {
         sel.add_preflight("cargo-test");
         if pattern_matches("td-boot/*|td-boot/src/*|td-boot/Cargo.toml|td-boot/Cargo.lock", p) {
-            // `td-boot/` is staged whole into td-net's seed.
+            // Retained `td-boot/` inputs enter td-net's seed.
             sel.add_preflight("local-source-digests");
         }
         sel.add_target("check");
@@ -2073,10 +2082,10 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     assert_preflight!("engine/src/json.rs", "local-source-digests");
     assert_preflight!("engine/src/gzip.rs", "local-source-digests");
     // A document under engine/ or td-boot/ matches no arm of theirs and
-    // falls to the docs arm; it still moves the row. (net/'s own arm
+    // falls to the docs arm; retained prose still moves the row. (net/'s own arm
     // catches every path beneath it first.)
     assert_preflight!("engine/README.md", "local-source-digests");
-    assert_preflight!("engine/DESIGN.md", "local-source-digests");
+    assert_no_preflight!("engine/DESIGN.md", "local-source-digests");
     assert_preflight!("td-boot/README.md", "local-source-digests");
     assert_target!(
         "engine/tests/fixtures/flathub-firefox-154.commit.hex",
@@ -2369,10 +2378,10 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     assert_target!("td-portal/Cargo.lock", "check");
     assert_target!("td-portal/Cargo.lock", "recipe-checks");
     // td-portal builds from `local_source_trees(&["td-secret", "td-busd",
-    // "td-compositor", "engine", "td-ui"])`, each staged whole, so a change
-    // anywhere in the portal tree or in a sibling seed tree moves the
+    // "td-compositor", "engine", "td-ui"])`. Retained inputs in the portal
+    // tree or in a sibling seed tree move the
     // `td-portal-source` digest row and must reach the digest preflight —
-    // source, manifest, and documentation alike (engine and td-ui already carry
+    // source, manifest, and retained documentation (engine and td-ui already carry
     // their own reader arms above). td-seatd shares the compositor's crate arm
     // but is NOT a portal seed tree, so its edits must NOT select the digest
     // preflight.
@@ -2380,15 +2389,15 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     assert_preflight!("td-portal/Cargo.lock", "local-source-digests");
     assert_preflight!("td-busd/src/wire.rs", "local-source-digests");
     assert_preflight!("td-compositor/src/font.rs", "local-source-digests");
-    assert_preflight!("td-compositor/DESIGN.md", "local-source-digests");
+    assert_no_preflight!("td-compositor/DESIGN.md", "local-source-digests");
     assert_preflight!("td-secret/src/sys.rs", "local-source-digests");
     // td-ui joined the portal seed trees in 7(c): the file chooser depends on
-    // the toolkit by path, so any td-ui/ edit re-hashes the td-portal-source
-    // row and reaches the digest preflight, on top of its own reader arm.
+    // the toolkit by path, so staged td-ui/ edits re-hash the td-portal-source
+    // row and reach the digest preflight, on top of its own reader arm.
     assert_preflight!("td-ui/src/raster.rs", "local-source-digests");
     assert_preflight!("td-ui/src/chrome.rs", "local-source-digests");
     assert_preflight!("td-ui/Cargo.toml", "local-source-digests");
-    assert_preflight!("td-ui/DESIGN.md", "local-source-digests");
+    assert_no_preflight!("td-ui/DESIGN.md", "local-source-digests");
     assert_no_preflight!("td-seatd/src/main.rs", "local-source-digests");
     assert_preflight!("td-audio/src/main.rs", "cargo-test");
     assert_preflight!("td-audio/src/sys.rs", "cargo-test");
@@ -2415,9 +2424,9 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     assert_target!("td-sh/spec/smoke.test.sh", "check");
     assert_target!("td-sh/spec/smoke.test.sh", "recipe-checks");
 
-    // td-mail and td-news: standalone std-only crates staged WHOLE as their
-    // own seeds, so every path in the tree — tests, documents, the manifest —
-    // moves the digest row, and the source paths also take the static-link
+    // td-mail and td-news: standalone std-only crates staged as their own
+    // seeds. Retained paths — tests, documents, the manifest — move the
+    // digest row, and the source paths also take the static-link
     // proof through recipe-checks.
     for crate_dir in ["td-install-qemu-test", "td-mail", "td-news"] {
         assert_target!(&format!("{crate_dir}/src/main.rs"), "check");
@@ -4789,7 +4798,23 @@ mod tests {
     #[test]
     fn ready_defers_every_nonempty_selection_before_execution() {
         let root = repo_root();
-        for path in ["README.md", "td-vm/DESIGN.md", ".gitignore"] {
+        for path in [
+            "README.md",
+            "td-vm/DESIGN.md",
+            ".gitignore",
+            "engine/DESIGN.md",
+            "net/DESIGN.md",
+            "net/src/DESIGN.md",
+            "td-boot/DESIGN.md",
+            "td-ui/DESIGN.md",
+            "td-compositor/DESIGN.md",
+            "td-portal/DESIGN.md",
+            "td-secret/DESIGN.md",
+            "td-busd/DESIGN.md",
+            "td-mail/DESIGN.md",
+            "td-news/DESIGN.md",
+            "td-install-qemu-test/DESIGN.md",
+        ] {
             let args = vec!["--path".into(), path.into(), "--run".into()];
             assert_eq!(
                 run_selected(&root, &args, true),

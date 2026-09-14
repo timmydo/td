@@ -9766,8 +9766,9 @@ under td's deny lints, its shared modules (`json`, `toml`, `html`,
 used) copied byte for byte between the two and held so by a recipe
 test, and each is built by
 `ladder::static_local_source_program`: a direct static rustc over the
-tree interned as its `<crate>-source` seed, so a change anywhere in a
-tree moves that crate's `seed/seed-digests.txt` row and the
+tree interned as its `<crate>-source` seed with the local-source
+exclusions specified in `DEVELOPMENT.md`. A change to a retained input
+moves that crate's `seed/seed-digests.txt` row and the
 `local-source-digests` preflight reds a stale one. The pins, seed rows,
 feed-index rows and `recipes/locks` closures of `tmc` and `tn` are gone;
 the packages, `/bin` entries, units, boot markers and provisioning are
