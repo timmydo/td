@@ -326,6 +326,8 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
         (DiskBus::Virtio, SectorSize::Bytes512),
         (DiskBus::Virtio, SectorSize::Bytes4096),
         (DiskBus::Ahci, SectorSize::Bytes512),
+        (DiskBus::Nvme, SectorSize::Bytes512),
+        (DiskBus::Nvme, SectorSize::Bytes4096),
     ] {
         for (name, attachment, source_device) in [
             ("optical", FirmwareAttachment::Optical, "/dev/sr0"),
@@ -428,7 +430,7 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
                     &scratch.dir,
                     timeout,
                 )?;
-                let expected_device = format!("/dev/{}2", bus.name(count == 2));
+                let expected_device = format!("/dev/{}", partition_name(bus.name(count == 2), 2));
                 validate_fixture_boot(&result, &expected, &uuid, &expected_device, &id)?;
             }
         }
@@ -667,7 +669,7 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
         td_boot_protocol::MANIFEST_UNAUTHENTICATED,
     )?;
     println!(
-        "PASS: native optical/USB virtio 512-byte/4Kn and AHCI 512-byte installation and interrupted-publication refusal/reinstallation; provisioned UUID binding across verified kexec and reordered disks; duplicate identity refusal; undersized/read-only targets and wrong-key/corrupt-payload optical/USB refusals preserve every target byte; two persistent installed boots"
+        "PASS: native optical/USB virtio/NVMe 512-byte/4Kn and AHCI 512-byte installation and interrupted-publication refusal/reinstallation; provisioned UUID binding across verified kexec and reordered disks; duplicate identity refusal; undersized/read-only targets and wrong-key/corrupt-payload optical/USB refusals preserve every target byte; two persistent installed boots"
     );
     Ok(())
 }
@@ -944,7 +946,7 @@ fn inventory_snapshot(
             ));
         }
         for number in 1..=2 {
-            let name = format!("{}{number}", expected.target_name);
+            let name = partition_name(expected.target_name, number);
             let partition = by_name
                 .get(name.as_str())
                 .ok_or_else(|| format!("inventory lacks {name} after formatting"))?;
@@ -1421,7 +1423,7 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
                     "   [qemu-install-system] {name} cold boot {count} elapsed: {:.2}s",
                     result.elapsed.as_secs_f64()
                 );
-                let device = format!("/dev/{}2", bus.name(count == 2));
+                let device = format!("/dev/{}", partition_name(bus.name(count == 2), 2));
                 validate_installed_system(&result, &uuid, &device, &id, count == 1)?;
                 if let Some(first) = &first {
                     require_same_identity(
@@ -1547,9 +1549,9 @@ fn require_installation(
         return Err("guest did not report direct publication after staging checks".into());
     }
     let partition_evidence = format!(
-        "{} {uuid} /dev/{}2",
+        "{} {uuid} /dev/{}",
         protocol::PARTITIONS_MARKER,
-        target.bus.name(false)
+        partition_name(target.bus.name(false), 2)
     );
     if !result
         .console
@@ -2448,6 +2450,85 @@ mod tests {
         require_installation(&result, "uuid", "/dev/sdb", &target).unwrap();
         result.console = result.console.replace("/dev/sda2", "/dev/vda2");
         assert!(require_installation(&result, "uuid", "/dev/sdb", &target).is_err());
+    }
+
+    #[test]
+    fn nvme_attachments_preserve_sector_sizes_and_namespace_partition_names() {
+        for sector in [SectorSize::Bytes512, SectorSize::Bytes4096] {
+            let mut command = Command::new("qemu");
+            DiskBus::Nvme
+                .attach(
+                    &mut command,
+                    "target",
+                    protocol::TARGET_SERIAL,
+                    Some(1),
+                    sector,
+                )
+                .unwrap();
+            let args: Vec<_> = command
+                .get_args()
+                .map(|arg| arg.to_str().unwrap())
+                .collect();
+            assert_eq!(
+                args,
+                [
+                    "-device",
+                    &format!(
+                        "nvme,drive=target,serial={},bootindex=1{}",
+                        protocol::TARGET_SERIAL,
+                        sector.device_suffix()
+                    )
+                ]
+            );
+        }
+        let mut oversized = Command::new("qemu");
+        assert!(DiskBus::Nvme
+            .attach(
+                &mut oversized,
+                "target",
+                &"x".repeat(21),
+                None,
+                SectorSize::Bytes512
+            )
+            .is_err());
+        assert_eq!(oversized.get_args().count(), 0);
+        assert_eq!(partition_name(DiskBus::Nvme.name(false), 2), "nvme0n1p2");
+        assert_eq!(partition_name(DiskBus::Nvme.name(true), 2), "nvme1n1p2");
+        assert_eq!(partition_name(DiskBus::Virtio.name(true), 2), "vdb2");
+        assert_eq!(partition_name(DiskBus::Ahci.name(true), 2), "sdb2");
+        let mut expected = inventory_expectation();
+        expected.target_name = "nvme0n1";
+        let nvme = INVENTORY_FIXTURE
+            .replace("vda1", "nvme0n1p1")
+            .replace("vda2", "nvme0n1p2")
+            .replace("\"vda\"", "\"nvme0n1\"");
+        validate_inventories(&inventory_console(&nvme, Some(&nvme)), &expected, true).unwrap();
+        let invalid = nvme.replace("nvme0n1p2", "nvme0n12");
+        assert!(validate_inventories(
+            &inventory_console(&invalid, Some(&invalid)),
+            &expected,
+            true
+        )
+        .is_err());
+        let target = TargetDisk {
+            path: PathBuf::from("owned-fixture.img"),
+            read_only: false,
+            bus: DiskBus::Nvme,
+            sector_size: SectorSize::Bytes4096,
+        };
+        let planned = target_plan(&target, "marker");
+        let disk = planned.disk.as_ref().unwrap();
+        assert!(matches!(disk.bus, DiskBus::Nvme));
+        assert!(matches!(disk.sector_size, SectorSize::Bytes4096));
+        let mut result = healthy_system();
+        result.console = format!(
+            "{} /dev/sr0\n{} uuid /dev/nvme0n1p2\n{}\n{}\n",
+            protocol::MEDIA_MARKER,
+            protocol::PARTITIONS_MARKER,
+            protocol::DIRECT_MARKER,
+            protocol::INSTALL_MARKER
+        );
+        require_installation(&result, "uuid", "/dev/sr0", &target).unwrap();
     }
 
     fn inventory_document(text: &str) -> Result<td_engine::json::Json, String> {

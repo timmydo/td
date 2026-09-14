@@ -4298,6 +4298,7 @@ impl SectorSize {
 enum DiskBus {
     Virtio,
     Ahci,
+    Nvme,
 }
 
 impl DiskBus {
@@ -4307,6 +4308,8 @@ impl DiskBus {
             (Self::Virtio, true) => "vdb",
             (Self::Ahci, false) => "sda",
             (Self::Ahci, true) => "sdb",
+            (Self::Nvme, false) => "nvme0n1",
+            (Self::Nvme, true) => "nvme1n1",
         }
     }
 
@@ -4314,6 +4317,7 @@ impl DiskBus {
         match self {
             Self::Virtio => "virtio",
             Self::Ahci => "ahci",
+            Self::Nvme => "nvme",
         }
     }
 
@@ -4328,6 +4332,9 @@ impl DiskBus {
         if matches!((self, sector_size), (Self::Ahci, SectorSize::Bytes4096)) {
             return Err("QEMU AHCI installation targets require 512-byte logical sectors".into());
         }
+        if matches!(self, Self::Nvme) && serial.len() > 20 {
+            return Err("NVMe fixture serial exceeds its 20-byte Identify field".into());
+        }
         let mut device = match self {
             Self::Virtio => {
                 let prefix = crate::checks::vm_profile::DISK_DEVICE
@@ -4341,6 +4348,7 @@ impl DiskBus {
                     .arg(format!("ich9-ahci,id={drive}-ahci"));
                 format!("ide-hd,bus={drive}-ahci.0,drive={drive}")
             }
+            Self::Nvme => format!("nvme,drive={drive}"),
         };
         device.push_str(&format!(",serial={serial}"));
         if let Some(index) = boot_index {
@@ -4350,6 +4358,15 @@ impl DiskBus {
         command.arg("-device").arg(device);
         Ok(())
     }
+}
+
+fn partition_name(disk: &str, number: u64) -> String {
+    let separator = if disk.as_bytes().last().is_some_and(u8::is_ascii_digit) {
+        "p"
+    } else {
+        ""
+    };
+    format!("{disk}{separator}{number}")
 }
 
 /// A raw disk attachment; ordinary plans retain virtio and 512-byte geometry.
@@ -4377,7 +4394,7 @@ impl<'a> BootDisk<'a> {
 /// (`kill_on_marker: false`) beat positional bools/strings.
 struct BootPlan<'a> {
     /// A raw disk image, or none for diskless. Ordinary plans use virtio;
-    /// installation fixtures may select AHCI.
+    /// installation fixtures may select AHCI or NVMe.
     /// Probe EROFS images are read-only; system volumes allow @var writes.
     disk: Option<BootDisk<'a>>,
     /// Guest RAM in MiB (qemu `-m`). Diskless/probe and standalone kexec boots use

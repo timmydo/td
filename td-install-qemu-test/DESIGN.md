@@ -7,9 +7,10 @@ in the system or graphical installer profile. It adds no user-facing device
 admission, destructive consent, account configuration or signing identity.
 
 The host oracle exclusively creates each sparse target inside its private
-scratch directory and exposes it as a writable virtio or AHCI disk with the fixture
-serial. The ISO stays read-only. The fixture refuses outside PID 1 and admits
-exactly one whole virtio or SCSI-named AHCI installation target with that serial; it accepts
+scratch directory and exposes it as a writable virtio, AHCI or NVMe disk
+with the fixture serial. The ISO stays read-only. The fixture refuses outside PID 1 and admits
+exactly one whole virtio, SCSI-named AHCI or NVMe namespace target with
+that serial; it accepts
 no command-line destination. This is test identification, not a real installer authorization
 mechanism. Firmware variables are private copies, networking is disabled,
 and the host boot runner owns deadlines and QEMU teardown. Each boot defaults
@@ -213,7 +214,7 @@ not by itself demonstrate a UUID discovery defect. AHCI targets are
 restricted to 512-byte logical sectors before constructing QEMU arguments;
 QEMU ide-hd does not support the virtio 4Kn case.
 The same ISO bytes serve all target buses.
-The complete small oracle has forty boots, all with fresh private firmware
+The complete small oracle has fifty-six boots, all with fresh private firmware
 variables. Interruption and refusal cases retain virtio/512-byte geometry;
 the full-system diagnostic installs through both media attachments onto
 virtio and AHCI at 512-byte geometry, then boots each installation twice
@@ -296,7 +297,7 @@ require only the before report and prohibit an after report; a future
 unmountable-media case needs its own earlier failure expectation. The
 existing whole-target byte comparisons still establish write preservation;
 inventory alone does not. These observations cover all live
-legs of the 40-boot matrix and all four full-system ISO installations without
+legs of the 56-boot matrix and all four full-system ISO installations without
 adding boots or changing target admission.
 
 The live fixture also runs `td-install layout-preview` after successful
@@ -316,8 +317,35 @@ capacity and all fields of the two ordered partitions against the private
 attached disk and GPT boundaries. Malformed, truncated, duplicate, deeply
 nested or oversized reports refuse. As with inventory, trailing console
 text outside a complete frame is ignored; internal interleaving refuses.
-These checks run on both media attachments, virtio 512-byte/4Kn targets,
+These checks run on both media attachments, virtio/NVMe 512-byte/4Kn targets,
 AHCI 512-byte targets and the full-system installations without adding
 boots. Partition inventory, actual formatting and detached firmware boots
 retain their independent evidence. The report supplies no device identity,
 destination eligibility, immutable plan or destructive consent.
+
+NVMe adds the positive four-boot sequence at both 512-byte and 4096-byte
+geometry through each media attachment: sixteen additional small-oracle
+boots. Every disk gets its own QEMU nvme controller and one namespace;
+logical and physical geometry follow that namespace into detached boots.
+The reordered disk must move from nvme0n1p2 to nvme1n1p2 while retaining
+its configured volume UUID. Inventory partition naming also inserts the
+required p separator, as does the guest partition-refresh check. Optical
+and USB sources remain sr0 and sda.
+Controller discovery order can fail the strict pathname oracle just as
+SCSI ordering can; accepting an unchanged path would lose that evidence.
+
+The fixture accepts only nvme<digits>n<digits> whole-namespace names,
+reads device/serial and permits trailing ASCII padding on the fixed-width
+Identify Controller serial. Partitions and multipath namespace names do
+not enter its target roster. The production inventory already normalizes
+outer whitespace on descriptions, and production UUID discovery already
+recognizes NVMe disks and partitions. Neither gains a new admission rule.
+The kernel pins BLK_DEV_NVME and NVME_CORE built-in, enables PCI_MSI
+and disables NVME_MULTIPATH, and checks the resolved values before building.
+MSI/MSI-X is the chosen PCI profile, not an NVMe requirement: the driver
+can fall back to INTx. Enabling PCI_MSI also changes interrupt selection
+for other PCI drivers, so the existing virtio/AHCI desktop matrix must
+pass with this kernel. This is direct PCI namespace coverage in QEMU,
+not a physical NVMe, hotplug,
+multipath, RAID or full-system NVMe compatibility claim. The twelve-boot
+full-system matrix continues to use virtio and AHCI destinations.

@@ -54,6 +54,38 @@ fn read_file(file: File, path: &Path, limit: u64) -> Result<Vec<u8>, String> {
     Ok(bytes)
 }
 
+fn target_serial_attribute(name: &str) -> Option<&'static str> {
+    if name.bytes().all(|byte| byte.is_ascii_lowercase()) {
+        if name.starts_with("vd") {
+            return Some("serial");
+        }
+        if name.starts_with("sd") {
+            return Some("device/serial");
+        }
+    }
+    let (controller, namespace) = name.strip_prefix("nvme")?.split_once('n')?;
+    if !controller.is_empty()
+        && !namespace.is_empty()
+        && controller.bytes().all(|byte| byte.is_ascii_digit())
+        && namespace.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        Some("device/serial")
+    } else {
+        None
+    }
+}
+
+fn serial_matches(name: &str, bytes: &[u8]) -> bool {
+    let serial = bytes.strip_suffix(b"\n").unwrap_or(bytes);
+    // NVMe's fixed-width Identify Controller serial is space-padded in sysfs.
+    let serial = if name.starts_with("nvme") {
+        serial.trim_ascii_end()
+    } else {
+        serial
+    };
+    serial == TARGET_SERIAL.as_bytes()
+}
+
 fn scan_target() -> Result<Option<String>, String> {
     let mut matched = None;
     for entry in
@@ -62,17 +94,11 @@ fn scan_target() -> Result<Option<String>, String> {
         let entry = entry.map_err(|error| format!("read block device entry: {error}"))?;
         let name = entry.file_name();
         let name = name.to_str().ok_or("non-UTF-8 block device name")?;
-        // The oracle attaches virtio or AHCI targets; exclude partitions and paths.
-        if !(name.starts_with("vd") || name.starts_with("sd"))
-            || !name.bytes().all(|byte| byte.is_ascii_lowercase())
-        {
+        // Match only whole disks in the oracle's fixed attachment families.
+        let Some(attribute) = target_serial_attribute(name) else {
             continue;
-        }
-        let serial = entry.path().join(if name.starts_with("vd") {
-            "serial"
-        } else {
-            "device/serial"
-        });
+        };
+        let serial = entry.path().join(attribute);
         let serial_file = match File::open(&serial) {
             Ok(file) => file,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
@@ -92,7 +118,7 @@ fn scan_target() -> Result<Option<String>, String> {
             ));
         }
         let serial = bytes;
-        if serial.strip_suffix(b"\n").unwrap_or(&serial) != TARGET_SERIAL.as_bytes() {
+        if !serial_matches(name, &serial) {
             continue;
         }
         if matched.is_some() {
@@ -518,12 +544,23 @@ fn interrupt_publication(partition: &str) -> Result<(), String> {
     )
 }
 
+fn require_volume_partition(device: &str, partition: &str) -> Result<(), String> {
+    // Linux inserts p after digit-ending disk names, including NVMe namespaces.
+    let separator = if device.as_bytes().last().is_some_and(u8::is_ascii_digit) {
+        "p"
+    } else {
+        ""
+    };
+    if partition != format!("{device}{separator}2") {
+        return Err("partition reread resolved an unexpected fixture device".into());
+    }
+    Ok(())
+}
+
 fn refresh_partitions(device: &str, uuid: &str) -> Result<String, String> {
     applet(&["reread-partitions", device])?;
     let (_, partition) = volume(uuid)?;
-    if partition != format!("{device}2") {
-        return Err("partition reread resolved an unexpected fixture device".into());
-    }
+    require_volume_partition(device, &partition)?;
     command("/bin/td-boot", &["mount-root", &partition, "/volume"])?;
     reject_mounted_writers(device)?;
     let refused = Command::new("/bin/td-init")
@@ -767,6 +804,59 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn refreshed_volume_partition_requires_the_expected_disk_and_separator() {
+        for (disk, partition) in [
+            ("/dev/vda", "/dev/vda2"),
+            ("/dev/sda", "/dev/sda2"),
+            ("/dev/nvme0n1", "/dev/nvme0n1p2"),
+            ("/dev/nvme12n34", "/dev/nvme12n34p2"),
+        ] {
+            assert!(require_volume_partition(disk, partition).is_ok());
+        }
+        for partition in ["/dev/nvme0n12", "/dev/nvme0n1p1", "/dev/nvme1n1p2"] {
+            assert!(require_volume_partition("/dev/nvme0n1", partition).is_err());
+        }
+        assert!(require_volume_partition("/dev/vda", "/dev/vdap2").is_err());
+    }
+
+    #[test]
+    fn target_serials_admit_only_whole_supported_disk_names() {
+        for (name, attribute) in [
+            ("vda", "serial"),
+            ("sdaa", "device/serial"),
+            ("nvme0n1", "device/serial"),
+            ("nvme12n34", "device/serial"),
+        ] {
+            assert_eq!(target_serial_attribute(name), Some(attribute));
+            assert!(serial_matches(
+                name,
+                format!("{TARGET_SERIAL}\n").as_bytes()
+            ));
+        }
+        for name in [
+            "vda2",
+            "sda1",
+            "nvme0n1p2",
+            "nvme0c0n1",
+            "nvmen1",
+            "nvme0n",
+            "nvme0n1x",
+            "../nvme0n1",
+            "loop0",
+        ] {
+            assert_eq!(target_serial_attribute(name), None, "{name}");
+        }
+        let padded = format!("{TARGET_SERIAL:<20}\n");
+        assert!(serial_matches("nvme0n1", padded.as_bytes()));
+        assert!(!serial_matches("vda", padded.as_bytes()));
+        assert!(!serial_matches(
+            "nvme0n1",
+            format!(" {TARGET_SERIAL}\n").as_bytes()
+        ));
+        assert!(!serial_matches("nvme0n1", b"another-disk         \n"));
     }
 
     #[test]

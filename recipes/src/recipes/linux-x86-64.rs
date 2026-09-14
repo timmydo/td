@@ -544,6 +544,7 @@ pub fn recipe() -> Recipe {
                   /^#? *CONFIG_BLOCK[ =]/d; \
                   /^#? *CONFIG_BLK_DEV[ =]/d; \
                   /^#? *CONFIG_PCI[ =]/d; \
+                  /^#? *CONFIG_PCI_MSI[ =]/d; \
                   /^#? *CONFIG_VIRTIO[ =]/d; \
                   /^#? *CONFIG_VIRTIO_MENU[ =]/d; \
                   /^#? *CONFIG_VIRTIO_PCI[ =]/d; \
@@ -564,6 +565,9 @@ pub fn recipe() -> Recipe {
                   /^#? *CONFIG_BLK_DEV_SR[ =]/d; \
                   /^#? *CONFIG_ATA[ =]/d; \
                   /^#? *CONFIG_SATA_AHCI[ =]/d; \
+                  /^#? *CONFIG_BLK_DEV_NVME[ =]/d; \
+                  /^#? *CONFIG_NVME_CORE[ =]/d; \
+                  /^#? *CONFIG_NVME_MULTIPATH[ =]/d; \
                   /^#? *CONFIG_USB_STORAGE[ =]/d; \
                   /^#? *CONFIG_ISO9660_FS[ =]/d; \
                   /^#? *CONFIG_NET[ =]/d; \
@@ -677,6 +681,7 @@ pub fn recipe() -> Recipe {
                    'CONFIG_BLOCK=y' \
                    'CONFIG_BLK_DEV=y' \
                    'CONFIG_PCI=y' \
+                   'CONFIG_PCI_MSI=y' \
                    'CONFIG_VIRTIO=y' \
                    'CONFIG_VIRTIO_MENU=y' \
                    'CONFIG_VIRTIO_PCI=y' \
@@ -697,6 +702,9 @@ pub fn recipe() -> Recipe {
                    'CONFIG_BLK_DEV_SR=y' \
                    'CONFIG_ATA=y' \
                    'CONFIG_SATA_AHCI=y' \
+                   'CONFIG_BLK_DEV_NVME=y' \
+                   'CONFIG_NVME_CORE=y' \
+                   '# CONFIG_NVME_MULTIPATH is not set' \
                    'CONFIG_USB_STORAGE=y' \
                    'CONFIG_ISO9660_FS=y' \
                    'CONFIG_NET=y' \
@@ -814,6 +822,7 @@ pub fn recipe() -> Recipe {
                  grep -q '^CONFIG_TMPFS=y' .config || { echo 'TMPFS off - a usable userland needs writable /var,/tmp,/run mounts' >&2; exit 1; }; \
                  grep -q '^CONFIG_BLOCK=y' .config || { echo 'BLOCK off - no block layer for the virtio-blk erofs disk' >&2; exit 1; }; \
                  grep -q '^CONFIG_PCI=y' .config || { echo 'PCI off - virtio-blk-pci (the -M pc transport) needs the PCI bus' >&2; exit 1; }; \
+                 grep -q '^CONFIG_PCI_MSI=y' .config || { echo 'PCI_MSI off - target PCI profile selects MSI/MSI-X support' >&2; exit 1; }; \
                  grep -q '^CONFIG_VIRTIO_PCI=y' .config || { echo 'VIRTIO_PCI off - no virtio transport on the -M pc PCI bus' >&2; exit 1; }; \
                  grep -q '^CONFIG_VIRTIO_CONSOLE=y' .config || { echo 'VIRTIO_CONSOLE off - no td VM bridge' >&2; exit 1; }; \
                  grep -q '^CONFIG_VIRTIO_BLK=y' .config || { echo 'VIRTIO_BLK off - the erofs disk (/dev/vda) would not appear' >&2; exit 1; }; \
@@ -831,6 +840,9 @@ pub fn recipe() -> Recipe {
                  grep -q '^CONFIG_BLK_DEV_SR=y' .config || { echo 'BLK_DEV_SR off - offline optical/USB installation requires built-in media support' >&2; exit 1; }; \
                  grep -q '^CONFIG_ATA=y' .config || { echo 'ATA off - offline optical/USB installation requires built-in media support' >&2; exit 1; }; \
                  grep -q '^CONFIG_SATA_AHCI=y' .config || { echo 'SATA_AHCI off - offline optical/USB installation requires built-in media support' >&2; exit 1; }; \
+                 grep -q '^CONFIG_BLK_DEV_NVME=y' .config || { echo 'BLK_DEV_NVME off - NVMe installation requires its built-in PCI driver' >&2; exit 1; }; \
+                 grep -q '^CONFIG_NVME_CORE=y' .config || { echo 'NVME_CORE off - NVMe installation requires built-in namespace support' >&2; exit 1; }; \
+                 grep -q '^# CONFIG_NVME_MULTIPATH is not set' .config || { echo 'NVME_MULTIPATH on - installation fixture requires direct controller namespaces' >&2; exit 1; }; \
                  grep -q '^CONFIG_USB_STORAGE=y' .config || { echo 'USB_STORAGE off - offline optical/USB installation requires built-in media support' >&2; exit 1; }; \
                  grep -q '^CONFIG_ISO9660_FS=y' .config || { echo 'ISO9660_FS off - offline optical/USB installation requires built-in media support' >&2; exit 1; }; \
                  grep -q '^CONFIG_NET=y' .config || { echo 'NET off — no networking stack for td-netd link-up/DHCP' >&2; exit 1; }; \
@@ -1176,11 +1188,13 @@ mod tests {
             .join("\n");
         for symbol in [
             "SCSI", "BLK_DEV_SD", "BLK_DEV_SR", "ATA", "SATA_AHCI",
-            "USB_STORAGE", "ISO9660_FS",
+            "USB_STORAGE", "ISO9660_FS", "BLK_DEV_NVME", "NVME_CORE", "PCI_MSI",
         ] {
             assert!(text.contains(&format!("'CONFIG_{symbol}=y'")));
             assert!(text.contains(&format!("grep -q '^CONFIG_{symbol}=y' .config")));
         }
+        assert!(text.contains("'# CONFIG_NVME_MULTIPATH is not set'"));
+        assert!(text.contains("grep -q '^# CONFIG_NVME_MULTIPATH is not set' .config"));
     }
 
     #[test]

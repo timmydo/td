@@ -1311,9 +1311,15 @@ detached verified boots on 4Kn media; it is not a physical-device or
 512e performance claim. Refusal and interruption cases remain at 512
 bytes. Eight positive boots exercise AHCI targets at 512-byte geometry
 through both media attachments, including duplicate identity refusal and
-reordered detached boots on that same bus. The small matrix totals 40
-boots. This tests the built-in SATA disk path under QEMU, not physical
-ThinkPad compatibility.
+reordered detached boots on that same bus. The small matrix totals 56
+boots, including sixteen NVMe boots at 512-byte and 4Kn geometry through
+both media attachments. Each NVMe controller has one namespace; the
+second detached boot must move from nvme0n1p2 to nvme1n1p2. The kernel
+pins its PCI NVMe driver and core built-in, enables message-signaled
+interrupts and disables multipath. MSI/MSI-X is selected for the whole PCI
+profile; NVMe can also fall back to INTx. The virtio/AHCI desktop matrix
+therefore validates the kernel change as well. This tests SATA and NVMe paths
+under QEMU, not physical-device or ThinkPad compatibility.
 
 `td-recipe-eval qemu-install-system [system-x86-64]` uses the same live
 fixture to install the built system deployment and its verified selector.

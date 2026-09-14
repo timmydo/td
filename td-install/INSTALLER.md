@@ -209,9 +209,10 @@ require successful exit and a complete document.
 The QEMU installation diagnostics exercise this inventory before source
 verification and after partition refresh. Their host compares it with
 oracle-owned optical/USB images and writable, read-only, undersized and
-4Kn targets, plus SATA/AHCI targets at 512-byte geometry. Partition parents and disk identity continuity are checked on
-successful/recovery installations; refusals must have no post-format
-report and retain the existing whole-disk byte preservation proof. These
+4Kn targets, plus SATA/AHCI targets at 512-byte geometry and direct NVMe
+namespaces at both geometries. Partition parents and disk identity
+continuity are checked on successful/recovery installations; refusals must
+have no post-format report and retain the existing whole-disk byte preservation proof. These
 are observations under a disposable topology, not destination eligibility.
 
 ## Read-only layout preview
@@ -244,7 +245,7 @@ scratch availability, settings validity, exclusive admission or trusted
 destructive consent. Those checks remain required before installation.
 
 The QEMU installation diagnostics also invoke this command on actual
-virtio 512-byte/4Kn and AHCI 512-byte disk geometry. Their host compares
+virtio/NVMe 512-byte/4Kn and AHCI 512-byte disk geometry. Their host compares
 its complete partition report against the attached private disk and GPT
 boundaries, alongside post-format inventory and detached firmware boots.
 The diagnostic queries after successful layout so negative cases still
