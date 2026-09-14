@@ -1247,92 +1247,124 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
     let iso = scratch.dir.join("installer.iso");
     media::write_image_with_payloads(&iso, &kernel, &live, &payloads)?;
     let capacity = system_target_capacity(payload_bytes)?;
-    let mut previous_installation = None;
-    for (name, attachment, source_device) in [
-        ("optical", FirmwareAttachment::Optical, "/dev/sr0"),
-        ("usb", FirmwareAttachment::Usb, "/dev/sda"),
-    ] {
-        let target = TargetDisk::with_capacity(&scratch.dir, &format!("{name}.img"), capacity)?;
-        let vars = scratch.dir.join(format!("{name}-install-vars.fd"));
-        efi::copy_input(&vars_template, &vars)?;
-        println!("   [qemu-install-system] installing {payload_bytes} bytes through {name} media");
-        let result = boot_source(
-            &qemu,
-            BootSource::Firmware {
-                code: &code,
-                vars: &vars,
-                attachment,
-                installation_target: Some(&target),
-            },
-            plan(&iso, true, protocol::INSTALL_MARKER),
-            &scratch.dir,
-            timeout,
-        )?;
-        require_installation(&result, &uuid, source_device, &target)?;
-        require_inventory(
-            &result,
-            &target,
-            source_device,
-            &iso,
-            true,
-            InventoryBefore::Fresh,
-        )?;
-        let mut first = None;
-        for count in 1..=2 {
-            let decoy = if count == 2 {
-                Some(TargetDisk::create(
-                    &scratch.dir,
-                    &format!("{name}-decoy.img"),
-                )?)
+    let mut installations: Vec<(String, BootResult)> = Vec::new();
+    for bus in [DiskBus::Virtio, DiskBus::Ahci] {
+        for (media_name, attachment, source_device) in [
+            ("optical", FirmwareAttachment::Optical, "/dev/sr0"),
+            ("usb", FirmwareAttachment::Usb, "/dev/sda"),
+        ] {
+            let source_device = if matches!(bus, DiskBus::Ahci) && media_name == "usb" {
+                "/dev/sdb"
             } else {
-                None
+                source_device
             };
-            let vars = scratch.dir.join(format!("{name}-boot-{count}-vars.fd"));
+            let name = format!("{media_name}-{}", bus.label());
+            let mut target =
+                TargetDisk::with_capacity(&scratch.dir, &format!("{name}.img"), capacity)?;
+            target.bus = bus;
+            let vars = scratch.dir.join(format!("{name}-install-vars.fd"));
             efi::copy_input(&vars_template, &vars)?;
-            let mut boot_plan = plan(&target.path, false, SYSTEM_BOOT_SUCCESS_MARKER);
-            // Stock audio supervision needs the emulated sound device.
-            boot_plan.audio = true;
-            println!("   [qemu-install-system] cold system boot {count}, {name} media detached");
+            println!(
+                "   [qemu-install-system] installing {payload_bytes} bytes through {name} media"
+            );
             let result = boot_source(
                 &qemu,
                 BootSource::Firmware {
                     code: &code,
                     vars: &vars,
-                    attachment: if count == 2 {
-                        FirmwareAttachment::InstalledFixtureReordered
-                    } else {
-                        FirmwareAttachment::InstalledFixture
-                    },
-                    installation_target: decoy.as_ref(),
+                    attachment,
+                    installation_target: Some(&target),
                 },
-                boot_plan,
+                plan(&iso, true, protocol::INSTALL_MARKER),
                 &scratch.dir,
                 timeout,
             )?;
-            let device = if count == 2 { "/dev/vdb2" } else { "/dev/vda2" };
-            validate_installed_system(&result, &uuid, device, &id, count == 1)?;
-            if let Some(first) = &first {
-                require_same_identity(
-                    first,
-                    &result,
-                    "first installed boot",
-                    "second installed boot",
+            println!(
+                "   [qemu-install-system] {name} installation elapsed: {:.2}s",
+                result.elapsed.as_secs_f64()
+            );
+            require_installation(&result, &uuid, source_device, &target)?;
+            require_inventory(
+                &result,
+                &target,
+                source_device,
+                &iso,
+                true,
+                InventoryBefore::Fresh,
+            )?;
+            let mut first = None;
+            for count in 1..=2 {
+                let decoy = if count == 2 {
+                    let mut decoy = TargetDisk::create(&scratch.dir, &format!("{name}-decoy.img"))?;
+                    decoy.bus = bus;
+                    Some(decoy)
+                } else {
+                    None
+                };
+                let vars = scratch.dir.join(format!("{name}-boot-{count}-vars.fd"));
+                efi::copy_input(&vars_template, &vars)?;
+                let mut boot_plan = target_plan(&target, SYSTEM_BOOT_SUCCESS_MARKER);
+                // Stock audio supervision needs the emulated sound device.
+                boot_plan.audio = true;
+                println!(
+                    "   [qemu-install-system] cold system boot {count}, {name} media detached"
+                );
+                let result = boot_source(
+                    &qemu,
+                    BootSource::Firmware {
+                        code: &code,
+                        vars: &vars,
+                        attachment: if count == 2 {
+                            FirmwareAttachment::InstalledFixtureReordered
+                        } else {
+                            FirmwareAttachment::InstalledFixture
+                        },
+                        installation_target: decoy.as_ref(),
+                    },
+                    boot_plan,
+                    &scratch.dir,
+                    timeout,
                 )?;
-            } else {
-                if let Some(previous) = &previous_installation {
-                    require_distinct_identity(
-                        previous,
+                println!(
+                    "   [qemu-install-system] {name} cold boot {count} elapsed: {:.2}s",
+                    result.elapsed.as_secs_f64()
+                );
+                let device = format!("/dev/{}2", bus.name(count == 2));
+                validate_installed_system(&result, &uuid, &device, &id, count == 1)?;
+                if let Some(first) = &first {
+                    require_same_identity(
+                        first,
                         &result,
-                        "optical installation",
-                        "USB installation",
+                        &format!("{name} first boot"),
+                        &format!("{name} second boot"),
                     )?;
+                } else {
+                    require_new_installation(&installations, &result, &name)?;
+                    first = Some(result);
                 }
-                first = Some(result);
+                if let Some(decoy) = decoy {
+                    fs::remove_file(&decoy.path)
+                        .map_err(|error| format!("remove {}: {error}", decoy.path.display()))?;
+                }
             }
+            fs::remove_file(&target.path)
+                .map_err(|error| format!("remove {}: {error}", target.path.display()))?;
+            let first = first.ok_or("installed system has no first-boot evidence")?;
+            installations.push((name, first));
         }
-        previous_installation = first;
     }
-    println!("PASS: stock system installed offline through optical/USB ISO firmware; immutable root, compositor page flips, acknowledged deployment and stable machine identity across reordered cold boots");
+    println!("PASS: stock system installed offline through optical/USB ISO firmware onto virtio/AHCI disks; immutable root, compositor page flips, acknowledged deployment and stable machine identity across reordered cold boots");
+    Ok(())
+}
+
+fn require_new_installation(
+    previous: &[(String, BootResult)],
+    next: &BootResult,
+    name: &str,
+) -> Result<(), String> {
+    for (previous_name, previous) in previous {
+        require_distinct_identity(previous, next, previous_name, name)?;
+    }
     Ok(())
 }
 
@@ -1716,6 +1748,31 @@ mod tests {
             result.console = result.console.replace(from, to);
             assert!(validate(&result).is_err());
         }
+    }
+
+    #[test]
+    fn new_installation_rejects_collision_with_every_previous_machine() {
+        let mut previous = Vec::new();
+        for (name, key) in [
+            ("optical-virtio", "A"),
+            ("usb-virtio", "B"),
+            ("optical-ahci", "C"),
+        ] {
+            let mut result = healthy_system();
+            result.evidence.host_key = Some(key.into());
+            previous.push((name.into(), result));
+        }
+        let mut next = healthy_system();
+        next.evidence.host_key = Some("D".into());
+        require_new_installation(&previous, &next, "usb-ahci").unwrap();
+        for (name, result) in &previous {
+            next.evidence.host_key = result.evidence.host_key.clone();
+            let error = require_new_installation(&previous, &next, "usb-ahci").unwrap_err();
+            assert!(error.contains(name), "{error}");
+            assert!(error.contains("usb-ahci"), "{error}");
+        }
+        next.evidence.host_key = None;
+        assert!(require_new_installation(&previous, &next, "usb-ahci").is_err());
     }
 
     #[test]

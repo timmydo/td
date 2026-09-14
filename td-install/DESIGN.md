@@ -1298,38 +1298,49 @@ neither case changed target bytes or reached partition refresh/publication.
 Both media attachments run these cases.
 QEMU block-backend write protection is not exclusive device admission.
 
-The successful small installation matrix covers both 512-byte and 4096-byte
-logical sectors. The guest reports the target geometry read from sysfs;
-the host requires it to match the requested QEMU geometry. The installed
-target and duplicate/reordered companions retain that geometry through
-firmware boots. This tests GPT/FAT32 layout and detached verified boots on
-4Kn media; it is not a physical-device or 512e performance claim. Refusal
-and interruption cases remain at 512 bytes. Eight positive boots exercise AHCI targets at
-512-byte geometry through both media attachments, including duplicate
-identity refusal and reordered detached boots on that same bus. The small
-matrix totals 40 boots; full-system installation retains virtio. This tests
-the built-in SATA disk path under QEMU, not physical ThinkPad compatibility.
+The successful small installation matrix covers both 512-byte and
+4096-byte logical sectors. The guest reports the target geometry read
+from sysfs; the host requires it to match the requested QEMU geometry.
+The installed target and duplicate/reordered companions retain that
+geometry through firmware boots. This tests GPT/FAT32 layout and
+detached verified boots on 4Kn media; it is not a physical-device or
+512e performance claim. Refusal and interruption cases remain at 512
+bytes. Eight positive boots exercise AHCI targets at 512-byte geometry
+through both media attachments, including duplicate identity refusal and
+reordered detached boots on that same bus. The small matrix totals 40
+boots. This tests the built-in SATA disk path under QEMU, not physical
+ThinkPad compatibility.
 
 `td-recipe-eval qemu-install-system [system-x86-64]` uses the same live
 fixture to install the built system deployment and its verified selector.
-Both optical and USB legs cold-boot twice with the ISO detached; the second
-boot places a blank disk before the installed disk. Each boot must bind the
-planned UUID before selecting the exact signed deployment, reach the greeter,
-prove immutable root/configuration and writable owned state, complete
-compositor modesetting and page flips, and acknowledge deployment health.
-First-boot identity must become stable on the second boot, with the same SSH
-host-key fingerprint, while the independently installed optical and USB
-machines must have different fingerprints. Missing bookkeeping and
-exhausted attempts refuse. The host terminates QEMU immediately after the
-health marker, then starts a new firmware process for the next boot. This
+The same ISO installs through optical and USB media onto both virtio and
+AHCI targets with 512-byte sectors. Each of the four installations cold-
+boots twice with the ISO detached; the second boot places a blank disk
+on the same bus before the installed disk. Target and decoy retain their
+bus throughout; the host requires vda2/vdb2 for virtio and sda2/sdb2 for
+AHCI. Each boot must bind the planned UUID before selecting the exact
+signed deployment, reach the greeter, prove immutable root/configuration
+and writable owned state, complete compositor modesetting and page
+flips, and acknowledge deployment health. First-boot identity must
+become stable on the second boot, with the same SSH host-key
+fingerprint, while all four independently installed machines must have
+pairwise different fingerprints. Missing bookkeeping and exhausted
+attempts refuse. The host terminates QEMU immediately after the health
+marker, then starts a new firmware process for the next boot. This
 exercises durability before acknowledgement across abrupt termination;
 it does not exercise the installed session's orderly shutdown path.
 
-All six boots run with 2 GiB RAM and networking disabled. Private target
+After both cold boots validate, remove that installation's private target
+and decoy; only bounded captured identity evidence remains for later
+comparisons. Removal errors fail the oracle. The shared ISO and source
+stay until the matrix ends, and the scratch guard also cleans up on error.
+
+All twelve boots run with 2 GiB RAM and networking disabled. Private target
 capacity is at least 6 GiB, or the payload size plus 2 GiB and partition
 headroom rounded up to the partition alignment, whichever is larger. This
 is diagnostic sizing, not admission of an operator-owned disk. The default
-per-boot deadline is 900 seconds; a positive `TD_QEMU_BOOT_TIMEOUT_SECS`
+per-boot deadline is 900 seconds. The host prints each installation and
+cold boot duration from its QEMU runner. A positive `TD_QEMU_BOOT_TIMEOUT_SECS`
 overrides it. The diagnostic accepts no destination operand, provisions a
 throwaway signing key on the host, and does not enter the shipped closure.
 It retains the stock system's account defaults: username/PIN selection,

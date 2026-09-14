@@ -215,7 +215,11 @@ QEMU ide-hd does not support the virtio 4Kn case.
 The same ISO bytes serve all target buses.
 The complete small oracle has forty boots, all with fresh private firmware
 variables. Interruption and refusal cases retain virtio/512-byte geometry;
-the full-system diagnostic also retains its virtio target.
+the full-system diagnostic installs through both media attachments onto
+virtio and AHCI at 512-byte geometry, then boots each installation twice
+with media detached and a same-bus preceding decoy on the second boot.
+Those twelve full-system boots use the same ISO and require stable
+machine identity per installation and distinct identity across all four.
 
 The fixture's serial convention does not implement production installation
 admission. Volume discovery uses the production read-only primitive under
@@ -292,5 +296,5 @@ require only the before report and prohibit an after report; a future
 unmountable-media case needs its own earlier failure expectation. The
 existing whole-target byte comparisons still establish write preservation;
 inventory alone does not. These observations cover all live
-legs of the 40-boot matrix and both full-system ISO installations without
+legs of the 40-boot matrix and all four full-system ISO installations without
 adding boots or changing target admission.
