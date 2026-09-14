@@ -572,6 +572,14 @@ controlled diagnostics; the full-system profile uses `on-volume` throughout.
 The explicit mount forms are `td-boot mount-root DEVICE MOUNTPOINT` and
 `td-boot mount-var DEVICE MOUNTPOINT`; both paths must be absolute.
 
+Boot volume-binding and selection diagnostics are formatted completely
+before td-boot passes their bytes to `write_all`. This prevents formatting
+from splitting a record into separate writes, while preserving diagnostic
+text, ordering and I/O error propagation. Short writes can still require
+multiple calls, and this is not an atomic serial-console guarantee. The
+QEMU oracle continues to reject incomplete or interleaved binding evidence;
+a later deployment marker cannot substitute for the selector's binding.
+
 For `boot`, the expected UUID comes from the selector's own
 `/etc/td/volume-uuid`, a real regular file containing exactly the canonical
 UUID and one newline. Missing or malformed configuration refuses. The

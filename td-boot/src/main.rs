@@ -2177,59 +2177,85 @@ fn loop_command(root: File, loop_device: &Path) -> Command {
     command
 }
 
-fn report_fallback(selection: &Selection) -> io::Result<()> {
+fn diagnostic(out: &mut dyn Write, message: std::fmt::Arguments<'_>) -> io::Result<()> {
+    // Formatting directly to stderr can split a diagnostic across writes.
+    let complete = format!("{message}\n");
+    out.write_all(complete.as_bytes())
+}
+
+fn report_volume_binding(
+    out: &mut dyn Write,
+    uuid: &volume::Uuid,
+    device: &Path,
+) -> io::Result<()> {
+    diagnostic(
+        out,
+        format_args!("TD-BOOT-VOLUME {uuid} {}", device.display()),
+    )
+}
+
+fn report_fallback(out: &mut dyn Write, selection: &Selection) -> io::Result<()> {
     if let Some(error) = &selection.current_error {
         // Rejection is boot protocol, not best-effort diagnostics: an unobservable
         // fallback must not masquerade as a healthy primary selection.
-        writeln!(
-            io::stderr(),
-            "{}: current rejected ({error}); using previous {}",
-            protocol::CURRENT_REJECTED_MARKER,
-            selection.deployment.id
+        diagnostic(
+            out,
+            format_args!(
+                "{}: current rejected ({error}); using previous {}",
+                protocol::CURRENT_REJECTED_MARKER,
+                selection.deployment.id
+            ),
         )?;
     }
     Ok(())
 }
 
-fn report_boot_decision(decision: &BootDecision) -> io::Result<()> {
+fn report_boot_decision(out: &mut dyn Write, decision: &BootDecision) -> io::Result<()> {
     if let Some(error) = &decision.bookkeeping_error {
-        writeln!(
-            io::stderr(),
-            "{}: {error}",
-            protocol::BOOKKEEPING_UNAVAILABLE_MARKER
+        diagnostic(
+            out,
+            format_args!("{}: {error}", protocol::BOOKKEEPING_UNAVAILABLE_MARKER),
         )?;
     }
     if let Some(error) = &decision.current_error {
-        writeln!(
-            io::stderr(),
-            "{}: current rejected ({error}); using previous {}",
-            protocol::CURRENT_REJECTED_MARKER,
-            decision.deployment_id
+        diagnostic(
+            out,
+            format_args!(
+                "{}: current rejected ({error}); using previous {}",
+                protocol::CURRENT_REJECTED_MARKER,
+                decision.deployment_id
+            ),
         )?;
     }
     if let Some(exhausted) = &decision.exhausted_deployment {
         if let Some(error) = &decision.fallback_error {
-            writeln!(
-                io::stderr(),
-                "{} {exhausted}: previous unavailable ({error}); retrying {}",
-                protocol::ATTEMPTS_EXHAUSTED_MARKER,
-                decision.deployment_id
+            diagnostic(
+                out,
+                format_args!(
+                    "{} {exhausted}: previous unavailable ({error}); retrying {}",
+                    protocol::ATTEMPTS_EXHAUSTED_MARKER,
+                    decision.deployment_id
+                ),
             )?;
         } else {
-            writeln!(
-                io::stderr(),
-                "{} {exhausted} -> {}",
-                protocol::ATTEMPTS_EXHAUSTED_MARKER,
-                decision.deployment_id
+            diagnostic(
+                out,
+                format_args!(
+                    "{} {exhausted} -> {}",
+                    protocol::ATTEMPTS_EXHAUSTED_MARKER,
+                    decision.deployment_id
+                ),
             )?;
         }
     }
     if let Some(remaining) = decision.remaining_attempts {
-        writeln!(
-            io::stderr(),
-            "{} {} remaining={remaining}",
-            protocol::ATTEMPT_CONSUMED_MARKER,
-            decision.deployment_id
+        diagnostic(
+            out,
+            format_args!(
+                "{} {} remaining={remaining}",
+                protocol::ATTEMPT_CONSUMED_MARKER,
+                decision.deployment_id
+            ),
         )?;
     }
     let marker = match decision.slot {
@@ -2242,8 +2268,9 @@ fn report_boot_decision(decision: &BootDecision) -> io::Result<()> {
             )));
         }
     };
-    writeln!(io::stderr(), "{marker} {}", decision.deployment_id)
+    diagnostic(out, format_args!("{marker} {}", decision.deployment_id))
 }
+
 
 fn attempt_status(state: Option<u8>) -> String {
     match state {
@@ -2255,7 +2282,7 @@ fn attempt_status(state: Option<u8>) -> String {
 
 fn run_verify(root: &Path) -> io::Result<()> {
     let selection = select_deployment(root)?;
-    report_fallback(&selection)?;
+    report_fallback(&mut io::stderr(), &selection)?;
     let state = read_attempt_state(root, &selection.deployment.id)?;
     if selection.slot == "current" && state == Some(0) {
         if let Ok(previous) = verify_slot(root, "previous").and_then(|previous| {
@@ -2722,7 +2749,7 @@ fn kexec_boot_decision(
     base_cmdline: &OsStr,
     measured: bool,
 ) -> io::Result<()> {
-    report_boot_decision(decision)?;
+    report_boot_decision(&mut io::stderr(), decision)?;
     let cmdline = kernel_cmdline(
         base_cmdline,
         &decision.deployment_id,
@@ -3223,11 +3250,7 @@ fn on_volume(mut operation: Mode) -> io::Result<()> {
         )?)?
     };
     let pinned = volume::Pinned::open(&uuid)?;
-    writeln!(
-        io::stderr(),
-        "TD-BOOT-VOLUME {uuid} {}",
-        pinned.device.display()
-    )?;
+    report_volume_binding(&mut io::stderr(), &uuid, &pinned.device)?;
     let device = match &mut operation {
         Mode::Boot { device, .. }
         | Mode::Install { device, .. }
@@ -3332,6 +3355,176 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::mpsc;
     use std::time::Duration;
+
+    #[derive(Default)]
+    struct DiagnosticWrites {
+        writes: Vec<Vec<u8>>,
+        fail_after: Option<usize>,
+    }
+
+    impl Write for DiagnosticWrites {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            if self.fail_after == Some(self.writes.len()) {
+                return Err(io::Error::from(io::ErrorKind::BrokenPipe));
+            }
+            self.writes.push(bytes.to_vec());
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn volume_and_selection_diagnostics_offer_complete_records_to_the_writer() {
+        let mut output = DiagnosticWrites::default();
+        let uuid = volume::Uuid::parse("00112233-4455-6677-8899-aabbccddeeff").unwrap();
+        report_volume_binding(&mut output, &uuid, Path::new("/dev/nvme1n1p2")).unwrap();
+        let decision = BootDecision {
+            slot: "current",
+            deployment_id: "deployment".into(),
+            current_error: None,
+            exhausted_deployment: None,
+            fallback_error: None,
+            bookkeeping_error: None,
+            remaining_attempts: Some(2),
+        };
+        report_boot_decision(&mut output, &decision).unwrap();
+        assert_eq!(
+            output.writes,
+            [
+                format!("TD-BOOT-VOLUME {uuid} /dev/nvme1n1p2\n").into_bytes(),
+                b"TD-BOOT-ATTEMPT-CONSUMED deployment remaining=2\n".to_vec(),
+                b"TD-BOOT-SELECTED-CURRENT deployment\n".to_vec(),
+            ]
+        );
+        output.writes.clear();
+        let decision = BootDecision {
+            slot: "previous",
+            deployment_id: "deployment".into(),
+            current_error: Some("bad signature".into()),
+            exhausted_deployment: Some("old".into()),
+            fallback_error: None,
+            bookkeeping_error: Some("read-only state".into()),
+            remaining_attempts: None,
+        };
+        report_boot_decision(&mut output, &decision).unwrap();
+        assert_eq!(output.writes, [
+            b"TD-BOOT-BOOKKEEPING-UNAVAILABLE: read-only state\n".to_vec(),
+            b"TD-BOOT-CURRENT-REJECTED: current rejected (bad signature); using previous deployment\n".to_vec(),
+            b"TD-BOOT-ATTEMPTS-EXHAUSTED old -> deployment\n".to_vec(),
+            b"TD-BOOT-SELECTED-PREVIOUS deployment\n".to_vec(),
+        ]);
+        output.writes.clear();
+        let decision = BootDecision {
+            slot: "current",
+            deployment_id: "deployment".into(),
+            current_error: None,
+            exhausted_deployment: Some("old".into()),
+            fallback_error: Some("missing".into()),
+            bookkeeping_error: None,
+            remaining_attempts: None,
+        };
+        report_boot_decision(&mut output, &decision).unwrap();
+        assert_eq!(output.writes, [
+            b"TD-BOOT-ATTEMPTS-EXHAUSTED old: previous unavailable (missing); retrying deployment\n".to_vec(),
+            b"TD-BOOT-SELECTED-CURRENT deployment\n".to_vec(),
+        ]);
+    }
+
+    #[test]
+    fn verify_fallback_diagnostic_is_complete_and_propagates_failure() {
+        let fixture = Fixture::new();
+        let id = fixture.valid_deployment();
+        fixture.selector("previous", &id);
+        let mut selection = select_deployment(&fixture.root).unwrap();
+        selection.current_error = Some("bad signature".into());
+        let mut output = DiagnosticWrites::default();
+        report_fallback(&mut output, &selection).unwrap();
+        assert_eq!(
+            output.writes,
+            [format!(
+                "TD-BOOT-CURRENT-REJECTED: current rejected (bad signature); using previous {id}\n"
+            )
+            .into_bytes()]
+        );
+        let mut failed = DiagnosticWrites {
+            writes: Vec::new(),
+            fail_after: Some(0),
+        };
+        assert_eq!(
+            report_fallback(&mut failed, &selection).unwrap_err().kind(),
+            io::ErrorKind::BrokenPipe
+        );
+        assert!(failed.writes.is_empty());
+        selection.current_error = None;
+        report_fallback(&mut failed, &selection).unwrap();
+        assert!(failed.writes.is_empty());
+    }
+
+    #[test]
+    fn diagnostic_failures_stop_before_later_selection_evidence() {
+        let uuid = volume::Uuid::parse("00112233-4455-6677-8899-aabbccddeeff").unwrap();
+        let decision = BootDecision {
+            slot: "current",
+            deployment_id: "deployment".into(),
+            current_error: None,
+            exhausted_deployment: None,
+            fallback_error: None,
+            bookkeeping_error: None,
+            remaining_attempts: Some(2),
+        };
+        for fail_after in [0, 1] {
+            let mut output = DiagnosticWrites {
+                writes: Vec::new(),
+                fail_after: Some(fail_after),
+            };
+            assert_eq!(
+                report_boot_decision(&mut output, &decision)
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::BrokenPipe
+            );
+            assert_eq!(output.writes.len(), fail_after);
+            assert!(!output
+                .writes
+                .iter()
+                .any(|bytes| bytes.starts_with(b"TD-BOOT-SELECTED")));
+        }
+        let mut output = DiagnosticWrites {
+            writes: Vec::new(),
+            fail_after: Some(0),
+        };
+        assert_eq!(
+            report_volume_binding(&mut output, &uuid, Path::new("/dev/vda2"))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::BrokenPipe
+        );
+        assert!(output.writes.is_empty());
+    }
+
+    #[test]
+    fn diagnostic_short_writes_are_retried_until_complete() {
+        let uuid = volume::Uuid::parse("00112233-4455-6677-8899-aabbccddeeff").unwrap();
+        struct ShortWrites(Vec<u8>);
+        impl Write for ShortWrites {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                let taken = bytes.len().min(3);
+                self.0.extend_from_slice(bytes.get(..taken).unwrap());
+                Ok(taken)
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut short = ShortWrites(Vec::new());
+        report_volume_binding(&mut short, &uuid, Path::new("/dev/vda2")).unwrap();
+        assert_eq!(
+            short.0,
+            b"TD-BOOT-VOLUME 00112233-4455-6677-8899-aabbccddeeff /dev/vda2\n"
+        );
+    }
 
     static NEXT_DIR: AtomicU64 = AtomicU64::new(0);
 
