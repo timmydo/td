@@ -1275,7 +1275,8 @@ fn validate_fixture_boot(
     }
     if !bound_selector_before_selection(&result.console, &expected_identity, id) {
         return Err(format!(
-            "installed selector did not bind {expected_identity} before selecting {id}\n{}",
+            "installed selector did not bind {expected_identity} before selecting {id}\n{}console tail (last 80 lines):\n{}",
+            selector_binding_diagnostic(&result.console, &expected_identity, id),
             tail(&result.console, 80)
         ));
     }
@@ -1493,12 +1494,14 @@ fn validate_installed_system(
         return Err(format!("installed system did not acknowledge a healthy deployment: panic={}, success={}, bookkeeping unavailable={}, attempts exhausted={}\n{}", result.evidence.kernel_panic, result.evidence.boot_success, result.evidence.bookkeeping_unavailable, result.evidence.attempts_exhausted, tail(&result.console, 100)));
     }
     validate_primary_selection(result, "installed system")?;
+    let expected_identity = format!("{uuid} {device}");
     if result.evidence.selected_current_id.as_deref() != Some(id)
-        || !bound_selector_before_selection(&result.console, &format!("{uuid} {device}"), id)
+        || !bound_selector_before_selection(&result.console, &expected_identity, id)
     {
         return Err(format!(
-            "installed system did not bind {uuid} {device} and deployment {id}: selected={:?}\n{}",
+            "installed system did not bind {uuid} {device} and deployment {id}: selected={:?}\n{}console tail (last 100 lines):\n{}",
             result.evidence.selected_current_id,
+            selector_binding_diagnostic(&result.console, &expected_identity, id),
             tail(&result.console, 100)
         ));
     }
@@ -1605,12 +1608,64 @@ fn plan<'a>(path: &'a Path, read_only: bool, marker: &'a str) -> BootPlan<'a> {
     }
 }
 
-fn bound_selector_before_selection(console: &str, identity: &str, id: &str) -> bool {
+fn selector_offsets(console: &str, identity: &str, id: &str) -> (Option<usize>, Option<usize>) {
     let bound = format!("TD-BOOT-VOLUME {identity}");
-    let selected = format!("TD-BOOT-SELECTED-CURRENT {id}");
-    let binding = console.lines().position(|line| line.trim_end() == bound);
-    let selection = console.lines().position(|line| line.trim_end() == selected);
+    let selected = format!("{} {id}", td_boot_protocol::SELECTED_CURRENT_MARKER);
+    let mut binding = None;
+    let mut selection = None;
+    for (index, line) in console.lines().enumerate() {
+        let line = line.trim_end();
+        if binding.is_none() && line == bound {
+            binding = Some(index);
+        }
+        if selection.is_none() && line == selected {
+            selection = Some(index);
+        }
+        if binding.is_some() && selection.is_some() {
+            break;
+        }
+    }
+    (binding, selection)
+}
+
+fn bound_selector_before_selection(console: &str, identity: &str, id: &str) -> bool {
+    let (binding, selection) = selector_offsets(console, identity, id);
     matches!((binding, selection), (Some(binding), Some(selection)) if binding < selection)
+}
+
+fn selector_binding_diagnostic(console: &str, identity: &str, id: &str) -> String {
+    const MAX_RECORDS: usize = 8;
+    const MAX_RECORD_BYTES: usize = 256;
+    let (binding, selection) = selector_offsets(console, identity, id);
+    let lines = console.lines().count();
+    let bytes = console.len();
+    let mut report = format!(
+        "retained console: {lines} lines, {bytes} bytes; line offsets (zero-based): first exact binding={binding:?}, first exact selection={selection:?}\nselector record excerpts (at most {MAX_RECORDS}, {MAX_RECORD_BYTES} UTF-8 bytes each before escaping):\n"
+    );
+    let records = console
+        .lines()
+        .enumerate()
+        .filter(|(_, line)| line.contains("TD-BOOT-VOLUME") || line.contains("TD-BOOT-SELECTED"));
+    let mut emitted = false;
+    for (count, (index, line)) in records.take(MAX_RECORDS + 1).enumerate() {
+        if count == MAX_RECORDS {
+            report.push_str("  further matching records omitted\n");
+            break;
+        }
+        let mut end = line.len().min(MAX_RECORD_BYTES);
+        while !line.is_char_boundary(end) {
+            end -= 1;
+        }
+        let excerpt = line.get(..end).unwrap_or_default();
+        let suffix = if end < line.len() { " [truncated]" } else { "" };
+        // Debug formatting escapes control characters from the guest console.
+        report.push_str(&format!("  {index}: {excerpt:?}{suffix}\n"));
+        emitted = true;
+    }
+    if !emitted {
+        report.push_str("  no matching records in retained console\n");
+    }
+    report
 }
 
 fn require(result: &BootResult, marker: &str, phase: &str) -> Result<(), String> {
@@ -1942,6 +1997,92 @@ mod tests {
         assert!(!bound_selector_before_selection(
             &format!("{binding}{selection}"),
             "other /dev/vda2",
+            "deployment"
+        ));
+    }
+
+    #[test]
+    fn binding_failures_retain_early_selector_records_beyond_the_console_tail() {
+        let mut result = healthy_system();
+        let early = "TD-BOOT-VOLUME uuid [kernel interleave] /dev/vda2";
+        result.console = format!(
+            "{early}\nTD-BOOT-SELECTED-CURRENT deployment\n{}{SYSTEM_BOOT_SUCCESS_MARKER}\n",
+            "later kernel output\n".repeat(200)
+        );
+        assert!(!tail(&result.console, 100).contains(early));
+        let error = validate_installed_system(&result, "uuid", "/dev/vda2", "deployment", true)
+            .unwrap_err();
+        assert!(error.contains(early));
+        assert!(error.contains("retained console:"));
+        assert!(error.contains("console tail (last "));
+        assert!(error.contains("first exact binding=None, first exact selection=Some(1)"));
+        result.console.push_str("TD-INSTALL-VOLUME uuid /dev/vda2\nTD-INSTALL-VOLUME uuid /dev/vda2\nTD-INSTALL-STALE-MOUNT-RECOVERED\nTD-INSTALL-PERSISTED-1 deployment\n");
+        let error = validate_fixture_boot(
+            &result,
+            "TD-INSTALL-PERSISTED-1 deployment",
+            "uuid",
+            "/dev/vda2",
+            "deployment",
+        )
+        .unwrap_err();
+        assert!(error.contains(early));
+        assert!(error.contains("retained console:"));
+        assert!(error.contains("console tail (last "));
+        assert!(error.contains("first exact binding=None, first exact selection=Some(1)"));
+        let reversed = "TD-BOOT-SELECTED-CURRENT deployment\nTD-BOOT-VOLUME uuid /dev/vda2\n";
+        assert!(!bound_selector_before_selection(
+            reversed,
+            "uuid /dev/vda2",
+            "deployment"
+        ));
+        assert!(
+            selector_binding_diagnostic(reversed, "uuid /dev/vda2", "deployment")
+                .contains("first exact binding=Some(1), first exact selection=Some(0)")
+        );
+        assert!(
+            selector_binding_diagnostic("kernel only\n", "uuid /dev/vda2", "deployment")
+                .contains("no matching records in retained console")
+        );
+    }
+
+    #[test]
+    fn selector_record_excerpts_bound_unicode_and_escape_guest_control_bytes() {
+        let line = format!("noises\u{1b}[31m TD-BOOT-VOLUME {}", "é".repeat(200));
+        let console = format!(
+            "{}TD-BOOT-SELECTED-CURRENT ninth\n",
+            format!("{line}\n").repeat(8)
+        );
+        let report = selector_binding_diagnostic(&console, "uuid /dev/vda2", "deployment");
+        assert!(report.contains("\\u{1b}"));
+        assert!(!report.contains('\u{1b}'));
+        assert_eq!(report.matches(" [truncated]").count(), 8);
+        assert_eq!(report.matches("é\" [truncated]").count(), 8);
+        let eight = selector_binding_diagnostic(
+            &format!("{line}\n").repeat(8),
+            "uuid /dev/vda2",
+            "deployment",
+        );
+        assert_eq!(eight.matches("é\" [truncated]").count(), 8);
+        assert!(!eight.contains("further matching records omitted"));
+        for malformed in [
+            "TD-BOOT-SELECTED CURRENT",
+            "TD-BOOT-SELECTED: CURRENT",
+            "TD-BOOT-SELECTED",
+        ] {
+            let report = selector_binding_diagnostic(malformed, "uuid /dev/vda2", "deployment");
+            assert!(report.contains(&format!("0: {malformed:?}")));
+            assert!(report.contains("first exact selection=None"));
+        }
+        let controls = format!("TD-BOOT-VOLUME {}\n", "\u{1b}".repeat(256)).repeat(8);
+        let escaped = selector_binding_diagnostic(&controls, "uuid /dev/vda2", "deployment");
+        assert!(escaped.len() > 4096 && escaped.len() < 16 * 1024);
+        assert!(!escaped.contains('\u{1b}'));
+        assert!(report.contains("further matching records omitted"));
+        assert!(!report.contains("ninth"));
+        assert!(report.len() < 4096);
+        assert!(!bound_selector_before_selection(
+            &console,
+            "uuid /dev/vda2",
             "deployment"
         ));
     }

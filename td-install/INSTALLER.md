@@ -250,3 +250,17 @@ its complete partition report against the attached private disk and GPT
 boundaries, alongside post-format inventory and detached firmware boots.
 The diagnostic queries after successful layout so negative cases still
 exercise formatter refusal; this is not the future wizard's sequencing.
+
+## Installer-oracle failure diagnostics
+
+The small and full-system QEMU oracles keep their exact requirement that
+selector volume binding precede deployment selection. On a binding failure,
+they report the retained line/byte counts, the first exact binding and
+selection line offsets, and up to eight lines containing binding or
+selection prefixes, including malformed selection delimiters. Each excerpt retains at most 256 UTF-8 bytes before escaping
+control characters; escaping can expand the excerpts beyond those input
+byte counts. Clipping and omitted matches are explicit. A labeled console
+tail follows. These excerpts can expose earlier malformed records
+that the tail omits. They are diagnostic context, never substitute evidence
+for a missing, reordered or interleaved exact record. Output is limited to
+the console retained by the runner, not a complete boot transcript guarantee.
