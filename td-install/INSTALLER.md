@@ -149,3 +149,59 @@ attachments, wrong deployment signatures, insufficient capacity and scratch,
 interrupted installation, changed disk ordering and a second installed boot.
 Require actual rendered/input and installed-session evidence, not only
 serial markers printed before the relevant operation completes.
+
+## Read-only block inventory diagnostic
+
+`td-install inventory` takes no operands and prints one version-1 JSON
+object with `scope: "inventory-only"` and a `devices` array. It observes the
+fixed `/sys/class/block` tree; it never opens `/dev`, invokes a child,
+mounts, writes sysfs, or calls the layout/volume writers. There is no
+alternate sysfs root in the CLI. The internal root parameter supports
+owned filesystem fixtures in tests.
+
+This diagnostic deliberately includes partitions, mounted disks, media,
+read-only disks and stacked devices. It is not the eligible destination
+list specified above and is not connected to the wizard or write path.
+No field grants permission to install. Source/mount/swap backing-device
+resolution, unsupported-topology filtering, exclusive admission, immutable
+plans and trusted consent remain required before destination selection can
+activate writes. In particular, `holders` and `slaves` alone do not account
+for loop backing files, mounted filesystems or every Btrfs member.
+
+Each record contains the kernel name, decimal major:minor device number,
+capacity in bytes, read-only flag, whole-disk parent name for partitions,
+the partition number, and sorted holder/slave names. A whole disk reports its disk
+sequence number, logical sector bytes, removable flag, model, serial and
+WWID. Logical sector bytes are reported as observed, including zero for
+some no-media devices; consumers must validate geometry before using it
+in arithmetic or admitting a destination.
+Descriptions absent from the driver are JSON null; existing empty fields
+remain empty strings. Serial prefers the disk's own `serial`, then
+`device/serial`; WWID likewise prefers `wwid` then `device/wwid`, and model
+reads `device/model`. Serial and WWID remain distinct even when a driver
+provides only one. For identification reads only, ENXIO means absent VPD
+data under the pinned Linux 7.1.4 SCSI interface and produces null (or the
+fallback attribute). Other read errors still refuse the observation. These
+descriptions and the
+kernel identifiers do not authenticate hardware or survive every reboot.
+Partitions have no separate disk record: their parent's geometry applies.
+Linux's `size` is multiplied by 512 even for a 4096-byte logical sector.
+
+Collection admits at most 4096 block nodes, 16384 directed relationship
+entries in total, and 256 bytes per attribute. Exceeding a bound, invalid
+UTF-8/numeric metadata, missing required metadata, an unresolved parent,
+duplicate identity or inconsistent reciprocal relationship is an error.
+Canonical relationship destinations must match the referenced node.
+Partitions have a `holders` directory and no required `slaves` directory.
+Optional descriptions and the partition discriminator may be absent;
+other I/O failures propagate with their path. Text is JSON escaped, and
+node and relationship order is deterministic. A successful empty inventory
+is an empty array, not evidence that installation is possible.
+
+Two complete observations must agree before any JSON is printed. This
+catches changes between reads but is not an atomic snapshot or protection
+against removal/replacement after collection, or a change and reversal
+between observations. Bounds limit bytes and entries, not elapsed kernel
+I/O time. A failed collection prints no partial inventory; an output I/O
+failure can leave partial JSON and a nonzero exit status. Consumers must
+require successful exit and a complete document.

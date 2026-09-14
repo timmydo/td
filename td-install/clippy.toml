@@ -109,4 +109,4 @@ disallowed-methods = [
 # cannot hold it — `std::fs::ReadDir::next` does not resolve, so the entry
 # would warn once and refuse nothing. A `paths::read_dir` must therefore
 # CONSUME the iterator and name the directory itself; DESIGN.md D10 records
-# that as the constraint on the wrapper this crate does not yet have.
+# that as the constraint implemented by `paths::read_dir_bounded`.

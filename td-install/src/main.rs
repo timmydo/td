@@ -39,6 +39,9 @@ mod fat;
 #[path = "scratch.rs"]
 mod scratch;
 
+#[path = "inventory.rs"]
+mod inventory;
+
 use std::ffi::OsString;
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom, Write};
@@ -54,12 +57,13 @@ fn invalid(message: String) -> io::Error {
 }
 
 const USAGE: &str =
-    "usage: td-install layout <destination> [<efi-kernel> <selector-initramfs>]\n       \
+    "usage: td-install inventory\n       td-install layout <destination> [<efi-kernel> <selector-initramfs>]\n       \
                      td-install volume [--uuid <uuid>] <destination> <mkfs.btrfs> <scratch-dir> \
                      [<td-boot> <deployment> <trusted-key> | --trusted-key <trusted-key>]";
 
 #[derive(Debug, Eq, PartialEq)]
 enum Mode {
+    Inventory,
     Layout {
         destination: PathBuf,
         boot: Option<BootFiles>,
@@ -249,6 +253,7 @@ fn parse_args(mut args: impl Iterator<Item = OsString>) -> io::Result<Mode> {
         }));
     }
     match (verb.to_str(), rest) {
+        (Some("inventory"), []) => Ok(Mode::Inventory),
         (Some("layout"), [destination]) => Ok(Mode::Layout {
             destination: destination.clone(),
             boot: None,
@@ -537,7 +542,7 @@ fn random_guid() -> io::Result<gpt::Guid> {
 #[allow(clippy::disallowed_methods)]
 mod paths {
     use std::fs::{DirBuilder, File, Metadata, OpenOptions, Permissions};
-    use std::io;
+    use std::io::{self, Read};
     use std::path::{Path, PathBuf};
 
     /// Name the file an IO failure was about.
@@ -558,6 +563,48 @@ mod paths {
 
     pub fn open_read(path: &Path) -> io::Result<File> {
         File::open(path).at(path)
+    }
+
+    /// Consume directory iteration here so late errors also name the path.
+    pub fn read_dir_bounded(path: &Path, limit: usize) -> io::Result<Vec<PathBuf>> {
+        let mut entries = Vec::new();
+        for entry in std::fs::read_dir(path).at(path)? {
+            let entry = entry.at(path)?;
+            if entries.len() == limit {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("{}: directory exceeds {limit} entries", path.display()),
+                ));
+            }
+            entries.push(entry.path());
+        }
+        entries.sort();
+        Ok(entries)
+    }
+
+    pub fn read_bounded(path: &Path, limit: usize) -> io::Result<Vec<u8>> {
+        let ceiling = u64::try_from(limit)
+            .ok()
+            .and_then(|n| n.checked_add(1))
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("{}: invalid read limit", path.display()),
+                )
+            })?;
+        let mut bytes = Vec::new();
+        File::open(path)
+            .at(path)?
+            .take(ceiling)
+            .read_to_end(&mut bytes)
+            .at(path)?;
+        if bytes.len() > limit {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{}: attribute exceeds {limit} bytes", path.display()),
+            ));
+        }
+        Ok(bytes)
     }
 
     pub fn open_read_write(path: &Path) -> io::Result<File> {
@@ -1611,6 +1658,12 @@ fn main() -> ExitCode {
         }
     };
     let result = match mode {
+        Mode::Inventory => {
+            let stdout = io::stdout();
+            let mut output = io::BufWriter::new(stdout.lock());
+            inventory::run(Path::new("/sys/class/block"), &mut output)
+                .and_then(|()| output.flush())
+        },
         Mode::Layout { destination, boot } => match boot {
             Some(boot) => run_layout_with_boot(&destination, Some(&boot), &mut io::stdout()),
             None => run_layout(&destination, &mut io::stdout()),
@@ -3197,12 +3250,12 @@ mod tests {
     /// because that is the half the scan below keys on.
     const ALLOW: &str = concat!("#[all", "ow(clippy::disallowed_methods)]");
 
-    /// The seven files this binary compiles, with the item each allow in
-    /// them must sit on — none, for the four that reach no filesystem, nor
-    /// for `scratch.rs`, which is test-only and ships in nothing.
+    /// The eight files this binary compiles, with the item each allow in
+    /// them must sit on. Shared pure modules and test-only scratch have none;
+    /// inventory reaches the filesystem only through the paths module.
     type Compiled = (&'static str, &'static str, &'static [&'static str]);
 
-    fn compiled_files() -> [Compiled; 7] {
+    fn compiled_files() -> [Compiled; 8] {
         [
             ("main.rs", include_str!("main.rs"), MAIN_CHOKE.as_slice()),
             (
@@ -3219,10 +3272,11 @@ mod tests {
                 [].as_slice(),
             ),
             ("scratch.rs", include_str!("scratch.rs"), [].as_slice()),
+            ("inventory.rs", include_str!("inventory.rs"), [].as_slice()),
         ]
     }
 
-    /// THE LIST ABOVE IS HAND-KEPT, and an eighth file compiled into this
+    /// THE LIST ABOVE IS HAND-KEPT, and a ninth file compiled into this
     /// binary would be read by neither guard — silently, since both count only
     /// what they were handed. Nothing but this relates it to the `#[path]`
     /// declarations it mirrors. The marker is split so this file does not
@@ -3230,7 +3284,7 @@ mod tests {
     ///
     /// Over the UNCOMMENTED source, for the reason the allow scan is: a
     /// comment explaining a `#[path]` declaration is prose, and reading one as
-    /// a declaration reds a file that compiles exactly seven.
+    /// a declaration reds a file that compiles exactly eight.
     #[test]
     fn every_compiled_file_is_one_the_guards_read() {
         // WHITESPACE-INSENSITIVE from the marker on: `#[path="x.rs"]` with no
@@ -3250,7 +3304,7 @@ mod tests {
         // include inside a `stringify!`, which satisfied the search while
         // `compiled_files` went on reading the original.
         let table_body = {
-            const HEAD: &str = "fn compiled_files() -> [Compiled; 7] {";
+            const HEAD: &str = "fn compiled_files() -> [Compiled; 8] {";
             let Some(at) = index_of(&text, HEAD) else {
                 panic!("the compiled-file table is not where this scan looks for it")
             };
@@ -3319,12 +3373,12 @@ mod tests {
         // …and no file reaches this binary any OTHER way. A `#[path]` is not
         // how Rust normally names a second file: `mod escape;` compiles
         // `src/escape.rs` with no attribute to count, and `include!` splices
-        // one into this file outright. Either is an eighth compiled source
+        // one into this file outright. Either is a ninth compiled source
         // carrying a crate-level `#![allow]` and any filesystem call it
         // likes, with both guards passing — review's, and the reason the loop
         // below counts DECLARATIONS rather than trusting the attribute.
         // EVERY compiled file, not this one alone. An eighth file arrives
-        // through whichever of the seven declares it, and until review measured
+        // through whichever compiled file declares it, and until review measured
         // it the three checks below ran over `main.rs` only: an
         // `include!("spliced.rs")` in `gpt.rs` — which resolves to the same
         // file for both crates, so it is the realistic shape rather than a
@@ -3364,7 +3418,7 @@ mod tests {
             // A MACRO can assemble an attribute out of pieces no unit holds: a
             // `#[$attr]` in a definition and `allow(clippy::all)` at the call
             // site are two texts, and the scan reads text. Nothing here
-            // defines one, and these seven files are compiled with no external
+            // defines one, and these eight files are compiled with no external
             // crate to import one from, so refusing the DEFINITION closes it.
             //
             // Over the UNSPACED, UNSTRINGED file rather than at a line start:
@@ -3378,8 +3432,8 @@ mod tests {
                 "{label} defines a macro, which can assemble a lint \
                  suppression the allow scan cannot read"
             );
-            // …and no module of its own. `main.rs` declares the six; any
-            // other file declaring one compiles an eighth source.
+            // …and no module of its own. `main.rs` declares the seven; any
+            // other file declaring one compiles another source.
             let mods = declarations(&plain_file)
                 .into_iter()
                 .filter(|(keyword, head)| *keyword == "mod" && head.trim_end().ends_with(';'))
@@ -3431,7 +3485,7 @@ mod tests {
         }
         // A naming test that found nothing to check would pass whatever the
         // wrappers did.
-        assert_eq!(checked, 19, "{checked} wrappers were checked");
+        assert_eq!(checked, 21, "{checked} wrappers were checked");
     }
 
     /// The text of the item opened at `marker`, up to the next line that is a
@@ -3526,7 +3580,7 @@ mod tests {
     /// `pub(crate)` is `pub ` with no space after it — review wrote both and
     /// walked past a check reading raw text. Every export here is therefore a
     /// plain `pub fn`, which also refuses `pub(crate)`, `pub unsafe fn` and
-    /// `pub static`: fifteen short wrappers need none of them, and a shape
+    /// `pub static`: these short wrappers need none of them, and a shape
     /// that arrives is a decision rather than an accident.
     fn hands_out_no_capability(label: &str, region: &str, body: &str) {
         // With STRINGS dropped, so a message naming a shape is data rather
@@ -3706,7 +3760,7 @@ mod tests {
     /// two quotes are a delimiter to `unstringed`'s toggle, and the two braces
     /// are an item boundary to the brace count below. A sibling scan in
     /// `builder` NEUTRALISES the same literals instead, because it reads whole
-    /// files and cannot refuse one; nineteen short wrappers can afford the
+    /// files and cannot refuse one; these short wrappers can afford the
     /// refusal, and refusing is the smaller thing to be right about.
     const REFUSED_CHARS: [&str; 4] = ["'\u{22}'", "'\\\u{22}'", "'{'", "'}'"];
 
@@ -3809,12 +3863,12 @@ mod tests {
     /// of its own.
     ///
     /// The region scans still REFUSE rather than lex, and that stays the rule
-    /// for a region: nineteen short wrappers can afford it. A whole FILE
+    /// for a region: these short wrappers can afford it. A whole FILE
     /// cannot — main.rs holds sixteen char literals a counter would
     /// desynchronise on, and refusing them would refuse this file.
     ///
     /// What it does not lex is a raw string and a block comment, and neither
-    /// is a caveat: it refuses both, none of the seven compiled files holds
+    /// is a caveat: it refuses both, none of the eight compiled files holds
     /// either (measured), and the refusal is what the raw-string check this
     /// replaces could not state soundly.
     fn plain_source(text: &str) -> Option<String> {
@@ -4063,7 +4117,7 @@ mod tests {
             // and a `fn` with its name on the next line — both valid, and the
             // second is what `rustfmt` writes for a long one — declared a
             // wrapper this enumeration never saw: no name, no path, never
-            // counted, and the pinned nineteen still right. Review's.
+            // counted, and the pinned count still right. Review's.
             let before = body.get(..at).and_then(|t| t.chars().next_back());
             if before.is_some_and(|c| c.is_alphanumeric() || c == '_') {
                 continue;
@@ -4177,7 +4231,7 @@ mod tests {
     /// `impl AsRef<Path>`, so a `&str` — or an `&OsStr`, the same class and
     /// the same blind spot — is a path too and this cannot tell. The generic
     /// form is refused above; the concrete one is a limit, and a small one now
-    /// that it applies to nineteen short functions the compiler has already
+    /// that it applies to these short functions the compiler has already
     /// fenced rather than to a whole crate.
     fn path_parameters(piece: &str) -> Vec<String> {
         let Some((_, after)) = piece.split_once('(') else {

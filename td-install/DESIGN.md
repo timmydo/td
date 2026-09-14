@@ -240,7 +240,7 @@ that wants one.
 
 Two edges of that are worth stating because neither is visible from the
 code they constrain. The deny reaches every file this crate COMPILES,
-`engine/src/gpt.rs` and the other four included ones among them, so an
+`engine/src/gpt.rs` and the other five included ones among them, so an
 ordinary `std::fs::read` added there fails td-install's clippy while the
 engine's own stays green — and the advice in the message, to use `mod
 paths`, cannot be followed from a crate that has no such module. And an
@@ -256,8 +256,10 @@ roster cannot hold the second — `std::fs::ReadDir::next` does not resolve
 as a path, so an entry for it would warn once and refuse nothing. A
 `paths::read_dir` must therefore CONSUME the iterator and name the
 directory on each entry's error rather than hand a bare `ReadDir` back.
-This crate reads no directory today, which is why that wrapper does not
-exist and why its rule is written down before it does.
+`paths::read_dir_bounded` consumes that iterator for block inventory, names
+opening and per-entry errors, and refuses an excess entry instead of
+truncating the observation. `paths::read_bounded` similarly names read
+errors and rejects attributes exceeding their byte limit.
 
 ### Installation signing identity
 
