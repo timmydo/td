@@ -80,7 +80,16 @@ and target admission remain requirements for the production installer service.
 After both formatting commands, the guest asks td-init to reread the target's
 partition table. It resolves the configured UUID through the production
 reader and requires the expected virtio partition, then mounts it through
-td-boot. A second reread must fail specifically with EBUSY while mounted;
+td-boot. Both raw formatter commands must fail their destination open with
+exit status 1, EBUSY and no stdout while that partition is mounted. An
+assertion failure terminates the installation sequence and leaves PID 1
+parked for host collection and VM teardown, as with other fixture failures;
+no later installation step runs against the failed disk. A bounded 64 KiB
+read before and after each attempt also requires unchanged protective MBR
+and primary GPT metadata at both supported sector sizes. This exercises
+Linux's block claim through the production destination wrapper; it is not
+a whole-disk hash comparison while the filesystem is active. A second reread
+must fail specifically with EBUSY while mounted;
 no force or unmount fallback is accepted. The guest unmounts and requires a
 final successful reread before emitting the partition-refresh evidence.
 The host requires the exact configured UUID and /dev/vda2 in that evidence on both optical and USB installs. This exercises

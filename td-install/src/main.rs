@@ -607,8 +607,23 @@ mod paths {
         Ok(bytes)
     }
 
-    pub fn open_read_write(path: &Path) -> io::Result<File> {
-        OpenOptions::new().read(true).write(true).open(path).at(path)
+    pub fn open_format_destination(path: &Path) -> io::Result<File> {
+        use std::os::unix::fs::OpenOptionsExt;
+        if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!("{}: formatting requires x86-64 Linux", path.display()),
+            ));
+        }
+        // Linux claims block devices through O_EXCL, including their partitions.
+        // Without O_CREAT this flag does not change regular-image opens.
+        const O_EXCL: i32 = 0x80;
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(O_EXCL)
+            .open(path)
+            .at(path)
     }
 
     /// Create, refusing anything already there — which is what keeps a symlink
@@ -791,7 +806,7 @@ fn run_layout_with_boot(
     boot: Option<&BootFiles>,
     out: &mut dyn Write,
 ) -> io::Result<()> {
-    let mut file = paths::open_read_write(destination)?;
+    let mut file = paths::open_format_destination(destination)?;
     let disk_bytes = destination_bytes(&mut file)?;
     let sector_size = logical_sector_size(&file)?;
     let plan = plan(sector_size, disk_bytes).map_err(invalid)?;
@@ -1454,7 +1469,7 @@ fn run_volume(
     let key = seed
         .map(|seed| read_trusted_key(seed.trusted_key()))
         .transpose()?;
-    let mut file = paths::open_read_write(destination)?;
+    let mut file = paths::open_format_destination(destination)?;
     let disk_bytes = destination_bytes(&mut file)?;
     let sector_size = logical_sector_size(&file)?;
     if !disk_bytes.is_multiple_of(sector_size) {

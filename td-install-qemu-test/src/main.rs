@@ -435,6 +435,7 @@ fn refresh_partitions(device: &str, uuid: &str) -> Result<String, String> {
         return Err("partition reread resolved an unexpected fixture device".into());
     }
     command("/bin/td-boot", &["mount-root", &partition, "/volume"])?;
+    reject_mounted_writers(device)?;
     let refused = Command::new("/bin/td-init")
         .args(["reread-partitions", device])
         .output()
@@ -456,6 +457,47 @@ fn refresh_partitions(device: &str, uuid: &str) -> Result<String, String> {
         format_args!("{PARTITIONS_MARKER} {uuid} {partition}"),
     )?;
     Ok(partition)
+}
+
+fn primary_metadata(device: &str) -> Result<Vec<u8>, String> {
+    // Covers protective MBR, primary GPT header and entry array at 512/4096.
+    let mut bytes = vec![0; 64 * 1024];
+    fs::File::open(device)
+        .and_then(|mut file| file.read_exact(&mut bytes))
+        .map_err(|error| format!("read primary disk metadata {device}: {error}"))?;
+    Ok(bytes)
+}
+
+fn reject_mounted_writers(device: &str) -> Result<(), String> {
+    let baseline = primary_metadata(device)?;
+    let commands: &[&[&str]] = &[
+        &["layout", device],
+        &["volume", device, "/bin/mkfs.btrfs", "/scratch"],
+    ];
+    for arguments in commands {
+        let refused = Command::new("/bin/td-install")
+            .args(*arguments)
+            .output()
+            .map_err(|error| format!("execute mounted formatter refusal: {error}"))?;
+        let diagnostic = String::from_utf8_lossy(&refused.stderr);
+        if primary_metadata(device)? != baseline {
+            return Err(format!(
+                "mounted formatter {arguments:?} changed the first 64 KiB"
+            ));
+        }
+        if refused.status.code() != Some(1)
+            || !refused.stdout.is_empty()
+            || !diagnostic.contains(&format!("{device}:"))
+            || !diagnostic.contains("(os error 16)")
+        {
+            return Err(format!(
+                "mounted formatter {arguments:?} did not refuse its open as busy: status {}; stdout {:?}; stderr {diagnostic}",
+                refused.status,
+                String::from_utf8_lossy(&refused.stdout)
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn volume(uuid: &str) -> Result<(String, String), String> {

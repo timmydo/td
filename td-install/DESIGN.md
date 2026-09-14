@@ -469,6 +469,33 @@ at a later use. Root-owned devtmpfs/sysfs and their ancestors are trusted;
 this is neither exclusive device admission nor protection from hostile
 hotplug or a privileged namespace writer.
 
+### Block destination formatting guard
+
+Both raw formatting commands open their destination read-write with Linux
+`O_EXCL` (0x80) through safe `OpenOptionsExt`. The formatting wrapper
+refuses platforms other than x86-64 Linux before opening; another target
+architecture needs its flag mapping reviewed. On a block device, the held
+File owns a kernel claim until it closes: a mounted partition or another
+incompatible claim makes the open fail with EBUSY before any destination
+write. There is no retry or forced unmount. Without `O_CREAT`, Linux leaves
+ordinary existing image-file opens unchanged; source-built image production
+continues through the same wrapper.
+
+This guard does not implement the installation service's exclusive
+admission. Unclaimed raw I/O can still race a claim, image files have no
+block claim, and each command releases its descriptor when it finishes.
+Media/backing-device exclusion, stable identity, the service's held
+operation descriptors and trusted destructive consent remain required.
+A future service holding its own destination block claim cannot invoke
+these pathname commands: the distinct holder would conflict. That service
+needs a separately designed inherited-descriptor formatting interface;
+reopening a claimed descriptor through /proc is not claim transfer.
+The QEMU fixture attempts both raw commands while the just-formatted
+partition is mounted and requires the destination-open EBUSY diagnostic
+and unchanged first 64 KiB after each attempt before continuing with
+partition refresh and normal publication. This bounds the preservation
+check to the protective MBR and primary GPT metadata, not the entire disk.
+
 ### Refreshing partitions after formatting
 
 `td-init reread-partitions DEVICE` is the explicit kernel refresh between
