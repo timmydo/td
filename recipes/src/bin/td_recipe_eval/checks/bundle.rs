@@ -1279,10 +1279,37 @@ mod tests {
     fn concurrent_private_installations_cannot_admit_the_same_output() {
         let base = scratch("private-concurrent");
         let path = base.join("private");
+        let contention = format!(
+            "installation output is already in use: {}",
+            fs::TryLockError::WouldBlock
+        );
         let first = PrivateOutput::open(&path).unwrap();
-        assert!(PrivateOutput::open(&path).is_err());
+        let error = PrivateOutput::open(&path).err().unwrap();
+        assert_eq!(error, contention);
+        let inherited = first._lease.try_clone().unwrap();
         drop(first);
-        let _retry = PrivateOutput::open(&path).unwrap();
+        let error = PrivateOutput::open(&path).err().unwrap();
+        assert_eq!(error, contention);
+        drop(inherited);
+        // A parallel process test can inherit the lease before its exec.
+        // Match the cache-lock test's allowance for gate scheduling delays.
+        const WAIT: std::time::Duration = std::time::Duration::from_secs(20);
+        const POLL: std::time::Duration = std::time::Duration::from_millis(10);
+        let started = std::time::Instant::now();
+        let retry = loop {
+            match PrivateOutput::open(&path) {
+                Ok(output) => break output,
+                Err(error) => {
+                    assert_eq!(error, contention);
+                    assert!(
+                        started.elapsed() < WAIT,
+                        "lease was not released after dropping local holders: {error}"
+                    );
+                    std::thread::sleep(POLL);
+                }
+            }
+        };
+        drop(retry);
         fs::remove_dir_all(base).unwrap();
     }
 
