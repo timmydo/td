@@ -1,4 +1,4 @@
-//! Private, single-use PIN-authorized hmac-secret assertion flow. No device I/O.
+//! Private, single-use PIN-authorized enrollment and assertions. No device I/O.
 
 use super::fido_cbor::{self as cbor, Encoder, Value};
 use super::fido_ctap::{AssertionInfo, AssertionRequest, MAX_CREDENTIAL_ID, RP_ID};
@@ -75,6 +75,9 @@ pub(super) struct Profile {
     permissions: bool,
     max_message: usize,
     max_id: usize,
+    max_credentials: usize,
+    aaguid: [u8; 16],
+    can_enroll: bool,
 }
 impl Profile {
     /// Unsigned capability claims select a protocol, never credential identity.
@@ -88,9 +91,11 @@ impl Profile {
         if !supported {
             return Err("unsupported portable CTAP version".into());
         }
-        if info.required(&Value::Unsigned(3))?.bytes()?.len() != 16 {
-            return Err("invalid getInfo AAGUID length".into());
-        }
+        let aaguid = info
+            .required(&Value::Unsigned(3))?
+            .bytes()?
+            .try_into()
+            .map_err(|_| "invalid getInfo AAGUID length")?;
         let mut hmac_secret = false;
         for extension in array(info.required(&Value::Unsigned(2))?)? {
             hmac_secret |= extension.text()? == "hmac-secret";
@@ -131,12 +136,31 @@ impl Profile {
         } else {
             return Err("no supported PIN protocol".into());
         };
-        limit(&info, 7, 1, 1)?;
+        let mut can_enroll = true;
+        if let Some(algorithms) = info.get(&Value::Unsigned(10))? {
+            can_enroll = false;
+            let mut seen = Vec::new();
+            for algorithm in array(algorithms)? {
+                let kind = algorithm.required(&Value::Text("type"))?.text()?;
+                let alg = algorithm.required(&Value::Text("alg"))?;
+                if !matches!(alg, Value::Unsigned(_) | Value::Negative(_)) {
+                    return Err("invalid portable credential algorithm".into());
+                }
+                if seen.contains(&(kind, alg)) {
+                    return Err("duplicate portable credential algorithm".into());
+                }
+                seen.push((kind, alg));
+                can_enroll |= kind == "public-key" && alg == &Value::Negative(6);
+            }
+        }
         Ok(Self {
             protocol,
             permissions: option(options, "pinUvAuthToken", false)?,
             max_message: limit(&info, 5, 1024, cbor::MAX_BYTES)?,
             max_id: limit(&info, 8, MAX_CREDENTIAL_ID, MAX_CREDENTIAL_ID)?,
+            max_credentials: limit(&info, 7, 8, 8)?,
+            aaguid,
+            can_enroll,
         })
     }
 
@@ -168,7 +192,7 @@ impl Profile {
     }
 }
 
-struct Intent {
+pub(super) struct Intent {
     verifier: AssertionRequest,
     credential: Secret,
     key: PublicKey,
@@ -182,12 +206,25 @@ impl Drop for Intent {
     }
 }
 
-pub(super) struct KeyRequest {
+pub(super) trait Operation {
+    fn challenge(&self) -> &[u8; 32];
+    fn permission(&self) -> u64;
+}
+impl Operation for Intent {
+    fn challenge(&self) -> &[u8; 32] {
+        &self.challenge
+    }
+    fn permission(&self) -> u64 {
+        2
+    }
+}
+
+pub(super) struct KeyRequest<I = Intent> {
     profile: Profile,
-    intent: Intent,
+    intent: I,
     bytes: Secret,
 }
-impl KeyRequest {
+impl<I: Operation> KeyRequest<I> {
     pub(super) fn bytes(&self) -> &[u8] {
         &self.bytes.0
     }
@@ -198,7 +235,7 @@ impl KeyRequest {
         response: &[u8],
         pin: Pin,
         entropy: &mut impl FnMut(&mut [u8]) -> Result<(), String>,
-    ) -> Result<PinRequest, String> {
+    ) -> Result<PinRequest<I>, String> {
         let value = response_value(response, self.profile.max_message)?;
         let peer = agreement_key(value.required(&Value::Unsigned(1))?)?;
         let private = fresh_scalar(entropy)?;
@@ -223,7 +260,7 @@ impl KeyRequest {
         out.bytes(&encrypted.0)?;
         if self.profile.permissions {
             out.head(0, 9)?;
-            out.head(0, 2)?; // Only getAssertion, bound to our fixed RP.
+            out.head(0, self.intent.permission())?; // One operation, fixed RP.
             out.head(0, 10)?;
             out.text(RP_ID)?;
         }
@@ -238,23 +275,19 @@ impl KeyRequest {
     }
 }
 
-pub(super) struct PinRequest {
+pub(super) struct PinRequest<I = Intent> {
     profile: Profile,
-    intent: Intent,
+    intent: I,
     keys: Keys,
     public: PublicKey,
     bytes: Secret,
 }
-impl PinRequest {
+impl<I: Operation> PinRequest<I> {
     pub(super) fn bytes(&self) -> &[u8] {
         &self.bytes.0
     }
 
-    pub(super) fn finish(
-        self,
-        response: &[u8],
-        entropy: &mut impl FnMut(&mut [u8]) -> Result<(), String>,
-    ) -> Result<HmacRequest, String> {
+    fn authorize(&self, response: &[u8]) -> Result<Secret, String> {
         let value = response_value(response, self.profile.max_message)?;
         let encrypted = value.required(&Value::Unsigned(2))?.bytes()?;
         let length = encrypted
@@ -265,11 +298,19 @@ impl PinRequest {
             return Err("invalid PIN token length for selected protocol".into());
         }
         let token = self.keys.decrypt(encrypted, length)?;
-        let auth = self
+        Ok(self
             .profile
             .protocol
-            .authenticate(&token.0, &self.intent.challenge);
-        drop(token);
+            .authenticate(&token.0, self.intent.challenge()))
+    }
+}
+impl PinRequest {
+    pub(super) fn finish(
+        self,
+        response: &[u8],
+        entropy: &mut impl FnMut(&mut [u8]) -> Result<(), String>,
+    ) -> Result<HmacRequest, String> {
+        let auth = self.authorize(response)?;
         let salt_enc = self.keys.encrypt(&self.intent.salt, entropy)?;
         let salt_auth = self
             .profile
@@ -374,6 +415,329 @@ impl HmacRequest {
             secret,
             info: parsed.info,
         })
+    }
+}
+
+/// Creation authority remains private until a fresh PIN/hmac-secret proof succeeds.
+pub(super) struct Creation {
+    challenge: [u8; 32],
+    user: [u8; 32],
+    excluded: Vec<Secret>,
+}
+impl Drop for Creation {
+    fn drop(&mut self) {
+        clear(&mut self.challenge);
+        clear(&mut self.user);
+    }
+}
+impl Operation for Creation {
+    fn challenge(&self) -> &[u8; 32] {
+        &self.challenge
+    }
+    fn permission(&self) -> u64 {
+        1
+    }
+}
+impl Creation {
+    fn encode(&self, profile: &Profile, auth: &[u8]) -> Result<Secret, String> {
+        let mut out = Encoder::new();
+        out.head(5, 8 + u64::from(!self.excluded.is_empty()))?;
+        out.head(0, 1)?;
+        out.bytes(&self.challenge)?;
+        out.head(0, 2)?;
+        out.head(5, 2)?;
+        out.text("id")?;
+        out.text(RP_ID)?;
+        out.text("name")?;
+        out.text("td personal vault")?;
+        out.head(0, 3)?;
+        out.head(5, 3)?;
+        out.text("id")?;
+        out.bytes(&self.user)?;
+        out.text("name")?;
+        out.text("td personal vault")?;
+        out.text("displayName")?;
+        out.text("td personal vault")?;
+        out.head(0, 4)?;
+        out.head(4, 1)?;
+        out.head(5, 2)?;
+        out.text("alg")?;
+        out.head(1, 6)?;
+        out.text("type")?;
+        out.text("public-key")?;
+        if !self.excluded.is_empty() {
+            out.head(0, 5)?;
+            out.head(4, self.excluded.len() as u64)?;
+            for id in &self.excluded {
+                out.head(5, 2)?;
+                out.text("id")?;
+                out.bytes(&id.0)?;
+                out.text("type")?;
+                out.text("public-key")?;
+            }
+        }
+        out.head(0, 6)?;
+        out.head(5, 1)?;
+        out.text("hmac-secret")?;
+        out.boolean(true)?;
+        out.head(0, 7)?;
+        out.head(5, 1)?;
+        out.text("rk")?;
+        out.boolean(false)?;
+        // up defaults true; older tokens reject its explicit inclusion here.
+        out.head(0, 8)?;
+        out.bytes(auth)?;
+        out.head(0, 9)?;
+        out.head(0, profile.protocol.number())?;
+        command(1, out, profile.max_message)
+    }
+}
+impl Profile {
+    /// The backend supplies every existing ID; none may be omitted to fit a token.
+    pub(super) fn enrollment(
+        self,
+        challenge: [u8; 32],
+        user: [u8; 32],
+        excluded: &[&[u8]],
+    ) -> Result<KeyRequest<Creation>, String> {
+        if !self.can_enroll {
+            return Err("portable token does not advertise ES256 creation".into());
+        }
+        if excluded.len() > self.max_credentials {
+            return Err("portable exclusion list exceeds token capacity".into());
+        }
+        let mut intent = Creation {
+            challenge,
+            user,
+            excluded: Vec::with_capacity(excluded.len()),
+        };
+        for id in excluded {
+            if id.is_empty() || id.len() > self.max_id {
+                return Err(
+                    "invalid excluded credential ID length for portable token profile".into(),
+                );
+            }
+            if intent.excluded.iter().any(|old| old.0.as_ref() == *id) {
+                return Err("duplicate portable excluded credential".into());
+            }
+            intent.excluded.push(Secret((*id).into()));
+        }
+        // Check the entire future command before spending a PIN attempt.
+        let auth = Secret::zeroed(if self.protocol == Protocol::One {
+            16
+        } else {
+            32
+        });
+        intent.encode(&self, &auth.0)?;
+        let bytes = command(6, client_pin(self.protocol, 2, 2)?, self.max_message)?;
+        Ok(KeyRequest {
+            profile: self,
+            intent,
+            bytes,
+        })
+    }
+}
+impl PinRequest<Creation> {
+    pub(super) fn make(self, response: &[u8]) -> Result<MakeRequest, String> {
+        let auth = self.authorize(response)?;
+        let bytes = self.intent.encode(&self.profile, &auth.0)?;
+        Ok(MakeRequest {
+            profile: self.profile,
+            intent: self.intent,
+            bytes,
+        })
+    }
+}
+
+pub(super) struct MakeRequest {
+    profile: Profile,
+    intent: Creation,
+    bytes: Secret,
+}
+impl MakeRequest {
+    pub(super) fn bytes(&self) -> &[u8] {
+        &self.bytes.0
+    }
+
+    /// Attestation is untrusted metadata. Only the subsequent assertion proves a key.
+    pub(super) fn proof(
+        self,
+        response: &[u8],
+        challenge: [u8; 32],
+        salt: [u8; 32],
+    ) -> Result<EnrollmentProof<KeyRequest>, String> {
+        if challenge == self.intent.challenge {
+            return Err("portable enrollment proof requires a fresh challenge".into());
+        }
+        // maxMsgSize limits token input, not an attestation-bearing output.
+        let value = response_value(response, cbor::MAX_BYTES)?;
+        if let Some(enterprise) = value.get(&Value::Unsigned(4))? {
+            if boolean(enterprise)? {
+                return Err("unrequested portable enterprise attestation".into());
+            }
+        }
+        let format = value.required(&Value::Unsigned(1))?.text()?;
+        if format.is_empty() || format.len() > 64 {
+            return Err("invalid portable attestation format".into());
+        }
+        match value.get(&Value::Unsigned(3))? {
+            Some(statement) => {
+                let statement = statement.map()?;
+                if format == "none" && !statement.is_empty() {
+                    return Err("nonempty none attestation statement".into());
+                }
+            }
+            None if format != "none" => return Err("missing attestation statement".into()),
+            None => {}
+        }
+        let data = value.required(&Value::Unsigned(2))?.bytes()?;
+        if data.get(..32) != Some(crypto::digest(RP_ID.as_bytes()).as_slice()) {
+            return Err("portable enrollment RP hash mismatch".into());
+        }
+        let flags = *data.get(32).ok_or("short portable enrollment flags")?;
+        if flags & 0xc5 != 0xc5 || flags & 0x18 != 0 {
+            return Err(
+                "portable enrollment requires UP, UV, AT, ED and a device-bound key".into(),
+            );
+        }
+        let aaguid = data.get(37..53).ok_or("short portable enrollment AAGUID")?;
+        if aaguid != self.profile.aaguid && !(format == "none" && aaguid == [0; 16]) {
+            return Err("portable enrollment AAGUID changed".into());
+        }
+        let length = usize::from(u16::from_be_bytes(
+            data.get(53..55)
+                .ok_or("short portable credential length")?
+                .try_into()
+                .map_err(|_| "portable credential length extent")?,
+        ));
+        if length == 0 || length > self.profile.max_id {
+            return Err("created credential ID exceeds portable token profile".into());
+        }
+        let id = data
+            .get(55..55 + length)
+            .ok_or("short portable credential ID")?;
+        if self.intent.excluded.iter().any(|old| old.0.as_ref() == id) {
+            return Err("portable enrollment returned an excluded credential".into());
+        }
+        let tail = data
+            .get(55 + length..)
+            .ok_or("missing portable credential key")?;
+        let (cose, key_len) = cbor::prefix(tail)?;
+        if cose.map()?.len() != 5
+            || cose.required(&Value::Unsigned(1))? != &Value::Unsigned(2)
+            || cose.required(&Value::Unsigned(3))? != &Value::Negative(6)
+            || cose.required(&Value::Negative(0))? != &Value::Unsigned(1)
+        {
+            return Err("invalid portable public ES256 COSE profile".into());
+        }
+        let key = PublicKey::from_coordinates(
+            cose.required(&Value::Negative(1))?
+                .bytes()?
+                .try_into()
+                .map_err(|_| "credential x length")?,
+            cose.required(&Value::Negative(2))?
+                .bytes()?
+                .try_into()
+                .map_err(|_| "credential y length")?,
+        )?;
+        let extensions = cbor::decode(
+            tail.get(key_len..)
+                .ok_or("missing portable enrollment extensions")?,
+        )?;
+        for (name, _) in extensions.map()? {
+            name.text()?;
+        }
+        if !boolean(extensions.required(&Value::Text("hmac-secret"))?)? {
+            return Err("portable enrollment did not enable hmac-secret".into());
+        }
+        let credential = Credential {
+            id: Secret(id.into()),
+            cose: Secret(tail.get(..key_len).ok_or("credential key extent")?.into()),
+            salt,
+        };
+        let state = self.profile.assertion(id, key, challenge, salt)?;
+        Ok(EnrollmentProof { state, credential })
+    }
+}
+
+struct Credential {
+    id: Secret,
+    cose: Secret,
+    salt: [u8; 32],
+}
+impl Drop for Credential {
+    fn drop(&mut self) {
+        clear(&mut self.salt);
+    }
+}
+/// Candidate identity stays attached to the exact proof request through every step.
+pub(super) struct EnrollmentProof<S> {
+    state: S,
+    credential: Credential,
+}
+impl EnrollmentProof<KeyRequest> {
+    pub(super) fn bytes(&self) -> &[u8] {
+        self.state.bytes()
+    }
+    pub(super) fn with_pin(
+        self,
+        response: &[u8],
+        pin: Pin,
+        entropy: &mut impl FnMut(&mut [u8]) -> Result<(), String>,
+    ) -> Result<EnrollmentProof<PinRequest>, String> {
+        Ok(EnrollmentProof {
+            state: self.state.with_pin(response, pin, entropy)?,
+            credential: self.credential,
+        })
+    }
+}
+impl EnrollmentProof<PinRequest> {
+    pub(super) fn bytes(&self) -> &[u8] {
+        self.state.bytes()
+    }
+    pub(super) fn finish(
+        self,
+        response: &[u8],
+        entropy: &mut impl FnMut(&mut [u8]) -> Result<(), String>,
+    ) -> Result<EnrollmentProof<HmacRequest>, String> {
+        Ok(EnrollmentProof {
+            state: self.state.finish(response, entropy)?,
+            credential: self.credential,
+        })
+    }
+}
+impl EnrollmentProof<HmacRequest> {
+    pub(super) fn bytes(&self) -> &[u8] {
+        self.state.bytes()
+    }
+    pub(super) fn finish(self, response: &[u8]) -> Result<EnrolledCredential, String> {
+        let output = self.state.finish(response)?;
+        if output.info.backup_eligible || output.info.backed_up {
+            return Err("portable enrollment proof is not device-bound".into());
+        }
+        Ok(EnrolledCredential {
+            credential: self.credential,
+            output,
+        })
+    }
+}
+/// Backend-only evidence from one signed UV hmac-secret proof; no vault publication.
+pub(super) struct EnrolledCredential {
+    credential: Credential,
+    output: HmacOutput,
+}
+impl EnrolledCredential {
+    pub(super) fn id(&self) -> &[u8] {
+        &self.credential.id.0
+    }
+    pub(super) fn cose(&self) -> &[u8] {
+        &self.credential.cose.0
+    }
+    pub(super) fn salt(&self) -> &[u8; 32] {
+        &self.credential.salt
+    }
+    pub(super) fn output(&self) -> &HmacOutput {
+        &self.output
     }
 }
 
@@ -1083,5 +1447,493 @@ mod tests {
         assert!(pending.finish(&fixture(label, "response")).is_err());
         assert!(command(6, client_pin(Protocol::One, 2, 2).unwrap(), 6).is_ok());
         assert!(command(6, client_pin(Protocol::One, 2, 2).unwrap(), 5).is_err());
+    }
+    fn create_key(label: &str, excluded: &[&[u8]]) -> KeyRequest<Creation> {
+        Profile::parse(&fixture(label, "info"))
+            .unwrap()
+            .enrollment(
+                fixture(label, "create_challenge").try_into().unwrap(),
+                fixture(label, "user").try_into().unwrap(),
+                excluded,
+            )
+            .unwrap()
+    }
+    fn create_pin(label: &str, excluded: &[&[u8]]) -> PinRequest<Creation> {
+        let mut calls = 0;
+        let request = create_key(label, excluded);
+        assert_eq!(request.bytes(), fixture(label, "key_request"));
+        let result = request
+            .with_pin(
+                &fixture(label, "create_key_response"),
+                Pin::new(fixture(label, "pin").into_boxed_slice()).unwrap(),
+                &mut |bytes| {
+                    let field = match calls {
+                        0 => "create_scalar",
+                        1 => "create_iv_pin",
+                        _ => panic!("extra entropy"),
+                    };
+                    calls += 1;
+                    bytes.copy_from_slice(&fixture(label, field));
+                    Ok(())
+                },
+            )
+            .unwrap();
+        assert_eq!(calls, if label.starts_with("p1") { 1 } else { 2 });
+        assert_eq!(result.bytes(), fixture(label, "create_pin_request"));
+        result
+    }
+    fn make(label: &str, excluded: &[&[u8]]) -> MakeRequest {
+        create_pin(label, excluded)
+            .make(&fixture(label, "create_pin_response"))
+            .unwrap()
+    }
+    // Response-only tests do not repeat key agreement for every malformed byte.
+    fn make_parser(label: &str, excluded: &[&[u8]]) -> MakeRequest {
+        let request = create_key(label, excluded);
+        MakeRequest {
+            profile: request.profile,
+            intent: request.intent,
+            bytes: Secret::zeroed(0),
+        }
+    }
+    fn proof_request(
+        label: &str,
+        make_response: &[u8],
+        challenge: [u8; 32],
+    ) -> EnrollmentProof<HmacRequest> {
+        let proof = make_parser(label, &[])
+            .proof(
+                make_response,
+                challenge,
+                fixture(label, "salt").try_into().unwrap(),
+            )
+            .unwrap();
+        proof_steps(label, proof)
+    }
+    fn proof_steps(
+        label: &str,
+        proof: EnrollmentProof<KeyRequest>,
+    ) -> EnrollmentProof<HmacRequest> {
+        assert_eq!(proof.bytes(), fixture(label, "key_request"));
+        let mut calls = 0;
+        let proof = proof
+            .with_pin(
+                &fixture(label, "key_response"),
+                Pin::new(fixture(label, "pin").into_boxed_slice()).unwrap(),
+                &mut |bytes| {
+                    let field = match calls {
+                        0 => "scalar",
+                        1 => "iv_pin",
+                        _ => panic!("extra entropy"),
+                    };
+                    calls += 1;
+                    bytes.copy_from_slice(&fixture(label, field));
+                    Ok(())
+                },
+            )
+            .unwrap();
+        assert_eq!(proof.bytes(), fixture(label, "pin_request"));
+        proof
+            .finish(&fixture(label, "pin_response"), &mut |bytes| {
+                bytes.copy_from_slice(&fixture(label, "iv_salt"));
+                Ok(())
+            })
+            .unwrap()
+    }
+    fn make_data(label: &str) -> Vec<u8> {
+        let bytes = fixture(label, "make_none");
+        response_value(&bytes, 1024)
+            .unwrap()
+            .required(&Value::Unsigned(2))
+            .unwrap()
+            .bytes()
+            .unwrap()
+            .to_vec()
+    }
+    fn make_response(data: &[u8], format: &str) -> Vec<u8> {
+        let mut out = Encoder::new();
+        out.head(5, 2).unwrap();
+        out.head(0, 1).unwrap();
+        out.text(format).unwrap();
+        out.head(0, 2).unwrap();
+        out.bytes(data).unwrap();
+        let mut response = vec![0];
+        response.extend(out.finish().unwrap());
+        response
+    }
+
+    #[test]
+    fn enrollment_transcripts_bind_creation_permission_and_fresh_uv_secret_proof() {
+        for label in LABELS {
+            for (format, excluded, expected) in [
+                ("make_none", &[][..], "make_request"),
+                (
+                    "make_packed",
+                    &[b"prior-primary".as_slice(), b"prior-backup".as_slice()][..],
+                    "make_excluded",
+                ),
+            ] {
+                let created = make(label, excluded);
+                assert_eq!(created.bytes(), fixture(label, expected));
+                let proof = created
+                    .proof(
+                        &fixture(label, format),
+                        fixture(label, "challenge").try_into().unwrap(),
+                        fixture(label, "salt").try_into().unwrap(),
+                    )
+                    .unwrap();
+                let proof = proof_steps(label, proof);
+                assert_eq!(proof.bytes(), fixture(label, "enroll_assertion"));
+                let enrolled = proof.finish(&fixture(label, "enroll_response")).unwrap();
+                assert_eq!(enrolled.id(), fixture(label, "credential_id"));
+                assert_eq!(enrolled.cose(), fixture(label, "cose"));
+                assert_eq!(enrolled.salt().as_slice(), fixture(label, "salt"));
+                assert_eq!(enrolled.output().bytes(), fixture(label, "output"));
+                assert!(enrolled.output().info.user_verified);
+                assert_eq!(enrolled.output().info.counter, 7);
+            }
+        }
+    }
+
+    #[test]
+    fn enrollment_responses_refuse_truncation_flags_identity_and_missing_extension() {
+        let label = "p2-scoped";
+        let challenge = fixture(label, "challenge").try_into().unwrap();
+        let salt = fixture(label, "salt").try_into().unwrap();
+        let response = fixture(label, "make_none");
+        let refuse = |response: &[u8]| {
+            make_parser(label, &[])
+                .proof(response, challenge, salt)
+                .is_err()
+        };
+        for length in 0..response.len() {
+            assert!(refuse(&response[..length]), "length {length}");
+        }
+        for flags in [0x85, 0xc1, 0xc4, 0x45, 0xcd, 0xd5, 0xdd] {
+            let mut data = make_data(label);
+            data[32] = flags;
+            assert!(refuse(&make_response(&data, "none")), "flags {flags:x}");
+        }
+        for offset in [0, 37, 53, 54] {
+            let mut data = make_data(label);
+            data[offset] ^= 1;
+            assert!(refuse(&make_response(&data, "none")), "offset {offset}");
+        }
+        let mut data = make_data(label);
+        let len = data.len();
+        data[len - 1] = 0xf4;
+        assert!(refuse(&make_response(&data, "none")));
+        data[len - 1] = 0x01;
+        assert!(refuse(&make_response(&data, "none")));
+        data.truncate(len - 14);
+        assert!(refuse(&make_response(&data, "none")));
+        let mut trailing = response.clone();
+        trailing.push(0);
+        assert!(refuse(&trailing));
+        assert!(refuse(&[0x19]));
+        assert!(refuse(&[0; 1025]));
+        for format in ["", "packed", &"x".repeat(65)] {
+            assert!(refuse(&make_response(&make_data(label), format)));
+        }
+        let mut statement = response.clone();
+        statement[1] += 1;
+        statement.extend([3, 0xa1, 1, 2]);
+        assert!(refuse(&statement));
+        let id = fixture(label, "credential_id");
+        assert!(make_parser(label, &[&id])
+            .proof(&response, challenge, salt)
+            .is_err());
+        assert!(make_parser(label, &[])
+            .proof(
+                &response,
+                fixture(label, "create_challenge").try_into().unwrap(),
+                salt
+            )
+            .is_err());
+        let mut empty_statement = response.clone();
+        empty_statement[1] += 1;
+        empty_statement.extend([3, 0xa0]);
+        assert!(!refuse(&empty_statement));
+        let mut non_map = make_response(&make_data(label), "packed");
+        non_map[1] += 1;
+        non_map.extend([3, 0x80]);
+        assert!(refuse(&non_map));
+        for (value, admitted) in [(0xf4, true), (0xf5, false), (0, false)] {
+            let mut enterprise = response.clone();
+            enterprise[1] += 1;
+            enterprise.extend([4, value]);
+            assert_eq!(!refuse(&enterprise), admitted);
+        }
+        let padded = |size: usize| {
+            let mut out = Encoder::new();
+            out.head(5, 3).unwrap();
+            out.head(0, 1).unwrap();
+            out.text("packed").unwrap();
+            out.head(0, 2).unwrap();
+            out.bytes(&make_data(label)).unwrap();
+            out.head(0, 3).unwrap();
+            out.head(5, 1).unwrap();
+            out.text("x5c").unwrap();
+            out.head(4, 1).unwrap();
+            out.bytes(&vec![0; size]).unwrap();
+            let mut response = vec![0];
+            response.extend(out.finish().unwrap());
+            response
+        };
+        let padding = cbor::MAX_BYTES - padded(0).len() - 2;
+        let exact = padded(padding);
+        assert_eq!(exact.len(), cbor::MAX_BYTES);
+        assert!(exact.len() > Profile::parse(&fixture(label, "info")).unwrap().max_message);
+        assert!(!refuse(&exact));
+        assert!(refuse(&padded(padding + 1)));
+        let mut anonymous = make_parser(label, &[]);
+        anonymous.profile.aaguid = [7; 16];
+        assert!(anonymous.proof(&response, challenge, salt).is_ok());
+        let mut mismatched = make_parser(label, &[]);
+        mismatched.profile.aaguid = [7; 16];
+        assert!(mismatched
+            .proof(&fixture(label, "make_packed"), challenge, salt)
+            .is_err());
+    }
+
+    #[test]
+    fn enrollment_cose_requires_exact_public_es256_curve_membership() {
+        let label = "p1-legacy";
+        let data = make_data(label);
+        let key_offset = 55 + fixture(label, "credential_id").len();
+        let key_size = fixture(label, "cose").len();
+        let challenge = fixture(label, "challenge").try_into().unwrap();
+        let salt = fixture(label, "salt").try_into().unwrap();
+        let mut variants = Vec::new();
+        for offset in [2, 4, 6] {
+            let mut key = fixture(label, "cose");
+            key[offset] ^= 1;
+            variants.push(key);
+        }
+        let mut private = fixture(label, "cose");
+        private[0] += 1;
+        private.extend([0x23, 0x41, 1]);
+        variants.push(private);
+        let mut off_curve = fixture(label, "cose");
+        off_curve[10..42].fill(0xff);
+        variants.push(off_curve);
+        let mut off_curve = fixture(label, "cose");
+        off_curve[45..77].fill(0);
+        variants.push(off_curve);
+        let mut short_x = fixture(label, "cose");
+        short_x[9] = 31;
+        short_x.remove(10);
+        variants.push(short_x);
+        for key in variants {
+            let mut changed = data[..key_offset].to_vec();
+            changed.extend(key);
+            changed.extend(&data[key_offset + key_size..]);
+            assert!(make_parser(label, &[])
+                .proof(&make_response(&changed, "none"), challenge, salt)
+                .is_err());
+        }
+    }
+
+    #[test]
+    fn enrollment_proof_refuses_valid_signed_backup_flags_and_substituted_key_or_hash() {
+        let label = "p2-scoped";
+        let challenge = fixture(label, "challenge").try_into().unwrap();
+        for (field, reason) in [
+            ("enroll_be", "portable enrollment proof is not device-bound"),
+            ("enroll_bs", "portable enrollment proof is not device-bound"),
+            ("enroll_no_uv", "portable assertion requires UV"),
+            ("enroll_missing", "missing signed hmac-secret extension"),
+            ("enroll_short", "invalid PIN ciphertext length"),
+        ] {
+            let response = fixture(label, field);
+            let value = response_value(&response, 1024).unwrap();
+            let mut signed = value
+                .required(&Value::Unsigned(2))
+                .unwrap()
+                .bytes()
+                .unwrap()
+                .to_vec();
+            signed.extend(challenge);
+            let (r, s) = super::super::fido_ctap::signature(
+                value
+                    .required(&Value::Unsigned(3))
+                    .unwrap()
+                    .bytes()
+                    .unwrap(),
+            )
+            .unwrap();
+            let key = &intent(label, challenge).key;
+            key.verify(&crypto::digest(&signed), &r, &s).unwrap();
+            let result =
+                proof_request(label, &fixture(label, "make_none"), challenge).finish(&response);
+            assert_eq!(result.err().unwrap(), reason);
+        }
+        let response = fixture(label, "enroll_response");
+        let result = proof_request(label, &fixture(label, "make_none"), [9; 32]).finish(&response);
+        assert_eq!(
+            result.err().unwrap(),
+            "portable assertion signature mismatch"
+        );
+        let mut data = make_data(label);
+        let key_offset = 55 + fixture(label, "credential_id").len();
+        let key = fixture("p1-scoped", "cose");
+        data[key_offset..key_offset + key.len()].copy_from_slice(&key);
+        let result =
+            proof_request(label, &make_response(&data, "none"), challenge).finish(&response);
+        assert_eq!(
+            result.err().unwrap(),
+            "portable assertion signature mismatch"
+        );
+    }
+
+    #[test]
+    fn enrollment_limits_preserve_every_exclusion_before_pin_processing() {
+        let label = "p2-scoped";
+        let challenge = fixture(label, "create_challenge").try_into().unwrap();
+        let user = fixture(label, "user").try_into().unwrap();
+        let profile = || Profile::parse(&fixture(label, "info")).unwrap();
+        assert!(profile()
+            .enrollment(challenge, user, &[b"duplicate", b"duplicate"])
+            .is_err());
+        assert!(profile().enrollment(challenge, user, &[b""]).is_err());
+        let ids: Vec<Vec<u8>> = (0..9).map(|i| vec![i]).collect();
+        let refs: Vec<&[u8]> = ids.iter().map(Vec::as_slice).collect();
+        assert!(profile().enrollment(challenge, user, &refs[..8]).is_ok());
+        assert!(profile().enrollment(challenge, user, &refs).is_err());
+        let mut count = fixture(label, "info");
+        count[1] += 1;
+        count.extend([7, 1]);
+        assert!(Profile::parse(&count)
+            .unwrap()
+            .enrollment(challenge, user, &refs[..2])
+            .is_err());
+        for advertised in [9, 23] {
+            *count.last_mut().unwrap() = advertised;
+            assert!(Profile::parse(&count)
+                .unwrap()
+                .enrollment(challenge, user, &refs[..8])
+                .is_ok());
+            assert!(Profile::parse(&count)
+                .unwrap()
+                .enrollment(challenge, user, &refs)
+                .is_err());
+        }
+        let mut limited_id = profile();
+        limited_id.max_id = 2;
+        assert!(limited_id.enrollment(challenge, user, &[b"abc"]).is_err());
+        let size = fixture(label, "make_excluded").len();
+        let mut exact = profile();
+        exact.max_message = size;
+        assert!(exact
+            .enrollment(challenge, user, &[b"prior-primary", b"prior-backup"])
+            .is_ok());
+        let mut short = profile();
+        short.max_message = size - 1;
+        assert!(short
+            .enrollment(challenge, user, &[b"prior-primary", b"prior-backup"])
+            .is_err());
+        let mut algorithms = fixture(label, "info");
+        algorithms[1] += 1;
+        algorithms.extend(b"\x0a\x81\xa2\x63alg\x27\x64type\x6apublic-key");
+        let unsupported = Profile::parse(&algorithms).unwrap();
+        assert!(unsupported.enrollment(challenge, user, &[]).is_err());
+        // Advertised creation algorithms do not invalidate an existing ES256 key.
+        let i = intent(label, [1; 32]);
+        assert!(Profile::parse(&algorithms)
+            .unwrap()
+            .assertion(
+                &i.credential.0,
+                PublicKey::from_coordinates(
+                    &fixture(label, "x").try_into().unwrap(),
+                    &fixture(label, "y").try_into().unwrap()
+                )
+                .unwrap(),
+                [1; 32],
+                [2; 32]
+            )
+            .is_ok());
+        let at = algorithms.iter().position(|b| *b == 0x27).unwrap();
+        algorithms[at] = 0x26;
+        assert!(Profile::parse(&algorithms)
+            .unwrap()
+            .enrollment(challenge, user, &[])
+            .is_ok());
+        algorithms[at] = 0xf5;
+        assert!(Profile::parse(&algorithms).is_err());
+        let mut future = fixture(label, "info");
+        future[1] += 1;
+        future.extend(
+            b"\x0a\x82\xa2\x63alg\x26\x64type\x66future\xa2\x63alg\x26\x64type\x6apublic-key",
+        );
+        assert!(Profile::parse(&future)
+            .unwrap()
+            .enrollment(challenge, user, &[])
+            .is_ok());
+
+        for count in [0, 2] {
+            let mut algorithms = fixture(label, "info");
+            algorithms[1] += 1;
+            algorithms.extend([10, 0x80 + count]);
+            for _ in 0..count {
+                algorithms.extend(b"\xa2\x63alg\x26\x64type\x6apublic-key");
+            }
+            assert!(Profile::parse(&algorithms).is_err());
+        }
+        let oversized = vec![9; MAX_CREDENTIAL_ID + 1];
+        assert!(profile()
+            .enrollment(challenge, user, &[&oversized])
+            .is_err());
+        let large_ids: Vec<Vec<u8>> = (0..8).map(|i| vec![i; MAX_CREDENTIAL_ID]).collect();
+        let refs: Vec<&[u8]> = large_ids.iter().map(Vec::as_slice).collect();
+        let mut large = profile();
+        large.max_message = cbor::MAX_BYTES;
+        assert!(large.enrollment(challenge, user, &refs).is_err());
+    }
+
+    #[test]
+    fn enrollment_cancellation_errors_drop_each_pending_stage_without_output() {
+        let label = "p2-scoped";
+        for response in [vec![], vec![0x31], vec![0x32], vec![0x34], vec![0; 1025]] {
+            let result = create_key(label, &[]).with_pin(
+                &response,
+                Pin::new(fixture(label, "pin").into_boxed_slice()).unwrap(),
+                &mut |_| panic!("malformed key reply spent entropy"),
+            );
+            assert!(result.is_err());
+            assert!(create_pin(label, &[]).make(&response).is_err());
+        }
+        for fail_call in 0..2 {
+            let mut calls = 0;
+            let result = create_key(label, &[]).with_pin(
+                &fixture(label, "create_key_response"),
+                Pin::new(fixture(label, "pin").into_boxed_slice()).unwrap(),
+                &mut |bytes| {
+                    let call = calls;
+                    calls += 1;
+                    if call == fail_call {
+                        bytes.fill(8);
+                        return Err("entropy failed".into());
+                    }
+                    bytes.copy_from_slice(&fixture(label, "create_scalar"));
+                    Ok(())
+                },
+            );
+            assert_eq!(result.err().unwrap(), "entropy failed");
+            assert_eq!(calls, fail_call + 1);
+        }
+        let proof = make_parser(label, &[])
+            .proof(
+                &fixture(label, "make_none"),
+                fixture(label, "challenge").try_into().unwrap(),
+                fixture(label, "salt").try_into().unwrap(),
+            )
+            .unwrap();
+        assert!(proof
+            .with_pin(
+                &[0x31],
+                Pin::new(b"1234".to_vec().into_boxed_slice()).unwrap(),
+                &mut |_| panic!("malformed proof key reply spent entropy")
+            )
+            .is_err());
     }
 }

@@ -222,6 +222,55 @@ try:
                 data += cbor(extension)
             rows[name] = b"\0" + cbor({1: {"id": b"fixture-id", "type": "public-key"},
                                         2: data, 3: sign(signing, sha(data + challenge))})
+        # Enrollment uses a separate PIN transaction from its subsequent proof.
+        create_scalar = int.from_bytes(sha(seed + b"create-scalar"), "big") % (N-1) + 1
+        create_peer = int.from_bytes(sha(seed + b"create-peer"), "big") % (N-1) + 1
+        create_shared = xy(create_scalar * create_peer % N)[0]
+        create_aes = sha(create_shared) if protocol == 1 else hkdf(create_shared, b"CTAP2 AES key")
+        create_token = sha(seed + b"create-token")[:token_size]
+        create_challenge, user = sha(seed + b"create-challenge"), sha(seed + b"user")
+        create_iv_pin, create_iv_token = sha(seed + b"create-iv-pin")[:16], sha(seed + b"create-iv-token")[:16]
+        def create_enc(data, iv):
+            return aes(create_aes, bytes(16), data) if protocol == 1 else iv + aes(create_aes, iv, data)
+        create_client = {1: protocol, 2: 9 if permissions else 5, 3: cose(create_scalar),
+                         6: create_enc(sha(pin)[:16], create_iv_pin)}
+        if permissions:
+            create_client.update({9: 1, 10: "td.invalid"})
+        make = {1: create_challenge, 2: {"id": "td.invalid", "name": "td personal vault"},
+                3: {"id": user, "name": "td personal vault", "displayName": "td personal vault"},
+                4: [{"alg": -7, "type": "public-key"}], 6: {"hmac-secret": True},
+                7: {"rk": False}, 8: auth(create_token, create_challenge), 9: protocol}
+        credential_id = b"enrolled-" + seed
+        public = cose(signing)
+        public[3] = -7
+        data = sha(b"td.invalid") + b"\xc5" + (0).to_bytes(4, "big") + bytes(16)
+        data += len(credential_id).to_bytes(2, "big") + credential_id + cbor(public) + cbor({"hmac-secret": True})
+        rows.update(create_scalar=create_scalar.to_bytes(32, "big"), create_iv_pin=create_iv_pin,
+                    create_challenge=create_challenge, user=user, credential_id=credential_id, cose=cbor(public),
+                    create_key_response=b"\0"+cbor({1: cose(create_peer)}),
+                    create_pin_request=b"\6"+cbor(create_client),
+                    create_pin_response=b"\0"+cbor({2: create_enc(create_token, create_iv_token)}),
+                    make_request=b"\1"+cbor(make),
+                    make_none=b"\0"+cbor({1: "none", 2: data}),
+                    make_packed=b"\0"+cbor({1: "packed", 2: data,
+                        3: {"alg": -7, "sig": sign(signing, sha(data + create_challenge))}}))
+        make[5] = [{"id": b"prior-primary", "type": "public-key"},
+                   {"id": b"prior-backup", "type": "public-key"}]
+        rows["make_excluded"] = b"\1"+cbor(make)
+        get[3] = [{"id": credential_id, "type": "public-key"}]
+        rows["enroll_assertion"] = b"\2"+cbor(get)
+        for name, flags, extension in [
+                ("enroll_response", 0x85, {"hmac-secret": encrypted}),
+                ("enroll_be", 0x8d, {"hmac-secret": encrypted}),
+                ("enroll_bs", 0x9d, {"hmac-secret": encrypted}),
+                ("enroll_no_uv", 0x81, {"hmac-secret": encrypted}),
+                ("enroll_missing", 0x05, None),
+                ("enroll_short", 0x85, {"hmac-secret": encrypted[:-16]})]:
+            data = sha(b"td.invalid") + bytes([flags]) + (7).to_bytes(4, "big")
+            if extension is not None:
+                data += cbor(extension)
+            rows[name] = b"\0"+cbor({1: {"id": credential_id, "type": "public-key"},
+                                      2: data, 3: sign(signing, sha(data + challenge))})
         for key, value in rows.items():
             print(label, key, value.hex())
 finally:

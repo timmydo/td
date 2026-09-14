@@ -395,8 +395,9 @@ closure. Its NIST inputs are public CAVP data, not CAVP validation:
 `src/fido_pin.rs` implements a private, safe-Rust protocol flow for an
 already enrolled ES256 credential. It owns PIN handling, key agreement,
 PIN-token decryption, request authentication, signature verification and
-one-salt hmac-secret output. It has no device, timer, prompt, enrollment,
-persistent writer or public notebook API. It does not change the existing
+one-salt hmac-secret output. The enrollment codec below reuses this PIN
+exchange. It has no device, timer, prompt, persistent writer or public
+notebook API. It does not change the existing
 TPM-backed application assertion path. Response parsing is shared with that
 path; software verification uses the private P-256 implementation. Its
 private verification context retains a never-sent presence-only request
@@ -444,7 +445,8 @@ consumes the returned token for exactly the pinned assertion. It accepts
 16 or 32 plaintext token bytes under protocol 1 and exactly 32 under
 protocol 2. The decrypted token is retired immediately after authenticating
 the pinned client-data hash. It is not proof of user verification by itself.
-No raw token accessor, makeCredential, reset, changePIN or setPIN path exists.
+No raw token accessor, reset, changePIN or setPIN path exists. The creation
+flow below has its own operation type and permission.
 
 The assertion requests presence, the PIN authorization and one encrypted,
 authenticated salt. Built-in uv is absent because ClientPIN supplies UV.
@@ -487,6 +489,99 @@ and refuse signed-byte mutations, truncations, malformed negotiation and
 key/token responses, size violations, and failed entropy at each stage.
 Negative-policy tests first verify each fixture signature independently of
 the policy parser, then assert its exact refusal reason.
+
+### Implemented portable creation and proof codec
+
+The same private `src/fido_pin.rs` now supplies PIN-authorized
+makeCredential followed by a separate PIN-authorized hmac-secret proof.
+It shares key agreement, PIN-token admission and authentication with the
+assertion flow through typed operation state. Scoped tokens request only
+makeCredential permission (0x01) for creation, then only getAssertion
+permission (0x02) in a new proof transaction. Legacy subcommand 5 remains
+selected only by capability, before any attempt. Each token is retired
+immediately after authenticating its one pinned client-data hash.
+
+The backend supplies a fresh creation hash, opaque 32-byte user handle and
+all existing credential IDs. The codec accepts zero through eight excluded
+IDs, bounded by advertised list/ID limits and the complete encoded request
+size. Empty and duplicate IDs are refused; an empty list is omitted from
+the wire. No ID is dropped, shortened or split across requests to fit a
+token. The full creation command is size-checked before PIN processing.
+When getInfo advertises creation algorithms, the list must be nonempty,
+well-typed and duplicate-free. Unknown text credential types are ignored
+for selection, never treated as public-key. Enrollment requires ES256
+with the public-key type in that list;
+an absent list permits an ES256 request whose response still has to match.
+An advertised list without ES256 does not forbid an existing ES256
+assertion. The other PIN capability requirements remain unchanged.
+
+The fixed request uses td.invalid, generic personal-vault display labels,
+ES256, rk=false, hmac-secret=true and the selected PIN protocol and
+authentication parameter. User presence is left at its required true
+default for CTAP2.0 compatibility; built-in uv is absent. It requests no
+enterprise attestation, discoverable credential, credential deletion or
+PIN administration. The backend must present each immutable operation,
+retain its device/channel and deadline, and supply independent fresh
+entropy for creation and proof. The codec has no transport and cannot
+establish those obligations or enforce physically distinct tokens.
+
+The creation response is canonical CBOR bounded by the local HID/CBOR
+ceiling, including its status byte. The token's advertised maxMsgSize
+limits commands it receives, not attestation-bearing creation responses.
+A present epAtt field must be boolean false; unsolicited enterprise
+attestation is refused. This cannot undo identifying bytes already sent
+by a token. Require the fixed RP,
+UP, UV, attested data, extensions and neither backup flag; admit only a
+nonempty bounded ID that is not excluded. The public COSE key has exactly
+EC2/ES256/P-256's five public parameters, canonical 32-byte coordinates
+and validated curve membership. Parse the complete extension map and
+require hmac-secret=true. The AAGUID must match getInfo, except that none
+attestation may anonymize it to zero. None attestation permits an omitted
+or empty statement; other nonempty bounded format names require a map,
+whose contents (including an empty map) are not verified.
+Attestation statements and AAGUIDs are not authenticated identity evidence;
+no certificate parser, trust root or attestation verification is added.
+The flags and hmac-secret confirmation in this response are likewise
+untrusted until the subsequent proof establishes the usable credential.
+
+Creation returns only a pending proof state, with no candidate credential
+or output accessor. The proof must have a different, fresh operation-bound
+challenge and the exact vault salt. Its state owns the candidate ID/key and
+carries that identity through key agreement, PIN authorization and the
+signed assertion. Only successful software ES256 verification of UP, UV
+and the hmac-secret ciphertext, plus refusal of both signed backup flags,
+produces an EnrolledCredential. It retains the exact ID, canonical public
+COSE key, salt, 32-byte hmac-secret output owner and verified assertion
+metadata. The opaque creation user handle is retired; it is not an
+authenticated account identity or the output secret. The
+unsigned creation counter is not a persisted baseline; the verified proof
+counter is available for the future backend to retain and compare.
+
+This is one proof of usable key possession and a UV secret, not a complete
+primary/backup enrollment transaction or a physical hardware result. The
+future backend must repeat salt recovery with independent exchanges, prove
+both wrappers open the same notebook, bind public verification keys into
+the authenticated persistent format, and publish only the complete proved
+protector table. The current envelope prerequisite does not yet serialize
+those public keys. It must be amended before persisted hardware unlock.
+Cancellation or refusal consumes pending state and produces no enrolled
+credential; a token may still contain an orphan after uncertain creation.
+No operation is automatically retried and no vault bytes are published.
+
+The extended public Python/OpenSSL fixtures cover both PIN protocols and
+scoped/legacy commands, independent creation/proof ECDH exchanges, exact
+creation requests with and without exclusions, none/packed creation
+responses and signed proof output. Proof cases reuse the existing assertion
+cryptographic oracle with a new credential ID; each creation exchange uses
+different scalar/peer/token/IV material from its corresponding proof. The original assertion rows are
+unchanged. Tests reject response truncations, wrong flags/RP/AAGUID,
+excluded IDs, malformed/off-curve/private COSE keys, missing or false
+hmac-secret confirmation, stale proof hashes, wrong proof keys, signed
+backup flags, message/list/ID limits and failure at each PIN boundary.
+Additional response tests cover none with an empty statement, a non-map
+packed statement, epAtt admission, and attestation-bearing responses above
+the command limit up to the exact local response ceiling.
+These remain offline codec tests, not YubiKey interoperability evidence.
 
 ## Independently landable increments
 
