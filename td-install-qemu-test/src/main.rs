@@ -5,12 +5,13 @@ use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt};
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitCode};
+use std::process::{Command, ExitCode, Stdio};
 use std::time::{Duration, Instant};
 
 mod protocol;
 use protocol::*;
 
+const ENXIO: i32 = 6; // A published block node whose driver is not ready yet.
 const ENOMEDIUM: i32 = 123; // Linux: an optical drive with no readable medium.
 
 fn report(mut output: impl Write, message: std::fmt::Arguments<'_>) -> Result<(), String> {
@@ -124,7 +125,9 @@ fn media_device() -> Result<&'static str, String> {
                     // Opening read-only asks the block driver to check media.
                     let _medium = match File::open(path) {
                         Ok(file) => file,
-                        Err(error) if error.raw_os_error() == Some(ENOMEDIUM) => continue,
+                        Err(error) if matches!(error.raw_os_error(), Some(ENOMEDIUM | ENXIO)) => {
+                            continue
+                        }
                         Err(error) => return Err(format!("open media {path}: {error}")),
                     };
                     let name = path.strip_prefix("/dev/").ok_or("invalid fixture device")?;
@@ -201,10 +204,57 @@ fn configured_uuid() -> Result<String, String> {
         .ok_or_else(|| "configured volume UUID lacks its newline".into())
 }
 
+fn inventory_line(bytes: Vec<u8>) -> Result<String, String> {
+    if bytes.len() > MAX_INVENTORY_BYTES {
+        return Err("fixture inventory exceeds its byte limit".to_owned());
+    }
+    let text = String::from_utf8(bytes).map_err(|_| "inventory is not UTF-8")?;
+    let line = text
+        .strip_suffix('\n')
+        .ok_or("inventory lacks final newline")?;
+    if line.is_empty() || line.contains(['\n', '\r']) {
+        return Err("inventory is not one complete line".into());
+    }
+    Ok(line.to_owned())
+}
+
+fn inventory(marker: &str) -> Result<(), String> {
+    let mut child = Command::new("/bin/td-install")
+        .arg("inventory")
+        .stdout(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("start inventory: {error}"))?;
+    let captured = (|| {
+        let stdout = child.stdout.take().ok_or("inventory stdout is not piped")?;
+        let mut bytes = Vec::new();
+        stdout
+            .take(MAX_INVENTORY_BYTES as u64 + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|error| format!("read inventory: {error}"))?;
+        inventory_line(bytes)
+    })();
+    if captured.is_err() {
+        let _ = child.kill();
+    }
+    let waited = child
+        .wait()
+        .map_err(|error| format!("reap inventory: {error}"));
+    let json = captured?;
+    let status = waited?;
+    if !status.success() {
+        return Err(format!("inventory failed: {status}"));
+    }
+    report(
+        std::io::stdout(),
+        format_args!("{marker} {} {json}", json.len()),
+    )
+}
+
 fn install(device: &str, interrupt: bool) -> Result<(), String> {
     // The ISO carries the signed payloads and the live initramfs's public key.
     // Every path is fixture-owned; no private key enters the guest.
     mount_source()?;
+    inventory(INVENTORY_BEFORE_MARKER)?;
     let uuid = configured_uuid()?;
     let name = device
         .strip_prefix("/dev/")
@@ -263,6 +313,7 @@ fn install(device: &str, interrupt: bool) -> Result<(), String> {
         }
     }
     let partition = refresh_partitions(device, &uuid)?;
+    inventory(INVENTORY_AFTER_MARKER)?;
     fs::remove_dir_all("/scratch").map_err(|error| format!("remove formatter scratch: {error}"))?;
     // The volume image contains only filesystem metadata and the trust layout.
     // Publication now streams from read-only media straight onto the disk.
@@ -584,6 +635,27 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn inventory_report_requires_one_bounded_complete_utf8_line() {
+        assert_eq!(inventory_line(b"{}\n".to_vec()).unwrap(), "{}");
+        for bytes in [
+            b"".to_vec(),
+            b"{}".to_vec(),
+            b"{}\n{}\n".to_vec(),
+            b"{}\r\n".to_vec(),
+            vec![0xff, b'\n'],
+        ] {
+            assert!(inventory_line(bytes).is_err());
+        }
+        let mut exact = vec![b' '; MAX_INVENTORY_BYTES];
+        if let Some(last) = exact.last_mut() {
+            *last = b'\n';
+        }
+        assert!(inventory_line(exact.clone()).is_ok());
+        exact.insert(0, b' ');
+        assert!(inventory_line(exact).is_err());
     }
 
     #[test]

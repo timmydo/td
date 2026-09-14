@@ -333,6 +333,14 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
                 timeout,
             )?;
             require_installation(&result, &uuid, source_device)?;
+            require_inventory(
+                &result,
+                &target,
+                source_device,
+                &iso,
+                true,
+                InventoryBefore::Fresh,
+            )?;
             require(
                 &result,
                 &format!("{} {}", protocol::SECTOR_BYTES_MARKER, sector_size.bytes()),
@@ -442,6 +450,14 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
             protocol::INTERRUPTED_MARKER,
         )?;
         validate_interruption(&interrupted, kernel_bytes, &uuid, source_device)?;
+        require_inventory(
+            &interrupted,
+            &target,
+            source_device,
+            &interrupted_iso,
+            true,
+            InventoryBefore::Fresh,
+        )?;
         println!("   [qemu-install] refusing an incomplete installation, {name} media detached");
         let refused = format!(
             "{} /bin/td-boot failed: exit status: 1",
@@ -460,6 +476,14 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
         );
         let repaired = boot("repair", &iso, attachment, true, protocol::INSTALL_MARKER)?;
         require_installation(&repaired, &uuid, source_device)?;
+        require_inventory(
+            &repaired,
+            &target,
+            source_device,
+            &iso,
+            true,
+            InventoryBefore::Reinstall,
+        )?;
         let expected = format!("{} {id}", protocol::FIRST_BOOT_MARKER);
         let installed = boot(
             "reboot",
@@ -515,6 +539,14 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
                 ));
             }
             validate_target_refusal(&refused, source_device, diagnostic)?;
+            require_inventory(
+                &refused,
+                &target,
+                source_device,
+                &iso,
+                false,
+                InventoryBefore::Fresh,
+            )?;
         }
     }
     let refuse = |case: &str, image: &Path, diagnostic: &str| -> Result<(), String> {
@@ -551,6 +583,14 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
                 &refused,
                 &format!("{} {source_device}", protocol::MEDIA_MARKER),
                 "refused media access",
+            )?;
+            require_inventory(
+                &refused,
+                &target,
+                source_device,
+                image,
+                false,
+                InventoryBefore::Fresh,
             )?;
             if !refused.evidence.target
                 || !refused.console.lines().any(|line| {
@@ -605,6 +645,335 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
         "PASS: native optical/USB 512-byte/4Kn installation and interrupted-publication refusal/reinstallation; provisioned UUID binding across verified kexec and reordered disks; duplicate identity refusal; undersized/read-only targets and wrong-key/corrupt-payload optical/USB refusals preserve every target byte; two persistent installed boots"
     );
     Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum InventoryBefore {
+    Fresh,
+    Reinstall,
+}
+
+struct InventoryExpected<'a> {
+    target_bytes: u64,
+    source_bytes: u64,
+    sector_bytes: u64,
+    read_only: bool,
+    source_name: &'a str,
+    before: InventoryBefore,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct InventoryIdentity {
+    target_number: String,
+    target_sequence: u64,
+    source_number: String,
+    source_sequence: u64,
+}
+
+fn inventory_field<'a>(
+    value: &'a td_engine::json::Json,
+    name: &str,
+) -> Result<&'a td_engine::json::Json, String> {
+    let td_engine::json::Json::Obj(fields) = value else {
+        return Err("inventory value is not an object".into());
+    };
+    let mut found = fields.iter().filter(|(key, _)| key == name);
+    let (_, value) = found
+        .next()
+        .ok_or_else(|| format!("inventory lacks {name}"))?;
+    if found.next().is_some() {
+        return Err(format!("inventory duplicates {name}"));
+    }
+    Ok(value)
+}
+
+fn inventory_number(value: &td_engine::json::Json, name: &str) -> Result<u64, String> {
+    let td_engine::json::Json::Num(number) = inventory_field(value, name)? else {
+        return Err(format!("inventory {name} is not an integer"));
+    };
+    number
+        .parse()
+        .map_err(|_| format!("inventory {name} is not an unsigned integer"))
+}
+
+fn inventory_expect_field(
+    value: &td_engine::json::Json,
+    device: &str,
+    field: &str,
+    expected: &td_engine::json::Json,
+) -> Result<(), String> {
+    let actual = inventory_field(value, field).map_err(|error| format!("{device}: {error}"))?;
+    if actual != expected {
+        return Err(format!(
+            "inventory {device}.{field}: expected {expected:?}, observed {actual:?}"
+        ));
+    }
+    Ok(())
+}
+
+fn inventory_expect_number(
+    value: &td_engine::json::Json,
+    device: &str,
+    field: &str,
+    expected: u64,
+) -> Result<(), String> {
+    let actual = inventory_number(value, field).map_err(|error| format!("{device}: {error}"))?;
+    if actual != expected {
+        return Err(format!(
+            "inventory {device}.{field}: expected {expected}, observed {actual}"
+        ));
+    }
+    Ok(())
+}
+
+fn inventory_document(text: &str) -> Result<td_engine::json::Json, String> {
+    if text.len() >= protocol::MAX_INVENTORY_BYTES {
+        return Err("inventory exceeds fixture byte limit".into());
+    }
+    // Bound nesting before entering the shared recursive JSON parser.
+    const MAX_INVENTORY_DEPTH: usize = 8;
+    let mut depth = 0usize;
+    let mut quoted = false;
+    let mut escaped = false;
+    for byte in text.bytes() {
+        if quoted {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                quoted = false;
+            }
+        } else {
+            match byte {
+                b'"' => quoted = true,
+                b'{' | b'[' => {
+                    depth += 1;
+                    if depth > MAX_INVENTORY_DEPTH {
+                        return Err("inventory nesting exceeds fixture limit".into());
+                    }
+                }
+                b'}' | b']' => depth = depth.checked_sub(1).ok_or("unbalanced inventory JSON")?,
+                _ => {}
+            }
+        }
+    }
+    td_engine::json::parse(text).map_err(|error| format!("invalid inventory JSON: {error}"))
+}
+
+fn inventory_snapshot(
+    console: &str,
+    marker: &str,
+    expected: &InventoryExpected<'_>,
+    partitioned: bool,
+) -> Result<InventoryIdentity, String> {
+    use td_engine::json::Json;
+    let prefix = format!("{marker} ");
+    let mut lines = console
+        .lines()
+        .filter_map(|line| line.strip_prefix(&prefix));
+    let line = lines.next().ok_or_else(|| format!("missing {marker}"))?;
+    if lines.next().is_some() {
+        return Err(format!("duplicate {marker}"));
+    }
+    let (length, payload) = line.split_once(' ').ok_or("inventory lacks byte framing")?;
+    let length = length
+        .parse::<usize>()
+        .map_err(|_| "invalid inventory byte length")?;
+    if length >= protocol::MAX_INVENTORY_BYTES {
+        return Err("inventory exceeds fixture byte limit".into());
+    }
+    let json = payload.get(..length).ok_or("truncated inventory bytes")?;
+    let document = inventory_document(json)?;
+    if inventory_number(&document, "version")? != 1
+        || inventory_field(&document, "scope")?.as_str() != Some("inventory-only")
+    {
+        return Err("inventory has the wrong version or scope".into());
+    }
+    let devices = inventory_field(&document, "devices")?
+        .as_arr()
+        .ok_or("inventory devices is not an array")?;
+    let mut by_name = std::collections::BTreeMap::new();
+    let mut numbers = std::collections::BTreeSet::new();
+    let mut target_partitions = 0usize;
+    for device in devices {
+        let name = inventory_field(device, "name")?
+            .as_str()
+            .ok_or("inventory device name is not text")?;
+        let number = inventory_field(device, "device_number")?
+            .as_str()
+            .ok_or("inventory device number is not text")?;
+        if !numbers.insert(number) {
+            return Err(format!(
+                "inventory {name}.device_number duplicates {number}"
+            ));
+        }
+        match inventory_field(device, "parent")? {
+            Json::Null => {}
+            Json::Str(parent) => {
+                if parent == "vda" {
+                    target_partitions += 1;
+                }
+            }
+            _ => return Err(format!("inventory {name}.parent is not text or null")),
+        }
+        if by_name.insert(name, device).is_some() {
+            return Err("inventory duplicates a device name".into());
+        }
+    }
+    let target = by_name
+        .get("vda")
+        .ok_or("inventory lacks the fixture target")?;
+    let source = by_name
+        .get(expected.source_name)
+        .ok_or("inventory lacks the source media")?;
+    for (name, device, capacity, read_only) in [
+        ("vda", target, expected.target_bytes, expected.read_only),
+        (expected.source_name, source, expected.source_bytes, true),
+    ] {
+        inventory_expect_number(device, name, "capacity_bytes", capacity)?;
+        inventory_expect_field(device, name, "read_only", &Json::Bool(read_only))?;
+        inventory_expect_field(device, name, "parent", &Json::Null)?;
+        inventory_expect_field(device, name, "partition_number", &Json::Null)?;
+    }
+    let target_disk = inventory_field(target, "disk")?;
+    let source_disk = inventory_field(source, "disk")?;
+    inventory_expect_number(
+        target_disk,
+        "vda.disk",
+        "logical_sector_bytes",
+        expected.sector_bytes,
+    )?;
+    inventory_expect_field(
+        target_disk,
+        "vda.disk",
+        "serial",
+        &Json::Str(protocol::TARGET_SERIAL.into()),
+    )?;
+    inventory_expect_number(
+        source_disk,
+        &format!("{}.disk", expected.source_name),
+        "logical_sector_bytes",
+        if expected.source_name == "sr0" {
+            2048
+        } else {
+            512
+        },
+    )?;
+    let identity = InventoryIdentity {
+        target_number: inventory_field(target, "device_number")?
+            .as_str()
+            .ok_or("missing target device number")?
+            .into(),
+        target_sequence: inventory_number(target_disk, "sequence")?,
+        source_number: inventory_field(source, "device_number")?
+            .as_str()
+            .ok_or("missing source device number")?
+            .into(),
+        source_sequence: inventory_number(source_disk, "sequence")?,
+    };
+    if identity.target_sequence == 0
+        || identity.source_sequence == 0
+        || identity.target_number == identity.source_number
+    {
+        return Err(format!(
+            "inventory has invalid whole-disk identities: {identity:?}"
+        ));
+    }
+    if !partitioned && matches!(expected.before, InventoryBefore::Fresh) && target_partitions != 0 {
+        return Err(format!(
+            "inventory fresh vda has {target_partitions} partitions"
+        ));
+    }
+    if partitioned {
+        let disk_sectors = expected
+            .target_bytes
+            .checked_div(expected.sector_bytes)
+            .ok_or("invalid fixture target sector size")?;
+        let last_usable = td_engine::gpt::last_usable_lba(expected.sector_bytes, disk_sectors)?;
+        let volume_bytes = last_usable
+            .checked_add(1)
+            .and_then(|end| end.checked_mul(expected.sector_bytes))
+            .and_then(|end| end.checked_sub(td_boot_protocol::PARTITION_ALIGN_BYTES))
+            .and_then(|end| end.checked_sub(td_boot_protocol::ESP_BYTES))
+            .filter(|bytes| *bytes >= td_boot_protocol::MIN_VOLUME_BYTES)
+            .ok_or("invalid fixture volume capacity")?;
+        if target_partitions != 2 {
+            return Err(format!(
+                "inventory vda: expected two target partitions, observed {target_partitions}"
+            ));
+        }
+        for (name, number) in [("vda1", 1), ("vda2", 2)] {
+            let partition = by_name
+                .get(name)
+                .ok_or_else(|| format!("inventory lacks {name} after formatting"))?;
+            inventory_expect_field(partition, name, "parent", &Json::Str("vda".into()))?;
+            inventory_expect_number(partition, name, "partition_number", number)?;
+            inventory_expect_field(partition, name, "disk", &Json::Null)?;
+            inventory_expect_field(partition, name, "read_only", &Json::Bool(false))?;
+            inventory_expect_number(
+                partition,
+                name,
+                "capacity_bytes",
+                if number == 1 {
+                    td_boot_protocol::ESP_BYTES
+                } else {
+                    volume_bytes
+                },
+            )?;
+        }
+    }
+    Ok(identity)
+}
+
+fn validate_inventories(
+    console: &str,
+    expected: &InventoryExpected<'_>,
+    partitioned: bool,
+) -> Result<(), String> {
+    let before = inventory_snapshot(console, protocol::INVENTORY_BEFORE_MARKER, expected, false)?;
+    if partitioned {
+        let after = inventory_snapshot(console, protocol::INVENTORY_AFTER_MARKER, expected, true)?;
+        if before != after {
+            return Err(format!(
+                "inventory whole-disk identity changed: before {before:?}, after {after:?}"
+            ));
+        }
+    } else if console
+        .lines()
+        .any(|line| line.starts_with(protocol::INVENTORY_AFTER_MARKER))
+    {
+        return Err("refusal unexpectedly reported a formatted inventory".into());
+    }
+    Ok(())
+}
+
+fn require_inventory(
+    result: &BootResult,
+    target: &TargetDisk,
+    source_device: &str,
+    iso: &Path,
+    partitioned: bool,
+    before: InventoryBefore,
+) -> Result<(), String> {
+    let expected = InventoryExpected {
+        target_bytes: fs::metadata(&target.path)
+            .map_err(|error| error.to_string())?
+            .len(),
+        source_bytes: fs::metadata(iso).map_err(|error| error.to_string())?.len(),
+        sector_bytes: target.sector_size.bytes(),
+        read_only: target.read_only,
+        source_name: source_device
+            .strip_prefix("/dev/")
+            .ok_or("invalid fixture media path")?,
+        before,
+    };
+    validate_inventories(&result.console, &expected, partitioned).map_err(|error| {
+        format!(
+            "installer inventory: {error}\n{}",
+            tail(&result.console, 80)
+        )
+    })
 }
 
 fn validate_target_refusal(
@@ -860,6 +1229,14 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
             timeout,
         )?;
         require_installation(&result, &uuid, source_device)?;
+        require_inventory(
+            &result,
+            &target,
+            source_device,
+            &iso,
+            true,
+            InventoryBefore::Fresh,
+        )?;
         let mut first = None;
         for count in 1..=2 {
             let decoy = if count == 2 {
@@ -1497,5 +1874,214 @@ mod tests {
             result.err().unwrap(),
             "an installation target requires optical or USB source media"
         );
+    }
+    const INVENTORY_FIXTURE: &str = r#"{"version":1,"scope":"inventory-only","devices":[{"name":"vda","device_number":"252:0","capacity_bytes":6442450944,"read_only":false,"parent":null,"partition_number":null,"disk":{"sequence":11,"logical_sector_bytes":4096,"serial":"td-install-test","removable":false,"model":null,"wwid":null},"holders":[],"slaves":[]},{"name":"sr0","device_number":"11:0","capacity_bytes":1048576,"read_only":true,"parent":null,"partition_number":null,"disk":{"sequence":12,"logical_sector_bytes":2048,"removable":true,"model":null,"wwid":null,"serial":null},"holders":[],"slaves":[]},{"name":"vda1","device_number":"252:1","read_only":false,"capacity_bytes":536870912,"parent":"vda","partition_number":1,"disk":null,"holders":[],"slaves":[]},{"name":"vda2","device_number":"252:2","read_only":false,"capacity_bytes":5904510976,"parent":"vda","partition_number":2,"disk":null,"holders":[],"slaves":[]}]}"#;
+
+    fn inventory_expectation() -> InventoryExpected<'static> {
+        InventoryExpected {
+            target_bytes: 6 * 1024 * 1024 * 1024,
+            source_bytes: 1024 * 1024,
+            sector_bytes: 4096,
+            read_only: false,
+            source_name: "sr0",
+            before: InventoryBefore::Reinstall,
+        }
+    }
+
+    fn inventory_console(before: &str, after: Option<&str>) -> String {
+        let mut console = format!(
+            "{} {} {before}\n",
+            protocol::INVENTORY_BEFORE_MARKER,
+            before.len()
+        );
+        if let Some(after) = after {
+            console.push_str(&format!(
+                "{} {} {after}\n",
+                protocol::INVENTORY_AFTER_MARKER,
+                after.len()
+            ));
+        }
+        console
+    }
+
+    #[test]
+    fn inventory_oracle_checks_host_geometry_capacity_identity_and_partitions() {
+        let expected = inventory_expectation();
+        let valid = inventory_console(INVENTORY_FIXTURE, Some(INVENTORY_FIXTURE));
+        assert!(validate_inventories(&valid, &expected, true).is_ok());
+        for (old, new) in [
+            ("6442450944", "6442450943"),
+            ("1048576", "1048575"),
+            (
+                "\"logical_sector_bytes\":4096",
+                "\"logical_sector_bytes\":512",
+            ),
+            ("\"read_only\":false", "\"read_only\":true"),
+            ("td-install-test", "some-other-disk"),
+            ("\"parent\":\"vda\"", "\"parent\":\"vdb\""),
+            ("\"partition_number\":2", "\"partition_number\":1"),
+            ("\"name\":\"vda1\"", "\"name\":\"missing\""),
+            ("536870912", "536870911"),
+            ("5904510976", "1"),
+            ("5904510976", "6442450943"),
+            ("inventory-only", "eligible-targets"),
+            ("\"name\":\"vda\"", "\"name\":\"vda\",\"name\":\"vdb\""),
+        ] {
+            let changed = INVENTORY_FIXTURE.replace(old, new);
+            assert_ne!(changed, INVENTORY_FIXTURE);
+            assert!(
+                validate_inventories(
+                    &inventory_console(&changed, Some(&changed)),
+                    &expected,
+                    true
+                )
+                .is_err(),
+                "accepted {old} -> {new}"
+            );
+        }
+        let extra = INVENTORY_FIXTURE.replace(
+            "\"devices\":[",
+            "\"devices\":[{\"name\":\"vda3\",\"device_number\":\"252:3\",\"parent\":\"vda\"},",
+        );
+        assert!(
+            validate_inventories(&inventory_console(&extra, Some(&extra)), &expected, true)
+                .is_err()
+        );
+        let changed = INVENTORY_FIXTURE.replace("\"sequence\":11", "\"sequence\":13");
+        assert!(validate_inventories(
+            &inventory_console(INVENTORY_FIXTURE, Some(&changed)),
+            &expected,
+            true
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn inventory_oracle_requires_unique_reports_and_rejects_post_format_refusals() {
+        let expected = inventory_expectation();
+        let before = inventory_console(INVENTORY_FIXTURE, None);
+        assert!(validate_inventories(&before, &expected, false).is_ok());
+        let trailing_kernel = before.replace('\n', "clocksource: Switched to clocksource tsc\n");
+        assert!(validate_inventories(&trailing_kernel, &expected, false).is_ok());
+        let interleaved = before.replace("\"capacity_bytes\"", "kernel message\"capacity_bytes\"");
+        assert!(validate_inventories(&interleaved, &expected, false).is_err());
+        for length in [
+            "0".to_owned(),
+            "invalid".to_owned(),
+            protocol::MAX_INVENTORY_BYTES.to_string(),
+            (INVENTORY_FIXTURE.len() - 1).to_string(),
+            (INVENTORY_FIXTURE.len() + 1).to_string(),
+        ] {
+            let malformed = format!(
+                "{} {length} {INVENTORY_FIXTURE}\n",
+                protocol::INVENTORY_BEFORE_MARKER
+            );
+            assert!(validate_inventories(&malformed, &expected, false).is_err());
+        }
+        assert!(validate_inventories(&before, &expected, true).is_err());
+        assert!(validate_inventories(&format!("{before}{before}"), &expected, false).is_err());
+        assert!(validate_inventories(
+            &inventory_console(INVENTORY_FIXTURE, Some(INVENTORY_FIXTURE)),
+            &expected,
+            false
+        )
+        .is_err());
+        let mut expected = expected;
+        expected.read_only = true;
+        let readonly = INVENTORY_FIXTURE.replace("\"read_only\":false", "\"read_only\":true");
+        assert!(
+            validate_inventories(&inventory_console(&readonly, None), &expected, false).is_ok()
+        );
+    }
+
+    #[test]
+    fn inventory_observes_fresh_targets_usb_metadata_and_unique_identities() {
+        let mut expected = inventory_expectation();
+        let prefix = INVENTORY_FIXTURE
+            .split_once(",{\"name\":\"vda1\"")
+            .expect("fixture partition boundary")
+            .0;
+        let fresh = format!("{prefix}]}}");
+        expected.before = InventoryBefore::Fresh;
+        assert!(validate_inventories(
+            &inventory_console(&fresh, Some(INVENTORY_FIXTURE)),
+            &expected,
+            true
+        )
+        .is_ok());
+        assert!(validate_inventories(&inventory_console(&fresh, None), &expected, false).is_ok());
+        let stale = validate_inventories(
+            &inventory_console(INVENTORY_FIXTURE, None),
+            &expected,
+            false,
+        )
+        .unwrap_err();
+        assert!(stale.contains("fresh vda has 2 partitions"), "{stale}");
+        expected.before = InventoryBefore::Reinstall;
+        let usb = INVENTORY_FIXTURE.replace("\"sr0\"", "\"sda\"").replace(
+            "\"logical_sector_bytes\":2048",
+            "\"logical_sector_bytes\":512",
+        );
+        expected.source_name = "sda";
+        assert!(
+            validate_inventories(&inventory_console(&usb, Some(&usb)), &expected, true).is_ok()
+        );
+        expected.source_name = "sr0";
+        for (old, new, reason) in [
+            (
+                "\"sequence\":11",
+                "\"sequence\":0",
+                "invalid whole-disk identities",
+            ),
+            ("11:0", "252:0", "device_number duplicates"),
+            ("252:1", "252:0", "device_number duplicates"),
+            (
+                "\"logical_sector_bytes\":4096",
+                "\"logical_sector_bytes\":512",
+                "vda.disk.logical_sector_bytes: expected 4096, observed 512",
+            ),
+            (
+                "6442450944",
+                "6442450943",
+                "vda.capacity_bytes: expected 6442450944, observed 6442450943",
+            ),
+        ] {
+            let bad = INVENTORY_FIXTURE.replace(old, new);
+            let error = validate_inventories(&inventory_console(&bad, Some(&bad)), &expected, true)
+                .unwrap_err();
+            assert!(error.contains(reason), "{error}");
+        }
+        let readonly_partition = INVENTORY_FIXTURE.replace(
+            "\"device_number\":\"252:2\",\"read_only\":false",
+            "\"device_number\":\"252:2\",\"read_only\":true",
+        );
+        let error = validate_inventories(
+            &inventory_console(INVENTORY_FIXTURE, Some(&readonly_partition)),
+            &expected,
+            true,
+        )
+        .unwrap_err();
+        assert!(error.contains("vda2.read_only"), "{error}");
+    }
+
+    #[test]
+    fn inventory_json_has_a_byte_and_nesting_bound_before_recursive_parse() {
+        assert!(inventory_document(&format!(
+            "{}{}",
+            "{}",
+            " ".repeat(protocol::MAX_INVENTORY_BYTES - 3)
+        ))
+        .is_ok());
+        assert!(inventory_document(&format!(
+            "{}{}",
+            "{}",
+            " ".repeat(protocol::MAX_INVENTORY_BYTES - 2)
+        ))
+        .is_err());
+        assert!(inventory_document(&" ".repeat(protocol::MAX_INVENTORY_BYTES + 1)).is_err());
+        assert!(inventory_document(&format!("{}0{}", "[".repeat(9), "]".repeat(9))).is_err());
+        assert!(inventory_document(r#"{"text":"[[[[[[[[[\"{\\]"}"#).is_ok());
+        assert!(inventory_document("{} trailing").is_err());
+        assert!(inventory_document("}").is_err());
     }
 }

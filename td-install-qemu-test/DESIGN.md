@@ -36,8 +36,11 @@ two fixed candidate paths: /dev/sr0 (SATA optical) and /dev/sda (USB). QEMU
 adds an empty default CD-ROM in both attachments: /dev/sr1 during optical
 boots (outside this candidate list) and /dev/sr0 during USB boots. A read-only
 block-device open must succeed; Linux ENOMEDIUM (123) skips an empty drive
-even when the driver publishes a placeholder capacity. Other open errors
-refuse. Zero-capacity
+even when the driver publishes a placeholder capacity. ENXIO (6) also
+retries within the same deadline: USB can publish its node before the
+block driver accepts opens. A permanently absent/unready source still
+times out, and no install step runs before successful read-only access.
+Other open errors refuse. Zero-capacity
 devices are ignored. Malformed or unreadable capacities refuse. The host's
 VM deadline also bounds time spent in kernel operations during discovery.
 Absent, ambiguous or non-block candidates refuse. This convention applies
@@ -211,3 +214,48 @@ never count as interrupted publication. Preallocation or delegation to a
 child publisher also requires revisiting this observer. The detached-boot
 refusal oracle depends on td-boot reporting both missing selectors and
 on the fixture reporting its exact nonzero exit status.
+
+After the source mounts read-only, before source verification, and again
+after partition refresh, the live fixture runs the source-built
+`td-install inventory` command. Its owned
+child's stdout is read through a 32 KiB limit and must be one complete
+UTF-8 line; capture failure kills and reaps the child, and successful
+capture still requires a successful child exit. The host's VM deadline
+bounds blocked reads and child completion. Stderr goes to the bounded
+console capture. The fixture emits each JSON report in one formatted
+protocol line, with separate before/after prefixes and an explicit JSON
+byte count. The host consumes exactly that bounded number of UTF-8 bytes;
+console text after a complete JSON frame is outside the report. This
+handles kernel messages that join the line before its final newline.
+Truncated, malformed, duplicate or missing reports fail; interleaving
+inside the JSON still fails rather than repairing or stripping its bytes.
+This does not claim atomic serial-console writes.
+
+The host parses a uniquely prefixed report only after bounding its byte
+length (including the guest stdout newline) and JSON nesting. It checks
+version/scope, unique device names and queried fields, and compares
+target/source capacities with the private
+files it attached. Target geometry and write protection must match QEMU's
+configuration, its serial must match the fixture serial, and the source
+must report read-only media with the expected optical/USB sector size.
+Fresh targets must report no target partitions before formatting; explicit
+reinstallation may retain them. Every reported device number must be unique.
+After formatting, exactly two target partitions must name the target
+parent and correct partition numbers and report writable partitions.
+ESP capacity must match the fixed
+layout, and volume capacity must span from its fixed byte offset through
+the GPT last usable sector at the requested geometry. These capacity
+observations do not themselves report partition start offsets; GPT byte
+checks and detached firmware boots retain the layout proof.
+Mismatch diagnostics name the device, field and expected/observed value.
+Whole-disk device numbers and sequence numbers must remain consistent
+between reports. Reinstallation may already have partitions in its first
+report. These refusal cases have valid mountable ISO filesystems and
+damaged payload/trust data or unsupported target capacity/write protection.
+They
+require only the before report and prohibit an after report; a future
+unmountable-media case needs its own earlier failure expectation. The
+existing whole-target byte comparisons still establish write preservation;
+inventory alone does not. These observations cover all live
+legs of the 32-boot matrix and both full-system ISO installations without
+adding boots or changing target admission.
