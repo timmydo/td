@@ -372,49 +372,79 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
                 &scratch.dir,
                 timeout,
             )?;
-            require(&result, &expected, "installed boot")?;
-            require(
-                &result,
-                "TD-INSTALL-STALE-MOUNT-RECOVERED",
-                "closed-descriptor mount recovery",
-            )?;
             let expected_device = if count == 2 { "/dev/vdb2" } else { "/dev/vda2" };
-            let discovered: Vec<_> = result
-                .console
-                .lines()
-                .map(str::trim_end)
-                .filter_map(|line| line.strip_prefix("TD-INSTALL-VOLUME "))
-                .collect();
-            let expected_identity = format!("{uuid} {expected_device}");
-            if discovered.len() != 2 || discovered.iter().any(|line| *line != expected_identity) {
-                return Err(format!(
-                    "selector/deployment did not resolve {expected_identity}: {discovered:?}\n{}",
-                    tail(&result.console, 80)
-                ));
-            }
-            if !bound_selector_before_selection(&result.console, &expected_identity, &id) {
-                return Err(format!(
-                    "installed selector did not bind {expected_identity} before selecting {id}\n{}",
-                    tail(&result.console, 80)
-                ));
-            }
-            if !result.evidence.selected_current
-                || result.evidence.selected_previous
-                || result.evidence.bookkeeping_unavailable
-                || result.evidence.selected_current_id.as_deref() != Some(id.as_str())
-            {
-                return Err(format!("installed selector did not choose current {id}"));
-            }
-            if !result
-                .console
-                .lines()
-                .any(|line| line.trim_end() == expected)
-            {
-                return Err(format!(
-                    "installed boot did not report expected deployment {id}"
-                ));
-            }
+            validate_fixture_boot(&result, &expected, &uuid, expected_device, &id)?;
         }
+    }
+    let interrupted_live = scratch.dir.join("interrupted.cpio");
+    write(
+        &interrupted_live,
+        &initramfs(&base, &common, "interrupt\n", &extra)?,
+    )?;
+    let interrupted_iso = scratch.dir.join("interrupted.iso");
+    media::write_image_with_payloads(&interrupted_iso, &kernel, &interrupted_live, &payloads)?;
+    let kernel_bytes = fs::metadata(&kernel)
+        .map_err(|error| error.to_string())?
+        .len();
+    for (name, attachment, source_device) in [
+        ("optical", FirmwareAttachment::Optical, "/dev/sr0"),
+        ("usb", FirmwareAttachment::Usb, "/dev/sda"),
+    ] {
+        let target = TargetDisk::create(&scratch.dir, &format!("interrupted-{name}.img"))?;
+        let boot = |phase: &str, source: &Path, attachment, live: bool, marker: &str| {
+            let vars = scratch
+                .dir
+                .join(format!("interrupted-{name}-{phase}-vars.fd"));
+            efi::copy_input(&vars_template, &vars)?;
+            boot_source(
+                &qemu,
+                BootSource::Firmware {
+                    code: &code,
+                    vars: &vars,
+                    attachment,
+                    installation_target: if live { Some(&target) } else { None },
+                },
+                plan(source, live, marker),
+                &scratch.dir,
+                timeout,
+            )
+        };
+        println!("   [qemu-install] interrupting mounted publication through {name} media");
+        let interrupted = boot(
+            "copy",
+            &interrupted_iso,
+            attachment,
+            true,
+            protocol::INTERRUPTED_MARKER,
+        )?;
+        validate_interruption(&interrupted, kernel_bytes, &uuid, source_device)?;
+        println!("   [qemu-install] refusing an incomplete installation, {name} media detached");
+        let refused = format!(
+            "{} /bin/td-boot failed: exit status: 1",
+            protocol::REFUSED_PREFIX
+        );
+        let broken = boot(
+            "refuse",
+            &target.path,
+            FirmwareAttachment::InstalledFixture,
+            false,
+            &refused,
+        )?;
+        validate_interrupted_boot(&broken, &refused, &uuid)?;
+        println!(
+            "   [qemu-install] reinstalling after interrupted publication through {name} media"
+        );
+        let repaired = boot("repair", &iso, attachment, true, protocol::INSTALL_MARKER)?;
+        require_installation(&repaired, &uuid, source_device)?;
+        let expected = format!("{} {id}", protocol::FIRST_BOOT_MARKER);
+        let installed = boot(
+            "reboot",
+            &target.path,
+            FirmwareAttachment::InstalledFixture,
+            false,
+            &expected,
+        )?;
+        validate_fixture_boot(&installed, &expected, &uuid, "/dev/vda2", &id)?;
     }
     let refuse = |case: &str, image: &Path, diagnostic: &str| -> Result<(), String> {
         for (name, attachment, source_device) in [
@@ -501,8 +531,155 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
         td_boot_protocol::MANIFEST_UNAUTHENTICATED,
     )?;
     println!(
-        "PASS: native optical/USB installation; provisioned UUID binding across verified kexec and reordered disks; duplicate identity refusal; wrong-key and corrupt-payload optical/USB refusals preserve every target byte; two persistent installed boots"
+        "PASS: native optical/USB installation and interrupted-publication refusal/reinstallation; provisioned UUID binding across verified kexec and reordered disks; duplicate identity refusal; wrong-key and corrupt-payload optical/USB refusals preserve every target byte; two persistent installed boots"
     );
+    Ok(())
+}
+
+fn validate_interruption(
+    result: &BootResult,
+    kernel_bytes: u64,
+    uuid: &str,
+    source_device: &str,
+) -> Result<(), String> {
+    let diagnostic = |reason: &str| {
+        format!(
+            "{reason}: expected={kernel_bytes}, target={}, killed={}, clean={}, current={}, previous={}\n{}",
+            result.evidence.target, result.marker_killed, result.exited_clean,
+            result.evidence.selected_current, result.evidence.selected_previous,
+            tail(&result.console, 80)
+        )
+    };
+    let prefix = format!("{} ", protocol::INTERRUPTED_MARKER);
+    let mut reports = result
+        .console
+        .lines()
+        .filter_map(|line| line.strip_prefix(&prefix));
+    let report = reports
+        .next()
+        .ok_or_else(|| diagnostic("guest did not prove partial publication"))?;
+    if reports.next().is_some() {
+        return Err("duplicate interruption evidence".into());
+    }
+    let words: Vec<_> = report.split_ascii_whitespace().collect();
+    let [written, total] = words.as_slice() else {
+        return Err("malformed interruption evidence".into());
+    };
+    let written = written
+        .parse::<u64>()
+        .map_err(|_| "invalid interrupted length")?;
+    let total = total
+        .parse::<u64>()
+        .map_err(|_| "invalid interrupted total")?;
+    if !result.evidence.target
+        || !result.marker_killed
+        || result.exited_clean
+        || result.evidence.selected_current
+        || result.evidence.selected_previous
+        || written == 0
+        || written >= total
+        || total != kernel_bytes
+        || result.console.contains(protocol::INSTALL_MARKER)
+        || result.console.contains(protocol::DIRECT_MARKER)
+    {
+        return Err(diagnostic(&format!(
+            "guest did not stop before completing publication: written={written}, total={total}"
+        )));
+    }
+    for expected in [
+        format!("{} {uuid} /dev/vda2", protocol::PARTITIONS_MARKER),
+        format!("{} {source_device}", protocol::MEDIA_MARKER),
+    ] {
+        if !result
+            .console
+            .lines()
+            .any(|line| line.trim_end() == expected)
+        {
+            return Err(format!("interrupted installation lacks {expected}"));
+        }
+    }
+    Ok(())
+}
+
+fn validate_interrupted_boot(result: &BootResult, refused: &str, uuid: &str) -> Result<(), String> {
+    require(result, refused, "interrupted installation boot refusal")?;
+    if result.evidence.selected_current || result.evidence.selected_previous {
+        return Err("incomplete installation reached deployment selection".into());
+    }
+    for expected in [
+        format!("TD-BOOT-VOLUME {uuid} /dev/vda2"),
+        format!("TD-INSTALL-VOLUME {uuid} /dev/vda2"),
+    ] {
+        if !result
+            .console
+            .lines()
+            .any(|line| line.trim_end() == expected)
+        {
+            return Err(format!("interrupted boot lacks {expected}"));
+        }
+    }
+    for slot in ["current", "previous"] {
+        let missing = format!(
+            "{slot} selector /volume/td/boot/{slot}: No such file or directory (os error 2)"
+        );
+        if !result.console.contains(&missing) {
+            return Err(format!(
+                "interrupted boot did not refuse the missing {slot} selector\n{}",
+                tail(&result.console, 100)
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_fixture_boot(
+    result: &BootResult,
+    expected: &str,
+    uuid: &str,
+    expected_device: &str,
+    id: &str,
+) -> Result<(), String> {
+    require(result, expected, "installed boot")?;
+    require(
+        result,
+        "TD-INSTALL-STALE-MOUNT-RECOVERED",
+        "closed-descriptor mount recovery",
+    )?;
+    let discovered: Vec<_> = result
+        .console
+        .lines()
+        .map(str::trim_end)
+        .filter_map(|line| line.strip_prefix("TD-INSTALL-VOLUME "))
+        .collect();
+    let expected_identity = format!("{uuid} {expected_device}");
+    if discovered.len() != 2 || discovered.iter().any(|line| *line != expected_identity) {
+        return Err(format!(
+            "selector/deployment did not resolve {expected_identity}: {discovered:?}\n{}",
+            tail(&result.console, 80)
+        ));
+    }
+    if !bound_selector_before_selection(&result.console, &expected_identity, id) {
+        return Err(format!(
+            "installed selector did not bind {expected_identity} before selecting {id}\n{}",
+            tail(&result.console, 80)
+        ));
+    }
+    if !result.evidence.selected_current
+        || result.evidence.selected_previous
+        || result.evidence.bookkeeping_unavailable
+        || result.evidence.selected_current_id.as_deref() != Some(id)
+    {
+        return Err(format!("installed selector did not choose current {id}"));
+    }
+    if !result
+        .console
+        .lines()
+        .any(|line| line.trim_end() == expected)
+    {
+        return Err(format!(
+            "installed boot did not report expected deployment {id}"
+        ));
+    }
     Ok(())
 }
 
@@ -818,6 +995,96 @@ mod tests {
             console: format!("TD-BOOT-VOLUME uuid /dev/vda2\nTD-BOOT-SELECTED-CURRENT deployment\n{SYSTEM_BOOT_SUCCESS_MARKER}\n"),
             elapsed: Duration::ZERO, firefox_audio: FirefoxAudioCapture::NotRequested,
         }
+    }
+
+    fn interrupted_result() -> BootResult {
+        BootResult {
+            evidence: ConsoleEvidence {
+                target: true,
+                ..ConsoleEvidence::default()
+            },
+            exited_clean: false,
+            marker_killed: true,
+            reason: "fixture".into(),
+            console: format!(
+                "{} uuid /dev/vda2\n{} /dev/sr0\n{} 4 10\n",
+                protocol::PARTITIONS_MARKER,
+                protocol::MEDIA_MARKER,
+                protocol::INTERRUPTED_MARKER
+            ),
+            elapsed: Duration::ZERO,
+            firefox_audio: FirefoxAudioCapture::NotRequested,
+        }
+    }
+
+    #[test]
+    fn interruption_evidence_proves_a_partial_planned_payload() {
+        let validate = |result: &BootResult| validate_interruption(result, 10, "uuid", "/dev/sr0");
+        assert!(validate(&interrupted_result()).is_ok());
+        for bad in ["0 10", "10 10", "11 10", "4 11", "a 10", "4 10 extra", "4"] {
+            let mut result = interrupted_result();
+            result.console = result.console.replace("4 10", bad);
+            assert!(validate(&result).is_err(), "{bad}");
+        }
+        for extra in [
+            protocol::INSTALL_MARKER,
+            protocol::DIRECT_MARKER,
+            "TD-INSTALL-PUBLICATION-INTERRUPTED 4 10",
+        ] {
+            let mut result = interrupted_result();
+            result.console.push_str(extra);
+            assert!(validate(&result).is_err());
+        }
+        let mut result = interrupted_result();
+        result.console = result.console.replace("INTERRUPTED 4", "INTERRUPTED4");
+        assert!(validate(&result).is_err());
+        let mut result = interrupted_result();
+        result.evidence.target = false;
+        assert!(validate(&result).is_err());
+        result.evidence.target = true;
+        result.evidence.selected_current = true;
+        assert!(validate(&result).is_err());
+        let mut result = interrupted_result();
+        result.evidence.selected_previous = true;
+        assert!(validate(&result).is_err());
+        let mut result = interrupted_result();
+        result.marker_killed = false;
+        assert!(validate(&result).is_err());
+        let mut result = interrupted_result();
+        result.exited_clean = true;
+        assert!(validate(&result).is_err());
+        let mut result = interrupted_result();
+        result.console = result.console.replace("uuid", "wrong");
+        assert!(validate(&result).is_err());
+        let mut result = interrupted_result();
+        result.console = result.console.replace("/dev/sr0", "/dev/sda");
+        assert!(validate(&result).is_err());
+    }
+
+    #[test]
+    fn interrupted_boot_refusal_requires_both_missing_selectors() {
+        let refused = format!(
+            "{} /bin/td-boot failed: exit status: 1",
+            protocol::REFUSED_PREFIX
+        );
+        let mut result = interrupted_result();
+        result.console = format!("TD-BOOT-VOLUME uuid /dev/vda2\nTD-INSTALL-VOLUME uuid /dev/vda2\ncurrent selector /volume/td/boot/current: No such file or directory (os error 2)\nprevious selector /volume/td/boot/previous: No such file or directory (os error 2)\n{refused}\n");
+        assert!(validate_interrupted_boot(&result, &refused, "uuid").is_ok());
+        for missing in [refused.as_str(), "TD-BOOT-VOLUME uuid /dev/vda2"] {
+            let console = result.console.clone();
+            result.console = console.replace(missing, "");
+            assert!(validate_interrupted_boot(&result, &refused, "uuid").is_err());
+            result.console = console;
+        }
+        for slot in ["current", "previous"] {
+            let console = result.console.clone();
+            result.console = console.replace(&format!("{slot} selector"), "other failure");
+            assert!(validate_interrupted_boot(&result, &refused, "uuid").is_err());
+            result.console = console;
+        }
+        assert!(validate_interrupted_boot(&result, &refused, "wrong").is_err());
+        result.evidence.selected_previous = true;
+        assert!(validate_interrupted_boot(&result, &refused, "uuid").is_err());
     }
 
     #[test]

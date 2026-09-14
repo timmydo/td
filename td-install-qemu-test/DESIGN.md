@@ -1,6 +1,7 @@
 # Native QEMU installation fixture
 
-This crate is a diagnostic PID-1 program for `td-recipe-eval qemu-install`.
+This crate is a diagnostic PID-1 program for `td-recipe-eval qemu-install`
+and the live installation phase of `qemu-install-system`.
 It is built from source through the ordinary Rust ladder and is never packed
 in the system or graphical installer profile. It adds no user-facing device
 admission, destructive consent, account configuration or signing identity.
@@ -24,8 +25,8 @@ The live initramfs holds source-built tools and the public trust root. The
 tiny signed deployment and fixed selector are streamed into separate ISO
 files. Boot files and tools read into the fixture initramfs are bounded at
 256 MiB. The shared composer accepts larger ISO payloads under MEDIA.md,
-but this diagnostic still constructs only a small deployment. The private
-key remains on the host outside derivations. The fixture calls the
+while the full-system diagnostic supplies the built system deployment.
+The private key remains on the host outside derivations. The fixture calls the
 actual td-install layout and volume primitives, including td-boot's verified
 publication. Its success marker follows formatting, partition refresh,
 mounted publication and sync.
@@ -92,9 +93,9 @@ its entire private scratch directory after partition refresh, then calls `td-boo
 /source and the same read-only live public key. Successful mounted
 publication and sync precede the direct-publication and installation markers;
 the host requires both. The full cold-boot oracle still proves the expected
-deployment is installed. This removes deployment-sized staging copies but
-does not yet measure installation of the full system under a RAM ceiling or
-admit target capacity.
+deployment is installed. The separate full-system diagnostic checks its
+installed desktop under a RAM ceiling. Neither diagnostic admits operator
+target capacity.
 
 The host then detaches media and cold-boots the destination through
 firmware. The selector emits read-only discovery evidence for its configured
@@ -141,13 +142,33 @@ authentic manifest/signature and the correct trust root. Both optical and
 USB boots must report the root payload hash mismatch and preserve every
 target byte under the same whole-disk comparison. Unit tests in td-boot
 exercise corruption, missing files and symlinks for all three payloads.
-All twelve boots use fresh private firmware variables.
+A fourth ISO selects an interruption phase with otherwise identical valid
+payloads and the same selector. After layout and partition refresh, the
+fixture starts the production publisher as its owned child. It observes one
+real private .install-* directory and a nonempty kernel shorter than the
+source kernel, then kills and reaps that child. Every observer error also
+kills/reaps the child. The fixture checks the length again after death and
+requires both current and previous to be absent, then syncs the volume.
+Only then does it report the written/expected byte counts. Missing, empty,
+complete or indirect payloads cannot stand in for partial publication.
+The report triggers the host VM power cut. Afterward, the host verifies
+that QEMU was killed and checks the counts against its source kernel. This is a deliberate publisher kill followed by a VM power cut,
+not arbitrary timing of unassisted power loss or a media-flush fault model.
+
+A detached firmware boot must bind the expected volume, refuse specifically
+because both selectors are absent, and select no deployment. A subsequent
+explicit installation from the normal ISO must succeed; its detached boot
+must authenticate the expected deployment and start with fresh persisted
+state. No automatic resume or preservation of the erased disk is claimed.
+Both optical and USB attachments run all four interruption/recovery boots.
+All twenty small-fixture boots use fresh private firmware variables.
 
 The fixture's serial convention does not implement production installation
 admission. Volume discovery uses the production read-only primitive under
 the oracle's fixed topology; it does not establish exclusive admission.
-It does not launch the compositor, configure an account, retain an
-installation signing key, or test a full desktop deployment.
+The small fixture does not launch the compositor, configure an account or
+retain an installation signing key. The separate full-system diagnostic
+uses the ordinary system init after installation to test the desktop.
 The final installer still needs the activation evidence in
 ../td-install/INSTALLER.md, including a complete desktop installation and settings.
 
@@ -155,8 +176,22 @@ All operations use safe Rust and existing td-init/td-boot applets. No syscall
 surface or external dependency is added. Unit tests cover refusal outside
 PID 1; the host oracle is the executable integration test. A serial marker is
 accepted only after its named operation and persistence barriers finish.
+The fixture formats a complete protocol line before write_all, avoiding
+formatter-induced split writes that allowed kernel console messages to
+separate the refusal prefix from its reason. This is not an atomic-console
+guarantee; incomplete or interleaved evidence still fails the host oracle.
 
 The fixture deliberately inspects the formatter's staging layout as an
 internal regression oracle. A formatter rename requires updating that
 oracle; cleanup removes the whole fixture-owned /scratch directory rather
 than depending on the formatter's image filename or retention policy.
+
+The interruption observer intentionally depends on td-boot's private
+.install-* staging directory and kernel-first publication order. A change
+to that transaction layout must update this internal oracle. It neither
+adds a production pause hook nor teaches the publisher a testing mode.
+Polling may miss a fast kernel copy and fail the test; complete copies
+never count as interrupted publication. Preallocation or delegation to a
+child publisher also requires revisiting this observer. The detached-boot
+refusal oracle depends on td-boot reporting both missing selectors and
+on the fixture reporting its exact nonzero exit status.

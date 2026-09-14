@@ -1254,6 +1254,16 @@ trust root. Machine settings and a production installer remain required by
 INSTALLER.md. This fixture does not enforce selector/volume key
 agreement for arbitrary caller-provided inputs.
 
+The small fixture also interrupts the real publisher while its staged kernel
+is nonempty and incomplete. It kills/reaps its own child, proves there are
+no current/previous selectors, syncs the partial data, then reports byte
+counts so the host can cut VM power. A detached firmware boot must refuse
+both absent selectors without selecting a deployment. Explicit whole-disk
+reinstallation from the normal ISO must restore an authenticated boot and
+fresh state. Both media attachments exercise this sequence. The observer
+has no production pause hook; this is a controlled publisher interruption
+followed by a VM power cut, not a model of every storage power-loss window.
+
 `td-recipe-eval qemu-install-system [system-x86-64]` uses the same live
 fixture to install the built system deployment and its verified selector.
 Both optical and USB legs cold-boot twice with the ISO detached; the second

@@ -13,6 +13,14 @@ use protocol::*;
 
 const ENOMEDIUM: i32 = 123; // Linux: an optical drive with no readable medium.
 
+fn report(mut output: impl Write, message: std::fmt::Arguments<'_>) -> Result<(), String> {
+    // Formatting directly to stderr can split one protocol line across writes.
+    let line = format!("{message}\n");
+    output
+        .write_all(line.as_bytes())
+        .map_err(|error| error.to_string())
+}
+
 fn command(program: &str, args: &[&str]) -> Result<(), String> {
     let status = Command::new(program)
         .args(args)
@@ -182,7 +190,7 @@ fn mount_source() -> Result<(), String> {
             Ok(_) => return Err(format!("media payload is writable: {destination}")),
         }
     }
-    writeln!(std::io::stdout(), "{MEDIA_MARKER} {device}").map_err(|error| error.to_string())
+    report(std::io::stdout(), format_args!("{MEDIA_MARKER} {device}"))
 }
 
 fn configured_uuid() -> Result<String, String> {
@@ -193,14 +201,17 @@ fn configured_uuid() -> Result<String, String> {
         .ok_or_else(|| "configured volume UUID lacks its newline".into())
 }
 
-fn install(device: &str) -> Result<(), String> {
+fn install(device: &str, interrupt: bool) -> Result<(), String> {
     // The ISO carries the signed payloads and the live initramfs's public key.
     // Every path is fixture-owned; no private key enters the guest.
     mount_source()?;
     let uuid = configured_uuid()?;
     // Validate the stable read-only source before the first destructive command.
     // Publication below still rechecks the copied payloads and signature.
-    command("/bin/td-boot", &["validate-source", "/source", "/trusted.pub"])?;
+    command(
+        "/bin/td-boot",
+        &["validate-source", "/source", "/trusted.pub"],
+    )?;
     command(
         "/bin/td-install",
         &["layout", device, "/source/bzImage", "/selector.cpio"],
@@ -224,17 +235,125 @@ fn install(device: &str) -> Result<(), String> {
             .map_err(|error| format!("inspect staging {}: {error}", staged.display()))?;
         if let Some(entry) = entries.next() {
             let entry = entry.map_err(|error| format!("read staging entry: {error}"))?;
-            return Err(format!("unexpected staged content in guest RAM: {}", entry.path().display()));
+            return Err(format!(
+                "unexpected staged content in guest RAM: {}",
+                entry.path().display()
+            ));
         }
     }
     let partition = refresh_partitions(device, &uuid)?;
     fs::remove_dir_all("/scratch").map_err(|error| format!("remove formatter scratch: {error}"))?;
     // The volume image contains only filesystem metadata and the trust layout.
     // Publication now streams from read-only media straight onto the disk.
-    command("/bin/td-boot", &["install", &partition, "/volume", "/source", "/trusted.pub"])?;
+    if interrupt {
+        return interrupt_publication(&partition);
+    }
+    command(
+        "/bin/td-boot",
+        &["install", &partition, "/volume", "/source", "/trusted.pub"],
+    )?;
     applet(&["sync"])?;
-    writeln!(std::io::stdout(), "{DIRECT_MARKER}").map_err(|error| error.to_string())?;
-    writeln!(std::io::stdout(), "{INSTALL_MARKER}").map_err(|error| error.to_string())
+    report(std::io::stdout(), format_args!("{DIRECT_MARKER}"))?;
+    report(std::io::stdout(), format_args!("{INSTALL_MARKER}"))
+}
+
+/// Observe the publisher's private staging tree, never a production control hook.
+fn staged_kernel(root: &Path) -> Result<Option<PathBuf>, String> {
+    let entries = match fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("inspect publication staging: {error}")),
+    };
+    let mut found = None;
+    for entry in entries {
+        let entry = entry.map_err(|error| error.to_string())?;
+        if found.is_some()
+            || !entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.starts_with(".install-"))
+            || !entry
+                .file_type()
+                .map_err(|error| error.to_string())?
+                .is_dir()
+        {
+            return Err("publication did not leave one private staging directory".into());
+        }
+        found = Some(entry.path().join("bzImage"));
+    }
+    Ok(found)
+}
+
+fn partial_length(path: &Path, expected: u64) -> Result<Option<u64>, String> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("stat interrupted payload: {error}")),
+    };
+    if !metadata.is_file() {
+        return Err("interrupted payload is not a real file".into());
+    }
+    let len = metadata.len();
+    if len >= expected {
+        return Err("publisher finished its kernel before interruption".into());
+    }
+    Ok((len > 0).then_some(len))
+}
+
+fn observe_partial(child: &mut std::process::Child, expected: u64) -> Result<PathBuf, String> {
+    let start = Instant::now();
+    let mut kernel = None;
+    loop {
+        if let Some(status) = child.try_wait().map_err(|error| error.to_string())? {
+            return Err(format!("publisher exited before interruption: {status}"));
+        }
+        if kernel.is_none() {
+            kernel = staged_kernel(Path::new("/volume/td/deployments"))?;
+        }
+        if let Some(path) = &kernel {
+            if partial_length(path, expected)?.is_some() {
+                return Ok(path.clone());
+            }
+        }
+        if start.elapsed() >= Duration::from_secs(120) {
+            return Err("publisher never exposed an incomplete kernel".into());
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+}
+
+fn interrupt_publication(partition: &str) -> Result<(), String> {
+    let expected = fs::metadata("/source/bzImage")
+        .map_err(|error| error.to_string())?
+        .len();
+    let mut child = Command::new("/bin/td-boot")
+        .args(["install", partition, "/volume", "/source", "/trusted.pub"])
+        .spawn()
+        .map_err(|error| format!("start interrupted publisher: {error}"))?;
+    let observed = observe_partial(&mut child, expected);
+    // Always terminate and reap this owned child, including observer failures.
+    let killed = child.kill();
+    let waited = child.wait();
+    let path = observed?;
+    killed.map_err(|error| format!("stop interrupted publisher: {error}"))?;
+    let status = waited.map_err(|error| format!("reap interrupted publisher: {error}"))?;
+    if status.success() {
+        return Err("interrupted publisher exited successfully".into());
+    }
+    let len =
+        partial_length(&path, expected)?.ok_or("interrupted payload disappeared or is empty")?;
+    for slot in ["current", "previous"] {
+        match fs::symlink_metadata(Path::new("/volume/td/boot").join(slot)) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(format!("inspect interrupted selector: {error}")),
+            Ok(_) => return Err("interrupted publication advertised a boot selector".into()),
+        }
+    }
+    applet(&["sync"])?;
+    report(
+        std::io::stdout(),
+        format_args!("{INTERRUPTED_MARKER} {len} {expected}"),
+    )
 }
 
 fn refresh_partitions(device: &str, uuid: &str) -> Result<String, String> {
@@ -254,12 +373,16 @@ fn refresh_partitions(device: &str, uuid: &str) -> Result<String, String> {
         || !diagnostic.contains(&format!("reread partitions on {device}:"))
         || !diagnostic.contains("(os error 16)")
     {
-        return Err(format!("mounted disk reread did not refuse as busy: {diagnostic}"));
+        return Err(format!(
+            "mounted disk reread did not refuse as busy: {diagnostic}"
+        ));
     }
     applet(&["umount", "/volume"])?;
     applet(&["reread-partitions", device])?;
-    writeln!(std::io::stdout(), "{PARTITIONS_MARKER} {uuid} {partition}")
-        .map_err(|error| error.to_string())?;
+    report(
+        std::io::stdout(),
+        format_args!("{PARTITIONS_MARKER} {uuid} {partition}"),
+    )?;
     Ok(partition)
 }
 
@@ -283,8 +406,10 @@ fn volume(uuid: &str) -> Result<(String, String), String> {
     if uuid != *found {
         return Err("resolved wrong volume UUID".into());
     }
-    writeln!(std::io::stdout(), "TD-INSTALL-VOLUME {found} {path}")
-        .map_err(|error| error.to_string())?;
+    report(
+        std::io::stdout(),
+        format_args!("TD-INSTALL-VOLUME {found} {path}"),
+    )?;
     Ok(((*found).into(), (*path).into()))
 }
 
@@ -375,13 +500,16 @@ fn installed() -> Result<(), String> {
     {
         return Err("acknowledgement left its stale mount active".into());
     }
-    println!("TD-INSTALL-STALE-MOUNT-RECOVERED");
+    report(
+        std::io::stdout(),
+        format_args!("TD-INSTALL-STALE-MOUNT-RECOVERED"),
+    )?;
     let marker = if count == 1 {
         FIRST_BOOT_MARKER
     } else {
         SECOND_BOOT_MARKER
     };
-    writeln!(std::io::stdout(), "{marker} {id}").map_err(|error| error.to_string())
+    report(std::io::stdout(), format_args!("{marker} {id}"))
 }
 
 fn run() -> Result<(), String> {
@@ -390,7 +518,8 @@ fn run() -> Result<(), String> {
     }
     directories()?;
     match read(Path::new("/fixture-phase"), 32)?.as_slice() {
-        b"install\n" => install(&target()?),
+        b"install\n" => install(&target()?, false),
+        b"interrupt\n" => install(&target()?, true),
         b"selector\n" => selector(),
         b"installed\n" => installed(),
         _ => Err("invalid fixture phase".into()),
@@ -400,7 +529,7 @@ fn run() -> Result<(), String> {
 fn main() -> ExitCode {
     let result = run();
     if let Err(error) = result {
-        let _ = writeln!(std::io::stderr(), "{REFUSED_PREFIX} {error}");
+        let _ = report(std::io::stderr(), format_args!("{REFUSED_PREFIX} {error}"));
         if std::process::id() != 1 {
             return ExitCode::FAILURE;
         }
@@ -413,6 +542,92 @@ fn main() -> ExitCode {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used)]
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    struct Scratch(PathBuf);
+    impl Scratch {
+        fn new() -> Self {
+            static SEQ: AtomicU64 = AtomicU64::new(0);
+            let path = std::env::temp_dir().join(format!(
+                "td-install-interrupt-{}-{}",
+                std::process::id(),
+                SEQ.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::DirBuilder::new().mode(0o700).create(&path).unwrap();
+            Self(path)
+        }
+    }
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn protocol_formatting_does_not_split_a_line_across_writes() {
+        #[derive(Default)]
+        struct Output(Vec<Vec<u8>>);
+        impl Write for Output {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.push(bytes.to_vec());
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut output = Output::default();
+        let error = String::from("/bin/td-boot failed: exit status: 1");
+        report(&mut output, format_args!("{REFUSED_PREFIX} {error}")).unwrap();
+        assert_eq!(
+            output.0,
+            vec![format!("{REFUSED_PREFIX} {error}\n").into_bytes()]
+        );
+    }
+
+    #[test]
+    fn interruption_requires_one_real_private_staging_directory() {
+        let scratch = Scratch::new();
+        assert_eq!(staged_kernel(&scratch.0.join("missing")).unwrap(), None);
+        assert_eq!(staged_kernel(&scratch.0).unwrap(), None);
+        let staged = scratch.0.join(".install-fixture");
+        fs::write(&staged, b"file").unwrap();
+        assert!(staged_kernel(&scratch.0).is_err());
+        fs::remove_file(&staged).unwrap();
+        std::os::unix::fs::symlink("/", &staged).unwrap();
+        assert!(staged_kernel(&scratch.0).is_err());
+        fs::remove_file(&staged).unwrap();
+        fs::create_dir(&staged).unwrap();
+        assert_eq!(
+            staged_kernel(&scratch.0).unwrap(),
+            Some(staged.join("bzImage"))
+        );
+        fs::create_dir(scratch.0.join(".install-another")).unwrap();
+        assert!(staged_kernel(&scratch.0).is_err());
+        fs::remove_dir(scratch.0.join(".install-another")).unwrap();
+        fs::rename(&staged, scratch.0.join("published")).unwrap();
+        assert!(staged_kernel(&scratch.0).is_err());
+    }
+
+    #[test]
+    fn interruption_refuses_complete_empty_and_indirect_payloads() {
+        let scratch = Scratch::new();
+        let payload = scratch.0.join("bzImage");
+        assert_eq!(partial_length(&payload, 4).unwrap(), None);
+        fs::write(&payload, b"").unwrap();
+        assert_eq!(partial_length(&payload, 4).unwrap(), None);
+        fs::write(&payload, b"abc").unwrap();
+        assert_eq!(partial_length(&payload, 4).unwrap(), Some(3));
+        assert!(partial_length(&payload, 3).is_err());
+        assert!(partial_length(&payload, 2).is_err());
+        let alias = scratch.0.join("alias");
+        std::os::unix::fs::symlink(&payload, &alias).unwrap();
+        assert!(partial_length(&alias, 4).is_err());
+        assert!(partial_length(&scratch.0, 4).is_err());
+    }
+
     #[test]
     fn refuses_a_normal_process_before_accessing_devices() {
         assert_ne!(std::process::id(), 1);

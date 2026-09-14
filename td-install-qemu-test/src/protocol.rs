@@ -18,3 +18,5 @@ pub const MEDIA_FILES: &[(&str, &str)] = &[
     ("MANIFEST.SIG", "source/manifest.sig"),
     ("SELECTOR.CPIO", "selector.cpio"),
 ];
+
+pub const INTERRUPTED_MARKER: &str = "TD-INSTALL-PUBLICATION-INTERRUPTED";
