@@ -371,3 +371,29 @@ fn a_publishing_childs_id_stays_out_of_the_reported_line() -> Res<()> {
     std::fs::remove_dir_all(&dir)?;
     Ok(())
 }
+
+#[test]
+fn invalid_preselected_uuid_refuses_before_disk_or_scratch_changes() -> Res<()> {
+    let dir = scratch_dir("invalid-uuid")?;
+    let disk = dir.join("disk.img");
+    let staging = dir.join("td-volume-root");
+    std::fs::write(&disk, b"preserve destination")?;
+    std::fs::create_dir(&staging)?;
+    std::fs::write(staging.join("sentinel"), b"preserve scratch")?;
+    let output = Command::new(BIN)
+        .args(["volume", "--uuid", "00000000-0000-0000-0000-000000000000"])
+        .arg(&disk)
+        .arg("/does-not-exist/mkfs.btrfs")
+        .arg(&dir)
+        .output()?;
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("volume UUID"));
+    assert!(output.stdout.is_empty());
+    assert_eq!(std::fs::read(&disk)?, b"preserve destination");
+    assert_eq!(
+        std::fs::read(staging.join("sentinel"))?,
+        b"preserve scratch"
+    );
+    std::fs::remove_dir_all(&dir)?;
+    Ok(())
+}

@@ -55,7 +55,7 @@ fn invalid(message: String) -> io::Error {
 
 const USAGE: &str =
     "usage: td-install layout <destination> [<efi-kernel> <selector-initramfs>]\n       \
-                     td-install volume <destination> <mkfs.btrfs> <scratch-dir> \
+                     td-install volume [--uuid <uuid>] <destination> <mkfs.btrfs> <scratch-dir> \
                      [<td-boot> <deployment> <trusted-key>]";
 
 #[derive(Debug, Eq, PartialEq)]
@@ -74,6 +74,7 @@ enum Mode {
     /// then copies the tree into the image, so a scratch sized from the volume
     /// alone runs out inside mkfs rather than here.
     Volume {
+        uuid: Option<VolumeUuid>,
         destination: PathBuf,
         mkfs: PathBuf,
         scratch: PathBuf,
@@ -87,6 +88,27 @@ enum Mode {
         /// this command without them.
         publish: Option<Publish>,
     },
+}
+
+/// A preselected identity shared with the selector before the ESP is written.
+#[derive(Debug, Eq, PartialEq)]
+struct VolumeUuid(String);
+
+impl VolumeUuid {
+    fn parse(text: &str) -> io::Result<Self> {
+        if text.len() != 36 {
+            return Err(invalid(
+                "volume UUID must contain exactly 36 ASCII bytes".into(),
+            ));
+        }
+        let guid = gpt::Guid::parse(text).map_err(invalid)?;
+        if guid == gpt::Guid::ZERO || guid.to_string().to_ascii_lowercase() != text {
+            return Err(invalid(
+                "volume UUID must be nonzero canonical lowercase hex".into(),
+            ));
+        }
+        Ok(Self(text.to_owned()))
+    }
 }
 
 /// Fixed firmware entry, independent of the deployment selected on Btrfs.
@@ -175,7 +197,30 @@ struct Publish {
 fn parse_args(mut args: impl Iterator<Item = OsString>) -> io::Result<Mode> {
     let verb = args.next().ok_or_else(|| invalid(USAGE.to_string()))?;
     let rest: Vec<PathBuf> = args.map(PathBuf::from).collect();
-    match (verb.to_str(), rest.as_slice()) {
+    let (uuid, rest) = if rest.first().is_some_and(|arg| arg.as_os_str() == "--uuid") {
+        if verb != "volume" {
+            return Err(invalid("--uuid is only supported by volume".into()));
+        }
+        let text = rest
+            .get(1)
+            .and_then(|arg| arg.to_str())
+            .ok_or_else(|| invalid("--uuid requires a canonical volume UUID".into()))?;
+        let uuid = VolumeUuid::parse(text)?;
+        (
+            Some(uuid),
+            rest.get(2..).ok_or_else(|| invalid(USAGE.into()))?,
+        )
+    } else {
+        (None, rest.as_slice())
+    };
+    if rest.iter().any(|arg| arg.as_os_str() == "--uuid") {
+        return Err(invalid(if verb == "volume" {
+            "--uuid must appear once, immediately after volume".into()
+        } else {
+            "--uuid is only supported by volume".into()
+        }));
+    }
+    match (verb.to_str(), rest) {
         (Some("layout"), [destination]) => Ok(Mode::Layout {
             destination: destination.clone(),
             boot: None,
@@ -189,6 +234,7 @@ fn parse_args(mut args: impl Iterator<Item = OsString>) -> io::Result<Mode> {
         }),
         (Some("volume"), [destination, mkfs, scratch, td_boot, deployment, trusted_key]) => {
             Ok(Mode::Volume {
+                uuid,
                 destination: destination.clone(),
                 mkfs: mkfs.clone(),
                 scratch: scratch.clone(),
@@ -200,6 +246,7 @@ fn parse_args(mut args: impl Iterator<Item = OsString>) -> io::Result<Mode> {
             })
         }
         (Some("volume"), [destination, mkfs, scratch]) => Ok(Mode::Volume {
+            uuid,
             destination: destination.clone(),
             mkfs: mkfs.clone(),
             scratch: scratch.clone(),
@@ -1277,6 +1324,7 @@ fn publish_into(staging: &Path, publish: &Publish, key: &[u8]) -> io::Result<()>
 }
 
 fn run_volume(
+    uuid: Option<&VolumeUuid>,
     destination: &Path,
     mkfs: &Path,
     scratch: &Path,
@@ -1418,7 +1466,10 @@ fn run_volume(
     }
     drop(image);
 
-    let uuid = random_guid()?.to_string();
+    let uuid = match uuid {
+        Some(uuid) => uuid.0.clone(),
+        None => random_guid()?.to_string(),
+    };
     // The child's stdout is CAPTURED and replayed on ours, because this
     // program's stdout is a machine-readable line and mkfs.btrfs opens with a
     // banner. Inherited, that banner is the first line of what a caller parses
@@ -1532,11 +1583,13 @@ fn main() -> ExitCode {
             None => run_layout(&destination, &mut io::stdout()),
         },
         Mode::Volume {
+            uuid,
             destination,
             mkfs,
             scratch,
             publish,
         } => run_volume(
+            uuid.as_ref(),
             &destination,
             &mkfs,
             &scratch,
@@ -1792,6 +1845,7 @@ mod tests {
         assert_eq!(
             parse_args(args(&["volume", "/dev/sda", "/bin/mkfs.btrfs", "/tmp"])).unwrap(),
             Mode::Volume {
+                uuid: None,
                 destination: PathBuf::from("/dev/sda"),
                 mkfs: PathBuf::from("/bin/mkfs.btrfs"),
                 scratch: PathBuf::from("/tmp"),
@@ -1901,6 +1955,7 @@ mod tests {
         run_layout(&scratch.path, &mut Vec::new()).unwrap();
         let dir = fake_mkfs(RECORDING_MKFS);
         run_volume(
+            None,
             &scratch.path,
             &dir.join("mkfs.btrfs"),
             &dir,
@@ -1954,6 +2009,7 @@ mod tests {
             run_layout(&scratch.path, &mut Vec::new()).unwrap();
             let dir = fake_mkfs(RECORDING_MKFS);
             run_volume(
+                None,
                 &scratch.path,
                 &dir.join("mkfs.btrfs"),
                 &dir,
@@ -2079,6 +2135,7 @@ mod tests {
         std::fs::write(&bystander, b"do not truncate me").unwrap();
         std::os::unix::fs::symlink(&bystander, dir.join("td-volume.img")).unwrap();
         run_volume(
+            None,
             &scratch.path,
             &dir.join("mkfs.btrfs"),
             &dir,
@@ -2148,7 +2205,7 @@ mod tests {
         run_layout(&scratch.path, &mut Vec::new()).unwrap();
         let dir = fake_mkfs("#!/bin/sh\necho 'btrfs-progs v7.0'\n");
         let mut out = Vec::new();
-        run_volume(&scratch.path, &dir.join("mkfs.btrfs"), &dir, None, &mut out).unwrap();
+        run_volume(None, &scratch.path, &dir.join("mkfs.btrfs"), &dir, None, &mut out).unwrap();
         let text = String::from_utf8(out).unwrap();
         let fields: Vec<&str> = text.split_whitespace().collect();
         assert_eq!(fields.len(), 3, "the line is <off> <len> <written>: {text:?}");
@@ -2187,6 +2244,90 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    #[test]
+    fn a_preselected_uuid_is_forwarded_exactly_to_the_formatter() {
+        let uuid = "12345678-90ab-cdef-1234-567890abcdef";
+        let scratch = Scratch::disk(DISK);
+        run_layout(&scratch.path, &mut Vec::new()).unwrap();
+        let dir = fake_mkfs(RECORDING_MKFS);
+        let mode = parse_args(args(&[
+            "volume",
+            "--uuid",
+            uuid,
+            scratch.path.to_str().unwrap(),
+            dir.join("mkfs.btrfs").to_str().unwrap(),
+            dir.to_str().unwrap(),
+        ]))
+        .unwrap();
+        let Mode::Volume {
+            uuid: Some(identity),
+            destination,
+            mkfs,
+            scratch: staging_scratch,
+            publish,
+        } = mode
+        else {
+            panic!("preselected UUID was not retained");
+        };
+        run_volume(
+            Some(&identity),
+            &destination,
+            &mkfs,
+            &staging_scratch,
+            publish.as_ref(),
+            &mut Vec::new(),
+        )
+        .unwrap();
+        let argv = std::fs::read_to_string(dir.join("argv")).unwrap();
+        let words: Vec<_> = argv.lines().collect();
+        assert_eq!(
+            words
+                .windows(2)
+                .filter(|pair| pair[0] == "--uuid")
+                .collect::<Vec<_>>(),
+            vec![&["--uuid", uuid][..]]
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn uuid_options_require_canonical_bytes_and_exact_placement() {
+        let uuid = "12345678-90ab-cdef-1234-567890abcdef";
+        for bad in [
+            "",
+            "00000000-0000-0000-0000-000000000000",
+            "12345678-90AB-cdef-1234-567890abcdef",
+            "1234567890abcdef1234567890abcdef",
+            "12345678-90ab-cdef-1234-567890abcdeg",
+            "12345678-90ab-cdef-1234-567890abcdef\n",
+        ] {
+            assert!(parse_args(args(&["volume", "--uuid", bad, "disk", "/mkfs", "scratch"])).is_err());
+        }
+        for bad in [
+            vec!["volume", "--uuid"],
+            vec!["volume", "--uuid", uuid],
+            vec![
+                "volume", "--uuid", uuid, "--uuid", uuid, "disk", "/mkfs", "scratch",
+            ],
+            vec!["volume", "disk", "/mkfs", "scratch", "--uuid", uuid],
+            vec![
+                "volume", "--uuid", uuid, "--uuid", uuid, "disk", "/mkfs", "scratch", "key",
+            ],
+            vec!["layout", "--uuid", uuid, "disk"],
+        ] {
+            assert!(parse_args(args(&bad)).is_err(), "{bad:?}");
+        }
+        use std::os::unix::ffi::OsStringExt;
+        let mut non_utf8 = args(&["volume", "--uuid"]).collect::<Vec<_>>();
+        non_utf8.push(OsString::from_vec(vec![0xff; 36]));
+        non_utf8.extend(args(&["disk", "/mkfs", "scratch"]));
+        assert!(parse_args(non_utf8.into_iter()).is_err());
+        assert!(parse_args(args(&[
+            "volume", "--uuid", uuid, "disk", "/mkfs", "scratch", "/td-boot", "source", "key"
+        ]))
+        .is_ok());
+    }
+
     /// The publish arguments are three or none, never a defaulted subset.
     #[test]
     fn a_publish_is_all_three_arguments_or_none() {
@@ -2202,6 +2343,7 @@ mod tests {
             ]))
             .unwrap(),
             Mode::Volume {
+                uuid: None,
                 destination: PathBuf::from("/dev/sda"),
                 mkfs: PathBuf::from("/bin/mkfs.btrfs"),
                 scratch: PathBuf::from("/tmp"),
@@ -2317,6 +2459,7 @@ mod tests {
         };
         let mut out = Vec::new();
         run_volume(
+            None,
             &scratch.path,
             &dir.join("mkfs.btrfs"),
             &dir,
@@ -2399,6 +2542,7 @@ mod tests {
             trusted_key: key.clone(),
         };
         run_volume(
+            None,
             &scratch.path,
             &dir.join("mkfs.btrfs"),
             &dir,
@@ -2539,7 +2683,7 @@ mod tests {
             "layout must name the destination it could not open, got {refused:?}"
         );
 
-        let refused = run_volume(&absent, &dir.join("mkfs.btrfs"), &dir, None, &mut Vec::new())
+        let refused = run_volume(None, &absent, &dir.join("mkfs.btrfs"), &dir, None, &mut Vec::new())
             .unwrap_err()
             .to_string();
         assert!(
@@ -3898,6 +4042,7 @@ mod tests {
             trusted_key: dir.join("no-such-key.pub"),
         };
         let error = run_volume(
+            None,
             &scratch.path,
             &dir.join("mkfs.btrfs"),
             &dir,
@@ -3968,6 +4113,7 @@ mod tests {
                 trusted_key: key_file(&dir),
             };
             let _ = run_volume(
+                None,
                 &scratch.path,
                 &dir.join("mkfs.btrfs"),
                 &dir,
@@ -3996,6 +4142,7 @@ mod tests {
         run_layout(&scratch.path, &mut Vec::new()).unwrap();
         let dir = fake_mkfs(RECORDING_MKFS);
         run_volume(
+            None,
             &scratch.path,
             &dir.join("mkfs.btrfs"),
             &dir,
@@ -4050,6 +4197,7 @@ mod tests {
                 trusted_key: key_file(&dir),
             };
             let error = run_volume(
+                None,
                 &scratch.path,
                 &dir.join("mkfs.btrfs"),
                 &dir,
@@ -4106,6 +4254,7 @@ mod tests {
             trusted_key: key_file(&dir),
         };
         let error = run_volume(
+            None,
             &scratch.path,
             &dir.join("mkfs.btrfs"),
             &dir,
@@ -4152,6 +4301,7 @@ mod tests {
             trusted_key: key_file(&dir),
         };
         let error = run_volume(
+            None,
             &scratch.path,
             &dir.join("mkfs.btrfs"),
             &dir,
@@ -4185,6 +4335,7 @@ mod tests {
             trusted_key: key_file(&dir),
         };
         let error = run_volume(
+            None,
             &scratch.path,
             &dir.join("mkfs.btrfs"),
             &dir,
@@ -4228,6 +4379,7 @@ mod tests {
             trusted_key: key_file(&dir),
         };
         let error = run_volume(
+            None,
             &scratch.path,
             &dir.join("mkfs.btrfs"),
             &dir,
@@ -4292,6 +4444,7 @@ mod tests {
         let dir = scratch::path("relative");
         std::fs::create_dir(&dir).unwrap();
         let error = run_volume(
+            None,
             &scratch.path,
             Path::new("mkfs.btrfs"),
             &dir,
@@ -4317,7 +4470,7 @@ mod tests {
         run_layout(&path, &mut Vec::new()).unwrap();
         let fake = fake_mkfs("#!/bin/sh\nexit 0\n");
         let error =
-            run_volume(&path, &fake.join("mkfs.btrfs"), &dir, None, &mut Vec::new()).unwrap_err();
+            run_volume(None, &path, &fake.join("mkfs.btrfs"), &dir, None, &mut Vec::new()).unwrap_err();
         assert!(
             format!("{error}").contains("is the destination itself"),
             "the alias must be refused: {error}"
@@ -4417,6 +4570,7 @@ mod tests {
         std::fs::create_dir_all(stale.parent().unwrap()).unwrap();
         std::fs::write(&stale, b"not mine").unwrap();
         run_volume(
+            None,
             &scratch.path,
             &dir.join("mkfs.btrfs"),
             &dir,
@@ -4460,6 +4614,7 @@ mod tests {
         run_layout(&scratch.path, &mut Vec::new()).unwrap();
         let dir = fake_mkfs("#!/bin/sh\nexit 3\n");
         let error = run_volume(
+            None,
             &scratch.path,
             &dir.join("mkfs.btrfs"),
             &dir,

@@ -164,6 +164,8 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
         common.push((name.to_owned(), 0o755, read(&source)?));
     }
     let trust = RunTrust::generate()?;
+    let uuid = installation_uuid(&trust.public);
+    let uuid_line = format!("{uuid}\n").into_bytes();
     let installed = initramfs(&base, &common, "installed\n", &[])?;
     let deployment = scratch.dir.join("source");
     fs::create_dir(&deployment).map_err(|e| format!("create deployment: {e}"))?;
@@ -198,11 +200,10 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
         &base,
         &common,
         "selector\n",
-        &[(
-            td_boot_protocol::TRUSTED_KEY_PATH.into(),
-            0o644,
-            key.clone(),
-        )],
+        &[
+            (td_boot_protocol::TRUSTED_KEY_PATH.into(), 0o644, key.clone()),
+            (td_boot_protocol::VOLUME_UUID_PATH.into(), 0o644, uuid_line.clone()),
+        ],
     )?;
     write(&scratch.dir.join("selector.cpio"), &selector)?;
     let mut extra = vec![
@@ -217,6 +218,7 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
             read(&btrfs.join("bin/mkfs.btrfs"))?,
         ),
         ("trusted.pub".into(), 0o644, key),
+        (td_boot_protocol::VOLUME_UUID_PATH.into(), 0o644, uuid_line),
     ];
     let payloads: Vec<_> = protocol::MEDIA_FILES
         .iter()
@@ -278,7 +280,6 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
         if result.evidence.selected_current || result.evidence.selected_previous {
             return Err("ambiguous volume reached deployment selection".into());
         }
-        let mut previous_identity = None;
         for (count, marker) in [
             (1, protocol::FIRST_BOOT_MARKER),
             (2, protocol::SECOND_BOOT_MARKER),
@@ -311,7 +312,7 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
                 &scratch.dir,
                 timeout,
             )?;
-            require(&result, marker, "installed boot")?;
+            require(&result, &expected, "installed boot")?;
             require(&result, "TD-INSTALL-STALE-MOUNT-RECOVERED", "closed-descriptor mount recovery")?;
             let expected_device = if count == 2 { "/dev/vdb2" } else { "/dev/vda2" };
             let discovered: Vec<_> = result
@@ -320,28 +321,21 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
                 .map(str::trim_end)
                 .filter_map(|line| line.strip_prefix("TD-INSTALL-VOLUME "))
                 .collect();
+            let expected_identity = format!("{uuid} {expected_device}");
             if discovered.len() != 2
-                || discovered.first() != discovered.last()
-                || !discovered
-                    .first()
-                    .is_some_and(|line| line.ends_with(expected_device))
+                || discovered.iter().any(|line| *line != expected_identity)
             {
                 return Err(format!(
-                    "selector/deployment did not resolve the same UUID on {expected_device}"
+                    "selector/deployment did not resolve {expected_identity}: {discovered:?}\n{}",
+                    tail(&result.console, 80)
                 ));
             }
-            let identity = discovered
-                .first()
-                .and_then(|line| line.split_once(' '))
-                .map(|(uuid, _)| uuid.to_owned())
-                .ok_or("missing resolved UUID")?;
-            if previous_identity
-                .as_ref()
-                .is_some_and(|previous| previous != &identity)
-            {
-                return Err("volume UUID changed across cold boots".into());
+            if !bound_selector_before_selection(&result.console, &expected_identity, &id) {
+                return Err(format!(
+                    "installed selector did not bind {expected_identity} before selecting {id}\n{}",
+                    tail(&result.console, 80)
+                ));
             }
-            previous_identity = Some(identity);
             if !result.evidence.selected_current
                 || result.evidence.selected_previous
                 || result.evidence.bookkeeping_unavailable
@@ -391,10 +385,12 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
         &scratch.dir,
         timeout,
     )?;
-    require(&refused, protocol::REFUSED_PREFIX, "wrong-key installation")?;
-    if !refused
-        .console
-        .contains(td_boot_protocol::MANIFEST_UNAUTHENTICATED)
+    if !refused.evidence.target
+        || !refused.console.lines().any(|line| {
+            line.strip_prefix(protocol::REFUSED_PREFIX)
+                .is_some_and(|rest| rest.starts_with(' '))
+        })
+        || !refused.console.contains(td_boot_protocol::MANIFEST_UNAUTHENTICATED)
         || refused.console.contains(protocol::INSTALL_MARKER)
     {
         return Err(format!(
@@ -403,7 +399,7 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
         ));
     }
     println!(
-        "PASS: native optical/USB installation; UUID discovery across verified kexec and reordered disks; duplicate identity and wrong-key refusals; two persistent installed boots"
+        "PASS: native optical/USB installation; provisioned UUID binding across verified kexec and reordered disks; duplicate identity and wrong-key refusals; two persistent installed boots"
     );
     Ok(())
 }
@@ -431,8 +427,16 @@ fn plan<'a>(path: &'a Path, read_only: bool, marker: &'a str) -> BootPlan<'a> {
     }
 }
 
+fn bound_selector_before_selection(console: &str, identity: &str, id: &str) -> bool {
+    let bound = format!("TD-BOOT-VOLUME {identity}");
+    let selected = format!("TD-BOOT-SELECTED-CURRENT {id}");
+    let binding = console.lines().position(|line| line.trim_end() == bound);
+    let selection = console.lines().position(|line| line.trim_end() == selected);
+    matches!((binding, selection), (Some(binding), Some(selection)) if binding < selection)
+}
+
 fn require(result: &BootResult, marker: &str, phase: &str) -> Result<(), String> {
-    if result.evidence.target {
+    if result.evidence.target && result.console.lines().any(|line| line.trim_end() == marker) {
         Ok(())
     } else {
         Err(format!(
@@ -449,6 +453,57 @@ fn require(result: &BootResult, marker: &str, phase: &str) -> Result<(), String>
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
+
+    #[test]
+    fn a_later_bound_mount_cannot_stand_in_for_the_selector() {
+        let binding = "TD-BOOT-VOLUME uuid /dev/vda2\n";
+        let selection = "TD-BOOT-SELECTED-CURRENT deployment\n";
+        assert!(bound_selector_before_selection(
+            &format!("{binding}{selection}"),
+            "uuid /dev/vda2",
+            "deployment"
+        ));
+        assert!(!bound_selector_before_selection(
+            &format!("{selection}{binding}"),
+            "uuid /dev/vda2",
+            "deployment"
+        ));
+        assert!(!bound_selector_before_selection(
+            binding,
+            "uuid /dev/vda2",
+            "deployment"
+        ));
+        assert!(!bound_selector_before_selection(
+            &format!("{binding}{selection}"),
+            "other /dev/vda2",
+            "deployment"
+        ));
+    }
+
+    #[test]
+    fn a_named_marker_is_required_even_after_the_boot_target_was_reached() {
+        let mut result = BootResult {
+            evidence: ConsoleEvidence {
+                target: true,
+                ..ConsoleEvidence::default()
+            },
+            exited_clean: false,
+            marker_killed: true,
+            reason: "fixture".into(),
+            console: "TD-INSTALL-PERSISTED-1 deployment\n".into(),
+            elapsed: Duration::ZERO,
+            firefox_audio: FirefoxAudioCapture::NotRequested,
+        };
+        assert!(require(&result, "TD-INSTALL-STALE-MOUNT-RECOVERED", "recovery").is_err());
+        assert!(require(&result, "TD-INSTALL-PERSISTED-1 deployment", "installed").is_ok());
+        result.console =
+            "noiseTD-INSTALL-STALE-MOUNT-RECOVERED\nTD-INSTALL-STALE-MOUNT-RECOVERED-extra\n".into();
+        assert!(require(&result, "TD-INSTALL-STALE-MOUNT-RECOVERED", "recovery").is_err());
+        result.console = "TD-INSTALL-STALE-MOUNT-RECOVERED extra\n".into();
+        assert!(require(&result, "TD-INSTALL-STALE-MOUNT-RECOVERED", "recovery").is_err());
+        result.console = "TD-INSTALL-STALE-MOUNT-RECOVERED\r\n".into();
+        assert!(require(&result, "TD-INSTALL-STALE-MOUNT-RECOVERED", "recovery").is_ok());
+    }
 
     #[test]
     fn installation_deadline_defaults_and_accepts_positive_overrides() {

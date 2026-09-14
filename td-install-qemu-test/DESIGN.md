@@ -53,19 +53,29 @@ it does not establish exclusive admission against later hotplug.
 Missing payloads refuse before layout; no initramfs copy is available as a
 fallback. The formatter still stages the deployment and Btrfs image in RAM.
 
+The host chooses the UUID from the run's throwaway provisioning public key
+before assembling the ISO. Its canonical text is placed in the live and
+selector initramfs at `/etc/td/volume-uuid`. The live fixture supplies that
+value through `td-install volume --uuid`; formatting cannot silently choose
+a different identity. Optical and USB destinations deliberately share that
+run's UUID but are never attached together.
+
 The host then detaches media and cold-boots the destination through
-firmware. The selector calls `td-boot volume` to discover exactly one
-labelled td Btrfs volume and passes its UUID through `td.volume=` in the
-verified kexec command line. It refuses an existing handoff token. The
-selected fixture requires exactly one UUID token and resolves that UUID
-again, using the returned device for root, @var and acknowledgement.
+firmware. The selector emits read-only discovery evidence for its configured
+UUID and invokes production `td-boot on-volume boot`. That entry reads the
+selector's own identity file, rejects an existing handoff token, and binds
+verified kexec to the configured volume. The selected fixture requires one
+UUID handoff and resolves it again. The host requires both phases to report
+the exact preselected UUID and expected device, plus the production bound
+entry's marker; agreement with an arbitrary discovered UUID is insufficient.
 The selected fixture uses `td-boot on-volume` for both mounts and
 acknowledgement. Before acknowledgement it deliberately leaves a writable
 mount sourced through a descriptor it then closes. Success must recover
 that stale mount and leave no mount at `/ack`; the host requires the
-post-recovery marker on every normal boot. Neither installed phase uses
-the fixture serial or partition suffix.
-The host requires identical UUID/device evidence from both phases.
+post-recovery marker on every normal boot. Named-marker checks also inspect
+that marker's own complete line; a different boot target being reached is
+insufficient. Neither installed phase uses the fixture serial or partition
+suffix.
 
 Before successful boots, a private decoy gets a copy of the installed
 primary superblock at its own whole-disk superblock offset. The duplicate
@@ -91,8 +101,7 @@ the oracle's fixed topology; it does not establish exclusive admission.
 It does not launch the compositor, configure an account, retain an
 installation signing key, or test a full desktop deployment.
 The final installer still needs the activation evidence in
-../td-install/INSTALLER.md, including the full-system volume-consumer
-cutover and settings.
+../td-install/INSTALLER.md, including a complete desktop installation and settings.
 
 All operations use safe Rust and existing td-init/td-boot applets. No syscall
 surface or external dependency is added. Unit tests cover refusal outside

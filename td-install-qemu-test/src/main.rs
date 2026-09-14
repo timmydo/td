@@ -185,10 +185,19 @@ fn mount_source() -> Result<(), String> {
     writeln!(std::io::stdout(), "{MEDIA_MARKER} {device}").map_err(|error| error.to_string())
 }
 
+fn configured_uuid() -> Result<String, String> {
+    let bytes = read(Path::new("/etc/td/volume-uuid"), 37)?;
+    let text = std::str::from_utf8(&bytes).map_err(|_| "non-ASCII configured volume UUID")?;
+    text.strip_suffix('\n')
+        .map(str::to_owned)
+        .ok_or_else(|| "configured volume UUID lacks its newline".into())
+}
+
 fn install(device: &str) -> Result<(), String> {
     // The ISO carries the signed payloads and the live initramfs's public key.
     // Every path is fixture-owned; no private key enters the guest.
     mount_source()?;
+    let uuid = configured_uuid()?;
     command(
         "/bin/td-install",
         &["layout", device, "/source/bzImage", "/selector.cpio"],
@@ -197,6 +206,8 @@ fn install(device: &str) -> Result<(), String> {
         "/bin/td-install",
         &[
             "volume",
+            "--uuid",
+            &uuid,
             device,
             "/bin/mkfs.btrfs",
             "/scratch",
@@ -209,12 +220,9 @@ fn install(device: &str) -> Result<(), String> {
     writeln!(std::io::stdout(), "{INSTALL_MARKER}").map_err(|error| error.to_string())
 }
 
-fn volume(uuid: Option<&str>) -> Result<(String, String), String> {
+fn volume(uuid: &str) -> Result<(String, String), String> {
     let mut cmd = Command::new("/bin/td-boot");
-    cmd.arg("volume");
-    if let Some(uuid) = uuid {
-        cmd.arg(uuid);
-    }
+    cmd.arg("volume").arg(uuid);
     let output = cmd
         .output()
         .map_err(|error| format!("resolve volume: {error}"))?;
@@ -229,7 +237,7 @@ fn volume(uuid: Option<&str>) -> Result<(String, String), String> {
     let [found, path] = fields.as_slice() else {
         return Err("invalid volume result".into());
     };
-    if uuid.is_some_and(|uuid| uuid != *found) {
+    if uuid != *found {
         return Err("resolved wrong volume UUID".into());
     }
     writeln!(std::io::stdout(), "TD-INSTALL-VOLUME {found} {path}")
@@ -240,15 +248,12 @@ fn volume(uuid: Option<&str>) -> Result<(String, String), String> {
 fn selector() -> Result<(), String> {
     let cmdline = String::from_utf8(read(Path::new("/proc/cmdline"), 2048)?)
         .map_err(|_| "non-UTF-8 command line")?;
-    if cmdline
-        .split_ascii_whitespace()
-        .any(|word| word.starts_with("td.volume="))
-    {
-        return Err("selector refuses a preexisting volume handoff".into());
-    }
-    let (uuid, device) = volume(None)?;
-    let cmdline = format!("{} td.volume={uuid}", cmdline.trim_end());
-    command("/bin/td-boot", &["boot", &device, "/volume", &cmdline])
+    let uuid = configured_uuid()?;
+    volume(&uuid)?;
+    command(
+        "/bin/td-boot",
+        &["on-volume", "boot", "/volume", cmdline.trim_end()],
+    )
 }
 
 fn installed() -> Result<(), String> {
@@ -268,7 +273,7 @@ fn installed() -> Result<(), String> {
     let [uuid] = volumes.as_slice() else {
         return Err("missing or duplicate volume handoff".into());
     };
-    let (_, partition) = volume(Some(uuid))?;
+    let (_, partition) = volume(uuid)?;
     command("/bin/td-boot", &["on-volume", "mount-root", "/volume"])?;
     if !Path::new("/dev/loop0").exists() {
         applet(&["mknod", "/dev/loop0", "b", "7", "0"])?;

@@ -524,11 +524,34 @@ state setup are unchanged. The full-system oracle moves an installed
 pending candidate to `/dev/vdb` behind a blank disk, then requires its
 UUID evidence, persistent state, greeter and successful acknowledgement.
 
-The native installation oracle also resolves on both sides of kexec, but
-its tiny selector still uses unfiltered discovery under a fixed private
-single-volume topology. Installation target admission remains that fixture's
-private serial convention. Neither path activates a physical-device
-installer, machine settings or destructive user consent.
+The native installation oracle provisions its chosen UUID into both the
+formatter and the selector before writing the disk. Its tiny selector
+uses the same `on-volume boot` entry, including the selector-owned UUID
+configuration and verified handoff. The oracle requires the exact planned
+UUID on both sides of kexec and after disk reordering. Installation target
+admission remains the fixture's private serial convention. Neither path
+activates a physical-device installer, machine settings or destructive
+user consent.
+
+`td-install volume [--uuid UUID] DESTINATION MKFS SCRATCH
+[TD-BOOT DEPLOYMENT TRUSTED-KEY]` accepts a preselected filesystem identity.
+The optional pair appears immediately after `volume`; UUID is exactly
+36 ASCII bytes of nonzero, canonical lowercase UUID text. Invalid input
+refuses during argument parsing, before destination or scratch access.
+The formatter passes the supplied value unchanged to `mkfs.btrfs --uuid`.
+Omitting it retains the low-level operation's fresh random UUID behavior.
+This does not change GPT disk/partition GUID generation or the output's
+three numeric fields.
+
+A live-profile producer must choose the per-installation UUID and provision
+that same value into the fixed selector before creating the ESP. The
+formatter cannot inspect or repair a mismatched selector. A UUID identifies
+the filesystem; it provides no authentication, uniqueness proof or erase
+consent. The caller owns unique provisioning, stable device topology and
+exclusive admission. Reusing a UUID on two attached volumes deliberately
+causes boot discovery to refuse. The diagnostic derives one UUID from its
+throwaway provisioning key and reuses it only across separately attached
+optical/USB test destinations; no installation private key ships on media.
 
 td boots by the **removable-media path**: `\EFI\BOOT\BOOTX64.EFI` on the ESP,
 which every UEFI implementation boots when no NVRAM boot entry names anything
