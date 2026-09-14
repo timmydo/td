@@ -119,6 +119,26 @@ installed profile. Updates must retain the installed identity and settings.
 Keyboard and timezone choices must actually affect the installed session;
 only supported choices with available data may be offered.
 
+The `tzdata` recipe compiles the approved IANA 2026d data-only source
+with td's existing source-built glibc `zic`. Its output contains fat
+TZif files at `share/zoneinfo`, including backward-compatible aliases,
+geographic tables, and the upstream version and license. It uses
+ordinary POSIX time without leap-second corrections. Fat output is
+required by the pinned glibc compiler: its older `zic` miscompiles the
+2026 Canadian transitions in slim mode, dropping the correct
+daylight-saving flags and abbreviations. The native check covers those
+transitions in all six affected zone names. The upstream `Factory`
+placeholder for an unspecified timezone is intentionally omitted; it is
+not a selectable civil timezone. The upstream default source set omits
+`backzone`; merged locations share their canonical zone's pre-1970
+history. This data does not claim complete local histories before 1970.
+The recipe does not install a second libc or timezone compiler. Its
+native recipe check reads the realized geographic tables and requires
+their named zones to exist, then uses td's `zdump` to verify exact 2026
+Canadian and 2027 UTC, daylight-saving and fixed-offset behavior. This
+recipe supplies data for later image and settings integration; it does
+not yet select a timezone or change an installed session.
+
 ## Independently landable increments and evidence
 
 1. Record the agreed v1 scope and its activation boundaries here.

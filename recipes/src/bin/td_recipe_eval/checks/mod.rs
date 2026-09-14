@@ -16,6 +16,7 @@ mod codex;
 pub(crate) mod qemu_boot;
 pub(crate) mod run;
 mod rust_toolchain;
+mod tzdata;
 pub(crate) mod vm_profile;
 
 pub(crate) fn run(
@@ -27,5 +28,6 @@ pub(crate) fn run(
         CheckRunner::BuildOnly => basic::run_build_only(runner, stem),
         CheckRunner::Codex => codex::run(runner),
         CheckRunner::RustToolchain => rust_toolchain::run(runner),
+        CheckRunner::Tzdata => tzdata::run(runner),
     }
 }

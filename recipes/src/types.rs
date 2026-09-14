@@ -1226,6 +1226,7 @@ pub enum CheckRunner {
     BuildOnly,
     Codex,
     RustToolchain,
+    Tzdata,
 }
 
 impl RecipeCheck {

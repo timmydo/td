@@ -636,6 +636,14 @@ const PINS: &[PinDef] = &[
         file: "tcc-0.9.27.tar.bz2",
     },
     PinDef {
+        key: "tzdata-source",
+        aliases: &[],
+        // Approved IANA data-only input; compile with the existing td glibc zic.
+        url: "https://data.iana.org/time-zones/releases/tzdata2026d.tar.gz",
+        sha256: "0cb2aa8e333c3dc049badc42a0c61f21987b8cd44e107fa900bad764aacc7767",
+        file: "tzdata2026d.tar.gz",
+    },
+    PinDef {
         key: "util-linux-libs-x86-64-source",
         aliases: &[],
         // btrfs-progs requires libuuid and libblkid. The recipe builds only
@@ -772,7 +780,8 @@ mod tests {
         // the second reviewed foreign application seed, the Claude Code
         // 2.1.260 native release. The terminal applications are td's own
         // trees (APPLICATIONS.md §W.8) and pin nothing here.
-        assert_eq!(all().len(), 72);
+        // IANA timezone data 2026d adds one source-data pin.
+        assert_eq!(all().len(), 73);
     }
 
     /// A roster keyed by NAME can name nothing, and this workstream has twice

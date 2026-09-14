@@ -6576,9 +6576,9 @@ of memory bandwidth. **"Draws a window" does not imply watchable video.**
   DNS should fail like the network it names. **`/etc/hosts`** carries loopback
   and the inherited UTS hostname; `/etc/hostname` agrees with the same name.
 - **`/etc/localtime`** — **read-only bind of the runtime's own compiled
-  zone**, and the earlier "recorded divergence, zero code" is reversed:
-  §O made timezone support required and the ladder had no rung for it,
-  which is how a required thing was quietly becoming a permanent one.
+  zone**, as required by §O. Application timezone resolution uses
+  the runtime's data independently of the source-built `tzdata` recipe
+  described in `td-install/INSTALLER.md`.
   What §O actually answered — *"a per-user `TZ=` reading the runtime's
   own zoneinfo is zero td code"* — is the split kept here with the
   environment variable removed. **td owns the NAME and the runtime owns
@@ -6590,7 +6590,10 @@ of memory bandwidth. **"Draws a window" does not imply watchable video.**
   zone name, every component capitalised, at most three deep. It cannot
   be spelled the ordinary way, as an `/etc/localtime` symlink into
   `/usr/share/zoneinfo`, because **td's own root carries no zoneinfo for
-  such a symlink to name**: the zone data exists only inside a jail.
+  such a symlink to name**. The `tzdata` recipe is not wired
+  into the image. Future native-system timezone data must preserve this
+  application boundary: the system chooses a name, and each application's
+  runtime supplies and validates its own compiled file for that name.
   **Unset is not a zone**, and that is the whole of the first case.
   When `/etc/timezone` is absent — or is the reviewed link out to state
   nothing has minted yet, which is the same "nobody has said" — there is
@@ -7354,10 +7357,13 @@ ladder reading as the whole plan.
 Timezone was described here as "a TZif input plus `/etc/localtime` in
 the mount plan", and the mount-plan half is rung 12j. The **input** half
 turned out not to be a td input at all: §O's own answer reads the
-*runtime's* zoneinfo, so td pins no tzdata, builds no `zic`, and adds no
-foreign source — it carries the zone NAME and binds the runtime's
-compiled file. What remains is the writer for that name and td's own
-clock, which are rungs 12k and 29 rather than an unscheduled gap.
+*runtime's* zoneinfo. The application mount plan carries the zone NAME
+and binds the runtime's compiled file. Separately, the installer has
+an approved IANA `tzdata` source recipe compiled with td's existing
+source-built glibc `zic`; it is data for future native-system image and
+settings integration, not an application runtime input. What remains is
+the writer for that name and td's own clock, which are rungs 12k and 29
+rather than an unscheduled gap.
 Accessibility is unchanged: it belongs **after** M28 and before "daily
 usable", it is §S's second-bus landing, and it is not small.
 
