@@ -1,4 +1,4 @@
-//! Private Linux x86-64 Unix socket publication. No worker or editor access.
+//! Private Linux x86-64 Unix socket publication. No worker or consumer access.
 
 use std::ffi::OsString;
 use std::fs::{self, File, Metadata, OpenOptions, Permissions};

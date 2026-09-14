@@ -206,18 +206,18 @@ up to 64 completion/error/cancellation outcomes, separate from scan-pinned
 result pages. Native state also exposes separate redraw/submitted/callback
 generations; `wait-frame`
 waits for a matching main-surface callback without blocking editing.
-The separate `control_socket` library publishes a private Linux Unix
-listener only when explicitly requested. It checks directory
+The private Linux Unix listener is published only when explicitly
+requested, by td-ui's `control_socket`: it checks directory
 ownership/permissions, refuses symlinks and existing endpoints, and pins
-parent/socket inodes for checked cleanup. It has no request worker or editor
-access itself; CONTROL.md specifies the
-absolute-path limits and trust boundary.
-The `control_worker` library adds a bounded request thread with
-eight connection slots, typed nonblocking UI queues, whole-request deadlines
-and joined shutdown. The native adapter polls at most two jobs per outer
-event-loop turn without performing socket I/O on the UI thread. Opting in
-caps the receive wait at 10 ms even while idle; the default window does not
-incur this polling cost.
+parent/socket inodes for checked cleanup, with no request worker or editor
+access itself; the "Driving" section of td-ui/DESIGN.md specifies the
+absolute-path limits and trust boundary. td-ui's `control_worker` adds a
+bounded request thread with eight connection slots, typed nonblocking UI
+queues, whole-request deadlines and joined shutdown, parsing the editor's
+requests on its own thread. The native adapter polls at most two jobs per
+outer event-loop turn without performing socket I/O on the UI thread.
+Opting in caps the receive wait at 10 ms even while idle; the default
+window does not incur this polling cost.
 
 For an explicitly controllable local window:
 

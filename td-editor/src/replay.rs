@@ -1,5 +1,5 @@
-//! Bounded headless adapter for the editor dispatcher. Framing matches the
-//! planned control transport; replay accepts consecutive frames until EOF.
+//! Bounded headless adapter for the editor dispatcher, on td-ui's
+//! consecutive-frame runner: the control transport's framing until EOF.
 
 use crate::keys::Profile;
 use crate::model::{Command, Selection};
@@ -37,7 +37,7 @@ impl Session {
             self.command(envelope.name, &args)
         };
         match result {
-            Ok(body) => format!("1\t{request}\tok\t{body}"),
+            Ok(body) => td_ui::control::ok(request, &body),
             Err(error) => crate::control::Refusal { id: request, error }.response(),
         }
     }
@@ -192,35 +192,5 @@ fn reply(outcome: Outcome) -> Result<String> {
 
 pub fn run(input: &mut impl Read, output: &mut impl Write) -> io::Result<()> {
     let mut session = Session::default();
-    loop {
-        let mut header = [0u8; 4];
-        // EOF between frames is normal. A partial header is an error.
-        loop {
-            match input.read(
-                header
-                    .get_mut(..1)
-                    .ok_or_else(|| io::Error::other("header"))?,
-            ) {
-                Ok(0) => return Ok(()),
-                Ok(_) => break,
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-                Err(error) => return Err(error),
-            }
-        }
-        input.read_exact(
-            header
-                .get_mut(1..)
-                .ok_or_else(|| io::Error::other("header"))?,
-        )?;
-        let length = u32::from_be_bytes(header) as usize;
-        if length == 0 || length > MAX_FRAME {
-            return Err(io::Error::other("replay frame length outside 1..=1048576"));
-        }
-        let mut bytes = vec![0; length];
-        input.read_exact(&mut bytes)?;
-        let reply = session.request(&bytes);
-        let framed = crate::control::frame(reply.as_bytes()).map_err(io::Error::other)?;
-        output.write_all(&framed)?;
-        output.flush()?;
-    }
+    td_ui::replay::run(input, output, |bytes| session.request(bytes))
 }

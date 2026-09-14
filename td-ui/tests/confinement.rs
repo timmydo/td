@@ -23,8 +23,9 @@ fn compact(text: &str) -> String {
     text.chars().filter(|c| !c.is_whitespace()).collect()
 }
 
-const PURE: [&str; 11] = [
+const PURE: [&str; 12] = [
     "chrome.rs",
+    "control.rs",
     "data.rs",
     "keyboard.rs",
     "pointer.rs",
@@ -43,7 +44,19 @@ fn source_inventory_and_shared_mounts_are_closed() {
     assert!(!root.join("build.rs").exists());
     let expected: BTreeSet<String> = PURE
         .iter()
-        .chain(["client.rs", "lib.rs", "notices.rs", "sys.rs", "wayland.rs"].iter())
+        .chain(
+            [
+                "client.rs",
+                "control_socket.rs",
+                "control_worker.rs",
+                "lib.rs",
+                "notices.rs",
+                "replay.rs",
+                "sys.rs",
+                "wayland.rs",
+            ]
+            .iter(),
+        )
         .map(|name| name.to_string())
         .collect();
     let mut actual = BTreeSet::new();
@@ -74,8 +87,17 @@ fn source_inventory_and_shared_mounts_are_closed() {
         // The raw module is named by the crate root's private declaration
         // and by the transport's two imports and four wrapper calls; no
         // other module, shared source or test-support reader reaches it.
+        // The socket's pinned procfs pathname has a `sys` segment that is
+        // not raw-module access.
+        let raw_text = if name == "control_socket.rs" {
+            let literal = "\"/proc/sys/kernel/overflowuid\"";
+            assert_eq!(text.matches(literal).count(), 1);
+            text.replacen(literal, "\"\"", 1)
+        } else {
+            text.clone()
+        };
         assert_eq!(
-            identifier_count(&text, "sys"),
+            identifier_count(&raw_text, "sys"),
             match name.as_str() {
                 "lib.rs" => 1,
                 "wayland.rs" => 6,
@@ -338,6 +360,105 @@ fn complete_raw_layer_and_its_sole_caller_are_pinned() {
     ] {
         assert!(transport.contains(pin), "{pin}");
     }
+}
+
+#[test]
+fn control_socket_publication_keeps_kernel_path_and_identity_checks_explicit() {
+    let source = include_str!("../src/control_socket.rs");
+    let production = source.split("#[cfg(test)]").next().unwrap();
+    for pin in [
+        "const O_DIRECTORY: i32 = 0o200000;",
+        "const O_NOFOLLOW: i32 = 0o400000;",
+        "const O_PATH: i32 = 0o10000000;",
+        "const PATH_BYTES: usize = 107;",
+        "const NAME_BYTES: usize = 80;",
+        "const STATUS_BYTES: usize = 64 * 1024;",
+        "UnixListener::bind(&pinned_path)",
+        "custom_flags(O_PATH | O_DIRECTORY | O_NOFOLLOW)",
+        "custom_flags(O_PATH | O_NOFOLLOW)",
+        "File::open(\"/proc/self/status\")",
+        "File::open(\"/proc/sys/kernel/overflowuid\")",
+        "const UID_BYTES: usize = 11;",
+        ".take(UID_BYTES as u64 + 1)",
+        "unambiguous_uid(uid, overflow_uid(&bytes)?)",
+        "overflow == uid || overflow == 0",
+        "Permissions::from_mode(0o600)",
+        "identity(&named) != identity(&self.node.metadata()?)",
+        "fs::metadata(descriptor_path(&self.parent)).map_err",
+        "control cleanup parent is unavailable",
+        "trusted_ancestor(&current.metadata()?, uid)?",
+        "metadata.uid() != uid && metadata.uid() != 0",
+        "metadata.mode() & 0o022 != 0 && metadata.mode() & 0o1000 == 0",
+    ] {
+        assert!(production.contains(pin), "{pin}");
+    }
+    assert_eq!(production.matches("UnixListener::bind(").count(), 1);
+    assert!(!production.contains("UnixStream::connect"));
+    assert!(!production.contains("std::env"));
+    assert!(!production.contains("env::"));
+    assert!(!production.contains("canonicalize"));
+    assert!(!production.contains("65534"));
+    assert!(!production.contains("TD_TEST_TRUSTED_ROOT"));
+    // The socket is the sole caller of the listener; the worker owns it
+    // whole and the runner never opens one.
+    for other in [
+        include_str!("../src/control_worker.rs"),
+        include_str!("../src/replay.rs"),
+        include_str!("../src/control.rs"),
+    ] {
+        assert!(!other.contains("UnixListener"));
+    }
+}
+
+#[test]
+fn control_worker_keeps_bounded_nonblocking_transport_separate_from_consumer_state() {
+    let source = include_str!("../src/control_worker.rs");
+    let production = source.split("#[cfg(test)]").next().unwrap();
+    for pin in [
+        "pub const CONNECTIONS: usize = 8;",
+        "const IO_BYTES: usize = 16 * 1024;",
+        ".name(\"td-ui-control\".into())",
+        "Duration::from_secs(5)",
+        "Duration::from_millis(10)",
+        "mpsc::sync_channel(CONNECTIONS)",
+        "mpsc::sync_channel(1)",
+        "for _ in connections.len()..CONNECTIONS",
+        "requests.try_send(job)",
+        "self.requests.try_recv()",
+        "reply.try_send(response)",
+        "R::parse(payload)",
+        "thread::park_timeout(poll_interval(connections.is_empty()))",
+        "Duration::from_millis(100)",
+        ".join()",
+    ] {
+        assert!(production.contains(pin), "{pin}");
+    }
+    // The worker parses only through the consumer's `Parse` and touches no
+    // consumer state: the one generic parameter is the request type.
+    assert_eq!(production.matches("R::parse(").count(), 1);
+    assert!(!production.contains("Controller"));
+    assert!(!production.contains("App"));
+    let socket = include_str!("../src/control_socket.rs");
+    assert!(socket.contains("socket.listener.set_nonblocking(true)?"));
+    assert!(socket.contains("stream.set_nonblocking(true)?"));
+    for forbidden in [
+        "mpsc::channel(",
+        ".read_exact(",
+        ".write_all(",
+        ".recv()",
+        ".send(",
+    ] {
+        assert!(!production.contains(forbidden), "{forbidden}");
+    }
+    // The replay runner is the framing's only other reader of a stream:
+    // one header, one body, one framed reply, no state of its own.
+    let replay = include_str!("../src/replay.rs");
+    let replay = replay.split("#[cfg(test)]").next().unwrap();
+    assert!(replay.contains("if length == 0 || length > MAX_FRAME {"));
+    assert_eq!(replay.matches("input.read_exact(").count(), 2);
+    assert_eq!(replay.matches("frame(reply.as_bytes())").count(), 1);
+    assert!(!replay.contains("struct "));
+    assert!(!replay.contains("static "));
 }
 
 #[test]

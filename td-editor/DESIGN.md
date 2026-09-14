@@ -3161,18 +3161,20 @@ the Wayland transfer. This is two-editor interoperability, not arbitrary
 external applications, clipboard-manager persistence, source-exit survival
 or hostile peer/large-transfer coverage.
 
-The safe `control` library now supplies the one-frame decoder/encoder,
-`state`/`text` queries and a bounded revision-checked editing subset. It
-shares controller snapshots,
-scalar-aligned text pages and byte codecs with replay. The exact implemented
-field order, errors, limits and conformance fixtures are recorded in
-[CONTROL.md](CONTROL.md). The separate `control_socket` library implements
-explicit private Unix listener publication with descriptor-pinned paths,
-owner/mode admission and identity-checked cleanup; its complete path/trust
-contract and same-UID race boundary are in that reference. The
-`control_worker` library adds eight-connection
-nonblocking transport, typed bounded UI jobs and five-second acceptance-based
-deadlines under CONTROL.md's exact scheduling contract. The experimental
+The safe `control` library now supplies `state`/`text` queries and a
+bounded revision-checked editing subset over td-ui's framing and envelope
+(`td_ui::control`: the one-frame decoder/encoder, the field and byte
+codecs and the two response lines, re-exported here for replay and the
+tests). It shares controller snapshots and scalar-aligned text pages with
+replay, which runs on td-ui's consecutive-frame runner. The exact
+implemented field order, errors, limits and conformance fixtures are
+recorded in [CONTROL.md](CONTROL.md). The private Unix listener
+publication with descriptor-pinned paths, owner/mode admission and
+identity-checked cleanup, and the eight-connection nonblocking transport
+with typed bounded UI jobs and five-second acceptance-based deadlines, are
+td-ui's `control_socket` and `control_worker`, moved there intact and
+specified under "Driving" in [td-ui/DESIGN.md](../td-ui/DESIGN.md#driving);
+the editor's `Request` is the worker's `Parse` type. The experimental
 `--window --control-socket PATH` adapter now connects read-only state/text
 requests, including coarse native modal/job/spelling flags, plus Select
 Tab/Range, Insert, Delete, Undo, Redo, Fill Paragraph, Auto Fill/fill-column

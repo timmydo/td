@@ -89,8 +89,8 @@ struct Window {
     control_jobs: crate::control_jobs::Jobs,
     control_file_job: Option<ControlFile>,
     control_input_error: Option<String>,
-    control: Option<crate::control_worker::Worker>,
-    frame_waiters: VecDeque<crate::control_worker::Job>,
+    control: Option<crate::control::Worker>,
+    frame_waiters: VecDeque<crate::control::Job>,
     control_cleanup_error: Option<String>,
 }
 
@@ -1311,7 +1311,7 @@ impl Window {
             budget -= 1;
             if let crate::control::Operation::WaitFrame(target) = job.request().operation {
                 if self.frames.wait(target) == Ok(None) {
-                    if self.frame_waiters.len() < crate::control_worker::CONNECTIONS {
+                    if self.frame_waiters.len() < td_ui::control_worker::CONNECTIONS {
                         self.frame_waiters.push_back(job);
                     } else if let Err(detail) = job.respond_with(|request| {
                         crate::control::Refusal {
@@ -1359,7 +1359,7 @@ impl Window {
         }
         if matches!(request.operation, crate::control::Operation::PromptState) {
             return match self.control_prompt_state() {
-                Ok(body) => format!("1\t{}\tok\t{body}", request.id),
+                Ok(body) => td_ui::control::ok(request.id, &body),
                 Err(error) => crate::control::Refusal {
                     id: request.id,
                     error,
@@ -1369,7 +1369,7 @@ impl Window {
         }
         if matches!(request.operation, crate::control::Operation::ClipboardState) {
             return match self.control_clipboard_state() {
-                Ok(body) => format!("1\t{}\tok\t{body}", request.id),
+                Ok(body) => td_ui::control::ok(request.id, &body),
                 Err(error) => crate::control::Refusal {
                     id: request.id,
                     error,
@@ -1382,7 +1382,7 @@ impl Window {
             crate::control::Operation::PromptAnswer { .. }
         ) {
             return match self.control_prompt_answer(&request.operation) {
-                Ok(()) => format!("1\t{}\tok\t", request.id),
+                Ok(()) => td_ui::control::ok(request.id, ""),
                 Err(error) => crate::control::Refusal {
                     id: request.id,
                     error,
@@ -1392,7 +1392,7 @@ impl Window {
         }
         if matches!(request.operation, crate::control::Operation::Pointer { .. }) {
             return match self.control_pointer_event(&request.operation) {
-                Ok(()) => format!("1\t{}\tok\t", request.id),
+                Ok(()) => td_ui::control::ok(request.id, ""),
                 Err(error) => crate::control::Refusal {
                     id: request.id,
                     error,
@@ -1402,7 +1402,7 @@ impl Window {
         }
         if matches!(request.operation, crate::control::Operation::Wheel { .. }) {
             return match self.control_wheel(&request.operation) {
-                Ok(()) => format!("1\t{}\tok\t", request.id),
+                Ok(()) => td_ui::control::ok(request.id, ""),
                 Err(error) => crate::control::Refusal {
                     id: request.id,
                     error,
@@ -1425,7 +1425,7 @@ impl Window {
                 *generation,
                 chord,
             ) {
-                Ok(()) => format!("1\t{}\tok\t", request.id),
+                Ok(()) => td_ui::control::ok(request.id, ""),
                 Err(error) => crate::control::Refusal {
                     id: request.id,
                     error,
@@ -1448,8 +1448,10 @@ impl Window {
                 },
                 answer,
             ) {
-                Ok(ControlAnswer::Done) => format!("1\t{}\tok\t", request.id),
-                Ok(ControlAnswer::Dialog(id)) => format!("1\t{}\tok\tdialog\t{id}", request.id),
+                Ok(ControlAnswer::Done) => td_ui::control::ok(request.id, ""),
+                Ok(ControlAnswer::Dialog(id)) => {
+                    td_ui::control::ok(request.id, &format!("dialog\t{id}"))
+                }
                 Ok(ControlAnswer::Job(id)) => format!("1\t{}\tpending\t{id}", request.id),
                 Err(error) => crate::control::Refusal {
                     id: request.id,
@@ -1504,7 +1506,7 @@ impl Window {
                 })
             })();
             return match result {
-                Ok(body) => format!("1\t{}\tok\t{body}", request.id),
+                Ok(body) => td_ui::control::ok(request.id, &body),
                 Err(error) => crate::control::Refusal {
                     id: request.id,
                     error,
@@ -1567,7 +1569,7 @@ impl Window {
             return match self.ui.dispatch(Event::New) {
                 Ok(Outcome::Created(tab)) => {
                     self.control_mutation_accepted();
-                    format!("1\t{}\tok\t{tab}", request.id)
+                    td_ui::control::ok(request.id, &tab.to_string())
                 }
                 Ok(_) => {
                     // Defensive against a changed controller outcome, not bad wire input.
@@ -1610,7 +1612,7 @@ impl Window {
         }
         if let crate::control::Operation::WaitFrame(target) = request.operation {
             return match self.frames.wait(target) {
-                Ok(Some(stamp)) => format!("1\t{}\tok\t{}", request.id, stamp.fields()),
+                Ok(Some(stamp)) => td_ui::control::ok(request.id, &stamp.fields()),
                 // The scheduler holds pending waits; direct dispatch still fails safely.
                 Ok(None) => crate::control::Refusal {
                     id: request.id,
@@ -1635,7 +1637,7 @@ impl Window {
             return match result {
                 Ok(()) => {
                     self.control_mutation_accepted();
-                    format!("1\t{}\tok\t", request.id)
+                    td_ui::control::ok(request.id, "")
                 }
                 Err(error) => request.admitted_edit_refusal(error),
             };
@@ -5003,7 +5005,7 @@ pub fn file_window(options: FileWindowOptions) -> io::Result<()> {
     } = options;
     let work = || -> Result<()> {
         let socket = control
-            .map(|path| crate::control_socket::Socket::bind(&path))
+            .map(|path| td_ui::control_socket::Socket::bind(&path))
             .transpose()
             .map_err(error)?;
         let (ui, files, spelling) = prepare_files(profile, paths, dictionary)?;
@@ -5022,7 +5024,7 @@ pub fn file_window(options: FileWindowOptions) -> io::Result<()> {
         window.spelling = spelling;
         window.files = Some(files);
         window.control = socket
-            .map(crate::control_worker::Worker::start)
+            .map(crate::control::Worker::start)
             .transpose()
             .map_err(error)?;
         window.notify(format!("{dictionary_notice}UTF-8 clipboard needs data-device v3. F7 checks spelling; Format > Dictionary selects a local word list. Experimental software rendering; no crash recovery."));
@@ -7071,10 +7073,8 @@ mod tests {
         w.search_request("find", 2, 0).unwrap();
         w.client.input_mut().focused = false;
         w.control = Some(
-            crate::control_worker::Worker::start(
-                crate::control_socket::Socket::bind(&socket).unwrap(),
-            )
-            .unwrap(),
+            crate::control::Worker::start(td_ui::control_socket::Socket::bind(&socket).unwrap())
+                .unwrap(),
         );
         for action in ["entry\tcebb", "submit"] {
             let snapshot = job_request(&mut w, &peer, &socket, "1\t1\tprompt-state");
@@ -7187,10 +7187,8 @@ mod tests {
         let snapshot = clipboard_snapshot(&mut w);
         assert!(snapshot.ends_with("\tincoming=1\toutgoing=1"));
         w.control = Some(
-            crate::control_worker::Worker::start(
-                crate::control_socket::Socket::bind(&socket).unwrap(),
-            )
-            .unwrap(),
+            crate::control::Worker::start(td_ui::control_socket::Socket::bind(&socket).unwrap())
+                .unwrap(),
         );
         assert_eq!(
             job_request(&mut w, &peer, &socket, "1\t33\tclipboard-state"),
@@ -7488,10 +7486,8 @@ mod tests {
         w.ui.dispatch(Event::Load("a λ".as_bytes())).unwrap();
         decoded_key(&mut w, "C-f");
         w.control = Some(
-            crate::control_worker::Worker::start(
-                crate::control_socket::Socket::bind(&socket).unwrap(),
-            )
-            .unwrap(),
+            crate::control::Worker::start(td_ui::control_socket::Socket::bind(&socket).unwrap())
+                .unwrap(),
         );
         let state = job_request(&mut w, &peer, &socket, "1\t33\tprompt-state");
         assert!(state.contains("\tprompt=find-forward\ttarget=2,0\t"));
@@ -7781,10 +7777,8 @@ mod tests {
         w.ui.dispatch(Event::Focus(true)).unwrap();
         pointer_enter(&mut w);
         w.control = Some(
-            crate::control_worker::Worker::start(
-                crate::control_socket::Socket::bind(&socket).unwrap(),
-            )
-            .unwrap(),
+            crate::control::Worker::start(td_ui::control_socket::Socket::bind(&socket).unwrap())
+                .unwrap(),
         );
         let state = job_request(&mut w, &peer, &socket, "1\t0\tstate");
         assert!(state.contains("\twheel-ready=1\t"));
@@ -8076,10 +8070,8 @@ mod tests {
         w.ui.dispatch(Event::New).unwrap();
         pointer_enter(&mut w);
         w.control = Some(
-            crate::control_worker::Worker::start(
-                crate::control_socket::Socket::bind(&socket).unwrap(),
-            )
-            .unwrap(),
+            crate::control::Worker::start(td_ui::control_socket::Socket::bind(&socket).unwrap())
+                .unwrap(),
         );
         let tab = w.ui.geometry().tab(0, 1, 2).unwrap();
         let command = format!(
@@ -8598,10 +8590,8 @@ mod tests {
         configure(&mut w, 800, 600);
         w.ui.dispatch(Event::Focus(true)).unwrap();
         w.control = Some(
-            crate::control_worker::Worker::start(
-                crate::control_socket::Socket::bind(&socket).unwrap(),
-            )
-            .unwrap(),
+            crate::control::Worker::start(td_ui::control_socket::Socket::bind(&socket).unwrap())
+                .unwrap(),
         );
         let state = job_request(&mut w, &peer, &socket, "1\t0\tstate");
         assert!(state.contains("\tkey-ready=1\t"));
@@ -9438,10 +9428,8 @@ mod tests {
         finish_file(&mut w);
         w.chord("a", false).unwrap();
         w.control = Some(
-            crate::control_worker::Worker::start(
-                crate::control_socket::Socket::bind(&socket).unwrap(),
-            )
-            .unwrap(),
+            crate::control::Worker::start(td_ui::control_socket::Socket::bind(&socket).unwrap())
+                .unwrap(),
         );
         assert_eq!(
             job_request(&mut w, &peer, &socket, "1\t1\tsave\t2\t1"),
@@ -9639,10 +9627,8 @@ mod tests {
         w.chord("a", false).unwrap();
         let original = format!("{:?}", w.ui.editor().document(1).unwrap());
         w.control = Some(
-            crate::control_worker::Worker::start(
-                crate::control_socket::Socket::bind(&socket).unwrap(),
-            )
-            .unwrap(),
+            crate::control::Worker::start(td_ui::control_socket::Socket::bind(&socket).unwrap())
+                .unwrap(),
         );
         assert_eq!(
             job_request(&mut w, &peer, &socket, &open(&file)),
@@ -9734,10 +9720,8 @@ mod tests {
         let (mut w, peer) = file_dialog_fixture();
         w.files = Some(crate::session::Session::disconnected_for_test());
         w.control = Some(
-            crate::control_worker::Worker::start(
-                crate::control_socket::Socket::bind(&path).unwrap(),
-            )
-            .unwrap(),
+            crate::control::Worker::start(td_ui::control_socket::Socket::bind(&path).unwrap())
+                .unwrap(),
         );
         let documents = format!("{:?}", w.ui.editor());
         for id in [1, 2] {
@@ -9771,10 +9755,8 @@ mod tests {
         w.spelling
             .install(crate::spelling::Dictionary::parse(b"known").unwrap());
         w.control = Some(
-            crate::control_worker::Worker::start(
-                crate::control_socket::Socket::bind(&path).unwrap(),
-            )
-            .unwrap(),
+            crate::control::Worker::start(td_ui::control_socket::Socket::bind(&path).unwrap())
+                .unwrap(),
         );
         assert_eq!(
             job_request(&mut w, &peer, &path, "1\t1\tcheck-spelling\t1\t1"),
@@ -9923,10 +9905,8 @@ mod tests {
         std::fs::write(&file, b"opened").unwrap();
         let (mut w, peer) = file_dialog_fixture();
         w.control = Some(
-            crate::control_worker::Worker::start(
-                crate::control_socket::Socket::bind(&socket).unwrap(),
-            )
-            .unwrap(),
+            crate::control::Worker::start(td_ui::control_socket::Socket::bind(&socket).unwrap())
+                .unwrap(),
         );
         w.chord("C-o", false).unwrap();
         assert!(w
@@ -10016,10 +9996,8 @@ mod tests {
         let dictionary = directory.path("dictionary");
         let (mut w, peer) = file_dialog_fixture();
         w.control = Some(
-            crate::control_worker::Worker::start(
-                crate::control_socket::Socket::bind(&socket).unwrap(),
-            )
-            .unwrap(),
+            crate::control::Worker::start(td_ui::control_socket::Socket::bind(&socket).unwrap())
+                .unwrap(),
         );
         for (id, bytes, expected) in [
             (1, b"first\n".as_slice(), "complete,-"),
@@ -10203,10 +10181,8 @@ mod tests {
         w.chord("a", false).unwrap();
         std::fs::write(&file, b"external").unwrap();
         w.control = Some(
-            crate::control_worker::Worker::start(
-                crate::control_socket::Socket::bind(&socket).unwrap(),
-            )
-            .unwrap(),
+            crate::control::Worker::start(td_ui::control_socket::Socket::bind(&socket).unwrap())
+                .unwrap(),
         );
         assert_eq!(
             job_request(&mut w, &peer, &socket, "1\t1\tsave\t2\t1"),
@@ -10575,10 +10551,8 @@ mod tests {
         w.close_chord("C-s", false);
         assert!(!w.files.as_ref().unwrap().busy());
         w.control = Some(
-            crate::control_worker::Worker::start(
-                crate::control_socket::Socket::bind(&socket).unwrap(),
-            )
-            .unwrap(),
+            crate::control::Worker::start(td_ui::control_socket::Socket::bind(&socket).unwrap())
+                .unwrap(),
         );
         let before = job_request(&mut w, &peer, &socket, "1\t0\tstate");
         for (answer, code) in [
@@ -10644,10 +10618,8 @@ mod tests {
         let device = w.client.keyboard().unwrap();
         w.event(message(device, 2, &[99, SURFACE])).unwrap();
         w.control = Some(
-            crate::control_worker::Worker::start(
-                crate::control_socket::Socket::bind(&socket).unwrap(),
-            )
-            .unwrap(),
+            crate::control::Worker::start(td_ui::control_socket::Socket::bind(&socket).unwrap())
+                .unwrap(),
         );
         for (tab, destination, bytes) in [(2, &second, b"b"), (1, &first, b"a")] {
             assert_eq!(w.ui.editor().active(), Some(2));
@@ -10891,10 +10863,8 @@ mod tests {
         w.ui.dispatch(Event::New).unwrap();
         w.chord("b", false).unwrap();
         w.control = Some(
-            crate::control_worker::Worker::start(
-                crate::control_socket::Socket::bind(&path).unwrap(),
-            )
-            .unwrap(),
+            crate::control::Worker::start(td_ui::control_socket::Socket::bind(&path).unwrap())
+                .unwrap(),
         );
         let documents = format!("{:?}", w.ui.editor());
         assert_eq!(
@@ -11236,10 +11206,8 @@ mod tests {
         let path = directory.path("control");
         let (mut w, peer) = file_dialog_fixture();
         w.control = Some(
-            crate::control_worker::Worker::start(
-                crate::control_socket::Socket::bind(&path).unwrap(),
-            )
-            .unwrap(),
+            crate::control::Worker::start(td_ui::control_socket::Socket::bind(&path).unwrap())
+                .unwrap(),
         );
         w.chord("C-f", false).unwrap();
         let before = job_request(&mut w, &peer, &path, "1\t0\tstate");
@@ -11291,10 +11259,8 @@ mod tests {
         let pixels = w.client.pixels().to_vec();
         let generation = w.frames.generation().unwrap();
         w.control = Some(
-            crate::control_worker::Worker::start(
-                crate::control_socket::Socket::bind(&path).unwrap(),
-            )
-            .unwrap(),
+            crate::control::Worker::start(td_ui::control_socket::Socket::bind(&path).unwrap())
+                .unwrap(),
         );
         let mut client = control_client(&path, b"1\t1\tnew");
         assert_eq!(control_answer(&mut w, &mut client, &peer), "1\t1\tok\t2");
@@ -11377,10 +11343,8 @@ mod tests {
         w.spelling
             .install(crate::spelling::Dictionary::parse(b"known").unwrap());
         w.control = Some(
-            crate::control_worker::Worker::start(
-                crate::control_socket::Socket::bind(&path).unwrap(),
-            )
-            .unwrap(),
+            crate::control::Worker::start(td_ui::control_socket::Socket::bind(&path).unwrap())
+                .unwrap(),
         );
         assert_eq!(
             job_request(&mut w, &peer, &path, "1\t1\tcheck-spelling\t2\t1"),
@@ -11437,10 +11401,8 @@ mod tests {
         w.ui.dispatch(Event::Profile(Profile::Emacs)).unwrap();
         w.chord("C-x", false).unwrap();
         w.control = Some(
-            crate::control_worker::Worker::start(
-                crate::control_socket::Socket::bind(&path).unwrap(),
-            )
-            .unwrap(),
+            crate::control::Worker::start(td_ui::control_socket::Socket::bind(&path).unwrap())
+                .unwrap(),
         );
         assert_eq!(
             job_request(&mut w, &peer, &path, "1\t1\tcheck-spelling\t2\t0"),
@@ -11557,10 +11519,8 @@ mod tests {
         let path = directory.path("control");
         let (mut w, peer) = file_dialog_fixture();
         w.control = Some(
-            crate::control_worker::Worker::start(
-                crate::control_socket::Socket::bind(&path).unwrap(),
-            )
-            .unwrap(),
+            crate::control::Worker::start(td_ui::control_socket::Socket::bind(&path).unwrap())
+                .unwrap(),
         );
         let mut client = control_client(&path, b"1\t30\tinsert\t1\t0\t0\t0\t61cebb");
         assert_eq!(control_answer(&mut w, &mut client, &peer), "1\t30\tok\t");
@@ -11602,10 +11562,8 @@ mod tests {
             drain(&local_peer);
             let before = remote.client.pixels().to_vec();
             remote.control = Some(
-                crate::control_worker::Worker::start(
-                    crate::control_socket::Socket::bind(&path).unwrap(),
-                )
-                .unwrap(),
+                crate::control::Worker::start(td_ui::control_socket::Socket::bind(&path).unwrap())
+                    .unwrap(),
             );
             let mut client = control_client(&path, b"1\t1\tinsert\t1\t0\t0\t0\t61");
             assert_eq!(
@@ -11659,10 +11617,8 @@ mod tests {
         w.ui.dispatch(Event::Load("one   two\nthree λ".as_bytes()))
             .unwrap();
         w.control = Some(
-            crate::control_worker::Worker::start(
-                crate::control_socket::Socket::bind(&path).unwrap(),
-            )
-            .unwrap(),
+            crate::control::Worker::start(td_ui::control_socket::Socket::bind(&path).unwrap())
+                .unwrap(),
         );
         for (command, text) in [
             ("fill-paragraph\t2\t0\t0\t0", "one two three λ"),
@@ -11827,10 +11783,8 @@ mod tests {
         let path = directory.path("control");
         let (mut w, peer) = file_dialog_fixture();
         w.control = Some(
-            crate::control_worker::Worker::start(
-                crate::control_socket::Socket::bind(&path).unwrap(),
-            )
-            .unwrap(),
+            crate::control::Worker::start(td_ui::control_socket::Socket::bind(&path).unwrap())
+                .unwrap(),
         );
         let text = "one two three four five\nbad";
         w.ui.dispatch(Event::Load(text.as_bytes())).unwrap();
@@ -11963,10 +11917,8 @@ mod tests {
         let marks = w.spelling.view(w.ui.editor()).1.to_vec();
         assert!(!marks.is_empty());
         w.control = Some(
-            crate::control_worker::Worker::start(
-                crate::control_socket::Socket::bind(&path).unwrap(),
-            )
-            .unwrap(),
+            crate::control::Worker::start(td_ui::control_socket::Socket::bind(&path).unwrap())
+                .unwrap(),
         );
         w.find(2, 0, "λ", true);
         assert_eq!(
@@ -12066,10 +12018,8 @@ mod tests {
         let path = directory.path("control");
         let (mut w, peer) = file_dialog_fixture();
         w.control = Some(
-            crate::control_worker::Worker::start(
-                crate::control_socket::Socket::bind(&path).unwrap(),
-            )
-            .unwrap(),
+            crate::control::Worker::start(td_ui::control_socket::Socket::bind(&path).unwrap())
+                .unwrap(),
         );
         w.ui.dispatch(Event::Load("naïve bad wrong".as_bytes()))
             .unwrap();
@@ -12152,10 +12102,8 @@ mod tests {
         let path = directory.path("control");
         let (mut w, peer) = file_dialog_fixture();
         w.control = Some(
-            crate::control_worker::Worker::start(
-                crate::control_socket::Socket::bind(&path).unwrap(),
-            )
-            .unwrap(),
+            crate::control::Worker::start(td_ui::control_socket::Socket::bind(&path).unwrap())
+                .unwrap(),
         );
         w.event(message(SHM, 0, &[1])).unwrap();
         configure(&mut w, 800, 600);
@@ -12253,10 +12201,8 @@ mod tests {
         let path = directory.path("control");
         let (mut w, peer) = file_dialog_fixture();
         w.control = Some(
-            crate::control_worker::Worker::start(
-                crate::control_socket::Socket::bind(&path).unwrap(),
-            )
-            .unwrap(),
+            crate::control::Worker::start(td_ui::control_socket::Socket::bind(&path).unwrap())
+                .unwrap(),
         );
         w.event(message(SHM, 0, &[1])).unwrap();
         configure(&mut w, 800, 600);
@@ -12312,10 +12258,8 @@ mod tests {
         let path = directory.path("control");
         let (mut w, peer) = file_dialog_fixture();
         w.control = Some(
-            crate::control_worker::Worker::start(
-                crate::control_socket::Socket::bind(&path).unwrap(),
-            )
-            .unwrap(),
+            crate::control::Worker::start(td_ui::control_socket::Socket::bind(&path).unwrap())
+                .unwrap(),
         );
         let target = w.frames.generation().unwrap();
         let _client = control_client(&path, format!("1\t1\twait-frame\t{target}").as_bytes());
@@ -12342,10 +12286,8 @@ mod tests {
         let path = directory.path("control");
         let (mut w, peer) = file_dialog_fixture();
         w.control = Some(
-            crate::control_worker::Worker::start(
-                crate::control_socket::Socket::bind(&path).unwrap(),
-            )
-            .unwrap(),
+            crate::control::Worker::start(td_ui::control_socket::Socket::bind(&path).unwrap())
+                .unwrap(),
         );
         let target = w.frames.generation().unwrap();
         let before = crate::control::state(&w.ui).unwrap();
@@ -12375,8 +12317,8 @@ mod tests {
         std::fs::set_permissions(&directory.0, std::fs::Permissions::from_mode(0o700)).unwrap();
         let path = directory.path("control");
         let (mut w, peer) = file_dialog_fixture();
-        let socket = crate::control_socket::Socket::bind(&path).unwrap();
-        w.control = Some(crate::control_worker::Worker::start(socket).unwrap());
+        let socket = td_ui::control_socket::Socket::bind(&path).unwrap();
+        w.control = Some(crate::control::Worker::start(socket).unwrap());
         w.chord("a", false).unwrap();
         let tab = w.ui.editor().active().unwrap();
         let revision = w.ui.editor().document(tab).unwrap().revision();
@@ -12427,10 +12369,8 @@ mod tests {
         .unwrap();
         let revision = w.ui.editor().document(tab).unwrap().revision();
         w.control = Some(
-            crate::control_worker::Worker::start(
-                crate::control_socket::Socket::bind(&path).unwrap(),
-            )
-            .unwrap(),
+            crate::control::Worker::start(td_ui::control_socket::Socket::bind(&path).unwrap())
+                .unwrap(),
         );
         let mut partial = UnixStream::connect(&path).unwrap();
         partial.write_all(&[0, 0]).unwrap();
@@ -12454,10 +12394,8 @@ mod tests {
         let path = directory.path("control");
         let (mut w, _peer) = file_dialog_fixture();
         w.control = Some(
-            crate::control_worker::Worker::start(
-                crate::control_socket::Socket::bind(&path).unwrap(),
-            )
-            .unwrap(),
+            crate::control::Worker::start(td_ui::control_socket::Socket::bind(&path).unwrap())
+                .unwrap(),
         );
         std::fs::remove_file(&path).unwrap();
         std::fs::write(&path, b"replacement").unwrap();
@@ -12480,8 +12418,8 @@ mod tests {
         std::fs::set_permissions(&directory.0, std::fs::Permissions::from_mode(0o700)).unwrap();
         let path = directory.path("control");
         let (mut w, peer) = file_dialog_fixture();
-        let socket = crate::control_socket::Socket::bind(&path).unwrap();
-        w.control = Some(crate::control_worker::Worker::start(socket).unwrap());
+        let socket = td_ui::control_socket::Socket::bind(&path).unwrap();
+        w.control = Some(crate::control::Worker::start(socket).unwrap());
         let mut clients: Vec<_> = (0..8)
             .map(|id| control_client(&path, format!("1\t{id}\tstate").as_bytes()))
             .collect();

@@ -64,6 +64,19 @@ own a Wayland object of its own, the privileged `td_portal_manager_v1` it
 binds through its `Tag`. td-editor's window is the first `App` and
 td-setup's the second; each of those owns no Wayland objects of its own.
 
+Moved (increment 8(a)): the transport of td-editor's driven UI, the layer
+an agent or a test operates a program through. `control` carries the
+length-prefixed frame, the tab-separated ASCII envelope, the scalar and
+byte codecs and the two response lines; `control_socket` publishes the
+private Unix listener under td-editor's path and ownership contract;
+`control_worker` is that transport's bounded thread, now generic over the
+consumer's request type behind `Parse`; and `replay::run` is the
+consecutive-frame runner behind a headless `--replay`. td-editor's control
+socket, worker and replay run on them, wire-compatible with its
+CONTROL.md; what a request means, and whether it may read or act, stays
+the consumer's. The semantic half, a driven controller over an action
+table with generic verbs, is increment 8(b), below under "Driving".
+
 ## Purpose and trust position
 
 td-ui is target-zone source: it ships only inside the programs that embed
@@ -242,6 +255,348 @@ of its own files may name each module.
   end of turn and draw, and the transport's wait. `unconfigure` and
   `input_mut` are test support, public because a consumer's tests are
   another crate and hidden from the crate's documentation.
+- `control`: `MAX_FRAME`; `Error` (`Protocol`, `Limit`) with its `code`,
+  and `Result`; `ErrorCode`, the one method a consumer's error type gives
+  so its codes can travel, and `valid_code`, the grammar of a code;
+  `Refusal<E>` (`id`, `error`) with `response`, the error line, and `ok`,
+  the success line; `Parse`, the request type a worker parses off the
+  wire; `Decoder` (`push`, `payload`, `finish`) and `frame`; `Envelope`
+  (`id`, `name`, `args`) and `envelope`, generic over the consumer's error
+  so its parser can `?` through; and the codecs `decimal`, `size`,
+  `boolean`, `hex` and `unhex`.
+- `control_socket`: `Socket` with `bind`, `accept` and `close`, the
+  private listener publication under "Private socket publication" below.
+- `control_worker`: `CONNECTIONS`; `Worker<R>` (`start` for an `R: Parse`,
+  `try_request`, `close`) and `Job<R>` (`request`, `is_live`,
+  `respond_with`, `respond`), the bounded transport under "Bounded
+  worker" below.
+- `replay`: `run`, the consecutive-frame runner over a consumer's handler.
+
+## Driving
+
+A td program is operated by a person at the keyboard and by an agent
+acting for that person, and APPLICATIONS.md §S asks that agents be a
+first-class consumer rather than a reader of an accessibility tree bolted
+on afterwards. The toolkit therefore carries the driven UI's mechanism,
+so that every consumer speaks one protocol on one transport and a
+consumer adds only its own vocabulary. The shape is td-editor's, the
+tree's precedent: a display-independent dispatcher, a headless replay of
+it, and a control socket on the live window, all speaking one envelope.
+td-editor's CONTROL.md remains the reference for its own verbs and their
+admission rules; this section is normative for what moved here.
+
+The split is fixed. The toolkit owns the wire (frame, envelope, codecs,
+the two response lines and the transport's two error codes), the private
+socket publication, the bounded worker and the replay runner. The
+consumer owns its request type, parsed behind `Parse` on the worker's
+thread; the meaning of every verb; the body of its `state`; and the
+decision, per request, whether it reads or acts. The toolkit never
+decides that last question: as td-editor separates `response(&Controller)`
+from `execute(&mut Controller)`, a consumer answers a reading verb from a
+borrow and dispatches an acting verb through the same admission its
+keyboard goes through. Reading is the lower authority (§S); a consumer
+that wants to grant it separately does so at its own boundary, not in the
+toolkit.
+
+### Framing
+
+One frame is a four-byte unsigned big-endian length followed by that many
+payload bytes. Length excludes the header and must be 1..=1,048,576 bytes
+(`MAX_FRAME`), for requests and responses. There is no newline terminator.
+`frame` checks the bound before allocating its output. `Decoder`
+accumulates one frame, accepts arbitrary header/body fragmentation, and
+exposes its payload only after all declared bytes arrive. A zero length
+is `protocol`; a length over the ceiling is `limit`. Incomplete `finish`
+is `protocol`.
+
+Any decoder refusal permanently poisons it and drops partial payload
+storage. More input cannot revive it. Bytes beyond the declared body, if
+supplied to that decoder, are refused rather than treated as a second
+request. Completion does not prove peer EOF or that no later bytes will
+arrive: the worker dispatches at most once per connection and closes it
+after the response. `finish` transfers the completed buffer; it performs
+no read or EOF check. Empty input chunks make no progress. The decoder
+allocates at most one MiB of payload storage, only after validating the
+length; the full declared storage is allocated on header completion,
+before body bytes arrive, so the worker budgets each admitted connection
+against that one-MiB allocation, not against bytes received so far.
+
+### Envelope and responses
+
+Payloads are ASCII tab-separated records: `1 ID NAME ARGS...` with literal
+Tab separators. Literal control bytes other than Tab, DEL and non-ASCII
+bytes are refused. `decimal` fields contain one or more digits only:
+leading zeros are accepted; signs, spaces, exponents and overflow are
+refused. IDs fit `u64`; `size` additionally fits the host's `usize`;
+`boolean` is `0` or `1`. Byte strings are lowercase `hex`, two digits per
+byte, the empty string spelled `-`. `envelope` validates the version, the
+ID and the presence of a name, and hands the consumer the name with the
+remaining fields as a bounded iterator, never a vector proportional to
+the Tab bytes in an untrusted payload; unknown names, missing or extra
+fields and argument grammar are the consumer's `protocol` refusals.
+
+A success is `1 ID ok BODY` (`ok`); an error is `1 ID error CODE HEX`
+(`Refusal::response`), the diagnostic being the code's own ASCII bytes
+in hex. A code is one to 32 bytes of lowercase ASCII letters, digits and
+hyphens (`valid_code`), since it stands unquoted in the tab-separated
+line; the toolkit renders whatever `ErrorCode` returns, so a consumer
+pins its codes against that grammar in its own tests. The toolkit
+renders these two lines; a consumer may answer with a further status
+word in the same position for its own protocol, as td-editor answers a
+queued job with `1 ID pending JOB`, which its own reference specifies.
+A recoverable request ID is echoed even if the name is missing or
+later arguments are invalid; failures before a valid ID is parsed use
+zero, so frame-size, ASCII and version checks precede ID parsing. Zero is
+also a valid caller ID and carries no authorization meaning. The
+transport's own codes are `protocol` and `limit`; a consumer's `Error`
+maps them into its own type (`From<control::Error>`) and gives its codes
+through `ErrorCode`, so one `Refusal<E>` renders every refusal, the
+worker's included.
+
+### Private socket publication
+
+`control_socket::Socket::bind` opens a Linux Unix-domain listener only when
+explicitly called. It does not accept a CLI option, create a worker, decode
+a request, read consumer state or send a response. `accept` and each
+accepted stream are nonblocking; connection limits, deadlines,
+cancellation and turn-loop integration are the worker's and the
+consumer's. No raw syscall surface or dependency is used: the filesystem
+operations use safe `std` and procfs, which must be mounted at `/proc`.
+Like the transport beneath `wayland`, the crate's raw guard requires
+Linux x86-64 at compile time; these open flags name that ABI, not all
+Unix platforms or Linux architectures.
+
+The socket pathname must be absolute, non-NUL and at most 107 bytes, with
+a nonempty basename of at most 80 bytes. Trailing slash, `.`/`..`
+basenames and parent `..` traversal are refused. Interior `.` and
+repeated separators have ordinary `Path` normalization; there is no shell
+expansion or canonicalization through symlinks. Non-UTF-8 names remain
+literal OS bytes. The basename cap keeps the internal descriptor-relative
+bind name within Linux's pathname socket limit independently of the
+current descriptor number.
+
+The final parent must already exist, belong to the calling UID and have
+mode exactly 0700, including no special bits. The binder neither creates
+nor chmods directories. Every ancestor, including root, must be owned by
+root or the caller and must not be group/other-writable unless sticky.
+This admits ordinary `/tmp` while protecting caller/root-owned path
+components from rename by another UID. An otherwise private parent
+inside a non-sticky shared writable ancestor is refused.
+
+Ownership is interpreted in the consumer's current user namespace.
+Unmapped ancestor owners are not trusted: the overflow UID (commonly
+65534) is not an alias for root. A rootless container must provide a
+path whose complete ancestry satisfies these checks; the optional
+endpoint otherwise refuses. Before walking the path, the binder reads
+`/proc/sys/kernel/overflowuid` with an 11-byte limit plus one byte for
+overflow detection, requiring a decimal `u32` with at most one final LF;
+missing, malformed or oversized data refuses publication. If the
+configured overflow value equals the caller UID or zero, it refuses:
+otherwise an unmapped owner could be numerically indistinguishable from a
+trusted owner. This includes callers legitimately mapped to the overflow
+number; the binder cannot distinguish the two cases from stat ownership.
+No fixed overflow number is assumed and no sysctl is changed. Concurrent
+changes to that global sysctl require the already-excluded privileged
+host authority. Linux's [user namespace
+contract](https://man7.org/linux/man-pages/man7/user_namespaces.7.html)
+specifies this substitution for stat and process-status ownership. The
+predicate is never relaxed on environment variables or test execution.
+The crate declares `trusted-test-root = true` in its gate metadata: the
+gate's derived test commands then set the variable the capped runner
+consumes to run each test binary under a private caller-owned root with
+its own `/tmp`, so the fixtures' ancestry is trusted inside the gate's
+namespace, where the host's root otherwise appears as the unmapped
+overflow UID and publication refuses (DEVELOPMENT.md, "Trusted filesystem
+roots for permission tests"). That is a test environment, not a
+production admission; the socket module reads no such variable and its
+confinement test pins that.
+
+The UID comes from a bounded `/proc/self/status` read (64 KiB plus one
+byte for overflow detection): exactly one complete `Uid:` record with four
+equal representable `u32` values, real, effective, saved and filesystem.
+Missing/duplicate/malformed/mixed records refuse. UID zero is allowed
+when all slots agree; this is not a sandbox for root. Environment
+variables are never evidence of identity.
+
+The binder walks directory components from an opened root using `O_PATH
+| O_DIRECTORY | O_NOFOLLOW`, one component at a time through
+`/proc/self/fd/N`. These kernel descriptor links are intentional; no
+user-supplied symlink component is followed. It retains the final
+directory descriptor and binds through its pinned descriptor path rather
+than reopening the user's absolute path. Every existing final name is
+refused without connecting to it: regular files, directories, symlinks,
+live listeners and stale sockets all remain untouched. A concurrent
+binder is still subject to the kernel's exclusive pathname creation.
+Socket address diagnostics report the internal `/proc/self/fd/N/name`
+bind address, not the requested pathname. A peer must connect using the
+requested path it was given, not reuse `peer_addr` as a path in its own
+descriptor table. Callers retain the requested path for diagnostics; the
+guard does not store another copy.
+
+Binding briefly creates a listening socket with umask-derived permissions
+before mode 0600 is set. The already-private parent contains that
+interval to the same caller/root trust boundary; changing process-global
+umask would race unrelated file operations and is not used.
+
+The binder opens the new filesystem socket inode with `O_PATH |
+O_NOFOLLOW`, requires a socket owned by the caller, and pins that
+descriptor too. It sets mode 0600 through its kernel descriptor path and
+reads back mode/owner, then rewalks the visible parent, rechecking trust,
+private mode and identity, and verifies the named socket still matches
+the pinned inode. This catches parent/name changes during publication.
+The filesystem socket inode is distinct from the listener's socket
+descriptor inode; cleanup pins the former.
+
+Explicit `close` makes one checked cleanup attempt and reports errors.
+Drop attempts the same cleanup best-effort. Before unlinking the original
+basename inside the pinned parent, cleanup requires socket type and
+matching device/inode. A missing name is already clean only after
+rechecking that the procfs parent descriptor path remains accessible;
+this is an accessibility check, not detection of a renamed or removed
+parent. A real procfs link still addresses that pinned inode after either
+operation. This also handles a name removed between the identity check
+and unlink. A replacement file/socket is left alone. Renaming the parent
+does not redirect cleanup into a replacement directory. Keeping the
+socket inode open prevents inode-number reuse from fooling the
+comparison. If binding succeeds but inode ownership cannot be
+established, the binder does not unlink an unverified name; a stale
+endpoint may remain for caller inspection. Later setup failures attempt
+normal checked cleanup.
+
+Identity checks and pathname operations are separate kernel operations,
+not an atomic compare-and-unlink primitive. These rules protect against
+other UIDs under the admitted permissions; they are not isolation from
+root or another process running as the same UID. Such a process can race
+bind-to-pin or check-to-unlink, rename names, or change permissions, and
+already has the endpoint's authority. The consumer must keep this path
+private. Sharing it across a jail boundary remains a separate explicit
+grant.
+
+### Bounded worker
+
+`control_worker::Worker::start` takes an already admitted `Socket`. One
+thread, named `td-ui-control`, owns the listener and every accepted
+connection; no socket I/O occurs in `try_request` or `Job::respond`. The
+thread holds no consumer state and no lock on it: the one thing it knows of
+the consumer is the request type `R: Parse`, whose `parse` it runs on each
+complete payload. The consumer's turn loop owns dispatch and command-line
+opt-in.
+
+The worker admits at most eight connections (`CONNECTIONS`). When all
+slots are occupied, further clients stay in the kernel listener backlog;
+no descriptors, threads or request allocations are created for them. No
+backlog connection deadline or backlog size is promised. The five-second
+whole-request deadline starts when the worker accepts, never renews on
+progress, and includes header, body, queue/response time and output. At
+or after expiry the connection closes silently. Every loop checks each
+live connection, allowing at most one 16-KiB read or write for it, then
+parks for at most ten milliseconds with live connections, or 100
+milliseconds when idle. Replies, abandoned jobs and shutdown unpark the
+worker early. A ready reply attempts its first write in the same step; a
+refusal after a read waits until the next step to preserve the I/O
+bound. This deliberately paces output near 1.6 MiB/s per connection: a
+maximal one-MiB reply takes 64 steps, about 640 milliseconds, and
+td-editor's largest hex-encoded text page, 512 KiB, 32 steps, about 320,
+excluding scheduling delays.
+Idle polling trades up to 100 milliseconds of acceptance latency for
+fewer wakeups; blocking accept would require a separate reliable shutdown
+wakeup. Scheduling delay and kernel execution are not hard real-time
+guarantees; the worker never deliberately blocks on socket I/O.
+
+The endpoint is not an availability boundary against the same UID or
+root. Such a process can continually occupy all eight slots, keeping
+legitimate clients in the backlog. Deadlines bound each admitted
+connection, not a peer's share of future admissions. A full consumer
+queue closes without an error frame.
+
+One complete request dispatches at most once, without requiring write
+EOF. The shared decoder rejects zero/oversized frames and extra bytes
+delivered in the same read. After completion no further request bytes
+are read: later bytes never execute a second command. A premature EOF or
+decoder refusal queues a framed error with ID zero; a parse refusal uses
+its recovered ID and the consumer's code. Transport failures, deadline
+expiry or a full consumer queue close the connection without a
+guaranteed error frame. Successful output closes after its one complete
+frame, without waiting for the peer to close.
+
+Eight typed jobs fit in the consumer's queue; submission is nonblocking
+and a full/disconnected queue closes that connection. Each job has a
+one-element response channel and a liveness token combining the
+acceptance deadline and connection lifetime. `try_request` never waits
+and makes at most eight receives per call, returning the first live job.
+After eight expired entries it returns no job; remaining arrivals or
+worker disconnection are observed on a later poll. A disconnected worker
+reports an error once that bounded expired prefix has been drained.
+Dropping a job without a response disconnects its response channel
+before waking the worker to close the client.
+
+The consumer answers through `Job::respond_with`, which checks liveness
+before passing the borrowed request to the consumer's handler; the
+handler applies the consumer's own admission and returns one payload.
+The underlying `Job::respond` checks liveness and frame limits before
+copying/queuing it; success means queued, not delivered or rendered. It
+does not validate the handler's response fields. A disconnected or
+expired job returns false; an invalid payload size returns the shared
+frame error. Closing a connection cancels its queued/held job; a deadline
+never reserves a consumer snapshot. This transport API does not replace
+the consumer's live admission of a request against its state.
+
+Request payload allocation is at most one MiB per reading connection.
+What a parsed `R` retains is the consumer's contract (td-editor's holds a
+fixed-size descriptor plus at most 256 KiB of decoded text); the worker
+drops the wire payload when moving to the wait and may briefly hold
+both. Each response channel/connection owns at most one framed reply of
+one MiB plus four bytes. A reply may briefly coexist with its original
+request allocation during handoff; there are at most eight such
+connections and eight queued jobs. One reusable 16-KiB scratch buffer
+serves the thread. These bounds exclude consumer-owned response inputs
+and retained jobs, allocator overhead and kernel socket buffers; there is
+no unbounded worker byte queue. A job's debug output is its request's;
+a consumer whose requests carry text redacts it there.
+
+Explicit `close` and Drop set the stop flag, unpark and join the worker.
+It invalidates all live jobs, closes clients, and uses the socket's
+checked cleanup. Explicit close reports worker/cleanup failure; Drop is
+best-effort. No detached thread survives a completed join. Interrupted or
+aborted accepts and temporary descriptor/memory/buffer exhaustion retry
+after the normal park; other listener errors stop the worker and socket
+Drop attempts cleanup. A deadline representation overflow also stops it
+rather than accepting without a deadline. Shutdown is not a wall-clock
+promise about filesystem operations or host scheduling.
+
+### Replay runner
+
+`replay::run` reads consecutive frames from a reader until EOF and writes
+one framed reply per frame, produced by the consumer's handler, to a
+writer, flushing after each. EOF between frames ends the session
+normally; a partial header, a zero or over-ceiling length, a short body
+or a reply the frame encoder refuses is an error that ends it. The runner
+owns no state and no descriptor: a consumer's `--replay` hands it its
+stdin and stdout and a closure over its own headless session, so the
+same parser and dispatcher answer both the socket and the replay.
+
+### The semantic seam (increment 8(b))
+
+What the transport carries is, so far, each consumer's own. The next
+landing adds the half that lets a new consumer be driven without
+designing a protocol: `driven`, with a semantic input event (a key chord,
+a pointer phase at a position, wheel rows and columns, a resize, focus, a
+tick), an outcome, and a `Controller` trait a consumer implements over
+its own closed action type; an action table (name, chord, replay name and
+argument shape, help line) checked once for uniqueness and printed by
+`--help actions` so an agent reads it instead of guessing; a request
+router for the generic verbs `action NAME ARGS...`, `key HEX_CHORD`,
+`pointer PHASE X Y`, `wheel ROWS COLUMNS`, `resize W H`, `focus 0|1`,
+`tick MS`, `wait-frame GENERATION`, `frame` and `text`; `text` read back
+from a `Composition`'s draw stream, since every widget already emits its
+glyphs as Unicode scalars, which is the accessibility-tree question
+answered at the seam the toolkit already has; and one XRGB-to-PPM writer
+replacing the three copies in td-setup, td-editor and td-photo. A
+consumer keeps its own `state` body and its own verbs beside the generic
+ones. td-photo is the first consumer; td-editor keeps its own `Event`,
+whose tab and revision fences are its admission contract, and is not
+required to adopt the seam; td-setup and td-portal adopt it when their
+pages need driving.
 
 ## Invariants
 
@@ -250,10 +605,24 @@ of its own files may name each module.
   Outside the pure set are `notices` (three `include_str!` constants and
   nothing else), the transport pair `wayland` and `sys`, which own the
   stream, its deadlines and the pool files in the directory a consumer
-  names, and `client`, whose `run` reads the monotonic clock for the
-  consumer's ticks and whose buffers are those pool files; even they read
-  no environment variable, taking the display values as explicit
-  arguments.
+  names, `client`, whose `run` reads the monotonic clock for the
+  consumer's ticks and whose buffers are those pool files, and the three
+  driving adapters: `control_socket`, which owns the listener it binds
+  and reads procfs for the caller's identity; `control_worker`, which
+  owns its thread and reads the monotonic clock for its deadlines; and
+  `replay`, which reads and writes only the streams it is handed. Even
+  they read no environment variable, taking the display values and the
+  socket path as explicit arguments.
+- `control` is pure: the frame, envelope and codecs touch no descriptor.
+  The decoder allocates at most one frame, after validating its length,
+  and `frame` checks the ceiling before allocating its output; the
+  envelope hands fields on as a bounded iterator; the codecs and `ok`
+  allocate in proportion to the caller's own input, which the caller
+  budgets (hex-encoding a page allocates twice its bytes before `frame`
+  judges the reply). The worker knows the
+  consumer only as `R: Parse`; it holds no consumer state, and the one
+  parse site is `R::parse`. Whether a parsed request reads or acts is the
+  consumer's decision at dispatch, never the transport's.
 - The transport: `endpoint` prefers `WAYLAND_SOCKET`, which `connect`
   duplicates close-on-exec rather than adopting, so the borrowed original
   stays open until its owner closes it and the consumer must give the
@@ -531,6 +900,50 @@ toolkit's one consumer of a received right, through the pinned keymap reader
 with its format, size and regular-file checks and the send that hands its
 right on.
 
+`control`'s in-file tests are td-editor's framing tests moved: every frame
+split and single-byte delivery, truncation, zero/oversized/trailing frames,
+the poisoned decoder, the envelope grammar with ID recovery and the lift
+into a consumer's error type, the scalar and hex codecs, both response
+lines, and arbitrary bytes as headers and as framed payloads.
+`control_socket`'s kernel tests moved intact: they connect through the
+requested pathname, exchange bounded bytes, check nonblocking and
+close-on-exec flags and mode/owner, preserve every existing endpoint class,
+reject symlinked/unowned/nonprivate/untrusted ancestors, exercise
+replacement-name and renamed-parent cleanup, and prove through a
+deterministic publication hook that a replaced visible parent refuses and
+only the pinned candidate is cleaned. They create 0700 fixtures under
+`/tmp`; the crate's `trusted-test-root` declaration gives them a private
+caller-owned root inside the gate's namespace, where the unmapped host root
+would otherwise refuse publication. These are transport-ownership tests, not
+a consumer's endpoint or an adversarial same-UID race proof.
+`control_worker`'s tests moved with a toy `Parse` type in place of the
+editor's requests: deterministic connection tests inject time and cover
+bytewise input, complete and truncated frames, refusal IDs, late extra
+requests, full queues, abandoned jobs, invalid response sizes, and expiry
+while reading, awaiting the consumer or blocked on output, with a separate
+pre-output expiry test independent of socket-buffer tuning, plus large
+draining replies, retry classification, idle pacing, liveness before
+dispatch and explicit thread-error propagation; real Unix-socket tests cover
+a framed round trip, admission backpressure with continued client progress,
+shutdown cancellation and owned endpoint removal. `replay`'s tests drive the
+runner bytewise through consecutive frames, EOF between frames, partial
+headers, bad lengths, short bodies and a refused reply.
+
+`tests/confinement.rs` adds `control.rs` to the pure set and the three
+adapters to the inventory, and carries td-editor's pins over the moved
+modules: the socket's open flags, path and identity constants, procfs reads,
+mode and identity checks, and the absence of `connect`, environment reads,
+canonicalization, a fixed overflow number and the trusted-root variable; the
+worker's thread name, its slot, buffer and deadline constants, its bounded
+channels and nonblocking operations, `R::parse` as its sole parse site, and
+the absence of blocking reads, writes and receives; and the runner's ceiling
+check, its two exact reads and one framed reply. The socket's
+`/proc/sys/kernel/overflowuid` literal is excluded from the raw-module
+identifier count by name, as td-editor excluded it. The consumer-level
+conformance, td-editor's request grammar, refusal parity between socket and
+replay, and its window's two-jobs-per-turn polling, stays in td-editor's
+suites and confinement tests.
+
 The builder discovers the crate by existing. Its gate runs `cargo test` and
 all-target Clippy; a change under `td-ui/` selects td-editor's tests through
 the reader graph, because td-editor's manifest names the crate.
@@ -606,3 +1019,14 @@ the reader graph, because td-editor's manifest names the crate.
    from a byte fingerprint to named palette colours. Landed. (d) Its transport
    a td-ui `App`, the private dialog client deleted, under the native
    compositor harness.
+8. Driving, in two landings. (a) The transport lifted from td-editor:
+   `control` (frame, envelope, codecs, response lines, `Parse`),
+   `control_socket` moved intact, `control_worker` generic over the
+   consumer's request type, and `replay::run`; td-editor cut over
+   atomically and wire-compatibly, its framing, socket and worker tests
+   and their confinement pins moved, its own `Refusal` and worker types
+   specialisations of the toolkit's. Landed. (b) The semantic seam under
+   "Driving": `driven` with the input event, outcome, `Controller`
+   trait, action table and generic verbs, `text` read back from a
+   `Composition`'s draw stream and one XRGB-to-PPM writer, proven with a
+   toy controller in the crate's tests; td-photo is its first consumer.

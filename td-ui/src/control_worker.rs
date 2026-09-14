@@ -1,8 +1,9 @@
-//! Bounded control transport. The worker never owns editor state.
+//! Bounded control transport over a published socket. The worker never owns
+//! consumer state: it parses each request as the consumer's `Parse` type on
+//! its own thread and hands typed jobs to the consumer's turn loop.
 
-use crate::control::{frame, Decoder, Refusal, Request};
+use crate::control::{frame, Decoder, Error, ErrorCode, Parse, Refusal};
 use crate::control_socket::Socket;
-use crate::Error;
 use std::io::{self, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -11,7 +12,7 @@ use std::sync::Arc;
 use std::thread::{self, JoinHandle, Thread};
 use std::time::{Duration, Instant};
 
-pub(crate) const CONNECTIONS: usize = 8;
+pub const CONNECTIONS: usize = 8;
 const IO_BYTES: usize = 16 * 1024;
 const DEADLINE: Duration = Duration::from_secs(5);
 const POLL: Duration = Duration::from_millis(10);
@@ -30,17 +31,18 @@ impl Live {
 }
 
 /// One request. Dropping it without replying closes its connection.
-/// Liveness neither retains a snapshot nor replaces UI target admission.
+/// Liveness neither retains a snapshot nor replaces the consumer's own
+/// admission of the request against its live state.
 #[derive(Debug)]
-pub struct Job {
-    request: Request,
+pub struct Job<R> {
+    request: R,
     live: Arc<Live>,
     reply: Option<SyncSender<Vec<u8>>>,
     worker: Thread,
 }
 
-impl Job {
-    pub fn request(&self) -> &Request {
+impl<R> Job<R> {
+    pub fn request(&self) -> &R {
         &self.request
     }
 
@@ -48,9 +50,9 @@ impl Job {
         self.live.at(Instant::now())
     }
 
-    /// Invoke at most once, only if live immediately before UI admission.
-    /// Expiry/disconnect during execution cannot roll back an accepted edit.
-    pub fn respond_with(self, dispatch: impl FnOnce(&Request) -> String) -> crate::Result<bool> {
+    /// Invoke at most once, only if live immediately before admission.
+    /// Expiry/disconnect during execution cannot roll back an applied change.
+    pub fn respond_with(self, dispatch: impl FnOnce(&R) -> String) -> crate::control::Result<bool> {
         if !self.is_live() {
             return Ok(false);
         }
@@ -59,7 +61,7 @@ impl Job {
     }
 
     /// Copies only a valid bounded payload. Success means queued, not delivered.
-    pub fn respond(self, payload: &[u8]) -> crate::Result<bool> {
+    pub fn respond(self, payload: &[u8]) -> crate::control::Result<bool> {
         if !self.is_live() {
             return Ok(false);
         }
@@ -71,7 +73,7 @@ impl Job {
     }
 }
 
-impl Drop for Job {
+impl<R> Drop for Job<R> {
     fn drop(&mut self) {
         // Disconnect before waking: the next step must see an abandoned job.
         self.reply.take();
@@ -80,20 +82,20 @@ impl Drop for Job {
 }
 
 #[derive(Debug)]
-pub struct Worker {
-    requests: Receiver<Job>,
+pub struct Worker<R> {
+    requests: Receiver<Job<R>>,
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<io::Result<()>>>,
 }
 
-impl Worker {
+impl<R: Parse> Worker<R> {
     /// Takes ownership of an already published private nonblocking listener.
     pub fn start(socket: Socket) -> io::Result<Self> {
         let (sender, requests) = mpsc::sync_channel(CONNECTIONS);
         let stop = Arc::new(AtomicBool::new(false));
         let stopping = Arc::clone(&stop);
         let thread = thread::Builder::new()
-            .name("td-editor-control".into())
+            .name("td-ui-control".into())
             .spawn(move || run(socket, sender, &stopping))?;
         Ok(Self {
             requests,
@@ -101,10 +103,12 @@ impl Worker {
             thread: Some(thread),
         })
     }
+}
 
+impl<R> Worker<R> {
     /// Never waits; makes at most eight receives, returning the first live job.
     /// After eight expired jobs, disconnection is reported on a later call.
-    pub fn try_request(&self) -> io::Result<Option<Job>> {
+    pub fn try_request(&self) -> io::Result<Option<Job<R>>> {
         for _ in 0..CONNECTIONS {
             match self.requests.try_recv() {
                 Ok(job) if job.is_live() => return Ok(Some(job)),
@@ -137,7 +141,7 @@ impl Worker {
     }
 }
 
-impl Drop for Worker {
+impl<R> Drop for Worker<R> {
     fn drop(&mut self) {
         let _ = self.shutdown();
     }
@@ -171,7 +175,12 @@ impl Connection {
         })
     }
 
-    fn step(&mut self, now: Instant, scratch: &mut [u8], requests: &SyncSender<Job>) -> bool {
+    fn step<R: Parse>(
+        &mut self,
+        now: Instant,
+        scratch: &mut [u8],
+        requests: &SyncSender<Job<R>>,
+    ) -> bool {
         if !self.live.at(now) {
             return false;
         }
@@ -191,7 +200,7 @@ impl Connection {
                     let Some(payload) = decoder.payload() else {
                         return true;
                     };
-                    let request = match Request::parse(payload) {
+                    let request = match R::parse(payload) {
                         Ok(request) => request,
                         Err(refusal) => return self.refuse(refusal),
                     };
@@ -244,7 +253,7 @@ impl Connection {
         }
     }
 
-    fn refuse(&mut self, refusal: Refusal) -> bool {
+    fn refuse<E: ErrorCode>(&mut self, refusal: Refusal<E>) -> bool {
         // Drop a partially allocated request before constructing the response.
         self.phase = Phase::Closed;
         match frame(refusal.response().as_bytes()) {
@@ -283,7 +292,11 @@ fn poll_interval(idle: bool) -> Duration {
     }
 }
 
-fn run(socket: Socket, requests: SyncSender<Job>, stop: &AtomicBool) -> io::Result<()> {
+fn run<R: Parse>(
+    socket: Socket,
+    requests: SyncSender<Job<R>>,
+    stop: &AtomicBool,
+) -> io::Result<()> {
     let mut connections = Vec::with_capacity(CONNECTIONS);
     let mut scratch = [0; IO_BYTES];
     while !stop.load(Ordering::Relaxed) {
@@ -306,11 +319,45 @@ fn run(socket: Socket, requests: SyncSender<Job>, stop: &AtomicBool) -> io::Resu
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use crate::control::{Operation, MAX_FRAME};
+    use crate::control::{envelope, Envelope, MAX_FRAME};
     use std::fs;
     use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
     use std::path::PathBuf;
     use std::sync::atomic::AtomicU64;
+
+    /// A consumer's request in miniature: three verbs, `insert` carrying one
+    /// decoded field, every other verb taking none.
+    #[derive(Debug, PartialEq, Eq)]
+    struct Toy {
+        id: u64,
+        verb: &'static str,
+        text: Vec<u8>,
+    }
+
+    impl Parse for Toy {
+        type Error = Error;
+
+        fn parse(payload: &[u8]) -> Result<Self, Refusal> {
+            let Envelope { id, name, mut args } = envelope::<Error>(payload)?;
+            let result = (|| {
+                let (verb, text) = match name {
+                    "state" => ("state", Vec::new()),
+                    "text" => ("text", Vec::new()),
+                    "new" => ("new", Vec::new()),
+                    "insert" => (
+                        "insert",
+                        crate::control::unhex(args.next().ok_or(Error::Protocol)?)?,
+                    ),
+                    _ => return Err(Error::Protocol),
+                };
+                if args.next().is_some() {
+                    return Err(Error::Protocol);
+                }
+                Ok(Self { id, verb, text })
+            })();
+            result.map_err(|error| Refusal { id, error })
+        }
+    }
 
     fn connection(now: Instant) -> (Connection, UnixStream) {
         let (server, peer) = UnixStream::pair().unwrap();
@@ -319,7 +366,7 @@ mod tests {
         (Connection::new(server, now).unwrap(), peer)
     }
 
-    fn request(connection: &mut Connection, peer: &mut UnixStream, now: Instant) -> Job {
+    fn request(connection: &mut Connection, peer: &mut UnixStream, now: Instant) -> Job<Toy> {
         let (tx, rx) = mpsc::sync_channel(CONNECTIONS);
         peer.write_all(&frame(b"1\t7\tstate").unwrap()).unwrap();
         assert!(connection.step(now, &mut [0; IO_BYTES], &tx));
@@ -330,7 +377,7 @@ mod tests {
     fn bytewise_request_dispatches_once_without_requiring_eof_and_frames_one_reply() {
         let now = Instant::now();
         let (mut connection, mut peer) = connection(now);
-        let (tx, rx) = mpsc::sync_channel(CONNECTIONS);
+        let (tx, rx) = mpsc::sync_channel::<Job<Toy>>(CONNECTIONS);
         let input = frame(b"1\t42\tstate").unwrap();
         for (index, byte) in input.iter().enumerate() {
             peer.write_all(&[*byte]).unwrap();
@@ -342,9 +389,10 @@ mod tests {
         let job = rx.try_recv().unwrap();
         assert_eq!(
             job.request(),
-            &Request {
+            &Toy {
                 id: 42,
-                operation: Operation::State
+                verb: "state",
+                text: Vec::new()
             }
         );
         peer.write_all(&frame(b"1\t43\tstate").unwrap()).unwrap();
@@ -409,7 +457,7 @@ mod tests {
             ),
         ] {
             let (mut connection, mut peer) = connection(now);
-            let (tx, rx) = mpsc::sync_channel(CONNECTIONS);
+            let (tx, rx) = mpsc::sync_channel::<Job<Toy>>(CONNECTIONS);
             peer.write_all(&bytes).unwrap();
             if half_close {
                 peer.shutdown(std::net::Shutdown::Write).unwrap();
@@ -431,7 +479,7 @@ mod tests {
     fn deadline_covers_reading_ui_wait_and_blocked_response_without_renewal() {
         let now = Instant::now();
         let expiry = now + DEADLINE;
-        let (tx, _) = mpsc::sync_channel(CONNECTIONS);
+        let (tx, _) = mpsc::sync_channel::<Job<Toy>>(CONNECTIONS);
         let (mut reading, mut peer) = connection(now);
         peer.write_all(&[0]).unwrap();
         assert!(reading.step(expiry - Duration::from_nanos(1), &mut [0; IO_BYTES], &tx));
@@ -471,7 +519,7 @@ mod tests {
     #[test]
     fn full_queue_dropped_jobs_and_oversized_replies_close_without_blocking() {
         let now = Instant::now();
-        let (tx, rx) = mpsc::sync_channel(1);
+        let (tx, rx) = mpsc::sync_channel::<Job<Toy>>(1);
         let (mut first, mut peer) = connection(now);
         peer.write_all(&frame(b"1\t1\tstate").unwrap()).unwrap();
         assert!(first.step(now, &mut [0; IO_BYTES], &tx));
@@ -490,7 +538,7 @@ mod tests {
     #[test]
     fn expired_queued_jobs_are_skipped_and_cannot_queue_a_late_reply() {
         let now = Instant::now();
-        let (tx, requests) = mpsc::sync_channel(CONNECTIONS);
+        let (tx, requests) = mpsc::sync_channel::<Job<Toy>>(CONNECTIONS);
         let worker = Worker {
             requests,
             stop: Arc::new(AtomicBool::new(false)),
@@ -530,7 +578,7 @@ mod tests {
     impl Directory {
         fn new() -> Self {
             let path = std::env::temp_dir().join(format!(
-                "tdec-worker-{}-{}",
+                "tduc-worker-{}-{}",
                 std::process::id(),
                 NEXT.fetch_add(1, Ordering::Relaxed)
             ));
@@ -545,7 +593,7 @@ mod tests {
         }
     }
 
-    fn next_job(worker: &Worker) -> Job {
+    fn next_job(worker: &Worker<Toy>) -> Job<Toy> {
         let until = Instant::now() + Duration::from_secs(2);
         loop {
             if let Some(job) = worker.try_request().unwrap() {
@@ -560,7 +608,7 @@ mod tests {
     fn real_worker_round_trip_shutdown_cancels_jobs_and_removes_owned_endpoint() {
         let dir = Directory::new();
         let path = dir.0.join("control");
-        let worker = Worker::start(Socket::bind(&path).unwrap()).unwrap();
+        let worker = Worker::<Toy>::start(Socket::bind(&path).unwrap()).unwrap();
         let mut peer = UnixStream::connect(&path).unwrap();
         peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
         peer.write_all(&frame(b"1\t70\tstate").unwrap()).unwrap();
@@ -584,7 +632,7 @@ mod tests {
     fn real_worker_limits_admitted_connections_while_existing_clients_progress() {
         let dir = Directory::new();
         let path = dir.0.join("control");
-        let worker = Worker::start(Socket::bind(&path).unwrap()).unwrap();
+        let worker = Worker::<Toy>::start(Socket::bind(&path).unwrap()).unwrap();
         let mut peers = Vec::new();
         let mut jobs = Vec::new();
         for id in 0..CONNECTIONS {
@@ -624,15 +672,15 @@ mod tests {
         for cancelled in [false, true] {
             let now = Instant::now();
             let (mut connection, mut peer) = connection(now);
-            let (tx, rx) = mpsc::sync_channel(CONNECTIONS);
-            let bytes = frame(b"1\t7\tinsert\t1\t0\t0\t0\t61").unwrap();
+            let (tx, rx) = mpsc::sync_channel::<Job<Toy>>(CONNECTIONS);
+            let bytes = frame(b"1\t7\tinsert\t61").unwrap();
             for byte in bytes {
                 peer.write_all(&[byte]).unwrap();
                 assert!(connection.step(now, &mut [0; IO_BYTES], &tx));
             }
             let job = rx.try_recv().unwrap();
-            assert!(job.request().is_edit());
-            peer.write_all(&frame(b"1\t8\tinsert\t1\t1\t1\t1\t62").unwrap())
+            assert_eq!(job.request().verb, "insert");
+            peer.write_all(&frame(b"1\t8\tinsert\t62").unwrap())
                 .unwrap();
             assert!(connection.step(now, &mut [0; IO_BYTES], &tx));
             assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
@@ -640,21 +688,25 @@ mod tests {
                 assert!(!connection.step(now + DEADLINE, &mut [0; IO_BYTES], &tx));
                 drop(connection);
             }
-            let mut ui = crate::ui::Controller::default();
-            ui.dispatch(crate::ui::Event::New).unwrap();
+            // The consumer's state, applied only inside the live dispatch.
+            let mut document = Vec::new();
             let mut called = false;
             let queued = job
                 .respond_with(|request| {
                     called = true;
-                    request.execute(&mut ui).unwrap();
+                    document.extend_from_slice(&request.text);
                     "1\t7\tok\t".into()
                 })
                 .unwrap();
             assert_eq!(called, !cancelled);
             assert_eq!(queued, !cancelled);
             assert_eq!(
-                ui.editor().document(1).unwrap().text(),
-                if cancelled { "" } else { "a" }
+                document,
+                if cancelled {
+                    b"".to_vec()
+                } else {
+                    b"a".to_vec()
+                }
             );
         }
     }
@@ -695,12 +747,11 @@ mod tests {
     fn text_request_and_large_reply_resume_to_completion_with_a_draining_peer() {
         let now = Instant::now();
         let (mut connection, mut peer) = connection(now);
-        let (tx, rx) = mpsc::sync_channel(CONNECTIONS);
-        peer.write_all(&frame(b"1\t8\ttext\t1\t0\t0\t4096").unwrap())
-            .unwrap();
+        let (tx, rx) = mpsc::sync_channel::<Job<Toy>>(CONNECTIONS);
+        peer.write_all(&frame(b"1\t8\ttext").unwrap()).unwrap();
         assert!(connection.step(now, &mut [0; IO_BYTES], &tx));
         let job = rx.try_recv().unwrap();
-        assert!(matches!(job.request().operation, Operation::Text { .. }));
+        assert_eq!(job.request().verb, "text");
         let payload = vec![b'x'; IO_BYTES * 3 + 5];
         let expected = frame(&payload).unwrap();
         assert!(job.respond(&payload).unwrap());
@@ -727,7 +778,7 @@ mod tests {
 
     #[test]
     fn explicit_close_reports_thread_failure() {
-        let (_sender, requests) = mpsc::sync_channel(CONNECTIONS);
+        let (_sender, requests) = mpsc::sync_channel::<Job<Toy>>(CONNECTIONS);
         let worker = Worker {
             requests,
             stop: Arc::new(AtomicBool::new(false)),

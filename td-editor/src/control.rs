@@ -1,4 +1,5 @@
-//! Safe control framing, queries and revision-checked edits. No listener or I/O.
+//! The editor's control requests over td-ui's framing and envelope: queries
+//! and revision-checked edits. No listener or I/O.
 
 use crate::model::{Command, Selection, TabId};
 use crate::ui::{Controller, Event};
@@ -7,7 +8,15 @@ use std::fmt::Write;
 use std::os::unix::ffi::OsStringExt;
 use std::path::PathBuf;
 
-pub const MAX_FRAME: usize = 1024 * 1024;
+pub(crate) use td_ui::control::{boolean, decimal, size, Envelope};
+pub use td_ui::control::{frame, hex, unhex, Decoder, MAX_FRAME};
+
+/// A refusal carrying the editor's error; the toolkit renders the line.
+pub type Refusal = td_ui::control::Refusal<Error>;
+/// The toolkit's bounded transport, specialised to the editor's requests.
+pub type Worker = td_ui::control_worker::Worker<Request>;
+pub type Job = td_ui::control_worker::Job<Request>;
+
 pub const PAGE_BYTES: usize = 256 * 1024;
 pub const INSERT_BYTES: usize = 256 * 1024;
 pub const SEARCH_BYTES: usize = crate::search::QUERY_BYTES;
@@ -61,88 +70,6 @@ impl PromptState<'_> {
             hex(self.status.as_bytes()), hex(notice.as_bytes())
         ))
     }
-}
-
-/// One length-prefixed frame. Any refusal poisons it and drops partial text.
-#[derive(Default)]
-pub struct Decoder {
-    header: [u8; 4],
-    header_used: usize,
-    payload: Vec<u8>,
-    used: usize,
-    failed: bool,
-}
-
-impl Decoder {
-    pub fn push(&mut self, bytes: &[u8]) -> Result<()> {
-        let result = self.append(bytes);
-        if result.is_err() {
-            self.failed = true;
-            self.payload = Vec::new();
-        }
-        result
-    }
-
-    fn append(&mut self, mut bytes: &[u8]) -> Result<()> {
-        if self.failed {
-            return Err(Error::Protocol);
-        }
-        if self.header_used < 4 {
-            let take = bytes.len().min(4 - self.header_used);
-            self.header
-                .get_mut(self.header_used..self.header_used + take)
-                .ok_or(Error::Protocol)?
-                .copy_from_slice(bytes.get(..take).ok_or(Error::Protocol)?);
-            self.header_used += take;
-            bytes = bytes.get(take..).ok_or(Error::Protocol)?;
-            if self.header_used < 4 {
-                return Ok(());
-            }
-            let size =
-                usize::try_from(u32::from_be_bytes(self.header)).map_err(|_| Error::Limit)?;
-            if size == 0 {
-                return Err(Error::Protocol);
-            }
-            if size > MAX_FRAME {
-                return Err(Error::Limit);
-            }
-            self.payload = vec![0; size];
-        }
-        let end = self.used.checked_add(bytes.len()).ok_or(Error::Limit)?;
-        self.payload
-            .get_mut(self.used..end)
-            .ok_or(Error::Protocol)?
-            .copy_from_slice(bytes);
-        self.used = end;
-        Ok(())
-    }
-
-    pub fn payload(&self) -> Option<&[u8]> {
-        (!self.failed && self.header_used == 4 && self.used == self.payload.len())
-            .then_some(self.payload.as_slice())
-    }
-
-    /// EOF before a complete payload is an error, not a shorter request.
-    pub fn finish(self) -> Result<Vec<u8>> {
-        if self.payload().is_none() {
-            return Err(Error::Protocol);
-        }
-        Ok(self.payload)
-    }
-}
-
-pub fn frame(payload: &[u8]) -> Result<Vec<u8>> {
-    if payload.is_empty() {
-        return Err(Error::Protocol);
-    }
-    if payload.len() > MAX_FRAME {
-        return Err(Error::Limit);
-    }
-    let length = u32::try_from(payload.len()).map_err(|_| Error::Limit)?;
-    let mut framed = Vec::with_capacity(payload.len() + 4);
-    framed.extend_from_slice(&length.to_be_bytes());
-    framed.extend_from_slice(payload);
-    Ok(framed)
 }
 
 #[derive(Clone, Eq, PartialEq)]
@@ -556,20 +483,26 @@ pub struct Request {
     pub operation: Operation,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct Refusal {
-    pub id: u64,
-    pub error: Error,
+/// The worker parses the editor's requests on its thread through the
+/// inherent parser below; inherent items shadow the trait's name, and
+/// the lint turns a rename that would make this call itself into an
+/// error.
+impl td_ui::control::Parse for Request {
+    type Error = Error;
+
+    #[deny(unconditional_recursion)]
+    fn parse(payload: &[u8]) -> std::result::Result<Self, Refusal> {
+        Request::parse(payload)
+    }
 }
 
-impl Refusal {
-    pub fn response(self) -> String {
-        format!(
-            "1\t{}\terror\t{}\t{}",
-            self.id,
-            self.error.code(),
-            hex(self.error.code().as_bytes())
-        )
+/// Find's admitted no-match is a code without an `Error` variant: it is
+/// never a parse or admission refusal, only a search outcome.
+struct NoMatch;
+
+impl td_ui::control::ErrorCode for NoMatch {
+    fn code(&self) -> &'static str {
+        "no-match"
     }
 }
 
@@ -811,7 +744,7 @@ impl Request {
             | Operation::WaitFrame(_) => Err(Error::Unavailable),
         };
         match result {
-            Ok(body) => format!("1\t{}\tok\t{body}", self.id),
+            Ok(body) => td_ui::control::ok(self.id, &body),
             Err(error) => Refusal { id: self.id, error }.response(),
         }
     }
@@ -831,7 +764,11 @@ impl Request {
                 }
             )
         {
-            format!("1\t{}\terror\tno-match\t{}", self.id, hex(b"no-match"))
+            td_ui::control::Refusal {
+                id: self.id,
+                error: NoMatch,
+            }
+            .response()
         } else {
             Refusal { id: self.id, error }.response()
         }
@@ -912,7 +849,7 @@ impl Request {
             Ok(body)
         })();
         match result {
-            Ok(body) => format!("1\t{}\tok\t{body}", self.id),
+            Ok(body) => td_ui::control::ok(self.id, &body),
             Err(error) => Refusal { id: self.id, error }.response(),
         }
     }
@@ -1074,95 +1011,9 @@ fn os_path(encoded: &str) -> Result<PathBuf> {
     Ok(std::ffi::OsString::from_vec(path).into())
 }
 
-pub(crate) struct Envelope<'a> {
-    pub id: u64,
-    pub name: &'a str,
-    pub args: std::str::Split<'a, char>,
-}
-
+/// The shared envelope, its refusal lifted into the editor's error.
 pub(crate) fn envelope(input: &[u8]) -> std::result::Result<Envelope<'_>, Refusal> {
-    let mut id = 0;
-    let result = (|| {
-        if input.len() > MAX_FRAME {
-            return Err(Error::Limit);
-        }
-        let input = std::str::from_utf8(input).map_err(|_| Error::Protocol)?;
-        if !input.is_ascii() || input.bytes().any(|b| b < b' ' && b != b'\t' || b == 127) {
-            return Err(Error::Protocol);
-        }
-        let mut args = input.split('\t');
-        if args.next() != Some("1") {
-            return Err(Error::Protocol);
-        }
-        id = decimal(args.next().ok_or(Error::Protocol)?)?;
-        let name = args.next().ok_or(Error::Protocol)?;
-        Ok((name, args))
-    })();
-    result
-        .map(|(name, args)| Envelope { id, name, args })
-        .map_err(|error| Refusal { id, error })
-}
-
-pub(crate) fn decimal(text: &str) -> Result<u64> {
-    if text.is_empty() || !text.bytes().all(|b| b.is_ascii_digit()) {
-        return Err(Error::Protocol);
-    }
-    text.parse().map_err(|_| Error::Protocol)
-}
-
-pub(crate) fn size(text: &str) -> Result<usize> {
-    usize::try_from(decimal(text)?).map_err(|_| Error::Protocol)
-}
-
-pub(crate) fn boolean(value: &str) -> Result<bool> {
-    match value {
-        "0" => Ok(false),
-        "1" => Ok(true),
-        _ => Err(Error::Protocol),
-    }
-}
-
-pub fn hex(bytes: &[u8]) -> String {
-    if bytes.is_empty() {
-        return "-".into();
-    }
-    const DIGITS: &[u8] = b"0123456789abcdef";
-    let mut out = String::with_capacity(bytes.len().saturating_mul(2));
-    for byte in bytes {
-        for index in [usize::from(byte >> 4), usize::from(byte & 15)] {
-            if let Some(&digit) = DIGITS.get(index) {
-                out.push(char::from(digit));
-            }
-        }
-    }
-    out
-}
-
-pub fn unhex(value: &str) -> Result<Vec<u8>> {
-    if value == "-" {
-        return Ok(Vec::new());
-    }
-    if value.is_empty() || value.len() > MAX_FRAME || !value.len().is_multiple_of(2) {
-        return Err(Error::Protocol);
-    }
-    let digit = |b: u8| -> Result<u8> {
-        match b {
-            b'0'..=b'9' => Ok(b - b'0'),
-            b'a'..=b'f' => Ok(b - b'a' + 10),
-            _ => Err(Error::Protocol),
-        }
-    };
-    value
-        .as_bytes()
-        .as_chunks::<2>()
-        .0
-        .iter()
-        .map(|pair| {
-            let high = digit(*pair.first().ok_or(Error::Protocol)?)?;
-            let low = digit(*pair.get(1).ok_or(Error::Protocol)?)?;
-            Ok(high * 16 + low)
-        })
-        .collect()
+    td_ui::control::envelope(input)
 }
 
 pub(crate) fn state(ui: &Controller) -> Result<String> {
@@ -1176,7 +1027,11 @@ pub(crate) fn state(ui: &Controller) -> Result<String> {
         u8::from(ui.keys().pending())
     );
     if ui.geometry().prompt_rows() != 0 {
-        out.push_str(&format!("\tminibuffer={},{}", ui.geometry().prompt_rows(), ui.geometry().prompt().height));
+        out.push_str(&format!(
+            "\tminibuffer={},{}",
+            ui.geometry().prompt_rows(),
+            ui.geometry().prompt().height
+        ));
     }
     for (id, doc) in ui.editor().tabs() {
         let sel = doc.selection();
@@ -2221,25 +2076,10 @@ mod tests {
     }
 
     #[test]
-    fn every_frame_split_and_single_byte_delivery_wait_for_complete_payload() {
-        let payload = b"1\t17\ttext\t1\t0\t0\t4";
-        let bytes = frame(payload).unwrap();
-        for split in 0..=bytes.len() {
-            let mut decoder = Decoder::default();
-            decoder.push(bytes.get(..split).unwrap()).unwrap();
-            assert_eq!(
-                decoder.payload(),
-                (split == bytes.len()).then_some(payload.as_slice())
-            );
-            decoder.push(bytes.get(split..).unwrap()).unwrap();
-            assert_eq!(decoder.payload(), Some(payload.as_slice()));
-            assert_eq!(decoder.finish().unwrap(), payload);
-        }
+    fn a_decoded_frame_parses_to_the_editor_request_and_every_code_fits_the_line() {
+        let bytes = frame(b"1\t17\ttext\t1\t0\t0\t4").unwrap();
         let mut decoder = Decoder::default();
-        for (index, byte) in bytes.iter().enumerate() {
-            decoder.push(std::slice::from_ref(byte)).unwrap();
-            assert_eq!(decoder.payload().is_some(), index + 1 == bytes.len());
-        }
+        decoder.push(&bytes).unwrap();
         assert_eq!(
             Request::parse(&decoder.finish().unwrap()).unwrap(),
             Request {
@@ -2252,38 +2092,29 @@ mod tests {
                 },
             }
         );
-    }
-
-    #[test]
-    fn frame_limits_truncation_and_trailing_bytes_never_publish_partial_requests() {
-        let bytes = frame(b"1\t0\tstate").unwrap();
-        for end in 0..bytes.len() {
-            let mut decoder = Decoder::default();
-            decoder.push(bytes.get(..end).unwrap()).unwrap();
-            assert_eq!(decoder.finish(), Err(Error::Protocol));
+        // Every code stands unquoted in the refusal line; the toolkit
+        // states the grammar and the editor pins its own codes to it.
+        for error in [
+            Error::InvalidText,
+            Error::InvalidPosition,
+            Error::InvalidArgument,
+            Error::Limit,
+            Error::MissingTab,
+            Error::StaleRevision,
+            Error::Dirty,
+            Error::Exhausted,
+            Error::Protocol,
+            Error::Unavailable,
+        ] {
+            assert!(td_ui::control::valid_code(error.code()), "{}", error.code());
         }
-        for length in [0u32, MAX_FRAME as u32 + 1, u32::MAX] {
-            let mut decoder = Decoder::default();
-            assert!(decoder.push(&length.to_be_bytes()).is_err());
-            assert!(decoder.payload.is_empty());
-            assert_eq!(decoder.push(&bytes), Err(Error::Protocol));
-            assert!(decoder.payload().is_none());
-        }
-        let mut decoder = Decoder::default();
-        decoder.push(&bytes).unwrap();
-        assert_eq!(decoder.push(b"x"), Err(Error::Protocol));
-        assert!(decoder.payload().is_none());
-        let mut joined = bytes.clone();
-        joined.extend_from_slice(&bytes);
-        let mut decoder = Decoder::default();
-        assert_eq!(decoder.push(&joined), Err(Error::Protocol));
-        assert!(decoder.payload().is_none());
-        assert_eq!(frame(b""), Err(Error::Protocol));
-        assert_eq!(frame(&vec![b'x'; MAX_FRAME + 1]), Err(Error::Limit));
-        let limit = frame(&vec![b'x'; MAX_FRAME]).unwrap();
-        let mut decoder = Decoder::default();
-        decoder.push(&limit).unwrap();
-        assert_eq!(decoder.finish().unwrap().len(), MAX_FRAME);
+        assert!(td_ui::control::valid_code("no-match"));
+        assert_eq!(
+            Request::parse(b"1\t3\tfind\t1\t0\t0\t0\t78\t0\t0")
+                .unwrap()
+                .admitted_edit_refusal(Error::Unavailable),
+            "1\t3\terror\tno-match\t6e6f2d6d61746368"
+        );
     }
 
     #[test]
@@ -2309,6 +2140,13 @@ mod tests {
                     error: Error::Protocol
                 }),
                 "{input}"
+            );
+        }
+        // The worker's `Parse` is the inherent parser, not a second grammar.
+        for input in [b"1\t5\tstate".as_slice(), b"1\t5\tnew\tx", b"\xff"] {
+            assert_eq!(
+                <Request as td_ui::control::Parse>::parse(input),
+                Request::parse(input)
             );
         }
         assert_eq!(Request::parse(b"1\t000\tstate").unwrap().id, 0);
@@ -2446,13 +2284,7 @@ mod tests {
     }
 
     #[test]
-    fn binary_text_encoding_and_arbitrary_framed_input_have_closed_error_paths() {
-        let bytes: Vec<_> = (0..=255).collect();
-        assert_eq!(unhex(&hex(&bytes)).unwrap(), bytes);
-        assert_eq!(hex(b""), "-");
-        for invalid in ["", "A0", "g0", "0", "--"] {
-            assert!(unhex(invalid).is_err());
-        }
+    fn arbitrary_framed_input_has_closed_error_paths_through_the_editor_grammar() {
         let mut completed = 0;
         for seed in 0u64..1000 {
             let mut value = seed;

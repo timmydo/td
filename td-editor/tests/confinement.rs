@@ -42,8 +42,6 @@ fn source_inventory_and_allowances_are_closed() {
         "control.rs",
         "control_frame.rs",
         "control_jobs.rs",
-        "control_socket.rs",
-        "control_worker.rs",
         "dialog.rs",
         "directory.rs",
         "files.rs",
@@ -121,30 +119,36 @@ fn source_inventory_and_allowances_are_closed() {
             }
         }
         // The crate reaches the toolkit in a closed set of files: the input
-        // adapter, which also paints the minibuffer through `td_ui::chrome`;
-        // `layout`, which re-exports the shared cell constants; the crate
-        // root, which re-exports the shared font and wire modules and maps
-        // the raster's errors; the scene, controller and menu, which compose
-        // `td_ui::raster`, the scene and menu also `td_ui::chrome`; and
-        // `main`, which prints `td_ui::notices`.
+        // adapter, which also paints the minibuffer through `td_ui::chrome`
+        // and publishes the control socket and its worker; `layout`, which
+        // re-exports the shared cell constants; the crate root, which
+        // re-exports the shared font and wire modules and maps the raster's
+        // and the transport's errors; the scene, controller and menu, which
+        // compose `td_ui::raster`, the scene and menu also `td_ui::chrome`;
+        // `control`, whose requests ride the toolkit's framing and envelope
+        // and specialise its worker; `replay`, on the toolkit's frame runner;
+        // and `main`, which prints `td_ui::notices`.
         assert!(
             identifier_count(&text, "td_ui") == 0
                 || matches!(
                     name.as_str(),
                     "wayland.rs" | "layout.rs" | "lib.rs" | "render.rs" | "ui.rs" | "menu.rs"
-                        | "main.rs"
+                        | "main.rs" | "control.rs" | "replay.rs"
                 ),
             "toolkit access outside its roster: {name}"
         );
         // Naming the toolkit is one thing; re-exporting it is the crate
-        // root's (font, wire) and `layout`'s (the cell constants) alone, so
-        // every other file names `td_ui::` paths directly.
+        // root's (font, wire), `layout`'s (the cell constants) and
+        // `control`'s (the framing and codecs its tests and replay share,
+        // public and crate-private) alone, so every other file names
+        // `td_ui::` paths directly.
         let compact: String = text.chars().filter(|c| !c.is_whitespace()).collect();
         assert_eq!(
             compact.matches("pubusetd_ui").count() + compact.matches(")usetd_ui").count(),
             match name.as_str() {
                 "lib.rs" => 2,
                 "layout.rs" => 1,
+                "control.rs" => 2,
                 _ => 0,
             },
             "toolkit re-export in {name}"
@@ -180,16 +184,8 @@ fn source_inventory_and_allowances_are_closed() {
                 "wire through td-ui"
             );
         }
-        // The pinned procfs pathname's sys segment is not raw-module access.
-        let raw_tokens = if name == "control_socket.rs" {
-            let literal = "\"/proc/sys/kernel/overflowuid\"";
-            assert_eq!(text.matches(literal).count(), 1);
-            raw_module_tokens(&text.replacen(literal, "\"\"", 1))
-        } else {
-            raw_module_tokens(&text)
-        };
         assert_eq!(
-            raw_tokens,
+            raw_module_tokens(&text),
             match name.as_str() {
                 "lib.rs" => 1,
                 "files.rs" => 2,
@@ -338,82 +334,6 @@ fn complete_raw_layer_and_production_callers_are_pinned() {
             .count(),
         0
     );
-}
-
-#[test]
-fn control_socket_publication_keeps_kernel_path_and_identity_checks_explicit() {
-    let source = include_str!("../src/control_socket.rs");
-    let production = source.split("#[cfg(test)]").next().unwrap();
-    for pin in [
-        "const O_DIRECTORY: i32 = 0o200000;",
-        "const O_NOFOLLOW: i32 = 0o400000;",
-        "const O_PATH: i32 = 0o10000000;",
-        "const PATH_BYTES: usize = 107;",
-        "const NAME_BYTES: usize = 80;",
-        "const STATUS_BYTES: usize = 64 * 1024;",
-        "UnixListener::bind(&pinned_path)",
-        "custom_flags(O_PATH | O_DIRECTORY | O_NOFOLLOW)",
-        "custom_flags(O_PATH | O_NOFOLLOW)",
-        "File::open(\"/proc/self/status\")",
-        "File::open(\"/proc/sys/kernel/overflowuid\")",
-        "const UID_BYTES: usize = 11;",
-        ".take(UID_BYTES as u64 + 1)",
-        "unambiguous_uid(uid, overflow_uid(&bytes)?)",
-        "overflow == uid || overflow == 0",
-        "Permissions::from_mode(0o600)",
-        "identity(&named) != identity(&self.node.metadata()?)",
-        "fs::metadata(descriptor_path(&self.parent)).map_err",
-        "control cleanup parent is unavailable",
-        "trusted_ancestor(&current.metadata()?, uid)?",
-        "metadata.uid() != uid && metadata.uid() != 0",
-        "metadata.mode() & 0o022 != 0 && metadata.mode() & 0o1000 == 0",
-    ] {
-        assert!(production.contains(pin), "{pin}");
-    }
-    assert_eq!(production.matches("UnixListener::bind(").count(), 1);
-    assert!(!production.contains("UnixStream::connect"));
-    assert!(!production.contains("std::env"));
-    assert!(!production.contains("env::"));
-    assert!(!production.contains("canonicalize"));
-    assert!(!production.contains("65534"));
-    assert!(!production.contains("TD_TEST_TRUSTED_ROOT"));
-}
-
-#[test]
-fn control_worker_keeps_bounded_nonblocking_transport_separate_from_editor_state() {
-    let source = include_str!("../src/control_worker.rs");
-    let production = source.split("#[cfg(test)]").next().unwrap();
-    for pin in [
-        "const CONNECTIONS: usize = 8;",
-        "const IO_BYTES: usize = 16 * 1024;",
-        "Duration::from_secs(5)",
-        "Duration::from_millis(10)",
-        "mpsc::sync_channel(CONNECTIONS)",
-        "mpsc::sync_channel(1)",
-        "for _ in connections.len()..CONNECTIONS",
-        "requests.try_send(job)",
-        "self.requests.try_recv()",
-        "reply.try_send(response)",
-        "Request::parse(payload)",
-        "thread::park_timeout(poll_interval(connections.is_empty()))",
-        "Duration::from_millis(100)",
-        ".join()",
-    ] {
-        assert!(production.contains(pin), "{pin}");
-    }
-    let socket = include_str!("../src/control_socket.rs");
-    assert!(socket.contains("socket.listener.set_nonblocking(true)?"));
-    assert!(socket.contains("stream.set_nonblocking(true)?"));
-    for forbidden in [
-        "Controller",
-        "mpsc::channel(",
-        ".read_exact(",
-        ".write_all(",
-        ".recv()",
-        ".send(",
-    ] {
-        assert!(!production.contains(forbidden), "{forbidden}");
-    }
 }
 
 #[test]
@@ -709,7 +629,7 @@ fn native_control_is_opt_in_and_liveness_checked_with_bounded_outer_turns() {
     assert!(production.contains("const CONTROL_JOBS_PER_TURN: usize = 2;"));
     assert!(poll.contains("let mut budget = CONTROL_JOBS_PER_TURN;"));
     assert!(poll.contains("for _ in 0..self.frame_waiters.len()"));
-    assert!(poll.contains("self.frame_waiters.len() < crate::control_worker::CONNECTIONS"));
+    assert!(poll.contains("self.frame_waiters.len() < td_ui::control_worker::CONNECTIONS"));
     assert!(poll.contains("error: crate::Error::Limit"));
     assert_eq!(poll.matches("budget -= 1;").count(), 2);
     assert_eq!(production.matches("self.frames.complete()").count(), 1);

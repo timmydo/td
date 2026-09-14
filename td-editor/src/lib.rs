@@ -8,8 +8,6 @@ mod command;
 pub mod control;
 mod control_frame;
 mod control_jobs;
-pub mod control_socket;
-pub mod control_worker;
 mod dialog;
 mod directory;
 pub use dialog::{Discard, Reload};
@@ -86,6 +84,24 @@ impl From<td_ui::raster::Error> for Error {
             td_ui::raster::Error::InvalidArgument => Self::InvalidArgument,
             td_ui::raster::Error::Limit => Self::Limit,
         }
+    }
+}
+
+/// The toolkit's transport refusals are the editor's own two wire errors,
+/// so a control parser can `?` through the shared envelope and codecs.
+impl From<td_ui::control::Error> for Error {
+    fn from(error: td_ui::control::Error) -> Self {
+        match error {
+            td_ui::control::Error::Protocol => Self::Protocol,
+            td_ui::control::Error::Limit => Self::Limit,
+        }
+    }
+}
+
+/// The editor's codes travel in the toolkit's refusal line unchanged.
+impl td_ui::control::ErrorCode for Error {
+    fn code(&self) -> &'static str {
+        Error::code(*self)
     }
 }
 
