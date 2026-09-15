@@ -379,6 +379,7 @@ fn render_develops_neutral_patches_to_expected_values() {
     let level1 = level1_of(&[grey(0.0), grey(MIDDLE_GREY), grey(1.0), grey(0.5)], 2, 2);
     let image = develop::render(
         &level1,
+        None,
         2,
         1,
         wb,
@@ -407,6 +408,7 @@ fn render_develops_neutral_patches_to_expected_values() {
     // One stop up doubles the light: middle grey lands near 163.
     let brighter = develop::render(
         &level1,
+        None,
         2,
         1,
         wb,
@@ -427,6 +429,7 @@ fn render_develops_neutral_patches_to_expected_values() {
     let hot = level1_of(&[[1.0, 1.0, 1.0]], 1, 1);
     let out = develop::render(
         &hot,
+        None,
         1,
         1,
         [2.0, 1.0, 1.5],
@@ -477,9 +480,9 @@ fn the_levels_split_composes_to_render() {
         }
     }
     let level1 = level1_of(&pixels, 6, 4);
-    let flat = level2(&level1, 3, 1, 3).unwrap();
+    let flat = level2(&level1, None, 3, 1, 3).unwrap();
     assert_eq!((flat.width, flat.height), (3, 2));
-    let turned: Level2 = level2(&level1, 3, 6, 3).unwrap();
+    let turned: Level2 = level2(&level1, None, 3, 6, 3).unwrap();
     assert_eq!((turned.width, turned.height), (2, 3));
     // The new ordering (orient in level 2, then the per-pixel tail) equals
     // the old ordering (the tail on a held unturned level 2, then orient the
@@ -488,7 +491,7 @@ fn the_levels_split_composes_to_render() {
     // and it holds render against a level 3 rerun off one held level 2 (the
     // memoization an exposure or look edit relies on).
     let look = Look::parse(b"td-photo look 1\nsaturation 1.5\n").unwrap();
-    let held = level2(&level1, 3, 1, 3).unwrap();
+    let held = level2(&level1, None, 3, 1, 3).unwrap();
     for look_opt in [None, Some(&look)] {
         for orientation in [1u16, 3, 6, 8] {
             for exposure in [-1.0, 0.0, 0.4] {
@@ -497,8 +500,17 @@ fn the_levels_split_composes_to_render() {
                     threads: 3,
                     look: look_opt,
                 };
-                let new = develop::render(&level1, 3, orientation, wb, &color, &transfer, &params)
-                    .unwrap();
+                let new = develop::render(
+                    &level1,
+                    None,
+                    3,
+                    orientation,
+                    wb,
+                    &color,
+                    &transfer,
+                    &params,
+                )
+                .unwrap();
                 let old = orient(
                     level3(&held, wb, &color, &transfer, &params).unwrap(),
                     orientation,
@@ -520,6 +532,7 @@ fn the_levels_split_composes_to_render() {
                 height: 4,
                 rgb: vec![0; 5],
             },
+            None,
             3,
             1,
             1
@@ -547,6 +560,129 @@ fn the_levels_split_composes_to_render() {
         .unwrap_err(),
         develop::Error::Size
     );
+}
+
+#[test]
+fn a_crop_selects_the_oriented_region_for_every_orientation() {
+    // The crop is fractions of the *oriented* image; level 2 maps them back
+    // through the inverse of the orientation to the un-oriented level 1. With
+    // a long edge past the frame nothing resamples, so developing the crop
+    // must equal the same rectangle cut from a develop of the whole frame:
+    // this pins source_rect's per-orientation arithmetic against the orient
+    // it inverts. The frame varies on both axes, so a wrong arm shows.
+    let color = camera_color(&z8().xyz_to_cam).unwrap();
+    let transfer = Transfer::srgb();
+    let wb = color.daylight;
+    let grey = |v: f32| [v / wb[0], v / wb[1], v / wb[2]];
+    let (w, h) = (8usize, 6usize);
+    let mut pixels = Vec::new();
+    for y in 0..h {
+        for x in 0..w {
+            pixels.push(grey(0.1 + 0.02 * x as f32 + 0.13 * y as f32));
+        }
+    }
+    let level1 = level1_of(&pixels, w, h);
+    let params = Params {
+        exposure: 0.0,
+        threads: 3,
+        look: None,
+    };
+    // A long edge past the frame, so fit never shrinks and the compare is
+    // exact; the same fractions land on pixel boundaries at either orientation.
+    let long_edge = 100;
+    let fractions = [0.25f32, 0.5, 0.5, 0.5];
+    for orientation in [1u16, 3, 6, 8] {
+        // The oriented axes: swapped from level 1 for a quarter turn.
+        let (ow, oh) = if matches!(orientation, 6 | 8) {
+            (h, w)
+        } else {
+            (w, h)
+        };
+        let px = |f: f32, dim: usize| (f * dim as f32).round() as usize;
+        let (ox, oy) = (px(fractions[0], ow), px(fractions[1], oh));
+        let (ocw, och) = (px(fractions[2], ow), px(fractions[3], oh));
+        let full = develop::render(
+            &level1,
+            None,
+            long_edge,
+            orientation,
+            wb,
+            &color,
+            &transfer,
+            &params,
+        )
+        .unwrap();
+        assert_eq!((full.width, full.height), (ow, oh));
+        let cropped = develop::render(
+            &level1,
+            Some(fractions),
+            long_edge,
+            orientation,
+            wb,
+            &color,
+            &transfer,
+            &params,
+        )
+        .unwrap();
+        assert_eq!(
+            (cropped.width, cropped.height),
+            (ocw, och),
+            "orientation {orientation} crop size"
+        );
+        // The same rectangle cut out of the whole-frame develop.
+        let mut want = Vec::with_capacity(ocw * och * 3);
+        for row in oy..oy + och {
+            let start = (row * ow + ox) * 3;
+            want.extend_from_slice(&full.data[start..start + ocw * 3]);
+        }
+        assert_eq!(cropped.data, want, "orientation {orientation} crop pixels");
+    }
+}
+
+#[test]
+fn a_degenerate_or_edge_crop_is_refused_not_panicked() {
+    // A crop whose origin sits at the far edge, or whose extent rounds to
+    // nothing, or a fraction past the unit square, is no crop: Error::Crop on
+    // either axis and at every orientation, never a panic. (A boundary the
+    // sidecar's own grammar can reach on a small oriented axis, and any input
+    // through the public develop API.)
+    let color = camera_color(&z8().xyz_to_cam).unwrap();
+    let transfer = Transfer::srgb();
+    let wb = color.daylight;
+    let level1 = level1_of(&[[0.5, 0.5, 0.5]; 24], 6, 4);
+    let params = Params {
+        exposure: 0.0,
+        threads: 1,
+        look: None,
+    };
+    let refused = |crop: [f32; 4], orientation: u16| {
+        develop::render(
+            &level1,
+            Some(crop),
+            100,
+            orientation,
+            wb,
+            &color,
+            &transfer,
+            &params,
+        )
+        .unwrap_err()
+    };
+    for orientation in [1u16, 3, 6, 8] {
+        for crop in [
+            [1.0, 0.0, 0.5, 0.5], // origin at the far edge in x
+            [0.0, 1.0, 0.5, 0.5], // origin at the far edge in y
+            [0.0, 0.0, 0.0, 0.5], // a zero-width request
+            [0.0, 0.0, 0.5, 0.0], // a zero-height request
+            [2.0, 0.0, 0.5, 0.5], // a fraction past the unit square
+        ] {
+            assert_eq!(
+                refused(crop, orientation),
+                develop::Error::Crop,
+                "orientation {orientation} crop {crop:?}"
+            );
+        }
+    }
 }
 
 #[test]
@@ -599,10 +735,29 @@ fn render_reduces_orients_and_refuses_bad_buffers() {
         threads: 3,
         look: None,
     };
-    let small = develop::render(&level1, 3, 1, color.daylight, &color, &transfer, &params).unwrap();
+    let small = develop::render(
+        &level1,
+        None,
+        3,
+        1,
+        color.daylight,
+        &color,
+        &transfer,
+        &params,
+    )
+    .unwrap();
     assert_eq!((small.width, small.height), (3, 2));
-    let turned =
-        develop::render(&level1, 3, 6, color.daylight, &color, &transfer, &params).unwrap();
+    let turned = develop::render(
+        &level1,
+        None,
+        3,
+        6,
+        color.daylight,
+        &color,
+        &transfer,
+        &params,
+    )
+    .unwrap();
     assert_eq!((turned.width, turned.height), (2, 3));
     let bad = Level1 {
         width: 6,
@@ -610,7 +765,7 @@ fn render_reduces_orients_and_refuses_bad_buffers() {
         rgb: vec![0; 5],
     };
     assert_eq!(
-        develop::render(&bad, 3, 1, color.daylight, &color, &transfer, &params).unwrap_err(),
+        develop::render(&bad, None, 3, 1, color.daylight, &color, &transfer, &params).unwrap_err(),
         develop::Error::Size
     );
 }
@@ -774,7 +929,8 @@ fn resampler_and_demosaic_refuse_oversize_and_overflowing_axes() {
             rgb: vec![],
         };
         assert_eq!(
-            develop::render(&bad, 3, 1, color.daylight, &color, &transfer, &params).unwrap_err(),
+            develop::render(&bad, None, 3, 1, color.daylight, &color, &transfer, &params)
+                .unwrap_err(),
             develop::Error::Size
         );
     }
@@ -821,7 +977,7 @@ fn work_is_the_same_on_one_thread_and_many() {
             threads,
             look: None,
         };
-        develop::render(&one, 17, 8, wb, &color, &transfer, &params).unwrap()
+        develop::render(&one, None, 17, 8, wb, &color, &transfer, &params).unwrap()
     };
     let single = render(1);
     assert_eq!((single.width, single.height), (11, 17));

@@ -1001,13 +1001,16 @@ all-target Clippy.
    developed frame and the native test; this slice re-develops from the raw
    on each edit, correct but not yet incremental. Landed. Second: the level
    memoization and the level-0 cache, so an exposure or look edit reruns
-   level 3 alone, a resize level 2 (a crop too once 5(e) applies it), and a
+   level 3 alone, a resize or crop edit level 2, and a
    photo switch level 1 from the cached level 0; the pool plans each develop
    from the window's memo and the raw cache evicts the least recently shown
    under `RAW_CACHE_BYTES`. Landed; prefetching neighbouring level-0 frames
-   is a later slice. (e) The crop applied to level 2 (the crop of level 1)
-   in the preview and the headless verb, the crop drag contract, and the
-   look list overlay.
+   is a later slice. (e) First: the user crop applied to level 2 (the crop
+   of level 1), mapped through the inverse of the orientation so an
+   uncropped develop is byte-identical, in the window preview, `--preview`
+   and the headless verb's `--crop`. Landed. The crop drag contract (drag
+   handles and the aspect presets) and the look list overlay are a later
+   slice.
 6. Export: banded full-resolution bilinear demosaic, the JPEG encoder,
    `exported/` naming, and `td-photo export`; and `delete-rejected`, the
    action and its verb that move rejects and their sidecars into

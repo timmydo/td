@@ -40,10 +40,12 @@ const HELP: &str = concat!(
     "  with their geometry. --decode also decodes the raw strip and every\n",
     "  preview and prints their statistics and hashes.\n",
     "td-photo develop FILE OUT.ppm [--long-edge N] [--exposure STOPS]\n",
-    "                 [--look STEM]\n",
+    "                 [--look STEM] [--crop \"X Y W H\"]\n",
     "  Develops the raw to 8-bit sRGB at most N pixels on the long side\n",
-    "  (default 1600) with an exposure offset in stops (default 0) and the\n",
-    "  look STEM (see looks; default none), written through a fresh\n",
+    "  (default 1600) with an exposure offset in stops (default 0), the\n",
+    "  look STEM (see looks; default none) and the crop \"X Y W H\", four\n",
+    "  fractions of the oriented frame as the sidecar spells it (default\n",
+    "  the whole frame), written through a fresh\n",
     "  OUT.ppm.tmp and linked into place. OUT.ppm must not exist: td-photo\n",
     "  never overwrites a file.\n",
     "td-photo thumb FILE OUT.ppm [--long-edge N] [--cache]\n",
@@ -468,7 +470,11 @@ fn fnv1a64(bytes: &[u8]) -> u64 {
 }
 
 fn develop_file(path: &Path, out: &Path, rest: &[OsString]) -> Result<(), String> {
-    check_flags(rest, &["--long-edge", "--exposure", "--look"], &[])?;
+    check_flags(
+        rest,
+        &["--long-edge", "--exposure", "--look", "--crop"],
+        &[],
+    )?;
     let long_edge = match option(rest, "--long-edge")? {
         Some(text) => text
             .parse::<usize>()
@@ -491,11 +497,19 @@ fn develop_file(path: &Path, out: &Path, rest: &[OsString]) -> Result<(), String
         Some(stem) => Some(find_look(&stem)?),
         None => None,
     };
+    // The crop, `X Y W H` fractions as the sidecar spells them, refused by the
+    // same grammar before the decode.
+    let crop = match option(rest, "--crop")? {
+        Some(text) => Some(crop_fractions(
+            library::Crop::parse(&text).map_err(|_| format!("--crop {text:?} is not X Y W H"))?,
+        )),
+        None => None,
+    };
     // Refused before the decode, not only before the write.
     refuse_existing(out)?;
     let threads = threads();
     let started = Instant::now();
-    let (image, info) = develop_raw(path, long_edge, exposure, look.as_ref(), threads)?;
+    let (image, info) = develop_raw(path, crop, long_edge, exposure, look.as_ref(), threads)?;
     write_atomically(out, &image)?;
     writeln!(
         io::stdout().lock(),
@@ -651,15 +665,29 @@ pub(crate) fn raw_level1(raw: &RawFrame, threads: usize) -> Result<develop::Leve
     .map_err(|e| e.to_string())
 }
 
-/// Level 1 to level 2: resample to the canvas that fits `long_edge` and
-/// orient. Rerun on a resize; reused across exposure and look edits.
+/// A user crop, ten-thousandths of the oriented image, to the `0..=1`
+/// fractions the develop pipeline maps back to level 1.
+pub(crate) fn crop_fractions(crop: library::Crop) -> [f32; 4] {
+    let unit = library::CROP_UNIT as f32;
+    [
+        crop.x as f32 / unit,
+        crop.y as f32 / unit,
+        crop.width as f32 / unit,
+        crop.height as f32 / unit,
+    ]
+}
+
+/// Level 1 to level 2: the `crop`'s region (the whole frame when there is
+/// none) resampled to the canvas that fits `long_edge` and oriented. Rerun on
+/// a crop or resize; reused across exposure and look edits.
 pub(crate) fn level1_level2(
     level1: &develop::Level1,
     meta: &Meta,
+    crop: Option<[f32; 4]>,
     long_edge: usize,
     threads: usize,
 ) -> Result<develop::Level2, String> {
-    develop::level2(level1, long_edge, meta.orientation, threads).map_err(|e| e.to_string())
+    develop::level2(level1, crop, long_edge, meta.orientation, threads).map_err(|e| e.to_string())
 }
 
 /// Level 2 to the frame: the per-pixel pipeline at `stops` with `look`, then
@@ -691,13 +719,14 @@ pub(crate) fn level2_frame(
 
 /// The raw develop the `develop` verb shares with the window's preview: a
 /// file's raw sub-image parsed, decoded, demosaiced and rendered to an sRGB
-/// `Rgb8` fitting `long_edge`, at `exposure` stops with `look` when one is
-/// given, by way of the levels above. No file is written here; the caller
-/// decides. The verb runs it whole on one thread; the window runs the levels
-/// apart and caches them, and `--preview` runs the whole preview through
-/// `develop_preview` below.
+/// `Rgb8` fitting `long_edge`, `crop`'s region when one is given, at
+/// `exposure` stops with `look` when one is given, by way of the levels
+/// above. No file is written here; the caller decides. The verb runs it whole
+/// on one thread; the window runs the levels apart and caches them, and
+/// `--preview` runs the whole preview through `develop_preview` below.
 fn develop_raw(
     path: &Path,
+    crop: Option<[f32; 4]>,
     long_edge: usize,
     exposure: f32,
     look: Option<&Look>,
@@ -707,6 +736,7 @@ fn develop_raw(
     let level1 = raw_level1(&raw, threads)?;
     let image = develop::render(
         &level1,
+        crop,
         long_edge,
         raw.meta.orientation,
         raw.meta.wb,
@@ -729,7 +759,10 @@ fn develop_raw(
 /// placeholder as a grid box does for a thumbnail that cannot be made. The
 /// look stem is resolved here, off the turn loop's thread. Mirrors the
 /// thumbnail rule: developed at the box's long edge, then shrunk to the box
-/// for a shape taller than it. Crop is not applied yet (increment 5(d)(e)).
+/// for a shape taller than it. The `crop`, when the sidecar sets one, is the
+/// region of the frame developed.
+// The window's preview key: it names every input the develop turns on.
+#[allow(clippy::too_many_arguments)]
 fn develop_preview(
     roll: &Path,
     name: &str,
@@ -737,6 +770,7 @@ fn develop_preview(
     box_h: usize,
     exposure: i32,
     look: Option<&str>,
+    crop: Option<library::Crop>,
     threads: usize,
 ) -> Option<Rgb8> {
     let path = roll.join(name);
@@ -752,11 +786,13 @@ fn develop_preview(
     };
     let long_edge = box_w.max(box_h);
     let stops = exposure as f32 / 100.0;
-    let made =
-        develop_raw(&path, long_edge, stops, look.as_ref(), threads).and_then(|(image, _)| {
+    let crop = crop.map(crop_fractions);
+    let made = develop_raw(&path, crop, long_edge, stops, look.as_ref(), threads).and_then(
+        |(image, _)| {
             develop::shrink(image, box_w, box_h, threads)
                 .map_err(|e| format!("{}: {e}", path.display()))
-        });
+        },
+    );
     match made {
         Ok(image) => Some(image),
         Err(why) => {

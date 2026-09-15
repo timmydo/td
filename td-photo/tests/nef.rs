@@ -1541,6 +1541,55 @@ fn the_command_line_probes_and_develops_without_overwriting() {
     let pixels = &ppm[header.len()..];
     assert_eq!(pixels.len(), 16 * 7 * 3);
     assert!(pixels.chunks(3).all(|p| p[0] == p[1] && p[1] == p[2]));
+    // A crop develops a sub-region: fewer pixels on each axis than the whole
+    // frame at the same long edge, so the crop is applied (5(e)). The exact
+    // oriented-region mapping is pinned in tests/develop.rs.
+    let dims = |ppm: &[u8]| -> (usize, usize) {
+        let nl = |from: usize| from + ppm[from..].iter().position(|&b| b == b'\n').unwrap();
+        let first = nl(0);
+        assert_eq!(&ppm[..first], b"P6");
+        let second = nl(first + 1);
+        let mut wh = std::str::from_utf8(&ppm[first + 1..second])
+            .unwrap()
+            .split(' ');
+        let mut next = || wh.next().unwrap().parse().unwrap();
+        (next(), next())
+    };
+    let whole = dir.join("whole.ppm");
+    let (ok, _, stderr) = run(&[
+        OsStr::new("develop"),
+        file.as_os_str(),
+        whole.as_os_str(),
+        OsStr::new("--long-edge"),
+        OsStr::new("40"),
+    ]);
+    assert!(ok, "{stderr}");
+    let (fw, fh) = dims(&std::fs::read(&whole).unwrap());
+    let cropped = dir.join("cropped.ppm");
+    let (ok, _, stderr) = run(&[
+        OsStr::new("develop"),
+        file.as_os_str(),
+        cropped.as_os_str(),
+        OsStr::new("--long-edge"),
+        OsStr::new("40"),
+        OsStr::new("--crop"),
+        OsStr::new("0.2000 0.3000 0.5000 0.4000"),
+    ]);
+    assert!(ok, "{stderr}");
+    let (cw, ch) = dims(&std::fs::read(&cropped).unwrap());
+    assert!(cw < fw && ch < fh, "crop {cw}x{ch} vs whole {fw}x{fh}");
+    // A malformed crop is refused by name and writes nothing.
+    let bad_crop = dir.join("bad-crop.ppm");
+    let (ok, _, stderr) = run(&[
+        OsStr::new("develop"),
+        file.as_os_str(),
+        bad_crop.as_os_str(),
+        OsStr::new("--crop"),
+        OsStr::new("not a crop"),
+    ]);
+    assert!(!ok);
+    assert!(stderr.contains("is not X Y W H"), "{stderr}");
+    assert!(!bad_crop.exists());
     let x = dir.join("x.ppm");
     let (ok, _, stderr) = run(&[
         OsStr::new("develop"),

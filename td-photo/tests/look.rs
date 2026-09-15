@@ -637,6 +637,7 @@ fn the_pipeline_applies_the_look_after_the_matrix() {
     let render = |look: Option<&Look>| {
         develop::render(
             &level1,
+            None,
             2,
             1,
             wb,

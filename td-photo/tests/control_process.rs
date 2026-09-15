@@ -175,3 +175,40 @@ fn preview_develop_reflects_the_sidecar() {
         "the exposure did not reach the developed pixels"
     );
 }
+
+#[test]
+fn preview_develop_reflects_the_crop() {
+    // A crop written to the sidecar changes the develop box the same way an
+    // exposure does: `--preview --develop` develops the cropped region, so the
+    // shared crop the window, the verb and the preview read reaches the pixels.
+    let dir = Directory::new();
+    let roll = dir.0.join("roll");
+    std::fs::create_dir(&roll).unwrap();
+    let (w, h) = (64usize, 48usize);
+    let samples: Vec<u16> = (0..w * h).map(|i| 1008 + (i as u16 % 4000)).collect();
+    std::fs::write(
+        roll.join("DSC_0001.NEF"),
+        synth_nef::uncompressed_nef(w, h, &samples),
+    )
+    .unwrap();
+
+    let base = preview_develop(&dir, 800, 600, &roll, 0);
+    let layout = td_photo::ui::Layout::new(Surface::new(800, 600, Scale::default()).unwrap());
+    let r#box = layout
+        .preview_box()
+        .expect("a develop box on an 800x600 surface");
+    assert!(varies(&base, 800, r#box), "no developed image to crop");
+
+    std::fs::write(
+        roll.join("DSC_0001.NEF.edit"),
+        "td-photo edit 1\ncrop 0.2500 0.2500 0.5000 0.5000\n",
+    )
+    .unwrap();
+    let cropped = preview_develop(&dir, 800, 600, &roll, 0);
+    // The develop box itself changes: the crop reached the developed pixels.
+    assert_ne!(
+        box_pixels(&base, 800, r#box),
+        box_pixels(&cropped, 800, r#box),
+        "the crop did not reach the developed pixels"
+    );
+}

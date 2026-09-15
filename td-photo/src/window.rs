@@ -32,6 +32,7 @@ use td_ui::wire::Message;
 
 use td_photo::develop;
 use td_photo::image::Rgb8;
+use td_photo::library;
 use td_photo::ui::{
     self, Action, BINDINGS, CONTROL_JOBS_PER_TURN, MAX_WAIT_MS, THUMB_CACHE_BYTES, THUMB_HEIGHT,
     THUMB_WIDTH,
@@ -250,6 +251,7 @@ fn developed(session: &Session, roll: &Path) -> Option<(td_ui::raster::Rect, Rgb
         .and_then(|sidecar| sidecar.exposure())
         .unwrap_or(0);
     let look = photo.sidecar.as_ref().and_then(|sidecar| sidecar.look());
+    let crop = photo.sidecar.as_ref().and_then(|sidecar| sidecar.crop());
     let image = crate::develop_preview(
         roll,
         &photo.name,
@@ -257,6 +259,7 @@ fn developed(session: &Session, roll: &Path) -> Option<(td_ui::raster::Rect, Rgb
         r#box.height as usize,
         exposure,
         look,
+        crop,
         threads(),
     )?;
     Some((r#box, image))
@@ -281,8 +284,8 @@ impl Key {
 }
 
 /// What a worker develops the preview by: the roll, the photo in it, the
-/// box it fits and the sidecar's exposure and look, so the same photo at
-/// another box, exposure or look is another develop. There is no
+/// box it fits, the sidecar's crop, exposure and look, so the same photo at
+/// another box, crop, exposure or look is another develop. There is no
 /// generation: two requests with the same fields yield the same pixels.
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct Preview {
@@ -290,6 +293,7 @@ struct Preview {
     name: String,
     box_w: usize,
     box_h: usize,
+    crop: Option<library::Crop>,
     exposure: i32,
     look: Option<String>,
 }
@@ -346,6 +350,7 @@ enum Made {
         meta: crate::Meta,
         level1: Arc<develop::Level1>,
         long_edge: usize,
+        crop: Option<library::Crop>,
         level2: Arc<develop::Level2>,
         image: Rgb8,
     },
@@ -353,11 +358,13 @@ enum Made {
         meta: crate::Meta,
         level1: Arc<develop::Level1>,
         long_edge: usize,
+        crop: Option<library::Crop>,
         level2: Arc<develop::Level2>,
         image: Rgb8,
     },
     Level2 {
         long_edge: usize,
+        crop: Option<library::Crop>,
         level2: Arc<develop::Level2>,
         image: Rgb8,
     },
@@ -590,6 +597,7 @@ fn develop_task(preview: &Preview, start: Start) -> Made {
 fn develop_try(preview: &Preview, start: Start) -> Result<Made> {
     let threads = threads();
     let long_edge = preview.box_w.max(preview.box_h);
+    let crop = preview.crop.map(crate::crop_fractions);
     let stops = preview.exposure as f32 / 100.0;
     let look = match &preview.look {
         Some(stem) => Some(crate::find_look(stem)?),
@@ -610,7 +618,7 @@ fn develop_try(preview: &Preview, start: Start) -> Result<Made> {
     // Level 1 to its level 2 and frame, shared by the decode and cached-raw
     // starts.
     let from_level1 = |level1: &develop::Level1, meta: &crate::Meta| {
-        let level2 = crate::level1_level2(level1, meta, long_edge, threads)?;
+        let level2 = crate::level1_level2(level1, meta, crop, long_edge, threads)?;
         let image = frame(&level2, meta)?;
         Ok::<_, String>((level2, image))
     };
@@ -622,6 +630,7 @@ fn develop_try(preview: &Preview, start: Start) -> Result<Made> {
             let (level2, image) = from_level1(&level1, &meta)?;
             Made::Level2 {
                 long_edge,
+                crop: preview.crop,
                 level2: Arc::new(level2),
                 image,
             }
@@ -634,6 +643,7 @@ fn develop_try(preview: &Preview, start: Start) -> Result<Made> {
                 meta,
                 level1: Arc::new(level1),
                 long_edge,
+                crop: preview.crop,
                 level2: Arc::new(level2),
                 image,
             }
@@ -648,6 +658,7 @@ fn develop_try(preview: &Preview, start: Start) -> Result<Made> {
                 meta,
                 level1: Arc::new(level1),
                 long_edge,
+                crop: preview.crop,
                 level2: Arc::new(level2),
                 image,
             }
@@ -704,14 +715,15 @@ impl PhotoKey {
 }
 
 /// The current photo's levels above 0: level 1 (the demosaic, reused across
-/// resizes) and the level 2 for the box's current long edge (reused across
-/// exposure and look edits), with the metadata level 3 applies. Let go with
-/// the thumbnails when the roll or scale changes.
+/// resizes) and the level 2 for the box's current long edge and crop (reused
+/// across exposure and look edits), with the metadata level 3 applies. Let go
+/// with the thumbnails when the roll or scale changes.
 struct Current {
     key: PhotoKey,
     meta: crate::Meta,
     level1: Arc<develop::Level1>,
     long_edge: usize,
+    crop: Option<library::Crop>,
     level2: Arc<develop::Level2>,
 }
 
@@ -755,14 +767,15 @@ impl Memo {
     }
 
     /// The level a develop for `preview` starts from, given what is held:
-    /// level 3 when its level 2 is current for the box, level 2 when only
-    /// level 1 is, level 1 when the level 0 is cached, else a decode. Each
-    /// start carries the cached levels the worker reuses.
+    /// level 3 when its level 2 is current for the box and crop, level 2 when
+    /// only level 1 is (a resize or crop edit), level 1 when the level 0 is
+    /// cached, else a decode. Each start carries the cached levels the worker
+    /// reuses.
     fn plan(&self, preview: &Preview) -> Start {
         let long_edge = preview.box_w.max(preview.box_h);
         if let Some(current) = &self.current {
             if current.key.is(preview) {
-                if current.long_edge == long_edge {
+                if current.long_edge == long_edge && current.crop == preview.crop {
                     return Start::Level3 {
                         meta: current.meta,
                         level2: Arc::clone(&current.level2),
@@ -802,6 +815,7 @@ impl Memo {
                 meta,
                 level1,
                 long_edge,
+                crop,
                 level2,
                 image,
             } => {
@@ -812,6 +826,7 @@ impl Memo {
                         meta,
                         level1,
                         long_edge,
+                        crop,
                         level2,
                     });
                 }
@@ -821,6 +836,7 @@ impl Memo {
                 meta,
                 level1,
                 long_edge,
+                crop,
                 level2,
                 image,
             } => {
@@ -832,6 +848,7 @@ impl Memo {
                         meta,
                         level1,
                         long_edge,
+                        crop,
                         level2,
                     });
                 }
@@ -839,11 +856,13 @@ impl Memo {
             }
             Made::Level2 {
                 long_edge,
+                crop,
                 level2,
                 image,
             } => match self.current.as_mut() {
                 Some(current) if current.key == key => {
                     current.long_edge = long_edge;
+                    current.crop = crop;
                     current.level2 = level2;
                     Some(image)
                 }
@@ -1298,8 +1317,8 @@ impl Window {
     }
 
     /// The develop the model wants now: the cursor photo fitted to the
-    /// develop box at its sidecar's exposure and look, or `None` outside
-    /// develop mode or before a roll.
+    /// develop box at its sidecar's crop, exposure and look, or `None`
+    /// outside develop mode or before a roll.
     fn wanted_preview(&self) -> Option<Preview> {
         let ui = &self.session.ui;
         let r#box = ui.develop_box()?;
@@ -1311,6 +1330,7 @@ impl Window {
             name: photo.name.clone(),
             box_w: r#box.width as usize,
             box_h: r#box.height as usize,
+            crop: photo.sidecar.as_ref().and_then(|sidecar| sidecar.crop()),
             exposure: photo
                 .sidecar
                 .as_ref()
@@ -1652,6 +1672,7 @@ mod tests {
             name: name.to_string(),
             box_w: 300,
             box_h: 200,
+            crop: None,
             exposure: 0,
             look: None,
         }
@@ -1832,6 +1853,7 @@ mod tests {
                 rgb: vec![0, 0, 0],
             }),
             long_edge,
+            crop: None,
             level2: Arc::new(develop::Level2 {
                 width: 1,
                 height: 1,
@@ -1868,6 +1890,13 @@ mod tests {
             ..a.clone()
         };
         assert_eq!(memo.plan(&a_big).stage(), Stage::Level2);
+        // Same photo and box, a crop edit: level 2 reruns from the cached
+        // level 1, since the crop is applied there.
+        let a_cropped = Preview {
+            crop: Some(library::Crop::new(2500, 2500, 5000, 5000).unwrap()),
+            ..a.clone()
+        };
+        assert_eq!(memo.plan(&a_cropped).stage(), Stage::Level2);
         // Another photo, not cached: a decode.
         let b = preview("b");
         assert_eq!(memo.plan(&b).stage(), Stage::Decode);

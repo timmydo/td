@@ -412,12 +412,81 @@ pub fn shrink(image: Rgb8, width: usize, height: usize, threads: usize) -> Resul
     Ok(out)
 }
 
-/// Level 1 to level 2: resample the `u16` level directly to the canvas
-/// that fits `long_edge` on the long side, then orient. Level 2 is the
-/// only `f32` image buffer retained, reused across exposure and look
-/// edits; the resample and the orient hold transient `f32` buffers.
+/// A fraction in `0..=1` to a pixel index in `0..=dim`, rounded and
+/// clamped, so a fraction the caller validated cannot land outside the axis.
+fn frac_px(fraction: f32, dim: usize) -> usize {
+    let scaled = (fraction.clamp(0.0, 1.0) * dim as f32).round();
+    (scaled.max(0.0) as usize).min(dim)
+}
+
+/// The user crop, four fractions `x y w h` of the oriented image, mapped to
+/// the rectangle it selects in the un-oriented level 1 (`x0, y0, width,
+/// height`). The oriented image is level 1 turned by `orientation`, so the
+/// crop is turned the other way to reach level 1: this is the inverse of
+/// `oriented3`'s per-pixel map. `None` when the rectangle is degenerate.
+fn source_rect(
+    fractions: [f32; 4],
+    w: usize,
+    h: usize,
+    orientation: u16,
+) -> Option<(usize, usize, usize, usize)> {
+    let [fx, fy, fw, fh] = fractions;
+    // The oriented image's axes: swapped from level 1 for a quarter turn.
+    let (ow, oh) = if matches!(orientation, 6 | 8) {
+        (h, w)
+    } else {
+        (w, h)
+    };
+    let (ox, oy) = (frac_px(fx, ow), frac_px(fy, oh));
+    // The room from the origin to the far edge; `frac_px` keeps ox, oy within
+    // 0..=ow/oh, so the subtraction cannot underflow.
+    let (room_w, room_h) = (ow.checked_sub(ox)?, oh.checked_sub(oy)?);
+    // The requested extent, held to the room. A zero extent -- a start at the
+    // edge, or a fraction that rounds to nothing -- is a degenerate crop, so
+    // no crop.
+    let ocw = frac_px(fw, ow).min(room_w);
+    let och = frac_px(fh, oh).min(room_h);
+    if ocw == 0 || och == 0 {
+        return None;
+    }
+    // Inverse of `oriented3`: an oriented rectangle back to level 1.
+    let rect = match orientation {
+        3 => (w - ox - ocw, h - oy - och, ocw, och),
+        6 => (oy, h - ox - ocw, och, ocw),
+        8 => (w - oy - och, ox, och, ocw),
+        _ => (ox, oy, ocw, och),
+    };
+    Some(rect)
+}
+
+/// The `cw` by `ch` window at `x0, y0` of a `w`-wide interleaved level 1,
+/// row by row. `None` if it runs past a row or past the buffer.
+fn subimage(rgb: &[u16], w: usize, x0: usize, y0: usize, cw: usize, ch: usize) -> Option<Vec<u16>> {
+    // A window wider than the row would wrap into the next row while staying
+    // inside the buffer; that is running past this row.
+    if x0.checked_add(cw)? > w {
+        return None;
+    }
+    let row_bytes = cw.checked_mul(3)?;
+    let mut out = Vec::with_capacity(row_bytes.checked_mul(ch)?);
+    for row in y0..y0.checked_add(ch)? {
+        let start = row.checked_mul(w)?.checked_add(x0)?.checked_mul(3)?;
+        out.extend_from_slice(rgb.get(start..start.checked_add(row_bytes)?)?);
+    }
+    Some(out)
+}
+
+/// Level 1 to level 2: the user crop's region of the `u16` level (the whole
+/// frame when there is none) resampled to the canvas that fits `long_edge`
+/// on the long side, then oriented. The crop is `x y w h` fractions of the
+/// oriented image; cropping level 1 before the resample keeps the crop at
+/// full canvas resolution, and the fit and orient are the uncropped path's
+/// applied to the cropped region, so an uncropped develop is unchanged.
+/// Level 2 is the only `f32` image buffer retained, reused across exposure
+/// and look edits; the resample and the orient hold transient `f32` buffers.
 pub fn level2(
     level1: &Level1,
+    crop: Option<[f32; 4]>,
     long_edge: usize,
     orientation: u16,
     threads: usize,
@@ -426,11 +495,21 @@ pub fn level2(
     if !pixels_ok(w, h) || level1.rgb.len() != w * h * 3 {
         return Err(Error::Size);
     }
-    let (dw, dh) = fit(w, h, long_edge);
-    let canvas = resample_u16(&level1.rgb, w, h, dw, dh, threads)?;
-    let (rgb, width, height) = match oriented3(&canvas, dw, dh, orientation) {
+    let (sw, sh, canvas) = match crop {
+        None => {
+            let (dw, dh) = fit(w, h, long_edge);
+            (dw, dh, resample_u16(&level1.rgb, w, h, dw, dh, threads)?)
+        }
+        Some(fractions) => {
+            let (x0, y0, cw, ch) = source_rect(fractions, w, h, orientation).ok_or(Error::Crop)?;
+            let region = subimage(&level1.rgb, w, x0, y0, cw, ch).ok_or(Error::Crop)?;
+            let (dw, dh) = fit(cw, ch, long_edge);
+            (dw, dh, resample_u16(&region, cw, ch, dw, dh, threads)?)
+        }
+    };
+    let (rgb, width, height) = match oriented3(&canvas, sw, sh, orientation) {
         Some(turned) => turned,
-        None => (canvas, dw, dh),
+        None => (canvas, sw, sh),
     };
     Ok(Level2 { width, height, rgb })
 }
@@ -497,10 +576,13 @@ pub fn level3(
 }
 
 /// Develops level 1 to 8-bit sRGB at most `long_edge` on its long side, by
-/// way of level 2 (resample and orient) then level 3 (the per-pixel
+/// way of level 2 (crop, resample and orient) then level 3 (the per-pixel
 /// pipeline): what the headless verb runs, one frame at a time.
+// It composes both stages, so it carries both stages' inputs.
+#[allow(clippy::too_many_arguments)]
 pub fn render(
     level1: &Level1,
+    crop: Option<[f32; 4]>,
     long_edge: usize,
     orientation: u16,
     wb: [f32; 3],
@@ -508,7 +590,7 @@ pub fn render(
     transfer: &Transfer,
     params: &Params<'_>,
 ) -> Result<Rgb8, Error> {
-    let l2 = level2(level1, long_edge, orientation, params.threads)?;
+    let l2 = level2(level1, crop, long_edge, orientation, params.threads)?;
     level3(&l2, wb, color, transfer, params)
 }
 
