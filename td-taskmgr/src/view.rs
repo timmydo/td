@@ -6,11 +6,11 @@ use crate::projection::{self, Expansion, Key, Projection, Sort};
 use crate::snapshot::Snapshot;
 use std::cell::RefCell;
 use std::fmt::Write;
-type CachedCells = MemoryVec<(Key, [Text<32>; 7], Text<4096>)>;
+type CachedCells = MemoryVec<(Key, [Text<32>; 8], Text<4096>)>;
 use std::sync::Arc;
 use td_ui::raster::{Draw, Rect, Surface};
 use td_ui::tree_table::{self as tree, Cell, Column, Heading};
-const COLUMNS: [Column<'static>; 8] = [
+const COLUMNS: [Column<'static>; 9] = [
     Column {
         title: "Process",
         minimum: 160,
@@ -39,6 +39,12 @@ const COLUMNS: [Column<'static>; 8] = [
         title: "CPU % / core",
         minimum: 120,
         preferred: 128,
+        numeric: true,
+    },
+    Column {
+        title: "CPU time",
+        minimum: 144,
+        preferred: 144,
         numeric: true,
     },
     Column {
@@ -114,6 +120,7 @@ pub struct Inputs<'a> {
     pub query: &'a str,
     pub selected: Option<crate::hierarchy::ProcessKey>,
     pub expansion: &'a Expansion,
+    pub root: Option<crate::hierarchy::ProcessKey>,
 }
 impl View {
     pub fn new(
@@ -129,9 +136,11 @@ impl View {
             query,
             selected,
             expansion,
+            root,
         } = input;
         let projection =
-            Projection::new(budget, snapshot, sort, query, selected, expansion).map_err(error)?;
+            Projection::for_root(budget, snapshot, sort, query, selected, expansion, root)
+                .map_err(error)?;
         let (model, charge) = model(budget, &projection)?;
         let table = tree::Controller::new(model, surface, rect).map_err(error)?;
         Ok(Self {
@@ -150,9 +159,11 @@ impl View {
             query,
             selected,
             expansion,
+            root,
         } = input;
         let projection =
-            Projection::new(budget, snapshot, sort, query, selected, expansion).map_err(error)?;
+            Projection::for_root(budget, snapshot, sort, query, selected, expansion, root)
+                .map_err(error)?;
         let (model, charge) = model(budget, &projection)?;
         self.table.replace(model).map_err(error)?;
         self.projection = projection;
@@ -191,7 +202,7 @@ impl View {
                     .take(geometry.visible())
                     .enumerate()
                 {
-                    let mut cells = [Text::<32>::default(); 7];
+                    let mut cells = [Text::<32>::default(); 8];
                     if let Key::Process(key) = row.id {
                         if let Ok(index) =
                             snapshot.processes().binary_search_by_key(&key, |p| p.key)
@@ -203,6 +214,7 @@ impl View {
                                     Text::number(p.uid.map(u64::from)),
                                     Text::new(std::str::from_utf8(&[p.state]).unwrap_or("?")),
                                     Text::percent(p.cpu, false),
+                                    Text::cpu_time(p.cpu_time_ms),
                                     Text::bytes(p.rss, false),
                                     Text::percent(
                                         node.and_then(|n| n.cpu.value()),
@@ -280,6 +292,7 @@ pub fn column(index: usize) -> Option<projection::Column> {
         projection::Column::Uid,
         projection::Column::State,
         projection::Column::Cpu,
+        projection::Column::CpuTime,
         projection::Column::Rss,
         projection::Column::TreeCpu,
         projection::Column::TreeRss,

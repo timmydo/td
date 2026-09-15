@@ -197,3 +197,23 @@ fn escaped_names_preserve_unicode_and_bound_complete_escapes_without_growth() {
         assert_eq!(small.capacity(), capacity);
     }
 }
+
+#[test]
+fn lifetime_cpu_uses_runtime_ticks_without_needing_a_previous_sample() {
+    use td_taskmgr::parsers::cpu_time_ms;
+    assert_eq!(cpu_time_ms(Some(700), Some(300), 100), Some(10_000));
+    assert_eq!(cpu_time_ms(Some(2048), Some(512), 2048), Some(1250));
+    assert_eq!(cpu_time_ms(Some(0), Some(0), 100), Some(0));
+    assert_eq!(cpu_time_ms(Some(1), Some(1), 0), None);
+    assert_eq!(cpu_time_ms(None, Some(3), 100), None);
+    assert_eq!(cpu_time_ms(Some(3), None, 100), None);
+    assert_eq!(cpu_time_ms(Some(u64::MAX), Some(u64::MAX), 1), None);
+    assert_eq!(
+        td_taskmgr::format::Text::<32>::cpu_time(Some(3_661_234)).as_str(),
+        "1:01:01.234"
+    );
+    assert_eq!(
+        td_taskmgr::format::Text::<32>::cpu_time(None).as_str(),
+        "Unavailable"
+    );
+}

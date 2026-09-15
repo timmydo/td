@@ -641,3 +641,76 @@ fn assert_confirmation_cancel(pixels: &[u8], place: &Placement) {
         );
     }
 }
+
+#[test]
+#[ignore = "ready supplies the disposable native compositor"]
+fn physical_double_click_opens_history_and_back_restores_the_ranked_list() {
+    use td_ui::{
+        raster::{Rect, Surface},
+        split,
+    };
+    let directory = Directory::new();
+    let mut compositor = Compositor::start(&directory);
+    let client_directory = Directory::new();
+    let client = TaskProcess::start(&client_directory, &compositor.directory.join("wayland-0"));
+    let deadline = Instant::now() + TIMEOUT;
+    let place = loop {
+        if let Some(place) = compositor.placement("td-taskmgr") {
+            break place;
+        }
+        assert!(Instant::now() < deadline, "mapping deadline");
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    wait_state(&client, |s| counter(s, "retained") >= 2);
+    compositor.click(place.x + 200, place.y + 10);
+    tap(&mut compositor, 15); // Graph focus.
+    tap(&mut compositor, 107); // Pin the newest observation, avoiding process churn during gestures.
+    wait_state(&client, |s| s.get("live").is_some_and(|s| s == "false"));
+    // Target the actual client extent through the shared split geometry.
+    let surface = Surface::new(place.width, place.height, Default::default()).unwrap();
+    let layout = split::Controller::new(
+        split::Config {
+            axis: split::Axis::Vertical,
+            first_min: 216,
+            second_min: 96,
+        },
+        split::Share::default(),
+        surface,
+        Rect {
+            x: 0,
+            y: 48,
+            width: place.width as u32,
+            height: place.height as u32 - 72,
+        },
+    )
+    .unwrap()
+    .layout()
+    .unwrap();
+    compositor.click(place.x + 550, place.y + layout.second.y as usize + 28);
+    tap(&mut compositor, 102); // Highest CPU row after the global sort.
+    let selected = wait_state(&client, |s| {
+        s.get("selected")
+            .is_some_and(|s| s != "none" && s != "group")
+    });
+    let key = selected.get("selected").unwrap().clone();
+    let before = compositor.tile(&place);
+    let x = place.x + 120;
+    let y = place.y + layout.second.y as usize + 52;
+    compositor.click(x, y);
+    compositor.click(x, y);
+    wait_state(&client, |s| s.get("detail") == Some(&key));
+    let detail = compositor.tile(&place);
+    assert_ne!(before, detail);
+    let text = client.request(4, &["text"]);
+    let text = String::from_utf8(td_ui::control::unhex(text.last().unwrap()).unwrap()).unwrap();
+    assert!(text.contains("CPU time:"), "{text}");
+    assert!(text.contains("Back (Esc)"), "{text}");
+    tap(&mut compositor, 1);
+    let restored = wait_state(&client, |s| s.get("detail").is_some_and(|s| s == "none"));
+    assert_eq!(restored.get("selected"), Some(&key));
+    assert_eq!(restored.get("rows"), selected.get("rows"));
+    let _ = compositor.tile(&place);
+    assert_eq!(client.request(3, &["action", "quit"]), ["ok", "quit"]);
+    assert!(client.finish());
+    compositor.stop();
+}

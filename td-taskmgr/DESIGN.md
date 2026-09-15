@@ -69,7 +69,7 @@ It uses td-ui's palette, font, input handling, and software draw stream.
 | Live / inspected time           contributor legend or device list |
 +===================== draggable divider ==========================+
 | Search processes...             Process actions                   |
-| Process       PID   UID   State   CPU %   RSS   Tree CPU %  Tree RSS |
+| Process  PID  UID  State  CPU %  CPU time  RSS  Tree CPU %  Tree RSS |
 | v parent                                                          |
 |   > child                                                         |
 |   > child                                                         |
@@ -154,37 +154,67 @@ with a diagnostic. Walk and aggregate iteratively, with bounded depth.
 Synthetic grouping roots can receive navigation focus and expand/collapse,
 but have no process identity, action menu or actionable subtree.
 
-Show all visible processes, including other users' processes when readable.
-Search matches the displayed command/name, PID, and numeric UID; matching
-descendants keep their ancestors as context rows. Search does not change
-subtree totals or the scope of a subtree action: actions resolve recorded
-snapshot ancestry independently of visible rows. Own CPU/RSS and subtree
-CPU/RSS column sorts produce a flat global ranking, including processes
-beneath collapsed
-parents; search retains only matches and an explicit selected exception.
-Sorting by Process restores the parent/child tree and saved expansions.
-PID, UID and state also sort siblings in tree mode. Every sort uses a
-stable process-key tie-break and returns the viewport to the first row.
-Default is PID ascending; clicking a numeric
-heading starts descending; a text heading starts ascending, comparing the
-displayed text by Unicode scalar value. Repeated clicks on the active sort
-heading toggle ascending/descending. Refresh preserves selection and the
-first visible row by key. While a pointer gesture or menu is active,
-freeze row geometry;
-actions bind to the captured target, never a later row at the same index.
+Show all visible processes, including other users' processes when
+readable. Search matches the displayed command/name, PID, and numeric
+UID; matching descendants keep their ancestors as context rows. Search
+does not change subtree totals or the scope of a subtree action: actions
+resolve recorded snapshot ancestry independently of visible rows. Own
+CPU/RSS, lifetime CPU time and subtree CPU/RSS sorts produce a flat
+global ranking, including processes beneath collapsed parents; search
+retains only matches and an explicit selected exception. Sorting by
+Process restores the parent/child tree and saved expansions. PID, UID
+and state also sort siblings in tree mode. Every sort uses a stable
+process-key tie-break and returns the viewport to the first row. Default
+is PID ascending; clicking a numeric heading starts descending; a text
+heading starts ascending, comparing the displayed text by Unicode scalar
+value. Repeated clicks on the active sort heading toggle
+ascending/descending. Refresh preserves selection and the first visible
+row by key. While a pointer gesture or menu is active, freeze row
+geometry; actions bind to the captured target, never a later row at the
+same index.
 
-The initial columns are name, PID, numeric UID, state, own CPU %, own RSS,
-subtree CPU %, and subtree RSS. Command-line detail is available on demand
-with a bounded read and clear truncation. Escape control bytes and display
-invalid UTF-8 safely; process-controlled text never supplies menu syntax,
-markup, commands, or authority. An unreadable field is Unavailable, not 0.
-An absent row is marked no longer observed; call it exited only when there
-is positive exit evidence. Visibility loss alone does not prove exit.
+The columns are name, PID, numeric UID, state, own CPU %, lifetime CPU
+time, own RSS, subtree CPU %, and subtree RSS. Command-line detail is
+available on demand with a bounded read and clear truncation. Escape
+control bytes and display invalid UTF-8 safely; process-controlled text
+never supplies menu syntax, markup, commands, or authority. An
+unreadable field is Unavailable, not 0. An absent row is marked no
+longer observed; call it exited only when there is positive exit
+evidence. Visibility loss alone does not prove exit.
 
 Subtree values sum each observed process once, including the parent.
 Collapsed children remain included. Partial coverage is visible on totals;
 there is no accounting for unobserved children between samples. No process
 action interprets the visual indentation or a substring match as its target.
+
+## Process detail view
+
+Double-clicking a process row or pressing Enter opens a detail view for its
+exact process key. Details (Enter) provides the same toolbar action. Its
+CPU and RSS plots use retained history for that process, with one row of
+cards and Page Up/Down access when both do not fit side by side. The lower
+pane roots a parent/child tree at that process; unrelated branches and
+ancestors no longer consume its indentation. A Parent button and Alt+Up
+open its observed parent using the same key-bound view. An unavailable
+parent is informational, not an invented PID target.
+
+The detail identity stays fixed while selecting related rows for ordinary
+process actions. Double-click/Enter on a related process opens its details.
+The view has its own subtree search and expansion state. Back or Escape
+restores the broader search, sort, expansion and first visible anchor when
+still available. If the saved selection is absent, Back clears it.
+Graph-tab changes and sorting a heading return to the broader view;
+a heading click toggles the visible detail sort, not the saved browse sort. Comparing all also exits details and clears the plot filter.
+A missing identity leaves an explicit unavailable detail view. PID reuse
+never redirects it, and historical details retain the existing prohibition
+on signals. Historical plots begin with retained observations; opening a
+detail does not reconstruct past CPU/RSS samples.
+
+`pointer::DoubleClick` pairs completed semantic row clicks using explicit
+monotonic timestamps and logical coordinates. Keys, scrolling, resize,
+focus loss, nonrow clicks and canceled row releases retire the pair. The
+shared tree still captures the exact row identity for each press/release;
+a completed pair opens a view, never bypasses process-action confirmation.
 
 ## Measurements
 
@@ -220,7 +250,14 @@ Use ticks per second and elapsed time for a one-logical-CPU basis: a
 multithreaded process can exceed 100%. Label that basis on the table and
 process plot; subtree CPU uses it too. The system and contribution plots
 have distinct axes. Include process guest time only through utime.
-Source fields follow
+Lifetime CPU time is `(utime + stime) / CLK_TCK`, using the runtime tick
+frequency, displayed as hours:minutes:seconds.milliseconds. It is the
+process's cumulative user plus kernel execution time since start, including
+execution before the task manager opened. It excludes waited-for-child
+counters, is available on the first observation, and is separate from the
+interval CPU percentage. Missing counters, zero tick frequency or an
+unrepresentable conversion remain unavailable. Sorting CPU time ranks all
+processes globally. Source fields follow
 [proc_pid_stat(5)](https://man7.org/linux/man-pages/man5/proc_pid_stat.5.html).
 
 ### Memory
@@ -559,12 +596,14 @@ endpoint; a remote quit allows a bounded reply-drain interval. Transport and
 surface buffers retain td-ui's separate ceilings.
 
 `--preview [WIDTHxHEIGHT]` emits a PPM from two actual observations.
-`--help` and `--font-license` require no display. Ctrl+L returns to Live,
-Ctrl+I cycles cadence, Ctrl+A outside search clears the process plot filter,
-and Ctrl+Q closes; graph Page Up/Down scrolls cards,
+`--help` and `--font-license` require no display. Ctrl+L returns to
+Live, Ctrl+I cycles cadence, Ctrl+A outside search clears the process
+plot filter, and Ctrl+Q closes; graph Page Up/Down scrolls cards,
 Ctrl+Tab selects another visible graph and arrows inspect times/series.
-Network/Disk add a device-list stop to the Tab focus cycle; Space toggles
-membership. Escape closes the ranked contributors before changing focus.
+Network/Disk add a device-list stop to the Tab focus cycle; Space
+toggles membership. Escape closes the ranked contributors before
+returning from process details or changing focus. Enter and double-click
+open process details; F10 remains the explicit process-actions shortcut.
 
 The native fixture uses the repository trusted-root test wrapper so the
 private endpoint keeps its ordinary ancestor-ownership checks inside the

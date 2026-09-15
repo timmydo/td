@@ -1,7 +1,39 @@
-//! Bounded wl_pointer v5-v7 decoding and axis-frame accumulation.
+//! Bounded pointer decoding, axis frames and completed-click pairing.
 
 use crate::wire::{Cursor, Message};
 use crate::{CELL_HEIGHT, CELL_WIDTH};
+
+/// Pairs completed semantic clicks using caller-supplied monotonic time.
+#[derive(Clone, Copy, Debug)]
+pub struct DoubleClick<I> {
+    previous: Option<(I, u64, i64, i64)>,
+}
+impl<I> Default for DoubleClick<I> {
+    fn default() -> Self {
+        Self { previous: None }
+    }
+}
+impl<I: Copy + Eq> DoubleClick<I> {
+    pub fn cancel(&mut self) {
+        self.previous = None;
+    }
+    pub fn completed(&mut self, id: I, now_ns: u64, x: i64, y: i64) -> bool {
+        let paired = self.previous.is_some_and(|(previous, at, px, py)| {
+            previous == id
+                && now_ns
+                    .checked_sub(at)
+                    .is_some_and(|elapsed| elapsed <= 500_000_000)
+                && x.abs_diff(px) <= 4
+                && y.abs_diff(py) <= 4
+        });
+        self.previous = if paired {
+            None
+        } else {
+            Some((id, now_ns, x, y))
+        };
+        paired
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Event {
@@ -276,5 +308,19 @@ mod tests {
         wheel.update(Event::Discrete(0, 0)).unwrap();
         wheel.update(Event::Axis(0, 8 * 256)).unwrap();
         assert_eq!(wheel.frame(), (1, 0));
+    }
+
+    #[test]
+    fn completed_pairs_require_identity_time_and_position_and_are_consumed() {
+        let mut clicks = DoubleClick::default();
+        assert!(!clicks.completed(1, 100, 10, 20));
+        assert!(clicks.completed(1, 200, 11, 21));
+        assert!(!clicks.completed(1, 300, 11, 21));
+        assert!(!clicks.completed(2, 400, 11, 21));
+        assert!(!clicks.completed(2, 500_000_401, 11, 21));
+        assert!(!clicks.completed(2, 400, 11, 21));
+        assert!(!clicks.completed(2, 500, i64::MIN, i64::MAX));
+        clicks.cancel();
+        assert!(!clicks.completed(2, 600, i64::MIN, i64::MAX));
     }
 }

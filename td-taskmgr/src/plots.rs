@@ -406,6 +406,7 @@ mod tests {
         let budget = Budget::new(crate::budget::LIMIT).unwrap();
         let mut model = Model::new(&budget, Interval::Second).unwrap();
         let rows = [1, 2].map(|pid| Observed {
+            cpu_time_ms: None,
             input: Input {
                 key: ProcessKey {
                     generation: 1,
@@ -472,6 +473,7 @@ mod tests {
         let budget = Budget::new(crate::budget::LIMIT).unwrap();
         let mut model = Model::new(&budget, Interval::Second).unwrap();
         let rows = [Some(2500), None].map(|cpu| Observed {
+            cpu_time_ms: None,
             input: Input {
                 key: ProcessKey {
                     generation: 1,

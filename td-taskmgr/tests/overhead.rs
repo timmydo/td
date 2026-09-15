@@ -10,6 +10,7 @@ fn synthetic_population_model_overhead() {
     let store = IdentityStore::new(&budget).unwrap();
     let rows = (1..=32768)
         .map(|pid| Observed {
+            cpu_time_ms: None,
             input: Input {
                 key: ProcessKey {
                     generation: 1,

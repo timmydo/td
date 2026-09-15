@@ -4,6 +4,7 @@ use td_taskmgr::hierarchy::{Input, ProcessKey};
 use td_taskmgr::snapshot::{IdentityStore, Observed, Snapshot};
 fn row(pid: u32, parent: u32, name: &str) -> Observed<'_> {
     Observed {
+        cpu_time_ms: None,
         input: Input {
             key: ProcessKey {
                 generation: 1,

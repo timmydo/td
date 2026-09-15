@@ -1297,6 +1297,18 @@ clamp/fallback restoration, stationary/returning clicks, invalid inputs
 and focused/partial repaint pixel oracles on both axes that leave child
 pixels untouched.
 
+## Completed double clicks
+
+`pointer::DoubleClick<I>` pairs completed semantic clicks on the same opaque
+identity within 500 milliseconds and four logical pixels per axis. The
+caller supplies monotonic nanoseconds and logical coordinates; the helper
+reads no clock and allocates nothing. Backward time, excessive delay,
+distance or a different identity starts a new candidate. A completed pair
+is consumed, so a third click cannot reuse it. The caller cancels on other
+input or geometry/focus changes and remains responsible for matching each
+individual press/release against its captured target. Tests cover identity,
+time, coordinate extremes, explicit cancellation and consumed pairs.
+
 ## Shared tree table
 
 `tree_table::Model` captures a validated visible preorder over opaque

@@ -57,6 +57,23 @@ impl<const N: usize> Text<N> {
         }
         this
     }
+    pub fn cpu_time(value: Option<u64>) -> Self {
+        let mut this = Self::default();
+        if let Some(ms) = value {
+            let seconds = ms / 1000;
+            let _ = write!(
+                this,
+                "{}:{:02}:{:02}.{:03}",
+                seconds / 3600,
+                seconds / 60 % 60,
+                seconds % 60,
+                ms % 1000
+            );
+        } else {
+            let _ = this.write_str("Unavailable");
+        }
+        this
+    }
     pub fn percent(value: Option<u64>, partial: bool) -> Self {
         let mut this = Self::default();
         match value {

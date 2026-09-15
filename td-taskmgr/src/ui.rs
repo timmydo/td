@@ -82,6 +82,14 @@ pub struct State {
     dirty: bool,
     refresh_pending: bool,
     group_selected: bool,
+    detail: Option<crate::hierarchy::ProcessKey>,
+    browse_selection: Option<crate::hierarchy::ProcessKey>,
+    browse_search: Option<Search>,
+    browse_anchor: Option<Key>,
+    browse_graph_first: usize,
+    detail_expansion: Expansion,
+    detail_name: Text<256>,
+    clicks: td_ui::pointer::DoubleClick<crate::hierarchy::ProcessKey>,
     keyboard_focus: bool,
     selection_refresh: bool,
     _charge: Charge,
@@ -199,6 +207,14 @@ impl State {
             dirty: true,
             refresh_pending: false,
             group_selected: false,
+            detail: None,
+            browse_selection: None,
+            browse_search: None,
+            browse_anchor: None,
+            browse_graph_first: 0,
+            detail_expansion: Expansion::new(budget).map_err(error)?,
+            detail_name: Text::default(),
+            clicks: td_ui::pointer::DoubleClick::default(),
             keyboard_focus: true,
             selection_refresh: false,
             _charge: budget.charge(std::mem::size_of::<Self>()).map_err(error)?,
@@ -309,6 +325,7 @@ impl State {
     }
     pub fn cancel_gesture(&mut self) {
         self.actions.cancel_gesture();
+        self.clicks.cancel();
         self.dirty = true;
         self.held = false;
         self.armed = None;
@@ -351,7 +368,10 @@ impl State {
     }
     fn set_focus(&mut self, focus: Focus) {
         self.focus = focus;
-        if matches!(self.tab, 3 | 4) && matches!(focus, Focus::Devices | Focus::Graph) {
+        if self.detail.is_none()
+            && matches!(self.tab, 3 | 4)
+            && matches!(focus, Focus::Devices | Focus::Graph)
+        {
             let first = usize::from(focus == Focus::Devices);
             if !self
                 .slots()
@@ -441,6 +461,9 @@ impl State {
         }
     }
     fn card_count(&self) -> usize {
+        if self.detail.is_some() {
+            return 2;
+        }
         match self.tab {
             0 => 4,
             1 => {
@@ -457,6 +480,9 @@ impl State {
         }
     }
     fn kind(&self, index: usize) -> Option<Kind> {
+        if self.detail.is_some() {
+            return [Kind::ProcessCpu, Kind::ProcessRss].get(index).copied();
+        }
         match self.tab {
             0 => [Kind::Cpu, Kind::Memory, Kind::Network, Kind::Disk]
                 .get(index)
@@ -485,9 +511,16 @@ impl State {
             return slots;
         };
         let s = self.surface.scale.value() as u32;
-        let area = below(layout.first, 24 * s);
+        let area = below(
+            layout.first,
+            if self.detail.is_some() {
+                48 * s
+            } else {
+                24 * s
+            },
+        );
         let columns = if area.width >= 1024 * s { 2 } else { 1 };
-        let rows = if self.tab == 0 {
+        let rows = if self.tab == 0 && self.detail.is_none() {
             (area.height / (176 * s)).clamp(1, 2)
         } else {
             1
@@ -560,6 +593,8 @@ impl State {
         // Release replaced plots before charging the next visible working set.
         self.graphs.clear();
         self.expansion.retain_snapshot(&sample.value.processes);
+        self.detail_expansion
+            .retain_snapshot(&sample.value.processes);
         if let Some(devices) = &sample.value.devices {
             self.devices.initialize(devices)?;
         }
@@ -568,10 +603,15 @@ impl State {
             let input = crate::view::Inputs {
                 sample: sample.id,
                 snapshot: &sample.value.processes,
-                sort: self.sort,
+                sort: self.view_sort(),
                 query: self.search.text(),
                 selected: self.model.selected(),
-                expansion: &self.expansion,
+                expansion: if self.detail.is_some() {
+                    &self.detail_expansion
+                } else {
+                    &self.expansion
+                },
+                root: self.detail,
             };
             if let Some(view) = &mut self.view {
                 if rebuild_tree || view.sample != sample.id {
@@ -611,7 +651,7 @@ impl State {
                 &self.budget,
                 self.model.history(),
                 kind,
-                self.model.selected(),
+                self.detail.or(self.model.selected()),
                 colors,
                 &self.devices,
             )?;
@@ -621,7 +661,10 @@ impl State {
                 .find(|(previous_kind, _)| *previous_kind == kind)
                 .and_then(|(_, series)| *series);
             let preferred = if matches!(kind, Kind::ProcessCpu | Kind::ProcessRss) {
-                self.model.selected().map(Id::Process).or(previous)
+                self.detail
+                    .or(self.model.selected())
+                    .map(Id::Process)
+                    .or(previous)
             } else {
                 previous
             };
@@ -651,6 +694,7 @@ impl State {
         Ok(())
     }
     fn choose_tab(&mut self, index: usize) {
+        self.close_detail();
         self.ranking = None;
         if index < TABS.len() {
             self.tab = index;
@@ -676,7 +720,196 @@ impl State {
         self.refresh(true);
         self.dirty = true;
     }
+    fn view_sort(&self) -> Sort {
+        if self.detail.is_some() {
+            Sort::default()
+        } else {
+            self.sort
+        }
+    }
+    fn open_detail(&mut self, key: crate::hierarchy::ProcessKey) {
+        self.cancel_gesture();
+        if self.detail.is_none() {
+            self.browse_selection = self.model.selected();
+            self.browse_search = Some(std::mem::take(&mut self.search));
+            self.browse_anchor = self
+                .view
+                .as_ref()
+                .and_then(|view| view.table.first_anchor());
+            self.browse_graph_first = self.graph_first;
+        }
+        self.detail = Some(key);
+        self.detail_expansion.clear();
+        self.set_focus(Focus::Tree);
+        self.model.select(key);
+        self.group_selected = false;
+        self.graph_first = 0;
+        self.ranking = None;
+        self.detail_name = Text::new("No longer observed");
+        if let Some(snapshot) = self
+            .model
+            .history()
+            .selected()
+            .map(|sample| &sample.value.processes)
+        {
+            if let Ok(index) = snapshot.processes().binary_search_by_key(&key, |p| p.key) {
+                if let Ok(name) = snapshot.with_identities(|names| {
+                    Text::truncated(
+                        names
+                            .get(index)
+                            .map(|name| name.name())
+                            .unwrap_or("Process"),
+                    )
+                }) {
+                    self.detail_name = name;
+                }
+            }
+        }
+        self.refresh(true);
+    }
+    fn close_detail(&mut self) {
+        if self.detail.take().is_none() {
+            return;
+        }
+        self.cancel_gesture();
+        self.graph_first = self.browse_graph_first;
+        if let Some(search) = self.browse_search.take() {
+            self.search = search;
+        }
+        if let Some(key) = self.browse_selection.take() {
+            if !self.model.select(key) {
+                self.model.clear_selection();
+            }
+        } else {
+            self.model.clear_selection();
+        }
+        self.refresh(true);
+        if let Some(view) = &mut self.view {
+            if let Some(at) = self.browse_anchor.take().and_then(|key| {
+                view.table
+                    .model()
+                    .rows()
+                    .iter()
+                    .position(|row| row.id == key)
+            }) {
+                view.table.event(tree::Event::Scroll {
+                    rows: i64::MIN + 1,
+                    columns: 0,
+                });
+                view.table.event(tree::Event::Scroll {
+                    rows: at as i64,
+                    columns: 0,
+                });
+            }
+        }
+    }
+    fn detail_parent(&self) -> Option<crate::hierarchy::ProcessKey> {
+        let key = self.detail?;
+        let snapshot = &self.model.history().selected()?.value.processes;
+        let index = snapshot
+            .processes()
+            .binary_search_by_key(&key, |p| p.key)
+            .ok()?;
+        snapshot
+            .ancestry()
+            .get(index)?
+            .parent
+            .and_then(|parent| snapshot.processes().get(parent))
+            .map(|p| p.key)
+    }
+    fn parent_rect(&self) -> Option<Rect> {
+        self.detail?;
+        let first = self.split.layout()?.first;
+        let s = self.surface.scale.value() as u32;
+        let width = first.width.min(224 * s);
+        Some(Rect {
+            x: first.x + i64::from(first.width - width),
+            y: first.y + i64::from(24 * s),
+            width,
+            height: (24 * s).min(first.height.saturating_sub(24 * s)),
+        })
+    }
+    fn emit_detail_summary(&self, rect: Rect, damage: Rect, sink: &mut dyn FnMut(Draw)) {
+        let Some(key) = self.detail else { return };
+        let process = self.model.history().selected().and_then(|sample| {
+            sample
+                .value
+                .processes
+                .processes()
+                .binary_search_by_key(&key, |p| p.key)
+                .ok()
+                .and_then(|index| sample.value.processes.processes().get(index))
+        });
+        let mut line = Text::<256>::new("No longer observed in this snapshot");
+        if let Some(p) = process {
+            line = Text::new("CPU time: ");
+            let _ = write!(
+                line,
+                "{} | CPU {} | RSS {}",
+                Text::<32>::cpu_time(p.cpu_time_ms).as_str(),
+                Text::<32>::percent(p.cpu, false).as_str(),
+                Text::<32>::bytes(p.rss, false).as_str()
+            );
+        }
+        if let Some(parent_rect) = self.parent_rect() {
+            label(
+                self.surface,
+                Rect {
+                    y: parent_rect.y,
+                    height: parent_rect.height,
+                    width: rect.width.saturating_sub(parent_rect.width),
+                    ..rect
+                },
+                line.as_str(),
+                false,
+                damage,
+                sink,
+            );
+            if let Some(parent) = self.detail_parent() {
+                let mut title = Text::<32>::new("Parent: ");
+                let _ = write!(title, "{} (M-Up)", parent.pid);
+                button(
+                    self.surface,
+                    parent_rect,
+                    title.as_str(),
+                    false,
+                    damage,
+                    sink,
+                );
+            } else {
+                label(
+                    self.surface,
+                    parent_rect,
+                    "Parent unavailable",
+                    false,
+                    damage,
+                    sink,
+                );
+            }
+        }
+    }
+    fn pointer_tree_outcome(&mut self, outcome: tree::Outcome<Key>, phase: Phase, x: i64, y: i64) {
+        let open = if let (Phase::Release, tree::Outcome::Selected(Key::Process(key))) =
+            (phase, outcome)
+        {
+            let scale = self.surface.scale.value() as i64;
+            // The UI tick clock has approximately 50 ms resolution.
+            self.clicks
+                .completed(key, self.now_ns, x.div_euclid(scale), y.div_euclid(scale))
+                .then_some(key)
+        } else {
+            if phase == Phase::Release {
+                self.clicks.cancel();
+            }
+            None
+        };
+        self.tree_outcome(outcome);
+        if let Some(key) = open {
+            self.open_detail(key);
+        }
+    }
     fn all_processes(&mut self) {
+        self.close_detail();
         self.cancel_gesture();
         self.ranking = None;
         self.group_selected = false;
@@ -713,14 +946,22 @@ impl State {
                 self.refresh(!self.held && !self.search.text().is_empty());
             }
             tree::Outcome::Disclosure { id, expanded } => {
-                if let Err(e) = self.expansion.set(id, expanded) {
+                let expansion = if self.detail.is_some() {
+                    &mut self.detail_expansion
+                } else {
+                    &mut self.expansion
+                };
+                if let Err(e) = expansion.set(id, expanded) {
                     self.note(&e.to_string());
                 }
                 self.refresh(true);
             }
             tree::Outcome::Sort(column) => {
                 if let Some(column) = crate::view::column(column) {
-                    self.sort.click(column);
+                    let mut sort = self.view_sort();
+                    sort.click(column);
+                    self.close_detail();
+                    self.sort = sort;
                     self.refresh(true);
                     if let Some(view) = &mut self.view {
                         view.table.event(tree::Event::Scroll {
@@ -730,7 +971,7 @@ impl State {
                     }
                 }
             }
-            tree::Outcome::Activate(_) => self.process_menu(None),
+            tree::Outcome::Activate(Key::Process(key)) => self.open_detail(key),
             _ => {}
         }
         self.dirty = true;
@@ -766,7 +1007,12 @@ impl State {
                     if self.model.select_contributor(selection.at, key) {
                         self.group_selected = false;
                         if let Some(sample) = self.model.history().selected() {
-                            self.expansion.reveal(&sample.value.processes, key);
+                            let expansion = if self.detail.is_some() {
+                                &mut self.detail_expansion
+                            } else {
+                                &mut self.expansion
+                            };
+                            expansion.reveal(&sample.value.processes, key);
                         }
                         self.refresh(true);
                     } else {
@@ -777,7 +1023,8 @@ impl State {
                 }
                 _ => {
                     self.model.inspect(selection.at);
-                    if matches!(selection.series, None | Some(Id::Other))
+                    if self.detail.is_none()
+                        && matches!(selection.series, None | Some(Id::Other))
                         && matches!(
                             kind,
                             Kind::Cpu | Kind::Memory | Kind::ProcessCpu | Kind::ProcessRss
@@ -1053,6 +1300,7 @@ impl State {
         }
     }
     pub fn key(&mut self, key: &str, repeated: bool) -> Outcome {
+        self.clicks.cancel();
         let key = if key == " " { "Space" } else { key };
         if self.actions.key(key, repeated) {
             self.action_note();
@@ -1071,6 +1319,12 @@ impl State {
             self.actions.cancel();
             return Outcome::Quit;
         }
+        if key == "M-Up" && self.detail.is_some() && !repeated {
+            if let Some(parent) = self.detail_parent() {
+                self.open_detail(parent);
+            }
+            return Outcome::Changed;
+        }
         if key == "C-f" {
             self.set_focus(Focus::Search);
             return Outcome::Changed;
@@ -1081,12 +1335,13 @@ impl State {
                 self.dirty = true;
                 return Outcome::Changed;
             }
+            self.close_detail();
             self.cancel_gesture();
             self.set_focus(Focus::Tree);
             return Outcome::Changed;
         }
         if matches!(key, "Tab" | "S-Tab") {
-            let focuses: &[Focus] = if matches!(self.tab, 3 | 4) {
+            let focuses: &[Focus] = if self.detail.is_none() && matches!(self.tab, 3 | 4) {
                 &[
                     Focus::Tabs,
                     Focus::Graph,
@@ -1297,6 +1552,7 @@ impl State {
         self.dirty = true;
     }
     pub fn scroll(&mut self, x: i64, y: i64, rows: i64, columns: i64) -> Outcome {
+        self.clicks.cancel();
         if self.actions.scroll(x, y, rows) {
             self.action_note();
             self.dirty = true;
@@ -1352,6 +1608,14 @@ impl State {
         }
     }
     pub fn pointer(&mut self, phase: Phase, x: i64, y: i64) -> Outcome {
+        if phase == Phase::Press
+            && !self
+                .view
+                .as_ref()
+                .is_some_and(|view| matches!(view.table.target(x, y), Some(tree::Target::Row(_))))
+        {
+            self.clicks.cancel();
+        }
         let outcome = self.pointer_inner(phase, x, y);
         self.flush_selection();
         outcome
@@ -1408,7 +1672,7 @@ impl State {
                     tree::Event::Release { x, y }
                 };
                 let outcome = view.table.event(event);
-                self.tree_outcome(outcome);
+                self.pointer_tree_outcome(outcome, phase, x, y);
                 return Outcome::Changed;
             }
         }
@@ -1466,7 +1730,16 @@ impl State {
                     self.choose_tab(index);
                     return Outcome::Changed;
                 }
-                for index in 0..3 {
+                if self
+                    .parent_rect()
+                    .is_some_and(|rect| rect.contains(px, py) && rect.contains(x, y))
+                {
+                    if let Some(parent) = self.detail_parent() {
+                        self.open_detail(parent);
+                    }
+                    return Outcome::Changed;
+                }
+                for index in 0..4 {
                     if self.toolbar(index).contains(px, py) && self.toolbar(index).contains(x, y) {
                         if index == 0 {
                             self.live();
@@ -1475,7 +1748,13 @@ impl State {
                         if index == 1 {
                             return self.interval();
                         }
-                        self.all_processes();
+                        if index == 2 {
+                            self.all_processes();
+                        } else if self.detail.is_some() {
+                            self.close_detail();
+                        } else if let Some(key) = self.model.selected() {
+                            self.open_detail(key);
+                        }
                         return Outcome::Changed;
                     }
                 }
@@ -1544,7 +1823,7 @@ impl State {
             };
             let outcome = view.table.event(event);
             if outcome != tree::Outcome::Ignored {
-                self.tree_outcome(outcome);
+                self.pointer_tree_outcome(outcome, phase, x, y);
                 return Outcome::Changed;
             }
         }
@@ -1667,6 +1946,19 @@ impl State {
             damage,
             sink,
         );
+        if let Some(action) = chrome::Button::new(surface, self.toolbar(3)) {
+            action.emit(
+                if self.detail.is_some() {
+                    "Back (Esc)"
+                } else {
+                    "Details (Enter)"
+                },
+                false,
+                self.detail.is_some() || self.model.selected().is_some(),
+                damage,
+                sink,
+            );
+        }
         if let Some(layout) = self.split.layout() {
             let mut title = Text::<128>::new("Resource history");
             let _ = write!(
@@ -1675,6 +1967,16 @@ impl State {
                 self.graph_first + 1,
                 self.card_count()
             );
+            if let Some(key) = self.detail {
+                title = Text::new("Details: ");
+                let _ = write!(
+                    title,
+                    "{} [{}] | PgUp/PgDn: CPU / RSS",
+                    Text::<60>::truncated(self.detail_name.as_str()).as_str(),
+                    key.pid
+                );
+                self.emit_detail_summary(layout.first, damage, sink);
+            }
             label(
                 surface,
                 Rect {
@@ -1692,7 +1994,9 @@ impl State {
             for graph in self.graphs.iter().filter(|_| self.ranking.is_none()) {
                 let mut title = Text::<128>::new(graph.plot.kind.title());
                 if matches!(graph.plot.kind, Kind::ProcessCpu | Kind::ProcessRss) {
-                    let _ = title.write_str(if self.model.selected().is_some() {
+                    let _ = title.write_str(if self.detail.is_some() {
+                        " | Detail process"
+                    } else if self.model.selected().is_some() {
                         " | Selected process"
                     } else {
                         " | Top processes"
@@ -1796,7 +2100,11 @@ impl State {
                 entry.emit(
                     chrome::Field {
                         text: self.search.text(),
-                        placeholder: "Search processes (name, PID, UID)",
+                        placeholder: if self.detail.is_some() {
+                            "Search this subtree (name, PID, UID)"
+                        } else {
+                            "Search processes (name, PID, UID)"
+                        },
                         caret,
                         anchor: self.search.anchor(),
                         first,
@@ -1817,7 +2125,7 @@ impl State {
                     .find(|sample| sample.id == view.sample)
                 {
                     if view
-                        .paint(&sample.value.processes, self.sort, damage, sink)
+                        .paint(&sample.value.processes, self.view_sort(), damage, sink)
                         .is_err()
                     {
                         label(
@@ -1841,7 +2149,9 @@ impl State {
                 sink,
             );
         }
-        let mut status = Text::<1024>::new(if self.sort.flat() {
+        let mut status = Text::<1024>::new(if self.detail.is_some() {
+            "PROCESS DETAILS | "
+        } else if self.sort.flat() {
             "RANKED LIST | "
         } else {
             "PROCESS TREE | "
@@ -1850,13 +2160,14 @@ impl State {
             let age = self.now_ns.saturating_sub(sample.time_ns) / 1_000_000_000;
             let _ = write!(
                 status,
-                "{} | age {}s | {} processes{} | history {}s",
+                "{} | age {}s | {} shown / {} observed{} | history {}s",
                 if self.model.historical() {
                     "INSPECTING"
                 } else {
                     "LIVE"
                 },
                 age,
+                self.visible(),
                 sample.value.processes.processes().len(),
                 if sample.value.coverage.partial() {
                     " (partial, totals marked *)"
@@ -2118,7 +2429,11 @@ impl State {
             Some(Key::Unavailable) => "group".into(),
             None => "none".into(),
         };
-        format!("tab={}\tfocus={:?}\tquery={}\tselected={}\tlive={}\tinspected_ns={}\tnewest_ns={}\trows={}\tretained={}\tmodel_bytes={}\tactions={}",TABS.get(self.tab).copied().unwrap_or(""),self.focus,td_ui::control::hex(self.search.text().as_bytes()),selected,!self.model.historical(),self.model.history().selected().map(|s|s.time_ns).unwrap_or(0),self.model.history().samples().last().map(|s|s.time_ns).unwrap_or(0),self.visible(),self.model.history().samples().len(),self.budget.used(),self.actions.stage())
+        let detail = self
+            .detail
+            .map(|key| format!("{}:{}:{}", key.generation, key.pid, key.start_ticks))
+            .unwrap_or_else(|| "none".into());
+        format!("tab={}\tfocus={:?}\tquery={}\tselected={}\tlive={}\tinspected_ns={}\tnewest_ns={}\trows={}\tretained={}\tmodel_bytes={}\tactions={}\tdetail={}",TABS.get(self.tab).copied().unwrap_or(""),self.focus,td_ui::control::hex(self.search.text().as_bytes()),selected,!self.model.historical(),self.model.history().selected().map(|s|s.time_ns).unwrap_or(0),self.model.history().samples().last().map(|s|s.time_ns).unwrap_or(0),self.visible(),self.model.history().samples().len(),self.budget.used(),self.actions.stage(),detail)
     }
 }
 
@@ -2138,6 +2453,7 @@ mod tests {
     }
     fn rows() -> [Observed<'static>; 3] {
         std::array::from_fn(|index| Observed {
+            cpu_time_ms: None,
             input: Input {
                 key: key(index as u32 + 1),
                 parent_pid: Some(if index == 0 { 0 } else { 1 }),
@@ -2162,6 +2478,154 @@ mod tests {
             },
             at,
         );
+    }
+    #[test]
+    fn detail_keeps_scope_history_and_restores_browse_search_and_expansion() {
+        let budget = Budget::new(crate::budget::LIMIT).unwrap();
+        let mut state = State::new(
+            &budget,
+            Surface::new(1280, 960, Default::default()).unwrap(),
+        )
+        .unwrap();
+        let mut data = rows();
+        data.get_mut(1).unwrap().cpu_time_ms = Some(3_661_234);
+        state.update(
+            Update {
+                batch: Some(Batch::fixture(&budget, 1_000_000_000, &data)),
+                skipped: 0,
+                failure: None,
+            },
+            1_000_000_000,
+        );
+        state.choose_tab(1);
+        for ch in ["w", "o", "r", "k"] {
+            state.search.key(ch);
+        }
+        state.refresh(true);
+        state.tree_outcome(tree::Outcome::Selected(Key::Process(key(2))));
+        state.open_detail(key(2));
+        assert_eq!(state.detail, Some(key(2)));
+        assert!(state.search.text().is_empty());
+        assert_eq!(state.visible(), 1);
+        assert_eq!(state.kind(0), Some(Kind::ProcessCpu));
+        assert_eq!(state.kind(1), Some(Kind::ProcessRss));
+        let (_, _, text) = td_ui::driven::text(&state).unwrap();
+        assert!(text.contains("1:01:01.234"), "{text}");
+        state.key("M-Up", false);
+        assert_eq!(state.detail, Some(key(1)));
+        assert_eq!(state.visible(), 3);
+        state.tree_outcome(tree::Outcome::Disclosure {
+            id: Key::Process(key(1)),
+            expanded: false,
+        });
+        assert_eq!(state.visible(), 1);
+        assert!(state.expansion.expanded(Key::Process(key(1))));
+        state.key("Escape", false);
+        assert!(state.detail.is_none());
+        assert_eq!(state.search.text(), "work");
+        assert_eq!(state.model.selected(), Some(key(2)));
+        assert!(state.expansion.expanded(Key::Process(key(1))));
+    }
+    #[test]
+    fn detail_back_clears_an_absent_browse_selection() {
+        let budget = Budget::new(crate::budget::LIMIT).unwrap();
+        let mut state = State::new(
+            &budget,
+            Surface::new(1280, 960, Default::default()).unwrap(),
+        )
+        .unwrap();
+        observation(&mut state, &budget, 1_000_000_000);
+        state.tree_outcome(tree::Outcome::Selected(Key::Process(key(2))));
+        state.open_detail(key(1));
+        state.tree_outcome(tree::Outcome::Selected(Key::Process(key(3))));
+        let data = rows();
+        state.update(
+            Update {
+                batch: Some(Batch::fixture(&budget, 2_000_000_000, &[data[0], data[2]])),
+                skipped: 0,
+                failure: None,
+            },
+            2_000_000_000,
+        );
+        state.close_detail();
+        assert!(state.model.selected().is_none());
+    }
+    #[test]
+    fn detail_open_retires_divider_focus() {
+        let budget = Budget::new(crate::budget::LIMIT).unwrap();
+        let mut state = State::new(
+            &budget,
+            Surface::new(1280, 960, Default::default()).unwrap(),
+        )
+        .unwrap();
+        observation(&mut state, &budget, 1_000_000_000);
+        state.set_focus(Focus::Divider);
+        assert!(state.split.focused());
+        state.open_detail(key(1));
+        assert_eq!(state.focus, Focus::Tree);
+        assert!(!state.split.focused());
+    }
+    #[test]
+    fn detail_heading_toggles_the_visible_sort() {
+        let budget = Budget::new(crate::budget::LIMIT).unwrap();
+        let mut state = State::new(
+            &budget,
+            Surface::new(1280, 960, Default::default()).unwrap(),
+        )
+        .unwrap();
+        observation(&mut state, &budget, 1_000_000_000);
+        state.sort.click(crate::projection::Column::Pid);
+        assert!(state.sort.descending);
+        state.open_detail(key(1));
+        assert!(!state.view_sort().descending);
+        state.tree_outcome(tree::Outcome::Sort(1));
+        assert!(state.detail.is_none());
+        assert!(state.sort.descending);
+    }
+    #[test]
+    fn double_click_opens_only_the_completed_row_and_reused_pid_stays_absent() {
+        let budget = Budget::new(crate::budget::LIMIT).unwrap();
+        let mut state = State::new(
+            &budget,
+            Surface::new(1280, 960, Default::default()).unwrap(),
+        )
+        .unwrap();
+        observation(&mut state, &budget, 1_000_000_000);
+        let rect = state
+            .view
+            .as_ref()
+            .unwrap()
+            .table
+            .geometry()
+            .unwrap()
+            .row(1)
+            .unwrap();
+        for _ in 0..2 {
+            state.pointer(Phase::Press, 120, rect.y + 5);
+            state.pointer(Phase::Release, 120, rect.y + 5);
+            state.now_ns += 100_000_000;
+        }
+        assert_eq!(state.detail, Some(key(2)));
+        assert_eq!(state.visible(), 1);
+        let mut data = rows();
+        data.get_mut(1).unwrap().input.key.start_ticks += 1;
+        state.update(
+            Update {
+                batch: Some(Batch::fixture(&budget, 2_000_000_000, &data)),
+                skipped: 0,
+                failure: None,
+            },
+            2_000_000_000,
+        );
+        assert_eq!(state.detail, Some(key(2)));
+        assert_eq!(state.visible(), 0);
+        let (_, _, text) = td_ui::driven::text(&state).unwrap();
+        assert!(text.contains("No longer observed"));
+        assert!(state.model.inspect(1_000_000_000));
+        state.refresh(true);
+        assert_eq!(state.visible(), 1);
+        state.process_menu(None);
+        assert_ne!(state.actions.stage(), "confirm");
     }
     #[test]
     fn sorting_reveals_highest_and_compare_button_clears_the_plot_filter() {

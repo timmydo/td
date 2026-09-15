@@ -17,6 +17,7 @@ fn actual_procfs_collection_observes_self_and_retains_names_with_one_budget() {
         .unwrap();
     assert_eq!(own.input.key.generation, 7);
     assert_eq!(own.input.cpu, None);
+    let first_cpu_time = own.cpu_time_ms.unwrap();
     assert!(own.input.rss.is_some());
     assert!(first.name(own).is_some());
     assert!(!first.cpus.is_empty());
@@ -25,6 +26,15 @@ fn actual_procfs_collection_observes_self_and_retains_names_with_one_budget() {
     let own_key = own.input.key;
     let snapshot = first.snapshot(&store).unwrap();
     assert_eq!(snapshot.processes().len(), first.processes.len());
+    assert_eq!(
+        snapshot
+            .processes()
+            .iter()
+            .find(|row| row.key == own_key)
+            .unwrap()
+            .cpu_time_ms,
+        Some(first_cpu_time)
+    );
     drop(first);
     std::thread::sleep(std::time::Duration::from_millis(20));
     let second = collector.sample(&cancel).unwrap();
@@ -34,6 +44,7 @@ fn actual_procfs_collection_observes_self_and_retains_names_with_one_budget() {
         .find(|row| row.input.key == own_key)
         .unwrap();
     assert!(own.input.cpu.is_some());
+    assert!(own.cpu_time_ms.unwrap() >= first_cpu_time);
     assert!(second.cpu.is_some());
     drop(second);
     drop(snapshot);

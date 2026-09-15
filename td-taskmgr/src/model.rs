@@ -190,6 +190,7 @@ mod tests {
     use crate::snapshot::Observed;
     fn row(pid: u32) -> Observed<'static> {
         Observed {
+            cpu_time_ms: None,
             input: Input {
                 key: ProcessKey {
                     generation: 1,

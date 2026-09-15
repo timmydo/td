@@ -175,6 +175,17 @@ impl Cpu {
         })
     }
 }
+/// Cumulative process user plus kernel time, excluding waited-for children.
+pub fn cpu_time_ms(
+    user_ticks: Option<u64>,
+    system_ticks: Option<u64>,
+    ticks_per_second: u64,
+) -> Option<u64> {
+    let ticks = u128::from(user_ticks?) + u128::from(system_ticks?);
+    let millis = (ticks * 1000).checked_div(u128::from(ticks_per_second))?;
+    u64::try_from(millis).ok()
+}
+
 /// Basis points of one logical CPU; elapsed nanoseconds and runtime ticks/sec.
 pub fn process_cpu(
     next: Process<'_>,

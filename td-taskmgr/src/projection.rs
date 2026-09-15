@@ -17,6 +17,7 @@ pub enum Column {
     Uid,
     State,
     Cpu,
+    CpuTime,
     Rss,
     TreeCpu,
     TreeRss,
@@ -38,7 +39,7 @@ impl Sort {
     pub fn flat(self) -> bool {
         matches!(
             self.column,
-            Column::Cpu | Column::Rss | Column::TreeCpu | Column::TreeRss
+            Column::Cpu | Column::CpuTime | Column::Rss | Column::TreeCpu | Column::TreeRss
         )
     }
     pub fn click(&mut self, column: Column) {
@@ -104,6 +105,9 @@ impl Expansion {
         Ok(Self {
             collapsed: MemoryVec::new(budget, 64)?,
         })
+    }
+    pub fn clear(&mut self) {
+        self.collapsed.clear();
     }
     pub fn expanded(&self, key: Key) -> bool {
         self.collapsed.binary_search(&key).is_err()
@@ -176,6 +180,7 @@ fn compare(snapshot: &Snapshot, names: &Names<'_>, a: usize, b: usize, sort: Sor
         Column::Uid => a_row.uid.cmp(&b_row.uid),
         Column::State => a_row.state.cmp(&b_row.state),
         Column::Cpu => a_row.cpu.cmp(&b_row.cpu),
+        Column::CpuTime => a_row.cpu_time_ms.cmp(&b_row.cpu_time_ms),
         Column::Rss => a_row.rss.cmp(&b_row.rss),
         Column::TreeCpu => snapshot
             .ancestry()
@@ -223,7 +228,10 @@ fn matches_query(snapshot: &Snapshot, names: &Names<'_>, index: usize, query: &s
                 || p.uid.is_some_and(|uid| decimal_contains(uid, query))
         })
 }
-fn parent(snapshot: &Snapshot, index: usize) -> Option<usize> {
+fn parent(snapshot: &Snapshot, index: usize, root: Option<usize>) -> Option<usize> {
+    if root == Some(index) {
+        return None;
+    }
     let node = snapshot.ancestry().get(index)?;
     node.parent
         .or_else(|| (node.issue != ParentIssue::None).then_some(snapshot.processes().len()))
@@ -244,12 +252,25 @@ impl Projection {
         selected: Option<ProcessKey>,
         expansion: &Expansion,
     ) -> Result<Self, Error> {
+        Self::for_root(budget, snapshot, sort, query, selected, expansion, None)
+    }
+    pub fn for_root(
+        budget: &Arc<Budget>,
+        snapshot: &Snapshot,
+        sort: Sort,
+        query: &str,
+        selected: Option<ProcessKey>,
+        expansion: &Expansion,
+        root: Option<ProcessKey>,
+    ) -> Result<Self, Error> {
         if query.len() > 256 {
             return Err(Error::Invalid);
         }
         snapshot
             .with_identities(|names| {
-                Self::build(budget, snapshot, sort, query, selected, expansion, &names)
+                Self::build(
+                    budget, snapshot, sort, query, selected, expansion, root, &names,
+                )
             })
             .map_err(|_| Error::Names)?
     }
@@ -261,11 +282,23 @@ impl Projection {
         query: &str,
         selected: Option<ProcessKey>,
         expansion: &Expansion,
+        root: Option<ProcessKey>,
         names: &Names<'_>,
     ) -> Result<Self, Error> {
+        let root_index = root.and_then(|key| {
+            snapshot
+                .processes()
+                .binary_search_by_key(&key, |p| p.key)
+                .ok()
+        });
+        if root.is_some() && root_index.is_none() {
+            return Ok(Self {
+                rows: MemoryVec::new(budget, 0)?,
+            });
+        }
         let count = snapshot.processes().len();
         let mut order = MemoryVec::new(budget, count + 1)?;
-        if sort.flat() {
+        if sort.flat() && root.is_none() {
             let mut rows = MemoryVec::new(budget, count)?;
             for (index, process) in snapshot.processes().iter().enumerate() {
                 let matching = matches_query(snapshot, names, index, query);
@@ -300,8 +333,23 @@ impl Projection {
         let mut kept = filled(budget, count + 1, false)?;
         let mut exceptions = filled(budget, count + 1, false)?;
         for (index, process) in snapshot.processes().iter().enumerate() {
+            if let Some(root) = root_index {
+                let mut ancestor = Some(index);
+                let mut included = false;
+                for _ in 0..=DEPTH {
+                    let Some(at) = ancestor else { break };
+                    if at == root {
+                        included = true;
+                        break;
+                    }
+                    ancestor = snapshot.ancestry().get(at).and_then(|node| node.parent);
+                }
+                if !included {
+                    continue;
+                }
+            }
             push(&mut order, index)?;
-            synthetic |= parent(snapshot, index) == Some(count);
+            synthetic |= parent(snapshot, index, root_index) == Some(count);
             let matching = matches_query(snapshot, names, index, query);
             *matches.get_mut(index).ok_or(Error::Invalid)? = matching;
             let exception = selected == Some(process.key) && !matching;
@@ -313,7 +361,7 @@ impl Projection {
                     if exception && at == index {
                         *exceptions.get_mut(at).ok_or(Error::Invalid)? = true;
                     }
-                    ancestor = parent(snapshot, at);
+                    ancestor = parent(snapshot, at, root_index);
                 }
             }
         }
@@ -321,8 +369,8 @@ impl Projection {
             push(&mut order, count)?;
         }
         order.sort_unstable_by(|a, b| {
-            parent(snapshot, *a)
-                .cmp(&parent(snapshot, *b))
+            parent(snapshot, *a, root_index)
+                .cmp(&parent(snapshot, *b, root_index))
                 .then_with(|| {
                     if *a == count || *b == count {
                         a.cmp(b)
@@ -338,7 +386,7 @@ impl Projection {
             if !kept.get(index).copied().unwrap_or(false) {
                 continue;
             }
-            let group = parent(snapshot, index).unwrap_or(root);
+            let group = parent(snapshot, index, root_index).unwrap_or(root);
             let head = first.get_mut(group).ok_or(Error::Invalid)?;
             *next.get_mut(index).ok_or(Error::Invalid)? = *head;
             *head = Some(index);
@@ -355,7 +403,7 @@ impl Projection {
                 &mut rows,
                 Row {
                     key: id,
-                    parent: parent(snapshot, index).and_then(|p| key(snapshot, p)),
+                    parent: parent(snapshot, index, root_index).and_then(|p| key(snapshot, p)),
                     depth,
                     children: child.is_some(),
                     expanded,

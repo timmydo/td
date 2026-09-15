@@ -7,6 +7,7 @@ fn snapshot(store: &IdentityStore, values: &[(u32, Option<u64>)]) -> Snapshot {
     let rows = values
         .iter()
         .map(|(pid, cpu)| Observed {
+            cpu_time_ms: None,
             input: Input {
                 key: ProcessKey {
                     generation: 1,

@@ -6,6 +6,7 @@ use td_taskmgr::projection::{Column, Expansion, Key, Projection, Sort};
 use td_taskmgr::snapshot::{IdentityStore, Observed, Snapshot};
 fn process(pid: u32, parent: u32, name: &'static str, cpu: u64) -> Observed<'static> {
     Observed {
+        cpu_time_ms: None,
         input: Input {
             key: ProcessKey {
                 generation: 1,
@@ -244,4 +245,83 @@ fn maximum_roster_plus_synthetic_root_and_depth_remain_visible() {
     let view = Projection::new(&budget, &snapshot, Sort::default(), "", None, &expansion).unwrap();
     assert_eq!(view.rows().len(), 258);
     assert!(view.rows().iter().all(|r| r.depth <= 256));
+}
+
+#[test]
+fn process_detail_roots_the_subtree_and_excludes_siblings_and_reused_ids() {
+    let budget = Budget::new(LIMIT).unwrap();
+    let snapshot = make_snapshot(
+        &budget,
+        &[
+            process(1, 0, "root", 0),
+            process(2, 1, "child", 50),
+            process(3, 2, "grandchild", 80),
+            process(4, 1, "sibling", 100),
+        ],
+    );
+    let expansion = Expansion::new(&budget).unwrap();
+    let root = snapshot.processes()[1].key;
+    let detail = Projection::for_root(
+        &budget,
+        &snapshot,
+        Sort::default(),
+        "",
+        Some(root),
+        &expansion,
+        Some(root),
+    )
+    .unwrap();
+    assert_eq!(
+        detail.rows().iter().map(|r| r.key).collect::<Vec<_>>(),
+        vec![key(2), key(3)]
+    );
+    assert_eq!(detail.rows()[0].depth, 0);
+    assert_eq!(detail.rows()[0].parent, None);
+    assert_eq!(detail.rows()[1].parent, Some(key(2)));
+    let missing = Projection::for_root(
+        &budget,
+        &snapshot,
+        Sort::default(),
+        "",
+        None,
+        &expansion,
+        Some(ProcessKey {
+            start_ticks: 2,
+            ..root
+        }),
+    )
+    .unwrap();
+    assert!(missing.rows().is_empty());
+}
+
+#[test]
+fn cpu_time_ranks_lifetime_totals_including_collapsed_descendants() {
+    let budget = Budget::new(LIMIT).unwrap();
+    let mut rows = [
+        process(1, 0, "parent", 99),
+        process(2, 1, "child", 0),
+        process(3, 0, "unknown", 5),
+    ];
+    rows[0].cpu_time_ms = Some(10);
+    rows[1].cpu_time_ms = Some(50_000);
+    let snapshot = make_snapshot(&budget, &rows);
+    let mut expansion = Expansion::new(&budget).unwrap();
+    expansion.set(key(1), false).unwrap();
+    let view = Projection::new(
+        &budget,
+        &snapshot,
+        Sort {
+            column: Column::CpuTime,
+            descending: true,
+        },
+        "",
+        None,
+        &expansion,
+    )
+    .unwrap();
+    assert_eq!(
+        view.rows().iter().map(|row| row.key).collect::<Vec<_>>(),
+        vec![key(2), key(1), key(3)]
+    );
+    assert!(view.rows().iter().all(|row| row.depth == 0));
 }

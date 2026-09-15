@@ -37,6 +37,7 @@ impl Baseline {
 }
 #[derive(Clone, Copy, Debug)]
 pub struct Process {
+    pub cpu_time_ms: Option<u64>,
     pub input: Input,
     pub uid: Option<u32>,
     pub state: u8,
@@ -131,6 +132,7 @@ impl Batch {
                 crate::identities::Error::Invalid,
             ))?;
             rows.push(Observed {
+                cpu_time_ms: process.cpu_time_ms,
                 input: process.input,
                 uid: process.uid,
                 state: process.state,
@@ -280,6 +282,11 @@ impl Collector {
             cpu,
             rss: parsers::resident_bytes(current.rss_pages, self.units.page_size),
         };
+        let cpu_time_ms = parsers::cpu_time_ms(
+            current.user_ticks,
+            current.system_ticks,
+            self.units.ticks_per_second,
+        );
         let baseline = Baseline {
             key,
             user: current.user_ticks,
@@ -332,6 +339,7 @@ impl Collector {
         batch
             .processes
             .push(Process {
+                cpu_time_ms,
                 input,
                 uid,
                 state,
@@ -442,6 +450,7 @@ impl Batch {
                 batch
                     .processes
                     .push(Process {
+                        cpu_time_ms: row.cpu_time_ms,
                         input: row.input,
                         uid: row.uid,
                         state: row.state,

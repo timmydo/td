@@ -5,6 +5,7 @@ use crate::identities::{Identities, Identity, IdentityId, Spec};
 use std::sync::{Arc, Mutex};
 #[derive(Clone, Copy, Debug)]
 pub struct Observed<'a> {
+    pub cpu_time_ms: Option<u64>,
     pub input: Input,
     pub name: &'a str,
     pub uid: Option<u32>,
@@ -12,6 +13,7 @@ pub struct Observed<'a> {
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Process {
+    pub cpu_time_ms: Option<u64>,
     pub key: ProcessKey,
     pub cpu: Option<u64>,
     pub rss: Option<u64>,
@@ -114,6 +116,7 @@ impl Snapshot {
                 .map_err(|_| Error::Budget(BudgetError::Limit))?;
             processes
                 .push(Process {
+                    cpu_time_ms: row.cpu_time_ms,
                     key: row.input.key,
                     cpu: row.input.cpu,
                     rss: row.input.rss,
