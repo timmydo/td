@@ -6,17 +6,16 @@ lower pane across graph tabs. CPU and memory plots connect a resource spike
 to the processes observed at that time. Process actions send signals under
 the caller's existing authority.
 
-This is the version-1 target contract, not a claim that all features ship.
-The standalone collection/model crate, read-only `--sample` command and
-Wayland window and descriptor-bound process controls are implemented.
+Version 1 is implemented for standalone Wayland sessions and the td image.
+It includes the collection/model crate, read-only `--sample` command,
+Wayland window and descriptor-bound process controls.
 The td image stages the complete target output and exposes /bin/td-taskmgr.
 The authority-mode compositor launcher starts it through fixed request 07
 after dropping to the human credentials and checking the session cgroup.
 It retains the system PID view and ordinary signal permissions. Root
-AGENTS.md and DEVELOPMENT.md govern
-implementation and landing; [td-ui](../td-ui/DESIGN.md) owns the
-shared widget contracts. Each increment below must update its status and
-record its actual validation without claiming later increments are done.
+AGENTS.md and DEVELOPMENT.md govern implementation and landing;
+[td-ui](../td-ui/DESIGN.md) owns the shared widget contracts. The validation
+section records the completed delivery and the scope of its evidence.
 
 ## Scope and portability
 
@@ -474,7 +473,7 @@ and installs a static binary with the standard frame-pointer/debug-companion
 policy. Its companion check executes the realized binary's help and two
 bounded resource observations. Source edits select the local pin and target
 recipe checks; DESIGN.md remains excluded from staging and source hashes.
-Image and launcher integration must add runtime coverage in that landing.
+The image and launcher runtime coverage is recorded below.
 
 ## Implemented window
 
@@ -633,7 +632,7 @@ The implementation must demonstrate:
   plus measured collector CPU/memory overhead at idle and under a large
   synthetic process population. No unmeasured performance claim.
 
-Independently landable increments:
+Completed delivery increments:
 
 1. This design and the td-ui extension contract. Documentation only.
 2. Shared td-ui widgets, each with oracles and existing consumer regressions:
@@ -649,15 +648,14 @@ Independently landable increments:
    it is not the graphical version-1 deliverable.
 5. Live Wayland window with all five tabs, process tree and linked CPU/RSS
    history (implemented); native compositor and Guix/Weston smoke evidence.
-   Read-only until the following increment, explicitly identified as
-   incomplete version 1.
 6. Descriptor-bound process and subtree controls, reviewed unsafe surface,
    kernel tests and real menu interaction (implemented), completing the
-   standalone v1. The td delivery remains required.
+   standalone v1.
 7. td recipe and image/launcher integration with declared sibling trees,
    target debug/profile policy, runtime visibility and launch authority
-   reviewed against APPLICATIONS.md and td-compositor/DESIGN.md. Realize
-   and test the output in the image; a host binary is not target evidence.
+   reviewed against APPLICATIONS.md and td-compositor/DESIGN.md
+   (implemented). The source-built output passed the read-only deployment
+   VM fixture described below.
 
 Standalone support and td image delivery are both required outcomes. Image
 integration must give the ordinary desktop identity the intended monitoring
@@ -671,6 +669,15 @@ PID view, session membership and null standard descriptors, then drives
 live repaint and default-Cancel/confirmed suspend/resume through real
 compositor input against a child owned by its driver. This fixture is not
 a runtime application interface or an elevation path.
+
+The final source-built deployment passed this fixture with Linux 7.1.4
+and QEMU 10.2.1 TCG. All five tested programs resolved through the read-only
+image links; the task-manager runtime and readable debug companion were
+listed in the image profiler index. Captures advanced with live updates,
+default Cancel left the owned child running, and confirmed STOP/CONT
+changed its actual kernel state. Host verdict checks required both the
+task-manager and EROFS evidence before accepting PASS. Independent reviews
+and the full `ready` gate passed for each implementation increment.
 
 Collector overhead was measured on the Guix Linux 7.0.14 x86-64 host using
 the actual static target executable built with source-built Rust 1.96.0.
