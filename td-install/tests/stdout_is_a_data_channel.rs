@@ -420,3 +420,21 @@ fn invalid_timezone_refuses_before_disk_or_scratch_changes() -> Res<()> {
     std::fs::remove_dir_all(&dir)?;
     Ok(())
 }
+
+#[test]
+fn invalid_hostname_refuses_before_destination_or_scratch_access() -> Res<()> {
+    let dir = scratch_dir("hostname-refusal")?;
+    let disk = dir.join("disk");
+    let scratch = dir.join("scratch");
+    std::fs::write(&disk, b"unchanged target")?;
+    for name in ["", "UPPER", "two words", "td\n", "../../outside"] {
+        let output = Command::new(BIN).args(["volume", "--hostname", name])
+            .arg(&disk).arg("/does-not-exist/mkfs").arg(&scratch).output()?;
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+        assert_eq!(std::fs::read(&disk)?, b"unchanged target");
+        assert!(!scratch.exists());
+    }
+    std::fs::remove_dir_all(dir)?;
+    Ok(())
+}

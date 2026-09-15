@@ -412,6 +412,8 @@ fn install(device: &str, interrupt: bool, system_autotest: bool) -> Result<(), S
             &uuid,
             "--timezone",
             TIMEZONE_ID,
+            "--hostname",
+            HOSTNAME,
             device,
             "/bin/mkfs.btrfs",
             "/scratch",
@@ -420,18 +422,20 @@ fn install(device: &str, interrupt: bool, system_autotest: bool) -> Result<(), S
         ],
     )?;
     check_timezone(Path::new("/scratch/td-volume-root/@var"))?;
+    check_hostname(Path::new("/scratch/td-volume-root/@var"))?;
     for (directory, expected) in [
-        ("@var", "lib"),
-        ("@var/lib", "td"),
-        ("@var/lib/td", "timezone"),
+        ("@var", &["lib"][..]),
+        ("@var/lib", &["td"][..]),
+        ("@var/lib/td", &["hostname", "timezone"][..]),
     ] {
         let staged = Path::new("/scratch/td-volume-root").join(directory);
-        let names = fs::read_dir(&staged)
+        let mut names = fs::read_dir(&staged)
             .map_err(|error| format!("inspect {}: {error}", staged.display()))?
             .map(|entry| entry.map(|entry| entry.file_name()))
             .collect::<Result<Vec<_>, _>>()
             .map_err(|error| format!("read {}: {error}", staged.display()))?;
-        if names != [std::ffi::OsString::from(expected)] {
+        names.sort();
+        if names != expected.iter().map(std::ffi::OsString::from).collect::<Vec<_>>() {
             return Err(format!(
                 "unexpected staged settings in {}",
                 staged.display()
@@ -466,6 +470,7 @@ fn install(device: &str, interrupt: bool, system_autotest: bool) -> Result<(), S
         command("/bin/td-boot", &["mount-var", &partition, "/state"])?;
         seed_system_autotest(Path::new("/"), Path::new("/state"))?;
         check_timezone(Path::new("/state"))?;
+        check_hostname(Path::new("/state"))?;
         command("/bin/umount", &["/state"])?;
     }
     applet(&["sync"])?;
@@ -726,8 +731,16 @@ fn selector() -> Result<(), String> {
     )
 }
 
+fn check_hostname(state: &Path) -> Result<(), String> {
+    check_setting(state, "lib/td/hostname", HOSTNAME)
+}
+
 fn check_timezone(state: &Path) -> Result<(), String> {
-    let path = state.join("lib/td/timezone");
+    check_setting(state, "lib/td/timezone", TIMEZONE_ID)
+}
+
+fn check_setting(state: &Path, relative: &str, expected: &str) -> Result<(), String> {
+    let path = state.join(relative);
     let metadata = fs::symlink_metadata(&path)
         .map_err(|error| format!("inspect {}: {error}", path.display()))?;
     if !metadata.is_file() || metadata.permissions().mode() & 0o7777 != 0o644 {
@@ -736,8 +749,8 @@ fn check_timezone(state: &Path) -> Result<(), String> {
             path.display()
         ));
     }
-    if read(&path, 65)? != format!("{TIMEZONE_ID}\n").as_bytes() {
-        return Err(format!("wrong timezone in {}", path.display()));
+    if read(&path, 65)? != format!("{expected}\n").as_bytes() {
+        return Err(format!("wrong saved setting in {}", path.display()));
     }
     Ok(())
 }
@@ -779,6 +792,7 @@ fn installed() -> Result<(), String> {
     }
     command("/bin/td-boot", &["on-volume", "mount-var", "/state"])?;
     check_timezone(Path::new("/state"))?;
+    check_hostname(Path::new("/state"))?;
     let path = PathBuf::from("/state/installation-count");
     let count = match File::open(&path) {
         Ok(file) => match read_file(file, &path, 8)?.as_slice() {
@@ -926,25 +940,30 @@ mod tests {
     }
 
     #[test]
-    fn cold_boot_timezone_evidence_refuses_absence_wrong_names_and_links() {
-        let scratch = Scratch::new();
-        let path = scratch.0.join("lib/td/timezone");
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-        assert!(check_timezone(&scratch.0).is_err());
-        for value in ["Etc/UTC\n", "Europe/London", "Europe/London\nextra\n"] {
-            fs::write(&path, value).unwrap();
-            fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
-            assert!(check_timezone(&scratch.0).is_err());
+    fn cold_boot_settings_refuse_absence_wrong_names_and_links() {
+        for (relative, expected, check) in [
+            ("hostname", HOSTNAME, check_hostname as fn(&Path) -> Result<(), String>),
+            ("timezone", TIMEZONE_ID, check_timezone),
+        ] {
+            let scratch = Scratch::new();
+            let path = scratch.0.join("lib/td").join(relative);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            assert!(check(&scratch.0).is_err());
+            for value in ["wrong\n".into(), expected.into(), format!("{expected}\nextra\n")] {
+                fs::write(&path, value).unwrap();
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+                assert!(check(&scratch.0).is_err());
+            }
+            fs::write(&path, format!("{expected}\n")).unwrap();
+            check(&scratch.0).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o666)).unwrap();
+            assert!(check(&scratch.0).is_err());
+            let target = scratch.0.join("choice");
+            fs::rename(&path, &target).unwrap();
+            fs::set_permissions(&target, fs::Permissions::from_mode(0o644)).unwrap();
+            std::os::unix::fs::symlink(&target, &path).unwrap();
+            assert!(check(&scratch.0).is_err());
         }
-        fs::write(&path, format!("{TIMEZONE_ID}\n")).unwrap();
-        check_timezone(&scratch.0).unwrap();
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o666)).unwrap();
-        assert!(check_timezone(&scratch.0).is_err());
-        let target = scratch.0.join("choice");
-        fs::rename(&path, &target).unwrap();
-        fs::set_permissions(&target, fs::Permissions::from_mode(0o644)).unwrap();
-        std::os::unix::fs::symlink(&target, &path).unwrap();
-        assert!(check_timezone(&scratch.0).is_err());
     }
 
     #[test]

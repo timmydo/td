@@ -1604,6 +1604,12 @@ fn validate_installed_system(
             tail(&result.console, 100)
         ));
     }
+    let expected_hostname = format!("TD-HOSTNAME-READY {}", protocol::HOSTNAME);
+    let hostnames: Vec<_> = result.console.lines().map(str::trim_end)
+        .filter(|line| line.starts_with("TD-HOSTNAME-READY ")).collect();
+    if hostnames != [expected_hostname.as_str()] {
+        return Err(format!("installed system did not activate its saved hostname: {hostnames:?}\n{}", tail(&result.console, 100)));
+    }
     for (name, present) in [
         ("greeter", result.evidence.greeter),
         ("read-only root", result.evidence.root_read_only),
@@ -1786,6 +1792,18 @@ mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
 
+    #[test]
+    fn installed_hostname_requires_exactly_one_verified_saved_name() {
+        let good = healthy_system();
+        let expected = format!("TD-HOSTNAME-READY {}\n", protocol::HOSTNAME);
+        for replacement in [String::new(), "TD-HOSTNAME-READY td\n".into(), expected.repeat(2)] {
+            let mut bad = healthy_system();
+            bad.console = bad.console.replace(&expected, &replacement);
+            assert!(validate_installed_system(&bad, "uuid", "/dev/vda2", "deployment", true).is_err());
+        }
+        assert!(validate_installed_system(&good, "uuid", "/dev/vda2", "deployment", true).is_ok());
+    }
+
     fn healthy_system() -> BootResult {
         let mut evidence = ConsoleEvidence {
             target: true,
@@ -1817,7 +1835,7 @@ mod tests {
         BootResult {
             evidence, exited_clean: false, marker_killed: true,
             reason: "fixture".into(),
-            console: format!("TD-BOOT-VOLUME uuid /dev/vda2\nTD-BOOT-SELECTED-CURRENT deployment\n{SYSTEM_BOOT_SUCCESS_MARKER}\n"),
+            console: format!("TD-BOOT-VOLUME uuid /dev/vda2\nTD-BOOT-SELECTED-CURRENT deployment\nTD-HOSTNAME-READY {}\n{SYSTEM_BOOT_SUCCESS_MARKER}\n", protocol::HOSTNAME),
             elapsed: Duration::ZERO, firefox_audio: FirefoxAudioCapture::NotRequested,
         }
     }

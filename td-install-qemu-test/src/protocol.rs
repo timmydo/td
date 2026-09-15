@@ -30,6 +30,8 @@ pub const MAX_INVENTORY_BYTES: usize = 32 * 1024;
 pub const PREVIEW_MARKER: &str = "TD-INSTALL-LAYOUT-PREVIEW";
 pub const MAX_PREVIEW_BYTES: usize = 1024;
 
+/// Machine name verified in the formatted volume and both cold boots.
+pub const HOSTNAME: &str = "td-qemu-installed";
 /// Geographic choice verified in the formatted volume and both cold boots.
 pub const TIMEZONE_ID: &str = "Europe/London";
 

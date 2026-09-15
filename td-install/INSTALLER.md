@@ -148,8 +148,8 @@ privileged writer. Output errors fail the command and may leave partial
 JSON. This command neither selects nor persists a timezone. The
 compositor reads the selection written by the volume formatter below.
 
-`td-install volume [--uuid UUID] [--timezone IANA-ID] DESTINATION MKFS
-SCRATCH --trusted-key KEY` accepts an optional catalog selection. It
+`td-install volume [--uuid UUID] [--timezone IANA-ID] [--hostname NAME]
+DESTINATION MKFS SCRATCH --trusted-key KEY` accepts an optional catalog selection. It
 validates the entire offline catalog and selected identifier before
 opening the destination or creating scratch state. Unknown names and
 backward aliases refuse. The formatter seeds one mode-0644,
@@ -175,6 +175,46 @@ hardware qualification. The small diagnostic matrix retains 2 GiB.
 The application-evidence boot uses the shared system-test timeout,
 which covers the longer autotest profiler prerequisite; installation
 and ordinary firmware boots retain their separate 900-second default.
+
+`--hostname` selects the installed machine name before destination or
+scratch access. Options have the displayed order; duplicate, misplaced,
+missing and non-UTF-8 values refuse. Names contain 1 to 63 lowercase ASCII
+bytes in dot-separated labels. Each label starts with a letter, ends with
+a letter or digit, and otherwise permits letters, digits and hyphens.
+The formatter seeds `@var/lib/td/hostname` as one newline-terminated name,
+mode 0644 beneath mode-0755 directories. Omission leaves the file absent.
+
+The deployment owns `/etc/hostname` as a persistent link to that file and
+ships its default in immutable `/etc/hostname-default`. The existing
+`hostname` startup unit runs `td-firstboot hostname` before other sysinit
+units. It validates an existing saved name without changing it. Only
+absence initializes the deployment default, using the provisioner's
+synced temporary-file and rename protocol. An invalid, symlinked,
+non-regular, oversized, wrongly owned or wrongly permissioned file
+refuses; it is never replaced with a fallback. Reads are bounded to 65
+bytes, accept at most one trailing newline, and require mode 0644 and
+root ownership. Parents are trusted root-owned system directories;
+concurrent privileged replacement is outside this boot-time contract.
+This operation has no alternate paths or name operand and is not a
+post-install rename interface. Provisioning remains a serialized startup
+operation, not a concurrent settings writer.
+
+The provisioner sets the kernel name through the shipped `/bin/hostname`
+applet, then reads it back from procfs before reporting
+`TD-HOSTNAME-READY NAME`. Deployment health requires that unit to succeed;
+the serial console retains its independent recovery path. `/etc/hostname`,
+the kernel name and the existing network/app-jail consumers therefore
+share the installed choice. Later defaults do not replace saved state.
+Malformed shared state therefore prevents acknowledgement across deployments;
+rolling back does not repair it. Recovery requires restoring a canonical,
+root-owned mode-0644 `lib/td/hostname` in the volume's `@var` subvolume from
+a trusted recovery environment. There is no supported in-system rename or
+repair UI yet; activation of the complete installer profile still awaits
+that recovery flow. The current `su` escape hatch is not its intended API.
+The QEMU installer selects `td-qemu-installed`, checks its saved bytes
+alongside timezone state, and requires activation on both full-system
+cold boots and the additional application-evidence boot. Unit tests retain
+the same saved inode and bytes across a changed deployment default.
 
 The existing application launcher reads that name and binds each runtime's
 own zone file at its jailed `/etc/localtime`. Static mail and news carry

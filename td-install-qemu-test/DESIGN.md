@@ -115,7 +115,8 @@ no raw syscall surface.
 The live guest supplies `--trusted-key` to `td-install volume` instead of
 the three publishing operands. The formatter initializes the publication
 directories and key without a deployment or selector. The fixture requires
-empty staged boot, deployment, incoming and @var directories, then deletes
+empty staged boot, deployment and incoming directories, plus only the
+expected timezone and hostname settings beneath @var, then deletes
 its entire private scratch directory after partition refresh, then calls `td-boot install` with the resolved partition,
 /source and the same read-only live public key. Successful mounted
 publication and sync precede the direct-publication and installation markers;
@@ -123,6 +124,15 @@ the host requires both. The full cold-boot oracle still proves the expected
 deployment is installed. The separate full-system diagnostic checks its
 installed desktop under a RAM ceiling. Neither diagnostic admits operator
 target capacity.
+
+The fixture supplies `--timezone Europe/London --hostname td-qemu-installed`
+to the volume formatter. It checks exact mode-0644 regular saved files in
+the staged @var, again after mounting the published full-system volume,
+and on both small-fixture cold boots. The full-system host oracle requires
+exactly one `TD-HOSTNAME-READY td-qemu-installed` line on every installed
+boot, including the additional application-evidence boot. That production
+marker follows setting and reading back the kernel hostname; merely
+saving the file cannot satisfy it.
 
 The host then detaches media and cold-boots the destination through
 firmware. The selector emits read-only discovery evidence for its configured

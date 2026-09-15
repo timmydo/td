@@ -1330,6 +1330,15 @@ interleaved console beats a machine that is up and cannot be repaired from
 its own console — and the boot oracle latches markers order-independently,
 so it does not depend on the ordering either way.
 
+The shipped `hostname` unit runs `td-firstboot hostname` to retain the
+installed name, initialize an absent value from the deployment default,
+and activate and verify the kernel hostname. It retains the first place
+in the serialized sysinit chain. Deployment success strictly requires
+this unit, alongside graphical readiness; a failed hostname operation
+cannot acknowledge the deployment as healthy. The console still has only
+ordering edges and retains I5. `td-install/INSTALLER.md` owns the saved
+name format, file validation and default-preservation contract.
+
 The mounts stay with PID 1 deliberately: td-svc reads `/proc` for its own
 group and session and for every containment and liveness query, and one
 started before `/proc` exists comes up unable to signal a group at all.

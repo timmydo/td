@@ -5114,6 +5114,7 @@ mod tests {
                 "td-compositor",
                 "td-editor",
                 "td-firstboot",
+                "td-install",
                 "td-jail",
                 "td-photo",
                 "td-portal",
@@ -7195,6 +7196,7 @@ mod tests {
                 "td-compositor",
                 "td-editor",
                 "td-firstboot",
+                "td-install",
                 "td-jail",
                 "td-photo",
                 "td-portal",
@@ -7208,7 +7210,7 @@ mod tests {
             ]
         );
         // td-photo's native case makes its commands three, as td-setup's are.
-        assert_eq!(comp.len(), 35, "{comp:?}");
+        assert_eq!(comp.len(), 37, "{comp:?}");
         // Runtime td-vm/ spellings conservatively connect the same reader set.
         assert_eq!(vm, comp);
         assert_eq!(
@@ -7220,6 +7222,7 @@ mod tests {
                 "td-compositor",
                 "td-editor",
                 "td-firstboot",
+                "td-install",
                 "td-jail",
                 "td-login",
                 "td-photo",

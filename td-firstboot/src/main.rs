@@ -35,6 +35,7 @@ mod fido_hid;
 mod fido_metadata;
 #[path = "../../td-secret/src/crypto.rs"]
 mod crypto;
+mod hostname;
 mod machineid;
 mod mounts;
 mod principal_store;
@@ -72,6 +73,9 @@ const DEFAULT_KEYGEN: &str = "/bin/ssh-keygen";
 
 /// Paths relative to the state dir. Each is one entry in the recipe's table.
 const MACHINE_ID: &str = "machine-id";
+const HOSTNAME: &str = "hostname";
+const HOSTNAME_DEFAULT: &str = "/etc/hostname-default";
+const HOSTNAME_PROGRAM: &str = "/bin/hostname";
 const HOST_KEY: &str = "ssh/ssh_host_ed25519_key";
 const HOST_KEY_PUB: &str = "ssh/ssh_host_ed25519_key.pub";
 const AUTHORIZED_KEYS: &str = "ssh/authorized_keys";
@@ -220,6 +224,7 @@ fn usage() -> String {
          provisions this machine's identity under {DEFAULT_STATE_DIR}: {MACHINE_ID}, \
          {HOST_KEY}(.pub), {AUTHORIZED_KEYS}; with the application pair, a first \
          configuration under DIR/{APPLICATION_STATE_ROOT} or its validated private app home\n  \
+         td-firstboot hostname prepares and activates the persistent hostname\n  \
          td-firstboot check-principals ROOT validates staged deployment identities without writing\n  \
          td-firstboot check-launch-session USER UID COMPOSITOR_UID verifies live reservations\n  \
          td-firstboot check-launch-application OWNER APP selects an enrolled active application UID\n"
@@ -229,6 +234,7 @@ fn usage() -> String {
 fn run(args: &[String]) -> Result<(), Failure> {
     let config = match parse(args)? {
         Invocation::Help => return emit(&usage()).map_err(Failure::Failed),
+        Invocation::Hostname => return activate_hostname(),
         Invocation::CheckPrincipals(root) => {
             principals::check_deployment(&root).map_err(Failure::Failed)?;
             return emit("TD-PRINCIPALS-CHECK-OK\n").map_err(Failure::Failed);
@@ -354,6 +360,7 @@ fn run(args: &[String]) -> Result<(), Failure> {
 /// What an argv asked for.
 enum Invocation {
     Help,
+    Hostname,
     CheckPrincipals(PathBuf),
     CheckLaunchSession(String, u32, u32),
     CheckLaunchApplication(u32, String),
@@ -361,6 +368,10 @@ enum Invocation {
 }
 
 fn parse(args: &[String]) -> Result<Invocation, Failure> {
+    if args.first().is_some_and(|arg| arg == "hostname") {
+        return if args.len() == 1 { Ok(Invocation::Hostname) }
+            else { Err(Failure::Usage("hostname takes no operands".into())) };
+    }
     if args
         .first()
         .is_some_and(|verb| verb == "check-launch-application")
@@ -854,6 +865,102 @@ fn sync_directories(deepest: &Path, boundary: Option<&Path>) -> Result<(), Failu
     Ok(())
 }
 
+fn read_hostname(path: &Path, owner: u32) -> Result<Option<hostname::Hostname>, Failure> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(Failure::Failed(format!(
+                "inspect {}: {error}",
+                path.display()
+            )))
+        }
+    };
+    if !metadata.is_file()
+        || metadata.uid() != owner
+        || metadata.permissions().mode() & 0o7777 != 0o644
+        || metadata.len() > 64
+    {
+        return Err(Failure::Failed(format!(
+            "{} is not a bounded owner-{owner} mode-0644 hostname file",
+            path.display()
+        )));
+    }
+    let file = std::fs::File::open(path)
+        .map_err(|error| Failure::Failed(format!("open {}: {error}", path.display())))?;
+    let opened = file
+        .metadata()
+        .map_err(|error| Failure::Failed(format!("inspect opened {}: {error}", path.display())))?;
+    if (
+        opened.dev(),
+        opened.ino(),
+        opened.uid(),
+        opened.mode(),
+        opened.len(),
+    ) != (
+        metadata.dev(),
+        metadata.ino(),
+        metadata.uid(),
+        metadata.mode(),
+        metadata.len(),
+    ) {
+        return Err(Failure::Failed(format!(
+            "{} changed while opening",
+            path.display()
+        )));
+    }
+    let mut text = String::new();
+    file.take(65)
+        .read_to_string(&mut text)
+        .map_err(|error| Failure::Failed(format!("read {}: {error}", path.display())))?;
+    if text.len() > 64 {
+        return Err(Failure::Failed(format!(
+            "{} exceeds the hostname file bound",
+            path.display()
+        )));
+    }
+    hostname::Hostname::parse(text.strip_suffix('\n').unwrap_or(&text))
+        .map(Some)
+        .map_err(|error| Failure::Failed(format!("{}: {error}", path.display())))
+}
+
+fn provision_hostname(
+    state: &Path,
+    default: &Path,
+    owner: u32,
+) -> Result<hostname::Hostname, Failure> {
+    if let Some(name) = read_hostname(state, owner)? {
+        return Ok(name);
+    }
+    let name = read_hostname(default, owner)?.ok_or_else(|| {
+        Failure::Failed(format!("missing hostname default {}", default.display()))
+    })?;
+    write_durably(state, format!("{}\n", name.name()).as_bytes(), 0o644)?;
+    Ok(name)
+}
+
+fn activate_hostname() -> Result<(), Failure> {
+    let state = Path::new(DEFAULT_STATE_DIR);
+    let boundary = check_persistent(state)?;
+    make_dir(state, 0o755)?;
+    sync_directories(state, Some(&boundary))?;
+    let name = provision_hostname(&state.join(HOSTNAME), Path::new(HOSTNAME_DEFAULT), 0)?;
+    let status = std::process::Command::new(HOSTNAME_PROGRAM)
+        .arg(name.name())
+        .status()
+        .map_err(|error| Failure::Failed(format!("set installed hostname: {error}")))?;
+    if !status.success() {
+        return Err(Failure::Failed(format!("set installed hostname: {status}")));
+    }
+    let actual = read_hostname(Path::new("/proc/sys/kernel/hostname"), 0)?;
+    if actual.as_ref() != Some(&name) {
+        return Err(Failure::Failed(
+            "kernel hostname differs from the saved choice".into(),
+        ));
+    }
+    emit(&format!("TD-HOSTNAME-READY {}\n", name.name())).map_err(Failure::Failed)
+}
+
 fn provision_machine_id(path: &Path) -> Result<Outcome, Failure> {
     match read_optional(path)? {
         Some(text) => {
@@ -1266,6 +1373,116 @@ fn emit_err(text: &str) {
 }
 
 #[cfg(test)]
+mod hostname_tests {
+    use super::*;
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    struct Scratch(PathBuf);
+    impl Scratch {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "td-hostname-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ));
+            std::fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+        fn file(&self, name: &str, bytes: &[u8]) -> PathBuf {
+            let path = self.0.join(name);
+            std::fs::write(&path, bytes).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+            path
+        }
+        fn owner(&self) -> u32 {
+            std::fs::metadata(&self.0).unwrap().uid()
+        }
+    }
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn a_saved_choice_survives_a_new_deployment_default_and_repeated_boots() {
+        let scratch = Scratch::new();
+        let default = scratch.file("default", b"td\n");
+        let state = scratch.0.join("hostname");
+        assert_eq!(
+            provision_hostname(&state, &default, scratch.owner())
+                .unwrap()
+                .name(),
+            "td"
+        );
+        scratch.file("hostname", b"my-laptop\n");
+        let before = std::fs::metadata(&state).unwrap();
+        scratch.file("default", b"new-release-default\n");
+        for _ in 0..2 {
+            assert_eq!(
+                provision_hostname(&state, &default, scratch.owner())
+                    .unwrap()
+                    .name(),
+                "my-laptop"
+            );
+            let after = std::fs::metadata(&state).unwrap();
+            assert_eq!(
+                (after.ino(), after.mtime(), after.mtime_nsec()),
+                (before.ino(), before.mtime(), before.mtime_nsec())
+            );
+        }
+        assert_eq!(std::fs::read(&state).unwrap(), b"my-laptop\n");
+        assert_eq!(before.mode() & 0o7777, 0o644);
+    }
+
+    #[test]
+    fn malformed_state_is_never_replaced_by_the_default() {
+        let scratch = Scratch::new();
+        let default = scratch.file("default", b"td\n");
+        for bytes in [
+            b"".as_slice(),
+            b"UPPER\n",
+            b"td\n\n",
+            b"td\0\n",
+            &[0xff],
+            &[b'a'; 65],
+        ] {
+            let state = scratch.file("hostname", bytes);
+            assert!(provision_hostname(&state, &default, scratch.owner()).is_err());
+            assert_eq!(std::fs::read(&state).unwrap(), bytes);
+        }
+        let state = scratch.file("hostname", b"my-td\n");
+        std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o666)).unwrap();
+        assert!(provision_hostname(&state, &default, scratch.owner()).is_err());
+        assert_eq!(std::fs::metadata(&state).unwrap().mode() & 0o7777, 0o666);
+        std::fs::remove_file(&state).unwrap();
+        std::os::unix::fs::symlink("absent", &state).unwrap();
+        assert!(provision_hostname(&state, &default, scratch.owner()).is_err());
+        std::fs::remove_file(&state).unwrap();
+        std::fs::create_dir(&state).unwrap();
+        assert!(provision_hostname(&state, &default, scratch.owner()).is_err());
+    }
+
+    #[test]
+    fn invalid_or_unreadable_defaults_do_not_create_state() {
+        let scratch = Scratch::new();
+        let state = scratch.0.join("hostname");
+        let default = scratch.0.join("default");
+        assert!(provision_hostname(&state, &default, scratch.owner()).is_err());
+        scratch.file("default", b"invalid default\n");
+        assert!(provision_hostname(&state, &default, scratch.owner()).is_err());
+        assert!(!state.exists());
+        scratch.file("default", b"td\n");
+        assert!(provision_hostname(&state, &default, scratch.owner().wrapping_add(1)).is_err());
+        assert!(!state.exists());
+        assert!(matches!(
+            parse(&["hostname".into()]),
+            Ok(Invocation::Hostname)
+        ));
+        assert!(parse(&["hostname".into(), "unexpected".into()]).is_err());
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -1275,6 +1492,7 @@ mod tests {
         match parse(&args.iter().map(|a| (*a).to_string()).collect::<Vec<_>>())? {
             Invocation::Provision(config) => Ok(config),
             Invocation::Help
+            | Invocation::Hostname
             | Invocation::CheckPrincipals(_)
             | Invocation::CheckLaunchApplication(..)
             | Invocation::CheckLaunchSession(..) => Err(Failure::Usage(

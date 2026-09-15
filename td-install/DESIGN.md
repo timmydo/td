@@ -222,6 +222,12 @@ including when no zone is selected. The deployment-owned optional persistent
 link at `/etc/timezone` points to that file; no selection leaves it
 absent. INSTALLER.md owns the catalog grammar and consumer boundaries.
 
+An optional hostname is parsed into the shared canonical name type before
+any destination access and seeds `@var/lib/td/hostname` with the same
+readable file and directory modes. The persistent `/etc/hostname` link,
+boot-time default initialization, kernel activation and QEMU evidence are
+specified in INSTALLER.md. No user-selected value enters generated shell.
+
 `layout-preview` uses the same layout calculation without a destination
 operand or any filesystem access. Its geometry-only contract and output
 schema live in INSTALLER.md; it does not admit a disk or authorize writes.
@@ -1233,6 +1239,14 @@ warm does, and that is a chain target. The arm is `cargo-test` + `check` +
 assertions require `td-boot/src/main.rs` to select none of the three
 bootstrap targets, so the rule has to be about this FILE rather than about
 the crate.
+
+### Shared hostname grammar
+
+`td-firstboot/src/hostname.rs` is included by `td-install` for option
+validation and by the system recipe's tests to validate its default. The
+target recipes stage that same dependency-free source. Crate-wide reader
+discovery tracks the include, including the conservative firstboot reader
+cluster; the installer does not carry a separately maintained parser.
 
 ## 8. Oracles
 

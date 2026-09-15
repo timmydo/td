@@ -46,6 +46,12 @@ pub fn recipe() -> Recipe {
         Step::MkDir {
             path: "{src}/engine/src".into(),
         },
+        Step::MkDir { path: "{src}/td-firstboot/src".into() },
+        Step::WriteFile {
+            path: "{src}/td-firstboot/src/hostname.rs".into(),
+            content: include_str!("../../../td-firstboot/src/hostname.rs").into(),
+            exec: false,
+        },
         Step::WriteFile {
             path: "{src}/td-install/src/main.rs".into(),
             content: MAIN_RS.into(),

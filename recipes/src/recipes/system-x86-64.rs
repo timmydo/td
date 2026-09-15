@@ -707,7 +707,7 @@ const TD_LOGIN_APPLETS: &[&str] = &["login", "su"];
 /// `#![forbid(unsafe_code)]` farm. Unlike every other farm here these names are LOAD-BEARING:
 /// `/init` is PID 1, `switch_root` is the stage-1 pivot, `mount`/`umount` bring up and
 /// release every filesystem the machine has (both `/init` scripts, sysinit, td-boot and
-/// `/etc/shutdown`), `hostname -F` runs at sysinit (the `-F` flag is the gap uutils has — it
+/// `/etc/shutdown`), `hostname` runs through td-firstboot at sysinit (uutils
 /// ships no `hostname` at all), and `reboot` is how a boot ends. So this farm is not merely
 /// symlinked and probed; the image's actual boot path runs it, and `shape_check` additionally
 /// dry-runs the shipped `/etc/inittab` through the packed binary so a table PID 1 would
@@ -812,7 +812,7 @@ enum Probe {
     /// exit non-zero, and that would prove the applet TRIED — the opposite of the contract.
     Refuses(&'static str, &'static str),
     /// Must print the hostname `sysinit` set from /etc/hostname — the only way to see that
-    /// `hostname -F` actually took, since it runs long before the greeter exists.
+    /// hostname provisioning actually took, since it runs long before the greeter exists.
     ReadsBackHostname,
 }
 
@@ -908,7 +908,7 @@ fn td_init_applets() -> Vec<&'static str> {
 /// Double quotes only, never single: these segments are pasted inside the health target's
 /// single-quoted `su -c '…'` argument, where one `'` would end it and hand the rest to the
 /// wrong shell.
-fn td_init_probe(applet: &str, probe: &Probe, sys: &SystemDef) -> String {
+fn td_init_probe(applet: &str, probe: &Probe) -> String {
     match probe {
         // Captured, not discarded: the one Runs probe is `init --dry-run` over the shipped
         // table, and its per-line parse diagnostics ARE the answer to why it refused.
@@ -928,9 +928,9 @@ fn td_init_probe(applet: &str, probe: &Probe, sys: &SystemDef) -> String {
              *) echo \"td-init: /bin/{applet} refused without saying {says}: $e\"; i=0 ;; esac; fi; "
         ),
         Probe::ReadsBackHostname => format!(
-            "[ \"$(/bin/{applet})\" = \"{}\" ] || \
-             {{ echo \"td-init: /bin/{applet} did not read back the configured name\"; i=0; }}; ",
-            sys.hostname
+            "n=$(/bin/cat /etc/hostname) && [ -n \"$n\" ] && \
+             [ \"$(/bin/{applet})\" = \"$n\" ] || \
+             {{ echo \"td-init: /bin/{applet} did not read back the configured name\"; i=0; }}; "
         ),
     }
 }
@@ -1299,7 +1299,7 @@ const TD_SVC_UNITS: [&str; 46] = [
 /// a oneshot that times out is marked failed, and since `after=` is ordering, every
 /// dependent still runs.
 mod svc_timeouts {
-    /// `sethostname(2)` plus one file read.
+    /// Validate or durably initialize the saved name, set it and read it back.
     pub const HOSTNAME: u32 = 30;
     /// Mints the per-machine identity: ed25519 keygen, writes to /var, then sync.
     pub const FIRSTBOOT: u32 = 300;
@@ -1362,10 +1362,9 @@ mod svc_timeouts {
 /// load-bearing and nothing can tell a deliberate order from an accidental one.
 ///
 /// Ordering, and why each edge exists:
-///   hostname precedes td-firstboot only to keep the sysinit chain SERIAL. init ran
-///     sysinit lines one at a time; td-svc starts every unit whose edges are settled in
-///     the same pass, so an absent edge here is not "no constraint", it is CONCURRENCY
-///     the inittab never had. Nothing actually reads across the two.
+///   hostname precedes td-firstboot to keep the sysinit chain SERIAL. Both
+///     provisioners create and sync /var/lib/td; the ordering prevents concurrent
+///     initialization of their shared state directory.
 ///   td-firstboot mints the per-machine identity, so it precedes everything that reads
 ///     or checks it — rootcheck (asserts it is READABLE through the MUTABLE_ETC
 ///     symlinks on a still-read-only /etc), and OpenSSH (whose immutable config
@@ -1384,7 +1383,8 @@ mod svc_timeouts {
 /// Existing boot jobs keep their ordering-only `after=` edges. The graphical daemon
 /// additionally requires the seat assignment: starting an unprivileged compositor
 /// without its device capability can only crash-loop. Deployment success strictly
-/// requires graphical readiness, so a broken UI cannot mark an update healthy. The
+/// requires graphical readiness and hostname activation, so either failure
+/// prevents an update from being marked healthy. The
 /// serial console has no such dependency and remains available when graphics fail.
 fn build_td_svc_conf() -> String {
     // The sysinit set, in one place: every post-sysinit unit names all of it.
@@ -1398,14 +1398,12 @@ fn build_td_svc_conf() -> String {
          \n\
          [hostname]\n\
          type=oneshot\n\
-         exec=/bin/hostname -F /etc/hostname\n\
+         exec=/bin/td-firstboot hostname\n\
          timeout={hostname}\n\
          \n\
          # Mints the per-machine identity everything below reads or checks.\n\
-         # after=hostname only to keep sysinit SERIAL, as init ran it: nothing here\n\
-         # reads the hostname (this writes /var/lib/td alone), but a cutover that\n\
-         # silently made two jobs concurrent would be a behaviour change wearing a\n\
-         # migration's clothes. Relaxing this edge is a separate, argued landing.\n\
+         # after=hostname serializes both provisioners' initialization of\n\
+         # their shared /var/lib/td directory.\n\
          # The application pair adds a first configuration for the terminal\n\
          # applications (mail, news) under each private application home: created\n\
          # once, owned by its service UID, never rewritten after provisioning.\n\
@@ -1912,7 +1910,7 @@ fn build_td_svc_conf() -> String {
          # bounded capture. This is ordering only: profiler evidence cannot decide\n\
          # whether a deployment is healthy, and a failed evidence unit still settles.\n\
          after={sysinit},busd,wayland,terminal,seat-access-evidence,profiler-evidence,sshd\n\
-         requires=terminal,seat-access-evidence\n\
+         requires=terminal,seat-access-evidence,hostname\n\
          timeout={bootsuccess}\n\
          \n\
          [bootfail]\n\
@@ -2904,7 +2902,7 @@ fn build_bootsuccess(sys: &SystemDef) -> String {
     // probe that can precede the marker it gates. See `Probe`.
     let mut td_init_probes = String::new();
     for (applet, probe) in TD_INIT_FARM {
-        td_init_probes.push_str(&td_init_probe(applet, probe, sys));
+        td_init_probes.push_str(&td_init_probe(applet, probe));
     }
     let td_login_probe = td_login_probe(sys);
     let td_login_exec_as_probe = td_login_exec_as_probe(sys);
@@ -3048,10 +3046,11 @@ fn build_bootsuccess(sys: &SystemDef) -> String {
          [ \"$u\" = 1 ]'; then \
          [ \"$mu\" = 1 ] || {{ echo {UUTILS_RUNTIME_MARKER}; mu=1; }}; else healthy=0; fi; \
          if /bin/su -s /bin/sh {} -c \
-         'r=$(/bin/rg --color never --no-filename --fixed-strings --line-regexp -- \
-         {hostname} /etc/hostname) || \
+         'n=$(/bin/hostname) && [ -n \"$n\" ] || exit 1; \
+         r=$(/bin/rg --color never --no-filename --fixed-strings --line-regexp -- \
+         \"$n\" /etc/hostname) || \
          {{ echo \"ripgrep: /bin/rg failed\"; exit 1; }}; \
-         [ \"$r\" = {hostname} ] || \
+         [ \"$r\" = \"$n\" ] || \
          {{ echo \"ripgrep: unexpected hostname result: $r\"; exit 1; }}; \
          f=$(/bin/fd --color never --absolute-path --max-depth 1 ^hostname$ /etc) || \
          {{ echo \"fd: /bin/fd failed\"; exit 1; }}; \
@@ -3258,7 +3257,6 @@ fn build_bootsuccess(sys: &SystemDef) -> String {
         codex_probe_root = format!("/run/user/{UI_UID}/td-codex-sandbox-probe"),
         codex_version = CODEX_VERSION_OUTPUT,
         bwrap_version = CODEX_BWRAP_VERSION_OUTPUT,
-        hostname = sys.hostname,
     )
 }
 
@@ -3522,6 +3520,12 @@ const IMMUTABLE_ETC: &[ImmutableEtc] = &[
 ];
 
 const MUTABLE_ETC: &[MutableEtc] = &[
+    MutableEtc {
+        etc: "hostname",
+        target: "/var/lib/td/hostname",
+        state: State::Persistent,
+        why: "td-install saves the chosen hostname; td-firstboot supplies a default only when absent",
+    },
     MutableEtc {
         etc: "timezone",
         target: "/var/lib/td/timezone",
@@ -3947,7 +3951,7 @@ fn etc_files(sys: &SystemDef) -> Result<Vec<(&'static str, String, bool)>, Strin
         ),
         ("group", build_group(sys), false),
         (SHADOW_ETC_NAME, build_shadow(sys), false),
-        ("hostname", format!("{}\n", sys.hostname), false),
+        ("hostname-default", format!("{}\n", sys.hostname), false),
         ("os-release", build_os_release(sys), false),
         (
             td_portal_settings_etc_name(),
@@ -4682,7 +4686,7 @@ fn shape_check() -> String {
      [ -f \"$root/init\" ] || [ -L \"$root/init\" ] || { echo 'root tree: /init missing' >&2; exit 1; }; \
      case $(readlink \"$root/init\") in /td/store/*) : ;; *) echo 'root tree: /init is not a symlink into /td/store' >&2; exit 1;; esac; \
      case $(readlink \"$root/bin/sh\") in /td/store/*) : ;; *) echo 'root tree: /bin/sh is not a symlink into /td/store - the store-native /bin farm regressed' >&2; exit 1;; esac; \
-     for f in passwd group shadow hostname os-release @BUS_APPLICATION_POLICY_NAME@ @TD_PORTAL_SETTINGS_NAME@ mutable-state inittab @TD_SVC_CONF_NAME@ @APPLICATION_CONFIG_NAME@ profile autologin tty-session shutdown rootcheck netup bootsuccess bootfail; do \
+     for f in passwd group shadow hostname-default os-release @BUS_APPLICATION_POLICY_NAME@ @TD_PORTAL_SETTINGS_NAME@ mutable-state inittab @TD_SVC_CONF_NAME@ @APPLICATION_CONFIG_NAME@ profile autologin tty-session shutdown rootcheck netup bootsuccess bootfail; do \
          [ -f \"$root/etc/$f\" ] || { echo \"root tree: /etc/$f missing\" >&2; exit 1; }; \
          if [ -L \"$root/etc/$f\" ]; then echo \"root tree: /etc/$f is a symlink - immutable image config must be a regular file in the erofs, not a hole in the read-only /etc\" >&2; exit 1; fi; \
      done; \
@@ -5200,7 +5204,7 @@ pub fn recipe() -> Recipe {
         //   /etc/rootcheck and four other generated scripts grep /proc with them.
         // td-init: the static boot-glue multicall (empty runtime closure, CopyTree'd). Not a
         //   farm like the others: it is /init (PID 1), the deployment initramfs' pivot, and
-        //   the sysinit `hostname -F`, so the image's boot path runs it on every boot.
+        //   the sysinit hostname provisioner, so the image's boot path runs it on every boot.
         // td-firstboot: the static per-machine identity provisioner (empty runtime closure,
         //   CopyTree'd). One /bin entry, run once per boot as a sysinit job; it is what
         //   fills the /var targets the MUTABLE_ETC symlinks point at.
@@ -5266,6 +5270,10 @@ pub fn recipe() -> Recipe {
         recipe.payload_inputs(&application_inputs)
     }
 }
+
+#[cfg(test)]
+#[path = "../../../td-firstboot/src/hostname.rs"]
+mod hostname;
 
 #[cfg(test)]
 mod tests {
@@ -5657,7 +5665,7 @@ mod tests {
         );
         assert_eq!(
             unit_key("bootsuccess", "requires").as_deref(),
-            Some("terminal,seat-access-evidence"),
+            Some("terminal,seat-access-evidence,hostname"),
             "profiler evidence is an ordering boundary, not deployment health"
         );
 
@@ -5751,7 +5759,7 @@ news\tnews-0.1\tsource\tstatic-runtime-1\tsource\n"
         let table = build_td_svc_conf();
         let inittab = build_inittab();
         for command in [
-            "/bin/hostname -F /etc/hostname",
+            "/bin/td-firstboot hostname",
             "/bin/td-firstboot provision",
             "/etc/rootcheck",
             "/bin/td-seatd assign",
@@ -5838,7 +5846,7 @@ news\tnews-0.1\tsource\tstatic-runtime-1\tsource\n"
         // hopeful grep.
         assert_eq!(
             unit_key("bootsuccess", "requires").as_deref(),
-            Some("terminal,seat-access-evidence")
+            Some("terminal,seat-access-evidence,hostname")
         );
         assert!(unit_after("bootsuccess").contains(&"terminal".to_string()));
         assert!(!unit_after("bootsuccess").contains(&"firefox".to_string()));
@@ -7734,7 +7742,7 @@ news\tnews-0.1\tsource\tstatic-runtime-1\tsource\n"
         );
         assert_eq!(
             unit_key("bootsuccess", "requires").as_deref(),
-            Some("terminal,seat-access-evidence"),
+            Some("terminal,seat-access-evidence,hostname"),
             "deployment health must be skipped when the terminal failed, while the \
              mutable Firefox launch remains independent QEMU evidence"
         );
@@ -9379,6 +9387,7 @@ news\tnews-0.1\tsource\tstatic-runtime-1\tsource\n"
         // Each persistent entry's target must be exactly the state dir joined with the
         // relative path td-firstboot declares for it.
         for (name, etc) in [
+            ("HOSTNAME", "hostname"),
             ("MACHINE_ID", "machine-id"),
             ("HOST_KEY", "ssh/ssh_host_ed25519_key"),
             ("HOST_KEY_PUB", "ssh/ssh_host_ed25519_key.pub"),
@@ -9408,7 +9417,7 @@ news\tnews-0.1\tsource\tstatic-runtime-1\tsource\n"
         // Every PERSISTENT entry must be one td-firstboot actually creates: a table
         // entry with no provisioner is a symlink that dangles for the life of the
         // machine, which is worse than no entry at all.
-        let provisioned = ["MACHINE_ID", "HOST_KEY", "HOST_KEY_PUB", "AUTHORIZED_KEYS"]
+        let provisioned = ["HOSTNAME", "MACHINE_ID", "HOST_KEY", "HOST_KEY_PUB", "AUTHORIZED_KEYS"]
             .iter()
             .filter_map(|name| firstboot_const(name))
             .collect::<Vec<_>>();
@@ -9419,6 +9428,24 @@ news\tnews-0.1\tsource\tstatic-runtime-1\tsource\n"
                 entry.etc
             );
         }
+    }
+
+    #[test]
+    fn hostname_startup_reads_the_persistent_choice_and_has_its_applet() {
+        assert_eq!(hostname::Hostname::parse(SYSTEM.hostname).unwrap().name(), SYSTEM.hostname);
+        let saved = MUTABLE_ETC.iter().find(|entry| entry.etc == "hostname").unwrap();
+        assert_eq!(saved.state, State::Persistent);
+        assert_eq!(saved.target, "/var/lib/td/hostname");
+        assert!(include_str!("../../../td-install/src/main.rs")
+            .contains("const HOSTNAME_STATE_RELATIVE: &str = \"lib/td/hostname\";"));
+        assert_eq!(firstboot_const("HOSTNAME_DEFAULT"), Some("/etc/hostname-default"));
+        assert_eq!(firstboot_const("HOSTNAME_PROGRAM"), Some("/bin/hostname"));
+        assert!(td_init_applets().contains(&"hostname"));
+        assert_eq!(unit_key("hostname", "exec").as_deref(), Some("/bin/td-firstboot hostname"));
+        assert!(etc_files(&SYSTEM).unwrap().iter().any(|(path, text, _)|
+            *path == "hostname-default" && *text == format!("{}\n", SYSTEM.hostname)));
+        assert!(!etc_files(&SYSTEM).unwrap().iter().any(|(path, _, _)| *path == "hostname"));
+        assert!(unit_key("bootsuccess", "requires").unwrap().split(',').any(|unit| unit == "hostname"));
     }
 
     #[test]
@@ -10421,11 +10448,9 @@ news\tnews-0.1\tsource\tstatic-runtime-1\tsource\n"
                 && bootsuccess.contains("set -f")
                 && bootsuccess.contains("su -s /bin/sh tester -c")
                 && bootsuccess.contains("/bin/cat /etc/os-release")
-                && bootsuccess.contains(&format!(
-                    "/bin/rg --color never --no-filename --fixed-strings --line-regexp -- {} \
-                     /etc/hostname",
-                    SYSTEM.hostname
-                ))
+                && bootsuccess.contains(
+                    "/bin/rg --color never --no-filename --fixed-strings --line-regexp -- \"$n\" /etc/hostname"
+                )
                 && bootsuccess.contains(
                     "/bin/fd --color never --absolute-path --max-depth 1 ^hostname$ /etc"
                 )
@@ -10643,11 +10668,8 @@ news\tnews-0.1\tsource\tstatic-runtime-1\tsource\n"
         );
         assert!(
             bootsuccess.contains(
-                &format!(
-                    "r=$(/bin/rg --color never --no-filename --fixed-strings --line-regexp -- {} \
-                     /etc/hostname) || {{ echo \"ripgrep: /bin/rg failed\"; exit 1; }}",
-                    SYSTEM.hostname
-                )
+                "r=$(/bin/rg --color never --no-filename --fixed-strings --line-regexp -- \"$n\" \
+                 /etc/hostname) || { echo \"ripgrep: /bin/rg failed\"; exit 1; }"
             ) && bootsuccess.contains(
                 "f=$(/bin/fd --color never --absolute-path --max-depth 1 ^hostname$ /etc) || \
                  { echo \"fd: /bin/fd failed\"; exit 1; }"
@@ -10677,13 +10699,13 @@ news\tnews-0.1\tsource\tstatic-runtime-1\tsource\n"
         };
         let configured_bootsuccess = build_bootsuccess(&configured);
         assert!(
-            configured_bootsuccess.contains(
-                "r=$(/bin/rg --color never --no-filename --fixed-strings --line-regexp -- \
-                 configured.host /etc/hostname)"
-            ) && configured_bootsuccess.contains("[ \"$r\" = configured.host ]"),
-            "the ripgrep health probe must follow the configured hostname without treating \
-             hostname punctuation as a regular expression"
+            configured_bootsuccess.contains("n=$(/bin/hostname) && [ -n \"$n\" ]")
+                && configured_bootsuccess.contains("[ \"$r\" = \"$n\" ]")
+                && !configured_bootsuccess.contains("configured.host /etc/hostname"),
+            "runtime probes must read the installed hostname rather than the deployment default"
         );
+        assert!(etc_files(&configured).unwrap().iter().any(|(path, text, _)|
+            *path == "hostname-default" && text == "configured.host\n"));
         assert!(
             bootsuccess.contains(DEPLOY_INSTALL_CMDLINE_TOKEN)
                 && bootsuccess.contains(&format!(
@@ -12179,20 +12201,9 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
         );
         // The segments are pasted inside the health target's single-quoted `su -c '…'`
         // argument, so ONE `'` anywhere in them ends it and hands the rest to the wrong
-        // shell. The rule is stated at `td_init_probe`; this is what holds it — including
-        // for `sys.hostname`, the one caller-supplied value that reaches generated shell here.
-        assert!(
-            !SYSTEM.hostname.is_empty()
-                && SYSTEM
-                    .hostname
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.'),
-            "hostname {:?} is interpolated into generated shell; keep it to characters that \
-             need no quoting",
-            SYSTEM.hostname
-        );
+        // shell. The rule is stated at `td_init_probe`; this is what holds it.
         for (applet, probe) in TD_INIT_FARM {
-            let segment = td_init_probe(applet, probe, &SYSTEM);
+            let segment = td_init_probe(applet, probe);
             assert!(
                 !segment.contains('\''),
                 "the probe segment for /bin/{applet} contains a single quote, which would \
@@ -12205,7 +12216,7 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
         // everything except the `i=0` leaves the gate defeatable — drop that one assignment
         // and the marker prints unconditionally.
         for (applet, probe) in TD_INIT_FARM {
-            let segment = td_init_probe(applet, probe, &SYSTEM);
+            let segment = td_init_probe(applet, probe);
             assert!(
                 bootsuccess.contains(&segment),
                 "the health target must probe /bin/{applet} by its literal /bin path AND clear the \
@@ -12637,7 +12648,7 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
         for (name, body, _) in etc_files(&SYSTEM).unwrap() {
             let mut body = body;
             for (applet, probe) in TD_INIT_FARM {
-                body = body.replace(&td_init_probe(applet, probe, &SYSTEM), "");
+                body = body.replace(&td_init_probe(applet, probe), "");
             }
             for applet in POWER {
                 // Match `/bin/reboot`, not `exec /bin/reboot`: a caller that drops the `exec`
