@@ -49,6 +49,66 @@ fn fill(rect: Rect, color: u32, damage: Rect, sink: &mut dyn FnMut(Draw)) {
     }
 }
 
+/// A bordered action with shared text, focus and disabled styling.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Button {
+    surface: Surface,
+    rect: Rect,
+}
+impl Button {
+    pub fn new(surface: Surface, rect: Rect) -> Option<Self> {
+        surface.check().ok()?;
+        (rect.width > 0 && rect.height > 0 && rect.intersection(surface.bounds()) == Some(rect))
+            .then_some(Self { surface, rect })
+    }
+    pub fn hit(self, x: i64, y: i64) -> bool {
+        self.rect.contains(x, y)
+    }
+    pub fn emit(
+        self,
+        text: &str,
+        selected: bool,
+        enabled: bool,
+        damage: Rect,
+        sink: &mut dyn FnMut(Draw),
+    ) {
+        let s = self.surface.scale.value() as u32;
+        let outer = self.rect;
+        let inset_x = s.min(outer.width / 2);
+        let inset_y = s.min(outer.height / 2);
+        let inner = Rect {
+            x: outer.x + i64::from(inset_x),
+            y: outer.y + i64::from(inset_y),
+            width: outer.width.saturating_sub(2 * inset_x),
+            height: outer.height.saturating_sub(2 * inset_y),
+        };
+        let background = if selected && enabled { SELECTED } else { PAPER };
+        fill(outer, BORDER, damage, sink);
+        fill(inner, background, damage, sink);
+        text_run(
+            self.surface.scale,
+            text.chars(),
+            (
+                outer.x + INSET.0 * i64::from(s),
+                outer.y + INSET.1 * i64::from(s),
+            ),
+            inner,
+            GlyphStyle::medium(
+                if !enabled {
+                    DISABLED
+                } else if selected {
+                    PAPER
+                } else {
+                    INK
+                },
+                background,
+            ),
+            damage,
+            sink,
+        );
+    }
+}
+
 /// One list row as painted, the shared model behind `Panel` and `List`:
 /// its background chosen by `selected`, its ink by `enabled`, `prefix`
 /// then `label` from the row's first cell and `trailing` at its right.

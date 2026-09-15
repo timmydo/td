@@ -29,7 +29,7 @@ impl Kind {
             Self::Network => "Network: current namespace",
             Self::Disk => "Disk read / write",
             Self::ProcessCpu => "Process CPU (one-core basis)",
-            Self::ProcessRss => "Summed RSS (shared pages counted)",
+            Self::ProcessRss => "Process RSS (shared pages counted)",
             Self::Swap => "Swap used",
             Self::Core(_) => "Logical CPU",
         }
@@ -47,7 +47,7 @@ const PALETTE: [u32; 8] = [
 #[derive(Debug)]
 struct Line {
     id: Id,
-    label: Text<32>,
+    label: Text<128>,
     color: u32,
     values: MemoryVec<Option<u64>>,
 }
@@ -58,11 +58,10 @@ pub struct Plot {
     times: MemoryVec<u64>,
     labels: MemoryVec<Text<24>>,
     maximum: u64,
-    maximum_label: Text<32>,
+    maximum_label: Text<128>,
     divisor: u64,
     unit: &'static str,
     decimals: u8,
-    mode: Mode,
     _charge: Charge,
 }
 fn error(e: impl std::fmt::Display) -> String {
@@ -96,7 +95,6 @@ impl Plot {
             divisor: 1,
             unit: "B/s",
             decimals: 0,
-            mode: Mode::Lines,
             _charge: budget.charge(std::mem::size_of::<Self>()).map_err(error)?,
         };
         let metric = match kind {
@@ -105,9 +103,13 @@ impl Plot {
             _ => None,
         };
         let contributors = metric.map(|metric| {
-            Contributors::choose(visible().map(|s| &s.value.processes), metric, selected)
+            if let Some(key) = selected {
+                Contributors::selected(key, metric)
+            } else {
+                Contributors::choose(visible().map(|s| &s.value.processes), metric, None)
+            }
         });
-        let mut add = |id, label: Text<32>, color| -> Result<(), String> {
+        let mut add = |id, label: Text<128>, color| -> Result<(), String> {
             this.lines
                 .push(Line {
                     id,
@@ -118,15 +120,18 @@ impl Plot {
                 .map_err(|_| "chart series limit".to_owned())
         };
         if let Some(contributors) = &contributors {
-            colors.update(contributors);
-            for item in contributors.named() {
-                let mut label = Text::<32>::new("Process");
+            if selected.is_none() {
+                colors.update(contributors);
+            }
+            let keys = contributors.named().map(|item| item.key);
+            for key in keys {
+                let mut label = Text::<128>::new("Process");
                 for sample in visible().rev() {
                     if let Ok(index) = sample
                         .value
                         .processes
                         .processes()
-                        .binary_search_by_key(&item.key, |p| p.key)
+                        .binary_search_by_key(&key, |p| p.key)
                     {
                         label = sample
                             .value
@@ -142,16 +147,17 @@ impl Plot {
                         break;
                     }
                 }
-                let _ = write!(label, " [{}]", item.key.pid);
+                let _ = write!(label, " [{}]", key.pid);
                 let color = colors
-                    .slot(item.key)
+                    .slot(key)
                     .and_then(|i| PALETTE.get(i))
                     .copied()
                     .unwrap_or(PALETTE.first().copied().unwrap_or(0xff333333));
-                add(Id::Process(item.key), label, color)?;
+                add(Id::Process(key), label, color)?;
             }
-            add(Id::Other, Text::new("Other observed"), 0xffa39a8d)?;
-            this.mode = Mode::Stacked;
+            if selected.is_none() {
+                add(Id::Other, Text::new("Other observed"), 0xffa39a8d)?;
+            }
         } else {
             let labels: &[&str] = match kind {
                 Kind::Cpu | Kind::Core(_) => &["Busy", "I/O wait", "Steal"],
@@ -212,14 +218,31 @@ impl Plot {
                 .map_err(|_| "chart time label limit")?;
             let mut values = [None; 9];
             if let Some(contributors) = &contributors {
-                let v = contributors.values(&sample.value.processes);
-                for (i, _) in contributors.named().enumerate() {
-                    if let Some(slot) = values.get_mut(i) {
-                        *slot = v.get(i).copied().flatten();
+                if selected.is_none() {
+                    let observed = contributors.values(&sample.value.processes);
+                    for (index, (slot, line)) in
+                        values.iter_mut().zip(this.lines.iter()).enumerate()
+                    {
+                        *slot = if line.id == Id::Other {
+                            observed.last().copied().flatten()
+                        } else {
+                            observed.get(index).copied().flatten()
+                        };
                     }
-                }
-                if let Some(slot) = values.get_mut(this.lines.len().saturating_sub(1)) {
-                    *slot = v.last().copied().flatten();
+                } else {
+                    for (slot, line) in values.iter_mut().zip(this.lines.iter()) {
+                        *slot = match line.id {
+                            Id::Process(key) => sample
+                                .value
+                                .processes
+                                .processes()
+                                .binary_search_by_key(&key, |process| process.key)
+                                .ok()
+                                .and_then(|index| sample.value.processes.processes().get(index))
+                                .and_then(|process| contributors.metric().value(process)),
+                            _ => None,
+                        };
+                    }
                 }
             } else {
                 let a = &sample.value;
@@ -266,21 +289,11 @@ impl Plot {
                     *slot = value;
                 }
             }
-            let sum = values
-                .iter()
-                .take(this.lines.len())
-                .try_fold(0u64, |sum, value| sum.checked_add((*value)?));
-            if this.mode == Mode::Stacked && sum.is_none() {
-                values.fill(None);
-            }
             for (line, value) in this.lines.iter_mut().zip(values) {
                 line.values.push(value).map_err(|_| "chart value limit")?;
                 if let Some(value) = value {
                     this.maximum = this.maximum.max(value);
                 }
-            }
-            if this.mode == Mode::Stacked {
-                this.maximum = this.maximum.max(sum.unwrap_or(0));
             }
         }
         if matches!(kind, Kind::Cpu | Kind::Core(_)) {
@@ -363,7 +376,7 @@ impl Plot {
         let chart = Chart::new(
             surface,
             rect,
-            self.mode,
+            Mode::Lines,
             Axis {
                 maximum: self.maximum,
                 divisor: self.divisor,
@@ -380,7 +393,7 @@ impl Plot {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::panic)]
+    #![allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
     use super::*;
     use crate::collector::Batch;
     use crate::hierarchy::Input;
@@ -389,7 +402,7 @@ mod tests {
     use crate::snapshot::Observed;
     use crate::worker::Update;
     #[test]
-    fn missed_observations_break_lines_and_stack_overflow_stays_unavailable() {
+    fn missed_observations_break_independent_lines_without_summing_them() {
         let budget = Budget::new(crate::budget::LIMIT).unwrap();
         let mut model = Model::new(&budget, Interval::Second).unwrap();
         let rows = [1, 2].map(|pid| Observed {
@@ -427,10 +440,14 @@ mod tests {
         )
         .unwrap();
         assert_eq!(cpu.times.len(), 3);
+        assert_eq!(
+            cpu.lines.first().unwrap().values.first(),
+            Some(&Some(u64::MAX))
+        );
         assert!(cpu
             .lines
             .iter()
-            .all(|line| line.values.iter().all(Option::is_none)));
+            .all(|line| line.values.get(1) == Some(&None)));
         let rss = Plot::new(
             &budget,
             model.history(),
@@ -447,7 +464,82 @@ mod tests {
             .all(|line| line.values.get(1) == Some(&None)));
         assert_eq!(rss.lines.first().unwrap().values.first(), Some(&Some(10)));
         let surface = Surface::new(800, 600, Default::default()).unwrap();
+        assert!(cpu.with_chart(surface, surface.bounds(), |_| ()).is_ok());
         assert!(rss.with_chart(surface, surface.bounds(), |_| ()).is_ok());
+    }
+    #[test]
+    fn unrelated_unknown_process_does_not_blank_known_history() {
+        let budget = Budget::new(crate::budget::LIMIT).unwrap();
+        let mut model = Model::new(&budget, Interval::Second).unwrap();
+        let rows = [Some(2500), None].map(|cpu| Observed {
+            input: Input {
+                key: ProcessKey {
+                    generation: 1,
+                    pid: if cpu.is_some() { 1 } else { 2 },
+                    start_ticks: 1,
+                },
+                parent_pid: Some(0),
+                cpu,
+                rss: Some(10),
+            },
+            name: "a-very-long-process-name-that-must-not-hide-the-graph",
+            uid: Some(1000),
+            state: b'R',
+        });
+        for second in 1..=3 {
+            model.receive(Update {
+                batch: Some(Batch::fixture(&budget, second * 1_000_000_000, &rows)),
+                skipped: 0,
+                failure: None,
+            });
+            assert!(matches!(model.admit_pending(), Admission::Admitted(_)));
+        }
+        let devices = Selection::new(&budget).unwrap();
+        let mut colors = Colors::default();
+        let plot = Plot::new(
+            &budget,
+            model.history(),
+            Kind::ProcessCpu,
+            None,
+            &mut colors,
+            &devices,
+        )
+        .unwrap();
+        let known = plot
+            .lines
+            .iter()
+            .find(|line| line.id == Id::Process(rows[0].input.key))
+            .unwrap();
+        assert_eq!(&*known.values, &[Some(2500); 3]);
+        let comparison_colors = colors;
+        let selected = Plot::new(
+            &budget,
+            model.history(),
+            Kind::ProcessCpu,
+            Some(rows[0].input.key),
+            &mut colors,
+            &devices,
+        )
+        .unwrap();
+        assert_eq!(colors, comparison_colors);
+        assert_eq!(selected.lines[0].color, known.color);
+        let compared_again = Plot::new(
+            &budget,
+            model.history(),
+            Kind::ProcessCpu,
+            None,
+            &mut colors,
+            &devices,
+        )
+        .unwrap();
+        assert_eq!(colors, comparison_colors);
+        assert_eq!(compared_again.lines[0].color, plot.lines[0].color);
+        let surface = Surface::new(400, 500, Default::default()).unwrap();
+        assert!(selected
+            .with_chart(surface, surface.bounds(), |_| ())
+            .is_ok());
+        assert_eq!(selected.lines.len(), 1);
+        assert_eq!(selected.lines[0].id, Id::Process(rows[0].input.key));
     }
     #[test]
     fn evicted_predecessors_break_lines_after_a_cadence_change() {

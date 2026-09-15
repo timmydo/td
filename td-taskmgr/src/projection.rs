@@ -35,6 +35,12 @@ impl Default for Sort {
     }
 }
 impl Sort {
+    pub fn flat(self) -> bool {
+        matches!(
+            self.column,
+            Column::Cpu | Column::Rss | Column::TreeCpu | Column::TreeRss
+        )
+    }
     pub fn click(&mut self, column: Column) {
         *self = Self {
             column,
@@ -207,6 +213,16 @@ fn decimal_contains(mut number: u32, query: &str) -> bool {
         .and_then(|b| std::str::from_utf8(b).ok())
         .is_some_and(|text| text.contains(query))
 }
+fn matches_query(snapshot: &Snapshot, names: &Names<'_>, index: usize, query: &str) -> bool {
+    query.is_empty()
+        || names
+            .get(index)
+            .is_some_and(|name| name.name().contains(query))
+        || snapshot.processes().get(index).is_some_and(|p| {
+            decimal_contains(p.key.pid, query)
+                || p.uid.is_some_and(|uid| decimal_contains(uid, query))
+        })
+}
 fn parent(snapshot: &Snapshot, index: usize) -> Option<usize> {
     let node = snapshot.ancestry().get(index)?;
     node.parent
@@ -249,6 +265,36 @@ impl Projection {
     ) -> Result<Self, Error> {
         let count = snapshot.processes().len();
         let mut order = MemoryVec::new(budget, count + 1)?;
+        if sort.flat() {
+            let mut rows = MemoryVec::new(budget, count)?;
+            for (index, process) in snapshot.processes().iter().enumerate() {
+                let matching = matches_query(snapshot, names, index, query);
+                if matching || selected == Some(process.key) {
+                    push(&mut order, index)?;
+                }
+            }
+            order.sort_unstable_by(|a, b| compare(snapshot, names, *a, *b, sort));
+            for index in order.iter().copied() {
+                push(
+                    &mut rows,
+                    Row {
+                        key: key(snapshot, index).ok_or(Error::Invalid)?,
+                        parent: None,
+                        depth: 0,
+                        children: false,
+                        expanded: false,
+                        process: Some(index),
+                        context: false,
+                        exception: snapshot
+                            .processes()
+                            .get(index)
+                            .is_some_and(|p| selected == Some(p.key))
+                            && !matches_query(snapshot, names, index, query),
+                    },
+                )?;
+            }
+            return Ok(Self { rows });
+        }
         let mut synthetic = false;
         let mut matches = filled(budget, count + 1, false)?;
         let mut kept = filled(budget, count + 1, false)?;
@@ -256,12 +302,7 @@ impl Projection {
         for (index, process) in snapshot.processes().iter().enumerate() {
             push(&mut order, index)?;
             synthetic |= parent(snapshot, index) == Some(count);
-            let matching = query.is_empty()
-                || names
-                    .get(index)
-                    .is_some_and(|name| name.name().contains(query))
-                || decimal_contains(process.key.pid, query)
-                || process.uid.is_some_and(|uid| decimal_contains(uid, query));
+            let matching = matches_query(snapshot, names, index, query);
             *matches.get_mut(index).ok_or(Error::Invalid)? = matching;
             let exception = selected == Some(process.key) && !matching;
             if matching || exception {

@@ -8,7 +8,7 @@ pub enum Metric {
     Rss,
 }
 impl Metric {
-    fn value(self, process: &Process) -> Option<u64> {
+    pub(crate) fn value(self, process: &Process) -> Option<u64> {
         match self {
             Self::Cpu => process.cpu,
             Self::Rss => process.rss,
@@ -29,6 +29,14 @@ fn outranks(a: Contributor, b: Contributor) -> bool {
     a.peak > b.peak || (a.peak == b.peak && a.key < b.key)
 }
 impl Contributors {
+    pub fn selected(key: ProcessKey, metric: Metric) -> Self {
+        let mut named = [None; NAMED];
+        if let Some(slot) = named.first_mut() {
+            *slot = Some(Contributor { key, peak: 0 });
+        }
+        Self { named, metric }
+    }
+
     pub fn choose<'a>(
         samples: impl IntoIterator<Item = &'a Snapshot>,
         metric: Metric,

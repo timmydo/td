@@ -1046,6 +1046,16 @@ The builder discovers the crate by existing. Its gate runs `cargo test` and
 all-target Clippy; a change under `td-ui/` selects td-editor's tests through
 the reader graph, because td-editor's manifest names the crate.
 
+## Shared action button
+
+`chrome::Button` paints a bordered paper action with selected and disabled
+styling, using the shared text and palette. It accepts a nonempty rectangle
+fully inside the surface; its hit test uses that exact rectangle. Rendering
+clips both text and borders to damage and allocates nothing. The consumer
+owns focus, enabled-state hit policy and matching press/release activation,
+as with the other chrome geometry primitives. Scale 1-4 pixel tests cover
+bounds, focus/disabled colors and partial repaint equivalence.
+
 ## Shared menu controller
 
 `menus::Model` is an immutable, caller-revisioned tree of `Node` values.

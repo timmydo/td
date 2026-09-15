@@ -32,7 +32,7 @@ fn key(pid: u32) -> Key {
     })
 }
 #[test]
-fn sorts_siblings_without_flattening_parent_child_relationships() {
+fn cpu_sort_ranks_all_processes_across_parent_child_relationships() {
     let budget = Budget::new(LIMIT).unwrap();
     let snapshot = make_snapshot(
         &budget,
@@ -58,13 +58,56 @@ fn sorts_siblings_without_flattening_parent_child_relationships() {
     .unwrap();
     assert_eq!(
         view.rows().iter().map(|r| r.key).collect::<Vec<_>>(),
-        vec![key(1), key(3), key(2), key(4)]
+        vec![key(4), key(3), key(2), key(1)]
     );
     assert_eq!(
         view.rows().iter().map(|r| r.depth).collect::<Vec<_>>(),
-        vec![0, 1, 1, 2]
+        vec![0, 0, 0, 0]
     );
-    assert_eq!(view.rows()[3].parent, Some(key(2)));
+    assert!(view.rows().iter().all(|row| row.parent.is_none()));
+    let tree = Projection::new(
+        &budget,
+        &snapshot,
+        Sort {
+            column: Column::Name,
+            descending: false,
+        },
+        "",
+        None,
+        &expansion,
+    )
+    .unwrap();
+    assert_eq!(
+        tree.rows().iter().map(|r| r.key).collect::<Vec<_>>(),
+        vec![key(1), key(3), key(2), key(4)]
+    );
+    let memory = Projection::new(
+        &budget,
+        &snapshot,
+        Sort {
+            column: Column::Rss,
+            descending: true,
+        },
+        "",
+        None,
+        &expansion,
+    )
+    .unwrap();
+    assert_eq!(memory.rows().first().unwrap().key, key(4));
+    let filtered = Projection::new(
+        &budget,
+        &snapshot,
+        Sort {
+            column: Column::Cpu,
+            descending: true,
+        },
+        "grandchild",
+        None,
+        &expansion,
+    )
+    .unwrap();
+    assert_eq!(filtered.rows().len(), 1);
+    assert!(!filtered.rows()[0].context);
 }
 #[test]
 fn search_keeps_context_and_selected_exception_without_changing_collapses() {

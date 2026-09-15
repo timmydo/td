@@ -147,6 +147,18 @@ fn label(
         sink,
     );
 }
+fn button(
+    surface: Surface,
+    rect: Rect,
+    text: &str,
+    selected: bool,
+    damage: Rect,
+    sink: &mut dyn FnMut(Draw),
+) {
+    if let Some(button) = chrome::Button::new(surface, rect) {
+        button.emit(text, selected, true, damage, sink);
+    }
+}
 impl State {
     pub fn new(budget: &Arc<Budget>, surface: Surface) -> Result<Self, String> {
         Ok(Self {
@@ -475,7 +487,11 @@ impl State {
         let s = self.surface.scale.value() as u32;
         let area = below(layout.first, 24 * s);
         let columns = if area.width >= 1024 * s { 2 } else { 1 };
-        let rows = (area.height / (if self.tab == 0 { 176 * s } else { 264 * s })).clamp(1, 16);
+        let rows = if self.tab == 0 {
+            (area.height / (176 * s)).clamp(1, 2)
+        } else {
+            1
+        };
         let count = self.card_count();
         let first = (self.graph_first / columns as usize) * columns as usize;
         for (position, slot) in slots.iter_mut().take((rows * columns) as usize).enumerate() {
@@ -660,6 +676,16 @@ impl State {
         self.refresh(true);
         self.dirty = true;
     }
+    fn all_processes(&mut self) {
+        self.cancel_gesture();
+        self.ranking = None;
+        self.group_selected = false;
+        self.model.clear_selection();
+        if let Some(view) = &mut self.view {
+            view.table.select(None, false);
+        }
+        self.refresh(true);
+    }
     fn interval(&mut self) -> Outcome {
         let interval = match self.model.history().interval() {
             Interval::HalfSecond => Interval::Second,
@@ -696,6 +722,12 @@ impl State {
                 if let Some(column) = crate::view::column(column) {
                     self.sort.click(column);
                     self.refresh(true);
+                    if let Some(view) = &mut self.view {
+                        view.table.event(tree::Event::Scroll {
+                            rows: i64::MIN + 1,
+                            columns: 0,
+                        });
+                    }
                 }
             }
             tree::Outcome::Activate(_) => self.process_menu(None),
@@ -1012,11 +1044,11 @@ impl State {
 
     fn toolbar(&self, index: usize) -> Rect {
         let s = self.surface.scale.value() as u32;
-        let x = (index as u32 * 112 * s).min(self.surface.width as u32);
+        let x = (index as u32 * 176 * s).min(self.surface.width as u32);
         Rect {
             x: i64::from(x),
             y: i64::from((24 * s).min(self.surface.height as u32)),
-            width: (112 * s).min((self.surface.width as u32).saturating_sub(x)),
+            width: (176 * s).min((self.surface.width as u32).saturating_sub(x)),
             height: (24 * s).min((self.surface.height as u32).saturating_sub(24 * s)),
         }
     }
@@ -1087,6 +1119,10 @@ impl State {
         }
         if key == "C-l" && !repeated {
             self.live();
+            return Outcome::Changed;
+        }
+        if key == "C-a" && self.focus != Focus::Search && !repeated {
+            self.all_processes();
             return Outcome::Changed;
         }
         if key == "C-i" && !repeated {
@@ -1430,13 +1466,17 @@ impl State {
                     self.choose_tab(index);
                     return Outcome::Changed;
                 }
-                for index in 0..2 {
+                for index in 0..3 {
                     if self.toolbar(index).contains(px, py) && self.toolbar(index).contains(x, y) {
                         if index == 0 {
                             self.live();
                             return Outcome::Changed;
                         }
-                        return self.interval();
+                        if index == 1 {
+                            return self.interval();
+                        }
+                        self.all_processes();
+                        return Outcome::Changed;
                     }
                 }
             }
@@ -1591,13 +1631,13 @@ impl State {
                 sink,
             );
         }
-        label(
+        button(
             surface,
             self.toolbar(0),
             if self.model.historical() {
-                "Return to Live"
+                "Return to Live (C-L)"
             } else {
-                "Live"
+                "Live (C-L)"
             },
             !self.model.historical(),
             damage,
@@ -1609,12 +1649,29 @@ impl State {
             Interval::TwoSeconds => "2 s",
             Interval::FiveSeconds => "5 s",
         };
-        label(surface, self.toolbar(1), interval, false, damage, sink);
+        let mut cadence = Text::<32>::new("Refresh: ");
+        let _ = cadence.write_str(interval);
+        button(
+            surface,
+            self.toolbar(1),
+            cadence.as_str(),
+            false,
+            damage,
+            sink,
+        );
+        button(
+            surface,
+            self.toolbar(2),
+            "Compare all (C-A)",
+            self.model.selected().is_none(),
+            damage,
+            sink,
+        );
         if let Some(layout) = self.split.layout() {
             let mut title = Text::<128>::new("Resource history");
             let _ = write!(
                 title,
-                "   {}/{}   Page Up/Down or wheel",
+                "   {}/{}   PgUp/PgDn: more | Click plot/legend to inspect",
                 self.graph_first + 1,
                 self.card_count()
             );
@@ -1634,6 +1691,13 @@ impl State {
             }
             for graph in self.graphs.iter().filter(|_| self.ranking.is_none()) {
                 let mut title = Text::<128>::new(graph.plot.kind.title());
+                if matches!(graph.plot.kind, Kind::ProcessCpu | Kind::ProcessRss) {
+                    let _ = title.write_str(if self.model.selected().is_some() {
+                        " | Selected process"
+                    } else {
+                        " | Top processes"
+                    });
+                }
                 if let Kind::Core(id) = graph.plot.kind {
                     let _ = write!(title, " {id}");
                 }
@@ -1717,10 +1781,10 @@ impl State {
                 height: 0,
             });
             if let Some(rect) = self.actions_rect() {
-                label(
+                button(
                     surface,
                     rect,
-                    "Process actions",
+                    "Process actions (F10)",
                     self.keyboard_focus && self.focus == Focus::Actions,
                     damage,
                     sink,
@@ -1777,7 +1841,11 @@ impl State {
                 sink,
             );
         }
-        let mut status = Text::<1024>::default();
+        let mut status = Text::<1024>::new(if self.sort.flat() {
+            "RANKED LIST | "
+        } else {
+            "PROCESS TREE | "
+        });
         if let Some(sample) = self.model.history().selected() {
             let age = self.now_ns.saturating_sub(sample.time_ns) / 1_000_000_000;
             let _ = write!(
@@ -2096,6 +2164,39 @@ mod tests {
         );
     }
     #[test]
+    fn sorting_reveals_highest_and_compare_button_clears_the_plot_filter() {
+        let budget = Budget::new(crate::budget::LIMIT).unwrap();
+        let mut state = State::new(
+            &budget,
+            Surface::new(1280, 960, Default::default()).unwrap(),
+        )
+        .unwrap();
+        observation(&mut state, &budget, 1_000_000_000);
+        state.choose_tab(1);
+        state.tree_outcome(tree::Outcome::Selected(Key::Process(key(1))));
+        state.tree_outcome(tree::Outcome::Sort(4));
+        assert_eq!(
+            state.view.as_ref().unwrap().table.first_anchor(),
+            Some(Key::Process(key(3)))
+        );
+        assert!(state.sort.flat());
+        let rect = state.toolbar(2);
+        state.pointer(Phase::Press, rect.x + 5, rect.y + 5);
+        state.pointer(Phase::Release, rect.x + 5, rect.y + 5);
+        assert!(state.model.selected().is_none());
+        assert!(state.selected().is_none());
+        state.tree_outcome(tree::Outcome::Sort(0));
+        assert!(!state.sort.flat());
+        assert!(state
+            .view
+            .as_ref()
+            .unwrap()
+            .projection
+            .rows()
+            .iter()
+            .any(|row| row.depth > 0));
+    }
+    #[test]
     fn right_click_selects_captured_row_and_modal_motion_needs_no_repaint() {
         let budget = Budget::new(crate::budget::LIMIT).unwrap();
         let mut state = State::new(
@@ -2389,6 +2490,27 @@ mod tests {
         assert_eq!(state.model.history().interval(), interval);
     }
     #[test]
+    fn dragging_down_keeps_dedicated_graphs_growing() {
+        let budget = Budget::new(crate::budget::LIMIT).unwrap();
+        let mut state = State::new(
+            &budget,
+            Surface::new(1200, 1400, Default::default()).unwrap(),
+        )
+        .unwrap();
+        observation(&mut state, &budget, 1_000_000_000);
+        state.choose_tab(1);
+        let divider = state.split.layout().unwrap().divider;
+        state.pointer(Phase::Press, 20, divider.y + 2);
+        let mut before = state.slots()[0].unwrap().rect.height;
+        for y in divider.y + 3..1250 {
+            state.pointer(Phase::Move, 20, y);
+            let next = state.slots()[0].unwrap().rect.height;
+            assert!(next >= before, "graph shrank at {y}: {before} -> {next}");
+            before = next;
+        }
+        state.pointer(Phase::Release, 20, 1250);
+    }
+    #[test]
     fn system_series_survive_refresh_and_resize_keeps_graph_navigation_available() {
         let budget = Budget::new(crate::budget::LIMIT).unwrap();
         let mut state = State::new(
@@ -2494,9 +2616,9 @@ mod tests {
         state
             .resize(Surface::new(900, 1400, Default::default()).unwrap())
             .unwrap();
-        state.graph_first = 0;
+        state.graph_first = 1;
         state.refresh(false);
-        state.set_focus(Focus::Graph);
+        state.set_focus(Focus::Tabs);
         let rect = state.device_list().unwrap().rect();
         state.pointer(Phase::Press, rect.x + 2, rect.y + 2);
         assert_eq!(

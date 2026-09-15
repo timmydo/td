@@ -1537,3 +1537,67 @@ fn the_caret_shows_only_when_visible_and_inside_the_window() {
         1
     );
 }
+
+#[test]
+fn action_buttons_have_borders_shared_hit_bounds_and_clipped_focus_pixels() {
+    let font = font::pinned().unwrap();
+    for scale in 1..=4u8 {
+        let s = usize::from(scale);
+        let surface = surface(240 * s, 64 * s, scale);
+        let rect = Rect {
+            x: (8 * s) as i64,
+            y: (8 * s) as i64,
+            width: (176 * s) as u32,
+            height: (24 * s) as u32,
+        };
+        let button = td_ui::chrome::Button::new(surface, rect).unwrap();
+        assert!(button.hit(rect.x, rect.y));
+        assert!(!button.hit(rect.x - 1, rect.y));
+        assert!(!button.hit(rect.x + i64::from(rect.width), rect.y));
+        for (selected, enabled) in [(false, true), (true, true), (true, false)] {
+            let paint = |damage| {
+                let mut pixels = vec![0x11; surface.width * surface.height * 4];
+                let mut raster =
+                    Raster::new(&mut pixels, &font, surface, surface.width * 4).unwrap();
+                button.emit("Refresh: 1 s", selected, enabled, damage, &mut |draw| {
+                    raster.draw(draw)
+                });
+                pixels
+            };
+            let full = paint(surface.bounds());
+            let damage = Rect {
+                x: rect.x + 3,
+                y: rect.y + 2,
+                width: rect.width / 2,
+                height: rect.height / 2,
+            };
+            let partial = paint(damage);
+            for y in 0..surface.height {
+                for x in 0..surface.width {
+                    let offset = (y * surface.width + x) * 4;
+                    let pixel = &partial[offset..offset + 4];
+                    if damage.contains(x as i64, y as i64) {
+                        assert_eq!(pixel, &full[offset..offset + 4]);
+                    } else {
+                        assert_eq!(pixel, &[0x11; 4]);
+                    }
+                }
+            }
+            let corner = (rect.y as usize * surface.width + rect.x as usize) * 4;
+            assert_eq!(&full[corner..corner + 4], &(BORDER | 0xff000000).to_le_bytes());
+            let draws = run(surface, |damage, sink| {
+                button.emit("Action", selected, enabled, damage, sink)
+            });
+            assert!(glyphs(&draws).iter().all(|g| g.3
+                == if !enabled {
+                    DISABLED
+                } else if selected {
+                    PAPER
+                } else {
+                    INK
+                }));
+        }
+        assert!(td_ui::chrome::Button::new(surface, Rect { x: -1, ..rect }).is_none());
+        assert!(td_ui::chrome::Button::new(surface, Rect { width: 0, ..rect }).is_none());
+    }
+}

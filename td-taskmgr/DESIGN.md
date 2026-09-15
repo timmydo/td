@@ -84,10 +84,14 @@ give one resource more room and expose its legend or device selector.
 CPU includes total and per-logical-CPU detail; Memory includes RAM and
 swap; Network and Disk show separate directions. These are resource tabs,
 so they have no close buttons. Switching tabs preserves process selection,
-search, sibling sort, expansions, scroll anchor, and the inspected time.
+search, sort mode, expansions, scroll anchor, and the inspected time.
 
 The divider initially splits usable height equally and is draggable and
-keyboard adjustable. Both panes retain useful minimum extents. Narrow
+keyboard adjustable. Dedicated resource tabs keep one row of cards as
+the divider moves, so
+adding height enlarges their graphs rather than adding rows and shrinking
+them. More cards remain reachable with Page Up/Down or the wheel. Overview
+uses up to two rows. Both panes retain useful minimum extents. Narrow
 windows reflow Overview and scroll graph content; the lower pane retains
 its search, column headings and at least one process row when space permits.
 At smaller extents show a resize message without losing state or extending
@@ -113,10 +117,15 @@ the processes and parent relationships recorded in that snapshot. A Live
 control explicitly returns to current observations. Historical rows never
 offer process actions, even if an apparently matching PID still exists.
 
-CPU and Memory have system line plots and separate stacked-area
-process-contribution plots. Process series use stable colors and explicit
-names; selecting a
-series reveals and selects its process row, expanding recorded ancestors.
+CPU and Memory have system line plots and separate process line plots.
+Each process keeps its own gaps, so an unreadable or newly observed process
+cannot blank another process's history. Selecting a process filters these
+process plots to that identity; the system plots retain their machine-wide
+basis. Compare all (Ctrl+A outside search) clears the process selection
+and any contributor list. Comparison series retain their palette slots
+while inspecting a selected process; names remain explicit. Selecting a
+series reveals
+and selects its process row, expanding recorded ancestors in tree mode.
 Search cannot hide a graph-selected row: reveal it and its ancestors as an
 explicit selection exception without discarding the query. Clicking a time
 outside a particular series opens a ranked contributor list for that time.
@@ -126,11 +135,12 @@ The list uses the same metric and sample as the graph and can reveal any
 retained process, including one now exited. Network and Disk clicks inspect
 device/interface values at that time and never invent a process selection.
 
-At most eight named process series are drawn together. Choose them by peak
-value across the visible history; retain the selected process as one of
-the eight and break ties by process key. Keep their vertical order fixed
-over that view. Remaining measured processes form Other observed, which
-opens the contributor list rather than selecting an arbitrary PID. Missing
+Comparison mode draws at most eight named process series. Choose them by
+peak value across the visible history and break ties by process key. Keep
+their legend order fixed over that view. Remaining measured processes
+form Other observed, which opens the contributor list rather than
+selecting an arbitrary PID. A selected process instead has one series,
+including explicit gaps when absent from retained samples. Missing
 observations are gaps, not zeroes. System CPU activity and RAM consumption
 are not forced to equal the sum of process observations.
 
@@ -147,12 +157,20 @@ but have no process identity, action menu or actionable subtree.
 Show all visible processes, including other users' processes when readable.
 Search matches the displayed command/name, PID, and numeric UID; matching
 descendants keep their ancestors as context rows. Search does not change
-subtree totals or the scope of a subtree action. Sort only siblings, with a
-stable process-key tie-break. Default is PID ascending; clicking a numeric
+subtree totals or the scope of a subtree action: actions resolve recorded
+snapshot ancestry independently of visible rows. Own CPU/RSS and subtree
+CPU/RSS column sorts produce a flat global ranking, including processes
+beneath collapsed
+parents; search retains only matches and an explicit selected exception.
+Sorting by Process restores the parent/child tree and saved expansions.
+PID, UID and state also sort siblings in tree mode. Every sort uses a
+stable process-key tie-break and returns the viewport to the first row.
+Default is PID ascending; clicking a numeric
 heading starts descending; a text heading starts ascending, comparing the
 displayed text by Unicode scalar value. Repeated clicks on the active sort
 heading toggle ascending/descending. Refresh preserves selection and the
-first visible row by key. While a pointer gesture or menu is active, freeze row geometry;
+first visible row by key. While a pointer gesture or menu is active,
+freeze row geometry;
 actions bind to the captured target, never a later row at the same index.
 
 The initial columns are name, PID, numeric UID, state, own CPU %, own RSS,
@@ -216,8 +234,8 @@ pieces summed with used RAM. Definitions follow
 
 Process contributions use resident bytes from RSS pages and the runtime
 page size. RSS is approximate and shared pages appear in multiple processes.
-Label the contribution plot and subtree RSS as summed RSS, including shared
-pages; they may exceed physical RAM and are not a decomposition of system
+Label process RSS as including shared pages and subtree RSS as summed RSS.
+Process sums may exceed physical RAM and are not a decomposition of system
 used memory. Version 1 does not continuously walk smaps for proportional
 accounting. The RSS limitations are documented in the kernel's
 [procfs reference](https://docs.kernel.org/filesystems/proc.html).
@@ -463,7 +481,8 @@ visible samples, retains a selected observed process, breaks ties by key and
 keeps series order by key. Retained named keys keep their palette slots; new
 names take free slots. Missing observations and unknown/overflowing Other
 observed totals stay gaps. The window implements device selection, checked
-selected-device sums, search/sibling ordering and the visible tree
+selected-device sums, search/sibling ordering and the visible tree or flat
+ranking
 projection. Process controls use a separate bounded action worker.
 
 The affected-check mapping runs the discovered standalone crate and
@@ -477,7 +496,8 @@ The image and launcher runtime coverage is recorded below.
 
 ## Implemented window
 
-`projection` constructs the sibling-sorted visible parent/child rows with
+`projection` constructs globally ranked metric rows or sibling-sorted
+parent/child rows with
 search ancestors and selected-row exceptions. Explicit labels identify both
 kinds of context without changing the query. `view` adapts those rows to
 td-ui's tree table, charging its storage and reusable visible cell cache to
@@ -540,7 +560,8 @@ surface buffers retain td-ui's separate ceilings.
 
 `--preview [WIDTHxHEIGHT]` emits a PPM from two actual observations.
 `--help` and `--font-license` require no display. Ctrl+L returns to Live,
-Ctrl+I cycles cadence and Ctrl+Q closes; graph Page Up/Down scrolls cards,
+Ctrl+I cycles cadence, Ctrl+A outside search clears the process plot filter,
+and Ctrl+Q closes; graph Page Up/Down scrolls cards,
 Ctrl+Tab selects another visible graph and arrows inspect times/series.
 Network/Disk add a device-list stop to the Tab focus cycle; Space toggles
 membership. Escape closes the ranked contributors before changing focus.
