@@ -215,7 +215,7 @@ mod tests {
                 assert!(entry.file_type().unwrap().is_file());
                 let name = format!("{directory}/{}", entry.file_name().to_str().unwrap());
                 // This standalone QEMU driver is host-only diagnostic code.
-                if name != "tests/launch_vm.rs" {
+                if !matches!(name.as_str(), "tests/launch_vm.rs" | "tests/launch_taskmgr_vm.rs") {
                     actual.push(name);
                 }
             }

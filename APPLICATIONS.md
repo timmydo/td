@@ -8077,7 +8077,7 @@ middle.
 | `td-busd` | 992 (`tdb1000`) | protected runtime and explicit kernel-UID admission |
 | `td-portal` | 991 (`tdp1000`) | owns the credential store and reads a fixed read-only Downloads view |
 | `td-jail` (stage 0/1) | 1000 | fully unprivileged — resolve, register, unshare. It writes only under `~/.td/app` (§B.4), where `td-firstboot` may already have placed a first configuration as the user's own files; packages are read-only store paths (§B.1) |
-| `td-authd` | root | fixed terminal launcher; §L.1 elevation remains unimplemented |
+| `td-authd` | root | fixed human terminal and task-manager launcher; §L.1 elevation remains unimplemented |
 | `td-jail` | 1000 | it *is* the boundary; it holds nothing |
 | `td-audio` | **`audio`** | §K.5 — dedicated audio uid |
 | the app | 1000, identity-mapped | upstream's model; see below |
@@ -8166,6 +8166,15 @@ list must not do is imply a network boundary that `.OpenURI` walks
 around.
 
 ---
+
+The source-built `td-taskmgr` is a system inspection tool, launched by the
+fixed private authority request 07 as the human user after credential and
+session-cgroup validation. The image ships its complete recipe output,
+including its debug companion, and a `/bin/td-taskmgr` link. It retains
+the system PID view outside application namespaces. It receives no root
+credentials, capability grant or authority channel; process controls use
+ordinary kernel permission checks. The compositor exposes its Task Manager
+card only in authority mode. This does not add an elevation operation.
 
 ### L.1 Elevation — consent without a secret
 

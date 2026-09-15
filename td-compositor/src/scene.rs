@@ -907,6 +907,10 @@ impl Scene {
         }
     }
 
+    pub(crate) fn set_launcher_task_manager(&mut self, available: bool) {
+        self.launcher.set_task_manager(available);
+    }
+
     pub(crate) fn set_launcher_application(&mut self, application: Option<&str>) {
         self.launcher.set_application(application);
     }

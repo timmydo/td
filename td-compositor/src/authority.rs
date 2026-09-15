@@ -29,7 +29,7 @@ const QUEUE_CAPACITY: usize = 1;
 const TICK: Duration = Duration::from_millis(250);
 
 enum Work {
-    Terminal(Terminal),
+    Program(Program),
     Secret(std::sync::Arc<crate::secret_client::Attempt>),
 }
 
@@ -44,11 +44,11 @@ impl Launcher {
         startup()?;
         let mut wire = channel::Channel::from_stdin(0).map_err(|e| e.to_string())?;
         if wire.receive().map_err(|e| e.to_string())? != VERSION {
-            return Err("unsupported terminal authority protocol".into());
+            return Err("unsupported program authority protocol".into());
         }
         wire.send(VERSION).map_err(|e| e.to_string())?;
         if wire.receive().map_err(|e| e.to_string())? != [0x80] {
-            return Err("terminal authority refused session admission".into());
+            return Err("program authority refused session admission".into());
         }
         prepare_session(&mut wire)?;
         let (send, receive) = mpsc::sync_channel(QUEUE_CAPACITY);
@@ -58,13 +58,13 @@ impl Launcher {
                 if let Err(error) = worker(wire, receive) {
                     let _ = writeln!(
                         std::io::stderr().lock(),
-                        "td-compositor: terminal authority: {error}"
+                        "td-compositor: program authority: {error}"
                     );
                 }
                 // Losing either peer must end this paired service generation.
                 std::process::exit(1);
             })
-            .map_err(|e| format!("start terminal authority worker: {e}"))?;
+            .map_err(|e| format!("start program authority worker: {e}"))?;
         Ok(Self { send })
     }
 
@@ -80,32 +80,33 @@ impl Launcher {
     }
 
     pub fn launch(&self) -> Result<(), String> {
-        match self.send.try_send(Work::Terminal(Terminal::Home)) {
+        match self.send.try_send(Work::Program(Program::Home)) {
             Ok(()) => Ok(()),
-            Err(TrySendError::Full(_)) => Err("terminal launch is already pending".into()),
-            Err(TrySendError::Disconnected(_)) => Err("terminal authority is unavailable".into()),
+            Err(TrySendError::Full(_)) => Err("program launch is already pending".into()),
+            Err(TrySendError::Disconnected(_)) => Err("program authority is unavailable".into()),
         }
     }
 
     pub fn launch_task(&self) -> Result<(), String> {
-        self.launch_selected(Terminal::Task)
+        self.launch_selected(Program::Task)
     }
 
-    pub fn launch_selected(&self, terminal: Terminal) -> Result<(), String> {
-        match self.send.try_send(Work::Terminal(terminal)) {
+    pub fn launch_selected(&self, terminal: Program) -> Result<(), String> {
+        match self.send.try_send(Work::Program(terminal)) {
             Ok(()) => Ok(()),
-            Err(TrySendError::Full(_)) => Err("terminal launch is already pending".into()),
-            Err(TrySendError::Disconnected(_)) => Err("terminal authority is unavailable".into()),
+            Err(TrySendError::Full(_)) => Err("program launch is already pending".into()),
+            Err(TrySendError::Disconnected(_)) => Err("program authority is unavailable".into()),
         }
     }
 }
 
 #[derive(Clone, Copy)]
-pub(crate) enum Terminal {
+pub(crate) enum Program {
     Home,
     Task,
     Codex,
     Claude,
+    TaskManager,
 }
 
 fn startup() -> Result<(), String> {
@@ -233,37 +234,38 @@ impl Processes {
     fn start(
         &mut self,
         wire: &mut impl Exchange,
-        terminal: Terminal,
+        terminal: Program,
     ) -> Result<Option<&'static str>, String> {
         if self.handles.len() >= CAPACITY {
-            return Ok(Some("terminal launch limit reached"));
+            return Ok(Some("program launch limit reached"));
         }
         let request = match terminal {
-            Terminal::Home => [1],
-            Terminal::Task => [4],
-            Terminal::Codex => [5],
-            Terminal::Claude => [6],
+            Program::Home => [1],
+            Program::Task => [4],
+            Program::Codex => [5],
+            Program::Claude => [6],
+            Program::TaskManager => [7],
         };
         match wire.exchange(&request)?.as_slice() {
-            [0xff, 1] => Ok(Some("terminal authority process table is full")),
-            [0xff, 2] => Ok(Some("terminal authority could not start the helper")),
+            [0xff, 1] => Ok(Some("program authority process table is full")),
+            [0xff, 2] => Ok(Some("program authority could not start the helper")),
             [0x81, handle @ ..] if handle.len() == 8 => {
                 let handle = u64::from_be_bytes(handle.try_into().map_err(|_| "invalid handle")?);
                 if handle <= self.latest {
-                    return Err("terminal authority reused a process handle".into());
+                    return Err("program authority reused a process handle".into());
                 }
                 self.latest = handle;
                 self.handles.push_back(handle);
                 Ok(None)
             }
-            _ => Err("invalid terminal authority start response".into()),
+            _ => Err("invalid program authority start response".into()),
         }
     }
 
     fn poll(&mut self, wire: &mut impl Exchange) -> Result<Option<&'static str>, String> {
         let Some(handle) = self.handles.pop_front() else {
             if wire.exchange(&[3])? != [0x83] {
-                return Err("invalid terminal authority heartbeat".into());
+                return Err("invalid program authority heartbeat".into());
             }
             return Ok(None);
         };
@@ -281,8 +283,8 @@ impl Processes {
                 Ok(None)
             }
             [0x82, 1] => Ok(None),
-            [0x82, 2] => Ok(Some("launched terminal failed")),
-            _ => Err("invalid terminal authority process status".into()),
+            [0x82, 2] => Ok(Some("launched program failed")),
+            _ => Err("invalid program authority process status".into()),
         }
     }
 }
@@ -293,7 +295,7 @@ fn worker(mut wire: impl Exchange, receive: Receiver<Work>) -> Result<(), String
     loop {
         match receive.recv_timeout(TICK) {
             Ok(Work::Secret(attempt)) => secrets.start(&mut wire, attempt)?,
-            Ok(Work::Terminal(terminal)) => {
+            Ok(Work::Program(terminal)) => {
                 if let Some(error) = processes.start(&mut wire, terminal)? {
                     let _ = writeln!(std::io::stderr().lock(), "td-compositor: {error}");
                 }
@@ -418,12 +420,12 @@ mod tests {
             vec![0x82, 1],
             vec![0x83],
         ]);
-        assert_eq!(p.start(&mut w, Terminal::Home).unwrap(), None);
-        assert_eq!(p.start(&mut w, Terminal::Task).unwrap(), None);
+        assert_eq!(p.start(&mut w, Program::Home).unwrap(), None);
+        assert_eq!(p.start(&mut w, Program::Task).unwrap(), None);
         assert_eq!(w.requests[0], [1]);
         assert_eq!(w.requests[1], [4]);
         assert_eq!(p.poll(&mut w).unwrap(), None);
-        assert_eq!(p.poll(&mut w).unwrap(), Some("launched terminal failed"));
+        assert_eq!(p.poll(&mut w).unwrap(), Some("launched program failed"));
         assert_eq!(p.poll(&mut w).unwrap(), None);
         assert_eq!(p.poll(&mut w).unwrap(), None);
         assert_eq!(w.requests[2], [2, 0, 0, 0, 0, 0, 0, 0, 1]);
@@ -433,8 +435,12 @@ mod tests {
     }
 
     #[test]
-    fn selected_agents_send_only_their_fixed_authority_request() {
-        for (terminal, expected) in [(Terminal::Codex, 5), (Terminal::Claude, 6)] {
+    fn selected_programs_send_only_their_fixed_authority_request() {
+        for (terminal, expected) in [
+            (Program::Codex, 5),
+            (Program::Claude, 6),
+            (Program::TaskManager, 7),
+        ] {
             let mut processes = Processes::new();
             let mut wire = wire(vec![handle(1)]);
             assert_eq!(processes.start(&mut wire, terminal).unwrap(), None);
@@ -452,20 +458,20 @@ mod tests {
             vec![0xff, 1, 0],
         ] {
             assert!(Processes::new()
-                .start(&mut wire(vec![answer]), Terminal::Home)
+                .start(&mut wire(vec![answer]), Program::Home)
                 .is_err());
         }
         let mut p = Processes::new();
         let mut w = wire(vec![handle(1), vec![0x82, 1], handle(1)]);
-        p.start(&mut w, Terminal::Home).unwrap();
+        p.start(&mut w, Program::Home).unwrap();
         p.poll(&mut w).unwrap();
-        assert!(p.start(&mut w, Terminal::Home).is_err());
+        assert!(p.start(&mut w, Program::Home).is_err());
         let mut p = Processes::new();
         let mut w = wire((1..=16).map(handle).collect());
         for _ in 0..16 {
-            assert_eq!(p.start(&mut w, Terminal::Home).unwrap(), None);
+            assert_eq!(p.start(&mut w, Program::Home).unwrap(), None);
         }
-        assert!(p.start(&mut w, Terminal::Home).unwrap().is_some());
+        assert!(p.start(&mut w, Program::Home).unwrap().is_some());
         assert_eq!(w.requests.len(), 16);
     }
 
@@ -480,7 +486,7 @@ mod tests {
         ] {
             let mut processes = Processes::new();
             let mut wire = wire(vec![handle(1), status]);
-            processes.start(&mut wire, Terminal::Home).unwrap();
+            processes.start(&mut wire, Program::Home).unwrap();
             assert!(processes.poll(&mut wire).is_err());
         }
         for status in [vec![], vec![0x83, 0], vec![0x82, 1]] {
@@ -489,7 +495,7 @@ mod tests {
         for response in [vec![0xff, 1], vec![0xff, 2]] {
             let mut processes = Processes::new();
             assert!(processes
-                .start(&mut wire(vec![response]), Terminal::Home)
+                .start(&mut wire(vec![response]), Program::Home)
                 .unwrap()
                 .is_some());
             assert!(processes.handles.is_empty());
@@ -507,7 +513,7 @@ mod tests {
             }
         }
         let (send, receive) = mpsc::sync_channel(QUEUE_CAPACITY);
-        assert!(send.try_send(Work::Terminal(Terminal::Home)).is_ok());
+        assert!(send.try_send(Work::Program(Program::Home)).is_ok());
         drop(send);
         let calls = std::rc::Rc::new(std::cell::Cell::new(0));
         assert!(worker(Broken(calls.clone()), receive).is_err());
@@ -520,9 +526,15 @@ mod tests {
         let launcher = Launcher { send };
         assert!(launcher.launch().is_ok());
         assert!(launcher.launch().is_err());
-        assert!(matches!(receive.try_recv(), Ok(Work::Terminal(Terminal::Home))));
+        assert!(matches!(
+            receive.try_recv(),
+            Ok(Work::Program(Program::Home))
+        ));
         assert!(launcher.launch_task().is_ok());
-        assert!(matches!(receive.try_recv(), Ok(Work::Terminal(Terminal::Task))));
+        assert!(matches!(
+            receive.try_recv(),
+            Ok(Work::Program(Program::Task))
+        ));
         assert!(receive.try_recv().is_err());
         drop(receive);
         assert!(launcher.launch().is_err());

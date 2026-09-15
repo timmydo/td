@@ -2418,7 +2418,7 @@ Confinement tests inventory the complete production source, pin keyword counts
 without prose slack, function-only allowances, both bodies, ABI layouts, all
 syscall and option values and production callers. A fifth syscall, new option,
 caller, descriptor consumer or allowance amends this section and
-td-authd/DESIGN.md in the same landing. The terminal-launch consumer adds no
+td-authd/DESIGN.md in the same landing. The fixed-program launch consumer adds no
 raw syscall or descriptor-adoption surface. Its startup admits only the three
 standard descriptors before the channel greeting. Safe std replaces all three
 with `/dev/null` for every child; the Channel sender-pinning greeting
@@ -2426,6 +2426,11 @@ precedes the first spawn. The unprivileged terminal-exec path checks its
 already-dropped identity and exact session cgroup before a fixed exec. Safe
 std creates a new process group for the terminal helper; neither path adds
 a raw syscall or credential switch.
+The closed request roster also admits task manager request 07. After the
+same credential and cgroup checks, it execs only /bin/td-taskmgr with no
+arguments and the fixed human Wayland socket. This ordinary human program
+retains the system PID view and current signal permissions; it gains no
+elevation or authority descriptor.
 Confinement pins the complete startup and launch sources as well as the raw
 channel boundary.
 

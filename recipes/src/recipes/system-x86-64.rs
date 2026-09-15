@@ -4170,6 +4170,14 @@ fn real_root_steps(sys: &SystemDef) -> Result<Vec<Step>, String> {
         from: "{in:td-profiler}".into(),
         dest: "{root}/real-root{in:td-profiler}".into(),
     });
+    steps.push(Step::CopyTree {
+        from: "{in:td-taskmgr}".into(),
+        dest: "{root}/real-root{in:td-taskmgr}".into(),
+    });
+    steps.push(Step::Symlink {
+        target: "{in:td-taskmgr}/bin/td-taskmgr".into(),
+        link: "{root}/real-root/bin/td-taskmgr".into(),
+    });
     // td-jail is static so the running-kernel transition oracle does not depend
     // on the dynamic userland it helps confine.
     steps.push(Step::CopyTree {
@@ -5222,6 +5230,7 @@ pub fn recipe() -> Recipe {
             "td-authd",
             "td-svc",
             "td-profiler",
+            "td-taskmgr",
             "td-jail",
             "td-seatd",
             "td-vm-guest",
@@ -6884,7 +6893,7 @@ news\tnews-0.1\tsource\tempty-runtime-1\tsource\n"
         );
         assert_eq!(unit_key("wayland", "cgroup").as_deref(), Some("service"));
         let steps = real_root_steps(&SYSTEM).unwrap();
-        for (name, package) in [("td-authd", "td-authd"), ("td-term", "td-compositor")] {
+        for (name, package) in [("td-authd", "td-authd"), ("td-term", "td-compositor"), ("td-taskmgr", "td-taskmgr")] {
             assert!(steps.iter().any(|step| matches!(step,
                 Step::Symlink { link, target }
                 if link == &format!("{{root}}/real-root/bin/{name}")
@@ -12929,6 +12938,34 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
         assert!(
             native_inputs.iter().any(|i| i == "td-net"),
             "td-net must be a declared native input, or {{in:td-net}} does not resolve"
+        );
+    }
+
+    #[test]
+    fn td_taskmgr_is_packed_and_not_merely_symlinked() {
+        let steps = real_root_steps(&SYSTEM).unwrap();
+        assert!(
+            steps.iter().any(|step| matches!(
+                step,
+                Step::CopyTree { from, dest }
+                    if from == "{in:td-taskmgr}"
+                        && dest == "{root}/real-root{in:td-taskmgr}"
+            )),
+            "td-taskmgr must be CopyTree'd into the immutable root"
+        );
+        assert!(
+            steps.iter().any(|step| matches!(
+                step,
+                Step::Symlink { target, link }
+                    if target == "{in:td-taskmgr}/bin/td-taskmgr"
+                        && link == "{root}/real-root/bin/td-taskmgr"
+            )),
+            "/bin/td-taskmgr must name the staged static package"
+        );
+        let native_inputs = recipe().native_inputs.expect("system native inputs");
+        assert!(
+            native_inputs.iter().any(|input| input == "td-taskmgr"),
+            "td-taskmgr must be a declared native input"
         );
     }
 

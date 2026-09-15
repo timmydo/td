@@ -1,4 +1,4 @@
-//! Fixed terminal launches for the separately owned compositor.
+//! Fixed human-session program launches for the separately owned compositor.
 
 use crate::channel::Channel;
 use std::collections::BTreeMap;
@@ -61,18 +61,18 @@ impl Config {
         command
     }
 
-    fn terminal(&self, generation: &str, handle: u64, terminal: Terminal) -> Command {
+    fn terminal(&self, generation: &str, handle: u64, terminal: Program) -> Command {
         let mut command = Command::new("/bin/td-login");
         command.args([
-                "exec-as",
-                &self.user,
-                "--",
-                "/bin/td-authd",
-                "terminal-exec",
-                &self.owner.to_string(),
-                generation,
-                &handle.to_string(),
-            ]);
+            "exec-as",
+            &self.user,
+            "--",
+            "/bin/td-authd",
+            "terminal-exec",
+            &self.owner.to_string(),
+            generation,
+            &handle.to_string(),
+        ]);
         if let Some(selection) = terminal.selection() {
             command.arg(selection);
         }
@@ -198,7 +198,15 @@ fn require_session_process(uid: u32, status: &str, cgroup: &str) -> Result<(), S
     Ok(())
 }
 
-fn terminal_command(uid: u32, generation: &str, handle: u64, terminal: Terminal) -> Command {
+fn terminal_command(uid: u32, generation: &str, handle: u64, terminal: Program) -> Command {
+    if terminal == Program::TaskManager {
+        let mut command = Command::new("/bin/td-taskmgr");
+        command.env(
+            "WAYLAND_DISPLAY",
+            format!("/run/td-compositor/{uid}/wayland-0"),
+        );
+        return command;
+    }
     let mut command = Command::new("/bin/td-term");
     command.env(
         "TD_CONTROL_SOCKET",
@@ -211,17 +219,17 @@ fn terminal_command(uid: u32, generation: &str, handle: u64, terminal: Terminal)
         "--ready-socket",
         &format!("/run/user/{uid}/td-auth-terminal-{generation}-{handle}.ready"),
     ]);
-    if terminal != Terminal::Home {
+    if terminal != Program::Home {
         command.args(["--working-directory", TASK_DIRECTORY]);
     }
     match terminal {
-        Terminal::Codex => {
+        Program::Codex => {
             command.args(["--command", "/bin/cttyhack", "--stdin", "/bin/codex"]);
         }
-        Terminal::Claude => {
+        Program::Claude => {
             command.args(["--command", "/bin/cttyhack", "--stdin", "/bin/claude"]);
         }
-        Terminal::Home | Terminal::Task => {}
+        Program::Home | Program::Task | Program::TaskManager => {}
     }
     command
 }
@@ -229,17 +237,24 @@ fn terminal_command(uid: u32, generation: &str, handle: u64, terminal: Terminal)
 /// Runs only after td-login dropped credentials, before any terminal code.
 pub(crate) fn terminal_exec(arguments: &[String]) -> Result<(), String> {
     let (uid, generation, handle, terminal) = match arguments {
-        [uid, generation, handle] => (uid, generation, handle, Terminal::Home),
+        [uid, generation, handle] => (uid, generation, handle, Program::Home),
         [uid, generation, handle, task] if task == "task" => {
-            (uid, generation, handle, Terminal::Task)
+            (uid, generation, handle, Program::Task)
         }
         [uid, generation, handle, agent] if agent == "codex" => {
-            (uid, generation, handle, Terminal::Codex)
+            (uid, generation, handle, Program::Codex)
         }
         [uid, generation, handle, agent] if agent == "claude" => {
-            (uid, generation, handle, Terminal::Claude)
+            (uid, generation, handle, Program::Claude)
         }
-        _ => return Err("terminal-exec requires UID GENERATION HANDLE [task|codex|claude]".into()),
+        [uid, generation, handle, program] if program == "taskmgr" => {
+            (uid, generation, handle, Program::TaskManager)
+        }
+        _ => {
+            return Err(
+                "terminal-exec requires UID GENERATION HANDLE [task|codex|claude|taskmgr]".into(),
+            )
+        }
     };
     let uid = number(uid, 1000..=1000)?;
     if generation.len() != 32
@@ -328,37 +343,40 @@ fn wait_check(child: &mut Child, deadline: Instant) -> Result<(), String> {
 
 #[derive(Debug, PartialEq, Eq)]
 enum Request {
-    Start(Terminal),
+    Start(Program),
     Poll(u64),
     Heartbeat,
     Secret(crate::session::Request),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Terminal {
+enum Program {
     Home,
     Task,
     Codex,
     Claude,
+    TaskManager,
 }
 
-impl Terminal {
+impl Program {
     fn selection(self) -> Option<&'static str> {
         match self {
             Self::Home => None,
             Self::Task => Some("task"),
             Self::Codex => Some("codex"),
             Self::Claude => Some("claude"),
+            Self::TaskManager => Some("taskmgr"),
         }
     }
 }
 
 fn request(bytes: &[u8]) -> Result<Request, String> {
     match bytes {
-        [1] => Ok(Request::Start(Terminal::Home)),
-        [4] => Ok(Request::Start(Terminal::Task)),
-        [5] => Ok(Request::Start(Terminal::Codex)),
-        [6] => Ok(Request::Start(Terminal::Claude)),
+        [1] => Ok(Request::Start(Program::Home)),
+        [4] => Ok(Request::Start(Program::Task)),
+        [5] => Ok(Request::Start(Program::Codex)),
+        [6] => Ok(Request::Start(Program::Claude)),
+        [7] => Ok(Request::Start(Program::TaskManager)),
         [2, rest @ ..] if rest.len() == 8 => {
             let handle =
                 u64::from_be_bytes(rest.try_into().map_err(|_| "invalid terminal handle")?);
@@ -475,11 +493,23 @@ mod tests;
 fn enrollment_dispatch_reaches_the_secret_decoder() -> Result<(), String> {
     use crate::consent::Recovery;
     for (tag, recovery) in [(0, Recovery::Unrecoverable), (1, Recovery::SecondToken)] {
-        assert_eq!(request(&[0x16, tag])?, Request::Secret(crate::session::Request::Enroll(recovery)));
+        assert_eq!(
+            request(&[0x16, tag])?,
+            Request::Secret(crate::session::Request::Enroll(recovery))
+        );
     }
-    assert_eq!(request(&[0x17])?, Request::Secret(crate::session::Request::Inspect));
-    assert_eq!(request(&[0x18])?, Request::Secret(crate::session::Request::Write));
-    assert_eq!(request(&[0x19])?, Request::Secret(crate::session::Request::Install));
+    assert_eq!(
+        request(&[0x17])?,
+        Request::Secret(crate::session::Request::Inspect)
+    );
+    assert_eq!(
+        request(&[0x18])?,
+        Request::Secret(crate::session::Request::Write)
+    );
+    assert_eq!(
+        request(&[0x19])?,
+        Request::Secret(crate::session::Request::Install)
+    );
     assert!(request(&[0x1a]).is_err());
     assert!(request(&[0x16, 2]).is_err());
     Ok(())

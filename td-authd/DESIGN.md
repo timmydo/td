@@ -433,13 +433,12 @@ update; overflow never silently drops reservations. Without a complete
 ledger, keep the application UID launcher disabled. Console recovery does not
 make an unverified deployment pass the boot oracle.
 
-## Fixed terminal launch prerequisite
+## Fixed program launch prerequisite
 
 `terminal-serve --user USER --uid UID --peer-uid UID` is a root-configured
 consumer of the private channel. The image compositor runs at its reserved
-identity and uses this channel for human terminal creation. The configured
-application card already activates a supervised window; only terminal creation
-needs this request. Direct compositor spawning remains a host-development
+identity and uses this channel for human terminals and the task manager.
+The configured application card activates a supervised window. Direct compositor spawning remains a host-development
 mode.
 
 Startup requires all four root uid/gid columns, one thread, and only fd
@@ -469,8 +468,8 @@ The validator has a two-second observed completion deadline, measured before
 spawn and shorter than the channel frame deadline. Failure kills and reaps
 the trusted validator and closes the channel. There is no caller-provided
 executable, environment, directory path, account, uid or argument vector. A
-typed terminal kind selects either the account home or td's fixed task
-worktree. All
+typed program kind selects a fixed executable and, for terminals, either
+the account home or td's fixed task worktree. All
 authority-spawned credential-helper children replace stdin, stdout and stderr
 with `/dev/null`, clear the environment, and start from `/`. The task variant's
 eventual td-term child enters only the fixed worktree described below. Replacing
@@ -493,6 +492,7 @@ Subsequent payloads are exact byte records:
 | `04` | `81` plus a process handle for a terminal in the fixed task worktree |
 | `05` | `81` plus a process handle for Codex in the fixed task worktree |
 | `06` | `81` plus a process handle for Claude in the fixed task worktree |
+| `07` | `81` plus a process handle for the human task manager |
 
 A full table returns `ff 01`; a spawn failure returns `ff 02`. Every other
 request, trailing byte, unknown handle, wait error, timeout or transport
@@ -515,8 +515,8 @@ increase without reuse; exhaustion fails before spawn. The peer must send a
 request or heartbeat within each five-second receive deadline.
 
 The authority runs `/bin/td-login exec-as USER -- /bin/td-authd
-terminal-exec UID GENERATION HANDLE [task|codex|claude]` in a new process group.
-The optional literal selects requests `04`, `05`, or `06`; it is not a pathname.
+terminal-exec UID GENERATION HANDLE [task|codex|claude|taskmgr]` in a new process group.
+The optional literal selects requests `04`, `05`, `06`, or `07`; it is not a pathname.
 td-login checks
 the human account policy and drops and verifies credentials. Its exact
 environment is `HOME`, `SHELL`, `USER`, `LOGNAME` from the account and
@@ -528,7 +528,18 @@ nonfatal for console recovery; this wrapper makes it fatal before terminal
 code runs. The current launcher supports only uid 1000, the sole delegation
 configured by td-login.
 
-After that check it execs `/bin/td-term run --socket
+For request `07`, after that check it execs `/bin/td-taskmgr` with no
+arguments, adding only `WAYLAND_DISPLAY=/run/td-compositor/UID/wayland-0`
+to the verified human environment. It keeps the outer PID namespace and
+ordinary human credentials, including kernel signal permission checks.
+No authority descriptor, extra capability or elevation enters the program.
+The program is a source-built system tool, not a jailed application.
+An older authority closes the entire launch channel on unknown request
+07; its paired compositor then restarts. The image ships both peers
+atomically. The exact new record is additive within TDLA002, without
+negotiation or mixed-version compatibility.
+
+For terminal requests it execs `/bin/td-term run --socket
 /run/td-compositor/UID/wayland-0 --ready-socket
 /run/user/UID/td-auth-terminal-GENERATION-HANDLE.ready`. The task variant adds
 `--working-directory /home/tester/src/td-vm/work`; the ordinary variant keeps
@@ -1297,3 +1308,15 @@ cgroup owns every descendant and forbids a replacement generation until the
 entire previous cgroup is empty; helpers never detach from that containment.
 The boot transaction owns recovery of interrupted publication. No privileged
 shell, setuid entry, remembered consent or new credential switch is added.
+
+The host-only launch VM fixture also accepts `--run-taskmgr-vm`, followed
+by the ordinary kernel/authd/firstboot/login/busybox inputs, compositor,
+task manager, optional deployment EROFS, and a new absolute log path.
+With EROFS it mounts the deployment read-only and resolves every program
+under test through its shipped /bin link and /td/store output. It drives
+request 07 through the real root private channel, verifies all four human
+UID/GID columns, zero capabilities, outer PID view, human session cgroup
+and null standard descriptors. Real compositor keyboard input and
+correlated captures check live repaint, default Cancel, and confirmed
+suspend/resume of a child owned by the driver. Host fixture source is not
+staged into the target authority recipe.

@@ -5,13 +5,13 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 
 const CARD_WIDTH: usize = 480;
-const CARD_HEIGHT: usize = 210;
+const CARD_HEIGHT: usize = 252;
 const CARD_PADDING: usize = 24;
 const MAX_LAUNCHED_CLIENTS: usize = 16;
 const MAX_APPLICATION_NAME_BYTES: usize = 32;
 const RESERVED_APPLICATION_NAMES: &[&str] = &["td-jail", "td-jail-reaper-probe"];
 const UI_ENTRY_INDEX: usize = 1;
-const ENTRY_COUNT: usize = 3;
+const ENTRY_COUNT: usize = 4;
 pub(crate) const TASK_DIRECTORY: &str = "/home/tester/src/td-vm/work";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -30,6 +30,7 @@ pub enum LaunchRequest {
     UiDemo,
     Terminal,
     TaskTerminal,
+    TaskManager,
 }
 
 #[derive(Clone, Copy)]
@@ -65,7 +66,11 @@ struct ApplicationEntry {
     search: String,
 }
 
-fn entry_at(application: Option<&ApplicationEntry>, index: usize) -> Option<Entry<'_>> {
+fn entry_at(
+    application: Option<&ApplicationEntry>,
+    index: usize,
+    task_manager: bool,
+) -> Option<Entry<'_>> {
     match index {
         0 => Some(TERMINAL_ENTRY),
         UI_ENTRY_INDEX => match application {
@@ -76,7 +81,12 @@ fn entry_at(application: Option<&ApplicationEntry>, index: usize) -> Option<Entr
             }),
             None => Some(DIRECT_UI_ENTRY),
         },
-        2 => Some(CLOSE_ENTRY),
+        2 if task_manager => Some(Entry {
+            label: "TASK MANAGER",
+            search: "task manager processes cpu memory network disk",
+            request: Some(LaunchRequest::TaskManager),
+        }),
+        3 => Some(CLOSE_ENTRY),
         _ => None,
     }
 }
@@ -88,6 +98,7 @@ pub struct Launcher {
     query: String,
     matches: Vec<usize>,
     application: Option<ApplicationEntry>,
+    task_manager: bool,
 }
 
 pub struct LaunchOptions {
@@ -144,7 +155,10 @@ impl LaunchBackend {
         }
     }
 
-    pub fn unlock(&self, attempt: std::sync::Arc<crate::secret_client::Attempt>) -> Result<(), String> {
+    pub fn unlock(
+        &self,
+        attempt: std::sync::Arc<crate::secret_client::Attempt>,
+    ) -> Result<(), String> {
         match self {
             Self::Authority(authority) => authority.unlock(attempt),
             Self::Direct(_) => Err("secret unlock requires the paired authority".into()),
@@ -167,6 +181,10 @@ impl LaunchBackend {
             }
             Self::Authority(authority) if request == LaunchRequest::TaskTerminal => {
                 authority.launch_task()?;
+                Ok(Vec::new())
+            }
+            Self::Authority(authority) if request == LaunchRequest::TaskManager => {
+                authority.launch_selected(crate::authority::Program::TaskManager)?;
                 Ok(Vec::new())
             }
             // LiveInputTarget activates the configured scene before calling us.
@@ -215,9 +233,10 @@ impl LaunchOptions {
                 || application.name == "."
                 || application.name.contains("..")
                 || RESERVED_APPLICATION_NAMES.contains(&application.name.as_str())
-                || !application.name.bytes().all(|byte| {
-                    byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-')
-                })
+                || !application
+                    .name
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
             {
                 return Err("launcher application name is outside the image grammar".into());
             }
@@ -232,9 +251,15 @@ impl Launcher {
             visible: false,
             selected: 0,
             query: String::with_capacity(filter::MAX_QUERY_BYTES),
-            matches: (0..ENTRY_COUNT).collect(),
+            matches: vec![0, UI_ENTRY_INDEX, ENTRY_COUNT - 1],
             application: None,
+            task_manager: false,
         }
+    }
+
+    pub(crate) fn set_task_manager(&mut self, available: bool) {
+        self.task_manager = available;
+        self.refresh_matches();
     }
 
     pub(crate) fn set_application(&mut self, application: Option<&str>) {
@@ -268,7 +293,9 @@ impl Launcher {
                 let request = self
                     .matches
                     .get(self.selected)
-                    .and_then(|index| entry_at(self.application.as_ref(), *index))
+                    .and_then(|index| {
+                        entry_at(self.application.as_ref(), *index, self.task_manager)
+                    })
                     .map(|entry| entry.request);
                 let request = request?;
                 self.visible = false;
@@ -295,7 +322,7 @@ impl Launcher {
     fn refresh_matches(&mut self) {
         self.matches.clear();
         for index in 0..ENTRY_COUNT {
-            let Some(entry) = entry_at(self.application.as_ref(), index) else {
+            let Some(entry) = entry_at(self.application.as_ref(), index, self.task_manager) else {
                 continue;
             };
             if filter::matches(entry.search, &self.query) {
@@ -374,7 +401,8 @@ impl Launcher {
             );
         }
         for (match_index, entry_index) in self.matches.iter().enumerate() {
-            let Some(entry) = entry_at(self.application.as_ref(), *entry_index) else {
+            let Some(entry) = entry_at(self.application.as_ref(), *entry_index, self.task_manager)
+            else {
                 continue;
             };
             let row_top = top
@@ -437,7 +465,8 @@ impl Launcher {
         self.matches
             .iter()
             .filter_map(|index| {
-                entry_at(self.application.as_ref(), *index).map(|entry| entry.label)
+                entry_at(self.application.as_ref(), *index, self.task_manager)
+                    .map(|entry| entry.label)
             })
             .collect()
     }
@@ -595,6 +624,9 @@ pub(crate) fn launch_command(
     // activates the observed surface through Runtime and must never create a
     // second process over the same persistent profile.
     let (program, published_ready, tracked_ready) = match (request, &options.application) {
+        (LaunchRequest::TaskManager, _) => {
+            return Err("task manager is not configured for this development launcher".into());
+        }
         (LaunchRequest::UiDemo, Some(_)) => {
             return Err("configured launcher application is activation-only".to_string());
         }
@@ -721,7 +753,7 @@ mod tests {
     #[test]
     fn application_configuration_names_only_the_ui_entry() {
         assert_eq!(
-            entry_at(None, UI_ENTRY_INDEX).map(|entry| entry.label),
+            entry_at(None, UI_ENTRY_INDEX, false).map(|entry| entry.label),
             Some("NEW INPUT MONITOR")
         );
         let mut launcher = Launcher::new();
@@ -878,10 +910,11 @@ mod tests {
         assert_eq!(terminal_arguments.first(), Some(&OsString::from("run")));
         let (_, task_arguments, _) =
             launch_command(&options, LaunchRequest::TaskTerminal, 10).unwrap();
-        assert!(task_arguments.windows(2).any(|pair| pair == [
-            OsString::from("--working-directory"),
-            OsString::from("/home/tester/src/td-vm/work"),
-        ]));
+        assert!(task_arguments.windows(2).any(|pair| pair
+            == [
+                OsString::from("--working-directory"),
+                OsString::from("/home/tester/src/td-vm/work"),
+            ]));
 
         let direct = LaunchOptions {
             socket: options.socket.clone(),
@@ -1162,5 +1195,29 @@ mod tests {
         assert!(processes.launch(LaunchRequest::UiDemo).is_err());
         assert!(processes.spawner.calls.is_empty());
         assert!(processes.children.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod task_manager_tests {
+    use super::*;
+    #[test]
+    fn task_manager_entry_is_enabled_only_for_the_fixed_authority() {
+        let mut launcher = Launcher::new();
+        assert!(!launcher.matched_labels().contains(&"TASK MANAGER"));
+        launcher.set_task_manager(true);
+        launcher.apply(LauncherAction::Open);
+        assert_eq!(launcher.matched_labels().len(), 4);
+        for character in "process".chars() {
+            launcher.apply(LauncherAction::Insert(character));
+        }
+        assert_eq!(launcher.matched_labels(), ["TASK MANAGER"]);
+        assert_eq!(
+            launcher.apply(LauncherAction::Activate),
+            Some(LaunchRequest::TaskManager)
+        );
+        launcher.set_task_manager(false);
+        launcher.apply(LauncherAction::Open);
+        assert_eq!(launcher.matched_labels().len(), 3);
     }
 }

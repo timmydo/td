@@ -711,6 +711,10 @@ impl Runtime {
         self.headless_commits.remove(&client);
     }
 
+    pub(crate) fn set_launcher_task_manager(&mut self, available: bool) {
+        self.scene.set_launcher_task_manager(available);
+    }
+
     pub(crate) fn set_launcher_application(&mut self, application: Option<&str>) {
         self.scene.set_launcher_application(application);
     }

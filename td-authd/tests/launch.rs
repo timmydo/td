@@ -41,10 +41,11 @@ fn only_canonical_disjoint_session_identities_are_configurable() {
 
 #[test]
 fn the_caller_can_only_start_poll_or_keep_the_channel_alive() {
-    assert_eq!(request(&[1]).unwrap(), Request::Start(Terminal::Home));
-    assert_eq!(request(&[4]).unwrap(), Request::Start(Terminal::Task));
-    assert_eq!(request(&[5]).unwrap(), Request::Start(Terminal::Codex));
-    assert_eq!(request(&[6]).unwrap(), Request::Start(Terminal::Claude));
+    assert_eq!(request(&[1]).unwrap(), Request::Start(Program::Home));
+    assert_eq!(request(&[4]).unwrap(), Request::Start(Program::Task));
+    assert_eq!(request(&[5]).unwrap(), Request::Start(Program::Codex));
+    assert_eq!(request(&[6]).unwrap(), Request::Start(Program::Claude));
+    assert_eq!(request(&[7]).unwrap(), Request::Start(Program::TaskManager));
     assert_eq!(request(&[3]).unwrap(), Request::Heartbeat);
     let mut poll = vec![2];
     poll.extend_from_slice(&17u64.to_be_bytes());
@@ -57,7 +58,8 @@ fn the_caller_can_only_start_poll_or_keep_the_channel_alive() {
         vec![4, 0],
         vec![5, 0],
         vec![6, 0],
-        vec![7],
+        vec![7, 0],
+        vec![8],
         vec![2],
         vec![2, 0],
         vec![2; 10],
@@ -79,11 +81,7 @@ fn fixed_commands_select_the_account_and_all_terminal_arguments() {
         check.get_args().collect::<Vec<_>>(),
         ["check-launch-session", "tester", "1000", "993"]
     );
-    let terminal = config.terminal(
-        "000102030405060708090a0b0c0d0e0f",
-        17,
-        Terminal::Home,
-    );
+    let terminal = config.terminal("000102030405060708090a0b0c0d0e0f", 17, Program::Home);
     assert_eq!(terminal.get_program(), "/bin/td-login");
     assert_eq!(
         terminal.get_args().collect::<Vec<_>>(),
@@ -98,12 +96,7 @@ fn fixed_commands_select_the_account_and_all_terminal_arguments() {
             "17",
         ]
     );
-    let terminal = terminal_command(
-        1000,
-        "000102030405060708090a0b0c0d0e0f",
-        17,
-        Terminal::Home,
-    );
+    let terminal = terminal_command(1000, "000102030405060708090a0b0c0d0e0f", 17, Program::Home);
     assert_eq!(terminal.get_program(), "/bin/td-term");
     assert_eq!(
         terminal.get_envs().collect::<Vec<_>>(),
@@ -112,18 +105,9 @@ fn fixed_commands_select_the_account_and_all_terminal_arguments() {
             Some(std::ffi::OsStr::new("/run/td-compositor/1000/td-control")),
         )]
     );
-    let task = config.terminal(
-        "000102030405060708090a0b0c0d0e0f",
-        18,
-        Terminal::Task,
-    );
+    let task = config.terminal("000102030405060708090a0b0c0d0e0f", 18, Program::Task);
     assert_eq!(task.get_args().last(), Some(std::ffi::OsStr::new("task")));
-    let task = terminal_command(
-        1000,
-        "000102030405060708090a0b0c0d0e0f",
-        18,
-        Terminal::Task,
-    );
+    let task = terminal_command(1000, "000102030405060708090a0b0c0d0e0f", 18, Program::Task);
     assert!(task.get_args().collect::<Vec<_>>().windows(2).any(|pair| {
         pair == [
             std::ffi::OsStr::new("--working-directory"),
@@ -145,17 +129,27 @@ fn fixed_commands_select_the_account_and_all_terminal_arguments() {
 #[test]
 fn task_agents_use_fixed_human_entry_points_and_a_controlling_terminal() {
     for (terminal, selection, program) in [
-        (Terminal::Codex, "codex", "/bin/codex"),
-        (Terminal::Claude, "claude", "/bin/claude"),
+        (Program::Codex, "codex", "/bin/codex"),
+        (Program::Claude, "claude", "/bin/claude"),
     ] {
         let helper = config().terminal("000102030405060708090a0b0c0d0e0f", 1, terminal);
-        assert_eq!(helper.get_args().last(), Some(std::ffi::OsStr::new(selection)));
+        assert_eq!(
+            helper.get_args().last(),
+            Some(std::ffi::OsStr::new(selection))
+        );
         let command = terminal_command(1000, "000102030405060708090a0b0c0d0e0f", 1, terminal);
         assert_eq!(command.get_program(), "/bin/td-term");
-        assert_eq!(command.get_args().skip(5).collect::<Vec<_>>(), [
-            "--working-directory", TASK_DIRECTORY,
-            "--command", "/bin/cttyhack", "--stdin", program,
-        ]);
+        assert_eq!(
+            command.get_args().skip(5).collect::<Vec<_>>(),
+            [
+                "--working-directory",
+                TASK_DIRECTORY,
+                "--command",
+                "/bin/cttyhack",
+                "--stdin",
+                program,
+            ]
+        );
     }
 }
 
@@ -186,23 +180,31 @@ fn probe_diagnostics() -> String {
             }
             let flags = std::fs::read_to_string(format!("/proc/self/fdinfo/{fd}"))
                 .ok()
-                .and_then(|info| info.lines().find_map(|line| {
-                    line.strip_prefix("flags:")
-                        .and_then(|value| u32::from_str_radix(value.trim(), 8).ok())
-                }));
+                .and_then(|info| {
+                    info.lines().find_map(|line| {
+                        line.strip_prefix("flags:")
+                            .and_then(|value| u32::from_str_radix(value.trim(), 8).ok())
+                    })
+                });
             if flags.is_some_and(|flags| flags & 0o2000000 == 0) {
                 descriptors.push((fd, std::fs::read_link(entry.path())));
             }
         }
     }
     descriptors.sort_by_key(|(fd, _)| *fd);
-    format!("parent inheritable descriptors: {descriptors:?}; /dev/null: {:?}",
-        std::fs::metadata("/dev/null").map(|m| (m.file_type().is_char_device(), m.rdev())))
+    format!(
+        "parent inheritable descriptors: {descriptors:?}; /dev/null: {:?}",
+        std::fs::metadata("/dev/null").map(|m| (m.file_type().is_char_device(), m.rdev()))
+    )
 }
 
 fn wait_for_probe(child: &mut std::process::Child) {
     let status = child.wait().unwrap();
-    assert!(status.success(), "launch probe exited {status}; {}", probe_diagnostics());
+    assert!(
+        status.success(),
+        "launch probe exited {status}; {}",
+        probe_diagnostics()
+    );
 }
 
 #[test]
@@ -249,7 +251,12 @@ fn a_polled_completion_retires_its_handle_and_unknown_handles_fail() {
         if response == [0x82, 1] {
             break;
         }
-        assert_eq!(response, [0x82, 0], "launch probe failed; {}", probe_diagnostics());
+        assert_eq!(
+            response,
+            [0x82, 0],
+            "launch probe failed; {}",
+            probe_diagnostics()
+        );
         assert!(Instant::now() < deadline);
         thread::sleep(Duration::from_millis(5));
     }
@@ -271,7 +278,7 @@ fn capacity_counts_unacknowledged_completions_and_cannot_spawn_over_the_limit() 
     }
     assert_eq!(
         launches
-            .answer(&config(), Request::Start(Terminal::Home))
+            .answer(&config(), Request::Start(Program::Home))
             .unwrap(),
         [0xff, 1]
     );
@@ -283,7 +290,7 @@ fn handle_exhaustion_fails_before_a_child_can_start() {
     let mut launches = Launches::new("000102030405060708090a0b0c0d0e0f".into());
     launches.next = u64::MAX;
     assert!(launches
-        .answer(&config(), Request::Start(Terminal::Home))
+        .answer(&config(), Request::Start(Program::Home))
         .unwrap_err()
         .contains("exhausted"));
     assert!(launches.children.is_empty());
@@ -351,8 +358,8 @@ fn readiness_names_include_fresh_generations_and_fit_unix_socket_bounds() {
     assert_ne!(a, b);
     assert_eq!(a.len(), 32);
     assert_eq!(b.len(), 32);
-    let first = terminal_command(1000, &a, u64::MAX, Terminal::Home);
-    let second = terminal_command(1000, &b, u64::MAX, Terminal::Home);
+    let first = terminal_command(1000, &a, u64::MAX, Program::Home);
+    let second = terminal_command(1000, &b, u64::MAX, Program::Home);
     assert_ne!(first.get_args().last(), second.get_args().last());
     assert!(first.get_args().last().unwrap().len() < 108);
 }
@@ -439,4 +446,26 @@ fn log_descriptors_must_not_alias_the_private_channel() {
         || Ok(vec![0, 1, 2, 3]),
     )
     .is_ok());
+}
+
+#[test]
+fn task_manager_has_fixed_unprivileged_exec_and_display_only() {
+    let wrapper = config().terminal("000102030405060708090a0b0c0d0e0f", 17, Program::TaskManager);
+    assert_eq!(wrapper.get_program(), "/bin/td-login");
+    assert_eq!(wrapper.get_args().last().unwrap(), "taskmgr");
+    let command = terminal_command(
+        1000,
+        "000102030405060708090a0b0c0d0e0f",
+        17,
+        Program::TaskManager,
+    );
+    assert_eq!(command.get_program(), "/bin/td-taskmgr");
+    assert_eq!(command.get_args().count(), 0);
+    assert_eq!(
+        command.get_envs().collect::<Vec<_>>(),
+        vec![(
+            std::ffi::OsStr::new("WAYLAND_DISPLAY"),
+            Some(std::ffi::OsStr::new("/run/td-compositor/1000/wayland-0"))
+        )]
+    );
 }

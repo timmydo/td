@@ -3675,6 +3675,7 @@ mod tests {
                 Bound::Launch(LaunchRequest::Terminal) => "NEW TERMINAL",
                 Bound::Launch(LaunchRequest::TaskTerminal) => "NEW TERMINAL",
                 Bound::Launch(LaunchRequest::UiDemo) => "OPEN UI CLIENT",
+                Bound::Launch(LaunchRequest::TaskManager) => "TASK MANAGER",
                 Bound::Launcher(_) => "OPEN LAUNCHER",
                 Bound::Help(_) => "THIS HELP",
             }

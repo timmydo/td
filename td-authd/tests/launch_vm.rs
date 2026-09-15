@@ -12,6 +12,8 @@
 mod channel;
 #[path = "../src/sys.rs"]
 mod sys;
+#[path = "launch_taskmgr_vm.rs"]
+mod taskmgr;
 use std::fs;
 use std::io::{Read, Write};
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
@@ -174,7 +176,11 @@ fn peer(denied: bool, placement_denied: bool) {
 }
 
 fn wait(child: &mut Child) -> ExitStatus {
-    let deadline = Instant::now() + Duration::from_secs(20);
+    wait_for(child, Duration::from_secs(20))
+}
+
+fn wait_for(child: &mut Child, timeout: Duration) -> ExitStatus {
+    let deadline = Instant::now() + timeout;
     loop {
         if let Some(status) = child.try_wait().unwrap() {
             return status;
@@ -238,6 +244,9 @@ fn init() {
         .unwrap()
         .success());
 
+    if Path::new("/td-taskmgr-test-image").exists() {
+        taskmgr::mount_image();
+    }
     fs::create_dir_all("/sys/fs/cgroup").unwrap();
     assert!(Command::new("/bin/busybox")
         .args(["mount", "-t", "cgroup2", "none", "/sys/fs/cgroup"])
@@ -277,6 +286,9 @@ fn init() {
         fs::read_to_string("/run/user/1000/task-terminal-evidence").unwrap(),
         "uid 1000; null stdio; no authority descriptor\n"
     );
+    if Path::new("/bin/td-taskmgr").exists() {
+        taskmgr::run();
+    }
     fs::remove_file("/run/user/1000/terminal-evidence").unwrap();
     fs::remove_file("/run/user/1000/task-terminal-evidence").unwrap();
     attempt(true, true, false);
@@ -298,7 +310,10 @@ fn init() {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    if args.get(1).is_some_and(|a| a == "--run-vm") {
+    if args
+        .get(1)
+        .is_some_and(|a| matches!(a.as_str(), "--run-vm" | "--run-taskmgr-vm"))
+    {
         run_vm(&args[1..]).unwrap();
         return;
     }
@@ -319,6 +334,9 @@ fn main() {
         return;
     }
     match args.get(1).map(String::as_str) {
+        Some("--taskmgr-peer") => taskmgr::peer(),
+        Some("--taskmgr-driver") => taskmgr::driver(),
+        Some("--taskmgr-owned") => taskmgr::owned(),
         Some("--peer") => peer(false, false),
         Some("--peer-denied") => peer(true, false),
         Some("--peer-placement-denied") => peer(false, true),
@@ -387,17 +405,35 @@ fn artifact(path: &Path) -> std::io::Result<Vec<u8>> {
 }
 
 fn run_vm(arguments: &[String]) -> std::io::Result<()> {
-    let [_verb, kernel, authority, firstboot, login, busybox, log_path] = arguments else {
-        return Err(std::io::Error::other(
-            "usage: terminal-vm --run-vm KERNEL AUTHD FIRSTBOOT LOGIN BUSYBOX NEW-LOG",
-        ));
+    let (kernel, authority, firstboot, login, busybox, extra, image, log_path) = match arguments {
+        [verb, kernel, authority, firstboot, login, busybox, log] if verb == "--run-vm" =>
+            (kernel, authority, firstboot, login, busybox, None, None, log),
+        [verb, kernel, authority, firstboot, login, busybox, compositor, taskmgr, log]
+            if verb == "--run-taskmgr-vm" =>
+            (kernel, authority, firstboot, login, busybox, Some((compositor, taskmgr)), None, log),
+        [verb, kernel, authority, firstboot, login, busybox, compositor, taskmgr, image, log]
+            if verb == "--run-taskmgr-vm" =>
+            (kernel, authority, firstboot, login, busybox, Some((compositor, taskmgr)), Some(image), log),
+        _ => return Err(std::io::Error::other("usage: terminal-vm --run-vm KERNEL AUTHD FIRSTBOOT LOGIN BUSYBOX NEW-LOG; --run-taskmgr-vm adds COMPOSITOR TASKMGR [IMAGE] before NEW-LOG")),
     };
-    for input in [kernel, authority, firstboot, login, busybox, log_path] {
+    for input in [kernel, authority, firstboot, login, busybox, log_path]
+        .into_iter()
+        .chain(
+            extra
+                .into_iter()
+                .flat_map(|(compositor, taskmgr)| [compositor, taskmgr]),
+        )
+    {
         if !Path::new(input).is_absolute() {
             return Err(std::io::Error::other(
                 "VM artifact and log paths must be absolute",
             ));
         }
+    }
+    if image.is_some_and(|path| !Path::new(path).is_absolute() || path.contains(',')) {
+        return Err(std::io::Error::other(
+            "image path must be absolute and contain no comma",
+        ));
     }
     // Refuse overwriting a prior proof or an arbitrary caller file.
     let mut saved = fs::OpenOptions::new()
@@ -415,7 +451,15 @@ fn run_vm(arguments: &[String]) -> std::io::Result<()> {
     let mut archive = Vec::new();
     let mut inode = 1;
     for name in [".", "bin", "dev", "proc", "sys", "run", "etc", "tmp"] {
-        entry(&mut archive, inode, name, 0o40755, &[], 0, 0);
+        entry(
+            &mut archive,
+            inode,
+            name,
+            if name == "tmp" { 0o41777 } else { 0o40755 },
+            &[],
+            0,
+            0,
+        );
         inode += 1;
     }
     for (name, mode, data, major, minor) in [
@@ -448,11 +492,40 @@ fn run_vm(arguments: &[String]) -> std::io::Result<()> {
         ),
         ("bin/td-login", 0o100755, artifact(Path::new(login))?, 0, 0),
         ("bin/td-term", 0o120777, b"/pair-probe".to_vec(), 0, 0),
-        ("TRAILER!!!", 0, Vec::new(), 0, 0),
     ] {
         entry(&mut archive, inode, name, mode, &data, major, minor);
         inode += 1;
     }
+    if let Some((compositor, taskmgr)) = extra {
+        for (name, source) in [
+            ("bin/td-compositor", compositor),
+            ("bin/td-taskmgr", taskmgr),
+        ] {
+            entry(
+                &mut archive,
+                inode,
+                name,
+                0o100755,
+                &artifact(Path::new(source))?,
+                0,
+                0,
+            );
+            inode += 1;
+        }
+    }
+    if image.is_some() {
+        entry(
+            &mut archive,
+            inode,
+            "td-taskmgr-test-image",
+            0o100600,
+            &[],
+            0,
+            0,
+        );
+        inode += 1;
+    }
+    entry(&mut archive, inode, "TRAILER!!!", 0, &[], 0, 0);
     let initramfs = scratch.0.join("initramfs.cpio");
     fs::write(&initramfs, archive)?;
     let output_path = scratch.0.join("serial");
@@ -484,13 +557,25 @@ fn run_vm(arguments: &[String]) -> std::io::Result<()> {
             ])
             .arg(&initramfs)
             .args(["-append", "console=ttyS0 rdinit=/init panic=-1"])
+            .args(
+                image
+                    .map(|image| {
+                        vec![
+                            "-drive".to_string(),
+                            format!("if=none,id=taskmgr-image,format=raw,readonly=on,file={image}"),
+                            "-device".to_string(),
+                            "virtio-blk-pci,drive=taskmgr-image".to_string(),
+                        ]
+                    })
+                    .unwrap_or_default(),
+            )
             .stdin(Stdio::null())
             .stdout(output.try_clone()?)
             .stderr(output)
             .spawn()?,
     );
     let mut serial = fs::File::open(output_path)?;
-    let deadline = Instant::now() + Duration::from_secs(120);
+    let deadline = Instant::now() + Duration::from_secs(if extra.is_some() { 240 } else { 120 });
     let mut report = Vec::new();
     let mut bytes = [0u8; 8192];
     let verdict = loop {
@@ -501,7 +586,12 @@ fn run_vm(arguments: &[String]) -> std::io::Result<()> {
         saved.write_all(chunk)?;
         report.extend_from_slice(chunk);
         let text = String::from_utf8_lossy(&report);
-        match proof_verdict(&text) {
+        let proof = if extra.is_some() {
+            taskmgr_verdict(&text, image.is_some())
+        } else {
+            proof_verdict(&text)
+        };
+        match proof {
             Some(true) => break Ok(()),
             Some(false) => break Err(std::io::Error::other("VM terminal authority check failed")),
             None => {}
@@ -557,4 +647,53 @@ fn streamed_proof_requires_the_complete_exact_verdict_line() {
             Some(false)
         );
     }
+}
+
+fn taskmgr_verdict(text: &str, image: bool) -> Option<bool> {
+    match proof_verdict(text) {
+        Some(true) => {
+            let taskmgr = text.lines().any(|line| {
+                line.strip_prefix(taskmgr::PROOF_PREFIX)
+                    .is_some_and(|hash| {
+                        hash.len() == 16
+                            && hash
+                                .bytes()
+                                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+                    })
+            });
+            Some(taskmgr && (!image || text.lines().any(|line| line == taskmgr::IMAGE_PROOF)))
+        }
+        other => other,
+    }
+}
+#[test]
+fn taskmgr_mode_requires_exact_resource_and_image_evidence() {
+    let pass = "TD-TERMINAL-VM: PASS\n";
+    assert_eq!(taskmgr_verdict(pass, false), Some(false));
+    for hash in [
+        "",
+        "0123456789abcde",
+        "0123456789abcdeg",
+        "0123456789ABCDEF",
+    ] {
+        assert_eq!(
+            taskmgr_verdict(&format!("{}{hash}\n{pass}", taskmgr::PROOF_PREFIX), false),
+            Some(false)
+        );
+    }
+    let taskmgr = format!("{}0123456789abcdef\n{pass}", taskmgr::PROOF_PREFIX);
+    assert_eq!(taskmgr_verdict(&taskmgr, false), Some(true));
+    assert_eq!(taskmgr_verdict(&taskmgr, true), Some(false));
+    assert_eq!(
+        taskmgr_verdict(&format!("{}-wrong\n{taskmgr}", taskmgr::IMAGE_PROOF), true),
+        Some(false)
+    );
+    assert_eq!(
+        taskmgr_verdict(&format!("{}\n{taskmgr}", taskmgr::IMAGE_PROOF), true),
+        Some(true)
+    );
+    assert_eq!(
+        taskmgr_verdict(&format!("{taskmgr}TD-TERMINAL-VM: FAIL: later\n"), false),
+        Some(false)
+    );
 }

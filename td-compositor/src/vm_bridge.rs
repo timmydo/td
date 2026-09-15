@@ -104,7 +104,7 @@ impl Session {
         request: wire::Message,
         runtime: &Arc<Mutex<Runtime>>,
         feed_path: &Path,
-        task_launch: &mut impl FnMut(crate::authority::Terminal) -> Result<(), String>,
+        task_launch: &mut impl FnMut(crate::authority::Program) -> Result<(), String>,
     ) -> wire::Message {
         let id = request.id;
         let result = self.dispatch(request, runtime, feed_path, task_launch);
@@ -119,7 +119,7 @@ impl Session {
         request: wire::Message,
         runtime: &Arc<Mutex<Runtime>>,
         feed_path: &Path,
-        task_launch: &mut impl FnMut(crate::authority::Terminal) -> Result<(), String>,
+        task_launch: &mut impl FnMut(crate::authority::Program) -> Result<(), String>,
     ) -> Result<(u64, Vec<u8>), String> {
         match request.verb.as_str() {
             wire::SNAPSHOT if request.data.is_empty() && request.revision == 0 => {
@@ -204,13 +204,13 @@ fn launch_task_terminal(
     status: &[u8],
     plan: &wire::workspace::Plan,
     verb: &str,
-    task_launch: &mut impl FnMut(crate::authority::Terminal) -> Result<(), String>,
+    task_launch: &mut impl FnMut(crate::authority::Program) -> Result<(), String>,
 ) -> Result<(), String> {
     wire::workspace::parse_ready(status, plan)?;
     let terminal = match verb {
-        wire::WORKSPACE_TERMINAL => crate::authority::Terminal::Task,
-        wire::WORKSPACE_CODEX => crate::authority::Terminal::Codex,
-        wire::WORKSPACE_CLAUDE => crate::authority::Terminal::Claude,
+        wire::WORKSPACE_TERMINAL => crate::authority::Program::Task,
+        wire::WORKSPACE_CODEX => crate::authority::Program::Codex,
+        wire::WORKSPACE_CLAUDE => crate::authority::Program::Claude,
         _ => return Err("invalid task launch selection".into()),
     };
     task_launch(terminal)
@@ -605,8 +605,8 @@ mod tests {
             let mut selections = Vec::new();
             let mut launch = |terminal| {
                 selections.push(match terminal {
-                    crate::authority::Terminal::Codex => wire::WORKSPACE_CODEX,
-                    crate::authority::Terminal::Claude => wire::WORKSPACE_CLAUDE,
+                    crate::authority::Program::Codex => wire::WORKSPACE_CODEX,
+                    crate::authority::Program::Claude => wire::WORKSPACE_CLAUDE,
                     _ => "wrong terminal",
                 });
                 Ok(())

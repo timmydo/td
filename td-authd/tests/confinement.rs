@@ -210,7 +210,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
     assert_eq!(launch.matches(".spawn(").count(), 1);
     assert_eq!(launch.matches(".exec()").count(), 1);
     assert_eq!(launch.matches(".process_group(0)").count(), 1);
-    assert_eq!(launch.matches("Command::new(").count(), 3);
+    assert_eq!(launch.matches("Command::new(").count(), 4);
     assert_eq!(launch.matches(".stdin(Stdio::null())").count(), 1);
     assert_eq!(launch.matches(".stdout(Stdio::null())").count(), 1);
     assert_eq!(launch.matches(".stderr(Stdio::null())").count(), 1);
@@ -361,7 +361,7 @@ fn fingerprint(source: &str) -> u64 {
     })
 }
 
-const LAUNCH_FINGERPRINT: u64 = 0xc99249c6bc179c26;
+const LAUNCH_FINGERPRINT: u64 = 0x91d5a1bc5bf7d011;
 
 const INTAKE_RAW_FINGERPRINT: u64 = 0x320c8b6ddbfe29af;
 const INTAKE_FINGERPRINT: u64 = 0xe2f50441f71b4c76;

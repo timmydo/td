@@ -9,8 +9,11 @@ the caller's existing authority.
 This is the version-1 target contract, not a claim that all features ship.
 The standalone collection/model crate, read-only `--sample` command and
 Wayland window and descriptor-bound process controls are implemented.
-The td image integration remains a subsequent increment. Root AGENTS.md
-and DEVELOPMENT.md govern
+The td image stages the complete target output and exposes /bin/td-taskmgr.
+The authority-mode compositor launcher starts it through fixed request 07
+after dropping to the human credentials and checking the session cgroup.
+It retains the system PID view and ordinary signal permissions. Root
+AGENTS.md and DEVELOPMENT.md govern
 implementation and landing; [td-ui](../td-ui/DESIGN.md) owns the
 shared widget contracts. Each increment below must update its status and
 record its actual validation without claiming later increments are done.
@@ -660,3 +663,23 @@ Standalone support and td image delivery are both required outcomes. Image
 integration must give the ordinary desktop identity the intended monitoring
 view; it must not place this system tool in an application PID namespace
 and claim it can see the full system, nor grant extra signal authority.
+
+The host-only td-authd task-manager VM fixture exercises the real target
+programs and optionally the read-only deployment EROFS. It checks the
+fixed launch request, exact human credentials, zero capabilities, outer
+PID view, session membership and null standard descriptors, then drives
+live repaint and default-Cancel/confirmed suspend/resume through real
+compositor input against a child owned by its driver. This fixture is not
+a runtime application interface or an elevation path.
+
+Collector overhead was measured on the Guix Linux 7.0.14 x86-64 host using
+the actual static target executable built with source-built Rust 1.96.0.
+Ten `--sample` observations at 0.5-second intervals took 4.797 s with
+705-706 visible processes, using 0.050 s user plus 0.243 s system CPU;
+with 512 additional owned sleeping children (1,218 visible), they took
+4.954 s and 0.064 s user plus 0.389 s system CPU. Retained model peaks
+were 5,839,762 and 6,739,490 bytes. Linux wait4 process-lifecycle peak RSS
+was 13,392 and 13,520 KiB, including startup. The host was concurrently
+building other work: these are collector/retention observations for an
+idle added workload, not isolated-system or graphical-render benchmarks.
+Only recorded Child handles were used to terminate the synthetic children.
