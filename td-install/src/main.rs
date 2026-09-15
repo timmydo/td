@@ -42,6 +42,9 @@ mod scratch;
 #[path = "inventory.rs"]
 mod inventory;
 
+#[path = "timezones.rs"]
+mod timezones;
+
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom, Write};
@@ -57,13 +60,14 @@ fn invalid(message: String) -> io::Error {
 }
 
 const USAGE: &str =
-    "usage: td-install inventory\n       td-install layout-preview <logical-sector-bytes> <capacity-bytes>\n       td-install layout <destination> [<efi-kernel> <selector-initramfs>]\n       \
+    "usage: td-install inventory\n       td-install timezones\n       td-install layout-preview <logical-sector-bytes> <capacity-bytes>\n       td-install layout <destination> [<efi-kernel> <selector-initramfs>]\n       \
                      td-install volume [--uuid <uuid>] <destination> <mkfs.btrfs> <scratch-dir> \
                      [<td-boot> <deployment> <trusted-key> | --trusted-key <trusted-key>]";
 
 #[derive(Debug, Eq, PartialEq)]
 enum Mode {
     Inventory,
+    Timezones,
     LayoutPreview {
         sector_bytes: u64,
         capacity_bytes: u64,
@@ -258,6 +262,7 @@ fn parse_args(mut args: impl Iterator<Item = OsString>) -> io::Result<Mode> {
     }
     match (verb.to_str(), rest) {
         (Some("inventory"), []) => Ok(Mode::Inventory),
+        (Some("timezones"), []) => Ok(Mode::Timezones),
         (Some("layout-preview"), [sector, capacity]) => Ok(Mode::LayoutPreview {
             sector_bytes: preview_number(sector.as_os_str(), "logical sector bytes")?,
             capacity_bytes: preview_number(capacity.as_os_str(), "capacity bytes")?,
@@ -1725,6 +1730,12 @@ fn main() -> ExitCode {
         }
     };
     let result = match mode {
+        Mode::Timezones => {
+            let stdout = io::stdout();
+            let mut output = io::BufWriter::new(stdout.lock());
+            timezones::run(Path::new("/etc/zoneinfo"), &mut output)
+                .and_then(|()| output.flush())
+        },
         Mode::Inventory => {
             let stdout = io::stdout();
             let mut output = io::BufWriter::new(stdout.lock());
@@ -1775,6 +1786,21 @@ mod tests {
     // this is the test half's own — a test opening a fixture is not a path the
     // installer takes from an operator, and the scan reads only the half above.
     use std::fs::OpenOptions;
+
+    #[test]
+    fn cli_accepts_no_root_or_other_operands() {
+        use std::ffi::OsString;
+        assert_eq!(
+            parse_args([OsString::from("timezones")].into_iter()).unwrap(),
+            Mode::Timezones
+        );
+        for operand in ["/tmp", "--root", "--uuid", "--trusted-key"] {
+            assert!(parse_args(
+                [OsString::from("timezones"), OsString::from(operand)].into_iter()
+            )
+            .is_err());
+        }
+    }
 
     const MIB: u64 = 1024 * 1024;
     const GIB: u64 = 1024 * MIB;
@@ -3444,12 +3470,12 @@ mod tests {
     /// because that is the half the scan below keys on.
     const ALLOW: &str = concat!("#[all", "ow(clippy::disallowed_methods)]");
 
-    /// The eight files this binary compiles, with the item each allow in
+    /// The nine files this binary compiles, with the item each allow in
     /// them must sit on. Shared pure modules and test-only scratch have none;
-    /// inventory reaches the filesystem only through the paths module.
+    /// inventory uses paths; timezones uses the regular-file reader.
     type Compiled = (&'static str, &'static str, &'static [&'static str]);
 
-    fn compiled_files() -> [Compiled; 8] {
+    fn compiled_files() -> [Compiled; 9] {
         [
             ("main.rs", include_str!("main.rs"), MAIN_CHOKE.as_slice()),
             (
@@ -3467,10 +3493,11 @@ mod tests {
             ),
             ("scratch.rs", include_str!("scratch.rs"), [].as_slice()),
             ("inventory.rs", include_str!("inventory.rs"), [].as_slice()),
+            ("timezones.rs", include_str!("timezones.rs"), [].as_slice()),
         ]
     }
 
-    /// THE LIST ABOVE IS HAND-KEPT, and a ninth file compiled into this
+    /// THE LIST ABOVE IS HAND-KEPT, and a tenth file compiled into this
     /// binary would be read by neither guard — silently, since both count only
     /// what they were handed. Nothing but this relates it to the `#[path]`
     /// declarations it mirrors. The marker is split so this file does not
@@ -3478,7 +3505,7 @@ mod tests {
     ///
     /// Over the UNCOMMENTED source, for the reason the allow scan is: a
     /// comment explaining a `#[path]` declaration is prose, and reading one as
-    /// a declaration reds a file that compiles exactly eight.
+    /// a declaration reds a file that compiles exactly nine.
     #[test]
     fn every_compiled_file_is_one_the_guards_read() {
         // WHITESPACE-INSENSITIVE from the marker on: `#[path="x.rs"]` with no
@@ -3498,7 +3525,7 @@ mod tests {
         // include inside a `stringify!`, which satisfied the search while
         // `compiled_files` went on reading the original.
         let table_body = {
-            const HEAD: &str = "fn compiled_files() -> [Compiled; 8] {";
+            const HEAD: &str = "fn compiled_files() -> [Compiled; 9] {";
             let Some(at) = index_of(&text, HEAD) else {
                 panic!("the compiled-file table is not where this scan looks for it")
             };

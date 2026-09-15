@@ -35,6 +35,11 @@ pub mod td_boot_protocol;
 // Keep the ISO composer's shared file admission inside the catalog scan.
 #[path = "../../td-boot/src/realfile.rs"]
 pub mod td_boot_realfile;
+// Shared check assertions must participate in the catalog dependency scan.
+use td_boot_realfile as realfile;
+#[path = "../../td-install/src/timezones.rs"]
+pub mod td_install_timezones;
+
 // Keep the native guest oracle contract inside the catalog dependency scan.
 #[path = "../../td-install-qemu-test/src/protocol.rs"]
 pub mod td_install_qemu_protocol;
@@ -46,3 +51,11 @@ pub mod release_upstream;
 #[path = "../../td-profiler/src/contract.rs"]
 pub mod td_profiler_contract;
 pub mod types;
+
+#[cfg(test)]
+mod timezone_catalog_tests {
+    #[test]
+    fn tzdata_check_tracks_the_installer_catalog_source() {
+        assert!(crate::catalog::named_dirs("tzdata").contains(&"td-install"));
+    }
+}

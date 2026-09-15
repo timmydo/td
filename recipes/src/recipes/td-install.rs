@@ -7,6 +7,7 @@ use crate::types::{Recipe, Step};
 // reaches its checksum as `crate::crc32`, so those two arrive as a pair or the
 // build does not link.
 const MAIN_RS: &str = include_str!("../../../td-install/src/main.rs");
+const TIMEZONES_RS: &str = include_str!("../../../td-install/src/timezones.rs");
 const INVENTORY_RS: &str = include_str!("../../../td-install/src/inventory.rs");
 const PROTOCOL_RS: &str = include_str!("../../../td-boot/src/protocol.rs");
 const REALFILE_RS: &str = include_str!("../../../td-boot/src/realfile.rs");
@@ -48,6 +49,11 @@ pub fn recipe() -> Recipe {
         Step::WriteFile {
             path: "{src}/td-install/src/main.rs".into(),
             content: MAIN_RS.into(),
+            exec: false,
+        },
+        Step::WriteFile {
+            path: "{src}/td-install/src/timezones.rs".into(),
+            content: TIMEZONES_RS.into(),
             exec: false,
         },
         Step::WriteFile {

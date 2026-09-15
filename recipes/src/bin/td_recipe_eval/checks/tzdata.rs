@@ -6,6 +6,8 @@ use std::path::Path;
 use super::rust_toolchain::{path_basename, GLIBC_STAGE};
 use crate::check_runner::{RecipeCheckRunner, TD_STORE_DIR};
 
+use td_recipe::td_install_timezones as installer_timezones;
+
 const TABLES: &[&str] = &["iso3166.tab", "zone.tab", "zone1970.tab", "zonenow.tab"];
 const MAX_FILE_BYTES: u64 = 1024 * 1024;
 const MAX_ENTRIES: usize = 2048;
@@ -103,6 +105,8 @@ fn verify_tree(output: &Path) -> Result<usize, String> {
         return Err("tzdata: missing license text".into());
     }
     let root = output.join("share/zoneinfo");
+    installer_timezones::run(&root, &mut std::io::sink())
+        .map_err(|error| format!("tzdata: installer catalog: {error}"))?;
     for (alias, zone) in [("UTC", "Etc/UTC"), ("US/Pacific", "America/Los_Angeles")] {
         if read_regular(&root.join(alias))? != read_regular(&root.join(zone))? {
             return Err(format!(
@@ -291,8 +295,18 @@ mod tests {
             fs::write(zones.join(name), &header).unwrap();
         }
         for name in TABLES {
-            fs::write(zones.join(name), b"XX\t0\tAmerica/Los_Angeles\n").unwrap();
+            let row = if *name == "iso3166.tab" {
+                "US\tUnited States\n"
+            } else {
+                "US\t+340308-1181434\tAmerica/Los_Angeles\n"
+            };
+            fs::write(zones.join(name), row).unwrap();
         }
+        assert_eq!(verify_tree(root).unwrap(), 4);
+        fs::write(zones.join("iso3166.tab"), b"CA\tCanada\n").unwrap();
+        let error = verify_tree(root).unwrap_err();
+        assert!(error.contains("installer catalog") && error.contains("zone1970.tab:1"));
+        fs::write(zones.join("iso3166.tab"), b"US\tUnited States\n").unwrap();
         assert_eq!(verify_tree(root).unwrap(), 4);
         let alias = zones.join("US/Pacific");
         fs::remove_file(&alias).unwrap();

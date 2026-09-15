@@ -119,6 +119,31 @@ installed profile. Updates must retain the installed identity and settings.
 Keyboard and timezone choices must actually affect the installed session;
 only supported choices with available data may be offered.
 
+`td-install timezones` provides the read-only catalog for later settings
+selection. It accepts no operands and reads only the deployment's
+`/etc/zoneinfo`: `zone1970.tab`, `iso3166.tab`, and referenced TZif files.
+Its JSON `version: 1` is a schema version, not a tzdata release. `source`
+is `zone1970.tab`; `timezones` is sorted by IANA `id`. Each entry carries
+`countries` with upstream `code` and `name`, and an upstream `comment`
+(empty when absent). Country order follows the upstream zone row.
+`Etc/UTC` is added with no countries and the comment `Coordinated Universal
+Time`. Backward aliases and fixed-offset alternatives are not enumerated.
+
+The catalog permits at most 512 countries and 1,024 zones including UTC.
+Each table is limited to 128 KiB, each line to 2,048 bytes, country names
+to 256 bytes, zone IDs to 128 bytes, comments to 512 bytes, and each zone
+file to 64 KiB. Empty tables, duplicate or unresolved entries, malformed
+UTF-8, unsafe zone IDs, and missing or non-regular files refuse the whole
+catalog before JSON output. TZif screening requires a complete 44-byte
+v2/v3 header; it does not parse transitions or establish semantic validity.
+The tzdata recipe's native checks own that validation and also run this
+exact catalog reader against every realized output. File leaves cannot
+be symlinks, but the deployment's root symlink into its immutable store is
+supported. Parent paths are trusted deployment data, not a defense against
+a concurrent privileged writer. Output errors fail the command and may
+leave partial JSON. This command neither selects nor persists a timezone;
+the session clock remains UTC until settings and consumers are connected.
+
 The `tzdata` recipe compiles the approved IANA 2026d data-only source
 with td's existing source-built glibc `zic`. Its output contains fat
 TZif files at `share/zoneinfo`, including backward-compatible aliases,
