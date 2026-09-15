@@ -215,6 +215,13 @@ file, then boots that file under OVMF. An installer whose tested path and
 shipped path differ is an installer tested somewhere other than where it
 runs.
 
+The optional volume timezone is validated against the deployment's offline
+catalog before destination access. It seeds only `@var/lib/td/timezone`,
+mode 0644, under mode-0755 parents. The subvolume root is always mode 0755,
+including when no zone is selected. The deployment-owned optional persistent
+link at `/etc/timezone` points to that file; no selection leaves it
+absent. INSTALLER.md owns the catalog grammar and consumer boundaries.
+
 `layout-preview` uses the same layout calculation without a destination
 operand or any filesystem access. Its geometry-only contract and output
 schema live in INSTALLER.md; it does not admit a disk or authorize writes.
@@ -531,7 +538,8 @@ onto the mounted destination, as described below.
 
 ### Trust-only initialization and mounted publication
 
-`td-install volume [--uuid UUID] DESTINATION MKFS SCRATCH --trusted-key KEY`
+`td-install volume [--uuid UUID] [--timezone IANA-ID] DESTINATION MKFS
+SCRATCH --trusted-key KEY`
 formats the same Btrfs image and destination region as bare `volume`, but
 initializes the publication directories and `td/trusted.pub` without
 copying a deployment into scratch. The existing three-operand publishing
@@ -550,8 +558,9 @@ That command remains the single transaction writer and rechecks copied
 payloads. No dependency or syscall surface is added to the formatter.
 
 The diagnostic ISO uses this sequence after preflight and layout. After
-trust-only formatting it requires empty staged boot, deployment, incoming
-and @var directories, refreshes and checks the partition devices, deletes
+trust-only formatting it requires empty staged boot, deployment and incoming
+directories and only the selected timezone under `@var`, refreshes and checks
+the partition devices, deletes
 its entire owned scratch directory, then invokes `td-boot install` on the resolved partition. Publication
 streams from read-only media onto Btrfs. The host requires the direct
 publication marker as well as successful detached boots from the expected
@@ -635,7 +644,7 @@ admission remains the fixture's private serial convention. Neither path
 activates a physical-device installer, machine settings or destructive
 user consent.
 
-`td-install volume [--uuid UUID] DESTINATION MKFS SCRATCH
+`td-install volume [--uuid UUID] [--timezone IANA-ID] DESTINATION MKFS SCRATCH
 [TD-BOOT DEPLOYMENT TRUSTED-KEY]` accepts a preselected filesystem identity.
 The optional pair appears immediately after `volume`; UUID is exactly
 36 ASCII bytes of nonzero, canonical lowercase UUID text. Invalid input

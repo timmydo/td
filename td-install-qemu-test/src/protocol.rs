@@ -29,3 +29,10 @@ pub const MAX_INVENTORY_BYTES: usize = 32 * 1024;
 
 pub const PREVIEW_MARKER: &str = "TD-INSTALL-LAYOUT-PREVIEW";
 pub const MAX_PREVIEW_BYTES: usize = 1024;
+
+/// Geographic choice verified in the formatted volume and both cold boots.
+pub const TIMEZONE_ID: &str = "Europe/London";
+
+/// Only the full-system diagnostic ISO carries these existing SSH test inputs.
+pub const SYSTEM_AUTOTEST_PRIVATE: &str = "system-autotest/private";
+pub const SYSTEM_AUTOTEST_AUTHORIZED: &str = "system-autotest/authorized_keys";

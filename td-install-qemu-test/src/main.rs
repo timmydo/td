@@ -3,7 +3,7 @@
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::{DirBuilderExt, FileTypeExt};
+use std::os::unix::fs::{DirBuilderExt, FileTypeExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
 use std::time::{Duration, Instant};
@@ -364,9 +364,10 @@ fn preview(name: &str, geometry: u64) -> Result<(), String> {
     )
 }
 
-fn install(device: &str, interrupt: bool) -> Result<(), String> {
+fn install(device: &str, interrupt: bool, system_autotest: bool) -> Result<(), String> {
     // The ISO carries the signed payloads and the live initramfs's public key.
-    // Every path is fixture-owned; no private key enters the guest.
+    // Every path is fixture-owned; no deployment-signing key enters the guest.
+    // Only install-system carries the disposable SSH administrator test key.
     mount_source(device)?;
     inventory(INVENTORY_BEFORE_MARKER)?;
     let uuid = configured_uuid()?;
@@ -409,6 +410,8 @@ fn install(device: &str, interrupt: bool) -> Result<(), String> {
             "volume",
             "--uuid",
             &uuid,
+            "--timezone",
+            TIMEZONE_ID,
             device,
             "/bin/mkfs.btrfs",
             "/scratch",
@@ -416,7 +419,26 @@ fn install(device: &str, interrupt: bool) -> Result<(), String> {
             "/trusted.pub",
         ],
     )?;
-    for directory in ["@var", "td/boot", "td/deployments", "td/incoming"] {
+    check_timezone(Path::new("/scratch/td-volume-root/@var"))?;
+    for (directory, expected) in [
+        ("@var", "lib"),
+        ("@var/lib", "td"),
+        ("@var/lib/td", "timezone"),
+    ] {
+        let staged = Path::new("/scratch/td-volume-root").join(directory);
+        let names = fs::read_dir(&staged)
+            .map_err(|error| format!("inspect {}: {error}", staged.display()))?
+            .map(|entry| entry.map(|entry| entry.file_name()))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("read {}: {error}", staged.display()))?;
+        if names != [std::ffi::OsString::from(expected)] {
+            return Err(format!(
+                "unexpected staged settings in {}",
+                staged.display()
+            ));
+        }
+    }
+    for directory in ["td/boot", "td/deployments", "td/incoming"] {
         let staged = Path::new("/scratch/td-volume-root").join(directory);
         let mut entries = fs::read_dir(&staged)
             .map_err(|error| format!("inspect staging {}: {error}", staged.display()))?;
@@ -431,7 +453,7 @@ fn install(device: &str, interrupt: bool) -> Result<(), String> {
     let partition = refresh_partitions(device, &uuid)?;
     inventory(INVENTORY_AFTER_MARKER)?;
     fs::remove_dir_all("/scratch").map_err(|error| format!("remove formatter scratch: {error}"))?;
-    // The volume image contains only filesystem metadata and the trust layout.
+    // The volume image contains metadata, trust layout and bounded settings.
     // Publication now streams from read-only media straight onto the disk.
     if interrupt {
         return interrupt_publication(&partition);
@@ -440,9 +462,48 @@ fn install(device: &str, interrupt: bool) -> Result<(), String> {
         "/bin/td-boot",
         &["install", &partition, "/volume", "/source", "/trusted.pub"],
     )?;
+    if system_autotest {
+        command("/bin/td-boot", &["mount-var", &partition, "/state"])?;
+        seed_system_autotest(Path::new("/"), Path::new("/state"))?;
+        check_timezone(Path::new("/state"))?;
+        command("/bin/umount", &["/state"])?;
+    }
     applet(&["sync"])?;
     report(std::io::stdout(), format_args!("{DIRECT_MARKER}"))?;
     report(std::io::stdout(), format_args!("{INSTALL_MARKER}"))
+}
+
+/// The installed application oracle uses the standard VM's loopback-only SSH
+/// fixture. Its inputs exist only on the full-system diagnostic ISO.
+fn seed_system_autotest(source: &Path, state: &Path) -> Result<(), String> {
+    let private = read(&source.join(SYSTEM_AUTOTEST_PRIVATE), 4096)?;
+    let authorized = read(&source.join(SYSTEM_AUTOTEST_AUTHORIZED), 4096)?;
+    if private.is_empty() || authorized.is_empty() {
+        return Err("empty system autotest SSH fixture".into());
+    }
+    for (relative, mode) in [("lib/td-test", 0o755), ("lib/td/ssh", 0o700)] {
+        let path = state.join(relative);
+        fs::create_dir_all(&path).map_err(|error| format!("create {}: {error}", path.display()))?;
+        fs::set_permissions(&path, fs::Permissions::from_mode(mode))
+            .map_err(|error| format!("chmod {}: {error}", path.display()))?;
+    }
+    for (relative, bytes) in [
+        ("lib/td-test/openssh-admin-selftest", private),
+        ("lib/td/ssh/authorized_keys", authorized),
+    ] {
+        let path = state.join(relative);
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+            .map_err(|error| format!("create {}: {error}", path.display()))?;
+        file.set_permissions(fs::Permissions::from_mode(0o600))
+            .and_then(|()| file.write_all(&bytes))
+            .and_then(|()| file.sync_all())
+            .map_err(|error| format!("write {}: {error}", path.display()))?;
+    }
+    Ok(())
 }
 
 /// Observe the publisher's private staging tree, never a production control hook.
@@ -665,6 +726,22 @@ fn selector() -> Result<(), String> {
     )
 }
 
+fn check_timezone(state: &Path) -> Result<(), String> {
+    let path = state.join("lib/td/timezone");
+    let metadata = fs::symlink_metadata(&path)
+        .map_err(|error| format!("inspect {}: {error}", path.display()))?;
+    if !metadata.is_file() || metadata.permissions().mode() & 0o7777 != 0o644 {
+        return Err(format!(
+            "{} is not a mode-0644 regular setting",
+            path.display()
+        ));
+    }
+    if read(&path, 65)? != format!("{TIMEZONE_ID}\n").as_bytes() {
+        return Err(format!("wrong timezone in {}", path.display()));
+    }
+    Ok(())
+}
+
 fn installed() -> Result<(), String> {
     let cmdline = String::from_utf8(read(Path::new("/proc/cmdline"), 2048)?)
         .map_err(|_| "non-UTF-8 command line")?;
@@ -701,6 +778,7 @@ fn installed() -> Result<(), String> {
         return Err("wrong installed EROFS payload".into());
     }
     command("/bin/td-boot", &["on-volume", "mount-var", "/state"])?;
+    check_timezone(Path::new("/state"))?;
     let path = PathBuf::from("/state/installation-count");
     let count = match File::open(&path) {
         Ok(file) => match read_file(file, &path, 8)?.as_slice() {
@@ -759,8 +837,9 @@ fn run() -> Result<(), String> {
     }
     directories()?;
     match read(Path::new("/fixture-phase"), 32)?.as_slice() {
-        b"install\n" => install(&target()?, false),
-        b"interrupt\n" => install(&target()?, true),
+        b"install\n" => install(&target()?, false, false),
+        b"install-system\n" => install(&target()?, false, true),
+        b"interrupt\n" => install(&target()?, true, false),
         b"selector\n" => selector(),
         b"installed\n" => installed(),
         _ => Err("invalid fixture phase".into()),
@@ -804,6 +883,68 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn system_autotest_requires_explicit_inputs_and_preserves_existing_state() {
+        let source = Scratch::new();
+        let state = Scratch::new();
+        assert!(seed_system_autotest(&source.0, &state.0).is_err());
+        assert!(!state.0.join("lib").exists());
+        fs::create_dir(source.0.join("system-autotest")).unwrap();
+        fs::write(source.0.join(SYSTEM_AUTOTEST_PRIVATE), b"private fixture").unwrap();
+        fs::write(source.0.join(SYSTEM_AUTOTEST_AUTHORIZED), b"public fixture").unwrap();
+        seed_system_autotest(&source.0, &state.0).unwrap();
+        for (relative, expected) in [
+            (
+                "lib/td-test/openssh-admin-selftest",
+                b"private fixture".as_slice(),
+            ),
+            ("lib/td/ssh/authorized_keys", b"public fixture".as_slice()),
+        ] {
+            let path = state.0.join(relative);
+            assert_eq!(fs::read(&path).unwrap(), expected);
+            assert_eq!(
+                fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        assert_eq!(
+            fs::metadata(state.0.join("lib/td/ssh"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        fs::write(state.0.join("lib/td/ssh/authorized_keys"), b"preserve").unwrap();
+        assert!(seed_system_autotest(&source.0, &state.0).is_err());
+        assert_eq!(
+            fs::read(state.0.join("lib/td/ssh/authorized_keys")).unwrap(),
+            b"preserve"
+        );
+    }
+
+    #[test]
+    fn cold_boot_timezone_evidence_refuses_absence_wrong_names_and_links() {
+        let scratch = Scratch::new();
+        let path = scratch.0.join("lib/td/timezone");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        assert!(check_timezone(&scratch.0).is_err());
+        for value in ["Etc/UTC\n", "Europe/London", "Europe/London\nextra\n"] {
+            fs::write(&path, value).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+            assert!(check_timezone(&scratch.0).is_err());
+        }
+        fs::write(&path, format!("{TIMEZONE_ID}\n")).unwrap();
+        check_timezone(&scratch.0).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o666)).unwrap();
+        assert!(check_timezone(&scratch.0).is_err());
+        let target = scratch.0.join("choice");
+        fs::rename(&path, &target).unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o644)).unwrap();
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        assert!(check_timezone(&scratch.0).is_err());
     }
 
     #[test]

@@ -119,7 +119,7 @@ installed profile. Updates must retain the installed identity and settings.
 Keyboard and timezone choices must actually affect the installed session;
 only supported choices with available data may be offered.
 
-`td-install timezones` provides the read-only catalog for later settings
+`td-install timezones` provides the read-only catalog for settings
 selection. It accepts no operands and reads only the deployment's
 `/etc/zoneinfo`: `zone1970.tab`, `iso3166.tab`, and referenced TZif files.
 Its JSON `version: 1` is a schema version, not a tzdata release. `source`
@@ -130,19 +130,58 @@ is `zone1970.tab`; `timezones` is sorted by IANA `id`. Each entry carries
 Time`. Backward aliases and fixed-offset alternatives are not enumerated.
 
 The catalog permits at most 512 countries and 1,024 zones including UTC.
-Each table is limited to 128 KiB, each line to 2,048 bytes, country names
-to 256 bytes, zone IDs to 128 bytes, comments to 512 bytes, and each zone
-file to 64 KiB. Empty tables, duplicate or unresolved entries, malformed
-UTF-8, unsafe zone IDs, and missing or non-regular files refuse the whole
-catalog before JSON output. TZif screening requires a complete 44-byte
-v2/v3 header; it does not parse transitions or establish semantic validity.
-The tzdata recipe's native checks own that validation and also run this
-exact catalog reader against every realized output. File leaves cannot
-be symlinks, but the deployment's root symlink into its immutable store is
-supported. Parent paths are trusted deployment data, not a defense against
-a concurrent privileged writer. Output errors fail the command and may
-leave partial JSON. This command neither selects nor persists a timezone;
-the session clock remains UTC until settings and consumers are connected.
+Each table is limited to 128 KiB, each line to 2,048 bytes, country
+names to 256 bytes, zone IDs to 64 bytes, comments to 512 bytes, and
+each zone file to 64 KiB. Empty tables, duplicate or unresolved entries,
+malformed UTF-8, unsafe zone IDs, and missing or non-regular files
+refuse the whole catalog before JSON output. Zone IDs have two or three
+slash-separated components, each starting with an ASCII uppercase letter
+and otherwise containing ASCII letters, digits, underscores, plus or
+minus signs. This matches the application launcher's name bounds. TZif
+screening requires a complete 44-byte v2/v3 header; it does not parse
+transitions or establish semantic validity. The tzdata recipe's native
+checks own that validation and also run this exact catalog reader
+against every realized output. File leaves cannot be symlinks, but the
+deployment's root symlink into its immutable store is supported. Parent
+paths are trusted deployment data, not a defense against a concurrent
+privileged writer. Output errors fail the command and may leave partial
+JSON. This command neither selects nor persists a timezone; the
+compositor clock remains explicitly UTC.
+
+`td-install volume [--uuid UUID] [--timezone IANA-ID] DESTINATION MKFS
+SCRATCH --trusted-key KEY` accepts an optional catalog selection. It
+validates the entire offline catalog and selected identifier before
+opening the destination or creating scratch state. Unknown names and
+backward aliases refuse. The formatter seeds one mode-0644,
+newline-terminated name at `@var/lib/td/timezone`; its parent
+directories are mode 0755. Omitting the option leaves that file absent.
+The deployment-owned optional persistent `/etc/timezone` link points to
+`/var/lib/td/timezone`, so deployment updates preserve the choice and
+first boot does not overwrite it. The QEMU installation oracle selects
+`Europe/London` and verifies the file after formatting and on both cold
+boots with the installation media removed. The full-system oracle also
+requires mail, news, Firefox and Claude startup evidence and clean guest
+shutdown in one additional direct selector boot of that installed disk.
+Only this additional boot supplies the existing autotest command-line
+token; the two firmware boots remain unchanged. The full-system
+diagnostic ISO seeds the standard VM loopback-restricted SSH self-test
+authorization and mode-0600 test key in its disposable volume, which the
+autotest health probe requires. Ordinary installer artifacts do not
+contain that diagnostic fixture. The full installed-system boots use a
+4 GiB test VM: the current roughly 3 GiB deployment verification can
+fill a 2 GiB guest's page cache before kexec allocates its control page
+without reclaim retries. This is an oracle budget, not a minimum-memory
+hardware qualification. The small diagnostic matrix retains 2 GiB.
+The application-evidence boot uses the shared system-test timeout,
+which covers the longer autotest profiler prerequisite; installation
+and ordinary firmware boots retain their separate 900-second default.
+
+The existing application launcher reads that name and binds each runtime's
+own zone file at its jailed `/etc/localtime`. Static mail and news carry
+the source-built data in `static-runtime`; Firefox and Claude use their
+reviewed Freedesktop runtime data. Missing runtime zones refuse launch.
+Native clock rendering, account and keyboard settings, and a post-install
+timezone setter remain separate increments.
 
 The `tzdata` recipe compiles the approved IANA 2026d data-only source
 with td's existing source-built glibc `zic`. Its output contains fat
@@ -165,8 +204,7 @@ Canadian and 2027 UTC, daylight-saving and fixed-offset behavior.
 The complete data output ships at its canonical store path in the system
 deployment, including live and installed profiles. The immutable
 `/etc/zoneinfo` link exposes compiled zones and geographic tables for
-offline selection. This does not yet select a timezone or change an
-installed session. Source-built td glibc's compiled `TZDIR` is
+offline selection. Source-built td glibc's compiled `TZDIR` is
 `/td/store/glibc-2.41-x86_64/share/zoneinfo` and its `TZDEFAULT` is
 `/td/store/glibc-2.41-x86_64/etc/localtime`. Later settings consumers
 must explicitly connect the selected data to native readers; libc does

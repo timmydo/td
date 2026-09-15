@@ -199,7 +199,7 @@ impl ApplicationSpec {
         }
         match manifest.runtime() {
             // Fully static payload: no runtime-major rendering override exists.
-            "empty-runtime" => {}
+            "empty-runtime" | "static-runtime" => {}
             "freedesktop-platform-25-08" => {
                 if manifest
                     .environment()
@@ -489,7 +489,7 @@ impl ApplicationSpec {
 
 fn runtime_recipe_name(path: &str) -> Option<&str> {
     let package = runtime_store_name(path).ok()?;
-    ["freedesktop-platform-25-08", "empty-runtime"]
+    ["freedesktop-platform-25-08", "empty-runtime", "static-runtime"]
         .into_iter()
         .find(|name| {
             package == *name
@@ -621,6 +621,29 @@ mod tests {
         );
         assert!(!spec.to_keyfile().contains("provenance="));
         assert_eq!(ApplicationSpec::parse(&spec.to_keyfile()).unwrap(), spec);
+    }
+
+    #[test]
+    fn data_only_static_runtime_round_trips_without_loader_overrides() {
+        let manifest = ApplicationDeclaration::new("static-runtime", "/app/bin/mail")
+            .unwrap()
+            .manifest("mail", "0.1", ApplicationProvenance::Source)
+            .unwrap();
+        let runtime = "/td/store/0123456789abcdfghijklmnpqrsvwxyz-static-runtime-1";
+        let spec = ApplicationSpec::compile(&manifest, runtime, PermissionPolicy::new()).unwrap();
+        assert_eq!(ApplicationSpec::parse(&spec.to_keyfile()).unwrap(), spec);
+        assert!(!spec
+            .environment()
+            .any(|(name, _)| name.starts_with("LD_") || name == "LIBGL_ALWAYS_SOFTWARE"));
+        let unreviewed = ApplicationDeclaration::new("unreviewed-runtime", "/app/bin/mail")
+            .unwrap()
+            .manifest("mail", "0.1", ApplicationProvenance::Source)
+            .unwrap();
+        assert!(ApplicationSpec::compile(
+            &unreviewed,
+            &runtime.replace("-static-runtime-1", "-unreviewed-runtime-1"),
+            PermissionPolicy::new(),
+        ).is_err());
     }
 
     #[test]

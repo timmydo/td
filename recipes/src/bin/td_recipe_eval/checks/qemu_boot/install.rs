@@ -6,6 +6,9 @@ pub(super) use td_recipe::td_install_qemu_protocol as protocol;
 
 pub(super) const TARGET_DRIVE_ID: &str = "install-target";
 const MINIMUM_TARGET_BYTES: u64 = 6 * 1024 * 1024 * 1024;
+// Verifying the full deployment fills page cache before kexec allocates its
+// control page without reclaim retries. Reserve room above the 3 GiB payload.
+const INSTALLED_SYSTEM_MEMORY_MIB: &str = "4096";
 
 /// Only this module can create a writable installation target, in owned scratch.
 pub(super) struct TargetDisk {
@@ -140,6 +143,7 @@ const OUTPUTS: &[&str] = &[
     "td-boot",
     "td-kexec",
     "btrfs-progs-x86-64",
+    "tzdata",
 ];
 
 fn read(path: &Path) -> Result<Vec<u8>, String> {
@@ -174,8 +178,17 @@ fn initramfs(
     phase: &str,
     extra: &[PackedFile],
 ) -> Result<Vec<u8>, String> {
+    let mut parents: std::collections::BTreeSet<String> =
+        key_path_parents().into_iter().map(str::to_owned).collect();
+    for (name, _, _) in common.iter().chain(extra) {
+        let mut parent = Path::new(name).parent();
+        while let Some(path) = parent.filter(|path| !path.as_os_str().is_empty()) {
+            parents.insert(path.to_str().ok_or("non-UTF-8 fixture parent")?.to_owned());
+            parent = path.parent();
+        }
+    }
     let mut entries = Vec::new();
-    for name in key_path_parents() {
+    for name in &parents {
         entries.push(Entry {
             name,
             mode: 0o755,
@@ -214,7 +227,7 @@ struct LiveInstaller {
 impl LiveInstaller {
     fn load(runner: &RecipeCheckRunner, trust: &RunTrust) -> Result<Self, String> {
         let outputs = runner.build_and_stage("td-install-qemu-test", OUTPUTS)?;
-        let [probe, linux, installer, init, boot, kexec, btrfs] = outputs.as_slice() else {
+        let [probe, linux, installer, init, boot, kexec, btrfs, tzdata] = outputs.as_slice() else {
             return Err("installation fixture output roster mismatch".into());
         };
         let kernel = linux.join("bzImage");
@@ -233,7 +246,7 @@ impl LiveInstaller {
         }
         let uuid = installation_uuid(&trust.public);
         let uuid_line = format!("{uuid}\n").into_bytes();
-        let extra = vec![
+        let mut extra = vec![
             (
                 "bin/td-install".into(),
                 0o755,
@@ -247,6 +260,19 @@ impl LiveInstaller {
             ("trusted.pub".into(), 0o644, trust.trusted_key_line()),
             (td_boot_protocol::VOLUME_UUID_PATH.into(), 0o644, uuid_line),
         ];
+        let zoneinfo = tzdata.join("share/zoneinfo");
+        let catalog = td_recipe::td_install_timezones::Catalog::load(&zoneinfo)
+            .map_err(|error| format!("load fixture timezone catalog: {error}"))?;
+        for name in ["iso3166.tab", "zone1970.tab"]
+            .into_iter()
+            .chain(catalog.ids())
+        {
+            extra.push((
+                format!("etc/zoneinfo/{name}"),
+                0o644,
+                read(&zoneinfo.join(name))?,
+            ));
+        }
         Ok(Self {
             kernel,
             base,
@@ -1310,7 +1336,7 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
         kernel,
         base,
         common,
-        extra,
+        mut extra,
         uuid,
     } = LiveInstaller::load(runner, &trust)?;
     static SEQ: AtomicU64 = AtomicU64::new(0);
@@ -1337,8 +1363,23 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
         .iter()
         .map(|(iso_name, name)| (*iso_name, scratch.dir.join(name)))
         .collect();
+    extra.extend([
+        (
+            protocol::SYSTEM_AUTOTEST_PRIVATE.into(),
+            0o600,
+            OPENSSH_ADMIN_PRIVATE_KEY.as_bytes().to_vec(),
+        ),
+        (
+            protocol::SYSTEM_AUTOTEST_AUTHORIZED.into(),
+            0o600,
+            OPENSSH_ADMIN_AUTHORIZATION.as_bytes().to_vec(),
+        ),
+    ]);
     let live = scratch.dir.join("installer.cpio");
-    write(&live, &initramfs(&base, &common, "install\n", &extra)?)?;
+    write(
+        &live,
+        &initramfs(&base, &common, "install-system\n", &extra)?,
+    )?;
     let iso = scratch.dir.join("installer.iso");
     media::write_image_with_payloads(&iso, &kernel, &live, &payloads)?;
     let capacity = system_target_capacity(payload_bytes)?;
@@ -1399,6 +1440,7 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
                 let vars = scratch.dir.join(format!("{name}-boot-{count}-vars.fd"));
                 efi::copy_input(&vars_template, &vars)?;
                 let mut boot_plan = target_plan(&target, SYSTEM_BOOT_SUCCESS_MARKER);
+                boot_plan.mem = INSTALLED_SYSTEM_MEMORY_MIB;
                 // Stock audio supervision needs the emulated sound device.
                 boot_plan.audio = true;
                 println!(
@@ -1442,13 +1484,70 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
                         .map_err(|error| format!("remove {}: {error}", decoy.path.display()))?;
                 }
             }
+            if installations.is_empty() {
+                // Firmware cannot inject autotest tokens. Keep both stock firmware
+                // boots above and add one direct selector boot of that SAME disk.
+                let app_timeout = boot_timeout();
+                let tokens =
+                    format!("{AUTOTEST_CMDLINE_TOKEN} {}", autotest_wait_token(app_timeout));
+                let mut app_plan = target_plan(&target, GREETER_MARKER);
+                app_plan.kill_on_marker = false;
+                app_plan.mem = INSTALLED_SYSTEM_MEMORY_MIB;
+                app_plan.audio = true;
+                app_plan.extra_append = &tokens;
+                println!("   [qemu-install-system] checking all four jailed applications with the installed timezone");
+                let result = boot_with_timeout(
+                    &qemu,
+                    &deployment.join("bzImage"),
+                    &provisioned,
+                    app_plan,
+                    &scratch.dir,
+                    app_timeout,
+                )?;
+                let device = format!("/dev/{}", partition_name(bus.name(false), 2));
+                validate_installed_system(&result, &uuid, &device, &id, false)?;
+                require_installed_applications(&result)?;
+                require_same_identity(
+                    first.as_ref().ok_or("missing firmware boot identity")?,
+                    &result,
+                    "firmware installed boot",
+                    "application evidence boot",
+                )?;
+            }
             fs::remove_file(&target.path)
                 .map_err(|error| format!("remove {}: {error}", target.path.display()))?;
             let first = first.ok_or("installed system has no first-boot evidence")?;
             installations.push((name, first));
         }
     }
-    println!("PASS: stock system installed offline through optical/USB ISO firmware onto virtio/AHCI disks; immutable root, compositor page flips, acknowledged deployment and stable machine identity across reordered cold boots");
+    println!("PASS: stock system installed offline through optical/USB ISO firmware onto virtio/AHCI disks; immutable root, compositor page flips, acknowledged deployment and stable machine identity across reordered cold boots; all four jailed applications start in an additional direct selector boot of the timezone-configured installed disk");
+    Ok(())
+}
+
+fn require_installed_applications(result: &BootResult) -> Result<(), String> {
+    if !result.exited_clean || result.marker_killed {
+        return Err(format!(
+            "installed application boot did not shut down cleanly: {}\n{}",
+            result.reason,
+            tail(&result.console, 100)
+        ));
+    }
+    for (marker, present) in [
+        (TD_MAIL_BOOT_MARKER, result.evidence.td_mail_running),
+        (TD_NEWS_BOOT_MARKER, result.evidence.td_news_running),
+        (TD_FIREFOX_BOOT_MARKER, result.evidence.td_firefox),
+        (
+            TD_CLAUDE_TERMINAL_MARKER,
+            result.evidence.td_claude_terminal,
+        ),
+    ] {
+        if !present {
+            return Err(format!(
+                "installed timezone application proof lacks {marker}\n{}",
+                tail(&result.console, 100)
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -1849,6 +1948,38 @@ mod tests {
         assert!(validate_interrupted_boot(&result, &refused, "wrong").is_err());
         result.evidence.selected_previous = true;
         assert!(validate_interrupted_boot(&result, &refused, "uuid").is_err());
+    }
+
+    #[test]
+    fn installed_timezone_proof_requires_every_shipped_application() {
+        assert!(require_installed_applications(&healthy_system()).is_err());
+        let healthy = || {
+            let mut result = healthy_system();
+            result.evidence.td_mail_running = true;
+            result.evidence.td_news_running = true;
+            result.evidence.td_firefox = true;
+            result.evidence.td_claude_terminal = true;
+            result.exited_clean = true;
+            result.marker_killed = false;
+            result
+        };
+        require_installed_applications(&healthy()).unwrap();
+        let mut unclean = healthy();
+        unclean.exited_clean = false;
+        assert!(require_installed_applications(&unclean).is_err());
+        let mut killed = healthy();
+        killed.marker_killed = true;
+        assert!(require_installed_applications(&killed).is_err());
+        for remove in [
+            |e: &mut ConsoleEvidence| e.td_mail_running = false,
+            |e: &mut ConsoleEvidence| e.td_news_running = false,
+            |e: &mut ConsoleEvidence| e.td_firefox = false,
+            |e: &mut ConsoleEvidence| e.td_claude_terminal = false,
+        ] {
+            let mut missing = healthy();
+            remove(&mut missing.evidence);
+            assert!(require_installed_applications(&missing).is_err());
+        }
     }
 
     #[test]

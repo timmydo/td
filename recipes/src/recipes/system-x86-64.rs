@@ -410,7 +410,7 @@ const SHIPPED_APPLICATIONS: &[ShippedApplication] = &[
         runtime: "freedesktop-platform-25-08",
         runtime_recipe: super::freedesktop_platform_25_08::recipe,
     },
-    // The terminal applications: td-owned static programs on the empty
+    // The terminal applications: td-owned static programs on the data-only
     // runtime, each a td-term window at boot. Neither holds a bus name; the
     // tripwire below counts the applications that do.
     ShippedApplication {
@@ -418,16 +418,16 @@ const SHIPPED_APPLICATIONS: &[ShippedApplication] = &[
         package: TD_MAIL_NAME,
         package_recipe: super::mail::recipe,
         external_uid: 65537,
-        runtime: "empty-runtime",
-        runtime_recipe: super::empty_runtime::recipe,
+        runtime: "static-runtime",
+        runtime_recipe: super::static_runtime::recipe,
     },
     ShippedApplication {
         name: TD_NEWS_NAME,
         package: TD_NEWS_NAME,
         package_recipe: super::news::recipe,
         external_uid: 65538,
-        runtime: "empty-runtime",
-        runtime_recipe: super::empty_runtime::recipe,
+        runtime: "static-runtime",
+        runtime_recipe: super::static_runtime::recipe,
     },
     // Claude Code: a marked foreign payload on the freedesktop runtime, run as
     // a terminal application with no bus name — the first foreign-payload
@@ -3441,6 +3441,9 @@ enum State {
     /// Per-machine identity on the persistent Btrfs `@var` subvolume. Minted once
     /// by `/bin/td-firstboot` and thereafter never rewritten.
     Persistent,
+    /// A user choice seeded by td-install. Absence means no choice; updates
+    /// retain it, and the application reader validates a present value.
+    OptionalPersistent,
 }
 
 /// One reviewed hole in the immutable `/etc`.
@@ -3461,7 +3464,7 @@ struct MutableEtc {
     /// Path under `/etc` — the stable name every reader uses.
     etc: &'static str,
     /// Absolute symlink target: under `/run` for `Volatile`, under `/var/lib/td`
-    /// (td-firstboot's state dir) for `Persistent`.
+    /// for both persistent classes, seeded by td-firstboot or td-install.
     target: &'static str,
     state: State,
     /// Who writes the target, and why this cannot be image content. The reason has
@@ -3500,7 +3503,7 @@ const IMMUTABLE_ETC: &[ImmutableEtc] = &[
     ImmutableEtc {
         etc: "zoneinfo",
         target: "{in:tzdata}/share/zoneinfo",
-        why: "The pending installer settings consumer needs a stable zoneinfo \
+        why: "The installer settings consumer needs a stable zoneinfo \
               path because its binary cannot name a content-addressed data hash",
     },
     ImmutableEtc {
@@ -3519,6 +3522,13 @@ const IMMUTABLE_ETC: &[ImmutableEtc] = &[
 ];
 
 const MUTABLE_ETC: &[MutableEtc] = &[
+    MutableEtc {
+        etc: "timezone",
+        target: "/var/lib/td/timezone",
+        state: State::OptionalPersistent,
+        why: "td-install records an explicit offline timezone choice; absent means \
+              no choice and td-jail keeps the application's existing UTC default",
+    },
     MutableEtc {
         etc: "resolv.conf",
         target: "/run/resolv.conf",
@@ -3662,6 +3672,7 @@ fn build_mutable_state() -> String {
          #\n\
          # volatile  = /run tmpfs, rebuilt every boot by td-netd\n\
          # persistent = /var Btrfs subvolume, minted once per machine by td-firstboot\n\
+         # optional-persistent = /var state seeded only when explicitly chosen at installation\n\
          #\n\
          # <path>  <state>  <target>\n\
          #     why it cannot be image content\n",
@@ -3670,6 +3681,7 @@ fn build_mutable_state() -> String {
         let state = match entry.state {
             State::Volatile => "volatile",
             State::Persistent => "persistent",
+            State::OptionalPersistent => "optional-persistent",
         };
         s.push_str(&format!(
             "{}  {state}  {}\n    {}\n",
@@ -5657,8 +5669,8 @@ mod tests {
                     && content == "td-profiler-application-roots-v1\n\
 claude\tclaude-2.1.260\tforeign\tfreedesktop-platform-25-08-25.08\tforeign\n\
 firefox\tfirefox-154.0\tforeign\tfreedesktop-platform-25-08-25.08\tforeign\n\
-mail\tmail-0.1\tsource\tempty-runtime-1\tsource\n\
-news\tnews-0.1\tsource\tempty-runtime-1\tsource\n"
+mail\tmail-0.1\tsource\tstatic-runtime-1\tsource\n\
+news\tnews-0.1\tsource\tstatic-runtime-1\tsource\n"
         )));
         assert!(steps.iter().any(|step| matches!(
             step,
@@ -7301,9 +7313,9 @@ news\tnews-0.1\tsource\tempty-runtime-1\tsource\n"
         // Every other shipped application holds no bus name and is a terminal
         // application the broker would admit as a peer that sees and addresses
         // only the portal and itself. mail and news are td-owned source builds
-        // on the empty runtime; Claude is the reviewed foreign payload on
+        // on the data-only static runtime; Claude is the reviewed foreign payload on
         // Firefox's runtime, the first foreign-payload terminal application, so
-        // the runtime is one of those two rather than empty-runtime alone.
+        // the runtime is one of those two reviewed families.
         for application in SHIPPED_APPLICATIONS
             .iter()
             .filter(|application| application.name != FIREFOX_NAME)
@@ -7318,8 +7330,8 @@ news\tnews-0.1\tsource\tempty-runtime-1\tsource\n"
             let foreign_terminal = application.name == CLAUDE_NAME
                 && application.runtime == "freedesktop-platform-25-08";
             assert!(
-                application.runtime == "empty-runtime" || foreign_terminal,
-                "{} is neither a source-built empty-runtime terminal app nor the \
+                application.runtime == "static-runtime" || foreign_terminal,
+                "{} is neither a source-built static-runtime terminal app nor the \
                  reviewed foreign-payload terminal app Claude",
                 application.name
             );
@@ -7850,11 +7862,11 @@ news\tnews-0.1\tsource\tempty-runtime-1\tsource\n"
             "{in:binutils-x86-64-self}".to_string(),
             "{in:td-cc}".to_string(),
             format!("{{payload:{CLAUDE_NAME}}}"),
-            "{payload:empty-runtime}".to_string(),
             format!("{{payload:{FIREFOX_NAME}}}"),
             "{payload:freedesktop-platform-25-08}".to_string(),
             format!("{{payload:{TD_MAIL_NAME}}}"),
             format!("{{payload:{TD_NEWS_NAME}}}"),
+            "{payload:static-runtime}".to_string(),
         ];
         assert_eq!(
             roots.as_slice(),
@@ -8562,8 +8574,8 @@ news\tnews-0.1\tsource\tempty-runtime-1\tsource\n"
             shipped,
             vec![
                 (FIREFOX_NAME, FIREFOX_NAME, "freedesktop-platform-25-08"),
-                (TD_MAIL_NAME, TD_MAIL_NAME, "empty-runtime"),
-                (TD_NEWS_NAME, TD_NEWS_NAME, "empty-runtime"),
+                (TD_MAIL_NAME, TD_MAIL_NAME, "static-runtime"),
+                (TD_NEWS_NAME, TD_NEWS_NAME, "static-runtime"),
                 (CLAUDE_NAME, CLAUDE_NAME, "freedesktop-platform-25-08"),
             ],
             "the system image pairs each reviewed package with its runtime: \
@@ -8574,11 +8586,11 @@ news\tnews-0.1\tsource\tempty-runtime-1\tsource\n"
             system_recipe.payload_inputs,
             Some(vec![
                 CLAUDE_NAME.into(),
-                "empty-runtime".into(),
                 FIREFOX_NAME.into(),
                 "freedesktop-platform-25-08".into(),
                 TD_MAIL_NAME.into(),
                 TD_NEWS_NAME.into(),
+                "static-runtime".into(),
             ]),
             "each reviewed package and each runtime is one payload input, deduped \
              and sorted; the two freedesktop apps share one runtime input"
@@ -9409,6 +9421,24 @@ news\tnews-0.1\tsource\tempty-runtime-1\tsource\n"
         }
     }
 
+    #[test]
+    fn the_optional_timezone_link_names_the_installers_persistent_file() {
+        let optional: Vec<_> = MUTABLE_ETC
+            .iter()
+            .filter(|entry| entry.state == State::OptionalPersistent)
+            .collect();
+        assert_eq!(optional.len(), 1);
+        assert_eq!(optional[0].etc, "timezone");
+        assert_eq!(optional[0].target, "/var/lib/td/timezone");
+        assert!(include_str!("../../../td-install/src/main.rs")
+            .contains("const TIMEZONE_STATE_RELATIVE: &str = \"lib/td/timezone\";"));
+        let check = build_mutable_etc_check(&SYSTEM);
+        assert!(check.contains("readlink /etc/timezone"));
+        assert!(!check.contains("test -f /etc/timezone"));
+        assert!(
+            build_mutable_state().contains("timezone  optional-persistent  /var/lib/td/timezone")
+        );
+    }
     /// The table's invariants, including the ones that keep it safe to interpolate
     /// unquoted into `shape_check`'s and `rootcheck`'s generated shell.
     #[test]
@@ -9446,7 +9476,7 @@ news\tnews-0.1\tsource\tempty-runtime-1\tsource\n"
                 // Volatile state must be on the /run tmpfs, which starts every boot
                 // empty — that is what makes it volatile rather than merely mutable.
                 State::Volatile => "/run/",
-                State::Persistent => "/var/",
+                State::Persistent | State::OptionalPersistent => "/var/",
             };
             assert!(
                 entry.target.starts_with(wanted_root),
@@ -9454,6 +9484,7 @@ news\tnews-0.1\tsource\tempty-runtime-1\tsource\n"
                 match entry.state {
                     State::Volatile => "volatile",
                     State::Persistent => "persistent",
+                    State::OptionalPersistent => "optional-persistent",
                 },
                 entry.target
             );

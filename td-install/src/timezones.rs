@@ -75,12 +75,11 @@ fn countries(text: &str) -> io::Result<BTreeMap<String, String>> {
 }
 
 fn zone_id(id: &str) -> bool {
-    id.len() <= 128
+    id.len() <= 64
         && id.contains('/')
+        && id.split('/').count() <= 3
         && id.split('/').all(|part| {
-            !part.is_empty()
-                && part != "."
-                && part != ".."
+            part.bytes().next().is_some_and(|b| b.is_ascii_uppercase())
                 && part
                     .bytes()
                     .all(|b| b.is_ascii_alphanumeric() || b"_+-".contains(&b))
@@ -171,25 +170,65 @@ fn quoted(output: &mut impl Write, text: &str) -> io::Result<()> {
     write!(output, "\"")
 }
 
-pub fn run(root: &Path, output: &mut impl Write) -> io::Result<()> {
-    let countries = countries(&table(root, "iso3166.tab")?)?;
-    let zones = zones(&table(root, "zone1970.tab")?, &countries)?;
-    // Validate every advertised file before writing even the JSON prefix.
-    // This is header screening; the tzdata recipe owns transition validation.
-    for id in zones.keys() {
-        let bytes = realfile::read_bounded_real_file(&root.join(id), id, MAX_TZIF)?;
-        if bytes.len() < 44
-            || bytes.get(..4) != Some(b"TZif")
-            || !matches!(bytes.get(4), Some(b'2' | b'3'))
-        {
-            return Err(invalid(format!("{id}: expected a TZif v2/v3 header")));
+/// A catalog-backed installation choice; callers cannot construct unchecked IDs.
+#[derive(Debug, Eq, PartialEq)]
+pub struct Selection(String);
+
+impl Selection {
+    pub fn load(root: &Path, id: &str) -> io::Result<Self> {
+        if !zone_id(id) {
+            return Err(invalid("invalid installation timezone identifier".into()));
         }
+        let catalog = Catalog::load(root)?;
+        if !catalog.ids().any(|candidate| candidate == id) {
+            return Err(invalid(format!(
+                "timezone {id:?} is not an available catalog choice"
+            )));
+        }
+        Ok(Self(id.to_owned()))
     }
+
+    pub fn id(&self) -> &str {
+        &self.0
+    }
+}
+
+pub struct Catalog {
+    countries: BTreeMap<String, String>,
+    zones: BTreeMap<String, Zone>,
+}
+
+impl Catalog {
+    pub fn ids(&self) -> impl Iterator<Item = &str> {
+        self.zones.keys().map(String::as_str)
+    }
+
+    pub fn load(root: &Path) -> io::Result<Self> {
+        let countries = countries(&table(root, "iso3166.tab")?)?;
+        let zones = zones(&table(root, "zone1970.tab")?, &countries)?;
+        // Validate every advertised file before writing even the JSON prefix.
+        // This is header screening; the tzdata recipe owns transition validation.
+        for id in zones.keys() {
+            let bytes = realfile::read_bounded_real_file(&root.join(id), id, MAX_TZIF)?;
+            if bytes.len() < 44
+                || bytes.get(..4) != Some(b"TZif")
+                || !matches!(bytes.get(4), Some(b'2' | b'3'))
+            {
+                return Err(invalid(format!("{id}: expected a TZif v2/v3 header")));
+            }
+        }
+        Ok(Self { countries, zones })
+    }
+}
+
+pub fn run(root: &Path, output: &mut impl Write) -> io::Result<()> {
+    let catalog = Catalog::load(root)?;
+    let countries = &catalog.countries;
     write!(
         output,
         "{{\"version\":1,\"source\":\"zone1970.tab\",\"timezones\":["
     )?;
-    for (i, (id, zone)) in zones.iter().enumerate() {
+    for (i, (id, zone)) in catalog.zones.iter().enumerate() {
         if i != 0 {
             write!(output, ",")?;
         }
@@ -284,6 +323,20 @@ mod tests {
     }
 
     #[test]
+    fn selections_require_an_available_geographic_choice_or_utc() {
+        let fixture = Fixture::new();
+        for id in ["Etc/UTC", "America/Los_Angeles"] {
+            assert_eq!(Selection::load(&fixture.0, id).unwrap().id(), id);
+        }
+        fixture.write("US/Pacific", b"TZif2");
+        for id in ["US/Pacific", "America/Missing", "../UTC", "", "UTC"] {
+            assert!(Selection::load(&fixture.0, id).is_err(), "{id}");
+        }
+        fs::remove_file(fixture.0.join("Etc/UTC")).unwrap();
+        assert!(Selection::load(&fixture.0, "America/Los_Angeles").is_err());
+    }
+
+    #[test]
     fn sorted_geographic_catalog_has_countries_and_utc_but_no_aliases() {
         let fixture = Fixture::new();
         fixture.write("US/Pacific", b"not read");
@@ -374,13 +427,17 @@ mod tests {
             "A/B\\C",
             "A/B.C",
             "UTC",
+            "A/B/C/D",
+            "a/B",
+            "A/b",
             "A/é",
         ] {
             assert!(!zone_id(id), "{id}");
         }
         assert!(zone_id("America/Argentina/Buenos_Aires"));
         assert!(zone_id("Etc/GMT+12"));
-        assert!(!zone_id(&format!("A/{}", "x".repeat(128))));
+        assert!(zone_id(&format!("A/B{}", "x".repeat(61))));
+        assert!(!zone_id(&format!("A/B{}", "x".repeat(62))));
     }
 
     #[test]

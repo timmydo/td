@@ -10,5 +10,6 @@ pub fn recipe() -> Recipe {
         "td-boot",
         "td-kexec",
         "btrfs-progs-x86-64",
+        "tzdata",
     ])
 }

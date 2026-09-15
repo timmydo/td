@@ -1,5 +1,5 @@
 //! The `mail` application: td-mail, td's JMAP mail client, as a static
-//! package on the empty runtime. It runs in a td-term window at boot
+//! package on the data-only static runtime. It runs in a td-term window at boot
 //! (`system-x86-64`'s `[mail]` unit) and reads
 //! `$XDG_CONFIG_HOME/td-mail/config.toml`, which
 //! td-firstboot provisions once under the login user's jail state. Saved
@@ -18,7 +18,7 @@ const PROGRAM: &str = "td-mail";
 const PROGRAM_RECIPE: &str = "td-mail";
 
 pub fn recipe() -> Recipe {
-    let Ok(declaration) = ApplicationDeclaration::new("empty-runtime", APPLICATION_ENTRY) else {
+    let Ok(declaration) = ApplicationDeclaration::new("static-runtime", APPLICATION_ENTRY) else {
         return invalid_recipe("declaration");
     };
     let Ok(launcher) =
@@ -52,7 +52,7 @@ pub fn recipe() -> Recipe {
 
     Recipe::mesboot(APPLICATION_NAME, "0.1")
         .inputs(&[PROGRAM_RECIPE, "td-secret"])
-        .payload_inputs(&["empty-runtime"])
+        .payload_inputs(&["static-runtime"])
         .steps(vec![
             Step::MkDir {
                 path: "{out}/files/bin".into(),
@@ -121,11 +121,11 @@ mod tests {
     fn mail_is_one_static_terminal_application_without_a_bus_name() {
         let recipe = recipe();
         let declaration = recipe.application.as_ref().expect("declaration");
-        assert_eq!(declaration.runtime(), "empty-runtime");
+        assert_eq!(declaration.runtime(), "static-runtime");
         assert_eq!(declaration.entry(), APPLICATION_ENTRY);
         assert_eq!(declaration.alias(), None);
         assert_eq!(recipe.inputs, Some(vec![PROGRAM_RECIPE.into(), "td-secret".into()]));
-        assert_eq!(recipe.payload_inputs, Some(vec!["empty-runtime".into()]));
+        assert_eq!(recipe.payload_inputs, Some(vec!["static-runtime".into()]));
         let launcher = recipe.application_launcher.as_ref().expect("launcher");
         assert_eq!(launcher.display_name(), APPLICATION_DISPLAY_NAME);
         assert_eq!(
@@ -170,7 +170,7 @@ mod tests {
         assert!(matches!(
             steps.last(),
             Some(Step::ValidateStaticApplication { entry, runtime })
-                if entry == APPLICATION_ENTRY && runtime == "empty-runtime"
+                if entry == APPLICATION_ENTRY && runtime == "static-runtime"
         ));
     }
 }

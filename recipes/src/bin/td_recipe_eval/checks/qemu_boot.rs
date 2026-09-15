@@ -2222,7 +2222,7 @@ fn validate_system_boot(
         return Err(format!(
             "the terminal became ready, but a terminal application's running marker was \
              absent ({TD_MAIL_BOOT_MARKER:?} {}, {TD_NEWS_BOOT_MARKER:?} {}) — the /bin \
-             launcher, the static package on the empty runtime, the fresh-terminal grant, \
+             launcher, the static package on its data-only runtime, the fresh-terminal grant, \
              td-firstboot's provisioned configuration, or the program itself failed within \
              the settle window, or its td-term window never reported ready. \
              Last serial output:\n{}",

@@ -61,7 +61,7 @@ fn invalid(message: String) -> io::Error {
 
 const USAGE: &str =
     "usage: td-install inventory\n       td-install timezones\n       td-install layout-preview <logical-sector-bytes> <capacity-bytes>\n       td-install layout <destination> [<efi-kernel> <selector-initramfs>]\n       \
-                     td-install volume [--uuid <uuid>] <destination> <mkfs.btrfs> <scratch-dir> \
+                     td-install volume [--uuid <uuid>] [--timezone <IANA-id>] <destination> <mkfs.btrfs> <scratch-dir> \
                      [<td-boot> <deployment> <trusted-key> | --trusted-key <trusted-key>]";
 
 #[derive(Debug, Eq, PartialEq)]
@@ -87,6 +87,7 @@ enum Mode {
     /// alone runs out inside mkfs rather than here.
     Volume {
         uuid: Option<VolumeUuid>,
+        timezone: Option<String>,
         destination: PathBuf,
         mkfs: PathBuf,
         scratch: PathBuf,
@@ -242,6 +243,26 @@ fn parse_args(mut args: impl Iterator<Item = OsString>) -> io::Result<Mode> {
     } else {
         (None, rest.as_slice())
     };
+    let (timezone, rest) = if rest.first().is_some_and(|arg| arg.as_os_str() == "--timezone") {
+        if verb != "volume" {
+            return Err(invalid("--timezone is only supported by volume".into()));
+        }
+        let id = rest
+            .get(1)
+            .and_then(|arg| arg.to_str())
+            .ok_or_else(|| invalid("--timezone requires an IANA identifier".into()))?;
+        (
+            Some(id.to_owned()),
+            rest.get(2..).ok_or_else(|| invalid(USAGE.into()))?,
+        )
+    } else {
+        (None, rest)
+    };
+    if rest.iter().any(|arg| arg.as_os_str() == "--timezone") {
+        return Err(invalid(
+            "--timezone must appear once before the volume operands".into(),
+        ));
+    }
     if rest.iter().any(|arg| arg.as_os_str() == "--uuid") {
         return Err(invalid(if verb == "volume" {
             "--uuid must appear once, immediately after volume".into()
@@ -281,6 +302,7 @@ fn parse_args(mut args: impl Iterator<Item = OsString>) -> io::Result<Mode> {
         (Some("volume"), [destination, mkfs, scratch, flag, trusted_key])
             if flag.as_os_str() == "--trusted-key" => Ok(Mode::Volume {
                 uuid,
+                timezone,
                 destination: destination.clone(),
                 mkfs: mkfs.clone(),
                 scratch: scratch.clone(),
@@ -289,6 +311,7 @@ fn parse_args(mut args: impl Iterator<Item = OsString>) -> io::Result<Mode> {
         (Some("volume"), [destination, mkfs, scratch, td_boot, deployment, trusted_key]) => {
             Ok(Mode::Volume {
                 uuid,
+                timezone,
                 destination: destination.clone(),
                 mkfs: mkfs.clone(),
                 scratch: scratch.clone(),
@@ -301,6 +324,7 @@ fn parse_args(mut args: impl Iterator<Item = OsString>) -> io::Result<Mode> {
         }
         (Some("volume"), [destination, mkfs, scratch]) => Ok(Mode::Volume {
             uuid,
+            timezone,
             destination: destination.clone(),
             mkfs: mkfs.clone(),
             scratch: scratch.clone(),
@@ -1480,7 +1504,26 @@ fn seed_into(staging: &Path, seed: &VolumeSeed, key: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
+const TIMEZONE_ROOT: &str = "/etc/zoneinfo";
+const TIMEZONE_STATE_RELATIVE: &str = "lib/td/timezone";
+
+fn seed_timezone(subvol: &Path, timezone: &timezones::Selection) -> io::Result<()> {
+    for relative in ["lib", "lib/td"] {
+        let path = subvol.join(relative);
+        paths::create_dir_all(&path)?;
+        paths::set_mode(&path, 0o755)?;
+    }
+    let path = subvol.join(TIMEZONE_STATE_RELATIVE);
+    let mut file = paths::create_new_with_mode(&path, 0o644)?;
+    writeln!(file, "{}", timezone.id())
+        .map_err(|error| io::Error::new(error.kind(), format!("write {}: {error}", path.display())))?;
+    paths::set_mode(&path, 0o644)?;
+    file.sync_all()
+        .map_err(|error| io::Error::new(error.kind(), format!("sync {}: {error}", path.display())))
+}
+
 fn run_volume(
+    timezone: Option<&timezones::Selection>,
     uuid: Option<&VolumeUuid>,
     destination: &Path,
     mkfs: &Path,
@@ -1566,6 +1609,10 @@ fn run_volume(
     // on a machine's /var, with nothing about the install saying so.
     paths::remove_dir_all_if_present(&staging)?;
     paths::create_dir_all(&subvol)?;
+    paths::set_mode(&subvol, 0o755)?;
+    if let Some(timezone) = timezone {
+        seed_timezone(&subvol, timezone)?;
+    }
     // BEFORE the mkfs that bakes this tree into the image, which is the whole
     // of why the publish can happen without a mount: `--rootdir` is what puts
     // it in the filesystem.
@@ -1733,7 +1780,7 @@ fn main() -> ExitCode {
         Mode::Timezones => {
             let stdout = io::stdout();
             let mut output = io::BufWriter::new(stdout.lock());
-            timezones::run(Path::new("/etc/zoneinfo"), &mut output)
+            timezones::run(Path::new(TIMEZONE_ROOT), &mut output)
                 .and_then(|()| output.flush())
         },
         Mode::Inventory => {
@@ -1757,18 +1804,26 @@ fn main() -> ExitCode {
         },
         Mode::Volume {
             uuid,
+            timezone,
             destination,
             mkfs,
             scratch,
             seed,
-        } => run_volume(
-            uuid.as_ref(),
-            &destination,
-            &mkfs,
-            &scratch,
-            seed.as_ref(),
-            &mut io::stdout(),
-        ),
+        } => timezone
+            .as_deref()
+            .map(|id| timezones::Selection::load(Path::new(TIMEZONE_ROOT), id))
+            .transpose()
+            .and_then(|timezone| {
+                run_volume(
+                    timezone.as_ref(),
+                    uuid.as_ref(),
+                    &destination,
+                    &mkfs,
+                    &scratch,
+                    seed.as_ref(),
+                    &mut io::stdout(),
+                )
+            }),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -1802,6 +1857,118 @@ mod tests {
         }
     }
 
+    #[test]
+    fn volume_timezone_is_an_optional_prefix_after_the_uuid() {
+        let args = |values: &[&str]| {
+            values
+                .iter()
+                .map(OsString::from)
+                .collect::<Vec<_>>()
+                .into_iter()
+        };
+        let mode = parse_args(args(&[
+            "volume",
+            "--timezone",
+            "Europe/London",
+            "disk",
+            "/mkfs",
+            "scratch",
+        ]))
+        .unwrap();
+        assert!(
+            matches!(mode, Mode::Volume { timezone: Some(ref id), uuid: None, .. } if id == "Europe/London")
+        );
+        let mode = parse_args(args(&[
+            "volume",
+            "--uuid",
+            "12345678-1234-4234-8234-123456789abc",
+            "--timezone",
+            "Etc/UTC",
+            "disk",
+            "/mkfs",
+            "scratch",
+        ]))
+        .unwrap();
+        assert!(
+            matches!(mode, Mode::Volume { timezone: Some(ref id), uuid: Some(_), .. } if id == "Etc/UTC")
+        );
+        for values in [
+            vec!["volume", "--timezone"],
+            vec![
+                "volume",
+                "disk",
+                "/mkfs",
+                "scratch",
+                "--timezone",
+                "Etc/UTC",
+            ],
+            vec![
+                "volume",
+                "--timezone",
+                "Etc/UTC",
+                "--timezone",
+                "Etc/UTC",
+                "disk",
+                "/mkfs",
+                "scratch",
+            ],
+            vec!["layout", "--timezone", "Etc/UTC", "disk"],
+            vec![
+                "volume",
+                "--timezone",
+                "Etc/UTC",
+                "--uuid",
+                "12345678-1234-4234-8234-123456789abc",
+                "disk",
+                "/mkfs",
+                "scratch",
+            ],
+        ] {
+            assert!(parse_args(args(&values)).is_err(), "{values:?}");
+        }
+    }
+
+    #[test]
+    fn timezone_state_is_readable_persistent_data_and_is_never_overwritten() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = scratch::path("timezone-state");
+        std::fs::create_dir(&root).unwrap();
+        let catalog = root.join("catalog");
+        std::fs::create_dir_all(catalog.join("Europe")).unwrap();
+        std::fs::create_dir(catalog.join("Etc")).unwrap();
+        std::fs::write(catalog.join("iso3166.tab"), b"GB\tBritain\n").unwrap();
+        std::fs::write(
+            catalog.join("zone1970.tab"),
+            b"GB\t+5130-00007\tEurope/London\n",
+        )
+        .unwrap();
+        let mut header = vec![0; 44];
+        header[..5].copy_from_slice(b"TZif2");
+        for id in ["Europe/London", "Etc/UTC"] {
+            std::fs::write(catalog.join(id), &header).unwrap();
+        }
+        let choice = timezones::Selection::load(&catalog, "Europe/London").unwrap();
+        let subvol = root.join("@var");
+        std::fs::create_dir(&subvol).unwrap();
+        std::fs::set_permissions(&subvol, std::fs::Permissions::from_mode(0o755)).unwrap();
+        seed_timezone(&subvol, &choice).unwrap();
+        let state = subvol.join("lib/td/timezone");
+        assert_eq!(std::fs::read(&state).unwrap(), b"Europe/London\n");
+        assert_eq!(
+            std::fs::metadata(&state).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
+        for directory in [subvol.clone(), subvol.join("lib"), subvol.join("lib/td")] {
+            assert_eq!(
+                std::fs::metadata(directory).unwrap().permissions().mode() & 0o777,
+                0o755
+            );
+        }
+        std::fs::write(&state, b"preserve existing state").unwrap();
+        assert!(seed_timezone(&subvol, &choice).is_err());
+        assert_eq!(std::fs::read(&state).unwrap(), b"preserve existing state");
+        std::fs::remove_dir_all(root).unwrap();
+    }
     const MIB: u64 = 1024 * 1024;
     const GIB: u64 = 1024 * MIB;
     /// Big enough for the ESP plus the smallest volume td-install accepts.
@@ -2152,6 +2319,7 @@ mod tests {
             parse_args(args(&["volume", "/dev/sda", "/bin/mkfs.btrfs", "/tmp"])).unwrap(),
             Mode::Volume {
                 uuid: None,
+                timezone: None,
                 destination: PathBuf::from("/dev/sda"),
                 mkfs: PathBuf::from("/bin/mkfs.btrfs"),
                 scratch: PathBuf::from("/tmp"),
@@ -2262,6 +2430,7 @@ mod tests {
         let dir = fake_mkfs(RECORDING_MKFS);
         run_volume(
             None,
+            None,
             &scratch.path,
             &dir.join("mkfs.btrfs"),
             &dir,
@@ -2315,6 +2484,7 @@ mod tests {
             run_layout(&scratch.path, &mut Vec::new()).unwrap();
             let dir = fake_mkfs(RECORDING_MKFS);
             run_volume(
+                None,
                 None,
                 &scratch.path,
                 &dir.join("mkfs.btrfs"),
@@ -2442,6 +2612,7 @@ mod tests {
         std::os::unix::fs::symlink(&bystander, dir.join("td-volume.img")).unwrap();
         run_volume(
             None,
+            None,
             &scratch.path,
             &dir.join("mkfs.btrfs"),
             &dir,
@@ -2511,7 +2682,15 @@ mod tests {
         run_layout(&scratch.path, &mut Vec::new()).unwrap();
         let dir = fake_mkfs("#!/bin/sh\necho 'btrfs-progs v7.0'\n");
         let mut out = Vec::new();
-        run_volume(None, &scratch.path, &dir.join("mkfs.btrfs"), &dir, None, &mut out).unwrap();
+        run_volume(
+            None,
+            None,
+            &scratch.path,
+            &dir.join("mkfs.btrfs"),
+            &dir,
+            None,
+            &mut out,
+        ).unwrap();
         let text = String::from_utf8(out).unwrap();
         let fields: Vec<&str> = text.split_whitespace().collect();
         assert_eq!(fields.len(), 3, "the line is <off> <len> <written>: {text:?}");
@@ -2567,6 +2746,7 @@ mod tests {
         .unwrap();
         let Mode::Volume {
             uuid: Some(identity),
+            timezone: None,
             destination,
             mkfs,
             scratch: staging_scratch,
@@ -2576,6 +2756,7 @@ mod tests {
             panic!("preselected UUID was not retained");
         };
         run_volume(
+            None,
             Some(&identity),
             &destination,
             &mkfs,
@@ -2650,6 +2831,7 @@ mod tests {
             .unwrap(),
             Mode::Volume {
                 uuid: None,
+                timezone: None,
                 destination: PathBuf::from("/dev/sda"),
                 mkfs: PathBuf::from("/bin/mkfs.btrfs"),
                 scratch: PathBuf::from("/tmp"),
@@ -2713,6 +2895,7 @@ mod tests {
             .unwrap(),
             Mode::Volume {
                 uuid: None,
+                timezone: None,
                 destination: PathBuf::from("disk"),
                 mkfs: PathBuf::from("/mkfs"),
                 scratch: PathBuf::from("scratch"),
@@ -2783,6 +2966,7 @@ mod tests {
             .unwrap(),
             Mode::Volume {
                 uuid: Some(VolumeUuid(uuid.into())),
+                timezone: None,
                 destination: PathBuf::from("disk"),
                 mkfs: PathBuf::from("/mkfs"),
                 scratch: PathBuf::from("scratch"),
@@ -2800,6 +2984,7 @@ mod tests {
         let key = key_file(&dir);
         let mut out = Vec::new();
         run_volume(
+            None,
             None,
             &scratch.path,
             &dir.join("mkfs.btrfs"),
@@ -2866,6 +3051,7 @@ mod tests {
         for key in [missing, link, oversized] {
             let mut out = Vec::new();
             let error = run_volume(
+                None,
                 None,
                 &scratch.path,
                 &dir.join("mkfs.btrfs"),
@@ -2953,6 +3139,7 @@ mod tests {
         let mut out = Vec::new();
         run_volume(
             None,
+            None,
             &scratch.path,
             &dir.join("mkfs.btrfs"),
             &dir,
@@ -3035,6 +3222,7 @@ mod tests {
             trusted_key: key.clone(),
         };
         run_volume(
+            None,
             None,
             &scratch.path,
             &dir.join("mkfs.btrfs"),
@@ -3176,7 +3364,15 @@ mod tests {
             "layout must name the destination it could not open, got {refused:?}"
         );
 
-        let refused = run_volume(None, &absent, &dir.join("mkfs.btrfs"), &dir, None, &mut Vec::new())
+        let refused = run_volume(
+            None,
+            None,
+            &absent,
+            &dir.join("mkfs.btrfs"),
+            &dir,
+            None,
+            &mut Vec::new(),
+        )
             .unwrap_err()
             .to_string();
         assert!(
@@ -4538,6 +4734,7 @@ mod tests {
         };
         let error = run_volume(
             None,
+            None,
             &scratch.path,
             &dir.join("mkfs.btrfs"),
             &dir,
@@ -4609,6 +4806,7 @@ mod tests {
             };
             let _ = run_volume(
                 None,
+                None,
                 &scratch.path,
                 &dir.join("mkfs.btrfs"),
                 &dir,
@@ -4633,6 +4831,7 @@ mod tests {
         run_layout(&scratch.path, &mut Vec::new()).unwrap();
         let dir = fake_mkfs(RECORDING_MKFS);
         run_volume(
+            None,
             None,
             &scratch.path,
             &dir.join("mkfs.btrfs"),
@@ -4688,6 +4887,7 @@ mod tests {
                 trusted_key: key_file(&dir),
             };
             let error = run_volume(
+                None,
                 None,
                 &scratch.path,
                 &dir.join("mkfs.btrfs"),
@@ -4746,6 +4946,7 @@ mod tests {
         };
         let error = run_volume(
             None,
+            None,
             &scratch.path,
             &dir.join("mkfs.btrfs"),
             &dir,
@@ -4793,6 +4994,7 @@ mod tests {
         };
         let error = run_volume(
             None,
+            None,
             &scratch.path,
             &dir.join("mkfs.btrfs"),
             &dir,
@@ -4826,6 +5028,7 @@ mod tests {
             trusted_key: key_file(&dir),
         };
         let error = run_volume(
+            None,
             None,
             &scratch.path,
             &dir.join("mkfs.btrfs"),
@@ -4870,6 +5073,7 @@ mod tests {
             trusted_key: key_file(&dir),
         };
         let error = run_volume(
+            None,
             None,
             &scratch.path,
             &dir.join("mkfs.btrfs"),
@@ -4936,6 +5140,7 @@ mod tests {
         std::fs::create_dir(&dir).unwrap();
         let error = run_volume(
             None,
+            None,
             &scratch.path,
             Path::new("mkfs.btrfs"),
             &dir,
@@ -4961,7 +5166,15 @@ mod tests {
         run_layout(&path, &mut Vec::new()).unwrap();
         let fake = fake_mkfs("#!/bin/sh\nexit 0\n");
         let error =
-            run_volume(None, &path, &fake.join("mkfs.btrfs"), &dir, None, &mut Vec::new()).unwrap_err();
+            run_volume(
+            None,
+            None,
+            &path,
+            &fake.join("mkfs.btrfs"),
+            &dir,
+            None,
+            &mut Vec::new(),
+        ).unwrap_err();
         assert!(
             format!("{error}").contains("is the destination itself"),
             "the alias must be refused: {error}"
@@ -5062,6 +5275,7 @@ mod tests {
         std::fs::write(&stale, b"not mine").unwrap();
         run_volume(
             None,
+            None,
             &scratch.path,
             &dir.join("mkfs.btrfs"),
             &dir,
@@ -5105,6 +5319,7 @@ mod tests {
         run_layout(&scratch.path, &mut Vec::new()).unwrap();
         let dir = fake_mkfs("#!/bin/sh\nexit 3\n");
         let error = run_volume(
+            None,
             None,
             &scratch.path,
             &dir.join("mkfs.btrfs"),
