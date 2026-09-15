@@ -547,10 +547,14 @@ level 2 from level 1 (tens of milliseconds across the pool) and then level
 3; during a crop drag the previous level 2 is shown scaled until the
 pointer settles for one frame, so the drag never waits. Resizing the
 window recomputes level 2. Switching photo recomputes level 1 from the
-cached level 0 and prefetches the next two and previous one level-0 frames
-in the background. The window holds these levels and this memoization from
-the second slice of increment 5(d); the first slice develops the preview
-correctly but reruns the whole pipeline on each edit. Level 1 is superpixel
+cached level 0, or decodes when the photo is no longer cached. The window
+holds these levels and this memoization from increment 5(d)'s second slice,
+described here; its first slice developed the preview correctly but reran
+the whole pipeline on each edit. Prefetching the neighbouring level-0 frames
+in the background is a later slice; until then the raw cache holds the
+current photo and those recently shown, evicting the least recently shown
+under `RAW_CACHE_BYTES`, so a return to a photo reruns level 1, not the
+codec. Level 1 is superpixel
 (each 2x2 CFA quad becomes one RGB
 pixel: exact colour, no interpolation, a quarter of the samples), which is
 the right demosaic for every on-screen size below half resolution; export
@@ -738,8 +742,9 @@ thumbnail is not ready paints a neutral placeholder and its name, never blocks.
   queue the turn loop replaces under its lock whenever the model's generation
   moves, so a request the model no longer wants is dropped before it starts;
   jobs are `Thumbnail` and `Preview` now — the develop preview, at most one at a
-  time, which runs the whole pipeline until the memoization slice splits it into
-  `RawDecode`, `Level1` and `Level2` — with `Export` in its increment. A job
+  time, run from the level an edit invalidates (`Decode`, `Level1`, `Level2` or
+  `Level3`, planned from the window's memo, so an exposure or look edit reruns
+  level 3 alone and a resize level 2) — with `Export` in its increment. A job
   stays outstanding — a thumbnail in the running set, the develop in its
   in-flight slot — until the turn loop collects its result, so the job count
   never reads zero with a result made and not yet held. A finished thumbnail is
@@ -757,6 +762,20 @@ thumbnail is not ready paints a neutral placeholder and its name, never blocks.
   Demosaic and resampling split rows into bands on one shared queue that the
   calling thread and its scoped helper threads drain together, so no thread
   outlives the call and a band count that exceeds the threads is shared out.
+- The window memoizes the current photo's level 1 and its level 2 for the box's
+  long edge, and caches level-0 frames (charged by their samples and key) under
+  `RAW_CACHE_BYTES`, evicting the least recently shown, so a develop reruns only
+  what its edit invalidated and a return to a recently shown photo skips the
+  codec. Each plan is keyed by the photo, so it never supplies another photo's
+  levels: a result from a previous roll is dropped, and one whose photo is no
+  longer the cursor's does not become the current levels (its decoded level 0 is
+  still cached), so a develop that finished after a switch never evicts the
+  photo the model moved to. When a develop completes the pool drops its own
+  queued plan too, so the turn loop replans from the merged memo before any
+  worker takes a plan made against the old one. The memo and the raw cache are
+  let go when the roll or scale changes, as the thumbnails are. `--preview`
+  keeps no memo: it develops the whole preview on the calling thread, so it
+  stays the window's oracle.
 - Budgets are named constants the tests pin: `RAW_CACHE_BYTES` 512 MiB,
   `THUMB_CACHE_BYTES` 256 MiB in memory, `MAX_FILE_BYTES` 512 MiB,
   `MAX_RAW_SAMPLES` 128 Mi, `MAX_PREVIEW_SAMPLES` 128 Mi over a preview's padded
@@ -917,7 +936,13 @@ second roll or a stray flag before it looks for a display and leaving no socket
 behind when the display is not there; `src/window.rs`'s own tests hold
 `wait_ms`'s grammar, the envelope's ID, the charge of a held entry, the queue's
 replacement skipping what runs and the pool's count staying outstanding until a
-result is collected. `tests/control_process.rs` runs the built binary under the
+result is collected, the pool running one develop at a time and dropping its
+queued plan when one finishes, the memo planning each develop from what it
+holds (level 3 for an exposure or look edit, level 2 for a resize, level 1 for
+a cached photo, else a decode), untouched by a failed develop, caching but not
+becoming current for a develop that finishes off the cursor, and the raw cache
+evicting the least recently shown under
+`RAW_CACHE_BYTES`. `tests/control_process.rs` runs the built binary under the
 native compositor harness the sibling crates use (`ready`
 builds the compositor; the case is ignored without it): the window on a roll of
 originals no decoder accepts, so the frame is the scene's, mapped with its app
@@ -976,8 +1001,11 @@ all-target Clippy.
    developed frame and the native test; this slice re-develops from the raw
    on each edit, correct but not yet incremental. Landed. Second: the level
    memoization and the level-0 cache, so an exposure or look edit reruns
-   level 3 alone, a crop or resize level 2, and a photo switch level 1 from
-   the cached level 0. (e) The crop applied to level 2 (the crop of level 1)
+   level 3 alone, a resize level 2 (a crop too once 5(e) applies it), and a
+   photo switch level 1 from the cached level 0; the pool plans each develop
+   from the window's memo and the raw cache evicts the least recently shown
+   under `RAW_CACHE_BYTES`. Landed; prefetching neighbouring level-0 frames
+   is a later slice. (e) The crop applied to level 2 (the crop of level 1)
    in the preview and the headless verb, the crop drag contract, and the
    look list overlay.
 6. Export: banded full-resolution bilinear demosaic, the JPEG encoder,

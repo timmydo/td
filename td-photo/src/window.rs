@@ -294,24 +294,91 @@ struct Preview {
     look: Option<String>,
 }
 
-/// What a worker finished: a thumbnail for a key, or the developed preview
-/// for a request; `None` for either when it could not be made (said on
-/// stderr), which leaves the box its placeholder.
+/// The level a develop starts from, and the cached levels it reuses: an
+/// exposure or look edit starts at `Level3` (level 2 reused), a resize at
+/// `Level2` (level 1 reused), a photo whose level 0 is cached at `Level1`,
+/// and a new photo at `Decode`. The window plans it from what its memo
+/// holds; the worker runs from here forward.
+enum Start {
+    Decode,
+    Level1 {
+        raw: Arc<crate::RawFrame>,
+    },
+    Level2 {
+        meta: crate::Meta,
+        level1: Arc<develop::Level1>,
+    },
+    Level3 {
+        meta: crate::Meta,
+        level2: Arc<develop::Level2>,
+    },
+}
+
+/// Which level a develop began at: what the memo tests read from a plan.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Stage {
+    Decode,
+    Level1,
+    Level2,
+    Level3,
+}
+
+#[cfg(test)]
+impl Start {
+    fn stage(&self) -> Stage {
+        match self {
+            Start::Decode => Stage::Decode,
+            Start::Level1 { .. } => Stage::Level1,
+            Start::Level2 { .. } => Stage::Level2,
+            Start::Level3 { .. } => Stage::Level3,
+        }
+    }
+}
+
+/// What a develop produced, to merge into the window's memo and show: each
+/// variant carries only the levels recomputed, since the window already
+/// holds the earlier ones. `None` when it could not be made (said on
+/// stderr), which redraws the box's placeholder.
+enum Made {
+    Decoded {
+        raw: Arc<crate::RawFrame>,
+        meta: crate::Meta,
+        level1: Arc<develop::Level1>,
+        long_edge: usize,
+        level2: Arc<develop::Level2>,
+        image: Rgb8,
+    },
+    Level1 {
+        meta: crate::Meta,
+        level1: Arc<develop::Level1>,
+        long_edge: usize,
+        level2: Arc<develop::Level2>,
+        image: Rgb8,
+    },
+    Level2 {
+        long_edge: usize,
+        level2: Arc<develop::Level2>,
+        image: Rgb8,
+    },
+    Level3 {
+        image: Rgb8,
+    },
+    None,
+}
+
+/// What a worker finished: a thumbnail for a key (`None` when it could not
+/// be made, said on stderr, which leaves the box its placeholder), or the
+/// developed preview for a request, carrying what it made.
 enum Done {
-    Thumb {
-        key: Key,
-        image: Option<Rgb8>,
-    },
-    Develop {
-        preview: Preview,
-        image: Option<Rgb8>,
-    },
+    Thumb { key: Key, image: Option<Rgb8> },
+    Develop { preview: Preview, made: Made },
 }
 
 /// What a worker takes off the queue.
 enum Task {
     Thumb(Key),
-    Develop(Preview),
+    Develop(Preview, Start),
 }
 
 #[derive(Default)]
@@ -319,8 +386,9 @@ struct Queue {
     pending: VecDeque<Key>,
     /// Thumbnails taken by a worker and not yet collected by the window.
     running: HashSet<Key>,
-    /// The develop the window wants and no worker has taken yet.
-    preview: Option<Preview>,
+    /// The develop the window wants and no worker has taken yet, with the
+    /// level it should start from.
+    preview: Option<(Preview, Start)>,
     /// The develop a worker has taken and the window has not collected yet;
     /// at most one, so at most one raw is decoded at a time.
     developing: Option<Preview>,
@@ -331,14 +399,14 @@ impl Queue {
     /// Replaces the thumbnail wants with `thumbs` (less what is running) and
     /// the develop want with `preview`, but never re-queues the develop a
     /// worker already holds, and says how many jobs are outstanding.
-    fn replace(&mut self, thumbs: Vec<Key>, preview: Option<Preview>) -> usize {
+    fn replace(&mut self, thumbs: Vec<Key>, preview: Option<(Preview, Start)>) -> usize {
         let running = &self.running;
         self.pending.clear();
         self.pending
             .extend(thumbs.into_iter().filter(|key| !running.contains(key)));
         self.preview = match preview {
             // The one in flight is not queued again; it is being made.
-            Some(preview) if self.developing.as_ref() == Some(&preview) => None,
+            Some((want, _)) if self.developing.as_ref() == Some(&want) => None,
             other => other,
         };
         self.outstanding()
@@ -360,12 +428,22 @@ impl Queue {
             return Some(Task::Thumb(key));
         }
         if self.developing.is_none() {
-            if let Some(preview) = self.preview.take() {
+            if let Some((preview, start)) = self.preview.take() {
                 self.developing = Some(preview.clone());
-                return Some(Task::Develop(preview));
+                return Some(Task::Develop(preview, start));
             }
         }
         None
+    }
+
+    /// A develop finished: it leaves the in-flight slot, and any queued plan
+    /// is dropped too, so no worker takes a plan made against the old memo in
+    /// the gap before the turn loop merges the result and replans. `want`
+    /// re-submits from the fresh memo in the same turn, so nothing wanted is
+    /// lost.
+    fn develop_done(&mut self) {
+        self.developing = None;
+        self.preview = None;
     }
 }
 
@@ -414,7 +492,7 @@ impl Pool {
 
     /// Replaces the thumbnail wants and the develop want, and says how many
     /// jobs are outstanding.
-    fn want(&self, thumbs: Vec<Key>, preview: Option<Preview>) -> Result<usize> {
+    fn want(&self, thumbs: Vec<Key>, preview: Option<(Preview, Start)>) -> Result<usize> {
         let outstanding = self.lock()?.replace(thumbs, preview);
         self.queue.1.notify_all();
         Ok(outstanding)
@@ -435,7 +513,7 @@ impl Pool {
                 Done::Thumb { key, .. } => {
                     queue.running.remove(key);
                 }
-                Done::Develop { .. } => queue.developing = None,
+                Done::Develop { .. } => queue.develop_done(),
             }
         }
         Ok(done)
@@ -484,23 +562,97 @@ fn work(queue: &(Mutex<Queue>, Condvar), done: &Sender<Done>) {
                 let image = thumbnail(&key.path(), key.scale, 1);
                 Done::Thumb { key, image }
             }
-            Task::Develop(preview) => {
-                let image = crate::develop_preview(
-                    &preview.roll,
-                    &preview.name,
-                    preview.box_w,
-                    preview.box_h,
-                    preview.exposure,
-                    preview.look.as_deref(),
-                    threads(),
-                );
-                Done::Develop { preview, image }
+            Task::Develop(preview, start) => {
+                let made = develop_task(&preview, start);
+                Done::Develop { preview, made }
             }
         };
         if done.send(result).is_err() {
             return;
         }
     }
+}
+
+/// Runs a develop from `start` forward on a pool worker, off the turn
+/// thread: the look stem resolved here, then the levels the start does not
+/// already carry, each cheaper than the last. `Made::None`, with a note,
+/// when any level cannot be made, so the box redraws its placeholder.
+fn develop_task(preview: &Preview, start: Start) -> Made {
+    match develop_try(preview, start) {
+        Ok(made) => made,
+        Err(why) => {
+            note(&why);
+            Made::None
+        }
+    }
+}
+
+fn develop_try(preview: &Preview, start: Start) -> Result<Made> {
+    let threads = threads();
+    let long_edge = preview.box_w.max(preview.box_h);
+    let stops = preview.exposure as f32 / 100.0;
+    let look = match &preview.look {
+        Some(stem) => Some(crate::find_look(stem)?),
+        None => None,
+    };
+    // Level 2 to the shown frame, at this box, exposure and look.
+    let frame = |level2: &develop::Level2, meta: &crate::Meta| {
+        crate::level2_frame(
+            level2,
+            meta,
+            preview.box_w,
+            preview.box_h,
+            stops,
+            look.as_ref(),
+            threads,
+        )
+    };
+    // Level 1 to its level 2 and frame, shared by the decode and cached-raw
+    // starts.
+    let from_level1 = |level1: &develop::Level1, meta: &crate::Meta| {
+        let level2 = crate::level1_level2(level1, meta, long_edge, threads)?;
+        let image = frame(&level2, meta)?;
+        Ok::<_, String>((level2, image))
+    };
+    Ok(match start {
+        Start::Level3 { meta, level2 } => Made::Level3 {
+            image: frame(&level2, &meta)?,
+        },
+        Start::Level2 { meta, level1 } => {
+            let (level2, image) = from_level1(&level1, &meta)?;
+            Made::Level2 {
+                long_edge,
+                level2: Arc::new(level2),
+                image,
+            }
+        }
+        Start::Level1 { raw } => {
+            let meta = raw.meta();
+            let level1 = crate::raw_level1(&raw, threads)?;
+            let (level2, image) = from_level1(&level1, &meta)?;
+            Made::Level1 {
+                meta,
+                level1: Arc::new(level1),
+                long_edge,
+                level2: Arc::new(level2),
+                image,
+            }
+        }
+        Start::Decode => {
+            let (raw, _info) = crate::decode_raw(&preview.roll.join(&preview.name))?;
+            let meta = raw.meta();
+            let level1 = crate::raw_level1(&raw, threads)?;
+            let (level2, image) = from_level1(&level1, &meta)?;
+            Made::Decoded {
+                raw: Arc::new(raw),
+                meta,
+                level1: Arc::new(level1),
+                long_edge,
+                level2: Arc::new(level2),
+                image,
+            }
+        }
+    })
 }
 
 // ----------------------------------------------------------------- window
@@ -535,6 +687,226 @@ fn charge(key: &Key, image: Option<&Rgb8>) -> usize {
         .saturating_add(THUMB_OVERHEAD)
 }
 
+/// A photo the memo and the raw cache key by: the roll and the name in it,
+/// so another roll's file of the same name is another photo. Scale-free,
+/// since level 0 and level 1 do not depend on the scale.
+#[derive(Clone, Eq, PartialEq)]
+struct PhotoKey {
+    roll: PathBuf,
+    name: String,
+}
+
+impl PhotoKey {
+    /// Whether this is the photo the preview develops.
+    fn is(&self, preview: &Preview) -> bool {
+        self.roll == preview.roll && self.name == preview.name
+    }
+}
+
+/// The current photo's levels above 0: level 1 (the demosaic, reused across
+/// resizes) and the level 2 for the box's current long edge (reused across
+/// exposure and look edits), with the metadata level 3 applies. Let go with
+/// the thumbnails when the roll or scale changes.
+struct Current {
+    key: PhotoKey,
+    meta: crate::Meta,
+    level1: Arc<develop::Level1>,
+    long_edge: usize,
+    level2: Arc<develop::Level2>,
+}
+
+/// A level-0 frame the raw cache holds, with its byte charge and the turn
+/// clock when it was last the current develop; eviction picks the smallest
+/// `shown`, so the entries' order in the deque carries no meaning.
+struct Cached {
+    key: PhotoKey,
+    frame: Arc<crate::RawFrame>,
+    bytes: usize,
+    shown: u64,
+}
+
+/// What a raw-cache entry costs beside its samples and key: the slot alone,
+/// so the cache is bounded as the frames are.
+const RAW_OVERHEAD: usize = 128;
+
+/// The develop memo the window holds for the open roll: the current photo's
+/// levels above 0 and the level-0 raw cache. It plans each develop from what
+/// it holds, so only the levels an edit invalidates rerun, and merges each
+/// result back. Held apart from the window so its planning and eviction are
+/// tested on their own.
+#[derive(Default)]
+struct Memo {
+    /// The current photo's level 1 and its level 2 for the box's current
+    /// long edge, with the metadata level 3 applies.
+    current: Option<Current>,
+    /// Level-0 frames held in memory under `develop::RAW_CACHE_BYTES`,
+    /// evicted least-recently-shown (by each entry's `shown`, not position).
+    raw: VecDeque<Cached>,
+    /// What the raw cache holds between its entries, for eviction.
+    raw_bytes: usize,
+}
+
+impl Memo {
+    /// Lets go of every level, as when the roll or scale changes.
+    fn clear(&mut self) {
+        self.current = None;
+        self.raw.clear();
+        self.raw_bytes = 0;
+    }
+
+    /// The level a develop for `preview` starts from, given what is held:
+    /// level 3 when its level 2 is current for the box, level 2 when only
+    /// level 1 is, level 1 when the level 0 is cached, else a decode. Each
+    /// start carries the cached levels the worker reuses.
+    fn plan(&self, preview: &Preview) -> Start {
+        let long_edge = preview.box_w.max(preview.box_h);
+        if let Some(current) = &self.current {
+            if current.key.is(preview) {
+                if current.long_edge == long_edge {
+                    return Start::Level3 {
+                        meta: current.meta,
+                        level2: Arc::clone(&current.level2),
+                    };
+                }
+                return Start::Level2 {
+                    meta: current.meta,
+                    level1: Arc::clone(&current.level1),
+                };
+            }
+        }
+        if let Some(cached) = self.raw.iter().find(|cached| cached.key.is(preview)) {
+            return Start::Level1 {
+                raw: Arc::clone(&cached.frame),
+            };
+        }
+        Start::Decode
+    }
+
+    /// Merges a develop's result and returns the frame to show. Only the
+    /// levels the develop recomputed are stored; the earlier ones are already
+    /// held. `on_photo` says whether the result's photo is still the one the
+    /// model wants now: a `Decoded` or `Level1` result becomes the current
+    /// levels only then, so a develop that finished after a switch does not
+    /// evict the photo the model moved to (its level 0 is cached either way).
+    /// A `Made::Level2` for a photo no longer current is stale, so it is
+    /// dropped and returns no frame; `Made::None` leaves the memo untouched.
+    /// `shown` is the turn clock, for the raw cache's eviction order.
+    fn merge(&mut self, preview: &Preview, made: Made, shown: u64, on_photo: bool) -> Option<Rgb8> {
+        let key = PhotoKey {
+            roll: preview.roll.clone(),
+            name: preview.name.clone(),
+        };
+        match made {
+            Made::Decoded {
+                raw,
+                meta,
+                level1,
+                long_edge,
+                level2,
+                image,
+            } => {
+                self.cache_raw(key.clone(), raw, shown);
+                if on_photo {
+                    self.current = Some(Current {
+                        key,
+                        meta,
+                        level1,
+                        long_edge,
+                        level2,
+                    });
+                }
+                Some(image)
+            }
+            Made::Level1 {
+                meta,
+                level1,
+                long_edge,
+                level2,
+                image,
+            } => {
+                // The level 0 it ran from is already cached; keep it recent.
+                self.touch_raw(&key, shown);
+                if on_photo {
+                    self.current = Some(Current {
+                        key,
+                        meta,
+                        level1,
+                        long_edge,
+                        level2,
+                    });
+                }
+                Some(image)
+            }
+            Made::Level2 {
+                long_edge,
+                level2,
+                image,
+            } => match self.current.as_mut() {
+                Some(current) if current.key == key => {
+                    current.long_edge = long_edge;
+                    current.level2 = level2;
+                    Some(image)
+                }
+                // The photo is no longer current: the level 2 is stale, so it
+                // is dropped, neither memoized nor shown.
+                _ => None,
+            },
+            Made::Level3 { image } => Some(image),
+            Made::None => None,
+        }
+    }
+
+    /// Adds a level-0 frame, replacing any entry for the same photo, and
+    /// evicts the least recently shown while over `develop::RAW_CACHE_BYTES`,
+    /// keeping at least the one just added. The charge counts the samples and
+    /// the key's own heap (the roll path and the name), as the thumbnail
+    /// charge does, so the byte budget bounds the whole cache.
+    fn cache_raw(&mut self, key: PhotoKey, frame: Arc<crate::RawFrame>, shown: u64) {
+        let bytes = frame
+            .bytes()
+            .saturating_add(key.roll.as_os_str().len())
+            .saturating_add(key.name.len())
+            .saturating_add(RAW_OVERHEAD);
+        self.drop_raw(&key);
+        self.raw.push_back(Cached {
+            key,
+            frame,
+            bytes,
+            shown,
+        });
+        self.raw_bytes = self.raw_bytes.saturating_add(bytes);
+        while self.raw_bytes > develop::RAW_CACHE_BYTES && self.raw.len() > 1 {
+            let victim = self
+                .raw
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, cached)| cached.shown)
+                .map(|(index, _)| index);
+            let Some(gone) = victim.and_then(|index| self.raw.remove(index)) else {
+                break;
+            };
+            self.raw_bytes = self.raw_bytes.saturating_sub(gone.bytes);
+        }
+    }
+
+    /// Drops the raw-cache entry for a photo, if any.
+    fn drop_raw(&mut self, key: &PhotoKey) {
+        if let Some(index) = self.raw.iter().position(|cached| cached.key == *key) {
+            if let Some(gone) = self.raw.remove(index) {
+                self.raw_bytes = self.raw_bytes.saturating_sub(gone.bytes);
+            }
+        }
+    }
+
+    /// Marks a raw-cache entry the most recently shown, so a photo returned
+    /// to is not the first evicted.
+    fn touch_raw(&mut self, key: &PhotoKey, shown: u64) {
+        if let Some(cached) = self.raw.iter_mut().find(|cached| cached.key == *key) {
+            cached.shown = shown;
+        }
+    }
+}
+
 struct Window {
     client: Client<Object>,
     font: Font,
@@ -552,6 +924,12 @@ struct Window {
     /// when it could not be made), shown in the develop box until the next
     /// one lands. Let go with the thumbnails when the roll or scale changes.
     developed: Option<(Preview, Option<Rgb8>)>,
+    /// The develop memo: the current photo's cached levels above 0 (so an
+    /// exposure or look edit reruns level 3 alone and a resize reruns level
+    /// 2) and the level-0 raw cache (so returning to a photo reruns level 1
+    /// rather than the codec). Let go with the thumbnails when the roll or
+    /// scale changes.
+    memo: Memo,
     /// The pointer's last position on the surface, in the protocol's 24.8
     /// fixed point as the toolkit decodes it.
     pointer: (i32, i32),
@@ -626,6 +1004,7 @@ impl Window {
             thumbs: HashMap::new(),
             thumb_bytes: 0,
             developed: None,
+            memo: Memo::default(),
             pointer: (0, 0),
             wheel: Wheel::default(),
             control,
@@ -847,19 +1226,28 @@ impl Window {
             match item {
                 Done::Thumb { key, image } => thumbs.push((key, image)),
                 // Only the newest develop matters; earlier ones are stale.
-                Done::Develop { preview, image } => developed = Some((preview, image)),
+                Done::Develop { preview, made } => developed = Some((preview, made)),
             }
         }
-        if let Some((preview, image)) = developed {
+        if let Some((preview, made)) = developed {
             // A develop for a roll no longer held (one from a previous roll
-            // completing after a switch) is dropped, not shown; either way the
-            // wants are recomputed, so the current roll's develop is asked for.
+            // completing after a switch) is dropped, not shown or memoized;
+            // either way the wants are recomputed, so the current roll's
+            // develop is asked for.
             if self.held.as_ref().map(|(roll, _)| roll) == Some(&preview.roll) {
+                // The develop the model wants now, read once: `on_photo` is
+                // whether its photo is still the cursor's (so its levels
+                // become current), and the exact match drives the redraw.
+                let wanted = self.wanted_preview();
+                let on_photo = wanted
+                    .as_ref()
+                    .is_some_and(|w| w.roll == preview.roll && w.name == preview.name);
+                let image = self.memo.merge(&preview, made, self.clock, on_photo);
                 // A new generation whenever this is the develop the model
                 // wants now, an image or not: a made one to show it, a failed
                 // one to redraw the placeholder over any image a previous
                 // develop left in the box and to settle idle honestly.
-                touched |= self.wanted_preview().as_ref() == Some(&preview);
+                touched |= wanted.as_ref() == Some(&preview);
                 self.developed = Some((preview, image));
             }
             self.wanted_at = None;
@@ -957,6 +1345,7 @@ impl Window {
             self.thumbs.clear();
             self.thumb_bytes = 0;
             self.developed = None;
+            self.memo.clear();
             self.held = held;
         }
         let ui = &self.session.ui;
@@ -975,11 +1364,13 @@ impl Window {
                 .collect(),
         };
         // The develop, asked for once and not again while the frame holds it,
-        // so a settled develop is not re-run every turn.
+        // so a settled develop is not re-run every turn; when it is asked
+        // for, planned from the memo so only the invalidated levels rerun.
         let preview = self.wanted_preview();
         let submit = match (&preview, &self.developed) {
             (Some(want), Some((have, _))) if want == have => None,
-            _ => preview,
+            (Some(want), _) => Some((want.clone(), self.memo.plan(want))),
+            (None, _) => None,
         };
         self.pool.want(keys, submit)
     }
@@ -1290,9 +1681,12 @@ mod tests {
         let mut queue = Queue::default();
         // One develop wanted; taking it moves it into the in-flight slot,
         // where it stays outstanding until the window collects it.
-        assert_eq!(queue.replace(Vec::new(), Some(preview("a"))), 1);
+        assert_eq!(
+            queue.replace(Vec::new(), Some((preview("a"), Start::Decode))),
+            1
+        );
         match queue.take() {
-            Some(Task::Develop(request)) => assert_eq!(request.name, "a"),
+            Some(Task::Develop(request, _)) => assert_eq!(request.name, "a"),
             _ => panic!("expected the develop"),
         }
         assert!(queue.developing.is_some());
@@ -1300,24 +1694,50 @@ mod tests {
         // No second develop while one is in flight, and wanting the same one
         // again does not re-queue it.
         assert!(queue.take().is_none());
-        assert_eq!(queue.replace(Vec::new(), Some(preview("a"))), 1);
+        assert_eq!(
+            queue.replace(Vec::new(), Some((preview("a"), Start::Decode))),
+            1
+        );
         assert!(queue.preview.is_none());
         // A different develop queues behind the one in flight; only once the
         // in-flight one is collected does a worker take it.
-        assert_eq!(queue.replace(Vec::new(), Some(preview("b"))), 2);
+        assert_eq!(
+            queue.replace(Vec::new(), Some((preview("b"), Start::Decode))),
+            2
+        );
         assert!(queue.take().is_none());
         queue.developing = None;
         match queue.take() {
-            Some(Task::Develop(request)) => assert_eq!(request.name, "b"),
+            Some(Task::Develop(request, _)) => assert_eq!(request.name, "b"),
             _ => panic!("expected the queued develop"),
         }
         // A thumbnail is taken before the develop.
         let mut queue = Queue::default();
-        assert_eq!(queue.replace(vec![key("t")], Some(preview("a"))), 2);
+        assert_eq!(
+            queue.replace(vec![key("t")], Some((preview("a"), Start::Decode))),
+            2
+        );
         match queue.take() {
             Some(Task::Thumb(taken)) => assert_eq!(taken.name, "t"),
             _ => panic!("expected the thumbnail first"),
         }
+    }
+
+    #[test]
+    fn a_finished_develop_drops_the_queued_plan() {
+        // A develop is in flight and another is queued behind it (an edit
+        // made while it ran). When it finishes, the in-flight slot empties
+        // and the queued plan is dropped, so no worker takes a plan made
+        // against the pre-merge memo; the turn loop replans in the same turn.
+        let mut queue = Queue {
+            developing: Some(preview("a")),
+            preview: Some((preview("b"), Start::Decode)),
+            ..Queue::default()
+        };
+        queue.develop_done();
+        assert!(queue.developing.is_none());
+        assert!(queue.preview.is_none());
+        assert_eq!(queue.outstanding(), 0);
     }
 
     #[test]
@@ -1369,14 +1789,18 @@ mod tests {
     #[test]
     fn the_pool_runs_the_develop_and_keeps_it_outstanding() {
         let pool = Pool::start(2).unwrap();
-        assert_eq!(pool.want(Vec::new(), Some(preview("x.NEF"))).unwrap(), 1);
+        assert_eq!(
+            pool.want(Vec::new(), Some((preview("x.NEF"), Start::Decode)))
+                .unwrap(),
+            1
+        );
         let mut got = false;
         for _ in 0..2000 {
             for done in pool.collect().unwrap() {
-                if let Done::Develop { preview, image } = done {
+                if let Done::Develop { preview, made } = done {
                     assert_eq!(preview.name, "x.NEF");
                     // The roll is not there, so it could not be made.
-                    assert!(image.is_none());
+                    assert!(matches!(made, Made::None));
                     got = true;
                 }
             }
@@ -1387,5 +1811,121 @@ mod tests {
         }
         assert!(got, "no develop result");
         assert_eq!(pool.outstanding().unwrap(), 0);
+    }
+
+    fn photo_key(name: &str) -> PhotoKey {
+        PhotoKey {
+            roll: PathBuf::from("/td-photo/no-such-roll"),
+            name: name.to_string(),
+        }
+    }
+
+    fn made_decoded(samples: usize, long_edge: usize) -> Made {
+        let raw = Arc::new(crate::RawFrame::synth(samples));
+        let meta = raw.meta();
+        Made::Decoded {
+            raw,
+            meta,
+            level1: Arc::new(develop::Level1 {
+                width: 1,
+                height: 1,
+                rgb: vec![0, 0, 0],
+            }),
+            long_edge,
+            level2: Arc::new(develop::Level2 {
+                width: 1,
+                height: 1,
+                rgb: vec![0.0, 0.0, 0.0],
+            }),
+            image: Rgb8 {
+                width: 1,
+                height: 1,
+                data: vec![0, 0, 0],
+            },
+        }
+    }
+
+    #[test]
+    fn the_memo_plans_the_start_from_what_it_holds() {
+        let mut memo = Memo::default();
+        let a = preview("a"); // box 300x200, so long edge 300
+                              // Nothing held: a decode.
+        assert_eq!(memo.plan(&a).stage(), Stage::Decode);
+        // Develop it on the cursor: level 0 cached, level 1 and 2 current.
+        assert!(memo.merge(&a, made_decoded(4, 300), 1, true).is_some());
+        // Same photo, same box, another exposure or look: level 3 alone.
+        assert_eq!(memo.plan(&a).stage(), Stage::Level3);
+        let a_edited = Preview {
+            exposure: 150,
+            look: Some("mono".to_string()),
+            ..a.clone()
+        };
+        assert_eq!(memo.plan(&a_edited).stage(), Stage::Level3);
+        // Same photo, a larger box: level 2 from the cached level 1.
+        let a_big = Preview {
+            box_w: 600,
+            box_h: 400,
+            ..a.clone()
+        };
+        assert_eq!(memo.plan(&a_big).stage(), Stage::Level2);
+        // Another photo, not cached: a decode.
+        let b = preview("b");
+        assert_eq!(memo.plan(&b).stage(), Stage::Decode);
+        // Develop b on the cursor, then return to a: a's level 0 is still
+        // cached, so its level 1 reruns rather than the codec.
+        assert!(memo.merge(&b, made_decoded(4, 300), 2, true).is_some());
+        assert_eq!(memo.plan(&b).stage(), Stage::Level3);
+        assert_eq!(memo.plan(&a).stage(), Stage::Level1);
+        // Cleared, everything is a decode again.
+        memo.clear();
+        assert_eq!(memo.plan(&a).stage(), Stage::Decode);
+    }
+
+    #[test]
+    fn a_failed_develop_leaves_the_memo_untouched() {
+        let mut memo = Memo::default();
+        let a = preview("a");
+        assert!(memo.merge(&a, made_decoded(4, 300), 1, true).is_some());
+        // A develop that could not be made returns no frame and changes
+        // nothing: the current photo's levels still plan a level-3 rerun.
+        assert!(memo.merge(&a, Made::None, 2, true).is_none());
+        assert_eq!(memo.plan(&a).stage(), Stage::Level3);
+    }
+
+    #[test]
+    fn a_develop_finishing_off_the_cursor_caches_but_is_not_current() {
+        let mut memo = Memo::default();
+        let a = preview("a");
+        let b = preview("b");
+        // Develop a on the cursor: it becomes current.
+        assert!(memo.merge(&a, made_decoded(4, 300), 1, true).is_some());
+        assert_eq!(memo.plan(&a).stage(), Stage::Level3);
+        // A develop for b lands while the cursor is still on a (on_photo
+        // false, as after a switch back to a): b's level 0 is cached, but a
+        // stays current, so an a edit still reruns level 3 alone and a return
+        // to b reruns level 1 from the cache, not a decode.
+        assert!(memo.merge(&b, made_decoded(4, 300), 2, false).is_some());
+        assert_eq!(memo.plan(&a).stage(), Stage::Level3);
+        assert_eq!(memo.plan(&b).stage(), Stage::Level1);
+    }
+
+    #[test]
+    fn the_raw_cache_evicts_least_recently_shown_under_the_budget() {
+        let mut memo = Memo::default();
+        // Each frame is a bit over a third of the budget (bytes are two a
+        // sample), so two fit and a third pushes the least recently shown
+        // out. The buffers are zero-allocated, hence lazily faulted, so this
+        // costs address space, not resident memory.
+        let big = develop::RAW_CACHE_BYTES / 6 + 2_000_000;
+        memo.cache_raw(photo_key("a"), Arc::new(crate::RawFrame::synth(big)), 1);
+        memo.cache_raw(photo_key("b"), Arc::new(crate::RawFrame::synth(big)), 2);
+        assert_eq!(memo.raw.len(), 2);
+        assert!(memo.raw_bytes <= develop::RAW_CACHE_BYTES);
+        // Show a again, so b is now the oldest; the third frame evicts b.
+        memo.touch_raw(&photo_key("a"), 3);
+        memo.cache_raw(photo_key("c"), Arc::new(crate::RawFrame::synth(big)), 4);
+        assert!(memo.raw_bytes <= develop::RAW_CACHE_BYTES);
+        let held: Vec<&str> = memo.raw.iter().map(|c| c.key.name.as_str()).collect();
+        assert_eq!(held, ["a", "c"]);
     }
 }

@@ -22,7 +22,7 @@ use std::time::Instant;
 use td_ui::driven::{self, Binding, Input, Outcome};
 use td_ui::raster::{Composition, Scale, Surface};
 
-use td_photo::color::{camera_color, Transfer};
+use td_photo::color::{camera_color, CameraColor, Transfer};
 use td_photo::develop::{self, Params, MAX_THREADS};
 use td_photo::image::{read_ppm, write_ppm, Rgb8};
 use td_photo::library::{self, Filter, Flag, Key, Sidecar};
@@ -512,10 +512,10 @@ fn develop_file(path: &Path, out: &Path, rest: &[OsString]) -> Result<(), String
     .map_err(|e| e.to_string())
 }
 
-/// What `develop_raw` reports beside the developed frame: the raw
-/// sub-image's size, the corrupt-sample count the decoder tolerated, and the
-/// decode time (which the read and parse before it are folded into, as the
-/// verb has always reported it).
+/// What `decode_raw` reports beside the level-0 frame: the raw sub-image's
+/// size, the corrupt-sample count the decoder tolerated, and the decode
+/// time (which the read and parse before it are folded into, as the verb
+/// has always reported it).
 struct DevelopInfo {
     raw_width: usize,
     raw_height: usize,
@@ -523,18 +523,79 @@ struct DevelopInfo {
     decode_ms: u128,
 }
 
-/// The raw develop the `develop` verb and the window's preview share: a
-/// file's raw sub-image parsed, decoded, demosaiced and rendered to an sRGB
-/// `Rgb8` fitting `long_edge`, at `exposure` stops with `look` when one is
-/// given. The white balance is the maker note's when present, else the
-/// camera's daylight estimate. No file is written here; the caller decides.
-fn develop_raw(
-    path: &Path,
-    long_edge: usize,
-    exposure: f32,
-    look: Option<&Look>,
-    threads: usize,
-) -> Result<(Rgb8, DevelopInfo), String> {
+/// The per-photo development metadata the levels above 0 are made with: the
+/// orientation level 2 turns by, and the white balance and camera colour
+/// level 3 applies. Small and `Copy`, so the window holds it beside the
+/// cached levels without keeping the whole raw frame alive.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct Meta {
+    orientation: u16,
+    wb: [f32; 3],
+    color: CameraColor,
+}
+
+/// Level 0: a decoded CFA frame and everything the pipeline needs to make
+/// the levels above it without reading the file again. The window caches it
+/// under `develop::RAW_CACHE_BYTES` so returning to a photo reruns level 1
+/// rather than the codec.
+pub(crate) struct RawFrame {
+    decoded: nef::Decoded,
+    cfa: nef::Cfa,
+    crop: nef::Crop,
+    black: u16,
+    white: u16,
+    meta: Meta,
+}
+
+impl RawFrame {
+    /// The development metadata, `Copy`, for the levels above 0.
+    pub(crate) fn meta(&self) -> Meta {
+        self.meta
+    }
+
+    /// What the frame costs the raw cache, the CFA samples dominating: two
+    /// bytes a sample, so the cache's byte budget bounds how many frames it
+    /// holds.
+    pub(crate) fn bytes(&self) -> usize {
+        self.decoded.samples.len().saturating_mul(2)
+    }
+
+    /// A minimal frame of `samples` CFA samples, for the window's raw-cache
+    /// tests: only `bytes` (the sample count) is load-bearing there.
+    #[cfg(test)]
+    pub(crate) fn synth(samples: usize) -> RawFrame {
+        RawFrame {
+            decoded: nef::Decoded {
+                width: 2,
+                height: 2,
+                samples: vec![0u16; samples],
+                corrupt: 0,
+            },
+            cfa: nef::Cfa::RGGB,
+            crop: nef::Crop {
+                left: 0,
+                top: 0,
+                width: 2,
+                height: 2,
+            },
+            black: 0,
+            white: 1,
+            meta: Meta {
+                orientation: 1,
+                wb: [1.0, 1.0, 1.0],
+                color: CameraColor {
+                    rgb_cam: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+                    daylight: [1.0, 1.0, 1.0],
+                },
+            },
+        }
+    }
+}
+
+/// Level 0: read, parse and decode `path` and gather its development
+/// metadata, the codec's single sequential pass. No frame is developed
+/// here; the caller runs the levels above it.
+pub(crate) fn decode_raw(path: &Path) -> Result<(RawFrame, DevelopInfo), String> {
     let started = Instant::now();
     let data = read_file(path)?;
     let nef = nef::parse(&data).map_err(|e| format!("{}: {e}", path.display()))?;
@@ -550,25 +611,106 @@ fn develop_raw(
     let decoded = nef::decode(&nef, &data).map_err(|e| format!("{}: {e}", path.display()))?;
     let decode_ms = started.elapsed().as_millis();
     let black = nef.maker.black.unwrap_or(camera.black);
-    let level1 = develop::superpixel(
-        &decoded,
-        nef.raw.cfa,
-        nef.crop(),
-        black,
-        camera.white,
-        threads,
-    )
-    .map_err(|e| e.to_string())?;
     let wb = match nef.maker.wb {
         Some((r, b)) => [r, 1.0, b],
         None => color.daylight,
     };
+    let info = DevelopInfo {
+        raw_width: nef.raw.width,
+        raw_height: nef.raw.height,
+        corrupt: decoded.corrupt,
+        decode_ms,
+    };
+    let raw = RawFrame {
+        decoded,
+        cfa: nef.raw.cfa,
+        crop: nef.crop(),
+        black,
+        white: camera.white,
+        meta: Meta {
+            orientation: nef.orientation,
+            wb,
+            color,
+        },
+    };
+    Ok((raw, info))
+}
+
+/// Level 0 to level 1: the superpixel demosaic, one RGB pixel per CFA quad
+/// of the crop, black-subtracted and scaled. Cheap beside the codec, so a
+/// return to a cached photo reruns it rather than decoding.
+pub(crate) fn raw_level1(raw: &RawFrame, threads: usize) -> Result<develop::Level1, String> {
+    develop::superpixel(
+        &raw.decoded,
+        raw.cfa,
+        raw.crop,
+        raw.black,
+        raw.white,
+        threads,
+    )
+    .map_err(|e| e.to_string())
+}
+
+/// Level 1 to level 2: resample to the canvas that fits `long_edge` and
+/// orient. Rerun on a resize; reused across exposure and look edits.
+pub(crate) fn level1_level2(
+    level1: &develop::Level1,
+    meta: &Meta,
+    long_edge: usize,
+    threads: usize,
+) -> Result<develop::Level2, String> {
+    develop::level2(level1, long_edge, meta.orientation, threads).map_err(|e| e.to_string())
+}
+
+/// Level 2 to the frame: the per-pixel pipeline at `stops` with `look`, then
+/// the shrink to the box for a shape taller than it, the thumbnail rule.
+/// What an exposure or look edit reruns; level 2 is untouched.
+pub(crate) fn level2_frame(
+    level2: &develop::Level2,
+    meta: &Meta,
+    box_w: usize,
+    box_h: usize,
+    stops: f32,
+    look: Option<&Look>,
+    threads: usize,
+) -> Result<Rgb8, String> {
+    let image = develop::level3(
+        level2,
+        meta.wb,
+        &meta.color,
+        &Transfer::srgb(),
+        &Params {
+            exposure: stops,
+            threads,
+            look,
+        },
+    )
+    .map_err(|e| e.to_string())?;
+    develop::shrink(image, box_w, box_h, threads).map_err(|e| e.to_string())
+}
+
+/// The raw develop the `develop` verb shares with the window's preview: a
+/// file's raw sub-image parsed, decoded, demosaiced and rendered to an sRGB
+/// `Rgb8` fitting `long_edge`, at `exposure` stops with `look` when one is
+/// given, by way of the levels above. No file is written here; the caller
+/// decides. The verb runs it whole on one thread; the window runs the levels
+/// apart and caches them, and `--preview` runs the whole preview through
+/// `develop_preview` below.
+fn develop_raw(
+    path: &Path,
+    long_edge: usize,
+    exposure: f32,
+    look: Option<&Look>,
+    threads: usize,
+) -> Result<(Rgb8, DevelopInfo), String> {
+    let (raw, info) = decode_raw(path)?;
+    let level1 = raw_level1(&raw, threads)?;
     let image = develop::render(
         &level1,
         long_edge,
-        nef.orientation,
-        wb,
-        &color,
+        raw.meta.orientation,
+        raw.meta.wb,
+        &raw.meta.color,
         &Transfer::srgb(),
         &Params {
             exposure,
@@ -577,15 +719,7 @@ fn develop_raw(
         },
     )
     .map_err(|e| e.to_string())?;
-    Ok((
-        image,
-        DevelopInfo {
-            raw_width: nef.raw.width,
-            raw_height: nef.raw.height,
-            corrupt: decoded.corrupt,
-            decode_ms,
-        },
-    ))
+    Ok((image, info))
 }
 
 /// The developed preview the window blits into its box and `--preview`
