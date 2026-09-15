@@ -1,3 +1,4 @@
+use crate::clock::Clock;
 use crate::ui;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -291,42 +292,10 @@ fn human_uptime(secs: u64) -> String {
     }
 }
 
-/// UTC, spelled out. There is no TZif parser here, so naming the zone is the
-/// honest thing: a local-looking time that is silently UTC is worse than a
-/// UTC one that says so.
-fn utc_stamp(epoch_secs: u64) -> String {
-    let days = epoch_secs / 86_400;
-    let seconds = epoch_secs % 86_400;
-    let (year, month, day) = civil_from_days(days);
-    let (hour, minute, second) = (seconds / 3600, (seconds % 3600) / 60, seconds % 60);
-    format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02} UTC")
-}
-
-/// Days since 1970-01-01 to a civil date, by Howard Hinnant's shift-the-era
-/// method: March-based years put the leap day last, so the month-length
-/// pattern repeats with no table and no branch on February.
-fn civil_from_days(days: u64) -> (u64, u64, u64) {
-    let shifted = days.saturating_add(719_468);
-    let era = shifted / 146_097;
-    let day_of_era = shifted % 146_097;
-    let year_of_era =
-        (day_of_era - day_of_era / 1460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
-    let year = year_of_era + era * 400;
-    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
-    let month_prime = (5 * day_of_year + 2) / 153;
-    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
-    let month = if month_prime < 10 {
-        month_prime + 3
-    } else {
-        month_prime - 9
-    };
-    (if month <= 2 { year + 1 } else { year }, month, day)
-}
-
 /// The line, left to right. A reading that could not be taken shows its
 /// label with `?` rather than vanishing, so a bar with a broken source looks
 /// broken instead of looking like a machine with less to report.
-pub fn line(readings: &Readings) -> String {
+pub fn line(clock: &Clock, readings: &Readings) -> String {
     let load = readings.load_centi.map_or_else(
         || "LOAD ?".to_string(),
         |centi| format!("LOAD {}.{:02}", centi / 100, centi % 100),
@@ -340,9 +309,7 @@ pub fn line(readings: &Readings) -> String {
     let uptime = readings
         .uptime_secs
         .map_or_else(|| "UP ?".to_string(), |secs| format!("UP {}", human_uptime(secs)));
-    let clock = readings
-        .epoch_secs
-        .map_or_else(|| "CLOCK ?".to_string(), utc_stamp);
+    let clock = clock.stamp(readings.epoch_secs);
     // Leftmost, as the ethernet stanza is in the config this follows, and
     // for the same reason the clock is rightmost.
     let net = match (&readings.link.name, readings.link.up, &readings.link.address) {
@@ -622,10 +589,11 @@ fn tick(
     proc_root: &Path,
     sys_root: &Path,
     epoch_secs: Option<u64>,
+    clock: &Clock,
     reported: &mut Reported,
 ) -> Tick {
     let readings = Readings::sample(proc_root, sys_root, epoch_secs);
-    let line = line(&readings);
+    let line = line(clock, &readings);
     // The guard is released BEFORE anything is printed. `eprintln!` takes
     // stderr's own lock and blocks on a slow console, and holding the runtime
     // across that would stop the compositor over the least important thing on
@@ -651,12 +619,19 @@ pub fn start(
     thread::Builder::new()
         .name("td-status-bar".to_string())
         .spawn(move || {
+            let clock = match Clock::load(Path::new("/etc/timezone"), Path::new("/etc/zoneinfo")) {
+                Ok(clock) => clock,
+                Err(error) => {
+                    eprintln!("td-compositor: status bar: {error}");
+                    Clock::Unavailable
+                }
+            };
             let mut reported = Reported::default();
             loop {
                 // A paint failure is REPORTED, never fatal: the bar is the
                 // least important thing on the screen and must not take the
                 // session down with it.
-                match tick(&runtime, &proc_root, &sys_root, unix_epoch_secs(), &mut reported) {
+                match tick(&runtime, &proc_root, &sys_root, unix_epoch_secs(), &clock, &mut reported) {
                     Tick::Continue(report) => {
                         if let Some(report) = report {
                             eprintln!("td-compositor: status bar: {report}");
@@ -778,7 +753,7 @@ Local:
         assert_eq!(readings.used_kb, Some(8_039_384 - 5_242_880));
         assert_eq!(readings.uptime_secs, Some(187_245));
         assert_eq!(
-            line(&readings),
+            line(&Clock::Utc, &readings),
             "NET ?  LOAD 0.42  MEM 2.6G/7.6G  UP 2D 04:00  2026-02-02 02:40:00 UTC"
         );
     }
@@ -796,7 +771,7 @@ Local:
         assert_eq!(readings.link.name.as_deref(), Some("eth0"));
         assert_eq!(readings.link.up, Some(true));
         assert_eq!(readings.link.address, Address::Known("10.0.2.15".to_string()));
-        assert!(line(&readings).starts_with("NET eth0 10.0.2.15  LOAD"));
+        assert!(line(&Clock::Utc, &readings).starts_with("NET eth0 10.0.2.15  LOAD"));
     }
 
     #[test]
@@ -804,7 +779,7 @@ Local:
         let down = Fixture::with_net("0 0 0\n", MEMINFO, "0\n", &[("eth0", "down\n")], "");
         let readings = Readings::sample(&down.proc_root, &down.sys_root, Some(0));
         assert_eq!(readings.link.up, Some(false));
-        assert!(line(&readings).starts_with("NET eth0 DOWN"));
+        assert!(line(&Clock::Utc, &readings).starts_with("NET eth0 DOWN"));
 
         // Up with no address is a REAL state — a link with no lease — and it
         // is not the same claim as an interface nobody could name. The table
@@ -819,7 +794,7 @@ Local:
         );
         let readings = Readings::sample(&leaseless.proc_root, &leaseless.sys_root, Some(0));
         assert_eq!(readings.link.address, Address::Absent);
-        assert!(line(&readings).starts_with("NET eth0 UP  LOAD"));
+        assert!(line(&Clock::Utc, &readings).starts_with("NET eth0 UP  LOAD"));
 
         // No routing table at all is neither of those: it is the question
         // going unanswered, and `?` is what the rest of this bar spells that
@@ -827,7 +802,7 @@ Local:
         let blind = Fixture::with_net("0 0 0\n", MEMINFO, "0\n", &[("eth0", "up\n")], "");
         let readings = Readings::sample(&blind.proc_root, &blind.sys_root, Some(0));
         assert_eq!(readings.link.address, Address::Unattributable);
-        assert!(line(&readings).starts_with("NET eth0 UP ?  LOAD"));
+        assert!(line(&Clock::Utc, &readings).starts_with("NET eth0 UP ?  LOAD"));
     }
 
     #[test]
@@ -846,7 +821,7 @@ Local:
         let readings = Readings::sample(&two.proc_root, &two.sys_root, Some(0));
         assert_eq!(readings.link.name.as_deref(), Some("eth0"));
         assert_eq!(readings.link.address, Address::Unattributable);
-        assert!(line(&readings).starts_with("NET eth0 UP ?  LOAD"));
+        assert!(line(&Clock::Utc, &readings).starts_with("NET eth0 UP ?  LOAD"));
 
         // The very same routing table IS attributable once there is only one
         // interface it could belong to.
@@ -882,7 +857,7 @@ Local:
         assert_eq!(readings.link.up, None);
         // The address still shows: an unknown link state is no reason to
         // withhold an address the routing table has.
-        assert!(line(&readings).starts_with("NET eth0 10.0.2.15  LOAD"));
+        assert!(line(&Clock::Utc, &readings).starts_with("NET eth0 10.0.2.15  LOAD"));
 
         // Named, but with no readable state and no address at all: `?`.
         let stateless = Fixture::with_net("0 0 0\n", MEMINFO, "0\n", &[], "");
@@ -890,7 +865,7 @@ Local:
         let readings = Readings::sample(&stateless.proc_root, &stateless.sys_root, Some(0));
         assert_eq!(readings.link.name.as_deref(), Some("eth0"));
         assert_eq!(readings.link.up, None);
-        assert!(line(&readings).starts_with("NET eth0 ?  LOAD"));
+        assert!(line(&Clock::Utc, &readings).starts_with("NET eth0 ?  LOAD"));
     }
 
     #[test]
@@ -904,7 +879,7 @@ Local:
             readings.link.address,
             Address::Known("10.0.2.15".to_string())
         );
-        assert!(line(&readings).starts_with("NET eth0 DOWN  LOAD"));
+        assert!(line(&Clock::Utc, &readings).starts_with("NET eth0 DOWN  LOAD"));
     }
 
     #[test]
@@ -994,7 +969,7 @@ Local:
         ));
         let readings = Readings::sample(&empty, &empty, None);
         assert_eq!(readings, Readings::default());
-        assert_eq!(line(&readings), "NET ?  LOAD ?  MEM ?  UP ?  CLOCK ?");
+        assert_eq!(line(&Clock::Utc, &readings), "NET ?  LOAD ?  MEM ?  UP ?  CLOCK ?");
 
         // Present but unparseable is the same answer, and each field fails on
         // its own: a garbled loadavg must not take the clock down with it.
@@ -1005,7 +980,7 @@ Local:
         assert_eq!(readings.used_kb, None);
         assert_eq!(readings.uptime_secs, None);
         assert_eq!(
-            line(&readings),
+            line(&Clock::Utc, &readings),
             "NET ?  LOAD ?  MEM ?  UP ?  1970-01-01 00:00:00 UTC"
         );
     }
@@ -1018,7 +993,7 @@ Local:
         let readings = Readings::sample(&fixture.proc_root, &fixture.sys_root, Some(0));
         assert_eq!(readings.total_kb, Some(1_048_576));
         assert_eq!(readings.used_kb, None);
-        assert!(line(&readings).contains("MEM ?"));
+        assert!(line(&Clock::Utc, &readings).contains("MEM ?"));
     }
 
     #[test]
@@ -1069,61 +1044,6 @@ Local:
         assert_eq!(human_uptime(3600), "01:00");
         assert_eq!(human_uptime(86_400), "1D 00:00");
         assert_eq!(human_uptime(187_245), "2D 04:00");
-    }
-
-    #[test]
-    fn the_civil_calendar_holds_across_leap_years_and_centuries() {
-        assert_eq!(utc_stamp(0), "1970-01-01 00:00:00 UTC");
-        assert_eq!(utc_stamp(86_399), "1970-01-01 23:59:59 UTC");
-        assert_eq!(utc_stamp(86_400), "1970-01-02 00:00:00 UTC");
-        // 1972 is a leap year and 2000 is (the 400 rule); 2100 will not be
-        // (the 100 rule), which is the one a naive every-fourth-year gets
-        // wrong. 1900 is the other side of that rule and cannot be asked
-        // here — it is before the epoch, and these are unsigned days since
-        // it.
-        assert_eq!(utc_stamp(68_255_999), "1972-02-29 23:59:59 UTC");
-        assert_eq!(utc_stamp(951_782_400), "2000-02-29 00:00:00 UTC");
-        assert_eq!(utc_stamp(4_107_542_400), "2100-03-01 00:00:00 UTC");
-        assert_eq!(utc_stamp(4_107_456_000), "2100-02-28 00:00:00 UTC");
-        assert_eq!(utc_stamp(1_770_000_000), "2026-02-02 02:40:00 UTC");
-        // Every day of a leap year and the year after it, walked in order.
-        // The round trip alone would pass against a matching pair of wrong
-        // functions, so each step is also required to ADVANCE the calendar
-        // by exactly one day — which only `civil_from_days` can be wrong
-        // about.
-        for (year, length) in [(2024u64, 366u64), (2025, 365)] {
-            let start = days_from_civil(year, 1, 1);
-            let mut previous = civil_from_days(start);
-            assert_eq!(previous, (year, 1, 1));
-            for offset in 1..length {
-                let today = civil_from_days(start + offset);
-                assert_eq!(days_from_civil(today.0, today.1, today.2), start + offset);
-                assert_eq!(next_day(previous), today, "after {previous:?}");
-                previous = today;
-            }
-            assert_eq!(next_day(previous), (year + 1, 1, 1), "after {previous:?}");
-        }
-    }
-
-    /// The next date, written out as month lengths and the leap rule rather
-    /// than as arithmetic on a day count — so a walk through the year checks
-    /// `civil_from_days` against a different method rather than against its
-    /// own inverse, which a matching pair of wrong functions would satisfy.
-    fn next_day((year, month, day): (u64, u64, u64)) -> (u64, u64, u64) {
-        let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
-        let length = match month {
-            1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
-            4 | 6 | 9 | 11 => 30,
-            2 if leap => 29,
-            _ => 28,
-        };
-        if day < length {
-            (year, month, day + 1)
-        } else if month < 12 {
-            (year, month + 1, 1)
-        } else {
-            (year + 1, 1, 1)
-        }
     }
 
     #[test]
@@ -1378,7 +1298,7 @@ Local:
         let mut at = 1_770_000_000u64;
         let mut next = |reported: &mut Reported| {
             at = at.saturating_add(1);
-            tick(&runtime, &fixture.proc_root, &fixture.sys_root, Some(at), reported)
+            tick(&runtime, &fixture.proc_root, &fixture.sys_root, Some(at), &Clock::Utc, reported)
         };
 
         assert_eq!(next(&mut reported), Tick::Continue(None), "a good paint says nothing");
@@ -1401,16 +1321,40 @@ Local:
         let _ = std::fs::remove_file(&path);
     }
 
-    /// The inverse, for the round-trip above only.
-    fn days_from_civil(year: u64, month: u64, day: u64) -> u64 {
-        let year = if month <= 2 { year - 1 } else { year };
-        let era = year / 400;
-        let year_of_era = year - era * 400;
-        let month_prime = if month > 2 { month - 3 } else { month + 9 };
-        let day_of_year = (153 * month_prime + 2) / 5 + day - 1;
-        let day_of_era =
-            year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
-        era * 146_097 + day_of_era - 719_468
+    #[test]
+    fn the_sampler_publishes_the_selected_clock_to_the_runtime() {
+        let path = std::env::temp_dir().join(format!(
+            "td-bar-clock-{}-{}", std::process::id(), SEQ.fetch_add(1, Ordering::Relaxed),
+        ));
+        let framebuffer = crate::framebuffer::Framebuffer::test_file(&path, 320, 200, 320 * 4).unwrap();
+        let runtime = Mutex::new(crate::runtime::Runtime::new(framebuffer));
+        let fixture = Fixture::new("0.42 0.31 0.28 2/517 9182\n", MEMINFO, "187245.31 91.2\n");
+        let clock = Clock::Local(crate::timezone::Zone::parse(&crate::timezone::fixture(
+            &[], &[(0, false, "UTC")], "JST-9",
+        )).unwrap());
+        let mut reported = Reported::default();
+        assert_eq!(tick(&runtime, &fixture.proc_root, &fixture.sys_root, Some(0), &clock, &mut reported), Tick::Continue(None));
+        let expected = line(&clock, &Readings::sample(&fixture.proc_root, &fixture.sys_root, Some(0)));
+        let mut runtime = runtime.lock().unwrap();
+        runtime.fail_next_repaint();
+        // An identical published line requires no paint. A UTC line from the
+        // sampler would instead consume this fault and fail the assertion.
+        assert!(runtime.set_status(expected).is_ok());
+        assert!(runtime.set_status("different".into()).is_err());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn the_line_uses_the_selected_clock_and_keeps_other_fields_on_failure() {
+        let zone = crate::timezone::Zone::parse(&crate::timezone::fixture(
+            &[], &[(0, false, "UTC")], "JST-9",
+        )).unwrap();
+        let readings = Readings { epoch_secs: Some(0), load_centi: Some(42), ..Readings::default() };
+        let local = line(&Clock::Local(zone), &readings);
+        assert!(local.ends_with("1970-01-01 09:00:00 UTC+09:00"));
+        let unavailable = line(&Clock::Unavailable, &readings);
+        assert!(unavailable.contains("LOAD 0.42"));
+        assert!(unavailable.ends_with("CLOCK ?"));
     }
 
     #[test]
@@ -1420,7 +1364,7 @@ Local:
         // reading it could not take — so `LOAD 0.42` and `LOAD ?` looked the
         // same. Both a full line and an all-failed one are checked, since the
         // failure marker is a character of the vocabulary too.
-        let full = line(&Readings {
+        let full = line(&Clock::Utc, &Readings {
             load_centi: Some(1_234),
             used_kb: Some(2_800_000),
             total_kb: Some(8_039_384),
@@ -1432,13 +1376,13 @@ Local:
                 address: Address::Known("10.0.2.15".to_string()),
             },
         });
-        let failed = line(&Readings::default());
+        let failed = line(&Clock::Utc, &Readings::default());
         // `DOWN` spells a `W` that neither of the others does, and the
         // interface NAME is a kernel-supplied string flowing into a 43-glyph
         // font — `dev_valid_name` forbids only `/`, `:` and whitespace, so a
         // name is not guaranteed to be spellable and this is what would say
         // so.
-        let down = line(&Readings {
+        let down = line(&Clock::Utc, &Readings {
             link: Link {
                 name: Some("br-1a2b3c".to_string()),
                 up: Some(false),

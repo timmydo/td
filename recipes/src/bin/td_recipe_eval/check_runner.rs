@@ -8558,11 +8558,10 @@ chmod 755 '{}'
         assert!(!is_plain_basename("..\\etc"));
     }
 
-    /// The reach of a scope: td-compositor, a directory td-portal's recipe
-    /// embeds, selects exactly the checks whose closure builds a recipe that
-    /// names it and leaves the rest; a scope nothing reads is an error
-    /// rather than an empty list, and so is one that is not a directory
-    /// name, while an unread directory beside a read one changes nothing.
+    /// Shared compositor clock rules and boot protocol reach every recipe;
+    /// toolkit siblings retain a narrower closure. A scope nothing reads or
+    /// one that is not a directory name refuses, while adding an unread
+    /// directory beside a read one changes nothing.
     #[test]
     fn checks_reaching_follows_the_embeds_through_the_closure() {
         let reached = checks_reaching(&["td-compositor"]).expect("reach");
@@ -8598,9 +8597,12 @@ chmod 755 '{}'
                 reached.contains(*stem)
             );
         }
-        assert!(!reached.contains("curl-x86-64-test"), "{reached:?}");
+        // Shared clock rules and boot protocol conservatively reach every
+        // recipe; the toolkit sibling still proves narrower selection.
+        assert!(!toolkit.contains("curl-x86-64-test"), "{toolkit:?}");
         let every = checks_reaching(&["td-boot"]).expect("reach");
-        assert!(every.len() > reached.len(), "{every:?}");
+        assert_eq!(every, reached);
+        assert!(every.len() > toolkit.len(), "{every:?}");
         assert!(checks_reaching(&["no-such-dir"]).is_err());
         assert_eq!(
             checks_reaching(&["td-compositor", "no-such-dir"]).expect("reach beside an unread dir"),

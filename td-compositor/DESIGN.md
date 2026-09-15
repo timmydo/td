@@ -94,9 +94,10 @@ on, and the reason the reservation has a test of its own: fullscreen is the
 one arrangement with no gap, so it is the only one whose pixels would reach
 row 0 if the reservation were dropped.
 
-It shows load, memory, uptime and a UTC clock, all read from `/proc` as
-ordinary files, so the bar adds no syscall and needs no `UNSAFE.md`
-amendment. Memory is total minus MemAvailable rather than minus MemFree,
+It shows load, memory, uptime and a clock. Metrics come from `/proc`
+and the clock samples `SystemTime`; timezone data uses ordinary files.
+The bar adds no unsafe syscall surface. Memory is total minus
+MemAvailable rather than minus MemFree,
 which counts neither cache nor reclaimable slab and reads alarmingly low on
 an idle machine. A reading that could not be taken shows its label with `?`
 rather than vanishing, so a broken source looks broken instead of looking
@@ -342,16 +343,53 @@ model rather than an oversight, and nothing is lost but pixels —
 rather than clipping a glyph, which is also what would keep the clock while
 the workspaces grow.
 
-The clock is UTC and SAYS so. There is no TZif parser here, and a
-local-looking time that is silently UTC is worse than a UTC one that admits
-it. The civil date comes from days-since-epoch by the shift-the-era method,
-which is integer-only and needs no month table; its test pins 1972, 2000 and
-2100 — 1900 is the other side of the century rule and cannot be asked here,
-since these are UNSIGNED days since 1970. It also walks every day of a leap
-year and the year after, requiring each step to ADVANCE the calendar by one
-day against month lengths written out longhand. The round trip alone would
-not: it closes over the test's own inverse, so a matched pair of wrong
-functions satisfies it, which is what the walk is there to refuse.
+The clock reads the optional persistent `/etc/timezone` setting once when
+its worker starts, before taking the runtime lock. Absence selects UTC.
+A selected IANA name resolves beneath the deployment's `/etc/zoneinfo`;
+the root may be a store symlink, but each descendant must be a directory
+or a regular leaf. Setting and zone reads are bounded to 65 bytes and
+64 KiB. Names have two or three components, each starting with an ASCII
+uppercase letter and containing only ASCII alphanumerics, `_`, `+`, `-`,
+with at most 64 bytes overall and one optional trailing newline. These
+are the installer catalog's name rules. The immutable deployment owns
+the zone tree; this is not a filesystem confinement boundary for an
+adversary replacing trusted root-owned paths.
+
+The Rust reader implements the deployment's leap-free TZif v2/v3 files
+under [RFC 9636](https://www.rfc-editor.org/rfc/rfc9636.html). It skips the
+32-bit block, bounds the 64-bit arrays before allocating, checks ordered
+transitions, type indices, offset range -89999 through 93599, designation
+terminators with at most 64 bytes per designation and standard/UT
+indicators, and requires a complete footer.
+The footer must agree with the last transition. The tzdata recipe uses
+fat output: glibc 2.41 zic's slim Canadian files can disagree with their
+final footer, so this reader refuses them. Version 1, version 4,
+leap-second records in the selected block, and oversized data refuse.
+POSIX month/week/weekday, Julian and ordinal rules include southern and
+negative DST, all-year DST, fractional offsets and v3 signed transition
+hours. Recurrence is evaluated beyond the recorded transitions instead
+of freezing the last offset. Missing future information and the `-00`
+placeholder remain unknown. Parsed rules are owned for the session;
+there is no per-tick file I/O, environment `TZ` lookup, subprocess, or
+process-global timezone mutation. A later setting change takes effect
+when the compositor restarts.
+
+The date is proleptic Gregorian and supports a local date before the
+Unix epoch, such as the previous evening west of Greenwich. The
+clock still samples nonnegative Unix seconds; an unavailable, pre-epoch,
+or unrepresentable system sample displays `CLOCK ?`. Invalid settings
+or data also display `CLOCK ?`, with one startup diagnostic, while other
+status fields continue. The suffix is the actual offset, `UTC` or
+`UTC+HH:MM` / `UTC-HH:MM`, adding seconds for historical sub-minute
+offsets. It does not use an ambiguous timezone abbreviation. Existing
+strip clipping still applies to the longer field.
+
+The target recipe runs the clock, timezone and bar tests. Fixtures cover
+calendar walks through leap and non-leap centuries, exact DST boundaries,
+future recurrence, cross-year rules, malformed binary/text input, trusted
+root symlinks, refused descendant aliases and the setting's session
+snapshot. The tzdata recipe check runs this same parser over every
+installer choice and verifies twelve winter/summer offset pairs in 2100.
 
 Nothing else in the compositor wakes without input, so the bar is the one
 thing in the process with a timer: a thread samples every second and hands
@@ -382,9 +420,8 @@ failures between good paints — because a fault that ALTERNATES defeats
 deduplication on its own and is a line a second again.
 
 Deliberately not here: disk free, which needs `statfs(2)` and so an
-`UNSAFE.md` amendment; a local timezone, which needs a TZif parser; and the
-wireless, ethernet and temperature fields of the i3status config this is
-modelled on. All three are additions rather than changes to what is above.
+`UNSAFE.md` amendment; wireless and temperature fields; and a live
+timezone setter. Ethernet is already represented by the network field.
 
 The stock QEMU input fixture has a PS/2 keyboard and pointer plus a virtio
 tablet. The USB-enabled kernel also exposes USB HID input through evdev.

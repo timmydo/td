@@ -10,6 +10,7 @@ mod bar;
 mod buffer;
 mod client;
 mod client_resources;
+mod clock;
 mod configure;
 mod conn;
 mod control;
@@ -41,6 +42,7 @@ mod sys;
 mod term;
 mod term_client;
 mod terminfo;
+mod timezone;
 mod ui;
 mod vm_bridge;
 mod vm_wire;
@@ -1306,6 +1308,7 @@ mod confinement {
         ("buffer.rs", include_str!("buffer.rs")),
         ("client.rs", include_str!("client.rs")),
         ("client_resources.rs", include_str!("client_resources.rs")),
+        ("clock.rs", include_str!("clock.rs")),
         ("configure.rs", include_str!("configure.rs")),
         ("conn.rs", include_str!("conn.rs")),
         ("control.rs", include_str!("control.rs")),
@@ -1336,6 +1339,7 @@ mod confinement {
         ("term.rs", include_str!("term.rs")),
         ("term_client.rs", include_str!("term_client.rs")),
         ("terminfo.rs", include_str!("terminfo.rs")),
+        ("timezone.rs", include_str!("timezone.rs")),
         ("ui.rs", include_str!("ui.rs")),
         ("vm_bridge.rs", include_str!("vm_bridge.rs")),
         ("vm_wire.rs", include_str!("vm_wire.rs")),

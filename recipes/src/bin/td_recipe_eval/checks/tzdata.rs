@@ -6,6 +6,7 @@ use std::path::Path;
 use super::rust_toolchain::{path_basename, GLIBC_STAGE};
 use crate::check_runner::{RecipeCheckRunner, TD_STORE_DIR};
 
+use td_recipe::td_compositor_timezone::Zone;
 use td_recipe::td_install_timezones as installer_timezones;
 
 const TABLES: &[&str] = &["iso3166.tab", "zone.tab", "zone1970.tab", "zonenow.tab"];
@@ -18,6 +19,7 @@ pub(super) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
     let output = runner.ladder_out_from(&build_out, "tzdata")?;
     let glibc = runner.ladder_out_from(&build_out, "glibc-x86-64")?;
     let zones = verify_tree(&output)?;
+    verify_clock_catalog(&output.join("share/zoneinfo"))?;
     let glibc = format!("{TD_STORE_DIR}/{}/{GLIBC_STAGE}", path_basename(&glibc)?);
     let zoneinfo = format!("{TD_STORE_DIR}/{}/share/zoneinfo", path_basename(&output)?);
     for (name, years, rows) in EXPECTED {
@@ -37,7 +39,61 @@ pub(super) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
         )?;
         verify_report(&report, &zone, rows)?;
     }
-    println!("PASS: tzdata 2026d: {zones} TZif files; td glibc reads UTC, DST transitions, fixed offsets and six Canadian zones through the 2026 transition");
+    println!("PASS: tzdata 2026d: {zones} TZif files; td glibc reads UTC, DST transitions, fixed offsets and six Canadian zones through the 2026 transition; the native clock reads all installer choices and exact winter/summer offsets in 2100");
+    Ok(())
+}
+
+const WINTER_2100: i64 = 4_102_444_800;
+const SUMMER_2100: i64 = 4_118_083_200;
+const CLOCK_OFFSETS: &[(&str, i32, i32)] = &[
+    ("Etc/UTC", 0, 0),
+    ("America/Los_Angeles", -28_800, -25_200),
+    ("Europe/London", 0, 3600),
+    ("Asia/Tokyo", 32_400, 32_400),
+    ("Asia/Kathmandu", 20_700, 20_700),
+    ("Australia/Lord_Howe", 39_600, 37_800),
+    ("Pacific/Chatham", 49_500, 45_900),
+    ("Europe/Dublin", 0, 3600),
+    ("America/Nuuk", -7200, -3600),
+    ("Pacific/Auckland", 46_800, 43_200),
+    ("America/Inuvik", -21_600, -21_600),
+    ("America/Vancouver", -25_200, -25_200),
+];
+
+fn verify_clock_catalog(root: &Path) -> Result<(), String> {
+    let catalog = installer_timezones::Catalog::load(root)
+        .map_err(|error| format!("tzdata: clock catalog: {error}"))?;
+    for name in catalog.ids() {
+        let bytes = read_regular(&root.join(name))?;
+        let zone = Zone::parse(&bytes)
+            .ok_or_else(|| format!("tzdata: native clock cannot parse {name}"))?;
+        // Some Antarctic zones intentionally leave pre-settlement time unknown.
+        for at in [1_767_225_600, 1_782_864_000, WINTER_2100, SUMMER_2100] {
+            if zone.offset_at(at).is_none() {
+                return Err(format!(
+                    "tzdata: native clock has no offset for {name} at {at}"
+                ));
+            }
+        }
+    }
+    for (name, winter, summer) in CLOCK_OFFSETS {
+        let bytes = read_regular(&root.join(name))?;
+        verify_clock_offsets(name, &bytes, *winter, *summer)?;
+    }
+    Ok(())
+}
+
+fn verify_clock_offsets(name: &str, bytes: &[u8], winter: i32, summer: i32) -> Result<(), String> {
+    let zone =
+        Zone::parse(bytes).ok_or_else(|| format!("tzdata: native clock cannot parse {name}"))?;
+    for (at, expected) in [(WINTER_2100, winter), (SUMMER_2100, summer)] {
+        let actual = zone.offset_at(at);
+        if actual != Some(expected) {
+            return Err(format!(
+                "tzdata: native clock {name} at {at}: expected {expected}, got {actual:?}"
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -213,6 +269,26 @@ fn verify_table(root: &Path, bytes: &[u8]) -> Result<(), String> {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clock_oracle_rejects_a_frozen_or_wrong_future_offset() {
+        let mut bytes = Vec::new();
+        for _ in 0..2 {
+            bytes.extend_from_slice(b"TZif2");
+            bytes.extend_from_slice(&[0; 15]);
+            for count in [0u32, 0, 0, 0, 1, 4] {
+                bytes.extend_from_slice(&count.to_be_bytes());
+            }
+            bytes.extend_from_slice(&[0; 6]);
+            bytes.extend_from_slice(b"UTC\0");
+        }
+        bytes.extend_from_slice(b"\nUTC0\n");
+        verify_clock_offsets("Etc/UTC", &bytes, 0, 0).unwrap();
+        assert!(verify_clock_offsets("Europe/London", &bytes, 0, 3600).is_err());
+        assert!(verify_clock_offsets("Asia/Tokyo", &bytes, 32_400, 32_400).is_err());
+        bytes.pop();
+        assert!(verify_clock_offsets("Etc/UTC", &bytes, 0, 0).is_err());
+    }
 
     struct Scratch(std::path::PathBuf);
 

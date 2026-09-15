@@ -559,32 +559,21 @@ mod tests {
 mod named_dirs_tests {
     use super::*;
 
-    /// The table carries the `td-*` dirs each recipe file spells with a slash,
-    /// plus what the crate's shared modules embed. td-portal's own file now
-    /// names only td-portal (its lock, and the source lines its tests read) and
-    /// td-authd (the download-grant parity test's `include_str!`); its build
-    /// siblings move to `local_source_trees`, routed by the digest preflight, so
-    /// td-compositor and td-secret leave the embed scan. td-busd stays, but not
-    /// because td-portal names it: a shared module (lib.rs) embeds
-    /// td-busd/src/app_policy.rs, so every recipe carries it, td-boot and
-    /// td-profiler alike. Each list is sorted, names only `td-*` directories,
-    /// and an unknown stem has none.
+    /// Recipe spellings and shared-module embeds both participate in the
+    /// conservative reader map. Portal's local-source siblings do not create
+    /// embed edges, but the shared native timezone reader now embeds the
+    /// compositor in every recipe, like the bus policy and boot protocol.
     #[test]
     fn named_dirs_carry_the_embeds_the_recipes_spell() {
         let portal = named_dirs("td-portal");
         for dir in ["td-authd", "td-portal"] {
             assert!(portal.contains(&dir), "td-portal: {portal:?}");
         }
-        // td-compositor and td-secret were named ONLY by the recipe's former
-        // `include_str!` vendoring; staging them as local_source_trees drops
-        // them from the embed scan. td-busd is not checked here: lib.rs embeds
-        // it into every recipe (see the doc comment).
-        for dir in ["td-compositor", "td-secret"] {
-            assert!(!portal.contains(&dir), "td-portal still embeds {dir}: {portal:?}");
-        }
+        assert!(!portal.contains(&"td-secret"), "local-source sibling is not an embed");
+        assert!(portal.contains(&"td-compositor"), "shared timezone reader: {portal:?}");
         assert!(named_dirs("td-sh").contains(&"td-busd"), "lib.rs embeds td-busd everywhere");
         assert!(named_dirs("td-sh").contains(&"td-sh"));
-        assert!(!named_dirs("td-sh").contains(&"td-compositor"));
+        assert!(named_dirs("td-sh").contains(&"td-compositor"));
         for (stem, _) in all() {
             let dirs = named_dirs(stem);
             assert!(dirs.contains(&"td-boot"), "{stem}: {dirs:?}");

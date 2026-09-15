@@ -145,8 +145,8 @@ against every realized output. File leaves cannot be symlinks, but the
 deployment's root symlink into its immutable store is supported. Parent
 paths are trusted deployment data, not a defense against a concurrent
 privileged writer. Output errors fail the command and may leave partial
-JSON. This command neither selects nor persists a timezone; the
-compositor clock remains explicitly UTC.
+JSON. This command neither selects nor persists a timezone. The
+compositor reads the selection written by the volume formatter below.
 
 `td-install volume [--uuid UUID] [--timezone IANA-ID] DESTINATION MKFS
 SCRATCH --trusted-key KEY` accepts an optional catalog selection. It
@@ -180,8 +180,12 @@ The existing application launcher reads that name and binds each runtime's
 own zone file at its jailed `/etc/localtime`. Static mail and news carry
 the source-built data in `static-runtime`; Firefox and Claude use their
 reviewed Freedesktop runtime data. Missing runtime zones refuse launch.
-Native clock rendering, account and keyboard settings, and a post-install
-timezone setter remain separate increments.
+The compositor snapshots the saved name and source-built TZif rules at
+startup, rendering local civil time with its actual UTC offset. Invalid
+settings or unsupported data show `CLOCK ?`; an absent setting stays UTC.
+See `td-compositor/DESIGN.md` for reader bounds and DST proof. Account and
+keyboard settings and a post-install timezone setter remain separate
+increments.
 
 The `tzdata` recipe compiles the approved IANA 2026d data-only source
 with td's existing source-built glibc `zic`. Its output contains fat

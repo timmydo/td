@@ -39,6 +39,8 @@ pub mod td_boot_realfile;
 use td_boot_realfile as realfile;
 #[path = "../../td-install/src/timezones.rs"]
 pub mod td_install_timezones;
+#[path = "../../td-compositor/src/timezone.rs"]
+pub mod td_compositor_timezone;
 
 // Keep the native guest oracle contract inside the catalog dependency scan.
 #[path = "../../td-install-qemu-test/src/protocol.rs"]
@@ -57,5 +59,6 @@ mod timezone_catalog_tests {
     #[test]
     fn tzdata_check_tracks_the_installer_catalog_source() {
         assert!(crate::catalog::named_dirs("tzdata").contains(&"td-install"));
+        assert!(crate::catalog::named_dirs("tzdata").contains(&"td-compositor"));
     }
 }

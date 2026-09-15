@@ -30,6 +30,7 @@ const MODULES: &[(&str, &str)] = &[
         "client_resources",
         include_str!("../../../td-compositor/src/client_resources.rs"),
     ),
+    ("clock", include_str!("../../../td-compositor/src/clock.rs")),
     (
         "configure",
         include_str!("../../../td-compositor/src/configure.rs"),
@@ -105,6 +106,7 @@ const MODULES: &[(&str, &str)] = &[
         "terminfo",
         include_str!("../../../td-compositor/src/terminfo.rs"),
     ),
+    ("timezone", include_str!("../../../td-compositor/src/timezone.rs")),
     ("ui", include_str!("../../../td-compositor/src/ui.rs")),
     ("vm_bridge", include_str!("../../../td-compositor/src/vm_bridge.rs")),
     ("vm_wire", include_str!("../../../td-compositor/src/vm_wire.rs")),
@@ -305,6 +307,9 @@ pub fn recipe() -> Recipe {
         Step::run("{root}", &["{root}/session-tests", "authority::"]),
         Step::run("{root}", &["{root}/session-tests", "secret_client::"]),
         Step::run("{root}", &["{root}/session-tests", "physical_attention_"]),
+        Step::run("{root}", &["{root}/session-tests", "timezone::"]),
+        Step::run("{root}", &["{root}/session-tests", "clock::"]),
+        Step::run("{root}", &["{root}/session-tests", "bar::"]),
         split_target_debug("{out}"),
         Step::assert_static(&[
             "{out}/bin/td-compositor",
@@ -434,7 +439,7 @@ mod tests {
             .position(|argv| argv.as_slice() == ["{root}/session-tests", "authority::"])
             .unwrap();
         assert!(compile < execute);
-        for filter in ["secret_client::", "physical_attention_"] {
+        for filter in ["secret_client::", "physical_attention_", "timezone::", "clock::", "bar::"] {
             assert!(runs.iter().any(|argv| argv.as_slice() == ["{root}/session-tests", filter]));
         }
         let args = runs[compile];
