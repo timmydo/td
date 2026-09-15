@@ -407,6 +407,7 @@ mod tests {
                 "td-compositor",
                 "td-portal",
                 "td-secret",
+                "td-taskmgr",
                 "td-ui"
             ]
         );

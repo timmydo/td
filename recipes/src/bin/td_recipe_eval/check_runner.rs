@@ -2030,7 +2030,8 @@ fn gate_local_source_candidate(key: &str, candidate_path: &str) -> Result<(), St
         None => format!(
             "{PROVENANCE_REJECTED}local source `{key}' has no compiled expected digest in \
              seed/seed-digests.txt — an unpinned seed is not admissible; regenerate the table \
-             with `td-recipe-eval seed-digests' and commit it (re #469)"
+             with `td-recipe-eval seed-digests', or add the computed row `{key} {candidate}', \
+             rebuild the evaluator, verify it and commit the table (re #469)"
         ),
     })
 }
@@ -3737,8 +3738,8 @@ pub(crate) fn recipe_closure(targets: &[&str]) -> Result<Vec<RecipeNode>, String
 
 /// The check-owning recipes a change under `dirs` can reach: each whose
 /// closure holds a recipe that may read one of them — by the catalog's
-/// named-directory table (`catalog::named_dirs`), or a `local_source` under
-/// it. A scope none of whose directories any recipe reads is an error
+/// named-directory table (`catalog::named_dirs`), or a `local_source` or
+/// sibling tree under it. A scope none of whose directories any recipe reads is an error
 /// rather than an empty reach: a scope that missed a read would skip every
 /// check, so the caller lists them all instead. One unread directory beside
 /// a read one contributes nothing: the dispatcher sends a changed crate with
@@ -3759,7 +3760,11 @@ pub(crate) fn checks_reaching(dirs: &[&str]) -> Result<BTreeSet<String>, String>
         for (stem, recipe) in &all {
             let local = recipe.local_source.as_deref().map(|s| s.trim_start_matches("./"));
             let reads = catalog::named_dirs(stem).contains(&dir)
-                || local.is_some_and(|s| s == dir || s.starts_with(&under));
+                || local.is_some_and(|s| s == dir || s.starts_with(&under))
+                || recipe.local_source_trees.iter().flatten().any(|s| {
+                    let s = s.trim_start_matches("./");
+                    s == dir || s.starts_with(&under)
+                });
             if reads {
                 reached.insert(stem);
             }
@@ -8561,7 +8566,11 @@ chmod 755 '{}'
     #[test]
     fn checks_reaching_follows_the_embeds_through_the_closure() {
         let reached = checks_reaching(&["td-compositor"]).expect("reach");
-        assert!(!reached.is_empty());
+        assert!(reached.contains("td-taskmgr-test"));
+        assert!(reached.contains("td-portal-test"));
+        let toolkit = checks_reaching(&["td-ui"]).expect("sibling reach");
+        assert!(toolkit.contains("td-taskmgr-test"));
+        assert!(toolkit.contains("td-portal-test"));
         // Both directions: every selected owner reads the crate somewhere in
         // its closure, and every check owner that does is selected — the
         // second is the one a dropped owner would fail.
@@ -8570,10 +8579,10 @@ chmod 755 '{}'
             catalog::named_dirs(stem).contains(&"td-compositor")
                 || all.iter().any(|(s, r)| {
                     *s == stem
-                        && r.local_source.as_deref().is_some_and(|l| {
+                        && (r.local_source.as_deref().is_some_and(|l| {
                             let l = l.trim_start_matches("./");
                             l == "td-compositor" || l.starts_with("td-compositor/")
-                        })
+                        }) || r.local_source_trees.iter().flatten().any(|s| s == "td-compositor"))
                 })
         };
         for (stem, recipe) in &all {

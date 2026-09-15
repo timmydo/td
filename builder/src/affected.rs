@@ -595,22 +595,14 @@ fn map_path(root: &Path, roster: &Result<Vec<GateCrate>, String>, p: &str, sel: 
         return;
     }
 
-    // Every staged file under a td-portal seed tree moves the `td-portal-source`
-    // digest row. `td-portal` builds from `Recipe::rust` with
-    // `local_source_trees(&["td-secret", "td-busd", "td-compositor", "engine",
-    // "td-ui"])`, each staged with local-source exclusions, so a change in those
-    // inputs — source, spec, tool, retained doc, or manifest — re-hashes the seed (re
-    // #469). The digest preflight is cheap (a tree copy and a NAR hash, no
-    // ladder), so this AUGMENTS and does not return: the path still reaches its
-    // own crate arm below for cargo-test/check/recipe-checks. `engine/` and
-    // `td-ui/` keep their existing per-arm routing too (each is also a reader
-    // crate arm); `td-seatd/`, which shares the compositor's crate arm, is NOT
-    // a portal seed tree and is excluded here. The roster of trees is pinned by
-    // the recipes catalog test
-    // `local_source_trees_are_staged_by_basename_and_routed_by_the_builder`, so
-    // this literal and that one must agree.
+    // Portal and taskmgr stage sibling trees; every retained input moves its
+    // consumer's source digest. This cheap preflight augments each crate arm
+    // below. engine/ carries its own routing; td-seatd shares the compositor
+    // arm but is not a staged sibling. Keep this top-level tree roster in
+    // agreement with the catalog's
+    // local_source_trees_are_staged_by_basename_and_routed_by_the_builder test.
     if pattern_matches(
-        "td-portal/*|td-busd/*|td-compositor/*|td-secret/*|td-ui/*",
+        "td-portal/*|td-busd/*|td-compositor/*|td-secret/*|td-ui/*|td-taskmgr/*",
         p,
     ) {
         sel.add_preflight("local-source-digests");
@@ -1444,28 +1436,25 @@ fn map_path(root: &Path, roster: &Result<Vec<GateCrate>, String>, p: &str, sel: 
         return;
     }
 
-    // The task-manager backend has no recipe consumer yet. Its discovered
-    // roster preflight checks the standalone lock, tests and Clippy alongside
-    // the workspace's lock guard. Image packaging must replace this arm with
-    // coverage of the recipe and its runtime consumers in the same increment.
+    // The task manager is a static target recipe with a realized-output check.
     if p.starts_with("td-taskmgr/") && !p.contains("..") {
         sel.add_preflight("cargo-test");
+        sel.add_target("check");
+        sel.add_target("recipe-checks");
         return;
     }
 
-    // td-ui, the shared UI toolkit, is the editor's path dependency and, like
-    // the editor, has no recipe consumer yet, so the same arm: the host
-    // preflight covers its own lock/test/clippy obligations, and the cargo
-    // narrowing carries a change here to every crate whose manifest names
-    // it. Packaging a consumer replaces this arm with target-artifact
-    // coverage together with the editor's.
+    // Toolkit edits affect the standalone consumers and the target taskmgr
+    // and portal recipes; source pins and realized-output checks are required.
     if p.starts_with("td-ui/") && !p.contains("..") {
         sel.add_preflight("cargo-test");
+        sel.add_target("check");
+        sel.add_target("recipe-checks");
         return;
     }
 
     // td-setup, the installer front end, is a td-ui consumer with no recipe
-    // consumer yet, so the same arm as the editor and td-ui: the host
+    // consumer yet, so the same arm as the editor: the host
     // preflight covers its own lock/test/clippy obligations, and the cargo
     // narrowing carries the change to every crate whose manifest names it
     // (nobody yet). Packaging the installer replaces this arm with
@@ -7289,7 +7278,7 @@ mod tests {
     }
 
     #[test]
-    fn taskmgr_backend_routes_to_its_discovered_roster_until_packaged() {
+    fn taskmgr_source_routes_to_its_roster_pin_and_target_checks() {
         let root = repo_root();
         for path in [
             "td-taskmgr/Cargo.toml",
@@ -7306,7 +7295,9 @@ mod tests {
                 output.contains("--workspace (builder/recipes/engine)"),
                 "{path}: {output}"
             );
-            assert!(!output.contains("td-builder check"), "{path}: {output}");
+            assert!(output.contains("local-source-digests"), "{path}: {output}");
+            assert!(output.contains("td-builder check"), "{path}: {output}");
+            assert!(output.contains("recipe-checks"), "{path}: {output}");
         }
         let docs = path_output(&root, "td-taskmgr/DESIGN.md");
         assert!(docs.contains("Selected checks: none"), "{docs}");
@@ -7375,7 +7366,9 @@ mod tests {
         // The toolkit brings its five leaf consumers and their native fixtures.
         for path in ["td-ui/src/keyboard.rs", "td-ui/Cargo.toml", "td-ui/tests/xkb.rs"] {
             let toolkit = [path.to_string()];
-            assert!(compute_selection(&root, &toolkit).targets.is_empty(), "{path}");
+            let targets = compute_selection(&root, &toolkit).targets;
+            assert!(targets.contains(&"check".to_string()), "{path}");
+            assert!(targets.contains(&"recipe-checks".to_string()), "{path}");
             let commands = cargo_test_cmds(&root, &toolkit).unwrap();
             // Two workspace checks, two toolkit checks, and three per consumer.
             assert_eq!(commands.len(), 19, "{path}: {commands:?}");

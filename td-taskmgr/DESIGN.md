@@ -464,9 +464,14 @@ observed totals stay gaps. The window implements device selection, checked
 selected-device sums, search/sibling ordering and the visible tree
 projection. Process controls use a separate bounded action worker.
 
-The affected-check mapping currently runs the discovered standalone crate
-and workspace lock/test/Clippy preflight. No recipe embeds this crate yet.
-Image packaging must add target-recipe/runtime coverage in the same landing.
+The affected-check mapping runs the discovered standalone crate and
+workspace lock/test/Clippy preflight. The target recipe stages td-taskmgr,
+td-ui and td-compositor, builds offline with the source-built Rust toolchain,
+and installs a static binary with the standard frame-pointer/debug-companion
+policy. Its companion check executes the realized binary's help and two
+bounded resource observations. Source edits select the local pin and target
+recipe checks; DESIGN.md remains excluded from staging and source hashes.
+Image and launcher integration must add runtime coverage in that landing.
 
 ## Implemented window
 

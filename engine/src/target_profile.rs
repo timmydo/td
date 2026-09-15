@@ -93,7 +93,7 @@ pub const ASSEMBLY_EXCEPTIONS: [(&str, &str); 7] = [
 /// and libgcc boundaries apply to every output passed to the target splitter;
 /// this roster adds Rust/LLVM and is pinned against both Cargo and direct-rustc
 /// recipes by the catalog tests.
-pub const RUST_PROFILED_RECIPES: [&str; 33] = [
+pub const RUST_PROFILED_RECIPES: [&str; 34] = [
     "codex",
     "fd",
     "ripgrep",
@@ -122,6 +122,7 @@ pub const RUST_PROFILED_RECIPES: [&str; 33] = [
     "td-secret-vm-test",
     "td-sh",
     "td-svc",
+    "td-taskmgr",
     "td-txt",
     "td-update",
     "td-util",
@@ -453,10 +454,7 @@ mod tests {
             "Rust 1.96.0 librustc_driver's line program is beyond td-profiler's bounded per-object reader"
         );
         assert_eq!(line_attribution_exception("td-profiler"), None);
-        assert_eq!(
-            debug_companion_policy("td-profiler"),
-            "line-tables-v2"
-        );
+        assert_eq!(debug_companion_policy("td-profiler"), "line-tables-v2");
         let mut recipes = std::collections::BTreeSet::new();
         for (recipe, exception) in LINE_ATTRIBUTION_EXCEPTIONS {
             assert!(recipes.insert(recipe), "duplicate exception for {recipe}");
