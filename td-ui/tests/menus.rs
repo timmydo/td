@@ -621,3 +621,19 @@ fn complete_mode_preserves_editor_panel_pixels_and_minima() {
         assert_eq!(&bytes[..4], &[0x55; 4]);
     }
 }
+
+#[test]
+fn storage_accounting_tracks_nodes_while_labels_remain_borrowed() {
+    let short = [action(None, "a", 1, true)];
+    let long = [action(None, "a longer borrowed static label", 1, true)];
+    let a = Model::new(Kind::Context, 1u64, &short).unwrap();
+    let b = Model::new(Kind::Context, 1u64, &long).unwrap();
+    assert_eq!(a.storage_bytes(), b.storage_bytes());
+    let many = [
+        branch(None, "Scope"),
+        action(Some(0), "First", 1, true),
+        action(Some(0), "Second", 2, true),
+    ];
+    let c = Model::new(Kind::Context, 1u64, &many).unwrap();
+    assert!(c.storage_bytes() > a.storage_bytes());
+}

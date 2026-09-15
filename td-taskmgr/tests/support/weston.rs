@@ -65,6 +65,7 @@ fn real_weston_configures_releases_buffers_and_keeps_collection_live() {
     wait_state(&client, |s| {
         counter(s, "newest_ns") > counter(&initial, "newest_ns")
     });
+    exercise_controls(&client, |key| chord(&client, key), || {});
     // Scope wire evidence to the exact client that set our app id.
     let deadline = Instant::now() + TIMEOUT;
     loop {

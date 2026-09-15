@@ -28,6 +28,7 @@ struct Window {
     font: Font,
     state: State,
     worker: Option<Worker>,
+    actions: Option<td_taskmgr::action_worker::Worker>,
     origin: Instant,
     quit_at: Option<u64>,
     size: (usize, usize),
@@ -55,11 +56,19 @@ impl Window {
                 None
             }
         };
+        let actions = match td_taskmgr::action_worker::Worker::start(&budget, 1) {
+            Ok(worker) => Some(worker),
+            Err(why) => {
+                state.action_unavailable(&format!("Process controls unavailable: {why}"));
+                None
+            }
+        };
         Ok(Self {
             client: Client::new(stream, temporary)?,
             font: td_ui::font::pinned()?,
             state,
             worker,
+            actions,
             origin: Instant::now(),
             quit_at: None,
             size: (1280, 960),
@@ -71,6 +80,33 @@ impl Window {
             remote_pointer: (0, 0),
             presentations: 0,
         })
+    }
+    fn process_actions(&mut self) {
+        if let Some(command) = self.state.take_action_command() {
+            let result = self
+                .actions
+                .as_ref()
+                .ok_or_else(|| io::Error::other("process controls unavailable"))
+                .and_then(|worker| worker.submit(command));
+            if let Err(why) = result {
+                if !matches!(command, td_taskmgr::actions::Command::Cancel(_)) {
+                    self.actions = None;
+                    self.state
+                        .action_unavailable(&format!("Process controls unavailable: {why}"));
+                }
+            }
+        }
+        if let Some(worker) = &mut self.actions {
+            match worker.take() {
+                Ok(Some(update)) => self.state.action_update(update),
+                Ok(None) => {}
+                Err(why) => {
+                    self.actions = None;
+                    self.state
+                        .action_unavailable(&format!("Process controls unavailable: {why}"));
+                }
+            }
+        }
     }
     fn apply(&mut self, outcome: Outcome) -> Result<()> {
         match outcome {
@@ -114,6 +150,11 @@ impl Window {
                 let outcome = self.state.pointer(phase, self.pointer.0, self.pointer.1);
                 self.apply(outcome)?;
             }
+            pointer::Event::Button {
+                button: 273,
+                pressed: true,
+                ..
+            } => self.state.context_menu(self.pointer),
             pointer::Event::Button { .. } => {}
             pointer::Event::Frame => {
                 let (rows, cols) = self.wheel.frame();
@@ -240,6 +281,7 @@ impl App for Window {
                 );
             }
         }
+        self.process_actions();
         if self.quit_at.is_some_and(|at| now >= at) {
             self.client.close();
         }

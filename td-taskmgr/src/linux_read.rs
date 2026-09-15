@@ -104,6 +104,49 @@ impl Reader {
             .map_err(|_| io::Error::other("source path formatting failed"))?;
         File::open(&self.process_path)
     }
+    /// A bounded command prefix; one extra byte establishes truncation.
+    pub fn process_command(&mut self, directory: &File) -> io::Result<(&[u8], bool)> {
+        self.process_path.clear();
+        write!(
+            &mut self.process_path,
+            "/proc/self/fd/{}/cmdline",
+            directory.as_raw_fd()
+        )
+        .map_err(|_| io::Error::other("source path formatting failed"))?;
+        let mut source = File::open(&self.process_path)?;
+        let limit = 4096usize;
+        if self.bytes.len() <= limit {
+            return Err(io::ErrorKind::InvalidInput.into());
+        }
+        let mut used = 0;
+        let mut interrupted = 0;
+        while used <= limit {
+            let target = self
+                .bytes
+                .get_mut(used..limit + 1)
+                .ok_or_else(|| io::Error::other("invalid command buffer range"))?;
+            match source.read(target) {
+                Ok(0) => break,
+                Ok(count) => {
+                    used = used
+                        .checked_add(count)
+                        .ok_or_else(|| io::Error::other("command length overflow"))?
+                }
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {
+                    interrupted += 1;
+                    if interrupted > 32 {
+                        return Err(error);
+                    }
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        let bytes = self
+            .bytes
+            .get(..used.min(limit))
+            .ok_or_else(|| io::Error::other("invalid command prefix range"))?;
+        Ok((bytes, used > limit))
+    }
     /// `name` is a fixed component chosen by the adapter, never process text.
     pub fn process_file(
         &mut self,

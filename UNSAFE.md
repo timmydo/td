@@ -14,7 +14,7 @@ in `builder/src/sys.rs` and the low-level conversions in `nar.rs` and
 can stay `libc`-free. `ostree.rs` calls one safe syscall wrapper and carries
 no unsafe allowance. Every other
 engine crate (the shared `engine` lib and
-`recipes`/`fetch`/`feed`/`subst`) `forbid`s `unsafe_code`. There are NINETEEN
+`recipes`/`fetch`/`feed`/`subst`) `forbid`s `unsafe_code`. There are TWENTY
 target-side exceptions, each a standalone crate OUTSIDE the
 `builder`/`recipes`/`engine` workspace with a scoped `#[allow]` around its
 recorded raw Linux boundary (the crate itself `#![deny(unsafe_code)]`s).
@@ -49,6 +49,8 @@ left no shared crate to put it in. The gate now admits a path dependency on
 a sibling roster crate (AGENTS.md 'Rust code'), so folding the copies into
 one crate is possible and is its own reviewed change; until it lands, §17
 argues it once and §18 records only that the copy is the same bytes.
+The twentieth, `td-taskmgr`, has one function-scoped instruction for
+process-directed signals through retained procfs directory descriptors.
 
 The host-only `td-vm-registrar` binary in `td-vm` has one separately
 recorded account-authentication surface, H1 below. The existing `td-review`,
@@ -105,6 +107,7 @@ raw boundary of the consumer's own, which gets its own entry.
 | 17 | `td-mail` | `ioctl(2)` (three pinned requests), `poll(2)` — td-sh's terminal half, in `term_sys.rs` |
 | 18 | `td-news` | the same `term_sys.rs`, byte for byte — see [§18](#18-td-news--the-same-terminal-surface) |
 | 19 | `td-ui` | `recvmsg(2)`, `sendmsg(2)`, `fcntl(2)` pinned to `F_DUPFD_CLOEXEC`, the shared Wayland client transport; plus one scoped descriptor adoption — see [§19](#19-td-ui--the-shared-wayland-client-transport) |
+| 20 | `td-taskmgr` | `pidfd_send_signal(2)`, retained procfs process directories, named signals or a fixed signal-zero self probe |
 
 The control-plane exception (`builder/src/sys.rs`) is described under The
 rule above and is not part of this numbering. This is a program-role boundary,
@@ -2743,6 +2746,57 @@ reader and the send hand-off is authorized here. A fourth syscall, second
 fcntl command, another caller, or additional allowance amends this section
 and `td-ui/DESIGN.md` in the same landing; a consumer that takes a right
 from the FIFO records that consumer in its own section.
+
+## 20. `td-taskmgr` — descriptor-bound process signals
+
+`signal_sys.rs` carries exactly one x86-64 Linux syscall instruction:
+`pidfd_send_signal` (424). Its private wrapper accepts a borrowed live
+`File` retained from a procfs process-directory open and a closed `Signal`
+enum. Signal numbers 1 through 31 are resolved only in this platform
+adapter; a distinct fixed self-probe uses signal zero. The `siginfo`
+argument is null and flags are zero, giving process-directed ordinary
+signal semantics without queued payloads. Neither a PID nor an arbitrary
+number, flag, pointer or descriptor integer is an accepted caller input.
+The kernel checks descriptor kind, lifetime and caller permission.
+
+`action_linux` is the sole production caller. Its startup probe retains
+its own procfs directory, validates stat/status against the caller PID and
+requires one NStgid value, proving the procfs PID view is the caller's
+own under the kernel's procfs contract. Missing or inconsistent fields
+refuse controls while monitoring remains available. It probes that same
+descriptor with signal zero; no user-selected target is probed as an
+implicit action. Selected-only preparation opens its numeric directory
+once. Subtree preparation scans numeric directories, then reopens each
+listed member and verifies its identity and parent against the scan before
+retaining it. Both read bounded confirmation details through the retained
+directory. Descriptor-relative
+reads use `/proc/self/fd/FD/NAME`, with NAME chosen from fixed components;
+std owns all opens, reads and closes. A prepared member is never reopened
+by PID at delivery, and no numeric kill fallback exists. A stale procfs
+descriptor cannot retarget PID reuse. A start-time key alone is not authority:
+the confirmation authorizes the presently pinned instance.
+
+The independent action worker retains every member descriptor from
+preparation through confirmation and delivery. One request is outstanding,
+with a bounded typed handoff to the UI; fresh scan and confirmation limits
+are specified in `td-taskmgr/DESIGN.md`. Cancel, geometry change, physical
+focus loss and close retire pending consent and any remaining confirmed
+delivery; cancellation is checked between reads and sends. Already sent signals are
+not undone, and closing never joins a stalled filesystem operation. The
+manager and any observed namespace-init member (an NStgid value of 1) are
+protected; a subtree containing either is refused as a whole. Every send
+reports its own result under existing credentials, without retry,
+elevation, process-group delivery, namespace changes or descriptor adoption.
+
+The crate root denies unsafe code. One function-scoped allowance contains
+the one instruction; there is no pointer dereference, mapping, FFI, signal
+handler or raw ownership conversion. Unsupported architectures fail at
+compile time rather than inheriting x86 register or signal-number choices.
+Confinement tests pin the complete raw source, fixed syscall/argument
+mapping, allowance and instruction counts, closed module inventory and
+production callers. Kernel tests use only child processes the fixture owns.
+Any additional syscall, raw caller, signal value, flags, queued information,
+allowance or authority channel amends this section and the component design.
 
 ## H1. `td-vm-registrar` — host Git account enrollment
 

@@ -8,8 +8,9 @@ the caller's existing authority.
 
 This is the version-1 target contract, not a claim that all features ship.
 The standalone collection/model crate, read-only `--sample` command and
-Wayland window are implemented. Process controls and td image integration
-remain subsequent increments. Root AGENTS.md and DEVELOPMENT.md govern
+Wayland window and descriptor-bound process controls are implemented.
+The td image integration remains a subsequent increment. Root AGENTS.md
+and DEVELOPMENT.md govern
 implementation and landing; [td-ui](../td-ui/DESIGN.md) owns the
 shared widget contracts. Each increment below must update its status and
 record its actual validation without claiming later increments are done.
@@ -305,8 +306,15 @@ denied descriptor access leaves monitoring available and controls disabled
 with the concrete reason.
 
 Subtree preparation makes a fresh bounded scan, resolves parent links,
-pins every listed member, and refuses inconsistent identities or topology
-before presenting the list. This is the observed membership, not an atomic
+pins every listed member, and refuses inconsistent identities or cycles in
+the selected subtree before presenting the list. An unrelated process that
+vanishes during enumeration is omitted; other unreadable entries refuse
+preparation with their PID. Every retained member is revalidated. Unrelated
+cycles or deep ancestry do not disable a bounded selected subtree. A
+non-vanished unreadable PID can belong to that subtree, so it refuses
+subtree preparation system-wide, for example with foreign-UID entries on
+a hidepid=1 mount; selected-process actions remain available. This is the
+observed membership, not an atomic
 process-family operation: later children are excluded, reparented captured
 members remain included, and exited members are reported individually.
 Send parents before children for SIGSTOP and SIGCONT in deterministic
@@ -326,6 +334,11 @@ no rollback or automatic retry. The manager itself and namespace PID 1
 are not actionable in version 1, including through subtree membership.
 Preparing a subtree containing either refuses the whole action and names
 the protected member; it never silently drops that member from delivery.
+This includes nested namespace inits: killing one implicitly kills its
+namespace, exceeding a selected-process request or its captured member set.
+Version 1 therefore cannot tear down a confined application by killing its
+namespace init. td's distinct application UIDs also retain their ordinary
+kernel permission boundary until separately authorized elevation exists.
 There is no sudo, su, setuid executable, capability grant, password dialog,
 or privileged helper.
 
@@ -334,9 +347,17 @@ authorized executor can accept a descriptor-bound signal and exact member
 set after fresh request-bound consent. That increment must amend the
 relevant authority/threat contracts and provide the trusted input path;
 this seam neither implements elevation nor delegates ambient UI authority.
-The Linux signal and relative-descriptor adapters need their own UNSAFE.md
-roster entry and confinement tests when implemented. This document does
-not authorize a new unsafe surface on its own.
+The signal adapter is recorded in UNSAFE.md §20. One x86-64 syscall
+instruction issues pidfd_send_signal with null siginfo and zero flags;
+only the adapter resolves the closed named-signal enum to numbers. A
+separate fixed signal-zero startup probe opens and validates the manager's
+own directory, retains it through the probe, then closes it. Each preparation
+opens and validates the caller's procfs view again.
+Fresh status requires matching PID/TGID and NStgid; the manager's own
+NStgid must contain one value matching its PID. Any target NStgid value
+of 1 identifies a protected namespace-init member. Missing or inconsistent
+status disables controls or refuses preparation. std owns all descriptors;
+no process-number fallback, raw adoption or privilege change is admitted.
 
 ## Collection and resource bounds
 
@@ -386,8 +407,8 @@ The dependency-free crate currently offers `--sample [COUNT]` with
 unavailable first-interval rates are printed explicitly. The command is a
 read-only backend probe. It does not open a window, send signals or claim td
 image integration. The default invocation opens the Wayland window using
-td-ui and its compiled font. The executable remains read-only until the
-controls increment.
+td-ui and its compiled font. Process controls use the desktop caller's
+existing authority.
 
 `parsers` takes bounded bytes and explicit units. `linux_read` owns one
 charged reusable source buffer, descriptor-relative process-file reads and
@@ -441,7 +462,7 @@ keeps series order by key. Retained named keys keep their palette slots; new
 names take free slots. Missing observations and unknown/overflowing Other
 observed totals stay gaps. The window implements device selection, checked
 selected-device sums, search/sibling ordering and the visible tree
-projection. Process controls remain disabled until their own landing.
+projection. Process controls use a separate bounded action worker.
 
 The affected-check mapping currently runs the discovered standalone crate
 and workspace lock/test/Clippy preflight. No recipe embeds this crate yet.
@@ -487,10 +508,11 @@ original pane cannot activate a later row or graph. A failed view refresh
 releases old plot caches before constructing replacements. If replacement
 still fails, it releases the old projection and retries once before painting;
 continuing pressure enters the bounded tick-recovery path. An unavailable
-view never presents old data as the newly selected sample. The status reports age, partial coverage, actual history duration,
-absent selections and inspections older than the plot. Process actions
-currently report unavailable; F10/context menus and command detail arrive
-with descriptor-bound controls.
+view never presents old data as the newly selected sample. The status
+reports age, partial coverage, actual history duration, absent selections
+and inspections older than the plot. F10/Shift+F10 and the Process actions
+button open the selected process menu. Right-clicking a tree row first
+selects that captured row, then opens its menu.
 
 `window` owns the Wayland transport, compiled font, collection worker and
 optional control transport. It polls the latest collection handoff at most
@@ -501,7 +523,10 @@ drops the worker without joining a stalled read. The optional local endpoint
 is enabled only by `--control-socket ABSOLUTE-PATH`, using td-ui's existing
 private-socket, bounded-worker and driven protocol contracts. It exposes
 state, shared key/pointer/wheel input, composition and four semantic actions
-(live, interval, search, quit); no process-signal action exists yet. Remote
+(live, interval, search, quit). Process controls use ordinary shared input
+and the same required confirmation. When enabled, the same-UID endpoint
+can navigate and confirm process actions; it grants its caller the UI's
+ordinary signal authority. Remote
 resize/tick injection is refused. Transport failure disables the optional
 endpoint; a remote quit allows a bounded reply-drain interval. Transport and
 surface buffers retain td-ui's separate ceilings.
@@ -527,6 +552,50 @@ frame callbacks, buffer releases, navigation, continuing observations and
 clean remote quit. The host smoke passed with Guix Weston 10.0.2 on x86-64
 Linux 7.0.14. These are host compatibility observations, not td target-image
 evidence.
+
+## Implemented process controls
+
+`actions` carries the closed named-signal enum, explicit scope and request
+revision. `action_plan` validates bounded status/PID-view evidence and
+builds iterative deterministic membership. `action_linux` owns fresh
+procfs reads, retained directories and per-member results; `signal_sys`
+is the sole raw boundary. Preparation never sends a signal. The worker
+retains all captured directories until confirmation or cancellation, and
+pre-reserves the entire delivery report before exposing a confirmation.
+
+`action_worker` has one thread and one bounded command/reply slot. Request
+revisions increase without reuse. Confirmation requires the matching
+prepared reply to have been consumed, and consumes the retained preparation
+once. A cancellation invalidates queued or in-flight intent and is checked
+between target sends; completed sends remain in the report. No I/O holds
+the handoff mutex. A stalled read cannot create replacement workers, and
+closing invalidates authority without joining that read.
+
+`action_ui` supplies data to shared td-ui submenus and confirmations. It
+charges their owned capacities and wrapped-line storage before growth.
+Pending menus and requests pause history admission. Physical focus loss,
+geometry changes and Escape cancel pending authority and remaining sends,
+even after confirmation; already sent signals remain in the result report.
+A same-size configure preserves the request. Pointer leave alone does not
+cancel keyboard focus. Confirm does not overlap the pointer position that
+opened the request. A completed report retains its details and per-member
+results if a small window or memory pressure prevents displaying it;
+Enter retries, resize reflows it, and Escape explicitly closes it. Budget
+recovery evicts at most one old unpinned snapshot per tick, shared with the
+visible-view recovery policy, while preserving newest and inspected data.
+
+Owned-child kernel tests exercise STOP/CONT/TERM/KILL, stale descriptors,
+key mismatch, self protection and cancelled delivery. A captured subtree
+excludes a child created after preparation, includes it in a later fresh
+request, and reports a captured member that exits before delivery alongside
+successful sends. Worker tests cover duplicate/stale confirmation, bounded
+cancellation during a stalled preparation and nonblocking close. Shared
+widget tests cover default Cancel, all 256 detail rows, explicit submenu
+scope, repeated input, resize cancellation, opener overlap and retained
+partial results at the byte ceiling. Actual td-compositor routed keys and
+correlated captures exercise confirmations against an owned child; Guix
+Weston 10.0.2 also passes owned-child stop/resume through the same dispatcher.
+These are host tests and do not claim td image delivery.
 
 ## Validation and delivery
 
@@ -575,7 +644,8 @@ Independently landable increments:
    Read-only until the following increment, explicitly identified as
    incomplete version 1.
 6. Descriptor-bound process and subtree controls, reviewed unsafe surface,
-   kernel tests and real menu interaction, completing the standalone v1.
+   kernel tests and real menu interaction (implemented), completing the
+   standalone v1. The td delivery remains required.
 7. td recipe and image/launcher integration with declared sibling trees,
    target debug/profile policy, runtime visibility and launch authority
    reviewed against APPLICATIONS.md and td-compositor/DESIGN.md. Realize

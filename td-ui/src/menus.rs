@@ -137,6 +137,13 @@ impl<'a, A: Copy, R: Copy + Eq> Model<'a, A, R> {
         Ok(model)
     }
 
+    /// Owned capacities; labels are borrowed and charged by their owner.
+    pub fn storage_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            + self.nodes.capacity() * std::mem::size_of::<Node<'a, A>>()
+            + self.roots.capacity() * std::mem::size_of::<usize>()
+            + self.labels.capacity() * std::mem::size_of::<&str>()
+    }
     pub fn revision(&self) -> R {
         self.revision
     }

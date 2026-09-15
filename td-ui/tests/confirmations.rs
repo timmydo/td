@@ -570,3 +570,37 @@ fn resize_keeps_the_reading_position_and_paint_contains_every_visible_character(
         );
     }
 }
+
+#[test]
+fn storage_accounting_includes_captured_text_and_wrapped_rows_after_resize() {
+    let text = "owned process detail ".repeat(150);
+    let model = Model::new("Confirm", "Send", &[text.as_str()], 1u32, 9u64).unwrap();
+    let captured = model.storage_bytes();
+    assert!(captured >= std::mem::size_of_val(&model) + text.len());
+    let mut widget = Controller::new(model, surface(1), rect(1), Some(42u32)).unwrap();
+    let wide = widget.storage_bytes();
+    assert!(wide > captured + std::mem::size_of_val(&widget));
+    let narrow = Rect {
+        width: 240,
+        ..rect(1)
+    };
+    let outcome = event(
+        &mut widget,
+        Event::Resize {
+            surface: surface(1),
+            rect: narrow,
+        },
+    );
+    assert!(!matches!(outcome, Outcome::Closed { .. }));
+    assert!(
+        widget.storage_bytes() > wide,
+        "narrower wrapping retains more line records"
+    );
+    let bytes = widget.storage_bytes();
+    widget.emit(surface(1).bounds(), &mut |_| {});
+    assert_eq!(
+        widget.storage_bytes(),
+        bytes,
+        "paint does not grow retained data"
+    );
+}

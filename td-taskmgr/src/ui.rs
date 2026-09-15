@@ -56,6 +56,7 @@ struct Cached {
 #[derive(Debug)]
 pub struct State {
     pub model: Model,
+    actions: crate::action_ui::Controller,
     budget: Arc<Budget>,
     surface: Surface,
     split: split::Controller,
@@ -150,6 +151,7 @@ impl State {
     pub fn new(budget: &Arc<Budget>, surface: Surface) -> Result<Self, String> {
         Ok(Self {
             model: Model::new(budget, Interval::Second).map_err(error)?,
+            actions: crate::action_ui::Controller::new(budget, surface)?,
             budget: Arc::clone(budget),
             surface,
             split: split::Controller::new(
@@ -190,6 +192,54 @@ impl State {
             _charge: budget.charge(std::mem::size_of::<Self>()).map_err(error)?,
         })
     }
+    fn action_note(&mut self) {
+        if let Some(note) = self.actions.take_note() {
+            self.note(note.as_str());
+        }
+    }
+    pub fn action_update(&mut self, update: crate::actions::Update) {
+        self.actions.update(update);
+        self.action_note();
+        self.dirty = true;
+    }
+    pub fn action_unavailable(&mut self, reason: &str) {
+        self.actions.disable(reason);
+        self.action_note();
+        self.dirty = true;
+    }
+    pub fn take_action_command(&mut self) -> Option<crate::actions::Command> {
+        self.actions.take_command()
+    }
+    pub fn context_menu(&mut self, point: (i64, i64)) {
+        if self.actions.busy() {
+            return;
+        }
+        let target = self
+            .view
+            .as_ref()
+            .and_then(|view| view.table.target(point.0, point.1));
+        let key = match target {
+            Some(tree::Target::Row(key) | tree::Target::Disclosure { id: key, .. }) => key,
+            _ => return,
+        };
+        self.cancel_gesture();
+        self.set_focus(Focus::Tree);
+        if let Some(view) = &mut self.view {
+            view.table.select(Some(key), false);
+        }
+        self.tree_outcome(tree::Outcome::Selected(key));
+        self.process_menu(Some(point));
+    }
+    pub fn process_menu(&mut self, point: Option<(i64, i64)>) {
+        self.cancel_gesture();
+        let key = self.selected().and_then(|key| match key {
+            Key::Process(key) => Some(key),
+            Key::Unavailable => None,
+        });
+        self.actions.open(key, self.model.historical(), point);
+        self.action_note();
+        self.dirty = true;
+    }
     pub fn surface(&self) -> Surface {
         self.surface
     }
@@ -228,7 +278,12 @@ impl State {
         }
     }
     pub fn resize(&mut self, surface: Surface) -> Result<(), String> {
+        if self.surface == surface {
+            return Ok(());
+        }
         self.surface = surface;
+        self.actions.resize(surface);
+        self.action_note();
         self.cancel_gesture();
         self.split
             .event(split::Event::Resize {
@@ -241,6 +296,7 @@ impl State {
         Ok(())
     }
     pub fn cancel_gesture(&mut self) {
+        self.actions.cancel_gesture();
         self.dirty = true;
         self.held = false;
         self.armed = None;
@@ -256,6 +312,8 @@ impl State {
         }
     }
     pub fn cancel(&mut self) {
+        self.actions.focus_lost();
+        self.action_note();
         self.keyboard_focus = false;
         self.cancel_gesture();
         let _ = self.split.event(split::Event::FocusLost);
@@ -315,13 +373,22 @@ impl State {
         self.now_ns = now_ns;
         self.model.receive(update);
         self.flush_selection();
+        let mut reclaimed = false;
+        if self.actions.needs_result_memory() {
+            self.actions.retry_results();
+            if self.actions.needs_result_memory() {
+                reclaimed = self.model.reclaim_for_view();
+            }
+            self.action_note();
+            self.dirty = true;
+        }
         if self.refresh_pending {
             // Recover the visible working set before admitting another snapshot.
             self.refresh(false);
-            if self.refresh_pending && self.model.reclaim_for_view() {
+            if self.refresh_pending && !reclaimed && self.model.reclaim_for_view() {
                 self.dirty = true;
             }
-        } else if !self.held {
+        } else if !self.held && !self.actions.busy() {
             match self.model.admit_pending() {
                 Admission::Admitted(_) => {
                     if [
@@ -631,7 +698,7 @@ impl State {
                     self.refresh(true);
                 }
             }
-            tree::Outcome::Activate(_) => self.note("Process controls are unavailable."),
+            tree::Outcome::Activate(_) => self.process_menu(None),
             _ => {}
         }
         self.dirty = true;
@@ -955,11 +1022,21 @@ impl State {
     }
     pub fn key(&mut self, key: &str, repeated: bool) -> Outcome {
         let key = if key == " " { "Space" } else { key };
+        if self.actions.key(key, repeated) {
+            self.action_note();
+            self.dirty = true;
+            return Outcome::Changed;
+        }
+        if matches!(key, "F10" | "S-F10") && !repeated {
+            self.process_menu(None);
+            return Outcome::Changed;
+        }
         if self.held {
             self.cancel_gesture();
         }
         self.flush_selection();
         if key == "C-q" && !repeated {
+            self.actions.cancel();
             return Outcome::Quit;
         }
         if key == "C-f" {
@@ -1158,7 +1235,7 @@ impl State {
             }
             Focus::Actions => {
                 if key == "Return" {
-                    self.note("Process controls are unavailable.");
+                    self.process_menu(None);
                     return Outcome::Changed;
                 }
             }
@@ -1184,6 +1261,11 @@ impl State {
         self.dirty = true;
     }
     pub fn scroll(&mut self, x: i64, y: i64, rows: i64, columns: i64) -> Outcome {
+        if self.actions.scroll(x, y, rows) {
+            self.action_note();
+            self.dirty = true;
+            return Outcome::Changed;
+        }
         if self.held {
             self.cancel_gesture();
         }
@@ -1239,6 +1321,15 @@ impl State {
         outcome
     }
     fn pointer_inner(&mut self, phase: Phase, x: i64, y: i64) -> Outcome {
+        if let Some(changed) = self.actions.pointer(phase, x, y) {
+            self.action_note();
+            self.dirty |= changed;
+            return if changed {
+                Outcome::Changed
+            } else {
+                Outcome::Ignored
+            };
+        }
         if phase == Phase::Move && !self.held {
             return Outcome::Ignored;
         }
@@ -1299,7 +1390,7 @@ impl State {
                 {
                     let _ = rect;
                     self.set_focus(Focus::Actions);
-                    self.note("Process controls are unavailable.");
+                    self.process_menu(Some((x, y)));
                     return Outcome::Changed;
                 }
                 if let Some(list) = self.ranking_list() {
@@ -1742,6 +1833,7 @@ impl State {
             }
         }
         chrome::Status::new(surface).emit(status.as_str().chars(), damage, sink);
+        self.actions.emit(damage, sink);
     }
     fn emit_devices(&self, rect: Rect, damage: Rect, sink: &mut dyn FnMut(Draw)) {
         let Some(sample) = self
@@ -1958,7 +2050,7 @@ impl State {
             Some(Key::Unavailable) => "group".into(),
             None => "none".into(),
         };
-        format!("tab={}\tfocus={:?}\tquery={}\tselected={}\tlive={}\tinspected_ns={}\tnewest_ns={}\trows={}\tretained={}\tmodel_bytes={}",TABS.get(self.tab).copied().unwrap_or(""),self.focus,td_ui::control::hex(self.search.text().as_bytes()),selected,!self.model.historical(),self.model.history().selected().map(|s|s.time_ns).unwrap_or(0),self.model.history().samples().last().map(|s|s.time_ns).unwrap_or(0),self.visible(),self.model.history().samples().len(),self.budget.used())
+        format!("tab={}\tfocus={:?}\tquery={}\tselected={}\tlive={}\tinspected_ns={}\tnewest_ns={}\trows={}\tretained={}\tmodel_bytes={}\tactions={}",TABS.get(self.tab).copied().unwrap_or(""),self.focus,td_ui::control::hex(self.search.text().as_bytes()),selected,!self.model.historical(),self.model.history().selected().map(|s|s.time_ns).unwrap_or(0),self.model.history().samples().last().map(|s|s.time_ns).unwrap_or(0),self.visible(),self.model.history().samples().len(),self.budget.used(),self.actions.stage())
     }
 }
 
@@ -2002,6 +2094,32 @@ mod tests {
             },
             at,
         );
+    }
+    #[test]
+    fn right_click_selects_captured_row_and_modal_motion_needs_no_repaint() {
+        let budget = Budget::new(crate::budget::LIMIT).unwrap();
+        let mut state = State::new(
+            &budget,
+            Surface::new(1280, 960, Default::default()).unwrap(),
+        )
+        .unwrap();
+        observation(&mut state, &budget, 1_000_000_000);
+        state.action_update(crate::actions::Update::Available);
+        let rect = state
+            .view
+            .as_ref()
+            .unwrap()
+            .table
+            .geometry()
+            .unwrap()
+            .row(1)
+            .unwrap();
+        state.context_menu((rect.x + 100, rect.y + 12));
+        assert_eq!(state.selected(), Some(Key::Process(key(2))));
+        assert_eq!(state.actions.stage(), "menu");
+        state.dirty = false;
+        state.pointer(Phase::Move, 0, 0);
+        assert!(!state.dirty);
     }
     #[test]
     fn graph_selection_pins_matching_tree_and_reveals_search_exception_across_tabs() {

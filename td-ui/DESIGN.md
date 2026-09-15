@@ -1052,7 +1052,9 @@ the reader graph, because td-editor's manifest names the crate.
 Each node carries a bounded `chrome::Row` and either a typed action ID
 or a submenu. Parent indices precede children; only submenus have
 children, branches cannot be empty, and bar roots are labelled submenus.
-Context roots are the first panel's rows. Construction refuses invalid
+Context roots are the first panel's rows. `Model::storage_bytes` exposes
+owned capacities for consumer budgets; borrowed labels remain their owner's
+responsibility. Construction refuses invalid
 trees, more than 256 entries, more than eight open panels,
 empty/control-bearing labels, labels over 256 bytes or shortcuts over 64
 bytes. Allocation is fallible; event handling and painting allocate no
@@ -1113,6 +1115,10 @@ copying and allocates fallibly: at most 256 detail entries, 4096 bytes per
 entry and one MiB of detail text, plus nonempty title/action labels of at
 most 256 bytes each. Control characters are refused. A source change or
 drop after capture cannot change the request presented for confirmation.
+`storage_bytes` on the model and controller exposes actual retained text,
+container and wrapped-row capacities for consumer accounting, excluding
+allocator bookkeeping. A consumer reserves its bound before construction
+and reconciles actual capacity before admitting the widget.
 The consumer owns any authority or descriptors behind the action ID.
 
 `confirmations::Controller` composes a title panel, a scrolling detail list

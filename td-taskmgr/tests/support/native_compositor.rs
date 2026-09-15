@@ -430,7 +430,7 @@ impl Drop for TaskProcess {
     }
 }
 
-fn state(client: &TaskProcess) -> std::collections::BTreeMap<String, String> {
+pub(super) fn state(client: &TaskProcess) -> std::collections::BTreeMap<String, String> {
     let fields = client.request(1, &["state"]);
     assert_eq!(fields.first().map(String::as_str), Some("ok"));
     fields
@@ -559,4 +559,85 @@ fn live_history_graph_tree_and_hidden_window_collection() {
     assert_eq!(client.request(3, &["action", "quit"]), ["ok", "quit"]);
     assert!(client.finish());
     compositor.stop();
+}
+
+#[test]
+#[ignore = "ready supplies the disposable native compositor"]
+fn physical_submenus_confirm_owned_stop_and_resume() {
+    let directory = Directory::new();
+    let compositor = std::cell::RefCell::new(Compositor::start(&directory));
+    let client_directory = Directory::new();
+    let client = TaskProcess::start(
+        &client_directory,
+        &compositor.borrow().directory.join("wayland-0"),
+    );
+    let deadline = Instant::now() + TIMEOUT;
+    let place = loop {
+        if let Some(place) = compositor.borrow().placement("td-taskmgr") {
+            break place;
+        }
+        assert!(Instant::now() < deadline, "mapping deadline");
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    wait_state(&client, |s| counter(s, "retained") > 0);
+    exercise_controls(
+        &client,
+        |name| {
+            let code = match name {
+                "F10" => 68,
+                "Right" => 106,
+                "Down" => 108,
+                "Return" => 28,
+                "Tab" => 15,
+                "Escape" => 1,
+                _ => panic!("unknown physical fixture key"),
+            };
+            tap(&mut compositor.borrow_mut(), code);
+        },
+        || {
+            let pixels = compositor.borrow().tile(&place);
+            assert_confirmation_cancel(&pixels, &place);
+        },
+    );
+    assert_eq!(client.request(3, &["action", "quit"]), ["ok", "quit"]);
+    assert!(client.finish());
+    compositor.borrow_mut().stop();
+}
+
+// Compare the displayed default-Cancel band with an independently constructed
+// shared confirmation; unrelated search/menu changes cannot satisfy this.
+fn assert_confirmation_cancel(pixels: &[u8], place: &Placement) {
+    use td_ui::confirmations::{Controller, Focus, Model};
+    use td_ui::raster::{self, Raster, Rect, Surface};
+    let surface = Surface::new(place.width, place.height, Default::default()).unwrap();
+    let rect = Rect {
+        x: 16,
+        y: 24,
+        width: place.width as u32 - 32,
+        height: place.height as u32 - 72,
+    };
+    let model = Model::new(
+        "Expected confirmation",
+        "Send signal",
+        &["owned process"],
+        (),
+        1u64,
+    )
+    .unwrap();
+    let widget = Controller::new(model, surface, rect, Some(())).unwrap();
+    let band = widget.action_rect(Focus::Cancel).unwrap();
+    let mut expected = vec![0; place.width * place.height * 4];
+    let font = td_ui::font::pinned().unwrap();
+    let mut raster = Raster::new(&mut expected, &font, surface, place.width * 4).unwrap();
+    widget.emit(surface.bounds(), &mut |draw| raster.draw(draw));
+    let expected = raster::rgb(&expected, surface, place.width * 4).unwrap();
+    for y in band.y as usize..band.y as usize + band.height as usize {
+        let begin = (y * place.width + band.x as usize) * 3;
+        let end = begin + band.width as usize * 3;
+        assert_eq!(
+            &pixels[begin..end],
+            &expected[begin..end],
+            "mapped default-Cancel band"
+        );
+    }
 }

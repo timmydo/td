@@ -1,4 +1,4 @@
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 
 pub mod budget;
 pub mod collector;
@@ -21,3 +21,11 @@ pub mod snapshot;
 pub mod ui;
 pub mod view;
 pub mod worker;
+
+mod action_linux;
+mod action_plan;
+pub mod action_worker;
+pub mod actions;
+mod signal_sys;
+
+pub mod action_ui;

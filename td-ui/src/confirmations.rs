@@ -85,6 +85,13 @@ impl<A: Copy, R: Copy + Eq> Model<A, R> {
             revision,
         })
     }
+    pub fn storage_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            + self.title.capacity()
+            + self.confirm.capacity()
+            + self.details.capacity() * std::mem::size_of::<String>()
+            + self.details.iter().map(String::capacity).sum::<usize>()
+    }
     pub fn revision(&self) -> R {
         self.revision
     }
@@ -278,6 +285,12 @@ impl<A: Copy, R: Copy + Eq, F: Copy> Controller<A, R, F> {
             });
         }
         Ok((title, details, actions, wrapped))
+    }
+    /// Retained text and wrapped-row capacities, excluding allocator bookkeeping.
+    pub fn storage_bytes(&self) -> usize {
+        std::mem::size_of::<Self>() - std::mem::size_of::<Model<A, R>>()
+            + self.model.storage_bytes()
+            + self.wrapped.capacity() * std::mem::size_of::<Line>()
     }
     pub fn is_open(&self) -> bool {
         self.open
