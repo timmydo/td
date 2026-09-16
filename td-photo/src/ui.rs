@@ -227,13 +227,14 @@ pub enum Action {
     Look,
     Crop,
     AdjustCrop,
+    Aspect,
     Reset,
     Scroll,
     Quit,
 }
 
 impl Action {
-    pub const ALL: [Action; 30] = [
+    pub const ALL: [Action; 31] = [
         Action::Open,
         Action::Next,
         Action::Previous,
@@ -261,6 +262,7 @@ impl Action {
         Action::Look,
         Action::Crop,
         Action::AdjustCrop,
+        Action::Aspect,
         Action::Reset,
         Action::Scroll,
         Action::Quit,
@@ -295,6 +297,7 @@ impl Action {
             Self::Look => "look",
             Self::Crop => "crop",
             Self::AdjustCrop => "adjust-crop",
+            Self::Aspect => "aspect",
             Self::Reset => "reset",
             Self::Scroll => "scroll",
             Self::Quit => "quit",
@@ -320,7 +323,7 @@ impl Action {
 /// binds, the argument shape and the help line. Actions without a chord
 /// take an argument or are the agent's (`open`); the pointer reaches
 /// `select` by pressing a cell and `scroll` by the wheel.
-pub const BINDINGS: [Binding; 30] = [
+pub const BINDINGS: [Binding; 31] = [
     Binding {
         name: "open",
         chord: None,
@@ -482,6 +485,12 @@ pub const BINDINGS: [Binding; 30] = [
         chord: Some("c"),
         arguments: "",
         help: "Toggle crop adjust: drag the crop's edges and corners (develop mode).",
+    },
+    Binding {
+        name: "aspect",
+        chord: None,
+        arguments: "RATIO",
+        help: "Lock the crop drag to a ratio: free, 3:2, 4:3, 1:1 or 16:9 (develop mode).",
     },
     Binding {
         name: "reset",
@@ -672,17 +681,24 @@ pub struct Controller {
     /// so the crop can be grown as well as tightened. Off outside develop and
     /// dropped when the photo or mode changes; the surface keeps it.
     adjusting: bool,
+    /// The aspect the crop drag is locked to: a transient crop-tool setting,
+    /// not a `state` field, dropped on a photo or mode change but kept across a
+    /// surface resize and the crop-adjust toggle, so a ratio picked in one
+    /// governs the next drag either way.
+    aspect: Aspect,
 }
 
 /// A crop drag: the canvas it maps against (the develop preview's fitted
 /// rectangle, captured at the press so a fit reported mid-drag cannot re-map
 /// the gesture), the press anchor and the pointer's current point (both in
-/// surface pixels clamped into the canvas), and what the drag grips. The
-/// marquee (a tighten drag) is the bounding box of anchor and current.
+/// surface pixels clamped into the canvas), the aspect it is locked to (also
+/// frozen at the press), and what the drag grips. The marquee (a tighten drag)
+/// is the bounding box of anchor and current, snapped to the aspect.
 struct Drag {
     canvas: Rect,
     anchor: (i64, i64),
     current: (i64, i64),
+    aspect: Aspect,
     grip: Grip,
 }
 
@@ -711,6 +727,47 @@ enum Zone {
     Sw,
 }
 
+/// The aspect a crop drag is locked to: `Free` is any shape, the rest a fixed
+/// pixel ratio the drag holds. A transient crop-tool setting, not a `state`
+/// field and not saved to the sidecar -- the crop's own fractions record the
+/// achieved shape; the lock only shapes the next drag.
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum Aspect {
+    Free,
+    R3_2,
+    R4_3,
+    R1_1,
+    R16_9,
+}
+
+impl Aspect {
+    /// The tokens the `aspect` action takes, each with its pixel ratio; `Free`
+    /// has none.
+    const ALL: [(Aspect, &'static str, u32, u32); 5] = [
+        (Aspect::Free, "free", 0, 0),
+        (Aspect::R3_2, "3:2", 3, 2),
+        (Aspect::R4_3, "4:3", 4, 3),
+        (Aspect::R1_1, "1:1", 1, 1),
+        (Aspect::R16_9, "16:9", 16, 9),
+    ];
+
+    fn parse(token: &str) -> Option<Aspect> {
+        Self::ALL
+            .into_iter()
+            .find(|(_, name, _, _)| *name == token)
+            .map(|(aspect, _, _, _)| aspect)
+    }
+
+    /// The pixel ratio `(rw, rh)`, or `None` for `Free`.
+    fn ratio(self) -> Option<(u32, u32)> {
+        Self::ALL
+            .into_iter()
+            .find(|(aspect, _, _, _)| *aspect == self)
+            .filter(|(_, _, rw, rh)| *rw > 0 && *rh > 0)
+            .map(|(_, _, rw, rh)| (rw, rh))
+    }
+}
+
 /// The marquee a drag spans: the bounding box of its anchor and current.
 fn marquee_rect(drag: &Drag) -> Rect {
     let (ax, ay) = drag.anchor;
@@ -722,6 +779,40 @@ fn marquee_rect(drag: &Drag) -> Rect {
         y,
         width: (ax.max(cx) - x) as u32,
         height: (ay.max(cy) - y) as u32,
+    }
+}
+
+/// The marquee a drag paints and commits: the plain bounding box when the drag
+/// is `Free`, else snapped to its locked aspect.
+fn marquee_now(drag: &Drag) -> Rect {
+    match drag.aspect.ratio() {
+        None => marquee_rect(drag),
+        Some((rw, rh)) => marquee_snapped(drag, rw, rh),
+    }
+}
+
+/// The marquee snapped to the pixel ratio `rw:rh`: the largest ratio box that
+/// fits inside the raw bounding box of anchor and current, anchored at the press
+/// corner and extending toward the pointer. Canvas pixels throughout, so the
+/// ratio is the displayed image's pixel ratio; a zero raw edge stays zero (a
+/// click, which `drag_crop` rejects).
+fn marquee_snapped(drag: &Drag, rw: u32, rh: u32) -> Rect {
+    let (ax, ay) = drag.anchor;
+    let (cx, cy) = drag.current;
+    let raw_w = (cx - ax).abs();
+    let raw_h = (cy - ay).abs();
+    let (rw, rh) = (i64::from(rw), i64::from(rh));
+    // Reduce whichever dimension overshoots the ratio.
+    let (w, h) = if raw_w * rh > raw_h * rw {
+        (raw_h * rw / rh, raw_h)
+    } else {
+        (raw_w, raw_w * rh / rw)
+    };
+    Rect {
+        x: if cx >= ax { ax } else { ax - w },
+        y: if cy >= ay { ay } else { ay - h },
+        width: w.max(0) as u32,
+        height: h.max(0) as u32,
     }
 }
 
@@ -764,7 +855,14 @@ fn crop_on_canvas(canvas: Rect, crop: Crop) -> Rect {
 /// edge is confined to the unit square and kept at least `MIN_CROP_EDGE` from
 /// its opposite, so `Crop::new` (the safety net) accepts a valid `start`'s
 /// result; a full-frame result is the whole image (`FULL_CROP`).
-fn commit_crop(canvas: Rect, start: Crop, zone: Zone, dx: i64, dy: i64) -> Option<Crop> {
+fn commit_crop(
+    canvas: Rect,
+    start: Crop,
+    zone: Zone,
+    dx: i64,
+    dy: i64,
+    aspect: Aspect,
+) -> Option<Crop> {
     let unit = i64::from(library::CROP_UNIT);
     let min = i64::from(library::MIN_CROP_EDGE);
     // A canvas-pixel delta mapped to ten-thousandths, rounded to the nearest
@@ -783,6 +881,19 @@ fn commit_crop(canvas: Rect, start: Crop, zone: Zone, dx: i64, dy: i64) -> Optio
     };
     let fdx = frac(dx, canvas.width);
     let fdy = frac(dy, canvas.height);
+    // A locked aspect reshapes an edge or corner drag to hold the ratio, but
+    // only once the drag actually moves: a zero-delta grab keeps the free path
+    // so it paints the crop already shown rather than reshaping on the press
+    // (which a stationary release would then discard). `Move` is a translation,
+    // ratio-independent, and a degenerate canvas is guarded against division by
+    // zero -- both take the free path too.
+    if !matches!(zone, Zone::Move) && (fdx != 0 || fdy != 0) {
+        if let Some((rw, rh)) = aspect.ratio() {
+            if canvas.width > 0 && canvas.height > 0 {
+                return commit_locked(canvas, start, zone, fdx, fdy, rw, rh);
+            }
+        }
+    }
     let mut x0 = i64::from(start.x);
     let mut y0 = i64::from(start.y);
     let mut x1 = i64::from(start.x) + i64::from(start.width);
@@ -809,6 +920,170 @@ fn commit_crop(canvas: Rect, start: Crop, zone: Zone, dx: i64, dy: i64) -> Optio
         }
     }
     Crop::new(x0 as u32, y0 as u32, (x1 - x0) as u32, (y1 - y0) as u32).ok()
+}
+
+/// `a / b` rounded to the nearest, for `b > 0` and any sign of `a`.
+fn round_div(a: i128, b: i128) -> i128 {
+    if a >= 0 {
+        (a + b / 2) / b
+    } else {
+        -((-a + b / 2) / b)
+    }
+}
+
+/// The crop after a locked-aspect edge or corner drag: like `commit_crop`'s
+/// free path but holding the pixel ratio `rw:rh`. Since the ratio is in canvas
+/// pixels, in the crop's ten-thousandths it is `width : height =
+/// rw*canvas.height : rh*canvas.width`; `h_of_w`/`w_of_h` map one edge to the
+/// other. A corner drives the larger ratio box that reaches the pointer, capped
+/// to the space from its fixed opposite corner; an edge sets its own axis and
+/// centres the derived dimension on the crop's midline. The box is floored to a
+/// ratio-preserving `MIN_CROP_EDGE`, and is `None` when even that will not fit;
+/// `Crop::new` is the final safety net. `Move` never reaches here.
+fn commit_locked(
+    canvas: Rect,
+    start: Crop,
+    zone: Zone,
+    fdx: i64,
+    fdy: i64,
+    rw: u32,
+    rh: u32,
+) -> Option<Crop> {
+    let unit = i128::from(library::CROP_UNIT);
+    let min = i128::from(library::MIN_CROP_EDGE);
+    let cw = i128::from(canvas.width);
+    let ch = i128::from(canvas.height);
+    let rw = i128::from(rw);
+    let rh = i128::from(rh);
+    let h_of_w = |w: i128| round_div(w * cw * rh, ch * rw);
+    let w_of_h = |h: i128| round_div(h * ch * rw, cw * rh);
+    let (fdx, fdy) = (i128::from(fdx), i128::from(fdy));
+    let x0 = i128::from(start.x);
+    let y0 = i128::from(start.y);
+    let x1 = x0 + i128::from(start.width);
+    let y1 = y0 + i128::from(start.height);
+
+    // Reconcile a raw corner box to the ratio (the larger box that reaches the
+    // pointer), cap it to the space from the fixed opposite corner, then floor
+    // to a ratio-preserving minimum; `None` when even the minimum will not fit.
+    let corner = |raw_w: i128, raw_h: i128, aw: i128, ah: i128| -> Option<(i128, i128)> {
+        let (raw_w, raw_h) = (raw_w.max(0), raw_h.max(0));
+        let (mut w, mut h) = if raw_w >= w_of_h(raw_h) {
+            (raw_w, h_of_w(raw_w))
+        } else {
+            (w_of_h(raw_h), raw_h)
+        };
+        if w > aw {
+            w = aw;
+            h = h_of_w(aw);
+        }
+        if h > ah {
+            h = ah;
+            w = w_of_h(ah);
+        }
+        if w < min {
+            w = min;
+            h = h_of_w(min);
+        }
+        if h < min {
+            h = min;
+            w = w_of_h(min);
+        }
+        (w >= min && h >= min && w <= aw && h <= ah).then_some((w, h))
+    };
+
+    match zone {
+        Zone::Se => {
+            let (w, h) = corner(x1 + fdx - x0, y1 + fdy - y0, unit - x0, unit - y0)?;
+            Crop::new(x0 as u32, y0 as u32, w as u32, h as u32).ok()
+        }
+        Zone::Sw => {
+            let (w, h) = corner(x1 - (x0 + fdx), y1 + fdy - y0, x1, unit - y0)?;
+            Crop::new((x1 - w) as u32, y0 as u32, w as u32, h as u32).ok()
+        }
+        Zone::Ne => {
+            let (w, h) = corner(x1 + fdx - x0, y1 - (y0 + fdy), unit - x0, y1)?;
+            Crop::new(x0 as u32, (y1 - h) as u32, w as u32, h as u32).ok()
+        }
+        Zone::Nw => {
+            let (w, h) = corner(x1 - (x0 + fdx), y1 - (y0 + fdy), x1, y1)?;
+            Crop::new((x1 - w) as u32, (y1 - h) as u32, w as u32, h as u32).ok()
+        }
+        Zone::E | Zone::W => {
+            // The dragged edge sets the width; the height is derived and centred
+            // on the crop's horizontal midline (kept doubled to avoid a rounding
+            // bias). The far vertical edges cap the centred height.
+            let aw = if matches!(zone, Zone::E) {
+                unit - x0
+            } else {
+                x1
+            };
+            let raw_w = if matches!(zone, Zone::E) {
+                x1 + fdx - x0
+            } else {
+                x1 - (x0 + fdx)
+            };
+            let mid2 = y0 + y1;
+            let ah = mid2.min(2 * unit - mid2);
+            let mut w = raw_w.max(0).min(aw);
+            let mut h = h_of_w(w);
+            if h > ah {
+                h = ah;
+                w = w_of_h(ah);
+            }
+            if w < min {
+                w = min;
+                h = h_of_w(min);
+            }
+            if h < min {
+                h = min;
+                w = w_of_h(min);
+            }
+            if w < min || h < min || w > aw || h > ah {
+                return None;
+            }
+            let top = (mid2 - h) / 2;
+            let x = if matches!(zone, Zone::E) { x0 } else { x1 - w };
+            Crop::new(x as u32, top as u32, w as u32, h as u32).ok()
+        }
+        Zone::N | Zone::S => {
+            // Symmetric: the dragged edge sets the height, the width derived and
+            // centred on the crop's vertical midline.
+            let ah = if matches!(zone, Zone::S) {
+                unit - y0
+            } else {
+                y1
+            };
+            let raw_h = if matches!(zone, Zone::S) {
+                y1 + fdy - y0
+            } else {
+                y1 - (y0 + fdy)
+            };
+            let mid2 = x0 + x1;
+            let aw = mid2.min(2 * unit - mid2);
+            let mut h = raw_h.max(0).min(ah);
+            let mut w = w_of_h(h);
+            if w > aw {
+                w = aw;
+                h = h_of_w(aw);
+            }
+            if h < min {
+                h = min;
+                w = w_of_h(min);
+            }
+            if w < min {
+                w = min;
+                h = h_of_w(min);
+            }
+            if w < min || h < min || w > aw || h > ah {
+                return None;
+            }
+            let left = (mid2 - w) / 2;
+            let y = if matches!(zone, Zone::S) { y0 } else { y1 - h };
+            Crop::new(left as u32, y as u32, w as u32, h as u32).ok()
+        }
+        Zone::Move => None,
+    }
 }
 
 /// A value confined to `[lo, hi]` without the `clamp` panic when `hi < lo`
@@ -869,6 +1144,7 @@ impl Controller {
             preview_fit: None,
             drag: None,
             adjusting: false,
+            aspect: Aspect::Free,
         }
     }
 
@@ -895,6 +1171,7 @@ impl Controller {
         self.first_row = 0;
         self.drag = None;
         self.adjusting = false;
+        self.aspect = Aspect::Free;
         self.preview_fit = None;
         self.refresh_shown();
         self.cursor = self.shown.first().copied();
@@ -1020,7 +1297,7 @@ impl Controller {
     /// drag is in progress: what the scene outlines over the cropped preview.
     pub fn crop_drag(&self) -> Option<Rect> {
         match self.drag.as_ref() {
-            Some(drag) if matches!(drag.grip, Grip::Marquee) => Some(marquee_rect(drag)),
+            Some(drag) if matches!(drag.grip, Grip::Marquee) => Some(marquee_now(drag)),
             _ => None,
         }
     }
@@ -1041,7 +1318,7 @@ impl Controller {
                 // `commit_crop` the release uses, so the overlay is exactly the
                 // crop that will commit -- no snap and no mid-drag re-mapping if
                 // a fresh fit arrives.
-                let crop = commit_crop(drag.canvas, crop, zone, dx, dy)?;
+                let crop = commit_crop(drag.canvas, crop, zone, dx, dy, drag.aspect)?;
                 return Some(crop_on_canvas(drag.canvas, crop));
             }
         }
@@ -1071,7 +1348,7 @@ impl Controller {
         let rect = if self.adjusting {
             self.crop_adjust_rect()
         } else {
-            self.drag.as_ref().map(marquee_rect)
+            self.drag.as_ref().map(marquee_now)
         };
         rect.filter(|rect| rect.width > 0 && rect.height > 0)
             .map(|rect| (self.adjusting, rect))
@@ -1371,6 +1648,7 @@ impl Controller {
             (Action::Look, [stem]) => return self.set_look(stem, effects),
             (Action::Crop, [x, y, w, h]) => return self.set_crop(x, y, w, h, effects),
             (Action::AdjustCrop, []) => self.toggle_adjust()?,
+            (Action::Aspect, [ratio]) => return self.set_aspect(ratio, effects),
             (Action::Reset, []) => return self.reset_develop(effects),
             _ => return Err(control::Error::Protocol.into()),
         };
@@ -1471,6 +1749,7 @@ impl Controller {
                     canvas,
                     anchor: point,
                     current: point,
+                    aspect: self.aspect,
                     grip: Grip::Marquee,
                 });
                 Ok(self.outline_changed(before))
@@ -1495,10 +1774,11 @@ impl Controller {
                 // The release point ends the gesture as a move to it would, so
                 // a press then release with no move between still selects.
                 let current = clamp_into(canvas, x, y);
-                let marquee = marquee_rect(&Drag {
+                let marquee = marquee_now(&Drag {
                     canvas,
                     anchor: drag.anchor,
                     current,
+                    aspect: drag.aspect,
                     grip: Grip::Marquee,
                 });
                 // The marquee leaves the frame on release; if it was painted,
@@ -1561,6 +1841,7 @@ impl Controller {
                     canvas,
                     anchor: point,
                     current: point,
+                    aspect: self.aspect,
                     grip: Grip::Handle { zone, crop },
                 });
                 // Grabbing a handle paints the same rectangle already shown, so
@@ -1595,7 +1876,7 @@ impl Controller {
                     return Ok(self.outline_changed(before));
                 }
                 let commit = self.cursor.and_then(|index| {
-                    commit_crop(canvas, start, zone, dx, dy).map(|crop| (index, crop))
+                    commit_crop(canvas, start, zone, dx, dy, drag.aspect).map(|crop| (index, crop))
                 });
                 match commit {
                     Some((index, crop)) => {
@@ -1695,6 +1976,7 @@ impl Controller {
             self.mode = Mode::Cull;
             self.view = View::Grid;
             self.drag = None;
+            self.aspect = Aspect::Free;
             return Outcome::Changed;
         }
         self.set_view(View::Grid)
@@ -1732,6 +2014,7 @@ impl Controller {
         self.view = View::Grid;
         self.drag = None;
         self.adjusting = false;
+        self.aspect = Aspect::Free;
         Ok(Outcome::Changed)
     }
 
@@ -1834,6 +2117,33 @@ impl Controller {
         )
     }
 
+    /// Locks the crop drag to `ratio` (`free`, `3:2`, `4:3`, `1:1`, `16:9`), an
+    /// unknown token being `BadArgument`. Picking a ratio only arms the lock for
+    /// the next drag; it never reshapes the current crop, so it is always
+    /// `Ignored` (no `Edit`, no generation bump). The lock is transient
+    /// controller state, not a `state` field or sidecar key.
+    fn set_aspect(
+        &mut self,
+        ratio: &str,
+        effects: Vec<Effect>,
+    ) -> Result<(Outcome, Vec<Effect>), Error> {
+        if self.develop_photo()?.is_none() {
+            return Ok((Outcome::Ignored, effects));
+        }
+        // Arm the lock for the next drag; picking a ratio never reshapes the
+        // current crop on its own. An immediate snap would run against the
+        // canvas last reported for the *cropped* preview: crop-adjust develops
+        // the frame uncropped only asynchronously, so a snap issued before that
+        // fit lands would read the cropped preview's aspect as the whole
+        // image's and silently commit a wrong-ratio crop, with no visible drag
+        // to reveal it. Reshaping instead flows through a drag -- which the eye
+        // follows and which self-corrects once the uncropped fit arrives -- and
+        // the immediate snap-on-pick waits for the slice that reports the
+        // displayed crop alongside the fit.
+        self.aspect = Aspect::parse(ratio).ok_or(Error::BadArgument)?;
+        Ok((Outcome::Ignored, effects))
+    }
+
     /// Resets the cursor photo's develop keys to camera defaults, keeping
     /// the flag.
     fn reset_develop(&mut self, effects: Vec<Effect>) -> Result<(Outcome, Vec<Effect>), Error> {
@@ -1858,16 +2168,18 @@ impl Controller {
     fn keep_cursor_shown(&mut self) {
         if self.position().is_none() {
             self.cursor = self.shown.first().copied();
-            // The cursor left the photo the drag and crop-adjust were for; end
-            // them.
+            // The cursor left the photo the drag, crop-adjust and aspect lock
+            // were for; end them.
             self.drag = None;
             self.adjusting = false;
+            self.aspect = Aspect::Free;
         }
         if self.cursor.is_none() {
             self.view = View::Grid;
             self.mode = Mode::Cull;
             self.drag = None;
             self.adjusting = false;
+            self.aspect = Aspect::Free;
         }
         self.reveal();
     }
@@ -1891,10 +2203,11 @@ impl Controller {
             return Ok(Outcome::Ignored);
         }
         self.cursor = Some(index);
-        // The cursor moved off the photo the drag and crop-adjust were for; end
-        // them.
+        // The cursor moved off the photo the drag, crop-adjust and aspect lock
+        // were for; end them.
         self.drag = None;
         self.adjusting = false;
+        self.aspect = Aspect::Free;
         self.reveal();
         Ok(Outcome::Changed)
     }

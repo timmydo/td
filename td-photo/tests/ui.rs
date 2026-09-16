@@ -136,7 +136,7 @@ fn the_action_table_is_closed_aligned_and_reachable() {
         match binding.chord {
             None => {
                 assert!(
-                    ["open", "select", "scroll", "look", "crop"].contains(&binding.name),
+                    ["open", "select", "scroll", "look", "crop", "aspect"].contains(&binding.name),
                     "{} has no key",
                     binding.name
                 );
@@ -1197,7 +1197,7 @@ fn the_binary_replays_the_cull_over_a_roll_and_writes_through_the_sidecar() {
             "1"
         ]
     );
-    assert_eq!(&reply(2)[..2], ["ok", "30"]);
+    assert_eq!(&reply(2)[..2], ["ok", "31"]);
     assert_eq!(reply(3), ["ok", "changed"]);
     assert_eq!(reply(4), ["ok", &name(1), "pick", "-", "-", "-", "ok", "-"]);
     assert_eq!(
@@ -2805,4 +2805,379 @@ fn opening_a_roll_clears_the_crop_adjust_sub_mode() {
     assert!(!c.adjusting());
     assert_eq!(c.crop_adjust_rect(), None);
     assert_eq!(c.mode(), ui::Mode::Cull);
+}
+
+// ---- crop aspect presets (5(e) fourth slice) ----
+
+/// Opens a roll, enters develop, sets an optional crop, and reports `canvas`
+/// as the develop preview's fitted rectangle. Crop-adjust is left off.
+fn develop_at(canvas: Rect, crop: &[&str]) -> Controller {
+    let mut c = Controller::new(surface(800, 600));
+    c.open("roll", b"/r", photos(5)).unwrap();
+    assert_eq!(act(&mut c, "develop", &[]), Outcome::Changed);
+    if !crop.is_empty() {
+        assert_eq!(carry(&mut c, "crop", crop), Outcome::Changed);
+    }
+    c.set_preview_fit(Some(canvas));
+    c
+}
+
+#[test]
+fn a_locked_corner_drag_maps_the_ratio_in_pixel_space() {
+    // A 4:3-pixel canvas: a 3:2-pixel lock is a 9:8 box in fractions, so this
+    // proves the ratio is applied in the canvas's pixel space, not in fractions.
+    // The crop starts 4:3 in pixels (200x150), not the locked 3:2.
+    let mut c = develop_at(
+        Rect {
+            x: 0,
+            y: 0,
+            width: 400,
+            height: 300,
+        },
+        &["0.2500", "0.2500", "0.5000", "0.5000"],
+    );
+    assert_eq!(act(&mut c, "adjust-crop", &[]), Outcome::Changed);
+    // Picking a ratio only arms the lock; it never reshapes the crop on its own
+    // (an immediate snap could read a stale cropped fit as the whole image's
+    // aspect and commit a wrong-ratio crop). Reshaping flows through the drag.
+    assert_eq!(act(&mut c, "aspect", &["3:2"]), Outcome::Ignored);
+    // Grabbing the south-east corner paints the crop already shown, not a
+    // reshaped ratio box: a zero-delta grab keeps the free path.
+    assert_eq!(press(&mut c, 300, 225), Outcome::Ignored);
+    assert_eq!(
+        c.crop_adjust_rect(),
+        Some(Rect {
+            x: 100,
+            y: 75,
+            width: 200,
+            height: 150,
+        })
+    );
+    // Dragging the corner out holds 3:2 in pixels: 300x200 on screen, a 9:8
+    // box in the crop's fractions; the live overlay is already the committed
+    // box.
+    assert_eq!(drag_to(&mut c, 400, 300), Outcome::Changed);
+    assert_eq!(
+        c.crop_adjust_rect(),
+        Some(Rect {
+            x: 100,
+            y: 75,
+            width: 300,
+            height: 200,
+        })
+    );
+    let (outcome, effects) = release(&mut c, 400, 300);
+    assert_eq!(outcome, Outcome::Changed);
+    assert_eq!(
+        effects,
+        [Effect::Edit {
+            index: 0,
+            name: file(0),
+            key: Key::Crop,
+            value: Some("0.2500 0.2500 0.7500 0.6667".to_string()),
+        }]
+    );
+    assert_eq!(apply(&mut c, &effects).unwrap(), Outcome::Changed);
+    assert_eq!(fields(&c)[CROP], "0.2500 0.2500 0.7500 0.6667");
+}
+
+#[test]
+fn a_locked_grab_without_moving_neither_reshapes_nor_commits() {
+    // A lock armed while the crop does not match it (here armed in plain
+    // develop, before entering crop-adjust, over the full frame). Grabbing a
+    // handle must paint the crop already shown -- not reshape to the ratio on
+    // the press and then discard it on a stationary release.
+    let mut c = develop_at(
+        Rect {
+            x: 0,
+            y: 0,
+            width: 600,
+            height: 400,
+        },
+        &[],
+    );
+    assert_eq!(act(&mut c, "aspect", &["1:1"]), Outcome::Ignored);
+    assert_eq!(act(&mut c, "adjust-crop", &[]), Outcome::Changed);
+    let full = Rect {
+        x: 0,
+        y: 0,
+        width: 600,
+        height: 400,
+    };
+    assert_eq!(c.crop_adjust_rect(), Some(full));
+    let crop_before = fields(&c)[CROP].clone();
+    // The grab does not reshape the full-frame overlay to a square.
+    assert_eq!(press(&mut c, 0, 0), Outcome::Ignored);
+    assert_eq!(c.crop_adjust_rect(), Some(full));
+    // Releasing without moving commits nothing and leaves the crop untouched.
+    let (outcome, effects) = release(&mut c, 0, 0);
+    assert_eq!(outcome, Outcome::Ignored);
+    assert!(effects.is_empty());
+    assert_eq!(fields(&c)[CROP], crop_before);
+}
+
+#[test]
+fn a_corner_drag_holds_the_locked_ratio() {
+    let mut c = develop_at(
+        Rect {
+            x: 0,
+            y: 0,
+            width: 600,
+            height: 400,
+        },
+        &["0.2500", "0.0000", "0.5000", "0.5000"],
+    );
+    assert_eq!(act(&mut c, "adjust-crop", &[]), Outcome::Changed);
+    // Arming the lock paints nothing; the crop starts 3:2 in pixels (300x200)
+    // and a locked drag holds that ratio.
+    assert_eq!(act(&mut c, "aspect", &["3:2"]), Outcome::Ignored);
+    // Drag the south-east corner out to the canvas: the box grows holding 3:2,
+    // capped by the canvas edge; the live overlay is already the committed box.
+    assert_eq!(press(&mut c, 450, 200), Outcome::Ignored);
+    assert_eq!(drag_to(&mut c, 600, 400), Outcome::Changed);
+    assert_eq!(
+        c.crop_adjust_rect(),
+        Some(Rect {
+            x: 150,
+            y: 0,
+            width: 450,
+            height: 300,
+        })
+    );
+    let (outcome, effects) = release(&mut c, 600, 400);
+    assert_eq!(outcome, Outcome::Changed);
+    assert_eq!(
+        effects,
+        [Effect::Edit {
+            index: 0,
+            name: file(0),
+            key: Key::Crop,
+            value: Some("0.2500 0.0000 0.7500 0.7500".to_string()),
+        }]
+    );
+}
+
+#[test]
+fn an_edge_drag_under_a_lock_adjusts_the_orthogonal_dimension() {
+    let mut c = develop_at(
+        Rect {
+            x: 0,
+            y: 0,
+            width: 600,
+            height: 400,
+        },
+        &["0.2500", "0.2500", "0.5000", "0.5000"],
+    );
+    assert_eq!(act(&mut c, "adjust-crop", &[]), Outcome::Changed);
+    assert_eq!(act(&mut c, "aspect", &["3:2"]), Outcome::Ignored);
+    // Drag the east edge inward: the width shrinks and the height follows to
+    // hold 3:2, centred on the crop's old horizontal midline.
+    assert_eq!(press(&mut c, 450, 200), Outcome::Ignored);
+    assert_eq!(drag_to(&mut c, 390, 200), Outcome::Changed);
+    let (_, effects) = release(&mut c, 390, 200);
+    assert_eq!(
+        effects,
+        [Effect::Edit {
+            index: 0,
+            name: file(0),
+            key: Key::Crop,
+            value: Some("0.2500 0.3000 0.4000 0.4000".to_string()),
+        }]
+    );
+}
+
+#[test]
+fn a_one_to_one_lock_keeps_a_square_in_pixels() {
+    let mut c = develop_at(
+        Rect {
+            x: 0,
+            y: 0,
+            width: 400,
+            height: 400,
+        },
+        &[],
+    );
+    assert_eq!(act(&mut c, "adjust-crop", &[]), Outcome::Changed);
+    // Arming the lock paints nothing (the full image is already 1:1 here).
+    assert_eq!(act(&mut c, "aspect", &["1:1"]), Outcome::Ignored);
+    // Drag the north-west corner in: the box stays square in pixels.
+    assert_eq!(press(&mut c, 0, 0), Outcome::Ignored);
+    assert_eq!(drag_to(&mut c, 100, 100), Outcome::Changed);
+    assert_eq!(
+        c.crop_adjust_rect(),
+        Some(Rect {
+            x: 100,
+            y: 100,
+            width: 300,
+            height: 300,
+        })
+    );
+    let (_, effects) = release(&mut c, 100, 100);
+    assert_eq!(
+        effects,
+        [Effect::Edit {
+            index: 0,
+            name: file(0),
+            key: Key::Crop,
+            value: Some("0.2500 0.2500 0.7500 0.7500".to_string()),
+        }]
+    );
+}
+
+#[test]
+fn switching_the_lock_back_to_free_releases_the_constraint() {
+    let mut c = develop_at(
+        Rect {
+            x: 0,
+            y: 0,
+            width: 600,
+            height: 400,
+        },
+        &["0.2500", "0.2500", "0.5000", "0.5000"],
+    );
+    assert_eq!(act(&mut c, "adjust-crop", &[]), Outcome::Changed);
+    assert_eq!(act(&mut c, "aspect", &["3:2"]), Outcome::Ignored);
+    // Back to free: an east-edge drag now changes the width alone, leaving the
+    // height at 0.5000 (the pre-lock free behaviour).
+    assert_eq!(act(&mut c, "aspect", &["free"]), Outcome::Ignored);
+    assert_eq!(press(&mut c, 450, 200), Outcome::Ignored);
+    assert_eq!(drag_to(&mut c, 390, 200), Outcome::Changed);
+    let (_, effects) = release(&mut c, 390, 200);
+    assert_eq!(
+        effects,
+        [Effect::Edit {
+            index: 0,
+            name: file(0),
+            key: Key::Crop,
+            value: Some("0.2500 0.2500 0.4000 0.5000".to_string()),
+        }]
+    );
+}
+
+#[test]
+fn a_locked_edge_drag_clamps_to_the_minimum_holding_the_ratio() {
+    let mut c = develop_at(
+        Rect {
+            x: 0,
+            y: 0,
+            width: 600,
+            height: 400,
+        },
+        &["0.2500", "0.2500", "0.5000", "0.5000"],
+    );
+    assert_eq!(act(&mut c, "adjust-crop", &[]), Outcome::Changed);
+    assert_eq!(act(&mut c, "aspect", &["3:2"]), Outcome::Ignored);
+    // Drag the east edge far in: both edges pin to the minimum (0.0500) while
+    // holding 3:2, never past it.
+    assert_eq!(press(&mut c, 450, 200), Outcome::Ignored);
+    assert_eq!(drag_to(&mut c, 100, 200), Outcome::Changed);
+    let (_, effects) = release(&mut c, 100, 200);
+    assert_eq!(
+        effects,
+        [Effect::Edit {
+            index: 0,
+            name: file(0),
+            key: Key::Crop,
+            value: Some("0.2500 0.4750 0.0500 0.0500".to_string()),
+        }]
+    );
+}
+
+#[test]
+fn a_locked_tighten_marquee_snaps_the_selection() {
+    let mut c = develop_at(
+        Rect {
+            x: 0,
+            y: 0,
+            width: 600,
+            height: 400,
+        },
+        &[],
+    );
+    // Not in crop-adjust: the lock arms the tighten marquee too, and survives
+    // the sub-mode boundary.
+    assert_eq!(act(&mut c, "aspect", &["3:2"]), Outcome::Ignored);
+    assert_eq!(press(&mut c, 0, 0), Outcome::Ignored);
+    assert_eq!(drag_to(&mut c, 600, 300), Outcome::Changed);
+    assert_eq!(
+        c.crop_drag(),
+        Some(Rect {
+            x: 0,
+            y: 0,
+            width: 450,
+            height: 300,
+        })
+    );
+    let (_, effects) = release(&mut c, 600, 300);
+    assert_eq!(
+        effects,
+        [Effect::Edit {
+            index: 0,
+            name: file(0),
+            key: Key::Crop,
+            value: Some("0.0000 0.0000 0.7500 0.7500".to_string()),
+        }]
+    );
+}
+
+#[test]
+fn the_lock_is_dropped_on_a_photo_switch() {
+    let mut c = develop_at(
+        Rect {
+            x: 0,
+            y: 0,
+            width: 600,
+            height: 400,
+        },
+        &[],
+    );
+    assert_eq!(act(&mut c, "adjust-crop", &[]), Outcome::Changed);
+    assert_eq!(act(&mut c, "aspect", &["3:2"]), Outcome::Ignored);
+    assert!(c.adjusting());
+    // Moving to another photo ends the sub-mode and the lock.
+    assert_eq!(act(&mut c, "next", &[]), Outcome::Changed);
+    assert!(!c.adjusting());
+    // A fresh tighten marquee is unconstrained: a square drag stays square, so
+    // the 3:2 lock did not survive the switch.
+    assert_eq!(press(&mut c, 100, 100), Outcome::Ignored);
+    assert_eq!(drag_to(&mut c, 400, 400), Outcome::Changed);
+    assert_eq!(
+        c.crop_drag(),
+        Some(Rect {
+            x: 100,
+            y: 100,
+            width: 300,
+            height: 300,
+        })
+    );
+}
+
+#[test]
+fn a_bad_aspect_token_or_wrong_mode_is_refused() {
+    let mut c = develop_at(
+        Rect {
+            x: 0,
+            y: 0,
+            width: 600,
+            height: 400,
+        },
+        &[],
+    );
+    // In develop, an unknown ratio token is a bad argument, judged before any
+    // write.
+    assert!(matches!(
+        c.action("aspect", &["2:0"]),
+        Err(ui::Error::BadArgument)
+    ));
+    assert!(matches!(
+        c.action("aspect", &["square"]),
+        Err(ui::Error::BadArgument)
+    ));
+    // In cull the aspect action is not this mode's: Ignored, no effect (and no
+    // argument judgement).
+    assert_eq!(act(&mut c, "grid", &[]), Outcome::Changed);
+    assert_eq!(c.mode(), ui::Mode::Cull);
+    let (outcome, effects) = c.action("aspect", &["3:2"]).unwrap();
+    assert_eq!(outcome, Outcome::Ignored);
+    assert!(effects.is_empty());
 }
