@@ -22,7 +22,7 @@ use td_photo::library::{self, Filter, Flag, Key, Sidecar};
 use td_photo::ui::{self, Action, Controller, Effect, Photo, View, BINDINGS};
 use td_ui::control::{frame, hex, valid_code, Decoder, ErrorCode};
 use td_ui::driven::{self, Input, Outcome, PointerPhase};
-use td_ui::raster::{Scale, Surface};
+use td_ui::raster::{Rect, Scale, Surface};
 
 const MODE: usize = 0;
 const SHOWN: usize = 3;
@@ -99,6 +99,29 @@ fn press(controller: &mut Controller, x: u32, y: u32) -> Outcome {
         })
         .unwrap()
         .0
+}
+
+fn drag_to(controller: &mut Controller, x: u32, y: u32) -> Outcome {
+    controller
+        .input(Input::Pointer {
+            phase: PointerPhase::Move,
+            x,
+            y,
+        })
+        .unwrap()
+        .0
+}
+
+/// A pointer release carries effects (a crop commit), so it returns the
+/// full pair, unlike `press`/`drag_to` which never emit one.
+fn release(controller: &mut Controller, x: u32, y: u32) -> (Outcome, Vec<Effect>) {
+    controller
+        .input(Input::Pointer {
+            phase: PointerPhase::Release,
+            x,
+            y,
+        })
+        .unwrap()
 }
 
 #[test]
@@ -2070,4 +2093,427 @@ fn the_develop_box_is_the_preview_box_only_in_develop_mode() {
     assert_eq!(act(&mut small, "develop", &[]), Outcome::Changed);
     assert_eq!(small.layout().preview_box(), None);
     assert_eq!(small.develop_box(), None);
+}
+
+#[test]
+fn a_crop_drag_over_the_preview_selects_a_sub_region() {
+    let mut c = Controller::new(surface(800, 600));
+    c.open("roll", b"/r", photos(5)).unwrap();
+    assert_eq!(act(&mut c, "develop", &[]), Outcome::Changed);
+    assert_eq!(c.crop_drag(), None);
+
+    // The adapter reports the developed image's fitted rectangle as a fact,
+    // the drag's canvas; like the job count it never bumps the generation,
+    // only the marquee the model derives from it does.
+    let canvas = Rect {
+        x: 100,
+        y: 100,
+        width: 400,
+        height: 300,
+    };
+    let quiet = fields(&c)[GENERATION].clone();
+    c.set_preview_fit(Some(canvas));
+    assert_eq!(fields(&c)[GENERATION], quiet);
+    assert_eq!(c.crop_drag(), None);
+
+    // A press inside the canvas arms a zero-size marquee: invisible, so no
+    // frame change and no generation bump yet.
+    assert_eq!(press(&mut c, 200, 150), Outcome::Ignored);
+    assert_eq!(
+        c.crop_drag(),
+        Some(Rect {
+            x: 200,
+            y: 150,
+            width: 0,
+            height: 0,
+        })
+    );
+    assert_eq!(fields(&c)[GENERATION], quiet);
+
+    // A move rubber-bands the marquee: the frame changes, so a bump.
+    assert_eq!(drag_to(&mut c, 400, 300), Outcome::Changed);
+    assert_eq!(
+        c.crop_drag(),
+        Some(Rect {
+            x: 200,
+            y: 150,
+            width: 200,
+            height: 150,
+        })
+    );
+    assert_ne!(fields(&c)[GENERATION], quiet);
+
+    // The release commits the selected fractions of the canvas as the crop,
+    // through the same Edit the `crop` action emits, and the marquee is gone.
+    // dx/dy = 100/50 of 400x300, dw/dh = 200/150: x=0.2500, y=0.1666 (floor),
+    // w=h=0.5000 of the whole (uncropped) image.
+    let (outcome, effects) = release(&mut c, 400, 300);
+    assert_eq!(outcome, Outcome::Changed);
+    assert_eq!(
+        effects,
+        [Effect::Edit {
+            index: 0,
+            name: file(0),
+            key: Key::Crop,
+            value: Some("0.2500 0.1666 0.5000 0.5000".to_string()),
+        }]
+    );
+    assert_eq!(c.crop_drag(), None);
+
+    // Settling the effect records the crop; the state reads it back.
+    assert_eq!(apply(&mut c, &effects).unwrap(), Outcome::Changed);
+    assert_eq!(fields(&c)[CROP], "0.2500 0.1666 0.5000 0.5000");
+}
+
+#[test]
+fn a_crop_drag_composes_with_the_current_crop() {
+    let mut c = Controller::new(surface(800, 600));
+    c.open("roll", b"/r", photos(5)).unwrap();
+    assert_eq!(act(&mut c, "develop", &[]), Outcome::Changed);
+
+    // Start from a crop already on the photo: a centred half.
+    assert_eq!(
+        carry(&mut c, "crop", &["0.2500", "0.1666", "0.5000", "0.5000"]),
+        Outcome::Changed
+    );
+    assert_eq!(fields(&c)[CROP], "0.2500 0.1666 0.5000 0.5000");
+
+    let canvas = Rect {
+        x: 100,
+        y: 100,
+        width: 400,
+        height: 300,
+    };
+    c.set_preview_fit(Some(canvas));
+
+    // A marquee over the canvas selects a sub-region of the *current* crop,
+    // not the whole image. From the canvas top-left, 200x150 of 400x300 is
+    // the top-left quarter-area; composed with the current crop (w=h=0.5000)
+    // that leaves x=0.2500, y=0.1666 and shrinks w=h to 0.2500 -- a subset.
+    assert_eq!(press(&mut c, 100, 100), Outcome::Ignored);
+    assert_eq!(drag_to(&mut c, 300, 250), Outcome::Changed);
+    let (outcome, effects) = release(&mut c, 300, 250);
+    assert_eq!(outcome, Outcome::Changed);
+    assert_eq!(
+        effects,
+        [Effect::Edit {
+            index: 0,
+            name: file(0),
+            key: Key::Crop,
+            value: Some("0.2500 0.1666 0.2500 0.2500".to_string()),
+        }]
+    );
+    assert_eq!(apply(&mut c, &effects).unwrap(), Outcome::Changed);
+    assert_eq!(fields(&c)[CROP], "0.2500 0.1666 0.2500 0.2500");
+}
+
+#[test]
+fn a_crop_drag_refuses_clicks_tiny_marquees_and_off_canvas_presses() {
+    let mut c = Controller::new(surface(800, 600));
+    c.open("roll", b"/r", photos(5)).unwrap();
+    assert_eq!(act(&mut c, "develop", &[]), Outcome::Changed);
+    let canvas = Rect {
+        x: 100,
+        y: 100,
+        width: 400,
+        height: 300,
+    };
+    c.set_preview_fit(Some(canvas));
+
+    // A press off the canvas arms no drag: the far edges are exclusive.
+    assert_eq!(press(&mut c, 50, 50), Outcome::Ignored);
+    assert_eq!(c.crop_drag(), None);
+    assert_eq!(press(&mut c, 500, 200), Outcome::Ignored);
+    assert_eq!(c.crop_drag(), None);
+
+    // A move or release with no drag armed is inert.
+    assert_eq!(drag_to(&mut c, 300, 250), Outcome::Ignored);
+    assert_eq!(release(&mut c, 300, 250).0, Outcome::Ignored);
+    assert_eq!(c.crop_drag(), None);
+
+    // A plain click -- press and release with no move -- is a zero-size
+    // marquee: nothing selected, no effect, no change.
+    assert_eq!(press(&mut c, 200, 150), Outcome::Ignored);
+    let (outcome, effects) = release(&mut c, 200, 150);
+    assert_eq!(outcome, Outcome::Ignored);
+    assert!(effects.is_empty());
+    assert_eq!(c.crop_drag(), None);
+
+    // A marquee that maps under the minimum edge selects nothing, but a
+    // visible marquee that then vanishes is still a frame change: Changed
+    // with no effect. 12px of 400 is 0.0300, under the 0.0500 minimum edge.
+    assert_eq!(press(&mut c, 200, 150), Outcome::Ignored);
+    assert_eq!(drag_to(&mut c, 212, 165), Outcome::Changed);
+    let (outcome, effects) = release(&mut c, 212, 165);
+    assert_eq!(outcome, Outcome::Changed);
+    assert!(effects.is_empty());
+    assert_eq!(c.crop_drag(), None);
+    assert_eq!(fields(&c)[CROP], "-");
+}
+
+#[test]
+fn the_crop_drag_uses_the_develop_box_when_no_fit_is_reported() {
+    let mut c = Controller::new(surface(800, 600));
+    c.open("roll", b"/r", photos(5)).unwrap();
+
+    // In the cull grid the pointer culls, never crops: a move and release
+    // are inert and no marquee is ever armed.
+    assert_eq!(c.crop_drag(), None);
+    assert_eq!(drag_to(&mut c, 300, 250), Outcome::Ignored);
+    assert_eq!(release(&mut c, 300, 250).0, Outcome::Ignored);
+    assert_eq!(c.crop_drag(), None);
+
+    // In develop mode with no fitted rectangle reported, the develop box is
+    // the fallback canvas: a press at its centre arms a marquee.
+    assert_eq!(act(&mut c, "develop", &[]), Outcome::Changed);
+    let box_rect = c.develop_box().unwrap();
+    let cx = u32::try_from(box_rect.x + i64::from(box_rect.width) / 2).unwrap();
+    let cy = u32::try_from(box_rect.y + i64::from(box_rect.height) / 2).unwrap();
+    assert_eq!(press(&mut c, cx, cy), Outcome::Ignored);
+    assert_eq!(
+        c.crop_drag(),
+        Some(Rect {
+            x: i64::from(cx),
+            y: i64::from(cy),
+            width: 0,
+            height: 0,
+        })
+    );
+
+    // Leaving develop for the grid drops the drag.
+    assert_eq!(act(&mut c, "grid", &[]), Outcome::Changed);
+    assert_eq!(c.crop_drag(), None);
+}
+
+#[test]
+fn the_crop_marquee_is_drawn_into_the_scene_frame() {
+    let mut c = Controller::new(surface(800, 600));
+    c.open("roll", b"/r", photos(5)).unwrap();
+    assert_eq!(act(&mut c, "develop", &[]), Outcome::Changed);
+    c.set_preview_fit(Some(Rect {
+        x: 100,
+        y: 100,
+        width: 400,
+        height: 300,
+    }));
+
+    // The scene paints the develop placeholder; the marquee is witnessed by
+    // the frame, not `state`, so it lands in the seam's own paint (the replay
+    // `frame` and the `--preview` PPM), not just the model.
+    let bare = driven::fnv1a64(&driven::paint(&c.scene()).unwrap().rgb);
+
+    // Arming a zero-size marquee draws nothing: the frame is unchanged.
+    assert_eq!(press(&mut c, 200, 150), Outcome::Ignored);
+    assert_eq!(
+        driven::fnv1a64(&driven::paint(&c.scene()).unwrap().rgb),
+        bare
+    );
+
+    // Rubber-banding it outlines a rectangle over the preview: the frame
+    // differs.
+    assert_eq!(drag_to(&mut c, 400, 300), Outcome::Changed);
+    let marked = driven::fnv1a64(&driven::paint(&c.scene()).unwrap().rgb);
+    assert_ne!(marked, bare);
+
+    // The release takes the drag (its crop is an effect the adapter settles,
+    // not the scene): the marquee is gone and the frame is the bare one again.
+    let (_, effects) = release(&mut c, 400, 300);
+    assert!(!effects.is_empty());
+    assert_eq!(
+        driven::fnv1a64(&driven::paint(&c.scene()).unwrap().rgb),
+        bare
+    );
+}
+
+#[test]
+fn a_horizontal_or_vertical_crop_drag_paints_nothing() {
+    let mut c = Controller::new(surface(800, 600));
+    c.open("roll", b"/r", photos(5)).unwrap();
+    assert_eq!(act(&mut c, "develop", &[]), Outcome::Changed);
+    c.set_preview_fit(Some(Rect {
+        x: 100,
+        y: 100,
+        width: 400,
+        height: 300,
+    }));
+    let bare = driven::fnv1a64(&driven::paint(&c.scene()).unwrap().rgb);
+
+    // A press then a purely horizontal move: the marquee has zero height, so
+    // both painters suppress it. It is invisible, so no frame change -- the
+    // move is Ignored, the generation holds, and the frame is the bare one,
+    // even though the raw marquee (which crop_drag reports) did change.
+    assert_eq!(press(&mut c, 200, 150), Outcome::Ignored);
+    let quiet = fields(&c)[GENERATION].clone();
+    assert_eq!(drag_to(&mut c, 350, 150), Outcome::Ignored);
+    assert_eq!(fields(&c)[GENERATION], quiet);
+    assert_eq!(
+        driven::fnv1a64(&driven::paint(&c.scene()).unwrap().rgb),
+        bare
+    );
+    assert_eq!(
+        c.crop_drag(),
+        Some(Rect {
+            x: 200,
+            y: 150,
+            width: 150,
+            height: 0,
+        })
+    );
+
+    // Growing the height makes it visible: now a frame change.
+    assert_eq!(drag_to(&mut c, 350, 250), Outcome::Changed);
+    assert_ne!(fields(&c)[GENERATION], quiet);
+    assert_ne!(
+        driven::fnv1a64(&driven::paint(&c.scene()).unwrap().rgb),
+        bare
+    );
+}
+
+#[test]
+fn a_second_press_during_a_drag_clears_the_visible_marquee() {
+    let mut c = Controller::new(surface(800, 600));
+    c.open("roll", b"/r", photos(5)).unwrap();
+    assert_eq!(act(&mut c, "develop", &[]), Outcome::Changed);
+    c.set_preview_fit(Some(Rect {
+        x: 100,
+        y: 100,
+        width: 400,
+        height: 300,
+    }));
+
+    assert_eq!(press(&mut c, 200, 150), Outcome::Ignored);
+    assert_eq!(drag_to(&mut c, 400, 300), Outcome::Changed);
+    let visible = fields(&c)[GENERATION].clone();
+    let marked = driven::fnv1a64(&driven::paint(&c.scene()).unwrap().rgb);
+
+    // A second press (the replay/socket vocabulary permits one during a drag)
+    // arms a fresh zero-size marquee: the visible outline left the frame, so
+    // that is a change even though the new marquee is itself invisible.
+    assert_eq!(press(&mut c, 250, 200), Outcome::Changed);
+    assert_ne!(fields(&c)[GENERATION], visible);
+    assert_ne!(
+        driven::fnv1a64(&driven::paint(&c.scene()).unwrap().rgb),
+        marked
+    );
+    assert_eq!(
+        c.crop_drag(),
+        Some(Rect {
+            x: 250,
+            y: 200,
+            width: 0,
+            height: 0,
+        })
+    );
+}
+
+#[test]
+fn a_release_committing_the_current_crop_still_clears_the_marquee() {
+    let mut c = Controller::new(surface(800, 600));
+    c.open("roll", b"/r", photos(5)).unwrap();
+    assert_eq!(act(&mut c, "develop", &[]), Outcome::Changed);
+    c.set_preview_fit(Some(Rect {
+        x: 100,
+        y: 100,
+        width: 400,
+        height: 300,
+    }));
+
+    // A drag over the whole canvas composes to exactly the full crop; commit
+    // it so the sidecar holds it.
+    assert_eq!(press(&mut c, 100, 100), Outcome::Ignored);
+    assert_eq!(drag_to(&mut c, 500, 400), Outcome::Changed);
+    let (_, effects) = release(&mut c, 500, 400);
+    assert_eq!(apply(&mut c, &effects).unwrap(), Outcome::Changed);
+    let crop = fields(&c)[CROP].clone();
+    assert_ne!(crop, "-");
+
+    // Drag the whole canvas again: the composed crop equals the one already in
+    // the sidecar, so settling it changes nothing. The marquee still left the
+    // frame, so the release must move the generation on its own -- otherwise
+    // the outline would stay painted until an unrelated change.
+    assert_eq!(press(&mut c, 100, 100), Outcome::Ignored);
+    assert_eq!(drag_to(&mut c, 500, 400), Outcome::Changed);
+    let visible = fields(&c)[GENERATION].clone();
+    let (outcome, effects) = release(&mut c, 500, 400);
+    assert_eq!(outcome, Outcome::Changed);
+    assert_eq!(
+        effects,
+        [Effect::Edit {
+            index: 0,
+            name: file(0),
+            key: Key::Crop,
+            value: Some(crop.clone()),
+        }]
+    );
+    assert_ne!(fields(&c)[GENERATION], visible);
+    assert_eq!(c.crop_drag(), None);
+    // Settling the same crop is a no-op, proving the release's own bump is what
+    // witnessed the marquee removal.
+    assert_eq!(apply(&mut c, &effects).unwrap(), Outcome::Ignored);
+}
+
+#[test]
+fn a_crop_drag_holds_the_canvas_it_started_on() {
+    let mut c = Controller::new(surface(800, 600));
+    c.open("roll", b"/r", photos(5)).unwrap();
+    assert_eq!(act(&mut c, "develop", &[]), Outcome::Changed);
+    c.set_preview_fit(Some(Rect {
+        x: 100,
+        y: 100,
+        width: 400,
+        height: 300,
+    }));
+
+    assert_eq!(press(&mut c, 200, 150), Outcome::Ignored);
+    assert_eq!(drag_to(&mut c, 400, 300), Outcome::Changed);
+
+    // A new fit arrives mid-drag (an in-flight develop lands at a different
+    // size): the gesture keeps mapping against the canvas it started on, not
+    // the new one, so the committed crop cannot escape the current crop.
+    c.set_preview_fit(Some(Rect {
+        x: 200,
+        y: 100,
+        width: 200,
+        height: 300,
+    }));
+    let (_, effects) = release(&mut c, 400, 300);
+    assert_eq!(
+        effects,
+        [Effect::Edit {
+            index: 0,
+            name: file(0),
+            key: Key::Crop,
+            value: Some("0.2500 0.1666 0.5000 0.5000".to_string()),
+        }]
+    );
+}
+
+#[test]
+fn a_press_then_release_with_no_move_selects_from_the_two_points() {
+    let mut c = Controller::new(surface(800, 600));
+    c.open("roll", b"/r", photos(5)).unwrap();
+    assert_eq!(act(&mut c, "develop", &[]), Outcome::Changed);
+    c.set_preview_fit(Some(Rect {
+        x: 100,
+        y: 100,
+        width: 400,
+        height: 300,
+    }));
+
+    // The replay/socket adapter can name a rubber-band by its two corners: a
+    // press at one, a release at the other with no move between. The release
+    // uses its own point, so the marquee spans the two and commits a crop.
+    assert_eq!(press(&mut c, 200, 150), Outcome::Ignored);
+    let (outcome, effects) = release(&mut c, 400, 300);
+    assert_eq!(outcome, Outcome::Changed);
+    assert_eq!(
+        effects,
+        [Effect::Edit {
+            index: 0,
+            name: file(0),
+            key: Key::Crop,
+            value: Some("0.2500 0.1666 0.5000 0.5000".to_string()),
+        }]
+    );
+    assert_eq!(c.crop_drag(), None);
 }

@@ -952,6 +952,9 @@ struct Window {
     /// The pointer's last position on the surface, in the protocol's 24.8
     /// fixed point as the toolkit decodes it.
     pointer: (i32, i32),
+    /// Whether the left button is down: a motion while it is drives a crop
+    /// drag's move, and its release the drag's release.
+    pressed: bool,
     wheel: Wheel,
     control: Option<Worker<Payload>>,
     /// `wait-idle` requests held, each with its deadline on the turn clock.
@@ -1025,6 +1028,7 @@ impl Window {
             developed: None,
             memo: Memo::default(),
             pointer: (0, 0),
+            pressed: false,
             wheel: Wheel::default(),
             control,
             waiters: VecDeque::new(),
@@ -1078,12 +1082,18 @@ impl Window {
             Handled::GlobalRemoved { required: true, .. } => {
                 Err("required Wayland global was removed".to_string())
             }
+            // The pointer went with the seat or its capability: end any drag it
+            // was running so it does not resume on the next device.
+            Handled::SeatRemoved | Handled::Capabilities { pointer: false, .. } => {
+                self.abort_pointer_grab();
+                Ok(())
+            }
             // The clipboard is not used, and the client released what it
             // held for a seat or a device that went; a removed optional
-            // global needs nothing of the window's.
+            // global, or a capability change that keeps the pointer, needs
+            // nothing of the window's.
             Handled::GlobalRemoved { .. }
             | Handled::Capabilities { .. }
-            | Handled::SeatRemoved
             | Handled::Clipboard(_) => Ok(()),
             Handled::Unhandled => Err(format!(
                 "unexpected Wayland event {}:{}",
@@ -1144,18 +1154,44 @@ impl Window {
 
     fn pointer(&mut self, event: pointer::Event) -> Result<()> {
         use pointer::Event as P;
+        // The toolkit hands the protocol's 24.8 fixed point; the model takes
+        // pixels.
+        let pixel = |fixed: i32| i64::from(fixed).div_euclid(256);
+        // A move or release under the implicit button grab a drag runs under
+        // may leave the surface, reading negative above or left of it; it
+        // clamps to zero, which the controller clamps into the canvas, so a
+        // drag past the top-left edge tracks the edge and the release still
+        // reaches the controller (which clears the drag) rather than being
+        // dropped.
+        let send_clamped = |this: &mut Self, phase| {
+            let (x, y) = this.pointer;
+            this.input(Input::Pointer {
+                phase,
+                x: u32::try_from(pixel(x)).unwrap_or(0),
+                y: u32::try_from(pixel(y)).unwrap_or(0),
+            });
+        };
         match event {
-            P::Enter { x, y, .. } | P::Motion(x, y) => self.pointer = (x, y),
+            P::Enter { x, y, .. } => self.pointer = (x, y),
+            P::Motion(x, y) => {
+                self.pointer = (x, y);
+                // A motion while the button is down carries a drag along.
+                if self.pressed {
+                    send_clamped(self, PointerPhase::Move);
+                }
+            }
             P::Button {
                 button: 0x110,
                 pressed: true,
                 ..
             } => {
-                // The toolkit hands the protocol's 24.8 fixed point; the
-                // model takes pixels.
+                self.pressed = true;
+                // A press is a real on-surface location: one off the top-left
+                // (a left press while another button holds a cross-button grab)
+                // is rejected, not clamped, so it cannot land a spurious hit at
+                // a clamped zero (a bar header, a cell).
                 let (x, y) = self.pointer;
-                let pixel = |fixed: i32| u32::try_from(i64::from(fixed).div_euclid(256)).ok();
-                if let (Some(x), Some(y)) = (pixel(x), pixel(y)) {
+                if let (Ok(x), Ok(y)) = (u32::try_from(pixel(x)), u32::try_from(pixel(y))) {
                     self.input(Input::Pointer {
                         phase: PointerPhase::Press,
                         x,
@@ -1163,7 +1199,18 @@ impl Window {
                     });
                 }
             }
-            P::Leave(_) | P::Button { .. } => {}
+            P::Button {
+                button: 0x110,
+                pressed: false,
+                ..
+            } => {
+                if self.pressed {
+                    self.pressed = false;
+                    send_clamped(self, PointerPhase::Release);
+                }
+            }
+            P::Leave(_) => self.abort_pointer_grab(),
+            P::Button { .. } => {}
             P::Axis(..) | P::Source(_) | P::Stop(_) | P::Discrete(..) => {
                 self.wheel.update(event)?;
             }
@@ -1181,6 +1228,25 @@ impl Window {
             }
         }
         Ok(())
+    }
+
+    /// Ends an in-progress drag when the pointer goes away without a button
+    /// release -- a grab the compositor revoked (leave), the pointer capability
+    /// withdrawn, or the seat removed -- by releasing at the last point, so the
+    /// controller clears the drag rather than leaving it armed to rubber-band on
+    /// the next hover. A no-op when no button is held.
+    fn abort_pointer_grab(&mut self) {
+        if !self.pressed {
+            return;
+        }
+        self.pressed = false;
+        let (x, y) = self.pointer;
+        let pixel = |fixed: i32| i64::from(fixed).div_euclid(256);
+        self.input(Input::Pointer {
+            phase: PointerPhase::Release,
+            x: u32::try_from(pixel(x)).unwrap_or(0),
+            y: u32::try_from(pixel(y)).unwrap_or(0),
+        });
     }
 
     fn end_turn(&mut self, now: u64, idle: bool) -> Result<()> {
@@ -1210,6 +1276,7 @@ impl Window {
         // or a scale a request changed is what the wants, and the frame
         // drawn after this turn, are for.
         self.collect()?;
+        self.report_preview_fit();
         self.control_tick(now);
         let jobs = self.want()?;
         self.session.ui.set_jobs(jobs);
@@ -1225,6 +1292,35 @@ impl Window {
         let connection = self.client.connection();
         connection.set_wait(connection.wait().min(wait));
         Ok(())
+    }
+
+    /// Reports the developed image's fitted rectangle to the model as the
+    /// crop drag's canvas: a fact, so it does not bump the generation.
+    fn report_preview_fit(&mut self) {
+        let fit = self.preview_fit();
+        self.session.ui.set_preview_fit(fit);
+    }
+
+    /// The develop box rectangle the cursor photo's held developed image
+    /// fills, centred as `ui::blit` centres it, or `None` when not developing
+    /// or no image is held for the cursor photo yet.
+    fn preview_fit(&self) -> Option<td_ui::raster::Rect> {
+        let ui = &self.session.ui;
+        let r#box = ui.develop_box()?;
+        let name = &ui.photos().get(ui.cursor()?)?.name;
+        let image = self
+            .developed
+            .as_ref()
+            .filter(|(preview, _)| preview.name == *name)
+            .and_then(|(_, image)| image.as_ref())?;
+        let width = i64::try_from(image.width).ok()?;
+        let height = i64::try_from(image.height).ok()?;
+        Some(td_ui::raster::Rect {
+            x: r#box.x + (i64::from(r#box.width) - width) / 2,
+            y: r#box.y + (i64::from(r#box.height) - height) / 2,
+            width: u32::try_from(image.width).ok()?,
+            height: u32::try_from(image.height).ok()?,
+        })
     }
 
     /// Takes what the pool made. The developed preview replaces the one held
@@ -1548,6 +1644,7 @@ impl Window {
         let visible = ui.visible();
         let scene = ui.scene();
         let badges = ui.badges();
+        let marquee = ui.marquee();
         let photos = ui.photos();
         // The develop box and the image to fill it: the held develop of the
         // cursor's photo, so an exposure or look edit shows the last frame of
@@ -1587,6 +1684,12 @@ impl Window {
             Raster::new(pixels, font, surface, stride)
                 .map_err(error)?
                 .paint(&badges, area)
+                .map_err(error)?;
+            // The crop marquee over the develop image, as the badges are
+            // painted over the thumbnails.
+            Raster::new(pixels, font, surface, stride)
+                .map_err(error)?
+                .paint(&marquee, area)
                 .map_err(error)
         })?;
         if submitted {

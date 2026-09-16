@@ -48,8 +48,8 @@ file td-photo replaces, and only through its own temporary. The crate depends on
 td-ui, by path, for the driven seam, the raster and bands the scene is laid out
 with and the Wayland client the window runs on; the window's develop mode
 lands over its own slices: the mode, its keys and the develop edits over the
-seam and the socket are in; the developed preview, the crop drag and the look
-list follow, as the increments at the end schedule.
+seam and the socket are in, as are the developed preview and the crop drag;
+the look list follows, as the increments at the end schedule.
 
 The rules below define version 1; the increments identify the order of
 implementation, not choices left to each implementing agent.
@@ -96,12 +96,13 @@ modes are the photographer's order of work.
    on the cursor's photo and left with `Escape`. `=`/`-` move exposure by a
    third of a stop and their shifted pair `+`/`_` by a tenth, `0` resets to
    camera defaults, and the crop and the look are set by the `crop` and
-   `look` actions, taking the box's four fractions or a look's stem; the
-   crop's drag handles and aspect presets (free, 3:2, 4:3, 1:1, 16:9) and
-   the look list overlay are a later slice, as the developed preview and
-   `export` are. Every change is saved to the sidecar as it is made; there
-   is no explicit save and no undo stack in version 1, only reset to camera
-   defaults.
+   `look` actions, taking the box's four fractions or a look's stem, and
+   the crop also by dragging a marquee over the preview, which selects a
+   sub-region of the current crop and is saved on release; the crop's drag
+   handles and aspect presets (free, 3:2, 4:3, 1:1, 16:9) and the look list
+   overlay are a later slice, as `export` is. Every change is saved to the
+   sidecar as it is made; there is no explicit save and no undo stack in
+   version 1, only reset to camera defaults.
 
 Export renders the full-resolution raw through the same pipeline and writes
 an sRGB image into the roll's `exported/` folder, never overwriting: a
@@ -200,7 +201,15 @@ window, all speaking the toolkit's one vocabulary.
   what is absent. The generation moves on a change and
   on nothing else: not on a step at an end, a filter, view or size already set,
   a refused open, or a refused flag that leaves the file as the model held it; a
-  settle that brings a file changed meanwhile is a change. A flag the adapter
+  settle that brings a file changed meanwhile is a change. A crop drag over
+  the develop preview is witnessed by the frame, not `state`: the generation
+  moves exactly when the painted marquee does, so arming one or dragging it
+  to a zero-edge, invisible rectangle changes nothing, and a resize to a
+  visible rectangle, and any press or release that removes a painted one,
+  are changes; its release commits the selected crop as the `crop` action
+  does. The developed image's fitted rectangle the window reports for the
+  drag's canvas is a fact like the job count, so it never moves the
+  generation. A flag the adapter
   wrote answers `changed` whether or not the model moved, since the file did.
   Error codes are stable (`no-roll`, `no-photo`, `bad-argument`, `refused`, and
   the transport's `protocol` and `limit`); a refusal's reason goes to stderr,
@@ -233,7 +242,8 @@ window, all speaking the toolkit's one vocabulary.
   action name, the key it binds, argument shape and a help line, held to the
   seam's grammar by `driven::check` in `tests/ui.rs`, which also pins that every
   action either binds a key or takes an argument and is reached by the pointer
-  (`select` by a press on a cell, `scroll` by the wheel) or is the agent's
+  (`select` by a press on a cell, `scroll` by the wheel, `crop` by a drag
+  over the develop preview) or is the agent's
   (`open`). `td-photo --help actions` prints the table so an agent can read it
   instead of guessing.
 
@@ -544,13 +554,16 @@ what an edit invalidates:
 
 Exposure and look edits recompute level 3 only. A crop edit recomputes
 level 2 from level 1 (tens of milliseconds across the pool) and then level
-3; during a crop drag the previous level 2 is shown scaled until the
-pointer settles for one frame, so the drag never waits. Resizing the
-window recomputes level 2. Switching photo recomputes level 1 from the
-cached level 0, or decodes when the photo is no longer cached. The window
-holds these levels and this memoization from increment 5(d)'s second slice,
-described here; its first slice developed the preview correctly but reran
-the whole pipeline on each edit. Prefetching the neighbouring level-0 frames
+3; a crop drag outlines a marquee over the current preview and commits the
+crop on release, which reruns level 2 as any crop edit does, so no develop
+runs mid-drag. Showing the previous level 2 scaled under the marquee while
+the drag is live, so the crop previews before release, is a later slice.
+Resizing the window recomputes level 2. Switching photo recomputes level 1
+from the cached level 0, or decodes when the photo is no longer cached. The
+window holds these levels and this memoization from increment 5(d)'s second
+slice, described here; its first slice developed the preview correctly but
+reran the whole pipeline on each edit. Prefetching the neighbouring level-0
+frames
 in the background is a later slice; until then the raw cache holds the
 current photo and those recently shown, evicting the least recently shown
 under `RAW_CACHE_BYTES`, so a return to a photo reruns level 1, not the
@@ -698,9 +711,13 @@ stays a placeholder.
 `td_ui::client::App` in the shape td-setup's is, and one adapter over the same
 `Session` the replay drives (see Driving): `event` maps the compositor's
 configure to a resize, a key to its chord (a held move or page repeats through
-the toolkit's repeat; a flag, a filter, a view or quit fires once), a left press
-to the pointer path and the wheel's frames to `scroll`, and `end_turn` takes the
-pool's results, asks for the thumbnails the model wants and serves the socket.
+the toolkit's repeat; a flag, a filter, a view or quit fires once), a left
+button's press, motion and release to the pointer path (the crop drag reads
+the motion and release, not the press alone) and the wheel's frames to
+`scroll`, and `end_turn` takes the pool's results, asks for the thumbnails the
+model wants, reports the developed image's fitted rectangle within the develop
+box as the crop drag's canvas (`set_preview_fit`, a fact that no more moves the
+generation than the job count does) and serves the socket.
 It owns no Wayland objects of its own. A frame is presented whenever the
 generation submitted is not the model's: the scene through the toolkit's raster,
 then each held thumbnail centred in its box through `ui::blit`, a clipped XRGB
@@ -710,7 +727,9 @@ the status band on a short surface leaves the band alone, then the flag badges
 again (`Controller::badges`, the scene's badge draws alone, painted within the
 grid's area as the blits are, so over the scene's own frame they change
 nothing), since a thumbnail covers the corner the scene painted its badge in.
-The generation on screen is the one the compositor
+In develop mode a crop drag in progress is outlined over the preview last,
+clipped to the develop box, the one overlay the model derives from the
+reported fit. The generation on screen is the one the compositor
 acknowledged with its frame callback, which is what `wait-idle` waits for; a
 generation is submitted once. When a second consumer needs an image primitive it
 is promoted into `td_ui::raster` with a pixel oracle; until then the blitter is
@@ -931,7 +950,11 @@ the in-memory shrink by the thumbnail rule), `wait-idle` over the replay idle at
 once with its argument
 judged, `--preview` equal to the seam's frame of the empty window and of a roll
 and refused for a bad size or roll, `develop_box` the preview box only in
-develop mode, and `open` refusing a bad socket path, a
+develop mode, the crop drag over the develop preview (a marquee armed,
+rubber-banded and committed as a sub-region of the current crop, a click, a
+sub-minimum marquee and an off-canvas press refused, the develop box the
+fallback canvas when no fit is reported), and `open` refusing a bad socket
+path, a
 second roll or a stray flag before it looks for a display and leaving no socket
 behind when the display is not there; `src/window.rs`'s own tests hold
 `wait_ms`'s grammar, the envelope's ID, the charge of a held entry, the queue's
@@ -1008,9 +1031,13 @@ all-target Clippy.
    is a later slice. (e) First: the user crop applied to level 2 (the crop
    of level 1), mapped through the inverse of the orientation so an
    uncropped develop is byte-identical, in the window preview, `--preview`
-   and the headless verb's `--crop`. Landed. The crop drag contract (drag
-   handles and the aspect presets) and the look list overlay are a later
-   slice.
+   and the headless verb's `--crop`. Landed. Second: the crop drag over the
+   develop preview — a marquee the pointer arms, rubber-bands and commits on
+   release as a sub-region of the current crop, through the same `Edit` the
+   `crop` action makes, the window reporting the developed image's fitted
+   rectangle as the drag's canvas. Landed. The drag handles, the aspect
+   presets (free, 3:2, 4:3, 1:1, 16:9), the live scaled preview under the
+   marquee and the look list overlay are a later slice.
 6. Export: banded full-resolution bilinear demosaic, the JPEG encoder,
    `exported/` naming, and `td-photo export`; and `delete-rejected`, the
    action and its verb that move rejects and their sidecars into

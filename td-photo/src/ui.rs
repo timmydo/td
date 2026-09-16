@@ -649,6 +649,48 @@ pub struct Controller {
     bytes: usize,
     /// The jobs the adapter has outstanding, as it last said.
     jobs: usize,
+    /// The developed image's rectangle within the develop box, as the
+    /// adapter last reported it: the crop drag's canvas, since the model is
+    /// pixel-blind and cannot know the fitted image's size. `None` before a
+    /// develop lands, when the box itself is the fallback canvas.
+    preview_fit: Option<Rect>,
+    /// The crop drag in progress, in surface pixels, or `None`: set on a
+    /// press inside the preview, moved, and taken on release. Held only in
+    /// develop mode and dropped when the photo, mode or surface changes.
+    drag: Option<Drag>,
+}
+
+/// A crop drag: the canvas it maps against (the develop preview's fitted
+/// rectangle, captured at the press so a fit reported mid-drag cannot re-map
+/// the gesture), the press anchor and the pointer's current point, both in
+/// surface pixels clamped into the canvas. The marquee is their bounding box.
+struct Drag {
+    canvas: Rect,
+    anchor: (i64, i64),
+    current: (i64, i64),
+}
+
+/// The marquee a drag spans: the bounding box of its anchor and current.
+fn marquee_rect(drag: &Drag) -> Rect {
+    let (ax, ay) = drag.anchor;
+    let (cx, cy) = drag.current;
+    let x = ax.min(cx);
+    let y = ay.min(cy);
+    Rect {
+        x,
+        y,
+        width: (ax.max(cx) - x) as u32,
+        height: (ay.max(cy) - y) as u32,
+    }
+}
+
+/// A point clamped into `rect`, its far edges inclusive so a drag can end on
+/// the far edge though `Rect::contains` excludes it, keeping the marquee within
+/// the canvas.
+fn clamp_into(rect: Rect, x: i64, y: i64) -> (i64, i64) {
+    let far_x = rect.x.saturating_add(i64::from(rect.width));
+    let far_y = rect.y.saturating_add(i64::from(rect.height));
+    (x.clamp(rect.x, far_x), y.clamp(rect.y, far_y))
 }
 
 impl Controller {
@@ -666,6 +708,8 @@ impl Controller {
             shown: Vec::new(),
             bytes: 0,
             jobs: 0,
+            preview_fit: None,
+            drag: None,
         }
     }
 
@@ -788,6 +832,51 @@ impl Controller {
         self.jobs = jobs;
     }
 
+    /// The developed image's fitted rectangle within the develop box, as the
+    /// adapter computed it (the box centring `blit` uses): the crop drag's
+    /// canvas. A fact like the job count, so it never bumps the generation;
+    /// the drag rectangle the model derives from it does.
+    pub fn set_preview_fit(&mut self, fit: Option<Rect>) {
+        self.preview_fit = fit;
+    }
+
+    /// The crop drag's canvas: the developed image's fitted rectangle when
+    /// the adapter has reported one, else the develop box itself (exact when
+    /// the developed image fills the box, as an uncropped 3:2 frame does).
+    fn canvas(&self) -> Option<Rect> {
+        self.preview_fit.or_else(|| self.develop_box())
+    }
+
+    /// The crop drag's marquee, in surface pixels, or `None` when no drag is
+    /// in progress: what the scene outlines over the preview.
+    pub fn crop_drag(&self) -> Option<Rect> {
+        self.drag.as_ref().map(marquee_rect)
+    }
+
+    /// The marquee as it is actually painted, or `None` when nothing is: both
+    /// painters suppress a rectangle with a zero edge, so a zero-size marquee
+    /// (a fresh press, a purely horizontal or vertical drag) is invisible and
+    /// its change is not a frame change. The generation follows this, not the
+    /// raw marquee, so it moves exactly when the painted outline does.
+    fn painted_marquee(&self) -> Option<Rect> {
+        self.drag
+            .as_ref()
+            .map(marquee_rect)
+            .filter(|rect| rect.width > 0 && rect.height > 0)
+    }
+
+    /// The outcome of a pointer step that may have changed the painted marquee:
+    /// `Changed` with one generation bump when the painted outline differs from
+    /// `before`, else `Ignored` with no bump.
+    fn marquee_changed(&mut self, before: Option<Rect>) -> (Outcome, Vec<Effect>) {
+        if self.painted_marquee() == before {
+            (Outcome::Ignored, Vec::new())
+        } else {
+            self.bump();
+            (Outcome::Changed, Vec::new())
+        }
+    }
+
     /// Something the adapter paints into the frame changed (a thumbnail
     /// arrived for a photo on screen): a new generation.
     pub fn touch(&mut self) {
@@ -907,6 +996,8 @@ impl Controller {
                     return Ok((Outcome::Ignored, Vec::new()));
                 }
                 self.surface = surface;
+                // The canvas moved under any drag; its pixels are stale.
+                self.drag = None;
                 self.reveal();
                 self.bump();
                 Ok((Outcome::Changed, Vec::new()))
@@ -981,6 +1072,12 @@ impl Controller {
     /// painted them in.
     pub fn badges(&self) -> Badges<'_> {
         Badges { model: self }
+    }
+
+    /// The crop marquee alone: what the window paints again over the develop
+    /// image it blitted, as it repaints the badges over the thumbnails.
+    pub fn marquee(&self) -> Marquee<'_> {
+        Marquee { model: self }
     }
 
     fn bump(&mut self) {
@@ -1073,6 +1170,13 @@ impl Controller {
         x: i64,
         y: i64,
     ) -> Result<(Outcome, Vec<Effect>), Error> {
+        // Develop mode: the crop drag owns the pointer over the preview, for
+        // press, move and release; a press off the preview (the bar, the
+        // status row, the margins) starts no drag, as a filter press is inert
+        // here. Nothing else in develop uses the pointer.
+        if self.mode == Mode::Develop {
+            return self.crop_pointer(phase, x, y);
+        }
         // Only a press, and only on the surface: a header the width does
         // not show is not a target. The bands are tested last painted
         // first, so on a surface too short for both the status row covers
@@ -1095,11 +1199,6 @@ impl Controller {
         if self.roll.is_none() {
             return Ok((Outcome::Ignored, Vec::new()));
         }
-        // The develop view takes no press yet: the crop drag is a later
-        // increment (DESIGN.md, increments).
-        if self.mode == Mode::Develop {
-            return Ok((Outcome::Ignored, Vec::new()));
-        }
         let outcome = match self.view {
             View::Single if self.layout().area.contains(x, y) => self.set_view(View::Grid),
             View::Single => Outcome::Ignored,
@@ -1109,6 +1208,135 @@ impl Controller {
             },
         };
         Ok((self.finish(outcome), Vec::new()))
+    }
+
+    /// The crop drag over the develop preview: a press inside the canvas
+    /// anchors a marquee, a move rubber-bands it, a release commits the
+    /// selected sub-region as the new crop (composed with the current crop,
+    /// so always a subset of it) through the same `Effect::Edit` the `crop`
+    /// action produces. A degenerate marquee or a plain click commits
+    /// nothing. The marquee is not a `state` field; it is witnessed by the
+    /// frame, so every step reports `Changed` with one generation bump exactly
+    /// when the *painted* outline changes (`marquee_changed`): arming or moving
+    /// to a zero-edge, invisible marquee changes nothing, and both a release
+    /// and a fresh press that remove a painted marquee do.
+    fn crop_pointer(
+        &mut self,
+        phase: PointerPhase,
+        x: i64,
+        y: i64,
+    ) -> Result<(Outcome, Vec<Effect>), Error> {
+        let ignored = Ok((Outcome::Ignored, Vec::new()));
+        match phase {
+            PointerPhase::Press => {
+                let Some(canvas) = self.canvas() else {
+                    return ignored;
+                };
+                if !canvas.contains(x, y) {
+                    return ignored;
+                }
+                // Capture the canvas with the drag: a fit the adapter reports
+                // mid-gesture cannot re-map an anchor taken against the old one.
+                let before = self.painted_marquee();
+                let point = (x, y);
+                self.drag = Some(Drag {
+                    canvas,
+                    anchor: point,
+                    current: point,
+                });
+                // Arming is a zero-size, invisible marquee; a frame change only
+                // if it replaced one that was painted (a second press).
+                Ok(self.marquee_changed(before))
+            }
+            PointerPhase::Move => {
+                let Some(canvas) = self.drag.as_ref().map(|drag| drag.canvas) else {
+                    return ignored;
+                };
+                let point = clamp_into(canvas, x, y);
+                let before = self.painted_marquee();
+                if let Some(drag) = self.drag.as_mut() {
+                    drag.current = point;
+                }
+                Ok(self.marquee_changed(before))
+            }
+            PointerPhase::Release => {
+                let before = self.painted_marquee();
+                let Some(drag) = self.drag.take() else {
+                    return ignored;
+                };
+                let canvas = drag.canvas;
+                // The release point ends the gesture as a move to it would, so
+                // a press then release with no move between still selects.
+                let current = clamp_into(canvas, x, y);
+                let marquee = marquee_rect(&Drag {
+                    canvas,
+                    anchor: drag.anchor,
+                    current,
+                });
+                // The marquee leaves the frame on release; if it was painted,
+                // that is a frame change whatever the commit does -- a crop
+                // equal to the current one settles to no change and would not
+                // otherwise repaint, leaving the outline behind.
+                if before.is_some() {
+                    self.bump();
+                }
+                // The cursor is the develop photo; a drag only exists here.
+                let commit = self.cursor.and_then(|index| {
+                    self.drag_crop(index, canvas, marquee)
+                        .map(|crop| (index, crop))
+                });
+                match commit {
+                    Some((index, crop)) => self.develop_effect(
+                        index,
+                        |index, name| Effect::Edit {
+                            index,
+                            name,
+                            key: Key::Crop,
+                            value: Some(crop.text()),
+                        },
+                        Vec::new(),
+                    ),
+                    None if before.is_some() => Ok((Outcome::Changed, Vec::new())),
+                    None => ignored,
+                }
+            }
+        }
+    }
+
+    /// The crop a marquee selects: its fractions of the `canvas` composed
+    /// with the cursor photo's current crop, so the result is a sub-region
+    /// of it. `None` when the marquee is degenerate or the composed box is
+    /// under the minimum edge (`Crop::new`); floor division keeps it inside
+    /// the current crop, so it is always inside the image.
+    fn drag_crop(&self, index: usize, canvas: Rect, marquee: Rect) -> Option<Crop> {
+        if marquee.width == 0 || marquee.height == 0 {
+            return None;
+        }
+        let (w, h) = (u64::from(canvas.width), u64::from(canvas.height));
+        if w == 0 || h == 0 {
+            return None;
+        }
+        let current = self
+            .photos
+            .get(index)?
+            .sidecar
+            .as_ref()
+            .and_then(Sidecar::crop)
+            .unwrap_or(Crop {
+                x: 0,
+                y: 0,
+                width: library::CROP_UNIT,
+                height: library::CROP_UNIT,
+            });
+        let dx = (marquee.x - canvas.x).max(0) as u64;
+        let dy = (marquee.y - canvas.y).max(0) as u64;
+        let (dw, dh) = (u64::from(marquee.width), u64::from(marquee.height));
+        let (cw, ch) = (u64::from(current.width), u64::from(current.height));
+        let nx = u64::from(current.x) + dx * cw / w;
+        let ny = u64::from(current.y) + dy * ch / h;
+        let nw = dw * cw / w;
+        let nh = dh * ch / h;
+        Crop::new(nx as u32, ny as u32, nw as u32, nh as u32).ok()
     }
 
     fn need_roll(&self) -> Result<(), Error> {
@@ -1142,6 +1370,7 @@ impl Controller {
         if self.mode == Mode::Develop {
             self.mode = Mode::Cull;
             self.view = View::Grid;
+            self.drag = None;
             return Outcome::Changed;
         }
         self.set_view(View::Grid)
@@ -1158,6 +1387,7 @@ impl Controller {
         // Develop leaves for the cull grid, so the reported view is the
         // grid throughout, not a stale `single` it will not return to.
         self.view = View::Grid;
+        self.drag = None;
         Ok(Outcome::Changed)
     }
 
@@ -1284,10 +1514,13 @@ impl Controller {
     fn keep_cursor_shown(&mut self) {
         if self.position().is_none() {
             self.cursor = self.shown.first().copied();
+            // The cursor left the photo the drag was for; end it.
+            self.drag = None;
         }
         if self.cursor.is_none() {
             self.view = View::Grid;
             self.mode = Mode::Cull;
+            self.drag = None;
         }
         self.reveal();
     }
@@ -1311,6 +1544,8 @@ impl Controller {
             return Ok(Outcome::Ignored);
         }
         self.cursor = Some(index);
+        // The cursor moved off the photo the drag was for; end it.
+        self.drag = None;
         self.reveal();
         Ok(Outcome::Changed)
     }
@@ -1477,45 +1712,7 @@ impl Scene<'_> {
         let scale = layout.surface.scale;
         fill(rect, CHROME, damage, sink);
         if selected {
-            let edge = (2 * s) as u32;
-            fill(
-                Rect {
-                    height: edge,
-                    ..rect
-                },
-                SELECTED,
-                damage,
-                sink,
-            );
-            fill(
-                Rect {
-                    y: rect.y + i64::from(rect.height) - i64::from(edge),
-                    height: edge,
-                    ..rect
-                },
-                SELECTED,
-                damage,
-                sink,
-            );
-            fill(
-                Rect {
-                    width: edge,
-                    ..rect
-                },
-                SELECTED,
-                damage,
-                sink,
-            );
-            fill(
-                Rect {
-                    x: rect.x + i64::from(rect.width) - i64::from(edge),
-                    width: edge,
-                    ..rect
-                },
-                SELECTED,
-                damage,
-                sink,
-            );
+            outline(rect, (2 * s) as u32, SELECTED, damage, sink);
         }
         let pad = (CELL_PAD * s) as i64;
         let thumb = layout.thumb(rect);
@@ -1630,6 +1827,17 @@ impl Scene<'_> {
         // into, so the placeholder and the image share one geometry.
         if let Some(r#box) = layout.preview_box() {
             fill(r#box, PLACEHOLDER, damage, sink);
+            // The crop marquee over the preview, clipped to the box so it
+            // cannot stray past it; drawn here so it is in the scene frame,
+            // the `--preview` PPM and the replay `text` oracle, and repainted
+            // over the blitted image on the live window as the badges are.
+            if let Some(rect) = self.model.crop_drag() {
+                if rect.width > 0 && rect.height > 0 {
+                    if let Some(clip) = r#box.intersection(damage) {
+                        outline(rect, (2 * s) as u32, SELECTED, clip, sink);
+                    }
+                }
+            }
         }
     }
 }
@@ -1669,6 +1877,49 @@ impl Composition for Scene<'_> {
         }
         Status::new(layout.surface).emit(self.status_line().chars(), damage, sink);
     }
+}
+
+/// An `edge`-thick frame just inside `rect` in `color`: the four sides as
+/// fills, clipped to `damage`. The selection border and the crop marquee.
+fn outline(rect: Rect, edge: u32, color: u32, damage: Rect, sink: &mut dyn FnMut(Draw)) {
+    fill(
+        Rect {
+            height: edge,
+            ..rect
+        },
+        color,
+        damage,
+        sink,
+    );
+    fill(
+        Rect {
+            y: rect.y + i64::from(rect.height) - i64::from(edge),
+            height: edge,
+            ..rect
+        },
+        color,
+        damage,
+        sink,
+    );
+    fill(
+        Rect {
+            width: edge,
+            ..rect
+        },
+        color,
+        damage,
+        sink,
+    );
+    fill(
+        Rect {
+            x: rect.x + i64::from(rect.width) - i64::from(edge),
+            width: edge,
+            ..rect
+        },
+        color,
+        damage,
+        sink,
+    );
 }
 
 /// A flagged photo's badge at its box's corner: `P` for a pick, `X` for a
@@ -1721,6 +1972,36 @@ impl Composition for Badges<'_> {
             if let Some(photo) = self.model.photos.get(index) {
                 badge(&layout, thumb, photo, damage, sink);
             }
+        }
+    }
+}
+
+/// The crop marquee and nothing else, a composition the window paints over
+/// the develop image it blitted, clipped to the box. So painted, over the
+/// scene's own frame it changes nothing: the outline is the scene's, at the
+/// same place.
+pub struct Marquee<'a> {
+    model: &'a Controller,
+}
+
+impl Composition for Marquee<'_> {
+    fn surface(&self) -> Surface {
+        self.model.surface
+    }
+
+    fn emit(&self, damage: Rect, sink: &mut dyn FnMut(Draw)) {
+        let Some(r#box) = self.model.develop_box() else {
+            return;
+        };
+        let Some(rect) = self.model.crop_drag() else {
+            return;
+        };
+        if rect.width == 0 || rect.height == 0 {
+            return;
+        }
+        if let Some(clip) = r#box.intersection(damage) {
+            let edge = (2 * self.model.surface.scale.value()) as u32;
+            outline(rect, edge, SELECTED, clip, sink);
         }
     }
 }
