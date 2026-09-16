@@ -1197,7 +1197,7 @@ fn the_binary_replays_the_cull_over_a_roll_and_writes_through_the_sidecar() {
             "1"
         ]
     );
-    assert_eq!(&reply(2)[..2], ["ok", "29"]);
+    assert_eq!(&reply(2)[..2], ["ok", "30"]);
     assert_eq!(reply(3), ["ok", "changed"]);
     assert_eq!(reply(4), ["ok", &name(1), "pick", "-", "-", "-", "ok", "-"]);
     assert_eq!(
@@ -2516,4 +2516,293 @@ fn a_press_then_release_with_no_move_selects_from_the_two_points() {
         }]
     );
     assert_eq!(c.crop_drag(), None);
+}
+
+// ---- crop drag handles: the crop-adjust sub-mode (5(e) third slice) ----
+
+/// Enters develop, sets the given crop and the shared 400x300 canvas, and turns
+/// on crop-adjust. The centred-half crop maps to Rect{200,175,200,150}.
+fn adjusting(crop: &[&str]) -> Controller {
+    let mut c = Controller::new(surface(800, 600));
+    c.open("roll", b"/r", photos(5)).unwrap();
+    assert_eq!(act(&mut c, "develop", &[]), Outcome::Changed);
+    if !crop.is_empty() {
+        assert_eq!(carry(&mut c, "crop", crop), Outcome::Changed);
+    }
+    c.set_preview_fit(Some(Rect {
+        x: 100,
+        y: 100,
+        width: 400,
+        height: 300,
+    }));
+    assert_eq!(act(&mut c, "adjust-crop", &[]), Outcome::Changed);
+    c
+}
+
+#[test]
+fn adjust_crop_toggles_only_in_develop_and_escapes_in_layers() {
+    let mut c = Controller::new(surface(800, 600));
+    c.open("roll", b"/r", photos(5)).unwrap();
+
+    // In cull the crop-adjust toggle is not this mode's: Ignored, no overlay.
+    assert_eq!(act(&mut c, "adjust-crop", &[]), Outcome::Ignored);
+    assert!(!c.adjusting());
+    assert_eq!(c.crop_adjust_rect(), None);
+
+    // In develop it toggles the sub-mode; the overlay appears and leaves, and
+    // the tighten marquee is not this mode's.
+    assert_eq!(act(&mut c, "develop", &[]), Outcome::Changed);
+    assert_eq!(act(&mut c, "adjust-crop", &[]), Outcome::Changed);
+    assert!(c.adjusting());
+    assert!(c.crop_adjust_rect().is_some());
+    assert_eq!(c.crop_drag(), None);
+    assert_eq!(act(&mut c, "adjust-crop", &[]), Outcome::Changed);
+    assert!(!c.adjusting());
+    assert_eq!(c.crop_adjust_rect(), None);
+
+    // The `c` key toggles it too.
+    assert_eq!(key(&mut c, "c"), Outcome::Changed);
+    assert!(c.adjusting());
+
+    // Escape (grid) backs out of crop-adjust first, staying in develop, then
+    // leaves develop for the grid.
+    assert_eq!(act(&mut c, "grid", &[]), Outcome::Changed);
+    assert!(!c.adjusting());
+    assert_eq!(c.mode(), ui::Mode::Develop);
+    assert_eq!(act(&mut c, "grid", &[]), Outcome::Changed);
+    assert_eq!(c.mode(), ui::Mode::Cull);
+}
+
+#[test]
+fn crop_adjust_maps_the_crop_onto_the_canvas() {
+    // With no crop the overlay is the whole canvas.
+    let c = adjusting(&[]);
+    assert_eq!(
+        c.crop_adjust_rect(),
+        Some(Rect {
+            x: 100,
+            y: 100,
+            width: 400,
+            height: 300,
+        })
+    );
+
+    // With a centred-half crop it is the mapped sub-rectangle.
+    let c = adjusting(&["0.2500", "0.2500", "0.5000", "0.5000"]);
+    assert_eq!(
+        c.crop_adjust_rect(),
+        Some(Rect {
+            x: 200,
+            y: 175,
+            width: 200,
+            height: 150,
+        })
+    );
+}
+
+#[test]
+fn a_corner_handle_grows_the_crop() {
+    let mut c = adjusting(&["0.2500", "0.2500", "0.5000", "0.5000"]);
+
+    // Grab the NW corner (200,175) and drag it to the canvas top-left: the crop
+    // grows from a centred half to the top-left three-quarters -- a growth the
+    // tighten marquee can never do. Grabbing paints nothing new (Ignored).
+    assert_eq!(press(&mut c, 200, 175), Outcome::Ignored);
+    assert_eq!(drag_to(&mut c, 100, 100), Outcome::Changed);
+    let (outcome, effects) = release(&mut c, 100, 100);
+    assert_eq!(outcome, Outcome::Changed);
+    assert_eq!(
+        effects,
+        [Effect::Edit {
+            index: 0,
+            name: file(0),
+            key: Key::Crop,
+            value: Some("0.0000 0.0000 0.7500 0.7500".to_string()),
+        }]
+    );
+    assert_eq!(apply(&mut c, &effects).unwrap(), Outcome::Changed);
+    assert_eq!(fields(&c)[CROP], "0.0000 0.0000 0.7500 0.7500");
+    assert_eq!(c.crop_drag(), None);
+}
+
+#[test]
+fn the_interior_handle_moves_the_crop() {
+    let mut c = adjusting(&["0.2500", "0.2500", "0.5000", "0.5000"]);
+
+    // Press inside the crop rectangle and drag: the whole rectangle translates,
+    // keeping its width and height.
+    assert_eq!(press(&mut c, 300, 250), Outcome::Ignored);
+    assert_eq!(drag_to(&mut c, 320, 260), Outcome::Changed);
+    let (_, effects) = release(&mut c, 320, 260);
+    assert_eq!(
+        effects,
+        [Effect::Edit {
+            index: 0,
+            name: file(0),
+            key: Key::Crop,
+            value: Some("0.3000 0.2833 0.5000 0.5000".to_string()),
+        }]
+    );
+}
+
+#[test]
+fn an_edge_handle_shrinks_to_the_minimum_and_grows_to_clear_the_crop() {
+    // Dragging the east edge far in clamps to the minimum edge (0.0500), never
+    // past it.
+    let mut c = adjusting(&["0.2500", "0.2500", "0.5000", "0.5000"]);
+    assert_eq!(press(&mut c, 400, 250), Outcome::Ignored);
+    assert_eq!(drag_to(&mut c, 210, 250), Outcome::Changed);
+    let (_, effects) = release(&mut c, 210, 250);
+    assert_eq!(
+        effects,
+        [Effect::Edit {
+            index: 0,
+            name: file(0),
+            key: Key::Crop,
+            value: Some("0.2500 0.2500 0.0500 0.5000".to_string()),
+        }]
+    );
+
+    // Dragging an edge out to the canvas so the rectangle covers the whole
+    // image clears the crop (value None), not a redundant full-frame crop.
+    let mut c = adjusting(&["0.0000", "0.0000", "0.5000", "1.0000"]);
+    assert_eq!(press(&mut c, 300, 250), Outcome::Ignored);
+    assert_eq!(drag_to(&mut c, 500, 250), Outcome::Changed);
+    let (_, effects) = release(&mut c, 500, 250);
+    assert_eq!(
+        effects,
+        [Effect::Edit {
+            index: 0,
+            name: file(0),
+            key: Key::Crop,
+            value: None,
+        }]
+    );
+    assert_eq!(apply(&mut c, &effects).unwrap(), Outcome::Changed);
+    assert_eq!(fields(&c)[CROP], "-");
+}
+
+#[test]
+fn crop_adjust_is_witnessed_by_the_frame_not_state() {
+    let mut c = Controller::new(surface(800, 600));
+    c.open("roll", b"/r", photos(5)).unwrap();
+    assert_eq!(act(&mut c, "develop", &[]), Outcome::Changed);
+    let canvas = Rect {
+        x: 100,
+        y: 100,
+        width: 400,
+        height: 300,
+    };
+
+    // set_preview_fit is a fact, like the job count: no generation bump.
+    let quiet = fields(&c)[GENERATION].clone();
+    c.set_preview_fit(Some(canvas));
+    assert_eq!(fields(&c)[GENERATION], quiet);
+    let bare = driven::fnv1a64(&driven::paint(&c.scene()).unwrap().rgb);
+
+    // Entering crop-adjust shows the overlay: a frame change, digest differs.
+    assert_eq!(act(&mut c, "adjust-crop", &[]), Outcome::Changed);
+    assert_ne!(fields(&c)[GENERATION], quiet);
+    assert_ne!(
+        driven::fnv1a64(&driven::paint(&c.scene()).unwrap().rgb),
+        bare
+    );
+
+    // Grabbing a handle paints the rectangle already shown: no bump. Moving it
+    // does bump.
+    let armed = fields(&c)[GENERATION].clone();
+    assert_eq!(press(&mut c, 100, 100), Outcome::Ignored);
+    assert_eq!(fields(&c)[GENERATION], armed);
+    assert_eq!(drag_to(&mut c, 200, 175), Outcome::Changed);
+    assert_ne!(fields(&c)[GENERATION], armed);
+
+    // Leaving crop-adjust removes the overlay: back to the bare frame.
+    let _ = release(&mut c, 200, 175);
+    assert_eq!(act(&mut c, "adjust-crop", &[]), Outcome::Changed);
+    assert!(!c.adjusting());
+    assert_eq!(
+        driven::fnv1a64(&driven::paint(&c.scene()).unwrap().rgb),
+        bare
+    );
+}
+
+#[test]
+fn a_handle_grab_and_click_never_bumps_or_mutates_a_minimum_crop() {
+    let mut c = Controller::new(surface(800, 600));
+    c.open("roll", b"/r", photos(5)).unwrap();
+    assert_eq!(act(&mut c, "develop", &[]), Outcome::Changed);
+    // A minimum-edge crop (width 0.0500) whose pixel rectangle is floored on a
+    // canvas whose width is not a multiple of the crop grid: mapping the whole
+    // rectangle back through pixels would drift it, so the commit works in the
+    // crop's own units and a grab or click that does not move changes nothing.
+    assert_eq!(
+        carry(&mut c, "crop", &["0.2500", "0.2500", "0.0500", "0.5000"]),
+        Outcome::Changed
+    );
+    c.set_preview_fit(Some(Rect {
+        x: 0,
+        y: 0,
+        width: 250,
+        height: 200,
+    }));
+    assert_eq!(act(&mut c, "adjust-crop", &[]), Outcome::Changed);
+
+    // The east edge sits at x = 62 + 12 = 74 (floored from 12.5 px).
+    let armed = fields(&c)[GENERATION].clone();
+    assert_eq!(press(&mut c, 74, 100), Outcome::Ignored);
+    assert_eq!(fields(&c)[GENERATION], armed);
+    let (outcome, effects) = release(&mut c, 74, 100);
+    assert_eq!(outcome, Outcome::Ignored);
+    assert!(effects.is_empty());
+    assert_eq!(fields(&c)[GENERATION], armed);
+    assert_eq!(fields(&c)[CROP], "0.2500 0.2500 0.0500 0.5000");
+}
+
+#[test]
+fn toggling_crop_adjust_over_a_matching_marquee_is_a_frame_change() {
+    let mut c = Controller::new(surface(800, 600));
+    c.open("roll", b"/r", photos(5)).unwrap();
+    assert_eq!(act(&mut c, "develop", &[]), Outcome::Changed);
+    let canvas = Rect {
+        x: 100,
+        y: 100,
+        width: 400,
+        height: 300,
+    };
+    c.set_preview_fit(Some(canvas));
+
+    // A tighten marquee spanning the whole canvas (no crop yet).
+    assert_eq!(press(&mut c, 100, 100), Outcome::Ignored);
+    assert_eq!(drag_to(&mut c, 500, 400), Outcome::Changed);
+    assert_eq!(c.crop_drag(), Some(canvas));
+    let marquee_gen = fields(&c)[GENERATION].clone();
+    let marquee_digest = driven::fnv1a64(&driven::paint(&c.scene()).unwrap().rgb);
+
+    // Entering crop-adjust shows the SAME rectangle but drawn with handle marks:
+    // the rectangle does not move, yet the painted frame differs, so the toggle
+    // is a change and the generation bumps -- the overlay's kind is part of its
+    // identity, not only its rectangle.
+    assert_eq!(act(&mut c, "adjust-crop", &[]), Outcome::Changed);
+    assert_eq!(c.crop_adjust_rect(), Some(canvas));
+    assert_ne!(fields(&c)[GENERATION], marquee_gen);
+    assert_ne!(
+        driven::fnv1a64(&driven::paint(&c.scene()).unwrap().rgb),
+        marquee_digest
+    );
+}
+
+#[test]
+fn opening_a_roll_clears_the_crop_adjust_sub_mode() {
+    let mut c = Controller::new(surface(800, 600));
+    c.open("roll", b"/r", photos(5)).unwrap();
+    assert_eq!(act(&mut c, "develop", &[]), Outcome::Changed);
+    assert_eq!(act(&mut c, "adjust-crop", &[]), Outcome::Changed);
+    assert!(c.adjusting());
+
+    // Opening another roll returns to the cull grid with the sub-mode cleared,
+    // so a later single view cannot paint a stale overlay over the new roll.
+    c.open("roll2", b"/r2", photos(3)).unwrap();
+    assert!(!c.adjusting());
+    assert_eq!(c.crop_adjust_rect(), None);
+    assert_eq!(c.mode(), ui::Mode::Cull);
 }

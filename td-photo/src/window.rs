@@ -1426,7 +1426,14 @@ impl Window {
             name: photo.name.clone(),
             box_w: r#box.width as usize,
             box_h: r#box.height as usize,
-            crop: photo.sidecar.as_ref().and_then(|sidecar| sidecar.crop()),
+            // Crop-adjust shows the uncropped image so the crop can be grown;
+            // its handles overlay the whole frame. Elsewhere the preview is the
+            // cropped result.
+            crop: if ui.adjusting() {
+                None
+            } else {
+                photo.sidecar.as_ref().and_then(|sidecar| sidecar.crop())
+            },
             exposure: photo
                 .sidecar
                 .as_ref()
