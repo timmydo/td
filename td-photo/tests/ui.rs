@@ -719,6 +719,7 @@ fn develop_edits_act_on_the_cursor_only_in_develop_mode() {
         act(&mut c, "crop", &["0.1", "0.1", "0.5", "0.5"]),
         Outcome::Ignored
     );
+    assert_eq!(act(&mut c, "looks", &[]), Outcome::Ignored);
     assert_eq!(fields(&c)[GENERATION], quiet);
 
     // Entering needs the cursor's photo; the mode word then leads the
@@ -1197,7 +1198,7 @@ fn the_binary_replays_the_cull_over_a_roll_and_writes_through_the_sidecar() {
             "1"
         ]
     );
-    assert_eq!(&reply(2)[..2], ["ok", "31"]);
+    assert_eq!(&reply(2)[..2], ["ok", "32"]);
     assert_eq!(reply(3), ["ok", "changed"]);
     assert_eq!(reply(4), ["ok", &name(1), "pick", "-", "-", "-", "ok", "-"]);
     assert_eq!(
@@ -2805,6 +2806,226 @@ fn opening_a_roll_clears_the_crop_adjust_sub_mode() {
     assert!(!c.adjusting());
     assert_eq!(c.crop_adjust_rect(), None);
     assert_eq!(c.mode(), ui::Mode::Cull);
+}
+
+// ---- look list overlay (5(e) fifth slice) ----
+
+/// The look stems a palette test lists, sorted as the adapter reports them.
+fn some_looks() -> Vec<String> {
+    ["contrast-boost", "mono", "velvia-like"]
+        .iter()
+        .map(|stem| stem.to_string())
+        .collect()
+}
+
+#[test]
+fn the_look_palette_toggles_in_develop_and_escapes_in_layers() {
+    let mut c = Controller::new(surface(800, 600));
+    c.open("roll", b"/r", photos(5)).unwrap();
+    c.set_looks(some_looks());
+
+    // In cull the palette toggle is not this mode's: Ignored, nothing listed.
+    assert_eq!(act(&mut c, "looks", &[]), Outcome::Ignored);
+    assert_eq!(c.look_palette(), None);
+
+    // In develop it toggles the sub-mode; the palette lists the looks with no
+    // current one marked, and the crop overlays are not this mode's.
+    assert_eq!(act(&mut c, "develop", &[]), Outcome::Changed);
+    assert_eq!(act(&mut c, "looks", &[]), Outcome::Changed);
+    let looks = some_looks();
+    assert_eq!(c.look_palette(), Some((looks.as_slice(), None)));
+    assert!(!c.adjusting());
+    assert_eq!(c.crop_drag(), None);
+    assert_eq!(act(&mut c, "looks", &[]), Outcome::Changed);
+    assert_eq!(c.look_palette(), None);
+
+    // The `l` key toggles it too.
+    assert_eq!(key(&mut c, "l"), Outcome::Changed);
+    assert!(c.look_palette().is_some());
+
+    // Escape (grid) backs out of the palette first, staying in develop, then
+    // leaves develop for the grid.
+    assert_eq!(act(&mut c, "grid", &[]), Outcome::Changed);
+    assert_eq!(c.look_palette(), None);
+    assert_eq!(c.mode(), ui::Mode::Develop);
+    assert_eq!(act(&mut c, "grid", &[]), Outcome::Changed);
+    assert_eq!(c.mode(), ui::Mode::Cull);
+}
+
+#[test]
+fn the_look_palette_is_a_fact_and_witnessed_by_the_frame() {
+    let mut c = Controller::new(surface(800, 600));
+    c.open("roll", b"/r", photos(5)).unwrap();
+    assert_eq!(act(&mut c, "develop", &[]), Outcome::Changed);
+    c.set_preview_fit(Some(Rect {
+        x: 100,
+        y: 100,
+        width: 400,
+        height: 300,
+    }));
+
+    // An empty look list: opening the palette paints nothing, so it is Ignored
+    // and the frame does not move.
+    let bare = driven::fnv1a64(&driven::paint(&c.scene()).unwrap().rgb);
+    let quiet = fields(&c)[GENERATION].clone();
+    assert_eq!(act(&mut c, "looks", &[]), Outcome::Ignored);
+    assert_eq!(c.look_palette(), None);
+    assert_eq!(fields(&c)[GENERATION], quiet);
+    assert_eq!(
+        driven::fnv1a64(&driven::paint(&c.scene()).unwrap().rgb),
+        bare
+    );
+
+    // set_looks is a fact, like the job count and the preview fit: no bump.
+    c.set_looks(some_looks());
+    assert_eq!(fields(&c)[GENERATION], quiet);
+    assert_eq!(
+        driven::fnv1a64(&driven::paint(&c.scene()).unwrap().rgb),
+        bare
+    );
+
+    // Opening the palette over the non-empty list shows it: a frame change.
+    assert_eq!(act(&mut c, "looks", &[]), Outcome::Changed);
+    assert_ne!(fields(&c)[GENERATION], quiet);
+    assert_ne!(
+        driven::fnv1a64(&driven::paint(&c.scene()).unwrap().rgb),
+        bare
+    );
+
+    // Closing it returns to the bare frame.
+    assert_eq!(act(&mut c, "looks", &[]), Outcome::Changed);
+    assert_eq!(
+        driven::fnv1a64(&driven::paint(&c.scene()).unwrap().rgb),
+        bare
+    );
+}
+
+#[test]
+fn the_look_palette_marks_the_current_look_and_ignores_the_pointer() {
+    let mut c = Controller::new(surface(800, 600));
+    c.open("roll", b"/r", photos(5)).unwrap();
+    assert_eq!(act(&mut c, "develop", &[]), Outcome::Changed);
+    c.set_preview_fit(Some(Rect {
+        x: 100,
+        y: 100,
+        width: 400,
+        height: 300,
+    }));
+    c.set_looks(some_looks());
+    assert_eq!(carry(&mut c, "look", &["mono"]), Outcome::Changed);
+
+    // The palette marks the cursor photo's current look (mono, index 1).
+    assert_eq!(act(&mut c, "looks", &[]), Outcome::Changed);
+    let looks = some_looks();
+    assert_eq!(c.look_palette(), Some((looks.as_slice(), Some(1))));
+
+    // The read-only palette owns the box and ignores the pointer: no crop drag
+    // starts and it stays open.
+    assert_eq!(press(&mut c, 200, 200), Outcome::Ignored);
+    assert_eq!(c.crop_drag(), None);
+    assert_eq!(drag_to(&mut c, 260, 240), Outcome::Ignored);
+    let (outcome, effects) = release(&mut c, 260, 240);
+    assert_eq!(outcome, Outcome::Ignored);
+    assert!(effects.is_empty());
+    assert!(c.look_palette().is_some());
+}
+
+#[test]
+fn the_look_palette_and_crop_adjust_are_mutually_exclusive() {
+    let mut c = Controller::new(surface(800, 600));
+    c.open("roll", b"/r", photos(5)).unwrap();
+    assert_eq!(act(&mut c, "develop", &[]), Outcome::Changed);
+    c.set_preview_fit(Some(Rect {
+        x: 100,
+        y: 100,
+        width: 400,
+        height: 300,
+    }));
+    c.set_looks(some_looks());
+
+    // Opening the palette while adjusting closes crop-adjust.
+    assert_eq!(act(&mut c, "adjust-crop", &[]), Outcome::Changed);
+    assert!(c.adjusting());
+    assert_eq!(act(&mut c, "looks", &[]), Outcome::Changed);
+    assert!(c.look_palette().is_some());
+    assert!(!c.adjusting());
+    assert_eq!(c.crop_adjust_rect(), None);
+
+    // Entering crop-adjust while the palette is open closes the palette.
+    assert_eq!(act(&mut c, "adjust-crop", &[]), Outcome::Changed);
+    assert!(c.adjusting());
+    assert_eq!(c.look_palette(), None);
+    assert!(c.crop_adjust_rect().is_some());
+}
+
+#[test]
+fn the_look_palette_drops_on_a_photo_switch() {
+    let mut c = Controller::new(surface(800, 600));
+    c.open("roll", b"/r", photos(5)).unwrap();
+    assert_eq!(act(&mut c, "develop", &[]), Outcome::Changed);
+    c.set_looks(some_looks());
+    assert_eq!(act(&mut c, "looks", &[]), Outcome::Changed);
+    assert!(c.look_palette().is_some());
+
+    // Moving to the next photo ends the palette, as it ends a drag or
+    // crop-adjust; the look list (a fact) survives the switch.
+    assert_eq!(act(&mut c, "next", &[]), Outcome::Changed);
+    assert_eq!(c.look_palette(), None);
+    assert_eq!(act(&mut c, "looks", &[]), Outcome::Changed);
+    let looks = some_looks();
+    assert_eq!(c.look_palette(), Some((looks.as_slice(), None)));
+}
+
+#[test]
+fn the_look_palette_is_not_witnessed_without_a_develop_box() {
+    // A surface too small for a develop box: the sub-mode can open, but with
+    // no box nothing paints the palette, so its toggle is not a frame change.
+    // The witness gates the generation on the box, as the paint does.
+    let mut c = Controller::new(surface(400, 40));
+    c.open("roll", b"/r", photos(1)).unwrap();
+    assert_eq!(act(&mut c, "develop", &[]), Outcome::Changed);
+    c.set_looks(some_looks());
+    assert_eq!(c.develop_box(), None);
+
+    let bare = driven::fnv1a64(&driven::paint(&c.scene()).unwrap().rgb);
+    let quiet = fields(&c)[GENERATION].clone();
+    // Opening the sub-mode paints nothing over a boxless surface: Ignored, no
+    // bump, and the frame does not move.
+    assert_eq!(act(&mut c, "looks", &[]), Outcome::Ignored);
+    assert!(c.look_palette().is_some());
+    assert_eq!(fields(&c)[GENERATION], quiet);
+    assert_eq!(
+        driven::fnv1a64(&driven::paint(&c.scene()).unwrap().rgb),
+        bare
+    );
+    // Closing it again is likewise no frame change.
+    assert_eq!(act(&mut c, "looks", &[]), Outcome::Ignored);
+    assert_eq!(fields(&c)[GENERATION], quiet);
+}
+
+#[test]
+fn a_touch_behind_the_open_palette_does_not_bump() {
+    let mut c = Controller::new(surface(800, 600));
+    c.open("roll", b"/r", photos(5)).unwrap();
+    assert_eq!(act(&mut c, "develop", &[]), Outcome::Changed);
+    c.set_looks(some_looks());
+
+    // Outside the palette a touch -- a develop image landing, a thumbnail
+    // arriving -- is a new generation.
+    let before = fields(&c)[GENERATION].clone();
+    c.touch();
+    assert_ne!(fields(&c)[GENERATION], before);
+
+    // With the palette open its opaque panel covers the develop box, so a
+    // touch behind it changes nothing on screen: no bump.
+    assert_eq!(act(&mut c, "looks", &[]), Outcome::Changed);
+    let open = fields(&c)[GENERATION].clone();
+    c.touch();
+    assert_eq!(fields(&c)[GENERATION], open);
+
+    // Closing the palette bumps, so the image held meanwhile is shown then.
+    assert_eq!(act(&mut c, "looks", &[]), Outcome::Changed);
+    assert_ne!(fields(&c)[GENERATION], open);
 }
 
 // ---- crop aspect presets (5(e) fourth slice) ----

@@ -10,7 +10,7 @@
 //! modules take bytes and buffers, and the window takes its thumbnails
 //! from here.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::{self, BufWriter, Read, Write};
@@ -1371,6 +1371,26 @@ fn looks(stem: Option<&OsStr>) -> Result<(), String> {
     Ok(())
 }
 
+/// The look stems the palette lists: the built-in set and the user's
+/// `*.look` files, merged, sorted and deduped (a user look shares its
+/// built-in's stem). User looks that cannot be listed (no directory, or one
+/// that cannot be read) are skipped, as the `looks` verb notes them, so the
+/// palette always carries the built-ins.
+fn look_stems() -> Vec<String> {
+    let mut stems: BTreeSet<String> = look::BUILTIN
+        .iter()
+        .map(|(stem, _)| (*stem).to_string())
+        .collect();
+    if let Ok(user) = looks_dir().and_then(|dir| user_looks(&dir)) {
+        for (stem, _) in user {
+            if library::valid_look(&stem) {
+                stems.insert(stem);
+            }
+        }
+    }
+    stems.into_iter().collect()
+}
+
 /// Every `STEM.look` in `dir` with its name, or `error` and why it is
 /// refused; a stem the sidecar grammar cannot hold is listed quoted and
 /// escaped, so a name with a tab or a newline in it is still one record
@@ -1890,8 +1910,13 @@ fn note(why: &str) {
 
 impl Session {
     fn new(surface: Surface) -> Session {
+        let mut ui = ui::Controller::new(surface);
+        // The look palette's list, reported once as a fact: session-static, so
+        // a look added on disk mid-session appears on the next run, as the
+        // `looks` verb would show it.
+        ui.set_looks(look_stems());
         Session {
-            ui: ui::Controller::new(surface),
+            ui,
             idle: true,
             quit: false,
         }

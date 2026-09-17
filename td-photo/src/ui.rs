@@ -228,13 +228,14 @@ pub enum Action {
     Crop,
     AdjustCrop,
     Aspect,
+    Looks,
     Reset,
     Scroll,
     Quit,
 }
 
 impl Action {
-    pub const ALL: [Action; 31] = [
+    pub const ALL: [Action; 32] = [
         Action::Open,
         Action::Next,
         Action::Previous,
@@ -263,6 +264,7 @@ impl Action {
         Action::Crop,
         Action::AdjustCrop,
         Action::Aspect,
+        Action::Looks,
         Action::Reset,
         Action::Scroll,
         Action::Quit,
@@ -298,6 +300,7 @@ impl Action {
             Self::Crop => "crop",
             Self::AdjustCrop => "adjust-crop",
             Self::Aspect => "aspect",
+            Self::Looks => "looks",
             Self::Reset => "reset",
             Self::Scroll => "scroll",
             Self::Quit => "quit",
@@ -323,7 +326,7 @@ impl Action {
 /// binds, the argument shape and the help line. Actions without a chord
 /// take an argument or are the agent's (`open`); the pointer reaches
 /// `select` by pressing a cell and `scroll` by the wheel.
-pub const BINDINGS: [Binding; 31] = [
+pub const BINDINGS: [Binding; 32] = [
     Binding {
         name: "open",
         chord: None,
@@ -491,6 +494,12 @@ pub const BINDINGS: [Binding; 31] = [
         chord: None,
         arguments: "RATIO",
         help: "Lock the crop drag to a ratio: free, 3:2, 4:3, 1:1 or 16:9 (develop mode).",
+    },
+    Binding {
+        name: "looks",
+        chord: Some("l"),
+        arguments: "",
+        help: "Toggle the look palette: the available looks, the current marked (develop mode).",
     },
     Binding {
         name: "reset",
@@ -686,6 +695,17 @@ pub struct Controller {
     /// surface resize and the crop-adjust toggle, so a ratio picked in one
     /// governs the next drag either way.
     aspect: Aspect,
+    /// The available look stems (built-in and user) the adapter last reported
+    /// with `set_looks`: what the look palette lists. A fact like the job
+    /// count -- sorted and deduped by the adapter -- so it never bumps the
+    /// generation and is absent from `state`.
+    looks: Vec<String>,
+    /// The look-palette sub-mode of develop: the box lists the available looks
+    /// with the current one marked, for discovery (picking from it is a later
+    /// slice; the `look` action still sets one). Off outside develop, dropped
+    /// when the photo or mode changes, kept across a surface resize, and
+    /// mutually exclusive with crop-adjust.
+    look_list: bool,
 }
 
 /// A crop drag: the canvas it maps against (the develop preview's fitted
@@ -1126,6 +1146,22 @@ fn classify(rect: Rect, canvas: Rect, x: i64, y: i64, grip: i64) -> Option<Zone>
     Some(zone)
 }
 
+/// The overlay the scene paints over the develop box, as its identity for the
+/// generation: the crop-adjust rectangle or tighten marquee (the kind matters,
+/// so a marquee and a crop-adjust rectangle of the same shape are different
+/// frames), or the look palette. Mutually exclusive; `None` when nothing is
+/// painted. The generation follows this, so it moves exactly when the overlay
+/// does.
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum Painted {
+    /// `true` the crop-adjust rectangle (drawn with handle marks), `false` a
+    /// plain tighten marquee outline; a zero-edge rectangle is never this.
+    Crop(bool, Rect),
+    /// The look palette (a non-empty list of look names); its rows and the
+    /// current-look mark are derived, so its identity is just that it shows.
+    Looks,
+}
+
 impl Controller {
     pub fn new(surface: Surface) -> Controller {
         Controller {
@@ -1145,6 +1181,8 @@ impl Controller {
             drag: None,
             adjusting: false,
             aspect: Aspect::Free,
+            looks: Vec::new(),
+            look_list: false,
         }
     }
 
@@ -1172,6 +1210,7 @@ impl Controller {
         self.drag = None;
         self.adjusting = false;
         self.aspect = Aspect::Free;
+        self.look_list = false;
         self.preview_fit = None;
         self.refresh_shown();
         self.cursor = self.shown.first().copied();
@@ -1279,6 +1318,29 @@ impl Controller {
         self.preview_fit = fit;
     }
 
+    /// The look stems the palette lists (built-in and user), as the adapter
+    /// enumerated them: a fact like the job count -- sorted and deduped by the
+    /// adapter -- so it never bumps the generation. Session-static in practice,
+    /// reported once when the roll opens.
+    pub fn set_looks(&mut self, looks: Vec<String>) {
+        self.looks = looks;
+    }
+
+    /// The look palette for the scene, when it is open over a non-empty list:
+    /// the available look stems and the index of the cursor photo's current
+    /// look among them (the row to mark), or `None`. Read by the scene; a fact
+    /// and a frame-witnessed sub-mode, not a `state` field.
+    pub fn look_palette(&self) -> Option<(&[String], Option<usize>)> {
+        if !self.look_list || self.looks.is_empty() {
+            return None;
+        }
+        let active = self.cursor.and_then(|index| {
+            let stem = self.current_look(index)?;
+            self.looks.iter().position(|look| look == stem)
+        });
+        Some((&self.looks, active))
+    }
+
     /// The crop drag's canvas: the developed image's fitted rectangle when
     /// the adapter has reported one, else the develop box itself (exact when
     /// the developed image fills the box, as an uncropped 3:2 frame does).
@@ -1335,29 +1397,40 @@ impl Controller {
             .unwrap_or(FULL_CROP)
     }
 
-    /// The overlay the scene actually paints over the develop box, as its kind
-    /// and rectangle, or `None` when nothing is: `true` (the crop-adjust
-    /// rectangle, drawn with handle marks) while adjusting, else `false` (a
-    /// plain tighten marquee outline). The kind is part of the identity -- the
-    /// same rectangle drawn as a marquee and as a crop-adjust rectangle are
-    /// different frames -- so a toggle between them is a change though the
-    /// rectangle does not move. Both painters suppress a zero-edge rectangle, so
-    /// such an outline is invisible and its change is not a frame change. The
-    /// generation follows this, so it moves exactly when the overlay does.
-    fn painted(&self) -> Option<(bool, Rect)> {
+    /// The cursor photo's look stem, or `None` when it has none: the row the
+    /// palette marks as current.
+    fn current_look(&self, index: usize) -> Option<&str> {
+        self.photos
+            .get(index)
+            .and_then(|photo| photo.sidecar.as_ref())
+            .and_then(Sidecar::look)
+    }
+
+    /// The overlay the scene actually paints over the develop box, or `None`
+    /// when nothing is: the look palette when it is open over a non-empty list
+    /// with a box to paint into, else the crop-adjust rectangle while adjusting
+    /// or the tighten marquee. The kind is part of the identity, so a toggle
+    /// between two overlays of the same rectangle is still a change. A zero-edge
+    /// crop rectangle, an empty look list, and a surface too small for a develop
+    /// box are invisible, so their change is not a frame change. The generation
+    /// follows this, so it moves exactly when the overlay does.
+    fn painted(&self) -> Option<Painted> {
+        if self.look_list && !self.looks.is_empty() && self.develop_box().is_some() {
+            return Some(Painted::Looks);
+        }
         let rect = if self.adjusting {
             self.crop_adjust_rect()
         } else {
             self.drag.as_ref().map(marquee_now)
         };
         rect.filter(|rect| rect.width > 0 && rect.height > 0)
-            .map(|rect| (self.adjusting, rect))
+            .map(|rect| Painted::Crop(self.adjusting, rect))
     }
 
     /// The outcome of a pointer step or a mode toggle that may have changed the
     /// painted overlay: `Changed` with one generation bump when it differs from
     /// `before`, else `Ignored` with no bump.
-    fn outline_changed(&mut self, before: Option<(bool, Rect)>) -> (Outcome, Vec<Effect>) {
+    fn outline_changed(&mut self, before: Option<Painted>) -> (Outcome, Vec<Effect>) {
         if self.painted() == before {
             (Outcome::Ignored, Vec::new())
         } else {
@@ -1366,9 +1439,15 @@ impl Controller {
         }
     }
 
-    /// Something the adapter paints into the frame changed (a thumbnail
-    /// arrived for a photo on screen): a new generation.
+    /// Something the adapter paints into the frame changed (a thumbnail arrived
+    /// for a photo on screen, or the develop image landed): a new generation --
+    /// unless the look palette is painted over the develop box, an opaque panel
+    /// that hides whatever landed behind it. Closing the palette bumps the
+    /// generation, so the image the adapter held meanwhile is shown then.
     pub fn touch(&mut self) {
+        if self.painted() == Some(Painted::Looks) {
+            return;
+        }
         self.bump();
     }
 
@@ -1649,6 +1728,7 @@ impl Controller {
             (Action::Crop, [x, y, w, h]) => return self.set_crop(x, y, w, h, effects),
             (Action::AdjustCrop, []) => self.toggle_adjust()?,
             (Action::Aspect, [ratio]) => return self.set_aspect(ratio, effects),
+            (Action::Looks, []) => self.toggle_looks()?,
             (Action::Reset, []) => return self.reset_develop(effects),
             _ => return Err(control::Error::Protocol.into()),
         };
@@ -1666,6 +1746,11 @@ impl Controller {
         // status row, the margins) starts no drag, as a filter press is inert
         // here. Nothing else in develop uses the pointer.
         if self.mode == Mode::Develop {
+            // The read-only look palette owns the develop box while it is open,
+            // and ignores the pointer: it starts no crop drag.
+            if self.look_list {
+                return Ok((Outcome::Ignored, Vec::new()));
+            }
             return self.crop_pointer(phase, x, y);
         }
         // Only a press, and only on the surface: a header the width does
@@ -1887,8 +1972,8 @@ impl Controller {
                         // frame). `commit_crop` also drove the live overlay, so
                         // the snap is usually nothing and only the settle bumps.
                         let settled = crop_on_canvas(canvas, crop);
-                        let settled =
-                            (settled.width > 0 && settled.height > 0).then_some((true, settled));
+                        let settled = (settled.width > 0 && settled.height > 0)
+                            .then_some(Painted::Crop(true, settled));
                         if settled != before {
                             self.bump();
                         }
@@ -1967,6 +2052,17 @@ impl Controller {
     /// then from develop to the cull grid; from the single view, back to the
     /// grid; from the grid, nothing.
     fn back_to_grid(&mut self) -> Outcome {
+        if self.mode == Mode::Develop && self.look_list {
+            // Escape closes the palette first, then leaves develop; closing an
+            // empty (invisible) palette is no frame change.
+            let before = self.painted();
+            self.look_list = false;
+            return if self.painted() == before {
+                Outcome::Ignored
+            } else {
+                Outcome::Changed
+            };
+        }
         if self.mode == Mode::Develop && self.adjusting {
             self.adjusting = false;
             self.drag = None;
@@ -1977,6 +2073,7 @@ impl Controller {
             self.view = View::Grid;
             self.drag = None;
             self.aspect = Aspect::Free;
+            self.look_list = false;
             return Outcome::Changed;
         }
         self.set_view(View::Grid)
@@ -1994,6 +2091,37 @@ impl Controller {
         let before = self.painted();
         self.adjusting = !self.adjusting;
         self.drag = None;
+        // Crop-adjust and the look palette are mutually exclusive overlays.
+        if self.adjusting {
+            self.look_list = false;
+        }
+        Ok(if self.painted() == before {
+            Outcome::Ignored
+        } else {
+            Outcome::Changed
+        })
+    }
+
+    /// Toggles the read-only look palette for the cursor's photo; only in
+    /// develop mode (`Ignored` in cull, as the other develop edits are).
+    /// Opening it closes crop-adjust, the two being mutually exclusive
+    /// overlays; opening over an empty list paints nothing, so it stays closed
+    /// and is `Ignored`. The palette is a frame change witnessed by the painted
+    /// overlay; the settle-bump is `finish`'s, on the `Changed` this returns.
+    fn toggle_looks(&mut self) -> Result<Outcome, Error> {
+        if self.develop_photo()?.is_none() {
+            return Ok(Outcome::Ignored);
+        }
+        let before = self.painted();
+        if self.look_list {
+            self.look_list = false;
+        } else {
+            self.look_list = !self.looks.is_empty();
+            if self.look_list {
+                self.adjusting = false;
+                self.drag = None;
+            }
+        }
         Ok(if self.painted() == before {
             Outcome::Ignored
         } else {
@@ -2015,6 +2143,7 @@ impl Controller {
         self.drag = None;
         self.adjusting = false;
         self.aspect = Aspect::Free;
+        self.look_list = false;
         Ok(Outcome::Changed)
     }
 
@@ -2168,11 +2297,12 @@ impl Controller {
     fn keep_cursor_shown(&mut self) {
         if self.position().is_none() {
             self.cursor = self.shown.first().copied();
-            // The cursor left the photo the drag, crop-adjust and aspect lock
-            // were for; end them.
+            // The cursor left the photo the drag, crop-adjust, aspect lock and
+            // look palette were for; end them.
             self.drag = None;
             self.adjusting = false;
             self.aspect = Aspect::Free;
+            self.look_list = false;
         }
         if self.cursor.is_none() {
             self.view = View::Grid;
@@ -2180,6 +2310,7 @@ impl Controller {
             self.drag = None;
             self.adjusting = false;
             self.aspect = Aspect::Free;
+            self.look_list = false;
         }
         self.reveal();
     }
@@ -2203,11 +2334,12 @@ impl Controller {
             return Ok(Outcome::Ignored);
         }
         self.cursor = Some(index);
-        // The cursor moved off the photo the drag, crop-adjust and aspect lock
-        // were for; end them.
+        // The cursor moved off the photo the drag, crop-adjust, aspect lock
+        // and look palette were for; end them.
         self.drag = None;
         self.adjusting = false;
         self.aspect = Aspect::Free;
+        self.look_list = false;
         self.reveal();
         Ok(Outcome::Changed)
     }
@@ -2489,11 +2621,12 @@ impl Scene<'_> {
         // into, so the placeholder and the image share one geometry.
         if let Some(r#box) = layout.preview_box() {
             fill(r#box, PLACEHOLDER, damage, sink);
-            // The crop overlay over the preview, clipped to the box so it
-            // cannot stray past it; drawn here so it is in the scene frame,
-            // the `--preview` PPM and the replay `text` oracle, and repainted
-            // over the blitted image on the live window as the badges are.
-            paint_crop(self.model, r#box, s, damage, sink);
+            // The develop overlay over the preview -- the crop overlay, or the
+            // look palette when it is open -- clipped to the box so it cannot
+            // stray past it; drawn here so it is in the scene frame, the
+            // `--preview` PPM and the replay `text` oracle, and repainted over
+            // the blitted image on the live window as the badges are.
+            paint_develop_overlay(self.model, r#box, scale, damage, sink);
         }
     }
 }
@@ -2557,6 +2690,79 @@ fn handle_marks(rect: Rect) -> [(i64, i64); 8] {
         (l, my),
         (r, my),
     ]
+}
+
+/// The develop box's overlay: the read-only look palette when it is open, else
+/// the crop overlay. Mutually exclusive; painted by the scene and again by the
+/// window over the blitted image.
+fn paint_develop_overlay(
+    model: &Controller,
+    r#box: Rect,
+    scale: Scale,
+    damage: Rect,
+    sink: &mut dyn FnMut(Draw),
+) {
+    if model.look_palette().is_some() {
+        paint_looks(model, r#box, scale, damage, sink);
+    } else {
+        paint_crop(model, r#box, scale.value(), damage, sink);
+    }
+}
+
+/// The read-only look palette over the develop box: an opaque panel listing the
+/// available look stems, the current one marked. Chrome (frame fills and
+/// glyphs), clipped to the box, so photo pixels reach the frame only through
+/// `blit` when the palette is closed. Rows past the box are not shown (scroll
+/// is a later slice, as picking a look from the palette is).
+fn paint_looks(
+    model: &Controller,
+    r#box: Rect,
+    scale: Scale,
+    damage: Rect,
+    sink: &mut dyn FnMut(Draw),
+) {
+    let Some((looks, active)) = model.look_palette() else {
+        return;
+    };
+    let Some(clip) = r#box.intersection(damage) else {
+        return;
+    };
+    let s = scale.value();
+    // An opaque panel so the names read over the develop image.
+    fill(r#box, CHROME, clip, sink);
+    let pad = (CELL_PAD * s) as i64;
+    let row = (CELL_HEIGHT * s) as i64;
+    let bottom = r#box.y + i64::from(r#box.height);
+    let width = (i64::from(r#box.width) - 2 * pad).max(0) as u32;
+    for (index, look) in looks.iter().enumerate() {
+        let y = r#box.y + pad + row * index as i64;
+        if y + row > bottom {
+            break;
+        }
+        let line = Rect {
+            x: r#box.x + pad,
+            y,
+            width,
+            height: row as u32,
+        };
+        let current = active == Some(index);
+        let background = if current {
+            fill(line, SELECTED, clip, sink);
+            SELECTED
+        } else {
+            CHROME
+        };
+        let ink = if current { PAPER } else { INK };
+        text_run(
+            scale,
+            look.chars(),
+            (line.x, line.y),
+            line,
+            GlyphStyle::medium(ink, background),
+            clip,
+            sink,
+        );
+    }
 }
 
 impl Composition for Scene<'_> {
@@ -2693,10 +2899,10 @@ impl Composition for Badges<'_> {
     }
 }
 
-/// The crop overlay and nothing else, a composition the window paints over the
-/// develop image it blitted, clipped to the box. So painted, over the scene's
-/// own frame it changes nothing: the outline and handles are the scene's, at
-/// the same place.
+/// The develop overlay and nothing else -- the crop overlay, or the look
+/// palette when it is open -- a composition the window paints over the develop
+/// image it blitted, clipped to the box. So painted, over the scene's own frame
+/// it changes nothing: it is the scene's overlay at the same place.
 pub struct Marquee<'a> {
     model: &'a Controller,
 }
@@ -2710,13 +2916,7 @@ impl Composition for Marquee<'_> {
         let Some(r#box) = self.model.develop_box() else {
             return;
         };
-        paint_crop(
-            self.model,
-            r#box,
-            self.model.surface.scale.value(),
-            damage,
-            sink,
-        );
+        paint_develop_overlay(self.model, r#box, self.model.surface.scale, damage, sink);
     }
 }
 
