@@ -103,11 +103,11 @@ modes are the photographer's order of work.
    its edge, corner and interior handles, saving on release. The `aspect`
    action locks the crop drag to a ratio (free, 3:2, 4:3, 1:1 or 16:9), held
    in the preview's own pixel space, so a locked marquee, corner or edge drag
-   keeps that ratio; picking a ratio only arms the lock. A read-only look
-   palette toggled with `l` lists the available looks with the current one
-   marked. Picking a look from that palette, the immediate snap that reshapes
-   the current crop and the live scaled preview under the marquee are later
-   slices, as `export` is. Every change is saved to the
+   keeps that ratio; picking a ratio only arms the lock. A look palette
+   toggled with `l` lists the available looks with the current one marked, and
+   a press on a name picks it. The immediate snap that reshapes the current
+   crop and the live scaled preview under the marquee are later slices, as
+   `export` is. Every change is saved to the
    sidecar as it is made; there is no explicit save and no undo stack in
    version 1, only reset to camera defaults.
 
@@ -221,11 +221,13 @@ window, all speaking the toolkit's one vocabulary.
   shows is not; its release commits the resized or moved crop, or clears it
   when the rectangle covers the whole frame. The `aspect` lock shapes the drag
   geometry, not the frame directly: a locked drag moves the outlined rectangle,
-  already a change, while arming a ratio paints nothing. A read-only look
-  palette, toggled with `l`, lists the available looks over the develop box
-  with the current one marked: opening or closing it over a non-empty list with
-  a box to paint into is a change, over an empty list or a surface too small for
-  a box nothing, and the mark follows the look edit's settle. So the aspect
+  already a change, while arming a ratio paints nothing. A look palette,
+  toggled with `l`, lists the available looks over the develop box with the
+  current one marked: opening or closing it over a non-empty list with a box to
+  paint into is a change, over an empty list or a surface too small for a box
+  nothing. A press on a name picks that look through the same edit the `look`
+  action makes, so the mark follows the edit's settle; the palette stays open.
+  So the aspect
   lock, the crop-adjust and look-palette sub-mode flags, the available look list
   (reported once when a session opens) and the developed image's fitted
   rectangle for the drag's canvas (the window's report) are none of them
@@ -1000,9 +1002,10 @@ in pixels, a locked edge clamped to the minimum, switching back to free, the
 lock dropped on a photo switch, and a bad ratio token or wrong mode refused);
 the look palette (toggled only in develop and escaping in layers; a `set_looks`
 fact and a frame-witnessed sub-mode an empty list or a boxless surface leaves
-blank; the current look marked and the pointer ignored; mutually exclusive with
-crop-adjust and dropped on a photo switch; a touch behind the open palette not
-bumping the generation), and `open` refusing a bad
+blank; the current look marked and picked by a press on its name (a press off
+the names or with no box picking nothing); mutually exclusive with crop-adjust
+and dropped on a photo switch; a touch behind the open palette not bumping the
+generation), and `open` refusing a bad
 socket
 path, a
 second roll or a stray flag before it looks for a display and leaving no socket
@@ -1099,13 +1102,15 @@ all-target Clippy.
    live scaled preview under the marquee: both need the window to report the
    displayed crop, not only its fit, since crop-adjust develops the frame
    uncropped only asynchronously and a snap issued before that fit lands would
-   read a stale cropped aspect as the whole image's. Landed. Fifth: a read-only
+   read a stale cropped aspect as the whole image's. Landed. Fifth: a
    look palette — the `looks` action (`l`) toggles a list of the available
    looks (built-in and user stems, a `set_looks` fact) over the develop box
    with the current one marked. It is a frame-witnessed sub-mode, mutually
-   exclusive with crop-adjust, and read-only: the pointer is ignored and the
-   `look` action still sets one. Landed. Picking a look from the palette and
-   the live scaled preview under the marquee remain later slices.
+   exclusive with crop-adjust. Landed. Sixth: picking from the palette — a
+   press on a name sets that look through the same `Edit` the `look` action
+   makes, so the mark rides the edit's settle and the palette stays open; a
+   press off the names, or on a surface too small for the box, picks nothing.
+   Landed. The live scaled preview under the marquee remains a later slice.
 6. Export: banded full-resolution bilinear demosaic, the JPEG encoder,
    `exported/` naming, and `td-photo export`; and `delete-rejected`, the
    action and its verb that move rejects and their sidecars into

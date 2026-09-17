@@ -23,6 +23,7 @@ use td_photo::ui::{self, Action, Controller, Effect, Photo, View, BINDINGS};
 use td_ui::control::{frame, hex, valid_code, Decoder, ErrorCode};
 use td_ui::driven::{self, Input, Outcome, PointerPhase};
 use td_ui::raster::{Rect, Scale, Surface};
+use td_ui::CELL_HEIGHT;
 
 const MODE: usize = 0;
 const SHOWN: usize = 3;
@@ -2901,16 +2902,10 @@ fn the_look_palette_is_a_fact_and_witnessed_by_the_frame() {
 }
 
 #[test]
-fn the_look_palette_marks_the_current_look_and_ignores_the_pointer() {
+fn the_look_palette_marks_the_current_look_and_picks_with_the_pointer() {
     let mut c = Controller::new(surface(800, 600));
     c.open("roll", b"/r", photos(5)).unwrap();
     assert_eq!(act(&mut c, "develop", &[]), Outcome::Changed);
-    c.set_preview_fit(Some(Rect {
-        x: 100,
-        y: 100,
-        width: 400,
-        height: 300,
-    }));
     c.set_looks(some_looks());
     assert_eq!(carry(&mut c, "look", &["mono"]), Outcome::Changed);
 
@@ -2919,15 +2914,163 @@ fn the_look_palette_marks_the_current_look_and_ignores_the_pointer() {
     let looks = some_looks();
     assert_eq!(c.look_palette(), Some((looks.as_slice(), Some(1))));
 
-    // The read-only palette owns the box and ignores the pointer: no crop drag
-    // starts and it stays open.
-    assert_eq!(press(&mut c, 200, 200), Outcome::Ignored);
+    // The rows the palette paints, top-down over the develop box: the top pad,
+    // then one CELL_HEIGHT-high row each. `at(i)` is the middle of row `i`.
+    let r#box = c.develop_box().unwrap();
+    let pad = ui::CELL_PAD as i64;
+    let row = CELL_HEIGHT as i64;
+    let at = |index: i64| Input::Pointer {
+        phase: PointerPhase::Press,
+        x: (r#box.x + pad + 2) as u32,
+        y: (r#box.y + pad + row * index + row / 2) as u32,
+    };
+
+    // A press on the current look (mono, row 1) is a no-op: Ignored, no effect,
+    // no crop drag, the mark unmoved.
+    let (outcome, effects) = c.input(at(1)).unwrap();
+    assert_eq!(outcome, Outcome::Ignored);
+    assert!(effects.is_empty());
     assert_eq!(c.crop_drag(), None);
+    assert_eq!(c.look_palette(), Some((looks.as_slice(), Some(1))));
+
+    // A press on another look (velvia-like, row 2) picks it: one look edit, and
+    // once it settles the mark moves there. The palette stays open.
+    let (outcome, effects) = c.input(at(2)).unwrap();
+    assert_eq!(outcome, Outcome::Changed);
+    assert_eq!(effects.len(), 1);
+    assert!(matches!(&effects[0], Effect::Edit { key: Key::Look, .. }));
+    assert_eq!(c.crop_drag(), None);
+    assert_eq!(apply(&mut c, &effects).unwrap(), Outcome::Changed);
+    assert_eq!(c.look_palette(), Some((looks.as_slice(), Some(2))));
+
+    // A press off the names -- the left padding -- picks nothing.
+    let (outcome, effects) = c
+        .input(Input::Pointer {
+            phase: PointerPhase::Press,
+            x: r#box.x as u32,
+            y: (r#box.y + pad + row / 2) as u32,
+        })
+        .unwrap();
+    assert_eq!(outcome, Outcome::Ignored);
+    assert!(effects.is_empty());
+
+    // Move and release are inert; the palette stays open throughout.
     assert_eq!(drag_to(&mut c, 260, 240), Outcome::Ignored);
     let (outcome, effects) = release(&mut c, 260, 240);
     assert_eq!(outcome, Outcome::Ignored);
     assert!(effects.is_empty());
     assert!(c.look_palette().is_some());
+}
+
+#[test]
+fn the_look_palette_pick_needs_a_develop_box() {
+    // On a surface too small for a develop box the palette opens as a sub-mode
+    // but paints nothing, so a press picks nothing: no row exists to hit.
+    let mut c = Controller::new(surface(400, 40));
+    c.open("roll", b"/r", photos(1)).unwrap();
+    assert_eq!(act(&mut c, "develop", &[]), Outcome::Changed);
+    c.set_looks(some_looks());
+    assert_eq!(act(&mut c, "looks", &[]), Outcome::Ignored);
+    assert!(c.look_palette().is_some());
+    assert_eq!(c.develop_box(), None);
+
+    let (outcome, effects) = c
+        .input(Input::Pointer {
+            phase: PointerPhase::Press,
+            x: 10,
+            y: 10,
+        })
+        .unwrap();
+    assert_eq!(outcome, Outcome::Ignored);
+    assert!(effects.is_empty());
+    assert_eq!(c.crop_drag(), None);
+}
+
+#[test]
+fn picking_a_look_named_dash_sets_it_not_clears() {
+    let mut c = Controller::new(surface(800, 600));
+    c.open("roll", b"/r", photos(5)).unwrap();
+    assert_eq!(act(&mut c, "develop", &[]), Outcome::Changed);
+    // `-` is the `look` action's clear sentinel but a valid look stem: a user
+    // `-.look` lists in the palette, and a press there must set that look, not
+    // clear the current one.
+    c.set_looks(vec!["-".to_string(), "mono".to_string()]);
+    assert_eq!(act(&mut c, "looks", &[]), Outcome::Changed);
+
+    let r#box = c.develop_box().unwrap();
+    let pad = ui::CELL_PAD as i64;
+    let row = CELL_HEIGHT as i64;
+    // Row 0 is the `-` look; the edit sets it (value `Some("-")`), not `None`.
+    let (outcome, effects) = c
+        .input(Input::Pointer {
+            phase: PointerPhase::Press,
+            x: (r#box.x + pad + 2) as u32,
+            y: (r#box.y + pad + row / 2) as u32,
+        })
+        .unwrap();
+    assert_eq!(outcome, Outcome::Changed);
+    assert_eq!(
+        effects,
+        [Effect::Edit {
+            index: 0,
+            name: file(0),
+            key: Key::Look,
+            value: Some("-".to_string()),
+        }]
+    );
+}
+
+#[test]
+fn the_look_palette_pick_rejects_the_padding_and_clipped_rows() {
+    let mut c = Controller::new(surface(800, 600));
+    c.open("roll", b"/r", photos(5)).unwrap();
+    assert_eq!(act(&mut c, "develop", &[]), Outcome::Changed);
+    let r#box = c.develop_box().unwrap();
+    let pad = ui::CELL_PAD as i64;
+    let row = CELL_HEIGHT as i64;
+    let width = (i64::from(r#box.width) - 2 * pad).max(0);
+    // Enough looks that a row falls past the box bottom.
+    let fit = (i64::from(r#box.height) - pad) / row;
+    assert!(fit >= 2);
+    let looks: Vec<String> = (0..fit + 2).map(|i| format!("look-{i}")).collect();
+    c.set_looks(looks);
+    assert_eq!(act(&mut c, "looks", &[]), Outcome::Changed);
+
+    let press = |c: &mut Controller, x: i64, y: i64| {
+        c.input(Input::Pointer {
+            phase: PointerPhase::Press,
+            x: x as u32,
+            y: y as u32,
+        })
+        .unwrap()
+    };
+    let inert = |(outcome, effects): (Outcome, Vec<Effect>)| {
+        assert_eq!(outcome, Outcome::Ignored);
+        assert!(effects.is_empty());
+    };
+    // The top padding, the left padding, the right padding past the names, and
+    // a row clipped by the box bottom are none of them a name: a press picks
+    // nothing.
+    inert(press(&mut c, r#box.x + pad + 2, r#box.y + pad - 1));
+    inert(press(&mut c, r#box.x, r#box.y + pad + row / 2));
+    inert(press(
+        &mut c,
+        r#box.x + pad + width,
+        r#box.y + pad + row / 2,
+    ));
+    inert(press(
+        &mut c,
+        r#box.x + pad + 2,
+        r#box.y + pad + row * fit + row / 2,
+    ));
+    // But the last fully-shown row (index fit - 1) picks.
+    let (outcome, effects) = press(
+        &mut c,
+        r#box.x + pad + 2,
+        r#box.y + pad + row * (fit - 1) + row / 2,
+    );
+    assert_eq!(outcome, Outcome::Changed);
+    assert_eq!(effects.len(), 1);
 }
 
 #[test]

@@ -701,10 +701,10 @@ pub struct Controller {
     /// generation and is absent from `state`.
     looks: Vec<String>,
     /// The look-palette sub-mode of develop: the box lists the available looks
-    /// with the current one marked, for discovery (picking from it is a later
-    /// slice; the `look` action still sets one). Off outside develop, dropped
-    /// when the photo or mode changes, kept across a surface resize, and
-    /// mutually exclusive with crop-adjust.
+    /// with the current one marked, and a press on a name picks it (the `look`
+    /// action also sets one). Off outside develop, dropped when the photo or
+    /// mode changes, kept across a surface resize, and mutually exclusive with
+    /// crop-adjust.
     look_list: bool,
 }
 
@@ -1406,6 +1406,40 @@ impl Controller {
             .and_then(Sidecar::look)
     }
 
+    /// The look row a pointer at `(x, y)` in surface pixels falls on, when the
+    /// palette is open over a non-empty list with a develop box to paint into:
+    /// the same rows `paint_looks` draws, so a press picks exactly the name
+    /// under it. The top and side padding is not a row, and a row past the box
+    /// bottom is not shown and so not hittable.
+    fn look_row_at(&self, x: i64, y: i64) -> Option<usize> {
+        let (looks, _) = self.look_palette()?;
+        let r#box = self.develop_box()?;
+        let s = self.surface.scale.value();
+        let pad = (CELL_PAD * s) as i64;
+        let row = (CELL_HEIGHT * s) as i64;
+        if row <= 0 {
+            return None;
+        }
+        let left = r#box.x + pad;
+        let width = (i64::from(r#box.width) - 2 * pad).max(0);
+        if x < left || x >= left + width {
+            return None;
+        }
+        let top = r#box.y + pad;
+        if y < top {
+            return None;
+        }
+        let index = ((y - top) / row) as usize;
+        if index >= looks.len() {
+            return None;
+        }
+        let bottom = r#box.y + i64::from(r#box.height);
+        if top + row * (index as i64 + 1) > bottom {
+            return None;
+        }
+        Some(index)
+    }
+
     /// The overlay the scene actually paints over the develop box, or `None`
     /// when nothing is: the look palette when it is open over a non-empty list
     /// with a box to paint into, else the crop-adjust rectangle while adjusting
@@ -1746,9 +1780,36 @@ impl Controller {
         // status row, the margins) starts no drag, as a filter press is inert
         // here. Nothing else in develop uses the pointer.
         if self.mode == Mode::Develop {
-            // The read-only look palette owns the develop box while it is open,
-            // and ignores the pointer: it starts no crop drag.
+            // The look palette owns the develop box while it is open: a press on
+            // a name picks that look and no crop drag starts under it; a move or
+            // release, or a press off the names, is inert. The pick is set
+            // through the same `Effect::Edit` the `look` action makes, so the
+            // current-look mark rides the edit's settle; the palette stays open.
             if self.look_list {
+                if phase == PointerPhase::Press {
+                    if let Some(row) = self.look_row_at(x, y) {
+                        let active = self.look_palette().and_then(|(_, active)| active);
+                        if active != Some(row) {
+                            // The picked name is always set, never the `look`
+                            // action's `-` clear sentinel: the palette lists
+                            // real looks, so a press sets the one under it.
+                            if let (Some(index), Some(stem)) =
+                                (self.develop_photo()?, self.looks.get(row).cloned())
+                            {
+                                return self.develop_effect(
+                                    index,
+                                    move |index, name| Effect::Edit {
+                                        index,
+                                        name,
+                                        key: Key::Look,
+                                        value: Some(stem),
+                                    },
+                                    Vec::new(),
+                                );
+                            }
+                        }
+                    }
+                }
                 return Ok((Outcome::Ignored, Vec::new()));
             }
             return self.crop_pointer(phase, x, y);
@@ -2102,7 +2163,7 @@ impl Controller {
         })
     }
 
-    /// Toggles the read-only look palette for the cursor's photo; only in
+    /// Toggles the look palette for the cursor's photo; only in
     /// develop mode (`Ignored` in cull, as the other develop edits are).
     /// Opening it closes crop-adjust, the two being mutually exclusive
     /// overlays; opening over an empty list paints nothing, so it stays closed
@@ -2692,9 +2753,9 @@ fn handle_marks(rect: Rect) -> [(i64, i64); 8] {
     ]
 }
 
-/// The develop box's overlay: the read-only look palette when it is open, else
-/// the crop overlay. Mutually exclusive; painted by the scene and again by the
-/// window over the blitted image.
+/// The develop box's overlay: the look palette when it is open, else the crop
+/// overlay. Mutually exclusive; painted by the scene and again by the window
+/// over the blitted image.
 fn paint_develop_overlay(
     model: &Controller,
     r#box: Rect,
@@ -2709,11 +2770,11 @@ fn paint_develop_overlay(
     }
 }
 
-/// The read-only look palette over the develop box: an opaque panel listing the
-/// available look stems, the current one marked. Chrome (frame fills and
-/// glyphs), clipped to the box, so photo pixels reach the frame only through
-/// `blit` when the palette is closed. Rows past the box are not shown (scroll
-/// is a later slice, as picking a look from the palette is).
+/// The look palette over the develop box: an opaque panel listing the
+/// available look stems, the current one marked, a press picking the one under
+/// it. Chrome (frame fills and glyphs), clipped to the box, so photo pixels
+/// reach the frame only through `blit` when the palette is closed. Rows past
+/// the box are not shown (scroll is a later slice).
 fn paint_looks(
     model: &Controller,
     r#box: Rect,
