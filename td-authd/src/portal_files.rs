@@ -206,7 +206,8 @@ pub(crate) fn prepare() -> Result<(), String> {
     let root = directory(Path::new("/"), 0, true)?;
     let var = child(&root, "var", 0, true)?;
     let home = child(&var, "home", 0, true)?;
-    let human = child(&home, "tester", HUMAN, true)?;
+    let account = crate::primary_account::load().map_err(|error| error.to_string())?;
+    let human = child(&home, account.name(), HUMAN, true)?;
     let source = child(&human, "Downloads", HUMAN, false)?;
     let grants = ensure_root_child(&var, "td-portal-files")?;
     let session = ensure_root_child(&grants, "1000")?;

@@ -38,6 +38,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
             "main.rs",
             "mount_sys.rs",
             "portal_files.rs",
+            "primary_account.rs",
             "secret_intake.rs",
             "secret_request.rs",
             "secret_sys.rs",
@@ -70,6 +71,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
         ("inspection.rs", 0),
         ("mount_sys.rs", 4),
         ("portal_files.rs", 0),
+        ("primary_account.rs", 0),
     ] {
         let source = std::fs::read_to_string(root.join("src").join(name)).unwrap();
         assert_eq!(source.matches("unsafe").count(), count, "{name}");
@@ -273,7 +275,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
     let files = include_str!("../src/portal_files.rs");
     assert_eq!(
         fingerprint(files),
-        0x682ccae6552948c7,
+        0x706b52a9e1d6c729,
         "root portal grant controller changed"
     );
     assert_eq!(files.matches("Command::new(\"/bin/td-authd\")").count(), 1);
@@ -289,7 +291,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
     assert_eq!(files.matches("mount_sys::portal_attributes(").count(), 1);
     assert_eq!(files.matches("mount_sys::publish(").count(), 1);
     let application_files = include_str!("../src/application_files.rs");
-    assert_eq!(fingerprint(application_files), 0x3cec66b5b2025b31);
+    assert_eq!(fingerprint(application_files), 0x53ce2d93237c54f9);
     assert_eq!(
         application_files
             .matches("mount_sys::clone_directory(")
@@ -343,7 +345,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
     // Pin startup as well as raw code: aliases can evade API-name scans.
     assert_eq!(
         fingerprint(main),
-        0x4d7dcc0809699555,
+        0xe38845e6b5d3fc58,
         "main.rs: production startup changed"
     );
     assert_eq!(

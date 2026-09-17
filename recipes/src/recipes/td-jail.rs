@@ -17,6 +17,7 @@ const MODULES: &[(&str, &str)] = &[
         "permissions",
         include_str!("../../../engine/src/permissions.rs"),
     ),
+    ("primary_account", include_str!("../../../td-authd/src/primary_account.rs")),
     ("seccomp", include_str!("../../../td-jail/src/seccomp.rs")),
     ("sys", include_str!("../../../td-jail/src/sys.rs")),
     (

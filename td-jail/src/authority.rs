@@ -1793,12 +1793,23 @@ fn human_projection(mountinfo: &str, home: &Path) -> io::Result<Option<(PathBuf,
         return Err(invalid("declared human projection has not been prepared"));
     }
     require_owned_directory(&view, (uid, uid), true)?;
-    let identity = mount_identity_for_path(mountinfo, &view)?;
-    let human = mount_identity_for_path(mountinfo, &Path::new("/var/home/tester").join(component))?;
+    let account = crate::primary_account::load()?;
+    let identity = projection_identity(mountinfo, &view, &account, component)?;
+    Ok(Some((view, identity)))
+}
+
+fn projection_identity(
+    mountinfo: &str,
+    view: &Path,
+    account: &crate::primary_account::PrimaryAccount,
+    component: &str,
+) -> io::Result<MountIdentity> {
+    let identity = mount_identity_for_path(mountinfo, view)?;
+    let human = mount_identity_for_path(mountinfo, &account.persistent_home().join(component))?;
     if identity != human {
         return Err(invalid("application projection does not name its declared human directory"));
     }
-    Ok(Some((view, identity)))
+    Ok(identity)
 }
 
 fn require_projection_mounts(
@@ -3589,6 +3600,24 @@ mod tests {
     use std::ops::Deref;
     use std::os::unix::net::UnixListener;
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    #[test]
+    fn selected_account_home_resolves_to_its_own_mount_identity() {
+        let mounts = "1 0 0:1 / / rw - erofs none rw\n2 1 0:9 /@var /var rw,nosuid,nodev - btrfs none rw\n3 2 0:9 /@var/home/alice/Downloads /var/lib/td/applications/65536/Downloads rw,nosuid,nodev,noexec - btrfs none rw\n";
+        let view = Path::new("/var/lib/td/applications/65536/Downloads");
+        for name in ["alice", "tester"] {
+            let account = crate::primary_account::parse(&format!("{name}:x:1000:1000:human:/home/{name}:/bin/sh\n")).unwrap();
+            let source = mount_identity_for_path(mounts, &account.persistent_home().join("Downloads")).unwrap();
+            assert_eq!(source.device, "0:9");
+            assert_eq!(source.root, Path::new(&format!("/@var/home/{name}/Downloads")));
+            let admitted = projection_identity(mounts, view, &account, "Downloads");
+            if name == "alice" {
+                assert_eq!(admitted.unwrap(), source);
+            } else {
+                assert!(admitted.is_err());
+            }
+        }
+    }
 
     #[test]
     fn human_projection_cannot_smuggle_sibling_or_reserved_mounts() {

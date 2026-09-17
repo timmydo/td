@@ -27,6 +27,7 @@ mod session;
 mod inspection;
 mod mount_sys;
 mod portal_files;
+mod primary_account;
 mod sys;
 
 use std::io::Write;

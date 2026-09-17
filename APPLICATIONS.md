@@ -8128,7 +8128,11 @@ mounts preserve mode-0600 files and map new writes back to human ownership.
 They are nosuid,nodev,noexec; they grant no other human directory. Jail
 resolution verifies their exact source mount identity and rejects nested
 mounts outside that declared source or aliases to protected state. The
-portal retains its separate read-only mapped Downloads view.
+portal retains its separate read-only mapped Downloads view. Grant preparation
+and jail admission resolve the primary UID 1000 through the same bounded,
+root-owned account database reader, deriving `/var/home/NAME` from its
+validated name and canonical home. This lookup changes no application
+assignment or grant; its exact admission rules are in `td-authd/DESIGN.md`.
 
 Compositor public Wayland and audio admission consume the same immutable
 application table; audio admits only its Firefox assignment. Human

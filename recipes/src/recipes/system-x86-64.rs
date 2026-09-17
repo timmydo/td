@@ -4690,6 +4690,7 @@ fn shape_check() -> String {
          [ -f \"$root/etc/$f\" ] || { echo \"root tree: /etc/$f missing\" >&2; exit 1; }; \
          if [ -L \"$root/etc/$f\" ]; then echo \"root tree: /etc/$f is a symlink - immutable image config must be a regular file in the erofs, not a hole in the read-only /etc\" >&2; exit 1; fi; \
      done; \
+     [ \"$(ls -ld \"$root/etc/passwd\" | cut -c1-10)\" = -rw-r--r-- ] || { echo 'root tree: passwd must have mode 0644 for shared account admission' >&2; exit 1; }; \
      [ \"$(ls -ld \"$root/etc/@BUS_APPLICATION_POLICY_NAME@\" | cut -c1-10)\" = -r--r--r-- ] || { echo 'root tree: bus application policy must have mode 0444' >&2; exit 1; }; \
      for f in @APPLICATION_REGISTRY_NAME@ @APPLICATION_LAUNCHER_NAME@; do \
          [ -f \"$root/etc/$f\" ] || { echo \"root tree: /etc/$f missing - compileApplicationTables did not materialize the application image contract\" >&2; exit 1; }; \
@@ -6799,11 +6800,16 @@ news\tnews-0.1\tsource\tstatic-runtime-1\tsource\n"
         );
         let jail = include_str!("../../../td-jail/src/authority.rs");
         assert!(jail.contains(&format!("if policy.owner() != {UI_UID} ||")));
-        assert!(jail.contains(&format!("Path::new(\"/var{UI_HOME}\")")));
+        let account = crate::primary_account::parse(&build_passwd(&SYSTEM)).unwrap();
+        assert_eq!(crate::primary_account::UID, UI_UID);
+        assert_eq!(account.name(), UI_USER);
+        assert_eq!(account.persistent_home().to_str(), Some(format!("/var{UI_HOME}").as_str()));
+        assert!(jail.contains("crate::primary_account::load()?"));
+        assert!(jail.contains("account.persistent_home().join(component)"));
         let application_grants = include_str!("../../../td-authd/src/application_files.rs");
-        assert!(application_grants.contains(&format!(
-            "portal_files::child(&homes, \"{UI_USER}\", {UI_UID}, true)?"
-        )));
+        assert!(application_grants.contains(
+            "portal_files::child(&homes, account.name(), crate::primary_account::UID, true)?"
+        ));
         assert!(jail.contains(r#"PathBuf::from(format!("/run/user/{owner}"))"#));
         let probe = include_str!("../../../td-compositor/src/session.rs");
         assert!(probe.contains(&format!(
@@ -6859,7 +6865,7 @@ news\tnews-0.1\tsource\tstatic-runtime-1\tsource\n"
         assert!(grants.contains(&format!("const PORTAL: u32 = {PORTAL_RESERVED_UID};")));
         assert_eq!(UI_HOME, format!("/home/{UI_USER}"));
         assert_eq!(FIREFOX_DOWNLOAD_SOURCE, format!("/var{UI_HOME}/Downloads"));
-        assert!(grants.contains(&format!("let human = child(&home, \"{UI_USER}\", HUMAN, true)?;")));
+        assert!(grants.contains("let human = child(&home, account.name(), HUMAN, true)?;"));
         assert_eq!(unit_key("portal-files", "exec").as_deref(), Some("/bin/td-authd prepare-portal-files"));
         assert_eq!(unit_key("portal-files", "requires").as_deref(), Some("td-firstboot"));
         let seat = include_str!("../../../td-seatd/src/main.rs");

@@ -12,6 +12,9 @@ pub mod application;
 #[path = "../../td-busd/src/app_policy.rs"]
 #[allow(dead_code)]
 mod app_policy;
+#[cfg(test)]
+#[path = "../../td-authd/src/primary_account.rs"]
+mod primary_account;
 pub mod catalog;
 // The build script's source scans, here for their tests only.
 #[cfg(test)]

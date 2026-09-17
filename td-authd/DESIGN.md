@@ -16,7 +16,7 @@ enabling that path.
 ## Portal file preparation
 
 The root-only `prepare-portal-files` startup operation exposes the fixed
-human Downloads directory `/var/home/tester/Downloads` at
+human Downloads directory `/var/home/NAME/Downloads` at
 `/var/td-portal-files/1000/Downloads`. It changes neither on-disk ownership
 nor file contents. A detached, nonrecursive idmapped mount maps filesystem
 UID/GID 1000 to portal UID/GID 991 and requires read-only, nosuid, nodev and
@@ -27,6 +27,23 @@ the human home. The portal does not receive a mount or namespace descriptor. The
 root-owned destination directories persist under `/var`, with the mount
 recreated at boot. This shared view stays outside reserved private-runtime
 trees so the jail's alias refusal does not also reserve human Downloads.
+
+Grant creation and jail admission share `primary_account.rs`: resolve UID
+1000 from `/etc/passwd`, require GID 1000 and a canonical `/home/NAME` or
+`/var/home/NAME`, and derive the physical home under `/var/home`. The
+primary name starts with a lowercase ASCII letter and contains only
+lowercase letters, digits, underscores and hyphens (at most 32 bytes).
+All rows must have seven fields, unique names and UIDs, canonical decimal u32 IDs,
+and absolute home and shell paths. The reader requires newline-terminated
+UTF-8 without other ASCII controls, at most 64 KiB, 1,024 records and
+4,096 bytes per record. Blank or malformed unrelated rows refuse too.
+It refuses account-file symlinks, requires a root-owned regular mode-0644
+file (also pinned by the image shape check), compares identity and metadata
+after opening, and checks the read length against the opened size.
+Configuration publication is trusted root work serialized before sessions;
+this reader does not defend against a privileged concurrent file rewrite.
+It reads no shadow data and grants no authentication authority. The stock
+account remains `tester`; this lookup alone does not enable account rename.
 
 There are no caller-selected paths, IDs, flags or permissions. Startup uses
 the same single-root-thread, no-controlling-terminal and standard-descriptor
@@ -759,7 +776,9 @@ refusal and Firefox identity checks.
 ## Application filesystem grants
 
 Root startup prepares three writable idmapped views: Firefox and mail
-share human Downloads, and Claude receives human src, each below the assigned
+share human Downloads, and Claude receives human src, resolved through the
+same primary-account reader as portal preparation and jail admission,
+each below the assigned
 application's private home. `prepare-application-files APP` and the matching
 shutdown operation accept only those three installed names. Active-account and
 durable-ledger admission select the UID; no caller supplies a path or map.

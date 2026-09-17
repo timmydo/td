@@ -80,7 +80,8 @@ pub(crate) fn prepare(arguments: &[String]) -> Result<(), String> {
     let root = portal_files::directory(Path::new("/"), 0, true)?;
     let var = portal_files::child(&root, "var", 0, true)?;
     let homes = portal_files::child(&var, "home", 0, true)?;
-    let human = portal_files::child(&homes, "tester", 1000, true)?;
+    let account = crate::primary_account::load().map_err(|error| error.to_string())?;
+    let human = portal_files::child(&homes, account.name(), crate::primary_account::UID, true)?;
     let source_path = format!("/proc/self/fd/{}/{}",
         std::os::fd::AsRawFd::as_raw_fd(&human), grant.component());
     match fs::DirBuilder::new().mode(0o700).create(&source_path) {

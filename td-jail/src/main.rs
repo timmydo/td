@@ -20,6 +20,8 @@ mod firefox;
     path = "../../engine/src/permissions.rs"
 )]
 mod permissions;
+#[cfg_attr(not(feature = "target-recipe"), path = "../../td-authd/src/primary_account.rs")]
+mod primary_account;
 mod seccomp;
 mod sys;
 mod transition;
@@ -174,6 +176,7 @@ mod confinement {
     const FIREFOX: &str = include_str!("firefox.rs");
     const MAIN: &str = include_str!("main.rs");
     const PERMISSIONS: &str = include_str!("../../engine/src/permissions.rs");
+    const PRIMARY_ACCOUNT: &str = include_str!("../../td-authd/src/primary_account.rs");
     const SECCOMP: &str = include_str!("seccomp.rs");
     const SYS: &str = include_str!("sys.rs");
     const TRANSITION: &str = include_str!("transition.rs");
@@ -197,6 +200,7 @@ mod confinement {
         assert_eq!(FIREFOX.matches("unsafe {").count(), 0);
         assert_eq!(PERMISSIONS.matches("#[allow(unsafe_code)]").count(), 0);
         assert_eq!(PERMISSIONS.matches("unsafe {").count(), 0);
+        assert!(!PRIMARY_ACCOUNT.contains("unsafe"));
         assert_eq!(SECCOMP.matches("#[allow(unsafe_code)]").count(), 0);
         assert_eq!(SECCOMP.matches("unsafe {").count(), 0);
         assert_eq!(TRANSITION.matches("#[allow(unsafe_code)]").count(), 0);
