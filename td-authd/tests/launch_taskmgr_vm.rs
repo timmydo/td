@@ -10,7 +10,7 @@ pub(super) const IMAGE_PROOF: &str =
 
 fn human(arguments: &[&str]) -> Command {
     let mut command = Command::new("/bin/td-login");
-    command.args(["exec-as", "tester", "--"]).args(arguments);
+    command.args(["exec-as", "alice", "--"]).args(arguments);
     command
 }
 fn line(output: impl Read + Send + 'static) -> String {
@@ -135,7 +135,7 @@ pub(super) fn run() {
             .args([
                 "terminal-serve",
                 "--user",
-                "tester",
+                "alice",
                 "--uid",
                 "1000",
                 "--peer-uid",

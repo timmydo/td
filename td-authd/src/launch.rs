@@ -13,7 +13,6 @@ use std::time::{Duration, Instant};
 const LIMIT: usize = 16;
 const CHECK_TIMEOUT: Duration = Duration::from_secs(2);
 const VERSION: &[u8] = b"TDLA002\n";
-const TASK_DIRECTORY: &str = "/home/tester/src/td-vm/work";
 
 pub(crate) struct Config {
     user: String,
@@ -198,14 +197,20 @@ fn require_session_process(uid: u32, status: &str, cgroup: &str) -> Result<(), S
     Ok(())
 }
 
-fn terminal_command(uid: u32, generation: &str, handle: u64, terminal: Program) -> Command {
+fn terminal_command(
+    uid: u32,
+    generation: &str,
+    handle: u64,
+    terminal: Program,
+    account: impl FnOnce() -> std::io::Result<crate::primary_account::PrimaryAccount>,
+) -> std::io::Result<Command> {
     if terminal == Program::TaskManager {
         let mut command = Command::new("/bin/td-taskmgr");
         command.env(
             "WAYLAND_DISPLAY",
             format!("/run/td-compositor/{uid}/wayland-0"),
         );
-        return command;
+        return Ok(command);
     }
     let mut command = Command::new("/bin/td-term");
     command.env(
@@ -220,7 +225,9 @@ fn terminal_command(uid: u32, generation: &str, handle: u64, terminal: Program) 
         &format!("/run/user/{uid}/td-auth-terminal-{generation}-{handle}.ready"),
     ]);
     if terminal != Program::Home {
-        command.args(["--working-directory", TASK_DIRECTORY]);
+        command
+            .arg("--working-directory")
+            .arg(account()?.home().join("src/td-vm/work"));
     }
     match terminal {
         Program::Codex => {
@@ -231,7 +238,7 @@ fn terminal_command(uid: u32, generation: &str, handle: u64, terminal: Program) 
         }
         Program::Home | Program::Task | Program::TaskManager => {}
     }
-    command
+    Ok(command)
 }
 
 /// Runs only after td-login dropped credentials, before any terminal code.
@@ -275,9 +282,17 @@ pub(crate) fn terminal_exec(arguments: &[String]) -> Result<(), String> {
         &bounded_file("/proc/self/status")?,
         &bounded_file("/proc/self/cgroup")?,
     )?;
+    let mut command = terminal_command(
+        uid,
+        generation,
+        value,
+        terminal,
+        crate::primary_account::load,
+    )
+    .map_err(|error| error.to_string())?;
     Err(format!(
         "exec session terminal: {}",
-        terminal_command(uid, generation, value, terminal).exec()
+        command.exec()
     ))
 }
 

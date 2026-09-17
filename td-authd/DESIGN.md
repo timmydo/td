@@ -559,8 +559,10 @@ negotiation or mixed-version compatibility.
 For terminal requests it execs `/bin/td-term run --socket
 /run/td-compositor/UID/wayland-0 --ready-socket
 /run/user/UID/td-auth-terminal-GENERATION-HANDLE.ready`. The task variant adds
-`--working-directory /home/tester/src/td-vm/work`; the ordinary variant keeps
-the verified account home. No shell command or
+`--working-directory /home/NAME/src/td-vm/work`, deriving NAME through the
+shared primary-account reader after checking the human credentials and
+session cgroup. The ordinary variant keeps the verified account home.
+No request carries a directory or account name. No shell command or
 consent operation is involved. Directly invoking terminal-exec cannot change
 credentials or enter a different session. Its membership check verifies
 placement after the trusted credential helper; it is not human
@@ -612,8 +614,9 @@ it with host rustc for an installed static target, then run its binary with
 paths. The supplied production binaries may be source-built target outputs;
 the fixture itself is a host diagnostic, never an input to a target recipe
 or part of an image. It requires td's pidfs-capable kernel and QEMU on the
-host. It proves the real channel-to-validator-to-credential-helper chain,
-verifies the terminal's uid/gid, empty capabilities, independent process
+host. Its primary account is `alice`, exercising a nondefault name through
+the real channel-to-validator-to-credential-helper chain. It verifies the
+terminal's uid/gid, empty capabilities, independent process
 group, exact session cgroup, six-variable environment and absence of
 inherited authority fds. A wrong sender, missing ledger and failed cgroup
 placement all withhold terminal execution. A missing persistent state
@@ -733,8 +736,11 @@ The length-prefixed request is at most 40 KiB, with at most 128 literal
 arguments totaling 32 KiB including terminators, a 4096-byte absolute cwd,
 a 64-byte ASCII terminal name and four u16 window dimensions. Each frame
 has one two-second read/write deadline. The server maps cwd beneath
-`/home/tester/src` or `/var/home/tester/src` to its existing private idmapped
+`/home/NAME/src` or `/var/home/NAME/src` to its existing private idmapped
 `src` grant, rejecting parent traversal; other directories select `/`.
+Both the client preflight and server decode derive NAME from the same
+primary-account reader used by grant creation and jail admission. A caller
+cannot map another account's workspace into this grant by supplying its path.
 The jail independently resolves and validates that directory through its
 ordinary grant policy. No grant or file ownership changes. No other ambient
 environment, executable selection, UID selection or root command is accepted.

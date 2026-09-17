@@ -21,10 +21,10 @@ impl PrimaryAccount {
         &self.name
     }
 
-    #[allow(
-        dead_code,
-        reason = "canonical path used by the jail; authd opens each named child"
-    )]
+    pub(crate) fn home(&self) -> PathBuf {
+        Path::new("/home").join(self.name())
+    }
+
     pub(crate) fn persistent_home(&self) -> PathBuf {
         Path::new("/var/home").join(self.name())
     }
@@ -91,22 +91,23 @@ pub(crate) fn parse(text: &str) -> io::Result<PrimaryAccount> {
         if uid != UID {
             continue;
         }
+        let account = PrimaryAccount {
+            name: (*name).to_owned(),
+        };
         if gid != UID
             || !name.as_bytes().first().is_some_and(u8::is_ascii_lowercase)
             || !name.bytes().all(|byte| {
                 byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"_-".contains(&byte)
             })
-            || ![format!("/home/{name}"), format!("/var/home/{name}")]
+            || ![account.home(), account.persistent_home()]
                 .iter()
-                .any(|expected| expected == home)
+                .any(|expected| expected.to_str() == Some(*home))
         {
             return Err(invalid(
                 "primary account requires gid 1000 and its canonical named home",
             ));
         }
-        primary = Some(PrimaryAccount {
-            name: (*name).to_owned(),
-        });
+        primary = Some(account);
     }
     primary.ok_or_else(|| invalid("account database has no uid-1000 human"))
 }

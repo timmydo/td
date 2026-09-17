@@ -317,7 +317,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
             .count(),
         1
     );
-    assert_eq!(fingerprint(include_str!("../src/application_shell.rs").split("#[cfg(test)]").next().unwrap()), 0x96b87ab192ae992d, "application_shell.rs: production boundary changed");
+    assert_eq!(fingerprint(include_str!("../src/application_shell.rs").split("#[cfg(test)]").next().unwrap()), 0xa1f90f25ed95bbdc, "application_shell.rs: production boundary changed");
     assert_eq!(fingerprint(include_str!("../src/shell_channel.rs").split("#[cfg(test)]").next().unwrap()), 0x8cf83d4d6ed3f6a7, "shell_channel.rs: production boundary changed");
     assert_eq!(fingerprint(include_str!("../src/terminal.rs").split("#[cfg(test)]").next().unwrap()), 0x06cfa9e717caa1e0, "terminal.rs: production boundary changed");
     assert_eq!(fingerprint(include_str!("../src/terminal_sys.rs").split("#[cfg(test)]").next().unwrap()), 0xdbf1730949a19a6b, "terminal_sys.rs: production boundary changed");
@@ -363,7 +363,7 @@ fn fingerprint(source: &str) -> u64 {
     })
 }
 
-const LAUNCH_FINGERPRINT: u64 = 0x91d5a1bc5bf7d011;
+const LAUNCH_FINGERPRINT: u64 = 0x140eea83ddfd49b0;
 
 const INTAKE_RAW_FINGERPRINT: u64 = 0x320c8b6ddbfe29af;
 const INTAKE_FINGERPRINT: u64 = 0xe2f50441f71b4c76;

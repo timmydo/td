@@ -85,11 +85,17 @@ fn append(bytes: &mut Vec<u8>, value: &OsStr) -> io::Result<()> {
     Ok(())
 }
 
-fn workspace(cwd: &Path) -> io::Result<PathBuf> {
+fn workspace(
+    cwd: &Path,
+    account: &crate::primary_account::PrimaryAccount,
+) -> io::Result<PathBuf> {
     if !cwd.is_absolute() || cwd.components().any(|c| matches!(c, Component::ParentDir)) {
         return Err(io::Error::other("invalid Claude launch working directory"));
     }
-    for source in ["/var/home/tester/src", "/home/tester/src"] {
+    for source in [
+        account.persistent_home().join("src"),
+        account.home().join("src"),
+    ] {
         if let Ok(relative) = cwd.strip_prefix(source) {
             return Ok(Path::new(HOME).join("src").join(relative));
         }
@@ -98,7 +104,10 @@ fn workspace(cwd: &Path) -> io::Result<PathBuf> {
 }
 
 impl Request {
-    fn decode(mut bytes: &[u8]) -> io::Result<Self> {
+    fn decode(
+        mut bytes: &[u8],
+        account: &crate::primary_account::PrimaryAccount,
+    ) -> io::Result<Self> {
         if bytes.len() > crate::shell_channel::LIMIT {
             return Err(io::Error::other("Claude request too large"));
         }
@@ -106,7 +115,7 @@ impl Request {
         if cwd.len() > 4096 {
             return Err(io::Error::other("Claude working directory too long"));
         }
-        let cwd = workspace(Path::new(OsStr::from_bytes(&cwd)))?;
+        let cwd = workspace(Path::new(OsStr::from_bytes(&cwd)), account)?;
         let term = field(&mut bytes)?;
         if term.is_empty()
             || term.len() > 64
@@ -188,7 +197,7 @@ fn accept(stream: UnixStream) -> io::Result<Option<Session>> {
     let Some((&1, body)) = bytes.split_first() else {
         return Err(io::Error::other("invalid Claude request"));
     };
-    let request = Request::decode(body)?;
+    let request = Request::decode(body, &crate::primary_account::load()?)?;
     channel.live()?;
     let (master, slave) = terminal::terminal_pair()?;
     terminal_sys::relay_window_set(master.as_fd(), &request.size)?;
@@ -301,6 +310,7 @@ pub(crate) fn client(arguments: Vec<OsString>, probe: bool) -> io::Result<u8> {
         bytes
             .get(1..)
             .ok_or_else(|| io::Error::other("empty Claude request"))?,
+        &crate::primary_account::load()?,
     )?;
     channel.send(&bytes)?;
     let master = channel.receive_terminal()?;
@@ -397,13 +407,42 @@ mod tests {
         }
     }
 
+    fn primary(name: &str) -> crate::primary_account::PrimaryAccount {
+        crate::primary_account::parse(&format!(
+            "{name}:x:1000:1000:human:/home/{name}:/bin/sh\n"
+        ))
+        .unwrap()
+    }
+
+    fn decode(bytes: &[u8]) -> io::Result<Request> {
+        Request::decode(bytes, &primary("tester"))
+    }
+
+    #[test]
+    fn selected_primary_workspace_maps_both_home_aliases_only() {
+        for name in ["alice", "bob"] {
+            let account = primary(name);
+            for prefix in ["/home", "/var/home"] {
+                for suffix in ["", "/", "/project"] {
+                    let cwd = format!("{prefix}/{name}/src{suffix}");
+                    let request = Request::decode(&request(&cwd, &[]), &account).unwrap();
+                    assert_eq!(request.cwd, Path::new(HOME).join(format!("src{suffix}")));
+                }
+            }
+            for cwd in ["/home/tester/src/project", "/home/alice-sibling/src", "/var/lib/td/secrets", "/etc"] {
+                assert_eq!(workspace(Path::new(cwd), &account).unwrap(), Path::new("/"));
+            }
+            assert!(workspace(Path::new(&format!("/home/{name}/src/../secret")), &account).is_err());
+        }
+    }
+
     #[test]
     fn literal_request_retains_bytes_and_maps_only_the_granted_workspace() {
         let bytes = request(
             "/home/tester/src/td/.worktrees/fix",
             &[OsStr::new(";$(literal)"), OsStr::from_bytes(b"nonutf8\xff")],
         );
-        let request = Request::decode(&bytes).unwrap();
+        let request = decode(&bytes).unwrap();
         assert_eq!(request.cwd, Path::new(HOME).join("src/td/.worktrees/fix"));
         let command = request.command();
         assert_eq!(command.get_program(), "/bin/td-jail");
@@ -412,25 +451,25 @@ mod tests {
             b"nonutf8\xff"
         );
         assert_eq!(
-            workspace(Path::new("/var/home/tester/src/sub")).unwrap(),
+            workspace(Path::new("/var/home/tester/src/sub"), &primary("tester")).unwrap(),
             Path::new(HOME).join("src/sub")
         );
-        assert_eq!(workspace(Path::new("/etc")).unwrap(), Path::new("/"));
-        assert!(workspace(Path::new("/home/tester/src/../secret")).is_err());
-        assert!(workspace(Path::new("relative")).is_err());
+        assert_eq!(workspace(Path::new("/etc"), &primary("tester")).unwrap(), Path::new("/"));
+        assert!(workspace(Path::new("/home/tester/src/../secret"), &primary("tester")).is_err());
+        assert!(workspace(Path::new("relative"), &primary("tester")).is_err());
     }
 
     #[test]
     fn truncated_oversized_and_nul_requests_are_refused() {
         let bytes = request("/", &[]);
         for length in 0..bytes.len() {
-            assert!(Request::decode(bytes.get(..length).unwrap()).is_err());
+            assert!(decode(bytes.get(..length).unwrap()).is_err());
         }
-        assert!(Request::decode(&request("/", &vec![OsStr::new("x"); 129])).is_err());
-        assert!(Request::decode(&request("/", &[OsStr::new(&"x".repeat(32768))])).is_err());
+        assert!(decode(&request("/", &vec![OsStr::new("x"); 129])).is_err());
+        assert!(decode(&request("/", &[OsStr::new(&"x".repeat(32768))])).is_err());
         let mut bytes = request("/", &[]);
         bytes.extend_from_slice(&1u32.to_be_bytes());
         bytes.push(0);
-        assert!(Request::decode(&bytes).is_err());
+        assert!(decode(&bytes).is_err());
     }
 }

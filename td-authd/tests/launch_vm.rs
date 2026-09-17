@@ -46,7 +46,7 @@ fn terminal() {
     if task {
         assert_eq!(
             &args[5..],
-            ["--working-directory", "/home/tester/src/td-vm/work"]
+            ["--working-directory", "/home/alice/src/td-vm/work"]
         );
     }
     // td-authd starts td-term itself in the authority's fixed neutral
@@ -199,7 +199,7 @@ fn attempt(denied: bool, wrong_sender: bool, placement_denied: bool) {
         .args([
             "terminal-serve",
             "--user",
-            "tester",
+            "alice",
             "--uid",
             "1000",
             "--peer-uid",
@@ -215,7 +215,7 @@ fn attempt(denied: bool, wrong_sender: bool, placement_denied: bool) {
             } else {
                 "exec-service-as"
             },
-            if wrong_sender { "tester" } else { "tdc1000" },
+            if wrong_sender { "alice" } else { "tdc1000" },
             "--",
             "/pair-probe",
             if denied {
@@ -257,23 +257,23 @@ fn init() {
     for path in [
         "/var/lib/td",
         "/run/user/1000",
-        "/home/tester/src/td-vm/work",
+        "/home/alice/src/td-vm/work",
     ] {
         fs::create_dir_all(path).unwrap();
     }
-    for path in ["/run/user/1000", "/home/tester"] {
+    for path in ["/run/user/1000", "/home/alice"] {
         std::os::unix::fs::chown(path, Some(1000), Some(1000)).unwrap();
     }
     let table = "td-principals-v1\nsession\t1000\t993\t992\t991\napplication\t1000\tmail\t65537\n";
     for (path,text,mode) in [
         ("/etc/td-principals.tsv",table,0o444),
         ("/var/lib/td/principals.tsv",table,0o600),
-        ("/etc/passwd","root:x:0:0:root:/root:/bin/false\ntester:x:1000:1000:Test:/home/tester:/bin/false\ntdc1000:x:993:993:Compositor:/run:/bin/false\n",0o644),
-        ("/etc/group","root:x:0:\ntester:x:1000:\ntdc1000:x:993:\n",0o644),
-        ("/etc/shadow","root::1:0:99999:7:::\ntester::1:0:99999:7:::\ntdc1000:!td-service:1:0:99999:7:::\n",0o600),
+        ("/etc/passwd","root:x:0:0:root:/root:/bin/false\nalice:x:1000:1000:Test:/home/alice:/bin/false\ntdc1000:x:993:993:Compositor:/run:/bin/false\n",0o644),
+        ("/etc/group","root:x:0:\nalice:x:1000:\ntdc1000:x:993:\n",0o644),
+        ("/etc/shadow","root::1:0:99999:7:::\nalice::1:0:99999:7:::\ntdc1000:!td-service:1:0:99999:7:::\n",0o600),
     ] { fs::write(path,text).unwrap();fs::set_permissions(path,fs::Permissions::from_mode(mode)).unwrap(); }
     assert!(Command::new("/bin/td-firstboot")
-        .args(["check-launch-session", "tester", "1000", "993"])
+        .args(["check-launch-session", "alice", "1000", "993"])
         .status()
         .unwrap()
         .success());

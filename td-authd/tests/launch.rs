@@ -2,6 +2,13 @@
 use super::*;
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 
+fn primary(name: &str) -> crate::primary_account::PrimaryAccount {
+    crate::primary_account::parse(&format!(
+        "{name}:x:1000:1000:human:/home/{name}:/bin/sh\n"
+    ))
+    .unwrap()
+}
+
 fn config() -> Config {
     Config::parse(&["--user", "tester", "--uid", "1000", "--peer-uid", "993"].map(String::from))
         .unwrap()
@@ -96,7 +103,14 @@ fn fixed_commands_select_the_account_and_all_terminal_arguments() {
             "17",
         ]
     );
-    let terminal = terminal_command(1000, "000102030405060708090a0b0c0d0e0f", 17, Program::Home);
+    let terminal = terminal_command(
+        1000,
+        "000102030405060708090a0b0c0d0e0f",
+        17,
+        Program::Home,
+        || Ok(primary("tester")),
+    )
+    .unwrap();
     assert_eq!(terminal.get_program(), "/bin/td-term");
     assert_eq!(
         terminal.get_envs().collect::<Vec<_>>(),
@@ -107,11 +121,18 @@ fn fixed_commands_select_the_account_and_all_terminal_arguments() {
     );
     let task = config.terminal("000102030405060708090a0b0c0d0e0f", 18, Program::Task);
     assert_eq!(task.get_args().last(), Some(std::ffi::OsStr::new("task")));
-    let task = terminal_command(1000, "000102030405060708090a0b0c0d0e0f", 18, Program::Task);
+    let task = terminal_command(
+        1000,
+        "000102030405060708090a0b0c0d0e0f",
+        18,
+        Program::Task,
+        || Ok(primary("tester")),
+    )
+    .unwrap();
     assert!(task.get_args().collect::<Vec<_>>().windows(2).any(|pair| {
         pair == [
             std::ffi::OsStr::new("--working-directory"),
-            std::ffi::OsStr::new(TASK_DIRECTORY),
+            std::ffi::OsStr::new("/home/tester/src/td-vm/work"),
         ]
     }));
     assert_eq!(
@@ -137,13 +158,20 @@ fn task_agents_use_fixed_human_entry_points_and_a_controlling_terminal() {
             helper.get_args().last(),
             Some(std::ffi::OsStr::new(selection))
         );
-        let command = terminal_command(1000, "000102030405060708090a0b0c0d0e0f", 1, terminal);
+        let command = terminal_command(
+            1000,
+            "000102030405060708090a0b0c0d0e0f",
+            1,
+            terminal,
+            || Ok(primary("tester")),
+        )
+        .unwrap();
         assert_eq!(command.get_program(), "/bin/td-term");
         assert_eq!(
             command.get_args().skip(5).collect::<Vec<_>>(),
             [
                 "--working-directory",
-                TASK_DIRECTORY,
+                "/home/tester/src/td-vm/work",
                 "--command",
                 "/bin/cttyhack",
                 "--stdin",
@@ -358,8 +386,22 @@ fn readiness_names_include_fresh_generations_and_fit_unix_socket_bounds() {
     assert_ne!(a, b);
     assert_eq!(a.len(), 32);
     assert_eq!(b.len(), 32);
-    let first = terminal_command(1000, &a, u64::MAX, Program::Home);
-    let second = terminal_command(1000, &b, u64::MAX, Program::Home);
+    let first = terminal_command(
+        1000,
+        &a,
+        u64::MAX,
+        Program::Home,
+        || Ok(primary("tester")),
+    )
+    .unwrap();
+    let second = terminal_command(
+        1000,
+        &b,
+        u64::MAX,
+        Program::Home,
+        || Ok(primary("tester")),
+    )
+    .unwrap();
     assert_ne!(first.get_args().last(), second.get_args().last());
     assert!(first.get_args().last().unwrap().len() < 108);
 }
@@ -458,7 +500,9 @@ fn task_manager_has_fixed_unprivileged_exec_and_display_only() {
         "000102030405060708090a0b0c0d0e0f",
         17,
         Program::TaskManager,
-    );
+        || Ok(primary("tester")),
+    )
+    .unwrap();
     assert_eq!(command.get_program(), "/bin/td-taskmgr");
     assert_eq!(command.get_args().count(), 0);
     assert_eq!(
@@ -468,4 +512,44 @@ fn task_manager_has_fixed_unprivileged_exec_and_display_only() {
             Some(std::ffi::OsStr::new("/run/td-compositor/1000/wayland-0"))
         )]
     );
+}
+
+#[test]
+fn task_and_agent_directories_follow_the_validated_primary_account() {
+    for name in ["alice", "bob"] {
+        for program in [Program::Task, Program::Codex, Program::Claude] {
+            let command = terminal_command(
+                1000,
+                "000102030405060708090a0b0c0d0e0f",
+                1,
+                program,
+                || Ok(primary(name)),
+            )
+            .unwrap();
+            let expected = format!("/home/{name}/src/td-vm/work");
+            assert!(command.get_args().collect::<Vec<_>>().windows(2).any(|pair| {
+                pair == [std::ffi::OsStr::new("--working-directory"), std::ffi::OsStr::new(&expected)]
+            }));
+        }
+    }
+}
+
+#[test]
+fn only_workspace_launches_require_the_primary_account() {
+    for program in [
+        Program::Home,
+        Program::TaskManager,
+        Program::Task,
+        Program::Codex,
+        Program::Claude,
+    ] {
+        let mut loaded = false;
+        let result = terminal_command(1000, "000102030405060708090a0b0c0d0e0f", 1, program, || {
+            loaded = true;
+            Err(std::io::Error::other("invalid primary account"))
+        });
+        let requires_account = !matches!(program, Program::Home | Program::TaskManager);
+        assert_eq!(loaded, requires_account);
+        assert_eq!(result.is_err(), requires_account);
+    }
 }

@@ -117,9 +117,11 @@ service configuration and automatic login must agree before the session
 starts. Existing `/home/tester` assumptions need an atomic cutover in the
 installed profile. Grant preparation and jail admission already share a
 validated UID-1000 account lookup; account publication, login and remaining
-home-path consumers still need that cutover. These include authd's Claude
-workspace mapping and task directory, the compositor's paired task directory,
-and the jail's Firefox download probe. The stock account is `tester`.
+home-path consumers still need that cutover. Authd's Claude workspace mapping
+and task directory and the jail's Firefox download probe use the same
+primary-account lookup. The compositor sends typed launch requests without
+paths in the installed authority profile; its direct development launcher
+still has its separate fixed task directory. The stock account is `tester`.
 Updates must retain the installed identity and settings.
 Keyboard and timezone choices must actually affect the installed session;
 only supported choices with available data may be offered.

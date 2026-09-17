@@ -71,11 +71,10 @@ const FIREFOX_SOAK_PAGES: [(&str, &str, &str); 2] = [
         "TD-FIREFOX-SOAK-CONTENT-B-V1",
     ),
 ];
-const DOWNLOAD_DIRECTORY: &str = "/var/home/tester/Downloads";
 const DOWNLOAD_NAME: &str = "td-firefox-download.txt";
 const DOWNLOAD_BYTES: &[u8] = b"TD-FIREFOX-DOWNLOAD-V1\n";
-const DOWNLOAD_UID: u32 = 1000;
-const DOWNLOAD_GID: u32 = 1000;
+const DOWNLOAD_UID: u32 = crate::primary_account::UID;
+const DOWNLOAD_GID: u32 = crate::primary_account::UID;
 const MAX_DOWNLOAD_DIRECTORY_ENTRIES: usize = 64;
 
 const NETWORK_DOCUMENT_SCRIPT_TEMPLATE: &str = r#"
@@ -876,8 +875,9 @@ pub(crate) fn probe_input<W: Write>(
 }
 
 pub(crate) fn probe_download() -> io::Result<String> {
+    let account = crate::primary_account::load()?;
     validate_download(
-        Path::new(DOWNLOAD_DIRECTORY),
+        &account.persistent_home().join("Downloads"),
         DOWNLOAD_BYTES,
         DOWNLOAD_UID,
         DOWNLOAD_GID,

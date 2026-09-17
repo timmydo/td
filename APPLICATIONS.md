@@ -3033,7 +3033,8 @@ that grant; file ownership on the human's view remains unchanged. The boot
 oracle also requires a human-UID shell launch of `claude --version`.
 
 The VM's explicit task-agent launch uses this same human entry point in
-`/home/tester/src/td-vm/work`. Its outer td-term slave may be a human
+the primary account's `src/td-vm/work` directory (stock VM:
+`/home/tester/src/td-vm/work`). Its outer td-term slave may be a human
 controlling terminal; only the application service's separate fresh slave
 enters the jail. This adds no grant, build tool, credential import or
 foreign-runtime execution channel into source-built recipes.
@@ -7082,7 +7083,8 @@ and image commits — showing:
    so delayed repeats are observed before success. The volatile Firefox
    profile selects its compiled `/home/td/Downloads` grant without a prompt.
    Outside the jail, a td-owned unprivileged probe then requires one stable
-   regular inode at the corresponding `/var/home/tester/Downloads` source:
+   regular inode at the corresponding `/var/home/NAME/Downloads` source,
+   derived from the validated primary account:
    uid/gid 1000, no special or executable bits, no group/other write, one link,
    exact 23-byte size and fixture contents, unchanged path/descriptor identity,
    and no partial or duplicate proof name in a bounded directory scan. Only

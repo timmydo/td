@@ -9137,7 +9137,8 @@ mod tests {
         assert!(firefox.contains(&format!(
             "const INPUT_DOWNLOAD_PUBLIC_ARMED: &str = \"{TD_FIREFOX_DOWNLOAD_ARMED_MARKER}\";"
         )));
-        assert!(firefox.contains("DOWNLOAD_DIRECTORY: &str = \"/var/home/tester/Downloads\""));
+        assert!(firefox.contains("let account = crate::primary_account::load()?;"));
+        assert!(firefox.contains("&account.persistent_home().join(\"Downloads\")"));
         assert!(firefox.contains("DOWNLOAD_NAME: &str = \"td-firefox-download.txt\""));
         assert!(firefox.contains("const expected = \"https://localhost:8443/download.txt\";"));
         assert!(firefox.contains("DOWNLOAD_BYTES: &[u8] = b\"TD-FIREFOX-DOWNLOAD-V1\\n\""));

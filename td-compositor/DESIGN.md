@@ -5256,7 +5256,8 @@ start wherever td-svc left the graphical service and disagree with its own
 environment. `--working-directory PATH` accepts one absolute path before
 `--command`; failure to enter it fails the spawn rather than silently landing
 in `/`. The paired authority never accepts that path from its caller: its typed
-task-terminal request supplies the fixed `/home/tester/src/td-vm/work` value.
+task-terminal request derives `/home/NAME/src/td-vm/work` from the validated
+primary account.
 Immediately after a successful spawn, td-term drops the original
 slave and all three parent-side `Stdio` clones, retaining only the master.
 Closing that master produces the kernel's normal PTY hangup; child exit unmaps
@@ -6224,7 +6225,8 @@ The original stdin remains open and private for the compositor's lifetime.
 Authority-mode launch requests never reach CommandSpawner; all ordinary
 terminal processes are created by the root authority through td-login. The
 task variant is a distinct `TDLA002` request and carries no directory bytes.
-The root authority alone maps it to `/home/tester/src/td-vm/work`. The
+After td-login drops credentials, the authority's terminal-exec stage resolves
+the validated primary account and selects `/home/NAME/src/td-vm/work`. The
 compositor neither reads nor removes human-owned readiness paths. It observes
 new terminals as ordinary Wayland surfaces. The paired secret extension
 carries only typed operation descriptions and acknowledgements; no master or
