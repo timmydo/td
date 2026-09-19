@@ -53,9 +53,9 @@ td-ui, by path, for the driven seam, the raster and bands the scene is laid out
 with and the Wayland client the window runs on; the window's develop mode
 lands over its own slices: the mode, its keys and the develop edits over the
 seam and the socket are in, as are the developed preview and the crop drag
-with its edge and corner handles and the look palette; the headless `export`
-verb is in, and the window's `export` action and `delete-rejected` follow, as
-the increments at the end schedule.
+with its edge and corner handles and the look palette; the `export` verb and
+the window's `export` action are in, and `delete-rejected` follows, as the
+increments at the end schedule.
 
 The rules below define version 1; the increments identify the order of
 implementation, not choices left to each implementing agent.
@@ -111,15 +111,15 @@ modes are the photographer's order of work.
    keeps that ratio; picking a ratio only arms the lock. A look palette
    toggled with `l` lists the available looks with the current one marked, and
    a press on a name picks it. The immediate snap that reshapes the current
-   crop and the live scaled preview under the marquee are later slices, as
-   the window's `export` action is. Every change is saved to the
-   sidecar as it is made; there is no explicit save and no undo stack in
-   version 1, only reset to camera defaults.
-
-Export renders the full-resolution raw through the same pipeline and writes
-an sRGB JPEG into the roll's `exported/` folder, never overwriting: a
-second export of the same name takes a numbered suffix (Files, below).
-`td-photo export FILE` is it headless; the window's action follows.
+   crop and the live scaled preview under the marquee are later slices.
+   Every change is saved to the sidecar as it is made; there is no explicit
+   save and no undo stack in version 1, only reset to camera defaults.
+4. **Export**, with `e` on the cursor's photo in the grid or in develop
+   mode, renders the full-resolution raw through the same pipeline and
+   writes an sRGB JPEG into the roll's `exported/` folder, never
+   overwriting: a second export of the same name takes a numbered suffix
+   (Files, below). The status row says what came of it. `td-photo export
+   FILE` is it headless.
 
 ## Driving
 
@@ -134,16 +134,17 @@ window, all speaking the toolkit's one vocabulary.
   in `ui` (open a roll, the cursor moves, select, pick, reject, unflag, the four
   filters, the single view and back, scroll, quit, enter develop and its
   exposure, look, crop, crop-adjust, aspect, the look palette (`looks`) and
-  reset; export and delete rejected join it in their increments).
+  reset, and export; delete rejected joins it in its increment).
   `ui::Controller` holds the model (the roll's names and sidecars, the cursor,
   the filter, the view, the scroll and the surface, and the shown list the
   filter admits, kept rather than rescanned); `action(name, fields)` and
   `input(Input)` apply one
   action to it and return the outcome and the `Effect`s the adapter carries out
   (`Open` this folder, `Flag` that photo, `Expose` by a delta, `Edit` a crop or
-  look, `Reset` to camera defaults). The keyboard bindings, the pointer
-  hit-testing, the replay stream and the control socket are four adapters over
-  that one dispatcher, and nothing reaches the model around it. The cursor is
+  look, `Reset` to camera defaults, `Export` that photo). The keyboard
+  bindings, the pointer hit-testing, the replay stream and the control socket
+  are four adapters over that one dispatcher, and nothing reaches the model
+  around it. The cursor is
   always among the shown or nowhere: a filter or a flag that hides it moves it
   to the first shown photo, and the single view ends when there is none, as
   develop mode does, both falling back to the cull grid. The
@@ -182,6 +183,21 @@ window, all speaking the toolkit's one vocabulary.
   write; `reset` clears the develop keys and keeps the flag. Losing the cursor,
   when a flag hides the last shown photo, drops develop back to the cull grid as
   it ends the single view.
+- **Export is the roll's, not develop's.** `export` (`e`) asks for the
+  cursor photo's export in either mode; the dispatch is `changed` with the
+  effect and moves nothing in the model. The adapter reads the sidecar as the
+  file holds it when the action arrives (a refused sidecar refuses the action
+  before anything is read) and runs `export_file`, the verb's own runner: the
+  replay on the request, answering `changed` with the JPEG written or
+  `refused` with the reason on stderr; the window through its pool (Window),
+  answering `changed` as the job is queued, `wait-idle` waiting for it. What
+  came of it is the status row's export note (`exporting NAME`, `exported
+  NAME.jpg`, `export of NAME failed`, `export of NAME refused`): the adapter's
+  report through `set_export`, a fact absent from `state` like the job count,
+  but one the row shows, so a note that differs from the one held moves the
+  generation and the same note again does not; it is cleared when a roll
+  opens, and the row's note is the open roll's: an export of a roll opened
+  before that finishes after the switch is noted on stderr instead.
 - **A headless verb for every durable effect.** Whatever an action does to
   files is also a command-line verb: `import`, `list`, `flag`, `edit`
   (get and set of a sidecar's values), `develop`, `export`, `thumb`,
@@ -826,7 +842,17 @@ the motion and release, not the press alone) and the wheel's frames to
 `scroll`, and `end_turn` takes the pool's results, asks for the thumbnails the
 model wants, reports the developed image's fitted rectangle within the develop
 box as the crop drag's canvas (`set_preview_fit`, a fact that no more moves the
-generation than the job count does) and serves the socket. While crop-adjust
+generation than the job count does), serves the socket and hands the exports
+the session queued this turn to the pool, each with the photo's cached level 0
+when the memo holds it, keyed by the request's own path (so a roll opened in
+the same turn never lends a like-named photo's frame) and held weakly, so the
+queue keeps no frame the raw cache has let go. An export that finishes sets
+the status row's note (`exported NAME.jpg`, or `export of NAME failed`, the
+worker having noted the reason on stderr), a new generation, and the frame it
+decoded joins the raw cache, when its roll is still the held one; for a roll
+no longer held the note goes to stderr and nothing is cached. The exports
+asked for in the closing turn reach the pool as the window finishes,
+whichever way it closed, so none is lost to a `quit` or a close request. While crop-adjust
 is on it asks the pool for the develop uncropped (the preview's crop `None`,
 the byte-identical path), so the handles overlay the whole frame and can grow
 the crop; the cropped result returns when the sub-mode is left.
@@ -874,13 +900,25 @@ thumbnail is not ready paints a neutral placeholder and its name, never blocks.
   (`develop::MAX_THREADS`), started at window open and joined at close, over one
   queue the turn loop replaces under its lock whenever the model's generation
   moves, so a request the model no longer wants is dropped before it starts;
-  jobs are `Thumbnail` and `Preview` now — the develop preview, at most one at a
+  jobs are `Thumbnail`, `Preview` — the develop preview, at most one at a
   time, run from the level an edit invalidates (`Decode`, `Level1`, `Level2` or
   `Level3`, planned from the window's memo, so an exposure or look edit reruns
-  level 3 alone and a resize level 2) — with `Export` in its increment. A job
-  stays outstanding — a thumbnail in the running set, the develop in its
-  in-flight slot — until the turn loop collects its result, so the job count
-  never reads zero with a result made and not yet held. A finished thumbnail is
+  level 3 alone and a resize level 2) — and `Export`, the verb's runner over
+  the request the session read on the dispatch, with the cached level 0 when
+  the window held one at submission. Exports are not wants: a replacement of
+  the wants leaves them queued, they run in order one at a time beside the
+  develop (a thumbnail and the develop are taken first), and a closing pool
+  hands out the exports alone until none is left queued or in flight, so a
+  `quit` waits for the exports asked for rather than dropping them. A
+  thumbnail in the running set and the develop in its in-flight slot stay
+  outstanding until the turn loop collects the result; an export, queued or in
+  its slot, until the worker sends the result, which it does under the queue's
+  lock as it leaves the slot and wakes the workers waiting for it, so the
+  window never counts an export it holds the result of nor misses one whose
+  result is unsent, and a closing pool, with no turn loop to collect, still
+  drains its exports. The worker notes a failed export's reason on stderr, so
+  one that fails after the window closed is reported. The count never reads
+  zero with a result made and not yet sent. A finished thumbnail is
   kept whichever wants asked for it, since it is the file's; the later jobs'
   results the turn loop
   compares before applying. Thumbnails are held in memory by name for the roll
@@ -1114,7 +1152,16 @@ fact and a frame-witnessed sub-mode an empty list or a boxless surface leaves
 blank; the current look marked and picked by a press on its name (a press off
 the names or with no box picking nothing); mutually exclusive with crop-adjust
 and dropped on a photo switch; a touch behind the open palette not bumping the
-generation), and `open` refusing a bad
+generation); the export action (asking for the cursor photo in either mode
+by verb and by `e`, refused without a roll or a photo, not repeating on a
+held key, the dispatch moving nothing; the note set, shown at the row's end,
+a new generation when it differs and none when it is the same, absent from
+`state` but for the generation, and cleared by an open); the binary's
+`--replay` exporting a synthesized decodable NEF on the request (the JPEG
+there and the row noting it when the reply is, the second export numbered,
+the job count zero, a frame that cannot be decoded `refused` with the row
+saying it failed, a refused sidecar `refused` before anything is read, and
+nothing written for either), and `open` refusing a bad
 socket
 path, a
 second roll or a stray flag before it looks for a display and leaving no socket
@@ -1125,9 +1172,14 @@ result is collected, the pool running one develop at a time and dropping its
 queued plan when one finishes, the memo planning each develop from what it
 holds (level 3 for an exposure or look edit, level 2 for a resize, level 1 for
 a cached photo, else a decode), untouched by a failed develop, caching but not
-becoming current for a develop that finishes off the cursor, and the raw cache
+becoming current for a develop that finishes off the cursor, the raw cache
 evicting the least recently shown under
-`RAW_CACHE_BYTES`. `tests/control_process.rs` runs the built binary under the
+`RAW_CACHE_BYTES`, an export keyed by its own path as the memo keys it, and
+the exports surviving a replacement of the wants, running in order one at a
+time after a thumbnail and the develop, draining alone from a closing queue
+once none is in flight, coming back from the pool with why one failed and
+leaving the count as the result is sent, running one after another on
+collection alone, and drained by a pool closing with no window to collect. `tests/control_process.rs` runs the built binary under the
 native compositor harness the sibling crates use (`ready`
 builds the compositor; the case is ignored without it): the window on a roll of
 originals no decoder accepts, so the frame is the scene's, mapped with its app
@@ -1140,7 +1192,12 @@ desktop bar, since the seat draws the client's cursor over the tile), `first`
 over the socket restoring the frame, and `quit` closing the window with its
 socket gone. A second native case, on a synthesized decodable NEF, develops
 the cursor photo over the socket and holds the captured tile to `--preview
---develop` of the roll before and after an exposure edit; a headless case (no
+--develop` of the roll before and after an exposure edit, then exports over
+the socket: with the sidecar naming a look no file provides the export fails
+and the row says so with nothing written, and with the look cleared
+`wait-idle` waits for the pool's export, the JPEG is in `exported/` and the
+row names it, and an export asked for and quit at once is written, numbered,
+by the time the process has exited; a headless case (no
 compositor) holds `--preview --develop` to a develop box that carries a
 developed image and changes with the sidecar's exposure.
 
@@ -1224,9 +1281,10 @@ all-target Clippy.
    and the export geometry in `develop`, the JPEG encoder in `jpeg`, the
    `exported/` naming, and `td-photo export FILE` headless. Landed. (b) The
    `export` action in the window: the `Export` pool job over the raw cache,
-   running the verb's band pipeline off the turn thread, its outcome a
-   fact the status row shows. (c) `delete-rejected`, the action and its
-   verb that move rejects and their sidecars into `rejected/`.
+   running the verb's runner off the turn thread, its outcome the status
+   row's note; the replay running it on the request. Landed. (c)
+   `delete-rejected`, the action and its verb that move rejects and their
+   sidecars into `rejected/`.
 7. Packaging: the cargo recipe staging td-ui, the image entry, and the
    recipe check that develops the synthetic frame in the built artifact.
 8. Later: the 100% loupe from level 0, DNG and JPEG rolls, the Nikon High

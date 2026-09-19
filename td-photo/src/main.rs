@@ -539,11 +539,24 @@ fn develop_file(path: &Path, out: &Path, rest: &[OsString]) -> Result<(), String
 /// size, the corrupt-sample count the decoder tolerated, and the decode
 /// time (which the read and parse before it are folded into, as the verb
 /// has always reported it).
-struct DevelopInfo {
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct DevelopInfo {
     raw_width: usize,
     raw_height: usize,
     corrupt: usize,
     decode_ms: u128,
+}
+
+impl DevelopInfo {
+    /// The facts of a frame the caller already held: no decode ran.
+    fn cached(frame: &RawFrame) -> DevelopInfo {
+        DevelopInfo {
+            raw_width: frame.decoded.width,
+            raw_height: frame.decoded.height,
+            corrupt: frame.decoded.corrupt,
+            decode_ms: 0,
+        }
+    }
 }
 
 /// The per-photo development metadata the levels above 0 are made with: the
@@ -831,26 +844,65 @@ const EXPORT_BAND_ROWS: usize = 64;
 /// Numbered names tried for one export before it gives up.
 const MAX_EXPORT_NAMES: u32 = 1000;
 
-/// `td-photo export FILE`: the original developed at full resolution
-/// through its sidecar and written as a JPEG into `exported/` beside it,
-/// under its stem, or the stem with the first free number from 2 when
-/// that name is taken. The frame is developed a band of rows at a time
-/// (`develop::export_band`) straight into the encoder, so no whole-frame
-/// RGB buffer is held; the stream goes through a fresh `STEM.jpg.tmp`,
-/// synced, then linked to the first free name, so a name that appears
-/// meanwhile is skipped rather than replaced.
-fn export(path: &Path, rest: &[OsString]) -> Result<(), String> {
-    check_flags(rest, &[], &[])?;
+/// One export as asked for: the original and its sidecar's exposure, crop
+/// and look as the file held them when the export was asked for, so the
+/// verb, the replay and the window's pool job develop the same thing. The
+/// look is a stem here and resolved where the export runs.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ExportRequest {
+    pub(crate) path: PathBuf,
+    pub(crate) exposure: i32,
+    pub(crate) crop: Option<library::Crop>,
+    pub(crate) look: Option<String>,
+}
+
+/// What an export made: the JPEG's path, the frame it decoded (for the
+/// window's raw cache, absent when the caller supplied one), and the
+/// decode's facts.
+pub(crate) struct Exported {
+    pub(crate) out: PathBuf,
+    pub(crate) raw: Option<RawFrame>,
+    pub(crate) info: DevelopInfo,
+    pub(crate) width: usize,
+    pub(crate) height: usize,
+}
+
+/// The export `path` asks for, from its sidecar as the file holds it now. A
+/// sidecar the reader refuses refuses the export: developing with camera
+/// defaults would silently drop the edits the file holds.
+pub(crate) fn export_request(path: &Path) -> Result<ExportRequest, String> {
     original(path)?;
-    // A refused sidecar refuses the export: developing with camera defaults
-    // would silently drop the edits the file holds.
     let sidecar = read_sidecar(path)?;
-    let look = match sidecar.look() {
+    Ok(ExportRequest {
+        path: path.to_path_buf(),
+        exposure: sidecar.exposure().unwrap_or(0),
+        crop: sidecar.crop(),
+        look: sidecar.look().map(str::to_string),
+    })
+}
+
+/// Runs one export: the look resolved (a stem no look answers to refuses
+/// it before anything is decoded or written), the raw decoded unless
+/// `raw` supplies the frame, the frame developed a band of rows at a time
+/// (`develop::export_band`) straight into the encoder, so no whole-frame
+/// RGB buffer is held, and the stream written through a fresh
+/// `exported/STEM.jpg.tmp`, synced, then linked to the first free name --
+/// `STEM.jpg`, or `STEM-2.jpg` on from 2 when that is taken -- so a name
+/// that appears meanwhile is skipped rather than replaced. The folder is
+/// made once there is something to put in it; anything else at its name, a
+/// link included, is refused.
+pub(crate) fn export_file(
+    request: &ExportRequest,
+    raw: Option<&RawFrame>,
+    threads: usize,
+) -> Result<Exported, String> {
+    let path = request.path.as_path();
+    let look = match &request.look {
         Some(stem) => Some(find_look(stem)?),
         None => None,
     };
-    let stops = sidecar.exposure().unwrap_or(0) as f32 / 100.0;
-    let crop = sidecar.crop().map(crop_fractions);
+    let stops = request.exposure as f32 / 100.0;
+    let crop = request.crop.map(crop_fractions);
     let stem = path
         .file_stem()
         .and_then(OsStr::to_str)
@@ -861,11 +913,17 @@ fn export(path: &Path, rest: &[OsString]) -> Result<(), String> {
         Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
         _ => PathBuf::from("."),
     };
-    let threads = threads();
-    let started = Instant::now();
-    let (raw, info) = decode_raw(path)?;
-    let source = raw.source();
-    let meta = raw.meta();
+    let decoded = match raw {
+        Some(_) => None,
+        None => Some(decode_raw(path)?),
+    };
+    let (frame, info) = match (&decoded, raw) {
+        (Some((frame, info)), _) => (frame, *info),
+        (None, Some(frame)) => (frame, DevelopInfo::cached(frame)),
+        (None, None) => return Err(format!("{}: no frame to export", path.display())),
+    };
+    let source = frame.source();
+    let meta = frame.meta();
     let geometry = develop::export_geometry(&source, crop, meta.orientation)
         .map_err(|e| format!("{}: {e}", path.display()))?;
     // The folder is made once there is something to put in it, so a raw
@@ -961,16 +1019,33 @@ fn export(path: &Path, rest: &[OsString]) -> Result<(), String> {
             dir.display()
         ));
     };
+    Ok(Exported {
+        out,
+        raw: decoded.map(|(frame, _)| frame),
+        info,
+        width: geometry.width,
+        height: geometry.height,
+    })
+}
+
+/// `td-photo export FILE`: the original developed at full resolution
+/// through its sidecar and written as a JPEG into `exported/` beside it
+/// (`export_request` and `export_file`, which the window's pool runs too).
+fn export(path: &Path, rest: &[OsString]) -> Result<(), String> {
+    check_flags(rest, &[], &[])?;
+    let request = export_request(path)?;
+    let started = Instant::now();
+    let exported = export_file(&request, None, threads())?;
     writeln!(
         io::stdout().lock(),
         "exported {}x{} -> {}x{} into {} ({} corrupt samples; decode {} ms, total {} ms)",
-        info.raw_width,
-        info.raw_height,
-        geometry.width,
-        geometry.height,
-        out.display(),
-        info.corrupt,
-        info.decode_ms,
+        exported.info.raw_width,
+        exported.info.raw_height,
+        exported.width,
+        exported.height,
+        exported.out.display(),
+        exported.info.corrupt,
+        exported.info.decode_ms,
         started.elapsed().as_millis()
     )
     .map_err(|e| e.to_string())
@@ -2054,6 +2129,10 @@ struct Session {
     /// Set when a dispatch answered `quit`: the window closes on it, the
     /// replay keeps answering.
     quit: bool,
+    /// Where an `Export` effect goes: `None` runs it on the request, as the
+    /// replay does; the window sets `Some` and drains the requests to its
+    /// pool each turn, so no decode runs on its thread.
+    exports: Option<Vec<ExportRequest>>,
 }
 
 /// One photo as the model takes it, from a sidecar as found.
@@ -2076,6 +2155,17 @@ fn photo(name: String, loaded: Loaded) -> Photo {
     }
 }
 
+/// The status row's note for a finished export: the JPEG's name.
+pub(crate) fn export_note(out: &Path) -> String {
+    format!(
+        "exported {}",
+        out.file_name().map_or_else(
+            || out.display().to_string(),
+            |n| n.to_string_lossy().into_owned()
+        )
+    )
+}
+
 /// A reason that does not fit the wire: the reply carries the code, the
 /// reason goes to stderr.
 fn note(why: &str) {
@@ -2093,6 +2183,7 @@ impl Session {
             ui,
             idle: true,
             quit: false,
+            exports: None,
         }
     }
 
@@ -2176,9 +2267,48 @@ impl Session {
                         Ok(())
                     })?
                 }
+                Effect::Export { name, .. } => outcome = self.export(name)?,
             }
         }
         Ok(outcome)
+    }
+
+    /// Exports `name` through its sidecar as the file holds it now: the
+    /// request is read here, on the dispatch, so a refused sidecar refuses
+    /// the action; the export itself runs on the request when nothing
+    /// defers it (the replay), or is queued for the window's pool. The
+    /// status row's note says what came of it, and a failure is `refused`
+    /// with its reason on stderr.
+    fn export(&mut self, name: String) -> Result<Outcome, ui::Error> {
+        let roll = self.ui.roll().ok_or(ui::Error::NoRoll)?;
+        let original = PathBuf::from(OsStr::from_bytes(roll)).join(&name);
+        let request = match export_request(&original) {
+            Ok(request) => request,
+            Err(why) => {
+                note(&why);
+                self.ui
+                    .set_export(Some(format!("export of {name} refused")));
+                return Err(ui::Error::Refused);
+            }
+        };
+        match self.exports.as_mut() {
+            Some(queue) => {
+                queue.push(request);
+                self.ui.set_export(Some(format!("exporting {name}")));
+                Ok(Outcome::Changed)
+            }
+            None => match export_file(&request, None, threads()) {
+                Ok(exported) => {
+                    self.ui.set_export(Some(export_note(&exported.out)));
+                    Ok(Outcome::Changed)
+                }
+                Err(why) => {
+                    note(&why);
+                    self.ui.set_export(Some(format!("export of {name} failed")));
+                    Err(ui::Error::Refused)
+                }
+            },
+        }
     }
 
     /// Applies one sidecar edit on the file as it holds it now, not the

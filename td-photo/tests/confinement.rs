@@ -353,9 +353,15 @@ fn budgets_are_the_documented_values() {
     // the encoder spreads its transform through `develop`'s bands rather
     // than threads of its own (pinned above: no `thread::` outside
     // `develop.rs`).
-    assert_eq!(main.matches("fn export(").count(), 1);
+    assert_eq!(main.matches("fn export(path: &Path").count(), 1);
+    assert_eq!(main.matches("fn export_file(").count(), 1);
     assert!(main.contains("develop::export_band("));
     assert!(main.contains("jpeg::Encoder::new("));
+    // The window's export is the verb's runner on a pool thread, queued by
+    // the session and handed over each turn; no decode on the turn thread.
+    assert!(window.contains("crate::export_file("));
+    assert!(window.contains("fn submit_exports("));
+    assert!(main.contains("exports: Option<Vec<ExportRequest>>"));
     assert!(main.contains("format!(\"{stem}.jpg.tmp\")"));
     assert!(main.contains("const EXPORT_BAND_ROWS: usize = 64;"));
     assert!(main.contains("const MAX_EXPORT_NAMES: u32 = 1000;"));

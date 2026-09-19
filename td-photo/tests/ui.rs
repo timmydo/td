@@ -25,6 +25,9 @@ use td_ui::driven::{self, Input, Outcome, PointerPhase};
 use td_ui::raster::{Rect, Scale, Surface};
 use td_ui::CELL_HEIGHT;
 
+#[path = "support/synth_nef.rs"]
+mod synth_nef;
+
 const MODE: usize = 0;
 const SHOWN: usize = 3;
 const POSITION: usize = 4;
@@ -448,9 +451,16 @@ fn apply(c: &mut Controller, effects: &[Effect]) -> Result<Outcome, ui::Error> {
             Effect::Flag { index, name, .. }
             | Effect::Edit { index, name, .. }
             | Effect::Expose { index, name, .. }
-            | Effect::Reset { index, name } => (*index, name.clone()),
+            | Effect::Reset { index, name }
+            | Effect::Export { index, name } => (*index, name.clone()),
             Effect::Open(_) => panic!("{effect:?}"),
         };
+        if let Effect::Export { .. } = effect {
+            // The adapter writes no sidecar for an export: it reports.
+            c.set_export(Some(format!("exported {name}")));
+            outcome = Outcome::Changed;
+            continue;
+        }
         let photo = &c.photos()[index];
         if photo.error.is_some() {
             return Err(ui::Error::Refused);
@@ -470,7 +480,7 @@ fn apply(c: &mut Controller, effects: &[Effect]) -> Result<Outcome, ui::Error> {
                     .unwrap();
             }
             Effect::Reset { .. } => sidecar.reset(),
-            Effect::Open(_) => panic!("{effect:?}"),
+            Effect::Open(_) | Effect::Export { .. } => panic!("{effect:?}"),
         }
         let unchanged = sidecar == before;
         let changed = c.settle(
@@ -1199,7 +1209,7 @@ fn the_binary_replays_the_cull_over_a_roll_and_writes_through_the_sidecar() {
             "1"
         ]
     );
-    assert_eq!(&reply(2)[..2], ["ok", "32"]);
+    assert_eq!(&reply(2)[..2], ["ok", "33"]);
     assert_eq!(reply(3), ["ok", "changed"]);
     assert_eq!(reply(4), ["ok", &name(1), "pick", "-", "-", "-", "ok", "-"]);
     assert_eq!(
@@ -3544,4 +3554,178 @@ fn a_bad_aspect_token_or_wrong_mode_is_refused() {
     let (outcome, effects) = c.action("aspect", &["3:2"]).unwrap();
     assert_eq!(outcome, Outcome::Ignored);
     assert!(effects.is_empty());
+}
+
+// ------------------------------------------------------------------ export
+
+#[test]
+fn export_asks_for_the_cursor_photo_in_either_mode_and_notes_the_status_row() {
+    let mut c = Controller::new(surface(800, 600));
+    assert_eq!(c.action("export", &[]).unwrap_err(), ui::Error::NoRoll);
+    c.open("roll", b"/r", Vec::new()).unwrap();
+    assert_eq!(c.action("export", &[]).unwrap_err(), ui::Error::NoPhoto);
+    c.open("roll", b"/r", photos(3)).unwrap();
+    // In the cull grid: the cursor's photo, by verb and by `e`; the outcome
+    // is the adapter's to settle, so the dispatch itself is `changed` with
+    // the effect and moves nothing in the model.
+    let before = fields(&c)[GENERATION].clone();
+    let (outcome, effects) = c.action("export", &[]).unwrap();
+    assert_eq!(outcome, Outcome::Changed);
+    assert_eq!(
+        effects,
+        [Effect::Export {
+            index: 0,
+            name: file(0)
+        }]
+    );
+    assert_eq!(fields(&c)[GENERATION], before);
+    let (_, by_key) = c.input(Input::Key { chord: "e" }).unwrap();
+    assert_eq!(by_key, effects);
+    assert!(!Action::Export.repeats());
+    // The second photo, and in develop mode too: an export is the roll's,
+    // not a develop edit.
+    assert_eq!(act(&mut c, "next", &[]), Outcome::Changed);
+    assert_eq!(act(&mut c, "develop", &[]), Outcome::Changed);
+    let (_, effects) = c.action("export", &[]).unwrap();
+    assert_eq!(
+        effects,
+        [Effect::Export {
+            index: 1,
+            name: file(1)
+        }]
+    );
+    let (_, by_key) = c.input(Input::Key { chord: "e" }).unwrap();
+    assert_eq!(by_key, effects);
+    // The note: set by the adapter, shown at the end of the status row, a
+    // new generation when it differs and none when it is the same; cleared
+    // by opening a roll.
+    let quiet = fields(&c)[GENERATION].clone();
+    assert!(c.export_note().is_none());
+    assert!(!c.scene().status_line().contains("export"));
+    c.set_export(Some("exporting DSC_0002.NEF".to_string()));
+    assert_ne!(fields(&c)[GENERATION], quiet);
+    assert_eq!(c.export_note(), Some("exporting DSC_0002.NEF"));
+    assert!(c
+        .scene()
+        .status_line()
+        .ends_with("| develop | exporting DSC_0002.NEF"));
+    let noted = fields(&c)[GENERATION].clone();
+    c.set_export(Some("exporting DSC_0002.NEF".to_string()));
+    assert_eq!(fields(&c)[GENERATION], noted);
+    c.set_export(Some("exported DSC_0002.jpg".to_string()));
+    assert_ne!(fields(&c)[GENERATION], noted);
+    assert!(c
+        .scene()
+        .status_line()
+        .ends_with("| develop | exported DSC_0002.jpg"));
+    // Not a `state` field: the state is the same with and without the note
+    // but for the generation, which the row's repaint moves.
+    let without_generation = |c: &Controller| fields(c)[..GENERATION].to_vec();
+    let with_note = without_generation(&c);
+    c.set_export(None);
+    assert_eq!(without_generation(&c), with_note);
+    c.set_export(Some("x".to_string()));
+    c.open("roll", b"/r", photos(3)).unwrap();
+    assert!(c.export_note().is_none());
+    // Carried by the test adapter: the settled outcome is `changed`.
+    assert_eq!(carry(&mut c, "export", &[]), Outcome::Changed);
+    assert_eq!(
+        c.export_note(),
+        Some(format!("exported {}", file(0)).as_str())
+    );
+}
+
+#[test]
+fn the_binary_exports_over_the_replay_and_notes_the_status_row() {
+    let temp = Temp::new("export");
+    let roll = temp.0.join("roll");
+    fs::create_dir_all(&roll).unwrap();
+    // One decodable frame, one that is not a NEF, and one whose sidecar the
+    // reader refuses.
+    let (w, h) = (64usize, 48usize);
+    let samples: Vec<u16> = (0..w * h).map(|i| 1008 + (i as u16 % 4000)).collect();
+    fs::write(
+        roll.join("DSC_0001.NEF"),
+        synth_nef::uncompressed_nef(w, h, &samples),
+    )
+    .unwrap();
+    fs::write(roll.join("DSC_0002.NEF"), b"not really a nef").unwrap();
+    fs::write(roll.join("DSC_0003.NEF"), b"not really a nef").unwrap();
+    fs::write(
+        roll.join("DSC_0003.NEF.edit"),
+        "td-photo edit 1\nflag maybe\n",
+    )
+    .unwrap();
+    let roll_s = roll.to_str().unwrap();
+    let text_of = |reply: &[String]| -> String {
+        String::from_utf8(td_ui::control::unhex(&reply[3]).unwrap()).unwrap()
+    };
+
+    // Wide enough that the status row is not cut before the note.
+    let mut session = Replay::start(&["--size", "1100x300", roll_s]);
+    let a = session.send(&[
+        request(1, &["action", "export"]),
+        request(2, &["text"]),
+        request(3, &["state"]),
+        request(4, &["key", &hex(b"e")]),
+        request(5, &["text"]),
+    ]);
+    // The replay runs the export on the request: the JPEG is there when the
+    // reply is, the status row says so, and a second takes the next name.
+    assert_eq!(&a[0][1..], ["ok", "changed"]);
+    assert!(
+        text_of(&a[1][1..]).ends_with("| all | 1/3 DSC_0001.NEF unflagged | exported DSC_0001.jpg"),
+        "{}",
+        text_of(&a[1][1..])
+    );
+    // The job count stays zero: nothing is outstanding in the replay.
+    assert_eq!(a[2][15], "0");
+    assert_eq!(&a[3][1..], ["ok", "changed"]);
+    assert!(
+        text_of(&a[4][1..]).ends_with("| exported DSC_0001-2.jpg"),
+        "{}",
+        text_of(&a[4][1..])
+    );
+    assert_eq!(
+        names(&roll.join("exported")),
+        ["DSC_0001-2.jpg", "DSC_0001.jpg"]
+    );
+    let first = fs::read(roll.join("exported/DSC_0001.jpg")).unwrap();
+    let head = td_photo::jpeg::header(&first).unwrap();
+    assert_eq!((head.width, head.height), (60, 44));
+
+    // A frame that cannot be decoded fails on the request: `refused`, the
+    // reason on stderr, the row saying it failed, and nothing written; a
+    // refused sidecar is refused before anything is read.
+    let b = session.send(&[
+        request(6, &["action", "select", "1"]),
+        request(7, &["action", "export"]),
+        request(8, &["text"]),
+        request(9, &["action", "select", "2"]),
+        request(10, &["action", "export"]),
+        request(11, &["text"]),
+    ]);
+    assert_eq!(&b[0][1..], ["ok", "changed"]);
+    assert_eq!(b[1][1..3], ["error", "refused"]);
+    assert!(
+        text_of(&b[2][1..]).ends_with("| export of DSC_0002.NEF failed"),
+        "{}",
+        text_of(&b[2][1..])
+    );
+    assert_eq!(b[4][1..3], ["error", "refused"]);
+    assert!(
+        text_of(&b[5][1..]).ends_with("| export of DSC_0003.NEF refused"),
+        "{}",
+        text_of(&b[5][1..])
+    );
+    assert_eq!(
+        names(&roll.join("exported")),
+        ["DSC_0001-2.jpg", "DSC_0001.jpg"]
+    );
+    let (ok, _, err) = session.finish();
+    assert!(ok, "{err}");
+    assert!(
+        err.contains("DSC_0002.NEF") && err.contains("DSC_0003.NEF.edit"),
+        "{err}"
+    );
 }

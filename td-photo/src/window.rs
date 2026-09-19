@@ -15,7 +15,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, Weak};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -375,17 +375,33 @@ enum Made {
 }
 
 /// What a worker finished: a thumbnail for a key (`None` when it could not
-/// be made, said on stderr, which leaves the box its placeholder), or the
-/// developed preview for a request, carrying what it made.
+/// be made, said on stderr, which leaves the box its placeholder), the
+/// developed preview for a request, carrying what it made, or an export,
+/// carrying the JPEG's path and the frame it decoded (for the raw cache)
+/// or why it failed (said on stderr).
 enum Done {
-    Thumb { key: Key, image: Option<Rgb8> },
-    Develop { preview: Preview, made: Made },
+    Thumb {
+        key: Key,
+        image: Option<Rgb8>,
+    },
+    Develop {
+        preview: Preview,
+        made: Made,
+    },
+    Export {
+        request: crate::ExportRequest,
+        result: std::result::Result<(PathBuf, Option<crate::RawFrame>), String>,
+    },
 }
 
-/// What a worker takes off the queue.
+/// What a worker takes off the queue: an export carries the cached level 0
+/// when the window held it at submission, so a photo just developed exports
+/// without the codec; weakly, so the queue keeps no frame the raw cache has
+/// let go, and one evicted while queued is decoded again.
 enum Task {
     Thumb(Key),
     Develop(Preview, Start),
+    Export(crate::ExportRequest, Option<Weak<crate::RawFrame>>),
 }
 
 #[derive(Default)]
@@ -399,6 +415,16 @@ struct Queue {
     /// The develop a worker has taken and the window has not collected yet;
     /// at most one, so at most one raw is decoded at a time.
     developing: Option<Preview>,
+    /// Exports asked for and not yet taken, in order: never dropped by a
+    /// replacement of the wants, since each is a file the user asked for,
+    /// and drained before the pool closes.
+    exports: VecDeque<(crate::ExportRequest, Option<Weak<crate::RawFrame>>)>,
+    /// The export a worker has taken and not yet sent the result of; at
+    /// most one, so exports run in order and one raw decode of theirs at a
+    /// time, beside the develop's. The worker leaves it, under the lock, as
+    /// it sends, so a closing pool drains its exports with no window to
+    /// collect them.
+    exporting: Option<crate::ExportRequest>,
     closing: bool,
 }
 
@@ -424,23 +450,41 @@ impl Queue {
             + self.running.len()
             + usize::from(self.preview.is_some())
             + usize::from(self.developing.is_some())
+            + self.exports.len()
+            + usize::from(self.exporting.is_some())
     }
 
     /// The next task for a worker, or `None` to wait: a thumbnail first,
     /// then the develop when no develop is already in flight, so the one
-    /// raw decode is never run twice at once.
+    /// raw decode is never run twice at once, then an export when none is
+    /// in flight. A closing queue hands out exports alone, so what was
+    /// asked for is written before the pool is joined.
     fn take(&mut self) -> Option<Task> {
-        if let Some(key) = self.pending.pop_front() {
-            self.running.insert(key.clone());
-            return Some(Task::Thumb(key));
+        if !self.closing {
+            if let Some(key) = self.pending.pop_front() {
+                self.running.insert(key.clone());
+                return Some(Task::Thumb(key));
+            }
+            if self.developing.is_none() {
+                if let Some((preview, start)) = self.preview.take() {
+                    self.developing = Some(preview.clone());
+                    return Some(Task::Develop(preview, start));
+                }
+            }
         }
-        if self.developing.is_none() {
-            if let Some((preview, start)) = self.preview.take() {
-                self.developing = Some(preview.clone());
-                return Some(Task::Develop(preview, start));
+        if self.exporting.is_none() {
+            if let Some((request, raw)) = self.exports.pop_front() {
+                self.exporting = Some(request.clone());
+                return Some(Task::Export(request, raw));
             }
         }
         None
+    }
+
+    /// Whether a closing worker may leave: nothing to export and none in
+    /// flight.
+    fn drained(&self) -> bool {
+        self.exports.is_empty() && self.exporting.is_none()
     }
 
     /// A develop finished: it leaves the in-flight slot, and any queued plan
@@ -456,12 +500,13 @@ impl Queue {
 
 /// The pool: `threads()` workers over one queue, started at window open and
 /// joined at close. The queue is replaced whenever the wants move, so a
-/// request the model no longer wants is dropped before it starts; a result
-/// stays outstanding (in the running set, or as the develop in flight)
-/// until the window collects it, so the count never reads zero with a
-/// result made and not yet held. Thumbnails run many at once; the develop
-/// runs one at a time. A finished thumbnail is kept whichever wants asked
-/// for it, since it is the file's.
+/// request the model no longer wants is dropped before it starts; a
+/// thumbnail or develop result stays outstanding (in the running set, or as
+/// the develop in flight) until the window collects it, and an export until
+/// the worker sends its result, so the count never reads zero with a result
+/// made and not yet held or sent. Thumbnails run many at once; the develop
+/// and the exports run one at a time. A finished thumbnail is kept whichever
+/// wants asked for it, since it is the file's.
 struct Pool {
     queue: Arc<(Mutex<Queue>, Condvar)>,
     done: Receiver<Done>,
@@ -509,9 +554,27 @@ impl Pool {
         Ok(self.lock()?.outstanding())
     }
 
+    /// Queues an export behind those already asked for, with the cached
+    /// level 0 when the window holds it, and says how many jobs are
+    /// outstanding.
+    fn export(
+        &self,
+        request: crate::ExportRequest,
+        raw: Option<Weak<crate::RawFrame>>,
+    ) -> Result<usize> {
+        let outstanding = {
+            let mut queue = self.lock()?;
+            queue.exports.push_back((request, raw));
+            queue.outstanding()
+        };
+        self.queue.1.notify_all();
+        Ok(outstanding)
+    }
+
     /// Takes what the workers made, each leaving the running set or the
     /// develop-in-flight slot as it is taken, under the one lock, so what
     /// `outstanding` counts next is exactly what the window does not hold.
+    /// An export left its slot as the worker sent it, under the same lock.
     fn collect(&self) -> Result<Vec<Done>> {
         let mut queue = self.lock()?;
         let done: Vec<Done> = std::iter::from_fn(|| self.done.try_recv().ok()).collect();
@@ -521,6 +584,7 @@ impl Pool {
                     queue.running.remove(key);
                 }
                 Done::Develop { .. } => queue.develop_done(),
+                Done::Export { .. } => {}
             }
         }
         Ok(done)
@@ -548,7 +612,9 @@ fn work(queue: &(Mutex<Queue>, Condvar), done: &Sender<Done>) {
                 return;
             };
             loop {
-                if guard.closing {
+                // A closing queue is left once its exports are drained; the
+                // thumbnails and the develop it dropped are not waited for.
+                if guard.closing && guard.drained() {
                     return;
                 }
                 match guard.take() {
@@ -573,8 +639,38 @@ fn work(queue: &(Mutex<Queue>, Condvar), done: &Sender<Done>) {
                 let made = develop_task(&preview, start);
                 Done::Develop { preview, made }
             }
+            Task::Export(request, raw) => {
+                // A frame the raw cache let go while this waited is decoded
+                // again; the export is what was asked for either way.
+                let raw = raw.as_ref().and_then(Weak::upgrade);
+                let result = crate::export_file(&request, raw.as_deref(), threads())
+                    .map(|exported| (exported.out, exported.raw));
+                // Why it failed is noted here, so an export that fails after
+                // the window closed is reported too.
+                if let Err(why) = &result {
+                    note(why);
+                }
+                Done::Export { request, result }
+            }
         };
-        if done.send(result).is_err() {
+        if matches!(result, Done::Export { .. }) {
+            // Sent and the slot left under the one lock: the window never
+            // counts an export it holds the result of, nor misses one whose
+            // result is not yet sent. The worker leaves the slot, not the
+            // window's collect, so a closing pool drains its exports with no
+            // window to collect them, and the waiting workers are woken to
+            // take the next.
+            let Ok(mut guard) = queue.0.lock() else {
+                return;
+            };
+            let sent = done.send(result).is_ok();
+            guard.exporting = None;
+            drop(guard);
+            queue.1.notify_all();
+            if !sent {
+                return;
+            }
+        } else if done.send(result).is_err() {
             return;
         }
     }
@@ -712,6 +808,15 @@ impl PhotoKey {
     fn is(&self, preview: &Preview) -> bool {
         self.roll == preview.roll && self.name == preview.name
     }
+}
+
+/// The photo an export is of, keyed as the memo keys it: the request's
+/// path is the roll's directory and the name in it.
+fn export_key(request: &crate::ExportRequest) -> Option<PhotoKey> {
+    Some(PhotoKey {
+        roll: request.path.parent()?.to_path_buf(),
+        name: request.path.file_name()?.to_str()?.to_string(),
+    })
 }
 
 /// The current photo's levels above 0: level 1 (the demosaic, reused across
@@ -908,6 +1013,14 @@ impl Memo {
         }
     }
 
+    /// The cached level 0 of a photo, if held: what an export starts from.
+    fn raw_frame(&self, key: &PhotoKey) -> Option<Arc<crate::RawFrame>> {
+        self.raw
+            .iter()
+            .find(|cached| cached.key == *key)
+            .map(|cached| Arc::clone(&cached.frame))
+    }
+
     /// Drops the raw-cache entry for a photo, if any.
     fn drop_raw(&mut self, key: &PhotoKey) {
         if let Some(index) = self.raw.iter().position(|cached| cached.key == *key) {
@@ -1014,9 +1127,12 @@ impl Window {
     fn new(
         stream: UnixStream,
         temporary: PathBuf,
-        session: Session,
+        mut session: Session,
         control: Option<Worker<Payload>>,
     ) -> Result<Self> {
+        // The session queues exports for the pool rather than running them
+        // on the turn thread; `submit_exports` drains it each turn.
+        session.exports = Some(Vec::new());
         Ok(Window {
             client: Client::new(stream, temporary)?,
             font: td_ui::font::pinned()?,
@@ -1274,10 +1390,12 @@ impl Window {
         }
         // The socket is served before the wants are recomputed, so a roll
         // or a scale a request changed is what the wants, and the frame
-        // drawn after this turn, are for.
+        // drawn after this turn, are for; the exports a request or a key
+        // asked for go to the pool in the same turn.
         self.collect()?;
         self.report_preview_fit();
         self.control_tick(now);
+        self.submit_exports()?;
         let jobs = self.want()?;
         self.session.ui.set_jobs(jobs);
         // The wait: the repeat's due time, at most a frame while work is
@@ -1291,6 +1409,27 @@ impl Window {
         }
         let connection = self.client.connection();
         connection.set_wait(connection.wait().min(wait));
+        Ok(())
+    }
+
+    /// Hands the exports the session queued this turn to the pool, each with
+    /// the photo's cached level 0 when the memo holds it, so a photo just
+    /// developed exports without the codec.
+    fn submit_exports(&mut self) -> Result<()> {
+        let requests: Vec<crate::ExportRequest> = self
+            .session
+            .exports
+            .as_mut()
+            .map(std::mem::take)
+            .unwrap_or_default();
+        for request in requests {
+            // Keyed by the request's own path, so a roll opened in the same
+            // turn never lends its like-named photo's frame.
+            let raw = export_key(&request)
+                .and_then(|key| self.memo.raw_frame(&key))
+                .map(|frame| Arc::downgrade(&frame));
+            self.pool.export(request, raw)?;
+        }
         Ok(())
     }
 
@@ -1342,6 +1481,7 @@ impl Window {
                 Done::Thumb { key, image } => thumbs.push((key, image)),
                 // Only the newest develop matters; earlier ones are stale.
                 Done::Develop { preview, made } => developed = Some((preview, made)),
+                Done::Export { request, result } => self.exported(request, result),
             }
         }
         if let Some((preview, made)) = developed {
@@ -1410,6 +1550,42 @@ impl Window {
             self.session.ui.touch();
         }
         Ok(())
+    }
+
+    /// An export finished: the status row's note says which name it took or
+    /// that it failed (its reason went to stderr on the worker), a new
+    /// generation either way, and the frame it decoded joins the raw cache
+    /// when the roll is still the held one, so the photo develops from it.
+    fn exported(
+        &mut self,
+        request: crate::ExportRequest,
+        result: std::result::Result<(PathBuf, Option<crate::RawFrame>), String>,
+    ) {
+        let key = export_key(&request);
+        // The export's roll is the one held, or the note is stderr's: the
+        // row's note is the open roll's, and a like-named photo there is
+        // another photo.
+        let held = self
+            .held
+            .as_ref()
+            .zip(key.as_ref())
+            .is_some_and(|((roll, _), key)| *roll == key.roll);
+        let name = key.as_ref().map_or("", |key| key.name.as_str());
+        let text = match result {
+            Ok((out, raw)) => {
+                if let (Some(raw), true, Some(key)) = (raw, held, key.clone()) {
+                    self.memo.cache_raw(key, Arc::new(raw), self.clock);
+                }
+                crate::export_note(&out)
+            }
+            // The worker noted why.
+            Err(_) => format!("export of {name} failed"),
+        };
+        if held {
+            self.session.ui.set_export(Some(text));
+        } else {
+            note(&text);
+        }
     }
 
     /// The develop the model wants now: the cursor photo fitted to the
@@ -1615,6 +1791,13 @@ impl Window {
     /// beside the loop's own result, as td-editor does. The pool is joined
     /// when the window is dropped.
     fn finish(mut self, result: Result<()>) -> Result<()> {
+        // The exports a key or a request asked for in the closing turn
+        // reach the pool before it is joined, so a `quit` waits for them
+        // too, whichever way the window closed.
+        let result = match (result, self.submit_exports()) {
+            (Ok(()), Err(why)) => Err(format!("exports not queued at close: {why}")),
+            (result, _) => result,
+        };
         self.stop_control();
         match self.control_error.take() {
             Some(detail) => Err(match result {
@@ -1871,6 +2054,148 @@ mod tests {
         assert_eq!(queue.outstanding(), 0);
     }
 
+    fn export(name: &str) -> crate::ExportRequest {
+        crate::ExportRequest {
+            path: PathBuf::from("/td-photo/none").join(name),
+            exposure: 0,
+            crop: None,
+            look: None,
+        }
+    }
+
+    #[test]
+    fn exports_survive_the_wants_run_in_order_one_at_a_time_and_drain_at_close() {
+        let mut queue = Queue::default();
+        queue.exports.push_back((export("a.NEF"), None));
+        queue.exports.push_back((export("b.NEF"), None));
+        // A replacement of the wants leaves the exports where they are, and
+        // they count as outstanding.
+        assert_eq!(
+            queue.replace(vec![key("t")], Some((preview("p"), Start::Decode))),
+            4
+        );
+        // A thumbnail and the develop go first; then one export, and not the
+        // second while it is in flight.
+        assert!(matches!(queue.take(), Some(Task::Thumb(_))));
+        assert!(matches!(queue.take(), Some(Task::Develop(..))));
+        match queue.take() {
+            Some(Task::Export(request, None)) => {
+                assert_eq!(request.path.file_name().unwrap(), "a.NEF")
+            }
+            _ => panic!("expected the first export"),
+        }
+        assert!(queue.take().is_none());
+        assert_eq!(queue.outstanding(), 4);
+        // Collected, the next runs; a closing queue hands out exports alone
+        // and is drained once none is left to take.
+        queue.exporting = None;
+        queue.closing = true;
+        queue.pending.push_back(key("u"));
+        queue.preview = Some((preview("q"), Start::Decode));
+        assert!(!queue.drained());
+        match queue.take() {
+            Some(Task::Export(request, _)) => {
+                assert_eq!(request.path.file_name().unwrap(), "b.NEF")
+            }
+            _ => panic!("expected the second export"),
+        }
+        // Not drained while the second is in flight; the worker's leaving
+        // the slot drains it.
+        assert!(!queue.drained());
+        assert!(queue.take().is_none());
+        queue.exporting = None;
+        assert!(queue.drained());
+    }
+
+    #[test]
+    fn the_pool_runs_an_export_and_reports_what_came_of_it() {
+        let pool = Pool::start(1).unwrap();
+        // A file that is not there fails on the worker; the request comes
+        // back with why. It leaves the count as its result is sent, so the
+        // count reads zero with the result still in the channel, never the
+        // other way round.
+        assert_eq!(pool.export(export("a.NEF"), None).unwrap(), 1);
+        let mut sent = false;
+        for _ in 0..2000 {
+            if pool.outstanding().unwrap() == 0 {
+                sent = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(sent, "the export never left the count");
+        let done = pool.collect().unwrap();
+        match done.as_slice() {
+            [Done::Export { request, result }] => {
+                assert_eq!(request.path.file_name().unwrap(), "a.NEF");
+                assert!(result.is_err());
+            }
+            _ => panic!("expected one export result"),
+        }
+        assert_eq!(pool.outstanding().unwrap(), 0);
+    }
+
+    #[test]
+    fn an_export_is_keyed_by_its_own_path() {
+        let key = export_key(&export("a.NEF")).unwrap();
+        assert_eq!(key.roll, PathBuf::from("/td-photo/none"));
+        assert_eq!(key.name, "a.NEF");
+        let mut memo = Memo::default();
+        let frame = Arc::new(crate::RawFrame::synth(4));
+        memo.cache_raw(key.clone(), Arc::clone(&frame), 1);
+        assert!(memo.raw_frame(&key).is_some());
+        // The same name in another roll is another photo.
+        assert!(memo.raw_frame(&photo_key("a.NEF")).is_none());
+    }
+
+    #[test]
+    fn the_pool_runs_queued_exports_one_after_another_without_the_wants() {
+        let pool = Pool::start(2).unwrap();
+        assert_eq!(pool.export(export("a.NEF"), None).unwrap(), 1);
+        // One or two outstanding: the first may already have failed and
+        // left the count before the second is queued.
+        assert!((1..=2).contains(&pool.export(export("b.NEF"), None).unwrap()));
+        // Nothing but collection: the second runs once the first has left
+        // the slot, with no want to wake the workers.
+        let mut names = Vec::new();
+        for _ in 0..2000 {
+            for done in pool.collect().unwrap() {
+                if let Done::Export { request, result } = done {
+                    assert!(result.is_err());
+                    names.push(request.path.file_name().unwrap().to_owned());
+                }
+            }
+            if names.len() == 2 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(names, ["a.NEF", "b.NEF"]);
+        assert_eq!(pool.outstanding().unwrap(), 0);
+    }
+
+    #[test]
+    fn a_closing_pool_drains_the_exports_queued_without_the_window() {
+        // The window collects nothing once it closes: the workers alone must
+        // hand the exports on, or the join never returns.
+        let (tx, rx) = mpsc::channel();
+        std::thread::Builder::new()
+            .name("closing-pool".to_string())
+            .spawn(move || {
+                let pool = Pool::start(2).unwrap();
+                for name in ["a.NEF", "b.NEF", "c.NEF"] {
+                    pool.export(export(name), None).unwrap();
+                }
+                drop(pool);
+                let _ = tx.send(());
+            })
+            .unwrap();
+        assert!(
+            rx.recv_timeout(Duration::from_secs(10)).is_ok(),
+            "the pool did not join with exports queued"
+        );
+    }
+
     #[test]
     fn a_held_entry_is_charged_with_its_name_made_or_not() {
         let image = Rgb8 {
@@ -1905,7 +2230,7 @@ mod tests {
             .iter()
             .filter_map(|done| match done {
                 Done::Thumb { key, .. } => Some(key.name.clone()),
-                Done::Develop { .. } => None,
+                Done::Develop { .. } | Done::Export { .. } => None,
             })
             .collect();
         names.sort_unstable();

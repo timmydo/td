@@ -193,6 +193,11 @@ pub enum Effect {
     /// Reset this photo's develop keys to camera defaults, keeping the
     /// flag, on the file as it is then, and settle the model.
     Reset { index: usize, name: String },
+    /// Export this photo at full resolution into the roll's `exported/`
+    /// through its sidecar as the file holds it then: the replay runs the
+    /// verb on the request, the window hands it to its pool; either says
+    /// what came of it through `set_export`, the status row's note.
+    Export { index: usize, name: String },
 }
 
 /// The closed set of things the window does. The table below is its
@@ -230,12 +235,13 @@ pub enum Action {
     Aspect,
     Looks,
     Reset,
+    Export,
     Scroll,
     Quit,
 }
 
 impl Action {
-    pub const ALL: [Action; 32] = [
+    pub const ALL: [Action; 33] = [
         Action::Open,
         Action::Next,
         Action::Previous,
@@ -266,6 +272,7 @@ impl Action {
         Action::Aspect,
         Action::Looks,
         Action::Reset,
+        Action::Export,
         Action::Scroll,
         Action::Quit,
     ];
@@ -302,6 +309,7 @@ impl Action {
             Self::Aspect => "aspect",
             Self::Looks => "looks",
             Self::Reset => "reset",
+            Self::Export => "export",
             Self::Scroll => "scroll",
             Self::Quit => "quit",
         }
@@ -326,7 +334,7 @@ impl Action {
 /// binds, the argument shape and the help line. Actions without a chord
 /// take an argument or are the agent's (`open`); the pointer reaches
 /// `select` by pressing a cell and `scroll` by the wheel.
-pub const BINDINGS: [Binding; 32] = [
+pub const BINDINGS: [Binding; 33] = [
     Binding {
         name: "open",
         chord: None,
@@ -506,6 +514,12 @@ pub const BINDINGS: [Binding; 32] = [
         chord: Some("0"),
         arguments: "",
         help: "Reset exposure, crop and look to camera defaults (develop mode).",
+    },
+    Binding {
+        name: "export",
+        chord: Some("e"),
+        arguments: "",
+        help: "Export the photo under the cursor at full resolution into exported/, with its sidecar's edits.",
     },
     Binding {
         name: "scroll",
@@ -706,6 +720,12 @@ pub struct Controller {
     /// mode changes, kept across a surface resize, and mutually exclusive with
     /// crop-adjust.
     look_list: bool,
+    /// The status row's export note, as the adapter last set it: what the
+    /// last export asked for came to (`exporting NAME`, `exported NAME.jpg`,
+    /// `export of NAME failed`). A fact the frame witnesses: setting a
+    /// different note bumps the generation, since the row repaints; absent
+    /// from `state`, and cleared when a roll opens.
+    export: Option<String>,
 }
 
 /// A crop drag: the canvas it maps against (the develop preview's fitted
@@ -1183,6 +1203,7 @@ impl Controller {
             aspect: Aspect::Free,
             looks: Vec::new(),
             look_list: false,
+            export: None,
         }
     }
 
@@ -1212,6 +1233,7 @@ impl Controller {
         self.aspect = Aspect::Free;
         self.look_list = false;
         self.preview_fit = None;
+        self.export = None;
         self.refresh_shown();
         self.cursor = self.shown.first().copied();
         self.bump();
@@ -1324,6 +1346,22 @@ impl Controller {
     /// reported once when the roll opens.
     pub fn set_looks(&mut self, looks: Vec<String>) {
         self.looks = looks;
+    }
+
+    /// The status row's export note, as last set.
+    pub fn export_note(&self) -> Option<&str> {
+        self.export.as_deref()
+    }
+
+    /// What the last export asked for came to, for the status row: the
+    /// adapter's report, a fact, but one the row shows, so a note that
+    /// differs from the one held is a new generation; the same note again
+    /// is not.
+    pub fn set_export(&mut self, note: Option<String>) {
+        if self.export != note {
+            self.export = note;
+            self.bump();
+        }
     }
 
     /// The look palette for the scene, when it is open over a non-empty list:
@@ -1764,6 +1802,7 @@ impl Controller {
             (Action::Aspect, [ratio]) => return self.set_aspect(ratio, effects),
             (Action::Looks, []) => self.toggle_looks()?,
             (Action::Reset, []) => return self.reset_develop(effects),
+            (Action::Export, []) => return self.export(effects),
             _ => return Err(control::Error::Protocol.into()),
         };
         Ok((self.finish(outcome), effects))
@@ -2334,6 +2373,14 @@ impl Controller {
         Ok((Outcome::Ignored, effects))
     }
 
+    /// Asks for the cursor photo's export, in either mode: the export is not
+    /// a develop edit but the roll's, so the cull grid exports too. The
+    /// adapter carries it out and reports through `set_export`.
+    fn export(&mut self, effects: Vec<Effect>) -> Result<(Outcome, Vec<Effect>), Error> {
+        let index = self.need_photo()?;
+        self.develop_effect(index, |index, name| Effect::Export { index, name }, effects)
+    }
+
     /// Resets the cursor photo's develop keys to camera defaults, keeping
     /// the flag.
     fn reset_develop(&mut self, effects: Vec<Effect>) -> Result<(Outcome, Vec<Effect>), Error> {
@@ -2550,6 +2597,10 @@ impl Scene<'_> {
             Mode::Develop => line.push_str(" | develop"),
             Mode::Cull if model.view == View::Single => line.push_str(" | single"),
             Mode::Cull => {}
+        }
+        if let Some(note) = &model.export {
+            line.push_str(" | ");
+            line.push_str(note);
         }
         line
     }

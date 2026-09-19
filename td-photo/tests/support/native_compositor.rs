@@ -633,6 +633,19 @@ fn the_window_presents_the_roll_and_answers_the_socket_over_the_native_composito
     compositor.stop();
 }
 
+/// The status row, the last line of `text`, is `full`, or, when the tile is
+/// narrower than the row, its head ended with an ellipsis; either way the row shown
+/// reaches `note`, the start of the note under test. The wide replay test
+/// in `tests/ui.rs` holds the whole row.
+fn shows(text: &str, full: &str, note: &str) {
+    let row = text.lines().last().unwrap_or("").trim_start();
+    let head = row.strip_suffix('\u{2026}').unwrap_or(row);
+    assert!(
+        full.starts_with(head) && head.contains(note),
+        "status row {row:?} does not show {full:?} up to {note:?}"
+    );
+}
+
 #[test]
 #[ignore = "ready supplies the disposable native compositor"]
 fn the_window_develops_the_cursor_photo_over_the_native_compositor() {
@@ -743,10 +756,47 @@ fn the_window_develops_the_cursor_photo_over_the_native_compositor() {
         "the placeholder frame after a failed develop"
     );
 
-    // `quit` closes the window, which exits well and takes its socket away.
-    assert_eq!(client.request(8, &["action", "quit"]), ["ok", "quit"]);
+    // An export over the socket runs on the pool: `wait-idle` waits for it,
+    // the JPEG is in the roll's `exported/` when idle, and the status row
+    // says so. The look the sidecar still names is not there, so the
+    // export fails as the develop did, and the row says that too.
+    assert_eq!(client.request(20, &["action", "export"]), ["ok", "changed"]);
+    client.settle(21);
+    let text = client.request(22, &["text"]);
+    let row = String::from_utf8(td_ui::control::unhex(&text[3]).unwrap()).unwrap();
+    shows(
+        &row,
+        "roll | 1 photos, 1 shown | all | 1/1 DSC_0001.NEF unflagged | develop | export of DSC_0001.NEF failed",
+        "| export of DSC_0001.",
+    );
+    assert!(!roll.join("exported").exists());
+    assert_eq!(
+        client.request(23, &["action", "look", "-"]),
+        ["ok", "changed"]
+    );
+    assert_eq!(client.request(24, &["action", "export"]), ["ok", "changed"]);
+    client.settle(25);
+    let text = client.request(26, &["text"]);
+    let row = String::from_utf8(td_ui::control::unhex(&text[3]).unwrap()).unwrap();
+    shows(
+        &row,
+        "roll | 1 photos, 1 shown | all | 1/1 DSC_0001.NEF unflagged | develop | exported DSC_0001.jpg",
+        "| exported DSC_0001.",
+    );
+    let jpeg = std::fs::read(roll.join("exported/DSC_0001.jpg")).unwrap();
+    let head = td_photo::jpeg::header(&jpeg).unwrap();
+    assert_eq!((head.width, head.height), (60, 44));
+
+    // An export asked for and not waited for: `quit` closes the window,
+    // which exits well and takes its socket away, once the pool has
+    // written the export (the second of the name, numbered).
+    assert_eq!(client.request(27, &["action", "export"]), ["ok", "changed"]);
+    assert_eq!(client.request(28, &["action", "quit"]), ["ok", "quit"]);
     let socket = client.socket.clone();
     assert!(client.finish(), "td-photo exited with a failure");
     assert!(!socket.exists(), "the control socket was left behind");
+    let jpeg = std::fs::read(roll.join("exported/DSC_0001-2.jpg")).unwrap();
+    let head = td_photo::jpeg::header(&jpeg).unwrap();
+    assert_eq!((head.width, head.height), (60, 44));
     compositor.stop();
 }
