@@ -9,6 +9,9 @@ use std::path::{Path, PathBuf};
 
 #[path = "../../engine/src/principals.rs"]
 mod table;
+#[allow(dead_code, clippy::duplicate_mod, reason = "standalone preflight shares the parser; authd also embeds it for live account reads")]
+#[path = "../../td-authd/src/primary_account.rs"]
+mod primary_account;
 use table::decimal;
 pub(crate) use table::{Application, Registry, MAX_BYTES};
 
@@ -91,6 +94,19 @@ pub(crate) fn check_deployment(root: &Path) -> Result<(), String> {
     )
 }
 
+/// Read-only admission against a caller-supplied, already verified deployment.
+pub(crate) fn check_primary_name(root: &Path, name: &str) -> Result<(), String> {
+    primary_account::validate_name(name).map_err(|error| error.to_string())?;
+    let etc = etc_directory(root, None)?;
+    let registry = Registry::parse(&read_root_file(&etc, TABLE_NAME, Some(0o444))?)?;
+    registry.check_primary_name(
+        &read_root_file(&etc, "passwd", Some(0o644))?,
+        &read_root_file(&etc, "group", Some(0o644))?,
+        &read_root_file(&etc, "shadow", Some(0o600))?,
+        name,
+    )
+}
+
 fn account_rows(text: &str) -> Result<Vec<Vec<&str>>, String> {
     if text.len() > MAX_BYTES || !text.ends_with('\n') || text.contains('\0') || text.contains('\r')
     {
@@ -103,6 +119,73 @@ fn account_rows(text: &str) -> Result<Vec<Vec<&str>>, String> {
 }
 
 impl Registry {
+    pub(crate) fn check_primary_name(
+        &self,
+        passwd: &str,
+        group: &str,
+        shadow: &str,
+        name: &str,
+    ) -> Result<(), String> {
+        primary_account::validate_name(name).map_err(|error| error.to_string())?;
+        let primary = primary_account::parse(passwd).map_err(|error| error.to_string())?;
+        self.verify_retained_accounts(self, passwd, group, shadow)?;
+        if ["tda", "tdb", "tdc", "tdp"].iter().any(|prefix| {
+            name.strip_prefix(prefix).is_some_and(|suffix| {
+                !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit())
+            })
+        }) || self.account_names().values().any(|reserved| reserved == name) {
+            return Err("primary name is reserved for a service or application".into());
+        }
+        let mut names = BTreeSet::new();
+        for row in account_rows(passwd)? {
+            let [account, ..] = row.as_slice() else {
+                return Err("missing account name".into());
+            };
+            if *account == name && *account != primary.name() {
+                return Err("primary name conflicts with another account".into());
+            }
+            names.insert(*account);
+        }
+        let mut primary_group = false;
+        let primary_gid = primary_account::UID.to_string();
+        for row in account_rows(group)? {
+            let [account, "x", gid, members] = row.as_slice() else {
+                return Err("invalid primary-name group row".into());
+            };
+            if *gid == primary_gid {
+                if *account != primary.name() {
+                    return Err("human primary group must have the human account name".into());
+                }
+                primary_group = true;
+            } else if *account == primary.name() {
+                return Err("deployment primary name belongs to another group".into());
+            } else if *account == name {
+                return Err("proposed primary name conflicts with another group".into());
+            }
+            // A currently unresolved member must not acquire authority by rename.
+            let mut seen = BTreeSet::new();
+            if !members.is_empty()
+                && members.split(',').any(|member| !names.contains(member) || !seen.insert(member))
+            {
+                return Err("group contains an unknown or duplicate account member".into());
+            }
+        }
+        if !primary_group {
+            return Err("human account lacks its named primary group".into());
+        }
+        let mut shadow_names = BTreeSet::new();
+        for row in account_rows(shadow)? {
+            let [account, ..] = row.as_slice() else {
+                return Err("missing shadow account name".into());
+            };
+            shadow_names.insert(*account);
+        }
+        if shadow_names != names {
+            return Err("passwd and shadow must name exactly the same accounts".into());
+        }
+        Ok(())
+    }
+
     /// Call after the complete current and retained account validation.
     pub(crate) fn active_applications(&self) -> Result<Vec<Application>, String> {
         let etc = etc_directory(Path::new("/"), Some((0, 0)))?;

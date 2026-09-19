@@ -13057,6 +13057,20 @@ mod principal_tests {
     use super::*;
 
     #[test]
+    fn installer_primary_name_preflight_checks_the_generated_account_tables() {
+        let registry = principal_schema::Registry::parse(&build_principals(&SYSTEM)).unwrap();
+        let passwd = build_passwd(&SYSTEM);
+        let group = build_group(&SYSTEM);
+        let shadow = build_shadow(&SYSTEM);
+        for name in [UI_USER, "alice", "user_2"] {
+            registry.check_primary_name(&passwd, &group, &shadow, name).unwrap();
+        }
+        for name in ["root", "profiler", "wheel", "tty", "profiler-read", "tdc1000", "tdb1000", "tdp1000", "tda65536"] {
+            assert!(registry.check_primary_name(&passwd, &group, &shadow, name).is_err(), "accepted {name}");
+        }
+    }
+
+    #[test]
     fn deployment_principals_parse_and_cannot_alias_system_credentials() {
         let registry = principal_schema::Registry::parse(&build_principals(&SYSTEM)).unwrap();
         registry

@@ -46,6 +46,18 @@ fn number(value: &str) -> io::Result<u32> {
     value.parse().map_err(|_| invalid("account id exceeds u32"))
 }
 
+pub(crate) fn validate_name(name: &str) -> io::Result<()> {
+    if name.len() > 32
+        || !name.as_bytes().first().is_some_and(u8::is_ascii_lowercase)
+        || !name.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"_-".contains(&byte)
+        })
+    {
+        return Err(invalid("primary name requires 1-32 lowercase ASCII letters, digits, underscores or hyphens, starting with a letter"));
+    }
+    Ok(())
+}
+
 pub(crate) fn parse(text: &str) -> io::Result<PrimaryAccount> {
     if text.is_empty()
         || text.len() > LIMIT
@@ -94,11 +106,8 @@ pub(crate) fn parse(text: &str) -> io::Result<PrimaryAccount> {
         let account = PrimaryAccount {
             name: (*name).to_owned(),
         };
+        validate_name(name)?;
         if gid != UID
-            || !name.as_bytes().first().is_some_and(u8::is_ascii_lowercase)
-            || !name.bytes().all(|byte| {
-                byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"_-".contains(&byte)
-            })
             || ![account.home(), account.persistent_home()]
                 .iter()
                 .any(|expected| expected.to_str() == Some(*home))
@@ -225,8 +234,9 @@ mod tests {
     fn file_read_requires_bounded_regular_owned_data() {
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let root = std::env::temp_dir().join(format!(
-            "td-primary-account-{}-{}",
+            "td-primary-account-{}-{}-{}",
             std::process::id(),
+            module_path!().replace("::", "-"),
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
         fs::create_dir(&root).unwrap();

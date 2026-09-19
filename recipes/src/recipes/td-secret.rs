@@ -84,6 +84,7 @@ pub fn recipe() -> Recipe {
         });
     }
     for (path, source) in [
+        ("{src}/td-authd/src/primary_account.rs", include_str!("../../../td-authd/src/primary_account.rs")),
         ("{src}/td-secret/tests/aes_vectors.txt", include_str!("../../../td-secret/tests/aes_vectors.txt")),
         ("{src}/td-secret/tests/p256_vectors.txt", include_str!("../../../td-secret/tests/p256_vectors.txt")),
         ("{src}/td-secret/tests/pin_vectors.txt", include_str!("../../../td-secret/tests/pin_vectors.txt")),

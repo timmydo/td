@@ -97,6 +97,7 @@ pub fn recipe() -> Recipe {
     for directory in [
         "{src}/td-firstboot/src",
         "{src}/td-secret/src",
+        "{src}/td-authd/src",
         "{src}/engine/src",
     ] {
         steps.push(Step::MkDir {
@@ -130,6 +131,11 @@ pub fn recipe() -> Recipe {
             exec: false,
         });
     }
+    steps.push(Step::WriteFile {
+        path: "{src}/td-authd/src/primary_account.rs".into(),
+        content: include_str!("../../../td-authd/src/primary_account.rs").into(),
+        exec: false,
+    });
     steps.push(Step::WriteFile {
         path: "{src}/engine/src/principals.rs".into(),
         content: include_str!("../../../engine/src/principals.rs").into(),

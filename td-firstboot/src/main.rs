@@ -226,6 +226,7 @@ fn usage() -> String {
          configuration under DIR/{APPLICATION_STATE_ROOT} or its validated private app home\n  \
          td-firstboot hostname prepares and activates the persistent hostname\n  \
          td-firstboot check-principals ROOT validates staged deployment identities without writing\n  \
+         td-firstboot check-primary-name ROOT NAME checks a proposed human name without writing\n  \
          td-firstboot check-launch-session USER UID COMPOSITOR_UID verifies live reservations\n  \
          td-firstboot check-launch-application OWNER APP selects an enrolled active application UID\n"
     )
@@ -238,6 +239,10 @@ fn run(args: &[String]) -> Result<(), Failure> {
         Invocation::CheckPrincipals(root) => {
             principals::check_deployment(&root).map_err(Failure::Failed)?;
             return emit("TD-PRINCIPALS-CHECK-OK\n").map_err(Failure::Failed);
+        }
+        Invocation::CheckPrimaryName(root, name) => {
+            principals::check_primary_name(&root, &name).map_err(Failure::Failed)?;
+            return emit("TD-PRIMARY-NAME-CHECK-OK\n").map_err(Failure::Failed);
         }
         Invocation::CheckLaunchSession(user, owner, compositor) => {
             principal_store::check_launch_session(&user, owner, compositor)
@@ -362,12 +367,19 @@ enum Invocation {
     Help,
     Hostname,
     CheckPrincipals(PathBuf),
+    CheckPrimaryName(PathBuf, String),
     CheckLaunchSession(String, u32, u32),
     CheckLaunchApplication(u32, String),
     Provision(Config),
 }
 
 fn parse(args: &[String]) -> Result<Invocation, Failure> {
+    if args.first().is_some_and(|verb| verb == "check-primary-name") {
+        let [_, root, name] = args else {
+            return Err(Failure::Usage("check-primary-name requires ROOT NAME".into()));
+        };
+        return Ok(Invocation::CheckPrimaryName(PathBuf::from(root), name.clone()));
+    }
     if args.first().is_some_and(|arg| arg == "hostname") {
         return if args.len() == 1 { Ok(Invocation::Hostname) }
             else { Err(Failure::Usage("hostname takes no operands".into())) };
@@ -1494,6 +1506,7 @@ mod tests {
             Invocation::Help
             | Invocation::Hostname
             | Invocation::CheckPrincipals(_)
+            | Invocation::CheckPrimaryName(_, _)
             | Invocation::CheckLaunchApplication(..)
             | Invocation::CheckLaunchSession(..) => Err(Failure::Usage(
                 "asked for a non-provisioning operation".to_string(),
@@ -1911,6 +1924,18 @@ mod tests {
 mod principal_arguments {
     #![allow(clippy::unwrap_used, clippy::panic)]
     use super::*;
+
+    #[test]
+    fn primary_name_check_takes_exactly_a_root_and_name() {
+        let args: Vec<String> = ["check-primary-name", "/staged", "alice"].map(str::to_owned).into();
+        assert!(matches!(parse(&args), Ok(Invocation::CheckPrimaryName(root, name))
+            if root == Path::new("/staged") && name == "alice"));
+        assert!(parse(&args[..1]).is_err());
+        assert!(parse(&args[..2]).is_err());
+        let mut extra = args;
+        extra.push("--state-dir".into());
+        assert!(parse(&extra).is_err());
+    }
 
     #[test]
     fn staged_check_accepts_only_a_deployment_root() {

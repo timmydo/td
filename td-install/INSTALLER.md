@@ -123,6 +123,31 @@ primary-account lookup. The compositor sends typed launch requests without
 paths in the installed authority profile; its direct development launcher
 still has its separate fixed task directory. The stock account is `tester`.
 Updates must retain the installed identity and settings.
+
+`td-firstboot check-primary-name ROOT NAME` is a read-only preflight for a
+proposed name against an already verified, staged deployment. It shares the
+primary-account grammar: 1–32 lowercase ASCII letters, digits, underscores
+or hyphens, beginning with a letter. Names formed from `tda`, `tdb`, `tdc`
+or `tdp` followed only by digits are reserved even before that principal
+is enrolled, so later enrollment cannot collide with the installed name.
+Rechecking the deployment's current primary name is allowed when it passes
+these checks. It requires regular, consistently owned
+account tables (passwd/group 0644, shadow 0600, principal reservations 0444),
+rejects account/group collisions and reserved service/application names,
+and requires a matching human primary group and complete shadow roster.
+Its exact public account-table modes match the generated image and shared
+live account reader; the general `check-principals` command instead checks
+reservation integrity and excludes unsafe writers without pinning those
+public modes.
+Unknown or duplicate supplementary-group members refuse, so choosing a
+previously unresolved member name cannot silently acquire group authority.
+It prints `TD-PRIMARY-NAME-CHECK-OK` only on success and never writes settings
+or account files. The caller supplies the staged root and must separately
+verify deployment authenticity; this command does not authorize erasure,
+enroll retained reservations, validate service configuration or activate the
+selected account. Wiring it into the installer and publishing the coherent
+boot-time account configuration remain part of the username cutover.
+
 Keyboard and timezone choices must actually affect the installed session;
 only supported choices with available data may be offered.
 

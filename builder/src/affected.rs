@@ -5070,7 +5070,7 @@ mod tests {
             ["td-authd", "td-editor", "td-jail", "td-photo", "td-portal", "td-seatd", "td-secret", "td-setup", "td-taskmgr", "td-ui", "td-vm", "td-vm-guest"]
         );
         // Jail shares the primary-account reader used by grant preparation.
-        assert_eq!(readers_of("td-authd"), ["td-compositor", "td-jail", "td-secret"]);
+        assert_eq!(readers_of("td-authd"), ["td-compositor", "td-firstboot", "td-jail", "td-secret"]);
         // td-login is here for a test's argument string `/bin/td-busd/`, no
         // read at all: the edge only widens, and pinning it pins the rule that
         // a name is a name wherever it is spelled.
