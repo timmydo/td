@@ -1666,10 +1666,10 @@ fn build_td_svc_conf() -> String {
          [terminal]\n\
          type=daemon\n\
          cgroup=session\n\
-         exec=/bin/su -s /bin/sh {ui_user} -c 'TD_CONTROL_SOCKET={control_socket} /bin/td-term run --socket {wayland_socket} --ready-socket /run/user/{ui_uid}/td-term-ready'\n\
+         exec=/bin/td-login exec-primary -- /bin/env TD_CONTROL_SOCKET={control_socket} /bin/td-term run --socket {wayland_socket} --ready-socket /run/user/{ui_uid}/td-term-ready\n\
          after=wayland\n\
          requires=wayland\n\
-         ready=/bin/su -s /bin/sh {ui_user} -c '/bin/td-term probe /run/user/{ui_uid}/td-term-ready'\n\
+         ready=/bin/td-login exec-primary -- /bin/td-term probe /run/user/{ui_uid}/td-term-ready\n\
          ready-timeout=30\n\
          restart=always\n\
          \n\
@@ -1692,7 +1692,7 @@ fn build_td_svc_conf() -> String {
          [applications-workspace]\n\
          type=oneshot\n\
          cgroup=session\n\
-         exec=/bin/su -s /bin/sh {ui_user} -c 'TD_CONTROL_SOCKET={control_socket} /bin/td-ctl workspace {application_workspace}'\n\
+         exec=/bin/td-login exec-primary -- /bin/td-ctl --socket {control_socket} workspace {application_workspace}\n\
          after=terminal\n\
          requires=wayland\n\
          timeout={application_place}\n\
@@ -1748,7 +1748,7 @@ fn build_td_svc_conf() -> String {
          [shell-workspace]\n\
          type=oneshot\n\
          cgroup=session\n\
-         exec=/bin/su -s /bin/sh {ui_user} -c 'TD_CONTROL_SOCKET={control_socket} /bin/td-ctl workspace 1'\n\
+         exec=/bin/td-login exec-primary -- /bin/td-ctl --socket {control_socket} workspace 1\n\
          after=mail,news\n\
          requires=wayland\n\
          timeout={application_place}\n\
@@ -1956,7 +1956,6 @@ fn build_td_svc_conf() -> String {
         netup = svc_timeouts::NETUP,
         bootsuccess = svc_timeouts::BOOTSUCCESS,
         bootfail = svc_timeouts::BOOTFAIL,
-        ui_user = UI_USER,
         ui_uid = UI_UID,
         broker_user = BROKER_USER,
         compositor_uid = COMPOSITOR_RESERVED_UID,
@@ -5297,10 +5296,9 @@ mod tests {
     #[test]
     fn a_unit_that_hands_its_process_to_td_login_says_so() {
         let handoff_leaders = [
-            "/bin/td-login exec-primary ".into(),
-            format!("/bin/su -s /bin/sh {UI_USER} "),
-            "/bin/td-login exec-service-as tda".into(),
-            "/bin/td-authd application-start ".into(),
+            "/bin/td-login exec-primary ",
+            "/bin/td-login exec-service-as tda",
+            "/bin/td-authd application-start ",
         ];
         let mut session = Vec::new();
         let mut service = Vec::new();
@@ -5321,21 +5319,20 @@ mod tests {
             // loops and command substitutions — are not handoffs.
             let hands_off = handoff_leaders
                 .iter()
-                .any(|p| exec.starts_with(p.as_str()) || exec.contains(&format!("exec {p}")));
+                .any(|p| exec.starts_with(*p) || exec.contains(&format!("exec {p}")));
             if hands_off {
                 session.push(name.clone());
                 assert!(
                     declared,
-                    "{name} execs td-login as {UI_USER}, so its processes are moved \
-                     into the session leaf — it must declare cgroup=session, or a \
-                     limit on it would be written where they are not"
+                    "{name} hands off its processes, so it must declare cgroup=session; \
+                     a limit would target a leaf it does not occupy"
                 );
             } else {
                 service.push(name.clone());
                 assert!(
                     !declared,
-                    "{name} declares cgroup=session but its leader is not td-login \
-                     as {UI_USER}, so it does own a leaf and can be bounded"
+                    "{name} declares cgroup=session but its leader does not hand off \
+                     its processes, so it does own a leaf and can be bounded"
                 );
             }
         }
@@ -5350,6 +5347,7 @@ mod tests {
         let config = build_td_svc_conf();
         assert!(config.contains("exec=/bin/td-login exec-primary -- /bin/td-update init"));
         assert!(!config.contains(&format!("/bin/td-login exec-as {UI_USER} --")));
+        assert!(!config.contains("/bin/su"));
         assert_eq!(build_autologin(&SYSTEM), "#!/bin/sh\nexec /bin/td-login login-primary\n");
         // A tailored non-primary console still uses the named login interface.
         let diagnostic = SystemDef { autologin: "root", ..SYSTEM };
@@ -5856,7 +5854,9 @@ news\tnews-0.1\tsource\tstatic-runtime-1\tsource\n"
         // has to carry the socket, from the same constant the compositor
         // binds, or the documented no-flag invocation is documentation only.
         assert!(
-            exec.contains(&format!("TD_CONTROL_SOCKET={CONTROL_SOCKET} ")),
+            exec.starts_with(&format!(
+                "/bin/td-login exec-primary -- /bin/env TD_CONTROL_SOCKET={CONTROL_SOCKET} "
+            )),
             "the terminal's shell is not told where the control socket is: {exec}"
         );
         // bootsuccess turns on it, so a boot that reaches no terminal is not a
@@ -6572,7 +6572,7 @@ news\tnews-0.1\tsource\tstatic-runtime-1\tsource\n"
     /// Each terminal application is one td-term window whose `--command` is
     /// the application's `/bin` launcher: started after the first terminal,
     /// probed through a ready socket of its own, handed to the session cgroup
-    /// like every `su` unit, ordered behind the broker every jail registers
+    /// like every handed-off unit, ordered behind the broker every jail registers
     /// with, and never restarted by td-svc. Its evidence oneshot requires the
     /// window, runs under the autotest token alone, and prints the marker
     /// only after td-jail finds the client itself, by the program its entry
@@ -6596,8 +6596,8 @@ news\tnews-0.1\tsource\tstatic-runtime-1\tsource\n"
             ("shell-workspace", 1, vec!["mail", "news"]),
         ] {
             let switch = format!(
-                "/bin/su -s /bin/sh {UI_USER} -c 'TD_CONTROL_SOCKET={CONTROL_SOCKET} \
-                 /bin/td-ctl workspace {workspace}'"
+                "/bin/td-login exec-primary -- /bin/td-ctl --socket {CONTROL_SOCKET} \
+                 workspace {workspace}"
             );
             assert_eq!(unit_key(unit, "exec").as_deref(), Some(switch.as_str()), "{unit}");
             assert_eq!(unit_key(unit, "type").as_deref(), Some("oneshot"), "{unit}");

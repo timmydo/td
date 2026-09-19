@@ -122,10 +122,13 @@ and task directory and the jail's Firefox download probe use the same
 primary-account lookup. The compositor sends typed launch requests without
 paths in the installed authority profile; its direct development launcher
 still has its separate fixed task directory. The stock account is `tester`.
-The stock console uses `td-login login-primary`, and literal human-UID
-service commands use `td-login exec-primary`. Both resolve the current
+The stock console uses `td-login login-primary`, and human-UID service
+commands use `td-login exec-primary`. Both selectors resolve the current
 UID-1000 account and retain td-login's existing authorization and credential
-checks. The paired terminal authority uses `terminal-serve --primary` and
+checks. The initial terminal, its readiness probe and workspace selection
+use literal argv through that launcher. The existing `env` program sets
+the terminal control socket after the credential transition. The paired
+terminal authority uses `terminal-serve --primary` and
 passes the resolved name through its existing ledger and credential checks.
 Firstboot's `--application-primary` selects the same account's canonical
 home before provisioning writes, retaining application state migration

@@ -490,12 +490,13 @@ it is a few dozen lines over immutable input.
 
 ### Supervision
 
-`td-svc` has no `user=` field; the existing units spell the credential
-switch as `exec=/bin/su -s /bin/sh {user} -c '…'`. Rather than write more
-shell (directive 3), literal human-user commands use
-**`td-login exec-primary -- PROGRAM ARGS`**. It resolves the validated
-UID/GID-1000 account at runtime and uses the existing credential switch and
-readback. Named service identities use `exec-service-as`:
+`td-svc` has no `user=` field. Literal human-user commands invoke
+**`td-login exec-primary -- PROGRAM ARGS`** with literal arguments,
+including the initial terminal, its readiness probe and workspace
+selection. It resolves the validated UID/GID-1000 account at runtime and
+uses the existing credential switch and readback. For the initial
+terminal, `PROGRAM` is `/bin/env`, which sets the control socket before
+executing td-term. Named service identities use `exec-service-as`:
 
 ```ini
 [busd]

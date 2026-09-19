@@ -1,14 +1,11 @@
 //! `exec-as` — run one named program as another user, with no shell anywhere.
 //!
-//! This exists because td-svc has no `user=` field, so every unit that must run
-//! unprivileged spells its credential switch as
-//! `exec=/bin/su -s /bin/sh {user} -c '…'`. That hands a STRING to a shell which
-//! then word-splits it, which is both more shell than directive 3 wants and a
-//! parser between the supervisor and the program it supervises: a store path
-//! containing a space, a glob character in an argument, or an `$` anywhere is
-//! re-interpreted by `sh` before the daemon ever starts. `exec-as` takes a
-//! literal argv instead and execs it directly — the words the unit wrote are the
-//! words the program receives.
+//! td-svc has no `user=` field. Its unprivileged units use `exec-primary` or
+//! `exec-service-as`, sharing the literal `exec-as` grammar. The former `su -c`
+//! launch form passed a string through a shell, which could reinterpret spaces,
+//! glob characters and dollar signs before the supervised program started.
+//! Direct execution avoids that extra shell parser: the words the unit writes
+//! are the words the program receives.
 //!
 //! It is the same operation `su` performs, minus the shell: resolve the account,
 //! refuse a locked one, build the session, and hand it to `session::enter`, which
