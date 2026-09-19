@@ -185,7 +185,8 @@ pub fn recipe() -> Recipe {
 ```sh
 td-recipe-eval list                  # list every recipe
 td-recipe-eval build-run <name>      # build one recipe into /td/store
-td-recipe-eval qemu-boot-system      # headless boot proof (pass/fail)
+td-recipe-eval qemu-boot-session     # one offline graphical session (pass/fail)
+td-recipe-eval qemu-boot-system      # install/update/recovery boot sequence
 td-recipe-eval qemu-install          # disposable offline ISO installation test
 ```
 

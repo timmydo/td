@@ -485,9 +485,10 @@ pub fn qemu_boot_erofs_cli(args: &[String]) -> Result<(), String> {
 
 /// `td-recipe-eval qemu-boot-system [system-x86-64]` — the persistent deployment
 /// boot proof. It builds the system and target Btrfs tools, creates one volume,
-/// and boots it twice through selector, verified kexec, loop-mounted EROFS, and
-/// persistent @var. Boot two must read boot one's synced marker; both prove the
-/// immutable root, target-owned state, clean shutdown, and offline Btrfs checks.
+/// and boots through installation, healthy updates, failed attempts and fallback
+/// using selector, verified kexec, loop-mounted EROFS and persistent @var.
+/// Reboots must retain identity and synced state; the sequence proves the
+/// immutable root, target-owned state, clean shutdown and offline Btrfs checks.
 /// This is host-side because the gate sandbox has no host qemu.
 pub fn qemu_boot_system_cli(args: &[String]) -> Result<(), String> {
     const STEM: &str = "system-x86-64";
@@ -517,6 +518,23 @@ pub fn qemu_boot_system_cli(args: &[String]) -> Result<(), String> {
     warm_operator_inputs(&runner, &targets);
     let _lock = lock_ladder_for_run(&runner)?;
     crate::checks::qemu_boot::run_system(&runner)
+}
+
+/// One offline graphical session, with the full system boot evidence contract.
+/// Host-side only: the gate sandbox does not supply a QEMU executable.
+pub fn qemu_boot_session_cli(args: &[String]) -> Result<(), String> {
+    const STEM: &str = "system-x86-64";
+    if args.len() > 1 || args.first().is_some_and(|stem| stem != STEM) {
+        return Err(format!("usage: qemu-boot-session [{STEM}]"));
+    }
+    let targets = [STEM, "btrfs-progs-x86-64", "td-jail-seccomp-probe"];
+    ensure_targets_provenance(&targets)?;
+    let root = env::current_dir().map_err(|error| format!("current dir: {error}"))?;
+    let name = scratch_name("qemu-boot", &[STEM]);
+    let runner = RecipeCheckRunner::new(root, &name)?.with_streamed_progress();
+    warm_operator_inputs(&runner, &targets);
+    let _lock = lock_ladder_for_run(&runner)?;
+    crate::checks::qemu_boot::run_session(&runner)
 }
 
 /// `td-recipe-eval qemu-boot-net [system-x86-64]` — the networking proof. It
@@ -8107,6 +8125,7 @@ chmod 755 '{}'
             "qemu_install_system_cli",
             "qemu_boot_erofs_cli",
             "qemu_boot_system_cli",
+            "qemu_boot_session_cli",
             "qemu_boot_net_cli",
             "qemu_boot_kexec_cli",
             "run_cli",

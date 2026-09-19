@@ -2753,6 +2753,62 @@ fn validate_persistent_shutdown(result: &BootResult, context: &str) -> Result<()
     Ok(())
 }
 
+/// One offline session boot, using the full system evidence contract.
+pub(crate) fn run_session(runner: &RecipeCheckRunner) -> Result<(), String> {
+    let qemu = find_qemu()?;
+    let (bzimage, init_cpio, disk, btrfs) = build_persistent_system(runner)?;
+    let wait_token = autotest_wait_token(boot_timeout());
+    let tokens = format!("{AUTOTEST_CMDLINE_TOKEN} {wait_token}");
+    println!(
+        "   [qemu-boot-session] {qemu} boots one fresh offline system session under TCG\n              kernel:        {}\n              initramfs:     {}\n              Btrfs volume:  {}",
+        bzimage.display(), init_cpio.display(), disk.display()
+    );
+    let result = boot(
+        &qemu,
+        &bzimage,
+        &init_cpio,
+        BootPlan {
+            disk: Some(BootDisk::new(&disk, false)),
+            mem: SYSTEM_GUEST_MEMORY_MIB,
+            target_marker: GREETER_MARKER,
+            kill_on_marker: false,
+            extra_append: &tokens,
+            user_net: false,
+            audio: true,
+            physical_input: false,
+            capture_firefox_audio: false,
+            tpm_socket: None,
+        },
+        runner.scratch_dir(),
+    )?;
+    println!("   [qemu-boot-session] elapsed: {:.2}s", result.elapsed.as_secs_f64());
+    validate_session_boot(&result)?;
+    check_persistent_volume(&btrfs, &disk)?;
+    println!("PASS: one offline system session proves firstboot identity, immutable root, \
+        owned state, component health, compositor/terminal readiness, application placement, \
+        browser support, Claude terminal admission and clean shutdown");
+    Ok(())
+}
+
+fn validate_session_boot(result: &BootResult) -> Result<(), String> {
+    validate_system_boot(
+        result,
+        PersistencePhase::None,
+        IdentityPhase::Fresh,
+        "session",
+        SelectionExpectation::Current,
+    )?;
+    validate_claude_terminal(result)?;
+    if result.evidence.attempt_consumed || result.evidence.attempts_exhausted {
+        return Err(format!(
+            "the fresh session unexpectedly consumed or exhausted a boot-attempt budget. \
+             Last serial output:\n{}",
+            tail(&result.console, 80)
+        ));
+    }
+    Ok(())
+}
+
 /// `qemu-boot-net`: the operator proof that the source-built kernel + the static
 /// td-netd bring the network up under QEMU user-net and can resolve + reach a host.
 /// It boots the SAME `system-x86-64` deployment as `qemu-boot-system`, but with a
@@ -10401,6 +10457,29 @@ mod tests {
             complaint.contains(TD_JAIL_KILL_REAPS_MARKER),
             "the rejection must name the marker that was absent: {complaint}"
         );
+    }
+
+    #[test]
+    fn fresh_session_rejects_boot_attempt_bookkeeping() {
+        let mut result = BootResult {
+            evidence: healthy_evidence(),
+            exited_clean: true,
+            marker_killed: false,
+            reason: String::new(),
+            console: String::new(),
+            elapsed: Duration::from_secs(1),
+            firefox_audio: FirefoxAudioCapture::NotRequested,
+        };
+        result.evidence.shutdown = true;
+        result.evidence.td_claude_terminal = true;
+        assert_eq!(validate_session_boot(&result), Ok(()));
+        for (consumed, exhausted) in [(true, false), (false, true)] {
+            result.evidence.attempt_consumed = consumed;
+            result.evidence.attempts_exhausted = exhausted;
+            assert!(validate_session_boot(&result)
+                .unwrap_err()
+                .contains("boot-attempt budget"));
+        }
     }
 
     #[test]

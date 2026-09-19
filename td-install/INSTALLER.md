@@ -458,6 +458,19 @@ boundaries, alongside post-format inventory and detached firmware boots.
 The diagnostic queries after successful layout so negative cases still
 exercise formatter refusal; this is not the future wizard's sequencing.
 
+## Session validation
+
+For one-boot session validation, run `td-recipe-eval qemu-boot-session`
+(optionally followed by `system-x86-64`). It builds a fresh disposable
+system volume and boots it under headless QEMU TCG with networking disabled.
+The full system validator requires firstboot identity, immutable deployment
+configuration, owned writable state, component health, the compositor and
+terminal, application workspace placement and browser support. The check
+also requires Claude terminal admission, clean shutdown and an offline
+Btrfs check. It does not request the physical-input or audio-capture oracles.
+Use `qemu-install-system` for the optical/USB installation matrix and
+`qemu-boot-system` for the longer install, update and recovery sequence.
+
 ## Installer-oracle failure diagnostics
 
 The small and full-system QEMU oracles keep their exact requirement that
