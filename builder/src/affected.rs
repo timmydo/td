@@ -595,14 +595,14 @@ fn map_path(root: &Path, roster: &Result<Vec<GateCrate>, String>, p: &str, sel: 
         return;
     }
 
-    // Portal and taskmgr stage sibling trees; every retained input moves its
-    // consumer's source digest. This cheap preflight augments each crate arm
-    // below. engine/ carries its own routing; td-seatd shares the compositor
-    // arm but is not a staged sibling. Keep this top-level tree roster in
-    // agreement with the catalog's
+    // Portal, taskmgr and the editor stage sibling trees; every retained
+    // input moves its consumer's source digest. This cheap preflight augments
+    // each crate arm below. engine/ carries its own routing; td-seatd shares
+    // the compositor arm but is not a staged sibling. Keep this top-level
+    // tree roster in agreement with the catalog's
     // local_source_trees_are_staged_by_basename_and_routed_by_the_builder test.
     if pattern_matches(
-        "td-portal/*|td-busd/*|td-compositor/*|td-secret/*|td-ui/*|td-taskmgr/*",
+        "td-portal/*|td-busd/*|td-compositor/*|td-secret/*|td-ui/*|td-taskmgr/*|td-editor/*",
         p,
     ) {
         sel.add_preflight("local-source-digests");
@@ -1425,14 +1425,15 @@ fn map_path(root: &Path, roster: &Result<Vec<GateCrate>, String>, p: &str, sel: 
         return;
     }
 
-    // The editor core has no recipe or workspace consumer yet, so no check
-    // target reaches it; packaging the editor must replace this arm with
-    // target-artifact coverage. As for td-review above, the host preflight
-    // covers the editor's gate 325 lock/test/clippy obligations without the
-    // unrelated check pools — beside the workspace suite, whose builder
-    // tests read every roster lock and manifest, the editor's included.
+    // The editor is a static target recipe with a realized-output check
+    // (td-editor-test), so a source edit changes a target artifact: the host
+    // preflight still holds its gate 325 lock/test/clippy obligations, and
+    // recipe-checks holds the static link and the headless modes. The digest
+    // preflight came from the sibling-tree arm above.
     if p.starts_with("td-editor/") && !p.contains("..") {
         sel.add_preflight("cargo-test");
+        sel.add_target("check");
+        sel.add_target("recipe-checks");
         return;
     }
 
@@ -1444,8 +1445,9 @@ fn map_path(root: &Path, roster: &Result<Vec<GateCrate>, String>, p: &str, sel: 
         return;
     }
 
-    // Toolkit edits affect the standalone consumers and the target taskmgr
-    // and portal recipes; source pins and realized-output checks are required.
+    // Toolkit edits affect the standalone consumers and the target taskmgr,
+    // editor and portal recipes; source pins and realized-output checks are
+    // required.
     if p.starts_with("td-ui/") && !p.contains("..") {
         sel.add_preflight("cargo-test");
         sel.add_target("check");
@@ -1454,10 +1456,10 @@ fn map_path(root: &Path, roster: &Result<Vec<GateCrate>, String>, p: &str, sel: 
     }
 
     // td-setup, the installer front end, is a td-ui consumer with no recipe
-    // consumer yet, so the same arm as the editor: the host
-    // preflight covers its own lock/test/clippy obligations, and the cargo
-    // narrowing carries the change to every crate whose manifest names it
-    // (nobody yet). Packaging the installer replaces this arm with
+    // consumer yet, so the arm the editor had before it had a recipe: the
+    // host preflight covers its own lock/test/clippy obligations, and the
+    // cargo narrowing carries the change to every crate whose manifest names
+    // it (nobody yet). Packaging the installer replaces this arm with
     // target-artifact coverage.
     if p.starts_with("td-setup/") && !p.contains("..") {
         sel.add_preflight("cargo-test");
@@ -2397,6 +2399,17 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     assert_preflight!("td-ui/Cargo.toml", "local-source-digests");
     assert_no_preflight!("td-ui/DESIGN.md", "local-source-digests");
     assert_no_preflight!("td-seatd/src/main.rs", "local-source-digests");
+    // td-editor stages td-ui and td-compositor beside itself, so its own
+    // retained inputs move the `td-editor-source` row, and the static link
+    // plus the headless modes are proven by td-editor-test on recipe-checks.
+    assert_preflight!("td-editor/src/main.rs", "local-source-digests");
+    assert_preflight!("td-editor/Cargo.lock", "local-source-digests");
+    assert_preflight!("td-editor/tests/core.rs", "local-source-digests");
+    assert_no_preflight!("td-editor/DESIGN.md", "local-source-digests");
+    assert_preflight!("td-editor/src/main.rs", "cargo-test");
+    assert_target!("td-editor/src/main.rs", "check");
+    assert_target!("td-editor/src/main.rs", "recipe-checks");
+    assert_target!("td-editor/Cargo.lock", "recipe-checks");
     assert_preflight!("td-audio/src/main.rs", "cargo-test");
     assert_preflight!("td-audio/src/sys.rs", "cargo-test");
     assert_preflight!("td-audio/src/pcm.rs", "cargo-test");
@@ -7322,7 +7335,7 @@ mod tests {
     }
 
     #[test]
-    fn editor_only_changes_select_its_own_checks_but_mixed_changes_do_not() {
+    fn editor_source_routes_to_its_roster_pin_and_target_checks() {
         let root = repo_root();
         let editor_paths = [
             "td-editor/Cargo.toml",
@@ -7332,27 +7345,36 @@ mod tests {
             "td-editor/src/model.rs",
             "td-editor/src/io/file.rs",
             "td-editor/tests/core.rs",
-            "td-editor/README.md",
-            "td-editor/DESIGN.md",
         ];
         // The editor's own commands ride beside the workspace suite, as
         // td-review's do: the builder's tests read every roster lock and
-        // manifest, so a change to the editor's can red them.
+        // manifest, so a change to the editor's can red them. Since the
+        // editor is a target recipe staged whole (td-editor-source), every
+        // retained input also moves its digest row and takes the static-link
+        // proof through recipe-checks, as td-taskmgr's do.
         for path in editor_paths {
             let output = path_output(&root, path);
-            assert!(!output.contains("td-builder check"), "{path}: {output}");
-            if path.ends_with(".md") {
-                assert!(output.contains("Selected checks: none"), "{path}: {output}");
-            } else {
-                assert!(
-                    output.contains("--workspace (builder/recipes/engine)")
-                        && output.contains("--manifest-path td-editor/Cargo.toml"),
-                    "{path}: {output}"
-                );
-            }
+            assert!(
+                output.contains("--workspace (builder/recipes/engine)")
+                    && output.contains("--manifest-path td-editor/Cargo.toml"),
+                "{path}: {output}"
+            );
+            assert!(output.contains("local-source-digests"), "{path}: {output}");
+            assert!(output.contains("td-builder check"), "{path}: {output}");
+            assert!(output.contains("recipe-checks"), "{path}: {output}");
         }
+        // Retained documentation moves the row too; DESIGN.md alone is
+        // excluded from staging and selects nothing.
+        let readme = path_output(&root, "td-editor/README.md");
+        assert!(readme.contains("local-source-digests"), "{readme}");
+        assert!(!readme.contains("td-builder check"), "{readme}");
+        let docs = path_output(&root, "td-editor/DESIGN.md");
+        assert!(docs.contains("Selected checks: none"), "{docs}");
         let mut paths: Vec<String> = editor_paths.iter().map(|p| (*p).to_string()).collect();
-        assert!(compute_selection(&root, &paths).targets.is_empty());
+        let targets = compute_selection(&root, &paths).targets;
+        for target in ["check", "recipe-checks"] {
+            assert!(targets.contains(&target.to_string()), "{targets:?}");
+        }
         let commands = cargo_test_cmds(&root, &paths).unwrap();
         assert_eq!(commands.len(), 5, "{commands:?}");
         assert!(commands.iter().all(|c| {

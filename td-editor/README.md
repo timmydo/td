@@ -716,12 +716,14 @@ establish td-mail/jail integration or GPU rendering.
 
 Editor-only changes are routed by `td-builder ready` to this crate's tests
 and Clippy alongside the workspace Rust suite, whose tests validate every
-discovered crate's lock and manifest. Documentation-only changes keep the
-normal docs-only waiver. Neither runs bootstrap/image gates. This is valid while no
-recipe or workspace member consumes editor sources; builder regression tests
-guard that boundary. Adding an editor recipe or another consumer must update
-the routing and its guard in the same increment. A diff that also changes
-the builder or another embedded component still selects its broader checks.
+discovered crate's lock and manifest, and to the target checks: the crate is
+staged whole as the `td-editor-source` seed of the `td-editor` recipe, so
+every retained input (this file included; `DESIGN.md` is excluded from
+staging) moves that seed's digest row and selects the digest preflight, and
+source changes also select recipe-checks, where `td-editor-test` builds the
+static binary and runs its headless modes on the target. Builder regression
+tests guard that routing. A diff that also changes the builder or another
+embedded component still selects its broader checks.
 
 ## Headless replay protocol
 

@@ -9507,8 +9507,10 @@ jail's `/app` cannot see one that is not packaged with the application.
 An editor is also the first td program that must render text in a
 Wayland window from a source other than a terminal.
 
-**Shape.** A dependency-free Rust crate, `td-editor`, built like the
-other td crates (direct rustc, static) and packaged into the `mail`
+**Shape.** A dependency-free Rust crate, `td-editor`, built as a static
+target recipe from the checkout with `td-ui` and `td-compositor` staged
+beside it (the td-taskmgr shape, since it links the toolkit as a second
+crate); the packaging step, (6) below, is to put it into the `mail`
 application's store closure as `/app/bin/td-editor` with
 `EDITOR=/app/bin/td-editor` in the manifest environment. It is a native
 Wayland client: the mail jail already carries `sockets=wayland`, so the
@@ -9541,7 +9543,8 @@ at a configured column while typing, on by default for a mail draft.
 other input) and the underline rendition on misspelled words, with
 `M-$` correction. (5) Mouse selection through `wl_pointer`, and the
 clipboard through `wl_data_device`, which td-compositor already serves
-to td-term. (6) The packaging step above and the manifest environment.
+to td-term. (6) Packaging into the `mail` closure as `/app/bin/td-editor`
+with `EDITOR` in the manifest environment.
 
 **Non-goals.** Syntax highlighting, multiple windows, a terminal mode.
 The terminal fallback for a headless session is a later increment; the

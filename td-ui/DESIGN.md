@@ -96,8 +96,12 @@ sibling-dependency spelling `builder/src/affected.rs` admits, and the
 consumer's lock then lists exactly its own package plus td-ui. A program
 that depends on td-ui is built by a cargo recipe that stages sibling source
 trees (`local_source_trees`, the td-net shape); a flat-staged direct-rustc
-recipe cannot link a second crate. td-editor has no recipe yet, so nothing
-changes for packaging until one exists.
+recipe cannot link a second crate. td-portal, td-taskmgr and td-editor are
+built that way: each stages `td-ui`, and `td-compositor` because td-ui
+mounts the font and wire modules from it, beside its own tree (td-portal
+stages further siblings of its own), so a toolkit edit moves each
+consumer's source-digest row and selects each consumer's realized-output
+check.
 
 ## Public surface
 

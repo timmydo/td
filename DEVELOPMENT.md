@@ -372,8 +372,9 @@ metadata adds a native process-test command to both the host preflight and
 gate 325. It requires the discovered `td-compositor` crate. The command is
 attributed to the consumer for affected-check narrowing: an editor-only
 change builds its compositor test tool without selecting the compositor's
-own suites or expanding the recipe-check scope. Compositor changes select
-declared native-test consumers as readers even without shared source files.
+own suites or bringing the compositor into the recipe-check scope, which
+names the editor alone. Compositor changes select declared native-test
+consumers as readers even without shared source files.
 
 `td-builder gate-crates native-compositor --manifest-path CRATE/Cargo.toml`
 checks that declaration, builds the repository's compositor offline into a

@@ -405,6 +405,7 @@ mod tests {
                 "td-boot",
                 "td-busd",
                 "td-compositor",
+                "td-editor",
                 "td-portal",
                 "td-secret",
                 "td-taskmgr",

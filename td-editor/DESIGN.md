@@ -977,8 +977,15 @@ td-compositor/assets/unifont-COPYING
 td-compositor/assets/unifont-OFL-1.1.txt
 ```
 
-There is no editor recipe yet; adding one must replace the editor-only gate
-exemption with target-artifact coverage, as specified below.
+The target recipe `td-editor` (`recipes/src/recipes/td-editor.rs`) builds
+the crate with cargo on the source-built toolchain, staging the `td-ui` and
+`td-compositor` trees beside it so those five files arrive as the sources
+above name them, links the binary fully static and splits its debug
+companion. Its realized-output check, `td-editor-test`, requires and asserts
+the static binary and runs `--help`, an empty `--replay` and
+`--font-license` on the target; that check is the target-artifact coverage
+an editor, toolkit or compositor edit selects, in place of the former
+editor-only host gate exemption.
 
 Chrome dimensions below are logical pixels multiplied by the frame scale.
 The menu occupies the first 24 pixels, then any active minibuffer, then
@@ -1938,11 +1945,11 @@ The adapter frames requests and events with `td_ui::wire` (the compositor's
 `td_ui::client::run` drives the connection, and the client owns the object
 table, the toplevel surface, its buffers, the seat with its keyboard and
 pointer, and the pointer image; the codec and the client are staged with the
-td-ui tree beside the five font/license inputs when the future source recipe
-is added. This adapter owns display environment access, passing the
-environment values it reads to td-ui's `endpoint` explicitly, and the loop's
-clock is td-ui's; `files::Session` separately owns document file I/O. The
-core's explicit-input contract is unchanged.
+td-ui tree beside the five font/license inputs by the `td-editor` recipe.
+This adapter owns display environment access, passing the environment
+values it reads to td-ui's `endpoint` explicitly, and the loop's clock is
+td-ui's; `files::Session` separately owns document file I/O. The core's
+explicit-input contract is unchanged.
 
 The client binds compositor v4, SHM v1 and xdg shell v1, requiring those
 minimum versions and capping higher advertisements, binds the seat and
