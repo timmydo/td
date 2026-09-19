@@ -169,7 +169,14 @@ fn pure_modules_reach_no_file_environment_clock_network_or_process() {
     let main = read("src/main.rs");
     assert!(main.contains("fs::File::open(path)"));
     assert!(main.contains(".take(ceiling + 1)"));
-    assert!(!main.contains("fs::read("), "an unbounded read");
+    // The inline test module opts out of the two negative pins, as
+    // `#[cfg(test)]` code may; the production slice, everything before
+    // that module's own marker (a `#[cfg(test)]` helper earlier in the
+    // file is production too), is what is held.
+    let production = main
+        .split_once("#[cfg(test)]\nmod tests {")
+        .map_or(main.as_str(), |(production, _)| production);
+    assert!(!production.contains("fs::read("), "an unbounded read");
     assert!(main.contains("Instant::now"));
     // Output is created exclusively and nothing existing is replaced.
     assert!(main.contains(".create_new(true)"));
@@ -178,11 +185,18 @@ fn pure_modules_reach_no_file_environment_clock_network_or_process() {
     // Publication is a link, which cannot replace. A rename is the fallback
     // for a file system without links, and the sidecar's write: the one
     // file td-photo replaces, through a temporary of its own (DESIGN.md,
-    // Files). No third.
+    // Files). Culling's move into `rejected/` is the same rule over the
+    // original: linked, then its old name dropped, with the same fallback.
+    // No fourth rename.
     assert!(main.contains("fs::hard_link(temporary, out)"));
     assert!(main.contains("fs::rename(temporary, out)"));
     assert!(main.contains("fs::rename(&temporary, &path)"));
-    assert_eq!(main.matches("fs::rename(").count(), 2);
+    assert!(main.contains("fs::hard_link(from, to)"));
+    assert!(main.contains("fs::rename(from, to)"));
+    assert_eq!(main.matches("fs::rename(").count(), 3);
+    assert_eq!(main.matches("fn move_file(").count(), 1);
+    assert!(main.contains("move_rejects_with(roll, &mut move_file)"));
+    assert_eq!(main.matches("fn move_rejects_with(").count(), 1);
     assert!(!main.contains("println!"), "a panicking print");
     // The window opens no file and reads no clock of its own: its
     // thumbnails come from `main`'s rule on the pool's threads, its time is
@@ -321,7 +335,10 @@ fn budgets_are_the_documented_values() {
     let main = read("src/main.rs");
     assert!(main.contains("fn is_cache_name("));
     assert!(main.contains("if !is_cache_name(name)"));
-    assert!(!main.contains("remove_dir"), "a directory removal");
+    let production = main
+        .split_once("#[cfg(test)]\nmod tests {")
+        .map_or(main.as_str(), |(production, _)| production);
+    assert!(!production.contains("remove_dir"), "a directory removal");
     assert!(main.contains("fn own_dir("));
     assert!(main.contains("XDG_CACHE_HOME"));
     assert!(main.contains(".take(MAX_THUMB_FILE_BYTES + 1)"));

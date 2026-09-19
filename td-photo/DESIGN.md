@@ -54,8 +54,9 @@ with and the Wayland client the window runs on; the window's develop mode
 lands over its own slices: the mode, its keys and the develop edits over the
 seam and the socket are in, as are the developed preview and the crop drag
 with its edge and corner handles and the look palette; the `export` verb and
-the window's `export` action are in, and `delete-rejected` follows, as the
-increments at the end schedule.
+the window's `export` action are in, and `delete-rejected` closes the
+export increment; packaging follows, as the increments at the end
+schedule.
 
 The rules below define version 1; the increments identify the order of
 implementation, not choices left to each implementing agent.
@@ -96,8 +97,10 @@ modes are the photographer's order of work.
    and the page keys, presses `p` to pick, `x` to reject and `u` to clear,
    `Return` to see one photo at the medium preview's full size and `Return` or
    `Escape` to go back, and `1` to `4` (or the bar) to show all, the picks, the
-   rejects or the unflagged. `Delete rejected` moves the rejects and their
-   sidecars into the roll's `rejected/` folder; nothing is unlinked.
+   rejects or the unflagged. `Delete` (`delete-rejected`) moves the rejects
+   and their sidecars into the roll's `rejected/` folder, each file linked
+   there before its old name is dropped, so no file is lost and no name is
+   replaced. `td-photo delete-rejected ROLL` is it headless.
 3. **Develop** shows one photo developed from its raw data, entered with `d`
    on the cursor's photo and left with `Escape`. `=`/`-` move exposure by a
    third of a stop and their shifted pair `+`/`_` by a tenth, `0` resets to
@@ -134,7 +137,7 @@ window, all speaking the toolkit's one vocabulary.
   in `ui` (open a roll, the cursor moves, select, pick, reject, unflag, the four
   filters, the single view and back, scroll, quit, enter develop and its
   exposure, look, crop, crop-adjust, aspect, the look palette (`looks`) and
-  reset, and export; delete rejected joins it in its increment).
+  reset, export, and delete rejected).
   `ui::Controller` holds the model (the roll's names and sidecars, the cursor,
   the filter, the view, the scroll and the surface, and the shown list the
   filter admits, kept rather than rescanned); `action(name, fields)` and
@@ -198,9 +201,26 @@ window, all speaking the toolkit's one vocabulary.
   generation and the same note again does not; it is cleared when a roll
   opens, and the row's note is the open roll's: an export of a roll opened
   before that finishes after the switch is noted on stderr instead.
+- **Delete rejected is the files'.** `delete-rejected` (`Delete`) is the
+  cull grid's action, as the filters are, so develop mode ignores it; with
+  a roll open the dispatch asks whenever it is called, since the files, not
+  the model's copies, say which photos are rejects. The adapter runs the
+  verb's mover over the roll as it stands (Files, Rejected) and takes the
+  photos it moved out of the model through `remove`: the shown list is
+  recomputed, the cursor keeps its photo when that stays and otherwise its
+  position among the shown, clamped to the end, or leaves when none is
+  shown, ending the single view and the drag, crop-adjust, aspect lock and
+  look palette that were the moved photo's, as a filter that hides it
+  does. The reply is `changed` when any moved, `ignored` when the files
+  hold no reject, and `refused`, each reason on stderr, when one was kept
+  or moved without its sidecar, the ones that moved taken out all the
+  same, so the model holds what the roll lists. The window keeps a moved
+  name's thumbnail and cached level 0 until they are evicted, as it does
+  for a file replaced in place.
 - **A headless verb for every durable effect.** Whatever an action does to
   files is also a command-line verb: `import`, `list`, `flag`, `edit`
-  (get and set of a sidecar's values), `develop`, `export`, `thumb`,
+  (get and set of a sidecar's values), `delete-rejected`, `develop`,
+  `export`, `thumb`,
   `looks` and `cache clear`. Verbs are the batch face: they read the same
   sidecars and write them the same way, and an agent that does not need
   to see pixels never opens a window.
@@ -353,9 +373,30 @@ The library is folders of originals; there is no database.
   is created exclusively, so a stale one is reported rather than reused or
   removed; an edit that would take the sidecar past the ceilings above is
   refused before anything is written, so what td-photo writes it reads.
-- **Rejected** originals move, with their sidecars, into `rejected/`
-  under the roll. Neither that folder nor `exported/` is listed as part of
-  the roll.
+- **Rejected** originals move, with their sidecars, into `rejected/` under the
+  roll: `delete-rejected` lists the roll, reads each sidecar and moves the
+  photos whose sidecar says `flag reject` (a sidecar the reader refuses cannot
+  say so, and that photo stays). The folder is made when the first reject is
+  found, so a roll without one is left as it was, and checked by name as
+  `exported/` is, the roll itself under that name (a bind mount) refused with a
+  link. Each file moves by the publication rule: linked to its name in
+  `rejected/`, which fails on a name that appeared meanwhile, then its old name
+  dropped, so the file has a name throughout and nothing existing is replaced; a
+  file system without links falls back to the check and rename `publish` uses; a
+  file linked whose old name could not be dropped is reported and has both
+  names, the roll listing it still, until the next ask finds the name there the
+  file's own (the same inode on the same device, with two names to it) and
+  finishes the move by dropping the old name. Both destinations, `rejected/NAME`
+  and `rejected/NAME.ext.edit`, are refused by name before either moves (a name
+  that cannot be looked up refuses too, and so does a stale `NAME.ext.edit.tmp`,
+  the sign of an interrupted write the user should look at) and the photo is
+  kept with why; then the original moves, then its sidecar, and a sidecar that
+  could not follow is reported with where its original went, the photo moved
+  without it. The verb prints `moved NAME`, `moved NAME without its sidecar:
+  WHY` or `kept NAME: WHY` per reject and fails after the rest when any was kept
+  or split, as `import` does; the window's adapter notes the same line on
+  stderr, so a kept photo, still whole in the roll, is told apart from a split
+  one. Neither that folder nor `exported/` is listed as part of the roll.
 - **Export** writes `exported/STEM.jpg` beside the roll, `STEM` the
   original's name without its extension, or `STEM-2.jpg`, `STEM-3.jpg` and
   so on: the first free number from 2 when the plain name is taken, at most
@@ -965,14 +1006,18 @@ thumbnail is not ready paints a neutral placeholder and its name, never blocks.
 
 ## Invariants
 
-- No original is ever modified, renamed or unlinked by td-photo. Import
-  copies; culling moves into `rejected/`; export writes new names.
+- No original is ever modified or lost by td-photo, and no name of one is
+  dropped but by culling's move into `rejected/`, under the roll it is in
+  and by the same name, once the file has its name there. Import copies;
+  export writes new names.
 - No existing name but a sidecar's is ever replaced: a destination is
   refused by name before any work, and the final step of every write is a
   hard link, which fails on a name that appeared meanwhile; only a file
   system that refuses links falls back to a second check and a rename.
   The sidecar is td-photo's own file, read whole and accepted before its
-  temporary is renamed over it.
+  temporary is renamed over it. Culling's move is the same rule over the
+  original and its sidecar: linked to the name in `rejected/`, then the
+  old name dropped.
 - Pure modules (`tiff`, `nef`, `camera`, `color`, `develop`, `image`,
   `jpeg`, `library`, `look`) read no file, environment, clock or descriptor.
   `main` and the library adapter own I/O.
@@ -1098,7 +1143,18 @@ card unchanged and no temporary left; `list` with each filter; and `flag` and
 `edit` writing through the sidecar, keeping an unknown line, refusing a bad
 value before writing, refusing a malformed sidecar, a stale temporary, a linked
 sidecar, a sidecar past either ceiling and an edit that would take one past, and
-unlinking nothing.
+unlinking nothing; and `delete-rejected` moving a reject and its sidecar into
+`rejected/` byte for byte (an unknown line carried), keeping one whose name
+there is taken with why and on a second run again, leaving a pick, a refused
+sidecar that says reject and a photo without one where they are, with as many
+files under the roll as before, saying and making nothing for a roll whose
+only rejects are a refused sidecar's and a link's, keeping a photo whose
+original's name is taken or whose sidecar temporary is stale, finishing a move
+interrupted after the link, refusing a link at `rejected/` by name before
+anything moves, and a missing roll or argument. A unit test in `main` drives
+the mover over an injected file move that fails the sidecar's leg: the photo
+reported as moved without it, the rest going on, and the real mover refusing
+a taken name and finishing its own interrupted move.
 
 `tests/ui.rs` holds the action table to `driven::check` and to its alignment
 with `Action`, and the error codes to the code grammar; drives `ui::Controller`
@@ -1113,93 +1169,99 @@ for, the model unchanged until they are settled and its sidecar text after, the
 flag the file already holds ignored, an unknown line kept, a refused sidecar
 never rewritten, a flag that hides the photo under a filter and ends the single
 view, a settle that brings nothing new leaving the generation and one that
-differs moving it, and the sidecar budget at open and at settle); reads the
-scene back as text (the bar with its headers in place under every filter, the
-names and badges by row, the status line, the single view, the empty and
-filtered-out messages, a scale of 2) and holds its frame digest to equality and
-to change; and runs the built binary's `--replay` over a temporary roll through
-the seam's verbs, writing a pick through the sidecar, refusing to flag a refused
-one, keeping an edit made meanwhile and refusing a sidecar that became
-malformed, reporting a stale temporary and settling the model from the file with
-the cursor and the generation unmoved, a name that is not ASCII in hex,
-answering after `quit`, and refusing a roll that is not there, a bad size and a
-stray argument before the session starts; holds the window's helpers (the boxes
-on screen and the wants in order under a scroll, a filter and the single view,
-the job count as a fact and a touch as a change, which keys repeat, the
-blitter's pixels centred, clipped to the surface, the box and the area, and in
-BGRX order, the badges painted back over a thumbnail that covered one and
-changing nothing over the scene's own frame, on a tall surface and on one too
-short for a cell where only the area's clip keeps them off the status band, and
-the in-memory shrink by the thumbnail rule), `wait-idle` over the replay idle at
-once with its argument
+differs moving it, the sidecar budget at open and at settle, and delete rejected
+asked for by verb and by `Delete` whenever a roll is open and moving nothing
+itself, ignored in develop mode, and `remove` taking the moved photos out with
+the cursor keeping its photo or its position, clamped to the end, the single
+view staying on the photo that takes a reject's place or leaving with the cursor
+when none is shown, and names not held changing nothing); reads the scene back
+as text (the bar with its headers in place under every filter, the names and
+badges by row, the status line, the single view, the empty and filtered-out
+messages, a scale of 2) and holds its frame digest to equality and to change;
+and runs the built binary's `--replay` over a temporary roll through the seam's
+verbs, writing a pick through the sidecar, refusing to flag a refused one,
+keeping an edit made meanwhile and refusing a sidecar that became malformed,
+reporting a stale temporary and settling the model from the file with the cursor
+and the generation unmoved, a name that is not ASCII in hex, answering after
+`quit`, and refusing a roll that is not there, a bad size and a stray argument
+before the session starts, and deleting the rejects: the rejects and their
+sidecars in `rejected/` when the reply is and the model holding what is left, a
+second ask `ignored`, a reject added since the roll opened moving and `changed`
+though the model never held it, and a mixed batch, one moved and one whose name
+there is taken kept, `refused` with the reason on stderr and the model holding
+what the roll lists; holds the window's helpers (the boxes on screen and the
+wants in order under a scroll, a filter and the single view, the job count as a
+fact and a touch as a change, which keys repeat, the blitter's pixels centred,
+clipped to the surface, the box and the area, and in BGRX order, the badges
+painted back over a thumbnail that covered one and changing nothing over the
+scene's own frame, on a tall surface and on one too short for a cell where only
+the area's clip keeps them off the status band, and the in-memory shrink by the
+thumbnail rule), `wait-idle` over the replay idle at once with its argument
 judged, `--preview` equal to the seam's frame of the empty window and of a roll
 and refused for a bad size or roll, `develop_box` the preview box only in
 develop mode, the crop set over the develop preview (a marquee armed,
 rubber-banded and committed as a sub-region of the current crop, a click, a
 sub-minimum marquee and an off-canvas press refused, the develop box the
 fallback canvas when no fit is reported; the crop-adjust sub-mode toggled and
-escaped in layers, the crop mapped onto the canvas, a corner handle growing
-it, the interior handle moving it, an edge handle clamped to the minimum and
-grown to clear the crop, and the sub-mode and its handles witnessed by the
-frame not `state`; the `aspect` lock -- a locked corner drag mapping the ratio
-in the canvas's pixel space (so a 3:2 lock on a 4:3 canvas is a 9:8 fraction
-box), a grab without moving neither reshaping nor committing, a corner, edge
-and tighten-marquee drag holding the ratio, a one-to-one lock keeping a square
-in pixels, a locked edge clamped to the minimum, switching back to free, the
-lock dropped on a photo switch, and a bad ratio token or wrong mode refused);
-the look palette (toggled only in develop and escaping in layers; a `set_looks`
-fact and a frame-witnessed sub-mode an empty list or a boxless surface leaves
-blank; the current look marked and picked by a press on its name (a press off
-the names or with no box picking nothing); mutually exclusive with crop-adjust
-and dropped on a photo switch; a touch behind the open palette not bumping the
-generation); the export action (asking for the cursor photo in either mode
-by verb and by `e`, refused without a roll or a photo, not repeating on a
-held key, the dispatch moving nothing; the note set, shown at the row's end,
-a new generation when it differs and none when it is the same, absent from
-`state` but for the generation, and cleared by an open); the binary's
-`--replay` exporting a synthesized decodable NEF on the request (the JPEG
-there and the row noting it when the reply is, the second export numbered,
-the job count zero, a frame that cannot be decoded `refused` with the row
-saying it failed, a refused sidecar `refused` before anything is read, and
-nothing written for either), and `open` refusing a bad
-socket
-path, a
-second roll or a stray flag before it looks for a display and leaving no socket
-behind when the display is not there; `src/window.rs`'s own tests hold
-`wait_ms`'s grammar, the envelope's ID, the charge of a held entry, the queue's
-replacement skipping what runs and the pool's count staying outstanding until a
-result is collected, the pool running one develop at a time and dropping its
-queued plan when one finishes, the memo planning each develop from what it
-holds (level 3 for an exposure or look edit, level 2 for a resize, level 1 for
-a cached photo, else a decode), untouched by a failed develop, caching but not
-becoming current for a develop that finishes off the cursor, the raw cache
-evicting the least recently shown under
-`RAW_CACHE_BYTES`, an export keyed by its own path as the memo keys it, and
-the exports surviving a replacement of the wants, running in order one at a
-time after a thumbnail and the develop, draining alone from a closing queue
-once none is in flight, coming back from the pool with why one failed and
-leaving the count as the result is sent, running one after another on
-collection alone, and drained by a pool closing with no window to collect. `tests/control_process.rs` runs the built binary under the
-native compositor harness the sibling crates use (`ready`
-builds the compositor; the case is ignored without it): the window on a roll of
-originals no decoder accepts, so the frame is the scene's, mapped with its app
-id, idle over the socket, its state, its captured tile equal to `--preview` of
-the roll at the tile's size under the observe, capture, observe rule, a pick
-over the socket written through the sidecar and shown, a click from the seat on
-the second cell and `End` from the seat each moving the cursor (repeated until
-one lands, each the same cell however many land; the pointer then parked in the
-desktop bar, since the seat draws the client's cursor over the tile), `first`
-over the socket restoring the frame, and `quit` closing the window with its
-socket gone. A second native case, on a synthesized decodable NEF, develops
-the cursor photo over the socket and holds the captured tile to `--preview
---develop` of the roll before and after an exposure edit, then exports over
-the socket: with the sidecar naming a look no file provides the export fails
-and the row says so with nothing written, and with the look cleared
-`wait-idle` waits for the pool's export, the JPEG is in `exported/` and the
-row names it, and an export asked for and quit at once is written, numbered,
-by the time the process has exited; a headless case (no
-compositor) holds `--preview --develop` to a develop box that carries a
-developed image and changes with the sidecar's exposure.
+escaped in layers, the crop mapped onto the canvas, a corner handle growing it,
+the interior handle moving it, an edge handle clamped to the minimum and grown
+to clear the crop, and the sub-mode and its handles witnessed by the frame not
+`state`; the `aspect` lock -- a locked corner drag mapping the ratio in the
+canvas's pixel space (so a 3:2 lock on a 4:3 canvas is a 9:8 fraction box), a
+grab without moving neither reshaping nor committing, a corner, edge and
+tighten-marquee drag holding the ratio, a one-to-one lock keeping a square in
+pixels, a locked edge clamped to the minimum, switching back to free, the lock
+dropped on a photo switch, and a bad ratio token or wrong mode refused); the
+look palette (toggled only in develop and escaping in layers; a `set_looks` fact
+and a frame-witnessed sub-mode an empty list or a boxless surface leaves blank;
+the current look marked and picked by a press on its name (a press off the names
+or with no box picking nothing); mutually exclusive with crop-adjust and dropped
+on a photo switch; a touch behind the open palette not bumping the generation);
+the export action (asking for the cursor photo in either mode by verb and by
+`e`, refused without a roll or a photo, not repeating on a held key, the
+dispatch moving nothing; the note set, shown at the row's end, a new generation
+when it differs and none when it is the same, absent from `state` but for the
+generation, and cleared by an open); the binary's `--replay` exporting a
+synthesized decodable NEF on the request (the JPEG there and the row noting it
+when the reply is, the second export numbered, the job count zero, a frame that
+cannot be decoded `refused` with the row saying it failed, a refused sidecar
+`refused` before anything is read, and nothing written for either), and `open`
+refusing a bad socket path, a second roll or a stray flag before it looks for a
+display and leaving no socket behind when the display is not there;
+`src/window.rs`'s own tests hold `wait_ms`'s grammar, the envelope's ID, the
+charge of a held entry, the queue's replacement skipping what runs and the
+pool's count staying outstanding until a result is collected, the pool running
+one develop at a time and dropping its queued plan when one finishes, the memo
+planning each develop from what it holds (level 3 for an exposure or look edit,
+level 2 for a resize, level 1 for a cached photo, else a decode), untouched by a
+failed develop, caching but not becoming current for a develop that finishes off
+the cursor, the raw cache evicting the least recently shown under
+`RAW_CACHE_BYTES`, an export keyed by its own path as the memo keys it, and the
+exports surviving a replacement of the wants, running in order one at a time
+after a thumbnail and the develop, draining alone from a closing queue once none
+is in flight, coming back from the pool with why one failed and leaving the
+count as the result is sent, running one after another on collection alone, and
+drained by a pool closing with no window to collect. `tests/control_process.rs`
+runs the built binary under the native compositor harness the sibling crates use
+(`ready` builds the compositor; the case is ignored without it): the window on a
+roll of originals no decoder accepts, so the frame is the scene's, mapped with
+its app id, idle over the socket, its state, its captured tile equal to
+`--preview` of the roll at the tile's size under the observe, capture, observe
+rule, a pick over the socket written through the sidecar and shown, a click from
+the seat on the second cell and `End` from the seat each moving the cursor
+(repeated until one lands, each the same cell however many land; the pointer
+then parked in the desktop bar, since the seat draws the client's cursor over
+the tile), `first` over the socket restoring the frame, and `quit` closing the
+window with its socket gone. A second native case, on a synthesized decodable
+NEF, develops the cursor photo over the socket and holds the captured tile to
+`--preview --develop` of the roll before and after an exposure edit, then
+exports over the socket: with the sidecar naming a look no file provides the
+export fails and the row says so with nothing written, and with the look cleared
+`wait-idle` waits for the pool's export, the JPEG is in `exported/` and the row
+names it, and an export asked for and quit at once is written, numbered, by the
+time the process has exited; a headless case (no compositor) holds `--preview
+--develop` to a develop box that carries a developed image and changes with the
+sidecar's exposure.
 
 The builder discovers the crate by existing; its gate runs `cargo test` and
 all-target Clippy.
@@ -1283,8 +1345,9 @@ all-target Clippy.
    `export` action in the window: the `Export` pool job over the raw cache,
    running the verb's runner off the turn thread, its outcome the status
    row's note; the replay running it on the request. Landed. (c)
-   `delete-rejected`, the action and its verb that move rejects and their
-   sidecars into `rejected/`.
+   `delete-rejected`, the action (`Delete`) and its verb that move rejects
+   and their sidecars into `rejected/` by the publication rule, the names
+   there refused first, the model taking the moved photos out. Landed.
 7. Packaging: the cargo recipe staging td-ui, the image entry, and the
    recipe check that develops the synthetic frame in the built artifact.
 8. Later: the 100% loupe from level 0, DNG and JPEG rolls, the Nikon High

@@ -198,6 +198,10 @@ pub enum Effect {
     /// verb on the request, the window hands it to its pool; either says
     /// what came of it through `set_export`, the status row's note.
     Export { index: usize, name: String },
+    /// Move the roll's rejects, as the files flag them then, with their
+    /// sidecars into `rejected/`, and take the moved ones out of the model
+    /// through `remove`.
+    DeleteRejected,
 }
 
 /// The closed set of things the window does. The table below is its
@@ -236,12 +240,13 @@ pub enum Action {
     Looks,
     Reset,
     Export,
+    DeleteRejected,
     Scroll,
     Quit,
 }
 
 impl Action {
-    pub const ALL: [Action; 33] = [
+    pub const ALL: [Action; 34] = [
         Action::Open,
         Action::Next,
         Action::Previous,
@@ -273,6 +278,7 @@ impl Action {
         Action::Looks,
         Action::Reset,
         Action::Export,
+        Action::DeleteRejected,
         Action::Scroll,
         Action::Quit,
     ];
@@ -310,6 +316,7 @@ impl Action {
             Self::Looks => "looks",
             Self::Reset => "reset",
             Self::Export => "export",
+            Self::DeleteRejected => "delete-rejected",
             Self::Scroll => "scroll",
             Self::Quit => "quit",
         }
@@ -334,7 +341,7 @@ impl Action {
 /// binds, the argument shape and the help line. Actions without a chord
 /// take an argument or are the agent's (`open`); the pointer reaches
 /// `select` by pressing a cell and `scroll` by the wheel.
-pub const BINDINGS: [Binding; 33] = [
+pub const BINDINGS: [Binding; 34] = [
     Binding {
         name: "open",
         chord: None,
@@ -520,6 +527,12 @@ pub const BINDINGS: [Binding; 33] = [
         chord: Some("e"),
         arguments: "",
         help: "Export the photo under the cursor at full resolution into exported/, with its sidecar's edits.",
+    },
+    Binding {
+        name: "delete-rejected",
+        chord: Some("Delete"),
+        arguments: "",
+        help: "Move the rejects and their sidecars into rejected/ under the roll; no name there is replaced.",
     },
     Binding {
         name: "scroll",
@@ -1283,6 +1296,47 @@ impl Controller {
         true
     }
 
+    /// Takes the photos named out of the model, as the adapter moved them
+    /// out of the roll: the shown list is recomputed, the cursor keeps its
+    /// photo when that stays and otherwise its position among the shown,
+    /// clamped to the end, or leaves when none is shown, ending the drag,
+    /// crop-adjust, aspect lock and look palette that were the moved
+    /// photo's, as a filter that hides it does. Whether the model changed:
+    /// a name it does not hold changes nothing.
+    pub fn remove(&mut self, names: &[String]) -> bool {
+        if names.is_empty() || !self.photos.iter().any(|photo| names.contains(&photo.name)) {
+            return false;
+        }
+        let position = self.position();
+        let kept = self
+            .cursor
+            .and_then(|index| self.photos.get(index))
+            .filter(|photo| !names.contains(&photo.name))
+            .map(|photo| photo.name.clone());
+        self.photos.retain(|photo| !names.contains(&photo.name));
+        self.bytes = self
+            .photos
+            .iter()
+            .fold(0usize, |total, photo| total.saturating_add(photo.bytes()));
+        self.refresh_shown();
+        self.cursor = match kept {
+            Some(name) => self.photos.iter().position(|photo| photo.name == name),
+            None => {
+                self.drag = None;
+                self.adjusting = false;
+                self.aspect = Aspect::Free;
+                self.look_list = false;
+                let last = self.shown.len().checked_sub(1);
+                position
+                    .zip(last)
+                    .and_then(|(position, last)| self.shown.get(position.min(last)).copied())
+            }
+        };
+        self.keep_cursor_shown();
+        self.bump();
+        true
+    }
+
     pub fn surface(&self) -> Surface {
         self.surface
     }
@@ -1803,6 +1857,7 @@ impl Controller {
             (Action::Looks, []) => self.toggle_looks()?,
             (Action::Reset, []) => return self.reset_develop(effects),
             (Action::Export, []) => return self.export(effects),
+            (Action::DeleteRejected, []) => return self.delete_rejected(effects),
             _ => return Err(control::Error::Protocol.into()),
         };
         Ok((self.finish(outcome), effects))
@@ -2379,6 +2434,23 @@ impl Controller {
     fn export(&mut self, effects: Vec<Effect>) -> Result<(Outcome, Vec<Effect>), Error> {
         let index = self.need_photo()?;
         self.develop_effect(index, |index, name| Effect::Export { index, name }, effects)
+    }
+
+    /// Asks for the roll's rejects to be moved into `rejected/`: the cull
+    /// grid's action, as the filters are, so develop mode ignores it. The
+    /// files say which photos are rejects, not the model's copy, so the
+    /// dispatch asks whenever a roll is open; the adapter moves them and
+    /// takes them out of the model through `remove`, which is the change.
+    fn delete_rejected(
+        &mut self,
+        mut effects: Vec<Effect>,
+    ) -> Result<(Outcome, Vec<Effect>), Error> {
+        self.need_roll()?;
+        if self.mode == Mode::Develop {
+            return Ok((Outcome::Ignored, effects));
+        }
+        effects.push(Effect::DeleteRejected);
+        Ok((Outcome::Changed, effects))
     }
 
     /// Resets the cursor photo's develop keys to camera defaults, keeping

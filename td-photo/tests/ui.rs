@@ -453,6 +453,22 @@ fn apply(c: &mut Controller, effects: &[Effect]) -> Result<Outcome, ui::Error> {
             | Effect::Expose { index, name, .. }
             | Effect::Reset { index, name }
             | Effect::Export { index, name } => (*index, name.clone()),
+            Effect::DeleteRejected => {
+                // The adapter moves the rejects the files flag; here the
+                // model's copies stand in for the files.
+                let rejects: Vec<String> = c
+                    .photos()
+                    .iter()
+                    .filter(|photo| photo.error.is_none() && photo.flag() == Some(Flag::Reject))
+                    .map(|photo| photo.name.clone())
+                    .collect();
+                outcome = if c.remove(&rejects) {
+                    Outcome::Changed
+                } else {
+                    Outcome::Ignored
+                };
+                continue;
+            }
             Effect::Open(_) => panic!("{effect:?}"),
         };
         if let Effect::Export { .. } = effect {
@@ -480,7 +496,9 @@ fn apply(c: &mut Controller, effects: &[Effect]) -> Result<Outcome, ui::Error> {
                     .unwrap();
             }
             Effect::Reset { .. } => sidecar.reset(),
-            Effect::Open(_) | Effect::Export { .. } => panic!("{effect:?}"),
+            Effect::Open(_) | Effect::Export { .. } | Effect::DeleteRejected => {
+                panic!("{effect:?}")
+            }
         }
         let unchanged = sidecar == before;
         let changed = c.settle(
@@ -1209,7 +1227,7 @@ fn the_binary_replays_the_cull_over_a_roll_and_writes_through_the_sidecar() {
             "1"
         ]
     );
-    assert_eq!(&reply(2)[..2], ["ok", "33"]);
+    assert_eq!(&reply(2)[..2], ["ok", "34"]);
     assert_eq!(reply(3), ["ok", "changed"]);
     assert_eq!(reply(4), ["ok", &name(1), "pick", "-", "-", "-", "ok", "-"]);
     assert_eq!(
@@ -3559,6 +3577,105 @@ fn a_bad_aspect_token_or_wrong_mode_is_refused() {
 // ------------------------------------------------------------------ export
 
 #[test]
+fn delete_rejected_takes_the_rejects_out_of_the_model_and_keeps_the_cursor_near() {
+    let mut c = Controller::new(surface(800, 600));
+    assert_eq!(
+        c.action("delete-rejected", &[]).unwrap_err(),
+        ui::Error::NoRoll
+    );
+    // Six photos: the third a reject, the fourth refused. The dispatch asks
+    // whenever a roll is open, by verb and by `Delete`, and moves nothing
+    // itself.
+    c.open("roll", b"/r", photos(6)).unwrap();
+    let before = fields(&c)[GENERATION].clone();
+    let (outcome, effects) = c.action("delete-rejected", &[]).unwrap();
+    assert_eq!(outcome, Outcome::Changed);
+    assert_eq!(effects, [Effect::DeleteRejected]);
+    let (_, by_key) = c.input(Input::Key { chord: "Delete" }).unwrap();
+    assert_eq!(by_key, effects);
+    assert!(!Action::DeleteRejected.repeats());
+    assert_eq!(fields(&c)[GENERATION], before);
+    assert_eq!(c.photos().len(), 6);
+    // Applied with the cursor on the reject: the reject leaves, the cursor
+    // takes its position among the shown, and the generation moves.
+    assert_eq!(act(&mut c, "select", &["2"]), Outcome::Changed);
+    let before = fields(&c)[GENERATION].clone();
+    assert_eq!(apply(&mut c, &effects), Ok(Outcome::Changed));
+    assert_ne!(fields(&c)[GENERATION], before);
+    let f = fields(&c);
+    assert_eq!(
+        (&f[2], &f[3], &f[4], &f[7]),
+        (
+            &"5".to_string(),
+            &"5".to_string(),
+            &"2".to_string(),
+            &name(3)
+        )
+    );
+    let names: Vec<&str> = c.photos().iter().map(|p| p.name.as_str()).collect();
+    assert_eq!(names, [file(0), file(1), file(3), file(4), file(5)]);
+    // Nothing left to move: `remove` of names not held changes nothing, and
+    // the adapter says `ignored`.
+    let before = fields(&c)[GENERATION].clone();
+    assert!(!c.remove(&[file(2)]));
+    assert!(!c.remove(&[]));
+    assert_eq!(apply(&mut c, &effects), Ok(Outcome::Ignored));
+    assert_eq!(fields(&c)[GENERATION], before);
+    // The cursor on a reject at the end clamps to the new end, keeping its
+    // photo when that stays.
+    let mut c = Controller::new(surface(800, 600));
+    c.open("roll", b"/r", photos(3)).unwrap();
+    assert_eq!(act(&mut c, "select", &["2"]), Outcome::Changed);
+    assert_eq!(apply(&mut c, &effects), Ok(Outcome::Changed));
+    assert_eq!(fields(&c)[7], name(1));
+    assert_eq!(act(&mut c, "select", &["0"]), Outcome::Changed);
+    let mut roll = c.photos().to_vec();
+    roll[1].sidecar = Some(edits("td-photo edit 1\nflag reject\n"));
+    c.open("roll", b"/r", roll).unwrap();
+    assert_eq!(apply(&mut c, &effects), Ok(Outcome::Changed));
+    assert_eq!(fields(&c)[7], name(0));
+    // Under the rejects filter, in the single view: nothing is left shown,
+    // the cursor leaves and the view ends with it.
+    let mut c = Controller::new(surface(800, 600));
+    c.open("roll", b"/r", photos(3)).unwrap();
+    assert_eq!(act(&mut c, "rejects", &[]), Outcome::Changed);
+    assert_eq!(act(&mut c, "view", &[]), Outcome::Changed);
+    assert_eq!(apply(&mut c, &effects), Ok(Outcome::Changed));
+    let f = fields(&c);
+    assert_eq!(
+        (&f[2], &f[3], &f[4], &f[6]),
+        (
+            &"2".to_string(),
+            &"0".to_string(),
+            &"-".to_string(),
+            &"grid".to_string()
+        )
+    );
+    // In the single view of a reject with others left: the view stays, on
+    // the photo that takes the reject's place.
+    let mut c = Controller::new(surface(800, 600));
+    c.open("roll", b"/r", photos(4)).unwrap();
+    assert_eq!(act(&mut c, "select", &["2"]), Outcome::Changed);
+    assert_eq!(act(&mut c, "view", &[]), Outcome::Changed);
+    assert_eq!(apply(&mut c, &effects), Ok(Outcome::Changed));
+    let f = fields(&c);
+    assert_eq!(
+        (&f[4], &f[6], &f[7]),
+        (&"2".to_string(), &"single".to_string(), &name(3))
+    );
+    // Develop mode ignores it, as it does the filters.
+    let mut c = Controller::new(surface(800, 600));
+    c.open("roll", b"/r", photos(3)).unwrap();
+    assert_eq!(act(&mut c, "develop", &[]), Outcome::Changed);
+    assert_eq!(
+        c.action("delete-rejected", &[]).unwrap(),
+        (Outcome::Ignored, Vec::new())
+    );
+    assert_eq!(key(&mut c, "Delete"), Outcome::Ignored);
+    assert_eq!(c.photos().len(), 3);
+}
+
+#[test]
 fn export_asks_for_the_cursor_photo_in_either_mode_and_notes_the_status_row() {
     let mut c = Controller::new(surface(800, 600));
     assert_eq!(c.action("export", &[]).unwrap_err(), ui::Error::NoRoll);
@@ -3632,6 +3749,112 @@ fn export_asks_for_the_cursor_photo_in_either_mode_and_notes_the_status_row() {
     assert_eq!(
         c.export_note(),
         Some(format!("exported {}", file(0)).as_str())
+    );
+}
+
+#[test]
+fn the_binary_deletes_the_rejects_over_the_replay() {
+    let temp = Temp::new("delete");
+    let roll = temp.0.join("roll");
+    fs::create_dir_all(&roll).unwrap();
+    for i in 1..=3 {
+        fs::write(roll.join(format!("DSC_000{i}.NEF")), format!("photo {i}")).unwrap();
+    }
+    let first = "td-photo edit 1\nflag reject\nexposure 0.33\n";
+    fs::write(roll.join("DSC_0001.NEF.edit"), first).unwrap();
+    fs::write(
+        roll.join("DSC_0003.NEF.edit"),
+        "td-photo edit 1\nflag reject\n",
+    )
+    .unwrap();
+    let roll_s = roll.to_str().unwrap();
+    let mut session = Replay::start(&[roll_s]);
+    let a = session.send(&[
+        request(1, &["action", "delete-rejected"]),
+        request(2, &["state"]),
+        request(3, &["key", &hex(b"Delete")]),
+    ]);
+    // The rejects and their sidecars are in `rejected/` when the reply is,
+    // the model holds the one photo left, and a second asks moves nothing.
+    assert_eq!(&a[0][1..], ["ok", "changed"]);
+    assert_eq!(
+        (&a[1][4], &a[1][5], &a[1][9]),
+        (&"1".to_string(), &"1".to_string(), &name(2))
+    );
+    assert_eq!(&a[2][1..], ["ok", "ignored"]);
+    assert_eq!(names(&roll), ["DSC_0002.NEF", "rejected"]);
+    assert_eq!(
+        names(&roll.join("rejected")),
+        [
+            "DSC_0001.NEF",
+            "DSC_0001.NEF.edit",
+            "DSC_0003.NEF",
+            "DSC_0003.NEF.edit"
+        ]
+    );
+    assert_eq!(
+        fs::read(roll.join("rejected/DSC_0001.NEF")).unwrap(),
+        b"photo 1"
+    );
+    assert_eq!(
+        fs::read_to_string(roll.join("rejected/DSC_0001.NEF.edit")).unwrap(),
+        first
+    );
+    // A reject added since the roll opened moves too, `changed` though the
+    // model never held it.
+    fs::write(roll.join("DSC_0004.NEF"), b"photo 4").unwrap();
+    fs::write(
+        roll.join("DSC_0004.NEF.edit"),
+        "td-photo edit 1\nflag reject\n",
+    )
+    .unwrap();
+    let b = session.send(&[
+        request(4, &["action", "delete-rejected"]),
+        request(5, &["state"]),
+    ]);
+    assert_eq!(&b[0][1..], ["ok", "changed"]);
+    assert_eq!((&b[1][4], &b[1][9]), (&"1".to_string(), &name(2)));
+    assert_eq!(names(&roll), ["DSC_0002.NEF", "rejected"]);
+    assert!(roll.join("rejected/DSC_0004.NEF.edit").is_file());
+    // A mixed batch: a reject whose name is taken in `rejected/` is kept
+    // and one that is free moves; `refused`, the reason on stderr, the
+    // model holding what the roll lists.
+    fs::write(roll.join("rejected/DSC_0002.NEF"), b"taken").unwrap();
+    fs::write(roll.join("DSC_0005.NEF"), b"photo 5").unwrap();
+    fs::write(
+        roll.join("DSC_0005.NEF.edit"),
+        "td-photo edit 1\nflag reject\n",
+    )
+    .unwrap();
+    let c = session.send(&[
+        request(6, &["action", "reject"]),
+        request(7, &["action", "delete-rejected"]),
+        request(8, &["state"]),
+    ]);
+    assert_eq!(&c[0][1..], ["ok", "changed"]);
+    assert_eq!(c[1][1..3], ["error", "refused"]);
+    assert_eq!(
+        (&c[2][4], &c[2][9], &c[2][10]),
+        (&"1".to_string(), &name(2), &"reject".to_string())
+    );
+    assert_eq!(
+        names(&roll),
+        ["DSC_0002.NEF", "DSC_0002.NEF.edit", "rejected"]
+    );
+    assert_eq!(
+        fs::read(roll.join("rejected/DSC_0002.NEF")).unwrap(),
+        b"taken"
+    );
+    assert_eq!(
+        fs::read(roll.join("rejected/DSC_0005.NEF")).unwrap(),
+        b"photo 5"
+    );
+    assert!(roll.join("rejected/DSC_0005.NEF.edit").is_file());
+    let (ok, _, err) = session.finish();
+    assert!(ok, "{err}");
+    assert!(
+        err.contains("DSC_0002.NEF") && err.contains("already exists"),
+        "{err}"
     );
 }
 

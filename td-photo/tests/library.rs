@@ -509,6 +509,203 @@ fn import_files_by_date_skips_identical_copies_and_never_overwrites() {
     assert!(!td_photo(&["import", src_s]).0);
 }
 
+/// Every regular file under `dir`, by path, for the count that shows
+/// nothing was unlinked by a move.
+fn files_under(dir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for entry in fs::read_dir(dir).unwrap() {
+        let entry = entry.unwrap();
+        let kind = entry.file_type().unwrap();
+        if kind.is_dir() {
+            out.extend(files_under(&entry.path()));
+        } else if kind.is_file() {
+            out.push(entry.path());
+        }
+    }
+    out.sort();
+    out
+}
+
+#[test]
+fn delete_rejected_moves_rejects_with_their_sidecars_and_unlinks_nothing() {
+    let temp = Temp::new("delete");
+    let roll = temp.0.join("roll");
+    fs::create_dir_all(roll.join("rejected")).unwrap();
+    // A reject with an unknown line to carry, a pick, a reject whose
+    // sidecar's name is taken in `rejected/`, a refused sidecar that says
+    // reject (not a reject the reader can vouch for), and no sidecar.
+    for i in 1..=5 {
+        fs::write(roll.join(format!("DSC_000{i}.NEF")), format!("photo {i}")).unwrap();
+    }
+    let first = "td-photo edit 1\nflag reject\nfuture 1 2 3\nexposure -0.33\n";
+    fs::write(roll.join("DSC_0001.NEF.edit"), first).unwrap();
+    fs::write(
+        roll.join("DSC_0002.NEF.edit"),
+        "td-photo edit 1\nflag pick\n",
+    )
+    .unwrap();
+    fs::write(
+        roll.join("DSC_0003.NEF.edit"),
+        "td-photo edit 1\nflag reject\n",
+    )
+    .unwrap();
+    fs::write(roll.join("rejected/DSC_0003.NEF.edit"), "taken").unwrap();
+    fs::write(
+        roll.join("DSC_0004.NEF.edit"),
+        "td-photo edit 1\nflag reject\nexposure bad\n",
+    )
+    .unwrap();
+    let roll_s = roll.to_str().unwrap();
+    let before = files_under(&roll);
+    let (ok, out, err) = td_photo(&["delete-rejected", roll_s]);
+    assert!(!ok);
+    assert_eq!(
+        out,
+        format!(
+            "moved DSC_0001.NEF\nkept DSC_0003.NEF: {}: already exists\n",
+            roll.join("rejected/DSC_0003.NEF.edit").display()
+        )
+    );
+    assert!(err.contains("1 reject(s) not moved"), "{err}");
+    // The reject and its sidecar are in `rejected/`, byte for byte; the
+    // rest, the kept reject's sidecar included, are where they were; and
+    // as many files as before are under the roll.
+    assert_eq!(
+        fs::read(roll.join("rejected/DSC_0001.NEF")).unwrap(),
+        b"photo 1"
+    );
+    assert_eq!(
+        fs::read_to_string(roll.join("rejected/DSC_0001.NEF.edit")).unwrap(),
+        first
+    );
+    assert_eq!(
+        names(&roll),
+        [
+            "DSC_0002.NEF",
+            "DSC_0002.NEF.edit",
+            "DSC_0003.NEF",
+            "DSC_0003.NEF.edit",
+            "DSC_0004.NEF",
+            "DSC_0004.NEF.edit",
+            "DSC_0005.NEF",
+            "rejected"
+        ]
+    );
+    assert_eq!(files_under(&roll).len(), before.len());
+    assert_eq!(
+        td_photo(&["list", roll_s, "--rejects"]).1,
+        "DSC_0003.NEF\treject\t-\t-\t-\tok\n"
+    );
+    // Asked again, the kept one is kept again and nothing else moves.
+    let (ok, out, _) = td_photo(&["delete-rejected", roll_s]);
+    assert!(!ok);
+    assert!(out.starts_with("kept DSC_0003.NEF: "), "{out}");
+    assert_eq!(files_under(&roll).len(), before.len());
+    // A roll without a reject the reader can vouch for: nothing said,
+    // nothing made, a refused sidecar that says reject and a link at an
+    // original's name flagged reject both left where they are, unmentioned.
+    let quiet = temp.0.join("quiet");
+    fs::create_dir_all(&quiet).unwrap();
+    fs::write(quiet.join("DSC_0001.NEF"), b"x").unwrap();
+    fs::write(quiet.join("DSC_0002.NEF"), b"y").unwrap();
+    fs::write(
+        quiet.join("DSC_0002.NEF.edit"),
+        "td-photo edit 1\nflag reject\nexposure bad\n",
+    )
+    .unwrap();
+    std::os::unix::fs::symlink(quiet.join("DSC_0001.NEF"), quiet.join("DSC_0003.NEF")).unwrap();
+    fs::write(
+        quiet.join("DSC_0003.NEF.edit"),
+        "td-photo edit 1\nflag reject\n",
+    )
+    .unwrap();
+    let (ok, out, err) = td_photo(&["delete-rejected", quiet.to_str().unwrap()]);
+    assert!(ok, "{err}");
+    assert_eq!(out, "");
+    assert_eq!(
+        names(&quiet),
+        [
+            "DSC_0001.NEF",
+            "DSC_0002.NEF",
+            "DSC_0002.NEF.edit",
+            "DSC_0003.NEF",
+            "DSC_0003.NEF.edit"
+        ]
+    );
+    // The original's name taken in `rejected/` keeps the photo as the
+    // sidecar's does; a stale sidecar temporary keeps it too; and a move
+    // interrupted after the link, the original under both names, is
+    // finished, its sidecar following.
+    let held = temp.0.join("held");
+    fs::create_dir_all(held.join("rejected")).unwrap();
+    for i in 1..=3 {
+        fs::write(held.join(format!("DSC_000{i}.NEF")), format!("held {i}")).unwrap();
+        fs::write(
+            held.join(format!("DSC_000{i}.NEF.edit")),
+            "td-photo edit 1\nflag reject\n",
+        )
+        .unwrap();
+    }
+    fs::write(held.join("rejected/DSC_0001.NEF"), b"taken").unwrap();
+    fs::write(held.join("DSC_0002.NEF.edit.tmp"), b"stale").unwrap();
+    fs::hard_link(
+        held.join("DSC_0003.NEF"),
+        held.join("rejected/DSC_0003.NEF"),
+    )
+    .unwrap();
+    let held_s = held.to_str().unwrap();
+    let (ok, out, _) = td_photo(&["delete-rejected", held_s]);
+    assert!(!ok);
+    assert_eq!(
+        out,
+        format!(
+            "kept DSC_0001.NEF: {}: already exists\nkept DSC_0002.NEF: {}: stale temporary in the way\nmoved DSC_0003.NEF\n",
+            held.join("rejected/DSC_0001.NEF").display(),
+            held.join("DSC_0002.NEF.edit.tmp").display()
+        )
+    );
+    assert_eq!(
+        fs::read(held.join("rejected/DSC_0001.NEF")).unwrap(),
+        b"taken"
+    );
+    assert_eq!(fs::read(held.join("DSC_0001.NEF")).unwrap(), b"held 1");
+    assert!(held.join("DSC_0001.NEF.edit").is_file());
+    assert!(held.join("DSC_0002.NEF").is_file() && held.join("DSC_0002.NEF.edit").is_file());
+    assert_eq!(
+        fs::read(held.join("DSC_0002.NEF.edit.tmp")).unwrap(),
+        b"stale"
+    );
+    assert!(!held.join("DSC_0003.NEF").exists() && !held.join("DSC_0003.NEF.edit").exists());
+    assert_eq!(
+        fs::read(held.join("rejected/DSC_0003.NEF")).unwrap(),
+        b"held 3"
+    );
+    assert!(held.join("rejected/DSC_0003.NEF.edit").is_file());
+    // A link at `rejected` is refused by name before anything moves.
+    let linked = temp.0.join("linked");
+    fs::create_dir_all(&linked).unwrap();
+    fs::write(linked.join("DSC_0001.NEF"), b"x").unwrap();
+    fs::write(
+        linked.join("DSC_0001.NEF.edit"),
+        "td-photo edit 1\nflag reject\n",
+    )
+    .unwrap();
+    std::os::unix::fs::symlink(&quiet, linked.join("rejected")).unwrap();
+    let (ok, _, err) = td_photo(&["delete-rejected", linked.to_str().unwrap()]);
+    assert!(!ok);
+    assert!(err.contains("not a directory"), "{err}");
+    assert_eq!(
+        names(&linked),
+        ["DSC_0001.NEF", "DSC_0001.NEF.edit", "rejected"]
+    );
+    assert_eq!(names(&quiet).len(), 5);
+    // A roll that is not there, and the argument's shape.
+    assert!(!td_photo(&["delete-rejected", temp.0.join("none").to_str().unwrap()]).0);
+    let (ok, _, err) = td_photo(&["delete-rejected"]);
+    assert!(!ok);
+    assert!(err.contains("needs ROLL"), "{err}");
+}
+
 #[test]
 fn list_flag_and_edit_go_through_the_sidecar_and_unlink_nothing() {
     let temp = Temp::new("edit");

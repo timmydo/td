@@ -15,6 +15,7 @@ use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::{self, BufWriter, Read, Write};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Instant;
@@ -84,6 +85,13 @@ const HELP: &str = concat!(
     "  the sidecar's state (none, ok, or error and why), tab-separated.\n",
     "td-photo flag FILE pick | reject | clear\n",
     "  Sets or clears the cull flag in FILE's sidecar.\n",
+    "td-photo delete-rejected ROLL\n",
+    "  Moves ROLL's rejects (flag reject in the sidecar) with their sidecars\n",
+    "  into ROLL/rejected/, each reported as moved, kept with why when a\n",
+    "  name there is taken or the move fails, or moved without its sidecar\n",
+    "  when only the sidecar's move failed; the run fails after the rest\n",
+    "  when any was kept or split. Each file is linked into rejected/ before\n",
+    "  its old name is dropped, so no name is replaced and no file is lost.\n",
     "td-photo edit FILE [KEY VALUE ... | reset]\n",
     "  Prints FILE's sidecar, or sets exposure STOPS (-5.00 to 5.00), crop\n",
     "  X Y W H (fractions to four decimals), look STEM or flag pick|reject;\n",
@@ -150,6 +158,10 @@ fn main() -> ExitCode {
         [verb, file, word] if verb == "flag" => flag(Path::new(file), word),
         [verb, ..] if verb == "flag" => {
             Err("flag needs FILE and pick, reject or clear; see --help".to_string())
+        }
+        [verb, roll] if verb == "delete-rejected" => delete_rejected(Path::new(roll)),
+        [verb, ..] if verb == "delete-rejected" => {
+            Err("delete-rejected needs ROLL; see --help".to_string())
         }
         [verb, file, rest @ ..] if verb == "edit" => edit(Path::new(file), rest),
         [verb] if verb == "edit" => Err("edit needs FILE; see --help".to_string()),
@@ -928,20 +940,7 @@ pub(crate) fn export_file(
         .map_err(|e| format!("{}: {e}", path.display()))?;
     // The folder is made once there is something to put in it, so a raw
     // that cannot be developed leaves the roll as it was.
-    let dir = roll.join(library::EXPORTED);
-    match fs::create_dir(&dir) {
-        Ok(()) => {}
-        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
-        Err(e) => return Err(format!("{}: {e}", dir.display())),
-    }
-    // By name, not through a link: a link at `exported` would carry the
-    // export elsewhere, and the folder is the roll's own.
-    if !fs::symlink_metadata(&dir)
-        .map(|m| m.is_dir())
-        .unwrap_or(false)
-    {
-        return Err(format!("{}: not a directory", dir.display()));
-    }
+    let dir = own_folder(&roll, library::EXPORTED)?;
     let temporary = dir.join(format!("{stem}.jpg.tmp"));
     let file = fs::OpenOptions::new()
         .write(true)
@@ -1061,6 +1060,28 @@ fn refuse_existing(out: &Path) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+/// The roll's own folder `name` (`exported/`, `rejected/`), made when
+/// absent and checked by name, not through a link: a link there would
+/// carry the roll's files elsewhere. The roll itself under that name (a
+/// bind mount) is refused too, since a move into it would drop a name
+/// for nothing.
+fn own_folder(roll: &Path, name: &str) -> Result<PathBuf, String> {
+    let dir = roll.join(name);
+    match fs::create_dir(&dir) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(format!("{}: {e}", dir.display())),
+    }
+    match fs::symlink_metadata(&dir) {
+        Ok(meta) if meta.is_dir() && same_file(roll, &dir) => {
+            Err(format!("{}: is the roll itself", dir.display()))
+        }
+        Ok(meta) if meta.is_dir() => Ok(dir),
+        Ok(_) => Err(format!("{}: not a directory", dir.display())),
+        Err(e) => Err(format!("{}: {e}", dir.display())),
+    }
 }
 
 /// Gives the finished temporary the name `out` without replacing anything
@@ -1820,6 +1841,211 @@ fn flag(path: &Path, word: &OsStr) -> Result<(), String> {
     write_sidecar(path, &sidecar)
 }
 
+/// What became of one reject: moved with its sidecar, moved without it
+/// (the original in `rejected/`, the sidecar not, and why), or kept whole
+/// in the roll and why.
+enum Move {
+    Whole,
+    Split(String),
+    Kept(String),
+}
+
+impl Move {
+    /// The verb's line for the reject `name`, the note the adapter makes.
+    fn line(&self, name: &str) -> String {
+        match self {
+            Move::Whole => format!("moved {name}"),
+            Move::Split(why) => format!("moved {name} without its sidecar: {why}"),
+            Move::Kept(why) => format!("kept {name}: {why}"),
+        }
+    }
+
+    /// Whether the original is in `rejected/`, so the model lets it go.
+    fn moved(&self) -> bool {
+        !matches!(self, Move::Kept(_))
+    }
+}
+
+struct Rejected {
+    name: String,
+    result: Move,
+}
+
+/// Moves the roll's rejects, as their sidecars flag them now, with those
+/// sidecars into `rejected/`: the one move td-photo makes, culling's, each
+/// file by `move_file` after both destinations are refused by name. A
+/// sidecar the reader refuses cannot say the photo is a reject, so that
+/// photo stays. The original moves first, then its sidecar; a photo whose
+/// sidecar could not follow is reported as moved without it. The folder is
+/// made when the first reject is found, so a roll without one is left as
+/// it was.
+fn move_rejects(roll: &Path) -> Result<Vec<Rejected>, String> {
+    move_rejects_with(roll, &mut move_file)
+}
+
+/// `move_rejects` over `mover`, the one file move, so a test can make the
+/// sidecar's move fail after the original's.
+fn move_rejects_with(
+    roll: &Path,
+    mover: &mut dyn FnMut(&Path, &Path) -> io::Result<()>,
+) -> Result<Vec<Rejected>, String> {
+    let mut report = Vec::new();
+    let mut dir = None;
+    for name in read_roll(roll)? {
+        let original = roll.join(&name);
+        let reject = match load_sidecar(&original) {
+            Loaded::Sidecar(sidecar) => sidecar.flag() == Some(Flag::Reject),
+            Loaded::None | Loaded::Refused(_) => false,
+        };
+        if !reject {
+            continue;
+        }
+        let dir = match &dir {
+            Some(dir) => dir,
+            None => dir.insert(own_folder(roll, library::REJECTED)?),
+        };
+        let sidecar = sidecar_path(&original);
+        let sidecar_name = library::sidecar_name(&name);
+        // Both names refused before either moves, so a taken name keeps
+        // the photo whole, unless it is this file's own from a move that
+        // was interrupted, which the mover finishes; a name that cannot be
+        // looked up keeps it too, as does a stale sidecar temporary, the
+        // sign of an interrupted write the user should look at.
+        let mut temporary = sidecar.as_os_str().to_owned();
+        temporary.push(".tmp");
+        let temporary = PathBuf::from(temporary);
+        let kept = [(&original, &name), (&sidecar, &sidecar_name)]
+            .into_iter()
+            .find_map(|(from, name)| {
+                let to = dir.join(name);
+                match fs::symlink_metadata(&to) {
+                    Ok(_) if same_file(from, &to) => None,
+                    Ok(_) => Some(format!("{}: already exists", to.display())),
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+                    Err(e) => Some(format!("{}: {e}", to.display())),
+                }
+            })
+            .or_else(|| {
+                fs::symlink_metadata(&temporary)
+                    .is_ok()
+                    .then(|| format!("{}: stale temporary in the way", temporary.display()))
+            });
+        if let Some(why) = kept {
+            report.push(Rejected {
+                name,
+                result: Move::Kept(why),
+            });
+            continue;
+        }
+        if let Err(e) = mover(&original, &dir.join(&name)) {
+            report.push(Rejected {
+                name: name.clone(),
+                result: Move::Kept(format!("{}: {e}", original.display())),
+            });
+            continue;
+        }
+        // A sidecar that could not follow is reported with where its
+        // original went, so the two can be reunited by hand.
+        let result = match mover(&sidecar, &dir.join(&sidecar_name)) {
+            Ok(()) => Move::Whole,
+            Err(e) => Move::Split(format!(
+                "{}: {e}; the original is at {}",
+                sidecar.display(),
+                dir.join(&name).display()
+            )),
+        };
+        report.push(Rejected { name, result });
+    }
+    Ok(report)
+}
+
+/// Whether the two names are one file: the same inode on the same device,
+/// neither followed through a link. What a move interrupted between the
+/// link and the drop of the old name leaves behind.
+fn same_file(a: &Path, b: &Path) -> bool {
+    match (fs::symlink_metadata(a), fs::symlink_metadata(b)) {
+        (Ok(a), Ok(b)) => a.dev() == b.dev() && a.ino() == b.ino(),
+        _ => false,
+    }
+}
+
+/// Whether the file at `path` has at least two names, as one whose move
+/// was interrupted after the link does.
+fn linked_twice(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|meta| meta.nlink() >= 2)
+}
+
+/// Gives `from` the name `to` and drops the old one: culling's move, by
+/// the publication rule, so a name that appeared at `to` meanwhile is
+/// refused, not replaced (the link fails on an existing name) and the file
+/// has a name throughout. A file system without links falls back to the
+/// check and rename `publish` uses. A file linked whose old name could not
+/// be dropped is reported and has both names: the roll still lists it,
+/// and the next ask finds the name at `to` its own and finishes the move.
+fn move_file(from: &Path, to: &Path) -> io::Result<()> {
+    let drop_old = || {
+        fs::remove_file(from).map_err(|e| {
+            io::Error::new(
+                e.kind(),
+                format!("linked to {} but the old name stays: {e}", to.display()),
+            )
+        })
+    };
+    match fs::hard_link(from, to) {
+        Ok(()) => drop_old(),
+        // The name is this file's own: a move interrupted after the link,
+        // finished by dropping the old name, which replaces nothing. The
+        // file must have both names for that: one entry seen twice (a
+        // bind mount of the roll at `rejected/`) has one link and stays.
+        Err(e)
+            if e.kind() == io::ErrorKind::AlreadyExists
+                && same_file(from, to)
+                && linked_twice(to) =>
+        {
+            drop_old()
+        }
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "already exists; td-photo never overwrites",
+        )),
+        Err(e)
+            if matches!(
+                e.kind(),
+                io::ErrorKind::PermissionDenied | io::ErrorKind::Unsupported
+            ) =>
+        {
+            match fs::symlink_metadata(to) {
+                Ok(_) => Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "already exists; td-photo never overwrites",
+                )),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => fs::rename(from, to),
+                Err(e) => Err(e),
+            }
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// `td-photo delete-rejected ROLL`: one line per reject, `moved NAME`,
+/// `moved NAME without its sidecar: WHY` or `kept NAME: WHY`; the run fails
+/// after the rest when any was kept or moved without its sidecar.
+fn delete_rejected(roll: &Path) -> Result<(), String> {
+    let stdout = io::stdout();
+    let mut out = stdout.lock();
+    let mut failed = 0usize;
+    for rejected in move_rejects(roll)? {
+        if !matches!(rejected.result, Move::Whole) {
+            failed += 1;
+        }
+        writeln!(out, "{}", rejected.result.line(&rejected.name)).map_err(|e| e.to_string())?;
+    }
+    if failed > 0 {
+        return Err(format!("{failed} reject(s) not moved whole"));
+    }
+    Ok(())
+}
+
 fn edit(path: &Path, rest: &[OsString]) -> Result<(), String> {
     original(path)?;
     let mut sidecar = read_sidecar(path)?;
@@ -2268,6 +2494,7 @@ impl Session {
                     })?
                 }
                 Effect::Export { name, .. } => outcome = self.export(name)?,
+                Effect::DeleteRejected => outcome = self.delete_rejected()?,
             }
         }
         Ok(outcome)
@@ -2309,6 +2536,48 @@ impl Session {
                 }
             },
         }
+    }
+
+    /// Moves the roll's rejects into `rejected/` as the verb does, on the
+    /// files as they are now, and takes the moved ones out of the model:
+    /// `changed` when any moved (a reject added since the roll opened moves
+    /// too, though the model never held it), `ignored` when the files hold
+    /// no reject, and `refused`, with each reason on stderr, when one was
+    /// kept or moved without its sidecar, the ones that moved taken out
+    /// all the same.
+    fn delete_rejected(&mut self) -> Result<Outcome, ui::Error> {
+        let roll = self.ui.roll().ok_or(ui::Error::NoRoll)?;
+        let roll = PathBuf::from(OsStr::from_bytes(roll));
+        let report = match move_rejects(&roll) {
+            Ok(report) => report,
+            Err(why) => {
+                note(&why);
+                return Err(ui::Error::Refused);
+            }
+        };
+        let mut moved = Vec::new();
+        let mut failed = false;
+        for rejected in report {
+            // The verb's own line, so a kept photo, still whole in the
+            // roll, is told apart from one split across the two folders.
+            if !matches!(rejected.result, Move::Whole) {
+                note(&rejected.result.line(&rejected.name));
+                failed = true;
+            }
+            if rejected.result.moved() {
+                moved.push(rejected.name);
+            }
+        }
+        let changed = !moved.is_empty();
+        self.ui.remove(&moved);
+        if failed {
+            return Err(ui::Error::Refused);
+        }
+        Ok(if changed {
+            Outcome::Changed
+        } else {
+            Outcome::Ignored
+        })
     }
 
     /// Applies one sidecar edit on the file as it holds it now, not the
@@ -2471,4 +2740,93 @@ fn help_actions() -> Result<(), String> {
         .lock()
         .write_all(driven::help(&ui::BINDINGS).as_bytes())
         .map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A reject whose sidecar cannot follow its original is reported as
+    /// moved without it, and the next reject still moves.
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn a_sidecar_that_cannot_follow_is_reported_and_the_rest_go_on() {
+        let roll = std::env::temp_dir().join(format!("td-photo-split-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&roll);
+        fs::create_dir_all(&roll).unwrap();
+        for name in ["DSC_0001.NEF", "DSC_0002.NEF"] {
+            fs::write(roll.join(name), name).unwrap();
+            fs::write(
+                roll.join(library::sidecar_name(name)),
+                "td-photo edit 1\nflag reject\n",
+            )
+            .unwrap();
+        }
+        let mut mover = |from: &Path, to: &Path| -> io::Result<()> {
+            if from.ends_with("DSC_0001.NEF.edit") {
+                return Err(io::Error::other("the sidecar's move refused"));
+            }
+            move_file(from, to)
+        };
+        let report = move_rejects_with(&roll, &mut mover).unwrap();
+        let lines: Vec<String> = report.iter().map(|r| r.result.line(&r.name)).collect();
+        assert!(
+            lines[0].starts_with("moved DSC_0001.NEF without its sidecar: ")
+                && lines[0].contains("the sidecar's move refused")
+                && lines[0].ends_with(&format!(
+                    "; the original is at {}",
+                    roll.join("rejected/DSC_0001.NEF").display()
+                )),
+            "{}",
+            lines[0]
+        );
+        assert_eq!(lines[1], "moved DSC_0002.NEF");
+        assert!(report.iter().all(|r| r.result.moved()));
+        // The first original moved, its sidecar stayed; the second pair
+        // moved whole.
+        assert!(roll.join("rejected/DSC_0001.NEF").is_file());
+        assert!(!roll.join("DSC_0001.NEF").exists());
+        assert!(roll.join("DSC_0001.NEF.edit").is_file());
+        assert!(!roll.join("rejected/DSC_0001.NEF.edit").exists());
+        assert!(roll.join("rejected/DSC_0002.NEF").is_file());
+        assert!(roll.join("rejected/DSC_0002.NEF.edit").is_file());
+        assert!(!roll.join("DSC_0002.NEF").exists());
+        // The real mover refuses a taken name without touching either side.
+        fs::write(roll.join("DSC_0003.NEF"), b"3").unwrap();
+        let taken = roll.join("rejected/DSC_0003.NEF");
+        fs::write(&taken, b"taken").unwrap();
+        let e = move_file(&roll.join("DSC_0003.NEF"), &taken).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read(&taken).unwrap(), b"taken");
+        assert_eq!(fs::read(roll.join("DSC_0003.NEF")).unwrap(), b"3");
+        // A move interrupted after the link, the file under both names, is
+        // finished: the old name dropped, nothing replaced.
+        fs::write(roll.join("DSC_0004.NEF"), b"4").unwrap();
+        fs::hard_link(
+            roll.join("DSC_0004.NEF"),
+            roll.join("rejected/DSC_0004.NEF"),
+        )
+        .unwrap();
+        assert!(same_file(
+            &roll.join("DSC_0004.NEF"),
+            &roll.join("rejected/DSC_0004.NEF")
+        ));
+        assert!(!same_file(&roll.join("DSC_0003.NEF"), &taken));
+        assert!(linked_twice(&roll.join("rejected/DSC_0004.NEF")));
+        assert!(!linked_twice(&taken));
+        move_file(
+            &roll.join("DSC_0004.NEF"),
+            &roll.join("rejected/DSC_0004.NEF"),
+        )
+        .unwrap();
+        assert!(!roll.join("DSC_0004.NEF").exists());
+        assert_eq!(fs::read(roll.join("rejected/DSC_0004.NEF")).unwrap(), b"4");
+        // The roll under its own folder's name is refused before anything
+        // moves: `.` is the roll itself, as a bind mount there would be.
+        assert!(own_folder(&roll, ".")
+            .unwrap_err()
+            .ends_with("is the roll itself"));
+        assert!(own_folder(&roll, "rejected").is_ok());
+        let _ = fs::remove_dir_all(&roll);
+    }
 }
