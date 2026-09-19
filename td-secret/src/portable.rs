@@ -1,22 +1,24 @@
 //! Bounded portable envelope. Token authorization and persistence are adapters.
 
-use super::crypto;
+use super::{crypto, fido_p256::PublicKey};
 use std::collections::BTreeSet;
 use std::io::Read;
 
 type Result<T> = std::result::Result<T, String>;
 
-const MAGIC: &[u8; 8] = b"TDVAULT1";
-const WRAP: &[u8] = b"td-secret/portable/wrap/v1";
-const SLOT: &[u8] = b"td-secret/portable/slot/v1\0";
-const BODY: &[u8] = b"td-secret/portable/body/v1\0";
+const MAGIC: &[u8; 8] = b"TDVAULT2";
+const WRAP: &[u8] = b"td-secret/portable/wrap/v2";
+const SLOT: &[u8] = b"td-secret/portable/slot/v2\0";
+const BODY: &[u8] = b"td-secret/portable/body/v2\0";
 const MAX_ENTRIES: usize = 1024;
 const MAX_TITLE: usize = 512;
 const MAX_BODY: usize = 64 * 1024;
 const MAX_PLAIN: usize = 4 * 1024 * 1024;
 const MAX_SLOTS: usize = 8;
 const MAX_CREDENTIAL: usize = 1024;
-const MAX_ENVELOPE: usize = MAX_PLAIN + 16 + 65 + MAX_SLOTS * 1119;
+const KEY_BYTES: usize = 77;
+const MAX_SLOT: usize = 3 + MAX_CREDENTIAL + KEY_BYTES + 32 + 12 + 48;
+const MAX_ENVELOPE: usize = MAX_PLAIN + 16 + 65 + MAX_SLOTS * MAX_SLOT;
 
 // Neither secret owner implements Debug or Clone.
 pub(super) struct Secret32([u8; 32]);
@@ -169,10 +171,61 @@ impl Notebook {
     }
 }
 
+/// Canonical public-only EC2/ES256/P-256 COSE key with validated coordinates.
+/// Shape and curve membership alone establish no enrollment or authority.
+#[derive(Clone)]
+pub(super) struct VerificationKey([u8; KEY_BYTES]);
+
+impl VerificationKey {
+    pub fn from_cose(bytes: &[u8]) -> Result<Self> {
+        let key = Self(
+            bytes
+                .try_into()
+                .map_err(|_| "invalid portable COSE key length")?,
+        );
+        key.public_key()?;
+        Ok(key)
+    }
+
+    pub fn cose(&self) -> &[u8; KEY_BYTES] {
+        &self.0
+    }
+
+    pub fn public_key(&self) -> Result<PublicKey> {
+        // The fixed encoding admits exactly five canonical public parameters.
+        if self.0.get(..10) != Some(&[0xa5, 1, 2, 3, 0x26, 0x20, 1, 0x21, 0x58, 0x20])
+            || self.0.get(42..45) != Some(&[0x22, 0x58, 0x20])
+        {
+            return Err("invalid portable public ES256 COSE profile".into());
+        }
+        let x = self
+            .0
+            .get(10..42)
+            .ok_or("portable key x extent")?
+            .try_into()
+            .map_err(|_| "portable key x length")?;
+        let y = self
+            .0
+            .get(45..77)
+            .ok_or("portable key y extent")?
+            .try_into()
+            .map_err(|_| "portable key y length")?;
+        PublicKey::from_coordinates(x, y).map_err(str::to_owned)
+    }
+}
+
+/// Bounded input to a token attempt, untrusted until the whole envelope opens.
+pub(super) struct UnlockHint<'a> {
+    pub credential: &'a [u8],
+    pub key: &'a VerificationKey,
+    pub salt: &'a [u8; 32],
+}
+
 // Produced only by the future proved enrollment adapter, never an app API.
 pub(super) struct Protector {
     pub role: Role,
     pub credential: Vec<u8>,
+    pub key: VerificationKey,
     pub salt: [u8; 32],
     pub secret: Secret32,
 }
@@ -180,6 +233,7 @@ pub(super) struct Protector {
 struct Slot {
     role: Role,
     credential: Vec<u8>,
+    key: VerificationKey,
     salt: [u8; 32],
     nonce: [u8; 12],
     wrapped: [u8; 48],
@@ -202,6 +256,7 @@ impl Slot {
             .map_err(|_| "portable credential length overflow")?;
         out.extend_from_slice(&size.to_be_bytes());
         out.extend_from_slice(&self.credential);
+        out.extend_from_slice(self.key.cose());
         out.extend_from_slice(&self.salt);
         Ok(())
     }
@@ -244,6 +299,7 @@ impl LockedVault {
             let mut slot = Slot {
                 role: protector.role,
                 credential: protector.credential.clone(),
+                key: protector.key.clone(),
                 salt: protector.salt,
                 nonce: random_array(random)?,
                 wrapped: [0; 48],
@@ -315,6 +371,7 @@ impl LockedVault {
             slots.push(Slot {
                 role,
                 credential: reader.take(size)?.to_vec(),
+                key: VerificationKey::from_cose(reader.take(KEY_BYTES)?)?,
                 salt: reader.array()?,
                 nonce: reader.array()?,
                 wrapped: reader.array()?,
@@ -341,6 +398,22 @@ impl LockedVault {
 
     pub fn bytes(&self) -> &[u8] {
         &self.bytes
+    }
+
+    /// Bounded enumeration for selecting a credential before contacting a token.
+    /// These public fields are hints, never authority for a protector change.
+    pub fn unlock_hints(&self) -> impl ExactSizeIterator<Item = UnlockHint<'_>> {
+        self.slots.iter().map(|slot| UnlockHint {
+            credential: &slot.credential,
+            key: &slot.key,
+            salt: &slot.salt,
+        })
+    }
+
+    pub fn unlock_hint(&self, credential: &[u8]) -> Result<UnlockHint<'_>> {
+        self.unlock_hints()
+            .find(|hint| hint.credential == credential)
+            .ok_or_else(|| "portable credential is not enrolled".into())
     }
 
     // The secret must come from the enrolled UV hmac-secret adapter. This
@@ -512,17 +585,43 @@ mod tests {
         }
     }
 
+    fn verification_key(backup: bool) -> VerificationKey {
+        let x = hex_bytes("6b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c296");
+        let y = hex_bytes(if backup {
+            "b01cbd1c01e58065711814b583f061e9d431cca994cea1313449bf97c840ae0a"
+        } else {
+            "4fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5"
+        });
+        let mut cose = vec![0xa5, 1, 2, 3, 0x26, 0x20, 1, 0x21, 0x58, 0x20];
+        cose.extend(x);
+        cose.extend([0x22, 0x58, 0x20]);
+        cose.extend(y);
+        VerificationKey::from_cose(&cose).unwrap()
+    }
+
+    fn hex_bytes(hex: &str) -> Vec<u8> {
+        assert_eq!(hex.len() % 2, 0, "odd hex string length");
+        hex.as_bytes()
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
+            .collect()
+    }
+
     fn protectors() -> Vec<Protector> {
         vec![
             Protector {
                 role: Role::Primary,
                 credential: b"primary".to_vec(),
+                key: verification_key(false),
                 salt: [0xa1; 32],
                 secret: Secret32([0x11; 32]),
             },
             Protector {
                 role: Role::Backup,
                 credential: b"backup".to_vec(),
+                key: verification_key(true),
                 salt: [0xb2; 32],
                 secret: Secret32([0x22; 32]),
             },
@@ -611,6 +710,163 @@ mod tests {
         wrong = vault.bytes().to_vec();
         wrong[vault.body_offset - 4..vault.body_offset].copy_from_slice(&u32::MAX.to_be_bytes());
         assert!(LockedVault::decode(&wrong).is_err());
+    }
+
+    #[test]
+    fn persisted_keys_and_salts_survive_restart_and_revision() {
+        let bytes = fixture().bytes().to_vec();
+        let imported = LockedVault::decode(&bytes).unwrap();
+        assert_eq!(imported.unlock_hints().len(), 2);
+        let ids: Vec<_> = imported
+            .unlock_hints()
+            .map(|hint| hint.credential)
+            .collect();
+        assert_eq!(ids, [b"backup".as_slice(), b"primary".as_slice()]);
+        for backup in [false, true] {
+            let id = if backup {
+                b"backup".as_slice()
+            } else {
+                b"primary".as_slice()
+            };
+            let hint = imported.unlock_hint(id).unwrap();
+            assert_eq!(hint.credential, id);
+            assert_eq!(hint.key.cose(), verification_key(backup).cose());
+            assert_eq!(
+                hint.key.public_key().unwrap().coordinates(),
+                verification_key(backup).public_key().unwrap().coordinates()
+            );
+            assert_eq!(*hint.salt, [if backup { 0xb2 } else { 0xa1 }; 32]);
+        }
+        assert!(imported.unlock_hint(b"missing").is_err());
+        let opened = imported.open(b"backup", &Secret32([0x22; 32])).unwrap();
+        let revised = imported
+            .revise(&opened, &notebook(), &mut random())
+            .unwrap();
+        for slot in &imported.slots {
+            let hint = revised.unlock_hint(&slot.credential).unwrap();
+            assert_eq!(hint.key.cose(), slot.key.cose());
+            assert_eq!(hint.salt, &slot.salt);
+        }
+    }
+
+    #[test]
+    fn verification_keys_refuse_noncanonical_private_and_invalid_points() {
+        let valid = verification_key(false).cose().to_vec();
+        let mut cases = Vec::new();
+        for position in (0..10).chain(42..45) {
+            let mut bad = valid.clone();
+            bad[position] ^= 1;
+            cases.push(bad);
+        }
+        let mut off_curve = valid.clone();
+        off_curve[76] ^= 1;
+        cases.push(off_curve);
+        let mut infinity = valid.clone();
+        infinity[10..42].fill(0);
+        infinity[45..77].fill(0);
+        cases.push(infinity);
+        for range in [10..42, 45..77] {
+            let mut out_of_field = valid.clone();
+            out_of_field[range].fill(0xff);
+            cases.push(out_of_field);
+        }
+        let mut private = valid.clone();
+        private[0] = 0xa6;
+        private.extend([0x23, 0x58, 0x20]);
+        private.extend([1; 32]);
+        cases.push(private);
+        let mut noncanonical = valid.clone();
+        noncanonical.splice(1..2, [0x18, 1]);
+        cases.push(noncanonical);
+        let mut trailing = valid.clone();
+        trailing.push(0);
+        cases.push(trailing);
+        for end in 0..KEY_BYTES {
+            assert!(VerificationKey::from_cose(&valid[..end]).is_err());
+        }
+        for bad in cases {
+            if bad.len() != KEY_BYTES {
+                assert!(matches!(VerificationKey::from_cose(&bad),
+                    Err(error) if error == "invalid portable COSE key length"));
+                continue;
+            }
+            assert!(VerificationKey::from_cose(&bad).is_err());
+            let mut envelope = fixture().bytes().to_vec();
+            envelope.splice(58..58 + KEY_BYTES, bad);
+            assert!(LockedVault::decode(&envelope).is_err());
+        }
+    }
+
+    #[test]
+    fn valid_key_substitution_breaks_slot_and_whole_table_authentication() {
+        let vault = fixture();
+        let mut offset = 49;
+        for slot in &vault.slots {
+            let replacement = verification_key(slot.role == Role::Primary);
+            assert_ne!(replacement.cose(), slot.key.cose());
+            let start = offset + 3 + slot.credential.len();
+            let mut tampered = vault.bytes().to_vec();
+            tampered[start..start + KEY_BYTES].copy_from_slice(replacement.cose());
+            // A valid replacement remains only untrusted unlock metadata.
+            let parsed = LockedVault::decode(&tampered).unwrap();
+            assert_eq!(
+                parsed.unlock_hint(&slot.credential).unwrap().key.cose(),
+                replacement.cose()
+            );
+            let modified = parsed
+                .slots
+                .iter()
+                .find(|s| s.credential == slot.credential)
+                .unwrap();
+            let secret = if slot.role == Role::Primary {
+                0x11
+            } else {
+                0x22
+            };
+            let wrapping = Secret32(crypto::hkdf(&[secret; 32], &vault.id, WRAP));
+            // Pin wrapper authentication separately from the body's table check.
+            assert!(crypto::open(
+                &wrapping.0,
+                &modified.nonce,
+                &modified.context(&vault.id).unwrap(),
+                &modified.wrapped
+            )
+            .is_err());
+            let unchanged = parsed
+                .slots
+                .iter()
+                .find(|s| s.credential != slot.credential)
+                .unwrap();
+            let secret = if unchanged.role == Role::Primary {
+                0x11
+            } else {
+                0x22
+            };
+            let wrapping = Secret32(crypto::hkdf(&[secret; 32], &vault.id, WRAP));
+            assert!(crypto::open(
+                &wrapping.0,
+                &unchanged.nonce,
+                &unchanged.context(&vault.id).unwrap(),
+                &unchanged.wrapped
+            )
+            .map(Plaintext)
+            .is_ok());
+            // Its wrapper opens; only whole-table body authentication can refuse it.
+            assert!(parsed.open(b"primary", &Secret32([0x11; 32])).is_err());
+            assert!(parsed.open(b"backup", &Secret32([0x22; 32])).is_err());
+            offset = start + KEY_BYTES + 32 + 12 + 48;
+        }
+        both_open(&vault, &notebook().entries[0].body);
+    }
+
+    #[test]
+    fn earlier_and_unknown_versions_are_refused_without_downgrade() {
+        for version in [b'1', b'0', b'3', 0xff] {
+            let mut bytes = fixture().bytes().to_vec();
+            bytes[7] = version;
+            assert!(matches!(LockedVault::decode(&bytes),
+                Err(error) if error == "unsupported portable vault format"));
+        }
     }
 
     #[test]
@@ -780,13 +1036,18 @@ mod tests {
             keys.push(Protector {
                 role: Role::Backup,
                 credential: vec![number as u8; MAX_CREDENTIAL],
+                key: verification_key(false),
                 salt: [number as u8; 32],
                 secret: Secret32([number as u8; 32]),
             });
         }
+        keys[0].credential = vec![0; MAX_CREDENTIAL];
+        keys[1].credential = vec![1; MAX_CREDENTIAL];
         let vault = LockedVault::create(&n, keys, &mut random()).unwrap();
-        assert!(vault.bytes().len() <= MAX_ENVELOPE);
-        let opened = vault.open(b"backup", &Secret32([0x22; 32])).unwrap();
+        assert_eq!(vault.bytes().len(), MAX_ENVELOPE);
+        let opened = vault
+            .open(&vec![1; MAX_CREDENTIAL], &Secret32([0x22; 32]))
+            .unwrap();
         assert_eq!(opened.notebook.validate().unwrap(), MAX_PLAIN);
         n.entries.last_mut().unwrap().body.push(b'x');
         assert!(n.validate().is_err());
@@ -842,7 +1103,7 @@ mod tests {
         entropy.set_position(10);
         let second = LockedVault::create(&notebook(), protectors(), &mut entropy).unwrap();
         assert_ne!(first.id, second.id);
-        let slot_size = 1 + 2 + b"backup".len() + 32 + 12 + 48;
+        let slot_size = 1 + 2 + b"backup".len() + KEY_BYTES + 32 + 12 + 48;
         let mut spliced = first.bytes().to_vec();
         spliced[49..49 + slot_size].copy_from_slice(&second.bytes()[49..49 + slot_size]);
         let parsed = LockedVault::decode(&spliced).unwrap();
@@ -854,25 +1115,24 @@ mod tests {
     fn independent_openssl_and_python_envelope_vector() {
         // Generated by tests/portable_vector.py with host OpenSSL 3.5.7.
         let hex = concat!(
-            "54445641554c5431000102030405060708090a0b0c0d0e0f101112131415161718191a1b",
-            "1c1d1e1f0000000000000001020200066261636b7570b2b2b2b2b2b2b2b2b2b2b2b2b2b2",
-            "b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2404142434445464748494a4bcb606d2baece",
-            "5eee1f036a13499c6ee1a212f288f433c1f695635c48e0bab844fdf1e50f3c0b628153b3",
-            "30b8e4b4b6830100077072696d617279a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
-            "a1a1a1a1a1a1a1a1a1a1a1a14c4d4e4f505152535455565742cc6ae8451957c37c0ec9ad",
-            "9f91d8a8ca4846ec136281dd06c51ba96fb433109204c5b79492788aea87cdd0ed59b31e",
-            "58595a5b5c5d5e5f6061626300000065462f990168d2b1ca4526a2a2a2661088c8c6cd79",
-            "8526125ef02eddf979402b9f7c30c8123477d35106251a1bfa8e3384d933ffe4610c5b25",
-            "e0d613037c44feda3b8be6b8035aaad7b6307a0a323a2a857c1bfdf076eacc3b7347ef80",
-            "d02ba6b187a9d6d778",
+            "54445641554c5432000102030405060708090a0b0c0d0e0f10111213141516171819",
+            "1a1b1c1d1e1f0000000000000001020200066261636b7570a5010203262001215820",
+            "6b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c2962258",
+            "20b01cbd1c01e58065711814b583f061e9d431cca994cea1313449bf97c840ae0ab2",
+            "b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2404142",
+            "434445464748494a4bad2ede791d0dc70680c0b1254d78b8a21812539b185d6bf9a0",
+            "d9638afe783b108abddfb41df096e09cf1001d8840c3820100077072696d617279a5",
+            "0102032620012158206b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4",
+            "a13945d898c2962258204fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ece",
+            "cbb6406837bf51f5a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+            "a1a1a1a1a1a14c4d4e4f505152535455565736e81f8f0828bc7285c1adf6d1dbf0b6",
+            "f071f89929a9a7610394b5b38a7c0fffd9b2ffa9c4ebc9ea17b7822164ea8dc85859",
+            "5a5b5c5d5e5f6061626300000065bed3434f7027e797b48740ebb3f3538f8eb45926",
+            "07e1eec732ee0c79b0949c87af2a1c0beba101a094cb587c7bceaaf519f69a6ff969",
+            "72c47f3253e879b00ddb21d5001a782b26e8a69bf8d5216235df1517915b9d59c6b1",
+            "035ee8c30ab731cad4dba5e03d",
         );
-        let expected: Vec<u8> = hex
-            .as_bytes()
-            .as_chunks::<2>()
-            .0
-            .iter()
-            .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
-            .collect();
+        let expected = hex_bytes(hex);
         assert_eq!(fixture().bytes(), expected);
         both_open(
             &LockedVault::decode(&expected).unwrap(),

@@ -81,9 +81,9 @@ never enter argv, environment, logs, notebook buffers or persistent files.
 A fresh kernel-random 256-bit vault key protects the notebook. Each enrolled
 token gets an independent encrypted copy of that key, protected by its own
 credential-specific wrapping key. The versioned wrapping context binds the
-vault ID, credential ID, role and derivation salt. The encrypted notebook
-authenticates the complete protector table, format version and revision as
-well as its contents. Unauthenticated metadata is only bounded input to an
+vault ID, credential ID, canonical public verification key, role and
+derivation salt. The encrypted notebook authenticates the complete protector
+table, format version and revision as well as its contents. Unauthenticated metadata is only bounded input to an
 unlock attempt, never authority to add or replace a protector.
 
 Initial enrollment proves a primary and a separately presented backup before
@@ -170,11 +170,14 @@ backend must authorize and publish at most one against that baseline.
 A saved envelope needs a new open snapshot before a subsequent revision;
 this primitive does not advance the browsing session automatically.
 
-All wire integers are unsigned big-endian. Version 1 is:
+All wire integers are unsigned big-endian. Version 2 replaces the earlier
+synthetic-only version 1 prerequisite atomically; version 1 and unknown
+versions are refused, with no downgrade or implicit migration. No supported
+hardware vault was published by version 1. Version 2 is:
 
 | Field | Encoding |
 | --- | --- |
-| Magic | Eight bytes `TDVAULT1` |
+| Magic | Eight bytes `TDVAULT2` |
 | Vault ID | 32 random bytes |
 | Vault revision | Nonzero u64 |
 | Slot count | u8, two through eight |
@@ -184,23 +187,50 @@ All wire integers are unsigned big-endian. Version 1 is:
 | Sealed notebook | Ciphertext followed by the 16-byte AEAD tag |
 
 Each slot contains role u8 (1 primary, 2 backup), credential length u16
-(1 through 1024), credential bytes, 32-byte hmac-secret salt, 12-byte random wrapping
-nonce and 48 bytes of encrypted vault key plus tag. Exactly one slot is
+(1 through 1024), credential bytes, a fixed 77-byte public COSE key,
+32-byte hmac-secret salt, 12-byte random wrapping nonce and 48 bytes of
+encrypted vault key plus tag. Exactly one slot is
 primary; all other slots are backups. The maximum envelope is 4 MiB + 16 +
-65 + 8 * 1119 bytes. Duplicate or unordered credentials, unknown roles,
+65 + 8 * 1196 bytes. Duplicate or unordered credentials, unknown roles,
 truncation and trailing bytes are refused before cryptographic work.
 
 The wrapping key is HKDF-SHA256 with the UV hmac-secret result as input,
-vault ID as salt and ASCII `td-secret/portable/wrap/v1` as info. Its AEAD
-associated data is ASCII `td-secret/portable/slot/v1`, a zero byte, vault ID,
-and the slot's encoded role, credential length/bytes and hmac-secret salt.
+vault ID as salt and ASCII `td-secret/portable/wrap/v2` as info. Its AEAD
+associated data is ASCII `td-secret/portable/slot/v2`, a zero byte, vault ID,
+and the slot's encoded role, credential length/bytes, canonical public COSE
+key and hmac-secret salt.
 The body key is HKDF-SHA256 with the vault key as input, vault ID as salt
-and ASCII `td-secret/portable/body/v1` followed by a zero byte as info. Body
+and ASCII `td-secret/portable/body/v2` followed by a zero byte as info. Body
 associated data is that same info followed by every envelope byte before the
 sealed body, including the full key table, nonce and body length. Both use
 the existing RFC 8439 ChaCha20-Poly1305 implementation. Independent random
 96-bit nonces are appropriate for this bounded local notebook; no
 high-volume encryption service is claimed.
+
+The fixed COSE encoding admits exactly the five canonical public
+EC2/ES256/P-256 parameters: kty=2, alg=-7, crv=1, and 32-byte x and y.
+The safe P-256 primitive checks canonical field ranges and curve membership
+before an envelope can be used. This bounded public-point check runs while
+parsing each of at most eight slots, before the final table-order and
+trailing-byte checks; it does not perform key agreement or signature work.
+Private parameters, extra fields, alternate
+encodings, off-curve points and malformed extents are refused. The typed
+VerificationKey can be built from a proved enrollment's canonical COSE
+bytes, but key parsing itself is not proof of enrollment.
+
+Backend-only unlock hints expose the credential ID, verification key and
+salt from a locked envelope. A borrowed iterator enumerates at most eight
+hints in canonical credential order so a future adapter can select a
+credential without relying on an external credential-ID database. Exact-ID
+lookup uses that same iterator. They remain untrusted inputs to an attempted
+assertion until the wrapped key and the entire notebook authenticate.
+The backend must retain that exact envelope and hint through the attempt,
+supply a fresh challenge and enforce signature/UP/UV policy before passing
+the resulting secret to open. Hints confer no write or protector-change
+authority. This increment stores verification keys but does not persist
+assertion-counter history or implement a hardware unlock adapter. Revisions
+preserve the complete key table. Changing even a valid public key invalidates
+its own wrapping tag and the notebook tag for every other slot.
 
 Decrypted notebook bytes contain entry count u32 followed by each entry's
 16-byte stable ID, nonzero u64 revision, u32 title length and UTF-8 title,
@@ -220,7 +250,10 @@ policy and tests; the wire format rejects control characters only.
 using host OpenSSL 3.5.7 EVP and Python hashlib/hmac. These are optional
 fixture-generation tools, never target inputs or test dependencies. The
 ordinary suite checks the exact bytes, both keys, a single-bit flip at every byte offset, every truncation, invalid tables/entries/lengths, failed entropy,
-stale snapshots and the maximum plaintext envelope. These are cryptographic
+stale snapshots and the exact maximum envelope. Key-specific cases cover
+persisted hints after restart and revision, malformed COSE and curve points,
+valid-point substitutions against both wrapper and body authentication,
+and refusal of old/unknown versions. These are cryptographic
 and structural tests, not physical enrollment or recovery evidence.
 
 ### Dependency-free cryptography boundary
@@ -560,10 +593,10 @@ counter is available for the future backend to retain and compare.
 This is one proof of usable key possession and a UV secret, not a complete
 primary/backup enrollment transaction or a physical hardware result. The
 future backend must repeat salt recovery with independent exchanges, prove
-both wrappers open the same notebook, bind public verification keys into
-the authenticated persistent format, and publish only the complete proved
-protector table. The current envelope prerequisite does not yet serialize
-those public keys. It must be amended before persisted hardware unlock.
+both wrappers open the same notebook, transfer the proved public verification
+keys into the version-2 envelope, and publish only the complete proved
+protector table. The envelope now authenticates those keys; the hardware
+adapter and persistent publication remain prerequisites for usable unlock.
 Cancellation or refusal consumes pending state and produces no enrolled
 credential; a token may still contain an orphan after uncertain creation.
 No operation is automatically retried and no vault bytes are published.
