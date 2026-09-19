@@ -38,13 +38,22 @@ remove it separately when discarding that draft. Moving only the `.eml`
 file does not move or rewrite attachment references. There is no draft-list
 UI, automatic expiry or mail submission in this increment.
 
-The configured editor remains shell command text, but the draft pathname is
-one quoted argument with its OS bytes preserved. Attachment-bearing drafts
-require a UTF-8 storage path without quotes, backslashes, angle brackets or
-control characters;
-unrepresentable MML paths or content types fail explicitly instead of
-pointing elsewhere. Descriptions replace control/attribute characters for
-display. Colliding sanitized attachment names refuse before writing files.
+A configured editor made only of plain words (ASCII letters, digits and
+`._/+:@,-`, plus `=` after the first word, separated by spaces or tabs)
+whose first word is not a shell reserved word, or a builtin a shell resolves
+itself rather than by `PATH` and that has no identical utility there, is
+executed directly, with no shell, and the draft pathname is its last
+argument: the `mail` application's runtime has no shell, and this is how it
+launches the `/app/bin/td-editor` it ships as `$EDITOR`. Any other editor
+text is shell command text, and the draft pathname is then one quoted
+argument with its OS bytes preserved; inside the `mail` jail, which has no
+`sh`, such a command fails to launch and the draft is retained. Both paths
+hand the pathname over unchanged.
+Attachment-bearing drafts require a UTF-8 storage path without quotes,
+backslashes, angle brackets or control characters; unrepresentable MML
+paths or content types fail explicitly instead of pointing elsewhere.
+Descriptions replace control/attribute characters for display. Colliding
+sanitized attachment names refuse before writing files.
 On preparation failure, only that attempt's created files and sidecar
 directory are removed; cleanup failure reports the remaining paths. This
 is best-effort error cleanup, not recovery from process death or power loss.

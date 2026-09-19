@@ -9502,20 +9502,23 @@ specifies the exact format, boundaries and verification limits.
 
 ### W.5 td-editor: a td-owned editor for mail and text
 
-**Why.** `td-mail` composes in `$EDITOR`; the image ships no editor, and the
-jail's `/app` cannot see one that is not packaged with the application.
+**Why.** `td-mail` composes in `$EDITOR`; the image shipped no editor, and
+the jail's `/app` cannot see one that is not packaged with the application.
 An editor is also the first td program that must render text in a
 Wayland window from a source other than a terminal.
 
 **Shape.** A dependency-free Rust crate, `td-editor`, built as a static
 target recipe from the checkout with `td-ui` and `td-compositor` staged
 beside it (the td-taskmgr shape, since it links the toolkit as a second
-crate); the packaging step, (6) below, is to put it into the `mail`
-application's store closure as `/app/bin/td-editor` with
-`EDITOR=/app/bin/td-editor` in the manifest environment. It is a native
-Wayland client: the mail jail already carries `sockets=wayland`, so the
-editor opens its own toplevel beside the terminal, and td-mail waits for it
-to exit as it does for any editor.
+crate) and packaged into the `mail` application's store closure as
+`/app/bin/td-editor` with `EDITOR=/app/bin/td-editor` in the manifest
+environment. It is a native Wayland client: the mail jail already carries
+`sockets=wayland`, so the editor opens its own toplevel beside the
+terminal, and td-mail reaps it in the background while its own screen
+continues, as it does for any editor. The static runtime has no shell, so
+td-mail executes a plain-word editor command directly and keeps `sh -c`
+only for shell text (`td-mail/README.md`). Landed; the in-jail acceptance
+test in `td-editor/DESIGN.md` is not.
 
 **Rendering.** Section 11 of `td-compositor/DESIGN.md` pins a Unifont PSF2
 face and a pure renderer over it; td-term draws with it. The editor borrows
@@ -9544,7 +9547,7 @@ other input) and the underline rendition on misspelled words, with
 `M-$` correction. (5) Mouse selection through `wl_pointer`, and the
 clipboard through `wl_data_device`, which td-compositor already serves
 to td-term. (6) Packaging into the `mail` closure as `/app/bin/td-editor`
-with `EDITOR` in the manifest environment.
+with `EDITOR` in the manifest environment. Landed.
 
 **Non-goals.** Syntax highlighting, multiple windows, a terminal mode.
 The terminal fallback for a headless session is a later increment; the
@@ -9556,7 +9559,8 @@ mail composition path is the one the editor exists for.
 browser command through `sh -c`, `$BROWSER` as a program, then
 `xdg-open` and `open`. `td-mail` opens links through `sh -c` with its
 configured browser and saved attachments through `$OPENER` or
-`xdg-open`; it also runs its editor through `sh -c`. Inside the jail
+`xdg-open`; it ran its editor through `sh -c` too, until W.5 (a
+plain-word editor command now runs directly). Inside the jail
 none of those exist: the `mail` and `news` packages are static binaries
 on the data-only `static-runtime`, so `PATH=/app/bin:/usr/bin` holds only the
 application itself, there is no `sh`, no `xdg-open`, `$BROWSER` is
@@ -9565,8 +9569,9 @@ the jail the image has no `xdg-open` either, so the unjailed behaviour
 was already "no browser opener available". The portal is the designed
 answer (§E, row 4): `.OpenURI` starts the configured browser for `http`
 and `https` and refuses `file`; it is listed as absent in rung 22.
-Composing mail has the same shape: until td-editor (W.5) ships inside
-the `mail` closure at `/app/bin/td-editor`, td-mail has no editor to run.
+Composing mail had the same shape until td-editor (W.5) shipped inside
+the `mail` closure at `/app/bin/td-editor`; td-mail now has an editor to
+run, and links and attachments are what remain.
 
 **Plan.** (1) td-portal serves `org.freedesktop.portal.OpenURI.OpenURI`
 for `http` and `https` exactly as §E's row specifies: the handler is the

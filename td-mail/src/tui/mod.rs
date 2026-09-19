@@ -298,13 +298,77 @@ fn launch_draft_editor(
             "editor command is empty",
         ));
     }
-    // Preserve the OS path as one quoted positional argument, not shell text.
+    // A command of plain words needs no shell and gets none: the program is
+    // executed directly with the draft path as its last argument, which is
+    // what `sh -c 'cmd "$1"'` does for such a command, on the application
+    // runtime that has no `sh` (the `mail` package ships `/app/bin/td-editor`
+    // as `$EDITOR` on the data-only static runtime) as much as on a host.
+    if let Some((program, args)) = plain_command(editor_cmd) {
+        return std::process::Command::new(program)
+            .args(args)
+            .arg(&prepared.draft_path)
+            .spawn();
+    }
+    // Anything else is shell text. Preserve the OS path as one quoted
+    // positional argument, not part of that text.
     std::process::Command::new("sh")
         .arg("-c")
         .arg(format!("{} \"$1\"", editor_cmd))
         .arg("sh")
         .arg(&prepared.draft_path)
         .spawn()
+}
+
+/// A byte a shell passes through unchanged in an unquoted word.
+fn plain_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || b"._/+:@,-".contains(&byte)
+}
+
+/// Leading words made of plain bytes that a shell interprets itself rather
+/// than resolving by `PATH`: its reserved words, and the builtins that
+/// have no identically behaving utility on `PATH`. A command starting with
+/// one keeps the shell, since executing it directly would look for a
+/// program of that name. A builtin with an identical external utility
+/// (`true`, `pwd`) need not be listed: the direct path runs the utility.
+const SHELL_WORDS: &[&str] = &[
+    ".", ":", "alias", "bg", "break", "builtin", "case", "cd", "command",
+    "continue", "do", "done", "elif", "else", "esac", "eval", "exec", "exit",
+    "export", "fc", "fg", "fi", "for", "function", "getopts", "hash", "if",
+    "in", "jobs", "local", "read", "readonly", "return", "select", "set",
+    "shift", "source", "then", "time", "times", "trap", "type", "ulimit",
+    "umask", "unalias", "unset", "until", "wait", "while",
+];
+
+/// The program and arguments of an editor command that needs no shell:
+/// words of ASCII letters, digits and `._/+:@,-`, plus `=` after the first
+/// word where a shell passes it through unchanged, separated by spaces or
+/// tabs, whose first word is not one a shell interprets itself. Anything
+/// else (quotes, `$`, redirections, globs, `~`, `#`, a leading assignment,
+/// a newline or other control byte, a non-ASCII byte) makes the whole
+/// command shell text: `None`. The `mail` package names
+/// `/app/bin/td-editor` as `$EDITOR` (recipes/src/recipes/mail.rs) and its
+/// runtime has no shell, so that value must stay one this accepts; the
+/// test below pins it.
+fn plain_command(editor_cmd: &str) -> Option<(&str, Vec<&str>)> {
+    if editor_cmd
+        .bytes()
+        .any(|byte| byte.is_ascii_control() && byte != b'\t')
+    {
+        return None;
+    }
+    let mut words = editor_cmd.split([' ', '\t']).filter(|word| !word.is_empty());
+    let program = words.next()?;
+    if !program.bytes().all(plain_byte) || SHELL_WORDS.contains(&program) {
+        return None;
+    }
+    let args: Vec<&str> = words.collect();
+    if args
+        .iter()
+        .any(|word| !word.bytes().all(|byte| plain_byte(byte) || byte == b'='))
+    {
+        return None;
+    }
+    Some((program, args))
 }
 
 #[cfg(test)]
@@ -332,11 +396,29 @@ mod draft_tests {
             attachment_dir: Some(sidecar.clone()),
         };
         assert!(launch_draft_editor(&prepared, "  ").is_err());
+        // A plain-word command is executed directly: an absent program is a
+        // spawn error here, where a shell would have returned a child that
+        // exits 127. That difference is the proof no shell stood between.
+        assert!(launch_draft_editor(&prepared, "/definitely-absent-td-editor").is_err());
+        // The direct path hands the program the exact path bytes as its
+        // last argument: `cp SOURCE` receives the draft path, `\xff` and
+        // all, and writes the source's bytes there. The command is plain
+        // words, so this is the direct path and not the shell's.
+        std::fs::write(root.join("source"), b"saved")?;
+        let direct = format!("cp {}", root.join("source").display());
+        assert!(plain_command(&direct).is_some(), "{direct}");
+        std::fs::write(&path, b"original")?;
+        assert!(launch_draft_editor(&prepared, &direct)?.wait()?.success());
+        assert_eq!(std::fs::read(&path)?, b"saved");
+        // Shell text keeps the shell: a leading builtin the shell must
+        // resolve, and an interior newline the shell reads as a command
+        // separator, with `"$1"` still landing on the last line.
         for (command, success, saved) in [
             ("printf saved > \"$1\"; exit 0 #", true, true),
-            ("test -f\n", true, false),
+            ("true\nprintf saved > \"$1\"; exit 0 #", true, true),
             ("exit 7 #", false, false),
             ("exec /definitely-absent-td-editor", false, false),
+            ("sh -c 'exit 7' sh #", false, false),
         ] {
             std::fs::write(&path, b"original")?;
             let status = launch_draft_editor(&prepared, command)?.wait()?;
@@ -357,5 +439,69 @@ mod draft_tests {
         assert!(!production.contains("remove_file"));
         assert!(!production.contains("remove_dir_all"));
         std::fs::remove_dir_all(root)
+    }
+
+    /// The direct path takes exactly the commands a shell would run
+    /// unchanged; every construct a shell would interpret keeps the shell.
+    #[test]
+    fn plain_words_run_without_a_shell_and_shell_text_keeps_one() {
+        assert_eq!(
+            plain_command("/app/bin/td-editor"),
+            Some(("/app/bin/td-editor", vec![]))
+        );
+        assert_eq!(
+            plain_command("  emacs -nw\t--keys=x  "),
+            Some(("emacs", vec!["-nw", "--keys=x"])),
+            "spaces and tabs separate; `=` after the first word is literal"
+        );
+        assert_eq!(
+            plain_command("/usr/bin/vi.1+2:3@4,5-6"),
+            Some(("/usr/bin/vi.1+2:3@4,5-6", vec![]))
+        );
+        for text in [
+            "",
+            " \t",
+            "vim -u ~/.vimrc",
+            "printf saved > \"$1\"",
+            "exit 7 #",
+            "a=b vi",
+            "vi=x",
+            "vi *",
+            "vi 'x'",
+            "vi\nx",
+            "vi\rx",
+            "vi\u{c}x",
+            "vi\tx\u{1}",
+            "vi;",
+            "vi|less",
+            "vi&",
+            "vi (x)",
+            "vi `x`",
+            "vi \\x",
+            "vi {x}",
+            "vi [x]",
+            "vi x?",
+            "vi x!",
+            "vi <x",
+            "vi %x",
+            "édit",
+            "exec vim",
+            "command emacs -nw",
+            ":",
+            ". vi",
+            "eval vi",
+            "time vi",
+            "if vi",
+        ] {
+            assert_eq!(plain_command(text), None, "{text:?}");
+        }
+        // Every reserved word is one the byte rule would otherwise admit,
+        // so the list is what keeps it on the shell; and a program named
+        // like one is still reachable by its path.
+        for word in SHELL_WORDS {
+            assert!(word.bytes().all(plain_byte), "{word}");
+            assert_eq!(plain_command(word), None, "{word}");
+        }
+        assert_eq!(plain_command("/bin/time vi"), Some(("/bin/time", vec!["vi"])));
     }
 }

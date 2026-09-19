@@ -69,9 +69,11 @@ It accepts keyboard input in both profiles, but cannot save or open user
 documents. Dirty window close requires explicit discard; process termination
 still loses scratch text. Ordinary invocation now opens the separate
 experimental file window; `--window` remains an optional explicit alias.
-It supports foreground local `$EDITOR` use, not td-mail/jail integration
-or the GPU milestone. See the file-window contract below for its narrower
-scheduling and close/conflict behavior.
+It supports foreground local `$EDITOR` use, and the `mail` package ships
+it as the jail's `$EDITOR` (see `$EDITOR`, td-mail, and td-jail below);
+the in-jail acceptance test and the GPU milestone are not landed. See the
+file-window contract below for its narrower scheduling and close/conflict
+behavior.
 
 File-window close now has per-document Save/Discard/Cancel decisions,
 including Save As for untitled tabs and cancellation during a pending save.
@@ -1204,7 +1206,8 @@ files. Duplicate paths/inodes select the existing tab without refreshing its
 baseline or replacing edits. With no paths, New creates one clean Untitled
 tab. Missing paths create empty dirty tabs without creating a disk file.
 Ordinary no-option/filename invocation uses this same experimental window;
-td-mail/jail and GPU integration remain separate milestones.
+GPU integration remains a separate milestone, and of the td-mail jail
+integration only the in-jail acceptance test does.
 
 The file window reuses the preview's transport, input dispatcher and bitmap
 renderer, with the warm palette and medium weight. It requires a v5+ seat
@@ -2816,12 +2819,19 @@ their sidecars; Save As does not move or rewrite attachment references.
 
 The caller inspected for this design is td-mail (then the standalone
 `tmc` repository, now `td-mail/` in this tree). Its `src/tui/mod.rs`
-selects `[ui].editor`, then `$EDITOR`, then `vi`; `spawn_editor` starts
-`sh -c` with the configured editor command followed by quoted `"$1"`,
-passing the OS pathname as a separate shell argument. Spaces, shell
+selects `[ui].editor`, then `$EDITOR`, then `vi`. A command made only of
+plain words (ASCII letters, digits and `._/+:@,-`, plus `=` after the
+first word, separated by spaces or tabs) whose first word is not a shell
+reserved word, or a builtin a shell resolves itself rather than by `PATH`
+and that has no identical utility there, is executed directly with the OS
+pathname as its last argument, which is how the jail, whose runtime has no
+shell, launches `/app/bin/td-editor`; any other text is shell command
+text, and `spawn_editor` starts `sh -c` with it followed by quoted `"$1"`,
+passing the OS pathname as a separate shell argument, which inside the
+jail fails to launch and retains the draft. Either way spaces, shell
 metacharacters and non-UTF-8 filename bytes remain one unchanged argument.
-The TUI continues immediately. A background thread reaps the shell child;
-exit, failure and failed launch never delete drafts or attachment sidecars.
+The TUI continues immediately. A background thread reaps the child; exit,
+failure and failed launch never delete drafts or attachment sidecars.
 td-mail neither rereads the saved file nor submits mail. Local retention is
 implemented; a complete mail-composition workflow still needs submission.
 
@@ -2836,20 +2846,30 @@ product capability. The caller retains sidecars until explicit user removal.
 td-mail/README.md owns the local
 retention, private-directory and MML-representability details.
 
-td-mail still interprets its configured editor command as shell text, but
-passes the draft's original OS bytes separately. Integration must preserve
-that identity; td-editor cannot recover bytes already changed by its parent.
-Do not add shell evaluation to the editor. The editor leaves the caller's
-inherited terminal input untouched.
+td-mail passes the draft's original OS bytes as one argument on both of
+its launch paths. Integration must preserve that identity; td-editor cannot
+recover bytes already changed by its parent. Do not add shell evaluation to
+the editor. The editor leaves the caller's inherited terminal input
+untouched.
 
-An integration increment must make the executable and exact runtime closure
-available inside the jail in which td-mail runs, set its explicit `EDITOR`
-environment, and provide the intended file/directory grants.
-`APPLICATIONS.md` section X.4 currently says source-built td store closures
-are absent from the jail, so
-this requires an actual packaging/layout decision; a host `/bin/td-editor`
-path is insufficient. Keep source-built editor artifacts distinct from
-marked foreign application payloads.
+The `mail` package (`recipes/src/recipes/mail.rs`) makes the executable
+available inside the jail in which td-mail runs: it copies the static
+`td-editor` recipe output and its debug companion beside td-mail as
+`/app/bin/td-editor`, and its manifest sets `EDITOR=/app/bin/td-editor`,
+which the jail places in the application's environment. The runtime closure
+is the binary alone, since it is static and its font and licence notices are
+compiled in, so no `/td/store` closure enters the jail (`APPLICATIONS.md`
+§X.4) and the source-built editor stays distinct from marked foreign
+payloads. The editor inherits the jail's grants: drafts live under the
+application's private state directory, and `xdg-download` is the persistent
+granted directory for Save As. Its SHM pools are unlinked files under the
+jail's private `/tmp`.
+
+Not yet landed: the in-jail acceptance test below. The package check builds
+the closure and validates the static entry, td-editor-test proves the
+editor's static shape and headless modes on the target, and td-mail's own
+tests prove the direct launch, child lifetime and retention on the host;
+none of them launches the editor from td-mail inside the jail.
 
 The caller's real launch path is the acceptance test: launch td-mail, request a
 draft, observe an editor frame, edit and save while its child remains live,

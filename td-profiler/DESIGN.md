@@ -141,7 +141,11 @@ as the terminal application packages copy `td-mail` and `td-news` into
 carries the companion at the copied runtime's own path below its `lib/debug`
 and the producing output's `.td-assembly-exception` marker at that tree's root:
 the producing output is not in the image's closure, so nothing else would put
-them where the object index looks.
+them where the object index looks. A package that copies runtimes from several
+producing outputs, as `mail` copies td-mail, td-secret and td-editor, carries
+one marker at that root, so its exception set must be the union of the
+producing outputs' sets; for std-only Rust outputs of one toolchain that is
+one set, and the package's recipe test pins the equality.
 
 Stripping removes the full ordinary symbol table and non-allocated debug
 payload from the runtime after both have been copied to the companion. Dynamic
