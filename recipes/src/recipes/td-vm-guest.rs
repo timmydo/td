@@ -32,6 +32,11 @@ pub fn recipe() -> Recipe {
             exec: false,
         },
         Step::WriteFile {
+            path: "{src}/primary_account.rs".into(),
+            content: include_str!("../../../td-authd/src/primary_account.rs").into(),
+            exec: false,
+        },
+        Step::WriteFile {
             path: "{src}/workspace.rs".into(),
             content: include_str!("../../../td-vm-guest/src/workspace.rs").into(),
             exec: false,

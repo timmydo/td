@@ -1,11 +1,20 @@
 # Guest development identity helper
 
-`td-vm-guest serve` is a dependency-free, source-built service in the standard
-image. `td-svc` launches it with `td-login exec-primary`, which resolves the
-validated UID/GID-1000 account at runtime, after seat setup and networking,
-requiring seat setup and firstboot. It runs in the session cgroup. The stock
-account and the helper's fixed home paths remain `tester`. This mode has no
-root operation and adds no unsafe surface. The separate root power mode below has no Git or credential job. A running process is not a claim that a workspace is ready.
+`td-vm-guest serve` is a dependency-free, source-built service in the
+standard image. `td-svc` launches it with `td-login exec-primary`, which
+resolves the validated UID/GID-1000 account at runtime, after seat setup
+and networking, requiring seat setup and firstboot. It runs in the
+session cgroup. The stock account remains `tester`. The helper and SSH
+alias resolve the validated primary account and derive `/home/NAME`
+themselves; environment variables and compositor requests cannot select
+that home. Missing or malformed account data refuses without a fallback.
+This mode has no root operation and adds no unsafe surface. The separate
+root power mode below has no Git or credential job. A running process is
+not a claim that a workspace is ready.
+
+The image's typed terminal authority already resolves the primary task
+directory. The separate direct compositor development launcher still uses
+`/home/tester/src/td-vm/work`; that path is outside this helper cutover.
 
 The compositor owns the VM carrier and writes one public 32-digit lowercase
 hexadecimal instance ID to `/run/td-compositor/1000/vm-git-identity`. The helper
@@ -15,7 +24,7 @@ Without an assignment it waits quietly. This is host-selected identity data,
 not an arbitrary command or pathname.
 
 The helper holds a private lifetime file lock under
-`/home/tester/.local/share/td-vm`. Its immutable `git` directory contains the
+`/home/NAME/.local/share/td-vm`. Its immutable `git` directory contains the
 instance ID, `id_ed25519` and `id_ed25519.pub`. It creates these in private
 staging using the image's fixed `/bin/ssh-keygen`, an empty environment,
 bounded output and execution time. Generation and public-key extraction use
@@ -31,7 +40,7 @@ An operator needing another identity creates a fresh VM.
 
 The helper publishes only `TDVM-GIT-KEY-1`, the instance ID and an Ed25519
 public key in `/run/td-guest/1000/git-key`. Seat setup prepares the root-owned
-0755 `/run/td-guest` and tester-owned 0755 child. The file is 0644; the
+0755 `/run/td-guest` and human-owned 0755 child. The file is 0644; the
 compositor can read it but cannot read the private home state. The shared
 codec in `td-compositor/src/vm_wire.rs` limits replies to 256 bytes and accepts
 exactly one canonical public key bound to the requested ID. It grants no
@@ -65,7 +74,7 @@ supply OpenSSH. The target recipe checks its realized static helper's startup
 interface, and boot evidence must exercise the standard image's OpenSSH tool.
 Tool stderr is discarded deliberately; failure diagnostics expose only the
 fixed operation and exit status, without private material or tool output.
-The fixed tester/compositor identities are the standard image contract.
+The fixed human/compositor UIDs are the standard image contract.
 
 
 The helper follows the target-wide frame-pointer and debug-companion policy.
@@ -75,30 +84,33 @@ and libgcc. The recipe requires both the companion and marker in its output.
 
 ## Private SSH clone provisioning
 
-The service also consumes the compositor-owned `vm-workspace` plan described
-in [td-vm/DESIGN.md](../td-vm/DESIGN.md#explicit-guest-clone-provisioning).
-It runs as tester and never invokes a root operation. The plan's ID and public
-key must match the locally generated, signature-verified private key. The
-private `ssh` directory beside `git` contains the immutable canonical plan,
-`config` and `known_hosts`, all mode 0600. They are synced before atomic
-publication; state ancestors through the existing human home are synced before
-Git starts. Existing configuration must match exactly. A changed host key or
-profile requires an explicit future migration or a new instance; this helper
-does not silently replace trust data in a used workspace.
+The service also consumes the compositor-owned `vm-workspace` plan
+described in
+[td-vm/DESIGN.md](../td-vm/DESIGN.md#explicit-guest-clone-provisioning).
+It runs as the primary human and never invokes a root operation. The
+plan's ID and public key must match the locally generated,
+signature-verified private key. The private `ssh` directory beside `git`
+contains the immutable canonical plan, `config` and `known_hosts`, all
+mode 0600. They are synced before atomic publication; state ancestors
+through the existing human home are synced before Git starts. Existing
+configuration must match exactly. A changed host key or profile requires
+an explicit future migration or a new instance; this helper does not
+silently replace trust data in a used workspace.
 
-`td-vm-ssh` is a source-built alias of the same Rust executable. It requires
-tester UID 1000, validates the private configuration, clears the environment,
-and execs the fixed `/bin/ssh -F` configuration path with Git's argument vector.
-Only exact `GIT_PROTOCOL=version=2` is preserved. The configuration selects the
-instance key, `IdentitiesOnly`, no agent, batch public-key authentication,
-strict host-key checking and the pinned `td-host` host-key alias. System/global
-known-hosts additions, host-key updates, proxy commands/jumps, local commands,
-agent and network forwarding are disabled by the generated profile. Connect
-has a ten-second timeout; server keepalive has a fifteen-second interval and
-three-failure ceiling. The unconfined human UID can also invoke ordinary SSH
-or edit its own Git configuration; this is not a new isolation boundary
-against that UID. Confined application identities do not acquire these paths
-or the tester-only launcher through this change.
+`td-vm-ssh` is a source-built alias of the same Rust executable. It
+requires primary human UID 1000, validates the private configuration,
+clears the environment, and execs the fixed `/bin/ssh -F` configuration
+path with Git's argument vector. Only exact `GIT_PROTOCOL=version=2` is
+preserved. The configuration selects the instance key, `IdentitiesOnly`,
+no agent, batch public-key authentication, strict host-key checking and
+the pinned `td-host` host-key alias. System/global known-hosts
+additions, host-key updates, proxy commands/jumps, local commands, agent
+and network forwarding are disabled by the generated profile. Connect
+has a ten-second timeout; server keepalive has a fifteen-second interval
+and three-failure ceiling. The unconfined human UID can also invoke
+ordinary SSH or edit its own Git configuration; this is not a new
+isolation boundary against that UID. Confined application identities do
+not acquire these paths or the human-only launcher through this change.
 
 Git stdout is drained with a 4096-byte retained-output bound. Trusted Git
 execution and filesystem work have no absolute completion deadline: a carrier
@@ -124,25 +136,28 @@ object verification. It clones without a checkout or shallow history, fetches
 and verifies the retained starting commit, sets the author with literal argv
 values, and creates a task worktree with relative Git links. Both directories
 and their immutable plan are synced and atomically published under
-`/home/tester/src/td-vm`. The private `.td-vm.tmp` staging name is reserved for
+`/home/NAME/src/td-vm`. The private `.td-vm.tmp` staging name is reserved for
 the helper; failed/interrupted unpublished work there may be removed on retry.
 Published work is never removed, recloned, reset or silently rebased. A later
 request validates its plan and Git common-directory link and preserves the
 human's commits, dirty files, untracked files and other local Git settings.
 
-Before publishing ready status, the target helper requires the fixed task
-worktree to resolve below `/var/home/tester`, with writable executable Btrfs
-mounted at `/var` using `nodev,nosuid`. It separately requires `/td/store` to
-remain part of the read-only EROFS root. It prepares mode-0700, tester-owned
-physical state at `~/.td/build-daemon/ladder-shared-v1`, including separate
-seed and build-output stores, plus `~/.td/{sources,ostree}` and the worktree's
-ignored `.td-build-cache`. These are the existing evaluator and builder paths;
-the logical store prefix seen inside a derivation remains `/td/store`. The
-helper does not bind, redirect or write the deployed store. Existing owned
-directories are tightened to 0700 for upgrades; links, wrong owners, a
-volatile/readonly home, a `noexec` private mount, or a writable deployed store
-refuse readiness. A same-plan retry only validates and completes private
-directories; it does not reset build outputs.
+Before publishing ready status, the target helper revalidates the
+primary account. Its logical home and fixed task worktree must match
+that account; their canonical paths must equal `/var/home/NAME` and its
+`src/td-vm/work` child, with writable executable Btrfs mounted at `/var`
+using `nodev,nosuid`. It separately requires `/td/store` to remain part
+of the read-only EROFS root. It prepares mode-0700, human-owned physical
+state at `~/.td/build-daemon/ladder-shared-v1`, including separate seed
+and build-output stores, plus `~/.td/{sources,ostree}` and the
+worktree's ignored `.td-build-cache`. These are the existing evaluator
+and builder paths; the logical store prefix seen inside a derivation
+remains `/td/store`. The helper does not bind, redirect or write the
+deployed store. Existing owned directories are tightened to 0700 for
+upgrades; links, wrong owners, a volatile/readonly home, a `noexec`
+private mount, or a writable deployed store refuse readiness. A
+same-plan retry only validates and completes private directories; it
+does not reset build outputs.
 
 Host tests use disposable roots and therefore skip the standard-image pathname
 and mount assertion while exercising the same directory preparation. Pure
@@ -168,7 +183,7 @@ staging. A separate regression lets the Git parent fail while a descendant
 keeps stderr and redirects stdout; the same helper must wait for it. A changed retention ref refuses publication and can be repaired for
 a same-plan retry. A wrong host-key probe is refused. These fixtures use
 host-only fixed Rust test adapters; the standard-image proof exercises the
-actual tester-only `td-vm-ssh` alias and source-built Git/OpenSSH.
+actual human-only `td-vm-ssh` alias and source-built Git/OpenSSH.
 
 The combined service-loop regression retains both requests across a damaged
 key's signature self-test failure. Each job attempts once, then remains idle
@@ -182,7 +197,7 @@ job; a tracked private-key permission change remains observable.
 `td-svc` starts `td-vm-guest power-serve` as a separate root `vm-power` unit
 after successful seat setup. It has no arguments beyond that mode and opens
 no private home or key state. It holds a lifetime lock in root-only
-`/run/td-vm-power`; the ordinary tester helper cannot acquire that lock.
+`/run/td-vm-power`; the ordinary human helper cannot acquire that lock.
 It additionally requires the kernel-owned `/sys/class/virtio-ports` to name
 `org.td.vm.1`, scanning at most 64 entries and 129 bytes per name. Unnamed
 ports and concurrently removed name attributes are skipped; other discovery

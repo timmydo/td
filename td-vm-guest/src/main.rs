@@ -7,6 +7,9 @@
     path = "../../td-compositor/src/vm_wire.rs"
 )]
 mod vm_wire;
+#[cfg_attr(feature = "target-recipe", path = "primary_account.rs")]
+#[cfg_attr(not(feature = "target-recipe"), path = "../../td-authd/src/primary_account.rs")]
+mod primary_account;
 mod development;
 mod workspace;
 mod power;
@@ -420,12 +423,14 @@ fn failure_state(
 
 fn serve() -> Result<()> {
     let uid = io(fs::metadata("/proc/self"), "inspect guest UID")?.uid();
-    if uid != 1000 {
-        return Err("VM guest helper must run as tester (UID 1000)".into());
+    if uid != primary_account::UID {
+        return Err("VM guest helper must run as the primary human (UID 1000)".into());
     }
     clear_response(Path::new(protocol::RESPONSE), uid)?;
     clear_response(Path::new(vm_wire::workspace::RESPONSE), uid)?;
-    let home = Path::new("/home/tester");
+    let account = io(primary_account::load(), "resolve primary guest account")?;
+    let home = account.home();
+    let home = home.as_path();
     directory(home, uid, false)?;
     let mut state = home.to_path_buf();
     for part in [".local", "share"] {

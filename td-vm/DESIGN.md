@@ -815,11 +815,14 @@ branch. Opening td-vm from a host checkout can discover this local origin,
 but must not silently create or
 replace a repository when the configured origin is absent or inaccessible.
 
+Here `PRIMARY` is the validated UID/GID-1000 guest account name (stock:
+`tester`), distinct from the instance name accepted by CLI commands.
+
 | Location | Repository and purpose |
 | --- | --- |
 | Host `/srv/git/td.git` | Shared bare origin: `refs/heads/main` and submitted topic branches. No working tree. |
-| Each guest `/home/tester/src/td-vm/repo` | Full private clone, with `origin` addressing the host as `test` over SSH. |
-| Each guest `/home/tester/src/td-vm/work` | Private task worktree on a descriptive branch, where the agent runs. |
+| Each guest `/home/PRIMARY/src/td-vm/repo` | Full private clone, with `origin` addressing the host as `test` over SSH. |
+| Each guest `/home/PRIMARY/src/td-vm/work` | Private task worktree on a descriptive branch, where the agent runs. |
 | Host integrator checkout | Separate ordinary clone whose `origin` is `/srv/git/td.git`; td-review fetches and reviews its remote-tracking branches. |
 
 ```mermaid
@@ -1288,8 +1291,8 @@ explicitly and check its object ID against the saved starting commit.
 
 The workspace clone operation performs the equivalent of the following inside
 the guest; Open invokes its non-retrying ensure variant automatically. These
-commands illustrate the provisioner's fixed argv operations, not manual setup
-or a generated shell script:
+commands illustrate the provisioner's fixed argv operations using the stock
+guest account `tester`, not manual setup or a generated shell script:
 
 ```text
 git clone --no-checkout --origin origin ssh://test@td-host/srv/git/td.git /home/tester/src/td-vm/repo
@@ -1492,20 +1495,21 @@ and implementation status explicit until this evidence exists.
 
 ## Guest Git public key exchange
 
-The standard image includes [td-vm-guest](../td-vm-guest/DESIGN.md), running
-as `tester` through the existing login launcher. For an instance with a saved
-workspace plan, `td-vm workspace key NAME` sends its immutable instance ID
-over the compositor-owned `git-key` operation. The first request can report
-pending while the helper generates the key; repeating it returns the same
-Ed25519 public key. The manager validates the reply's identity and exact
-public-key format at both relay boundaries. It never receives private bytes.
-Clipboard sharing and keyboard focus do not gate this provisioning request.
-Older images without this operation cannot provide a key; use the updated
-standard image for new instances.
+The standard image includes [td-vm-guest](../td-vm-guest/DESIGN.md),
+running as the validated primary human through the existing login
+launcher. For an instance with a saved workspace plan, `td-vm workspace
+key NAME` sends its immutable instance ID over the compositor-owned
+`git-key` operation. The first request can report pending while the
+helper generates the key; repeating it returns the same Ed25519 public
+key. The manager validates the reply's identity and exact public-key
+format at both relay boundaries. It never receives private bytes.
+Clipboard sharing and keyboard focus do not gate this provisioning
+request. Older images without this operation cannot provide a key; use
+the updated standard image for new instances.
 
-Seat setup creates a separate public tester runtime at
+Seat setup creates a separate public human runtime at
 `/run/td-guest/1000`; it leaves the human's private runtime private. Persistent
-keys live under `/home/tester/.local/share/td-vm/git` inside each VM disk.
+keys live under `/home/PRIMARY/.local/share/td-vm/git` inside each VM disk.
 Changing the host-assigned ID of a used disk is refused by the guest helper.
 The key exchange alone does not enroll or reserve anything. The enrollment
 operation below uses this public key and the saved host Git profile; a key
@@ -1633,13 +1637,19 @@ reports workspace and private build-state preparation, not terminal launch,
 completed tests, or provider authentication.
 
 `td-vm workspace terminal NAME` or T in the TUI is the explicit terminal
-action. It rechecks the saved profile, branch reservation, retained commit and
-complete clone plan, then sends `workspace-terminal`. The compositor requires
-the matching guest status to be ready before it queues one fresh td-term whose
-child starts in `/home/tester/src/td-vm/work`. The fixed reply is `task terminal
-queued`; it proves queue admission only, not process exec, Wayland mapping or
-terminal readiness. A missing reply may follow admission, so the manager never
-describes that outcome as a safe automatic retry.
+action. It rechecks the saved profile, branch reservation, retained
+commit and complete clone plan, then sends `workspace-terminal`. The
+compositor requires the matching guest status to be ready before it
+queues one fresh td-term whose child starts in
+`/home/PRIMARY/src/td-vm/work` through the image's terminal authority.
+The fixed reply is `task terminal queued`; it proves queue admission
+only, not process exec, Wayland mapping or terminal readiness. A missing
+reply may follow admission, so the manager never describes that outcome
+as a safe automatic retry.
+
+The separate direct compositor development launcher still uses
+`/home/tester/src/td-vm/work`; it does not use the image's typed terminal
+authority. That fixed path remains outside the guest-helper home cutover.
 
 The `workspace` request has revision zero and contains `TDVM-CLONE-1`, then
 exactly eleven LF-separated fields with a final LF: instance ID, task branch,
@@ -1672,17 +1682,18 @@ inspection of subsequent human edits. New helper startup clears stale replies.
 Plan/status files contain public configuration only, never provider tokens or
 private SSH key bytes. A lost carrier reply does not cancel a clone.
 
-The source-built helper runs fixed Git commands as tester. It validates its
-existing private key against the enrolled public key, publishes a private SSH
-configuration, then prepares the full clone in `/home/tester/src/.td-vm.tmp`.
-The matching standard image includes the `td-vm-ssh` alias of this Rust helper.
-Git records that fixed executable as `core.sshCommand`; the single executable
-path needs no generated shell command. The alias execs `/bin/ssh` with the
-fixed private configuration and carries only exact Git protocol-v2 metadata.
-No SSH daemon, host terminal relay, tmux or forwarded agent runs in the guest.
+The source-built helper runs fixed Git commands as the primary human. It
+validates its existing private key against the enrolled public key,
+publishes a private SSH configuration, then prepares the full clone in
+`/home/PRIMARY/src/.td-vm.tmp`. The matching standard image includes the
+`td-vm-ssh` alias of this Rust helper. Git records that fixed executable
+as `core.sshCommand`; the single executable path needs no generated
+shell command. The alias execs `/bin/ssh` with the fixed private
+configuration and carries only exact Git protocol-v2 metadata. No SSH
+daemon, host terminal relay, tmux or forwarded agent runs in the guest.
 
-The full clone and task worktree live at `/home/tester/src/td-vm/repo` and
-`/home/tester/src/td-vm/work`. Git's relative worktree links allow the complete
+The full clone and task worktree live at `/home/PRIMARY/src/td-vm/repo` and
+`/home/PRIMARY/src/td-vm/work`. Git's relative worktree links allow the complete
 staged parent to be renamed atomically into place after validation and sync.
 Clone rejects a shallow source and uses SSH exclusively, without alternates,
 hardlinks to host objects, a bundle, or a repository snapshot in the image.

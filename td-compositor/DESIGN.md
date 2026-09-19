@@ -6615,21 +6615,22 @@ The `git-key` request carries a 32-digit lowercase hexadecimal instance ID and
 revision zero. It cancels any clipboard lease and does not need keyboard
 focus. The compositor atomically publishes the ID in its volatile
 `vm-git-identity` file, then returns only a matching bounded public reply from
-the tester-owned `/run/td-guest/1000/git-key` file. A missing reply reports
+the UID-1000-owned `/run/td-guest/1000/git-key` file. A missing reply reports
 pending; retrying the same request is idempotent. Directory ownership and
 opened-file type, owner, link count and write permissions are checked before
 reading. This is a private carrier operation, absent from public Wayland and
 the control socket. [The guest helper](../td-vm-guest/DESIGN.md) retains the
-private key in tester's persistent home. The compositor cannot generate,
-import, export or enroll a private key through this operation.
+private key in the primary human's persistent home. The compositor cannot
+generate, import, export or enroll a private key through this operation.
 
 
 The `workspace` carrier operation accepts only the bounded public clone plan
 in [td-vm's clone contract](../td-vm/DESIGN.md#explicit-guest-clone-provisioning).
 It cancels clipboard leases and publishes to compositor-owned `vm-workspace`,
-then validates a matching bounded tester-owned status. Explicit requests replace
-the request inode so the helper can retry a failed attempt. The compositor does
-not run Git, SSH, key tools or a terminal for this operation. The helper owns
+then validates a matching bounded UID-1000-owned status. Explicit requests
+replace the request inode so the helper can retry a failed attempt. The
+compositor does not run Git, SSH, key tools or a terminal for this
+operation. The helper owns
 private configuration and staging; only the complete public plan and status
 cross the carrier. Success is recorded workspace preparation, not live
 inspection of human edits or agent readiness. Public Wayland/control clients

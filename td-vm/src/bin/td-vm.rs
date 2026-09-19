@@ -662,7 +662,7 @@ impl Manager {
         let plan = workspace.profile.clone_plan(&workspace.id, &workspace.branch, start, &enrollment.key)?;
         let reply = vm_bridge::ask(&dir, vm_wire::WORKSPACE, plan.encode())?;
         vm_wire::workspace::parse_ready(&reply, &plan)?;
-        Ok(format!("Guest workspace and private build state prepared on {} at /home/tester/src/td-vm/work. Terminal launch and agent setup remain pending.", workspace.branch))
+        Ok(format!("Guest workspace and private build state prepared on {} in the primary task worktree. Terminal launch and agent setup remain pending.", workspace.branch))
     }
 
     fn workspace_terminal(&self, value: &str) -> Result<String> {
@@ -699,7 +699,7 @@ impl Manager {
         }
         if verb == vm_wire::WORKSPACE_TERMINAL {
             return Ok(format!(
-                "Task terminal queued on {} in /home/tester/src/td-vm/work.",
+                "Task terminal queued on {} in the primary task worktree.",
                 workspace.branch
             ));
         }
@@ -709,7 +709,7 @@ impl Manager {
             _ => return Err("invalid task agent launch selection".into()),
         };
         Ok(format!(
-            "{agent} queued on {} in /home/tester/src/td-vm/work; agent authentication is not verified.",
+            "{agent} queued on {} in the primary task worktree; agent authentication is not verified.",
             workspace.branch
         ))
     }

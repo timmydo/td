@@ -83,7 +83,7 @@ impl Provision {
                 Ok(Progress::Ready) => {
                     self.phase = Phase::Launch(plan.clone());
                     self.unavailable_until = now + UNAVAILABLE;
-                    self.report(host, "Opening a task terminal in /home/tester/src/td-vm/work.".into());
+                    self.report(host, "Opening a task terminal in the primary task worktree.".into());
                 }
                 Ok(Progress::Failed(error)) => {
                     self.phase = Phase::Done;
@@ -94,7 +94,7 @@ impl Provision {
             Phase::Launch(plan) => match host.launch(plan) {
                 Ok(()) => {
                     self.phase = Phase::Done;
-                    self.report(host, "Prepared: private build state is ready and a task terminal is queued in /home/tester/src/td-vm/work. Agent login remains pending.".into());
+                    self.report(host, "Prepared: private build state is ready and a task terminal is queued in the primary task worktree. Agent login remains pending.".into());
                 }
                 Err(error) => {
                     self.phase = Phase::Done;

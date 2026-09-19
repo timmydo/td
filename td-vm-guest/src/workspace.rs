@@ -416,11 +416,13 @@ pub fn prepare(
 }
 
 pub fn ssh(args: &[OsString]) -> Result<()> {
-    let state = Path::new("/home/tester/.local/share/td-vm");
     let uid = io(fs::metadata("/proc/self"), "inspect SSH launcher UID")?.uid();
-    if uid != 1000 {
-        return Err("VM SSH launcher requires tester UID 1000".into());
+    if uid != super::primary_account::UID {
+        return Err("VM SSH launcher requires primary human UID 1000".into());
     }
+    let account = io(super::primary_account::load(), "resolve primary SSH account")?;
+    let state = account.home().join(".local/share/td-vm");
+    let state = state.as_path();
     directory(state, uid, true)?;
     directory(&state.join("ssh"), uid, true)?;
     let plan = Plan::parse(&read(
