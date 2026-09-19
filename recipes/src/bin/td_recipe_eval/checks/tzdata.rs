@@ -298,11 +298,39 @@ mod tests {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_nanos();
-            let path =
-                std::env::temp_dir().join(format!("td-tzdata-{}-{nonce}", std::process::id()));
-            fs::create_dir(&path).unwrap();
-            Self(path)
+            Self::with_nonce(nonce)
         }
+
+        fn with_nonce(nonce: u128) -> Self {
+            use std::os::unix::fs::DirBuilderExt;
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            static NEXT: AtomicUsize = AtomicUsize::new(0);
+            for _ in 0..16 {
+                let serial = NEXT.fetch_add(1, Ordering::Relaxed);
+                let path = std::env::temp_dir()
+                    .join(format!("td-tzdata-{}-{nonce}-{serial}", std::process::id()));
+                match fs::DirBuilder::new().mode(0o700).create(&path) {
+                    Ok(()) => return Self(path),
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                    Err(error) => panic!("create timezone fixture {}: {error}", path.display()),
+                }
+            }
+            panic!("all timezone fixture names were occupied");
+        }
+    }
+
+    #[test]
+    fn equal_clock_ticks_do_not_share_a_fixture() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let first = Scratch::with_nonce(nonce);
+        fs::write(first.0.join("evidence"), b"first").unwrap();
+        let second = Scratch::with_nonce(nonce);
+        assert_ne!(first.0, second.0);
+        drop(second);
+        assert_eq!(fs::read(first.0.join("evidence")).unwrap(), b"first");
     }
 
     impl Drop for Scratch {

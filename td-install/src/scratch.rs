@@ -26,10 +26,14 @@
 //! process. `/dev/shm` and `/tmp` are world-writable, and a fixture at a
 //! predictable name in one is a name a planted symlink could already hold;
 //! `mkdir` does not follow one, so a taken name fails instead of being
-//! entered. The base is swept of the roots of earlier runs whose process is
-//! gone, which is what a killed run leaves behind.
+//! entered. A held file lock protects each root across PID namespaces. Only
+//! unlocked roots with the lease marker are swept; legacy unmarked roots are
+//! left for manual cleanup. The chosen filesystem must support advisory file
+//! locks. The lease belongs to the test process, not orphaned children.
 
+use std::fs::{self, File};
 use std::io::{self, ErrorKind, Write};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::OnceLock;
@@ -38,7 +42,14 @@ use std::sync::OnceLock;
 /// fixtures a full-width run holds at once, with margin.
 const RESERVE: u64 = 256 * 1024 * 1024;
 
-const PREFIX: &str = "td-install-scratch";
+// Old PID-based sweepers must not recognize the leased roots.
+const PREFIX: &str = "td-install-leased-scratch";
+const LEASE: &str = ".lease";
+
+struct ScratchRoot {
+    path: PathBuf,
+    _lease: File,
+}
 
 static NEXT: AtomicUsize = AtomicUsize::new(0);
 
@@ -49,7 +60,7 @@ pub fn path(tag: &str) -> PathBuf {
 }
 
 fn root() -> &'static Path {
-    static ROOT: OnceLock<PathBuf> = OnceLock::new();
+    static ROOT: OnceLock<ScratchRoot> = OnceLock::new();
     ROOT.get_or_init(|| {
         let explicit = std::env::var_os("TMPDIR").is_some_and(|v| !v.is_empty());
         let shm = PathBuf::from("/dev/shm");
@@ -58,30 +69,67 @@ fn root() -> &'static Path {
         } else {
             std::env::temp_dir()
         };
-        sweep(&base);
         match private_dir(&base) {
-            Ok(dir) => dir,
+            Ok(dir) => {
+                if let Ok(metadata) = dir._lease.metadata() {
+                    sweep(&base, metadata.uid());
+                }
+                dir
+            }
             Err(e) => panic!("no scratch root under {}: {e}", base.display()),
         }
     })
+    .path
+    .as_path()
 }
 
-/// A directory `base/td-install-scratch-<pid>-<n>` that did not exist, mode
-/// 0700. Exclusive: an entry already at the name, a symlink included, fails
+/// A private directory named with a PID, clock tick and serial.
+/// Mode 0700 and exclusive: an entry already at the name, a symlink included, fails
 /// the creation rather than being entered, and the next name is tried.
-fn private_dir(base: &Path) -> io::Result<PathBuf> {
+fn private_dir(base: &Path) -> io::Result<ScratchRoot> {
     use std::os::unix::fs::DirBuilderExt;
     let pid = std::process::id();
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(io::Error::other)?
+        .as_nanos();
     let mut taken = None;
-    for _ in 0..8 {
-        let dir = base.join(format!("{PREFIX}-{pid}-{}", NEXT.fetch_add(1, Ordering::Relaxed)));
+    for _ in 0..64 {
+        let dir = base.join(format!(
+            "{PREFIX}-{pid}-{nonce}-{}",
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
         match std::fs::DirBuilder::new().mode(0o700).create(&dir) {
-            Ok(()) => return Ok(dir),
+            Ok(()) => {
+                let result = claim_root(&dir);
+                if result.is_err() {
+                    let _ = fs::remove_dir_all(&dir);
+                }
+                return result;
+            }
             Err(e) if e.kind() == ErrorKind::AlreadyExists => taken = Some(e),
             Err(e) => return Err(e),
         }
     }
     Err(taken.unwrap_or_else(|| io::Error::other("every scratch name is taken")))
+}
+
+fn claim_root(dir: &Path) -> io::Result<ScratchRoot> {
+    let pending = dir.join(".lease-new");
+    let lease = File::options()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&pending)?;
+    lease
+        .try_lock()
+        .map_err(|error| io::Error::other(format!("lock scratch lease: {error}")))?;
+    // Publish only after locking, so another process cannot reclaim a new root.
+    fs::rename(&pending, dir.join(LEASE))?;
+    Ok(ScratchRoot {
+        path: dir.to_path_buf(),
+        _lease: lease,
+    })
 }
 
 /// Whether `base` can hold a run's fixtures and run a script from them.
@@ -90,14 +138,14 @@ fn suits(base: &Path) -> bool {
     let Ok(dir) = private_dir(base) else {
         return false;
     };
-    let script = dir.join("probe.sh");
+    let script = dir.path.join("probe.sh");
     let ok = std::fs::write(&script, "#!/bin/sh\nexit 0\n").is_ok()
         && std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).is_ok()
         && std::process::Command::new(&script)
             .status()
             .is_ok_and(|status| status.success())
-        && fills(&dir.join("reserve"), RESERVE);
-    let _ = std::fs::remove_dir_all(&dir);
+        && fills(&dir.path.join("reserve"), RESERVE);
+    let _ = std::fs::remove_dir_all(&dir.path);
     ok
 }
 
@@ -123,31 +171,104 @@ fn fills(path: &Path, bytes: u64) -> bool {
     true
 }
 
-/// Remove the scratch roots under `base` of earlier runs whose process is
-/// gone. Liveness is `/proc/<pid>`; without a procfs nothing is known and
-/// nothing is removed. Only a root this user made can be removed — anything
-/// else fails quietly — and a symlink at such a name is removed as a link.
-fn sweep(base: &Path) {
-    if !Path::new("/proc/self").exists() {
-        return;
-    }
-    let Ok(entries) = std::fs::read_dir(base) else {
+/// Reclaim only private, same-owner roots whose published lease is unlocked.
+/// PID visibility is not evidence of liveness across namespaces.
+fn sweep(base: &Path, owner: u32) {
+    let Ok(entries) = fs::read_dir(base) else {
         return;
     };
+    let prefix = format!("{PREFIX}-");
     for entry in entries.flatten() {
-        let name = entry.file_name();
-        let Some(pid) = name
+        if !entry
+            .file_name()
             .to_str()
-            .and_then(|n| n.strip_prefix(PREFIX))
-            .and_then(|rest| rest.strip_prefix('-'))
-            .and_then(|rest| rest.split('-').next())
-            .and_then(|pid| pid.parse::<u32>().ok())
-        else {
-            continue;
-        };
-        if pid == std::process::id() || Path::new("/proc").join(pid.to_string()).exists() {
+            .is_some_and(|name| name.starts_with(&prefix))
+        {
             continue;
         }
-        let _ = std::fs::remove_dir_all(entry.path());
+        let Ok(root) = fs::symlink_metadata(entry.path()) else {
+            continue;
+        };
+        if !root.is_dir() || root.uid() != owner || root.mode() & 0o7777 != 0o700 {
+            continue;
+        }
+        let path = entry.path().join(LEASE);
+        let Ok(marker) = fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if !marker.is_file()
+            || marker.uid() != owner
+            || marker.nlink() != 1
+            || marker.mode() & 0o7777 != 0o600
+        {
+            continue;
+        }
+        let Ok(lease) = File::options().read(true).write(true).open(&path) else {
+            continue;
+        };
+        let Ok(opened) = lease.metadata() else {
+            continue;
+        };
+        if opened.dev() != marker.dev() || opened.ino() != marker.ino() || lease.try_lock().is_err()
+        {
+            continue;
+        }
+        // Keep the lock until reclamation finishes.
+        let _ = reclaim_root(&entry.path());
+    }
+}
+
+fn reclaim_root(root: &Path) -> io::Result<()> {
+    for entry in fs::read_dir(root)? {
+        let entry = entry?;
+        if entry.file_name() == LEASE {
+            continue;
+        }
+        if entry.file_type()?.is_dir() {
+            fs::remove_dir_all(entry.path())?;
+        } else {
+            fs::remove_file(entry.path())?;
+        }
+    }
+    // A failed content removal retains the lease marker for the next sweep.
+    // Interruption after this unlink can strand only an empty directory.
+    fs::remove_file(root.join(LEASE))?;
+    fs::remove_dir(root)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::DirBuilderExt;
+
+    #[test]
+    fn a_live_lease_survives_an_invisible_pid_and_released_roots_are_swept() -> io::Result<()> {
+        let base = private_dir(&std::env::temp_dir())?;
+        let owner = fs::metadata(&base.path)?.uid();
+        let hidden = base.path.join(format!("{PREFIX}-0-0"));
+        fs::DirBuilder::new().mode(0o700).create(&hidden)?;
+        let held = claim_root(&hidden)?;
+        fs::write(hidden.join("evidence"), b"live fixture")?;
+        sweep(&base.path, owner);
+        assert_eq!(fs::read(hidden.join("evidence"))?, b"live fixture");
+        drop(held);
+        sweep(&base.path, owner);
+        assert!(!hidden.exists());
+        fs::remove_dir_all(&base.path)
+    }
+
+    #[test]
+    fn incomplete_and_aliased_roots_are_not_reclaimed() -> io::Result<()> {
+        let base = private_dir(&std::env::temp_dir())?;
+        let owner = fs::metadata(&base.path)?.uid();
+        let incomplete = base.path.join(format!("{PREFIX}-0-0"));
+        fs::DirBuilder::new().mode(0o700).create(&incomplete)?;
+        fs::write(incomplete.join("evidence"), b"not published")?;
+        let alias = base.path.join(format!("{PREFIX}-0-1"));
+        std::os::unix::fs::symlink(&incomplete, &alias)?;
+        sweep(&base.path, owner);
+        assert_eq!(fs::read(incomplete.join("evidence"))?, b"not published");
+        assert!(fs::symlink_metadata(alias)?.is_symlink());
+        fs::remove_dir_all(&base.path)
     }
 }
