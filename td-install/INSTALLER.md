@@ -164,6 +164,30 @@ enroll retained reservations, validate service configuration or activate the
 selected account. Wiring it into the installer and publishing the coherent
 boot-time account configuration remain part of the username cutover.
 
+`td-firstboot stage-primary-name ROOT NAME OUT` prepares that account
+configuration from the same caller-verified deployment. It validates the
+complete input and renamed tables before creating a new private output
+root. `OUT/etc` contains passwd/group at 0644, shadow at 0600 and the
+unchanged principal reservations at 0444. Only the human account name,
+canonical `/home/NAME`, matching primary group name and exact
+supplementary-group member references change. Numeric identities,
+password/lock fields, other account fields and application reservations
+remain intact; the renamed result passes the same complete admission.
+
+The output parent must have the input tree's owner and exclude other
+writers. The invoking uid/gid must match that owner, and `/proc` must be
+mounted for descriptor-relative access. Parent and output directories are
+descriptor-pinned, existing
+output roots refuse, and files are created exclusively with their exact
+modes. The output root is 0700 and its `etc` directory 0755, independent of
+umask. Success is reported as `TD-PRIMARY-NAME-STAGED` only after files and
+directories are synced. A write failure can leave a private incomplete
+output; callers must require success before consuming it and use a new
+output for a retry. This command does not modify the input account files or live `/etc`,
+create homes, save an installer choice or start a session. Deployment
+verification, boot-time publication and the remaining coordinated cutover
+are still the caller's responsibility.
+
 Keyboard and timezone choices must actually affect the installed session;
 only supported choices with available data may be offered.
 

@@ -254,6 +254,7 @@ fn usage() -> String {
          td-firstboot hostname prepares and activates the persistent hostname\n  \
          td-firstboot check-principals ROOT validates staged deployment identities without writing\n  \
          td-firstboot check-primary-name ROOT NAME checks a proposed human name without writing\n  \
+         td-firstboot stage-primary-name ROOT NAME OUT prepares new account tables without activating them\n  \
          td-firstboot check-launch-session USER UID COMPOSITOR_UID verifies live reservations\n  \
          td-firstboot check-launch-application OWNER APP selects an enrolled active application UID\n"
     )
@@ -277,6 +278,10 @@ fn run_with_primary(
         Invocation::CheckPrimaryName(root, name) => {
             principals::check_primary_name(&root, &name).map_err(Failure::Failed)?;
             return emit("TD-PRIMARY-NAME-CHECK-OK\n").map_err(Failure::Failed);
+        }
+        Invocation::StagePrimaryName(root, name, output) => {
+            principals::stage_primary_name(&root, &name, &output).map_err(Failure::Failed)?;
+            return emit("TD-PRIMARY-NAME-STAGED\n").map_err(Failure::Failed);
         }
         Invocation::CheckLaunchSession(user, owner, compositor) => {
             principal_store::check_launch_session(&user, owner, compositor)
@@ -403,12 +408,19 @@ enum Invocation {
     Hostname,
     CheckPrincipals(PathBuf),
     CheckPrimaryName(PathBuf, String),
+    StagePrimaryName(PathBuf, String, PathBuf),
     CheckLaunchSession(String, u32, u32),
     CheckLaunchApplication(u32, String),
     Provision(Config),
 }
 
 fn parse(args: &[String]) -> Result<Invocation, Failure> {
+    if args.first().is_some_and(|verb| verb == "stage-primary-name") {
+        let [_, root, name, output] = args else {
+            return Err(Failure::Usage("stage-primary-name requires ROOT NAME OUT".into()));
+        };
+        return Ok(Invocation::StagePrimaryName(PathBuf::from(root), name.clone(), PathBuf::from(output)));
+    }
     if args.first().is_some_and(|verb| verb == "check-primary-name") {
         let [_, root, name] = args else {
             return Err(Failure::Usage("check-primary-name requires ROOT NAME".into()));
@@ -1557,6 +1569,7 @@ mod tests {
             | Invocation::Hostname
             | Invocation::CheckPrincipals(_)
             | Invocation::CheckPrimaryName(_, _)
+            | Invocation::StagePrimaryName(_, _, _)
             | Invocation::CheckLaunchApplication(..)
             | Invocation::CheckLaunchSession(..) => Err(Failure::Usage(
                 "asked for a non-provisioning operation".to_string(),
@@ -2052,6 +2065,20 @@ mod tests {
 mod principal_arguments {
     #![allow(clippy::unwrap_used, clippy::panic)]
     use super::*;
+
+    #[test]
+    fn primary_name_staging_requires_one_new_output_root() {
+        let args: Vec<String> = ["stage-primary-name", "/staged", "alice", "/prepared"]
+            .map(str::to_owned).into();
+        assert!(matches!(parse(&args), Ok(Invocation::StagePrimaryName(root, name, output))
+            if root == Path::new("/staged") && name == "alice" && output == Path::new("/prepared")));
+        for length in 1..args.len() {
+            assert!(parse(&args[..length]).is_err());
+        }
+        let mut extra = args;
+        extra.push("--enroll-principals".into());
+        assert!(parse(&extra).is_err());
+    }
 
     #[test]
     fn primary_name_check_takes_exactly_a_root_and_name() {

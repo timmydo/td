@@ -9,6 +9,196 @@ const GROUP: &str = "root:x:0:\ntester:x:1000:\nother:x:1001:\nwheel:x:10:tester
 const SHADOW: &str = "root::0:0:99999:7:::\ntester::0:0:99999:7:::\nother::0:0:99999:7:::\n";
 
 #[test]
+fn primary_table_rename_preserves_credentials_reservations_and_other_fields() {
+    let registry = Registry::parse(TABLE).unwrap();
+    let passwd = format!(
+        "{}tdc1000:x:993:993:Compositor:/run/tdc1000:/bin/false\n\
+        tda65536:x:65536:65536:Browser:/var/lib/td/applications/65536:/bin/false\n",
+        PASSWD.replace(":Tester:", ":tester comment:")
+    );
+    let group = format!("{GROUP}tdc1000:x:993:\ntda65536:x:65536:\nteam:x:2000:tester,other\n");
+    let shadow = format!(
+        "{}tdc1000:!td-service:0:0:99999:7:::\n\
+        tda65536:!td-service:0:0:99999:7:::\n",
+        SHADOW.replace("tester::", "tester:opaque-tester-hash:")
+    );
+    let renamed = rename_primary_tables(&registry, &passwd, &group, &shadow, "alice").unwrap();
+    assert_eq!(
+        renamed.passwd,
+        passwd.replace(
+            "tester:x:1000:1000:tester comment:/home/tester:",
+            "alice:x:1000:1000:tester comment:/home/alice:"
+        )
+    );
+    assert_eq!(renamed.group, group.replace("tester", "alice"));
+    assert_eq!(renamed.shadow, shadow.replace("\ntester:", "\nalice:"));
+    assert_eq!(
+        registry.application_accounts(&renamed.passwd).unwrap(),
+        registry.application_accounts(&passwd).unwrap()
+    );
+    let again = rename_primary_tables(
+        &registry,
+        &renamed.passwd,
+        &renamed.group,
+        &renamed.shadow,
+        "alice",
+    )
+    .unwrap();
+    assert_eq!(again.passwd, renamed.passwd);
+    assert_eq!(again.group, renamed.group);
+    assert_eq!(again.shadow, renamed.shadow);
+    for name in ["root", "other", "wheel", "tdc1000", "tda99999", "../alice"] {
+        assert!(rename_primary_tables(&registry, &passwd, &group, &shadow, name).is_err());
+    }
+    let canonical = rename_primary_tables(
+        &registry,
+        &PASSWD.replace("/home/tester", "/var/home/tester"),
+        GROUP,
+        SHADOW,
+        "tester",
+    )
+    .unwrap();
+    assert_eq!(canonical.passwd, PASSWD);
+}
+
+#[test]
+fn primary_table_rename_preserves_near_matches_and_refuses_growth_past_the_bound() {
+    let registry = Registry::parse(TABLE).unwrap();
+    let passwd = format!("{PASSWD}tester2:x:2000:2000:Other:/home/tester2:/bin/sh\natester:x:2001:2001:Other:/home/atester:/bin/sh\n");
+    let group = format!("{GROUP}team:x:2000:tester2,tester,atester\n");
+    let shadow = format!("{SHADOW}tester2::0:0:99999:7:::\natester::0:0:99999:7:::\n");
+    let renamed = rename_primary_tables(&registry, &passwd, &group, &shadow, "alice").unwrap();
+    assert!(renamed
+        .group
+        .ends_with("team:x:2000:tester2,alice,atester\n"));
+    assert!(renamed.passwd.contains("\ntester2:x:2000:"));
+    assert!(renamed.passwd.contains("\natester:x:2001:"));
+    let bounded = SHADOW.replace(
+        "other::",
+        &format!("other:{}:", "x".repeat(MAX_BYTES - SHADOW.len())),
+    );
+    assert_eq!(bounded.len(), MAX_BYTES);
+    registry
+        .check_primary_name(PASSWD, GROUP, &bounded, "alexandria")
+        .unwrap();
+    let error = rename_primary_tables(&registry, PASSWD, GROUP, &bounded, "alexandria")
+        .err()
+        .unwrap();
+    assert!(error.contains("exceeds its bound"), "{error}");
+}
+
+struct AccountStageFixture(PathBuf);
+
+impl AccountStageFixture {
+    fn new() -> Self {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root =
+            std::env::temp_dir().join(format!("td-primary-stage-{}-{stamp}", std::process::id()));
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&root)
+            .unwrap();
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(root.join("etc"))
+            .unwrap();
+        for (name, contents, mode) in [
+            (TABLE_NAME, TABLE, 0o444),
+            ("passwd", PASSWD, 0o644),
+            ("group", GROUP, 0o644),
+            ("shadow", SHADOW, 0o600),
+        ] {
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(mode)
+                .open(root.join("etc").join(name))
+                .unwrap();
+            file.write_all(contents.as_bytes()).unwrap();
+            file.set_permissions(std::fs::Permissions::from_mode(mode))
+                .unwrap();
+        }
+        Self(root)
+    }
+}
+
+impl Drop for AccountStageFixture {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+#[test]
+fn primary_staging_creates_consistent_private_output_without_changing_the_source() {
+    let fixture = AccountStageFixture::new();
+    let output = fixture.0.join("prepared");
+    stage_primary_name(&fixture.0, "alice", &output).unwrap();
+    check_primary_name(&output, "alice").unwrap();
+    check_deployment(&output).unwrap();
+    assert_eq!(std::fs::metadata(&output).unwrap().mode() & 0o7777, 0o700);
+    assert_eq!(std::fs::metadata(output.join("etc")).unwrap().mode() & 0o7777, 0o755);
+    for (name, original, mode) in [
+        (TABLE_NAME, TABLE, 0o444),
+        ("passwd", PASSWD, 0o644),
+        ("group", GROUP, 0o644),
+        ("shadow", SHADOW, 0o600),
+    ] {
+        assert_eq!(
+            std::fs::read_to_string(fixture.0.join("etc").join(name)).unwrap(),
+            original
+        );
+        let path = output.join("etc").join(name);
+        let metadata = std::fs::symlink_metadata(&path).unwrap();
+        assert!(metadata.is_file());
+        assert_eq!(metadata.nlink(), 1);
+        assert_eq!(metadata.mode() & 0o7777, mode);
+        assert_eq!(metadata.uid(), std::fs::metadata(&fixture.0).unwrap().uid());
+    }
+    assert_eq!(
+        std::fs::read_to_string(output.join("etc/td-principals.tsv")).unwrap(),
+        TABLE
+    );
+    assert!(!output.join("var").exists());
+    let before = std::fs::read(output.join("etc/passwd")).unwrap();
+    assert!(stage_primary_name(&fixture.0, "bob", &output).is_err());
+    assert_eq!(std::fs::read(output.join("etc/passwd")).unwrap(), before);
+    let alias = fixture.0.join("alias");
+    std::os::unix::fs::symlink(&output, &alias).unwrap();
+    assert!(stage_primary_name(&fixture.0, "bob", &alias).is_err());
+    assert_eq!(std::fs::read(output.join("etc/passwd")).unwrap(), before);
+}
+
+#[test]
+fn primary_staging_refuses_bad_identity_or_writable_parent_before_creating_output() {
+    let fixture = AccountStageFixture::new();
+    let output = fixture.0.join("prepared");
+    for name in ["root", "other", "tdc1000", "invalid:name"] {
+        assert!(stage_primary_name(&fixture.0, name, &output).is_err());
+        assert!(!output.exists());
+    }
+    std::fs::write(
+        fixture.0.join("etc/group"),
+        GROUP.replace("10:tester", "10:tester,alice"),
+    )
+    .unwrap();
+    assert!(stage_primary_name(&fixture.0, "alice", &output).is_err());
+    assert!(!output.exists());
+    std::fs::write(fixture.0.join("etc/group"), GROUP).unwrap();
+    let weak = fixture.0.join("weak");
+    std::fs::create_dir(&weak).unwrap();
+    std::fs::set_permissions(&weak, std::fs::Permissions::from_mode(0o777)).unwrap();
+    assert!(stage_primary_name(&fixture.0, "alice", &weak.join("prepared")).is_err());
+    assert!(!weak.join("prepared").exists());
+    let linked = fixture.0.join("linked");
+    std::os::unix::fs::symlink(&fixture.0, &linked).unwrap();
+    assert!(stage_primary_name(&fixture.0, "alice", &linked.join("prepared")).is_err());
+    assert!(!output.exists());
+}
+
+#[test]
 fn primary_names_preserve_numeric_reservations_and_reject_identity_collisions() {
     let registry = Registry::parse(TABLE).unwrap();
     for name in ["tester", "alice", "a-b_2", "tda", "tdcarol", "tda99x", &"a".repeat(32)] {

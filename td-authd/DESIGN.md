@@ -257,6 +257,24 @@ The live enrollment path always requires root ownership. The current image
 declares one graphical session for uid 1000; adding another passwd account
 does not implicitly create a second graphical session.
 
+`td-firstboot stage-primary-name ROOT NAME OUT` is a preparation-only
+consumer of the same staged account validation. It validates name
+collisions, complete membership and the resulting renamed tables before
+writing a new private `OUT/etc`. It copies the reservation table unchanged
+and preserves credential/lock fields and numeric IDs, changing only the
+primary name, canonical home and matching group/member references. Its
+files have exact passwd/group 0644, shadow 0600 and reservations 0444 modes;
+its output root is 0700 and its `etc` directory 0755, independent of umask.
+Both remain outside the live account view. Staging requires a
+consistently owned parent without other writers and refuses an existing
+output. The invoking uid/gid must match the source owner, and `/proc` must
+be mounted for descriptor-relative access. Only a successful, synced
+staging result may be consumed; failure
+can leave a private partial output. This is neither enrollment nor live
+account publication, and grants no session or authentication authority.
+The caller must verify the source deployment and serialize any eventual
+activation before account consumers start.
+
 Account files have bounded, newline-terminated records: passwd has seven
 colon-separated fields and group four, both with `x` in the password field;
 shadow has nine. Comments, blank records, extra fields, duplicate names or

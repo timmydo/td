@@ -2,9 +2,9 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{File, OpenOptions};
-use std::io::Read;
+use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 #[path = "../../engine/src/principals.rs"]
@@ -105,6 +105,156 @@ pub(crate) fn check_primary_name(root: &Path, name: &str) -> Result<(), String> 
         &read_root_file(&etc, "shadow", Some(0o600))?,
         name,
     )
+}
+
+/// Prepare account data only; the caller owns deployment verification and activation.
+pub(crate) fn stage_primary_name(root: &Path, name: &str, output: &Path) -> Result<(), String> {
+    primary_account::validate_name(name).map_err(|error| error.to_string())?;
+    let etc = etc_directory(root, None)?;
+    let owner = etc.metadata().map_err(|error| error.to_string())?;
+    let table = read_root_file(&etc, TABLE_NAME, Some(0o444))?;
+    let registry = Registry::parse(&table)?;
+    let tables = rename_primary_tables(
+        &registry,
+        &read_root_file(&etc, "passwd", Some(0o644))?,
+        &read_root_file(&etc, "group", Some(0o644))?,
+        &read_root_file(&etc, "shadow", Some(0o600))?,
+        name,
+    )?;
+    let leaf = output
+        .file_name()
+        .ok_or("account staging output needs a directory name")?;
+    let parent = output
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let parent = root_directory(parent, Some((owner.uid(), owner.gid())))?;
+    let destination = PathBuf::from(format!("/proc/self/fd/{}", parent.as_raw_fd())).join(leaf);
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&destination)
+        .map_err(|error| format!("create new account staging directory: {error}"))?;
+    // The pinned parent excludes other writers; restore owner access before open.
+    std::fs::set_permissions(&destination, std::fs::Permissions::from_mode(0o700))
+        .map_err(|error| format!("set private account staging mode: {error}"))?;
+    let destination = root_directory(&destination, Some((owner.uid(), owner.gid())))?;
+    let pinned = PathBuf::from(format!("/proc/self/fd/{}", destination.as_raw_fd()));
+    std::fs::DirBuilder::new()
+        .mode(0o755)
+        .create(pinned.join("etc"))
+        .map_err(|error| format!("create staged account directory: {error}"))?;
+    std::fs::set_permissions(pinned.join("etc"), std::fs::Permissions::from_mode(0o755))
+        .map_err(|error| format!("set staged account directory mode: {error}"))?;
+    let staged = root_directory(&pinned.join("etc"), Some((owner.uid(), owner.gid())))?;
+    for (file_name, contents, mode) in [
+        (TABLE_NAME, table.as_str(), 0o444),
+        ("passwd", tables.passwd.as_str(), 0o644),
+        ("group", tables.group.as_str(), 0o644),
+        ("shadow", tables.shadow.as_str(), 0o600),
+    ] {
+        let path = format!("/proc/self/fd/{}/{file_name}", staged.as_raw_fd());
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .custom_flags(O_NOFOLLOW | O_NONBLOCK)
+            .mode(mode)
+            .open(path)
+            .map_err(|error| format!("create staged {file_name}: {error}"))?;
+        file.write_all(contents.as_bytes())
+            .and_then(|()| file.set_permissions(std::fs::Permissions::from_mode(mode)))
+            .and_then(|()| file.sync_all())
+            .map_err(|error| format!("write staged {file_name}: {error}"))?;
+    }
+    staged
+        .sync_all()
+        .and_then(|()| destination.sync_all())
+        .and_then(|()| parent.sync_all())
+        .map_err(|error| format!("sync staged account tables: {error}"))
+}
+
+struct PrimaryTables {
+    passwd: String,
+    group: String,
+    shadow: String,
+}
+
+fn append_account_row(output: &mut String, fields: &[&str]) -> Result<(), String> {
+    let row = fields.join(":");
+    if output.len().saturating_add(row.len()).saturating_add(1) > MAX_BYTES {
+        return Err("renamed account table exceeds its bound".into());
+    }
+    output.push_str(&row);
+    output.push('\n');
+    Ok(())
+}
+
+fn rename_primary_tables(
+    registry: &Registry,
+    passwd: &str,
+    group: &str,
+    shadow: &str,
+    name: &str,
+) -> Result<PrimaryTables, String> {
+    registry.check_primary_name(passwd, group, shadow, name)?;
+    let primary = primary_account::parse(passwd).map_err(|error| error.to_string())?;
+    let home = format!("/home/{name}");
+    let mut result = PrimaryTables {
+        passwd: String::new(),
+        group: String::new(),
+        shadow: String::new(),
+    };
+    for row in account_rows(passwd)? {
+        let [account, password, uid, gid, comment, old_home, shell] = row.as_slice() else {
+            return Err("invalid primary-name passwd row".into());
+        };
+        let (account, home) = if *account == primary.name() {
+            (name, home.as_str())
+        } else {
+            (*account, *old_home)
+        };
+        append_account_row(
+            &mut result.passwd,
+            &[account, password, uid, gid, comment, home, shell],
+        )?;
+    }
+    for row in account_rows(group)? {
+        let [account, password, gid, members] = row.as_slice() else {
+            return Err("invalid primary-name group row".into());
+        };
+        let account = if *account == primary.name() {
+            name
+        } else {
+            *account
+        };
+        let members = members
+            .split(',')
+            .map(|member| {
+                if member == primary.name() {
+                    name
+                } else {
+                    member
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        append_account_row(&mut result.group, &[account, password, gid, &members])?;
+    }
+    for row in account_rows(shadow)? {
+        let Some((account, fields)) = row.split_first() else {
+            return Err("missing shadow account name".into());
+        };
+        let account = if *account == primary.name() {
+            name
+        } else {
+            *account
+        };
+        let mut renamed = Vec::with_capacity(row.len());
+        renamed.push(account);
+        renamed.extend_from_slice(fields);
+        append_account_row(&mut result.shadow, &renamed)?;
+    }
+    registry.check_primary_name(&result.passwd, &result.group, &result.shadow, name)?;
+    Ok(result)
 }
 
 fn account_rows(text: &str) -> Result<Vec<Vec<&str>>, String> {
