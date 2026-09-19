@@ -1631,6 +1631,212 @@ fn the_command_line_probes_and_develops_without_overwriting() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[test]
+fn the_command_line_exports_into_the_rolls_folder() {
+    use std::ffi::OsStr;
+    let dir = scratch("export");
+    let roll = dir.join("roll");
+    std::fs::create_dir(&roll).unwrap();
+    // A smooth frame, so the JPEG round trip is held to a tight tolerance.
+    let (w, h) = (64usize, 32usize);
+    let samples: Vec<u16> = (0..w * h)
+        .map(|i| 1100 + 40 * (i % w) as u16 + 60 * (i / w) as u16)
+        .collect();
+    let file = roll.join("DSC_0001.NEF");
+    let bytes = Synth::lossless(w, h, &samples).build();
+    std::fs::write(&file, &bytes).unwrap();
+    let exported = roll.join("exported");
+    let listing = || -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(&exported)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    };
+
+    let (ok, stdout, stderr) = run(&[OsStr::new("export"), file.as_os_str()]);
+    assert!(ok, "{stderr}");
+    assert!(stdout.contains("exported 64x32 -> 60x28 into"), "{stdout}");
+    assert!(stdout.contains("DSC_0001.jpg"), "{stdout}");
+    assert_eq!(listing(), ["DSC_0001.jpg"]);
+    let first = std::fs::read(exported.join("DSC_0001.jpg")).unwrap();
+    let decoded = td_photo::jpeg::decode(&first, td_photo::jpeg::Scale::Full).unwrap();
+    assert_eq!((decoded.width, decoded.height), (60, 28));
+    // Against the in-process export of the same frame, whole, at the
+    // camera's white balance and defaults: the verb is the pipeline the
+    // library exposes, band by band, then the encoder.
+    let nef = nef::parse(&bytes).unwrap();
+    let raw = nef::decode(&nef, &bytes).unwrap();
+    let camera = td_photo::camera::find(&nef.make, &nef.model).unwrap();
+    let color = td_photo::color::camera_color(&camera.xyz_to_cam).unwrap();
+    let source = td_photo::develop::Source {
+        decoded: &raw,
+        cfa: nef.raw.cfa,
+        crop: nef.crop(),
+        black: nef.maker.black.unwrap_or(camera.black),
+        white: camera.white,
+    };
+    let (r, b) = nef.maker.wb.unwrap();
+    let export = td_photo::develop::export_geometry(&source, None, nef.orientation).unwrap();
+    let expected = td_photo::develop::export_band(
+        &source,
+        &export,
+        0,
+        export.height,
+        [r, 1.0, b],
+        &color,
+        &td_photo::color::Transfer::srgb(),
+        &td_photo::develop::Params {
+            exposure: 0.0,
+            threads: 2,
+            look: None,
+        },
+    )
+    .unwrap();
+    assert_eq!((expected.width, expected.height), (60, 28));
+    let worst = decoded
+        .data
+        .iter()
+        .zip(expected.data.iter())
+        .map(|(a, b)| (i32::from(*a) - i32::from(*b)).abs())
+        .max()
+        .unwrap();
+    assert!(worst <= 12, "worst {worst}");
+    let mean = |image: &[u8]| image.iter().map(|v| u64::from(*v)).sum::<u64>() / image.len() as u64;
+    assert!(mean(&decoded.data) > 20, "{}", mean(&decoded.data));
+
+    // A second and third export take the next free numbers; the first is
+    // untouched.
+    let (ok, stdout, stderr) = run(&[OsStr::new("export"), file.as_os_str()]);
+    assert!(ok, "{stderr}");
+    assert!(stdout.contains("DSC_0001-2.jpg"), "{stdout}");
+    let (ok, _, stderr) = run(&[OsStr::new("export"), file.as_os_str()]);
+    assert!(ok, "{stderr}");
+    assert_eq!(
+        listing(),
+        ["DSC_0001-2.jpg", "DSC_0001-3.jpg", "DSC_0001.jpg"]
+    );
+    assert_eq!(std::fs::read(exported.join("DSC_0001.jpg")).unwrap(), first);
+    assert_eq!(
+        std::fs::read(exported.join("DSC_0001-2.jpg")).unwrap(),
+        first
+    );
+    // A gap is filled: the free number is the first, not one past the last.
+    std::fs::remove_file(exported.join("DSC_0001-2.jpg")).unwrap();
+    let (ok, stdout, _) = run(&[OsStr::new("export"), file.as_os_str()]);
+    assert!(ok);
+    assert!(stdout.contains("DSC_0001-2.jpg"), "{stdout}");
+
+    // The sidecar's edits are the export's: exposure brightens, a look
+    // applies, a crop selects, each in the next free name.
+    let sidecar = roll.join("DSC_0001.NEF.edit");
+    std::fs::write(&sidecar, "td-photo edit 1\nexposure 1.00\n").unwrap();
+    let (ok, stdout, stderr) = run(&[OsStr::new("export"), file.as_os_str()]);
+    assert!(ok, "{stderr}");
+    assert!(stdout.contains("DSC_0001-4.jpg"), "{stdout}");
+    let brighter = td_photo::jpeg::decode(
+        &std::fs::read(exported.join("DSC_0001-4.jpg")).unwrap(),
+        td_photo::jpeg::Scale::Full,
+    )
+    .unwrap();
+    assert!(mean(&brighter.data) > mean(&decoded.data) + 10);
+    std::fs::write(&sidecar, "td-photo edit 1\nlook mono\n").unwrap();
+    let (ok, stdout, stderr) = run(&[OsStr::new("export"), file.as_os_str()]);
+    assert!(ok, "{stderr}");
+    assert!(stdout.contains("DSC_0001-5.jpg"), "{stdout}");
+    let mono = td_photo::jpeg::decode(
+        &std::fs::read(exported.join("DSC_0001-5.jpg")).unwrap(),
+        td_photo::jpeg::Scale::Full,
+    )
+    .unwrap();
+    assert!(mono.data.chunks(3).all(|p| p[0] == p[1] && p[1] == p[2]));
+    std::fs::write(
+        &sidecar,
+        "td-photo edit 1\ncrop 0.2000 0.3000 0.5000 0.4000\n",
+    )
+    .unwrap();
+    let (ok, stdout, stderr) = run(&[OsStr::new("export"), file.as_os_str()]);
+    assert!(ok, "{stderr}");
+    assert!(stdout.contains("-> 30x11 into"), "{stdout}");
+    let count = listing().len();
+
+    // A sidecar the reader refuses, and a look it cannot find, refuse the
+    // export before anything is written: the edits are not dropped.
+    std::fs::write(&sidecar, "td-photo edit 1\nflag maybe\n").unwrap();
+    let (ok, _, stderr) = run(&[OsStr::new("export"), file.as_os_str()]);
+    assert!(!ok);
+    assert!(stderr.contains("DSC_0001.NEF.edit"), "{stderr}");
+    std::fs::write(&sidecar, "td-photo edit 1\nlook no-such-look\n").unwrap();
+    let (ok, _, stderr) = run(&[OsStr::new("export"), file.as_os_str()]);
+    assert!(!ok);
+    assert!(stderr.contains("no-such-look"), "{stderr}");
+    std::fs::remove_file(&sidecar).unwrap();
+    // A stale temporary is reported, not reused or removed.
+    let stale = exported.join("DSC_0001.jpg.tmp");
+    std::fs::write(&stale, b"mine").unwrap();
+    let (ok, _, stderr) = run(&[OsStr::new("export"), file.as_os_str()]);
+    assert!(!ok);
+    assert!(stderr.contains("DSC_0001.jpg.tmp"), "{stderr}");
+    assert_eq!(std::fs::read(&stale).unwrap(), b"mine");
+    std::fs::remove_file(&stale).unwrap();
+    assert_eq!(listing().len(), count);
+    // Not an original, a stray argument and no FILE are refused by name.
+    let notes = roll.join("notes.txt");
+    std::fs::write(&notes, b"x").unwrap();
+    let (ok, _, stderr) = run(&[OsStr::new("export"), notes.as_os_str()]);
+    assert!(!ok);
+    assert!(stderr.contains("not a NEF original"), "{stderr}");
+    let (ok, _, stderr) = run(&[
+        OsStr::new("export"),
+        file.as_os_str(),
+        OsStr::new("--bogus"),
+    ]);
+    assert!(!ok);
+    assert!(stderr.contains("unrecognized argument"), "{stderr}");
+    let (ok, _, stderr) = run(&[OsStr::new("export")]);
+    assert!(!ok);
+    assert!(stderr.contains("export needs FILE"), "{stderr}");
+    assert_eq!(listing().len(), count);
+
+    // A turned frame exports turned, and a folder that cannot be is
+    // refused.
+    let other = dir.join("other");
+    std::fs::create_dir(&other).unwrap();
+    let turned = other.join("DSC_0002.NEF");
+    let mut synth = Synth::lossless(w, h, &samples);
+    synth.orientation = 6;
+    std::fs::write(&turned, synth.build()).unwrap();
+    let (ok, stdout, stderr) = run(&[OsStr::new("export"), turned.as_os_str()]);
+    assert!(ok, "{stderr}");
+    assert!(stdout.contains("-> 28x60 into"), "{stdout}");
+    let blocked = dir.join("blocked");
+    std::fs::create_dir(&blocked).unwrap();
+    std::fs::write(blocked.join("exported"), b"a file").unwrap();
+    let third = blocked.join("DSC_0003.NEF");
+    std::fs::write(&third, &bytes).unwrap();
+    let (ok, _, stderr) = run(&[OsStr::new("export"), third.as_os_str()]);
+    assert!(!ok);
+    assert!(stderr.contains("exported"), "{stderr}");
+    assert_eq!(std::fs::read(blocked.join("exported")).unwrap(), b"a file");
+    // A link at `exported`, even to a folder, is refused by name: the
+    // export stays in the roll's own folder.
+    let linked = dir.join("linked");
+    std::fs::create_dir(&linked).unwrap();
+    let elsewhere = dir.join("elsewhere");
+    std::fs::create_dir(&elsewhere).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, linked.join("exported")).unwrap();
+    let fourth = linked.join("DSC_0004.NEF");
+    std::fs::write(&fourth, &bytes).unwrap();
+    let (ok, _, stderr) = run(&[OsStr::new("export"), fourth.as_os_str()]);
+    assert!(!ok);
+    assert!(stderr.contains("not a directory"), "{stderr}");
+    assert_eq!(std::fs::read_dir(&elsewhere).unwrap().count(), 0);
+    // The originals are as they were.
+    assert_eq!(std::fs::read(&file).unwrap(), bytes);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// FNV-1a over bytes as they lie, for PPM payloads.
 fn fnv1a64_bytes(bytes: &[u8]) -> u64 {
     let mut hash: u64 = 0xcbf29ce484222325;

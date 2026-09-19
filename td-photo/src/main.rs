@@ -48,6 +48,13 @@ const HELP: &str = concat!(
     "  the whole frame), written through a fresh\n",
     "  OUT.ppm.tmp and linked into place. OUT.ppm must not exist: td-photo\n",
     "  never overwrites a file.\n",
+    "td-photo export FILE\n",
+    "  Renders FILE's raw at full resolution (a bilinear demosaic, in row\n",
+    "  bands) with its sidecar's exposure, crop and look, and writes it as\n",
+    "  a JPEG (quality 92, 4:4:4) into exported/ beside FILE: STEM.jpg, or\n",
+    "  STEM-2.jpg, STEM-3.jpg ... when that name is taken, through a fresh\n",
+    "  STEM.jpg.tmp linked into place. Never overwrites, and a sidecar the\n",
+    "  reader refuses refuses the export rather than dropping its edits.\n",
     "td-photo thumb FILE OUT.ppm [--long-edge N] [--cache]\n",
     "  Writes the thumbnail: the smallest embedded preview that covers N\n",
     "  pixels on the long side (default 400), decoded at the coarsest\n",
@@ -122,6 +129,8 @@ fn main() -> ExitCode {
         [verb, ..] if verb == "develop" => {
             Err("develop needs FILE and OUT.ppm; see --help".to_string())
         }
+        [verb, file, rest @ ..] if verb == "export" => export(Path::new(file), rest),
+        [verb] if verb == "export" => Err("export needs FILE; see --help".to_string()),
         [verb, file, out, rest @ ..] if verb == "thumb" => {
             thumb_file(Path::new(file), Path::new(out), rest)
         }
@@ -567,6 +576,17 @@ impl RawFrame {
         self.meta
     }
 
+    /// The frame as the demosaics read it.
+    fn source(&self) -> develop::Source<'_> {
+        develop::Source {
+            decoded: &self.decoded,
+            cfa: self.cfa,
+            crop: self.crop,
+            black: self.black,
+            white: self.white,
+        }
+    }
+
     /// What the frame costs the raw cache, the CFA samples dominating: two
     /// bytes a sample, so the cache's byte budget bounds how many frames it
     /// holds.
@@ -800,6 +820,160 @@ fn develop_preview(
             None
         }
     }
+}
+
+// ----------------------------------------------------------------- export
+
+/// Rows per export band: a multiple of the encoder's block row, and a few
+/// of them, so a band's transform spreads over the pool while the band
+/// stays small beside the frame.
+const EXPORT_BAND_ROWS: usize = 64;
+/// Numbered names tried for one export before it gives up.
+const MAX_EXPORT_NAMES: u32 = 1000;
+
+/// `td-photo export FILE`: the original developed at full resolution
+/// through its sidecar and written as a JPEG into `exported/` beside it,
+/// under its stem, or the stem with the first free number from 2 when
+/// that name is taken. The frame is developed a band of rows at a time
+/// (`develop::export_band`) straight into the encoder, so no whole-frame
+/// RGB buffer is held; the stream goes through a fresh `STEM.jpg.tmp`,
+/// synced, then linked to the first free name, so a name that appears
+/// meanwhile is skipped rather than replaced.
+fn export(path: &Path, rest: &[OsString]) -> Result<(), String> {
+    check_flags(rest, &[], &[])?;
+    original(path)?;
+    // A refused sidecar refuses the export: developing with camera defaults
+    // would silently drop the edits the file holds.
+    let sidecar = read_sidecar(path)?;
+    let look = match sidecar.look() {
+        Some(stem) => Some(find_look(stem)?),
+        None => None,
+    };
+    let stops = sidecar.exposure().unwrap_or(0) as f32 / 100.0;
+    let crop = sidecar.crop().map(crop_fractions);
+    let stem = path
+        .file_stem()
+        .and_then(OsStr::to_str)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| format!("{}: no stem to name the export by", path.display()))?
+        .to_owned();
+    let roll = match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
+        _ => PathBuf::from("."),
+    };
+    let threads = threads();
+    let started = Instant::now();
+    let (raw, info) = decode_raw(path)?;
+    let source = raw.source();
+    let meta = raw.meta();
+    let geometry = develop::export_geometry(&source, crop, meta.orientation)
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    // The folder is made once there is something to put in it, so a raw
+    // that cannot be developed leaves the roll as it was.
+    let dir = roll.join(library::EXPORTED);
+    match fs::create_dir(&dir) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(format!("{}: {e}", dir.display())),
+    }
+    // By name, not through a link: a link at `exported` would carry the
+    // export elsewhere, and the folder is the roll's own.
+    if !fs::symlink_metadata(&dir)
+        .map(|m| m.is_dir())
+        .unwrap_or(false)
+    {
+        return Err(format!("{}: not a directory", dir.display()));
+    }
+    let temporary = dir.join(format!("{stem}.jpg.tmp"));
+    let file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)
+        .map_err(|e| format!("{}: {e}", temporary.display()))?;
+    let transfer = Transfer::srgb();
+    let params = Params {
+        exposure: stops,
+        threads,
+        look: look.as_ref(),
+    };
+    let write = |file: fs::File| -> Result<(), String> {
+        let mut writer = BufWriter::new(file);
+        let mut encoder =
+            jpeg::Encoder::new(geometry.width, geometry.height, jpeg::QUALITY, threads)
+                .map_err(|e| e.to_string())?;
+        let mut first = 0;
+        while first < geometry.height {
+            let band = develop::export_band(
+                &source,
+                &geometry,
+                first,
+                EXPORT_BAND_ROWS,
+                meta.wb,
+                &meta.color,
+                &transfer,
+                &params,
+            )
+            .map_err(|e| e.to_string())?;
+            encoder.encode_rows(&band.data).map_err(|e| e.to_string())?;
+            writer
+                .write_all(&encoder.take())
+                .map_err(|e| e.to_string())?;
+            first += band.height;
+        }
+        let tail = encoder.finish().map_err(|e| e.to_string())?;
+        writer.write_all(&tail).map_err(|e| e.to_string())?;
+        writer
+            .into_inner()
+            .map_err(|e| e.into_error().to_string())?
+            .sync_all()
+            .map_err(|e| e.to_string())
+    };
+    // The temporary is ours to remove on any failure: created exclusively
+    // above, so nothing that was there before is touched.
+    if let Err(why) = write(file) {
+        let _ = fs::remove_file(&temporary);
+        return Err(format!("{}: {why}", temporary.display()));
+    }
+    let mut published = None;
+    for n in 1..=MAX_EXPORT_NAMES {
+        let name = if n == 1 {
+            format!("{stem}.jpg")
+        } else {
+            format!("{stem}-{n}.jpg")
+        };
+        let out = dir.join(name);
+        match publish(&temporary, &out) {
+            Ok(()) => {
+                published = Some(out);
+                break;
+            }
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(e) => {
+                let _ = fs::remove_file(&temporary);
+                return Err(format!("{}: {e}", out.display()));
+            }
+        }
+    }
+    let Some(out) = published else {
+        let _ = fs::remove_file(&temporary);
+        return Err(format!(
+            "{}: {MAX_EXPORT_NAMES} names for {stem} are taken",
+            dir.display()
+        ));
+    };
+    writeln!(
+        io::stdout().lock(),
+        "exported {}x{} -> {}x{} into {} ({} corrupt samples; decode {} ms, total {} ms)",
+        info.raw_width,
+        info.raw_height,
+        geometry.width,
+        geometry.height,
+        out.display(),
+        info.corrupt,
+        info.decode_ms,
+        started.elapsed().as_millis()
+    )
+    .map_err(|e| e.to_string())
 }
 
 /// The never-overwrite rule, checked by name: anything at `out` (a file, a

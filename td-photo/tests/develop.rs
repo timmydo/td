@@ -16,7 +16,8 @@ use td_photo::color::{
     self, apply, camera_color, invert, multiply, srgb_encode, Transfer, MIDDLE_GREY,
 };
 use td_photo::develop::{
-    self, fit, level2, level3, orient, resample, resample_u16, superpixel, Level1, Level2, Params,
+    self, bilinear, export_band, export_geometry, fit, level2, level3, orient, resample,
+    resample_u16, superpixel, Export, Level1, Level2, Params, Region, Source,
 };
 use td_photo::image::Rgb8;
 use td_photo::look::Look;
@@ -998,4 +999,411 @@ fn fit_clamps_hostile_axes_before_multiplying() {
     assert_eq!(fit(1, usize::MAX, 3), (1, 3));
     assert_eq!(fit(0, 0, 100), (1, 1));
     assert_eq!(fit(3000, 2000, 1500), (1500, 1000));
+}
+
+// ------------------------------------------------------------------ export
+
+fn full(w: usize, h: usize) -> Crop {
+    Crop {
+        left: 0,
+        top: 0,
+        width: w,
+        height: h,
+    }
+}
+
+fn region(left: usize, top: usize, width: usize, height: usize) -> Region {
+    Region {
+        left,
+        top,
+        width,
+        height,
+    }
+}
+
+/// A frame whose photosites hold a value by channel, so every demosaiced
+/// pixel is the same triple wherever it is.
+fn by_channel(w: usize, h: usize, cfa: Cfa, values: [u16; 3]) -> Decoded {
+    let mut samples = Vec::with_capacity(w * h);
+    for y in 0..h {
+        for x in 0..w {
+            samples.push(values[cfa.at(x, y) as usize]);
+        }
+    }
+    frame(w, h, samples)
+}
+
+#[test]
+fn bilinear_keeps_the_sample_and_averages_each_other_channel() {
+    // Constant per channel: every pixel, edges included, is the triple.
+    let decoded = by_channel(6, 4, Cfa::RGGB, [100, 200, 300]);
+    let source = Source {
+        decoded: &decoded,
+        cfa: Cfa::RGGB,
+        crop: full(6, 4),
+        black: 0,
+        white: 1000,
+    };
+    let level = bilinear(&source, region(0, 0, 6, 4), 3).unwrap();
+    assert_eq!((level.width, level.height), (6, 4));
+    let scaled = |v: u32| (v * 65535 / 1000) as u16;
+    for px in level.rgb.as_chunks::<3>().0 {
+        assert_eq!(*px, [scaled(100), scaled(200), scaled(300)]);
+    }
+    // One bright green site at (1, 0) over zeros: its neighbours take it
+    // in their green with the rounded mean over the neighbours they have,
+    // the edge pixels fewer of them.
+    let mut samples = vec![0u16; 16];
+    samples[1] = 1000;
+    let decoded = frame(4, 4, samples);
+    let source = Source {
+        decoded: &decoded,
+        crop: full(4, 4),
+        ..source
+    };
+    let level = bilinear(&source, region(0, 0, 4, 4), 1).unwrap();
+    let at = |x: usize, y: usize| -> [u16; 3] {
+        let i = (y * 4 + x) * 3;
+        [level.rgb[i], level.rgb[i + 1], level.rgb[i + 2]]
+    };
+    // (0,0) is red: greens at (1,0) and (0,1), so (1000 + 0 + 1) / 2.
+    assert_eq!(at(0, 0), [0, scaled(500), 0]);
+    // (2,0) is red: greens at (1,0), (3,0) and (2,1), so (1000 + 1) / 3.
+    assert_eq!(at(2, 0), [0, scaled(333), 0]);
+    // (1,0) itself keeps its green; its reds (0,0), (2,0) and blue (1,1)
+    // are zero.
+    assert_eq!(at(1, 0), [0, scaled(1000), 0]);
+    // (1,1) is blue: greens at (0,1), (2,1), (1,0), (1,2): 1000 / 4.
+    assert_eq!(at(1, 1), [0, scaled(250), 0]);
+    // (0,1) is green: its reds are (0,0), (0,2), its blues (1,1): none of
+    // them the bright site, and its own green is zero.
+    assert_eq!(at(0, 1), [0, 0, 0]);
+    // Two rows down nothing sees it.
+    assert_eq!(at(1, 2), [0, 0, 0]);
+    assert_eq!(at(3, 3), [0, 0, 0]);
+}
+
+#[test]
+fn bilinear_of_a_region_is_that_window_of_the_whole_and_reads_the_crop_origin() {
+    // A varying frame under an offset crop, so the region's window and the
+    // absolute CFA phase both show.
+    let (w, h) = (12usize, 10usize);
+    let samples: Vec<u16> = (0..w * h)
+        .map(|i| ((i as u32 * 7919 + 13) % 2000) as u16)
+        .collect();
+    let decoded = frame(w, h, samples);
+    let crop = Crop {
+        left: 1,
+        top: 1,
+        width: 10,
+        height: 8,
+    };
+    let source = Source {
+        decoded: &decoded,
+        cfa: Cfa::RGGB,
+        crop,
+        black: 10,
+        white: 2010,
+    };
+    let whole = bilinear(&source, region(0, 0, 10, 8), 4).unwrap();
+    let window = bilinear(&source, region(2, 3, 5, 4), 1).unwrap();
+    assert_eq!((window.width, window.height), (5, 4));
+    for y in 0..4 {
+        let from = ((y + 3) * 10 + 2) * 3;
+        assert_eq!(
+            &window.rgb[y * 15..(y + 1) * 15],
+            &whole.rgb[from..from + 15],
+            "row {y}"
+        );
+    }
+    // The crop's own origin is a blue site of the RGGB grid (1, 1), so the
+    // whole's first pixel keeps its sample as blue, not red: the phase is
+    // the sensor's, not the crop's.
+    let b = u32::from(decoded.samples[w + 1]) - 10;
+    assert_eq!(whole.rgb[2], (b * 65535 / 2000) as u16);
+    // The whole on one thread and on many is the same.
+    let one = bilinear(&source, region(0, 0, 10, 8), 1).unwrap();
+    assert_eq!(one, whole);
+}
+
+#[test]
+fn bilinear_refuses_bad_regions_levels_and_buffers() {
+    let decoded = by_channel(8, 8, Cfa::RGGB, [1, 2, 3]);
+    let source = Source {
+        decoded: &decoded,
+        cfa: Cfa::RGGB,
+        crop: full(8, 8),
+        black: 0,
+        white: 100,
+    };
+    for (bad, why) in [
+        (region(0, 0, 9, 8), "past the right"),
+        (region(0, 1, 8, 8), "past the bottom"),
+        (region(0, 0, 0, 8), "no width"),
+        (region(0, 0, 8, 0), "no height"),
+        (region(usize::MAX, 0, 1, 1), "overflowing left"),
+    ] {
+        assert_eq!(
+            bilinear(&source, bad, 1).unwrap_err(),
+            develop::Error::Crop,
+            "{why}"
+        );
+    }
+    let levels = Source {
+        black: 100,
+        ..source
+    };
+    assert_eq!(
+        bilinear(&levels, region(0, 0, 8, 8), 1).unwrap_err(),
+        develop::Error::Levels
+    );
+    let short = frame(8, 8, vec![0; 63]);
+    let short = Source {
+        decoded: &short,
+        ..source
+    };
+    assert_eq!(
+        bilinear(&short, region(0, 0, 8, 8), 1).unwrap_err(),
+        develop::Error::Size
+    );
+    let crop = Source {
+        crop: full(9, 8),
+        ..source
+    };
+    assert_eq!(
+        bilinear(&crop, region(0, 0, 8, 8), 1).unwrap_err(),
+        develop::Error::Crop
+    );
+}
+
+#[test]
+fn export_geometry_maps_the_crop_through_the_orientation() {
+    let decoded = by_channel(8, 6, Cfa::RGGB, [1, 2, 3]);
+    let source = Source {
+        decoded: &decoded,
+        cfa: Cfa::RGGB,
+        crop: full(8, 6),
+        black: 0,
+        white: 100,
+    };
+    assert_eq!(
+        export_geometry(&source, None, 1).unwrap(),
+        Export {
+            region: region(0, 0, 8, 6),
+            width: 8,
+            height: 6,
+            orientation: 1,
+        }
+    );
+    assert_eq!(
+        export_geometry(&source, None, 6).unwrap(),
+        Export {
+            region: region(0, 0, 8, 6),
+            width: 6,
+            height: 8,
+            orientation: 6,
+        }
+    );
+    let fractions = [0.25f32, 0.5, 0.5, 0.5];
+    // Upright: x 2, y 3, 4 by 3.
+    assert_eq!(
+        export_geometry(&source, Some(fractions), 1).unwrap(),
+        Export {
+            region: region(2, 3, 4, 3),
+            width: 4,
+            height: 3,
+            orientation: 1,
+        }
+    );
+    // A quarter turn clockwise: the oriented axes are 6 by 8, so the crop
+    // is x 2, y 4, 3 by 4 there, and lands at (4, 1), 4 by 3 in the sensor,
+    // as level 2 maps it; the output is the crop's oriented 3 by 4.
+    assert_eq!(
+        export_geometry(&source, Some(fractions), 6).unwrap(),
+        Export {
+            region: region(4, 1, 4, 3),
+            width: 3,
+            height: 4,
+            orientation: 6,
+        }
+    );
+    // Half way round: the crop's far corner from the sensor's, 4 by 3 at
+    // (2, 0).
+    assert_eq!(
+        export_geometry(&source, Some(fractions), 3).unwrap(),
+        Export {
+            region: region(2, 0, 4, 3),
+            width: 4,
+            height: 3,
+            orientation: 3,
+        }
+    );
+    // A quarter turn anticlockwise: the oriented crop x 2, y 4, 3 by 4
+    // lands at (0, 2), 4 by 3.
+    assert_eq!(
+        export_geometry(&source, Some(fractions), 8).unwrap(),
+        Export {
+            region: region(0, 2, 4, 3),
+            width: 3,
+            height: 4,
+            orientation: 8,
+        }
+    );
+    assert_eq!(
+        export_geometry(&source, Some([1.0, 0.0, 0.5, 0.5]), 1).unwrap_err(),
+        develop::Error::Crop
+    );
+}
+
+#[test]
+fn export_bands_concatenate_to_the_whole_at_every_orientation() {
+    // A frame varying on both axes, so a band taken from the wrong place or
+    // turned the wrong way shows; the whole in one band is the oracle for
+    // every band size, and the upright export turned by `orient` is the
+    // oracle for each orientation, since the per-pixel pipeline commutes
+    // with the turn.
+    let (w, h) = (14usize, 10usize);
+    let samples: Vec<u16> = (0..w * h)
+        .map(|i| {
+            let (x, y) = (i % w, i / w);
+            1100 + 40 * x as u16 + 60 * y as u16 + ((i * 31) % 17) as u16
+        })
+        .collect();
+    let decoded = frame(w, h, samples);
+    let source = Source {
+        decoded: &decoded,
+        cfa: Cfa::RGGB,
+        crop: Crop {
+            left: 1,
+            top: 1,
+            width: 12,
+            height: 8,
+        },
+        black: 1008,
+        white: 15892,
+    };
+    let color = camera_color(&z8().xyz_to_cam).unwrap();
+    let transfer = Transfer::srgb();
+    let params = Params {
+        exposure: 2.5,
+        threads: 3,
+        look: None,
+    };
+    let whole = |crop: Option<[f32; 4]>, orientation: u16| -> Rgb8 {
+        let export = export_geometry(&source, crop, orientation).unwrap();
+        export_band(
+            &source,
+            &export,
+            0,
+            export.height,
+            color.daylight,
+            &color,
+            &transfer,
+            &params,
+        )
+        .unwrap()
+    };
+    for crop in [None, Some([0.25f32, 0.125, 0.5, 0.75])] {
+        let upright = whole(crop, 1);
+        for orientation in [1u16, 3, 6, 8] {
+            let export = export_geometry(&source, crop, orientation).unwrap();
+            let expected = whole(crop, orientation);
+            assert_eq!(
+                (expected.width, expected.height),
+                (export.width, export.height)
+            );
+            // Against the turned upright export, when the crop is turned
+            // with it: the same region of the sensor either way only for
+            // no crop, since a crop is fractions of the oriented image.
+            if crop.is_none() {
+                assert_eq!(
+                    orient(upright.clone(), orientation),
+                    expected,
+                    "{orientation}"
+                );
+            }
+            for rows in [1usize, 3, 8, 64] {
+                let mut joined = Rgb8::new(export.width, export.height).unwrap();
+                joined.data.clear();
+                let mut first = 0;
+                while first < export.height {
+                    let band = export_band(
+                        &source,
+                        &export,
+                        first,
+                        rows,
+                        color.daylight,
+                        &color,
+                        &transfer,
+                        &params,
+                    )
+                    .unwrap();
+                    assert_eq!(band.width, export.width);
+                    assert_eq!(band.height, rows.min(export.height - first));
+                    joined.data.extend_from_slice(&band.data);
+                    first += band.height;
+                }
+                assert_eq!(joined, expected, "orientation {orientation} rows {rows}");
+            }
+            // Past the end, and no rows, are refused.
+            assert_eq!(
+                export_band(
+                    &source,
+                    &export,
+                    export.height,
+                    1,
+                    color.daylight,
+                    &color,
+                    &transfer,
+                    &params
+                )
+                .unwrap_err(),
+                develop::Error::Size
+            );
+            assert_eq!(
+                export_band(
+                    &source,
+                    &export,
+                    0,
+                    0,
+                    color.daylight,
+                    &color,
+                    &transfer,
+                    &params
+                )
+                .unwrap_err(),
+                develop::Error::Size
+            );
+        }
+    }
+    // An export whose axes disagree with its region, or whose region
+    // leaves the crop, is refused before a band is selected: the fields
+    // are public.
+    let good = export_geometry(&source, None, 6).unwrap();
+    let band = |export: &Export| {
+        export_band(
+            &source,
+            export,
+            0,
+            2,
+            color.daylight,
+            &color,
+            &transfer,
+            &params,
+        )
+    };
+    assert!(band(&good).is_ok());
+    let mut lying = good;
+    lying.height += 1;
+    assert_eq!(band(&lying).unwrap_err(), develop::Error::Size);
+    let mut swapped = good;
+    swapped.orientation = 1;
+    assert_eq!(band(&swapped).unwrap_err(), develop::Error::Size);
+    let mut outside = good;
+    outside.region.left = 9;
+    assert_eq!(band(&outside).unwrap_err(), develop::Error::Crop);
+    // The export is not flat: the ramp shows across it.
+    let upright = whole(None, 1);
+    assert!(upright.data.iter().any(|&v| v > 0));
+    assert_ne!(upright.pixel(0, 0), upright.pixel(11, 7));
 }

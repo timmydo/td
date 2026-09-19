@@ -1,6 +1,7 @@
 //! Development: the superpixel demosaic that makes level 1 from a decoded
-//! frame, the separable area/bilinear resampler, the per-pixel pipeline
-//! (white balance and clip, exposure, camera matrix, transfer) and the
+//! frame, the full-resolution bilinear demosaic export runs in row bands,
+//! the separable area/bilinear resampler, the per-pixel pipeline (white
+//! balance and clip, exposure, camera matrix, transfer) and the
 //! orientation step. Row bands are pulled from one shared queue by the
 //! caller and the scoped threads it could start, so a thread the system
 //! refuses costs parallelism and never the result; buffers are sized once
@@ -47,7 +48,8 @@ impl fmt::Display for Error {
 impl std::error::Error for Error {}
 
 /// Level 1: camera-native linear RGB, black-subtracted and scaled so the
-/// white level is 65535, one pixel per 2x2 quad of the crop.
+/// white level is 65535, one pixel per 2x2 quad of the crop from
+/// `superpixel`, or one per photosite of a region from `bilinear`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Level1 {
     pub width: usize,
@@ -79,8 +81,11 @@ fn band_rows(rows: usize, threads: usize) -> usize {
 /// Runs `work` over every band exactly once, on up to `threads - 1` scoped
 /// threads beside the caller, all pulling from one queue. A thread the
 /// system refuses to create is simply absent: the caller drains what is
-/// left, so the result never depends on how many threads started.
-fn bands<T: Send>(items: Vec<T>, threads: usize, work: impl Fn(T) + Sync) {
+/// left, so the result never depends on how many threads started. The one
+/// place the crate spreads work across threads; the JPEG encoder borrows
+/// it for its transform.
+pub(crate) fn bands<T: Send>(items: Vec<T>, threads: usize, work: impl Fn(T) + Sync) {
+    let threads = threads.clamp(1, MAX_THREADS);
     let queue = Mutex::new(items);
     let next = || queue.lock().unwrap_or_else(|e| e.into_inner()).pop();
     std::thread::scope(|scope| {
@@ -107,30 +112,15 @@ pub fn superpixel(
     white: u16,
     threads: usize,
 ) -> Result<Level1, Error> {
-    // Checked: `Decoded`'s fields are public, so the raw ceilings `nef`
-    // applies to a parsed frame are applied here again.
-    if !axis_ok(decoded.width)
-        || !axis_ok(decoded.height)
-        || decoded
-            .width
-            .checked_mul(decoded.height)
-            .is_none_or(|n| n != decoded.samples.len() || n > MAX_RAW_SAMPLES)
-    {
-        return Err(Error::Size);
-    }
-    if !crop.fits(decoded.width, decoded.height) {
-        return Err(Error::Crop);
-    }
-    if white <= black {
-        return Err(Error::Levels);
-    }
-    let range = u32::from(white - black);
-    let scale: Vec<u16> = (0..=u16::MAX)
-        .map(|s| {
-            let v = u32::from(s.saturating_sub(black)) * 65535 / range;
-            v.min(65535) as u16
-        })
-        .collect();
+    let source = Source {
+        decoded,
+        cfa,
+        crop,
+        black,
+        white,
+    };
+    source.check()?;
+    let scale = source.scale();
     let out_w = crop.width / 2;
     let out_h = crop.height / 2;
     let mut rgb = vec![0u16; out_w * out_h * 3];
@@ -186,6 +176,301 @@ pub fn superpixel(
         height: out_h,
         rgb,
     })
+}
+
+/// A decoded frame with the facts the demosaics read it by: the CFA
+/// layout, the sensor crop, and the black and white levels. Borrowed, so
+/// the window's cached level 0 is read in place.
+#[derive(Clone, Copy, Debug)]
+pub struct Source<'a> {
+    pub decoded: &'a Decoded,
+    pub cfa: Cfa,
+    pub crop: Crop,
+    pub black: u16,
+    pub white: u16,
+}
+
+impl Source<'_> {
+    /// The raw ceilings `nef` applies to a parsed frame, applied again
+    /// since `Decoded`'s fields are public; the crop within the frame; and
+    /// the levels' order.
+    fn check(&self) -> Result<(), Error> {
+        let d = self.decoded;
+        if !axis_ok(d.width)
+            || !axis_ok(d.height)
+            || d.width
+                .checked_mul(d.height)
+                .is_none_or(|n| n != d.samples.len() || n > MAX_RAW_SAMPLES)
+        {
+            return Err(Error::Size);
+        }
+        if !self.crop.fits(d.width, d.height) {
+            return Err(Error::Crop);
+        }
+        if self.white <= self.black {
+            return Err(Error::Levels);
+        }
+        Ok(())
+    }
+
+    /// Black subtraction and scaling to 65535 at the white level, as a
+    /// table over every sample value. Guarded on its own, though every
+    /// caller checks first, since the fields are public.
+    fn scale(&self) -> Vec<u16> {
+        let range = u32::from(self.white.saturating_sub(self.black)).max(1);
+        (0..=u16::MAX)
+            .map(|s| {
+                let v = u32::from(s.saturating_sub(self.black)) * 65535 / range;
+                v.min(65535) as u16
+            })
+            .collect()
+    }
+}
+
+/// A rectangle of the sensor crop, in the crop's own coordinates.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Region {
+    pub left: usize,
+    pub top: usize,
+    pub width: usize,
+    pub height: usize,
+}
+
+impl Region {
+    fn fits(self, width: usize, height: usize) -> bool {
+        self.width != 0
+            && self.height != 0
+            && self
+                .left
+                .checked_add(self.width)
+                .is_some_and(|right| right <= width)
+            && self
+                .top
+                .checked_add(self.height)
+                .is_some_and(|bottom| bottom <= height)
+    }
+}
+
+/// The full-resolution bilinear demosaic of `region`: every photosite
+/// becomes one pixel, its own channel the sample as it is and each other
+/// channel the mean, rounded, of the neighbours of that channel in the
+/// 3x3 around it (on a Bayer grid the four axial neighbours or the four
+/// diagonals at a red or blue site, a facing pair at a green one); a
+/// neighbour past the crop's edge is left out of the mean, so an edge
+/// pixel averages the neighbours it has. Black-subtracted and scaled
+/// like `superpixel`, so its output is a level 1 at full resolution.
+/// Export runs it band by band from level 0, so no whole-frame RGB buffer
+/// is ever held.
+pub fn bilinear(source: &Source<'_>, region: Region, threads: usize) -> Result<Level1, Error> {
+    source.check()?;
+    let crop = source.crop;
+    if !region.fits(crop.width, crop.height) {
+        return Err(Error::Crop);
+    }
+    if !pixels_ok(region.width, region.height) {
+        return Err(Error::Size);
+    }
+    let scale = source.scale();
+    let (out_w, out_h) = (region.width, region.height);
+    let mut rgb = vec![0u16; out_w * out_h * 3];
+    let threads = thread_count(threads, out_h);
+    let band = band_rows(out_h, threads);
+    let width = source.decoded.width;
+    let samples = &source.decoded.samples;
+    let cfa = source.cfa;
+    let scale = &scale;
+    // Absolute sensor bounds of the crop, exclusive: a neighbour outside
+    // them is not in the mean.
+    let (x_end, y_end) = (crop.left + crop.width, crop.top + crop.height);
+    let items: Vec<(usize, &mut [u16])> = rgb.chunks_mut(band * out_w * 3).enumerate().collect();
+    bands(items, threads, |(band_index, chunk)| {
+        let first_row = band_index * band;
+        for (r, out_row) in chunk.chunks_exact_mut(out_w * 3).enumerate() {
+            let ay = crop.top + region.top + first_row + r;
+            let ys = (ay.saturating_sub(1)..=ay + 1).filter(|&y| y >= crop.top && y < y_end);
+            for (c, out_px) in out_row.as_chunks_mut::<3>().0.iter_mut().enumerate() {
+                let ax = crop.left + region.left + c;
+                let own = cfa.at(ax, ay);
+                // Sum and count of the neighbours by channel, red, green,
+                // blue.
+                let mut acc = [(0u32, 0u32); 3];
+                for ny in ys.clone() {
+                    for nx in
+                        (ax.saturating_sub(1)..=ax + 1).filter(|&x| x >= crop.left && x < x_end)
+                    {
+                        if nx == ax && ny == ay {
+                            continue;
+                        }
+                        let value = samples.get(ny * width + nx).copied().unwrap_or(0);
+                        if let Some((sum, count)) = acc.get_mut(cfa.at(nx, ny) as usize) {
+                            *sum += u32::from(value);
+                            *count += 1;
+                        }
+                    }
+                }
+                let centre = samples.get(ay * width + ax).copied().unwrap_or(0);
+                let mut px = [0u16; 3];
+                for ((channel, slot), &(sum, count)) in px.iter_mut().enumerate().zip(acc.iter()) {
+                    let raw = if channel == own as usize {
+                        u32::from(centre)
+                    } else {
+                        (sum + count / 2).checked_div(count).unwrap_or(0)
+                    };
+                    *slot = scale.get(raw as usize).copied().unwrap_or(u16::MAX);
+                }
+                *out_px = px;
+            }
+        }
+    });
+    Ok(Level1 {
+        width: out_w,
+        height: out_h,
+        rgb,
+    })
+}
+
+/// The geometry of one export: the region of the sensor crop the user
+/// crop selects (the whole crop without one) and the oriented output's
+/// axes. `export_band` develops the output a band of rows at a time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Export {
+    pub region: Region,
+    pub width: usize,
+    pub height: usize,
+    pub orientation: u16,
+}
+
+/// Plans an export of `source` at full resolution: the user crop's
+/// fractions of the oriented frame mapped back through the orientation to
+/// the sensor crop by the mapping `level2` applies to level 1 (the same
+/// rounding at twice the scale, so the two agree to within level 1's
+/// pixel). A degenerate crop is `Crop`.
+pub fn export_geometry(
+    source: &Source<'_>,
+    crop: Option<[f32; 4]>,
+    orientation: u16,
+) -> Result<Export, Error> {
+    source.check()?;
+    let (w, h) = (source.crop.width, source.crop.height);
+    if !pixels_ok(w, h) {
+        return Err(Error::Size);
+    }
+    let region = match crop {
+        None => Region {
+            left: 0,
+            top: 0,
+            width: w,
+            height: h,
+        },
+        Some(fractions) => {
+            let (left, top, width, height) =
+                source_rect(fractions, w, h, orientation).ok_or(Error::Crop)?;
+            Region {
+                left,
+                top,
+                width,
+                height,
+            }
+        }
+    };
+    let (width, height) = if matches!(orientation, 6 | 8) {
+        (region.height, region.width)
+    } else {
+        (region.width, region.height)
+    };
+    Ok(Export {
+        region,
+        width,
+        height,
+        orientation,
+    })
+}
+
+/// The sensor region that becomes output rows `first..first + rows` of
+/// the oriented image: the band's rows themselves upright, the mirrored
+/// rows turned half way round, and a run of columns for a quarter turn,
+/// the inverse of `oriented3`'s per-pixel map applied to a band. `None`
+/// when the band does not lie within the export's region (its fields are
+/// public, so an `Export` is not trusted to be consistent).
+fn band_region(export: &Export, first: usize, rows: usize) -> Option<Region> {
+    let r = export.region;
+    // The offset of the band from the far edge, for the turned cases.
+    let from_end = |extent: usize| extent.checked_sub(first)?.checked_sub(rows);
+    Some(match export.orientation {
+        3 => Region {
+            left: r.left,
+            top: r.top.checked_add(from_end(r.height)?)?,
+            width: r.width,
+            height: rows,
+        },
+        6 => Region {
+            left: r.left.checked_add(first)?,
+            top: r.top,
+            width: rows,
+            height: r.height,
+        },
+        8 => Region {
+            left: r.left.checked_add(from_end(r.width)?)?,
+            top: r.top,
+            width: rows,
+            height: r.height,
+        },
+        _ => Region {
+            left: r.left,
+            top: r.top.checked_add(first)?,
+            width: r.width,
+            height: rows,
+        },
+    })
+}
+
+/// Output rows `first..first + rows` of the export, developed from level
+/// 0: the band's sensor region through the bilinear demosaic, oriented, then
+/// the per-pixel pipeline at `params`. `rows` is clipped to the end, so
+/// the last band may be short; a band that starts past the end, or of no
+/// rows, is `Size`. The bands concatenate to the whole image whatever
+/// their size, so peak memory is one band's, never the frame's.
+// It composes the demosaic and level 3, so it carries both stages' inputs.
+#[allow(clippy::too_many_arguments)]
+pub fn export_band(
+    source: &Source<'_>,
+    export: &Export,
+    first: usize,
+    rows: usize,
+    wb: [f32; 3],
+    color: &CameraColor,
+    transfer: &Transfer,
+    params: &Params<'_>,
+) -> Result<Rgb8, Error> {
+    // The export's fields are public, so its axes are held to its region
+    // and its region to the crop before either selects a band.
+    let (turned_w, turned_h) = if matches!(export.orientation, 6 | 8) {
+        (export.region.height, export.region.width)
+    } else {
+        (export.region.width, export.region.height)
+    };
+    if (export.width, export.height) != (turned_w, turned_h) {
+        return Err(Error::Size);
+    }
+    if !export.region.fits(source.crop.width, source.crop.height) {
+        return Err(Error::Crop);
+    }
+    let rows = rows.min(export.height.saturating_sub(first));
+    if rows == 0 {
+        return Err(Error::Size);
+    }
+    let region = band_region(export, first, rows).ok_or(Error::Size)?;
+    let level = bilinear(source, region, params.threads)?;
+    let linear: Vec<f32> = level.rgb.iter().map(|v| f32::from(*v) / 65535.0).collect();
+    let (rgb, width, height) =
+        match oriented3(&linear, level.width, level.height, export.orientation) {
+            Some(turned) => turned,
+            None => (linear, level.width, level.height),
+        };
+    if (width, height) != (export.width, rows) {
+        return Err(Error::Size);
+    }
+    level3(&Level2 { width, height, rgb }, wb, color, transfer, params)
 }
 
 /// One destination index's source contributions along one axis.

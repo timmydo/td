@@ -314,6 +314,7 @@ fn budgets_are_the_documented_values() {
     assert_eq!(td_photo::nef::MAX_RANGE, 32768);
     assert_eq!(td_photo::jpeg::MAX_PREVIEW_SAMPLES, 128 << 20);
     assert_eq!(td_photo::jpeg::MAX_TABLE_DEFINITIONS, 32);
+    assert_eq!(td_photo::jpeg::QUALITY, 92);
     // The cache unlinks only names of its own shape inside directories of
     // its own, never a tree; fills go through per-process temporaries; a
     // thumbnail is turned like a development.
@@ -347,6 +348,20 @@ fn budgets_are_the_documented_values() {
     assert_eq!(main.matches("fn make_thumbnail(").count(), 1);
     assert_eq!(main.matches("jpeg::thumbnail(").count(), 1);
     assert!(window.contains("make_thumbnail(") && !window.contains("jpeg::"));
+    // Export develops in bands straight into the encoder, through a
+    // temporary of the export's own name published by the link rule, and
+    // the encoder spreads its transform through `develop`'s bands rather
+    // than threads of its own (pinned above: no `thread::` outside
+    // `develop.rs`).
+    assert_eq!(main.matches("fn export(").count(), 1);
+    assert!(main.contains("develop::export_band("));
+    assert!(main.contains("jpeg::Encoder::new("));
+    assert!(main.contains("format!(\"{stem}.jpg.tmp\")"));
+    assert!(main.contains("const EXPORT_BAND_ROWS: usize = 64;"));
+    assert!(main.contains("const MAX_EXPORT_NAMES: u32 = 1000;"));
+    let jpeg = read("src/jpeg.rs");
+    assert!(jpeg.contains("crate::develop::bands("));
+    assert!(jpeg.contains("pub const QUALITY: u8 = 92;"));
     assert_eq!(td_photo::nef::MAX_RAW_SAMPLES, 128 << 20);
     assert_eq!(td_photo::nef::MAX_SUB_IFDS, 16);
     assert_eq!(td_photo::develop::MAX_THREADS, 16);

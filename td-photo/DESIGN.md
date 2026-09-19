@@ -27,30 +27,35 @@ verified against a real Z 8 frame and the others against the test encoder only,
 the camera table with the Z 8's colour matrix (`camera`), the linear colour math
 and the sRGB transfer (`color`), the look format with its built-in set (`look`),
 the superpixel demosaic, area resampler and headless development pipeline with
-the look in it (`develop`), the RGB image buffers and PPM writer and reader
+the look in it, and the full-resolution bilinear demosaic export runs in row
+bands (`develop`), the RGB image buffers and PPM writer and reader
 (`image`), the baseline JPEG decoder for the embedded previews with its
-reduced-transform scaling (`jpeg`), the thumbnail rule and the thumbnail cache,
+reduced-transform scaling and the baseline encoder export writes through
+(`jpeg`), the thumbnail rule and the thumbnail cache,
 the library's sidecar grammar, roll rules and dating rule (`library`), the cull
 and develop controller over td-ui's driven seam with its action table and scene
 (`ui`), the
 window over it with its thumbnail pool and control socket (`window`), and the
 command line `td-photo probe FILE`, `td-photo develop FILE OUT.ppm`, `td-photo
-thumb FILE OUT.ppm`, `td-photo cache`, `td-photo looks`, `td-photo import SRC
-DEST`, `td-photo list ROLL`, `td-photo flag FILE`, `td-photo edit FILE`,
-`td-photo open ROLL`, `td-photo --replay`, `td-photo --preview` and `td-photo
---help actions`. Every read of a camera file is bounded by `MAX_FILE_BYTES`, of
-a sidecar by `MAX_SIDECAR_BYTES` and of a look by `MAX_LOOK_BYTES`, trusting
-neither the length the file system reported; `develop` and `thumb` refuse an
-`OUT.ppm` (or `OUT.ppm.tmp`) that already exists rather than replace it, and
-`import` a copy that differs, publishing the finished temporary by a hard link
-so a name that appeared meanwhile is not replaced either; the sidecar is the one
-file td-photo replaces, and only through its own temporary. The crate depends on
+export FILE`, `td-photo thumb FILE OUT.ppm`, `td-photo cache`, `td-photo
+looks`, `td-photo import SRC DEST`, `td-photo list ROLL`, `td-photo flag
+FILE`, `td-photo edit FILE`, `td-photo open ROLL`, `td-photo --replay`,
+`td-photo --preview` and `td-photo --help actions`. Every read of a camera
+file is bounded by `MAX_FILE_BYTES`, of a sidecar by `MAX_SIDECAR_BYTES` and
+of a look by `MAX_LOOK_BYTES`, trusting neither the length the file system
+reported; `develop` and `thumb` refuse an `OUT.ppm` (or `OUT.ppm.tmp`) that
+already exists rather than replace it, `export` takes the first free numbered
+name and refuses a stale `STEM.jpg.tmp`, and `import` a copy that differs,
+publishing the finished temporary by a hard link so a name that appeared
+meanwhile is not replaced either; the sidecar is the one file td-photo
+replaces, and only through its own temporary. The crate depends on
 td-ui, by path, for the driven seam, the raster and bands the scene is laid out
 with and the Wayland client the window runs on; the window's develop mode
 lands over its own slices: the mode, its keys and the develop edits over the
 seam and the socket are in, as are the developed preview and the crop drag
-with its edge and corner handles; the look list follows, as the increments
-at the end schedule.
+with its edge and corner handles and the look palette; the headless `export`
+verb is in, and the window's `export` action and `delete-rejected` follow, as
+the increments at the end schedule.
 
 The rules below define version 1; the increments identify the order of
 implementation, not choices left to each implementing agent.
@@ -107,13 +112,14 @@ modes are the photographer's order of work.
    toggled with `l` lists the available looks with the current one marked, and
    a press on a name picks it. The immediate snap that reshapes the current
    crop and the live scaled preview under the marquee are later slices, as
-   `export` is. Every change is saved to the
+   the window's `export` action is. Every change is saved to the
    sidecar as it is made; there is no explicit save and no undo stack in
    version 1, only reset to camera defaults.
 
 Export renders the full-resolution raw through the same pipeline and writes
-an sRGB image into the roll's `exported/` folder, never overwriting: a
-second export of the same name takes a numbered suffix.
+an sRGB JPEG into the roll's `exported/` folder, never overwriting: a
+second export of the same name takes a numbered suffix (Files, below).
+`td-photo export FILE` is it headless; the window's action follows.
 
 ## Driving
 
@@ -332,8 +338,23 @@ The library is folders of originals; there is no database.
   removed; an edit that would take the sidecar past the ceilings above is
   refused before anything is written, so what td-photo writes it reads.
 - **Rejected** originals move, with their sidecars, into `rejected/`
-  under the roll. Export writes into `exported/`. Neither folder is
-  listed as part of the roll.
+  under the roll. Neither that folder nor `exported/` is listed as part of
+  the roll.
+- **Export** writes `exported/STEM.jpg` beside the roll, `STEM` the
+  original's name without its extension, or `STEM-2.jpg`, `STEM-3.jpg` and
+  so on: the first free number from 2 when the plain name is taken, at most
+  `MAX_EXPORT_NAMES` (1000) tried, and a gap left by a removed export is
+  filled before a new number is taken. The folder is created, once the raw
+  is decoded and the export planned, when absent; anything else at its
+  name, a link included, is refused. The stream is developed and coded a
+  band at a time into a fresh `exported/STEM.jpg.tmp`, created exclusively
+  (a stale one is reported, not reused or removed), synced, then linked to
+  the first free name, the same publication as `develop`'s: a name that
+  appears between the check and the link is skipped for the next, never
+  replaced. The export takes the sidecar's exposure, crop and look as the
+  file holds them; a sidecar the reader refuses, or a look it cannot find,
+  refuses the export before anything is written, since developing at camera
+  defaults would silently drop the edits.
 - **Cache**: `$XDG_CACHE_HOME/td-photo` when that variable is absolute
   (`~/.cache/td-photo` otherwise), holding `thumbs/` and nothing else in version
   1. The base directory is the user's and may be a symlink; `td-photo` and
@@ -603,9 +624,9 @@ codec. Level 1 is superpixel
 (each 2x2 CFA quad becomes one RGB
 pixel: exact colour, no interpolation, a quarter of the samples), which is
 the right demosaic for every on-screen size below half resolution; export
-and the 100% loupe (a later increment) run a full-resolution demosaic in
-row bands from level 0 so peak memory stays bounded by the band, never by
-the frame.
+(and the 100% loupe, a later increment) runs the full-resolution demosaic
+in row bands from level 0 so peak memory stays bounded by the band, never
+by the frame (Export, below).
 
 The resampler is separable area averaging for reduction and bilinear for
 enlargement, over `f32` rows, and is shared with thumbnails. It reads the
@@ -614,6 +635,62 @@ value the whole-frame conversion would give, in the same order), so level 2
 is the only retained `f32` image buffer, for the headless verb and the
 window alike (the resampler's middle pass and the orient hold transient
 `f32` buffers).
+
+### Export
+
+`td-photo export` develops from level 0 at full resolution, one band of
+output rows at a time, straight into the JPEG encoder, so the frame is
+never held as RGB: level 0 (the decoded CFA frame, 87 MiB on a Z 8) plus
+one band is the peak. `develop::export_geometry` plans it: the user crop's
+fractions of the oriented frame are mapped back through the inverse of the
+orientation to a `Region` of the sensor crop by the mapping `level2`
+applies to level 1 (the same rounding at twice the scale, so the export
+and the preview select the same region to within a level-1 pixel), the
+whole crop without one, and the output's axes are the region's turned by
+the orientation. `develop::export_band` makes output rows `first..first
++ rows`: the sensor region those rows come from (the band's rows upright,
+the mirrored rows for a half turn, a run of columns for a quarter turn,
+the inverse of `orient`'s per-pixel map applied to a band) through
+`develop::bilinear`, turned, then `level3` at the sidecar's exposure and
+look. The bands concatenate to the same bytes whatever their size, and an
+uncropped export turned by `orient` is the turned export; the tests pin
+both. `main` feeds `EXPORT_BAND_ROWS` (64) rows a band, a multiple of the
+encoder's block row and enough of them that a band's transform spreads
+over the pool.
+
+The bilinear demosaic makes one pixel per photosite: its own channel the
+sample as it is, each other channel the rounded mean of that channel's
+neighbours in the 3x3 around it (on a Bayer grid the four axial neighbours
+or the four diagonals at a red or blue site, a facing pair at a green
+one); a neighbour outside the sensor crop is left out of the mean, so an
+edge pixel averages the neighbours it has. It is black-subtracted and
+scaled like `superpixel`, a level 1 at full resolution, and a region of it
+is that window of the whole, read at the sensor's CFA phase, not the
+crop's. A better full-resolution demosaic is a later increment.
+
+The encoder (`jpeg::Encoder`) is baseline: JFIF, YCbCr 4:4:4 (one block
+per component per MCU, so a band of eight rows is a row of MCUs and the
+right edge and bottom pad by replicating the last column and row), the
+T.81 Annex K quantisation tables scaled at `QUALITY` (92) the way every
+encoder since IJG scales them (`5000 / q` below 50, `200 - 2q` from 50 up,
+entries held to 1..=255) and the Annex K.3 Huffman tables, written into
+the stream, no restart intervals. The colour transform is the JFIF one the
+decoder inverts; the forward transform is the decoder's `T8` basis
+transposed, in `f32`, rows then columns; coefficients are held to the
+categories the tables carry (the DC to -1024..=1023, each AC to
+-1023..=1023), and a symbol no table carries would be refused rather than
+coded as a bare run of bits; the last byte is padded with ones. It is fed
+rows in any number at a time and drained of bytes as they are made, so the
+stream is written as the frame is developed; the transform and
+quantisation of a band run across the pool through `develop::bands`, the
+entropy coding is sequential, and the bytes are the same whatever the band
+or thread count. The decoder is its oracle: a ramp at `QUALITY` round-trips
+within 12 of every 8-bit value and noise at quality 100 within the colour
+transform's rounding, a grey frame stays exactly grey, a black frame at
+quality 100 (the largest DC category through coder and decoder) exactly
+black, and the standard tables are pinned complete (every baseline DC
+category and AC run/size once) with no code of all ones, which is what the
+decoder refuses; the clamp is pinned by a unit test over `forward`.
 
 ## Looks
 
@@ -815,6 +892,8 @@ thumbnail is not ready paints a neutral placeholder and its name, never blocks.
   let go while still wanted off screen is asked for again.
 - At most one develop, and so one raw decode, runs at a time (the codec is
   sequential): the pool hands a worker the develop only when none is in flight.
+  The headless `export` verb runs on the calling thread, each band's
+  demosaic, pipeline and transform split across scoped threads as below.
   Demosaic and resampling split rows into bands on one shared queue that the
   calling thread and its scoped helper threads drain together, so no thread
   outlives the call and a band count that exceeds the threads is shared out.
@@ -880,7 +959,9 @@ no `include!`, that the pure modules name no
 `std::fs`, `std::env`, `std::time`, `std::net` or `std::process` path and the
 window no file, which files name which toolkit modules, that photo pixels reach
 a frame through `ui::blit` alone and the verb and the window share one thumbnail
-rule, and the budgets by value.
+rule, that export develops in bands into the encoder through a temporary of
+its own name and the encoder spreads its transform through `develop`'s
+bands, and the budgets by value.
 
 `tests/nef.rs` carries a synthetic NEF writer and a Nikon Huffman encoder
 for all six trees, and pins: round trips of random and edge-valued frames
@@ -897,8 +978,18 @@ of the reference file's header values.
 `tests/develop.rs` pins the colour math against hand-computed values
 (neutral in, neutral out; the daylight multipliers of the Z 8 matrix; the
 sRGB table's endpoints and monotonicity), the superpixel demosaic on a
-known quad, the area resampler on constant and step images, and a complete
-development of a synthetic frame to expected 8-bit values.
+known quad, the area resampler on constant and step images, a complete
+development of a synthetic frame to expected 8-bit values, and the export
+path: the bilinear demosaic keeping a sample and averaging each other
+channel over the neighbours a pixel has (a constant-per-channel frame, and
+one bright site seen by its neighbours with the rounded means at the edge),
+a region being that window of the whole at the sensor's CFA phase, its
+refusals (a region past the crop, empty or overflowing, levels, a short
+buffer), the export geometry mapping the crop through every orientation to
+pinned regions and axes, and the export bands concatenating to the whole at
+every band size and orientation, with and without a crop, the uncropped
+export turned by `orient` being the turned export, and a band past the end
+or of no rows refused.
 
 `tests/look.rs` holds the look format to its refusals by line (the header, a
 blank line, an unknown word, a second or over-long name, every arity and range,
@@ -938,7 +1029,25 @@ all-ones or zero-valued table and more definitions than the budget, a
 scan that is not the whole frame or lists it out of order, a missing,
 wrong or out-of-sequence restart marker and an unread byte before one, a
 code no table holds, a reserved AC symbol, a predictor past 16 bits, a
-run or a ZRL past the block, and anything but EOI after the scan).
+run or a ZRL past the block, and anything but EOI after the scan); and the
+encoder against the decoder (Export, above): ramps of every partial-block
+shape at `QUALITY` and noise at quality 100 round-tripping within their
+tolerances, a grey frame staying grey, the stream compressing, the bytes
+identical however the rows are fed and on any thread count, the axes
+and rows refused by name, and the headers held to their literal bytes (the
+frame and scan segments whole, each table's counts, the luma quantiser's
+first zigzag entries and the chroma's last at `QUALITY`); the standard
+tables' completeness is an inline unit test in `jpeg`.
+
+`tests/nef.rs`'s second command case runs `export` over a temporary roll:
+the JPEG in `exported/` decoding to the in-process export of the same frame
+within the round trip's tolerance, the second and third exports numbered
+and a gap filled, the sidecar's exposure brightening, `mono` greying and a
+crop selecting the pinned axes, a refused sidecar and an unknown look
+refusing before anything is written, a stale temporary reported and left, a
+non-original, a stray argument and a missing FILE refused by name, a turned
+frame exporting turned, a file at `exported/` refusing, and the originals
+unchanged.
 
 `tests/library.rs` holds the sidecar grammar to its refusals by name and to
 in-place rewriting around an unknown line, the canonical value spellings, and
@@ -1111,10 +1220,13 @@ all-target Clippy.
    makes, so the mark rides the edit's settle and the palette stays open; a
    press off the names, or on a surface too small for the box, picks nothing.
    Landed. The live scaled preview under the marquee remains a later slice.
-6. Export: banded full-resolution bilinear demosaic, the JPEG encoder,
-   `exported/` naming, and `td-photo export`; and `delete-rejected`, the
-   action and its verb that move rejects and their sidecars into
-   `rejected/`.
+6. Export, in landings. (a) The banded full-resolution bilinear demosaic
+   and the export geometry in `develop`, the JPEG encoder in `jpeg`, the
+   `exported/` naming, and `td-photo export FILE` headless. Landed. (b) The
+   `export` action in the window: the `Export` pool job over the raw cache,
+   running the verb's band pipeline off the turn thread, its outcome a
+   fact the status row shows. (c) `delete-rejected`, the action and its
+   verb that move rejects and their sidecars into `rejected/`.
 7. Packaging: the cargo recipe staging td-ui, the image entry, and the
    recipe check that develops the synthetic frame in the built artifact.
 8. Later: the 100% loupe from level 0, DNG and JPEG rolls, the Nikon High
