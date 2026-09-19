@@ -7,6 +7,10 @@ use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
 use std::process::{Child, Command, Stdio};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use std::time::{Duration, Instant};
 
 const NOFOLLOW: i32 = 0o400000;
@@ -15,6 +19,7 @@ const NONBLOCK: i32 = 0o4000;
 const LOCK_REFUSED: u8 = 1;
 pub(crate) const MAX_LIFETIME: Duration = Duration::from_secs(120);
 const MAX_DESCRIPTOR: usize = 4096;
+const CANCEL_INTERVAL: Duration = Duration::from_millis(50);
 const WRITE: u8 = 1;
 const READ: u8 = 2;
 
@@ -181,19 +186,86 @@ impl Drop for Worker {
     }
 }
 
+/// One-way revocation shared with the owner of a presented operation.
+#[derive(Clone)]
+pub(crate) struct Cancellation(Arc<AtomicBool>);
+impl Cancellation {
+    pub(crate) fn new() -> Self {
+        Self(Arc::new(AtomicBool::new(false)))
+    }
+    pub(crate) fn cancel(&self) {
+        self.0.store(true, Ordering::Release);
+    }
+}
+
+struct Operation {
+    deadline: Instant,
+    cancellation: Option<Cancellation>,
+}
+impl Operation {
+    fn remaining(&self) -> Result<Duration, String> {
+        if self
+            .cancellation
+            .as_ref()
+            .is_some_and(|c| c.0.load(Ordering::Acquire))
+        {
+            return Err("token operation cancelled".into());
+        }
+        remaining(self.deadline)
+    }
+    fn timeout(&self) -> Result<Duration, String> {
+        let remaining = self.remaining()?;
+        Ok(if self.cancellation.is_some() {
+            remaining.min(CANCEL_INTERVAL)
+        } else {
+            remaining
+        })
+    }
+    // A socket timeout transfers no bytes. Resume the remaining stream extent,
+    // never a HID report whose acknowledgement or outcome is uncertain.
+    fn polling_timeout(&self, error: &io::Error) -> bool {
+        self.cancellation.is_some()
+            && matches!(
+                error.kind(),
+                io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+            )
+    }
+}
+
 pub struct Session {
     worker: Option<Worker>,
-    deadline: Instant,
+    operation: Operation,
     channel: u32,
 }
 
 impl Session {
     pub fn open(device: Device, deadline: Instant) -> Result<Self, String> {
+        Self::open_with(device, deadline, None)
+    }
+
+    pub(crate) fn open_cancellable(
+        device: Device,
+        deadline: Instant,
+        cancellation: Cancellation,
+    ) -> Result<Self, String> {
+        Self::open_with(device, deadline, Some(cancellation))
+    }
+
+    fn open_with(
+        device: Device,
+        deadline: Instant,
+        cancellation: Option<Cancellation>,
+    ) -> Result<Self, String> {
+        let operation = Operation {
+            deadline,
+            cancellation,
+        };
+        // Revocation refuses before any root or device setup is considered.
+        operation.remaining()?;
         store::require_root()?;
         if deadline.saturating_duration_since(Instant::now()) > MAX_LIFETIME {
             return Err("token operation exceeds lifetime limit".into());
         }
-        remaining(deadline)?;
         let (socket, child_socket) =
             UnixStream::pair().map_err(|_| "create token worker channel")?;
         let child_output: OwnedFd = child_socket
@@ -201,6 +273,7 @@ impl Session {
             .map_err(|_| "clone token worker channel")?
             .into();
         let child_input: OwnedFd = child_socket.into();
+        operation.remaining()?;
         let child = Command::new("/proc/self/exe")
             .args([
                 "hid-worker",
@@ -215,29 +288,30 @@ impl Session {
             .stderr(Stdio::null())
             .spawn()
             .map_err(|_| "start token worker")?;
-        let mut session = Self {
+        Self {
             worker: Some(Worker { child, socket }),
-            deadline,
+            operation,
             channel: hid::BROADCAST,
-        };
-        let result = session.initialize();
-        if result.is_err() {
-            session.worker.take();
         }
-        result.map(|()| session)
+        .start()
     }
 
-    fn socket(&mut self) -> Result<&mut UnixStream, String> {
+    fn start(mut self) -> Result<Self, String> {
+        self.initialize()?;
+        Ok(self)
+    }
+
+    fn io(&mut self) -> Result<(&mut UnixStream, &Operation), String> {
         self.worker
             .as_mut()
-            .map(|worker| &mut worker.socket)
+            .map(|worker| (&mut worker.socket, &self.operation))
             .ok_or_else(|| "token session is closed".into())
     }
 
     fn initialize(&mut self) -> Result<(), String> {
-        let deadline = self.deadline;
         let mut ready = [0];
-        receive(self.socket()?, &mut ready, deadline)?;
+        let (socket, operation) = self.io()?;
+        receive(socket, &mut ready, operation)?;
         if ready == [LOCK_REFUSED] {
             return Err("token transport is busy or unavailable".into());
         }
@@ -258,6 +332,7 @@ impl Session {
             let result = init.push(&report);
             report.fill(0);
             if let Some(channel) = result? {
+                self.operation.remaining()?;
                 self.channel = channel;
                 return Ok(());
             }
@@ -282,31 +357,32 @@ impl Session {
             let result = decoder.push(&report);
             report.fill(0);
             if let hid::Event::Complete(message) = result? {
+                self.operation.remaining()?;
                 return Ok(message);
             }
         }
     }
     fn write(&mut self, report: &[u8; 64]) -> Result<(), String> {
-        let deadline = self.deadline;
         let mut frame = Report([WRITE; 65]);
         frame
             .0
             .get_mut(1..)
             .ok_or("invalid worker frame storage")?
             .copy_from_slice(report);
-        send(self.socket()?, &frame.0, deadline)?;
+        let (socket, operation) = self.io()?;
+        send(socket, &frame.0, operation)?;
         let mut ack = [0];
-        receive(self.socket()?, &mut ack, deadline)?;
+        receive(socket, &mut ack, operation)?;
         if ack != [0] {
             return Err("token write refused".into());
         }
         Ok(())
     }
     fn read(&mut self) -> Result<[u8; 64], String> {
-        let deadline = self.deadline;
-        send(self.socket()?, &[READ], deadline)?;
+        let (socket, operation) = self.io()?;
+        send(socket, &[READ], operation)?;
         let mut report = [0; 64];
-        if let Err(error) = receive(self.socket()?, &mut report, deadline) {
+        if let Err(error) = receive(socket, &mut report, operation) {
             report.fill(0);
             return Err(error);
         }
@@ -322,33 +398,39 @@ fn remaining(deadline: Instant) -> Result<Duration, String> {
         Ok(time)
     }
 }
-fn send(socket: &mut UnixStream, mut bytes: &[u8], deadline: Instant) -> Result<(), String> {
+fn send(socket: &mut UnixStream, mut bytes: &[u8], operation: &Operation) -> Result<(), String> {
     while !bytes.is_empty() {
         socket
-            .set_write_timeout(Some(remaining(deadline)?))
+            .set_write_timeout(Some(operation.timeout()?))
             .map_err(|_| "set token write deadline")?;
         match socket.write(bytes) {
             Ok(0) => return Err("token worker disconnected".into()),
             Ok(n) => bytes = bytes.get(n..).ok_or("invalid token write size")?,
             Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) if operation.polling_timeout(&error) => {}
             Err(_) => return Err("token worker write failed or expired".into()),
         }
     }
-    remaining(deadline).map(|_| ())
+    operation.remaining().map(|_| ())
 }
-fn receive(socket: &mut UnixStream, mut bytes: &mut [u8], deadline: Instant) -> Result<(), String> {
+fn receive(
+    socket: &mut UnixStream,
+    mut bytes: &mut [u8],
+    operation: &Operation,
+) -> Result<(), String> {
     while !bytes.is_empty() {
         socket
-            .set_read_timeout(Some(remaining(deadline)?))
+            .set_read_timeout(Some(operation.timeout()?))
             .map_err(|_| "set token read deadline")?;
         match socket.read(bytes) {
             Ok(0) => return Err("token worker disconnected".into()),
             Ok(n) => bytes = bytes.get_mut(n..).ok_or("invalid token read size")?,
             Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) if operation.polling_timeout(&error) => {}
             Err(_) => return Err("token worker read failed or expired".into()),
         }
     }
-    remaining(deadline).map(|_| ())
+    operation.remaining().map(|_| ())
 }
 
 struct Report([u8; 65]);
@@ -648,6 +730,9 @@ mod tests {
                     let mut request = [0; 64];
                     input.read_exact(&mut request).unwrap();
                     assert_eq!(&request[..8], &[0, 0, 0, 1, 0x90, 0, 1, 4]);
+                    if role == "stall-ack" {
+                        std::thread::sleep(Duration::from_secs(30));
+                    }
                     output.write_all(&[u8::from(role == "bad-ack")]).unwrap();
                 }
                 [READ] if role == "stall" => {
@@ -665,7 +750,17 @@ mod tests {
                     } else {
                         report[..9].copy_from_slice(&[0, 0, 0, 1, 0x90, 0, 2, 0, 0xa0]);
                     }
-                    output.write_all(&report).unwrap();
+                    if role == "slow-reply" {
+                        std::thread::sleep(Duration::from_millis(160));
+                    }
+                    if role == "partial" {
+                        output.write_all(&report[..32]).unwrap();
+                        output.flush().unwrap();
+                        std::thread::sleep(Duration::from_secs(30));
+                        output.write_all(&report[32..]).unwrap();
+                    } else {
+                        output.write_all(&report).unwrap();
+                    }
                 }
                 _ => panic!("unexpected fixture operation"),
             }
@@ -706,7 +801,10 @@ mod tests {
         Session {
             worker: Some(Worker { child, socket }),
             channel: 1,
-            deadline: Instant::now() + time,
+            operation: Operation {
+                deadline: Instant::now() + time,
+                cancellation: None,
+            },
         }
     }
 
@@ -727,6 +825,116 @@ mod tests {
             );
             assert!(session.cbor(&[4]).is_err());
         }
+    }
+
+    fn cancel_soon(cancellation: &Cancellation) -> std::thread::JoinHandle<()> {
+        let cancellation = cancellation.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(120));
+            cancellation.cancel();
+        })
+    }
+
+    #[test]
+    fn cancellation_refuses_open_and_reuse_without_another_submission() {
+        let cancellation = Cancellation::new();
+        cancellation.cancel();
+        cancellation.cancel();
+        let device = Device {
+            index: 0,
+            inode: 0,
+            rdev: 0,
+        };
+        assert_eq!(
+            Session::open_cancellable(device, Instant::now() + MAX_LIFETIME, cancellation.clone())
+                .err()
+                .unwrap(),
+            "token operation cancelled"
+        );
+        // A reply is available, but revocation must win before any submission.
+        let mut session = fixture("reply", Duration::from_secs(10));
+        let cancellation = Cancellation::new();
+        session.operation.cancellation = Some(cancellation.clone());
+        assert_eq!(session.cbor(&[4]).unwrap().as_ref(), &[0, 0xa0]);
+        cancellation.cancel();
+        assert_eq!(session.cbor(&[4]).unwrap_err(), "token operation cancelled");
+        assert!(session.worker.is_none());
+        assert!(session.cbor(&[4]).is_err());
+    }
+
+    #[test]
+    fn cancellation_interrupts_startup_ack_reads_and_keepalives_and_reaps() {
+        for role in ["startup", "stall-ack", "stall", "partial", "keepalive"] {
+            let mut session = fixture(role, Duration::from_secs(10));
+            let pid = session.worker.as_ref().unwrap().child.id();
+            let cancellation = Cancellation::new();
+            session.operation.cancellation = Some(cancellation.clone());
+            let canceller = cancel_soon(&cancellation);
+            let started = Instant::now();
+            let error = if role == "startup" {
+                // The fixture waits for a command instead of sending startup ready.
+                session.start().err().unwrap()
+            } else {
+                let error = session.cbor(&[4]).unwrap_err();
+                assert!(session.worker.is_none(), "{role}");
+                assert!(session.cbor(&[4]).is_err(), "{role}");
+                error
+            };
+            canceller.join().unwrap();
+            assert_eq!(error, "token operation cancelled", "{role}");
+            assert!(started.elapsed() < Duration::from_secs(3), "{role}");
+            assert!(
+                !std::path::Path::new(&format!("/proc/{pid}")).exists(),
+                "worker not reaped: {role}"
+            );
+        }
+    }
+
+    #[test]
+    fn cancellation_interrupts_a_blocked_stream_write() {
+        let (mut socket, _peer) = UnixStream::pair().unwrap();
+        let cancellation = Cancellation::new();
+        let operation = Operation {
+            deadline: Instant::now() + Duration::from_secs(10),
+            cancellation: Some(cancellation.clone()),
+        };
+        let canceller = cancel_soon(&cancellation);
+        let started = Instant::now();
+        let error = send(&mut socket, &vec![7; 1_048_576], &operation).unwrap_err();
+        canceller.join().unwrap();
+        assert_eq!(error, "token operation cancelled");
+        assert!(started.elapsed() < Duration::from_secs(3));
+    }
+
+    #[test]
+    fn cancellation_polling_preserves_partial_progress_without_replay() {
+        // One frame is split across several poll intervals; only one READ is sent.
+        let (mut socket, mut peer) = UnixStream::pair().unwrap();
+        let worker = std::thread::spawn(move || {
+            let mut request = [0];
+            peer.read_exact(&mut request).unwrap();
+            assert_eq!(request, [READ]);
+            for byte in [7, 8, 9] {
+                std::thread::sleep(Duration::from_millis(80));
+                peer.write_all(&[byte]).unwrap();
+            }
+            peer.set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            assert_eq!(peer.read(&mut request).unwrap(), 0, "unexpected replay");
+        });
+        let operation = Operation {
+            deadline: Instant::now() + Duration::from_secs(5),
+            cancellation: Some(Cancellation::new()),
+        };
+        send(&mut socket, &[READ], &operation).unwrap();
+        let mut bytes = [0; 3];
+        receive(&mut socket, &mut bytes, &operation).unwrap();
+        assert_eq!(bytes, [7, 8, 9]);
+        drop(socket);
+        worker.join().unwrap();
+        let mut session = fixture("slow-reply", Duration::from_secs(5));
+        session.operation.cancellation = Some(Cancellation::new());
+        assert_eq!(session.cbor(&[4]).unwrap().as_ref(), &[0, 0xa0]);
     }
 
     struct LockFixture(std::path::PathBuf);
@@ -960,29 +1168,41 @@ mod tests {
 
     #[test]
     fn partial_stream_traffic_never_renews_the_absolute_deadline() {
-        let (mut socket, mut peer) = UnixStream::pair().unwrap();
-        let writer = std::thread::spawn(move || {
-            for _ in 0..5 {
-                if peer.write_all(&[7]).is_err() {
-                    break;
+        for cancellation in [None, Some(Cancellation::new())] {
+            let (mut socket, mut peer) = UnixStream::pair().unwrap();
+            let writer = std::thread::spawn(move || {
+                for _ in 0..5 {
+                    if peer.write_all(&[7]).is_err() {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(40));
                 }
-                std::thread::sleep(Duration::from_millis(40));
-            }
-        });
-        let mut bytes = [0; 5];
-        assert!(receive(
+            });
+            let mut bytes = [0; 5];
+            assert!(receive(
+                &mut socket,
+                &mut bytes,
+                &Operation {
+                    deadline: Instant::now() + Duration::from_millis(60),
+                    cancellation
+                }
+            )
+            .is_err());
+            drop(socket);
+            writer.join().unwrap();
+        }
+        let (mut socket, _peer) = UnixStream::pair().unwrap();
+        assert!(send(
             &mut socket,
-            &mut bytes,
-            Instant::now() + Duration::from_millis(60)
+            &[7],
+            &Operation {
+                deadline: Instant::now(),
+                cancellation: None
+            }
         )
         .is_err());
-        drop(socket);
-        writer.join().unwrap();
-        let (mut socket, _peer) = UnixStream::pair().unwrap();
-        assert!(send(&mut socket, &[7], Instant::now()).is_err());
     }
 }
-
 #[cfg(test)]
 mod vm_tests {
     use super::*;
@@ -1187,7 +1407,10 @@ mod vm_tests {
             .unwrap();
         let mut session = Session {
             worker: Some(Worker { child, socket }),
-            deadline: Instant::now() + lifetime,
+            operation: Operation {
+                deadline: Instant::now() + lifetime,
+                cancellation: None,
+            },
             channel: hid::BROADCAST,
         };
         session.initialize().unwrap();

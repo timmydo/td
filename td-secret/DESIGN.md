@@ -365,6 +365,37 @@ the deadline bounds accepted protocol replies, not teardown completion.
 This is not a hard real-time bound on an unresponsive kernel. No late
 reply is accepted as authorization.
 
+A caller may opt into cancellation with `Session::open_cancellable` and
+one cloneable, one-way `Cancellation` handle for the whole operation. The
+parent caps each socket wait at 50 milliseconds to observe revocation,
+while retaining the original absolute deadline. This polls only the
+private worker socket; it does not poll the USB token or replay a report.
+An interrupted or timed-out stream read/write resumes only its remaining
+bytes. Startup, write acknowledgements, partial reports and keepalives all
+observe cancellation. The parent checks again after decoding a completed
+reply; cancellation or expiration drops that reply and closes the Session.
+The existing `open` path retains deadline-only blocking waits.
+
+Cancellation requests no CTAPHID_CANCEL exchange: a worker can already be
+blocked inside device I/O, so another device request cannot be relied on
+for teardown. An observed cancellation kills and reaps the owned worker,
+with the same kernel-wait limitation described above. It cannot undo a
+command already received by the token; no failed or uncertain operation
+is retried. Stopping the worker does not prove the token has left its
+presence wait: a subsequent operation may find it busy until its own
+command completes or times out. This follows from the lack of a device
+abort in this path; see [CTAP transaction abort](https://fidoalliance.org/specs/fido-v2.2-ps-20250714/fido-client-to-authenticator-protocol-v2.2-ps-20250714.html).
+Only a newly presented operation may start another request, never an
+automatic retry of the cancelled operation.
+The cancellation handle has no reset and does not itself own
+the worker. Between calls the operation owner must drop an idle Session
+and all pending protocol state on revocation. A cancellation racing after
+the final transport check still requires the consumer's authorization
+check before releasing a secret or publishing state. These transport
+primitives do not yet wire lock, suspend or UI events to the portable
+backend. Child/socket fixtures exercise early and in-flight cancellation,
+reaping, partial progress without replay and the unchanged deadline.
+
 Every td-owned HID worker takes a nonblocking exclusive file lock before
 opening a token. The stable empty `operation.lock` lives under root-owned
 mode-0700 `/run/td-fido`, with root-owned mode-0600 single-link regular-file

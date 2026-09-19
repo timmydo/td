@@ -458,6 +458,16 @@ are for one transport submission; these types cannot stop a malicious or
 incorrect caller from copying or retransmitting them. No token I/O or
 transport-retry authority is supplied by the codec.
 
+The shared USB transport now offers an opt-in cancellation handle across
+startup and all exchanges, without renewing the deadline or replaying USB
+reports. See `DESIGN.md` under USB token transport for its socket polling,
+worker teardown and final consumer-check contract. The portable codec is
+not yet connected to that transport. Its future owner must route cancel,
+lock, suspend and authority loss to the handle, drop idle sessions and
+pending PIN state, and check authorization before accepting a result.
+The root-only device admission remains unchanged; standalone Guix device
+access is still a separate integration requirement.
+
 Key agreement requires exactly the public EC2/-25/P-256 COSE parameters,
 canonical 32-byte coordinates and curve membership. The entropy callback
 must fill from kernel randomness directly into the candidate allocation.
