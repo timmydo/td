@@ -52,12 +52,11 @@ use crate::types::{Recipe, Step};
 // The actual static link needs the full target toolchain (no target rustc in
 // the loop sandbox); the sibling td-login-test carries that build+assert check.
 //
-// The crate root (`main.rs`) declares each sibling module with `mod NAME;`, so a
-// single `rustc src/main.rs` pulls them all in — but only if every module file is
-// present next to it in {src}. MODULES is held to those `mod` lines by
-// `the_recipe_writes_out_exactly_the_modules_the_crate_declares` below rather than
-// by a comment asking; the crate's own `src_holds_exactly_the_eleven_scanned_modules`
-// is the other half of the pin, from the directory side.
+// The crate root declares sibling modules and one path-qualified shared primary
+// account reader. Preserve that directory layout when staging the sources.
+// MODULES is held to the root's `mod` lines by
+// `the_recipe_writes_out_exactly_the_modules_the_crate_declares` below; the
+// crate's confinement scan pins both local sources and the shared reader.
 //
 // Every source below is written out with a WriteFile, which the ladder
 // `no_bootstrap_step_invokes_host_find_or_xargs` guard scans as a command
@@ -68,13 +67,14 @@ use crate::types::{Recipe, Step};
 // of td-login's is on it.
 const MAIN_RS: &str = include_str!("../../../td-login/src/main.rs");
 
-// (module basename, source text). rustc resolves `mod NAME;` to `{src}/NAME.rs`.
+// (module basename, source text); the shared reader keeps its declared path.
 const MODULES: &[(&str, &str)] = &[
     ("cgroup", include_str!("../../../td-login/src/cgroup.rs")),
     ("creds", include_str!("../../../td-login/src/creds.rs")),
     ("db", include_str!("../../../td-login/src/db.rs")),
     ("exec_as", include_str!("../../../td-login/src/exec_as.rs")),
     ("login", include_str!("../../../td-login/src/login.rs")),
+    ("primary_account", include_str!("../../../td-authd/src/primary_account.rs")),
     ("session", include_str!("../../../td-login/src/session.rs")),
     ("status", include_str!("../../../td-login/src/status.rs")),
     ("su", include_str!("../../../td-login/src/su.rs")),
@@ -95,8 +95,8 @@ pub(crate) fn source(name: &str) -> Option<&'static str> {
     MODULES.iter().find(|(n, _)| *n == name).map(|(_, s)| *s)
 }
 
-/// Every `mod NAME;` the embedded crate root declares. `rustc src/main.rs`
-/// resolves each one from the filesystem, so a module `MODULES` does not write
+/// Every `mod NAME;` the embedded crate root declares. rustc resolves each
+/// from its declared filesystem location, so a module `MODULES` does not write
 /// out is a compile error — but one that only surfaces in recipe-checks, on a
 /// rung that needs the whole target toolchain. Deriving the list from the source
 /// makes the mismatch a `cargo test` failure instead.
@@ -140,19 +140,25 @@ pub fn recipe() -> Recipe {
     let path = format!("{bbin}:{gccbin}");
 
     let mut steps = Vec::new();
+    for directory in ["{src}/td-login/src", "{src}/td-authd/src"] {
+        steps.push(Step::MkDir { path: directory.into() });
+    }
     steps.push(Step::MkDir {
         path: "{out}/bin".into(),
     });
     steps.push(Step::WriteFile {
-        path: "{src}/main.rs".into(),
+        path: "{src}/td-login/src/main.rs".into(),
         content: MAIN_RS.into(),
         exec: false,
     });
-    // Every module `main.rs` declares must sit beside it so `rustc src/main.rs`
-    // can resolve `mod NAME;` from the filesystem.
+    // Preserve sibling locations and the shared reader's explicit path.
     for (name, source) in MODULES {
         steps.push(Step::WriteFile {
-            path: format!("{{src}}/{name}.rs"),
+            path: if *name == "primary_account" {
+                "{src}/td-authd/src/primary_account.rs".into()
+            } else {
+                format!("{{src}}/td-login/src/{name}.rs")
+            },
             content: (*source).into(),
             exec: false,
         });
@@ -194,7 +200,7 @@ pub fn recipe() -> Recipe {
                 "-Clink-arg=-static-libgcc",
                 "-o",
                 "{out}/bin/td-login",
-                "{src}/main.rs",
+                "{src}/td-login/src/main.rs",
             ],
         )
         .env("PATH", &path)
@@ -240,9 +246,8 @@ mod tests {
         written.sort_unstable();
         assert_eq!(
             written, declared,
-            "MODULES and src/main.rs's `mod` lines disagree; rustc resolves each \
-             `mod NAME;` to {{src}}/NAME.rs, so every declared module must be written out \
-             and nothing else should be"
+            "MODULES and main.rs's `mod` lines disagree; every declared module \
+             must be staged at the location rustc resolves, and nothing else should be"
         );
         assert!(
             declared.len() >= 8,

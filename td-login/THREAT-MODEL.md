@@ -3,6 +3,8 @@
 td-login is the credential-switching half of td's login chain: the
 `login` and `su` applets, replacing busybox's, plus the `exec-as` and
 `exec-service-as` subcommands that run supervised daemons as another user.
+`login-primary` and `exec-primary` select the deployment's UID-1000 human
+and then call the existing `login -f` and ordinary `exec-as` front ends.
 It is the only
 td-owned general-purpose program on a td image whose job is to *change* a
 process's Unix credentials, so a
@@ -222,6 +224,30 @@ same credential switch, but a disjoint policy decision accepts only the exact
 `!td-service` shadow marker. It rejects an empty field, a hash and an ordinary
 lock, so a unit cannot turn the service path into a second way to enter a
 human account.
+
+`login-primary` takes no operands; `exec-primary -- PROGRAM [ARG…]` takes
+the same absolute program and literal argument tail as `exec-as`. Neither
+accepts a name, UID, account-file path or environment override. They resolve
+the primary name through the shared `td-authd/src/primary_account.rs` reader:
+a root-owned, regular mode-0644 `/etc/passwd`, bounded canonical records,
+unique names and UIDs, UID/GID 1000 and its canonical named home. The normal
+front end then independently authorizes that name against shadow, resolves
+groups and enters the existing credential switch. Publication must precede
+sessions; concurrent privileged account-file rewriting is outside this model.
+These selectors neither authenticate nor grant authority: `login-primary`
+retains the all-root caller requirement of `login -f`; `exec-primary` retains
+the ordinary forced policy and same-credentials no-op behavior. Locked and
+service-only accounts remain denied. A missing or malformed primary record
+refuses without a fallback name. Environment and terminal handling follow
+their existing front ends exactly. The applet/symlink roster stays `login,su`.
+
+The shared reader is compiled beneath `forbid(unsafe_code)` and is included
+in the source-level confinement scan alongside the local modules. Exactly
+one reviewed external path is admitted; other path attributes and code
+inclusion remain forbidden. Metadata's zero-argument UID reads are distinct
+from credential setters, and the reader's test-only mode-0644/0666 fixtures
+are pinned separately from the two production terminal mode writes. No
+credential syscall, policy decision or terminal handover is added.
 
 | `/etc/shadow` field | class        | interactive `login` | `login -f` | `su`, `exec-as` (forced) | `exec-service-as` |
 | ------------------- | ------------ | ------------------- | ---------- | ------------------------ | ----------------- |
@@ -585,10 +611,19 @@ assert equality against `/proc/self/status`.
 - `cargo test` covers the parsers, the policy table, the ordering
   confinement, and the `/proc/self/status` reader against captured
   fixtures.
-- The boot itself is the success-path oracle: `login -f` is how a td
-  image reaches its greeter at all, and `su` is how every health leg in
-  `/etc/bootsuccess` runs unprivileged. Neither can regress without the
-  boot failing.
+- The disposable `td-authd/tests/launch_vm.rs` QEMU fixture exercises
+  both primary selectors with `alice`, UID/GID 1000. Its child probes
+  check all four UID/GID columns, supplementary groups, cleared held
+  capabilities, environment replacement and working directories.
+  A nonroot forced login, foreign-UID primary exec, locked/service-only
+  shadow records, missing UID 1000 and duplicate UID aliases must refuse.
+  The foreign-UID case temporarily makes the disposable guest's shadow
+  readable to prove the credential gate itself refuses the switch. This
+  fixture is a host diagnostic supplied with the target td-login binary,
+  not image content.
+- The boot exercises login's forced-session path through `login-primary`
+  and credential health probes through `su`. Unit tests cover the login
+  applet's basename route; the image shape check pins its symlink.
 - `TD-LOGIN-RUN-OK` is the credential-specific evidence. `/etc/bootsuccess`
   runs `su` to the unprivileged user and has `td-login verify-credentials`
   read `/proc/self/status` back, asserting the exact uid, gid and

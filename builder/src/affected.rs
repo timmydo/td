@@ -5069,8 +5069,8 @@ mod tests {
             readers_of("td-compositor"),
             ["td-authd", "td-editor", "td-jail", "td-photo", "td-portal", "td-seatd", "td-secret", "td-setup", "td-taskmgr", "td-ui", "td-vm", "td-vm-guest"]
         );
-        // Jail shares the primary-account reader used by grant preparation.
-        assert_eq!(readers_of("td-authd"), ["td-compositor", "td-firstboot", "td-jail", "td-secret"]);
+        // Jail and login share the primary-account reader used by grant preparation.
+        assert_eq!(readers_of("td-authd"), ["td-compositor", "td-firstboot", "td-jail", "td-login", "td-secret"]);
         // td-login is here for a test's argument string `/bin/td-busd/`, no
         // read at all: the edge only widens, and pinning it pins the rule that
         // a name is a name wherever it is spelled.
@@ -5117,6 +5117,7 @@ mod tests {
                 "td-firstboot",
                 "td-install",
                 "td-jail",
+                "td-login",
                 "td-photo",
                 "td-portal",
                 "td-seatd",
@@ -7199,6 +7200,7 @@ mod tests {
                 "td-firstboot",
                 "td-install",
                 "td-jail",
+                "td-login",
                 "td-photo",
                 "td-portal",
                 "td-seatd",
@@ -7211,7 +7213,7 @@ mod tests {
             ]
         );
         // td-photo's native case makes its commands three, as td-setup's are.
-        assert_eq!(comp.len(), 37, "{comp:?}");
+        assert_eq!(comp.len(), 39, "{comp:?}");
         // Runtime td-vm/ spellings conservatively connect the same reader set.
         assert_eq!(vm, comp);
         assert_eq!(

@@ -116,12 +116,18 @@ application accounts. Account databases, home paths, application grants,
 service configuration and automatic login must agree before the session
 starts. Existing `/home/tester` assumptions need an atomic cutover in the
 installed profile. Grant preparation and jail admission already share a
-validated UID-1000 account lookup; account publication, login and remaining
+validated UID-1000 account lookup; account publication and remaining
 home-path consumers still need that cutover. Authd's Claude workspace mapping
 and task directory and the jail's Firefox download probe use the same
 primary-account lookup. The compositor sends typed launch requests without
 paths in the installed authority profile; its direct development launcher
 still has its separate fixed task directory. The stock account is `tester`.
+The stock console uses `td-login login-primary`, and literal human-UID
+service commands use `td-login exec-primary`. Both resolve the current
+UID-1000 account and retain td-login's existing authorization and credential
+checks. The terminal authority's configured name, firstboot/home setup and
+remaining diagnostic shell commands still need the coordinated cutover;
+these selectors alone do not activate a saved username.
 Updates must retain the installed identity and settings.
 
 `td-firstboot check-primary-name ROOT NAME` is a read-only preflight for a

@@ -272,6 +272,7 @@ fn init() {
         ("/etc/group","root:x:0:\nalice:x:1000:\ntdc1000:x:993:\n",0o644),
         ("/etc/shadow","root::1:0:99999:7:::\nalice::1:0:99999:7:::\ntdc1000:!td-service:1:0:99999:7:::\n",0o600),
     ] { fs::write(path,text).unwrap();fs::set_permissions(path,fs::Permissions::from_mode(mode)).unwrap(); }
+    primary_login_checks();
     assert!(Command::new("/bin/td-firstboot")
         .args(["check-launch-session", "alice", "1000", "993"])
         .status()
@@ -308,6 +309,86 @@ fn init() {
     park();
 }
 
+fn primary_probe(login: bool) {
+    let status = fs::read_to_string("/proc/self/status").unwrap();
+    for key in ["Uid:", "Gid:"] {
+        let ids = status.lines().find_map(|line| line.strip_prefix(key)).unwrap();
+        assert_eq!(ids.split_whitespace().collect::<Vec<_>>(), ["1000"; 4]);
+    }
+    for key in ["CapPrm:", "CapEff:", "CapAmb:"] {
+        assert_eq!(status.lines().find_map(|line| line.strip_prefix(key)).unwrap().trim(),
+            "0000000000000000");
+    }
+    assert_eq!(status.lines().find_map(|line| line.strip_prefix("Groups:")).unwrap().trim(), "1000");
+    for (key, value) in [("USER", "alice"), ("LOGNAME", "alice"), ("HOME", "/home/alice"),
+        ("PATH", "/bin"), ("SHELL", "/pair-probe")] {
+        assert_eq!(std::env::var(key).unwrap(), value);
+    }
+    assert!(std::env::var_os("TD_PRIMARY_POISON").is_none());
+    assert_eq!(std::env::var("TERM").ok(), login.then(|| "td-primary-test".to_string()));
+    assert_eq!(std::env::vars_os().count(), if login { 6 } else { 5 });
+    assert_eq!(std::env::current_dir().unwrap(), Path::new(if login { "/home/alice" } else { "/" }));
+    let refused = Command::new("/bin/td-login").arg("login-primary").output().unwrap();
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("only root may use -f"));
+    println!("TD-PRIMARY-LOGIN-PROBE-OK");
+}
+
+fn primary_login_checks() {
+    let original = fs::read_to_string("/etc/passwd").unwrap();
+    let shadow = fs::read_to_string("/etc/shadow").unwrap();
+    let passwd = original.replace("/home/alice:/bin/false", "/home/alice:/pair-probe");
+    fs::write("/etc/passwd", &passwd).unwrap();
+    let invoke = |args: &[&str]| {
+        Command::new("/bin/td-login").args(args)
+            .env("USER", "root").env("HOME", "/root")
+            .env("TD_PRIMARY_POISON", "untrusted").env("TERM", "td-primary-test")
+            .output().unwrap()
+    };
+    let commands: [&[&str]; 2] = [
+        &["exec-primary", "--", "/pair-probe", "--primary-exec-probe"],
+        &["login-primary"],
+    ];
+    for command in commands {
+        let result = invoke(command);
+        assert!(result.status.success(), "primary session failed: {}", String::from_utf8_lossy(&result.stderr));
+        assert_eq!(String::from_utf8(result.stdout).unwrap(), "TD-PRIMARY-LOGIN-PROBE-OK\n");
+    }
+    // In this disposable guest only, permit shadow reads so the foreign-UID
+    // case reaches the credential gate rather than failing to open the file.
+    fs::set_permissions("/etc/shadow", fs::Permissions::from_mode(0o644)).unwrap();
+    let foreign = invoke(&["exec-service-as", "tdc1000", "--", "/bin/td-login",
+        "exec-primary", "--", "/pair-probe", "--primary-exec-probe"]);
+    fs::set_permissions("/etc/shadow", fs::Permissions::from_mode(0o600)).unwrap();
+    assert!(!foreign.status.success());
+    assert!(foreign.stdout.is_empty());
+    let error = String::from_utf8_lossy(&foreign.stderr);
+    assert!(error.contains("only root may switch credentials"), "{error}");
+    assert!(error.contains("[993, 993, 993, 993]"), "{error}");
+    for marker in ["!", "!td-service"] {
+        fs::write("/etc/shadow", shadow.replace("alice::", &format!("alice:{marker}:"))).unwrap();
+        for command in commands {
+            let result = invoke(command);
+            assert!(!result.status.success(), "primary path admitted {marker}");
+            assert!(result.stdout.is_empty());
+            assert!(String::from_utf8_lossy(&result.stderr).contains(
+                if marker == "!" { "is locked" } else { "is service-only" }));
+        }
+    }
+    fs::write("/etc/shadow", &shadow).unwrap();
+    for bad in [passwd.replace("1000:1000", "1001:1001"),
+        format!("{passwd}alias:x:1000:1000:Alias:/home/alias:/pair-probe\n")] {
+        fs::write("/etc/passwd", bad).unwrap();
+        for command in commands {
+            let result = invoke(command);
+            assert!(!result.status.success());
+            assert!(result.stdout.is_empty());
+        }
+    }
+    fs::write("/etc/passwd", original).unwrap();
+    println!("TD-PRIMARY-LOGIN-VM: PASS");
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args
@@ -334,6 +415,8 @@ fn main() {
         return;
     }
     match args.get(1).map(String::as_str) {
+        Some("--primary-exec-probe") => primary_probe(false),
+        None if args.first().is_some_and(|arg| arg == "-pair-probe") => primary_probe(true),
         Some("--taskmgr-peer") => taskmgr::peer(),
         Some("--taskmgr-driver") => taskmgr::driver(),
         Some("--taskmgr-owned") => taskmgr::owned(),

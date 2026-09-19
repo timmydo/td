@@ -492,9 +492,10 @@ it is a few dozen lines over immutable input.
 
 `td-svc` has no `user=` field; the existing units spell the credential
 switch as `exec=/bin/su -s /bin/sh {user} -c '…'`. Rather than write more
-shell (directive 3), add a **`td-login exec-as USER -- PROGRAM ARGS`**
-applet using the credential syscalls and readback that crate already has,
-and give the new units a literal argv:
+shell (directive 3), literal human-user commands use
+**`td-login exec-primary -- PROGRAM ARGS`**. It resolves the validated
+UID/GID-1000 account at runtime and uses the existing credential switch and
+readback. Named service identities use `exec-service-as`:
 
 ```ini
 [busd]
@@ -503,7 +504,7 @@ cgroup=service
 exec=/bin/td-login exec-service-as tdb1000 -- /bin/td-busd run-session
 after=seat
 requires=seat,td-firstboot
-ready=/bin/td-login exec-as tester -- /bin/td-busd probe /run/td-bus/1000/bus
+ready=/bin/td-login exec-primary -- /bin/td-busd probe /run/td-bus/1000/bus
 ready-timeout=30
 restart=always
 
@@ -520,14 +521,14 @@ exec=/bin/td-portal supervise --bus /run/td-bus/1000/bus \
      --settings /etc/td-portal-settings
 after=busd,portal-files
 requires=busd
-ready=/bin/td-login exec-as tester -- /bin/td-portal probe \
+ready=/bin/td-login exec-primary -- /bin/td-portal probe \
       --bus /run/td-bus/1000/bus --settings /etc/td-portal-settings
 ready-timeout=30
 restart=always
 
 [portal-evidence]
 type=oneshot
-exec=/bin/td-login exec-as tester -- /bin/td-portal probe \
+exec=/bin/td-login exec-primary -- /bin/td-portal probe \
      --bus /run/td-bus/1000/bus --settings /etc/td-portal-settings
 after=portal
 requires=portal

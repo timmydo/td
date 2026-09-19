@@ -1,10 +1,11 @@
 # Guest development identity helper
 
 `td-vm-guest serve` is a dependency-free, source-built service in the standard
-image. `td-svc` launches it with the existing `td-login exec-as tester` path,
-after seat setup and networking, requiring seat setup and firstboot. It runs
-as UID 1000 in the session cgroup. This mode has no root operation and adds no unsafe
-surface. The separate root power mode below has no Git or credential job. A running process is not a claim that a workspace is ready.
+image. `td-svc` launches it with `td-login exec-primary`, which resolves the
+validated UID/GID-1000 account at runtime, after seat setup and networking,
+requiring seat setup and firstboot. It runs in the session cgroup. The stock
+account and the helper's fixed home paths remain `tester`. This mode has no
+root operation and adds no unsafe surface. The separate root power mode below has no Git or credential job. A running process is not a claim that a workspace is ready.
 
 The compositor owns the VM carrier and writes one public 32-digit lowercase
 hexadecimal instance ID to `/run/td-compositor/1000/vm-git-identity`. The helper

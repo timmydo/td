@@ -189,7 +189,8 @@ struct SystemDef {
     /// Welcome banner printed by the login shell (via `/etc/profile`).
     motd: &'static str,
     /// The user getty auto-logs-in on ttyS0, through `/etc/autologin` running
-    /// `login -f`. td-login refuses `-f` for a LOCKED account, so this user must be
+    /// the primary selector (named login for non-primary fixtures). td-login
+    /// refuses forced login for a LOCKED account, so this user must be
     /// `passwordless` — `system_def_is_self_consistent` holds that.
     autologin: &'static str,
     users: &'static [User],
@@ -444,8 +445,8 @@ const SHIPPED_APPLICATIONS: &[ShippedApplication] = &[
 ];
 
 /// Account names are embedded UNQUOTED in generated root shell — `/bin/su -s /bin/sh
-/// <name> -c …` in rootcheck and every health leg, and `/bin/login -f <name>` in
-/// /etc/autologin — and unquoted in the colon-separated /etc/{passwd,group,shadow}
+/// <name> -c …` in diagnostic health legs and named logins for non-primary
+/// autologin fixtures — and in the colon-separated /etc/{passwd,group,shadow}
 /// this recipe writes. A name carrying `$(…)` would run as ROOT at sysinit; one
 /// carrying `:` would silently restructure the account database. This is the same
 /// hazard `valid_home` below already guards, applied to the other string that
@@ -689,13 +690,11 @@ const DROPPED_APPLETS: &[&str] = &["vi", "more", "awk"];
 /// a malfunction: `setuid(2)` before `setgroups(2)` drops the uid and silently keeps the
 /// previous holder's supplementary groups. td-login/THREAT-MODEL.md is the specification.
 ///
-/// Both names are LOAD-BEARING on this image, more so than any other farm here. `/bin/login`
-/// is what getty execs through `/etc/autologin`, so it is how the machine reaches its greeter
-/// at all; `/bin/su` is how `/etc/rootcheck` and `/etc/bootsuccess` run every unprivileged
-/// health leg. Neither can regress without the boot failing, which is why — unlike td-util
-/// and td-init — this farm needs no synthetic per-name probe. What the boot cannot see is a
-/// switch that started a working session while leaving a residual credential behind, and
-/// that is what `TD_LOGIN_RUNTIME_MARKER` gates on.
+/// The stock console enters login's forced-session path through login-primary;
+/// health probes still use the su applet. The boot exercises their session and
+/// credential behavior, while login's basename dispatch is covered by unit tests
+/// and the image shape check pins its symlink. TD_LOGIN_RUNTIME_MARKER also
+/// verifies that a working session retained no unexpected credentials.
 ///
 /// td-login is an ET_EXEC with an EMPTY runtime closure: a `login` that dies with the
 /// dynamic closure locks an operator out of the console exactly when the closure is what
@@ -1416,7 +1415,7 @@ fn build_td_svc_conf() -> String {
          [release-source]\n\
          type=oneshot\n\
          cgroup=session\n\
-         exec=/bin/td-login exec-as {ui_user} -- /bin/td-update init\n\
+         exec=/bin/td-login exec-primary -- /bin/td-update init\n\
          after=td-firstboot\n\
          requires=td-firstboot\n\
          timeout=180\n\
@@ -1475,7 +1474,7 @@ fn build_td_svc_conf() -> String {
          [vm-guest]\n\
          type=daemon\n\
          cgroup=session\n\
-         exec=/bin/td-login exec-as {ui_user} -- /bin/td-vm-guest serve\n\
+         exec=/bin/td-login exec-primary -- /bin/td-vm-guest serve\n\
          after=seat,netup\n\
          requires=seat,td-firstboot\n\
          restart=always\n\
@@ -1509,7 +1508,7 @@ fn build_td_svc_conf() -> String {
          exec=/bin/td-login exec-service-as {broker_user} -- /bin/td-busd run-session\n\
          after=seat\n\
          requires=seat,td-firstboot\n\
-         ready=/bin/td-login exec-as {ui_user} -- /bin/td-busd probe {bus_socket}\n\
+         ready=/bin/td-login exec-primary -- /bin/td-busd probe {bus_socket}\n\
          ready-timeout=30\n\
          restart=always\n\
          \n\
@@ -1524,10 +1523,10 @@ fn build_td_svc_conf() -> String {
          [fetchd]\n\
          type=daemon\n\
          cgroup=session\n\
-         exec=/bin/td-login exec-as {ui_user} -- /bin/td-fetchd run --socket /run/user/{ui_uid}/td-fetch/socket\n\
+         exec=/bin/td-login exec-primary -- /bin/td-fetchd run --socket /run/user/{ui_uid}/td-fetch/socket\n\
          after=seat,netup\n\
          requires=seat\n\
-         ready=/bin/td-login exec-as {ui_user} -- /bin/td-fetchd probe /run/user/{ui_uid}/td-fetch/socket\n\
+         ready=/bin/td-login exec-primary -- /bin/td-fetchd probe /run/user/{ui_uid}/td-fetch/socket\n\
          ready-timeout=30\n\
          restart=always\n\
          \n\
@@ -1578,7 +1577,7 @@ fn build_td_svc_conf() -> String {
          exec=/bin/td-authd application-start {ui_uid} {claude_name} shell --\n\
          after=claude-files,busd\n\
          requires=td-firstboot,claude-files,busd\n\
-         ready=/bin/td-login exec-as {ui_user} -- /bin/td-authd application-probe\n\
+         ready=/bin/td-login exec-primary -- /bin/td-authd application-probe\n\
          ready-timeout=30\n\
          restart=on-failure\n\
          \n\
@@ -1591,7 +1590,7 @@ fn build_td_svc_conf() -> String {
          # exact lines; the shell leader stays, so the unit keeps its leaf.\n\
          [fetch-evidence]\n\
          type=oneshot\n\
-         exec=/bin/sh -c 'case \" $(/bin/cat /proc/cmdline) \" in *\" {autotest_cmdline_token} \"*) :;; *) exit 0;; esac; /bin/td-login exec-as {ui_user} -- /bin/td-fetchd probe /run/user/{ui_uid}/td-fetch/socket && /bin/echo {fetch_marker}'\n\
+         exec=/bin/sh -c 'case \" $(/bin/cat /proc/cmdline) \" in *\" {autotest_cmdline_token} \"*) :;; *) exit 0;; esac; /bin/td-login exec-primary -- /bin/td-fetchd probe /run/user/{ui_uid}/td-fetch/socket && /bin/echo {fetch_marker}'\n\
          after=fetchd,firefox-tls-setup\n\
          requires=fetchd\n\
          timeout={application_evidence}\n\
@@ -1610,7 +1609,7 @@ fn build_td_svc_conf() -> String {
          exec=/bin/td-portal supervise --bus {bus_socket} --settings {portal_settings}\n\
          after=busd,portal-files\n\
          requires=busd\n\
-         ready=/bin/td-login exec-as {ui_user} -- /bin/td-portal probe --bus {bus_socket} --settings {portal_settings}\n\
+         ready=/bin/td-login exec-primary -- /bin/td-portal probe --bus {bus_socket} --settings {portal_settings}\n\
          ready-timeout=30\n\
          restart=always\n\
          log={portal_service_log}\n\
@@ -1630,7 +1629,7 @@ fn build_td_svc_conf() -> String {
          [portal-evidence]\n\
          type=oneshot\n\
          cgroup=session\n\
-         exec=/bin/td-login exec-as {ui_user} -- /bin/td-portal probe --bus {bus_socket} --settings {portal_settings}\n\
+         exec=/bin/td-login exec-primary -- /bin/td-portal probe --bus {bus_socket} --settings {portal_settings}\n\
          after=portal,firefox-tls-setup\n\
          requires=portal\n\
          timeout=30\n\
@@ -1645,14 +1644,14 @@ fn build_td_svc_conf() -> String {
          pair-exec=/bin/td-login exec-service-as {compositor_user} -- /bin/td-compositor run --framebuffer /dev/fb0 --input /dev/input --socket {wayland_socket} --portal-socket {portal_wayland_socket} --control-socket {control_socket} --launcher-application {firefox_name} --terminal-authority stdin --application-ready-socket {firefox_window_ready_socket} --application-app-id {firefox_app_id} --application-content-rgb-a {firefox_content_rgb_a} --application-content-rgb-b {firefox_content_rgb_b}\n\
          after=seat\n\
          requires=seat\n\
-         ready=/bin/td-login exec-as {ui_user} -- /bin/td-compositor probe {wayland_socket}\n\
+         ready=/bin/td-login exec-primary -- /bin/td-compositor probe {wayland_socket}\n\
          ready-timeout=30\n\
          restart=always\n\
          \n\
          [seat-access-evidence]\n\
          type=oneshot\n\
          cgroup=session\n\
-         exec=/bin/td-login exec-as {ui_user} -- /bin/td-seatd probe-access --uid {ui_uid} --gid {ui_gid} --compositor-uid {compositor_uid} --audio-uid {audio_uid} --audio-gid {audio_gid}\n\
+         exec=/bin/td-login exec-primary -- /bin/td-seatd probe-access --uid {ui_uid} --gid {ui_gid} --compositor-uid {compositor_uid} --audio-uid {audio_uid} --audio-gid {audio_gid}\n\
          after=wayland,firefox-tls-setup\n\
          requires=wayland\n\
          timeout=30\n\
@@ -1762,7 +1761,7 @@ fn build_td_svc_conf() -> String {
          # marker waits for TLS setup like the other exact lines.\n\
          [placement-evidence]\n\
          type=oneshot\n\
-         exec=/bin/sh -c 'case \" $(/bin/cat /proc/cmdline) \" in *\" {autotest_cmdline_token} \"*) :;; *) exit 0;; esac; layout=$(/bin/td-login exec-as {ui_user} -- /bin/td-ctl --socket {control_socket} layout) || exit 1; /bin/echo \"$layout\" | /bin/grep -qxF \"workspace active=1 occupied=1,{application_workspace}\" && /bin/td-util test \"$(/bin/echo \"$layout\" | /bin/grep -c \"^window id=[^ ]* object=[^ ]* workspace=1 \")\" -eq 1 && /bin/echo {placed_marker}'\n\
+         exec=/bin/sh -c 'case \" $(/bin/cat /proc/cmdline) \" in *\" {autotest_cmdline_token} \"*) :;; *) exit 0;; esac; layout=$(/bin/td-login exec-primary -- /bin/td-ctl --socket {control_socket} layout) || exit 1; /bin/echo \"$layout\" | /bin/grep -qxF \"workspace active=1 occupied=1,{application_workspace}\" && /bin/td-util test \"$(/bin/echo \"$layout\" | /bin/grep -c \"^window id=[^ ]* object=[^ ]* workspace=1 \")\" -eq 1 && /bin/echo {placed_marker}'\n\
          after=shell-workspace,firefox-tls-setup\n\
          requires=shell-workspace\n\
          timeout={application_place}\n\
@@ -1781,7 +1780,7 @@ fn build_td_svc_conf() -> String {
          [firefox-tls-origin]\n\
          type=daemon\n\
          cgroup=session\n\
-         exec=/bin/td-login exec-as {ui_user} -- /etc/firefox-tls-origin\n\
+         exec=/bin/td-login exec-primary -- /etc/firefox-tls-origin\n\
          after=firefox-tls-setup\n\
          requires=firefox-tls-setup\n\
          ready=/etc/firefox-tls-ready\n\
@@ -1814,7 +1813,7 @@ fn build_td_svc_conf() -> String {
          exec=/bin/sh -c 'case \" $(/bin/cat /proc/cmdline) \" in *\" {autotest_cmdline_token} \"*) exec /bin/td-authd application-start {ui_uid} {firefox_name} direct -- --marionette --remote-allow-system-access --profile {firefox_autotest_profile} {firefox_tls_url};; *) exec /bin/td-authd application-start {ui_uid} {firefox_name} direct --;; esac'\n\
          after=audio,busd,portal,wayland,firefox-files,firefox-autotest,firefox-tls-origin,placement-evidence\n\
          requires=wayland,firefox-autotest,firefox-tls-origin,firefox-files,td-firstboot\n\
-         ready=/bin/sh -c 'case \" $(/bin/cat /proc/cmdline) \" in *\" {autotest_cmdline_token} \"*) exec /bin/td-login exec-as {ui_user} -- /bin/td-compositor probe-application {firefox_window_ready_socket} {firefox_app_id} {firefox_content_rgb_a} {firefox_content_rgb_b} --quiet;; *) exit 0;; esac'\n\
+         ready=/bin/sh -c 'case \" $(/bin/cat /proc/cmdline) \" in *\" {autotest_cmdline_token} \"*) exec /bin/td-login exec-primary -- /bin/td-compositor probe-application {firefox_window_ready_socket} {firefox_app_id} {firefox_content_rgb_a} {firefox_content_rgb_b} --quiet;; *) exit 0;; esac'\n\
          ready-timeout={firefox_ready_timeout}\n\
          restart=always\n\
          \n\
@@ -1831,7 +1830,7 @@ fn build_td_svc_conf() -> String {
          # the authority.\n\
          [firefox-evidence]\n\
          type=daemon\n\
-         exec=/bin/sh -c 'case \" $(/bin/cat /proc/cmdline) \" in *\" {autotest_cmdline_token} \"*) :;; *) exit 0;; esac; n=0; s=0; while [ \"$n\" -lt {firefox_evidence_wait} ]; do if application=$(/bin/td-login exec-as {ui_user} -- /bin/td-compositor probe-application {firefox_window_ready_socket} {firefox_app_id} {firefox_content_rgb_a} {firefox_content_rgb_b} 2>/dev/null) && content=$(/bin/td-login exec-service-as tda65536 -- /bin/td-jail --probe-process-token {firefox_name} -contentproc 2>/dev/null) && /bin/td-login exec-service-as tda65536 -- /bin/td-jail --probe-resource-caps {firefox_name}; then if support=$(/bin/td-login exec-service-as tda65536 -- /bin/td-jail --probe-firefox-support); then network=; case \" $(/bin/cat /proc/cmdline) \" in *\" {nettest_cmdline_token} \"*) network=$(/bin/td-login exec-service-as tda65536 -- /bin/td-jail --probe-firefox-network) || exit 1; [ \"$network\" = {firefox_network_marker} ] || exit 1;; esac; /bin/rm -f {firefox_evidence_tmp_path} {firefox_completion_tmp_path} && /bin/td-util printf \"%s\\n\" {firefox_evidence} > {firefox_evidence_tmp_path} && /bin/td-util chmod 0644 {firefox_evidence_tmp_path} && /bin/mv {firefox_evidence_tmp_path} {firefox_evidence_path} && /bin/td-util printf \"%s\\n\" \"$application\" && /bin/td-util printf \"%s\\n\" \"$content\" && /bin/td-util printf \"%s\\n\" \"$support\" && /bin/td-util printf \"%s\\n\" \"$network\" && /bin/echo {firefox_marker} && /bin/echo {firefox_content_marker} && /bin/echo {firefox_support_marker} && /bin/td-util printf \"%s\\n\" {firefox_completion} > {firefox_completion_tmp_path} && /bin/td-util chmod 0644 {firefox_completion_tmp_path} && /bin/mv {firefox_completion_tmp_path} {firefox_completion_path} && exit 0; exit 1; fi; s=$((s+1)); [ \"$s\" -lt {firefox_support_attempts} ] || exit 1; fi; n=$((n+1)); /bin/td-util sleep 1; done; exit 1'\n\
+         exec=/bin/sh -c 'case \" $(/bin/cat /proc/cmdline) \" in *\" {autotest_cmdline_token} \"*) :;; *) exit 0;; esac; n=0; s=0; while [ \"$n\" -lt {firefox_evidence_wait} ]; do if application=$(/bin/td-login exec-primary -- /bin/td-compositor probe-application {firefox_window_ready_socket} {firefox_app_id} {firefox_content_rgb_a} {firefox_content_rgb_b} 2>/dev/null) && content=$(/bin/td-login exec-service-as tda65536 -- /bin/td-jail --probe-process-token {firefox_name} -contentproc 2>/dev/null) && /bin/td-login exec-service-as tda65536 -- /bin/td-jail --probe-resource-caps {firefox_name}; then if support=$(/bin/td-login exec-service-as tda65536 -- /bin/td-jail --probe-firefox-support); then network=; case \" $(/bin/cat /proc/cmdline) \" in *\" {nettest_cmdline_token} \"*) network=$(/bin/td-login exec-service-as tda65536 -- /bin/td-jail --probe-firefox-network) || exit 1; [ \"$network\" = {firefox_network_marker} ] || exit 1;; esac; /bin/rm -f {firefox_evidence_tmp_path} {firefox_completion_tmp_path} && /bin/td-util printf \"%s\\n\" {firefox_evidence} > {firefox_evidence_tmp_path} && /bin/td-util chmod 0644 {firefox_evidence_tmp_path} && /bin/mv {firefox_evidence_tmp_path} {firefox_evidence_path} && /bin/td-util printf \"%s\\n\" \"$application\" && /bin/td-util printf \"%s\\n\" \"$content\" && /bin/td-util printf \"%s\\n\" \"$support\" && /bin/td-util printf \"%s\\n\" \"$network\" && /bin/echo {firefox_marker} && /bin/echo {firefox_content_marker} && /bin/echo {firefox_support_marker} && /bin/td-util printf \"%s\\n\" {firefox_completion} > {firefox_completion_tmp_path} && /bin/td-util chmod 0644 {firefox_completion_tmp_path} && /bin/mv {firefox_completion_tmp_path} {firefox_completion_path} && exit 0; exit 1; fi; s=$((s+1)); [ \"$s\" -lt {firefox_support_attempts} ] || exit 1; fi; n=$((n+1)); /bin/td-util sleep 1; done; exit 1'\n\
          after=firefox,netup\n\
          restart=never\n\
          \n\
@@ -1855,14 +1854,14 @@ fn build_td_svc_conf() -> String {
          [terminal-authority-evidence]\n\
          type=oneshot\n\
          cgroup=session\n\
-         exec=/bin/td-login exec-as {ui_user} -- /bin/td-compositor probe-terminal-authority\n\
+         exec=/bin/td-login exec-primary -- /bin/td-compositor probe-terminal-authority\n\
          after=firefox-evidence,placement-evidence\n\
          requires=wayland,terminal\n\
          timeout=90\n\
          \n\
          [firefox-input]\n\
          type=daemon\n\
-         exec=/bin/sh -c 'case \" $(/bin/cat /proc/cmdline) \" in *\" {firefox_input_cmdline_token} \"*) :;; *) exit 0;; esac; /bin/rm -f {firefox_download_path} {firefox_download_part_path} || exit 1; n=0; while [ \"$n\" -lt {firefox_input_evidence_wait} ]; do evidence=$(/bin/td-util cat {firefox_completion_path} 2>/dev/null); [ \"$evidence\" = {firefox_completion} ] && break; n=$((n+1)); /bin/td-util sleep 1; done; [ \"$n\" -lt {firefox_input_evidence_wait} ] || exit 1; n=0; while [ \"$n\" -lt {firefox_input_wait} ]; do /bin/td-login exec-service-as tda65536 -- /bin/td-jail --probe-firefox-input arm && break; n=$((n+1)); /bin/td-util sleep 1; done; [ \"$n\" -lt {firefox_input_wait} ] || exit 1; /bin/td-login exec-service-as tda65536 -- /bin/td-jail --probe-firefox-input focus || exit 1; n=0; while [ \"$n\" -lt {firefox_input_wait} ]; do /bin/td-login exec-service-as tda65536 -- /bin/td-jail --probe-firefox-input menu && break; n=$((n+1)); /bin/td-util sleep 1; done; [ \"$n\" -lt {firefox_input_wait} ] || exit 1; n=0; while [ \"$n\" -lt {firefox_input_wait} ]; do /bin/td-login exec-service-as tda65536 -- /bin/td-jail --probe-firefox-input final && break; n=$((n+1)); /bin/td-util sleep 1; done; [ \"$n\" -lt {firefox_input_wait} ] || exit 1; n=0; while [ \"$n\" -lt {firefox_input_wait} ]; do /bin/td-login exec-service-as tda65536 -- /bin/td-jail --probe-firefox-input clipboard-refocus-arm && break; n=$((n+1)); /bin/td-util sleep 1; done; [ \"$n\" -lt {firefox_input_wait} ] || exit 1; n=0; while [ \"$n\" -lt {firefox_input_wait} ]; do /bin/td-login exec-service-as tda65536 -- /bin/td-jail --probe-firefox-input clipboard-refocus && break; n=$((n+1)); /bin/td-util sleep 1; done; [ \"$n\" -lt {firefox_input_wait} ] || exit 1; n=0; while [ \"$n\" -lt {firefox_input_wait} ]; do /bin/td-login exec-service-as tda65536 -- /bin/td-jail --probe-firefox-input clipboard && break; n=$((n+1)); case \"$n\" in 1) /bin/td-util printf \"%s\\n\" {firefox_clipboard_focus_retry_one};; 2) /bin/td-util printf \"%s\\n\" {firefox_clipboard_focus_retry_two};; *) :;; esac; /bin/td-util sleep 1; done; [ \"$n\" -lt {firefox_input_wait} ] || exit 1; /bin/td-login exec-service-as tda65536 -- /bin/td-jail --probe-firefox-input download || exit 1; n=0; while [ \"$n\" -lt {firefox_download_observe_wait} ]; do if download=$(/bin/td-login exec-as {ui_user} -- /bin/td-jail --probe-firefox-download); then /bin/td-util printf \"%s\\n\" \"$download\" && break; fi; n=$((n+1)); /bin/td-util sleep 1; done; [ \"$n\" -lt {firefox_download_observe_wait} ] || exit 1; portal_done=$(/bin/rg -c \"^{portal_file_chooser_completed} .* response=0$\" {portal_service_log} 2>/dev/null || :); [ -n \"$portal_done\" ] || portal_done=0; /bin/td-login exec-service-as tda65536 -- /bin/td-jail --probe-firefox-input file-chooser || exit 1; /bin/td-login exec-service-as tda65536 -- /bin/td-jail --probe-firefox-input file-chooser-focus || exit 1; n=0; while [ \"$n\" -lt {firefox_file_chooser_wait} ]; do portal_now=$(/bin/rg -c \"^{portal_file_chooser_completed} .* response=0$\" {portal_service_log} 2>/dev/null || :); [ -n \"$portal_now\" ] || portal_now=0; [ \"$portal_now\" -gt \"$portal_done\" ] && break; n=$((n+1)); /bin/td-util sleep 1; done; [ \"$n\" -lt {firefox_file_chooser_wait} ] || exit 1; /bin/td-login exec-service-as tda65536 -- /bin/td-jail --probe-firefox-input file-chooser-result || exit 1; /bin/rm -f {firefox_input_completion_tmp_path} && /bin/td-util printf \"%s\\n\" {firefox_input_completion} > {firefox_input_completion_tmp_path} && /bin/td-util chmod 0644 {firefox_input_completion_tmp_path} && /bin/mv {firefox_input_completion_tmp_path} {firefox_input_completion_path} && exit 0'\n\
+         exec=/bin/sh -c 'case \" $(/bin/cat /proc/cmdline) \" in *\" {firefox_input_cmdline_token} \"*) :;; *) exit 0;; esac; /bin/rm -f {firefox_download_path} {firefox_download_part_path} || exit 1; n=0; while [ \"$n\" -lt {firefox_input_evidence_wait} ]; do evidence=$(/bin/td-util cat {firefox_completion_path} 2>/dev/null); [ \"$evidence\" = {firefox_completion} ] && break; n=$((n+1)); /bin/td-util sleep 1; done; [ \"$n\" -lt {firefox_input_evidence_wait} ] || exit 1; n=0; while [ \"$n\" -lt {firefox_input_wait} ]; do /bin/td-login exec-service-as tda65536 -- /bin/td-jail --probe-firefox-input arm && break; n=$((n+1)); /bin/td-util sleep 1; done; [ \"$n\" -lt {firefox_input_wait} ] || exit 1; /bin/td-login exec-service-as tda65536 -- /bin/td-jail --probe-firefox-input focus || exit 1; n=0; while [ \"$n\" -lt {firefox_input_wait} ]; do /bin/td-login exec-service-as tda65536 -- /bin/td-jail --probe-firefox-input menu && break; n=$((n+1)); /bin/td-util sleep 1; done; [ \"$n\" -lt {firefox_input_wait} ] || exit 1; n=0; while [ \"$n\" -lt {firefox_input_wait} ]; do /bin/td-login exec-service-as tda65536 -- /bin/td-jail --probe-firefox-input final && break; n=$((n+1)); /bin/td-util sleep 1; done; [ \"$n\" -lt {firefox_input_wait} ] || exit 1; n=0; while [ \"$n\" -lt {firefox_input_wait} ]; do /bin/td-login exec-service-as tda65536 -- /bin/td-jail --probe-firefox-input clipboard-refocus-arm && break; n=$((n+1)); /bin/td-util sleep 1; done; [ \"$n\" -lt {firefox_input_wait} ] || exit 1; n=0; while [ \"$n\" -lt {firefox_input_wait} ]; do /bin/td-login exec-service-as tda65536 -- /bin/td-jail --probe-firefox-input clipboard-refocus && break; n=$((n+1)); /bin/td-util sleep 1; done; [ \"$n\" -lt {firefox_input_wait} ] || exit 1; n=0; while [ \"$n\" -lt {firefox_input_wait} ]; do /bin/td-login exec-service-as tda65536 -- /bin/td-jail --probe-firefox-input clipboard && break; n=$((n+1)); case \"$n\" in 1) /bin/td-util printf \"%s\\n\" {firefox_clipboard_focus_retry_one};; 2) /bin/td-util printf \"%s\\n\" {firefox_clipboard_focus_retry_two};; *) :;; esac; /bin/td-util sleep 1; done; [ \"$n\" -lt {firefox_input_wait} ] || exit 1; /bin/td-login exec-service-as tda65536 -- /bin/td-jail --probe-firefox-input download || exit 1; n=0; while [ \"$n\" -lt {firefox_download_observe_wait} ]; do if download=$(/bin/td-login exec-primary -- /bin/td-jail --probe-firefox-download); then /bin/td-util printf \"%s\\n\" \"$download\" && break; fi; n=$((n+1)); /bin/td-util sleep 1; done; [ \"$n\" -lt {firefox_download_observe_wait} ] || exit 1; portal_done=$(/bin/rg -c \"^{portal_file_chooser_completed} .* response=0$\" {portal_service_log} 2>/dev/null || :); [ -n \"$portal_done\" ] || portal_done=0; /bin/td-login exec-service-as tda65536 -- /bin/td-jail --probe-firefox-input file-chooser || exit 1; /bin/td-login exec-service-as tda65536 -- /bin/td-jail --probe-firefox-input file-chooser-focus || exit 1; n=0; while [ \"$n\" -lt {firefox_file_chooser_wait} ]; do portal_now=$(/bin/rg -c \"^{portal_file_chooser_completed} .* response=0$\" {portal_service_log} 2>/dev/null || :); [ -n \"$portal_now\" ] || portal_now=0; [ \"$portal_now\" -gt \"$portal_done\" ] && break; n=$((n+1)); /bin/td-util sleep 1; done; [ \"$n\" -lt {firefox_file_chooser_wait} ] || exit 1; /bin/td-login exec-service-as tda65536 -- /bin/td-jail --probe-firefox-input file-chooser-result || exit 1; /bin/rm -f {firefox_input_completion_tmp_path} && /bin/td-util printf \"%s\\n\" {firefox_input_completion} > {firefox_input_completion_tmp_path} && /bin/td-util chmod 0644 {firefox_input_completion_tmp_path} && /bin/mv {firefox_input_completion_tmp_path} {firefox_input_completion_path} && exit 0'\n\
          after=terminal-authority-evidence\n\
          requires=terminal-authority-evidence\n\
          restart=never\n\
@@ -1875,7 +1874,7 @@ fn build_td_svc_conf() -> String {
          # until kauditd has printed it.\n\
          [firefox-soak]\n\
          type=daemon\n\
-         exec=/bin/sh -c 'case \" $(/bin/cat /proc/cmdline) \" in *\" {firefox_input_cmdline_token} \"*) :;; *) exit 0;; esac; n=0; while [ \"$n\" -lt {firefox_input_pre_soak_wait} ]; do input=$(/bin/td-util cat {firefox_input_completion_path} 2>/dev/null); [ \"$input\" = {firefox_input_stages_completion} ] && break; n=$((n+1)); /bin/td-util sleep 1; done; [ \"$n\" -lt {firefox_input_pre_soak_wait} ] || exit 1; process_before=$(/bin/td-login exec-service-as tda65536 -- /bin/td-jail --probe-process-token {firefox_name} --marionette) || exit 1; set -- $process_before; [ \"$#\" = 5 ] || exit 1; case \"$4\" in pid=*) firefox_pid=${{4#pid=}};; *) exit 1;; esac; case \"$firefox_pid\" in \"\"|*[!0-9]*|0) exit 1;; esac; bus_before=$(/bin/td-login exec-as {ui_user} -- /bin/td-busd application {bus_socket} {firefox_name}) || exit 1; wayland_before=$(/bin/td-login exec-as {ui_user} -- /bin/td-compositor probe-application {firefox_window_ready_socket} {firefox_app_id} {firefox_content_rgb_a} {firefox_content_rgb_b}) || exit 1; soak=$(/bin/td-login exec-service-as tda65536 -- /bin/td-jail --probe-firefox-soak) || exit 1; [ \"$soak\" = \"{firefox_soak_marker}\" ] || exit 1; process_after=$(/bin/td-login exec-service-as tda65536 -- /bin/td-jail --probe-process-token {firefox_name} --marionette) || exit 1; [ \"$process_after\" = \"$process_before\" ] || exit 1; bus_after=$(/bin/td-login exec-as {ui_user} -- /bin/td-busd application {bus_socket} {firefox_name}) || exit 1; [ \"$bus_after\" = \"$bus_before\" ] || exit 1; wayland_after=$(/bin/td-login exec-as {ui_user} -- /bin/td-compositor probe-application {firefox_window_ready_socket} {firefox_app_id} {firefox_content_rgb_a} {firefox_content_rgb_b}) || exit 1; [ \"$wayland_after\" = \"$wayland_before\" ] || exit 1; seccomp=; case \" $(/bin/cat /proc/cmdline) \" in *\" {firefox_audit_cmdline_token} \"*) {seccomp_probe} --audit-marker end || exit 1; n=0; /bin/rm -f {firefox_seccomp_audit_error_path} || exit 1; while [ \"$n\" -lt {firefox_seccomp_audit_wait} ]; do if seccomp=$(/bin/dmesg | /bin/td-jail --probe-firefox-seccomp-audit \"$firefox_pid\" 2>{firefox_seccomp_audit_error_path}); then break; fi; n=$((n+1)); /bin/td-util sleep 1; done; if [ \"$n\" -ge {firefox_seccomp_audit_wait} ]; then /bin/td-util cat {firefox_seccomp_audit_error_path} >&2; exit 1; fi; /bin/rm -f {firefox_seccomp_audit_error_path} || exit 1; [ \"$seccomp\" = \"{firefox_seccomp_audit_marker}\" ] || exit 1;; *) :;; esac; /bin/td-util printf \"%s\\n\" \"$soak\"; [ -z \"$seccomp\" ] || /bin/td-util printf \"%s\\n\" \"$seccomp\"; /bin/rm -f {firefox_input_completion_tmp_path} && /bin/td-util printf \"%s\\n\" {firefox_input_final_completion} > {firefox_input_completion_tmp_path} && /bin/td-util chmod 0644 {firefox_input_completion_tmp_path} && /bin/mv {firefox_input_completion_tmp_path} {firefox_input_completion_path} && exit 0'\n\
+         exec=/bin/sh -c 'case \" $(/bin/cat /proc/cmdline) \" in *\" {firefox_input_cmdline_token} \"*) :;; *) exit 0;; esac; n=0; while [ \"$n\" -lt {firefox_input_pre_soak_wait} ]; do input=$(/bin/td-util cat {firefox_input_completion_path} 2>/dev/null); [ \"$input\" = {firefox_input_stages_completion} ] && break; n=$((n+1)); /bin/td-util sleep 1; done; [ \"$n\" -lt {firefox_input_pre_soak_wait} ] || exit 1; process_before=$(/bin/td-login exec-service-as tda65536 -- /bin/td-jail --probe-process-token {firefox_name} --marionette) || exit 1; set -- $process_before; [ \"$#\" = 5 ] || exit 1; case \"$4\" in pid=*) firefox_pid=${{4#pid=}};; *) exit 1;; esac; case \"$firefox_pid\" in \"\"|*[!0-9]*|0) exit 1;; esac; bus_before=$(/bin/td-login exec-primary -- /bin/td-busd application {bus_socket} {firefox_name}) || exit 1; wayland_before=$(/bin/td-login exec-primary -- /bin/td-compositor probe-application {firefox_window_ready_socket} {firefox_app_id} {firefox_content_rgb_a} {firefox_content_rgb_b}) || exit 1; soak=$(/bin/td-login exec-service-as tda65536 -- /bin/td-jail --probe-firefox-soak) || exit 1; [ \"$soak\" = \"{firefox_soak_marker}\" ] || exit 1; process_after=$(/bin/td-login exec-service-as tda65536 -- /bin/td-jail --probe-process-token {firefox_name} --marionette) || exit 1; [ \"$process_after\" = \"$process_before\" ] || exit 1; bus_after=$(/bin/td-login exec-primary -- /bin/td-busd application {bus_socket} {firefox_name}) || exit 1; [ \"$bus_after\" = \"$bus_before\" ] || exit 1; wayland_after=$(/bin/td-login exec-primary -- /bin/td-compositor probe-application {firefox_window_ready_socket} {firefox_app_id} {firefox_content_rgb_a} {firefox_content_rgb_b}) || exit 1; [ \"$wayland_after\" = \"$wayland_before\" ] || exit 1; seccomp=; case \" $(/bin/cat /proc/cmdline) \" in *\" {firefox_audit_cmdline_token} \"*) {seccomp_probe} --audit-marker end || exit 1; n=0; /bin/rm -f {firefox_seccomp_audit_error_path} || exit 1; while [ \"$n\" -lt {firefox_seccomp_audit_wait} ]; do if seccomp=$(/bin/dmesg | /bin/td-jail --probe-firefox-seccomp-audit \"$firefox_pid\" 2>{firefox_seccomp_audit_error_path}); then break; fi; n=$((n+1)); /bin/td-util sleep 1; done; if [ \"$n\" -ge {firefox_seccomp_audit_wait} ]; then /bin/td-util cat {firefox_seccomp_audit_error_path} >&2; exit 1; fi; /bin/rm -f {firefox_seccomp_audit_error_path} || exit 1; [ \"$seccomp\" = \"{firefox_seccomp_audit_marker}\" ] || exit 1;; *) :;; esac; /bin/td-util printf \"%s\\n\" \"$soak\"; [ -z \"$seccomp\" ] || /bin/td-util printf \"%s\\n\" \"$seccomp\"; /bin/rm -f {firefox_input_completion_tmp_path} && /bin/td-util printf \"%s\\n\" {firefox_input_final_completion} > {firefox_input_completion_tmp_path} && /bin/td-util chmod 0644 {firefox_input_completion_tmp_path} && /bin/mv {firefox_input_completion_tmp_path} {firefox_input_completion_path} && exit 0'\n\
          after=firefox-input\n\
          restart=never\n\
          \n\
@@ -1898,7 +1897,7 @@ fn build_td_svc_conf() -> String {
          # for.\n\
          [claude-evidence]\n\
          type=daemon\n\
-         exec=/bin/sh -c 'case \" $(/bin/cat /proc/cmdline) \" in *\" {autotest_cmdline_token} \"*) :;; *) exit 0;; esac; n=0; while [ \"$n\" -lt {claude_pre_run_wait} ]; do firefox=$(/bin/td-util cat {firefox_completion_path} 2>/dev/null); if [ \"$firefox\" = {firefox_completion} ]; then case \" $(/bin/cat /proc/cmdline) \" in *\" {firefox_input_cmdline_token} \"*) input=$(/bin/td-util cat {firefox_input_completion_path} 2>/dev/null); [ \"$input\" = {firefox_input_final_completion} ] && break;; *) break;; esac; fi; n=$((n+1)); /bin/td-util sleep 1; done; [ \"$n\" -lt {claude_pre_run_wait} ] || exit 1; /bin/rm -f {claude_error_path} {claude_completion_tmp_path} || exit 1; process_before=$(/bin/td-login exec-service-as tda65536 -- /bin/td-jail --probe-process-token {firefox_name} --marionette) || exit 1; bus_before=$(/bin/td-login exec-as {ui_user} -- /bin/td-busd application {bus_socket} {firefox_name}) || exit 1; if refused=$(/bin/td-login exec-service-as tda65539 -- /bin/env TERM=td-term /bin/{claude_name} --version 2>&1 </dev/null); then /bin/echo \"td-claude-evidence: a launch with no terminal of its own ran\"; exit 1; fi; if [ \"$refused\" = \"{claude_refused_line}\" ]; then :; else /bin/td-util printf \"%s\\n\" \"$refused\" > {claude_error_path}; /bin/echo \"td-claude-evidence: the launch with no terminal was refused for another reason, kept in {claude_error_path}\"; exit 1; fi; ran=$(/bin/td-login exec-service-as tda65539 -- /bin/td-term run --socket {wayland_socket} --ready-socket /run/user/65539/td-claude-evidence-ready --command /bin/{claude_name} --version 2>&1 </dev/null); if /bin/td-util printf \"%s\\n\" \"$ran\" | /bin/rg --quiet --line-regexp \"td-term: the terminal.s child exited with status 0\"; then :; else /bin/td-util printf \"%s\\n\" \"$ran\" > {claude_error_path}; /bin/echo \"td-claude-evidence: the launch inside a terminal did not report its child at status 0, kept in {claude_error_path}\"; exit 1; fi; if shell_ran=$(/bin/td-login exec-as {ui_user} -- /bin/env TERM=td-term /bin/{claude_name} --version 2>&1 </dev/null); then :; else /bin/td-util printf \"%s\\n\" \"$shell_ran\" > {claude_error_path}; /bin/echo \"td-claude-evidence: human shell launch failed, kept in {claude_error_path}\"; exit 1; fi; process_after=$(/bin/td-login exec-service-as tda65536 -- /bin/td-jail --probe-process-token {firefox_name} --marionette) || exit 1; [ \"$process_after\" = \"$process_before\" ] || exit 1; bus_after=$(/bin/td-login exec-as {ui_user} -- /bin/td-busd application {bus_socket} {firefox_name}) || exit 1; [ \"$bus_after\" = \"$bus_before\" ] || exit 1; /bin/echo \"{claude_marker}\" && /bin/td-util printf \"%s\\n\" {claude_completion} > {claude_completion_tmp_path} && /bin/td-util chmod 0644 {claude_completion_tmp_path} && /bin/mv {claude_completion_tmp_path} {claude_completion_path} && exit 0; exit 1'\n\
+         exec=/bin/sh -c 'case \" $(/bin/cat /proc/cmdline) \" in *\" {autotest_cmdline_token} \"*) :;; *) exit 0;; esac; n=0; while [ \"$n\" -lt {claude_pre_run_wait} ]; do firefox=$(/bin/td-util cat {firefox_completion_path} 2>/dev/null); if [ \"$firefox\" = {firefox_completion} ]; then case \" $(/bin/cat /proc/cmdline) \" in *\" {firefox_input_cmdline_token} \"*) input=$(/bin/td-util cat {firefox_input_completion_path} 2>/dev/null); [ \"$input\" = {firefox_input_final_completion} ] && break;; *) break;; esac; fi; n=$((n+1)); /bin/td-util sleep 1; done; [ \"$n\" -lt {claude_pre_run_wait} ] || exit 1; /bin/rm -f {claude_error_path} {claude_completion_tmp_path} || exit 1; process_before=$(/bin/td-login exec-service-as tda65536 -- /bin/td-jail --probe-process-token {firefox_name} --marionette) || exit 1; bus_before=$(/bin/td-login exec-primary -- /bin/td-busd application {bus_socket} {firefox_name}) || exit 1; if refused=$(/bin/td-login exec-service-as tda65539 -- /bin/env TERM=td-term /bin/{claude_name} --version 2>&1 </dev/null); then /bin/echo \"td-claude-evidence: a launch with no terminal of its own ran\"; exit 1; fi; if [ \"$refused\" = \"{claude_refused_line}\" ]; then :; else /bin/td-util printf \"%s\\n\" \"$refused\" > {claude_error_path}; /bin/echo \"td-claude-evidence: the launch with no terminal was refused for another reason, kept in {claude_error_path}\"; exit 1; fi; ran=$(/bin/td-login exec-service-as tda65539 -- /bin/td-term run --socket {wayland_socket} --ready-socket /run/user/65539/td-claude-evidence-ready --command /bin/{claude_name} --version 2>&1 </dev/null); if /bin/td-util printf \"%s\\n\" \"$ran\" | /bin/rg --quiet --line-regexp \"td-term: the terminal.s child exited with status 0\"; then :; else /bin/td-util printf \"%s\\n\" \"$ran\" > {claude_error_path}; /bin/echo \"td-claude-evidence: the launch inside a terminal did not report its child at status 0, kept in {claude_error_path}\"; exit 1; fi; if shell_ran=$(/bin/td-login exec-primary -- /bin/env TERM=td-term /bin/{claude_name} --version 2>&1 </dev/null); then :; else /bin/td-util printf \"%s\\n\" \"$shell_ran\" > {claude_error_path}; /bin/echo \"td-claude-evidence: human shell launch failed, kept in {claude_error_path}\"; exit 1; fi; process_after=$(/bin/td-login exec-service-as tda65536 -- /bin/td-jail --probe-process-token {firefox_name} --marionette) || exit 1; [ \"$process_after\" = \"$process_before\" ] || exit 1; bus_after=$(/bin/td-login exec-primary -- /bin/td-busd application {bus_socket} {firefox_name}) || exit 1; [ \"$bus_after\" = \"$bus_before\" ] || exit 1; /bin/echo \"{claude_marker}\" && /bin/td-util printf \"%s\\n\" {claude_completion} > {claude_completion_tmp_path} && /bin/td-util chmod 0644 {claude_completion_tmp_path} && /bin/mv {claude_completion_tmp_path} {claude_completion_path} && exit 0; exit 1'\n\
          after=firefox-soak,claude-files,claude-launch\n\
          requires=td-firstboot,claude-files,claude-launch\n\
          restart=never\n\
@@ -2184,7 +2183,7 @@ fn build_deployment_init(sys: &SystemDef) -> String {
 }
 
 /// The ttyS0 session wrapper, run by init AS ROOT (inittab `respawn`). It runs the
-/// normal getty -> autologin -> `login -f <user>` flow, then, when that session
+/// normal getty -> autologin -> `td-login login-primary` flow, then, when that session
 /// ENDS — the greeter user types `exit` / Ctrl-D — tears the system down and resets
 /// the machine so the VM stops. The auto-login user is UNPRIVILEGED and cannot shut
 /// the system down itself; this wrapper runs as root (init's child), so it does it on
@@ -2254,7 +2253,11 @@ fn build_shutdown() -> String {
 fn build_autologin(sys: &SystemDef) -> String {
     // getty (-n -l) execs this with the tty already set up; force-login the
     // configured user with no authentication.
-    format!("#!/bin/sh\nexec /bin/login -f {}\n", sys.autologin)
+    if sys.users.iter().any(|user| user.name == sys.autologin && user.uid == UI_UID) {
+        "#!/bin/sh\nexec /bin/td-login login-primary\n".into()
+    } else {
+        format!("#!/bin/sh\nexec /bin/login -f {}\n", sys.autologin)
+    }
 }
 
 /// The boot self-check run once at sysinit AS ROOT on the REAL (post-switch_root) root
@@ -5294,7 +5297,7 @@ mod tests {
     #[test]
     fn a_unit_that_hands_its_process_to_td_login_says_so() {
         let handoff_leaders = [
-            format!("/bin/td-login exec-as {UI_USER} "),
+            "/bin/td-login exec-primary ".into(),
             format!("/bin/su -s /bin/sh {UI_USER} "),
             "/bin/td-login exec-service-as tda".into(),
             "/bin/td-authd application-start ".into(),
@@ -5340,6 +5343,20 @@ mod tests {
         // silently returned nothing would otherwise pass this test.
         assert!(!session.is_empty(), "no session units parsed");
         assert!(!service.is_empty(), "no service units parsed");
+    }
+
+    #[test]
+    fn human_literal_commands_and_the_stock_console_resolve_the_primary_account() {
+        let config = build_td_svc_conf();
+        assert!(config.contains("exec=/bin/td-login exec-primary -- /bin/td-update init"));
+        assert!(!config.contains(&format!("/bin/td-login exec-as {UI_USER} --")));
+        assert_eq!(build_autologin(&SYSTEM), "#!/bin/sh\nexec /bin/td-login login-primary\n");
+        // A tailored non-primary console still uses the named login interface.
+        let diagnostic = SystemDef { autologin: "root", ..SYSTEM };
+        assert_eq!(build_autologin(&diagnostic), "#!/bin/sh\nexec /bin/login -f root\n");
+        let source = super::super::td_login::source("main").unwrap();
+        assert!(source.contains("const EXEC_PRIMARY: &str = \"exec-primary\";"));
+        assert!(source.contains("const LOGIN_PRIMARY: &str = \"login-primary\";"));
     }
 
     /// Parse the generated unit table into `(name, [(key, value)])`.
@@ -5868,7 +5885,7 @@ news\tnews-0.1\tsource\tstatic-runtime-1\tsource\n"
         );
         assert_eq!(
             unit_key("firefox-tls-origin", "exec").as_deref(),
-            Some("/bin/td-login exec-as tester -- /etc/firefox-tls-origin")
+            Some("/bin/td-login exec-primary -- /etc/firefox-tls-origin")
         );
         assert_eq!(
             unit_key("firefox-tls-origin", "requires").as_deref(),
@@ -6116,7 +6133,7 @@ news\tnews-0.1\tsource\tstatic-runtime-1\tsource\n"
             firefox_ready,
             format!(
                 "/bin/sh -c 'case \" $(/bin/cat /proc/cmdline) \" in \
-                 *\" {AUTOTEST_CMDLINE_TOKEN} \"*) exec /bin/td-login exec-as tester -- \
+                 *\" {AUTOTEST_CMDLINE_TOKEN} \"*) exec /bin/td-login exec-primary -- \
                  /bin/td-compositor probe-application \
                  {FIREFOX_WINDOW_READY_SOCKET} {FIREFOX_APP_ID} \
                  {FIREFOX_CONTENT_RGB_A} {FIREFOX_CONTENT_RGB_B} --quiet;; \
@@ -6178,7 +6195,7 @@ news\tnews-0.1\tsource\tstatic-runtime-1\tsource\n"
         );
         let evidence = unit_key("firefox-evidence", "exec").unwrap_or_default();
         assert!(evidence.starts_with(&format!(
-            "/bin/sh -c 'case \" $(/bin/cat /proc/cmdline) \" in *\" {AUTOTEST_CMDLINE_TOKEN} \"*) :;; *) exit 0;; esac; n=0; s=0; while [ \"$n\" -lt {FIREFOX_EVIDENCE_WAIT_ITERATIONS} ]; do if application=$(/bin/td-login exec-as tester -- /bin/td-compositor probe-application {FIREFOX_WINDOW_READY_SOCKET} {FIREFOX_APP_ID} {FIREFOX_CONTENT_RGB_A} {FIREFOX_CONTENT_RGB_B} 2>/dev/null) && content=$(/bin/td-login exec-service-as tda65536 -- /bin/td-jail --probe-process-token {FIREFOX_NAME} -contentproc 2>/dev/null) && /bin/td-login exec-service-as tda65536 -- /bin/td-jail --probe-resource-caps {FIREFOX_NAME}; then if support=$(/bin/td-login exec-service-as tda65536 -- /bin/td-jail --probe-firefox-support); then "
+            "/bin/sh -c 'case \" $(/bin/cat /proc/cmdline) \" in *\" {AUTOTEST_CMDLINE_TOKEN} \"*) :;; *) exit 0;; esac; n=0; s=0; while [ \"$n\" -lt {FIREFOX_EVIDENCE_WAIT_ITERATIONS} ]; do if application=$(/bin/td-login exec-primary -- /bin/td-compositor probe-application {FIREFOX_WINDOW_READY_SOCKET} {FIREFOX_APP_ID} {FIREFOX_CONTENT_RGB_A} {FIREFOX_CONTENT_RGB_B} 2>/dev/null) && content=$(/bin/td-login exec-service-as tda65536 -- /bin/td-jail --probe-process-token {FIREFOX_NAME} -contentproc 2>/dev/null) && /bin/td-login exec-service-as tda65536 -- /bin/td-jail --probe-resource-caps {FIREFOX_NAME}; then if support=$(/bin/td-login exec-service-as tda65536 -- /bin/td-jail --probe-firefox-support); then "
         )));
         assert!(evidence.contains(&format!(
             "s=$((s+1)); [ \"$s\" -lt {FIREFOX_SUPPORT_ATTEMPTS} ] || exit 1"
@@ -6651,7 +6668,7 @@ news\tnews-0.1\tsource\tstatic-runtime-1\tsource\n"
         assert!(exec.contains(AUTOTEST_CMDLINE_TOKEN), "{exec}");
         assert!(
             exec.contains(&format!(
-                "/bin/td-login exec-as {UI_USER} -- /bin/td-ctl --socket {CONTROL_SOCKET} layout"
+                "/bin/td-login exec-primary -- /bin/td-ctl --socket {CONTROL_SOCKET} layout"
             )),
             "{exec}"
         );
@@ -6824,7 +6841,7 @@ news\tnews-0.1\tsource\tstatic-runtime-1\tsource\n"
         )));
         assert_eq!(
             unit_key("terminal-authority-evidence", "exec").as_deref(),
-            Some("/bin/td-login exec-as tester -- /bin/td-compositor probe-terminal-authority")
+            Some("/bin/td-login exec-primary -- /bin/td-compositor probe-terminal-authority")
         );
         assert_eq!(
             unit_key("terminal-authority-evidence", "timeout").as_deref(),
@@ -7137,7 +7154,7 @@ news\tnews-0.1\tsource\tstatic-runtime-1\tsource\n"
     #[test]
     fn release_source_initialization_is_unprivileged_and_optional() {
         assert_eq!(unit_key("release-source", "exec").as_deref(),
-            Some("/bin/td-login exec-as tester -- /bin/td-update init"));
+            Some("/bin/td-login exec-primary -- /bin/td-update init"));
         assert_eq!(unit_key("release-source", "type").as_deref(), Some("oneshot"));
         assert_eq!(unit_key("release-source", "cgroup").as_deref(), Some("session"));
         assert_eq!(unit_key("release-source", "requires").as_deref(), Some("td-firstboot"));
@@ -7155,7 +7172,7 @@ news\tnews-0.1\tsource\tstatic-runtime-1\tsource\n"
 
     #[test]
     fn vm_guest_helper_runs_without_root_in_the_standard_image() {
-        assert_eq!(unit_key("vm-guest", "exec").as_deref(), Some("/bin/td-login exec-as tester -- /bin/td-vm-guest serve"));
+        assert_eq!(unit_key("vm-guest", "exec").as_deref(), Some("/bin/td-login exec-primary -- /bin/td-vm-guest serve"));
         assert_eq!(unit_key("vm-power", "exec").as_deref(), Some("/bin/td-vm-guest power-serve"));
         assert_eq!(unit_key("vm-power", "requires").as_deref(), Some("seat"));
         assert_eq!(unit_key("vm-power", "restart").as_deref(), Some("always"));
@@ -7412,7 +7429,7 @@ news\tnews-0.1\tsource\tstatic-runtime-1\tsource\n"
                  --probe-process-token {FIREFOX_NAME} --marionette) || exit 1"
             ),
             format!(
-                "bus_before=$(/bin/td-login exec-as tester -- /bin/td-busd application \
+                "bus_before=$(/bin/td-login exec-primary -- /bin/td-busd application \
                  {SESSION_BUS_SOCKET} {FIREFOX_NAME}) || exit 1"
             ),
             format!(
@@ -7457,7 +7474,7 @@ news\tnews-0.1\tsource\tstatic-runtime-1\tsource\n"
         assert!(after < marker && marker < published);
         assert_eq!(exec.matches("--command").count(), 1);
         assert_eq!(exec.matches("--version").count(), 3);
-        assert!(exec.contains("if shell_ran=$(/bin/td-login exec-as tester -- /bin/env TERM=td-term /bin/claude --version"));
+        assert!(exec.contains("if shell_ran=$(/bin/td-login exec-primary -- /bin/env TERM=td-term /bin/claude --version"));
         assert_eq!(exec.matches("--probe-process-token").count(), 2);
         assert_eq!(exec.matches("/bin/td-busd application").count(), 2);
         // Nothing but this unit publishes the completion, and the greeter
@@ -7485,7 +7502,7 @@ news\tnews-0.1\tsource\tstatic-runtime-1\tsource\n"
         assert_eq!(
             unit_key("busd", "ready"),
             Some(format!(
-                "/bin/td-login exec-as {UI_USER} -- /bin/td-busd probe \
+                "/bin/td-login exec-primary -- /bin/td-busd probe \
                  {SESSION_BUS_SOCKET}"
             )),
             "readiness must be a real client completing the handshake"
@@ -7524,7 +7541,7 @@ news\tnews-0.1\tsource\tstatic-runtime-1\tsource\n"
     #[test]
     fn settings_portal_activation_and_live_probe_are_exact() {
         let probe = format!(
-            "/bin/td-login exec-as {UI_USER} -- /bin/td-portal probe \
+            "/bin/td-login exec-primary -- /bin/td-portal probe \
              --bus {SESSION_BUS_SOCKET} --settings {TD_PORTAL_SETTINGS_PATH}"
         );
         assert_eq!(
@@ -8127,8 +8144,8 @@ news\tnews-0.1\tsource\tstatic-runtime-1\tsource\n"
         }
         assert!(
             valid_account_name(SYSTEM.autologin),
-            "autologin user '{}' must be a plain [A-Za-z0-9._-] name: /etc/autologin execs \
-             `/bin/login -f <name>` unquoted, as root, before any session exists",
+            "autologin user '{}' must be a plain account name for generated account \
+             tables and diagnostic shell commands",
             SYSTEM.autologin
         );
         assert!(
@@ -12297,15 +12314,10 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
     /// td-login is packed, owns `/bin/{login,su}`, and the credential switch it performs is
     /// VERIFIED on the image rather than assumed.
     ///
-    /// This farm differs from td-util's and td-init's in what its failures look like. A dead
-    /// `/bin/login` or `/bin/su` fails the boot outright — nothing reaches a greeter and no
-    /// unprivileged health leg runs — so the SUCCESS path needs no synthetic probe and gets
-    /// none. The failure worth a test is the opposite: a switch that started a perfectly
-    /// working session while leaving a residual credential attached. `setuid(2)` issued
-    /// before `setgroups(2)` drops the uid and keeps root's supplementary groups; every other
-    /// marker on this image still prints. So the assertions here are about the READBACK —
-    /// that the health target actually runs it, through `su`, with the credentials the
-    /// shipped /etc/{passwd,group} imply, and clears the marker gate when it disagrees.
+    /// The stock console and health probes exercise the session machinery;
+    /// unit tests cover login's basename route and the shape check pins its link.
+    /// The readback catches a working session with unexpected credentials, which
+    /// an ordinary successful boot cannot detect.
     #[test]
     fn td_login_serves_its_farm_and_the_credential_switch_is_verified() {
         // THREAT-MODEL.md section 4 says td-login is never installed setuid-root, and
