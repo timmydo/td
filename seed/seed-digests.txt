@@ -86,7 +86,7 @@ tcc-source mhwyc6lcd16pxbln8kwvc4ia5zisf8fn-tcc-source
 td-editor-source k5cnbhwnyhjsjpdvq8pm8khxak358akg-td-editor-source
 td-install-qemu-test-source xha8n9wwjg22cdp0akfg3090pa2yk3r9-td-install-qemu-test-source
 td-mail-source 5h2vf443ja7pskqpwwdmzd4iw6k2r9jx-td-mail-source
-td-net-source 3h910y2sf1m1wbzyzp8izpmjfjf1ckpq-td-net-source
+td-net-source g62l6a5b7hrjx3lrimlgpy93ld6pggqx-td-net-source
 td-news-source r5cycw0wjyg12vydavg0s4fp9dfs35ss-td-news-source
 td-portal-source nhcx3zamw67yjgg60swg0caw8037fcac-td-portal-source
 td-taskmgr-source f6ywj6fnad60b6qnn9y7cn9gw97jyv04-td-taskmgr-source

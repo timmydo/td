@@ -2158,10 +2158,6 @@ fn warm_crate(root: &Path, krate: &str, ver: &str, dest: &str) {
     let want = sources.registry.len();
     let n = copy_crates(&crates_src, &vendor);
     let _ = std::fs::remove_dir_all(srcdir.join("target"));
-    if want == 0 && sources.git_packages == 0 {
-        eprintln!("td-feed warm crate: Cargo.lock has no external dependencies for {krate}-{ver}");
-        return;
-    }
     // Mark complete ONLY if EVERY fetched crate copied. copy_crates silently drops per-file
     // errors, so a partial copy (n>=1 but < the fetched set) would otherwise be sealed by the
     // sentinel and skipped forever while the build-time set-equality gate rejects it (Codex
@@ -2323,10 +2319,6 @@ fn warm_crate_lock(root: &Path, lock: &Path, dest: &str, action: &str) {
     let want = sources.registry.len();
     let n = copy_crates(&crates_src, &vendor);
     let _ = std::fs::remove_dir_all(&work);
-    if want == 0 && sources.git_packages == 0 {
-        eprintln!("td-feed warm {action}: Cargo.lock has no external dependencies for {dest}");
-        return;
-    }
     // Complete only if EVERY fetched crate copied (see warm_crate) — a short copy leaves no
     // marker so the next warm re-does it, instead of sealing a partial set forever.
     if n != want {
@@ -3626,6 +3618,40 @@ pub(crate) mod tests {
         assert_eq!(got, b"verified bytes");
         assert_eq!(digest, super::hex_sha256(b"verified bytes"));
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn warming_a_dependency_free_local_crate_publishes_an_empty_complete_set() {
+        let root = unique_tmp_dir("warm-empty-local");
+        let source = root.join("local");
+        std::fs::create_dir_all(&source).unwrap();
+        let lock = source.join("Cargo.lock");
+        std::fs::write(
+            &lock,
+            "version = 4\n\n[[package]]\nname = \"local\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        let vendor = root.join(".td-build-cache/crate-vendor/local/vendor");
+        std::fs::create_dir_all(&vendor).unwrap();
+        std::fs::write(vendor.join("stale-1.0.0.crate"), b"stale").unwrap();
+        super::warm_crate_local(&root, "local", "local");
+        assert!(
+            is_warm_complete(&vendor, &lock),
+            "an empty closure must finish warming"
+        );
+        assert_eq!(super::count_crates(&vendor), 0);
+        let marker = std::fs::read(vendor.join(".warm-complete")).unwrap();
+        super::warm_crate_local(&root, "local", "local");
+        assert_eq!(
+            std::fs::read(vendor.join(".warm-complete")).unwrap(),
+            marker
+        );
+        std::fs::write(&lock, "not a lock file").unwrap();
+        super::warm_crate_local(&root, "local", "invalid");
+        assert!(!root
+            .join(".td-build-cache/crate-vendor/invalid/vendor/.warm-complete")
+            .exists());
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
