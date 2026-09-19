@@ -592,8 +592,9 @@ const SYSTEM: SystemDef = SystemDef {
 const UI_USER: &str = "tester";
 const UI_UID: u32 = td_engine::application_spec::APPLICATION_UID;
 const UI_GID: u32 = 1000;
-/// The autologin account's home as the users table names it, and the home
-/// td-firstboot is handed for the terminal applications' first configuration.
+/// The stock autologin home as named by the image's users table.
+/// Firstboot resolves the live primary account before preparing application state.
+#[cfg(test)]
 const UI_HOME: &str = "/home/tester";
 const TD_PORTAL_SETTINGS_PATH: &str = "/etc/td-portal-settings";
 const TD_PORTAL_SETTINGS: &str = include_str!("../../../td-portal/default-settings.conf");
@@ -1403,12 +1404,12 @@ fn build_td_svc_conf() -> String {
          # Mints the per-machine identity everything below reads or checks.\n\
          # after=hostname serializes both provisioners' initialization of\n\
          # their shared /var/lib/td directory.\n\
-         # The application pair adds a first configuration for the terminal\n\
+         # The primary selector adds a first configuration for the terminal\n\
          # applications (mail, news) under each private application home: created\n\
          # once, owned by its service UID, never rewritten after provisioning.\n\
          [td-firstboot]\n\
          type=oneshot\n\
-         exec=/bin/td-firstboot provision --application-home {ui_home} --application-owner {ui_uid}:{ui_gid} --enroll-principals\n\
+         exec=/bin/td-firstboot provision --application-primary --enroll-principals\n\
          after=hostname\n\
          timeout={firstboot}\n\
          \n\
@@ -1957,7 +1958,6 @@ fn build_td_svc_conf() -> String {
         bootfail = svc_timeouts::BOOTFAIL,
         ui_user = UI_USER,
         ui_uid = UI_UID,
-        ui_home = UI_HOME,
         broker_user = BROKER_USER,
         compositor_uid = COMPOSITOR_RESERVED_UID,
         compositor_user = COMPOSITOR_USER,
@@ -8187,12 +8187,8 @@ news\tnews-0.1\tsource\tstatic-runtime-1\tsource\n"
         );
         assert_eq!(
             unit_key("td-firstboot", "exec"),
-            Some(format!(
-                "/bin/td-firstboot provision --application-home {UI_HOME} \
-                 --application-owner {UI_UID}:{UI_GID} --enroll-principals"
-            )),
-            "td-firstboot must be handed the login user's home and identity for the \
-             terminal applications' first configuration"
+            Some("/bin/td-firstboot provision --application-primary --enroll-principals".into()),
+            "td-firstboot must resolve the primary home before preparing application state"
         );
         // td-login refuses `login -f` for a LOCKED account — stricter than busybox, whose
         // `-f` skips the account database entirely (td-login/THREAT-MODEL.md section 3). So a
@@ -13103,7 +13099,7 @@ mod principal_tests {
             assert!(build_group(&SYSTEM).contains(&format!("tda{uid}:x:{uid}:\n")));
             assert!(build_shadow(&SYSTEM).contains(&format!("tda{uid}:!td-service:19000:0:99999:7:::\n")));
         }
-        assert!(build_td_svc_conf().contains("--application-owner 1000:1000 --enroll-principals\n"));
+        assert!(build_td_svc_conf().contains("--application-primary --enroll-principals\n"));
         assert!(etc_files(&SYSTEM)
             .unwrap()
             .iter()

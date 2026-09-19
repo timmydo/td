@@ -9,9 +9,9 @@ use std::path::{Path, PathBuf};
 
 #[path = "../../engine/src/principals.rs"]
 mod table;
-#[allow(dead_code, clippy::duplicate_mod, reason = "standalone preflight shares the parser; authd also embeds it for live account reads")]
+#[allow(dead_code, clippy::duplicate_mod, reason = "firstboot shares live primary lookup and preflight parsing; authd also embeds these validators")]
 #[path = "../../td-authd/src/primary_account.rs"]
-mod primary_account;
+pub(crate) mod primary_account;
 use table::decimal;
 pub(crate) use table::{Application, Registry, MAX_BYTES};
 

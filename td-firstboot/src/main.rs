@@ -180,8 +180,8 @@ struct Config {
     /// operator-named directory carries no implied mount to check.
     require_persistent: bool,
     /// The login user whose terminal applications get a first configuration,
-    /// or `None` when the invocation names none.
-    applications: Option<ApplicationHome>,
+    /// or no selection when the invocation names none.
+    applications: ApplicationSelection,
     enroll_principals: bool,
 }
 
@@ -193,6 +193,33 @@ struct ApplicationHome {
     home: PathBuf,
     uid: u32,
     gid: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ApplicationSelection {
+    None,
+    Explicit(ApplicationHome),
+    Primary,
+}
+
+impl ApplicationSelection {
+    fn resolve(
+        &self,
+        load: impl FnOnce() -> std::io::Result<principals::primary_account::PrimaryAccount>,
+    ) -> Result<Option<ApplicationHome>, Failure> {
+        match self {
+            Self::None => Ok(None),
+            Self::Explicit(home) => Ok(Some(home.clone())),
+            Self::Primary => {
+                let account = load().map_err(|error| Failure::Failed(error.to_string()))?;
+                Ok(Some(ApplicationHome {
+                    home: account.home(),
+                    uid: principals::primary_account::UID,
+                    gid: principals::primary_account::UID,
+                }))
+            }
+        }
+    }
 }
 
 fn main() -> ExitCode {
@@ -220,9 +247,9 @@ enum Failure {
 fn usage() -> String {
     format!(
         "usage: td-firstboot [provision] [--state-dir DIR] [--keygen PROGRAM] \
-         [--application-home DIR --application-owner UID:GID] [--enroll-principals]\n  \
+         [--application-primary | --application-home DIR --application-owner UID:GID] [--enroll-principals]\n  \
          provisions this machine's identity under {DEFAULT_STATE_DIR}: {MACHINE_ID}, \
-         {HOST_KEY}(.pub), {AUTHORIZED_KEYS}; with the application pair, a first \
+         {HOST_KEY}(.pub), {AUTHORIZED_KEYS}; with an application selector, a first \
          configuration under DIR/{APPLICATION_STATE_ROOT} or its validated private app home\n  \
          td-firstboot hostname prepares and activates the persistent hostname\n  \
          td-firstboot check-principals ROOT validates staged deployment identities without writing\n  \
@@ -233,6 +260,13 @@ fn usage() -> String {
 }
 
 fn run(args: &[String]) -> Result<(), Failure> {
+    run_with_primary(args, principals::primary_account::load)
+}
+
+fn run_with_primary(
+    args: &[String],
+    load: impl FnOnce() -> std::io::Result<principals::primary_account::PrimaryAccount>,
+) -> Result<(), Failure> {
     let config = match parse(args)? {
         Invocation::Help => return emit(&usage()).map_err(Failure::Failed),
         Invocation::Hostname => return activate_hostname(),
@@ -257,6 +291,7 @@ fn run(args: &[String]) -> Result<(), Failure> {
         }
         Invocation::Provision(config) => config,
     };
+    let applications = config.applications.resolve(load)?;
     let plan = Plan::of(&config);
 
     // The mount point the state dir lives on, when we checked for one. It bounds
@@ -291,7 +326,7 @@ fn run(args: &[String]) -> Result<(), Failure> {
     sync_directories(&plan.key_dir, boundary.as_deref())?;
 
     let mut active_homes = std::collections::BTreeMap::new();
-    let mut credential_owner = config.applications.as_ref().map(|home| home.uid);
+    let mut credential_owner = applications.as_ref().map(|home| home.uid);
     if config.enroll_principals {
         let desired = principals::Registry::load().map_err(Failure::Failed)?;
         principal_store::provision(&desired).map_err(Failure::Failed)?;
@@ -299,7 +334,7 @@ fn run(args: &[String]) -> Result<(), Failure> {
         principal_store::prepare_portal_runtimes(&desired).map_err(Failure::Failed)?;
         credentials::isolate_stores(&config.state, &desired)?;
         for application in desired.active_applications().map_err(Failure::Failed)? {
-            let former = config.applications.as_ref().filter(|home| home.uid == application.owner)
+            let former = applications.as_ref().filter(|home| home.uid == application.owner)
                 .ok_or_else(|| Failure::Failed("active application lacks its configured human migration home".into()))?;
             let home = application_state::prepare(former, &application.name, application.uid)
                 .map_err(Failure::Failed)?;
@@ -308,7 +343,7 @@ fn run(args: &[String]) -> Result<(), Failure> {
                 application.owner, application.name, application.uid)).map_err(Failure::Failed)?;
             active_homes.insert(application.name, home);
         }
-        if let Some(home) = &config.applications {
+        if let Some(home) = &applications {
             credential_owner = Some(desired.sessions().find(|session| session.owner == home.uid)
                 .ok_or_else(|| Failure::Failed("credential owner has no configured session".into()))?.portal);
         }
@@ -343,7 +378,7 @@ fn run(args: &[String]) -> Result<(), Failure> {
     // Template errors do not change machine identity or fail unrelated services.
     // Active-account ownership preparation above must succeed before enrollment
     // is reported; template provisioning does not substitute for that boundary.
-    if let Some(applications) = &config.applications {
+    if let Some(applications) = &applications {
         let credential_owner = credential_owner.ok_or_else(|| Failure::Failed("credential owner is missing".into()))?;
         match provision_application_homes(applications, &config.state, credential_owner, &active_homes) {
             Ok(outcomes) => {
@@ -456,6 +491,7 @@ fn parse(args: &[String]) -> Result<Invocation, Failure> {
     let mut keygen = DEFAULT_KEYGEN.to_string();
     let mut application_home: Option<PathBuf> = None;
     let mut application_owner: Option<(u32, u32)> = None;
+    let mut application_primary = false;
     let mut rest = args;
     // `provision` is accepted (and is the default) so the inittab line can name
     // what it does, and so a second mode could be added without changing it.
@@ -467,6 +503,14 @@ fn parse(args: &[String]) -> Result<Invocation, Failure> {
     let mut index = 0;
     while let Some(flag) = rest.get(index) {
         match flag.as_str() {
+            "--application-primary" => {
+                if application_primary {
+                    return Err(Failure::Usage("duplicate --application-primary".into()));
+                }
+                application_primary = true;
+                index += 1;
+                continue;
+            }
             "--enroll-principals" => {
                 if enroll_principals {
                     return Err(Failure::Usage("duplicate --enroll-principals".into()));
@@ -494,6 +538,11 @@ fn parse(args: &[String]) -> Result<Invocation, Failure> {
         }
         index += 2;
     }
+    if application_primary && (application_home.is_some() || application_owner.is_some()) {
+        return Err(Failure::Usage(
+            "--application-primary cannot mix with --application-home or --application-owner".into(),
+        ));
+    }
     // The pair is one fact — whose applications, and where — so half of it is
     // a usage error rather than a default the other half silently supplies.
     let applications = match (application_home, application_owner) {
@@ -514,8 +563,9 @@ fn parse(args: &[String]) -> Result<Invocation, Failure> {
                 home.display()
             )))
         }
-        (Some(home), Some((uid, gid))) => Some(ApplicationHome { home, uid, gid }),
-        (None, None) => None,
+        (Some(home), Some((uid, gid))) => ApplicationSelection::Explicit(ApplicationHome { home, uid, gid }),
+        (None, None) if application_primary => ApplicationSelection::Primary,
+        (None, None) => ApplicationSelection::None,
         _ => {
             return Err(Failure::Usage(
                 "--application-home and --application-owner come together".to_string(),
@@ -1627,6 +1677,84 @@ mod tests {
     }
 
     #[test]
+    fn primary_application_selection_loads_the_account_and_preserves_explicit_configuration() {
+        let selected = config(&["provision", "--application-primary", "--enroll-principals"]).unwrap();
+        assert_eq!(selected.applications, ApplicationSelection::Primary);
+        assert!(selected.require_persistent);
+        assert!(selected.enroll_principals);
+        for home in ["/home/alice", "/var/home/alice"] {
+            let mut loads = 0;
+            let resolved = selected.applications.resolve(|| {
+                loads += 1;
+                principals::primary_account::parse(&format!(
+                    "alice:x:1000:1000:Alice:{home}:/bin/sh\n"
+                ))
+            }).unwrap();
+            assert_eq!(loads, 1);
+            assert_eq!(resolved, Some(ApplicationHome {
+                home: PathBuf::from("/home/alice"), uid: 1000, gid: 1000,
+            }));
+        }
+        let explicit = config(&["--application-home", "/srv/human", "--application-owner", "1001:1002"]).unwrap();
+        let mut loads = 0;
+        for selection in [&explicit.applications, &ApplicationSelection::None] {
+            let resolved = selection.resolve(|| {
+                loads += 1;
+                Err(std::io::Error::other("explicit configuration must not load passwd"))
+            }).unwrap();
+            match selection {
+                ApplicationSelection::Explicit(home) => assert_eq!(resolved.as_ref(), Some(home)),
+                ApplicationSelection::None => assert_eq!(resolved, None),
+                ApplicationSelection::Primary => panic!("fixture is explicit"),
+            }
+        }
+        assert_eq!(loads, 0);
+    }
+
+    #[test]
+    fn primary_application_flags_preserve_existing_provisioning_constraints() {
+        for args in [
+            vec!["--application-primary", "--application-primary"],
+            vec!["--application-primary", "--application-home", "/home/alice"],
+            vec!["--application-owner", "1000:1000", "--application-primary"],
+            vec!["--application-primary", "--application-home", "/home/alice", "--application-owner", "1000:1000"],
+            vec!["--application-primary", "alice"],
+            vec!["--application-primary", "--enroll-principals", "--state-dir", "/tmp/state"],
+        ] {
+            assert!(matches!(config(&args), Err(Failure::Usage(_))), "{args:?}");
+        }
+    }
+
+    #[test]
+    fn invalid_primary_account_refuses_before_any_provisioning_write() {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let root = std::env::temp_dir().join(format!("td-firstboot-primary-refusal-{}-{stamp}", std::process::id()));
+        std::fs::create_dir(&root).unwrap();
+        struct Cleanup(PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
+        }
+        let _cleanup = Cleanup(root.clone());
+        let state = root.join("state");
+        let args = ["provision", "--application-primary", "--state-dir", state.to_str().unwrap(),
+            "--keygen", "/must-not-run-keygen"].map(String::from);
+        for passwd in [
+            "root:x:0:0:Root:/root:/bin/sh\n",
+            "alice:x:1000:1000:Alice:/home/alice:/bin/sh\nalias:x:1000:1000:Alias:/home/alias:/bin/sh\n",
+            "alice:x:1000:1001:Alice:/home/alice:/bin/sh\n",
+        ] {
+            let expected = principals::primary_account::parse(passwd).unwrap_err().to_string();
+            let result = run_with_primary(&args, || principals::primary_account::parse(passwd));
+            assert!(matches!(result, Err(Failure::Failed(error)) if error == expected));
+            assert!(!state.exists(), "invalid primary created state");
+        }
+        let result = run_with_primary(&args, || Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied)));
+        assert!(matches!(result, Err(Failure::Failed(_))));
+        assert!(!state.exists());
+    }
+
+    #[test]
     fn the_application_flags_come_as_a_pair() {
         let paired = config(&[
             "provision",
@@ -1638,7 +1766,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             paired.applications,
-            Some(ApplicationHome {
+            ApplicationSelection::Explicit(ApplicationHome {
                 home: PathBuf::from("/home/tester"),
                 uid: 1000,
                 gid: 1000,
@@ -1648,7 +1776,7 @@ mod tests {
             paired.require_persistent,
             "the pair does not relax the mount check"
         );
-        assert_eq!(config(&[]).unwrap().applications, None);
+        assert_eq!(config(&[]).unwrap().applications, ApplicationSelection::None);
         for argv in [
             vec!["--application-home", "/home/tester"],
             vec!["--application-owner", "1000:1000"],

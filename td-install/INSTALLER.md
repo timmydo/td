@@ -127,9 +127,11 @@ service commands use `td-login exec-primary`. Both resolve the current
 UID-1000 account and retain td-login's existing authorization and credential
 checks. The paired terminal authority uses `terminal-serve --primary` and
 passes the resolved name through its existing ledger and credential checks.
-Firstboot/home setup and remaining diagnostic shell commands still need
-the coordinated cutover; these selectors alone do not activate a saved
-username.
+Firstboot's `--application-primary` selects the same account's canonical
+home before provisioning writes, retaining application state migration and
+ownership checks. Home creation and remaining diagnostic shell commands
+still need the coordinated cutover; these selectors alone do not activate
+a saved username.
 Updates must retain the installed identity and settings.
 
 `td-firstboot check-primary-name ROOT NAME` is a read-only preflight for a

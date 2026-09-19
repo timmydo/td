@@ -384,8 +384,14 @@ cgroups, socket admission and per-application fetch services.
 When a deployed application account is present, firstboot prepares its home
 after checking the durable registry and before reporting enrollment success.
 It requires the configured human migration home for that application's
-owner. The current provisioner invocation configures one human home; it
-refuses a deployment with active applications for another owner. This is a
+owner. The image invokes `td-firstboot provision --application-primary`,
+which resolves the shared validated UID/GID-1000 account before any
+provisioning write. Its canonical `/home/NAME` becomes the migration source;
+missing or malformed account data fails without a fallback. The explicit
+`--application-home DIR --application-owner UID:GID` pair remains available
+for root configuration and fixtures, and cannot mix with the primary
+selector. The current invocation configures one human home and refuses a
+deployment with active applications for another owner. This is a
 sysinit operation before human or application processes start, not a live
 ownership conversion. Root configuration and that startup ordering are trusted.
 It does not revoke descriptors or historical copies from an earlier session.
