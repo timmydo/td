@@ -47,6 +47,54 @@ fn only_canonical_disjoint_session_identities_are_configurable() {
 }
 
 #[test]
+fn primary_configuration_resolves_once_and_keeps_the_ledger_and_helper_checks() {
+    let mut loads = 0;
+    let config = Config::parse_with_primary(
+        &["--primary", "--peer-uid", "993"].map(String::from),
+        || { loads += 1; Ok(primary("alice")) },
+    ).unwrap();
+    assert_eq!(loads, 1);
+    assert_eq!(config.peer_uid(), 993);
+    assert_eq!(config.checker().get_args().collect::<Vec<_>>(),
+        ["check-launch-session", "alice", "1000", "993"]);
+    assert_eq!(config.terminal("generation", 1, Program::Home).get_args().collect::<Vec<_>>(),
+        ["exec-as", "alice", "--", "/bin/td-authd", "terminal-exec", "1000", "generation", "1"]);
+    assert!(Config::parse_with_primary(
+        &["--primary", "--peer-uid", "993"].map(String::from),
+        || Err("invalid primary database".into()),
+    ).is_err_and(|error| error == "invalid primary database"));
+}
+
+#[test]
+fn malformed_primary_configuration_never_reads_the_account_database() {
+    for args in [
+        vec!["--user", "alice", "--uid"],
+        vec!["arbitrary", "three", "arguments"],
+        vec!["--primary"],
+        vec!["--primary", "--peer-uid"],
+        vec!["--primary", "--peer-uid", "0"],
+        vec!["--primary", "--peer-uid", "1000"],
+        vec!["--primary", "--peer-uid", "0993"],
+        vec!["--primary", "--peer-uid", "+993"],
+        vec!["--primary", "--peer-uid", "4294967296"],
+        vec!["--primary", "--uid", "1000"],
+        vec!["--primary", "--peer-uid", "993", "extra"],
+        vec!["--primary", "--uid", "1000", "--peer-uid", "993"],
+        vec!["--primary", "--user", "alice", "--peer-uid", "993"],
+        vec!["--user", "alice", "--primary", "--uid", "1000", "--peer-uid", "993"],
+    ] {
+        let mut loaded = false;
+        let args: Vec<_> = args.into_iter().map(String::from).collect();
+        assert!(Config::parse_with_primary(&args, || { loaded = true; Ok(primary("alice")) }).is_err());
+        assert!(!loaded, "{args:?}");
+    }
+    assert!(Config::parse_with_primary(
+        &["--user", "alice", "--uid", "1000", "--peer-uid", "993"].map(String::from),
+        || Err("named configuration must not resolve a primary".into()),
+    ).is_ok());
+}
+
+#[test]
 fn the_caller_can_only_start_poll_or_keep_the_channel_alive() {
     assert_eq!(request(&[1]).unwrap(), Request::Start(Program::Home));
     assert_eq!(request(&[4]).unwrap(), Request::Start(Program::Task));

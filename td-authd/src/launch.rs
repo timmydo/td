@@ -21,10 +21,31 @@ pub(crate) struct Config {
 }
 
 impl Config {
-    // Keep the name grammar aligned with td-firstboot check-launch-session.
     pub fn parse(arguments: &[String]) -> Result<Self, String> {
+        Self::parse_with_primary(arguments, || {
+            crate::primary_account::load().map_err(|error| error.to_string())
+        })
+    }
+
+    fn parse_with_primary(
+        arguments: &[String],
+        load: impl FnOnce() -> Result<crate::primary_account::PrimaryAccount, String>,
+    ) -> Result<Self, String> {
+        const USAGE: &str = "terminal-serve requires --primary --peer-uid UID or --user USER --uid UID --peer-uid UID";
+        if let [primary, peer_flag, compositor] = arguments {
+            if primary != "--primary" || peer_flag != "--peer-uid" {
+                return Err(USAGE.into());
+            }
+            let compositor = number(compositor, 1..=999)?;
+            return Ok(Self {
+                user: load()?.name().into(),
+                owner: crate::primary_account::UID,
+                compositor,
+            });
+        }
+        // Keep the named interface aligned with check-launch-session.
         let [user_flag, user, owner_flag, owner, peer_flag, compositor] = arguments else {
-            return Err("terminal-serve requires --user USER --uid UID --peer-uid UID".into());
+            return Err(USAGE.into());
         };
         if user_flag != "--user"
             || owner_flag != "--uid"

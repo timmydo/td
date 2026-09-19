@@ -1640,7 +1640,7 @@ fn build_td_svc_conf() -> String {
          [wayland]\n\
          type=daemon\n\
          cgroup=service\n\
-         exec=/bin/td-authd terminal-serve --user {ui_user} --uid {ui_uid} --peer-uid {compositor_uid}\n\
+         exec=/bin/td-authd terminal-serve --primary --peer-uid {compositor_uid}\n\
          pair-exec=/bin/td-login exec-service-as {compositor_user} -- /bin/td-compositor run --framebuffer /dev/fb0 --input /dev/input --socket {wayland_socket} --portal-socket {portal_wayland_socket} --control-socket {control_socket} --launcher-application {firefox_name} --terminal-authority stdin --application-ready-socket {firefox_window_ready_socket} --application-app-id {firefox_app_id} --application-content-rgb-a {firefox_content_rgb_a} --application-content-rgb-b {firefox_content_rgb_b}\n\
          after=seat\n\
          requires=seat\n\
@@ -6918,7 +6918,7 @@ news\tnews-0.1\tsource\tstatic-runtime-1\tsource\n"
             [PORTAL_USER, BROKER_USER, COMPOSITOR_USER, AUDIO_USER]
         );
         assert_eq!(unit_key("wayland", "exec"), Some(format!(
-            "/bin/td-authd terminal-serve --user {UI_USER} --uid {UI_UID} --peer-uid {COMPOSITOR_RESERVED_UID}"
+            "/bin/td-authd terminal-serve --primary --peer-uid {COMPOSITOR_RESERVED_UID}"
         )));
         let peer = unit_key("wayland", "pair-exec").unwrap_or_default();
         assert!(peer.starts_with(&format!(

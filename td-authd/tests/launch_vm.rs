@@ -198,10 +198,7 @@ fn attempt(denied: bool, wrong_sender: bool, placement_denied: bool) {
     let mut authority = Command::new("/bin/td-authd")
         .args([
             "terminal-serve",
-            "--user",
-            "alice",
-            "--uid",
-            "1000",
+            "--primary",
             "--peer-uid",
             "993",
         ])
@@ -273,6 +270,7 @@ fn init() {
         ("/etc/shadow","root::1:0:99999:7:::\nalice::1:0:99999:7:::\ntdc1000:!td-service:1:0:99999:7:::\n",0o600),
     ] { fs::write(path,text).unwrap();fs::set_permissions(path,fs::Permissions::from_mode(mode)).unwrap(); }
     primary_login_checks();
+    primary_authority_refusals();
     assert!(Command::new("/bin/td-firstboot")
         .args(["check-launch-session", "alice", "1000", "993"])
         .status()
@@ -307,6 +305,27 @@ fn init() {
     assert!(!Path::new("/run/user/1000/terminal-evidence").exists());
     println!("TD-TERMINAL-VM: PASS");
     park();
+}
+
+fn primary_authority_refusals() {
+    let original = fs::read_to_string("/etc/passwd").unwrap();
+    for (passwd, diagnostic) in [
+        (original.replace("1000:1000", "1001:1001"), "account database has no uid-1000 human"),
+        (format!("{original}alias:x:1000:1000:Alias:/home/alias:/bin/false\n"),
+            "two account names claim one uid"),
+    ] {
+        assert_ne!(passwd, original, "refusal fixture must change the account table");
+        fs::write("/etc/passwd", passwd).unwrap();
+        let result = Command::new("/bin/td-authd")
+            .args(["terminal-serve", "--primary", "--peer-uid", "993"])
+            .output();
+        fs::write("/etc/passwd", &original).unwrap();
+        let result = result.unwrap();
+        assert!(!result.status.success());
+        assert!(result.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&result.stderr).contains(diagnostic),
+            "unexpected primary authority refusal: {}", String::from_utf8_lossy(&result.stderr));
+    }
 }
 
 fn primary_probe(login: bool) {

@@ -452,11 +452,21 @@ make an unverified deployment pass the boot oracle.
 
 ## Fixed program launch prerequisite
 
-`terminal-serve --user USER --uid UID --peer-uid UID` is a root-configured
-consumer of the private channel. The image compositor runs at its reserved
-identity and uses this channel for human terminals and the task manager.
-The configured application card activates a supervised window. Direct compositor spawning remains a host-development
-mode.
+`terminal-serve --primary --peer-uid UID` is the image's root-configured
+consumer of the private channel. It validates the peer UID before resolving
+the UID/GID-1000 human through the shared primary-account reader. The
+resolved name is retained for this generation's existing ledger check and
+credential helper; no name or numeric human UID comes from the peer.
+Missing or malformed account data refuses without a fallback name. The
+named `--user USER --uid UID --peer-uid UID` interface remains available
+for explicit root configuration and diagnostics; the two forms cannot mix.
+Neither selector replaces root startup, sender pinning or ledger admission.
+Primary resolution precedes the startup audit; its bounded account read
+closes the file before the audit and retains no descriptor or child.
+The image compositor runs at its reserved identity and uses this channel
+for human terminals and the task manager. The configured application card
+activates a supervised window. Direct compositor spawning remains a
+host-development mode.
 
 Startup requires all four root uid/gid columns, one thread, and only fd
 0/1/2 inherited from the trusted supervisor. It proves each standard
@@ -614,8 +624,10 @@ it with host rustc for an installed static target, then run its binary with
 paths. The supplied production binaries may be source-built target outputs;
 the fixture itself is a host diagnostic, never an input to a target recipe
 or part of an image. It requires td's pidfs-capable kernel and QEMU on the
-host. Its primary account is `alice`, exercising a nondefault name through
-the real channel-to-validator-to-credential-helper chain. It verifies the
+host. Its primary account is `alice`, exercising `--primary` and a
+nondefault name through the real channel-to-validator-to-credential-helper
+chain. Missing and duplicate UID-1000 records refuse before channel
+admission. It verifies the
 terminal's uid/gid, empty capabilities, independent process
 group, exact session cgroup, six-variable environment and absence of
 inherited authority fds. A wrong sender, missing ledger and failed cgroup
