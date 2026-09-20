@@ -902,3 +902,46 @@ fn the_finder_rasterizes_to_pixels_and_leaves_the_rest_of_the_surface_alone() {
             }));
     }
 }
+
+/// A mark is the consumer's: set on a listing's entry or on the shown
+/// listing by entry index, painted as the list's star prefix, refused
+/// for an entry that is not there, and gone with the listing it was on.
+#[test]
+fn a_mark_is_painted_as_the_star_prefix_and_goes_with_its_listing() {
+    for scale in 1..=2u8 {
+        let s = i64::from(scale);
+        let marked = Listing::new(
+            "/x",
+            vec![
+                entry("a", Kind::Folder),
+                entry("b.txt", Kind::File).with_marked(true),
+                entry("c.txt", Kind::File),
+            ],
+            false,
+        )
+        .unwrap();
+        assert!(marked.entries()[1].marked() && !marked.entries()[0].marked());
+        let mut f =
+            Controller::new(marked, Choose::File, surface(scale), rect(scale), None).unwrap();
+        let row = |f: &Controller, index: usize| {
+            let y = f.list_rect().y + 24 * s * index as i64 + 4 * s;
+            text_at(&draws(f, f.rect()), y)
+        };
+        assert_eq!(row(&f, 0), "  afolder");
+        assert_eq!(row(&f, 1), "* b.txt");
+        assert_eq!(row(&f, 2), "  c.txt");
+        // Marks move by entry index, whichever rows are shown.
+        assert_eq!(f.set_marked(2, true), Ok(()));
+        assert_eq!(f.set_marked(1, false), Ok(()));
+        assert_eq!(f.set_marked(3, true), Err(Error::NoEntry));
+        assert_eq!(row(&f, 1), "  b.txt");
+        assert_eq!(row(&f, 2), "* c.txt");
+        assert!(f.listing().entries()[2].marked());
+        typed(&mut f, "c");
+        assert_eq!(row(&f, 0), "* c.txt");
+        // A new listing carries its own marks.
+        f.set_listing(listing(), None).unwrap();
+        assert!(f.listing().entries().iter().all(|entry| !entry.marked()));
+        assert_eq!(row(&f, 4), "  notes.txt1 KiB");
+    }
+}

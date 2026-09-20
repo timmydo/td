@@ -5909,8 +5909,10 @@ deliberate refusal rather than a gap to be filled opportunistically.
 ### Who draws the dialog
 
 **`td-portal` draws it as an ordinary Wayland client**: a keyboard-first
-list navigator reusing the launcher's filter model, the multicall's PSF2
-font, and the software renderer, titled `<authenticated app> — <caller title>`
+list navigator, td-ui's shared directory finder (td-ui/DESIGN.md, "Shared
+directory finder", which carries the launcher's filter model) over the
+portal's own directory model, the multicall's PSF2 font, and the software
+renderer, titled `<authenticated app> — <caller title>`
 (or `<authenticated app> — Open file` for the standard empty title). Keeping
 the authenticated identity first prevents a long caller-controlled title from
 clipping it out of the ordinary viewport. Once that
@@ -5932,15 +5934,25 @@ query, 32 multiple selections, 64 directory descriptors, 4 KiB paths, and
 512 KiB of aggregate result URIs. It pins the root and every entered directory
 with no-follow descriptors, truncates oversized listings visibly, preserves
 and visibly counts cross-directory selections, escapes raw filename bytes,
-prefixes rows with distinct ordinals, and excludes symlink entries. It refuses
+gives rows distinct ordinals, and excludes symlink entries. It refuses
 `/` as either grant root: choosing through the complete host or guest namespace
-is not a supported FileChooser authority. The navigator shares the launcher's
-all-term filter implementation rather than copying its semantics. It renders
-the compositor-configured viewport into one XRGB `wl_shm` buffer at a time,
-bounded to 32 MiB so the supported 3840x2160 output's 2880x1582 modal viewport
-fits, with the cached pinned PSF2 face. Smaller nonempty viewports clip safely
-and keep the navigation and scroll arithmetic at a one-row minimum instead of
-failing the request.
+is not a supported FileChooser authority. The navigator is td-ui's shared
+finder over a listing the model builds per directory (each row's display name,
+a folder's with its slash, the ordinal as its meta, a file disabled where a
+directory is asked for, and the multiple-file mode's selections as the
+finder's marks), so the filter, the shown rows, the selection and the scroll
+window are the widget's: the moves clamp at the ends, Backspace on an empty
+filter ascends as Parent does, a name filters on as much of its escaped
+display as a row holds (1020 bytes, then an ellipsis), and a descent the
+model refuses (a child changed since it was listed) fails the request as it
+always has, the widget untouched. The physical key bindings, the
+multiple-file toggle and its accept, and every result stay the portal's. It
+renders the compositor-configured viewport into one XRGB
+`wl_shm` buffer at a time, bounded to 32 MiB so the supported 3840x2160
+output's 2880x1582 modal viewport fits, with the cached pinned PSF2 face. A
+nonempty viewport smaller than the finder's minimum (176 by 168) is rendered
+on a surface padded to it and clipped back, so the request keeps a one-row
+list instead of failing.
 
 The public surface is FileChooser version 3. Its introspection carries the
 standard `OpenFile`, `SaveFile`, and `SaveFiles` method shapes; the two save

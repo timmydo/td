@@ -83,13 +83,13 @@ sed-mesboot-source 331jp1sj5iyjhnb35391k2sjjkqrawk1-sed-mesboot-source
 sed-mesboot0-source i6y1c09pssxjdc60wmdf96vf11hxa56c-sed-mesboot0-source
 stage0-source ma16im40lnb5dldxwglzzs7iqpzfiz4m-stage0-source
 tcc-source mhwyc6lcd16pxbln8kwvc4ia5zisf8fn-tcc-source
-td-editor-source rs26c7b36av1sivvmn5qkl8hgryqikid-td-editor-source
+td-editor-source cnf85qshdih14k2zr05nw65q8yflnzas-td-editor-source
 td-install-qemu-test-source xha8n9wwjg22cdp0akfg3090pa2yk3r9-td-install-qemu-test-source
 td-mail-source 5h2vf443ja7pskqpwwdmzd4iw6k2r9jx-td-mail-source
 td-net-source g62l6a5b7hrjx3lrimlgpy93ld6pggqx-td-net-source
 td-news-source r5cycw0wjyg12vydavg0s4fp9dfs35ss-td-news-source
-td-portal-source zmyk97gicvzbhd1kvjw13i76chsfimid-td-portal-source
-td-taskmgr-source hwrf45zqr0sq66d4rkj474md7xf8mlzn-td-taskmgr-source
+td-portal-source prc30vsrs41c3hgyxfqh6y96yxa60i6z-td-portal-source
+td-taskmgr-source fw8b5mjjvkp1106jw8d2if4nvbpq7m1l-td-taskmgr-source
 tzdata-source p7yjpvl5kwdfqqdgakzww94zx5mdz86r-tzdata-source
 util-linux-libs-x86-64-source 06vhdikawhfyswkhrxs905cm3qbpqj4r-util-linux-libs-x86-64-source
 uutils-source rkmjdm6nicq3js0xhdyqk4rl3r9ki4xv-uutils-source

@@ -43,6 +43,7 @@ pub enum Error {
     InvalidSurface,
     NoRoom,
     Allocation,
+    NoEntry,
 }
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -52,6 +53,7 @@ impl std::fmt::Display for Error {
             Self::InvalidSurface => "invalid finder surface",
             Self::NoRoom => "surface cannot show the finder",
             Self::Allocation => "finder allocation failed",
+            Self::NoEntry => "no such finder entry",
         })
     }
 }
@@ -81,13 +83,16 @@ pub enum Kind {
 
 /// One listed entry: its name as the consumer wants it shown, a
 /// right-aligned meta (`""` for none; a folder without one shows
-/// `folder`), its kind and whether it can be descended into or chosen.
+/// `folder`), its kind, whether it can be descended into or chosen, and
+/// whether it carries the mark, the list's star prefix, whose meaning
+/// (a multiple selection) is the consumer's.
 #[derive(Debug)]
 pub struct Entry {
     name: String,
     meta: String,
     kind: Kind,
     enabled: bool,
+    marked: bool,
 }
 impl Entry {
     pub fn new(name: &str, meta: &str, kind: Kind, enabled: bool) -> Result<Self, Error> {
@@ -99,7 +104,14 @@ impl Entry {
             meta: copy_text(meta, META_BYTES)?,
             kind,
             enabled,
+            marked: false,
         })
+    }
+    /// The entry with its mark set or cleared, for a listing built with
+    /// marks the consumer remembers.
+    pub fn with_marked(mut self, marked: bool) -> Self {
+        self.marked = marked;
+        self
     }
     pub fn name(&self) -> &str {
         &self.name
@@ -112,6 +124,9 @@ impl Entry {
     }
     pub fn enabled(&self) -> bool {
         self.enabled
+    }
+    pub fn marked(&self) -> bool {
+        self.marked
     }
     /// The text bytes, for the listing bound.
     fn text_bytes(&self) -> usize {
@@ -430,6 +445,15 @@ impl Controller {
         Ok(())
     }
 
+    /// Sets or clears the mark of the entry at `index` in the listing (not
+    /// among the shown), `NoEntry` when there is none; the frame changes,
+    /// nothing else does.
+    pub fn set_marked(&mut self, index: usize, marked: bool) -> Result<(), Error> {
+        let entry = self.listing.entries.get_mut(index).ok_or(Error::NoEntry)?;
+        entry.marked = marked;
+        Ok(())
+    }
+
     /// Sets the status row's note, shown until the next listing: what the
     /// consumer has to say about the last descent or ascent it refused.
     pub fn set_note(&mut self, note: &str) -> Result<(), Error> {
@@ -693,7 +717,7 @@ impl Controller {
                             ""
                         },
                         enabled: entry.enabled,
-                        marked: false,
+                        marked: entry.marked,
                     }
                 }),
             self.first,

@@ -1,6 +1,8 @@
-//! Bounded filesystem model and software pixels for the FileChooser dialog.
+//! Bounded filesystem model and software pixels for the FileChooser dialog,
+//! the navigation, filter, selection and scroll window being td-ui's shared
+//! directory finder's (td-ui/DESIGN.md, "Shared directory finder") over a
+//! listing this model reads under its own descriptors and bounds.
 
-use crate::list_filter;
 use std::collections::BTreeSet;
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
@@ -8,12 +10,13 @@ use std::os::fd::AsRawFd;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Component, Path, PathBuf};
-use td_ui::chrome::{Field, Item, List, Status, TextEntry, ROW};
+use td_ui::chrome::{Status, ROW};
+use td_ui::finder;
+use td_ui::font::Font;
 use td_ui::raster::{
     text_run, Composition, Draw, GlyphStyle, Primitive, Raster, Rect, Scale, Surface, BORDER,
     CHROME, INK, LINE_NUMBER,
 };
-use td_ui::font::Font;
 use td_ui::{CELL_HEIGHT, CELL_WIDTH};
 
 pub const WIDTH: usize = 640;
@@ -28,20 +31,28 @@ pub const MAX_RESULT_URI_BYTES: usize = 512 * 1024;
 pub const MAX_FRAME_BYTES: usize = 32 * 1024 * 1024;
 pub const MAX_RENDERED_TITLE_BYTES: usize = 320;
 pub const MAX_ACCEPT_LABEL_BYTES: usize = 64;
-const MAX_DISPLAY_NAME_CHARS: usize = 64;
+// A display name fills the room the finder's row has, less the folder's
+// slash and the ellipsis a cut name ends in, so the filter sees as much of
+// a name as the widget holds; the list clips the row at its edge.
+const MAX_DISPLAY_NAME_CHARS: usize = finder::NAME_BYTES - 1 - '…'.len_utf8();
 
 // The file chooser renders as a `Composition` over the shared raster at
-// scale 1: a chrome ground, a title heading over a hairline rule, the guest
-// path and selection-status lines, the filter as a `TextEntry`, the entries
-// as a `List`, and a `Status` footer. These are the band tops in font pixels;
-// the list fills from `LIST_TOP` to one `ROW` above the bottom (the footer).
+// scale 1: a chrome ground, a title heading over a hairline rule, the
+// selection facts line, td-ui's finder (its path row, filter field, entry
+// list and status row) and a `Status` footer with the control legend. These
+// are the band tops in font pixels; the finder fills from `FINDER_TOP` to
+// one `ROW` above the bottom (the footer).
 const INSET_X: usize = CELL_WIDTH;
 const TITLE_Y: usize = 4;
 const RULE_Y: usize = ROW;
-const PATH_Y: usize = ROW + 4;
-const STATUS_Y: usize = 2 * ROW + 4;
-const FILTER_TOP: usize = 3 * ROW;
-const LIST_TOP: usize = 4 * ROW;
+const FACTS_Y: usize = ROW + 4;
+const FINDER_TOP: usize = 2 * ROW;
+/// The smallest surface the finder lays out on: its `MIN_COLUMNS` inside the
+/// inset, and its four rows between `FINDER_TOP` and the footer. A viewport
+/// smaller than this is rendered on a surface padded to it and clipped back,
+/// so the request keeps a one-row list instead of failing.
+const MIN_WIDTH: usize = (finder::MIN_COLUMNS + 2) * CELL_WIDTH;
+const MIN_HEIGHT: usize = FINDER_TOP + 5 * ROW;
 
 const O_DIRECTORY: i32 = 0x0001_0000;
 const O_NOFOLLOW: i32 = 0x0002_0000;
@@ -111,7 +122,6 @@ enum EntryKind {
 struct Entry {
     name: OsString,
     display: String,
-    search: String,
     kind: EntryKind,
     device: u64,
     inode: u64,
@@ -126,12 +136,13 @@ pub struct Chooser {
     accept_label: Option<String>,
     filter: Option<FileFilter>,
     entries: Vec<Entry>,
-    matches: Vec<usize>,
-    selected: usize,
-    scroll_start: usize,
-    visible_rows: usize,
+    /// The shared finder over the current directory's listing: the filter,
+    /// the shown rows, the selection and the scroll window are its.
+    finder: finder::Controller,
+    /// The configured viewport; the finder lays out on it padded to the
+    /// minimum and the frame is clipped back to it.
+    viewport: (usize, usize),
     chosen: BTreeSet<Vec<u8>>,
-    query: String,
     directory_truncated: bool,
     selection_limit_hit: bool,
     finished: bool,
@@ -181,9 +192,26 @@ impl Chooser {
                 host_root.display()
             )
         })?;
-        let row_capacity = visible_rows(HEIGHT);
         let (entries, directory_truncated) = read_entries(&root)?;
-        let mut chooser = Self {
+        let chosen = BTreeSet::new();
+        let listing = listing_of(
+            guest_root,
+            Path::new(""),
+            &entries,
+            &chosen,
+            directory_truncated,
+            mode,
+        )?;
+        let surface = padded_surface(WIDTH, HEIGHT)?;
+        let finder = finder::Controller::new(
+            listing,
+            choose_of(mode),
+            surface,
+            finder_rect(surface),
+            None,
+        )
+        .map_err(|error| format!("file chooser finder: {error}"))?;
+        Ok(Self {
             title: title.to_string(),
             guest_root: guest_root.to_path_buf(),
             relative: PathBuf::new(),
@@ -192,63 +220,37 @@ impl Chooser {
             accept_label,
             filter,
             entries,
-            matches: Vec::new(),
-            selected: 0,
-            scroll_start: 0,
-            visible_rows: row_capacity,
-            chosen: BTreeSet::new(),
-            query: String::with_capacity(list_filter::MAX_QUERY_BYTES),
+            finder,
+            viewport: (WIDTH, HEIGHT),
+            chosen,
             directory_truncated,
             selection_limit_hit: false,
             finished: false,
             font: td_ui::font::pinned()?,
-        };
-        chooser.refresh_matches();
-        Ok(chooser)
+        })
     }
 
+    /// One action: the finder's keys for the moves, the filter, a descent,
+    /// an ascent (Parent, or Backspace on an empty filter) and the cancel;
+    /// the model's own for the marks of the multiple-file mode, whose
+    /// Activate on a file toggles it and whose Accept takes the marked set.
     pub fn apply(&mut self, action: Action) -> Result<Outcome, String> {
         if self.finished {
             return Err("file chooser request is already complete".into());
         }
         let outcome = match action {
-            Action::Next if !self.matches.is_empty() => {
-                self.selected = self.selected.saturating_add(1) % self.matches.len();
-                self.keep_selected_visible();
-                Outcome::Pending
-            }
-            Action::Previous if !self.matches.is_empty() => {
-                self.selected = if self.selected == 0 {
-                    self.matches.len().saturating_sub(1)
-                } else {
-                    self.selected.saturating_sub(1)
-                };
-                self.keep_selected_visible();
-                Outcome::Pending
-            }
-            Action::Insert(character) if list_filter::insert(&mut self.query, character) => {
-                self.refresh_matches();
-                Outcome::Pending
-            }
-            Action::Backspace if !self.query.is_empty() => {
-                self.query.pop();
-                self.refresh_matches();
-                Outcome::Pending
-            }
+            Action::Next => self.key(finder::Key::Down)?,
+            Action::Previous => self.key(finder::Key::Up)?,
+            Action::Insert(character) => self.finder_event(finder::Event::Insert(character))?,
+            Action::Backspace => self.key(finder::Key::Backspace)?,
             Action::Activate => self.activate()?,
             Action::Toggle => {
                 self.toggle()?;
                 Outcome::Pending
             }
             Action::Accept => self.accept()?,
-            Action::Parent => {
-                self.parent()?;
-                Outcome::Pending
-            }
-            Action::Cancel => Outcome::Cancelled,
-            Action::Next | Action::Previous | Action::Insert(_) | Action::Backspace => {
-                Outcome::Pending
-            }
+            Action::Parent => self.key(finder::Key::Parent)?,
+            Action::Cancel => self.key(finder::Key::Escape)?,
         };
         if outcome != Outcome::Pending {
             self.finished = true;
@@ -256,76 +258,141 @@ impl Chooser {
         Ok(outcome)
     }
 
-    pub fn render(&self) -> Result<Vec<u8>, String> {
-        self.render_sized(WIDTH, HEIGHT)
+    fn key(&mut self, key: finder::Key) -> Result<Outcome, String> {
+        // The dialog sees one press per key and repeats nothing itself;
+        // a held Backspace ascending is what the flag would guard against.
+        self.finder_event(finder::Event::Key {
+            key,
+            repeated: false,
+        })
     }
 
+    /// One finder event and what it asks of the model: a descent enters the
+    /// folder under the cursor (refused when it changed since it was
+    /// listed, which fails the request with the widget untouched), an
+    /// ascent the parent, a choice the accepted result. A choice closes the
+    /// finder, so a result that cannot be made completes the request
+    /// refused rather than leaving a closed finder behind a pending one.
+    fn finder_event(&mut self, event: finder::Event) -> Result<Outcome, String> {
+        match self.finder.event(event) {
+            finder::Outcome::Descend(index) => {
+                self.enter_directory(index)?;
+                Ok(Outcome::Pending)
+            }
+            finder::Outcome::Ascend => {
+                self.parent()?;
+                Ok(Outcome::Pending)
+            }
+            finder::Outcome::Closed(choice) => {
+                self.finished = true;
+                match choice {
+                    finder::Choice::Entry(index) => {
+                        let entry = self.entries.get(index).ok_or_else(|| {
+                            "file chooser choice escaped its entry table".to_string()
+                        })?;
+                        // The result invariant is the portal's, not the
+                        // widget's: only a file is a chosen entry.
+                        if entry.kind != EntryKind::File {
+                            return Err("file chooser choice of a folder".into());
+                        }
+                        let uri = self.entry_uri(entry)?;
+                        accepted_uris(vec![uri])
+                    }
+                    finder::Choice::Here => accepted_uris(vec![file_uri(&self.guest_directory())?]),
+                    finder::Choice::Cancelled => Ok(Outcome::Cancelled),
+                    finder::Choice::Unavailable(error) => {
+                        Err(format!("file chooser finder closed: {error}"))
+                    }
+                }
+            }
+            finder::Outcome::Ignored | finder::Outcome::Consumed | finder::Outcome::Changed => {
+                Ok(Outcome::Pending)
+            }
+        }
+    }
+
+    pub fn render(&mut self) -> Result<Vec<u8>, String> {
+        let (width, height) = self.viewport;
+        self.render_sized(width, height)
+    }
+
+    /// Lays the finder out for the viewport, padded to the minimum it needs;
+    /// the selection stays shown.
     pub fn set_viewport(&mut self, width: usize, height: usize) -> Result<(), String> {
         frame_bytes(width, height)?;
-        self.visible_rows = visible_rows(height);
-        self.keep_selected_visible();
+        let surface = padded_surface(width, height)?;
+        if let finder::Outcome::Closed(finder::Choice::Unavailable(error)) =
+            self.finder.event(finder::Event::Resize {
+                surface,
+                rect: finder_rect(surface),
+            })
+        {
+            // The widget has closed; the request ends with it.
+            self.finished = true;
+            return Err(format!("file chooser finder cannot lay out: {error}"));
+        }
+        self.viewport = (width, height);
         Ok(())
     }
 
-    pub fn render_sized(&self, width: usize, height: usize) -> Result<Vec<u8>, String> {
-        let scale = Scale::new(1).map_err(|error| format!("file chooser scale: {error}"))?;
-        let surface = Surface::new(width, height, scale)
-            .map_err(|error| format!("file chooser surface {width}x{height}: {error}"))?;
-        let rows = visible_rows(height);
-        let mut items = Vec::with_capacity(rows);
-        for entry_index in self.matches.iter().skip(self.scroll_start).take(rows) {
-            let Some(entry) = self.entries.get(*entry_index) else {
-                continue;
-            };
-            let suffix = if entry.kind == EntryKind::Directory {
-                "/"
-            } else {
-                ""
-            };
-            let marked = self
-                .chosen
-                .contains(&selection_key(&self.relative, &entry.name));
-            items.push(ListRow {
-                label: item_label(*entry_index, entry, suffix),
-                marked,
-            });
+    /// The frame for a `width` by `height` viewport, laid out for it first
+    /// when it is not the configured one; a viewport under the minimum is
+    /// painted on the padded surface and clipped to its top-left corner.
+    pub fn render_sized(&mut self, width: usize, height: usize) -> Result<Vec<u8>, String> {
+        if (width, height) != self.viewport {
+            self.set_viewport(width, height)?;
         }
-        let view = ChooserView {
+        let surface = padded_surface(width, height)?;
+        let view = View {
+            chooser: self,
             surface,
-            rows,
-            title: self.title.clone(),
-            path: format!("PATH  {}", file_uri(&self.guest_directory())?),
-            status: self.status_line(),
-            query: self.query.clone(),
-            help: self.help_line(),
-            items,
-            first: self.scroll_start,
-            selected: self.selected,
-            total: self.matches.len(),
         };
         let mut pixels = vec![0u8; frame_bytes(width, height)?];
-        Raster::new(
-            &mut pixels,
-            &self.font,
-            surface,
-            width.saturating_mul(BYTES_PER_PIXEL),
-        )
-        .map_err(|error| format!("file chooser raster: {error}"))?
-        .paint(&view, surface.bounds())
-        .map_err(|error| format!("file chooser paint: {error}"))?;
+        if surface.width == width && surface.height == height {
+            Raster::new(
+                &mut pixels,
+                &self.font,
+                surface,
+                width.saturating_mul(BYTES_PER_PIXEL),
+            )
+            .map_err(|error| format!("file chooser raster: {error}"))?
+            .paint(&view, surface.bounds())
+            .map_err(|error| format!("file chooser paint: {error}"))?;
+            return Ok(pixels);
+        }
+        let padded_stride = surface.width.saturating_mul(BYTES_PER_PIXEL);
+        let mut padded = vec![0u8; padded_stride.saturating_mul(surface.height)];
+        Raster::new(&mut padded, &self.font, surface, padded_stride)
+            .map_err(|error| format!("file chooser raster: {error}"))?
+            .paint(&view, surface.bounds())
+            .map_err(|error| format!("file chooser paint: {error}"))?;
+        let stride = width.saturating_mul(BYTES_PER_PIXEL);
+        for (row, target) in pixels.chunks_mut(stride).enumerate() {
+            let start = row.saturating_mul(padded_stride);
+            if let Some(source) = padded.get(start..start.saturating_add(stride)) {
+                target.copy_from_slice(source);
+            }
+        }
         Ok(pixels)
     }
 
     pub fn query(&self) -> &str {
-        &self.query
+        self.finder.query()
     }
 
     pub fn matched_names(&self) -> Vec<&OsStr> {
-        self.matches
+        self.finder
+            .shown()
             .iter()
             .filter_map(|index| self.entries.get(*index))
             .map(|entry| entry.name.as_os_str())
             .collect()
+    }
+
+    /// The rows the finder's list shows at the configured viewport, at
+    /// least one.
+    pub fn visible_rows(&self) -> usize {
+        (self.finder.list_rect().height as usize / ROW).max(1)
     }
 
     fn status_line(&self) -> String {
@@ -362,61 +429,54 @@ impl Chooser {
         line
     }
 
+    /// The entry under the finder's cursor when it is a file.
+    fn selected_file(&self) -> Option<usize> {
+        let index = self.finder.selected()?;
+        self.entries
+            .get(index)
+            .filter(|entry| entry.kind == EntryKind::File)
+            .map(|_| index)
+    }
+
     fn activate(&mut self) -> Result<Outcome, String> {
-        let Some(entry_index) = self.matches.get(self.selected).copied() else {
-            return Ok(Outcome::Pending);
-        };
-        let Some(entry) = self.entries.get(entry_index) else {
-            return Err("file chooser selection escaped its entry table".into());
-        };
-        if entry.kind == EntryKind::Directory {
-            let name = entry.name.clone();
-            let device = entry.device;
-            let inode = entry.inode;
-            self.enter_directory(&name, device, inode)?;
-            return Ok(Outcome::Pending);
-        }
-        match self.mode {
-            Mode::OpenFile { multiple: false } => {
-                let uri = self.entry_uri(entry)?;
-                accepted_uris(vec![uri])
-            }
-            Mode::OpenFile { multiple: true } => {
+        if let Mode::OpenFile { multiple: true } = self.mode {
+            if self.selected_file().is_some() {
                 self.toggle()?;
-                Ok(Outcome::Pending)
+                return Ok(Outcome::Pending);
             }
-            Mode::OpenDirectory => Ok(Outcome::Pending),
         }
+        self.key(finder::Key::Activate)
     }
 
     fn toggle(&mut self) -> Result<(), String> {
         let Mode::OpenFile { multiple: true } = self.mode else {
             return Ok(());
         };
-        let Some(entry_index) = self.matches.get(self.selected).copied() else {
+        let Some(index) = self.selected_file() else {
             return Ok(());
         };
-        let Some(entry) = self.entries.get(entry_index) else {
+        let Some(entry) = self.entries.get(index) else {
             return Err("file chooser selection escaped its entry table".into());
         };
-        if entry.kind != EntryKind::File {
-            return Ok(());
-        }
         let key = selection_key(&self.relative, &entry.name);
-        if !self.chosen.remove(&key) {
+        let marked = if self.chosen.remove(&key) {
+            false
+        } else {
             if self.chosen.len() >= MAX_SELECTIONS {
                 self.selection_limit_hit = true;
                 return Ok(());
             }
             self.chosen.insert(key);
-        }
+            true
+        };
         self.selection_limit_hit = false;
-        Ok(())
+        self.finder
+            .set_marked(index, marked)
+            .map_err(|error| format!("file chooser mark: {error}"))
     }
 
-    fn accept(&self) -> Result<Outcome, String> {
+    fn accept(&mut self) -> Result<Outcome, String> {
         match self.mode {
-            Mode::OpenDirectory => accepted_uris(vec![file_uri(&self.guest_directory())?]),
             Mode::OpenFile { multiple: true } if !self.chosen.is_empty() => {
                 let mut uris = Vec::with_capacity(self.chosen.len());
                 for relative in &self.chosen {
@@ -425,9 +485,10 @@ impl Chooser {
                 }
                 accepted_uris(uris)
             }
-            Mode::OpenFile { multiple: false } | Mode::OpenFile { multiple: true } => {
-                Ok(Outcome::Pending)
-            }
+            // Accept is the multiple-file mode's and the directory mode's
+            // key; a single file is opened by Activate alone, as it was.
+            Mode::OpenFile { .. } => Ok(Outcome::Pending),
+            Mode::OpenDirectory => self.key(finder::Key::Accept),
         }
     }
 
@@ -441,26 +502,44 @@ impl Chooser {
             .ok_or_else(|| "file chooser parent descriptor is absent".to_string())?;
         let (entries, truncated) = read_entries(target)?;
         let mut relative = self.relative.clone();
+        let from = relative
+            .file_name()
+            .map(|name| folder_label(&display_name(name)));
         if !relative.pop() {
             return Err("file chooser descriptor stack escaped its relative path".into());
         }
+        let listing = listing_of(
+            &self.guest_root,
+            &relative,
+            &entries,
+            &self.chosen,
+            truncated,
+            self.mode,
+        )?;
+        self.finder
+            .set_listing(listing, from.as_deref())
+            .map_err(|error| format!("file chooser listing: {error}"))?;
         self.entries = entries;
         self.relative = relative;
         self.directories.pop();
         self.directory_truncated = truncated;
         self.selection_limit_hit = false;
-        self.query.clear();
-        self.refresh_matches();
         Ok(())
     }
 
-    fn enter_directory(&mut self, name: &OsStr, device: u64, inode: u64) -> Result<(), String> {
+    fn enter_directory(&mut self, index: usize) -> Result<(), String> {
+        let Some(entry) = self.entries.get(index) else {
+            return Err("file chooser descent escaped its entry table".into());
+        };
+        if entry.kind != EntryKind::Directory {
+            return Err("file chooser descent into a file".into());
+        }
         if self.directories.len() >= MAX_DIRECTORY_DEPTH {
             return Err(format!(
                 "file chooser directory depth exceeds {MAX_DIRECTORY_DEPTH}"
             ));
         }
-        let relative = self.relative.join(name);
+        let relative = self.relative.join(&entry.name);
         require_path_bound(&relative, "file chooser relative path")?;
         require_path_bound(
             &self.guest_root.join(&relative),
@@ -470,28 +549,25 @@ impl Chooser {
             .directories
             .last()
             .ok_or_else(|| "file chooser current descriptor is absent".to_string())?;
-        let directory = open_child_directory(current, name, device, inode)?;
+        let directory = open_child_directory(current, &entry.name, entry.device, entry.inode)?;
         let (entries, truncated) = read_entries(&directory)?;
-
+        let listing = listing_of(
+            &self.guest_root,
+            &relative,
+            &entries,
+            &self.chosen,
+            truncated,
+            self.mode,
+        )?;
+        self.finder
+            .set_listing(listing, None)
+            .map_err(|error| format!("file chooser listing: {error}"))?;
         self.relative = relative;
         self.directories.push(directory);
         self.entries = entries;
         self.directory_truncated = truncated;
         self.selection_limit_hit = false;
-        self.query.clear();
-        self.refresh_matches();
         Ok(())
-    }
-
-    fn refresh_matches(&mut self) {
-        self.matches.clear();
-        for (index, entry) in self.entries.iter().enumerate() {
-            if list_filter::matches(&entry.search, &self.query) {
-                self.matches.push(index);
-            }
-        }
-        self.selected = 0;
-        self.scroll_start = 0;
     }
 
     fn guest_directory(&self) -> PathBuf {
@@ -502,20 +578,119 @@ impl Chooser {
         }
     }
 
-    fn keep_selected_visible(&mut self) {
-        if self.selected < self.scroll_start {
-            self.scroll_start = self.selected;
-        } else if self.selected >= self.scroll_start.saturating_add(self.visible_rows) {
-            self.scroll_start = self
-                .selected
-                .saturating_add(1)
-                .saturating_sub(self.visible_rows);
-        }
-    }
-
     fn entry_uri(&self, entry: &Entry) -> Result<String, String> {
         file_uri(&self.guest_directory().join(&entry.name))
     }
+}
+
+/// What the finder chooses in each mode: a folder (`Here`) when a
+/// directory is asked for, else a file.
+fn choose_of(mode: Mode) -> finder::Choose {
+    match mode {
+        Mode::OpenDirectory => finder::Choose::Folder,
+        Mode::OpenFile { .. } => finder::Choose::File,
+    }
+}
+
+/// The scale-1 surface the finder lays out on for a viewport: the viewport
+/// itself, or the minimum where the viewport is under it.
+fn padded_surface(width: usize, height: usize) -> Result<Surface, String> {
+    let scale = Scale::new(1).map_err(|error| format!("file chooser scale: {error}"))?;
+    let (width, height) = (width.max(MIN_WIDTH), height.max(MIN_HEIGHT));
+    Surface::new(width, height, scale)
+        .map_err(|error| format!("file chooser surface {width}x{height}: {error}"))
+}
+
+/// The finder's rectangle on a surface: inside the inset, from `FINDER_TOP`
+/// to the footer.
+fn finder_rect(surface: Surface) -> Rect {
+    Rect {
+        x: INSET_X as i64,
+        y: FINDER_TOP as i64,
+        width: surface.width.saturating_sub(2 * INSET_X) as u32,
+        height: surface.height.saturating_sub(FINDER_TOP + ROW) as u32,
+    }
+}
+
+/// A directory's row label: its display name and a slash.
+fn folder_label(display: &str) -> String {
+    let mut label = String::with_capacity(display.len() + 1);
+    label.push_str(display);
+    label.push('/');
+    label
+}
+
+/// One entry as the finder lists it: the display name (a folder with its
+/// slash), the row ordinal as the meta, so two names cut to the same
+/// display stay distinct rows (an ascent selecting by name lands on the
+/// first of them), a file chosen only where files are, and the mark when
+/// the entry is among the chosen.
+fn row_of(index: usize, entry: &Entry, mode: Mode, marked: bool) -> Result<finder::Entry, String> {
+    let (name, kind, enabled) = match entry.kind {
+        EntryKind::Directory => (folder_label(&entry.display), finder::Kind::Folder, true),
+        EntryKind::File => (
+            entry.display.clone(),
+            finder::Kind::File,
+            mode != Mode::OpenDirectory,
+        ),
+    };
+    finder::Entry::new(&name, &format!("{index:03}"), kind, enabled)
+        .map(|row| row.with_marked(marked))
+        .map_err(|error| format!("file chooser row {index}: {error}"))
+}
+
+/// A directory's listing for the finder: the guest path as its label, the
+/// entries in their read order and whether the read was cut short.
+fn listing_of(
+    guest_root: &Path,
+    relative: &Path,
+    entries: &[Entry],
+    chosen: &BTreeSet<Vec<u8>>,
+    truncated: bool,
+    mode: Mode,
+) -> Result<finder::Listing, String> {
+    let guest = if relative.as_os_str().is_empty() {
+        guest_root.to_path_buf()
+    } else {
+        guest_root.join(relative)
+    };
+    let mut rows = Vec::with_capacity(entries.len());
+    for (index, entry) in entries.iter().enumerate() {
+        let marked = chosen.contains(&selection_key(relative, &entry.name));
+        rows.push(row_of(index, entry, mode, marked)?);
+    }
+    finder::Listing::new(&path_label(&guest), rows, truncated)
+        .map_err(|error| format!("file chooser listing: {error}"))
+}
+
+/// A path as the finder's path row shows it: its bytes escaped as a display
+/// name's are, and its tail when the escaped form is longer than the finder
+/// holds.
+fn path_label(path: &Path) -> String {
+    let mut label = String::with_capacity(path.as_os_str().len());
+    for byte in path.as_os_str().as_bytes() {
+        if matches!(*byte, b' '..=b'~') && *byte != b'%' {
+            label.push(char::from(*byte));
+        } else {
+            push_hex_escape(&mut label, *byte);
+        }
+    }
+    if label.len() <= finder::PATH_BYTES {
+        return label;
+    }
+    let mut keep = label.len() - (finder::PATH_BYTES - '…'.len_utf8());
+    // The label is ASCII, so any index is a char boundary; the cut is moved
+    // past a `%XX` escape it would split so the tail begins whole.
+    let bytes = label.as_bytes();
+    if keep >= 1 && bytes.get(keep - 1) == Some(&b'%') {
+        keep += 2;
+    } else if keep >= 2 && bytes.get(keep - 2) == Some(&b'%') {
+        keep += 1;
+    }
+    let mut tail = String::with_capacity(finder::PATH_BYTES);
+    tail.push('…');
+    tail.push_str(label.get(keep..).unwrap_or_default());
+    tail
 }
 
 fn open_directory(path: &Path) -> std::io::Result<File> {
@@ -589,7 +764,6 @@ fn read_entries(directory: &File) -> Result<(Vec<Entry>, bool), String> {
             .map_err(|error| format!("inspect chooser entry {:?}: {error}", name))?;
         entries.push(Entry {
             display: display_name(&name),
-            search: name.to_string_lossy().to_ascii_lowercase(),
             name,
             kind,
             device: metadata.dev(),
@@ -663,10 +837,6 @@ fn display_name(name: &OsStr) -> String {
     display
 }
 
-fn item_label(index: usize, entry: &Entry, suffix: &str) -> String {
-    format!("{index:03} {}{suffix}", entry.display)
-}
-
 fn push_hex_escape(text: &mut String, byte: u8) {
     const HEX: &[u8; 16] = b"0123456789ABCDEF";
     text.push('%');
@@ -695,14 +865,6 @@ pub fn file_uri(path: &Path) -> Result<String, String> {
     Ok(uri)
 }
 
-/// The `List` rows the surface shows: the height less the header bands and
-/// the footer row, divided by the chrome row, at least one. `render_sized`
-/// lays the `List` out at exactly this many rows, so the caller-owned scroll
-/// window and the list's own row count agree.
-fn visible_rows(height: usize) -> usize {
-    (height.saturating_sub(LIST_TOP.saturating_add(ROW)) / ROW).max(1)
-}
-
 fn frame_bytes(width: usize, height: usize) -> Result<usize, String> {
     if width == 0 || height == 0 {
         return Err(format!(
@@ -721,30 +883,12 @@ fn frame_bytes(width: usize, height: usize) -> Result<usize, String> {
     Ok(bytes)
 }
 
-/// One `List` row built from an entry: its label and whether it carries the
-/// multi-select mark. The list paints the mark prefix and the selection.
-struct ListRow {
-    label: String,
-    marked: bool,
-}
-
 /// The file chooser laid out over one surface as a `Composition`: a chrome
-/// ground, the title heading over a hairline rule, the guest path and
-/// selection-status lines, the filter field, the entry list and the status
-/// footer. It owns the strings and the visible window `render_sized` built
-/// from the model, and reads nothing but its own fields.
-struct ChooserView {
+/// ground, the title heading over a hairline rule, the selection facts line,
+/// the finder and the footer with the control legend. It reads the model.
+struct View<'a> {
+    chooser: &'a Chooser,
     surface: Surface,
-    rows: usize,
-    title: String,
-    path: String,
-    status: String,
-    query: String,
-    help: String,
-    items: Vec<ListRow>,
-    first: usize,
-    selected: usize,
-    total: usize,
 }
 
 /// Streams a filled rectangle clipped to the damage, like the chrome bands.
@@ -757,7 +901,7 @@ fn fill(rect: Rect, color: u32, damage: Rect, sink: &mut dyn FnMut(Draw)) {
     }
 }
 
-impl Composition for ChooserView {
+impl Composition for View<'_> {
     fn surface(&self) -> Surface {
         self.surface
     }
@@ -777,14 +921,14 @@ impl Composition for ChooserView {
         let title = band(TITLE_Y);
         text_run(
             self.surface.scale,
-            self.title.chars(),
+            self.chooser.title.chars(),
             (title.x, title.y),
             title,
             GlyphStyle::medium(INK, CHROME),
             damage,
             sink,
         );
-        // A hairline rule separates the heading from the path and status.
+        // A hairline rule separates the heading from the facts.
         fill(
             Rect {
                 x: inset,
@@ -796,76 +940,18 @@ impl Composition for ChooserView {
             damage,
             sink,
         );
-        for (line, top) in [(&self.path, PATH_Y), (&self.status, STATUS_Y)] {
-            let at = band(top);
-            text_run(
-                self.surface.scale,
-                line.chars(),
-                (at.x, at.y),
-                at,
-                GlyphStyle::medium(LINE_NUMBER, CHROME),
-                damage,
-                sink,
-            );
-        }
-        let filter = Rect {
-            x: inset,
-            y: (FILTER_TOP * s) as i64,
-            width: content,
-            height: (ROW * s) as u32,
-        };
-        if let Some(entry) = TextEntry::new(self.surface, filter) {
-            let caret = self.query.chars().count();
-            let first = entry.reveal(caret, caret, 0);
-            entry.emit(
-                Field {
-                    text: &self.query,
-                    placeholder: "Filter",
-                    caret,
-                    anchor: None,
-                    first,
-                    masked: false,
-                    focused: true,
-                    caret_visible: true,
-                },
-                damage,
-                sink,
-            );
-        }
-        let list_rect = Rect {
-            x: inset,
-            y: (LIST_TOP * s) as i64,
-            width: content,
-            height: (self.rows * ROW * s) as u32,
-        };
-        if let Some(list) = List::new(self.surface, list_rect) {
-            list.emit(
-                self.items.iter().map(|row| Item {
-                    label: row.label.as_str(),
-                    meta: "",
-                    enabled: true,
-                    marked: row.marked,
-                }),
-                self.first,
-                self.selected,
-                self.total,
-                damage,
-                sink,
-            );
-            if self.total == 0 {
-                let body = list.body();
-                text_run(
-                    self.surface.scale,
-                    "No matches".chars(),
-                    (body.x + (INSET_X * s) as i64, body.y + (TITLE_Y * s) as i64),
-                    body,
-                    GlyphStyle::medium(LINE_NUMBER, CHROME),
-                    damage,
-                    sink,
-                );
-            }
-        }
-        Status::new(self.surface).emit(self.help.chars(), damage, sink);
+        let facts = band(FACTS_Y);
+        text_run(
+            self.surface.scale,
+            self.chooser.status_line().chars(),
+            (facts.x, facts.y),
+            facts,
+            GlyphStyle::medium(LINE_NUMBER, CHROME),
+            damage,
+            sink,
+        );
+        self.chooser.finder.emit(damage, sink);
+        Status::new(self.surface).emit(self.chooser.help_line().chars(), damage, sink);
     }
 }
 
@@ -1138,6 +1224,7 @@ mod tests {
         assert_eq!(chooser.entries.len(), MAX_DIRECTORY_ENTRIES);
         assert!(chooser.directory_truncated);
         assert!(chooser.status_line().contains("DIRECTORY TRUNCATED"));
+        assert!(chooser.finder.listing().truncated());
 
         let names = Temp::new("name-bound");
         for index in 0..258 {
@@ -1189,10 +1276,6 @@ mod tests {
             Mode::OpenDirectory,
         )
         .unwrap();
-        assert_eq!(
-            chooser.apply(Action::Accept).unwrap(),
-            Outcome::Accepted(vec!["file:///home/td/Downloads".into()])
-        );
         let first = chooser.render().unwrap();
         let second = chooser.render().unwrap();
         assert_eq!(first, second);
@@ -1205,6 +1288,17 @@ mod tests {
         assert!(contains_rgb(&first, SELECTED_ROW));
         assert!(contains_rgb(&first, INK));
         assert!(contains_rgb(&first, BORDER));
+        // A file cannot be chosen where a directory is asked for; the
+        // listed directory is, and the finished chooser still renders its
+        // frame, the finder's rows gone with the choice.
+        assert_eq!(chooser.apply(Action::Activate).unwrap(), Outcome::Pending);
+        assert_eq!(
+            chooser.apply(Action::Accept).unwrap(),
+            Outcome::Accepted(vec!["file:///home/td/Downloads".into()])
+        );
+        let done = chooser.render().unwrap();
+        assert_eq!(done.len(), WIDTH * HEIGHT * BYTES_PER_PIXEL);
+        assert!(!contains_rgb(&done, SELECTED_ROW) && contains_rgb(&done, INK));
     }
 
     #[test]
@@ -1220,16 +1314,21 @@ mod tests {
             Mode::OpenFile { multiple: false },
         )
         .unwrap();
-        let rows = chooser.visible_rows;
+        let rows = chooser.visible_rows();
         for _ in 0..rows.saturating_add(3) {
             chooser.apply(Action::Next).unwrap();
         }
-        assert_eq!(chooser.selected, rows.saturating_add(3));
-        assert_eq!(chooser.scroll_start, 4);
+        assert_eq!(chooser.finder.selected(), Some(rows.saturating_add(3)));
+        assert_eq!(chooser.finder.first(), 4);
         chooser.apply(Action::Previous).unwrap();
-        assert_eq!(chooser.selected, rows.saturating_add(2));
-        assert_eq!(chooser.scroll_start, 4);
+        assert_eq!(chooser.finder.selected(), Some(rows.saturating_add(2)));
+        assert_eq!(chooser.finder.first(), 4);
         assert!(contains_rgb(&chooser.render().unwrap(), SELECTED_ROW));
+        // The moves clamp at the ends rather than wrapping.
+        for _ in 0..40 {
+            chooser.apply(Action::Next).unwrap();
+        }
+        assert_eq!(chooser.finder.selected(), Some(31));
     }
 
     #[test]
@@ -1320,6 +1419,15 @@ mod tests {
         }
         assert_eq!(chooser.matched_names(), [OsStr::new("nested")]);
         assert!(chooser.status_line().contains("SELECTED 2"));
+        // Re-entering the folder derives the star from the chosen set again.
+        chooser.apply(Action::Activate).unwrap();
+        assert!(chooser
+            .finder
+            .listing()
+            .entries()
+            .iter()
+            .any(|entry| entry.name() == "child.txt" && entry.marked()));
+        chooser.apply(Action::Parent).unwrap();
         assert_eq!(
             chooser.apply(Action::Accept).unwrap(),
             Outcome::Accepted(vec![
@@ -1343,7 +1451,6 @@ mod tests {
         let entry = |name: &OsStr| Entry {
             name: name.to_os_string(),
             display: display_name(name),
-            search: String::new(),
             kind: EntryKind::File,
             device: 1,
             inode: 1,
@@ -1351,7 +1458,124 @@ mod tests {
         let left = entry(&long_left);
         let right = entry(&long_right);
         assert_eq!(left.display, right.display);
-        assert_ne!(item_label(1, &left, ""), item_label(2, &right, ""));
+        let mode = Mode::OpenFile { multiple: false };
+        let (left, right) = (
+            row_of(1, &left, mode, false).unwrap(),
+            row_of(2, &right, mode, true).unwrap(),
+        );
+        assert_eq!(left.name(), right.name());
+        assert_ne!(left.meta(), right.meta());
+        assert!(!left.marked() && right.marked());
+        // A path label escapes as a display name does and keeps its tail
+        // within the finder's bound.
+        assert_eq!(path_label(Path::new("/home/td/a%b")), "/home/td/a%25b");
+        let long = PathBuf::from(format!("/{}", "y".repeat(finder::PATH_BYTES)));
+        let label = path_label(&long);
+        assert!(label.len() <= finder::PATH_BYTES && label.starts_with('…'));
+        assert_eq!(label.len(), finder::PATH_BYTES);
+        // The tail is the suffix, so an escape near the head is where the
+        // cut falls: on its `%` the tail begins with the whole escape, and on
+        // either hex digit the cut moves past it and the tail is shorter.
+        for (shift, head, len) in [
+            (0, "…%FF/", finder::PATH_BYTES),
+            (1, "…/", finder::PATH_BYTES - 2),
+            (2, "…/", finder::PATH_BYTES - 1),
+        ] {
+            let mut raw = vec![b'/'; 10];
+            raw.push(0xff);
+            raw.extend(std::iter::repeat_n(b'/', 4090 + shift));
+            let label = path_label(Path::new(OsStr::from_bytes(&raw)));
+            assert_eq!(label.len(), len, "{shift}: {label}");
+            assert!(
+                label.starts_with(head) && !label.contains("…F"),
+                "{shift}: {label}"
+            );
+        }
+    }
+
+    /// The filter sees the whole of a name the finder holds, not a short
+    /// display of it: a suffix past sixty-four characters still matches,
+    /// and a name past the finder's room is cut with an ellipsis.
+    #[test]
+    fn the_filter_matches_a_name_beyond_sixty_four_characters() {
+        let root = Temp::new("long-filter");
+        fs::write(root.0.join(format!("{}.txt", "x".repeat(70))), b"x").unwrap();
+        fs::write(root.0.join("short.md"), b"y").unwrap();
+        let mut chooser = Chooser::open(
+            "Open",
+            &root.0,
+            Path::new("/home/td/Downloads"),
+            Mode::OpenFile { multiple: false },
+        )
+        .unwrap();
+        for character in ".txt".chars() {
+            chooser.apply(Action::Insert(character)).unwrap();
+        }
+        assert_eq!(chooser.matched_names().len(), 1);
+        assert!(matches!(chooser.matched_names().first(), Some(name) if name.len() == 74));
+        let cut = OsString::from("w".repeat(MAX_DISPLAY_NAME_CHARS + 1));
+        let display = display_name(&cut);
+        assert!(display.ends_with('…') && display.len() <= MAX_DISPLAY_NAME_CHARS + 3);
+        assert!(folder_label(&display).len() <= finder::NAME_BYTES);
+        // A row far wider than the list (250 raw bytes escape to 750
+        // display characters) is listed and painted, clipped at its edge.
+        fs::create_dir(root.0.join(OsStr::from_bytes(&[0xff; 250]))).unwrap();
+        let mut chooser = Chooser::open(
+            "Open",
+            &root.0,
+            Path::new("/home/td/Downloads"),
+            Mode::OpenFile { multiple: false },
+        )
+        .unwrap();
+        assert_eq!(chooser.finder.listing().entries().len(), 3);
+        assert!(chooser
+            .finder
+            .listing()
+            .entries()
+            .iter()
+            .any(|entry| entry.name().len() == 751));
+        assert!(chooser.render().unwrap().iter().any(|byte| *byte != 0));
+    }
+
+    /// Backspace on an empty filter is an ascent, landing on the folder it
+    /// came from; on a filter it deletes; at the root it does nothing. In
+    /// the single-file mode Accept does nothing, as before: Activate opens.
+    #[test]
+    fn backspace_on_an_empty_filter_ascends_to_the_folder_it_left() {
+        let root = Temp::new("ascend");
+        fs::create_dir(root.0.join("first")).unwrap();
+        fs::create_dir(root.0.join("second")).unwrap();
+        fs::write(root.0.join("second").join("inner.txt"), b"x").unwrap();
+        let mut chooser = Chooser::open(
+            "Open",
+            &root.0,
+            Path::new("/home/td/Downloads"),
+            Mode::OpenFile { multiple: false },
+        )
+        .unwrap();
+        chooser.apply(Action::Next).unwrap();
+        chooser.apply(Action::Activate).unwrap();
+        assert_eq!(
+            chooser.guest_directory(),
+            Path::new("/home/td/Downloads/second")
+        );
+        assert_eq!(chooser.apply(Action::Accept).unwrap(), Outcome::Pending);
+        chooser.apply(Action::Insert('i')).unwrap();
+        assert_eq!(chooser.apply(Action::Backspace).unwrap(), Outcome::Pending);
+        assert_eq!(chooser.query(), "");
+        assert_eq!(
+            chooser.guest_directory(),
+            Path::new("/home/td/Downloads/second")
+        );
+        assert_eq!(chooser.apply(Action::Backspace).unwrap(), Outcome::Pending);
+        assert_eq!(chooser.guest_directory(), Path::new("/home/td/Downloads"));
+        assert_eq!(
+            chooser.finder.selected_entry().map(finder::Entry::name),
+            Some("second/")
+        );
+        assert_eq!(chooser.apply(Action::Backspace).unwrap(), Outcome::Pending);
+        assert_eq!(chooser.guest_directory(), Path::new("/home/td/Downloads"));
+        assert_eq!(chooser.finder.selected(), Some(1));
     }
 
     #[test]
@@ -1429,11 +1653,30 @@ mod tests {
         );
         chooser.set_viewport(600, 402).unwrap();
         assert_eq!(chooser.render_sized(600, 402).unwrap().len(), 600 * 402 * 4);
-        let large_rows = chooser.visible_rows;
+        let large_rows = chooser.visible_rows();
         chooser.set_viewport(1, 1).unwrap();
-        assert_eq!(chooser.visible_rows, 1);
-        assert!(large_rows > chooser.visible_rows);
-        assert_eq!(chooser.render_sized(1, 1).unwrap().len(), 4);
+        assert_eq!(chooser.visible_rows(), 1);
+        assert!(large_rows > chooser.visible_rows());
+        // Under the minimum the frame is the padded surface's corner: the
+        // chrome ground, still one row of list to move in.
+        let corner = chooser.render_sized(1, 1).unwrap();
+        assert_eq!(corner.len(), 4);
+        assert_eq!(pixel_rgb(&corner, 1, 0, 0), CHROME);
+        // A small frame is the top-left crop of the minimum's, row by row,
+        // through the title and the finder's rows.
+        let whole = chooser.render_sized(MIN_WIDTH, MIN_HEIGHT).unwrap();
+        let (width, height) = (100, 60);
+        let crop = chooser.render_sized(width, height).unwrap();
+        assert!(crop.iter().any(|byte| *byte != 0));
+        for row in 0..height {
+            let from = row * MIN_WIDTH * BYTES_PER_PIXEL;
+            assert_eq!(
+                &crop[row * width * BYTES_PER_PIXEL..(row + 1) * width * BYTES_PER_PIXEL],
+                &whole[from..from + width * BYTES_PER_PIXEL],
+                "row {row}"
+            );
+        }
+        assert_eq!(chooser.apply(Action::Next).unwrap(), Outcome::Pending);
         assert!(chooser.set_viewport(0, 432).is_err());
         assert!(chooser.render_sized(4096, 2161).is_err());
     }
@@ -1441,7 +1684,7 @@ mod tests {
     #[test]
     fn empty_title_uses_the_same_bounded_model() {
         let root = Temp::new("empty-title");
-        let chooser = Chooser::open(
+        let mut chooser = Chooser::open(
             "",
             &root.0,
             Path::new("/home/td/Downloads"),

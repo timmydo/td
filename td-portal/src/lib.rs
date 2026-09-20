@@ -33,8 +33,5 @@ mod scene {
     reason = "the shared keyboard profile is broader than one chooser"
 )]
 pub mod keyboard;
-#[path = "../../td-compositor/src/filter.rs"]
-pub mod list_filter;
-
 pub mod dialog;
 pub mod file_chooser;

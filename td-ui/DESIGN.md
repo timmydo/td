@@ -1212,11 +1212,16 @@ dialog, preserve pixels outside it and respect partial damage.
 ## Shared directory finder
 
 `finder::Listing` is one folder as the consumer read it: its path as
-shown, its `Entry` values in the consumer's order (a name, a right-aligned
-meta, a `Kind` of folder or file, and whether it can be descended into or
-chosen) and whether the read stopped short. The consumer reads the
-filesystem under its own bounds and trust, as td-portal's chooser and
-td-editor's directory tabs do, and the widget reads nothing: at most 4096
+shown, its `Entry` values in the consumer's order, and whether the read
+stopped short. An entry is a name, a right-aligned meta, a `Kind` of
+folder or file, whether it can be descended into or chosen, and whether
+it carries the mark, the list's star prefix: set on the entry with
+`with_marked` or on the shown listing by entry index with `set_marked`,
+refused `NoEntry` for one not there; what a mark means, a multiple
+selection in td-portal, is the consumer's, and the marks go with the
+listing they were on. The consumer reads the filesystem under its own
+bounds and trust, as td-portal's chooser and td-editor's directory tabs
+do, and the widget reads nothing: at most 4096
 entries, 1024-byte names, 16-byte metas, a 4096-byte path and one MiB of
 name and meta text between the entries, all control-free, refused before
 capture. `storage_bytes` on the listing and the controller exposes the
@@ -1602,7 +1607,7 @@ regressions. Those increments extend the original sequence below.
    guest-path mapping) and hands the widget a `Listing` per folder, its
    own filter, selection, scroll window and `ChooserView` deleted, the
    multi-select mark added to the widget's `Entry` for the multiple-file
-   mode, and its render oracles regolded over the widget's bands.
+   mode, and its render oracles regolded over the widget's bands. Landed.
 10. Button strip: `chrome::Buttons`, a row of bezelled `Button`s on one
     band (see "Shared action button"), the button's text centred in its
     height; td-photo's mode and filter strips are its first consumer.
