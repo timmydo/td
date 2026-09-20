@@ -7,7 +7,7 @@
 
 use std::fmt;
 
-use td_ui::chrome::{Bar, Block, Status, DISABLED, ROW};
+use td_ui::chrome::{Block, Buttons, Status, DISABLED, ROW};
 use td_ui::control::{self, decimal, hex, ErrorCode};
 use td_ui::driven::{self, Binding, Input, Outcome, PointerPhase};
 use td_ui::finder;
@@ -568,13 +568,20 @@ pub const BINDINGS: [Binding; 35] = [
     },
 ];
 
-/// The filters in the order the bar shows them.
+/// The filters in the order the filter strip shows them.
 pub const FILTERS: [(Filter, &str); 4] = [
     (Filter::All, "All"),
     (Filter::Picks, "Picks"),
     (Filter::Rejects, "Rejects"),
     (Filter::Unflagged, "Unflagged"),
 ];
+
+/// The filter strip's labels, `FILTERS` in order.
+const FILTER_NAMES: [&str; 4] = [FILTERS[0].1, FILTERS[1].1, FILTERS[2].1, FILTERS[3].1];
+
+/// The mode strip's labels: the roll chooser, the cull grid and develop,
+/// in the order `mode_states` reports them.
+const MODES: [&str; 3] = ["Roll Selection", "Culling", "Develop"];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum View {
@@ -596,8 +603,8 @@ struct Roll {
     path: Vec<u8>,
 }
 
-/// The grid's geometry on a surface: the bar above, the status row below,
-/// and whole cells in the area between.
+/// The grid's geometry on a surface: the mode and filter strips above,
+/// the status row below, and whole cells in the area between.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Layout {
     pub surface: Surface,
@@ -612,10 +619,10 @@ impl Layout {
     pub fn new(surface: Surface) -> Layout {
         let s = surface.scale.value();
         let band = ROW * s;
-        let height = surface.height.saturating_sub(2 * band);
+        let height = surface.height.saturating_sub(3 * band);
         let area = Rect {
             x: 0,
-            y: band as i64,
+            y: (2 * band) as i64,
             width: surface.width as u32,
             height: height as u32,
         };
@@ -1731,6 +1738,96 @@ impl Controller {
         Layout::new(self.surface)
     }
 
+    /// The mode strip, the first band.
+    fn mode_strip(&self) -> Buttons<'static> {
+        Buttons::new(self.surface, 0, &MODES)
+    }
+
+    /// The filter strip, the band under the mode strip.
+    fn filter_strip(&self) -> Buttons<'static> {
+        Buttons::new(
+            self.surface,
+            (ROW * self.surface.scale.value()) as i64,
+            &FILTER_NAMES,
+        )
+    }
+
+    /// The mode strip's buttons as `(selected, enabled)`, in `MODES`
+    /// order: the one in view is selected (the chooser while it is open,
+    /// else the mode; nothing before a roll, when no mode is in view),
+    /// Culling can be pressed once a roll is open and Develop once there
+    /// is a photo under the cursor.
+    pub fn mode_states(&self) -> [(bool, bool); 3] {
+        let roll = self.roll.is_some();
+        let in_view = if self.chooser.is_some() {
+            0
+        } else if !roll {
+            3
+        } else if self.mode == Mode::Develop {
+            2
+        } else {
+            1
+        };
+        [
+            (in_view == 0, true),
+            (in_view == 1, roll),
+            (in_view == 2, roll && self.cursor.is_some()),
+        ]
+    }
+
+    /// The filter strip's buttons as `(selected, enabled)`, in `FILTERS`
+    /// order: the active filter selected, all of them disabled while the
+    /// filters are not the mode's (develop, or the chooser open).
+    pub fn filter_states(&self) -> [(bool, bool); 4] {
+        let enabled = self.mode == Mode::Cull && self.chooser.is_none();
+        let state = |(filter, _): &(Filter, &str)| (*filter == self.filter, enabled);
+        [
+            state(&FILTERS[0]),
+            state(&FILTERS[1]),
+            state(&FILTERS[2]),
+            state(&FILTERS[3]),
+        ]
+    }
+
+    /// A press on the mode strip: the roll chooser, the cull grid or
+    /// develop, from whatever is in view. The mode in view is `ignored`,
+    /// as is one whose button is disabled: culling before a roll, develop
+    /// before a photo. Culling leaves develop whole (its palette, its
+    /// crop-adjust and any drag with it) and closes the chooser; develop
+    /// closes the chooser too.
+    fn press_mode(&mut self, index: usize) -> Result<(Outcome, Vec<Effect>), Error> {
+        let roll = self.roll.is_some();
+        let photo = roll && self.cursor.is_some();
+        let chooser = self.chooser.is_some();
+        match index {
+            0 if !chooser => self.choose(Vec::new()),
+            1 if roll && (chooser || self.mode == Mode::Develop) => {
+                self.chooser = None;
+                if self.mode == Mode::Develop {
+                    self.leave_develop();
+                }
+                Ok((self.finish(Outcome::Changed), Vec::new()))
+            }
+            2 if photo && (chooser || self.mode == Mode::Cull) => {
+                self.chooser = None;
+                self.enter_develop()?;
+                Ok((self.finish(Outcome::Changed), Vec::new()))
+            }
+            _ => Ok((Outcome::Ignored, Vec::new())),
+        }
+    }
+
+    /// Develop to the cull grid, its sub-modes and drag dropped: what
+    /// `grid` does once the palette and crop-adjust are down.
+    fn leave_develop(&mut self) {
+        self.mode = Mode::Cull;
+        self.view = View::Grid;
+        self.drag = None;
+        self.adjusting = false;
+        self.aspect = Aspect::Free;
+        self.look_list = false;
+    }
+
     /// The develop preview's box: the layout's preview box when developing a
     /// photo under the cursor, else `None`. The window and `--preview` blit
     /// the developed image here; the cull single view keeps the placeholder,
@@ -1961,7 +2058,8 @@ impl Controller {
         // While the chooser is open the window's actions are behind it:
         // only `choose` (closing it), `open`, `quit` and `scroll` (the
         // finder's wheel) reach through, the rest is `ignored`, as the
-        // keyboard cannot reach them either.
+        // keyboard cannot reach them either; the mode strip's Culling and
+        // Develop buttons reach through by the pointer (`press_mode`).
         if self.chooser.is_some()
             && !matches!(
                 action,
@@ -2046,8 +2144,20 @@ impl Controller {
         x: i64,
         y: i64,
     ) -> Result<(Outcome, Vec<Effect>), Error> {
+        // The mode strip is the target every mode shares: a press on it
+        // changes the mode whatever is in view, the chooser included. The
+        // status row covers it on a surface too short for the bands, as
+        // it covers its pixels.
+        if phase == PointerPhase::Press
+            && self.surface.bounds().contains(x, y)
+            && !Status::new(self.surface).rect().contains(x, y)
+        {
+            if let Some(index) = self.mode_strip().hit(x, y) {
+                return self.press_mode(index);
+            }
+        }
         // The chooser owns the pointer while it is open: a press picks a
-        // row, and nothing under it (the bar, a cell) is a target.
+        // row, and nothing under it (the filter strip, a cell) is a target.
         if self.chooser.is_some() {
             return self.chooser_event(match phase {
                 PointerPhase::Press => finder::Event::Press { x, y },
@@ -2056,7 +2166,7 @@ impl Controller {
             });
         }
         // Develop mode: the crop drag owns the pointer over the preview, for
-        // press, move and release; a press off the preview (the bar, the
+        // press, move and release; a press off the preview (the strips, the
         // status row, the margins) starts no drag, as a filter press is inert
         // here. Nothing else in develop uses the pointer.
         if self.mode == Mode::Develop {
@@ -2094,19 +2204,17 @@ impl Controller {
             }
             return self.crop_pointer(phase, x, y);
         }
-        // Only a press, and only on the surface: a header the width does
-        // not show is not a target. The bands are tested last painted
-        // first, so on a surface too short for both the status row covers
-        // the bar's headers as it covers their pixels.
+        // Only a press, and only on the surface: a button the width does
+        // not show whole is not a target. The bands are tested last
+        // painted first, so on a surface too short for them the status row
+        // covers the filter strip's buttons as it covers their pixels.
         if phase != PointerPhase::Press
             || !self.surface.bounds().contains(x, y)
             || Status::new(self.surface).rect().contains(x, y)
         {
             return Ok((Outcome::Ignored, Vec::new()));
         }
-        let labels = labels(self.filter);
-        let names = names(&labels);
-        if let Some(index) = Bar::new(self.surface, &names).hit(x, y) {
+        if let Some(index) = self.filter_strip().hit(x, y) {
             let Some((filter, _)) = FILTERS.get(index) else {
                 return Ok((Outcome::Ignored, Vec::new()));
             };
@@ -2377,7 +2485,7 @@ impl Controller {
     }
 
     /// A filter is the cull grid's; in develop mode it is ignored, since
-    /// develop is scoped to the one photo. The bar is still painted, so the
+    /// develop is scoped to the one photo. The strips are still painted, so the
     /// keys `1`-`4` and a press on it are inert here, not absent.
     fn set_filter(&mut self, filter: Filter) -> Outcome {
         if self.mode == Mode::Develop || self.filter == filter {
@@ -2531,11 +2639,7 @@ impl Controller {
             return Outcome::Changed;
         }
         if self.mode == Mode::Develop {
-            self.mode = Mode::Cull;
-            self.view = View::Grid;
-            self.drag = None;
-            self.aspect = Aspect::Free;
-            self.look_list = false;
+            self.leave_develop();
             return Outcome::Changed;
         }
         self.set_view(View::Grid)
@@ -2888,33 +2992,6 @@ impl Controller {
     }
 }
 
-/// The bar's labels: the active filter in brackets, the others padded to
-/// the same width, so the headers keep their places whichever is active.
-fn labels(active: Filter) -> [String; 4] {
-    let label = |(filter, name): &(Filter, &str)| {
-        if *filter == active {
-            format!("[{name}]")
-        } else {
-            format!(" {name} ")
-        }
-    };
-    [
-        label(&FILTERS[0]),
-        label(&FILTERS[1]),
-        label(&FILTERS[2]),
-        label(&FILTERS[3]),
-    ]
-}
-
-fn names(labels: &[String; 4]) -> [&str; 4] {
-    [
-        labels[0].as_str(),
-        labels[1].as_str(),
-        labels[2].as_str(),
-        labels[3].as_str(),
-    ]
-}
-
 /// `folder/name`, one separator between them.
 fn join_folder(folder: &[u8], name: &str) -> Vec<u8> {
     let mut joined = Vec::with_capacity(folder.len() + 1 + name.len());
@@ -2948,7 +3025,7 @@ fn fill(rect: Rect, color: u32, damage: Rect, sink: &mut dyn FnMut(Draw)) {
     }
 }
 
-/// What the window shows: the filter bar, the grid or the single photo,
+/// What the window shows: the mode and filter strips, the grid or the single photo,
 /// and the status row, laid out for the model's surface.
 pub struct Scene<'a> {
     model: &'a Controller,
@@ -3280,9 +3357,10 @@ impl Composition for Scene<'_> {
     fn emit(&self, damage: Rect, sink: &mut dyn FnMut(Draw)) {
         let model = self.model;
         let layout = model.layout();
-        let labels = labels(model.filter);
-        let names = names(&labels);
-        Bar::new(layout.surface, &names).emit(damage, sink);
+        model.mode_strip().emit(model.mode_states(), damage, sink);
+        model
+            .filter_strip()
+            .emit(model.filter_states(), damage, sink);
         if let Some(chooser) = &model.chooser {
             // The finder stands in for the area, whatever is open behind it.
             chooser.finder.emit(damage, sink);

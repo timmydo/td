@@ -375,20 +375,23 @@ fn a_session_walks_the_grid_and_reports_its_state() {
         );
     }
 
-    // The pointer: a bar header sets the filter, a cell selects, the rest
-    // is ignored, and only a press does anything.
-    assert_eq!(press(&mut c, 80, 10), Outcome::Changed);
+    // The pointer: a filter button sets the filter, a cell selects, the
+    // rest is ignored, and only a press does anything; the gap between
+    // two buttons and the strip's margin are no targets.
+    assert_eq!(press(&mut c, 80, 36), Outcome::Changed);
     assert_eq!(c.filter(), Filter::Picks);
-    assert_eq!(press(&mut c, 80, 10), Outcome::Ignored);
-    assert_eq!(press(&mut c, 10, 10), Outcome::Changed);
+    assert_eq!(press(&mut c, 80, 36), Outcome::Ignored);
+    assert_eq!(press(&mut c, 10, 36), Outcome::Changed);
     assert_eq!(c.filter(), Filter::All);
+    assert_eq!(press(&mut c, 52, 36), Outcome::Ignored);
+    assert_eq!(press(&mut c, 80, 25), Outcome::Ignored);
     assert_eq!(act(&mut c, "first", &[]), Outcome::Changed);
     assert_eq!(press(&mut c, 300, 100), Outcome::Changed);
     assert_eq!(fields(&c)[POSITION], "1");
     assert_eq!(press(&mut c, 300, 100), Outcome::Ignored);
     assert_eq!(press(&mut c, 300, 290), Outcome::Ignored);
-    // Off the 400x300 surface nothing is a target, not even the bar's row.
-    assert_eq!(press(&mut c, 400, 10), Outcome::Ignored);
+    // Off the 400x300 surface nothing is a target, not even a strip's row.
+    assert_eq!(press(&mut c, 400, 36), Outcome::Ignored);
     assert_eq!(press(&mut c, 10, 300), Outcome::Ignored);
     assert_eq!(c.filter(), Filter::All);
     assert_eq!(
@@ -401,21 +404,29 @@ fn a_session_walks_the_grid_and_reports_its_state() {
         .0,
         Outcome::Ignored
     );
-    // On a surface too short for both bands the status row paints over the
-    // bar, so a press there is the status row's, never a header's.
+    // On a surface too short for all the bands the status row paints over
+    // the strips, so a press there is the status row's, never a button's:
+    // at 64 tall it covers the filter strip's lower half, at 40 the mode
+    // strip's, and the part left showing is still a target.
+    let mut short = Controller::new(surface(400, 64));
+    short.open("roll", b"/r", photos(2)).unwrap();
+    assert_eq!(press(&mut short, 80, 44), Outcome::Ignored);
+    assert_eq!(short.filter(), Filter::All);
+    assert_eq!(press(&mut short, 80, 30), Outcome::Changed);
+    assert_eq!(short.filter(), Filter::Picks);
     let mut short = Controller::new(surface(400, 40));
     short.open("roll", b"/r", photos(2)).unwrap();
-    assert_eq!(press(&mut short, 80, 20), Outcome::Ignored);
-    assert_eq!(short.filter(), Filter::All);
-    assert_eq!(press(&mut short, 80, 10), Outcome::Changed);
-    assert_eq!(short.filter(), Filter::Picks);
+    assert_eq!(press(&mut short, 230, 20), Outcome::Ignored);
+    assert_eq!(short.mode(), ui::Mode::Cull);
+    assert_eq!(press(&mut short, 230, 10), Outcome::Changed);
+    assert_eq!(short.mode(), ui::Mode::Develop);
     // In the single view a press anywhere in the area between the bands
     // returns to the grid, the picture's margin as much as the picture;
     // the status row does not.
     assert_eq!(act(&mut c, "view", &[]), Outcome::Changed);
     assert_eq!(press(&mut c, 300, 290), Outcome::Ignored);
     assert_eq!(c.view(), View::Single);
-    assert_eq!(press(&mut c, 20, 30), Outcome::Changed);
+    assert_eq!(press(&mut c, 20, 60), Outcome::Changed);
     assert_eq!(c.view(), View::Grid);
     assert_eq!(act(&mut c, "view", &[]), Outcome::Changed);
     assert_eq!(press(&mut c, 200, 150), Outcome::Changed);
@@ -922,8 +933,9 @@ fn the_scene_reads_back_as_text_and_paints_deterministically() {
     let (rows, columns, text) = driven::text(&c.scene()).unwrap();
     assert_eq!((rows, columns), (37, 100));
     let lines: Vec<&str> = text.lines().collect();
-    assert_eq!(lines[0].trim(), "[All]    Picks     Rejects     Unflagged");
-    let bar = lines[0].to_string();
+    assert_eq!(lines[0].trim(), "Roll Selection   Culling   Develop");
+    assert_eq!(lines[1].trim(), "All   Picks   Rejects   Unflagged");
+    let strip = lines[1].to_string();
     assert!(text.contains("No roll open."), "{text}");
     assert_eq!(lines.last().unwrap().trim(), "No roll open");
 
@@ -936,11 +948,16 @@ fn the_scene_reads_back_as_text_and_paints_deterministically() {
     );
     // Four cells across: the names on one row, the badges above them.
     assert!(
-        lines[9].contains("DSC_0000.NEF") && lines[9].contains("DSC_0003.NEF"),
+        lines[11].contains("DSC_0000.NEF") && lines[11].contains("DSC_0003.NEF"),
         "{text}"
     );
-    assert!(lines[19].contains("DSC_0004.NEF") && lines[19].contains("DSC_0005.NEF"));
-    assert_eq!(lines[2].trim(), "P                     X", "{}", lines[2]);
+    let second = lines
+        .iter()
+        .position(|line| line.contains("DSC_0004.NEF"))
+        .unwrap();
+    assert_eq!(second, 20, "{text}");
+    assert!(lines[second].contains("DSC_0005.NEF"));
+    assert_eq!(lines[3].trim(), "P                     X", "{}", lines[3]);
     let frame = driven::paint(&c.scene()).unwrap();
     assert_eq!((frame.surface.width, frame.surface.height), (800, 600));
     assert_eq!(frame.rgb.len(), 800 * 600 * 3);
@@ -956,7 +973,7 @@ fn the_scene_reads_back_as_text_and_paints_deterministically() {
     assert_ne!(picked, digest);
     let (_, _, text) = driven::text(&c.scene()).unwrap();
     assert_eq!(
-        text.lines().nth(2).unwrap().trim(),
+        text.lines().nth(3).unwrap().trim(),
         "P                     P                     X"
     );
     act(&mut c, "next", &[]);
@@ -967,17 +984,18 @@ fn the_scene_reads_back_as_text_and_paints_deterministically() {
     act(&mut c, "rejects", &[]);
     let (_, _, text) = driven::text(&c.scene()).unwrap();
     let lines: Vec<&str> = text.lines().collect();
-    assert_eq!(lines[0].trim(), "All     Picks    [Rejects]    Unflagged");
-    // The headers keep their places whichever filter is active.
+    assert_eq!(lines[1].trim(), "All   Picks   Rejects   Unflagged");
+    // The buttons keep their places whichever filter is active: the
+    // active one is styled, not marked in the text.
     for filter in ["picks", "unflagged", "all", "rejects"] {
         act(&mut c, filter, &[]);
         let (_, _, text) = driven::text(&c.scene()).unwrap();
-        let row = text.lines().next().unwrap().to_string();
+        let row = text.lines().nth(1).unwrap().to_string();
         for header in ["All", "Picks", "Rejects", "Unflagged"] {
-            assert_eq!(row.find(header), bar.find(header), "{filter} {header}");
+            assert_eq!(row.find(header), strip.find(header), "{filter} {header}");
         }
     }
-    assert!(lines[9].contains("DSC_0002.NEF") && !lines[9].contains("DSC_0000.NEF"));
+    assert!(lines[11].contains("DSC_0002.NEF") && !lines[11].contains("DSC_0000.NEF"));
     assert_eq!(
         lines.last().unwrap().trim(),
         "roll | 6 photos, 1 shown | rejects | 1/1 DSC_0002.NEF reject"
@@ -986,9 +1004,9 @@ fn the_scene_reads_back_as_text_and_paints_deterministically() {
     act(&mut c, "view", &[]);
     let (_, _, text) = driven::text(&c.scene()).unwrap();
     let lines: Vec<&str> = text.lines().collect();
-    assert_eq!(lines[1].trim(), "DSC_0002.NEF");
+    assert_eq!(lines[3].trim(), "DSC_0002.NEF");
     assert_eq!(
-        lines[2].trim(),
+        lines[4].trim(),
         "reject | exposure - | crop - | look - | sidecar ok"
     );
     assert!(lines.last().unwrap().ends_with("| single"));
@@ -1605,11 +1623,11 @@ fn the_window_helpers_place_thumbnails_and_report_jobs() {
     let visible = c.visible();
     let indices = |visible: &[(usize, Rect)]| visible.iter().map(|(i, _)| *i).collect::<Vec<_>>();
     assert_eq!(indices(&visible), (0..12).collect::<Vec<_>>());
-    // The box sits under the bar and the cell's padding; the fifth cell
-    // begins the second row, the second the second column.
+    // The box sits under the strips and the cell's padding; the fifth
+    // cell begins the second row, the second the second column.
     let first = Rect {
         x: 8,
-        y: 32,
+        y: 56,
         width: 160,
         height: 120,
     };
@@ -1624,7 +1642,7 @@ fn the_window_helpers_place_thumbnails_and_report_jobs() {
     assert_eq!(
         visible[4].1,
         Rect {
-            y: 32 + 152,
+            y: 56 + 152,
             ..first
         }
     );
@@ -1942,13 +1960,13 @@ fn the_window_helpers_place_thumbnails_and_report_jobs() {
     // lower rows; painted within the grid's area, as the window paints
     // them, the badges leave the band as the scene left it, and painted
     // over the whole surface they would not.
-    let short = Surface::new(400, 60, Scale::default()).unwrap();
+    let short = Surface::new(400, 84, Scale::default()).unwrap();
     let mut c = Controller::new(short);
     c.open("roll", b"/r", photos(3)).unwrap();
     let area = c.layout().area;
-    assert_eq!((area.y, area.height), (24, 12));
+    assert_eq!((area.y, area.height), (48, 12));
     assert_eq!(c.visible()[1].0, 1, "the pick is on the one row");
-    let mut pixels = vec![0u8; big_stride * 60];
+    let mut pixels = vec![0u8; big_stride * 84];
     Raster::new(&mut pixels, &font, short, big_stride)
         .unwrap()
         .paint(&c.scene(), short.bounds())
@@ -3008,10 +3026,11 @@ fn the_look_palette_pick_needs_a_develop_box() {
     assert!(c.look_palette().is_some());
     assert_eq!(c.develop_box(), None);
 
+    // Left of the mode strip's first button, off every band's target.
     let (outcome, effects) = c
         .input(Input::Pointer {
             phase: PointerPhase::Press,
-            x: 10,
+            x: 4,
             y: 10,
         })
         .unwrap();
@@ -4283,14 +4302,15 @@ fn the_roll_chooser_opens_the_folder_in_view_and_closes_on_escape_a_roll_or_a_sm
     )
     .unwrap();
     // The pointer and the wheel are the finder's: a press on its row
-    // selects, one on the bar sets no filter, the wheel scrolls its list;
-    // a resize lays it out again, and a surface too small for it closes it.
+    // selects, one on the filter strip sets no filter, the wheel scrolls
+    // its list; a resize lays it out again, and a surface too small for
+    // it closes it.
     let list = c.chooser().unwrap().1.list_rect();
     assert_eq!(
         press(&mut c, list.x as u32 + 8, list.y as u32 + 8),
         Outcome::Ignored
     );
-    assert_eq!(press(&mut c, 12, 8), Outcome::Ignored);
+    assert_eq!(press(&mut c, 80, 36), Outcome::Ignored);
     assert_eq!(fields(&c)[5], "all");
     assert_eq!(
         c.input(Input::Wheel {
@@ -4560,6 +4580,205 @@ fn the_binary_chooses_a_roll_over_the_replay() {
         err.contains("gone") && err.contains("No such file"),
         "{err}"
     );
+}
+
+/// The mode strip: which mode is in view and which can be pressed, and
+/// a press changing the mode from whatever is open.
+#[test]
+fn the_mode_strip_names_the_mode_in_view_and_changes_it() {
+    let mut c = Controller::new(surface(800, 600));
+    let mode_press = |c: &mut Controller, x: u32| {
+        c.input(Input::Pointer {
+            phase: PointerPhase::Press,
+            x,
+            y: 12,
+        })
+        .unwrap()
+    };
+    // Before a roll only the chooser can be pressed and no mode is in
+    // view; the strip reads back by its labels, the filters are enabled.
+    assert_eq!(
+        c.mode_states(),
+        [(false, true), (false, false), (false, false)]
+    );
+    assert!(c.filter_states().iter().all(|state| state.1));
+    let (_, _, text) = driven::text(&c.scene()).unwrap();
+    assert_eq!(
+        text.lines().next().unwrap().trim(),
+        "Roll Selection   Culling   Develop"
+    );
+    assert_eq!(press(&mut c, 150, 12), Outcome::Ignored);
+    assert_eq!(press(&mut c, 230, 12), Outcome::Ignored);
+    // Roll Selection asks the adapter to list the working directory; the
+    // chooser is in view once the listing is installed, the filters and
+    // the other modes disabled with no roll behind.
+    let (outcome, effects) = mode_press(&mut c, 20);
+    assert_eq!(outcome, Outcome::Changed);
+    assert_eq!(
+        effects,
+        [Effect::List {
+            folder: None,
+            parent: false,
+        }]
+    );
+    c.set_listing(
+        b"/photos".to_vec(),
+        listing("/photos", &["2025"], &[]),
+        None,
+    )
+    .unwrap();
+    assert_eq!(
+        c.mode_states(),
+        [(true, true), (false, false), (false, false)]
+    );
+    assert!(c.filter_states().iter().all(|state| !state.1));
+    assert_eq!(press(&mut c, 20, 12), Outcome::Ignored);
+    assert_eq!(press(&mut c, 150, 12), Outcome::Ignored);
+    assert!(c.chooser().is_some());
+    assert_eq!(key(&mut c, "Escape"), Outcome::Changed);
+    // With a roll open, Culling is in view and Develop can be pressed:
+    // it develops the cursor's photo, the filters disabled and inert.
+    c.open("roll", b"/r", photos(3)).unwrap();
+    assert_eq!(
+        c.mode_states(),
+        [(false, true), (true, true), (false, true)]
+    );
+    assert_eq!(press(&mut c, 150, 12), Outcome::Ignored);
+    // From the single view, as from the grid: develop reports the grid
+    // as the view it will return to.
+    assert_eq!(act(&mut c, "view", &[]), Outcome::Changed);
+    assert_eq!(press(&mut c, 230, 12), Outcome::Changed);
+    assert_eq!((c.mode(), c.view()), (ui::Mode::Develop, View::Grid));
+    assert_eq!(
+        c.mode_states(),
+        [(false, true), (false, true), (true, true)]
+    );
+    assert!(c.filter_states().iter().all(|state| !state.1));
+    assert_eq!(press(&mut c, 80, 36), Outcome::Ignored);
+    assert_eq!(c.filter(), Filter::All);
+    assert_eq!(c.crop_drag(), None);
+    assert_eq!(press(&mut c, 230, 12), Outcome::Ignored);
+    // Culling leaves develop whole, its palette with it.
+    c.set_looks(some_looks());
+    assert_eq!(act(&mut c, "looks", &[]), Outcome::Changed);
+    assert_eq!(press(&mut c, 150, 12), Outcome::Changed);
+    assert_eq!((c.mode(), c.view()), (ui::Mode::Cull, View::Grid));
+    assert!(c.look_palette().is_none());
+    // Through the chooser: Roll Selection lists beside the roll; Develop
+    // closes the chooser and develops; from develop, Culling closes it
+    // and leaves develop.
+    let (outcome, effects) = mode_press(&mut c, 20);
+    assert_eq!(outcome, Outcome::Changed);
+    assert_eq!(
+        effects,
+        [Effect::List {
+            folder: Some(b"/r".to_vec()),
+            parent: true,
+        }]
+    );
+    c.set_listing(b"/".to_vec(), listing("/", &["r"], &[]), Some("r"))
+        .unwrap();
+    assert_eq!(press(&mut c, 230, 12), Outcome::Changed);
+    assert!(c.chooser().is_none());
+    assert_eq!(c.mode(), ui::Mode::Develop);
+    assert_eq!(mode_press(&mut c, 20).0, Outcome::Changed);
+    c.set_listing(b"/".to_vec(), listing("/", &["r"], &[]), Some("r"))
+        .unwrap();
+    assert_eq!(
+        c.mode_states(),
+        [(true, true), (false, true), (false, true)]
+    );
+    assert_eq!(press(&mut c, 150, 12), Outcome::Changed);
+    assert!(c.chooser().is_none());
+    assert_eq!((c.mode(), c.view()), (ui::Mode::Cull, View::Grid));
+    // The gap between two buttons and the strip's margin are no targets.
+    assert_eq!(press(&mut c, 140, 12), Outcome::Ignored);
+    assert_eq!(press(&mut c, 20, 1), Outcome::Ignored);
+}
+
+/// The mode strip's generations and its remaining transitions: a change
+/// bumps once, an ignored press and a chooser request never (the listing
+/// is the adapter's change), the chooser over cull to Culling and over
+/// develop to Develop, an empty roll's Develop disabled, and Culling out
+/// of crop-adjust and out of a drag in progress.
+#[test]
+fn the_mode_strip_bumps_once_a_change_and_never_a_request() {
+    let mut c = Controller::new(surface(800, 600));
+    let generation = |c: &Controller| fields(c)[GENERATION].clone();
+    let mode_press = |c: &mut Controller, x: u32| {
+        c.input(Input::Pointer {
+            phase: PointerPhase::Press,
+            x,
+            y: 12,
+        })
+        .unwrap()
+    };
+    // An empty roll: Culling in view, Develop disabled with no cursor.
+    c.open("roll", b"/r", photos(0)).unwrap();
+    assert_eq!(
+        c.mode_states(),
+        [(false, true), (true, true), (false, false)]
+    );
+    let before = generation(&c);
+    assert_eq!(press(&mut c, 230, 12), Outcome::Ignored);
+    assert_eq!(press(&mut c, 150, 12), Outcome::Ignored);
+    assert_eq!(generation(&c), before);
+    // Roll Selection asks; the generation waits for the listing, which
+    // moves it once; Culling then closes the chooser over the grid, once.
+    c.open("roll", b"/r", photos(3)).unwrap();
+    let before = generation(&c);
+    assert_eq!(mode_press(&mut c, 20).0, Outcome::Changed);
+    assert_eq!(generation(&c), before);
+    c.set_listing(b"/".to_vec(), listing("/", &["r"], &[]), Some("r"))
+        .unwrap();
+    let listed = generation(&c);
+    assert_ne!(listed, before);
+    assert_eq!(press(&mut c, 150, 12), Outcome::Changed);
+    assert!(c.chooser().is_none());
+    assert_eq!((c.mode(), c.view()), (ui::Mode::Cull, View::Grid));
+    let after = generation(&c);
+    assert_ne!(after, listed);
+    // Develop from the grid bumps once; the chooser over develop, then
+    // Develop again: the chooser closes, develop stays, one bump.
+    assert_eq!(press(&mut c, 230, 12), Outcome::Changed);
+    let developed = generation(&c);
+    assert_ne!(developed, after);
+    assert_eq!(mode_press(&mut c, 20).0, Outcome::Changed);
+    assert_eq!(generation(&c), developed);
+    c.set_listing(b"/".to_vec(), listing("/", &["r"], &[]), Some("r"))
+        .unwrap();
+    let listed = generation(&c);
+    assert_eq!(press(&mut c, 230, 12), Outcome::Changed);
+    assert!(c.chooser().is_none());
+    assert_eq!(c.mode(), ui::Mode::Develop);
+    assert_ne!(generation(&c), listed);
+    // Culling out of crop-adjust drops the sub-mode with the mode.
+    c.set_preview_fit(Some(Rect {
+        x: 100,
+        y: 100,
+        width: 400,
+        height: 300,
+    }));
+    assert_eq!(act(&mut c, "adjust-crop", &[]), Outcome::Changed);
+    assert!(c.adjusting());
+    assert_eq!(press(&mut c, 150, 12), Outcome::Changed);
+    assert!(!c.adjusting() && c.mode() == ui::Mode::Cull);
+    // And out of a marquee in progress: the drag is dropped, no crop
+    // effect made.
+    assert_eq!(press(&mut c, 230, 12), Outcome::Changed);
+    c.set_preview_fit(Some(Rect {
+        x: 100,
+        y: 100,
+        width: 400,
+        height: 300,
+    }));
+    assert_eq!(press(&mut c, 200, 200), Outcome::Ignored);
+    assert_eq!(drag_to(&mut c, 300, 300), Outcome::Changed);
+    assert!(c.crop_drag().is_some());
+    let (outcome, effects) = mode_press(&mut c, 150);
+    assert_eq!((outcome, effects.len()), (Outcome::Changed, 0));
+    assert_eq!(c.crop_drag(), None);
+    assert_eq!((c.mode(), c.view()), (ui::Mode::Cull, View::Grid));
 }
 
 /// The chords the chooser names are the ones td-ui's keymap makes, so a

@@ -97,11 +97,11 @@ modes are the photographer's order of work.
    embedded preview. The photographer walks it with the arrows, `Home`, `End`
    and the page keys, presses `p` to pick, `x` to reject and `u` to clear,
    `Return` to see one photo at the medium preview's full size and `Return` or
-   `Escape` to go back, and `1` to `4` (or the bar) to show all, the picks, the
-   rejects or the unflagged. `Delete` (`delete-rejected`) moves the rejects
-   and their sidecars into the roll's `rejected/` folder, each file linked
-   there before its old name is dropped, so no file is lost and no name is
-   replaced. `td-photo delete-rejected ROLL` is it headless.
+   `Escape` to go back, and `1` to `4` (or the filter strip) to show all,
+   the picks, the rejects or the unflagged. `Delete` (`delete-rejected`)
+   moves the rejects and their sidecars into the roll's `rejected/` folder,
+   each file linked there before its old name is dropped, so no file is
+   lost and no name is replaced. `td-photo delete-rejected ROLL` is it headless.
 3. **Develop** shows one photo developed from its raw data, entered with `d`
    on the cursor's photo and left with `Escape`. `=`/`-` move exposure by a
    third of a stop and their shifted pair `+`/`_` by a tenth, `0` resets to
@@ -171,9 +171,21 @@ window, all speaking the toolkit's one vocabulary.
   held, and the budget holds at every settle as at open: a flag that would take
   the roll past it is refused before anything is written, and a sidecar that
   grew past it meanwhile is not held, its photo shown as refused.
-- **Two modes.** The controller is in `cull` or `develop`; `develop` is a view
-  of one photo, the cursor's, entered with the `develop` action (`d`) and left
-  with `grid` (`Escape`), which returns to the cull grid. The develop edits are
+- **Two modes, and a strip that names them.** The controller is in `cull`
+  or `develop`; `develop` is a view of one photo, the cursor's, entered
+  with the `develop` action (`d`) and left with `grid` (`Escape`), which
+  returns to the cull grid. The mode strip (td-ui's `chrome::Buttons`,
+  the window's first band: Roll Selection, Culling, Develop) shows which
+  is in view, the roll chooser while it is open and none before a roll,
+  and a press on it is the one target every mode shares (`press_mode`):
+  Roll Selection is `choose`, Culling closes the chooser or leaves
+  develop whole (its palette, crop-adjust and any drag dropped, as `grid`
+  does once they are down), and Develop closes the chooser and develops
+  the cursor's photo. The
+  mode in view is `ignored`, as is a disabled button: Culling before a
+  roll, Develop before a photo (`mode_states`); `filter_states` disables
+  the filter strip in develop and under the chooser, where the filters
+  are not the mode's, its buttons inert. The develop edits are
   that mode's alone and are `ignored` in cull; the cull filters and the
   single-view toggle are cull's and are `ignored` in develop. Exposure is a
   delta, `expose-in`/`expose-out` a third of a stop and
@@ -256,11 +268,12 @@ window, all speaking the toolkit's one vocabulary.
   one on an empty filter, or a held `M-Up` or `^`, would run up the tree;
   the window asks it again before each repeat it delivers and stops the
   repeat the rule no longer allows), and every press and wheel is the
-  finder's too, so the bar's headers and the cells under it are no
-  targets; of the actions only
-  `choose` (closing it), `open`, `quit` and `scroll` (its wheel) reach
-  through, the rest is `ignored`. A descent asks for the folder under the
-  cursor and an ascent for this folder's parent with it selected (nothing
+  finder's too, so the filter strip's buttons and the cells under it are
+  no targets (the mode strip's are, being every mode's); of the actions
+  only `choose` (closing it), `open`, `quit` and `scroll` (its wheel)
+  reach through, the rest is `ignored`. A descent asks for the folder
+  under the cursor and an ascent for this folder's parent with it
+  selected (nothing
   above the root), each `changed` without moving the generation, as `open`
   is, since the frame changes when the adapter installs the listing or
   notes the refusal; opening the folder in view is the same `Open` effect
@@ -910,15 +923,18 @@ refused before anything is read.
 ## Window
 
 The scene is `ui::Scene`, a td-ui `Composition` the controller builds over its
-model per request: the filter bar (`chrome::Bar`, the active filter in brackets
-and the others padded to its width, so the headers keep their places), the grid
-or the single view (or the roll chooser's finder over the area while one is
-open, see Driving), and the status row (`chrome::Status`: the roll's folder, the
-counts, the filter, the photo under the cursor with its flag, `(sidecar
-refused)` when it was, `single` in that view, `develop` in develop mode). A grid
-cell is `CELL_W` by `CELL_H` (176 by 152) reference pixels at the surface's
-scale: a 160 by 120
-thumbnail box under `CELL_PAD` (8) of padding, a `P` or `X` badge at its corner
+model per request: the mode strip and the filter strip (each a td-ui
+`chrome::Buttons`, the first band Roll Selection, Culling and Develop with the
+mode in view selected, the second All, Picks, Rejects and Unflagged with the
+active filter selected, a button the mode cannot use disabled, see Driving:
+the buttons keep their places whichever is active, the selection styled rather
+than marked in the text), the grid or the single view (or the roll chooser's
+finder over the area while one is open, see Driving), and the status row
+(`chrome::Status`: the roll's folder, the counts, the filter, the photo under
+the cursor with its flag, `(sidecar refused)` when it was, `single` in that
+view, `develop` in develop mode). A grid cell is `CELL_W` by `CELL_H` (176 by
+152) reference pixels at the surface's scale: a 160 by 120 thumbnail box under
+`CELL_PAD` (8) of padding, a `P` or `X` badge at its corner
 for a flagged photo, and the name under it, a reject's dimmed; the cursor's cell
 wears a two-pixel selected frame. Cells fill whole rows from the top-left, as
 many columns as the width holds and as many rows as the height between the bands
@@ -929,14 +945,15 @@ develop mode shows the same view of the cursor's photo, its status marked
 `develop`, with the developed preview blitted into that box once it is made.
 The box geometry (`Layout::preview_box`) is one function the scene, the window
 and `--preview` share, so the placeholder and the image land in one place. A
-press on a bar header sets the filter, on a cell selects it, and in the single
-view anywhere in the area between the bands returns to the grid; the status row,
-and anything off the surface, is not a target, and the bands are hit-tested last
-painted first, so on a surface too short for both the status row covers the
-bar's headers as it covers their pixels. A box whose thumbnail is not held is a
-neutral placeholder, which is what `frame` digests either way; the develop box
-holds the developed preview once it is made, and the cull single view's box
-stays a placeholder.
+press on a mode button changes the mode, on a filter button sets the filter,
+on a cell selects it, and in the single view anywhere in the area between the
+bands returns to the grid; the status row, a strip's margin and the gap between
+two buttons, and anything off the surface, are not targets, and the bands are
+hit-tested last painted first, so on a surface too short for them the status
+row covers the strips' buttons as it covers their pixels. A box whose
+thumbnail is not held is a neutral placeholder, which is what `frame` digests
+either way; the develop box holds the developed preview once it is made, and
+the cull single view's box stays a placeholder.
 
 `td-photo open [ROLL] [--control-socket PATH]` runs the window (`window`), a
 `td_ui::client::App` in the shape td-setup's is, and one adapter over the same
@@ -1232,9 +1249,14 @@ in-process (the state before a roll and after, walking with every step and page,
 `select`, the filters and the cursor they keep or move, the single view and back
 by action and by key, unbound keys, `quit`, scrolling by action and by wheel
 clamped to the roll and revealed by the cursor, resizes good and bad, the
-pointer on the bar, a cell, the status row (on a surface too short for both
-bands too), off the surface and past the last photo, a resize to the size it
-has, an empty roll and one past `MAX_PHOTOS`; the effects a flag change asks
+pointer on the filter strip, the mode strip (its transitions from the grid,
+the chooser over the grid and over develop, and develop with its palette,
+crop-adjust or a marquee up, the disabled buttons and the mode in view
+ignored, a change bumping once and a chooser request never, the states it
+reports), a gap and a margin, a cell, the status row (on a surface too short
+for the bands too), off the surface and past the last photo, a resize to the
+size it has, an empty roll and one past `MAX_PHOTOS`; the effects a flag
+change asks
 for, the model unchanged until they are settled and its sidecar text after, the
 flag the file already holds ignored, an unknown line kept, a refused sidecar
 never rewritten, a flag that hides the photo under a filter and ends the single
@@ -1254,13 +1276,13 @@ tail and a control character blanked, an original listed disabled, the
 window's actions behind it but `choose`, `open`, `quit` and `scroll`, the
 chooser's repeat rule, `M-Up` and `^` ascending over a filter and never
 repeating, every chord it names made by the keymap from its key, a plain
-space filtering, `C-Return` opening the folder in view as an `Open`
-effect, `Escape`, a roll opening and an area too small
-closing it, the root and a relative roll asking for their parent by their own
+space filtering, `C-Return` opening the folder in view as an `Open` effect,
+`Escape`, a roll opening and an area too small closing it, the root and a
+relative roll asking for their parent by their own
 path, the pointer, the wheel and a resize its, and develop's box, handles and
 palette withheld under it and back when it closes); reads the scene back
-as text (the bar with its headers in place under every filter, the names and
-badges by row, the status line, the single view, the empty and filtered-out
+as text (the strips with their buttons in place under every filter, the names
+and badges by row, the status line, the single view, the empty and filtered-out
 messages, a scale of 2) and holds its frame digest to equality and to change;
 and runs the built binary's `--replay` over a temporary roll through the seam's
 verbs, writing a pick through the sidecar, refusing to flag a refused one,
@@ -1444,7 +1466,9 @@ all-target Clippy.
    finder, the `List` effect and `list_folder`, the chooser owning the
    keys, the pointer and the area while it is open, `C-Return` opening the
    folder in view through the `open` path, and a bare `td-photo` opening
-   the window. Landed.
+   the window. Landed. (e) The mode strip and the filter strip over
+   td-ui's bezelled button strip, the mode strip a target in every mode.
+   Landed.
 7. Packaging: the cargo recipe staging td-ui, the image entry, and the
    recipe check that develops the synthetic frame in the built artifact.
 8. Later: the 100% loupe from level 0, DNG and JPEG rolls, the Nikon High

@@ -399,7 +399,8 @@ pub enum Filter {
 }
 
 impl Filter {
-    /// The filter's word, as the window's `state` and bar spell it; for
+    /// The filter's word, as the window's `state` and filter strip spell
+    /// it; for
     /// the three `list` can switch to, its switch is `--WORD`.
     pub fn word(self) -> &'static str {
         match self {

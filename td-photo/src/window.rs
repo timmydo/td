@@ -1318,7 +1318,7 @@ impl Window {
                 // A press is a real on-surface location: one off the top-left
                 // (a left press while another button holds a cross-button grab)
                 // is rejected, not clamped, so it cannot land a spurious hit at
-                // a clamped zero (a bar header, a cell).
+                // a clamped zero (a strip's button, a cell).
                 let (x, y) = self.pointer;
                 if let (Ok(x), Ok(y)) = (u32::try_from(pixel(x)), u32::try_from(pixel(y))) {
                     self.input(Input::Pointer {
