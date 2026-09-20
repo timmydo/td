@@ -400,9 +400,11 @@ reaping, partial progress without replay and the unchanged deadline.
 for protocol owners checking after local work. Cancellation or expiry stays
 observable after an I/O error retires the worker, without interpreting the
 transport's diagnostic strings. Existing deadline-only callers retain their
-string error API. The portable transaction runner and its test-only Session
-binding are specified in `PORTABLE.md`; no production PIN consumer is added
-by that binding.
+string error API. The portable transaction runner and explicit manual
+hardware diagnostic are specified in `PORTABLE.md`. The diagnostic uses
+the existing root-only Session admission, a host-owned terminal PIN prompt,
+and no store or application authorization path. Its private terminal and
+process-protection syscall surface is recorded in `UNSAFE.md` section 15.
 
 Every td-owned HID worker takes a nonblocking exclusive file lock before
 opening a token. The stable empty `operation.lock` lives under root-owned

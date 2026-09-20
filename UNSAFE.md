@@ -38,7 +38,8 @@ module — see §13 for the escape a module-level one permits. The fourteenth,
 with no descriptor adoption and no mapping since its Wayland transport
 moved to the nineteenth, `td-ui`, which has one instruction and one
 adoption site for freshly installed descriptors. The
-fifteenth, `td-secret`, shares the portal transport. The sixteenth,
+fifteenth, `td-secret`, shares the portal transport and adds a scoped
+terminal/process-protection instruction for its manual token check. The sixteenth,
 `td-authd`, confines kernel sender credentials and pidfds to one instruction
 and one descriptor-adoption site. The seventeenth and eighteenth, `td-mail`
 and `td-news`, are ONE surface recorded twice: each carries a byte-identical
@@ -102,7 +103,7 @@ raw boundary of the consumer's own, which gets its own entry.
 | 12 | `td-portal` | `recvmsg(2)`, `sendmsg(2)`, `close(2)` for the shared credential-descriptor module (also compiled by td-secret, §15); one scoped received-descriptor adoption. The Wayland dialog's descriptor passing moved to td-ui (§19) |
 | 13 | `td-audio` | `ioctl(2)` with eleven value-pinned PCM requests, `poll(2)`, `getsockopt(2)` pinned to `SOL_SOCKET`/`SO_PEERCRED` |
 | 14 | `td-editor` | `fcntl(2)` pinned to `F_GETFL` and `F_SETFL`, `flistxattr(2)` pinned to a size-only query, `renameat2(2)` pinned to two borrowed parents and `RENAME_NOREPLACE`; no descriptor adoption |
-| 15 | `td-secret` | shared `recvmsg(2)`, `sendmsg(2)`, `close(2)` transport and scoped adoption for bounded credential replies; plus the named credential intake module of §16 |
+| 15 | `td-secret` | shared `recvmsg(2)`, `sendmsg(2)`, `close(2)` transport and scoped adoption for bounded credential replies; the named credential intake module of §16; plus the manual PIN terminal's two-request `ioctl(2)`, single-descriptor `poll(2)`, and fixed dumpability `prctl(2)` below |
 | 16 | `td-authd` | `recvmsg(2)`, `setsockopt(2)` with fixed `SO_PASSCRED`/`SO_PASSPIDFD`, `getsockopt(2)` with fixed `SO_PEERCRED`, and `poll(2)` on the peer pidfd; one scoped descriptor adoption; a separate mount instruction/adoption for `unshare(2)`, `open_tree(2)`, `mount_setattr(2)`, and `move_mount(2)` with the fixed portal file-grant values below; plus the separate named credential intake and six-request terminal ioctl/poll modules below |
 | 17 | `td-mail` | `ioctl(2)` (three pinned requests), `poll(2)` — td-sh's terminal half, in `term_sys.rs` |
 | 18 | `td-news` | the same `term_sys.rs`, byte for byte — see [§18](#18-td-news--the-same-terminal-surface) |
@@ -2358,6 +2359,38 @@ consumer, or additional allowance amends this section and
 `td-editor/DESIGN.md` in the same landing.
 
 ## 15. `td-secret` — the credential portal client
+
+The explicit `check-portable-token --create-test-credential` diagnostic
+adds one function-scoped syscall instruction in `pin_sys.rs`. It admits
+Linux x86-64 only. Its safe wrappers borrow a live terminal descriptor and
+own all kernel buffers until return. `ioctl(16)` has exactly TCGETS
+(0x5401) and TCSETSF (0x5404), each operating on the kernel's 36-byte
+termios layout, not libc's structure. TCSETSF flushes pending input on
+entry and restoration; it can wait for terminal output to drain. The PIN
+reader clears echo, canonical processing, signals and input transforms,
+checks the accepted mode, and restores the exact saved mode. Restoration
+is attempted on every normal error and Drop; process termination or a
+failed terminal driver cannot guarantee restoration or bounded teardown.
+This is host-owned input, not secure attention or a td authorization path.
+
+`poll(7)` receives one eight-byte repr(C) pollfd, requesting only POLLIN
+with a fixed 50 ms timeout. Disconnect/error events refuse. The safe reader
+uses O_NONBLOCK and checks the original operation deadline around input;
+poll readiness alone grants no secret release. `prctl(157)` is fixed to
+PR_SET_DUMPABLE(4, 0), followed by PR_GET_DUMPABLE(3) requiring zero.
+Unused syscall argument registers are zero. There is no restore-to-dumpable
+API. The diagnostic alone calls this before PIN/crypto work and also
+requires no active swap and a zero core soft limit. A trusted host kernel,
+root and terminal are prerequisites; suspend/hibernation integration and
+ordinary-account Guix use are not admitted by this diagnostic.
+
+Only `pin_terminal.rs` calls the terminal wrappers; only `token_check.rs`
+calls process protection. No descriptor adoption, mapping, signal handler
+or general request interface is added. Tests pin the raw surface and use
+real PTYs for echo, cancellation, timeout and restoration. The existing
+`td-authd/src/terminal_sys.rs` PTY allocator is compiled only into those
+tests, with its already recorded instruction/adoption allowances; it is
+absent from the production td-secret binary.
 
 The client compiles surface 12's `td-secret/src/sys.rs` directly: the same
 three-syscall instruction and exact descriptor-adoption allowance.

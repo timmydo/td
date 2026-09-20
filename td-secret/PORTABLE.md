@@ -279,7 +279,7 @@ validation, fixed operation schedules for secret scalars and AES, no
 secret-indexed tables, and an explicit analysis of compiler/timing and
 memory-erasure limits. It must not introduce a proprietary token protocol
 or replace the required PIN/UV policy with touch-only authentication.
-The private protocol flow below has no hardware consumer yet.
+The manual hardware diagnostic below is the first private protocol consumer.
 Any proposal to change this boundary requires a new explicit user decision.
 
 ### Implemented CTAP AES prerequisite
@@ -334,8 +334,8 @@ committed literals. These are primitive tests, not PIN or YubiKey evidence.
 ### Implemented P-256 prerequisite
 
 `src/fido_p256.rs` supplies private P-256 public-key derivation, raw ECDH
-and ES256 verification. The private PIN flow below consumes it; it has
-no direct device, entropy or notebook consumer. Existing TPM-backed
+and ES256 verification. The private PIN flow below consumes it through the
+manual hardware diagnostic; there is no notebook consumer. Existing TPM-backed
 application assertions are unchanged. The
 curve is fixed to secp256r1/P-256 from
 [Standards for Efficient Cryptography 2 (SEC 2)](https://www.secg.org/sec2-v2.pdf).
@@ -480,16 +480,75 @@ classify received bytes, not reachable recovery actions. No consumer may
 parse those diagnostics to choose an action. Typed capability refusal and
 any setup guidance require a later consumer-facing API increment.
 
-The concrete Session binding is test-only. Ordinary and td-built tests run
+The concrete Session binding also serves the manual diagnostic below.
+Ordinary and td-built tests run
 all four independent PIN transcripts, including creation and proof, through
 real child/socket HID framing with keepalives. They also cover every nonzero
 status, failures at each enrollment exchange, local interruption, late
-results, callback errors and signed backup-flag refusal. This runner has no
-production transport binding, public command or notebook entry point. The
+results, callback errors and signed backup-flag refusal. There is no
+notebook entry point. The
 actual consumer binary's generated-code inspection remains mandatory before
 hardware admission; these fixtures do not satisfy that gate or establish
 physical YubiKey interoperability. Guix device access, authority/prompt
 integration and durable primary/backup vault lifecycle remain prerequisites.
+
+### Manual hardware diagnostic
+
+`td-secret check-portable-token --create-test-credential` explicitly requests
+creation of one nonresident `td.invalid` test credential. It requires a
+root console, exactly one device admitted by the existing root-owned 0600
+USB policy, no active swap, zero core-dump soft limit, and a controlling
+terminal. It disables the diagnostic process's dumpability and checks that
+setting before reading a PIN. The re-executed HID worker relays encrypted
+PIN/hmac-secret frames and may be dumpable; it receives no plaintext PIN.
+The command changes no device permissions, invokes no elevation tool,
+and does not provide unprivileged Guix device admission.
+
+The terminal identifies the operation as host authentication, with no td
+secure-attention claim. Three separate PIN prompts authorize creation,
+enrollment proof and a second assertion on a newly opened channel. All
+three phases share one absolute two-minute deadline, fresh kernel entropy,
+and distinct domain-separated challenges. The second assertion must recover
+the identical 32-byte secret with a fresh UP/UV signature. Counters may both
+be zero; otherwise the second must increase. The output is only a success
+message or bounded diagnostic, never a PIN, credential, key, or secret.
+
+The command retains credential metadata and both proved secrets in clearing
+owners only until comparison. It saves no file and publishes no vault.
+The token may retain an orphan after failure or completion; this command
+never deletes credentials, resets the key, changes its PIN, retries a
+command, or promises to undo credential creation. The explicit CLI flag is
+required before discovery or input. Automated fixtures never invoke this
+command on an operator's hardware.
+
+`pin_terminal.rs` opens `/dev/tty` without following its leaf symlink, with
+nonblocking I/O. It disables echo and line/signal processing before showing
+the PIN prompt, flushes pending input, accepts only the codec's 4–63-byte
+ASCII profile, and supports backspace and Ctrl+C/Ctrl+D/Ctrl+Z cancellation. It
+polls the terminal with 50 ms waits and never sends input through stdout,
+argv, environment or a file. Success and ordinary errors restore and verify
+the original terminal mode; Drop makes another attempt after failure.
+A restoration failure also emits an explicit terminal-settings diagnostic
+on stderr. Busy nonblocking output queues refuse the operation. Drivers
+that normalize the requested terminal mode instead of preserving it are
+refused. Mode ioctls may wait for pending output to drain: the deadline
+refuses late results but does not guarantee wall-clock-bounded teardown.
+Abrupt termination can leave echo disabled. Outside a PIN prompt, ordinary
+terminal signals may terminate the process, leaving the existing worker
+watchdog to retire blocked USB I/O. No portable lock/suspend integration or
+real-secret host support follows from this diagnostic.
+
+The [generated-code acceptance record](CRYPTO-AUDIT.md) identifies the
+inspected source-built diagnostic. A host Cargo build is not that record.
+Physical model/firmware, independent primary/backup proofs and Guix access
+still require separate acceptance evidence.
+
+`tests/token_check_vectors.txt` supplies four independent complete command
+transcripts, generated by the optional host tool `tests/pin_vectors.py`
+with `--manual-check`. Tests reject signed wrong-secret and stale-counter
+responses and stop without retry at every exchange. Real pseudo-terminal
+fixtures check echo suppression, cancellation, timeout, invalid input,
+mode restoration and flushing pasted input beyond the PIN terminator.
 
 ### Implemented PIN-authorized hmac-secret assertion flow
 
@@ -529,8 +588,8 @@ transport-retry authority is supplied by the codec.
 The shared USB transport now offers an opt-in cancellation handle across
 startup and all exchanges, without renewing the deadline or replaying USB
 reports. See `DESIGN.md` under USB token transport for its socket polling,
-worker teardown and final consumer-check contract. The production portable
-path is not yet connected to that transport. Its future owner must route
+worker teardown and final consumer-check contract. The manual diagnostic
+connects the private portable flow to that transport. A notebook owner must route
 cancel, lock, suspend and authority loss to the handle, drop idle sessions and
 pending PIN state, and check authorization before accepting a result.
 The root-only device admission remains unchanged; standalone Guix device

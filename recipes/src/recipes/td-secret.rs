@@ -22,6 +22,9 @@ const MODULES: &[(&str, &str)] = &[
     ("fido_p256", include_str!("../../../td-secret/src/fido_p256.rs")),
     ("fido_pin", include_str!("../../../td-secret/src/fido_pin.rs")),
     ("fido_transaction", include_str!("../../../td-secret/src/fido_transaction.rs")),
+    ("pin_sys", include_str!("../../../td-secret/src/pin_sys.rs")),
+    ("pin_terminal", include_str!("../../../td-secret/src/pin_terminal.rs")),
+    ("token_check", include_str!("../../../td-secret/src/token_check.rs")),
     ("tpm", include_str!("../../../td-secret/src/tpm.rs")),
     ("store", include_str!("../../../td-secret/src/store.rs")),
     ("sys", include_str!("../../../td-secret/src/sys.rs")),
@@ -85,10 +88,12 @@ pub fn recipe() -> Recipe {
         });
     }
     for (path, source) in [
+        ("{src}/td-authd/src/terminal_sys.rs", include_str!("../../../td-authd/src/terminal_sys.rs")),
         ("{src}/td-authd/src/primary_account.rs", include_str!("../../../td-authd/src/primary_account.rs")),
         ("{src}/td-secret/tests/aes_vectors.txt", include_str!("../../../td-secret/tests/aes_vectors.txt")),
         ("{src}/td-secret/tests/p256_vectors.txt", include_str!("../../../td-secret/tests/p256_vectors.txt")),
         ("{src}/td-secret/tests/pin_vectors.txt", include_str!("../../../td-secret/tests/pin_vectors.txt")),
+        ("{src}/td-secret/tests/token_check_vectors.txt", include_str!("../../../td-secret/tests/token_check_vectors.txt")),
         ("{src}/td-secret/src/system_vm.rs", include_str!("../../../td-secret/src/system_vm.rs")),
         ("{src}/td-authd/tests/secret_sys.rs", include_str!("../../../td-authd/tests/secret_sys.rs")),
         ("{src}/td-firstboot/src/principals.rs", include_str!("../../../td-firstboot/src/principals.rs")),

@@ -1,6 +1,6 @@
 //! Owned portable PIN transactions. Transport admission and presentation stay backend duties.
 
-use super::fido_device::Interruption;
+use super::fido_device::{Interruption, Session};
 use super::fido_hid::Message;
 use super::fido_p256::PublicKey;
 use super::fido_pin::{EnrolledCredential, HmacOutput, Pin, Profile};
@@ -10,6 +10,15 @@ use super::fido_pin::{EnrolledCredential, HmacOutput, Pin, Profile};
 pub(super) trait Channel {
     fn check(&self) -> Result<(), Interruption>;
     fn exchange(&mut self, request: &[u8]) -> Result<Message, String>;
+}
+
+impl Channel for Session {
+    fn check(&self) -> Result<(), Interruption> {
+        self.check_active()
+    }
+    fn exchange(&mut self, request: &[u8]) -> Result<Message, String> {
+        self.cbor(request)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -246,7 +255,7 @@ impl<C: Channel> Transaction<C> {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::fido_device::{self as device, Cancellation, Session};
+    use crate::fido_device::{self as device, Cancellation};
     use crate::fido_hid::{self as hid, Event};
     use std::cell::{Cell, RefCell};
     use std::collections::VecDeque;
@@ -255,16 +264,6 @@ pub(crate) mod tests {
     use std::time::Duration;
 
     const LABELS: [&str; 4] = ["p1-legacy", "p1-scoped", "p2-legacy", "p2-scoped"];
-
-    // Hardware binding is deliberately test-only until the consumer assembly gate.
-    impl Channel for Session {
-        fn check(&self) -> Result<(), Interruption> {
-            self.check_active()
-        }
-        fn exchange(&mut self, request: &[u8]) -> Result<Message, String> {
-            self.cbor(request)
-        }
-    }
 
     fn fixture(label: &str, name: &str) -> Vec<u8> {
         let row = include_str!("../tests/pin_vectors.txt")

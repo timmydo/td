@@ -39,10 +39,13 @@ mod fido_ctap;
 mod fido_enroll;
 #[allow(dead_code, reason = "private P-256 and portable protocol support")]
 mod fido_p256;
-#[allow(dead_code, reason = "portable PIN protocol; no device consumer yet")]
+#[allow(dead_code, reason = "portable PIN protocol and manual token check")]
 mod fido_pin;
-#[allow(dead_code, reason = "private portable transaction runner; hardware admission pending")]
+#[allow(dead_code, reason = "private portable transaction runner")]
 mod fido_transaction;
+mod pin_sys;
+mod pin_terminal;
+mod token_check;
 #[path = "../../td-firstboot/src/principals.rs"]
 #[allow(dead_code, reason = "shared immutable session identity loader")]
 mod principals;
@@ -72,6 +75,9 @@ use std::io;
 
 fn run(args: &[String]) -> Result<(), String> {
     match args {
+        [command, flag] if command == "check-portable-token" && flag == "--create-test-credential" => {
+            token_check::run()
+        }
         [command] if command == "selftest" => crypto::selftest(),
         [command, flag, uid] if command == "write-operation" && flag == "--uid" => {
             write_operation::run(parse_uid(uid)?)
@@ -117,7 +123,8 @@ fn run(args: &[String]) -> Result<(), String> {
             set_client::set(target, consent::Role::Recovery),
         _ => Err(concat!(
             "usage: td-secret set [--recovery] APPLICATION/NAME < credential-input; ",
-            "use physical secure attention to enroll or unlock the store"
+            "use physical secure attention to enroll or unlock the store; ",
+            "manual hardware diagnostic: td-secret check-portable-token --create-test-credential"
         )
         .into()),
     }
@@ -160,7 +167,25 @@ fn main() -> std::process::ExitCode {
 }
 
 #[cfg(test)]
+#[path = "../../td-authd/src/terminal_sys.rs"]
+#[allow(dead_code, reason = "PTY allocation for PIN terminal fixtures only")]
+mod terminal_fixture_sys;
+
+#[cfg(test)]
 mod confinement {
+    #[test]
+    fn manual_token_check_requires_explicit_creation_and_has_no_input_arguments() {
+        for args in [
+            vec!["check-portable-token"],
+            vec!["check-portable-token", "--pin", "1234"],
+            vec!["check-portable-token", "--create-test-credential", "1234"],
+            vec!["check-portable-token", "--create-test-credential", "--device", "0"],
+        ] {
+            assert!(super::run(&args.into_iter().map(String::from).collect::<Vec<_>>())
+                .unwrap_err().starts_with("usage:"));
+        }
+    }
+
     #[test]
     fn private_unlock_controller_and_shared_description_are_pinned() {
         let fingerprint = |source: &str| source.bytes().fold(0xcbf29ce484222325u64,
@@ -205,6 +230,9 @@ mod confinement {
             ("fido_p256.rs", include_str!("fido_p256.rs")),
             ("fido_pin.rs", include_str!("fido_pin.rs")),
             ("fido_transaction.rs", include_str!("fido_transaction.rs")),
+            ("pin_sys.rs", include_str!("pin_sys.rs")),
+            ("pin_terminal.rs", include_str!("pin_terminal.rs")),
+            ("token_check.rs", include_str!("token_check.rs")),
             ("store.rs", include_str!("store.rs")),
             ("sys.rs", include_str!("sys.rs")),
             ("system_vm.rs", include_str!("system_vm.rs")),
@@ -212,13 +240,22 @@ mod confinement {
         ];
         for (name, source) in sources {
             let production = source.split("#[cfg(test)]").next().unwrap();
+            for (operation, owner) in [
+                ("mode", "pin_terminal.rs"), ("set_mode", "pin_terminal.rs"),
+                ("readable", "pin_terminal.rs"), ("protect_process", "token_check.rs"),
+            ] {
+                if production.contains(&format!("pin_sys::{operation}(")) {
+                    assert_eq!(name, owner, "unexpected PIN syscall caller");
+                }
+            }
             let keyword = format!("un{}", "safe");
             let lint = format!("{keyword}_code");
             let raw = production.matches(&keyword).count() - production.matches(&lint).count();
-            assert_eq!(raw, 2 * usize::from(matches!(name, "sys.rs" | "secret_sys.rs")), "{name}");
+            let scopes = 2 * usize::from(matches!(name, "sys.rs" | "secret_sys.rs")) + usize::from(name == "pin_sys.rs");
+            assert_eq!(raw, scopes, "{name}");
             assert_eq!(
                 production.matches(&format!("#[allow({lint})]")).count(),
-                2 * usize::from(matches!(name, "sys.rs" | "secret_sys.rs"))
+                scopes
             );
         }
         let fingerprint = |source: &str| source.bytes().fold(0xcbf29ce484222325u64,
@@ -277,11 +314,14 @@ pub fn take_received(fd: RawFd) -> Result<File, String> {
                 "fido_transaction.rs",
                 "main.rs",
                 "operation.rs",
+                "pin_sys.rs",
+                "pin_terminal.rs",
                 "portable.rs",
                 "set_client.rs",
                 "store.rs",
                 "sys.rs",
                 "system_vm.rs",
+                "token_check.rs",
                 "tpm.rs",
                 "write_operation.rs"
             ]

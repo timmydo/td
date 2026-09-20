@@ -1,6 +1,6 @@
 """Optional public transcript generator; Python stdlib + OpenSSL 3.5.7 only.
 
-Usage: python3 pin_vectors.py /path/to/libcrypto.so
+Usage: python3 pin_vectors.py /path/to/libcrypto.so [--manual-check]
 No network or td implementation imports. Not a build/test/runtime dependency.
 All private scalars, PINs and tokens below are deterministic PUBLIC fixtures.
 """
@@ -10,6 +10,9 @@ import hmac
 import sys
 
 lib = c.CDLL(sys.argv[1])
+manual = sys.argv[2:] == ["--manual-check"]
+if sys.argv[2:] and not manual:
+    raise ValueError("unknown fixture profile")
 ptr, integer = c.c_void_p, c.c_int
 
 
@@ -171,11 +174,12 @@ def sign(private, digest):
     return b"\x30" + bytes([len(body)]) + body
 
 
-print("# Public complete PIN/hmac-secret transcripts; pin_vectors.py, OpenSSL 3.5.7")
+print("# Public complete PIN/hmac-secret transcripts; pin_vectors.py, OpenSSL 3.5.7" +
+      ("; manual hardware check" if manual else ""))
 try:
     for protocol, permissions, token_size in [(1, False, 16), (1, True, 32), (2, False, 32), (2, True, 32)]:
         label = f"p{protocol}-{'scoped' if permissions else 'legacy'}"
-        seed = label.encode()
+        seed = (label + ("-manual" if manual else "")).encode()
         scalar = int.from_bytes(sha(seed + b"scalar"), "big") % (N-1) + 1
         peer = int.from_bytes(sha(seed + b"peer"), "big") % (N-1) + 1
         signing = int.from_bytes(sha(seed + b"credential"), "big") % (N-1) + 1
@@ -185,6 +189,11 @@ try:
         pin = b" 1234 printable PIN! "
         token = sha(seed + b"token")[:token_size]
         salt, challenge, output = [sha(seed + name) for name in [b"salt", b"challenge", b"output"]]
+        phase_entropy = [sha(seed + name) for name in [b"creation-entropy", b"proof-entropy", b"repeat-entropy"]]
+        phase_hashes = [sha(b"td-secret/manual-token-check/v1" + bytes([i+1]) + value)
+                        for i, value in enumerate(phase_entropy)]
+        if manual:
+            challenge = phase_hashes[1]
         iv_pin, iv_salt, iv_token, iv_output = [sha(seed + name)[:16] for name in [b"iv-pin", b"iv-salt", b"iv-token", b"iv-output"]]
         def enc(data, iv):
             return aes(aes_key, bytes(16), data) if protocol == 1 else iv + aes(aes_key, iv, data)
@@ -229,6 +238,8 @@ try:
         create_aes = sha(create_shared) if protocol == 1 else hkdf(create_shared, b"CTAP2 AES key")
         create_token = sha(seed + b"create-token")[:token_size]
         create_challenge, user = sha(seed + b"create-challenge"), sha(seed + b"user")
+        if manual:
+            create_challenge = phase_hashes[0]
         create_iv_pin, create_iv_token = sha(seed + b"create-iv-pin")[:16], sha(seed + b"create-iv-token")[:16]
         def create_enc(data, iv):
             return aes(create_aes, bytes(16), data) if protocol == 1 else iv + aes(create_aes, iv, data)
@@ -271,6 +282,36 @@ try:
                 data += cbor(extension)
             rows[name] = b"\0"+cbor({1: {"id": credential_id, "type": "public-key"},
                                       2: data, 3: sign(signing, sha(data + challenge))})
+        if manual:
+            # New ECDH/PIN authorization for the same credential and salt.
+            repeat_scalar = int.from_bytes(sha(seed + b"repeat-scalar"), "big") % (N-1) + 1
+            repeat_peer = int.from_bytes(sha(seed + b"repeat-peer"), "big") % (N-1) + 1
+            shared = xy(repeat_scalar * repeat_peer % N)[0]
+            aes_key = sha(shared) if protocol == 1 else hkdf(shared, b"CTAP2 AES key")
+            hmac_key = sha(shared) if protocol == 1 else hkdf(shared, b"CTAP2 HMAC key")
+            token = sha(seed + b"repeat-token")[:token_size]
+            iv_pin, iv_salt, iv_token, iv_output = [sha(seed + b"repeat-" + name)[:16]
+                for name in [b"iv-pin", b"iv-salt", b"iv-token", b"iv-output"]]
+            client[3], client[6] = cose(repeat_scalar), enc(sha(pin)[:16], iv_pin)
+            salt_enc = enc(salt, iv_salt)
+            ext = {1: cose(repeat_scalar), 2: salt_enc, 3: auth(hmac_key, salt_enc)}
+            if protocol == 2:
+                ext[4] = 2
+            get[2], get[4], get[6] = phase_hashes[2], {"hmac-secret": ext}, auth(token, phase_hashes[2])
+            rows.update(creation_entropy=phase_entropy[0], proof_entropy=phase_entropy[1],
+                        repeat_entropy=phase_entropy[2], repeat_scalar=repeat_scalar.to_bytes(32, "big"),
+                        repeat_iv_pin=iv_pin, repeat_iv_salt=iv_salt,
+                        repeat_key_response=b"\0"+cbor({1: cose(repeat_peer)}),
+                        repeat_pin_request=b"\6"+cbor(client),
+                        repeat_pin_response=b"\0"+cbor({2: enc(token, iv_token)}),
+                        repeat_assertion=b"\2"+cbor(get))
+            for name, counter, result in [("repeat_response", 8, output),
+                                          ("repeat_stale", 7, output),
+                                          ("repeat_wrong", 8, bytes([output[0] ^ 1])+output[1:])]:
+                data = sha(b"td.invalid") + b"\x85" + counter.to_bytes(4, "big")
+                data += cbor({"hmac-secret": enc(result, iv_output)})
+                rows[name] = b"\0"+cbor({1: {"id": credential_id, "type": "public-key"},
+                    2: data, 3: sign(signing, sha(data + phase_hashes[2]))})
         for key, value in rows.items():
             print(label, key, value.hex())
 finally:
