@@ -632,8 +632,9 @@ fn refresh_partitions(device: &str, uuid: &str) -> Result<String, String> {
     applet(&["reread-partitions", device])?;
     let (_, partition) = volume(uuid)?;
     require_volume_partition(device, &partition)?;
+    reject_held_disk_users(device, &partition)?;
     command("/bin/td-boot", &["mount-root", &partition, "/volume"])?;
-    reject_mounted_writers(device)?;
+    reject_busy_formatters(device, "mounted partition")?;
     let refused = Command::new("/bin/td-init")
         .args(["reread-partitions", device])
         .output()
@@ -666,7 +667,48 @@ fn primary_metadata(device: &str) -> Result<Vec<u8>, String> {
     Ok(bytes)
 }
 
-fn reject_mounted_writers(device: &str) -> Result<(), String> {
+fn reject_held_disk_users(device: &str, partition: &str) -> Result<(), String> {
+    if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        return Err("whole-disk claim fixture requires x86-64 Linux".into());
+    }
+    // Match td-install/src/main.rs::paths::open_format_destination.
+    const O_EXCL: i32 = 0x80;
+    let claim = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(O_EXCL)
+        .open(device)
+        .map_err(|error| format!("claim fixture disk {device}: {error}"))?;
+    if !claim
+        .metadata()
+        .map_err(|error| format!("inspect claimed fixture disk {device}: {error}"))?
+        .file_type()
+        .is_block_device()
+    {
+        return Err("claimed fixture destination is not a block device".into());
+    }
+    reject_busy_formatters(device, "held whole disk")?;
+    let refused = Command::new("/bin/td-boot")
+        .args(["mount-root", partition, "/volume"])
+        .output()
+        .map_err(|error| format!("execute claimed partition mount refusal: {error}"))?;
+    let diagnostic = String::from_utf8_lossy(&refused.stderr);
+    if refused.status.code() != Some(1)
+        || !refused.stdout.is_empty()
+        || !diagnostic.contains(&format!("mounting {partition} on /volume:"))
+        || !diagnostic.contains("(os error 16)")
+    {
+        return Err(format!(
+            "claimed partition mount did not refuse as busy: status {}; stdout {:?}; stderr {diagnostic}",
+            refused.status,
+            String::from_utf8_lossy(&refused.stdout)
+        ));
+    }
+    drop(claim);
+    Ok(())
+}
+
+fn reject_busy_formatters(device: &str, state: &str) -> Result<(), String> {
     let baseline = primary_metadata(device)?;
     let commands: &[&[&str]] = &[
         &["layout", device],
@@ -676,11 +718,11 @@ fn reject_mounted_writers(device: &str) -> Result<(), String> {
         let refused = Command::new("/bin/td-install")
             .args(*arguments)
             .output()
-            .map_err(|error| format!("execute mounted formatter refusal: {error}"))?;
+            .map_err(|error| format!("execute {state} formatter refusal: {error}"))?;
         let diagnostic = String::from_utf8_lossy(&refused.stderr);
         if primary_metadata(device)? != baseline {
             return Err(format!(
-                "mounted formatter {arguments:?} changed the first 64 KiB"
+                "{state} formatter {arguments:?} changed the first 64 KiB"
             ));
         }
         if refused.status.code() != Some(1)
@@ -689,7 +731,7 @@ fn reject_mounted_writers(device: &str) -> Result<(), String> {
             || !diagnostic.contains("(os error 16)")
         {
             return Err(format!(
-                "mounted formatter {arguments:?} did not refuse its open as busy: status {}; stdout {:?}; stderr {diagnostic}",
+                "{state} formatter {arguments:?} did not refuse its open as busy: status {}; stdout {:?}; stderr {diagnostic}",
                 refused.status,
                 String::from_utf8_lossy(&refused.stdout)
             ));

@@ -93,9 +93,23 @@ and target admission remain requirements for the production installer service.
 
 After both formatting commands, the guest asks td-init to reread the target's
 partition table. It resolves the configured UUID through the production
-reader and requires the expected target partition, then mounts it through
-td-boot. Both raw formatter commands must fail their destination open with
-exit status 1, EBUSY and no stdout while that partition is mounted. An
+reader and requires the expected target partition. Before mounting, the
+fixture holds the private whole disk open with the same x86-64 Linux O_EXCL
+claim as the formatter; other targets refuse this probe. Both raw formatter
+commands must refuse their destination open with exit status 1, EBUSY,
+no stdout and unchanged first 64 KiB. A td-boot mount-root of the system
+partition must also fail with exit status 1, EBUSY from its mount applet
+and no stdout. Disk-header comparison applies to raw formatter attempts;
+it cannot detect writes within the system partition during a mount. The
+fixture closes the whole-disk claim and requires that same partition mount
+to succeed before continuing. This proves the competing-operation barrier
+and release behavior in the disposable topology; it does not implement an
+atomic claim transfer, hotplug admission or exclusion of arbitrary raw I/O
+by another privileged process. The future coordinator's transition from
+raw formatting to mounted publication still needs its own protocol.
+
+Once the partition is mounted through td-boot, both raw formatter commands
+must fail their destination open with exit status 1, EBUSY and no stdout. An
 assertion failure terminates the installation sequence and leaves PID 1
 parked for host collection and VM teardown, as with other fixture failures;
 no later installation step runs against the failed disk. A bounded 64 KiB
@@ -111,6 +125,10 @@ The host requires the exact configured UUID and the planned /dev/vda2 or
 partition publication during the same boot; firmware reboot cannot mask a
 missing reread. UNSAFE.md §3 owns the td-init request; this crate still has
 no raw syscall surface.
+These internal refusal oracles bind the existing applets' path-labelled
+diagnostics and numeric OS error suffix. A diagnostic-format or path-binding
+change must update the fixture rather than accepting any nonzero exit as
+evidence of a busy device.
 
 The live guest supplies `--trusted-key` to `td-install volume` instead of
 the three publishing operands. The formatter initializes the publication
