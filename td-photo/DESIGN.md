@@ -244,17 +244,20 @@ window, all speaking the toolkit's one vocabulary.
   keeping its tail (the reason follows the path), blanks control
   characters, and leaves the generation alone for the note it already
   shows. While it is open every chord is the finder's (`Up`, `Down`,
-  `PageUp`, `PageDown`, `Home`, `End`, `Return` to descend, `BackSpace` to
-  edit the filter or with none to ascend, `C-Return` to open the folder in
-  view as the roll, `Escape` to close, a single printable character or
-  `Space` for the filter; anything else `ignored`), so a letter filters
-  rather than flags; a held key repeats by the chooser's own rule
-  (`chooser_repeats`: the moves, a typed character, and `BackSpace` while
-  there is a filter to edit, since a held one on an empty filter would run
-  up the tree; the window asks it again before each repeat it delivers
-  and stops the repeat the rule no longer allows), and every press and
-  wheel is the finder's too, so the
-  bar's headers and the cells under it are no targets; of the actions only
+  `PageUp`, `PageDown`, `Home`, `End`, `Return` to descend, `Backspace` to
+  edit the filter or with none to ascend, `M-Up` or `^` to ascend filter or
+  none (the caret is the ascent's, so a caret in a name cannot be filtered
+  by; the rest of the name can), `C-Return` to open the folder in view as
+  the roll, `Escape` to close, any other single printable character, a
+  plain space among them, for the filter; anything else `ignored`), so a
+  letter filters rather than flags; a held key repeats by the chooser's
+  own rule (`chooser_repeats`: the moves, a typed character but the
+  caret, and `Backspace` while there is a filter to edit, since a held
+  one on an empty filter, or a held `M-Up` or `^`, would run up the tree;
+  the window asks it again before each repeat it delivers and stops the
+  repeat the rule no longer allows), and every press and wheel is the
+  finder's too, so the bar's headers and the cells under it are no
+  targets; of the actions only
   `choose` (closing it), `open`, `quit` and `scroll` (its wheel) reach
   through, the rest is `ignored`. A descent asks for the folder under the
   cursor and an ascent for this folder's parent with it selected (nothing
@@ -270,9 +273,12 @@ window, all speaking the toolkit's one vocabulary.
   Its boxes, the develop preview and the overlays are withheld while it is
   open (`visible` is empty and `develop_box` is `None`), so the window
   blits nothing over it, and the status row carries the prompt, short
-  enough for the default width whole (Return enter, BackSpace up, C-Return
-  open here, Escape cancel, type to filter) in place of the roll's facts,
-  since the finder paints no affordance of its own.
+  enough for the default width whole (Return enter, Backspace or ^ up,
+  C-Return open here, Escape cancel, type to filter: 97 of the 98 cells
+  the default width paints, so a longer prompt reds the read-back rather
+  than eliding) in place of the roll's facts, since the finder paints no
+  affordance of its own. The chords it names are spelled as td-ui's
+  keymap spells them, pinned by translating each through the keymap.
 - **A headless verb for every durable effect.** Whatever an action does to
   files is also a command-line verb: `import`, `list`, `flag`, `edit`
   (get and set of a sidecar's values), `delete-rejected`, `develop`,
@@ -1246,8 +1252,10 @@ flagging, a descent and an ascent as `List` effects moving no generation, a
 refused listing noted, the same note again no change, a long note keeping its
 tail and a control character blanked, an original listed disabled, the
 window's actions behind it but `choose`, `open`, `quit` and `scroll`, the
-chooser's repeat rule, `Space` filtering, `C-Return` opening the folder in
-view as an `Open` effect, `Escape`, a roll opening and an area too small
+chooser's repeat rule, `M-Up` and `^` ascending over a filter and never
+repeating, every chord it names made by the keymap from its key, a plain
+space filtering, `C-Return` opening the folder in view as an `Open`
+effect, `Escape`, a roll opening and an area too small
 closing it, the root and a relative roll asking for their parent by their own
 path, the pointer, the wheel and a resize its, and develop's box, handles and
 palette withheld under it and back when it closes); reads the scene back

@@ -1356,16 +1356,19 @@ impl Controller {
     }
 
     /// Whether holding `chord` repeats while the chooser is open: the moves,
-    /// a typed character, and BackSpace while there is a filter to edit (a
-    /// held one on an empty filter would run up the tree); Return,
-    /// C-Return and Escape fire once.
+    /// a typed character but the caret, and Backspace while there is a
+    /// filter to edit (a held one on an empty filter would run up the
+    /// tree, as a held M-Up or ^ would); Return, C-Return and Escape fire
+    /// once.
     pub fn chooser_repeats(&self, chord: &str) -> bool {
         let Some(chooser) = self.chooser.as_ref() else {
             return false;
         };
         match chord {
-            "Up" | "Down" | "PageUp" | "PageDown" | "Space" => true,
-            "BackSpace" => !chooser.finder.query().is_empty(),
+            "Up" | "Down" | "PageUp" | "PageDown" => true,
+            "Backspace" => !chooser.finder.query().is_empty(),
+            // An ascent held would run up the tree.
+            "M-Up" | "^" => false,
             _ => {
                 let mut chars = chord.chars();
                 matches!((chars.next(), chars.next()), (Some(c), None) if !c.is_control())
@@ -2410,8 +2413,10 @@ impl Controller {
     }
 
     /// A chord while the chooser is open: the finder's keys by their
-    /// names, `C-Return` its accept, and a single printable character the
-    /// filter's; any other chord is `ignored`.
+    /// names, `C-Return` its accept, `M-Up` and `^` its parent (so a caret
+    /// in a name cannot be filtered by; the rest of the name can), and a
+    /// single printable character the filter's; any other chord is
+    /// `ignored`.
     fn chooser_key(&mut self, chord: &str) -> Result<(Outcome, Vec<Effect>), Error> {
         let key = |key| finder::Event::Key {
             key,
@@ -2426,9 +2431,9 @@ impl Controller {
             "End" => key(finder::Key::End),
             "Return" => key(finder::Key::Activate),
             "C-Return" => key(finder::Key::Accept),
-            "BackSpace" => key(finder::Key::Backspace),
+            "Backspace" => key(finder::Key::Backspace),
+            "M-Up" | "^" => key(finder::Key::Parent),
             "Escape" => key(finder::Key::Escape),
-            "Space" => finder::Event::Insert(' '),
             _ => {
                 let mut chars = chord.chars();
                 match (chars.next(), chars.next()) {
@@ -2954,7 +2959,7 @@ impl Scene<'_> {
     pub fn status_line(&self) -> String {
         let model = self.model;
         if model.chooser.is_some() {
-            return "Choose a roll: Return enter, BackSpace up, C-Return open here, \
+            return "Choose a roll: Return enter, Backspace or ^ up, C-Return open here, \
                     Escape cancel; type to filter"
                 .to_string();
         }

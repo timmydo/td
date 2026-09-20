@@ -4083,11 +4083,11 @@ fn the_roll_chooser_opens_beside_the_roll_and_walks_the_folders_through_the_adap
     assert_eq!((outcome, effects.len()), (Outcome::Changed, 0));
     assert_eq!(c.chooser().unwrap().1.query(), "p");
     assert_eq!(fields(&c)[FLAG], "-");
-    assert_eq!(key(&mut c, "BackSpace"), Outcome::Changed);
+    assert_eq!(key(&mut c, "Backspace"), Outcome::Changed);
     assert_eq!(c.chooser().unwrap().1.query(), "");
     // The filter round trip left the selection on the first shown. Return
     // descends into the folder under the cursor; the adapter lists it, and
-    // BackSpace on an empty filter asks for the parent with this folder
+    // Backspace on an empty filter asks for the parent with this folder
     // selected.
     assert_eq!(
         c.chooser().unwrap().1.selected_entry().unwrap().name(),
@@ -4115,7 +4115,7 @@ fn the_roll_chooser_opens_beside_the_roll_and_walks_the_folders_through_the_adap
     .unwrap();
     assert_eq!(fields(&c)[CHOOSER], hex(b"/photos/2026-b"));
     let generation = fields(&c)[GENERATION].clone();
-    let (outcome, effects) = c.input(Input::Key { chord: "BackSpace" }).unwrap();
+    let (outcome, effects) = c.input(Input::Key { chord: "Backspace" }).unwrap();
     assert_eq!(outcome, Outcome::Changed);
     assert_eq!(
         effects,
@@ -4125,6 +4125,22 @@ fn the_roll_chooser_opens_beside_the_roll_and_walks_the_folders_through_the_adap
         }]
     );
     assert_eq!(fields(&c)[GENERATION], generation);
+    // M-Up and ^ ascend too, filter or none, so a person who has typed
+    // one still has a way up.
+    for chord in ["M-Up", "^"] {
+        assert_eq!(key(&mut c, "r"), Outcome::Changed);
+        let (outcome, effects) = c.input(Input::Key { chord }).unwrap();
+        assert_eq!(outcome, Outcome::Changed, "{chord}");
+        assert_eq!(
+            effects,
+            [Effect::List {
+                folder: Some(b"/photos/2026-b".to_vec()),
+                parent: true,
+            }],
+            "{chord}"
+        );
+        assert_eq!(key(&mut c, "Backspace"), Outcome::Changed);
+    }
     // A listing the adapter could not make is noted in the finder's
     // status row and changes the frame; the folder stays; the same note
     // again changes nothing; a long note keeps its tail, where the reason
@@ -4149,7 +4165,7 @@ fn the_roll_chooser_opens_beside_the_roll_and_walks_the_folders_through_the_adap
     let (_, _, text) = driven::text(&c.scene()).unwrap();
     assert_eq!(
         text.lines().last().unwrap().trim(),
-        "Choose a roll: Return enter, BackSpace up, C-Return open here, Escape cancel; type to filter"
+        "Choose a roll: Return enter, Backspace or ^ up, C-Return open here, Escape cancel; type to filter"
     );
     // Return on an original (listed disabled, for what the folder is)
     // descends nowhere; the window's actions are behind the chooser but
@@ -4174,15 +4190,18 @@ fn the_roll_chooser_opens_beside_the_roll_and_walks_the_folders_through_the_adap
         )
     );
     // Space filters, and a held key repeats the moves, a typed character
-    // and BackSpace while there is a filter, never Return or Escape.
+    // and Backspace while there is a filter, never Return or Escape.
     assert!(c.chooser_repeats("Down") && c.chooser_repeats("PageUp"));
-    assert!(c.chooser_repeats("a") && c.chooser_repeats("Space"));
-    assert!(!c.chooser_repeats("BackSpace"));
+    assert!(c.chooser_repeats("a") && c.chooser_repeats(" "));
+    assert!(!c.chooser_repeats("Backspace"));
+    assert!(!c.chooser_repeats("M-Up"));
+    assert!(!c.chooser_repeats("^"));
     assert!(!c.chooser_repeats("Return") && !c.chooser_repeats("C-Return"));
     assert!(!c.chooser_repeats("Escape") && !c.chooser_repeats("M-x"));
-    assert_eq!(key(&mut c, "Space"), Outcome::Changed);
+    assert_eq!(key(&mut c, " "), Outcome::Changed);
     assert_eq!(c.chooser().unwrap().1.query(), " ");
-    assert!(c.chooser_repeats("BackSpace"));
+    assert!(c.chooser_repeats("Backspace"));
+    assert!(!c.chooser_repeats("M-Up") && !c.chooser_repeats("^"));
     assert_eq!(act(&mut c, "choose", &[]), Outcome::Changed);
     assert!(!c.chooser_repeats("Down"));
     assert_eq!(fields(&c)[CHOOSER], "-");
@@ -4229,7 +4248,7 @@ fn the_roll_chooser_opens_the_folder_in_view_and_closes_on_escape_a_roll_or_a_sm
         .unwrap();
     assert_eq!(fields(&c)[CHOOSER], hex(b"/"));
     // Nothing above the root.
-    assert_eq!(key(&mut c, "BackSpace"), Outcome::Ignored);
+    assert_eq!(key(&mut c, "Backspace"), Outcome::Ignored);
     let (outcome, effects) = c.input(Input::Key { chord: "Escape" }).unwrap();
     assert_eq!((outcome, effects.len()), (Outcome::Changed, 0));
     assert_eq!(fields(&c)[CHOOSER], "-");
@@ -4340,7 +4359,7 @@ fn the_roll_chooser_covers_develop_and_its_overlays_and_gives_them_back() {
     // The develop keys are the finder's: `l` filters, `d` filters.
     assert_eq!(key(&mut c, "l"), Outcome::Changed);
     assert_eq!(c.look_palette(), None);
-    assert_eq!(key(&mut c, "BackSpace"), Outcome::Changed);
+    assert_eq!(key(&mut c, "Backspace"), Outcome::Changed);
     // Escape closes the chooser, not develop: the box and the handles are
     // back as they were.
     assert_eq!(key(&mut c, "Escape"), Outcome::Changed);
@@ -4502,7 +4521,7 @@ fn the_binary_chooses_a_roll_over_the_replay() {
         request(9, &["key", &hex(b"Up")]),
         request(10, &["key", &hex(b"Return")]),
         request(11, &["state"]),
-        request(12, &["key", &hex(b"BackSpace")]),
+        request(12, &["key", &hex(b"Backspace")]),
         request(13, &["state"]),
         request(14, &["key", &hex(b"Return")]),
         request(15, &["key", &hex(b"C-Return")]),
@@ -4515,7 +4534,7 @@ fn the_binary_chooses_a_roll_over_the_replay() {
         text.contains("gone") && text.contains("No such file"),
         "{text}"
     );
-    // Up to 2026-b, Return lists it (its original shown), BackSpace lists
+    // Up to 2026-b, Return lists it (its original shown), Backspace lists
     // the parent again with 2026-b selected, so Return goes back down and
     // C-Return opens it: the roll is 2026-b and the chooser is gone, the
     // keys the window's again.
@@ -4541,4 +4560,75 @@ fn the_binary_chooses_a_roll_over_the_replay() {
         err.contains("gone") && err.contains("No such file"),
         "{err}"
     );
+}
+
+/// The chords the chooser names are the ones td-ui's keymap makes, so a
+/// key the prompt names does what it says: the keymap spells its command
+/// keys its own way (`Backspace`, not X's `BackSpace`), and a chord the
+/// chooser matched by another spelling would reach it never.
+#[test]
+fn the_chooser_names_its_chords_as_the_keymap_spells_them() {
+    let map =
+        td_ui::keyboard::Keymap::parse(include_str!("../../td-ui/tests/fixtures/us.xkb")).unwrap();
+    let chord = |code: u32, mask: u32| {
+        let modifiers = td_ui::keyboard::Modifiers {
+            depressed: mask,
+            ..Default::default()
+        };
+        map.translate(code, modifiers).unwrap().unwrap().chord
+    };
+    let mut c = Controller::new(surface(800, 600));
+    c.set_listing(
+        b"/photos/2026-b".to_vec(),
+        listing("/photos/2026-b", &["rejected"], &["DSC_0100.NEF"]),
+        None,
+    )
+    .unwrap();
+    // Each key by its evdev code with a modifier mask (1 shift, 4
+    // control, 8 alt): the moves are consumed or change the
+    // finder, Return asks for the folder under the cursor, Backspace with
+    // no filter, M-Up and ^ ask for the parent, a space types a filter
+    // character and Escape closes.
+    for (code, mask, expected, asks) in [
+        (108, 0, "Down", None),
+        (103, 0, "Up", None),
+        (109, 0, "PageDown", None),
+        (104, 0, "PageUp", None),
+        (107, 0, "End", None),
+        (102, 0, "Home", None),
+        (28, 0, "Return", Some(false)),
+        (14, 0, "Backspace", Some(true)),
+        (103, 8, "M-Up", Some(true)),
+        (7, 1, "^", Some(true)),
+    ] {
+        let chord = chord(code, mask);
+        assert_eq!(chord, expected);
+        let (outcome, effects) = c.input(Input::Key { chord: &chord }).unwrap();
+        assert_ne!(outcome, Outcome::Ignored, "{chord}");
+        let asked = effects.iter().find_map(|e| match e {
+            Effect::List { parent, .. } => Some(*parent),
+            _ => None,
+        });
+        assert_eq!(asked, asks, "{chord}");
+        assert!(c.chooser().is_some(), "{chord}");
+    }
+    // A plain space is the character itself; `Space` is the keymap's name
+    // for it under a modifier.
+    assert_eq!(chord(57, 0), " ");
+    assert_eq!(key(&mut c, " "), Outcome::Changed);
+    assert_eq!(c.chooser().unwrap().1.query(), " ");
+    assert_eq!(chord(1, 0), "Escape");
+    assert_eq!(key(&mut c, "Escape"), Outcome::Changed);
+    assert!(c.chooser().is_none());
+    c.set_listing(
+        b"/photos/2026-b".to_vec(),
+        listing("/photos/2026-b", &["rejected"], &["DSC_0100.NEF"]),
+        None,
+    )
+    .unwrap();
+    assert_eq!(chord(28, 4), "C-Return");
+    let (outcome, effects) = c.input(Input::Key { chord: "C-Return" }).unwrap();
+    assert_eq!(outcome, Outcome::Changed);
+    assert_eq!(effects, [Effect::Open(b"/photos/2026-b".to_vec())]);
+    assert!(c.chooser().is_none());
 }

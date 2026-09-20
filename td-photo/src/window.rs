@@ -1387,7 +1387,7 @@ impl Window {
         if idle {
             match self.client.repeat(now) {
                 Ok(Some(stroke)) => {
-                    // A repeat the chooser no longer wants (BackSpace once
+                    // A repeat the chooser no longer wants (Backspace once
                     // the filter it was editing is empty) stops here, or a
                     // held key would run up the tree.
                     let ui = &self.session.ui;
