@@ -9663,8 +9663,9 @@ rustc on a local source and linked static, and shipped through the same
 today. What goes with that: the two GitHub pins and their archive
 hashes, the `tn-source` and `tmc-source` seed rows, the two feed-index
 rows, the two vendor closures the Cargo runner builds, and
-`recipes/locks/tn` and `recipes/locks/tmc`; `local-source-digests`
-covers the two trees instead, cheaply. The two repositories are frozen
+`recipes/locks/tn` and `recipes/locks/tmc`; both trees are
+declaration-pinned by `seed/local-source-roster.txt` and re-derived live
+from the checkout instead, cheaply. The two repositories are frozen
 after the import with a pointer here, and their `td` branches deleted
 once nothing pins them.
 
@@ -9834,9 +9835,11 @@ used) copied byte for byte between the two and held so by a recipe
 test, and each is built by
 `ladder::static_local_source_program`: a direct static rustc over the
 tree interned as its `<crate>-source` seed with the local-source
-exclusions specified in `DEVELOPMENT.md`. A change to a retained input
-moves that crate's `seed/seed-digests.txt` row and the
-`local-source-digests` preflight reds a stale one. The pins, seed rows,
+exclusions specified in `DEVELOPMENT.md`. Each crate's identity is
+declaration-pinned by `seed/local-source-roster.txt` and re-derived live
+from the checkout on every run; a change to a retained input moves no
+committed row (that is the whole point — see `DEVELOPMENT.md` "Ready").
+The pins, seed rows,
 feed-index rows and `recipes/locks` closures of `tmc` and `tn` are gone;
 the packages, `/bin` entries, units, boot markers and provisioning are
 unchanged in shape, with the programs, the process tokens and the

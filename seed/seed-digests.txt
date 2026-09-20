@@ -1,6 +1,9 @@
 # seed/seed-digests.txt — the compiled seed-digest table (re #469).
-# Every admissible seed input's expected store basename, derived from its
-# compiled pin. Compiled into td-recipe-eval (enforced after every seed
+# Every admissible FETCHED or HOST-GENERATED seed input's expected store
+# basename, derived from its compiled pin. Local sources (`local_source`/
+# `local_source_trees` recipes) are NOT here — see
+# seed/local-source-roster.txt, which pins their declarations instead of a
+# content hash. Compiled into td-recipe-eval (enforced after every seed
 # derivation) and td-builder (enforced at build-plan lock synthesis).
 # Regenerate with `td-recipe-eval seed-digests > seed/seed-digests.txt`
 # (warm source cache required) when a pin, seed patch, or the stage0
@@ -83,14 +86,6 @@ sed-mesboot-source 331jp1sj5iyjhnb35391k2sjjkqrawk1-sed-mesboot-source
 sed-mesboot0-source i6y1c09pssxjdc60wmdf96vf11hxa56c-sed-mesboot0-source
 stage0-source ma16im40lnb5dldxwglzzs7iqpzfiz4m-stage0-source
 tcc-source mhwyc6lcd16pxbln8kwvc4ia5zisf8fn-tcc-source
-td-editor-source 0pzg1gj0yzw2a4qdfzx7aigyb2gq208r-td-editor-source
-td-install-qemu-test-source xha8n9wwjg22cdp0akfg3090pa2yk3r9-td-install-qemu-test-source
-td-mail-source 4dcpf62azqdyx4qcsd6ligr03af8nv1m-td-mail-source
-td-net-source 8x9hvnkjd0rlhdi6768cxd79b13b5ib7-td-net-source
-td-news-source rdrj7mp297y0ymlfw8130wvfmq49is91-td-news-source
-td-photo-source m1awrigv4n04jdi6wghgx7rm0l36hq3g-td-photo-source
-td-portal-source mxfw8a7y44jn46f2b5bz7cz8rzmg1rh4-td-portal-source
-td-taskmgr-source w5pg3gzay7w668fmp594gcpvv8n1krki-td-taskmgr-source
 tzdata-source p7yjpvl5kwdfqqdgakzww94zx5mdz86r-tzdata-source
 util-linux-libs-x86-64-source 06vhdikawhfyswkhrxs905cm3qbpqj4r-util-linux-libs-x86-64-source
 uutils-source rkmjdm6nicq3js0xhdyqk4rl3r9ki4xv-uutils-source

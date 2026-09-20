@@ -360,10 +360,17 @@ mod tests {
     }
 
     /// A local source with sibling trees is staged under basenames, so its
-    /// `cargo_subdir` must be its own basename; and the roster of trees the
-    /// seed table pins is what td-builder's affected-checks routes to the
-    /// digest preflight (builder/src/affected.rs names this test), so the
-    /// two literals must agree.
+    /// `cargo_subdir` must be its own basename; `trees` is a verified-red
+    /// lever ONLY for that basename shape (re #469 local-source-roster
+    /// split: routing no longer keys off this list at all — every recipe
+    /// edit routes by its own file path under `recipes/*`, and every staged
+    /// tree's identity is re-derived live, not by name) — a new or renamed
+    /// sibling tree must still land here so the `cargo_subdir` assertion
+    /// above actually covers it. The roster of LONE local-source crates (no
+    /// siblings) is different: it is what td-builder's affected-checks
+    /// routes by its own literal list (`local_source_crate`,
+    /// builder/src/affected.rs names this test), so the two literals must
+    /// agree.
     #[test]
     fn local_source_trees_are_staged_by_basename_and_routed_by_the_builder() {
         let mut trees: Vec<String> = Vec::new();

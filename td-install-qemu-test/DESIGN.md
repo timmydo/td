@@ -21,9 +21,9 @@ deadline. Other metadata/open errors and non-block nodes refuse.
 A refusal keeps PID 1 alive for the host to collect its diagnostic and
 terminate the VM at the deadline.
 
-The complete crate tree is a local_source input pinned by
-seed/seed-digests.txt. The catalog and affected-check routing include it in
-local-source verification; it is not a production system input.
+The complete crate tree is a `local_source` input, declaration-pinned by
+seed/local-source-roster.txt and re-derived live from the checkout on every
+run (`DEVELOPMENT.md` "Ready"). It is not a production system input.
 
 The live initramfs holds source-built tools and the public trust root. The
 tiny signed deployment and fixed selector are streamed into separate ISO

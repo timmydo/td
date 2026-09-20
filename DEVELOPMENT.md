@@ -71,8 +71,9 @@ The recipe-checks gate answers a check from its verdict memo when that check
 passed on this host before and nothing it reads has changed since: the
 closure's recipe definitions with the sources they embed, the seed patches,
 committed cargo locks and local-source trees, the builder's engine sources
-— what a build can execute, with the seed digest table it compiles in, and
-not its routing, check loop or gates, which no check runs — and the
+— what a build can execute, with the seed digest table AND the local-source
+roster it compiles in, and not its routing, check loop or gates, which no
+check runs — and the
 evaluator's own sources, with the script that builds it for the gate, each
 as fingerprinted when its binary was built (`td-builder engine-fingerprint`
 prints the builder's). The repo's cargo config is in that key; the host
@@ -91,28 +92,75 @@ recorded pass before it runs, so a failure leaves nothing to answer from.
 `td-recipe-eval clear-store` drops the memos with the rest of the ladder work
 dir.
 
-A recipe built from the checkout's own trees (a `local_source`, with any
-sibling `local_source_trees`) is pinned by the seed digest table the
-evaluator compiles in, so an edit to a staged input moves its row and
-the provenance gate refuses the build, naming the row, until the table is
-regenerated:
+Fetched and host-generated seeds are pinned by the seed digest table the
+evaluator compiles in (`seed/seed-digests.txt`); regenerate it after a pin,
+seed patch, or stage0 source change and commit it with the change:
 
 ```text
 td-recipe-eval seed-digests > seed/seed-digests.txt
 ```
 
-Regenerate after the last edit to the staged inputs and commit the table
-with the change. The recipe catalog declares the local-source roster,
-including each recipe's sibling trees.
+A recipe built from the checkout's own trees (a `local_source`, with any
+sibling `local_source_trees`) is pinned differently: DECLARATION-only, by
+`seed/local-source-roster.txt`, which the evaluator and td-builder both
+compile in. That table records only which key stages which paths — never a
+content hash — because a local source's bytes are the checkout itself, so a
+committed hash would go stale on every ordinary edit to a staged tree (105
+commits once touched `seed/seed-digests.txt` this way; one row alone was
+rewritten 29 times). Instead, both the evaluator (interning a seed) and
+td-builder (independently re-deriving a `--auto` map/db entry's identity,
+straight from the repository root, using the identical exclusion rule and
+staging shape) re-derive a local source's identity LIVE from the working
+tree on every run. An ordinary edit inside a staged tree therefore needs no
+table regeneration and moves no row; only adding, removing, or renaming a
+`local_source`/`local_source_trees` declaration does, and the
+`local-source-roster` preflight reds naming the stale key until the table is
+regenerated:
+
+```text
+td-recipe-eval local-source-roster > seed/local-source-roster.txt
+```
+
+A key must never appear in both tables; td-builder refuses that outright,
+naming the key, on every path that gates one (the keyed seed db, the
+separate local-source seed db below, and a `--auto` map entry alike). The
+recipe catalog declares the local-source roster, including each recipe's
+sibling trees.
+
+A local source's registration lives in its OWN per-run, disposable seed db
+— never in the shared db keyed by `seed/seed-digests.txt`'s digest. That
+keyed db is authenticated wholesale for every worktree still on the same
+digest table; since a local source's identity does not move with that
+table, an interned local-source row there would poison the shared db on
+the very next ordinary edit to its staged tree, for every later
+`build-plan`, on every worktree sharing the table (found in review — the
+kind of bug this whole split exists to prevent). td-builder therefore
+refuses a local-source-roster row outright if it ever finds one in the
+keyed db, naming the key, and the runner interns a local source only into
+its own run's separate db, removed once that run's `build-plan --auto` has
+read it.
+
+The root `TD_AUTO_REPO_ROOT` names for a `--auto` re-derivation is anchored
+to the checkout td-builder was built from — its own committed roster must
+be byte-identical to the one compiled in — but this is a sanity check on an
+already-trusted input (the same pre-existing convention
+`provision_auto_vendor` uses for a rust step's committed `Cargo.lock`), not
+a cryptographic proof: it catches a stale td-builder or a directory that is
+plainly not the repository, not a purpose-built directory carrying a copy
+of the roster.
 
 Local-source staging excludes entries named `target`, `.git`, or
-`DESIGN.md` at every depth, including sibling trees. Those entries are
-absent from the staged build input, its content address, and the
-recipe-check memo fingerprint. Design documents must not be consumed by
-these builds. Other files, including README documents and licenses,
-remain pinned inputs. Editing `DESIGN.md` alone selects no checks; the
-profiler design is the exception and retains its runtime-contract
-checks.
+`DESIGN.md` at every depth, including sibling trees — for BOTH the
+evaluator's intern and td-builder's re-derivation, from the one shared
+`td_engine::local_source` implementation. This policy is unchanged by the
+digest/roster split. Those entries are absent from the staged build input,
+its content address, and the recipe-check memo fingerprint. Design
+documents must not be consumed by these builds. Other files, including
+README documents and licenses, remain pinned inputs, and the checkout's
+dirty and untracked files are included exactly as tracked ones are — a
+build reads what is on disk now, not the last commit. Editing `DESIGN.md`
+alone selects no checks; the profiler design is the exception and retains
+its runtime-contract checks.
 
 When every changed path lies under `td-*` crates, `ready` also scopes the
 recipe-checks gate: the crates and their readers travel to the gate in

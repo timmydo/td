@@ -68,6 +68,8 @@ mod check_runner;
 mod checks;
 #[path = "td_recipe_eval/iso_image.rs"]
 mod iso_image;
+#[path = "td_recipe_eval/local_source_roster.rs"]
+mod local_source_roster;
 #[path = "td_recipe_eval/seed_digests.rs"]
 mod seed_digests;
 #[path = "td_recipe_eval/warm.rs"]
@@ -474,19 +476,21 @@ fn main() {
                 die_runner(&e);
             }
         }
-        Some("local-source-digests") => {
-            if args.get(2).is_some() {
-                die("usage: local-source-digests");
-            }
-            // `die`, not `die_runner`: this reds on a stale COMMITTED table, which is a
-            // hard failure to fix in the tree. die_runner would map its `provenance
-            // rejected' prose to 69, the code a gate runner reads as UNPROVISIONED and
-            // tolerates as a SKIP — the one outcome that would make this gate vacuous.
-            if let Err(e) = check_runner::local_source_digests_cli() {
+        Some("local-source-roster") => {
+            let check = match (args.get(2).map(String::as_str), args.get(3)) {
+                (None, _) => false,
+                (Some("--check"), None) => true,
+                _ => die("usage: local-source-roster [--check]"),
+            };
+            // `die`, not `die_runner`: a stale COMMITTED roster is a hard failure to fix
+            // in the tree. die_runner would map its `provenance rejected' prose to 69,
+            // the code a gate runner reads as UNPROVISIONED and tolerates as a SKIP —
+            // the one outcome that would make this gate vacuous.
+            if let Err(e) = check_runner::local_source_roster_cli(check) {
                 die(&e);
             }
         }
-        _ => die("usage: td-recipe-eval list|emit|check-list|check-count|check-script|check-run|build-run|clear-store|qemu-secret|qemu-secret-system|qemu-boot|qemu-boot-uefi|qemu-boot-media|qemu-install|qemu-install-system|compose-iso|qemu-boot-erofs|qemu-boot-system|qemu-update|qemu-boot-session|qemu-boot-net|qemu-boot-kexec|run|bundle|warm|verify-store|payload-closure|application-closure|vendor-warm-args|source-pins|source-pin|ostree-pins|ostree-pin|seed-digests|local-source-digests ..."),
+        _ => die("usage: td-recipe-eval list|emit|check-list|check-count|check-script|check-run|build-run|clear-store|qemu-secret|qemu-secret-system|qemu-boot|qemu-boot-uefi|qemu-boot-media|qemu-install|qemu-install-system|compose-iso|qemu-boot-erofs|qemu-boot-system|qemu-update|qemu-boot-net|qemu-boot-kexec|run|bundle|warm|verify-store|payload-closure|application-closure|vendor-warm-args|source-pins|source-pin|ostree-pins|ostree-pin|seed-digests|local-source-roster ..."),
     }
 }
 

@@ -1,0 +1,20 @@
+# seed/local-source-roster.txt — the compiled local-source roster (re #469
+# local-source-roster split).
+# One line per `local_source' recipe: `KEY PATH' or, with sibling
+# `local_source_trees', `KEY PATH TREE,TREE,...' (comma-joined, declared
+# order). No content hash: a local source's bytes are the checkout, so both
+# td-recipe-eval and td-builder re-derive its identity live from these
+# declared paths on every run instead of comparing against a committed one.
+# Compiled into td-recipe-eval (this generator/check) and td-builder
+# (`--auto' provenance re-derivation). Regenerate with `td-recipe-eval
+# local-source-roster > seed/local-source-roster.txt` when a recipe adds,
+# removes, or renames a `local_source'/`local_source_trees' declaration —
+# an ordinary edit inside a staged tree does not move a row.
+td-editor-source td-editor td-ui,td-compositor
+td-install-qemu-test-source td-install-qemu-test
+td-mail-source td-mail td-ui,td-compositor,td-editor
+td-net-source net engine,td-boot
+td-news-source td-news td-ui,td-compositor,td-editor
+td-photo-source td-photo td-ui,td-compositor
+td-portal-source td-portal td-secret,td-busd,td-compositor,engine,td-ui
+td-taskmgr-source td-taskmgr td-ui,td-compositor

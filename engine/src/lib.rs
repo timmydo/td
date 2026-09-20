@@ -31,6 +31,16 @@
 //! deployment is installed and booted, by a program that cannot depend on a
 //! crate at all. They are a pair, since the verifier reaches its hash as
 //! `crate::sha512`, so a consumer `#[path]`-includes BOTH at its crate root.
+//!
+//! `local_source` is back to being shared by BOTH engine bins (re #469
+//! local-source-roster split): the exclusion rule and staging shape a
+//! `local_source`/`local_source_trees` recipe is copied by must be exactly
+//! one implementation, since td-recipe-eval interns those bytes and
+//! td-builder independently re-derives their identity from the checkout —
+//! a divergence here would let the two sides silently disagree about what
+//! "the same tree" means. It does no hashing of its own: this crate is
+//! `unsafe`-forbidding and dependency-free, and the NAR hash stays
+//! td-builder's confined syscall surface (`nar.rs`).
 // `cpio` writes the one-file archive a harness APPENDS to an initramfs, which
 // is how a per-run trusted key reaches td-boot without any recipe being
 // parameterized (DESIGN.md §6). Host-side only: it produces bytes for a check
@@ -54,6 +64,7 @@ pub mod gpt;
 pub mod gzip;
 pub mod iso9660;
 pub mod json;
+pub mod local_source;
 pub mod sha256;
 pub mod sha512;
 pub mod target_profile;

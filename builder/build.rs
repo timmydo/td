@@ -109,8 +109,8 @@ fn main() -> Result<(), Box<dyn Error>> {
 /// the host-only ones `engine_set` names, this script, this crate's manifest,
 /// the engine crate's `src/` and manifest, the workspace manifest and lock,
 /// the repo's cargo config where present, since it shapes the binary as the
-/// manifests do, and `seed/seed-digests.txt`, which `main.rs` compiles in —
-/// as (path, file digest) pairs in path order. `td-builder
+/// manifests do, and `seed/seed-digests.txt` plus `seed/local-source-roster.txt`,
+/// which `main.rs` compiles in — as (path, file digest) pairs in path order. `td-builder
 /// engine-fingerprint` prints it, and the evaluator keys a recipe check's
 /// verdict memo and plan memo on it in place of the binary's bytes: an edit
 /// to the routing, the check loop or a gate re-keys nothing, an edit to any
@@ -134,6 +134,7 @@ fn engine_source_fingerprint(manifest_dir: &Path) -> Result<String, Box<dyn Erro
         "Cargo.toml",
         "Cargo.lock",
         "seed/seed-digests.txt",
+        "seed/local-source-roster.txt",
     ]
     .iter()
     .map(|rel| root.join(rel))

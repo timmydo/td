@@ -982,13 +982,15 @@ fn catalog_seed_universe() -> Result<Vec<SeedInput>, String> {
     Ok(seeds)
 }
 
-/// seed-digests: derive the catalog's whole pinned-seed universe
-/// (`catalog_seed_universe` — every seed any recipe declares, including
-/// recipes whose graphs currently red at planning on OTHER inputs) from the
-/// compiled pins, through the exact `derive_seed_input_for_generator` path the runner
-/// enforces, and print the full seed/seed-digests.txt content — header
-/// comment plus sorted `key basename` rows — on stdout. Requires the warm
-/// source cache, like any ladder run.
+/// seed-digests: derive the catalog's FETCHED/GENERATED seed universe
+/// (`catalog_seed_universe` minus its `SeedInput::LocalSource` entries — see
+/// `local-source-roster` for those, re #469 local-source-roster split; every
+/// seed any recipe declares, including recipes whose graphs currently red at
+/// planning on OTHER inputs) from the compiled pins, through the exact
+/// `derive_seed_input_for_generator` path the runner enforces, and print the
+/// full seed/seed-digests.txt content — header comment plus sorted `key
+/// basename` rows — on stdout. Requires the warm source cache, like any
+/// ladder run.
 pub fn seed_digests_cli() -> Result<(), String> {
     let root = env::current_dir().map_err(|e| format!("current dir: {e}"))?;
     let mut runner = RecipeCheckRunner::new(root, "seed-digests")?;
@@ -998,6 +1000,12 @@ pub fn seed_digests_cli() -> Result<(), String> {
     runner.setup()?;
     let mut rows: BTreeMap<String, String> = BTreeMap::new();
     for input in catalog_seed_universe()? {
+        // Local sources are declaration-pinned by seed/local-source-roster.txt
+        // and re-derived live from the checkout on every run by both sides —
+        // they never belong in this table (re #469 local-source-roster split).
+        if matches!(input, SeedInput::LocalSource { .. }) {
+            continue;
+        }
         let derived = runner.derive_seed_input_for_generator(&input)?;
         rows.insert(
             input.key().to_string(),
@@ -1009,8 +1017,11 @@ pub fn seed_digests_cli() -> Result<(), String> {
     let _ = fs::remove_file(&runner.db);
     println!(
         "# seed/seed-digests.txt — the compiled seed-digest table (re #469).\n\
-         # Every admissible seed input's expected store basename, derived from its\n\
-         # compiled pin. Compiled into td-recipe-eval (enforced after every seed\n\
+         # Every admissible FETCHED or HOST-GENERATED seed input's expected store\n\
+         # basename, derived from its compiled pin. Local sources (`local_source`/\n\
+         # `local_source_trees` recipes) are NOT here — see\n\
+         # seed/local-source-roster.txt, which pins their declarations instead of a\n\
+         # content hash. Compiled into td-recipe-eval (enforced after every seed\n\
          # derivation) and td-builder (enforced at build-plan lock synthesis).\n\
          # Regenerate with `td-recipe-eval seed-digests > seed/seed-digests.txt`\n\
          # (warm source cache required) when a pin, seed patch, or the stage0\n\
@@ -1023,73 +1034,119 @@ pub fn seed_digests_cli() -> Result<(), String> {
     Ok(())
 }
 
-/// local-source-digests: check every catalog `local_source` tree against the row
-/// the compiled table pins for it.
+/// local-source-roster: print (or, with `check`, verify) the catalog's
+/// DECLARATION-ONLY local-source roster — key, main path, and sibling
+/// `local_source_trees`, one line per `SeedInput::LocalSource` — matching
+/// `seed/local-source-roster.txt`'s format.
 ///
-/// The cheap half of `seed-digests`. That command re-derives the WHOLE seed
-/// universe and so needs a warm source cache and the ladder; a local source needs
-/// neither — its bytes are already in the checkout, so the check is a tree copy
-/// and a NAR hash. It exists because the key-set coverage test cannot see this
-/// class of staleness at all: editing a local-source tree leaves the key present
-/// and the row unchanged, so coverage stays green while the row now describes a
-/// tree that no longer exists. Nothing but a re-hash catches that, and re-hashing
-/// a fetched pin is expensive while re-hashing this is not — which is the whole
-/// reason it can be a per-change gate. A catalog with no local-source inputs is a
-/// valid empty set; exact seed-table coverage independently refuses orphan rows.
-///
-/// Deliberately NOT a `RecipeCheckRunner`: no ladder lock, no ladder scratch, no
-/// stage0 placement, no store and no db. It is wired to the recipes surface, which
-/// is edited constantly, and it must never be the thing that makes
-/// `affected-checks --run` sit behind another agent's multi-hour climb on the
-/// SHARED ladder — every other preflight is lock-free and this one has no business
-/// being the exception. td-builder is used only to NAR-hash a scratch copy, which
-/// is what `--auto` staging would do to it anyway; nothing here derives a seed.
-pub fn local_source_digests_cli() -> Result<(), String> {
-    let inputs = catalog_seed_universe()?;
-    if !inputs
-        .iter()
-        .any(|input| matches!(input, SeedInput::LocalSource { .. }))
-    {
-        println!("PASS: catalog declares no local sources; no checkout tree needs re-hashing");
-        return Ok(());
-    }
-    let root = env::current_dir().map_err(|e| format!("current dir: {e}"))?;
-    let tb = find_td_builder_self(&root)?;
-    let scratch = env::temp_dir().join(format!("td-local-source-digests-{}", process::id()));
-    remove_path_if_exists(&scratch)?;
-    fs::create_dir_all(&scratch).map_err(|e| format!("mkdir {}: {e}", scratch.display()))?;
-    let mut checked = 0u32;
-    let mut errors: Vec<String> = Vec::new();
-    for input in inputs {
-        let SeedInput::LocalSource { key, path, trees } = &input else {
-            continue;
-        };
-        checked += 1;
-        // The row hashes every staged tree, so a stale one names them all: an
-        // `engine/` edit moves `td-net-source` as surely as a `net/` edit does.
-        let staged_from = if trees.is_empty() {
-            path.clone()
-        } else {
-            format!("{path} with {}", trees.join(", "))
-        };
-        // Every local source is reported, so one that cannot even be hashed does not
-        // hide a stale row behind it — and the cleanup below stays reachable.
-        let hashed = stage_local_source_at(&root, key, path, trees, &scratch.join(key))
-            .and_then(|staged| store_path_recursive_with(&tb, &root, key, &staged))
-            .and_then(|candidate| gate_local_source_candidate(key, &candidate).map(|()| candidate))
-            .map_err(|e| format!("{e} (staged from {staged_from})"));
-        match hashed {
-            Ok(candidate) => {
-                println!("local source `{key}' ({staged_from}) hashes to its pinned {candidate}")
-            }
-            Err(e) => errors.push(e),
+/// Unlike the digest table's generator this touches no bytes and needs no
+/// warm cache or ladder: it is a listing of the CATALOG's own declarations
+/// (`catalog_seed_universe`, which is a pure walk over compiled recipes and
+/// pins — see its doc comment), which is exactly why editing a `td-*` source
+/// tree cannot move a row here. A row changes only when a recipe adds,
+/// removes, or renames a `local_source`/`local_source_trees` declaration.
+/// Deliberately not a `RecipeCheckRunner`: no ladder lock, no stage0
+/// placement, no store or db — this is wired to the recipes surface, which
+/// is edited constantly, and must stay a cheap, lock-free preflight.
+pub fn local_source_roster_cli(check: bool) -> Result<(), String> {
+    let mut rows: BTreeMap<String, (String, Vec<String>)> = BTreeMap::new();
+    for input in catalog_seed_universe()? {
+        if let SeedInput::LocalSource { key, path, trees } = input {
+            rows.insert(key, (path, trees));
         }
     }
-    remove_path_if_exists(&scratch)?;
-    if !errors.is_empty() {
-        return Err(errors.join("\n"));
+    let mut rendered = String::new();
+    rendered.push_str(
+        "# seed/local-source-roster.txt — the compiled local-source roster (re #469\n\
+         # local-source-roster split).\n\
+         # One line per `local_source' recipe: `KEY PATH' or, with sibling\n\
+         # `local_source_trees', `KEY PATH TREE,TREE,...' (comma-joined, declared\n\
+         # order). No content hash: a local source's bytes are the checkout, so both\n\
+         # td-recipe-eval and td-builder re-derive its identity live from these\n\
+         # declared paths on every run instead of comparing against a committed one.\n\
+         # Compiled into td-recipe-eval (this generator/check) and td-builder\n\
+         # (`--auto' provenance re-derivation). Regenerate with `td-recipe-eval\n\
+         # local-source-roster > seed/local-source-roster.txt` when a recipe adds,\n\
+         # removes, or renames a `local_source'/`local_source_trees' declaration —\n\
+         # an ordinary edit inside a staged tree does not move a row.\n",
+    );
+    for (key, (path, trees)) in &rows {
+        if trees.is_empty() {
+            rendered.push_str(&format!("{key} {path}\n"));
+        } else {
+            rendered.push_str(&format!("{key} {path} {}\n", trees.join(",")));
+        }
     }
-    println!("PASS: {checked} local source(s) agree with seed/seed-digests.txt");
+    if !check {
+        print!("{rendered}");
+        return Ok(());
+    }
+    let committed = fs::read_to_string("seed/local-source-roster.txt")
+        .map_err(|e| format!("read seed/local-source-roster.txt: {e}"))?;
+    if committed != rendered {
+        // Name exactly which key(s) disagree, not just "the file is stale" —
+        // `local-source-roster` is a trust anchor for a re-derivation check
+        // done elsewhere, so a reviewer must see, at a glance, which
+        // declaration to inspect rather than diffing the whole file by hand.
+        let mut detail = String::new();
+        match crate::local_source_roster::parse(&committed) {
+            Ok(committed_rows) => {
+                let committed_map: BTreeMap<String, (String, Vec<String>)> = committed_rows
+                    .into_iter()
+                    .map(|(k, p, t)| {
+                        (
+                            k.to_string(),
+                            (p.to_string(), t.into_iter().map(str::to_string).collect()),
+                        )
+                    })
+                    .collect();
+                for key in rows.keys().chain(committed_map.keys()).collect::<BTreeSet<_>>() {
+                    match (committed_map.get(key), rows.get(key)) {
+                        (None, Some(_)) => {
+                            detail.push_str(&format!(
+                                "\n  - `{key}': the catalog now declares this local source, but it is missing from the file"
+                            ));
+                        }
+                        (Some(_), None) => {
+                            detail.push_str(&format!(
+                                "\n  - `{key}': the file still declares this local source, but the catalog no longer does"
+                            ));
+                        }
+                        (Some(c), Some(g)) if c != g => {
+                            detail.push_str(&format!(
+                                "\n  - `{key}': the file declares path `{}' trees `{}', but the catalog declares path `{}' trees `{}'",
+                                c.0, c.1.join(","), g.0, g.1.join(",")
+                            ));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Err(e) => {
+                detail.push_str(&format!("\n  - the committed file itself fails to parse: {e}"));
+            }
+        }
+        if detail.is_empty() {
+            // Every row agrees — the drift is in the header/comment text
+            // (e.g. hand-edited, or generated by an older version of this
+            // command). Say so explicitly rather than leaving the message
+            // as a bare "is stale" with nothing to point at.
+            detail.push_str(
+                "\n  - every row agrees; only the header/comment text differs from what this \
+                 command currently generates",
+            );
+        }
+        return Err(format!(
+            "seed/local-source-roster.txt is stale: it no longer matches the catalog's \
+             local_source/local_source_trees declarations.{detail}\nRegenerate with \
+             `td-recipe-eval local-source-roster > seed/local-source-roster.txt' and commit it \
+             (re #469)"
+        ));
+    }
+    println!(
+        "PASS: seed/local-source-roster.txt matches the catalog's {} local-source declaration(s)",
+        rows.len()
+    );
     Ok(())
 }
 
@@ -1398,6 +1455,29 @@ fn candidate_db_path(lw: &Path, scratch_id: &str) -> PathBuf {
         .join(format!(".candidate-{scratch_id}.db"))
 }
 
+/// A per-run db for THIS run's local-source registrations (re #469
+/// local-source-roster blocker fix, found independently by three reviewers).
+///
+/// The keyed seed db (`seed_db_path`) is keyed on
+/// `seed_digests::table_digest()` — the FETCHED/GENERATED table's digest —
+/// and is authenticated WHOLESALE by td-builder (`authenticate_seed_db`). A
+/// local source's row is never keyed by that table: its identity is
+/// re-derived live from the checkout, never pinned by a committed digest, so
+/// the table's digest does not move when a local source's tree changes.
+/// Interning a local source into the KEYED db would therefore put a row
+/// there that goes stale on the very next ordinary edit to its staged tree —
+/// and since that db is authenticated wholesale, one stale row reds every
+/// later `build-plan`, for every target, on every worktree sharing the same
+/// digest table. Local-source rows live here instead: a SEPARATE,
+/// per-run, disposable db, a sibling of the keyed dbs (same parent) so the
+/// shared store still derives the same commit lock (`lock_store_commit`).
+/// td-builder authenticates it with its own reciprocal rule
+/// (`authenticate_local_seed_db`): every row here must be a CURRENT
+/// local-source-roster re-derivation, never a digest-table basename.
+fn local_seed_db_path(lw: &Path, scratch_id: &str) -> PathBuf {
+    lw.join("seed-db").join(format!(".local-{scratch_id}.db"))
+}
+
 fn seed_db_path(lw: &Path) -> Result<PathBuf, String> {
     let digest = crate::seed_digests::table_digest()?;
     // 16 hex chars: this names a cache directory, not a trust anchor — the table
@@ -1537,12 +1617,13 @@ fn hash_repo_inputs(
     Ok(())
 }
 
-/// Hash a local-source tree into `h` exactly the way `copy_source_tree` interns it
-/// — skip build/VCS artifacts and design documents, sort entries, hash symlink
-/// targets verbatim and file contents plus the executable bit (`mode & 0o100`,
-/// the only mode bit the NAR records) — so
-/// the build-run memo fingerprint co-varies with the store content address without
-/// recomputing the NAR. Fails closed on any I/O error or an unrepresentable node.
+/// Hash a local-source tree into `h` exactly the way `td_engine::local_source::stage`
+/// interns it — skip build/VCS artifacts and design documents
+/// (`td_engine::local_source::excluded_entry`, the one shared exclusion list), sort
+/// entries, hash symlink targets verbatim and file contents plus the executable bit
+/// (`mode & 0o100`, the only mode bit the NAR records) — so the build-run memo
+/// fingerprint co-varies with the store content address without recomputing the NAR.
+/// Fails closed on any I/O error or an unrepresentable node.
 fn hash_source_tree(dir: &Path, h: &mut crate::sha256::Sha256) -> Result<(), String> {
     let meta = fs::symlink_metadata(dir).map_err(|e| format!("stat {}: {e}", dir.display()))?;
     let ftype = meta.file_type();
@@ -1566,7 +1647,7 @@ fn hash_source_tree(dir: &Path, h: &mut crate::sha256::Sha256) -> Result<(), Str
             let Some(name) = child.file_name().map(|n| n.to_owned()) else {
                 continue;
             };
-            if excluded_local_source_entry(&name) {
+            if td_engine::local_source::excluded_entry(&name) {
                 continue;
             }
             let nb = name.as_bytes();
@@ -1911,65 +1992,13 @@ pub(crate) struct RecipeNode {
     pub(crate) recipe: Recipe,
 }
 
-/// Gate one local source's freshly computed content address against the compiled
-/// table. Separate from `seed_digests::require` only for its recovery line: the
-/// generic wording blames "a pin bump without regenerating", which for a local
-/// source is never what happened — nobody bumped anything, the tree was edited.
-/// It also has to say what NOT to do: the failure surfaces near enough to the
-/// stale-seed-store reds that `clear-store` looks like the fix, and it is not one.
-/// A cold ladder derives the same address from the same tree and reds identically,
-/// having thrown away every rung to get there.
-/// Resolve and validate an in-tree directory against a repo root: it must be a
-/// plain repo-relative path (no `..`/`.`/absolute component) that, once symlinks
-/// are resolved, stays under the root. Returns the CANONICAL path, so whoever
-/// copies it copies the validated bytes. The `local_source` crate itself goes
-/// through `resolve_local_source_dir_at`, which adds the crate checks; a
-/// sibling tree needs only these rules.
-fn resolve_local_source_tree_at(root: &Path, rel: &str) -> Result<PathBuf, String> {
-    if rel.is_empty() {
-        return Err("local source path is empty".into());
-    }
-    let relp = Path::new(rel);
-    for comp in relp.components() {
-        if !matches!(comp, std::path::Component::Normal(_)) {
-            return Err(format!(
-                "local source `{rel}' must be a plain repo-relative path \
-                 (no `..', `.', or absolute root)"
-            ));
-        }
-    }
-    let dir = root.join(relp);
-    if !dir.is_dir() {
-        return Err(format!(
-            "local source `{rel}' is not a directory ({})",
-            dir.display()
-        ));
-    }
-    // Defense beyond the lexical `..` check: a symlinked path COMPONENT could
-    // still resolve outside the checkout and smuggle ambient (non-committed)
-    // bytes into the interned seed, breaking the in-tree provenance boundary.
-    // Canonicalize both and require the source stays under the repo root; the
-    // caller then copies this resolved path.
-    let canon_root = root
-        .canonicalize()
-        .map_err(|e| format!("canonicalize repo root {}: {e}", root.display()))?;
-    let canon_dir = dir
-        .canonicalize()
-        .map_err(|e| format!("canonicalize local source {}: {e}", dir.display()))?;
-    if !canon_dir.starts_with(&canon_root) {
-        return Err(format!(
-            "local source `{rel}' resolves outside the checkout ({}) — a symlinked \
-             component must not escape the repo (#469 in-tree provenance)",
-            canon_dir.display()
-        ));
-    }
-    Ok(canon_dir)
-}
-
-/// A `local_source` path resolved as above and required to be a Cargo crate
-/// (Cargo.toml + committed Cargo.lock).
+/// A `local_source` path resolved through the shared `td_engine::local_source`
+/// staging code (re #469 local-source-roster split: td-builder re-derives the
+/// SAME staged bytes from `TD_AUTO_REPO_ROOT` through that one shared module,
+/// so the exclusion rule and staging shape live in exactly one place) and
+/// required to be a Cargo crate (Cargo.toml + committed Cargo.lock).
 fn resolve_local_source_dir_at(root: &Path, rel: &str) -> Result<PathBuf, String> {
-    let canon_dir = resolve_local_source_tree_at(root, rel)?;
+    let canon_dir = td_engine::local_source::resolve_tree(root, rel)?;
     if !canon_dir.join("Cargo.toml").is_file() {
         return Err(format!("local source `{rel}' has no Cargo.toml"));
     }
@@ -1979,15 +2008,13 @@ fn resolve_local_source_dir_at(root: &Path, rel: &str) -> Result<PathBuf, String
     Ok(canon_dir)
 }
 
-/// Copy a validated `local_source` tree with staging exclusions to `dest`. The
-/// staged tree is what BOTH the content-address computation and the intern read,
-/// so the address that is gated and the bytes that are interned cannot diverge.
-///
-/// With sibling `trees`, `dest` is a directory holding every tree, the main
-/// one included, under its own basename, so a relative path from one to
-/// another resolves as it does in the checkout; the recipe's `cargo_subdir`
-/// then names the main tree's basename. Two trees with one basename are
-/// refused rather than merged.
+/// Stage a validated `local_source` (plus any sibling `trees`) to `dest`
+/// through the shared engine staging code. The staged tree is what BOTH the
+/// content-address computation and the intern read, so the address that is
+/// used and the bytes that are interned cannot diverge. The only thing this
+/// wrapper adds over `td_engine::local_source::stage` is the main tree's
+/// Cargo.toml/Cargo.lock check above — a recipe-hygiene requirement, not
+/// part of what td-builder needs to re-derive the same identity.
 fn stage_local_source_at(
     root: &Path,
     key: &str,
@@ -1995,48 +2022,8 @@ fn stage_local_source_at(
     trees: &[String],
     dest: &Path,
 ) -> Result<PathBuf, String> {
-    let dir = resolve_local_source_dir_at(root, rel)?;
-    if trees.is_empty() {
-        remove_path_if_exists(dest)?;
-        copy_source_tree(&dir, dest)
-            .map_err(|e| format!("copy local source {} for `{key}': {e}", dir.display()))?;
-        return Ok(dest.to_path_buf());
-    }
-    // Every tree is resolved and named before anything is copied, so a
-    // refused roster leaves no half-staged directory behind.
-    let mut resolved: Vec<(String, PathBuf)> = vec![(rel.to_string(), dir)];
-    for tree in trees {
-        resolved.push((tree.clone(), resolve_local_source_tree_at(root, tree)?));
-    }
-    let mut staged: Vec<(PathBuf, String)> = Vec::new();
-    for (tree_rel, tree_dir) in resolved {
-        // Named by the declared path, not the canonical one: the crate's
-        // relative paths (`../engine`, `../../td-boot/src`) are written against
-        // the checkout's names, which a symlinked tree would not keep.
-        let name = Path::new(&tree_rel)
-            .file_name()
-            .and_then(|name| name.to_str())
-            .map(str::to_string)
-            .ok_or_else(|| format!("local source tree `{tree_rel}' for `{key}' has no name"))?;
-        if staged.iter().any(|(_, seen)| *seen == name) {
-            return Err(format!(
-                "local source `{key}' stages two trees named `{name}' — sibling trees \
-                 must have distinct basenames"
-            ));
-        }
-        staged.push((tree_dir, name));
-    }
-    remove_path_if_exists(dest)?;
-    fs::create_dir_all(dest).map_err(|e| format!("mkdir {}: {e}", dest.display()))?;
-    for (tree_dir, name) in &staged {
-        copy_source_tree(tree_dir, &dest.join(name)).map_err(|e| {
-            format!(
-                "copy local source tree {} for `{key}': {e}",
-                tree_dir.display()
-            )
-        })?;
-    }
-    Ok(dest.to_path_buf())
+    resolve_local_source_dir_at(root, rel)?;
+    td_engine::local_source::stage(root, key, rel, trees, dest)
 }
 
 /// `td-builder store-path-recursive`: the content address `src` WOULD intern at,
@@ -2062,33 +2049,6 @@ fn store_path_recursive_with(
         .ok_or_else(|| format!("store-path-recursive {name} produced no path"))
 }
 
-fn gate_local_source_candidate(key: &str, candidate_path: &str) -> Result<(), String> {
-    let candidate = path_basename_str(candidate_path)?;
-    // The DECISION stays `require`'s, so a local source is admitted on exactly the
-    // terms every other seed is; only the explanation below is local.
-    if crate::seed_digests::require(key, candidate).is_ok() {
-        return Ok(());
-    }
-    // PROVENANCE_REJECTED, not the literal: `die_runner` keys the 78 exit on this
-    // prefix, so a drifted copy would silently reclassify the failure.
-    Err(match crate::seed_digests::expected(key)? {
-        Some(exp) => format!(
-            "{PROVENANCE_REJECTED}local source `{key}' hashes to {candidate} but the compiled \
-             table pins {exp} — the in-tree source was edited without regenerating \
-             seed/seed-digests.txt. Fix the TABLE (`td-recipe-eval seed-digests > \
-             seed/seed-digests.txt', or edit this one row to {candidate}) and commit it. \
-             `clear-store' does NOT help: a cold ladder hashes the same tree to the same \
-             {candidate} and reds here again, minus the build cache (re #469)"
-        ),
-        None => format!(
-            "{PROVENANCE_REJECTED}local source `{key}' has no compiled expected digest in \
-             seed/seed-digests.txt — an unpinned seed is not admissible; regenerate the table \
-             with `td-recipe-eval seed-digests', or add the computed row `{key} {candidate}', \
-             rebuild the evaluator, verify it and commit the table (re #469)"
-        ),
-    })
-}
-
 #[derive(Debug)]
 pub(crate) enum SeedInput {
     Stage0 { key: String },
@@ -2099,8 +2059,9 @@ pub(crate) enum SeedInput {
     /// An IN-TREE source directory (#469 local-source provenance): `path` is the
     /// repo-relative dir the recipe's `local_source` names, `trees` the sibling
     /// dirs its `local_source_trees` stage beside it. Interned by copying the
-    /// committed tree (minus build/VCS artifacts) into the seed store, then
-    /// gated against the compiled table like every other seed.
+    /// working tree (minus build/VCS artifacts) into the seed store; its
+    /// declaration is pinned by seed/local-source-roster.txt and its identity
+    /// re-derived live on every run, never gated against the digest table.
     LocalSource {
         key: String,
         path: String,
@@ -2332,6 +2293,18 @@ impl RecipeCheckRunner {
         // live run can hold that name, so nothing here can reach persisted store state.
         fs::create_dir_all(&self.scratch)
             .map_err(|e| format!("mkdir {}: {e}", self.scratch.display()))?;
+        // The per-run local-source db is named by the claimed scratch, and a run
+        // that died between interning and build-plan leaves it behind under a
+        // name a later run can win again (pids repeat across pid namespaces).
+        // `store-add-recursive` MERGES into an existing db, so that stale row
+        // would red every later plan of this check. Nothing else sweeps it, and
+        // nothing live can hold this name, so clear it here.
+        let local_db = local_seed_db_path(&self.lw, &self.scratch_id());
+        match fs::remove_file(&local_db) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(format!("remove {}: {e}", local_db.display())),
+        }
         // Reclaim disk from abandoned predecessors' scratch trees. Safe under a SHARED
         // ladder because it reaps by CLAIM rather than by name: a live peer's tree is
         // one whose lock it cannot take, in this or any other pid namespace.
@@ -2681,9 +2654,16 @@ impl RecipeCheckRunner {
 
     /// Intern an IN-TREE source directory: stage it, then content-address it into
     /// the seed store under `intern_name`. No fetch/verify: the bytes ARE the
-    /// committed tree, and the compiled seed-digest table is what pins them. This
-    /// is the GENERATOR's path (`seed-digests`, which is producing the table and so
-    /// cannot be gated by it); the enforcing path is `ensure_local_source`.
+    /// committed tree, and a local source is DECLARATION-pinned (`seed/
+    /// local-source-roster.txt`), never by a content hash — there is nothing
+    /// here for a "compiled digest" to gate against (re #469 local-source-roster
+    /// split). Reachable only via `derive_seed_input_into`/
+    /// `derive_seed_input_for_generator`, whose OWN doc comment is the
+    /// authority on when that is (in practice: never, for a local source —
+    /// `seed_digests_cli` skips `SeedInput::LocalSource` entirely, and
+    /// `ensure_seed_input` dispatches a local source straight to
+    /// `ensure_local_source`, which does NOT call this function; it interns
+    /// into the separate PER-RUN local-source db directly).
     fn intern_local_source(
         &self,
         intern_name: &str,
@@ -2695,27 +2675,62 @@ impl RecipeCheckRunner {
         self.store_add_recursive_into(intern_name, &staged, db)
     }
 
-    /// Realize a local source under the compiled table's authority, in the ONE order
-    /// that keeps a stale digest recoverable: hash, GATE, only then intern.
+    /// Realize a local source and intern it into THIS RUN's separate
+    /// local-source seed db, never the keyed digest-table db (re #469
+    /// local-source-roster blocker fix, found independently by three
+    /// reviewers): a local source's identity is not pinned by that table's
+    /// digest, so an interned row there would go stale on the very next
+    /// ordinary edit to its staged tree and poison the SHARED, wholesale-
+    /// authenticated keyed db for every worktree on the same table, for
+    /// every later `build-plan`.
     ///
-    /// Interning first would be self-defeating. The retained seed db is authenticated
-    /// WHOLESALE (`authenticate_seed_db`) — one row on a basename the table does not
-    /// pin makes every later `build-plan` red, for every target, including ones that
-    /// never look at this source. So an intern that happens before the gate converts
-    /// "this tree's digest is stale" into "the ladder is unusable", and the developer
-    /// pays a full cold climb for a one-line table fix.
+    /// First requires the CATALOG's declaration (`rel`/`trees`, what
+    /// `stage_local_source` is about to resolve and stage) to equal the
+    /// COMPILED roster's declaration for `key` — a mismatch means
+    /// `seed/local-source-roster.txt` is stale relative to the catalog this
+    /// run is evaluating, which the `local-source-roster` preflight should
+    /// have caught at commit time; this is the run-time backstop, naming the
+    /// key and both declarations rather than silently staging whichever one
+    /// the caller happened to pass.
     fn ensure_local_source(&self, key: &str, rel: &str, trees: &[String]) -> Result<String, String> {
+        match crate::local_source_roster::expected(key)? {
+            Some((roster_path, roster_trees))
+                if roster_path == rel
+                    && roster_trees.len() == trees.len()
+                    && roster_trees.iter().zip(trees.iter()).all(|(r, t)| *r == t) => {}
+            Some((roster_path, roster_trees)) => {
+                return Err(format!(
+                    "local source `{key}': the catalog declares path `{rel}' trees `{}' but \
+                     seed/local-source-roster.txt declares path `{roster_path}' trees `{}' — \
+                     regenerate the roster (`td-recipe-eval local-source-roster > \
+                     seed/local-source-roster.txt`) (re #469 local-source-roster split)",
+                    trees.join(","),
+                    roster_trees.join(",")
+                ));
+            }
+            None => {
+                return Err(format!(
+                    "local source `{key}': the catalog declares it but \
+                     seed/local-source-roster.txt has no row for `{key}' — regenerate the \
+                     roster (`td-recipe-eval local-source-roster > \
+                     seed/local-source-roster.txt`) (re #469 local-source-roster split)"
+                ));
+            }
+        }
         let staged = self.stage_local_source(key, rel, trees)?;
         let candidate = self.store_path_recursive(key, &staged)?;
-        gate_local_source_candidate(key, &candidate)?;
-        let derived = self.store_add_recursive(key, &staged)?;
-        // The intern re-hashes the same staged tree, so this cannot disagree with the
-        // gate above — assert it rather than assume it, since everything downstream
-        // trusts that the interned basename is the one the table vouched for.
+        let local_db = local_seed_db_path(&self.lw, &self.scratch_id());
+        let derived = self.store_add_recursive_into(key, &staged, &local_db)?;
+        // The DERIVED value is the identity (re #469 local-source-roster split):
+        // there is no committed digest to gate a local source against, only the
+        // declared roster (key + paths), just checked above. This integrity
+        // check stays: the intern re-hashes the same staged tree, and
+        // disagreement would mean the staged tree changed between the two
+        // hashes, which everything downstream must never trust.
         if derived != candidate {
             return Err(format!(
                 "local source `{key}': hashed {candidate} before interning but interned \
-                 {derived} — the staged tree changed under the gate"
+                 {derived} — the staged tree changed between the two hashes"
             ));
         }
         self.stage_store_path(&derived)?;
@@ -3088,6 +3103,16 @@ impl RecipeCheckRunner {
         let auto_map_s = path_str(&auto_map)?;
         let scratch = path_str(&self.scratch)?;
         let root_s = path_str(&self.root)?;
+        // This run's SEPARATE local-source seed db (re #469 local-source-roster
+        // blocker fix): `ensure_local_source` interned any local-source
+        // registrations here, never into the keyed `self.db` — see
+        // `local_seed_db_path`'s doc comment for why. Always passed: when no
+        // local source was staged this run the file is absent, and the builder
+        // drops an absent path before it can join its typed db list
+        // (`present_local_seed_db`), which is what makes always passing it
+        // safe — every db in that list is read per step.
+        let local_seed_db = local_seed_db_path(&self.lw, &self.scratch_id());
+        let local_seed_db_s = path_str(&local_seed_db)?;
         let mut cmd = Command::new(&self.tb);
         cmd.current_dir(&self.root)
             .env_clear()
@@ -3120,7 +3145,8 @@ impl RecipeCheckRunner {
             .arg(auto_map_s)
             .arg(path_str(&self.store)?)
             .arg(path_str(&self.db)?)
-            .arg(scratch);
+            .arg(scratch)
+            .arg(local_seed_db_s);
         // Cross-run reuse is ALWAYS on (re #469 build speed): point the chain at the
         // DEDICATED build-output cache (build_cache_paths, under the ladder work dir), kept
         // SEPARATE from the seed store/db (self.store/self.db). Each UNCHANGED rung is reused
@@ -3165,6 +3191,14 @@ impl RecipeCheckRunner {
                 .map_err(|e| format!("spawn build-plan --auto {target}: {e}"))?;
             (out.status, out.stdout, out.stderr)
         };
+        // Best-effort, like the candidate/generator dbs (re #469 local-source-
+        // roster blocker fix): this run's local-source registrations have
+        // served their purpose once `build-plan --auto` has read them, whether
+        // it succeeded or reds. Removed here rather than kept warm across runs
+        // — unlike the keyed db, a local source's identity can move on the
+        // very next edit, so keeping a stale row around buys nothing and a
+        // crash-left dotfile is never authenticated as seed authority.
+        let _ = fs::remove_file(&local_seed_db);
         let out_file = self.scratch.join(format!("build-{target}.out"));
         let err_file = self.scratch.join(format!("build-{target}.err"));
         fs::write(&out_file, &stdout_bytes)
@@ -5210,9 +5244,13 @@ fn seed_reset_hint(lw: &Path, err: &str) -> String {
             "hint: the seed db for this pin table vouches an item the table does not pin. \
              The db is keyed by the table's row set, so a peer branch's seeds cannot land in \
              it and a pin change starts a fresh one — which leaves a stale TABLE as the \
-             remaining cause: regenerate it (`td-recipe-eval seed-digests', or \
-             `local-source-digests' for an in-tree source). Do NOT `clear-store' the ladder \
-             ({}): it discards the whole shared build cache and cannot correct a table.",
+             remaining cause: regenerate it (`td-recipe-eval seed-digests'). For an in-tree \
+             local source there is no committed digest to go stale (re #469 \
+             local-source-roster split) — check instead whether \
+             `seed/local-source-roster.txt' still lists the key (`td-recipe-eval \
+             local-source-roster' regenerates it if a declaration changed). Do NOT \
+             `clear-store' the ladder ({}): it discards the whole shared build cache and \
+             cannot correct a table.",
             lw.display()
         );
     }
@@ -5643,61 +5681,6 @@ fn copy_tree(src: &Path, dst: &Path) -> io::Result<()> {
             if let Some(name) = child.file_name() {
                 copy_tree(&child, &dst.join(name))?;
             }
-        }
-        fs::set_permissions(dst, meta.permissions())?;
-        return Ok(());
-    }
-    if ftype.is_file() {
-        if let Some(parent) = dst.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::copy(src, dst)?;
-        fs::set_permissions(dst, meta.permissions())?;
-    }
-    Ok(())
-}
-
-/// Keep staging and memo hashing on the same input boundary. Excluded entries
-/// never reach the build: ignoring only their hashes would admit unpinned data.
-fn excluded_local_source_entry(name: &std::ffi::OsStr) -> bool {
-    matches!(
-        name.to_str(),
-        Some("target") | Some(".git") | Some("DESIGN.md")
-    )
-}
-
-/// Copy the working source tree, excluding build/VCS artifacts and `DESIGN.md`
-/// at every depth. Preserve symlinks and executable bits in sorted entry order.
-/// Other untracked or modified files enter the content address and must match
-/// the compiled seed pin. A git-tracked-file filter would require a git
-/// subprocess, which the dependency-free recipe runner avoids.
-fn copy_source_tree(src: &Path, dst: &Path) -> io::Result<()> {
-    let meta = fs::symlink_metadata(src)?;
-    let ftype = meta.file_type();
-    if ftype.is_symlink() {
-        if let Some(parent) = dst.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        let target = fs::read_link(src)?;
-        let _ = fs::remove_file(dst);
-        symlink(target, dst)?;
-        return Ok(());
-    }
-    if ftype.is_dir() {
-        fs::create_dir_all(dst)?;
-        let mut children = Vec::new();
-        for entry in fs::read_dir(src)? {
-            children.push(entry?.path());
-        }
-        children.sort();
-        for child in children {
-            let Some(name) = child.file_name() else {
-                continue;
-            };
-            if excluded_local_source_entry(name) {
-                continue;
-            }
-            copy_source_tree(&child, &dst.join(name))?;
         }
         fs::set_permissions(dst, meta.permissions())?;
         return Ok(());
@@ -6977,16 +6960,20 @@ chmod 755 '{}'
         );
     }
 
-    // The compiled seed-digest table and the catalog must agree EXACTLY
-    // (re #469): a seed key any recipe declares without a compiled digest
-    // would red at derivation, and an orphan row pins nothing. Cold-safe:
-    // walks the compiled catalog + pins only, no warm sources. On mismatch,
-    // regenerate with `td-recipe-eval seed-digests > seed/seed-digests.txt`.
+    // The compiled seed-digest table and the catalog's NON-local seed universe
+    // must agree EXACTLY (re #469 local-source-roster split): a fetched/generated
+    // seed key any recipe declares without a compiled digest would red at
+    // derivation, and an orphan row pins nothing. Local sources are excluded here
+    // — they are covered by `local_source_roster_covers_the_catalog_local_source_universe`
+    // below instead, against `seed/local-source-roster.txt`. Cold-safe: walks the
+    // compiled catalog + pins only, no warm sources. On mismatch, regenerate with
+    // `td-recipe-eval seed-digests > seed/seed-digests.txt`.
     #[test]
     fn seed_digest_table_covers_the_catalog_seed_universe() {
         let universe: std::collections::BTreeSet<String> = catalog_seed_universe()
             .unwrap()
             .iter()
+            .filter(|s| !matches!(s, SeedInput::LocalSource { .. }))
             .map(|s| s.key().to_string())
             .collect();
         let table: std::collections::BTreeSet<String> = crate::seed_digests::rows()
@@ -6996,41 +6983,48 @@ chmod 755 '{}'
             .collect();
         assert_eq!(
             universe, table,
-            "seed/seed-digests.txt must pin exactly the catalog's pinned-seed universe — \
-             regenerate with `td-recipe-eval seed-digests > seed/seed-digests.txt`"
+            "seed/seed-digests.txt must pin exactly the catalog's NON-local pinned-seed \
+             universe — regenerate with `td-recipe-eval seed-digests > seed/seed-digests.txt`"
         );
     }
 
-    // A deliberately stale local-source address. The key below uses a real compiled
-    // row so this exercises the same comparison without retaining a dead fixture pin.
-    const STALE_LOCAL_BASENAME: &str = "00000000000000000000000000000000-stale-local-source";
+    // The compiled local-source roster and the catalog's LocalSource universe must
+    // agree exactly, key AND declaration (main path, sibling trees, in declared
+    // order) — not just the key set: a roster row naming the wrong path or a
+    // stale sibling list would silently re-derive the wrong bytes. On mismatch,
+    // regenerate with `td-recipe-eval local-source-roster > seed/local-source-roster.txt`.
+    #[test]
+    fn local_source_roster_covers_the_catalog_local_source_universe() {
+        let mut universe: Vec<(String, String, Vec<String>)> = catalog_seed_universe()
+            .unwrap()
+            .into_iter()
+            .filter_map(|s| match s {
+                SeedInput::LocalSource { key, path, trees } => Some((key, path, trees)),
+                _ => None,
+            })
+            .collect();
+        universe.sort();
+        let table: Vec<(String, String, Vec<String>)> = crate::local_source_roster::rows()
+            .unwrap()
+            .into_iter()
+            .map(|(k, p, trees)| {
+                (
+                    k.to_string(),
+                    p.to_string(),
+                    trees.into_iter().map(str::to_string).collect(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            universe, table,
+            "seed/local-source-roster.txt must pin exactly the catalog's local-source \
+             universe (key, main path, sibling trees) — regenerate with \
+             `td-recipe-eval local-source-roster > seed/local-source-roster.txt`"
+        );
+    }
 
     fn pinned_basename(key: &str) -> &'static str {
         crate::seed_digests::expected(key).unwrap().unwrap()
-    }
-
-    // The gate an edited local source hits, in both directions. An address that is
-    // NOT the pinned one is rejected however warm the ladder is (the store still
-    // holding the old basename is not consulted — this is a pure comparison against
-    // the compiled table), and the matching address is accepted.
-    #[test]
-    fn a_local_source_is_gated_on_its_current_hash_not_on_what_the_store_holds() {
-        let key = "stage0-source";
-        let err = gate_local_source_candidate(key, &format!("{TD_STORE_DIR}/{STALE_LOCAL_BASENAME}"))
-            .expect_err("the pre-edit basename must no longer be admissible");
-        assert!(err.contains("provenance rejected"), "got: {err}");
-        assert!(err.contains(pinned_basename(key)), "got: {err}");
-        // The recovery line must send the developer to the TABLE. `clear-store` is the
-        // reflex the neighbouring stale-seed reds teach, and it is wrong here: it costs
-        // the whole ladder and lands on the identical red.
-        assert!(err.contains("seed/seed-digests.txt"), "got: {err}");
-        assert!(
-            err.contains("`clear-store' does NOT help"),
-            "the error must say clear-store is not the fix: {err}"
-        );
-
-        gate_local_source_candidate(key, &format!("{TD_STORE_DIR}/{}", pinned_basename(key)))
-            .expect("the tree's current hash is exactly what the committed table pins");
     }
 
     // A warm seed store answers for a PINNED seed and NEVER for a local source. A pin
@@ -7072,12 +7066,14 @@ chmod 755 '{}'
             format!("{TD_STORE_DIR}/{}", pinned_basename("stage0-source"))
         );
 
+        // A REAL roster key (`td-mail-source`/`td-mail`, re #469
+        // local-source-roster split's runtime declaration cross-check), so
+        // this reaches staging rather than reding at the declaration check
+        // first; "td-mail" does not exist under this fake root, so it still
+        // fails to resolve, proving the LocalSource arm re-hashes rather
+        // than trusting any warm digest-table hit.
         let err = runner
-            .ensure_seed_input(&SeedInput::LocalSource {
-                key: "stage0-source".into(),
-                path: "tests".into(),
-                trees: Vec::new(),
-            })
+            .ensure_seed_input(&roster_local_source("td-mail-source"))
             .expect_err("a local source must re-hash even with its basename interned");
         assert!(err.contains("local source"), "got: {err}");
         let _ = fs::remove_dir_all(&lw);
@@ -7237,6 +7233,59 @@ chmod 755 '{}'
         let _ = remove_path_if_exists(&lw);
     }
 
+    // `ensure_local_source` must intern into the SEPARATE per-run local-source
+    // db, never the keyed `self.db` (re #469 local-source-roster blocker fix,
+    // found independently by three reviewers): a local source's identity is
+    // not pinned by the digest table, so a row in the KEYED db would go stale
+    // on the very next ordinary edit and poison a db every worktree on the
+    // same table shares. Drive it with a REAL td-builder against the REAL
+    // checkout so the success path is actually exercised, not merely a
+    // failure-leaves-things-untouched proof.
+    #[test]
+    fn ensure_local_source_interns_into_the_separate_local_seed_db_not_the_keyed_one() {
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("recipes has a repository parent");
+        let tb = repo.join("target/release/td-builder");
+        assert!(
+            is_executable(&tb),
+            "build the required test runner first: cargo build --release --manifest-path \
+             builder/Cargo.toml"
+        );
+
+        let lw = env::temp_dir().join(format!("td-local-src-own-db-{}", process::id()));
+        let _ = remove_path_if_exists(&lw);
+        let mut runner = shared_test_runner(&lw);
+        runner.root = repo.to_path_buf();
+        runner.tb = tb;
+        fs::create_dir_all(&runner.store).unwrap();
+        fs::create_dir_all(&runner.scratch).unwrap();
+        fs::create_dir_all(runner.db.parent().unwrap()).unwrap();
+
+        let local_db = local_seed_db_path(&runner.lw, &runner.scratch_id());
+        assert!(!runner.db.exists(), "no keyed db before this call");
+        assert!(!local_db.exists(), "no local-source db before this call");
+
+        let derived = runner
+            .ensure_seed_input(&roster_local_source("td-mail-source"))
+            .expect("td-mail is a real local source in this checkout");
+        assert!(derived.ends_with("-td-mail-source"), "{derived}");
+
+        assert!(
+            !runner.db.exists(),
+            "the keyed db must stay untouched — ensure_local_source must never write it"
+        );
+        assert!(
+            local_db.is_file(),
+            "the separate local-source db must exist after a successful intern"
+        );
+        assert!(
+            !fs::read(&local_db).unwrap().is_empty(),
+            "the local-source db must actually carry the interned row"
+        );
+        let _ = remove_path_if_exists(&lw);
+    }
+
     // A local source that does not make it through the check leaves the retained seed
     // store and db byte-identical. The tree here is a real, resolvable crate, so the
     // run gets as far as hashing it (which fails: this runner has no builder) — far
@@ -7251,30 +7300,48 @@ chmod 755 '{}'
         let _ = fs::remove_dir_all(&lw);
         let mut runner = shared_test_runner(&lw);
         runner.root = lw.join("root");
-        let src = runner.root.join("tests/demo-src");
-        fs::create_dir_all(&src).unwrap();
-        fs::write(src.join("Cargo.toml"), b"[package]\nname = \"demo\"\n").unwrap();
-        fs::write(src.join("Cargo.lock"), b"version = 4\n").unwrap();
+        // A REAL roster key (`td-mail-source`), so this reaches
+        // staging+hashing rather than reding at the declaration cross-check
+        // first (re #469 local-source-roster split). Every path the compiled
+        // roster declares for it — the main tree and each sibling — must
+        // exist under the fake root, or staging reds before the hasher.
+        let (rel, trees) = crate::local_source_roster::expected("td-mail-source")
+            .unwrap()
+            .expect("td-mail-source is in the compiled roster");
+        for path in std::iter::once(rel).chain(trees.iter().copied()) {
+            let src = runner.root.join(path);
+            fs::create_dir_all(&src).unwrap();
+            fs::write(src.join("Cargo.toml"), b"[package]\nname = \"demo\"\n").unwrap();
+            fs::write(src.join("Cargo.lock"), b"version = 4\n").unwrap();
+        }
         fs::create_dir_all(&runner.store).unwrap();
         fs::create_dir_all(&runner.scratch).unwrap();
-        // A retained ladder: one interned seed plus its db.
+        // A retained ladder: one interned seed plus its KEYED db.
         fs::create_dir_all(runner.store.join(pinned_basename("stage0-source"))).unwrap();
         fs::create_dir_all(runner.db.parent().unwrap()).unwrap();
         fs::write(&runner.db, b"the retained seed registrations").unwrap();
         let store_before = dir_listing(&runner.store);
         let db_before = fs::read(&runner.db).unwrap();
+        // The SEPARATE local-source db (re #469 blocker fix) must not exist
+        // yet either — nothing has interned into it.
+        let local_db = local_seed_db_path(&runner.lw, &runner.scratch_id());
+        assert!(!local_db.exists(), "no local-source db before this call");
 
         let err = runner
-            .ensure_seed_input(&SeedInput::LocalSource {
-                key: "stage0-source".into(),
-                path: "tests/demo-src".into(),
-                trees: Vec::new(),
-            })
+            .ensure_seed_input(&roster_local_source("td-mail-source"))
             .expect_err("this runner has no td-builder to hash with");
         assert!(err.contains("store-path-recursive"), "got: {err}");
 
+        // The KEYED db is byte-identical: `ensure_local_source` never writes
+        // there (re #469 local-source-roster blocker fix) — only the
+        // separate local-source db, and even that gets no row here since the
+        // failure is at the pre-intern hash, before any store-add-recursive.
         assert_eq!(store_before, dir_listing(&runner.store));
         assert_eq!(db_before, fs::read(&runner.db).unwrap());
+        assert!(
+            !local_db.exists(),
+            "a failed hash must not leave a row in the local-source db either"
+        );
         let _ = fs::remove_dir_all(&lw);
     }
 
@@ -7453,28 +7520,46 @@ chmod 755 '{}'
         let _ = fs::remove_dir_all(&lw);
     }
 
-    // The ORDER inside `ensure_local_source` — hash, gate, only then intern — is the
-    // whole defence, and no type or test above can observe it without a real builder
-    // to hash with. Assert it against the source, as td-init does for its syscall
-    // confinement: the gate call must PRECEDE the interning call.
+    // `ensure_local_source` no longer gates against a committed row (re #469
+    // local-source-roster split: the derived value IS the identity); it keeps
+    // only the hash-then-intern INTEGRITY check — the two hashes of the same
+    // staged tree must agree — and (re #469 blocker fix) interns into the
+    // SEPARATE local-source db, never the keyed `self.db`. It also (re #469
+    // blocker review item C) cross-checks the catalog's declaration against
+    // the compiled roster before ever staging anything. Assert all of that
+    // from the source text, in the right order.
     #[test]
-    fn ensure_local_source_gates_before_it_interns() {
+    fn ensure_local_source_checks_hash_agreement_before_returning() {
         let src = include_str!("check_runner.rs");
         let body = src
             .split_once("fn ensure_local_source(")
             .and_then(|(_, rest)| rest.split_once("\n    }\n"))
             .map(|(body, _)| body)
             .expect("ensure_local_source must be findable in this file");
-        let gate = body
-            .find("gate_local_source_candidate(")
-            .expect("ensure_local_source must gate the candidate address");
-        let intern = body
-            .find("store_add_recursive(")
-            .expect("ensure_local_source must intern the staged tree");
         assert!(
-            gate < intern,
-            "ensure_local_source must gate the address BEFORE interning it — interning \
-             first poisons the retained seed db for every later plan"
+            !body.contains("gate_local_source_candidate"),
+            "ensure_local_source must not gate a local source against a committed row"
+        );
+        let roster_check = body
+            .find("local_source_roster::expected(key)")
+            .expect("ensure_local_source must cross-check the catalog against the roster");
+        let intern = body
+            .find("store_add_recursive_into(key, &staged, &local_db)")
+            .expect("ensure_local_source must intern the staged tree into the SEPARATE local db");
+        let check = body
+            .find("if derived != candidate")
+            .expect("ensure_local_source must keep the hash-then-intern integrity check");
+        assert!(
+            roster_check < intern,
+            "the roster cross-check must run before anything is staged or interned"
+        );
+        assert!(
+            intern < check,
+            "the integrity check must compare against the ALREADY-interned value"
+        );
+        assert!(
+            !body.contains("self.store_add_recursive(key"),
+            "ensure_local_source must never intern into the keyed self.db"
         );
     }
 
@@ -7774,6 +7859,21 @@ chmod 755 '{}'
         let (again, _hold) = claim_scratch(&root, name).unwrap();
         assert_eq!(again, first, "the released name comes back");
         let _ = fs::remove_dir_all(&lw);
+    }
+
+    // The declaration a test hands the runner comes from the COMPILED roster,
+    // never a literal: the catalog can give a key sibling trees (main gave
+    // td-mail three) and the runtime cross-check would then red a literal
+    // before staging, for a reason unrelated to what the test asserts.
+    fn roster_local_source(key: &str) -> SeedInput {
+        let (path, trees) = crate::local_source_roster::expected(key)
+            .unwrap()
+            .expect("key must be in the compiled local-source roster");
+        SeedInput::LocalSource {
+            key: key.into(),
+            path: path.into(),
+            trees: trees.iter().map(|t| t.to_string()).collect(),
+        }
     }
 
     /// A minimal runner pointed at a throwaway ladder tree, for the fs-level
@@ -8344,13 +8444,19 @@ chmod 755 '{}'
         let keyed = seed_db_path(lw).unwrap();
         let generator = generator_db_path(lw, "seed-digests-4242");
         let candidate = candidate_db_path(lw, "check-demo-4242");
+        let local = local_seed_db_path(lw, "check-demo-4242");
         assert_ne!(generator, keyed, "the generator must not write the keyed db");
         assert_ne!(candidate, keyed, "a cold candidate must not write the keyed db");
+        assert_ne!(local, keyed, "local-source registrations must not write the keyed db");
+        assert_ne!(local, candidate, "the local-source db is its own file, not the candidate's");
         assert_eq!(generator.parent(), keyed.parent(), "same commit-lock parent");
         assert_eq!(candidate.parent(), keyed.parent(), "same commit-lock parent");
-        // Distinct per run, so two generators cannot merge into one file.
+        assert_eq!(local.parent(), keyed.parent(), "same commit-lock parent");
+        // Distinct per run, so two generators (or two runs' local-source dbs)
+        // cannot merge into one file (re #469 local-source-roster blocker fix).
         assert_ne!(generator, generator_db_path(lw, "seed-digests-4243"));
         assert_ne!(candidate, candidate_db_path(lw, "check-demo-4243"));
+        assert_ne!(local, local_seed_db_path(lw, "check-demo-4243"));
     }
 
     // The seed store moved with the keyed db, and that rename IS the rollout barrier:
@@ -8382,6 +8488,25 @@ chmod 755 '{}'
         assert!(db.to_string_lossy().contains(digest.get(..16).unwrap_or("")));
         // The STORE is deliberately NOT keyed — content-addressed items are shared.
         assert_eq!(seed_store_dir(lw), shared_test_runner(lw).store);
+    }
+
+    // A run that died between interning a local source and build-plan leaves
+    // its per-run local-source db behind under a name a later run can claim
+    // again; setup() sweeps it so a stale row cannot merge into the new run's
+    // db and red every later plan (found in the confirmation review).
+    #[test]
+    fn setup_sweeps_a_dead_predecessors_local_seed_db() {
+        let lw = env::temp_dir().join(format!("td-ladder-local-db-sweep-{}", process::id()));
+        let _ = fs::remove_dir_all(&lw);
+        let runner = shared_test_runner(&lw);
+        let stale = local_seed_db_path(&lw, &runner.scratch_id());
+        fs::create_dir_all(stale.parent().unwrap()).unwrap();
+        fs::write(&stale, b"a dead run's local-source registrations").unwrap();
+
+        runner.setup().unwrap();
+
+        assert!(!stale.exists(), "{} must be swept by setup()", stale.display());
+        let _ = fs::remove_dir_all(&lw);
     }
 
     // setup() never wipes the seed store/db: it retains it across runs. A from-stage0

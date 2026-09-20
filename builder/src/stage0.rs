@@ -976,6 +976,7 @@ fn recipe_eval_fp_roots(root: &Path) -> Result<Vec<String>, String> {
         "Cargo.toml",
         "Cargo.lock",
         "seed/seed-digests.txt",
+        "seed/local-source-roster.txt",
         "tests/recipe-eval-tool.sh",
         "builder/src/stage0.rs",
     ]
@@ -1215,16 +1216,18 @@ pub(crate) fn stage0_place(root: &Path, base: &Path) -> Result<String, String> {
 
     // Fingerprint the builder source the stage0 is compiled from — reuse only
     // if unchanged. Absolute roots: the caller's cwd must not matter. The
-    // seed-digest table is `include_str!`-compiled INTO the builder (main.rs
-    // SEED_DIGESTS), so it is a genuine compile input to the placed binary and
-    // MUST be fingerprinted too — otherwise adding a source pin (a new
-    // seed-digests row) leaves the prior placement's compiled table in force
-    // and the new pin reads as an unpinned seed (re #469). The builder now
-    // compiles the shared `td-engine` lib (JSON + SHA-256) as a path dependency,
-    // resolved through the workspace-root Cargo.toml/Cargo.lock (which also carry
-    // the release profile + member set), so engine/src, engine/Cargo.toml, and
-    // both workspace-root files are compile inputs and join the fingerprint too —
-    // else an engine edit leaves a stale placement in force.
+    // seed-digest table AND the local-source roster are both `include_str!`-compiled
+    // INTO the builder (main.rs SEED_DIGESTS, LOCAL_SOURCE_ROSTER), so they are
+    // genuine compile inputs to the placed binary and MUST be fingerprinted too —
+    // otherwise adding a source pin (a new seed-digests row) or a local-source
+    // declaration (a new roster row) leaves the prior placement's compiled tables
+    // in force and the new pin/declaration reads as unpinned (re #469 /
+    // local-source-roster split). The builder now compiles the shared `td-engine`
+    // lib (JSON + SHA-256 + local-source staging) as a path dependency, resolved
+    // through the workspace-root Cargo.toml/Cargo.lock (which also carry the
+    // release profile + member set), so engine/src, engine/Cargo.toml, and both
+    // workspace-root files are compile inputs and join the fingerprint too — else
+    // an engine edit leaves a stale placement in force.
     let fp_roots: Vec<String> = [
         "builder/src",
         "builder/build.rs",
@@ -1234,6 +1237,7 @@ pub(crate) fn stage0_place(root: &Path, base: &Path) -> Result<String, String> {
         "Cargo.toml",
         "Cargo.lock",
         "seed/seed-digests.txt",
+        "seed/local-source-roster.txt",
     ]
     .iter()
     .map(|p| root.join(p).to_string_lossy().into_owned())

@@ -596,19 +596,6 @@ fn map_path(root: &Path, roster: &Result<Vec<GateCrate>, String>, p: &str, sel: 
         return;
     }
 
-    // Portal, taskmgr, the editor, news, mail and td-photo stage sibling
-    // trees; every retained input moves its consumer's source digest. This
-    // cheap preflight augments each crate arm below. engine/ carries its own
-    // routing; td-seatd shares the compositor arm but is not a staged
-    // sibling. Keep this top-level tree roster in agreement with the catalog's
-    // local_source_trees_are_staged_by_basename_and_routed_by_the_builder test.
-    if pattern_matches(
-        "td-portal/*|td-busd/*|td-compositor/*|td-secret/*|td-ui/*|td-taskmgr/*|td-editor/*|td-news/*|td-mail/*|td-photo/*",
-        p,
-    ) {
-        sel.add_preflight("local-source-digests");
-    }
-
     if pattern_matches(
         "check.sh|builder/build.rs|builder/src/gates.rs|builder/src/check_loop.rs",
         p,
@@ -736,9 +723,10 @@ fn map_path(root: &Path, roster: &Result<Vec<GateCrate>, String>, p: &str, sel: 
     if p == "engine/src/gzip.rs" {
         sel.add_preflight("cargo-test");
         sel.add_preflight("net-test");
-        // Staged into the td-net seed with the rest of engine/, so it moves
-        // the `td-net-source` digest row like any engine file.
-        sel.add_preflight("local-source-digests");
+        // engine/ is staged into the td-net seed, but that is re-derived LIVE
+        // from the checkout on every run (re #469 local-source-roster split) —
+        // this edit selects no local-source preflight; only a declaration
+        // change (recipes/*) would.
         sel.add_target("check-engine");
         sel.add_target("check");
         sel.add_note(
@@ -765,8 +753,9 @@ fn map_path(root: &Path, roster: &Result<Vec<GateCrate>, String>, p: &str, sel: 
             // `engine/` is staged into td-net's seed (the `td-net` recipe's
             // local-source trees, pinned by the catalog test
             // `local_source_trees_are_staged_by_basename_and_routed_by_the_builder`),
-            // so an edit moves the `td-net-source` digest row.
-            sel.add_preflight("local-source-digests");
+            // but that identity is re-derived LIVE from the checkout on every run
+            // (re #469 local-source-roster split) — an edit here selects no
+            // local-source preflight.
         }
         sel.add_target("check-engine");
         sel.add_target("recipe-rs");
@@ -850,12 +839,31 @@ fn map_path(root: &Path, roster: &Result<Vec<GateCrate>, String>, p: &str, sel: 
     // seed_digests.rs and td-builder's auto_seed_provenance). The
     // digest-coverage unit tests in both crates are the direct check
     // (cargo-test); a row change shifts what the planners ADMIT, so the
-    // recipe self-consistency and package build gates run too.
-    // A row edit is checkable directly for the LOCAL sources (their bytes are in the
-    // checkout); the fetched pins' rows still need a warm-cache `seed-digests` run.
+    // recipe self-consistency and package build gates run too. Local sources
+    // are NOT in this table (re #469 local-source-roster split; see
+    // seed/local-source-roster.txt below) — every row here is a fetched or
+    // host-generated pin, which needs a warm-cache `seed-digests` run to
+    // check directly.
     if p == "seed/seed-digests.txt" {
         sel.add_preflight("cargo-test");
-        sel.add_preflight("local-source-digests");
+        sel.add_target("recipe-rs");
+        add_build_gate_targets(root, sel);
+        return;
+    }
+
+    // seed/local-source-roster.txt — the compiled, DECLARATION-ONLY local-source
+    // roster (re #469 local-source-roster split): key, main path, and sibling
+    // `local_source_trees`, include_str!-compiled into both planners. No content
+    // hash lives here, so it changes only when a recipe adds, removes, or renames
+    // a `local_source`/`local_source_trees` declaration — an edit inside a staged
+    // tree does not move a row and so must NOT select this preflight (that is the
+    // whole point of the split: see `recipes/*` below, where a catalog edit that
+    // touches this DOES route here). A row change shifts what BOTH planners admit
+    // for that key (found in review: this arm omitted the build gates the sibling
+    // seed-digests.txt/recipes/* arms both run for exactly the same reason).
+    if p == "seed/local-source-roster.txt" {
+        sel.add_preflight("cargo-test");
+        sel.add_preflight("local-source-roster");
         sel.add_target("recipe-rs");
         add_build_gate_targets(root, sel);
         return;
@@ -874,9 +882,11 @@ fn map_path(root: &Path, roster: &Result<Vec<GateCrate>, String>, p: &str, sel: 
         // in-loop gates are unprovisionable (re #469).
         sel.add_preflight("shell-syntax");
         sel.add_preflight("cargo-test");
-        // A catalog edit can add, retarget, or drop a `local_source`, any of which
-        // changes which trees the table must pin.
-        sel.add_preflight("local-source-digests");
+        // A catalog edit can add, retarget, or drop a `local_source`/
+        // `local_source_trees` declaration, which moves a
+        // seed/local-source-roster.txt row (re #469 local-source-roster split) —
+        // unlike an edit INSIDE a staged tree, which must not select this.
+        sel.add_preflight("local-source-roster");
         sel.add_target("recipe-rs");
         if glob_match("recipes/src/recipes/*.rs", p) {
             sel.add_target("recipe-checks");
@@ -896,14 +906,13 @@ fn map_path(root: &Path, roster: &Result<Vec<GateCrate>, String>, p: &str, sel: 
         // (former feed coverage); AND, since the old fetch/* rule mapped to the broad
         // behavioral tier, a net-only change keeps that too — without it such a diff
         // would run nothing while waiving the full check. The union of BOTH former
-        // rules. The host net-test preflight compiles and tests td-net. The
-        // target builds it too, as the `td-net` recipe's local source with
-        // `engine/` and `td-boot/` staged beside it (APPLICATIONS.md §W.8),
-        // so an edit moves the `td-net-source` digest row. No gated check
-        // builds that recipe, so the digest preflight is the one thing that
-        // reds a stale row before an image build would.
+        // rules. The host net-test preflight compiles and tests td-net. The target
+        // builds it too, as the `td-net` recipe's local source with `engine/` and
+        // `td-boot/` staged beside it (APPLICATIONS.md §W.8), but that identity is
+        // re-derived LIVE from the checkout by both td-recipe-eval and td-builder on
+        // every run (re #469 local-source-roster split) — an edit here selects no
+        // local-source preflight.
         sel.add_preflight("net-test");
-        sel.add_preflight("local-source-digests");
         sel.add_target("check");
         add_chain_targets(sel);
         return;
@@ -1098,24 +1107,11 @@ fn map_path(root: &Path, roster: &Result<Vec<GateCrate>, String>, p: &str, sel: 
     }
 
     if pattern_matches("*.md|.gitignore", p) {
-        // Retained prose under a td-net source tree moves its digest row.
-        // net/ never gets here: its own arm above catches its retained paths.
-        if p.starts_with("engine/") || p.starts_with("td-boot/") {
-            sel.add_preflight("local-source-digests");
-            sel.add_note(&format!(
-                "{p} is a document inside a tree staged into the td-net seed, so it moves the td-net-source digest row: the digest preflight is the one check."
-            ));
-            return;
-        }
-        // Retained prose in a terminal application's source tree moves its
-        // own seed row (APPLICATIONS.md §W.8).
-        if let Some(seed) = local_source_crate(p) {
-            sel.add_preflight("local-source-digests");
-            sel.add_note(&format!(
-                "{p} is a document inside the {seed} tree, which contributes retained inputs to the {seed}-source seed, so it moves that digest row: the digest preflight is the one check."
-            ));
-            return;
-        }
+        // A retained document inside a local-source tree (engine/, td-boot/, or a
+        // lone local-source crate — APPLICATIONS.md §W.8) still enters that seed's
+        // staged bytes, but its identity is re-derived LIVE from the checkout on
+        // every run (re #469 local-source-roster split), so there is no committed
+        // row for the edit to move and no preflight it needs to select.
         return; // docs — no checks
     }
 
@@ -1136,9 +1132,9 @@ fn map_path(root: &Path, roster: &Result<Vec<GateCrate>, String>, p: &str, sel: 
     // narrower one beside the assertions below.
     if p == "td-boot/src/protocol.rs" || p == "td-boot/src/realfile.rs" {
         sel.add_preflight("cargo-test");
-        // Both are `#[path]`-included by td-net, and `td-boot/` is staged
-        // into td-net's seed: the digest row moves with them.
-        sel.add_preflight("local-source-digests");
+        // Both are `#[path]`-included by td-net, and `td-boot/` is staged into
+        // td-net's seed, but that identity is re-derived LIVE from the checkout
+        // (re #469 local-source-roster split) — no local-source preflight to select.
         sel.add_target("check");
         sel.add_target("recipe-checks");
         add_chain_targets(sel);
@@ -1153,10 +1149,9 @@ fn map_path(root: &Path, roster: &Result<Vec<GateCrate>, String>, p: &str, sel: 
         p,
     ) {
         sel.add_preflight("cargo-test");
-        if pattern_matches("td-boot/*|td-boot/src/*|td-boot/Cargo.toml|td-boot/Cargo.lock", p) {
-            // Retained `td-boot/` inputs enter td-net's seed.
-            sel.add_preflight("local-source-digests");
-        }
+        // Retained `td-boot/` inputs enter td-net's seed, re-derived LIVE from
+        // the checkout (re #469 local-source-roster split) — no local-source
+        // preflight to select here either.
         sel.add_target("check");
         sel.add_target("recipe-checks");
         return;
@@ -1356,9 +1351,10 @@ fn map_path(root: &Path, roster: &Result<Vec<GateCrate>, String>, p: &str, sel: 
     // td-news and td-mail: the feed reader and the mail client, each in a
     // td-ui window, standalone crates OUTSIDE the engine workspace built
     // static by the Cargo runner from their own `local_source` tree with
-    // the toolkit staged beside it, as td-taskmgr is. The tree roster above
-    // already routes every retained file to the digest preflight; the
-    // source takes the cargo-test preflight and the realized-output proofs
+    // the toolkit staged beside it, as td-taskmgr is. The staged identity is
+    // re-derived live from the checkout on every run (re #469 local-source-
+    // roster split), so a retained edit selects no local-source preflight;
+    // the source takes the cargo-test preflight and the realized-output proofs
     // (the `news` and `mail` package checks, td-firstboot-test,
     // rust-userland-auto-test) through recipe-checks.
     if (p.starts_with("td-news/") || p.starts_with("td-mail/")) && !p.contains("..") {
@@ -1371,15 +1367,14 @@ fn map_path(root: &Path, roster: &Result<Vec<GateCrate>, String>, p: &str, sel: 
     // td-install-qemu-test: a standalone std-only crate OUTSIDE the engine
     // workspace, built static by direct rustc like td-util — but from a
     // `local_source` tree rather than `include_str!`, so the whole tree is
-    // the `<crate>-source` seed and ANY file in it, tests and documents
-    // included, moves that crate's seed-digest row: the digest preflight
-    // reds a stale row before an image build would. Unit and integration
+    // the `<crate>-source` seed. That identity is re-derived live from the
+    // checkout on every run (re #469 local-source-roster split), so an edit
+    // here selects no local-source preflight. Unit and integration
     // tests lint/test on the host cargo-test preflight; the recipe-checks
     // that build the program prove the static link. Its RECIPE files are
     // routed by the recipes arm above, not here.
     if local_source_crate(p).is_some() {
         sel.add_preflight("cargo-test");
-        sel.add_preflight("local-source-digests");
         sel.add_target("check");
         sel.add_target("recipe-checks");
         return;
@@ -1442,8 +1437,8 @@ fn map_path(root: &Path, roster: &Result<Vec<GateCrate>, String>, p: &str, sel: 
     // The editor is a static target recipe with a realized-output check
     // (td-editor-test), so a source edit changes a target artifact: the host
     // preflight still holds its gate 325 lock/test/clippy obligations, and
-    // recipe-checks holds the static link and the headless modes. The digest
-    // preflight came from the sibling-tree arm above.
+    // recipe-checks holds the static link and the headless modes. Its staged
+    // identity is re-derived live, so no local-source preflight is selected.
     if p.starts_with("td-editor/") && !p.contains("..") {
         sel.add_preflight("cargo-test");
         sel.add_target("check");
@@ -1650,7 +1645,9 @@ fn preflight_cmd(root: &Path, name: &str, changed: &[String]) -> Option<String> 
             Some("  CC=gcc cargo test --frozen --manifest-path net/Cargo.toml".to_string())
         }
         "affected-self-test" => Some("  td-builder affected-checks --self-test".to_string()),
-        "local-source-digests" => Some("  td-recipe-eval local-source-digests".to_string()),
+        "local-source-roster" => {
+            Some("  td-recipe-eval local-source-roster --check".to_string())
+        }
         _ => None,
     }
 }
@@ -2086,6 +2083,18 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     assert_target!("recipes/src/recipes/make-test.rs", "recipe-checks");
     assert_target!("recipes/build.rs", "recipe-rs");
     assert_target!("recipes/Cargo.toml", "recipe-rs");
+    // A recipe file can add, remove, or rename a `local_source`/
+    // `local_source_trees` declaration, which moves a
+    // seed/local-source-roster.txt row (re #469 local-source-roster split) —
+    // this is the ONLY class of edit that selects the roster preflight; an
+    // edit inside a staged tree itself must not (asserted throughout above).
+    assert_preflight!("recipes/src/recipes/td-portal.rs", "local-source-roster");
+    assert_preflight!("recipes/src/catalog.rs", "local-source-roster");
+    assert_preflight!("seed/local-source-roster.txt", "local-source-roster");
+    // A roster row change shifts what BOTH planners admit for that key, exactly
+    // like a seed/seed-digests.txt row change — the build gates must run too
+    // (found in review: this arm omitted them while its sibling arms did not).
+    assert_target!("seed/local-source-roster.txt", "build-recipes");
     assert_target!("builder/src/gate_defs/207-recipe-rs.rs", "recipe-rs");
     // The td-builder build engine (its own src) rides the check-engine smoke.
     assert_target!("builder/src/main.rs", "check-engine");
@@ -2100,16 +2109,18 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     assert_contains!("engine/src/gzip.rs", "source extraction");
     assert_preflight!("engine/src/ostree.rs", "net-test");
     assert_preflight!("engine/src/lib.rs", "net-test");
-    // The three trees staged into td-net's seed reach the digest preflight.
-    assert_preflight!("engine/src/lib.rs", "local-source-digests");
-    assert_preflight!("engine/src/json.rs", "local-source-digests");
-    assert_preflight!("engine/src/gzip.rs", "local-source-digests");
-    // A document under engine/ or td-boot/ matches no arm of theirs and
-    // falls to the docs arm; retained prose still moves the row. (net/'s own arm
-    // catches every path beneath it first.)
-    assert_preflight!("engine/README.md", "local-source-digests");
-    assert_no_preflight!("engine/DESIGN.md", "local-source-digests");
-    assert_preflight!("td-boot/README.md", "local-source-digests");
+    // The three trees staged into td-net's seed are re-derived LIVE from the
+    // checkout (re #469 local-source-roster split): an edit inside them
+    // selects no local-source preflight.
+    assert_no_preflight!("engine/src/lib.rs", "local-source-roster");
+    assert_no_preflight!("engine/src/json.rs", "local-source-roster");
+    assert_no_preflight!("engine/src/gzip.rs", "local-source-roster");
+    // A document under engine/ or td-boot/ matches no arm of theirs and falls
+    // to the docs arm, which selects nothing. (net/'s own arm catches every
+    // path beneath it first.)
+    assert_no_preflight!("engine/README.md", "local-source-roster");
+    assert_no_preflight!("engine/DESIGN.md", "local-source-roster");
+    assert_no_preflight!("td-boot/README.md", "local-source-roster");
     assert_target!(
         "engine/tests/fixtures/flathub-firefox-154.commit.hex",
         "check-engine"
@@ -2363,8 +2374,8 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     assert_preflight!("net/src/ostree.rs", "net-test");
     assert_preflight!("net/src/http.rs", "net-test");
     assert_preflight!("net/Cargo.toml", "net-test");
-    assert_preflight!("net/src/fetchd.rs", "local-source-digests");
-    assert_preflight!("net/Cargo.lock", "local-source-digests");
+    assert_no_preflight!("net/src/fetchd.rs", "local-source-roster");
+    assert_no_preflight!("net/Cargo.lock", "local-source-roster");
     assert_contains!(
         "net/src/ostree.rs",
         "CC=gcc cargo test --frozen --manifest-path net/Cargo.toml"
@@ -2401,34 +2412,32 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     assert_target!("td-portal/Cargo.lock", "check");
     assert_target!("td-portal/Cargo.lock", "recipe-checks");
     // td-portal builds from `local_source_trees(&["td-secret", "td-busd",
-    // "td-compositor", "engine", "td-ui"])`. Retained inputs in the portal
-    // tree or in a sibling seed tree move the
-    // `td-portal-source` digest row and must reach the digest preflight —
-    // source, manifest, and retained documentation (engine and td-ui already carry
-    // their own reader arms above). td-seatd shares the compositor's crate arm
-    // but is NOT a portal seed tree, so its edits must NOT select the digest
-    // preflight.
-    assert_preflight!("td-portal/src/main.rs", "local-source-digests");
-    assert_preflight!("td-portal/Cargo.lock", "local-source-digests");
-    assert_preflight!("td-busd/src/wire.rs", "local-source-digests");
-    assert_preflight!("td-compositor/src/font.rs", "local-source-digests");
-    assert_no_preflight!("td-compositor/DESIGN.md", "local-source-digests");
-    assert_preflight!("td-secret/src/sys.rs", "local-source-digests");
-    // td-ui joined the portal seed trees in 7(c): the file chooser depends on
-    // the toolkit by path, so staged td-ui/ edits re-hash the td-portal-source
-    // row and reach the digest preflight, on top of its own reader arm.
-    assert_preflight!("td-ui/src/raster.rs", "local-source-digests");
-    assert_preflight!("td-ui/src/chrome.rs", "local-source-digests");
-    assert_preflight!("td-ui/Cargo.toml", "local-source-digests");
-    assert_no_preflight!("td-ui/DESIGN.md", "local-source-digests");
-    assert_no_preflight!("td-seatd/src/main.rs", "local-source-digests");
-    // td-editor stages td-ui and td-compositor beside itself, so its own
-    // retained inputs move the `td-editor-source` row, and the static link
-    // plus the headless modes are proven by td-editor-test on recipe-checks.
-    assert_preflight!("td-editor/src/main.rs", "local-source-digests");
-    assert_preflight!("td-editor/Cargo.lock", "local-source-digests");
-    assert_preflight!("td-editor/tests/core.rs", "local-source-digests");
-    assert_no_preflight!("td-editor/DESIGN.md", "local-source-digests");
+    // "td-compositor", "engine", "td-ui"])`. That identity is re-derived LIVE
+    // from the checkout by both td-recipe-eval and td-builder on every run
+    // (re #469 local-source-roster split), so retained inputs in the portal
+    // tree or a sibling seed tree select no local-source preflight — only a
+    // declaration change (recipes/src/recipes/td-portal.rs) would.
+    assert_no_preflight!("td-portal/src/main.rs", "local-source-roster");
+    assert_no_preflight!("td-portal/Cargo.lock", "local-source-roster");
+    assert_no_preflight!("td-busd/src/wire.rs", "local-source-roster");
+    assert_no_preflight!("td-compositor/src/font.rs", "local-source-roster");
+    assert_no_preflight!("td-compositor/DESIGN.md", "local-source-roster");
+    assert_no_preflight!("td-secret/src/sys.rs", "local-source-roster");
+    // td-ui joined the portal seed trees in 7(c); it is a portal sibling AND
+    // a td-taskmgr/td-editor sibling, and every one of those identities is
+    // re-derived live too.
+    assert_no_preflight!("td-ui/src/raster.rs", "local-source-roster");
+    assert_no_preflight!("td-ui/src/chrome.rs", "local-source-roster");
+    assert_no_preflight!("td-ui/Cargo.toml", "local-source-roster");
+    assert_no_preflight!("td-ui/DESIGN.md", "local-source-roster");
+    assert_no_preflight!("td-seatd/src/main.rs", "local-source-roster");
+    // td-editor stages td-ui and td-compositor beside itself; its own retained
+    // inputs select no local-source preflight either, and the static link plus
+    // the headless modes are proven by td-editor-test on recipe-checks.
+    assert_no_preflight!("td-editor/src/main.rs", "local-source-roster");
+    assert_no_preflight!("td-editor/Cargo.lock", "local-source-roster");
+    assert_no_preflight!("td-editor/tests/core.rs", "local-source-roster");
+    assert_no_preflight!("td-editor/DESIGN.md", "local-source-roster");
     assert_preflight!("td-editor/src/main.rs", "cargo-test");
     assert_target!("td-editor/src/main.rs", "check");
     assert_target!("td-editor/src/main.rs", "recipe-checks");
@@ -2459,17 +2468,18 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     assert_target!("td-sh/spec/smoke.test.sh", "recipe-checks");
 
     // td-news: a toolkit consumer staged as its own seed beside the trees it
-    // draws through. Retained paths move the digest row; the source takes
-    // the cargo-test preflight and the realized-output proofs.
+    // draws through. Its staged identity is re-derived live, so retained
+    // paths select no local-source preflight; the source takes the
+    // cargo-test preflight and the realized-output proofs.
     assert_target!("td-news/src/main.rs", "check");
     assert_target!("td-news/src/main.rs", "recipe-checks");
     assert_target!("td-news/src/tui/window.rs", "recipe-checks");
     assert_target!("td-news/Cargo.toml", "recipe-checks");
     assert_preflight!("td-news/src/main.rs", "cargo-test");
     assert_preflight!("td-news/tests/cli_integration.rs", "cargo-test");
-    assert_preflight!("td-news/src/main.rs", "local-source-digests");
-    assert_preflight!("td-news/README.md", "local-source-digests");
-    assert_preflight!("td-news/Cargo.lock", "local-source-digests");
+    assert_no_preflight!("td-news/src/main.rs", "local-source-roster");
+    assert_no_preflight!("td-news/README.md", "local-source-roster");
+    assert_no_preflight!("td-news/Cargo.lock", "local-source-roster");
     // td-mail: the same shape, the same routing.
     assert_target!("td-mail/src/main.rs", "check");
     assert_target!("td-mail/src/main.rs", "recipe-checks");
@@ -2477,21 +2487,21 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     assert_target!("td-mail/Cargo.toml", "recipe-checks");
     assert_preflight!("td-mail/src/main.rs", "cargo-test");
     assert_preflight!("td-mail/tests/cli_integration.rs", "cargo-test");
-    assert_preflight!("td-mail/src/main.rs", "local-source-digests");
-    assert_preflight!("td-mail/README.md", "local-source-digests");
-    assert_preflight!("td-mail/Cargo.lock", "local-source-digests");
+    assert_no_preflight!("td-mail/src/main.rs", "local-source-roster");
+    assert_no_preflight!("td-mail/README.md", "local-source-roster");
+    assert_no_preflight!("td-mail/Cargo.lock", "local-source-roster");
 
     // td-install-qemu-test: a standalone std-only crate staged as its own
-    // seed. Retained paths — the sources, the manifest and lock — move the
-    // digest row, and the source paths also take the static-link proof
-    // through recipe-checks.
+    // seed, re-derived live: retained paths — the sources, the manifest and
+    // lock — select no local-source preflight, and the source paths take
+    // the static-link proof through recipe-checks.
     assert_target!("td-install-qemu-test/src/main.rs", "check");
     assert_target!("td-install-qemu-test/src/main.rs", "recipe-checks");
     assert_target!("td-install-qemu-test/src/protocol.rs", "recipe-checks");
     assert_target!("td-install-qemu-test/Cargo.toml", "recipe-checks");
     assert_preflight!("td-install-qemu-test/src/main.rs", "cargo-test");
-    assert_preflight!("td-install-qemu-test/src/main.rs", "local-source-digests");
-    assert_preflight!("td-install-qemu-test/Cargo.lock", "local-source-digests");
+    assert_no_preflight!("td-install-qemu-test/src/main.rs", "local-source-roster");
+    assert_no_preflight!("td-install-qemu-test/Cargo.lock", "local-source-roster");
 
     // td-txt mirrors td-sh: standalone std-only crate, main.rs + modules
     // include_str!'d into the recipe, corpus DATA under spec/ (including the
@@ -2538,7 +2548,12 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     assert_target!("td-firstboot/Cargo.lock", "check");
     assert_target!("td-firstboot/Cargo.lock", "recipe-checks");
     assert_target!("td-firstboot/clippy.toml", "check");
-    assert_preflight!("seed/seed-digests.txt", "local-source-digests");
+    // seed-digests.txt no longer covers local sources (re #469 local-source-roster
+    // split): it selects cargo-test + recipe-rs + the build gates, never the
+    // roster preflight. The roster file's own row is asserted by the
+    // seed/local-source-roster.txt cases above in this function.
+    assert_no_preflight!("seed/seed-digests.txt", "local-source-roster");
+    assert_preflight!("seed/seed-digests.txt", "cargo-test");
     // td-init mirrors td-util, including its confined syscall module: every source
     // is include_str!'d into the td-init recipe, so host cargo preflight
     // + the recipe-checks static-link proof.
@@ -2689,9 +2704,9 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     assert_target!("td-netd/Cargo.toml", "recipe-checks");
     assert_target!("td-boot/src/main.rs", "check");
     assert_target!("td-boot/src/main.rs", "recipe-checks");
-    assert_preflight!("td-boot/src/main.rs", "local-source-digests");
-    assert_preflight!("td-boot/src/protocol.rs", "local-source-digests");
-    assert_preflight!("td-boot/src/realfile.rs", "local-source-digests");
+    assert_no_preflight!("td-boot/src/main.rs", "local-source-roster");
+    assert_no_preflight!("td-boot/src/protocol.rs", "local-source-roster");
+    assert_no_preflight!("td-boot/src/realfile.rs", "local-source-roster");
     assert_target!("td-boot/Cargo.toml", "check");
     assert_target!("td-boot/Cargo.toml", "recipe-checks");
     // protocol.rs is the deployment contract three OTHER trees compile: two
@@ -4599,25 +4614,18 @@ fn run_preflight(root: &Path, name: &str, changed: &[String]) -> i32 {
                 1
             }
         }
-        // Re-hash every `local_source` tree and compare it to the row
-        // seed/seed-digests.txt pins (re #469). Cheap by construction — the bytes are
-        // already in the checkout, so there is no fetch and no ladder — which is why
-        // this can be a preflight while the fetched pins' equivalent (`seed-digests`,
-        // whole universe, warm cache required) cannot. The key-set coverage unit test
-        // does not overlap it: an edited local source keeps its key, so coverage stays
-        // green while the row describes a tree that no longer exists.
-        // td-recipe-eval hashes through td-builder, so hand it THIS binary rather than
-        // rebuilding one: cargo would be replacing the executable it is running from,
-        // and a stale one would not matter anyway — td-builder only NAR-hashes here;
-        // the compiled table being checked is td-recipe-eval's, which cargo rebuilds.
-        "local-source-digests" => {
-            let cmd = "cargo run --release --frozen --quiet --manifest-path recipes/Cargo.toml \
-                       --bin td-recipe-eval -- local-source-digests";
-            match std::env::current_exe().ok().and_then(|p| shell_quote(&p)) {
-                Some(tb) => run_shell(root, &format!("TD_BUILDER_SELF={tb} {cmd}")),
-                None => run_shell(root, cmd),
-            }
-        }
+        // Verify the committed seed/local-source-roster.txt still matches the
+        // catalog's `local_source`/`local_source_trees` declarations (re #469
+        // local-source-roster split). Cheap by construction: a pure catalog
+        // walk, no fetch, no ladder, no NAR hash — unlike the fetched pins'
+        // `seed-digests` (whole universe, warm cache required), this can be a
+        // preflight. It reds naming the stale key/row; regenerate with
+        // `td-recipe-eval local-source-roster > seed/local-source-roster.txt`.
+        "local-source-roster" => run_shell(
+            root,
+            "cargo run --release --frozen --quiet --manifest-path recipes/Cargo.toml \
+             --bin td-recipe-eval -- local-source-roster --check",
+        ),
         _ => 0,
     }
 }
@@ -4865,6 +4873,11 @@ mod tests {
             "td-mail/DESIGN.md",
             "td-news/DESIGN.md",
             "td-install-qemu-test/DESIGN.md",
+            // A retained document inside a local-source tree used to always
+            // select the (now-removed) local-source-digests preflight; that
+            // identity is re-derived live (re #469 local-source-roster
+            // split), so this now selects nothing, like any other doc.
+            "engine/README.md",
         ] {
             let args = vec!["--path".into(), path.into(), "--run".into()];
             assert_eq!(
@@ -4874,7 +4887,6 @@ mod tests {
             );
         }
         for path in [
-            "engine/README.md",
             "td-profiler/DESIGN.md",
             "td-review/src/main.rs",
             "unknown.rs",
@@ -7364,7 +7376,7 @@ mod tests {
                 output.contains("--workspace (builder/recipes/engine)"),
                 "{path}: {output}"
             );
-            assert!(output.contains("local-source-digests"), "{path}: {output}");
+            assert!(!output.contains("local-source-roster"), "{path}: {output}");
             assert!(output.contains("td-builder check"), "{path}: {output}");
             assert!(output.contains("recipe-checks"), "{path}: {output}");
         }
@@ -7402,7 +7414,7 @@ mod tests {
                 output.contains("--workspace (builder/recipes/engine)"),
                 "{path}: {output}"
             );
-            assert!(output.contains("local-source-digests"), "{path}: {output}");
+            assert!(!output.contains("local-source-roster"), "{path}: {output}");
             assert!(output.contains("td-builder check"), "{path}: {output}");
             assert!(output.contains("recipe-checks"), "{path}: {output}");
             assert!(!output.contains("discovered crate"), "{path}: {output}");
@@ -7439,8 +7451,8 @@ mod tests {
         // td-review's do: the builder's tests read every roster lock and
         // manifest, so a change to the editor's can red them. Since the
         // editor is a target recipe staged whole (td-editor-source), every
-        // retained input also moves its digest row and takes the static-link
-        // proof through recipe-checks, as td-taskmgr's do.
+        // retained input is re-derived live (no local-source preflight) and
+        // takes the static-link proof through recipe-checks, as td-taskmgr's.
         for path in editor_paths {
             let output = path_output(&root, path);
             assert!(
@@ -7448,14 +7460,15 @@ mod tests {
                     && output.contains("--manifest-path td-editor/Cargo.toml"),
                 "{path}: {output}"
             );
-            assert!(output.contains("local-source-digests"), "{path}: {output}");
+            assert!(!output.contains("local-source-roster"), "{path}: {output}");
             assert!(output.contains("td-builder check"), "{path}: {output}");
             assert!(output.contains("recipe-checks"), "{path}: {output}");
         }
-        // Retained documentation moves the row too; DESIGN.md alone is
-        // excluded from staging and selects nothing.
+        // Retained documentation still enters the staged tree, but that
+        // identity is re-derived live (re #469 local-source-roster split), so
+        // it selects nothing; DESIGN.md alone is excluded from staging too.
         let readme = path_output(&root, "td-editor/README.md");
-        assert!(readme.contains("local-source-digests"), "{readme}");
+        assert!(!readme.contains("local-source-roster"), "{readme}");
         assert!(!readme.contains("td-builder check"), "{readme}");
         let docs = path_output(&root, "td-editor/DESIGN.md");
         assert!(docs.contains("Selected checks: none"), "{docs}");

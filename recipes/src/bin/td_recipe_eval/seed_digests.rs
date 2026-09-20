@@ -1,6 +1,6 @@
-//! The COMPILED seed-digest table (re #469): every admissible seed input's
-//! expected store basename, compiled into both td-recipe-eval and td-builder
-//! from the same audited repo file.
+//! The COMPILED seed-digest table (re #469): every admissible FETCHED or
+//! HOST-GENERATED seed input's expected store basename, compiled into both
+//! td-recipe-eval and td-builder from the same audited repo file.
 //!
 //! `seed/seed-digests.txt` maps each classified seed KEY to the store
 //! basename (`<hash>-<name>`) its pinned bytes derive — the content address
@@ -17,6 +17,16 @@
 //!   forged MAP/SEED-STORE/SEED-DB triple — internally consistent but never
 //!   derived from the pins — reds at lock synthesis even when td-builder is
 //!   invoked directly (the authority is compiled in, not caller-supplied).
+//!
+//! Local sources (`local_source`/`local_source_trees` recipes) are NOT in
+//! this table (re #469 local-source-roster split): their bytes are the
+//! checkout itself, so a committed content hash goes stale on every ordinary
+//! source edit — the whole reason this split exists (105 commits touching
+//! this file; one row rewritten 29 times). They are declaration-pinned
+//! instead by `seed/local-source-roster.txt` (see `local_source_roster.rs`)
+//! and re-derived live by both sides; `require` below refuses outright if
+//! asked about one, so a routing mistake reds loudly instead of silently
+//! comparing against the wrong table.
 //!
 //! Regenerate with `td-recipe-eval seed-digests > seed/seed-digests.txt`
 //! (warm source cache required) whenever a pin, a seed patch, or the stage0
@@ -96,7 +106,21 @@ pub(crate) fn expected(key: &str) -> Result<Option<&'static str>, String> {
 /// Enforce the table against a freshly DERIVED basename: the key must be
 /// pinned and the derivation must reproduce the pinned basename. Reds with a
 /// `provenance rejected` planning error otherwise (re #469).
+///
+/// Refuses OUTRIGHT when `key` is a local-source-roster key (re #469
+/// local-source-roster split): a local source is declaration-pinned by
+/// `seed/local-source-roster.txt` and re-derived live, never by a row in
+/// THIS table, so asking here about one is a routing bug, not a provenance
+/// question this function can answer.
 pub(crate) fn require(key: &str, derived_basename: &str) -> Result<(), String> {
+    if crate::local_source_roster::expected(key)?.is_some() {
+        return Err(format!(
+            "seed `{key}' is a local-source-roster key — seed_digests::require must not be \
+             asked about a local source, which is declaration-pinned by \
+             seed/local-source-roster.txt and re-derived live, never by a seed/seed-digests.txt \
+             row (re #469 local-source-roster split)"
+        ));
+    }
     match expected(key)? {
         None => Err(format!(
             "provenance rejected: seed `{key}' has no compiled expected digest in \
@@ -148,5 +172,21 @@ mod tests {
         let err = require(some_key, "0000000000000000000000000000000-not-it").unwrap_err();
         assert!(err.contains("provenance rejected"), "{err}");
         assert!(err.contains("the compiled table pins"), "{err}");
+    }
+
+    // require() must refuse OUTRIGHT for a local-source-roster key, whatever
+    // basename is supplied — the two tables are disjoint identity sources, and a
+    // stray call here would silently route a local source through the wrong one
+    // (re #469 local-source-roster split).
+    #[test]
+    fn require_refuses_a_local_source_roster_key() {
+        let roster_key = crate::local_source_roster::rows()
+            .unwrap()
+            .first()
+            .map(|(k, _, _)| k.to_string())
+            .expect("the compiled roster must pin at least one local source");
+        let err = require(&roster_key, "does-not-matter").unwrap_err();
+        assert!(err.contains("local-source-roster"), "{err}");
+        assert!(!err.contains("provenance rejected"), "{err}");
     }
 }
