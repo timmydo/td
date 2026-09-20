@@ -125,8 +125,11 @@ mod tests {
             "let human = child(&home, account.name(), HUMAN, true)?;",
             "let source = child(&human, \"Downloads\", HUMAN, false)?;",
         ] { assert!(grant.contains(step), "{step}"); }
-        assert!(SYSTEM_X86_64_RS
-            .contains("const FIREFOX_DOWNLOAD_SOURCE: &str = \"/var/home/tester/Downloads\";"));
+        let init = super::super::system_x86_64::deployment_init_fixture();
+        assert!(init.contains(
+            "primary_home=$(/bin/td-firstboot prepare-primary-home /sysroot) || exit 1"
+        ));
+        assert!(init.contains("downloads=\"$primary_home/Downloads\""));
         assert!(SYSTEM_X86_64_RS.contains(
             r#"user_pref(\\\"browser.download.dir\\\", \\\"/home/td/Downloads\\\");"#
         ));

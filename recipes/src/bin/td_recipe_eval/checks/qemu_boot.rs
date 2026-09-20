@@ -9228,13 +9228,10 @@ mod tests {
         assert!(
             system.contains("const FIREFOX_DOWNLOAD_FIXTURE: &str = \"TD-FIREFOX-DOWNLOAD-V1\";")
         );
-        assert!(system
-            .contains("const FIREFOX_DOWNLOAD_SOURCE: &str = \"/var/home/tester/Downloads\";"));
         assert!(system.contains("https://localhost:8443/content.html"));
         assert!(system.contains("$origin/content-alt.html"));
         assert!(system.contains("<a id=td-download href=download.txt "));
         assert!(system.contains("download=td-firefox-download.txt>Download</a>"));
-        assert!(system.contains("/var/home/tester/Downloads/td-firefox-download.txt"));
         let terminal = include_str!("../../../../../td-compositor/src/term_client.rs");
         assert!(terminal.contains("TD-TERM-CLIPBOARD-TARGET-READY"));
         assert!(terminal.contains("TD-TERM-CLIPBOARD-FOCUS-READY"));
