@@ -438,8 +438,8 @@ const SHIPPED_APPLICATIONS: &[ShippedApplication] = &[
     },
     // Claude Code: a marked foreign payload on the freedesktop runtime, run as
     // a terminal application with no bus name — the first foreign-payload
-    // terminal program, beside Firefox's foreign non-terminal one and the
-    // source-built terminal mail/news.
+    // terminal program, beside Firefox's foreign non-terminal one, the
+    // source-built terminal mail and the source-built td-ui window news.
     ShippedApplication {
         name: CLAUDE_NAME,
         package: CLAUDE_NAME,
@@ -1212,6 +1212,15 @@ fn build_inittab() -> String {
 /// the shape check would still validate it, both exiting 0.
 const TD_SVC_CONF: &str = "/etc/td-svc.conf";
 
+/// A window record of the compositor's layout report up to its app id,
+/// as a basic regular expression: every field before the title is one
+/// word, since the report replaces whitespace in an app id and a handle
+/// never has any, so a match pins the app id to its own field and a
+/// title, which keeps its spaces and equals signs, cannot forge one.
+const WINDOW_RECORD: &str = "^window id=[^ ]* object=[^ ]* workspace=[^ ]* x=[^ ]* y=[^ ]* \
+                             width=[^ ]* height=[^ ]* visible=[^ ]* focused=[^ ]* \
+                             fullscreen=[^ ]* floating=[^ ]* parent=[^ ]* app_id=";
+
 /// The td-term terminfo entry as the image stages it: the one store file
 /// td-jail admits at a fixed mode, `0444`, which the staging copy loses and
 /// the mode-fixing step restores; the root-tree check reads it back.
@@ -1730,14 +1739,18 @@ fn build_td_svc_conf() -> String {
          requires=mail\n\
          timeout={application_evidence}\n\
          \n\
-         # The second terminal application: as mail, in a window of its own.\n\
+         # The news reader: a td-ui window of its own, launched direct as\n\
+         # Firefox is, with no terminal. Ready once the compositor's report\n\
+         # shows its toplevel, which the client names by app id; a client\n\
+         # that could not open its window is a unit that never becomes\n\
+         # ready, as one that could not open its pty was.\n\
          [news]\n\
          type=daemon\n\
          cgroup=session\n\
-         exec=/bin/td-authd application-start {ui_uid} {news_name} terminal --\n\
-         after=terminal,busd,news-fetch,applications-workspace\n\
+         exec=/bin/td-authd application-start {ui_uid} {news_name} direct --\n\
+         after=busd,news-fetch,applications-workspace\n\
          requires=wayland,busd,news-fetch,td-firstboot\n\
-         ready=/bin/td-login exec-service-as tda65538 -- /bin/td-term probe /run/user/65538/td-app-news.ready\n\
+         ready=/bin/sh -c 'layout=$(/bin/td-login exec-primary -- /bin/td-ctl --socket {control_socket} layout) && /bin/echo \"$layout\" | /bin/grep -q \"{window_record}{news_program} title=\"'\n\
          ready-timeout=30\n\
          restart=never\n\
          \n\
@@ -2005,6 +2018,7 @@ fn build_td_svc_conf() -> String {
         news_name = TD_NEWS_NAME,
         mail_program = entry_program(TD_MAIL_ENTRY),
         news_program = entry_program(TD_NEWS_ENTRY),
+        window_record = WINDOW_RECORD,
         mail_marker = TD_MAIL_BOOT_MARKER,
         news_marker = TD_NEWS_BOOT_MARKER,
         fetch_marker = TD_FETCH_BOOT_MARKER,
@@ -6625,9 +6639,24 @@ news\tnews-0.1\tsource\tstatic-runtime-1\tsource\n"
             let program = entry_program(entry);
             let exec = unit_key(unit, "exec").unwrap_or_default();
             let uid = if name == "mail" { 65537 } else { 65538 };
-            assert_eq!(exec, format!("/bin/td-authd application-start {UI_UID} {name} terminal --"));
             let ready = unit_key(unit, "ready").unwrap_or_default();
-            assert_eq!(ready, format!("/bin/td-login exec-service-as tda{uid} -- /bin/td-term probe /run/user/{uid}/td-app-{name}.ready"));
+            if name == "mail" {
+                // Still a terminal application: td-term's pty, and its ready
+                // socket as the proof the program has it.
+                assert_eq!(exec, format!("/bin/td-authd application-start {UI_UID} {name} terminal --"));
+                assert_eq!(ready, format!("/bin/td-login exec-service-as tda{uid} -- /bin/td-term probe /run/user/{uid}/td-app-{name}.ready"));
+            } else {
+                // A td-ui window of its own, launched direct as Firefox is;
+                // ready is the compositor's report naming its toplevel by
+                // the app id the client sets, which is the program's name.
+                assert_eq!(exec, format!("/bin/td-authd application-start {UI_UID} {name} direct --"));
+                assert_eq!(
+                    ready,
+                    format!(
+                        "/bin/sh -c 'layout=$(/bin/td-login exec-primary -- /bin/td-ctl --socket {CONTROL_SOCKET} layout) && /bin/echo \"$layout\" | /bin/grep -q \"{WINDOW_RECORD}{program} title=\"'"
+                    )
+                );
+            }
             assert_eq!(unit_key(&format!("{name}-fetch"), "exec"), Some(format!("/bin/td-login exec-service-as tda{uid} -- /bin/td-fetchd run --socket /run/user/{uid}/td-fetch/socket")));
             assert_eq!(unit_key(unit, "type").as_deref(), Some("daemon"), "{unit}");
             assert_eq!(unit_key(unit, "restart").as_deref(), Some("never"), "{unit}");
@@ -6646,7 +6675,7 @@ news\tnews-0.1\tsource\tstatic-runtime-1\tsource\n"
                 if unit == "mail" {
                     vec!["terminal", "busd", "portal", "mail-fetch", "mail-files", "applications-workspace", "firefox-tls-setup"]
                 } else {
-                    vec!["terminal", "busd", "news-fetch", "applications-workspace"]
+                    vec!["busd", "news-fetch", "applications-workspace"]
                 },
                 "{unit}"
             );
@@ -7249,7 +7278,7 @@ news\tnews-0.1\tsource\tstatic-runtime-1\tsource\n"
             ("mail-evidence", vec!["mail", "firefox-tls-setup"]),
             (
                 "news",
-                vec!["terminal", "busd", "news-fetch", "applications-workspace"],
+                vec!["busd", "news-fetch", "applications-workspace"],
             ),
             ("news-evidence", vec!["news", "firefox-tls-setup"]),
             ("shell-workspace", vec!["mail", "news"]),
@@ -7316,7 +7345,7 @@ news\tnews-0.1\tsource\tstatic-runtime-1\tsource\n"
     /// host pid, and the descriptor budget is charged per admission key. What
     /// remains is that no boot oracle drives two applications' traffic on one
     /// live bus: the entry that lifts this count brings that oracle. The
-    /// terminal applications ship with no bus policy at all: mail and news are
+    /// other applications ship with no bus policy at all: mail and news are
     /// static td-owned programs, Claude is a foreign payload, none with a
     /// D-Bus client, which the broker would admit as a peer that sees and
     /// addresses only the portal and itself, and the two surfaces it could
@@ -7352,12 +7381,13 @@ news\tnews-0.1\tsource\tstatic-runtime-1\tsource\n"
              drives yet: the entry that lifts this count brings the oracle. \
              See APPLICATIONS.md §D for the limits of this tripwire"
         );
-        // Every other shipped application holds no bus name and is a terminal
-        // application the broker would admit as a peer that sees and addresses
-        // only the portal and itself. mail and news are td-owned source builds
-        // on the data-only static runtime; Claude is the reviewed foreign payload on
-        // Firefox's runtime, the first foreign-payload terminal application, so
-        // the runtime is one of those two reviewed families.
+        // Every other shipped application holds no bus name; the broker
+        // would admit it as a peer that sees and addresses only the portal
+        // and itself. mail and news are td-owned source builds on the
+        // data-only static runtime, mail in a terminal and news in a td-ui
+        // window; Claude is the reviewed foreign payload on Firefox's
+        // runtime, the first foreign-payload terminal application, so the
+        // runtime is one of those two reviewed families.
         for application in SHIPPED_APPLICATIONS
             .iter()
             .filter(|application| application.name != FIREFOX_NAME)
@@ -7368,12 +7398,19 @@ news\tnews-0.1\tsource\tstatic-runtime-1\tsource\n"
                 .as_ref()
                 .expect("a shipped application declares its permissions");
             assert_eq!(permissions.session_bus().count(), 0, "{}", application.name);
-            assert!(permissions.terminal(), "{} is a terminal application", application.name);
+            // news draws in a td-ui window of its own and holds no terminal;
+            // mail and Claude are terminal applications still.
+            assert_eq!(
+                permissions.terminal(),
+                application.name != TD_NEWS_NAME,
+                "{} terminal grant",
+                application.name
+            );
             let foreign_terminal = application.name == CLAUDE_NAME
                 && application.runtime == "freedesktop-platform-25-08";
             assert!(
                 application.runtime == "static-runtime" || foreign_terminal,
-                "{} is neither a source-built static-runtime terminal app nor the \
+                "{} is neither a source-built static-runtime app nor the \
                  reviewed foreign-payload terminal app Claude",
                 application.name
             );
@@ -8612,7 +8649,7 @@ news\tnews-0.1\tsource\tstatic-runtime-1\tsource\n"
                 (CLAUDE_NAME, CLAUDE_NAME, "freedesktop-platform-25-08"),
             ],
             "the system image pairs each reviewed package with its runtime: \
-             Firefox, the terminal apps mail and news, then the Claude payload"
+             Firefox, the source-built mail and news, then the Claude payload"
         );
         let system_recipe = recipe();
         assert_eq!(

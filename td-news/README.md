@@ -1,16 +1,21 @@
 # Timmy's News
 
-`td-news` (Timmy's News) is a Rust terminal news reader for RSS/Atom feeds. It fetches feeds,
-caches articles in a small key/value store, and provides a keyboard/mouse-first TUI.
+`td-news` (Timmy's News) is a Rust news reader for RSS/Atom feeds. It fetches
+feeds, caches articles in a small key/value store, and shows them in a
+keyboard/mouse-first window drawn in rows and columns of text, a td-ui cell
+screen presented as a Wayland toplevel of its own.
 
 ## Dependencies
 
-None. `td-news` is the Rust standard library and nothing else: JSON, TOML, XML,
-HTML rendering, the cache, dates and the terminal are td's shared `std`
-modules under `src/`, copied whole from one master each. Fetching is not
-done here at all — `td-news` asks td's fetch service over the unix socket at
+td-ui, td's dependency-free UI toolkit, by path, and the Rust standard
+library: JSON, TOML, XML, HTML rendering, the cache and dates are td's
+shared `std` modules under `src/`, copied whole from one master each, and
+the window is td-ui's `screen_app`. Fetching is not done here at all —
+`td-news` asks td's fetch service over the unix socket at
 `$XDG_RUNTIME_DIR/td-fetch/socket`, which holds the TLS, the resolver and
-the timeouts, and without it no feed can be fetched.
+the timeouts, and without it no feed can be fetched. The window needs a
+Wayland compositor: `WAYLAND_SOCKET`, or `WAYLAND_DISPLAY` under
+`XDG_RUNTIME_DIR`, as td-ui's clients find it.
 
 ## Build / Run
 

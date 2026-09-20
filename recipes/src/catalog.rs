@@ -183,7 +183,6 @@ mod tests {
             "td-login",
             "td-mail",
             "td-netd",
-            "td-news",
             "td-photo-test",
             "td-profiler",
             "td-seatd",
@@ -407,6 +406,7 @@ mod tests {
                 "td-busd",
                 "td-compositor",
                 "td-editor",
+                "td-news",
                 "td-photo",
                 "td-portal",
                 "td-secret",
@@ -418,7 +418,7 @@ mod tests {
         lone.dedup();
         assert_eq!(
             lone,
-            ["td-install-qemu-test", "td-mail", "td-news"],
+            ["td-install-qemu-test", "td-mail"],
             "a lone local-source crate joined; add it to builder/src/affected.rs local_source_crate"
         );
     }

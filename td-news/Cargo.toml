@@ -2,20 +2,18 @@
 name = "td-news"
 version = "0.1.0"
 edition = "2021"
-description = "Timmy's News: a terminal RSS and Atom reader, td's news application"
+description = "Timmy's News: an RSS and Atom reader in a td-ui window, td's news application"
 license = "MIT"
 
-# The SHIPPED reader is this one bin, compiled directly by rustc from td's
-# recipe (never `cargo build`) into a static executable.
 [[bin]]
 name = "td-news"
 path = "src/main.rs"
 
 # td-news is a TARGET-built application, NOT part of td's control-plane engine
-# workspace. It is standalone — its own workspace root — with its own
-# one-self-entry lock. No dependencies, and staying that way: td-news is `std`
-# alone (td's AGENTS.md "std, not no_std", and APPLICATIONS.md §W.8). What
-# ten crates used to supply is now seven shared td modules under `src/`,
+# workspace. It is standalone — its own workspace root — with a lock that
+# names itself and the one sibling it draws through. Its closure is `std`
+# and td-ui (td's AGENTS.md "std, not no_std", and APPLICATIONS.md §W.8):
+# what ten crates used to supply is six shared td modules under `src/`,
 # copied whole and never edited, plus one unix socket to td's fetch service.
 #
 # From a nested checkout (a worktree that lives physically under another
@@ -34,12 +32,8 @@ todo = "deny"
 unimplemented = "deny"
 indexing_slicing = "deny"  # use .get(i) over xs[i] / &xs[a..b]
 
-# The shipped td-news is built by td's recipe invoking rustc DIRECTLY with
-# +crt-static; that recipe restates opt-level=s / panic=abort / strip. This
-# profile governs only local `cargo build --release`. lto is not set: a
-# single-crate direct rustc build cannot mirror it, so declaring it here
-# would be a contract the artifact ignores.
-[profile.release]
-opt-level = "s"
-panic = "abort"
-strip = true
+# The shared UI toolkit, by the one sibling-dependency spelling the lock
+# guard admits (AGENTS.md 'Rust code'): the screen window the reader draws
+# in reaches this crate only through `td_ui::`.
+[dependencies]
+td-ui = { path = "../td-ui" }

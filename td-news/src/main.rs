@@ -1,18 +1,18 @@
-//! td-news: a terminal RSS and Atom reader.
+//! td-news: an RSS and Atom reader in a td-ui window.
 //!
-//! The crate is `std` and nothing else. Seven modules — `civil`, `html`,
-//! `json`, `kv`, `term_sys`, `toml`, `xml` — are td's shared std modules,
-//! copied in whole from one master each and never edited here, so the
-//! import into td can diff them byte for byte against td-mail's copies. What
-//! td-news does not call therefore stays, allowed on its `mod` line rather
-//! than trimmed: a binary crate exports nothing, so `dead_code` fires
-//! here and not in the module's own crate.
+//! The crate is `std` and td-ui, the shared toolkit whose screen window it
+//! draws in. Six modules — `civil`, `html`, `json`, `kv`, `toml`, `xml` —
+//! are td's shared std modules, copied in whole from one master each and
+//! never edited here, so the import into td can diff them byte for byte
+//! against td-mail's copies. What td-news does not call therefore stays,
+//! allowed on its `mod` line rather than trimmed: a binary crate exports
+//! nothing, so `dead_code` fires here and not in the module's own crate.
 //!
-//! `unsafe` is denied for the whole crate. `term_sys` carries the single
-//! scoped allowance, over one `syscall` instruction, and its own tests
-//! assert that this file is the only other place the lint is named.
+//! `unsafe` is forbidden for the whole crate: the terminal surface the
+//! reader once carried (UNSAFE.md §18) went with the terminal, and the
+//! Wayland transport is td-ui's (§19).
 
-#![deny(unsafe_code)]
+#![forbid(unsafe_code)]
 
 mod backend;
 mod cache;
@@ -34,9 +34,6 @@ mod log;
 // Shared with td-mail, which reads response headers where td-news does not.
 #[allow(dead_code)]
 mod td_fetch;
-// The shared module carries a terminal surface wider than td-news's one raw mode.
-#[allow(dead_code)]
-mod term_sys;
 /// `tempfile`'s replacement, test-only and shared with the integration
 /// tests through a `#[path]` include.
 #[cfg(test)]

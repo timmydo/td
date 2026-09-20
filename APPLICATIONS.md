@@ -1878,7 +1878,7 @@ on missing broker substrate: the filter, names, match rules, admission, pid
 answers, descriptor budget and portal routing are all per-caller now. A second
 application with a bus name still needs reviewed service decisions and exact
 grants from the remaining bullets; it must not weaken the assertion merely
-because the broker mechanisms exist. The terminal applications — mail, news
+because the broker mechanisms exist. The other applications — mail, news
 and Claude — hold no name and did not (§D).
 
 For `td-compositor`, the minimum useful Firefox target is Software WebRender
@@ -5674,10 +5674,12 @@ its own included, by either credentials method (rung 32).
 Every one of those was a problem between PEERS, and each now has a test that
 drives it through the broker. Firefox is the one selected application that
 holds a bus name; the first-window oracle drives one peer, not two
-applications' traffic on one live bus. The terminal applications `mail`,
-`news` and `claude` ship beside it with NO bus policy: mail and news are
-static td-owned programs and Claude a foreign payload, none with a D-Bus
-client, each started by td-term at boot under the `devices=tty` grant.
+applications' traffic on one live bus. `mail`, `news` and `claude` ship
+beside it with NO bus policy: mail and news are static td-owned programs
+and Claude a foreign payload, none with a D-Bus client. Mail and Claude
+are terminal applications, each started by td-term at boot under the
+`devices=tty` grant; news draws in a td-ui window of its own and is
+started direct, as Firefox is (§W.8, "Reworked").
 Claude's oracle proves a launch, a fresh terminal and a registration on the
 live broker beside Firefox's instance, not a message between two peers. Step
 12 still binds the socket into their jails, so a compromised one could
@@ -7368,6 +7370,7 @@ Each row is one landing or a small family, leaving the tree green.
 | 32 | **a second bus-holding application's peer attribution — LANDED** in the broker, in two halves. A jailed or unproved caller is told no host pid, about itself or the broker: `GetConnectionUnixProcessID` answers `UnixProcessIdUnknown` and `GetConnectionCredentials` carries the uid without `ProcessID`, and only a caller the lineage walk proved unconfined gets one. Queued descriptors are charged to the admission key HOLDING them beside the bus's ceiling, in two counts per key with a quarter of it each: the sender's freight count until every recipient is charged, each recipient's queued count once a frame is queued to it, apart so a stall on one of a key's connections does not refuse its siblings. A recipient key at its queued share costs the sender a `LimitsExceeded` reply and nobody a connection; a sender key at its freight share is refused; only the ceiling, which one key's two counts cannot reach, relieves a holder. Both halves have tests that drive them through the broker. The roster tripwire stays at one bus-holding application until the entry that lifts it brings the first two-application boot oracle | a second bus-holding application shares the broker without reading a host pid through it, and without starving the first of descriptors |
 | 33 | **Claude Code ships — LANDED** as the fourth shipped application and the first foreign-payload terminal program: a marked payload on Firefox's runtime, run behind the same jail as the source-built mail and news, with the `devices=tty` grant in its policy and its own boot oracle unit, `claude-evidence`. Once every Firefox oracle has published, so no second window shares a frame those measure, the unit launches it twice as its application user: with no terminal of its own, which the grant refuses before anything runs, and inside a pseudo-terminal from `td-term --command`, where `claude --version` runs to exit status 0 through td-jail's registration on the live broker beside Firefox's instance; td-term's own line for its child's status, matched whole wherever the capture holds it, is the proof, so a failed acquisition, registration, jail or payload is a failed launch; Firefox's process token and bus identity are read before and after and must match, so the instance it ran beside is the live one; a failed launch's captured output goes to a file, never the console. The oracle found the jail keying the `/usr` aliases on Firefox's reviewed package library path rather than on the runtime, so a dynamic application with no package libraries had no interpreter; the aliases now follow the runtime, and stage 1 tells stage 2 so in a word of its own. The payload then died with SIGILL: the oracle's default `qemu64` CPU has no SSE4.2 or POPCNT, the x86-64-v2 baseline the payload assumes and Firefox's conservative build does not, so the boot now emulates `Nehalem`, the lowest stock model that supplies it. It then ran `--version` to exit 0, but the jail's post-exit read of the cgroup leaf's diagnostics found it already reaped, since the application is short-lived, and reported that as a failure; that read is observability the launch discards on success, so a leaf already gone is now `None`, not a failed launch, matching the rest of the module. The host oracle latches `TD-CLAUDE-TERMINAL-OK` and fails without it, and the roster tripwire now requires an evidence unit per shipped application. Not yet: a launcher card that opens it, and the executable state subtree its updater needs; the caller's working directory is rung 34 | a foreign-payload terminal application is proved to run in a terminal of its own, beside the browser, on one live bus |
 | 34 | **the admitted caller's working directory**: stage 1 maps its own directory through a declared filesystem grant and passes the bounded canonical result to stage 2, which starts there or falls back to `/` if it cannot enter it. The private-UID cutover makes the stock root authority the supported launcher; it starts from `/` and does not forward an operator's working directory. Direct human-UID application launch is refused. A later typed launch request must carry an admitted working directory to restore that operator flow. The jail's existing grant mapping and argv/refusal tests remain applicable to admitted callers | an admitted caller's directory is retained only inside its declared grant; stock launches currently start at `/` |
+| 35 | **news in a td-ui window — LANDED** (§W.8, "Reworked"): td-ui gains the cell screen, a grid of styled cells presented as a plain toplevel that polls the program's handler each turn, and td-news's views draw on it whole; its terminal layer and UNSAFE.md §18 surface are gone, the crate forbids `unsafe`, the recipe is a static PIE Cargo build over the toolkit, the `news` package drops `devices=tty`, and the `[news]` unit launches it direct and is ready when the compositor's layout names its toplevel. Mail follows in its own increment | one of the two source-built applications no longer needs a terminal, a pty grant or td-term to exist |
 
 **Of the two reversals this ladder used to omit entirely, timezone now
 has a rung and accessibility still does not.** §O made timezone support
@@ -9636,7 +9639,7 @@ files name no restart path at all, and the two units keep
 `restart=never`: a client that exits because its configuration is wrong
 must not be restarted into the same failure behind a flickering window.
 
-### W.8 td-mail and td-news: the terminal applications as td code
+### W.8 td-mail and td-news: the two applications as td code
 
 **Decision.** `tmc` and `tn` come into this repository as `td-mail` and
 `td-news`: root crates that AGENTS.md's discovery rule gates as
@@ -9836,6 +9839,40 @@ development VMs, and td-firstboot provisions the new directories on the
 next boot. The import commit is the frozen trees byte for byte; what its
 review found in them is fixed in the commit that follows the rename, and
 the trees' home is td from there on.
+
+**Reworked: td-news draws in a td-ui window.** The terminal was the
+shape the two programs arrived in, not a decision about how td shows
+them, and it cost each a raw-terminal layer with an `unsafe` surface
+(UNSAFE.md §17 and §18), the `devices=tty` grant, a td-term window to
+live in and the relaunch problem §W.7 describes. td-ui's cell screen
+(`td-ui/DESIGN.md`, "Cell screen") keeps the shape the views draw in,
+rows and columns of styled cells, and presents it as a plain Wayland
+toplevel, so the views move whole. td-news is the first: its views
+paint a `Screen`, its keys arrive translated from the keyboard's chords,
+a click is the cell under the pointer and a wheel frame is rows of
+travel; its backend thread's channel is read by the window's poll each
+turn. Two things change for the reader with that: the wheel now scrolls
+the article view, which its help line always promised and the
+terminal's mouse-off there prevented; and the article view's text
+selection, which that mouse-off existed for, is gone, since the
+toolkit's screen has no selection and no clipboard (`td-ui/DESIGN.md`,
+"Cell screen"). Copying article text is a toolkit increment to come,
+not a reader change. The terminal layer and `term_sys.rs` are gone,
+the crate forbids `unsafe` outright and UNSAFE.md §18 is retired. The
+crate depends on td-ui by the one sibling spelling the gate admits, so
+its recipe is `Recipe::rust` with `td-ui` and `td-compositor` staged
+beside it, as td-taskmgr's is, a static PIE rather than direct rustc's
+fixed-address executable; rust-userland-auto-test holds it to that
+shape. The `news` package keeps `sockets=wayland;fetch` and drops the
+terminal grant; the `[news]` unit launches it `direct` as Firefox is,
+with no `terminal` ordering, and is ready when the compositor's layout
+report names its toplevel by app id in a record anchored at its every
+field, so a title cannot forge one, polled to the unit's timeout as
+td-term's socket
+probe was. td-firstboot's provisioning, the fetch service, the boot
+marker and the evidence unit are unchanged. td-mail follows in its own
+increment, after which §W.7's relaunch problem is a launcher request
+for a window rather than a pty, and §D's terminal set is Claude alone.
 
 ## X. Host mode — development only
 

@@ -6,9 +6,9 @@
 - [x] Implement periodic background feed refresh (sync_interval_secs)
 
 ## TUI
-- [x] Raw terminal setup and ANSI drawing (`tui/screen.rs`)
-- [x] Key and mouse input parser (`tui/input.rs`)
-- [x] Event loop and terminal management (`tui/mod.rs`)
+- [x] Cell-screen drawing in a td-ui window (`tui/window.rs`, td-ui `screen_app`)
+- [x] Key and mouse translation from the window's input (`tui/input.rs`)
+- [x] Views and their frame over the screen's rows and columns (`tui/mod.rs`)
 - [x] Feed list view with unread counts
 - [x] Article list view with search
 - [x] Article view with plain text rendering (td's `html` renderer)

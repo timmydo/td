@@ -1,7 +1,14 @@
-use std::io::{self, Read};
-use std::sync::mpsc;
+//! The reader's input vocabulary, and how the window's arrives in it.
+//!
+//! The views were written against a terminal's keys and SGR mouse
+//! reports; they keep that vocabulary, and the screen window's input
+//! (`td_ui::screen::Input`) is translated into it here, so a click still
+//! carries the terminal's one-based row and a wheel frame is one scroll
+//! event per row of travel.
 
-#[derive(Debug, Clone, Copy)]
+use td_ui::screen::{self, Input, Press};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Key {
     Char(char),
     Enter,
@@ -14,160 +21,184 @@ pub enum Key {
     End,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MouseEvent {
-    LeftClick { row: usize },
+    /// The row as a terminal reports it: one-based, the title row first.
+    LeftClick {
+        row: usize,
+    },
     ScrollUp,
     ScrollDown,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InputEvent {
     Key(Key),
     Mouse(MouseEvent),
 }
 
-pub fn spawn_input_thread(tx: mpsc::Sender<InputEvent>) {
-    std::thread::spawn(move || {
-        let mut stdin = io::stdin();
-        let mut b = [0u8; 1];
+/// The most scroll events one wheel frame becomes, so a fling is bounded.
+const WHEEL_EVENTS: usize = 64;
 
-        loop {
-            if stdin.read_exact(&mut b).is_err() {
-                break;
+/// The key a press names, or none: a chord with Control, Alt or Shift is
+/// not one of the reader's keys (the terminal read only the unmodified
+/// key sequences; a shifted scalar arrives folded, with no shift), and
+/// the vocabulary has no Escape, Tab or Delete.
+pub fn key(press: Press) -> Option<Key> {
+    if press.control || press.alt || press.shift {
+        return None;
+    }
+    Some(match press.key {
+        screen::Key::Char(c) => Key::Char(c),
+        screen::Key::Enter => Key::Enter,
+        screen::Key::Backspace => Key::Backspace,
+        screen::Key::Up => Key::Up,
+        screen::Key::Down => Key::Down,
+        screen::Key::PageUp => Key::PageUp,
+        screen::Key::PageDown => Key::PageDown,
+        screen::Key::Home => Key::Home,
+        screen::Key::End => Key::End,
+        screen::Key::Left
+        | screen::Key::Right
+        | screen::Key::Escape
+        | screen::Key::Tab
+        | screen::Key::Insert
+        | screen::Key::Delete
+        | screen::Key::Function(_) => return None,
+    })
+}
+
+/// The reader's events for one window input; `mouse` is the
+/// configuration's switch, off meaning clicks and wheel travel are nothing.
+pub fn translate(input: Input, mouse: bool, out: &mut Vec<InputEvent>) {
+    match input {
+        Input::Key(press) => {
+            if let Some(key) = key(press) {
+                out.push(InputEvent::Key(key));
             }
-
-            let event = match b[0] {
-                b'\r' | b'\n' => Some(InputEvent::Key(Key::Enter)),
-                127 | 8 => Some(InputEvent::Key(Key::Backspace)),
-                0x1b => parse_escape(&mut stdin),
-                c => Some(InputEvent::Key(Key::Char(c as char))),
+        }
+        Input::Click { row, .. } if mouse => {
+            out.push(InputEvent::Mouse(MouseEvent::LeftClick {
+                row: row.saturating_add(1),
+            }));
+        }
+        Input::Wheel { rows, .. } if mouse => {
+            let event = if rows < 0 {
+                MouseEvent::ScrollUp
+            } else {
+                MouseEvent::ScrollDown
             };
-
-            if let Some(ev) = event {
-                if tx.send(ev).is_err() {
-                    break;
-                }
-            }
+            let count = rows.unsigned_abs().min(WHEEL_EVENTS);
+            out.extend(std::iter::repeat_n(InputEvent::Mouse(event), count));
         }
-    });
-}
-
-fn parse_escape(stdin: &mut io::Stdin) -> Option<InputEvent> {
-    let mut b = [0u8; 1];
-    stdin.read_exact(&mut b).ok()?;
-    if b[0] == b'O' {
-        stdin.read_exact(&mut b).ok()?;
-        return match b[0] {
-            b'H' => Some(InputEvent::Key(Key::Home)),
-            b'F' => Some(InputEvent::Key(Key::End)),
-            _ => None,
-        };
-    }
-    if b[0] != b'[' {
-        return None;
-    }
-
-    stdin.read_exact(&mut b).ok()?;
-    match b[0] {
-        b'A' => Some(InputEvent::Key(Key::Up)),
-        b'B' => Some(InputEvent::Key(Key::Down)),
-        b'H' => Some(InputEvent::Key(Key::Home)),
-        b'F' => Some(InputEvent::Key(Key::End)),
-        b'5' => {
-            stdin.read_exact(&mut b).ok()?;
-            if b[0] == b'~' {
-                Some(InputEvent::Key(Key::PageUp))
-            } else {
-                None
-            }
-        }
-        b'6' => {
-            stdin.read_exact(&mut b).ok()?;
-            if b[0] == b'~' {
-                Some(InputEvent::Key(Key::PageDown))
-            } else {
-                None
-            }
-        }
-        b'1' | b'7' => {
-            stdin.read_exact(&mut b).ok()?;
-            if b[0] == b'~' {
-                Some(InputEvent::Key(Key::Home))
-            } else {
-                None
-            }
-        }
-        b'4' | b'8' => {
-            stdin.read_exact(&mut b).ok()?;
-            if b[0] == b'~' {
-                Some(InputEvent::Key(Key::End))
-            } else {
-                None
-            }
-        }
-        b'<' => parse_sgr_mouse(stdin),
-        _ => None,
-    }
-}
-
-fn parse_sgr_mouse(stdin: &mut io::Stdin) -> Option<InputEvent> {
-    let mut seq = Vec::with_capacity(16);
-    let mut b = [0u8; 1];
-
-    loop {
-        stdin.read_exact(&mut b).ok()?;
-        seq.push(b[0]);
-        if b[0] == b'M' || b[0] == b'm' {
-            break;
-        }
-        if seq.len() > 32 {
-            return None;
-        }
-    }
-
-    let s = String::from_utf8(seq).ok()?;
-    parse_sgr_mouse_event(&s)
-}
-
-fn parse_sgr_mouse_event(s: &str) -> Option<InputEvent> {
-    let is_press = s.ends_with('M');
-    let body = &s[..s.len().saturating_sub(1)];
-    let mut parts = body.split(';');
-
-    let cb = parts.next()?.parse::<usize>().ok()?;
-    let _cx = parts.next()?.parse::<usize>().ok()?;
-    let cy = parts.next()?.parse::<usize>().ok()?;
-
-    if !is_press {
-        return None;
-    }
-
-    match cb {
-        // Preserve reported row and let view hit-testing account for header rows.
-        0 => Some(InputEvent::Mouse(MouseEvent::LeftClick { row: cy })),
-        64 => Some(InputEvent::Mouse(MouseEvent::ScrollUp)),
-        65 => Some(InputEvent::Mouse(MouseEvent::ScrollDown)),
-        _ => None,
+        Input::Click { .. }
+        | Input::Wheel { .. }
+        | Input::Resize { .. }
+        | Input::Focus(_)
+        | Input::Close => {}
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_sgr_mouse_event, InputEvent, MouseEvent};
+    use super::*;
 
     #[test]
-    fn sgr_left_click_preserves_reported_row() {
-        let event = parse_sgr_mouse_event("0;10;7M");
-        assert!(matches!(
-            event,
-            Some(InputEvent::Mouse(MouseEvent::LeftClick { row: 7 }))
-        ));
+    fn presses_translate_to_the_readers_keys_and_chords_to_nothing() {
+        let mut out = Vec::new();
+        for (chord, expected) in [
+            ("a", Some(Key::Char('a'))),
+            ("Space", Some(Key::Char(' '))),
+            ("Return", Some(Key::Enter)),
+            ("Backspace", Some(Key::Backspace)),
+            ("PageDown", Some(Key::PageDown)),
+            ("End", Some(Key::End)),
+            ("A", Some(Key::Char('A'))),
+            ("C-c", None),
+            ("M-Return", None),
+            ("S-Up", None),
+            ("S-PageDown", None),
+            ("Escape", None),
+            ("Tab", None),
+            ("F1", None),
+        ] {
+            out.clear();
+            let press = screen::press(chord).expect(chord);
+            translate(Input::Key(press), true, &mut out);
+            assert_eq!(
+                out,
+                expected
+                    .map(InputEvent::Key)
+                    .into_iter()
+                    .collect::<Vec<_>>(),
+                "{chord}"
+            );
+        }
     }
 
     #[test]
-    fn sgr_release_is_ignored() {
-        let event = parse_sgr_mouse_event("0;10;7m");
-        assert!(event.is_none());
+    fn clicks_carry_the_terminals_row_and_wheel_travel_is_one_event_per_row() {
+        let mut out = Vec::new();
+        translate(Input::Click { row: 2, column: 5 }, true, &mut out);
+        assert_eq!(out, [InputEvent::Mouse(MouseEvent::LeftClick { row: 3 })]);
+        out.clear();
+        translate(
+            Input::Wheel {
+                rows: -2,
+                columns: 0,
+            },
+            true,
+            &mut out,
+        );
+        assert_eq!(out, [InputEvent::Mouse(MouseEvent::ScrollUp); 2]);
+        out.clear();
+        translate(
+            Input::Wheel {
+                rows: 3,
+                columns: 0,
+            },
+            true,
+            &mut out,
+        );
+        assert_eq!(out, [InputEvent::Mouse(MouseEvent::ScrollDown); 3]);
+        out.clear();
+        translate(
+            Input::Wheel {
+                rows: 1000,
+                columns: 0,
+            },
+            true,
+            &mut out,
+        );
+        assert_eq!(out.len(), WHEEL_EVENTS);
+        out.clear();
+        translate(
+            Input::Wheel {
+                rows: 0,
+                columns: 4,
+            },
+            true,
+            &mut out,
+        );
+        translate(Input::Click { row: 2, column: 5 }, false, &mut out);
+        translate(
+            Input::Wheel {
+                rows: 3,
+                columns: 0,
+            },
+            false,
+            &mut out,
+        );
+        translate(
+            Input::Resize {
+                rows: 1,
+                columns: 1,
+            },
+            true,
+            &mut out,
+        );
+        translate(Input::Focus(true), true, &mut out);
+        translate(Input::Close, true, &mut out);
+        assert!(out.is_empty());
     }
 }

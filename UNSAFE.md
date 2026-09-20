@@ -15,9 +15,11 @@ can stay `libc`-free. `ostree.rs` calls one safe syscall wrapper and carries
 no unsafe allowance. Every other
 engine crate (the shared `engine` lib and
 `recipes`/`fetch`/`feed`/`subst`) `forbid`s `unsafe_code`. There are TWENTY
-target-side exceptions, each a standalone crate OUTSIDE the
-`builder`/`recipes`/`engine` workspace with a scoped `#[allow]` around its
-recorded raw Linux boundary (the crate itself `#![deny(unsafe_code)]`s).
+numbered target-side exceptions, NINETEEN of them live, each a standalone
+crate OUTSIDE the `builder`/`recipes`/`engine` workspace with a scoped
+`#[allow]` around its recorded raw Linux boundary (the crate itself
+`#![deny(unsafe_code)]`s); the eighteenth is retired and its crate forbids
+`unsafe` outright.
 The first nine confine that boundary to their syscall-instruction layer except
 for `td-compositor`, whose received descriptors enter exact File ownership through a second
 scoped allow. The tenth, `td-busd`,
@@ -41,17 +43,16 @@ adoption site for freshly installed descriptors. The
 fifteenth, `td-secret`, shares the portal transport and adds a scoped
 terminal/process-protection instruction for its manual token check. The sixteenth,
 `td-authd`, confines kernel sender credentials and pidfds to one instruction
-and one descriptor-adoption site. The seventeenth and eighteenth, `td-mail`
-and `td-news`, are ONE surface recorded twice: each carries a byte-identical
-copy of `term_sys.rs`, the terminal half of td-sh's surface — `ioctl(2)`
-with the same three value-pinned requests, and `poll(2)` — because the
-one-package locks the gate required of a root crate when they were imported
-left no shared crate to put it in. The gate now admits a path dependency on
-a sibling roster crate (AGENTS.md 'Rust code'), so folding the copies into
-one crate is possible and is its own reviewed change; until it lands, §17
-argues it once and §18 records only that the copy is the same bytes.
-The twentieth, `td-taskmgr`, has one function-scoped instruction for
-process-directed signals through retained procfs directory descriptors.
+and one descriptor-adoption site. The seventeenth, `td-mail`, carries
+`term_sys.rs`, the terminal half of td-sh's surface — `ioctl(2)` with the
+same three value-pinned requests, and `poll(2)`. The eighteenth was
+`td-news`'s byte-identical copy of that file, recorded once more because
+the one-package locks the gate required of a root crate when the two were
+imported left no shared crate to put it in; td-news now draws in a td-ui
+window and forbids `unsafe` crate-wide, so §18 is retired and the roster
+counts nineteen live surfaces in twenty numbered entries. The twentieth,
+`td-taskmgr`, has one function-scoped instruction for process-directed
+signals through retained procfs directory descriptors.
 
 The host-only `td-vm-registrar` binary in `td-vm` has one separately
 recorded account-authentication surface, H1 below. The existing `td-review`,
@@ -106,7 +107,7 @@ raw boundary of the consumer's own, which gets its own entry.
 | 15 | `td-secret` | shared `recvmsg(2)`, `sendmsg(2)`, `close(2)` transport and scoped adoption for bounded credential replies; the named credential intake module of §16; plus the manual PIN terminal's two-request `ioctl(2)`, single-descriptor `poll(2)`, and fixed dumpability `prctl(2)` below |
 | 16 | `td-authd` | `recvmsg(2)`, `setsockopt(2)` with fixed `SO_PASSCRED`/`SO_PASSPIDFD`, `getsockopt(2)` with fixed `SO_PEERCRED`, and `poll(2)` on the peer pidfd; one scoped descriptor adoption; a separate mount instruction/adoption for `unshare(2)`, `open_tree(2)`, `mount_setattr(2)`, and `move_mount(2)` with the fixed portal file-grant values below; plus the separate named credential intake and six-request terminal ioctl/poll modules below |
 | 17 | `td-mail` | `ioctl(2)` (three pinned requests), `poll(2)` — td-sh's terminal half, in `term_sys.rs` |
-| 18 | `td-news` | the same `term_sys.rs`, byte for byte — see [§18](#18-td-news--the-same-terminal-surface) |
+| 18 | `td-news` | retired: the copy of `term_sys.rs` went with the terminal; the crate forbids `unsafe` and draws through td-ui (§19) — see [§18](#18-td-news--retired) |
 | 19 | `td-ui` | `recvmsg(2)`, `sendmsg(2)`, `fcntl(2)` pinned to `F_DUPFD_CLOEXEC`, the shared Wayland client transport; plus one scoped descriptor adoption — see [§19](#19-td-ui--the-shared-wayland-client-transport) |
 | 20 | `td-taskmgr` | `pidfd_send_signal(2)`, retained procfs process directories, named signals or a fixed signal-zero self probe |
 
@@ -2664,18 +2665,17 @@ a real pseudo-terminal. A third syscall, a fourth request, a signal handler
 or a second allowance is an amendment to this section — and, since the
 file is copied, to §18 in the same landing.
 
-## 18. `td-news` — the same terminal surface
+## 18. `td-news` — retired
 
-td-news, td's feed reader, carries `src/term_sys.rs` byte for byte as
+td-news, td's feed reader, carried `src/term_sys.rs` byte for byte as
 td-mail does, under the same crate-root deny and the same single
-function-level allowance, with the same confinement tests, and nothing
-else. The surface is §17's; this entry exists because the gate held every
-root crate to a one-package lock when td-news was imported, so the shared
-file is a copy rather than a dependency, and a copy that drifted would be a
-second surface. The gate now admits a sibling path dependency; retiring the
-copy for one is a separate reviewed change to §17 and this entry. The
-import's rule is that the two copies stay identical: a change to either is
-a change to both, reviewed once and recorded in §17.
+function-level allowance, because the gate held every root crate to a
+one-package lock when td-news was imported. It now draws in a td-ui
+window (APPLICATIONS.md §W.8, td-ui's `screen_app`): the terminal file is
+deleted, the crate root `#![forbid(unsafe_code)]`s, and its raw Linux
+boundary is td-ui's transport (§19), which it reaches as a sibling path
+dependency. The number is kept so the roster's entries stay stable; the
+surface it recorded is §17's alone until td-mail follows.
 
 ## 19. `td-ui` — the shared Wayland client transport
 

@@ -90,8 +90,8 @@ which drives a program's `Handler` with translated presses, clicks and
 wheel travel on cells, the grid laid out again on configure, focus and
 the close request, and polls the handler each turn under a bounded wait
 so work arriving on a channel from another thread is served without a
-descriptor of its own in the loop. td-news and td-mail, until now
-terminal programs, consume it in their next increments.
+descriptor of its own in the loop. td-news, until now a terminal
+program, draws in it; td-mail consumes it in its next increment.
 
 ## Purpose and trust position
 
@@ -1767,5 +1767,6 @@ regressions. Those increments extend the original sequence below.
     `Composition` with the key vocabulary and chord translation, and
     `screen_app`, the window that presents it and polls a `Handler`,
     proven with a recording handler against a scripted peer. Landed;
-    td-news and td-mail move from the terminal onto it next, each in its
-    own increment with its recipe, package and unit.
+    td-news draws in it (APPLICATIONS.md §W.8, "Reworked"), and td-mail
+    moves from the terminal onto it next, in its own increment with its
+    recipe, package and unit.

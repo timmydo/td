@@ -66,17 +66,14 @@ mod tests {
         )));
     }
 
-    /// The modules the two trees share are one text: the terminal surface
-    /// UNSAFE.md §17 and §18 record as one, and the six copied with it. A
-    /// fix that reached one tree and not the other would part them here.
+    /// The modules the two trees share are one text: the six std modules
+    /// copied into both. A fix that reached one tree and not the other
+    /// would part them here. The terminal surface UNSAFE.md §17 records is
+    /// td-mail's alone now that td-news draws in a td-ui window; §18 is
+    /// retired.
     #[test]
     fn the_shared_modules_are_one_text_in_both_trees() {
         for (name, mail, news) in [
-            (
-                "term_sys.rs",
-                include_str!("../../../td-mail/src/term_sys.rs"),
-                include_str!("../../../td-news/src/term_sys.rs"),
-            ),
             (
                 "td_fetch.rs",
                 include_str!("../../../td-mail/src/td_fetch.rs"),

@@ -1,14 +1,18 @@
 mod input;
-mod screen;
 pub mod views;
+mod window;
 
 use std::cell::Cell;
 use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom};
-use std::os::fd::{AsFd, BorrowedFd};
 use std::path::PathBuf;
 use std::sync::mpsc;
-use std::time::Duration;
+
+use td_ui::screen::{self, Screen, Style};
+
+/// The one-based row of a list's first entry, under the title row and
+/// the view's header row: what a click on it reports (`input::translate`).
+const LIST_FIRST_ROW: usize = 3;
 
 use crate::backend::{BackendCommand, BackendResponse, FeedRefreshReport};
 use crate::cache::Cache;
@@ -17,7 +21,22 @@ use crate::feed::{datetime_sort_key, normalize_datetime_to_local, Article};
 use crate::keybindings;
 
 use input::{InputEvent, Key, MouseEvent};
-use screen::Terminal;
+pub use window::run;
+
+/// One row of a frame: its text, and the style it is drawn in, the base
+/// style when none. A styled row is painted whole, its background to the
+/// right edge, as a terminal's erase-to-end did under the row's colours.
+#[derive(Debug, Default)]
+struct Line {
+    text: String,
+    style: Option<Style>,
+}
+
+impl From<String> for Line {
+    fn from(text: String) -> Self {
+        Self { text, style: None }
+    }
+}
 
 #[derive(Clone)]
 struct FeedRow {
@@ -81,79 +100,16 @@ fn log_tab_index(tab: LogTab) -> usize {
 }
 
 #[derive(Clone, Copy, Default)]
+/// The frame's styles, from the configuration's colours over the
+/// toolkit's paper and ink: a row kind with no colour of its own is drawn
+/// reversed where the terminal drew it reversed, and in the base style
+/// otherwise.
 struct UiTheme {
-    selection_bg: Option<(u8, u8, u8)>,
-    selection_fg: Option<(u8, u8, u8)>,
-    status_bg: Option<(u8, u8, u8)>,
-    status_fg: Option<(u8, u8, u8)>,
-    header_fg: Option<(u8, u8, u8)>,
-    bold_fg: Option<(u8, u8, u8)>,
-}
-
-pub fn run(
-    config: &Config,
-    cache: &Cache,
-    cmd_tx: &mpsc::Sender<BackendCommand>,
-    resp_rx: &mpsc::Receiver<BackendResponse>,
-    offline: bool,
-) -> Result<(), String> {
-    // The two handles outlive the screen, which borrows their descriptors:
-    // the raw-mode guard restores the terminal from `Drop`, and a restore
-    // issued on a descriptor that had been closed and reused would land on
-    // whatever took its number.
-    let stdin = std::io::stdin();
-    let stdout = std::io::stdout();
-    let outcome = run_screen(
-        config,
-        cache,
-        cmd_tx,
-        resp_rx,
-        offline,
-        stdin.as_fd(),
-        stdout.as_fd(),
-    );
-    // After the screen is gone, so the message is not drawn over.
-    if let Some(why) = screen::restore_failure() {
-        eprintln!("td-news: {}", why);
-    }
-    outcome
-}
-
-#[allow(clippy::too_many_arguments)]
-fn run_screen(
-    config: &Config,
-    cache: &Cache,
-    cmd_tx: &mpsc::Sender<BackendCommand>,
-    resp_rx: &mpsc::Receiver<BackendResponse>,
-    offline: bool,
-    tty: BorrowedFd<'_>,
-    out: BorrowedFd<'_>,
-) -> Result<(), String> {
-    let mut terminal = Terminal::enter(tty, out, config.ui.mouse, &config.theme)?;
-    let (input_tx, input_rx) = mpsc::channel::<InputEvent>();
-    input::spawn_input_thread(input_tx);
-
-    let mut app = App::new(config, cache, offline);
-
-    loop {
-        while let Ok(resp) = resp_rx.try_recv() {
-            app.handle_backend(resp, cache);
-        }
-
-        app.draw(&terminal)?;
-
-        match input_rx.recv_timeout(Duration::from_millis(120)) {
-            Ok(input) => {
-                if app.handle_input(input, cache, cmd_tx, &mut terminal) {
-                    break;
-                }
-            }
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
-            Err(mpsc::RecvTimeoutError::Disconnected) => break,
-        }
-    }
-
-    Ok(())
+    base: Style,
+    header: Style,
+    status: Style,
+    selection: Style,
+    unread: Style,
 }
 
 struct App {
@@ -195,13 +151,28 @@ struct App {
 
 impl UiTheme {
     fn from_config(theme: &crate::config::Theme) -> Self {
+        let base = Style::new(
+            parse_color_opt(&theme.fg).map_or(screen::INK, rgb),
+            parse_color_opt(&theme.bg).map_or(screen::PAPER, rgb),
+        );
         Self {
-            selection_bg: parse_color_opt(&theme.selection_bg),
-            selection_fg: parse_color_opt(&theme.selection_fg),
-            status_bg: parse_color_opt(&theme.status_bg),
-            status_fg: parse_color_opt(&theme.status_fg),
-            header_fg: parse_color_opt(&theme.header_fg),
-            bold_fg: parse_color_opt(&theme.bold_fg),
+            base,
+            header: styled(base, parse_color_opt(&theme.header_fg), None, true, false),
+            status: styled(
+                base,
+                parse_color_opt(&theme.status_fg),
+                parse_color_opt(&theme.status_bg),
+                false,
+                true,
+            ),
+            selection: styled(
+                base,
+                parse_color_opt(&theme.selection_fg),
+                parse_color_opt(&theme.selection_bg),
+                false,
+                true,
+            ),
+            unread: styled(base, parse_color_opt(&theme.bold_fg), None, true, false),
         }
     }
 }
@@ -402,7 +373,6 @@ impl App {
         input: InputEvent,
         cache: &Cache,
         cmd_tx: &mpsc::Sender<BackendCommand>,
-        terminal: &mut Terminal<'_>,
     ) -> bool {
         if self.quitting {
             return true;
@@ -457,8 +427,8 @@ impl App {
 
         match self.view {
             View::FeedList => self.handle_feed_keys(input, cache, cmd_tx),
-            View::ArticleList => self.handle_article_list_keys(input, cache, cmd_tx, terminal),
-            View::Article => self.handle_article_view_keys(input, cache, cmd_tx, terminal),
+            View::ArticleList => self.handle_article_list_keys(input, cache, cmd_tx),
+            View::Article => self.handle_article_view_keys(input, cache, cmd_tx),
             View::Log => self.handle_log_keys(input),
             View::Help => {}
         }
@@ -495,9 +465,10 @@ impl App {
                 }
             }
             InputEvent::Mouse(MouseEvent::LeftClick { row }) => {
-                if row >= 2 {
+                // The one-based row under the title and the header rows.
+                if row >= LIST_FIRST_ROW {
                     let start = self.feed_list_start();
-                    let idx = start + (row - 2);
+                    let idx = start + (row - LIST_FIRST_ROW);
                     if idx < self.feed_row_count() {
                         self.selected_feed = idx;
                         self.ensure_selected_feed_visible();
@@ -580,7 +551,6 @@ impl App {
         input: InputEvent,
         cache: &Cache,
         cmd_tx: &mpsc::Sender<BackendCommand>,
-        terminal: &mut Terminal<'_>,
     ) {
         match input {
             InputEvent::Key(Key::Char('q')) => {
@@ -608,15 +578,15 @@ impl App {
                 }
             }
             InputEvent::Mouse(MouseEvent::LeftClick { row }) => {
-                if row >= 2 {
+                if row >= LIST_FIRST_ROW {
                     let visible = self.filtered_article_indices();
                     let start = self.article_list_start(visible.len());
-                    let idx = start + (row - 2);
+                    let idx = start + (row - LIST_FIRST_ROW);
                     if idx < visible.len() {
                         self.selected_article = idx;
                         self.ensure_selected_article_visible(visible.len());
                         self.article_scroll = 0;
-                        self.enter_article_view(cmd_tx, terminal);
+                        self.enter_article_view(cmd_tx);
                         self.pending_redraw = true;
                     }
                 }
@@ -639,7 +609,7 @@ impl App {
             InputEvent::Key(Key::Enter) => {
                 if !self.filtered_article_indices().is_empty() {
                     self.article_scroll = 0;
-                    self.enter_article_view(cmd_tx, terminal);
+                    self.enter_article_view(cmd_tx);
                     self.pending_redraw = true;
                 }
             }
@@ -746,7 +716,6 @@ impl App {
         input: InputEvent,
         cache: &Cache,
         cmd_tx: &mpsc::Sender<BackendCommand>,
-        terminal: &mut Terminal<'_>,
     ) {
         // URL picker mode
         if self.url_picking {
@@ -795,7 +764,7 @@ impl App {
 
         match input {
             InputEvent::Key(Key::Char('q')) => {
-                self.leave_article_view(terminal);
+                self.leave_article_view();
                 self.pending_redraw = true;
             }
             InputEvent::Key(Key::Down) | InputEvent::Key(Key::Char('j')) => {
@@ -806,13 +775,21 @@ impl App {
                 self.article_scroll = self.article_scroll.saturating_sub(1);
                 self.pending_redraw = true;
             }
-            InputEvent::Mouse(MouseEvent::ScrollDown)
-            | InputEvent::Key(Key::PageDown)
-            | InputEvent::Key(Key::Char(' ')) => {
+            // A wheel event is one row of travel (a notch is three), as in
+            // the lists and the log; the page keys keep their fifteen.
+            InputEvent::Mouse(MouseEvent::ScrollDown) => {
+                self.article_scroll = self.article_scroll.saturating_add(1);
+                self.pending_redraw = true;
+            }
+            InputEvent::Mouse(MouseEvent::ScrollUp) => {
+                self.article_scroll = self.article_scroll.saturating_sub(1);
+                self.pending_redraw = true;
+            }
+            InputEvent::Key(Key::PageDown) | InputEvent::Key(Key::Char(' ')) => {
                 self.article_scroll = self.article_scroll.saturating_add(15);
                 self.pending_redraw = true;
             }
-            InputEvent::Mouse(MouseEvent::ScrollUp) | InputEvent::Key(Key::PageUp) => {
+            InputEvent::Key(Key::PageUp) => {
                 self.article_scroll = self.article_scroll.saturating_sub(15);
                 self.pending_redraw = true;
             }
@@ -882,11 +859,20 @@ impl App {
                 self.log_scroll = self.log_scroll.saturating_sub(1);
                 self.pending_redraw = true;
             }
-            InputEvent::Mouse(MouseEvent::ScrollDown) | InputEvent::Key(Key::PageDown) => {
+            // A wheel event is one row of travel, as in the article view.
+            InputEvent::Mouse(MouseEvent::ScrollDown) => {
+                self.log_scroll = self.log_scroll.saturating_add(1);
+                self.pending_redraw = true;
+            }
+            InputEvent::Mouse(MouseEvent::ScrollUp) => {
+                self.log_scroll = self.log_scroll.saturating_sub(1);
+                self.pending_redraw = true;
+            }
+            InputEvent::Key(Key::PageDown) => {
                 self.log_scroll = self.log_scroll.saturating_add(15);
                 self.pending_redraw = true;
             }
-            InputEvent::Mouse(MouseEvent::ScrollUp) | InputEvent::Key(Key::PageUp) => {
+            InputEvent::Key(Key::PageUp) => {
                 self.log_scroll = self.log_scroll.saturating_sub(15);
                 self.pending_redraw = true;
             }
@@ -912,29 +898,19 @@ impl App {
         }
     }
 
-    fn enter_article_view(
-        &mut self,
-        cmd_tx: &mpsc::Sender<BackendCommand>,
-        terminal: &mut Terminal<'_>,
-    ) {
+    fn enter_article_view(&mut self, cmd_tx: &mpsc::Sender<BackendCommand>) {
         self.sync_open_article_to_selection();
         self.view = View::Article;
         self.mark_current_article_read(cmd_tx);
         self.extract_current_article_urls();
         self.url_picking = false;
-        if self.mouse_config {
-            terminal.set_mouse(false);
-        }
     }
 
-    fn leave_article_view(&mut self, terminal: &mut Terminal<'_>) {
+    fn leave_article_view(&mut self) {
         self.view = View::ArticleList;
         self.open_article = None;
         self.article_urls.clear();
         self.url_picking = false;
-        if self.mouse_config {
-            terminal.set_mouse(true);
-        }
     }
 
     fn extract_current_article_urls(&mut self) {
@@ -1127,12 +1103,11 @@ impl App {
         .and_then(|visible_idx| visible_indices.get(visible_idx).copied())
     }
 
-    fn draw(&mut self, terminal: &Terminal<'_>) -> Result<(), String> {
-        if !self.pending_redraw {
-            return Ok(());
-        }
-
-        let (width, height) = terminal.size();
+    /// Paints one whole frame onto the screen's grid: the title row, the
+    /// view's rows and its status row, every row in the base style unless
+    /// the view styled it.
+    fn draw(&mut self, screen: &mut Screen) {
+        let (width, height) = (screen.columns(), screen.rows());
         self.last_size = (width, height);
         let mut lines = Vec::with_capacity(height);
         lines.push(self.style_header(views::truncate(
@@ -1158,12 +1133,22 @@ impl App {
         }
         lines.extend(content_lines);
 
-        terminal.draw(&lines)?;
+        screen.clear(self.theme.base);
+        for (row, line) in lines.iter().enumerate().take(height) {
+            let style = line.style.unwrap_or(self.theme.base);
+            if line.style.is_some() {
+                screen.clear_row(row, 0, style);
+            }
+            if line.text.contains('\t') {
+                screen.write(row, 0, &expand_tabs(&line.text), style);
+            } else {
+                screen.write(row, 0, &line.text, style);
+            }
+        }
         self.pending_redraw = false;
-        Ok(())
     }
 
-    fn render_feed_list(&self, width: usize, height: usize, lines: &mut Vec<String>) {
+    fn render_feed_list(&self, width: usize, height: usize, lines: &mut Vec<Line>) {
         lines.push(self.style_header(views::truncate(
             "Feeds (Enter open feed/log, g refresh feed, G refresh all, u mark read, ? help, q quit)",
             width,
@@ -1220,17 +1205,17 @@ impl App {
             if idx == self.selected_feed {
                 lines.push(self.style_selection(line, false));
             } else {
-                lines.push(line);
+                lines.push(line.into());
             }
         }
 
         while lines.len() + 1 < height {
-            lines.push(String::new());
+            lines.push(Line::default());
         }
         lines.push(self.style_status(views::truncate(&self.status, width)));
     }
 
-    fn render_article_list(&self, width: usize, height: usize, lines: &mut Vec<String>) {
+    fn render_article_list(&self, width: usize, height: usize, lines: &mut Vec<Line>) {
         let feed_name = match self.selected_feed_scope.as_ref() {
             Some(FeedScope::All) => "[All]",
             Some(FeedScope::Unread) => "[Unread]",
@@ -1301,12 +1286,12 @@ impl App {
             } else if !article.read {
                 lines.push(self.style_unread(line));
             } else {
-                lines.push(line);
+                lines.push(line.into());
             }
         }
 
         while lines.len() + 1 < height {
-            lines.push(String::new());
+            lines.push(Line::default());
         }
         lines.push(if visible.is_empty() {
             self.style_status(views::truncate("No matching articles", width))
@@ -1315,9 +1300,9 @@ impl App {
         });
     }
 
-    fn render_article_view(&self, width: usize, height: usize, lines: &mut Vec<String>) {
+    fn render_article_view(&self, width: usize, height: usize, lines: &mut Vec<Line>) {
         let Some(article) = self.current_article() else {
-            lines.push(views::truncate("No article selected", width));
+            lines.push(views::truncate("No article selected", width).into());
             return;
         };
 
@@ -1358,10 +1343,10 @@ impl App {
         let body_rows = height.saturating_sub(2);
         let start = self.article_scroll.min(rendered.len());
         for line in rendered.iter().skip(start).take(body_rows) {
-            lines.push(line.clone());
+            lines.push(line.clone().into());
         }
         while lines.len() + 1 < height {
-            lines.push(String::new());
+            lines.push(Line::default());
         }
 
         if self.url_picking {
@@ -1388,30 +1373,29 @@ impl App {
         }
     }
 
-    fn render_help(&self, width: usize, height: usize, lines: &mut Vec<String>) {
+    fn render_help(&self, width: usize, height: usize, lines: &mut Vec<Line>) {
         lines.push(self.style_header(views::truncate("Help (q to close)", width)));
-        for item in keybindings::GLOBAL {
-            lines.push(views::truncate(&format!("Global: {}", item), width));
+        for (label, items) in [
+            ("Global", keybindings::GLOBAL),
+            ("Feed list", keybindings::FEED_LIST),
+            ("Article list", keybindings::ARTICLE_LIST),
+            ("Article view", keybindings::ARTICLE_VIEW),
+            ("Log view", keybindings::LOG_VIEW),
+        ] {
+            for item in items {
+                lines.push(views::truncate(&format!("{}: {}", label, item), width).into());
+            }
         }
-        for item in keybindings::FEED_LIST {
-            lines.push(views::truncate(&format!("Feed list: {}", item), width));
-        }
-        for item in keybindings::ARTICLE_LIST {
-            lines.push(views::truncate(&format!("Article list: {}", item), width));
-        }
-        for item in keybindings::ARTICLE_VIEW {
-            lines.push(views::truncate(&format!("Article view: {}", item), width));
-        }
-        for item in keybindings::LOG_VIEW {
-            lines.push(views::truncate(&format!("Log view: {}", item), width));
-        }
-        lines.push(views::truncate(
-            "Mouse: feed click selects, article click opens, wheel scrolls lists/view",
-            width,
-        ));
+        lines.push(
+            views::truncate(
+                "Mouse: feed click selects, article click opens, wheel scrolls lists/view",
+                width,
+            )
+            .into(),
+        );
 
         while lines.len() + 1 < height {
-            lines.push(String::new());
+            lines.push(Line::default());
         }
         lines.push(self.style_status(views::truncate(&self.status, width)));
     }
@@ -1419,7 +1403,7 @@ impl App {
     /// The log view shows one window of the file, read line by line, so a
     /// log of any size costs a frame one window's worth of memory: the
     /// whole file in one string was the allocation that ended a session.
-    fn render_log_view(&self, width: usize, height: usize, lines: &mut Vec<String>) {
+    fn render_log_view(&self, width: usize, height: usize, lines: &mut Vec<Line>) {
         let label = match self.log_tab {
             LogTab::News => "[News Log]",
             LogTab::Debug => "[Debug Log]",
@@ -1458,14 +1442,12 @@ impl App {
         // for one that cannot.
         let total = if window.is_none() { None } else { total };
         match window {
-            Some(window) => lines.extend(window),
-            None => lines.push(views::truncate(
-                &format!("Could not read {}", path.display()),
-                width,
-            )),
+            Some(window) => lines.extend(window.into_iter().map(Line::from)),
+            None => lines
+                .push(views::truncate(&format!("Could not read {}", path.display()), width).into()),
         }
         while lines.len() + 1 < height {
-            lines.push(String::new());
+            lines.push(Line::default());
         }
         lines.push(self.style_status(views::truncate(
             &format!(
@@ -1477,26 +1459,37 @@ impl App {
         )));
     }
 
-    fn style_header(&self, s: String) -> String {
-        style_line(&s, self.theme.header_fg, None, true, false)
+    fn style_header(&self, text: String) -> Line {
+        Line {
+            text,
+            style: Some(self.theme.header),
+        }
     }
 
-    fn style_status(&self, s: String) -> String {
-        style_line(&s, self.theme.status_fg, self.theme.status_bg, false, true)
+    fn style_status(&self, text: String) -> Line {
+        Line {
+            text,
+            style: Some(self.theme.status),
+        }
     }
 
-    fn style_selection(&self, s: String, bold: bool) -> String {
-        style_line(
-            &s,
-            self.theme.selection_fg,
-            self.theme.selection_bg,
-            bold,
-            true,
-        )
+    fn style_selection(&self, text: String, bold: bool) -> Line {
+        let style = if bold {
+            self.theme.selection.bold()
+        } else {
+            self.theme.selection
+        };
+        Line {
+            text,
+            style: Some(style),
+        }
     }
 
-    fn style_unread(&self, s: String) -> String {
-        style_line(&s, self.theme.bold_fg, None, true, false)
+    fn style_unread(&self, text: String) -> Line {
+        Line {
+            text,
+            style: Some(self.theme.unread),
+        }
     }
 
     fn reload_feeds_from_cache(&mut self, cache: &Cache) {
@@ -2216,33 +2209,49 @@ fn finish_log_line(line: &mut Vec<u8>, width: usize) -> String {
     shown
 }
 
-fn style_line(
-    text: &str,
+/// A row kind's style over the base: its own ink and background where the
+/// configuration names them, reversed where the terminal fell back to
+/// reverse video for a kind with no colours, and bold where it was bold.
+fn styled(
+    base: Style,
     fg: Option<(u8, u8, u8)>,
     bg: Option<(u8, u8, u8)>,
     bold: bool,
     reverse_fallback: bool,
-) -> String {
-    let mut seq = String::new();
-    let has_colors = fg.is_some() || bg.is_some();
+) -> Style {
+    let mut style = Style::new(
+        fg.map_or(base.ink, rgb),
+        bg.map_or(base.background, rgb),
+    );
+    if reverse_fallback && fg.is_none() && bg.is_none() {
+        style = style.reversed();
+    }
     if bold {
-        seq.push_str("\x1b[1m");
+        style = style.bold();
     }
-    if let Some((r, g, b)) = fg {
-        seq.push_str(&format!("\x1b[38;2;{};{};{}m", r, g, b));
-    }
-    if let Some((r, g, b)) = bg {
-        seq.push_str(&format!("\x1b[48;2;{};{};{}m", r, g, b));
-    }
-    if reverse_fallback && !has_colors {
-        seq.push_str("\x1b[7m");
-    }
+    style
+}
 
-    if seq.is_empty() {
-        text.to_string()
-    } else {
-        format!("{}{}", seq, text)
+fn rgb((r, g, b): (u8, u8, u8)) -> u32 {
+    u32::from(r) << 16 | u32::from(g) << 8 | u32::from(b)
+}
+
+/// A tab to the next stop of eight cells, as the terminal expanded it;
+/// the screen would draw the control scalar as the replacement character.
+fn expand_tabs(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() + 8);
+    let mut column = 0;
+    for ch in text.chars() {
+        if ch == '\t' {
+            let stop = column / 8 * 8 + 8;
+            out.extend(std::iter::repeat_n(' ', stop - column));
+            column = stop;
+        } else {
+            out.push(ch);
+            column += 1;
+        }
     }
+    out
 }
 
 #[cfg(test)]
@@ -2492,6 +2501,74 @@ mod tests {
             app.pending_read_mutations.get(ARTICLE_HASH).copied(),
             Some(true)
         );
+    }
+
+    /// A click reports the terminal's one-based row; the title and the
+    /// view's header take the first two, so the first feed row is the third.
+    #[test]
+    fn a_click_selects_the_feed_row_under_it_below_the_title_and_header() {
+        let dir = tempdir().expect("tempdir");
+        let cache = Cache::open_at(dir.path().join("test.tdkv")).expect("cache");
+        seed_cache(&cache, false);
+        let config = test_config();
+        let (cmd_tx, _cmd_rx) = mpsc::channel();
+        let mut app = App::new(&config, &cache, true);
+        app.last_size = (80, 24);
+        app.selected_feed = 1;
+        let click = |app: &mut App, row: usize| {
+            app.handle_input(
+                InputEvent::Mouse(MouseEvent::LeftClick { row }),
+                &cache,
+                &cmd_tx,
+            );
+        };
+        for row in [1, 2] {
+            click(&mut app, row);
+            assert_eq!(app.selected_feed, 1, "row {row}");
+        }
+        click(&mut app, 3);
+        assert_eq!(app.selected_feed, 0);
+        let rows = app.feed_row_count();
+        click(&mut app, rows + 2);
+        assert_eq!(app.selected_feed, rows - 1);
+        click(&mut app, rows + 3);
+        assert_eq!(app.selected_feed, rows - 1);
+        // A tab is expanded to the next stop of eight, never drawn as U+FFFD.
+        assert_eq!(expand_tabs("a\tb\t\tc"), "a       b               c");
+        assert_eq!(expand_tabs("12345678\tx"), "12345678        x");
+    }
+
+    /// A wheel event moves the article and log views one row; the page
+    /// keys keep their fifteen. The window sends three events per notch.
+    #[test]
+    fn a_wheel_event_scrolls_the_article_and_log_views_one_row() {
+        let dir = tempdir().expect("tempdir");
+        let cache = Cache::open_at(dir.path().join("test.tdkv")).expect("cache");
+        seed_cache(&cache, false);
+        let config = test_config();
+        let (cmd_tx, _cmd_rx) = mpsc::channel();
+        let mut app = App::new(&config, &cache, true);
+        let send = |app: &mut App, input: InputEvent| {
+            app.handle_input(input, &cache, &cmd_tx);
+        };
+        app.view = View::Article;
+        send(&mut app, InputEvent::Mouse(MouseEvent::ScrollDown));
+        assert_eq!(app.article_scroll, 1);
+        send(&mut app, InputEvent::Key(Key::PageDown));
+        assert_eq!(app.article_scroll, 16);
+        send(&mut app, InputEvent::Mouse(MouseEvent::ScrollUp));
+        assert_eq!(app.article_scroll, 15);
+        send(&mut app, InputEvent::Key(Key::PageUp));
+        assert_eq!(app.article_scroll, 0);
+        app.view = View::Log;
+        send(&mut app, InputEvent::Mouse(MouseEvent::ScrollDown));
+        assert_eq!(app.log_scroll, 1);
+        send(&mut app, InputEvent::Key(Key::PageDown));
+        assert_eq!(app.log_scroll, 16);
+        send(&mut app, InputEvent::Mouse(MouseEvent::ScrollUp));
+        assert_eq!(app.log_scroll, 15);
+        send(&mut app, InputEvent::Key(Key::PageUp));
+        assert_eq!(app.log_scroll, 0);
     }
 
     #[test]
