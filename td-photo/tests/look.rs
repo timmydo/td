@@ -571,8 +571,12 @@ fn every_built_in_parses_within_the_budgets_and_keeps_neutral_neutral() {
             "velvia-like",
             "astia-like",
             "classic-chrome-like",
+            "reala-ace-like",
+            "pro-neg-hi-like",
+            "pro-neg-std-like",
             "classic-neg-like",
             "eterna-like",
+            "eterna-bleach-bypass-like",
             "acros-like",
         ]
     );

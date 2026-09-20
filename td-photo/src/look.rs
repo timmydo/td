@@ -530,10 +530,11 @@ impl Look {
     }
 }
 
-/// The built-in set, by stem, each authored by hand in this format. The
-/// Fujifilm-inspired family names what it is inspired by and claims no
-/// reproduction of it.
-pub const BUILTIN: [(&str, &str); 10] = [
+/// The built-in set, keyed by stem (every listing sorts; this order is
+/// the reader's), each authored by hand in this format. The
+/// Fujifilm-inspired family names what it is inspired by, in the order
+/// the camera lists them, and claims no reproduction of it.
+pub const BUILTIN: [(&str, &str); 14] = [
     (
         "contrast-boost",
         "td-photo look 1\nname Contrast boost\ntone contrast 1.35 toe 0.0 shoulder 0.0\n",
@@ -576,6 +577,30 @@ pub const BUILTIN: [(&str, &str); 10] = [
         ),
     ),
     (
+        "reala-ace-like",
+        concat!(
+            "td-photo look 1\nname Reala Ace-like\n",
+            "primaries 1.03 -0.02 -0.01  -0.01 1.03 -0.02  -0.01 -0.02 1.03\n",
+            "tone contrast 1.2 toe 0.1 shoulder 0.05\n",
+        ),
+    ),
+    (
+        "pro-neg-hi-like",
+        concat!(
+            "td-photo look 1\nname Pro Neg. Hi-like\n",
+            "primaries 0.96 0.03 0.01  0.02 0.96 0.02  0.01 0.03 0.96\n",
+            "tone contrast 1.2 toe 0.05 shoulder 0.2\nsaturation 0.9\n",
+        ),
+    ),
+    (
+        "pro-neg-std-like",
+        concat!(
+            "td-photo look 1\nname Pro Neg. Std-like\n",
+            "primaries 0.96 0.03 0.01  0.02 0.96 0.02  0.01 0.03 0.96\n",
+            "tone contrast 0.95 toe -0.1 shoulder 0.3\nsaturation 0.85\n",
+        ),
+    ),
+    (
         "classic-neg-like",
         concat!(
             "td-photo look 1\nname Classic Neg-like\n",
@@ -586,6 +611,13 @@ pub const BUILTIN: [(&str, &str); 10] = [
     (
         "eterna-like",
         "td-photo look 1\nname Eterna-like\ntone contrast 0.85 toe -0.3 shoulder 0.35\nsaturation 0.75\n",
+    ),
+    (
+        "eterna-bleach-bypass-like",
+        concat!(
+            "td-photo look 1\nname Eterna Bleach Bypass-like\n",
+            "tone contrast 1.5 toe 0.2 shoulder -0.15\nsaturation 0.45\n",
+        ),
     ),
     (
         "acros-like",

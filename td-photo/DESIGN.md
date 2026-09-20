@@ -463,9 +463,15 @@ window, all speaking the toolkit's one vocabulary.
   shapes the drag geometry, not the frame directly: a locked drag moves the
   outlined rectangle, already a change, while arming a ratio paints
   nothing. A look palette, toggled with `l`, lists the available looks over the
-  develop box with the current one marked: opening or closing it over a
-  non-empty list is a change (the status row names the sub-mode whether or not
-  there is a box to list into, as it names crop-adjust), over an empty list
+  develop box with the current one marked (on a panel of the box's rows across
+  the develop region, `look_panel`; a row a name each, down a column and on
+  beside it in the next, each column as wide as its longest name, so a list
+  taller than the panel is not cut at its foot; a column that starts within
+  the panel is cut at its right as a long name is, one past it neither
+  painted nor a target; `look_rows`, which the painter and the pointer
+  share): opening or closing it over a non-empty
+  list is a change (the status row names the sub-mode whether or not there
+  is a box to list into, as it names crop-adjust), over an empty list
   nothing. A press on a name picks that look through the same edit the `look`
   action makes, so the mark follows the edit's settle; the palette stays open.
   So the aspect lock, the crop-adjust and look-palette sub-mode flags and the
@@ -1058,14 +1064,21 @@ pipeline can produce finite in f32, and step 6 clips.
 
 At most 16 operations, a 4 KiB file. The built-in set is `contrast-boost`,
 `contrast-soft`, `mono` and a Fujifilm-inspired family (`provia-like`,
-`velvia-like`, `astia-like`, `classic-chrome-like`, `classic-neg-like`,
-`eterna-like`, `acros-like`), each authored by hand in this format and carried
-as a constant of `look` (no `include_str!`). The jssfr.de darktable styles that
-motivated them are built from darktable's `primaries`, `colorcontrast`,
-`colorbalancergb`, `agx` and `monochrome` modules; td-photo does not execute
-darktable's pipeline and does not claim to reproduce those styles. A converter
-that reads a `.dtstyle` and emits the nearest `.look` for that module subset is
-a later increment and is a translation the user runs, not a runtime dependency.
+`velvia-like`, `astia-like`, `classic-chrome-like`, `reala-ace-like`,
+`pro-neg-hi-like`, `pro-neg-std-like`, `classic-neg-like`, `eterna-like`,
+`eterna-bleach-bypass-like`, `acros-like`), each authored by hand in this
+format and carried as a constant of `look` (no `include_str!`). With `mono`
+standing for Monochrome, the built-in set covers the twelve simulations of
+the jssfr.de darktable style set that motivated the family (Nostalgic Neg is
+not in that set). Those styles are built from darktable's `primaries`,
+`colorcontrast`, `colorbalancergb`, `agx` and `monochrome` modules; td-photo
+does not execute darktable's pipeline and does not claim to reproduce those
+styles. A converter that reads a `.dtstyle` and emits the nearest `.look` for
+that module subset is a later increment and is a translation the user runs,
+not a runtime dependency. The looks are listed sorted by stem, so with more
+than nine the `F1`..`F9` shortcuts reach the first nine of that order and the
+band and the palette the rest (the palette laying a list taller than its
+panel in columns).
 
 `td-photo looks` lists every look, one per line, tab-separated: the stem, `user`
 or `built-in`, and the name (`-` without one) or `error` and why a user file is
@@ -1514,7 +1527,9 @@ dropped on a photo switch, and a bad ratio token or wrong mode refused); the
 look palette (toggled only in develop and escaping in layers; a `set_looks`
 fact, and the status row naming the sub-mode over a boxless surface too;
 the current look marked and picked by a press on its name (a press off the names
-or with no box picking nothing); mutually exclusive with crop-adjust and dropped
+or with no box picking nothing; the built-in set on a 640 by 480 surface going
+on in a second column, a column of long names cut at the panel's right and
+the next not laid); mutually exclusive with crop-adjust and dropped
 on a photo switch; a touch behind the open palette not bumping the generation);
 the develop controls (the bands' geometry, the buttons enabled as the
 photo's crop and steps allow and inert otherwise, each button's effect and

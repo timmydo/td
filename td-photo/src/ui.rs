@@ -2269,38 +2269,78 @@ impl Controller {
             .and_then(Sidecar::look)
     }
 
-    /// The look row a pointer at `(x, y)` in surface pixels falls on, when the
-    /// palette is open over a non-empty list with a develop box to paint into:
-    /// the same rows `paint_looks` draws, so a press picks exactly the name
-    /// under it. The top and side padding is not a row, and a row past the box
-    /// bottom is not shown and so not hittable.
-    fn look_row_at(&self, x: i64, y: i64) -> Option<usize> {
-        let (looks, _) = self.look_palette()?;
+    /// The palette's panel: the develop box's rows across the develop
+    /// region's width, so the columns have the room the box's 3:2 shape
+    /// leaves at its sides; `None` when the palette is not open over a
+    /// non-empty list with a box to paint into.
+    pub fn look_panel(&self) -> Option<Rect> {
+        self.look_palette()?;
         let r#box = self.develop_box()?;
+        let region = self.layout().develop_region();
+        Some(Rect {
+            x: region.x,
+            width: region.width,
+            ..r#box
+        })
+    }
+
+    /// The palette's rows on its panel, one per look in list order:
+    /// `CELL_HEIGHT` tall from `CELL_PAD` in, down a column and then the
+    /// next column to its right, each column as wide as its longest name
+    /// plus a pad, so a list taller than the panel goes on beside itself
+    /// rather than past its foot. A column that starts within the panel
+    /// is laid, cut at the panel's right as one long name is cut, so a
+    /// long name never hides the short ones beside it; `None` for a row
+    /// past the panel's foot or in a column past its right, which is
+    /// neither painted nor a target. The painter and the pointer share
+    /// these, so a press picks exactly the name under it.
+    pub fn look_rows(&self) -> Option<Vec<Option<Rect>>> {
+        let (looks, _) = self.look_palette()?;
+        let panel = self.look_panel()?;
         let s = self.surface.scale.value();
         let pad = (CELL_PAD * s) as i64;
         let row = (CELL_HEIGHT * s) as i64;
-        if row <= 0 {
-            return None;
+        let cell = (CELL_WIDTH * s) as i64;
+        let mut rows = Vec::with_capacity(looks.len());
+        let per_column = if row > 0 {
+            ((i64::from(panel.height) - pad) / row).max(0) as usize
+        } else {
+            0
+        };
+        if per_column == 0 {
+            rows.resize(looks.len(), None);
+            return Some(rows);
         }
-        let left = r#box.x + pad;
-        let width = (i64::from(r#box.width) - 2 * pad).max(0);
-        if x < left || x >= left + width {
-            return None;
+        let right = panel.x + i64::from(panel.width) - pad;
+        let mut x = panel.x + pad;
+        for column in looks.chunks(per_column) {
+            let longest = column
+                .iter()
+                .map(|look| look.chars().count())
+                .max()
+                .unwrap_or(0);
+            let width = cell.saturating_mul(longest as i64);
+            let shown = (right - x).min(width);
+            rows.extend(column.iter().enumerate().map(|(line, _)| {
+                (shown > 0).then_some(Rect {
+                    x,
+                    y: panel.y + pad + row * line as i64,
+                    width: shown as u32,
+                    height: row as u32,
+                })
+            }));
+            x = x.saturating_add(width).saturating_add(pad);
         }
-        let top = r#box.y + pad;
-        if y < top {
-            return None;
-        }
-        let index = ((y - top) / row) as usize;
-        if index >= looks.len() {
-            return None;
-        }
-        let bottom = r#box.y + i64::from(r#box.height);
-        if top + row * (index as i64 + 1) > bottom {
-            return None;
-        }
-        Some(index)
+        Some(rows)
+    }
+
+    /// The look row a pointer at `(x, y)` in surface pixels falls on: the
+    /// same rows `paint_looks` draws (`look_rows`), so a press picks exactly
+    /// the name under it; the padding is no row.
+    fn look_row_at(&self, x: i64, y: i64) -> Option<usize> {
+        self.look_rows()?
+            .iter()
+            .position(|row| row.is_some_and(|row| row.contains(x, y)))
     }
 
     /// The overlay the scene actually paints over the develop box, or `None`
@@ -4414,9 +4454,10 @@ impl Scene<'_> {
         // into, so the placeholder and the image share one geometry.
         if let Some(r#box) = r#box {
             fill(r#box, PLACEHOLDER, damage, sink);
-            // The develop overlay over the preview -- the crop overlay, or the
-            // look palette when it is open -- clipped to the box so it cannot
-            // stray past it; drawn here so it is in the scene frame, the
+            // The develop overlay over the preview -- the crop overlay,
+            // clipped to the box so it cannot stray past it, or the look
+            // palette when it is open, on its panel across the region's
+            // width; drawn here so it is in the scene frame, the
             // `--preview` PPM and the replay `text` oracle, and repainted over
             // the blitted image on the live window as the badges are.
             paint_develop_overlay(self.model, r#box, scale, damage, sink);
@@ -4485,9 +4526,10 @@ fn handle_marks(rect: Rect) -> [(i64, i64); 8] {
     ]
 }
 
-/// The develop box's overlay: the look palette when it is open, else the crop
-/// overlay. Mutually exclusive; painted by the scene and again by the window
-/// over the blitted image.
+/// The develop overlay: the look palette when it is open (on its panel, the
+/// box's rows across the region), else the crop overlay in the box. Mutually
+/// exclusive; painted by the scene and again by the window over the blitted
+/// image.
 fn paint_develop_overlay(
     model: &Controller,
     r#box: Rect,
@@ -4496,47 +4538,32 @@ fn paint_develop_overlay(
     sink: &mut dyn FnMut(Draw),
 ) {
     if model.look_palette().is_some() {
-        paint_looks(model, r#box, scale, damage, sink);
+        paint_looks(model, scale, damage, sink);
     } else {
         paint_crop(model, r#box, scale.value(), damage, sink);
     }
 }
 
-/// The look palette over the develop box: an opaque panel listing the
-/// available look stems, the current one marked, a press picking the one under
-/// it. Chrome (frame fills and glyphs), clipped to the box, so photo pixels
-/// reach the frame only through `blit` when the palette is closed. Rows past
-/// the box are not shown (scroll is a later slice).
-fn paint_looks(
-    model: &Controller,
-    r#box: Rect,
-    scale: Scale,
-    damage: Rect,
-    sink: &mut dyn FnMut(Draw),
-) {
-    let Some((looks, active)) = model.look_palette() else {
+/// The look palette over the develop box: an opaque panel (`look_panel`,
+/// the box's rows across the develop region) listing the available look
+/// stems in columns (`look_rows`), the current one marked, a press picking
+/// the one under it. Chrome (frame fills and glyphs), clipped to the panel,
+/// so photo pixels reach the frame only through `blit` when the palette is
+/// closed. A row past the panel is not shown.
+fn paint_looks(model: &Controller, scale: Scale, damage: Rect, sink: &mut dyn FnMut(Draw)) {
+    let (Some((looks, active)), Some(rows), Some(panel)) =
+        (model.look_palette(), model.look_rows(), model.look_panel())
+    else {
         return;
     };
-    let Some(clip) = r#box.intersection(damage) else {
+    let Some(clip) = panel.intersection(damage) else {
         return;
     };
-    let s = scale.value();
     // An opaque panel so the names read over the develop image.
-    fill(r#box, CHROME, clip, sink);
-    let pad = (CELL_PAD * s) as i64;
-    let row = (CELL_HEIGHT * s) as i64;
-    let bottom = r#box.y + i64::from(r#box.height);
-    let width = (i64::from(r#box.width) - 2 * pad).max(0) as u32;
-    for (index, look) in looks.iter().enumerate() {
-        let y = r#box.y + pad + row * index as i64;
-        if y + row > bottom {
-            break;
-        }
-        let line = Rect {
-            x: r#box.x + pad,
-            y,
-            width,
-            height: row as u32,
+    fill(panel, CHROME, clip, sink);
+    for (index, (look, line)) in looks.iter().zip(rows).enumerate() {
+        let Some(line) = line else {
+            continue;
         };
         let current = active == Some(index);
         let background = if current {
@@ -4729,10 +4756,11 @@ impl Composition for Badges<'_> {
     }
 }
 
-/// The develop overlay and nothing else -- the crop overlay, or the look
-/// palette when it is open -- a composition the window paints over the develop
-/// image it blitted, clipped to the box. So painted, over the scene's own frame
-/// it changes nothing: it is the scene's overlay at the same place.
+/// The develop overlay and nothing else -- the crop overlay, clipped to
+/// the box, or the look palette when it is open, on its panel -- a
+/// composition the window paints over the develop image it blitted. So
+/// painted, over the scene's own frame it changes nothing: it is the
+/// scene's overlay at the same place.
 pub struct Marquee<'a> {
     model: &'a Controller,
 }

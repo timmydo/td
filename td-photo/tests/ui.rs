@@ -19,6 +19,7 @@ use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use td_photo::library::{self, Filter, Flag, Key, Sidecar};
+use td_photo::look;
 use td_photo::ui::{self, Action, Controller, Effect, Photo, View, BINDINGS};
 use td_ui::chrome::DISABLED;
 use td_ui::control::{frame, hex, valid_code, Decoder, ErrorCode};
@@ -3042,15 +3043,38 @@ fn the_look_palette_marks_the_current_look_and_picks_with_the_pointer() {
     let looks = some_looks();
     assert_eq!(c.look_palette(), Some((looks.as_slice(), Some(1))));
 
-    // The rows the palette paints, top-down over the develop box: the top pad,
-    // then one CELL_HEIGHT-high row each. `at(i)` is the middle of row `i`.
+    // The rows the palette paints, top-down on its panel (the box's rows
+    // across the develop region): the top pad, then one CELL_HEIGHT-high
+    // row each from a pad in. `at(i)` is the middle of row `i`.
+    let panel = c.look_panel().unwrap();
+    let region = c.layout().develop_region();
     let r#box = c.develop_box().unwrap();
+    assert_eq!(
+        panel,
+        Rect {
+            x: region.x,
+            width: region.width,
+            ..r#box
+        }
+    );
     let pad = ui::CELL_PAD as i64;
     let row = CELL_HEIGHT as i64;
+    let rows = c.look_rows().unwrap();
+    for (index, line) in rows.iter().enumerate() {
+        assert_eq!(
+            *line,
+            Some(Rect {
+                x: panel.x + pad,
+                y: panel.y + pad + row * index as i64,
+                width: ("contrast-boost".len() * td_ui::CELL_WIDTH) as u32,
+                height: row as u32,
+            })
+        );
+    }
     let at = |index: i64| Input::Pointer {
         phase: PointerPhase::Press,
-        x: (r#box.x + pad + 2) as u32,
-        y: (r#box.y + pad + row * index + row / 2) as u32,
+        x: (panel.x + pad + 2) as u32,
+        y: (panel.y + pad + row * index + row / 2) as u32,
     };
 
     // A press on the current look (mono, row 1) is a no-op: Ignored, no effect,
@@ -3075,8 +3099,8 @@ fn the_look_palette_marks_the_current_look_and_picks_with_the_pointer() {
     let (outcome, effects) = c
         .input(Input::Pointer {
             phase: PointerPhase::Press,
-            x: r#box.x as u32,
-            y: (r#box.y + pad + row / 2) as u32,
+            x: panel.x as u32,
+            y: (panel.y + pad + row / 2) as u32,
         })
         .unwrap();
     assert_eq!(outcome, Outcome::Ignored);
@@ -3088,6 +3112,75 @@ fn the_look_palette_marks_the_current_look_and_picks_with_the_pointer() {
     assert_eq!(outcome, Outcome::Ignored);
     assert!(effects.is_empty());
     assert!(c.look_palette().is_some());
+}
+
+/// A list taller than the panel goes on in a second column beside the
+/// first, each column as wide as its longest name: the built-in set on a
+/// 640 by 480 surface, where one column holds 12 rows, lays the other two
+/// beside them and a press there picks the last.
+#[test]
+fn the_look_palette_lays_a_tall_list_in_columns() {
+    let mut c = Controller::new(surface(640, 480));
+    c.open("roll", b"/r", photos(5)).unwrap();
+    assert_eq!(act(&mut c, "develop", &[]), Outcome::Changed);
+    let mut stems: Vec<String> = look::BUILTIN
+        .iter()
+        .map(|(stem, _)| stem.to_string())
+        .collect();
+    stems.sort();
+    c.set_looks(stems.clone());
+    assert_eq!(act(&mut c, "looks", &[]), Outcome::Changed);
+    let panel = c.look_panel().unwrap();
+    let rows = c.look_rows().unwrap();
+    assert_eq!(rows.len(), 14);
+    assert!(rows.iter().all(Option::is_some), "{panel:?} {rows:?}");
+    let first = rows[0].unwrap();
+    let last = rows[13].unwrap();
+    let per_column =
+        ((i64::from(panel.height) - ui::CELL_PAD as i64) / CELL_HEIGHT as i64) as usize;
+    assert_eq!(per_column, 12);
+    let longest = stems[..per_column].iter().map(|s| s.len()).max().unwrap() as i64;
+    assert_eq!(
+        first,
+        Rect {
+            x: panel.x + ui::CELL_PAD as i64,
+            y: panel.y + ui::CELL_PAD as i64,
+            width: (longest * td_ui::CELL_WIDTH as i64) as u32,
+            height: CELL_HEIGHT as u32,
+        }
+    );
+    assert_eq!(last.y, first.y + CELL_HEIGHT as i64);
+    assert_eq!(
+        last.x,
+        first.x + i64::from(first.width) + ui::CELL_PAD as i64
+    );
+    let second: &[String] = &stems[per_column..];
+    let widest = second.iter().map(|s| s.len()).max().unwrap();
+    assert_eq!(last.width, (widest * td_ui::CELL_WIDTH) as u32);
+    assert!(
+        last.x + i64::from(last.width) <= panel.x + i64::from(panel.width) - ui::CELL_PAD as i64
+    );
+    let (outcome, effects) = c
+        .input(Input::Pointer {
+            phase: PointerPhase::Press,
+            x: (last.x + 2) as u32,
+            y: (last.y + 2) as u32,
+        })
+        .unwrap();
+    assert_eq!(outcome, Outcome::Changed);
+    assert!(matches!(
+        &effects[..],
+        [Effect::Edit { key: Key::Look, value: Some(stem), .. }] if *stem == stems[13]
+    ));
+    // A surface without a develop box lays none.
+    c.input(Input::Resize {
+        width: 640,
+        height: 100,
+        scale: 1,
+    })
+    .unwrap();
+    assert_eq!(c.develop_box(), None);
+    assert_eq!(c.look_rows(), None);
 }
 
 #[test]
@@ -3127,15 +3220,13 @@ fn picking_a_look_named_dash_sets_it_not_clears() {
     c.set_looks(vec!["-".to_string(), "mono".to_string()]);
     assert_eq!(act(&mut c, "looks", &[]), Outcome::Changed);
 
-    let r#box = c.develop_box().unwrap();
-    let pad = ui::CELL_PAD as i64;
-    let row = CELL_HEIGHT as i64;
+    let first = c.look_rows().unwrap()[0].unwrap();
     // Row 0 is the `-` look; the edit sets it (value `Some("-")`), not `None`.
     let (outcome, effects) = c
         .input(Input::Pointer {
             phase: PointerPhase::Press,
-            x: (r#box.x + pad + 2) as u32,
-            y: (r#box.y + pad + row / 2) as u32,
+            x: (first.x + 2) as u32,
+            y: (first.y + i64::from(first.height) / 2) as u32,
         })
         .unwrap();
     assert_eq!(outcome, Outcome::Changed);
@@ -3152,19 +3243,33 @@ fn picking_a_look_named_dash_sets_it_not_clears() {
 
 #[test]
 fn the_look_palette_pick_rejects_the_padding_and_clipped_rows() {
-    let mut c = Controller::new(surface(800, 600));
+    // A panel 424 wide (640 by 480): a column of 60-character names (480
+    // pixels) starts within it and is cut at its right, and the next column
+    // starts past it and is not laid.
+    let mut c = Controller::new(surface(640, 480));
     c.open("roll", b"/r", photos(5)).unwrap();
     assert_eq!(act(&mut c, "develop", &[]), Outcome::Changed);
     let r#box = c.develop_box().unwrap();
     let pad = ui::CELL_PAD as i64;
     let row = CELL_HEIGHT as i64;
-    let width = (i64::from(r#box.width) - 2 * pad).max(0);
-    // Enough looks that a row falls past the box bottom.
     let fit = (i64::from(r#box.height) - pad) / row;
     assert!(fit >= 2);
-    let looks: Vec<String> = (0..fit + 2).map(|i| format!("look-{i}")).collect();
+    let looks: Vec<String> = (0..fit + 2).map(|i| format!("look-{i:0>55}")).collect();
     c.set_looks(looks);
     assert_eq!(act(&mut c, "looks", &[]), Outcome::Changed);
+    let panel = c.look_panel().unwrap();
+    let rows = c.look_rows().unwrap();
+    assert_eq!(rows.len() as i64, fit + 2);
+    assert!(rows[..fit as usize].iter().all(Option::is_some));
+    assert!(rows[fit as usize..].iter().all(Option::is_none));
+    // The cut column's rows run to the pad short of the panel's right, not
+    // to the names' full width.
+    let width = i64::from(rows[0].unwrap().width);
+    assert_eq!(
+        panel.x + pad + width,
+        panel.x + i64::from(panel.width) - pad
+    );
+    assert!(width < 60 * td_ui::CELL_WIDTH as i64);
 
     let press = |c: &mut Controller, x: i64, y: i64| {
         c.input(Input::Pointer {
@@ -3178,26 +3283,32 @@ fn the_look_palette_pick_rejects_the_padding_and_clipped_rows() {
         assert_eq!(outcome, Outcome::Ignored);
         assert!(effects.is_empty());
     };
-    // The top padding, the left padding, the right padding past the names, and
-    // a row clipped by the box bottom are none of them a name: a press picks
-    // nothing.
-    inert(press(&mut c, r#box.x + pad + 2, r#box.y + pad - 1));
-    inert(press(&mut c, r#box.x, r#box.y + pad + row / 2));
+    // The top padding, the left padding, the pad past the names, where a
+    // row past the foot would go, and where the column past the right
+    // would start are none of them a name: a press picks nothing.
+    inert(press(&mut c, panel.x + pad + 2, panel.y + pad - 1));
+    inert(press(&mut c, panel.x, panel.y + pad + row / 2));
     inert(press(
         &mut c,
-        r#box.x + pad + width,
-        r#box.y + pad + row / 2,
+        panel.x + pad + width,
+        panel.y + pad + row / 2,
     ));
     inert(press(
         &mut c,
-        r#box.x + pad + 2,
-        r#box.y + pad + row * fit + row / 2,
+        panel.x + pad + 2,
+        panel.y + pad + row * fit + row / 2,
     ));
-    // But the last fully-shown row (index fit - 1) picks.
+    inert(press(
+        &mut c,
+        panel.x + pad + 60 * td_ui::CELL_WIDTH as i64 + pad + 2,
+        panel.y + pad + row / 2,
+    ));
+    // But the last row of the cut column (index fit - 1) picks, at its
+    // cut end too.
     let (outcome, effects) = press(
         &mut c,
-        r#box.x + pad + 2,
-        r#box.y + pad + row * (fit - 1) + row / 2,
+        panel.x + pad + width - 1,
+        panel.y + pad + row * (fit - 1) + row / 2,
     );
     assert_eq!(outcome, Outcome::Changed);
     assert_eq!(effects.len(), 1);
