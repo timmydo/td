@@ -1,24 +1,31 @@
+//! The client in a window: td-ui's screen window drives the view stack
+//! with the keys it translates, polls the backend's channel each turn and
+//! presents the frame the top view renders. The window owns the Wayland
+//! connection; the session owns the views, the backend and the account.
+
 pub mod input;
 pub mod screen;
 pub mod views;
 
-use crate::backend::{self, BackendCommand};
+use crate::backend::{self, BackendCommand, BackendResponse};
 use crate::compose;
 use crate::config::{AccountConfig, RetentionPolicyConfig, SpamConfig, Theme};
-use crate::jmap::client::JmapClient;
 use crate::regex::UserRegex;
 use crate::rules::CompiledRule;
-use input::read_key;
+use input::Key;
 use screen::Terminal;
 use std::io;
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
+use td_ui::screen::{Input, Screen, Style};
+use td_ui::screen_app::{Flow, Handler};
 use views::mailbox_list::MailboxListView;
 use views::{ViewAction, ViewStack};
 
-fn sync_mouse_for_view(term: &mut Terminal, stack: &ViewStack) -> io::Result<()> {
-    let wants_mouse = stack.current().map(|v| v.wants_mouse()).unwrap_or(true);
-    term.set_mouse_enabled(wants_mouse)
-}
+/// The tenth of a second the terminal's read timed out at, kept as the
+/// longest a turn waits for the backend's answer or the idle-sync clock.
+const POLL_MS: u64 = 100;
 
 /// Wait on a fire-and-forget child in a detached thread so it does not linger
 /// as a zombie. `Child` has no reaping `Drop` impl, so a dropped handle leaks a
@@ -29,12 +36,337 @@ pub fn reap_in_background(mut child: std::process::Child) {
     });
 }
 
+/// What a session keeps of the configuration to open an account's views.
+struct Setup {
+    accounts: Vec<AccountConfig>,
+    account_names: Vec<String>,
+    page_size: u32,
+    scrolloff: usize,
+    browser: Option<String>,
+    reply_from: Option<String>,
+    archive_folder: String,
+    deleted_folder: String,
+    retention_policies: Vec<RetentionPolicyConfig>,
+    sync_interval_secs: Option<u64>,
+    rules: Arc<Vec<CompiledRule>>,
+    custom_headers: Arc<Vec<String>>,
+    rules_mailbox_regex: Arc<UserRegex>,
+    my_email_regex: Arc<UserRegex>,
+    spam_config: SpamConfig,
+    offline: bool,
+    editor_cmd: String,
+    theme: Theme,
+    /// None offline: no connection is ever asked for.
+    connector: Option<Sender<ConnectRequest>>,
+}
+
+impl Setup {
+    fn mailbox_view(
+        &self,
+        cmd_tx: &Sender<BackendCommand>,
+        account: &AccountConfig,
+    ) -> MailboxListView {
+        MailboxListView::new(
+            cmd_tx.clone(),
+            account.username.clone(),
+            self.reply_from.clone(),
+            self.browser.clone(),
+            self.page_size,
+            self.scrolloff,
+            self.account_names.clone(),
+            account.name.clone(),
+            self.archive_folder.clone(),
+            self.deleted_folder.clone(),
+            self.retention_policies.clone(),
+            self.sync_interval_secs,
+        )
+    }
+
+    /// Opens an account: its backend starts with no connection, so the
+    /// window opens at once on the mailbox list's loading state. The
+    /// session offline fetches the mailboxes from the cache now; otherwise
+    /// the connector is asked for the account's connection, which can
+    /// take minutes to make, and the backend holds the fetch, and every
+    /// command a view sends meanwhile, until the connection is decided,
+    /// so nothing is answered from the cache that the connection then
+    /// supersedes and the window never says the client is offline while
+    /// it connects.
+    fn open_account(
+        &self,
+        account: &AccountConfig,
+        origin: &str,
+    ) -> (Sender<BackendCommand>, Receiver<BackendResponse>) {
+        let (cmd_tx, resp_rx) = backend::spawn(
+            None,
+            !self.offline,
+            true,
+            account.name.clone(),
+            self.rules.clone(),
+            self.custom_headers.clone(),
+            self.rules_mailbox_regex.clone(),
+            self.my_email_regex.clone(),
+            self.spam_config.clone(),
+        );
+        let _ = cmd_tx.send(BackendCommand::FetchMailboxes {
+            origin: origin.to_string(),
+        });
+        if let Some(connector) = &self.connector {
+            let _ = connector.send((account.clone(), cmd_tx.clone()));
+        }
+        (cmd_tx, resp_rx)
+    }
+}
+
+/// A connection to make: the account, and the backend it is for.
+type ConnectRequest = (AccountConfig, Sender<BackendCommand>);
+
+/// The connector: the session's one thread for the credential and
+/// discovery round trips, so however many times the account is switched
+/// while a connection is pending, one is in flight (the package caps the
+/// jail's tasks). It serves the latest request, since an account switched
+/// away from needs no connection, and sends the backend its connection,
+/// or the failure, on which the backend answers what it held; a backend
+/// shut down meanwhile has dropped its receiver, and the send fails
+/// unheard. A connection that fails leaves the account on its cache,
+/// logged; selecting the account again retries. The thread ends with the
+/// session, which holds the sender.
+fn spawn_connector() -> Sender<ConnectRequest> {
+    let (tx, rx) = mpsc::channel::<ConnectRequest>();
+    std::thread::spawn(move || {
+        while let Ok(mut request) = rx.recv() {
+            while let Ok(newer) = rx.try_recv() {
+                request = newer;
+            }
+            let (account, cmd_tx) = request;
+            crate::log_info!(
+                "[Connect] connecting to {} ({})",
+                account.name,
+                account.well_known_url
+            );
+            let decision = match crate::connect_account(&account) {
+                Ok(client) => {
+                    crate::log_info!("[Connect] connected to {}", account.name);
+                    BackendCommand::Connect(Box::new(client))
+                }
+                Err(e) => {
+                    crate::log_error!(
+                        "[Connect] {} failed: {}; on the cache until it is selected again",
+                        account.name,
+                        e
+                    );
+                    BackendCommand::ConnectFailed
+                }
+            };
+            let _ = cmd_tx.send(decision);
+        }
+    });
+    tx
+}
+
+struct Session {
+    setup: Setup,
+    stack: ViewStack,
+    cmd_tx: Sender<BackendCommand>,
+    resp_rx: Receiver<BackendResponse>,
+    mouse: bool,
+    /// The grid's rows as the window last laid it out, which the views'
+    /// key handling takes as the terminal's height.
+    rows: u16,
+    sync_interval: Option<Duration>,
+    last_user_activity: Instant,
+    last_idle_sync: Instant,
+    dirty: bool,
+    quitting: bool,
+    /// Reused per input so a wheel frame allocates nothing.
+    keys: Vec<Key>,
+}
+
+impl Session {
+    fn redraw(&mut self) {
+        self.dirty = true;
+    }
+
+    fn act(&mut self, action: ViewAction) {
+        match action {
+            ViewAction::Continue => self.redraw(),
+            ViewAction::Push(new_view) => {
+                self.stack.push(new_view);
+                self.redraw();
+            }
+            ViewAction::Pop => {
+                if !self.stack.pop() {
+                    self.quitting = true;
+                    return;
+                }
+                // Let the revealed view refresh state that may have changed
+                // while it was hidden (e.g. mailbox unread counts).
+                if let Some(view) = self.stack.current_mut() {
+                    view.on_reveal();
+                }
+                self.redraw();
+            }
+            ViewAction::Quit => self.quitting = true,
+            ViewAction::Compose(draft_text) => {
+                spawn_editor(&draft_text, &self.setup.editor_cmd);
+                self.redraw();
+            }
+            ViewAction::SwitchAccount(name) => self.switch_account(&name),
+        }
+    }
+
+    /// Switches to the named account as the session started on the first:
+    /// its mailbox list at once, its connection when the connector has
+    /// it. The old backend is told to shut down first; one still finishing
+    /// a request holds its store's lock a while longer, and the backend of
+    /// an account switched away from and back opens the store once it is
+    /// free, blocking nothing meanwhile.
+    fn switch_account(&mut self, name: &str) {
+        let Some(account) = self.setup.accounts.iter().find(|a| a.name == name) else {
+            return;
+        };
+        let _ = self.cmd_tx.send(BackendCommand::Shutdown);
+        let (cmd_tx, resp_rx) = self.setup.open_account(account, "switch_account");
+        let mailbox_view = self.setup.mailbox_view(&cmd_tx, account);
+        self.cmd_tx = cmd_tx;
+        self.resp_rx = resp_rx;
+        self.stack = ViewStack::new(Box::new(mailbox_view));
+        self.last_idle_sync = Instant::now();
+        self.redraw();
+    }
+
+    /// A pending action the top view raised from a response or a click
+    /// that rendered its feedback first.
+    fn take_pending(&mut self) {
+        let Some(view) = self.stack.current_mut() else {
+            return;
+        };
+        match view.take_pending_action() {
+            Some(ViewAction::Push(new_view)) => {
+                self.stack.push(new_view);
+                self.redraw();
+            }
+            Some(ViewAction::Compose(draft_text)) => {
+                spawn_editor(&draft_text, &self.setup.editor_cmd);
+                self.redraw();
+            }
+            _ => {}
+        }
+    }
+
+    fn wants_mouse(&self) -> bool {
+        self.mouse && self.stack.current().map(|v| v.wants_mouse()).unwrap_or(true)
+    }
+}
+
+impl Handler for Session {
+    fn title(&self) -> &str {
+        "Mail"
+    }
+
+    fn app_id(&self) -> &str {
+        "td-mail"
+    }
+
+    fn ground(&self) -> Style {
+        screen::base_style(&self.setup.theme)
+    }
+
+    fn input(&mut self, input: Input) -> Flow {
+        match input {
+            Input::Close => return Flow::Quit,
+            Input::Resize { rows, .. } => {
+                self.rows = u16::try_from(rows).unwrap_or(u16::MAX);
+                self.redraw();
+                return Flow::Continue;
+            }
+            _ => {}
+        }
+        self.keys.clear();
+        input::translate(input, self.wants_mouse(), &mut self.keys);
+        let keys = std::mem::take(&mut self.keys);
+        for key in keys.iter().cloned() {
+            if self.quitting {
+                break;
+            }
+            self.last_user_activity = Instant::now();
+            match self.stack.handle_key(key, self.rows) {
+                Some(action) => self.act(action),
+                None => self.quitting = true,
+            }
+        }
+        self.keys = keys;
+        if self.quitting {
+            Flow::Quit
+        } else {
+            Flow::Continue
+        }
+    }
+
+    fn poll(&mut self, _now: u64) -> Flow {
+        // A backend that is gone answers nothing more; the views stay up
+        // on what they hold, as they did in the terminal.
+        while let Ok(response) = self.resp_rx.try_recv() {
+            if self.stack.handle_response(&response) {
+                self.redraw();
+            }
+            if let Some(view) = self.stack.current_mut() {
+                if let Some(ViewAction::Compose(draft_text)) = view.take_pending_action() {
+                    spawn_editor(&draft_text, &self.setup.editor_cmd);
+                    self.redraw();
+                }
+            }
+        }
+        self.take_pending();
+        if let Some(interval) = self.sync_interval {
+            if self.last_user_activity.elapsed() >= interval
+                && self.last_idle_sync.elapsed() >= interval
+            {
+                if let Some(view) = self.stack.current_mut() {
+                    if view.trigger_idle_sync() {
+                        self.last_idle_sync = Instant::now();
+                    }
+                }
+            }
+        }
+        if self.quitting {
+            Flow::Quit
+        } else {
+            Flow::Continue
+        }
+    }
+
+    fn wait_ms(&self, _now: u64) -> u64 {
+        POLL_MS
+    }
+
+    fn needs_redraw(&self) -> bool {
+        self.dirty
+    }
+
+    fn render(&mut self, screen: &mut Screen) {
+        let mut term = Terminal::new(screen, self.setup.theme.clone());
+        // The grid the views key against is the one they were drawn on.
+        self.rows = term.rows;
+        if let Err(e) = self.stack.render_current(&mut term) {
+            crate::log_error!("render failed: {}", e);
+        }
+        self.dirty = false;
+    }
+
+    fn notice(&mut self, message: &str) {
+        crate::log_error!("window: {}", message);
+    }
+}
+
+/// Runs the client in a window on the compositor the environment names,
+/// until the window closes or the top view quits. The window opens before
+/// the account connects, its mailbox list loading until the connector
+/// has decided the connection, so the toplevel is up within the unit's
+/// readiness wait however long discovery takes.
 #[allow(clippy::too_many_arguments)]
 pub fn run(
-    client: Option<JmapClient>,
     accounts: Vec<AccountConfig>,
     current_account_idx: usize,
-    initial_account_name: String,
     page_size: u32,
     scrolloff: usize,
     editor: Option<String>,
@@ -53,9 +385,8 @@ pub fn run(
     spam_config: SpamConfig,
     offline: bool,
 ) -> io::Result<()> {
-    // Read before the backend thread is spawned and the terminal taken over,
-    // so an index the account list does not hold fails on a plain screen with
-    // nothing to clean up.
+    // Read before the backend thread is spawned and the window opened, so
+    // an index the account list does not hold fails with nothing to close.
     let Some(first) = accounts.get(current_account_idx) else {
         return Err(io::Error::other(format!(
             "no account at index {} of {}",
@@ -63,208 +394,73 @@ pub fn run(
             accounts.len()
         )));
     };
-    let (first_username, first_name) = (first.username.clone(), first.name.clone());
-
-    let rules = std::sync::Arc::new(rules);
-    let custom_headers = std::sync::Arc::new(custom_headers);
-    // Both patterns were compiled where the configuration was read.
-    let rules_mailbox_regex = std::sync::Arc::new(rules_mailbox_regex);
-    let my_email_regex = std::sync::Arc::new(my_email_regex);
-    let (mut cmd_tx, mut resp_rx) = backend::spawn(
-        client,
-        initial_account_name,
-        rules.clone(),
-        custom_headers.clone(),
-        rules_mailbox_regex.clone(),
-        my_email_regex.clone(),
-        spam_config.clone(),
-    );
-    let mut term = Terminal::new(mouse, theme)?;
-
-    let account_names: Vec<String> = accounts.iter().map(|a| a.name.clone()).collect();
-
-    let mailbox_view = MailboxListView::new(
-        cmd_tx.clone(),
-        first_username,
-        reply_from.clone(),
-        browser.clone(),
-        page_size,
-        scrolloff,
-        account_names.clone(),
-        first_name,
-        archive_folder.clone(),
-        deleted_folder.clone(),
-        retention_policies.clone(),
-        sync_interval_secs,
-    );
-    let _ = cmd_tx.send(BackendCommand::FetchMailboxes {
-        origin: "startup".to_string(),
-    });
-
-    let mut stack = ViewStack::new(Box::new(mailbox_view));
-    let sync_interval = sync_interval_secs.map(Duration::from_secs);
-    let mut last_user_activity = Instant::now();
-    let mut last_idle_sync = Instant::now();
-
+    let first = first.clone();
     let editor_cmd = editor
         .or_else(|| std::env::var("EDITOR").ok())
         .unwrap_or_else(|| "vi".to_string());
+    let setup = Setup {
+        account_names: accounts.iter().map(|a| a.name.clone()).collect(),
+        accounts,
+        page_size,
+        scrolloff,
+        browser,
+        reply_from,
+        archive_folder,
+        deleted_folder,
+        retention_policies,
+        sync_interval_secs,
+        rules: Arc::new(rules),
+        custom_headers: Arc::new(custom_headers),
+        // Both patterns were compiled where the configuration was read.
+        rules_mailbox_regex: Arc::new(rules_mailbox_regex),
+        my_email_regex: Arc::new(my_email_regex),
+        spam_config,
+        offline,
+        editor_cmd,
+        theme,
+        connector: (!offline).then(spawn_connector),
+    };
 
-    sync_mouse_for_view(&mut term, &stack)?;
-    stack.render_current(&mut term)?;
+    let endpoint = td_ui::wayland::endpoint(
+        std::env::var_os("WAYLAND_SOCKET"),
+        std::env::var_os("WAYLAND_DISPLAY"),
+        std::env::var_os("XDG_RUNTIME_DIR"),
+    )
+    .map_err(io::Error::other)?;
+    let stream = td_ui::wayland::connect(endpoint).map_err(io::Error::other)?;
 
-    loop {
-        if term.check_resize() {
-            sync_mouse_for_view(&mut term, &stack)?;
-            stack.render_current(&mut term)?;
-        }
+    let (cmd_tx, resp_rx) = setup.open_account(&first, "startup");
+    let mailbox_view = setup.mailbox_view(&cmd_tx, &first);
 
-        let mut needs_render = false;
-        while let Ok(response) = resp_rx.try_recv() {
-            if stack.handle_response(&response) {
-                needs_render = true;
-            }
-
-            if let Some(view) = stack.current_mut() {
-                if let Some(ViewAction::Compose(draft_text)) = view.take_pending_action() {
-                    spawn_editor(&draft_text, &editor_cmd);
-                    needs_render = true;
-                }
-            }
-        }
-        if needs_render {
-            sync_mouse_for_view(&mut term, &stack)?;
-            stack.render_current(&mut term)?;
-        }
-
-        // Check for pending actions (e.g. mouse click that rendered feedback first)
-        if let Some(view) = stack.current_mut() {
-            if let Some(action) = view.take_pending_action() {
-                match action {
-                    ViewAction::Push(new_view) => {
-                        stack.push(new_view);
-                        sync_mouse_for_view(&mut term, &stack)?;
-                        stack.render_current(&mut term)?;
-                    }
-                    ViewAction::Compose(draft_text) => {
-                        spawn_editor(&draft_text, &editor_cmd);
-                        sync_mouse_for_view(&mut term, &stack)?;
-                        stack.render_current(&mut term)?;
-                    }
-                    _ => {}
-                }
-            }
-        }
-
-        if let Some(key) = read_key() {
-            last_user_activity = Instant::now();
-            let action = match stack.handle_key(key, term.rows) {
-                Some(action) => action,
-                None => break,
-            };
-
-            match action {
-                ViewAction::Continue => {
-                    sync_mouse_for_view(&mut term, &stack)?;
-                    stack.render_current(&mut term)?;
-                }
-                ViewAction::Push(new_view) => {
-                    stack.push(new_view);
-                    sync_mouse_for_view(&mut term, &stack)?;
-                    stack.render_current(&mut term)?;
-                }
-                ViewAction::Pop => {
-                    if !stack.pop() {
-                        break;
-                    }
-                    // Let the revealed view refresh state that may have changed
-                    // while it was hidden (e.g. mailbox unread counts).
-                    if let Some(view) = stack.current_mut() {
-                        view.on_reveal();
-                    }
-                    sync_mouse_for_view(&mut term, &stack)?;
-                    stack.render_current(&mut term)?;
-                }
-                ViewAction::Quit => {
-                    break;
-                }
-                ViewAction::Compose(draft_text) => {
-                    spawn_editor(&draft_text, &editor_cmd);
-                    sync_mouse_for_view(&mut term, &stack)?;
-                    stack.render_current(&mut term)?;
-                }
-                ViewAction::SwitchAccount(name) => {
-                    if let Some(account) = accounts.iter().find(|a| a.name == name) {
-                        // Shut down old backend
-                        let _ = cmd_tx.send(BackendCommand::Shutdown);
-
-                        let new_client = if offline {
-                            Ok(None)
-                        } else {
-                            match crate::connect_account(account) {
-                                Ok(c) => Ok(Some(c)),
-                                Err(e) => Err(e),
-                            }
-                        };
-
-                        match new_client {
-                            Ok(client) => {
-                                let (new_cmd_tx, new_resp_rx) = backend::spawn(
-                                    client,
-                                    account.name.clone(),
-                                    rules.clone(),
-                                    custom_headers.clone(),
-                                    rules_mailbox_regex.clone(),
-                                    my_email_regex.clone(),
-                                    spam_config.clone(),
-                                );
-                                cmd_tx = new_cmd_tx;
-                                resp_rx = new_resp_rx;
-
-                                let mailbox_view = MailboxListView::new(
-                                    cmd_tx.clone(),
-                                    account.username.clone(),
-                                    reply_from.clone(),
-                                    browser.clone(),
-                                    page_size,
-                                    scrolloff,
-                                    account_names.clone(),
-                                    account.name.clone(),
-                                    archive_folder.clone(),
-                                    deleted_folder.clone(),
-                                    retention_policies.clone(),
-                                    sync_interval_secs,
-                                );
-                                let _ = cmd_tx.send(BackendCommand::FetchMailboxes {
-                                    origin: "switch_account".to_string(),
-                                });
-                                stack = ViewStack::new(Box::new(mailbox_view));
-                                last_idle_sync = Instant::now();
-                            }
-                            Err(e) => {
-                                crate::log_error!("Failed to connect to account {}: {}", name, e);
-                                // Stay on current account, just re-render
-                            }
-                        }
-                        sync_mouse_for_view(&mut term, &stack)?;
-                        stack.render_current(&mut term)?;
-                    }
-                }
-            }
-        } else if let Some(interval) = sync_interval {
-            if last_user_activity.elapsed() >= interval && last_idle_sync.elapsed() >= interval {
-                if let Some(view) = stack.current_mut() {
-                    if view.trigger_idle_sync() {
-                        last_idle_sync = Instant::now();
-                    }
-                }
-            }
+    let mut session = Session {
+        stack: ViewStack::new(Box::new(mailbox_view)),
+        cmd_tx,
+        resp_rx,
+        mouse,
+        rows: 0,
+        sync_interval: sync_interval_secs.map(Duration::from_secs),
+        last_user_activity: Instant::now(),
+        last_idle_sync: Instant::now(),
+        dirty: true,
+        quitting: false,
+        keys: Vec::new(),
+        setup,
+    };
+    let outcome = td_ui::screen_app::run(&mut session, stream, std::env::temp_dir());
+    let _ = session.cmd_tx.send(BackendCommand::Shutdown);
+    // The backend answers what it held from the cache on the way out;
+    // wait for it to go, up to two seconds of silence, so a mutation it
+    // queues is written before the process ends. One mid-request is left
+    // to the exit.
+    let mut silent = 0;
+    while silent < 20 {
+        match session.resp_rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(_) => {}
+            Err(mpsc::RecvTimeoutError::Timeout) => silent += 1,
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
     }
-
-    let _ = cmd_tx.send(BackendCommand::Shutdown);
-
-    Ok(())
+    outcome.map_err(io::Error::other)
 }
 
 fn spawn_editor(draft: &compose::ComposeDraft, editor_cmd: &str) {

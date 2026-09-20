@@ -1,6 +1,7 @@
-// The crate's one unsafe surface is `term_sys.rs`, which allows the lint on its
-// single syscall entry point. Nothing else may.
-#![deny(unsafe_code)]
+// The client draws in a td-ui window: the terminal surface it once carried
+// (UNSAFE.md §17) went with the terminal, and the Wayland transport is
+// td-ui's (§19), so no `unsafe` is written here.
+#![forbid(unsafe_code)]
 
 #[macro_use]
 mod log;
@@ -30,9 +31,6 @@ mod regex;
 mod rules;
 mod spam;
 mod td_fetch;
-// The shared module carries a terminal surface wider than td-mail's one raw mode.
-#[allow(dead_code)]
-mod term_sys;
 #[cfg(test)]
 mod testing;
 // The shared module carries more of TOML than td-mail's two files need.
@@ -42,7 +40,6 @@ mod tui;
 
 use config::{AccountConfig, Config, PasswordSource};
 use jmap::client::{JmapClient, JmapError};
-use std::io::{self, Write};
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -633,44 +630,17 @@ fn main() {
         std::process::exit(1);
     };
 
-    let client = if offline {
+    if offline {
         eprintln!("Offline mode ({})", first_account.name);
-        None
-    } else {
-        // Connect to the first account
-        eprint!(
-            "Connecting to {} ({})...",
-            first_account.name, first_account.well_known_url
-        );
-        io::stderr().flush().ok();
+    }
 
-        match connect_account(first_account) {
-            Ok(client) => {
-                eprintln!(" OK");
-                Some(client)
-            }
-            Err(e) => {
-                // A server that is down, a network that is not up yet, or a
-                // placeholder account: start from the cache instead of
-                // exiting, so the window stays open and switching to the
-                // account again retries the connection.
-                eprintln!(" FAILED");
-                eprintln!("{}", e);
-                eprintln!("Starting offline; select the account again to reconnect.");
-                log_error!("[Startup] connect to {} failed: {}", first_account.name, e);
-                None
-            }
-        }
-    };
-
-    let first_account_name = first_account.name.clone();
-
-    // Enter TUI
+    // Open the window before the first account connects; the connection
+    // is made behind it, so a server that is down, a network that is not
+    // up yet, or a placeholder account leaves the window open on what
+    // the cache holds, and selecting the account again retries.
     let outcome = tui::run(
-        client,
         config.accounts,
         0,
-        first_account_name,
         config.ui.page_size,
         config.ui.scrolloff,
         config.ui.editor,
@@ -690,17 +660,8 @@ fn main() {
         offline,
     );
 
-    // The raw-mode guard restores the terminal from a `Drop`, which has nowhere
-    // to report from. This is the exit, and the operator staring at a terminal
-    // with no echo is the only one who can act on it.
-    if let Some(why) = term_sys::take_restore_failure() {
-        eprintln!("td-mail: {}", why);
-        eprintln!("td-mail: run `stty sane` to put the terminal back.");
-        log_error!("[Exit] {}", why);
-    }
-
     if let Err(e) = outcome {
-        eprintln!("TUI error: {}", e);
+        eprintln!("Window error: {}", e);
         std::process::exit(1);
     }
 }

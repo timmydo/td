@@ -1,6 +1,6 @@
 //! The `mail` application: td-mail, td's JMAP mail client, as a static
-//! package on the data-only static runtime. It runs in a td-term window at boot
-//! (`system-x86-64`'s `[mail]` unit) and reads
+//! package on the data-only static runtime. It opens a td-ui window of its own at
+//! boot (`system-x86-64`'s `[mail]` unit) and reads
 //! `$XDG_CONFIG_HOME/td-mail/config.toml`, which
 //! td-firstboot provisions once under the login user's jail state. Saved
 //! attachments land in the `xdg-download` grant, the directory Firefox shares.
@@ -9,7 +9,7 @@
 //! composes in `$EDITOR`, the jail's `/app` sees no editor that is not
 //! packaged with the application, and the editor is a Wayland client the
 //! jail's existing `sockets=wayland` grant admits, so it opens its own
-//! toplevel beside the terminal.
+//! toplevel beside the mail window.
 use crate::application::ApplicationDeclaration;
 use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 use td_engine::launcher::LauncherDeclaration;
@@ -47,15 +47,14 @@ pub fn recipe() -> Recipe {
         return invalid_recipe("launcher");
     };
     // The fetch socket for the protocol the program speaks (APPLICATIONS.md
-    // §W.8; no network of its own), the Wayland socket the jail requires of
-    // every application, and the terminal grant: td-term hands the
-    // launcher a fresh pty and td-jail makes it the program's controlling
-    // terminal. The credential client needs only the default portal grant;
-    // mail still owns no bus name.
+    // §W.8; no network of its own) and the Wayland socket, which is the
+    // window the program draws in as well as the one the jail requires of
+    // every application. No terminal grant: the client draws through td-ui,
+    // and a pty would be a descriptor nothing reads. The credential client
+    // needs only the default portal grant; mail still owns no bus name.
     let Ok(permissions) = PermissionPolicy::new()
         .with_socket(PermissionSocket::Wayland)
         .and_then(|permissions| permissions.with_socket(PermissionSocket::Fetch))
-        .and_then(|permissions| permissions.with_terminal())
         .and_then(|permissions| {
             permissions.with_filesystem("xdg-download", FilesystemAccess::ReadWrite, true)
         })
@@ -156,7 +155,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn mail_is_one_static_terminal_application_without_a_bus_name() {
+    fn mail_is_one_static_window_application_without_a_terminal_or_a_bus_name() {
         let recipe = recipe();
         let declaration = recipe.application.as_ref().expect("declaration");
         assert_eq!(declaration.runtime(), "static-runtime");
@@ -183,11 +182,12 @@ mod tests {
         let permissions = recipe.application_permissions.as_ref().expect("permissions");
         // The fetch grant, not the network: the keyfile below says which.
         assert!(!permissions.network());
-        assert!(permissions.terminal());
+        // No terminal: the client is a Wayland client of its own window.
+        assert!(!permissions.terminal());
         assert_eq!(permissions.session_bus().count(), 0);
         assert_eq!(
             permissions.to_keyfile(),
-            "format=2\n\n[Context]\nsockets=wayland;fetch\ndevices=tty\n\n[Filesystem]\nxdg-download=rw:create\n\n[Resources]\nmemory-high=201326592\nmemory-max=268435456\npids-max=32\ncpu-max=50000 100000\n"
+            "format=2\n\n[Context]\nsockets=wayland;fetch\n\n[Filesystem]\nxdg-download=rw:create\n\n[Resources]\nmemory-high=201326592\nmemory-max=268435456\npids-max=32\ncpu-max=50000 100000\n"
         );
         let steps = recipe.steps.as_ref().expect("steps");
         assert!(steps.iter().any(|step| matches!(

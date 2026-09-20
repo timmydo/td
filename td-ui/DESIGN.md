@@ -90,8 +90,8 @@ which drives a program's `Handler` with translated presses, clicks and
 wheel travel on cells, the grid laid out again on configure, focus and
 the close request, and polls the handler each turn under a bounded wait
 so work arriving on a channel from another thread is served without a
-descriptor of its own in the loop. td-news, until now a terminal
-program, draws in it; td-mail consumes it in its next increment.
+descriptor of its own in the loop. td-news and td-mail, until now
+terminal programs, draw in it.
 
 ## Purpose and trust position
 
@@ -108,12 +108,12 @@ sibling-dependency spelling `builder/src/affected.rs` admits, and the
 consumer's lock then lists exactly its own package plus td-ui. A program
 that depends on td-ui is built by a cargo recipe that stages sibling source
 trees (`local_source_trees`, the td-net shape); a flat-staged direct-rustc
-recipe cannot link a second crate. td-portal, td-taskmgr and td-editor are
-built that way: each stages `td-ui`, and `td-compositor` because td-ui
-mounts the font and wire modules from it, beside its own tree (td-portal
-stages further siblings of its own), so a toolkit edit moves each
-consumer's source-digest row and selects each consumer's realized-output
-check.
+recipe cannot link a second crate. td-portal, td-taskmgr, td-editor,
+td-news and td-mail are built that way: each stages `td-ui`, and
+`td-compositor` because td-ui mounts the font and wire modules from it,
+beside its own tree (td-portal stages further siblings of its own), so a
+toolkit edit moves each consumer's source-digest row and selects each
+consumer's realized-output check.
 
 ## Public surface
 
@@ -1767,6 +1767,5 @@ regressions. Those increments extend the original sequence below.
     `Composition` with the key vocabulary and chord translation, and
     `screen_app`, the window that presents it and polls a `Handler`,
     proven with a recording handler against a scripted peer. Landed;
-    td-news draws in it (APPLICATIONS.md §W.8, "Reworked"), and td-mail
-    moves from the terminal onto it next, in its own increment with its
-    recipe, package and unit.
+    td-news and td-mail draw in it (APPLICATIONS.md §W.8, "Reworked"),
+    each landed in its own increment with its recipe, package and unit.

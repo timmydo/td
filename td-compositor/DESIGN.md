@@ -2444,7 +2444,7 @@ with `--launcher-application` (otherwise an input-monitor entry that starts
 close entry. Task Manager issues fixed private request 07 and uses the
 human credentials and system PID view described in td-authd/DESIGN.md.
 Direct development mode hides that entry; the standalone task manager
-runs directly on the user's Wayland session. The terminal applications carry
+runs directly on the user's Wayland session. Mail and news carry
 launcher declarations of their own, but the image names Firefox alone, so the
 card does not show them; showing them is the relaunch work APPLICATIONS.md §W.7
 defers, and it grows the card. The application entry's uppercase label and
@@ -6022,7 +6022,7 @@ the vocabulary a caller might expect the other way round, so the help text
 says which it is and a test pins it.
 
 The image's first scripted callers use that vocabulary and nothing finer. The
-`[applications-workspace]` unit switches to the terminal applications' workspace
+`[applications-workspace]` unit switches to the applications' workspace
 before either of them starts, `[shell-workspace]` switches back to the first
 once both are decided, and Firefox maps only after that: a new window goes to
 the active workspace, so the two applications share the second and the first

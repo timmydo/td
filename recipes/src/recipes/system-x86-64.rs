@@ -402,7 +402,7 @@ const APPLICATION_GREETER_WAIT_ITERATIONS: u16 =
 /// enough for a program that exits on its configuration to have done so.
 const APPLICATION_SETTLE_SECS: u32 = 5;
 
-/// The workspace the terminal applications' windows map on: the control
+/// The workspace the applications' windows map on: the control
 /// channel makes it active before they start. Not the first: that one is the
 /// shell's and Firefox's, whose tiles the physical-input oracle binds at
 /// fixed coordinates.
@@ -417,9 +417,9 @@ const SHIPPED_APPLICATIONS: &[ShippedApplication] = &[
         runtime: "freedesktop-platform-25-08",
         runtime_recipe: super::freedesktop_platform_25_08::recipe,
     },
-    // The terminal applications: td-owned static programs on the data-only
-    // runtime, each a td-term window at boot. Neither holds a bus name; the
-    // tripwire below counts the applications that do.
+    // The two source-built applications: td-owned static programs on the
+    // data-only runtime, each a td-ui window of its own at boot. Neither
+    // holds a bus name; the tripwire below counts the applications that do.
     ShippedApplication {
         name: TD_MAIL_NAME,
         package: TD_MAIL_NAME,
@@ -438,8 +438,8 @@ const SHIPPED_APPLICATIONS: &[ShippedApplication] = &[
     },
     // Claude Code: a marked foreign payload on the freedesktop runtime, run as
     // a terminal application with no bus name — the first foreign-payload
-    // terminal program, beside Firefox's foreign non-terminal one, the
-    // source-built terminal mail and the source-built td-ui window news.
+    // terminal program, beside Firefox's foreign non-terminal one and the
+    // source-built td-ui window applications mail and news.
     ShippedApplication {
         name: CLAUDE_NAME,
         package: CLAUDE_NAME,
@@ -1383,7 +1383,7 @@ mod svc_timeouts {
 ///   td-firstboot mints the per-machine identity, so it precedes everything that reads
 ///     or checks it — rootcheck (asserts it is READABLE through the MUTABLE_ETC
 ///     symlinks on a still-read-only /etc), and OpenSSH (whose immutable config
-///     names those mutable paths). It also provisions the terminal applications'
+///     names those mutable paths). It also provisions the applications'
 ///     first configuration into the login user's home, which stage-1 init created
 ///     and handed to that user before sysinit began.
 ///   rootcheck precedes netup: the read-only-root self-check before networking.
@@ -1419,7 +1419,7 @@ fn build_td_svc_conf() -> String {
          # Mints the per-machine identity everything below reads or checks.\n\
          # after=hostname serializes both provisioners' initialization of\n\
          # their shared /var/lib/td directory.\n\
-         # The primary selector adds a first configuration for the terminal\n\
+         # The primary selector adds a first configuration for the\n\
          # applications (mail, news) under each private application home: created\n\
          # once, owned by its service UID, never rewritten after provisioning.\n\
          [td-firstboot]\n\
@@ -1688,11 +1688,16 @@ fn build_td_svc_conf() -> String {
          ready-timeout=30\n\
          restart=always\n\
          \n\
-         # The terminal applications, one td-term window each, whose child is\n\
-         # the application's /bin launcher: the program runs in its own jail\n\
-         # under the terminal grant, and the window is ready once td-term has\n\
-         # spawned that child. restart=never: a client that exits is restarted\n\
-         # by the operator (a reboot today; a user-level relaunch is\n\
+         # The two source-built applications, a td-ui window each, launched\n\
+         # direct as Firefox is with no terminal: the program runs in its own\n\
+         # jail, and the unit is ready once the compositor's layout report\n\
+         # names its toplevel by the app id the client sets, anchored at the\n\
+         # record's every field so a title cannot forge one; a client that\n\
+         # could not open its window is a unit that never becomes ready, as\n\
+         # one that could not open its pty was. Mail opens its window before\n\
+         # the account connects, so the minutes discovery can take do not\n\
+         # count against the wait. restart=never: a client that exits is\n\
+         # restarted by the operator (a reboot today; a user-level relaunch is\n\
          # APPLICATIONS.md §W.7), not by a loop that would hide a broken\n\
          # configuration behind a flickering window, and a broker that failed\n\
          # is a session they are skipped in rather than launched into. The\n\
@@ -1717,10 +1722,10 @@ fn build_td_svc_conf() -> String {
          [mail]\n\
          type=daemon\n\
          cgroup=session\n\
-         exec=/bin/td-authd application-start {ui_uid} {mail_name} terminal --\n\
-         after=terminal,busd,portal,mail-fetch,mail-files,applications-workspace,firefox-tls-setup\n\
+         exec=/bin/td-authd application-start {ui_uid} {mail_name} direct --\n\
+         after=busd,portal,mail-fetch,mail-files,applications-workspace,firefox-tls-setup\n\
          requires=wayland,busd,mail-fetch,mail-files,td-firstboot\n\
-         ready=/bin/td-login exec-service-as tda65537 -- /bin/td-term probe /run/user/65537/td-app-mail.ready\n\
+         ready=/bin/sh -c 'layout=$(/bin/td-login exec-primary -- /bin/td-ctl --socket {control_socket} layout) && /bin/echo \"$layout\" | /bin/grep -q \"{window_record}{mail_program} title=\"'\n\
          ready-timeout=30\n\
          restart=never\n\
          \n\
@@ -2170,7 +2175,7 @@ fn build_deployment_init(sys: &SystemDef) -> String {
          /bin/td-util chmod 0700 /sysroot/var/root\n"
     ));
     // Each persistent home is its user's from the moment it exists: td-firstboot
-    // provisions the terminal applications' configuration into it at sysinit,
+    // provisions the applications' configuration into it at sysinit,
     // before rootcheck, and refuses a home the user does not own.
     for user in sys.users {
         if gets_generic_persistent_home_setup(user) && user.uid != UI_UID {
@@ -6590,11 +6595,11 @@ news\tnews-0.1\tsource\tstatic-runtime-1\tsource\n"
         );
     }
 
-    /// Each terminal application is one td-term window whose `--command` is
-    /// the application's `/bin` launcher: started after the first terminal,
-    /// probed through a ready socket of its own, handed to the session cgroup
-    /// like every handed-off unit, ordered behind the broker every jail registers
-    /// with, and never restarted by td-svc. Its evidence oneshot requires the
+    /// Each source-built application is one td-ui window of its own,
+    /// launched direct as Firefox is: probed through the compositor's
+    /// layout report naming its toplevel by app id, handed to the session
+    /// cgroup like every handed-off unit, ordered behind the broker every
+    /// jail registers with, and never restarted by td-svc. Its evidence oneshot requires the
     /// window, runs under the autotest token alone, and prints the marker
     /// only after td-jail finds the client itself, by the program its entry
     /// runs as, still in the instance. Placement is the compositor's own map
@@ -6603,7 +6608,7 @@ news\tnews-0.1\tsource\tstatic-runtime-1\tsource\n"
     /// only after the placement evidence has read the compositor's report
     /// with the shell alone on the first workspace.
     #[test]
-    fn the_terminal_applications_are_td_term_windows_of_their_launchers() {
+    fn the_source_built_applications_are_td_ui_windows_launched_direct() {
         assert_eq!(entry_program(TD_MAIL_ENTRY), "td-mail");
         assert_eq!(entry_program(TD_NEWS_ENTRY), "td-news");
         assert_eq!(entry_program("td-news"), "td-news");
@@ -6640,23 +6645,16 @@ news\tnews-0.1\tsource\tstatic-runtime-1\tsource\n"
             let exec = unit_key(unit, "exec").unwrap_or_default();
             let uid = if name == "mail" { 65537 } else { 65538 };
             let ready = unit_key(unit, "ready").unwrap_or_default();
-            if name == "mail" {
-                // Still a terminal application: td-term's pty, and its ready
-                // socket as the proof the program has it.
-                assert_eq!(exec, format!("/bin/td-authd application-start {UI_UID} {name} terminal --"));
-                assert_eq!(ready, format!("/bin/td-login exec-service-as tda{uid} -- /bin/td-term probe /run/user/{uid}/td-app-{name}.ready"));
-            } else {
-                // A td-ui window of its own, launched direct as Firefox is;
-                // ready is the compositor's report naming its toplevel by
-                // the app id the client sets, which is the program's name.
-                assert_eq!(exec, format!("/bin/td-authd application-start {UI_UID} {name} direct --"));
-                assert_eq!(
-                    ready,
-                    format!(
-                        "/bin/sh -c 'layout=$(/bin/td-login exec-primary -- /bin/td-ctl --socket {CONTROL_SOCKET} layout) && /bin/echo \"$layout\" | /bin/grep -q \"{WINDOW_RECORD}{program} title=\"'"
-                    )
-                );
-            }
+            // A td-ui window of its own, launched direct as Firefox is;
+            // ready is the compositor's report naming its toplevel by
+            // the app id the client sets, which is the program's name.
+            assert_eq!(exec, format!("/bin/td-authd application-start {UI_UID} {name} direct --"));
+            assert_eq!(
+                ready,
+                format!(
+                    "/bin/sh -c 'layout=$(/bin/td-login exec-primary -- /bin/td-ctl --socket {CONTROL_SOCKET} layout) && /bin/echo \"$layout\" | /bin/grep -q \"{WINDOW_RECORD}{program} title=\"'"
+                )
+            );
             assert_eq!(unit_key(&format!("{name}-fetch"), "exec"), Some(format!("/bin/td-login exec-service-as tda{uid} -- /bin/td-fetchd run --socket /run/user/{uid}/td-fetch/socket")));
             assert_eq!(unit_key(unit, "type").as_deref(), Some("daemon"), "{unit}");
             assert_eq!(unit_key(unit, "restart").as_deref(), Some("never"), "{unit}");
@@ -6673,7 +6671,7 @@ news\tnews-0.1\tsource\tstatic-runtime-1\tsource\n"
             assert_eq!(
                 unit_after(unit),
                 if unit == "mail" {
-                    vec!["terminal", "busd", "portal", "mail-fetch", "mail-files", "applications-workspace", "firefox-tls-setup"]
+                    vec!["busd", "portal", "mail-fetch", "mail-files", "applications-workspace", "firefox-tls-setup"]
                 } else {
                     vec!["busd", "news-fetch", "applications-workspace"]
                 },
@@ -7273,7 +7271,7 @@ news\tnews-0.1\tsource\tstatic-runtime-1\tsource\n"
             ("applications-workspace", vec!["terminal"]),
             (
                 "mail",
-                vec!["terminal", "busd", "portal", "mail-fetch", "mail-files", "applications-workspace", "firefox-tls-setup"],
+                vec!["busd", "portal", "mail-fetch", "mail-files", "applications-workspace", "firefox-tls-setup"],
             ),
             ("mail-evidence", vec!["mail", "firefox-tls-setup"]),
             (
@@ -7384,8 +7382,8 @@ news\tnews-0.1\tsource\tstatic-runtime-1\tsource\n"
         // Every other shipped application holds no bus name; the broker
         // would admit it as a peer that sees and addresses only the portal
         // and itself. mail and news are td-owned source builds on the
-        // data-only static runtime, mail in a terminal and news in a td-ui
-        // window; Claude is the reviewed foreign payload on Firefox's
+        // data-only static runtime, each in a td-ui window of its own;
+        // Claude is the reviewed foreign payload on Firefox's
         // runtime, the first foreign-payload terminal application, so the
         // runtime is one of those two reviewed families.
         for application in SHIPPED_APPLICATIONS
@@ -7398,11 +7396,11 @@ news\tnews-0.1\tsource\tstatic-runtime-1\tsource\n"
                 .as_ref()
                 .expect("a shipped application declares its permissions");
             assert_eq!(permissions.session_bus().count(), 0, "{}", application.name);
-            // news draws in a td-ui window of its own and holds no terminal;
-            // mail and Claude are terminal applications still.
+            // mail and news draw in td-ui windows of their own and hold no
+            // terminal; Claude is the one terminal application.
             assert_eq!(
                 permissions.terminal(),
-                application.name != TD_NEWS_NAME,
+                application.name == CLAUDE_NAME,
                 "{} terminal grant",
                 application.name
             );

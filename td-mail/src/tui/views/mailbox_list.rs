@@ -104,8 +104,11 @@ impl MailboxListView {
         });
     }
 
+    /// The account after the current one, round; with one account it is
+    /// that account, so selecting it again reopens it, which is how a
+    /// connection that failed is retried.
     fn next_account_name(&self) -> Option<String> {
-        if self.account_names.len() <= 1 {
+        if self.account_names.is_empty() {
             return None;
         }
         let current_idx = self
@@ -303,10 +306,11 @@ impl View for MailboxListView {
         // Status bar
         term.move_to(term.rows, 1)?;
         term.set_status()?;
+        // With one account the key reopens it, which is the reconnect.
         let account_hint = if self.account_names.len() > 1 {
             " a:account"
         } else {
-            ""
+            " a:reconnect"
         };
         let status = if self.create_mode {
             " New folder name | Enter:create Esc:cancel".to_string()

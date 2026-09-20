@@ -228,8 +228,9 @@ pub fn split_target_debug(root: &str) -> Step {
 }
 
 /// A td-owned program built by direct rustc from a `local_source` tree of the
-/// checkout named `name` (`td-mail/`, `td-news/`: APPLICATIONS.md §W.8) and
-/// linked static exactly as td-sh is. The interned tree is copied under
+/// checkout named `name` (td-install-qemu-test; the two applications it once
+/// built draw through td-ui and are Cargo builds now, APPLICATIONS.md §W.8)
+/// and linked static exactly as td-sh is. The interned tree is copied under
 /// `{src}` before the compile so its paths remap to `/td-build` as every
 /// other direct recipe's do; rustc reads `src/main.rs` and resolves each
 /// `mod` from the tree beside it, so unlike the `include_str!` recipes this

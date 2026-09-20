@@ -1,76 +1,72 @@
 use crate::types::Recipe;
 
-/// td-mail, td's JMAP terminal mail client and the program the `mail`
-/// application packages (APPLICATIONS.md §W.8). Built like td-sh: a static
-/// ET_EXEC by direct rustc, from the checkout's own `td-mail/` tree rather
-/// than a pinned archive. The tree is the `td-mail-source` seed, interned by
-/// the runner and pinned by the compiled seed-digest table, and the crate is
-/// a root crate the gate holds dependency-free, so its closure is std and the
-/// recipe stages no vendor set and carries no lock of its own.
+/// td-mail, td's JMAP mail client in a td-ui window and the program the
+/// `mail` application packages (APPLICATIONS.md §W.8). Built as td-news
+/// and td-taskmgr are: a static Cargo build from the checkout's own
+/// `td-mail/` tree with the toolkit and the compositor's shared font and
+/// wire sources staged beside it, the `td-mail-source` seed pinned by the
+/// compiled seed-digest table, and the crate's committed lock naming
+/// itself and the one sibling.
 pub fn recipe() -> Recipe {
-    crate::ladder::static_local_source_program("td-mail")
+    Recipe::rust("td-mail", "0.1.0")
+        .local_source("td-mail")
+        .local_source_trees(&["td-ui", "td-compositor"])
+        .native_inputs(&[
+            "rust-toolchain",
+            "gcc-x86-64-self",
+            "binutils-x86-64-self",
+            "glibc-x86-64",
+            "busybox-x86-64",
+        ])
+        .cargo_subdir("td-mail")
+        .cargo_lock("td-mail/Cargo.lock")
+        .static_link()
+        .bins(&["td-mail"])
 }
 
 #[cfg(test)]
 mod tests {
     use super::recipe;
-    use crate::types::Step;
 
     #[test]
-    fn td_mail_is_a_static_program_built_from_the_checkout() {
+    fn td_mail_is_a_static_toolkit_program_built_from_the_checkout() {
         let recipe = recipe();
         assert_eq!(recipe.name, "td-mail");
-        assert_eq!(recipe.local_source.as_deref(), Some("td-mail"));
-        assert_eq!(recipe.local_source_trees, None);
         assert_eq!(recipe.source_input.as_deref(), Some("td-mail-source"));
-        assert_eq!(recipe.cargo_lock, None);
+        assert_eq!(recipe.local_source.as_deref(), Some("td-mail"));
+        assert_eq!(
+            recipe.local_source_trees,
+            Some(vec!["td-ui".into(), "td-compositor".into()])
+        );
+        assert_eq!(recipe.cargo_subdir.as_deref(), Some("td-mail"));
+        assert_eq!(recipe.cargo_lock.as_deref(), Some("td-mail/Cargo.lock"));
+        assert_eq!(recipe.static_link, Some(true));
+        assert_eq!(recipe.bins, Some(vec!["td-mail".into()]));
         // No fetch pin: the bytes are the committed tree.
         assert!(crate::source_pins::by_key("td-mail-source").is_none());
-        let steps = recipe.steps.as_ref().expect("steps");
-        assert!(steps.iter().any(|step| matches!(
-            step,
-            Step::CopyTree { from, dest } if from == "{in:td-mail-source}" && dest == "{src}"
-        )));
-        // The compile reads the copied tree's own main.rs: spelled in two
-        // halves so the roster scan for recipes that STAGE `.rs` files (this
-        // one copies a tree instead) does not read it as a staged source.
-        assert!(steps.iter().any(|step| matches!(
-            step,
-            Step::Run { argv, .. }
-                if argv.iter().any(|arg| {
-                    arg.starts_with("{src}/") && arg.ends_with("/src/main.rs")
-                }) && argv.iter().any(|arg| arg == "{out}/bin/td-mail")
-        )));
-        assert!(matches!(
-            steps.last(),
-            Some(Step::AssertStatic { paths }) if paths == &["{out}/bin/td-mail".to_string()]
-        ));
     }
 
-    /// `--edition 2021` is the crate's own: cargo never sees this build, so
-    /// the manifest and the flag agree by this test rather than by cargo.
+    /// The lock the recipe names is the crate's own, and it closes over
+    /// exactly the crate and the toolkit: a registry or git entry would be
+    /// a dependency the gate refuses, and a missing `td-ui` entry a build
+    /// that could not resolve the window.
     #[test]
-    fn td_mail_is_compiled_in_its_manifest_edition() {
+    fn td_mail_lock_names_the_crate_and_the_toolkit_alone() {
+        let lock = include_str!("../../../td-mail/Cargo.lock");
+        let names: Vec<&str> = lock
+            .lines()
+            .filter_map(|line| line.strip_prefix("name = \""))
+            .filter_map(|rest| rest.strip_suffix('"'))
+            .collect();
+        assert_eq!(names, ["td-mail", "td-ui"]);
+        assert!(!lock.contains("source = "));
         let manifest = include_str!("../../../td-mail/Cargo.toml");
-        assert!(
-            manifest.contains("edition = \"2021\""),
-            "the manifest's edition moved; move the recipe's --edition with it"
-        );
-        let steps = recipe().steps.expect("steps");
-        assert!(steps.iter().any(|step| matches!(
-            step,
-            Step::Run { argv, .. } if argv.windows(2).any(|pair| {
-                pair.first().map(String::as_str) == Some("--edition")
-                    && pair.get(1).map(String::as_str) == Some("2021")
-            })
-        )));
+        assert!(manifest.contains("td-ui = { path = \"../td-ui\" }"));
     }
 
     /// The modules the two trees share are one text: the six std modules
     /// copied into both. A fix that reached one tree and not the other
-    /// would part them here. The terminal surface UNSAFE.md §17 records is
-    /// td-mail's alone now that td-news draws in a td-ui window; §18 is
-    /// retired.
+    /// would part them here.
     #[test]
     fn the_shared_modules_are_one_text_in_both_trees() {
         for (name, mail, news) in [
@@ -80,19 +76,9 @@ mod tests {
                 include_str!("../../../td-news/src/td_fetch.rs"),
             ),
             (
-                "kv.rs",
-                include_str!("../../../td-mail/src/kv.rs"),
-                include_str!("../../../td-news/src/kv.rs"),
-            ),
-            (
-                "json.rs",
-                include_str!("../../../td-mail/src/json.rs"),
-                include_str!("../../../td-news/src/json.rs"),
-            ),
-            (
-                "toml.rs",
-                include_str!("../../../td-mail/src/toml.rs"),
-                include_str!("../../../td-news/src/toml.rs"),
+                "civil.rs",
+                include_str!("../../../td-mail/src/civil.rs"),
+                include_str!("../../../td-news/src/civil.rs"),
             ),
             (
                 "html.rs",
@@ -100,9 +86,19 @@ mod tests {
                 include_str!("../../../td-news/src/html.rs"),
             ),
             (
-                "civil.rs",
-                include_str!("../../../td-mail/src/civil.rs"),
-                include_str!("../../../td-news/src/civil.rs"),
+                "json.rs",
+                include_str!("../../../td-mail/src/json.rs"),
+                include_str!("../../../td-news/src/json.rs"),
+            ),
+            (
+                "kv.rs",
+                include_str!("../../../td-mail/src/kv.rs"),
+                include_str!("../../../td-news/src/kv.rs"),
+            ),
+            (
+                "toml.rs",
+                include_str!("../../../td-mail/src/toml.rs"),
+                include_str!("../../../td-news/src/toml.rs"),
             ),
         ] {
             assert!(mail == news, "{name} differs between td-mail and td-news");

@@ -135,13 +135,13 @@ fn pattern_matches(alts: &str, s: &str) -> bool {
 
 /// The crates whose whole tree is a `local_source` seed of their own recipe
 /// (APPLICATIONS.md §W.8): the name, when `p` lies anywhere beneath one. The
-/// separator matters (`td-mailer/x` is not `td-mail/x`), and a `..` names no
-/// path a recipe can stage.
+/// separator matters (`td-install-qemu-tests/x` is not
+/// `td-install-qemu-test/x`), and a `..` names no path a recipe can stage.
 fn local_source_crate(p: &str) -> Option<&'static str> {
     if p.contains("..") {
         return None;
     }
-    ["td-install-qemu-test", "td-mail"]
+    ["td-install-qemu-test"]
         .into_iter()
         .find(|name| p.strip_prefix(name).is_some_and(|rest| rest.starts_with('/')))
 }
@@ -596,14 +596,14 @@ fn map_path(root: &Path, roster: &Result<Vec<GateCrate>, String>, p: &str, sel: 
         return;
     }
 
-    // Portal, taskmgr, the editor, news and td-photo stage sibling trees;
-    // every retained input moves its consumer's source digest. This cheap
-    // preflight augments each crate arm below. engine/ carries its own routing;
-    // td-seatd shares the compositor arm but is not a staged sibling. Keep
-    // this top-level tree roster in agreement with the catalog's
+    // Portal, taskmgr, the editor, news, mail and td-photo stage sibling
+    // trees; every retained input moves its consumer's source digest. This
+    // cheap preflight augments each crate arm below. engine/ carries its own
+    // routing; td-seatd shares the compositor arm but is not a staged
+    // sibling. Keep this top-level tree roster in agreement with the catalog's
     // local_source_trees_are_staged_by_basename_and_routed_by_the_builder test.
     if pattern_matches(
-        "td-portal/*|td-busd/*|td-compositor/*|td-secret/*|td-ui/*|td-taskmgr/*|td-editor/*|td-news/*|td-photo/*",
+        "td-portal/*|td-busd/*|td-compositor/*|td-secret/*|td-ui/*|td-taskmgr/*|td-editor/*|td-news/*|td-mail/*|td-photo/*",
         p,
     ) {
         sel.add_preflight("local-source-digests");
@@ -1353,30 +1353,29 @@ fn map_path(root: &Path, roster: &Result<Vec<GateCrate>, String>, p: &str, sel: 
         return;
     }
 
-    // td-news: the feed reader in a td-ui window, a standalone crate OUTSIDE
-    // the engine workspace built static by the Cargo runner from its own
-    // `local_source` tree with the toolkit staged beside it, as td-taskmgr
-    // is. The tree roster above already routes every retained file to the
-    // digest preflight; the source takes the cargo-test preflight and the
-    // realized-output proofs (the `news` package check, td-firstboot-test,
+    // td-news and td-mail: the feed reader and the mail client, each in a
+    // td-ui window, standalone crates OUTSIDE the engine workspace built
+    // static by the Cargo runner from their own `local_source` tree with
+    // the toolkit staged beside it, as td-taskmgr is. The tree roster above
+    // already routes every retained file to the digest preflight; the
+    // source takes the cargo-test preflight and the realized-output proofs
+    // (the `news` and `mail` package checks, td-firstboot-test,
     // rust-userland-auto-test) through recipe-checks.
-    if p.starts_with("td-news/") && !p.contains("..") {
+    if (p.starts_with("td-news/") || p.starts_with("td-mail/")) && !p.contains("..") {
         sel.add_preflight("cargo-test");
         sel.add_target("check");
         sel.add_target("recipe-checks");
         return;
     }
 
-    // td-mail: the terminal mail application, a standalone std-only crate
-    // OUTSIDE the engine workspace, built static by direct rustc like
-    // td-util — but from a `local_source` tree rather than `include_str!`
-    // (APPLICATIONS.md §W.8), so the whole tree is the `<crate>-source` seed
-    // and ANY file in it, tests and documents included, moves that crate's
-    // seed-digest row: the digest preflight reds a stale row before an image
-    // build would. Unit and integration tests lint/test on the host cargo-test
-    // preflight; the recipe-checks that build the program (the `mail`
-    // package check, td-firstboot-test, rust-userland-auto-test) prove the
-    // static link and the provisioned configuration. Its RECIPE files are
+    // td-install-qemu-test: a standalone std-only crate OUTSIDE the engine
+    // workspace, built static by direct rustc like td-util — but from a
+    // `local_source` tree rather than `include_str!`, so the whole tree is
+    // the `<crate>-source` seed and ANY file in it, tests and documents
+    // included, moves that crate's seed-digest row: the digest preflight
+    // reds a stale row before an image build would. Unit and integration
+    // tests lint/test on the host cargo-test preflight; the recipe-checks
+    // that build the program prove the static link. Its RECIPE files are
     // routed by the recipes arm above, not here.
     if local_source_crate(p).is_some() {
         sel.add_preflight("cargo-test");
@@ -2471,23 +2470,28 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     assert_preflight!("td-news/src/main.rs", "local-source-digests");
     assert_preflight!("td-news/README.md", "local-source-digests");
     assert_preflight!("td-news/Cargo.lock", "local-source-digests");
+    // td-mail: the same shape, the same routing.
+    assert_target!("td-mail/src/main.rs", "check");
+    assert_target!("td-mail/src/main.rs", "recipe-checks");
+    assert_target!("td-mail/src/tui/mod.rs", "recipe-checks");
+    assert_target!("td-mail/Cargo.toml", "recipe-checks");
+    assert_preflight!("td-mail/src/main.rs", "cargo-test");
+    assert_preflight!("td-mail/tests/cli_integration.rs", "cargo-test");
+    assert_preflight!("td-mail/src/main.rs", "local-source-digests");
+    assert_preflight!("td-mail/README.md", "local-source-digests");
+    assert_preflight!("td-mail/Cargo.lock", "local-source-digests");
 
-    // td-mail: a standalone std-only crate staged as its own seed. Retained
-    // paths — tests, documents, the manifest — move the digest row, and the
-    // source paths also take the static-link proof through recipe-checks.
-    for crate_dir in ["td-install-qemu-test", "td-mail"] {
-        assert_target!(&format!("{crate_dir}/src/main.rs"), "check");
-        assert_target!(&format!("{crate_dir}/src/main.rs"), "recipe-checks");
-        assert_target!(&format!("{crate_dir}/src/tui/mod.rs"), "recipe-checks");
-        assert_target!(&format!("{crate_dir}/tests/cli_integration.rs"), "check");
-        assert_target!(&format!("{crate_dir}/Cargo.toml"), "recipe-checks");
-        assert_preflight!(&format!("{crate_dir}/src/main.rs"), "cargo-test");
-        assert_preflight!(&format!("{crate_dir}/tests/cli_integration.rs"), "cargo-test");
-        assert_preflight!(&format!("{crate_dir}/src/main.rs"), "local-source-digests");
-        assert_preflight!(&format!("{crate_dir}/tests/cli_integration.rs"), "local-source-digests");
-        assert_preflight!(&format!("{crate_dir}/README.md"), "local-source-digests");
-        assert_preflight!(&format!("{crate_dir}/Cargo.lock"), "local-source-digests");
-    }
+    // td-install-qemu-test: a standalone std-only crate staged as its own
+    // seed. Retained paths — the sources, the manifest and lock — move the
+    // digest row, and the source paths also take the static-link proof
+    // through recipe-checks.
+    assert_target!("td-install-qemu-test/src/main.rs", "check");
+    assert_target!("td-install-qemu-test/src/main.rs", "recipe-checks");
+    assert_target!("td-install-qemu-test/src/protocol.rs", "recipe-checks");
+    assert_target!("td-install-qemu-test/Cargo.toml", "recipe-checks");
+    assert_preflight!("td-install-qemu-test/src/main.rs", "cargo-test");
+    assert_preflight!("td-install-qemu-test/src/main.rs", "local-source-digests");
+    assert_preflight!("td-install-qemu-test/Cargo.lock", "local-source-digests");
 
     // td-txt mirrors td-sh: standalone std-only crate, main.rs + modules
     // include_str!'d into the recipe, corpus DATA under spec/ (including the
@@ -5167,6 +5171,7 @@ mod tests {
                 "td-install",
                 "td-jail",
                 "td-login",
+                "td-mail",
                 "td-news",
                 "td-photo",
                 "td-portal",
@@ -7251,6 +7256,7 @@ mod tests {
                 "td-install",
                 "td-jail",
                 "td-login",
+                "td-mail",
                 "td-news",
                 "td-photo",
                 "td-portal",
@@ -7264,8 +7270,9 @@ mod tests {
             ]
         );
         // td-photo's native case makes its commands three, as td-setup's are;
-        // td-news, a toolkit consumer with no native case, adds two.
-        assert_eq!(comp.len(), 41, "{comp:?}");
+        // td-news and td-mail, toolkit consumers with no native case, add
+        // two each.
+        assert_eq!(comp.len(), 43, "{comp:?}");
         // Runtime td-vm/ spellings conservatively connect the same reader set.
         assert_eq!(vm, comp);
         assert_eq!(
@@ -7280,6 +7287,7 @@ mod tests {
                 "td-install",
                 "td-jail",
                 "td-login",
+                "td-mail",
                 "td-news",
                 "td-photo",
                 "td-portal",
@@ -7495,13 +7503,13 @@ mod tests {
             };
             assert_eq!(crates(&commands), crates(&comp), "{path}");
             for consumer in [
-                "td-ui", "td-editor", "td-setup", "td-portal", "td-photo", "td-taskmgr", "td-news",
+                "td-ui", "td-editor", "td-setup", "td-portal", "td-photo", "td-taskmgr", "td-news", "td-mail",
             ] {
                 let manifest = format!("--manifest-path {consumer}/Cargo.toml");
                 // Test and clippy, plus the native fixture where declared.
                 assert_eq!(
                     commands.iter().filter(|c| c.contains(&manifest)).count(),
-                    if consumer == "td-news" || consumer == "td-ui" { 2 } else { 3 },
+                    if matches!(consumer, "td-news" | "td-mail" | "td-ui") { 2 } else { 3 },
                     "{path}: {consumer}"
                 );
             }

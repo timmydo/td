@@ -5,3 +5,10 @@ version = 4
 [[package]]
 name = "td-mail"
 version = "0.1.0"
+dependencies = [
+ "td-ui",
+]
+
+[[package]]
+name = "td-ui"
+version = "0.1.0"

@@ -86,10 +86,10 @@ const AUTHORIZED_KEYS: &str = "ssh/authorized_keys";
 /// (`td-jail/src/authority.rs` `STATE_ROOT`): `<home>/.td/app/<name>` holds
 /// `config`, which the jail binds at `/home/td/.config`. A file written at
 /// `config/<program>/config.toml` here is `$XDG_CONFIG_HOME/<program>/config.toml`
-/// inside the jail, which is where each terminal application looks.
+/// inside the jail, which is where each application looks.
 const APPLICATION_STATE_ROOT: &str = ".td/app";
 
-/// One terminal application's first configuration: enough for the program to
+/// One application's first configuration: enough for the program to
 /// start and show the operator what to edit, never a credential that works.
 struct ApplicationConfig {
     /// The application name, which is the `/bin` entry and the state directory.
@@ -115,8 +115,8 @@ const APPLICATION_CONFIGS: &[ApplicationConfig] = &[
 
 /// td-mail starts offline from this and says so; the operator replaces the two
 /// placeholders, stores mail/main through td-secret, and the client reads them when it next
-/// starts. The comments name no way to start it: a user-level relaunch of a
-/// terminal window is deferred (APPLICATIONS.md §W.7), and the
+/// starts. The comments name no way to start it: a user-level relaunch of an
+/// application window is deferred (APPLICATIONS.md §W.7), and the
 /// administrative escape hatch is not a flow a shipped file may depend on
 /// (AGENTS.md).
 const MAIL_CONFIG: &str = "\
@@ -181,13 +181,13 @@ struct Config {
     /// filesystem. On by default; `--state-dir` turns it off because an
     /// operator-named directory carries no implied mount to check.
     require_persistent: bool,
-    /// The login user whose terminal applications get a first configuration,
+    /// The login user whose applications get a first configuration,
     /// or no selection when the invocation names none.
     applications: ApplicationSelection,
     enroll_principals: bool,
 }
 
-/// Where the terminal applications' state lives and who owns it. The
+/// Where the applications' state lives and who owns it. The
 /// provisioner runs as root at sysinit, so everything it creates here is
 /// handed to this identity; the jail refuses state it does not own.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -657,7 +657,7 @@ fn parse_owner(value: &str) -> Result<(u32, u32), Failure> {
     Ok((uid, gid))
 }
 
-/// A first configuration for each terminal application, under the login
+/// A first configuration for each application, under the login
 /// user's td-jail state root, created once and owned by the user.
 ///
 /// Every directory is 0700 and every file 0600, the shape td-jail requires of

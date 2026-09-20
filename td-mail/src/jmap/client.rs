@@ -83,6 +83,21 @@ pub struct JmapClient {
     download_url: Option<String>,
 }
 
+#[cfg(test)]
+impl JmapClient {
+    /// A client for a server that is not there, for the paths that need
+    /// one to exist and not to answer.
+    pub(crate) fn unreachable_for_tests() -> Self {
+        JmapClient {
+            username: "tester".to_string(),
+            password: String::new(),
+            api_url: "https://mail.invalid/jmap".to_string(),
+            account_id: "account".to_string(),
+            download_url: None,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum JmapError {
     Http(String),

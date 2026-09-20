@@ -59,40 +59,20 @@ fn dynamic_contract(label: &str, binary: &str, expected_needed: &str) -> Step {
     .env("PATH", &post_bootstrap_path())
 }
 
-/// The two shapes a td-owned static program takes: a fixed-address
-/// `ET_EXEC` from direct rustc (`static_local_source_program`, the shape
-/// td-sh and td-init wear) or a static PIE, `ET_DYN`, from the Cargo
-/// runner's `static_link` (the shape td-taskmgr wears), which is what
-/// rustc's `+crt-static` emits for a position-independent target. The
-/// application package's validator admits either.
-#[derive(Clone, Copy)]
-enum StaticShape {
-    FixedAddress,
-    Pie,
-}
-
-impl StaticShape {
-    /// The `Type:` word `readelf -h` prints, and the shape's name for a
-    /// diagnostic.
-    fn elf_type(self) -> (&'static str, &'static str) {
-        match self {
-            Self::FixedAddress => ("EXEC", "a fixed-address (ET_EXEC) static executable"),
-            Self::Pie => ("DYN", "a static PIE (ET_DYN) executable"),
-        }
-    }
-}
-
-/// The contract of a td-owned static program: the same provenance scans
-/// and ELF64/x86-64 shape as the dynamic rungs, then the ELF type of its
-/// `shape` with no program interpreter, no `DT_NEEDED`, and no run-path —
-/// a static executable has no dynamic section for either to live in, and
-/// `readelf -d` says so by printing none. The recipe's own static assert
-/// or the runner's install check is the producer's check, this one the
-/// consumer's.
-fn static_contract(label: &str, binary: &str, shape: StaticShape) -> Step {
+/// The contract of a td-owned static program the Cargo runner links
+/// (`Recipe::rust` with `static_link`, the shape td-taskmgr wears): the
+/// same provenance scans and ELF64/x86-64 shape as the dynamic rungs,
+/// then a static PIE — `ET_DYN` with no program interpreter, no
+/// `DT_NEEDED` and no run-path, which is what rustc's `+crt-static`
+/// emits for a position-independent target; a static executable has no
+/// dynamic section for either to live in, and `readelf -d` says so by
+/// printing none. The application package's validator admits this shape
+/// as it admits direct rustc's fixed-address one; the runner's install
+/// check is the producer's check, this one the consumer's.
+fn static_contract(label: &str, binary: &str) -> Step {
     let readelf = "{in:binutils-x86-64-self}/bin/readelf";
     let scans = provenance_scans(label, binary);
-    let (elf_type, shape_name) = shape.elf_type();
+    let (elf_type, shape_name) = ("DYN", "a static PIE (ET_DYN) executable");
     Step::run(
         "{root}",
         &[
@@ -127,12 +107,11 @@ pub fn recipe() -> Recipe {
         dynamic_contract("ripgrep", rg, "ld-linux-x86-64.so.2\nlibc.so.6"),
         dynamic_contract("fd", fd, "libc.so.6"),
         // The two applications are td's own root crates built static from
-        // the checkout (APPLICATIONS.md §W.8): their contract is a td-owned
-        // static shape, not the glibc one. td-news is the Cargo runner's
-        // static PIE over td-ui; td-mail is still direct rustc's fixed
-        // address executable.
-        static_contract("td-news", news, StaticShape::Pie),
-        static_contract("td-mail", mail, StaticShape::FixedAddress),
+        // the checkout by the Cargo runner over td-ui (APPLICATIONS.md
+        // §W.8): their contract is the td-owned static PIE, not the glibc
+        // one.
+        static_contract("td-news", news),
+        static_contract("td-mail", mail),
         Step::MkDir {
             path: "{root}/fixtures".into(),
         },
@@ -167,7 +146,7 @@ pub fn recipe() -> Recipe {
     });
     steps.push(Step::WriteFile {
         path: "{out}/result".into(),
-        content: "PASS: ripgrep and fd are target-built auto graph nodes with the declared td glibc runtime closure, td-news is a fully static PIE over td-ui and td-mail a fully static direct-rustc output\n".into(),
+        content: "PASS: ripgrep and fd are target-built auto graph nodes with the declared td glibc runtime closure, td-news and td-mail are fully static PIEs over td-ui\n".into(),
         exec: false,
     });
     steps.push(Step::Require {
@@ -193,7 +172,7 @@ pub fn recipe() -> Recipe {
         .checks(vec![
             RecipeCheck::new(
                 r#"
-echo ">> recipe-check rust-userland-auto-test: build-plan --auto builds ripgrep, fd, td-news and td-mail with the source-built Rust/native toolchain, verifies the exact dynamic runtime closure of the first two, the td-owned static PIE shape of td-news and the static ET_EXEC shape of td-mail, and runs real searches and usage output with /gnu/store absent"
+echo ">> recipe-check rust-userland-auto-test: build-plan --auto builds ripgrep, fd, td-news and td-mail with the source-built Rust/native toolchain, verifies the exact dynamic runtime closure of the first two, the td-owned static PIE shape of the last two, and runs real searches and usage output with /gnu/store absent"
 : "${TD_RECIPE_EVAL:=$PWD/target/release/td-recipe-eval}"
 exec "$TD_RECIPE_EVAL" check-run rust-userland-auto-test 1
 "#,

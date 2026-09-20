@@ -1,4 +1,12 @@
-use std::io::{self, Read};
+//! The client's input vocabulary, and how the window's arrives in it.
+//!
+//! The views were written against a terminal's keys and SGR mouse
+//! reports; they keep that vocabulary, and the screen window's input
+//! (`td_ui::screen::Input`) is translated into it here, so a click still
+//! carries the terminal's one-based row and column and a wheel frame is
+//! one scroll event per row of travel.
+
+use td_ui::screen::{self, Input, Press};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Key {
@@ -23,173 +31,159 @@ pub enum Key {
     ScrollDown,
 }
 
-/// Read a single keypress from stdin.
-/// Returns None if no key is available (timeout expired).
-pub fn read_key() -> Option<Key> {
-    let mut buf = [0u8; 1];
-    match io::stdin().read(&mut buf) {
-        Ok(0) => None, // timeout, no data
-        Ok(_) => Some(parse_byte(buf[0])),
-        Err(_) => None,
+/// The most scroll events one wheel frame becomes, so a fling is bounded.
+const WHEEL_EVENTS: usize = 64;
+
+/// The key a press names, or none. A control chord is a `Ctrl` of its
+/// letter, as the terminal's control bytes were, except that Control
+/// with M or I is the chord here where the terminal's byte was Return
+/// or Tab (no view binds a control chord); Alt with Return is
+/// `AltEnter`; any other chord with Control, Alt or Shift, and the keys
+/// the client never bound (Insert, the function keys), are nothing. The
+/// terminal's parser answered those sequences with `Escape`, which the
+/// views bind as back, so a shifted arrow left a view; nothing is the
+/// answer a chord the client does not name deserves. A shifted scalar
+/// arrives folded, with no shift.
+pub fn key(press: Press) -> Option<Key> {
+    if press.shift && !matches!(press.key, screen::Key::Char(_)) {
+        return None;
+    }
+    if press.control {
+        return match press.key {
+            screen::Key::Char(c) if c.is_ascii_alphabetic() && !press.alt => {
+                Some(Key::Ctrl(c.to_ascii_lowercase()))
+            }
+            _ => None,
+        };
+    }
+    if press.alt {
+        return match press.key {
+            screen::Key::Enter => Some(Key::AltEnter),
+            _ => None,
+        };
+    }
+    Some(match press.key {
+        screen::Key::Char(c) => Key::Char(c),
+        screen::Key::Enter => Key::Enter,
+        screen::Key::Escape => Key::Escape,
+        screen::Key::Backspace => Key::Backspace,
+        screen::Key::Tab => Key::Tab,
+        screen::Key::Up => Key::Up,
+        screen::Key::Down => Key::Down,
+        screen::Key::Left => Key::Left,
+        screen::Key::Right => Key::Right,
+        screen::Key::PageUp => Key::PageUp,
+        screen::Key::PageDown => Key::PageDown,
+        screen::Key::Home => Key::Home,
+        screen::Key::End => Key::End,
+        screen::Key::Delete => Key::Delete,
+        screen::Key::Insert | screen::Key::Function(_) => return None,
+    })
+}
+
+fn one_based(cell: usize) -> u16 {
+    u16::try_from(cell.saturating_add(1)).unwrap_or(u16::MAX)
+}
+
+/// The client's keys for one window input; `mouse` is whether clicks and
+/// wheel travel are read at all, off meaning they are nothing. Resize,
+/// focus and close carry no key: the window reads those itself.
+pub fn translate(input: Input, mouse: bool, out: &mut Vec<Key>) {
+    match input {
+        Input::Key(press) => {
+            if let Some(key) = key(press) {
+                out.push(key);
+            }
+        }
+        Input::Click { row, column } if mouse => {
+            out.push(Key::MouseClick {
+                row: one_based(row),
+                col: one_based(column),
+            });
+        }
+        Input::Wheel { rows, .. } if mouse => {
+            let event = if rows < 0 {
+                Key::ScrollUp
+            } else {
+                Key::ScrollDown
+            };
+            let count = rows.unsigned_abs().min(WHEEL_EVENTS);
+            out.extend(std::iter::repeat_n(event, count));
+        }
+        Input::Click { .. }
+        | Input::Wheel { .. }
+        | Input::Resize { .. }
+        | Input::Focus(_)
+        | Input::Close => {}
     }
 }
 
-fn parse_byte(b: u8) -> Key {
-    match b {
-        13 => Key::Enter,
-        27 => parse_escape(),
-        127 => Key::Backspace,
-        9 => Key::Tab,
-        b @ 1..=26 => Key::Ctrl((b'a' + b - 1) as char),
-        b if (32..127).contains(&b) => Key::Char(b as char),
-        _ => Key::Char('?'),
-    }
-}
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    use super::*;
 
-fn parse_escape() -> Key {
-    // Try to read the next byte quickly
-    let mut buf = [0u8; 1];
-    match io::stdin().read(&mut buf) {
-        Ok(0) => return Key::Escape, // bare escape
-        Ok(_) => {}
-        Err(_) => return Key::Escape,
-    }
-
-    if buf[0] == 13 {
-        return Key::AltEnter; // ESC followed by Enter
-    }
-
-    if buf[0] != b'[' {
-        return Key::Escape; // not a CSI sequence
-    }
-
-    // Read the sequence character
-    match io::stdin().read(&mut buf) {
-        Ok(0) => return Key::Escape,
-        Ok(_) => {}
-        Err(_) => return Key::Escape,
-    }
-
-    match buf[0] {
-        b'A' => Key::Up,
-        b'B' => Key::Down,
-        b'C' => Key::Right,
-        b'D' => Key::Left,
-        b'H' => Key::Home,
-        b'F' => Key::End,
-        // Extended sequences like ESC [ 5 ~ or CSI u like ESC [ 13 ; 7 u
-        b'0'..=b'9' => parse_csi_number(buf[0]),
-        // SGR mouse: ESC [ < ...
-        b'<' => parse_sgr_mouse(),
-        _ => Key::Escape,
-    }
-}
-
-fn parse_csi_number(first_digit: u8) -> Key {
-    let mut num: u16 = (first_digit - b'0') as u16;
-    let mut buf = [0u8; 1];
-
-    // Read remaining digits or terminator
-    loop {
-        match io::stdin().read(&mut buf) {
-            Ok(0) | Err(_) => return Key::Escape,
-            Ok(_) => {}
-        }
-        match buf[0] {
-            b'0'..=b'9' => {
-                num = num
-                    .saturating_mul(10)
-                    .saturating_add((buf[0] - b'0') as u16);
-            }
-            b'~' => {
-                return match num {
-                    3 => Key::Delete,
-                    5 => Key::PageUp,
-                    6 => Key::PageDown,
-                    _ => Key::Escape,
-                };
-            }
-            b';' => {
-                // CSI u format: ESC [ keycode ; modifiers u
-                // Read modifier number
-                let mut modifiers: u16 = 0;
-                loop {
-                    match io::stdin().read(&mut buf) {
-                        Ok(0) | Err(_) => return Key::Escape,
-                        Ok(_) => {}
-                    }
-                    match buf[0] {
-                        b'0'..=b'9' => {
-                            modifiers = modifiers
-                                .saturating_mul(10)
-                                .saturating_add((buf[0] - b'0') as u16);
-                        }
-                        b'u' => {
-                            return Key::Escape;
-                        }
-                        b'~' => return Key::Escape,
-                        _ => return Key::Escape,
-                    }
-                }
-            }
-            _ => return Key::Escape,
+    #[test]
+    fn presses_translate_to_the_clients_keys() {
+        let mut out = Vec::new();
+        for (chord, expected) in [
+            ("a", Some(Key::Char('a'))),
+            ("A", Some(Key::Char('A'))),
+            (" ", Some(Key::Char(' '))),
+            ("Space", Some(Key::Char(' '))),
+            ("Return", Some(Key::Enter)),
+            ("Escape", Some(Key::Escape)),
+            ("Backspace", Some(Key::Backspace)),
+            ("Tab", Some(Key::Tab)),
+            ("Left", Some(Key::Left)),
+            ("Right", Some(Key::Right)),
+            ("PageDown", Some(Key::PageDown)),
+            ("End", Some(Key::End)),
+            ("Delete", Some(Key::Delete)),
+            ("C-c", Some(Key::Ctrl('c'))),
+            ("C-R", Some(Key::Ctrl('r'))),
+            ("M-Return", Some(Key::AltEnter)),
+            ("C-M-c", None),
+            ("C-1", None),
+            ("C-Up", None),
+            ("M-a", None),
+            ("S-Up", None),
+            ("S-Tab", None),
+            ("S-Return", None),
+            ("Insert", None),
+            ("F1", None),
+        ] {
+            out.clear();
+            let press = screen::press(chord).expect(chord);
+            translate(Input::Key(press), true, &mut out);
+            assert_eq!(out, expected.into_iter().collect::<Vec<_>>(), "{chord}");
         }
     }
-}
 
-fn parse_sgr_mouse() -> Key {
-    // SGR format: ESC [ < btn ; col ; row M (press) or m (release)
-    let mut params = [0u16; 3];
-    let mut param_idx = 0;
-    let mut buf = [0u8; 1];
-
-    loop {
-        match io::stdin().read(&mut buf) {
-            Ok(0) | Err(_) => return Key::Escape,
-            Ok(_) => {}
-        }
-        match buf[0] {
-            b'0'..=b'9' => {
-                // `get_mut` is the bound check: a fourth parameter has nowhere
-                // to go and is dropped, as it was under `param_idx < 3`.
-                if let Some(slot) = params.get_mut(param_idx) {
-                    *slot = slot
-                        .saturating_mul(10)
-                        .saturating_add(u16::from(buf[0] - b'0'));
-                }
-            }
-            b';' => {
-                param_idx += 1;
-                if param_idx >= 3 {
-                    // Too many params, consume until terminator
-                    loop {
-                        match io::stdin().read(&mut buf) {
-                            Ok(0) | Err(_) => return Key::Escape,
-                            Ok(_) if buf[0] == b'M' || buf[0] == b'm' => return Key::Escape,
-                            _ => {}
-                        }
-                    }
-                }
-            }
-            b'M' => {
-                if param_idx != 2 {
-                    return Key::Escape;
-                }
-                return match params[0] {
-                    0 => Key::MouseClick {
-                        row: params[2],
-                        col: params[1],
-                    },
-                    64 => Key::ScrollUp,
-                    65 => Key::ScrollDown,
-                    _ => Key::Escape,
-                };
-            }
-            b'm' => {
-                // Release event — ignore
-                return Key::Escape;
-            }
-            _ => return Key::Escape,
-        }
+    #[test]
+    fn clicks_carry_the_terminals_cell_and_wheel_travel_is_one_event_per_row() {
+        let mut out = Vec::new();
+        translate(Input::Click { row: 2, column: 5 }, true, &mut out);
+        assert_eq!(out, [Key::MouseClick { row: 3, col: 6 }]);
+        out.clear();
+        translate(Input::Wheel { rows: -2, columns: 0 }, true, &mut out);
+        assert_eq!(out, [Key::ScrollUp, Key::ScrollUp]);
+        out.clear();
+        translate(Input::Wheel { rows: 3, columns: 1 }, true, &mut out);
+        assert_eq!(out, vec![Key::ScrollDown; 3]);
+        out.clear();
+        translate(Input::Wheel { rows: isize::MAX, columns: 0 }, true, &mut out);
+        assert_eq!(out.len(), WHEEL_EVENTS);
+        out.clear();
+        translate(Input::Wheel { rows: 0, columns: 4 }, true, &mut out);
+        assert!(out.is_empty());
+        translate(Input::Click { row: 0, column: 0 }, false, &mut out);
+        translate(Input::Wheel { rows: 5, columns: 0 }, false, &mut out);
+        translate(Input::Resize { rows: 4, columns: 4 }, true, &mut out);
+        translate(Input::Focus(true), true, &mut out);
+        translate(Input::Close, true, &mut out);
+        assert!(out.is_empty());
+        translate(Input::Click { row: usize::MAX, column: 70000 }, true, &mut out);
+        assert_eq!(out, [Key::MouseClick { row: u16::MAX, col: u16::MAX }]);
     }
 }

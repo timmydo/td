@@ -6,7 +6,7 @@ use crate::json::{self, Json, ObjectBuilder, ToJson};
 use crate::regex::UserRegex;
 use crate::rules::{self, CompiledRule};
 use crate::spam::{self, SpamModel};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc};
 use std::thread;
@@ -134,6 +134,14 @@ pub enum BackendCommand {
         origin: String,
         id: String,
     },
+    /// The account's connection, once the connector has it: a backend
+    /// started connecting holds every command until this or the failure
+    /// below decides where they are answered from, and goes online here,
+    /// replaying what the cache queued.
+    Connect(Box<JmapClient>),
+    /// The connection could not be made: the held commands are answered
+    /// from the cache, as the rest are until the account is opened again.
+    ConnectFailed,
     Shutdown,
 }
 
@@ -719,10 +727,20 @@ fn process_mutation_via_queue(
     Ok(())
 }
 
-/// Spawn the backend thread. Returns the command sender and response receiver.
+/// Spawns the account's backend thread and returns the command sender and
+/// response receiver. `connecting` says a connection is on its way
+/// (`Connect` or `ConnectFailed` follows), and the backend holds every
+/// command until it arrives; a backend started with a client, or without
+/// one and not connecting, answers at once. `reopen` says a store another
+/// handle holds at the start (the account's previous backend in the same
+/// client, finishing a request before it shuts down) is to be opened once
+/// it is free; the CLI's one backend has no predecessor and keeps what it
+/// opened.
 #[allow(clippy::too_many_arguments)]
 pub fn spawn(
     client: Option<JmapClient>,
+    connecting: bool,
+    reopen: bool,
     account_name: String,
     rules: Arc<Vec<CompiledRule>>,
     custom_headers: Arc<Vec<String>>,
@@ -760,6 +778,7 @@ pub fn spawn(
         );
         backend_loop(
             client,
+            connecting,
             cmd_rx,
             resp_tx,
             rules,
@@ -767,6 +786,7 @@ pub fn spawn(
             rules_mailbox_regex,
             my_email_regex,
             cache,
+            reopen.then_some(account_name),
             spam_config,
             spam_model,
         );
@@ -901,6 +921,8 @@ fn handle_offline_command(
         BackendCommand::Shutdown => {
             return false;
         }
+        // The loop takes the connection's decision before it gets here.
+        BackendCommand::Connect(_) | BackendCommand::ConnectFailed => {}
         // Offline mutations: queue and apply local projection.
         BackendCommand::MarkEmailRead { op_id, id, .. } => {
             let op = QueuedMutation::MarkRead {
@@ -1366,6 +1388,7 @@ fn replay_queued_mutations(
 #[allow(clippy::too_many_arguments)]
 fn backend_loop(
     client: Option<JmapClient>,
+    connecting: bool,
     cmd_rx: mpsc::Receiver<BackendCommand>,
     resp_tx: mpsc::Sender<BackendResponse>,
     rules: Arc<Vec<CompiledRule>>,
@@ -1373,34 +1396,145 @@ fn backend_loop(
     rules_mailbox_regex: Arc<UserRegex>,
     my_email_regex: Arc<UserRegex>,
     cache: Option<Cache>,
+    reopen: Option<String>,
     spam_config: SpamConfig,
     mut spam_model: SpamModel,
 ) {
     let mut cached_mailboxes: Vec<Mailbox> = Vec::new();
     let mut command_seq: u64 = 0;
-    let offline = client.is_none();
+    let mut client = client;
+    let mut connecting = connecting;
+    let mut cache = cache;
+    // What arrived while the connection was pending, answered in order
+    // once it is decided: nothing is answered from the cache that the
+    // connection then supersedes, and no fetch fails as offline while
+    // the client is connecting.
+    let mut held: VecDeque<BackendCommand> = VecDeque::new();
     if let Some(cache) = cache.as_ref() {
         if let Some(mboxes) = cache.get_mailboxes() {
             cached_mailboxes = mboxes;
         }
     }
-    if !offline {
-        if let (Some(client), Some(cache)) = (client.as_ref(), cache.as_ref()) {
-            replay_queued_mutations(
-                client,
-                &mut cached_mailboxes,
-                &rules,
-                &custom_headers,
-                &my_email_regex,
-                cache,
-            );
-        }
+    if let (Some(client), Some(cache)) = (client.as_ref(), cache.as_ref()) {
+        replay_queued_mutations(
+            client,
+            &mut cached_mailboxes,
+            &rules,
+            &custom_headers,
+            &my_email_regex,
+            cache,
+        );
     }
 
-    while let Ok(cmd) = cmd_rx.recv() {
+    loop {
+        let cmd = match held.pop_front() {
+            Some(cmd) if !connecting => cmd,
+            Some(cmd) => {
+                held.push_front(cmd);
+                match cmd_rx.recv() {
+                    Ok(cmd) => cmd,
+                    Err(_) => break,
+                }
+            }
+            None => match cmd_rx.recv() {
+                Ok(cmd) => cmd,
+                Err(_) => break,
+            },
+        };
         command_seq = command_seq.wrapping_add(1);
 
-        if offline {
+        // A store another handle held when this backend started (the
+        // account's previous backend, finishing a request before it shuts
+        // down, or a second td-mail) is opened once it is free: tried
+        // before each command, blocking nothing, until it is.
+        if cache.is_none() {
+            if let Some(name) = reopen.as_deref() {
+                if let Ok(opened) = Cache::open(name) {
+                    log_info!(
+                        "[Backend] Opened cache for account '{}' once it was free",
+                        name
+                    );
+                    if cached_mailboxes.is_empty() {
+                        if let Some(mboxes) = opened.get_mailboxes() {
+                            cached_mailboxes = mboxes;
+                        }
+                    }
+                    // Online already: what the store queued (the previous
+                    // backend's, on its way out) is replayed now, as it
+                    // would have been had the store been there at connect.
+                    if let Some(client) = client.as_ref() {
+                        replay_queued_mutations(
+                            client,
+                            &mut cached_mailboxes,
+                            &rules,
+                            &custom_headers,
+                            &my_email_regex,
+                            &opened,
+                        );
+                    }
+                    cache = Some(opened);
+                }
+            }
+        }
+
+        // The connection's decision lands here once the connector has it;
+        // the loop is offline until a connection lands and online from
+        // then on, replaying what the cache queued as a backend started
+        // online replays it.
+        match cmd {
+            BackendCommand::Connect(connected) => {
+                log_info!("[Backend] cmd#{} Connect", command_seq);
+                if let Some(cache) = cache.as_ref() {
+                    replay_queued_mutations(
+                        &connected,
+                        &mut cached_mailboxes,
+                        &rules,
+                        &custom_headers,
+                        &my_email_regex,
+                        cache,
+                    );
+                }
+                client = Some(*connected);
+                connecting = false;
+                continue;
+            }
+            BackendCommand::ConnectFailed => {
+                log_info!("[Backend] cmd#{} ConnectFailed", command_seq);
+                connecting = false;
+                continue;
+            }
+            BackendCommand::Shutdown if connecting => {
+                // What was held is answered from the cache on the way out,
+                // as it would have been had the connection failed: a
+                // mutation is queued there, durably, rather than dropped.
+                for cmd in held.drain(..) {
+                    command_seq = command_seq.wrapping_add(1);
+                    handle_offline_command(
+                        &cmd,
+                        &resp_tx,
+                        &cache,
+                        &mut cached_mailboxes,
+                        command_seq,
+                    );
+                }
+                break;
+            }
+            BackendCommand::Shutdown => break,
+            cmd if connecting => {
+                // Numbered when served. A fetch of the mailboxes behind
+                // another is the same fetch, so a burst holds one.
+                command_seq = command_seq.wrapping_sub(1);
+                let same_fetch = matches!(cmd, BackendCommand::FetchMailboxes { .. })
+                    && matches!(held.back(), Some(BackendCommand::FetchMailboxes { .. }));
+                if !same_fetch {
+                    held.push_back(cmd);
+                }
+                continue;
+            }
+            _ => {}
+        }
+
+        if client.is_none() {
             if handle_offline_command(&cmd, &resp_tx, &cache, &mut cached_mailboxes, command_seq) {
                 continue;
             } else {
@@ -1408,7 +1542,7 @@ fn backend_loop(
             }
         }
 
-        // `offline` is `client.is_none()`, so this arm always has one. A `let
+        // Offline is `client.is_none()`, so this arm always has one. A `let
         // else` says that to the compiler; stopping is the graceful answer if
         // the two ever drift apart, since every command here needs a client.
         let Some(client) = client.as_ref() else {
@@ -2263,6 +2397,8 @@ fn backend_loop(
                 let result = classify_message(client, &spam_model, &spam_config, &id);
                 let _ = resp_tx.send(BackendResponse::MessageClassified { id, result });
             }
+            // The loop takes the connection's decision before it gets here.
+            BackendCommand::Connect(_) | BackendCommand::ConnectFailed => {}
             BackendCommand::Shutdown => {
                 break;
             }
@@ -2897,6 +3033,179 @@ mod tests {
     use super::*;
     use crate::cache::Cache;
     use std::collections::HashMap;
+
+    /// A backend started connecting holds a fetch until the connection is
+    /// decided: a failure answers it from the (absent) cache with the
+    /// offline diagnostic; a connection that then lands takes the loop
+    /// online, and the next fetch goes to the server, which is not there,
+    /// so the answer is the fetch service's, not the cache's.
+    #[test]
+    fn a_connecting_backend_holds_commands_until_the_connection_is_decided() {
+        let _env = crate::testing::env_lock();
+        let runtime = crate::testing::tempdir().unwrap();
+        std::env::set_var("XDG_RUNTIME_DIR", runtime.path());
+        let (cmd_tx, cmd_rx) = mpsc::channel();
+        let (resp_tx, resp_rx) = mpsc::channel();
+        let regex = || Arc::new(UserRegex::compile(".*").unwrap());
+        let spam_config = SpamConfig {
+            enabled: false,
+            threshold: 0.9,
+            ham_threshold: 0.1,
+            min_training: 1,
+        };
+        let backend = thread::spawn(move || {
+            backend_loop(
+                None,
+                true,
+                cmd_rx,
+                resp_tx,
+                Arc::new(Vec::new()),
+                Arc::new(Vec::new()),
+                regex(),
+                regex(),
+                None,
+                None,
+                spam_config,
+                SpamModel::default(),
+            );
+        });
+        let fetch = |origin: &str| BackendCommand::FetchMailboxes {
+            origin: origin.to_string(),
+        };
+        let answer = |resp_rx: &mpsc::Receiver<BackendResponse>| match resp_rx.recv() {
+            Ok(BackendResponse::Mailboxes(Err(e))) => e,
+            Ok(_) => panic!("expected a failed mailbox fetch, got another response"),
+            Err(_) => panic!("expected a failed mailbox fetch, the backend is gone"),
+        };
+        let silent = |resp_rx: &mpsc::Receiver<BackendResponse>| {
+            resp_rx
+                .recv_timeout(std::time::Duration::from_millis(200))
+                .is_err()
+        };
+        // A burst of the same fetch holds one.
+        cmd_tx.send(fetch("startup")).unwrap();
+        cmd_tx.send(fetch("refresh")).unwrap();
+        assert!(
+            silent(&resp_rx),
+            "a held fetch was answered before the connection was decided"
+        );
+        cmd_tx.send(BackendCommand::ConnectFailed).unwrap();
+        assert!(answer(&resp_rx).contains("(offline mode)"));
+        assert!(silent(&resp_rx), "the burst was held as two fetches");
+        cmd_tx
+            .send(BackendCommand::Connect(Box::new(
+                JmapClient::unreachable_for_tests(),
+            )))
+            .unwrap();
+        cmd_tx.send(fetch("connect")).unwrap();
+        let online = answer(&resp_rx);
+        assert!(!online.contains("offline mode"), "{online}");
+        cmd_tx.send(BackendCommand::Shutdown).unwrap();
+        backend.join().unwrap();
+        std::env::remove_var("XDG_RUNTIME_DIR");
+    }
+
+    /// A shutdown while the connection is pending answers what was held
+    /// from the cache on the way out, as a failed connection would have.
+    #[test]
+    fn a_shutdown_while_connecting_answers_the_held_commands_offline() {
+        let (cmd_tx, cmd_rx) = mpsc::channel();
+        let (resp_tx, resp_rx) = mpsc::channel();
+        let regex = || Arc::new(UserRegex::compile(".*").unwrap());
+        let spam_config = SpamConfig {
+            enabled: false,
+            threshold: 0.9,
+            ham_threshold: 0.1,
+            min_training: 1,
+        };
+        let backend = thread::spawn(move || {
+            backend_loop(
+                None,
+                true,
+                cmd_rx,
+                resp_tx,
+                Arc::new(Vec::new()),
+                Arc::new(Vec::new()),
+                regex(),
+                regex(),
+                None,
+                None,
+                spam_config,
+                SpamModel::default(),
+            );
+        });
+        cmd_tx
+            .send(BackendCommand::CreateMailbox {
+                name: "held".to_string(),
+            })
+            .unwrap();
+        cmd_tx.send(BackendCommand::Shutdown).unwrap();
+        backend.join().unwrap();
+        match resp_rx.recv() {
+            Ok(BackendResponse::MailboxCreated { name, result }) => {
+                assert_eq!(name, "held");
+                assert!(result.is_err());
+            }
+            Ok(_) => panic!("expected the held creation's answer, got another response"),
+            Err(_) => panic!("the held creation was dropped"),
+        }
+    }
+
+    /// A backend whose store another handle held when it started (the
+    /// account's previous backend, finishing a request) opens it once it
+    /// is free, before the next command: the first fetch has no cache at
+    /// all, the one after the release has the (empty) cache.
+    #[test]
+    fn a_backend_opens_the_cache_once_the_lock_is_released() {
+        let _env = crate::testing::env_lock();
+        let dir = crate::testing::tempdir().unwrap();
+        std::env::set_var("XDG_CACHE_HOME", dir.path());
+        let held = Cache::open("backend_late_open").unwrap();
+        let (cmd_tx, cmd_rx) = mpsc::channel();
+        let (resp_tx, resp_rx) = mpsc::channel();
+        let regex = || Arc::new(UserRegex::compile(".*").unwrap());
+        let spam_config = SpamConfig {
+            enabled: false,
+            threshold: 0.9,
+            ham_threshold: 0.1,
+            min_training: 1,
+        };
+        let backend = thread::spawn(move || {
+            backend_loop(
+                None,
+                false,
+                cmd_rx,
+                resp_tx,
+                Arc::new(Vec::new()),
+                Arc::new(Vec::new()),
+                regex(),
+                regex(),
+                None,
+                Some("backend_late_open".to_string()),
+                spam_config,
+                SpamModel::default(),
+            );
+        });
+        let fetch = |origin: &str| BackendCommand::FetchMailboxes {
+            origin: origin.to_string(),
+        };
+        let answer = |resp_rx: &mpsc::Receiver<BackendResponse>| match resp_rx.recv() {
+            Ok(BackendResponse::Mailboxes(Err(e))) => e,
+            Ok(_) => panic!("expected a failed mailbox fetch, got another response"),
+            Err(_) => panic!("expected a failed mailbox fetch, the backend is gone"),
+        };
+        cmd_tx.send(fetch("held")).unwrap();
+        assert_eq!(answer(&resp_rx), "cache unavailable (offline mode)");
+        drop(held);
+        cmd_tx.send(fetch("released")).unwrap();
+        assert_eq!(
+            answer(&resp_rx),
+            "no cached mailboxes available (offline mode)"
+        );
+        cmd_tx.send(BackendCommand::Shutdown).unwrap();
+        backend.join().unwrap();
+        std::env::remove_var("XDG_CACHE_HOME");
+    }
 
     fn make_email(id: &str) -> Email {
         Email {

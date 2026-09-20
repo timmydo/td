@@ -1,10 +1,10 @@
 # td-mail (Timmy's Mail Console)
 
-`td-mail` is a Rust terminal mail client (MUA) for reading and triaging email over JMAP.
+`td-mail` is a Rust mail client (MUA) for reading and triaging email over JMAP, drawn in a td-ui window.
 
 ## Goals
 
-- Fast, keyboard-first email workflow in a terminal UI.
+- Fast, keyboard-first email workflow in a cell-grid window on td's compositor.
 - Unix-friendly composition flow: drafts open in `$EDITOR`.
 - Clear separation of concerns: `td-mail` reads/manages mail; message submission is external.
 - Scriptable automation through a JSON-over-stdin/stdout CLI mode.
@@ -141,9 +141,12 @@ Each account sets exactly one of `secret = "portal"` or `password_command`.
 Legacy fallback is supported via `[jmap]` with `well_known_url`, `username`, and one of those;
 its portal credential is mail/default.
 
-If the first account cannot be reached at startup (server down, network not
-up yet, placeholder credentials), td-mail starts offline from its cache instead
-of exiting; selecting the account again retries the connection.
+The window opens before the first account is connected, so the credential and
+discovery round trips never hold it; the mailbox list loads once the
+connection is decided. If the account cannot be reached (server down, network
+not up yet, placeholder credentials), td-mail lists what its cache holds
+instead of exiting; `a` in the mailbox list, which selects the next account
+and with one account reopens it, retries the connection.
 
 Optional rules file path defaults to `rules.toml` next to your config; override with `--rules=PATH`.
 

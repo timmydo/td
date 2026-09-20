@@ -324,6 +324,8 @@ fn cmd_connect(state: &mut CliState, input: &Value) -> Value {
 
     let (cmd_tx, resp_rx) = backend::spawn(
         client,
+        false,
+        false,
         account.name.clone(),
         state.rules.clone(),
         state.custom_headers.clone(),

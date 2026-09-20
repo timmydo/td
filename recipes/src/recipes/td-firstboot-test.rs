@@ -201,7 +201,7 @@ pub fn recipe() -> Recipe {
         .env("PATH", &post_bootstrap_path()),
     );
 
-    // The terminal applications' first configuration. The flag pair adds the
+    // The applications' first configuration. The flag pair adds the
     // mail and news configurations under the login user's td-jail state: once,
     // owned by that user, in the modes the jail insists on, and without turning
     // a stable identity into a first boot. The sandbox user's own uid is the

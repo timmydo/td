@@ -27,6 +27,7 @@ impl HelpView {
             "  p/k/Up      Previous mailbox".to_string(),
             "  Enter       Open mailbox".to_string(),
             "  g           Refresh".to_string(),
+            "  a           Next account; with one, reopen it (reconnect)".to_string(),
             "  +           Create folder".to_string(),
             "  d           Delete selected folder".to_string(),
             "  u           Mark all mail in selected folder read".to_string(),

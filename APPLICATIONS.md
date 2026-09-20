@@ -1976,7 +1976,7 @@ The relative state root is resolved beneath the real user's home. Rung 7
 does not create that writable directory; `td-jail` does so on first launch
 once the ownership and confinement boundary exists. One exception is
 deliberate: for a program that cannot start without a configuration (the
-terminal applications, §D), `td-firstboot` creates the application's
+two source-built applications, §D), `td-firstboot` creates the application's
 `config` directory ahead of its first launch, at sysinit, in exactly the
 shape the jail requires — 0700 directories and 0600 files owned by the
 user, handed over through their own descriptors, written once and never
@@ -3054,7 +3054,7 @@ that its session and process group are unchanged and its
 controlling-terminal field decodes to that device. What the kernel enforces
 for the zero argument is exact: a terminal *some session owns* is refused,
 and stage 1 never steals. A shell's terminal is owned because td-term's
-default child is `cttyhack`, which takes it; so `mail` typed at a td-term
+default child is `cttyhack`, which takes it; so `claude` typed at a td-term
 prompt fails with a diagnostic naming td-term's `--command`, the path that
 produces a session-less pty for exactly this purpose
 (`td-compositor/DESIGN.md` §12). "Never the operator's" therefore rests on
@@ -3369,7 +3369,7 @@ two ioctls the truncation *is* the point.
    token that begins with `-` is a flag and names a process by an exact argv
    word after argv[0]; any other token is a program and names a process by
    the final path component of argv[0], which for a td-jail launch is the
-   entry path, so that a terminal application's boot evidence can name the
+   entry path, so that an application's boot evidence can name the
    program its entry runs as, `td-mail` or `td-news`, without either taking a marker
    argument. Neither form reads the other's field, so a wrapper carrying the
    program's name as an argument is not the program.
@@ -5676,10 +5676,10 @@ drives it through the broker. Firefox is the one selected application that
 holds a bus name; the first-window oracle drives one peer, not two
 applications' traffic on one live bus. `mail`, `news` and `claude` ship
 beside it with NO bus policy: mail and news are static td-owned programs
-and Claude a foreign payload, none with a D-Bus client. Mail and Claude
-are terminal applications, each started by td-term at boot under the
-`devices=tty` grant; news draws in a td-ui window of its own and is
-started direct, as Firefox is (§W.8, "Reworked").
+and Claude a foreign payload, none with a D-Bus client. Claude is the one
+terminal application, started by td-term under the `devices=tty` grant;
+mail and news draw in td-ui windows of their own and are started direct,
+as Firefox is (§W.8, "Reworked").
 Claude's oracle proves a launch, a fresh terminal and a registration on the
 live broker beside Firefox's instance, not a message between two peers. Step
 12 still binds the socket into their jails, so a compromised one could
@@ -7371,6 +7371,7 @@ Each row is one landing or a small family, leaving the tree green.
 | 33 | **Claude Code ships — LANDED** as the fourth shipped application and the first foreign-payload terminal program: a marked payload on Firefox's runtime, run behind the same jail as the source-built mail and news, with the `devices=tty` grant in its policy and its own boot oracle unit, `claude-evidence`. Once every Firefox oracle has published, so no second window shares a frame those measure, the unit launches it twice as its application user: with no terminal of its own, which the grant refuses before anything runs, and inside a pseudo-terminal from `td-term --command`, where `claude --version` runs to exit status 0 through td-jail's registration on the live broker beside Firefox's instance; td-term's own line for its child's status, matched whole wherever the capture holds it, is the proof, so a failed acquisition, registration, jail or payload is a failed launch; Firefox's process token and bus identity are read before and after and must match, so the instance it ran beside is the live one; a failed launch's captured output goes to a file, never the console. The oracle found the jail keying the `/usr` aliases on Firefox's reviewed package library path rather than on the runtime, so a dynamic application with no package libraries had no interpreter; the aliases now follow the runtime, and stage 1 tells stage 2 so in a word of its own. The payload then died with SIGILL: the oracle's default `qemu64` CPU has no SSE4.2 or POPCNT, the x86-64-v2 baseline the payload assumes and Firefox's conservative build does not, so the boot now emulates `Nehalem`, the lowest stock model that supplies it. It then ran `--version` to exit 0, but the jail's post-exit read of the cgroup leaf's diagnostics found it already reaped, since the application is short-lived, and reported that as a failure; that read is observability the launch discards on success, so a leaf already gone is now `None`, not a failed launch, matching the rest of the module. The host oracle latches `TD-CLAUDE-TERMINAL-OK` and fails without it, and the roster tripwire now requires an evidence unit per shipped application. Not yet: a launcher card that opens it, and the executable state subtree its updater needs; the caller's working directory is rung 34 | a foreign-payload terminal application is proved to run in a terminal of its own, beside the browser, on one live bus |
 | 34 | **the admitted caller's working directory**: stage 1 maps its own directory through a declared filesystem grant and passes the bounded canonical result to stage 2, which starts there or falls back to `/` if it cannot enter it. The private-UID cutover makes the stock root authority the supported launcher; it starts from `/` and does not forward an operator's working directory. Direct human-UID application launch is refused. A later typed launch request must carry an admitted working directory to restore that operator flow. The jail's existing grant mapping and argv/refusal tests remain applicable to admitted callers | an admitted caller's directory is retained only inside its declared grant; stock launches currently start at `/` |
 | 35 | **news in a td-ui window — LANDED** (§W.8, "Reworked"): td-ui gains the cell screen, a grid of styled cells presented as a plain toplevel that polls the program's handler each turn, and td-news's views draw on it whole; its terminal layer and UNSAFE.md §18 surface are gone, the crate forbids `unsafe`, the recipe is a static PIE Cargo build over the toolkit, the `news` package drops `devices=tty`, and the `[news]` unit launches it direct and is ready when the compositor's layout names its toplevel. Mail follows in its own increment | one of the two source-built applications no longer needs a terminal, a pty grant or td-term to exist |
+| 36 | **mail in a td-ui window — LANDED** (§W.8, "Reworked"): td-mail's views keep their cursor-and-attribute writer over the window's cell screen, so they move untouched; its terminal layer and UNSAFE.md §17 are gone and the crate forbids `unsafe`; the recipe is a static PIE Cargo build over the toolkit, the `mail` package drops `devices=tty`, and the `[mail]` unit launches it direct with the anchored layout probe. The direct-rustc local-source ladder keeps one user, td-install-qemu-test | neither source-built application needs a terminal, a pty grant or td-term to exist; Claude is the terminal set, and §W.7's relaunch is a window request |
 
 **Of the two reversals this ladder used to omit entirely, timezone now
 has a rung and accessibility still does not.** §O made timezone support
@@ -9529,8 +9530,8 @@ beside it (the td-taskmgr shape, since it links the toolkit as a second
 crate) and packaged into the `mail` application's store closure as
 `/app/bin/td-editor` with `EDITOR=/app/bin/td-editor` in the manifest
 environment. It is a native Wayland client: the mail jail already carries
-`sockets=wayland`, so the editor opens its own toplevel beside the
-terminal, and td-mail reaps it in the background while its own screen
+`sockets=wayland`, so the editor opens its own toplevel beside the mail
+window, and td-mail reaps it in the background while its own window
 continues, as it does for any editor. The static runtime has no shell, so
 td-mail executes a plain-word editor command directly and keeps `sh -c`
 only for shell text (`td-mail/README.md`). Landed; the in-jail acceptance
@@ -9597,7 +9598,7 @@ must hand the URL to the running instance; Firefox does that over the
 session bus name it owns (`org.mozilla.firefox`), and the broker must
 admit that one call between two instances of the same application. (2) A
 td-owned helper, `td-open URL`, dependency-free Rust reusing td-portal's
-client-side D-Bus codec, packaged into each terminal application's store
+client-side D-Bus codec, packaged into each application's store
 closure as `/app/bin/td-open`. The applications then need no D-Bus code:
 `td-news`'s configured browser command and `td-mail`'s opener become
 `/app/bin/td-open`, and the manifests set `BROWSER=/app/bin/td-open`.
@@ -9611,25 +9612,28 @@ read-only grant, which is the Documents-portal shape without FUSE.
 prefer `$BROWSER` when set before probing `xdg-open`, so the manifest
 environment is enough and no `sh -c` is involved.
 
-### W.7 Relaunching a terminal application without root
+### W.7 Relaunching a shipped application without root
 
 **Diagnosis.** `mail` and `news` are started once at boot by td-svc
 units with `restart=never`, so a client that exits stays gone until the
 operator starts it again. Today the two ways to do that are a reboot
 and `td-svc restart` from the `su` escape hatch, and AGENTS.md forbids
-making a user-facing flow depend on the latter. Running `mail` from a
-shell in the terminal window does not work either: td-jail's
-`devices=tty` grant makes the entry a session leader on a fresh pty
-and acquires that pty with `TIOCSCTTY`, which fails when the pty is
-already the shell's controlling terminal. The grant is right to insist
-on a fresh terminal; what is missing is a user-level way to get one
-with a program in it.
+making a user-facing flow depend on the latter. Both programs now draw
+in td-ui windows of their own (§W.8, "Reworked"), so the pty the
+terminal grant insisted on is no longer in the way; what is missing is
+a user-level request that starts the program in a fresh window. Claude
+remains the terminal case: running it from a shell in the terminal
+window does not work, since td-jail's `devices=tty` grant makes the
+entry a session leader on a fresh pty and acquires that pty with
+`TIOCSCTTY`, which fails when the pty is already the shell's
+controlling terminal.
 
 **Plan.** (1) The compositor's launcher already builds `td-term run`
-for a new terminal window on a key chord; it gains a request that adds
-`--command /bin/<name>` for a shipped terminal application, so a chord
+for a new terminal window on a key chord; it gains a request that
+starts a shipped application through td-authd's `application-start`,
+`direct` for a window application and `terminal` for Claude, so a chord
 opens a fresh `mail` or `news` window, and the running td-svc window is
-not involved. The launcher, not the shell, chooses the command, so the
+not involved. The launcher, not the shell, chooses the program, so the
 set of programs a chord can start is the launcher table's and nothing
 the user typed. (2) The same request is exposed through the compositor
 control socket the `[applications-workspace]` and `[shell-workspace]`
@@ -9847,9 +9851,9 @@ them, and it cost each a raw-terminal layer with an `unsafe` surface
 live in and the relaunch problem §W.7 describes. td-ui's cell screen
 (`td-ui/DESIGN.md`, "Cell screen") keeps the shape the views draw in,
 rows and columns of styled cells, and presents it as a plain Wayland
-toplevel, so the views move whole. td-news is the first: its views
-paint a `Screen`, its keys arrive translated from the keyboard's chords,
-a click is the cell under the pointer and a wheel frame is rows of
+toplevel, so the views move whole. td-news went first: its views paint
+a `Screen`, its keys arrive translated from the keyboard's chords, a
+click is the cell under the pointer and a wheel frame is rows of
 travel; its backend thread's channel is read by the window's poll each
 turn. Two things change for the reader with that: the wheel now scrolls
 the article view, which its help line always promised and the
@@ -9868,11 +9872,29 @@ terminal grant; the `[news]` unit launches it `direct` as Firefox is,
 with no `terminal` ordering, and is ready when the compositor's layout
 report names its toplevel by app id in a record anchored at its every
 field, so a title cannot forge one, polled to the unit's timeout as
-td-term's socket
-probe was. td-firstboot's provisioning, the fetch service, the boot
-marker and the evidence unit are unchanged. td-mail follows in its own
-increment, after which §W.7's relaunch problem is a launcher request
-for a window rather than a pty, and §D's terminal set is Claude alone.
+td-term's socket probe was. td-firstboot's provisioning, the fetch
+service, the boot marker and the evidence unit are unchanged. td-mail
+followed in its own increment by the same route: its views keep their
+cursor-and-attribute writer, `Terminal`, now a render's writer over the
+window's `Screen` with the theme's colours as styles and the HTML
+rendering's SGR sequences read into cell attributes, so the view files
+are untouched but for the mailbox list's account switch, which reopens
+a lone account, and the hint and help that say so; its keys, clicks
+and wheel travel arrive translated as td-news's do, into the client's
+own key type; the session polls the backend's channel, the pending
+actions and the idle-sync clock each turn; the draft is retained and
+the editor spawned as before, a path §W.5 still owns. The window
+opens before the account connects, the session's one connector thread
+making the connection behind it, the backend holding every command
+until the connection is decided and the mailbox list loading until
+then, so the credential and discovery round trips never hold the
+toplevel the unit's readiness waits for and nothing is read from the
+cache that the connection supersedes. The same terminal text
+selection goes with it. Its terminal layer and UNSAFE.md §17 are
+retired, the `mail` package drops `devices=tty`, and the `[mail]` unit
+launches it `direct` with the same anchored layout probe. With both
+moved, §W.7's relaunch problem is a launcher request for a window
+rather than a pty, and §D's terminal set is Claude alone.
 
 ## X. Host mode — development only
 
