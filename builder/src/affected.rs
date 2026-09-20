@@ -1096,6 +1096,15 @@ fn map_path(root: &Path, roster: &Result<Vec<GateCrate>, String>, p: &str, sel: 
         return;
     }
 
+    // The application entry points and the test that drives both through
+    // fake tools: they bootstrap the runner and exec `td-builder host-run`,
+    // whose own logic the builder's cargo tests cover.
+    if p == "news" || p == "mail" || p == "tests/host-run.sh" {
+        sel.add_preflight("shell-syntax");
+        sel.add_preflight("host-run-entry");
+        return;
+    }
+
     // Unlike generic prose, the profiler design is its normative runtime and
     // evidence contract. Route it before the docs waiver so an amendment runs
     // both the host parser/boundedness tests and target image integration.
@@ -1627,10 +1636,16 @@ fn map_path(root: &Path, roster: &Result<Vec<GateCrate>, String>, p: &str, sel: 
 // Rendering — byte-for-byte with the shell's stdout.
 // ---------------------------------------------------------------------------
 
+/// The shell scripts' syntax check, one `bash -n` per script: given several
+/// names at once, bash checks the first and hands the rest to it as its
+/// arguments.
+const SHELL_SYNTAX: &str = "for f in start build-qcow host-preflight.sh news mail tests/*.sh ci/*.sh tools/*.sh; do bash -n \"$f\" || exit 1; done";
+
 fn preflight_cmd(root: &Path, name: &str, changed: &[String]) -> Option<String> {
     match name {
-        "shell-syntax" => Some("  bash -n start build-qcow host-preflight.sh tests/*.sh ci/*.sh tools/*.sh".to_string()),
+        "shell-syntax" => Some(format!("  {}", SHELL_SYNTAX)),
         "start-bootstrap" => Some("  bash tests/start.sh".to_string()),
+        "host-run-entry" => Some("  bash tests/host-run.sh".to_string()),
         "heal-revert" => Some("  bash tests/heal-revert.sh".to_string()),
         // Rendered from the SAME list that runs, so a scoped run cannot print a
         // command it will not issue — the dry run is what a reader trusts.
@@ -2694,6 +2709,12 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     assert_preflight!("build-qcow", "start-bootstrap");
     assert_preflight!("host-preflight.sh", "shell-syntax");
     assert_preflight!("host-preflight.sh", "start-bootstrap");
+    assert_preflight!("news", "shell-syntax");
+    assert_preflight!("news", "host-run-entry");
+    assert_preflight!("mail", "shell-syntax");
+    assert_preflight!("mail", "host-run-entry");
+    assert_preflight!("tests/host-run.sh", "shell-syntax");
+    assert_preflight!("tests/host-run.sh", "host-run-entry");
     // td-netd/src is include_str!'d into the target artifact (its recipe AND packed
     // into system-x86-64), so a helper-source edit rides the host cargo preflight
     // AND is recorded against recipe-checks, which statically links + shape-asserts
@@ -4543,8 +4564,9 @@ pub(crate) fn gate_crate_names(root: &Path) -> Result<Vec<String>, String> {
 
 fn run_preflight(root: &Path, name: &str, changed: &[String]) -> i32 {
     match name {
-        "shell-syntax" => run_shell(root, "bash -n start build-qcow host-preflight.sh tests/*.sh ci/*.sh tools/*.sh"),
+        "shell-syntax" => run_shell(root, SHELL_SYNTAX),
         "start-bootstrap" => run_shell(root, "bash tests/start.sh"),
+        "host-run-entry" => run_shell(root, "bash tests/host-run.sh"),
         "heal-revert" => run_shell(root, "bash tests/heal-revert.sh"),
         // BOTH engine crates, tests AND clippy: the AGENTS.md deny-lints only
         // fire under the clippy driver, and the in-loop cargo-test gate (325)
@@ -8823,7 +8845,7 @@ mod tests {
                 "  check.sh",
                 "",
                 "Selected checks:",
-                "  bash -n start build-qcow host-preflight.sh tests/*.sh ci/*.sh tools/*.sh",
+                "  for f in start build-qcow host-preflight.sh news mail tests/*.sh ci/*.sh tools/*.sh; do bash -n \"$f\" || exit 1; done",
                 &full_cargo,
                 "  td-builder check check",
                 "",

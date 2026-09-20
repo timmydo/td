@@ -20,8 +20,22 @@ Wayland compositor: `WAYLAND_SOCKET`, or `WAYLAND_DISPLAY` under
 
 ## Build / Run
 
-This project needs `CC=gcc` for the linker; `cc` is not on `PATH` in this
-environment:
+On a host, the one-word way is the repository root's entry script, which
+builds td-news, serves td's fetch service for this launch alone, runs
+td-news under your Wayland session and stops the service when td-news
+exits (`td-builder host-run`, APPLICATIONS.md §X.7). It is not the jail:
+td-news runs as you, with your whole privilege, and nothing confines it.
+It needs cargo and a C compiler (`cc`, `gcc`, or `TD_CC_HOME`), and
+crates.io the first time, for td-net's dependencies:
+
+```bash
+./news
+```
+
+Directly, this project needs `CC=gcc` for the linker; `cc` is not on
+`PATH` in this environment, and the fetch service is yours to serve
+(`net/target/release/td-net fetchd run --socket "$XDG_RUNTIME_DIR/td-fetch/socket"`
+after `CC=gcc cargo build --release --manifest-path net/Cargo.toml`):
 
 ```bash
 CC=gcc cargo build

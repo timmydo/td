@@ -1,0 +1,61 @@
+#!/bin/sh
+# ./mail — run the checkout's td-mail on this host, unjailed, with the fetch
+# service it needs served for it (td-builder host-run, builder/src/host_run.rs).
+# Arguments go to td-mail. Not ./start's preflight: that provisions the seed
+# toolchain, musl target included, for control-plane artifacts that enter
+# builds; nothing here does, so the host's own cargo is enough.
+set -eu
+unset CDPATH
+
+case "$0" in
+    */*) start_dir=${0%/*} ;;
+    *) start_dir=. ;;
+esac
+cd "${start_dir:-/}"
+
+command -v cargo >/dev/null 2>&1 || {
+    echo "$0: no cargo on PATH: install Rust (cargo and rustc)" >&2
+    exit 1
+}
+command -v rustc >/dev/null 2>&1 || {
+    echo "$0: no rustc on PATH beside cargo" >&2
+    exit 1
+}
+
+# rustc links through cc. The runner resolves a C compiler for the builds
+# it makes (TD_CC_HOME, else cc or gcc on PATH, as builder/src/stage0.rs
+# does); the runner's own build, made here, is given the same one when cc
+# is not on PATH, which on Guix it is not.
+linker=
+if [ -n "${TD_CC_HOME:-}" ]; then
+    if [ -x "$TD_CC_HOME/bin/cc" ]; then
+        linker=$TD_CC_HOME/bin/cc
+    elif [ -x "$TD_CC_HOME/bin/gcc" ]; then
+        linker=$TD_CC_HOME/bin/gcc
+    else
+        echo "$0: TD_CC_HOME=$TD_CC_HOME has no bin/gcc or bin/cc" >&2
+        exit 1
+    fi
+elif ! command -v cc >/dev/null 2>&1; then
+    command -v gcc >/dev/null 2>&1 || {
+        echo "$0: no cc or gcc on PATH (build-essential), and TD_CC_HOME is not set" >&2
+        exit 1
+    }
+    linker=gcc
+fi
+if [ -n "$linker" ]; then
+    triple=$(rustc -vV | sed -n 's/^host: //p')
+    export "CARGO_TARGET_$(printf '%s' "$triple" | tr 'a-z.-' 'A-Z__')_LINKER=$linker"
+fi
+
+# The runner is built into the checkout's own target directory, where the
+# cargo configuration's runner expects it, and for this host: an ambient
+# target directory or build target would put it elsewhere.
+export CARGO_TARGET_DIR="$PWD/target"
+unset CARGO_BUILD_TARGET
+cargo build --release --locked --quiet --manifest-path builder/Cargo.toml
+[ -x target/release/td-builder ] || {
+    echo "$0: cargo built the runner but target/release/td-builder is not there (a build.target in a cargo configuration?)" >&2
+    exit 1
+}
+exec target/release/td-builder host-run mail "$@"

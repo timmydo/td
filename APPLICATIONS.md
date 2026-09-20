@@ -10306,6 +10306,41 @@ the safe stable `OsStrExt::from_bytes`; converting them would let the
 file drop its `#![allow(unsafe_code)]`, which is a reduction in td's
 unsafe surface available for free.
 
+### X.7 An unjailed checkout launch
+
+`./news` and `./mail` at the repository root run the checkout's td-news
+and td-mail on the host in one word, and they are not §X.1's host mode:
+no jail, no materialized package, no td-busd, no confinement of any
+kind. The application runs as the caller, with the caller's whole
+privilege, under the caller's Wayland session. Each is an entry script
+in `./start`'s shape that builds the Cargo runner into the checkout's
+own target directory, the linker the host has named for rustc when `cc`
+is not on PATH (`TD_CC_HOME`'s, else `gcc`, as the seed provisioning
+resolves it), and execs `td-builder host-run NAME`, whose whole logic is
+dependency-free Rust in the builder. The verb resolves the host's own
+cargo and C compiler the same way, with no static or musl requirement,
+since nothing it builds enters a build; builds the checkout's td-net and
+the application, taking each binary from cargo's own report of where it
+put it; and serves the application's fetch service itself, in a runtime
+directory of the launch's own under the session's
+(`$XDG_RUNTIME_DIR/td-host-run/PID`, mode 0700), which the application
+is given as its `XDG_RUNTIME_DIR` with the session's display made
+absolute: td-net's `fetchd` applet is started at `td-fetch/socket` there
+as a child, armed to die with the launcher, and stopped, its directory
+removed, when the application exits, whose exit code, or 128 plus its
+signal, is the launcher's. Two launches side by side are two services,
+neither the other's to take away; the session's own `td-fetch/socket` is
+never touched, so a direct `cargo run` still gets the application's
+named refusal, which now names the launcher; and a launch that is killed
+leaves no service, only a directory the next launch sweeps, judging by
+its own pid namespace, which is the session's. Every fetch
+the applications make goes through that service, as on td, since they
+carry no network client of their own; that is a property of the
+applications, not a boundary this launch enforces, and nothing of §W's
+confinement holds here. This section's two-configuration rule reads the
+launch as availability: the applications run here as they run on td,
+the jail is what is absent, and a feature owes this launcher nothing.
+
 ## Z. No server infrastructure
 
 A constraint rather than a design, stated because several decisions above

@@ -63,6 +63,12 @@ Nonempty selections still run through that host. This uses the affected-path
 mapping, not a blanket Markdown exemption: documentation that selects a check
 still runs it. `ready` remains required for documentation updates.
 
+The repository-root entry scripts are `./start` and `./build-qcow`, which
+build the system through the Cargo runner, and `./news` and `./mail`,
+which run the checkout's two applications on this host unjailed
+(`td-builder host-run`, APPLICATIONS.md §X.7). `tests/start.sh` and
+`tests/host-run.sh` prove each pair's bootstrap.
+
 `ready` runs the selected checks once over the branch tip. It does not prove
 that an intermediate commit is green, so keep every commit independently
 passing as it is made.

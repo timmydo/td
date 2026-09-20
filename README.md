@@ -60,7 +60,13 @@ Build the system and boot it under QEMU:
 ```
 
 `./start` is the repository-root convenience wrapper for
-`td-recipe-eval run system-x86-64`.
+`td-recipe-eval run system-x86-64`. `./news` and `./mail` run the
+checkout's two applications on this host instead, unjailed and as you,
+under your Wayland session, with td's fetch service started for each
+launch (`td-builder host-run`, APPLICATIONS.md §X.7); they need cargo
+and a C compiler on `PATH` (or `TD_CC_HOME`) and nothing else of the
+toolchain, and crates.io reachable the first time, for td-net's
+dependencies.
 It boots a selector initramfs, verifies the current deployment on a persistent
 Btrfs volume, kexecs that deployment, loop-mounts its read-only EROFS root,
 starts the software Wayland compositor and visible td-native demo, and

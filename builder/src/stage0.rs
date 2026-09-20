@@ -123,7 +123,7 @@ fn native_std_in(toolchain: &Toolchain) -> Result<(), ProvisionErr> {
     )))
 }
 
-fn is_exec(p: &Path) -> bool {
+pub(crate) fn is_exec(p: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
     std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
 }
@@ -319,7 +319,7 @@ fn require_musl_target(rust_bin_dir: &str) -> Result<(), ProvisionErr> {
     ensure_musl_target(rust_bin_dir).map_err(|e| ProvisionErr::Broken(e.into_message()))
 }
 
-fn find_in_path(search_path: &str, bin: &str) -> Option<PathBuf> {
+pub(crate) fn find_in_path(search_path: &str, bin: &str) -> Option<PathBuf> {
     search_path
         .split(':')
         .filter(|d| !d.is_empty())

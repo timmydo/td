@@ -117,7 +117,8 @@ fn fetch_socket_location() -> String {
 fn no_fetch_service() -> String {
     format!(
         "no td-fetch socket at {}: td-news fetches through td's fetch service; \
-         on a host, serve one there",
+         on a host, ./news from the checkout serves one, or \
+         td-net fetchd run --socket PATH",
         fetch_socket_location()
     )
 }
@@ -480,7 +481,10 @@ mod tests {
             "{err}"
         );
         assert!(
-            err.ends_with("/td-fetch/socket: td-news fetches through td's fetch service; on a host, serve one there"),
+            err.ends_with(
+                "/td-fetch/socket: td-news fetches through td's fetch service; on a host, \
+                 ./news from the checkout serves one, or td-net fetchd run --socket PATH"
+            ),
             "{err}"
         );
         assert!(fetch_socket_location().ends_with("/td-fetch/socket"));

@@ -46,6 +46,7 @@ mod gate_timing;
 mod gates;
 use td_engine::gzip;
 mod host_bin;
+mod host_run;
 mod kernel_headers;
 mod lock;
 mod mes_boot;
@@ -11238,6 +11239,10 @@ fn main() -> ExitCode {
                 }
             }
         }
+        // td-builder host-run news|mail [ARG...] — the checkout's application on
+        // this host, unjailed, with the fetch service it needs served for it; the
+        // repository-root ./news and ./mail entry scripts exec this (host_run.rs).
+        Some("host-run") => host_run::run(args.get(2..).unwrap_or(&[])),
         // td-builder assert-static PATH — verify a host-built control-plane binary
         // is FULLY static: no PT_INTERP, no DT_NEEDED, no run-path. The no-leakage
         // invariant enforced at every host build site (re #469) so a dynamically

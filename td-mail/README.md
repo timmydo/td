@@ -82,8 +82,9 @@ Older runtime drafts are not moved or deleted automatically.
 - td's fetch service, listening at `$XDG_RUNTIME_DIR/td-fetch/socket`. td-mail
   opens no socket of its own: every request goes through the service, which
   holds the TLS trust, the resolver and the timeouts. Inside a td jail the
-  `sockets=fetch` grant provides it; elsewhere, serve one there or td-mail
-  reports that it is missing and starts from its cache.
+  `sockets=fetch` grant provides it; elsewhere, `./mail` from the checkout
+  serves one for its launch (below), or td-mail reports that it is
+  missing and starts from its cache.
 - A password source per account: td's credential portal for
   `secret = "portal"` (the secret stored as mail/NAME for `[account.NAME]`,
   read through the `/app/bin/td-secret` helper packaged beside td-mail, so
@@ -189,6 +190,23 @@ ASCII: `(?i)é` does not match `É`. A pattern too expensive to decide counts
 as no match, so a rule that cannot be evaluated does not fire.
 
 ## Run
+
+On a host, the one-word way is the repository root's entry script, which
+builds td-mail, serves td's fetch service for this launch alone, runs
+td-mail under your Wayland session and stops the service when td-mail
+exits (`td-builder host-run`, APPLICATIONS.md §X.7). It is not the jail:
+td-mail runs as you, with your whole privilege, and nothing confines it.
+It needs cargo and a C compiler (`cc`, `gcc`, or `TD_CC_HOME`), and
+crates.io the first time, for td-net's dependencies:
+
+```bash
+./mail
+```
+
+Directly, with the fetch service yours to serve
+(`net/target/release/td-net fetchd run --socket "$XDG_RUNTIME_DIR/td-fetch/socket"`
+after `cargo build --release --manifest-path net/Cargo.toml`), and
+`CC=gcc` on a host without `cc` on `PATH`, as the linker:
 
 ```bash
 cargo run
