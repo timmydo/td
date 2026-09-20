@@ -143,8 +143,8 @@ Boot health resolves the primary name once through the checked launcher
 and passes it as a quoted argument to its existing `su` and `exec-as`
 probes. The network self-test does the same. SSH and Git clients use the
 credential-selected USER value, including when a probe substitutes a
-temporary HOME. The SSH server's self-test Match configuration and early
-home/Downloads preparation still need the coordinated profile cutover.
+temporary HOME. The SSH server's self-test Match configuration and remaining
+download-test paths still need the coordinated profile cutover.
 These diagnostics do not publish or activate a selected username.
 Updates must retain the installed identity and settings.
 
@@ -195,6 +195,43 @@ output for a retry. This command does not modify the input account files or live
 create homes, save an installer choice or start a session. Deployment
 verification, boot-time publication and the remaining coordinated cutover
 are still the caller's responsibility.
+
+`td-firstboot prepare-primary-home ROOT` is an early boot operation over
+an already authenticated deployment with its persistent `/var` mounted.
+Before writing, it admits the complete root-owned account and principal
+tables using the primary-name checks above. It derives `/var/home/NAME`
+from the validated UID/GID-1000 account. ROOT, its `var`, and `var/home`
+must be real root-owned mode-0755 directories; procfs must be available
+for descriptor-relative access. The caller supplies trusted ancestors and
+serializes this operation before any user process or competing root writer.
+It neither verifies the deployment signature nor proves the mount itself.
+
+An existing primary home must be a real UID/GID-1000 directory. Its
+inode, contents and ownership are retained; after ownership validation,
+its open descriptor restores mode 0700 and syncs any permission change.
+Aliases, different owners and non-directories refuse without repair.
+A new home is prepared in an exclusive hidden sibling, assigned its final
+ownership and mode and synced before rename and parent sync. Up to 64
+exclusive creation attempts handle collisions; time and PID are only name
+hints, and a pre-1970 clock is allowed. Old staging names are not reused
+or removed. Successful stdout is exactly the canonical persistent home path and a newline.
+A failure may leave a hidden staging directory after an abrupt stop, or
+a complete final home if the final sync fails; it cannot publish a
+partially owned home. There is no live rename or home-adoption interface.
+
+The image recipe normalizes the deployment root to mode 0755 and checks
+its complete primary-account tables before packing. The deployment
+initramfs packs the source-built static provisioner and runs this operation before unmounting procfs or entering the root. The
+selector does not pack it. Generic early directory creation excludes the
+primary UID. Downloads preparation derives its path from the returned
+home and retains its existing grant policy; it records the successful
+self-bind path in a root-owned mode-0600 file under `/run`. Shutdown uses
+that private record to release the same bind before `/var`, after the
+application and portal views are released. Invalid home ownership or
+type stops boot and requires inspection from a trusted recovery
+environment; user changes to home permissions do not prevent boot. Account-choice persistence, publication,
+SSH self-test configuration and remaining download-test paths still need
+the coordinated installed-profile cutover.
 
 Keyboard and timezone choices must actually affect the installed session;
 only supported choices with available data may be offered.

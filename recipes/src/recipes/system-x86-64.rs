@@ -281,6 +281,7 @@ const CONTROL_SOCKET: &str = "/run/td-compositor/1000/td-control";
 const PORTAL_SERVICE_LOG: &str = "/run/td-portal.log";
 const PORTAL_FILE_CHOOSER_COMPLETED: &str =
     "TD-PORTAL-FILE-CHOOSER-COMPLETED";
+#[cfg(test)]
 const FIREFOX_DOWNLOAD_SOURCE: &str = "/var/home/tester/Downloads";
 const FIREFOX_DOWNLOAD_PATH: &str =
     "/var/home/tester/Downloads/td-firefox-download.txt";
@@ -2103,7 +2104,6 @@ fn build_deployment_init(sys: &SystemDef) -> String {
      /bin/td-boot on-volume mount-var /sysroot/var\n\
      /bin/td-util printf '%s\\n' 2 > /proc/sys/kernel/perf_event_paranoid\n\
      /bin/td-util test \"$(/bin/td-util cat /proc/sys/kernel/perf_event_paranoid)\" = 2 || { echo 'td-init: kernel.perf_event_paranoid did not realize the pinned value 2' >&2; exit 1; }\n\
-     /bin/umount /proc\n\
      /bin/umount /dev\n\
      /bin/umount /sys\n\
      /bin/mount -t tmpfs -o mode=0755 tmpfs /sysroot/run\n\
@@ -2115,35 +2115,41 @@ fn build_deployment_init(sys: &SystemDef) -> String {
      /bin/td-util mkdir -p /sysroot/var/log /sysroot/var/home"
         .to_string();
     for user in sys.users {
-        if gets_generic_persistent_home_setup(user) {
+        if gets_generic_persistent_home_setup(user) && user.uid != UI_UID {
             init.push_str(&format!(" /sysroot/var{}", user.home));
         }
     }
     init.push_str(&format!(
-        "\nif /bin/td-util readlink /sysroot{FIREFOX_DOWNLOAD_SOURCE} >/dev/null 2>&1; then\n\
+        "\n/bin/td-util chown 0:0 /sysroot/var /sysroot/var/home\n\
+         /bin/td-util chmod 0755 /sysroot/var /sysroot/var/home\n\
+         primary_home=$(/bin/td-firstboot prepare-primary-home /sysroot) || exit 1\n\
+         /bin/umount /proc\n\
+         downloads=\"$primary_home/Downloads\"\n\
+         if /bin/td-util readlink \"/sysroot$downloads\" >/dev/null 2>&1; then\n\
            echo 'td-init: Firefox Downloads source is a symlink; grant disabled' >&2\n\
-         elif /bin/td-util test -e /sysroot{FIREFOX_DOWNLOAD_SOURCE} && ! /bin/td-util test -d /sysroot{FIREFOX_DOWNLOAD_SOURCE}; then\n\
+         elif /bin/td-util test -e \"/sysroot$downloads\" && ! /bin/td-util test -d \"/sysroot$downloads\"; then\n\
            echo 'td-init: Firefox Downloads source is not a directory; grant disabled' >&2\n\
-         elif /bin/td-util mkdir -p /sysroot{FIREFOX_DOWNLOAD_SOURCE}; then\n\
-           /bin/td-util chown {UI_UID}:{UI_GID} /sysroot{FIREFOX_DOWNLOAD_SOURCE}\n\
-           /bin/td-util chmod 0700 /sysroot{FIREFOX_DOWNLOAD_SOURCE}\n\
-           /bin/mount -o bind /sysroot{FIREFOX_DOWNLOAD_SOURCE} /sysroot{FIREFOX_DOWNLOAD_SOURCE}\n\
-           /bin/td-util printf '' > /sysroot{FIREFOX_XDG_MOUNT_MARKER}\n\
+         elif /bin/td-util mkdir -p \"/sysroot$downloads\"; then\n\
+           /bin/td-util chown {UI_UID}:{UI_GID} \"/sysroot$downloads\"\n\
+           /bin/td-util chmod 0700 \"/sysroot$downloads\"\n\
+           /bin/mount -o bind \"/sysroot$downloads\" \"/sysroot$downloads\"\n\
+           /bin/td-util printf '%s\\n' \"$downloads\" > /sysroot{FIREFOX_XDG_MOUNT_MARKER}\n\
+           /bin/td-util chmod 0600 /sysroot{FIREFOX_XDG_MOUNT_MARKER}\n\
          else\n\
            echo 'td-init: cannot prepare Firefox Downloads source; grant disabled' >&2\n\
          fi\n\
          /bin/sh -c 'umask 077; /bin/td-util mkdir -p /sysroot/var/root'\n\
          /bin/td-util rm -rf /sysroot/var/run\n\
          /bin/td-util ln -s /run /sysroot/var/run\n\
-         /bin/td-util chown 0:0 /sysroot/var /sysroot/var/log /sysroot/var/home /sysroot/var/root\n\
-         /bin/td-util chmod 0755 /sysroot/var /sysroot/var/log /sysroot/var/home\n\
+         /bin/td-util chown 0:0 /sysroot/var/log /sysroot/var/root\n\
+         /bin/td-util chmod 0755 /sysroot/var/log\n\
          /bin/td-util chmod 0700 /sysroot/var/root\n"
     ));
     // Each persistent home is its user's from the moment it exists: td-firstboot
     // provisions the terminal applications' configuration into it at sysinit,
     // before rootcheck, and refuses a home the user does not own.
     for user in sys.users {
-        if gets_generic_persistent_home_setup(user) {
+        if gets_generic_persistent_home_setup(user) && user.uid != UI_UID {
             init.push_str(&format!(
                 "/bin/td-util chown {}:{} /sysroot/var{}\n\
                  /bin/td-util chmod 0700 /sysroot/var{}\n",
@@ -2241,7 +2247,7 @@ fn build_shutdown() -> String {
          /bin/td-authd release-application-files claude || {{ echo 'td-shutdown: Claude file release failed' >&2; ok=0; }}\n\
          /bin/td-authd release-portal-files || {{ echo 'td-shutdown: portal file release failed' >&2; ok=0; }}\n\
          if /bin/td-util test -e {FIREFOX_XDG_MOUNT_MARKER}; then\n\
-           /bin/umount {FIREFOX_DOWNLOAD_SOURCE} || {{ echo 'td-shutdown: umount Firefox Downloads failed' >&2; ok=0; }}\n\
+           downloads=$(/bin/td-util cat {FIREFOX_XDG_MOUNT_MARKER}) && /bin/umount \"$downloads\" || {{ echo 'td-shutdown: umount Firefox Downloads failed' >&2; ok=0; }}\n\
          fi\n\
          /bin/umount /var || {{ echo 'td-shutdown: umount /var failed' >&2; ok=0; }}\n\
          /bin/umount -a -r --exclude /run || {{ echo 'td-shutdown: final unmount failed' >&2; ok=0; }}\n\
@@ -4066,6 +4072,12 @@ fn build_initramfs_spec(init: &str, phase: Phase) -> String {
         // runs `td-boot boot`, which kexecs. Carrying either name there would give
         // an initramfs a capability its /init has no branch for.
         Phase::Deployment => {
+            // This static helper validates accounts and creates the primary home
+            // before any reader starts and while the initramfs still has procfs.
+            s.push_str("dir {in:td-firstboot} 0755 0 0\n");
+            s.push_str("dir {in:td-firstboot}/bin 0755 0 0\n");
+            s.push_str("file {in:td-firstboot}/bin/td-firstboot {in:td-firstboot}/bin/td-firstboot 0755 0 0\n");
+            s.push_str("slink /bin/td-firstboot {in:td-firstboot}/bin/td-firstboot 0777 0 0\n");
             s.push_str("slink /bin/switch_root {in:td-init}/bin/td-init 0777 0 0\n");
             s.push_str("slink /bin/losetup {in:td-init}/bin/td-init 0777 0 0\n");
             // `mknod` joins them for the same reason: only this /init creates
@@ -4673,6 +4685,9 @@ fn shape_check() -> String {
      printf '%s\\n' \"$init_list\" | grep -qE '^td/store/[^/]+/bin/td-boot$' || { echo 'deployment initramfs: td-boot store member missing' >&2; exit 1; }; \
      printf '%s\\n' \"$selector_list\" | grep -qE '^td/store/[^/]+/bin/td-kexec$' || { echo 'selector initramfs: td-kexec store member missing' >&2; exit 1; }; \
      if printf '%s\\n' \"$init_list\" | grep -qE '^td/store/[^/]+/bin/td-kexec$'; then echo 'deployment initramfs: td-kexec store member must be selector-only' >&2; exit 1; fi; \
+     printf '%s\\n' \"$init_list\" | grep -q -x -F bin/td-firstboot || { echo 'deployment initramfs: primary home provisioner missing' >&2; exit 1; }; \
+     printf '%s\\n' \"$init_list\" | grep -qE '^td/store/[^/]+/bin/td-firstboot$' || { echo 'deployment initramfs: provisioner store member missing' >&2; exit 1; }; \
+     if printf '%s\\n' \"$selector_list\" | grep -q -x -F bin/td-firstboot; then echo 'selector initramfs: home provisioner must be deployment-only' >&2; exit 1; fi; \
      printf '%s\\n' \"$init_list\" | grep -q -x -F bin/switch_root || { echo 'deployment initramfs: bin/switch_root missing - its /init would exec nothing and the boot would end in a 300s timeout with no cause' >&2; exit 1; }; \
      printf '%s\\n' \"$init_list\" | grep -qE '^td/store/[^/]+/bin/td-init$' || { echo 'deployment initramfs: td-init store member missing - the switch_root and mount/umount symlinks would dangle' >&2; exit 1; }; \
      for l in \"$selector_list\" \"$init_list\"; do printf '%s\\n' \"$l\" | grep -qE '^td/store/[^/]+/bin/td-util$' || { echo 'initramfs: td-util store member missing - /bin/td-util would dangle and the /init would stop at its first cat/sleep under set -e, with no cause on the console' >&2; exit 1; }; done; \
@@ -5060,7 +5075,7 @@ pub fn recipe() -> Recipe {
                 POST_BOOTSTRAP_SH,
                 "-c",
                 &format!(
-                    "chmod 0600 '{{root}}/real-root/etc/shadow' && chmod 0444 '{TERMINFO_ENTRY}' '{{root}}/real-root{PRINCIPALS_PATH}' '{{root}}/real-root{BUS_APPLICATION_POLICY}'"
+                    "chmod 0755 '{{root}}/real-root' && chmod 0600 '{{root}}/real-root/etc/shadow' && chmod 0444 '{TERMINFO_ENTRY}' '{{root}}/real-root{PRINCIPALS_PATH}' '{{root}}/real-root{BUS_APPLICATION_POLICY}'"
                 ),
             ],
         )
@@ -5073,6 +5088,16 @@ pub fn recipe() -> Recipe {
             "{in:td-firstboot}/bin/td-firstboot",
             "check-principals",
             "{root}/real-root",
+        ],
+    ));
+
+    steps.push(Step::run(
+        "{root}",
+        &[
+            "{in:td-firstboot}/bin/td-firstboot",
+            "check-primary-name",
+            "{root}/real-root",
+            UI_USER,
         ],
     ));
 
@@ -10130,7 +10155,7 @@ news\tnews-0.1\tsource\tstatic-runtime-1\tsource\n"
         let shutdown = build_shutdown();
         let xdg_guard =
             format!("if /bin/td-util test -e {FIREFOX_XDG_MOUNT_MARKER}; then");
-        let download_unmount = format!("/bin/umount {FIREFOX_DOWNLOAD_SOURCE} || {{");
+        let download_unmount = "/bin/umount \"$downloads\" || {";
         assert!(
             shutdown.contains("/bin/td-init sync || {")
                 && shutdown.contains(&download_unmount)
@@ -10217,7 +10242,7 @@ news\tnews-0.1\tsource\tstatic-runtime-1\tsource\n"
         );
         for user in SYSTEM.users {
             let path = format!("/sysroot/var{}", user.home);
-            if gets_generic_persistent_home_setup(user) {
+            if gets_generic_persistent_home_setup(user) && user.uid != UI_UID {
                 assert!(
                     init.contains(&path),
                     "stage-1 init must create state directory {path} before switch_root"
@@ -10240,6 +10265,9 @@ news\tnews-0.1\tsource\tstatic-runtime-1\tsource\n"
                     init.find(&chown) < init.find(&chmod),
                     "the hand-over precedes the mode, as the Downloads setup does"
                 );
+            } else if user.uid == UI_UID {
+                assert!(init.contains("primary_home=$(/bin/td-firstboot prepare-primary-home /sysroot)"));
+                assert!(!init.contains(&path));
             } else if user.uid == 0 {
                 assert!(init.contains("/sysroot/var/root"));
             } else {
@@ -10304,25 +10332,25 @@ news\tnews-0.1\tsource\tstatic-runtime-1\tsource\n"
     fn firefox_downloads_is_prepared_once_before_switch_root() {
         let init = build_deployment_init(&SYSTEM);
         let source_mkdir = format!(
-            "elif /bin/td-util mkdir -p /sysroot{FIREFOX_DOWNLOAD_SOURCE}; then"
+            "elif /bin/td-util mkdir -p \"/sysroot$downloads\"; then"
         );
         let download_mount = format!(
-            "/bin/mount -o bind /sysroot{FIREFOX_DOWNLOAD_SOURCE} /sysroot{FIREFOX_DOWNLOAD_SOURCE}"
+            "/bin/mount -o bind \"/sysroot$downloads\" \"/sysroot$downloads\""
         );
         let download_link_guard = format!(
-            "if /bin/td-util readlink /sysroot{FIREFOX_DOWNLOAD_SOURCE} >/dev/null 2>&1; then"
+            "if /bin/td-util readlink \"/sysroot$downloads\" >/dev/null 2>&1; then"
         );
         let download_directory_guard = format!(
-            "elif /bin/td-util test -e /sysroot{FIREFOX_DOWNLOAD_SOURCE} && ! /bin/td-util test -d /sysroot{FIREFOX_DOWNLOAD_SOURCE}; then"
+            "elif /bin/td-util test -e \"/sysroot$downloads\" && ! /bin/td-util test -d \"/sysroot$downloads\"; then"
         );
         let source_chown = format!(
-            "/bin/td-util chown {UI_UID}:{UI_GID} /sysroot{FIREFOX_DOWNLOAD_SOURCE}"
+            "/bin/td-util chown {UI_UID}:{UI_GID} \"/sysroot$downloads\""
         );
         let source_chmod = format!(
-            "/bin/td-util chmod 0700 /sysroot{FIREFOX_DOWNLOAD_SOURCE}"
+            "/bin/td-util chmod 0700 \"/sysroot$downloads\""
         );
         let mount_marker =
-            format!("/bin/td-util printf '' > /sysroot{FIREFOX_XDG_MOUNT_MARKER}");
+            format!("/bin/td-util printf '%s\\n' \"$downloads\" > /sysroot{FIREFOX_XDG_MOUNT_MARKER}");
         let downloads_end =
             "/bin/sh -c 'umask 077; /bin/td-util mkdir -p /sysroot/var/root'";
         assert_eq!(init.matches(&source_mkdir).count(), 1);
@@ -10404,6 +10432,39 @@ news\tnews-0.1\tsource\tstatic-runtime-1\tsource\n"
         assert!(!stock.contains("/home/tester") && !stock.contains("/bin/su "));
         assert_eq!(stock.matches("/bin/td-login exec-primary -- /bin/sh -c").count(), 2);
         assert_eq!(stock.matches("/bin/td-util rm -f \"$HOME/.tdwr-su\"").count(), 2);
+    }
+
+    #[test]
+    fn deployment_prepares_the_checked_home_before_releasing_procfs() {
+        let init = build_deployment_init(&SYSTEM);
+        assert_eq!(init, build_deployment_init(&renamed_primary_system()));
+        let prepare = "primary_home=$(/bin/td-firstboot prepare-primary-home /sysroot) || exit 1";
+        assert_eq!(init.matches(prepare).count(), 1);
+        assert!(init.find("mount-var /sysroot/var").unwrap() < init.find(prepare).unwrap());
+        assert!(init.find(prepare).unwrap() < init.find("/bin/umount /proc").unwrap());
+        assert!(init.find(prepare).unwrap() < init.find("/bin/switch_root").unwrap());
+        assert!(!init.contains("/home/tester") && !init.contains("/home/alice"));
+        assert!(init.contains(&format!("/bin/td-util chmod 0600 /sysroot{FIREFOX_XDG_MOUNT_MARKER}")));
+        let deployment = build_initramfs_spec("deployment-init", Phase::Deployment);
+        let selector = build_initramfs_spec("selector-init", Phase::Selector);
+        assert!(deployment.contains("file {in:td-firstboot}/bin/td-firstboot {in:td-firstboot}/bin/td-firstboot 0755 0 0"));
+        assert!(deployment.contains("slink /bin/td-firstboot {in:td-firstboot}/bin/td-firstboot 0777 0 0"));
+        assert!(!selector.contains("td-firstboot"));
+        let steps = recipe().steps.unwrap();
+        let normalized = steps.iter().position(|step| matches!(step,
+            Step::Run { argv, .. } if argv.iter().any(|arg|
+                arg.contains("chmod 0755 '{root}/real-root'"))
+        )).unwrap();
+        let checked = steps.iter().position(|step| matches!(step,
+            Step::Run { argv, .. } if argv == &[
+                "{in:td-firstboot}/bin/td-firstboot", "check-primary-name",
+                "{root}/real-root", UI_USER,
+            ]
+        )).unwrap();
+        let packed = steps.iter().position(|step|
+            matches!(step, Step::PackErofs { .. })
+        ).unwrap();
+        assert!(normalized < checked && checked < packed);
     }
 
     #[test]
@@ -11271,7 +11332,7 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
         }
         // Exact for the same reason: a floor stays green while shape_check quietly
         // stops asking one archive for a payload the other still gets checked for.
-        assert_eq!(greps, 9, "{greps} store-member greps found - the scan has gone stale");
+        assert_eq!(greps, 10, "{greps} store-member greps found - the scan has gone stale");
     }
 
     /// The td-term terminfo entry ships at `0444`, the mode td-jail's terminal

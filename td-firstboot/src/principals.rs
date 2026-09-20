@@ -107,6 +107,21 @@ pub(crate) fn check_primary_name(root: &Path, name: &str) -> Result<(), String> 
     )
 }
 
+/// Admit the complete root-owned account set before early home preparation.
+pub(crate) fn primary_in_root(root: &Path) -> Result<primary_account::PrimaryAccount, String> {
+    let etc = etc_directory(root, Some((0, 0)))?;
+    let passwd = read_root_file(&etc, "passwd", Some(0o644))?;
+    let primary = primary_account::parse(&passwd).map_err(|error| error.to_string())?;
+    let registry = Registry::parse(&read_root_file(&etc, TABLE_NAME, Some(0o444))?)?;
+    registry.check_primary_name(
+        &passwd,
+        &read_root_file(&etc, "group", Some(0o644))?,
+        &read_root_file(&etc, "shadow", Some(0o600))?,
+        primary.name(),
+    )?;
+    Ok(primary)
+}
+
 /// Prepare account data only; the caller owns deployment verification and activation.
 pub(crate) fn stage_primary_name(root: &Path, name: &str, output: &Path) -> Result<(), String> {
     primary_account::validate_name(name).map_err(|error| error.to_string())?;
