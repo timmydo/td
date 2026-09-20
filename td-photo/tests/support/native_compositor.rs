@@ -653,14 +653,17 @@ fn the_window_develops_the_cursor_photo_over_the_native_compositor() {
     let mut compositor = Compositor::start(&compositor_directory);
     let client_directory = Directory::new();
     // One decodable synthetic NEF, a gradient so the developed frame is not
-    // uniform, so the develop box carries an image the placeholder is not.
+    // uniform, so the develop box carries an image the placeholder is not;
+    // its embedded preview a flat JPEG, so the filmstrip's box carries a
+    // thumbnail the live window blits as `--preview` does.
     let roll = client_directory.0.join("roll");
     std::fs::create_dir(&roll).unwrap();
     let (w, h) = (64usize, 48usize);
     let samples: Vec<u16> = (0..w * h).map(|i| 1008 + (i as u16 % 4000)).collect();
+    let thumb = [0x30u8, 0x70, 0xb0];
     std::fs::write(
         roll.join("DSC_0001.NEF"),
-        super::synth_nef::uncompressed_nef(w, h, &samples),
+        super::synth_nef::nef_with_preview(w, h, &samples, &super::flat_jpeg(w, h, thumb)),
     )
     .unwrap();
     let client = PhotoProcess::start(
@@ -701,7 +704,20 @@ fn the_window_develops_the_cursor_photo_over_the_native_compositor() {
         super::varies(&developed, place.width, r#box),
         "the develop box carries no developed image"
     );
-    assert_eq!(compositor.tile(&place), developed, "the developed frame");
+    let tile = compositor.tile(&place);
+    assert_eq!(tile, developed, "the developed frame");
+    // The strip's one box carries the thumbnail in the live frame: the
+    // window's own blit loop, not only `--preview`'s.
+    let film = layout.film_boxes(1, 0);
+    let (_, strip) = film.first().expect("a filmstrip box on the tile");
+    let middle = (strip.y as usize + strip.height as usize / 2) * place.width
+        + strip.x as usize
+        + strip.width as usize / 2;
+    let at = &tile[middle * 3..middle * 3 + 3];
+    assert!(
+        at.iter().zip(thumb).all(|(p, q)| p.abs_diff(q) <= 4),
+        "the filmstrip box shows {at:?}, not the thumbnail {thumb:?}"
+    );
 
     // An exposure edit over the socket re-develops: the frame changes and is
     // the developed preview of the roll as its sidecar now is.

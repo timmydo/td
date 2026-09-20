@@ -179,8 +179,8 @@ pub fn preview(rest: &[OsString]) -> Result<()> {
         }
         // The developed preview, when developing: the cursor photo blitted
         // into the develop box, the same frame the window shows there, made
-        // here on the calling thread. The grid loop above is inert in
-        // develop mode, where nothing is `visible`.
+        // here on the calling thread. The loop above blitted the grid's
+        // thumbnails in cull and the filmstrip's in develop.
         if let Some((r#box, image)) = developed(&session, roll) {
             ui::blit(&mut pixels, surface, stride, area, r#box, &image).map_err(error)?;
         }
@@ -1831,9 +1831,10 @@ impl Window {
 
     /// Presents the model's generation when the frame last submitted is not
     /// it: the scene through the raster, then the thumbnails held for the
-    /// photos on screen or, in develop mode, the developed preview in the
-    /// develop box, each centred and clipped to the grid's area, then the
-    /// flag badges again over the thumbnails, within the area too.
+    /// photos on screen (the grid's cells, or develop's filmstrip) and, in
+    /// develop mode, the developed preview in the develop box, each centred
+    /// and clipped to the grid's area, then the flag badges again over the
+    /// thumbnails, within the area too.
     fn draw(&mut self) -> Result<()> {
         let generation = self.session.ui.generation();
         if self.submitted == Some(generation) || !self.client.can_present() {

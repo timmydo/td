@@ -212,3 +212,66 @@ fn preview_develop_reflects_the_crop() {
         "the crop did not reach the developed pixels"
     );
 }
+
+/// A flat baseline JPEG of one colour, `width` by `height`, through the
+/// crate's own encoder.
+fn flat_jpeg(width: usize, height: usize, rgb: [u8; 3]) -> Vec<u8> {
+    let mut encoder =
+        td_photo::jpeg::Encoder::new(width, height, td_photo::jpeg::QUALITY, 1).unwrap();
+    let rows: Vec<u8> = rgb
+        .iter()
+        .copied()
+        .cycle()
+        .take(width * height * 3)
+        .collect();
+    encoder.encode_rows(&rows).unwrap();
+    encoder.finish().unwrap()
+}
+
+#[test]
+fn preview_develop_blits_the_filmstrip_thumbnails() {
+    // Three decodable NEFs whose embedded previews are flat colours: in
+    // develop the strip under the box carries each photo's thumbnail, in
+    // roll order around the cursor, and the cursor's box is outlined.
+    let dir = Directory::new();
+    let roll = dir.0.join("roll");
+    std::fs::create_dir_all(&roll).unwrap();
+    let (w, h) = (16usize, 12usize);
+    let samples: Vec<u16> = (0..w * h).map(|i| 1008 + (i as u16 % 4000)).collect();
+    let colours = [[0x20u8, 0x40, 0x60], [0x80, 0x90, 0xa0], [0xc0, 0xb0, 0xa0]];
+    for (i, rgb) in colours.iter().enumerate() {
+        std::fs::write(
+            roll.join(format!("DSC_000{i}.NEF")),
+            synth_nef::nef_with_preview(w, h, &samples, &flat_jpeg(w, h, *rgb)),
+        )
+        .unwrap();
+    }
+    let pixels = preview_develop(&dir, 800, 600, &roll, 1);
+    let at = |x: usize, y: usize| {
+        let i = (y * 800 + x) * 3;
+        [pixels[i], pixels[i + 1], pixels[i + 2]]
+    };
+    let near = |a: [u8; 3], b: [u8; 3]| a.iter().zip(b).all(|(p, q)| p.abs_diff(q) <= 4);
+    // The boxes at 800 by 600: from 224, 168 apart, at y 452, 160 by 120;
+    // a 16 by 12 thumbnail is never enlarged, so it sits at each box's
+    // middle, the placeholder around it.
+    for (n, rgb) in colours.iter().enumerate() {
+        let (x, y) = (224 + n * 168, 452);
+        let middle = at(x + 80, y + 60);
+        assert!(near(middle, *rgb), "box {n}: {middle:?} for {rgb:?}");
+        let corner = at(x + 2, y + 2);
+        assert!(!near(corner, *rgb), "box {n} corner is the placeholder");
+    }
+    // The cursor's outline in the middle box's padding.
+    let selected = [
+        (td_ui::raster::SELECTED >> 16) as u8,
+        (td_ui::raster::SELECTED >> 8) as u8,
+        td_ui::raster::SELECTED as u8,
+    ];
+    assert_eq!(at(224 + 168 - 3, 452 - 3), selected);
+    assert_ne!(at(224 - 3, 452 - 3), selected);
+    // The developed box above carries the raw's pixels, not a preview.
+    let ui = td_photo::ui::Controller::new(Surface::new(800, 600, Scale::default()).unwrap());
+    let r#box = ui.layout().develop_box().unwrap();
+    assert!(varies(&pixels, 800, r#box));
+}

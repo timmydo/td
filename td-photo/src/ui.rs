@@ -728,6 +728,10 @@ const MODES: [&str; 3] = ["Roll Selection", "Culling", "Develop"];
 /// `step_label`) and for the three buttons under the list.
 pub const PANE_W: usize = 216;
 
+/// The filmstrip band's height in reference pixels: a thumbnail and its
+/// padding, half above and half below.
+pub const FILM_H: usize = THUMB_HEIGHT + CELL_PAD;
+
 /// A history step as the pane lists it: `KEY VALUE`, `-` a clear, a crop
 /// as `x,y wxh` in whole percents so it fits the pane's row.
 pub fn step_label(step: &Step) -> String {
@@ -909,7 +913,7 @@ impl Layout {
     }
 
     /// The develop view's box: under the name row in the area right of
-    /// the history pane and below the two bands.
+    /// the history pane, below the two bands and above the filmstrip.
     pub fn develop_box(&self) -> Option<Rect> {
         self.box_in(self.develop_view(), 1)
     }
@@ -934,14 +938,79 @@ impl Layout {
         }
     }
 
-    /// The develop region under its two bands: the name row and the box.
-    pub fn develop_view(&self) -> Rect {
+    /// The develop region under its two bands.
+    fn below_bands(&self) -> Rect {
         let region = self.develop_region();
         let bands = 2 * (ROW * self.surface.scale.value()) as u32;
         Rect {
             y: region.y + i64::from(bands),
             height: region.height.saturating_sub(bands),
             ..region
+        }
+    }
+
+    /// The filmstrip band: `FILM_H` at the foot of the region under the
+    /// bands, laid only when it can hold a box whole and the view above it
+    /// keeps a name row and a box at least a thumbnail tall; `None`
+    /// otherwise, and the view keeps the foot.
+    pub fn film_band(&self) -> Option<Rect> {
+        let s = self.surface.scale.value();
+        let below = self.below_bands();
+        let film = (FILM_H * s) as u32;
+        let keep = ((ROW + FILM_H) * s) as u32;
+        let one = ((2 * CELL_WIDTH + THUMB_WIDTH) * s) as u32;
+        if below.height < film.saturating_add(keep) || below.width < one {
+            return None;
+        }
+        Some(Rect {
+            y: below.y + i64::from(below.height - film),
+            height: film,
+            ..below
+        })
+    }
+
+    /// The filmstrip's boxes with `shown` photos and the cursor at
+    /// `position` among them: `THUMB_WIDTH` by `THUMB_HEIGHT` from a cell
+    /// in, a cell between, as many as the band holds whole, the cursor's
+    /// kept centred as the ends allow; each with the shown position it
+    /// holds, ascending.
+    pub fn film_boxes(&self, shown: usize, position: usize) -> Vec<(usize, Rect)> {
+        let Some(band) = self.film_band() else {
+            return Vec::new();
+        };
+        let s = self.surface.scale.value();
+        let cell = CELL_WIDTH * s;
+        let (width, height) = (THUMB_WIDTH * s, THUMB_HEIGHT * s);
+        let count = ((band.width as usize).saturating_sub(cell) / (width + cell)).min(shown);
+        if count == 0 {
+            return Vec::new();
+        }
+        let first = position.saturating_sub(count / 2).min(shown - count);
+        (0..count)
+            .map(|offset| {
+                (
+                    first + offset,
+                    Rect {
+                        x: band.x + (cell + offset * (width + cell)) as i64,
+                        y: band.y + ((CELL_PAD / 2) * s) as i64,
+                        width: width as u32,
+                        height: height as u32,
+                    },
+                )
+            })
+            .collect()
+    }
+
+    /// The develop region under its two bands and above the filmstrip:
+    /// the name row and the box.
+    pub fn develop_view(&self) -> Rect {
+        let below = self.below_bands();
+        match self.film_band() {
+            Some(film) => Rect {
+                height: below.height.saturating_sub(film.height),
+                ..below
+            },
+            None => below,
         }
     }
 
@@ -2327,15 +2396,34 @@ impl Controller {
         self.layout().develop_box()
     }
 
-    /// The shown photos on screen and the boxes their thumbnails go in, in
-    /// the cull grid; nothing in the single or develop view, whose box is
-    /// the develop increment's preview, and nothing before a roll.
+    /// The filmstrip's boxes and the photos in them: the shown photos
+    /// around the cursor in develop, `Layout::film_boxes`; nothing in cull,
+    /// under the chooser or without a cursor.
+    pub fn film(&self) -> Vec<(usize, Rect)> {
+        if self.mode != Mode::Develop || self.chooser.is_some() {
+            return Vec::new();
+        }
+        let Some(position) = self.position() else {
+            return Vec::new();
+        };
+        self.layout()
+            .film_boxes(self.shown.len(), position)
+            .into_iter()
+            .filter_map(|(position, rect)| Some((*self.shown.get(position)?, rect)))
+            .collect()
+    }
+
+    /// The shown photos on screen and the boxes their thumbnails go in: the
+    /// cull grid's cells, or develop's filmstrip; nothing in the single
+    /// view, under the chooser, or before a roll.
     pub fn visible(&self) -> Vec<(usize, Rect)> {
-        if self.roll.is_none()
-            || self.mode != Mode::Cull
-            || self.view != View::Grid
-            || self.chooser.is_some()
-        {
+        if self.roll.is_none() || self.chooser.is_some() {
+            return Vec::new();
+        }
+        if self.mode == Mode::Develop {
+            return self.film();
+        }
+        if self.view != View::Grid {
             return Vec::new();
         }
         let layout = self.layout();
@@ -2355,15 +2443,29 @@ impl Controller {
     /// The photos whose thumbnails the window wants, in the order it wants
     /// them: the cull grid's screen, then the screen below it, then the one
     /// above, whichever cull view is showing, so the grid is ready when the
-    /// single view returns to it. Develop mode wants no grid thumbnails;
-    /// its preview is a later increment.
+    /// single view returns to it; in develop the filmstrip's boxes, then
+    /// as many shown after them, then before, so a cursor move finds its
+    /// neighbours made. Develop without a strip wants none.
     pub fn wanted(&self) -> Vec<usize> {
-        if self.roll.is_none() || self.mode != Mode::Cull {
+        if self.roll.is_none() {
             return Vec::new();
         }
         let layout = self.layout();
-        let screen = layout.rows * layout.columns;
-        let first = self.first_row * layout.columns;
+        let (screen, first) = if self.mode == Mode::Develop {
+            let Some(position) = self.position() else {
+                return Vec::new();
+            };
+            let boxes = layout.film_boxes(self.shown.len(), position);
+            let Some((first, _)) = boxes.first() else {
+                return Vec::new();
+            };
+            (boxes.len(), *first)
+        } else {
+            (
+                layout.rows * layout.columns,
+                self.first_row * layout.columns,
+            )
+        };
         let mut wanted: Vec<usize> = self
             .shown
             .iter()
@@ -2666,11 +2768,12 @@ impl Controller {
                 PointerPhase::Release => finder::Event::Release { x, y },
             });
         }
-        // Develop mode: the history pane and the two bands take the pointer
-        // over their own pixels, then the crop drag owns it over the
-        // preview, for press, move and release; a press off the preview
-        // (the strips, the status row, the margins) starts no drag, as a
-        // filter press is inert here.
+        // Develop mode: a crop or slider drag in progress owns the pointer
+        // wherever it goes; otherwise the history pane, the two bands and
+        // the filmstrip take it over their own pixels, and the preview
+        // starts a crop drag on press. A press off all of them (the strips,
+        // the status row, the margins) starts no drag, as a filter press is
+        // inert here.
         if self.mode == Mode::Develop {
             // The history pane: a press on a step selects it, on a button
             // asks for what the button says; the pane's other pixels, and
@@ -2684,6 +2787,13 @@ impl Controller {
             // it says; the bands' other pixels, and a move or release over
             // them, are inert.
             if let Some(result) = self.tool_pointer(phase, x, y) {
+                return result;
+            }
+            // The filmstrip under the preview: a press on a box selects its
+            // photo as the keys do (closing an open palette, as a photo
+            // switch does); the band's other pixels, and a move or release
+            // over it, are inert.
+            if let Some(result) = self.film_pointer(phase, x, y) {
                 return result;
             }
             // The look palette owns the develop box while it is open: a press on
@@ -2792,6 +2902,43 @@ impl Controller {
             Some(1) => self.step_effect(true, Vec::new()),
             Some(2) => self.undo(Vec::new()),
             _ => Ok((Outcome::Ignored, Vec::new())),
+        })
+    }
+
+    /// The pointer over the filmstrip's band, `None` when it is elsewhere
+    /// or a crop drag is on. A press on a box selects its photo as the
+    /// `select` action does; the band's other pixels, and a move or
+    /// release over it, are inert.
+    fn film_pointer(
+        &mut self,
+        phase: PointerPhase,
+        x: i64,
+        y: i64,
+    ) -> Option<Result<(Outcome, Vec<Effect>), Error>> {
+        // A crop drag in progress owns the pointer wherever it goes (the
+        // slider's took its turn above).
+        if self.drag.is_some() {
+            return None;
+        }
+        let layout = self.layout();
+        if !layout.film_band()?.contains(x, y) {
+            return None;
+        }
+        if phase != PointerPhase::Press {
+            return Some(Ok((Outcome::Ignored, Vec::new())));
+        }
+        let Some(position) = self.position() else {
+            return Some(Ok((Outcome::Ignored, Vec::new())));
+        };
+        let hit = layout
+            .film_boxes(self.shown.len(), position)
+            .into_iter()
+            .find(|(_, r#box)| r#box.contains(x, y));
+        Some(match hit {
+            Some((position, _)) => self
+                .select(position)
+                .map(|outcome| (self.finish(outcome), Vec::new())),
+            None => Ok((Outcome::Ignored, Vec::new())),
         })
     }
 
@@ -4031,6 +4178,34 @@ impl Scene<'_> {
         }
     }
 
+    /// The filmstrip: its band chrome, a placeholder and badge per box, and
+    /// the cursor's box outlined in its padding, as the grid's cell is.
+    fn film(&self, layout: &Layout, damage: Rect, sink: &mut dyn FnMut(Draw)) {
+        let model = self.model;
+        let Some(band) = layout.film_band() else {
+            return;
+        };
+        fill(band, CHROME, damage, sink);
+        let s = layout.surface.scale.value();
+        let half = ((CELL_PAD / 2) * s) as i64;
+        for (index, thumb) in model.film() {
+            let Some(photo) = model.photos.get(index) else {
+                continue;
+            };
+            if model.cursor == Some(index) {
+                let around = Rect {
+                    x: thumb.x - half,
+                    y: thumb.y - half,
+                    width: thumb.width + 2 * half as u32,
+                    height: thumb.height + 2 * half as u32,
+                };
+                outline(around, (2 * s) as u32, SELECTED, damage, sink);
+            }
+            fill(thumb, PLACEHOLDER, damage, sink);
+            badge(layout, thumb, photo, damage, sink);
+        }
+    }
+
     /// The tool band and the look band over the develop view: chrome, the
     /// tool buttons with the crop-adjust one selected while it is on and
     /// each enabled as `tool_states` says, the exposure slider at the
@@ -4318,6 +4493,7 @@ impl Composition for Scene<'_> {
                     if let Some(index) = model.cursor {
                         self.bands(&layout, index, damage, sink);
                     }
+                    self.film(&layout, damage, sink);
                     self.single(
                         &layout,
                         SingleView {

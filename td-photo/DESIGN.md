@@ -107,26 +107,27 @@ modes are the photographer's order of work.
 3. **Develop** shows one photo developed from its raw data, entered with `d`
    on the cursor's photo and left with `Escape`. `=`/`-` move exposure by a
    third of a stop and their shifted pair `+`/`_` by a tenth, `0` resets to
-   camera defaults, and the crop and the look are set by the `crop` and
-   `look` actions, taking the box's four fractions or a look's stem, and
-   the crop also over the preview: a marquee tightens it to a sub-region,
-   and a crop-adjust sub-mode toggled with `c` grows, shrinks or moves it by
-   its edge, corner and interior handles, saving on release. The `aspect`
-   action locks the crop drag to a ratio (free, 3:2, 4:3, 1:1 or 16:9), held
-   in the preview's own pixel space, so a locked marquee, corner or edge drag
-   keeps that ratio; picking a ratio only arms the lock. A look palette
-   toggled with `l` lists the available looks with the current one marked, and
-   a press on a name picks it. Two bands above the preview carry the same
-   controls as buttons: a tool band with Crop (the crop-adjust toggle, shown
-   selected while it is on), Uncrop (`C`, clearing the crop), Undo, Reset
-   and the exposure's `-` and `+` beside a slider over the exposure's whole
-   range, and a look band with None and every available look, the current
-   one selected, the first nine on `F1`..`F9`. The status row names the
-   sub-mode in force (`develop crop-adjust`, `develop looks`). The
-   immediate snap that reshapes the current crop and the live scaled
-   preview under the marquee are later slices. Every change is saved to
-   the sidecar as it is made, as a step of the photo's history (below);
-   there is no explicit save.
+   camera defaults, and the crop and the look are set by the `crop` and `look`
+   actions, taking the box's four fractions or a look's stem, and the crop
+   also over the preview: a marquee tightens it to a sub-region, and a
+   crop-adjust sub-mode toggled with `c` grows, shrinks or moves it by its
+   edge, corner and interior handles, saving on release. The `aspect` action
+   locks the crop drag to a ratio (free, 3:2, 4:3, 1:1 or 16:9), held in the
+   preview's own pixel space, so a locked marquee, corner or edge drag keeps
+   that ratio; picking a ratio only arms the lock. A look palette toggled with
+   `l` lists the available looks with the current one marked, and a press on a
+   name picks it. Two bands above the preview carry the same controls as
+   buttons: a tool band with Crop (the crop-adjust toggle, shown selected
+   while it is on), Uncrop (`C`, clearing the crop), Undo, Reset and the
+   exposure's `-` and `+` beside a slider over the exposure's whole range, and
+   a look band with None and every available look, the current one selected,
+   the first nine on `F1`..`F9`. A filmstrip under the preview shows the shown
+   photos around the cursor's, `Left` and `Right` or a press moving along it.
+   The status row names the sub-mode in force (`develop crop-adjust`, `develop
+   looks`). The immediate snap that reshapes the current crop and the live
+   scaled preview under the marquee are later slices. Every change is saved to
+   the sidecar as it is made, as a step of the photo's history (below); there
+   is no explicit save.
 4. **Export**, with `e` on the cursor's photo in the grid or in develop
    mode, renders the full-resolution raw through the same pipeline and
    writes an sRGB JPEG into the roll's `exported/` folder, never
@@ -277,6 +278,26 @@ window, all speaking the toolkit's one vocabulary.
   crop's or the slider's, owns the pointer over the bands and the pane. All
   of it is `Ignored` in cull. The status row names the sub-mode after the
   mode: `develop crop-adjust` or `develop looks`.
+- **The filmstrip.** Under the develop view, at the foot of the region, a band
+  `FILM_H` (a thumbnail and its padding) tall (`Layout::film_band`) carries
+  the shown photos in thumbnail boxes (`Layout::film_boxes`: `THUMB_WIDTH` by
+  `THUMB_HEIGHT` from a cell in, a cell between, as many as the band holds
+  whole), the cursor's box outlined in its padding and kept centred as the
+  ends allow, so `Left` and `Right` walk the strip as they walk the shown, and
+  the roll of picks is the strip under the picks filter. The band is laid only
+  when it can hold a box whole and the view above it keeps a name row and a
+  box at least a thumbnail tall; a shorter or narrower surface keeps the foot
+  for the view. A press on a box selects its photo as `select` does (`Ignored`
+  on the cursor's own; an open look palette closes with it, as on any photo
+  switch); the band's other pixels, and a move or release over it, are inert,
+  and a crop drag in progress owns the pointer over it. The strip's boxes are
+  the window's `visible` in develop, as the grid's cells are in cull: the
+  window blits the thumbnails it holds into them and repaints the badges over
+  them, `--preview` the same, and the chooser withholds the boxes as it
+  withholds the grid's; `wanted` in develop is the strip's boxes, then as many
+  shown after them, then before, so a cursor move finds its neighbours made,
+  and none without a strip (the wants stand under the chooser, as the grid's
+  do).
 - **Export is the roll's, not develop's.** `export` (`e`) asks for the
   cursor photo's export in either mode; the dispatch is `changed` with the
   effect and moves nothing in the model. The adapter reads the sidecar as the
@@ -1054,9 +1075,10 @@ The single view shows the name, the facts and the largest 3:2 box under them;
 develop mode shows the name row and the box (no facts row: the bands take the
 room) of the cursor's photo in the area right of the history pane
 (`Layout::develop_region`), under the tool and look bands (`Layout::tools`,
-`Layout::look_buttons`, see Driving; `Layout::develop_view` the rest), its
-status marked `develop`, with the developed preview blitted into that box once
-it is made, and the pane at the area's left: the history list
+`Layout::look_buttons`, see Driving) and above the filmstrip
+(`Layout::film_band`, its boxes `Layout::film_boxes`; `Layout::develop_view` the
+rest), its status marked `develop`, with the developed preview blitted into that
+box once it is made, and the pane at the area's left: the history list
 (`Layout::history`, a `chrome::List` over the pane's width, less one band) and,
 on the band under it, the Toggle, Delete and Undo buttons
 (`Layout::history_buttons`, `chrome::Button`s from a cell in, a cell between,
@@ -1066,16 +1088,16 @@ step; a surface too short for a row has neither. The box geometry
 `develop_box` over the develop view) is one function the scene, the window and
 `--preview` share, so the placeholder and the image land in one place. A press
 on a mode button changes the mode, on a filter button sets the filter, on a cell
-selects it, in develop on a history step selects it, on a pane, tool or look
-button asks what it says and on the slider starts its drag (see Driving), and in
-the single view anywhere in the area between the bands returns to the grid; the
-status row, a strip's margin and the gap between two buttons, the pane's chrome,
-and anything off the surface, are not targets, and the bands are hit-tested last
-painted first, so on a surface too short for them the status row covers the
-strips' buttons as it covers their pixels. A box whose thumbnail is not held is
-a neutral placeholder, which is what `frame` digests either way; the develop box
-holds the developed preview once it is made, and the cull single view's box
-stays a placeholder.
+selects it, in develop on a history step or a filmstrip box selects it, on a
+pane, tool or look button asks what it says and on the slider starts its drag
+(see Driving), and in the single view anywhere in the area between the bands
+returns to the grid; the status row, a strip's margin and the gap between two
+buttons, the pane's chrome, and anything off the surface, are not targets, and
+the bands are hit-tested last painted first, so on a surface too short for them
+the status row covers the strips' buttons as it covers their pixels. A box whose
+thumbnail is not held is a neutral placeholder, which is what `frame` digests
+either way; the develop box holds the developed preview once it is made, and the
+cull single view's box stays a placeholder.
 
 `td-photo open [ROLL] [--control-socket PATH]` runs the window (`window`), a
 `td_ui::client::App` in the shape td-setup's is, and one adapter over the same
@@ -1138,7 +1160,8 @@ them, marks damage and, while
 any job is outstanding, sets the transport wait to at most 16 ms so results
 appear within a frame of arriving; with nothing outstanding the wait is the
 toolkit's idle wait. Thumbnails are requested for the rows on screen first, then
-the screen below and the one above; a scroll that makes a request stale drops it
+the screen below and the one above (in develop, the filmstrip's boxes, then the
+shown after them, then before); a scroll that makes a request stale drops it
 before it starts. A thumbnail is asked for at the box's width by the rule `thumb
 --cache` applies, so the disk cache is the verb's exactly, and shrunk in memory
 to the box for a shape taller than it (`develop::shrink`). A grid cell whose
@@ -1463,7 +1486,19 @@ committing, a drag back to the value in force releasing without a write,
 the last column the last step and a drag off the edge staying there, a
 photo switch dropping the drag; the look band's buttons and `F1`..`F9`
 picking and clearing, a key past the list ignored, the band read back and
-the palette's status word);
+the palette's status word); the filmstrip (its band and boxes at 800 by 600
+and at scale two, the develop box above it, the cursor centred as the ends
+allow and its box outlined, `visible` the strip's boxes and `wanted` around
+them, a press selecting and recentring, the cursor's own box and the band's
+chrome inert, a crop drag released over it the crop's, the badges over the
+boxes following the flags, the palette closing on a strip press, the band
+withheld a row short of the room it needs and laid with it (a box at least a
+thumbnail tall above), a region too narrow for a box laying none and a cell
+wider one, fewer shown than boxes, an even box count, the wants bounded on a
+roll of twenty, and the chooser withholding the boxes but not the wants); the
+`--preview --develop` of a roll whose embedded previews are flat JPEGs
+blitting each into its strip box (`control_process.rs`), the native
+compositor leg holding the live frame to it;
 the export action (asking for the cursor photo in either mode by verb and by
 `e`, refused without a roll or a photo, not repeating on a held key, the
 dispatch moving nothing; the note set, shown at the row's end, a new generation
@@ -1634,22 +1669,20 @@ preflight. A td-photo, td-ui or td-compositor edit selects this check in
 7. Packaging: the cargo recipe staging td-ui, the image entry, and the
    recipe check that develops the synthetic frame in the built artifact.
    Landed.
-8. The develop history, in landings. (a) The sidecar history: `step-N`
-   lines with the develop keys their summary, seeded from a file without
-   one, `undo`, a step toggled or deleted,
-   `reset` clearing it, and `edit FILE undo`; the history pane at the
-   develop view's left with its Toggle, Delete and Undo buttons, `Up` and
-   `Down` walking its selection in develop, the `undo` (`z`),
+8. The develop history, in landings. (a) The sidecar history: `step-N` lines
+   with the develop keys their summary, seeded from a file without one, `undo`,
+   a step toggled or deleted, `reset` clearing it, and `edit FILE undo`; the
+   history pane at the develop view's left with its Toggle, Delete and Undo
+   buttons, `Up` and `Down` walking its selection in develop, the `undo` (`z`),
    `step-toggle` (`t`) and `step-delete` (`Backspace`) actions and their
-   effects, and the step count and selection in `state`. Landed. (b) The
-   develop controls: a tool strip above the preview with the crop, uncrop,
-   undo and reset buttons and the exposure in a td-ui slider
-   (`chrome::Slider`) beside its step buttons, a look strip with the looks
-   on `F1`..`F9`, and the status row naming the crop sub-mode. Landed. (c) A
-   filmstrip of the shown photos under the preview, `Left` and `Right` or
-   a press moving between them. (d) The crop tool drawing a fresh marquee
-   from a press outside the crop in crop-adjust, and a live preview under
-   it.
+   effects, and the step count and selection in `state`. Landed. (b) The develop
+   controls: a tool strip above the preview with the crop, uncrop, undo and
+   reset buttons and the exposure in a td-ui slider (`chrome::Slider`) beside
+   its step buttons, a look strip with the looks on `F1`..`F9`, and the status
+   row naming the crop sub-mode. Landed. (c) A filmstrip of the shown photos
+   under the preview, `Left` and `Right` or a press moving between them. Landed.
+   (d) The crop tool drawing a fresh marquee from a press outside the crop in
+   crop-adjust, and a live preview under it.
 9. Later: the 100% loupe from level 0, DNG and JPEG rolls, the Nikon High
    Efficiency codec, a better full-resolution demosaic, highlight
    reconstruction, the `.dtstyle` translator, and ratings.

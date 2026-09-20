@@ -125,6 +125,15 @@ impl Builder {
 /// `width` and `height` must be even and at least 8, so the 2x2 CFA and the
 /// two-pixel crop margin stay whole and superpixel has rows to work on.
 pub fn uncompressed_nef(width: usize, height: usize, samples: &[u16]) -> Vec<u8> {
+    // A bare SOI/EOI: begins with SOI so the reader accepts the entry, but
+    // decodes to no image, so the thumbnail is skipped and the grid box
+    // keeps its placeholder.
+    nef_with_preview(width, height, samples, &[0xff, 0xd8, 0xff, 0xd9])
+}
+
+/// `uncompressed_nef` with `jpeg` as the embedded preview: a baseline
+/// JPEG here is the thumbnail the window shows.
+pub fn nef_with_preview(width: usize, height: usize, samples: &[u16], jpeg: &[u8]) -> Vec<u8> {
     // Even and at least 8 so the 2x2 CFA and the crop stay whole, and within
     // u16 so the crop entry below does not truncate.
     assert!(width >= 8 && height >= 8 && width.is_multiple_of(2) && height.is_multiple_of(2));
@@ -137,10 +146,7 @@ pub fn uncompressed_nef(width: usize, height: usize, samples: &[u16]) -> Vec<u8>
         strip_bytes.extend_from_slice(&u16_bytes(*sample));
     }
     let strip = b.blob(&strip_bytes);
-    // A bare SOI/EOI: begins with SOI so the reader accepts the entry, but
-    // decodes to no image, so the thumbnail is skipped and the grid box
-    // keeps its placeholder.
-    let preview = b.blob(&[0xff, 0xd8, 0xff, 0xd9]);
+    let preview = b.blob(jpeg);
 
     // The maker note: its own little TIFF behind the ten-byte Nikon prefix.
     let mut inner = Builder::new();
@@ -178,7 +184,7 @@ pub fn uncompressed_nef(width: usize, height: usize, samples: &[u16]) -> Vec<u8>
     let small = b.ifd(&[
         (tag::NEW_SUBFILE_TYPE, Value::Long(vec![1])),
         (tag::JPEG_OFFSET, Value::Long(vec![preview])),
-        (tag::JPEG_LENGTH, Value::Long(vec![4])),
+        (tag::JPEG_LENGTH, Value::Long(vec![jpeg.len() as u32])),
     ]);
     let ifd0 = b.ifd(&[
         (tag::NEW_SUBFILE_TYPE, Value::Long(vec![1])),

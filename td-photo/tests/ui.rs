@@ -24,7 +24,7 @@ use td_ui::chrome::DISABLED;
 use td_ui::control::{frame, hex, valid_code, Decoder, ErrorCode};
 use td_ui::driven::{self, Input, Outcome, PointerPhase};
 use td_ui::finder;
-use td_ui::raster::{Composition, Primitive, Rect, Scale, Surface};
+use td_ui::raster::{Composition, Primitive, Rect, Scale, Surface, CHROME, MISSPELLED, SELECTED};
 use td_ui::CELL_HEIGHT;
 
 #[path = "support/synth_nef.rs"]
@@ -2176,13 +2176,15 @@ fn the_develop_box_is_the_preview_box_only_in_develop_mode() {
         (ui::PANE_W as i64, 800 - ui::PANE_W as u32)
     );
     assert_ne!(c.develop_box(), c.layout().preview_box());
+    // Under the two bands and above the filmstrip: the box is the height
+    // left, 3:2, centred in the region's width.
     assert_eq!(
         c.develop_box(),
         Some(Rect {
-            x: 224,
+            x: 268,
             y: 120,
-            width: 568,
-            height: 378,
+            width: 480,
+            height: 320,
         })
     );
 
@@ -5834,4 +5836,291 @@ fn the_look_band_and_the_f_keys_pick_looks() {
             value: Some("look-number-04".to_string()),
         }]
     );
+}
+
+/// The filmstrip under the develop preview: the shown photos around the
+/// cursor in thumbnail boxes, the cursor's outlined and kept centred as
+/// the ends allow, `Left` and `Right` moving along it and a press on a box
+/// selecting its photo; the window blits the strip's thumbnails as it
+/// blits the grid's, and wants them around the cursor.
+#[test]
+fn the_filmstrip_shows_the_shown_photos_under_the_preview() {
+    let mut c = Controller::new(surface(800, 600));
+    c.open("roll", b"/r", photos(5)).unwrap();
+    // Nothing in cull: the grid's cells are the visible boxes.
+    assert!(c.film().is_empty());
+    assert_eq!(c.visible().len(), 5);
+    assert_eq!(act(&mut c, "develop", &[]), Outcome::Changed);
+    let layout = c.layout();
+    // The band is the foot of the region under the bands, a thumbnail and
+    // its padding tall; the view above keeps the name row and the box.
+    let band = layout.film_band().unwrap();
+    assert_eq!(
+        band,
+        Rect {
+            x: 216,
+            y: 448,
+            width: 584,
+            height: 128
+        }
+    );
+    assert_eq!(layout.develop_view().height, 352);
+    assert_eq!(ui::FILM_H, 128);
+    // Three boxes fit the band whole: from a cell in, a cell between.
+    let r#box = |n: i64| Rect {
+        x: 224 + n * 168,
+        y: 452,
+        width: 160,
+        height: 120,
+    };
+    assert_eq!(c.film(), [(0, r#box(0)), (1, r#box(1)), (2, r#box(2))]);
+    assert_eq!(c.visible(), c.film());
+    // The strip's boxes, then the shown after them, then before.
+    assert_eq!(c.wanted(), [0, 1, 2, 3, 4]);
+    // The cursor is kept centred once it can be: at 2 the strip shows 1..3,
+    // at the end it shows the last three.
+    assert_eq!(key(&mut c, "Right"), Outcome::Changed);
+    assert_eq!(key(&mut c, "Right"), Outcome::Changed);
+    assert_eq!(c.film(), [(1, r#box(0)), (2, r#box(1)), (3, r#box(2))]);
+    assert_eq!(c.wanted(), [1, 2, 3, 4, 0]);
+    assert_eq!(key(&mut c, "End"), Outcome::Changed);
+    assert_eq!(c.film(), [(2, r#box(0)), (3, r#box(1)), (4, r#box(2))]);
+    assert_eq!(c.wanted(), [2, 3, 4, 0, 1]);
+    // The cursor's box is outlined: the frame moves with the cursor, and
+    // the outline sits in the box's padding.
+    let end = driven::paint(&c.scene()).unwrap();
+    let at = |frame: &driven::Frame, x: i64, y: i64| {
+        let i = (y as usize * 800 + x as usize) * 3;
+        (frame.rgb[i], frame.rgb[i + 1], frame.rgb[i + 2])
+    };
+    let selected = (
+        (SELECTED >> 16) as u8,
+        (SELECTED >> 8) as u8,
+        SELECTED as u8,
+    );
+    let chrome = ((CHROME >> 16) as u8, (CHROME >> 8) as u8, CHROME as u8);
+    let last = r#box(2);
+    assert_eq!(at(&end, last.x - 3, last.y - 3), selected);
+    assert_eq!(at(&end, last.x - 4, last.y + 10), selected);
+    assert_eq!(at(&end, last.x - 6, last.y + 10), chrome);
+    let first = r#box(0);
+    assert_eq!(at(&end, first.x - 3, first.y - 3), chrome);
+    assert_eq!(at(&end, first.x - 4, first.y + 10), chrome);
+    // A press on a box selects its photo: a change, the strip recentring
+    // on it; on the cursor's own box nothing; on the band's chrome, and a
+    // move or release over it, nothing.
+    let centre = |r: Rect| ((r.x + 80) as u32, (r.y + 60) as u32);
+    let (x, y) = centre(r#box(0));
+    let generation = fields(&c)[GENERATION].clone();
+    assert_eq!(
+        c.input(Input::Pointer {
+            phase: PointerPhase::Press,
+            x,
+            y
+        })
+        .unwrap(),
+        (Outcome::Changed, vec![])
+    );
+    assert_eq!(fields(&c)[POSITION], "2");
+    assert_ne!(fields(&c)[GENERATION], generation);
+    assert_eq!(c.film(), [(1, r#box(0)), (2, r#box(1)), (3, r#box(2))]);
+    let (x, y) = centre(r#box(1));
+    assert_eq!(press(&mut c, x, y), Outcome::Ignored);
+    // The gutters, the band's padding above and below the boxes, and the
+    // room past the last box.
+    assert_eq!(press(&mut c, 220, 460), Outcome::Ignored);
+    assert_eq!(press(&mut c, 388, 460), Outcome::Ignored);
+    assert_eq!(press(&mut c, 300, 449), Outcome::Ignored);
+    assert_eq!(press(&mut c, 300, 574), Outcome::Ignored);
+    assert_eq!(press(&mut c, 750, 460), Outcome::Ignored);
+    assert_eq!(drag_to(&mut c, x, y), Outcome::Ignored);
+    assert_eq!(release(&mut c, x, y), (Outcome::Ignored, vec![]));
+    assert_eq!(c.crop_drag(), None);
+    // With the look palette open a press on a box still selects, and the
+    // palette closes with the photo switch.
+    c.set_looks(some_looks());
+    assert_eq!(act(&mut c, "looks", &[]), Outcome::Changed);
+    assert!(c.look_palette().is_some());
+    let (x, y) = centre(r#box(2));
+    assert_eq!(press(&mut c, x, y), Outcome::Changed);
+    assert_eq!(fields(&c)[POSITION], "3");
+    assert!(c.look_palette().is_none());
+    assert_eq!(key(&mut c, "Left"), Outcome::Changed);
+    assert_eq!(fields(&c)[POSITION], "2");
+    // A crop drag from the preview released over the strip is the crop's:
+    // it commits the marquee, and selects nothing.
+    let preview = c.develop_box().unwrap();
+    assert_eq!(
+        press(&mut c, (preview.x + 40) as u32, (preview.y + 40) as u32),
+        Outcome::Ignored
+    );
+    let (x, y) = centre(r#box(2));
+    assert_eq!(drag_to(&mut c, x, y), Outcome::Changed);
+    let (outcome, effects) = release(&mut c, x, y);
+    assert_eq!(outcome, Outcome::Changed);
+    // From (308, 160) to (640, 512), the foot clamped to the box's 440:
+    // 40/480 and 40/320 in, 332/480 (truncated) by 280/320.
+    assert_eq!(
+        effects,
+        [Effect::Edit {
+            index: 2,
+            name: file(2),
+            key: Key::Crop,
+            value: Some("0.0833 0.1250 0.6916 0.8750".to_string()),
+        }]
+    );
+    assert_eq!(fields(&c)[POSITION], "2");
+    // The badges over the strip are the flags', repainted by the window
+    // over the thumbnails it blits there: the fixture's pick (photo 1) in
+    // the first box, its reject (photo 2) in the middle one, and the
+    // unflagged third bare.
+    let badges = driven::paint(&c.badges()).unwrap();
+    let mid = r#box(1);
+    let reject = (
+        (MISSPELLED >> 16) as u8,
+        (MISSPELLED >> 8) as u8,
+        MISSPELLED as u8,
+    );
+    assert_eq!(at(&badges, first.x + 1, first.y + 1), selected);
+    assert_eq!(at(&badges, mid.x + 1, mid.y + 1), reject);
+    assert_ne!(at(&badges, last.x + 1, last.y + 1), selected);
+    assert_ne!(at(&badges, last.x + 1, last.y + 1), reject);
+    // Unflagging takes a badge with it: the reject's, then the pick's.
+    let (_, effects) = c.action("unflag", &[]).unwrap();
+    assert_eq!(apply(&mut c, &effects).unwrap(), Outcome::Changed);
+    let badges = driven::paint(&c.badges()).unwrap();
+    assert_ne!(at(&badges, mid.x + 1, mid.y + 1), reject);
+    assert_eq!(at(&badges, first.x + 1, first.y + 1), selected);
+    assert_eq!(key(&mut c, "Left"), Outcome::Changed);
+    let (_, effects) = c.action("unflag", &[]).unwrap();
+    assert_eq!(apply(&mut c, &effects).unwrap(), Outcome::Changed);
+    let badges = driven::paint(&c.badges()).unwrap();
+    assert_ne!(at(&badges, first.x + 1, first.y + 1), selected);
+    // A surface too short to keep a name row and a row for the box above
+    // the strip lays none: the view keeps the foot, and nothing is wanted.
+    // Under the strips, the status row and the two bands, 399 leaves 279
+    // for the view: a row short of the strip and the name row and
+    // thumbnail-tall box it keeps.
+    let mut short = Controller::new(surface(800, 399));
+    short.open("roll", b"/r", photos(5)).unwrap();
+    assert_eq!(act(&mut short, "develop", &[]), Outcome::Changed);
+    assert_eq!(short.layout().film_band(), None);
+    assert_eq!(short.layout().develop_view().height, 279);
+    assert!(short.film().is_empty() && short.visible().is_empty());
+    assert!(short.wanted().is_empty());
+    assert_eq!(press(&mut short, 300, 250), Outcome::Ignored);
+    // One more row and it is laid, with its boxes.
+    let mut tall = Controller::new(surface(800, 400));
+    tall.open("roll", b"/r", photos(5)).unwrap();
+    assert_eq!(act(&mut tall, "develop", &[]), Outcome::Changed);
+    assert_eq!(tall.layout().film_band().map(|b| b.y), Some(248));
+    assert_eq!(tall.layout().develop_view().height, 152);
+    // The box above is at least a thumbnail tall: 152 less the name row
+    // and its padding, 120 high, 180 wide.
+    assert_eq!(
+        tall.develop_box().map(|b| (b.width, b.height)),
+        Some((180, 120))
+    );
+    let lifted = |n: i64| Rect { y: 252, ..r#box(n) };
+    assert_eq!(
+        tall.film(),
+        [(0, lifted(0)), (1, lifted(1)), (2, lifted(2))]
+    );
+    // A region narrower than a box and its cells lays no band: the view
+    // keeps the foot. A cell wider, and it holds its one box.
+    let mut narrow = Controller::new(surface(216 + 175, 600));
+    narrow.open("roll", b"/r", photos(5)).unwrap();
+    assert_eq!(act(&mut narrow, "develop", &[]), Outcome::Changed);
+    assert_eq!(narrow.layout().film_band(), None);
+    assert_eq!(narrow.layout().develop_view().height, 480);
+    assert!(narrow.film().is_empty() && narrow.wanted().is_empty());
+    let mut one = Controller::new(surface(216 + 176, 600));
+    one.open("roll", b"/r", photos(5)).unwrap();
+    assert_eq!(act(&mut one, "develop", &[]), Outcome::Changed);
+    assert_eq!(act(&mut one, "select", &["3"]), Outcome::Changed);
+    assert_eq!(one.film(), [(3, r#box(0))]);
+    assert_eq!(one.wanted(), [3, 4, 2]);
+    // Fewer shown than boxes: the strip holds them all from the left.
+    let mut few = Controller::new(surface(800, 600));
+    few.open("roll", b"/r", photos(2)).unwrap();
+    assert_eq!(act(&mut few, "develop", &[]), Outcome::Changed);
+    assert_eq!(key(&mut few, "Right"), Outcome::Changed);
+    assert_eq!(few.film(), [(0, r#box(0)), (1, r#box(1))]);
+    assert_eq!(few.wanted(), [0, 1]);
+    // At scale two the band, its boxes and their padding double.
+    let mut two = Controller::new(surface(800, 600));
+    two.open("roll", b"/r", photos(5)).unwrap();
+    two.input(Input::Resize {
+        width: 1600,
+        height: 1200,
+        scale: 2,
+    })
+    .unwrap();
+    assert_eq!(act(&mut two, "develop", &[]), Outcome::Changed);
+    assert_eq!(
+        two.layout().film_band(),
+        Some(Rect {
+            x: 432,
+            y: 896,
+            width: 1168,
+            height: 256
+        })
+    );
+    let doubled = |n: i64| Rect {
+        x: 448 + n * 336,
+        y: 904,
+        width: 320,
+        height: 240,
+    };
+    assert_eq!(
+        two.film(),
+        [(0, doubled(0)), (1, doubled(1)), (2, doubled(2))]
+    );
+    let frame = driven::paint(&two.scene()).unwrap();
+    let at2 = |x: i64, y: i64| {
+        let i = (y as usize * 1600 + x as usize) * 3;
+        (frame.rgb[i], frame.rgb[i + 1], frame.rgb[i + 2])
+    };
+    // The outline is four pixels wide in the doubled padding.
+    assert_eq!(at2(doubled(0).x - 5, doubled(0).y + 20), selected);
+    assert_eq!(at2(doubled(0).x - 8, doubled(0).y + 20), selected);
+    assert_eq!(at2(doubled(0).x - 9, doubled(0).y + 20), chrome);
+    assert_eq!(at2(doubled(1).x - 5, doubled(1).y + 20), chrome);
+    // The chooser over develop hides the strip as it hides the grid.
+    c.set_listing(b"/".to_vec(), listing("/", &["a"], &[]), None)
+        .unwrap();
+    assert!(c.film().is_empty() && c.visible().is_empty());
+    // The wants stand under it, as the grid's do: the cursor is at 1.
+    assert_eq!(fields(&c)[POSITION], "1");
+    assert_eq!(c.wanted(), [0, 1, 2, 3, 4]);
+    assert_eq!(key(&mut c, "Escape"), Outcome::Changed);
+    assert_eq!(c.film(), [(0, r#box(0)), (1, r#box(1)), (2, r#box(2))]);
+    // On a long roll the wants are bounded: the strip's three, the three
+    // after, the three before.
+    let mut long = Controller::new(surface(800, 600));
+    long.open("roll", b"/r", photos(20)).unwrap();
+    assert_eq!(act(&mut long, "develop", &[]), Outcome::Changed);
+    assert_eq!(act(&mut long, "select", &["10"]), Outcome::Changed);
+    assert_eq!(
+        long.film().iter().map(|(i, _)| *i).collect::<Vec<_>>(),
+        [9, 10, 11]
+    );
+    assert_eq!(long.wanted(), [9, 10, 11, 12, 13, 14, 6, 7, 8]);
+    assert_eq!(act(&mut long, "select", &["0"]), Outcome::Changed);
+    assert_eq!(long.wanted(), [0, 1, 2, 3, 4, 5]);
+    assert_eq!(act(&mut long, "select", &["19"]), Outcome::Changed);
+    assert_eq!(long.wanted(), [17, 18, 19, 14, 15, 16]);
+    // An even count of boxes: the cursor's sits right of centre, and the
+    // ends clamp as before. 900 wide holds four.
+    let mut even = Controller::new(surface(900, 600));
+    even.open("roll", b"/r", photos(10)).unwrap();
+    assert_eq!(act(&mut even, "develop", &[]), Outcome::Changed);
+    let shown = |c: &Controller| c.film().iter().map(|(i, _)| *i).collect::<Vec<_>>();
+    assert_eq!(shown(&even), [0, 1, 2, 3]);
+    assert_eq!(act(&mut even, "select", &["5"]), Outcome::Changed);
+    assert_eq!(shown(&even), [3, 4, 5, 6]);
+    assert_eq!(act(&mut even, "select", &["2"]), Outcome::Changed);
+    assert_eq!(shown(&even), [0, 1, 2, 3]);
+    assert_eq!(act(&mut even, "select", &["8"]), Outcome::Changed);
+    assert_eq!(shown(&even), [6, 7, 8, 9]);
 }
