@@ -92,6 +92,36 @@ recorded pass before it runs, so a failure leaves nothing to answer from.
 `td-recipe-eval clear-store` drops the memos with the rest of the ladder work
 dir.
 
+## Reclaiming the shared build cache
+
+The ladder work dir under `~/.td/build-daemon/ladder-shared-v1` keeps every
+output every worktree has built, and nothing reclaims it on its own. To drop
+what no build has used for a while and keep the rest warm:
+
+```text
+td-recipe-eval gc-store --unused-for 14 --dry-run
+td-recipe-eval gc-store --unused-for 14
+```
+
+A cache record is used when a build reuses it: a rung's receipt on a warm
+hit, a build-run memo when an unchanged plan skips the climb, a verdict memo
+when a check is skipped. Each hit stamps its record, and a record's last use
+is the newer of that stamp and its atime, so a reader can only keep an entry
+longer, never shorter. `gc-store` keeps the closure of everything used
+within the window over the cache's reference graph — what a reused output
+references stays with it, and a memo's whole recorded closure stays — and
+removes the other rows, trees, receipts and memos. The seed store is not
+touched.
+
+It holds the ladder exclusively, as `clear-store` does: it waits for the
+running builds, checks and boots that hold it to finish and blocks new ones
+while it runs, so run it when builds are quiet. A check whose verdict memo
+hits never takes the ladder, and its read of that memo may overlap the memo
+reaping; nothing worse than a lost stamp comes of it. Too short a window
+costs a rebuild, never a wrong build: the cache is content-addressed, and a
+missing rung cold-climbs on its next use. The dry run prints what a window
+would reclaim before it does.
+
 Fetched and host-generated seeds are pinned by the seed digest table the
 evaluator compiles in (`seed/seed-digests.txt`); regenerate it after a pin,
 seed patch, or stage0 source change and commit it with the change:

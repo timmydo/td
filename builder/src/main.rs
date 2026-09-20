@@ -975,6 +975,26 @@ fn commit_temp_path(dest: &Path) -> Result<std::path::PathBuf, String> {
     Ok(parent.join(format!(".commit-tmp.{}.{base}.staging", std::process::id())))
 }
 
+/// Remove the store item at PATH so that its canonical name is whole or absent at
+/// every instant: rename it onto this pid's commit-temp name first (atomic), then
+/// delete the temp. A memo hit trusts a canonical name's presence as proof of a whole
+/// tree — a commit renames a complete tree into place — so a delete in place, killed
+/// midway, would leave a torn tree that hit; a kill here leaves only a
+/// `.commit-tmp.<pid>.<base>.staging` the pid-checked sweep reaps. Returns whether
+/// there was anything to remove; an absent PATH is not an error.
+fn remove_store_path_aside(path: &Path) -> Result<bool, String> {
+    let tmp = commit_temp_path(path)?;
+    remove_store_path(&tmp)?; // this pid's own stale temp from an earlier crash
+    match std::fs::rename(path, &tmp) {
+        Ok(()) => {
+            remove_store_path(&tmp)?;
+            Ok(true)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(format!("rename {} aside to {}: {e}", path.display(), tmp.display())),
+    }
+}
+
 /// Whether PID is a live process (a `/proc/<pid>` entry exists) — so a sweep reaps only
 /// crash-orphaned staging temps, never a concurrent committer's live one. Only a NotFound
 /// `/proc/<pid>` is treated as dead; an ambiguous error is treated as ALIVE, so uncertainty
@@ -1202,6 +1222,42 @@ fn commit_canonical_atomic(src: &Path, dest: &Path) -> Result<(), String> {
         let _ = remove_store_path(&tmp);
         format!("commit rename {} -> {}: {e}", tmp.display(), dest.display())
     })
+}
+
+/// The extra roots `store-gc-unused` reads from its `--roots FILE`: one store
+/// basename per line, blank lines ignored. A root is joined onto nothing (it only
+/// selects rows and trees by basename), but a non-basename is a malformed caller,
+/// not a root: refused.
+fn parse_extra_roots(text: &str) -> Result<std::collections::HashSet<String>, String> {
+    let mut roots = std::collections::HashSet::new();
+    for line in text.lines() {
+        let base = line.trim();
+        if base.is_empty() {
+            continue;
+        }
+        if base.contains('/') || base == "." || base == ".." {
+            return Err(format!("extra root `{base}` is not a store basename"));
+        }
+        roots.insert(base.to_string());
+    }
+    Ok(roots)
+}
+
+/// The instant before which a record counts as unused: `now` less DAYS whole days.
+/// Zero days is refused: it would judge everything unused and reclaim the whole
+/// cache, which is `clear-store`'s job and should be asked for by that name.
+fn gc_cutoff(now: std::time::SystemTime, days: u64) -> Result<std::time::SystemTime, String> {
+    if days == 0 {
+        return Err("DAYS must be at least 1 (to drop the whole cache, use \
+                    `td-recipe-eval clear-store`)"
+            .to_string());
+    }
+    let window = days
+        .checked_mul(86_400)
+        .map(std::time::Duration::from_secs)
+        .ok_or_else(|| format!("DAYS {days} is out of range"))?;
+    now.checked_sub(window)
+        .ok_or_else(|| format!("DAYS {days} is out of range"))
 }
 
 /// Write BYTES to PATH atomically: to a sibling temp, then rename over PATH. A kill
@@ -1679,7 +1735,12 @@ fn store_add_recursive(
 /// The surviving db carries ValidPaths + Refs only: the deriver scaffold and
 /// DerivationOutputs are deliberately not carried over, because a pruned store
 /// is content + references — the build-derivation mapping is rebuilt by
-/// registration, not by pruning.
+/// registration, not by pruning. A hashless row is a REFERENCE scaffold, not
+/// content: `merge_regs` mints one for every path an output references that
+/// this db does not register (an input from another store, such as a seed).
+/// One a survivor still references survives with it, edge included, so a warm
+/// reuse reads the same references a real build would have registered; one
+/// nothing surviving references is dropped. It names no bytes here either way.
 fn retain_registered_paths(
     store_dir: &str,
     db_path: &str,
@@ -1698,19 +1759,29 @@ fn retain_registered_paths(
             path_of.insert(*rid, p.clone());
         }
     }
-    // A registered content path = a row WITH a recorded hash (skip the deriver
-    // scaffold). Keep the admitted ones; DELETE the dropped ones' files.
+    // A registered content path = a row WITH a recorded hash; a hashless row is a
+    // reference scaffold, decided below by what survives. Keep the admitted content
+    // paths; DELETE the dropped ones' files.
     let mut survivors: Vec<&Vec<RV>> = Vec::new();
+    let mut surviving_ids: std::collections::HashSet<i64> = std::collections::HashSet::new();
+    let mut scaffold: HashMap<i64, &Vec<RV>> = HashMap::new();
     let mut condemned: Vec<PathBuf> = Vec::new();
     let mut dropped = 0u64;
-    for (_rid, cols) in &valid {
+    for (rid, cols) in &valid {
+        // An empty hash is no hash: `persist_index` reads such a row as unregistered,
+        // and so does this, or the two would disagree about which rows hold bytes.
         let path = match (cols.get(1), cols.get(2)) {
-            (Some(RV::Text(p)), Some(RV::Text(_))) => p,
-            _ => continue, // no hash -> scaffolding, not a content path
+            (Some(RV::Text(p)), Some(RV::Text(h))) if !h.is_empty() => p,
+            (Some(RV::Text(_)), _) => {
+                scaffold.insert(*rid, cols);
+                continue;
+            }
+            _ => continue, // no path at all: nothing to keep or name
         };
         let base = path.rsplit('/').next().unwrap_or(path.as_str());
         if keep(path, base) {
             survivors.push(cols);
+            surviving_ids.insert(*rid);
             continue;
         }
         dropped += 1;
@@ -1726,6 +1797,26 @@ fn retain_registered_paths(
                 "td-builder: dropping db row `{path}' without deleting anything: not a \
                  canonical store path"
             );
+        }
+    }
+    // A scaffold a survivor references (through any chain of scaffolds) survives
+    // with it, so no surviving row loses an edge; the rest are dropped with the
+    // content rows nothing keeps.
+    let mut edges: HashMap<i64, Vec<i64>> = HashMap::new();
+    for (_r, cols) in &refs {
+        if let (Some(RV::Int(a)), Some(RV::Int(b))) = (cols.first(), cols.get(1)) {
+            edges.entry(*a).or_default().push(*b);
+        }
+    }
+    let mut stack: Vec<i64> = surviving_ids.iter().copied().collect();
+    while let Some(from) = stack.pop() {
+        for to in edges.get(&from).into_iter().flatten() {
+            if let Some(cols) = scaffold.get(to) {
+                if surviving_ids.insert(*to) {
+                    survivors.push(cols);
+                    stack.push(*to);
+                }
+            }
         }
     }
     // Renumber survivors 1..k by path; remap Refs among them.
@@ -1790,23 +1881,345 @@ fn retain_registered_paths(
     // `write_atomic` rather than a direct `write`.
     //
     // The cost of that order: a crash between the two leaves trees no row names, and
-    // since both callers are db-driven neither will ever revisit them. Trading a
-    // rare unreclaimed tree for never producing a db that reds every plan is the
-    // right way round; reclaiming them wants an orphan pass over the store dir.
+    // `store-gc-sweep` will never revisit them. Trading a rare unreclaimed tree for
+    // never producing a db that reds every plan is the right way round; `store-gc-
+    // unused` reclaims them with its orphan pass over the store dir. Each tree goes
+    // aside-then-delete, so a kill mid-delete never leaves a torn tree under the
+    // canonical name a memo hit takes for a whole one.
     write_atomic(Path::new(db_path), &store_db::write_db(&tables))?;
     let mut deleted = 0u64;
     for entry in &condemned {
-        if !entry.exists() {
-            continue;
+        if remove_store_path_aside(entry)? {
+            deleted += 1;
         }
-        if entry.is_dir() {
-            std::fs::remove_dir_all(entry).map_err(|e| format!("{}: {e}", entry.display()))?;
-        } else {
-            std::fs::remove_file(entry).map_err(|e| format!("{}: {e}", entry.display()))?;
-        }
-        deleted += 1;
     }
     Ok((dropped, deleted, newid.len()))
+}
+
+/// What `store_gc_unused` found in a cache and, unless it was a dry run, removed.
+/// Every count is over the state it read under the commit lock; `nar` sizes are the
+/// rows' recorded `narSize`, an estimate of the disk a tree holds (a compressing or
+/// reflinking filesystem stores less), never a walk of the trees.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct StoreGcReport {
+    /// Registered content rows, and how they split.
+    rows: usize,
+    live_rows: usize,
+    dead_rows: usize,
+    live_nar: u64,
+    dead_nar: u64,
+    /// Receipt sidecars, partitioned: kept because used since the cutoff, kept because
+    /// a live row's deriver wrote them though nothing used them (a root's input, or a
+    /// memo's), and removed because no live row's deriver wrote them — which includes
+    /// a used receipt with no rows, since a hit needs every output's row.
+    receipts: usize,
+    fresh_receipts: usize,
+    closure_receipts: usize,
+    stale_receipts: usize,
+    /// Store trees no registered row names (the crash leak the db-first order accepts).
+    /// A row records its tree's NAR size; an orphan has no row, so no size is known.
+    orphan_trees: usize,
+    /// Extra roots the caller named that are registered paths here. The rest name
+    /// either a tree an earlier reclaim already took (the memo naming it is stale)
+    /// or a tree present but unregistered, which the orphan pass spares for them.
+    extra_roots_found: usize,
+    /// Trees actually removed (dead rows whose tree was present, plus orphans).
+    deleted_trees: u64,
+    dry_run: bool,
+}
+
+impl StoreGcReport {
+    fn lines(&self) -> Vec<String> {
+        let verb = if self.dry_run { "would remove" } else { "removed" };
+        vec![
+            format!(
+                "store-gc: {} registered paths: {} live ({}), {} unused ({})",
+                self.rows,
+                self.live_rows,
+                human_bytes(self.live_nar),
+                self.dead_rows,
+                human_bytes(self.dead_nar)
+            ),
+            format!(
+                "store-gc: {} receipts: {} kept ({} used since the cutoff, {} for a live \
+                 output nothing used), {} {verb}",
+                self.receipts,
+                self.fresh_receipts + self.closure_receipts,
+                self.fresh_receipts,
+                self.closure_receipts,
+                self.stale_receipts
+            ),
+            format!(
+                "store-gc: {} orphan trees no row names (size unrecorded) {verb}; {} extra \
+                 roots registered here",
+                self.orphan_trees, self.extra_roots_found
+            ),
+            if self.dry_run {
+                format!(
+                    "store-gc: dry run — nothing changed; {} unused registered paths ({} \
+                     recorded) and {} orphan trees would be removed",
+                    self.dead_rows,
+                    human_bytes(self.dead_nar),
+                    self.orphan_trees
+                )
+            } else {
+                format!(
+                    "store-gc: deleted {} trees; {} registered paths ({}) remain",
+                    self.deleted_trees,
+                    self.live_rows,
+                    human_bytes(self.live_nar)
+                )
+            },
+        ]
+    }
+}
+
+/// `1234567` → `1.2 MB`: decimal units, one decimal, for an operator's report.
+fn human_bytes(n: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "kB", "MB", "GB", "TB"];
+    let mut v = n as f64;
+    let mut i = 0;
+    // 999.95 rounds to `1000.0` at one decimal; step up before that, not at 1000.
+    while v >= 999.95 && i + 1 < UNITS.len() {
+        v /= 1000.0;
+        i += 1;
+    }
+    let unit = UNITS.get(i).copied().unwrap_or("B");
+    if i == 0 {
+        format!("{n} {unit}")
+    } else {
+        format!("{v:.1} {unit}")
+    }
+}
+
+/// The persistent build cache's RETENTION reclaim — the low-watermark GC the
+/// all-or-nothing cap eviction (`TD_CHECK_LADDER_CACHE_CAP_BYTES`) defers to. Given a
+/// cache STORE-DIR + DB, a CUTOFF, and EXTRA-ROOTS (store basenames the caller wants
+/// kept: what a recently used build-run memo names), the live set is the closure over
+/// `Refs` of every output of every receipt used since CUTOFF (`last_used`: the hit stamp
+/// a warm reuse leaves, or the atime a reader does) and of every extra root that is a
+/// registered path. Closure over the RUNTIME references, not just roots: a warm hit
+/// registers the reused output with the references the db records, and what it
+/// references must still be in the cache for the closure staged around it to be whole.
+///
+/// Then, unless DRY: the db is rewritten to the live rows and the dead trees deleted
+/// (`retain_registered_paths`, db first, so a crash leaks a tree rather than a row that
+/// names nothing); receipts no live row's deriver wrote are removed (a hit needs every
+/// output's row, so they could never hit again); and store trees no surviving row names
+/// are removed — the leak the db-first order accepts, and this is its orphan pass. Holds
+/// the cache commit lock across all of it, so no orphaned committer can be publishing a
+/// tree mid-sweep; excluding READERS is the caller's job (`gc-store` holds the ladder
+/// EXCLUSIVE, as `clear-store` does), since a reader copies a tree without any lock.
+///
+/// Correctness never depends on what is kept: the cache is content-addressed and a
+/// reclaimed rung cold-climbs on its next use, so what a wrong cutoff costs is time.
+fn store_gc_unused(
+    store_dir: &str,
+    db_path: &str,
+    cutoff: std::time::SystemTime,
+    extra_roots: &std::collections::HashSet<String>,
+    dry_run: bool,
+) -> Result<StoreGcReport, String> {
+    use std::collections::{HashMap, HashSet};
+    use store_db_read::Value as RV;
+    let db_file = Path::new(db_path);
+    let _commit_lock = lock_store_commit(db_file)?;
+    let mut report = StoreGcReport {
+        dry_run,
+        ..StoreGcReport::default()
+    };
+    // No db is no registered rows, not an empty cache: a first commit publishes its
+    // trees before it writes the db, so an interrupted one leaves trees only the orphan
+    // pass below will ever reach.
+    let db = match std::fs::read(db_file) {
+        Ok(bytes) => Some(store_db_read::Db::open(bytes)?),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(format!("read {db_path}: {e}")),
+    };
+    let receipts_dir = {
+        let mut d = db_file.as_os_str().to_owned();
+        d.push(".receipts");
+        PathBuf::from(d)
+    };
+    if !dry_run {
+        // The same crash recovery a commit runs first: reap dead pids' staging temps so
+        // they neither survive as clutter nor get mistaken for orphans below.
+        sweep_commit_temps(Path::new(store_dir));
+        if let Some(dbdir) = db_file.parent() {
+            sweep_commit_temps(dbdir);
+        }
+        sweep_commit_temps(&receipts_dir);
+    }
+    // Registered content rows: path, basename, deriver basename, narSize.
+    let mut rows: Vec<(String, String, Option<String>, u64)> = Vec::new();
+    if let Some(db) = &db {
+        for (_rid, cols) in db.table("ValidPaths")? {
+            let (path, _hash) = match (cols.get(1), cols.get(2)) {
+                (Some(RV::Text(p)), Some(RV::Text(h))) if !h.is_empty() => (p.clone(), h),
+                _ => continue, // hashless scaffolding: not a content row
+            };
+            let base = path.rsplit('/').next().unwrap_or(path.as_str()).to_string();
+            let deriver = match cols.get(4) {
+                Some(RV::Text(d)) if !d.is_empty() => {
+                    Some(d.rsplit('/').next().unwrap_or(d.as_str()).to_string())
+                }
+                _ => None,
+            };
+            let size = match cols.get(5) {
+                Some(RV::Int(s)) => u64::try_from(*s).unwrap_or(0),
+                _ => 0,
+            };
+            rows.push((path, base, deriver, size));
+        }
+    }
+    report.rows = rows.len();
+    let mut by_deriver: HashMap<&str, Vec<&str>> = HashMap::new();
+    let mut by_base: HashMap<&str, &str> = HashMap::new();
+    for (path, base, deriver, _) in &rows {
+        by_base.insert(base.as_str(), path.as_str());
+        if let Some(d) = deriver {
+            by_deriver.entry(d.as_str()).or_default().push(path.as_str());
+        }
+    }
+    // Receipts: the regular files `<drv-basename>.receipt`, judged by last use WITHOUT
+    // reading them (a read would be a use). The stem is the deriver basename the rows
+    // record. A dotfile is never one of ours (a staged receipt temp ends in `.staging`)
+    // and is left to the pid-checked sweep; so is anything that is not a plain file.
+    let mut receipt_stems: Vec<(String, PathBuf, bool)> = Vec::new();
+    match std::fs::read_dir(&receipts_dir) {
+        Ok(rd) => {
+            for ent in rd {
+                let ent = ent.map_err(|e| format!("read {}: {e}", receipts_dir.display()))?;
+                let p = ent.path();
+                let stem = match p
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .filter(|n| !n.starts_with('.'))
+                    .and_then(|n| n.strip_suffix(".receipt"))
+                {
+                    Some(s) => s.to_string(),
+                    None => continue, // not a receipt (a swept temp, a stray)
+                };
+                if !std::fs::symlink_metadata(&p).is_ok_and(|m| m.file_type().is_file()) {
+                    continue;
+                }
+                let fresh = td_engine::cache_use::last_used(&p)
+                    .map_err(|e| format!("stat {}: {e}", p.display()))?
+                    >= cutoff;
+                receipt_stems.push((stem, p, fresh));
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(format!("read {}: {e}", receipts_dir.display())),
+    }
+    report.receipts = receipt_stems.len();
+    // Roots: every output of a fresh receipt, plus every extra root registered here.
+    let mut roots: HashSet<&str> = HashSet::new();
+    for (stem, _, fresh) in &receipt_stems {
+        if *fresh {
+            if let Some(outs) = by_deriver.get(stem.as_str()) {
+                roots.extend(outs.iter().copied());
+            }
+        }
+    }
+    for base in extra_roots {
+        if let Some(path) = by_base.get(base.as_str()) {
+            roots.insert(path);
+            report.extra_roots_found += 1;
+        }
+    }
+    let root_list: Vec<String> = roots.iter().map(|p| p.to_string()).collect();
+    let live: HashSet<String> = match &db {
+        Some(db) => db.closure_roots(&root_list)?.into_iter().collect(),
+        None => HashSet::new(),
+    };
+    // A receipt hits only when EVERY output it names has a live row, so a deriver
+    // whose outputs are only partly live keeps no receipt: (live, total) per deriver.
+    let mut outputs_of: HashMap<&str, (usize, usize)> = HashMap::new();
+    for (path, _, deriver, size) in &rows {
+        let is_live = live.contains(path);
+        if is_live {
+            report.live_rows += 1;
+            report.live_nar += size;
+        } else {
+            report.dead_rows += 1;
+            report.dead_nar += size;
+        }
+        if let Some(d) = deriver {
+            let counts = outputs_of.entry(d.as_str()).or_default();
+            counts.0 += usize::from(is_live);
+            counts.1 += 1;
+        }
+    }
+    // Every receipt is exactly one of: kept and used, kept for a live output, removed.
+    let mut stale_receipts: Vec<&PathBuf> = Vec::new();
+    for (stem, p, fresh) in &receipt_stems {
+        let whole = outputs_of
+            .get(stem.as_str())
+            .is_some_and(|(live, total)| live == total);
+        if !whole {
+            stale_receipts.push(p);
+        } else if *fresh {
+            report.fresh_receipts += 1;
+        } else {
+            report.closure_receipts += 1;
+        }
+    }
+    report.stale_receipts = stale_receipts.len();
+    // Orphans: canonical `<digest>-<name>` trees in the store no row names and no fresh
+    // memo names either — a memo hit stages a tree on its presence alone, without the
+    // db, so a tree a fresh memo names is kept whether or not a row vouches it (a db
+    // removed to clear a torn write leaves every earlier tree unregistered). Dotfiles
+    // (commit staging temps) belong to the pid-checked sweep, never to this pass.
+    let registered: HashSet<&str> = rows.iter().map(|(_, b, _, _)| b.as_str()).collect();
+    let mut orphans: Vec<PathBuf> = Vec::new();
+    match std::fs::read_dir(store_dir) {
+        Ok(rd) => {
+            for ent in rd {
+                let ent = ent.map_err(|e| format!("read {store_dir}: {e}"))?;
+                let name = ent.file_name();
+                let name = match name.to_str() {
+                    Some(n) => n,
+                    None => continue,
+                };
+                if name.starts_with('.')
+                    || registered.contains(name)
+                    || extra_roots.contains(name)
+                    || store::name_from_store_path(name).is_none()
+                {
+                    continue;
+                }
+                orphans.push(ent.path());
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(format!("read {store_dir}: {e}")),
+    }
+    report.orphan_trees = orphans.len();
+    if dry_run {
+        return Ok(report);
+    }
+    // Db first, then the trees the dropped rows named (retain_registered_paths' order).
+    // A db with nothing to drop is not rewritten: the rewrite would change nothing but
+    // the file's identity.
+    if let (Some(db), true) = (&db, report.dead_rows > 0) {
+        let (_dropped, deleted, _kept) =
+            retain_registered_paths(store_dir, db_path, db, |path, _base| {
+                live.contains(path)
+            })?;
+        report.deleted_trees = deleted;
+    }
+    // A receipt that can never hit again holds no authority; remove it. Its row (if any)
+    // is already gone, so a crash here leaves a receipt that misses on its row check.
+    for p in stale_receipts {
+        remove_store_path(p)?;
+    }
+    for p in orphans {
+        if remove_store_path_aside(&p)? {
+            report.deleted_trees += 1;
+        }
+    }
+    Ok(report)
 }
 
 /// The content-addressed `source` path a tree WOULD intern at — computed, not
@@ -2350,9 +2763,11 @@ fn persistent_realization(
 ) -> Result<Option<Vec<OutputReg>>, String> {
     // The receipt gate: the sidecar for THIS derivation must exist and match the
     // CURRENT plan's identity, or the persistent entry is a miss (rebuild).
-    let receipt_hashes = match persist_receipt_path(persist_db, expected_deriver)
-        .and_then(|p| std::fs::read_to_string(p).ok())
-    {
+    let receipt_path = match persist_receipt_path(persist_db, expected_deriver) {
+        Some(p) => p,
+        None => return Ok(None),
+    };
+    let receipt_hashes = match std::fs::read_to_string(&receipt_path).ok() {
         Some(text) => match receipt_outputs(&text, expect) {
             Some(h) => h,
             None => return Ok(None),
@@ -2435,6 +2850,9 @@ fn persistent_realization(
             deriver,
         });
     }
+    // A confirmed hit: stamp the receipt, so `store-gc-unused` can tell an entry a
+    // current plan still reaches from one nothing has asked for since it was built.
+    td_engine::cache_use::stamp(&receipt_path);
     Ok(Some(out))
 }
 
@@ -10601,6 +11019,59 @@ fn main() -> ExitCode {
                 }
             }
         }
+        // The persistent build cache's retention GC (`store_gc_unused`): keep what a
+        // receipt used in the last DAYS days reaches — plus the closure of every store
+        // basename in ROOTS, one per line (a recently used build-run memo's outputs,
+        // supplied by `td-recipe-eval gc-store`, the operator verb that holds the ladder
+        // exclusive around this) — and remove the rest: dead rows and their trees,
+        // receipts that could never hit again, and orphan trees. Usage:
+        //   store-gc-unused STORE-DIR DB DAYS [--dry-run] [--roots FILE]
+        // `--dry-run` reports the same counts and changes nothing. Prints the report.
+        // Stdin is not read: `gc-store` hands this process a dup of its ladder lock as
+        // stdin, so the sweep holds the ladder exclusive even if `gc-store` is killed.
+        Some("store-gc-unused") if (5..=8).contains(&args.len()) => {
+            let run = || -> Result<StoreGcReport, String> {
+                let store_dir = args.get(2).ok_or("missing STORE-DIR")?;
+                let db_path = args.get(3).ok_or("missing DB")?;
+                let days: u64 = args
+                    .get(4)
+                    .ok_or("missing DAYS")?
+                    .parse()
+                    .map_err(|e| format!("DAYS must be a whole number of days: {e}"))?;
+                let mut dry_run = false;
+                let mut roots_file: Option<&String> = None;
+                let mut rest = args.iter().skip(5);
+                while let Some(arg) = rest.next() {
+                    match arg.as_str() {
+                        "--dry-run" => dry_run = true,
+                        "--roots" => {
+                            roots_file = Some(rest.next().ok_or("--roots needs FILE")?);
+                        }
+                        other => return Err(format!("unknown argument `{other}`")),
+                    }
+                }
+                let cutoff = gc_cutoff(std::time::SystemTime::now(), days)?;
+                let extra_roots = match roots_file {
+                    Some(f) => parse_extra_roots(
+                        &std::fs::read_to_string(f).map_err(|e| format!("read roots {f}: {e}"))?,
+                    )?,
+                    None => std::collections::HashSet::new(),
+                };
+                store_gc_unused(store_dir, db_path, cutoff, &extra_roots, dry_run)
+            };
+            match run() {
+                Ok(report) => {
+                    for line in report.lines() {
+                        println!("{line}");
+                    }
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("td-builder: store-gc-unused: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
         // The generic `build DRV CLOSURE SCRATCH` and `realize DRV STORE-DIR SCRATCH`
         // arms are DELETED (re #469 typed origins): both took their entire staging
         // manifest from the caller-writable TD_EXTRA_DBS env — self-issued authority
@@ -11884,6 +12355,7 @@ fn main() -> ExitCode {
             eprintln!("       td-builder store-add-output OUTPUT DERIVER CLOSURE-FILE STORE-DIR OUT-DB");
             eprintln!("       td-builder store-verify DB STORE-ROOT");
             eprintln!("       td-builder store-gc-sweep STORE-DIR DB ROOT");
+            eprintln!("       td-builder store-gc-unused STORE-DIR DB DAYS [--dry-run] [--roots FILE]");
             eprintln!("       td-builder resolve LOCKFILE NAME...");
             eprintln!("       td-builder build-recipe RECIPE-JSON LOCK SCRATCH-DIR STORE-DIR [SRC-STORE-DIR SRC-DB] [--recipe-output-store STORE] [--recipe-output-db DB]...");
             eprintln!("       td-builder build-plan --auto TARGET RECIPE-DIR MAP-FILE SEED-STORE SEED-DB SCRATCH");
@@ -12548,12 +13020,16 @@ daemon build START (2/2 active)
                 .unwrap();
         assert!(no_receipt.is_none(), "a valid row+tree without an engine receipt must MISS");
 
-        // Write the engine receipt sidecar for this deriver.
+        // Write the engine receipt sidecar for this deriver, dated long ago: the hit
+        // below must stamp it as used (what `store-gc-unused` judges it by), and a
+        // miss must not.
         let rp = persist_receipt_path(&db, &deriver).unwrap();
         std::fs::create_dir_all(rp.parent().unwrap()).unwrap();
         std::fs::write(&rp, receipt_text(&expect, std::slice::from_ref(&reg))).unwrap();
+        let long_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(40 * 86_400);
+        set_times(&rp, long_ago, long_ago);
 
-        // HIT: staged into scratch/newstore + the reg returned.
+        // HIT: staged into scratch/newstore + the reg returned, and the receipt stamped.
         let s1 = tmp.join("s-hit");
         std::fs::create_dir_all(&s1).unwrap();
         let regs = persistent_realization(&one_output_drv(&path), sd, &db, &s1, &expect, &deriver)
@@ -12561,9 +13037,13 @@ daemon build START (2/2 active)
             .expect("expected a persistent-store HIT");
         assert_eq!(regs[0].store_path, path);
         assert!(s1.join("newstore").join(base).join("bin/run").exists(), "output tree staged into newstore");
+        let mtime = |p: &Path| std::fs::symlink_metadata(p).unwrap().modified().unwrap();
+        assert!(mtime(&rp) > long_ago, "a hit stamps its receipt as used");
 
         // A DIFFERENT current plan identity (the typed-manifest digest moved) → MISS:
-        // the stored receipt cannot vouch a plan it was not issued for.
+        // the stored receipt cannot vouch a plan it was not issued for, and a miss is
+        // not a use of it.
+        set_times(&rp, long_ago, long_ago);
         let s_id = tmp.join("s-wrong-identity");
         std::fs::create_dir_all(&s_id).unwrap();
         let other = ReceiptExpect { manifest_sha256: "99".repeat(32), ..expect.clone() };
@@ -12571,6 +13051,7 @@ daemon build START (2/2 active)
             persistent_realization(&one_output_drv(&path), sd, &db, &s_id, &other, &deriver)
                 .unwrap();
         assert!(wrong_id.is_none(), "a receipt issued for another plan identity must MISS");
+        assert_eq!(mtime(&rp), long_ago, "a miss leaves the receipt unstamped");
 
         // Rows minted for a DIFFERENT deriver → MISS even with a matching sidecar:
         // the ValidPaths row must itself record THIS drv as its producer.
@@ -13981,6 +14462,274 @@ daemon build START (2/2 active)
         assert!(bystander.is_dir(), "so does its sibling");
         assert!(d.is_dir(), "and above all the store's PARENT");
         std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// A build cache with one row per letter, each with its own receipt and tree, laid
+    /// out the way `commit_scratch_to_store` leaves it: `store/<base>`, `db`, and
+    /// `db.receipts/<drv-base>.receipt`. Returns (dir, store, db).
+    fn gc_fixture(tag: &str, regs: &[OutputReg]) -> (PathBuf, PathBuf, PathBuf) {
+        let d = std::env::temp_dir().join(format!("td-gc-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let store = d.join("store");
+        let receipts = d.join("db.receipts");
+        std::fs::create_dir_all(&store).unwrap();
+        std::fs::create_dir_all(&receipts).unwrap();
+        let db = d.join("db");
+        write_output_db(regs, &db).unwrap();
+        for r in regs {
+            let base = r.store_path.rsplit('/').next().unwrap();
+            let tree = store.join(base);
+            std::fs::create_dir_all(tree.join("bin")).unwrap();
+            std::fs::write(tree.join("bin/prog"), base).unwrap();
+            let drv_base = r.deriver.rsplit('/').next().unwrap();
+            std::fs::write(receipts.join(format!("{drv_base}.receipt")), "td-receipt v1\n").unwrap();
+        }
+        (d, store, db)
+    }
+
+    fn gc_reg(letter: char, name: &str, refs: &[&str], size: u64) -> OutputReg {
+        let digest: String = std::iter::repeat_n(letter, 32).collect();
+        OutputReg {
+            store_path: format!("/td/store/{digest}-{name}"),
+            nar_hash: format!("sha256:{letter}{letter}"),
+            nar_size: size,
+            refs: refs.iter().map(|s| s.to_string()).collect(),
+            deriver: format!("/td/store/{digest}-{name}.drv"),
+        }
+    }
+
+    fn set_times(path: &Path, accessed: std::time::SystemTime, modified: std::time::SystemTime) {
+        std::fs::File::open(path)
+            .unwrap()
+            .set_times(
+                std::fs::FileTimes::new()
+                    .set_accessed(accessed)
+                    .set_modified(modified),
+            )
+            .unwrap();
+    }
+
+    // The retention rule end to end: a fresh receipt's outputs are roots; the closure
+    // over Refs keeps what they reference even when THAT receipt is stale, a reference
+    // scaffold (a row for an input another store holds) included; an extra root (a
+    // memo's base) keeps its row; a stale atime-only read still counts as a use;
+    // everything else — dead rows, their trees, their scaffolds, receipts that can
+    // never hit, and orphan trees — goes, while a live pid's commit temp and a dotfile
+    // are left alone.
+    #[test]
+    fn store_gc_unused_keeps_the_closure_of_what_was_used() {
+        let long_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(40 * 86_400);
+        let now = std::time::SystemTime::now();
+        let seed = "/td/store/ssssssssssssssssssssssssssssssss-seed-1.0";
+        let dead_seed = "/td/store/tttttttttttttttttttttttttttttttt-dead-seed-1.0";
+        let app = gc_reg(
+            'a',
+            "app-1.0",
+            &[
+                "/td/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-lib-1.0",
+                "/td/store/pppppppppppppppppppppppppppppppp-pair-bin-1.0",
+            ],
+            100,
+        );
+        let lib = gc_reg('b', "lib-1.0", &[seed], 10);
+        let old = gc_reg('c', "old-1.0", &[dead_seed], 1000);
+        let memo = gc_reg('d', "memo-1.0", &[], 7);
+        let read = gc_reg('e', "read-1.0", &[], 3);
+        // One derivation, two outputs: `app` references only the first, so the second
+        // is dead, and a receipt that names both can never hit again.
+        let pair_bin = gc_reg('p', "pair-bin-1.0", &[], 5);
+        let mut pair_dev = gc_reg('q', "pair-dev-1.0", &[], 6);
+        pair_dev.deriver = pair_bin.deriver.clone();
+        let regs = [
+            app.clone(),
+            lib.clone(),
+            old.clone(),
+            memo.clone(),
+            read.clone(),
+            pair_bin.clone(),
+            pair_dev.clone(),
+        ];
+        let (d, store, db) = gc_fixture("closure", &regs);
+        let receipts = d.join("db.receipts");
+        let receipt_of = |r: &OutputReg| receipts.join(format!("{}.receipt", r.deriver.rsplit('/').next().unwrap()));
+        // Everything was built long ago; only `app` has been hit since.
+        for r in &regs {
+            set_times(&receipt_of(r), long_ago, long_ago);
+        }
+        set_times(&receipt_of(&app), long_ago, now);
+        // `read` was never stamped, but a relatime reader left an atime.
+        set_times(&receipt_of(&read), now, long_ago);
+        // A receipt nothing registered (fresh, even: a use of a receipt with no rows
+        // is a miss, so it still goes), a dotfile that is not a receipt of ours, a
+        // directory wearing a receipt's name, an orphan tree, a tree no row names but a
+        // fresh memo does, and a live committer's temp.
+        std::fs::write(receipts.join("gggggggggggggggggggggggggggggggg-gone-1.0.drv.receipt"), "x").unwrap();
+        let dotfile = receipts.join(".hidden.receipt");
+        std::fs::write(&dotfile, "x").unwrap();
+        set_times(&dotfile, long_ago, long_ago);
+        let dir_receipt = receipts.join("xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx-dir-1.0.drv.receipt");
+        std::fs::create_dir_all(&dir_receipt).unwrap();
+        set_times(&dir_receipt, long_ago, long_ago);
+        let orphan = store.join("ffffffffffffffffffffffffffffffff-orphan-1.0");
+        std::fs::create_dir_all(&orphan).unwrap();
+        let memo_only = store.join("iiiiiiiiiiiiiiiiiiiiiiiiiiiiiiii-memo-only-1.0");
+        std::fs::create_dir_all(&memo_only).unwrap();
+        let temp = store.join(format!(".commit-tmp.{}.zzz.staging", std::process::id()));
+        std::fs::create_dir_all(&temp).unwrap();
+        let cutoff = now - std::time::Duration::from_secs(7 * 86_400);
+        let extra: std::collections::HashSet<String> = [
+            "dddddddddddddddddddddddddddddddd-memo-1.0".to_string(),
+            "hhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhh-evicted-1.0".to_string(),
+            "iiiiiiiiiiiiiiiiiiiiiiiiiiiiiiii-memo-only-1.0".to_string(),
+        ]
+        .into_iter()
+        .collect();
+        let (store_s, db_s) = (store.to_string_lossy().to_string(), db.to_string_lossy().to_string());
+
+        // Dry run: the report, and not one byte moved.
+        let dry = store_gc_unused(&store_s, &db_s, cutoff, &extra, true).unwrap();
+        assert_eq!(
+            dry,
+            StoreGcReport {
+                rows: 7,
+                live_rows: 5,
+                dead_rows: 2,
+                live_nar: 125,
+                dead_nar: 1006,
+                receipts: 7,
+                fresh_receipts: 2,
+                closure_receipts: 2,
+                stale_receipts: 3,
+                orphan_trees: 1,
+                extra_roots_found: 1,
+                deleted_trees: 0,
+                dry_run: true,
+            }
+        );
+        assert!(store.join(old.store_path.rsplit('/').next().unwrap()).is_dir());
+        assert!(orphan.is_dir());
+        assert_eq!(std::fs::read_dir(&receipts).unwrap().count(), 9);
+
+        let got = store_gc_unused(&store_s, &db_s, cutoff, &extra, false).unwrap();
+        assert_eq!(got.deleted_trees, 3, "the two dead rows' trees and the orphan");
+        assert_eq!((got.live_rows, got.dead_rows, got.stale_receipts), (5, 2, 3));
+        assert!(dotfile.is_file(), "a dotfile is not a receipt, and not ours to remove");
+        assert!(dir_receipt.is_dir(), "nor is a directory, whatever its name");
+        let base = |r: &OutputReg| r.store_path.rsplit('/').next().unwrap().to_string();
+        for kept in [&app, &lib, &memo, &read, &pair_bin] {
+            assert!(store.join(base(kept)).join("bin/prog").is_file(), "{} survives", base(kept));
+        }
+        for kept in [&app, &lib, &memo, &read] {
+            assert!(receipt_of(kept).is_file(), "{}'s receipt survives", base(kept));
+        }
+        assert!(!store.join(base(&old)).exists(), "the unused tree is gone");
+        assert!(!receipt_of(&old).exists(), "and its receipt");
+        assert!(!store.join(base(&pair_dev)).exists(), "the unreferenced second output is gone");
+        assert!(!receipt_of(&pair_bin).exists(), "and a receipt that named it can never hit again");
+        assert!(!orphan.exists(), "the orphan tree is gone");
+        assert!(memo_only.is_dir(), "a tree a fresh memo names is kept, row or no row");
+        assert!(!receipts.join("gggggggggggggggggggggggggggggggg-gone-1.0.drv.receipt").exists());
+        assert!(temp.is_dir(), "a live pid's staging temp is not ours to reap");
+        let dotfiles: Vec<_> = std::fs::read_dir(&store)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with('.'))
+            .map(|e| e.path())
+            .collect();
+        assert_eq!(dotfiles, vec![temp.clone()], "every tree went aside and then away");
+        let after = store_db_read::Db::open(std::fs::read(&db).unwrap()).unwrap();
+        let mut paths: Vec<String> = after.hashes_by_path().unwrap().into_keys().collect();
+        paths.sort();
+        assert_eq!(
+            paths,
+            vec![
+                app.store_path.clone(),
+                lib.store_path.clone(),
+                memo.store_path.clone(),
+                read.store_path.clone(),
+                pair_bin.store_path.clone()
+            ]
+        );
+        assert_eq!(
+            after.closure(&app.store_path).unwrap(),
+            vec![app.store_path.clone(), lib.store_path.clone(), pair_bin.store_path.clone(), seed.to_string()],
+            "Refs survive renumbering, the live scaffold and its edge with them"
+        );
+        let rows_after = after.table("ValidPaths").unwrap();
+        assert_eq!(rows_after.len(), 6, "five content rows and the one live scaffold");
+        assert!(
+            !rows_after.iter().any(|(_, cols)| path_at(cols) == dead_seed),
+            "the dead row's scaffold went with it"
+        );
+
+        // Idempotent, and a second pass with nothing dead leaves the db inode alone.
+        use std::os::unix::fs::MetadataExt;
+        let ino = std::fs::metadata(&db).unwrap().ino();
+        let again = store_gc_unused(&store_s, &db_s, cutoff, &extra, false).unwrap();
+        assert_eq!((again.dead_rows, again.stale_receipts, again.orphan_trees, again.deleted_trees), (0, 0, 0, 0));
+        assert_eq!(std::fs::metadata(&db).unwrap().ino(), ino);
+        std::fs::remove_dir_all(&d).ok();
+        std::fs::remove_file(d.with_extension("commit.lock")).ok();
+    }
+
+    // No db and no store is nothing at all; no db with trees is no registered rows,
+    // and the orphan pass still runs — a first commit publishes trees before its db,
+    // so an interrupted one leaves trees only that pass reaches — sparing a tree a
+    // fresh memo names.
+    #[test]
+    fn store_gc_unused_without_a_db_reclaims_orphans_only() {
+        let d = std::env::temp_dir().join(format!("td-gc-empty-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let store = d.join("store");
+        let (store_s, db_s) = (store.to_string_lossy().to_string(), d.join("db").to_string_lossy().to_string());
+        let now = std::time::SystemTime::now();
+        let got = store_gc_unused(&store_s, &db_s, now, &Default::default(), false).unwrap();
+        assert_eq!(got, StoreGcReport::default());
+        let torn = store.join("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-torn-1.0");
+        let named = store.join("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-named-1.0");
+        std::fs::create_dir_all(torn.join("bin")).unwrap();
+        std::fs::create_dir_all(named.join("bin")).unwrap();
+        let extra: std::collections::HashSet<String> =
+            ["bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-named-1.0".to_string()].into_iter().collect();
+        let got = store_gc_unused(&store_s, &db_s, now, &extra, false).unwrap();
+        assert_eq!((got.rows, got.orphan_trees, got.deleted_trees, got.extra_roots_found), (0, 1, 1, 0));
+        assert!(!torn.exists() && named.is_dir());
+        assert!(!d.join("db").exists(), "no db was conjured");
+        std::fs::remove_dir_all(&d).ok();
+        std::fs::remove_file(d.with_extension("commit.lock")).ok();
+    }
+
+    #[test]
+    fn gc_cutoff_refuses_zero_days_and_counts_whole_days() {
+        let now = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000);
+        assert!(gc_cutoff(now, 0).unwrap_err().contains("clear-store"));
+        assert_eq!(gc_cutoff(now, 1).unwrap(), now - std::time::Duration::from_secs(86_400));
+        assert!(gc_cutoff(now, u64::MAX).is_err(), "overflow");
+    }
+
+    // The roots-file contract with `gc-store`: basenames, one per line, blanks
+    // ignored; anything that could name a path is refused rather than matched.
+    #[test]
+    fn parse_extra_roots_takes_basenames_only() {
+        let got = parse_extra_roots("aaa-x-1.0\n\n  bbb-y-2.0  \naaa-x-1.0\n").unwrap();
+        assert_eq!(got.len(), 2);
+        assert!(got.contains("aaa-x-1.0") && got.contains("bbb-y-2.0"));
+        assert!(parse_extra_roots("").unwrap().is_empty());
+        for bad in ["../x", "a/b", ".", ".."] {
+            assert!(parse_extra_roots(bad).unwrap_err().contains("not a store basename"), "{bad}");
+        }
+    }
+
+    #[test]
+    fn human_bytes_reads_like_an_operator_expects() {
+        assert_eq!(human_bytes(0), "0 B");
+        assert_eq!(human_bytes(999), "999 B");
+        assert_eq!(human_bytes(1_234_567), "1.2 MB");
+        assert_eq!(human_bytes(422_100_000_000), "422.1 GB");
+        assert_eq!(human_bytes(1_500_000_000_000), "1.5 TB");
+        assert_eq!(human_bytes(999_950), "1.0 MB", "no `1000.0 kB`");
+        assert_eq!(human_bytes(999_949), "999.9 kB");
     }
 
     // --auto: synthesize a recipe's WHOLE lock straight from its declared graph — no

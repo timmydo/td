@@ -235,6 +235,201 @@ pub fn clear_store_cli(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// `td-recipe-eval gc-store --unused-for DAYS [--dry-run]` — reclaim the shared
+/// build-cache's UNUSED entries and keep the ones current plans still reach, the
+/// middle ground between `clear-store` (everything) and the cap eviction (everything,
+/// once over a size). What counts as used is what the warm paths touched: a receipt a
+/// rung reuse hit, a build-run memo a top-level reuse hit, a verdict memo a check
+/// skip read — each stamped at the hit, and each judged by the newer of that stamp
+/// and its atime, so an entry can only be kept longer than the stamp says, never
+/// shorter. What is kept is the closure of the used entries over the cache's own
+/// reference graph, so a reused rung's inputs and a memo root's references survive
+/// with it; every other row, tree and receipt goes, as do memos unused that long.
+///
+/// The ladder is held EXCLUSIVE, as `clear-store` holds it: a build reads the cache
+/// under no lock but the shared ladder, so this waits for every running build, check
+/// and boot that holds it to finish and blocks new ones while it runs — run it when
+/// builds are quiet. The one reader outside it is a check whose verdict memo hits,
+/// which reads and stamps that memo before ever taking the ladder; that read may
+/// overlap the memo reaping, and the worst of it is a stamp on a file being removed
+/// (the verdict it read was valid, and the next run re-earns it). Nothing here can
+/// make a build wrong: the cache is content-addressed and a reclaimed rung cold-climbs
+/// on its next use, so the cost of too short a window is time, and `--dry-run` prints
+/// what a window would reclaim before it does.
+pub fn gc_store_cli(args: &[String]) -> Result<(), String> {
+    let opts = parse_gc_store_args(args)?;
+    let root = env::current_dir().map_err(|e| format!("current dir: {e}"))?;
+    let runner = RecipeCheckRunner::new(root, &scratch_name("gc-store", &[]))?;
+    let lock = lock_ladder(&runner.lock_path(), LadderLock::Exclusive)?;
+    runner.gc_store(&opts, &lock)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct GcStoreArgs {
+    unused_for_days: u64,
+    dry_run: bool,
+}
+
+const GC_STORE_USAGE: &str = "usage: gc-store --unused-for DAYS [--dry-run]";
+
+/// The verb's argument grammar, kept pure so its rejections are testable: the window
+/// is required (an implicit one would be a destructive default), whole days, at
+/// least one (zero would be `clear-store` under another name).
+fn parse_gc_store_args(args: &[String]) -> Result<GcStoreArgs, String> {
+    let mut days: Option<u64> = None;
+    let mut dry_run = false;
+    let mut it = args.iter();
+    while let Some(arg) = it.next() {
+        match arg.as_str() {
+            "--unused-for" => {
+                let v = it
+                    .next()
+                    .ok_or_else(|| format!("--unused-for needs DAYS ({GC_STORE_USAGE})"))?;
+                let n: u64 = v.parse().map_err(|_| {
+                    format!("--unused-for DAYS must be a whole number of days, not `{v}`")
+                })?;
+                if n == 0 {
+                    return Err(
+                        "--unused-for 0 would reclaim the whole cache; that is `clear-store`"
+                            .to_string(),
+                    );
+                }
+                if days.replace(n).is_some() {
+                    return Err(format!("--unused-for given twice ({GC_STORE_USAGE})"));
+                }
+            }
+            "--dry-run" => dry_run = true,
+            other => return Err(format!("unknown argument `{other}` ({GC_STORE_USAGE})")),
+        }
+    }
+    let unused_for_days =
+        days.ok_or_else(|| format!("--unused-for DAYS is required ({GC_STORE_USAGE})"))?;
+    Ok(GcStoreArgs {
+        unused_for_days,
+        dry_run,
+    })
+}
+
+/// A memo's last use, by the rule the builder judges receipts by (`td_engine::cache_use`).
+/// `None` for a memo that is gone: the reclaim holds the ladder, but a check whose
+/// verdict memo hits reads outside it, and a run it reaps a temp from may be tearing
+/// down; a file that vanished between the listing and the stat needs nothing done.
+fn last_used(path: &Path) -> Result<Option<std::time::SystemTime>, String> {
+    match td_engine::cache_use::last_used(path) {
+        Ok(t) => Ok(Some(t)),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(format!("stat {}: {e}", path.display())),
+    }
+}
+
+/// Whether the dir entry at PATH is one of DIR's own memos: a regular file (never a
+/// symlink or a directory, whatever its name) named `<stem>.<key>SUFFIX` — a dot
+/// before the key, so a stray `notes.pass` is not one — and not a dotfile. The name
+/// gives back its key.
+fn memo_key(path: &Path, suffix: &str) -> Option<String> {
+    let name = path.file_name().and_then(OsStr::to_str)?;
+    if name.starts_with('.') || !fs::symlink_metadata(path).ok()?.file_type().is_file() {
+        return None;
+    }
+    let (_stem, key) = name.strip_suffix(suffix)?.rsplit_once('.')?;
+    Some(key.to_string())
+}
+
+/// A crashed run's staging temp beside the memos: a dotfile ending in `.tmp` that
+/// is a regular file. Nothing else reaps these.
+fn is_memo_temp(path: &Path) -> bool {
+    path.file_name()
+        .and_then(OsStr::to_str)
+        .is_some_and(|n| n.starts_with('.') && n.ends_with(".tmp"))
+        && fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_file())
+}
+
+/// The output basenames every build-run memo used since CUTOFF names — `gc-store`'s
+/// extra roots. A memo hit stages those trees straight from the cache without touching
+/// a receipt, so without this a worktree whose plan has not changed would lose its
+/// whole closure while still hitting. Each memo is judged by `last_used` BEFORE it is
+/// read, read without leaving a use (a reclaim run every day must not keep every memo
+/// fresh by its own reading), and parsed the way the reuse path parses it (the header
+/// fingerprint must be the one in the name), so a memo the reuse path would ignore —
+/// unreadable, not UTF-8, or a lie — contributes nothing, as it would miss there. A
+/// missing dir is no memos. Sorted and deduped, so the builder reads a stable list.
+fn fresh_build_run_memo_roots(
+    dir: &Path,
+    cutoff: std::time::SystemTime,
+) -> Result<Vec<String>, String> {
+    let entries = match fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(format!("read {}: {e}", dir.display())),
+    };
+    let mut roots: BTreeSet<String> = BTreeSet::new();
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("read {}: {e}", dir.display()))?;
+        let path = entry.path();
+        let Some(fingerprint) = memo_key(&path, ".map") else {
+            continue;
+        };
+        match last_used(&path)? {
+            Some(used) if used >= cutoff => {}
+            _ => continue,
+        }
+        let Ok(text) = td_engine::cache_use::read_to_string_leaving_no_use(&path) else {
+            continue;
+        };
+        if let Some(map) = parse_build_run_memo(&text, &fingerprint) {
+            roots.extend(map.into_values());
+        }
+    }
+    Ok(roots.into_iter().collect())
+}
+
+/// Remove every memo under DIR (`memo_key` with SUFFIX: `build-run-memo/*.map`,
+/// `check-memo/*.pass`) whose last use is before CUTOFF, and every staging temp a
+/// crashed run left beside them that is as old, which nothing else reaps. Returns
+/// (memos seen, memos stale); temps are not memos and are not counted. A dry run
+/// counts without removing. Anything else in the dir is not ours and is left alone.
+/// A missing dir is no memos.
+fn reap_stale_records(
+    dir: &Path,
+    suffix: &str,
+    cutoff: std::time::SystemTime,
+    dry_run: bool,
+) -> Result<(usize, usize), String> {
+    let entries = match fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok((0, 0)),
+        Err(e) => return Err(format!("read {}: {e}", dir.display())),
+    };
+    let (mut seen, mut stale) = (0usize, 0usize);
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("read {}: {e}", dir.display()))?;
+        let path = entry.path();
+        let is_memo = memo_key(&path, suffix).is_some();
+        if !is_memo && !is_memo_temp(&path) {
+            continue;
+        }
+        if is_memo {
+            seen += 1;
+        }
+        match last_used(&path)? {
+            Some(used) if used >= cutoff => continue,
+            Some(_) => {}
+            None => continue, // gone since the listing: nothing to reap
+        }
+        if is_memo {
+            stale += 1;
+        }
+        if !dry_run {
+            match fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(format!("remove {}: {e}", path.display())),
+            }
+        }
+    }
+    Ok((seen, stale))
+}
+
 /// The machine-wide signed substitute store `clear-store` also resets: an explicit
 /// `TD_SUBST_STORE` wins, else the HOME-derived `~/.td/subst` — the exact resolution the loop
 /// (`check_loop::subst_env`) uses to EXPOSE it, so clearing hits precisely what a later build
@@ -1503,7 +1698,8 @@ fn ladder_lock_path(lw: &Path) -> PathBuf {
 /// recipe OUTPUT committed there would be rejected as an unpinned seed. The cache lives in
 /// its own subtree so reuse never pollutes the seed authority. Shared across worktrees and
 /// content-addressed, so it is never wiped on a pin/patch change. Nothing reclaims it
-/// implicitly; the explicit `clear-store` resets the whole ladder, and an opt-in
+/// implicitly; the explicit `clear-store` resets the whole ladder, the explicit `gc-store`
+/// keeps the closure of what builds used within a window and drops the rest, and an opt-in
 /// `TD_CHECK_LADDER_CACHE_CAP_BYTES` enables a coarse high-watermark eviction of the whole
 /// `build-cache/` (store + db + `db.receipts` sidecars — the coherent unit the builder writes).
 fn build_cache_paths(lw: &Path) -> (PathBuf, PathBuf) {
@@ -2212,6 +2408,78 @@ impl RecipeCheckRunner {
         Ok(())
     }
 
+    /// `gc-store`'s body, under the ladder lock the CLI holds exclusive. Three passes
+    /// over the ladder's reusable state, oldest evidence first: the memos used within
+    /// the window name the roots a memo hit would stage; the builder's
+    /// `store-gc-unused` keeps the closure of those and of every receipt used within
+    /// it, and reclaims the rest of the cache under its own commit lock; then the memo
+    /// dirs drop what was unused that long. The order matters only for a crash: a memo
+    /// that outlives its trees is a miss the reuse path already handles, while a tree
+    /// that outlives its memo is plain unreclaimed disk the next run takes.
+    ///
+    /// The seed store is not touched: it is pinned by the compiled digest table, not by
+    /// use, and `clear-store` is the one thing that resets it.
+    ///
+    /// LADDER_LOCK is the exclusive ladder lock the CLI holds. The sweeping builder gets
+    /// a dup of it as its stdin: a flock belongs to the open file description, which a
+    /// dup shares and an exec keeps, so the ladder stays held while the child runs even
+    /// if this process is killed under it — otherwise a killed `gc-store` would release
+    /// the ladder to new builds while its child was still deleting trees they copy
+    /// under no other lock. The child reads nothing from it; its roots go by file.
+    fn gc_store(&self, opts: &GcStoreArgs, ladder_lock: &File) -> Result<(), String> {
+        let window = std::time::Duration::from_secs(opts.unused_for_days.saturating_mul(86_400));
+        let cutoff = std::time::SystemTime::now()
+            .checked_sub(window)
+            .ok_or_else(|| format!("--unused-for {} is out of range", opts.unused_for_days))?;
+        let build_run_memos = self.lw.join("build-run-memo");
+        let check_memos = self.lw.join("check-memo");
+        let roots = fresh_build_run_memo_roots(&build_run_memos, cutoff)?;
+        println!(
+            "gc-store: keeping what was used in the last {} day(s); {} build-run memo \
+             outputs are roots",
+            opts.unused_for_days,
+            roots.len()
+        );
+        // The roots travel by a file in this run's claimed scratch, the one place that
+        // is ours to write under the shared ladder.
+        fs::create_dir_all(&self.scratch)
+            .map_err(|e| format!("mkdir {}: {e}", self.scratch.display()))?;
+        let roots_file = self.scratch.join("gc-roots");
+        let mut text = roots.join("\n");
+        text.push('\n');
+        fs::write(&roots_file, text).map_err(|e| format!("write {}: {e}", roots_file.display()))?;
+        let held = ladder_lock
+            .try_clone()
+            .map_err(|e| format!("dup the ladder lock for the sweep: {e}"))?;
+        let (cache_store, cache_db) = self.build_cache_paths();
+        let mut cmd = self.builder_command();
+        cmd.arg("store-gc-unused")
+            .arg(path_str(&cache_store)?)
+            .arg(path_str(&cache_db)?)
+            .arg(opts.unused_for_days.to_string())
+            .arg("--roots")
+            .arg(path_str(&roots_file)?)
+            .stdin(Stdio::from(held));
+        if opts.dry_run {
+            cmd.arg("--dry-run");
+        }
+        let report = command_output_reporting_stderr(&mut cmd, "store-gc-unused")?;
+        print!("{report}");
+        let (maps, stale_maps) =
+            reap_stale_records(&build_run_memos, ".map", cutoff, opts.dry_run)?;
+        let (passes, stale_passes) =
+            reap_stale_records(&check_memos, ".pass", cutoff, opts.dry_run)?;
+        let verb = if opts.dry_run { "would remove" } else { "removed" };
+        println!(
+            "gc-store: {maps} build-run memos, {stale_maps} unused {verb}; \
+             {passes} check verdict memos, {stale_passes} unused {verb}"
+        );
+        if opts.dry_run {
+            println!("gc-store: dry run — nothing changed");
+        }
+        Ok(())
+    }
+
     /// Every pin table's seed db on this ladder, sorted so a failure names the same one
     /// run to run. Dotfiles are skipped: the table generator and cold-seed candidate
     /// paths keep their disposable dbs here too, and neither is authority.
@@ -2320,7 +2588,8 @@ impl RecipeCheckRunner {
     /// it — so a crash mid-reclaim leaves only a stale tombstone (reaped next setup), never a
     /// torn store/db/receipts triple. Content-addressing makes eviction safe: an evicted rung
     /// cold-climbs on next need, never mis-reuses. All-or-nothing, so a steady-state union
-    /// over the cap re-evicts every setup; a low-watermark retention GC is the follow-up.
+    /// over the cap re-evicts every setup; the retention reclaim that keeps what builds
+    /// still use is the explicit `gc-store` (`RecipeCheckRunner::gc_store`).
     fn evict_build_cache_if_over_watermark(&self, cap: u64) -> Result<(), String> {
         // Take the SAME stable commit lock the builder holds during a commit, held across reap +
         // size + rename + reap, so eviction never renames the cache out from under an uncovered
@@ -3581,9 +3850,15 @@ impl RecipeCheckRunner {
     /// Whether `key` has a recorded pass: the file exists and its header names
     /// the key, the name alone being one rename away from a lie.
     fn check_verdict_memoized(&self, stem: &str, index: usize, key: &str) -> bool {
-        fs::read_to_string(self.check_verdict_memo_path(stem, index, key))
+        let path = self.check_verdict_memo_path(stem, index, key);
+        let hit = fs::read_to_string(&path)
             .ok()
-            .is_some_and(|text| parse_check_verdict_memo(&text, key))
+            .is_some_and(|text| parse_check_verdict_memo(&text, key));
+        if hit {
+            // The skip this buys is what `gc-store` keeps the memo for; say so.
+            td_engine::cache_use::stamp(&path);
+        }
+        hit
     }
 
     /// Drop the recorded pass for `key`, if any, ahead of a run that will earn
@@ -3601,8 +3876,9 @@ impl RecipeCheckRunner {
 
     /// Publish a pass for `key`: temp then rename, the temp qualified by this
     /// run's claimed scratch name for the reason `write_build_run_memo` gives.
-    /// Per-key files sit side by side and are never reaped, as the build-run
-    /// maps are: a stale one is inert, and `clear-store` removes them all.
+    /// Per-key files sit side by side and no run reaps them, as with the
+    /// build-run maps: a stale one is inert, `clear-store` removes them all, and
+    /// `gc-store` removes the ones no check has read within its window.
     fn write_check_verdict_memo(&self, stem: &str, index: usize, key: &str) -> Result<(), String> {
         let dir = self.lw.join("check-memo");
         fs::create_dir_all(&dir).map_err(|e| format!("mkdir {}: {e}", dir.display()))?;
@@ -3663,8 +3939,9 @@ impl RecipeCheckRunner {
             // the builder prints a rung's `STEP` line only AFTER its durable
             // persist-cache commit finishes, and a committed base is
             // content-addressed and hence immutable — so a memoized base was fully
-            // committed and its bytes can only be removed wholesale (eviction /
-            // clear-store under the ladder lock), never torn in place. Use
+            // committed and its bytes can only be removed wholesale (eviction and
+            // clear-store move the cache aside; gc-store renames each tree aside
+            // before deleting it; all under the ladder lock), never torn in place. Use
             // `symlink_metadata` (lstat, does NOT follow) not `Path::is_dir` (which
             // follows): a symlink squatting the basename must be REJECTED, not
             // followed — else `copy_tree` would recreate the link and stage an
@@ -3679,6 +3956,10 @@ impl RecipeCheckRunner {
             }
             sources.push((base.clone(), src));
         }
+        // A hit. Stamp the memo: `gc-store` keeps every tree a memo used within its
+        // window names, which is what lets an unchanged plan keep hitting here after
+        // a reclaim, when no rung reuse has touched a receipt of this closure.
+        td_engine::cache_use::stamp(&self.build_run_memo_path(target, fingerprint));
         // Pass 2: stage each as an INDEPENDENT copy (never a hardlink/symlink).
         // Copy into a temp then rename, so a kill mid-copy never leaves a torn tree
         // a later read would trust as complete. The temp name is static (not
@@ -3751,15 +4032,16 @@ impl RecipeCheckRunner {
         // winner can publish the OTHER's bytes under its own fingerprint, which
         // `parse_build_run_memo` then rejects on read and turns into a full climb.
         // The orphan a crash leaves is inert exactly as a stale `.map` is (its name
-        // is never looked up), and is cleaned by the same wholesale `clear-store`.
+        // is never looked up), and is cleaned by the same `clear-store` or `gc-store`.
         //
-        // The published `.map` is per fingerprint and is NOT reaped: `lw` (hence
+        // The published `.map` is per fingerprint and no RUN reaps it: `lw` (hence
         // this dir) is shared across all worktrees, whose distinct evaluator
         // binaries fingerprint differently, so deleting other-fingerprint maps
         // would clobber a concurrent worktree's live memo. Per-fingerprint maps sit
         // side by side (mirroring the loop-userland map, check_loop.rs); a stale one
         // is inert (its fingerprint never matches, so it is never read) and is
-        // cleaned only wholesale by `clear-store`.
+        // cleaned wholesale by `clear-store`, or by `gc-store` once nothing has
+        // read it for the window — which is why a hit stamps the map it read.
         // Qualified by this run's CLAIMED SCRATCH NAME, not by its pid: the pid is
         // namespace-local and two sandboxed runs share one (see `claim_scratch`),
         // which would put them back on a single temp name. The claim makes the
@@ -8341,6 +8623,7 @@ chmod 755 '{}'
         let whole_ladder: std::collections::BTreeSet<&str> = [
             "clear_ladder",
             "verify_store_cli",
+            "gc_store_cli",
             "seed_digests_cli",
             "ladder_lock_mode",
             "lock_ladder",
@@ -8925,6 +9208,154 @@ chmod 755 '{}'
         assert_eq!(parse_build_run_memo(evil, "deadbeef"), None);
     }
 
+    fn gc_args(args: &[&str]) -> Result<GcStoreArgs, String> {
+        parse_gc_store_args(&args.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+    }
+
+    // The window is required and whole; zero is `clear-store` and is refused by name.
+    #[test]
+    fn gc_store_args_require_a_positive_window() {
+        assert_eq!(
+            gc_args(&["--unused-for", "14"]).unwrap(),
+            GcStoreArgs { unused_for_days: 14, dry_run: false }
+        );
+        assert_eq!(
+            gc_args(&["--dry-run", "--unused-for", "1"]).unwrap(),
+            GcStoreArgs { unused_for_days: 1, dry_run: true }
+        );
+        assert!(gc_args(&[]).unwrap_err().contains("--unused-for DAYS is required"));
+        assert!(gc_args(&["--unused-for"]).unwrap_err().contains("needs DAYS"));
+        assert!(gc_args(&["--unused-for", "0"]).unwrap_err().contains("clear-store"));
+        assert!(gc_args(&["--unused-for", "1.5"]).unwrap_err().contains("whole number"));
+        assert!(gc_args(&["--unused-for", "2", "--unused-for", "3"]).unwrap_err().contains("twice"));
+        assert!(gc_args(&["--unused-for", "2", "--force"]).unwrap_err().contains("unknown argument"));
+    }
+
+    fn set_times(path: &Path, accessed: std::time::SystemTime, modified: std::time::SystemTime) {
+        File::open(path)
+            .unwrap()
+            .set_times(
+                std::fs::FileTimes::new()
+                    .set_accessed(accessed)
+                    .set_modified(modified),
+            )
+            .unwrap();
+    }
+
+    // Roots come only from memos used within the window, read the way the reuse path
+    // reads them: a stale memo, a staging temp, a directory wearing a memo's name, a
+    // memo that is not UTF-8, and a memo whose header disagrees with its name
+    // contribute nothing; an old memo a reader touched (atime) still counts; and the
+    // reading itself leaves every memo's last use exactly as it found it.
+    #[test]
+    fn fresh_build_run_memo_roots_reads_only_recently_used_memos() {
+        let d = env::temp_dir().join(format!("td-gc-memo-roots-{}", process::id()));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(&d).unwrap();
+        let now = std::time::SystemTime::now();
+        let old = now - std::time::Duration::from_secs(30 * 86_400);
+        let cutoff = now - std::time::Duration::from_secs(7 * 86_400);
+        let write = |name: &str, text: &[u8], atime, mtime| {
+            let p = d.join(name);
+            fs::write(&p, text).unwrap();
+            set_times(&p, atime, mtime);
+        };
+        write("system-x86-64.aaaa.map", b"fingerprint aaaa\ngcc xxx-gcc\nglibc yyy-glibc\n", old, now);
+        write("td-sh-test.bbbb.map", b"fingerprint bbbb\ntd-sh zzz-td-sh\n", now, old);
+        write("system-x86-64.cccc.map", b"fingerprint cccc\ngcc old-gcc\n", old, old);
+        write("system-x86-64.dddd.map", b"fingerprint mismatch\ngcc lie-gcc\n", now, now);
+        // Fresh, but old enough that a plain read would refresh the atime (relatime
+        // does once atime trails mtime or a day): the read fails on the bytes, and a
+        // failed read must leave no more of a trace than a successful one.
+        let recent = now - std::time::Duration::from_secs(2 * 86_400);
+        write("system-x86-64.eeee.map", b"fingerprint eeee\ngcc \xff\xfe-gcc\n", recent, recent);
+        write(".system-x86-64.ffff.run-1.tmp", b"fingerprint ffff\ngcc tmp-gcc\n", now, now);
+        write("noise.txt", b"gcc noise-gcc\n", now, now);
+        write("custom.map", b"fingerprint custom\ngcc custom-gcc\n", now, now);
+        fs::create_dir_all(d.join("system-x86-64.gggg.map")).unwrap();
+        let judged = [
+            "system-x86-64.aaaa.map",
+            "td-sh-test.bbbb.map",
+            "system-x86-64.cccc.map",
+            "system-x86-64.eeee.map",
+        ];
+        let before: Vec<_> = judged.iter().map(|n| last_used(&d.join(n)).unwrap()).collect();
+        assert_eq!(
+            fresh_build_run_memo_roots(&d, cutoff).unwrap(),
+            vec!["xxx-gcc".to_string(), "yyy-glibc".to_string(), "zzz-td-sh".to_string()]
+        );
+        let after: Vec<_> = judged.iter().map(|n| last_used(&d.join(n)).unwrap()).collect();
+        assert_eq!(before, after, "judging and reading the memos was not a use of them");
+        assert_eq!(after.get(3), Some(&Some(recent)), "the unreadable memo's last use stands");
+        assert_eq!(fresh_build_run_memo_roots(&d.join("absent"), cutoff).unwrap(), Vec::<String>::new());
+        fs::remove_dir_all(&d).ok();
+    }
+
+    // The memo dirs are reaped by the same last-use rule: a memo of the dir's kind or a
+    // crashed run's staging temp, and nothing else — not a file of another kind, a
+    // subdirectory, or a symlink. Temps are reaped but are not memos and go uncounted;
+    // a dry run counts and removes nothing.
+    #[test]
+    fn reap_stale_records_removes_only_unused_memos_and_temps() {
+        let d = env::temp_dir().join(format!("td-gc-reap-{}", process::id()));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(d.join("subdir.pass")).unwrap();
+        let now = std::time::SystemTime::now();
+        let old = now - std::time::Duration::from_secs(30 * 86_400);
+        let cutoff = now - std::time::Duration::from_secs(7 * 86_400);
+        for (name, atime, mtime) in [
+            ("td-sh-test.1.fresh.pass", old, now),
+            ("td-sh-test.1.read.pass", now, old),
+            ("td-sh-test.1.stale.pass", old, old),
+            (".td-sh-test.1.stale.run-1.tmp", old, old),
+            (".td-sh-test.1.fresh.run-2.tmp", now, now),
+            ("README", old, old),
+            ("notes.pass", old, old),
+            ("other.map", old, old),
+        ] {
+            let p = d.join(name);
+            fs::write(&p, "fingerprint x\nverdict pass\n").unwrap();
+            set_times(&p, atime, mtime);
+        }
+        symlink(d.join("td-sh-test.1.stale.pass"), d.join("link.pass")).unwrap();
+        assert_eq!(reap_stale_records(&d, ".pass", cutoff, true).unwrap(), (3, 1));
+        assert!(d.join("td-sh-test.1.stale.pass").exists(), "dry run removes nothing");
+        assert!(d.join(".td-sh-test.1.stale.run-1.tmp").exists());
+        assert_eq!(reap_stale_records(&d, ".pass", cutoff, false).unwrap(), (3, 1));
+        assert!(d.join("td-sh-test.1.fresh.pass").exists());
+        assert!(d.join("td-sh-test.1.read.pass").exists(), "an atime is a use");
+        assert!(!d.join("td-sh-test.1.stale.pass").exists());
+        assert!(!d.join(".td-sh-test.1.stale.run-1.tmp").exists(), "a crashed run's temp goes");
+        assert!(d.join(".td-sh-test.1.fresh.run-2.tmp").exists(), "a fresh temp may be live");
+        assert!(d.join("README").exists() && d.join("other.map").exists(), "not this dir's memos");
+        assert!(d.join("notes.pass").exists(), "no key before the suffix: not a memo either");
+        assert!(d.join("subdir.pass").is_dir());
+        assert!(fs::symlink_metadata(d.join("link.pass")).is_ok(), "a symlink is not a memo");
+        assert_eq!(reap_stale_records(&d, ".pass", cutoff, false).unwrap(), (2, 0));
+        assert_eq!(reap_stale_records(&d.join("absent"), ".pass", cutoff, false).unwrap(), (0, 0));
+        fs::remove_dir_all(&d).ok();
+    }
+
+    // A verdict hit stamps its memo, so `gc-store` sees the skip it keeps buying; a
+    // miss (a memo for another key) leaves the file's mtime where it was.
+    #[test]
+    fn check_verdict_hit_stamps_its_memo_and_a_miss_does_not() {
+        let lw = env::temp_dir().join(format!("td-verdict-stamp-{}", process::id()));
+        let _ = fs::remove_dir_all(&lw);
+        let runner = shared_test_runner(&lw);
+        runner.write_check_verdict_memo("td-sh-test", 1, "k1").unwrap();
+        let memo = runner.check_verdict_memo_path("td-sh-test", 1, "k1");
+        let old = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        set_times(&memo, old, old);
+        let mtime = |p: &Path| fs::symlink_metadata(p).unwrap().modified().unwrap();
+        assert!(!runner.check_verdict_memoized("td-sh-test", 1, "k2"), "another key: a miss");
+        assert_eq!(mtime(&memo), old, "a miss is not a use");
+        assert!(runner.check_verdict_memoized("td-sh-test", 1, "k1"));
+        assert!(mtime(&memo) > old, "a hit stamps the memo it read");
+        assert_eq!(fs::read_to_string(&memo).unwrap(), serialize_check_verdict_memo("k1"));
+        let _ = fs::remove_dir_all(&lw);
+    }
+
     // The STEP map takes the LAST line for a stem (matching ladder_out_from) and
     // keeps only the basename; a malformed/traversal STEP path is dropped.
     #[test]
@@ -9122,9 +9553,14 @@ chmod 755 '{}'
         runner
             .write_build_run_memo("system-x86-64", "fp1", &steps)
             .unwrap();
+        // Dated long ago: a hit must stamp it as used (what `gc-store` keeps it by).
+        let memo = runner.build_run_memo_path("system-x86-64", "fp1");
+        let long_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(40 * 86_400);
+        set_times(&memo, long_ago, long_ago);
+        let mtime = |p: &Path| fs::symlink_metadata(p).unwrap().modified().unwrap();
 
         // HIT: both outputs staged into tdstore, as independent copies (mutating the
-        // staged copy does NOT touch the durable cache tree).
+        // staged copy does NOT touch the durable cache tree), and the memo stamped.
         let staged = runner
             .reuse_build_run("system-x86-64", "fp1", &["system-x86-64", "linux-x86-64"])
             .unwrap()
@@ -9134,6 +9570,8 @@ chmod 755 '{}'
             staged,
             vec![tdstore.join("aaa-system"), tdstore.join("bbb-linux")]
         );
+        assert!(mtime(&memo) > long_ago, "a hit stamps the memo it staged from");
+        set_times(&memo, long_ago, long_ago);
         assert_eq!(fs::read(tdstore.join("aaa-system").join("file")).unwrap(), b"SYS");
         fs::write(tdstore.join("aaa-system").join("file"), b"TAMPERED").unwrap();
         assert_eq!(
@@ -9147,17 +9585,19 @@ chmod 755 '{}'
             .reuse_build_run("system-x86-64", "fp2", &["system-x86-64"])
             .unwrap()
             .is_none());
-        // MISS: a requested output not recorded in the memo.
+        // MISS: a requested output not recorded in the memo — and a miss is not a use.
         assert!(runner
             .reuse_build_run("system-x86-64", "fp1", &["busybox-x86-64"])
             .unwrap()
             .is_none());
+        assert_eq!(mtime(&memo), long_ago, "a miss leaves the memo unstamped");
         // MISS: the durable cache tree was evicted since it was recorded.
         fs::remove_dir_all(cache_store.join("bbb-linux")).unwrap();
         assert!(runner
             .reuse_build_run("system-x86-64", "fp1", &["linux-x86-64"])
             .unwrap()
             .is_none());
+        assert_eq!(mtime(&memo), long_ago, "an evicted tree is a miss, not a use");
         // MISS: a non-directory squats the recorded basename (corruption) — a bare
         // `exists()` would accept it; the real-dir gate rejects it and rebuilds.
         fs::write(cache_store.join("bbb-linux"), b"not-a-dir").unwrap();

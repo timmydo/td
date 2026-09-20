@@ -18,6 +18,10 @@
 //!   clear-store           reset the ladder work dir (seed store/db + shared
 //!                         build-cache); the next build re-derives seeds and
 //!                         cold-climbs. The only path that clears persisted state
+//!   gc-store --unused-for DAYS [--dry-run]
+//!                         reclaim shared build-cache entries and memos nothing
+//!                         has used for DAYS days; what a recent build reused
+//!                         stays, with everything it references
 //!   compose-iso OUTPUT KERNEL INITRAMFS [ISO-NAME=FILE ...]
 //!                         stream built inputs into a retained hybrid ISO;
 //!                         no build, signing, device access or live-profile creation
@@ -313,6 +317,12 @@ fn main() {
                 die_runner(&e);
             }
         }
+        Some("gc-store") => {
+            let rest = args.get(2..).unwrap_or(&[]);
+            if let Err(e) = check_runner::gc_store_cli(rest) {
+                die_runner(&e);
+            }
+        }
         Some("clear-store") => {
             let rest = args.get(2..).unwrap_or(&[]);
             if let Err(e) = check_runner::clear_store_cli(rest) {
@@ -490,7 +500,7 @@ fn main() {
                 die(&e);
             }
         }
-        _ => die("usage: td-recipe-eval list|emit|check-list|check-count|check-script|check-run|build-run|clear-store|qemu-secret|qemu-secret-system|qemu-boot|qemu-boot-uefi|qemu-boot-media|qemu-install|qemu-install-system|compose-iso|qemu-boot-erofs|qemu-boot-system|qemu-update|qemu-boot-net|qemu-boot-kexec|run|bundle|warm|verify-store|payload-closure|application-closure|vendor-warm-args|source-pins|source-pin|ostree-pins|ostree-pin|seed-digests|local-source-roster ..."),
+        _ => die("usage: td-recipe-eval list|emit|check-list|check-count|check-script|check-run|build-run|clear-store|gc-store|qemu-secret|qemu-secret-system|qemu-boot|qemu-boot-uefi|qemu-boot-media|qemu-install|qemu-install-system|compose-iso|qemu-boot-erofs|qemu-boot-system|qemu-update|qemu-boot-net|qemu-boot-kexec|run|bundle|warm|verify-store|payload-closure|application-closure|vendor-warm-args|source-pins|source-pin|ostree-pins|ostree-pin|seed-digests|local-source-roster ..."),
     }
 }
 

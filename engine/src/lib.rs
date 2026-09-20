@@ -47,6 +47,11 @@
 // to write, and no target binary includes it.
 pub mod application;
 pub mod application_spec;
+// `cache_use` is the last-use rule the build cache's reclaim reads: td-builder
+// stamps a receipt at a warm hit, td-recipe-eval a memo, and `gc-store` judges
+// both by it — one module so the two writers and the one reader cannot drift.
+// Control-plane only: no target binary includes it.
+pub mod cache_use;
 pub mod cpio;
 pub mod crc32;
 pub mod ed25519;
