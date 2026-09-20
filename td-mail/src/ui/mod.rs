@@ -168,7 +168,7 @@ fn spawn_connector() -> Sender<ConnectRequest> {
                         account.name,
                         e
                     );
-                    BackendCommand::ConnectFailed
+                    BackendCommand::ConnectFailed(e)
                 }
             };
             let _ = cmd_tx.send(decision);

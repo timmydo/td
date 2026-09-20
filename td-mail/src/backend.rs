@@ -139,9 +139,11 @@ pub enum BackendCommand {
     /// below decides where they are answered from, and goes online here,
     /// replaying what the cache queued.
     Connect(Box<JmapClient>),
-    /// The connection could not be made: the held commands are answered
-    /// from the cache, as the rest are until the account is opened again.
-    ConnectFailed,
+    /// The connection could not be made, and why: the held commands are
+    /// answered from the cache, as the rest are until the account is
+    /// opened again, and every answer the cache cannot give names the
+    /// reason.
+    ConnectFailed(String),
     Shutdown,
 }
 
@@ -597,7 +599,7 @@ impl From<&RetentionPolicySnapshot> for RetentionPolicyConfig {
 }
 
 fn queue_mutation(cache: Option<&Cache>, op: &QueuedMutation) -> Result<u64, String> {
-    let cache = cache.ok_or_else(|| "cache unavailable (offline mode)".to_string())?;
+    let cache = cache.ok_or_else(|| "cache unavailable".to_string())?;
     // Writing a value cannot fail, so queueing has no serialize error.
     cache.enqueue_operation(&op.to_json().to_vec())
 }
@@ -795,13 +797,38 @@ pub fn spawn(
     (cmd_tx, resp_rx)
 }
 
-/// Handle a command in offline mode. Returns true to continue, false to break (shutdown).
+/// An answer that could not be served offline: `what`, and the reason
+/// the backend is offline when a connection was tried and failed, so a
+/// window shows why and not only that.
+fn offline_error(what: &str, reason: Option<&str>) -> String {
+    match reason {
+        Some(reason) => format!("{what} (offline mode: {reason})"),
+        None => format!("{what} (offline mode)"),
+    }
+}
+
+/// Queues a mutation for the connection and applies its local projection;
+/// a queue that refuses names why the backend is offline with the refusal.
+fn queue_offline(
+    cache: Option<&Cache>,
+    op: &QueuedMutation,
+    reason: Option<&str>,
+) -> Result<(), String> {
+    queue_mutation(cache, op)
+        .map(|_| apply_local_mutation(cache, op))
+        .map_err(|e| offline_error(&e, reason))
+}
+
+/// Handle a command in offline mode. Returns true to continue, false to
+/// break (shutdown). `reason` is why the connection failed, when one was
+/// tried; none for a session that asked to be offline.
 fn handle_offline_command(
     cmd: &BackendCommand,
     resp_tx: &mpsc::Sender<BackendResponse>,
     cache: &Option<Cache>,
     cached_mailboxes: &mut Vec<Mailbox>,
     command_seq: u64,
+    reason: Option<&str>,
 ) -> bool {
     match cmd {
         BackendCommand::FetchMailboxes { origin } => {
@@ -816,13 +843,13 @@ fn handle_offline_command(
                         *cached_mailboxes = mboxes.clone();
                         Ok(mboxes)
                     } else {
-                        Err("no cached mailboxes available (offline mode)".to_string())
+                        Err(offline_error("no cached mailboxes available", reason))
                     }
                 } else {
-                    Err("no cached mailboxes available (offline mode)".to_string())
+                    Err(offline_error("no cached mailboxes available", reason))
                 }
             } else {
-                Err("cache unavailable (offline mode)".to_string())
+                Err(offline_error("cache unavailable", reason))
             };
             let _ = resp_tx.send(BackendResponse::Mailboxes(result));
         }
@@ -849,7 +876,7 @@ fn handle_offline_command(
             {
                 let _ = resp_tx.send(BackendResponse::Emails {
                     mailbox_id: mailbox_id.clone(),
-                    emails: Err("search and pagination not available in offline mode".to_string()),
+                    emails: Err(offline_error("search and pagination not available", reason)),
                     total: None,
                     position: *position,
                     loaded: 0,
@@ -879,7 +906,7 @@ fn handle_offline_command(
             } else {
                 let _ = resp_tx.send(BackendResponse::Emails {
                     mailbox_id: mailbox_id.clone(),
-                    emails: Err("cache unavailable (offline mode)".to_string()),
+                    emails: Err(offline_error("cache unavailable", reason)),
                     total: None,
                     position: 0,
                     loaded: 0,
@@ -893,10 +920,10 @@ fn handle_offline_command(
                     log_debug!("[Backend/offline] Cache hit for email {}", id);
                     Ok(email)
                 } else {
-                    Err("email not cached (offline mode)".to_string())
+                    Err(offline_error("email not cached", reason))
                 }
             } else {
-                Err("cache unavailable (offline mode)".to_string())
+                Err(offline_error("cache unavailable", reason))
             };
             let _ = resp_tx.send(BackendResponse::EmailBody {
                 id: id.clone(),
@@ -908,10 +935,10 @@ fn handle_offline_command(
                 if let Some(email) = cache.get_email(id) {
                     Ok(email)
                 } else {
-                    Err("email not cached (offline mode)".to_string())
+                    Err(offline_error("email not cached", reason))
                 }
             } else {
-                Err("cache unavailable (offline mode)".to_string())
+                Err(offline_error("cache unavailable", reason))
             };
             let _ = resp_tx.send(BackendResponse::EmailForReply {
                 id: id.clone(),
@@ -922,16 +949,14 @@ fn handle_offline_command(
             return false;
         }
         // The loop takes the connection's decision before it gets here.
-        BackendCommand::Connect(_) | BackendCommand::ConnectFailed => {}
+        BackendCommand::Connect(_) | BackendCommand::ConnectFailed(_) => {}
         // Offline mutations: queue and apply local projection.
         BackendCommand::MarkEmailRead { op_id, id, .. } => {
             let op = QueuedMutation::MarkRead {
                 op_id: *op_id,
                 id: id.clone(),
             };
-            let result = queue_mutation(cache.as_ref(), &op).map(|_| {
-                apply_local_mutation(cache.as_ref(), &op);
-            });
+            let result = queue_offline(cache.as_ref(), &op, reason);
             let _ = resp_tx.send(BackendResponse::EmailMutation {
                 op_id: *op_id,
                 id: id.clone(),
@@ -944,9 +969,7 @@ fn handle_offline_command(
                 op_id: *op_id,
                 id: id.clone(),
             };
-            let result = queue_mutation(cache.as_ref(), &op).map(|_| {
-                apply_local_mutation(cache.as_ref(), &op);
-            });
+            let result = queue_offline(cache.as_ref(), &op, reason);
             let _ = resp_tx.send(BackendResponse::EmailMutation {
                 op_id: *op_id,
                 id: id.clone(),
@@ -962,9 +985,7 @@ fn handle_offline_command(
                 id: id.clone(),
                 flagged: *flagged,
             };
-            let result = queue_mutation(cache.as_ref(), &op).map(|_| {
-                apply_local_mutation(cache.as_ref(), &op);
-            });
+            let result = queue_offline(cache.as_ref(), &op, reason);
             let _ = resp_tx.send(BackendResponse::EmailMutation {
                 op_id: *op_id,
                 id: id.clone(),
@@ -982,9 +1003,7 @@ fn handle_offline_command(
                 id: id.clone(),
                 to_mailbox_id: to_mailbox_id.clone(),
             };
-            let result = queue_mutation(cache.as_ref(), &op).map(|_| {
-                apply_local_mutation(cache.as_ref(), &op);
-            });
+            let result = queue_offline(cache.as_ref(), &op, reason);
             let _ = resp_tx.send(BackendResponse::EmailMutation {
                 op_id: *op_id,
                 id: id.clone(),
@@ -1002,9 +1021,7 @@ fn handle_offline_command(
                 thread_id: thread_id.clone(),
                 to_mailbox_id: to_mailbox_id.clone(),
             };
-            let result = queue_mutation(cache.as_ref(), &op).map(|_| {
-                apply_local_mutation(cache.as_ref(), &op);
-            });
+            let result = queue_offline(cache.as_ref(), &op, reason);
             let _ = resp_tx.send(BackendResponse::EmailMutation {
                 op_id: *op_id,
                 id: thread_id.clone(),
@@ -1017,9 +1034,7 @@ fn handle_offline_command(
                 op_id: *op_id,
                 id: id.clone(),
             };
-            let result = queue_mutation(cache.as_ref(), &op).map(|_| {
-                apply_local_mutation(cache.as_ref(), &op);
-            });
+            let result = queue_offline(cache.as_ref(), &op, reason);
             let _ = resp_tx.send(BackendResponse::EmailMutation {
                 op_id: *op_id,
                 id: id.clone(),
@@ -1034,9 +1049,7 @@ fn handle_offline_command(
                 op_id: *op_id,
                 thread_id: thread_id.clone(),
             };
-            let result = queue_mutation(cache.as_ref(), &op).map(|_| {
-                apply_local_mutation(cache.as_ref(), &op);
-            });
+            let result = queue_offline(cache.as_ref(), &op, reason);
             let _ = resp_tx.send(BackendResponse::EmailMutation {
                 op_id: *op_id,
                 id: thread_id.clone(),
@@ -1047,20 +1060,20 @@ fn handle_offline_command(
         BackendCommand::CreateMailbox { name } => {
             let _ = resp_tx.send(BackendResponse::MailboxCreated {
                 name: name.clone(),
-                result: Err("not available in offline mode".to_string()),
+                result: Err(offline_error("not available", reason)),
             });
         }
         BackendCommand::DeleteMailbox { name, .. } => {
             let _ = resp_tx.send(BackendResponse::MailboxDeleted {
                 name: name.clone(),
-                result: Err("not available in offline mode".to_string()),
+                result: Err(offline_error("not available", reason)),
             });
         }
         BackendCommand::QueryThreadEmails { thread_id } => {
             let result = if let Some(cache) = cache {
                 Ok(cache.get_thread_emails(thread_id))
             } else {
-                Err("cache unavailable (offline mode)".to_string())
+                Err(offline_error("cache unavailable", reason))
             };
             let _ = resp_tx.send(BackendResponse::ThreadEmails {
                 thread_id: thread_id.clone(),
@@ -1075,9 +1088,7 @@ fn handle_offline_command(
                 thread_id: thread_id.clone(),
                 email_ids: email_ids.clone(),
             };
-            let result = queue_mutation(cache.as_ref(), &op).map(|_| {
-                apply_local_mutation(cache.as_ref(), &op);
-            });
+            let result = queue_offline(cache.as_ref(), &op, reason);
             let _ = resp_tx.send(BackendResponse::ThreadMarkedRead {
                 thread_id: thread_id.clone(),
                 result: result.map(|_| ()),
@@ -1101,9 +1112,7 @@ fn handle_offline_command(
                         .count()
                 })
                 .unwrap_or(0);
-            let result = queue_mutation(cache.as_ref(), &op).map(|_| {
-                apply_local_mutation(cache.as_ref(), &op);
-            });
+            let result = queue_offline(cache.as_ref(), &op, reason);
             let _ = resp_tx.send(BackendResponse::MailboxMarkedRead {
                 mailbox_id: mailbox_id.clone(),
                 mailbox_name: mailbox_name.clone(),
@@ -1114,31 +1123,31 @@ fn handle_offline_command(
         BackendCommand::GetEmailRawHeaders { id } => {
             let _ = resp_tx.send(BackendResponse::EmailRawHeaders {
                 id: id.clone(),
-                result: Err("not available in offline mode".to_string()),
+                result: Err(offline_error("not available", reason)),
             });
         }
         BackendCommand::GetEmailRaw { id } => {
             let _ = resp_tx.send(BackendResponse::EmailRaw {
                 id: id.clone(),
-                result: Err("not available in offline mode".to_string()),
+                result: Err(offline_error("not available", reason)),
             });
         }
         BackendCommand::DownloadAttachment { name, .. } => {
             let _ = resp_tx.send(BackendResponse::AttachmentDownloaded {
                 name: name.clone(),
-                result: Err("not available in offline mode".to_string()),
+                result: Err(offline_error("not available", reason)),
             });
         }
         BackendCommand::PreviewRetentionExpiry { .. } => {
             let _ = resp_tx.send(BackendResponse::RetentionPreview {
-                result: Err("not available in offline mode".to_string()),
+                result: Err(offline_error("not available", reason)),
             });
         }
         BackendCommand::ExecuteRetentionExpiry { policies } => {
             let op = QueuedMutation::ExecuteRetentionExpiry {
                 policies: policies.iter().map(RetentionPolicySnapshot::from).collect(),
             };
-            let result = queue_mutation(cache.as_ref(), &op).map(|_| ());
+            let result = queue_offline(cache.as_ref(), &op, reason);
             let _ = resp_tx.send(BackendResponse::RetentionExecuted {
                 result: result.map(|_| RetentionExecutionResult {
                     deleted: 0,
@@ -1154,7 +1163,7 @@ fn handle_offline_command(
             let _ = resp_tx.send(BackendResponse::RulesDryRun {
                 mailbox_id: mailbox_id.clone(),
                 mailbox_name: mailbox_name.clone(),
-                result: Err("not available in offline mode".to_string()),
+                result: Err(offline_error("not available", reason)),
             });
         }
         BackendCommand::RunRulesForMailbox {
@@ -1165,7 +1174,7 @@ fn handle_offline_command(
             let op = QueuedMutation::RunRulesForMailbox {
                 mailbox_id: mailbox_id.clone(),
             };
-            let result = queue_mutation(cache.as_ref(), &op).map(|_| ());
+            let result = queue_offline(cache.as_ref(), &op, reason);
             let _ = resp_tx.send(BackendResponse::RulesRun {
                 mailbox_id: mailbox_id.clone(),
                 mailbox_name: mailbox_name.clone(),
@@ -1180,24 +1189,30 @@ fn handle_offline_command(
             // Training fetches the raw message over the network; unavailable offline.
             let _ = resp_tx.send(BackendResponse::MessageTrained {
                 spam: *spam,
-                result: Err("training requires an online connection".to_string()),
+                result: Err(offline_error("training requires a connection", reason)),
             });
         }
         BackendCommand::TrainMailbox { spam, .. } => {
             let _ = resp_tx.send(BackendResponse::MailboxTrained {
                 spam: *spam,
-                result: Err("training requires an online connection".to_string()),
+                result: Err(offline_error("training requires a connection", reason)),
             });
         }
         BackendCommand::ClassifyMailbox { .. } => {
             let _ = resp_tx.send(BackendResponse::MailboxClassified {
-                result: Err("classification requires an online connection".to_string()),
+                result: Err(offline_error(
+                    "classification requires a connection",
+                    reason,
+                )),
             });
         }
         BackendCommand::ClassifyMessage { id, .. } => {
             let _ = resp_tx.send(BackendResponse::MessageClassified {
                 id: id.clone(),
-                result: Err("classification requires an online connection".to_string()),
+                result: Err(offline_error(
+                    "classification requires a connection",
+                    reason,
+                )),
             });
         }
     }
@@ -1410,6 +1425,9 @@ fn backend_loop(
     // connection then supersedes, and no fetch fails as offline while
     // the client is connecting.
     let mut held: VecDeque<BackendCommand> = VecDeque::new();
+    // Why the loop is offline, when a connection was tried and failed:
+    // named in every answer served from the cache until one is made.
+    let mut offline_reason: Option<String> = None;
     if let Some(cache) = cache.as_ref() {
         if let Some(mboxes) = cache.get_mailboxes() {
             cached_mailboxes = mboxes;
@@ -1496,11 +1514,15 @@ fn backend_loop(
                 }
                 client = Some(*connected);
                 connecting = false;
+                offline_reason = None;
                 continue;
             }
-            BackendCommand::ConnectFailed => {
-                log_info!("[Backend] cmd#{} ConnectFailed", command_seq);
+            BackendCommand::ConnectFailed(reason) => {
+                log_info!("[Backend] cmd#{} ConnectFailed: {}", command_seq, reason);
                 connecting = false;
+                if client.is_none() {
+                    offline_reason = Some(reason);
+                }
                 continue;
             }
             BackendCommand::Shutdown if connecting => {
@@ -1515,6 +1537,7 @@ fn backend_loop(
                         &cache,
                         &mut cached_mailboxes,
                         command_seq,
+                        offline_reason.as_deref(),
                     );
                 }
                 break;
@@ -1535,7 +1558,14 @@ fn backend_loop(
         }
 
         if client.is_none() {
-            if handle_offline_command(&cmd, &resp_tx, &cache, &mut cached_mailboxes, command_seq) {
+            if handle_offline_command(
+                &cmd,
+                &resp_tx,
+                &cache,
+                &mut cached_mailboxes,
+                command_seq,
+                offline_reason.as_deref(),
+            ) {
                 continue;
             } else {
                 break; // Shutdown
@@ -2398,7 +2428,7 @@ fn backend_loop(
                 let _ = resp_tx.send(BackendResponse::MessageClassified { id, result });
             }
             // The loop takes the connection's decision before it gets here.
-            BackendCommand::Connect(_) | BackendCommand::ConnectFailed => {}
+            BackendCommand::Connect(_) | BackendCommand::ConnectFailed(_) => {}
             BackendCommand::Shutdown => {
                 break;
             }
@@ -3036,7 +3066,9 @@ mod tests {
 
     /// A backend started connecting holds a fetch until the connection is
     /// decided: a failure answers it from the (absent) cache with the
-    /// offline diagnostic; a connection that then lands takes the loop
+    /// offline diagnostic naming the failure, as it answers a mutation,
+    /// a training request and a retention run; a connection that then
+    /// lands takes the loop
     /// online, and the next fetch goes to the server, which is not there,
     /// so the answer is the fetch service's, not the cache's.
     #[test]
@@ -3089,8 +3121,54 @@ mod tests {
             silent(&resp_rx),
             "a held fetch was answered before the connection was decided"
         );
-        cmd_tx.send(BackendCommand::ConnectFailed).unwrap();
-        assert!(answer(&resp_rx).contains("(offline mode)"));
+        cmd_tx
+            .send(BackendCommand::ConnectFailed("no route to host".into()))
+            .unwrap();
+        // The reason is in every answer served offline, so the window
+        // shows why it is on the cache and not only that it is.
+        assert_eq!(
+            answer(&resp_rx),
+            "cache unavailable (offline mode: no route to host)"
+        );
+        cmd_tx
+            .send(BackendCommand::MarkEmailRead {
+                op_id: 7,
+                id: "m1".to_string(),
+            })
+            .unwrap();
+        match resp_rx.recv() {
+            Ok(BackendResponse::EmailMutation { result, .. }) => assert_eq!(
+                result,
+                Err("cache unavailable (offline mode: no route to host)".to_string())
+            ),
+            _ => panic!("expected the mutation's answer"),
+        }
+        cmd_tx
+            .send(BackendCommand::TrainMessage {
+                origin: "test".to_string(),
+                id: "m1".to_string(),
+                spam: true,
+            })
+            .unwrap();
+        match resp_rx.recv() {
+            Ok(BackendResponse::MessageTrained { result, .. }) => assert_eq!(
+                result,
+                Err("training requires a connection (offline mode: no route to host)".to_string())
+            ),
+            _ => panic!("expected the training answer"),
+        }
+        cmd_tx
+            .send(BackendCommand::ExecuteRetentionExpiry {
+                policies: Vec::new(),
+            })
+            .unwrap();
+        match resp_rx.recv() {
+            Ok(BackendResponse::RetentionExecuted { result }) => assert_eq!(
+                result.map(|_| ()),
+                Err("cache unavailable (offline mode: no route to host)".to_string())
+            ),
+            _ => panic!("expected the retention answer"),
+        }
         assert!(silent(&resp_rx), "the burst was held as two fetches");
         cmd_tx
             .send(BackendCommand::Connect(Box::new(

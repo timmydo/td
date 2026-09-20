@@ -147,8 +147,10 @@ The window opens before the first account is connected, so the credential and
 discovery round trips never hold it; the mailbox list loads once the
 connection is decided. If the account cannot be reached (server down, network
 not up yet, placeholder credentials), td-mail lists what its cache holds
-instead of exiting; `a` in the mailbox list, which selects the next account
-and with one account reopens it, retries the connection.
+instead of exiting, and everything it cannot serve from the cache says
+why the connection failed (`... (offline mode: <reason>)`), as the log does;
+`a` in the mailbox list, which selects the next account and with one
+account reopens it, retries the connection.
 
 Optional rules file path defaults to `rules.toml` next to your config; override with `--rules=PATH`.
 
