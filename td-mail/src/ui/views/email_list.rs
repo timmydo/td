@@ -2,17 +2,39 @@ use crate::backend::{BackendCommand, BackendResponse, EmailMutationAction, Rules
 use crate::compose;
 use crate::jmap::types::{Email, Mailbox};
 use crate::rules;
-use crate::tui::input::Key;
-use crate::tui::screen::Terminal;
-use crate::tui::views::email_view::{EmailNavEntry, EmailView};
-use crate::tui::views::help::HelpView;
-use crate::tui::views::rules_preview::RulesPreviewView;
-use crate::tui::views::thread_view::ThreadView;
-use crate::tui::views::{format_system_time, View, ViewAction};
+use crate::ui::input::Key;
+use crate::ui::views::email_view::{EmailNavEntry, EmailView};
+use crate::ui::views::help::HelpView;
+use crate::ui::views::rules_preview::RulesPreviewView;
+use crate::ui::views::thread_view::ThreadView;
+use crate::ui::views::{
+    format_system_time, strip_newlines, Body, Entry, Row, Scene, View, ViewAction,
+};
 use std::collections::{HashMap, HashSet};
-use std::io;
 use std::sync::mpsc;
 use std::time::SystemTime;
+
+/// The action bar's labels for each mode, and the key each stands for; a
+/// click on a label is that key.
+const LIST_LABELS: &[&str] = &[
+    "Read", "Refresh", "Reply", "Archive", "Delete", "Move", "Search", "Compose", "Help", "Back",
+];
+const LIST_KEYS: &[Key] = &[
+    Key::Enter,
+    Key::Char('g'),
+    Key::Char('r'),
+    Key::Char('a'),
+    Key::Char('d'),
+    Key::Char('m'),
+    Key::Char('s'),
+    Key::Char('c'),
+    Key::Char('?'),
+    Key::Char('q'),
+];
+const SEARCH_LABELS: &[&str] = &["Cancel"];
+const SEARCH_KEYS: &[Key] = &[Key::Escape];
+const MOVE_LABELS: &[&str] = &["Move", "Cancel"];
+const MOVE_KEYS: &[Key] = &[Key::Enter, Key::Escape];
 
 enum PendingWriteOp {
     Flag {
@@ -45,7 +67,6 @@ pub struct EmailListView {
     mailbox_id: String,
     mailbox_name: String,
     page_size: u32,
-    scrolloff: usize,
     emails: Vec<Email>,
     cursor: usize,
     total: Option<u32>,
@@ -71,7 +92,6 @@ pub struct EmailListView {
     /// On-demand spam verdicts keyed by email id (from the `S` key), used to tag
     /// rows in the list. Not persisted; populated as the user scores messages.
     spam_verdicts: HashMap<String, String>,
-    scroll_offset: usize,
     archive_folder: String,
     deleted_folder: String,
     browser: Option<String>,
@@ -86,7 +106,6 @@ impl EmailListView {
         mailbox_id: String,
         mailbox_name: String,
         page_size: u32,
-        scrolloff: usize,
         mailboxes: Vec<Mailbox>,
         archive_folder: String,
         deleted_folder: String,
@@ -98,7 +117,6 @@ impl EmailListView {
             mailbox_id,
             mailbox_name,
             page_size,
-            scrolloff,
             emails: Vec::new(),
             cursor: 0,
             total: None,
@@ -122,7 +140,6 @@ impl EmailListView {
             pending_write_ops: HashMap::new(),
             thread_counts: HashMap::new(),
             spam_verdicts: HashMap::new(),
-            scroll_offset: 0,
             archive_folder,
             deleted_folder,
             browser,
@@ -141,7 +158,6 @@ impl EmailListView {
         self.loading_more = false;
         self.error = None;
         self.pending_write_ops.clear();
-        self.scroll_offset = 0;
         if self.cursor >= self.emails.len() && !self.emails.is_empty() {
             self.cursor = self.emails.len() - 1;
         }
@@ -152,7 +168,6 @@ impl EmailListView {
         self.last_loaded_count = 0;
         self.loading = true;
         self.loading_more = false;
-        self.scroll_offset = 0;
         let _ = self.cmd_tx.send(BackendCommand::QueryEmails {
             origin: origin.to_string(),
             mailbox_id: self.mailbox_id.clone(),
@@ -219,24 +234,31 @@ impl EmailListView {
         }
     }
 
-    fn format_email(
-        email: &Email,
-        width: u16,
-        thread_counts: Option<(usize, usize)>,
-        spam: &str,
-    ) -> String {
-        let unread = if Self::is_unread(email) { "N" } else { " " };
-        let flagged = if Self::is_flagged(email) { "F" } else { " " };
-
-        // Fixed 8-char column for thread indicator [read/total]
-        let thread_col = match thread_counts {
-            Some((unread_count, total)) if total > 1 => {
-                let read_count = total - unread_count;
-                format!("[{}/{}]", read_count, total)
-            }
-            _ => String::new(),
+    /// Message `index` as a row: the subject, led by the flag and the spam
+    /// verdict and followed by the thread's read count, over the sender and
+    /// the day it arrived. Unread is the mark; the widget elides what does
+    /// not fit, so nothing here is laid out to a width.
+    fn email_row(&self, index: usize) -> Row {
+        let Some(email) = self.emails.get(index) else {
+            return Row::default();
         };
-        let thread_display = format!("{:<8}", thread_col);
+        let mut label = String::new();
+        if Self::is_flagged(email) {
+            label.push_str("F ");
+        }
+        let spam = self.spam_marker(email).trim();
+        if !spam.is_empty() {
+            label.push_str(spam);
+            label.push(' ');
+        }
+        label.push_str(&strip_newlines(
+            email.subject.as_deref().unwrap_or("(no subject)"),
+        ));
+        if let Some((unread, total)) = self.get_thread_counts(email) {
+            if total > 1 {
+                label.push_str(&format!(" [{}/{}]", total.saturating_sub(unread), total));
+            }
+        }
 
         let from = email
             .from
@@ -248,35 +270,121 @@ impl EmailListView {
                     .unwrap_or_else(|| a.email.as_deref().unwrap_or("(unknown)"))
             })
             .unwrap_or("(unknown)");
-
-        let subject = email.subject.as_deref().unwrap_or("(no subject)");
-
+        // The day of an ISO timestamp, and a shorter one whole.
         let date = email
             .received_at
             .as_deref()
-            .map(|d| if d.len() >= 10 { &d[..10] } else { d })
-            .unwrap_or("");
+            .map_or("", |d| d.get(..10).unwrap_or(d));
 
-        let w = width as usize;
-        // " NFS" (5) + thread_display (8) + date (10) + " " (1) + from + " " (1) + subject
-        let prefix_len = 5 + 8 + 10 + 1;
-        let from_width = 20.min(w.saturating_sub(prefix_len + 1));
-        let subj_width = w.saturating_sub(prefix_len + from_width + 1);
+        Row {
+            label,
+            meta: format!("{} · {}", strip_newlines(from), date),
+            marked: Self::is_unread(email),
+        }
+    }
 
-        let from_display = truncate(from, from_width);
-        let subj_display = truncate(subject, subj_width);
+    /// The window's title: the mailbox, what it was searched for, and when
+    /// it was last refreshed.
+    fn title(&self) -> String {
+        let base = if let Some(ref query) = self.active_search {
+            match self.total {
+                Some(total) => format!(
+                    "{} [search: {}] ({} results)",
+                    self.mailbox_name, query, total
+                ),
+                None => format!("{} [search: {}]", self.mailbox_name, query),
+            }
+        } else {
+            match self.total {
+                Some(total) => format!("{} ({} messages)", self.mailbox_name, total),
+                None => self.mailbox_name.clone(),
+            }
+        };
+        match self.last_refreshed {
+            Some(ts) => format!("{} (refreshed {})", base, format_system_time(ts)),
+            None => base,
+        }
+    }
 
-        format!(
-            " {}{}{}{}{} {:from_w$} {}",
-            unread,
-            flagged,
-            spam,
-            thread_display,
-            date,
-            from_display,
-            subj_display,
-            from_w = from_width
-        )
+    /// The messages, the mailbox picker while moving, or the word for a
+    /// list there is nothing to show of.
+    fn body(&self) -> Body<'_> {
+        if self.move_mode {
+            return Body::List {
+                total: self.mailboxes.len(),
+                selected: self.move_cursor,
+                row: Box::new(move |index| Row {
+                    label: self
+                        .mailboxes
+                        .get(index)
+                        .map(|mailbox| mailbox.name.clone())
+                        .unwrap_or_default(),
+                    ..Row::default()
+                }),
+            };
+        }
+        if self.loading && self.emails.is_empty() {
+            return Body::message("Loading emails...".to_string());
+        }
+        if let Some(error) = &self.error {
+            return Body::message(error.clone());
+        }
+        if self.emails.is_empty() {
+            return Body::message("No messages.".to_string());
+        }
+        Body::List {
+            total: self.emails.len(),
+            selected: self.cursor,
+            row: Box::new(move |index| self.email_row(index)),
+        }
+    }
+
+    /// The status row: where the cursor is and the keys that act on it,
+    /// behind whatever the last command had to say.
+    fn status(&self) -> String {
+        // Searching and moving say their keys only: the entry shows what is
+        // typed, and the picker its place in the mailboxes.
+        let base = if self.search_mode {
+            "RET:search Esc:cancel".to_string()
+        } else if self.move_mode {
+            format!(
+                "Move to mailbox: {}/{} | n/p:navigate RET:move Esc:cancel",
+                self.move_cursor + 1,
+                self.mailboxes.len()
+            )
+        } else if self.loading {
+            if self.loading_more {
+                "Loading more... | q:back".to_string()
+            } else {
+                "Loading... | q:back".to_string()
+            }
+        } else if self.emails.is_empty() {
+            "q:back g:refresh s:search".to_string()
+        } else {
+            let search_hint = if self.active_search.is_some() {
+                " Esc:clear-search"
+            } else {
+                ""
+            };
+            let load_more_hint = if self.can_load_more() { " l:more" } else { "" };
+            let expire_hint = if self.is_in_deleted_folder() {
+                " D:expire"
+            } else {
+                ""
+            };
+            format!(
+                "{}/{} | q:back n/p:nav RET:read g:refresh r:reply R:reply-all e:dry-run E:run-rules a:archive d:delete{} J:spam H:ham S:score f:flag u:unread m:move s:search{}{}",
+                self.cursor + 1,
+                self.total.unwrap_or(self.emails.len() as u32),
+                expire_hint,
+                search_hint,
+                load_more_hint
+            )
+        };
+        match &self.status_message {
+            Some(message) => format!("{} | {}", message, base),
+            None => base,
+        }
     }
 
     fn get_thread_counts(&self, email: &Email) -> Option<(usize, usize)> {
@@ -389,7 +497,6 @@ impl EmailListView {
                 self.reply_from_address.clone(),
                 thread_id,
                 subject,
-                self.scrolloff,
                 self.mailboxes.clone(),
                 self.archive_folder.clone(),
                 self.deleted_folder.clone(),
@@ -462,28 +569,6 @@ impl EmailListView {
         self.pending_write_ops.remove(&op_id);
         self.rollback_pending_write(op);
         self.status_message = Some(format!("{} failed: {}", action, err));
-    }
-
-    fn adjust_scroll(&mut self, max_items: usize) {
-        if max_items == 0 {
-            return;
-        }
-        let max_offset = self.emails.len().saturating_sub(max_items);
-        let margin = self.scrolloff.min(max_items.saturating_sub(1));
-        let min_cursor = self.scroll_offset.saturating_add(margin);
-        let max_cursor = self
-            .scroll_offset
-            .saturating_add(max_items.saturating_sub(margin + 1));
-
-        if self.cursor < min_cursor {
-            self.scroll_offset = self.cursor.saturating_sub(margin);
-        } else if self.cursor > max_cursor {
-            self.scroll_offset = self
-                .cursor
-                .saturating_add(margin + 1)
-                .saturating_sub(max_items);
-        }
-        self.scroll_offset = self.scroll_offset.min(max_offset);
     }
 
     fn is_in_deleted_folder(&self) -> bool {
@@ -613,187 +698,29 @@ impl EmailListView {
     }
 }
 
-fn truncate(s: &str, max: usize) -> String {
-    if s.len() <= max {
-        s.to_string()
-    } else if max <= 3 {
-        s.chars().take(max).collect()
-    } else {
-        let mut end = max - 3;
-        while end > 0 && !s.is_char_boundary(end) {
-            end -= 1;
-        }
-        format!("{}...", &s[..end])
-    }
-}
-
 impl View for EmailListView {
-    fn render(&self, term: &mut Terminal) -> io::Result<()> {
-        term.clear()?;
-
-        // Header
-        term.move_to(1, 1)?;
-        term.set_header()?;
-        let header = {
-            let base = if let Some(ref query) = self.active_search {
-                match self.total {
-                    Some(total) => format!(
-                        "{} [search: {}] ({} results)",
-                        self.mailbox_name, query, total
-                    ),
-                    None => format!("{} [search: {}]", self.mailbox_name, query),
-                }
-            } else {
-                match self.total {
-                    Some(total) => format!("{} ({} messages)", self.mailbox_name, total),
-                    None => self.mailbox_name.clone(),
-                }
-            };
-            if let Some(ts) = self.last_refreshed {
-                format!("{} (refreshed {})", base, format_system_time(ts))
-            } else {
-                base
-            }
-        };
-        term.write_truncated(&header, term.cols)?;
-        term.reset_attr()?;
-
-        // Separator
-        term.move_to(2, 1)?;
-        let sep = "-".repeat(term.cols as usize);
-        term.write_str(&sep)?;
-
-        if self.move_mode {
-            // Render mailbox picker
-            term.move_to(3, 1)?;
-            term.set_header()?;
-            term.write_truncated("Move to mailbox:", term.cols)?;
-            term.reset_attr()?;
-
-            let max_items = (term.rows as usize).saturating_sub(5);
-            let scroll_offset = if self.move_cursor >= max_items {
-                self.move_cursor - max_items + 1
-            } else {
-                0
-            };
-
-            for (i, mailbox) in self
-                .mailboxes
-                .iter()
-                .skip(scroll_offset)
-                .enumerate()
-                .take(max_items)
-            {
-                let row = 4 + i as u16;
-                term.move_to(row, 1)?;
-
-                let display_idx = scroll_offset + i;
-                let line = format!("  {}", mailbox.name);
-
-                if display_idx == self.move_cursor {
-                    term.set_selection()?;
-                }
-
-                term.write_truncated(&line, term.cols)?;
-                term.reset_attr()?;
-            }
-        } else if self.loading && self.emails.is_empty() {
-            term.move_to(3, 1)?;
-            term.write_truncated("Loading emails...", term.cols)?;
-        } else if let Some(ref err) = self.error {
-            term.move_to(3, 1)?;
-            term.write_truncated(err, term.cols)?;
-        } else if self.emails.is_empty() {
-            term.move_to(3, 1)?;
-            term.write_truncated("No messages.", term.cols)?;
-        } else {
-            let max_items = (term.rows as usize).saturating_sub(4);
-
-            for (i, email) in self
-                .emails
-                .iter()
-                .skip(self.scroll_offset)
-                .enumerate()
-                .take(max_items)
-            {
-                let row = 3 + i as u16;
-                term.move_to(row, 1)?;
-
-                let display_idx = self.scroll_offset + i;
-                let thread_counts = self.get_thread_counts(email);
-                let line =
-                    Self::format_email(email, term.cols, thread_counts, self.spam_marker(email));
-
-                if display_idx == self.cursor {
-                    term.set_selection()?;
-                    if Self::is_unread(email) {
-                        term.set_bold_text()?;
-                    }
-                } else if Self::is_unread(email) {
-                    term.set_bold_text()?;
-                }
-
-                term.write_truncated(&line, term.cols)?;
-                term.reset_attr()?;
-            }
-        }
-
-        // Status bar
-        term.move_to(term.rows, 1)?;
-        term.set_status()?;
-        let base_status = if self.search_mode {
-            format!(" Search: {}_", self.search_input)
+    fn scene(&self) -> Scene<'_> {
+        let (labels, keys) = if self.search_mode {
+            (SEARCH_LABELS, SEARCH_KEYS)
         } else if self.move_mode {
-            format!(
-                " {}/{} | n/p:navigate RET:move Esc:cancel",
-                self.move_cursor + 1,
-                self.mailboxes.len()
-            )
-        } else if self.loading {
-            if self.loading_more {
-                " Loading more... | q:back".to_string()
-            } else {
-                " Loading... | q:back".to_string()
-            }
-        } else if self.emails.is_empty() {
-            " q:back g:refresh s:search".to_string()
+            (MOVE_LABELS, MOVE_KEYS)
         } else {
-            let search_hint = if self.active_search.is_some() {
-                " Esc:clear-search"
-            } else {
-                ""
-            };
-            let load_more_hint = if self.can_load_more() { " l:more" } else { "" };
-            let expire_hint = if self.is_in_deleted_folder() {
-                " D:expire"
-            } else {
-                ""
-            };
-            format!(
-                " {}/{} | q:back n/p:nav RET:read g:refresh r:reply R:reply-all e:dry-run E:run-rules a:archive d:delete{} J:spam H:ham S:score f:flag u:unread m:move s:search{}{}",
-                self.cursor + 1,
-                self.total.unwrap_or(self.emails.len() as u32),
-                expire_hint,
-                search_hint,
-                load_more_hint
-            )
+            (LIST_LABELS, LIST_KEYS)
         };
-        let status = if let Some(ref msg) = self.status_message {
-            format!("{} | {}", msg, base_status)
-        } else {
-            base_status
-        };
-        term.write_truncated(&status, term.cols)?;
-        let remaining = (term.cols as usize).saturating_sub(status.len());
-        for _ in 0..remaining {
-            term.write_str(" ")?;
+        Scene {
+            title: self.title(),
+            labels,
+            keys,
+            entry: self.search_mode.then(|| Entry {
+                placeholder: "Search",
+                text: &self.search_input,
+            }),
+            body: self.body(),
+            status: self.status(),
         }
-        term.reset_attr()?;
-
-        term.flush()
     }
 
-    fn handle_key(&mut self, key: Key, term_rows: u16) -> ViewAction {
+    fn handle_key(&mut self, key: Key, page: usize) -> ViewAction {
         // Search mode: capture text input
         if self.search_mode {
             match key {
@@ -888,20 +815,22 @@ impl View for EmailListView {
                 Key::ScrollDown if self.move_cursor + 1 < self.mailboxes.len() => {
                     self.move_cursor += 1;
                 }
+                // A press on a mailbox picks it out; moving there is its own
+                // key, so a misdirected press costs nothing.
+                Key::Click(index) if index < self.mailboxes.len() => {
+                    self.move_cursor = index;
+                }
                 _ => {}
             }
             return ViewAction::Continue;
         }
 
         // Normal mode
-        let max_items = (term_rows as usize).saturating_sub(4);
-        let page = max_items;
         match key {
             Key::Char('q') => ViewAction::Pop,
             Key::Char('n') | Key::Char('j') | Key::Down => {
                 if !self.emails.is_empty() && self.cursor + 1 < self.emails.len() {
                     self.cursor += 1;
-                    self.adjust_scroll(max_items);
                 } else {
                     self.request_load_more();
                 }
@@ -910,14 +839,12 @@ impl View for EmailListView {
             Key::Char('p') | Key::Char('k') | Key::Up => {
                 if self.cursor > 0 {
                     self.cursor -= 1;
-                    self.adjust_scroll(max_items);
                 }
                 ViewAction::Continue
             }
             Key::PageDown => {
                 if !self.emails.is_empty() {
                     self.cursor = (self.cursor + page).min(self.emails.len() - 1);
-                    self.adjust_scroll(max_items);
                     if self.cursor + 1 >= self.emails.len() {
                         self.request_load_more();
                     }
@@ -926,18 +853,15 @@ impl View for EmailListView {
             }
             Key::PageUp => {
                 self.cursor = self.cursor.saturating_sub(page);
-                self.adjust_scroll(max_items);
                 ViewAction::Continue
             }
             Key::Home => {
                 self.cursor = 0;
-                self.adjust_scroll(max_items);
                 ViewAction::Continue
             }
             Key::End => {
                 if !self.emails.is_empty() {
                     self.cursor = self.emails.len() - 1;
-                    self.adjust_scroll(max_items);
                     self.request_load_more();
                 }
                 ViewAction::Continue
@@ -1093,7 +1017,6 @@ impl View for EmailListView {
                         if let Some(i) = next_unread {
                             self.cursor = i;
                         }
-                        self.adjust_scroll(max_items);
                     }
                 }
                 ViewAction::Continue
@@ -1166,27 +1089,23 @@ impl View for EmailListView {
             Key::ScrollUp => {
                 if self.cursor > 0 {
                     self.cursor -= 1;
-                    self.adjust_scroll(max_items);
                 }
                 ViewAction::Continue
             }
             Key::ScrollDown => {
                 if !self.emails.is_empty() && self.cursor + 1 < self.emails.len() {
                     self.cursor += 1;
-                    self.adjust_scroll(max_items);
                 } else {
                     self.request_load_more();
                 }
                 ViewAction::Continue
             }
-            Key::MouseClick { row, col: _ } => {
-                if row >= 3 && !self.emails.is_empty() {
-                    let clicked = self.scroll_offset + (row - 3) as usize;
-                    if clicked < self.emails.len() {
-                        self.cursor = clicked;
-                        self.pending_click = true;
-                        return ViewAction::Continue;
-                    }
+            // A press selects the message; opening it is the pending
+            // action, so the selection is shown before the message loads.
+            Key::Click(index) => {
+                if index < self.emails.len() {
+                    self.cursor = index;
+                    self.pending_click = true;
                 }
                 ViewAction::Continue
             }
@@ -1423,8 +1342,9 @@ impl View for EmailListView {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::panic, clippy::expect_used, clippy::unwrap_used)]
     use super::*;
-    use crate::jmap::types::{Email, Mailbox};
+    use crate::jmap::types::{Email, EmailAddress, Mailbox};
 
     fn make_email(id: &str, thread_id: &str) -> Email {
         Email {
@@ -1482,9 +1402,7 @@ mod tests {
         ]
     }
 
-    fn make_view_with_scrolloff(
-        scrolloff: usize,
-    ) -> (EmailListView, mpsc::Receiver<BackendCommand>) {
+    fn make_view() -> (EmailListView, mpsc::Receiver<BackendCommand>) {
         let (cmd_tx, cmd_rx) = mpsc::channel();
         let mailboxes = make_mailboxes();
         let mut view = EmailListView::new(
@@ -1493,7 +1411,6 @@ mod tests {
             "mbox-inbox".to_string(),
             "Inbox".to_string(),
             50,
-            scrolloff,
             mailboxes,
             "Archive".to_string(),
             "Trash".to_string(),
@@ -1514,8 +1431,20 @@ mod tests {
         (view, cmd_rx)
     }
 
-    fn make_view() -> (EmailListView, mpsc::Receiver<BackendCommand>) {
-        make_view_with_scrolloff(1)
+    /// Every row the scene's list names, in order.
+    fn list_rows(scene: &Scene<'_>) -> Vec<Row> {
+        match &scene.body {
+            Body::List { total, row, .. } => (0..*total).map(|index| row(index)).collect(),
+            Body::Text { .. } => panic!("the scene shows a list"),
+        }
+    }
+
+    /// What the scene's text body says, wrapped for a wide pane.
+    fn message(scene: &Scene<'_>) -> String {
+        match &scene.body {
+            Body::Text { text, .. } => text(60),
+            Body::List { .. } => panic!("the scene shows a text"),
+        }
     }
 
     #[test]
@@ -1614,7 +1543,6 @@ mod tests {
             "mbox-trash".to_string(),
             "Trash".to_string(),
             50,
-            1,
             mailboxes,
             "Archive".to_string(),
             "Trash".to_string(),
@@ -1656,12 +1584,8 @@ mod tests {
         view.total = Some(150);
         assert_eq!(view.emails.len(), 3);
 
-        // Render and capture status bar content
-        // We can't easily render, so test the logic directly:
-        // The status format uses self.total.unwrap_or(self.emails.len() as u32)
-        let displayed_total = view.total.unwrap_or(view.emails.len() as u32);
-        assert_eq!(
-            displayed_total, 150,
+        assert!(
+            view.scene().status.starts_with("1/150 |"),
             "Y should be server total (150), not loaded count (3)"
         );
     }
@@ -1671,9 +1595,8 @@ mod tests {
         let (mut view, _cmd_rx) = make_view();
         view.total = None;
 
-        let displayed_total = view.total.unwrap_or(view.emails.len() as u32);
-        assert_eq!(
-            displayed_total, 3,
+        assert!(
+            view.scene().status.starts_with("1/3 |"),
             "Y should fall back to loaded count when total is None"
         );
     }
@@ -1777,36 +1700,207 @@ mod tests {
         assert_eq!(view.cursor, 0, "marking unread should not move cursor");
     }
 
-    #[test]
-    fn scrolloff_keeps_context_when_scrolling_down() {
-        let (mut view, _cmd_rx) = make_view_with_scrolloff(3);
+    fn make_long_view() -> (EmailListView, mpsc::Receiver<BackendCommand>) {
+        let (mut view, cmd_rx) = make_view();
         view.emails = (0..20)
             .map(|i| make_email(&format!("email-{i}"), &format!("thread-{i}")))
             .collect();
+        view.total = Some(20);
         view.cursor = 0;
-        view.scroll_offset = 0;
+        (view, cmd_rx)
+    }
+
+    /// The list keeps the selection in view itself, so navigating only has
+    /// to move the cursor the scene selects with.
+    #[test]
+    fn navigating_down_moves_the_cursor_the_list_selects() {
+        let (mut view, _cmd_rx) = make_long_view();
 
         for _ in 0..8 {
             view.handle_key(Key::Char('n'), 12);
         }
 
         assert_eq!(view.cursor, 8);
-        assert_eq!(view.scroll_offset, 4);
+        let scene = view.scene();
+        match &scene.body {
+            Body::List {
+                total, selected, ..
+            } => assert_eq!((*total, *selected), (20, 8)),
+            Body::Text { .. } => panic!("the messages are a list"),
+        }
     }
 
     #[test]
-    fn scrolloff_keeps_context_when_scrolling_up() {
-        let (mut view, _cmd_rx) = make_view_with_scrolloff(3);
-        view.emails = (0..20)
-            .map(|i| make_email(&format!("email-{i}"), &format!("thread-{i}")))
-            .collect();
+    fn navigating_up_moves_the_cursor_back() {
+        let (mut view, _cmd_rx) = make_long_view();
         view.cursor = 8;
-        view.scroll_offset = 4;
 
         view.handle_key(Key::Char('p'), 12);
         view.handle_key(Key::Char('p'), 12);
 
         assert_eq!(view.cursor, 6);
-        assert_eq!(view.scroll_offset, 3);
+    }
+
+    #[test]
+    fn the_page_keys_move_by_the_rows_the_body_shows() {
+        let (mut view, _cmd_rx) = make_long_view();
+
+        view.handle_key(Key::PageDown, 5);
+        assert_eq!(view.cursor, 5);
+        view.handle_key(Key::PageDown, 5);
+        assert_eq!(view.cursor, 10);
+        view.handle_key(Key::PageUp, 5);
+        assert_eq!(view.cursor, 5);
+        view.handle_key(Key::PageDown, 100);
+        assert_eq!(view.cursor, 19, "a page past the end stops on the last");
+    }
+
+    #[test]
+    fn the_scene_titles_the_mailbox_and_names_every_row() {
+        let (mut view, _cmd_rx) = make_view();
+        let mut flagged = make_email("email-1", "thread-A");
+        flagged.keywords.insert("$flagged".to_string(), true);
+        flagged.subject = Some("Two\nlines".to_string());
+        flagged.from = Some(vec![EmailAddress {
+            name: Some("Ada Lovelace".to_string()),
+            email: Some("ada@example.com".to_string()),
+        }]);
+        let mut scored = make_email("email-3", "thread-B");
+        scored.keywords.insert("$seen".to_string(), true);
+        scored.subject = None;
+        scored.received_at = Some("2025-03-04T05:06:07Z".to_string());
+        scored.from = Some(vec![EmailAddress {
+            name: None,
+            email: Some("bob@example.com".to_string()),
+        }]);
+        view.emails = vec![flagged, scored];
+        view.total = Some(2);
+        view.spam_verdicts
+            .insert("email-3".to_string(), "spam".to_string());
+
+        let scene = view.scene();
+        assert_eq!(scene.title, "Inbox (2 messages)");
+        assert_eq!(scene.labels, LIST_LABELS);
+        assert_eq!(scene.keys, LIST_KEYS);
+        assert_eq!(scene.labels.len(), scene.keys.len());
+        assert!(scene.entry.is_none());
+        assert_eq!(
+            list_rows(&scene),
+            vec![
+                Row {
+                    // Flagged, one line, and two of the thread's two read.
+                    label: "F Two lines [2/2]".to_string(),
+                    meta: "Ada Lovelace · 2025-01-01".to_string(),
+                    marked: true,
+                },
+                Row {
+                    // Scored spam, no subject, and a thread of its own.
+                    label: "S (no subject)".to_string(),
+                    meta: "bob@example.com · 2025-03-04".to_string(),
+                    marked: false,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn the_title_says_what_was_searched_for_and_when_it_was_refreshed() {
+        let (mut view, _cmd_rx) = make_view();
+        view.active_search = Some("invoice".to_string());
+        view.total = Some(7);
+        assert_eq!(view.scene().title, "Inbox [search: invoice] (7 results)");
+        view.total = None;
+        assert_eq!(view.scene().title, "Inbox [search: invoice]");
+
+        view.active_search = None;
+        view.last_refreshed = Some(SystemTime::UNIX_EPOCH);
+        let title = view.scene().title;
+        assert!(title.starts_with("Inbox (refreshed "), "{title}");
+    }
+
+    #[test]
+    fn a_press_on_a_row_selects_it_and_opens_it() {
+        let (mut view, _cmd_rx) = make_view();
+
+        view.handle_key(Key::Click(2), 10);
+        assert_eq!(view.cursor, 2);
+        assert!(view.pending_click);
+        assert!(matches!(
+            view.take_pending_action(),
+            Some(ViewAction::Push(_))
+        ));
+        assert!(!view.pending_click, "the press is spent on the one open");
+
+        // A press past the last row selects nothing.
+        view.handle_key(Key::Click(9), 10);
+        assert_eq!(view.cursor, 2);
+        assert!(!view.pending_click);
+    }
+
+    #[test]
+    fn searching_shows_the_entry_over_the_messages() {
+        let (mut view, _cmd_rx) = make_view();
+        view.handle_key(Key::Char('s'), 10);
+        view.handle_key(Key::Char('h'), 10);
+        view.handle_key(Key::Char('i'), 10);
+
+        {
+            let scene = view.scene();
+            let entry = scene.entry.as_ref().expect("the search entry");
+            assert_eq!((entry.placeholder, entry.text), ("Search", "hi"));
+            assert_eq!(scene.labels, SEARCH_LABELS);
+            assert_eq!(scene.keys, SEARCH_KEYS);
+            assert_eq!(
+                list_rows(&scene).len(),
+                3,
+                "the messages stay under the entry"
+            );
+        }
+
+        view.handle_key(Key::Escape, 10);
+        assert!(view.scene().entry.is_none());
+    }
+
+    #[test]
+    fn moving_lists_the_mailboxes_and_a_press_picks_one() {
+        let (mut view, _cmd_rx) = make_view();
+        view.handle_key(Key::Char('m'), 10);
+        view.handle_key(Key::Click(2), 10);
+
+        let scene = view.scene();
+        assert_eq!(scene.labels, MOVE_LABELS);
+        assert_eq!(scene.keys, MOVE_KEYS);
+        assert!(scene.entry.is_none());
+        assert_eq!(
+            list_rows(&scene)
+                .iter()
+                .map(|row| row.label.clone())
+                .collect::<Vec<_>>(),
+            vec!["Inbox", "Archive", "Trash"]
+        );
+        match &scene.body {
+            Body::List { selected, .. } => assert_eq!(*selected, 2),
+            Body::Text { .. } => panic!("the mailbox picker is a list"),
+        }
+        assert!(scene.status.starts_with("Move to mailbox: 3/3 |"));
+    }
+
+    #[test]
+    fn a_list_with_nothing_to_show_says_so_in_the_pane() {
+        let (mut view, _cmd_rx) = make_view();
+        view.emails.clear();
+        view.total = Some(0);
+        assert_eq!(message(&view.scene()), "No messages.");
+
+        view.error = Some("Failed to fetch emails: no route to host".to_string());
+        assert_eq!(
+            message(&view.scene()),
+            "Failed to fetch emails: no route to host"
+        );
+
+        view.error = None;
+        view.loading = true;
+        assert_eq!(message(&view.scene()), "Loading emails...");
+        assert_eq!(view.scene().status, "Loading... | q:back");
     }
 }

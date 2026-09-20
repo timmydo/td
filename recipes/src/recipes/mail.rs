@@ -24,7 +24,7 @@ const PROGRAM: &str = "td-mail";
 const PROGRAM_RECIPE: &str = "td-mail";
 /// The editor the package ships for composition, and where td-mail finds it.
 /// The entry must stay a command of plain words: td-mail runs such an
-/// `$EDITOR` directly (`plain_command` in td-mail/src/tui/mod.rs, which
+/// `$EDITOR` directly (`plain_command` in td-mail/src/ui/mod.rs, which
 /// pins this value), and anything else it hands to a shell the runtime
 /// does not have.
 const EDITOR: &str = "td-editor";

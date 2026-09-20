@@ -5130,8 +5130,8 @@ mod tests {
         assert_eq!(readers_of("td-busd"), ["td-audio", "td-compositor", "td-jail", "td-login", "td-portal", "td-secret"]);
         assert_eq!(readers_of("td-boot"), ["td-install", "td-update"]);
         assert!(readers_of("td-review").is_empty(), "{readers:?}");
-        // td-news depends on the editor for its document pane.
-        assert_eq!(readers_of("td-editor"), ["td-news"]);
+        // td-mail and td-news depend on the editor for their document pane.
+        assert_eq!(readers_of("td-editor"), ["td-mail", "td-news"]);
         // Public VM retention-ref and guest workspace paths also spell td-vm/.
         // Authd's fixed task-terminal directory joins the compositor and guest
         // helper as a conservative textual reader of the VM crate.

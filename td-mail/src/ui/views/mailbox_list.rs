@@ -2,16 +2,45 @@ use crate::backend::{BackendCommand, BackendResponse, RetentionCandidate};
 use crate::compose;
 use crate::config::RetentionPolicyConfig;
 use crate::jmap::types::Mailbox;
-use crate::tui::input::Key;
-use crate::tui::screen::Terminal;
-use crate::tui::views::email_list::{CachedEmailListState, EmailListView};
-use crate::tui::views::help::HelpView;
-use crate::tui::views::retention_preview::RetentionPreviewView;
-use crate::tui::views::{format_system_time, View, ViewAction};
+use crate::ui::input::Key;
+use crate::ui::views::email_list::{CachedEmailListState, EmailListView};
+use crate::ui::views::help::HelpView;
+use crate::ui::views::retention_preview::RetentionPreviewView;
+use crate::ui::views::{
+    format_system_time, strip_newlines, Body, Entry, Row, Scene, View, ViewAction,
+};
 use std::collections::{HashMap, HashSet};
-use std::io;
 use std::sync::mpsc;
 use std::time::SystemTime;
+
+/// The action bar's labels for each of the view's modes, and the key each
+/// stands for; a press on a label is that key.
+const LABELS: &[&str] = &[
+    "Open",
+    "Refresh",
+    "Compose",
+    "New folder",
+    "Delete folder",
+    "Mark read",
+    "Account",
+    "Help",
+    "Quit",
+];
+const KEYS: &[Key] = &[
+    Key::Enter,
+    Key::Char('g'),
+    Key::Char('c'),
+    Key::Char('+'),
+    Key::Char('d'),
+    Key::Char('u'),
+    Key::Char('a'),
+    Key::Char('?'),
+    Key::Char('q'),
+];
+const CREATE_LABELS: &[&str] = &["Create", "Cancel"];
+const CREATE_KEYS: &[Key] = &[Key::Enter, Key::Escape];
+const DELETE_LABELS: &[&str] = &["Delete", "Cancel"];
+const DELETE_KEYS: &[Key] = &[Key::Char('y'), Key::Escape];
 
 pub struct MailboxListView {
     cmd_tx: mpsc::Sender<BackendCommand>,
@@ -19,7 +48,6 @@ pub struct MailboxListView {
     reply_from_address: Option<String>,
     browser: Option<String>,
     page_size: u32,
-    scrolloff: usize,
     mailboxes: Vec<Mailbox>,
     cursor: usize,
     loading: bool,
@@ -48,7 +76,6 @@ impl MailboxListView {
         reply_from_address: Option<String>,
         browser: Option<String>,
         page_size: u32,
-        scrolloff: usize,
         account_names: Vec<String>,
         current_account: String,
         archive_folder: String,
@@ -62,7 +89,6 @@ impl MailboxListView {
             reply_from_address,
             browser,
             page_size,
-            scrolloff,
             mailboxes: Vec::new(),
             cursor: 0,
             loading: true,
@@ -144,32 +170,81 @@ impl MailboxListView {
         });
     }
 
-    fn format_mailbox(m: &Mailbox) -> String {
-        if m.unread_emails > 0 {
-            format!("{} ({}/{})", m.name, m.unread_emails, m.total_emails)
-        } else if m.total_emails > 0 {
-            format!("{} ({})", m.name, m.total_emails)
+    /// The window's title: the account when there is more than one to
+    /// name, and when the counts were last refreshed. Confirming a delete,
+    /// the title asks the question.
+    fn title(&self) -> String {
+        if self.delete_confirm_mode {
+            let name = self
+                .mailboxes
+                .get(self.cursor)
+                .map_or("(unknown)", |m| m.name.as_str());
+            return format!("Delete folder '{}'?", name);
+        }
+        let title = if self.account_names.len() > 1 {
+            format!("td-mail - {}", self.current_account)
         } else {
-            m.name.clone()
+            "td-mail - Timmy's Mail Console".to_string()
+        };
+        match self.last_refreshed {
+            Some(ts) => format!("{} (refreshed {})", title, format_system_time(ts)),
+            None => title,
         }
     }
 
-    fn scroll_offset_for(&self, max_items: usize) -> usize {
-        if max_items == 0 || self.mailboxes.is_empty() {
-            return 0;
-        }
-        let max_offset = self.mailboxes.len().saturating_sub(max_items);
-        let margin = self.scrolloff.min(max_items.saturating_sub(1));
-        let lower_bound = margin;
-        let upper_bound = max_items.saturating_sub(margin + 1);
-
-        // Both bounds scroll to the top: above the margin there is nothing to
-        // scroll past, and within the visible window the first row is still
-        // the first mailbox.
-        if self.cursor < lower_bound || self.cursor <= upper_bound {
-            0
+    /// Folder `index`: its name, its unread of its total at the right, and
+    /// marked while it holds unread mail.
+    fn mailbox_row(&self, index: usize) -> Row {
+        let Some(mailbox) = self.mailboxes.get(index) else {
+            return Row::default();
+        };
+        let meta = if mailbox.unread_emails > 0 {
+            format!("{}/{}", mailbox.unread_emails, mailbox.total_emails)
+        } else if mailbox.total_emails > 0 {
+            mailbox.total_emails.to_string()
         } else {
-            (self.cursor - upper_bound).min(max_offset)
+            String::new()
+        };
+        Row {
+            label: strip_newlines(&mailbox.name),
+            meta,
+            marked: mailbox.unread_emails > 0,
+        }
+    }
+
+    /// The status row: the mode's keys, behind any message the view has.
+    fn status_line(&self) -> String {
+        // With one account the key reopens it, which is the reconnect.
+        let account_hint = if self.account_names.len() > 1 {
+            " a:account"
+        } else {
+            " a:reconnect"
+        };
+        let base = if self.create_mode {
+            "New folder name | Enter:create Esc:cancel".to_string()
+        } else if self.delete_confirm_mode {
+            "Confirm delete | y:delete n/Esc:cancel".to_string()
+        } else if self.loading {
+            format!(
+                "Loading... | q:quit g:refresh c:compose +:new-folder d:delete-folder u:read-all x:preview-expire X:expire{}",
+                account_hint
+            )
+        } else if self.mailboxes.is_empty() {
+            format!(
+                "q:quit g:refresh c:compose +:new-folder x:preview-expire X:expire{}",
+                account_hint
+            )
+        } else {
+            format!(
+                "{}/{} | q:quit n/p:navigate RET:open g:refresh c:compose +:new-folder d:delete-folder u:read-all x:preview-expire X:expire ?:help{}",
+                self.cursor + 1,
+                self.mailboxes.len(),
+                account_hint,
+            )
+        };
+        match self.status_message {
+            Some(ref msg) => format!("{} | {}", msg, base),
+            None => base,
         }
     }
 
@@ -184,7 +259,6 @@ impl MailboxListView {
             mailbox.id.clone(),
             mailbox.name.clone(),
             self.page_size,
-            self.scrolloff,
             self.mailboxes.clone(),
             self.archive_folder.clone(),
             self.deleted_folder.clone(),
@@ -216,140 +290,43 @@ impl MailboxListView {
 }
 
 impl View for MailboxListView {
-    fn render(&self, term: &mut Terminal) -> io::Result<()> {
-        term.clear()?;
-
-        // Header
-        term.move_to(1, 1)?;
-        term.set_header()?;
-        let header = {
-            let title = if self.account_names.len() > 1 {
-                format!("td-mail - {}", self.current_account)
-            } else {
-                "td-mail - Timmy's Mail Console".to_string()
-            };
-            if let Some(ts) = self.last_refreshed {
-                format!("{} (refreshed {})", title, format_system_time(ts))
-            } else {
-                title
-            }
-        };
-        term.write_truncated(&header, term.cols)?;
-        term.reset_attr()?;
-
-        // Separator
-        term.move_to(2, 1)?;
-        let sep = "-".repeat(term.cols as usize);
-        term.write_str(&sep)?;
-
-        if self.create_mode {
-            term.move_to(3, 1)?;
-            term.set_header()?;
-            term.write_truncated("Create new folder:", term.cols)?;
-            term.reset_attr()?;
-            term.move_to(4, 1)?;
-            let input = format!("Name: {}_", self.create_input);
-            term.write_truncated(&input, term.cols)?;
-        } else if self.delete_confirm_mode {
-            term.move_to(3, 1)?;
-            term.set_header()?;
-            let name = self
-                .mailboxes
-                .get(self.cursor)
-                .map(|m| m.name.as_str())
-                .unwrap_or("(unknown)");
-            let prompt = format!("Delete folder '{}'? (y/N)", name);
-            term.write_truncated(&prompt, term.cols)?;
-            term.reset_attr()?;
-            term.move_to(4, 1)?;
-            term.write_truncated("Press y to confirm, n or Esc to cancel.", term.cols)?;
-        } else if self.loading && self.mailboxes.is_empty() {
-            term.move_to(3, 1)?;
-            term.write_truncated("Loading mailboxes...", term.cols)?;
+    fn scene(&self) -> Scene<'_> {
+        // The list stays under the naming band and the delete question, so
+        // the folder each is about is the one shown selected.
+        let body = if self.loading && self.mailboxes.is_empty() {
+            Body::message("Loading mailboxes...".to_string())
         } else if let Some(ref err) = self.error {
-            term.move_to(3, 1)?;
-            term.write_truncated(err, term.cols)?;
+            Body::message(err.clone())
         } else if self.mailboxes.is_empty() {
-            term.move_to(3, 1)?;
-            term.write_truncated("No mailboxes found.", term.cols)?;
+            Body::message("No mailboxes found.".to_string())
         } else {
-            let max_items = (term.rows as usize).saturating_sub(4);
-            let scroll_offset = self.scroll_offset_for(max_items);
-
-            for (i, mailbox) in self
-                .mailboxes
-                .iter()
-                .skip(scroll_offset)
-                .enumerate()
-                .take(max_items)
-            {
-                let row = 3 + i as u16;
-                term.move_to(row, 1)?;
-
-                let display_idx = scroll_offset + i;
-                let line = Self::format_mailbox(mailbox);
-
-                if display_idx == self.cursor {
-                    term.set_selection()?;
-                    if mailbox.unread_emails > 0 {
-                        term.set_bold_text()?;
-                    }
-                } else if mailbox.unread_emails > 0 {
-                    term.set_bold_text()?;
-                }
-
-                term.write_truncated(&line, term.cols)?;
-                term.reset_attr()?;
+            Body::List {
+                total: self.mailboxes.len(),
+                selected: self.cursor,
+                row: Box::new(move |index| self.mailbox_row(index)),
             }
-        }
-
-        // Status bar
-        term.move_to(term.rows, 1)?;
-        term.set_status()?;
-        // With one account the key reopens it, which is the reconnect.
-        let account_hint = if self.account_names.len() > 1 {
-            " a:account"
-        } else {
-            " a:reconnect"
         };
-        let status = if self.create_mode {
-            " New folder name | Enter:create Esc:cancel".to_string()
+        let (labels, keys) = if self.create_mode {
+            (CREATE_LABELS, CREATE_KEYS)
         } else if self.delete_confirm_mode {
-            " Confirm delete | y:delete n/Esc:cancel".to_string()
-        } else if self.loading {
-            format!(
-                " Loading... | q:quit g:refresh c:compose +:new-folder d:delete-folder u:read-all x:preview-expire X:expire{}",
-                account_hint
-            )
-        } else if self.mailboxes.is_empty() {
-            format!(
-                " q:quit g:refresh c:compose +:new-folder x:preview-expire X:expire{}",
-                account_hint
-            )
+            (DELETE_LABELS, DELETE_KEYS)
         } else {
-            format!(
-                " {}/{} | q:quit n/p:navigate RET:open g:refresh c:compose +:new-folder d:delete-folder u:read-all x:preview-expire X:expire ?:help{}",
-                self.cursor + 1,
-                self.mailboxes.len(),
-                account_hint,
-            )
+            (LABELS, KEYS)
         };
-        let full_status = if let Some(ref msg) = self.status_message {
-            format!("{} | {}", msg, status)
-        } else {
-            status
-        };
-        term.write_truncated(&full_status, term.cols)?;
-        let remaining = (term.cols as usize).saturating_sub(full_status.len());
-        for _ in 0..remaining {
-            term.write_str(" ")?;
+        Scene {
+            title: self.title(),
+            labels,
+            keys,
+            entry: self.create_mode.then_some(Entry {
+                placeholder: "New folder name",
+                text: &self.create_input,
+            }),
+            body,
+            status: self.status_line(),
         }
-        term.reset_attr()?;
-
-        term.flush()
     }
 
-    fn handle_key(&mut self, key: Key, term_rows: u16) -> ViewAction {
+    fn handle_key(&mut self, key: Key, page: usize) -> ViewAction {
         if self.create_mode {
             match key {
                 Key::Enter => {
@@ -367,7 +344,9 @@ impl View for MailboxListView {
                         self.create_input.clear();
                     }
                 }
-                Key::Escape | Key::Char('q') => {
+                // Only Escape leaves: the name is typed into the entry,
+                // and a `q` in it is a letter.
+                Key::Escape => {
                     self.create_mode = false;
                     self.create_input.clear();
                 }
@@ -407,7 +386,6 @@ impl View for MailboxListView {
             return ViewAction::Continue;
         }
 
-        let page = (term_rows as usize).saturating_sub(4);
         match key {
             Key::Char('q') => ViewAction::Quit,
             Key::Char('n') | Key::Char('j') | Key::Down => {
@@ -526,16 +504,12 @@ impl View for MailboxListView {
                 }
                 ViewAction::Continue
             }
-            Key::MouseClick { row, col: _ } => {
-                if row >= 3 && !self.mailboxes.is_empty() {
-                    let max_items = (term_rows as usize).saturating_sub(4);
-                    let scroll_offset = self.scroll_offset_for(max_items);
-                    let clicked = scroll_offset + (row - 3) as usize;
-                    if clicked < self.mailboxes.len() {
-                        self.cursor = clicked;
-                        self.pending_click = true;
-                        return ViewAction::Continue;
-                    }
+            // The press selects the folder; opening it is the pending
+            // action, so the selection is shown before the folder loads.
+            Key::Click(index) => {
+                if index < self.mailboxes.len() {
+                    self.cursor = index;
+                    self.pending_click = true;
                 }
                 ViewAction::Continue
             }
@@ -747,5 +721,163 @@ impl View for MailboxListView {
         }
         self.request_refresh("mailbox_list.reveal");
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    use super::*;
+
+    fn make_mailbox(id: &str, name: &str, role: Option<&str>, total: u32, unread: u32) -> Mailbox {
+        Mailbox {
+            id: id.to_string(),
+            name: name.to_string(),
+            parent_id: None,
+            role: role.map(str::to_string),
+            total_emails: total,
+            unread_emails: unread,
+            sort_order: 0,
+        }
+    }
+
+    fn make_view() -> (MailboxListView, mpsc::Receiver<BackendCommand>) {
+        let (cmd_tx, cmd_rx) = mpsc::channel();
+        let view = MailboxListView::new(
+            cmd_tx,
+            "me@example.com".to_string(),
+            None,
+            None,
+            50,
+            vec!["personal".to_string()],
+            "personal".to_string(),
+            "Archive".to_string(),
+            "Trash".to_string(),
+            Vec::new(),
+            None,
+        );
+        (view, cmd_rx)
+    }
+
+    /// The folders in the order the view sorts them: the inbox, the
+    /// archive, the roleless one last.
+    fn folders() -> BackendResponse {
+        BackendResponse::Mailboxes(Ok(vec![
+            make_mailbox("m1", "Inbox", Some("inbox"), 10, 2),
+            make_mailbox("m2", "Archive", Some("archive"), 100, 0),
+            make_mailbox("m3", "Notes", None, 0, 0),
+        ]))
+    }
+
+    fn rows(view: &MailboxListView) -> Vec<Row> {
+        let scene = view.scene();
+        let Body::List { total, row, .. } = scene.body else {
+            return Vec::new();
+        };
+        let mut rows = Vec::with_capacity(total);
+        for index in 0..total {
+            rows.push(row(index));
+        }
+        rows
+    }
+
+    #[test]
+    fn the_folders_are_rows_of_name_and_unread_of_total() {
+        let (mut view, _cmd_rx) = make_view();
+        // Nothing fetched yet: the pane says the folders are loading.
+        assert!(matches!(view.scene().body, Body::Text { .. }));
+        assert!(view.on_response(&folders()));
+        assert_eq!(
+            rows(&view),
+            vec![
+                Row {
+                    label: "Inbox".to_string(),
+                    meta: "2/10".to_string(),
+                    marked: true,
+                },
+                Row {
+                    label: "Archive".to_string(),
+                    meta: "100".to_string(),
+                    marked: false,
+                },
+                Row {
+                    label: "Notes".to_string(),
+                    meta: String::new(),
+                    marked: false,
+                },
+            ]
+        );
+        let scene = view.scene();
+        assert!(
+            scene
+                .title
+                .starts_with("td-mail - Timmy's Mail Console (refreshed "),
+            "{}",
+            scene.title
+        );
+        assert_eq!(scene.labels, LABELS);
+        assert_eq!(scene.keys, KEYS);
+        assert!(scene.entry.is_none());
+        assert!(scene.status.starts_with("1/3 | "), "{}", scene.status);
+    }
+
+    #[test]
+    fn a_press_on_a_row_selects_it_and_opens_that_folder() {
+        let (mut view, cmd_rx) = make_view();
+        view.on_response(&folders());
+        view.handle_key(Key::Click(1), 10);
+        assert_eq!(view.cursor, 1);
+        assert!(matches!(
+            view.take_pending_action(),
+            Some(ViewAction::Push(_))
+        ));
+        let mut queried = None;
+        while let Ok(cmd) = cmd_rx.try_recv() {
+            if let BackendCommand::QueryEmails { mailbox_id, .. } = cmd {
+                queried = Some(mailbox_id);
+            }
+        }
+        assert_eq!(queried.as_deref(), Some("m2"));
+        // A press past the last row is no row.
+        view.handle_key(Key::Click(9), 10);
+        assert_eq!(view.cursor, 1);
+        assert!(view.take_pending_action().is_none());
+    }
+
+    #[test]
+    fn naming_a_folder_shows_the_entry_and_a_delete_asks_in_the_title() {
+        let (mut view, _cmd_rx) = make_view();
+        view.on_response(&folders());
+        view.handle_key(Key::Char('+'), 10);
+        view.handle_key(Key::Char('P'), 10);
+        view.handle_key(Key::Char('r'), 10);
+        {
+            let scene = view.scene();
+            let entry = scene.entry.expect("the folder is being named");
+            assert_eq!(entry.placeholder, "New folder name");
+            assert_eq!(entry.text, "Pr");
+            assert_eq!(scene.labels, CREATE_LABELS);
+            assert_eq!(scene.keys, CREATE_KEYS);
+            assert!(scene.status.starts_with("New folder name | "));
+        }
+        view.handle_key(Key::Escape, 10);
+        assert!(view.scene().entry.is_none());
+
+        view.handle_key(Key::Char('d'), 10);
+        let scene = view.scene();
+        assert_eq!(scene.title, "Delete folder 'Inbox'?");
+        assert_eq!(scene.labels, DELETE_LABELS);
+        assert_eq!(scene.keys, DELETE_KEYS);
+        assert!(scene.entry.is_none());
+        assert!(scene.status.ends_with("y:delete n/Esc:cancel"));
+        // The folder the question is about is the one still shown selected.
+        assert!(matches!(
+            scene.body,
+            Body::List {
+                total: 3,
+                selected: 0,
+                ..
+            }
+        ));
     }
 }

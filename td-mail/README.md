@@ -1,10 +1,10 @@
 # td-mail (Timmy's Mail Console)
 
-`td-mail` is a Rust mail client (MUA) for reading and triaging email over JMAP, drawn in a td-ui window.
+`td-mail` is a Rust mail client (MUA) for reading and triaging email over JMAP, in a td-ui window: mailboxes, messages and threads as lists, a message read in td-editor's document view.
 
 ## Goals
 
-- Fast, keyboard-first email workflow in a cell-grid window on td's compositor.
+- Fast, keyboard-first email workflow in a window on td's compositor: lists to move through, a document view to read in, an action bar for the pointer.
 - Unix-friendly composition flow: drafts open in `$EDITOR`.
 - Clear separation of concerns: `td-mail` reads/manages mail; message submission is external.
 - Scriptable automation through a JSON-over-stdin/stdout CLI mode.
@@ -116,7 +116,6 @@ Example config:
 [ui]
 editor = "nvim"
 page_size = 100
-scrolloff = 3
 mouse = true
 sync_interval_secs = 60
 

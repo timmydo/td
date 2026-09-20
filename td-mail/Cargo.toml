@@ -19,9 +19,9 @@ path = "tests/cli_integration.rs"
 
 # td-mail is a TARGET-built application, NOT part of the control-plane engine
 # workspace. It is standalone — its own workspace root — with a lock that
-# names itself and the one sibling it draws through. No external
-# dependencies: `std`, td's shared modules, and td-ui, and std is the pinned
-# toolchain rather than a cargo dep (AGENTS.md "std, not no_std").
+# names itself and the two siblings it draws through. No external
+# dependencies: `std`, td's shared modules, td-ui and td-editor, and std is
+# the pinned toolchain rather than a cargo dep (AGENTS.md "std, not no_std").
 #
 # From a nested checkout (.claude/worktrees/* lives physically under the main
 # checkout) cargo walks past this repo's root manifest and is captured by the
@@ -40,8 +40,10 @@ todo = "deny"
 unimplemented = "deny"
 indexing_slicing = "deny"  # use .get(i) over xs[i] / &xs[a..b]
 
-# The shared UI toolkit, by the one sibling-dependency spelling the lock
-# guard admits (AGENTS.md 'Rust code'): the screen window the client draws
-# in reaches this crate only through `td_ui::`.
+# The shared UI toolkit and the editor, by the one sibling-dependency
+# spelling the lock guard admits (AGENTS.md 'Rust code'): the widget window
+# the client draws in reaches this crate only through `td_ui::`, and the
+# document pane it reads a message in only through `td_editor::`.
 [dependencies]
 td-ui = { path = "../td-ui" }
+td-editor = { path = "../td-editor" }

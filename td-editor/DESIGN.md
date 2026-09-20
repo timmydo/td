@@ -2832,14 +2832,15 @@ module is imported. These fixtures do not replace the live Weston test.
 
 ## Embedding the document view
 
-td-news shows an article in a read-only document pane, and td-mail is
-to show a message in one and compose in an editable one, in their own
-windows beside the toolkit's lists, instead of calling out to an editor
-process. Each depends on the `td-editor` library crate by path, as a
-standalone target crate may on a `td-*` roster crate, with its recipe
-staging the `td-editor` tree beside `td-ui` and `td-compositor`;
-td-news's landing is APPLICATIONS.md §W.8, "Reworked again", and
-td-mail's is its own. The host owns the window, the surface, the
+td-news shows an article in a read-only document pane, td-mail shows
+a message in one, and td-mail is to compose in an editable one, in
+their own windows beside the toolkit's lists, instead of calling out to
+an editor process. Each depends on the `td-editor` library crate by
+path, as a standalone target crate may on a `td-*` roster crate, with
+its recipe staging the `td-editor` tree beside `td-ui` and
+`td-compositor`; both landings are APPLICATIONS.md §W.8, "Reworked
+again", and td-mail's composing is its own increment. The host owns the
+window, the surface, the
 event loop and every widget around the pane; the pane is a
 `ui::Controller` from `Controller::pane`, placed by `Event::Frame` with the
 pane's rectangle and the host's surface on each configure, and repainted
@@ -2900,7 +2901,7 @@ Those are outside this editor increment. td-mail retains local drafts and
 their sidecars; Save As does not move or rewrite attachment references.
 
 The caller inspected for this design is td-mail (then the standalone
-`tmc` repository, now `td-mail/` in this tree). Its `src/tui/mod.rs`
+`tmc` repository, now `td-mail/` in this tree). Its `src/ui/mod.rs`
 selects `[ui].editor`, then `$EDITOR`, then `vi`. A command made only of
 plain words (ASCII letters, digits and `._/+:@,-`, plus `=` after the
 first word, separated by spaces or tabs) whose first word is not a shell

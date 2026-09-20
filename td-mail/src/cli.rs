@@ -1727,7 +1727,7 @@ forward_draft: Generate a forward draft.
 
 Keybindings
 -----------
-keybindings: Export the TUI keybinding dictionary.
+keybindings: Export the window's keybinding dictionary.
    > {{"command": "keybindings"}}
    < {{"ok": true, "keybindings": [{{"view": "global", "key": "?", "action": "help", "description": "Show help"}}, ...]}}
 "#

@@ -4,13 +4,14 @@ use crate::types::Recipe;
 /// `mail` application packages (APPLICATIONS.md §W.8). Built as td-news
 /// and td-taskmgr are: a static Cargo build from the checkout's own
 /// `td-mail/` tree with the toolkit and the compositor's shared font and
-/// wire sources staged beside it, the `td-mail-source` seed pinned by the
-/// compiled seed-digest table, and the crate's committed lock naming
-/// itself and the one sibling.
+/// wire sources staged beside it, td-editor's tree for the document pane
+/// a message is read in, the `td-mail-source` seed pinned by the compiled
+/// seed-digest table, and the crate's committed lock naming itself and
+/// the two siblings.
 pub fn recipe() -> Recipe {
     Recipe::rust("td-mail", "0.1.0")
         .local_source("td-mail")
-        .local_source_trees(&["td-ui", "td-compositor"])
+        .local_source_trees(&["td-ui", "td-compositor", "td-editor"])
         .native_inputs(&[
             "rust-toolchain",
             "gcc-x86-64-self",
@@ -36,7 +37,11 @@ mod tests {
         assert_eq!(recipe.local_source.as_deref(), Some("td-mail"));
         assert_eq!(
             recipe.local_source_trees,
-            Some(vec!["td-ui".into(), "td-compositor".into()])
+            Some(vec![
+                "td-ui".into(),
+                "td-compositor".into(),
+                "td-editor".into()
+            ])
         );
         assert_eq!(recipe.cargo_subdir.as_deref(), Some("td-mail"));
         assert_eq!(recipe.cargo_lock.as_deref(), Some("td-mail/Cargo.lock"));
@@ -47,21 +52,23 @@ mod tests {
     }
 
     /// The lock the recipe names is the crate's own, and it closes over
-    /// exactly the crate and the toolkit: a registry or git entry would be
-    /// a dependency the gate refuses, and a missing `td-ui` entry a build
-    /// that could not resolve the window.
+    /// exactly the crate, the toolkit and the editor: a registry or git
+    /// entry would be a dependency the gate refuses, and a missing `td-ui`
+    /// or `td-editor` entry a build that could not resolve the window or
+    /// the pane.
     #[test]
-    fn td_mail_lock_names_the_crate_and_the_toolkit_alone() {
+    fn td_mail_lock_names_the_crate_the_toolkit_and_the_editor() {
         let lock = include_str!("../../../td-mail/Cargo.lock");
         let names: Vec<&str> = lock
             .lines()
             .filter_map(|line| line.strip_prefix("name = \""))
             .filter_map(|rest| rest.strip_suffix('"'))
             .collect();
-        assert_eq!(names, ["td-mail", "td-ui"]);
+        assert_eq!(names, ["td-editor", "td-mail", "td-ui"]);
         assert!(!lock.contains("source = "));
         let manifest = include_str!("../../../td-mail/Cargo.toml");
         assert!(manifest.contains("td-ui = { path = \"../td-ui\" }"));
+        assert!(manifest.contains("td-editor = { path = \"../td-editor\" }"));
     }
 
     /// The modules the two trees share are one text: the six std modules

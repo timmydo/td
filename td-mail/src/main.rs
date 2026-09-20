@@ -36,7 +36,7 @@ mod testing;
 // The shared module carries more of TOML than td-mail's two files need.
 #[allow(dead_code)]
 mod toml;
-mod tui;
+mod ui;
 
 use config::{AccountConfig, Config, PasswordSource};
 use jmap::client::{JmapClient, JmapError};
@@ -243,7 +243,6 @@ Here is the format:
 editor = "nvim"          # optional: editor for composing ($EDITOR fallback)
 browser = "firefox"      # optional: browser for opening URLs ($BROWSER fallback, then xdg-open)
 page_size = 100           # optional: emails per page (default 500)
-scrolloff = 1             # optional: keep this many context lines above/below cursor (default 1)
 mouse = true              # optional: enable mouse support (default true)
 sync_interval_secs = 60   # optional: background sync interval (default 60, 0 = off)
 
@@ -284,7 +283,7 @@ Rules:
 - `secret = "portal"` asks td's credential portal for the secret stored as mail/NAME for [account.NAME] (mail/default for a legacy [jmap] section); it needs no shell and no file, and it works inside a td jail only, where the helper is packaged. Submit the secret from the human session with `td-secret set mail/NAME < file`, then press Ctrl+Alt+Esc and W, verify the target and touch the enrolled token. NAME is 1 to 64 bytes of [A-Za-z0-9_-].
 - `password_command` is a shell command that prints the password to stdout.
 - Quoted strings support \", \\, \n, \t escapes.
-- `scrolloff` controls how many lines of context are kept above and below the cursor in list views.
+- `scrolloff` and `[theme]` were the terminal's; they are accepted and ignored. The window keeps the selection in view and draws with the toolkit's colours.
 - `archive_folder` and `deleted_folder` are mailbox targets for `a` and `d` in list views.
 - `rules_mailbox_regex` controls which mailbox names auto-run rules on refresh/fetch; default is `^INBOX$`.
 - `my_email_regex` is matched against combined To/Cc and used by rules with `skip_if_to_me = true`.
@@ -423,9 +422,6 @@ fn print_help_config() {
     );
     println!("  browser = \"firefox\"           # Browser for opening URLs (fallback: $BROWSER, xdg-open)");
     println!("  page_size = 500              # Emails per page (default: 500)");
-    println!(
-        "  scrolloff = 1               # Keep this many context lines while scrolling (default: 1)"
-    );
     println!("  mouse = true                 # Enable mouse support (default: true)");
     println!("  sync_interval_secs = 60      # Background sync interval in seconds (default: 60, 0 = off)");
     println!();
@@ -458,15 +454,7 @@ fn print_help_config() {
     println!("  folder = \"Archive\"            # Mailbox name to apply retention (required)");
     println!("  days = 365                   # Expire mail older than this many days (required)");
     println!();
-    println!("[theme]                          # Optional color customization (#RRGGBB hex)");
-    println!("  bg = \"#002b36\"               # Background color");
-    println!("  fg = \"#839496\"               # Foreground color");
-    println!("  bold_fg = \"#93a1a1\"          # Bold text color");
-    println!("  selection_bg = \"#073642\"     # Selection background");
-    println!("  selection_fg = \"#eee8d5\"     # Selection foreground");
-    println!("  status_bg = \"#586e75\"        # Status bar background");
-    println!("  status_fg = \"#eee8d5\"        # Status bar foreground");
-    println!("  header_fg = \"#268bd2\"        # Header text color");
+    println!("# `scrolloff` under [ui] and a [theme] section were the terminal's: accepted, ignored.");
     println!();
     println!(
         "Legacy: [jmap] section with well_known_url, username, password_command is also supported."
@@ -638,11 +626,10 @@ fn main() {
     // is made behind it, so a server that is down, a network that is not
     // up yet, or a placeholder account leaves the window open on what
     // the cache holds, and selecting the account again retries.
-    let outcome = tui::run(
+    let outcome = ui::run(
         config.accounts,
         0,
         config.ui.page_size,
-        config.ui.scrolloff,
         config.ui.editor,
         config.ui.browser,
         config.ui.mouse,
@@ -655,7 +642,6 @@ fn main() {
         config.mail.retention_policies,
         compiled_rules,
         custom_headers,
-        config.theme,
         config.spam,
         offline,
     );

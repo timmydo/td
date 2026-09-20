@@ -1,12 +1,14 @@
+//! The key reference, as text in the pane.
+
 use crate::backend::BackendResponse;
-use crate::tui::input::Key;
-use crate::tui::screen::Terminal;
-use crate::tui::views::{View, ViewAction};
-use std::io;
+use crate::ui::input::Key;
+use crate::ui::views::{text_scroll, wrap_text, Body, Scene, Scroll, View, ViewAction};
+
+const LABELS: &[&str] = &["Back"];
+const KEYS: &[Key] = &[Key::Char('q')];
 
 pub struct HelpView {
     lines: Vec<String>,
-    scroll: usize,
 }
 
 impl HelpView {
@@ -112,103 +114,34 @@ impl HelpView {
             String::new(),
         ];
 
-        HelpView { lines, scroll: 0 }
+        HelpView { lines }
     }
 }
 
 impl View for HelpView {
-    fn render(&self, term: &mut Terminal) -> io::Result<()> {
-        term.clear()?;
-
-        let visible_rows = (term.rows as usize).saturating_sub(1);
-
-        for (i, line) in self
-            .lines
-            .iter()
-            .skip(self.scroll)
-            .enumerate()
-            .take(visible_rows)
-        {
-            let row = 1 + i as u16;
-            term.move_to(row, 1)?;
-
-            // Bold section headers (lines that are followed by dashes or equal signs)
-            let is_header = !line.is_empty()
-                && !line.starts_with(' ')
-                && !line.starts_with('-')
-                && !line.starts_with('=');
-
-            if is_header {
-                term.set_header()?;
-                term.write_truncated(line, term.cols)?;
-                term.reset_attr()?;
-            } else {
-                term.write_truncated(line, term.cols)?;
-            }
+    fn scene(&self) -> Scene<'_> {
+        Scene {
+            title: "Help".to_string(),
+            labels: LABELS,
+            keys: KEYS,
+            entry: None,
+            body: Body::Text {
+                key: "help".to_string(),
+                text: Box::new(|columns| wrap_text(&self.lines.join("\n"), columns)),
+            },
+            status: "Help | q:close j/k:scroll".to_string(),
         }
-
-        // Status bar
-        term.move_to(term.rows, 1)?;
-        term.set_status()?;
-        let status = format!(
-            " Help | line {}/{} | q:close n/j:down p/k:up",
-            self.scroll + 1,
-            self.lines.len()
-        );
-        term.write_truncated(&status, term.cols)?;
-        let remaining = (term.cols as usize).saturating_sub(status.len());
-        for _ in 0..remaining {
-            term.write_str(" ")?;
-        }
-        term.reset_attr()?;
-
-        term.flush()
     }
 
-    fn handle_key(&mut self, key: Key, term_rows: u16) -> ViewAction {
-        let page = (term_rows as usize).saturating_sub(1);
+    fn handle_key(&mut self, key: Key, _page: usize) -> ViewAction {
+        if let Some(scroll) = text_scroll(key) {
+            return ViewAction::Scroll(scroll);
+        }
         match key {
             Key::Char('q') | Key::Char('?') | Key::Escape => ViewAction::Pop,
-            Key::Char('n') | Key::Char('j') | Key::Down => {
-                if self.scroll + 1 < self.lines.len() {
-                    self.scroll += 1;
-                }
-                ViewAction::Continue
-            }
-            Key::Char('p') | Key::Char('k') | Key::Up => {
-                if self.scroll > 0 {
-                    self.scroll -= 1;
-                }
-                ViewAction::Continue
-            }
-            Key::PageDown | Key::Char(' ') => {
-                self.scroll = (self.scroll + page).min(self.lines.len().saturating_sub(1));
-                ViewAction::Continue
-            }
-            Key::PageUp => {
-                self.scroll = self.scroll.saturating_sub(page);
-                ViewAction::Continue
-            }
-            Key::Home => {
-                self.scroll = 0;
-                ViewAction::Continue
-            }
-            Key::End => {
-                self.scroll = self.lines.len().saturating_sub(1);
-                ViewAction::Continue
-            }
-            Key::ScrollUp => {
-                if self.scroll > 0 {
-                    self.scroll -= 1;
-                }
-                ViewAction::Continue
-            }
-            Key::ScrollDown => {
-                if self.scroll + 1 < self.lines.len() {
-                    self.scroll += 1;
-                }
-                ViewAction::Continue
-            }
+            // The terminal's n and p, a line each; no unread to go to here.
+            Key::Char('n') => ViewAction::Scroll(Scroll::Lines(1)),
+            Key::Char('p') => ViewAction::Scroll(Scroll::Lines(-1)),
             _ => ViewAction::Continue,
         }
     }

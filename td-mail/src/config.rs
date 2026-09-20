@@ -75,52 +75,12 @@ fn portal_name(name: &str, section: &str) -> Result<String, ConfigError> {
     }
 }
 
-#[derive(Debug, Clone, Default)]
-pub struct Theme {
-    pub bg: Option<(u8, u8, u8)>,
-    pub fg: Option<(u8, u8, u8)>,
-    pub bold_fg: Option<(u8, u8, u8)>,
-    pub selection_bg: Option<(u8, u8, u8)>,
-    pub selection_fg: Option<(u8, u8, u8)>,
-    pub status_bg: Option<(u8, u8, u8)>,
-    pub status_fg: Option<(u8, u8, u8)>,
-    pub header_fg: Option<(u8, u8, u8)>,
-}
-
-fn parse_hex_color(s: &str, field: &str) -> Result<(u8, u8, u8), ConfigError> {
-    let s = s.trim();
-    if !s.starts_with('#') || s.len() != 7 {
-        return Err(ConfigError::Parse(format!(
-            "invalid color '{}' for theme.{}: expected #RRGGBB format",
-            s, field
-        )));
-    }
-    let r = u8::from_str_radix(&s[1..3], 16);
-    let g = u8::from_str_radix(&s[3..5], 16);
-    let b = u8::from_str_radix(&s[5..7], 16);
-    match (r, g, b) {
-        (Ok(r), Ok(g), Ok(b)) => Ok((r, g, b)),
-        _ => Err(ConfigError::Parse(format!(
-            "invalid hex digits in color '{}' for theme.{}",
-            s, field
-        ))),
-    }
-}
-
-fn resolve_color(value: &Option<String>, field: &str) -> Result<Option<(u8, u8, u8)>, ConfigError> {
-    match value {
-        Some(s) => Ok(Some(parse_hex_color(s, field)?)),
-        None => Ok(None),
-    }
-}
-
 #[derive(Debug)]
 pub struct Config {
     pub accounts: Vec<AccountConfig>,
     pub ui: UiConfig,
     pub mail: MailConfig,
     pub spam: SpamConfig,
-    pub theme: Theme,
 }
 
 /// Tunables for the built-in Bayesian spam classifier. The classifier scores
@@ -143,7 +103,6 @@ pub struct UiConfig {
     pub editor: Option<String>,
     pub browser: Option<String>,
     pub page_size: u32,
-    pub scrolloff: usize,
     pub mouse: bool,
     pub sync_interval_secs: Option<u64>,
 }
@@ -183,19 +142,10 @@ impl std::fmt::Display for ConfigError {
     }
 }
 
-/// `[theme]`. `deny_unknown_fields`, as every raw section below is.
-#[derive(Debug, Default)]
-struct RawThemeConfig {
-    bg: Option<String>,
-    fg: Option<String>,
-    bold_fg: Option<String>,
-    selection_bg: Option<String>,
-    selection_fg: Option<String>,
-    status_bg: Option<String>,
-    status_fg: Option<String>,
-    header_fg: Option<String>,
-}
-
+/// `[theme]`: the terminal's colours, which the window does not read
+/// (it draws with the toolkit's); the section and its keys are accepted
+/// so a configuration written for the terminal still loads, and checked,
+/// as every raw section is, so a typo is still a typo.
 const THEME_KEYS: &[&str] = &[
     "bg",
     "fg",
@@ -206,23 +156,6 @@ const THEME_KEYS: &[&str] = &[
     "status_fg",
     "header_fg",
 ];
-
-impl RawThemeConfig {
-    fn from_toml(table: &Toml) -> Result<Self, TomlError> {
-        table.check_known_keys(THEME_KEYS)?;
-        let text = |key: &str| table.optional_str(key).map(|v| v.map(str::to_string));
-        Ok(RawThemeConfig {
-            bg: text("bg")?,
-            fg: text("fg")?,
-            bold_fg: text("bold_fg")?,
-            selection_bg: text("selection_bg")?,
-            selection_fg: text("selection_fg")?,
-            status_bg: text("status_bg")?,
-            status_fg: text("status_fg")?,
-            header_fg: text("header_fg")?,
-        })
-    }
-}
 
 #[derive(Debug)]
 struct RawConfig {
@@ -235,7 +168,6 @@ struct RawConfig {
     account: Vec<(String, RawAccountFields)>,
     retention: Vec<(String, RawRetentionPolicy)>,
     spam: RawSpamConfig,
-    theme: RawThemeConfig,
 }
 
 const CONFIG_KEYS: &[&str] = &[
@@ -294,10 +226,9 @@ impl RawConfig {
             Some(table) => RawSpamConfig::from_toml(table)?,
             None => RawSpamConfig::default(),
         };
-        let theme = match section("theme")? {
-            Some(table) => RawThemeConfig::from_toml(table)?,
-            None => RawThemeConfig::default(),
-        };
+        if let Some(table) = section("theme")? {
+            table.check_known_keys(THEME_KEYS)?;
+        }
         Ok(RawConfig {
             ui,
             mail,
@@ -305,7 +236,6 @@ impl RawConfig {
             account,
             retention,
             spam,
-            theme,
         })
     }
 }
@@ -356,7 +286,6 @@ struct RawUiConfig {
     editor: Option<String>,
     browser: Option<String>,
     page_size: u32,
-    scrolloff: usize,
     mouse: bool,
     sync_interval_secs: u64,
 }
@@ -373,15 +302,14 @@ const UI_KEYS: &[&str] = &[
 impl RawUiConfig {
     fn from_toml(table: &Toml) -> Result<Self, TomlError> {
         table.check_known_keys(UI_KEYS)?;
+        // The terminal's key: its value is still checked, not read.
+        let _ = table.optional_usize("scrolloff")?;
         Ok(RawUiConfig {
             editor: table.optional_str("editor")?.map(str::to_string),
             browser: table.optional_str("browser")?.map(str::to_string),
             page_size: table
                 .optional_u32("page_size")?
                 .unwrap_or_else(default_page_size),
-            scrolloff: table
-                .optional_usize("scrolloff")?
-                .unwrap_or_else(default_scrolloff),
             mouse: table.optional_bool("mouse")?.unwrap_or_else(default_mouse),
             sync_interval_secs: table
                 .optional_u64("sync_interval_secs")?
@@ -396,7 +324,6 @@ impl Default for RawUiConfig {
             editor: None,
             browser: None,
             page_size: default_page_size(),
-            scrolloff: default_scrolloff(),
             mouse: default_mouse(),
             sync_interval_secs: default_sync_interval_secs(),
         }
@@ -522,10 +449,6 @@ impl RawRetentionPolicy {
 
 fn default_page_size() -> u32 {
     500
-}
-
-fn default_scrolloff() -> usize {
-    1
 }
 
 fn default_mouse() -> bool {
@@ -679,25 +602,12 @@ impl Config {
             )));
         }
 
-        let theme = Theme {
-            bg: resolve_color(&raw.theme.bg, "bg")?,
-            fg: resolve_color(&raw.theme.fg, "fg")?,
-            bold_fg: resolve_color(&raw.theme.bold_fg, "bold_fg")?,
-            selection_bg: resolve_color(&raw.theme.selection_bg, "selection_bg")?,
-            selection_fg: resolve_color(&raw.theme.selection_fg, "selection_fg")?,
-            status_bg: resolve_color(&raw.theme.status_bg, "status_bg")?,
-            status_fg: resolve_color(&raw.theme.status_fg, "status_fg")?,
-            header_fg: resolve_color(&raw.theme.header_fg, "header_fg")?,
-        };
-
         Ok(Config {
             accounts,
-            theme,
             ui: UiConfig {
                 editor: raw.ui.editor,
                 browser: raw.ui.browser,
                 page_size: raw.ui.page_size,
-                scrolloff: raw.ui.scrolloff,
                 mouse: raw.ui.mouse,
                 sync_interval_secs: if raw.ui.sync_interval_secs == 0 {
                     None
@@ -764,7 +674,6 @@ scrolloff = 3
         assert_eq!(config.accounts.len(), 1);
         assert_eq!(config.accounts[0].name, "default");
         assert_eq!(config.ui.page_size, 25);
-        assert_eq!(config.ui.scrolloff, 3);
         assert_eq!(config.ui.sync_interval_secs, Some(60));
         assert!(config.ui.mouse);
         assert_eq!(config.mail.rules_mailbox_regex.as_str(), "^INBOX$");
@@ -844,14 +753,12 @@ password_command = "pass show email/work.com"
         assert_eq!(config.accounts[0].name, "personal");
         assert_eq!(config.accounts[1].name, "work");
         assert_eq!(config.ui.editor.as_deref(), Some("nvim"));
-        assert_eq!(config.ui.scrolloff, 2);
     }
 
     #[test]
     fn test_defaults_and_sync_interval_zero() {
         let config = Config::parse(&jmap_config("[ui]\nsync_interval_secs = 0")).unwrap();
         assert_eq!(config.ui.page_size, 500);
-        assert_eq!(config.ui.scrolloff, 1);
         assert_eq!(config.ui.sync_interval_secs, None);
     }
 
@@ -956,75 +863,26 @@ password_command = "pass show email/example.com"
         );
     }
 
+    /// The terminal's `scrolloff` and `[theme]` still load, ignored, so a
+    /// configuration written for it is not refused; a key the terminal
+    /// never had is.
     #[test]
-    fn test_theme_defaults_all_none() {
-        let config = Config::parse(&jmap_config("")).unwrap();
-        assert!(config.theme.bg.is_none());
-        assert!(config.theme.fg.is_none());
-        assert!(config.theme.bold_fg.is_none());
-        assert!(config.theme.selection_bg.is_none());
-        assert!(config.theme.selection_fg.is_none());
-        assert!(config.theme.status_bg.is_none());
-        assert!(config.theme.status_fg.is_none());
-        assert!(config.theme.header_fg.is_none());
-    }
-
-    #[test]
-    fn test_theme_parses_hex_colors() {
+    fn the_terminals_theme_and_scrolloff_are_accepted_and_ignored() {
         let config = Config::parse(&jmap_config(
-            r##"[theme]
+            r##"[ui]
+scrolloff = 3
+
+[theme]
 bg = "#002b36"
-fg = "#839496"
-bold_fg = "#93a1a1"
-selection_bg = "#073642"
-selection_fg = "#eee8d5"
-status_bg = "#586e75"
-status_fg = "#eee8d5"
-header_fg = "#268bd2"
+header_fg = "not even a colour"
 "##,
         ))
         .unwrap();
-        assert_eq!(config.theme.bg, Some((0x00, 0x2b, 0x36)));
-        assert_eq!(config.theme.fg, Some((0x83, 0x94, 0x96)));
-        assert_eq!(config.theme.bold_fg, Some((0x93, 0xa1, 0xa1)));
-        assert_eq!(config.theme.selection_bg, Some((0x07, 0x36, 0x42)));
-        assert_eq!(config.theme.selection_fg, Some((0xee, 0xe8, 0xd5)));
-        assert_eq!(config.theme.status_bg, Some((0x58, 0x6e, 0x75)));
-        assert_eq!(config.theme.status_fg, Some((0xee, 0xe8, 0xd5)));
-        assert_eq!(config.theme.header_fg, Some((0x26, 0x8b, 0xd2)));
-    }
-
-    #[test]
-    fn test_theme_partial_colors() {
-        let config = Config::parse(&jmap_config(
-            "[theme]\nbg = \"#002b36\"\nheader_fg = \"#268bd2\"",
-        ))
-        .unwrap();
-        assert_eq!(config.theme.bg, Some((0x00, 0x2b, 0x36)));
-        assert!(config.theme.fg.is_none());
-        assert_eq!(config.theme.header_fg, Some((0x26, 0x8b, 0xd2)));
-    }
-
-    #[test]
-    fn test_theme_invalid_hex_format() {
-        let err = Config::parse(&jmap_config("[theme]\nbg = \"red\"")).unwrap_err();
+        assert_eq!(config.ui.page_size, 500);
+        assert!(Config::parse(&jmap_config("[ui]\nscrolloff = \"three\"")).is_err());
+        let err = Config::parse(&jmap_config("[theme]\ncursor = \"#ffffff\"")).unwrap_err();
         match err {
-            ConfigError::Parse(msg) => {
-                assert!(msg.contains("invalid color"), "got: {}", msg);
-                assert!(msg.contains("theme.bg"), "got: {}", msg);
-            }
-            _ => panic!("expected parse error"),
-        }
-    }
-
-    #[test]
-    fn test_theme_invalid_hex_digits() {
-        let err = Config::parse(&jmap_config("[theme]\nfg = \"#ZZZZZZ\"")).unwrap_err();
-        match err {
-            ConfigError::Parse(msg) => {
-                assert!(msg.contains("invalid hex digits"), "got: {}", msg);
-                assert!(msg.contains("theme.fg"), "got: {}", msg);
-            }
+            ConfigError::Parse(msg) => assert!(msg.contains("cursor"), "got: {}", msg),
             _ => panic!("expected parse error"),
         }
     }
@@ -1144,7 +1002,9 @@ secret = "portal"
             let err = Config::parse(&account(&name)).unwrap_err();
             match err {
                 ConfigError::Parse(msg) => assert!(
-                    msg.contains("the portal cannot name this account; a credential name is 1 to 64 bytes"),
+                    msg.contains(
+                        "the portal cannot name this account; a credential name is 1 to 64 bytes"
+                    ),
                     "{}: got: {}",
                     name,
                     msg

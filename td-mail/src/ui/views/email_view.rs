@@ -2,20 +2,52 @@ use crate::backend::{BackendCommand, BackendResponse, EmailMutationAction};
 use crate::compose;
 use crate::jmap::types::{Email, Mailbox};
 use crate::rules;
-use crate::tui::input::Key;
-use crate::tui::screen::Terminal;
-use crate::tui::views::help::HelpView;
-use crate::tui::views::{View, ViewAction};
+use crate::ui::input::Key;
+use crate::ui::views::help::HelpView;
+use crate::ui::views::{
+    strip_newlines, text_scroll, wrap_text, Body, Row, Scene, Scroll, View, ViewAction,
+};
 use std::collections::HashMap;
-use std::io;
 use std::sync::mpsc;
 
-#[derive(Clone, Copy, PartialEq)]
-enum LineKind {
-    Header,
-    Separator,
-    Body,
-}
+/// The action bar's labels for the view's modes, and the key each stands
+/// for; a press on a label is that key.
+const LABELS: &[&str] = &[
+    "Back",
+    "Reply",
+    "Reply all",
+    "Forward",
+    "Archive",
+    "Delete",
+    "Move",
+    "Links",
+    "HTML",
+    "Help",
+];
+const KEYS: &[Key] = &[
+    Key::Char('q'),
+    Key::Char('r'),
+    Key::Char('R'),
+    Key::Char('F'),
+    Key::Char('a'),
+    Key::Char('d'),
+    Key::Char('m'),
+    Key::Char('b'),
+    Key::Char('h'),
+    Key::Char('?'),
+];
+const URL_LABELS: &[&str] = &["Open", "Cancel"];
+const URL_KEYS: &[Key] = &[Key::Enter, Key::Escape];
+const MOVE_LABELS: &[&str] = &["Move", "Cancel"];
+const MOVE_KEYS: &[Key] = &[Key::Enter, Key::Escape];
+const ATTACHMENT_LABELS: &[&str] = &["Cancel"];
+const ATTACHMENT_KEYS: &[Key] = &[Key::Escape];
+
+/// Where a thread's messages part. The rule is drawn only in the text
+/// closure, which alone knows the pane's columns, so until then the line
+/// stands as a scalar a message body has no reason to carry (and which the
+/// pane would show as U+FFFD if one did).
+const SEPARATOR: &str = "\u{1}";
 
 fn format_size(bytes: u64) -> String {
     if bytes < 1024 {
@@ -25,50 +57,6 @@ fn format_size(bytes: u64) -> String {
     } else {
         format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
     }
-}
-
-/// Word-wrap a line at `max_width` characters, preferring to break at spaces.
-fn wrap_line(s: &str, max_width: usize) -> Vec<&str> {
-    if max_width == 0 || s.is_empty() {
-        return vec![s];
-    }
-
-    let char_len = s.chars().count();
-    if char_len <= max_width {
-        return vec![s];
-    }
-
-    let mut result = Vec::new();
-    let mut remaining = s;
-
-    while !remaining.is_empty() {
-        let char_len = remaining.chars().count();
-        if char_len <= max_width {
-            result.push(remaining);
-            break;
-        }
-
-        // Find the byte position of the max_width-th character
-        let byte_end = remaining
-            .char_indices()
-            .nth(max_width)
-            .map(|(pos, _)| pos)
-            .unwrap_or(remaining.len());
-
-        let segment = &remaining[..byte_end];
-
-        // Try to find a space to break at
-        if let Some(space_pos) = segment.rfind(' ') {
-            result.push(&remaining[..space_pos]);
-            remaining = &remaining[space_pos + 1..];
-        } else {
-            // Hard break at max_width
-            result.push(segment);
-            remaining = &remaining[byte_end..];
-        }
-    }
-
-    result
 }
 
 /// Heuristic check: does this text look like HTML rather than plain text?
@@ -91,58 +79,27 @@ fn looks_like_html(text: &str) -> bool {
         || lower.contains("<div")
 }
 
-/// Convert HTML to terminal-formatted text with ANSI escape codes for
-/// bold, underline, color, etc. using the rich rendering mode.
+/// Convert HTML to the plain text the document pane shows.
 ///
-/// `to_rich` hands back the same tagged spans html2text's coloured
-/// rendering did, so the SGR each tag turns into is unchanged; rendering
-/// cannot fail, so there is no fallback to the raw HTML any more.
-fn html_to_terminal(html: &str) -> String {
+/// `to_rich` carries the markup as tags rather than characters, and what
+/// survives here is what a target is: a link's URL and an image's source,
+/// after the text they belong to. Emphasis, code and colour are dropped
+/// rather than turned into escape sequences: the pane shows a control
+/// scalar as U+FFFD, so an escape would be read as text.
+fn html_to_text(html: &str) -> String {
     use crate::html::Tag;
 
     let mut out = String::new();
     for line in crate::html::to_rich(html.as_bytes(), 80) {
         for span in line {
-            let mut prefix = String::new();
-            let mut suffix = String::new();
+            out.push_str(&span.text);
             for tag in &span.tags {
                 match tag {
-                    Tag::Strong => {
-                        prefix.push_str("\x1b[1m");
-                        suffix.push_str("\x1b[22m");
-                    }
-                    Tag::Emphasis => {
-                        prefix.push_str("\x1b[3m");
-                        suffix.push_str("\x1b[23m");
-                    }
-                    Tag::Strikeout => {
-                        prefix.push_str("\x1b[9m");
-                        suffix.push_str("\x1b[29m");
-                    }
-                    Tag::Code | Tag::Preformat => {
-                        prefix.push_str("\x1b[2m");
-                        suffix.push_str("\x1b[22m");
-                    }
-                    Tag::Link(url) => {
-                        // Show link URL after text in dim
-                        suffix.push_str(&format!(" \x1b[2m[{}]\x1b[22m", url));
-                    }
-                    Tag::Image(src) => {
-                        suffix.push_str(&format!(" \x1b[2m[img: {}]\x1b[22m", src));
-                    }
-                    Tag::Colour(c) => {
-                        prefix.push_str(&format!("\x1b[38;2;{};{};{}m", c.r, c.g, c.b));
-                        suffix.push_str("\x1b[39m");
-                    }
-                    Tag::BgColour(c) => {
-                        prefix.push_str(&format!("\x1b[48;2;{};{};{}m", c.r, c.g, c.b));
-                        suffix.push_str("\x1b[49m");
-                    }
+                    Tag::Link(url) => out.push_str(&format!(" [{}]", url)),
+                    Tag::Image(src) => out.push_str(&format!(" [img: {}]", src)),
+                    _ => {}
                 }
             }
-            out.push_str(&prefix);
-            out.push_str(&span.text);
-            out.push_str(&suffix);
         }
         out.push('\n');
     }
@@ -182,9 +139,11 @@ pub struct EmailView {
     can_expire_now: bool,
     email_id: String,
     email: Option<Email>,
+    /// The message as lines, unwrapped: the pane's columns wrap them.
     lines: Vec<String>,
-    line_kinds: Vec<LineKind>,
-    scroll: usize,
+    /// Bumped whenever `lines` is rebuilt, so the text's key changes with
+    /// what it says even when the message is the same one.
+    text_generation: u64,
     loading: bool,
     error: Option<String>,
     pending_reply_all: Option<bool>,
@@ -198,6 +157,8 @@ pub struct EmailView {
     raw_headers_cache: HashMap<String, String>,
     raw_headers_loading: bool,
     thread_id: Option<String>,
+    /// The thread's subject as the list gave it, for the window's title.
+    thread_subject: String,
     thread_emails: Vec<Email>,
     mailboxes: Vec<Mailbox>,
     archive_folder: String,
@@ -234,8 +195,7 @@ impl EmailView {
             email_id,
             email: None,
             lines: Vec::new(),
-            line_kinds: Vec::new(),
-            scroll: 0,
+            text_generation: 0,
             loading: true,
             error: None,
             pending_reply_all: None,
@@ -249,6 +209,7 @@ impl EmailView {
             raw_headers_cache: HashMap::new(),
             raw_headers_loading: false,
             thread_id: None,
+            thread_subject: String::new(),
             thread_emails: Vec::new(),
             mailboxes,
             archive_folder,
@@ -270,7 +231,7 @@ impl EmailView {
         cmd_tx: mpsc::Sender<BackendCommand>,
         reply_from_address: String,
         thread_id: String,
-        _subject: String,
+        subject: String,
         can_expire_now: bool,
         mailboxes: Vec<Mailbox>,
         archive_folder: String,
@@ -287,8 +248,7 @@ impl EmailView {
             email_id: String::new(),
             email: None,
             lines: Vec::new(),
-            line_kinds: Vec::new(),
-            scroll: 0,
+            text_generation: 0,
             loading: true,
             error: None,
             pending_reply_all: None,
@@ -302,6 +262,7 @@ impl EmailView {
             raw_headers_cache: HashMap::new(),
             raw_headers_loading: false,
             thread_id: Some(thread_id),
+            thread_subject: subject,
             thread_emails: Vec::new(),
             mailboxes,
             archive_folder,
@@ -362,7 +323,6 @@ impl EmailView {
         self.email_id = next_id;
         self.loading = true;
         self.error = None;
-        self.scroll = 0;
         let _ = self.cmd_tx.send(BackendCommand::GetEmail {
             id: self.email_id.clone(),
         });
@@ -377,128 +337,105 @@ impl EmailView {
         true
     }
 
-    fn render_headers(
-        email: &Email,
-        raw_headers: Option<&str>,
-        lines: &mut Vec<String>,
-        kinds: &mut Vec<LineKind>,
-    ) {
+    fn render_headers(email: &Email, raw_headers: Option<&str>, lines: &mut Vec<String>) {
         if let Some(raw) = raw_headers {
             for line in raw.lines() {
                 lines.push(line.to_string());
-                kinds.push(LineKind::Header);
             }
         } else {
             if let Some(ref from) = email.from {
                 let addrs: Vec<String> = from.iter().map(|a| a.to_string()).collect();
                 lines.push(format!("From: {}", addrs.join(", ")));
-                kinds.push(LineKind::Header);
             }
             if let Some(ref to) = email.to {
                 let addrs: Vec<String> = to.iter().map(|a| a.to_string()).collect();
                 lines.push(format!("To: {}", addrs.join(", ")));
-                kinds.push(LineKind::Header);
             }
             if let Some(ref cc) = email.cc {
                 if !cc.is_empty() {
                     let addrs: Vec<String> = cc.iter().map(|a| a.to_string()).collect();
                     lines.push(format!("Cc: {}", addrs.join(", ")));
-                    kinds.push(LineKind::Header);
                 }
             }
             if let Some(ref date) = email.received_at {
                 lines.push(format!("Date: {}", date));
-                kinds.push(LineKind::Header);
             }
             lines.push(format!(
                 "Subject: {}",
                 email.subject.as_deref().unwrap_or("(no subject)")
             ));
-            kinds.push(LineKind::Header);
         }
     }
 
+    /// One message as lines, and the links it carries in the order the
+    /// picker numbers them.
     fn render_email(
         email: &Email,
         raw_headers: Option<&str>,
         prefer_html: bool,
-    ) -> (Vec<String>, Vec<LineKind>, Vec<String>) {
+    ) -> (Vec<String>, Vec<String>) {
         let mut lines = Vec::new();
-        let mut kinds = Vec::new();
 
-        Self::render_headers(email, raw_headers, &mut lines, &mut kinds);
+        Self::render_headers(email, raw_headers, &mut lines);
 
         // Attachments
         if let Some(ref attachments) = email.attachments {
             if !attachments.is_empty() {
                 lines.push(String::new());
-                kinds.push(LineKind::Body);
                 lines.push(format!("Attachments ({})", attachments.len()));
-                kinds.push(LineKind::Body);
                 for (i, att) in attachments.iter().enumerate() {
                     let name = att.name.as_deref().unwrap_or("unnamed");
                     let size = att.size.map(format_size).unwrap_or_default();
                     let type_str = att.r#type.as_deref().unwrap_or("application/octet-stream");
                     lines.push(format!("  [{}] {} ({}, {})", i + 1, name, type_str, size));
-                    kinds.push(LineKind::Body);
                 }
                 lines.push("  Press 'A' then 1-9 to download/open".to_string());
-                kinds.push(LineKind::Body);
             }
         }
 
         // Separator
         lines.push(String::new());
-        kinds.push(LineKind::Body);
 
         // Body
         let body_text = Self::extract_body(email, prefer_html);
         for line in body_text.lines() {
             lines.push(line.to_string());
-            kinds.push(LineKind::Body);
         }
 
         // Extract and append URLs
         let urls = extract_urls(&body_text);
         if !urls.is_empty() {
             lines.push(String::new());
-            kinds.push(LineKind::Body);
             lines.push("Links:".to_string());
-            kinds.push(LineKind::Header);
             for (i, url) in urls.iter().enumerate() {
                 lines.push(format!("  [{}] {}", i + 1, url));
-                kinds.push(LineKind::Body);
             }
         }
 
-        (lines, kinds, urls)
+        (lines, urls)
     }
 
+    /// A thread's messages as lines, parted by `SEPARATOR`, with every link
+    /// they carry listed once at the end.
     fn render_thread_emails(
         emails: &[Email],
         raw_headers_cache: &HashMap<String, String>,
         prefer_html: bool,
-    ) -> (Vec<String>, Vec<LineKind>, Vec<String>) {
+    ) -> (Vec<String>, Vec<String>) {
         let mut lines = Vec::new();
-        let mut kinds = Vec::new();
         let mut all_urls = Vec::new();
         for (i, email) in emails.iter().enumerate() {
             if i > 0 {
                 lines.push(String::new());
-                kinds.push(LineKind::Body);
+                lines.push(SEPARATOR.to_string());
                 lines.push(String::new());
-                kinds.push(LineKind::Separator);
-                lines.push(String::new());
-                kinds.push(LineKind::Body);
             }
             let raw = raw_headers_cache.get(&email.id).map(|s| s.as_str());
-            Self::render_headers(email, raw, &mut lines, &mut kinds);
+            Self::render_headers(email, raw, &mut lines);
             lines.push(String::new());
-            kinds.push(LineKind::Body);
             let body_text = Self::extract_body(email, prefer_html);
             for line in body_text.lines() {
                 lines.push(line.to_string());
-                kinds.push(LineKind::Body);
             }
             for url in extract_urls(&body_text) {
                 if !all_urls.contains(&url) {
@@ -509,15 +446,12 @@ impl EmailView {
         // Append combined URL list at end
         if !all_urls.is_empty() {
             lines.push(String::new());
-            kinds.push(LineKind::Body);
             lines.push("Links:".to_string());
-            kinds.push(LineKind::Header);
             for (i, url) in all_urls.iter().enumerate() {
                 lines.push(format!("  [{}] {}", i + 1, url));
-                kinds.push(LineKind::Body);
             }
         }
-        (lines, kinds, all_urls)
+        (lines, all_urls)
     }
 
     fn extract_body(email: &Email, prefer_html: bool) -> String {
@@ -526,7 +460,7 @@ impl EmailView {
             if let Some(ref html_body) = email.html_body {
                 for part in html_body {
                     if let Some(value) = email.body_values.get(&part.part_id) {
-                        return html_to_terminal(&value.value);
+                        return html_to_text(&value.value);
                     }
                 }
             }
@@ -543,7 +477,7 @@ impl EmailView {
                             .map(|t| t.eq_ignore_ascii_case("text/html"))
                             .unwrap_or(false)
                     {
-                        return html_to_terminal(&value.value);
+                        return html_to_text(&value.value);
                     }
                     return value.value.clone();
                 }
@@ -553,7 +487,7 @@ impl EmailView {
         if let Some(ref html_body) = email.html_body {
             for part in html_body {
                 if let Some(value) = email.body_values.get(&part.part_id) {
-                    return html_to_terminal(&value.value);
+                    return html_to_text(&value.value);
                 }
             }
         }
@@ -661,7 +595,7 @@ impl EmailView {
                 .spawn()
             {
                 Ok(child) => {
-                    crate::tui::reap_in_background(child);
+                    crate::ui::reap_in_background(child);
                     self.status_message = Some(format!("Opening [{}]...", index + 1));
                 }
                 Err(e) => {
@@ -675,30 +609,38 @@ impl EmailView {
         }
     }
 
+    /// Rebuilds the lines and the links from what is loaded, and bumps the
+    /// generation so the pane reloads the text its key now names.
     fn rerender_lines(&mut self) {
-        if self.thread_id.is_some() && !self.thread_emails.is_empty() {
+        let rebuilt = if self.thread_id.is_some() && !self.thread_emails.is_empty() {
+            let empty = HashMap::new();
             let cache = if self.show_all_headers {
                 &self.raw_headers_cache
             } else {
                 // Empty map = use structured headers
-                &HashMap::new()
+                &empty
             };
-            let (lines, kinds, urls) =
-                Self::render_thread_emails(&self.thread_emails, cache, self.prefer_html);
-            self.lines = lines;
-            self.line_kinds = kinds;
-            self.urls = urls;
+            Some(Self::render_thread_emails(
+                &self.thread_emails,
+                cache,
+                self.prefer_html,
+            ))
         } else if let Some(ref email) = self.email {
             let raw = if self.show_all_headers {
                 self.raw_headers_cache.get(&email.id).map(|s| s.as_str())
             } else {
                 None
             };
-            let (lines, kinds, urls) = Self::render_email(email, raw, self.prefer_html);
-            self.lines = lines;
-            self.line_kinds = kinds;
-            self.urls = urls;
-        }
+            Some(Self::render_email(email, raw, self.prefer_html))
+        } else {
+            None
+        };
+        let Some((lines, urls)) = rebuilt else {
+            return;
+        };
+        self.lines = lines;
+        self.urls = urls;
+        self.text_generation = self.text_generation.wrapping_add(1);
     }
 
     fn rollback_pending_write(&mut self, op: PendingWriteOp) {
@@ -832,233 +774,123 @@ impl EmailView {
             }
         }
     }
-}
 
-impl View for EmailView {
-    fn wants_mouse(&self) -> bool {
-        false
+    /// The subject the window names: the thread's, as the list gave it, or
+    /// the loaded message's.
+    fn subject(&self) -> &str {
+        if !self.thread_subject.is_empty() {
+            return &self.thread_subject;
+        }
+        self.email
+            .as_ref()
+            .and_then(|email| email.subject.as_deref())
+            .filter(|subject| !subject.is_empty())
+            .unwrap_or("(no subject)")
     }
 
-    fn render(&self, term: &mut Terminal) -> io::Result<()> {
-        term.clear()?;
+    fn title(&self) -> String {
+        match (self.loading, self.thread_id.is_some()) {
+            (true, true) => "Thread".to_string(),
+            (true, false) => "Email".to_string(),
+            (false, true) => format!("Thread: {}", strip_newlines(self.subject())),
+            (false, false) => strip_newlines(self.subject()),
+        }
+    }
 
+    /// The key of the text shown: what it is of, the generation its lines
+    /// were built in, and the flags that change what they say, so the pane
+    /// reloads exactly when the text differs.
+    fn text_key(&self) -> String {
+        let id = self.thread_id.as_deref().unwrap_or(&self.email_id);
+        format!(
+            "email:{}:{}:{}{}",
+            id,
+            self.text_generation,
+            if self.show_all_headers { 'v' } else { '-' },
+            if self.prefer_html { 'h' } else { '-' }
+        )
+    }
+
+    fn body(&self) -> Body<'_> {
         if self.loading {
-            term.move_to(1, 1)?;
-            let load_msg = if self.thread_id.is_some() {
+            let note = if self.thread_id.is_some() {
                 "Loading thread..."
             } else {
                 "Loading email..."
             };
-            term.write_truncated(load_msg, term.cols)?;
-            term.move_to(term.rows, 1)?;
-            term.set_status()?;
-            term.write_truncated(" Loading... | q:back", term.cols)?;
-            let remaining = (term.cols as usize).saturating_sub(20);
-            for _ in 0..remaining {
-                term.write_str(" ")?;
-            }
-            term.reset_attr()?;
-            return term.flush();
+            return Body::message(note.to_string());
         }
-
-        if let Some(ref err) = self.error {
-            term.move_to(1, 1)?;
-            term.write_truncated(err, term.cols)?;
-            term.move_to(term.rows, 1)?;
-            term.set_status()?;
-            term.write_truncated(" q:back", term.cols)?;
-            let remaining = (term.cols as usize).saturating_sub(7);
-            for _ in 0..remaining {
-                term.write_str(" ")?;
-            }
-            term.reset_attr()?;
-            return term.flush();
+        if let Some(ref error) = self.error {
+            return Body::message(error.clone());
         }
-
         if self.url_picking {
-            term.move_to(1, 1)?;
-            term.set_header()?;
-            term.write_truncated("Open URL:", term.cols)?;
-            term.reset_attr()?;
-
-            let max_items = (term.rows as usize).saturating_sub(3);
-            let url_scroll = if self.url_cursor >= max_items {
-                self.url_cursor - max_items + 1
-            } else {
-                0
+            return Body::List {
+                total: self.urls.len(),
+                selected: self.url_cursor,
+                row: Box::new(move |index| Row {
+                    label: self.urls.get(index).cloned().unwrap_or_default(),
+                    meta: format!("[{}]", index + 1),
+                    marked: false,
+                }),
             };
-
-            for (i, url) in self
-                .urls
-                .iter()
-                .skip(url_scroll)
-                .enumerate()
-                .take(max_items)
-            {
-                let row = 2 + i as u16;
-                term.move_to(row, 1)?;
-
-                let display_idx = url_scroll + i;
-                let line = format!("  [{}] {}", display_idx + 1, url);
-
-                if display_idx == self.url_cursor {
-                    term.set_selection()?;
-                }
-
-                term.write_truncated(&line, term.cols)?;
-                term.reset_attr()?;
-            }
-
-            // Status bar
-            term.move_to(term.rows, 1)?;
-            term.set_status()?;
-            let status = format!(
-                " {}/{} | 1-{}:open n/p:navigate RET:open Esc:cancel",
-                self.url_cursor + 1,
-                self.urls.len(),
-                self.urls.len()
-            );
-            term.write_truncated(&status, term.cols)?;
-            let remaining = (term.cols as usize).saturating_sub(status.len());
-            for _ in 0..remaining {
-                term.write_str(" ")?;
-            }
-            term.reset_attr()?;
-
-            return term.flush();
         }
-
         if self.move_mode {
-            term.move_to(1, 1)?;
-            term.set_header()?;
-            term.write_truncated("Move to mailbox:", term.cols)?;
-            term.reset_attr()?;
-
-            let max_items = (term.rows as usize).saturating_sub(3);
-            let scroll_offset = if self.move_cursor >= max_items {
-                self.move_cursor - max_items + 1
-            } else {
-                0
+            return Body::List {
+                total: self.mailboxes.len(),
+                selected: self.move_cursor,
+                row: Box::new(move |index| Row {
+                    label: self
+                        .mailboxes
+                        .get(index)
+                        .map(|mailbox| strip_newlines(&mailbox.name))
+                        .unwrap_or_default(),
+                    meta: String::new(),
+                    marked: false,
+                }),
             };
-
-            for (i, mailbox) in self
-                .mailboxes
-                .iter()
-                .skip(scroll_offset)
-                .enumerate()
-                .take(max_items)
-            {
-                let row = 2 + i as u16;
-                term.move_to(row, 1)?;
-
-                let display_idx = scroll_offset + i;
-                let line = format!("  {}", mailbox.name);
-
-                if display_idx == self.move_cursor {
-                    term.set_selection()?;
-                }
-
-                term.write_truncated(&line, term.cols)?;
-                term.reset_attr()?;
-            }
-
-            // Status bar
-            term.move_to(term.rows, 1)?;
-            term.set_status()?;
-            let status = format!(
-                " {}/{} | n/p:navigate RET:move Esc:cancel",
-                self.move_cursor + 1,
-                self.mailboxes.len()
-            );
-            term.write_truncated(&status, term.cols)?;
-            let remaining = (term.cols as usize).saturating_sub(status.len());
-            for _ in 0..remaining {
-                term.write_str(" ")?;
-            }
-            term.reset_attr()?;
-
-            return term.flush();
         }
-
-        let visible_rows = (term.rows as usize).saturating_sub(1);
-        let width = term.cols as usize;
-
-        let mut row_idx = 0;
-        for (i, line) in self.lines.iter().skip(self.scroll).enumerate() {
-            if row_idx >= visible_rows {
-                break;
-            }
-
-            let abs_idx = self.scroll + i;
-            let kind = self
-                .line_kinds
-                .get(abs_idx)
-                .copied()
-                .unwrap_or(LineKind::Body);
-
-            match kind {
-                LineKind::Header => {
-                    let row = 1 + row_idx as u16;
-                    term.move_to(row, 1)?;
-                    term.set_header()?;
-                    term.write_truncated(line, term.cols)?;
-                    term.reset_attr()?;
-                    row_idx += 1;
-                }
-                LineKind::Separator => {
-                    let row = 1 + row_idx as u16;
-                    term.move_to(row, 1)?;
-                    // Bar spanning entire width
-                    term.set_status()?;
-                    let pad = " ".repeat(width);
-                    term.write_str(&pad)?;
-                    term.reset_attr()?;
-                    row_idx += 1;
-                }
-                LineKind::Body => {
-                    if line.is_empty() {
-                        let row = 1 + row_idx as u16;
-                        term.move_to(row, 1)?;
-                        row_idx += 1;
+        Body::Text {
+            key: self.text_key(),
+            text: Box::new(move |columns| {
+                let mut text = String::new();
+                for (index, line) in self.lines.iter().enumerate() {
+                    if index > 0 {
+                        text.push('\n');
+                    }
+                    if line == SEPARATOR {
+                        text.push_str(&"─".repeat(columns));
                     } else {
-                        for segment in wrap_line(line, width) {
-                            if row_idx >= visible_rows {
-                                break;
-                            }
-                            let row = 1 + row_idx as u16;
-                            term.move_to(row, 1)?;
-                            term.write_truncated(segment, term.cols)?;
-                            row_idx += 1;
-                        }
+                        text.push_str(line);
                     }
                 }
-            }
+                wrap_text(&text, columns)
+            }),
         }
+    }
 
-        // Status bar
-        term.move_to(term.rows, 1)?;
-        term.set_status()?;
-        let total_lines = self.lines.len();
-        let base_status = if self.url_picking {
+    fn status(&self) -> String {
+        let base = if self.loading {
+            "Loading... | q:back".to_string()
+        } else if self.error.is_some() {
+            "q:back".to_string()
+        } else if self.url_picking {
             format!(
-                " line {}/{} | Open URL [1-{}] n/p:navigate RET:open or any key to cancel",
-                self.scroll + 1,
-                total_lines,
+                "Open URL [1-{}] n/p:navigate RET:open or any key to cancel",
                 self.urls.len()
+            )
+        } else if self.move_mode {
+            format!(
+                "{}/{} | n/p:navigate RET:move Esc:cancel",
+                self.move_cursor + 1,
+                self.mailboxes.len()
             )
         } else if self.attachment_picking {
             format!(
-                " line {}/{} | Pick attachment [1-{}] or any key to cancel",
-                self.scroll + 1,
-                total_lines,
+                "Pick attachment [1-{}] or any key to cancel",
                 self.attachment_count()
             )
         } else if self.pending_reply_all.is_some() || self.pending_forward {
-            format!(
-                " line {}/{} | Loading reply data... | q:back",
-                self.scroll + 1,
-                total_lines
-            )
+            "Loading reply data... | q:back".to_string()
         } else {
             let att_hint = if self.attachment_count() > 0 {
                 " A:attach"
@@ -1072,30 +904,39 @@ impl View for EmailView {
                 ""
             };
             format!(
-                " line {}/{} | q:back n/p:unread j/k:scroll r:reply R:reply-all F:forward h:html{}{}{} a:archive d:delete m:move J:spam H:ham S:score ?:help",
-                self.scroll + 1,
-                total_lines,
-                att_hint,
-                expire_hint,
-                url_hint
+                "q:back n/p:unread j/k:scroll r:reply R:reply-all F:forward h:html{}{}{} a:archive d:delete m:move J:spam H:ham S:score ?:help",
+                att_hint, expire_hint, url_hint
             )
         };
-        let status = if let Some(ref msg) = self.status_message {
-            format!("{} | {}", msg, base_status)
-        } else {
-            base_status
-        };
-        term.write_truncated(&status, term.cols)?;
-        let remaining = (term.cols as usize).saturating_sub(status.len());
-        for _ in 0..remaining {
-            term.write_str(" ")?;
+        match self.status_message {
+            Some(ref msg) => format!("{} | {}", msg, base),
+            None => base,
         }
-        term.reset_attr()?;
+    }
+}
 
-        term.flush()
+impl View for EmailView {
+    fn scene(&self) -> Scene<'_> {
+        let (labels, keys) = if self.url_picking {
+            (URL_LABELS, URL_KEYS)
+        } else if self.move_mode {
+            (MOVE_LABELS, MOVE_KEYS)
+        } else if self.attachment_picking {
+            (ATTACHMENT_LABELS, ATTACHMENT_KEYS)
+        } else {
+            (LABELS, KEYS)
+        };
+        Scene {
+            title: self.title(),
+            labels,
+            keys,
+            entry: None,
+            body: self.body(),
+            status: self.status(),
+        }
     }
 
-    fn handle_key(&mut self, key: Key, term_rows: u16) -> ViewAction {
+    fn handle_key(&mut self, key: Key, _page: usize) -> ViewAction {
         // Attachment picking mode: waiting for digit
         if self.attachment_picking {
             self.attachment_picking = false;
@@ -1108,7 +949,9 @@ impl View for EmailView {
             return ViewAction::Continue;
         }
 
-        // URL picking mode
+        // URL picking mode: the links are a list here, so a press on one
+        // opens it as Enter opens the one under the cursor, and the wheel
+        // moves the cursor rather than cancelling.
         if self.url_picking {
             self.url_picking = false;
             match key {
@@ -1116,13 +959,19 @@ impl View for EmailView {
                     let index = (c as usize) - ('1' as usize);
                     self.open_url(index);
                 }
-                Key::Char('n') | Key::Char('j') | Key::Down => {
-                    if !self.urls.is_empty() && self.url_cursor + 1 < self.urls.len() {
+                Key::Click(index) => {
+                    if index < self.urls.len() {
+                        self.url_cursor = index;
+                    }
+                    self.open_url(index);
+                }
+                Key::Char('n') | Key::Char('j') | Key::Down | Key::ScrollDown => {
+                    if self.url_cursor + 1 < self.urls.len() {
                         self.url_cursor += 1;
                     }
                     self.url_picking = true; // stay in picking mode
                 }
-                Key::Char('p') | Key::Char('k') | Key::Up => {
+                Key::Char('p') | Key::Char('k') | Key::Up | Key::ScrollUp => {
                     if self.url_cursor > 0 {
                         self.url_cursor -= 1;
                     }
@@ -1144,8 +993,13 @@ impl View for EmailView {
                 Key::Escape | Key::Char('q') => {
                     self.move_mode = false;
                 }
+                Key::Click(index) => {
+                    if index < self.mailboxes.len() {
+                        self.move_cursor = index;
+                    }
+                }
                 Key::Char('n') | Key::Char('j') | Key::Down | Key::ScrollDown => {
-                    if !self.mailboxes.is_empty() && self.move_cursor + 1 < self.mailboxes.len() {
+                    if self.move_cursor + 1 < self.mailboxes.len() {
                         self.move_cursor += 1;
                     }
                 }
@@ -1167,48 +1021,29 @@ impl View for EmailView {
             return ViewAction::Continue;
         }
 
-        let page = (term_rows as usize).saturating_sub(1);
+        // Reading the message is the pane's; the view keeps only the keys
+        // that mean something else here.
+        if let Some(scroll) = text_scroll(key) {
+            return ViewAction::Scroll(scroll);
+        }
+
         match key {
             Key::Char('q') => ViewAction::Pop,
+            // n/p are next/previous unread; with no unread message to go to
+            // they read on, as j/k do.
             Key::Char('n') => {
-                if !self.navigate_unread(true) && self.scroll + 1 < self.lines.len() {
-                    self.scroll += 1;
+                if self.navigate_unread(true) {
+                    ViewAction::Continue
+                } else {
+                    ViewAction::Scroll(Scroll::Lines(1))
                 }
-                ViewAction::Continue
             }
             Key::Char('p') => {
-                if !self.navigate_unread(false) && self.scroll > 0 {
-                    self.scroll -= 1;
+                if self.navigate_unread(false) {
+                    ViewAction::Continue
+                } else {
+                    ViewAction::Scroll(Scroll::Lines(-1))
                 }
-                ViewAction::Continue
-            }
-            Key::Char('j') | Key::Down => {
-                if self.scroll + 1 < self.lines.len() {
-                    self.scroll += 1;
-                }
-                ViewAction::Continue
-            }
-            Key::Char('k') | Key::Up => {
-                if self.scroll > 0 {
-                    self.scroll -= 1;
-                }
-                ViewAction::Continue
-            }
-            Key::PageDown | Key::Char(' ') => {
-                self.scroll = (self.scroll + page).min(self.lines.len().saturating_sub(1));
-                ViewAction::Continue
-            }
-            Key::PageUp => {
-                self.scroll = self.scroll.saturating_sub(page);
-                ViewAction::Continue
-            }
-            Key::Home => {
-                self.scroll = 0;
-                ViewAction::Continue
-            }
-            Key::End => {
-                self.scroll = self.lines.len().saturating_sub(1);
-                ViewAction::Continue
             }
             Key::Char('r') => {
                 self.request_reply(false);
@@ -1391,18 +1226,6 @@ impl View for EmailView {
                 ViewAction::Continue
             }
             Key::Char('?') => ViewAction::Push(Box::new(HelpView::new())),
-            Key::ScrollUp => {
-                if self.scroll > 0 {
-                    self.scroll -= 1;
-                }
-                ViewAction::Continue
-            }
-            Key::ScrollDown => {
-                if self.scroll + 1 < self.lines.len() {
-                    self.scroll += 1;
-                }
-                ViewAction::Continue
-            }
             _ => ViewAction::Continue,
         }
     }
@@ -1420,20 +1243,7 @@ impl View for EmailView {
                             self.email_id = last.id.clone();
                             self.email = Some(last.clone());
                         }
-                        let empty = HashMap::new();
-                        let cache = if self.show_all_headers {
-                            &self.raw_headers_cache
-                        } else {
-                            &empty
-                        };
-                        let (lines, kinds, urls) = Self::render_thread_emails(
-                            &self.thread_emails,
-                            cache,
-                            self.prefer_html,
-                        );
-                        self.lines = lines;
-                        self.line_kinds = kinds;
-                        self.urls = urls;
+                        self.rerender_lines();
                         self.error = None;
                         // Mark all unread thread emails as read
                         let unread_ids: Vec<String> = emails
@@ -1466,16 +1276,8 @@ impl View for EmailView {
                         if let Some(idx) = self.nav_entries.iter().position(|e| e.id == email.id) {
                             self.nav_cursor = idx;
                         }
-                        let raw = if self.show_all_headers {
-                            self.raw_headers_cache.get(&email.id).map(|s| s.as_str())
-                        } else {
-                            None
-                        };
-                        let (lines, kinds, urls) = Self::render_email(email, raw, self.prefer_html);
-                        self.lines = lines;
-                        self.line_kinds = kinds;
-                        self.urls = urls;
                         self.email = Some(email.clone());
+                        self.rerender_lines();
                         self.error = None;
                         self.pending_write_ops.clear();
                     }
@@ -1570,7 +1372,7 @@ impl View for EmailView {
                             .stderr(std::process::Stdio::null())
                             .spawn()
                         {
-                            Ok(child) => crate::tui::reap_in_background(child),
+                            Ok(child) => crate::ui::reap_in_background(child),
                             Err(e) => {
                                 self.status_message =
                                     Some(format!("Saved {} (could not open: {})", name, e));
@@ -1636,7 +1438,9 @@ impl View for EmailView {
 /// `sh -f -c <script> sh <url>`, `-f` so a `?` or `*` in the link is not a
 /// pattern either.
 fn browser_script(cmd: &str) -> String {
-    let cmd = cmd.replace("\"{url}\"", "{url}").replace("'{url}'", "{url}");
+    let cmd = cmd
+        .replace("\"{url}\"", "{url}")
+        .replace("'{url}'", "{url}");
     if cmd.contains("{url}") {
         cmd.replace("{url}", "\"$1\"")
     } else {
@@ -1671,8 +1475,205 @@ mod browser_script_tests {
                 .arg(link)
                 .output()
                 .expect("sh");
-            assert!(out.status.success(), "{cmd}: {}", String::from_utf8_lossy(&out.stderr));
-            assert_eq!(String::from_utf8_lossy(&out.stdout).trim_end(), expected, "{cmd}");
+            assert!(
+                out.status.success(),
+                "{cmd}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert_eq!(
+                String::from_utf8_lossy(&out.stdout).trim_end(),
+                expected,
+                "{cmd}"
+            );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+    use super::*;
+
+    fn make_email(id: &str, subject: &str, preview: &str) -> Email {
+        Email {
+            id: id.to_string(),
+            thread_id: None,
+            from: None,
+            to: None,
+            cc: None,
+            reply_to: None,
+            subject: Some(subject.to_string()),
+            received_at: Some("2025-01-01".to_string()),
+            sent_at: None,
+            preview: Some(preview.to_string()),
+            text_body: None,
+            html_body: None,
+            body_values: HashMap::new(),
+            keywords: HashMap::new(),
+            mailbox_ids: HashMap::new(),
+            message_id: None,
+            references: None,
+            attachments: None,
+            extra: HashMap::new(),
+        }
+    }
+
+    /// A view on one loaded message. Its browser is `true`, so opening a
+    /// link runs a command that does nothing.
+    fn loaded_view(preview: &str) -> (EmailView, mpsc::Receiver<BackendCommand>) {
+        let (cmd_tx, cmd_rx) = mpsc::channel();
+        let mut view = EmailView::new(
+            cmd_tx,
+            "me@example.com".to_string(),
+            "e1".to_string(),
+            Vec::new(),
+            0,
+            false,
+            Vec::new(),
+            "Archive".to_string(),
+            "Trash".to_string(),
+            Some("true".to_string()),
+        );
+        view.on_response(&BackendResponse::EmailBody {
+            id: "e1".to_string(),
+            result: Box::new(Ok(make_email("e1", "Hello", preview))),
+        });
+        (view, cmd_rx)
+    }
+
+    /// The key of the text the scene shows, and the text itself.
+    fn shown_text(view: &EmailView, columns: usize) -> (String, String) {
+        match view.scene().body {
+            Body::Text { key, text } => (key, text(columns)),
+            Body::List { .. } => panic!("the message is a text"),
+        }
+    }
+
+    #[test]
+    fn the_message_is_the_panes_text_titled_by_its_subject() {
+        let (view, _rx) = loaded_view("plain body");
+        {
+            let scene = view.scene();
+            assert_eq!(scene.title, "Hello");
+            assert_eq!(scene.labels, LABELS);
+            assert_eq!(scene.labels.len(), scene.keys.len());
+        }
+        let (_, text) = shown_text(&view, 40);
+        assert!(text.contains("Subject: Hello"), "{text}");
+        assert!(text.contains("plain body"), "{text}");
+    }
+
+    #[test]
+    fn the_texts_key_changes_when_the_headers_toggle_and_when_the_raw_headers_arrive() {
+        let (mut view, _rx) = loaded_view("plain body");
+        let (first, _) = shown_text(&view, 40);
+        view.handle_key(Key::Char('v'), 20);
+        let (toggled, _) = shown_text(&view, 40);
+        assert_ne!(first, toggled, "the raw headers were asked for");
+        view.on_response(&BackendResponse::EmailRawHeaders {
+            id: "e1".to_string(),
+            result: Ok("X-Mailer: td-mail\nSubject: Hello".to_string()),
+        });
+        let (arrived, text) = shown_text(&view, 60);
+        assert_ne!(toggled, arrived, "the raw headers arrived");
+        assert!(text.contains("X-Mailer: td-mail"), "{text}");
+    }
+
+    #[test]
+    fn the_url_picker_lists_the_links_and_a_press_opens_the_one_pressed() {
+        let (mut view, _rx) = loaded_view("see https://a.example/1 and https://b.example/2");
+        view.handle_key(Key::Char('b'), 20);
+        {
+            let scene = view.scene();
+            assert_eq!(scene.labels, URL_LABELS);
+            let Body::List {
+                total,
+                selected,
+                row,
+            } = scene.body
+            else {
+                panic!("the links are a list");
+            };
+            assert_eq!((total, selected), (2, 0));
+            assert_eq!(
+                row(0),
+                Row {
+                    label: "https://a.example/1".to_string(),
+                    meta: "[1]".to_string(),
+                    marked: false,
+                }
+            );
+            assert_eq!(row(1).label, "https://b.example/2");
+            assert_eq!(row(1).meta, "[2]");
+        }
+        view.handle_key(Key::Click(1), 20);
+        assert!(!view.url_picking, "the press left the picker");
+        assert_eq!(view.url_cursor, 1);
+        assert_eq!(view.status_message.as_deref(), Some("Opening [2]..."));
+    }
+
+    #[test]
+    fn the_reading_keys_are_the_panes_and_n_reads_on_with_nothing_unread() {
+        let (mut view, _rx) = loaded_view("plain body");
+        assert!(matches!(
+            view.handle_key(Key::Char('j'), 20),
+            ViewAction::Scroll(Scroll::Lines(1))
+        ));
+        assert!(matches!(
+            view.handle_key(Key::PageDown, 20),
+            ViewAction::Scroll(Scroll::Pages(1))
+        ));
+        assert!(matches!(
+            view.handle_key(Key::End, 20),
+            ViewAction::Scroll(Scroll::Chord("End"))
+        ));
+        // No nav entries: n and p read on rather than jumping.
+        assert!(matches!(
+            view.handle_key(Key::Char('n'), 20),
+            ViewAction::Scroll(Scroll::Lines(1))
+        ));
+        assert!(matches!(
+            view.handle_key(Key::Char('p'), 20),
+            ViewAction::Scroll(Scroll::Lines(-1))
+        ));
+    }
+
+    #[test]
+    fn a_threads_messages_are_parted_by_a_rule_across_the_pane() {
+        let (cmd_tx, _cmd_rx) = mpsc::channel();
+        let mut view = EmailView::new_thread(
+            cmd_tx,
+            "me@example.com".to_string(),
+            "t1".to_string(),
+            "The subject".to_string(),
+            false,
+            Vec::new(),
+            "Archive".to_string(),
+            "Trash".to_string(),
+            None,
+        );
+        assert_eq!(view.scene().title, "Thread");
+        view.on_response(&BackendResponse::ThreadEmails {
+            thread_id: "t1".to_string(),
+            emails: Ok(vec![
+                make_email("e1", "The subject", "first"),
+                make_email("e2", "Re: The subject", "second"),
+            ]),
+        });
+        assert_eq!(view.scene().title, "Thread: The subject");
+        let (_, text) = shown_text(&view, 12);
+        assert!(text.contains(&"─".repeat(12)), "{text}");
+        assert!(text.contains("first") && text.contains("second"), "{text}");
+    }
+
+    #[test]
+    fn the_html_body_is_plain_text_carrying_the_link_and_image_targets() {
+        let text = html_to_text(
+            "<p><b>Bold</b> <a href=\"http://e/x\">go</a> <img src=\"p.png\" alt=\"Pic\"></p>",
+        );
+        assert!(!text.contains('\u{1b}'), "no escape sequences: {text}");
+        assert!(text.contains("Bold"), "{text}");
+        assert!(text.contains("go [http://e/x]"), "{text}");
+        assert!(text.contains("Pic [img: p.png]"), "{text}");
     }
 }
