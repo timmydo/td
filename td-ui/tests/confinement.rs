@@ -23,7 +23,7 @@ fn compact(text: &str) -> String {
     text.chars().filter(|c| !c.is_whitespace()).collect()
 }
 
-const PURE: [&str; 22] = [
+const PURE: [&str; 23] = [
     "charts.rs",
     "chrome.rs",
     "confirmations.rs",
@@ -36,6 +36,7 @@ const PURE: [&str; 22] = [
     "pointer.rs",
     "raster.rs",
     "repeat.rs",
+    "screen.rs",
     "split.rs",
     "tree_table.rs",
     "tree_table_geometry.rs",
@@ -62,6 +63,7 @@ fn source_inventory_and_shared_mounts_are_closed() {
                 "lib.rs",
                 "notices.rs",
                 "replay.rs",
+                "screen_app.rs",
                 "sys.rs",
                 "wayland.rs",
             ]

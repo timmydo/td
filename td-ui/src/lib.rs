@@ -17,9 +17,13 @@
 //! the consumer's turn; `replay`: the consecutive-frame runner behind a
 //! headless `--replay`; `driven`: the semantic seam, a `Controller` over
 //! a consumer's action table with the generic verbs routed over the
-//! envelope, text read back from the draw stream and the painted frame).
-//! Outside `wayland`, `client`, the private raw module beneath them and
-//! the driving adapters `control_socket`, `control_worker` and `replay`
+//! envelope, text read back from the draw stream and the painted frame),
+//! and the cell screen a program that draws in rows and columns paints
+//! (`screen`: the styled grid as a composition, the key vocabulary and
+//! the chord translation; `screen_app`: the window that presents it and
+//! polls the program's handler). Outside `wayland`, `client`, the private
+//! raw module beneath them, the driving adapters `control_socket`,
+//! `control_worker` and `replay`, and the screen window `screen_app`
 //! nothing reads the environment, a clock, a descriptor or the
 //! filesystem: adapters supply explicit inputs, and `notices` embeds the
 //! face's licence texts at compile time.
@@ -53,6 +57,8 @@ pub mod pointer;
 pub mod raster;
 pub mod repeat;
 pub mod replay;
+pub mod screen;
+pub mod screen_app;
 pub mod split;
 mod sys;
 pub mod tree_table;
