@@ -145,7 +145,8 @@ fn the_action_table_is_closed_aligned_and_reachable() {
         match binding.chord {
             None => {
                 assert!(
-                    ["open", "select", "scroll", "look", "crop", "aspect"].contains(&binding.name),
+                    ["open", "select", "scroll", "look", "crop", "aspect", "exposure"]
+                        .contains(&binding.name),
                     "{} has no key",
                     binding.name
                 );
@@ -155,6 +156,11 @@ fn the_action_table_is_closed_aligned_and_reachable() {
         }
     }
     assert_eq!(Action::parse("colour"), None);
+    // `LookAt` is bounded by name: no look-0, and none past the ninth.
+    assert_eq!(Action::parse("look-0"), None);
+    assert_eq!(Action::parse("look-10"), None);
+    assert_eq!(Action::LookAt(0).name(), "look-0");
+    assert_eq!(Action::LookAt(10).name(), "look-0");
     let help = driven::help(&BINDINGS);
     for binding in BINDINGS {
         assert!(help.contains(binding.name) && help.contains(binding.help));
@@ -1274,7 +1280,7 @@ fn the_binary_replays_the_cull_over_a_roll_and_writes_through_the_sidecar() {
             "-"
         ]
     );
-    assert_eq!(&reply(2)[..2], ["ok", "38"]);
+    assert_eq!(&reply(2)[..2], ["ok", "49"]);
     assert_eq!(reply(3), ["ok", "changed"]);
     assert_eq!(reply(4), ["ok", &name(1), "pick", "-", "-", "-", "ok", "-"]);
     assert_eq!(
@@ -2174,7 +2180,7 @@ fn the_develop_box_is_the_preview_box_only_in_develop_mode() {
         c.develop_box(),
         Some(Rect {
             x: 224,
-            y: 88,
+            y: 120,
             width: 568,
             height: 378,
         })
@@ -2314,7 +2320,7 @@ fn a_crop_drag_refuses_clicks_tiny_marquees_and_off_canvas_presses() {
     c.set_preview_fit(Some(canvas));
 
     // A press off the canvas arms no drag: the far edges are exclusive.
-    assert_eq!(press(&mut c, 250, 50), Outcome::Ignored);
+    assert_eq!(press(&mut c, 250, 150), Outcome::Ignored);
     assert_eq!(c.crop_drag(), None);
     assert_eq!(press(&mut c, 700, 200), Outcome::Ignored);
     assert_eq!(c.crop_drag(), None);
@@ -2968,13 +2974,17 @@ fn the_look_palette_is_a_fact_and_witnessed_by_the_frame() {
         bare
     );
 
-    // set_looks is a fact, like the job count and the preview fit: no bump.
+    // set_looks is a fact absent from `state`, but the look band lists the
+    // looks, so a list that differs is a frame change: the generation
+    // moves once, and the same list again leaves it alone.
     c.set_looks(some_looks());
-    assert_eq!(fields(&c)[GENERATION], quiet);
-    assert_eq!(
-        driven::fnv1a64(&driven::paint(&c.scene()).unwrap().rgb),
-        bare
-    );
+    assert_ne!(fields(&c)[GENERATION], quiet);
+    let listed = fields(&c)[GENERATION].clone();
+    let with_band = driven::fnv1a64(&driven::paint(&c.scene()).unwrap().rgb);
+    assert_ne!(with_band, bare);
+    c.set_looks(some_looks());
+    assert_eq!(fields(&c)[GENERATION], listed);
+    let bare = with_band;
 
     // Opening the palette over the non-empty list shows it: a frame change.
     assert_eq!(act(&mut c, "looks", &[]), Outcome::Changed);
@@ -3056,12 +3066,13 @@ fn the_look_palette_marks_the_current_look_and_picks_with_the_pointer() {
 #[test]
 fn the_look_palette_pick_needs_a_develop_box() {
     // On a surface too small for a develop box the palette opens as a sub-mode
-    // but paints nothing, so a press picks nothing: no row exists to hit.
+    // (the status row names it) but paints no list, so a press picks
+    // nothing: no row exists to hit.
     let mut c = Controller::new(surface(400, 40));
     c.open("roll", b"/r", photos(1)).unwrap();
     assert_eq!(act(&mut c, "develop", &[]), Outcome::Changed);
     c.set_looks(some_looks());
-    assert_eq!(act(&mut c, "looks", &[]), Outcome::Ignored);
+    assert_eq!(act(&mut c, "looks", &[]), Outcome::Changed);
     assert!(c.look_palette().is_some());
     assert_eq!(c.develop_box(), None);
 
@@ -3212,11 +3223,13 @@ fn the_look_palette_drops_on_a_photo_switch() {
 }
 
 #[test]
-fn the_look_palette_is_not_witnessed_without_a_develop_box() {
-    // A surface too small for a develop box: the sub-mode can open, but with
-    // no box nothing paints the palette, so its toggle is not a frame change.
-    // The witness gates the generation on the box, as the paint does.
-    let mut c = Controller::new(surface(400, 40));
+fn the_look_palette_is_witnessed_by_the_status_row_without_a_develop_box() {
+    // A surface too small for a develop box: nothing paints the palette,
+    // but the status row names the sub-mode, so its toggle is a frame
+    // change all the same, and the generation moves with the frame (a
+    // row wide enough to show the word; a narrower one clips it as it
+    // clips any of its text).
+    let mut c = Controller::new(surface(800, 40));
     c.open("roll", b"/r", photos(1)).unwrap();
     assert_eq!(act(&mut c, "develop", &[]), Outcome::Changed);
     c.set_looks(some_looks());
@@ -3224,18 +3237,39 @@ fn the_look_palette_is_not_witnessed_without_a_develop_box() {
 
     let bare = driven::fnv1a64(&driven::paint(&c.scene()).unwrap().rgb);
     let quiet = fields(&c)[GENERATION].clone();
-    // Opening the sub-mode paints nothing over a boxless surface: Ignored, no
-    // bump, and the frame does not move.
-    assert_eq!(act(&mut c, "looks", &[]), Outcome::Ignored);
+    assert_eq!(act(&mut c, "looks", &[]), Outcome::Changed);
     assert!(c.look_palette().is_some());
-    assert_eq!(fields(&c)[GENERATION], quiet);
+    assert_ne!(fields(&c)[GENERATION], quiet);
+    assert_ne!(
+        driven::fnv1a64(&driven::paint(&c.scene()).unwrap().rgb),
+        bare
+    );
+    assert!(c.scene().status_line().ends_with(" | develop looks"));
+    // Closing it again returns the frame.
+    let open = fields(&c)[GENERATION].clone();
+    assert_eq!(act(&mut c, "looks", &[]), Outcome::Changed);
+    assert_ne!(fields(&c)[GENERATION], open);
     assert_eq!(
         driven::fnv1a64(&driven::paint(&c.scene()).unwrap().rgb),
         bare
     );
-    // Closing it again is likewise no frame change.
+    // Escape closes it the same way.
+    assert_eq!(act(&mut c, "looks", &[]), Outcome::Changed);
+    let open = fields(&c)[GENERATION].clone();
+    assert_eq!(key(&mut c, "Escape"), Outcome::Changed);
+    assert!(c.look_palette().is_none());
+    assert_ne!(fields(&c)[GENERATION], open);
+    assert!(c.scene().status_line().ends_with(" | develop"));
+    // Crop-adjust is named the same way, with no box to draw handles in.
+    assert_eq!(act(&mut c, "adjust-crop", &[]), Outcome::Changed);
+    assert!(c.scene().status_line().ends_with(" | develop crop-adjust"));
+    assert_ne!(
+        driven::fnv1a64(&driven::paint(&c.scene()).unwrap().rgb),
+        bare
+    );
+    // An empty look list has nothing to open: Ignored, as before.
+    c.set_looks(Vec::new());
     assert_eq!(act(&mut c, "looks", &[]), Outcome::Ignored);
-    assert_eq!(fields(&c)[GENERATION], quiet);
 }
 
 #[test]
@@ -3286,7 +3320,7 @@ fn a_locked_corner_drag_maps_the_ratio_in_pixel_space() {
     let mut c = develop_at(
         Rect {
             x: 220,
-            y: 48,
+            y: 96,
             width: 400,
             height: 300,
         },
@@ -3299,12 +3333,12 @@ fn a_locked_corner_drag_maps_the_ratio_in_pixel_space() {
     assert_eq!(act(&mut c, "aspect", &["3:2"]), Outcome::Ignored);
     // Grabbing the south-east corner paints the crop already shown, not a
     // reshaped ratio box: a zero-delta grab keeps the free path.
-    assert_eq!(press(&mut c, 520, 273), Outcome::Ignored);
+    assert_eq!(press(&mut c, 520, 321), Outcome::Ignored);
     assert_eq!(
         c.crop_adjust_rect(),
         Some(Rect {
             x: 320,
-            y: 123,
+            y: 171,
             width: 200,
             height: 150,
         })
@@ -3312,17 +3346,17 @@ fn a_locked_corner_drag_maps_the_ratio_in_pixel_space() {
     // Dragging the corner out holds 3:2 in pixels: 300x200 on screen, a 9:8
     // box in the crop's fractions; the live overlay is already the committed
     // box.
-    assert_eq!(drag_to(&mut c, 620, 348), Outcome::Changed);
+    assert_eq!(drag_to(&mut c, 620, 396), Outcome::Changed);
     assert_eq!(
         c.crop_adjust_rect(),
         Some(Rect {
             x: 320,
-            y: 123,
+            y: 171,
             width: 300,
             height: 200,
         })
     );
-    let (outcome, effects) = release(&mut c, 620, 348);
+    let (outcome, effects) = release(&mut c, 620, 396);
     assert_eq!(outcome, Outcome::Changed);
     assert_eq!(
         effects,
@@ -3346,7 +3380,7 @@ fn a_locked_grab_without_moving_neither_reshapes_nor_commits() {
     let mut c = develop_at(
         Rect {
             x: 220,
-            y: 48,
+            y: 96,
             width: 600,
             height: 400,
         },
@@ -3356,17 +3390,17 @@ fn a_locked_grab_without_moving_neither_reshapes_nor_commits() {
     assert_eq!(act(&mut c, "adjust-crop", &[]), Outcome::Changed);
     let full = Rect {
         x: 220,
-        y: 48,
+        y: 96,
         width: 600,
         height: 400,
     };
     assert_eq!(c.crop_adjust_rect(), Some(full));
     let crop_before = fields(&c)[CROP].clone();
     // The grab does not reshape the full-frame overlay to a square.
-    assert_eq!(press(&mut c, 220, 48), Outcome::Ignored);
+    assert_eq!(press(&mut c, 220, 96), Outcome::Ignored);
     assert_eq!(c.crop_adjust_rect(), Some(full));
     // Releasing without moving commits nothing and leaves the crop untouched.
-    let (outcome, effects) = release(&mut c, 220, 48);
+    let (outcome, effects) = release(&mut c, 220, 96);
     assert_eq!(outcome, Outcome::Ignored);
     assert!(effects.is_empty());
     assert_eq!(fields(&c)[CROP], crop_before);
@@ -3377,7 +3411,7 @@ fn a_corner_drag_holds_the_locked_ratio() {
     let mut c = develop_at(
         Rect {
             x: 220,
-            y: 48,
+            y: 96,
             width: 600,
             height: 400,
         },
@@ -3389,18 +3423,18 @@ fn a_corner_drag_holds_the_locked_ratio() {
     assert_eq!(act(&mut c, "aspect", &["3:2"]), Outcome::Ignored);
     // Drag the south-east corner out to the canvas: the box grows holding 3:2,
     // capped by the canvas edge; the live overlay is already the committed box.
-    assert_eq!(press(&mut c, 670, 248), Outcome::Ignored);
-    assert_eq!(drag_to(&mut c, 820, 448), Outcome::Changed);
+    assert_eq!(press(&mut c, 670, 296), Outcome::Ignored);
+    assert_eq!(drag_to(&mut c, 820, 496), Outcome::Changed);
     assert_eq!(
         c.crop_adjust_rect(),
         Some(Rect {
             x: 370,
-            y: 48,
+            y: 96,
             width: 450,
             height: 300,
         })
     );
-    let (outcome, effects) = release(&mut c, 820, 448);
+    let (outcome, effects) = release(&mut c, 820, 496);
     assert_eq!(outcome, Outcome::Changed);
     assert_eq!(
         effects,
@@ -3418,7 +3452,7 @@ fn an_edge_drag_under_a_lock_adjusts_the_orthogonal_dimension() {
     let mut c = develop_at(
         Rect {
             x: 220,
-            y: 48,
+            y: 96,
             width: 600,
             height: 400,
         },
@@ -3428,9 +3462,9 @@ fn an_edge_drag_under_a_lock_adjusts_the_orthogonal_dimension() {
     assert_eq!(act(&mut c, "aspect", &["3:2"]), Outcome::Ignored);
     // Drag the east edge inward: the width shrinks and the height follows to
     // hold 3:2, centred on the crop's old horizontal midline.
-    assert_eq!(press(&mut c, 670, 248), Outcome::Ignored);
-    assert_eq!(drag_to(&mut c, 610, 248), Outcome::Changed);
-    let (_, effects) = release(&mut c, 610, 248);
+    assert_eq!(press(&mut c, 670, 296), Outcome::Ignored);
+    assert_eq!(drag_to(&mut c, 610, 296), Outcome::Changed);
+    let (_, effects) = release(&mut c, 610, 296);
     assert_eq!(
         effects,
         [Effect::Edit {
@@ -3447,7 +3481,7 @@ fn a_one_to_one_lock_keeps_a_square_in_pixels() {
     let mut c = develop_at(
         Rect {
             x: 220,
-            y: 48,
+            y: 96,
             width: 400,
             height: 400,
         },
@@ -3457,18 +3491,18 @@ fn a_one_to_one_lock_keeps_a_square_in_pixels() {
     // Arming the lock paints nothing (the full image is already 1:1 here).
     assert_eq!(act(&mut c, "aspect", &["1:1"]), Outcome::Ignored);
     // Drag the north-west corner in: the box stays square in pixels.
-    assert_eq!(press(&mut c, 220, 48), Outcome::Ignored);
-    assert_eq!(drag_to(&mut c, 320, 148), Outcome::Changed);
+    assert_eq!(press(&mut c, 220, 96), Outcome::Ignored);
+    assert_eq!(drag_to(&mut c, 320, 196), Outcome::Changed);
     assert_eq!(
         c.crop_adjust_rect(),
         Some(Rect {
             x: 320,
-            y: 148,
+            y: 196,
             width: 300,
             height: 300,
         })
     );
-    let (_, effects) = release(&mut c, 320, 148);
+    let (_, effects) = release(&mut c, 320, 196);
     assert_eq!(
         effects,
         [Effect::Edit {
@@ -3485,7 +3519,7 @@ fn switching_the_lock_back_to_free_releases_the_constraint() {
     let mut c = develop_at(
         Rect {
             x: 220,
-            y: 48,
+            y: 96,
             width: 600,
             height: 400,
         },
@@ -3496,9 +3530,9 @@ fn switching_the_lock_back_to_free_releases_the_constraint() {
     // Back to free: an east-edge drag now changes the width alone, leaving the
     // height at 0.5000 (the pre-lock free behaviour).
     assert_eq!(act(&mut c, "aspect", &["free"]), Outcome::Ignored);
-    assert_eq!(press(&mut c, 670, 248), Outcome::Ignored);
-    assert_eq!(drag_to(&mut c, 610, 248), Outcome::Changed);
-    let (_, effects) = release(&mut c, 610, 248);
+    assert_eq!(press(&mut c, 670, 296), Outcome::Ignored);
+    assert_eq!(drag_to(&mut c, 610, 296), Outcome::Changed);
+    let (_, effects) = release(&mut c, 610, 296);
     assert_eq!(
         effects,
         [Effect::Edit {
@@ -3515,7 +3549,7 @@ fn a_locked_edge_drag_clamps_to_the_minimum_holding_the_ratio() {
     let mut c = develop_at(
         Rect {
             x: 220,
-            y: 48,
+            y: 96,
             width: 600,
             height: 400,
         },
@@ -3525,9 +3559,9 @@ fn a_locked_edge_drag_clamps_to_the_minimum_holding_the_ratio() {
     assert_eq!(act(&mut c, "aspect", &["3:2"]), Outcome::Ignored);
     // Drag the east edge far in: both edges pin to the minimum (0.0500) while
     // holding 3:2, never past it.
-    assert_eq!(press(&mut c, 670, 248), Outcome::Ignored);
-    assert_eq!(drag_to(&mut c, 320, 248), Outcome::Changed);
-    let (_, effects) = release(&mut c, 320, 248);
+    assert_eq!(press(&mut c, 670, 296), Outcome::Ignored);
+    assert_eq!(drag_to(&mut c, 320, 296), Outcome::Changed);
+    let (_, effects) = release(&mut c, 320, 296);
     assert_eq!(
         effects,
         [Effect::Edit {
@@ -3544,7 +3578,7 @@ fn a_locked_tighten_marquee_snaps_the_selection() {
     let mut c = develop_at(
         Rect {
             x: 220,
-            y: 48,
+            y: 96,
             width: 600,
             height: 400,
         },
@@ -3553,18 +3587,18 @@ fn a_locked_tighten_marquee_snaps_the_selection() {
     // Not in crop-adjust: the lock arms the tighten marquee too, and survives
     // the sub-mode boundary.
     assert_eq!(act(&mut c, "aspect", &["3:2"]), Outcome::Ignored);
-    assert_eq!(press(&mut c, 220, 48), Outcome::Ignored);
-    assert_eq!(drag_to(&mut c, 820, 348), Outcome::Changed);
+    assert_eq!(press(&mut c, 220, 96), Outcome::Ignored);
+    assert_eq!(drag_to(&mut c, 820, 396), Outcome::Changed);
     assert_eq!(
         c.crop_drag(),
         Some(Rect {
             x: 220,
-            y: 48,
+            y: 96,
             width: 450,
             height: 300,
         })
     );
-    let (_, effects) = release(&mut c, 820, 348);
+    let (_, effects) = release(&mut c, 820, 396);
     assert_eq!(
         effects,
         [Effect::Edit {
@@ -5218,4 +5252,586 @@ fn the_history_pane_takes_the_pointer_and_is_in_the_scene_frame() {
     assert!(small.layout().history().is_none());
     assert!(small.layout().history_buttons().iter().all(Option::is_none));
     assert_eq!(press(&mut small, 40, 50), Outcome::Ignored);
+}
+
+/// The tool band's buttons on an 800x600 surface in develop, and the
+/// slider after them: `TOOL_BUTTONS` from a cell into the region, each
+/// asking for what the key does, enabled as the photo's state allows.
+#[test]
+fn the_tool_band_drives_the_develop_edits() {
+    let mut c = Controller::new(surface(800, 600));
+    c.open("roll", b"/r", photos(5)).unwrap();
+    // Outside develop the bands and the new actions are not the mode's.
+    assert_eq!(act(&mut c, "uncrop", &[]), Outcome::Ignored);
+    assert_eq!(act(&mut c, "exposure", &["1.00"]), Outcome::Ignored);
+    assert_eq!(act(&mut c, "look-1", &[]), Outcome::Ignored);
+    assert_eq!(act(&mut c, "develop", &[]), Outcome::Changed);
+    let layout = c.layout();
+    assert_eq!(
+        layout.tool_band(),
+        Rect {
+            x: 216,
+            y: 48,
+            width: 584,
+            height: 24
+        }
+    );
+    assert_eq!(
+        layout.look_band(),
+        Rect {
+            x: 216,
+            y: 72,
+            width: 584,
+            height: 24
+        }
+    );
+    assert_eq!(layout.develop_view().y, 96);
+    let tools = layout.tools();
+    let button = |i: usize| tools.buttons[i].expect("a tool button").rect();
+    assert_eq!(
+        button(0),
+        Rect {
+            x: 224,
+            y: 50,
+            width: 48,
+            height: 20
+        }
+    );
+    assert_eq!(button(1).x, 224 + 48 + 8);
+    assert_eq!(
+        button(5).x + i64::from(button(5).width),
+        224 + 48 + 64 + 48 + 56 + 24 + 24 + 5 * 8
+    );
+    let slider = tools.slider.expect("a slider after the buttons");
+    assert_eq!(
+        slider.rect().x,
+        button(5).x + i64::from(button(5).width) + 8
+    );
+    assert_eq!(slider.rect().x + i64::from(slider.rect().width), 800 - 8);
+    assert_eq!(slider.rect().y, 48);
+    assert!(slider.travel() as usize >= ui::EXPOSURE_STEPS);
+    let centre = |r: Rect| {
+        (
+            (r.x + i64::from(r.width) / 2) as u32,
+            (r.y + i64::from(r.height) / 2) as u32,
+        )
+    };
+    let click = |c: &mut Controller, r: Rect| {
+        let (x, y) = centre(r);
+        c.input(Input::Pointer {
+            phase: PointerPhase::Press,
+            x,
+            y,
+        })
+        .unwrap()
+    };
+    // Crop toggles crop-adjust and shows selected; the status row names
+    // the sub-mode.
+    assert_eq!(c.tool_states(0), [true, false, false, false, true, true]);
+    assert_eq!(click(&mut c, button(0)), (Outcome::Changed, vec![]));
+    assert!(c.adjusting());
+    assert!(c.scene().status_line().ends_with(" | develop crop-adjust"));
+    assert_eq!(click(&mut c, button(0)), (Outcome::Changed, vec![]));
+    assert!(!c.adjusting());
+    assert!(c.scene().status_line().ends_with(" | develop"));
+    // Uncrop, Undo and Reset are disabled without a crop or a step: a
+    // press on them is inert.
+    for i in 1..=3 {
+        assert_eq!(click(&mut c, button(i)), (Outcome::Ignored, vec![]));
+    }
+    // The exposure steps ask for the nudges the keys make.
+    let (outcome, effects) = click(&mut c, button(5));
+    assert_eq!(outcome, Outcome::Changed);
+    assert_eq!(
+        effects,
+        [Effect::Expose {
+            index: 0,
+            name: file(0),
+            delta: ui::EXPOSURE_STEP,
+        }]
+    );
+    assert_eq!(apply(&mut c, &effects).unwrap(), Outcome::Changed);
+    let (_, effects) = click(&mut c, button(4));
+    assert_eq!(
+        effects,
+        [Effect::Expose {
+            index: 0,
+            name: file(0),
+            delta: -ui::EXPOSURE_STEP,
+        }]
+    );
+    assert_eq!(apply(&mut c, &effects).unwrap(), Outcome::Changed);
+    assert_eq!(&fields(&c)[STEPS..=STEP], ["2", "1"]);
+    // With steps, Undo and Reset are enabled and ask for what the keys do.
+    assert_eq!(c.tool_states(0), [true, false, true, true, true, true]);
+    let (_, effects) = click(&mut c, button(2));
+    assert_eq!(
+        effects,
+        [Effect::Undo {
+            index: 0,
+            name: file(0),
+        }]
+    );
+    let (_, effects) = click(&mut c, button(3));
+    assert_eq!(
+        effects,
+        [Effect::Reset {
+            index: 0,
+            name: file(0),
+        }]
+    );
+    // The states are the asked-about photo's, not the cursor's.
+    assert_eq!(key(&mut c, "Right"), Outcome::Changed);
+    assert_eq!(c.tool_states(0), [true, false, true, true, true, true]);
+    assert_eq!(c.tool_states(1), [true, false, false, false, true, true]);
+    assert_eq!(key(&mut c, "Left"), Outcome::Changed);
+    // A crop enables Uncrop, which clears it through the crop Edit; `C`
+    // is its key.
+    assert_eq!(
+        carry(&mut c, "crop", &["0.1000", "0.1000", "0.5000", "0.5000"]),
+        Outcome::Changed
+    );
+    assert!(c.tool_states(0)[1]);
+    let (_, effects) = click(&mut c, button(1));
+    assert_eq!(
+        effects,
+        [Effect::Edit {
+            index: 0,
+            name: file(0),
+            key: Key::Crop,
+            value: None,
+        }]
+    );
+    let (_, effects) = c.input(Input::Key { chord: "C" }).unwrap();
+    assert_eq!(
+        effects,
+        [Effect::Edit {
+            index: 0,
+            name: file(0),
+            key: Key::Crop,
+            value: None,
+        }]
+    );
+    assert_eq!(apply(&mut c, &effects).unwrap(), Outcome::Changed);
+    assert_eq!(fields(&c)[CROP], "-");
+    assert!(!c.tool_states(0)[1]);
+    // `exposure` is an absolute in the sidecar's spelling; other spellings
+    // are bad-argument before any write.
+    let (_, effects) = c.action("exposure", &["-1.25"]).unwrap();
+    assert_eq!(
+        effects,
+        [Effect::Edit {
+            index: 0,
+            name: file(0),
+            key: Key::Exposure,
+            value: Some("-1.25".to_string()),
+        }]
+    );
+    assert_eq!(apply(&mut c, &effects).unwrap(), Outcome::Changed);
+    assert_eq!(fields(&c)[EXPOSURE], "-1.25");
+    for bad in ["1.5", "5.01", "+1.00", "x"] {
+        assert_eq!(
+            c.action("exposure", &[bad]).unwrap_err(),
+            ui::Error::BadArgument,
+            "{bad}"
+        );
+    }
+    // The bands' chrome, and a move or release over them, are inert; a
+    // press on a band never starts a crop drag.
+    let gap = (button(0).x + i64::from(button(0).width) + 4) as u32;
+    assert_eq!(press(&mut c, gap, 60), Outcome::Ignored);
+    assert_eq!(drag_to(&mut c, 300, 60), Outcome::Ignored);
+    assert_eq!(release(&mut c, 300, 60).0, Outcome::Ignored);
+    assert_eq!(c.crop_drag(), None);
+    // The facts row is gone from develop: the name row alone leads the box.
+    let (_, _, text) = driven::text(&c.scene()).unwrap();
+    assert!(!text.contains("| sidecar "), "{text}");
+    assert!(text.contains("DSC_0000.NEF"), "{text}");
+    // A surface too narrow for the buttons whole lays none past the edge
+    // and no slider.
+    let mut narrow = Controller::new(surface(500, 600));
+    narrow.open("roll", b"/r", photos(1)).unwrap();
+    assert_eq!(act(&mut narrow, "develop", &[]), Outcome::Changed);
+    let tools = narrow.layout().tools();
+    assert!(tools.buttons[0].is_some());
+    assert!(tools.buttons[5].is_none());
+    assert!(tools.slider.is_none());
+    assert_eq!(press(&mut narrow, 700, 60), Outcome::Ignored);
+    // Room for the buttons but not a column per step lays no slider
+    // either; one column more, and it is there with its hundred steps.
+    // The buttons (264 wide, six cells between and one before) end at
+    // 528, the slider starts a cell on at 536 and ends at width - 8, so
+    // its travel is width - 544 - KNOB_WIDTH: 100 at 656.
+    for (width, laid) in [(655, false), (656, true)] {
+        let c = Controller::new(surface(width, 600));
+        let tools = c.layout().tools();
+        assert!(tools.buttons.iter().all(Option::is_some), "{width}");
+        assert_eq!(tools.slider.is_some(), laid, "{width}");
+        if let Some(slider) = tools.slider {
+            assert_eq!(slider.travel() as usize, ui::EXPOSURE_STEPS);
+        }
+    }
+    // At scale two the bands and the box double with the rows.
+    let mut two = Controller::new(surface(800, 600));
+    two.open("roll", b"/r", photos(1)).unwrap();
+    two.input(Input::Resize {
+        width: 1600,
+        height: 1200,
+        scale: 2,
+    })
+    .unwrap();
+    assert_eq!(act(&mut two, "develop", &[]), Outcome::Changed);
+    let layout = two.layout();
+    assert_eq!(
+        layout.tool_band(),
+        Rect {
+            x: 432,
+            y: 96,
+            width: 1168,
+            height: 48
+        }
+    );
+    assert_eq!(
+        layout.look_band(),
+        Rect {
+            x: 432,
+            y: 144,
+            width: 1168,
+            height: 48
+        }
+    );
+    assert_eq!(layout.develop_view().y, 192);
+    let tools = layout.tools();
+    assert_eq!(
+        tools.buttons[0].unwrap().rect(),
+        Rect {
+            x: 448,
+            y: 100,
+            width: 96,
+            height: 40
+        }
+    );
+    // Six labels of 6, 8, 6, 7, 3 and 3 cells at 16 each, a cell between.
+    assert_eq!(tools.slider.unwrap().rect().x, 448 + 528 + 96);
+}
+
+/// The exposure slider: the knob at the sidecar's exposure, a press and
+/// drag moving it (frame changes, no write), the release committing the
+/// exposure at the pointer's value as the `exposure` action does, unless
+/// it is the value in force.
+#[test]
+fn the_exposure_slider_commits_on_release() {
+    let mut c = Controller::new(surface(800, 600));
+    c.open("roll", b"/r", photos(5)).unwrap();
+    assert_eq!(act(&mut c, "develop", &[]), Outcome::Changed);
+    let slider = c.layout().tools().slider.unwrap();
+    let mid = |c: &Controller, value: usize| {
+        let knob = c
+            .layout()
+            .tools()
+            .slider
+            .unwrap()
+            .knob(value, ui::EXPOSURE_STEPS);
+        (
+            (knob.x + i64::from(knob.width) / 2) as u32,
+            (knob.y + i64::from(knob.height) / 2) as u32,
+        )
+    };
+    assert_eq!(ui::exposure_value(0), 50);
+    assert_eq!(ui::exposure_value(-500), 0);
+    assert_eq!(ui::exposure_value(500), 100);
+    assert_eq!(ui::exposure_value(33), 53);
+    assert_eq!(ui::exposure_value(35), 54);
+    assert_eq!(ui::exposure_at(50), 0);
+    assert_eq!(ui::exposure_at(0), -500);
+    assert_eq!(ui::exposure_at(100), 500);
+    assert_eq!(ui::exposure_at(200), 500);
+    assert_eq!(c.slider_value(), 50);
+    // A press on the knob's own centre moves nothing; releasing there
+    // writes nothing.
+    let (x, y) = mid(&c, 50);
+    assert_eq!(press(&mut c, x, y), Outcome::Ignored);
+    assert_eq!(release(&mut c, x, y), (Outcome::Ignored, vec![]));
+    // A press elsewhere on the track jumps the knob there: a frame change
+    // and no write; the drag takes it further, no write either; the
+    // release commits, and is a frame change on its own (the knob paints
+    // the held value again until the settle) as well as a bump.
+    let (x, y) = mid(&c, 70);
+    let before = driven::fnv1a64(&driven::paint(&c.scene()).unwrap().rgb);
+    let pressed = c
+        .input(Input::Pointer {
+            phase: PointerPhase::Press,
+            x,
+            y,
+        })
+        .unwrap();
+    assert_eq!(pressed, (Outcome::Changed, vec![]));
+    assert_eq!(c.slider_value(), 70);
+    assert_ne!(
+        driven::fnv1a64(&driven::paint(&c.scene()).unwrap().rgb),
+        before
+    );
+    let (x, _) = mid(&c, 80);
+    let moved = c
+        .input(Input::Pointer {
+            phase: PointerPhase::Move,
+            x,
+            y: 300,
+        })
+        .unwrap();
+    assert_eq!(moved, (Outcome::Changed, vec![]));
+    assert_eq!(c.slider_value(), 80);
+    assert_eq!(drag_to(&mut c, x, 300), Outcome::Ignored);
+    let dragged = fields(&c)[GENERATION].clone();
+    let (outcome, effects) = release(&mut c, x, 300);
+    assert_eq!(outcome, Outcome::Changed);
+    assert_ne!(fields(&c)[GENERATION], dragged);
+    assert_eq!(c.slider_value(), 50);
+    assert_eq!(
+        effects,
+        [Effect::Edit {
+            index: 0,
+            name: file(0),
+            key: Key::Exposure,
+            value: Some("3.00".to_string()),
+        }]
+    );
+    assert_eq!(apply(&mut c, &effects).unwrap(), Outcome::Changed);
+    assert_eq!(fields(&c)[EXPOSURE], "3.00");
+    assert_eq!(c.slider_value(), 80);
+    // A drag back to the value in force releases without a write, and the
+    // knob returning is a frame change only if the drag had moved it.
+    let (x, y) = mid(&c, 60);
+    assert_eq!(press(&mut c, x, y), Outcome::Changed);
+    let (x, _) = mid(&c, 80);
+    assert_eq!(drag_to(&mut c, x, y), Outcome::Changed);
+    assert_eq!(release(&mut c, x, y), (Outcome::Ignored, vec![]));
+    assert_eq!(c.slider_value(), 80);
+    // ... and a release straight back there, with the knob still away,
+    // is the frame change that returns it, still without a write.
+    let (x, y) = mid(&c, 60);
+    assert_eq!(press(&mut c, x, y), Outcome::Changed);
+    let (x, _) = mid(&c, 80);
+    let quiet = fields(&c)[GENERATION].clone();
+    assert_eq!(release(&mut c, x, y), (Outcome::Changed, vec![]));
+    assert_ne!(fields(&c)[GENERATION], quiet);
+    assert_eq!(c.slider_value(), 80);
+    // The drag owns the pointer over the history pane: a move there
+    // follows the column, and a release there commits.
+    let (x, y) = mid(&c, 60);
+    assert_eq!(press(&mut c, x, y), Outcome::Changed);
+    assert_eq!(drag_to(&mut c, 100, 300), Outcome::Changed);
+    assert_eq!(c.slider_value(), 0);
+    let (outcome, effects) = release(&mut c, 100, 300);
+    assert_eq!(outcome, Outcome::Changed);
+    assert_eq!(
+        effects,
+        [Effect::Edit {
+            index: 0,
+            name: file(0),
+            key: Key::Exposure,
+            value: Some("-5.00".to_string()),
+        }]
+    );
+    assert_eq!(apply(&mut c, &effects).unwrap(), Outcome::Changed);
+    assert_eq!(fields(&c)[EXPOSURE], "-5.00");
+    // And the pane is its own again afterwards: a press on the Undo
+    // button asks for the undo, not a slider step.
+    let undo = c.layout().history_buttons()[2].unwrap().rect();
+    let (_, effects) = c
+        .input(Input::Pointer {
+            phase: PointerPhase::Press,
+            x: (undo.x + i64::from(undo.width) / 2) as u32,
+            y: (undo.y + i64::from(undo.height) / 2) as u32,
+        })
+        .unwrap();
+    assert_eq!(
+        effects,
+        [Effect::Undo {
+            index: 0,
+            name: file(0),
+        }]
+    );
+    assert_eq!(apply(&mut c, &effects).unwrap(), Outcome::Changed);
+    assert_eq!(fields(&c)[EXPOSURE], "3.00");
+    assert_eq!(c.slider_value(), 80);
+    // The ends clamp: the slider's last column is the last step, and a
+    // drag off the surface's edge stays there.
+    let right = (slider.rect().x + i64::from(slider.rect().width) - 1) as u32;
+    assert_eq!(press(&mut c, right, y), Outcome::Changed);
+    assert_eq!(c.slider_value(), 100);
+    assert_eq!(drag_to(&mut c, 799, y), Outcome::Ignored);
+    let (_, effects) = release(&mut c, 799, y);
+    assert_eq!(
+        effects,
+        [Effect::Edit {
+            index: 0,
+            name: file(0),
+            key: Key::Exposure,
+            value: Some("5.00".to_string()),
+        }]
+    );
+    assert_eq!(apply(&mut c, &effects).unwrap(), Outcome::Changed);
+    // A press outside the slider is not its drag.
+    assert_eq!(press(&mut c, 799, y), Outcome::Ignored);
+    // A photo switch drops the drag: the release writes nothing.
+    let (x, y) = mid(&c, 40);
+    assert_eq!(press(&mut c, x, y), Outcome::Changed);
+    assert_eq!(key(&mut c, "Right"), Outcome::Changed);
+    assert_eq!(c.slider_value(), 50);
+    assert_eq!(release(&mut c, x, y), (Outcome::Ignored, vec![]));
+    // So does leaving develop, a resize, and the chooser opening.
+    assert_eq!(press(&mut c, x, y), Outcome::Changed);
+    assert_eq!(act(&mut c, "grid", &[]), Outcome::Changed);
+    assert_eq!(act(&mut c, "develop", &[]), Outcome::Changed);
+    assert_eq!(c.slider_value(), 50);
+    assert_eq!(release(&mut c, x, y), (Outcome::Ignored, vec![]));
+    assert_eq!(press(&mut c, x, y), Outcome::Changed);
+    c.input(Input::Resize {
+        width: 801,
+        height: 600,
+        scale: 1,
+    })
+    .unwrap();
+    assert_eq!(c.slider_value(), 50);
+    assert_eq!(release(&mut c, x, y), (Outcome::Ignored, vec![]));
+    assert_eq!(press(&mut c, x, y), Outcome::Changed);
+    c.set_listing(b"/".to_vec(), listing("/", &["a"], &[]), None)
+        .unwrap();
+    assert_eq!(c.slider_value(), 50);
+    assert_eq!(key(&mut c, "Escape"), Outcome::Changed);
+    assert!(c.chooser().is_none());
+    assert_eq!(release(&mut c, x, y), (Outcome::Ignored, vec![]));
+    // A crop drag in progress owns the pointer over the bands: a move
+    // over the slider moves no knob, and the release there is the crop's.
+    let r#box = c.develop_box().unwrap();
+    assert_eq!(
+        press(&mut c, (r#box.x + 40) as u32, (r#box.y + 40) as u32),
+        Outcome::Ignored
+    );
+    assert_eq!(drag_to(&mut c, x, y), Outcome::Changed);
+    assert_eq!(c.slider_value(), 50);
+    let (outcome, effects) = release(&mut c, x, y);
+    assert_eq!(outcome, Outcome::Changed);
+    match &effects[..] {
+        [Effect::Edit {
+            index: 1,
+            name,
+            key: Key::Crop,
+            value: Some(_),
+        }] if *name == file(1) => {}
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(fields(&c)[EXPOSURE], "-");
+    assert_eq!(c.crop_drag(), None);
+}
+
+/// The look band: `None` then the available looks, the current one
+/// selected; a press sets that look as the `look` action does; `F1`..`F9`
+/// pick the first nine, and a key past the list is ignored.
+#[test]
+fn the_look_band_and_the_f_keys_pick_looks() {
+    let mut c = Controller::new(surface(800, 600));
+    c.open("roll", b"/r", photos(5)).unwrap();
+    assert_eq!(act(&mut c, "develop", &[]), Outcome::Changed);
+    assert_eq!(key(&mut c, "F1"), Outcome::Ignored);
+    c.set_looks(vec![
+        "alpha".to_string(),
+        "beta".to_string(),
+        "gamma".to_string(),
+    ]);
+    let buttons =
+        c.layout()
+            .look_buttons(&["alpha".to_string(), "beta".to_string(), "gamma".to_string()]);
+    assert_eq!(buttons.len(), 4);
+    assert!(buttons.iter().all(Option::is_some));
+    assert_eq!(
+        buttons[0].unwrap().rect(),
+        Rect {
+            x: 224,
+            y: 74,
+            width: 48,
+            height: 20
+        }
+    );
+    assert_eq!(buttons[1].unwrap().rect().x, 224 + 48 + 8);
+    let click = |c: &mut Controller, r: Rect| {
+        c.input(Input::Pointer {
+            phase: PointerPhase::Press,
+            x: (r.x + i64::from(r.width) / 2) as u32,
+            y: (r.y + i64::from(r.height) / 2) as u32,
+        })
+        .unwrap()
+    };
+    let (outcome, effects) = click(&mut c, buttons[2].unwrap().rect());
+    assert_eq!(outcome, Outcome::Changed);
+    assert_eq!(
+        effects,
+        [Effect::Edit {
+            index: 0,
+            name: file(0),
+            key: Key::Look,
+            value: Some("beta".to_string()),
+        }]
+    );
+    assert_eq!(apply(&mut c, &effects).unwrap(), Outcome::Changed);
+    assert_eq!(fields(&c)[LOOK], "beta");
+    let (_, effects) = c.input(Input::Key { chord: "F3" }).unwrap();
+    assert_eq!(
+        effects,
+        [Effect::Edit {
+            index: 0,
+            name: file(0),
+            key: Key::Look,
+            value: Some("gamma".to_string()),
+        }]
+    );
+    assert_eq!(apply(&mut c, &effects).unwrap(), Outcome::Changed);
+    assert_eq!(fields(&c)[LOOK], "gamma");
+    assert_eq!(key(&mut c, "F4"), Outcome::Ignored);
+    assert_eq!(key(&mut c, "F9"), Outcome::Ignored);
+    let (_, effects) = click(&mut c, buttons[0].unwrap().rect());
+    assert_eq!(
+        effects,
+        [Effect::Edit {
+            index: 0,
+            name: file(0),
+            key: Key::Look,
+            value: None,
+        }]
+    );
+    assert_eq!(apply(&mut c, &effects).unwrap(), Outcome::Changed);
+    assert_eq!(fields(&c)[LOOK], "-");
+    // The band reads back with the looks, and the palette's sub-mode word.
+    let (_, _, text) = driven::text(&c.scene()).unwrap();
+    assert!(
+        text.contains("None") && text.contains("alpha") && text.contains("gamma"),
+        "{text}"
+    );
+    assert_eq!(act(&mut c, "looks", &[]), Outcome::Changed);
+    assert!(c.scene().status_line().ends_with(" | develop looks"));
+    // A band too narrow for every look lays the ones that fit whole: from
+    // 224, None (48 wide) then 128-wide names with 8 between, so the
+    // fourth name would end at 816, past the band's 800.
+    let long: Vec<String> = (0..20).map(|i| format!("look-number-{i:02}")).collect();
+    c.set_looks(long.clone());
+    let laid = c.layout().look_buttons(&long);
+    assert_eq!(laid.len(), 21);
+    let fitting = laid.iter().filter(|b| b.is_some()).count();
+    assert_eq!(fitting, 4);
+    assert_eq!(laid[3].unwrap().rect().x + 128, 680);
+    // A press where the fifth would have been is the band's chrome.
+    assert_eq!(press(&mut c, 700, 84), Outcome::Ignored);
+    assert_eq!(fields(&c)[LOOK], "-");
+    // `F5` still picks the fifth, laid or not: the keys are the list's.
+    let (_, effects) = c.input(Input::Key { chord: "F5" }).unwrap();
+    assert_eq!(
+        effects,
+        [Effect::Edit {
+            index: 0,
+            name: file(0),
+            key: Key::Look,
+            value: Some("look-number-04".to_string()),
+        }]
+    );
 }

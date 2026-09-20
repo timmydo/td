@@ -7,7 +7,9 @@
 
 use std::fmt;
 
-use td_ui::chrome::{Block, Button, Buttons, Item, List, Status, BUTTON_MARGIN, DISABLED, ROW};
+use td_ui::chrome::{
+    Block, Button, Buttons, Item, List, Slider, Status, BUTTON_MARGIN, DISABLED, ROW,
+};
 use td_ui::control::{self, decimal, hex, ErrorCode};
 use td_ui::driven::{self, Binding, Input, Outcome, PointerPhase};
 use td_ui::finder;
@@ -271,6 +273,10 @@ pub enum Action {
     Undo,
     StepToggle,
     StepDelete,
+    Uncrop,
+    Exposure,
+    /// The Nth (from 1) of the available looks, `F1`..`F9`.
+    LookAt(u8),
     Export,
     DeleteRejected,
     Scroll,
@@ -278,7 +284,7 @@ pub enum Action {
 }
 
 impl Action {
-    pub const ALL: [Action; 38] = [
+    pub const ALL: [Action; 49] = [
         Action::Open,
         Action::Choose,
         Action::Next,
@@ -313,6 +319,17 @@ impl Action {
         Action::Undo,
         Action::StepToggle,
         Action::StepDelete,
+        Action::Uncrop,
+        Action::Exposure,
+        Action::LookAt(1),
+        Action::LookAt(2),
+        Action::LookAt(3),
+        Action::LookAt(4),
+        Action::LookAt(5),
+        Action::LookAt(6),
+        Action::LookAt(7),
+        Action::LookAt(8),
+        Action::LookAt(9),
         Action::Export,
         Action::DeleteRejected,
         Action::Scroll,
@@ -355,6 +372,19 @@ impl Action {
             Self::Undo => "undo",
             Self::StepToggle => "step-toggle",
             Self::StepDelete => "step-delete",
+            Self::Uncrop => "uncrop",
+            Self::Exposure => "exposure",
+            Self::LookAt(1) => "look-1",
+            Self::LookAt(2) => "look-2",
+            Self::LookAt(3) => "look-3",
+            Self::LookAt(4) => "look-4",
+            Self::LookAt(5) => "look-5",
+            Self::LookAt(6) => "look-6",
+            Self::LookAt(7) => "look-7",
+            Self::LookAt(8) => "look-8",
+            Self::LookAt(9) => "look-9",
+            // Not an action: `parse` refuses it and dispatch ignores it.
+            Self::LookAt(_) => "look-0",
             Self::Export => "export",
             Self::DeleteRejected => "delete-rejected",
             Self::Scroll => "scroll",
@@ -381,7 +411,7 @@ impl Action {
 /// binds, the argument shape and the help line. Actions without a chord
 /// take an argument or are the agent's (`open`); the pointer reaches
 /// `select` by pressing a cell and `scroll` by the wheel.
-pub const BINDINGS: [Binding; 38] = [
+pub const BINDINGS: [Binding; 49] = [
     Binding {
         name: "open",
         chord: None,
@@ -587,6 +617,72 @@ pub const BINDINGS: [Binding; 38] = [
         help: "Delete the selected history step (develop mode).",
     },
     Binding {
+        name: "uncrop",
+        chord: Some("C"),
+        arguments: "",
+        help: "Clear the crop, back to the whole frame (develop mode).",
+    },
+    Binding {
+        name: "exposure",
+        chord: None,
+        arguments: "STOPS",
+        help: "Set the exposure to STOPS, two decimals in -5.00..5.00 (develop mode); the slider commits one on release.",
+    },
+    Binding {
+        name: "look-1",
+        chord: Some("F1"),
+        arguments: "",
+        help: "Set the look to the first of the available looks, the look strip's order (develop mode).",
+    },
+    Binding {
+        name: "look-2",
+        chord: Some("F2"),
+        arguments: "",
+        help: "Set the look to the second available look (develop mode).",
+    },
+    Binding {
+        name: "look-3",
+        chord: Some("F3"),
+        arguments: "",
+        help: "Set the look to the third available look (develop mode).",
+    },
+    Binding {
+        name: "look-4",
+        chord: Some("F4"),
+        arguments: "",
+        help: "Set the look to the fourth available look (develop mode).",
+    },
+    Binding {
+        name: "look-5",
+        chord: Some("F5"),
+        arguments: "",
+        help: "Set the look to the fifth available look (develop mode).",
+    },
+    Binding {
+        name: "look-6",
+        chord: Some("F6"),
+        arguments: "",
+        help: "Set the look to the sixth available look (develop mode).",
+    },
+    Binding {
+        name: "look-7",
+        chord: Some("F7"),
+        arguments: "",
+        help: "Set the look to the seventh available look (develop mode).",
+    },
+    Binding {
+        name: "look-8",
+        chord: Some("F8"),
+        arguments: "",
+        help: "Set the look to the eighth available look (develop mode).",
+    },
+    Binding {
+        name: "look-9",
+        chord: Some("F9"),
+        arguments: "",
+        help: "Set the look to the ninth available look (develop mode).",
+    },
+    Binding {
         name: "export",
         chord: Some("e"),
         arguments: "",
@@ -658,6 +754,52 @@ pub fn step_label(step: &Step) -> String {
 /// The buttons under the history pane, in order: the selected step off or
 /// on, the selected step deleted, the last step taken back.
 pub const HISTORY_BUTTONS: [&str; 3] = ["Toggle", "Delete", "Undo"];
+
+/// The tool band's buttons, in order, before the exposure slider: the
+/// crop-adjust sub-mode (selected while it is on), the crop cleared, the
+/// last step back, the history cleared, and the exposure a third of a
+/// stop down or up.
+pub const TOOL_BUTTONS: [&str; 6] = ["Crop", "Uncrop", "Undo", "Reset", "-", "+"];
+// The layout, the states and the paint zip the six by place.
+const _: () = assert!(TOOL_BUTTONS.len() == 6);
+
+/// The look band's first button: no look, the camera's rendering.
+pub const NO_LOOK: &str = "None";
+
+/// The exposure slider's steps: a tenth of a stop each over the range,
+/// so value 0 is `-MAX_EXPOSURE`, 50 is zero and 100 is `MAX_EXPOSURE`.
+pub const EXPOSURE_STEPS: usize = 100;
+const _: () = assert!(library::MAX_EXPOSURE == 5 * EXPOSURE_STEPS as i32);
+
+/// The slider's value for an exposure in hundredths of a stop.
+pub fn exposure_value(hundredths: i32) -> usize {
+    let offset = (hundredths.clamp(-library::MAX_EXPOSURE, library::MAX_EXPOSURE)
+        + library::MAX_EXPOSURE) as usize;
+    (offset + 5) / 10
+}
+
+/// The exposure, in hundredths of a stop, at a slider value.
+pub fn exposure_at(value: usize) -> i32 {
+    (value.min(EXPOSURE_STEPS) as i32) * 10 - library::MAX_EXPOSURE
+}
+
+/// Where a single view paints: its region, the preview box under the
+/// text rows, and whether the facts row is among them.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SingleView {
+    region: Rect,
+    r#box: Option<Rect>,
+    facts: bool,
+}
+
+/// The tool band's controls: its buttons, `TOOL_BUTTONS` in order, and
+/// the exposure slider after them, each `None` where the band cannot hold
+/// it whole.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Tools {
+    pub buttons: [Option<Button>; 6],
+    pub slider: Option<Slider>,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum View {
@@ -763,13 +905,119 @@ impl Layout {
     /// placeholder; the window and `--preview` blit the developed image into
     /// it in develop mode, so all three agree on where the pixels go.
     pub fn preview_box(&self) -> Option<Rect> {
-        self.box_in(self.area)
+        self.box_in(self.area, 2)
     }
 
-    /// The develop view's box: the same geometry in the area right of the
-    /// history pane.
+    /// The develop view's box: under the name row in the area right of
+    /// the history pane and below the two bands.
     pub fn develop_box(&self) -> Option<Rect> {
-        self.box_in(self.develop_region())
+        self.box_in(self.develop_view(), 1)
+    }
+
+    /// The tool band: the develop region's first `ROW`.
+    pub fn tool_band(&self) -> Rect {
+        let region = self.develop_region();
+        Rect {
+            height: region.height.min((ROW * self.surface.scale.value()) as u32),
+            ..region
+        }
+    }
+
+    /// The look band: the `ROW` under the tool band.
+    pub fn look_band(&self) -> Rect {
+        let region = self.develop_region();
+        let band = (ROW * self.surface.scale.value()) as u32;
+        Rect {
+            y: region.y + i64::from(band),
+            height: region.height.saturating_sub(band).min(band),
+            ..region
+        }
+    }
+
+    /// The develop region under its two bands: the name row and the box.
+    pub fn develop_view(&self) -> Rect {
+        let region = self.develop_region();
+        let bands = 2 * (ROW * self.surface.scale.value()) as u32;
+        Rect {
+            y: region.y + i64::from(bands),
+            height: region.height.saturating_sub(bands),
+            ..region
+        }
+    }
+
+    /// Buttons on `band` from a cell in, each its label's cells and a cell
+    /// each side, a cell between, inset as a strip's; `None` from the first
+    /// the band cannot hold whole. The x after the last laid, for what
+    /// follows them.
+    fn lay_buttons<'a>(
+        &self,
+        band: Rect,
+        labels: impl Iterator<Item = &'a str>,
+        out: &mut Vec<Option<Button>>,
+    ) -> i64 {
+        let s = self.surface.scale.value();
+        let cell = (CELL_WIDTH * s) as i64;
+        let margin = (BUTTON_MARGIN * s) as i64;
+        let right = band.x + i64::from(band.width);
+        let whole = band.height as usize >= ROW * s;
+        let mut x = band.x + cell;
+        for label in labels {
+            let width = cell * (label.chars().count() as i64 + 2);
+            let rect = Rect {
+                x,
+                y: band.y + margin,
+                width: width as u32,
+                height: ((ROW - 2 * BUTTON_MARGIN) * s) as u32,
+            };
+            let fits = whole && x + width <= right;
+            out.push(fits.then(|| Button::new(self.surface, rect)).flatten());
+            x += width + cell;
+        }
+        x
+    }
+
+    /// The tool band's buttons and, after them to a cell short of the
+    /// band's right, the exposure slider.
+    pub fn tools(&self) -> Tools {
+        let band = self.tool_band();
+        let mut laid = Vec::with_capacity(TOOL_BUTTONS.len());
+        let x = self.lay_buttons(band, TOOL_BUTTONS.into_iter(), &mut laid);
+        let mut buttons = [None; 6];
+        for (slot, button) in buttons.iter_mut().zip(laid) {
+            *slot = button;
+        }
+        let s = self.surface.scale.value();
+        let cell = (CELL_WIDTH * s) as i64;
+        let right = band.x + i64::from(band.width) - cell;
+        // Every step needs its own column, or a press on the knob's own
+        // centre would read as another step (td-ui's `travel` contract).
+        let slider = (buttons.iter().all(Option::is_some) && right > x)
+            .then(|| {
+                Slider::new(
+                    self.surface,
+                    Rect {
+                        x,
+                        y: band.y,
+                        width: (right - x) as u32,
+                        height: band.height,
+                    },
+                )
+            })
+            .flatten()
+            .filter(|slider| slider.travel() as usize >= EXPOSURE_STEPS);
+        Tools { buttons, slider }
+    }
+
+    /// The look band's buttons: `NO_LOOK`, then a button per available
+    /// look in `stems` order, as many as the band holds whole.
+    pub fn look_buttons(&self, stems: &[String]) -> Vec<Option<Button>> {
+        let mut laid = Vec::with_capacity(stems.len() + 1);
+        self.lay_buttons(
+            self.look_band(),
+            std::iter::once(NO_LOOK).chain(stems.iter().map(String::as_str)),
+            &mut laid,
+        );
+        laid
     }
 
     /// The area right of the history pane: where develop mode shows the
@@ -821,18 +1069,18 @@ impl Layout {
         buttons
     }
 
-    /// The largest 3:2 box under two text rows in `region`, the same
+    /// The largest 3:2 box under `rows` text rows in `region`, the same
     /// geometry the scene, the window and `--preview` share, so the
     /// placeholder and the image land in one place.
-    fn box_in(&self, region: Rect) -> Option<Rect> {
+    fn box_in(&self, region: Rect, rows: i64) -> Option<Rect> {
         let s = self.surface.scale.value();
         let pad = (CELL_PAD * s) as i64;
         let row = (CELL_HEIGHT * s) as i64;
         let text_x = region.x + pad;
         let text_w = (i64::from(region.width) - 2 * pad).max(0);
-        // The two text rows sit at `pad/2`, then `row`, then `row`; the box
-        // opens `pad/2` below them and closes `pad` above the region's foot.
-        let top = region.y + pad / 2 + 2 * row + pad / 2;
+        // The text rows sit at `pad/2`, then `row` each; the box opens
+        // `pad/2` below them and closes `pad` above the region's foot.
+        let top = region.y + pad / 2 + rows * row + pad / 2;
         let bottom = region.y + i64::from(region.height) - pad;
         let available_h = (bottom - top).max(0);
         let width = text_w.min(available_h * 3 / 2);
@@ -913,6 +1161,10 @@ pub struct Controller {
     /// The first history step the pane shows, moved as little as possible
     /// to keep the selection in view.
     history_first: usize,
+    /// The exposure slider's drag: the value under the pointer since the
+    /// press, painted as the knob, committed on release. Dropped with the
+    /// crop drag when the photo, mode or surface changes.
+    slider: Option<usize>,
 }
 
 /// The roll chooser: the toolkit's finder over the folder the adapter
@@ -1407,6 +1659,7 @@ impl Controller {
             chooser: None,
             history_step: None,
             history_first: 0,
+            slider: None,
         }
     }
 
@@ -1432,6 +1685,7 @@ impl Controller {
         self.mode = Mode::Cull;
         self.first_row = 0;
         self.drag = None;
+        self.slider = None;
         self.adjusting = false;
         self.aspect = Aspect::Free;
         self.look_list = false;
@@ -1474,6 +1728,7 @@ impl Controller {
                 .map_err(|_| Error::Refused)?;
                 // The pointer is the finder's now; a drag cannot go on.
                 self.drag = None;
+                self.slider = None;
                 self.chooser = Some(Chooser { finder, folder });
             }
         }
@@ -1589,9 +1844,10 @@ impl Controller {
     /// Takes the photos named out of the model, as the adapter moved them
     /// out of the roll: the shown list is recomputed, the cursor keeps its
     /// photo when that stays and otherwise its position among the shown,
-    /// clamped to the end, or leaves when none is shown, ending the drag,
-    /// crop-adjust, aspect lock and look palette that were the moved
-    /// photo's, as a filter that hides it does. Whether the model changed:
+    /// clamped to the end, or leaves when none is shown, ending the drag
+    /// (a crop's or the slider's), crop-adjust, aspect lock and look
+    /// palette that were the moved photo's, as a filter that hides it
+    /// does. Whether the model changed:
     /// a name it does not hold changes nothing.
     pub fn remove(&mut self, names: &[String]) -> bool {
         if names.is_empty() || !self.photos.iter().any(|photo| names.contains(&photo.name)) {
@@ -1615,6 +1871,7 @@ impl Controller {
             Some(name) => self.photos.iter().position(|photo| photo.name == name),
             None => {
                 self.drag = None;
+                self.slider = None;
                 self.adjusting = false;
                 self.aspect = Aspect::Free;
                 self.look_list = false;
@@ -1689,12 +1946,21 @@ impl Controller {
         self.preview_fit = fit;
     }
 
-    /// The look stems the palette lists (built-in and user), as the adapter
-    /// enumerated them: a fact like the job count -- sorted and deduped by the
-    /// adapter -- so it never bumps the generation. Session-static in practice,
-    /// reported once when the roll opens.
+    /// The look stems the palette and the look band list (built-in and
+    /// user), as the adapter enumerated them, sorted and deduped by it: a
+    /// fact absent from `state`, but one the band paints, so a list that
+    /// differs from the one held bumps the generation in develop, as an
+    /// export note does. Session-static in practice, reported once when
+    /// the roll opens.
     pub fn set_looks(&mut self, looks: Vec<String>) {
-        self.looks = looks;
+        if self.looks != looks {
+            self.looks = looks;
+            // The look band lists them, so a list that differs repaints
+            // where the band is: develop's, and entering develop bumps.
+            if self.mode == Mode::Develop {
+                self.bump();
+            }
+        }
     }
 
     /// The status row's export note, as last set.
@@ -2043,6 +2309,7 @@ impl Controller {
         self.mode = Mode::Cull;
         self.view = View::Grid;
         self.drag = None;
+        self.slider = None;
         self.adjusting = false;
         self.aspect = Aspect::Free;
         self.look_list = false;
@@ -2154,6 +2421,7 @@ impl Controller {
                 self.surface = surface;
                 // The canvas moved under any drag; its pixels are stale.
                 self.drag = None;
+                self.slider = None;
                 self.reveal();
                 // The chooser is laid out again over the new area; one it
                 // cannot fit closes it.
@@ -2361,6 +2629,9 @@ impl Controller {
             (Action::Undo, []) => return self.undo(effects),
             (Action::StepToggle, []) => return self.step_effect(false, effects),
             (Action::StepDelete, []) => return self.step_effect(true, effects),
+            (Action::Uncrop, []) => return self.uncrop(effects),
+            (Action::Exposure, [stops]) => return self.set_exposure(stops, effects),
+            (Action::LookAt(n), []) => return self.look_at(usize::from(n), effects),
             (Action::Export, []) => return self.export(effects),
             (Action::DeleteRejected, []) => return self.delete_rejected(effects),
             _ => return Err(control::Error::Protocol.into()),
@@ -2395,16 +2666,24 @@ impl Controller {
                 PointerPhase::Release => finder::Event::Release { x, y },
             });
         }
-        // Develop mode: the crop drag owns the pointer over the preview, for
-        // press, move and release; a press off the preview (the strips, the
-        // status row, the margins) starts no drag, as a filter press is inert
-        // here. Nothing else in develop uses the pointer.
+        // Develop mode: the history pane and the two bands take the pointer
+        // over their own pixels, then the crop drag owns it over the
+        // preview, for press, move and release; a press off the preview
+        // (the strips, the status row, the margins) starts no drag, as a
+        // filter press is inert here.
         if self.mode == Mode::Develop {
             // The history pane: a press on a step selects it, on a button
             // asks for what the button says; the pane's other pixels, and
             // a move or release over it, are inert. The pane is left of the
             // develop box, so nothing here starts or ends a crop drag.
             if let Some(result) = self.pane_pointer(phase, x, y) {
+                return result;
+            }
+            // The tool and look bands above the preview: the slider's drag
+            // owns the pointer once pressed; a press on a button asks what
+            // it says; the bands' other pixels, and a move or release over
+            // them, are inert.
+            if let Some(result) = self.tool_pointer(phase, x, y) {
                 return result;
             }
             // The look palette owns the develop box while it is open: a press on
@@ -2482,9 +2761,9 @@ impl Controller {
         x: i64,
         y: i64,
     ) -> Option<Result<(Outcome, Vec<Effect>), Error>> {
-        // A crop drag in progress owns the pointer wherever it goes, so
-        // its release over the pane still ends it.
-        if self.drag.is_some() {
+        // A crop or slider drag in progress owns the pointer wherever it
+        // goes, so its release over the pane still ends it.
+        if self.drag.is_some() || self.slider.is_some() {
             return None;
         }
         let layout = self.layout();
@@ -2514,6 +2793,217 @@ impl Controller {
             Some(2) => self.undo(Vec::new()),
             _ => Ok((Outcome::Ignored, Vec::new())),
         })
+    }
+
+    /// The pointer over the tool and look bands, `None` when it is over
+    /// neither and no slider drag is on. A press on the slider starts a
+    /// drag at the value under the pointer, a move takes it along, and the
+    /// release commits the exposure through the `Edit` the `exposure`
+    /// action makes, unless it is the value in force. A press on an
+    /// enabled button asks what the button says; on the look band's, the
+    /// look it names.
+    fn tool_pointer(
+        &mut self,
+        phase: PointerPhase,
+        x: i64,
+        y: i64,
+    ) -> Option<Result<(Outcome, Vec<Effect>), Error>> {
+        if self.drag.is_some() {
+            return None;
+        }
+        let layout = self.layout();
+        let tools = layout.tools();
+        if let Some(value) = self.slider {
+            let Some(slider) = tools.slider else {
+                self.slider = None;
+                return Some(Ok((self.finish(Outcome::Changed), Vec::new())));
+            };
+            let at = slider.value_at(x, EXPOSURE_STEPS);
+            return Some(match phase {
+                PointerPhase::Press | PointerPhase::Move => {
+                    if at == value {
+                        Ok((Outcome::Ignored, Vec::new()))
+                    } else {
+                        self.slider = Some(at);
+                        Ok((self.finish(Outcome::Changed), Vec::new()))
+                    }
+                }
+                PointerPhase::Release => {
+                    self.slider = None;
+                    let held = self
+                        .develop_photo()
+                        .ok()
+                        .flatten()
+                        .map(|index| exposure_value(self.current_exposure(index)));
+                    if held == Some(at) {
+                        // Back where the knob was: a frame change only if the
+                        // drag had moved it.
+                        Ok((
+                            self.finish(if value == at {
+                                Outcome::Ignored
+                            } else {
+                                Outcome::Changed
+                            }),
+                            Vec::new(),
+                        ))
+                    } else {
+                        // The knob paints the held value again from here,
+                        // whatever becomes of the write (a refused edit
+                        // settles to no change), so the frame moves now.
+                        if held != Some(value) {
+                            self.bump();
+                        }
+                        self.set_exposure(&library::exposure_text(exposure_at(at)), Vec::new())
+                    }
+                }
+            });
+        }
+        let on_band = layout.tool_band().contains(x, y) || layout.look_band().contains(x, y);
+        if !on_band {
+            return None;
+        }
+        if phase != PointerPhase::Press {
+            return Some(Ok((Outcome::Ignored, Vec::new())));
+        }
+        if let Some(slider) = tools.slider.filter(|slider| slider.hit(x, y)) {
+            let at = slider.value_at(x, EXPOSURE_STEPS);
+            self.slider = Some(at);
+            let held = self
+                .develop_photo()
+                .ok()
+                .flatten()
+                .map(|index| exposure_value(self.current_exposure(index)));
+            let outcome = if held == Some(at) {
+                Outcome::Ignored
+            } else {
+                Outcome::Changed
+            };
+            return Some(Ok((self.finish(outcome), Vec::new())));
+        }
+        let ignored = Some(Ok((Outcome::Ignored, Vec::new())));
+        let Some(index) = self.develop_photo().ok().flatten() else {
+            return ignored;
+        };
+        if let Some(which) = tools
+            .buttons
+            .iter()
+            .position(|button| button.is_some_and(|button| button.hit(x, y)))
+        {
+            if !self.tool_states(index).get(which).copied().unwrap_or(false) {
+                return ignored;
+            }
+            return Some(match which {
+                0 => self
+                    .toggle_adjust()
+                    .map(|outcome| (self.finish(outcome), Vec::new())),
+                1 => self.uncrop(Vec::new()),
+                2 => self.undo(Vec::new()),
+                3 => self.reset_develop(Vec::new()),
+                4 => self.expose(-EXPOSURE_STEP, Vec::new()),
+                _ => self.expose(EXPOSURE_STEP, Vec::new()),
+            });
+        }
+        let looks = layout.look_buttons(&self.looks);
+        if let Some(which) = looks
+            .iter()
+            .position(|button| button.is_some_and(|button| button.hit(x, y)))
+        {
+            return Some(match which {
+                0 => self.set_look("-", Vec::new()),
+                n => match self.looks.get(n - 1).cloned() {
+                    Some(stem) => self.set_look(&stem, Vec::new()),
+                    None => Ok((Outcome::Ignored, Vec::new())),
+                },
+            });
+        }
+        ignored
+    }
+
+    /// The cursor photo's exposure in hundredths, zero without one.
+    fn current_exposure(&self, index: usize) -> i32 {
+        self.photos
+            .get(index)
+            .and_then(|photo| photo.sidecar.as_ref())
+            .and_then(Sidecar::exposure)
+            .unwrap_or(0)
+    }
+
+    /// Whether each tool button is enabled, `TOOL_BUTTONS` in order: Crop
+    /// and the exposure steps always, Uncrop with a crop set, Undo and
+    /// Reset with a step in the history.
+    pub fn tool_states(&self, index: usize) -> [bool; 6] {
+        let sidecar = self
+            .photos
+            .get(index)
+            .and_then(|photo| photo.sidecar.as_ref());
+        let cropped = sidecar.and_then(Sidecar::crop).is_some();
+        let steps = sidecar.is_some_and(|sidecar| !sidecar.steps().is_empty());
+        [true, cropped, steps, steps, true, true]
+    }
+
+    /// The exposure slider's value as painted: the drag's while one is
+    /// on, else the cursor photo's exposure.
+    pub fn slider_value(&self) -> usize {
+        self.slider.unwrap_or_else(|| {
+            self.cursor.map_or(exposure_value(0), |index| {
+                exposure_value(self.current_exposure(index))
+            })
+        })
+    }
+
+    /// Asks for the cursor photo's crop cleared, the whole frame again:
+    /// the `Edit` the `crop` action makes, with no value.
+    fn uncrop(&mut self, effects: Vec<Effect>) -> Result<(Outcome, Vec<Effect>), Error> {
+        let Some(index) = self.develop_photo()? else {
+            return Ok((Outcome::Ignored, effects));
+        };
+        self.develop_effect(
+            index,
+            |index, name| Effect::Edit {
+                index,
+                name,
+                key: Key::Crop,
+                value: None,
+            },
+            effects,
+        )
+    }
+
+    /// Sets the cursor photo's exposure to `stops`, the sidecar's spelling
+    /// (two decimals in the range), else `BadArgument`; an absolute, unlike
+    /// the nudges.
+    fn set_exposure(
+        &mut self,
+        stops: &str,
+        effects: Vec<Effect>,
+    ) -> Result<(Outcome, Vec<Effect>), Error> {
+        let Some(index) = self.develop_photo()? else {
+            return Ok((Outcome::Ignored, effects));
+        };
+        let hundredths = library::exposure(stops).map_err(|_| Error::BadArgument)?;
+        let value = library::exposure_text(hundredths);
+        self.develop_effect(
+            index,
+            |index, name| Effect::Edit {
+                index,
+                name,
+                key: Key::Exposure,
+                value: Some(value),
+            },
+            effects,
+        )
+    }
+
+    /// Sets the look to the `n`th (from 1) of the available looks, the
+    /// look strip's order; `Ignored` when there is no such look.
+    fn look_at(&mut self, n: usize, effects: Vec<Effect>) -> Result<(Outcome, Vec<Effect>), Error> {
+        if self.develop_photo()?.is_none() || !(1..=9).contains(&n) {
+            return Ok((Outcome::Ignored, effects));
+        }
+        match n.checked_sub(1).and_then(|i| self.looks.get(i)).cloned() {
+            Some(stem) => self.set_look(&stem, effects),
+            None => Ok((Outcome::Ignored, effects)),
+        }
     }
 
     /// Asks for the last step of the cursor photo's history back: the
@@ -2940,15 +3430,11 @@ impl Controller {
     /// grid; from the grid, nothing.
     fn back_to_grid(&mut self) -> Outcome {
         if self.mode == Mode::Develop && self.look_list {
-            // Escape closes the palette first, then leaves develop; closing an
-            // empty (invisible) palette is no frame change.
-            let before = self.painted();
+            // Escape closes the palette first, then leaves develop; the
+            // status row names the sub-mode, so closing it is a frame
+            // change with or without a box the list painted over.
             self.look_list = false;
-            return if self.painted() == before {
-                Outcome::Ignored
-            } else {
-                Outcome::Changed
-            };
+            return Outcome::Changed;
         }
         if self.mode == Mode::Develop && self.adjusting {
             self.adjusting = false;
@@ -2971,18 +3457,15 @@ impl Controller {
         if self.develop_photo()?.is_none() {
             return Ok(Outcome::Ignored);
         }
-        let before = self.painted();
         self.adjusting = !self.adjusting;
         self.drag = None;
         // Crop-adjust and the look palette are mutually exclusive overlays.
         if self.adjusting {
             self.look_list = false;
         }
-        Ok(if self.painted() == before {
-            Outcome::Ignored
-        } else {
-            Outcome::Changed
-        })
+        // The status row names the sub-mode and the Crop button shows it,
+        // so the toggle is a frame change with or without a box.
+        Ok(Outcome::Changed)
     }
 
     /// Toggles the look palette for the cursor's photo; only in
@@ -2995,7 +3478,6 @@ impl Controller {
         if self.develop_photo()?.is_none() {
             return Ok(Outcome::Ignored);
         }
-        let before = self.painted();
         if self.look_list {
             self.look_list = false;
         } else {
@@ -3003,13 +3485,13 @@ impl Controller {
             if self.look_list {
                 self.adjusting = false;
                 self.drag = None;
+            } else {
+                return Ok(Outcome::Ignored);
             }
         }
-        Ok(if self.painted() == before {
-            Outcome::Ignored
-        } else {
-            Outcome::Changed
-        })
+        // The status row names the sub-mode, so the toggle is a frame
+        // change with or without a box to list the looks over.
+        Ok(Outcome::Changed)
     }
 
     /// Enters develop mode for the cursor's photo. A roll with a cursor is
@@ -3024,6 +3506,7 @@ impl Controller {
         // grid throughout, not a stale `single` it will not return to.
         self.view = View::Grid;
         self.drag = None;
+        self.slider = None;
         self.adjusting = false;
         self.aspect = Aspect::Free;
         self.look_list = false;
@@ -3209,6 +3692,7 @@ impl Controller {
             // The cursor left the photo the drag, crop-adjust, aspect lock and
             // look palette were for; end them.
             self.drag = None;
+            self.slider = None;
             self.adjusting = false;
             self.aspect = Aspect::Free;
             self.look_list = false;
@@ -3217,6 +3701,7 @@ impl Controller {
             self.view = View::Grid;
             self.mode = Mode::Cull;
             self.drag = None;
+            self.slider = None;
             self.adjusting = false;
             self.aspect = Aspect::Free;
             self.look_list = false;
@@ -3247,6 +3732,7 @@ impl Controller {
         // The cursor moved off the photo the drag, crop-adjust, aspect lock
         // and look palette were for; end them.
         self.drag = None;
+        self.slider = None;
         self.adjusting = false;
         self.aspect = Aspect::Free;
         self.look_list = false;
@@ -3387,7 +3873,14 @@ impl Scene<'_> {
             }
         }
         match model.mode {
-            Mode::Develop => line.push_str(" | develop"),
+            Mode::Develop => {
+                line.push_str(" | develop");
+                if model.look_palette().is_some() {
+                    line.push_str(" looks");
+                } else if model.adjusting {
+                    line.push_str(" crop-adjust");
+                }
+            }
             Mode::Cull if model.view == View::Single => line.push_str(" | single"),
             Mode::Cull => {}
         }
@@ -3538,18 +4031,61 @@ impl Scene<'_> {
         }
     }
 
-    /// The single view over `region`: the name, the facts and the preview
-    /// `r#box` under them (the cull view's `preview_box`, develop's
-    /// `develop_box`; `None` when the region cannot hold one).
+    /// The tool band and the look band over the develop view: chrome, the
+    /// tool buttons with the crop-adjust one selected while it is on and
+    /// each enabled as `tool_states` says, the exposure slider at the
+    /// value in force or under the drag, then the look buttons with the
+    /// current look selected (`None` without one).
+    fn bands(&self, layout: &Layout, index: usize, damage: Rect, sink: &mut dyn FnMut(Draw)) {
+        let model = self.model;
+        fill(layout.tool_band(), CHROME, damage, sink);
+        fill(layout.look_band(), CHROME, damage, sink);
+        let tools = layout.tools();
+        let states = model.tool_states(index);
+        let buttons = tools.buttons.into_iter().zip(TOOL_BUTTONS).zip(states);
+        for (which, ((button, label), enabled)) in buttons.enumerate() {
+            if let Some(button) = button {
+                button.emit(label, which == 0 && model.adjusting, enabled, damage, sink);
+            }
+        }
+        if let Some(slider) = tools.slider {
+            slider.emit(model.slider_value(), EXPOSURE_STEPS, true, damage, sink);
+        }
+        let current = model.current_look(index);
+        let labels = std::iter::once(NO_LOOK).chain(model.looks.iter().map(String::as_str));
+        let buttons = layout.look_buttons(&model.looks).into_iter().zip(labels);
+        for (which, (button, label)) in buttons.enumerate() {
+            if let Some(button) = button {
+                // The first is the clear, by place: a look named as it is
+                // a look.
+                let selected = if which == 0 {
+                    current.is_none()
+                } else {
+                    current == Some(label)
+                };
+                button.emit(label, selected, true, damage, sink);
+            }
+        }
+    }
+
+    /// The single view over `view.region`: the name, the facts when
+    /// `view.facts` (the cull view's; develop's bands and pane say them)
+    /// and the preview `view.r#box` under them (the cull view's
+    /// `preview_box`, develop's `develop_box`; `None` when the region
+    /// cannot hold one).
     fn single(
         &self,
         layout: &Layout,
-        region: Rect,
-        r#box: Option<Rect>,
+        view: SingleView,
         photo: &Photo,
         damage: Rect,
         sink: &mut dyn FnMut(Draw),
     ) {
+        let SingleView {
+            region,
+            r#box,
+            facts,
+        } = view;
         let s = layout.surface.scale.value();
         let scale = layout.surface.scale;
         fill(region, PAPER, damage, sink);
@@ -3571,28 +4107,30 @@ impl Scene<'_> {
             damage,
             sink,
         );
-        let facts = format!(
-            "{} | exposure {} | crop {} | look {} | sidecar {}",
-            photo.flag().map_or("unflagged", Flag::word),
-            photo.value(Key::Exposure),
-            photo.value(Key::Crop),
-            photo.value(Key::Look),
-            photo.status()
-        );
-        let second = Rect {
-            y: text.y + row,
-            ..text
-        };
-        text_run(
-            scale,
-            facts.chars(),
-            (second.x, second.y),
-            second,
-            style,
-            damage,
-            sink,
-        );
-        // The preview's place: the largest 3:2 box under the two rows, the
+        if facts {
+            let facts = format!(
+                "{} | exposure {} | crop {} | look {} | sidecar {}",
+                photo.flag().map_or("unflagged", Flag::word),
+                photo.value(Key::Exposure),
+                photo.value(Key::Crop),
+                photo.value(Key::Look),
+                photo.status()
+            );
+            let second = Rect {
+                y: text.y + row,
+                ..text
+            };
+            text_run(
+                scale,
+                facts.chars(),
+                (second.x, second.y),
+                second,
+                style,
+                damage,
+                sink,
+            );
+        }
+        // The preview's place: the largest 3:2 box under the text rows, the
         // same rectangle the window and `--preview` blit the developed image
         // into, so the placeholder and the image share one geometry.
         if let Some(r#box) = r#box {
@@ -3777,10 +4315,16 @@ impl Composition for Scene<'_> {
             (Some(_), Mode::Develop, _) => match cursor_photo {
                 Some(photo) => {
                     self.history(&layout, damage, sink);
+                    if let Some(index) = model.cursor {
+                        self.bands(&layout, index, damage, sink);
+                    }
                     self.single(
                         &layout,
-                        layout.develop_region(),
-                        layout.develop_box(),
+                        SingleView {
+                            region: layout.develop_view(),
+                            r#box: layout.develop_box(),
+                            facts: false,
+                        },
                         photo,
                         damage,
                         sink,
@@ -3791,8 +4335,11 @@ impl Composition for Scene<'_> {
             (Some(_), Mode::Cull, View::Single) => match cursor_photo {
                 Some(photo) => self.single(
                     &layout,
-                    layout.area,
-                    layout.preview_box(),
+                    SingleView {
+                        region: layout.area,
+                        r#box: layout.preview_box(),
+                        facts: true,
+                    },
                     photo,
                     damage,
                     sink,

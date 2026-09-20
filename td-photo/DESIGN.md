@@ -116,10 +116,17 @@ modes are the photographer's order of work.
    in the preview's own pixel space, so a locked marquee, corner or edge drag
    keeps that ratio; picking a ratio only arms the lock. A look palette
    toggled with `l` lists the available looks with the current one marked, and
-   a press on a name picks it. The immediate snap that reshapes the current
-   crop and the live scaled preview under the marquee are later slices.
-   Every change is saved to the sidecar as it is made; there is no explicit
-   save and no undo stack in version 1, only reset to camera defaults.
+   a press on a name picks it. Two bands above the preview carry the same
+   controls as buttons: a tool band with Crop (the crop-adjust toggle, shown
+   selected while it is on), Uncrop (`C`, clearing the crop), Undo, Reset
+   and the exposure's `-` and `+` beside a slider over the exposure's whole
+   range, and a look band with None and every available look, the current
+   one selected, the first nine on `F1`..`F9`. The status row names the
+   sub-mode in force (`develop crop-adjust`, `develop looks`). The
+   immediate snap that reshapes the current crop and the live scaled
+   preview under the marquee are later slices. Every change is saved to
+   the sidecar as it is made, as a step of the photo's history (below);
+   there is no explicit save.
 4. **Export**, with `e` on the cursor's photo in the grid or in develop
    mode, renders the full-resolution raw through the same pipeline and
    writes an sRGB JPEG into the roll's `exported/` folder, never
@@ -139,9 +146,10 @@ window, all speaking the toolkit's one vocabulary.
 - **One dispatcher.** Everything the window can do is an `Action`, a closed enum
   in `ui` (open a roll, choose one, the cursor moves, select, pick, reject,
   unflag, the four filters, the single view and back, scroll, quit, enter
-  develop and its exposure, look, crop, crop-adjust, aspect, the look palette
-  (`looks`), reset, undo and the history's step toggle and delete, export,
-  and delete rejected).
+  develop and its exposure nudges and absolute `exposure`, look and the
+  look shortcuts `look-1`..`look-9`, crop and `uncrop`, crop-adjust, aspect,
+  the look palette (`looks`), reset, undo and the history's step toggle and
+  delete, export, and delete rejected).
   `ui::Controller` holds the model (the roll's names and sidecars, the cursor,
   the filter, the view, the scroll and the surface, and the shown list the
   filter admits, kept rather than rescanned); `action(name, fields)` and
@@ -231,6 +239,44 @@ window, all speaking the toolkit's one vocabulary.
   pane and its buttons are the frame's: a selection move, a step toggled and
   the list itself are witnessed by the scene, so the replay `frame` and
   `--preview` carry them.
+- **The develop controls.** Two bands lead the develop region, above the
+  preview: the tool band (`Layout::tool_band`, the region's first row) with
+  `TOOL_BUTTONS` -- Crop, Uncrop, Undo, Reset, `-`, `+` -- laid from a cell
+  in, a cell between, as the strips lay theirs, and after them, to a cell
+  short of the band's end, the exposure slider (td-ui's `chrome::Slider`,
+  `EXPOSURE_STEPS` (100) steps of a tenth of a stop from -5.00 to +5.00,
+  `ui::exposure_value` placing the sidecar's exposure on it to the nearest
+  step and `ui::exposure_at` reading a step back); and the look band
+  (`Layout::look_band`, the next row) with `NO_LOOK` (None) then a button
+  per available look, in the order the session reported them. A button
+  the band cannot hold whole is not laid, and the slider needs every tool
+  button, the room td-ui asks and a column of travel per step (td-ui's
+  `travel` contract: with fewer, a press on the knob's own centre would
+  read as another step); a surface too short for a row lays none.
+  Crop toggles crop-adjust and is selected while it is on; Uncrop (`C`,
+  the `uncrop` action) clears the crop through the same `Edit` the `crop`
+  action makes; Undo and Reset ask what `z` and `0` do; `-` and `+` nudge
+  the exposure a third of a stop as `-` and `=` do; a look button sets that
+  look (None clears it) as the `look` action does, and `F1`..`F9` (the
+  `look-1`..`look-9` actions) pick the first nine, `Ignored` past the
+  list. Uncrop is enabled only with a crop, Undo and Reset only with a
+  step; a press on a disabled button, on a band's chrome, and a move or a
+  release over a band are `Ignored`, and never start a crop drag. The
+  `exposure` action takes the sidecar's own spelling (`-1.25`), bad-argument
+  otherwise, and sets it through an `Edit` like a look. The slider: a
+  press on it moves the knob to the pointer's step and starts a drag that
+  follows the pointer's column wherever it goes, each step it crosses a
+  frame change and no write; its release commits the step it rests on as
+  the `exposure` action would, or writes nothing when that is the step the
+  exposure in force rounds to (then a frame change only if the drag had
+  moved the knob; a nudge's off-step exposure stays as it is). A release
+  that commits is a frame change on its own when the knob had moved, since
+  the knob paints the held value again from there whatever becomes of the
+  write. A photo switch, a removal, the chooser opening, a resize or leaving
+  develop drops the drag as it drops a crop's, and a drag in progress, a
+  crop's or the slider's, owns the pointer over the bands and the pane. All
+  of it is `Ignored` in cull. The status row names the sub-mode after the
+  mode: `develop crop-adjust` or `develop looks`.
 - **Export is the roll's, not develop's.** `export` (`e`) asks for the
   cursor photo's export in either mode; the dispatch is `changed` with the
   effect and moves nothing in the model. The adapter reads the sidecar as the
@@ -254,12 +300,12 @@ window, all speaking the toolkit's one vocabulary.
   photos it moved out of the model through `remove`: the shown list is
   recomputed, the cursor keeps its photo when that stays and otherwise its
   position among the shown, clamped to the end, or leaves when none is
-  shown, ending the single view and the drag, crop-adjust, aspect lock and
-  look palette that were the moved photo's, as a filter that hides it
-  does. The reply is `changed` when any moved, `ignored` when the files
-  hold no reject, and `refused`, each reason on stderr, when one was kept
-  or moved without its sidecar, the ones that moved taken out all the
-  same, so the model holds what the roll lists. The window keeps a moved
+  shown, ending the single view and the drag (a crop's or the slider's),
+  crop-adjust, aspect lock and look palette that were the moved photo's,
+  as a filter that hides it does. The reply is `changed` when any moved,
+  `ignored` when the files hold no reject, and `refused`, each reason on stderr,
+  when one was kept or moved without its sidecar, the ones that moved taken out
+  all the same, so the model holds what the roll lists. The window keeps a moved
   name's thumbnail and cached level 0 until they are evicted, as it does
   for a file replaced in place.
 - **The roll chooser is the finder.** `choose` (`o`) opens td-ui's shared
@@ -373,16 +419,17 @@ window, all speaking the toolkit's one vocabulary.
   geometry, not the frame directly: a locked drag moves the outlined rectangle,
   already a change, while arming a ratio paints nothing. A look palette,
   toggled with `l`, lists the available looks over the develop box with the
-  current one marked: opening or closing it over a non-empty list with a box to
-  paint into is a change, over an empty list or a surface too small for a box
-  nothing. A press on a name picks that look through the same edit the `look`
-  action makes, so the mark follows the edit's settle; the palette stays open.
-  So the aspect
-  lock, the crop-adjust and look-palette sub-mode flags, the available look list
-  (reported once when a session opens) and the developed image's fitted
-  rectangle for the drag's canvas (the window's report) are none of them
-  `state` fields -- all facts like the job count, so they never move the
-  generation on their own. A flag
+  current one marked: opening or closing it over a non-empty list is a change
+  (the status row names the sub-mode whether or not there is a box to list into,
+  as it names crop-adjust), over an empty list nothing. A press on a name picks
+  that look through the same edit the `look` action makes, so the mark follows
+  the edit's settle; the palette stays open. So the aspect lock, the crop-adjust
+  and look-palette sub-mode flags and the developed image's fitted rectangle for
+  the drag's canvas (the window's report) are none of them `state` fields -- all
+  facts like the job count, so they never move the generation on their own. The
+  available look list (reported once when a session opens) is a fact too, but
+  the look band paints it, so a list that differs from the one held moves the
+  generation when develop is in view, as an export note does. A flag
   the adapter wrote answers `changed` whether or not the model moved, since the
   file did.
   Error codes are stable (`no-roll`, `no-photo`, `bad-argument`, `refused`, and
@@ -1004,28 +1051,31 @@ many columns as the width holds and as many rows as the height between the bands
 holds, at least one of each, so a surface too small for a cell clips one rather
 than shows none, and the grid scrolls by rows, keeping the cursor's row shown.
 The single view shows the name, the facts and the largest 3:2 box under them;
-develop mode shows the same view of the cursor's photo in the area right of
-the history pane (`Layout::develop_region`), its status marked `develop`, with
-the developed preview blitted into that box once it is made, and the pane at
-the area's left: the history list (`Layout::history`, a `chrome::List` over
-the pane's width, less one band) and, on the band under it, the Toggle,
-Delete and Undo buttons (`Layout::history_buttons`, `chrome::Button`s from a
-cell in, a cell between, inset as a strip's), Toggle and Delete enabled with a
-selection and Undo with a step; a surface too short for a row has neither.
-The box geometry (`Layout::box_in`, the single view's `preview_box` over the
-area and develop's `develop_box` over the region) is one function the scene,
-the window and `--preview` share, so the placeholder and the image land in
-one place. A press on a mode button changes the mode, on a filter button sets
-the filter, on a cell selects it, in develop on a history step selects it and
-on a pane button asks what it says (see Driving), and in the single view
-anywhere in the area between the bands returns to the grid; the status row, a
-strip's margin and the gap between two buttons, the pane's chrome, and
-anything off the surface, are not targets, and the bands are hit-tested last
+develop mode shows the name row and the box (no facts row: the bands take the
+room) of the cursor's photo in the area right of the history pane
+(`Layout::develop_region`), under the tool and look bands (`Layout::tools`,
+`Layout::look_buttons`, see Driving; `Layout::develop_view` the rest), its
+status marked `develop`, with the developed preview blitted into that box once
+it is made, and the pane at the area's left: the history list
+(`Layout::history`, a `chrome::List` over the pane's width, less one band) and,
+on the band under it, the Toggle, Delete and Undo buttons
+(`Layout::history_buttons`, `chrome::Button`s from a cell in, a cell between,
+inset as a strip's), Toggle and Delete enabled with a selection and Undo with a
+step; a surface too short for a row has neither. The box geometry
+(`Layout::box_in`, the single view's `preview_box` over the area and develop's
+`develop_box` over the develop view) is one function the scene, the window and
+`--preview` share, so the placeholder and the image land in one place. A press
+on a mode button changes the mode, on a filter button sets the filter, on a cell
+selects it, in develop on a history step selects it, on a pane, tool or look
+button asks what it says and on the slider starts its drag (see Driving), and in
+the single view anywhere in the area between the bands returns to the grid; the
+status row, a strip's margin and the gap between two buttons, the pane's chrome,
+and anything off the surface, are not targets, and the bands are hit-tested last
 painted first, so on a surface too short for them the status row covers the
-strips' buttons as it covers their pixels. A box whose
-thumbnail is not held is a neutral placeholder, which is what `frame` digests
-either way; the develop box holds the developed preview once it is made, and
-the cull single view's box stays a placeholder.
+strips' buttons as it covers their pixels. A box whose thumbnail is not held is
+a neutral placeholder, which is what `frame` digests either way; the develop box
+holds the developed preview once it is made, and the cull single view's box
+stays a placeholder.
 
 `td-photo open [ROLL] [--control-socket PATH]` runs the window (`window`), a
 `td_ui::client::App` in the shape td-setup's is, and one adapter over the same
@@ -1398,11 +1448,22 @@ grab without moving neither reshaping nor committing, a corner, edge and
 tighten-marquee drag holding the ratio, a one-to-one lock keeping a square in
 pixels, a locked edge clamped to the minimum, switching back to free, the lock
 dropped on a photo switch, and a bad ratio token or wrong mode refused); the
-look palette (toggled only in develop and escaping in layers; a `set_looks` fact
-and a frame-witnessed sub-mode an empty list or a boxless surface leaves blank;
+look palette (toggled only in develop and escaping in layers; a `set_looks`
+fact, and the status row naming the sub-mode over a boxless surface too;
 the current look marked and picked by a press on its name (a press off the names
 or with no box picking nothing); mutually exclusive with crop-adjust and dropped
 on a photo switch; a touch behind the open palette not bumping the generation);
+the develop controls (the bands' geometry, the buttons enabled as the
+photo's crop and steps allow and inert otherwise, each button's effect and
+`C`'s, `exposure` accepted and refused, the bands' chrome and a move or
+release over them inert, no facts row, a narrow surface laying no slider;
+the slider's mapping at its ends and between, a press on the knob's own
+step and a release there writing nothing, a jump, a drag and its release
+committing, a drag back to the value in force releasing without a write,
+the last column the last step and a drag off the edge staying there, a
+photo switch dropping the drag; the look band's buttons and `F1`..`F9`
+picking and clearing, a key past the list ignored, the band read back and
+the palette's status word);
 the export action (asking for the cursor photo in either mode by verb and by
 `e`, refused without a roll or a photo, not repeating on a held key, the
 dispatch moving nothing; the note set, shown at the row's end, a new generation
@@ -1584,7 +1645,7 @@ preflight. A td-photo, td-ui or td-compositor edit selects this check in
    develop controls: a tool strip above the preview with the crop, uncrop,
    undo and reset buttons and the exposure in a td-ui slider
    (`chrome::Slider`) beside its step buttons, a look strip with the looks
-   on `F1`..`F9`, and the status row naming the crop sub-mode. (c) A
+   on `F1`..`F9`, and the status row naming the crop sub-mode. Landed. (c) A
    filmstrip of the shown photos under the preview, `Left` and `Right` or
    a press moving between them. (d) The crop tool drawing a fresh marquee
    from a press outside the crop in crop-adjust, and a live preview under
