@@ -957,22 +957,47 @@ fn run_layout(destination: &Path, out: &mut dyn Write) -> io::Result<()> {
     run_layout_with_boot(destination, None, out)
 }
 
+/// One open destination; the label is diagnostic data and is never reopened.
+struct FormatDestination {
+    file: File,
+    label: PathBuf,
+}
+
+impl FormatDestination {
+    fn open(path: &Path) -> io::Result<Self> {
+        Ok(Self {
+            file: paths::open_format_destination(path)?,
+            label: path.to_owned(),
+        })
+    }
+}
+
 fn run_layout_with_boot(
     destination: &Path,
     boot: Option<&BootFiles>,
     out: &mut dyn Write,
 ) -> io::Result<()> {
-    let mut file = paths::open_format_destination(destination)?;
-    let disk_bytes = destination_bytes(&mut file)?;
-    let sector_size = logical_sector_size(&file)?;
+    let mut destination = FormatDestination::open(destination)?;
+    format_layout(&mut destination, boot, out)
+}
+
+fn format_layout(
+    destination: &mut FormatDestination,
+    boot: Option<&BootFiles>,
+    out: &mut dyn Write,
+) -> io::Result<()> {
+    let file = &mut destination.file;
+    let label = destination.label.as_path();
+    let disk_bytes = destination_bytes(file)?;
+    let sector_size = logical_sector_size(file)?;
     let plan = plan(sector_size, disk_bytes).map_err(invalid)?;
 
     // Pin and size both sources before any destructive write. The caller owns
     // their content and must keep it stable throughout the operation.
     let mut inputs = match boot {
         Some(boot) => Some((
-            BootInput::open(&boot.kernel, &file)?,
-            BootInput::open(&boot.initramfs, &file)?,
+            BootInput::open(&boot.kernel, file)?,
+            BootInput::open(&boot.initramfs, file)?,
         )),
         None => None,
     };
@@ -1118,27 +1143,27 @@ fn run_layout_with_boot(
     // is written LAST because it is the commit point — it is what firmware
     // reads first, and it is only correct once everything it points at is
     // durable.
-    invalidate_table(&mut file, &table)?;
+    invalidate_table(file, &table)?;
     file.sync_all()?;
 
-    zero_at(&mut file, esp_offset, metadata)?;
+    zero_at(file, esp_offset, metadata)?;
     for extent in &esp.extents {
         let at = esp_offset
             .checked_add(extent.offset)
             .ok_or_else(|| invalid("an ESP extent overflowed".to_string()))?;
-        write_at(&mut file, at, &extent.bytes)?;
+        write_at(file, at, &extent.bytes)?;
     }
     for (input, offset, end, padding) in payloads {
         file.seek(SeekFrom::Start(offset))?;
-        input.copy_to(&mut file, destination)?;
+        input.copy_to(file, label)?;
         // A partial final cluster must not disclose bytes from a previous ESP.
-        zero_at(&mut file, end, padding)?;
+        zero_at(file, end, padding)?;
     }
     file.sync_all()?;
 
-    write_at(&mut file, table.backup_offset, &table.backup)?;
+    write_at(file, table.backup_offset, &table.backup)?;
     file.sync_all()?;
-    write_at(&mut file, table.primary_offset, &table.primary)?;
+    write_at(file, table.primary_offset, &table.primary)?;
     file.sync_all()?;
 
     // NUMBERS ONLY, whitespace-separated, and every one a BYTE OFFSET. The
@@ -1619,6 +1644,28 @@ fn run_volume(
     seed: Option<&VolumeSeed>,
     out: &mut dyn Write,
 ) -> io::Result<()> {
+    let prepared = prepare_volume(settings, uuid, mkfs, scratch, seed)?;
+    let mut destination = FormatDestination::open(destination)?;
+    format_volume(prepared, &mut destination, out)
+}
+
+struct PreparedVolume<'a> {
+    settings: VolumeSettings<'a>,
+    uuid: Option<&'a VolumeUuid>,
+    mkfs: &'a Path,
+    scratch: &'a Path,
+    seed: Option<&'a VolumeSeed>,
+    key: Option<Vec<u8>>,
+}
+
+/// Validate caller-bound inputs before acquiring or changing the destination.
+fn prepare_volume<'a>(
+    settings: VolumeSettings<'a>,
+    uuid: Option<&'a VolumeUuid>,
+    mkfs: &'a Path,
+    scratch: &'a Path,
+    seed: Option<&'a VolumeSeed>,
+) -> io::Result<PreparedVolume<'a>> {
     // `Command::new` SEARCHES `PATH` for a name with no separator in it, which
     // is the ambient resolution the declared-input contract above rules out —
     // and the one form of it a caller cannot see they asked for.
@@ -1661,16 +1708,39 @@ fn run_volume(
     if let Some(selection) = settings.username {
         selection.check()?;
     }
-    let mut file = paths::open_format_destination(destination)?;
-    let disk_bytes = destination_bytes(&mut file)?;
-    let sector_size = logical_sector_size(&file)?;
+    Ok(PreparedVolume {
+        settings,
+        uuid,
+        mkfs,
+        scratch,
+        seed,
+        key,
+    })
+}
+
+fn format_volume(
+    prepared: PreparedVolume<'_>,
+    destination: &mut FormatDestination,
+    out: &mut dyn Write,
+) -> io::Result<()> {
+    let PreparedVolume {
+        settings,
+        uuid,
+        mkfs,
+        scratch,
+        seed,
+        key,
+    } = prepared;
+    let file = &mut destination.file;
+    let disk_bytes = destination_bytes(file)?;
+    let sector_size = logical_sector_size(file)?;
     if !disk_bytes.is_multiple_of(sector_size) {
         return Err(invalid(format!(
             "destination is {disk_bytes} bytes, not a whole number of \
              {sector_size}-byte sectors"
         )));
     }
-    let (offset, len) = volume_region(&mut file, sector_size, disk_bytes / sector_size)?;
+    let (offset, len) = volume_region(file, sector_size, disk_bytes / sector_size)?;
     // The partition the TABLE describes must fit in the destination the table
     // is on. `gpt::parse` cannot check this — it is handed two byte slices and
     // never learns where they came from — so a header claiming a larger disk
@@ -1804,7 +1874,7 @@ fn run_volume(
         )));
     }
 
-    zero_edges(&mut file, offset, len)?;
+    zero_edges(file, offset, len)?;
     // Durable BEFORE the copy starts, or the ordering below buys nothing: a
     // power loss could otherwise persist new filesystem blocks while the zero
     // over the old superblock is still only in page cache, which is exactly the
@@ -1832,9 +1902,9 @@ fn run_volume(
     // than merely tidy: with the chunk deferred, those zeros are what stands in
     // the superblock's place for the length of the copy.
     let head = COPY_CHUNK.min(len);
-    let rest = copy_sparse(&mut image, &mut file, offset, head, len)?;
+    let rest = copy_sparse(&mut image, file, offset, head, len)?;
     file.sync_all()?;
-    let first = copy_sparse(&mut image, &mut file, offset, 0, head)?;
+    let first = copy_sparse(&mut image, file, offset, 0, head)?;
     file.sync_all()?;
     let written = rest.saturating_add(first);
 
@@ -2192,6 +2262,14 @@ mod tests {
         path: PathBuf,
     }
 
+    struct ScratchDirectory(PathBuf);
+
+    impl Drop for ScratchDirectory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
     impl Scratch {
         /// A sparse file of `bytes`, which is a destination `td-install` treats
         /// exactly as it treats a disk (D9).
@@ -2463,8 +2541,13 @@ mod tests {
             kernel: kernel.path.clone(),
             initramfs: initramfs.path.clone(),
         };
+        let retained = Scratch::disk(0);
+        let mut destination = FormatDestination::open(&disk.path).unwrap();
+        std::fs::rename(&disk.path, &retained.path).unwrap();
+        std::fs::write(&disk.path, b"replacement must survive").unwrap();
         let mut output = Vec::new();
-        run_layout_with_boot(&disk.path, Some(&boot), &mut output).unwrap();
+        format_layout(&mut destination, Some(&boot), &mut output).unwrap();
+        assert_eq!(std::fs::read(&disk.path).unwrap(), b"replacement must survive");
         assert_eq!(String::from_utf8(output).unwrap(), "1048576 537919488\n");
         let bpb = read_at(&mut file, MIB, 512).unwrap();
         let u16le = |bytes: &[u8]| u16::from_le_bytes(bytes.try_into().unwrap()) as u64;
@@ -2509,7 +2592,7 @@ mod tests {
             .unwrap()
             .iter()
             .all(|byte| *byte == 0));
-        assert_eq!(disk.table(DISK).partitions.len(), 2);
+        assert_eq!(retained.table(DISK).partitions.len(), 2);
     }
 
     #[test]
@@ -2576,6 +2659,44 @@ mod tests {
             assert_eq!(primary, (image.primary_offset, image.primary.len() as u64));
             assert_eq!(backup, (image.backup_offset, image.backup.len() as u64));
         }
+    }
+
+    #[test]
+    fn held_formatting_never_reopens_a_replaced_destination_name() {
+        let disk = Scratch::disk(DISK);
+        let retained = Scratch::disk(0);
+        let dir = fake_mkfs(RECORDING_MKFS);
+        let _directory = ScratchDirectory(dir.clone());
+        let mkfs = dir.join("mkfs.btrfs");
+        let prepared =
+            prepare_volume(VolumeSettings::default(), None, &mkfs, &dir, None).unwrap();
+        let mut destination = FormatDestination::open(&disk.path).unwrap();
+        std::fs::rename(&disk.path, &retained.path).unwrap();
+        std::fs::write(&disk.path, b"replacement must survive").unwrap();
+
+        let mut layout_report = Vec::new();
+        format_layout(&mut destination, None, &mut layout_report).unwrap();
+        assert_eq!(layout_report, b"1048576 537919488\n");
+        assert_eq!(std::fs::read(&disk.path).unwrap(), b"replacement must survive");
+        let (offset, len) = volume_region(&mut destination.file, 512, DISK / 512).unwrap();
+        write_at(&mut destination.file, offset, &[0xa5; 512]).unwrap();
+        write_at(&mut destination.file, offset + len - 512, &[0x5a; 512]).unwrap();
+
+        let mut volume_report = Vec::new();
+        format_volume(prepared, &mut destination, &mut volume_report).unwrap();
+        assert_eq!(volume_report, format!("{offset} {len} 0\n").as_bytes());
+        assert_eq!(std::fs::read(&disk.path).unwrap(), b"replacement must survive");
+        assert_eq!(read_at(&mut destination.file, offset, 512).unwrap(), vec![0; 512]);
+        assert_eq!(
+            read_at(&mut destination.file, offset + len - 512, 512).unwrap(),
+            vec![0; 512]
+        );
+        assert_eq!(
+            volume_region(&mut destination.file, 512, DISK / 512).unwrap(),
+            (offset, len)
+        );
+        assert_eq!(std::fs::metadata(&retained.path).unwrap().len(), DISK);
+        drop(destination);
     }
 
     /// The volume region comes off the TABLE, so it is the partition the disk

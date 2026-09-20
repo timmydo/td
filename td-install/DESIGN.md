@@ -513,10 +513,37 @@ admission. Unclaimed raw I/O can still race a claim, image files have no
 block claim, and each command releases its descriptor when it finishes.
 Media/backing-device exclusion, stable identity, the service's held
 operation descriptors and trusted destructive consent remain required.
-A future service holding its own destination block claim cannot invoke
-these pathname commands: the distinct holder would conflict. That service
-needs a separately designed inherited-descriptor formatting interface;
-reopening a claimed descriptor through /proc is not claim transfer.
+
+The internal `FormatDestination` owns one File and a diagnostic label.
+Both formatting bodies borrow that File; neither reopens its label. A
+same-process coordinator can retain the object through layout and volume
+formatting. `prepare_volume` validates caller-bound programs, trust and
+account selection before the destination is acquired or changed; its
+consumed result feeds volume formatting. It retains the admitted key bytes,
+but other source paths and contents must remain stable under the caller's
+control. This preparation does not establish payload fit, scratch capacity,
+disk eligibility, a reviewed installation plan or consent.
+
+The existing pathname CLI commands each construct and release their own
+object. A service holding a separate block claim still cannot invoke them:
+the distinct holder would conflict. There is no descriptor-number CLI,
+claim transfer through /proc, or cross-process descriptor protocol. The
+future service must own its formatting object in the process performing
+writes. Partition refresh and mounted deployment publication still need an
+explicit claim handoff design and kernel validation before service
+activation; borrowing a File across raw writes does not settle that phase.
+In particular, callers must not assume the current separate pathname-based
+refresh and mount commands can run while this exclusive claim is held.
+
+A regular-file regression replaces the destination name after opening,
+then formats both layout and volume through the retained object. It checks
+the original's table and cleared volume edges and requires the replacement
+bytes to survive both phases. The populated ESP test also replaces the
+name, then independently reads the FAT directories, payload bytes and
+cluster padding from the retained inode. This proves pathname independence,
+not block
+exclusivity against raw I/O or hostile hotplug.
+
 The QEMU fixture attempts both raw commands while the just-formatted
 partition is mounted and requires the destination-open EBUSY diagnostic
 and unchanged first 64 KiB after each attempt before continuing with
