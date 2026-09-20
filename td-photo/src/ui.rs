@@ -578,7 +578,7 @@ pub const BINDINGS: [Binding; 49] = [
         name: "adjust-crop",
         chord: Some("c"),
         arguments: "",
-        help: "Toggle crop adjust: drag the crop's edges and corners (develop mode).",
+        help: "Toggle crop adjust: draw a crop over the whole frame, drag its edges and corners; leaving applies it (develop mode).",
     },
     Binding {
         name: "aspect",
@@ -1188,7 +1188,8 @@ pub struct Controller {
     /// The developed image's rectangle within the develop box, as the
     /// adapter last reported it: the crop drag's canvas, since the model is
     /// pixel-blind and cannot know the fitted image's size. `None` before a
-    /// develop lands, when the box itself is the fallback canvas.
+    /// develop lands, when the box itself is the fallback canvas, and from a
+    /// crop-adjust toggle until the turn's end re-reports it.
     preview_fit: Option<Rect>,
     /// The crop drag in progress, in surface pixels, or `None`: set on a
     /// press inside the preview, moved, and taken on release. Held only in
@@ -1253,8 +1254,9 @@ struct Chooser {
 /// rectangle, captured at the press so a fit reported mid-drag cannot re-map
 /// the gesture), the press anchor and the pointer's current point (both in
 /// surface pixels clamped into the canvas), the aspect it is locked to (also
-/// frozen at the press), and what the drag grips. The marquee (a tighten drag)
-/// is the bounding box of anchor and current, snapped to the aspect.
+/// frozen at the press), and what the drag grips. The marquee (a tighten
+/// drag, or a fresh crop drawn in crop-adjust) is the bounding box of anchor
+/// and current, snapped to the aspect.
 struct Drag {
     canvas: Rect,
     anchor: (i64, i64),
@@ -1263,11 +1265,13 @@ struct Drag {
     grip: Grip,
 }
 
-/// What a crop drag moves. `Marquee` draws a fresh rectangle that tightens the
-/// current crop (5(e)-ii); `Handle` grabs an edge, corner or the interior of
-/// the crop rectangle shown over the uncropped image in crop-adjust, resizing
-/// or moving `crop`, the cursor photo's crop frozen at the press, in its own
-/// ten-thousandths so the edges the drag does not move keep their exact value.
+/// What a crop drag moves. `Marquee` draws a fresh rectangle: over the
+/// cropped preview it tightens the current crop (5(e)-ii); in crop-adjust it
+/// is a fresh crop of the whole frame shown (8(d)). `Handle` grabs an edge,
+/// corner or the interior of the crop rectangle shown over the uncropped
+/// image in crop-adjust, resizing or moving `crop`, the cursor photo's crop
+/// frozen at the press, in its own ten-thousandths so the edges the drag does
+/// not move keep their exact value.
 enum Grip {
     Marquee,
     Handle { zone: Zone, crop: Crop },
@@ -1356,7 +1360,7 @@ fn marquee_now(drag: &Drag) -> Rect {
 /// fits inside the raw bounding box of anchor and current, anchored at the press
 /// corner and extending toward the pointer. Canvas pixels throughout, so the
 /// ratio is the displayed image's pixel ratio; a zero raw edge stays zero (a
-/// click, which `drag_crop` rejects).
+/// click, which `compose_crop` rejects).
 fn marquee_snapped(drag: &Drag, rw: u32, rh: u32) -> Rect {
     let (ax, ay) = drag.anchor;
     let (cx, cy) = drag.current;
@@ -1384,6 +1388,52 @@ fn clamp_into(rect: Rect, x: i64, y: i64) -> (i64, i64) {
     let far_x = rect.x.saturating_add(i64::from(rect.width));
     let far_y = rect.y.saturating_add(i64::from(rect.height));
     (x.clamp(rect.x, far_x), y.clamp(rect.y, far_y))
+}
+
+/// The crop a marquee selects: its fractions of the `canvas` composed with
+/// `current`, the crop the canvas shows, so the result is a sub-region of it
+/// (the whole frame in crop-adjust, `FULL_CROP`). `None` when the marquee is
+/// degenerate or the composed box is under the minimum edge (`Crop::new`);
+/// floor division keeps it inside `current`, so it is always inside the
+/// image.
+fn compose_crop(current: Crop, canvas: Rect, marquee: Rect) -> Option<Crop> {
+    if marquee.width == 0 || marquee.height == 0 {
+        return None;
+    }
+    let (w, h) = (u64::from(canvas.width), u64::from(canvas.height));
+    if w == 0 || h == 0 {
+        return None;
+    }
+    let dx = (marquee.x - canvas.x).max(0) as u64;
+    let dy = (marquee.y - canvas.y).max(0) as u64;
+    let (dw, dh) = (u64::from(marquee.width), u64::from(marquee.height));
+    let (cw, ch) = (u64::from(current.width), u64::from(current.height));
+    // Each edge maps on its own, so a marquee to the canvas's far edge
+    // reaches the crop's exactly, and its two edges never round apart.
+    let nx = u64::from(current.x) + dx * cw / w;
+    let ny = u64::from(current.y) + dy * ch / h;
+    let right = u64::from(current.x) + (dx + dw).min(w) * cw / w;
+    let bottom = u64::from(current.y) + (dy + dh).min(h) * ch / h;
+    let nw = right.saturating_sub(nx);
+    let nh = bottom.saturating_sub(ny);
+    Crop::new(nx as u32, ny as u32, nw as u32, nh as u32).ok()
+}
+
+/// `(x, y)` moved onto the edge of `rect` it lies within `reach` of, on
+/// each axis; the far edges are the ones `contains` excludes.
+fn snap_to_edges(rect: Rect, x: i64, y: i64, reach: i64) -> (i64, i64) {
+    let far_x = rect.x.saturating_add(i64::from(rect.width));
+    let far_y = rect.y.saturating_add(i64::from(rect.height));
+    let snap = |v: i64, near: i64, far: i64| {
+        if v - near <= reach {
+            near
+        } else if far - v <= reach {
+            far
+        } else {
+            v
+        }
+    };
+    (snap(x, rect.x, far_x), snap(y, rect.y, far_y))
 }
 
 /// The whole oriented image: the crop a photo with no sidecar crop is under.
@@ -2008,9 +2058,10 @@ impl Controller {
     }
 
     /// The developed image's fitted rectangle within the develop box, as the
-    /// adapter computed it (the box centring `blit` uses): the crop drag's
-    /// canvas. A fact like the job count, so it never bumps the generation;
-    /// the drag rectangle the model derives from it does.
+    /// adapter computed it (the box centring `blit` uses), of the image
+    /// developed at the crop the mode wants (uncropped in crop-adjust): the
+    /// crop drag's canvas. A fact like the job count, so it never bumps the
+    /// generation; the drag rectangle the model derives from it does.
     pub fn set_preview_fit(&mut self, fit: Option<Rect>) {
         self.preview_fit = fit;
     }
@@ -2127,8 +2178,16 @@ impl Controller {
 
     /// The crop drag's canvas: the developed image's fitted rectangle when
     /// the adapter has reported one, else the develop box itself (exact when
-    /// the developed image fills the box, as an uncropped 3:2 frame does).
+    /// the developed image fills the box, as an uncropped 3:2 frame does);
+    /// in crop-adjust the reported fit alone, and nothing under the chooser.
     fn canvas(&self) -> Option<Rect> {
+        if self.adjusting {
+            // The sub-mode's canvas is the uncropped frame's fit alone: the
+            // window reports one only once that frame is held, and the box
+            // meanwhile shows the cropped frame, which no crop maps onto.
+            // Nothing under the chooser, as the box is withheld there.
+            return self.develop_box().and(self.preview_fit);
+        }
         self.preview_fit.or_else(|| self.develop_box())
     }
 
@@ -2141,31 +2200,46 @@ impl Controller {
 
     /// The crop drag's marquee, in surface pixels, or `None` when no tighten
     /// drag is in progress: what the scene outlines over the cropped preview.
+    /// A fresh crop drawn in crop-adjust is `crop_adjust_rect`'s, not this.
     pub fn crop_drag(&self) -> Option<Rect> {
         match self.drag.as_ref() {
-            Some(drag) if matches!(drag.grip, Grip::Marquee) => Some(marquee_now(drag)),
+            Some(drag) if matches!(drag.grip, Grip::Marquee) && !self.adjusting => {
+                Some(marquee_now(drag))
+            }
             _ => None,
         }
     }
 
     /// The crop rectangle drawn over the uncropped develop in crop-adjust, in
-    /// surface pixels, or `None` when not adjusting: the live handle rectangle
-    /// while a handle is dragged, else the current crop mapped onto the canvas.
-    /// What the scene outlines and marks with handles.
+    /// surface pixels, or `None` when not adjusting or no canvas is reported:
+    /// the live handle rectangle while a handle is dragged, the fresh crop's
+    /// marquee once it has size, else the current crop mapped onto the
+    /// canvas. What the scene outlines and marks with handles.
     pub fn crop_adjust_rect(&self) -> Option<Rect> {
         if !self.adjusting {
             return None;
         }
         if let Some(drag) = self.drag.as_ref() {
-            if let Grip::Handle { zone, crop } = drag.grip {
-                let dx = drag.current.0 - drag.anchor.0;
-                let dy = drag.current.1 - drag.anchor.1;
-                // Against the canvas frozen at the press, and via the same
-                // `commit_crop` the release uses, so the overlay is exactly the
-                // crop that will commit -- no snap and no mid-drag re-mapping if
-                // a fresh fit arrives.
-                let crop = commit_crop(drag.canvas, crop, zone, dx, dy, drag.aspect)?;
-                return Some(crop_on_canvas(drag.canvas, crop));
+            match drag.grip {
+                Grip::Handle { zone, crop } => {
+                    let dx = drag.current.0 - drag.anchor.0;
+                    let dy = drag.current.1 - drag.anchor.1;
+                    // Against the canvas frozen at the press, and via the same
+                    // `commit_crop` the release uses, so the overlay is exactly
+                    // the crop that will commit -- no snap and no mid-drag
+                    // re-mapping if a fresh fit arrives.
+                    let crop = commit_crop(drag.canvas, crop, zone, dx, dy, drag.aspect)?;
+                    return Some(crop_on_canvas(drag.canvas, crop));
+                }
+                // A fresh crop being drawn: once it has size the marquee is
+                // the crop-to-be, shown as the crop is, with its handles;
+                // until then (a press, not yet a drag) the crop stays.
+                Grip::Marquee => {
+                    let marquee = marquee_now(drag);
+                    if marquee.width > 0 && marquee.height > 0 {
+                        return Some(marquee);
+                    }
+                }
             }
         }
         let canvas = self.canvas()?;
@@ -3299,12 +3373,16 @@ impl Controller {
         }
     }
 
-    /// The crop-adjust handles over the uncropped preview: a press grabs the
-    /// crop rectangle's edge, corner or interior (`classify`), a move resizes
+    /// The crop tool over the uncropped preview: a press grabs the crop
+    /// rectangle's edge, corner or interior (`classify`) and a move resizes
     /// or moves it (`commit_crop`, kept inside the unit square at the minimum
-    /// edge), and a release commits the result as an *absolute* crop (it can
-    /// grow the crop, unlike the tighten marquee) through the same `Effect::Edit`
-    /// the `crop` action makes, clearing the crop when it covers the whole image.
+    /// edge); a press off the rectangle, or inside a whole-frame crop off its
+    /// handles, draws a fresh crop instead, its anchor snapped to a canvas
+    /// edge within a handle's reach of it, and a move rubber-bands it
+    /// (`marquee_now`). A release commits the result as an *absolute* crop
+    /// (it can grow the crop, unlike the tighten marquee) through the same
+    /// `Effect::Edit` the `crop` action makes, clearing the crop when it
+    /// covers the whole image. Without a reported canvas nothing starts.
     fn adjust_pointer(
         &mut self,
         phase: PointerPhase,
@@ -3317,23 +3395,40 @@ impl Controller {
                 let (Some(canvas), Some(index)) = (self.canvas(), self.cursor) else {
                     return ignored;
                 };
+                if !canvas.contains(x, y) {
+                    return ignored;
+                }
                 let crop = self.current_crop(index);
                 let rect = crop_on_canvas(canvas, crop);
                 let grip = (8 * self.surface.scale.value()).max(1) as i64;
-                let Some(zone) = classify(rect, canvas, x, y, grip) else {
-                    return ignored;
+                // A press outside the crop's rectangle, or inside a crop that
+                // is the whole frame (whose interior moves nothing), draws a
+                // fresh crop from there; a press on a handle, the whole
+                // frame's edges and corners included, grabs it.
+                let reach = grip;
+                let grip = match classify(rect, canvas, x, y, grip) {
+                    Some(Zone::Move) if crop == FULL_CROP => Grip::Marquee,
+                    Some(zone) => Grip::Handle { zone, crop },
+                    None => Grip::Marquee,
                 };
                 let before = self.painted();
-                let point = (x, y);
+                let point = match grip {
+                    // A fresh crop pressed within a handle's reach of the
+                    // canvas's edge anchors on the edge, so a drag from the
+                    // far corner can reach the frame's, as `contains` keeps
+                    // the far edge itself from being pressed.
+                    Grip::Marquee => snap_to_edges(canvas, x, y, reach),
+                    Grip::Handle { .. } => (x, y),
+                };
                 self.drag = Some(Drag {
                     canvas,
                     anchor: point,
                     current: point,
                     aspect: self.aspect,
-                    grip: Grip::Handle { zone, crop },
+                    grip,
                 });
-                // Grabbing a handle paints the same rectangle already shown, so
-                // no frame change yet.
+                // Grabbing a handle paints the same rectangle already shown,
+                // and a fresh crop starts as a point: no frame change yet.
                 Ok(self.outline_changed(before))
             }
             PointerPhase::Move => {
@@ -3353,31 +3448,47 @@ impl Controller {
                     return ignored;
                 };
                 let canvas = drag.canvas;
-                let Grip::Handle { zone, crop: start } = drag.grip else {
-                    return ignored;
-                };
                 let current = clamp_into(canvas, x, y);
-                let (dx, dy) = (current.0 - drag.anchor.0, current.1 - drag.anchor.1);
-                // A grab released without moving commits nothing, like a marquee
-                // click; the overlay stays the crop it already shows.
-                if dx == 0 && dy == 0 {
-                    return Ok(self.outline_changed(before));
-                }
-                let commit = self.cursor.and_then(|index| {
-                    commit_crop(canvas, start, zone, dx, dy, drag.aspect).map(|crop| (index, crop))
-                });
+                let commit = match drag.grip {
+                    Grip::Handle { zone, crop: start } => {
+                        let (dx, dy) = (current.0 - drag.anchor.0, current.1 - drag.anchor.1);
+                        // A grab released without moving commits nothing, like
+                        // a marquee click; the overlay stays the crop it
+                        // already shows.
+                        if dx == 0 && dy == 0 {
+                            return Ok(self.outline_changed(before));
+                        }
+                        self.cursor.and_then(|index| {
+                            commit_crop(canvas, start, zone, dx, dy, drag.aspect)
+                                .map(|crop| (index, crop))
+                        })
+                    }
+                    // The fresh crop is the marquee's fractions of the whole
+                    // frame the sub-mode shows, as the release point ends it.
+                    Grip::Marquee => {
+                        let marquee = marquee_now(&Drag {
+                            canvas,
+                            anchor: drag.anchor,
+                            current,
+                            aspect: drag.aspect,
+                            grip: Grip::Marquee,
+                        });
+                        self.cursor.and_then(|index| {
+                            compose_crop(FULL_CROP, canvas, marquee).map(|crop| (index, crop))
+                        })
+                    }
+                };
                 match commit {
                     Some((index, crop)) => {
                         // A full-frame result clears the crop; else the absolute
-                        // crop. The overlay snaps from the live rectangle to the
-                        // crop the settle records; witness that snap here and let
-                        // the settle bump for the value (both this turn, one
-                        // frame). `commit_crop` also drove the live overlay, so
-                        // the snap is usually nothing and only the settle bumps.
-                        let settled = crop_on_canvas(canvas, crop);
-                        let settled = (settled.width > 0 && settled.height > 0)
-                            .then_some(Painted::Crop(true, settled));
-                        if settled != before {
+                        // crop. The drag's rectangle leaves the frame with the
+                        // drag, and the crop the model holds returns until the
+                        // settle records the new one: witness that here
+                        // whatever becomes of the write (a refused edit settles
+                        // to no change and would leave the dragged rectangle
+                        // on screen), and let the settle bump for the value
+                        // (both this turn, one frame).
+                        if self.painted() != before {
                             self.bump();
                         }
                         let value = (crop != FULL_CROP).then(|| crop.text());
@@ -3400,30 +3511,12 @@ impl Controller {
         }
     }
 
-    /// The crop a marquee selects: its fractions of the `canvas` composed
-    /// with the cursor photo's current crop, so the result is a sub-region
-    /// of it. `None` when the marquee is degenerate or the composed box is
-    /// under the minimum edge (`Crop::new`); floor division keeps it inside
-    /// the current crop, so it is always inside the image.
+    /// The crop a tighten marquee selects: its fractions of the `canvas`
+    /// composed with the cursor photo's current crop, so the result is a
+    /// sub-region of it (`compose_crop`).
     fn drag_crop(&self, index: usize, canvas: Rect, marquee: Rect) -> Option<Crop> {
-        if marquee.width == 0 || marquee.height == 0 {
-            return None;
-        }
-        let (w, h) = (u64::from(canvas.width), u64::from(canvas.height));
-        if w == 0 || h == 0 {
-            return None;
-        }
         self.photos.get(index)?;
-        let current = self.current_crop(index);
-        let dx = (marquee.x - canvas.x).max(0) as u64;
-        let dy = (marquee.y - canvas.y).max(0) as u64;
-        let (dw, dh) = (u64::from(marquee.width), u64::from(marquee.height));
-        let (cw, ch) = (u64::from(current.width), u64::from(current.height));
-        let nx = u64::from(current.x) + dx * cw / w;
-        let ny = u64::from(current.y) + dy * ch / h;
-        let nw = dw * cw / w;
-        let nh = dh * ch / h;
-        Crop::new(nx as u32, ny as u32, nw as u32, nh as u32).ok()
+        compose_crop(self.current_crop(index), canvas, marquee)
     }
 
     fn need_roll(&self) -> Result<(), Error> {
@@ -3586,6 +3679,7 @@ impl Controller {
         if self.mode == Mode::Develop && self.adjusting {
             self.adjusting = false;
             self.drag = None;
+            self.preview_fit = None;
             return Outcome::Changed;
         }
         if self.mode == Mode::Develop {
@@ -3606,6 +3700,11 @@ impl Controller {
         }
         self.adjusting = !self.adjusting;
         self.drag = None;
+        // The fit reported was of the frame the other crop shows: dropped
+        // until the adapter reports one for this crop (its turn's end), so a
+        // press in the same turn finds none in the sub-mode and the box
+        // outside it, never a stale one.
+        self.preview_fit = None;
         // Crop-adjust and the look palette are mutually exclusive overlays.
         if self.adjusting {
             self.look_list = false;

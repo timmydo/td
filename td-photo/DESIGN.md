@@ -110,11 +110,16 @@ modes are the photographer's order of work.
    camera defaults, and the crop and the look are set by the `crop` and `look`
    actions, taking the box's four fractions or a look's stem, and the crop
    also over the preview: a marquee tightens it to a sub-region, and a
-   crop-adjust sub-mode toggled with `c` grows, shrinks or moves it by its
-   edge, corner and interior handles, saving on release. The `aspect` action
-   locks the crop drag to a ratio (free, 3:2, 4:3, 1:1 or 16:9), held in the
-   preview's own pixel space, so a locked marquee, corner or edge drag keeps
-   that ratio; picking a ratio only arms the lock. A look palette toggled with
+   crop-adjust sub-mode toggled with `c` (the Crop button) shows the whole
+   frame with the crop's rectangle over it, a press off the rectangle (or
+   inside it, off its handles, when there is no crop yet) drawing a fresh
+   crop over the frame and its edge, corner and interior handles growing,
+   shrinking or moving it, each saved on release while the frame under it
+   stays whole -- the crop's content is what the rectangle encloses -- and
+   applied to the preview when the sub-mode is left. The `aspect` action locks
+   the crop drag to a ratio (free, 3:2, 4:3, 1:1 or 16:9), held in the preview's
+   own pixel space, so a locked marquee, corner or edge drag keeps that ratio;
+   picking a ratio only arms the lock. A look palette toggled with
    `l` lists the available looks with the current one marked, and a press on a
    name picks it. Two bands above the preview carry the same controls as
    buttons: a tool band with Crop (the crop-adjust toggle, shown selected
@@ -124,10 +129,10 @@ modes are the photographer's order of work.
    the first nine on `F1`..`F9`. A filmstrip under the preview shows the shown
    photos around the cursor's, `Left` and `Right` or a press moving along it.
    The status row names the sub-mode in force (`develop crop-adjust`, `develop
-   looks`). The immediate snap that reshapes the current crop and the live
-   scaled preview under the marquee are later slices. Every change is saved to
-   the sidecar as it is made, as a step of the photo's history (below); there
-   is no explicit save.
+   looks`). The immediate snap that reshapes the current crop and the scaled
+   preview under the tighten marquee are later slices. Every change is saved
+   to the sidecar as it is made, as a step of the photo's history (below);
+   there is no explicit save.
 4. **Export**, with `e` on the cursor's photo in the grid or in develop
    mode, renders the full-resolution raw through the same pipeline and
    writes an sRGB JPEG into the roll's `exported/` folder, never
@@ -423,40 +428,56 @@ window, all speaking the toolkit's one vocabulary.
   window last reported it (the turn before), the frame generation, the
   chooser's listed folder in hex, then the history's step count and the
   selected step's index, `-` for what is absent. The generation
-  moves on a change and
-  on nothing else: not on a step at an end, a filter, view or size already set,
-  a refused open, or a refused flag that leaves the file as the model held it; a
-  settle that brings a file changed meanwhile is a change. A crop set over
-  the develop preview is witnessed by the frame, not `state`: the generation
-  moves exactly when the painted outline does. The tighten marquee arms and
-  rubber-bands as before (a zero-edge, invisible rectangle changes nothing, a
-  visible one and any press or release that removes a painted one are
-  changes), committing the sub-region as the `crop` action does. The
+  moves on a change and on nothing else: not on a step at an end, a filter, view
+  or size already set, a refused open, or a refused flag that leaves the file as
+  the model held it; a settle that brings a file changed meanwhile is a change.
+  A crop set over the develop preview is witnessed by the frame, not `state`:
+  the generation moves exactly when the painted outline does. The tighten
+  marquee arms and rubber-bands as before (a zero-edge, invisible rectangle
+  changes nothing, a visible one and any press or release that removes a painted
+  one are changes), committing the sub-region as the `crop` action does. The
   crop-adjust sub-mode toggled with `c` paints the crop's rectangle and its
   eight handles: entering or leaving it, and a handle drag that moves the
   rectangle, are changes, while grabbing a handle at the rectangle it already
   shows is not; its release commits the resized or moved crop, or clears it
-  when the rectangle covers the whole frame. The `aspect` lock shapes the drag
-  geometry, not the frame directly: a locked drag moves the outlined rectangle,
-  already a change, while arming a ratio paints nothing. A look palette,
-  toggled with `l`, lists the available looks over the develop box with the
-  current one marked: opening or closing it over a non-empty list is a change
-  (the status row names the sub-mode whether or not there is a box to list into,
-  as it names crop-adjust), over an empty list nothing. A press on a name picks
-  that look through the same edit the `look` action makes, so the mark follows
-  the edit's settle; the palette stays open. So the aspect lock, the crop-adjust
-  and look-palette sub-mode flags and the developed image's fitted rectangle for
-  the drag's canvas (the window's report) are none of them `state` fields -- all
-  facts like the job count, so they never move the generation on their own. The
-  available look list (reported once when a session opens) is a fact too, but
-  the look band paints it, so a list that differs from the one held moves the
-  generation when develop is in view, as an export note does. A flag
-  the adapter wrote answers `changed` whether or not the model moved, since the
-  file did.
-  Error codes are stable (`no-roll`, `no-photo`, `bad-argument`, `refused`, and
-  the transport's `protocol` and `limit`); a refusal's reason goes to stderr,
-  since the line carries the code. `action quit` answers `quit` and the runner
-  keeps answering; the window closes on it.
+  when the rectangle covers the whole frame. A press on the canvas off the
+  rectangle -- or inside it, off its handles, when the crop is the whole
+  frame, whose interior moves nothing -- draws a fresh crop instead: the
+  press paints nothing (the crop stays shown until the marquee has size),
+  the drag rubber-bands the marquee as the crop's rectangle, handles and all
+  (`crop_adjust_rect`; it is not the tighten marquee `crop_drag` reports), and
+  the release commits the marquee's fractions of the whole frame the sub-mode
+  shows as an absolute crop, replacing the old one rather than tightening it,
+  `None` when it covers the frame; a click or a sub-minimum marquee commits
+  nothing and the crop's rectangle returns; a release that commits is a frame
+  change when the rectangle it leaves differs from the one shown, whatever
+  becomes of the write. Leaving the sub-mode drops a drag in progress. The
+  sub-mode's canvas is the uncropped frame's reported fit alone, never the box:
+  the window reports a fit only for an image developed at the crop the mode
+  wants, so while the uncropped frame is still being made the box shows the
+  cropped one with no overlay, no press draws or grabs, and the overlay
+  appears with the frame it maps onto (toggling or escaping the sub-mode
+  drops the fit held, so a press in that turn finds none). The `aspect` lock
+  shapes the drag geometry, not the frame directly: a locked drag moves the
+  outlined rectangle, already a change, while arming a ratio paints
+  nothing. A look palette, toggled with `l`, lists the available looks over the
+  develop box with the current one marked: opening or closing it over a
+  non-empty list is a change (the status row names the sub-mode whether or not
+  there is a box to list into, as it names crop-adjust), over an empty list
+  nothing. A press on a name picks that look through the same edit the `look`
+  action makes, so the mark follows the edit's settle; the palette stays open.
+  So the aspect lock, the crop-adjust and look-palette sub-mode flags and the
+  developed image's fitted rectangle for the drag's canvas (the window's report)
+  are none of them `state` fields -- all facts like the job count, so they never
+  move the generation on their own. The available look list (reported once when
+  a session opens) is a fact too, but the look band paints it, so a list that
+  differs from the one held moves the generation when develop is in view, as an
+  export note does. A flag the adapter wrote answers `changed` whether or not
+  the model moved, since the file did. Error codes are stable (`no-roll`,
+  `no-photo`, `bad-argument`, `refused`, and the transport's `protocol` and
+  `limit`); a refusal's reason goes to stderr, since the line carries the code.
+  `action quit` answers `quit` and the runner keeps answering; the window closes
+  on it.
 - **`--control-socket PATH`: the same vocabulary on the live window,** served
   from a private (0600) Unix socket by td-ui's bounded worker over
   `driven::Payload`, bound before the display is connected so a bad path fails
@@ -1461,11 +1482,19 @@ and refused for a bad size or roll, `develop_box` the preview box only in
 develop mode, the crop set over the develop preview (a marquee armed,
 rubber-banded and committed as a sub-region of the current crop, a click, a
 sub-minimum marquee and an off-canvas press refused, the develop box the
-fallback canvas when no fit is reported; the crop-adjust sub-mode toggled and
+fallback canvas when no fit is reported (in crop-adjust no canvas at all: no
+overlay and no drag until the uncropped fit is reported); the crop-adjust
+sub-mode toggled and
 escaped in layers, the crop mapped onto the canvas, a corner handle growing it,
 the interior handle moving it, an edge handle clamped to the minimum and grown
 to clear the crop, and the sub-mode and its handles witnessed by the frame not
-`state`; the `aspect` lock -- a locked corner drag mapping the ratio in the
+`state`; the fresh crop drawn in crop-adjust (from a press inside a full-frame
+crop and off a partial one, a point paint-free and the drag handled unlike the
+tighten marquee's frame, committed as the whole frame's fractions and
+replacing the old crop, a click and a sub-minimum marquee committing nothing,
+the whole frame clearing it, the lock shaping it, the sub-mode's leaving
+dropping it, an off-canvas press inert); the `aspect` lock -- a locked
+corner drag mapping the ratio in the
 canvas's pixel space (so a 3:2 lock on a 4:3 canvas is a 9:8 fraction box), a
 grab without moving neither reshaping nor committing, a corner, edge and
 tighten-marquee drag holding the ratio, a one-to-one lock keeping a square in
@@ -1638,10 +1667,10 @@ preflight. A td-photo, td-ui or td-compositor edit selects this check in
    the reported canvas's pixel space, so a locked marquee, corner or edge drag
    keeps it; picking a ratio only arms the lock. The immediate snap that would
    reshape the current crop the moment a ratio is picked is deferred with the
-   live scaled preview under the marquee: both need the window to report the
-   displayed crop, not only its fit, since crop-adjust develops the frame
-   uncropped only asynchronously and a snap issued before that fit lands would
-   read a stale cropped aspect as the whole image's. Landed. Fifth: a
+   scaled preview under the tighten marquee: the window now reports a fit
+   only for the frame the mode wants (8(d)), so a snap would wait for the
+   uncropped fit rather than read a stale cropped aspect, but it is still
+   a later slice. Landed. Fifth: a
    look palette — the `looks` action (`l`) toggles a list of the available
    looks (built-in and user stems, a `set_looks` fact) over the develop box
    with the current one marked. It is a frame-witnessed sub-mode, mutually
@@ -1681,8 +1710,10 @@ preflight. A td-photo, td-ui or td-compositor edit selects this check in
    its step buttons, a look strip with the looks on `F1`..`F9`, and the status
    row naming the crop sub-mode. Landed. (c) A filmstrip of the shown photos
    under the preview, `Left` and `Right` or a press moving between them. Landed.
-   (d) The crop tool drawing a fresh marquee from a press outside the crop in
-   crop-adjust, and a live preview under it.
+   (d) The crop tool: a press off the crop in crop-adjust (or off its handles,
+   with no crop) draws a fresh crop over the whole frame the sub-mode develops,
+   its handles adjust it, and leaving the sub-mode applies it, so the crop is
+   chosen and adjusted over its own content before the preview crops. Landed.
 9. Later: the 100% loupe from level 0, DNG and JPEG rolls, the Nikon High
    Efficiency codec, a better full-resolution demosaic, highlight
    reconstruction, the `.dtstyle` translator, and ratings.

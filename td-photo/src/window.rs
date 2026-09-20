@@ -1463,15 +1463,19 @@ impl Window {
 
     /// The develop box rectangle the cursor photo's held developed image
     /// fills, centred as `ui::blit` centres it, or `None` when not developing
-    /// or no image is held for the cursor photo yet.
+    /// or no image is held for the cursor photo yet at the crop the mode
+    /// wants: in crop-adjust the uncropped frame, else the sidecar's crop.
+    /// The held frame of the other crop is still shown while the wanted one
+    /// is made, but it is no canvas: a crop drawn or dragged against it
+    /// would map onto content the frame does not show.
     fn preview_fit(&self) -> Option<td_ui::raster::Rect> {
         let ui = &self.session.ui;
         let r#box = ui.develop_box()?;
-        let name = &ui.photos().get(ui.cursor()?)?.name;
+        let wanted = self.wanted_preview()?;
         let image = self
             .developed
             .as_ref()
-            .filter(|(preview, _)| preview.name == *name)
+            .filter(|(preview, _)| preview.name == wanted.name && preview.crop == wanted.crop)
             .and_then(|(_, image)| image.as_ref())?;
         let width = i64::try_from(image.width).ok()?;
         let height = i64::try_from(image.height).ok()?;
