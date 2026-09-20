@@ -27,7 +27,7 @@ use td_ui::driven::{self, Input, Outcome, Payload, PointerPhase};
 use td_ui::font::Font;
 use td_ui::pointer::{self, Wheel};
 use td_ui::raster::{Raster, Scale, Surface, MAX_FRAME_BYTES};
-use td_ui::wayland::{connect, endpoint};
+use td_ui::wayland::{connect, endpoint, Endpoint};
 use td_ui::wire::Message;
 
 use td_photo::develop;
@@ -82,12 +82,21 @@ pub fn open(rest: &[OsString]) -> Result<()> {
         .transpose()
         .map_err(error)?;
     let session = session(ui::DEFAULT_WIDTH, ui::DEFAULT_HEIGHT, roll.as_deref())?;
+    // Named as what was resolved, since a bare `td-photo` lands here: the
+    // path the display and runtime directory made, or the inherited
+    // descriptor, never a display the endpoint did not consult. Without a
+    // compositor the verbs are the way in, and the message says so.
     let endpoint = endpoint(
         std::env::var_os("WAYLAND_SOCKET"),
         std::env::var_os("WAYLAND_DISPLAY"),
         std::env::var_os("XDG_RUNTIME_DIR"),
-    )?;
-    let stream = connect(endpoint)?;
+    )
+    .map_err(|why| format!("Wayland: {why}; see --help"))?;
+    let name = match &endpoint {
+        Endpoint::Path(path) => format!("display {}", path.display()),
+        Endpoint::Inherited(fd) => format!("socket descriptor {fd}"),
+    };
+    let stream = connect(endpoint).map_err(|why| format!("Wayland {name}: {why}; see --help"))?;
     let control = socket.map(Worker::start).transpose().map_err(error)?;
     let mut window = Window::new(stream, std::env::temp_dir(), session, control)?;
     let result = run(&mut window);

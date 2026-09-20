@@ -3952,3 +3952,67 @@ fn the_binary_exports_over_the_replay_and_notes_the_status_row() {
         "{err}"
     );
 }
+
+/// A bare `td-photo` is the window, not the help: without a compositor it
+/// is refused with nothing on stdout, the refusal naming what was resolved
+/// (the path the display and runtime directory made, or the inherited
+/// descriptor, never a display the endpoint did not consult) or, when no
+/// endpoint could be made, why, and pointing at `--help`; `open` refuses
+/// the same.
+#[test]
+fn a_bare_invocation_is_the_window_and_without_a_compositor_names_what_it_tried() {
+    let refused = |args: &[&str], socket: Option<&str>, display: Option<&str>| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_td-photo"));
+        command.args(args);
+        command.env_remove("WAYLAND_SOCKET");
+        command.env_remove("WAYLAND_DISPLAY");
+        command.env("XDG_RUNTIME_DIR", "/nonexistent/td-photo-test-runtime");
+        if let Some(socket) = socket {
+            command.env("WAYLAND_SOCKET", socket);
+        }
+        if let Some(display) = display {
+            command.env("WAYLAND_DISPLAY", display);
+        }
+        let output = command.output().unwrap();
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+        String::from_utf8(output.stderr).unwrap()
+    };
+    let names = |err: &str, tried: &str| {
+        assert!(
+            err.contains(&format!("Wayland {tried}: ")) && err.contains("see --help"),
+            "{err}"
+        );
+    };
+    let absolute = "/nonexistent/td-photo-test-display";
+    names(
+        &refused(&[], None, Some(absolute)),
+        &format!("display {absolute}"),
+    );
+    names(
+        &refused(&["open"], None, Some(absolute)),
+        &format!("display {absolute}"),
+    );
+    // Unset is the default display under the runtime directory, and a
+    // relative one joins it: the path tried is named, not the bare name.
+    names(
+        &refused(&[], None, None),
+        "display /nonexistent/td-photo-test-runtime/wayland-0",
+    );
+    names(
+        &refused(&[], None, Some("wayland-td-photo-test")),
+        "display /nonexistent/td-photo-test-runtime/wayland-td-photo-test",
+    );
+    // The descriptor wins over the display, and the refusal says so rather
+    // than naming a display that was never consulted.
+    let socket = refused(&[], Some("2147483647"), Some(absolute));
+    names(&socket, "socket descriptor 2147483647");
+    assert!(!socket.contains(absolute), "{socket}");
+    // No endpoint at all: the reason stands alone, naming no display.
+    let invalid = refused(&[], Some("abc"), Some(absolute));
+    assert!(
+        invalid.contains("Wayland: invalid WAYLAND_SOCKET; see --help")
+            && !invalid.contains(absolute),
+        "{invalid}"
+    );
+}

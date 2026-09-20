@@ -98,12 +98,13 @@ const HELP: &str = concat!(
     "  a VALUE of - clears the key; reset clears all but the flag. The\n",
     "  sidecar is written through NAME.edit.tmp and renamed into place,\n",
     "  the one file td-photo replaces, since it is its own.\n",
-    "td-photo open [ROLL] [--control-socket PATH]\n",
-    "  Opens the window on the Wayland display, on ROLL if given: the\n",
-    "  roll as a grid of thumbnails from the camera's embedded previews,\n",
-    "  culled with the keys --help actions lists. --control-socket serves\n",
-    "  the --replay vocabulary on a private socket at PATH (absolute, at\n",
-    "  most 107 bytes) for an agent driving the live window.\n",
+    "td-photo [open [ROLL] [--control-socket PATH]]\n",
+    "  Opens the window on the Wayland display, on ROLL if given, a\n",
+    "  folder of originals: the roll as a grid of thumbnails from the\n",
+    "  camera's embedded previews, culled with the keys --help actions\n",
+    "  lists. td-photo alone is `open` with no roll. --control-socket\n",
+    "  serves the --replay vocabulary on a private socket at PATH\n",
+    "  (absolute, at most 107 bytes) for an agent driving the live window.\n",
     "td-photo --replay [--size WxH] [ROLL]\n",
     "  The window without a display: requests on stdin, answers on\n",
     "  stdout in td-ui's driving envelope, over the cull actions; ROLL is\n",
@@ -122,7 +123,8 @@ const DEFAULT_LONG_EDGE: usize = 1600;
 fn main() -> ExitCode {
     let args: Vec<OsString> = std::env::args_os().skip(1).collect();
     let result = match args.as_slice() {
-        [] => help(),
+        // The window is what td-photo is; the verbs are its batch face.
+        [] => window::open(&[]),
         [flag, sub] if flag == "--help" && sub == "actions" => help_actions(),
         [flag] if flag == "--help" => help(),
         [_, flag, ..] if flag == "--help" => help(),

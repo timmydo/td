@@ -39,8 +39,9 @@ window over it with its thumbnail pool and control socket (`window`), and the
 command line `td-photo probe FILE`, `td-photo develop FILE OUT.ppm`, `td-photo
 export FILE`, `td-photo thumb FILE OUT.ppm`, `td-photo cache`, `td-photo
 looks`, `td-photo import SRC DEST`, `td-photo list ROLL`, `td-photo flag
-FILE`, `td-photo edit FILE`, `td-photo open ROLL`, `td-photo --replay`,
-`td-photo --preview` and `td-photo --help actions`. Every read of a camera
+FILE`, `td-photo edit FILE`, `td-photo open [ROLL]` (a bare `td-photo` is
+`open`), `td-photo --replay`, `td-photo --preview` and `td-photo --help
+actions`. Every read of a camera
 file is bounded by `MAX_FILE_BYTES`, of a sidecar by `MAX_SIDECAR_BYTES` and
 of a look by `MAX_LOOK_BYTES`, trusting neither the length the file system
 reported; `develop` and `thumb` refuse an `OUT.ppm` (or `OUT.ppm.tmp`) that
@@ -875,7 +876,12 @@ stays a placeholder.
 
 `td-photo open [ROLL] [--control-socket PATH]` runs the window (`window`), a
 `td_ui::client::App` in the shape td-setup's is, and one adapter over the same
-`Session` the replay drives (see Driving): `event` maps the compositor's
+`Session` the replay drives (see Driving). A bare `td-photo` is `open` with no
+roll: the window is what td-photo is and the verbs are its batch face, so the
+usage is behind `--help`; without a compositor the refusal names what was
+resolved, the display path or the inherited `WAYLAND_SOCKET` descriptor, or
+why no endpoint could be made, and points at `--help`. The adapter: `event`
+maps the compositor's
 configure to a resize, a key to its chord (a held move or page repeats through
 the toolkit's repeat; a flag, a filter, a view or quit fires once), a left
 button's press, motion and release to the pointer path (the crop drag reads
