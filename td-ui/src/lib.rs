@@ -9,23 +9,23 @@
 //! with its buffers and pointer image, the seat with its devices and the
 //! clipboard, and the turn loop that drives a consumer's `App`), and the
 //! chrome bands over the raster (`chrome`: the menu bar and its panel, the
-//! wrapped text block, the tab strip, the status row, the paged list and
-//! the single-line text entry), and the driving layer an agent or a test
-//! operates a consumer through (`control`: the frame, envelope, codecs and
-//! response lines; `control_socket`: private listener publication;
-//! `control_worker`: the bounded transport thread handing typed jobs to the
-//! consumer's turn; `replay`: the consecutive-frame runner behind a
-//! headless `--replay`; `driven`: the semantic seam, a `Controller` over a
-//! consumer's action table with the generic verbs routed over the envelope,
-//! text read back from the draw stream and the painted frame), and the
-//! widget window (`window`: the window that presents what a program paints
-//! over its surface and hands it chords, button phases and wheel travel in
-//! surface pixels). Outside `wayland`, `client`, the private raw module
-//! beneath them, the driving adapters `control_socket`, `control_worker`
-//! and `replay`, and the widget window `window`, nothing reads the
-//! environment, a clock, a descriptor or the filesystem: adapters supply
-//! explicit inputs, and `notices` embeds the face's licence texts at
-//! compile time.
+//! wrapped text block, the tab strip, the button strip, the slider, the
+//! status row, the paged list and the single-line text entry), and the
+//! driving layer an agent or a test operates a consumer through (`control`:
+//! the frame, envelope, codecs and response lines; `control_socket`:
+//! private listener publication; `control_worker`: the bounded transport
+//! thread handing typed jobs to the consumer's turn; `replay`: the
+//! consecutive-frame runner behind a headless `--replay`; `driven`: the
+//! semantic seam, a `Controller` over a consumer's action table with the
+//! generic verbs routed over the envelope, text read back from the draw
+//! stream and the painted frame), and the widget window (`window`: the
+//! window that presents what a program paints over its surface and hands
+//! it chords, button phases and wheel travel in surface pixels). Outside
+//! `wayland`, `client`, the private raw module beneath them, the driving
+//! adapters `control_socket`, `control_worker` and `replay`, and the
+//! widget window `window`, nothing reads the environment, a clock, a
+//! descriptor or the filesystem: adapters supply explicit inputs, and
+//! `notices` embeds the face's licence texts at compile time.
 
 /// The bitmap cell every consumer lays text out on. The pinned Unifont face
 /// is 8x16 and `font::pinned` is held to these by a test, so pointer hit

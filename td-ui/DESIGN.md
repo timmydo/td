@@ -10,10 +10,11 @@ callback, the seat with its keyboard and pointer, the clipboard's data
 device with its offers and sources, the pointer image and the turn loop),
 all moved out of td-editor, with the chrome bands (`chrome`: the menu bar
 and its panel, the wrapped text block, the tab strip and the status row)
-that td-editor draws, the paged list `List` built on the panel's row
-painter and the single-line text entry `TextEntry`, the new widgets no
-scene drew. td-editor is its first consumer; the installer front end
-`td-setup` (its welcome page landed) and td-portal's file chooser follow.
+that td-editor draws, and the paged list `List` built on the panel's row
+painter, the single-line text entry `TextEntry`, the button strip
+`Buttons` and the slider `Slider`, the widgets no scene drew. td-editor
+is its first consumer; the installer front end `td-setup` (its welcome
+page landed), td-portal's file chooser and td-photo follow.
 This document is the component contract and the starting point for
 successive agents; the root `AGENTS.md` and `DEVELOPMENT.md` still govern
 changes and submission.
@@ -46,7 +47,8 @@ device with its offers, barriers and sources (the send right consumed and
 handed on), and the turn loop that drives a consumer's `App` under the
 startup deadline; and the chrome bands over the raster (`chrome`: the menu
 bar with its drop-down panel, the wrapped text block, the tab strip and the
-status row), which td-editor's scene composes and paints. It re-mounts the
+status row, which td-editor's scene composes and paints, and the list, text
+entry, button strip and slider later consumers asked for). It re-mounts the
 compositor's `font`, `font_data`, `wire` and `filter` sources exactly as
 td-editor did, so there is still one Unifont face and one wire codec in the
 tree, and it owns the 8x16 cell constants every consumer lays text out on.
@@ -177,11 +179,12 @@ of its own files may name each module.
   records under "Implemented reference-renderer contract"; that text moves here
   with the documentation increment.
 - `chrome`: `Bar` with its `Panel`, `Block`, `Strip`, `Button` and
-  `Buttons`, `Status`, `List` and `TextEntry`, the `Row` a panel paints,
-  the `Item` a list paints, the `Field` a text entry paints and `step`,
-  the bands, the paged list and the text entry a td-owned window shares,
-  over `raster` and independent of any scene. The bar, a panel's rows,
-  the tab strip, the button strip and the status row are each `ROW` (24)
+  `Buttons`, `Slider` with `KNOB_WIDTH`, `Status`, `List` and
+  `TextEntry`, the `Row` a panel paints, the `Item` a list paints, the
+  `Field` a text entry paints and `step`, the bands, the paged list, the
+  slider and the text entry a td-owned window shares, over `raster` and
+  independent of any scene. The bar, a panel's rows, the tab strip, the
+  button strip (a slider beside it) and the status row are each `ROW` (24)
   reference-renderer pixels tall, of 8x16 cells, scaled by the surface;
   the text block wraps in 16-pixel cell rows. `Bar` fills the first row
   and lays its labels from cell one, three cells apart, and answers a
@@ -1208,6 +1211,44 @@ descender's lowest row inside the bezel, partial repaint equivalence,
 damage off the band painting nothing, a clipped last button, a band at
 the surface's foot and past the integer range, and an empty strip.
 
+## Shared slider
+
+`chrome::Slider` is a horizontal slider in a rectangle the consumer
+chooses: a `BORDER` track one scaled pixel thick through the middle and
+a knob `KNOB_WIDTH` (12) font pixels wide, the rectangle's height less
+`BUTTON_MARGIN` above and below, so one on a `ROW`-tall band lines up
+with a strip's buttons. The knob is a bezelled block in a button's
+shape: a `BORDER` bezel a scaled pixel wide round a `PAPER` face, or
+round the band's own `CHROME` when disabled, so a slider nothing moves
+reads flat (a disabled `Button` keeps its paper; the knob is not one).
+The rectangle fills `CHROME` behind both. `new` refuses a rectangle
+outside the surface, narrower than two knobs or shorter than its
+margins and a knob of a bezel, a scaled pixel of face and a bezel, so
+the bezel always shows.
+
+The consumer owns the value and its meaning; the widget knows `steps`,
+the count of intervals, and places the knob's left edge at one of
+`steps + 1` positions spaced evenly along the travel from the
+rectangle's left edge to a knob short of its right, each at its nearest
+pixel, `value` clamped to `steps` and zero steps one position.
+`value_at(x, steps)` is the inverse a press or drag uses: the knob's
+centre put under the pointer, clamped to the travel, rounded to the
+nearest position, so a press past either end is that end and no pointer
+coordinate can overflow it. Both directions rounding, a knob's centre
+maps back to its own value whenever the travel (`travel`, the pixels the
+knob's left edge can take) has at least `steps` of them; a consumer
+wanting every step reachable sizes its steps or its rectangle by that.
+`hit` is the whole rectangle, band included, so a press on the track
+beside the knob jumps there; a drag is the consumer forwarding motion
+through `value_at` and committing the value when it likes (td-photo
+commits an exposure on release, painting the knob at the pointer's value
+meanwhile). Draw order is chrome, the track across the travel (its ends
+under the first and last knob), bezel, face, so the knob covers the
+track, and every fill clips to damage. Its test pins the geometry and the
+pointer mapping at scales 1-4, the draw stream, the disabled face, partial
+repaint clipping, damage off the slider painting nothing, the pixels at
+scale two and the refusals.
+
 ## Shared menu controller
 
 `menus::Model` is an immutable, caller-revisioned tree of `Node` values.
@@ -1752,3 +1793,6 @@ regressions. Those increments extend the original sequence below.
     files are gone, with their public surface, their "Cell screen"
     section and their oracles here; the widget window's section stands
     on its own. Landed.
+14. Slider: `chrome::Slider`, a knob on a track over `steps + 1`
+    positions with the pointer-to-position inverse (see "Shared
+    slider"); td-photo's exposure control is its first consumer. Landed.

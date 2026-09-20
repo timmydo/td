@@ -1,10 +1,10 @@
 //! The chrome bands td-owned windows share, over `raster`: the menu bar
 //! with its panel, a wrapped text block, a tab strip, a button strip, a
-//! status row, a scrolling list and a single-line text entry. Each is a
-//! geometry over a `Surface` in the reference renderer's units (24-pixel
-//! rows of 8x16 cells, scaled by the surface) and a painter that streams
-//! the complete band inside a damage rectangle. Nothing here reads a
-//! clock, a file or the environment.
+//! slider, a status row, a scrolling list and a single-line text entry.
+//! Each is a geometry over a `Surface` in the reference renderer's units
+//! (24-pixel rows of 8x16 cells, scaled by the surface) and a painter
+//! that streams the complete band inside a damage rectangle. Nothing
+//! here reads a clock, a file or the environment.
 
 use crate::raster::{
     text_run, Draw, GlyphStyle, Primitive, Rect, Scale, Scrollbar, Surface, BORDER, CHROME,
@@ -201,6 +201,155 @@ impl<'a> Buttons<'a> {
                 button.emit(label, selected, enabled, damage, sink);
             }
         }
+    }
+}
+
+/// A slider's knob width in font pixels: a cell and a half, wide enough
+/// to grab, narrow enough that a short track keeps its travel.
+pub const KNOB_WIDTH: usize = 12;
+
+/// A horizontal slider in a rectangle: a `BORDER` track through the
+/// middle and a bezelled knob in a button's shape at one of `steps + 1`
+/// positions, the knob a button's height (the rectangle inset
+/// `BUTTON_MARGIN` above and below, so one on a `ROW`-tall band lines up
+/// with a strip's buttons). The consumer owns the value and what it
+/// means; `value_at` maps a press or drag to the nearest position, so a
+/// drag is a sequence of values the consumer commits as it likes. Both
+/// directions round to nearest, so `value_at` of a knob's centre is that
+/// knob's value whenever the travel has at least `steps` pixels; more
+/// steps than pixels cannot all be reached, and a consumer wanting every
+/// step gives the slider the width.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Slider {
+    surface: Surface,
+    rect: Rect,
+}
+
+impl Slider {
+    /// The slider in `rect`; `None` when `rect` lies outside the surface,
+    /// is narrower than two knobs or shorter than the margins and a knob
+    /// of a bezel, a scaled pixel of face and a bezel between them.
+    pub fn new(surface: Surface, rect: Rect) -> Option<Self> {
+        surface.check().ok()?;
+        let s = surface.scale.value();
+        if rect.intersection(surface.bounds()) != Some(rect) {
+            return None;
+        }
+        if (rect.width as usize) < 2 * KNOB_WIDTH * s
+            || (rect.height as usize) < (2 * BUTTON_MARGIN + 3) * s
+        {
+            return None;
+        }
+        Some(Self { surface, rect })
+    }
+
+    fn scale(self) -> usize {
+        self.surface.scale.value()
+    }
+
+    pub fn rect(self) -> Rect {
+        self.rect
+    }
+
+    pub fn hit(self, x: i64, y: i64) -> bool {
+        self.rect.contains(x, y)
+    }
+
+    /// The knob's width and the travel its left edge has: from the
+    /// rectangle's left to a knob's width short of its right. `new` held
+    /// the width to two knobs, so the travel is at least one.
+    fn span(self) -> (i64, i64) {
+        let knob = (KNOB_WIDTH * self.scale()) as i64;
+        (knob, (i64::from(self.rect.width) - knob).max(0))
+    }
+
+    /// The travel in pixels: how many steps are all reachable, and what a
+    /// consumer sizes its `steps` or its rectangle by.
+    pub fn travel(self) -> u32 {
+        self.span().1 as u32
+    }
+
+    /// The knob at `value` among `steps + 1` positions, clamped: at the
+    /// left for a value of zero (and for any value when `steps` is zero,
+    /// the one position there is), at the right for `steps`, the ones
+    /// between at the nearest pixel.
+    pub fn knob(self, value: usize, steps: usize) -> Rect {
+        let s = self.scale();
+        let (knob, span) = self.span();
+        let offset = if steps == 0 {
+            0
+        } else {
+            let value = value.min(steps) as i128;
+            let steps = steps as i128;
+            ((span as i128 * value + steps / 2) / steps) as i64
+        };
+        let margin = (BUTTON_MARGIN * s) as i64;
+        Rect {
+            x: self.rect.x + offset,
+            y: self.rect.y + margin,
+            width: knob as u32,
+            height: self.rect.height.saturating_sub(2 * margin as u32),
+        }
+    }
+
+    /// The position nearest a pointer at `x`, among `steps + 1`: the knob's
+    /// centre put under the pointer and clamped to the travel, so a press
+    /// past either end is that end.
+    pub fn value_at(self, x: i64, steps: usize) -> usize {
+        let (knob, span) = self.span();
+        if steps == 0 {
+            return 0;
+        }
+        let along = x
+            .saturating_sub(self.rect.x)
+            .saturating_sub(knob / 2)
+            .clamp(0, span) as i128;
+        let steps_wide = steps as i128;
+        ((along * steps_wide + span as i128 / 2) / span as i128) as usize
+    }
+
+    /// Paints the rectangle chrome, the track through the knob's middle
+    /// row across the travel (from the first knob's centre to the pixel
+    /// before the last's, so each end is under a knob), and the knob at
+    /// `value`: a `BORDER` bezel round a `PAPER` face, or round the chrome
+    /// itself when disabled, so a slider nothing moves reads flat.
+    pub fn emit(
+        &self,
+        value: usize,
+        steps: usize,
+        enabled: bool,
+        damage: Rect,
+        sink: &mut dyn FnMut(Draw),
+    ) {
+        let Some(damage) = damage.intersection(self.surface.bounds()) else {
+            return;
+        };
+        let s = self.scale() as u32;
+        fill(self.rect, CHROME, damage, sink);
+        let knob = self.knob(value, steps);
+        let (width, span) = self.span();
+        let middle = knob.y + i64::from(knob.height) / 2;
+        fill(
+            Rect {
+                x: self.rect.x + width / 2,
+                y: middle - i64::from(s) / 2,
+                width: span as u32,
+                height: s,
+            },
+            BORDER,
+            damage,
+            sink,
+        );
+        // `new` held the knob to a bezel, a pixel and a bezel each way.
+        let inset = s.min(knob.width / 2).min(knob.height / 2);
+        let face = Rect {
+            x: knob.x + i64::from(inset),
+            y: knob.y + i64::from(inset),
+            width: knob.width.saturating_sub(2 * inset),
+            height: knob.height.saturating_sub(2 * inset),
+        };
+        fill(knob, BORDER, damage, sink);
+        fill(face, if enabled { PAPER } else { CHROME }, damage, sink);
     }
 }
 

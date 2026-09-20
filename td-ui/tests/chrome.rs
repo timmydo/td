@@ -13,8 +13,8 @@
 //! and paint one band whole to a buffer to confirm the pixels.
 
 use td_ui::chrome::{
-    step, Bar, Block, Field, Item, List, Panel, Row, Status, Strip, TextEntry, DISABLED,
-    SELECTED_ROW, STATUS_COLUMNS,
+    step, Bar, Block, Field, Item, List, Panel, Row, Slider, Status, Strip, TextEntry,
+    BUTTON_MARGIN, DISABLED, KNOB_WIDTH, SELECTED_ROW, STATUS_COLUMNS,
 };
 use td_ui::font;
 use td_ui::raster::{
@@ -1814,4 +1814,326 @@ fn a_button_strip_lays_bordered_buttons_from_cell_one_and_hits_only_whole_ones()
         assert_eq!(fills(&draws), vec![(empty.rect(), CHROME)]);
         assert!(glyphs(&draws).is_empty() && empty.hit(rects[0].x, mid).is_none());
     }
+}
+
+/// The slider's geometry at every scale: the knob a button's height and
+/// `KNOB_WIDTH` wide, travelling from the rectangle's left edge to a knob
+/// short of its right; `value_at` puts the knob's centre under the pointer
+/// and rounds to the nearest of `steps + 1` positions, the ends clamped.
+#[test]
+fn a_slider_lays_its_knob_along_the_travel_and_maps_the_pointer_to_the_nearest_step() {
+    for scale in 1..=4u8 {
+        let s = scale as usize;
+        let surface = surface(400 * s, 72 * s, scale);
+        let rect = Rect {
+            x: (16 * s) as i64,
+            y: (24 * s) as i64,
+            width: (212 * s) as u32,
+            height: (24 * s) as u32,
+        };
+        let slider = Slider::new(surface, rect).unwrap();
+        assert_eq!(slider.rect(), rect);
+        let knob = (KNOB_WIDTH * s) as i64;
+        let span = i64::from(rect.width) - knob;
+        let margin = (BUTTON_MARGIN * s) as i64;
+        let at = |x: i64| Rect {
+            x,
+            y: rect.y + margin,
+            width: knob as u32,
+            height: (rect.height as i64 - 2 * margin) as u32,
+        };
+        // Ten steps over a 200-pixel travel land the knob every twenty
+        // pixels, the last flush with the rectangle's right edge, and a
+        // value past the last step is the last step.
+        for value in 0..=10 {
+            assert_eq!(
+                slider.knob(value, 10),
+                at(rect.x + 20 * s as i64 * value as i64)
+            );
+        }
+        assert_eq!(slider.travel(), span as u32);
+        assert_eq!(slider.knob(11, 10), slider.knob(10, 10));
+        assert_eq!(slider.knob(usize::MAX, 10), slider.knob(10, 10));
+        assert_eq!(slider.knob(0, 0), at(rect.x));
+        assert_eq!(slider.knob(7, 0), at(rect.x));
+        // A knob's own centre maps back to its value; a pointer between two
+        // positions goes to the nearer, and beyond either end to that end.
+        for value in 0..=10 {
+            let centre = slider.knob(value, 10).x + knob / 2;
+            assert_eq!(
+                slider.value_at(centre, 10),
+                value,
+                "scale {scale} value {value}"
+            );
+            assert_eq!(slider.value_at(centre + 9 * s as i64, 10), value);
+            if value < 10 {
+                assert_eq!(slider.value_at(centre + 11 * s as i64, 10), value + 1);
+            }
+        }
+        assert_eq!(slider.value_at(i64::MIN, 10), 0);
+        assert_eq!(slider.value_at(i64::MAX, 10), 10);
+        assert_eq!(slider.value_at(rect.x + rect.width as i64 + 1, 0), 0);
+        // A travel of twelve pixels and ten steps still lands every
+        // knob's centre back on its own value, both directions rounding;
+        // more steps than pixels cannot, and the widget does not pretend.
+        let narrow = Slider::new(
+            surface,
+            Rect {
+                width: (24 * s) as u32,
+                ..rect
+            },
+        )
+        .unwrap();
+        for value in 0..=10 {
+            let centre = narrow.knob(value, 10).x + knob / 2;
+            assert_eq!(narrow.value_at(centre, 10), value, "narrow {value}");
+        }
+        // Step one of ten over the twelve is at 1.2 scaled pixels, rounded.
+        assert_eq!(narrow.knob(1, 10).x - rect.x, (12 * s as i64 + 5) / 10);
+        let many = 13 * s;
+        assert!((0..=many).any(|value| {
+            let centre = narrow.knob(value, many).x + knob / 2;
+            narrow.value_at(centre, many) != value
+        }));
+        // Hits are the whole rectangle, band included, and nothing outside.
+        let (right, bottom) = (rect.x + 212 * s as i64, rect.y + 24 * s as i64);
+        assert!(slider.hit(rect.x, rect.y) && slider.hit(right - 1, bottom - 1));
+        assert!(!slider.hit(rect.x - 1, rect.y) && !slider.hit(right, rect.y));
+        assert!(!slider.hit(rect.x, rect.y - 1) && !slider.hit(rect.x, bottom));
+    }
+}
+
+/// The slider paints its chrome, its track, then the knob's bezel and face
+/// in that order so the knob covers the track; the face is paper when
+/// enabled and chrome when not; a damage rectangle clips every fill and one
+/// outside the slider emits nothing; and the pixels of an enabled knob at
+/// scale two show the bezel, the face and the track either side.
+#[test]
+fn a_slider_paints_track_then_bezelled_knob_and_clips_to_the_damage() {
+    let surface = surface(400, 72, 1);
+    let rect = Rect {
+        x: 16,
+        y: 24,
+        width: 212,
+        height: 24,
+    };
+    let slider = Slider::new(surface, rect).unwrap();
+    let draws = run(surface, |damage, sink| {
+        slider.emit(5, 10, true, damage, sink)
+    });
+    assert!(glyphs(&draws).is_empty());
+    let knob = slider.knob(5, 10);
+    assert_eq!(
+        knob,
+        Rect {
+            x: 116,
+            y: 26,
+            width: 12,
+            height: 20
+        }
+    );
+    let track = Rect {
+        x: 22,
+        y: 36,
+        width: 200,
+        height: 1,
+    };
+    let face = Rect {
+        x: 117,
+        y: 27,
+        width: 10,
+        height: 18,
+    };
+    assert_eq!(
+        fills(&draws),
+        vec![
+            (rect, CHROME),
+            (track, BORDER),
+            (knob, BORDER),
+            (face, PAPER)
+        ]
+    );
+    let disabled = run(surface, |damage, sink| {
+        slider.emit(5, 10, false, damage, sink)
+    });
+    assert_eq!(fills(&disabled)[3], (face, CHROME));
+    // Damage covering the knob's left half alone clips each fill to it.
+    let part = Rect {
+        x: 110,
+        y: 24,
+        width: 12,
+        height: 24,
+    };
+    let mut clipped = Vec::new();
+    slider.emit(5, 10, true, part, &mut |draw| clipped.push(draw));
+    assert_eq!(
+        fills(&clipped),
+        vec![
+            (
+                Rect {
+                    x: 110,
+                    y: 24,
+                    width: 12,
+                    height: 24
+                },
+                CHROME
+            ),
+            (
+                Rect {
+                    x: 110,
+                    y: 36,
+                    width: 12,
+                    height: 1
+                },
+                BORDER
+            ),
+            (
+                Rect {
+                    x: 116,
+                    y: 26,
+                    width: 6,
+                    height: 20
+                },
+                BORDER
+            ),
+            (
+                Rect {
+                    x: 117,
+                    y: 27,
+                    width: 5,
+                    height: 18
+                },
+                PAPER
+            ),
+        ]
+    );
+    let mut nothing = Vec::new();
+    let off = Rect {
+        x: 0,
+        y: 0,
+        width: 400,
+        height: 24,
+    };
+    slider.emit(5, 10, true, off, &mut |draw| nothing.push(draw));
+    assert!(nothing.is_empty());
+    let mut outside = Vec::new();
+    let far = Rect {
+        x: 1000,
+        y: 0,
+        width: 4,
+        height: 4,
+    };
+    slider.emit(5, 10, true, far, &mut |draw| outside.push(draw));
+    assert!(outside.is_empty());
+    // Pixels at scale two: a two-pixel bezel round a paper face, the track
+    // two pixels thick through the knob's middle rows on either side of it,
+    // and chrome above and below.
+    let font = font::pinned().unwrap();
+    let (width, height) = (400, 72);
+    let two = Surface::new(width, height, Scale::new(2).unwrap()).unwrap();
+    let rect = Rect {
+        x: 0,
+        y: 0,
+        width: 400,
+        height: 48,
+    };
+    let slider = Slider::new(two, rect).unwrap();
+    let mut pixels = vec![0u8; width * height * 4];
+    let mut raster = Raster::new(&mut pixels, &font, two, width * 4).unwrap();
+    slider.emit(0, 1, true, two.bounds(), &mut |draw| raster.draw(draw));
+    assert_eq!(
+        slider.knob(0, 1),
+        Rect {
+            x: 0,
+            y: 4,
+            width: 24,
+            height: 40
+        }
+    );
+    let px = |x: usize, y: usize| -> u32 {
+        let base = (y * width + x) * 4;
+        u32::from_le_bytes([
+            pixels[base],
+            pixels[base + 1],
+            pixels[base + 2],
+            pixels[base + 3],
+        ]) & 0xff_ffff
+    };
+    assert_eq!(px(0, 4), BORDER);
+    assert_eq!(px(1, 5), BORDER);
+    assert_eq!(px(2, 6), PAPER);
+    assert_eq!(px(21, 41), PAPER);
+    assert_eq!(px(23, 43), BORDER);
+    assert_eq!(px(0, 3), CHROME);
+    assert_eq!(px(0, 44), CHROME);
+    assert_eq!(px(12, 24), PAPER);
+    assert_eq!(px(30, 23), BORDER);
+    assert_eq!(px(30, 24), BORDER);
+    assert_eq!(px(30, 22), CHROME);
+    assert_eq!(px(30, 25), CHROME);
+    assert_eq!(px(387, 24), BORDER);
+    assert_eq!(px(388, 24), CHROME);
+    // The track starts under the knob's centre, so the knob covers its
+    // left end; just past the knob it shows.
+    assert_eq!(px(24, 24), BORDER);
+    assert_eq!(px(24, 22), CHROME);
+    assert_eq!(px(200, 60), 0, "below the slider stays untouched");
+}
+
+/// `new` refuses a rectangle the surface cannot hold, one narrower than two
+/// knobs or one shorter than its margins, and a surface that fails its own
+/// check.
+#[test]
+fn slider_new_refuses_a_rect_the_surface_or_the_knob_cannot_hold() {
+    let surface = surface(200, 48, 2);
+    let ok = Rect {
+        x: 0,
+        y: 0,
+        width: 48,
+        height: 14,
+    };
+    assert!(Slider::new(surface, ok).is_some());
+    for bad in [
+        Rect { width: 47, ..ok },
+        Rect { height: 13, ..ok },
+        Rect { x: 153, ..ok },
+        Rect { y: 35, ..ok },
+        Rect { x: -1, ..ok },
+        Rect {
+            width: 0,
+            height: 0,
+            ..ok
+        },
+    ] {
+        assert!(Slider::new(surface, bad).is_none(), "{bad:?}");
+    }
+    assert!(Slider::new(surface, Rect { x: 152, ..ok }).is_some());
+    assert!(Slider::new(surface, Rect { y: 34, ..ok }).is_some());
+    // The shortest slider still shows a bezel round a pixel of face.
+    let short = Slider::new(surface, ok).unwrap();
+    let draws = run(surface, |damage, sink| {
+        short.emit(0, 1, false, damage, sink)
+    });
+    let knob = short.knob(0, 1);
+    assert_eq!(knob.height, 6);
+    assert_eq!(
+        fills(&draws)[3],
+        (
+            Rect {
+                x: knob.x + 2,
+                y: knob.y + 2,
+                width: knob.width - 4,
+                height: 2
+            },
+            CHROME
+        )
+    );
+    assert!(Slider::new(
+        Surface {
+            width: 0,
+            ..surface
+        },
+        ok
+    )
+    .is_none());
 }
