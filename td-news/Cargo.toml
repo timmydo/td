@@ -11,8 +11,9 @@ path = "src/main.rs"
 
 # td-news is a TARGET-built application, NOT part of td's control-plane engine
 # workspace. It is standalone — its own workspace root — with a lock that
-# names itself and the one sibling it draws through. Its closure is `std`
-# and td-ui (td's AGENTS.md "std, not no_std", and APPLICATIONS.md §W.8):
+# names itself and the two siblings it draws through. Its closure is `std`,
+# td-ui and td-editor (td's AGENTS.md "std, not no_std", and
+# APPLICATIONS.md §W.8):
 # what ten crates used to supply is six shared td modules under `src/`,
 # copied whole and never edited, plus one unix socket to td's fetch service.
 #
@@ -32,8 +33,11 @@ todo = "deny"
 unimplemented = "deny"
 indexing_slicing = "deny"  # use .get(i) over xs[i] / &xs[a..b]
 
-# The shared UI toolkit, by the one sibling-dependency spelling the lock
-# guard admits (AGENTS.md 'Rust code'): the screen window the reader draws
-# in reaches this crate only through `td_ui::`.
+# The shared UI toolkit and the editor's document view, by the one
+# sibling-dependency spelling the lock guard admits (AGENTS.md 'Rust
+# code'): the window and the lists reach this crate only through
+# `td_ui::`, and the read-only pane an article is read in through
+# `td_editor::`.
 [dependencies]
 td-ui = { path = "../td-ui" }
+td-editor = { path = "../td-editor" }

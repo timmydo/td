@@ -1,3 +1,13 @@
+//! The reader's views over the widget window: the toolkit's lists for
+//! the feeds, the articles and an article's links, td-editor's read-only
+//! document pane for an article, a log window and the help, a search
+//! field, an action bar and a status row, laid out over the surface each
+//! frame. The window owns the Wayland connection; the app owns every view
+//! and the pane's controller. A press in the pane is handed on at the
+//! pointer's pixel as both the caret and the cell coordinate, as the
+//! toolkit's replay does, so the caret lands before the glyph under the
+//! pointer rather than at its nearer edge.
+
 mod input;
 pub mod views;
 mod window;
@@ -8,11 +18,11 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::PathBuf;
 use std::sync::mpsc;
 
-use td_ui::screen::{self, Screen, Style};
-
-/// The one-based row of a list's first entry, under the title row and
-/// the view's header row: what a click on it reports (`input::translate`).
-const LIST_FIRST_ROW: usize = 3;
+use td_editor::model::TabId;
+use td_editor::ui::{Controller, Event, Outcome, PointerPhase as PanePhase};
+use td_ui::chrome::{Bar, Field, Item, List, Status, Strip, TabHit, TextEntry, ROW};
+use td_ui::raster::{Composition, Draw, Primitive, Raster, Rect, Surface, PAPER};
+use td_ui::window::{Input, PointerPhase};
 
 use crate::backend::{BackendCommand, BackendResponse, FeedRefreshReport};
 use crate::cache::Cache;
@@ -20,23 +30,12 @@ use crate::config::Config;
 use crate::feed::{datetime_sort_key, normalize_datetime_to_local, Article};
 use crate::keybindings;
 
-use input::{InputEvent, Key, MouseEvent};
+use input::Key;
 pub use window::run;
 
-/// One row of a frame: its text, and the style it is drawn in, the base
-/// style when none. A styled row is painted whole, its background to the
-/// right edge, as a terminal's erase-to-end did under the row's colours.
-#[derive(Debug, Default)]
-struct Line {
-    text: String,
-    style: Option<Style>,
-}
-
-impl From<String> for Line {
-    fn from(text: String) -> Self {
-        Self { text, style: None }
-    }
-}
+/// The rows a page key moves a list's selection or a pane's window by
+/// when the layout has none to say: the terminal's fifteen.
+const PAGE_ROWS: usize = 15;
 
 #[derive(Clone)]
 struct FeedRow {
@@ -48,6 +47,7 @@ struct FeedRow {
     last_error: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum View {
     FeedList,
     ArticleList,
@@ -99,40 +99,130 @@ fn log_tab_index(tab: LogTab) -> usize {
     }
 }
 
-#[derive(Clone, Copy, Default)]
-/// The frame's styles, from the configuration's colours over the
-/// toolkit's paper and ink: a row kind with no colour of its own is drawn
-/// reversed where the terminal drew it reversed, and in the base style
-/// otherwise.
-struct UiTheme {
-    base: Style,
-    header: Style,
-    status: Style,
-    selection: Style,
-    unread: Style,
+/// What the document pane holds, so a frame reloads it only when what it
+/// should show changed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum PaneText {
+    None,
+    NoArticle,
+    Article {
+        hash: String,
+        columns: usize,
+    },
+    Log {
+        tab: usize,
+        start: usize,
+        rows: usize,
+        columns: usize,
+        total: Option<usize>,
+    },
+    Help,
+}
+
+/// The action bar's labels for a view, and the key each stands for; a
+/// click on a label is that key.
+const FEED_LABELS: &[&str] = &[
+    "Open",
+    "Refresh",
+    "Refresh all",
+    "Mark read",
+    "Help",
+    "Quit",
+];
+const FEED_KEYS: &[Key] = &[
+    Key::Enter,
+    Key::Char('g'),
+    Key::Char('G'),
+    Key::Char('u'),
+    Key::Char('?'),
+    Key::Char('q'),
+];
+const ARTICLE_LIST_LABELS: &[&str] = &[
+    "Back",
+    "Refresh",
+    "Refresh all",
+    "Read, next",
+    "Digest",
+    "Open link",
+    "Help",
+];
+const ARTICLE_LIST_KEYS: &[Key] = &[
+    Key::Char('q'),
+    Key::Char('g'),
+    Key::Char('G'),
+    Key::Char('u'),
+    Key::Char('H'),
+    Key::Char('o'),
+    Key::Char('?'),
+];
+const ARTICLE_LABELS: &[&str] = &[
+    "Back",
+    "Previous",
+    "Next",
+    "Links",
+    "Open link",
+    "Toggle read",
+    "Help",
+];
+const ARTICLE_KEYS: &[Key] = &[
+    Key::Char('q'),
+    Key::Char('p'),
+    Key::Char('n'),
+    Key::Char('b'),
+    Key::Char('o'),
+    Key::Char('u'),
+    Key::Char('?'),
+];
+const LINKS_LABELS: &[&str] = &["Cancel", "Open"];
+const LINKS_KEYS: &[Key] = &[Key::Char('q'), Key::Enter];
+const LOG_LABELS: &[&str] = &["Back", "News", "Debug", "Help"];
+const LOG_KEYS: &[Key] = &[
+    Key::Char('q'),
+    Key::Char('n'),
+    Key::Char('d'),
+    Key::Char('?'),
+];
+const HELP_LABELS: &[&str] = &["Back"];
+const HELP_KEYS: &[Key] = &[Key::Char('q')];
+
+/// The frame's regions, laid out over the surface for the view: the
+/// action bar, then the view's body between it and the status row.
+struct Layout {
+    bar: Bar<'static>,
+    search: Option<TextEntry>,
+    list: Option<List>,
+    strip: Option<Strip>,
+    pane: Option<Rect>,
+    status: Status,
 }
 
 struct App {
     view: View,
+    /// The view the help returns to.
+    help_from: View,
     feeds: Vec<FeedRow>,
     selected_feed: usize,
-    feed_list_scroll: usize,
+    feed_first: usize,
     selected_article: usize,
-    article_list_scroll: usize,
-    article_scroll: usize,
+    article_first: usize,
     selected_feed_scope: Option<FeedScope>,
     articles: Vec<Article>,
     open_article: Option<Article>,
     search: String,
     search_mode: bool,
+    search_first: usize,
     status: String,
     last_updated: Option<String>,
-    last_size: (usize, usize),
-    page_size: usize,
-    scrolloff: usize,
-    theme: UiTheme,
+    /// The surface the window last laid the reader out for.
+    surface: Surface,
     log_tab: LogTab,
+    /// The first log line asked for; `usize::MAX` follows the log's end.
     log_scroll: usize,
+    /// The first line the last frame showed: `log_scroll` clamped.
+    log_start: usize,
+    /// The count the shown log window was read under; none when the
+    /// window could not be read, whatever a kept count says.
+    log_shown_total: Option<usize>,
     /// The line count of each log, so a frame counts only what grew.
     log_count: [Cell<Option<LogCount>>; 2],
     /// Where each log view's first line began, so a frame resumes its
@@ -145,40 +235,19 @@ struct App {
     article_urls: Vec<String>,
     url_picking: bool,
     url_cursor: usize,
+    url_first: usize,
     pending_user_fetches: usize,
     pending_read_mutations: HashMap<String, bool>,
-}
-
-impl UiTheme {
-    fn from_config(theme: &crate::config::Theme) -> Self {
-        let base = Style::new(
-            parse_color_opt(&theme.fg).map_or(screen::INK, rgb),
-            parse_color_opt(&theme.bg).map_or(screen::PAPER, rgb),
-        );
-        Self {
-            base,
-            header: styled(base, parse_color_opt(&theme.header_fg), None, true, false),
-            status: styled(
-                base,
-                parse_color_opt(&theme.status_fg),
-                parse_color_opt(&theme.status_bg),
-                false,
-                true,
-            ),
-            selection: styled(
-                base,
-                parse_color_opt(&theme.selection_fg),
-                parse_color_opt(&theme.selection_bg),
-                false,
-                true,
-            ),
-            unread: styled(base, parse_color_opt(&theme.bold_fg), None, true, false),
-        }
-    }
+    /// The document pane, read-only: an article, a log window or the help.
+    pane: Controller,
+    pane_tab: Option<TabId>,
+    pane_text: PaneText,
+    /// Whether a press in the pane began a drag the pane still receives.
+    pane_drag: bool,
 }
 
 impl App {
-    fn new(config: &Config, cache: &Cache, offline: bool) -> Self {
+    fn new(config: &Config, cache: &Cache, offline: bool) -> Result<Self, String> {
         let mut feeds = Vec::with_capacity(config.feeds.len());
         let mut last_updated = None;
         let mut last_updated_ts = None;
@@ -207,32 +276,32 @@ impl App {
                 last_error: None,
             });
         }
-
-        Self {
+        let pane = Controller::pane().map_err(|e| format!("document pane: {e}"))?;
+        Ok(Self {
             view: View::FeedList,
+            help_from: View::FeedList,
             feeds,
             selected_feed: 0,
-            feed_list_scroll: 0,
+            feed_first: 0,
             selected_article: 0,
-            article_list_scroll: 0,
-            article_scroll: 0,
+            article_first: 0,
             selected_feed_scope: None,
             articles: Vec::new(),
             open_article: None,
             search: String::new(),
             search_mode: false,
+            search_first: 0,
             status: if offline {
                 "Offline mode: browsing cache".to_string()
             } else {
                 "Ready".to_string()
             },
             last_updated,
-            last_size: (80, 24),
-            page_size: config.ui.page_size.max(1),
-            scrolloff: config.ui.scrolloff,
-            theme: UiTheme::from_config(&config.theme),
+            surface: pane.geometry().surface(),
             log_tab: LogTab::News,
             log_scroll: 0,
+            log_start: 0,
+            log_shown_total: None,
             log_count: [Cell::new(None), Cell::new(None)],
             log_window_hint: [Cell::new(None), Cell::new(None)],
             quitting: false,
@@ -242,9 +311,14 @@ impl App {
             article_urls: Vec::new(),
             url_picking: false,
             url_cursor: 0,
+            url_first: 0,
             pending_user_fetches: 0,
             pending_read_mutations: HashMap::new(),
-        }
+            pane,
+            pane_tab: None,
+            pane_text: PaneText::None,
+            pane_drag: false,
+        })
     }
 
     fn handle_backend(&mut self, msg: BackendResponse, cache: &Cache) {
@@ -368,130 +442,132 @@ impl App {
         }
     }
 
-    fn handle_input(
+    // ---- the window's inputs ------------------------------------------
+
+    /// One input from the window; whether the reader is quitting.
+    fn input(
         &mut self,
-        input: InputEvent,
+        input: Input<'_>,
         cache: &Cache,
         cmd_tx: &mpsc::Sender<BackendCommand>,
     ) -> bool {
         if self.quitting {
             return true;
         }
-
-        if let InputEvent::Key(Key::Char('?')) = input {
-            if !matches!(self.view, View::Help) {
-                self.view = View::Help;
-                self.pending_redraw = true;
-                return false;
-            }
-        }
-
-        if matches!(self.view, View::Help) {
-            if let InputEvent::Key(Key::Char('q')) = input {
-                self.view = if self.selected_feed_scope.is_some() {
-                    View::ArticleList
-                } else {
-                    View::FeedList
-                };
+        match input {
+            Input::Close => self.quitting = true,
+            Input::Resize(surface) => {
+                self.surface = surface;
                 self.pending_redraw = true;
             }
-            return false;
-        }
-
-        if self.search_mode {
-            if let InputEvent::Key(key) = input {
-                match key {
-                    Key::Enter => {
-                        self.search_mode = false;
-                        self.selected_article = 0;
-                        self.article_list_scroll = 0;
+            Input::Focus(focused) => {
+                self.pane_event(Event::Focus(focused));
+                self.pending_redraw = true;
+            }
+            Input::Key { chord, .. } => self.chord(chord, cache, cmd_tx),
+            Input::Pointer {
+                phase,
+                x,
+                y,
+                extend,
+            } if self.mouse_config => self.pointer(phase, x, y, extend, cache, cmd_tx),
+            Input::CancelPointer => {
+                if self.pane_drag {
+                    self.pane_drag = false;
+                    if self.pane_event(Event::CancelPointer) == Outcome::Changed {
                         self.pending_redraw = true;
                     }
-                    Key::Backspace => {
-                        self.search.pop();
-                        self.selected_article = 0;
-                        self.article_list_scroll = 0;
-                        self.pending_redraw = true;
-                    }
-                    Key::Char(c) if !c.is_control() => {
-                        self.search.push(c);
-                        self.selected_article = 0;
-                        self.article_list_scroll = 0;
-                        self.pending_redraw = true;
-                    }
-                    _ => {}
                 }
             }
-            return false;
+            Input::Wheel { rows, .. } if self.mouse_config => self.wheel(rows),
+            Input::Pointer { .. } | Input::Wheel { .. } => {}
         }
-
-        match self.view {
-            View::FeedList => self.handle_feed_keys(input, cache, cmd_tx),
-            View::ArticleList => self.handle_article_list_keys(input, cache, cmd_tx),
-            View::Article => self.handle_article_view_keys(input, cache, cmd_tx),
-            View::Log => self.handle_log_keys(input),
-            View::Help => {}
-        }
-
         self.quitting
     }
 
-    fn handle_feed_keys(
+    /// The loop's clock, for the pane's caret.
+    fn tick(&mut self, now: u64) {
+        if self.pane_event(Event::Tick(now)) == Outcome::Changed && self.pane_shown() {
+            self.pending_redraw = true;
+        }
+    }
+
+    fn pane_shown(&self) -> bool {
+        matches!(self.view, View::Help | View::Log)
+            || (self.view == View::Article && !self.url_picking)
+    }
+
+    /// A chord: one of the reader's keys, or the pane's when one is shown.
+    fn chord(&mut self, chord: &str, cache: &Cache, cmd_tx: &mpsc::Sender<BackendCommand>) {
+        match input::key(chord) {
+            Some(key) => self.handle_key(key, chord, cache, cmd_tx),
+            None => self.pane_chord(chord),
+        }
+    }
+
+    /// A key of the reader's; `chord` is its spelling, for the pane, or
+    /// empty for a key the action bar stood for.
+    fn handle_key(
         &mut self,
-        input: InputEvent,
+        key: Key,
+        chord: &str,
         cache: &Cache,
         cmd_tx: &mpsc::Sender<BackendCommand>,
     ) {
-        match input {
-            InputEvent::Key(Key::Char('q')) => {
-                self.quitting = true;
-            }
-            InputEvent::Key(Key::Down)
-            | InputEvent::Key(Key::Char('j'))
-            | InputEvent::Key(Key::Char('n')) => {
-                if self.selected_feed + 1 < self.feed_row_count() {
-                    self.selected_feed += 1;
-                    self.ensure_selected_feed_visible();
-                    self.pending_redraw = true;
-                }
-            }
-            InputEvent::Key(Key::Up)
-            | InputEvent::Key(Key::Char('k'))
-            | InputEvent::Key(Key::Char('p')) => {
-                if self.selected_feed > 0 {
-                    self.selected_feed -= 1;
-                    self.ensure_selected_feed_visible();
-                    self.pending_redraw = true;
-                }
-            }
-            InputEvent::Mouse(MouseEvent::LeftClick { row }) => {
-                // The one-based row under the title and the header rows.
-                if row >= LIST_FIRST_ROW {
-                    let start = self.feed_list_start();
-                    let idx = start + (row - LIST_FIRST_ROW);
-                    if idx < self.feed_row_count() {
-                        self.selected_feed = idx;
-                        self.ensure_selected_feed_visible();
-                        self.pending_redraw = true;
-                    }
-                }
-            }
-            InputEvent::Key(Key::Enter) => {
-                if self.selected_feed == self.log_row_index() {
-                    self.view = View::Log;
-                    self.log_scroll = 0;
-                } else {
-                    self.selected_feed_scope = Some(self.scope_for_selected_feed());
+        if key == Key::Char('?') && self.view != View::Help && !self.search_mode {
+            self.help_from = self.view;
+            self.view = View::Help;
+            self.pending_redraw = true;
+            return;
+        }
+        if self.search_mode {
+            match key {
+                Key::Enter => {
+                    self.search_mode = false;
                     self.selected_article = 0;
-                    self.article_list_scroll = 0;
-                    self.article_scroll = 0;
-                    self.search.clear();
-                    self.reload_articles(cache);
-                    self.view = View::ArticleList;
+                    self.pending_redraw = true;
                 }
-                self.pending_redraw = true;
+                Key::Backspace => {
+                    self.search.pop();
+                    self.selected_article = 0;
+                    self.pending_redraw = true;
+                }
+                Key::Char(c) if !c.is_control() => {
+                    self.search.push(c);
+                    self.selected_article = 0;
+                    self.pending_redraw = true;
+                }
+                _ => {}
             }
-            InputEvent::Key(Key::Char('g')) => {
+            return;
+        }
+        match self.view {
+            View::FeedList => self.handle_feed_keys(key, cache, cmd_tx),
+            View::ArticleList => self.handle_article_list_keys(key, cache, cmd_tx),
+            View::Article => self.handle_article_view_keys(key, chord, cache, cmd_tx),
+            View::Log => self.handle_log_keys(key),
+            View::Help => {
+                if key == Key::Char('q') {
+                    self.view = self.help_from;
+                    self.pending_redraw = true;
+                } else {
+                    self.pane_key(key, chord);
+                }
+            }
+        }
+    }
+
+    fn handle_feed_keys(&mut self, key: Key, cache: &Cache, cmd_tx: &mpsc::Sender<BackendCommand>) {
+        match key {
+            Key::Char('q') => self.quitting = true,
+            Key::Down | Key::Char('j') | Key::Char('n') => self.move_feed(1),
+            Key::Up | Key::Char('k') | Key::Char('p') => self.move_feed(-1),
+            Key::PageDown => self.move_feed(self.list_rows() as isize),
+            Key::PageUp => self.move_feed(-(self.list_rows() as isize)),
+            Key::Home => self.move_feed(isize::MIN),
+            Key::End => self.move_feed(isize::MAX),
+            Key::Enter => self.open_feed(cache),
+            Key::Char('g') => {
                 self.reload_feeds_from_cache(cache);
                 match self.scope_for_selected_feed() {
                     FeedScope::Feed(url) => {
@@ -513,14 +589,14 @@ impl App {
                 }
                 self.pending_redraw = true;
             }
-            InputEvent::Key(Key::Char('G')) => {
+            Key::Char('G') => {
                 self.reload_feeds_from_cache(cache);
                 self.pending_user_fetches += 1;
                 let _ = cmd_tx.send(BackendCommand::FetchAllFeeds);
                 self.status = "Refreshing feeds...".to_string();
                 self.pending_redraw = true;
             }
-            InputEvent::Key(Key::Char('u')) if self.selected_feed != self.log_row_index() => {
+            Key::Char('u') if self.selected_feed != self.log_row_index() => {
                 match self.scope_for_selected_feed() {
                     FeedScope::Feed(url) => {
                         if let Some(feed) = self.feeds.iter().find(|f| f.url == url) {
@@ -546,111 +622,62 @@ impl App {
         }
     }
 
+    /// Moves the feed selection by `by` rows, clamped; the extremes go to
+    /// the ends.
+    fn move_feed(&mut self, by: isize) {
+        let count = self.feed_row_count();
+        let target = step(self.selected_feed, by, count);
+        if target != self.selected_feed {
+            self.selected_feed = target;
+            self.pending_redraw = true;
+        }
+    }
+
+    fn open_feed(&mut self, cache: &Cache) {
+        if self.selected_feed == self.log_row_index() {
+            self.view = View::Log;
+            self.log_scroll = 0;
+        } else {
+            self.selected_feed_scope = Some(self.scope_for_selected_feed());
+            self.selected_article = 0;
+            self.article_first = 0;
+            self.search.clear();
+            self.search_mode = false;
+            self.reload_articles(cache);
+            self.view = View::ArticleList;
+        }
+        self.pending_redraw = true;
+    }
+
     fn handle_article_list_keys(
         &mut self,
-        input: InputEvent,
+        key: Key,
         cache: &Cache,
         cmd_tx: &mpsc::Sender<BackendCommand>,
     ) {
-        match input {
-            InputEvent::Key(Key::Char('q')) => {
+        match key {
+            Key::Char('q') => {
                 self.view = View::FeedList;
                 self.selected_feed_scope = None;
                 self.pending_redraw = true;
             }
-            InputEvent::Key(Key::Down)
-            | InputEvent::Key(Key::Char('j'))
-            | InputEvent::Key(Key::Char('n')) => {
-                let visible = self.filtered_article_indices();
-                if self.selected_article + 1 < visible.len() {
-                    self.selected_article += 1;
-                    self.ensure_selected_article_visible(visible.len());
-                    self.pending_redraw = true;
-                }
-            }
-            InputEvent::Key(Key::Up)
-            | InputEvent::Key(Key::Char('k'))
-            | InputEvent::Key(Key::Char('p')) => {
-                if self.selected_article > 0 {
-                    self.selected_article -= 1;
-                    self.ensure_selected_article_visible(self.filtered_article_indices().len());
-                    self.pending_redraw = true;
-                }
-            }
-            InputEvent::Mouse(MouseEvent::LeftClick { row }) => {
-                if row >= LIST_FIRST_ROW {
-                    let visible = self.filtered_article_indices();
-                    let start = self.article_list_start(visible.len());
-                    let idx = start + (row - LIST_FIRST_ROW);
-                    if idx < visible.len() {
-                        self.selected_article = idx;
-                        self.ensure_selected_article_visible(visible.len());
-                        self.article_scroll = 0;
-                        self.enter_article_view(cmd_tx);
-                        self.pending_redraw = true;
-                    }
-                }
-            }
-            InputEvent::Mouse(MouseEvent::ScrollDown) => {
-                let visible = self.filtered_article_indices();
-                if self.selected_article + 1 < visible.len() {
-                    self.selected_article += 1;
-                    self.ensure_selected_article_visible(visible.len());
-                    self.pending_redraw = true;
-                }
-            }
-            InputEvent::Mouse(MouseEvent::ScrollUp) => {
-                if self.selected_article > 0 {
-                    self.selected_article -= 1;
-                    self.ensure_selected_article_visible(self.filtered_article_indices().len());
-                    self.pending_redraw = true;
-                }
-            }
-            InputEvent::Key(Key::Enter) => {
+            Key::Down | Key::Char('j') | Key::Char('n') => self.move_article(1),
+            Key::Up | Key::Char('k') | Key::Char('p') => self.move_article(-1),
+            Key::PageDown => self.move_article(self.list_rows() as isize),
+            Key::PageUp => self.move_article(-(self.list_rows() as isize)),
+            Key::Home => self.move_article(isize::MIN),
+            Key::End => self.move_article(isize::MAX),
+            Key::Enter => {
                 if !self.filtered_article_indices().is_empty() {
-                    self.article_scroll = 0;
                     self.enter_article_view(cmd_tx);
                     self.pending_redraw = true;
                 }
             }
-            InputEvent::Key(Key::PageDown) => {
-                let visible = self.filtered_article_indices();
-                if !visible.is_empty() {
-                    let step = self.article_list_rows().max(1);
-                    self.selected_article = (self.selected_article + step).min(visible.len() - 1);
-                    self.ensure_selected_article_visible(visible.len());
-                    self.pending_redraw = true;
-                }
-            }
-            InputEvent::Key(Key::PageUp) => {
-                let visible = self.filtered_article_indices();
-                if !visible.is_empty() {
-                    let step = self.article_list_rows().max(1);
-                    self.selected_article = self.selected_article.saturating_sub(step);
-                    self.ensure_selected_article_visible(visible.len());
-                    self.pending_redraw = true;
-                }
-            }
-            InputEvent::Key(Key::Home) => {
-                if !self.filtered_article_indices().is_empty() {
-                    self.selected_article = 0;
-                    self.article_list_scroll = 0;
-                    self.pending_redraw = true;
-                }
-            }
-            InputEvent::Key(Key::End) => {
-                let visible = self.filtered_article_indices();
-                if !visible.is_empty() {
-                    self.selected_article = visible.len() - 1;
-                    self.ensure_selected_article_visible(visible.len());
-                    self.pending_redraw = true;
-                }
-            }
-            InputEvent::Key(Key::Char('/')) => {
+            Key::Char('/') => {
                 self.search_mode = true;
                 self.pending_redraw = true;
             }
-            InputEvent::Key(Key::Char('g')) => {
+            Key::Char('g') => {
                 self.reload_feeds_from_cache(cache);
                 self.reload_articles(cache);
                 if let Some(scope) = self.selected_feed_scope.as_ref() {
@@ -669,7 +696,7 @@ impl App {
                     self.pending_redraw = true;
                 }
             }
-            InputEvent::Key(Key::Char('G')) => {
+            Key::Char('G') => {
                 self.reload_feeds_from_cache(cache);
                 self.reload_articles(cache);
                 self.pending_user_fetches += 1;
@@ -677,8 +704,8 @@ impl App {
                 self.status = "Refreshing feeds...".to_string();
                 self.pending_redraw = true;
             }
-            InputEvent::Key(Key::Char('u')) => {
-                // Mark as read and advance to next article; if already read, toggle unread
+            Key::Char('u') => {
+                // Mark as read and advance to the next unread; toggle a read one.
                 let was_unread = self.current_article().map(|a| !a.read).unwrap_or(false);
                 let visible_before = self.filtered_article_indices();
                 let selected_before = self.selected_article;
@@ -693,209 +720,771 @@ impl App {
                             .position(|&article_idx| article_idx == target_article_idx)
                         {
                             self.selected_article = target_selected_idx;
-                            self.ensure_selected_article_visible(visible_after.len());
-                            self.pending_redraw = true;
                         }
-                    } else {
-                        let visible_after = self.filtered_article_indices();
-                        self.ensure_selected_article_visible(visible_after.len());
-                        self.pending_redraw = true;
                     }
+                    self.pending_redraw = true;
                 }
             }
-            InputEvent::Key(Key::Char('H')) => {
-                self.open_html_digest();
-            }
-            InputEvent::Key(Key::Char('o')) => self.open_current_article(),
+            Key::Char('H') => self.open_html_digest(),
+            Key::Char('o') => self.open_current_article(),
             _ => {}
+        }
+    }
+
+    fn move_article(&mut self, by: isize) {
+        let count = self.filtered_article_indices().len();
+        let target = step(self.selected_article, by, count);
+        if target != self.selected_article {
+            self.selected_article = target;
+            self.pending_redraw = true;
         }
     }
 
     fn handle_article_view_keys(
         &mut self,
-        input: InputEvent,
+        key: Key,
+        chord: &str,
         cache: &Cache,
         cmd_tx: &mpsc::Sender<BackendCommand>,
     ) {
-        // URL picker mode
         if self.url_picking {
-            match input {
-                InputEvent::Key(Key::Char('q')) => {
+            match key {
+                Key::Char('q') => {
                     self.url_picking = false;
                     self.pending_redraw = true;
                 }
-                InputEvent::Key(Key::Down) | InputEvent::Key(Key::Char('j')) => {
-                    if self.url_cursor + 1 < self.article_urls.len() {
-                        self.url_cursor += 1;
-                        self.pending_redraw = true;
-                    }
-                }
-                InputEvent::Key(Key::Up) | InputEvent::Key(Key::Char('k')) => {
-                    if self.url_cursor > 0 {
-                        self.url_cursor -= 1;
-                        self.pending_redraw = true;
-                    }
-                }
-                InputEvent::Key(Key::Enter) => {
-                    if let Some(url) = self.article_urls.get(self.url_cursor).cloned() {
-                        self.status = match open_in_browser(&url, self.browser.as_deref()) {
-                            Ok(()) => format!("Opened [{}]", self.url_cursor + 1),
-                            Err(e) => format!("Failed to open browser: {}", e),
-                        };
-                    }
-                    self.url_picking = false;
-                    self.pending_redraw = true;
-                }
-                InputEvent::Key(Key::Char(c)) if c.is_ascii_digit() && c != '0' => {
-                    let idx = (c as usize) - ('1' as usize);
-                    if let Some(url) = self.article_urls.get(idx).cloned() {
-                        self.status = match open_in_browser(&url, self.browser.as_deref()) {
-                            Ok(()) => format!("Opened [{}]", idx + 1),
-                            Err(e) => format!("Failed to open browser: {}", e),
-                        };
-                    }
-                    self.url_picking = false;
-                    self.pending_redraw = true;
+                Key::Down | Key::Char('j') | Key::Char('n') => self.move_url(1),
+                Key::Up | Key::Char('k') | Key::Char('p') => self.move_url(-1),
+                Key::PageDown => self.move_url(self.list_rows() as isize),
+                Key::PageUp => self.move_url(-(self.list_rows() as isize)),
+                Key::Home => self.move_url(isize::MIN),
+                Key::End => self.move_url(isize::MAX),
+                Key::Enter => self.open_url(self.url_cursor),
+                Key::Char(c) if c.is_ascii_digit() && c != '0' => {
+                    self.open_url((c as usize) - ('1' as usize));
                 }
                 _ => {}
             }
             return;
         }
-
-        match input {
-            InputEvent::Key(Key::Char('q')) => {
+        match key {
+            Key::Char('q') => {
                 self.leave_article_view();
                 self.pending_redraw = true;
             }
-            InputEvent::Key(Key::Down) | InputEvent::Key(Key::Char('j')) => {
-                self.article_scroll = self.article_scroll.saturating_add(1);
-                self.pending_redraw = true;
-            }
-            InputEvent::Key(Key::Up) | InputEvent::Key(Key::Char('k')) => {
-                self.article_scroll = self.article_scroll.saturating_sub(1);
-                self.pending_redraw = true;
-            }
-            // A wheel event is one row of travel (a notch is three), as in
-            // the lists and the log; the page keys keep their fifteen.
-            InputEvent::Mouse(MouseEvent::ScrollDown) => {
-                self.article_scroll = self.article_scroll.saturating_add(1);
-                self.pending_redraw = true;
-            }
-            InputEvent::Mouse(MouseEvent::ScrollUp) => {
-                self.article_scroll = self.article_scroll.saturating_sub(1);
-                self.pending_redraw = true;
-            }
-            InputEvent::Key(Key::PageDown) | InputEvent::Key(Key::Char(' ')) => {
-                self.article_scroll = self.article_scroll.saturating_add(15);
-                self.pending_redraw = true;
-            }
-            InputEvent::Key(Key::PageUp) => {
-                self.article_scroll = self.article_scroll.saturating_sub(15);
-                self.pending_redraw = true;
-            }
-            InputEvent::Key(Key::Char('n')) => {
+            Key::Char('j' | 'k' | ' ')
+            | Key::PageDown
+            | Key::PageUp
+            | Key::Up
+            | Key::Down
+            | Key::Home
+            | Key::End => self.pane_key(key, chord),
+            Key::Char('n') => {
                 let visible = self.filtered_article_indices();
                 if self.selected_article + 1 < visible.len() {
                     self.selected_article += 1;
-                    self.article_scroll = 0;
                     self.sync_open_article_to_selection();
                     self.mark_current_article_read(cmd_tx);
                     self.extract_current_article_urls();
                     self.pending_redraw = true;
                 }
             }
-            InputEvent::Key(Key::Char('p')) => {
+            Key::Char('p') => {
                 if self.selected_article > 0 {
                     self.selected_article -= 1;
-                    self.article_scroll = 0;
                     self.sync_open_article_to_selection();
                     self.mark_current_article_read(cmd_tx);
                     self.extract_current_article_urls();
                     self.pending_redraw = true;
                 }
             }
-            InputEvent::Key(Key::Char('u')) => self.toggle_current_read(cache, cmd_tx),
-            InputEvent::Key(Key::Char('o')) => self.open_current_article(),
-            InputEvent::Key(Key::Char('b')) => {
+            Key::Char('u') => self.toggle_current_read(cache, cmd_tx),
+            Key::Char('o') => self.open_current_article(),
+            Key::Char('b') => {
                 if self.article_urls.is_empty() {
                     self.status = "No URLs in article".to_string();
-                } else if let [url] = self.article_urls.as_slice() {
-                    let url = url.clone();
-                    self.status = match open_in_browser(&url, self.browser.as_deref()) {
-                        Ok(()) => "Opened [1]".to_string(),
-                        Err(e) => format!("Failed to open browser: {}", e),
-                    };
+                } else if self.article_urls.len() == 1 {
+                    self.open_url(0);
                 } else {
                     self.url_picking = true;
                     self.url_cursor = 0;
+                    self.url_first = 0;
                 }
                 self.pending_redraw = true;
             }
-            InputEvent::Key(Key::Char(c)) if c.is_ascii_digit() && c != '0' => {
-                let idx = (c as usize) - ('1' as usize);
-                if let Some(url) = self.article_urls.get(idx).cloned() {
-                    self.status = match open_in_browser(&url, self.browser.as_deref()) {
-                        Ok(()) => format!("Opened [{}]", idx + 1),
-                        Err(e) => format!("Failed to open browser: {}", e),
-                    };
-                    self.pending_redraw = true;
-                }
+            Key::Char(c) if c.is_ascii_digit() && c != '0' => {
+                self.open_url((c as usize) - ('1' as usize));
             }
             _ => {}
         }
     }
 
-    fn handle_log_keys(&mut self, input: InputEvent) {
-        match input {
-            InputEvent::Key(Key::Char('q')) => {
+    fn move_url(&mut self, by: isize) {
+        let target = step(self.url_cursor, by, self.article_urls.len());
+        if target != self.url_cursor {
+            self.url_cursor = target;
+            self.pending_redraw = true;
+        }
+    }
+
+    /// Opens link `index` of the article's, leaving the picker.
+    fn open_url(&mut self, index: usize) {
+        if let Some(url) = self.article_urls.get(index).cloned() {
+            self.status = match open_in_browser(&url, self.browser.as_deref()) {
+                Ok(()) => format!("Opened [{}]", index + 1),
+                Err(e) => format!("Failed to open browser: {}", e),
+            };
+            self.url_picking = false;
+            self.pending_redraw = true;
+        }
+    }
+
+    fn handle_log_keys(&mut self, key: Key) {
+        let page = self.pane_rows().max(1);
+        match key {
+            Key::Char('q') => {
                 self.view = View::FeedList;
                 self.pending_redraw = true;
             }
-            InputEvent::Key(Key::Down) | InputEvent::Key(Key::Char('j')) => {
-                self.log_scroll = self.log_scroll.saturating_add(1);
-                self.pending_redraw = true;
-            }
-            InputEvent::Key(Key::Up) | InputEvent::Key(Key::Char('k')) => {
-                self.log_scroll = self.log_scroll.saturating_sub(1);
-                self.pending_redraw = true;
-            }
-            // A wheel event is one row of travel, as in the article view.
-            InputEvent::Mouse(MouseEvent::ScrollDown) => {
-                self.log_scroll = self.log_scroll.saturating_add(1);
-                self.pending_redraw = true;
-            }
-            InputEvent::Mouse(MouseEvent::ScrollUp) => {
-                self.log_scroll = self.log_scroll.saturating_sub(1);
-                self.pending_redraw = true;
-            }
-            InputEvent::Key(Key::PageDown) => {
-                self.log_scroll = self.log_scroll.saturating_add(15);
-                self.pending_redraw = true;
-            }
-            InputEvent::Key(Key::PageUp) => {
-                self.log_scroll = self.log_scroll.saturating_sub(15);
-                self.pending_redraw = true;
-            }
-            InputEvent::Key(Key::Home) => {
-                self.log_scroll = 0;
-                self.pending_redraw = true;
-            }
-            InputEvent::Key(Key::End) => {
-                self.log_scroll = usize::MAX;
-                self.pending_redraw = true;
-            }
-            InputEvent::Key(Key::Char('n')) => {
-                self.log_tab = LogTab::News;
-                self.log_scroll = 0;
-                self.pending_redraw = true;
-            }
-            InputEvent::Key(Key::Char('d')) => {
-                self.log_tab = LogTab::Debug;
-                self.log_scroll = 0;
-                self.pending_redraw = true;
-            }
+            Key::Down | Key::Char('j') => self.scroll_log(1),
+            Key::Up | Key::Char('k') => self.scroll_log(-1),
+            Key::PageDown => self.scroll_log(page as isize),
+            Key::PageUp => self.scroll_log(-(page as isize)),
+            Key::Home => self.scroll_log(isize::MIN),
+            Key::End => self.scroll_log(isize::MAX),
+            Key::Char('n') => self.select_log(LogTab::News),
+            Key::Char('d') => self.select_log(LogTab::Debug),
             _ => {}
         }
+    }
+
+    /// Moves the log's window; the extremes go to the ends, and the end
+    /// is followed until the window moves from where it was last shown.
+    fn scroll_log(&mut self, by: isize) {
+        self.log_scroll = match by {
+            isize::MIN => 0,
+            isize::MAX => usize::MAX,
+            _ if self.log_scroll == usize::MAX => self.log_start.saturating_add_signed(by),
+            _ => self.log_scroll.saturating_add_signed(by),
+        };
+        self.pending_redraw = true;
+    }
+
+    fn select_log(&mut self, tab: LogTab) {
+        self.log_tab = tab;
+        self.log_scroll = 0;
+        self.pending_redraw = true;
+    }
+
+    /// A left-button phase in surface pixels: the pane's while a press in
+    /// it is held; otherwise a press on the bar, the search field, the
+    /// log's tabs or a list row.
+    fn pointer(
+        &mut self,
+        phase: PointerPhase,
+        x: i64,
+        y: i64,
+        extend: bool,
+        cache: &Cache,
+        cmd_tx: &mpsc::Sender<BackendCommand>,
+    ) {
+        let layout = self.layout();
+        let in_pane = layout.pane.is_some_and(|rect| rect.contains(x, y));
+        if self.pane_drag || (phase == PointerPhase::Press && in_pane) {
+            self.place_pane(&layout);
+            match phase {
+                PointerPhase::Press => self.pane_drag = true,
+                PointerPhase::Release => self.pane_drag = false,
+                PointerPhase::Move => {}
+            }
+            let phase = match phase {
+                PointerPhase::Press => PanePhase::Press,
+                PointerPhase::Move => PanePhase::Move,
+                PointerPhase::Release => PanePhase::Release,
+            };
+            if let Some((tab, revision)) = self.pane_target() {
+                if self.pane_event(Event::Pointer {
+                    tab,
+                    revision,
+                    phase,
+                    x,
+                    cell_x: x,
+                    y,
+                    extend,
+                }) == Outcome::Changed
+                {
+                    self.pending_redraw = true;
+                }
+            }
+            return;
+        }
+        if phase != PointerPhase::Press {
+            return;
+        }
+        if let Some(index) = layout.bar.hit(x, y) {
+            if let Some(&key) = self.keys().get(index) {
+                self.search_mode = false;
+                self.handle_key(key, "", cache, cmd_tx);
+            }
+            return;
+        }
+        if layout
+            .search
+            .is_some_and(|field| field.rect().contains(x, y))
+        {
+            self.search_mode = true;
+            self.pending_redraw = true;
+            return;
+        }
+        if let Some(strip) = layout.strip {
+            if let Some(TabHit::Select(index)) = strip.hit(x, y) {
+                self.select_log(if index == 0 {
+                    LogTab::News
+                } else {
+                    LogTab::Debug
+                });
+            }
+            return;
+        }
+        let Some(row) = layout.list.and_then(|list| list.hit(x, y)) else {
+            return;
+        };
+        match self.view {
+            View::FeedList => {
+                let index = self.feed_first + row;
+                if index < self.feed_row_count() {
+                    self.selected_feed = index;
+                    self.pending_redraw = true;
+                }
+            }
+            View::ArticleList => {
+                let index = self.article_first + row;
+                if index < self.filtered_article_indices().len() {
+                    self.selected_article = index;
+                    self.search_mode = false;
+                    self.enter_article_view(cmd_tx);
+                    self.pending_redraw = true;
+                }
+            }
+            View::Article => {
+                let index = self.url_first + row;
+                if index < self.article_urls.len() {
+                    self.url_cursor = index;
+                    self.open_url(index);
+                }
+            }
+            View::Log | View::Help => {}
+        }
+    }
+
+    /// Wheel travel in rows: a list's selection, the log's window, or the
+    /// pane's scroll.
+    fn wheel(&mut self, rows: isize) {
+        match self.view {
+            View::FeedList => self.move_feed(rows),
+            View::ArticleList => self.move_article(rows),
+            View::Article if self.url_picking => self.move_url(rows),
+            View::Article | View::Help => self.pane_scroll(rows),
+            View::Log => self.scroll_log(rows),
+        }
+    }
+
+    // ---- the document pane ---------------------------------------------
+
+    /// Dispatches to the pane; an error is a diagnostic, not the reader's
+    /// state, and reads as ignored.
+    fn pane_event(&mut self, event: Event<'_>) -> Outcome {
+        match self.pane.dispatch(event) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                crate::log::error(format!("document pane: {error}"));
+                Outcome::Ignored
+            }
+        }
+    }
+
+    fn pane_target(&self) -> Option<(TabId, u64)> {
+        let tab = self.pane_tab?;
+        let revision = self.pane.editor().document(tab).ok()?.revision();
+        Some((tab, revision))
+    }
+
+    /// A reading key over the pane: j, k, Space and the page keys scroll
+    /// it; the arrows, Home and End are its own chords.
+    fn pane_key(&mut self, key: Key, chord: &str) {
+        match key {
+            Key::Char('j') => self.pane_scroll(1),
+            Key::Char('k') => self.pane_scroll(-1),
+            Key::PageDown | Key::Char(' ') => {
+                let page = self.pane_rows() as isize;
+                self.pane_scroll(page);
+            }
+            Key::PageUp => {
+                let page = self.pane_rows() as isize;
+                self.pane_scroll(-page);
+            }
+            _ => self.pane_chord(chord),
+        }
+    }
+
+    fn pane_chord(&mut self, chord: &str) {
+        if chord.is_empty() || !self.pane_shown() {
+            return;
+        }
+        if let Some((tab, revision)) = self.pane_target() {
+            if self.pane_event(Event::Key {
+                tab,
+                revision,
+                chord,
+            }) == Outcome::Changed
+            {
+                self.pending_redraw = true;
+            }
+        }
+    }
+
+    fn pane_scroll(&mut self, rows: isize) {
+        if let Some((tab, revision)) = self.pane_target() {
+            if self.pane_event(Event::Scroll {
+                tab,
+                revision,
+                rows,
+                columns: 0,
+            }) == Outcome::Changed
+            {
+                self.pending_redraw = true;
+            }
+        }
+    }
+
+    /// The pane's rectangle, from the layout.
+    fn place_pane(&mut self, layout: &Layout) {
+        if let Some(rect) = layout.pane {
+            let surface = self.surface;
+            self.pane_event(Event::Frame { rect, surface });
+        }
+    }
+
+    /// Shows `text` in the pane when `key` is not what it shows already,
+    /// as `pane_source` admits it; a load the pane refuses all the same
+    /// shows that it did, so the pane is never left blank.
+    fn set_pane_text(&mut self, key: PaneText, text: &str) {
+        if self.pane_text == key {
+            return;
+        }
+        if let Some((tab, revision)) = self.pane_target() {
+            self.pane_event(Event::Close { tab, revision });
+        }
+        self.pane_tab = None;
+        self.pane_text = PaneText::None;
+        let source = pane_source(text);
+        let mut loaded = self.pane_event(Event::Load(source.as_bytes()));
+        if !matches!(loaded, Outcome::Created(_)) {
+            loaded = self.pane_event(Event::Load(b"This text cannot be shown."));
+        }
+        if let Outcome::Created(tab) = loaded {
+            self.pane_event(Event::ReadOnly { tab, enabled: true });
+            self.pane_tab = Some(tab);
+            self.pane_text = key;
+        }
+    }
+
+    /// The document rows and text columns the pane shows once placed
+    /// for the layout, as td-editor lays its document out in the rect.
+    fn pane_grid(&mut self, layout: &Layout) -> (usize, usize) {
+        self.place_pane(layout);
+        let (columns, rows) = self.pane.geometry().grid();
+        (rows, columns)
+    }
+
+    fn pane_rows(&mut self) -> usize {
+        let layout = self.layout();
+        if layout.pane.is_none() {
+            return PAGE_ROWS;
+        }
+        self.pane_grid(&layout).0.max(1)
+    }
+
+    fn list_rows(&self) -> usize {
+        self.layout()
+            .list
+            .map_or(PAGE_ROWS, |list| list.rows().max(1))
+    }
+
+    // ---- the frame -------------------------------------------------------
+
+    fn labels(&self) -> &'static [&'static str] {
+        match self.view {
+            View::FeedList => FEED_LABELS,
+            View::ArticleList => ARTICLE_LIST_LABELS,
+            View::Article if self.url_picking => LINKS_LABELS,
+            View::Article => ARTICLE_LABELS,
+            View::Log => LOG_LABELS,
+            View::Help => HELP_LABELS,
+        }
+    }
+
+    fn keys(&self) -> &'static [Key] {
+        match self.view {
+            View::FeedList => FEED_KEYS,
+            View::ArticleList => ARTICLE_LIST_KEYS,
+            View::Article if self.url_picking => LINKS_KEYS,
+            View::Article => ARTICLE_KEYS,
+            View::Log => LOG_KEYS,
+            View::Help => HELP_KEYS,
+        }
+    }
+
+    /// The view's regions over the surface.
+    fn layout(&self) -> Layout {
+        let surface = self.surface;
+        let s = surface.scale.value();
+        let row = (ROW * s) as u32;
+        let bar = Bar::new(surface, self.labels());
+        let status = Status::new(surface);
+        let top = i64::from(row);
+        let bottom = status.rect().y.max(top);
+        let body = Rect {
+            x: 0,
+            y: top,
+            width: surface.width as u32,
+            height: (bottom - top) as u32,
+        };
+        let mut layout = Layout {
+            bar,
+            search: None,
+            list: None,
+            strip: None,
+            pane: None,
+            status,
+        };
+        // A body too short for a band gets none of it.
+        let band = |body: Rect| -> (Rect, Rect) {
+            let height = row.min(body.height);
+            (
+                Rect { height, ..body },
+                Rect {
+                    y: body.y + i64::from(height),
+                    height: body.height - height,
+                    ..body
+                },
+            )
+        };
+        match self.view {
+            View::FeedList => layout.list = List::new(surface, body),
+            View::ArticleList => {
+                let (field, rest) = band(body);
+                layout.search = TextEntry::new(surface, field);
+                layout.list = List::new(surface, rest);
+            }
+            View::Article if self.url_picking => layout.list = List::new(surface, body),
+            View::Article | View::Help => layout.pane = pane_rect(body),
+            View::Log => {
+                let (tabs, rest) = band(body);
+                if tabs.height == row {
+                    layout.strip = Strip::new(surface, tabs.y, log_tab_index(self.log_tab), 2)
+                        .map(|strip| strip.with_close_buttons(false));
+                }
+                layout.pane = pane_rect(rest);
+            }
+        }
+        layout
+    }
+
+    /// Lays the frame out: the lists reveal their selections, the pane is
+    /// placed and holds what the view shows. Before every paint and every
+    /// read of the frame.
+    fn prepare_frame(&mut self) {
+        let layout = self.layout();
+        if let Some(list) = layout.list {
+            match self.view {
+                View::FeedList => {
+                    self.feed_first =
+                        list.reveal(self.feed_row_count(), self.selected_feed, self.feed_first);
+                }
+                View::ArticleList => {
+                    let total = self.filtered_article_indices().len();
+                    self.article_first =
+                        list.reveal(total, self.selected_article, self.article_first);
+                }
+                View::Article => {
+                    self.url_first =
+                        list.reveal(self.article_urls.len(), self.url_cursor, self.url_first);
+                }
+                View::Log | View::Help => {}
+            }
+        }
+        if let Some(field) = layout.search {
+            let len = self.search.chars().count();
+            self.search_first = field.reveal(len, len, self.search_first);
+        }
+        if layout.pane.is_none() {
+            return;
+        }
+        let (rows, columns) = self.pane_grid(&layout);
+        match self.view {
+            View::Article => {
+                let Some(article) = self.current_article().cloned() else {
+                    self.set_pane_text(PaneText::NoArticle, "No article selected");
+                    return;
+                };
+                let key = PaneText::Article {
+                    hash: article.hash.clone(),
+                    columns,
+                };
+                if self.pane_text != key {
+                    let text = article_text(&article, &self.article_urls, columns);
+                    self.set_pane_text(key, &text);
+                }
+            }
+            View::Log => {
+                let total = self.current_log_entry_count();
+                let rows = rows.max(1);
+                let start = self.log_scroll.min(total.unwrap_or(0).saturating_sub(rows));
+                self.log_start = start;
+                let key = PaneText::Log {
+                    tab: log_tab_index(self.log_tab),
+                    start,
+                    rows,
+                    columns,
+                    total,
+                };
+                if self.pane_text != key {
+                    let text = self.log_text(total, start, rows, columns.max(1));
+                    self.log_shown_total = text.as_ref().and(total);
+                    let text = text
+                        .unwrap_or_else(|| format!("Could not read {}", self.log_path().display()));
+                    self.set_pane_text(key, &text);
+                }
+            }
+            View::Help => {
+                if self.pane_text != PaneText::Help {
+                    self.set_pane_text(PaneText::Help, &help_text());
+                }
+            }
+            View::FeedList | View::ArticleList => {}
+        }
+    }
+
+    /// The log view shows one window of the file, read line by line, so a
+    /// log of any size costs a frame one window's worth of memory: the
+    /// whole file in one string was the allocation that ended a session.
+    fn log_text(
+        &self,
+        total: Option<usize>,
+        start: usize,
+        rows: usize,
+        width: usize,
+    ) -> Option<String> {
+        let path = self.log_path();
+        // Resume from the last frame's first line when it is not past this
+        // one's; the count drops the hint of a log that shrank.
+        let hint = self.log_window_hint.get(log_tab_index(self.log_tab));
+        let from = hint
+            .and_then(Cell::get)
+            .filter(|&(index, _)| index <= start)
+            .unwrap_or((0, 0));
+        let window = match total {
+            Some(0) => Some(vec!["Log is empty".to_string()]),
+            Some(_) => log_window(&path, start, rows, width, from).map(|(window, first)| {
+                if let Some(hint) = hint {
+                    hint.set(Some(first));
+                }
+                window
+            }),
+            None => None,
+        };
+        window.map(|window| window.join("\n"))
+    }
+
+    /// The status row's text for the view.
+    fn status_line(&self) -> String {
+        match self.view {
+            View::Article if self.url_picking => format!(
+                "Link [{}] of {} (Enter open, 1-9 jump, q cancel)",
+                self.url_cursor + 1,
+                self.article_urls.len()
+            ),
+            // The read state is here, recomputed each frame, rather than
+            // in the document, so a toggle reloads nothing; it leads, so
+            // the link, which may be long, is what the row's end elides.
+            View::Article => match self.current_article() {
+                Some(article) => {
+                    let state = if article.read { "read" } else { "unread" };
+                    match article.published.as_ref() {
+                        Some(published) => format!(
+                            "{} | {} | {}",
+                            state,
+                            normalize_datetime_to_local(published)
+                                .unwrap_or_else(|| "No date".to_string()),
+                            article.link
+                        ),
+                        None => format!("{} | {}", state, article.link),
+                    }
+                }
+                None => self.status.clone(),
+            },
+            View::Log => format!(
+                "{} lines | {}",
+                self.log_shown_total
+                    .map_or_else(|| "?".to_string(), |total| total.to_string()),
+                self.log_path().display()
+            ),
+            // M3: the scope the list is in, which the old header named.
+            View::ArticleList => {
+                let shown = self.filtered_article_indices().len();
+                let scope = self.scope_label();
+                if shown == 0 {
+                    format!("{scope}: no matching articles")
+                } else if self.search.is_empty() {
+                    format!("{scope}: {shown} articles · {}", self.status)
+                } else {
+                    format!("{scope}: {shown} matching · {}", self.status)
+                }
+            }
+            View::FeedList | View::Help => self.status.clone(),
+        }
+    }
+
+    /// The article list's scope as the feed list names it.
+    fn scope_label(&self) -> String {
+        match self.selected_feed_scope.as_ref() {
+            Some(FeedScope::All) | None => "[All]".to_string(),
+            Some(FeedScope::Unread) => "[Unread]".to_string(),
+            Some(FeedScope::Feed(url)) => self
+                .feeds
+                .iter()
+                .find(|feed| &feed.url == url)
+                .map_or_else(|| "Feed".to_string(), |feed| feed.name.clone()),
+        }
+    }
+
+    /// The list's rows as shown: label, meta, marked, from its first.
+    fn list_rows_shown(&self, list: List) -> Vec<(String, String, bool)> {
+        let rows = list.rows();
+        let mut shown = Vec::with_capacity(rows);
+        match self.view {
+            View::FeedList => {
+                let count = self.feed_row_count();
+                for index in self.feed_first..count.min(self.feed_first + rows) {
+                    shown.push(self.feed_row(index));
+                }
+            }
+            View::ArticleList => {
+                let visible = self.filtered_article_indices();
+                let show_feed = matches!(
+                    self.selected_feed_scope.as_ref(),
+                    Some(FeedScope::All | FeedScope::Unread)
+                );
+                for article in visible
+                    .iter()
+                    .skip(self.article_first)
+                    .take(rows)
+                    .filter_map(|&index| self.articles.get(index))
+                {
+                    let published = article
+                        .published
+                        .as_deref()
+                        .and_then(normalize_datetime_to_local)
+                        .unwrap_or_else(|| "No date".to_string());
+                    let meta = if show_feed {
+                        format!(
+                            "{} · {}",
+                            published,
+                            views::strip_newlines(&article.feed_name)
+                        )
+                    } else {
+                        published
+                    };
+                    shown.push((views::strip_newlines(&article.title), meta, !article.read));
+                }
+            }
+            View::Article => {
+                for (index, url) in self
+                    .article_urls
+                    .iter()
+                    .enumerate()
+                    .skip(self.url_first)
+                    .take(rows)
+                {
+                    shown.push((url.clone(), format!("[{}]", index + 1), false));
+                }
+            }
+            View::Log | View::Help => {}
+        }
+        shown
+    }
+
+    /// Feed row `index`: `[All]`, `[Unread]`, the feeds in order, `[Log]`.
+    fn feed_row(&self, index: usize) -> (String, String, bool) {
+        let updated = |value: Option<&String>| value.cloned().unwrap_or_else(|| "-".to_string());
+        if index == 0 {
+            (
+                "[All]".to_string(),
+                format!(
+                    "{} unread of {} · {}",
+                    self.total_unread(),
+                    self.total_articles(),
+                    updated(self.last_updated.as_ref())
+                ),
+                false,
+            )
+        } else if index == 1 {
+            (
+                "[Unread]".to_string(),
+                format!("{} unread", self.total_unread()),
+                false,
+            )
+        } else if index == self.log_row_index() {
+            (
+                "[Log]".to_string(),
+                format!(
+                    "{} lines",
+                    self.current_log_entry_count()
+                        .map_or_else(|| "?".to_string(), |count| count.to_string())
+                ),
+                false,
+            )
+        } else {
+            match index.checked_sub(2).and_then(|i| self.feeds.get(i)) {
+                Some(feed) => (
+                    feed.name.clone(),
+                    format!(
+                        "{} unread of {} · {}{}",
+                        feed.unread,
+                        feed.total,
+                        updated(feed.last_updated.as_ref()),
+                        if feed.last_error.is_some() { " !" } else { "" }
+                    ),
+                    feed.last_error.is_some(),
+                ),
+                None => (String::new(), String::new(), false),
+            }
+        }
+    }
+
+    fn list_selection(&self) -> (usize, usize, usize) {
+        match self.view {
+            View::FeedList => (self.feed_first, self.selected_feed, self.feed_row_count()),
+            View::ArticleList => (
+                self.article_first,
+                self.selected_article,
+                self.filtered_article_indices().len(),
+            ),
+            View::Article => (self.url_first, self.url_cursor, self.article_urls.len()),
+            View::Log | View::Help => (0, 0, 0),
+        }
+    }
+
+    /// Paints the frame whole into the raster, after `prepare_frame`.
+    fn paint(&mut self, raster: &mut Raster<'_, '_>) -> Result<(), String> {
+        self.prepare_frame();
+        let surface = self.surface;
+        raster
+            .paint(&Frame { app: self }, surface.bounds())
+            .map_err(|e| e.to_string())?;
+        self.pending_redraw = false;
+        Ok(())
     }
 
     fn enter_article_view(&mut self, cmd_tx: &mpsc::Sender<BackendCommand>) {
@@ -1103,395 +1692,6 @@ impl App {
         .and_then(|visible_idx| visible_indices.get(visible_idx).copied())
     }
 
-    /// Paints one whole frame onto the screen's grid: the title row, the
-    /// view's rows and its status row, every row in the base style unless
-    /// the view styled it.
-    fn draw(&mut self, screen: &mut Screen) {
-        let (width, height) = (screen.columns(), screen.rows());
-        self.last_size = (width, height);
-        let mut lines = Vec::with_capacity(height);
-        lines.push(self.style_header(views::truncate(
-            &format!(
-                "Timmy's News Console - Last Updated {}",
-                self.last_updated.as_deref().unwrap_or("never")
-            ),
-            width,
-        )));
-        let content_height = height.saturating_sub(1);
-        let mut content_lines = Vec::with_capacity(content_height);
-        self.ensure_selected_feed_visible();
-        self.ensure_selected_article_visible(self.filtered_article_indices().len());
-
-        match self.view {
-            View::FeedList => self.render_feed_list(width, content_height, &mut content_lines),
-            View::ArticleList => {
-                self.render_article_list(width, content_height, &mut content_lines)
-            }
-            View::Article => self.render_article_view(width, content_height, &mut content_lines),
-            View::Log => self.render_log_view(width, content_height, &mut content_lines),
-            View::Help => self.render_help(width, content_height, &mut content_lines),
-        }
-        lines.extend(content_lines);
-
-        screen.clear(self.theme.base);
-        for (row, line) in lines.iter().enumerate().take(height) {
-            let style = line.style.unwrap_or(self.theme.base);
-            if line.style.is_some() {
-                screen.clear_row(row, 0, style);
-            }
-            if line.text.contains('\t') {
-                screen.write(row, 0, &expand_tabs(&line.text), style);
-            } else {
-                screen.write(row, 0, &line.text, style);
-            }
-        }
-        self.pending_redraw = false;
-    }
-
-    fn render_feed_list(&self, width: usize, height: usize, lines: &mut Vec<Line>) {
-        lines.push(self.style_header(views::truncate(
-            "Feeds (Enter open feed/log, g refresh feed, G refresh all, u mark read, ? help, q quit)",
-            width,
-        )));
-
-        let list_rows = height.saturating_sub(2);
-        let start = self.feed_list_start();
-        for idx in start..self.feed_row_count().min(start + list_rows) {
-            let (name, updated, total, unread, has_error) = if idx == 0 {
-                (
-                    "[All]".to_string(),
-                    self.last_updated.clone().unwrap_or_else(|| "-".to_string()),
-                    self.total_articles().to_string(),
-                    self.total_unread(),
-                    false,
-                )
-            } else if idx == 1 {
-                (
-                    "[Unread]".to_string(),
-                    self.last_updated.clone().unwrap_or_else(|| "-".to_string()),
-                    self.total_unread().to_string(),
-                    self.total_unread(),
-                    false,
-                )
-            } else if idx == self.log_row_index() {
-                (
-                    "[Log]".to_string(),
-                    "-".to_string(),
-                    self.current_log_entry_count()
-                        .map_or_else(|| "?".to_string(), |count| count.to_string()),
-                    0,
-                    false,
-                )
-            } else {
-                // Rows 2.. are the feeds, one each, in order.
-                let Some(feed) = idx.checked_sub(2).and_then(|i| self.feeds.get(i)) else {
-                    continue;
-                };
-                (
-                    feed.name.clone(),
-                    feed.last_updated.clone().unwrap_or_else(|| "-".to_string()),
-                    feed.total.to_string(),
-                    feed.unread,
-                    feed.last_error.is_some(),
-                )
-            };
-            let marker = if idx == self.selected_feed { ">" } else { " " };
-            let err = if has_error { " !" } else { "" };
-            let line = format!(
-                "{} {:<22} {:<19} {:>5} total {:>5} unread{}",
-                marker, name, updated, total, unread, err
-            );
-            let line = views::truncate(&line, width);
-            if idx == self.selected_feed {
-                lines.push(self.style_selection(line, false));
-            } else {
-                lines.push(line.into());
-            }
-        }
-
-        while lines.len() + 1 < height {
-            lines.push(Line::default());
-        }
-        lines.push(self.style_status(views::truncate(&self.status, width)));
-    }
-
-    fn render_article_list(&self, width: usize, height: usize, lines: &mut Vec<Line>) {
-        let feed_name = match self.selected_feed_scope.as_ref() {
-            Some(FeedScope::All) => "[All]",
-            Some(FeedScope::Unread) => "[Unread]",
-            Some(FeedScope::Feed(url)) => self
-                .feeds
-                .iter()
-                .find(|f| &f.url == url)
-                .map(|f| f.name.as_str())
-                .unwrap_or("Articles"),
-            None => "Articles",
-        };
-        let mut header = format!(
-            "{} (Enter open, / search, g refresh, G all refresh, u toggle read, o open, q back)",
-            feed_name
-        );
-        if !self.search.is_empty() {
-            header.push_str(&format!(" [search: {}]", self.search));
-        }
-        if self.search_mode {
-            header.push_str(" (typing search)");
-        }
-        lines.push(self.style_header(views::truncate(&header, width)));
-
-        let visible = self.filtered_article_indices();
-        let show_feed_source = matches!(
-            self.selected_feed_scope.as_ref(),
-            Some(FeedScope::All | FeedScope::Unread)
-        );
-        let list_rows = height.saturating_sub(2);
-        let start = self.article_list_start(visible.len());
-        for (list_idx, article_idx) in visible
-            .iter()
-            .copied()
-            .enumerate()
-            .skip(start)
-            .take(list_rows)
-        {
-            let Some(article) = self.articles.get(article_idx) else {
-                continue;
-            };
-            let marker = if list_idx == self.selected_article {
-                ">"
-            } else {
-                " "
-            };
-            let unread = if article.read { " " } else { "*" };
-            let published = article
-                .published
-                .as_deref()
-                .and_then(normalize_datetime_to_local)
-                .unwrap_or_else(|| "No date".to_string());
-            let title = views::strip_newlines(&article.title);
-            let line = if show_feed_source {
-                format!(
-                    "{}{} [{}] [{}] {}",
-                    marker,
-                    unread,
-                    published,
-                    views::strip_newlines(&article.feed_name),
-                    title
-                )
-            } else {
-                format!("{}{} [{}] {}", marker, unread, published, title)
-            };
-            let line = views::truncate(&line, width);
-            if list_idx == self.selected_article {
-                lines.push(self.style_selection(line, !article.read));
-            } else if !article.read {
-                lines.push(self.style_unread(line));
-            } else {
-                lines.push(line.into());
-            }
-        }
-
-        while lines.len() + 1 < height {
-            lines.push(Line::default());
-        }
-        lines.push(if visible.is_empty() {
-            self.style_status(views::truncate("No matching articles", width))
-        } else {
-            self.style_status(views::truncate(&self.status, width))
-        });
-    }
-
-    fn render_article_view(&self, width: usize, height: usize, lines: &mut Vec<Line>) {
-        let Some(article) = self.current_article() else {
-            lines.push(views::truncate("No article selected", width).into());
-            return;
-        };
-
-        let header = format!(
-            "{} [{}] (q back, j/k scroll, n/p nav, b urls, o open, u toggle)",
-            views::strip_newlines(&article.title),
-            if article.read { "read" } else { "unread" }
-        );
-        lines.push(self.style_header(views::truncate(&header, width)));
-
-        let html = if article.content.trim().is_empty() {
-            article.description.as_str()
-        } else {
-            article.content.as_str()
-        };
-        let text = crate::html::to_text(html.as_bytes(), width.max(20));
-        // Strip reference link definitions the renderer emits (e.g. "[1]: https://...")
-        // since we append our own Links section with extracted URLs.
-        let mut rendered: Vec<String> = text
-            .lines()
-            .filter(|line| !is_reference_link_def(line))
-            .map(|line| views::truncate(line, width))
-            .collect();
-        // Trim trailing blank lines left after stripping reference defs
-        while rendered.last().is_some_and(|l| l.is_empty()) {
-            rendered.pop();
-        }
-
-        // Append Links section
-        if !self.article_urls.is_empty() {
-            rendered.push(String::new());
-            rendered.push("Links:".to_string());
-            for (i, url) in self.article_urls.iter().enumerate() {
-                rendered.push(views::truncate(&format!("  [{}] {}", i + 1, url), width));
-            }
-        }
-
-        let body_rows = height.saturating_sub(2);
-        let start = self.article_scroll.min(rendered.len());
-        for line in rendered.iter().skip(start).take(body_rows) {
-            lines.push(line.clone().into());
-        }
-        while lines.len() + 1 < height {
-            lines.push(Line::default());
-        }
-
-        if self.url_picking {
-            // Show URL picker in status bar
-            let picker = format!(
-                "URL [{}]: {} (j/k move, Enter open, 1-9 jump, q cancel)",
-                self.url_cursor + 1,
-                self.article_urls
-                    .get(self.url_cursor)
-                    .map(|s| s.as_str())
-                    .unwrap_or("")
-            );
-            lines.push(self.style_status(views::truncate(&picker, width)));
-        } else {
-            let footer = match article.published.as_ref() {
-                Some(published) => format!(
-                    "{} | {}",
-                    article.link,
-                    normalize_datetime_to_local(published).unwrap_or_else(|| "No date".to_string())
-                ),
-                None => article.link.clone(),
-            };
-            lines.push(self.style_status(views::truncate(&footer, width)));
-        }
-    }
-
-    fn render_help(&self, width: usize, height: usize, lines: &mut Vec<Line>) {
-        lines.push(self.style_header(views::truncate("Help (q to close)", width)));
-        for (label, items) in [
-            ("Global", keybindings::GLOBAL),
-            ("Feed list", keybindings::FEED_LIST),
-            ("Article list", keybindings::ARTICLE_LIST),
-            ("Article view", keybindings::ARTICLE_VIEW),
-            ("Log view", keybindings::LOG_VIEW),
-        ] {
-            for item in items {
-                lines.push(views::truncate(&format!("{}: {}", label, item), width).into());
-            }
-        }
-        lines.push(
-            views::truncate(
-                "Mouse: feed click selects, article click opens, wheel scrolls lists/view",
-                width,
-            )
-            .into(),
-        );
-
-        while lines.len() + 1 < height {
-            lines.push(Line::default());
-        }
-        lines.push(self.style_status(views::truncate(&self.status, width)));
-    }
-
-    /// The log view shows one window of the file, read line by line, so a
-    /// log of any size costs a frame one window's worth of memory: the
-    /// whole file in one string was the allocation that ended a session.
-    fn render_log_view(&self, width: usize, height: usize, lines: &mut Vec<Line>) {
-        let label = match self.log_tab {
-            LogTab::News => "[News Log]",
-            LogTab::Debug => "[Debug Log]",
-        };
-        let path = self.log_path();
-        lines.push(self.style_header(views::truncate(
-            &format!("{} (n news, d debug, j/k scroll, PgUp/PgDn, q back)", label),
-            width,
-        )));
-
-        let total = self.current_log_entry_count();
-        let body_rows = height.saturating_sub(2);
-        let start = self
-            .log_scroll
-            .min(total.unwrap_or(0).saturating_sub(body_rows.max(1)));
-        // Resume from the last frame's first line when it is not past this
-        // one's; the count drops the hint of a log that shrank.
-        let hint = self.log_window_hint.get(log_tab_index(self.log_tab));
-        let from = hint
-            .and_then(Cell::get)
-            .filter(|&(index, _)| index <= start)
-            .unwrap_or((0, 0));
-        let window = match total {
-            // No rows for a body: nothing read, and nothing said of it.
-            _ if body_rows == 0 => Some(Vec::new()),
-            Some(0) => Some(vec!["Log is empty".to_string()]),
-            Some(_) => log_window(&path, start, body_rows, width, from).map(|(window, first)| {
-                if let Some(hint) = hint {
-                    hint.set(Some(first));
-                }
-                window
-            }),
-            None => None,
-        };
-        // A count kept from a frame that could read the log says nothing
-        // for one that cannot.
-        let total = if window.is_none() { None } else { total };
-        match window {
-            Some(window) => lines.extend(window.into_iter().map(Line::from)),
-            None => lines
-                .push(views::truncate(&format!("Could not read {}", path.display()), width).into()),
-        }
-        while lines.len() + 1 < height {
-            lines.push(Line::default());
-        }
-        lines.push(self.style_status(views::truncate(
-            &format!(
-                "{} lines | {}",
-                total.map_or_else(|| "?".to_string(), |total| total.to_string()),
-                path.display()
-            ),
-            width,
-        )));
-    }
-
-    fn style_header(&self, text: String) -> Line {
-        Line {
-            text,
-            style: Some(self.theme.header),
-        }
-    }
-
-    fn style_status(&self, text: String) -> Line {
-        Line {
-            text,
-            style: Some(self.theme.status),
-        }
-    }
-
-    fn style_selection(&self, text: String, bold: bool) -> Line {
-        let style = if bold {
-            self.theme.selection.bold()
-        } else {
-            self.theme.selection
-        };
-        Line {
-            text,
-            style: Some(style),
-        }
-    }
-
-    fn style_unread(&self, text: String) -> Line {
-        Line {
-            text,
-            style: Some(self.theme.unread),
-        }
-    }
-
     fn reload_feeds_from_cache(&mut self, cache: &Cache) {
         let mut latest_ts = None;
         let mut latest_str = None;
@@ -1592,7 +1792,6 @@ impl App {
         if self.selected_article >= visible_len {
             self.selected_article = visible_len.saturating_sub(1);
         }
-        self.ensure_selected_article_visible(visible_len);
     }
 
     fn feed_unread_count_from_cache(&self, cache: &Cache, feed_url: &str) -> usize {
@@ -1808,83 +2007,185 @@ impl App {
             self.log_window_hint.get(tab)?,
         )
     }
+}
 
-    fn feed_list_rows(&self) -> usize {
-        self.last_size.1.saturating_sub(3).min(self.page_size)
-    }
-
-    fn article_list_rows(&self) -> usize {
-        self.last_size.1.saturating_sub(3).min(self.page_size)
-    }
-
-    fn feed_list_start(&self) -> usize {
-        let list_rows = self.feed_list_rows().max(1);
-        self.feed_list_scroll
-            .min(self.feed_row_count().saturating_sub(list_rows))
-    }
-
-    fn article_list_start(&self, visible_len: usize) -> usize {
-        let list_rows = self.article_list_rows().max(1);
-        self.article_list_scroll
-            .min(visible_len.saturating_sub(list_rows))
-    }
-
-    fn ensure_selected_feed_visible(&mut self) {
-        let total_rows = self.feed_row_count();
-        if total_rows == 0 {
-            self.selected_feed = 0;
-            self.feed_list_scroll = 0;
-            return;
+/// `text` as the pane's document admits it: CRLF is one newline, a
+/// control scalar other than newline and tab (a feed may carry one in a
+/// title) is the replacement character, a leading byte order mark goes,
+/// and the text is cut at the document's size ceiling.
+fn pane_source(text: &str) -> String {
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
+    let mut source = String::with_capacity(text.len());
+    for c in text.replace("\r\n", "\n").chars() {
+        let shown = match c {
+            '\n' | '\t' => c,
+            c if c <= '\u{1f}' || c == '\u{7f}' => '\u{fffd}',
+            c => c,
+        };
+        if source.len() + shown.len_utf8() > td_editor::text::MAX_FILE_BYTES {
+            break;
         }
-        self.selected_feed = self.selected_feed.min(total_rows - 1);
-        let list_rows = self.feed_list_rows().max(1);
-        let scrolloff = self.scrolloff.min(list_rows.saturating_sub(1));
-        self.feed_list_scroll = self
-            .feed_list_scroll
-            .min(total_rows.saturating_sub(list_rows));
-        if self.selected_feed < self.feed_list_scroll.saturating_add(scrolloff) {
-            self.feed_list_scroll = self.selected_feed.saturating_sub(scrolloff);
-        } else if self.selected_feed.saturating_add(scrolloff)
-            >= self.feed_list_scroll.saturating_add(list_rows)
-        {
-            self.feed_list_scroll = self
-                .selected_feed
-                .saturating_add(scrolloff)
-                .saturating_add(1)
-                .saturating_sub(list_rows);
-        }
-        self.feed_list_scroll = self
-            .feed_list_scroll
-            .min(total_rows.saturating_sub(list_rows));
+        source.push(shown);
+    }
+    source
+}
+
+/// The document pane's rectangle, none for a body with no room.
+fn pane_rect(body: Rect) -> Option<Rect> {
+    (body.width > 0 && body.height > 0).then_some(body)
+}
+
+/// `index` moved by `by` within `count`, the extremes meaning the ends.
+fn step(index: usize, by: isize, count: usize) -> usize {
+    let last = count.saturating_sub(1);
+    match by {
+        isize::MIN => 0,
+        isize::MAX => last,
+        _ => index.saturating_add_signed(by).min(last),
+    }
+}
+
+/// The reader's frame as a composition: what the window paints and what
+/// a test reads back.
+struct Frame<'a> {
+    app: &'a App,
+}
+
+impl Composition for Frame<'_> {
+    fn surface(&self) -> Surface {
+        self.app.surface
     }
 
-    fn ensure_selected_article_visible(&mut self, visible_len: usize) {
-        if visible_len == 0 {
-            self.selected_article = 0;
-            self.article_list_scroll = 0;
-            return;
+    fn emit(&self, damage: Rect, sink: &mut dyn FnMut(Draw)) {
+        let app = self.app;
+        let layout = app.layout();
+        if let Some(clip) = damage.intersection(app.surface.bounds()) {
+            sink(Draw {
+                clip,
+                primitive: Primitive::Fill {
+                    rect: app.surface.bounds(),
+                    color: PAPER,
+                },
+            });
         }
-        self.selected_article = self.selected_article.min(visible_len - 1);
-        let list_rows = self.article_list_rows().max(1);
-        let scrolloff = self.scrolloff.min(list_rows.saturating_sub(1));
-        self.article_list_scroll = self
-            .article_list_scroll
-            .min(visible_len.saturating_sub(list_rows));
-        if self.selected_article < self.article_list_scroll.saturating_add(scrolloff) {
-            self.article_list_scroll = self.selected_article.saturating_sub(scrolloff);
-        } else if self.selected_article.saturating_add(scrolloff)
-            >= self.article_list_scroll.saturating_add(list_rows)
-        {
-            self.article_list_scroll = self
-                .selected_article
-                .saturating_add(scrolloff)
-                .saturating_add(1)
-                .saturating_sub(list_rows);
+        layout.bar.emit(damage, sink);
+        if let Some(field) = layout.search {
+            let caret = app.search.chars().count();
+            field.emit(
+                Field {
+                    text: &app.search,
+                    placeholder: "Search",
+                    caret,
+                    anchor: None,
+                    first: app.search_first,
+                    masked: false,
+                    focused: app.search_mode,
+                    caret_visible: app.search_mode,
+                },
+                damage,
+                sink,
+            );
         }
-        self.article_list_scroll = self
-            .article_list_scroll
-            .min(visible_len.saturating_sub(list_rows));
+        if let Some(list) = layout.list {
+            let rows = app.list_rows_shown(list);
+            let (first, selected, total) = app.list_selection();
+            list.emit(
+                rows.iter().map(|(label, meta, marked)| Item {
+                    label: label.as_str(),
+                    meta: meta.as_str(),
+                    enabled: true,
+                    marked: *marked,
+                }),
+                first,
+                selected,
+                total,
+                damage,
+                sink,
+            );
+        }
+        if let Some(strip) = layout.strip {
+            strip.emit([("News", false), ("Debug", false)], damage, sink);
+        }
+        if layout.pane.is_some() {
+            if let Ok(scene) = app.pane.scene(&[]) {
+                scene.emit(damage, sink);
+            }
+        }
+        layout.status.emit(app.status_line().chars(), damage, sink);
     }
+}
+
+/// An article as the pane shows it: its title, source and link, the
+/// rendered body, and the links it carries, numbered as the picker does.
+fn article_text(article: &Article, urls: &[String], columns: usize) -> String {
+    let mut text = String::new();
+    text.push_str(&views::strip_newlines(&article.title));
+    text.push('\n');
+    let published = article
+        .published
+        .as_deref()
+        .and_then(normalize_datetime_to_local)
+        .unwrap_or_else(|| "No date".to_string());
+    text.push_str(&format!(
+        "{} · {}\n",
+        views::strip_newlines(&article.feed_name),
+        published
+    ));
+    text.push('\n');
+    let html = if article.content.trim().is_empty() {
+        article.description.as_str()
+    } else {
+        article.content.as_str()
+    };
+    let body = crate::html::to_text(html.as_bytes(), columns.max(20));
+    // The renderer's reference definitions (`[1]: https://...`) are
+    // dropped: the Links section below lists the same URLs.
+    let mut rendered: Vec<&str> = body
+        .lines()
+        .filter(|line| !is_reference_link_def(line))
+        .collect();
+    while rendered.last().is_some_and(|line| line.is_empty()) {
+        rendered.pop();
+    }
+    for line in rendered {
+        text.push_str(line);
+        text.push('\n');
+    }
+    if !urls.is_empty() {
+        text.push_str("\nLinks:\n");
+        for (index, url) in urls.iter().enumerate() {
+            text.push_str(&format!("  [{}] {}\n", index + 1, url));
+        }
+    }
+    text
+}
+
+/// The help as the pane shows it.
+fn help_text() -> String {
+    let mut text = String::from("Keys\n\n");
+    for (label, items) in [
+        ("Everywhere", keybindings::GLOBAL),
+        ("Feeds", keybindings::FEED_LIST),
+        ("Articles", keybindings::ARTICLE_LIST),
+        ("Article", keybindings::ARTICLE_VIEW),
+        ("Log", keybindings::LOG_VIEW),
+    ] {
+        text.push_str(label);
+        text.push('\n');
+        for item in items {
+            text.push_str("  ");
+            text.push_str(item);
+            text.push('\n');
+        }
+        text.push('\n');
+    }
+    text.push_str("Mouse\n");
+    for item in keybindings::MOUSE {
+        text.push_str("  ");
+        text.push_str(item);
+        text.push('\n');
+    }
+    text
 }
 
 /// The shell script that runs the configured browser command with the URL
@@ -1896,7 +2197,9 @@ impl App {
 /// `sh -f -c <script> sh <url>`, `-f` so a `?` or `*` in the link is not a
 /// pattern either.
 fn browser_script(cmd: &str) -> String {
-    let cmd = cmd.replace("\"{url}\"", "{url}").replace("'{url}'", "{url}");
+    let cmd = cmd
+        .replace("\"{url}\"", "{url}")
+        .replace("'{url}'", "{url}");
     if cmd.contains("{url}") {
         cmd.replace("{url}", "\"$1\"")
     } else {
@@ -1966,13 +2269,14 @@ fn extract_href_urls(html: &str) -> Vec<String> {
     let mut pos = 0;
     while let Some(start) = html[pos..].find(needle) {
         let url_start = pos + start + needle.len();
+        pos = url_start;
         if let Some(end) = html[url_start..].find('"') {
             let url = &html[url_start..url_start + end];
             if url.starts_with("http://") || url.starts_with("https://") {
                 urls.push(url.to_string());
             }
+            pos = url_start + end + 1;
         }
-        pos = url_start;
     }
     urls
 }
@@ -1993,11 +2297,6 @@ fn html_escape(s: &str) -> String {
         .replace('<', "&lt;")
         .replace('>', "&gt;")
         .replace('"', "&quot;")
-}
-
-fn parse_color_opt(v: &Option<String>) -> Option<(u8, u8, u8)> {
-    v.as_deref()
-        .and_then(|hex| crate::config::Theme::parse_color(hex).ok())
 }
 
 fn find_next_unread_visible_index<F>(
@@ -2209,51 +2508,6 @@ fn finish_log_line(line: &mut Vec<u8>, width: usize) -> String {
     shown
 }
 
-/// A row kind's style over the base: its own ink and background where the
-/// configuration names them, reversed where the terminal fell back to
-/// reverse video for a kind with no colours, and bold where it was bold.
-fn styled(
-    base: Style,
-    fg: Option<(u8, u8, u8)>,
-    bg: Option<(u8, u8, u8)>,
-    bold: bool,
-    reverse_fallback: bool,
-) -> Style {
-    let mut style = Style::new(
-        fg.map_or(base.ink, rgb),
-        bg.map_or(base.background, rgb),
-    );
-    if reverse_fallback && fg.is_none() && bg.is_none() {
-        style = style.reversed();
-    }
-    if bold {
-        style = style.bold();
-    }
-    style
-}
-
-fn rgb((r, g, b): (u8, u8, u8)) -> u32 {
-    u32::from(r) << 16 | u32::from(g) << 8 | u32::from(b)
-}
-
-/// A tab to the next stop of eight cells, as the terminal expanded it;
-/// the screen would draw the control scalar as the replacement character.
-fn expand_tabs(text: &str) -> String {
-    let mut out = String::with_capacity(text.len() + 8);
-    let mut column = 0;
-    for ch in text.chars() {
-        if ch == '\t' {
-            let stop = column / 8 * 8 + 8;
-            out.extend(std::iter::repeat_n(' ', stop - column));
-            column = stop;
-        } else {
-            out.push(ch);
-            column += 1;
-        }
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2281,13 +2535,21 @@ mod tests {
                 .arg(link)
                 .output()
                 .expect("sh");
-            assert!(out.status.success(), "{cmd}: {}", String::from_utf8_lossy(&out.stderr));
-            assert_eq!(String::from_utf8_lossy(&out.stdout).trim_end(), expected, "{cmd}");
+            assert!(
+                out.status.success(),
+                "{cmd}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert_eq!(
+                String::from_utf8_lossy(&out.stdout).trim_end(),
+                expected,
+                "{cmd}"
+            );
         }
     }
 
     use crate::cache::Cache;
-    use crate::config::{Config, FeedConfig, Theme, UiConfig};
+    use crate::config::{Config, FeedConfig, UiConfig};
     use crate::feed::FeedMeta;
     use crate::testing::tempdir;
     use std::sync::mpsc;
@@ -2472,7 +2734,7 @@ mod tests {
         seed_cache(&cache, false);
         let config = test_config();
         let (cmd_tx, _cmd_rx) = mpsc::channel();
-        let mut app = App::new(&config, &cache, true);
+        let mut app = App::new(&config, &cache, true).expect("app");
         app.selected_feed_scope = Some(FeedScope::Feed(FEED_URL.to_string()));
         app.reload_articles(&cache);
 
@@ -2503,72 +2765,218 @@ mod tests {
         );
     }
 
-    /// A click reports the terminal's one-based row; the title and the
-    /// view's header take the first two, so the first feed row is the third.
+    /// A press on a list row selects it, the action bar's labels stand
+    /// for keys, a press below the last row is nothing, and with the
+    /// mouse off in the configuration a press is nothing at all.
     #[test]
-    fn a_click_selects_the_feed_row_under_it_below_the_title_and_header() {
+    fn a_press_selects_the_feed_row_under_it_and_a_bar_label_is_its_key() {
         let dir = tempdir().expect("tempdir");
         let cache = Cache::open_at(dir.path().join("test.tdkv")).expect("cache");
         seed_cache(&cache, false);
         let config = test_config();
         let (cmd_tx, _cmd_rx) = mpsc::channel();
-        let mut app = App::new(&config, &cache, true);
-        app.last_size = (80, 24);
+        let mut app = App::new(&config, &cache, true).expect("app");
         app.selected_feed = 1;
-        let click = |app: &mut App, row: usize| {
-            app.handle_input(
-                InputEvent::Mouse(MouseEvent::LeftClick { row }),
-                &cache,
-                &cmd_tx,
-            );
+        let layout = app.layout();
+        let list = layout.list.expect("list");
+        let press = |app: &mut App, x: i64, y: i64| {
+            for phase in [PointerPhase::Press, PointerPhase::Release] {
+                let input = Input::Pointer {
+                    phase,
+                    x,
+                    y,
+                    extend: false,
+                };
+                app.input(input, &cache, &cmd_tx);
+            }
         };
-        for row in [1, 2] {
-            click(&mut app, row);
-            assert_eq!(app.selected_feed, 1, "row {row}");
-        }
-        click(&mut app, 3);
+        let row = |index: usize| list.row(index).expect("row");
+        press(&mut app, 10, row(0).y + 3);
         assert_eq!(app.selected_feed, 0);
-        let rows = app.feed_row_count();
-        click(&mut app, rows + 2);
-        assert_eq!(app.selected_feed, rows - 1);
-        click(&mut app, rows + 3);
-        assert_eq!(app.selected_feed, rows - 1);
-        // A tab is expanded to the next stop of eight, never drawn as U+FFFD.
-        assert_eq!(expand_tabs("a\tb\t\tc"), "a       b               c");
-        assert_eq!(expand_tabs("12345678\tx"), "12345678        x");
+        let last = app.feed_row_count() - 1;
+        press(&mut app, 10, row(last).y + 3);
+        assert_eq!(app.selected_feed, last);
+        press(&mut app, 10, row(last + 1).y + 3);
+        assert_eq!(app.selected_feed, last, "below the last row");
+        // The bar's "Help" is the `?` key, and the help's "Back" its `q`.
+        let help = layout.bar.header(4).expect("help label");
+        press(&mut app, help.x + 2, help.y + 2);
+        assert_eq!(app.view, View::Help);
+        let back = app.layout().bar.header(0).expect("back label");
+        press(&mut app, back.x + 2, back.y + 2);
+        assert_eq!(app.view, View::FeedList);
+        app.mouse_config = false;
+        press(&mut app, 10, row(0).y + 3);
+        assert_eq!(app.selected_feed, last, "the mouse off");
     }
 
-    /// A wheel event moves the article and log views one row; the page
-    /// keys keep their fifteen. The window sends three events per notch.
+    /// A wheel frame moves a list's selection by its rows and the log's
+    /// window likewise; the page keys move by what the layout shows.
     #[test]
-    fn a_wheel_event_scrolls_the_article_and_log_views_one_row() {
+    fn a_wheel_frame_moves_the_selection_and_the_log_window_by_its_rows() {
         let dir = tempdir().expect("tempdir");
         let cache = Cache::open_at(dir.path().join("test.tdkv")).expect("cache");
         seed_cache(&cache, false);
         let config = test_config();
         let (cmd_tx, _cmd_rx) = mpsc::channel();
-        let mut app = App::new(&config, &cache, true);
-        let send = |app: &mut App, input: InputEvent| {
-            app.handle_input(input, &cache, &cmd_tx);
+        let mut app = App::new(&config, &cache, true).expect("app");
+        let wheel = |app: &mut App, rows: isize| {
+            app.input(Input::Wheel { rows, columns: 0 }, &cache, &cmd_tx);
         };
-        app.view = View::Article;
-        send(&mut app, InputEvent::Mouse(MouseEvent::ScrollDown));
-        assert_eq!(app.article_scroll, 1);
-        send(&mut app, InputEvent::Key(Key::PageDown));
-        assert_eq!(app.article_scroll, 16);
-        send(&mut app, InputEvent::Mouse(MouseEvent::ScrollUp));
-        assert_eq!(app.article_scroll, 15);
-        send(&mut app, InputEvent::Key(Key::PageUp));
-        assert_eq!(app.article_scroll, 0);
+        let key = |app: &mut App, chord: &str| {
+            let input = Input::Key {
+                chord,
+                repeat: false,
+            };
+            app.input(input, &cache, &cmd_tx);
+        };
+        wheel(&mut app, 1);
+        assert_eq!(app.selected_feed, 1);
+        wheel(&mut app, -3);
+        assert_eq!(app.selected_feed, 0);
+        key(&mut app, "End");
+        assert_eq!(app.selected_feed, app.feed_row_count() - 1);
         app.view = View::Log;
-        send(&mut app, InputEvent::Mouse(MouseEvent::ScrollDown));
+        wheel(&mut app, 1);
         assert_eq!(app.log_scroll, 1);
-        send(&mut app, InputEvent::Key(Key::PageDown));
-        assert_eq!(app.log_scroll, 16);
-        send(&mut app, InputEvent::Mouse(MouseEvent::ScrollUp));
-        assert_eq!(app.log_scroll, 15);
-        send(&mut app, InputEvent::Key(Key::PageUp));
+        let page = app.pane_rows();
+        let pane = app.layout().pane.expect("pane");
+        assert_eq!(page, pane.height as usize / 16, "rows of sixteen pixels");
+        assert!(page > 1, "{page}");
+        key(&mut app, "PageDown");
+        assert_eq!(app.log_scroll, 1 + page);
+        wheel(&mut app, -1);
+        assert_eq!(app.log_scroll, page);
+        key(&mut app, "Home");
         assert_eq!(app.log_scroll, 0);
+        // End follows the log's end across frames; a step up leaves it
+        // from the window last shown.
+        key(&mut app, "End");
+        app.prepare_frame();
+        assert_eq!(app.log_scroll, usize::MAX);
+        let start = app.log_start;
+        wheel(&mut app, -1);
+        assert_eq!(
+            app.log_scroll,
+            start.saturating_sub(1),
+            "from the window shown"
+        );
+    }
+
+    /// What the pane is given is what it admits: a control scalar in a
+    /// title, a CRLF body and a leading byte order mark load, shown with
+    /// the replacement character and one newline; the read state is the
+    /// status row's, so a toggle changes it without reloading the
+    /// document.
+    #[test]
+    fn the_pane_admits_a_feeds_text_and_the_status_follows_the_read_state() {
+        assert_eq!(
+            pane_source("\u{feff}A\u{7f}B\r\nC\u{1}\tD\n"),
+            "A\u{fffd}B\nC\u{fffd}\tD\n"
+        );
+        let dir = tempdir().expect("tempdir");
+        let cache = Cache::open_at(dir.path().join("test.tdkv")).expect("cache");
+        seed_cache(&cache, false);
+        let config = test_config();
+        let (cmd_tx, _cmd_rx) = mpsc::channel();
+        let mut app = App::new(&config, &cache, true).expect("app");
+        app.set_pane_text(PaneText::Help, "x\u{7f}y");
+        let tab = app.pane_tab.expect("loaded");
+        let document = app.pane.editor().document(tab).expect("document");
+        assert_eq!(document.text(), "x\u{fffd}y");
+        app.selected_feed_scope = Some(FeedScope::Feed(FEED_URL.to_string()));
+        app.reload_articles(&cache);
+        app.enter_article_view(&cmd_tx);
+        let shown = |app: &mut App| {
+            app.prepare_frame();
+            td_ui::driven::text(&Frame { app }).expect("text").2
+        };
+        // The status row is the frame's last line, the state leading it.
+        let status = |text: &str| text.lines().last().unwrap_or("").trim().to_string();
+        let text = shown(&mut app);
+        assert!(status(&text).starts_with("read | "), "{text}");
+        let tab = app.pane_tab;
+        app.input(
+            Input::Key {
+                chord: "u",
+                repeat: false,
+            },
+            &cache,
+            &cmd_tx,
+        );
+        let text = shown(&mut app);
+        assert!(status(&text).starts_with("unread | "), "{text}");
+        assert_eq!(app.pane_tab, tab, "the document is not reloaded");
+        assert_eq!(app.pane.editor().tabs().count(), 1);
+    }
+
+    /// The frame reads back as text: the feed rows with their counts and
+    /// the status, then the article list, then an opened article in the
+    /// pane, read-only, with its links numbered as the picker numbers
+    /// them; a chord the reader does not claim reaches the pane and edits
+    /// nothing there.
+    #[test]
+    fn the_frame_shows_the_feeds_and_an_opened_article_in_the_pane() {
+        let dir = tempdir().expect("tempdir");
+        let cache = Cache::open_at(dir.path().join("test.tdkv")).expect("cache");
+        seed_cache(&cache, false);
+        let config = test_config();
+        let (cmd_tx, _cmd_rx) = mpsc::channel();
+        let mut app = App::new(&config, &cache, true).expect("app");
+        let key = |app: &mut App, chord: &str| {
+            let input = Input::Key {
+                chord,
+                repeat: false,
+            };
+            app.input(input, &cache, &cmd_tx);
+        };
+        let shown = |app: &mut App| {
+            app.prepare_frame();
+            td_ui::driven::text(&Frame { app }).expect("text").2
+        };
+        let text = shown(&mut app);
+        for expected in [
+            "[All]",
+            "[Unread]",
+            FEED_NAME,
+            "1 unread of 1",
+            "[Log]",
+            "Offline mode",
+        ] {
+            assert!(text.contains(expected), "{expected}: {text}");
+        }
+        key(&mut app, "Down");
+        key(&mut app, "Down");
+        key(&mut app, "Return");
+        assert_eq!(app.view, View::ArticleList);
+        let text = shown(&mut app);
+        assert!(text.contains("First"), "{text}");
+        assert!(text.contains("Search"), "{text}");
+        key(&mut app, "Return");
+        assert_eq!(app.view, View::Article);
+        let text = shown(&mut app);
+        for expected in ["First", FEED_NAME, "content", "[1] https://example.com/1"] {
+            assert!(text.contains(expected), "{expected}: {text}");
+        }
+        let tab = app.pane_tab.expect("the pane holds the article");
+        let document = app.pane.editor().document(tab).expect("document");
+        assert!(document.read_only());
+        let revision = document.revision();
+        key(&mut app, "Tab");
+        key(&mut app, "Delete");
+        let document = app.pane.editor().document(tab).expect("document");
+        assert_eq!(document.revision(), revision, "the pane is not edited");
+        assert_eq!(
+            app.pane.editor().tabs().count(),
+            1,
+            "one document at a time"
+        );
+        // Back to the list: the pane's article is closed with the view.
+        key(&mut app, "q");
+        assert_eq!(app.view, View::ArticleList);
+        assert!(app.open_article.is_none());
+        let text = shown(&mut app);
+        assert!(text.contains(&format!("{FEED_NAME}: 1 articles")), "{text}");
     }
 
     #[test]
@@ -2578,7 +2986,7 @@ mod tests {
         seed_cache(&cache, false);
         let config = test_config();
         let (cmd_tx, _cmd_rx) = mpsc::channel();
-        let mut app = App::new(&config, &cache, true);
+        let mut app = App::new(&config, &cache, true).expect("app");
         app.selected_feed_scope = Some(FeedScope::Feed(FEED_URL.to_string()));
         app.reload_articles(&cache);
 
@@ -2616,7 +3024,7 @@ mod tests {
         seed_two_unread_articles(&cache);
         let config = test_config();
         let (cmd_tx, _cmd_rx) = mpsc::channel();
-        let mut app = App::new(&config, &cache, true);
+        let mut app = App::new(&config, &cache, true).expect("app");
         app.selected_feed_scope = Some(FeedScope::Unread);
         app.reload_articles(&cache);
         assert!(app.select_visible_article_by_hash(ARTICLE_HASH));
@@ -2640,7 +3048,6 @@ mod tests {
     fn test_config() -> Config {
         Config {
             ui: UiConfig::default(),
-            theme: Theme::default(),
             feeds: vec![FeedConfig {
                 name: FEED_NAME.to_string(),
                 url: FEED_URL.to_string(),

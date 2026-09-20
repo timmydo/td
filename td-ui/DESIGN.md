@@ -90,8 +90,8 @@ which drives a program's `Handler` with translated presses, clicks and
 wheel travel on cells, the grid laid out again on configure, focus and
 the close request, and polls the handler each turn under a bounded wait
 so work arriving on a channel from another thread is served without a
-descriptor of its own in the loop. td-news and td-mail, until now
-terminal programs, draw in it.
+descriptor of its own in the loop. td-mail, until now a terminal
+program, draws in it; td-news did until increment 12.
 
 Newly built (increment 12): the widget window under "Widget window"
 below. `window` is the same loop for a program that lays toolkit widgets
@@ -99,8 +99,9 @@ and an embedded document pane out over its surface instead of a grid:
 its handler paints into a raster over the surface and reads the
 keyboard's chords, the left button's press, drag and release in surface
 pixels with Shift, wheel travel, the surface on configure, focus and the
-close request. td-news and td-mail move onto it, each with its lists and
-td-editor's pane, after which the cell screen and its window go.
+close request. td-news has moved onto it, with its lists and
+td-editor's pane (APPLICATIONS.md §W.8, "Reworked again"); td-mail
+follows, after which the cell screen and its window go.
 
 ## Purpose and trust position
 
@@ -1865,12 +1866,14 @@ regressions. Those increments extend the original sequence below.
     `Composition` with the key vocabulary and chord translation, and
     `screen_app`, the window that presents it and polls a `Handler`,
     proven with a recording handler against a scripted peer. Landed;
-    td-news and td-mail draw in it (APPLICATIONS.md §W.8, "Reworked"),
-    each landed in its own increment with its recipe, package and unit.
+    td-news and td-mail drew in it (APPLICATIONS.md §W.8, "Reworked"),
+    each landed in its own increment with its recipe, package and unit;
+    td-mail still does.
 12. The widget window under "Widget window": `window`, the screen
     window's loop without the grid, whose handler paints into a raster
     over the surface and reads chords, button phases and wheel travel in
     surface pixels, proven with a recording handler against the scripted
-    peer. td-news and td-mail move onto it with the toolkit's `List` and
-    td-editor's document pane, each in its own increment; the cell screen
-    and `screen_app` are deleted in the last of those.
+    peer. td-news has moved onto it with the toolkit's `List` and
+    td-editor's document pane (APPLICATIONS.md §W.8, "Reworked again");
+    td-mail follows in its own increment, and the cell screen and
+    `screen_app` are deleted with it.

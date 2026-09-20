@@ -8,6 +8,8 @@ pub const GLOBAL: &[&str] = &[
 pub const FEED_LIST: &[&str] = &[
     "j/k or arrows: move",
     "n/p: next/prev",
+    "PgUp/PgDn: move by page",
+    "Home/End: jump to top/bottom",
     "Enter: open feed/[Log]",
     "g: refresh current feed",
     "G: refresh all feeds",
@@ -20,8 +22,7 @@ pub const ARTICLE_LIST: &[&str] = &[
     "PgUp/PgDn: move by page",
     "Home/End: jump to top/bottom",
     "Enter: open article",
-    "Mouse wheel: move selection",
-    "Mouse click: open article",
+    "/: search titles and text",
     "g: refresh current feed",
     "G: refresh all feeds",
     "u: mark read + next (toggle if read)",
@@ -30,9 +31,10 @@ pub const ARTICLE_LIST: &[&str] = &[
 ];
 
 pub const ARTICLE_VIEW: &[&str] = &[
-    "j/k or arrows: scroll",
+    "j/k: scroll",
     "Space/PgDn: page down",
     "PgUp: page up",
+    "arrows, Home/End: move the caret; the view follows",
     "n/p: next/prev article",
     "u: toggle read",
     "o: open article link",
@@ -47,4 +49,11 @@ pub const LOG_VIEW: &[&str] = &[
     "PgUp/PgDn: page scroll",
     "Home/End: top/bottom",
     "q: back",
+];
+
+pub const MOUSE: &[&str] = &[
+    "click: select the row; a bar label is its key",
+    "click on an article: open it",
+    "wheel: move the selection, or scroll the article",
+    "drag in the article: select text",
 ];

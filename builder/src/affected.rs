@@ -5130,6 +5130,8 @@ mod tests {
         assert_eq!(readers_of("td-busd"), ["td-audio", "td-compositor", "td-jail", "td-login", "td-portal", "td-secret"]);
         assert_eq!(readers_of("td-boot"), ["td-install", "td-update"]);
         assert!(readers_of("td-review").is_empty(), "{readers:?}");
+        // td-news depends on the editor for its document pane.
+        assert_eq!(readers_of("td-editor"), ["td-news"]);
         // Public VM retention-ref and guest workspace paths also spell td-vm/.
         // Authd's fixed task-terminal directory joins the compositor and guest
         // helper as a conservative textual reader of the VM crate.
@@ -7462,11 +7464,15 @@ mod tests {
         for target in ["check", "recipe-checks"] {
             assert!(targets.contains(&target.to_string()), "{targets:?}");
         }
+        // td-news reads the editor for its document pane, so the editor's
+        // commands bring td-news's and, through td-news's own readers, the
+        // rest of the compositor's reader closure, as a toolkit edit does.
         let commands = cargo_test_cmds(&root, &paths).unwrap();
-        assert_eq!(commands.len(), 5, "{commands:?}");
-        assert!(commands.iter().all(|c| {
-            c.contains("--workspace") || c.contains("--manifest-path td-editor/Cargo.toml")
-        }));
+        assert!(commands.len() > 5, "{commands:?}");
+        for name in ["td-editor", "td-news"] {
+            let manifest = format!("--manifest-path {name}/Cargo.toml");
+            assert!(commands.iter().any(|c| c.contains(&manifest)), "{commands:?}");
+        }
         assert!(commands.iter().any(|c| c.starts_with("cargo test --frozen ")));
         assert!(commands.iter().any(|c| {
             c.starts_with("cargo clippy --frozen ") && c.contains("--all-targets")
@@ -7862,16 +7868,19 @@ mod tests {
             declared
         );
         assert!(declared.contains(&"td-editor"));
-        let editor = cargo_test_cmds(&root, &["td-editor/src/model.rs".into()]).unwrap();
+        // td-photo, which no crate reads, shows the declaration widening
+        // nothing; the editor's readers (td-news) bring other consumers.
+        assert!(declared.contains(&"td-photo"));
+        let photo = cargo_test_cmds(&root, &["td-photo/src/main.rs".into()]).unwrap();
         assert_eq!(
-            native(editor.clone()),
+            native(photo.clone()),
             host.iter()
-                .filter(|c| cmd_manifest_crate(c) == Some("td-editor"))
+                .filter(|c| cmd_manifest_crate(c) == Some("td-photo"))
                 .cloned()
                 .collect::<Vec<_>>()
         );
-        assert!(!editor.iter().any(|c| cmd_manifest_crate(c) == Some("td-compositor")));
-        assert!(render_cargo_test(&editor).contains("[native compositor tool + tests]"));
+        assert!(!photo.iter().any(|c| cmd_manifest_crate(c) == Some("td-compositor")));
+        assert!(render_cargo_test(&photo).contains("[native compositor tool + tests]"));
         let compositor = cargo_test_cmds(&root, &["td-compositor/src/main.rs".into()]).unwrap();
         assert_eq!(native(compositor), host);
         assert!(native(cargo_test_cmds(&root, &["td-review/src/main.rs".into()]).unwrap()).is_empty());

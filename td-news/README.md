@@ -2,15 +2,16 @@
 
 `td-news` (Timmy's News) is a Rust news reader for RSS/Atom feeds. It fetches
 feeds, caches articles in a small key/value store, and shows them in a
-keyboard/mouse-first window drawn in rows and columns of text, a td-ui cell
-screen presented as a Wayland toplevel of its own.
+keyboard/mouse-first window of its own: the feeds and the articles in
+td-ui's lists, and an article in td-editor's document view, read-only.
 
 ## Dependencies
 
-td-ui, td's dependency-free UI toolkit, by path, and the Rust standard
-library: JSON, TOML, XML, HTML rendering, the cache and dates are td's
-shared `std` modules under `src/`, copied whole from one master each, and
-the window is td-ui's `screen_app`. Fetching is not done here at all —
+td-ui, td's dependency-free UI toolkit, and td-editor, whose document
+view shows an article, both by path, and the Rust standard library: JSON,
+TOML, XML, HTML rendering, the cache and dates are td's shared `std`
+modules under `src/`, copied whole from one master each, and the window
+is td-ui's widget window. Fetching is not done here at all —
 `td-news` asks td's fetch service over the unix socket at
 `$XDG_RUNTIME_DIR/td-fetch/socket`, which holds the TLS, the resolver and
 the timeouts, and without it no feed can be fetched. The window needs a
@@ -41,28 +42,18 @@ Example:
 
 ```toml
 [ui]
-page_size = 100
-scrolloff = 0
 mouse = true
 sync_interval_secs = 300   # at least 30; 0 turns the automatic refresh off
-
-[theme]
-bg = "#002b36"
-fg = "#839496"
-bold_fg = "#93a1a1"
-selection_bg = "#073642"
-selection_fg = "#eee8d5"
-status_bg = "#586e75"
-status_fg = "#eee8d5"
-header_fg = "#268bd2"
+browser = "firefox {url}"  # optional; else $BROWSER, then xdg-open
 
 [[feed]]
 name = "Hacker News"
 url = "https://news.ycombinator.com/rss"
 ```
 
-`ui.scrolloff` controls the minimum number of list rows kept visible above and
-below the current selection while moving in feed/article lists.
+The terminal reader's `page_size`, `scrolloff` and `[theme]` keys are
+read as any unknown key is, and ignored: the lists page by what the
+window shows and draw in the toolkit's palette.
 
 ## Usage
 
@@ -78,13 +69,14 @@ below the current selection while moving in feed/article lists.
 ### Keybindings
 
 - Global: `?` help, `q` back/quit, `g` refresh
-- Feed list: `j/k/n/p` or arrows, `Enter`, `u`
+- Feed list: `j/k/n/p` or arrows, `PgUp/PgDn`, `Home/End`, `Enter`, `u`
 - Article list: `j/k/n/p` or arrows, `PgUp/PgDn`, `Home/End`, `Enter`, `u`, `o`, `/`
-- Article view: `j/k` or arrows, `Space`, `PgUp/PgDn`, `n/p`, `u`, `o`
+- Article view: `j/k`, `Space`, `PgUp/PgDn` scroll; arrows and `Home/End` move the caret; `n/p`, `u`, `o`, `b`
 - Mouse:
-- Feed list click selects feed
-- Article list click opens article
-- Mouse wheel scrolls article list and article view
+- A click selects a list row; a click on an article opens it
+- The action bar's labels are the view's keys
+- The wheel moves the selection, or scrolls the article
+- A drag in the article selects text
 
 ## Cache
 

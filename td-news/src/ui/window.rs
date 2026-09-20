@@ -1,14 +1,13 @@
-//! The reader in a window: td-ui's screen window drives the `App` with
-//! the inputs it translates, polls the backend's channel each turn and
-//! presents the frame the app draws. The window owns the Wayland
-//! connection; the app owns every view.
+//! The reader in a window: td-ui's widget window drives the `App` with
+//! its inputs, polls the backend's channel each turn and presents the
+//! frame the app paints. The window owns the Wayland connection; the app
+//! owns every view and the document pane.
 
 use std::sync::mpsc;
 
-use td_ui::screen::{Input, Screen, Style};
-use td_ui::screen_app::{Flow, Handler};
+use td_ui::raster::{Raster, Surface};
+use td_ui::window::{Flow, Handler, Input};
 
-use super::input::{self, InputEvent};
 use super::App;
 use crate::backend::{BackendCommand, BackendResponse};
 use crate::cache::Cache;
@@ -24,52 +23,32 @@ struct Session<'a> {
     cache: &'a Cache,
     cmd_tx: &'a mpsc::Sender<BackendCommand>,
     resp_rx: &'a mpsc::Receiver<BackendResponse>,
-    /// Reused per input so a wheel frame allocates nothing.
-    events: Vec<InputEvent>,
 }
 
 impl Handler for Session<'_> {
-    fn title(&self) -> &str {
-        "Timmy's News"
-    }
-
     fn app_id(&self) -> &str {
         "td-news"
     }
 
-    fn ground(&self) -> Style {
-        self.app.theme.base
+    fn title(&self) -> &str {
+        "Timmy's News"
     }
 
-    fn input(&mut self, input: Input) -> Flow {
-        match input {
-            Input::Close => return Flow::Quit,
-            Input::Resize { .. } => {
-                self.app.pending_redraw = true;
-                return Flow::Continue;
-            }
-            _ => {}
+    fn input(&mut self, input: Input<'_>) -> Flow {
+        if self.app.input(input, self.cache, self.cmd_tx) {
+            Flow::Quit
+        } else {
+            Flow::Continue
         }
-        self.events.clear();
-        input::translate(input, self.app.mouse_config, &mut self.events);
-        let events = std::mem::take(&mut self.events);
-        let mut flow = Flow::Continue;
-        for event in &events {
-            if self.app.handle_input(*event, self.cache, self.cmd_tx) {
-                flow = Flow::Quit;
-                break;
-            }
-        }
-        self.events = events;
-        flow
     }
 
-    fn poll(&mut self, _now: u64) -> Flow {
+    fn poll(&mut self, now: u64) -> Flow {
         // A backend that is gone answers nothing more; the reader stays up
         // on what it holds, as the terminal loop did, until the user quits.
         while let Ok(response) = self.resp_rx.try_recv() {
             self.app.handle_backend(response, self.cache);
         }
+        self.app.tick(now);
         if self.app.quitting {
             Flow::Quit
         } else {
@@ -85,8 +64,9 @@ impl Handler for Session<'_> {
         self.app.pending_redraw
     }
 
-    fn render(&mut self, screen: &mut Screen) {
-        self.app.draw(screen);
+    fn paint(&mut self, raster: &mut Raster<'_, '_>, surface: Surface) -> Result<(), String> {
+        self.app.surface = surface;
+        self.app.paint(raster)
     }
 
     fn notice(&mut self, message: &str) {
@@ -110,11 +90,10 @@ pub fn run(
     )?;
     let stream = td_ui::wayland::connect(endpoint)?;
     let mut session = Session {
-        app: App::new(config, cache, offline),
+        app: App::new(config, cache, offline)?,
         cache,
         cmd_tx,
         resp_rx,
-        events: Vec::new(),
     };
-    td_ui::screen_app::run(&mut session, stream, std::env::temp_dir())
+    td_ui::window::run(&mut session, stream, std::env::temp_dir())
 }

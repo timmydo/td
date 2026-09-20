@@ -40,7 +40,7 @@ mod td_fetch;
 mod testing;
 #[allow(dead_code)]
 mod toml;
-mod tui;
+mod ui;
 #[allow(dead_code)]
 mod xml;
 
@@ -217,11 +217,11 @@ fn main() {
 
     let offline = opts.offline;
     let (cmd_tx, resp_rx) = backend::spawn(&config, cache.clone());
-    let tui_failed = match tui::run(&config, &cache, &cmd_tx, &resp_rx, offline) {
+    let window_failed = match ui::run(&config, &cache, &cmd_tx, &resp_rx, offline) {
         Ok(()) => false,
         Err(e) => {
-            log::error(format!("tui error: {}", e));
-            eprintln!("TUI error: {}", e);
+            log::error(format!("window error: {}", e));
+            eprintln!("Window error: {}", e);
             true
         }
     };
@@ -231,7 +231,7 @@ fn main() {
     log::news("td-news session ended");
     // After the shutdown and the log lines, so the record is complete;
     // a launcher still learns that the session did not end on purpose.
-    if tui_failed {
+    if window_failed {
         std::process::exit(1);
     }
 }
@@ -307,10 +307,6 @@ fn print_help_config() {
     eprintln!("Configuration file: {}/td-news/config.toml", xdg);
     eprintln!();
     eprintln!("[ui]");
-    eprintln!("  page_size = 100              # max articles per page (default: 100)");
-    eprintln!(
-        "  scrolloff = 0                # min context lines above/below selection (default: 0)"
-    );
     eprintln!("  mouse = true                 # enable mouse support (default: true)");
     eprintln!("  sync_interval_secs = 300     # auto-refresh interval in seconds (default: 300; at least 30; 0 turns it off)");
     eprintln!(
@@ -320,16 +316,8 @@ fn print_help_config() {
     eprintln!(
         "                               # executed via sh -c; falls back to $BROWSER, xdg-open"
     );
-    eprintln!();
-    eprintln!("[theme]");
-    eprintln!("  bg = \"#002b36\"               # background color (#RRGGBB)");
-    eprintln!("  fg = \"#839496\"               # foreground color");
-    eprintln!("  bold_fg = \"#93a1a1\"           # bold/unread text color");
-    eprintln!("  selection_bg = \"#073642\"      # selected row background");
-    eprintln!("  selection_fg = \"#eee8d5\"      # selected row foreground");
-    eprintln!("  status_bg = \"#586e75\"         # status bar background");
-    eprintln!("  status_fg = \"#eee8d5\"         # status bar foreground");
-    eprintln!("  header_fg = \"#268bd2\"         # header text color");
+    eprintln!("  # page_size, scrolloff and a [theme] table are the terminal reader's:");
+    eprintln!("  # read as unknown keys and ignored");
     eprintln!();
     eprintln!("[[feed]]");
     eprintln!("  name = \"Feed Name\"            # display name for the feed");

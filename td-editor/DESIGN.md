@@ -2832,13 +2832,14 @@ module is imported. These fixtures do not replace the live Weston test.
 
 ## Embedding the document view
 
-td-news and td-mail are to show an article or a message in a read-only
-document pane and td-mail to compose in an editable one, in their own
+td-news shows an article in a read-only document pane, and td-mail is
+to show a message in one and compose in an editable one, in their own
 windows beside the toolkit's lists, instead of calling out to an editor
-process. Each will depend on the `td-editor` library crate by path, as a
+process. Each depends on the `td-editor` library crate by path, as a
 standalone target crate may on a `td-*` roster crate, with its recipe
-staging the `td-editor` tree beside `td-ui` and `td-compositor`; those
-landings are the hosts' own. The host owns the window, the surface, the
+staging the `td-editor` tree beside `td-ui` and `td-compositor`;
+td-news's landing is APPLICATIONS.md §W.8, "Reworked again", and
+td-mail's is its own. The host owns the window, the surface, the
 event loop and every widget around the pane; the pane is a
 `ui::Controller` from `Controller::pane`, placed by `Event::Frame` with the
 pane's rectangle and the host's surface on each configure, and repainted

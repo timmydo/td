@@ -3,9 +3,17 @@
 version = 4
 
 [[package]]
+name = "td-editor"
+version = "0.1.0"
+dependencies = [
+ "td-ui",
+]
+
+[[package]]
 name = "td-news"
 version = "0.1.0"
 dependencies = [
+ "td-editor",
  "td-ui",
 ]
 
