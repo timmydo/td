@@ -1929,5 +1929,6 @@ regressions. Those increments extend the original sequence below.
     window's `Clipboard` with `copy`, `paste` and `Input::Paste`, its
     serial, focus and idle-turn rules the editor's, proven against the
     scripted peer; td-editor's window on the moved writer,
-    its own raw module down to two syscalls. td-mail and td-news copy
-    and paste through it in their next increment. Landed.
+    its own raw module down to two syscalls. Landed. td-mail and
+    td-news copy and paste through it in their own increment
+    (APPLICATIONS.md §W.8, "Reworked again" and "Composing in place").

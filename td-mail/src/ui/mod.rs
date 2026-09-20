@@ -23,12 +23,13 @@ use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use td_editor::model::TabId;
 use td_editor::ui::Outcome;
 use td_ui::raster::{Raster, Surface};
-use td_ui::window::{Clipboard, Flow, Handler, Input, PointerPhase};
+use td_ui::window::{Clipboard, Flow, Handler, Input, PointerPhase, Refusal};
 use views::compose::ComposeView;
 use views::mailbox_list::MailboxListView;
-use views::{Body, Scroll, ViewAction, ViewStack};
+use views::{Body, Scene, Scroll, Slot, ViewAction, ViewStack};
 
 /// The tenth of a second the terminal's read timed out at, kept as the
 /// longest a turn waits for the backend's answer or the idle-sync clock.
@@ -188,6 +189,18 @@ struct Shape {
     keys: &'static [Key],
 }
 
+/// What the clipboard is asked while an input is handled, served with
+/// the window's clipboard before the input returns, so a copy is made
+/// at the press it answers, as the clipboard requires.
+enum Ask {
+    Copy(Arc<str>),
+    /// A paste; `clipboard` is whether the window's may serve it, which a
+    /// repeat's may not.
+    Paste {
+        clipboard: bool,
+    },
+}
+
 struct Session {
     setup: Setup,
     stack: ViewStack,
@@ -207,6 +220,14 @@ struct Session {
     /// The window's close was asked with a draft unsaved: the draft's
     /// question is up, and its answer closes the window or keeps it.
     closing: bool,
+    /// The clipboard's requests from the input being handled.
+    asks: Vec<Ask>,
+    /// The draft a paste was asked for: the text arrives only into it,
+    /// while it is still the one being edited.
+    paste_target: Option<TabId>,
+    /// What the clipboard last refused, or the window last noticed, in
+    /// the status row until the next key or press.
+    note: Option<String>,
 }
 
 impl Session {
@@ -233,6 +254,9 @@ impl Session {
             dirty: true,
             quitting: false,
             closing: false,
+            asks: Vec::new(),
+            paste_target: None,
+            note: None,
         };
         // The window reads the title at binding, before any poll.
         session.refresh_title();
@@ -371,17 +395,39 @@ impl Session {
         Draft::new(&mut self.pane, tab)
     }
 
-    /// A request of the pane's kind, from its chord or a bar label: the
-    /// clipboard's are the kill ring's, and the rest are the view's,
-    /// with its draft in hand.
+    /// A request of the pane's kind, from its chord or a bar label: a
+    /// cut or a copy is the kill ring's and then the clipboard's, so a
+    /// paste after either brings the same text back whichever serves it;
+    /// a paste is the clipboard's or the kill ring's once the clipboard
+    /// is in hand; and the rest are the view's, with its draft in hand.
     fn request(&mut self, name: &str) {
         let changed = match name {
-            "cut" => self.pane.cut(),
-            "copy" => {
-                self.pane.copy();
+            "cut" | "copy" => {
+                let kept = if name == "cut" {
+                    self.pane.cut()
+                } else {
+                    self.pane.copy()
+                };
+                match kept {
+                    Ok(true) => {
+                        if let Some(text) = self.pane.killed() {
+                            self.asks.push(Ask::Copy(text));
+                        }
+                        name == "cut"
+                    }
+                    Ok(false) => false,
+                    Err(why) => {
+                        self.note(format!("{name} refused: {why}"));
+                        false
+                    }
+                }
+            }
+            "paste" => {
+                if self.pane.editable() {
+                    self.asks.push(Ask::Paste { clipboard: true });
+                }
                 false
             }
-            "paste" => self.pane.paste(),
             _ => {
                 let Session { stack, pane, .. } = self;
                 let tab = stack
@@ -400,6 +446,53 @@ impl Session {
         if changed {
             self.redraw();
         }
+    }
+
+    /// The clipboard's requests the input raised, served while the
+    /// input is still being delivered: a copy is offered as the
+    /// selection, which the kill ring keeps either way, so a compositor
+    /// without a clipboard is no refusal; a paste asks the clipboard for
+    /// its text when it offers one, which arrives as `Input::Paste` for
+    /// the draft shown now, and the kill ring's otherwise. What the
+    /// clipboard refused is the status row's note.
+    fn serve(&mut self, clipboard: &mut dyn Clipboard) {
+        for ask in std::mem::take(&mut self.asks) {
+            match ask {
+                Ask::Copy(text) => match clipboard.copy(text) {
+                    Ok(()) | Err(Refusal::NoDevice) => {}
+                    Err(refusal) => self.note(format!("copy kept in td-mail only: {refusal}")),
+                },
+                Ask::Paste { clipboard: asked } => {
+                    if asked && clipboard.has_text() {
+                        match clipboard.paste() {
+                            Ok(()) => self.paste_target = self.pane.tab(),
+                            Err(refusal) => self.note(format!("paste refused: {refusal}")),
+                        }
+                    } else {
+                        match self.pane.paste() {
+                            Ok(true) => self.redraw(),
+                            Ok(false) => {}
+                            Err(why) => self.note(format!("paste refused: {why}")),
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn note(&mut self, text: String) {
+        self.note = Some(text);
+        self.redraw();
+    }
+
+    /// The top view's scene, its status row the clipboard's note while
+    /// one is up.
+    fn scene<'a>(&'a self, slot: &'a Slot) -> Scene<'a> {
+        let mut scene = slot.view.scene();
+        if let Some(note) = &self.note {
+            scene.status = note.clone();
+        }
+        scene
     }
 
     /// A chord to the pane, and what it asked for served.
@@ -648,7 +741,7 @@ impl Session {
     fn shown(&mut self) -> String {
         self.prepare_frame();
         let slot = self.stack.top().expect("a view");
-        let scene = slot.view.scene();
+        let scene = self.scene(slot);
         let frame = Frame {
             surface: self.surface,
             scene: &scene,
@@ -669,10 +762,38 @@ impl Handler for Session {
         "td-mail"
     }
 
-    fn input(&mut self, input: Input<'_>, _clipboard: &mut dyn Clipboard) -> Flow {
+    fn input(&mut self, input: Input<'_>, clipboard: &mut dyn Clipboard) -> Flow {
+        // The note is up until the next key or press.
+        let presses = matches!(
+            input,
+            Input::Key { .. }
+                | Input::Pointer {
+                    phase: PointerPhase::Press,
+                    ..
+                }
+        );
+        if presses && self.note.take().is_some() {
+            self.redraw();
+        }
         match input {
-            // The clipboard is the next increment's.
-            Input::Paste(_) => {}
+            // The clipboard's text, into the draft it was asked for, over
+            // its selection, while that draft is still the one being
+            // edited: closed, or under its save question, or another
+            // draft's, it goes nowhere, with a note.
+            Input::Paste(text) => {
+                let target = self.paste_target.take();
+                if target.is_none() || target != self.pane.tab() || !self.editing(false) {
+                    self.note(
+                        "paste dropped: the draft it was asked for is not being edited".into(),
+                    );
+                } else {
+                    match self.pane.insert(text) {
+                        Ok(true) => self.redraw(),
+                        Ok(false) => {}
+                        Err(why) => self.note(format!("paste refused: {why}")),
+                    }
+                }
+            }
             Input::Close => {
                 if self.close_requested() == Flow::Quit {
                     return Flow::Quit;
@@ -682,7 +803,21 @@ impl Handler for Session {
                 self.surface = surface;
                 self.redraw();
             }
-            Input::Key { chord, .. } => self.chord(chord),
+            // A repeat, a held key, has no press for the clipboard to
+            // take a selection at, and a paste it asked is still
+            // arriving: the chord is the kill ring's alone.
+            Input::Key { chord, repeat } => {
+                self.chord(chord);
+                if repeat {
+                    self.asks = std::mem::take(&mut self.asks)
+                        .into_iter()
+                        .filter_map(|ask| match ask {
+                            Ask::Copy(_) => None,
+                            Ask::Paste { .. } => Some(Ask::Paste { clipboard: false }),
+                        })
+                        .collect();
+                }
+            }
             Input::Pointer {
                 phase,
                 x,
@@ -704,6 +839,7 @@ impl Handler for Session {
                 self.redraw();
             }
         }
+        self.serve(clipboard);
         // The question the close put was answered with the draft kept:
         // the next close asks again.
         if self.closing && !self.quitting && self.editing(false) {
@@ -766,7 +902,7 @@ impl Handler for Session {
         self.surface = surface;
         self.prepare_frame();
         if let Some(slot) = self.stack.top() {
-            let scene = slot.view.scene();
+            let scene = self.scene(slot);
             let frame = Frame {
                 surface,
                 scene: &scene,
@@ -780,8 +916,11 @@ impl Handler for Session {
         Ok(())
     }
 
+    /// The window's diagnostics, a paste that failed or was cancelled
+    /// among them: logged, and the status row's note.
     fn notice(&mut self, message: &str) {
         crate::log_error!("window: {}", message);
+        self.note(message.to_string());
     }
 }
 
@@ -968,11 +1107,65 @@ mod frame_tests {
     }
 
     fn key(session: &mut Session, chord: &str) {
+        key_with(session, chord, &mut NoClipboard);
+    }
+
+    fn key_with(session: &mut Session, chord: &str, clipboard: &mut dyn Clipboard) {
         let input = Input::Key {
             chord,
             repeat: false,
         };
-        session.input(input, &mut NoClipboard);
+        session.input(input, clipboard);
+    }
+
+    /// A clipboard that records what it is asked, refused or not, and
+    /// answers as told.
+    struct Board {
+        text: bool,
+        refuse: Option<Refusal>,
+        copies: Vec<Arc<str>>,
+        pastes: usize,
+        attempts: usize,
+    }
+
+    impl Board {
+        fn new() -> Self {
+            Board {
+                text: false,
+                refuse: None,
+                copies: Vec::new(),
+                pastes: 0,
+                attempts: 0,
+            }
+        }
+    }
+
+    impl Clipboard for Board {
+        fn available(&self) -> bool {
+            true
+        }
+        fn has_text(&self) -> bool {
+            self.text
+        }
+        fn pasting(&self) -> bool {
+            false
+        }
+        fn copy(&mut self, text: Arc<str>) -> Result<(), Refusal> {
+            self.attempts += 1;
+            if let Some(refusal) = self.refuse {
+                return Err(refusal);
+            }
+            self.copies.push(text);
+            Ok(())
+        }
+        fn paste(&mut self) -> Result<(), Refusal> {
+            self.attempts += 1;
+            if let Some(refusal) = self.refuse {
+                return Err(refusal);
+            }
+            self.pastes += 1;
+            Ok(())
+        }
     }
 
     fn press(session: &mut Session, x: i64, y: i64) {
@@ -1483,5 +1676,186 @@ mod frame_tests {
         assert_eq!(small.input(Input::Close, &mut NoClipboard), Flow::Quit);
         let _ = std::fs::remove_dir_all(&draft_dir);
         let _ = std::fs::remove_dir_all(&small_dir);
+    }
+
+    /// A selection copied in a read-only text or in the draft reaches
+    /// the window's clipboard at the chord that asked it, and the kill
+    /// ring too, as a cut one does; a paste asks the clipboard when it
+    /// offers text and the text arrives as an input into the draft it
+    /// was asked for, and is the kill ring's otherwise; what the
+    /// clipboard refuses, and what the window notices, is the status
+    /// row's note until the next key, a compositor without a clipboard
+    /// excepted; and a paste arriving for a draft no longer edited goes
+    /// nowhere.
+    #[test]
+    fn a_copy_reaches_the_clipboard_and_a_paste_comes_from_it_or_the_kill_ring() {
+        let (mut session, _cmd_rx, _resp_tx) = session(true);
+        let draft_dir = session.setup.draft_dir.clone().unwrap();
+        let mut board = Board::new();
+        // The help, read-only: its whole text is copied out.
+        key(&mut session, "?");
+        assert_eq!(session.title(), "Help");
+        key_with(&mut session, "C-a", &mut board);
+        key_with(&mut session, "C-c", &mut board);
+        assert_eq!(board.copies.len(), 1);
+        assert!(
+            board.copies[0].contains("Mailbox List"),
+            "{}",
+            board.copies[0]
+        );
+        assert_eq!(session.pane.killed(), Some(board.copies[0].clone()));
+        assert!(!session.shown().contains("copy kept"), "no note");
+        // A paste into the help pastes nothing and asks nothing.
+        board.text = true;
+        key_with(&mut session, "C-v", &mut board);
+        assert_eq!(board.pastes, 0);
+        key(&mut session, "q");
+        // The draft: the clipboard offers text, so a paste asks it and
+        // the text arrives as an input over the selection.
+        key(&mut session, "c");
+        assert!(session.title.starts_with("Draft "), "{}", session.title);
+        let template = text(&session);
+        key_with(&mut session, "C-a", &mut board);
+        key_with(&mut session, "C-v", &mut board);
+        assert_eq!(board.pastes, 1);
+        assert_eq!(text(&session), template, "nothing yet");
+        session.input(Input::Paste("pasted"), &mut board);
+        assert_eq!(text(&session), "pasted");
+        // Without text on the clipboard the kill ring is pasted.
+        board.text = false;
+        key_with(&mut session, "C-v", &mut board);
+        assert_eq!(board.pastes, 1);
+        assert!(text(&session).starts_with("pasted"), "{}", text(&session));
+        assert!(
+            text(&session).contains("Mailbox List"),
+            "{}",
+            text(&session)
+        );
+        // A cut is the clipboard's too, so a paste after it brings the
+        // cut text back whichever serves it; an empty text arriving
+        // changes nothing and says nothing.
+        key_with(&mut session, "C-a", &mut board);
+        key_with(&mut session, "C-x", &mut board);
+        assert_eq!(board.copies.len(), 2);
+        assert!(board.copies[1].starts_with("pasted"), "{}", board.copies[1]);
+        assert_eq!(text(&session), "");
+        board.text = true;
+        key_with(&mut session, "C-v", &mut board);
+        assert_eq!(board.pastes, 2);
+        session.input(Input::Paste(""), &mut board);
+        assert_eq!(text(&session), "");
+        assert!(!session.shown().contains("paste"), "{}", session.shown());
+        key_with(&mut session, "C-v", &mut board);
+        assert_eq!(board.pastes, 3);
+        session.input(Input::Paste(&board.copies[1].clone()), &mut board);
+        assert!(text(&session).starts_with("pasted"), "{}", text(&session));
+        // A repeat of either chord, a held key, asks the clipboard
+        // nothing: the copy stays the kill ring's and the paste is the
+        // kill ring's, with no note.
+        let attempts = board.attempts;
+        key_with(&mut session, "C-a", &mut board);
+        session.input(
+            Input::Key {
+                chord: "C-c",
+                repeat: true,
+            },
+            &mut board,
+        );
+        assert_eq!(board.attempts, attempts);
+        assert!(session
+            .pane
+            .killed()
+            .as_deref()
+            .is_some_and(|k| k.starts_with("pasted")));
+        session.input(
+            Input::Key {
+                chord: "C-v",
+                repeat: true,
+            },
+            &mut board,
+        );
+        assert_eq!(board.attempts, attempts);
+        assert!(text(&session).starts_with("pasted"), "{}", text(&session));
+        assert!(!session.shown().contains("refused"), "{}", session.shown());
+        // The window's own notices, a paste cancelled among them, reach
+        // the status row too.
+        session.notice("paste cancelled: focus lost");
+        assert!(
+            session.shown().contains("paste cancelled: focus lost"),
+            "{}",
+            session.shown()
+        );
+        // A refusal is the note, and the next key clears it.
+        board.refuse = Some(Refusal::NoSerial);
+        key_with(&mut session, "C-a", &mut board);
+        key_with(&mut session, "C-c", &mut board);
+        assert_eq!(board.copies.len(), 2);
+        let shown = session.shown();
+        assert!(
+            shown.contains(
+                "copy kept in td-mail only: the clipboard answers a key or button press only"
+            ),
+            "{shown}"
+        );
+        key_with(&mut session, "Right", &mut board);
+        assert!(!session.shown().contains("copy kept"), "cleared");
+        board.text = true;
+        key_with(&mut session, "C-v", &mut board);
+        assert!(
+            session
+                .shown()
+                .contains("paste refused: the clipboard answers"),
+            "{}",
+            session.shown()
+        );
+        // No clipboard at all is no note: the kill ring is the clipboard.
+        // The copy is asked all the same.
+        board.refuse = Some(Refusal::NoDevice);
+        let attempts = board.attempts;
+        key_with(&mut session, "C-a", &mut board);
+        key_with(&mut session, "C-c", &mut board);
+        assert_eq!(board.attempts, attempts + 1);
+        assert!(
+            !session.shown().contains("copy kept"),
+            "{}",
+            session.shown()
+        );
+        // A paste asked in this draft arrives once it is under its save
+        // question, then once it is closed and another draft is edited:
+        // dropped with a note both times, the other draft untouched.
+        board.refuse = None;
+        key_with(&mut session, "C-v", &mut board);
+        assert_eq!(board.pastes, 4);
+        key(&mut session, "C-w");
+        assert!(session.title.starts_with("Save "), "{}", session.title);
+        session.input(Input::Paste("under the question"), &mut board);
+        assert!(
+            session.shown().contains("paste dropped"),
+            "{}",
+            session.shown()
+        );
+        key(&mut session, "n");
+        assert_eq!(session.stack.depth(), 1);
+        key(&mut session, "c");
+        assert!(session.title.starts_with("Draft "), "{}", session.title);
+        let other = text(&session);
+        key_with(&mut session, "C-v", &mut board);
+        assert_eq!(board.pastes, 5);
+        key(&mut session, "C-w");
+        key(&mut session, "n");
+        key(&mut session, "c");
+        let third = text(&session);
+        session.input(Input::Paste("late"), &mut board);
+        assert!(
+            session.shown().contains("paste dropped"),
+            "{}",
+            session.shown()
+        );
+        assert_eq!(text(&session), third);
+        assert_eq!(other, third, "two fresh drafts from the same template");
+        key(&mut session, "C-w");
+        key(&mut session, "n");
+        assert_eq!(session.stack.depth(), 1);
+        let _ = std::fs::remove_dir_all(&draft_dir);
     }
 }

@@ -17,12 +17,14 @@ use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::PathBuf;
 use std::sync::mpsc;
+use std::sync::Arc;
 
+use td_editor::clipboard::Snapshot;
 use td_editor::model::TabId;
 use td_editor::ui::{Controller, Event, Outcome, PointerPhase as PanePhase};
 use td_ui::chrome::{Bar, Field, Item, List, Status, Strip, TabHit, TextEntry, ROW};
 use td_ui::raster::{Composition, Draw, Primitive, Raster, Rect, Surface, PAPER};
-use td_ui::window::{Input, PointerPhase};
+use td_ui::window::{Clipboard, Input, PointerPhase};
 
 use crate::backend::{BackendCommand, BackendResponse, FeedRefreshReport};
 use crate::cache::Cache;
@@ -244,6 +246,13 @@ struct App {
     pane_text: PaneText,
     /// Whether a press in the pane began a drag the pane still receives.
     pane_drag: bool,
+    /// The selection a copy chord asked to put on the window's
+    /// clipboard, offered once the chord is handled, while it is still
+    /// being delivered.
+    copy: Option<Arc<str>>,
+    /// What the clipboard answered, or that nothing was selected, in
+    /// the status row until the next key or press.
+    note: Option<String>,
 }
 
 impl App {
@@ -318,6 +327,8 @@ impl App {
             pane_tab: None,
             pane_text: PaneText::None,
             pane_drag: false,
+            copy: None,
+            note: None,
         })
     }
 
@@ -454,6 +465,18 @@ impl App {
         if self.quitting {
             return true;
         }
+        // The note is up until the next key or press.
+        let presses = matches!(
+            input,
+            Input::Key { .. }
+                | Input::Pointer {
+                    phase: PointerPhase::Press,
+                    ..
+                }
+        );
+        if presses && self.note.take().is_some() {
+            self.pending_redraw = true;
+        }
         match input {
             Input::Close => self.quitting = true,
             Input::Resize(surface) => {
@@ -464,7 +487,14 @@ impl App {
                 self.pane_event(Event::Focus(focused));
                 self.pending_redraw = true;
             }
-            Input::Key { chord, .. } => self.chord(chord, cache, cmd_tx),
+            // A repeat, a held key, has no press for the clipboard to
+            // take a selection at: the chord is handled, the ask dropped.
+            Input::Key { chord, repeat } => {
+                self.chord(chord, cache, cmd_tx);
+                if repeat {
+                    self.copy = None;
+                }
+            }
             Input::Pointer {
                 phase,
                 x,
@@ -480,10 +510,54 @@ impl App {
                 }
             }
             Input::Wheel { rows, .. } if self.mouse_config => self.wheel(rows),
-            // The clipboard is the next increment's.
+            // Nothing here is editable: a paste has nowhere to go, and
+            // the reader asks for none.
             Input::Pointer { .. } | Input::Wheel { .. } | Input::Paste(_) => {}
         }
         self.quitting
+    }
+
+    /// The copy the input asked for, offered to the window's clipboard
+    /// while the input is still being delivered, so it is made at the
+    /// press's serial; what the clipboard answered is the status row's
+    /// note.
+    fn serve_clipboard(&mut self, clipboard: &mut dyn Clipboard) {
+        let Some(text) = self.copy.take() else {
+            return;
+        };
+        self.note = Some(match clipboard.copy(text) {
+            Ok(()) => "Copied to the clipboard".to_string(),
+            Err(refusal) => format!("Copy refused: {refusal}"),
+        });
+        self.pending_redraw = true;
+    }
+
+    /// The pane's selection, for the clipboard: none selected, or one
+    /// that cannot be captured (past the clipboard's ceiling), is said
+    /// in the status row.
+    fn copy_selection(&mut self) {
+        let Some((tab, revision)) = self.pane_target() else {
+            return;
+        };
+        match Snapshot::capture(self.pane.editor(), tab, revision) {
+            Ok(Some(snapshot)) => self.copy = Some(snapshot.text()),
+            Ok(None) => {
+                self.note = Some("Nothing selected to copy".to_string());
+                self.pending_redraw = true;
+            }
+            Err(td_editor::Error::Limit) => {
+                self.note = Some(format!(
+                    "Copy refused: the selection is past the clipboard's {} KiB ceiling",
+                    td_editor::clipboard::MAX_BYTES / 1024
+                ));
+                self.pending_redraw = true;
+            }
+            Err(error) => {
+                crate::log::error(format!("document pane: copy: {error}"));
+                self.note = Some(format!("Copy refused: {error}"));
+                self.pending_redraw = true;
+            }
+        }
     }
 
     /// The loop's clock, for the pane's caret.
@@ -1028,18 +1102,25 @@ impl App {
         }
     }
 
+    /// A chord to the pane: a copy it asks for is the selection's way
+    /// to the window's clipboard; its other requests, a read-only
+    /// text's, are nothing here.
     fn pane_chord(&mut self, chord: &str) {
         if chord.is_empty() || !self.pane_shown() {
             return;
         }
         if let Some((tab, revision)) = self.pane_target() {
-            if self.pane_event(Event::Key {
+            match self.pane_event(Event::Key {
                 tab,
                 revision,
                 chord,
-            }) == Outcome::Changed
-            {
-                self.pending_redraw = true;
+            }) {
+                Outcome::Changed => self.pending_redraw = true,
+                Outcome::Request { name: "copy", .. } => self.copy_selection(),
+                Outcome::Request { .. }
+                | Outcome::Created(_)
+                | Outcome::Prefix
+                | Outcome::Ignored => {}
             }
         }
     }
@@ -1298,8 +1379,11 @@ impl App {
         window.map(|window| window.join("\n"))
     }
 
-    /// The status row's text for the view.
+    /// The status row's text for the view, or the note while one is up.
     fn status_line(&self) -> String {
+        if let Some(note) = &self.note {
+            return note.clone();
+        }
         match self.view {
             View::Article if self.url_picking => format!(
                 "Link [{}] of {} (Enter open, 1-9 jump, q cancel)",
@@ -2510,7 +2594,7 @@ fn finish_log_line(line: &mut Vec<u8>, width: usize) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
 
     /// A link reaches the browser as one argument whichever way the command
@@ -2554,6 +2638,36 @@ mod tests {
     use crate::feed::FeedMeta;
     use crate::testing::tempdir;
     use std::sync::mpsc;
+    use td_ui::window::Refusal;
+
+    /// A clipboard that records the copies it is asked, or refuses them.
+    #[derive(Default)]
+    pub(super) struct Board {
+        pub(super) refuse: bool,
+        pub(super) copies: Vec<Arc<str>>,
+    }
+
+    impl Clipboard for Board {
+        fn available(&self) -> bool {
+            true
+        }
+        fn has_text(&self) -> bool {
+            false
+        }
+        fn pasting(&self) -> bool {
+            false
+        }
+        fn copy(&mut self, text: Arc<str>) -> Result<(), Refusal> {
+            if self.refuse {
+                return Err(Refusal::NoSerial);
+            }
+            self.copies.push(text);
+            Ok(())
+        }
+        fn paste(&mut self) -> Result<(), Refusal> {
+            Err(Refusal::NoSelection)
+        }
+    }
 
     const FEED_URL: &str = "https://example.com/feed";
     const FEED_NAME: &str = "Example Feed";
@@ -2972,12 +3086,89 @@ mod tests {
             1,
             "one document at a time"
         );
+        // A copy with nothing selected is said; the whole article
+        // selected and copied is the clipboard's, offered while the
+        // chord is delivered, and what the clipboard answered is the
+        // status.
+        key(&mut app, "C-c");
+        assert!(app.copy.is_none());
+        assert!(shown(&mut app).contains("Nothing selected to copy"));
+        key(&mut app, "C-a");
+        key(&mut app, "C-c");
+        let copied = app.copy.clone().expect("the selection");
+        assert!(copied.contains("content"), "{copied}");
+        assert!(copied.contains("[1] https://example.com/1"), "{copied}");
+        let mut board = Board::default();
+        app.serve_clipboard(&mut board);
+        assert_eq!(board.copies, [copied]);
+        assert!(app.copy.is_none());
+        assert!(shown(&mut app).contains("Copied to the clipboard"));
+        key(&mut app, "C-c");
+        board.refuse = true;
+        app.serve_clipboard(&mut board);
+        assert_eq!(board.copies.len(), 1);
+        let text = shown(&mut app);
+        assert!(
+            text.contains("Copy refused: the clipboard answers a key or button press only"),
+            "{text}"
+        );
+        key(&mut app, "Down");
+        assert!(
+            !shown(&mut app).contains("Copy refused"),
+            "the next key clears the note"
+        );
+        // No clipboard at all is said too: the reader has no kill ring to
+        // fall back on.
+        key(&mut app, "C-a");
+        key(&mut app, "C-c");
+        assert!(app.copy.is_some());
+        app.serve_clipboard(&mut td_ui::window::NoClipboard);
+        assert!(app.copy.is_none());
+        assert!(
+            shown(&mut app).contains("Copy refused: the compositor offers no clipboard"),
+            "{}",
+            shown(&mut app)
+        );
         // Back to the list: the pane's article is closed with the view.
         key(&mut app, "q");
         assert_eq!(app.view, View::ArticleList);
         assert!(app.open_article.is_none());
         let text = shown(&mut app);
         assert!(text.contains(&format!("{FEED_NAME}: 1 articles")), "{text}");
+        // A selection past the clipboard's ceiling is refused before the
+        // clipboard is asked, with the reason: the help's pane, holding
+        // a text that long for the chord.
+        key(&mut app, "?");
+        assert_eq!(app.view, View::Help);
+        app.set_pane_text(
+            PaneText::NoArticle,
+            &"x".repeat(td_editor::clipboard::MAX_BYTES + 1),
+        );
+        key(&mut app, "C-a");
+        key(&mut app, "C-c");
+        assert!(app.copy.is_none());
+        let text = shown(&mut app);
+        assert!(
+            text.contains("Copy refused: the selection is past the clipboard's 1024 KiB ceiling"),
+            "{text}"
+        );
+        // A repeat of the chord, a held key, asks the clipboard nothing:
+        // the clipboard takes a selection at a press only.
+        key(&mut app, "q");
+        key(&mut app, "Return");
+        assert_eq!(app.view, View::Article);
+        key(&mut app, "C-a");
+        app.input(
+            Input::Key {
+                chord: "C-c",
+                repeat: true,
+            },
+            &cache,
+            &cmd_tx,
+        );
+        assert!(app.copy.is_none(), "a repeat asks nothing");
+        key(&mut app, "C-c");
+        assert!(app.copy.is_some(), "the press asks");
     }
 
     #[test]
@@ -3046,7 +3237,7 @@ mod tests {
         );
     }
 
-    fn test_config() -> Config {
+    pub(super) fn test_config() -> Config {
         Config {
             ui: UiConfig::default(),
             feeds: vec![FeedConfig {
@@ -3056,7 +3247,7 @@ mod tests {
         }
     }
 
-    fn seed_cache(cache: &Cache, read: bool) {
+    pub(super) fn seed_cache(cache: &Cache, read: bool) {
         cache.put_articles(&[Article {
             hash: ARTICLE_HASH.to_string(),
             title: "First".to_string(),

@@ -5,7 +5,8 @@
 //! view that shows a text or a draft, so a view's text is its own and
 //! the view under a popped one is back where it was read to. The pane
 //! keeps the kill ring too: a selection cut or copied in any of its
-//! documents, pasted into an editable one, within the process.
+//! documents, pasted into an editable one; the session offers the same
+//! selection to the window's clipboard and pastes what it answers.
 
 use std::sync::Arc;
 use td_editor::clipboard::{Paste, Snapshot};
@@ -20,6 +21,18 @@ use super::views::{Body, Scene};
 /// The rows a page key moves by when the layout has none to say: the
 /// terminal's fifteen.
 pub const PAGE_ROWS: usize = 15;
+
+/// The editor's clipboard error as a status row says it: its ceiling is
+/// the one a person can act on, the rest are the editor's own words.
+fn describe(error: td_editor::Error, what: &str) -> String {
+    match error {
+        td_editor::Error::Limit => format!(
+            "{what} is past the clipboard's {} KiB ceiling",
+            td_editor::clipboard::MAX_BYTES / 1024
+        ),
+        other => other.to_string(),
+    }
+}
 
 /// The scene's regions over the surface.
 #[derive(Clone, Copy)]
@@ -135,7 +148,7 @@ impl Pane {
         self.controller.editor()
     }
 
-    #[cfg(test)]
+    /// The document shown, the top view's: what a paste is asked for.
     pub fn tab(&self) -> Option<TabId> {
         self.tab
     }
@@ -315,7 +328,7 @@ impl Pane {
 
     /// Whether the shown document may be edited: a read-only text is
     /// left alone by a cut or a paste, without a refusal logged.
-    fn editable(&self) -> bool {
+    pub fn editable(&self) -> bool {
         self.tab.is_some_and(|tab| {
             self.controller
                 .editor()
@@ -324,68 +337,79 @@ impl Pane {
         })
     }
 
-    /// The selection into the kill ring and out of the document.
-    pub fn cut(&mut self) -> bool {
+    /// The selection into the kill ring and out of the document: whether
+    /// one was, or why the selection could not be captured (past the
+    /// clipboard's ceiling).
+    pub fn cut(&mut self) -> Result<bool, String> {
         if !self.editable() {
-            return false;
+            return Ok(false);
         }
-        let Some(snapshot) = self.selection() else {
-            return false;
+        let Some(snapshot) = self.selection()? else {
+            return Ok(false);
         };
         let text = snapshot.text();
         if self.event(Event::Cut(snapshot)) != Outcome::Changed {
-            return false;
+            return Ok(false);
         }
         self.kill = Some(text);
-        true
+        Ok(true)
     }
 
-    /// The selection into the kill ring: whether one was kept.
-    pub fn copy(&mut self) -> bool {
-        match self.selection() {
+    /// The selection into the kill ring: whether one was kept, or why it
+    /// could not be captured.
+    pub fn copy(&mut self) -> Result<bool, String> {
+        match self.selection()? {
             Some(snapshot) => {
                 self.kill = Some(snapshot.text());
-                true
+                Ok(true)
             }
-            None => false,
+            None => Ok(false),
         }
     }
 
-    /// The kill ring into the document, over its selection.
-    pub fn paste(&mut self) -> bool {
-        if !self.editable() {
-            return false;
-        }
+    /// The kill ring's text: the last selection cut or copied.
+    pub fn killed(&self) -> Option<Arc<str>> {
+        self.kill.clone()
+    }
+
+    /// The kill ring into the document, over its selection: whether the
+    /// document changed, or why the paste was refused.
+    pub fn paste(&mut self) -> Result<bool, String> {
         let Some(text) = self.kill.clone() else {
-            return false;
+            return Ok(false);
         };
-        let Some((tab, revision)) = self.target() else {
-            return false;
-        };
-        let paste = Paste::begin(self.controller.editor(), tab, revision).and_then(|mut paste| {
-            paste.push(text.as_bytes())?;
-            Ok(paste)
-        });
-        match paste {
-            Ok(paste) => self.event(Event::Paste(paste)) == Outcome::Changed,
-            Err(error) => {
-                crate::log_error!("document pane: paste: {}", error);
-                false
-            }
+        self.insert(&text)
+    }
+
+    /// `text` into the document, over its selection, as a paste is: the
+    /// kill ring's or the system clipboard's. Whether the document
+    /// changed (a read-only document, no document, or an empty text
+    /// changes nothing), or why the paste was refused.
+    pub fn insert(&mut self, text: &str) -> Result<bool, String> {
+        if !self.editable() {
+            return Ok(false);
         }
+        let Some((tab, revision)) = self.target() else {
+            return Ok(false);
+        };
+        let paste = Paste::begin(self.controller.editor(), tab, revision)
+            .and_then(|mut paste| {
+                paste.push(text.as_bytes())?;
+                Ok(paste)
+            })
+            .map_err(|error| describe(error, "the text"))?;
+        Ok(self.event(Event::Paste(paste)) == Outcome::Changed)
     }
 
     /// The shown document's selection, bounded as the editor's clipboard
-    /// bounds it; none when nothing is selected.
-    fn selection(&self) -> Option<Snapshot> {
-        let (tab, revision) = self.target()?;
-        match Snapshot::capture(self.controller.editor(), tab, revision) {
-            Ok(snapshot) => snapshot,
-            Err(error) => {
-                crate::log_error!("document pane: selection: {}", error);
-                None
-            }
-        }
+    /// bounds it; none when nothing is selected, and the reason when it
+    /// cannot be captured.
+    fn selection(&self) -> Result<Option<Snapshot>, String> {
+        let Some((tab, revision)) = self.target() else {
+            return Ok(None);
+        };
+        Snapshot::capture(self.controller.editor(), tab, revision)
+            .map_err(|error| describe(error, "the selection"))
     }
 
     /// A press in the pane is handed on at the pointer's pixel as both
@@ -713,9 +737,9 @@ mod tests {
         assert_eq!(pane.editor().document(tab).unwrap().text(), "To: \nx");
         assert!(Draft::new(&mut pane, Some(tab)).dirty());
         // Nothing selected: nothing cut, copied or pasted.
-        assert!(!pane.cut());
-        assert!(!pane.copy());
-        assert!(!pane.paste());
+        assert_eq!(pane.cut(), Ok(false));
+        assert_eq!(pane.copy(), Ok(false));
+        assert_eq!(pane.paste(), Ok(false));
         // A selection copied from a read-only text is pasted into the draft.
         let mut text = None;
         pane.show(&mut text, "t", 40, || "quoted".to_string());
@@ -724,20 +748,37 @@ mod tests {
             pane.chord("C-c"),
             Outcome::Request { name: "copy", .. }
         ));
-        assert!(pane.copy(), "the selection is kept");
-        assert!(!pane.paste(), "read-only: nothing pasted");
-        assert!(!pane.cut(), "read-only: nothing cut");
+        assert_eq!(pane.copy(), Ok(true), "the selection is kept");
+        assert_eq!(pane.paste(), Ok(false), "read-only: nothing pasted");
+        assert_eq!(pane.cut(), Ok(false), "read-only: nothing cut");
         let shown = pane.tab().expect("the text");
         assert_eq!(pane.editor().document(shown).unwrap().text(), "quoted");
         pane.edit(&mut draft, "d", || unreachable!("held"));
-        assert!(pane.paste());
+        assert_eq!(pane.paste(), Ok(true));
         assert_eq!(pane.editor().document(tab).unwrap().text(), "To: \nxquoted");
-        // Cut takes the selection out and paste brings it back.
+        // Cut takes the selection out and paste brings it back; an empty
+        // text inserted changes nothing.
         assert_eq!(pane.chord("C-a"), Outcome::Changed);
-        assert!(pane.cut());
+        assert_eq!(pane.cut(), Ok(true));
         assert_eq!(pane.editor().document(tab).unwrap().text(), "");
-        assert!(pane.paste());
+        assert_eq!(pane.insert(""), Ok(false));
+        assert_eq!(pane.paste(), Ok(true));
         assert_eq!(pane.editor().document(tab).unwrap().text(), "To: \nxquoted");
+        // A selection past the clipboard's ceiling is refused with the
+        // reason, and the kill ring keeps what it had.
+        let mut big = None;
+        pane.show(&mut big, "big", 40, || {
+            "x".repeat(td_editor::clipboard::MAX_BYTES + 1)
+        });
+        assert_eq!(pane.chord("C-a"), Outcome::Changed);
+        let refused = pane.copy().unwrap_err();
+        assert_eq!(
+            refused,
+            "the selection is past the clipboard's 1024 KiB ceiling"
+        );
+        assert_eq!(pane.killed().as_deref(), Some("To: \nxquoted"));
+        pane.close(big);
+        pane.edit(&mut draft, "d", || unreachable!("held"));
         // Saved at a snapshot, the draft is clean; edited, dirty; given up, clean again.
         let (point, bytes) = Draft::new(&mut pane, Some(tab)).snapshot().unwrap();
         assert_eq!(bytes, b"To: \nxquoted");

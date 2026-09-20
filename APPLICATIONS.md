@@ -9925,8 +9925,13 @@ drag, and the arrows, Home and End are its own chords; the reader's
 letters, the wheel and the page keys scroll it and the lists by what the
 layout shows, so the terminal reader's `page_size` and `scrolloff` keys
 and its `[theme]` colours are read as unknown keys and ignored, the
-window drawing in the toolkit's palette. Copying the selection is still
-the toolkit's clipboard increment. The crate depends on `td-editor`
+window drawing in the toolkit's palette. `Ctrl-C` copies the selection
+to the system clipboard through the widget window's `Clipboard`
+(`td-ui/DESIGN.md`, increment 16): the reader captures the selection
+when the pane asks for a copy and offers it while the chord is still
+being delivered, since the clipboard takes a selection only at the
+press it answers, and the status row says whether it was taken or why
+not. The crate depends on `td-editor`
 beside `td-ui`, by the same sibling spelling, and its recipe stages the
 `td-editor` tree with the two it staged; the package, the unit and its
 readiness probe are unchanged. td-mail follows in two increments: its
@@ -9982,7 +9987,19 @@ save is seen; nothing here ever deletes a draft. A draft past the pane's
 ceiling is retained and not opened, never shortened. Cut, copy and paste
 are a kill ring in the process, a selection captured from any of the
 pane's documents, a message's read-only view included, and pasted into
-the draft; the system clipboard is the toolkit's later increment. The
+the draft. The system clipboard is the widget window's (`td-ui/DESIGN.md`,
+increment 16): a copy or a cut is the kill ring's and then offered as
+the seat's selection while the chord is still being delivered, so it is
+made at the press it answers, and a held key's repeats, which have no
+press, ask the clipboard nothing; a paste asks the clipboard for its
+text when it offers any, which arrives whole as `Input::Paste` on a
+later turn and goes into the draft it was asked for, over its selection,
+only while that draft is still the one being edited (closed, under its
+save question or replaced, it is dropped with a note), and is the kill
+ring's otherwise; a refusal, and a paste the window reports failed or
+cancelled, is the status row's note until the next key, a compositor
+without a clipboard excepted, the kill ring being the whole of it then.
+The
 `mail` package ships no editor and its manifest names none (§W.5,
 "Reworked"); td-mail's `[ui].editor` key is accepted and ignored, as
 `scrolloff` is; and the editor-launch code, its shell-word classifier
