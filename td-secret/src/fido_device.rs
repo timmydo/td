@@ -198,20 +198,44 @@ impl Cancellation {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Interruption {
+    Cancelled,
+    Expired,
+    Closed,
+}
+impl Interruption {
+    fn message(self) -> &'static str {
+        match self {
+            Self::Cancelled => "token operation cancelled",
+            Self::Expired => "token operation expired",
+            Self::Closed => "token session is closed",
+        }
+    }
+}
+
 struct Operation {
     deadline: Instant,
     cancellation: Option<Cancellation>,
 }
 impl Operation {
-    fn remaining(&self) -> Result<Duration, String> {
+    fn status(&self) -> Result<Duration, Interruption> {
         if self
             .cancellation
             .as_ref()
             .is_some_and(|c| c.0.load(Ordering::Acquire))
         {
-            return Err("token operation cancelled".into());
+            return Err(Interruption::Cancelled);
         }
-        remaining(self.deadline)
+        let time = self.deadline.saturating_duration_since(Instant::now());
+        if time.is_zero() {
+            Err(Interruption::Expired)
+        } else {
+            Ok(time)
+        }
+    }
+    fn remaining(&self) -> Result<Duration, String> {
+        self.status().map_err(|error| error.message().into())
     }
     fn timeout(&self) -> Result<Duration, String> {
         let remaining = self.remaining()?;
@@ -239,6 +263,15 @@ pub struct Session {
 }
 
 impl Session {
+    /// Also checked by protocol owners after local crypto or prompt work.
+    pub(crate) fn check_active(&self) -> Result<(), Interruption> {
+        self.operation.status()?;
+        if self.worker.is_none() {
+            return Err(Interruption::Closed);
+        }
+        Ok(())
+    }
+
     pub fn open(device: Device, deadline: Instant) -> Result<Self, String> {
         Self::open_with(device, deadline, None)
     }
@@ -611,7 +644,7 @@ fn canonical<T: std::str::FromStr + ToString>(text: &str) -> Result<T, String> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     const SYNC: &[u8] = b"TD-HID-TEST-READY\n";
 
@@ -718,6 +751,10 @@ mod tests {
         let mut output = io::stdout().lock();
         output.write_all(SYNC).unwrap();
         output.flush().unwrap();
+        if let Some(role) = role.strip_prefix("portable:") {
+            crate::fido_transaction::tests::worker(role, &mut input, &mut output);
+            std::process::exit(0);
+        }
         if role == "lock-refused" {
             output.write_all(&[LOCK_REFUSED]).unwrap();
             output.flush().unwrap();
@@ -768,7 +805,7 @@ mod tests {
         }
     }
 
-    fn fixture(role: &str, time: Duration) -> Session {
+    pub(crate) fn fixture(role: &str, time: Duration) -> Session {
         let (socket, peer) = UnixStream::pair().unwrap();
         let input: OwnedFd = peer.try_clone().unwrap().into();
         let output: OwnedFd = peer.into();
@@ -825,6 +862,16 @@ mod tests {
             );
             assert!(session.cbor(&[4]).is_err());
         }
+    }
+
+    pub(crate) fn cancellable_fixture(
+        role: &str,
+        time: Duration,
+        cancellation: Cancellation,
+    ) -> Session {
+        let mut session = fixture(role, time);
+        session.operation.cancellation = Some(cancellation);
+        session
     }
 
     fn cancel_soon(cancellation: &Cancellation) -> std::thread::JoinHandle<()> {
@@ -918,8 +965,7 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(80));
                 peer.write_all(&[byte]).unwrap();
             }
-            peer.set_read_timeout(Some(Duration::from_secs(5)))
-                .unwrap();
+            peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
             assert_eq!(peer.read(&mut request).unwrap(), 0, "unexpected replay");
         });
         let operation = Operation {
@@ -1203,6 +1249,7 @@ mod tests {
         .is_err());
     }
 }
+
 #[cfg(test)]
 mod vm_tests {
     use super::*;

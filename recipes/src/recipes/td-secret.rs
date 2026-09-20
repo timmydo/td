@@ -21,6 +21,7 @@ const MODULES: &[(&str, &str)] = &[
     ("fido_metadata", include_str!("../../../td-secret/src/fido_metadata.rs")),
     ("fido_p256", include_str!("../../../td-secret/src/fido_p256.rs")),
     ("fido_pin", include_str!("../../../td-secret/src/fido_pin.rs")),
+    ("fido_transaction", include_str!("../../../td-secret/src/fido_transaction.rs")),
     ("tpm", include_str!("../../../td-secret/src/tpm.rs")),
     ("store", include_str!("../../../td-secret/src/store.rs")),
     ("sys", include_str!("../../../td-secret/src/sys.rs")),

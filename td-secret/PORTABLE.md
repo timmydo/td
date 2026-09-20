@@ -423,6 +423,74 @@ closure. Its NIST inputs are public CAVP data, not CAVP validation:
 - [ECDSA archive](https://csrc.nist.gov/CSRC/media/Projects/Cryptographic-Algorithm-Validation-Program/documents/dss/186-4ecdsatestvectors.zip):
   `fe47cc92b4cee418236125c9ffbcd9bb01c8c34e74a4ba195d954bcb72824752`.
 
+### Implemented owned transaction runner
+
+`src/fido_transaction.rs` sequences one portable assertion or one creation
+plus a fresh proof through an owned, private `Channel` interface. Each
+transaction fetches getInfo, negotiates the existing PIN profile, exchanges
+key agreement and PIN-token requests, then verifies the signed hmac-secret
+result. Enrollment uses separate creation and proof PIN inputs and retires
+each immediately through the codec. The channel is consumed and dropped on
+success as well as every error; there is no command replay, PIN retry,
+protocol fallback, reset, PIN change or persistent publication.
+
+The backend must admit one device/channel before constructing a transaction.
+`Channel::check` and `exchange` must share the original absolute deadline and
+one-way revocation state; Drop must retire the worker. The runner checks
+before and after wire exchanges, PIN collection and each entropy callback,
+and after cryptographic transitions before accepting their results. A late
+PIN, message or verified output is dropped. Callback failure is a typed local
+error without its private diagnostic text. A callback that blocks cannot be
+preempted by this synchronous runner: the trusted prompt/entropy owner must
+observe its lifetime, and accepted results remain bounded by the checks.
+Enrollment spans seven exchanges, two PIN prompts and two presence waits
+under that one deadline. The Session limit is 120 seconds; the consumer must
+budget for the complete ceremony without extending it between phases.
+
+The backend supplies fresh operation-bound client-data hashes, the pinned
+credential key and salt, kernel entropy, and trusted or explicitly host-owned
+PIN collection. These are not caller-controlled application parameters.
+Enrollment refuses equal creation/proof hashes before any device request;
+that inequality alone does not prove freshness or bind consent. Both ordinary
+assertions and enrollment proofs refuse signed BE/BS flags. Returned metadata
+still needs backend counter comparison/persistence and current authorization
+before release or vault publication. One creation/proof is not the repeated
+primary/backup enrollment and recovery ceremony.
+The runner's input hashes, user ID and salt are ordinary copied arrays;
+their copies are outside the codec's best-effort clearing claim. They contain
+no PIN, private scalar, PIN token or derived vault secret.
+
+Nonzero status bytes are classified before response-body parsing. The typed
+surface preserves PIN-invalid, PIN-blocked, PIN-auth-invalid,
+PIN-auth-blocked, PIN-not-set/required/policy, denied, cancelled,
+no-credential, credential-excluded and timeout responses, plus unknown codes
+as `Other(byte)`.
+These are untrusted device claims, never proof of user verification. Local
+cancel/expiry takes precedence over a late device status; uncertain transport
+failure remains distinct from a closed channel. `Transport` also includes
+CTAPHID ERROR frames, including channel-busy; it does not establish whether
+the authenticator processed a request. Classification follows
+[CTAP 2.2 status codes](https://fidoalliance.org/specs/fido-v2.2-ps-20250714/fido-client-to-authenticator-protocol-v2.2-ps-20250714.html#message-encoding).
+It grants no retry or recovery authority and does not infer a PIN-attempt
+count from a status.
+Capability-policy refusals at getInfo remain opaque `Protocol` diagnostics;
+they are not typed PIN-setup or recovery instructions. Some named wire
+statuses cannot arise from a conforming device in this admitted flow; their names
+classify received bytes, not reachable recovery actions. No consumer may
+parse those diagnostics to choose an action. Typed capability refusal and
+any setup guidance require a later consumer-facing API increment.
+
+The concrete Session binding is test-only. Ordinary and td-built tests run
+all four independent PIN transcripts, including creation and proof, through
+real child/socket HID framing with keepalives. They also cover every nonzero
+status, failures at each enrollment exchange, local interruption, late
+results, callback errors and signed backup-flag refusal. This runner has no
+production transport binding, public command or notebook entry point. The
+actual consumer binary's generated-code inspection remains mandatory before
+hardware admission; these fixtures do not satisfy that gate or establish
+physical YubiKey interoperability. Guix device access, authority/prompt
+integration and durable primary/backup vault lifecycle remain prerequisites.
+
 ### Implemented PIN-authorized hmac-secret assertion flow
 
 `src/fido_pin.rs` implements a private, safe-Rust protocol flow for an
@@ -461,9 +529,9 @@ transport-retry authority is supplied by the codec.
 The shared USB transport now offers an opt-in cancellation handle across
 startup and all exchanges, without renewing the deadline or replaying USB
 reports. See `DESIGN.md` under USB token transport for its socket polling,
-worker teardown and final consumer-check contract. The portable codec is
-not yet connected to that transport. Its future owner must route cancel,
-lock, suspend and authority loss to the handle, drop idle sessions and
+worker teardown and final consumer-check contract. The production portable
+path is not yet connected to that transport. Its future owner must route
+cancel, lock, suspend and authority loss to the handle, drop idle sessions and
 pending PIN state, and check authorization before accepting a result.
 The root-only device admission remains unchanged; standalone Guix device
 access is still a separate integration requirement.
@@ -503,9 +571,10 @@ Only then is the signed hmac-secret ciphertext decrypted. Counter admission
 is structural only; comparison and persistence against the enrolled record
 are backend duties. Missing extensions,
 wrong output lengths, malformed CBOR and signatures, and CTAP error statuses
-return no output. Status codes currently appear in fixed diagnostic strings;
-the device adapter must add typed status handling before exposing PIN retries
-or recovery actions, without parsing human-readable error text.
+return no output. The codec alone reports status bytes in diagnostic strings.
+The transaction runner above classifies them before invoking the codec; no
+consumer may parse human-readable error text to choose retries or recovery
+actions.
 The backend-only output owner contains exactly 32 bytes
 plus assertion metadata; it is not an application release or store write.
 The standard unauthenticated clientPIN response has no independent MAC; the

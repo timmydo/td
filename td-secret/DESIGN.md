@@ -396,6 +396,14 @@ primitives do not yet wire lock, suspend or UI events to the portable
 backend. Child/socket fixtures exercise early and in-flight cancellation,
 reaping, partial progress without replay and the unchanged deadline.
 
+`Session::check_active` exposes typed Cancelled, Expired and Closed states
+for protocol owners checking after local work. Cancellation or expiry stays
+observable after an I/O error retires the worker, without interpreting the
+transport's diagnostic strings. Existing deadline-only callers retain their
+string error API. The portable transaction runner and its test-only Session
+binding are specified in `PORTABLE.md`; no production PIN consumer is added
+by that binding.
+
 Every td-owned HID worker takes a nonblocking exclusive file lock before
 opening a token. The stable empty `operation.lock` lives under root-owned
 mode-0700 `/run/td-fido`, with root-owned mode-0600 single-link regular-file

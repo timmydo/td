@@ -41,6 +41,8 @@ mod fido_enroll;
 mod fido_p256;
 #[allow(dead_code, reason = "portable PIN protocol; no device consumer yet")]
 mod fido_pin;
+#[allow(dead_code, reason = "private portable transaction runner; hardware admission pending")]
+mod fido_transaction;
 #[path = "../../td-firstboot/src/principals.rs"]
 #[allow(dead_code, reason = "shared immutable session identity loader")]
 mod principals;
@@ -202,6 +204,7 @@ mod confinement {
             ("fido_metadata.rs", include_str!("fido_metadata.rs")),
             ("fido_p256.rs", include_str!("fido_p256.rs")),
             ("fido_pin.rs", include_str!("fido_pin.rs")),
+            ("fido_transaction.rs", include_str!("fido_transaction.rs")),
             ("store.rs", include_str!("store.rs")),
             ("sys.rs", include_str!("sys.rs")),
             ("system_vm.rs", include_str!("system_vm.rs")),
@@ -271,6 +274,7 @@ pub fn take_received(fd: RawFd) -> Result<File, String> {
                 "fido_metadata.rs",
                 "fido_p256.rs",
                 "fido_pin.rs",
+                "fido_transaction.rs",
                 "main.rs",
                 "operation.rs",
                 "portable.rs",
