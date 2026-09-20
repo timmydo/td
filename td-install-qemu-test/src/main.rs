@@ -187,6 +187,36 @@ fn directories() -> Result<(), String> {
     applet(&["mount", "-t", "sysfs", "sysfs", "/sys"])
 }
 
+fn quiet_kernel_console(
+    control: &Path,
+    override_level: &Path,
+    no_auto_verbose: &Path,
+) -> Result<(), String> {
+    if read(override_level, 2)? != b"N\n" {
+        return Err("kernel console ignores its configured log level".into());
+    }
+    if read(no_auto_verbose, 2)? != b"N\n" {
+        return Err("kernel console cannot raise its log level on faults".into());
+    }
+    // Keep console_verbose functional while suppressing routine kernel messages.
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .open(control)
+        .map_err(|error| format!("open kernel console control: {error}"))?;
+    file.write_all(b"1\n")
+        .map_err(|error| format!("quiet kernel console: {error}"))?;
+    let bytes = read(control, 64)?;
+    let text = std::str::from_utf8(&bytes).map_err(|_| "non-UTF-8 kernel console control")?;
+    let fields: Vec<_> = text.split_ascii_whitespace().collect();
+    if fields.len() != 4
+        || fields.first() != Some(&"1")
+        || !fields.iter().all(|field| field.parse::<i32>().is_ok())
+    {
+        return Err("kernel console did not retain the quiet log level".into());
+    }
+    Ok(())
+}
+
 fn media_device(target: &str) -> Result<&'static str, String> {
     let started = Instant::now();
     loop {
@@ -901,6 +931,11 @@ fn run() -> Result<(), String> {
         return Err("installation fixture must be guest PID 1".into());
     }
     directories()?;
+    quiet_kernel_console(
+        Path::new("/proc/sys/kernel/printk"),
+        Path::new("/sys/module/printk/parameters/ignore_loglevel"),
+        Path::new("/sys/module/printk/parameters/console_no_auto_verbose"),
+    )?;
     match read(Path::new("/fixture-phase"), 32)?.as_slice() {
         b"install\n" => install(&target()?, false, false),
         b"install-system\n" => install(&target()?, false, true),
@@ -1160,6 +1195,77 @@ mod tests {
         std::os::unix::fs::symlink(&payload, &alias).unwrap();
         assert!(partial_length(&alias, 4).is_err());
         assert!(partial_length(&scratch.0, 4).is_err());
+    }
+
+    #[test]
+    fn kernel_console_is_quieted_and_read_back_before_reports() {
+        let dir = Scratch::new();
+        let control = dir.0.join("printk");
+        let override_level = dir.0.join("ignore_loglevel");
+        let no_auto_verbose = dir.0.join("console_no_auto_verbose");
+        fs::write(&control, b"7\t4\t1\t7\n").unwrap();
+        fs::write(&override_level, b"N\n").unwrap();
+        fs::write(&no_auto_verbose, b"N\n").unwrap();
+        quiet_kernel_console(&control, &override_level, &no_auto_verbose).unwrap();
+        // A plain fixture file retains the suffix just as procfs retains its
+        // other controls; opening with truncation would lose those fields.
+        assert_eq!(fs::read(&control).unwrap(), b"1\n4\t1\t7\n");
+    }
+
+    #[test]
+    fn kernel_console_override_refuses_before_changing_the_level() {
+        let dir = Scratch::new();
+        let control = dir.0.join("printk");
+        let override_level = dir.0.join("ignore_loglevel");
+        let no_auto_verbose = dir.0.join("console_no_auto_verbose");
+        for parameter in [&override_level, &no_auto_verbose] {
+            fs::write(&override_level, b"N\n").unwrap();
+            fs::write(&no_auto_verbose, b"N\n").unwrap();
+            for value in [b"Y\n".as_slice(), b"N", b"N\nextra"] {
+                fs::write(&control, b"7\t4\t1\t7\n").unwrap();
+                fs::write(parameter, value).unwrap();
+                assert!(quiet_kernel_console(&control, &override_level, &no_auto_verbose).is_err());
+                assert_eq!(fs::read(&control).unwrap(), b"7\t4\t1\t7\n");
+            }
+            fs::remove_file(parameter).unwrap();
+            assert!(quiet_kernel_console(&control, &override_level, &no_auto_verbose).is_err());
+            assert_eq!(fs::read(&control).unwrap(), b"7\t4\t1\t7\n");
+        }
+    }
+
+    #[test]
+    fn kernel_console_requires_complete_bounded_readback() {
+        let dir = Scratch::new();
+        let control = dir.0.join("printk");
+        let override_level = dir.0.join("ignore_loglevel");
+        let no_auto_verbose = dir.0.join("console_no_auto_verbose");
+        fs::write(&override_level, b"N\n").unwrap();
+        fs::write(&no_auto_verbose, b"N\n").unwrap();
+        for value in [
+            b"7\n".as_slice(),
+            b"7\t4\t1\n",
+            b"7\tx\t1\t7\n",
+            b"7\t4\t1\t7\t0\n",
+            b"7\t4\t1\t999999999999999999999999999999999999999999999999999999999999999999999\n",
+        ] {
+            fs::write(&control, value).unwrap();
+            assert!(quiet_kernel_console(&control, &override_level, &no_auto_verbose).is_err());
+        }
+    }
+
+    #[test]
+    fn kernel_console_refuses_in_bounds_integer_overflow() {
+        let dir = Scratch::new();
+        let control = dir.0.join("printk");
+        let override_level = dir.0.join("ignore_loglevel");
+        let no_auto_verbose = dir.0.join("console_no_auto_verbose");
+        fs::write(&control, b"7\t4\t1\t99999999999\n").unwrap();
+        fs::write(&override_level, b"N\n").unwrap();
+        fs::write(&no_auto_verbose, b"N\n").unwrap();
+        assert_eq!(
+            quiet_kernel_console(&control, &override_level, &no_auto_verbose),
+            Err("kernel console did not retain the quiet log level".into())
+        );
     }
 
     #[test]

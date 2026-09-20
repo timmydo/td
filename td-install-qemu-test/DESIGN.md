@@ -280,10 +280,37 @@ All operations use safe Rust and existing td-init/td-boot applets. No syscall
 surface or external dependency is added. Unit tests cover refusal outside
 PID 1; the host oracle is the executable integration test. A serial marker is
 accepted only after its named operation and persistence barriers finish.
+After mounting its private procfs and sysfs, before phase selection or
+any installation report, the fixture requires printk's ignore_loglevel
+and console_no_auto_verbose parameters to be disabled, writes one to the
+first /proc/sys/kernel/printk field without truncating or changing the
+other fields, and requires a bounded, complete four-integer readback with
+console_loglevel one. A missing control, active override, failed write or
+mismatched readback
+refuses before target discovery. This runs only after the guest-PID-1
+check and applies to the diagnostic fixture's phases; full-system
+installed boots retain their ordinary logging policy.
+
+This quiets routine kernel console output while retaining the kernel log
+buffer. The pinned Linux 7.1.4
+[printk sysctl](https://raw.githubusercontent.com/gregkh/linux/v7.1.4/kernel/printk/sysctl.c)
+accepts the first-field update; console priority filtering is described in
+the [kernel documentation](https://docs.kernel.org/admin-guide/sysctl/kernel.html#printk).
+A clocksource message had split an inventory JSON record despite its
+single formatted write. Quieting the console removes that competing
+routine writer; it does not grant atomic serial writes or repair damaged
+reports. Kernel faults or forced console output can still interrupt a
+report and fail the oracle. Level one retains emergency messages and
+allows the pinned kernel
+[console_verbose implementation](https://raw.githubusercontent.com/gregkh/linux/v7.1.4/kernel/printk/printk.c)
+to raise verbosity on faults; level zero would suppress that recovery.
+Tool stdout/stderr and explicit fixture errors continue to reach the
+captured console.
+
 The fixture formats a complete protocol line before write_all, avoiding
-formatter-induced split writes that allowed kernel console messages to
-separate the refusal prefix from its reason. This is not an atomic-console
-guarantee; incomplete or interleaved evidence still fails the host oracle.
+formatter-induced split writes that could separate the refusal prefix
+from its reason. Incomplete or interleaved evidence still fails the host
+oracle.
 
 The fixture deliberately inspects the formatter's staging layout as an
 internal regression oracle. A formatter rename requires updating that
