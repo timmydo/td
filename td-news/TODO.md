@@ -2,13 +2,13 @@
 
 ## Core
 - [x] Implement RSS/Atom XML feed parser in `feed.rs`
-- [x] Wire up backend thread to TUI in `main.rs`
+- [x] Wire up backend thread to the window in `main.rs`
 - [x] Implement periodic background feed refresh (sync_interval_secs)
 
-## TUI
-- [x] Cell-screen drawing in a td-ui window (`tui/window.rs`, td-ui `screen_app`)
-- [x] Key and mouse translation from the window's input (`tui/input.rs`)
-- [x] Views and their frame over the screen's rows and columns (`tui/mod.rs`)
+## Window
+- [x] Drawing in td-ui's widget window (`ui/window.rs`, td-ui `window`)
+- [x] Key and mouse translation from the window's input (`ui/input.rs`)
+- [x] Views as lists and td-editor's document pane (`ui/mod.rs`)
 - [x] Feed list view with unread counts
 - [x] Article list view with search
 - [x] Article view with plain text rendering (td's `html` renderer)

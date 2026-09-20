@@ -1,7 +1,7 @@
 //! td-news: an RSS and Atom reader in a td-ui window.
 //!
-//! The crate is `std` and td-ui, the shared toolkit whose screen window it
-//! draws in. Six modules — `civil`, `html`, `json`, `kv`, `toml`, `xml` —
+//! The crate is `std` and td-ui, the shared toolkit whose widget window
+//! it draws in. Six modules — `civil`, `html`, `json`, `kv`, `toml`, `xml` —
 //! are td's shared std modules, copied in whole from one master each and
 //! never edited here, so the import into td can diff them byte for byte
 //! against td-mail's copies. What td-news does not call therefore stays,

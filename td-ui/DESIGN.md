@@ -81,18 +81,14 @@ from the draw stream and the painted frame, digested and paged; and the
 raster's one XRGB-to-PPM writer, which td-setup's and td-editor's
 previews now use. td-photo consumes the seam in its next increment.
 
-Newly built (increment 11): the cell screen under "Cell screen" below.
-`screen` is the styled grid a program that draws in rows and columns
-paints, a `Composition` over the raster, with the key vocabulary such a
-program reads and the translation of the keyboard's chords into it;
-`screen_app` is the window that presents it, one more `App` shape,
-which drives a program's `Handler` with translated presses, clicks and
-wheel travel on cells, the grid laid out again on configure, focus and
-the close request, and polls the handler each turn under a bounded wait
-so work arriving on a channel from another thread is served without a
-descriptor of its own in the loop. td-news and td-mail drew in it
-until increment 12; nothing does now, and it goes with td-mail's
-composing increment.
+Built and deleted (increments 11 and 13): the cell screen, a styled grid
+a program written for a terminal painted in rows and columns, and the
+window that presented it and polled the program's handler. td-news and
+td-mail drew in it until increment 12, when each moved onto the widget
+window below; a grid kept the terminal's shape, and that was the wrong
+abstraction for a reader whose views are lists and texts. Nothing draws
+in it now; the widget window kept its loop, without the grid, and its
+section below describes that loop whole.
 
 Newly built (increment 12): the widget window under "Widget window"
 below. `window` is the same loop for a program that lays toolkit widgets
@@ -100,9 +96,9 @@ and an embedded document pane out over its surface instead of a grid:
 its handler paints into a raster over the surface and reads the
 keyboard's chords, the left button's press, drag and release in surface
 pixels with Shift, wheel travel, the surface on configure, focus and the
-close request. td-news and td-mail have moved onto it, with their
-lists and td-editor's pane (APPLICATIONS.md §W.8, "Reworked again");
-the cell screen and its window go with td-mail's composing increment.
+close request. td-news and td-mail have moved onto it, with their lists
+and td-editor's pane (APPLICATIONS.md §W.8, "Reworked again"), and the
+cell screen and its window are deleted (increment 13).
 
 ## Purpose and trust position
 
@@ -324,17 +320,6 @@ of its own files may name each module.
   `Payload`, the worker's request type for a driven consumer; `text`,
   the read-back of a composition's draw stream; `paint` and the `Frame`
   it returns with its `ppm`; and `fnv1a64`, the frame digest.
-- `screen`: `PAPER` and `INK`; `Style` (`new`, `bold`, `reversed`)
-  and `Cell`; `Screen` (`new`, `resize`, `surface`, `rows`,
-  `columns`, `ground`, `clear`, `clear_row`, `put`, `write`, `cell`,
-  `line`, `hit`), a `Composition`; `Key`, `Press` (`plain`,
-  `plain_char`) and `press`, the chord translation; and `Input`, the
-  vocabulary a screen program reads, under "Cell screen" below.
-- `screen_app`: `DEFAULT_WIDTH` and `DEFAULT_HEIGHT`; `Flow`; the
-  `Handler` trait (`app_id`, `ground`, `input`, `poll`, `wait_ms`,
-  `needs_redraw`, `render`, `title`, `notice`); `Object`, the empty
-  tag; `Window<'h, H>` (`new`, `handler`, `handler_mut`, `screen`), the
-  `App` over a handler it borrows; and `run`.
 - `window`: `DEFAULT_WIDTH` and `DEFAULT_HEIGHT`; `Flow`;
   `PointerPhase`, the driven seam's, re-exported; `Input<'a>`, the
   vocabulary a widget program reads; the `Handler` trait (`app_id`,
@@ -744,23 +729,20 @@ not frames, and stays its own).
   and reads procfs for the caller's identity; `control_worker`, which
   owns its thread and reads the monotonic clock for its deadlines; and
   `replay`, which reads and writes only the streams it is handed; and the
-  two windows `screen_app` and `window`, whose `Window::new` reads the
-  embedded face and whose loop is `client::run`. Even they read no environment
-  variable, taking the display values and the socket path as explicit
-  arguments.
-- `control`, `driven` and `screen` are pure: the frame, envelope and
-  codecs touch no descriptor, the seam reads only the composition it is
-  handed and the embedded face, and the screen is a grid in memory that
-  emits draws.
-  The decoder allocates at most one frame, after validating its length,
-  and `frame` checks the ceiling before allocating its output; the
-  envelope hands fields on as a bounded iterator; the codecs and `ok`
-  allocate in proportion to the caller's own input, which the caller
-  budgets (hex-encoding a page allocates twice its bytes before `frame`
-  judges the reply). The worker knows the
+  widget window `window`, whose `Window::new` reads the embedded face and
+  whose loop is `client::run`. Even they read no environment variable,
+  taking the display values and the socket path as explicit arguments.
+- `control` and `driven` are pure: the frame, envelope and codecs touch
+  no descriptor, and the seam reads only the composition it is handed
+  and the embedded face. The decoder allocates at most one frame, after
+  validating its length, and `frame` checks the ceiling before
+  allocating its output; the envelope hands fields on as a bounded
+  iterator; the codecs and `ok` allocate in proportion to the caller's
+  own input, which the caller budgets (hex-encoding a page allocates
+  twice its bytes before `frame` judges the reply). The worker knows the
   consumer only as `R: Parse`; it holds no consumer state, and the one
-  parse site is `R::parse`. Whether a parsed request reads or acts is the
-  consumer's decision at dispatch, never the transport's.
+  parse site is `R::parse`. Whether a parsed request reads or acts is
+  the consumer's decision at dispatch, never the transport's.
 - The transport: `endpoint` prefers `WAYLAND_SOCKET`, which `connect`
   duplicates close-on-exec rather than adopting, so the borrowed original
   stays open until its owner closes it and the consumer must give the
@@ -1081,51 +1063,17 @@ ceiling, the whole seam behind the replay runner, and `Payload` behind a live
 worker, a malformed frame refused on the worker's thread and the rest answered
 on the turn.
 
-`tests/screen.rs` holds the cell screen's oracles: the grid laid out over a
-surface with its remainder as ground, writes clipped at the right edge, a
-control scalar replaced, rows cleared from a column, a resize relaying out
-and clearing, hits inside the grid only, a surface under a cell on either
-axis giving no cells, and a row read back with its blank cells trimmed
-and a space-like scalar a program wrote kept; the draw stream as the
-ground fill first, one fill per run of cells sharing a background other
-than the ground and one glyph per non-blank cell, clipped to the damage
-by row and by column with the pixels of a culled paint equal to a whole
-one, at scale one and two; a whole-surface pixel oracle through the
-raster against the face's own bitmap; the driven seam's `text` reading
-the grid back; and the chord translation, every prefix and named key,
-the bare space and its named spelling, `plain_char` refusing every
-modifier, and the refused forms including the function keys' non-digit
-and zero-led spellings. `tests/screen_app.rs` drives the window against
-a scripted peer: the title, app id and commit closing the binding and
-the default grid delivered with it; configure laying the grid out, a
-zero axis keeping the extent, an extent the raster refuses kept out,
-reported and delivering nothing, and the extent the grid has keeping
-the cells and delivering nothing; the frame presented once dirty with
-the rendered cells and the ground in its pool, nothing re-rendered while
-clean, a redraw over the released buffer, and a paint with every buffer
-busy left dirty until one is released; the title re-sent with a frame
-only when it changed; presses translated after the keymap, focus and
-snapshot, repeat delivered at the turn's clock under the repeat's wait
-and not after the window closed, a chord with a modifier, a bare
-modifier typing nothing, focus following enter and leave and a handler
-quitting on a press; clicks landing on the cell under the pointer in
-24.8 fixed point only while inside, and wheel frames in cells; every
-turn polling under the wait capped at the client's idle wait and floored
-at one millisecond, a closed window not polling, and a lost keyboard
-capability as focus loss once and only for a window that had focus; and
-the whole loop over a socket to a close request.
-
-`tests/window.rs` drives the widget window against the same scripted
-peer: the binding delivering the default surface, configure laying the
-surface out, keeping it through a zero axis, a refused extent and a
-repeated extent, and the close request; the frame presented from the
-handler's paint into a raster over the surface, clean until a redraw,
-the buffer reused once released, every buffer busy asking for no paint
-and leaving it dirty, and the title sent when it changed, ahead of the
-frame when one follows and alone when none can; presses arriving as the
-keymap's chords, plain and with modifiers, marked when the repeat clock
-made them and not after the window closed, a bare modifier nothing,
-focus following the keyboard and a handler quitting on a chord; the left
+`tests/window.rs` drives the widget window against a scripted peer: the
+binding delivering the default surface, configure laying the surface
+out, keeping it through a zero axis, a refused extent and a repeated
+extent, and the close request; the frame presented from the handler's
+paint into a raster over the surface, clean until a redraw, the buffer
+reused once released, every buffer busy asking for no paint and leaving
+it dirty, and the title sent when it changed, ahead of the frame when
+one follows and alone when none can; presses arriving as the keymap's
+chords, plain and with modifiers, marked when the repeat clock made them
+and not after the window closed, a bare modifier nothing, focus
+following the keyboard and a handler quitting on a chord; the left
 button's press at the pointer in surface pixels rounded down, motion
 while held a drag signed past the edge, a second press while held
 nothing, the release where the pointer is, motion without the button, a
@@ -1137,12 +1085,11 @@ extending the press; wheel frames in cells; the poll and wait each turn,
 the keyboard capability's loss as focus loss once; and the whole loop
 over a socket.
 
-`tests/confinement.rs` holds `screen.rs` in the pure set and
-`screen_app.rs` and `window.rs` among the adapters, adds `control.rs`
-and `driven.rs` to the pure set and the three adapters to the inventory,
-and carries td-editor's pins over the moved modules: the socket's open
-flags, path and identity constants, procfs reads, mode and identity
-checks, and the absence of `connect`, environment reads,
+`tests/confinement.rs` holds `window.rs` among the adapters, adds
+`control.rs` and `driven.rs` to the pure set and the three adapters to
+the inventory, and carries td-editor's pins over the moved modules: the
+socket's open flags, path and identity constants, procfs reads, mode and
+identity checks, and the absence of `connect`, environment reads,
 canonicalization, a fixed overflow number and the trusted-root variable;
 the worker's thread name, its slot, buffer and deadline constants, its
 bounded channels and nonblocking operations, `R::parse` as its sole
@@ -1158,112 +1105,21 @@ The builder discovers the crate by existing. Its gate runs `cargo test` and
 all-target Clippy; a change under `td-ui/` selects td-editor's tests through
 the reader graph, because td-editor's manifest names the crate.
 
-## Cell screen
-
-A program written for a terminal draws in rows and columns of styled
-characters. The cell screen keeps that shape so such a program moves to a
-Wayland window without re-laying its views out over pixels: `Screen` is
-a grid of `Cell`s, each a scalar and a `Style` (ink, background, weight),
-laid out over a `Surface` at its scale as `width / (CELL_WIDTH * scale)`
-columns by `height / (CELL_HEIGHT * scale)` rows, and no cells at all when
-either axis is under a cell, so a program never sees rows it cannot lay a
-column in; the surface's own frame ceiling bounds the grid. The remainder
-of the surface beyond the grid is painted in the ground, the background
-of the style the grid was last cleared to with `clear`; `clear_row`
-paints its cells and leaves the ground, so a status row does not
-recolour the surface around the grid.
-`put` and `write` clip at the right edge and replace a control scalar with
-U+FFFD, so every cell holds something the face can draw; `line` reads a
-row back with its trailing blanks trimmed; `hit` maps a surface pixel to
-the cell under it, none for the remainder.
-
-As a `Composition` the screen emits, inside the damage it is asked for,
-one fill of the ground over the whole surface, then per row one fill for
-each run of adjacent cells whose background is not the ground and one
-glyph for each cell that is not a blank, every draw clipped to the
-damage. A frame is therefore one fill plus a fill per highlighted run plus
-a glyph per visible character, never a fill per cell. The raster paints
-only a glyph's lit pixels, so the screen guarantees a fill under every
-glyph, the ground's or its run's; a stream that dropped the single-cell
-run fill would leave stale pixels in a reused buffer. The driven seam's
-`text` reads the grid back, which is how a screen program's tests and
-its agent driving see it, up to that seam's own trimming: it drops
-trailing whitespace of any kind and trailing blank rows, where `line`
-drops trailing spaces alone.
-
-The vocabulary a screen program reads is `Input`: a `Key` press with its
-`control`, `alt` and `shift` modifiers, a `Click` on a cell, `Wheel`
-travel in rows and columns, a `Resize` to the grid's rows and columns,
-`Focus` and `Close`. `press` translates the keyboard's chords
-(`keyboard.rs`: optional `C-`, `M-`, `S-` prefixes in that order, then one
-printable ASCII scalar, the bare space an unmodified space bar is spelled
-as, `Space` as it is spelled under a modifier, a named key or `F1`
-through `F12` in digits with none leading) into a `Press`, and refuses
-anything else, including a chord longer than the seam's `KEY_BYTES`; a
-refused chord types nothing, as a terminal drops a sequence it cannot
-name, and the window reports it through `notice`.
-
-`screen_app` is the window over the client for such a program. Its
-`Handler` names the toplevel, gives the ground style, reads each `Input`,
-is polled every turn with the loop's clock, says how long the loop may
-wait, says when the screen must be painted again, and paints it whole.
-The window owns the client, the screen, the pinned face and the pointer's
-position; the handler owns everything else, and stays the caller's
-whichever way the loop ends, so a program reads its own state, its
-restore failures and its exit code back after `run` returns. On `Bound`
-the window sets the title and app id, commits, and hands the handler the
-`Resize` of the grid it was laid out for, so a render is never the
-handler's first word of an extent; on `Configure` it lays the grid out
-for the extent (a zero axis keeps the current one; an extent the raster
-refuses keeps the last grid, is reported through `notice` and delivers
-nothing; the extent the grid already has, which compositors send for
-activation and tiling changes, keeps the cells and delivers nothing),
-hands the handler the new `Resize` and acknowledges; the close request
-reaches the handler as `Close` and closes the window, as does a
-`Flow::Quit` from any input or poll. The title is read again after every
-render and sent with the frame when it changed, so a handler retitles
-the window from its state. Presses are translated with `press` and
-armed for repeat, and an idle turn of a window still open delivers the
-repeat under the client's wait.
-A left button press while the pointer is inside is a `Click` on the cell
-under it; the wheel accumulates axis events per frame through
-`pointer::Wheel` and each non-empty frame is one `Wheel`. Keyboard focus
-is delivered as a change: `Focus(true)` on enter, `Focus(false)` on
-leave, on losing the keyboard capability or the seat while focused, and
-never for a keyboard the window did not have. The vocabulary is the two
-terminal programs': one button, no release, drag, double click or
-modifier on a click, and no clipboard; the client's selection events are
-not delivered. Each is a later increment, added to `Input` when a
-program needs it.
-
-Each turn ends with the handler's `poll`, and the wait until the next is
-the least of the client's own wait (at most `wayland::IDLE_WAIT`, shorter
-under an armed repeat) and what the handler asks, floored at one
-millisecond: a channel the handler reads from a fetch thread is never
-left longer than the idle wait, a handler with a timer due sooner names
-it, and one that asks for nothing is polled a thousand times a second.
-The screen is presented when the handler says it needs a redraw or the
-window's own state changed, once a frame can be presented; a frame
-refused by the client (every buffer busy) leaves the window dirty, and
-the handler paints again next turn, so `render` is a paint and not a
-frame and must be repeatable.
-
 ## Widget window
 
 A program that lays the toolkit's widgets out over its surface, td-news
 and td-mail with their lists and td-editor's document pane, has no grid
 to draw in: it paints compositions into a raster over the surface and
 reads its input in surface pixels. `window` is the window over the
-client for such a program, the cell screen's loop with the grid taken
-out. Its `Handler` names the toplevel and its title, reads each `Input`,
-is polled every turn with the loop's clock, says how long the loop may
-wait, says when the surface must be painted again, and paints it whole
-through `paint`, which receives a `Raster` over the frame's buffer and
-the `Surface` it is laid out for; a paint is not a frame and must be
-repeatable, as the screen window's render is. The window owns the
-client, the pinned face, the pointer's position and whether the left
-button is held; the handler owns everything else, and stays the
-caller's whichever way the loop ends.
+client for such a program. Its `Handler` names the toplevel and its
+title, reads each `Input`, is polled every turn with the loop's clock,
+says how long the loop may wait, says when the surface must be painted
+again, and paints it whole through `paint`, which receives a `Raster`
+over the frame's buffer and the `Surface` it is laid out for; a paint is
+not a frame and must be repeatable. The window owns the client, the
+pinned face, the pointer's position and whether the left button is held;
+the handler owns everything else, and stays the caller's whichever way
+the loop ends.
 
 The vocabulary is `Input`: `Key` with the chord as the keymap spells it
 (`a`, `C-x`, `S-Right`), so a handler translates it itself or hands it
@@ -1281,31 +1137,42 @@ held, so a handler without drags sees no motion stream; a second press
 while held, a release without a press and every other button are
 nothing.
 
-Binding, configure, the close request, focus, repeat, the poll and the
-wait are the screen window's, and `Flow::Quit` is but for what may
-follow it: on `Bound` the window sets the title and app id, commits, and
-hands the handler the default `Resize`; on `Configure` it lays the
-surface out for the extent (a zero axis keeps the current one; an extent
-the raster refuses keeps the last surface, is reported through `notice`
-and delivers nothing; the extent the surface has delivers nothing),
-cancels a held button, hands the handler the new `Resize` and
-acknowledges. A handler that answers `Flow::Quit` hears nothing more:
-the window is closed, and the inputs that would have followed, a resize
+The loop, turn by turn: on `Bound` the window sets the title and app id,
+commits, and hands the handler the default `Resize`; on `Configure` it
+lays the surface out for the extent (a zero axis keeps the current one;
+an extent the raster refuses keeps the last surface, is reported through
+`notice` and delivers nothing; the extent the surface has delivers
+nothing), cancels a held button, hands the handler the new `Resize` and
+acknowledges. The compositor's close request is `Close` to the handler
+and then the window closed, whatever the handler answers. Focus is
+delivered as a change only, so a keyboard that was never there is not a
+loss; the seat's removal and the keyboard capability's loss are one
+focus loss, and the seat's removal, or the pointer capability's loss,
+ends a held button without a release and drops the wheel's accumulation.
+A press whose key repeats arms the client's repeat clock, and a turn
+that drained the queue with no event parked delivers the repeat that is
+due as a `Key` marked `repeat`, at most one a turn. Every turn ends with
+`poll` at the loop's clock, milliseconds since the loop began, and the
+connection then waits for the lesser of the client's wait (a hundred
+milliseconds, or the armed repeat's remainder) and the handler's
+`wait_ms`, floored at one millisecond; a closed window neither repeats
+nor polls. A handler that answers `Flow::Quit` hears nothing more: the
+window is closed, and the inputs that would have followed, a resize
 after the cancel it quit on or the focus loss after a seat's removal,
-are not delivered, where the screen window still delivers them. The
-surface is presented when the handler says it needs a redraw or the
-window's own state changed, once a frame can be presented, into a raster
-over the pool file at the surface's own stride; the handler paints only
-into a buffer, so a frame refused by the client (every buffer busy) asks
-for no paint and leaves the window dirty until one is back. A paint that
-fails ends the loop with its error, as a program that cannot paint its
-surface has nothing to show; the refusals the loop absorbs are the
-extent's and the frame's. The title is read before every attempted
-present, which is when the window is dirty and a frame can be presented,
-and sent then when it changed, ahead of the frame's commit when a frame
-follows and alone when none can; a retitle made while painting rides the
-next attempt. The client's selection events are not delivered: the
-clipboard is a later increment, for the host that composes.
+are not delivered. The surface is presented when the handler says it
+needs a redraw or the window's own state changed, once a frame can be
+presented, into a raster over the pool file at the surface's own stride;
+the handler paints only into a buffer, so a frame refused by the client
+(every buffer busy) asks for no paint and leaves the window dirty until
+one is back. A paint that fails ends the loop with its error, as a
+program that cannot paint its surface has nothing to show; the refusals
+the loop absorbs are the extent's and the frame's. The title is read
+before every attempted present, which is when the window is dirty and a
+frame can be presented, and sent then when it changed, ahead of the
+frame's commit when a frame follows and alone when none can; a retitle
+made while painting rides the next attempt. The client's selection
+events are not delivered: the clipboard is a later increment, for the
+host that composes.
 
 ## Shared action button
 
@@ -1863,20 +1730,22 @@ regressions. Those increments extend the original sequence below.
     band (see "Shared action button"), the button's text centred in its
     height; td-photo's mode and filter strips are its first consumer.
     Landed.
-11. The cell screen under "Cell screen": `screen`, the styled grid as a
-    `Composition` with the key vocabulary and chord translation, and
-    `screen_app`, the window that presents it and polls a `Handler`,
-    proven with a recording handler against a scripted peer. Landed;
-    td-news and td-mail drew in it (APPLICATIONS.md §W.8, "Reworked"),
-    each landed in its own increment with its recipe, package and unit;
-    neither does now, and it is deleted with td-mail's composing
-    increment.
-12. The widget window under "Widget window": `window`, the screen
-    window's loop without the grid, whose handler paints into a raster
-    over the surface and reads chords, button phases and wheel travel in
-    surface pixels, proven with a recording handler against the scripted
-    peer. td-news has moved onto it with the toolkit's `List` and
-    td-editor's document pane (APPLICATIONS.md §W.8, "Reworked again"),
-    and td-mail likewise, reading a message in the pane; td-mail's
-    composing increment follows, and the cell screen and `screen_app`
-    are deleted with it.
+11. The cell screen: `screen`, a styled grid as a `Composition` with a
+    key vocabulary and chord translation, and `screen_app`, the window
+    that presented it and polled a `Handler`, proven with a recording
+    handler against a scripted peer. Landed; td-news and td-mail drew
+    in it (APPLICATIONS.md §W.8, "Reworked"), each landed in its own
+    increment with its recipe, package and unit; both moved off it in
+    increment 12 and it is deleted in increment 13.
+12. The widget window under "Widget window": `window`, the same loop
+    without the grid, whose handler paints into a raster over the
+    surface and reads chords, button phases and wheel travel in surface
+    pixels, proven with a recording handler against the scripted peer.
+    td-news has moved onto it with the toolkit's `List` and td-editor's
+    document pane (APPLICATIONS.md §W.8, "Reworked again"), and td-mail
+    likewise, reading a message in the pane; td-mail's composing
+    increment follows.
+13. The cell screen deleted: `screen`, `screen_app` and their two test
+    files are gone, with their public surface, their "Cell screen"
+    section and their oracles here; the widget window's section stands
+    on its own. Landed.

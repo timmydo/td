@@ -2610,7 +2610,7 @@ td-mail, td's JMAP mail client (APPLICATIONS.md §W.8), carried
 value-pinned requests (`TCGETS`, `TCSETS`, `TIOCGWINSZ`) and `poll(2)` on
 one descriptor, minus td-sh's `umask(2)` and its `rt_sigaction(2)`, the
 terminal's size asked for on each input tick rather than signalled. It now
-draws in a td-ui window (APPLICATIONS.md §W.8, td-ui's `screen_app`): the
+draws in a td-ui window (APPLICATIONS.md §W.8, td-ui's `window`): the
 terminal file is deleted, the crate root `#![forbid(unsafe_code)]`s, and
 its raw Linux boundary is td-ui's transport (§19), which it reaches as a
 sibling path dependency. The number is kept so the roster's entries stay
@@ -2622,7 +2622,7 @@ td-news, td's feed reader, carried `src/term_sys.rs` byte for byte as
 td-mail does, under the same crate-root deny and the same single
 function-level allowance, because the gate held every root crate to a
 one-package lock when td-news was imported. It now draws in a td-ui
-window (APPLICATIONS.md §W.8, td-ui's `screen_app`): the terminal file is
+window (APPLICATIONS.md §W.8, td-ui's `window`): the terminal file is
 deleted, the crate root `#![forbid(unsafe_code)]`s, and its raw Linux
 boundary is td-ui's transport (§19), which it reaches as a sibling path
 dependency. The number is kept so the roster's entries stay stable; the

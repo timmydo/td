@@ -38,7 +38,7 @@ pub fn recipe() -> Recipe {
         .and_then(|permissions| permissions.with_memory_high(128 * 1024 * 1024))
         .and_then(|permissions| permissions.with_memory_max(192 * 1024 * 1024))
         // Tasks, threads included: the client keeps a backend thread beside
-        // the screen's, and a cap hit aborts a program that td-svc will not
+        // the window's, and a cap hit aborts a program that td-svc will not
         // restart, so the fixture's 32 rather than a tighter number.
         .and_then(|permissions| permissions.with_pids_max(32))
         .and_then(|permissions| permissions.with_cpu_max(50_000, 100_000))
