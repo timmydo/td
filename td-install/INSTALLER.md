@@ -149,8 +149,8 @@ primary account. A failed lookup or nonzero removal status prevents the
 input test; an absent directory is still diagnosed by the later grant
 and download probes. The immutable `/home` alias to `var/home` makes the
 account's canonical HOME and the provisioner's persistent home agree.
-The SSH server's self-test Match configuration still needs the coordinated
-profile cutover.
+The SSH server's self-test Match configuration also uses the admitted primary
+account, as specified below.
 These diagnostics do not publish or activate a selected username.
 Updates must retain the installed identity and settings.
 
@@ -236,8 +236,28 @@ that private record to release the same bind before `/var`, after the
 application and portal views are released. Invalid home ownership or
 type stops boot and requires inspection from a trusted recovery
 environment; user changes to home permissions do not prevent boot.
-Account-choice persistence, publication and SSH self-test configuration
-still need the coordinated installed-profile cutover.
+Account-choice persistence and publication still need the coordinated
+installed-profile cutover.
+
+`td-firstboot render-primary-sshd ROOT` is a read-only early boot operation
+using the same complete root-owned account admission as home preparation.
+It prints the full fixed SSH server policy with one Match block for that
+primary account. The caller owns deployment verification and serializes
+account publication before rendering. No name or policy fragment comes
+from argv, the environment or mutable home content. It preserves the
+per-machine administrator authorization and the distinct volatile,
+loopback-restricted human self-test key; it activates no saved username.
+
+The deployment initramfs writes that output to fresh volatile
+`/run/td-sshd.conf` with a private creation mask and final mode 0600,
+before releasing procfs or starting users.
+Failure stops boot; an incomplete file is never used by a started daemon.
+The supervised server explicitly requires that path. There is no optional
+include and no immutable config with a stale human name. Only root can
+modify its file or parent. The complete policy formatter is shared with
+the source-built OpenSSH test, which checks effective authorization for
+a renamed human, the stock name and root. The generated policy contains
+no secrets and is recreated on every boot, including deployment updates.
 
 Keyboard and timezone choices must actually affect the installed session;
 only supported choices with available data may be offered.

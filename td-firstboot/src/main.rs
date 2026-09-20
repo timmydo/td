@@ -41,6 +41,7 @@ mod mounts;
 mod primary_home;
 mod principal_store;
 mod principals;
+mod ssh_policy;
 #[path = "../../td-secret/src/store.rs"]
 #[allow(dead_code, reason = "the console and portal share store entry points")]
 mod secret_store;
@@ -256,6 +257,7 @@ fn usage() -> String {
          td-firstboot check-principals ROOT validates staged deployment identities without writing\n  \
          td-firstboot check-primary-name ROOT NAME checks a proposed human name without writing\n  \
          td-firstboot stage-primary-name ROOT NAME OUT prepares new account tables without activating them\n  \
+         td-firstboot render-primary-sshd ROOT prints the validated primary-account server policy\n  \
          td-firstboot prepare-primary-home ROOT prepares the validated primary home before users start\n  \
          td-firstboot check-launch-session USER UID COMPOSITOR_UID verifies live reservations\n  \
          td-firstboot check-launch-application OWNER APP selects an enrolled active application UID\n"
@@ -271,6 +273,10 @@ fn run_with_primary(
     load: impl FnOnce() -> std::io::Result<principals::primary_account::PrimaryAccount>,
 ) -> Result<(), Failure> {
     let config = match parse(args)? {
+        Invocation::RenderPrimarySshd(root) => {
+            let primary = principals::primary_in_root(&root).map_err(Failure::Failed)?;
+            return emit(&ssh_policy::config(primary.name())).map_err(Failure::Failed);
+        }
         Invocation::PreparePrimaryHome(root) => {
             let home = primary_home::prepare(&root).map_err(Failure::Failed)?;
             return emit(&format!("{home}\n")).map_err(Failure::Failed);
@@ -416,12 +422,19 @@ enum Invocation {
     CheckPrimaryName(PathBuf, String),
     StagePrimaryName(PathBuf, String, PathBuf),
     PreparePrimaryHome(PathBuf),
+    RenderPrimarySshd(PathBuf),
     CheckLaunchSession(String, u32, u32),
     CheckLaunchApplication(u32, String),
     Provision(Config),
 }
 
 fn parse(args: &[String]) -> Result<Invocation, Failure> {
+    if args.first().is_some_and(|verb| verb == "render-primary-sshd") {
+        let [_, root] = args else {
+            return Err(Failure::Usage("render-primary-sshd requires ROOT".into()));
+        };
+        return Ok(Invocation::RenderPrimarySshd(PathBuf::from(root)));
+    }
     if args.first().is_some_and(|verb| verb == "prepare-primary-home") {
         let [_, root] = args else {
             return Err(Failure::Usage("prepare-primary-home requires ROOT".into()));
@@ -1583,6 +1596,7 @@ mod tests {
             | Invocation::CheckPrincipals(_)
             | Invocation::CheckPrimaryName(_, _)
             | Invocation::PreparePrimaryHome(_)
+            | Invocation::RenderPrimarySshd(_)
             | Invocation::StagePrimaryName(_, _, _)
             | Invocation::CheckLaunchApplication(..)
             | Invocation::CheckLaunchSession(..) => Err(Failure::Usage(
@@ -2079,6 +2093,19 @@ mod tests {
 mod principal_arguments {
     #![allow(clippy::unwrap_used, clippy::panic)]
     use super::*;
+
+    #[test]
+    fn server_policy_requires_only_the_verified_root() {
+        let args = ["render-primary-sshd", "/sysroot"].map(str::to_owned);
+        assert!(matches!(parse(&args), Ok(Invocation::RenderPrimarySshd(root))
+            if root == Path::new("/sysroot")));
+        for args in [vec!["render-primary-sshd"], vec!["render-primary-sshd", "/sysroot", "root"]] {
+            let args: Vec<String> = args.into_iter().map(str::to_owned).collect();
+            assert!(matches!(parse(&args), Err(Failure::Usage(_))));
+        }
+        let args = ["render-primary-sshd", "/td-missing-primary-sshd-root"].map(str::to_owned);
+        assert!(matches!(run(&args), Err(Failure::Failed(_))));
+    }
 
     #[test]
     fn primary_home_preparation_requires_only_the_staged_root() {

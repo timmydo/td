@@ -267,7 +267,7 @@ timeout=60
 
 [sshd]
 type=daemon
-exec=/bin/sshd -D -e -f /etc/ssh/sshd_config
+exec=/bin/sshd -D -e -f /run/td-sshd.conf
 after=netup,td-firstboot
 ready=/bin/td-netd reach 127.0.0.1 22
 ready-timeout=30

@@ -19,7 +19,7 @@ pub fn recipe() -> Recipe {
         format!("{openssh}/lib/debug/libexec/sshd-session.debug"),
         format!("{openssh}/lib/debug/libexec/sshd-auth.debug"),
     ];
-    let server_config = super::system_x86_64::build_sshd_config();
+    let server_config = super::system_x86_64::ssh_policy::config("alice");
 
     let mut steps = vec![
         Step::Require {
@@ -115,14 +115,22 @@ pub fn recipe() -> Recipe {
         Step::run(
             "{root}",
             &[
-                &format!("{openssh}/bin/sshd"),
-                "-h",
-                "{root}/keys/id_ed25519",
-                "-T",
-                "-f",
-                "{root}/sshd_config",
-                "-C",
-                "user=tester,host=localhost,addr=127.0.0.1",
+                POST_BOOTSTRAP_SH,
+                "-c",
+                &format!(
+                    "for user in alice tester root; do \
+                         policy=$('{openssh}/bin/sshd' -h '{{root}}/keys/id_ed25519' \
+                             -T -f '{{root}}/sshd_config' \
+                             -C \"user=$user,host=localhost,addr=127.0.0.1\") || exit 1; \
+                         case \"$user\" in alice) expected='{selftest}';; \
+                             *) expected='{admin}';; esac; \
+                         printf '%s\\n' \"$policy\" | grep -q -x -F \
+                             \"AuthorizedKeysFile $expected\" || \
+                             {{ printf '%s\\n' \"unexpected authorization for $user\" \"$policy\" >&2; exit 1; }}; \
+                     done",
+                    selftest = super::system_x86_64::ssh_policy::SSHD_SELFTEST_AUTHORIZED_KEYS,
+                    admin = super::system_x86_64::ssh_policy::SSHD_AUTHORIZED_KEYS,
+                ),
             ],
         )
         .env("PATH", &path),
@@ -132,7 +140,7 @@ pub fn recipe() -> Recipe {
     });
     steps.push(Step::WriteFile {
         path: "{out}/result".into(),
-        content: "PASS: OpenSSH Portable 10.5p1 provides the bounded ssh/sshd/ssh-keygen profile configured for seccomp_filter, with Ed25519, ML-KEM/SNTRUP/Curve25519 KEX, and ChaCha20-Poly1305; the built daemon parses the exact image configuration with an ephemeral test host key; every shipped ELF uses only td glibc and has a debug companion; libcrypto, libcrypt, zlib, and agent/PKCS#11/FIDO/SCP/SFTP-server binaries are absent\n".into(),
+        content: "PASS: OpenSSH Portable 10.5p1 provides the bounded ssh/sshd/ssh-keygen profile configured for seccomp_filter, with Ed25519, ML-KEM/SNTRUP/Curve25519 KEX, and ChaCha20-Poly1305; the built daemon checks the shared primary-account configuration with an ephemeral test host key and distinct human/administrator authorization paths; every shipped ELF uses only td glibc and has a debug companion; libcrypto, libcrypt, zlib, and agent/PKCS#11/FIDO/SCP/SFTP-server binaries are absent\n".into(),
         exec: false,
     });
     steps.push(Step::Require {

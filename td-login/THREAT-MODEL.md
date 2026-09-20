@@ -48,12 +48,21 @@ Explicitly **not** in the model: an attacker who already has uid 0
 OpenSSH is a separate, deliberately narrow credential-changing boundary.
 The externally maintained `sshd` starts as root, switches its pre-auth process
 to the locked `sshd` privilege-separation identity, and switches authenticated
-sessions to their target account without going through td-login. Its immutable
-configuration permits only Ed25519 public-key authentication and disables
+sessions to their target account without going through td-login. Its fixed
+configuration policy permits only Ed25519 public-key authentication and disables
 password, interactive, host-based, and forwarding paths. This document does
 not extend td-login's syscall or post-condition claims to OpenSSH; the image
 recipe instead pins its source, configuration, locked account, empty volatile
 chroot, split helpers, seccomp sandbox, and a real unprivileged loopback login.
+Before entering the authenticated deployment, firstboot validates its complete
+root-owned account tables and renders the server policy into root-owned
+mode-0600 `/run/td-sshd.conf`. Only the admitted UID/GID-1000 account name
+selects its self-test Match block. The policy's remaining bytes are compiled
+from the shared source used by the realized OpenSSH recipe test. The daemon
+requires this configuration file explicitly; there is no optional include or
+fallback configuration. Generation failure stops boot before user processes,
+and the caller serializes publication against all account readers. This
+changes no credential transition or authentication method.
 The boot-health login uses a fresh volatile key for the unprivileged UI account,
 but its root-owned authorization line is constrained by OpenSSH `restrict` and
 `from="127.0.0.1"`; possession of that key cannot create a network-reachable

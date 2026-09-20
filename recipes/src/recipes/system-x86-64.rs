@@ -1,3 +1,13 @@
+#[path = "../../../td-firstboot/src/ssh_policy.rs"]
+pub(super) mod ssh_policy;
+use ssh_policy::{
+    OPENSSH_CIPHERS, OPENSSH_KEX_ALGORITHMS, OPENSSH_KEY_ALGORITHMS,
+    SSHD_HOST_KEY, SSHD_SELFTEST_AUTHORIZED_KEYS,
+};
+
+#[cfg(test)]
+use ssh_policy::SSHD_AUTHORIZED_KEYS;
+
 use crate::ladder::{
     entry_program, post_bootstrap_path, AUTOTEST_CMDLINE_TOKEN,
     BOOT_FAIL_TARGET_CMDLINE_TOKEN,
@@ -1921,7 +1931,7 @@ fn build_td_svc_conf() -> String {
          # per-machine Ed25519 host key, so a missing identity is fail-closed.\n\
          [sshd]\n\
          type=daemon\n\
-         exec=/bin/sshd -D -e -f /etc/ssh/sshd_config\n\
+         exec=/bin/sshd -D -e -f {SSHD_CONFIG}\n\
          after={sysinit}\n\
          ready=/bin/td-netd reach 127.0.0.1 22\n\
          restart=always\n\
@@ -2122,6 +2132,7 @@ fn build_deployment_init(sys: &SystemDef) -> String {
         "\n/bin/td-util chown 0:0 /sysroot/var /sysroot/var/home\n\
          /bin/td-util chmod 0755 /sysroot/var /sysroot/var/home\n\
          primary_home=$(/bin/td-firstboot prepare-primary-home /sysroot) || exit 1\n\
+         /bin/sh -c 'umask 077; /bin/td-firstboot render-primary-sshd /sysroot > /sysroot{SSHD_CONFIG} && /bin/td-util chmod 0600 /sysroot{SSHD_CONFIG}' || exit 1\n\
          /bin/umount /proc\n\
          downloads=\"$primary_home/Downloads\"\n\
          if /bin/td-util readlink \"/sysroot$downloads\" >/dev/null 2>&1; then\n\
@@ -3578,20 +3589,10 @@ const MUTABLE_ETC: &[MutableEtc] = &[
     },
 ];
 
-/// The two `/etc` paths the sshd service line names. Both are `MUTABLE_ETC`
-/// entries — `the_sshd_service_reads_only_mutable_etc_paths` proves it — so the
-/// daemon presents a per-machine host identity and authorizes from per-machine
-/// state.
-const SSHD_HOST_KEY: &str = "/etc/ssh/ssh_host_ed25519_key";
-const SSHD_AUTHORIZED_KEYS: &str = "/etc/ssh/authorized_keys";
+// Required early-boot output; sshd never falls back to an optional config.
+const SSHD_CONFIG: &str = "/run/td-sshd.conf";
 const SSHD_AUTHORIZED_KEYS_STATE: &str = "/var/lib/td/ssh/authorized_keys";
-const SSHD_SELFTEST_USER: &str = UI_USER;
-const SSHD_SELFTEST_AUTHORIZED_KEYS: &str = "/run/td-ssh-selftest-authorized_keys";
 const QEMU_OPENSSH_ADMIN_PRIVATE_KEY: &str = "/var/lib/td-test/openssh-admin-selftest";
-const OPENSSH_KEX_ALGORITHMS: &str =
-    "mlkem768x25519-sha256,sntrup761x25519-sha512,curve25519-sha256";
-const OPENSSH_KEY_ALGORITHMS: &str = "ssh-ed25519";
-const OPENSSH_CIPHERS: &str = "chacha20-poly1305@openssh.com";
 
 fn build_ssh_config() -> String {
     format!(
@@ -3607,40 +3608,6 @@ fn build_ssh_config() -> String {
     )
 }
 
-pub(super) fn build_sshd_config() -> String {
-    format!(
-        "Port 22\n\
-         ListenAddress 0.0.0.0\n\
-         HostKey {SSHD_HOST_KEY}\n\
-         AuthorizedKeysFile {SSHD_AUTHORIZED_KEYS}\n\
-         AuthenticationMethods publickey\n\
-         PubkeyAuthentication yes\n\
-         PasswordAuthentication no\n\
-         KbdInteractiveAuthentication no\n\
-         ChallengeResponseAuthentication no\n\
-         HostbasedAuthentication no\n\
-         PermitEmptyPasswords no\n\
-         PermitRootLogin prohibit-password\n\
-         StrictModes yes\n\
-         KexAlgorithms {OPENSSH_KEX_ALGORITHMS}\n\
-         HostKeyAlgorithms {OPENSSH_KEY_ALGORITHMS}\n\
-         PubkeyAcceptedAlgorithms {OPENSSH_KEY_ALGORITHMS}\n\
-         Ciphers {OPENSSH_CIPHERS}\n\
-         Compression no\n\
-         DisableForwarding yes\n\
-         PermitTTY yes\n\
-         PermitUserEnvironment no\n\
-         PermitUserRC no\n\
-         UseDNS no\n\
-         PrintMotd no\n\
-         LoginGraceTime 30\n\
-         MaxAuthTries 3\n\
-         MaxSessions 4\n\
-         PidFile /run/sshd.pid\n\
-         Match User {SSHD_SELFTEST_USER}\n\
-         \tAuthorizedKeysFile {SSHD_SELFTEST_AUTHORIZED_KEYS}\n"
-    )
-}
 
 /// Every parent directory needed by either `/etc` table, including intermediate
 /// parents. The same list drives staging and the fail-closed directory and symlink
@@ -3965,7 +3932,6 @@ fn etc_files(sys: &SystemDef) -> Result<Vec<(&'static str, String, bool)>, Strin
             false,
         ),
         ("ssh/ssh_config", build_ssh_config(), false),
-        ("ssh/sshd_config", build_sshd_config(), false),
         ("mutable-state", build_mutable_state(), false),
         (
             application_etc_name(APPLICATION_CONFIG),
@@ -5807,7 +5773,7 @@ news\tnews-0.1\tsource\tstatic-runtime-1\tsource\n"
             "/bin/td-term run",
             "/etc/bootsuccess",
             "/etc/bootfail",
-            "/bin/sshd -D -e -f /etc/ssh/sshd_config",
+            "/bin/sshd -D -e -f /run/td-sshd.conf",
             "/etc/tty-session",
         ] {
             assert!(
@@ -9824,7 +9790,7 @@ news\tnews-0.1\tsource\tstatic-runtime-1\tsource\n"
     }
 
     /// The sshd service must read its identity and its authorization from per-machine
-    /// state, not from image content. Both paths its immutable config names have to be
+    /// state, not from image content. Both paths its generated config names have to be
     /// table entries —
     /// otherwise a rebuild is the only way to rotate a host key or grant access, and
     /// every machine booting the image shares both.
@@ -9841,10 +9807,10 @@ news\tnews-0.1\tsource\tstatic-runtime-1\tsource\n"
             );
         }
         assert_eq!(
-            exec, "/bin/sshd -D -e -f /etc/ssh/sshd_config",
+            exec, "/bin/sshd -D -e -f /run/td-sshd.conf",
             "the service must run the foreground OpenSSH daemon against the reviewed config"
         );
-        let config = build_sshd_config();
+        let config = ssh_policy::config("alice");
         for required in [
             format!("HostKey {SSHD_HOST_KEY}"),
             format!("AuthorizedKeysFile {SSHD_AUTHORIZED_KEYS}"),
@@ -9870,10 +9836,29 @@ news\tnews-0.1\tsource\tstatic-runtime-1\tsource\n"
         );
         assert!(
             config.contains(&format!(
-                "Match User {SSHD_SELFTEST_USER}\n\
+                "Match User alice\n\
                  \tAuthorizedKeysFile {SSHD_SELFTEST_AUTHORIZED_KEYS}\n"
             )),
-            "the volatile boot key must authorize only the unprivileged tester account"
+            "the volatile boot key must authorize only the admitted primary account"
+        );
+    }
+
+    #[test]
+    fn primary_server_policy_is_required_before_entering_the_deployment() {
+        assert!(!etc_files(&SYSTEM).expect("generated etc").iter()
+            .any(|(path, _, _)| *path == "ssh/sshd_config"));
+        let init = build_deployment_init(&SYSTEM);
+        let render = format!(
+            "/bin/sh -c 'umask 077; \
+             /bin/td-firstboot render-primary-sshd /sysroot > /sysroot{SSHD_CONFIG} && \
+             /bin/td-util chmod 0600 /sysroot{SSHD_CONFIG}' || exit 1"
+        );
+        let at = init.find(&render).expect("required account-derived server policy");
+        assert!(at < init.find("/bin/umount /proc").expect("proc cleanup"));
+        assert!(init.contains(&format!("/bin/td-util chmod 0600 /sysroot{SSHD_CONFIG}")));
+        assert_eq!(
+            unit_key("sshd", "exec"),
+            Some(format!("/bin/sshd -D -e -f {SSHD_CONFIG}"))
         );
     }
 
