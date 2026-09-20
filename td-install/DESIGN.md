@@ -550,6 +550,28 @@ and unchanged first 64 KiB after each attempt before continuing with
 partition refresh and normal publication. This bounds the preservation
 check to the protective MBR and primary GPT metadata, not the entire disk.
 
+### Prepared volume image admission
+
+The volume formatter retains its exclusively created scratch-image inode
+while the source-built mkfs child runs. That formatter must write in place
+and leave the pre-sized regular file at exactly the planned length; the
+source-built td-install-test recipe exercises this contract. After that
+child succeeds, the installer opens that same path through the existing
+real-regular-file reader and requires
+both the original device/inode pair and the exact planned volume length.
+The original descriptor stays open through this comparison, preventing inode
+reuse from making a replacement look unchanged. The admitted read descriptor
+then supplies every sparse-copy pass; its pathname is not reopened.
+
+Missing, symlinked, non-regular, replaced, shortened or grown output refuses
+before clearing either destination edge or copying a filesystem byte. This
+protects the volume command's destination at that boundary; it cannot undo a
+preceding layout command. Staging changes remain in the caller's scratch.
+Admission checks the output file's identity and extent, not Btrfs semantic
+validity. The declared mkfs and caller-controlled scratch remain trusted,
+and the caller must prevent concurrent source mutation during copying. No
+claim transfer, filesystem snapshot or destructive authorization is added.
+
 ### Refreshing partitions after formatting
 
 `td-init reread-partitions DEVICE` is the explicit kernel refresh between

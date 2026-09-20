@@ -1804,10 +1804,10 @@ fn format_volume(
     // or a hard link is the same file under a different path, and `metadata`
     // follows the one while a string comparison sees neither.
     {
-        use std::os::linux::fs::MetadataExt;
+        use std::os::unix::fs::MetadataExt;
         if let Some(existing) = paths::metadata_if_present(&image_path) {
             let target = file.metadata()?;
-            if (existing.st_dev(), existing.st_ino()) == (target.st_dev(), target.st_ino()) {
+            if (existing.dev(), existing.ino()) == (target.dev(), target.ino()) {
                 return Err(invalid(format!(
                     "the scratch image {} is the destination itself",
                     image_path.display()
@@ -1823,15 +1823,16 @@ fn format_volume(
     // usually root. Removing the ENTRY affects only the link, and `create_new`
     // then refuses anything that appeared in between rather than opening it.
     paths::remove_file_if_present(&image_path)?;
-    let image = paths::create_new(&image_path)?;
-    image.set_len(len)?;
-    let got = image.metadata()?.len();
+    // Retain the original inode through mkfs so replacement cannot reuse it.
+    let staged_image = paths::create_new(&image_path)?;
+    staged_image.set_len(len)?;
+    let created = staged_image.metadata()?;
+    let got = created.len();
     if got != len {
         return Err(invalid(format!(
             "the scratch image is {got} bytes, not the {len} the volume needs"
         )));
     }
-    drop(image);
 
     let uuid = match uuid {
         Some(uuid) => uuid.0.clone(),
@@ -1874,13 +1875,29 @@ fn format_volume(
         )));
     }
 
+    let (mut image, prepared) = realfile::open_real_file(&image_path, "prepared Btrfs image")?;
+    {
+        use std::os::unix::fs::MetadataExt;
+        if created.dev() != prepared.dev() || created.ino() != prepared.ino() {
+            return Err(invalid(format!(
+                "prepared Btrfs image was replaced: {}", image_path.display()
+            )));
+        }
+    }
+    if prepared.len() != len {
+        return Err(invalid(format!(
+            "prepared Btrfs image {} is {} bytes, not the required {len}",
+            image_path.display(), prepared.len()
+        )));
+    }
+    drop(staged_image);
+
     zero_edges(file, offset, len)?;
     // Durable BEFORE the copy starts, or the ordering below buys nothing: a
     // power loss could otherwise persist new filesystem blocks while the zero
     // over the old superblock is still only in page cache, which is exactly the
     // mixed, apparently-valid volume the deferral exists to prevent.
     file.sync_all()?;
-    let mut image = paths::open_read(&image_path)?;
     // The copy is ORDERED, for `run_layout`'s reason one level down: the
     // superblock is this filesystem's commit point, as the primary table is the
     // disk's, and it is only true once everything it points at is durable.
@@ -5654,6 +5671,109 @@ mod tests {
         zero_edges(&mut file, MIB, MIB).unwrap();
         assert_eq!(dest.read_at(MIB, 4), [0; 4]);
         assert_eq!(dest.read_at(2 * MIB - 4, 4), [0; 4], "to its very end");
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum PreparedImageFault {
+        Missing,
+        Truncated,
+        Grown,
+        Replaced,
+        Aliased,
+    }
+
+    /// Observe the parent's held inode from the child, then force admission
+    /// failures where a late refusal would erase the destination's canaries.
+    fn refused_prepared_image_preserves_destination(fault: PreparedImageFault) {
+        let disk = Scratch::disk(DISK);
+        run_layout(&disk.path, &mut Vec::new()).unwrap();
+        let plan = plan(512, DISK).unwrap();
+        let offset = plan.volume_start * 512;
+        let len = (plan.volume_end - plan.volume_start + 1) * 512;
+        let ranges = [
+            (0, 64 * 1024),
+            (offset, MIB),
+            (offset + len / 2, 4096),
+            (offset + len - MIB, MIB),
+            (DISK - 64 * 1024, 64 * 1024),
+        ];
+        let mut file = OpenOptions::new().write(true).open(&disk.path).unwrap();
+        for (at, count) in ranges.iter().skip(1).take(3) {
+            write_at(&mut file, *at, &vec![0xa5; *count as usize]).unwrap();
+        }
+        drop(file);
+        let snapshot = || ranges.iter()
+            .map(|(at, count)| disk.read_at(*at, *count as usize))
+            .collect::<Vec<_>>();
+        let before = snapshot();
+        let (action, expected_kind, reason) = match fault {
+            PreparedImageFault::Missing => (
+                "rm -- \"$image\"", io::ErrorKind::NotFound, "prepared Btrfs image"),
+            PreparedImageFault::Truncated => (
+                ": > \"$image\"", io::ErrorKind::InvalidData, "bytes, not the required"),
+            PreparedImageFault::Grown => (
+                "printf x >> \"$image\"", io::ErrorKind::InvalidData, "bytes, not the required"),
+            PreparedImageFault::Replaced => (
+                "mv -- \"$image.replacement\" \"$image\"", io::ErrorKind::InvalidData,
+                "prepared Btrfs image was replaced"),
+            PreparedImageFault::Aliased => (
+                "mv -- \"$image.replacement\" \"$image\"", io::ErrorKind::InvalidData,
+                "prepared Btrfs image must be a real regular file"),
+        };
+        let observe_retention = concat!(
+            "#!/bin/sh\nset -eu\nfor image in \"$@\"; do :; done\n",
+            "held=no\nfor fd in /proc/\"$PPID\"/fd/*; do\n",
+            "  if [ \"$fd\" -ef \"$image\" ]; then held=yes; break; fi\n",
+            "done\n[ \"$held\" = yes ] || exit 9\n",
+        );
+        let dir = fake_mkfs(&format!(
+            "{observe_retention}{action}\nprintf done > \"$image.done\"\n"
+        ));
+        let alternate = dir.join("td-volume.img.replacement");
+        match fault {
+            PreparedImageFault::Replaced => File::create(&alternate).unwrap().set_len(len).unwrap(),
+            PreparedImageFault::Aliased => std::os::unix::fs::symlink(&disk.path, &alternate).unwrap(),
+            _ => {},
+        }
+        let mut output = Vec::new();
+        let result = run_volume(VolumeSettings::default(), None, &disk.path,
+            &dir.join("mkfs.btrfs"), &dir, None, &mut output);
+        let completed = dir.join("td-volume.img.done").is_file();
+        let after = snapshot();
+        let disk_len = std::fs::metadata(&disk.path).unwrap().len();
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(completed, "formatter did not observe the held inode and complete its mutation");
+        let error = result.expect_err("invalid prepared image was accepted");
+        assert_eq!(error.kind(), expected_kind, "wrong refusal for {fault:?}: {error}");
+        assert!(error.to_string().contains(reason), "wrong refusal for {fault:?}: {error}");
+        assert!(output.is_empty(), "a refused volume reported success");
+        assert!(before == after, "prepared-image refusal changed destination bytes");
+        assert_eq!(disk_len, DISK);
+    }
+
+    #[test]
+    fn missing_prepared_image_preserves_destination() {
+        refused_prepared_image_preserves_destination(PreparedImageFault::Missing);
+    }
+
+    #[test]
+    fn truncated_prepared_image_preserves_destination() {
+        refused_prepared_image_preserves_destination(PreparedImageFault::Truncated);
+    }
+
+    #[test]
+    fn grown_prepared_image_preserves_destination() {
+        refused_prepared_image_preserves_destination(PreparedImageFault::Grown);
+    }
+
+    #[test]
+    fn replaced_prepared_image_preserves_destination() {
+        refused_prepared_image_preserves_destination(PreparedImageFault::Replaced);
+    }
+
+    #[test]
+    fn aliased_prepared_image_preserves_destination() {
+        refused_prepared_image_preserves_destination(PreparedImageFault::Aliased);
     }
 
     /// A `mkfs` that FAILS fails the install, rather than leaving a partition
