@@ -138,9 +138,14 @@ primary account and retain the persistent mount and ownership checks.
 The boot state-ownership and SSH host-key permission checks run as the
 validated primary account; home writes and cleanup use its runtime HOME
 with dropped credentials. Their root pre/post cleanup clears only the
-fixed system-state probe paths. Home creation and remaining diagnostic
-shell commands still need the coordinated cutover; these selectors alone
-do not activate a saved username.
+fixed system-state probe paths.
+Boot health resolves the primary name once through the checked launcher
+and passes it as a quoted argument to its existing `su` and `exec-as`
+probes. The network self-test does the same. SSH and Git clients use the
+credential-selected USER value, including when a probe substitutes a
+temporary HOME. The SSH server's self-test Match configuration and early
+home/Downloads preparation still need the coordinated profile cutover.
+These diagnostics do not publish or activate a selected username.
 Updates must retain the installed identity and settings.
 
 `td-firstboot check-primary-name ROOT NAME` is a read-only preflight for a

@@ -2549,9 +2549,9 @@ fn td_login_probe(sys: &SystemDef) -> String {
 /// real image: the parser, the shared `authorize` policy, the credential switch, and the
 /// `exec`. It does that by pointing `exec-as` at the READBACK — `exec-as USER --
 /// td-login verify-credentials …` — so the process that reports whether the switch took
-/// is the process `exec-as` itself started. Without this leg `exec-as` ships entirely
-/// unexecuted: nothing else on the image invokes it, and `parse` plus `session_for` are
-/// the only parts a unit test can reach.
+/// is the process `exec-as` itself started. The root caller first sets health_user
+/// through the checked account launcher; this leg retains direct coverage of the
+/// literal exec-as CLI as well as the credential implementation used by selectors.
 ///
 /// Single quotes are fine here, unlike every probe inside the greeter's `su -c '…'`:
 /// this one is a root-level command in the generated script rather than an argument to
@@ -2567,11 +2567,10 @@ fn td_login_exec_as_probe(sys: &SystemDef) -> String {
         .map(|gid| gid.to_string())
         .collect();
     format!(
-        "{{ /bin/td-login exec-as {name} -- /bin/td-login verify-credentials \
+        "{{ /bin/td-login exec-as \"$health_user\" -- /bin/td-login verify-credentials \
          --uid {uid} --gid {gid} --groups \"{groups}\" || \
-         {{ echo \"td-login: exec-as {name} did not produce uid {uid} gid {gid} \
+         {{ echo \"td-login: exec-as $health_user did not produce uid {uid} gid {gid} \
          groups [{groups}]\"; false; }}; }}",
-        name = user.name,
         uid = user.uid,
         gid = user.gid,
         groups = groups.join(",")
@@ -2911,6 +2910,13 @@ fn build_bootsuccess(sys: &SystemDef) -> String {
     for (applet, probe) in TD_INIT_FARM {
         td_init_probes.push_str(&td_init_probe(applet, probe));
     }
+    let health_user_setup = match sys.users.iter().find(|user| user.name == sys.autologin) {
+        Some(user) => format!(
+            "health_user=$({} /bin/printenv USER) || fail",
+            account_probe_launcher(user)
+        ),
+        None => "echo \"td-boot: no autologin account for health probes\"; fail".into(),
+    };
     let td_login_probe = td_login_probe(sys);
     let td_login_exec_as_probe = td_login_exec_as_probe(sys);
     let td_txt_probes = build_td_txt_probes();
@@ -2923,7 +2929,7 @@ fn build_bootsuccess(sys: &SystemDef) -> String {
     let channel = td_boot_protocol::VOLUME_CHANNEL_DIR;
     let idle_channel = crate::ladder::DEPLOY_IDLE_CHANNEL;
     let update = td_boot_protocol::UPDATE_VERB;
-    // The tester may read its private self-test key but must not own the public
+    // The human may read its private self-test key but must not own the public
     // AuthorizedKeysFile that grants it access. Under the QEMU autotest token, a
     // separately preseeded root-only fixture exercises the persistent default
     // authorization path without changing it during the boot.
@@ -2935,6 +2941,7 @@ fn build_bootsuccess(sys: &SystemDef) -> String {
          fail() {{ finish td-boot-failure-v1; exit 1; }}\n\
          /bin/grep -q -F '{BOOT_FAIL_TARGET_CMDLINE_TOKEN}' /proc/cmdline && exit 0\n\
          /bin/td-util test \"$(/bin/td-util cat /run/td-rootcheck-ok 2>/dev/null)\" = td-rootcheck-v1 || fail\n\
+         {health_user_setup}\n\
          deployment=$(/bin/td-util cat /run/td-deployment 2>/dev/null)\n\
          /bin/td-util test -n \"$deployment\" || fail\n\
          wait={BOOT_SUCCESS_RETRY_SECS}; admin_fixture=0\n\
@@ -2982,16 +2989,16 @@ fn build_bootsuccess(sys: &SystemDef) -> String {
          [ \"$bg\" -ge \"$wait\" ] && bg=$((wait-1))\n\
          mu=0; mrf=0; mg=0; mc=0; ms=0; mtu=0; mti=0; mtl=0; mtt=0; mtb=0; btb=0\n\
          msk=0; mtj=0; mtk=0; mts=1\n\
-         if /bin/su -s /bin/sh {} -c \
+         if /bin/su -s /bin/sh \"$health_user\" -c \
          '{sandbox_kernel_probes}[ \"$k\" = 1 ]'; then \
          echo {TD_SANDBOX_KERNEL_MARKER}; msk=1; fi\n\
-         if /bin/su -s /bin/sh {} -c \
+         if /bin/su -s /bin/sh \"$health_user\" -c \
          'j=$(TD_JAIL_TEST_LEAK_FD=1 /bin/td-jail --probe-transition 2>&1) || \
          {{ echo \"td-jail: target transition probe failed: $j\"; exit 1; }}; \
          [ \"$j\" = \"{TD_JAIL_TRANSITION_MARKER} pid=1\" ] || \
          {{ echo \"td-jail: target transition returned unexpected output: $j\"; \
          exit 1; }}'; then echo {TD_JAIL_TRANSITION_MARKER}; mtj=1; fi\n\
-         if /bin/su -s /bin/sh {} -c \
+         if /bin/su -s /bin/sh \"$health_user\" -c \
          'k=$(/bin/td-jail --probe-kill-reaps 2>&1) || \
          {{ echo \"td-jail: kill-reaps probe failed: $k\"; exit 1; }}; \
          /bin/td-util printf \"%s\\n\" \"$k\" | \
@@ -3026,7 +3033,7 @@ fn build_bootsuccess(sys: &SystemDef) -> String {
          && /bin/chmod 0555 /run/td-jail-seccomp-probe \
          /run/td-jail-seccomp-probe/probe \
          && /bin/chmod 0444 /run/td-jail-seccomp-probe/filter.bpf; then \
-         if /bin/su -s /bin/sh {} -c \
+         if /bin/su -s /bin/sh \"$health_user\" -c \
          '[ -x /run/td-jail-seccomp-probe/probe ] \
          && [ ! -w /run/td-jail-seccomp-probe/probe ] \
          && [ -r /run/td-jail-seccomp-probe/filter.bpf ] \
@@ -3042,7 +3049,7 @@ fn build_bootsuccess(sys: &SystemDef) -> String {
          else echo \"td-jail: could not prepare immutable target seccomp inputs\"; fi; fi\n\
          while [ \"$n\" -lt \"$wait\" ]; do \
          healthy=1; \
-         if /bin/su -s /bin/sh {} -c \
+         if /bin/su -s /bin/sh \"$health_user\" -c \
          'u=1; h=0; /bin/cat /etc/os-release >/dev/null 2>&1 || \
          {{ echo \"uutils: /bin/cat failed\"; u=0; }}; \
          /bin/rm -rf /tmp/td-uutils-probe; \
@@ -3052,7 +3059,7 @@ fn build_bootsuccess(sys: &SystemDef) -> String {
          {{ echo \"uutils: /bin/rm could not remove probe directory\"; u=0; }}; \
          [ \"$u\" = 1 ]'; then \
          [ \"$mu\" = 1 ] || {{ echo {UUTILS_RUNTIME_MARKER}; mu=1; }}; else healthy=0; fi; \
-         if /bin/su -s /bin/sh {} -c \
+         if /bin/su -s /bin/sh \"$health_user\" -c \
          'n=$(/bin/hostname) && [ -n \"$n\" ] || exit 1; \
          r=$(/bin/rg --color never --no-filename --fixed-strings --line-regexp -- \
          \"$n\" /etc/hostname) || \
@@ -3063,7 +3070,7 @@ fn build_bootsuccess(sys: &SystemDef) -> String {
          {{ echo \"fd: /bin/fd failed\"; exit 1; }}; \
          [ \"$f\" = /etc/hostname ] || {{ echo \"fd: unexpected hostname path: $f\"; exit 1; }}'; then \
          [ \"$mrf\" = 1 ] || {{ echo {RIPGREP_FD_RUNTIME_MARKER}; mrf=1; }}; else healthy=0; fi; \
-         if /bin/su -s /bin/sh {git_user} -c \
+         if /bin/su -s /bin/sh \"$health_user\" -c \
          'HOME=/tmp/td-git-probe/home; export HOME; \
          XDG_CONFIG_HOME=/tmp/td-git-probe/xdg; export XDG_CONFIG_HOME; \
          GIT_CONFIG_GLOBAL=/dev/null; export GIT_CONFIG_GLOBAL; \
@@ -3084,7 +3091,7 @@ fn build_bootsuccess(sys: &SystemDef) -> String {
          {{ echo \"git: could not enter the health-probe directory\"; exit 1; }}; \
          /bin/git init --bare -b main origin >/dev/null 2>&1 || \
          {{ echo \"git: bare init failed\"; exit 1; }}; \
-         remote=ssh://{git_user}@127.0.0.1/tmp/td-git-probe/origin; \
+         remote=\"ssh://$USER@127.0.0.1/tmp/td-git-probe/origin\"; \
          /bin/git clone \"$remote\" work >/dev/null 2>&1 || \
          {{ echo \"git: SSH upload-pack clone failed\"; exit 1; }}; \
          /bin/git -C work config user.name td-boot || \
@@ -3114,7 +3121,7 @@ fn build_bootsuccess(sys: &SystemDef) -> String {
          /etc/ssl/certs/ca-certificates.crt || \
          {{ echo \"git: the installed CA bundle has no PEM certificate\"; exit 1; }}'; then \
          [ \"$mg\" = 1 ] || {{ echo {GIT_RUNTIME_MARKER}; mg=1; }}; else healthy=0; fi; \
-         if /bin/su -s /bin/sh {probe_user} -c \
+         if /bin/su -s /bin/sh \"$health_user\" -c \
          'c=$(/bin/codex --version 2>&1) || \
          {{ echo \"codex: /bin/codex --version failed: $c\"; exit 1; }}; \
          [ \"$c\" = \"{codex_version}\" ] || \
@@ -3156,7 +3163,7 @@ fn build_bootsuccess(sys: &SystemDef) -> String {
          /bin/rm -rf {codex_probe_root} || \
          {{ echo \"codex: could not clean the sandbox probe\"; exit 1; }}'; then \
          [ \"$mc\" = 1 ] || {{ echo {CODEX_RUNTIME_MARKER}; mc=1; }}; else healthy=0; fi; \
-         if /bin/su -s /bin/sh {} -c \
+         if /bin/su -s /bin/sh \"$health_user\" -c \
          'o=$(/bin/ssh -F /dev/null -i /run/td-ssh-selftest \
          -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes \
          -o UserKnownHostsFile=/run/td-ssh-known-hosts \
@@ -3165,28 +3172,28 @@ fn build_bootsuccess(sys: &SystemDef) -> String {
          -o HostKeyAlgorithms={OPENSSH_KEY_ALGORITHMS} \
          -o PubkeyAcceptedAlgorithms={OPENSSH_KEY_ALGORITHMS} \
          -o Ciphers={OPENSSH_CIPHERS} -o Compression=no \
-         {git_user}@127.0.0.1 /bin/echo TD-OPENSSH-ROUNDTRIP 2>&1) || \
+         \"$USER@127.0.0.1\" /bin/echo TD-OPENSSH-ROUNDTRIP 2>&1) || \
          {{ echo \"OpenSSH: loopback command failed: $o\"; exit 1; }}; \
          [ \"$o\" = TD-OPENSSH-ROUNDTRIP ] || \
          {{ echo \"OpenSSH: unexpected loopback output: $o\"; exit 1; }}'; then \
          [ \"$ms\" = 1 ] || {{ echo {SSHD_MARKER}; ms=1; }}; else healthy=0; fi; \
-         if /bin/su -s /bin/sh {} -c \
+         if /bin/su -s /bin/sh \"$health_user\" -c \
          'u=1; /bin/td-util --list >/dev/null 2>&1 || \
          {{ echo \"td-util: --list failed\"; u=0; }}; \
          {td_util_probes}[ \"$u\" = 1 ]'; then \
          [ \"$mtu\" = 1 ] || {{ echo {TD_UTIL_RUNTIME_MARKER}; mtu=1; }}; else healthy=0; fi; \
-         if /bin/su -s /bin/sh {} -c \
+         if /bin/su -s /bin/sh \"$health_user\" -c \
          'i=1; /bin/td-init --list >/dev/null 2>&1 || \
          {{ echo \"td-init: --list failed\"; i=0; }}; \
          {td_init_probes}[ \"$i\" = 1 ]'; then \
          [ \"$mti\" = 1 ] || {{ echo {TD_INIT_RUNTIME_MARKER}; mti=1; }}; else healthy=0; fi; \
-         if /bin/su -s /bin/sh {} -c \
+         if /bin/su -s /bin/sh \"$health_user\" -c \
          '{td_login_probe}' && {td_login_exec_as_probe}; then \
          [ \"$mtl\" = 1 ] || {{ echo {TD_LOGIN_RUNTIME_MARKER}; mtl=1; }}; else healthy=0; fi; \
-         if /bin/su -s /bin/sh {} -c \
+         if /bin/su -s /bin/sh \"$health_user\" -c \
          '{td_txt_probes}[ \"$t\" = 1 ]'; then \
          [ \"$mtt\" = 1 ] || {{ echo {TD_TXT_RUNTIME_MARKER}; mtt=1; }}; else healthy=0; fi; \
-         if /bin/su -s /bin/sh {} -c \
+         if /bin/su -s /bin/sh \"$health_user\" -c \
          'b=$(/bin/td-busd probe {SESSION_BUS_SOCKET} 2>&1) || \
          {{ echo \"td-busd: the session bus did not answer on {SESSION_BUS_SOCKET}: \
          $b\"; \
@@ -3247,20 +3254,6 @@ fn build_bootsuccess(sys: &SystemDef) -> String {
          n=$((n+1)); /bin/td-util sleep 1; \
          done\n\
          fail\n",
-        sys.autologin,
-        sys.autologin,
-        sys.autologin,
-        sys.autologin,
-        sys.autologin,
-        sys.autologin,
-        sys.autologin,
-        sys.autologin,
-        sys.autologin,
-        sys.autologin,
-        sys.autologin,
-        sys.autologin,
-        git_user = sys.autologin,
-        probe_user = UI_USER,
         codex_probe_root = format!("/run/user/{UI_UID}/td-codex-sandbox-probe"),
         codex_version = CODEX_VERSION_OUTPUT,
         bwrap_version = CODEX_BWRAP_VERSION_OUTPUT,
@@ -3409,7 +3402,8 @@ fn build_netup() -> String {
          [ \"$up\" = 1 ] && echo {SYSTEM_NET_UP_MARKER}; \
          /bin/td-netd resolve {NETTEST_DEFAULT_HOST} && echo {SYSTEM_NET_RESOLVE_MARKER}; \
          /bin/td-netd reach {NETTEST_DEFAULT_HOST} {NETTEST_DEFAULT_PORT} && echo {SYSTEM_NET_REACH_MARKER}; \
-         /bin/su -s /bin/sh {UI_USER} -c \
+         health_user=$(/bin/td-login exec-primary -- /bin/printenv USER) || exit 1\n\
+         /bin/su -s /bin/sh \"$health_user\" -c \
          'HOME=/tmp/td-git-net-home; export HOME; \
          XDG_CONFIG_HOME=/tmp/td-git-net-xdg; export XDG_CONFIG_HOME; \
          /bin/rm -rf \"$HOME\" \"$XDG_CONFIG_HOME\" && \
@@ -9883,8 +9877,8 @@ news\tnews-0.1\tsource\tstatic-runtime-1\tsource\n"
             "boot health must never read, append, replace, or remove live administrator state"
         );
         assert!(
-            bootsuccess.contains("tester@127.0.0.1 /bin/echo TD-OPENSSH-ROUNDTRIP"),
-            "the tester-only volatile Match override also needs a successful login"
+            bootsuccess.contains("\"$USER@127.0.0.1\" /bin/echo TD-OPENSSH-ROUNDTRIP"),
+            "the volatile primary-account Match override also needs a successful login"
         );
         assert!(
             !bootsuccess.contains(&format!(
@@ -10038,7 +10032,7 @@ news\tnews-0.1\tsource\tstatic-runtime-1\tsource\n"
             "the link probe must create the hard link before unlink consumes it"
         );
         let gated_probes = format!(
-            "if /bin/su -s /bin/sh {user} -c \
+            "if /bin/su -s /bin/sh \"$health_user\" -c \
              'u=1; h=0; /bin/cat /etc/os-release >/dev/null 2>&1 || \
              {{ echo \"uutils: /bin/cat failed\"; u=0; }}; \
              /bin/rm -rf /tmp/td-uutils-probe; \
@@ -10048,8 +10042,7 @@ news\tnews-0.1\tsource\tstatic-runtime-1\tsource\n"
              {{ echo \"uutils: /bin/rm could not remove probe directory\"; u=0; }}; \
              [ \"$u\" = 1 ]'; then \
              [ \"$mu\" = 1 ] || {{ echo {UUTILS_RUNTIME_MARKER}; mu=1; }}; \
-             else healthy=0; fi;",
-            user = SYSTEM.autologin
+             else healthy=0; fi;"
         );
         assert!(
             bootsuccess.contains(&gated_probes),
@@ -10386,8 +10379,7 @@ news\tnews-0.1\tsource\tstatic-runtime-1\tsource\n"
         assert!(!valid_home(AUDIO_UID, "/home/audio"));
     }
 
-    #[test]
-    fn rootcheck_resolves_the_login_home_at_runtime() {
+    fn renamed_primary_system() -> SystemDef {
         static USERS: std::sync::LazyLock<Vec<User>> = std::sync::LazyLock::new(|| {
             SYSTEM.users.iter().map(|user| {
                 if user.uid == UI_UID {
@@ -10397,16 +10389,44 @@ news\tnews-0.1\tsource\tstatic-runtime-1\tsource\n"
                 }
             }).collect()
         });
-        let renamed = SystemDef {
+        SystemDef {
             users: USERS.as_slice(),
             autologin: "alice",
             ..SYSTEM
-        };
+        }
+    }
+
+    #[test]
+    fn rootcheck_resolves_the_login_home_at_runtime() {
+        let renamed = renamed_primary_system();
         let stock = build_rootcheck(&SYSTEM);
         assert_eq!(stock, build_rootcheck(&renamed));
         assert!(!stock.contains("/home/tester") && !stock.contains("/bin/su "));
         assert_eq!(stock.matches("/bin/td-login exec-primary -- /bin/sh -c").count(), 2);
         assert_eq!(stock.matches("/bin/td-util rm -f \"$HOME/.tdwr-su\"").count(), 2);
+    }
+
+    #[test]
+    fn boot_health_resolves_one_name_and_keeps_both_credential_frontends() {
+        let script = build_bootsuccess(&SYSTEM);
+        assert_eq!(script, build_bootsuccess(&renamed_primary_system()));
+        let setup = "health_user=$(/bin/td-login exec-primary -- /bin/printenv USER) || fail";
+        let su = "/bin/su -s /bin/sh \"$health_user\" -c";
+        assert_eq!(script.matches(setup).count(), 1);
+        assert!(script.find(setup).unwrap() < script.find(su).unwrap());
+        assert_eq!(script.matches(su).count(), 14);
+        assert_eq!(script.matches("/bin/su ").count(), 14);
+        assert!(script.contains("/bin/td-login exec-as \"$health_user\" -- /bin/td-login verify-credentials"));
+        assert!(!script.contains("tester") && !script.contains("alice"));
+    }
+
+    #[test]
+    fn boot_health_reports_a_missing_configured_account_before_probes() {
+        let invalid = SystemDef { autologin: "nobody-here", ..SYSTEM };
+        let script = build_bootsuccess(&invalid);
+        let refusal = "echo \"td-boot: no autologin account for health probes\"; fail";
+        assert!(script.find(refusal).unwrap() < script.find("/bin/su ").unwrap());
+        assert!(!script.contains("health_user=$("));
     }
 
     #[test]
@@ -10516,7 +10536,7 @@ news\tnews-0.1\tsource\tstatic-runtime-1\tsource\n"
         assert!(
             rootcheck.contains("td-rootcheck-v1 > /run/td-rootcheck-ok")
                 && bootsuccess.contains("set -f")
-                && bootsuccess.contains("su -s /bin/sh tester -c")
+                && bootsuccess.contains("su -s /bin/sh \"$health_user\" -c")
                 && bootsuccess.contains("/bin/cat /etc/os-release")
                 && bootsuccess.contains(
                     "/bin/rg --color never --no-filename --fixed-strings --line-regexp -- \"$n\" /etc/hostname"
@@ -10540,7 +10560,7 @@ news\tnews-0.1\tsource\tstatic-runtime-1\tsource\n"
                 && bootsuccess.contains("/bin/git clone \"$remote\" verify")
                 && !bootsuccess.contains("--upload-pack=")
                 && !bootsuccess.contains("remote.origin.receivepack")
-                && bootsuccess.contains("remote=ssh://tester@127.0.0.1")
+                && bootsuccess.contains("remote=\"ssh://$USER@127.0.0.1")
                 && bootsuccess.contains("HOME=/tmp/td-git-probe/home")
                 && bootsuccess.contains("GIT_CONFIG_GLOBAL=/dev/null")
                 && bootsuccess.contains("/bin/git -C work submodule --td-invalid")
@@ -11063,6 +11083,10 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
         // markers. Each marker must be gated on its real operation so a failure drops
         // the marker and reds the qemu-boot-net oracle rather than false-passing.
         let netup = build_netup();
+        let user_lookup = "health_user=$(/bin/td-login exec-primary -- /bin/printenv USER) || exit 1";
+        let user_probe = "/bin/su -s /bin/sh \"$health_user\" -c";
+        assert!(netup.find(user_lookup).unwrap() < netup.find(user_probe).unwrap());
+        assert!(!netup.contains("tester"));
         assert!(
             netup.contains("/bin/td-netd up"),
             "netup must bring the link up via td-netd on every boot"
@@ -12447,9 +12471,7 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
             .map(|gid| gid.to_string())
             .collect();
         assert!(
-            bootsuccess.contains(&format!(
-                "/bin/su -s /bin/sh {} -c '{}", SYSTEM.autologin, "l=1;"
-            )),
+            bootsuccess.contains("/bin/su -s /bin/sh \"$health_user\" -c 'l=1;"),
             "the td-login leg must run THROUGH /bin/su as the login user: that IS the \
              credential switch under test, and a leg run as root would verify nothing"
         );
@@ -12530,7 +12552,7 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
         // whole-leg assertion above, so nothing here repeats that.
         let exec_as = td_login_exec_as_probe(&SYSTEM);
         assert!(
-            exec_as.contains("/bin/td-login exec-as tester -- /bin/td-login verify-credentials"),
+            exec_as.contains("/bin/td-login exec-as \"$health_user\" -- /bin/td-login verify-credentials"),
             "the exec-as leg must point exec-as at the readback, so the process reporting \
              the switch is the one exec-as started: {exec_as}"
         );
