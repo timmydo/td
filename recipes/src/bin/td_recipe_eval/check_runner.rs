@@ -102,7 +102,7 @@ pub fn cli(args: &[String]) -> Result<(), String> {
     // worktree's climb is part of what it saves.
     let key = runner.check_verdict_key(stem, index)?;
     let bypassed = check_memo_bypassed();
-    if !bypassed && runner.check_verdict_memoized(stem, index, &key) {
+    if !bypassed && reap_then_check_memoized(&runner, stem, index, &key) {
         say_memoized(stem, index, &key);
         return Ok(());
     }
@@ -158,6 +158,41 @@ pub(crate) const CHECK_FULL_ENV: &str = "TD_CHECK_FULL";
 
 fn check_memo_bypassed() -> bool {
     env::var_os(CHECK_FULL_ENV).is_some()
+}
+
+/// Reap dead peers' abandoned scratch, then report whether STEM#INDEX is already
+/// memoized for KEY. Called from `cli()` right after `new()`, before the memo check:
+/// `reap_dead_scratch` otherwise runs only inside `setup()`, which a memoized pass
+/// returns before ever reaching, and a memoized pass is the overwhelmingly common case
+/// for a `ready`/`affected-checks` run on an unchanged tree — so leaving this to
+/// `setup()` alone meant a hard-killed peer's tree was reclaimed only on the next cache
+/// MISS, rare enough that trees accumulated for weeks in production (one host: 88
+/// trees, 1.6 TB).
+///
+/// The reap runs only under a non-blocking SHARED ladder lock, unlike `setup()`'s own
+/// call to it (which always runs already holding at least a shared lock, taken by
+/// `lock_ladder_for_run` before `setup()`). Without that guard here, a concurrent
+/// EXCLUSIVE holder (`clear-store`, the fsck, the seed-digest generator) could rename
+/// or delete the whole ladder — including a scratch name's claim-file INODE this
+/// reaper already `try_lock`'d — between that lock check and the removal by PATHNAME
+/// a few lines later in `reap_dead_scratch`; a fresh peer re-claiming that same name in
+/// between (a sandboxed low-pid collision is routine here, not exotic; see
+/// `claim_scratch`) would then have its brand-new live tree deleted instead of the dead
+/// one this reaper meant to take. Skipping on contention rather than blocking is what
+/// keeps this fast path from queueing behind an exclusive holder — the whole reason to
+/// reap here rather than only in `setup()`.
+fn reap_then_check_memoized(
+    runner: &RecipeCheckRunner,
+    stem: &str,
+    index: usize,
+    key: &str,
+) -> bool {
+    if let Ok(guard) = open_lock_file(&runner.lock_path()) {
+        if guard.try_lock_shared().is_ok() {
+            runner.reap_dead_scratch();
+        }
+    }
+    runner.check_verdict_memoized(stem, index, key)
 }
 
 /// `td-recipe-eval clear-store` — the EXPLICIT cold reset, and the ONLY path that destroys
@@ -2397,8 +2432,17 @@ impl RecipeCheckRunner {
     /// dead runs' trees pile up. Removes only trees whose CLAIM it can take, which is
     /// what makes it safe with peers holding the ladder SHARED: our own in-progress
     /// scratch and every live peer's are locked, so neither is ever a candidate, and
-    /// that holds across pid namespaces where `/proc` did not. Never fails setup — any
-    /// error leaves the tree for a later pass.
+    /// that holds across pid namespaces where `/proc` did not. Never fails — any error
+    /// leaves the tree for a later pass.
+    ///
+    /// Called from `setup()` (so a build/boot/verify that does real work always reaps,
+    /// already holding at least a shared ladder lock by the time it gets here) AND,
+    /// guarded by a non-blocking shared ladder lock of its own, from
+    /// `reap_then_check_memoized` ahead of `cli()`'s verdict-memo check (so a fully
+    /// memoized `ready`/`affected-checks` run — which never reaches `setup()` —
+    /// still reaps). Idempotent and cheap either way: a second call in the same run
+    /// finds nothing new to take. This method itself takes no lock; see
+    /// `reap_then_check_memoized` for why its caller must.
     fn reap_dead_scratch(&self) {
         let dir = match self.scratch.parent() {
             Some(d) => d,
@@ -2427,7 +2471,14 @@ impl RecipeCheckRunner {
                 Err(_) => continue,
             };
             if matches!(lock.try_lock(), Ok(())) {
-                let _ = fs::remove_dir_all(entry.path());
+                let path = entry.path();
+                // A silent multi-GiB reclaim on what is meant to be a fast path (the
+                // memo-hit caller) reads as an unexplained hang, not progress — name
+                // what is happening, the way `evict_build_cache_if_over_watermark`
+                // already does for its own reclaim.
+                if fs::remove_dir_all(&path).is_ok() {
+                    eprintln!("ladder: reaped abandoned scratch {}", path.display());
+                }
             }
         }
     }
@@ -7609,6 +7660,86 @@ chmod 755 '{}'
         // name through the replaced inode.
         assert!(scratch_claim_lock(&scratch_root, dead).is_file());
         drop(held);
+        let _ = fs::remove_dir_all(&lw);
+    }
+
+    // `cli()` now calls `reap_then_check_memoized()` right after `new()` and before
+    // recording its own answer — because a memoized pass returns before ever reaching
+    // `setup()` (the only other place that reaps), and a memoized pass is the common
+    // case for a `ready`/`affected-checks` run on an unchanged tree. Without this, a
+    // hard-killed peer's scratch tree was reclaimed only on the next cache MISS, rare
+    // enough that trees piled up for weeks in production. Calls the real function
+    // `cli()` calls (not a hand-copied sequence), so reverting its internal reap would
+    // fail this test. Pins that a reap ahead of the memo answer (a) still reaps a dead
+    // peer's tree and (b) does not disturb the verdict memo it is about to answer from.
+    #[test]
+    fn reap_then_check_memoized_reclaims_a_dead_peer_and_leaves_the_memo_alone() {
+        let lw = env::temp_dir().join(format!("td-reap-memo-hit-{}", process::id()));
+        let _ = fs::remove_dir_all(&lw);
+        let runner = shared_test_runner(&lw);
+        let scratch_root = lw.join("scratch");
+        fs::create_dir_all(&scratch_root).unwrap();
+
+        // This check is already memoized, as it would be on a `ready` re-run of an
+        // unchanged tree — the scenario that used to skip `setup()`, and with it
+        // `reap_dead_scratch`, entirely.
+        let (stem, index, key) = ("td-boot-test", 1, "deadbeef");
+        runner.write_check_verdict_memo(stem, index, key).unwrap();
+
+        // A peer hard-killed mid-run: its claim is free, so its tree is abandoned.
+        let dead = "check-td-boot-test-1-31337";
+        fs::create_dir_all(scratch_root.join(dead)).unwrap();
+
+        assert!(
+            reap_then_check_memoized(&runner, stem, index, key),
+            "the memo hit must still be reported"
+        );
+        assert!(
+            !scratch_root.join(dead).exists(),
+            "the memo-hit path must still reap a dead peer's tree"
+        );
+
+        let _ = fs::remove_file(ladder_lock_path(&lw));
+        let _ = fs::remove_dir_all(&lw);
+    }
+
+    // The guard `reap_then_check_memoized` added over a bare `reap_dead_scratch` call:
+    // when the general ladder lock is held EXCLUSIVELY by someone else (`clear-store`,
+    // the fsck, the seed-digest generator), it must skip reaping rather than block or
+    // race it — a `clear-store` mid-reap could otherwise rename/delete the ladder out
+    // from under this walk between one entry's claim-lock check and its removal by
+    // pathname, so a fresh peer re-claiming that same name in between would have its
+    // brand-new live tree deleted instead of the dead one this reaper meant to take
+    // (review finding). Skipping must never block the memo answer either.
+    #[test]
+    fn reap_then_check_memoized_skips_reaping_under_an_exclusive_ladder_holder() {
+        let lw = env::temp_dir().join(format!("td-reap-contend-{}", process::id()));
+        let _ = fs::remove_dir_all(&lw);
+        let runner = shared_test_runner(&lw);
+        let scratch_root = lw.join("scratch");
+        fs::create_dir_all(&scratch_root).unwrap();
+
+        let (stem, index, key) = ("td-boot-test", 1, "deadbeef");
+        runner.write_check_verdict_memo(stem, index, key).unwrap();
+
+        let dead = "check-td-boot-test-1-31337";
+        fs::create_dir_all(scratch_root.join(dead)).unwrap();
+
+        // Simulate a concurrent `clear-store`/fsck/seed-digest generator: hold the
+        // SAME general ladder lock path exclusively, as `lock_ladder` would.
+        let held = lock_ladder(&runner.lock_path(), LadderLock::Exclusive).unwrap();
+
+        assert!(
+            reap_then_check_memoized(&runner, stem, index, key),
+            "contention on the ladder lock must not stop the memo answer"
+        );
+        assert!(
+            scratch_root.join(dead).is_dir(),
+            "a dead peer's tree must survive while an exclusive holder has the ladder"
+        );
+
+        drop(held);
+        let _ = fs::remove_file(ladder_lock_path(&lw));
         let _ = fs::remove_dir_all(&lw);
     }
 
