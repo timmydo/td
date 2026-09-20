@@ -22,7 +22,8 @@ fn editor(input: &str, selection: Selection) -> Editor {
 #[allow(clippy::unwrap_used, reason = "validated test scene")]
 fn pixels(editor: &Editor, geometry: Geometry, view: View) -> Vec<u8> {
     let font = font::pinned().unwrap();
-    let (w, h) = geometry.dimensions();
+    // The buffer is the surface's: a pane's surface encloses its rectangle.
+    let (w, h) = (geometry.surface().width, geometry.surface().height);
     let mut pixels = vec![0xaa; w * h * 4];
     let scene = Scene::new(editor, geometry, view, &[], Profile::Windows).unwrap();
     Raster::new(&mut pixels, &font, geometry.surface(), w * 4)
@@ -830,6 +831,231 @@ fn medium_weight_partial_repaints_are_idempotent_at_all_scales_and_focus_states(
                 raster.paint(&scene, damage).unwrap();
             }
             assert_eq!(actual, full, "scale {scale}, focus {focused}");
+        }
+    }
+}
+
+#[test]
+#[allow(clippy::unwrap_used, reason = "bounded pane fixtures")]
+fn a_pane_lays_the_document_out_at_its_origin_without_bands() {
+    for scale in 1..=4u8 {
+        let s = usize::from(scale);
+        let host = Surface::new(400 * s, 240 * s, Scale::new(scale).unwrap()).unwrap();
+        let rect = Rect {
+            x: (100 * s) as i64,
+            y: (40 * s) as i64,
+            width: (250 * s) as u32,
+            height: (150 * s) as u32,
+        };
+        let pane = Geometry::pane(rect, host).unwrap();
+        assert!(pane.is_pane());
+        assert!(!Geometry::default().is_pane());
+        assert_eq!(pane.bounds(), rect);
+        assert_eq!(pane.dimensions(), (250 * s, 150 * s));
+        assert_eq!(pane.surface(), host);
+        // No bands: the document starts at the pane's top edge, inset by
+        // the left margin, and runs to its foot; no prompt, tab, menu or
+        // status geometry exists, even when prompt rows are requested.
+        let document = pane.document();
+        assert_eq!(document.x, rect.x + (8 * s) as i64);
+        assert_eq!(document.y, rect.y);
+        assert_eq!(document.width, rect.width - (32 * s) as u32);
+        assert_eq!(document.height, rect.height);
+        assert_eq!(pane.gutter().width, 0);
+        assert_eq!(pane.with_prompt_rows(2).unwrap().prompt().height, 0);
+        assert_eq!(pane.with_prompt_rows(2).unwrap().document(), document);
+        assert_eq!(pane.prompt().y, rect.y);
+        assert_eq!(pane.status().height, 0);
+        assert!(!pane
+            .status()
+            .contains(rect.x, rect.y + i64::from(rect.height) - 1));
+        assert_eq!(pane.tab(0, 0, 1), None);
+        assert_eq!(pane.tab_close(0, 0, 1), None);
+        assert_eq!(pane.menu(0), None);
+        let bar = pane.scrollbar(1000, 0).unwrap();
+        assert_eq!(bar.track.intersection(rect), Some(bar.track));
+        assert_eq!(bar.track.intersection(document), None);
+        assert_eq!(
+            bar.track.x,
+            rect.x + i64::from(rect.width) - (16 * s) as i64
+        );
+        assert_eq!(bar.track.y, rect.y);
+        assert_eq!(bar.track.height, rect.height);
+        let wide = pane.with_horizontal_scrollbar(true);
+        assert_eq!(wide.document().height, rect.height - (16 * s) as u32);
+        let horizontal = wide.horizontal_scrollbar(1000, 0).unwrap();
+        assert_eq!(horizontal.track.intersection(rect), Some(horizontal.track));
+        assert_eq!(horizontal.track.intersection(wide.document()), None);
+        // A pane may be the whole surface.
+        let whole = Geometry::pane(host.bounds(), host).unwrap();
+        assert_eq!(whole.bounds(), host.bounds());
+        assert_eq!(whole.document().y, 0);
+    }
+    let one = Scale::new(1).unwrap();
+    let host = Surface::new(1000, 500, one).unwrap();
+    for rect in [
+        Rect {
+            x: -1,
+            y: 0,
+            width: 10,
+            height: 10,
+        },
+        Rect {
+            x: 0,
+            y: -1,
+            width: 10,
+            height: 10,
+        },
+        Rect {
+            x: 0,
+            y: 0,
+            width: 0,
+            height: 10,
+        },
+        Rect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 0,
+        },
+        // Fits the axis ceiling; not the surface.
+        Rect {
+            x: 0,
+            y: 0,
+            width: 1001,
+            height: 10,
+        },
+        Rect {
+            x: 995,
+            y: 0,
+            width: 10,
+            height: 10,
+        },
+        Rect {
+            x: 0,
+            y: 495,
+            width: 10,
+            height: 10,
+        },
+        Rect {
+            x: 1000,
+            y: 0,
+            width: 1,
+            height: 1,
+        },
+        Rect {
+            x: 0,
+            y: i64::MAX,
+            width: 10,
+            height: 10,
+        },
+        Rect {
+            x: 0,
+            y: 0,
+            width: u32::MAX,
+            height: u32::MAX,
+        },
+    ] {
+        assert_eq!(
+            Geometry::pane(rect, host),
+            Err(Error::InvalidArgument),
+            "{rect:?}"
+        );
+    }
+    // The surface is checked before the rectangle.
+    let rect = Rect {
+        x: 0,
+        y: 0,
+        width: 10,
+        height: 10,
+    };
+    assert_eq!(
+        Geometry::pane(
+            rect,
+            Surface {
+                width: 8193,
+                height: 10,
+                scale: one
+            }
+        ),
+        Err(Error::InvalidArgument)
+    );
+    assert_eq!(
+        Geometry::pane(
+            rect,
+            Surface {
+                width: 8192,
+                height: 8192,
+                scale: one
+            }
+        ),
+        Err(Error::Limit)
+    );
+    assert_eq!(
+        Geometry::pane(
+            rect,
+            Surface {
+                width: 0,
+                height: 10,
+                scale: one
+            }
+        ),
+        Err(Error::InvalidArgument)
+    );
+}
+
+#[test]
+#[allow(clippy::unwrap_used, reason = "bounded pane fixtures")]
+fn a_pane_paints_exactly_a_windows_document_region_and_nothing_outside_it() {
+    let text =
+        "alpha beta\n\tgamma\ndelta epsilon zeta eta theta iota kappa lambda mu nu\n".repeat(12);
+    let doc = editor(
+        &text,
+        Selection {
+            anchor: 7,
+            caret: 30,
+        },
+    );
+    for scale in 1..=4u8 {
+        let s = usize::from(scale);
+        let (w, h) = (200 * s, 120 * s);
+        let (x0, y0) = (36 * s, 20 * s);
+        // The host's surface extends past the pane on every side.
+        let host =
+            Surface::new(x0 + w + 30 * s, y0 + h + 24 * s, Scale::new(scale).unwrap()).unwrap();
+        let rect = Rect {
+            x: x0 as i64,
+            y: y0 as i64,
+            width: w as u32,
+            height: h as u32,
+        };
+        let pane = Geometry::pane(rect, host).unwrap();
+        // A window of the same width whose document region has the pane's
+        // height: its bands are the 72 scaled rows the pane omits.
+        let window = geometry(w, h + 72 * s, scale);
+        assert_eq!(window.document().height, pane.document().height);
+        for focused in [true, false] {
+            let view = View {
+                origin: Position { row: 1, column: 0 },
+                focused,
+                ..View::default()
+            };
+            let painted = pixels(&doc, pane, view);
+            let reference = pixels(&doc, window, view);
+            let mut outside = 0;
+            for y in 0..host.height {
+                for x in 0..host.width {
+                    let got = color(&painted, host.width, x, y);
+                    if inside(rect, x, y) {
+                        let want = color(&reference, w, x - x0, y - y0 + 48 * s);
+                        assert_eq!(got, want, "scale {scale} at ({x}, {y})");
+                    } else {
+                        outside += 1;
+                        assert_eq!(got, 0xaaaa_aaaa, "scale {scale} at ({x}, {y})");
+                    }
+                }
+            }
+            assert_eq!(outside, host.width * host.height - w * h);
         }
     }
 }

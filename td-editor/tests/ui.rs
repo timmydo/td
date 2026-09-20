@@ -7,9 +7,9 @@
 use td_editor::keys::Profile;
 use td_editor::layout::{Affinity, Caret};
 use td_editor::model::{Command, Selection};
-use td_ui::raster::Raster;
 use td_editor::ui::{Controller, Event, Outcome, PointerPhase};
 use td_editor::{font, replay, Error};
+use td_ui::raster::{Raster, Rect, Scale, Surface};
 
 fn loaded(text: &str) -> Controller {
     let mut ui = Controller::default();
@@ -353,7 +353,7 @@ fn resize(ui: &mut Controller, width: usize, height: usize, scale: u8) {
 }
 fn pixels(ui: &Controller) -> Vec<u8> {
     let geometry = ui.geometry();
-    let (w, h) = geometry.dimensions();
+    let (w, h) = (geometry.surface().width, geometry.surface().height);
     let mut pixels = vec![0; w * h * 4];
     let font = font::pinned().unwrap();
     Raster::new(&mut pixels, &font, geometry.surface(), w * 4)
@@ -1506,4 +1506,215 @@ fn the_real_replay_binary_accepts_ui_events_without_a_display() {
     let output = child.wait_with_output().unwrap();
     assert!(output.status.success());
     assert_eq!(output.stdout, expected);
+}
+
+#[test]
+fn a_pane_controller_frames_at_an_offset_and_reads_without_editing() {
+    let mut ui = Controller::pane().unwrap();
+    assert!(ui.geometry().is_pane());
+    ui.dispatch(Event::Load(b"hello world\nsecond line\n"))
+        .unwrap();
+    assert_eq!(ui.geometry().gutter().width, 0);
+    // A document loaded before the host's first frame is laid out on the
+    // pane's grid, not a window's.
+    assert_eq!(
+        ui.tab_view(1).unwrap().viewport.dimensions(),
+        ui.geometry().grid()
+    );
+    assert_eq!(ui.geometry().grid().1, 600 / 16);
+    // The host owns the document lifecycle: a key that would open or
+    // switch a document is nothing in a pane, as is a minibuffer.
+    let generation = ui.generation();
+    assert_eq!(key(&mut ui, "C-n"), Outcome::Ignored);
+    assert_eq!(key(&mut ui, "C-Tab"), Outcome::Ignored);
+    assert_eq!(ui.dispatch(Event::PromptRows(3)).unwrap(), Outcome::Ignored);
+    assert_eq!(ui.editor().tabs().count(), 1);
+    assert_eq!(ui.generation(), generation);
+    // A pane is placed, never resized; a window is resized, never placed.
+    assert_eq!(
+        ui.dispatch(Event::Resize {
+            width: 300,
+            height: 200,
+            scale: 1
+        }),
+        Err(Error::Unavailable)
+    );
+    let mut window = loaded("abc");
+    let surface = Surface::new(300, 200, Scale::default()).unwrap();
+    assert_eq!(
+        window.dispatch(Event::Frame {
+            rect: surface.bounds(),
+            surface
+        }),
+        Err(Error::Unavailable)
+    );
+    assert!(!window.geometry().is_pane());
+    for scale in 1..=4u8 {
+        let s = i64::from(scale);
+        let surface = Surface::new(
+            400 * scale as usize,
+            160 * scale as usize,
+            Scale::new(scale).unwrap(),
+        )
+        .unwrap();
+        let rect = Rect {
+            x: 120 * s,
+            y: 30 * s,
+            width: (240 * s) as u32,
+            height: (96 * s) as u32,
+        };
+        assert_eq!(
+            ui.dispatch(Event::Frame { rect, surface }).unwrap(),
+            Outcome::Changed
+        );
+        assert_eq!(
+            ui.dispatch(Event::Frame { rect, surface }).unwrap(),
+            Outcome::Ignored
+        );
+        assert_eq!(
+            ui.dispatch(Event::Frame {
+                rect: Rect { x: -1, ..rect },
+                surface
+            }),
+            Err(Error::InvalidArgument)
+        );
+        assert_eq!(ui.geometry().bounds(), rect);
+        assert_eq!(ui.geometry().surface(), surface);
+        let document = ui.geometry().document();
+        assert_eq!(document.y, rect.y);
+        // A press lands in the document at the pane's offset; one outside
+        // the pane is nothing.
+        pointer(
+            &mut ui,
+            PointerPhase::Press,
+            document.x + 3 * 8 * s + 1,
+            document.y + 1,
+            false,
+        );
+        pointer(
+            &mut ui,
+            PointerPhase::Release,
+            document.x + 3 * 8 * s + 1,
+            document.y + 1,
+            false,
+        );
+        assert_eq!(
+            selection(&ui),
+            Selection {
+                anchor: 3,
+                caret: 3
+            }
+        );
+        assert_eq!(
+            pointer(&mut ui, PointerPhase::Press, 0, 0, false),
+            Outcome::Ignored
+        );
+        assert_eq!(
+            selection(&ui),
+            Selection {
+                anchor: 3,
+                caret: 3
+            }
+        );
+        // The scene never leaves the rectangle: the host's corner and the
+        // pixel just past the pane's far corner stay unpainted.
+        let painted = pixels(&ui);
+        assert_eq!(painted[..4], [0, 0, 0, 0]);
+        let far = ((rect.y + i64::from(rect.height)) as usize * surface.width
+            + (rect.x + i64::from(rect.width)) as usize)
+            * 4;
+        assert_eq!(painted[far..far + 4], [0, 0, 0, 0]);
+        let at = ((document.y as usize) * surface.width + document.x as usize) * 4;
+        let paper = u32::from_le_bytes(painted[at..at + 4].try_into().unwrap());
+        assert_eq!(paper, td_ui::raster::PAPER | 0xff00_0000);
+    }
+    // Read-only: typing and edit commands are refused, motion and
+    // selection remain, and the flag lifts again.
+    let (tab, revision) = active(&ui);
+    assert_eq!(
+        ui.dispatch(Event::ReadOnly { tab, enabled: true }).unwrap(),
+        Outcome::Changed
+    );
+    assert_eq!(
+        ui.dispatch(Event::ReadOnly { tab, enabled: true }).unwrap(),
+        Outcome::Ignored
+    );
+    assert!(ui.editor().document(tab).unwrap().read_only());
+    let generation = ui.generation();
+    assert_eq!(key(&mut ui, "Z"), Outcome::Ignored);
+    assert_eq!(key(&mut ui, "Backspace"), Outcome::Ignored);
+    assert_eq!(key(&mut ui, "Return"), Outcome::Ignored);
+    assert_eq!(ui.generation(), generation);
+    assert!(!ui.keys().pending());
+    assert_eq!(
+        ui.dispatch(Event::Edit {
+            tab,
+            revision,
+            command: Command::Type('Z'),
+        }),
+        Err(Error::Unavailable)
+    );
+    assert_eq!(
+        ui.editor().document(tab).unwrap().text(),
+        "hello world\nsecond line\n"
+    );
+    assert_eq!(ui.editor().document(tab).unwrap().revision(), revision);
+    assert_eq!(key(&mut ui, "S-Right"), Outcome::Changed);
+    assert_eq!(
+        selection(&ui),
+        Selection {
+            anchor: 3,
+            caret: 4
+        }
+    );
+    assert_eq!(key(&mut ui, "Down"), Outcome::Changed);
+    // An ignored edit key is ignored input: a drag in flight survives it.
+    let document = ui.geometry().document();
+    let s = i64::from(ui.geometry().scale().value() as u8);
+    pointer(
+        &mut ui,
+        PointerPhase::Press,
+        document.x + 1,
+        document.y + 1,
+        false,
+    );
+    assert_eq!(key(&mut ui, "Z"), Outcome::Ignored);
+    pointer(
+        &mut ui,
+        PointerPhase::Move,
+        document.x + 4 * 8 * s + 1,
+        document.y + 1,
+        false,
+    );
+    pointer(
+        &mut ui,
+        PointerPhase::Release,
+        document.x + 4 * 8 * s + 1,
+        document.y + 1,
+        false,
+    );
+    assert_eq!(
+        selection(&ui),
+        Selection {
+            anchor: 0,
+            caret: 4
+        }
+    );
+    assert_eq!(
+        ui.dispatch(Event::ReadOnly {
+            tab,
+            enabled: false
+        })
+        .unwrap(),
+        Outcome::Changed
+    );
+    assert_eq!(key(&mut ui, "Z"), Outcome::Changed);
+    assert!(ui.editor().document(tab).unwrap().text().contains('Z'));
+    assert_eq!(
+        ui.dispatch(Event::ReadOnly {
+            tab: 99,
+            enabled: true
+        }),
+        Err(Error::MissingTab)
+    );
 }

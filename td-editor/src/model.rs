@@ -65,9 +65,24 @@ impl Transaction {
     }
 }
 
+impl Command {
+    /// Whether the command only looks at a document: what a directory
+    /// listing or a read-only document admits.
+    pub fn views(&self) -> bool {
+        matches!(
+            self,
+            Command::Select(_) | Command::Move { .. } | Command::GoToLine(_) | Command::Find { .. }
+        )
+    }
+}
+
 #[derive(Debug)]
 pub struct Document {
     directory: bool,
+    /// A document shown, not edited: a host embedding the view to read
+    /// an article or a message sets it, and the dispatcher then admits
+    /// only selection, motion, go-to-line and find, as for a directory.
+    read_only: bool,
     text: String,
     format: text::Format,
     newlines: usize,
@@ -84,6 +99,13 @@ pub struct Document {
 impl Document {
     pub fn directory(&self) -> bool {
         self.directory
+    }
+    pub fn read_only(&self) -> bool {
+        self.read_only
+    }
+    /// Whether the dispatcher admits only the commands a reader needs.
+    pub fn viewing(&self) -> bool {
+        self.directory || self.read_only
     }
     pub fn text(&self) -> &str {
         &self.text
@@ -271,6 +293,7 @@ impl Editor {
             id,
             Document {
                 directory: false,
+                read_only: false,
                 text: decoded.text,
                 format: decoded.format,
                 newlines,
@@ -374,6 +397,7 @@ impl Editor {
         let newlines = decoded.text.bytes().filter(|&b| b == b'\n').count();
         let replacement = Document {
             directory: false,
+            read_only: old.read_only,
             text: decoded.text,
             format: decoded.format,
             newlines,
@@ -430,6 +454,13 @@ impl Editor {
         Ok(tab)
     }
 
+    /// Marks a document read-only, or editable again; its text, history
+    /// and selection are untouched.
+    pub fn set_read_only(&mut self, id: TabId, read_only: bool) -> Result<()> {
+        self.document_mut(id)?.read_only = read_only;
+        Ok(())
+    }
+
     pub fn save_snapshot(&self, id: TabId) -> Result<(SavePoint, Vec<u8>)> {
         let doc = self.document(id)?;
         if doc.directory {
@@ -462,15 +493,7 @@ impl Editor {
 
     pub fn dispatch(&mut self, id: TabId, revision: u64, command: Command) -> Result<()> {
         let doc = self.checked(id, revision)?;
-        if doc.directory
-            && !matches!(
-                command,
-                Command::Select(_)
-                    | Command::Move { .. }
-                    | Command::GoToLine(_)
-                    | Command::Find { .. }
-            )
-        {
+        if doc.viewing() && !command.views() {
             return Err(Error::Unavailable);
         }
         match command {
@@ -919,6 +942,24 @@ mod reload_tests {
         assert!(doc.text().is_empty() && doc.dirty());
         assert_eq!(doc.revision(), 3);
         assert_eq!(doc.format(), text::Format::default());
+    }
+
+    #[test]
+    fn a_reload_keeps_the_read_only_mark() {
+        let mut editor = Editor::default();
+        let tab = editor.load_bytes(b"old").unwrap();
+        editor.set_read_only(tab, true).unwrap();
+        let point = editor.revision_point(tab, 0).unwrap();
+        editor.reload_bytes(point, b"new", false).unwrap();
+        assert!(editor.document(tab).unwrap().read_only());
+        assert_eq!(
+            editor.dispatch(tab, 1, Command::Type('x')),
+            Err(Error::Unavailable)
+        );
+        editor.set_read_only(tab, false).unwrap();
+        editor.dispatch(tab, 1, Command::Type('x')).unwrap();
+        assert_eq!(editor.document(tab).unwrap().text(), "xnew");
+        assert_eq!(editor.set_read_only(99, true), Err(Error::MissingTab));
     }
 
     #[test]

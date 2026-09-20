@@ -13,12 +13,22 @@ use td_ui::raster::{
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Geometry {
+    /// The origin on the surface: zero for the editor's own window, the
+    /// rectangle's corner for a pane a host lays out.
+    x: usize,
+    y: usize,
     width: usize,
     height: usize,
+    /// The surface the scene is laid out for: the window's own extent,
+    /// or the host surface a pane lies within.
+    surface: (usize, usize),
     scale: Scale,
     gutter_columns: usize,
     prompt_rows: usize,
     horizontal_scrollbar: bool,
+    /// A pane: the document and its scrollbars alone, without the menu
+    /// bar, minibuffer, tab strip and status row.
+    pane: bool,
 }
 
 pub const MAX_PROMPT_ROWS: usize = chrome::BLOCK_ROWS;
@@ -28,12 +38,16 @@ pub(crate) const MENU_LABELS: [&str; 5] = ["File", "Edit", "Format", "Help", "Di
 impl Default for Geometry {
     fn default() -> Self {
         Self {
+            x: 0,
+            y: 0,
             width: 800,
             height: 600,
+            surface: (800, 600),
             scale: Scale::default(),
             gutter_columns: 0,
             prompt_rows: 0,
             horizontal_scrollbar: false,
+            pane: false,
         }
     }
 }
@@ -49,23 +63,64 @@ impl Geometry {
         Ok(Self {
             width,
             height,
+            surface: (width, height),
             scale,
-            gutter_columns: 0,
-            prompt_rows: 0,
-            horizontal_scrollbar: false,
+            ..Self::default()
         })
     }
+    /// A pane laid out within `rect` of a host's `surface`: the document
+    /// area and its scrollbars, no bands. The surface is held to the
+    /// raster's ceilings and the rectangle must be non-empty and lie
+    /// within it, so a raster over that surface paints the scene.
+    pub fn pane(rect: Rect, surface: Surface) -> Result<Self> {
+        surface.check()?;
+        if rect.width == 0
+            || rect.height == 0
+            || rect.intersection(surface.bounds()) != Some(rect)
+        {
+            return Err(Error::InvalidArgument);
+        }
+        // Within a checked surface, so each fits a usize on every target.
+        let x = usize::try_from(rect.x).map_err(|_| Error::InvalidArgument)?;
+        let y = usize::try_from(rect.y).map_err(|_| Error::InvalidArgument)?;
+        let width = usize::try_from(rect.width).map_err(|_| Error::InvalidArgument)?;
+        let height = usize::try_from(rect.height).map_err(|_| Error::InvalidArgument)?;
+        Ok(Self {
+            x,
+            y,
+            width,
+            height,
+            surface: (surface.width, surface.height),
+            scale: surface.scale,
+            pane: true,
+            ..Self::default()
+        })
+    }
+    pub fn is_pane(self) -> bool {
+        self.pane
+    }
+    /// The extent the scene is laid out in: the window's, or the pane's
+    /// rectangle, which is not the surface a raster over it takes.
     pub fn dimensions(self) -> (usize, usize) {
         (self.width, self.height)
+    }
+    /// The bands above the document: none for a pane.
+    fn top(self) -> usize {
+        if self.pane {
+            0
+        } else {
+            48 * self.scale.value() + self.prompt().height as usize
+        }
     }
     pub fn with_horizontal_scrollbar(mut self, enabled: bool) -> Self {
         self.horizontal_scrollbar = enabled;
         self
     }
     fn document_height(self) -> u32 {
-        let chrome = 72 + if self.horizontal_scrollbar { 16 } else { 0 };
+        let status = if self.pane { 0 } else { 24 };
+        let chrome = status + if self.horizontal_scrollbar { 16 } else { 0 };
         self.height
-            .saturating_sub(chrome * self.scale.value() + self.prompt().height as usize)
+            .saturating_sub(chrome * self.scale.value() + self.top())
             as u32
     }
     pub fn with_prompt_rows(mut self, rows: usize) -> Result<Self> {
@@ -76,8 +131,15 @@ impl Geometry {
     pub fn prompt_rows(self) -> usize { self.prompt_rows }
     pub fn prompt(self) -> Rect {
         let scale = self.scale.value();
-        let rows = self.prompt_rows.min(self.height.saturating_sub(72 * scale) / (16 * scale));
-        Rect { x: 0, y: (24 * scale) as i64, width: self.width as u32,
+        let (rows, y) = if self.pane {
+            (0, self.y)
+        } else {
+            (
+                self.prompt_rows.min(self.height.saturating_sub(72 * scale) / (16 * scale)),
+                self.y + 24 * scale,
+            )
+        };
+        Rect { x: self.x as i64, y: y as i64, width: self.width as u32,
             height: (rows * 16 * scale) as u32 }
     }
     pub(crate) fn with_line_numbers(mut self, lines: Option<usize>) -> Self {
@@ -87,8 +149,8 @@ impl Geometry {
     pub fn gutter(self) -> Rect {
         let s = self.scale.value();
         Rect {
-            x: (8 * s) as i64,
-            y: (48 * s + self.prompt().height as usize) as i64,
+            x: (self.x + 8 * s) as i64,
+            y: (self.y + self.top()) as i64,
             width: (self.gutter_columns * CELL_WIDTH * s).min(self.width.saturating_sub(16 * s))
                 as u32,
             height: self.document_height(),
@@ -98,26 +160,36 @@ impl Geometry {
         self.scale
     }
     pub fn menu(self, index: usize) -> Option<Rect> {
+        if self.pane {
+            return None;
+        }
         Bar::new(self.surface(), &MENU_LABELS).header(index)
     }
     /// The surface the scene is laid out for: what `Raster::new` takes and
-    /// `Raster::paint` holds a scene to.
+    /// `Raster::paint` holds a scene to. For a pane, the host's surface.
     pub fn surface(self) -> Surface {
         Surface {
-            width: self.width,
-            height: self.height,
+            width: self.surface.0,
+            height: self.surface.1,
             scale: self.scale,
         }
     }
+    /// The area the scene paints: the whole surface, or the pane's
+    /// rectangle.
     pub fn bounds(self) -> Rect {
-        self.surface().bounds()
+        Rect {
+            x: self.x as i64,
+            y: self.y as i64,
+            width: self.width as u32,
+            height: self.height as u32,
+        }
     }
     pub fn document(self) -> Rect {
         let s = self.scale.value();
         let gutter = self.gutter();
         Rect {
             x: gutter.x + i64::from(gutter.width),
-            y: (48 * s + self.prompt().height as usize) as i64,
+            y: (self.y + self.top()) as i64,
             width: self.width.saturating_sub(32 * s + gutter.width as usize) as u32,
             height: self.document_height(),
         }
@@ -137,7 +209,7 @@ impl Geometry {
         let s = self.scale.value();
         let document = self.document();
         let track = Rect {
-            x: self.width.saturating_sub(16 * s) as i64,
+            x: (self.x + self.width.saturating_sub(16 * s)) as i64,
             y: document.y,
             width: (12 * s) as u32,
             height: document.height,
@@ -177,27 +249,37 @@ impl Geometry {
             true,
         ))
     }
+    /// The status row; for a pane, an empty rectangle at its foot, which
+    /// contains no point.
     pub fn status(self) -> Rect {
+        if self.pane {
+            return Rect {
+                x: self.x as i64,
+                y: (self.y + self.height) as i64,
+                width: self.width as u32,
+                height: 0,
+            };
+        }
         Status::new(self.surface()).rect()
     }
     /// The tab strip's row, below the menu bar and the minibuffer inset.
     fn strip(self) -> Rect {
         Rect {
-            x: 0,
-            y: 24 * self.scale.value() as i64 + i64::from(self.prompt().height),
+            x: self.x as i64,
+            y: (self.y + 24 * self.scale.value()) as i64 + i64::from(self.prompt().height),
             width: self.width as u32,
             height: (24 * self.scale.value()) as u32,
         }
     }
     pub fn tab_close(self, index: usize, active: usize, count: usize) -> Option<Rect> {
-        if count > Limits::default().tabs {
+        if self.pane || count > Limits::default().tabs {
             return None;
         }
         Strip::new(self.surface(), self.strip().y, active, count)?.close(index)
     }
     /// The active tab is always in the strip. Narrow surfaces clip one tab.
     pub fn tab(self, index: usize, active: usize, count: usize) -> Option<Rect> {
-        if count > Limits::default().tabs {
+        if self.pane || count > Limits::default().tabs {
             return None;
         }
         Strip::new(self.surface(), self.strip().y, active, count)?.tab(index)
@@ -372,34 +454,38 @@ impl<'a> Scene<'a> {
         };
         fill(self.geometry.bounds(), PAPER, sink);
         let surface = self.geometry.surface();
-        // The three bands tile [0, 48*scale + prompt height): the menu bar,
-        // the minibuffer inset (filled empty; the window paints its caption),
-        // and the tab strip.
-        Bar::new(surface, &MENU_LABELS).emit(clip, sink);
-        let prompt = self.geometry.prompt();
-        let prompt_rows = prompt.height as usize / (CELL_HEIGHT * self.geometry.scale.value());
-        if let Some(block) = Block::new(surface, prompt.y, prompt_rows) {
-            block.emit("", clip, sink);
-        }
-        let count = self.editor.tabs().count();
-        let active = self
-            .editor
-            .tabs()
-            .position(|(id, _)| Some(id) == self.editor.active())
-            .unwrap_or(0);
-        if let Some(strip) = Strip::new(surface, self.geometry.strip().y, active, count) {
-            let labels = self.labels;
-            strip.emit(
-                self.editor.tabs().map(|(id, doc)| {
-                    let title = labels
-                        .iter()
-                        .find(|label| label.tab == id)
-                        .map_or("Untitled", |label| label.title);
-                    (title, doc.dirty())
-                }),
-                clip,
-                sink,
-            );
+        // A pane is the document and its scrollbars alone; the window
+        // paints the three bands that tile [0, 48*scale + prompt height),
+        // the menu bar, the minibuffer inset (filled empty; the window
+        // paints its caption) and the tab strip, and the status row last.
+        if !self.geometry.pane {
+            Bar::new(surface, &MENU_LABELS).emit(clip, sink);
+            let prompt = self.geometry.prompt();
+            let prompt_rows =
+                prompt.height as usize / (CELL_HEIGHT * self.geometry.scale.value());
+            if let Some(block) = Block::new(surface, prompt.y, prompt_rows) {
+                block.emit("", clip, sink);
+            }
+            let count = self.editor.tabs().count();
+            let active = self
+                .editor
+                .tabs()
+                .position(|(id, _)| Some(id) == self.editor.active())
+                .unwrap_or(0);
+            if let Some(strip) = Strip::new(surface, self.geometry.strip().y, active, count) {
+                let labels = self.labels;
+                strip.emit(
+                    self.editor.tabs().map(|(id, doc)| {
+                        let title = labels
+                            .iter()
+                            .find(|label| label.tab == id)
+                            .map_or("Untitled", |label| label.title);
+                        (title, doc.dirty())
+                    }),
+                    clip,
+                    sink,
+                );
+            }
         }
         self.document(clip, sink);
         for bar in self.scrollbars.iter().flatten() {
@@ -409,6 +495,9 @@ impl<'a> Scene<'a> {
                 if bar.enabled() { LINE_NUMBER } else { BORDER },
                 sink,
             );
+        }
+        if self.geometry.pane {
+            return;
         }
         let status = Status::new(surface);
         if let Some(notice) = self.notice {

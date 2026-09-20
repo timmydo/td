@@ -184,7 +184,34 @@ budget. No per-scalar cache or unbounded event queue is introduced.
 
 The initial headless geometry is 800x600 at scale 1. A decoded Resize must
 already have nonzero dimensions; the future Wayland adapter owns zero-axis
-configure retention. Surfaces with no complete document row or column retain
+configure retention. `Controller::pane` starts a controller for an embedded
+document pane instead: line numbers off, laid out over the whole default
+surface until the host's first `Event::Frame`, which supplies the pane's
+rectangle and the host's surface and replaces the geometry whole as Resize
+does for a window (a repeated identical frame is ignored, an invalid one is
+refused with the geometry intact). A controller's kind is fixed at
+construction: `Resize` on a pane and `Frame` on a window are refused as
+unavailable, and an admitted `PromptRows` on a pane, which has no
+minibuffer, is ignored (an inadmissible count is still refused first). A
+document loaded before the first frame is laid out on the
+pane's grid. Pointer coordinates stay the host surface's physical pixels,
+so presses inside the rectangle hit the document at its offset and presses
+outside it are ignored; the empty status and absent tab rectangles hit
+nothing. `Event::ReadOnly` marks a document shown rather than edited: the
+model then admits only selection, motion, go-to-line and find (the set a
+directory listing admits), an `Edit` of any other command is refused as
+unavailable, and a translated key that would edit is ignored input, which
+leaves the keymap, a drag in flight, the click sequence and the caret
+phase as they were, so a reader's typing is nothing while its cursor keys,
+Shift-selection and mark still work. A directory tab keeps its existing
+key-path refusal. Marking a document again with its current state is
+ignored; a reload keeps the mark; lifting it restores editing with its
+history and selection intact. A pane's host loads, selects and closes its
+documents through events, so in a pane the keys that would open a new tab
+or switch tabs are ignored; the file, clipboard and prompt requests are
+still returned for the host to serve or ignore.
+
+Surfaces with no complete document row or column retain
 a virtual minimum 1x1 layout for bounded cached state but draw no document
 cells and refuse vertical motion. The next usable geometry reflows/clamps
 normally. `Controller::scene` supplies the renderer's exact geometry, origin,
@@ -961,7 +988,29 @@ additionally validates the supplied byte stride: it must be a multiple of
 four, at least width times four, with stride times height at most 32 MiB and
 within the borrowed buffer. Validation happens before writes. Pixels are B,
 G, R, 0xff bytes; row padding and any trailing allocation bytes are
-untouched. The backend accepts only 8x16 fonts and integer scales 1–4. The
+untouched.
+
+`Geometry::pane` lays the same document view out as a pane of a host's
+surface: a non-empty rectangle lying within a surface that meets the
+ceilings above. `Geometry::surface` then reports the host's surface, so
+`Raster::paint`, which holds a scene to the raster's own surface, paints
+the pane from a raster over the host's buffer, and `Geometry::bounds`
+reports the rectangle, the clip the host paints it with. A pane has no
+bands: no menu bar, minibuffer, tab strip or status row, so `prompt` is an
+empty rectangle at the origin whatever prompt rows were requested, `status`
+is an empty rectangle at the pane's foot that contains no point, and `tab`,
+`tab_close` and `menu` are `None`. The gutter, document, scrollbar tracks
+and horizontal scrollbar are the window's rectangles translated to the
+pane's origin, with the document starting at the pane's top edge and
+running to its foot (less the horizontal scrollbar's rows when enabled).
+`Scene::emit` fills the rectangle with paper and paints the document and
+its scrollbars, nothing else; a pane's pixels equal a window's
+document-region pixels for the same document, view and width, and no byte
+outside the rectangle is written, on any side. A notice has no status row
+to show in and is dropped. Whether a geometry is a pane is
+`Geometry::is_pane`.
+
+The backend accepts only 8x16 fonts and integer scales 1–4. The
 font is decoded once by the caller and borrowed; the production face and
 parser are the compositor's existing source modules, reached through td-ui.
 `--font-license` prints the provenance, COPYING and OFL notices
@@ -989,7 +1038,9 @@ the static binary and runs `--help`, an empty `--replay` and
 an editor, toolkit or compositor edit selects, in place of the former
 editor-only host gate exemption.
 
-Chrome dimensions below are logical pixels multiplied by the frame scale.
+Chrome dimensions below are logical pixels multiplied by the frame scale
+and describe the editor's own window; a pane omits every band and starts
+the document at its top edge.
 The menu occupies the first 24 pixels, then any active minibuffer, then
 the 24-pixel tab strip. The status strip occupies the bottom 24 pixels.
 The gutter starts at (8, 48); document text
@@ -2779,6 +2830,36 @@ across all 32 supported real-mask states. The td map is also
 read from its existing source for tests; no production compositor keyboard
 module is imported. These fixtures do not replace the live Weston test.
 
+## Embedding the document view
+
+td-news and td-mail are to show an article or a message in a read-only
+document pane and td-mail to compose in an editable one, in their own
+windows beside the toolkit's lists, instead of calling out to an editor
+process. Each will depend on the `td-editor` library crate by path, as a
+standalone target crate may on a `td-*` roster crate, with its recipe
+staging the `td-editor` tree beside `td-ui` and `td-compositor`; those
+landings are the hosts' own. The host owns the window, the surface, the
+event loop and every widget around the pane; the pane is a
+`ui::Controller` from `Controller::pane`, placed by `Event::Frame` with the
+pane's rectangle and the host's surface on each configure, and repainted
+through `Controller::scene` into a raster over the host's surface with
+`Geometry::bounds` as the clip. The host translates its keyboard and
+pointer input into the controller's existing `Event::Key` chords and
+`Event::Pointer` physical pixels; ticks, focus and scroll are the same
+events the editor's own adapter sends. Requests the controller returns
+(files, clipboard, prompts) are the host's to serve or ignore: a reader
+ignores them all, and a composer serves the clipboard through the
+toolkit's data path.
+
+What the pane does not do: it draws no menu bar, tab strip, minibuffer or
+status row (so notices are the host's to show), owns no Wayland surface,
+control socket, file I/O, spelling scan or `$EDITOR` process contract,
+adds nothing to the replay wire, and is not reached by the control socket's
+state frames, whose `window` extent and tab kinds describe the editor's
+own window. The hosts' own designs (`td-news`, `td-mail`) specify their
+windows, lists and the compose flow; the `$EDITOR` process contract below
+remains the editor's own, for callers outside this tree and for td-jail.
+
 ## `$EDITOR`, td-mail, and td-jail
 
 The implemented command contract is `td-editor [options] -- [file ...]`.
@@ -3444,6 +3525,10 @@ path. Target recipe/image work also owes the profiler contract.
    jail/compositor prerequisites. Validate both reference and GPU backends
    against the same scene operations and image oracles. A software-only
    milestone does not complete this objective.
+6. Embeddable document view: `Geometry::pane`, the pane controller with
+   `Event::Frame` and `Event::ReadOnly`, the pixel oracle holding a pane to
+   a window's document region, and this document's embedding contract, so
+   td-news and td-mail can show and compose text in their own windows.
 
 More keyboard layouts, grapheme/IME editing, language-aware filling,
 multilingual spelling and mail submission are outside version 1. They need

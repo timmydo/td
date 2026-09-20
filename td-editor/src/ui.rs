@@ -5,7 +5,7 @@ use crate::keys::{Action, Keymap, Profile};
 use crate::layout::{Affinity, Caret, Metrics, Viewport, CELL_HEIGHT, CELL_WIDTH};
 use crate::model::{Command, Editor, Selection, TabId};
 use crate::render::{Geometry, Label, Scene, View};
-use td_ui::raster::{Scale, Scrollbar};
+use td_ui::raster::{Rect, Scale, Scrollbar, Surface};
 use crate::{text, Error, Result};
 use std::collections::BTreeMap;
 
@@ -59,6 +59,20 @@ pub enum Event<'a> {
         width: usize,
         height: usize,
         scale: u8,
+    },
+    /// A pane's place on its host's surface: the document and its
+    /// scrollbars within `rect` of `surface`, no bands. Replaces the
+    /// geometry whole, as `Resize` does for a window; each is refused on
+    /// the other kind of controller.
+    Frame {
+        rect: Rect,
+        surface: Surface,
+    },
+    /// Show a document without editing it: the dispatcher then admits
+    /// selection, motion, go-to-line and find, and typing is ignored.
+    ReadOnly {
+        tab: TabId,
+        enabled: bool,
     },
     Profile(Profile),
     LineNumbers(bool),
@@ -195,6 +209,18 @@ impl Default for Controller {
 }
 
 impl Controller {
+    /// A controller for a pane a host lays out, without line numbers,
+    /// placed by `Event::Frame`; until then it is laid out over the
+    /// default extent's surface, whole.
+    pub fn pane() -> Result<Self> {
+        let surface = Surface::new(800, 600, Scale::default())?;
+        let geometry = Geometry::pane(surface.bounds(), surface)?;
+        Ok(Self {
+            geometry,
+            line_numbers: false,
+            ..Self::default()
+        })
+    }
     pub fn editor(&self) -> &Editor {
         &self.editor
     }
@@ -514,6 +540,10 @@ impl Controller {
                 height,
                 scale,
             } => {
+                // A pane is placed by its host's `Frame`, never resized.
+                if self.geometry.is_pane() {
+                    return Err(Error::Unavailable);
+                }
                 let geometry = Geometry::new(width, height, Scale::new(scale)?)?
                     .with_prompt_rows(self.geometry.prompt_rows())?;
                 if geometry.dimensions() == self.geometry.dimensions()
@@ -525,6 +555,30 @@ impl Controller {
                 self.drag = None;
                 self.click = None;
                 self.refresh(None)?;
+                Ok(Outcome::Changed)
+            }
+            Event::Frame { rect, surface } => {
+                if !self.geometry.is_pane() {
+                    return Err(Error::Unavailable);
+                }
+                let geometry = Geometry::pane(rect, surface)?;
+                if geometry.bounds() == self.geometry.bounds()
+                    && geometry.surface() == self.geometry.surface()
+                {
+                    return Ok(Outcome::Ignored);
+                }
+                self.geometry = geometry;
+                self.drag = None;
+                self.click = None;
+                self.refresh(None)?;
+                Ok(Outcome::Changed)
+            }
+            Event::ReadOnly { tab, enabled } => {
+                if self.editor.document(tab)?.read_only() == enabled {
+                    return Ok(Outcome::Ignored);
+                }
+                self.editor.set_read_only(tab, enabled)?;
+                self.reset_input();
                 Ok(Outcome::Changed)
             }
             Event::Profile(profile) => {
@@ -543,7 +597,8 @@ impl Controller {
             }
             Event::PromptRows(rows) => {
                 let geometry = self.geometry.with_prompt_rows(rows)?;
-                if geometry == self.geometry {
+                // A pane has no minibuffer, so rows change nothing in it.
+                if geometry == self.geometry || self.geometry.is_pane() {
                     return Ok(Outcome::Ignored);
                 }
                 self.geometry = geometry;
@@ -675,6 +730,21 @@ impl Controller {
         let mut keys = self.keys.clone();
         let action = keys.translate(chord)?;
         let result = match action {
+            // A read-only document ignores the keys that would edit it,
+            // as a reader's typing is nothing; motion and selection stay,
+            // and as for any ignored input the keymap, drag, click
+            // sequence and caret phase are left as they were.
+            Action::Edit(command)
+                if self.editor.document(tab)?.read_only() && !command.views() =>
+            {
+                return Ok(Outcome::Ignored);
+            }
+            // The host of a pane loads, selects and closes its documents
+            // through events; a key that would open or switch one behind
+            // it is nothing.
+            Action::New | Action::NextTab(_) if self.geometry.is_pane() => {
+                return Ok(Outcome::Ignored);
+            }
             Action::Edit(mut command) => {
                 let moving = matches!(command, Command::Move { .. });
                 if let Command::Move { extend, .. } = &mut command {
