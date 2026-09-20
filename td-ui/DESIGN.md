@@ -157,15 +157,16 @@ of its own files may name each module.
   scrollbar proportions and drag rounding) is the one td-editor/DESIGN.md
   records under "Implemented reference-renderer contract"; that text moves here
   with the documentation increment.
-- `chrome`: `Bar` with its `Panel`, `Block`, `Strip`, `Status`, `List`
-  and `TextEntry`, the `Row` a panel paints, the `Item` a list paints,
-  the `Field` a text entry paints and `step`, the bands, the paged list
-  and the text entry a td-owned window shares, over `raster` and
-  independent of any scene. The bar, a panel's rows, the tab
-  strip and the status row are each `ROW` (24) reference-renderer pixels
-  tall, of 8x16 cells, scaled by the surface; the text block wraps in
-  16-pixel cell rows. `Bar` fills the first row and lays its labels from
-  cell one, three cells apart, and answers a header hit. Its `Panel`,
+- `chrome`: `Bar` with its `Panel`, `Block`, `Strip`, `Button` and
+  `Buttons`, `Status`, `List` and `TextEntry`, the `Row` a panel paints,
+  the `Item` a list paints, the `Field` a text entry paints and `step`,
+  the bands, the paged list and the text entry a td-owned window shares,
+  over `raster` and independent of any scene. The bar, a panel's rows,
+  the tab strip, the button strip and the status row are each `ROW` (24)
+  reference-renderer pixels tall, of 8x16 cells, scaled by the surface;
+  the text block wraps in 16-pixel cell rows. `Bar` fills the first row
+  and lays its labels from cell one, three cells apart, and answers a
+  header hit. Its `Panel`,
   under a header and clamped to the right edge, is `PANEL_WIDTH` (320)
   pixels wide with one row per entry, at most `PANEL_ROWS` (13), and
   exists only with a status row's height below it; it paints each `Row`
@@ -1058,12 +1059,33 @@ the reader graph, because td-editor's manifest names the crate.
 ## Shared action button
 
 `chrome::Button` paints a bordered paper action with selected and disabled
-styling, using the shared text and palette. It accepts a nonempty rectangle
-fully inside the surface; its hit test uses that exact rectangle. Rendering
-clips both text and borders to damage and allocates nothing. The consumer
-owns focus, enabled-state hit policy and matching press/release activation,
-as with the other chrome geometry primitives. Scale 1-4 pixel tests cover
-bounds, focus/disabled colors and partial repaint equivalence.
+styling, using the shared text and palette: a `BORDER` bezel one scaled
+pixel wide around a `PAPER` face, `SELECTED` with `PAPER` ink when
+selected, `DISABLED` ink when disabled, the text a cell in and centred in
+the height (four pixels down in a `ROW`-tall button). It accepts a
+nonempty rectangle fully inside the surface; its hit test uses that exact
+rectangle. Rendering clips both text and borders to damage and allocates
+nothing. The consumer owns focus, enabled-state hit policy and matching
+press/release activation, as with the other chrome geometry primitives.
+Scale 1-4 pixel tests cover bounds, focus/disabled colors, the centring
+and partial repaint equivalence.
+
+`chrome::Buttons` is a strip of them on one `ROW`-tall band at a `y` the
+consumer chooses: the buttons from cell one, each its label's cells and a
+cell each side (so the first label starts at cell two), one cell between,
+inset `BUTTON_MARGIN` (2) pixels above and below so two strips stacked
+keep their bezels apart; the band fills `CHROME` behind them. A button the
+surface cannot hold whole is neither painted nor a target, nor is one
+whose geometry leaves the integer range; the layout is one pass over the
+labels. `emit` takes each button's `(selected, enabled)` in label order, a
+state it runs out of painting an enabled unselected button; `hit` answers
+the button whose own pixels hold the point, the gap and the margin none.
+A consumer that wants one selected at a time (a mode or a filter strip)
+selects one; the strip itself imposes nothing. Its test pins the
+geometry, the hit rule, the draw stream and the pixels at scales 1-4, a
+descender's lowest row inside the bezel, partial repaint equivalence,
+damage off the band painting nothing, a clipped last button, a band at
+the surface's foot and past the integer range, and an empty strip.
 
 ## Shared menu controller
 
@@ -1581,3 +1603,7 @@ regressions. Those increments extend the original sequence below.
    own filter, selection, scroll window and `ChooserView` deleted, the
    multi-select mark added to the widget's `Entry` for the multiple-file
    mode, and its render oracles regolded over the widget's bands.
+10. Button strip: `chrome::Buttons`, a row of bezelled `Button`s on one
+    band (see "Shared action button"), the button's text centred in its
+    height; td-photo's mode and filter strips are its first consumer.
+    Landed.

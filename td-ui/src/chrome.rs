@@ -1,10 +1,10 @@
 //! The chrome bands td-owned windows share, over `raster`: the menu bar
-//! with its panel, a wrapped text block, a tab strip, a status row, a
-//! scrolling list and a single-line text entry. Each is a geometry over a
-//! `Surface` in the reference renderer's units (24-pixel rows of 8x16
-//! cells, scaled by the surface) and a painter that streams the complete
-//! band inside a damage rectangle. Nothing here reads a clock, a file or
-//! the environment.
+//! with its panel, a wrapped text block, a tab strip, a button strip, a
+//! status row, a scrolling list and a single-line text entry. Each is a
+//! geometry over a `Surface` in the reference renderer's units (24-pixel
+//! rows of 8x16 cells, scaled by the surface) and a painter that streams
+//! the complete band inside a damage rectangle. Nothing here reads a
+//! clock, a file or the environment.
 
 use crate::raster::{
     text_run, Draw, GlyphStyle, Primitive, Rect, Scale, Scrollbar, Surface, BORDER, CHROME,
@@ -35,6 +35,10 @@ pub const DISABLED: u32 = 0xff827a6d;
 /// The text inset inside a chrome row: one cell in, four pixels down.
 const INSET: (i64, i64) = (8, 4);
 
+/// The band above and below a button strip's buttons, in font pixels,
+/// so two strips stacked keep their bezels apart.
+pub const BUTTON_MARGIN: usize = 2;
+
 /// A `List`'s scrollbar: the gutter reserved at its right and the track's
 /// width within it, in font pixels, matching the editor's document bar.
 const SCROLL_GUTTER: usize = 16;
@@ -64,6 +68,9 @@ impl Button {
     pub fn hit(self, x: i64, y: i64) -> bool {
         self.rect.contains(x, y)
     }
+    pub fn rect(self) -> Rect {
+        self.rect
+    }
     pub fn emit(
         self,
         text: &str,
@@ -85,13 +92,13 @@ impl Button {
         let background = if selected && enabled { SELECTED } else { PAPER };
         fill(outer, BORDER, damage, sink);
         fill(inner, background, damage, sink);
+        // The text sits centred in the button's height: `INSET.1` down in
+        // a `ROW`-tall one, nearer the top in a shorter one.
+        let text_y = (i64::from(outer.height) - (CELL_HEIGHT * s as usize) as i64).max(0) / 2;
         text_run(
             self.surface.scale,
             text.chars(),
-            (
-                outer.x + INSET.0 * i64::from(s),
-                outer.y + INSET.1 * i64::from(s),
-            ),
+            (outer.x + INSET.0 * i64::from(s), outer.y + text_y),
             inner,
             GlyphStyle::medium(
                 if !enabled {
@@ -106,6 +113,94 @@ impl Button {
             damage,
             sink,
         );
+    }
+}
+
+/// A row of bordered buttons on one `ROW`-tall band at `y`: the buttons
+/// from cell one, each its label's cells and a cell each side (so the
+/// first label starts at cell two), one cell between, and
+/// `BUTTON_MARGIN` of the band above and below. A button the surface
+/// cannot hold whole is neither painted nor a target.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Buttons<'a> {
+    surface: Surface,
+    y: i64,
+    labels: &'a [&'a str],
+}
+
+impl<'a> Buttons<'a> {
+    pub fn new(surface: Surface, y: i64, labels: &'a [&'a str]) -> Self {
+        Self { surface, y, labels }
+    }
+
+    fn scale(self) -> usize {
+        self.surface.scale.value()
+    }
+
+    /// The strip's band.
+    pub fn rect(self) -> Rect {
+        Rect {
+            x: 0,
+            y: self.y,
+            width: self.surface.width as u32,
+            height: (ROW * self.scale()) as u32,
+        }
+    }
+
+    /// Each label's button in one pass over the labels, `None` for one
+    /// the surface does not hold whole (or a geometry past the integer
+    /// range, which no surface holds either).
+    fn buttons(self) -> impl Iterator<Item = Option<Button>> + 'a {
+        let s = self.scale();
+        let top = self.y.checked_add((BUTTON_MARGIN * s) as i64);
+        let height = ((ROW - 2 * BUTTON_MARGIN) * s) as u32;
+        let mut column = 1usize;
+        self.labels.iter().map(move |label| {
+            let columns = label.chars().count().saturating_add(2);
+            let x = column.checked_mul(CELL_WIDTH * s);
+            column = column.saturating_add(columns).saturating_add(1);
+            let rect = Rect {
+                x: i64::try_from(x?).ok()?,
+                y: top?,
+                width: u32::try_from(columns.checked_mul(CELL_WIDTH * s)?).ok()?,
+                height,
+            };
+            Button::new(self.surface, rect)
+        })
+    }
+
+    /// Button `index`, when the surface holds it whole.
+    pub fn button(self, index: usize) -> Option<Button> {
+        self.buttons().nth(index)?
+    }
+
+    /// The button holding the point.
+    pub fn hit(self, x: i64, y: i64) -> Option<usize> {
+        self.buttons()
+            .position(|button| button.is_some_and(|b| b.hit(x, y)))
+    }
+
+    /// Paints the band chrome, then each button the surface holds whole
+    /// with its `(selected, enabled)` from `states`, in label order; a
+    /// label `states` runs out before is painted neither selected nor
+    /// disabled.
+    pub fn emit(
+        &self,
+        states: impl IntoIterator<Item = (bool, bool)>,
+        damage: Rect,
+        sink: &mut dyn FnMut(Draw),
+    ) {
+        let Some(damage) = damage.intersection(self.surface.bounds()) else {
+            return;
+        };
+        fill(self.rect(), CHROME, damage, sink);
+        let mut states = states.into_iter();
+        for (label, button) in self.labels.iter().zip(self.buttons()) {
+            let (selected, enabled) = states.next().unwrap_or((false, true));
+            if let Some(button) = button {
+                button.emit(label, selected, enabled, damage, sink);
+            }
+        }
     }
 }
 

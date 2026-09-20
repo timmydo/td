@@ -1584,7 +1584,10 @@ fn action_buttons_have_borders_shared_hit_bounds_and_clipped_focus_pixels() {
                 }
             }
             let corner = (rect.y as usize * surface.width + rect.x as usize) * 4;
-            assert_eq!(&full[corner..corner + 4], &(BORDER | 0xff000000).to_le_bytes());
+            assert_eq!(
+                &full[corner..corner + 4],
+                &(BORDER | 0xff000000).to_le_bytes()
+            );
             let draws = run(surface, |damage, sink| {
                 button.emit("Action", selected, enabled, damage, sink)
             });
@@ -1599,5 +1602,216 @@ fn action_buttons_have_borders_shared_hit_bounds_and_clipped_focus_pixels() {
         }
         assert!(td_ui::chrome::Button::new(surface, Rect { x: -1, ..rect }).is_none());
         assert!(td_ui::chrome::Button::new(surface, Rect { width: 0, ..rect }).is_none());
+        // The text is centred in the height: four pixels down in a row-tall
+        // button, two in one four pixels shorter, and at the top of one a
+        // cell tall.
+        for (height, down) in [(24, 4), (20, 2), (16, 0)] {
+            let short = Rect {
+                height: (height * s) as u32,
+                ..rect
+            };
+            let button = td_ui::chrome::Button::new(surface, short).unwrap();
+            let draws = run(surface, |damage, sink| {
+                button.emit("Action", false, true, damage, sink)
+            });
+            let ys: Vec<i64> = glyphs(&draws).iter().map(|g| g.1).collect();
+            assert_eq!(ys, vec![short.y + (down * s) as i64; 6], "height {height}");
+        }
+    }
+}
+
+#[test]
+fn a_button_strip_lays_bordered_buttons_from_cell_one_and_hits_only_whole_ones() {
+    use td_ui::chrome::{Buttons, BUTTON_MARGIN, ROW};
+    let font = font::pinned().unwrap();
+    let labels = ["All", "Picks", "Rejects", "Unflagged"];
+    for scale in 1..=4u8 {
+        let s = usize::from(scale);
+        let surface = surface(320 * s, 72 * s, scale);
+        let y = (ROW * s) as i64;
+        let strip = Buttons::new(surface, y, &labels);
+        assert_eq!(
+            strip.rect(),
+            Rect {
+                x: 0,
+                y,
+                width: (320 * s) as u32,
+                height: (ROW * s) as u32
+            }
+        );
+        // Each button is its label's cells and one each side, from cell
+        // one, a cell between, inset by the margin above and below.
+        let expected = |x: usize, columns: usize| Rect {
+            x: (x * 8 * s) as i64,
+            y: y + (BUTTON_MARGIN * s) as i64,
+            width: (columns * 8 * s) as u32,
+            height: ((ROW - 2 * BUTTON_MARGIN) * s) as u32,
+        };
+        let rects: Vec<Rect> = (0..4).map(|i| strip.button(i).unwrap().rect()).collect();
+        assert_eq!(
+            rects,
+            vec![
+                expected(1, 5),
+                expected(7, 7),
+                expected(15, 9),
+                expected(25, 11)
+            ]
+        );
+        assert!(strip.button(4).is_none());
+        // A hit is a button's own pixels: not the gap, not the margin.
+        let mid = y + (ROW * s / 2) as i64;
+        assert_eq!(strip.hit(rects[1].x, mid), Some(1));
+        assert_eq!(strip.hit(rects[1].x + i64::from(rects[1].width), mid), None);
+        assert_eq!(strip.hit(rects[2].x - 1, mid), None);
+        assert_eq!(strip.hit(rects[0].x, y), None);
+        assert_eq!(strip.hit(rects[0].x, y + (ROW * s) as i64 - 1), None);
+        assert_eq!(strip.hit(rects[3].x, mid), Some(3));
+        // The band fills chrome, then each button its border, its face
+        // and its label: the selected one dark with paper ink, the
+        // disabled one paper with dim ink, the rest paper with ink; a
+        // state the iterator ran out of is an enabled unselected button.
+        let draws = run(surface, |damage, sink| {
+            strip.emit([(false, true), (true, true), (false, false)], damage, sink)
+        });
+        let painted = fills(&draws);
+        assert_eq!(painted[0], (strip.rect(), CHROME));
+        assert_eq!(
+            painted[1..].iter().map(|f| f.1).collect::<Vec<u32>>(),
+            vec![BORDER, PAPER, BORDER, SELECTED, BORDER, PAPER, BORDER, PAPER]
+        );
+        let lettered = glyphs(&draws);
+        let text: String = lettered.iter().map(|g| g.2).collect();
+        assert_eq!(text, "AllPicksRejectsUnflagged");
+        assert!(lettered
+            .iter()
+            .all(|g| g.1 == y + (BUTTON_MARGIN * s) as i64 + (2 * s) as i64));
+        assert_eq!(lettered[0].0, rects[0].x + (8 * s) as i64);
+        let inks: Vec<u32> = lettered.iter().map(|g| g.3).collect();
+        assert_eq!(&inks[..3], &[INK; 3]);
+        assert_eq!(&inks[3..8], &[PAPER; 5]);
+        assert_eq!(&inks[8..15], &[DISABLED; 7]);
+        assert_eq!(&inks[15..], &[INK; 9]);
+        // The pixels: a border at a button's corner, chrome in the gap and
+        // the margin, the selected face dark, all within the band.
+        let mut pixels = vec![0x11; surface.width * surface.height * 4];
+        let mut raster = Raster::new(&mut pixels, &font, surface, surface.width * 4).unwrap();
+        strip.emit(
+            [(false, true), (true, true)],
+            surface.bounds(),
+            &mut |draw| raster.draw(draw),
+        );
+        let pixel = |x: i64, y: i64| {
+            let offset = (y as usize * surface.width + x as usize) * 4;
+            u32::from_le_bytes([
+                pixels[offset],
+                pixels[offset + 1],
+                pixels[offset + 2],
+                pixels[offset + 3],
+            ]) & 0xffffff
+        };
+        assert_eq!(pixel(rects[0].x, rects[0].y), BORDER);
+        assert_eq!(pixel(rects[0].x + i64::from(rects[0].width), mid), CHROME);
+        assert_eq!(pixel(rects[0].x, y), CHROME);
+        assert_eq!(pixel(rects[0].x, y + (ROW * s) as i64 - 1), CHROME);
+        assert_eq!(
+            pixel(rects[1].x + (2 * s) as i64, rects[1].y + (2 * s) as i64),
+            SELECTED
+        );
+        assert_eq!(pixel(0, y - 1), 0x111111);
+        assert_eq!(pixel(0, y + (ROW * s) as i64), 0x111111);
+        // A label of descenders keeps its lowest glyph row inside the
+        // bezel: ink on the last row the glyphs cover, the row under it
+        // the face, then the border.
+        let low = ["gjpqy"];
+        let strip_low = Buttons::new(surface, y, &low);
+        let mut lowered = vec![0x11; surface.width * surface.height * 4];
+        let mut raster = Raster::new(&mut lowered, &font, surface, surface.width * 4).unwrap();
+        strip_low.emit([(false, true)], surface.bounds(), &mut |draw| {
+            raster.draw(draw)
+        });
+        let low_rect = strip_low.button(0).unwrap().rect();
+        let row_has = |row: i64, color: u32| {
+            (low_rect.x..low_rect.x + i64::from(low_rect.width)).any(|x| {
+                let offset = (row as usize * surface.width + x as usize) * 4;
+                u32::from_le_bytes([
+                    lowered[offset],
+                    lowered[offset + 1],
+                    lowered[offset + 2],
+                    lowered[offset + 3],
+                ]) & 0xffffff
+                    == color
+            })
+        };
+        let last_glyph_row = low_rect.y + (2 * s + 16 * s) as i64 - 1;
+        assert!(row_has(last_glyph_row, INK), "scale {s}");
+        assert!(!row_has(last_glyph_row + (s as i64), INK), "scale {s}");
+        assert!(row_has(low_rect.y + i64::from(low_rect.height) - 1, BORDER));
+        // Painting within a damage rectangle is the same pixels inside it
+        // and nothing outside; damage off the band paints nothing.
+        let paint = |damage| {
+            let mut pixels = vec![0x11; surface.width * surface.height * 4];
+            let mut raster = Raster::new(&mut pixels, &font, surface, surface.width * 4).unwrap();
+            strip.emit([(false, true), (true, true)], damage, &mut |draw| {
+                raster.draw(draw)
+            });
+            pixels
+        };
+        let full = paint(surface.bounds());
+        let damage = Rect {
+            x: rects[1].x - 3,
+            y: y + 1,
+            width: rects[1].width,
+            height: (ROW * s) as u32 / 2,
+        };
+        let partial = paint(damage);
+        for py in 0..surface.height {
+            for px in 0..surface.width {
+                let offset = (py * surface.width + px) * 4;
+                if damage.contains(px as i64, py as i64) {
+                    assert_eq!(&partial[offset..offset + 4], &full[offset..offset + 4]);
+                } else {
+                    assert_eq!(&partial[offset..offset + 4], &[0x11; 4]);
+                }
+            }
+        }
+        let off = Rect {
+            x: 0,
+            y: 0,
+            width: surface.width as u32,
+            height: y as u32,
+        };
+        let mut nothing = Vec::new();
+        strip.emit([(false, true)], off, &mut |draw| nothing.push(draw));
+        assert!(nothing.is_empty());
+        // A surface too narrow for the last button whole neither paints
+        // nor hits it, its glyphs left out with its fills; an empty strip
+        // is its chrome band alone.
+        let narrow = Surface::new(272 * s, 72 * s, Scale::new(scale).unwrap()).unwrap();
+        let strip = Buttons::new(narrow, y, &labels);
+        assert!(strip.button(3).is_none() && strip.button(2).is_some());
+        assert_eq!(strip.hit(rects[3].x, mid), None);
+        let draws = run(narrow, |damage, sink| {
+            strip.emit(std::iter::repeat((false, true)), damage, sink)
+        });
+        assert_eq!(fills(&draws).len(), 1 + 2 * 3);
+        let text: String = glyphs(&draws).iter().map(|g| g.2).collect();
+        assert_eq!(text, "AllPicksRejects");
+        // A band placed past the integer range has no buttons and no hit,
+        // nor has one whose buttons would run under the surface's foot.
+        let far = Buttons::new(surface, i64::MAX - 1, &labels);
+        assert!(far.button(0).is_none() && far.hit(rects[0].x, i64::MAX - 1).is_none());
+        let foot = (surface.height - (ROW - BUTTON_MARGIN) * s + 1) as i64;
+        let low = Buttons::new(surface, foot, &labels);
+        assert!(
+            low.button(0).is_none() && low.hit(rects[0].x, foot + (ROW * s / 2) as i64).is_none()
+        );
+        let fits = Buttons::new(surface, foot - 1, &labels);
+        assert!(fits.button(0).is_some());
+        let empty = Buttons::new(surface, y, &[]);
+        let draws = run(surface, |damage, sink| {
+            empty.emit(std::iter::empty(), damage, sink)
+        });
+        assert_eq!(fills(&draws), vec![(empty.rect(), CHROME)]);
+        assert!(glyphs(&draws).is_empty() && empty.hit(rects[0].x, mid).is_none());
     }
 }
