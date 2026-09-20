@@ -21,12 +21,14 @@
 //! and the cell screen a program that draws in rows and columns paints
 //! (`screen`: the styled grid as a composition, the key vocabulary and
 //! the chord translation; `screen_app`: the window that presents it and
-//! polls the program's handler). Outside `wayland`, `client`, the private
-//! raw module beneath them, the driving adapters `control_socket`,
-//! `control_worker` and `replay`, and the screen window `screen_app`
-//! nothing reads the environment, a clock, a descriptor or the
-//! filesystem: adapters supply explicit inputs, and `notices` embeds the
-//! face's licence texts at compile time.
+//! polls the program's handler), and the widget window (`window`: the
+//! window that presents what a program paints over its surface and hands
+//! it chords, button phases and wheel travel in surface pixels). Outside
+//! `wayland`, `client`, the private raw module beneath them, the driving
+//! adapters `control_socket`, `control_worker` and `replay`, and the two
+//! windows `screen_app` and `window`, nothing reads the environment, a
+//! clock, a descriptor or the filesystem: adapters supply explicit
+//! inputs, and `notices` embeds the face's licence texts at compile time.
 
 /// The bitmap cell every consumer lays text out on. The pinned Unifont face
 /// is 8x16 and `font::pinned` is held to these by a test, so pointer hit
@@ -66,6 +68,7 @@ mod tree_table_geometry;
 mod tree_table_model;
 mod tree_table_paint;
 pub mod wayland;
+pub mod window;
 #[allow(clippy::new_without_default)]
 #[path = "../../td-compositor/src/wire.rs"]
 pub mod wire;

@@ -66,6 +66,7 @@ fn source_inventory_and_shared_mounts_are_closed() {
                 "screen_app.rs",
                 "sys.rs",
                 "wayland.rs",
+                "window.rs",
             ]
             .iter(),
         )

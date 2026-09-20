@@ -93,6 +93,15 @@ so work arriving on a channel from another thread is served without a
 descriptor of its own in the loop. td-news and td-mail, until now
 terminal programs, draw in it.
 
+Newly built (increment 12): the widget window under "Widget window"
+below. `window` is the same loop for a program that lays toolkit widgets
+and an embedded document pane out over its surface instead of a grid:
+its handler paints into a raster over the surface and reads the
+keyboard's chords, the left button's press, drag and release in surface
+pixels with Shift, wheel travel, the surface on configure, focus and the
+close request. td-news and td-mail move onto it, each with its lists and
+td-editor's pane, after which the cell screen and its window go.
+
 ## Purpose and trust position
 
 td-ui is target-zone source: it ships only inside the programs that embed
@@ -324,6 +333,13 @@ of its own files may name each module.
   `needs_redraw`, `render`, `title`, `notice`); `Object`, the empty
   tag; `Window<'h, H>` (`new`, `handler`, `handler_mut`, `screen`), the
   `App` over a handler it borrows; and `run`.
+- `window`: `DEFAULT_WIDTH` and `DEFAULT_HEIGHT`; `Flow`;
+  `PointerPhase`, the driven seam's, re-exported; `Input<'a>`, the
+  vocabulary a widget program reads; the `Handler` trait (`app_id`,
+  `title`, `input`, `poll`, `wait_ms`, `needs_redraw`, `paint`,
+  `notice`); `Object`, the empty tag; `Window<'h, H>` (`new`, `handler`,
+  `handler_mut`, `surface`), the `App` over a handler it borrows; and
+  `run`, under "Widget window" below.
 
 ## Driving
 
@@ -726,8 +742,8 @@ not frames, and stays its own).
   and reads procfs for the caller's identity; `control_worker`, which
   owns its thread and reads the monotonic clock for its deadlines; and
   `replay`, which reads and writes only the streams it is handed; and the
-  screen window `screen_app`, whose `Window::new` reads the embedded face
-  and whose loop is `client::run`. Even they read no environment
+  two windows `screen_app` and `window`, whose `Window::new` reads the
+  embedded face and whose loop is `client::run`. Even they read no environment
   variable, taking the display values and the socket path as explicit
   arguments.
 - `control`, `driven` and `screen` are pure: the frame, envelope and
@@ -1097,21 +1113,44 @@ at one millisecond, a closed window not polling, and a lost keyboard
 capability as focus loss once and only for a window that had focus; and
 the whole loop over a socket to a close request.
 
-`tests/confinement.rs` holds `screen.rs` in the pure set and `screen_app.rs`
-among the adapters, adds `control.rs` and `driven.rs` to the pure set and the
-three adapters to the inventory, and carries td-editor's pins over the moved
-modules: the socket's open flags, path and identity constants, procfs reads,
-mode and identity checks, and the absence of `connect`, environment reads,
-canonicalization, a fixed overflow number and the trusted-root variable; the
-worker's thread name, its slot, buffer and deadline constants, its bounded
-channels and nonblocking operations, `R::parse` as its sole parse site, and the
-absence of blocking reads, writes and receives; and the runner's ceiling check,
-its two exact reads and one framed reply. The socket's
-`/proc/sys/kernel/overflowuid` literal is excluded from the raw-module
-identifier count by name, as td-editor excluded it. The consumer-level
-conformance, td-editor's request grammar, refusal parity between socket and
-replay, and its window's two-jobs-per-turn polling, stays in td-editor's suites
-and confinement tests.
+`tests/window.rs` drives the widget window against the same scripted
+peer: the binding delivering the default surface, configure laying the
+surface out, keeping it through a zero axis, a refused extent and a
+repeated extent, and the close request; the frame presented from the
+handler's paint into a raster over the surface, clean until a redraw,
+the buffer reused once released, every buffer busy asking for no paint
+and leaving it dirty, and the title sent when it changed, ahead of the
+frame when one follows and alone when none can; presses arriving as the
+keymap's chords, plain and with modifiers, marked when the repeat clock
+made them and not after the window closed, a bare modifier nothing,
+focus following the keyboard and a handler quitting on a chord; the left
+button's press at the pointer in surface pixels rounded down, motion
+while held a drag signed past the edge, a second press while held
+nothing, the release where the pointer is, motion without the button, a
+stray release and the right button nothing, leaving or losing the
+pointer while held a cancel with no release after it, a handler quitting
+on that cancel hearing nothing of the resize that made it nor of
+anything after, and Shift under a focused synchronized keyboard
+extending the press; wheel frames in cells; the poll and wait each turn,
+the keyboard capability's loss as focus loss once; and the whole loop
+over a socket.
+
+`tests/confinement.rs` holds `screen.rs` in the pure set and
+`screen_app.rs` and `window.rs` among the adapters, adds `control.rs`
+and `driven.rs` to the pure set and the three adapters to the inventory,
+and carries td-editor's pins over the moved modules: the socket's open
+flags, path and identity constants, procfs reads, mode and identity
+checks, and the absence of `connect`, environment reads,
+canonicalization, a fixed overflow number and the trusted-root variable;
+the worker's thread name, its slot, buffer and deadline constants, its
+bounded channels and nonblocking operations, `R::parse` as its sole
+parse site, and the absence of blocking reads, writes and receives; and
+the runner's ceiling check, its two exact reads and one framed reply.
+The socket's `/proc/sys/kernel/overflowuid` literal is excluded from the
+raw-module identifier count by name, as td-editor excluded it. The
+consumer-level conformance, td-editor's request grammar, refusal parity
+between socket and replay, and its window's two-jobs-per-turn polling,
+stays in td-editor's suites and confinement tests.
 
 The builder discovers the crate by existing. Its gate runs `cargo test` and
 all-target Clippy; a change under `td-ui/` selects td-editor's tests through
@@ -1206,6 +1245,65 @@ window's own state changed, once a frame can be presented; a frame
 refused by the client (every buffer busy) leaves the window dirty, and
 the handler paints again next turn, so `render` is a paint and not a
 frame and must be repeatable.
+
+## Widget window
+
+A program that lays the toolkit's widgets out over its surface, td-news
+and td-mail with their lists and td-editor's document pane, has no grid
+to draw in: it paints compositions into a raster over the surface and
+reads its input in surface pixels. `window` is the window over the
+client for such a program, the cell screen's loop with the grid taken
+out. Its `Handler` names the toplevel and its title, reads each `Input`,
+is polled every turn with the loop's clock, says how long the loop may
+wait, says when the surface must be painted again, and paints it whole
+through `paint`, which receives a `Raster` over the frame's buffer and
+the `Surface` it is laid out for; a paint is not a frame and must be
+repeatable, as the screen window's render is. The window owns the
+client, the pinned face, the pointer's position and whether the left
+button is held; the handler owns everything else, and stays the
+caller's whichever way the loop ends.
+
+The vocabulary is `Input`: `Key` with the chord as the keymap spells it
+(`a`, `C-x`, `S-Right`), so a handler translates it itself or hands it
+to td-editor's controller unchanged, and `repeat` for a delivery the
+repeat clock made; `Pointer` with the driven seam's `PointerPhase` (`Press`,
+`Move`, `Release`), the position in the surface's physical pixels, signed so
+travel past an edge is representable, and `extend`, Shift held at the
+press as the keyboard's synchronized modifier state reports it while
+the window has focus; `CancelPointer` when the pointer leaves or the
+device goes while the button is held, so the handler ends a drag
+without a release; `Wheel` in cell rows and columns as `pointer::Wheel`
+accumulates a frame; `Resize` with the `Surface` the handler lays out
+for; `Focus` and `Close`. Motion is delivered only while the button is
+held, so a handler without drags sees no motion stream; a second press
+while held, a release without a press and every other button are
+nothing.
+
+Binding, configure, the close request, focus, repeat, the poll and the
+wait are the screen window's, and `Flow::Quit` is but for what may
+follow it: on `Bound` the window sets the title and app id, commits, and
+hands the handler the default `Resize`; on `Configure` it lays the
+surface out for the extent (a zero axis keeps the current one; an extent
+the raster refuses keeps the last surface, is reported through `notice`
+and delivers nothing; the extent the surface has delivers nothing),
+cancels a held button, hands the handler the new `Resize` and
+acknowledges. A handler that answers `Flow::Quit` hears nothing more:
+the window is closed, and the inputs that would have followed, a resize
+after the cancel it quit on or the focus loss after a seat's removal,
+are not delivered, where the screen window still delivers them. The
+surface is presented when the handler says it needs a redraw or the
+window's own state changed, once a frame can be presented, into a raster
+over the pool file at the surface's own stride; the handler paints only
+into a buffer, so a frame refused by the client (every buffer busy) asks
+for no paint and leaves the window dirty until one is back. A paint that
+fails ends the loop with its error, as a program that cannot paint its
+surface has nothing to show; the refusals the loop absorbs are the
+extent's and the frame's. The title is read before every attempted
+present, which is when the window is dirty and a frame can be presented,
+and sent then when it changed, ahead of the frame's commit when a frame
+follows and alone when none can; a retitle made while painting rides the
+next attempt. The client's selection events are not delivered: the
+clipboard is a later increment, for the host that composes.
 
 ## Shared action button
 
@@ -1769,3 +1867,10 @@ regressions. Those increments extend the original sequence below.
     proven with a recording handler against a scripted peer. Landed;
     td-news and td-mail draw in it (APPLICATIONS.md §W.8, "Reworked"),
     each landed in its own increment with its recipe, package and unit.
+12. The widget window under "Widget window": `window`, the screen
+    window's loop without the grid, whose handler paints into a raster
+    over the surface and reads chords, button phases and wheel travel in
+    surface pixels, proven with a recording handler against the scripted
+    peer. td-news and td-mail move onto it with the toolkit's `List` and
+    td-editor's document pane, each in its own increment; the cell screen
+    and `screen_app` are deleted in the last of those.
