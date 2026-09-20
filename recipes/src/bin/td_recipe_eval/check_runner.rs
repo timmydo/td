@@ -8717,9 +8717,11 @@ chmod 755 '{}'
         let reached = checks_reaching(&["td-compositor"]).expect("reach");
         assert!(reached.contains("td-taskmgr-test"));
         assert!(reached.contains("td-portal-test"));
+        assert!(reached.contains("td-photo-test"));
         let toolkit = checks_reaching(&["td-ui"]).expect("sibling reach");
         assert!(toolkit.contains("td-taskmgr-test"));
         assert!(toolkit.contains("td-portal-test"));
+        assert!(toolkit.contains("td-photo-test"));
         // Both directions: every selected owner reads the crate somewhere in
         // its closure, and every check owner that does is selected — the
         // second is the one a dropped owner would fail.

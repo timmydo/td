@@ -369,6 +369,7 @@ const TARGET_STATIC_RECIPES: &[(&str, &str)] = &[
     ("td-netd/src", "recipes/src/recipes/td-netd.rs"),
     ("td-secret/src", "recipes/src/recipes/td-secret.rs"),
     ("recipes/src/fixtures", "recipes/src/recipes/td-secret-vm-test.rs"),
+    ("recipes/src/fixtures", "recipes/src/recipes/td-photo-test.rs"),
     ("td-profiler/src", "recipes/src/recipes/td-profiler.rs"),
     ("td-seatd/src", "recipes/src/recipes/td-seatd.rs"),
     ("td-vm-guest/src", "recipes/src/recipes/td-vm-guest.rs"),
@@ -595,14 +596,14 @@ fn map_path(root: &Path, roster: &Result<Vec<GateCrate>, String>, p: &str, sel: 
         return;
     }
 
-    // Portal, taskmgr and the editor stage sibling trees; every retained
-    // input moves its consumer's source digest. This cheap preflight augments
-    // each crate arm below. engine/ carries its own routing; td-seatd shares
-    // the compositor arm but is not a staged sibling. Keep this top-level
-    // tree roster in agreement with the catalog's
+    // Portal, taskmgr, the editor and td-photo stage sibling trees; every
+    // retained input moves its consumer's source digest. This cheap preflight
+    // augments each crate arm below. engine/ carries its own routing;
+    // td-seatd shares the compositor arm but is not a staged sibling. Keep
+    // this top-level tree roster in agreement with the catalog's
     // local_source_trees_are_staged_by_basename_and_routed_by_the_builder test.
     if pattern_matches(
-        "td-portal/*|td-busd/*|td-compositor/*|td-secret/*|td-ui/*|td-taskmgr/*|td-editor/*",
+        "td-portal/*|td-busd/*|td-compositor/*|td-secret/*|td-ui/*|td-taskmgr/*|td-editor/*|td-photo/*",
         p,
     ) {
         sel.add_preflight("local-source-digests");
@@ -1445,9 +1446,18 @@ fn map_path(root: &Path, roster: &Result<Vec<GateCrate>, String>, p: &str, sel: 
         return;
     }
 
+    // The photo tool the same way: td-photo-test runs the static binary's
+    // verbs over a synthetic frame in the sandbox.
+    if p.starts_with("td-photo/") && !p.contains("..") {
+        sel.add_preflight("cargo-test");
+        sel.add_target("check");
+        sel.add_target("recipe-checks");
+        return;
+    }
+
     // Toolkit edits affect the standalone consumers and the target taskmgr,
-    // editor and portal recipes; source pins and realized-output checks are
-    // required.
+    // editor, photo and portal recipes; source pins and realized-output
+    // checks are required.
     if p.starts_with("td-ui/") && !p.contains("..") {
         sel.add_preflight("cargo-test");
         sel.add_target("check");
@@ -7326,6 +7336,45 @@ mod tests {
         }));
         let mixed = [
             "td-taskmgr/src/collector.rs".to_string(),
+            "builder/src/affected.rs".to_string(),
+        ];
+        assert_eq!(cargo_test_cmds(&root, &mixed).unwrap(), gate_cmds());
+        assert!(compute_selection(&root, &mixed)
+            .targets
+            .contains(&"check".to_string()));
+    }
+
+    #[test]
+    fn photo_source_routes_to_its_roster_pin_and_target_checks() {
+        let root = repo_root();
+        for path in [
+            "td-photo/Cargo.toml",
+            "td-photo/Cargo.lock",
+            "td-photo/src/develop.rs",
+            "td-photo/tests/nef.rs",
+        ] {
+            let output = path_output(&root, path);
+            assert!(
+                output.contains("--manifest-path td-photo/Cargo.toml"),
+                "{path}: {output}"
+            );
+            assert!(
+                output.contains("--workspace (builder/recipes/engine)"),
+                "{path}: {output}"
+            );
+            assert!(output.contains("local-source-digests"), "{path}: {output}");
+            assert!(output.contains("td-builder check"), "{path}: {output}");
+            assert!(output.contains("recipe-checks"), "{path}: {output}");
+            assert!(!output.contains("discovered crate"), "{path}: {output}");
+        }
+        let docs = path_output(&root, "td-photo/DESIGN.md");
+        assert!(docs.contains("Selected checks: none"), "{docs}");
+        assert!(gate_locks().iter().any(|(lock, members)| {
+            lock == "td-photo/Cargo.lock"
+                && matches!(members, LockMembers::Roster { own, .. } if own == "td-photo")
+        }));
+        let mixed = [
+            "td-photo/src/develop.rs".to_string(),
             "builder/src/affected.rs".to_string(),
         ];
         assert_eq!(cargo_test_cmds(&root, &mixed).unwrap(), gate_cmds());

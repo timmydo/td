@@ -56,8 +56,10 @@ lands over its own slices: the mode, its keys and the develop edits over the
 seam and the socket are in, as are the developed preview and the crop drag
 with its edge and corner handles and the look palette; the `export` verb and
 the window's `export` action are in, and `delete-rejected` closes the
-export increment; packaging follows, as the increments at the end
-schedule.
+export increment. The crate is packaged: the `td-photo` target recipe
+builds it static over the staged td-ui and td-compositor trees, the image
+copies its output and links `/bin/td-photo`, and `td-photo-test` runs the
+built binary's verbs over a synthetic frame (Packaging below).
 
 The rules below define version 1; the increments identify the order of
 implementation, not choices left to each implementing agent.
@@ -1380,6 +1382,35 @@ sidecar's exposure.
 The builder discovers the crate by existing; its gate runs `cargo test` and
 all-target Clippy.
 
+## Packaging
+
+The target recipe `td-photo` (`recipes/src/recipes/td-photo.rs`) builds the
+crate with cargo on the source-built toolchain, staging the `td-ui` and
+`td-compositor` trees beside it so the toolkit's `#[path]` mounts and
+embedded notices resolve as the sources name them, links the binary fully
+static and splits its debug companion: the td-editor and td-taskmgr shape,
+with a lock that lists only td-photo and td-ui. The system image
+(`recipes/src/recipes/system-x86-64.rs`) copies the complete recipe output,
+companion included, into the immutable root and links `/bin/td-photo` to
+it; the tool is run from the terminal and receives no authority, socket or
+credential of its own. Every retained file of the three trees moves the
+`td-photo-source` row of `seed/seed-digests.txt`; DESIGN.md is excluded
+from staging and from the hash.
+
+The realized-output check `td-photo-test` requires and asserts the static
+binary, runs `--help` and an empty `--replay` on the target, then compiles
+`recipes/src/fixtures/td_photo_synth.rs` with the target rustc, static as
+the direct td recipes are: the uncompressed synthetic writer of
+`tests/support/synth_nef.rs` restated over literal tags, so it compiles
+alone. The fixture writes one 64 by 48 Z 8 frame into a roll, and the built
+td-photo probes it with the raw strip decoded, develops it at a 16-pixel
+long edge with an exposure and the built-in `mono` look, writes its sidecar
+through `edit` and lists the roll. That is target-artifact coverage of the
+binary and its pipeline; the window, the thumbnails and the Wayland client
+stay with the crate's own tests under the native harness on the host
+preflight. A td-photo, td-ui or td-compositor edit selects this check in
+`td-builder affected-checks` beside the crate's cargo gate.
+
 ## Independently landable increments
 
 1. Crate and codec: this document, the container and NEF readers, the
@@ -1471,6 +1502,7 @@ all-target Clippy.
    Landed.
 7. Packaging: the cargo recipe staging td-ui, the image entry, and the
    recipe check that develops the synthetic frame in the built artifact.
+   Landed.
 8. Later: the 100% loupe from level 0, DNG and JPEG rolls, the Nikon High
    Efficiency codec, a better full-resolution demosaic, highlight
    reconstruction, the `.dtstyle` translator, and ratings.
