@@ -1813,7 +1813,7 @@ impl Controller {
         self.chooser = None;
         self.refresh_shown();
         self.cursor = self.shown.first().copied();
-        self.sync_step(0);
+        self.sync_step(true);
         self.bump();
         Ok(())
     }
@@ -1929,7 +1929,7 @@ impl Controller {
     /// sidecar that would take the roll past it is not held, and the photo
     /// is shown as refused for `OVER_BUDGET`. Whether the model changed.
     pub fn settle(&mut self, index: usize, photo: Photo) -> bool {
-        let before = self.steps().len();
+        let before = (self.steps().len(), self.steps().last().cloned());
         let cursor = self.cursor;
         let photo = if self.fits(index, photo.bytes()) {
             photo
@@ -1954,8 +1954,14 @@ impl Controller {
         self.refresh_shown();
         self.keep_cursor_shown();
         // A settle that moved the cursor (a flag that hid its photo) shows
-        // another photo's history, its newest step selected.
-        self.sync_step(if self.cursor == cursor { before } else { 0 });
+        // another photo's history, its newest step selected; so is a step
+        // just added, or the last one taken up by a run of its key (the
+        // history as long, its last step other than it was).
+        let steps = self.steps();
+        let newest = self.cursor != cursor
+            || steps.len() > before.0
+            || (steps.len() == before.0 && steps.last() != before.1.as_ref());
+        self.sync_step(newest);
         self.bump();
         true
     }
@@ -1972,7 +1978,6 @@ impl Controller {
         if names.is_empty() || !self.photos.iter().any(|photo| names.contains(&photo.name)) {
             return false;
         }
-        let before = self.steps().len();
         let position = self.position();
         let kept = self
             .cursor
@@ -2003,7 +2008,7 @@ impl Controller {
         self.keep_cursor_shown();
         // The cursor's photo kept its history and its selection; another
         // photo's shows with its newest step selected.
-        self.sync_step(if same { before } else { 0 });
+        self.sync_step(!same);
         self.bump();
         true
     }
@@ -2121,14 +2126,14 @@ impl Controller {
     }
 
     /// Keeps the selection on the history as it stands: none without a
-    /// step or outside develop, the newest when the history grew past
-    /// `before` (a step just added, or a photo just developed), else the
-    /// one selected, clamped to the steps that remain.
-    fn sync_step(&mut self, before: usize) {
+    /// step or outside develop, the newest when asked (a step just added
+    /// or taken up, or a photo just developed), else the one selected,
+    /// clamped to the steps that remain.
+    fn sync_step(&mut self, newest: bool) {
         let total = self.steps().len();
         self.history_step = if total == 0 {
             None
-        } else if total > before {
+        } else if newest {
             Some(total - 1)
         } else {
             Some(
@@ -3756,7 +3761,7 @@ impl Controller {
         self.adjusting = false;
         self.aspect = Aspect::Free;
         self.look_list = false;
-        self.sync_step(0);
+        self.sync_step(true);
         Ok(Outcome::Changed)
     }
 
@@ -3984,7 +3989,7 @@ impl Controller {
         self.look_list = false;
         self.reveal();
         // The history is the new photo's; its newest step is selected.
-        self.sync_step(0);
+        self.sync_step(true);
         Ok(Outcome::Changed)
     }
 

@@ -1549,8 +1549,9 @@ fn the_binary_develops_a_photo_over_the_effects_and_writes_the_sidecar() {
     );
     assert_eq!(&a[1][1..], ["ok", "changed"]);
     assert_eq!((a[2][2].as_str(), a[2][11].as_str()), ("develop", "-"));
-    // Four exposure steps, a look and a crop, each a change; the value is
-    // the file's, read back in the state.
+    // Three exposure nudges (one step, each taking the last's), a look and
+    // a crop, each a change; the value is the file's, read back in the
+    // state.
     for reply in &a[3..8] {
         assert_eq!(&reply[1..], ["ok", "changed"]);
     }
@@ -1565,7 +1566,7 @@ fn the_binary_develops_a_photo_over_the_effects_and_writes_the_sidecar() {
     assert_eq!((a[11][11].as_str(), a[11][13].as_str()), ("0.10", "portra"));
     assert_eq!(
         fs::read_to_string(&edit_1).unwrap(),
-        "td-photo edit 1\nexposure 0.10\nlook portra\ncrop 0.1000 0.1000 0.5000 0.5000\nstep-1 on exposure 0.33\nstep-2 on exposure 0.43\nstep-3 on exposure 0.10\nstep-4 on look portra\nstep-5 on crop 0.1000 0.1000 0.5000 0.5000\n"
+        "td-photo edit 1\nexposure 0.10\nlook portra\ncrop 0.1000 0.1000 0.5000 0.5000\nstep-1 on exposure 0.10\nstep-2 on look portra\nstep-3 on crop 0.1000 0.1000 0.5000 0.5000\n"
     );
 
     // The exposure delta is added to the file's value, not the model's: an
@@ -4961,8 +4962,9 @@ fn the_chooser_names_its_chords_as_the_keymap_spells_them() {
     assert!(c.chooser().is_none());
 }
 
-/// Develops the first photo and gives it three history steps: two
-/// exposure nudges, each its own step, and a look.
+/// Develops the first photo and gives it three history steps: a run of
+/// two exposure nudges (one step, the second nudge taking the first's
+/// step), a look, and a nudge back behind it.
 fn with_history() -> Controller {
     let mut c = Controller::new(surface(800, 600));
     c.open("roll", b"/r", photos(5)).unwrap();
@@ -4971,12 +4973,40 @@ fn with_history() -> Controller {
     assert_eq!(carry(&mut c, "expose-in", &[]), Outcome::Changed);
     assert_eq!(&fields(&c)[STEPS..=STEP], ["1", "0"]);
     assert_eq!(carry(&mut c, "expose-in", &[]), Outcome::Changed);
-    assert_eq!(&fields(&c)[STEPS..=STEP], ["2", "1"]);
+    assert_eq!(&fields(&c)[STEPS..=STEP], ["1", "0"]);
+    assert_eq!(fields(&c)[EXPOSURE], "0.66");
     assert_eq!(carry(&mut c, "look", &["portra"]), Outcome::Changed);
+    assert_eq!(&fields(&c)[STEPS..=STEP], ["2", "1"]);
+    assert_eq!(carry(&mut c, "expose-out", &[]), Outcome::Changed);
     assert_eq!(&fields(&c)[STEPS..=STEP], ["3", "2"]);
     assert_eq!(c.steps().len(), 3);
-    assert_eq!(fields(&c)[EXPOSURE], "0.66");
+    assert_eq!(fields(&c)[EXPOSURE], "0.33");
     c
+}
+
+/// A run taking up the last step selects that step, as a step added
+/// does, wherever the selection was.
+#[test]
+fn a_run_taken_up_selects_its_step() {
+    let mut c = with_history();
+    assert_eq!(key(&mut c, "Up"), Outcome::Changed);
+    assert_eq!(key(&mut c, "Up"), Outcome::Changed);
+    assert_eq!(&fields(&c)[STEPS..=STEP], ["3", "0"]);
+    assert_eq!(carry(&mut c, "expose-out", &[]), Outcome::Changed);
+    assert_eq!(&fields(&c)[STEPS..=STEP], ["3", "2"]);
+    assert_eq!(fields(&c)[EXPOSURE], "0.00");
+    // A clear is a step of its own, not the run's: Uncrop after a crop
+    // leaves the crop's step, and undo brings the crop back.
+    assert_eq!(
+        carry(&mut c, "crop", &["0.1000", "0.1000", "0.5000", "0.5000"]),
+        Outcome::Changed
+    );
+    assert_eq!(&fields(&c)[STEPS..=STEP], ["4", "3"]);
+    assert_eq!(carry(&mut c, "uncrop", &[]), Outcome::Changed);
+    assert_eq!(&fields(&c)[STEPS..=STEP], ["5", "4"]);
+    assert_eq!(fields(&c)[CROP], "-");
+    assert_eq!(carry(&mut c, "undo", &[]), Outcome::Changed);
+    assert_eq!(fields(&c)[CROP], "0.1000 0.1000 0.5000 0.5000");
 }
 
 #[test]
@@ -5010,31 +5040,31 @@ fn the_history_records_the_develop_steps_and_undoes_toggles_and_deletes_them() {
         }]
     );
     assert_eq!(apply(&mut c, &effects).unwrap(), Outcome::Changed);
-    assert_eq!(fields(&c)[LOOK], "-");
+    assert_eq!(fields(&c)[EXPOSURE], "0.66");
     assert_eq!(&fields(&c)[STEPS..=STEP], ["3", "2"]);
     assert!(!c.steps()[2].on);
     assert_eq!(carry(&mut c, "step-toggle", &[]), Outcome::Changed);
-    assert_eq!(fields(&c)[LOOK], "portra");
+    assert_eq!(fields(&c)[EXPOSURE], "0.33");
     assert!(c.steps()[2].on);
 
     // A step off in the middle: its key falls back to the earlier step's
     // value; set again, the new value is a new step, the off one kept.
     assert_eq!(key(&mut c, "Up"), Outcome::Changed);
     assert_eq!(carry_key(&mut c, "t"), Outcome::Changed);
-    assert_eq!(fields(&c)[EXPOSURE], "0.33");
-    assert_eq!(carry(&mut c, "expose-out", &[]), Outcome::Changed);
+    assert_eq!(fields(&c)[LOOK], "-");
+    assert_eq!(carry(&mut c, "look", &["velvia"]), Outcome::Changed);
     assert_eq!(&fields(&c)[STEPS..=STEP], ["4", "3"]);
-    assert_eq!(fields(&c)[EXPOSURE], "0.00");
+    assert_eq!(fields(&c)[LOOK], "velvia");
     assert_eq!(
         c.steps()
             .iter()
             .map(|step| (step.on, step.key, step.value.clone()))
             .collect::<Vec<_>>(),
         [
+            (true, Key::Exposure, Some("0.66".to_string())),
+            (false, Key::Look, Some("portra".to_string())),
             (true, Key::Exposure, Some("0.33".to_string())),
-            (false, Key::Exposure, Some("0.66".to_string())),
-            (true, Key::Look, Some("portra".to_string())),
-            (true, Key::Exposure, Some("0.00".to_string())),
+            (true, Key::Look, Some("velvia".to_string())),
         ]
     );
 
@@ -5051,12 +5081,12 @@ fn the_history_records_the_develop_steps_and_undoes_toggles_and_deletes_them() {
     );
     assert_eq!(apply(&mut c, &effects).unwrap(), Outcome::Changed);
     assert_eq!(&fields(&c)[STEPS..=STEP], ["3", "2"]);
-    assert_eq!(fields(&c)[EXPOSURE], "0.33");
+    assert_eq!(fields(&c)[LOOK], "-");
     assert_eq!(key(&mut c, "Up"), Outcome::Changed);
     assert_eq!(carry_key(&mut c, "Backspace"), Outcome::Changed);
     assert_eq!(&fields(&c)[STEPS..=STEP], ["2", "1"]);
     assert_eq!(fields(&c)[EXPOSURE], "0.33");
-    assert_eq!(fields(&c)[LOOK], "portra");
+    assert_eq!(fields(&c)[LOOK], "-");
 
     // Undo takes the last step back; with none left it asks all the same
     // and the adapter, finding nothing to take, settles it ignored.
@@ -5070,7 +5100,7 @@ fn the_history_records_the_develop_steps_and_undoes_toggles_and_deletes_them() {
     );
     assert_eq!(apply(&mut c, &effects).unwrap(), Outcome::Changed);
     assert_eq!(&fields(&c)[STEPS..=STEP], ["1", "0"]);
-    assert_eq!(fields(&c)[LOOK], "-");
+    assert_eq!(fields(&c)[EXPOSURE], "0.66");
     assert_eq!(carry_key(&mut c, "z"), Outcome::Changed);
     assert_eq!(&fields(&c)[STEPS..=STEP], ["0", "-"]);
     assert_eq!(fields(&c)[EXPOSURE], "-");
@@ -5397,8 +5427,9 @@ fn the_tool_band_drives_the_develop_edits() {
         }]
     );
     assert_eq!(apply(&mut c, &effects).unwrap(), Outcome::Changed);
-    assert_eq!(&fields(&c)[STEPS..=STEP], ["2", "1"]);
-    // With steps, Undo and Reset are enabled and ask for what the keys do.
+    // The two nudges are one step, the second taking the first's.
+    assert_eq!(&fields(&c)[STEPS..=STEP], ["1", "0"]);
+    // With a step, Undo and Reset are enabled and ask for what the keys do.
     assert_eq!(c.tool_states(0), [true, false, true, true, true, true]);
     let (_, effects) = click(&mut c, button(2));
     assert_eq!(
@@ -5672,7 +5703,8 @@ fn the_exposure_slider_commits_on_release() {
     assert_eq!(apply(&mut c, &effects).unwrap(), Outcome::Changed);
     assert_eq!(fields(&c)[EXPOSURE], "-5.00");
     // And the pane is its own again afterwards: a press on the Undo
-    // button asks for the undo, not a slider step.
+    // button asks for the undo, not a slider step; the two commits were
+    // one step, so the undo takes both back.
     let undo = c.layout().history_buttons()[2].unwrap().rect();
     let (_, effects) = c
         .input(Input::Pointer {
@@ -5689,8 +5721,8 @@ fn the_exposure_slider_commits_on_release() {
         }]
     );
     assert_eq!(apply(&mut c, &effects).unwrap(), Outcome::Changed);
-    assert_eq!(fields(&c)[EXPOSURE], "3.00");
-    assert_eq!(c.slider_value(), 80);
+    assert_eq!(fields(&c)[EXPOSURE], "-");
+    assert_eq!(c.slider_value(), 50);
     // The ends clamp: the slider's last column is the last step, and a
     // drag off the surface's edge stays there.
     let right = (slider.rect().x + i64::from(slider.rect().width) - 1) as u32;

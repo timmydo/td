@@ -220,7 +220,8 @@ window, all speaking the toolkit's one vocabulary.
   when a flag hides the last shown photo, drops develop back to the cull grid as
   it ends the single view.
 - **The history pane.** Every develop edit is a step of the photo's sidecar
-  history (Files, Sidecar), and develop mode shows that history in a pane at
+  history (Files, Sidecar; a run of edits to one key is the one step it
+  began), and develop mode shows that history in a pane at
   the area's left (td-ui's `chrome::List`, `PANE_W` (216) reference pixels
   wide, above a band of three buttons: Toggle, Delete, Undo), the steps
   oldest first as `KEY VALUE` (`-` a clear; a crop as `x,y wxh` in whole
@@ -228,7 +229,8 @@ window, all speaking the toolkit's one vocabulary.
   dimmed, one selected. The selection is the model's (`state` reports the
   step count and the selected index): the newest step when a photo is
   developed, when the cursor moves to another photo, and whenever a settle
-  brings a longer history (a step just added), else the one selected,
+  brings a longer history (a step just added) or one as long whose last
+  step differs (taken up by a run of its key), else the one selected,
   clamped as steps go; none without a step, and dropped on leaving develop. In
   develop `Up` and `Down` walk the selection (the rows are the history's, not
   the grid's; `Left` and `Right` still move the cursor), `Ignored` at an end
@@ -577,14 +579,23 @@ The library is folders of originals; there is no database.
   disagrees; one without and with develop keys (a file from before there
   was a history) seeds one step per key in the file's order, written at
   its next rewrite (and counted toward the roll's sidecar budget as it
-  will be written), so every edit from then on is a step. The history is
-  always written after the lines: a file with lines after its steps is
-  read all the same and rewritten with them before. Setting a develop
-  key adds a step (each exposure nudge is its own, so undo is one nudge at
-  a time); a value the key already holds is no step; the flag is a cull
-  decision, never a step; and a history of `MAX_STEPS` (128) refuses a
-  further step until one goes. The `step-` key prefix is the history's:
-  a `step-` line that is not a step is a fault, not an unknown line kept.
+  will be written), so every edit from then on is a step, or takes up
+  the last as one does. The history is always written after the lines: a
+  file with lines after its steps is read all the same and rewritten
+  with them before. Setting a develop key to a value is a step: when the
+  last step is on and sets the same key to a value, that step takes the
+  new value (a run of exposure nudges, of crops or of looks is one step,
+  undone as one, its row in the pane showing the value in force);
+  otherwise a step is added, so a step that is off, or one of another
+  key, is never taken up. The last step is the file's, whichever session
+  or `edit` wrote it: a run continues across them, as the pane shows it.
+  A clear is a step of its own, never taken up and never taking a value
+  up, so undoing an uncrop brings the crop back. A value the key already
+  holds is no step; the flag is a cull decision, never a step; and a
+  history of `MAX_STEPS` (128) refuses a further step until one goes
+  (its last step still takes a value up). The `step-` key prefix is the
+  history's: a `step-` line that is not a step is a fault, not an
+  unknown line kept.
   `undo` takes the last step back, a step may be turned off (its
   key falls back to the earlier step's value, or clears) or deleted (the
   later ones closing up), and `reset` clears the history with the keys. A
@@ -1704,7 +1715,8 @@ preflight. A td-photo, td-ui or td-compositor edit selects this check in
    history pane at the develop view's left with its Toggle, Delete and Undo
    buttons, `Up` and `Down` walking its selection in develop, the `undo` (`z`),
    `step-toggle` (`t`) and `step-delete` (`Backspace`) actions and their
-   effects, and the step count and selection in `state`. Landed. (b) The develop
+   effects, and the step count and selection in `state`. Landed; a run of
+   edits to one key folding into its step landed after. (b) The develop
    controls: a tool strip above the preview with the crop, uncrop, undo and
    reset buttons and the exposure in a td-ui slider (`chrome::Slider`) beside
    its step buttons, a look strip with the looks on `F1`..`F9`, and the status

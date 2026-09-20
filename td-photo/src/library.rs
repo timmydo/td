@@ -535,10 +535,14 @@ impl Sidecar {
 
     /// Sets a known key, or clears it with `None`. The flag is set in
     /// place, appended if absent. A develop key is a step of the history:
-    /// one is added and the keys are rewritten from it; a value the key
-    /// already holds is no step, and a full history refuses one. The
-    /// value is held to the key's grammar, the same one `parse` holds a
-    /// file to.
+    /// when the last step is on and sets the same key to a value, that
+    /// step takes the new value (a run of exposure nudges, crops or looks
+    /// is one step, undone as one); otherwise one is added, and a full
+    /// history refuses it. A clear is its own step, never taken up and
+    /// never taking a value up, so undoing it brings the value back. A
+    /// value the key already holds is no step. The keys are rewritten
+    /// from the history. The value is held to the key's grammar, the same
+    /// one `parse` holds a file to.
     pub fn set(&mut self, key: Key, value: Option<&str>) -> Result<(), Error> {
         if let Some(value) = value {
             check(key, value)?;
@@ -550,14 +554,22 @@ impl Sidecar {
         if self.get(key) == value {
             return Ok(());
         }
-        if self.steps.len() >= MAX_STEPS {
-            return Err(Error::HistoryFull);
+        let value = value.map(str::to_string);
+        match self.steps.last_mut() {
+            Some(last) if last.on && last.key == key && last.value.is_some() && value.is_some() => {
+                last.value = value;
+            }
+            _ => {
+                if self.steps.len() >= MAX_STEPS {
+                    return Err(Error::HistoryFull);
+                }
+                self.steps.push(Step {
+                    on: true,
+                    key,
+                    value,
+                });
+            }
         }
-        self.steps.push(Step {
-            on: true,
-            key,
-            value: value.map(str::to_string),
-        });
         self.derive();
         Ok(())
     }

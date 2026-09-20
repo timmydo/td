@@ -926,14 +926,16 @@ fn a_history_folds_its_steps_and_the_keys_are_its_summary() {
     assert!(!sidecar.undo() && !sidecar.toggle_step(0) && !sidecar.delete_step(0));
     sidecar.set(Key::Exposure, Some("0.33")).unwrap();
     sidecar.set(Key::Exposure, Some("0.66")).unwrap();
-    // Every set is its own step, so undo is one nudge at a time.
-    assert_eq!(sidecar.steps().len(), 2);
+    // A run of nudges is one step, the last step taking each value, so
+    // undo takes the run back as one.
+    assert_eq!(sidecar.steps().len(), 1);
     assert_eq!(sidecar.exposure(), Some(66));
     assert!(sidecar.undo());
-    assert_eq!(sidecar.exposure(), Some(33));
+    assert_eq!(sidecar.exposure(), None);
     sidecar.set(Key::Exposure, Some("0.66")).unwrap();
-    assert!(sidecar.delete_step(0));
+    // Another key starts a step; the same key behind it is a step again.
     sidecar.set(Key::Look, Some("mono")).unwrap();
+    sidecar.set(Key::Exposure, Some("0.90")).unwrap();
     sidecar.set(Key::Exposure, Some("1.00")).unwrap();
     let steps = |sidecar: &Sidecar| {
         sidecar
@@ -960,9 +962,26 @@ fn a_history_folds_its_steps_and_the_keys_are_its_summary() {
     assert!(sidecar.toggle_step(2));
     assert_eq!(sidecar.exposure(), Some(66));
     assert!(sidecar.text().contains("step-3 off exposure 1.00\n"));
+    // A step off is not taken up: the same key is a new step behind it,
+    // and undoing that leaves the step off as it was.
+    sidecar.set(Key::Exposure, Some("1.20")).unwrap();
+    assert_eq!(
+        steps(&sidecar),
+        [
+            "on exposure 0.66",
+            "on look mono",
+            "off exposure 1.00",
+            "on exposure 1.20"
+        ]
+    );
+    assert!(sidecar.undo());
     assert!(sidecar.toggle_step(2));
     assert_eq!(sidecar.exposure(), Some(100));
-    // A clear is a step too, and the summary drops the key.
+    // A clear is a step too, and the summary drops the key; it is never
+    // taken up (the look before it comes back with undo) and never takes a
+    // value up (the look set after it is a step behind it).
+    sidecar.set(Key::Look, Some("velvia")).unwrap();
+    assert_eq!(sidecar.steps().len(), 4);
     sidecar.set(Key::Look, None).unwrap();
     assert_eq!(
         steps(&sidecar).last().map(String::as_str),
@@ -970,6 +989,16 @@ fn a_history_folds_its_steps_and_the_keys_are_its_summary() {
     );
     assert_eq!(sidecar.look(), None);
     assert!(!sidecar.text().contains("\nlook "));
+    sidecar.set(Key::Look, Some("astia")).unwrap();
+    assert_eq!(sidecar.steps().len(), 6);
+    assert!(sidecar.undo());
+    assert_eq!(sidecar.look(), None);
+    assert!(sidecar.undo());
+    assert_eq!(sidecar.look(), Some("velvia"));
+    assert!(sidecar.undo());
+    assert_eq!(sidecar.look(), Some("mono"));
+    sidecar.set(Key::Look, None).unwrap();
+    assert_eq!(sidecar.steps().len(), 4);
     // Deleting a step closes the rest up; undo takes the last back.
     assert!(sidecar.delete_step(1));
     assert_eq!(
@@ -1011,6 +1040,14 @@ fn a_history_folds_its_steps_and_the_keys_are_its_summary() {
         stale.text(),
         "td-photo edit 1\nexposure 0.50\nfuture 1\nstep-1 on exposure 0.50\nstep-2 on crop -\n"
     );
+    // The last step of a file read back is taken up as one the session
+    // made would be, and so is a seeded one: the history is the file's.
+    let mut read = Sidecar::parse(b"td-photo edit 1\nstep-1 on exposure 0.50\n").unwrap();
+    read.set(Key::Exposure, Some("0.83")).unwrap();
+    assert_eq!(steps(&read), ["on exposure 0.83"]);
+    let mut seeded = Sidecar::parse(b"td-photo edit 1\nexposure 0.50\nlook mono\n").unwrap();
+    seeded.set(Key::Look, Some("velvia")).unwrap();
+    assert_eq!(steps(&seeded), ["on exposure 0.50", "on look velvia"]);
     // Reset clears the history with the keys.
     let mut reset = stale.clone();
     reset.reset();
@@ -1018,9 +1055,15 @@ fn a_history_folds_its_steps_and_the_keys_are_its_summary() {
     // A full history refuses a further step until one goes.
     let mut full = Sidecar::default();
     for i in 0..library::MAX_STEPS {
-        // Each value differs from the one in force, so each set is a step.
-        let value = format!("{}.{:02}", i / 100, i % 100);
-        full.set(Key::Exposure, Some(&value)).unwrap();
+        // The keys alternate and each value differs from the one in force,
+        // so each set is a step.
+        if i % 2 == 0 {
+            let value = format!("{}.{:02}", i / 100, i % 100);
+            full.set(Key::Exposure, Some(&value)).unwrap();
+        } else {
+            let value = format!("look-{i}");
+            full.set(Key::Look, Some(&value)).unwrap();
+        }
     }
     assert_eq!(full.steps().len(), library::MAX_STEPS);
     assert_eq!(
@@ -1028,6 +1071,10 @@ fn a_history_folds_its_steps_and_the_keys_are_its_summary() {
         Err(Error::HistoryFull)
     );
     assert_eq!(full.set(Key::Flag, Some("pick")), Ok(()));
+    // Its last step still takes a value up: no step is added.
+    assert_eq!(full.set(Key::Look, Some("look-full")), Ok(()));
+    assert_eq!(full.look(), Some("look-full"));
+    assert_eq!(full.steps().len(), library::MAX_STEPS);
     assert!(full.undo());
     assert_eq!(
         full.set(Key::Crop, Some("0.1000 0.1000 0.5000 0.5000")),
