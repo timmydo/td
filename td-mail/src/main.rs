@@ -240,7 +240,7 @@ Here is the format:
 
 ```toml
 [ui]
-editor = "nvim"          # optional: editor for composing ($EDITOR fallback)
+editor = "nvim"          # accepted and ignored: drafts are edited in the window
 browser = "firefox"      # optional: browser for opening URLs ($BROWSER fallback, then xdg-open)
 page_size = 100           # optional: emails per page (default 500)
 mouse = true              # optional: enable mouse support (default true)
@@ -418,7 +418,7 @@ fn print_help_config() {
     println!();
     println!("[ui]");
     println!(
-        "  editor = \"nvim\"              # Editor for composing (fallback: $EDITOR, then vi)"
+        "  editor = \"nvim\"              # Accepted and ignored: drafts are edited in the window"
     );
     println!("  browser = \"firefox\"           # Browser for opening URLs (fallback: $BROWSER, xdg-open)");
     println!("  page_size = 500              # Emails per page (default: 500)");
@@ -630,7 +630,6 @@ fn main() {
         config.accounts,
         0,
         config.ui.page_size,
-        config.ui.editor,
         config.ui.browser,
         config.ui.mouse,
         config.ui.sync_interval_secs,

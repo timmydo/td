@@ -112,6 +112,15 @@ impl HelpView {
             "  S           Show this message's spam score and verdict".to_string(),
             "  D           Expire now (deleted folder only)".to_string(),
             String::new(),
+            "Compose".to_string(),
+            "-------".to_string(),
+            "  Ctrl-S      Save the draft over its retained file".to_string(),
+            "  Ctrl-W      Close (asks when unsaved: y saves, n keeps the file as saved)"
+                .to_string(),
+            "  Ctrl-X/C/V  Cut, copy, paste within td-mail (a message's selection too)".to_string(),
+            "  Ctrl-Z/Y    Undo, redo".to_string(),
+            "  Ctrl-A      Select all".to_string(),
+            String::new(),
         ];
 
         HelpView { lines }

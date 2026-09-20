@@ -7371,7 +7371,7 @@ Each row is one landing or a small family, leaving the tree green.
 | 33 | **Claude Code ships — LANDED** as the fourth shipped application and the first foreign-payload terminal program: a marked payload on Firefox's runtime, run behind the same jail as the source-built mail and news, with the `devices=tty` grant in its policy and its own boot oracle unit, `claude-evidence`. Once every Firefox oracle has published, so no second window shares a frame those measure, the unit launches it twice as its application user: with no terminal of its own, which the grant refuses before anything runs, and inside a pseudo-terminal from `td-term --command`, where `claude --version` runs to exit status 0 through td-jail's registration on the live broker beside Firefox's instance; td-term's own line for its child's status, matched whole wherever the capture holds it, is the proof, so a failed acquisition, registration, jail or payload is a failed launch; Firefox's process token and bus identity are read before and after and must match, so the instance it ran beside is the live one; a failed launch's captured output goes to a file, never the console. The oracle found the jail keying the `/usr` aliases on Firefox's reviewed package library path rather than on the runtime, so a dynamic application with no package libraries had no interpreter; the aliases now follow the runtime, and stage 1 tells stage 2 so in a word of its own. The payload then died with SIGILL: the oracle's default `qemu64` CPU has no SSE4.2 or POPCNT, the x86-64-v2 baseline the payload assumes and Firefox's conservative build does not, so the boot now emulates `Nehalem`, the lowest stock model that supplies it. It then ran `--version` to exit 0, but the jail's post-exit read of the cgroup leaf's diagnostics found it already reaped, since the application is short-lived, and reported that as a failure; that read is observability the launch discards on success, so a leaf already gone is now `None`, not a failed launch, matching the rest of the module. The host oracle latches `TD-CLAUDE-TERMINAL-OK` and fails without it, and the roster tripwire now requires an evidence unit per shipped application. Not yet: a launcher card that opens it, and the executable state subtree its updater needs; the caller's working directory is rung 34 | a foreign-payload terminal application is proved to run in a terminal of its own, beside the browser, on one live bus |
 | 34 | **the admitted caller's working directory**: stage 1 maps its own directory through a declared filesystem grant and passes the bounded canonical result to stage 2, which starts there or falls back to `/` if it cannot enter it. The private-UID cutover makes the stock root authority the supported launcher; it starts from `/` and does not forward an operator's working directory. Direct human-UID application launch is refused. A later typed launch request must carry an admitted working directory to restore that operator flow. The jail's existing grant mapping and argv/refusal tests remain applicable to admitted callers | an admitted caller's directory is retained only inside its declared grant; stock launches currently start at `/` |
 | 35 | **news in a td-ui window — LANDED** (§W.8, "Reworked"): td-ui gains the cell screen, a grid of styled cells presented as a plain toplevel that polls the program's handler each turn, and td-news's views draw on it whole; its terminal layer and UNSAFE.md §18 surface are gone, the crate forbids `unsafe`, the recipe is a static PIE Cargo build over the toolkit, the `news` package drops `devices=tty`, and the `[news]` unit launches it direct and is ready when the compositor's layout names its toplevel. Mail follows in its own increment. Reworked again (§W.8, "Reworked again"): for news the toolkit's lists and td-editor's read-only document pane in the widget window replace the cell screen, since deleted (`td-ui/DESIGN.md`, increment 13), and the recipe stages `td-editor` beside `td-ui` | one of the two source-built applications no longer needs a terminal, a pty grant or td-term to exist |
-| 36 | **mail in a td-ui window — LANDED** (§W.8, "Reworked"): td-mail's views keep their cursor-and-attribute writer over the window's cell screen, so they move untouched; its terminal layer and UNSAFE.md §17 are gone and the crate forbids `unsafe`; the recipe is a static PIE Cargo build over the toolkit, the `mail` package drops `devices=tty`, and the `[mail]` unit launches it direct with the anchored layout probe. The direct-rustc local-source ladder keeps one user, td-install-qemu-test. Reworked again (§W.8, "Reworked again"): for mail too the toolkit's lists and td-editor's read-only document pane in the widget window replace the cell screen, since deleted, the recipe stages `td-editor` beside `td-ui`, and composing in an editable pane follows | neither source-built application needs a terminal, a pty grant or td-term to exist; Claude is the terminal set, and §W.7's relaunch is a window request |
+| 36 | **mail in a td-ui window — LANDED** (§W.8, "Reworked"): td-mail's views keep their cursor-and-attribute writer over the window's cell screen, so they move untouched; its terminal layer and UNSAFE.md §17 are gone and the crate forbids `unsafe`; the recipe is a static PIE Cargo build over the toolkit, the `mail` package drops `devices=tty`, and the `[mail]` unit launches it direct with the anchored layout probe. The direct-rustc local-source ladder keeps one user, td-install-qemu-test. Reworked again (§W.8, "Reworked again"): for mail too the toolkit's lists and td-editor's read-only document pane in the widget window replace the cell screen, since deleted, and the recipe stages `td-editor` beside `td-ui`; composing is in an editable pane in the same window (§W.8, "Composing in place"), so the package ships no editor | neither source-built application needs a terminal, a pty grant or td-term to exist; Claude is the terminal set, and §W.7's relaunch is a window request |
 
 **Of the two reversals this ladder used to omit entirely, timezone now
 has a rung and accessibility still does not.** §O made timezone support
@@ -9533,9 +9533,9 @@ environment. It is a native Wayland client: the mail jail already carries
 `sockets=wayland`, so the editor opens its own toplevel beside the mail
 window, and td-mail reaps it in the background while its own window
 continues, as it does for any editor. The static runtime has no shell, so
-td-mail executes a plain-word editor command directly and keeps `sh -c`
-only for shell text (`td-mail/README.md`). Landed; the in-jail acceptance
-test in `td-editor/DESIGN.md` is not.
+td-mail executed a plain-word editor command directly and kept `sh -c`
+only for shell text, until "Reworked" below. Landed; the in-jail
+acceptance test in `td-editor/DESIGN.md` is not.
 
 **Rendering.** Section 11 of `td-compositor/DESIGN.md` pins a Unifont PSF2
 face and a pure renderer over it; td-term draws with it. The editor borrows
@@ -9570,6 +9570,14 @@ with `EDITOR` in the manifest environment. Landed.
 The terminal fallback for a headless session is a later increment; the
 mail composition path is the one the editor exists for.
 
+**Reworked: composing in place.** td-mail no longer runs an editor
+child: it composes in td-editor's document view embedded in its own
+window (§W.8, "Composing in place"), so the `mail` package ships no
+`/app/bin/td-editor` and sets no `EDITOR`, and the in-jail `$EDITOR`
+acceptance test is moot. td-editor stays a shipped recipe and a
+library crate; the `$EDITOR` contract in `td-editor/DESIGN.md` stands
+for callers outside this tree.
+
 ### W.6 Opening links and attachments from a jailed terminal application
 
 **Diagnosis.** `td-news` opens a link by trying, in order, a configured
@@ -9577,8 +9585,9 @@ browser command through `sh -c`, `$BROWSER` as a program, then
 `xdg-open` and `open`. `td-mail` opens links through `sh -c` with its
 configured browser and saved attachments through `$OPENER` or
 `xdg-open`; it ran its editor through `sh -c` too, until W.5 (a
-plain-word editor command now runs directly). Inside the jail
-none of those exist: the `mail` and `news` packages are static binaries
+plain-word editor command then ran directly, until composing moved
+into its window, §W.5 "Reworked"). Inside the jail none of those
+exist: the `mail` and `news` packages are static binaries
 on the data-only `static-runtime`, so `PATH=/app/bin:/usr/bin` holds only the
 application itself, there is no `sh`, no `xdg-open`, `$BROWSER` is
 unset, and `/bin/firefox` is a host path the jail does not see. Outside
@@ -9587,8 +9596,9 @@ was already "no browser opener available". The portal is the designed
 answer (§E, row 4): `.OpenURI` starts the configured browser for `http`
 and `https` and refuses `file`; it is listed as absent in rung 22.
 Composing mail had the same shape until td-editor (W.5) shipped inside
-the `mail` closure at `/app/bin/td-editor`; td-mail now has an editor to
-run, and links and attachments are what remain.
+the `mail` closure at `/app/bin/td-editor`, and has none now that
+td-mail composes in its own window; links and attachments are what
+remain.
 
 **Plan.** (1) td-portal serves `org.freedesktop.portal.OpenURI.OpenURI`
 for `http` and `https` exactly as §E's row specifies: the handler is the
@@ -9944,11 +9954,36 @@ without the terminal's rendition sequences. The terminal client's
 are; `mouse = false` still turns the pointer off. The crate depends on
 `td-editor` beside `td-ui`, by the same sibling spelling, and its recipe
 stages the `td-editor` tree with the two it staged; the package, the
-unit and its readiness probe are unchanged. Composing is still the
-`$EDITOR` child (`$EDITOR`, td-mail, and td-jail in
-`td-editor/DESIGN.md`) until the next increment moves it into an
-editable pane. The cell screen and its window are deleted
-(`td-ui/DESIGN.md`, increment 13).
+unit and its readiness probe are unchanged. The cell screen and its
+window are deleted (`td-ui/DESIGN.md`, increment 13).
+
+**Composing in place: td-mail edits a draft in td-editor's document
+view.** `c`, a reply or a forward retains the draft as before, the
+`.eml` file under the state directory with its attachment sidecar, and
+then opens it in the pane, editable, its paragraphs filled as they are
+typed, in place of the `$EDITOR` child. While the draft is edited every
+chord is the pane's, in td-editor's default profile: Ctrl-S writes the
+pane's text over the retained file and marks the document saved at that
+state; Ctrl-W pops a saved draft and asks about an unsaved one, where
+`y` saves and pops, `n` pops keeping the file as it was last saved and
+Escape returns to the draft; the bar's Save and Close labels are the
+same requests, and while the question is up no chord or press reaches
+the draft. A save is whole or not at all: a private sibling written and
+renamed over the retained file, so a failed write leaves the draft as it
+was and a symlink at the path is replaced, not followed; while the
+composer holds a draft the file is its own. The window's close with an
+unsaved draft puts the same question instead of closing (the widget
+window now lets its handler keep the window on a close request,
+`td-ui/DESIGN.md`), so nothing typed is lost to the close and a failed
+save is seen; nothing here ever deletes a draft. A draft past the pane's
+ceiling is retained and not opened, never shortened. Cut, copy and paste
+are a kill ring in the process, a selection captured from any of the
+pane's documents, a message's read-only view included, and pasted into
+the draft; the system clipboard is the toolkit's later increment. The
+`mail` package ships no editor and its manifest names none (§W.5,
+"Reworked"); td-mail's `[ui].editor` key is accepted and ignored, as
+`scrolloff` is; and the editor-launch code, its shell-word classifier
+and their tests are gone.
 
 ## X. Host mode — development only
 

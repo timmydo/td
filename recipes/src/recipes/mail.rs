@@ -4,12 +4,9 @@
 //! `$XDG_CONFIG_HOME/td-mail/config.toml`, which
 //! td-firstboot provisions once under the login user's jail state. Saved
 //! attachments land in the `xdg-download` grant, the directory Firefox shares.
-//! The package also ships td-editor beside it as `/app/bin/td-editor` and
-//! names it in the manifest's `EDITOR` (APPLICATIONS.md §W.5): td-mail
-//! composes in `$EDITOR`, the jail's `/app` sees no editor that is not
-//! packaged with the application, and the editor is a Wayland client the
-//! jail's existing `sockets=wayland` grant admits, so it opens its own
-//! toplevel beside the mail window.
+//! Composing is in td-mail's own window, in td-editor's document pane
+//! the crate embeds (APPLICATIONS.md §W.8, "Composing in place"), so the
+//! package ships no editor and its manifest names none.
 use crate::application::ApplicationDeclaration;
 use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 use td_engine::launcher::LauncherDeclaration;
@@ -22,27 +19,12 @@ const APPLICATION_SEARCH_TERMS: &[&str] = crate::ladder::TD_MAIL_SEARCH_TERMS;
 /// The source-built static binary this package wraps, and its recipe.
 const PROGRAM: &str = "td-mail";
 const PROGRAM_RECIPE: &str = "td-mail";
-/// The editor the package ships for composition, and where td-mail finds it.
-/// The entry must stay a command of plain words: td-mail runs such an
-/// `$EDITOR` directly (`plain_command` in td-mail/src/ui/mod.rs, which
-/// pins this value), and anything else it hands to a shell the runtime
-/// does not have.
-const EDITOR: &str = "td-editor";
-const EDITOR_RECIPE: &str = "td-editor";
-const EDITOR_ENTRY: &str = "/app/bin/td-editor";
 
 pub fn recipe() -> Recipe {
-    // td-mail selects `[ui].editor`, then `$EDITOR`, then `vi`; td-firstboot's
-    // provisioned configuration sets no editor, so the manifest's `EDITOR`
-    // is the one td-mail runs, directly and without a shell, since the
-    // static runtime has none (td-mail/README.md).
-    let Ok(declaration) = ApplicationDeclaration::new("static-runtime", APPLICATION_ENTRY)
-        .and_then(|declaration| declaration.with_environment("EDITOR", EDITOR_ENTRY))
-    else {
+    let Ok(declaration) = ApplicationDeclaration::new("static-runtime", APPLICATION_ENTRY) else {
         return invalid_recipe("declaration");
     };
-    let Ok(launcher) =
-        LauncherDeclaration::new(APPLICATION_DISPLAY_NAME, APPLICATION_SEARCH_TERMS)
+    let Ok(launcher) = LauncherDeclaration::new(APPLICATION_DISPLAY_NAME, APPLICATION_SEARCH_TERMS)
     else {
         return invalid_recipe("launcher");
     };
@@ -70,7 +52,7 @@ pub fn recipe() -> Recipe {
     };
 
     Recipe::mesboot(APPLICATION_NAME, "0.1")
-        .inputs(&[PROGRAM_RECIPE, "td-secret", EDITOR_RECIPE])
+        .inputs(&[PROGRAM_RECIPE, "td-secret"])
         .payload_inputs(&["static-runtime"])
         .steps(vec![
             Step::MkDir {
@@ -110,24 +92,6 @@ pub fn recipe() -> Recipe {
                 files: vec!["{in:td-secret}/lib/debug/bin/td-secret.debug".into()],
                 dest: "{out}/lib/debug/files/bin".into(),
             },
-            // The editor, static and split by its own recipe (td-editor-test
-            // asserts the shape), and its companion at the path the object
-            // index derives from the copied runtime. The package's one
-            // assembly-exception marker above, td-mail's bytes, covers it
-            // too: the index reads one boundary set per store item, and a
-            // std-only Rust output on the same toolchain has exactly
-            // td-mail's three, which the test below pins
-            // (td-profiler/DESIGN.md's union rule).
-            Step::CopyFiles {
-                files: vec![format!("{{in:{EDITOR_RECIPE}}}/bin/{EDITOR}")],
-                dest: "{out}/files/bin".into(),
-            },
-            Step::CopyFiles {
-                files: vec![format!(
-                    "{{in:{EDITOR_RECIPE}}}/lib/debug/bin/{EDITOR}.debug"
-                )],
-                dest: "{out}/lib/debug/files/bin".into(),
-            },
             Step::validate_static_application(&declaration),
         ])
         .application(declaration)
@@ -161,16 +125,13 @@ mod tests {
         assert_eq!(declaration.runtime(), "static-runtime");
         assert_eq!(declaration.entry(), APPLICATION_ENTRY);
         assert_eq!(declaration.alias(), None);
-        // The editor is named by the path the package copies it to, and by
-        // nothing else: the manifest carries no other environment.
-        assert_eq!(
-            declaration.environment().collect::<Vec<_>>(),
-            [("EDITOR", EDITOR_ENTRY)]
-        );
-        assert_eq!(EDITOR_ENTRY, format!("/app/bin/{EDITOR}"));
+        // No editor: composing is in td-mail's window, so the manifest
+        // carries no environment and the package no second program but
+        // the credential helper.
+        assert_eq!(declaration.environment().count(), 0);
         assert_eq!(
             recipe.inputs,
-            Some(vec![PROGRAM_RECIPE.into(), "td-secret".into(), EDITOR_RECIPE.into()])
+            Some(vec![PROGRAM_RECIPE.into(), "td-secret".into()])
         );
         assert_eq!(recipe.payload_inputs, Some(vec!["static-runtime".into()]));
         let launcher = recipe.application_launcher.as_ref().expect("launcher");
@@ -179,7 +140,10 @@ mod tests {
             launcher.search_terms().collect::<Vec<_>>(),
             APPLICATION_SEARCH_TERMS
         );
-        let permissions = recipe.application_permissions.as_ref().expect("permissions");
+        let permissions = recipe
+            .application_permissions
+            .as_ref()
+            .expect("permissions");
         // The fetch grant, not the network: the keyfile below says which.
         assert!(!permissions.network());
         // No terminal: the client is a Wayland client of its own window.
@@ -211,40 +175,23 @@ mod tests {
                 if files == &[format!("{{in:{PROGRAM_RECIPE}}}/lib/debug/.td-assembly-exception")]
                     && dest == "{out}/lib/debug"
         )));
-        // The editor and its companion land beside td-mail's, before the
-        // validator.
-        let validator = steps
-            .iter()
-            .position(|step| matches!(step, Step::ValidateStaticApplication { .. }))
-            .expect("validator");
-        for (file, dest) in [
-            (format!("{{in:{EDITOR_RECIPE}}}/bin/{EDITOR}"), "{out}/files/bin"),
-            (
-                format!("{{in:{EDITOR_RECIPE}}}/lib/debug/bin/{EDITOR}.debug"),
-                "{out}/lib/debug/files/bin",
-            ),
-        ] {
-            let copy = steps
-                .iter()
-                .position(|step| matches!(
-                    step,
-                    Step::CopyFiles { files, dest: got } if files == &[file.clone()] && got == dest
-                ))
-                .unwrap_or_else(|| panic!("{file} is not copied to {dest}"));
-            assert!(copy < validator, "{file} is copied after the validator");
-        }
-        // One marker, td-mail's, stands for every runtime in the package:
-        // the editor's boundary set must be td-mail's exactly.
-        assert_eq!(
-            td_engine::target_profile::output_assembly_exceptions(EDITOR_RECIPE),
-            td_engine::target_profile::output_assembly_exceptions(PROGRAM_RECIPE)
+        assert!(
+            !steps.iter().any(|step| matches!(
+                step,
+                Step::CopyFiles { files, .. } if files.iter().any(|f| f.contains("td-editor"))
+            )),
+            "no editor is packaged"
         );
+        // One marker, td-mail's, stands for every runtime in the package:
+        // the helper's boundary set must be td-mail's exactly.
         assert_eq!(
             td_engine::target_profile::output_assembly_exceptions("td-secret"),
             td_engine::target_profile::output_assembly_exceptions(PROGRAM_RECIPE)
         );
         assert!(
-            !steps.iter().any(|step| matches!(step, Step::CopyTree { .. })),
+            !steps
+                .iter()
+                .any(|step| matches!(step, Step::CopyTree { .. })),
             "a tree copy may not precede the static validator"
         );
         assert!(matches!(

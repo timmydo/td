@@ -1545,7 +1545,7 @@ mod tests {
     fn shown_text(view: &EmailView, columns: usize) -> (String, String) {
         match view.scene().body {
             Body::Text { key, text } => (key, text(columns)),
-            Body::List { .. } => panic!("the message is a text"),
+            Body::List { .. } | Body::Edit { .. } => panic!("the message is a text"),
         }
     }
 

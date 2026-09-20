@@ -2,11 +2,12 @@
 //! with the keys it reads from its chords, a press on a row, and the
 //! wheel's travel; polls the backend's channel each turn; and presents
 //! the frame the top view's scene lays out (`frame`): the toolkit's
-//! action bar, text entry and list, and td-editor's read-only document
-//! pane for a message. The window owns the Wayland connection; the
-//! session owns the views, the pane, the backend and the account.
+//! action bar, text entry and list, and td-editor's document pane,
+//! read-only for a message and editable for a draft. The window owns
+//! the Wayland connection; the session owns the views, the pane, the
+//! backend and the account.
 
-mod frame;
+pub mod frame;
 pub mod input;
 pub mod views;
 
@@ -15,14 +16,17 @@ use crate::compose;
 use crate::config::{AccountConfig, RetentionPolicyConfig, SpamConfig};
 use crate::regex::UserRegex;
 use crate::rules::CompiledRule;
-use frame::{Frame, Layout, Pane};
+use frame::{Draft, Frame, Layout, Pane};
 use input::Key;
 use std::io;
+use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use td_editor::ui::Outcome;
 use td_ui::raster::{Raster, Surface};
 use td_ui::window::{Flow, Handler, Input, PointerPhase};
+use views::compose::ComposeView;
 use views::mailbox_list::MailboxListView;
 use views::{Body, Scroll, ViewAction, ViewStack};
 
@@ -63,7 +67,10 @@ struct Setup {
     my_email_regex: Arc<UserRegex>,
     spam_config: SpamConfig,
     offline: bool,
-    editor_cmd: String,
+    /// Where drafts are retained: a test's directory, or none for the
+    /// state directory the environment names, read as each draft is
+    /// retained.
+    draft_dir: Option<PathBuf>,
     /// None offline: no connection is ever asked for.
     connector: Option<Sender<ConnectRequest>>,
 }
@@ -197,6 +204,9 @@ struct Session {
     last_idle_sync: Instant,
     dirty: bool,
     quitting: bool,
+    /// The window's close was asked with a draft unsaved: the draft's
+    /// question is up, and its answer closes the window or keeps it.
+    closing: bool,
 }
 
 impl Session {
@@ -222,6 +232,7 @@ impl Session {
             last_idle_sync: Instant::now(),
             dirty: true,
             quitting: false,
+            closing: false,
         };
         // The window reads the title at binding, before any poll.
         session.refresh_title();
@@ -237,7 +248,7 @@ impl Session {
         let scene = view.scene();
         let total = match &scene.body {
             Body::List { total, .. } => Some(*total),
-            Body::Text { .. } => None,
+            Body::Text { .. } | Body::Edit { .. } => None,
         };
         Some(Shape {
             layout: Layout::new(self.surface, &scene),
@@ -271,6 +282,12 @@ impl Session {
                     return;
                 };
                 self.pane.close(slot.text);
+                // The draft the window's close asked about is closed:
+                // the window follows.
+                if self.closing {
+                    self.quitting = true;
+                    return;
+                }
                 // Let the revealed view refresh state that may have changed
                 // while it was hidden (e.g. mailbox unread counts).
                 if let Some(view) = self.stack.current_mut() {
@@ -283,10 +300,7 @@ impl Session {
                 self.redraw();
             }
             ViewAction::Quit => self.quitting = true,
-            ViewAction::Compose(draft_text) => {
-                spawn_editor(&draft_text, &self.setup.editor_cmd);
-                self.redraw();
-            }
+            ViewAction::Compose(draft) => self.compose(&draft),
             ViewAction::SwitchAccount(name) => self.switch_account(&name),
             ViewAction::Scroll(scroll) => {
                 let changed = match scroll {
@@ -295,12 +309,105 @@ impl Session {
                         let rows = self.page() as isize;
                         self.pane.scroll(rows.saturating_mul(pages))
                     }
-                    Scroll::Chord(chord) => self.pane.chord(chord),
+                    Scroll::Chord(chord) => self.pane.chord(chord) == Outcome::Changed,
                 };
                 if changed {
                     self.redraw();
                 }
             }
+            ViewAction::Request(name) => self.request(name),
+        }
+    }
+
+    /// Retains the draft as a file, as the `$EDITOR` child was handed
+    /// it, and opens it in the pane to edit; a draft that cannot be
+    /// retained is logged and not opened, since there would be nothing
+    /// to save it over.
+    fn compose(&mut self, draft: &compose::ComposeDraft) {
+        let prepared = match &self.setup.draft_dir {
+            Some(dir) => compose::write_compose_draft_in(draft, dir),
+            None => compose::write_compose_draft(draft),
+        };
+        let prepared = match prepared {
+            Ok(prepared) => prepared,
+            Err(e) => {
+                crate::log_error!("Failed to retain draft: {}", e);
+                self.redraw();
+                return;
+            }
+        };
+        crate::log_info!("Draft retained at {}", prepared.draft_path.display());
+        if let Some(path) = &prepared.attachment_dir {
+            crate::log_info!("Draft attachments retained at {}", path.display());
+        }
+        match ComposeView::open(prepared.draft_path, prepared.attachment_dir) {
+            Ok(view) => self.act(ViewAction::Push(Box::new(view))),
+            Err(e) => {
+                crate::log_error!("Failed to read the retained draft back: {}", e);
+                self.redraw();
+            }
+        }
+    }
+
+    /// Whether the top view's body is a draft being edited, so that
+    /// every chord is the pane's; `asking` too when the view holds
+    /// the draft but has the keys, asking about it.
+    fn editing(&self, asking: bool) -> bool {
+        self.stack.current().is_some_and(|view| {
+            matches!(
+                view.scene().body,
+                Body::Edit { focused, .. } if focused || asking
+            )
+        })
+    }
+
+    /// The top view's draft: the document its slot holds, whether or
+    /// not the pane shows it this frame.
+    fn draft(&mut self) -> Draft<'_> {
+        let tab = self
+            .stack
+            .top()
+            .and_then(|slot| slot.text.as_ref().map(frame::Shown::tab));
+        Draft::new(&mut self.pane, tab)
+    }
+
+    /// A request of the pane's kind, from its chord or a bar label: the
+    /// clipboard's are the kill ring's, and the rest are the view's,
+    /// with its draft in hand.
+    fn request(&mut self, name: &str) {
+        let changed = match name {
+            "cut" => self.pane.cut(),
+            "copy" => {
+                self.pane.copy();
+                false
+            }
+            "paste" => self.pane.paste(),
+            _ => {
+                let Session { stack, pane, .. } = self;
+                let tab = stack
+                    .top()
+                    .and_then(|slot| slot.text.as_ref().map(frame::Shown::tab));
+                let mut draft = Draft::new(pane, tab);
+                let action = stack
+                    .current_mut()
+                    .map(|view| view.request(name, &mut draft));
+                if let Some(action) = action {
+                    self.act(action);
+                }
+                return;
+            }
+        };
+        if changed {
+            self.redraw();
+        }
+    }
+
+    /// A chord to the pane, and what it asked for served.
+    fn pane_chord(&mut self, chord: &str) {
+        match self.pane.chord(chord) {
+            Outcome::Changed => self.redraw(),
+            Outcome::Request { name, .. } => self.request(name),
+            Outcome::Created(_) | Outcome::Prefix | Outcome::Ignored => {}
         }
     }
 
@@ -360,12 +467,17 @@ impl Session {
         }
     }
 
-    /// One of the client's keys to the top view.
+    /// One of the client's keys to the top view; a bar label's request
+    /// is served as the pane's own.
     fn key(&mut self, key: Key) {
         if self.quitting {
             return;
         }
         self.last_user_activity = Instant::now();
+        if let Key::Request(name) = key {
+            self.request(name);
+            return;
+        }
         let page = self.page();
         match self.stack.handle_key(key, page) {
             Some(action) => self.act(action),
@@ -373,21 +485,50 @@ impl Session {
         }
     }
 
-    /// A chord: the client's key when it names one; otherwise the pane's,
-    /// when a text is shown, so a chord the client does not claim (an
-    /// arrow with Shift, Tab, a copy) reaches the document.
+    /// A chord: every one is the pane's while a draft is edited, and
+    /// none is while its view asks about it, when only the client's
+    /// keys reach the view; otherwise the client's key when it names
+    /// one, and else the pane's, when a text is shown, so a chord the
+    /// client does not claim (an arrow with Shift, Tab, a copy) reaches
+    /// the document.
     fn chord(&mut self, chord: &str) {
+        if self.editing(false) {
+            self.last_user_activity = Instant::now();
+            self.pane_chord(chord);
+            return;
+        }
+        if self.editing(true) {
+            if let Some(key) = input::key(chord) {
+                self.key(key);
+            }
+            return;
+        }
         match input::key(chord) {
             Some(key) => self.key(key),
             None => {
                 if self
                     .shape()
                     .is_some_and(|shape| shape.layout.pane.is_some())
-                    && self.pane.chord(chord)
                 {
-                    self.redraw();
+                    self.pane_chord(chord);
                 }
             }
+        }
+    }
+
+    /// The compositor asks the window to close: it closes at once
+    /// unless a draft is unsaved, when the draft's own question is put
+    /// instead and its answer decides (a save or a discard closes the
+    /// window; Escape keeps it, with the draft), so nothing typed is
+    /// lost to the close and a save that fails is seen.
+    fn close_requested(&mut self) -> Flow {
+        if self.editing(true) && self.draft().dirty() {
+            self.closing = true;
+            self.request("close-tab");
+            self.redraw();
+            Flow::Continue
+        } else {
+            Flow::Quit
         }
     }
 
@@ -395,7 +536,10 @@ impl Session {
         let Some(shape) = self.shape() else {
             return;
         };
-        let Some(rect) = shape.layout.pane else {
+        // A view asking about its draft has the pointer too: the bar's
+        // labels answer, and the pane is not touched meanwhile.
+        let asking = self.editing(true) && !self.editing(false);
+        let Some(rect) = shape.layout.pane.filter(|_| !asking) else {
             // A drag begun in a pane the view no longer shows ends here.
             if self.pane.drag {
                 self.pane.cancel_pointer();
@@ -484,6 +628,14 @@ impl Session {
                         .show(&mut slot.text, key, columns, || text(columns));
                 }
             }
+            // The draft is loaded whether or not the surface has room
+            // for the pane, so its view's save is always its own.
+            Body::Edit { key, text, .. } => {
+                if let Some(rect) = layout.pane {
+                    self.pane.place(rect, surface);
+                }
+                self.pane.edit(&mut slot.text, key, text);
+            }
         }
         if let (Some(field), Some(entry)) = (layout.entry, &scene.entry) {
             let len = entry.text.chars().count();
@@ -519,7 +671,11 @@ impl Handler for Session {
 
     fn input(&mut self, input: Input<'_>) -> Flow {
         match input {
-            Input::Close => return Flow::Quit,
+            Input::Close => {
+                if self.close_requested() == Flow::Quit {
+                    return Flow::Quit;
+                }
+            }
             Input::Resize(surface) => {
                 self.surface = surface;
                 self.redraw();
@@ -545,6 +701,11 @@ impl Handler for Session {
                 self.pane.focus(focused);
                 self.redraw();
             }
+        }
+        // The question the close put was answered with the draft kept:
+        // the next close asks again.
+        if self.closing && !self.quitting && self.editing(false) {
+            self.closing = false;
         }
         self.refresh_title();
         if self.quitting {
@@ -632,7 +793,6 @@ pub fn run(
     accounts: Vec<AccountConfig>,
     current_account_idx: usize,
     page_size: u32,
-    editor: Option<String>,
     browser: Option<String>,
     mouse: bool,
     sync_interval_secs: Option<u64>,
@@ -657,9 +817,6 @@ pub fn run(
         )));
     };
     let first = first.clone();
-    let editor_cmd = editor
-        .or_else(|| std::env::var("EDITOR").ok())
-        .unwrap_or_else(|| "vi".to_string());
     let setup = Setup {
         account_names: accounts.iter().map(|a| a.name.clone()).collect(),
         accounts,
@@ -677,7 +834,7 @@ pub fn run(
         my_email_regex: Arc::new(my_email_regex),
         spam_config,
         offline,
-        editor_cmd,
+        draft_dir: None,
         connector: (!offline).then(spawn_connector),
     };
 
@@ -709,249 +866,6 @@ pub fn run(
         }
     }
     outcome.map_err(io::Error::other)
-}
-
-fn spawn_editor(draft: &compose::ComposeDraft, editor_cmd: &str) {
-    // Retain the draft and sidecars independently of the editor's lifetime.
-    let prepared = match compose::write_compose_draft(draft) {
-        Ok(prepared) => prepared,
-        Err(e) => {
-            crate::log_error!("Failed to retain draft: {}", e);
-            return;
-        }
-    };
-
-    crate::log_info!("Draft retained at {}", prepared.draft_path.display());
-    if let Some(path) = &prepared.attachment_dir {
-        crate::log_info!("Draft attachments retained at {}", path.display());
-    }
-    match launch_draft_editor(&prepared, editor_cmd) {
-        Ok(child) => reap_in_background(child),
-        Err(e) => crate::log_error!("Failed to spawn editor; draft retained: {}", e),
-    }
-}
-
-fn launch_draft_editor(
-    prepared: &compose::PreparedDraft,
-    editor_cmd: &str,
-) -> io::Result<std::process::Child> {
-    let editor_cmd = editor_cmd.trim();
-    if editor_cmd.is_empty() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "editor command is empty",
-        ));
-    }
-    // A command of plain words needs no shell and gets none: the program is
-    // executed directly with the draft path as its last argument, which is
-    // what `sh -c 'cmd "$1"'` does for such a command, on the application
-    // runtime that has no `sh` (the `mail` package ships `/app/bin/td-editor`
-    // as `$EDITOR` on the data-only static runtime) as much as on a host.
-    if let Some((program, args)) = plain_command(editor_cmd) {
-        return std::process::Command::new(program)
-            .args(args)
-            .arg(&prepared.draft_path)
-            .spawn();
-    }
-    // Anything else is shell text. Preserve the OS path as one quoted
-    // positional argument, not part of that text.
-    std::process::Command::new("sh")
-        .arg("-c")
-        .arg(format!("{} \"$1\"", editor_cmd))
-        .arg("sh")
-        .arg(&prepared.draft_path)
-        .spawn()
-}
-
-/// A byte a shell passes through unchanged in an unquoted word.
-fn plain_byte(byte: u8) -> bool {
-    byte.is_ascii_alphanumeric() || b"._/+:@,-".contains(&byte)
-}
-
-/// Leading words made of plain bytes that a shell interprets itself rather
-/// than resolving by `PATH`: its reserved words, and the builtins that
-/// have no identically behaving utility on `PATH`. A command starting with
-/// one keeps the shell, since executing it directly would look for a
-/// program of that name. A builtin with an identical external utility
-/// (`true`, `pwd`) need not be listed: the direct path runs the utility.
-const SHELL_WORDS: &[&str] = &[
-    ".", ":", "alias", "bg", "break", "builtin", "case", "cd", "command", "continue", "do", "done",
-    "elif", "else", "esac", "eval", "exec", "exit", "export", "fc", "fg", "fi", "for", "function",
-    "getopts", "hash", "if", "in", "jobs", "local", "read", "readonly", "return", "select", "set",
-    "shift", "source", "then", "time", "times", "trap", "type", "ulimit", "umask", "unalias",
-    "unset", "until", "wait", "while",
-];
-
-/// The program and arguments of an editor command that needs no shell:
-/// words of ASCII letters, digits and `._/+:@,-`, plus `=` after the first
-/// word where a shell passes it through unchanged, separated by spaces or
-/// tabs, whose first word is not one a shell interprets itself. Anything
-/// else (quotes, `$`, redirections, globs, `~`, `#`, a leading assignment,
-/// a newline or other control byte, a non-ASCII byte) makes the whole
-/// command shell text: `None`. The `mail` package names
-/// `/app/bin/td-editor` as `$EDITOR` (recipes/src/recipes/mail.rs) and its
-/// runtime has no shell, so that value must stay one this accepts; the
-/// test below pins it.
-fn plain_command(editor_cmd: &str) -> Option<(&str, Vec<&str>)> {
-    if editor_cmd
-        .bytes()
-        .any(|byte| byte.is_ascii_control() && byte != b'\t')
-    {
-        return None;
-    }
-    let mut words = editor_cmd
-        .split([' ', '\t'])
-        .filter(|word| !word.is_empty());
-    let program = words.next()?;
-    if !program.bytes().all(plain_byte) || SHELL_WORDS.contains(&program) {
-        return None;
-    }
-    let args: Vec<&str> = words.collect();
-    if args
-        .iter()
-        .any(|word| !word.bytes().all(|byte| plain_byte(byte) || byte == b'='))
-    {
-        return None;
-    }
-    Some((program, args))
-}
-
-#[cfg(test)]
-mod draft_tests {
-    use super::*;
-    use std::os::unix::ffi::OsStringExt;
-
-    #[test]
-    fn editor_exit_keeps_saved_draft_and_attachments_with_exact_path_bytes() -> io::Result<()> {
-        let root = std::env::temp_dir().join(format!(
-            "td-mail-editor-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir(&root)?;
-        let path = root.join(std::ffi::OsString::from_vec(b"draft ;$' \xff.eml".to_vec()));
-        let sidecar = root.join("attachments");
-        std::fs::create_dir(&sidecar)?;
-        std::fs::write(sidecar.join("original"), b"attachment")?;
-        let prepared = compose::PreparedDraft {
-            draft_path: path.clone(),
-            attachment_dir: Some(sidecar.clone()),
-        };
-        assert!(launch_draft_editor(&prepared, "  ").is_err());
-        // A plain-word command is executed directly: an absent program is a
-        // spawn error here, where a shell would have returned a child that
-        // exits 127. That difference is the proof no shell stood between.
-        assert!(launch_draft_editor(&prepared, "/definitely-absent-td-editor").is_err());
-        // The direct path hands the program the exact path bytes as its
-        // last argument: `cp SOURCE` receives the draft path, `\xff` and
-        // all, and writes the source's bytes there. The command is plain
-        // words, so this is the direct path and not the shell's.
-        std::fs::write(root.join("source"), b"saved")?;
-        let direct = format!("cp {}", root.join("source").display());
-        assert!(plain_command(&direct).is_some(), "{direct}");
-        std::fs::write(&path, b"original")?;
-        assert!(launch_draft_editor(&prepared, &direct)?.wait()?.success());
-        assert_eq!(std::fs::read(&path)?, b"saved");
-        // Shell text keeps the shell: a leading builtin the shell must
-        // resolve, and an interior newline the shell reads as a command
-        // separator, with `"$1"` still landing on the last line.
-        for (command, success, saved) in [
-            ("printf saved > \"$1\"; exit 0 #", true, true),
-            ("true\nprintf saved > \"$1\"; exit 0 #", true, true),
-            ("exit 7 #", false, false),
-            ("exec /definitely-absent-td-editor", false, false),
-            ("sh -c 'exit 7' sh #", false, false),
-        ] {
-            std::fs::write(&path, b"original")?;
-            let status = launch_draft_editor(&prepared, command)?.wait()?;
-            assert_eq!(status.success(), success);
-            assert_eq!(
-                std::fs::read(&path)?,
-                if saved {
-                    b"saved".as_slice()
-                } else {
-                    b"original"
-                }
-            );
-            assert_eq!(std::fs::read(sidecar.join("original"))?, b"attachment");
-        }
-        // The background reaper receives only Child, never retained paths.
-        let source = include_str!("mod.rs");
-        let production = source.split("#[cfg(test)]").next().unwrap();
-        assert!(!production.contains("remove_file"));
-        assert!(!production.contains("remove_dir_all"));
-        std::fs::remove_dir_all(root)
-    }
-
-    /// The direct path takes exactly the commands a shell would run
-    /// unchanged; every construct a shell would interpret keeps the shell.
-    #[test]
-    fn plain_words_run_without_a_shell_and_shell_text_keeps_one() {
-        assert_eq!(
-            plain_command("/app/bin/td-editor"),
-            Some(("/app/bin/td-editor", vec![]))
-        );
-        assert_eq!(
-            plain_command("  emacs -nw\t--keys=x  "),
-            Some(("emacs", vec!["-nw", "--keys=x"])),
-            "spaces and tabs separate; `=` after the first word is literal"
-        );
-        assert_eq!(
-            plain_command("/usr/bin/vi.1+2:3@4,5-6"),
-            Some(("/usr/bin/vi.1+2:3@4,5-6", vec![]))
-        );
-        for text in [
-            "",
-            " \t",
-            "vim -u ~/.vimrc",
-            "printf saved > \"$1\"",
-            "exit 7 #",
-            "a=b vi",
-            "vi=x",
-            "vi *",
-            "vi 'x'",
-            "vi\nx",
-            "vi\rx",
-            "vi\u{c}x",
-            "vi\tx\u{1}",
-            "vi;",
-            "vi|less",
-            "vi&",
-            "vi (x)",
-            "vi `x`",
-            "vi \\x",
-            "vi {x}",
-            "vi [x]",
-            "vi x?",
-            "vi x!",
-            "vi <x",
-            "vi %x",
-            "édit",
-            "exec vim",
-            "command emacs -nw",
-            ":",
-            ". vi",
-            "eval vi",
-            "time vi",
-            "if vi",
-        ] {
-            assert_eq!(plain_command(text), None, "{text:?}");
-        }
-        // Every reserved word is one the byte rule would otherwise admit,
-        // so the list is what keeps it on the shell; and a program named
-        // like one is still reachable by its path.
-        for word in SHELL_WORDS {
-            assert!(word.bytes().all(plain_byte), "{word}");
-            assert_eq!(plain_command(word), None, "{word}");
-        }
-        assert_eq!(
-            plain_command("/bin/time vi"),
-            Some(("/bin/time", vec!["vi"]))
-        );
-    }
 }
 
 #[cfg(test)]
@@ -994,9 +908,28 @@ mod frame_tests {
                 min_training: 20,
             },
             offline: true,
-            editor_cmd: "/definitely-absent-td-editor".to_string(),
+            draft_dir: Some(std::env::temp_dir().join(format!(
+                "td-mail-drafts-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ))),
             connector: None,
         }
+    }
+
+    /// The text of the pane's shown document.
+    fn text(session: &Session) -> String {
+        let tab = session.pane.tab().expect("a document");
+        session
+            .pane
+            .editor()
+            .document(tab)
+            .unwrap()
+            .text()
+            .to_string()
     }
 
     fn mailbox(id: &str, name: &str, role: &str, total: u32, unread: u32) -> Mailbox {
@@ -1321,5 +1254,207 @@ mod frame_tests {
             "popped: the pane's again"
         );
         assert_eq!(session.pane.editor().tabs().count(), 1);
+    }
+
+    /// `c` retains a draft and opens it in the pane, editable and
+    /// auto-filled, where every chord types (a `q` too); Ctrl-S writes
+    /// the pane's text over the file, as the Save label does; Ctrl-W
+    /// pops a saved draft and asks about an unsaved one, where Escape
+    /// returns to it, `y` saves and pops and `n` pops keeping the file
+    /// as last saved, and the question takes no edits; a message's
+    /// selection copied in its read-only pane pastes into the draft;
+    /// a window too small for the pane still gives the view its own
+    /// draft; and the window's close asks about an unsaved draft and
+    /// closes on the answer.
+    #[test]
+    fn composing_edits_the_retained_draft_in_the_pane() {
+        let (mut session, _cmd_rx, _resp_tx) = session(true);
+        let draft_dir = session.setup.draft_dir.clone().unwrap();
+        let path_of =
+            |session: &Session| draft_dir.join(session.title.trim_start_matches("Draft "));
+        key(&mut session, "c");
+        assert_eq!(session.stack.depth(), 2);
+        assert!(
+            session.title.starts_with("Draft td-mail-draft-"),
+            "{}",
+            session.title
+        );
+        let tab = session.pane.tab().expect("the draft");
+        let document = session.pane.editor().document(tab).unwrap();
+        assert!(!document.read_only());
+        assert!(document.auto_fill());
+        let template = document.text().to_string();
+        assert!(
+            template.starts_with("From: me@example.com\nTo: \n"),
+            "{template}"
+        );
+        let first = path_of(&session);
+        assert_eq!(std::fs::read_to_string(&first).unwrap(), template);
+        // Every chord is the pane's: q types rather than quits.
+        for chord in ["C-End", "h", "i", "q"] {
+            key(&mut session, chord);
+        }
+        assert_eq!(text(&session), format!("{template}hiq"));
+        assert_eq!(session.stack.depth(), 2);
+        assert_eq!(
+            std::fs::read_to_string(&first).unwrap(),
+            template,
+            "not written yet"
+        );
+        // Close asks; Escape is back to the draft, whose keys are the pane's again.
+        key(&mut session, "C-w");
+        assert!(
+            session.title.starts_with("Save td-mail-draft-"),
+            "{}",
+            session.title
+        );
+        assert_eq!(
+            session.stack.current().unwrap().scene().labels,
+            ["Save", "Discard", "Cancel"]
+        );
+        key(&mut session, "Escape");
+        assert!(session.title.starts_with("Draft "), "{}", session.title);
+        key(&mut session, "!");
+        assert_eq!(text(&session), format!("{template}hiq!"));
+        // Save writes the file; Close then pops the saved draft.
+        key(&mut session, "C-s");
+        assert_eq!(
+            std::fs::read_to_string(&first).unwrap(),
+            format!("{template}hiq!")
+        );
+        assert!(session
+            .stack
+            .current()
+            .unwrap()
+            .scene()
+            .status
+            .starts_with("Saved "));
+        key(&mut session, "C-w");
+        assert_eq!(session.stack.depth(), 1);
+        assert_eq!(
+            session.pane.editor().tabs().count(),
+            0,
+            "the draft's document closed"
+        );
+        // Discard keeps the file as it was last saved.
+        key(&mut session, "c");
+        let second = path_of(&session);
+        assert_ne!(second, first);
+        key(&mut session, "x");
+        key(&mut session, "C-w");
+        key(&mut session, "n");
+        assert_eq!(session.stack.depth(), 1);
+        assert_eq!(std::fs::read_to_string(&second).unwrap(), template);
+        // Save from the question writes and pops.
+        key(&mut session, "c");
+        let third = path_of(&session);
+        key(&mut session, "y");
+        key(&mut session, "C-w");
+        key(&mut session, "y");
+        assert_eq!(session.stack.depth(), 1);
+        assert_eq!(
+            std::fs::read_to_string(&third).unwrap(),
+            format!("y{template}")
+        );
+        // The bar's labels are the same requests.
+        key(&mut session, "c");
+        let fourth = path_of(&session);
+        key(&mut session, "z");
+        let bar = session.shape().unwrap().layout.bar;
+        let save = bar.header(0).expect("save label");
+        press(&mut session, save.x + 2, save.y + 2);
+        assert_eq!(
+            std::fs::read_to_string(&fourth).unwrap(),
+            format!("z{template}")
+        );
+        let close = bar.header(1).expect("close label");
+        press(&mut session, close.x + 2, close.y + 2);
+        assert_eq!(session.stack.depth(), 1);
+        // The question's labels answer it: Discard, pressed, pops with
+        // the file as it was saved; a press in the pane meanwhile is
+        // not the pane's.
+        key(&mut session, "c");
+        key(&mut session, "Z");
+        press(&mut session, close.x + 2, close.y + 2);
+        assert!(session.title.starts_with("Save "), "{}", session.title);
+        let pane = session.shape().unwrap().layout.pane.expect("the pane");
+        press(&mut session, pane.x + 4, pane.y + 4);
+        assert!(session.title.starts_with("Save "), "still asking");
+        let discard = session
+            .shape()
+            .unwrap()
+            .layout
+            .bar
+            .header(1)
+            .expect("discard label");
+        press(&mut session, discard.x + 2, discard.y + 2);
+        assert_eq!(session.stack.depth(), 1);
+        assert_eq!(
+            std::fs::read_to_string(&fourth).unwrap(),
+            format!("z{template}"),
+            "the fourth is unchanged"
+        );
+        // A selection copied in the help's read-only pane is pasted into a draft.
+        key(&mut session, "?");
+        key(&mut session, "C-a");
+        key(&mut session, "C-c");
+        assert_eq!(session.pane.editor().tabs().count(), 1);
+        key(&mut session, "q");
+        key(&mut session, "c");
+        let fifth = path_of(&session);
+        key(&mut session, "C-End");
+        key(&mut session, "C-v");
+        assert!(text(&session).contains("Timmy's Mail Console"));
+        // The question takes no edits: a chord the client does not
+        // claim is dropped, and a letter is not an answer.
+        key(&mut session, "C-w");
+        assert!(session.title.starts_with("Save "), "{}", session.title);
+        let asked = text(&session);
+        key(&mut session, "Tab");
+        key(&mut session, "x");
+        key(&mut session, "C-v");
+        assert_eq!(text(&session), asked);
+        key(&mut session, "Escape");
+        // The window's close with the draft unsaved asks; Escape keeps
+        // the window and the draft; a save closes it, the file written.
+        assert_eq!(session.input(Input::Close), Flow::Continue);
+        assert!(session.title.starts_with("Save "), "{}", session.title);
+        key(&mut session, "Escape");
+        assert!(session.title.starts_with("Draft "), "{}", session.title);
+        assert!(!session.closing && !session.quitting);
+        assert_eq!(session.input(Input::Close), Flow::Continue);
+        assert_eq!(
+            session.input(Input::Key {
+                chord: "y",
+                repeat: false
+            }),
+            Flow::Quit
+        );
+        assert!(std::fs::read_to_string(&fifth)
+            .unwrap()
+            .contains("Timmy's Mail Console"));
+        // A window too small for the pane: the draft is still loaded,
+        // the view's own, and a save writes it, not the text under it.
+        let (mut small, _cmd_rx, _resp_tx) = self::session(true);
+        key(&mut small, "?");
+        small.input(Input::Resize(
+            Surface::new(800, 40, Default::default()).unwrap(),
+        ));
+        assert!(small.shape().unwrap().layout.pane.is_none());
+        key(&mut small, "q");
+        key(&mut small, "c");
+        let small_dir = small.setup.draft_dir.clone().unwrap();
+        let sixth = small_dir.join(small.title.trim_start_matches("Draft "));
+        assert_eq!(small.pane.editor().tabs().count(), 1, "the draft, loaded");
+        key(&mut small, "w");
+        key(&mut small, "C-s");
+        assert_eq!(
+            std::fs::read_to_string(&sixth).unwrap(),
+            format!("w{template}")
+        );
+        // A clean draft lets the window close at once.
+        assert_eq!(small.input(Input::Close), Flow::Quit);
+        let _ = std::fs::remove_dir_all(&draft_dir);
+        let _ = std::fs::remove_dir_all(&small_dir);
     }
 }

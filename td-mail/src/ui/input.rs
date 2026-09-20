@@ -7,7 +7,9 @@
 //! those and every other chord the client does not claim are the document
 //! pane's when one is shown. A press on a list's row and the wheel's
 //! travel over one arrive as keys too, so a view reads the pointer as it
-//! reads the keyboard.
+//! reads the keyboard. While a draft is edited every chord is the pane's,
+//! and the view's keys are the bar's labels: a request of the pane's
+//! kind, which the session serves as it serves the pane's own.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Key {
@@ -25,6 +27,9 @@ pub enum Key {
     Click(usize),
     ScrollUp,
     ScrollDown,
+    /// A request of the document pane's kind (`save`, `close-tab`), from
+    /// a bar label; the session serves it as it serves the pane's own.
+    Request(&'static str),
 }
 
 /// The key a chord names, or none.

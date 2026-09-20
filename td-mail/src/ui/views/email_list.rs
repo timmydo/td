@@ -1435,7 +1435,7 @@ mod tests {
     fn list_rows(scene: &Scene<'_>) -> Vec<Row> {
         match &scene.body {
             Body::List { total, row, .. } => (0..*total).map(|index| row(index)).collect(),
-            Body::Text { .. } => panic!("the scene shows a list"),
+            Body::Text { .. } | Body::Edit { .. } => panic!("the scene shows a list"),
         }
     }
 
@@ -1443,7 +1443,7 @@ mod tests {
     fn message(scene: &Scene<'_>) -> String {
         match &scene.body {
             Body::Text { text, .. } => text(60),
-            Body::List { .. } => panic!("the scene shows a text"),
+            Body::List { .. } | Body::Edit { .. } => panic!("the scene shows a text"),
         }
     }
 
@@ -1726,7 +1726,7 @@ mod tests {
             Body::List {
                 total, selected, ..
             } => assert_eq!((*total, *selected), (20, 8)),
-            Body::Text { .. } => panic!("the messages are a list"),
+            Body::Text { .. } | Body::Edit { .. } => panic!("the messages are a list"),
         }
     }
 
@@ -1880,7 +1880,7 @@ mod tests {
         );
         match &scene.body {
             Body::List { selected, .. } => assert_eq!(*selected, 2),
-            Body::Text { .. } => panic!("the mailbox picker is a list"),
+            Body::Text { .. } | Body::Edit { .. } => panic!("the mailbox picker is a list"),
         }
         assert!(scene.status.starts_with("Move to mailbox: 3/3 |"));
     }

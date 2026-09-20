@@ -5,8 +5,8 @@ use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// A draft ready to hand to `$EDITOR`: the editor text plus any files that
-/// should be attached via MML (Emacs message-mode) when the message is sent.
+/// A draft ready to retain and edit: the text plus any files that should
+/// be attached via MML (Emacs message-mode) when the message is sent.
 pub struct ComposeDraft {
     pub body: String,
     pub attachments: Vec<DraftAttachment>,
@@ -374,7 +374,7 @@ fn html_to_plain(html: &str) -> String {
     crate::html::to_text(html.as_bytes(), 80)
 }
 
-/// Retained draft and sidecar paths. Editor exit never authorizes deletion.
+/// Retained draft and sidecar paths. Nothing here ever deletes them.
 pub struct PreparedDraft {
     pub draft_path: PathBuf,
     pub attachment_dir: Option<PathBuf>,
@@ -387,7 +387,10 @@ pub fn write_compose_draft(draft: &ComposeDraft) -> io::Result<PreparedDraft> {
     write_compose_draft_in(draft, &draft_dir()?)
 }
 
-fn write_compose_draft_in(draft: &ComposeDraft, dir: &Path) -> io::Result<PreparedDraft> {
+pub(crate) fn write_compose_draft_in(
+    draft: &ComposeDraft,
+    dir: &Path,
+) -> io::Result<PreparedDraft> {
     if !draft.attachments.is_empty() && dir.to_str().is_none_or(|s| !valid_mml_attribute(s)) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -553,6 +556,44 @@ fn sanitize_filename(name: &str) -> String {
     }
 }
 
+/// Replaces the draft at `path` with `bytes`, whole or not at all: they
+/// are written to a private sibling, synced, and renamed over the path,
+/// so a write that fails leaves the draft as it was and a symlink put at
+/// the path is replaced, not followed. A sibling left by a failure is
+/// removed; the draft never is.
+pub(crate) fn replace_draft(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let dir = path
+        .parent()
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "draft path has no directory")
+        })?;
+    let name = path
+        .file_name()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "draft path has no name"))?;
+    let mut sibling = std::ffi::OsString::from(".");
+    sibling.push(name);
+    sibling.push(format!(
+        ".tmp-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    let sibling = dir.join(sibling);
+    let written = create_secure_file(&sibling).and_then(|mut file| {
+        use std::io::Write;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        fs::rename(&sibling, path)
+    });
+    if written.is_err() {
+        let _ = fs::remove_file(&sibling);
+    }
+    written
+}
+
 fn draft_dir() -> io::Result<PathBuf> {
     draft_dir_from_env(std::env::var_os("XDG_STATE_HOME"), std::env::var_os("HOME"))
 }
@@ -581,6 +622,47 @@ fn draft_dir_from_env(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A draft is replaced whole: the bytes land under the path, a
+    /// symlink at the path is replaced rather than followed, and a
+    /// failure leaves the draft as it was with no sibling behind.
+    #[test]
+    fn replace_draft_is_whole_or_not_at_all() -> io::Result<()> {
+        let root = std::env::temp_dir().join(format!(
+            "td-mail-replace-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        fs::DirBuilder::new().mode(0o700).create(&root)?;
+        let path = root.join("draft.eml");
+        fs::write(&path, b"old")?;
+        replace_draft(&path, b"new")?;
+        assert_eq!(fs::read(&path)?, b"new");
+        assert_eq!(fs::read_dir(&root)?.count(), 1, "no sibling left");
+        let target = root.join("target");
+        fs::write(&target, b"target")?;
+        fs::remove_file(&path)?;
+        std::os::unix::fs::symlink(&target, &path)?;
+        replace_draft(&path, b"over the link")?;
+        assert!(
+            fs::symlink_metadata(&path)?.is_file(),
+            "the link is replaced"
+        );
+        assert_eq!(fs::read(&path)?, b"over the link");
+        assert_eq!(fs::read(&target)?, b"target", "the target is not followed");
+        assert!(replace_draft(&root.join("absent").join("draft.eml"), b"x").is_err());
+        assert!(replace_draft(Path::new("draft.eml"), b"x").is_err());
+        // A rename that fails after the sibling was written removes it.
+        let occupied = root.join("occupied");
+        fs::create_dir(&occupied)?;
+        assert!(replace_draft(&occupied, b"x").is_err());
+        assert_eq!(fs::read_dir(&root)?.count(), 3, "draft, target, occupied");
+        assert_eq!(fs::read(&path)?, b"over the link");
+        fs::remove_dir_all(&root)
+    }
 
     #[test]
     fn test_build_compose_draft() {

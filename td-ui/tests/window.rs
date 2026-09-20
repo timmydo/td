@@ -335,9 +335,18 @@ fn the_window_names_the_toplevel_and_lays_the_surface_out_on_configure() {
     assert!(w.handler().notices[0].starts_with("window extent refused"));
     configure(&mut w, 0, 0);
     assert_eq!(w.surface().width, 83, "the refused extent is forgotten");
-    // The close request reaches the handler and closes the window.
+    // The close request reaches the handler; the window stays while the
+    // handler continues, hears the request again, and closes when the
+    // handler quits on it.
     w.event(message(TOPLEVEL, 1, &[])).unwrap();
     assert_eq!(last(&w), Some(&Record::Close));
+    assert!(!w.client().closed());
+    let seen = w.handler().inputs.len();
+    w.event(message(TOPLEVEL, 1, &[])).unwrap();
+    assert_eq!(w.handler().inputs.len(), seen + 1);
+    assert!(!w.client().closed());
+    w.handler_mut().quit_on = Some(Record::Close);
+    w.event(message(TOPLEVEL, 1, &[])).unwrap();
     assert!(w.client().closed());
 }
 
@@ -704,6 +713,7 @@ fn a_repeat_due_after_the_window_closed_is_not_delivered() {
     focus_with_map(&mut w, &peer, keyboard);
     w.tick(100).unwrap();
     press(&mut w, keyboard, 9, 30);
+    w.handler_mut().quit_on = Some(Record::Close);
     w.event(message(TOPLEVEL, 1, &[])).unwrap();
     assert!(w.client().closed());
     let seen = w.handler().inputs.len();

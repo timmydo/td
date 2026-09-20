@@ -1066,16 +1066,17 @@ on the turn.
 `tests/window.rs` drives the widget window against a scripted peer: the
 binding delivering the default surface, configure laying the surface
 out, keeping it through a zero axis, a refused extent and a repeated
-extent, and the close request; the frame presented from the handler's
-paint into a raster over the surface, clean until a redraw, the buffer
-reused once released, every buffer busy asking for no paint and leaving
-it dirty, and the title sent when it changed, ahead of the frame when
-one follows and alone when none can; presses arriving as the keymap's
-chords, plain and with modifiers, marked when the repeat clock made them
-and not after the window closed, a bare modifier nothing, focus
-following the keyboard and a handler quitting on a chord; the left
-button's press at the pointer in surface pixels rounded down, motion
-while held a drag signed past the edge, a second press while held
+extent, and the close request delivered again while the handler
+continues and closing the window when it quits; the frame presented from
+the handler's paint into a raster over the surface, clean until a
+redraw, the buffer reused once released, every buffer busy asking for no
+paint and leaving it dirty, and the title sent when it changed, ahead of
+the frame when one follows and alone when none can; presses arriving as
+the keymap's chords, plain and with modifiers, marked when the repeat
+clock made them and not after the window closed, a bare modifier
+nothing, focus following the keyboard and a handler quitting on a chord;
+the left button's press at the pointer in surface pixels rounded down,
+motion while held a drag signed past the edge, a second press while held
 nothing, the release where the pointer is, motion without the button, a
 stray release and the right button nothing, leaving or losing the
 pointer while held a cancel with no release after it, a handler quitting
@@ -1143,15 +1144,17 @@ lays the surface out for the extent (a zero axis keeps the current one;
 an extent the raster refuses keeps the last surface, is reported through
 `notice` and delivers nothing; the extent the surface has delivers
 nothing), cancels a held button, hands the handler the new `Resize` and
-acknowledges. The compositor's close request is `Close` to the handler
-and then the window closed, whatever the handler answers. Focus is
-delivered as a change only, so a keyboard that was never there is not a
-loss; the seat's removal and the keyboard capability's loss are one
-focus loss, and the seat's removal, or the pointer capability's loss,
-ends a held button without a release and drops the wheel's accumulation.
-A press whose key repeats arms the client's repeat clock, and a turn
-that drained the queue with no event parked delivers the repeat that is
-due as a `Key` marked `repeat`, at most one a turn. Every turn ends with
+acknowledges. The compositor's close request is `Close` to the handler,
+which closes the window by answering `Flow::Quit` or keeps it by
+answering `Flow::Continue`, to ask about what a close would lose, and
+hears the request again when it is repeated. Focus is delivered as a
+change only, so a keyboard that was never there is not a loss; the
+seat's removal and the keyboard capability's loss are one focus loss,
+and the seat's removal, or the pointer capability's loss, ends a held
+button without a release and drops the wheel's accumulation. A press
+whose key repeats arms the client's repeat clock, and a turn that
+drained the queue with no event parked delivers the repeat that is due
+as a `Key` marked `repeat`, at most one a turn. Every turn ends with
 `poll` at the loop's clock, milliseconds since the loop began, and the
 connection then waits for the lesser of the client's wait (a hundred
 milliseconds, or the armed repeat's remainder) and the handler's

@@ -5,7 +5,7 @@
 ## Goals
 
 - Fast, keyboard-first email workflow in a window on td's compositor: lists to move through, a document view to read in, an action bar for the pointer.
-- Unix-friendly composition flow: drafts open in `$EDITOR`.
+- Composition in place: a draft is edited in the window, in td-editor's document view, and retained as a file.
 - Clear separation of concerns: `td-mail` reads/manages mail; message submission is external.
 - Scriptable automation through a JSON-over-stdin/stdout CLI mode.
 
@@ -29,26 +29,31 @@ Missing directories are created private; an existing draft directory must
 already be private and must not itself be a symlink. Files are mode 0600.
 These checks are not protection against a hostile ancestor-directory owner.
 
-Editor exit, including failure, never deletes the draft or its attachment
-sidecar. A failed launch retains them too. The log records both paths.
-Reopen the `.eml` file with your editor or file manager; delete it explicitly
-when no longer needed. The matching `td-mail-att-ID` directory belongs to
-`td-mail-draft-ID.eml`: keep it while the draft needs its attachments and
-remove it separately when discarding that draft. Moving only the `.eml`
-file does not move or rewrite attachment references. There is no draft-list
-UI, automatic expiry or mail submission in this increment.
+The retained file is then opened in the window, in td-editor's document
+view, editable, with paragraphs filled as they are typed: Ctrl-S writes
+what is in the window over the file, whole or not at all (a private
+sibling is written and renamed over the draft, so a write that fails
+leaves the draft as it was, and a symlink put at the path is replaced
+rather than followed), and Ctrl-W closes the draft, asking first when it
+has unsaved changes (y saves, n keeps the file as it was last saved,
+Escape returns to it); the Save and Close labels do the same. Closing
+the window with an unsaved draft asks the same question: a save or a
+discard closes the window, and Escape keeps it, so nothing typed is lost
+to the close and a save that fails is shown, not skipped. While the
+window holds a draft the file is its own: an edit made to it elsewhere
+is overwritten by the next save. A draft larger than the document view's
+ceiling (16 MiB) is retained but not opened, and the log says so. Cut,
+copy and paste (Ctrl-X, Ctrl-C, Ctrl-V) work within td-mail, so a
+selection made in a message's view can be pasted into a draft; the
+system clipboard is not yet connected. Nothing here deletes the draft or
+its attachment sidecar, and the log records both paths. Reopen the
+`.eml` file with an editor or file manager; delete it explicitly when no
+longer needed. The matching `td-mail-att-ID` directory belongs to
+`td-mail-draft-ID.eml`: keep it while the draft needs its attachments
+and remove it separately when discarding that draft. Moving only the
+`.eml` file does not move or rewrite attachment references. There is no
+draft-list UI, automatic expiry or mail submission in this increment.
 
-A configured editor made only of plain words (ASCII letters, digits and
-`._/+:@,-`, plus `=` after the first word, separated by spaces or tabs)
-whose first word is not a shell reserved word, or a builtin a shell resolves
-itself rather than by `PATH` and that has no identical utility there, is
-executed directly, with no shell, and the draft pathname is its last
-argument: the `mail` application's runtime has no shell, and this is how it
-launches the `/app/bin/td-editor` it ships as `$EDITOR`. Any other editor
-text is shell command text, and the draft pathname is then one quoted
-argument with its OS bytes preserved; inside the `mail` jail, which has no
-`sh`, such a command fails to launch and the draft is retained. Both paths
-hand the pathname over unchanged.
 Attachment-bearing drafts require a UTF-8 storage path without quotes,
 backslashes, angle brackets or control characters; unrepresentable MML
 paths or content types fail explicitly instead of pointing elsewhere.
@@ -69,7 +74,6 @@ Older runtime drafts are not moved or deleted automatically.
   holds the TLS trust, the resolver and the timeouts. Inside a td jail the
   `sockets=fetch` grant provides it; elsewhere, serve one there or td-mail
   reports that it is missing and starts from its cache.
-- An editor available via `$EDITOR` (for compose/reply/forward flow).
 - A password source per account: td's credential portal for
   `secret = "portal"` (the secret stored as mail/NAME for `[account.NAME]`,
   read through the `/app/bin/td-secret` helper packaged beside td-mail, so
@@ -114,7 +118,6 @@ Example config:
 
 ```toml
 [ui]
-editor = "nvim"
 page_size = 100
 mouse = true
 sync_interval_secs = 60

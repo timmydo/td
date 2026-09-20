@@ -517,5 +517,38 @@ pub fn all_keybindings() -> Vec<KeyBinding> {
             action: "open_url",
             description: "Open URL by number in configured browser",
         },
+        // Compose: the draft in the editable pane, whose keys are
+        // td-editor's default profile; the rest of the keyboard types.
+        KeyBinding {
+            view: "compose",
+            key: "Ctrl-S",
+            action: "save",
+            description: "Save the draft over its retained file",
+        },
+        KeyBinding {
+            view: "compose",
+            key: "Ctrl-W",
+            action: "close",
+            description:
+                "Close the draft (asks when unsaved: y saves, n keeps the file as last saved)",
+        },
+        KeyBinding {
+            view: "compose",
+            key: "Ctrl-X/Ctrl-C/Ctrl-V",
+            action: "cut_copy_paste",
+            description: "Cut, copy and paste within td-mail (a message's selection too)",
+        },
+        KeyBinding {
+            view: "compose",
+            key: "Ctrl-Z/Ctrl-Y",
+            action: "undo_redo",
+            description: "Undo and redo",
+        },
+        KeyBinding {
+            view: "compose",
+            key: "Ctrl-A",
+            action: "select_all",
+            description: "Select all",
+        },
     ]
 }

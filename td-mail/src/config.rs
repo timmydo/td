@@ -100,7 +100,6 @@ pub struct SpamConfig {
 
 #[derive(Debug)]
 pub struct UiConfig {
-    pub editor: Option<String>,
     pub browser: Option<String>,
     pub page_size: u32,
     pub mouse: bool,
@@ -283,7 +282,6 @@ impl Default for RawSpamConfig {
 
 #[derive(Debug)]
 struct RawUiConfig {
-    editor: Option<String>,
     browser: Option<String>,
     page_size: u32,
     mouse: bool,
@@ -302,10 +300,12 @@ const UI_KEYS: &[&str] = &[
 impl RawUiConfig {
     fn from_toml(table: &Toml) -> Result<Self, TomlError> {
         table.check_known_keys(UI_KEYS)?;
-        // The terminal's key: its value is still checked, not read.
+        // The terminal's keys: composing is in the window now, and the
+        // toolkit's list keeps the selection in view; each value is
+        // still checked, not read.
+        let _ = table.optional_str("editor")?;
         let _ = table.optional_usize("scrolloff")?;
         Ok(RawUiConfig {
-            editor: table.optional_str("editor")?.map(str::to_string),
             browser: table.optional_str("browser")?.map(str::to_string),
             page_size: table
                 .optional_u32("page_size")?
@@ -321,7 +321,6 @@ impl RawUiConfig {
 impl Default for RawUiConfig {
     fn default() -> Self {
         Self {
-            editor: None,
             browser: None,
             page_size: default_page_size(),
             mouse: default_mouse(),
@@ -605,7 +604,6 @@ impl Config {
         Ok(Config {
             accounts,
             ui: UiConfig {
-                editor: raw.ui.editor,
                 browser: raw.ui.browser,
                 page_size: raw.ui.page_size,
                 mouse: raw.ui.mouse,
@@ -752,7 +750,9 @@ password_command = "pass show email/work.com"
         assert_eq!(config.accounts.len(), 2);
         assert_eq!(config.accounts[0].name, "personal");
         assert_eq!(config.accounts[1].name, "work");
-        assert_eq!(config.ui.editor.as_deref(), Some("nvim"));
+        // `editor` is accepted and ignored; its value is still typed.
+        let bad = jmap_config("[ui]\neditor = 1");
+        assert!(matches!(Config::parse(&bad), Err(ConfigError::Parse(_))));
     }
 
     #[test]

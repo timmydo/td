@@ -67,6 +67,9 @@ pub enum Input<'a> {
     /// The surface the handler paints and lays out for.
     Resize(Surface),
     Focus(bool),
+    /// The compositor asks the window to close: `Flow::Quit` closes it,
+    /// and `Flow::Continue` keeps it, for a handler with something to
+    /// ask about first; the request comes again when it is repeated.
     Close,
 }
 
@@ -346,10 +349,7 @@ impl<H: Handler> App for Window<'_, H> {
                 }
                 self.client.acknowledge(serial)?;
             }
-            Handled::CloseRequested => {
-                self.deliver(Input::Close);
-                self.client.close();
-            }
+            Handled::CloseRequested => self.deliver(Input::Close),
             Handled::Keyboard(event) => self.keyboard(event),
             Handled::Pointer(event) => self.pointer(event)?,
             Handled::Capabilities { keyboard, pointer } => {

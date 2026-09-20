@@ -3,12 +3,15 @@
 //! A view keeps its state, its keys and its backend traffic, and describes
 //! what it shows as a `Scene`: the window's title, an action bar whose
 //! labels stand for keys, an optional text entry, a body that is a list of
-//! rows or a text, and the status row. The session (`super`) lays the
-//! scene out with the toolkit's widgets and td-editor's read-only document
-//! pane, and hands the view its keys, a press on a row and the wheel's
-//! travel over a list; scrolling a text is the pane's, which a view asks
-//! for with `ViewAction::Scroll`.
+//! rows, a text or a draft to edit, and the status row. The session
+//! (`super`) lays the scene out with the toolkit's widgets and td-editor's
+//! document pane, and hands the view its keys, a press on a row and the
+//! wheel's travel over a list; scrolling a text is the pane's, which a
+//! view asks for with `ViewAction::Scroll`. A draft's pane takes every
+//! chord, and what it asks of its host (a save, a close) reaches the view
+//! through `View::request`, with the draft in hand.
 
+pub mod compose;
 pub mod email_list;
 pub mod email_view;
 pub mod help;
@@ -66,6 +69,14 @@ pub enum Body<'a> {
         key: String,
         text: Box<dyn Fn(usize) -> String + 'a>,
     },
+    /// A draft in the editable pane: `text()` loaded once for `key`, and
+    /// then the pane's, edited in place. While `focused`, every chord
+    /// is the pane's; the view's keys are then the bar's labels.
+    Edit {
+        key: String,
+        text: Box<dyn Fn() -> String + 'a>,
+        focused: bool,
+    },
 }
 
 impl Body<'static> {
@@ -122,9 +133,14 @@ pub enum ViewAction {
     Push(Box<dyn View>),
     Pop,
     Quit,
+    /// Retain the draft and edit it in the pane.
     Compose(crate::compose::ComposeDraft),
     SwitchAccount(String),
     Scroll(Scroll),
+    /// A request of the pane's kind, served as the pane's own are: the
+    /// session answers the clipboard's, and hands the view the rest
+    /// through `View::request`.
+    Request(&'static str),
 }
 
 pub trait View {
@@ -133,6 +149,12 @@ pub trait View {
     /// A key, a press on a row or the wheel's travel; `page` is the rows
     /// the body shows, which the page keys move by.
     fn handle_key(&mut self, key: Key, page: usize) -> ViewAction;
+    /// A request the pane raised from a chord, or a bar label stood
+    /// for, with the draft the pane shows: `save`, `close-tab`, `quit`,
+    /// or one the view ignores.
+    fn request(&mut self, _name: &str, _draft: &mut super::frame::Draft<'_>) -> ViewAction {
+        ViewAction::Continue
+    }
     /// Handle a response from the backend thread.
     /// Returns true if the view consumed the response and should re-render.
     fn on_response(&mut self, response: &BackendResponse) -> bool;

@@ -1,9 +1,9 @@
 # td-editor
 
 td-editor is a small, Wayland-native text editor with a Notepad-like window
-and tabs. It is intended for ordinary text and prose, including use as the
-foreground `$EDITOR` child of td-mail inside td-jail. It must also run on Linux
-Wayland desktops outside td. This document is the component contract and
+and tabs. It is intended for ordinary text and prose, and its document view
+is the pane td-mail composes in and td-news and td-mail read in. It must
+also run on Linux Wayland desktops outside td. This document is the component contract and
 the starting point for successive agents; the root `AGENTS.md` and
 `DEVELOPMENT.md` still govern changes and submission.
 
@@ -69,9 +69,9 @@ It accepts keyboard input in both profiles, but cannot save or open user
 documents. Dirty window close requires explicit discard; process termination
 still loses scratch text. Ordinary invocation now opens the separate
 experimental file window; `--window` remains an optional explicit alias.
-It supports foreground local `$EDITOR` use, and the `mail` package ships
-it as the jail's `$EDITOR` (see `$EDITOR`, td-mail, and td-jail below);
-the in-jail acceptance test and the GPU milestone are not landed. See the
+It supports foreground local `$EDITOR` use (see `$EDITOR`, td-mail, and
+td-jail below; td-mail itself composes in the embedded document view and
+the `mail` package ships no editor); the GPU milestone is not landed. See the
 file-window contract below for its narrower scheduling and close/conflict
 behavior.
 
@@ -2832,26 +2832,35 @@ module is imported. These fixtures do not replace the live Weston test.
 
 ## Embedding the document view
 
-td-news shows an article in a read-only document pane, td-mail shows
-a message in one, and td-mail is to compose in an editable one, in
-their own windows beside the toolkit's lists, instead of calling out to
-an editor process. Each depends on the `td-editor` library crate by
-path, as a standalone target crate may on a `td-*` roster crate, with
-its recipe staging the `td-editor` tree beside `td-ui` and
-`td-compositor`; both landings are APPLICATIONS.md §W.8, "Reworked
-again", and td-mail's composing is its own increment. The host owns the
-window, the surface, the
-event loop and every widget around the pane; the pane is a
-`ui::Controller` from `Controller::pane`, placed by `Event::Frame` with the
-pane's rectangle and the host's surface on each configure, and repainted
-through `Controller::scene` into a raster over the host's surface with
+td-news shows an article in a read-only document pane, td-mail shows a
+message in one and composes a draft in an editable one, in their own
+windows beside the toolkit's lists, instead of calling out to an editor
+process. Each depends on the `td-editor` library crate by path, as a
+standalone target crate may on a `td-*` roster crate, with its recipe
+staging the `td-editor` tree beside `td-ui` and `td-compositor`; the
+landings are APPLICATIONS.md §W.8, "Reworked again", and "Composing in
+place". The host owns the window, the surface, the event loop and every
+widget around the pane; the pane is a `ui::Controller` from
+`Controller::pane`, placed by `Event::Frame` with the pane's rectangle
+and the host's surface on each configure, and repainted through
+`Controller::scene` into a raster over the host's surface with
 `Geometry::bounds` as the clip. The host translates its keyboard and
 pointer input into the controller's existing `Event::Key` chords and
 `Event::Pointer` physical pixels; ticks, focus and scroll are the same
 events the editor's own adapter sends. Requests the controller returns
 (files, clipboard, prompts) are the host's to serve or ignore: a reader
-ignores them all, and a composer serves the clipboard through the
-toolkit's data path.
+ignores them all; td-mail's composer serves `save` by writing the
+document's `save_snapshot` bytes over the retained draft, whole or not
+at all, and answering `Event::Saved`, `close-tab` by popping a clean
+draft or asking about a dirty one (the window's own close request puts
+the same question), and `cut`, `copy` and `paste` with a kill ring of
+its own, a `clipboard::Snapshot` captured into memory and returned
+through `clipboard::Paste`, so the document's bounds hold and the
+editor's own `Event::Cut`/`Event::Paste` apply; the toolkit's data path,
+for the system clipboard, is a later increment. A pane the host loads
+without `ReadOnly` is editable, and the host sets
+`Command::AutoFill(true)` on a mail draft as the editor's own window
+does.
 
 What the pane does not do: it draws no menu bar, tab strip, minibuffer or
 status row (so notices are the host's to show), owns no Wayland surface,
@@ -2900,23 +2909,16 @@ interprets MML, starts a mail transport, or manages attachment lifetimes.
 Those are outside this editor increment. td-mail retains local drafts and
 their sidecars; Save As does not move or rewrite attachment references.
 
-The caller inspected for this design is td-mail (then the standalone
-`tmc` repository, now `td-mail/` in this tree). Its `src/ui/mod.rs`
-selects `[ui].editor`, then `$EDITOR`, then `vi`. A command made only of
-plain words (ASCII letters, digits and `._/+:@,-`, plus `=` after the
-first word, separated by spaces or tabs) whose first word is not a shell
-reserved word, or a builtin a shell resolves itself rather than by `PATH`
-and that has no identical utility there, is executed directly with the OS
-pathname as its last argument, which is how the jail, whose runtime has no
-shell, launches `/app/bin/td-editor`; any other text is shell command
-text, and `spawn_editor` starts `sh -c` with it followed by quoted `"$1"`,
-passing the OS pathname as a separate shell argument, which inside the
-jail fails to launch and retains the draft. Either way spaces, shell
-metacharacters and non-UTF-8 filename bytes remain one unchanged argument.
-The TUI continues immediately. A background thread reaps the child; exit,
-failure and failed launch never delete drafts or attachment sidecars.
-td-mail neither rereads the saved file nor submits mail. Local retention is
-implemented; a complete mail-composition workflow still needs submission.
+The caller this contract was designed for was td-mail (then the
+standalone `tmc` repository, now `td-mail/` in this tree), which ran
+`[ui].editor`, then `$EDITOR`, then `vi` on the retained draft: a
+plain-word command directly, anything else through `sh -c` with the
+pathname as a quoted positional argument, a background thread reaping
+the child. td-mail no longer launches an editor: it composes in the
+embedded document view (see "Embedding the document view"), and its
+`editor` key is accepted and ignored. The contract stands for callers
+outside this tree. Local retention is td-mail's; a complete
+mail-composition workflow still needs submission.
 
 `src/compose.rs` creates mode-0600 `.eml` files inside a mode-0700 directory,
 using `$XDG_STATE_HOME/td-mail/drafts`, then `$HOME/.local/state/td-mail/drafts`.
@@ -2929,41 +2931,24 @@ product capability. The caller retains sidecars until explicit user removal.
 td-mail/README.md owns the local
 retention, private-directory and MML-representability details.
 
-td-mail passes the draft's original OS bytes as one argument on both of
-its launch paths. Integration must preserve that identity; td-editor cannot
-recover bytes already changed by its parent. Do not add shell evaluation to
-the editor. The editor leaves the caller's inherited terminal input
+A caller passes the file's original OS bytes as one argument.
+Integration must preserve that identity; td-editor cannot recover bytes
+already changed by its parent. Do not add shell evaluation to the
+editor. The editor leaves the caller's inherited terminal input
 untouched.
 
-The `mail` package (`recipes/src/recipes/mail.rs`) makes the executable
-available inside the jail in which td-mail runs: it copies the static
-`td-editor` recipe output and its debug companion beside td-mail as
-`/app/bin/td-editor`, and its manifest sets `EDITOR=/app/bin/td-editor`,
-which the jail places in the application's environment. The runtime closure
-is the binary alone, since it is static and its font and licence notices are
-compiled in, so no `/td/store` closure enters the jail (`APPLICATIONS.md`
-§X.4) and the source-built editor stays distinct from marked foreign
-payloads. The editor inherits the jail's grants: drafts live under the
-application's private state directory, and `xdg-download` is the persistent
-granted directory for Save As. Its SHM pools are unlinked files under the
-jail's private `/tmp`.
-
-Not yet landed: the in-jail acceptance test below. The package check builds
-the closure and validates the static entry, td-editor-test proves the
-editor's static shape and headless modes on the target, and td-mail's own
-tests prove the direct launch, child lifetime and retention on the host;
-none of them launches the editor from td-mail inside the jail.
-
-The caller's real launch path is the acceptance test: launch td-mail, request a
-draft, observe an editor frame, edit and save while its child remains live,
-and verify exact saved bytes after editor exit. For retention, prove that
-td-mail remains responsive and both the saved draft and attachment sidecars
-survive. Also exercise Save As to a persistent granted directory without
-claiming that moving text rewrites attachments. Submission needs its own
-oracle. Include spaces, leading dashes and non-UTF-8 paths with exact caller
-argument preservation, unwritable paths, cancellation, missing display,
-and an attempted path outside the grant. An isolated Wayland smoke test
-alone is not evidence that td-mail's jail can launch the editor.
+The `mail` package (`recipes/src/recipes/mail.rs`) used to copy the
+static `td-editor` recipe output and its debug companion beside td-mail
+as `/app/bin/td-editor` and set `EDITOR=/app/bin/td-editor` in its
+manifest, for the child td-mail launched; it ships no editor now, and
+its manifest carries no environment. The static executable, its font and
+licence notices compiled in, remains the `td-editor` recipe's output,
+checked by td-editor-test, and available to a package that needs a
+`$EDITOR` the same way. The in-jail acceptance test this section used to
+owe, td-mail launching the editor inside its jail, is moot: the draft is
+edited in td-mail's own window, and td-mail's session test proves the
+retained file, its edit, save and discard, and the window's close asking
+about an unsaved draft.
 
 ## Test and control architecture
 

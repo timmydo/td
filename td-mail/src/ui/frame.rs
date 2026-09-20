@@ -1,11 +1,15 @@
 //! The frame over the widget window: the top view's scene laid out as the
 //! toolkit's action bar, an optional text entry, a list or td-editor's
-//! read-only document pane, and the status row; and the pane itself,
-//! which holds a document per stacked view that shows a text, so a
-//! view's text is its own and the view under a popped one is back where
-//! it was read to.
+//! document pane, read-only for a text and editable for a draft, and the
+//! status row; and the pane itself, which holds a document per stacked
+//! view that shows a text or a draft, so a view's text is its own and
+//! the view under a popped one is back where it was read to. The pane
+//! keeps the kill ring too: a selection cut or copied in any of its
+//! documents, pasted into an editable one, within the process.
 
-use td_editor::model::TabId;
+use std::sync::Arc;
+use td_editor::clipboard::{Paste, Snapshot};
+use td_editor::model::{Command, SavePoint, TabId};
 use td_editor::ui::{Controller, Event, Outcome, PointerPhase as PanePhase};
 use td_ui::chrome::{Bar, Field, Item, List, Status, TextEntry, ROW};
 use td_ui::raster::{Composition, Draw, Primitive, Raster, Rect, Surface, PAPER};
@@ -66,7 +70,7 @@ impl Layout {
         }
         match scene.body {
             Body::List { .. } => layout.list = List::new(surface, body),
-            Body::Text { .. } => {
+            Body::Text { .. } | Body::Edit { .. } => {
                 layout.pane = (body.width > 0 && body.height > 0).then_some(body);
             }
         }
@@ -87,23 +91,33 @@ impl Layout {
 }
 
 /// A view's document in the pane: its tab, the key of the text it
-/// holds, and the columns the text was wrapped for. Kept by the view's
-/// slot on the stack, so two views that name their texts alike hold two
-/// documents, and a view's is closed with it.
+/// holds, and the columns the text was wrapped for (none for a draft,
+/// which the pane wraps as it is typed). Kept by the view's slot on the
+/// stack, so two views that name their texts alike hold two documents,
+/// and a view's is closed with it.
 pub struct Shown {
     tab: TabId,
     key: String,
     columns: usize,
 }
 
+impl Shown {
+    /// The document's tab, for the draft handle over it.
+    pub fn tab(&self) -> TabId {
+        self.tab
+    }
+}
+
 /// td-editor's document pane, holding a document per stacked view that
-/// shows a text; the active one is the top view's.
+/// shows a text or a draft; the active one is the top view's.
 pub struct Pane {
     controller: Controller,
     /// The document shown: the top view's, once its frame is prepared.
     tab: Option<TabId>,
     /// A press landed in the pane and has not been released.
     pub drag: bool,
+    /// The kill ring: the last selection cut or copied, for a paste.
+    kill: Option<Arc<str>>,
 }
 
 impl Pane {
@@ -112,6 +126,7 @@ impl Pane {
             controller: Controller::pane().map_err(|e| e.to_string())?,
             tab: None,
             drag: false,
+            kill: None,
         })
     }
 
@@ -145,7 +160,11 @@ impl Pane {
     }
 
     fn target(&self) -> Option<(TabId, u64)> {
-        let tab = self.tab?;
+        self.target_of(self.tab?)
+    }
+
+    /// The document's current revision, for an event bound to it.
+    fn target_of(&self, tab: TabId) -> Option<(TabId, u64)> {
         let revision = self.controller.editor().document(tab).ok()?.revision();
         Some((tab, revision))
     }
@@ -202,17 +221,64 @@ impl Pane {
         }
     }
 
-    /// Closes a view's document, with the view or for its next text.
+    /// Shows a view's draft for editing: the document in `shown` when it
+    /// holds the text `key` names, selected again if another view's was
+    /// active; otherwise a document loaded from `text`, asked only then,
+    /// editable, filling its paragraphs as a mail draft is typed. A
+    /// draft the pane refuses (one past its ceiling) leaves the view
+    /// without a document, which its save then reports; nothing is
+    /// shortened to fit.
+    pub fn edit(&mut self, shown: &mut Option<Shown>, key: &str, text: impl FnOnce() -> String) {
+        if let Some(held) = shown.as_ref() {
+            if held.key == key {
+                if self.tab != Some(held.tab) {
+                    self.event(Event::SelectTab(held.tab));
+                    self.tab = Some(held.tab);
+                }
+                return;
+            }
+        }
+        self.close(shown.take());
+        self.tab = None;
+        let Some(source) = draft_source(&text()) else {
+            crate::log_error!("document pane: the draft is larger than the pane's ceiling");
+            return;
+        };
+        if let Outcome::Created(tab) = self.event(Event::Load(source.as_bytes())) {
+            if let Some((tab, revision)) = self.target_of(tab) {
+                self.event(Event::Edit {
+                    tab,
+                    revision,
+                    command: Command::AutoFill(true),
+                });
+            }
+            self.tab = Some(tab);
+            *shown = Some(Shown {
+                tab,
+                key: key.to_string(),
+                columns: 0,
+            });
+        }
+    }
+
+    /// Closes a view's document, with the view or for its next text. A
+    /// document closed dirty (its view decided that, or a stack thrown
+    /// away closed it) is given up as it is rather than left open with
+    /// no view to reach it, and the log says so.
     pub fn close(&mut self, shown: Option<Shown>) {
         let Some(held) = shown else {
             return;
         };
         if let Ok(document) = self.controller.editor().document(held.tab) {
-            let revision = document.revision();
-            self.event(Event::Close {
-                tab: held.tab,
-                revision,
-            });
+            if document.dirty() {
+                crate::log_error!("document pane: a document is closed with unsaved changes");
+                if let Ok((point, _)) = self.controller.editor().save_snapshot(held.tab) {
+                    self.event(Event::Saved(point));
+                }
+            }
+            if let Some((tab, revision)) = self.target_of(held.tab) {
+                self.event(Event::Close { tab, revision });
+            }
         }
         if self.tab == Some(held.tab) {
             self.tab = None;
@@ -231,18 +297,95 @@ impl Pane {
         }) == Outcome::Changed
     }
 
-    pub fn chord(&mut self, chord: &str) -> bool {
+    /// A chord to the shown document: what the pane made of it, a
+    /// request being the host's to serve.
+    pub fn chord(&mut self, chord: &str) -> Outcome {
         let Some((tab, revision)) = self.target() else {
-            return false;
+            return Outcome::Ignored;
         };
         if chord.is_empty() {
-            return false;
+            return Outcome::Ignored;
         }
         self.event(Event::Key {
             tab,
             revision,
             chord,
-        }) == Outcome::Changed
+        })
+    }
+
+    /// Whether the shown document may be edited: a read-only text is
+    /// left alone by a cut or a paste, without a refusal logged.
+    fn editable(&self) -> bool {
+        self.tab.is_some_and(|tab| {
+            self.controller
+                .editor()
+                .document(tab)
+                .is_ok_and(|document| !document.read_only())
+        })
+    }
+
+    /// The selection into the kill ring and out of the document.
+    pub fn cut(&mut self) -> bool {
+        if !self.editable() {
+            return false;
+        }
+        let Some(snapshot) = self.selection() else {
+            return false;
+        };
+        let text = snapshot.text();
+        if self.event(Event::Cut(snapshot)) != Outcome::Changed {
+            return false;
+        }
+        self.kill = Some(text);
+        true
+    }
+
+    /// The selection into the kill ring: whether one was kept.
+    pub fn copy(&mut self) -> bool {
+        match self.selection() {
+            Some(snapshot) => {
+                self.kill = Some(snapshot.text());
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// The kill ring into the document, over its selection.
+    pub fn paste(&mut self) -> bool {
+        if !self.editable() {
+            return false;
+        }
+        let Some(text) = self.kill.clone() else {
+            return false;
+        };
+        let Some((tab, revision)) = self.target() else {
+            return false;
+        };
+        let paste = Paste::begin(self.controller.editor(), tab, revision).and_then(|mut paste| {
+            paste.push(text.as_bytes())?;
+            Ok(paste)
+        });
+        match paste {
+            Ok(paste) => self.event(Event::Paste(paste)) == Outcome::Changed,
+            Err(error) => {
+                crate::log_error!("document pane: paste: {}", error);
+                false
+            }
+        }
+    }
+
+    /// The shown document's selection, bounded as the editor's clipboard
+    /// bounds it; none when nothing is selected.
+    fn selection(&self) -> Option<Snapshot> {
+        let (tab, revision) = self.target()?;
+        match Snapshot::capture(self.controller.editor(), tab, revision) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                crate::log_error!("document pane: selection: {}", error);
+                None
+            }
+        }
     }
 
     /// A press in the pane is handed on at the pointer's pixel as both
@@ -295,13 +438,72 @@ impl Pane {
     }
 }
 
+/// A view's draft, as the view saves or gives it up: the document its
+/// slot holds, whether or not the pane shows it this frame, so a save
+/// never snapshots another view's document; none when the pane refused
+/// the draft.
+pub struct Draft<'a> {
+    pane: &'a mut Pane,
+    tab: Option<TabId>,
+}
+
+impl<'a> Draft<'a> {
+    pub fn new(pane: &'a mut Pane, tab: Option<TabId>) -> Self {
+        Draft { pane, tab }
+    }
+
+    /// Whether the document has changed since it was loaded or saved.
+    pub fn dirty(&self) -> bool {
+        let Some(tab) = self.tab else {
+            return false;
+        };
+        self.pane
+            .controller
+            .editor()
+            .document(tab)
+            .is_ok_and(|document| document.dirty())
+    }
+
+    /// The document's text as bytes to write, with the token that marks
+    /// the document saved at that state once they are written.
+    pub fn snapshot(&self) -> Option<(SavePoint, Vec<u8>)> {
+        let tab = self.tab?;
+        self.pane.controller.editor().save_snapshot(tab).ok()
+    }
+
+    /// The bytes of `snapshot` were written.
+    pub fn saved(&mut self, point: SavePoint) {
+        self.pane.event(Event::Saved(point));
+    }
+
+    /// The document's changes are given up: it counts as saved as it
+    /// is, without a write, so its view can close it.
+    pub fn discard(&mut self) {
+        if let Some((point, _)) = self.snapshot() {
+            self.saved(point);
+        }
+    }
+}
+
 /// `text` as the pane admits it: a leading byte order mark dropped, CRLF
 /// one newline, a control scalar other than newline and tab (which the
 /// editor refuses) the replacement character, and at most the editor's
-/// file ceiling in bytes.
+/// file ceiling in bytes, the rest dropped: a text to read is shown as
+/// far as it fits.
 pub fn pane_source(text: &str) -> String {
+    admit(text, true).unwrap_or_default()
+}
+
+/// `text` as an editable document: admitted as `pane_source` admits a
+/// text, but none past the editor's ceiling rather than shortened, so
+/// a save can never write a shortened draft over the file.
+pub fn draft_source(text: &str) -> Option<String> {
+    admit(text, false)
+}
+
+fn admit(text: &str, truncate: bool) -> Option<String> {
     let text = text.strip_prefix('\u{feff}').unwrap_or(text);
-    let mut source = String::with_capacity(text.len());
+    let mut source = String::with_capacity(text.len().min(td_editor::text::MAX_FILE_BYTES));
     for c in text.replace("\r\n", "\n").chars() {
         let shown = match c {
             '\n' | '\t' => c,
@@ -309,11 +511,14 @@ pub fn pane_source(text: &str) -> String {
             c => c,
         };
         if source.len() + shown.len_utf8() > td_editor::text::MAX_FILE_BYTES {
-            break;
+            if truncate {
+                break;
+            }
+            return None;
         }
         source.push(shown);
     }
-    source
+    Some(source)
 }
 
 /// The frame as a composition: what the window paints and what a test
@@ -384,7 +589,7 @@ impl Composition for Frame<'_> {
                     );
                 }
             }
-            Body::Text { .. } => {
+            Body::Text { .. } | Body::Edit { .. } => {
                 if layout.pane.is_some() {
                     self.pane.emit(damage, sink);
                 }
@@ -473,5 +678,95 @@ mod tests {
         assert_eq!(pane.tab(), None);
         assert_eq!(pane.editor().tabs().count(), 0);
         pane.close(None);
+    }
+
+    /// A draft is loaded once for its key, editable and auto-filled; the
+    /// kill ring carries a selection between documents; and the draft
+    /// handle reads the document's state, marks it saved and gives it up.
+    #[test]
+    fn a_draft_is_edited_in_place_and_the_kill_ring_carries_a_selection() {
+        let mut pane = Pane::new().unwrap();
+        pane.place(
+            Rect {
+                x: 0,
+                y: 0,
+                width: 400,
+                height: 64,
+            },
+            Surface::new(400, 64, Default::default()).unwrap(),
+        );
+        let mut draft = None;
+        pane.edit(&mut draft, "d", || "To: \n".to_string());
+        let tab = pane.tab().expect("the draft");
+        let document = pane.editor().document(tab).unwrap();
+        assert!(!document.read_only());
+        assert!(document.auto_fill());
+        assert!(!document.dirty(), "loaded is saved");
+        pane.edit(&mut draft, "d", || unreachable!("loaded once"));
+        assert_eq!(pane.tab(), Some(tab));
+        assert_eq!(pane.chord("C-End"), Outcome::Changed);
+        assert_eq!(pane.chord("x"), Outcome::Changed);
+        assert!(matches!(
+            pane.chord("C-s"),
+            Outcome::Request { name: "save", .. }
+        ));
+        assert_eq!(pane.editor().document(tab).unwrap().text(), "To: \nx");
+        assert!(Draft::new(&mut pane, Some(tab)).dirty());
+        // Nothing selected: nothing cut, copied or pasted.
+        assert!(!pane.cut());
+        assert!(!pane.copy());
+        assert!(!pane.paste());
+        // A selection copied from a read-only text is pasted into the draft.
+        let mut text = None;
+        pane.show(&mut text, "t", 40, || "quoted".to_string());
+        assert_eq!(pane.chord("C-a"), Outcome::Changed);
+        assert!(matches!(
+            pane.chord("C-c"),
+            Outcome::Request { name: "copy", .. }
+        ));
+        assert!(pane.copy(), "the selection is kept");
+        assert!(!pane.paste(), "read-only: nothing pasted");
+        assert!(!pane.cut(), "read-only: nothing cut");
+        let shown = pane.tab().expect("the text");
+        assert_eq!(pane.editor().document(shown).unwrap().text(), "quoted");
+        pane.edit(&mut draft, "d", || unreachable!("held"));
+        assert!(pane.paste());
+        assert_eq!(pane.editor().document(tab).unwrap().text(), "To: \nxquoted");
+        // Cut takes the selection out and paste brings it back.
+        assert_eq!(pane.chord("C-a"), Outcome::Changed);
+        assert!(pane.cut());
+        assert_eq!(pane.editor().document(tab).unwrap().text(), "");
+        assert!(pane.paste());
+        assert_eq!(pane.editor().document(tab).unwrap().text(), "To: \nxquoted");
+        // Saved at a snapshot, the draft is clean; edited, dirty; given up, clean again.
+        let (point, bytes) = Draft::new(&mut pane, Some(tab)).snapshot().unwrap();
+        assert_eq!(bytes, b"To: \nxquoted");
+        Draft::new(&mut pane, Some(tab)).saved(point);
+        assert!(!Draft::new(&mut pane, Some(tab)).dirty());
+        assert_eq!(pane.chord("y"), Outcome::Changed);
+        assert!(Draft::new(&mut pane, Some(tab)).dirty());
+        // The handle is the view's document, whichever is shown.
+        pane.show(&mut text, "t", 40, || unreachable!("held"));
+        assert!(Draft::new(&mut pane, Some(tab)).dirty());
+        let shown = pane.tab();
+        assert!(!Draft::new(&mut pane, shown).dirty(), "the text is clean");
+        assert!(Draft::new(&mut pane, None).snapshot().is_none());
+        Draft::new(&mut pane, Some(tab)).discard();
+        assert!(!Draft::new(&mut pane, Some(tab)).dirty());
+        // A draft past the ceiling is refused whole; a text is cut to it.
+        let long = "x".repeat(td_editor::text::MAX_FILE_BYTES + 1);
+        assert_eq!(draft_source(&long), None);
+        assert_eq!(pane_source(&long).len(), td_editor::text::MAX_FILE_BYTES);
+        assert_eq!(
+            draft_source("a\r\nb\u{1}"),
+            Some("a\nb\u{fffd}".to_string())
+        );
+        let mut refused = None;
+        pane.edit(&mut refused, "big", || long.clone());
+        assert!(refused.is_none());
+        assert_eq!(pane.tab(), None);
+        pane.close(draft);
+        pane.close(text);
+        assert_eq!(pane.editor().tabs().count(), 0);
     }
 }
