@@ -1815,8 +1815,9 @@ fn validate_system_boot(
              mutable-/etc contract ({SYSTEM_ETC_MUTABLE_MARKER:?} absent) — a reviewed \
              MUTABLE_ETC symlink points somewhere other than the image recorded, a persistent \
              one did not resolve (so td-firstboot did not provision it), /etc/machine-id is not \
-             32 hex digits through its symlink, or the unprivileged login user could read the \
-             SSH host PRIVATE key (or could not read its .pub). Last serial output:\n{}",
+             32 hex digits through its symlink, or the unprivileged login user could not \
+             start its checked session, could read the SSH host PRIVATE key, or could not \
+             read its .pub. Last serial output:\n{}",
             tail(&result.console, 80)
         ));
     }
@@ -1879,8 +1880,9 @@ fn validate_system_boot(
     if !result.evidence.state_owner {
         return Err(format!(
             "the greeter was reached but the unprivileged ownership check failed \
-             ({SYSTEM_STATE_OWNER_MARKER:?} absent) — the login user could write /var or \
-             /var/root, or could not write its own home. Last serial output:\n{}",
+             ({SYSTEM_STATE_OWNER_MARKER:?} absent) — the login user could not start its \
+             checked session, could write /var or /var/root, or could not write and clean \
+             its own home. Last serial output:\n{}",
             tail(&result.console, 80)
         ));
     }

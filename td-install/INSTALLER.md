@@ -135,9 +135,12 @@ home before provisioning writes, retaining application state migration
 and ownership checks. The VM helper's private identity, SSH
 configuration and development layout also derive their home from that
 primary account and retain the persistent mount and ownership checks.
-Home creation and remaining diagnostic shell commands still need the
-coordinated cutover; these selectors alone do not activate a saved
-username.
+The boot state-ownership and SSH host-key permission checks run as the
+validated primary account; home writes and cleanup use its runtime HOME
+with dropped credentials. Their root pre/post cleanup clears only the
+fixed system-state probe paths. Home creation and remaining diagnostic
+shell commands still need the coordinated cutover; these selectors alone
+do not activate a saved username.
 Updates must retain the installed identity and settings.
 
 `td-firstboot check-primary-name ROOT NAME` is a read-only preflight for a

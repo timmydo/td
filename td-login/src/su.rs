@@ -5,9 +5,9 @@
 //! anybody. That is what makes `-s SHELL` and `-c CMD` — an escalation surface in
 //! a setuid `su` — inert here.
 //!
-//! The image depends on this: `/etc/rootcheck` and `/etc/bootsuccess` run every
-//! unprivileged health leg through `su -s /bin/sh <user> -c '…'`, so a boot that
-//! reaches its markers has exercised this applet several times over.
+//! The image exercises this applet through `/etc/bootsuccess` health legs
+//! using `su -s /bin/sh <user> -c '…'`, including the credential readback.
+//! Rootcheck's ownership and host-key probes use literal execution subcommands.
 
 use crate::creds::Credentials;
 use crate::db;
@@ -151,7 +151,7 @@ mod tests {
         xs.iter().map(|s| (*s).to_string()).collect()
     }
 
-    /// The exact form `/etc/rootcheck` and `/etc/bootsuccess` use. Options
+    /// The exact form `/etc/bootsuccess` uses. Options
     /// AFTER the user name is the whole reason this parser permutes; reading
     /// `-c` as an operand would pass the health command to the shell as `$1`
     /// and run an interactive shell on a serial console instead.

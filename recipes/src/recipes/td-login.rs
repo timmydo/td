@@ -32,14 +32,15 @@ use crate::types::{Recipe, Step};
 // where nothing can read back what actually took. The readback is the whole
 // defence; see THREAT-MODEL.md section 2.
 //
-// system-x86-64 SHIPS this as the /bin/{login,su} farm, off busybox. Unlike the
-// td-util cutover the success paths need no synthetic probe: `login -f` is how
-// the image reaches its greeter, and `su` is how /etc/rootcheck and
-// /etc/bootsuccess run every unprivileged leg, so a regression in either fails
-// the boot outright. What the boot could NOT see is a switch that "worked" while
+// system-x86-64 SHIPS this as the /bin/{login,su} farm, off busybox. Unlike
+// the td-util cutover the success paths need no synthetic probe: `login -f`
+// is how the image reaches its greeter, and /etc/bootsuccess runs health legs
+// through `su`; rootcheck's ownership and host-key probes use literal
+// execution subcommands. A failed credential transition fails the boot
+// outright. What the boot could NOT see is a switch that "worked" while
 // leaving a residual credential behind — every marker still prints — so the
-// health target additionally runs `td-login verify-credentials` THROUGH `su` and
-// gates TD-LOGIN-RUN-OK on the kernel's own readback.
+// health target additionally runs `td-login verify-credentials` THROUGH `su`
+// and gates TD-LOGIN-RUN-OK on the kernel's own readback.
 //
 // Why mesboot-style (rustc invoked directly) rather than `Recipe::rust`, and why
 // static: identical to td-sh/td-util/td-init/td-kexec. `login` is the program

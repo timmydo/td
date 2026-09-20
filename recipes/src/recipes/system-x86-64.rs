@@ -2278,31 +2278,28 @@ fn build_rootcheck(sys: &SystemDef) -> String {
     ));
     if let Some(user) = sys.users.iter().find(|user| user.name == sys.autologin) {
         if user.uid != 0 {
-            let (name, home) = (user.name, user.home);
+            let launcher = account_probe_launcher(user);
             // These probes WRITE rather than ask `test -w`: POSIX `-w` is access(2),
             // and a mode-bits answer would read root's own bit on 0755 `/var` and
-            // report success for a system that had failed. Each attempt runs in a
-            // CHILD shell because ash exits a non-interactive shell when a special
-            // builtin's redirection fails, and td-sh keeps that behaviour (the /etc
-            // probe below is the same constraint). Both spell it `/bin/sh` now: the
-            // multiplexed `busybox sh` spelling left with the flip, and there is no
-            // second shell left for the two to disagree about.
+            // report success for a system that had failed. Negative attempts run
+            // in nested shells: a failed special-builtin redirection exits td-sh,
+            // but the parent still needs to run the remaining checks.
             //
-            // Root clears the probe files on BOTH sides, and the pre-clear is
-            // load-bearing: a stale root-owned `/var/.tdwr-su` makes the unprivileged
-            // write fail with EACCES even where `/var` is world-writable, and that
-            // failure would read as a pass. `home` sits inside DOUBLE quotes, so `$`
-            // and `"` would be live. The image-wide source contract pins the
-            // autologin account to UI_HOME, a shell-safe direct child of /home.
+            // Root clears only the protected probe paths on both sides: a stale
+            // root-owned file could otherwise mask a world-writable directory.
+            // The child clears and writes its own HOME with dropped credentials;
+            // its positive redirection can abort that child directly on failure.
             s.push_str(&format!(
-                "/bin/td-util rm -f /var/.tdwr-su /var/root/.tdwr-su {home}/.tdwr-su || ok=0\n\
-                 if /bin/su -s /bin/sh {name} -c \
+                "/bin/td-util rm -f /var/.tdwr-su /var/root/.tdwr-su || ok=0\n\
+                 if {launcher} /bin/sh -c \
                  '/bin/td-util test -d /var/root || exit 1; \
                  /bin/sh -c \": > /var/.tdwr-su\" 2>/dev/null && exit 1; \
                  /bin/sh -c \": > /var/root/.tdwr-su\" 2>/dev/null && exit 1; \
-                 /bin/sh -c \": > {home}/.tdwr-su\" 2>/dev/null || exit 1'; then \
+                 /bin/td-util rm -f \"$HOME/.tdwr-su\" || exit 1; \
+                 : > \"$HOME/.tdwr-su\" || exit 1; \
+                 /bin/td-util rm -f \"$HOME/.tdwr-su\"'; then \
                  echo {SYSTEM_STATE_OWNER_MARKER}; else ok=0; fi\n\
-                 /bin/td-util rm -f /var/.tdwr-su /var/root/.tdwr-su {home}/.tdwr-su || ok=0\n"
+                 /bin/td-util rm -f /var/.tdwr-su /var/root/.tdwr-su || ok=0\n"
             ));
         }
     }
@@ -2367,9 +2364,13 @@ fn build_rootcheck(sys: &SystemDef) -> String {
          [ -c /dev/pts/ptmx ] || ok=0\n",
     );
     s.push_str(&build_mutable_etc_check(sys));
+    // Exclude exactly the non-root autologin account probed above, including
+    // named diagnostic accounts. Their HOME write already used their credentials.
     let mut probe_paths = "/var /run /tmp /home /root".to_string();
     for user in sys.users {
-        if gets_generic_persistent_home_setup(user) {
+        if gets_generic_persistent_home_setup(user)
+            && !(user.name == sys.autologin && user.uid != 0)
+        {
             probe_paths.push(' ');
             probe_paths.push_str(user.home);
         }
@@ -2450,17 +2451,13 @@ fn build_mutable_etc_check(sys: &SystemDef) -> String {
     );
     if let Some(user) = sys.users.iter().find(|user| user.name == sys.autologin) {
         if user.uid != 0 {
-            // ONE su, and the marker requires it to SUCCEED. Splitting this into a
-            // negative probe (`if su …; then me=0; fi`) would fail OPEN: `su` itself
-            // failing for any unrelated reason would look exactly like a private key
-            // that is correctly unreadable, and pass. Here a broken `su` is a
-            // non-zero exit and withholds the marker, while a passing run has proved
-            // both halves — the private key is NOT readable and the `.pub` IS.
+            // Require one successful child to prove both halves. A failed
+            // credential switch cannot stand in for an unreadable private key.
             s.push_str(&format!(
-                "if /bin/su -s /bin/sh {name} -c \
+                "if {launcher} /bin/sh -c \
                  'if /bin/td-util cat {key} >/dev/null 2>&1; then exit 1; fi; \
                  /bin/td-util cat {key}.pub >/dev/null 2>&1'; then :; else me=0; fi\n",
-                name = user.name,
+                launcher = account_probe_launcher(user),
                 key = SSHD_HOST_KEY,
             ));
         }
@@ -2469,6 +2466,14 @@ fn build_mutable_etc_check(sys: &SystemDef) -> String {
         "if [ \"$me\" = 1 ]; then echo {SYSTEM_ETC_MUTABLE_MARKER}; fi\n"
     ));
     s
+}
+
+fn account_probe_launcher(user: &User) -> String {
+    if user.uid == UI_UID {
+        "/bin/td-login exec-primary --".into()
+    } else {
+        format!("/bin/td-login exec-as {} --", user.name)
+    }
 }
 
 /// The supplementary gids the SHIPPED `/etc/group` grants `user`, derived by reading the
@@ -2502,8 +2507,8 @@ fn supplementary_gids(sys: &SystemDef, user: &str) -> Vec<u32> {
 /// The td-login leg of the health target: run THROUGH `/bin/su` (which is td-login) and have
 /// the switched process read its own credentials back out of `/proc/self/status`.
 ///
-/// This is the one failure the rest of the image cannot see. Every other unprivileged leg
-/// already goes through `su`, so a td-login that fails to start a session reds them all — but
+/// The other unprivileged health legs also use td-login's credential switch,
+/// so a td-login that fails to start a session reds them all — but
 /// a `setuid(2)` issued before `setgroups(2)` starts a perfectly working session that has
 /// silently kept root's supplementary groups, and every marker still prints. So this asserts
 /// the RESULT: all four uid columns, all four gid columns, and the exact supplementary set.
@@ -10365,9 +10370,8 @@ news\tnews-0.1\tsource\tstatic-runtime-1\tsource\n"
             "/home/.",
             "/home/a b",
             "/home/a;b",
-            // rootcheck's write probe embeds the home inside DOUBLE quotes
-            // (`sh -c ": > <home>/.tdwr"`), where these two are live where the
-            // old single-quoted `test -w <home>` made them inert.
+            // Rootcheck's generic-home word list is unquoted shell syntax;
+            // variable expansion and quote characters must remain forbidden.
             "/home/a$b",
             "/home/a\"b",
             "/home/a/b",
@@ -10380,6 +10384,53 @@ news\tnews-0.1\tsource\tstatic-runtime-1\tsource\n"
         assert!(valid_home(1000, "/home/test-user_1.0"));
         assert!(valid_home(AUDIO_UID, AUDIO_RUNTIME));
         assert!(!valid_home(AUDIO_UID, "/home/audio"));
+    }
+
+    #[test]
+    fn rootcheck_resolves_the_login_home_at_runtime() {
+        static USERS: std::sync::LazyLock<Vec<User>> = std::sync::LazyLock::new(|| {
+            SYSTEM.users.iter().map(|user| {
+                if user.uid == UI_UID {
+                    User { name: "alice", home: "/home/alice", ..*user }
+                } else {
+                    User { ..*user }
+                }
+            }).collect()
+        });
+        let renamed = SystemDef {
+            users: USERS.as_slice(),
+            autologin: "alice",
+            ..SYSTEM
+        };
+        let stock = build_rootcheck(&SYSTEM);
+        assert_eq!(stock, build_rootcheck(&renamed));
+        assert!(!stock.contains("/home/tester") && !stock.contains("/bin/su "));
+        assert_eq!(stock.matches("/bin/td-login exec-primary -- /bin/sh -c").count(), 2);
+        assert_eq!(stock.matches("/bin/td-util rm -f \"$HOME/.tdwr-su\"").count(), 2);
+    }
+
+    #[test]
+    fn rootcheck_uses_the_named_diagnostic_account_outside_the_primary_uid() {
+        const DIAGNOSTIC: User = User {
+            name: "diagnostic",
+            uid: 1001,
+            gid: 1001,
+            gecos: "Diagnostic",
+            home: "/home/diagnostic",
+            shell: "/bin/sh",
+            groups: &[],
+            passwordless: true,
+            service_only: false,
+        };
+        const USERS: &[User] = &[
+            DIAGNOSTIC,
+            User { name: "other", uid: 1002, gid: 1002, home: "/home/other", ..DIAGNOSTIC },
+        ];
+        let diagnostic = SystemDef { users: USERS, autologin: "diagnostic", ..SYSTEM };
+        let script = build_rootcheck(&diagnostic);
+        assert_eq!(script.matches("/bin/td-login exec-as diagnostic -- /bin/sh -c").count(), 2);
+        assert!(!script.contains("exec-primary") && !script.contains("/home/diagnostic"));
+        assert!(script.contains("for d in /var /run /tmp /home /root /home/other; do "));
     }
 
     /// The read-only-root self-check must emit both diagnostic markers the headless
@@ -10405,37 +10456,37 @@ news\tnews-0.1\tsource\tstatic-runtime-1\tsource\n"
             rootcheck.contains("readlink /var/run)\" = /run"),
             "rootcheck must prove /var/run resolves into volatile /run"
         );
-        // The two negative probes must ABORT the su script on success (`&& exit 1`)
-        // and the positive one on failure (`|| exit 1`); a probe whose status is
-        // discarded proves nothing.
+        // Negative writes must abort on success. The positive write must fail
+        // the child; td-sh aborts a failed special-builtin redirection before
+        // reaching its explicit || exit 1 fallback.
         assert!(
             rootcheck.contains(SYSTEM_STATE_OWNER_MARKER)
                 && rootcheck.contains("/bin/sh -c \": > /var/.tdwr-su\" 2>/dev/null && exit 1")
                 && rootcheck
                     .contains("/bin/sh -c \": > /var/root/.tdwr-su\" 2>/dev/null && exit 1")
-                && rootcheck.contains(".tdwr-su\" 2>/dev/null || exit 1"),
+                && rootcheck.contains(": > \"$HOME/.tdwr-su\" || exit 1"),
             "rootcheck must prove the login user cannot own system state by WRITING"
         );
-        // The pre-clear must come BEFORE the su, and its failure must count. A stale
+        // The pre-clear must come BEFORE the child, and its failure must count. A stale
         // root-owned probe file makes the unprivileged write fail with EACCES even
         // where `/var` is world-writable, and that failure reads as a pass — so
-        // moving both clears after the su, or letting one fail quietly, reopens the
+        // moving both clears after the child, or letting one fail quietly, reopens the
         // hole while leaving the assertion above green.
         let clear = "/bin/td-util rm -f /var/.tdwr-su /var/root/.tdwr-su";
-        let (Some(first_clear), Some(su), Some(last_clear)) = (
+        let (Some(first_clear), Some(child), Some(last_clear)) = (
             rootcheck.find(clear),
-            rootcheck.find("if /bin/su -s /bin/sh"),
+            rootcheck.find("if /bin/td-login exec-primary -- /bin/sh -c"),
             rootcheck.rfind(clear),
         ) else {
-            panic!("rootcheck lost either the probe clears or the su block")
+            panic!("rootcheck lost either the probe clears or the child block")
         };
         assert!(
-            first_clear < su && last_clear > su,
-            "the probe files must be cleared on BOTH sides of the su ({first_clear} \
-             {su} {last_clear})"
+            first_clear < child && last_clear > child,
+            "the probe files must be cleared on BOTH sides of the child ({first_clear} \
+             {child} {last_clear})"
         );
         assert_eq!(
-            rootcheck.matches(&format!("{clear} /home/tester/.tdwr-su || ok=0")).count(),
+            rootcheck.matches(&format!("{clear} || ok=0")).count(),
             2,
             "a clear that fails is the one case the clear exists for; it must set ok=0"
         );
