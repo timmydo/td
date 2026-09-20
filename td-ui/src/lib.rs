@@ -39,6 +39,9 @@ pub mod control_socket;
 pub mod control_worker;
 pub mod data;
 pub mod driven;
+#[path = "../../td-compositor/src/filter.rs"]
+pub mod filter;
+pub mod finder;
 #[path = "../../td-compositor/src/font.rs"]
 pub mod font;
 #[path = "../../td-compositor/src/font_data.rs"]

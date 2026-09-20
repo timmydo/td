@@ -23,13 +23,14 @@ fn compact(text: &str) -> String {
     text.chars().filter(|c| !c.is_whitespace()).collect()
 }
 
-const PURE: [&str; 21] = [
+const PURE: [&str; 22] = [
     "charts.rs",
     "chrome.rs",
     "confirmations.rs",
     "control.rs",
     "data.rs",
     "driven.rs",
+    "finder.rs",
     "keyboard.rs",
     "menus.rs",
     "pointer.rs",
@@ -116,7 +117,7 @@ fn source_inventory_and_shared_mounts_are_closed() {
         );
         assert_eq!(
             compact.matches("#[path=").count(),
-            if name == "lib.rs" { 3 } else { 0 },
+            if name == "lib.rs" { 4 } else { 0 },
             "source paths in {name}"
         );
         assert_eq!(
@@ -142,6 +143,7 @@ fn source_inventory_and_shared_mounts_are_closed() {
             assert!(!compact.contains("pubmodsys"), "the raw module is private");
             assert!(compact.contains("pubmodwayland;"));
             for (file, declaration) in [
+                ("filter.rs", "pubmodfilter;"),
                 ("font.rs", "pubmodfont;"),
                 ("font_data.rs", "modfont_data;"),
                 ("wire.rs", "pubmodwire;"),
@@ -208,6 +210,25 @@ fn source_inventory_and_shared_mounts_are_closed() {
                 ],
                 "notices carry the three texts beside the face and nothing else"
             );
+        }
+        if name == "finder.rs" {
+            // The finder paints and handles events without allocating: its
+            // status counts stream through a digit iterator, so no
+            // formatting or collecting appears in the module at all.
+            for allocating in [
+                "format!(",
+                ".to_string()",
+                ".to_owned()",
+                "String::from(",
+                "vec![",
+                ".collect()",
+                "Box::new(",
+            ] {
+                assert!(
+                    !text.contains(allocating),
+                    "allocation `{allocating}` in the finder"
+                );
+            }
         }
         if PURE.contains(&name.as_str()) {
             // Production text only: a module's own `#[cfg(test)] mod tests`

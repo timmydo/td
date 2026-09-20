@@ -47,11 +47,11 @@ handed on), and the turn loop that drives a consumer's `App` under the
 startup deadline; and the chrome bands over the raster (`chrome`: the menu
 bar with its drop-down panel, the wrapped text block, the tab strip and the
 status row), which td-editor's scene composes and paints. It re-mounts the
-compositor's `font`, `font_data` and `wire` sources exactly as td-editor
-did, so there is still one Unifont face and one wire codec in the tree, and
-it owns the 8x16 cell constants every consumer lays text out on. td-editor
-depends on it by path and uses those modules through the crate's public
-surface.
+compositor's `font`, `font_data`, `wire` and `filter` sources exactly as
+td-editor did, so there is still one Unifont face and one wire codec in the
+tree, and it owns the 8x16 cell constants every consumer lays text out on.
+td-editor depends on it by path and uses those modules through the crate's
+public surface.
 
 Newly built: `td-setup`, the second consumer, is a new crate whose
 `welcome` page renders from the toolkit and whose Wayland turn loop
@@ -114,6 +114,11 @@ of its own files may name each module.
 - `font`: the compositor's PSF2 reader and pinned Unifont face, unchanged.
   Provenance and licences stay in `td-compositor/assets`.
 - `wire`: the compositor's Wayland framing codec, unchanged.
+- `filter`: `MAX_QUERY_BYTES`, `insert` and `matches`, the compositor's
+  bounded ASCII query rule shared by the launcher and td-portal's chooser,
+  mounted from `td-compositor/src/filter.rs` unchanged; the finder takes
+  its `insert` and bound and repeats its match rule with the name folded
+  at the comparison.
 - `keyboard`: `Keymap::parse` over an XKB text-v1 map, `Modifiers`,
   `Stroke`, `InputError`, `Selected`, and translation from evdev keycodes
   plus a compositor modifier snapshot to logical chords. No display,
@@ -1182,6 +1187,77 @@ request bound, malformed input and unusable geometry. Draw-stream and
 pixel checks at scales one through four keep the controls within the
 dialog, preserve pixels outside it and respect partial damage.
 
+## Shared directory finder
+
+`finder::Listing` is one folder as the consumer read it: its path as
+shown, its `Entry` values in the consumer's order (a name, a right-aligned
+meta, a `Kind` of folder or file, and whether it can be descended into or
+chosen) and whether the read stopped short. The consumer reads the
+filesystem under its own bounds and trust, as td-portal's chooser and
+td-editor's directory tabs do, and the widget reads nothing: at most 4096
+entries, 1024-byte names, 16-byte metas, a 4096-byte path and one MiB of
+name and meta text between the entries, all control-free, refused before
+capture. `storage_bytes` on the listing and the controller exposes the
+retained capacities for consumer accounting.
+
+`finder::Controller` lays a path row, a filter `TextEntry`, the entries as
+a `List` and a status row inside one rectangle: four `ROW`s and twenty
+cells at least, the list taking the whole rows between, else `NoRoom`. It
+owns the filter query, the shown indices, the selection and the scroll
+window; construction, like `set_listing`, selects the entry it is given
+by name when listed, else the first. The filter is the launcher's rule,
+`filter` mounted from the compositor: `insert` takes ASCII folded to lower
+case under `MAX_QUERY_BYTES`, and every whitespace-separated term is found
+in the name, `matches`' rule with the name folded at the comparison so no
+folded copy of each name is held; a change resets the selection to the
+first shown.
+Up/Down, PageUp/PageDown and Home/End move and reveal the selection and
+honour repeats; a move that goes nowhere is consumed. Activate descends
+into an enabled folder (`Descend` with the entry's index) and, when files
+are what is chosen, chooses an enabled file; Accept chooses the listed
+folder itself (`Here`) when folders are chosen, so a selection resting on
+a subfolder cannot be taken for the folder in view, and the selected
+enabled file otherwise; Parent, and Backspace on an empty filter, ascend
+(`Ascend`); Escape cancels. A repeated Activate, Accept, Parent, Escape or
+empty-filter Backspace is consumed. A press on a shown row selects it and
+the wheel over the list moves the window, keeping the selection in it;
+other pointer input on the finder is consumed, and pointer input off its
+rectangle is ignored, the consumer's to act on (its bar, its own
+controls). Descend and Ascend leave the widget as it
+is: the consumer lists the folder and installs it with `set_listing`,
+which clears the filter and the note and selects the entry it names (the
+folder an ascent came from), or says why it could not with `set_note`,
+shown in the status row until the next listing. Resize relays out and
+keeps the selection shown; a layout that cannot hold the finder closes it
+`Unavailable`. A choice, a cancel and an unavailable layout each produce
+one `Closed` outcome; later events are ignored and a closed finder emits
+no draws. The consumer owns physical key bindings, the double click it
+turns into Activate, the prompt that tells the user what Return, Backspace
+and Accept do (the finder paints no affordance for them), and whatever the
+chosen path is used for; the widget grants no process authority.
+
+`emit` paints chrome under the rectangle, the path's tail when it is
+longer than the row, the field with its `Filter` placeholder, the list
+with a folder's meta `folder` when the consumer gave none (a meta is left
+out of a row that cannot keep `LABEL_COLUMNS` of the label beside it, so
+a meta at its bound never hides the name), `No match` or `Empty folder`
+in an empty list, and the status row under a rule: the entry count
+(`0 entries` for an empty one), the match count over the total while
+filtering, `cut short` for a truncated read whether or not anything was
+listed, or the note. It allocates nothing, which `tests/confinement.rs`
+holds at the source: no formatting, collecting or boxing in the module.
+
+`tests/finder.rs` pins the listing bounds (the text bound measured as
+text, not capacity), the filter rule, navigation and reveal, an empty
+listing taking every key and press, the outcomes of choosing in either
+mode and of a disabled entry, listing replacement selecting by name, the
+note's life, the press and wheel paths on and off the finder, a meta left
+out of a row too narrow for it, a long query keeping its caret in a
+narrow field, the geometry refusals and resize, and draw-stream and pixel
+oracles at scales one through four keeping every draw inside the
+rectangle, naming each band's text with counts of several digits and
+leaving the surface around it untouched.
+
 ## Shared time-series charts
 
 `charts::Chart` is a borrowed, validated view over caller-owned `Time`
@@ -1496,3 +1572,12 @@ regressions. Those increments extend the original sequence below.
    `Composition`'s draw stream and one XRGB-to-PPM writer, proven with a
    toy controller in the crate's tests. Landed; td-photo consumes it
    next.
+9. Directory finder, in two landings. (a) `finder`, the shared directory
+   finder over a consumer-supplied listing (see "Shared directory
+   finder"), with its oracles; td-photo's roll chooser is its first
+   consumer. Landed. (b) td-portal's file chooser over `finder`: its
+   filesystem model stays (descriptors, no-follow, the bounds and the
+   guest-path mapping) and hands the widget a `Listing` per folder, its
+   own filter, selection, scroll window and `ChooserView` deleted, the
+   multi-select mark added to the widget's `Entry` for the multiple-file
+   mode, and its render oracles regolded over the widget's bands.
