@@ -10,6 +10,7 @@ use std::fmt;
 use td_ui::chrome::{Bar, Block, Status, DISABLED, ROW};
 use td_ui::control::{self, decimal, hex, ErrorCode};
 use td_ui::driven::{self, Binding, Input, Outcome, PointerPhase};
+use td_ui::finder;
 use td_ui::raster::{
     text_run, Composition, Draw, GlyphStyle, Primitive, Rect, Scale, Surface, CHROME, INK,
     MISSPELLED, PAPER, SELECTED,
@@ -202,6 +203,16 @@ pub enum Effect {
     /// sidecars into `rejected/`, and take the moved ones out of the model
     /// through `remove`.
     DeleteRejected,
+    /// List `folder` (`None`: the adapter's working directory) for the
+    /// roll chooser, or with `parent` its parent with `folder` itself
+    /// selected (the folder an ascent leaves, the open roll at first; the
+    /// root's parent is the root): its subfolders and originals, handed
+    /// back through `set_listing`, the folder's own name chosen in its
+    /// parent, or the refusal noted through `note_listing`.
+    List {
+        folder: Option<Vec<u8>>,
+        parent: bool,
+    },
 }
 
 /// The closed set of things the window does. The table below is its
@@ -210,6 +221,7 @@ pub enum Effect {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Action {
     Open,
+    Choose,
     Next,
     Previous,
     Down,
@@ -246,8 +258,9 @@ pub enum Action {
 }
 
 impl Action {
-    pub const ALL: [Action; 34] = [
+    pub const ALL: [Action; 35] = [
         Action::Open,
+        Action::Choose,
         Action::Next,
         Action::Previous,
         Action::Down,
@@ -286,6 +299,7 @@ impl Action {
     pub fn name(self) -> &'static str {
         match self {
             Self::Open => "open",
+            Self::Choose => "choose",
             Self::Next => "next",
             Self::Previous => "previous",
             Self::Down => "down",
@@ -341,12 +355,18 @@ impl Action {
 /// binds, the argument shape and the help line. Actions without a chord
 /// take an argument or are the agent's (`open`); the pointer reaches
 /// `select` by pressing a cell and `scroll` by the wheel.
-pub const BINDINGS: [Binding; 34] = [
+pub const BINDINGS: [Binding; 35] = [
     Binding {
         name: "open",
         chord: None,
         arguments: "HEX_PATH",
         help: "Open the roll at the path, given as hex bytes.",
+    },
+    Binding {
+        name: "choose",
+        chord: Some("o"),
+        arguments: "",
+        help: "Open the roll chooser, a finder over the folders; the prompt names its keys. The action closes an open one.",
     },
     Binding {
         name: "next",
@@ -739,6 +759,21 @@ pub struct Controller {
     /// different note bumps the generation, since the row repaints; absent
     /// from `state`, and cleared when a roll opens.
     export: Option<String>,
+    /// The roll chooser while it is open (`choose`, `o`); see `Chooser`.
+    chooser: Option<Chooser>,
+}
+
+/// The roll chooser: the toolkit's finder over the folder the adapter
+/// listed last, and that folder's path as the request carried it (what a
+/// descent joins a name to, what `Here` opens). Open until a choice, a
+/// cancel, a roll opening or a surface the finder cannot fit; while it is
+/// open every key, press and wheel is the finder's, the area shows it in
+/// place of the grid, and the boxes, the develop preview and the overlays
+/// are withheld from the window, so nothing is blitted over it.
+#[derive(Debug)]
+struct Chooser {
+    finder: finder::Controller,
+    folder: Vec<u8>,
 }
 
 /// A crop drag: the canvas it maps against (the develop preview's fitted
@@ -1217,6 +1252,7 @@ impl Controller {
             looks: Vec::new(),
             look_list: false,
             export: None,
+            chooser: None,
         }
     }
 
@@ -1247,10 +1283,101 @@ impl Controller {
         self.look_list = false;
         self.preview_fit = None;
         self.export = None;
+        self.chooser = None;
         self.refresh_shown();
         self.cursor = self.shown.first().copied();
         self.bump();
         Ok(())
+    }
+
+    /// The folder the adapter listed for the chooser, as its path bytes
+    /// and the finder's listing: installed in the open chooser, or opening
+    /// one over the area (refused when the area cannot hold a finder);
+    /// `select` names the entry to land on. A change either way.
+    pub fn set_listing(
+        &mut self,
+        folder: Vec<u8>,
+        listing: finder::Listing,
+        select: Option<&str>,
+    ) -> Result<(), Error> {
+        match self.chooser.as_mut() {
+            Some(chooser) => {
+                chooser
+                    .finder
+                    .set_listing(listing, select)
+                    .map_err(|_| Error::Refused)?;
+                chooser.folder = folder;
+            }
+            None => {
+                let finder = finder::Controller::new(
+                    listing,
+                    finder::Choose::Folder,
+                    self.surface,
+                    self.layout().area,
+                    select,
+                )
+                .map_err(|_| Error::Refused)?;
+                // The pointer is the finder's now; a drag cannot go on.
+                self.drag = None;
+                self.chooser = Some(Chooser { finder, folder });
+            }
+        }
+        self.bump();
+        Ok(())
+    }
+
+    /// Why the adapter could not list a folder, shown in the open
+    /// chooser's status row until the next listing; nothing without one.
+    /// The note is fitted to the finder's bound, its tail kept since the
+    /// reason follows the path, and its control characters blanked; the
+    /// same note again is no change.
+    pub fn note_listing(&mut self, note: &str) {
+        let Some(chooser) = self.chooser.as_mut() else {
+            return;
+        };
+        let mut fitted: String = note
+            .chars()
+            .map(|c| if c.is_control() { ' ' } else { c })
+            .collect();
+        if fitted.len() > finder::NOTE_BYTES {
+            let keep = finder::NOTE_BYTES - '\u{2026}'.len_utf8();
+            let mut start = fitted.len() - keep;
+            while !fitted.is_char_boundary(start) {
+                start += 1;
+            }
+            fitted = format!("\u{2026}{}", fitted.get(start..).unwrap_or(""));
+        }
+        if chooser.finder.note() == fitted {
+            return;
+        }
+        if chooser.finder.set_note(&fitted).is_ok() {
+            self.bump();
+        }
+    }
+
+    /// Whether holding `chord` repeats while the chooser is open: the moves,
+    /// a typed character, and BackSpace while there is a filter to edit (a
+    /// held one on an empty filter would run up the tree); Return,
+    /// C-Return and Escape fire once.
+    pub fn chooser_repeats(&self, chord: &str) -> bool {
+        let Some(chooser) = self.chooser.as_ref() else {
+            return false;
+        };
+        match chord {
+            "Up" | "Down" | "PageUp" | "PageDown" | "Space" => true,
+            "BackSpace" => !chooser.finder.query().is_empty(),
+            _ => {
+                let mut chars = chord.chars();
+                matches!((chars.next(), chars.next()), (Some(c), None) if !c.is_control())
+            }
+        }
+    }
+
+    /// The open chooser: the listed folder's path and the finder.
+    pub fn chooser(&self) -> Option<(&[u8], &finder::Controller)> {
+        self.chooser
+            .as_ref()
+            .map(|chooser| (chooser.folder.as_slice(), &chooser.finder))
     }
 
     /// Whether a sidecar of `bytes` in place of the photo at `index` keeps
@@ -1423,7 +1550,7 @@ impl Controller {
     /// look among them (the row to mark), or `None`. Read by the scene; a fact
     /// and a frame-witnessed sub-mode, not a `state` field.
     pub fn look_palette(&self) -> Option<(&[String], Option<usize>)> {
-        if !self.look_list || self.looks.is_empty() {
+        if !self.look_list || self.looks.is_empty() || self.chooser.is_some() {
             return None;
         }
         let active = self.cursor.and_then(|index| {
@@ -1541,6 +1668,9 @@ impl Controller {
     /// box are invisible, so their change is not a frame change. The generation
     /// follows this, so it moves exactly when the overlay does.
     fn painted(&self) -> Option<Painted> {
+        if self.chooser.is_some() {
+            return None;
+        }
         if self.look_list && !self.looks.is_empty() && self.develop_box().is_some() {
             return Some(Painted::Looks);
         }
@@ -1603,7 +1733,7 @@ impl Controller {
     /// the developed image here; the cull single view keeps the placeholder,
     /// so this is `Some` only in develop mode.
     pub fn develop_box(&self) -> Option<Rect> {
-        if self.mode != Mode::Develop || self.cursor.is_none() {
+        if self.mode != Mode::Develop || self.cursor.is_none() || self.chooser.is_some() {
             return None;
         }
         self.layout().preview_box()
@@ -1613,7 +1743,11 @@ impl Controller {
     /// the cull grid; nothing in the single or develop view, whose box is
     /// the develop increment's preview, and nothing before a roll.
     pub fn visible(&self) -> Vec<(usize, Rect)> {
-        if self.roll.is_none() || self.mode != Mode::Cull || self.view != View::Grid {
+        if self.roll.is_none()
+            || self.mode != Mode::Cull
+            || self.view != View::Grid
+            || self.chooser.is_some()
+        {
             return Vec::new();
         }
         let layout = self.layout();
@@ -1667,6 +1801,10 @@ impl Controller {
     /// One input through the key and pointer paths the window uses.
     pub fn input(&mut self, input: Input<'_>) -> Result<(Outcome, Vec<Effect>), Error> {
         match input {
+            // The chooser owns the keyboard while it is open: a chord is the
+            // finder's key or a typed filter character, and no binding is
+            // looked up under it.
+            Input::Key { chord } if self.chooser.is_some() => self.chooser_key(chord),
             Input::Key { chord } => match driven::bound(&BINDINGS, chord) {
                 Some(binding) => {
                     let action = Action::parse(binding.name).ok_or(Error::BadArgument)?;
@@ -1675,6 +1813,9 @@ impl Controller {
                 None => Ok((Outcome::Ignored, Vec::new())),
             },
             Input::Pointer { phase, x, y } => self.pointer(phase, i64::from(x), i64::from(y)),
+            Input::Wheel { rows, .. } if self.chooser.is_some() => {
+                self.chooser_wheel(i64::from(rows))
+            }
             Input::Wheel { rows, .. } => {
                 let outcome = self.scroll(i64::from(rows));
                 Ok((self.finish(outcome), Vec::new()))
@@ -1693,6 +1834,19 @@ impl Controller {
                 // The canvas moved under any drag; its pixels are stale.
                 self.drag = None;
                 self.reveal();
+                // The chooser is laid out again over the new area; one it
+                // cannot fit closes it.
+                let area = self.layout().area;
+                if let Some(chooser) = self.chooser.as_mut() {
+                    if let finder::Outcome::Closed(_) =
+                        chooser.finder.event(finder::Event::Resize {
+                            surface,
+                            rect: area,
+                        })
+                    {
+                        self.chooser = None;
+                    }
+                }
                 self.bump();
                 Ok((Outcome::Changed, Vec::new()))
             }
@@ -1705,7 +1859,8 @@ impl Controller {
     /// position among the shown, the filter, the cull view (`grid` or
     /// `single`, where develop mode returns), then the photo under the
     /// cursor (its name in hex, flag, exposure, crop, look, sidecar state),
-    /// the outstanding job count and the generation. Absent values are `-`.
+    /// the outstanding job count, the generation and the chooser's listed
+    /// folder in hex. Absent values are `-`.
     pub fn state(&self) -> String {
         let position = self.position();
         let photo = self.cursor.and_then(|index| self.photos.get(index));
@@ -1726,6 +1881,9 @@ impl Controller {
             photo.map_or_else(dash, |p| p.status().to_string()),
             self.jobs.to_string(),
             self.generation.to_string(),
+            self.chooser
+                .as_ref()
+                .map_or_else(dash, |chooser| hex(&chooser.folder)),
         ]
         .join("\t")
     }
@@ -1797,7 +1955,23 @@ impl Controller {
         arguments: &[&str],
     ) -> Result<(Outcome, Vec<Effect>), Error> {
         let mut effects = Vec::new();
+        // While the chooser is open the window's actions are behind it:
+        // only `choose` (closing it), `open`, `quit` and `scroll` (the
+        // finder's wheel) reach through, the rest is `ignored`, as the
+        // keyboard cannot reach them either.
+        if self.chooser.is_some()
+            && !matches!(
+                action,
+                Action::Choose | Action::Open | Action::Quit | Action::Scroll
+            )
+        {
+            return Ok((Outcome::Ignored, effects));
+        }
         let outcome = match (action, arguments) {
+            (Action::Choose, []) => return self.choose(effects),
+            (Action::Scroll, [rows]) if self.chooser.is_some() => {
+                return self.chooser_wheel(signed(rows)?)
+            }
             (Action::Open, [path]) => {
                 // The change is the adapter's to make: `open` bumps when the
                 // roll is installed, and a folder that cannot be read leaves
@@ -1869,6 +2043,15 @@ impl Controller {
         x: i64,
         y: i64,
     ) -> Result<(Outcome, Vec<Effect>), Error> {
+        // The chooser owns the pointer while it is open: a press picks a
+        // row, and nothing under it (the bar, a cell) is a target.
+        if self.chooser.is_some() {
+            return self.chooser_event(match phase {
+                PointerPhase::Press => finder::Event::Press { x, y },
+                PointerPhase::Move => finder::Event::Move { x, y },
+                PointerPhase::Release => finder::Event::Release { x, y },
+            });
+        }
         // Develop mode: the crop drag owns the pointer over the preview, for
         // press, move and release; a press off the preview (the bar, the
         // status row, the margins) starts no drag, as a filter press is inert
@@ -2201,6 +2384,125 @@ impl Controller {
         self.refresh_shown();
         self.keep_cursor_shown();
         Outcome::Changed
+    }
+
+    /// `choose`: opens the roll chooser, asking the adapter to list the
+    /// folder beside the open roll with the roll selected (its working
+    /// directory when none is open), or closes an open one. The opening
+    /// is the adapter's change to make through `set_listing`; a folder
+    /// that cannot be read opens nothing.
+    fn choose(&mut self, mut effects: Vec<Effect>) -> Result<(Outcome, Vec<Effect>), Error> {
+        if self.chooser.is_some() {
+            self.chooser = None;
+            return Ok((self.finish(Outcome::Changed), effects));
+        }
+        effects.push(match self.roll.as_ref() {
+            Some(roll) => Effect::List {
+                folder: Some(roll.path.clone()),
+                parent: true,
+            },
+            None => Effect::List {
+                folder: None,
+                parent: false,
+            },
+        });
+        Ok((Outcome::Changed, effects))
+    }
+
+    /// A chord while the chooser is open: the finder's keys by their
+    /// names, `C-Return` its accept, and a single printable character the
+    /// filter's; any other chord is `ignored`.
+    fn chooser_key(&mut self, chord: &str) -> Result<(Outcome, Vec<Effect>), Error> {
+        let key = |key| finder::Event::Key {
+            key,
+            repeated: false,
+        };
+        let event = match chord {
+            "Up" => key(finder::Key::Up),
+            "Down" => key(finder::Key::Down),
+            "PageUp" => key(finder::Key::PageUp),
+            "PageDown" => key(finder::Key::PageDown),
+            "Home" => key(finder::Key::Home),
+            "End" => key(finder::Key::End),
+            "Return" => key(finder::Key::Activate),
+            "C-Return" => key(finder::Key::Accept),
+            "BackSpace" => key(finder::Key::Backspace),
+            "Escape" => key(finder::Key::Escape),
+            "Space" => finder::Event::Insert(' '),
+            _ => {
+                let mut chars = chord.chars();
+                match (chars.next(), chars.next()) {
+                    (Some(c), None) if !c.is_control() => finder::Event::Insert(c),
+                    _ => return Ok((Outcome::Ignored, Vec::new())),
+                }
+            }
+        };
+        self.chooser_event(event)
+    }
+
+    /// The wheel while the chooser is open scrolls its list.
+    fn chooser_wheel(&mut self, rows: i64) -> Result<(Outcome, Vec<Effect>), Error> {
+        let Some(list) = self.chooser.as_ref().map(|c| c.finder.list_rect()) else {
+            return Ok((Outcome::Ignored, Vec::new()));
+        };
+        let rows = isize::try_from(rows).unwrap_or(if rows < 0 { isize::MIN } else { isize::MAX });
+        self.chooser_event(finder::Event::Wheel {
+            x: list.x,
+            y: list.y,
+            rows,
+        })
+    }
+
+    /// One finder event and what it asks of the adapter: a descent lists
+    /// the folder under the cursor, an ascent the parent with this folder
+    /// selected (nothing above the root), `Here` opens the listed folder as
+    /// the roll, and a close of any kind takes the chooser down. A descent
+    /// or an ascent is `changed` without moving the generation, as `open`
+    /// is: the frame changes when the adapter installs the listing or
+    /// notes the refusal.
+    fn chooser_event(&mut self, event: finder::Event) -> Result<(Outcome, Vec<Effect>), Error> {
+        let Some(chooser) = self.chooser.as_mut() else {
+            return Ok((Outcome::Ignored, Vec::new()));
+        };
+        let mut effects = Vec::new();
+        let outcome = match chooser.finder.event(event) {
+            finder::Outcome::Changed => Outcome::Changed,
+            finder::Outcome::Ignored | finder::Outcome::Consumed => Outcome::Ignored,
+            finder::Outcome::Descend(index) => {
+                return Ok(match chooser.finder.listing().entries().get(index) {
+                    Some(entry) => (
+                        Outcome::Changed,
+                        vec![Effect::List {
+                            folder: Some(join_folder(&chooser.folder, entry.name())),
+                            parent: false,
+                        }],
+                    ),
+                    None => (Outcome::Ignored, effects),
+                });
+            }
+            finder::Outcome::Ascend => {
+                return Ok(if chooser.folder.iter().all(|byte| *byte == b'/') {
+                    (Outcome::Ignored, effects)
+                } else {
+                    (
+                        Outcome::Changed,
+                        vec![Effect::List {
+                            folder: Some(chooser.folder.clone()),
+                            parent: true,
+                        }],
+                    )
+                });
+            }
+            finder::Outcome::Closed(choice) => {
+                let folder = std::mem::take(&mut chooser.folder);
+                self.chooser = None;
+                if choice == finder::Choice::Here {
+                    effects.push(Effect::Open(folder));
+                }
+                Outcome::Changed
+            }
+        };
+        Ok((self.finish(outcome), effects))
     }
 
     /// `grid`/Escape backs out one level: from crop-adjust to plain develop,
@@ -2608,6 +2910,17 @@ fn names(labels: &[String; 4]) -> [&str; 4] {
     ]
 }
 
+/// `folder/name`, one separator between them.
+fn join_folder(folder: &[u8], name: &str) -> Vec<u8> {
+    let mut joined = Vec::with_capacity(folder.len() + 1 + name.len());
+    joined.extend_from_slice(folder);
+    if !folder.ends_with(b"/") {
+        joined.push(b'/');
+    }
+    joined.extend_from_slice(name.as_bytes());
+    joined
+}
+
 fn signed(value: &str) -> Result<i64, Error> {
     let digits = value.strip_prefix('-').unwrap_or(value);
     let magnitude = i64::try_from(decimal(digits)?).map_err(|_| Error::BadArgument)?;
@@ -2640,6 +2953,11 @@ impl Scene<'_> {
     /// The status row's line.
     pub fn status_line(&self) -> String {
         let model = self.model;
+        if model.chooser.is_some() {
+            return "Choose a roll: Return enter, BackSpace up, C-Return open here, \
+                    Escape cancel; type to filter"
+                .to_string();
+        }
         let Some(roll) = &model.roll else {
             return "No roll open".to_string();
         };
@@ -2960,13 +3278,19 @@ impl Composition for Scene<'_> {
         let labels = labels(model.filter);
         let names = names(&labels);
         Bar::new(layout.surface, &names).emit(damage, sink);
+        if let Some(chooser) = &model.chooser {
+            // The finder stands in for the area, whatever is open behind it.
+            chooser.finder.emit(damage, sink);
+            Status::new(layout.surface).emit(self.status_line().chars(), damage, sink);
+            return;
+        }
         let cursor_photo = model.cursor.and_then(|index| model.photos.get(index));
         match (&model.roll, model.mode, model.view) {
             (None, _, _) => {
                 fill(layout.area, PAPER, damage, sink);
                 if let Some(block) = Block::new(layout.surface, layout.area.y, 2) {
                     block.emit(
-                        "No roll open.\naction open HEX_PATH opens one; --replay ROLL opens it at start.",
+                        "No roll open.\no chooses one; action open HEX_PATH opens one; --replay ROLL opens it at start.",
                         damage,
                         sink,
                     );

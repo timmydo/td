@@ -21,6 +21,7 @@ use std::process::ExitCode;
 use std::time::Instant;
 
 use td_ui::driven::{self, Binding, Input, Outcome};
+use td_ui::finder;
 use td_ui::raster::{Composition, Scale, Surface};
 
 use td_photo::color::{camera_color, CameraColor, Transfer};
@@ -102,7 +103,8 @@ const HELP: &str = concat!(
     "  Opens the window on the Wayland display, on ROLL if given, a\n",
     "  folder of originals: the roll as a grid of thumbnails from the\n",
     "  camera's embedded previews, culled with the keys --help actions\n",
-    "  lists. td-photo alone is `open` with no roll. --control-socket\n",
+    "  lists; `o` in the window chooses a roll through a folder finder.\n",
+    "  td-photo alone is `open` with no roll. --control-socket\n",
     "  serves the --replay vocabulary on a private socket at PATH\n",
     "  (absolute, at most 107 bytes) for an agent driving the live window.\n",
     "td-photo --replay [--size WxH] [ROLL]\n",
@@ -2128,6 +2130,78 @@ fn list(roll: &Path, rest: &[OsString]) -> Result<(), String> {
     Ok(())
 }
 
+/// A folder for the roll chooser: its subfolders and originals as a
+/// finder listing, folders first, each sorted, at most `finder::ENTRIES`
+/// entries and `finder::LISTING_BYTES` of their text before the listing
+/// is cut short. A link is followed to learn whether it is a folder, as
+/// `ls` does, and shown as one marked `link`; an original is shown for
+/// what the folder is, not as a target (disabled); an entry gone or
+/// unreadable between the read and its type, a name that is not text, or
+/// one the finder cannot show, is left out.
+fn list_folder(path: &Path) -> Result<finder::Listing, String> {
+    let named = |e: io::Error| format!("{}: {e}", path.display());
+    let mut folders: Vec<(String, &str)> = Vec::new();
+    let mut files: Vec<String> = Vec::new();
+    let mut truncated = false;
+    for entry in fs::read_dir(path).map_err(named)? {
+        let Ok(entry) = entry else {
+            continue;
+        };
+        let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        let Ok(kind) = entry.file_type() else {
+            continue;
+        };
+        let listed = if kind.is_dir() {
+            Some((finder::Kind::Folder, ""))
+        } else if kind.is_symlink() && fs::metadata(entry.path()).is_ok_and(|m| m.is_dir()) {
+            Some((finder::Kind::Folder, "link"))
+        } else if kind.is_file() && library::is_original(&name) {
+            Some((finder::Kind::File, "original"))
+        } else {
+            None
+        };
+        let Some((listed, meta)) = listed else {
+            continue;
+        };
+        // The bound counts what is listed, so a roll of many originals
+        // and sidecars still shows every subfolder it has room for.
+        if folders.len() + files.len() >= finder::ENTRIES {
+            truncated = true;
+            break;
+        }
+        match listed {
+            finder::Kind::Folder => folders.push((name, meta)),
+            finder::Kind::File => files.push(name),
+        }
+    }
+    folders.sort();
+    files.sort();
+    let mut entries = Vec::with_capacity(folders.len() + files.len());
+    let mut bytes = 0usize;
+    // Folders first, then the originals, until the text bound is met.
+    let candidates = folders
+        .iter()
+        .map(|(name, meta)| finder::Entry::new(name, meta, finder::Kind::Folder, true))
+        .chain(
+            files
+                .iter()
+                .map(|name| finder::Entry::new(name, "original", finder::Kind::File, false)),
+        );
+    for entry in candidates.flatten() {
+        let next = bytes.saturating_add(entry.name().len() + entry.meta().len());
+        if next > finder::LISTING_BYTES {
+            truncated = true;
+            break;
+        }
+        bytes = next;
+        entries.push(entry);
+    }
+    finder::Listing::new(&path.to_string_lossy(), entries, truncated)
+        .map_err(|e| format!("{}: {e}", path.display()))
+}
+
 /// A roll's originals by name, sorted; a folder of more than `MAX_ENTRIES`
 /// entries is refused. Sidecars are read by the caller, one at a time or
 /// under a budget, never all at once for a listing.
@@ -2497,9 +2571,53 @@ impl Session {
                 }
                 Effect::Export { name, .. } => outcome = self.export(name)?,
                 Effect::DeleteRejected => outcome = self.delete_rejected()?,
+                Effect::List { folder, parent } => self.list(folder, parent)?,
             }
         }
         Ok(outcome)
+    }
+
+    /// Lists `folder` (`None`: the working directory), or with `parent`
+    /// its parent with the folder's own name selected (the root's parent
+    /// being the root, and a name that is not text selecting nothing),
+    /// for the roll chooser and installs it in the model, that name chosen;
+    /// a folder that cannot be listed is `refused` with the reason on
+    /// stderr and in the open chooser's status row, the chooser left as
+    /// it was.
+    fn list(&mut self, folder: Option<Vec<u8>>, parent: bool) -> Result<(), ui::Error> {
+        let listed = folder
+            .map_or_else(std::env::current_dir, |bytes| {
+                Ok(PathBuf::from(OsString::from_vec(bytes)))
+            })
+            .and_then(|path| std::path::absolute(&path))
+            .map_err(|e| format!("{e}"))
+            .and_then(|path| {
+                let (path, select) = if parent {
+                    let name = path
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .map(str::to_string);
+                    let parent = path
+                        .parent()
+                        .map_or_else(|| path.clone(), Path::to_path_buf);
+                    (parent, name)
+                } else {
+                    (path, None)
+                };
+                list_folder(&path).map(|listing| (path, listing, select))
+            });
+        let (path, listing, select) = match listed {
+            Ok(listed) => listed,
+            Err(why) => {
+                note(&why);
+                self.ui.note_listing(&why);
+                return Err(ui::Error::Refused);
+            }
+        };
+        let display = path.display().to_string();
+        self.ui
+            .set_listing(path.into_os_string().into_vec(), listing, select.as_deref())
+            .inspect_err(|_| note(&format!("{display}: the window cannot show a chooser")))
     }
 
     /// Exports `name` through its sidecar as the file holds it now: the

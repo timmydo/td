@@ -1261,10 +1261,14 @@ impl Window {
                     chord: &stroke.chord,
                 });
                 // A held arrow walks the grid; a flag, a filter, a view or
-                // quit fires once.
-                let repeats = driven::bound(&BINDINGS, &stroke.chord)
-                    .and_then(|binding| Action::parse(binding.name))
-                    .is_some_and(Action::repeats);
+                // quit fires once. The chooser, when open, has its own rule.
+                let repeats = if self.session.ui.chooser().is_some() {
+                    self.session.ui.chooser_repeats(&stroke.chord)
+                } else {
+                    driven::bound(&BINDINGS, &stroke.chord)
+                        .and_then(|binding| Action::parse(binding.name))
+                        .is_some_and(Action::repeats)
+                };
                 if stroke.repeat && repeats && outcome != Outcome::Quit {
                     self.client.arm(key, self.clock);
                 }
@@ -1383,11 +1387,19 @@ impl Window {
         if idle {
             match self.client.repeat(now) {
                 Ok(Some(stroke)) => {
-                    let outcome = self.input(Input::Key {
-                        chord: &stroke.chord,
-                    });
-                    if outcome == Outcome::Ignored {
+                    // A repeat the chooser no longer wants (BackSpace once
+                    // the filter it was editing is empty) stops here, or a
+                    // held key would run up the tree.
+                    let ui = &self.session.ui;
+                    if ui.chooser().is_some() && !ui.chooser_repeats(&stroke.chord) {
                         self.client.cancel_repeat();
+                    } else {
+                        let outcome = self.input(Input::Key {
+                            chord: &stroke.chord,
+                        });
+                        if outcome == Outcome::Ignored {
+                            self.client.cancel_repeat();
+                        }
                     }
                 }
                 Ok(None) => {}

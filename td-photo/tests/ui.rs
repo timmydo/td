@@ -22,6 +22,7 @@ use td_photo::library::{self, Filter, Flag, Key, Sidecar};
 use td_photo::ui::{self, Action, Controller, Effect, Photo, View, BINDINGS};
 use td_ui::control::{frame, hex, valid_code, Decoder, ErrorCode};
 use td_ui::driven::{self, Input, Outcome, PointerPhase};
+use td_ui::finder;
 use td_ui::raster::{Rect, Scale, Surface};
 use td_ui::CELL_HEIGHT;
 
@@ -40,6 +41,7 @@ const LOOK: usize = 11;
 const STATUS: usize = 12;
 const JOBS: usize = 13;
 const GENERATION: usize = 14;
+const CHOOSER: usize = 15;
 
 fn surface(width: usize, height: usize) -> Surface {
     Surface::new(width, height, Scale::new(1).unwrap()).unwrap()
@@ -188,7 +190,7 @@ fn a_session_walks_the_grid_and_reports_its_state() {
     assert_eq!((layout.columns, layout.rows), (4, 3));
     assert_eq!(
         c.state(),
-        "cull\t-\t0\t0\t-\tall\tgrid\t-\t-\t-\t-\t-\t-\t0\t0"
+        "cull\t-\t0\t0\t-\tall\tgrid\t-\t-\t-\t-\t-\t-\t0\t0\t-"
     );
     for name in ["next", "pick", "view", "first"] {
         assert_eq!(
@@ -469,7 +471,7 @@ fn apply(c: &mut Controller, effects: &[Effect]) -> Result<Outcome, ui::Error> {
                 };
                 continue;
             }
-            Effect::Open(_) => panic!("{effect:?}"),
+            Effect::Open(_) | Effect::List { .. } => panic!("{effect:?}"),
         };
         if let Effect::Export { .. } = effect {
             // The adapter writes no sidecar for an export: it reports.
@@ -496,7 +498,10 @@ fn apply(c: &mut Controller, effects: &[Effect]) -> Result<Outcome, ui::Error> {
                     .unwrap();
             }
             Effect::Reset { .. } => sidecar.reset(),
-            Effect::Open(_) | Effect::Export { .. } | Effect::DeleteRejected => {
+            Effect::Open(_)
+            | Effect::Export { .. }
+            | Effect::DeleteRejected
+            | Effect::List { .. } => {
                 panic!("{effect:?}")
             }
         }
@@ -1224,10 +1229,11 @@ fn the_binary_replays_the_cull_over_a_roll_and_writes_through_the_sidecar() {
             "-",
             "none",
             "0",
-            "1"
+            "1",
+            "-"
         ]
     );
-    assert_eq!(&reply(2)[..2], ["ok", "34"]);
+    assert_eq!(&reply(2)[..2], ["ok", "35"]);
     assert_eq!(reply(3), ["ok", "changed"]);
     assert_eq!(reply(4), ["ok", &name(1), "pick", "-", "-", "-", "ok", "-"]);
     assert_eq!(
@@ -4014,5 +4020,525 @@ fn a_bare_invocation_is_the_window_and_without_a_compositor_names_what_it_tried(
         invalid.contains("Wayland: invalid WAYLAND_SOCKET; see --help")
             && !invalid.contains(absolute),
         "{invalid}"
+    );
+}
+
+/// A folder listing for the chooser, as the adapter would make it.
+fn listing(path: &str, folders: &[&str], files: &[&str]) -> finder::Listing {
+    let mut entries = Vec::new();
+    for name in folders {
+        entries.push(finder::Entry::new(name, "", finder::Kind::Folder, true).unwrap());
+    }
+    for name in files {
+        entries.push(finder::Entry::new(name, "original", finder::Kind::File, false).unwrap());
+    }
+    finder::Listing::new(path, entries, false).unwrap()
+}
+
+#[test]
+fn the_roll_chooser_opens_beside_the_roll_and_walks_the_folders_through_the_adapter() {
+    let mut c = Controller::new(surface(800, 600));
+    c.open("2026-a", b"/photos/2026-a", photos(3)).unwrap();
+    let generation = fields(&c)[GENERATION].clone();
+    // `choose` asks the adapter for the roll's parent with the roll
+    // selected (the parent is the adapter's to find from the roll's own
+    // path); nothing opens until the listing is installed.
+    let (outcome, effects) = c.action("choose", &[]).unwrap();
+    assert_eq!(outcome, Outcome::Changed);
+    assert_eq!(
+        effects,
+        [Effect::List {
+            folder: Some(b"/photos/2026-a".to_vec()),
+            parent: true,
+        }]
+    );
+    assert_eq!(fields(&c)[CHOOSER], "-");
+    assert_eq!(fields(&c)[GENERATION], generation);
+    c.set_listing(
+        b"/photos".to_vec(),
+        listing("/photos", &["2025", "2026-a", "2026-b"], &["DSC_0009.NEF"]),
+        Some("2026-a"),
+    )
+    .unwrap();
+    assert_eq!(fields(&c)[CHOOSER], hex(b"/photos"));
+    assert_ne!(fields(&c)[GENERATION], generation);
+    let (_, finder) = c.chooser().unwrap();
+    assert_eq!(finder.selected_entry().unwrap().name(), "2026-a");
+    // The scene shows the finder in place of the grid, the status row the
+    // prompt, and the window gets no boxes to blit over it.
+    let (_, _, text) = driven::text(&c.scene()).unwrap();
+    assert!(
+        text.contains("/photos") && text.contains("2026-b") && text.contains("Filter"),
+        "{text}"
+    );
+    assert!(!text.contains("DSC_0000.NEF"), "{text}");
+    assert!(
+        text.lines().last().unwrap().contains("Choose a roll"),
+        "{text}"
+    );
+    assert!(c.visible().is_empty());
+    // The keys are the finder's: a letter filters rather than flags, and
+    // the roll behind is untouched.
+    let (outcome, effects) = c.input(Input::Key { chord: "p" }).unwrap();
+    assert_eq!((outcome, effects.len()), (Outcome::Changed, 0));
+    assert_eq!(c.chooser().unwrap().1.query(), "p");
+    assert_eq!(fields(&c)[FLAG], "-");
+    assert_eq!(key(&mut c, "BackSpace"), Outcome::Changed);
+    assert_eq!(c.chooser().unwrap().1.query(), "");
+    // The filter round trip left the selection on the first shown. Return
+    // descends into the folder under the cursor; the adapter lists it, and
+    // BackSpace on an empty filter asks for the parent with this folder
+    // selected.
+    assert_eq!(
+        c.chooser().unwrap().1.selected_entry().unwrap().name(),
+        "2025"
+    );
+    assert_eq!(key(&mut c, "Down"), Outcome::Changed);
+    assert_eq!(key(&mut c, "Down"), Outcome::Changed);
+    let generation = fields(&c)[GENERATION].clone();
+    let (outcome, effects) = c.input(Input::Key { chord: "Return" }).unwrap();
+    assert_eq!(outcome, Outcome::Changed);
+    assert_eq!(
+        effects,
+        [Effect::List {
+            folder: Some(b"/photos/2026-b".to_vec()),
+            parent: false,
+        }]
+    );
+    // The frame is the adapter's to change: asking moves no generation.
+    assert_eq!(fields(&c)[GENERATION], generation);
+    c.set_listing(
+        b"/photos/2026-b".to_vec(),
+        listing("/photos/2026-b", &["rejected"], &["DSC_0100.NEF"]),
+        None,
+    )
+    .unwrap();
+    assert_eq!(fields(&c)[CHOOSER], hex(b"/photos/2026-b"));
+    let generation = fields(&c)[GENERATION].clone();
+    let (outcome, effects) = c.input(Input::Key { chord: "BackSpace" }).unwrap();
+    assert_eq!(outcome, Outcome::Changed);
+    assert_eq!(
+        effects,
+        [Effect::List {
+            folder: Some(b"/photos/2026-b".to_vec()),
+            parent: true,
+        }]
+    );
+    assert_eq!(fields(&c)[GENERATION], generation);
+    // A listing the adapter could not make is noted in the finder's
+    // status row and changes the frame; the folder stays; the same note
+    // again changes nothing; a long note keeps its tail, where the reason
+    // is, and a control character is blanked.
+    c.note_listing("/photos: permission denied");
+    assert_ne!(fields(&c)[GENERATION], generation);
+    let (_, _, text) = driven::text(&c.scene()).unwrap();
+    assert!(text.contains("/photos: permission denied"), "{text}");
+    assert_eq!(fields(&c)[CHOOSER], hex(b"/photos/2026-b"));
+    let generation = fields(&c)[GENERATION].clone();
+    c.note_listing("/photos: permission denied");
+    assert_eq!(fields(&c)[GENERATION], generation);
+    let long = format!("/{}: No such file or directory", "p".repeat(400));
+    c.note_listing(&long);
+    assert_ne!(fields(&c)[GENERATION], generation);
+    let note = c.chooser().unwrap().1.note().to_string();
+    assert!(note.starts_with('\u{2026}') && note.ends_with("ppp: No such file or directory"));
+    assert!(note.len() <= finder::NOTE_BYTES);
+    c.note_listing("a\tb");
+    assert_eq!(c.chooser().unwrap().1.note(), "a b");
+    // The prompt fits the default width whole.
+    let (_, _, text) = driven::text(&c.scene()).unwrap();
+    assert_eq!(
+        text.lines().last().unwrap().trim(),
+        "Choose a roll: Return enter, BackSpace up, C-Return open here, Escape cancel; type to filter"
+    );
+    // Return on an original (listed disabled, for what the folder is)
+    // descends nowhere; the window's actions are behind the chooser but
+    // `scroll` (the finder's wheel), `open`, `quit` and `choose`, which
+    // closes it.
+    assert_eq!(key(&mut c, "End"), Outcome::Changed);
+    assert!(!c.chooser().unwrap().1.selected_entry().unwrap().enabled());
+    assert_eq!(key(&mut c, "Return"), Outcome::Ignored);
+    assert_eq!(act(&mut c, "pick", &[]), Outcome::Ignored);
+    assert_eq!(act(&mut c, "next", &[]), Outcome::Ignored);
+    assert_eq!(act(&mut c, "delete-rejected", &[]), Outcome::Ignored);
+    assert_eq!(fields(&c)[POSITION], "0");
+    assert_eq!(act(&mut c, "scroll", &["-1"]), Outcome::Ignored);
+    assert_eq!(act(&mut c, "quit", &[]), Outcome::Quit);
+    assert_eq!(fields(&c)[CHOOSER], hex(b"/photos/2026-b"));
+    let (outcome, effects) = c.action("open", &[&hex(b"/photos/2025")]).unwrap();
+    assert_eq!(
+        (outcome, effects),
+        (
+            Outcome::Changed,
+            vec![Effect::Open(b"/photos/2025".to_vec())]
+        )
+    );
+    // Space filters, and a held key repeats the moves, a typed character
+    // and BackSpace while there is a filter, never Return or Escape.
+    assert!(c.chooser_repeats("Down") && c.chooser_repeats("PageUp"));
+    assert!(c.chooser_repeats("a") && c.chooser_repeats("Space"));
+    assert!(!c.chooser_repeats("BackSpace"));
+    assert!(!c.chooser_repeats("Return") && !c.chooser_repeats("C-Return"));
+    assert!(!c.chooser_repeats("Escape") && !c.chooser_repeats("M-x"));
+    assert_eq!(key(&mut c, "Space"), Outcome::Changed);
+    assert_eq!(c.chooser().unwrap().1.query(), " ");
+    assert!(c.chooser_repeats("BackSpace"));
+    assert_eq!(act(&mut c, "choose", &[]), Outcome::Changed);
+    assert!(!c.chooser_repeats("Down"));
+    assert_eq!(fields(&c)[CHOOSER], "-");
+    assert!(!c.visible().is_empty());
+    let (_, _, text) = driven::text(&c.scene()).unwrap();
+    assert!(text.contains("DSC_0000.NEF"), "{text}");
+}
+
+#[test]
+fn the_roll_chooser_opens_the_folder_in_view_and_closes_on_escape_a_roll_or_a_small_surface() {
+    let mut c = Controller::new(surface(800, 600));
+    // Without a roll the adapter's working directory is asked for.
+    let (outcome, effects) = c.input(Input::Key { chord: "o" }).unwrap();
+    assert_eq!(outcome, Outcome::Changed);
+    assert_eq!(
+        effects,
+        [Effect::List {
+            folder: None,
+            parent: false,
+        }]
+    );
+    c.set_listing(
+        b"/home/tester".to_vec(),
+        listing("/home/tester", &["photos", "videos"], &[]),
+        None,
+    )
+    .unwrap();
+    // C-Return opens the folder in view, whatever the selection rests on;
+    // the chooser is gone when the reply is.
+    assert_eq!(key(&mut c, "Down"), Outcome::Changed);
+    let (outcome, effects) = c.input(Input::Key { chord: "C-Return" }).unwrap();
+    assert_eq!(outcome, Outcome::Changed);
+    assert_eq!(effects, [Effect::Open(b"/home/tester".to_vec())]);
+    assert_eq!(fields(&c)[CHOOSER], "-");
+    // The keys are the window's again (no roll here, since the test does
+    // not carry the open out).
+    assert_eq!(
+        c.input(Input::Key { chord: "Down" }).unwrap_err(),
+        ui::Error::NoRoll
+    );
+    // Escape closes it with nothing asked for; a roll opening closes it.
+    c.action("choose", &[]).unwrap();
+    c.set_listing(b"/".to_vec(), listing("/", &["home"], &[]), None)
+        .unwrap();
+    assert_eq!(fields(&c)[CHOOSER], hex(b"/"));
+    // Nothing above the root.
+    assert_eq!(key(&mut c, "BackSpace"), Outcome::Ignored);
+    let (outcome, effects) = c.input(Input::Key { chord: "Escape" }).unwrap();
+    assert_eq!((outcome, effects.len()), (Outcome::Changed, 0));
+    assert_eq!(fields(&c)[CHOOSER], "-");
+    c.action("choose", &[]).unwrap();
+    c.set_listing(b"/".to_vec(), listing("/", &["home"], &[]), None)
+        .unwrap();
+    c.open("roll", b"/r", photos(2)).unwrap();
+    assert_eq!(fields(&c)[CHOOSER], "-");
+    // The parent is asked for by the roll's own path, absolute or not:
+    // the adapter finds it.
+    let (_, effects) = c.action("choose", &[]).unwrap();
+    assert_eq!(
+        effects,
+        [Effect::List {
+            folder: Some(b"/r".to_vec()),
+            parent: true,
+        }]
+    );
+    c.open("roll", b"roll", photos(2)).unwrap();
+    let (_, effects) = c.action("choose", &[]).unwrap();
+    assert_eq!(
+        effects,
+        [Effect::List {
+            folder: Some(b"roll".to_vec()),
+            parent: true,
+        }]
+    );
+    c.set_listing(
+        b"/cwd".to_vec(),
+        listing("/cwd", &["roll"], &[]),
+        Some("roll"),
+    )
+    .unwrap();
+    // The pointer and the wheel are the finder's: a press on its row
+    // selects, one on the bar sets no filter, the wheel scrolls its list;
+    // a resize lays it out again, and a surface too small for it closes it.
+    let list = c.chooser().unwrap().1.list_rect();
+    assert_eq!(
+        press(&mut c, list.x as u32 + 8, list.y as u32 + 8),
+        Outcome::Ignored
+    );
+    assert_eq!(press(&mut c, 12, 8), Outcome::Ignored);
+    assert_eq!(fields(&c)[5], "all");
+    assert_eq!(
+        c.input(Input::Wheel {
+            rows: 1,
+            columns: 0
+        })
+        .unwrap()
+        .0,
+        Outcome::Ignored
+    );
+    assert_eq!(
+        c.input(Input::Resize {
+            width: 640,
+            height: 400,
+            scale: 1
+        })
+        .unwrap()
+        .0,
+        Outcome::Changed
+    );
+    assert_eq!(fields(&c)[CHOOSER], hex(b"/cwd"));
+    assert_eq!(c.chooser().unwrap().1.rect(), c.layout().area);
+    assert_eq!(
+        c.input(Input::Resize {
+            width: 100,
+            height: 100,
+            scale: 1
+        })
+        .unwrap()
+        .0,
+        Outcome::Changed
+    );
+    assert_eq!(fields(&c)[CHOOSER], "-");
+    // A listing refused by the model (the area too small for a finder)
+    // opens nothing.
+    assert_eq!(
+        c.set_listing(b"/cwd".to_vec(), listing("/cwd", &["roll"], &[]), None)
+            .unwrap_err(),
+        ui::Error::Refused
+    );
+    assert_eq!(fields(&c)[CHOOSER], "-");
+}
+
+#[test]
+fn the_roll_chooser_covers_develop_and_its_overlays_and_gives_them_back() {
+    let mut c = Controller::new(surface(800, 600));
+    c.open("roll", b"/r", photos(5)).unwrap();
+    c.set_looks(some_looks());
+    act(&mut c, "develop", &[]);
+    act(&mut c, "adjust-crop", &[]);
+    assert!(c.develop_box().is_some() && c.crop_adjust_rect().is_some());
+    c.action("choose", &[]).unwrap();
+    c.set_listing(b"/".to_vec(), listing("/", &["r"], &[]), Some("r"))
+        .unwrap();
+    // Nothing of develop's shows through: no box, no handles, no palette;
+    // the text is the finder's and the mode is still develop.
+    assert_eq!(c.develop_box(), None);
+    assert_eq!(c.crop_adjust_rect(), None);
+    assert_eq!(c.look_palette(), None);
+    assert_eq!(fields(&c)[MODE], "develop");
+    let (_, _, text) = driven::text(&c.scene()).unwrap();
+    assert!(
+        text.contains("Filter") && !text.contains("develop |"),
+        "{text}"
+    );
+    // The develop keys are the finder's: `l` filters, `d` filters.
+    assert_eq!(key(&mut c, "l"), Outcome::Changed);
+    assert_eq!(c.look_palette(), None);
+    assert_eq!(key(&mut c, "BackSpace"), Outcome::Changed);
+    // Escape closes the chooser, not develop: the box and the handles are
+    // back as they were.
+    assert_eq!(key(&mut c, "Escape"), Outcome::Changed);
+    assert_eq!(fields(&c)[CHOOSER], "-");
+    assert_eq!(fields(&c)[MODE], "develop");
+    assert!(c.develop_box().is_some() && c.crop_adjust_rect().is_some());
+    let (_, _, text) = driven::text(&c.scene()).unwrap();
+    assert!(text.contains("develop"), "{text}");
+}
+
+#[test]
+fn the_binary_lists_links_leaves_out_what_is_not_text_and_cuts_a_long_folder_short() {
+    use std::os::unix::ffi::OsStrExt;
+    let temp = Temp::new("listing");
+    let root = temp.0.join("root");
+    let roll = root.join("roll");
+    fs::create_dir_all(&roll).unwrap();
+    fs::write(roll.join("DSC_0001.NEF"), b"photo 1").unwrap();
+    fs::create_dir_all(temp.0.join("elsewhere")).unwrap();
+    std::os::unix::fs::symlink(temp.0.join("elsewhere"), root.join("linked")).unwrap();
+    std::os::unix::fs::symlink(roll.join("DSC_0001.NEF"), root.join("DSC_0002.NEF")).unwrap();
+    std::os::unix::fs::symlink("/nonexistent/td-photo", root.join("dangling")).unwrap();
+    fs::create_dir(root.join(std::ffi::OsStr::from_bytes(b"caf\xe9"))).unwrap();
+    fs::write(root.join("notes.txt"), b"x").unwrap();
+    let mut session = Replay::start(&[roll.to_str().unwrap()]);
+    let replies = session.send(&[
+        request(1, &["action", "choose"]),
+        request(2, &["text"]),
+        request(3, &["state"]),
+    ]);
+    assert_eq!(&replies[0][1..], ["ok", "changed"]);
+    let text = String::from_utf8(td_ui::control::unhex(&replies[1][4]).unwrap()).unwrap();
+    // The linked folder is listed as one marked `link`; a link to a file,
+    // a dangling link, a name that is not text and a file that is no
+    // original are left out; the roll is selected by name.
+    assert!(text.contains("linked") && text.contains("link"), "{text}");
+    for absent in ["DSC_0002", "dangling", "caf", "notes"] {
+        assert!(!text.contains(absent), "{absent}: {text}");
+    }
+    assert!(text.contains("2 entries"), "{text}");
+    assert_eq!(replies[2][2 + CHOOSER], hex(root.as_os_str().as_bytes()));
+    let replies = session.send(&[
+        request(4, &["key", &hex(b"C-Return")]),
+        request(5, &["state"]),
+    ]);
+    // Accept opens the folder in view; `roll` was merely selected.
+    assert_eq!(&replies[0][1..], ["ok", "changed"]);
+    assert_eq!(replies[1][3], hex(root.as_os_str().as_bytes()));
+    assert_eq!(replies[1][4], "0");
+    // A folder of more entries than the finder holds is cut short, and
+    // the status row says so; a relative roll's parent is found too.
+    let many = temp.0.join("many");
+    fs::create_dir_all(&many).unwrap();
+    for i in 0..(finder::ENTRIES + 1) {
+        fs::create_dir(many.join(format!("f{i:05}"))).unwrap();
+    }
+    let replies = session.send(&[
+        request(
+            6,
+            &[
+                "action",
+                "open",
+                &hex(many.join("f00000").as_os_str().as_bytes()),
+            ],
+        ),
+        request(7, &["action", "choose"]),
+        request(8, &["text"]),
+    ]);
+    assert_eq!(&replies[0][1..], ["ok", "changed"]);
+    assert_eq!(&replies[1][1..], ["ok", "changed"]);
+    let text = String::from_utf8(td_ui::control::unhex(&replies[2][4]).unwrap()).unwrap();
+    assert!(
+        text.contains(&format!("{} entries, cut short", finder::ENTRIES)),
+        "{text}"
+    );
+    // The bound counts what is listed: a folder of as many subfolders as
+    // the finder holds and some sidecars besides is whole.
+    let full = temp.0.join("full");
+    fs::create_dir_all(&full).unwrap();
+    for i in 0..finder::ENTRIES {
+        fs::create_dir(full.join(format!("f{i:05}"))).unwrap();
+    }
+    fs::write(full.join("DSC_0001.xmp"), b"sidecar").unwrap();
+    fs::write(full.join("notes.txt"), b"x").unwrap();
+    let replies = session.send(&[
+        request(
+            9,
+            &[
+                "action",
+                "open",
+                &hex(full.join("f00000").as_os_str().as_bytes()),
+            ],
+        ),
+        request(10, &["action", "choose"]),
+        request(11, &["text"]),
+    ]);
+    assert_eq!(&replies[0][1..], ["ok", "changed"]);
+    assert_eq!(&replies[1][1..], ["ok", "changed"]);
+    let text = String::from_utf8(td_ui::control::unhex(&replies[2][4]).unwrap()).unwrap();
+    assert!(
+        text.contains(&format!("{} entries", finder::ENTRIES)),
+        "{text}"
+    );
+    assert!(!text.contains("cut short"), "{text}");
+    let (ok, _, err) = session.finish();
+    assert!(ok, "{err}");
+}
+
+#[test]
+fn the_binary_chooses_a_roll_over_the_replay() {
+    let temp = Temp::new("choose");
+    let photos = temp.0.join("photos");
+    let a = photos.join("2026-a");
+    let b = photos.join("2026-b");
+    fs::create_dir_all(&a).unwrap();
+    fs::create_dir_all(&b).unwrap();
+    fs::create_dir_all(photos.join("gone")).unwrap();
+    fs::write(a.join("DSC_0001.NEF"), b"photo 1").unwrap();
+    fs::write(b.join("DSC_0002.NEF"), b"photo 2").unwrap();
+    fs::write(b.join("DSC_0003.NEF"), b"photo 3").unwrap();
+    fs::write(photos.join("notes.txt"), b"not an original").unwrap();
+    let photos_hex = hex(photos.as_os_str().as_encoded_bytes());
+    let mut session = Replay::start(&[a.to_str().unwrap()]);
+    let replies = session.send(&[
+        request(1, &["action", "choose"]),
+        request(2, &["state"]),
+        request(3, &["text"]),
+        request(4, &["key", &hex(b"Down")]),
+        request(5, &["key", &hex(b"Down")]),
+    ]);
+    // The chooser lists the roll's parent with the roll selected; the
+    // text shows the folders and not the file that is no original.
+    assert_eq!(&replies[0][1..], ["ok", "changed"]);
+    assert_eq!(replies[1][2 + CHOOSER], photos_hex);
+    let text = String::from_utf8(td_ui::control::unhex(&replies[2][4]).unwrap()).unwrap();
+    assert!(
+        text.contains("2026-a") && text.contains("2026-b") && text.contains("gone"),
+        "{text}"
+    );
+    assert!(!text.contains("notes.txt"), "{text}");
+    assert!(text.contains("3 entries"), "{text}");
+    // Down twice from 2026-a lands on `gone`, removed meanwhile: the
+    // descent is refused, the reason noted in the finder, the folder kept.
+    assert_eq!(&replies[3][1..], ["ok", "changed"]);
+    assert_eq!(&replies[4][1..], ["ok", "changed"]);
+    fs::remove_dir(photos.join("gone")).unwrap();
+    let replies = session.send(&[
+        request(6, &["key", &hex(b"Return")]),
+        request(7, &["state"]),
+    ]);
+    assert_eq!(&replies[0][1..3], ["error", "refused"]);
+    assert_eq!(replies[1][2 + CHOOSER], photos_hex);
+    let (b_hex, roll_hex) = (
+        hex(b.as_os_str().as_encoded_bytes()),
+        hex(a.as_os_str().as_encoded_bytes()),
+    );
+    let replies = session.send(&[
+        request(8, &["text"]),
+        request(9, &["key", &hex(b"Up")]),
+        request(10, &["key", &hex(b"Return")]),
+        request(11, &["state"]),
+        request(12, &["key", &hex(b"BackSpace")]),
+        request(13, &["state"]),
+        request(14, &["key", &hex(b"Return")]),
+        request(15, &["key", &hex(b"C-Return")]),
+        request(16, &["state"]),
+        request(17, &["key", &hex(b"Down")]),
+        request(18, &["state"]),
+    ]);
+    let text = String::from_utf8(td_ui::control::unhex(&replies[0][4]).unwrap()).unwrap();
+    assert!(
+        text.contains("gone") && text.contains("No such file"),
+        "{text}"
+    );
+    // Up to 2026-b, Return lists it (its original shown), BackSpace lists
+    // the parent again with 2026-b selected, so Return goes back down and
+    // C-Return opens it: the roll is 2026-b and the chooser is gone, the
+    // keys the window's again.
+    assert_eq!(&replies[1][1..], ["ok", "changed"]);
+    assert_eq!(&replies[2][1..], ["ok", "changed"]);
+    assert_eq!(replies[3][2 + CHOOSER], b_hex);
+    assert_eq!(replies[3][3], roll_hex);
+    assert_eq!(&replies[4][1..], ["ok", "changed"]);
+    assert_eq!(replies[5][2 + CHOOSER], photos_hex);
+    assert_eq!(&replies[6][1..], ["ok", "changed"]);
+    assert_eq!(&replies[7][1..], ["ok", "changed"]);
+    assert_eq!(replies[8][3], b_hex);
+    assert_eq!(replies[8][2 + CHOOSER], "-");
+    assert_eq!(
+        (&replies[8][4], &replies[8][9]),
+        (&"2".to_string(), &name(2))
+    );
+    assert_eq!(&replies[9][1..], ["ok", "changed"]);
+    assert_eq!(replies[10][9], name(3));
+    let (ok, _, err) = session.finish();
+    assert!(ok, "{err}");
+    assert!(
+        err.contains("gone") && err.contains("No such file"),
+        "{err}"
     );
 }

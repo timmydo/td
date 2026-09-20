@@ -135,17 +135,18 @@ dispatcher, a headless replay of it, and a control socket on the live
 window, all speaking the toolkit's one vocabulary.
 
 - **One dispatcher.** Everything the window can do is an `Action`, a closed enum
-  in `ui` (open a roll, the cursor moves, select, pick, reject, unflag, the four
-  filters, the single view and back, scroll, quit, enter develop and its
-  exposure, look, crop, crop-adjust, aspect, the look palette (`looks`) and
-  reset, export, and delete rejected).
+  in `ui` (open a roll, choose one, the cursor moves, select, pick, reject,
+  unflag, the four filters, the single view and back, scroll, quit, enter
+  develop and its exposure, look, crop, crop-adjust, aspect, the look palette
+  (`looks`) and reset, export, and delete rejected).
   `ui::Controller` holds the model (the roll's names and sidecars, the cursor,
   the filter, the view, the scroll and the surface, and the shown list the
   filter admits, kept rather than rescanned); `action(name, fields)` and
   `input(Input)` apply one
   action to it and return the outcome and the `Effect`s the adapter carries out
-  (`Open` this folder, `Flag` that photo, `Expose` by a delta, `Edit` a crop or
-  look, `Reset` to camera defaults, `Export` that photo). The keyboard
+  (`Open` this folder, `List` it for the chooser, `Flag` that photo, `Expose`
+  by a delta, `Edit` a crop or look, `Reset` to camera defaults, `Export` that
+  photo). The keyboard
   bindings, the pointer hit-testing, the replay stream and the control socket
   are four adapters over that one dispatcher, and nothing reaches the model
   around it. The cursor is
@@ -218,6 +219,60 @@ window, all speaking the toolkit's one vocabulary.
   same, so the model holds what the roll lists. The window keeps a moved
   name's thumbnail and cached level 0 until they are evicted, as it does
   for a file replaced in place.
+- **The roll chooser is the finder.** `choose` (`o`) opens td-ui's shared
+  directory finder (td-ui/DESIGN.md, "Shared directory finder") over the
+  area, in place of the grid or the view, whatever mode is open behind it;
+  the action closes an open one (the key cannot, since every key is the
+  finder's then; `Escape` does). The dispatch asks the adapter to `List`
+  the open roll's parent with the roll selected, or its working directory
+  when none is open; path semantics are the adapter's: `list` makes the
+  path absolute (so an ascent has a parent and the model holds one
+  spelling), takes the parent when asked (the root's parent being the
+  root, a name that is not text selecting nothing) and reads the folder
+  (`list_folder`: its subfolders, a link followed only to learn it is one
+  and marked `link`, and its originals marked `original` and disabled, for
+  what the folder is rather than as targets, folders first and each
+  sorted, at most `finder::ENTRIES` listed entries, what is not listed
+  not counted, and `finder::LISTING_BYTES` of their text before the
+  listing is cut short; an entry gone between
+  the read and its type, or a name that is not text, left out), and
+  installs it through `set_listing`, which opens the chooser (refused when
+  the area cannot hold a finder, so nothing opens) or replaces its
+  listing, a change either way; a folder that cannot be read is `refused`
+  with the reason on stderr and, when a chooser is open, in its status row
+  through `note_listing`, which fits the reason to the finder's bound
+  keeping its tail (the reason follows the path), blanks control
+  characters, and leaves the generation alone for the note it already
+  shows. While it is open every chord is the finder's (`Up`, `Down`,
+  `PageUp`, `PageDown`, `Home`, `End`, `Return` to descend, `BackSpace` to
+  edit the filter or with none to ascend, `C-Return` to open the folder in
+  view as the roll, `Escape` to close, a single printable character or
+  `Space` for the filter; anything else `ignored`), so a letter filters
+  rather than flags; a held key repeats by the chooser's own rule
+  (`chooser_repeats`: the moves, a typed character, and `BackSpace` while
+  there is a filter to edit, since a held one on an empty filter would run
+  up the tree; the window asks it again before each repeat it delivers
+  and stops the repeat the rule no longer allows), and every press and
+  wheel is the finder's too, so the
+  bar's headers and the cells under it are no targets; of the actions only
+  `choose` (closing it), `open`, `quit` and `scroll` (its wheel) reach
+  through, the rest is `ignored`. A descent asks for the folder under the
+  cursor and an ascent for this folder's parent with it selected (nothing
+  above the root), each `changed` without moving the generation, as `open`
+  is, since the frame changes when the adapter installs the listing or
+  notes the refusal; opening the folder in view is the same `Open` effect
+  the `open` action makes, so the roll opens as it always does, or is
+  refused as it always is, the chooser gone either way; a roll opening
+  closes it too, and a resize lays it out again over the new area, closing
+  it when the area can no longer hold it. `state` reports the listed
+  folder's path in hex as its last field (`-` when closed): the chooser's
+  own selection and filter are the finder's, read back through `text`.
+  Its boxes, the develop preview and the overlays are withheld while it is
+  open (`visible` is empty and `develop_box` is `None`), so the window
+  blits nothing over it, and the status row carries the prompt, short
+  enough for the default width whole (Return enter, BackSpace up, C-Return
+  open here, Escape cancel, type to filter) in place of the roll's facts,
+  since the finder paints no affordance of its own.
 - **A headless verb for every durable effect.** Whatever an action does to
   files is also a command-line verb: `import`, `list`, `flag`, `edit`
   (get and set of a sidecar's values), `delete-rejected`, `develop`,
@@ -248,8 +303,9 @@ window, all speaking the toolkit's one vocabulary.
   filter, the view (`grid` or `single`), then the photo under the cursor (its
   name in hex, since the envelope is ASCII and a file name need not be, then
   flag, exposure, crop, look, sidecar state), the outstanding job count as the
-  window last reported it (the turn before) and the frame generation, `-` for
-  what is absent. The generation moves on a change and
+  window last reported it (the turn before), the frame generation and the
+  chooser's listed folder in hex, `-` for what is absent. The generation
+  moves on a change and
   on nothing else: not on a step at an end, a filter, view or size already set,
   a refused open, or a refused flag that leaves the file as the model held it; a
   settle that brings a file changed meanwhile is a change. A crop set over
@@ -311,7 +367,8 @@ window, all speaking the toolkit's one vocabulary.
   action either binds a key, takes a typed argument (`look` a stem, `aspect` a
   ratio) or is reached by the pointer (`select` by a press on a cell, `scroll`
   by the wheel, `crop` by a marquee or a crop-adjust handle over the develop
-  preview) or is the agent's (`open`). `td-photo --help actions` prints the
+  preview) or is the agent's (`open`; `choose`, `o`, is the person's way to
+  one). `td-photo --help actions` prints the
   table so an agent can read it
   instead of guessing.
 
@@ -849,7 +906,8 @@ refused before anything is read.
 The scene is `ui::Scene`, a td-ui `Composition` the controller builds over its
 model per request: the filter bar (`chrome::Bar`, the active filter in brackets
 and the others padded to its width, so the headers keep their places), the grid
-or the single view, and the status row (`chrome::Status`: the roll's folder, the
+or the single view (or the roll chooser's finder over the area while one is
+open, see Driving), and the status row (`chrome::Status`: the roll's folder, the
 counts, the filter, the photo under the cursor with its flag, `(sidecar
 refused)` when it was, `single` in that view, `develop` in develop mode). A grid
 cell is `CELL_W` by `CELL_H` (176 by 152) reference pixels at the surface's
@@ -1180,7 +1238,19 @@ asked for by verb and by `Delete` whenever a roll is open and moving nothing
 itself, ignored in develop mode, and `remove` taking the moved photos out with
 the cursor keeping its photo or its position, clamped to the end, the single
 view staying on the photo that takes a reject's place or leaving with the cursor
-when none is shown, and names not held changing nothing); reads the scene back
+when none is shown, and names not held changing nothing; the roll chooser
+asking for the roll's parent with the roll selected or the working directory,
+open only once a listing is installed, its finder in the text with the prompt
+whole in the status row and no boxes to blit, a letter filtering rather than
+flagging, a descent and an ascent as `List` effects moving no generation, a
+refused listing noted, the same note again no change, a long note keeping its
+tail and a control character blanked, an original listed disabled, the
+window's actions behind it but `choose`, `open`, `quit` and `scroll`, the
+chooser's repeat rule, `Space` filtering, `C-Return` opening the folder in
+view as an `Open` effect, `Escape`, a roll opening and an area too small
+closing it, the root and a relative roll asking for their parent by their own
+path, the pointer, the wheel and a resize its, and develop's box, handles and
+palette withheld under it and back when it closes); reads the scene back
 as text (the bar with its headers in place under every filter, the names and
 badges by row, the status line, the single view, the empty and filtered-out
 messages, a scale of 2) and holds its frame digest to equality and to change;
@@ -1189,7 +1259,15 @@ verbs, writing a pick through the sidecar, refusing to flag a refused one,
 keeping an edit made meanwhile and refusing a sidecar that became malformed,
 reporting a stale temporary and settling the model from the file with the cursor
 and the generation unmoved, a name that is not ASCII in hex, answering after
-`quit`, and refusing a roll that is not there, a bad size and a stray argument
+`quit`, choosing a roll (the chooser listing the roll's parent with the roll
+selected and no file that is no original, a descent into a folder removed
+meanwhile refused with the reason in the finder's row, the folder kept, an
+ascent selecting the folder left, `C-Return` opening the folder in view with
+the keys the window's again, a linked folder marked `link`, a link to a file,
+a dangling link and a name that is not text left out, a folder of more
+entries than the finder holds cut short and one of as many with sidecars
+besides whole), and refusing a roll that is not there, a
+bad size and a stray argument
 before the session starts, and deleting the rejects: the rejects and their
 sidecars in `rejected/` when the reply is and the model holding what is left, a
 second ask `ignored`, a reject added since the roll opened moving and `changed`
@@ -1354,6 +1432,11 @@ all-target Clippy.
    `delete-rejected`, the action (`Delete`) and its verb that move rejects
    and their sidecars into `rejected/` by the publication rule, the names
    there refused first, the model taking the moved photos out. Landed.
+   (d) The roll chooser: `choose` (`o`) over td-ui's shared directory
+   finder, the `List` effect and `list_folder`, the chooser owning the
+   keys, the pointer and the area while it is open, `C-Return` opening the
+   folder in view through the `open` path, and a bare `td-photo` opening
+   the window. Landed.
 7. Packaging: the cargo recipe staging td-ui, the image entry, and the
    recipe check that develops the synthetic frame in the built artifact.
 8. Later: the 100% loupe from level 0, DNG and JPEG rolls, the Nikon High

@@ -270,6 +270,7 @@ fn the_toolkit_is_named_only_where_the_design_says() {
                 "chrome",
                 "control",
                 "driven",
+                "finder",
                 "raster",
             ])
         } else {
@@ -279,7 +280,7 @@ fn the_toolkit_is_named_only_where_the_design_says() {
     }
     assert_eq!(
         modules(&read("src/main.rs")),
-        set(&["control", "driven", "raster", "replay"])
+        set(&["control", "driven", "finder", "raster", "replay"])
     );
     assert_eq!(
         modules(&read("src/window.rs")),
