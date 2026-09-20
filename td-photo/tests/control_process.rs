@@ -125,6 +125,21 @@ fn box_pixels(pixels: &[u8], width: usize, rect: td_ui::raster::Rect) -> Vec<u8>
 
 /// Whether the pixels within `rect` are not all one colour, so an image, not
 /// the flat placeholder, fills the box.
+/// The layout the binary lays on a surface of that size: its look band
+/// holds the built-in looks (the preview runs with a home that has no
+/// user looks), which wrap on the region's width and place the box.
+fn binary_layout(width: usize, height: usize) -> td_photo::ui::Layout {
+    let mut stems: Vec<String> = td_photo::look::BUILTIN
+        .iter()
+        .map(|(stem, _)| stem.to_string())
+        .collect();
+    stems.sort();
+    td_photo::ui::Layout::with_looks(
+        Surface::new(width, height, Scale::default()).unwrap(),
+        &stems,
+    )
+}
+
 fn varies(pixels: &[u8], width: usize, rect: td_ui::raster::Rect) -> bool {
     let region = box_pixels(pixels, width, rect);
     let (chunks, _) = region.as_chunks::<3>();
@@ -152,7 +167,7 @@ fn preview_develop_reflects_the_sidecar() {
     .unwrap();
 
     let base = preview_develop(&dir, 800, 600, &roll, 0);
-    let layout = td_photo::ui::Layout::new(Surface::new(800, 600, Scale::default()).unwrap());
+    let layout = binary_layout(800, 600);
     let r#box = layout
         .develop_box()
         .expect("a develop box on an 800x600 surface");
@@ -193,7 +208,7 @@ fn preview_develop_reflects_the_crop() {
     .unwrap();
 
     let base = preview_develop(&dir, 800, 600, &roll, 0);
-    let layout = td_photo::ui::Layout::new(Surface::new(800, 600, Scale::default()).unwrap());
+    let layout = binary_layout(800, 600);
     let r#box = layout
         .develop_box()
         .expect("a develop box on an 800x600 surface");

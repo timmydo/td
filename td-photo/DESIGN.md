@@ -223,7 +223,8 @@ window, all speaking the toolkit's one vocabulary.
   history (Files, Sidecar; a run of edits to one key is the one step it
   began), and develop mode shows that history in a pane at
   the area's left (td-ui's `chrome::List`, `PANE_W` (216) reference pixels
-  wide, above a band of three buttons: Toggle, Delete, Undo), the steps
+  wide, above a band of three buttons: Toggle, Delete, Undo, a td-ui strip
+  on the pane's width, wrapping where it is short), the steps
   oldest first as `KEY VALUE` (`-` a clear; a crop as `x,y wxh` in whole
   percents, `ui::step_label`, so it fits the row), a step that is off
   dimmed, one selected. The selection is the model's (`state` reports the
@@ -248,19 +249,30 @@ window, all speaking the toolkit's one vocabulary.
   the list itself are witnessed by the scene, so the replay `frame` and
   `--preview` carry them.
 - **The develop controls.** Two bands lead the develop region, above the
-  preview: the tool band (`Layout::tool_band`, the region's first row) with
-  `TOOL_BUTTONS` -- Crop, Uncrop, Undo, Reset, `-`, `+` -- laid from a cell
-  in, a cell between, as the strips lay theirs, and after them, to a cell
-  short of the band's end, the exposure slider (td-ui's `chrome::Slider`,
-  `EXPOSURE_STEPS` (100) steps of a tenth of a stop from -5.00 to +5.00,
-  `ui::exposure_value` placing the sidecar's exposure on it to the nearest
-  step and `ui::exposure_at` reading a step back); and the look band
-  (`Layout::look_band`, the next row) with `NO_LOOK` (None) then a button
-  per available look, in the order the session reported them. A button
-  the band cannot hold whole is not laid, and the slider needs every tool
-  button, the room td-ui asks and a column of travel per step (td-ui's
-  `travel` contract: with fewer, a press on the knob's own centre would
-  read as another step); a surface too short for a row lays none.
+  preview: the tool band (`Layout::tool_band`, the region's first rows)
+  with `TOOL_BUTTONS` -- Crop, Uncrop, Undo, Reset, `-`, `+` -- a td-ui
+  `chrome::Buttons` strip on the region's width, wrapping to more rows
+  where the width is short, and after them the exposure slider (td-ui's
+  `chrome::Slider`, `EXPOSURE_STEPS` (100) steps of a tenth of a stop from
+  -5.00 to +5.00, `ui::exposure_value` placing the sidecar's exposure on
+  it to the nearest step and `ui::exposure_at` reading a step back) from
+  the last button to a cell short of the region's right on that row when
+  the travel gives every step its own column, else on a row of its own
+  across the region; and the look band (`Layout::look_band`, the rows
+  under it) with `NO_LOOK` (None) then a button per available look, in
+  the order the session reported them, a strip wrapping the same way. The
+  tool band is as many rows as its strip takes and the look band as many
+  as its strip takes while the view under both keeps a name row and a box
+  a thumbnail tall (`ROW + FILM_H`), one row at least (`Layout::with_looks`
+  lays the look band for the session's looks, the layout the controller
+  uses; `Layout::new` for none), and the view is under them, so a narrow
+  window wraps its buttons rather than cuts them and a short one keeps
+  its preview; a button the surface cannot hold whole, or on a row cut at
+  the region's foot or for the view's room, is not laid (those looks are
+  the palette's and the keys'), and the slider needs every tool button,
+  the room td-ui asks and a column of travel per step (td-ui's `travel`
+  contract: with fewer, a press on the knob's own centre would read as
+  another step), on the buttons' row or its own.
   Crop toggles crop-adjust and is selected while it is on; Uncrop (`C`,
   the `uncrop` action) clears the crop through the same `Edit` the `crop`
   action makes; Undo and Reset ask what `z` and `0` do; `-` and `+` nudge
@@ -1104,7 +1116,9 @@ model per request: the mode strip and the filter strip (each a td-ui
 mode in view selected, the second All, Picks, Rejects and Unflagged with the
 active filter selected, a button the mode cannot use disabled, see Driving:
 the buttons keep their places whichever is active, the selection styled rather
-than marked in the text), the grid or the single view (or the roll chooser's
+than marked in the text; each strip wraps to more rows on a surface too
+narrow for its buttons on one, the filter strip under the mode strip's rows
+and the area under both), the grid or the single view (or the roll chooser's
 finder over the area while one is open, see Driving), and the status row
 (`chrome::Status`: the roll's folder, the counts, the filter, the photo under
 the cursor with its flag, `(sidecar refused)` when it was, `single` in that
@@ -1124,10 +1138,10 @@ room) of the cursor's photo in the area right of the history pane
 (`Layout::film_band`, its boxes `Layout::film_boxes`; `Layout::develop_view` the
 rest), its status marked `develop`, with the developed preview blitted into that
 box once it is made, and the pane at the area's left: the history list
-(`Layout::history`, a `chrome::List` over the pane's width, less one band) and,
-on the band under it, the Toggle, Delete and Undo buttons
-(`Layout::history_buttons`, `chrome::Button`s from a cell in, a cell between,
-inset as a strip's), Toggle and Delete enabled with a selection and Undo with a
+(`Layout::history`, a `chrome::List` over the pane's width, less the band
+its buttons take) and, on the band under it, the Toggle, Delete and Undo
+buttons (`Layout::history_buttons`, a `chrome::Buttons` strip on the pane's
+width, wrapping), Toggle and Delete enabled with a selection and Undo with a
 step; a surface too short for a row has neither. The box geometry
 (`Layout::box_in`, the single view's `preview_box` over the area and develop's
 `develop_box` over the develop view) is one function the scene, the window and

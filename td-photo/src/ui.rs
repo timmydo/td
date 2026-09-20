@@ -7,9 +7,7 @@
 
 use std::fmt;
 
-use td_ui::chrome::{
-    Block, Button, Buttons, Item, List, Slider, Status, BUTTON_MARGIN, DISABLED, ROW,
-};
+use td_ui::chrome::{Block, Button, Buttons, Item, List, Slider, Status, DISABLED, ROW};
 use td_ui::control::{self, decimal, hex, ErrorCode};
 use td_ui::driven::{self, Binding, Input, Outcome, PointerPhase};
 use td_ui::finder;
@@ -825,8 +823,11 @@ struct Roll {
     path: Vec<u8>,
 }
 
-/// The grid's geometry on a surface: the mode and filter strips above,
-/// the status row below, and whole cells in the area between.
+/// The grid's geometry on a surface: the mode and filter strips above
+/// (each as many rows as its buttons wrap to on the surface's width), the
+/// status row below, and whole cells in the area between. The develop
+/// bands' rows depend on the looks (`with_looks`); `new` lays them for
+/// none.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Layout {
     pub surface: Surface,
@@ -835,29 +836,90 @@ pub struct Layout {
     pub rows: usize,
     pub cell_width: usize,
     pub cell_height: usize,
+    /// The tool band's rows: the tool buttons' and, when the slider needs
+    /// its own, one more.
+    tool_rows: usize,
+    /// The look band's rows: the look buttons' on the region's width, cut
+    /// so the view under the bands keeps a name row and a box a thumbnail
+    /// tall (one row at least).
+    look_rows: usize,
+}
+
+/// The mode strip: `MODES` across the surface's top, wrapping.
+fn mode_strip(surface: Surface) -> Buttons<'static> {
+    Buttons::new(surface, 0, &MODES)
+}
+
+/// The filter strip: `FILTER_NAMES` across the surface under the mode
+/// strip, wrapping.
+fn filter_strip(surface: Surface) -> Buttons<'static> {
+    Buttons::new(
+        surface,
+        i64::from(mode_strip(surface).rect().height),
+        &FILTER_NAMES,
+    )
+}
+
+/// The look band's labels: `NO_LOOK`, then each look's stem.
+fn look_labels(looks: &[String]) -> Vec<&str> {
+    std::iter::once(NO_LOOK)
+        .chain(looks.iter().map(String::as_str))
+        .collect()
+}
+
+/// Whether `band` holds `rect` whole: a band cut at a region's foot holds
+/// only the buttons on the rows that remain.
+fn within(band: Rect, rect: Rect) -> bool {
+    rect.intersection(band) == Some(rect)
+}
+
+/// The height of `rows` `ROW`s at the surface's scale.
+fn rows_height(rows: usize, surface: Surface) -> u32 {
+    u32::try_from(rows.saturating_mul(ROW * surface.scale.value())).unwrap_or(u32::MAX)
 }
 
 impl Layout {
+    /// The layout with no looks: the look band a row for `NO_LOOK`.
     pub fn new(surface: Surface) -> Layout {
+        Self::with_looks(surface, &[])
+    }
+
+    /// The layout with the look band laid for `looks`, `NO_LOOK` first.
+    pub fn with_looks(surface: Surface, looks: &[String]) -> Layout {
         let s = surface.scale.value();
         let band = ROW * s;
-        let height = surface.height.saturating_sub(3 * band);
+        let strips = mode_strip(surface).rect().height as usize
+            + filter_strip(surface).rect().height as usize;
+        let height = surface.height.saturating_sub(strips.saturating_add(band));
         let area = Rect {
             x: 0,
-            y: (2 * band) as i64,
+            y: strips as i64,
             width: surface.width as u32,
             height: height as u32,
         };
         let cell_width = CELL_W * s;
         let cell_height = CELL_H * s;
-        Layout {
+        let mut layout = Layout {
             surface,
             area,
             columns: (surface.width / cell_width).max(1),
             rows: (height / cell_height).max(1),
             cell_width,
             cell_height,
-        }
+            tool_rows: 1,
+            look_rows: 1,
+        };
+        layout.tool_rows = layout.lay_tools().1;
+        let labels = look_labels(looks);
+        let region = layout.develop_region();
+        let keep = ((ROW + FILM_H) * s) as u32;
+        let spare = region
+            .height
+            .saturating_sub(layout.tool_band().height)
+            .saturating_sub(keep) as usize
+            / band;
+        layout.look_rows = layout.look_strip(&labels).rows().min(spare).max(1);
+        layout
     }
 
     /// The cell of the photo at `position` among the shown, with the grid
@@ -918,22 +980,28 @@ impl Layout {
         self.box_in(self.develop_view(), 1)
     }
 
-    /// The tool band: the develop region's first `ROW`.
+    /// The tool band: the develop region's first rows, as many as the tool
+    /// buttons wrap to (and the slider, when it needs its own), cut at the
+    /// region's foot.
     pub fn tool_band(&self) -> Rect {
         let region = self.develop_region();
+        let rows = rows_height(self.tool_rows, self.surface);
         Rect {
-            height: region.height.min((ROW * self.surface.scale.value()) as u32),
+            height: region.height.min(rows),
             ..region
         }
     }
 
-    /// The look band: the `ROW` under the tool band.
+    /// The look band: the rows under the tool band, as many as the look
+    /// buttons wrap to while the view keeps its room (`with_looks`), cut
+    /// at the region's foot.
     pub fn look_band(&self) -> Rect {
         let region = self.develop_region();
-        let band = (ROW * self.surface.scale.value()) as u32;
+        let tools = self.tool_band().height;
+        let rows = rows_height(self.look_rows, self.surface);
         Rect {
-            y: region.y + i64::from(band),
-            height: region.height.saturating_sub(band).min(band),
+            y: region.y + i64::from(tools),
+            height: region.height.saturating_sub(tools).min(rows),
             ..region
         }
     }
@@ -941,7 +1009,7 @@ impl Layout {
     /// The develop region under its two bands.
     fn below_bands(&self) -> Rect {
         let region = self.develop_region();
-        let bands = 2 * (ROW * self.surface.scale.value()) as u32;
+        let bands = self.tool_band().height + self.look_band().height;
         Rect {
             y: region.y + i64::from(bands),
             height: region.height.saturating_sub(bands),
@@ -1014,79 +1082,120 @@ impl Layout {
         }
     }
 
-    /// Buttons on `band` from a cell in, each its label's cells and a cell
-    /// each side, a cell between, inset as a strip's; `None` from the first
-    /// the band cannot hold whole. The x after the last laid, for what
-    /// follows them.
-    fn lay_buttons<'a>(
-        &self,
-        band: Rect,
-        labels: impl Iterator<Item = &'a str>,
-        out: &mut Vec<Option<Button>>,
-    ) -> i64 {
-        let s = self.surface.scale.value();
-        let cell = (CELL_WIDTH * s) as i64;
-        let margin = (BUTTON_MARGIN * s) as i64;
-        let right = band.x + i64::from(band.width);
-        let whole = band.height as usize >= ROW * s;
-        let mut x = band.x + cell;
-        for label in labels {
-            let width = cell * (label.chars().count() as i64 + 2);
-            let rect = Rect {
-                x,
-                y: band.y + margin,
-                width: width as u32,
-                height: ((ROW - 2 * BUTTON_MARGIN) * s) as u32,
-            };
-            let fits = whole && x + width <= right;
-            out.push(fits.then(|| Button::new(self.surface, rect)).flatten());
-            x += width + cell;
-        }
-        x
-    }
-
-    /// The tool band's buttons and, after them to a cell short of the
-    /// band's right, the exposure slider.
-    pub fn tools(&self) -> Tools {
-        let band = self.tool_band();
-        let mut laid = Vec::with_capacity(TOOL_BUTTONS.len());
-        let x = self.lay_buttons(band, TOOL_BUTTONS.into_iter(), &mut laid);
+    /// The tool buttons and the slider on the develop region's top, and
+    /// the rows they take: td-ui's strip of `TOOL_BUTTONS` from a cell in,
+    /// wrapping on the region's width; then the exposure slider from the
+    /// x after the last button to a cell short of the region's right on
+    /// that row when that gives every step its own column, else on a row
+    /// of its own across the region, else none. A button or the slider
+    /// the surface cannot hold whole is `None`.
+    fn lay_tools(&self) -> (Tools, usize) {
+        let region = self.develop_region();
+        let strip = Buttons::in_band(
+            self.surface,
+            region.x,
+            region.y,
+            region.width,
+            &TOOL_BUTTONS,
+        );
         let mut buttons = [None; 6];
-        for (slot, button) in buttons.iter_mut().zip(laid) {
+        for (slot, button) in buttons.iter_mut().zip(strip.buttons()) {
             *slot = button;
         }
+        let rows = strip.rows();
         let s = self.surface.scale.value();
         let cell = (CELL_WIDTH * s) as i64;
-        let right = band.x + i64::from(band.width) - cell;
-        // Every step needs its own column, or a press on the knob's own
-        // centre would read as another step (td-ui's `travel` contract).
-        let slider = (buttons.iter().all(Option::is_some) && right > x)
-            .then(|| {
-                Slider::new(
-                    self.surface,
-                    Rect {
-                        x,
-                        y: band.y,
-                        width: (right - x) as u32,
-                        height: band.height,
-                    },
-                )
-            })
-            .flatten()
-            .filter(|slider| slider.travel() as usize >= EXPOSURE_STEPS);
-        Tools { buttons, slider }
+        let band = (ROW * s) as i64;
+        let right = region.x + i64::from(region.width) - cell;
+        let (after, row_y) = strip.end();
+        let lay = |x: i64, y: i64| {
+            (right > x)
+                .then(|| {
+                    Slider::new(
+                        self.surface,
+                        Rect {
+                            x,
+                            y,
+                            width: (right - x) as u32,
+                            height: band as u32,
+                        },
+                    )
+                })
+                .flatten()
+                // Every step needs its own column, or a press on the knob's
+                // own centre would read as another step (td-ui's `travel`
+                // contract).
+                .filter(|slider| slider.travel() as usize >= EXPOSURE_STEPS)
+        };
+        if !buttons.iter().all(Option::is_some) {
+            return (
+                Tools {
+                    buttons,
+                    slider: None,
+                },
+                rows,
+            );
+        }
+        if let Some(slider) = lay(after, row_y) {
+            return (
+                Tools {
+                    buttons,
+                    slider: Some(slider),
+                },
+                rows,
+            );
+        }
+        match lay(region.x + cell, row_y.saturating_add(band)) {
+            Some(slider) => (
+                Tools {
+                    buttons,
+                    slider: Some(slider),
+                },
+                rows + 1,
+            ),
+            None => (
+                Tools {
+                    buttons,
+                    slider: None,
+                },
+                rows,
+            ),
+        }
+    }
+
+    /// The tool band's buttons and the exposure slider (`lay_tools`), each
+    /// `None` where the band cannot hold it whole.
+    pub fn tools(&self) -> Tools {
+        let band = self.tool_band();
+        let (tools, _) = self.lay_tools();
+        Tools {
+            buttons: tools
+                .buttons
+                .map(|button| button.filter(|b| within(band, b.rect()))),
+            slider: tools.slider.filter(|slider| within(band, slider.rect())),
+        }
+    }
+
+    /// The look band's strip over `labels` (`look_labels`), wrapping on
+    /// the band's width.
+    fn look_strip<'a>(&self, labels: &'a [&'a str]) -> Buttons<'a> {
+        let band = self.look_band();
+        Buttons::in_band(self.surface, band.x, band.y, band.width, labels)
     }
 
     /// The look band's buttons: `NO_LOOK`, then a button per available
-    /// look in `stems` order, as many as the band holds whole.
-    pub fn look_buttons(&self, stems: &[String]) -> Vec<Option<Button>> {
-        let mut laid = Vec::with_capacity(stems.len() + 1);
-        self.lay_buttons(
-            self.look_band(),
-            std::iter::once(NO_LOOK).chain(stems.iter().map(String::as_str)),
-            &mut laid,
-        );
-        laid
+    /// look in `looks` order, wrapping on the band's width; `None` where
+    /// the band cannot hold one whole (a row past the band's, cut for the
+    /// view's room, among them: those looks are the palette's and the
+    /// keys'). `looks` is the list the layout was laid with
+    /// (`with_looks`), whose rows size the band.
+    pub fn look_buttons(&self, looks: &[String]) -> Vec<Option<Button>> {
+        let band = self.look_band();
+        let labels = look_labels(looks);
+        self.look_strip(&labels)
+            .buttons()
+            .map(|button| button.filter(|b| within(band, b.rect())))
+            .collect()
     }
 
     /// The area right of the history pane: where develop mode shows the
@@ -1100,10 +1209,26 @@ impl Layout {
         }
     }
 
+    /// The pane's button band: `HISTORY_BUTTONS` as a strip on the pane's
+    /// width, wrapping, at the area's foot.
+    fn history_strip(&self) -> Buttons<'static> {
+        let s = self.surface.scale.value();
+        let width = (PANE_W * s) as u32;
+        let rows = Buttons::in_band(self.surface, self.area.x, 0, width, &HISTORY_BUTTONS).rows();
+        let band = (rows * ROW * s) as i64;
+        Buttons::in_band(
+            self.surface,
+            self.area.x,
+            self.area.y + i64::from(self.area.height) - band,
+            width,
+            &HISTORY_BUTTONS,
+        )
+    }
+
     /// The history pane's list: the pane's width at the area's left, above
-    /// one band for its buttons; `None` when the area cannot hold a row.
+    /// the band its buttons wrap to; `None` when the area cannot hold a row.
     pub fn history(&self) -> Option<List> {
-        let band = (ROW * self.surface.scale.value()) as u32;
+        let band = self.history_strip().rect().height;
         let rect = Rect {
             width: (PANE_W * self.surface.scale.value()) as u32,
             height: self.area.height.saturating_sub(band),
@@ -1113,27 +1238,16 @@ impl Layout {
     }
 
     /// The pane's buttons on the band under its list, `HISTORY_BUTTONS` in
-    /// order from a cell in, each its label's cells and a cell each side,
-    /// a cell between, inset as a strip's are; `None` where the surface
-    /// cannot hold one whole.
+    /// order, a td-ui strip on the pane's width, wrapping; `None` where
+    /// the surface cannot hold one whole, and all when the pane has no
+    /// list.
     pub fn history_buttons(&self) -> [Option<Button>; 3] {
-        let s = self.surface.scale.value();
-        let band = (ROW * s) as i64;
-        let y = self.area.y + i64::from(self.area.height) - band + (BUTTON_MARGIN * s) as i64;
-        let height = (ROW - 2 * BUTTON_MARGIN) * s;
-        let cell = (CELL_WIDTH * s) as i64;
-        let mut x = self.area.x + cell;
         let mut buttons = [None; 3];
-        for (slot, label) in buttons.iter_mut().zip(HISTORY_BUTTONS) {
-            let width = cell * (label.len() as i64 + 2);
-            let rect = Rect {
-                x,
-                y,
-                width: width as u32,
-                height: height as u32,
-            };
-            *slot = self.history().and_then(|_| Button::new(self.surface, rect));
-            x += width + cell;
+        if self.history().is_none() {
+            return buttons;
+        }
+        for (slot, button) in buttons.iter_mut().zip(self.history_strip().buttons()) {
+            *slot = button;
         }
         buttons
     }
@@ -2409,21 +2523,17 @@ impl Controller {
     }
 
     pub fn layout(&self) -> Layout {
-        Layout::new(self.surface)
+        Layout::with_looks(self.surface, &self.looks)
     }
 
     /// The mode strip, the first band.
     fn mode_strip(&self) -> Buttons<'static> {
-        Buttons::new(self.surface, 0, &MODES)
+        mode_strip(self.surface)
     }
 
     /// The filter strip, the band under the mode strip.
     fn filter_strip(&self) -> Buttons<'static> {
-        Buttons::new(
-            self.surface,
-            (ROW * self.surface.scale.value()) as i64,
-            &FILTER_NAMES,
-        )
+        filter_strip(self.surface)
     }
 
     /// The mode strip's buttons as `(selected, enabled)`, in `MODES`

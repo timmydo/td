@@ -1783,19 +1783,77 @@ fn a_button_strip_lays_bordered_buttons_from_cell_one_and_hits_only_whole_ones()
         let mut nothing = Vec::new();
         strip.emit([(false, true)], off, &mut |draw| nothing.push(draw));
         assert!(nothing.is_empty());
-        // A surface too narrow for the last button whole neither paints
-        // nor hits it, its glyphs left out with its fills; an empty strip
-        // is its chrome band alone.
+        // The strip is one row, its end after the last button on it.
+        assert_eq!(strip.rows(), 1);
+        assert_eq!(
+            strip.end(),
+            (rects[3].x + i64::from(rects[3].width) + (8 * s) as i64, y)
+        );
+        // A surface too narrow for the last button whole starts the next
+        // row with it: the band is two rows, the button at cell one a row
+        // down, painted and hit there; the end is after it on that row.
         let narrow = Surface::new(272 * s, 72 * s, Scale::new(scale).unwrap()).unwrap();
         let strip = Buttons::new(narrow, y, &labels);
-        assert!(strip.button(3).is_none() && strip.button(2).is_some());
+        assert_eq!(strip.rows(), 2);
+        assert_eq!(
+            strip.rect(),
+            Rect {
+                x: 0,
+                y,
+                width: (272 * s) as u32,
+                height: (2 * ROW * s) as u32
+            }
+        );
+        let wrapped = Rect {
+            y: y + (ROW * s) as i64 + (BUTTON_MARGIN * s) as i64,
+            ..expected(1, 11)
+        };
+        assert_eq!(strip.button(3).map(|b| b.rect()), Some(wrapped));
+        assert!(strip.button(2).is_some());
         assert_eq!(strip.hit(rects[3].x, mid), None);
+        assert_eq!(strip.hit(wrapped.x, wrapped.y), Some(3));
+        assert_eq!(
+            strip.end(),
+            (
+                wrapped.x + i64::from(wrapped.width) + (8 * s) as i64,
+                y + (ROW * s) as i64
+            )
+        );
         let draws = run(narrow, |damage, sink| {
             strip.emit(std::iter::repeat((false, true)), damage, sink)
         });
-        assert_eq!(fills(&draws).len(), 1 + 2 * 3);
+        assert_eq!(fills(&draws)[0], (strip.rect(), CHROME));
+        assert_eq!(fills(&draws).len(), 1 + 2 * 4);
         let text: String = glyphs(&draws).iter().map(|g| g.2).collect();
-        assert_eq!(text, "AllPicksRejects");
+        assert_eq!(text, "AllPicksRejectsUnflagged");
+        // A band given its own left and width lays from there; a button
+        // wider than a whole row is neither laid nor given room, the next
+        // going on where it would have been.
+        let band = Buttons::in_band(surface, (16 * s) as i64, y, (120 * s) as u32, &labels);
+        let at = |x: usize, columns: usize, row: usize| Rect {
+            x: ((16 + x * 8) * s) as i64,
+            y: y + ((row * ROW + BUTTON_MARGIN) * s) as i64,
+            width: (columns * 8 * s) as u32,
+            height: ((ROW - 2 * BUTTON_MARGIN) * s) as u32,
+        };
+        assert_eq!(band.rows(), 3);
+        assert_eq!(band.button(0).map(|b| b.rect()), Some(at(1, 5, 0)));
+        assert_eq!(band.button(1).map(|b| b.rect()), Some(at(7, 7, 0)));
+        assert_eq!(band.button(2).map(|b| b.rect()), Some(at(1, 9, 1)));
+        // The third row runs under this surface's foot: counted, not held.
+        assert!(band.button(3).is_none());
+        assert_eq!(
+            band.end(),
+            (
+                at(1, 11, 2).x + (11 * 8 * s) as i64 + (8 * s) as i64,
+                y + (2 * ROW * s) as i64
+            )
+        );
+        let wide = ["All", "Twenty-one characters", "Picks"];
+        let band = Buttons::in_band(surface, (16 * s) as i64, y, (120 * s) as u32, &wide);
+        assert_eq!(band.rows(), 1);
+        assert!(band.button(1).is_none());
+        assert_eq!(band.button(2).map(|b| b.rect()), Some(at(7, 7, 0)));
         // A band placed past the integer range has no buttons and no hit,
         // nor has one whose buttons would run under the surface's foot.
         let far = Buttons::new(surface, i64::MAX - 1, &labels);
@@ -1807,7 +1865,10 @@ fn a_button_strip_lays_bordered_buttons_from_cell_one_and_hits_only_whole_ones()
         );
         let fits = Buttons::new(surface, foot - 1, &labels);
         assert!(fits.button(0).is_some());
+        // An empty strip is its chrome band alone, one row, its end at
+        // cell one.
         let empty = Buttons::new(surface, y, &[]);
+        assert_eq!((empty.rows(), empty.end()), (1, ((8 * s) as i64, y)));
         let draws = run(surface, |damage, sink| {
             empty.emit(std::iter::empty(), damage, sink)
         });

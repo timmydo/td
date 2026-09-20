@@ -116,60 +116,144 @@ impl Button {
     }
 }
 
-/// A row of bordered buttons on one `ROW`-tall band at `y`: the buttons
-/// from cell one, each its label's cells and a cell each side (so the
-/// first label starts at cell two), one cell between, and
-/// `BUTTON_MARGIN` of the band above and below. A button the surface
-/// cannot hold whole is neither painted nor a target.
+/// A strip of bordered buttons on a band at `y`, the surface's width
+/// from its left (`new`) or a given left and width (`in_band`): the
+/// buttons from cell one, each its label's cells and a cell each side
+/// (so the first label starts at cell two), one cell between, and
+/// `BUTTON_MARGIN` of each `ROW` above and below. A button the row cannot
+/// hold whole starts the next row, so a narrow band wraps rather than
+/// cuts and is as many `ROW`s tall as that takes (one at least); one
+/// wider than a whole row is neither painted nor a target and takes no
+/// room. The rows are the labels' on the band's width, whether or not
+/// the surface holds them: a button on a row past the surface's foot has
+/// its place but is neither painted nor a target either.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Buttons<'a> {
     surface: Surface,
+    x: i64,
     y: i64,
+    width: u32,
     labels: &'a [&'a str],
 }
 
+/// Where a label's button goes: its rectangle when its row holds it
+/// whole, the row it is on (from 0), and the x after it.
+#[derive(Clone, Copy, Debug)]
+struct Place {
+    rect: Option<Rect>,
+    row: usize,
+    after: i64,
+}
+
 impl<'a> Buttons<'a> {
+    /// The strip across the surface at `y`.
     pub fn new(surface: Surface, y: i64, labels: &'a [&'a str]) -> Self {
-        Self { surface, y, labels }
+        Self::in_band(surface, 0, y, surface.width as u32, labels)
+    }
+
+    /// The strip on the band `width` wide from `x` at `y`.
+    pub fn in_band(surface: Surface, x: i64, y: i64, width: u32, labels: &'a [&'a str]) -> Self {
+        Self {
+            surface,
+            x,
+            y,
+            width,
+            labels,
+        }
     }
 
     fn scale(self) -> usize {
         self.surface.scale.value()
     }
 
-    /// The strip's band.
+    /// The rows the labels take: one, and one more each time a button
+    /// starts a new row.
+    pub fn rows(self) -> usize {
+        self.places().last().map_or(1, |place| place.row + 1)
+    }
+
+    /// The strip's band: `rows` `ROW`s tall.
     pub fn rect(self) -> Rect {
         Rect {
-            x: 0,
+            x: self.x,
             y: self.y,
-            width: self.surface.width as u32,
-            height: (ROW * self.scale()) as u32,
+            width: self.width,
+            height: u32::try_from(self.rows().saturating_mul(ROW * self.scale()))
+                .unwrap_or(u32::MAX),
         }
     }
 
-    /// Each label's button in one pass over the labels, `None` for one
-    /// the surface does not hold whole (or a geometry past the integer
-    /// range, which no surface holds either).
-    fn buttons(self) -> impl Iterator<Item = Option<Button>> + 'a {
+    /// The x after the last button placed on the last row and that row's
+    /// band top, for what a consumer lays after the buttons (the place is
+    /// the row's, whether or not the surface holds the button: a consumer
+    /// laying past the last button checks it was held); cell one and the
+    /// strip's top without labels.
+    pub fn end(self) -> (i64, i64) {
         let s = self.scale();
-        let top = self.y.checked_add((BUTTON_MARGIN * s) as i64);
+        let cell = (CELL_WIDTH * s) as i64;
+        match self.places().last() {
+            Some(place) => (
+                place.after,
+                self.y.saturating_add((place.row * ROW * s) as i64),
+            ),
+            None => (self.x.saturating_add(cell), self.y),
+        }
+    }
+
+    /// Each label's place in one pass over the labels, wrapping.
+    fn places(self) -> impl Iterator<Item = Place> + 'a {
+        let s = self.scale();
+        let cell = (CELL_WIDTH * s) as i64;
+        let band = (ROW * s) as i64;
+        let margin = (BUTTON_MARGIN * s) as i64;
         let height = ((ROW - 2 * BUTTON_MARGIN) * s) as u32;
-        let mut column = 1usize;
+        let start = self.x.saturating_add(cell);
+        let right = self.x.saturating_add(i64::from(self.width));
+        let y = self.y;
+        let mut x = start;
+        let mut row = 0usize;
         self.labels.iter().map(move |label| {
             let columns = label.chars().count().saturating_add(2);
-            let x = column.checked_mul(CELL_WIDTH * s);
-            column = column.saturating_add(columns).saturating_add(1);
-            let rect = Rect {
-                x: i64::try_from(x?).ok()?,
-                y: top?,
-                width: u32::try_from(columns.checked_mul(CELL_WIDTH * s)?).ok()?,
-                height,
-            };
-            Button::new(self.surface, rect)
+            let width = i64::try_from(columns.saturating_mul(CELL_WIDTH * s)).unwrap_or(i64::MAX);
+            let whole = start.saturating_add(width) <= right;
+            if whole && x.saturating_add(width) > right {
+                row = row.saturating_add(1);
+                x = start;
+            }
+            let end = x.saturating_add(width);
+            let fits = whole && end <= right;
+            let rect = fits
+                .then(|| {
+                    Some(Rect {
+                        x,
+                        y: y.checked_add((row as i64).checked_mul(band)?)?
+                            .checked_add(margin)?,
+                        width: u32::try_from(width).ok()?,
+                        height,
+                    })
+                })
+                .flatten();
+            if fits {
+                x = end.saturating_add(cell);
+            }
+            Place {
+                rect,
+                row,
+                after: x,
+            }
         })
     }
 
-    /// Button `index`, when the surface holds it whole.
+    /// Each label's button in label order, `None` for one its row does not
+    /// hold whole or the surface does not (or whose geometry leaves the
+    /// integer range, which no surface holds either).
+    pub fn buttons(self) -> impl Iterator<Item = Option<Button>> + 'a {
+        let surface = self.surface;
+        self.places()
+            .map(move |place| place.rect.and_then(|rect| Button::new(surface, rect)))
+    }
+
+    /// Button `index`, when its row and the surface hold it whole.
     pub fn button(self, index: usize) -> Option<Button> {
         self.buttons().nth(index)?
     }

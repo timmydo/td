@@ -695,9 +695,9 @@ fn the_window_develops_the_cursor_photo_over_the_native_compositor() {
     client.settle(2);
     let state = client.request(3, &["state"]);
     assert_eq!(&state[..2], ["ok", "develop"], "{state:?}");
-    let layout = td_photo::ui::Layout::new(
-        Surface::new(place.width, place.height, Scale::default()).unwrap(),
-    );
+    // The window's layout has the built-in looks in its look band (the
+    // client runs with a home that has no user looks), which place the box.
+    let layout = super::binary_layout(place.width, place.height);
     let r#box = layout.develop_box().expect("a develop box on the tile");
     let developed = super::preview_develop(&client_directory, place.width, place.height, &roll, 0);
     assert!(

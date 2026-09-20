@@ -3116,8 +3116,8 @@ fn the_look_palette_marks_the_current_look_and_picks_with_the_pointer() {
 
 /// A list taller than the panel goes on in a second column beside the
 /// first, each column as wide as its longest name: the built-in set on a
-/// 640 by 480 surface, where one column holds 12 rows, lays the other two
-/// beside them and a press there picks the last.
+/// 640 by 480 surface, where one column holds fewer than the fourteen,
+/// lays the rest beside them and a press there picks the last.
 #[test]
 fn the_look_palette_lays_a_tall_list_in_columns() {
     let mut c = Controller::new(surface(640, 480));
@@ -3136,9 +3136,14 @@ fn the_look_palette_lays_a_tall_list_in_columns() {
     assert!(rows.iter().all(Option::is_some), "{panel:?} {rows:?}");
     let first = rows[0].unwrap();
     let last = rows[13].unwrap();
+    // The tool band takes two rows here (the slider on its own) and the
+    // look band six, so the box under the name row is 276 by 184: eleven
+    // rows a column.
     let per_column =
         ((i64::from(panel.height) - ui::CELL_PAD as i64) / CELL_HEIGHT as i64) as usize;
-    assert_eq!(per_column, 12);
+    assert_eq!(c.layout().tool_band().height, 48);
+    assert_eq!(c.layout().look_band().height, 6 * 24);
+    assert_eq!(per_column, 11);
     let longest = stems[..per_column].iter().map(|s| s.len()).max().unwrap() as i64;
     assert_eq!(
         first,
@@ -3149,7 +3154,10 @@ fn the_look_palette_lays_a_tall_list_in_columns() {
             height: CELL_HEIGHT as u32,
         }
     );
-    assert_eq!(last.y, first.y + CELL_HEIGHT as i64);
+    assert_eq!(
+        last.y,
+        first.y + CELL_HEIGHT as i64 * (13 % per_column) as i64
+    );
     assert_eq!(
         last.x,
         first.x + i64::from(first.width) + ui::CELL_PAD as i64
@@ -5625,30 +5633,72 @@ fn the_tool_band_drives_the_develop_edits() {
     let (_, _, text) = driven::text(&c.scene()).unwrap();
     assert!(!text.contains("| sidecar "), "{text}");
     assert!(text.contains("DSC_0000.NEF"), "{text}");
-    // A surface too narrow for the buttons whole lays none past the edge
-    // and no slider.
+    // A surface too narrow for the buttons on one row wraps them: at 500,
+    // `+` would end at 528 and starts the second row, and the slider
+    // follows it on that row; the band is two rows.
     let mut narrow = Controller::new(surface(500, 600));
     narrow.open("roll", b"/r", photos(1)).unwrap();
     assert_eq!(act(&mut narrow, "develop", &[]), Outcome::Changed);
     let tools = narrow.layout().tools();
     assert!(tools.buttons[0].is_some());
-    assert!(tools.buttons[5].is_none());
-    assert!(tools.slider.is_none());
+    assert_eq!(
+        tools.buttons[4].unwrap().rect(),
+        Rect {
+            x: 472,
+            y: 50,
+            width: 24,
+            height: 20
+        }
+    );
+    assert_eq!(
+        tools.buttons[5].unwrap().rect(),
+        Rect {
+            x: 224,
+            y: 74,
+            width: 24,
+            height: 20
+        }
+    );
+    assert_eq!(
+        tools.slider.unwrap().rect(),
+        Rect {
+            x: 256,
+            y: 72,
+            width: 492 - 256,
+            height: 24
+        }
+    );
+    assert_eq!(narrow.layout().tool_band().height, 48);
+    assert_eq!(narrow.layout().look_band().y, 96);
     assert_eq!(press(&mut narrow, 700, 60), Outcome::Ignored);
-    // Room for the buttons but not a column per step lays no slider
-    // either; one column more, and it is there with its hundred steps.
-    // The buttons (264 wide, six cells between and one before) end at
-    // 528, the slider starts a cell on at 536 and ends at width - 8, so
-    // its travel is width - 544 - KNOB_WIDTH: 100 at 656.
-    for (width, laid) in [(655, false), (656, true)] {
+    // Room for the buttons but not a column per step on their row puts
+    // the slider on a row of its own across the band; one column more,
+    // and it is after them with its hundred steps. The buttons (264 wide,
+    // six cells between and one before) end at 528, the slider starts a
+    // cell on at 536 and ends at width - 8, so its travel is width - 544
+    // - KNOB_WIDTH: 100 at 656.
+    for (width, own_row) in [(655, true), (656, false)] {
         let c = Controller::new(surface(width, 600));
         let tools = c.layout().tools();
         assert!(tools.buttons.iter().all(Option::is_some), "{width}");
-        assert_eq!(tools.slider.is_some(), laid, "{width}");
-        if let Some(slider) = tools.slider {
+        let slider = tools.slider.unwrap();
+        if own_row {
+            assert_eq!(slider.rect().y, 72, "{width}");
+            assert_eq!(slider.rect().x, 224, "{width}");
+            assert_eq!(c.layout().tool_band().height, 48, "{width}");
+        } else {
+            assert_eq!(slider.rect().y, 48, "{width}");
+            assert_eq!(slider.rect().x, 536, "{width}");
             assert_eq!(slider.travel() as usize, ui::EXPOSURE_STEPS);
+            assert_eq!(c.layout().tool_band().height, 24, "{width}");
         }
     }
+    // Too narrow for a column a step even on its own row (the travel is
+    // the width less 244 and the knob), no slider.
+    let tiny = Controller::new(surface(304, 600));
+    let tools = tiny.layout().tools();
+    assert!(tools.buttons.iter().all(Option::is_some));
+    assert!(tools.slider.is_none());
     // At scale two the bands and the box double with the rows.
     let mut two = Controller::new(surface(800, 600));
     two.open("roll", b"/r", photos(1)).unwrap();
@@ -5989,20 +6039,71 @@ fn the_look_band_and_the_f_keys_pick_looks() {
     );
     assert_eq!(act(&mut c, "looks", &[]), Outcome::Changed);
     assert!(c.scene().status_line().ends_with(" | develop looks"));
-    // A band too narrow for every look lays the ones that fit whole: from
-    // 224, None (48 wide) then 128-wide names with 8 between, so the
-    // fourth name would end at 816, past the band's 800.
+    // A band too narrow for every look on one row wraps: from 224, None
+    // (48 wide) then 128-wide names with 8 between, so the fourth name
+    // would end at 816, past the band's 800, and starts the next row at
+    // 224; four names a row from then on, six rows for the twenty, and
+    // the view moves down under them.
     let long: Vec<String> = (0..20).map(|i| format!("look-number-{i:02}")).collect();
     c.set_looks(long.clone());
     let laid = c.layout().look_buttons(&long);
     assert_eq!(laid.len(), 21);
-    let fitting = laid.iter().filter(|b| b.is_some()).count();
-    assert_eq!(fitting, 4);
+    assert!(laid.iter().all(Option::is_some));
     assert_eq!(laid[3].unwrap().rect().x + 128, 680);
-    // A press where the fifth would have been is the band's chrome.
+    assert_eq!(
+        laid[4].unwrap().rect(),
+        Rect {
+            x: 224,
+            y: 72 + 24 + 2,
+            width: 128,
+            height: 20
+        }
+    );
+    assert_eq!(laid[20].unwrap().rect().y, 72 + 5 * 24 + 2);
+    assert_eq!(c.layout().look_band().height, 6 * 24);
+    assert_eq!(c.layout().develop_view().y, 72 + 6 * 24);
+    // A press past the row's last name is the band's chrome; one on the
+    // fifth name (the sixth button, second on its row), picks it.
     assert_eq!(press(&mut c, 700, 84), Outcome::Ignored);
     assert_eq!(fields(&c)[LOOK], "-");
-    // `F5` still picks the fifth, laid or not: the keys are the list's.
+    assert_eq!(laid[5].unwrap().rect().x, 360);
+    let (outcome, effects) = c
+        .input(Input::Pointer {
+            phase: PointerPhase::Press,
+            x: 366,
+            y: 108,
+        })
+        .unwrap();
+    assert_eq!(outcome, Outcome::Changed);
+    assert!(matches!(
+        &effects[..],
+        [Effect::Edit { key: Key::Look, value: Some(stem), .. }] if stem == "look-number-04"
+    ));
+    // A surface too short for every row keeps the view a name row and a
+    // thumbnail-tall box: at 400 by 400 the region is 184 wide, the tool
+    // band three rows (the slider on its own) and a look a row, and the
+    // look band is cut to the four rows that leave that room; the looks
+    // past it are not laid, and the palette (and `F5`) reach them.
+    let mut short = Controller::new(surface(400, 400));
+    short.open("roll", b"/r", photos(5)).unwrap();
+    assert_eq!(act(&mut short, "develop", &[]), Outcome::Changed);
+    short.set_looks(long.clone());
+    let layout = short.layout();
+    assert_eq!(layout.tool_band().height, 3 * 24);
+    assert_eq!(layout.look_band().height, 4 * 24);
+    assert_eq!(layout.develop_view().height, 400 - 72 - 7 * 24);
+    assert!(layout.develop_box().is_some());
+    let laid = layout.look_buttons(&long);
+    assert_eq!(laid.iter().filter(|b| b.is_some()).count(), 4);
+    assert!(laid[4..].iter().all(Option::is_none));
+    assert_eq!(act(&mut short, "looks", &[]), Outcome::Changed);
+    assert!(short.look_rows().is_some());
+    let (_, effects) = short.input(Input::Key { chord: "F5" }).unwrap();
+    assert!(matches!(
+        &effects[..],
+        [Effect::Edit { key: Key::Look, value: Some(stem), .. }] if stem == "look-number-04"
+    ));
+    // `F5` picks the fifth too: the keys are the list's.
     let (_, effects) = c.input(Input::Key { chord: "F5" }).unwrap();
     assert_eq!(
         effects,
@@ -6204,12 +6305,14 @@ fn the_filmstrip_shows_the_shown_photos_under_the_preview() {
         [(0, lifted(0)), (1, lifted(1)), (2, lifted(2))]
     );
     // A region narrower than a box and its cells lays no band: the view
-    // keeps the foot. A cell wider, and it holds its one box.
+    // keeps the foot (under the tool band's three rows here, the buttons
+    // wrapping on 175). A cell wider, and it holds its one box.
     let mut narrow = Controller::new(surface(216 + 175, 600));
     narrow.open("roll", b"/r", photos(5)).unwrap();
     assert_eq!(act(&mut narrow, "develop", &[]), Outcome::Changed);
     assert_eq!(narrow.layout().film_band(), None);
-    assert_eq!(narrow.layout().develop_view().height, 480);
+    assert_eq!(narrow.layout().tool_band().height, 72);
+    assert_eq!(narrow.layout().develop_view().height, 432);
     assert!(narrow.film().is_empty() && narrow.wanted().is_empty());
     let mut one = Controller::new(surface(216 + 176, 600));
     one.open("roll", b"/r", photos(5)).unwrap();

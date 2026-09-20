@@ -1194,22 +1194,34 @@ press/release activation, as with the other chrome geometry primitives.
 Scale 1-4 pixel tests cover bounds, focus/disabled colors, the centring
 and partial repaint equivalence.
 
-`chrome::Buttons` is a strip of them on one `ROW`-tall band at a `y` the
-consumer chooses: the buttons from cell one, each its label's cells and a
+`chrome::Buttons` is a strip of them on a band at a `y` the consumer
+chooses, across the surface (`new`) or on a given left and width
+(`in_band`): the buttons from cell one, each its label's cells and a
 cell each side (so the first label starts at cell two), one cell between,
-inset `BUTTON_MARGIN` (2) pixels above and below so two strips stacked
-keep their bezels apart; the band fills `CHROME` behind them. A button the
-surface cannot hold whole is neither painted nor a target, nor is one
-whose geometry leaves the integer range; the layout is one pass over the
-labels. `emit` takes each button's `(selected, enabled)` in label order, a
-state it runs out of painting an enabled unselected button; `hit` answers
-the button whose own pixels hold the point, the gap and the margin none.
-A consumer that wants one selected at a time (a mode or a filter strip)
-selects one; the strip itself imposes nothing. Its test pins the
-geometry, the hit rule, the draw stream and the pixels at scales 1-4, a
-descender's lowest row inside the bezel, partial repaint equivalence,
-damage off the band painting nothing, a clipped last button, a band at
-the surface's foot and past the integer range, and an empty strip.
+inset `BUTTON_MARGIN` (2) pixels above and below each `ROW` so two strips
+stacked keep their bezels apart; the band fills `CHROME` behind them. A
+button its row cannot hold whole starts the next row, so a band too
+narrow for its buttons on one row wraps rather than cuts and is as many
+`ROW`s tall as that takes (`rows`, one at least; `rect` is the band);
+`end` is the x after the last button on its row and that row's top, for
+what a consumer lays after them. A button wider than a whole row is
+neither painted nor a target and takes no room. The rows are the labels'
+on the band's width whether or not the surface holds them: a button on a
+row past the surface's foot, or whose geometry leaves the integer range,
+has its place (and `end`) but is neither painted nor a target, so a
+consumer laying past the last button checks it was held; the layout is
+one pass over the labels (`buttons`). `emit` takes each
+button's `(selected, enabled)` in label order, a state it runs out of
+painting an enabled unselected button; `hit` answers the button whose own
+pixels hold the point, the gap and the margin none. A consumer that wants
+one selected at a time (a mode or a filter strip) selects one; the strip
+itself imposes nothing. Its test pins the geometry, the hit rule, the
+draw stream and the pixels at scales 1-4, a descender's lowest row inside
+the bezel, partial repaint equivalence, damage off the band painting
+nothing, a last button wrapped to a second row and hit there, a band on
+its own left and width wrapping to three rows, a button too wide for a
+row left out, a band at the surface's foot and past the integer range,
+and an empty strip.
 
 ## Shared slider
 
@@ -1773,7 +1785,9 @@ regressions. Those increments extend the original sequence below.
 10. Button strip: `chrome::Buttons`, a row of bezelled `Button`s on one
     band (see "Shared action button"), the button's text centred in its
     height; td-photo's mode and filter strips are its first consumer.
-    Landed.
+    Landed; the strip wrapping to more rows on a narrow band, with a
+    left and width of its own, landed after (td-photo's develop and
+    history bands are consumers too).
 11. The cell screen: `screen`, a styled grid as a `Composition` with a
     key vocabulary and chord translation, and `screen_app`, the window
     that presented it and polled a `Handler`, proven with a recording
