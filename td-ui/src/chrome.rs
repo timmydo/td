@@ -7,10 +7,10 @@
 //! here reads a clock, a file or the environment.
 
 use crate::raster::{
-    text_run, Draw, GlyphStyle, Primitive, Rect, Scale, Scrollbar, Surface, BORDER, CHROME,
-    INACTIVE_SELECTION, INK, LINE_NUMBER, PAPER, SELECTED,
+    hint_run, text_run, Draw, GlyphStyle, Primitive, Rect, Scale, Scrollbar, Surface, BORDER,
+    CHROME, INACTIVE_SELECTION, INK, LINE_NUMBER, PAPER, SELECTED,
 };
-use crate::{CELL_HEIGHT, CELL_WIDTH};
+use crate::{hint, CELL_HEIGHT, CELL_WIDTH};
 
 /// A chrome row in font pixels: the bar's, a tab's, a panel row's and the
 /// status row's.
@@ -34,6 +34,14 @@ pub const DISABLED: u32 = 0xff827a6d;
 
 /// The text inset inside a chrome row: one cell in, four pixels down.
 const INSET: (i64, i64) = (8, 4);
+
+/// A hinted button's caption sits this much higher than a plain one's,
+/// and its hint's rows begin this far above its foot, in font pixels: on
+/// a strip's button (`ROW` less the margins) the caption's capitals then
+/// end a row above the hint, which ends a row above the bezel, and the
+/// first of a descender's two rows shows.
+const HINT_LIFT: i64 = 4;
+const HINT_FOOT: i64 = 7;
 
 /// The band above and below a button strip's buttons, in font pixels,
 /// so two strips stacked keep their bezels apart.
@@ -79,6 +87,27 @@ impl Button {
         damage: Rect,
         sink: &mut dyn FnMut(Draw),
     ) {
+        self.emit_hinted(text, None, selected, enabled, damage, sink);
+    }
+
+    /// `emit` with a hint under the caption when one is given (an empty
+    /// one is none): the caption lifted `HINT_LIFT`, and the hint in the
+    /// small face centred under it (from the face's left when the caption
+    /// is narrower, a mark the bezel would cut left off) on a band of the
+    /// button's background over the caption's descenders, in the lighter
+    /// `LINE_NUMBER` ink, or the caption's own when the button is selected
+    /// or disabled. A button too short for both shows the hint over the
+    /// caption's foot.
+    pub fn emit_hinted(
+        self,
+        text: &str,
+        hint: Option<&str>,
+        selected: bool,
+        enabled: bool,
+        damage: Rect,
+        sink: &mut dyn FnMut(Draw),
+    ) {
+        let hint = hint.filter(|hint| !hint.is_empty());
         let s = self.surface.scale.value() as u32;
         let outer = self.rect;
         let inset_x = s.min(outer.width / 2);
@@ -95,21 +124,53 @@ impl Button {
         // The text sits centred in the button's height: `INSET.1` down in
         // a `ROW`-tall one, nearer the top in a shorter one.
         let text_y = (i64::from(outer.height) - (CELL_HEIGHT * s as usize) as i64).max(0) / 2;
+        let text_y = if hint.is_some() {
+            text_y - HINT_LIFT * i64::from(s)
+        } else {
+            text_y
+        };
+        let ink = if !enabled {
+            DISABLED
+        } else if selected {
+            PAPER
+        } else {
+            INK
+        };
+        let text_x = outer.x + INSET.0 * i64::from(s);
         text_run(
             self.surface.scale,
             text.chars(),
-            (outer.x + INSET.0 * i64::from(s), outer.y + text_y),
+            (text_x, outer.y + text_y),
             inner,
-            GlyphStyle::medium(
-                if !enabled {
-                    DISABLED
-                } else if selected {
-                    PAPER
-                } else {
-                    INK
-                },
-                background,
-            ),
+            GlyphStyle::medium(ink, background),
+            damage,
+            sink,
+        );
+        let Some(hint) = hint else {
+            return;
+        };
+        let hint_y = outer.y + i64::from(outer.height) - HINT_FOOT * i64::from(s);
+        let band = Rect {
+            y: hint_y,
+            height: (hint::HEIGHT * s as usize) as u32,
+            ..inner
+        };
+        if let Some(band) = band.intersection(inner) {
+            fill(band, background, damage, sink);
+        }
+        let caption = (text.chars().count() * CELL_WIDTH * s as usize) as i64;
+        let width = (hint::width(hint) * s as usize) as i64;
+        let hint_x = text_x.saturating_add((caption - width) / 2).max(inner.x);
+        hint_run(
+            self.surface.scale,
+            hint.chars(),
+            (hint_x, hint_y),
+            inner,
+            if enabled && !selected {
+                LINE_NUMBER
+            } else {
+                ink
+            },
             damage,
             sink,
         );
@@ -274,15 +335,30 @@ impl<'a> Buttons<'a> {
         damage: Rect,
         sink: &mut dyn FnMut(Draw),
     ) {
+        self.emit_hinted(states, std::iter::empty(), damage, sink);
+    }
+
+    /// `emit` with a hint under each button's caption from `hints`, in
+    /// label order (`Button::emit_hinted`); a label `hints` runs out
+    /// before, or names `None` for, has none.
+    pub fn emit_hinted<'h>(
+        &self,
+        states: impl IntoIterator<Item = (bool, bool)>,
+        hints: impl IntoIterator<Item = Option<&'h str>>,
+        damage: Rect,
+        sink: &mut dyn FnMut(Draw),
+    ) {
         let Some(damage) = damage.intersection(self.surface.bounds()) else {
             return;
         };
         fill(self.rect(), CHROME, damage, sink);
         let mut states = states.into_iter();
+        let mut hints = hints.into_iter();
         for (label, button) in self.labels.iter().zip(self.buttons()) {
             let (selected, enabled) = states.next().unwrap_or((false, true));
+            let hint = hints.next().flatten();
             if let Some(button) = button {
-                button.emit(label, selected, enabled, damage, sink);
+                button.emit_hinted(label, hint, selected, enabled, damage, sink);
             }
         }
     }

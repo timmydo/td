@@ -25,6 +25,7 @@ use td_ui::control_socket::Socket;
 use td_ui::control_worker::{Job, Worker, CONNECTIONS};
 use td_ui::driven::{self, Input, Outcome, Payload, PointerPhase};
 use td_ui::font::Font;
+use td_ui::keyboard::Held;
 use td_ui::pointer::{self, Wheel};
 use td_ui::raster::{Raster, Scale, Surface, MAX_FRAME_BYTES};
 use td_ui::wayland::{connect, endpoint, Endpoint};
@@ -1276,8 +1277,19 @@ impl Window {
             KeyboardEvent::Focus(focused) => {
                 self.input(Input::Focus(focused));
             }
-            KeyboardEvent::Keymap(Err(why)) | KeyboardEvent::Refused(why) => note(&why),
-            KeyboardEvent::Keymap(Ok(())) | KeyboardEvent::Ready => {}
+            KeyboardEvent::Held(held) => {
+                self.input(Input::Held(held));
+            }
+            // A new map clears the roles held without a report: the hints
+            // go with them, and the next change brings them back.
+            KeyboardEvent::Keymap(result) => {
+                if let Err(why) = result {
+                    note(&why);
+                }
+                self.input(Input::Held(Held::default()));
+            }
+            KeyboardEvent::Refused(why) => note(&why),
+            KeyboardEvent::Ready => {}
         }
     }
 

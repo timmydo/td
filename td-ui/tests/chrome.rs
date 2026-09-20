@@ -40,7 +40,18 @@ fn fills(draws: &[Draw]) -> Vec<(Rect, u32)> {
         .iter()
         .filter_map(|d| match d.primitive {
             Primitive::Fill { rect, color } => Some((rect, color)),
-            Primitive::Glyph { .. } => None,
+            Primitive::Glyph { .. } | Primitive::Mark { .. } => None,
+        })
+        .collect()
+}
+
+/// Each mark as (x, y, scalar, ink).
+fn marks(draws: &[Draw]) -> Vec<(i64, i64, char, u32)> {
+    draws
+        .iter()
+        .filter_map(|d| match d.primitive {
+            Primitive::Mark { x, y, scalar, ink } => Some((x, y, scalar, ink)),
+            Primitive::Fill { .. } | Primitive::Glyph { .. } => None,
         })
         .collect()
 }
@@ -56,7 +67,7 @@ fn glyphs(draws: &[Draw]) -> Vec<(i64, i64, char, u32, Weight)> {
                 scalar,
                 style,
             } => Some((x, y, scalar, style.ink, style.weight)),
-            Primitive::Fill { .. } => None,
+            Primitive::Fill { .. } | Primitive::Mark { .. } => None,
         })
         .collect()
 }
@@ -1874,6 +1885,201 @@ fn a_button_strip_lays_bordered_buttons_from_cell_one_and_hits_only_whole_ones()
         });
         assert_eq!(fills(&draws), vec![(empty.rect(), CHROME)]);
         assert!(glyphs(&draws).is_empty() && empty.hit(rects[0].x, mid).is_none());
+    }
+}
+
+/// A hinted button at every scale: the caption four pixels higher than
+/// a plain one's, a band of the face over its descenders from seven
+/// pixels above the foot, and the hint's marks centred under the caption
+/// on that band in the lighter ink (the caption's own when selected or
+/// disabled), from the face's left when the caption is the narrower, a
+/// mark the bezel would cut left off; an empty hint is none.
+#[test]
+fn a_hinted_button_lifts_its_caption_and_marks_the_hint_under_it() {
+    use td_ui::chrome::{Buttons, ROW};
+    use td_ui::hint;
+    let font = font::pinned().unwrap();
+    let labels = ["All", "Picks", "Rejects", "-", "gjpqy"];
+    for scale in 1..=4u8 {
+        let s = usize::from(scale);
+        let px = |n: usize| (n * s) as i64;
+        let surface = surface(320 * s, 72 * s, scale);
+        let y = (ROW * s) as i64;
+        let strip = Buttons::new(surface, y, &labels);
+        let rects: Vec<Rect> = (0..5).map(|i| strip.button(i).unwrap().rect()).collect();
+        let states = [(false, true), (true, true), (false, false)];
+        let hints = [
+            Some("1"),
+            Some("2"),
+            Some("Backspace"),
+            Some("Backspace"),
+            Some("z"),
+        ];
+        let draws = run(surface, |damage, sink| {
+            strip.emit_hinted(states, hints, damage, sink)
+        });
+        // A plain caption sits two pixels down; a hinted one two up.
+        let lettered = glyphs(&draws);
+        assert!(lettered.iter().all(|g| g.1 == rects[0].y - px(2)));
+        // Each hinted button paints its band after its face, in the face's
+        // colour, over the inner width from seven pixels above the foot.
+        let painted = fills(&draws);
+        let band = |rect: Rect, color| {
+            (
+                Rect {
+                    x: rect.x + px(1),
+                    y: rect.y + i64::from(rect.height) - px(7),
+                    width: rect.width - 2 * px(1) as u32,
+                    height: (hint::HEIGHT * s) as u32,
+                },
+                color,
+            )
+        };
+        assert_eq!(
+            painted[1..],
+            [
+                (rects[0], BORDER),
+                (
+                    Rect {
+                        x: rects[0].x + px(1),
+                        y: rects[0].y + px(1),
+                        width: rects[0].width - 2 * px(1) as u32,
+                        height: rects[0].height - 2 * px(1) as u32
+                    },
+                    PAPER
+                ),
+                band(rects[0], PAPER),
+                (rects[1], BORDER),
+                (
+                    Rect {
+                        x: rects[1].x + px(1),
+                        y: rects[1].y + px(1),
+                        width: rects[1].width - 2 * px(1) as u32,
+                        height: rects[1].height - 2 * px(1) as u32
+                    },
+                    SELECTED
+                ),
+                band(rects[1], SELECTED),
+                (rects[2], BORDER),
+                (
+                    Rect {
+                        x: rects[2].x + px(1),
+                        y: rects[2].y + px(1),
+                        width: rects[2].width - 2 * px(1) as u32,
+                        height: rects[2].height - 2 * px(1) as u32
+                    },
+                    PAPER
+                ),
+                band(rects[2], PAPER),
+                (rects[3], BORDER),
+                (
+                    Rect {
+                        x: rects[3].x + px(1),
+                        y: rects[3].y + px(1),
+                        width: rects[3].width - 2 * px(1) as u32,
+                        height: rects[3].height - 2 * px(1) as u32
+                    },
+                    PAPER
+                ),
+                band(rects[3], PAPER),
+                (rects[4], BORDER),
+                (
+                    Rect {
+                        x: rects[4].x + px(1),
+                        y: rects[4].y + px(1),
+                        width: rects[4].width - 2 * px(1) as u32,
+                        height: rects[4].height - 2 * px(1) as u32
+                    },
+                    PAPER
+                ),
+                band(rects[4], PAPER),
+            ]
+        );
+        // The marks: centred under the caption, `hint::ADVANCE` apart, on
+        // the band's rows; the lighter ink, or the caption's when the
+        // button is selected or disabled; from the face's left, the marks
+        // the bezel would cut left off, when the hint is wider than the
+        // caption (`Back` of `Backspace`: 22 pixels hold four marks and
+        // three spaces, not a fifth mark).
+        let marked = marks(&draws);
+        let hint_y = rects[0].y + i64::from(rects[0].height) - px(7);
+        assert!(marked.iter().all(|m| m.1 == hint_y));
+        let text: String = marked.iter().map(|m| m.2).collect();
+        assert_eq!(text, "12BackspaceBackz");
+        assert_eq!(
+            marked[0].0,
+            rects[0].x + px(8) + (px(24) - px(hint::width("1"))) / 2
+        );
+        assert_eq!(marked[0].3, LINE_NUMBER);
+        assert_eq!(
+            marked[1].0,
+            rects[1].x + px(8) + (px(40) - px(hint::width("2"))) / 2
+        );
+        assert_eq!(marked[1].3, PAPER);
+        let backspace = &marked[2..11];
+        assert_eq!(
+            backspace[0].0,
+            rects[2].x + px(8) + (px(56) - px(hint::width("Backspace"))) / 2
+        );
+        assert!(backspace
+            .iter()
+            .enumerate()
+            .all(|(i, m)| m.0 == backspace[0].0 + px(hint::ADVANCE) * i as i64 && m.3 == DISABLED));
+        let cut = &marked[11..15];
+        assert_eq!(cut[0].0, rects[3].x + px(1));
+        assert_eq!(cut[3].0, rects[3].x + px(1) + px(3 * hint::ADVANCE));
+        // The pixels: the hint's lit and unlit cells, the band's row under
+        // it, the bezel, no caption ink on the band's rows and a
+        // descender's first row above them.
+        let mut pixels = vec![0x11; surface.width * surface.height * 4];
+        let mut raster = Raster::new(&mut pixels, &font, surface, surface.width * 4).unwrap();
+        strip.emit_hinted(states, hints, surface.bounds(), &mut |draw| {
+            raster.draw(draw)
+        });
+        let pixel = |x: i64, y: i64| {
+            let offset = (y as usize * surface.width + x as usize) * 4;
+            u32::from_le_bytes([
+                pixels[offset],
+                pixels[offset + 1],
+                pixels[offset + 2],
+                pixels[offset + 3],
+            ]) & 0xffffff
+        };
+        // '1' is `.#..` over `##..`, `.#..`, `.#..`, `###.`.
+        let one = marked[0].0;
+        assert_eq!(pixel(one, hint_y), PAPER);
+        assert_eq!(pixel(one + px(1), hint_y), LINE_NUMBER);
+        assert_eq!(
+            pixel(one + px(1) + px(1) - 1, hint_y + px(1) - 1),
+            LINE_NUMBER
+        );
+        assert_eq!(pixel(one, hint_y + px(4)), LINE_NUMBER);
+        assert_eq!(pixel(one + px(3), hint_y + px(4)), PAPER);
+        assert_eq!(pixel(one, hint_y + px(5)), PAPER);
+        assert_eq!(
+            pixel(one, rects[0].y + i64::from(rects[0].height) - 1),
+            BORDER
+        );
+        let row_has = |rect: Rect, row: i64, color: u32| {
+            (rect.x..rect.x + i64::from(rect.width)).any(|x| pixel(x, row) == color)
+        };
+        for row in hint_y..rects[4].y + i64::from(rects[4].height) - px(1) {
+            assert!(!row_has(rects[4], row, INK), "scale {s} row {row}");
+        }
+        assert!(row_has(rects[4], hint_y - 1, INK));
+        assert!(row_has(rects[4], hint_y + px(1), LINE_NUMBER));
+        // A plain strip is the same draws as one hinted with nothing, or
+        // with empty hints.
+        let plain = run(surface, |damage, sink| strip.emit(states, damage, sink));
+        let none = run(surface, |damage, sink| {
+            strip.emit_hinted(states, [None; 5], damage, sink)
+        });
+        assert_eq!(plain, none);
+        let empty = run(surface, |damage, sink| {
+            strip.emit_hinted(states, [Some(""); 5], damage, sink)
+        });
+        assert_eq!(plain, empty);
+        assert!(marks(&plain).is_empty());
     }
 }
 

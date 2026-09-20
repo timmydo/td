@@ -142,7 +142,10 @@ of its own files may name each module.
   at the comparison.
 - `keyboard`: `Keymap::parse` over an XKB text-v1 map, `Modifiers`,
   `Stroke`, `InputError`, `Selected`, and translation from evdev keycodes
-  plus a compositor modifier snapshot to logical chords. No display,
+  plus a compositor modifier snapshot to logical chords; `Held`, the
+  control, alt and shift roles a snapshot holds (`Keymap::held`; a state
+  the map refuses holds none), with its chord `prefix` (`C-M-S-` in that
+  order, `-` for none) and the `parse` of one. No display,
   descriptor, environment, action execution or clock is accessed. The
   bounded lexical envelope and the compatibility target are the ones
   td-editor/DESIGN.md records under "Implemented keyboard compiler"; that
@@ -167,10 +170,12 @@ of its own files may name each module.
   `announce` under the budgets; `UTF8` and `PLAIN`, the two text MIMEs a
   consumer offers and accepts; `OFFER_LIMIT`, `ANNOUNCEMENTS` and
   `MIME_BYTES`.
-- `raster`: `Rect`, `Scale` (1 through 4), `Weight`, `GlyphStyle`, `Primitive`,
-  `Draw`, `Surface`, the `Composition` trait, `Scrollbar`, `text_run`, `Raster`,
-  `Error`, the axis and frame-byte ceilings, the palette constants, and `rgb`
-  and `ppm`, a painted frame as tight RGB rows and as a binary PPM. A
+- `raster`: `Rect`, `Scale` (1 through 4), `Weight`, `GlyphStyle`, `Primitive`
+  (`Fill`, `Glyph`, and `Mark`, a scalar of the hint face in one ink),
+  `Draw`, `Surface`, the `Composition` trait, `Scrollbar`, `text_run`,
+  `hint_run`, `Raster`, `Error`, the axis and frame-byte ceilings, the
+  palette constants, and `rgb` and `ppm`, a painted frame as tight RGB rows
+  and as a binary PPM. A
   composition reports the surface it was laid out for and streams the draws
   inside a damage rectangle; `Raster::new` validates surface, font, stride and
   buffer before any write, and `Raster::paint` refuses a composition laid out
@@ -178,6 +183,10 @@ of its own files may name each module.
   scrollbar proportions and drag rounding) is the one td-editor/DESIGN.md
   records under "Implemented reference-renderer contract"; that text moves here
   with the documentation increment.
+- `hint`: the hint face, a hand-authored 4x5 glyph (`WIDTH`, `HEIGHT`,
+  `ADVANCE` 5) per printable ASCII scalar, `glyph` and the pixel `width`
+  of a text; a scalar it lacks is a box. It is the small lighter text a
+  button shows under its caption (`Button::emit_hinted`), never body text.
 - `chrome`: `Bar` with its `Panel`, `Block`, `Strip`, `Button` and
   `Buttons`, `Slider` with `KNOB_WIDTH`, `Status`, `List` and
   `TextEntry`, the `Row` a panel paints, the `Item` a list paints, the
@@ -286,7 +295,8 @@ of its own files may name each module.
   returns `Handled`: `Done`, `Bound`, `Configure`, `CloseRequested`,
   `FrameDone`, `GlobalRemoved`, `Capabilities`, `SeatRemoved`, `Keyboard`
   with a `KeyboardEvent` (`Keymap`, `Focus`, `Ready`, `Key` with its serial,
-  key and `Stroke`, `Refused`), `Pointer` with the decoded `pointer::Event`,
+  key and `Stroke`, `Refused`, `Held` with the roles a modifier snapshot
+  holds), `Pointer` with the decoded `pointer::Event`,
   `Clipboard` with a `ClipboardEvent` (`Selection`, `Send` carrying the
   right to write the offered text to, `Cancelled`, `Released`), or
   `Unhandled` for the consumer's own objects. `App` (`client`,
@@ -316,7 +326,8 @@ of its own files may name each module.
   worker" below.
 - `replay`: `run`, the consecutive-frame runner over a consumer's handler.
 - `driven`: `KEY_BYTES`, `ARGUMENTS`, `PAGE_BYTES` and `WHEEL_LIMIT`;
-  `PointerPhase`, `Input` and `Outcome` with its `word`; `Binding`, one
+  `PointerPhase`, `Input` (a key, the held roles, a pointer phase, wheel
+  travel, a resize, focus, a tick) and `Outcome` with its `word`; `Binding`, one
   row of a consumer's action table, with `check`, `bound` and `help`; the
   `Controller` trait (`bindings`, `action`, `input`, `state`,
   `compose`, `request`); `VERBS` and `request`, the generic router;
@@ -640,9 +651,10 @@ same parser and dispatcher answer both the socket and the replay.
 operate it without a protocol of its own; td-photo consumes it first. A consumer
 gives a `Controller`: `bindings`, its closed action table; `action`, applying a
 named action with the fields the request carried; `input`, delivering one
-semantic `Input` (a key chord, a pointer phase at a pixel position, wheel rows
-and columns, a resize, focus, a tick) through the same key and pointer paths its
-window uses; `state`, the tab-separated body of its facts; `compose`, one
+semantic `Input` (a key chord, the roles held with no key under them, a pointer
+phase at a pixel position, wheel rows and columns, a resize, focus, a tick)
+through the same key and pointer paths its window uses; `state`, the
+tab-separated body of its facts; `compose`, one
 reading of what the window shows now, building a scene that borrows its model
 per request if that is how it draws; and `request`, its own verbs beyond the
 generic set, `protocol` by default. Its `Error` maps the transport's two in and
@@ -672,6 +684,10 @@ denote literal Tabs):
   outcome word, `changed`, `ignored` or `quit`.
 - `1 ID key HEX_CHORD`: the chord, 1 to 32 bytes of UTF-8 without control
   characters, through `input`; the outcome word.
+- `1 ID held PREFIX`: the roles held as `Held::prefix` writes them
+  (`C-M-S-` in that order, `-` for none), through `input`; the outcome
+  word. It is what the keyboard reports on a modifier change with no key
+  under it, so a consumer's hints can be driven.
 - `1 ID pointer PHASE X Y`: `press`, `move` or `release` at pixel X, Y,
   each a `u32`; the outcome word.
 - `1 ID wheel ROWS COLUMNS`: signed whole cells, magnitude at most
@@ -688,7 +704,7 @@ denote literal Tabs):
 - A generic verb (`VERBS`) with fields it does not take: `protocol`,
   at the router. Anything else: the consumer's `request`.
 
-The reading verbs borrow the controller; `action`, `key`, `pointer`,
+The reading verbs borrow the controller; `action`, `key`, `held`, `pointer`,
 `wheel`, `resize`, `focus` and `tick` go through the consumer's own
 admission, which is where reading and acting are told apart (§S). The
 digest is an equality witness for tests and agents, not a hash for
@@ -708,7 +724,8 @@ own terms, so a consumer tracks its own quit.
 scale: each glyph lands in the cell its origin names (an origin off the grid, a
 glyph straddling the top or left edge included, names none), a later draw over
 an earlier one, a fill clearing every cell it wholly covers, so an opaque panel
-hides what it paints over, a glyph whose clip excludes it wholly absent; rows
+hides what it paints over, a glyph whose clip excludes it wholly absent, a
+mark (a hint's pixels, not text the window shows) passed over; rows
 are trimmed on the right and trailing blank rows dropped, so the text has at
 most ROWS lines. That is the accessibility question answered at the seam the
 toolkit already has: every widget emits its text as Unicode scalars, so nothing
@@ -817,7 +834,13 @@ not frames, and stays its own).
   repeat and awaits a modifier snapshot. Keyboard enter and leave must name
   the surface and are the repeat policy's focus gain, with the held keys,
   and loss; the modifiers event is its snapshot, and the first after a map
-  and focus is `Ready`, from which presses translate; the timing event is
+  and focus is `Ready`, from which presses translate, and each later one
+  whose roles (`Keymap::held`) differ from the last reported is `Held`,
+  once per change (the `Ready` snapshot's roles are the baseline, not
+  reported: a consumer starts from none, and a release from them is a
+  change; leaving, and a new map, clear the roles without a report,
+  `Focus(false)` and `Keymap` being the consumer's cues); the timing
+  event is
   its rate and delay, at the consumer's clock. The pointer's events are
   decoded by `pointer`, which refuses unknown opcodes, truncated or trailing
   payloads, invalid axis and source numbers and invalid button states; its
@@ -1194,6 +1217,21 @@ press/release activation, as with the other chrome geometry primitives.
 Scale 1-4 pixel tests cover bounds, focus/disabled colors, the centring
 and partial repaint equivalence.
 
+`emit_hinted` is `emit` with a hint under the caption when one is given
+(a chord, while a consumer shows its shortcuts; an empty one is none):
+the caption lifted four pixels, a band of the face's colour five pixels
+tall from seven above the foot (over the second row of the caption's
+descenders, which a strip's button, `ROW` less its margins, has no room
+for beside a hint), and the hint on it in the hint face (`hint`),
+`LINE_NUMBER` ink on an enabled unselected button and the caption's own
+ink otherwise, centred under the caption, from a pixel in from the bezel
+when the hint is the wider, a mark the bezel would cut left off. On a
+strip's button the caption's capitals then end a pixel above the hint,
+which ends a pixel above the bezel; a `ROW`-tall button has three rows
+between. With no hint it is `emit` exactly. Its test pins the lift, the
+band, the marks' places and inks, the wider hint's marks left off, the
+pixels and the plain and empty equivalence at scales 1-4.
+
 `chrome::Buttons` is a strip of them on a band at a `y` the consumer
 chooses, across the surface (`new`) or on a given left and width
 (`in_band`): the buttons from cell one, each its label's cells and a
@@ -1212,7 +1250,9 @@ has its place (and `end`) but is neither painted nor a target, so a
 consumer laying past the last button checks it was held; the layout is
 one pass over the labels (`buttons`). `emit` takes each
 button's `(selected, enabled)` in label order, a state it runs out of
-painting an enabled unselected button; `hit` answers the button whose own
+painting an enabled unselected button; `emit_hinted` takes the hints
+too, in label order, `None` or one it runs out of being no hint
+(`Button::emit_hinted`); `hit` answers the button whose own
 pixels hold the point, the gap and the margin none. A consumer that wants
 one selected at a time (a mode or a filter strip) selects one; the strip
 itself imposes nothing. Its test pins the geometry, the hit rule, the
@@ -1810,3 +1850,10 @@ regressions. Those increments extend the original sequence below.
 14. Slider: `chrome::Slider`, a knob on a track over `steps + 1`
     positions with the pointer-to-position inverse (see "Shared
     slider"); td-photo's exposure control is its first consumer. Landed.
+15. Shortcut hints: the hint face (`hint`), the `Mark` primitive and
+    `hint_run`, `Button::emit_hinted` and `Buttons::emit_hinted`, the
+    held roles (`keyboard::Held`, `Keymap::held`) reported by the client
+    as `KeyboardEvent::Held` and driven as `Input::Held` through the
+    `held` verb; td-photo shows its chords while Alt is held. The widget
+    window and the other consumers ignore the event (the task manager's
+    remote answers `held` ignored). Landed.

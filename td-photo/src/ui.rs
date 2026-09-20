@@ -720,6 +720,7 @@ const FILTER_NAMES: [&str; 4] = [FILTERS[0].1, FILTERS[1].1, FILTERS[2].1, FILTE
 /// The mode strip's labels: the roll chooser, the cull grid and develop,
 /// in the order `mode_states` reports them.
 const MODES: [&str; 3] = ["Roll Selection", "Culling", "Develop"];
+const MODE_ACTIONS: [&str; 3] = ["choose", "grid", "develop"];
 
 /// The develop history pane's width in reference pixels: 27 cells, room
 /// for an exposure or look step's row (a crop's shows in whole percents,
@@ -754,19 +755,34 @@ pub fn step_label(step: &Step) -> String {
 }
 
 /// The buttons under the history pane, in order: the selected step off or
-/// on, the selected step deleted, the last step taken back.
+/// on, the selected step deleted, the last step taken back; and the
+/// actions they press, whose chords are their hints.
 pub const HISTORY_BUTTONS: [&str; 3] = ["Toggle", "Delete", "Undo"];
+const HISTORY_ACTIONS: [&str; 3] = ["step-toggle", "step-delete", "undo"];
 
 /// The tool band's buttons, in order, before the exposure slider: the
 /// crop-adjust sub-mode (selected while it is on), the crop cleared, the
 /// last step back, the history cleared, and the exposure a third of a
 /// stop down or up.
 pub const TOOL_BUTTONS: [&str; 6] = ["Crop", "Uncrop", "Undo", "Reset", "-", "+"];
+const TOOL_ACTIONS: [&str; 6] = [
+    "adjust-crop",
+    "uncrop",
+    "undo",
+    "reset",
+    "expose-out",
+    "expose-in",
+];
 // The layout, the states and the paint zip the six by place.
 const _: () = assert!(TOOL_BUTTONS.len() == 6);
 
 /// The look band's first button: no look, the camera's rendering.
 pub const NO_LOOK: &str = "None";
+/// The actions that pick the first nine looks by place, the look
+/// buttons' hints after `NO_LOOK`'s (which has none).
+const LOOK_ACTIONS: [&str; 9] = [
+    "look-1", "look-2", "look-3", "look-4", "look-5", "look-6", "look-7", "look-8", "look-9",
+];
 
 /// The exposure slider's steps: a tenth of a stop each over the range,
 /// so value 0 is `-MAX_EXPOSURE`, 50 is zero and 100 is `MAX_EXPOSURE`.
@@ -1349,6 +1365,11 @@ pub struct Controller {
     /// press, painted as the knob, committed on release. Dropped with the
     /// crop drag when the photo, mode or surface changes.
     slider: Option<usize>,
+    /// Whether the buttons show their chords as hints: while Alt is held
+    /// (`Input::Held`), until it is released or the focus leaves. A fact
+    /// the frame witnesses, so a change bumps the generation; absent from
+    /// `state`.
+    hints: bool,
 }
 
 /// The roll chooser: the toolkit's finder over the folder the adapter
@@ -1893,6 +1914,7 @@ impl Controller {
             history_step: None,
             history_first: 0,
             slider: None,
+            hints: false,
         }
     }
 
@@ -2315,6 +2337,33 @@ impl Controller {
     /// develops the uncropped frame) and the scene; not a `state` field.
     pub fn adjusting(&self) -> bool {
         self.adjusting
+    }
+
+    /// Whether the buttons show their chords as hints (Alt held).
+    pub fn hints(&self) -> bool {
+        self.hints
+    }
+
+    /// The hint under a button that presses `action`: its chord, while
+    /// the hints are shown and the chooser is not open (it owns the
+    /// keyboard, so no chord means what the button does).
+    fn hint(&self, action: &str) -> Option<&'static str> {
+        if !self.hints || self.chooser.is_some() {
+            return None;
+        }
+        BINDINGS
+            .iter()
+            .find(|binding| binding.name == action)
+            .and_then(|binding| binding.chord)
+    }
+
+    /// The hints are shown or not: a change is a new frame.
+    fn show_hints(&mut self, shown: bool) -> Outcome {
+        if shown == self.hints {
+            return Outcome::Ignored;
+        }
+        self.hints = shown;
+        self.finish(Outcome::Changed)
     }
 
     /// The crop drag's marquee, in surface pixels, or `None` when no tighten
@@ -2770,7 +2819,12 @@ impl Controller {
                 self.bump();
                 Ok((Outcome::Changed, Vec::new()))
             }
-            Input::Focus(_) | Input::Tick(_) => Ok((Outcome::Ignored, Vec::new())),
+            // Alt held shows the chords under the buttons; a modifier the
+            // keyboard stops reporting (the focus left, or the window
+            // says so for a new map) hides them.
+            Input::Held(held) => Ok((self.show_hints(held.alt), Vec::new())),
+            Input::Focus(false) => Ok((self.show_hints(false), Vec::new())),
+            Input::Focus(true) | Input::Tick(_) => Ok((Outcome::Ignored, Vec::new())),
         }
     }
 
@@ -4420,14 +4474,15 @@ impl Scene<'_> {
         }
         let selected = model.history_step.is_some();
         let enabled = [selected, selected, !steps.is_empty()];
-        for ((button, label), enabled) in layout
+        for (((button, label), action), enabled) in layout
             .history_buttons()
             .into_iter()
             .zip(HISTORY_BUTTONS)
+            .zip(HISTORY_ACTIONS)
             .zip(enabled)
         {
             if let Some(button) = button {
-                button.emit(label, false, enabled, damage, sink);
+                button.emit_hinted(label, model.hint(action), false, enabled, damage, sink);
             }
         }
     }
@@ -4464,17 +4519,31 @@ impl Scene<'_> {
     /// tool buttons with the crop-adjust one selected while it is on and
     /// each enabled as `tool_states` says, the exposure slider at the
     /// value in force or under the drag, then the look buttons with the
-    /// current look selected (`None` without one).
+    /// current look selected (`None` without one). While the hints are
+    /// shown each button carries its action's chord, the look buttons
+    /// `look-1` through `look-9`'s for the first nine looks.
     fn bands(&self, layout: &Layout, index: usize, damage: Rect, sink: &mut dyn FnMut(Draw)) {
         let model = self.model;
         fill(layout.tool_band(), CHROME, damage, sink);
         fill(layout.look_band(), CHROME, damage, sink);
         let tools = layout.tools();
         let states = model.tool_states(index);
-        let buttons = tools.buttons.into_iter().zip(TOOL_BUTTONS).zip(states);
-        for (which, ((button, label), enabled)) in buttons.enumerate() {
+        let buttons = tools
+            .buttons
+            .into_iter()
+            .zip(TOOL_BUTTONS)
+            .zip(TOOL_ACTIONS)
+            .zip(states);
+        for (which, (((button, label), action), enabled)) in buttons.enumerate() {
             if let Some(button) = button {
-                button.emit(label, which == 0 && model.adjusting, enabled, damage, sink);
+                button.emit_hinted(
+                    label,
+                    model.hint(action),
+                    which == 0 && model.adjusting,
+                    enabled,
+                    damage,
+                    sink,
+                );
             }
         }
         if let Some(slider) = tools.slider {
@@ -4492,7 +4561,11 @@ impl Scene<'_> {
                 } else {
                     current == Some(label)
                 };
-                button.emit(label, selected, true, damage, sink);
+                let hint = which
+                    .checked_sub(1)
+                    .and_then(|place| LOOK_ACTIONS.get(place))
+                    .and_then(|action| model.hint(action));
+                button.emit_hinted(label, hint, selected, true, damage, sink);
             }
         }
     }
@@ -4703,10 +4776,18 @@ impl Composition for Scene<'_> {
     fn emit(&self, damage: Rect, sink: &mut dyn FnMut(Draw)) {
         let model = self.model;
         let layout = model.layout();
-        model.mode_strip().emit(model.mode_states(), damage, sink);
-        model
-            .filter_strip()
-            .emit(model.filter_states(), damage, sink);
+        model.mode_strip().emit_hinted(
+            model.mode_states(),
+            MODE_ACTIONS.map(|action| model.hint(action)),
+            damage,
+            sink,
+        );
+        model.filter_strip().emit_hinted(
+            model.filter_states(),
+            FILTERS.map(|(filter, _)| model.hint(filter.word())),
+            damage,
+            sink,
+        );
         if let Some(chooser) = &model.chooser {
             // The finder stands in for the area, whatever is open behind it.
             chooser.finder.emit(damage, sink);

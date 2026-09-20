@@ -6,7 +6,7 @@
     clippy::indexing_slicing
 )]
 
-use td_ui::keyboard::{InputError, Keymap, Modifiers};
+use td_ui::keyboard::{Held, InputError, Keymap, Modifiers};
 
 const US: &str = include_str!("fixtures/us.xkb");
 
@@ -609,4 +609,72 @@ fn reference_probes_pin_trailing_no_symbol_inference_predicates_and_real_lock() 
         chord(&Keymap::parse(&all).unwrap(), 1, 0).as_deref(),
         Some("a")
     );
+}
+
+#[test]
+fn held_roles_are_the_states_of_the_map_and_name_themselves_as_a_prefix() {
+    let map = Keymap::parse(US).unwrap();
+    assert_eq!(map.held(state(0)), Held::default());
+    // Shift 1, Control 4, Alt (Mod1) 8, latched or locked alike.
+    assert_eq!(
+        map.held(state(8)),
+        Held {
+            alt: true,
+            ..Held::default()
+        }
+    );
+    assert_eq!(
+        map.held(Modifiers {
+            depressed: 4,
+            latched: 8,
+            locked: 1,
+            group: 0
+        }),
+        Held {
+            control: true,
+            alt: true,
+            shift: true
+        }
+    );
+    // A state the map refuses (Super, a group) holds nothing.
+    assert_eq!(map.held(state(64 | 8)), Held::default());
+    assert_eq!(
+        map.held(Modifiers {
+            group: 1,
+            ..state(8)
+        }),
+        Held::default()
+    );
+    for (held, prefix) in [
+        (Held::default(), "-"),
+        (
+            Held {
+                alt: true,
+                ..Held::default()
+            },
+            "M-",
+        ),
+        (
+            Held {
+                control: true,
+                shift: true,
+                ..Held::default()
+            },
+            "C-S-",
+        ),
+        (
+            Held {
+                control: true,
+                alt: true,
+                shift: true,
+            },
+            "C-M-S-",
+        ),
+    ] {
+        assert_eq!(held.prefix(), prefix);
+        assert_eq!(Held::parse(prefix), Some(held), "{prefix}");
+    }
+    for bad in ["", "M", "M-C-", "--", "C-C-", "M-x", " -"] {
+        assert_eq!(Held::parse(bad), None, "{bad:?}");
+    }
 }

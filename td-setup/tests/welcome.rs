@@ -41,7 +41,7 @@ fn fills(draws: &[Draw]) -> Vec<(Rect, u32)> {
         .iter()
         .filter_map(|d| match d.primitive {
             Primitive::Fill { rect, color } => Some((rect, color)),
-            Primitive::Glyph { .. } => None,
+            Primitive::Glyph { .. } | Primitive::Mark { .. } => None,
         })
         .collect()
 }
@@ -57,7 +57,7 @@ fn glyphs(draws: &[Draw]) -> Vec<(i64, i64, char, u32, Weight)> {
                 scalar,
                 style,
             } => Some((x, y, scalar, style.ink, style.weight)),
-            Primitive::Fill { .. } => None,
+            Primitive::Fill { .. } | Primitive::Mark { .. } => None,
         })
         .collect()
 }

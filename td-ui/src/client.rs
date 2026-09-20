@@ -8,7 +8,7 @@
 //! transport's are.
 
 use crate::data::{self, DeviceEvent, Offer, SourceEvent, OFFER_LIMIT, PLAIN, UTF8};
-use crate::keyboard::{Keymap, Modifiers, Stroke};
+use crate::keyboard::{Held, Keymap, Modifiers, Stroke};
 use crate::pointer;
 use crate::raster::{MAX_AXIS, MAX_FRAME_BYTES};
 use crate::repeat::Input;
@@ -139,6 +139,13 @@ pub enum KeyboardEvent {
     },
     /// A press the map refused; the map stays.
     Refused(String),
+    /// The roles the modifier state holds changed while the keyboard was
+    /// ready: once per change, from the snapshot after `Ready` on. The
+    /// `Ready` snapshot's roles are the baseline, not reported: a consumer
+    /// starts from none, and a release from there is a change. Leaving,
+    /// and a new map, clear the roles without a report; `Focus(false)` and
+    /// `Keymap` are the consumer's cues.
+    Held(Held),
 }
 
 /// What the clipboard hands the consumer.
@@ -222,6 +229,7 @@ pub struct Client<T: Tag> {
     keyboard: Option<u32>,
     pointer: Option<u32>,
     input: Input,
+    held: Held,
     enter: Option<u32>,
     data: Option<Data>,
     bound: bool,
@@ -273,6 +281,7 @@ impl<T: Tag> Client<T> {
             keyboard: None,
             pointer: None,
             input: Input::default(),
+            held: Held::default(),
             enter: None,
             data: None,
             bound: false,
@@ -913,6 +922,7 @@ impl<T: Tag> Client<T> {
                 self.input.map = None;
                 self.input.cancel_repeat();
                 self.input.synchronized = false;
+                self.held = Held::default();
                 let result = read_keymap(fd, format, size).map(|map| self.input.map = Some(map));
                 Handled::Keyboard(KeyboardEvent::Keymap(result))
             }
@@ -929,15 +939,22 @@ impl<T: Tag> Client<T> {
                     return Err("keyboard leave for unknown surface".into());
                 }
                 self.input.focus(&[], false)?;
+                self.held = Held::default();
                 self.clear_selection()?;
                 Handled::Keyboard(KeyboardEvent::Focus(false))
             }
             KeyboardMessage::Modifiers(modifiers) => {
                 let ready =
                     !self.input.synchronized && self.input.focused && self.input.map.is_some();
+                let was = self.input.synchronized && self.input.focused;
                 self.input.modifiers(modifiers);
+                let held = self.input.map.as_ref().map(|map| map.held(modifiers));
                 if ready {
+                    self.held = held.unwrap_or_default();
                     Handled::Keyboard(KeyboardEvent::Ready)
+                } else if let Some(held) = held.filter(|held| was && *held != self.held) {
+                    self.held = held;
+                    Handled::Keyboard(KeyboardEvent::Held(held))
                 } else {
                     Handled::Done
                 }
@@ -1636,7 +1653,11 @@ mod tests {
         let advertised: Vec<(&str, u32)> = client.globals().collect();
         assert_eq!(
             advertised,
-            [("wl_compositor", 4), ("wl_shm", 1), ("td_portal_manager_v1", 1)]
+            [
+                ("wl_compositor", 4),
+                ("wl_shm", 1),
+                ("td_portal_manager_v1", 1)
+            ]
         );
         // Removing an unbound global drops it from the view.
         let mut body = Builder::new();
@@ -1645,7 +1666,10 @@ mod tests {
         let message = crate::wire::take(&mut bytes).unwrap().unwrap();
         assert!(matches!(
             client.handle(&message, 0).unwrap(),
-            Handled::GlobalRemoved { required: false, .. }
+            Handled::GlobalRemoved {
+                required: false,
+                ..
+            }
         ));
         let advertised: Vec<(&str, u32)> = client.globals().collect();
         assert_eq!(

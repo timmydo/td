@@ -3,16 +3,18 @@
 //! gives a `Controller` over its own closed action type, a table of
 //! `Binding`s naming those actions, its `state` body and its current
 //! `Composition`; the toolkit routes the generic verbs (`state`, `actions`,
-//! `action`, `key`, `pointer`, `wheel`, `resize`, `focus`, `tick`, `text`,
-//! `frame`, `frame-page`) over `control`'s envelope, reads text back from
-//! the draw stream and paints the frame for inspection. Whether a verb reads
-//! or acts stays the consumer's: the router borrows for the reading verbs
-//! and passes acting ones through the consumer's own dispatch.
+//! `action`, `key`, `held`, `pointer`, `wheel`, `resize`, `focus`, `tick`,
+//! `text`, `frame`, `frame-page`) over `control`'s envelope, reads text
+//! back from the draw stream and paints the frame for inspection. Whether
+//! a verb reads or acts stays the consumer's: the router borrows for the
+//! reading verbs and passes acting ones through the consumer's own
+//! dispatch.
 
 use crate::control::{
     self, decimal, envelope, hex, ok, size, unhex, Envelope, ErrorCode, Parse, Refusal,
 };
 use crate::font::Font;
+use crate::keyboard::Held;
 use crate::raster::{self, Composition, Primitive, Raster, Rect, Scale, Surface};
 use crate::{CELL_HEIGHT, CELL_WIDTH};
 use std::sync::OnceLock;
@@ -28,11 +30,12 @@ pub const WHEEL_LIMIT: i32 = 16_777_216;
 /// The generic verbs. One of these with fields it does not take is
 /// `protocol` at the router; only other names reach a consumer's
 /// `request`.
-pub const VERBS: [&str; 12] = [
+pub const VERBS: [&str; 13] = [
     "state",
     "actions",
     "action",
     "key",
+    "held",
     "pointer",
     "wheel",
     "resize",
@@ -57,6 +60,11 @@ pub enum Input<'a> {
     Key {
         chord: &'a str,
     },
+    /// The modifiers held changed, with no key under them; the keyboard
+    /// reports it once per change (`client::KeyboardEvent::Held`), and on
+    /// the wire `held` names them as a chord prefix (`C-M-S-`, `-` for
+    /// none).
+    Held(Held),
     Pointer {
         phase: PointerPhase,
         x: u32,
@@ -300,6 +308,10 @@ fn dispatch<C: Controller>(
                 .word()
                 .into()
         }
+        ("held", [held]) => controller
+            .input(Input::Held(Held::parse(held).ok_or(Protocol)?))?
+            .word()
+            .into(),
         ("pointer", [phase, x, y]) => {
             let phase = match *phase {
                 "press" => PointerPhase::Press,
@@ -446,6 +458,8 @@ pub fn text(composition: &dyn Composition) -> Result<(usize, usize, String), ras
     composition.emit(surface.bounds(), &mut |draw| {
         let (x, y, scalar) = match draw.primitive {
             Primitive::Glyph { x, y, scalar, .. } => (x, y, scalar),
+            // A mark is a hint's pixel, not text the window shows.
+            Primitive::Mark { .. } => return,
             Primitive::Fill { rect, .. } => {
                 // Opaque paint: whatever it wholly covers is no longer shown.
                 let Some(covered) = draw.clip.intersection(rect) else {

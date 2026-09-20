@@ -1,11 +1,13 @@
-//! Clipped, allocation-free XRGB painting over the pinned 8x16 face: the
-//! rectangle and glyph primitives, the integer scale, the palette td-owned
-//! chrome shares, scrollbar geometry, the text-run painter and the raster
-//! that writes them into a caller-owned buffer. A program's scene composes
-//! these and streams draws through [`Composition`]; nothing here reads the
+//! Clipped, allocation-free XRGB painting over the pinned 8x16 face and
+//! the 4x5 hint face: the rectangle, glyph and mark primitives, the
+//! integer scale, the palette td-owned chrome shares, scrollbar geometry,
+//! the text-run and hint-run painters and the raster that writes them
+//! into a caller-owned buffer. A program's scene composes these and
+//! streams draws through [`Composition`]; nothing here reads the
 //! environment, a clock or a descriptor.
 
 use crate::font::Font;
+use crate::hint;
 use crate::{CELL_HEIGHT, CELL_WIDTH};
 
 pub const MAX_AXIS: usize = 8192;
@@ -147,6 +149,15 @@ pub enum Primitive {
         y: i64,
         scalar: char,
         style: GlyphStyle,
+    },
+    /// A scalar in the hint face (`hint`): `hint::WIDTH` by
+    /// `hint::HEIGHT` at the scale, ink only, over whatever the caller
+    /// painted.
+    Mark {
+        x: i64,
+        y: i64,
+        scalar: char,
+        ink: u32,
     },
 }
 
@@ -354,6 +365,44 @@ pub fn text_run(
     }
 }
 
+/// A run of scalars in the hint face painted left to right from
+/// `origin` inside `bounds`, `hint::ADVANCE` apart at the surface's
+/// scale, as many as fit whole (the last needs no space after it),
+/// clipped to `damage`; a scalar the face lacks draws as its box.
+pub fn hint_run(
+    scale: Scale,
+    chars: impl Iterator<Item = char>,
+    (x, y): (i64, i64),
+    bounds: Rect,
+    ink: u32,
+    damage: Rect,
+    sink: &mut dyn FnMut(Draw),
+) {
+    let Some(clip) = bounds.intersection(damage) else {
+        return;
+    };
+    let advance = (hint::ADVANCE * scale.value()) as i64;
+    let space = ((hint::ADVANCE - hint::WIDTH) * scale.value()) as i64;
+    let slots = (bounds
+        .x
+        .saturating_add(i64::from(bounds.width))
+        .saturating_sub(x)
+        .saturating_add(space)
+        / advance)
+        .max(0) as usize;
+    for (index, scalar) in chars.take(slots).enumerate() {
+        sink(Draw {
+            clip,
+            primitive: Primitive::Mark {
+                x: x.saturating_add(index as i64 * advance),
+                y,
+                scalar,
+                ink,
+            },
+        });
+    }
+}
+
 /// The tight RGB rows of a painted frame: `pixels` as a `Raster` over
 /// `surface` at `stride` left them, three bytes per pixel, row-major, for
 /// a PPM body or a page of one. Validation mirrors `Raster::new`.
@@ -387,6 +436,18 @@ pub fn ppm(surface: Surface, rgb: &[u8]) -> Vec<u8> {
     out.extend_from_slice(header.as_bytes());
     out.extend_from_slice(rgb);
     out
+}
+
+/// What a primitive paints inside its rectangle: every pixel, the face's
+/// pixels of a glyph (and its fringe when medium), or the hint face's
+/// rows of a mark.
+enum Shape {
+    Solid,
+    Glyph {
+        index: usize,
+        fringe: Option<[u8; 4]>,
+    },
+    Mark([u8; hint::HEIGHT]),
 }
 
 pub struct Raster<'pixels, 'font> {
@@ -445,8 +506,8 @@ impl<'pixels, 'font> Raster<'pixels, 'font> {
             return;
         };
         let scale = self.surface.scale.value();
-        let (rect, color, glyph) = match draw.primitive {
-            Primitive::Fill { rect, color } => (rect, color, None),
+        let (rect, color, shape) = match draw.primitive {
+            Primitive::Fill { rect, color } => (rect, color, Shape::Solid),
             Primitive::Glyph {
                 x,
                 y,
@@ -460,11 +521,21 @@ impl<'pixels, 'font> Raster<'pixels, 'font> {
                     height: (CELL_HEIGHT * scale) as u32,
                 },
                 style.ink,
-                Some((
-                    self.font.index(scalar),
-                    (style.weight == Weight::Medium)
+                Shape::Glyph {
+                    index: self.font.index(scalar),
+                    fringe: (style.weight == Weight::Medium)
                         .then(|| (style.fringe() | 0xff000000).to_le_bytes()),
-                )),
+                },
+            ),
+            Primitive::Mark { x, y, scalar, ink } => (
+                Rect {
+                    x,
+                    y,
+                    width: (hint::WIDTH * scale) as u32,
+                    height: (hint::HEIGHT * scale) as u32,
+                },
+                ink,
+                Shape::Mark(hint::glyph(scalar)),
             ),
         };
         let Some(area) = rect.intersection(clip) else {
@@ -472,29 +543,40 @@ impl<'pixels, 'font> Raster<'pixels, 'font> {
         };
         let bytes = (color | 0xff000000).to_le_bytes();
         for y in area.y..area.y + i64::from(area.height) {
-            let row = if glyph.is_some() {
-                y.saturating_sub(rect.y) as usize / scale
-            } else {
-                0
-            };
+            // Intersection with an at-most-32x64 shape makes these
+            // differences small even for hostile signed origins; a fill
+            // needs neither.
+            let row = y.saturating_sub(rect.y) as usize / scale;
             let start = y as usize * self.stride;
             for x in area.x..area.x + i64::from(area.width) {
                 let mut paint = &bytes;
-                if let Some((index, fringe)) = &glyph {
-                    // Intersection with an at-most-32x64 glyph makes these
-                    // differences small even for hostile signed origins.
-                    let col = x.saturating_sub(rect.x) as usize / scale;
-                    if !self.font.pixel(*index, col, row) {
-                        let Some(fringe) = fringe else {
-                            continue;
-                        };
-                        if !col
-                            .checked_sub(1)
-                            .is_some_and(|left| self.font.pixel(*index, left, row))
-                        {
+                match &shape {
+                    Shape::Solid => {}
+                    Shape::Glyph { index, fringe } => {
+                        let col = x.saturating_sub(rect.x) as usize / scale;
+                        if !self.font.pixel(*index, col, row) {
+                            let Some(fringe) = fringe else {
+                                continue;
+                            };
+                            if !col
+                                .checked_sub(1)
+                                .is_some_and(|left| self.font.pixel(*index, left, row))
+                            {
+                                continue;
+                            }
+                            paint = fringe;
+                        }
+                    }
+                    Shape::Mark(rows) => {
+                        let col = x.saturating_sub(rect.x) as usize / scale;
+                        let lit = rows.get(row).is_some_and(|bits| {
+                            (hint::WIDTH - 1)
+                                .checked_sub(col)
+                                .is_some_and(|bit| bits >> bit & 1 != 0)
+                        });
+                        if !lit {
                             continue;
                         }
-                        paint = fringe;
                     }
                 }
                 let at = start + x as usize * 4;

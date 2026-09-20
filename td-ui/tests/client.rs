@@ -25,6 +25,7 @@ use td_ui::client::{
     SURFACE, SYNC, TOPLEVEL, WM, XDG_SURFACE,
 };
 use td_ui::data::{ANNOUNCEMENTS, OFFER_LIMIT, PLAIN, UTF8};
+use td_ui::keyboard::Held;
 use td_ui::pointer;
 use td_ui::wayland::{backing_file, cursor_pixels, peer, Connection, IDLE_WAIT, WRITE_DEADLINE};
 use td_ui::wire::{self, Builder, Cursor, Message};
@@ -1035,6 +1036,80 @@ fn a_keymap_crosses_the_socket_and_presses_translate_after_focus_and_the_snapsho
     p.event(message(keyboard, 1, &[15, SURFACE, 0])).unwrap();
     p.event(message(keyboard, 4, &[16, 0, 0, 0, 0])).unwrap();
     assert_eq!(p.keyboard.last(), Some(&KeyboardEvent::Ready));
+}
+
+#[test]
+fn held_roles_are_reported_once_per_change_while_the_keyboard_is_ready() {
+    let (mut p, peer, _, keyboard, _) = seat_fixture();
+    send_map(&mut p, &peer, keyboard, 1, &map_file());
+    let alt = Held {
+        alt: true,
+        ..Held::default()
+    };
+    // Before the map is ready a snapshot reports nothing.
+    p.event(message(keyboard, 4, &[1, 8, 0, 0, 0])).unwrap();
+    assert_eq!(p.keyboard.last(), Some(&KeyboardEvent::Keymap(Ok(()))));
+    p.event(message(keyboard, 1, &[2, SURFACE, 0])).unwrap();
+    // The Ready snapshot is Ready and the baseline: the same roles again
+    // are no report, a release from them is one.
+    p.event(message(keyboard, 4, &[3, 8, 0, 0, 0])).unwrap();
+    assert_eq!(p.keyboard.last(), Some(&KeyboardEvent::Ready));
+    let seen = p.keyboard.len();
+    p.event(message(keyboard, 4, &[4, 8, 0, 0, 0])).unwrap();
+    assert_eq!(p.keyboard.len(), seen);
+    p.event(message(keyboard, 4, &[4, 0, 0, 0, 0])).unwrap();
+    assert_eq!(
+        p.keyboard.last(),
+        Some(&KeyboardEvent::Held(Held::default()))
+    );
+    p.event(message(keyboard, 4, &[4, 8, 0, 0, 0])).unwrap();
+    assert_eq!(p.keyboard.last(), Some(&KeyboardEvent::Held(alt)));
+    // The same state again is no report; a change is one.
+    let seen = p.keyboard.len();
+    p.event(message(keyboard, 4, &[5, 8, 0, 0, 0])).unwrap();
+    assert_eq!(p.keyboard.len(), seen);
+    p.event(message(keyboard, 4, &[6, 12, 0, 0, 0])).unwrap();
+    assert_eq!(
+        p.keyboard.last(),
+        Some(&KeyboardEvent::Held(Held {
+            control: true,
+            ..alt
+        }))
+    );
+    // A state the map refuses holds nothing.
+    p.event(message(keyboard, 4, &[7, 64 | 8, 0, 0, 0]))
+        .unwrap();
+    assert_eq!(
+        p.keyboard.last(),
+        Some(&KeyboardEvent::Held(Held::default()))
+    );
+    p.event(message(keyboard, 4, &[8, 8, 0, 0, 0])).unwrap();
+    assert_eq!(p.keyboard.last(), Some(&KeyboardEvent::Held(alt)));
+    // Leaving clears the roles without a report: the consumer takes
+    // `Focus(false)` as its cue, and the next Ready starts from none.
+    p.event(message(keyboard, 2, &[9, SURFACE])).unwrap();
+    assert_eq!(p.keyboard.last(), Some(&KeyboardEvent::Focus(false)));
+    p.event(message(keyboard, 1, &[10, SURFACE, 0])).unwrap();
+    p.event(message(keyboard, 4, &[11, 0, 0, 0, 0])).unwrap();
+    assert_eq!(p.keyboard.last(), Some(&KeyboardEvent::Ready));
+    let seen = p.keyboard.len();
+    p.event(message(keyboard, 4, &[12, 0, 0, 0, 0])).unwrap();
+    assert_eq!(p.keyboard.len(), seen);
+    p.event(message(keyboard, 4, &[13, 8, 0, 0, 0])).unwrap();
+    assert_eq!(p.keyboard.last(), Some(&KeyboardEvent::Held(alt)));
+    // A new map clears the roles without a report, and its Ready snapshot
+    // is the baseline again: Alt held across it reports its release.
+    send_map(&mut p, &peer, keyboard, 1, &map_file());
+    p.event(message(keyboard, 4, &[14, 8, 0, 0, 0])).unwrap();
+    assert_eq!(p.keyboard.last(), Some(&KeyboardEvent::Ready));
+    let seen = p.keyboard.len();
+    p.event(message(keyboard, 4, &[15, 8, 0, 0, 0])).unwrap();
+    assert_eq!(p.keyboard.len(), seen);
+    p.event(message(keyboard, 4, &[16, 0, 0, 0, 0])).unwrap();
+    assert_eq!(
+        p.keyboard.last(),
+        Some(&KeyboardEvent::Held(Held::default()))
+    );
 }
 
 #[test]

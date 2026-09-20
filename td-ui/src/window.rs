@@ -241,7 +241,9 @@ impl<'h, H: Handler> Window<'h, H> {
             KeyboardEvent::Keymap(Err(why)) | KeyboardEvent::Refused(why) => {
                 self.handler.notice(&format!("keyboard: {why}"));
             }
-            KeyboardEvent::Keymap(Ok(())) | KeyboardEvent::Ready => {}
+            // The widget window has no hint layer yet: held roles reach a
+            // handler only under a key.
+            KeyboardEvent::Keymap(Ok(())) | KeyboardEvent::Ready | KeyboardEvent::Held(_) => {}
         }
     }
 

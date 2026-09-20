@@ -441,7 +441,7 @@ impl<'a, F: Fn(Notice) -> Result<()>> Dialog<'a, F> {
                 self.report_presented()
             }
             Handled::Keyboard(KeyboardEvent::Keymap(result)) => result,
-            Handled::Keyboard(KeyboardEvent::Refused(_)) => Ok(()),
+            Handled::Keyboard(KeyboardEvent::Refused(_) | KeyboardEvent::Held(_)) => Ok(()),
             // The private registry is fixed for the dialog's life: any global
             // in the validated set leaving is anomalous and closes it.
             Handled::GlobalRemoved { .. } => {

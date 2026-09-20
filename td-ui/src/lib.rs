@@ -2,8 +2,9 @@
 
 //! td's dependency-free UI toolkit, shared by td-owned graphical programs
 //! as a Cargo path dependency (td-editor first). It carries the
-//! display-independent input layer, the shared font and wire codecs and the
-//! clipped XRGB raster with its palette and scrollbar geometry, the Wayland
+//! display-independent input layer, the shared font, the hint face and
+//! wire codecs and the clipped XRGB raster with its palette and scrollbar
+//! geometry, the Wayland
 //! client connection over its own raw descriptor transport (UNSAFE.md §19)
 //! and the client over it (`client`: the object table, one toplevel surface
 //! with its buffers and pointer image, the seat with its devices and the
@@ -45,6 +46,7 @@ pub mod driven;
 #[path = "../../td-compositor/src/filter.rs"]
 pub mod filter;
 pub mod finder;
+pub mod hint;
 #[path = "../../td-compositor/src/font.rs"]
 pub mod font;
 #[path = "../../td-compositor/src/font_data.rs"]

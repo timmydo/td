@@ -6693,3 +6693,124 @@ fn a_press_off_the_crop_in_crop_adjust_draws_a_fresh_crop() {
     assert_eq!(drag_to(&mut c, 400, 200), Outcome::Ignored);
     assert_eq!(release(&mut c, 400, 200), (Outcome::Ignored, vec![]));
 }
+
+/// Alt held shows each button's chord under its caption: the mode and
+/// filter strips', the tool band's, the look band's (`F1` through `F9`
+/// for the first nine looks, none for `None`) and the history pane's;
+/// released, or the focus leaving, hides them again. The hints are the
+/// frame's, not `state`'s, and only Alt shows them.
+#[test]
+fn alt_held_shows_each_buttons_chord_under_its_caption() {
+    use td_ui::keyboard::Held;
+    let mut c = with_history();
+    c.set_looks(some_looks());
+    let alt = Held {
+        alt: true,
+        ..Held::default()
+    };
+    let control = Held {
+        control: true,
+        ..Held::default()
+    };
+    let plain = driven::fnv1a64(&driven::paint(&c.scene()).unwrap().rgb);
+    let marks = |c: &Controller| {
+        let mut out = Vec::new();
+        c.scene().emit(c.surface().bounds(), &mut |draw| {
+            if let Primitive::Mark { x, y, scalar, .. } = draw.primitive {
+                out.push((x, y, scalar));
+            }
+        });
+        out
+    };
+    assert!(marks(&c).is_empty());
+    assert!(!c.hints());
+    // Control alone shows nothing; Alt (with anything) does.
+    assert_eq!(c.input(Input::Held(control)).unwrap().0, Outcome::Ignored);
+    assert!(marks(&c).is_empty());
+    let before = fields(&c)[GENERATION].clone();
+    assert_eq!(c.input(Input::Held(alt)).unwrap().0, Outcome::Changed);
+    assert!(c.hints());
+    assert_ne!(fields(&c)[GENERATION], before);
+    assert_eq!(c.input(Input::Held(alt)).unwrap().0, Outcome::Ignored);
+    let hinted = driven::fnv1a64(&driven::paint(&c.scene()).unwrap().rgb);
+    assert_ne!(hinted, plain);
+    // The text read back is the captions', not the hints'.
+    let (_, _, text) = driven::text(&c.scene()).unwrap();
+    assert!(!text.contains("Backspace"), "{text}");
+    // Each hint sits on its button, under the caption: the chord of the
+    // action the button presses, in order along each band.
+    let layout = c.layout();
+    let under = |button: Option<td_ui::chrome::Button>| {
+        let rect = button.unwrap().rect();
+        let mut text: Vec<(i64, char)> = marks(&c)
+            .into_iter()
+            .filter(|(x, y, _)| rect.contains(*x, *y))
+            .map(|(x, _, scalar)| (x, scalar))
+            .collect();
+        text.sort();
+        text.into_iter()
+            .map(|(_, scalar)| scalar)
+            .collect::<String>()
+    };
+    let tools = layout.tools();
+    assert_eq!(tools.buttons.map(under), ["c", "C", "z", "0", "-", "="]);
+    let looks: Vec<String> = layout
+        .look_buttons(&some_looks())
+        .into_iter()
+        .map(under)
+        .collect();
+    assert_eq!(looks, ["", "F1", "F2", "F3"]);
+    assert_eq!(layout.history_buttons().map(under), ["t", "Backspace", "z"]);
+    // The strips' hints read in the strips' order, a row each.
+    let mut all = marks(&c);
+    all.sort();
+    let row: String = all
+        .iter()
+        .filter(|(_, y, _)| *y < 24)
+        .map(|(_, _, scalar)| *scalar)
+        .collect();
+    assert_eq!(row, "oEscaped");
+    let row: String = all
+        .iter()
+        .filter(|(_, y, _)| (24..48).contains(y))
+        .map(|(_, _, scalar)| *scalar)
+        .collect();
+    assert_eq!(row, "1234");
+    // Released, the hints go; the frame is the plain one again.
+    assert_eq!(
+        c.input(Input::Held(Held::default())).unwrap().0,
+        Outcome::Changed
+    );
+    assert!(marks(&c).is_empty());
+    assert_eq!(
+        driven::fnv1a64(&driven::paint(&c.scene()).unwrap().rgb),
+        plain
+    );
+    // The focus leaving hides them too, once.
+    assert_eq!(c.input(Input::Held(alt)).unwrap().0, Outcome::Changed);
+    assert_eq!(c.input(Input::Focus(false)).unwrap().0, Outcome::Changed);
+    assert_eq!(c.input(Input::Focus(false)).unwrap().0, Outcome::Ignored);
+    assert!(!c.hints() && marks(&c).is_empty());
+    // The chooser owns the keyboard while it is open, so no chord is
+    // shown under a button, the hints kept for when it closes.
+    assert_eq!(c.input(Input::Held(alt)).unwrap().0, Outcome::Changed);
+    let (outcome, _) = c.action("choose", &[]).unwrap();
+    assert_eq!(outcome, Outcome::Changed);
+    c.set_listing(b"/".to_vec(), listing("/", &["r"], &[]), Some("r"))
+        .unwrap();
+    assert!(c.hints() && marks(&c).is_empty());
+    assert_eq!(key(&mut c, "Escape"), Outcome::Changed);
+    assert!(c.chooser().is_none() && !marks(&c).is_empty());
+    assert_eq!(
+        c.input(Input::Held(Held::default())).unwrap().0,
+        Outcome::Changed
+    );
+    // In the cull grid the strips still hint, and the develop bands are
+    // not there to.
+    assert_eq!(act(&mut c, "grid", &[]), Outcome::Changed);
+    assert_eq!(c.input(Input::Held(alt)).unwrap().0, Outcome::Changed);
+    let mut all = marks(&c);
+    all.sort_by_key(|(x, y, _)| (*y, *x));
+    let text: String = all.iter().map(|(_, _, scalar)| *scalar).collect();
+    assert_eq!(text, "oEscaped1234");
+}

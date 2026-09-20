@@ -116,6 +116,8 @@ impl Controller for Remote<'_> {
                 Outcome::Changed
             }
             Input::Resize { .. } | Input::Tick(_) => return Err(Refusal::Unavailable),
+            // No hints to show: the roles held are nothing to it.
+            Input::Held(_) => return Ok(driven::Outcome::Ignored),
         };
         Ok(self.outcome(outcome))
     }

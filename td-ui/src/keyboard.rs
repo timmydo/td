@@ -28,6 +28,51 @@ pub struct Stroke {
     pub repeat: bool,
 }
 
+/// The modifier roles a state holds, as a chord names them: `C-` control,
+/// `M-` alt, `S-` shift, in that order, and `-` alone for none.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct Held {
+    pub control: bool,
+    pub alt: bool,
+    pub shift: bool,
+}
+
+impl Held {
+    /// The chord prefix: `C-M-S-` with the absent roles left out, `-`
+    /// for none.
+    pub fn prefix(self) -> String {
+        let mut out = String::new();
+        for (held, mark) in [(self.control, "C-"), (self.alt, "M-"), (self.shift, "S-")] {
+            if held {
+                out.push_str(mark);
+            }
+        }
+        if out.is_empty() {
+            out.push('-');
+        }
+        out
+    }
+    /// A prefix as `prefix` writes it, and nothing else.
+    pub fn parse(text: &str) -> Option<Self> {
+        if text == "-" {
+            return Some(Self::default());
+        }
+        let mut held = Self::default();
+        let mut rest = text;
+        for (mark, slot) in [
+            ("C-", &mut held.control),
+            ("M-", &mut held.alt),
+            ("S-", &mut held.shift),
+        ] {
+            if let Some(after) = rest.strip_prefix(mark) {
+                *slot = true;
+                rest = after;
+            }
+        }
+        (rest.is_empty() && held != Self::default()).then_some(held)
+    }
+}
+
 /// Event-local refusal, not a failed keymap compilation. Adapters diagnose
 /// the event without invalidating the previously compiled keyboard map.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -234,6 +279,18 @@ impl Keymap {
     pub fn pointer_extend(&self, modifiers: Modifiers) -> bool {
         self.state(modifiers)
             .is_ok_and(|state| state & self.role(Role::Shift) != 0)
+    }
+    /// The roles a modifier state holds; a state the map refuses holds
+    /// none.
+    pub fn held(&self, modifiers: Modifiers) -> Held {
+        let Ok(state) = self.state(modifiers) else {
+            return Held::default();
+        };
+        Held {
+            control: state & self.role(Role::Control) != 0,
+            alt: state & self.role(Role::Alt) != 0,
+            shift: state & self.role(Role::Shift) != 0,
+        }
     }
     /// Declared Wayland/evdev key numbers with symbols, including out-of-profile keys.
     pub fn keycodes(&self) -> impl Iterator<Item = u32> + '_ {

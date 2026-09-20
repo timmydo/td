@@ -291,6 +291,7 @@ fn the_toolkit_is_named_only_where_the_design_says() {
             "control_worker",
             "driven",
             "font",
+            "keyboard",
             "pointer",
             "raster",
             "wayland",

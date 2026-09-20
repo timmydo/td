@@ -807,6 +807,8 @@ impl Window {
                 self.activation_serial = None;
             }
             KeyboardEvent::Refused(detail) => self.notify(detail),
+            // The editor shows no hints; held roles matter only under a key.
+            KeyboardEvent::Held(_) => {}
         }
         Ok(())
     }

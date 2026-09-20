@@ -20,6 +20,7 @@ use td_ui::control::{self, frame, hex, ErrorCode};
 use td_ui::control_socket::Socket;
 use td_ui::control_worker::{Job, Worker};
 use td_ui::driven::{self, Binding, Controller, Input, Outcome, Payload, PointerPhase};
+use td_ui::keyboard::Held;
 use td_ui::raster::{
     Composition, Draw, GlyphStyle, Primitive, Rect, Scale, Surface, Weight, INK, PAPER,
 };
@@ -80,6 +81,7 @@ const BINDINGS: &[Binding] = &[
 
 struct Counter {
     count: i64,
+    held: Held,
     focused: bool,
     surface: Surface,
     pointer: Option<(u32, u32)>,
@@ -92,6 +94,7 @@ impl Counter {
     fn new() -> Self {
         Self {
             count: 0,
+            held: Held::default(),
             focused: false,
             surface: Surface::new(160, 48, Scale::new(1).unwrap()).unwrap(),
             pointer: None,
@@ -135,6 +138,17 @@ impl Composition for Counter {
             },
         });
         self.glyphs(damage, 0, 0, &format!("count={}", self.count), sink);
+        // A mark is a hint's pixel, not text: `text` reads through it to
+        // the count's first cell.
+        sink(Draw {
+            clip: damage,
+            primitive: Primitive::Mark {
+                x: 0,
+                y: 0,
+                scalar: 'M',
+                ink: PAPER,
+            },
+        });
         // A glyph whose clip excludes it entirely is not shown, so `text`
         // must not report it.
         let hidden = Rect {
@@ -198,6 +212,10 @@ impl Controller for Counter {
                 Some(binding) => self.action(binding.name, &[]),
                 None => Ok(Outcome::Ignored),
             },
+            Input::Held(held) => {
+                self.held = held;
+                Ok(Outcome::Changed)
+            }
             Input::Pointer {
                 phase: PointerPhase::Press,
                 x,
@@ -434,6 +452,33 @@ fn every_generic_verb_routes_through_the_controller_and_refuses_in_the_envelope(
         refusal(28, "protocol")
     );
     assert_eq!(ask(&mut c, "1\t29\tfocus\t1"), "1\t29\tok\tchanged");
+    // The held roles as a chord prefix, in the prefix's own order only.
+    assert_eq!(ask(&mut c, "1\t29\theld\tM-"), "1\t29\tok\tchanged");
+    assert_eq!(
+        c.held,
+        Held {
+            alt: true,
+            ..Held::default()
+        }
+    );
+    assert_eq!(ask(&mut c, "1\t29\theld\tC-M-S-"), "1\t29\tok\tchanged");
+    assert_eq!(
+        c.held,
+        Held {
+            control: true,
+            alt: true,
+            shift: true
+        }
+    );
+    assert_eq!(ask(&mut c, "1\t29\theld\t-"), "1\t29\tok\tchanged");
+    assert_eq!(c.held, Held::default());
+    for bad in ["M-C-", "M", "", "C--", "X-"] {
+        assert_eq!(
+            ask(&mut c, &format!("1\t29\theld\t{bad}")),
+            refusal(29, "protocol"),
+            "{bad}"
+        );
+    }
     assert_eq!(ask(&mut c, "1\t30\tfocus\t2"), refusal(30, "protocol"));
     assert_eq!(ask(&mut c, "1\t31\ttick\t500"), "1\t31\tok\tignored");
     assert_eq!(
@@ -450,6 +495,8 @@ fn every_generic_verb_routes_through_the_controller_and_refuses_in_the_envelope(
     for bad in [
         "actions\t1",
         "key",
+        "held",
+        "held\tM-\t1",
         "pointer\tpress\t1",
         "wheel\t1",
         "resize\t320\t96",

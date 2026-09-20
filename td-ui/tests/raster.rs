@@ -12,8 +12,8 @@
 
 use td_ui::font::{self, Font};
 use td_ui::raster::{
-    text_run, Composition, Draw, Error, GlyphStyle, Primitive, Raster, Rect, Scale, Scrollbar,
-    Surface, Weight, INK, PAPER,
+    hint_run, text_run, Composition, Draw, Error, GlyphStyle, Primitive, Raster, Rect, Scale,
+    Scrollbar, Surface, Weight, INK, PAPER,
 };
 
 fn surface(width: usize, height: usize, scale: u8) -> Surface {
@@ -394,6 +394,156 @@ fn text_runs_fill_whole_cells_inside_bounds_and_damage() {
                 vec![]
             }
         );
+    }
+}
+
+/// A hint run lays as many marks as fit whole from its origin to the
+/// bounds' right, `ADVANCE` apart, the last needing no space after it,
+/// each a `Mark` in the ink; nothing outside the damage or past the
+/// right edge, and no wrap at the far end of the coordinate space. The
+/// marks paint the face's rows at the scale, bit 3 the leftmost column,
+/// and nothing where a row is unlit.
+#[test]
+fn hint_runs_fit_whole_marks_and_paint_the_face_at_the_scale() {
+    use td_ui::hint::{self, ADVANCE, WIDTH};
+    let damage = Rect {
+        x: 0,
+        y: 0,
+        width: 200,
+        height: 200,
+    };
+    for scale in 1..=4u8 {
+        let s = scale as i64;
+        let scale = Scale::new(scale).unwrap();
+        let count = |width: u32| {
+            let mut out = Vec::new();
+            let bounds = Rect {
+                x: 10,
+                y: 0,
+                width,
+                height: 40,
+            };
+            hint_run(
+                scale,
+                "F12".chars(),
+                (10, 5),
+                bounds,
+                INK,
+                damage,
+                &mut |draw| {
+                    let Primitive::Mark { x, y, scalar, ink } = draw.primitive else {
+                        panic!("a hint run is marks");
+                    };
+                    assert_eq!((draw.clip, y, ink), (bounds, 5, INK));
+                    out.push((x, scalar));
+                },
+            );
+            out
+        };
+        // Exactly the text's width holds it all; a pixel less loses the
+        // last mark; one mark's width holds one.
+        let full = count((hint::width("F12") * scale.value()) as u32);
+        assert_eq!(
+            full,
+            vec![
+                (10, 'F'),
+                (10 + ADVANCE as i64 * s, '1'),
+                (10 + 2 * ADVANCE as i64 * s, '2')
+            ]
+        );
+        assert_eq!(
+            count((hint::width("F12") * scale.value()) as u32 - 1).len(),
+            2
+        );
+        assert_eq!(count((WIDTH * scale.value()) as u32).len(), 1);
+        assert_eq!(count((WIDTH * scale.value()) as u32 - 1).len(), 0);
+        let far = Rect {
+            x: 500,
+            y: 500,
+            width: 1,
+            height: 1,
+        };
+        let mut n = 0;
+        let bounds = Rect {
+            x: 0,
+            y: 0,
+            width: 100,
+            height: 100,
+        };
+        hint_run(scale, "x".chars(), (10, 5), bounds, INK, far, &mut |_| {
+            n += 1
+        });
+        hint_run(
+            scale,
+            "x".chars(),
+            (100, 5),
+            bounds,
+            INK,
+            damage,
+            &mut |_| n += 1,
+        );
+        assert_eq!(n, 0);
+        let edge = Rect {
+            x: i64::MAX - 4,
+            y: 0,
+            width: u32::MAX,
+            height: 16,
+        };
+        let mut origins = Vec::new();
+        hint_run(
+            scale,
+            "abc".chars(),
+            (i64::MAX - 4, 0),
+            edge,
+            INK,
+            edge,
+            &mut |draw| {
+                if let Primitive::Mark { x, .. } = draw.primitive {
+                    origins.push(x);
+                }
+            },
+        );
+        assert_eq!(
+            origins,
+            if scale.value() == 1 {
+                vec![i64::MAX - 4]
+            } else {
+                vec![]
+            }
+        );
+        // The pixels of a mark: '1' is `.#..` over `##..`, `.#..`, `.#..`,
+        // `###.`; the unlit cells keep what was under them.
+        let surface = surface(32, 32, scale.value() as u8);
+        let font = font::pinned().unwrap();
+        let mut pixels = vec![0x11; 32 * 32 * 4 * scale.value() * scale.value()];
+        let mut raster = Raster::new(&mut pixels, &font, surface, surface.width * 4).unwrap();
+        raster.draw(Draw {
+            clip: surface.bounds(),
+            primitive: Primitive::Mark {
+                x: 3,
+                y: 2,
+                scalar: '1',
+                ink: INK,
+            },
+        });
+        let pixel = |x: i64, y: i64| {
+            let offset = (y as usize * surface.width + x as usize) * 4;
+            u32::from_le_bytes([
+                pixels[offset],
+                pixels[offset + 1],
+                pixels[offset + 2],
+                pixels[offset + 3],
+            ]) & 0xffffff
+        };
+        assert_eq!(pixel(3, 2), 0x111111);
+        assert_eq!(pixel(3 + s, 2), INK);
+        assert_eq!(pixel(3 + 2 * s - 1, 2 + s - 1), INK);
+        assert_eq!(pixel(3 + 2 * s, 2), 0x111111);
+        assert_eq!(pixel(3, 2 + s), INK);
+        assert_eq!(pixel(3, 2 + 4 * s), INK);
+        assert_eq!(pixel(3 + 2 * s, 2 + 4 * s), INK);
+        assert_eq!(pixel(3 + 3 * s, 2 + 4 * s), 0x111111);
+        assert_eq!(pixel(3, 2 + 5 * s), 0x111111);
     }
 }
 

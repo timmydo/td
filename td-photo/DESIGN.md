@@ -423,8 +423,9 @@ window, all speaking the toolkit's one vocabulary.
   args...`, answered by `1 ID ok ...` or `1 ID error CODE HEX`. The same
   controller runs and the frame is painted through the toolkit's raster into
   memory. The vocabulary is the seam's: `state`, `actions`, `action NAME
-  ARGS...` for every action by its table name, `key HEX_CHORD`, `pointer PHASE X
-  Y`, `wheel ROWS COLUMNS`, `resize W H SCALE`, `focus`, `tick`, `text` (the
+  ARGS...` for every action by its table name, `key HEX_CHORD`, `held PREFIX`,
+  `pointer PHASE X Y`, `wheel ROWS COLUMNS`, `resize W H SCALE`, `focus`,
+  `tick`, `text` (the
   scene read back as a cell grid), `frame` (the frame's size and digest) and
   `frame-page` (its pixels in pages); and td-photo's own `photo N` (the Nth
   shown photo's name in hex, flag, exposure, crop, look, sidecar state and, for
@@ -1158,6 +1159,22 @@ thumbnail is not held is a neutral placeholder, which is what `frame` digests
 either way; the develop box holds the developed preview once it is made, and the
 cull single view's box stays a placeholder.
 
+While Alt is held every button shows its chord under its caption in
+td-ui's hint face (`Buttons::emit_hinted`, `Button::emit_hinted`): the
+mode strip's `o`, `Escape` and `d`, the filter strip's `1` through `4`,
+the tool band's `c`, `C`, `z`, `0`, `-` and `=`, the look band's `F1`
+through `F9` under the first nine looks (`None` has none, and a tenth
+look none), and the pane's `t`, `Backspace` and `z`; each is the chord
+of the action the button presses, read from `BINDINGS`, so the two
+cannot drift. The hints are shown from the keyboard's `Held` report
+(`Input::Held`, Alt with anything) until the roles change, the focus
+leaves (`Input::Focus(false)`) or a new keymap arrives (the window hands
+the model no roles held, the keyboard's baseline); while the roll
+chooser is open no chord is shown, since it owns the keyboard and a
+chord would not do what the button does. `Controller::hints` is the
+fact, a change a new generation, absent from `state` (the `held` verb
+drives it, the frame witnesses it).
+
 `td-photo open [ROLL] [--control-socket PATH]` runs the window (`window`), a
 `td_ui::client::App` in the shape td-setup's is, and one adapter over the same
 `Session` the replay drives (see Driving). A bare `td-photo` is `open` with no
@@ -1167,7 +1184,8 @@ resolved, the display path or the inherited `WAYLAND_SOCKET` descriptor, or
 why no endpoint could be made, and points at `--help`. The adapter: `event`
 maps the compositor's
 configure to a resize, a key to its chord (a held move or page repeats through
-the toolkit's repeat; a flag, a filter, a view or quit fires once), a left
+the toolkit's repeat; a flag, a filter, a view or quit fires once), a
+modifier change with no key under it to `Input::Held` (the hints), a left
 button's press, motion and release to the pointer path (the crop drag reads
 the motion and release, not the press alone) and the wheel's frames to
 `scroll`, and `end_turn` takes the pool's results, asks for the thumbnails the
@@ -1488,6 +1506,11 @@ palette withheld under it and back when it closes); reads the scene back
 as text (the strips with their buttons in place under every filter, the names
 and badges by row, the status line, the single view, the empty and filtered-out
 messages, a scale of 2) and holds its frame digest to equality and to change;
+shows the chords under the buttons while Alt is held (each band's in its
+order, the look band's `F1`..`F3` after `None`, marks the text read-back
+passes over, the frame changed and the plain one back on release or focus
+loss, Control alone showing none, none under the open chooser, the
+strips' in the cull grid too);
 and runs the built binary's `--replay` over a temporary roll through the seam's
 verbs, writing a pick through the sidecar, refusing to flag a refused one,
 keeping an edit made meanwhile and refusing a sidecar that became malformed,
