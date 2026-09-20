@@ -127,21 +127,32 @@ fn source_inventory_and_allowances_are_closed() {
         // compose `td_ui::raster`, the scene and menu also `td_ui::chrome`;
         // `control`, whose requests ride the toolkit's framing and envelope
         // and specialise its worker; `replay`, on the toolkit's frame runner;
-        // and `main`, which prints `td_ui::notices`.
+        // `main`, which prints `td_ui::notices`; and `transfer`, which
+        // re-exports the toolkit's clipboard writer beside its own
+        // receiver.
         assert!(
             identifier_count(&text, "td_ui") == 0
                 || matches!(
                     name.as_str(),
-                    "wayland.rs" | "layout.rs" | "lib.rs" | "render.rs" | "ui.rs" | "menu.rs"
-                        | "main.rs" | "control.rs" | "replay.rs"
+                    "wayland.rs"
+                        | "layout.rs"
+                        | "lib.rs"
+                        | "render.rs"
+                        | "ui.rs"
+                        | "menu.rs"
+                        | "main.rs"
+                        | "control.rs"
+                        | "replay.rs"
+                        | "transfer.rs"
                 ),
             "toolkit access outside its roster: {name}"
         );
         // Naming the toolkit is one thing; re-exporting it is the crate
-        // root's (font, wire), `layout`'s (the cell constants) and
+        // root's (font, wire), `layout`'s (the cell constants),
         // `control`'s (the framing and codecs its tests and replay share,
-        // public and crate-private) alone, so every other file names
-        // `td_ui::` paths directly.
+        // public and crate-private) and `transfer`'s (the clipboard
+        // writer) alone, so every other file names `td_ui::` paths
+        // directly.
         let compact: String = text.chars().filter(|c| !c.is_whitespace()).collect();
         assert_eq!(
             compact.matches("pubusetd_ui").count() + compact.matches(")usetd_ui").count(),
@@ -149,6 +160,7 @@ fn source_inventory_and_allowances_are_closed() {
                 "lib.rs" => 2,
                 "layout.rs" => 1,
                 "control.rs" => 2,
+                "transfer.rs" => 1,
                 _ => 0,
             },
             "toolkit re-export in {name}"
@@ -189,7 +201,6 @@ fn source_inventory_and_allowances_are_closed() {
             match name.as_str() {
                 "lib.rs" => 1,
                 "files.rs" => 2,
-                "transfer.rs" => 2,
                 _ => 0,
             },
             "unrostered raw-module access in {name}"
@@ -205,11 +216,10 @@ fn complete_raw_layer_and_production_callers_are_pinned() {
         (h ^ u64::from(b)).wrapping_mul(0x100000001b3)
     });
     assert_eq!(
-        hash, 0x2ff5fc90a0b399e4,
+        hash, 0x1963649271b03139,
         "review the complete raw layer before updating its fingerprint"
     );
     for pin in [
-        "const SYS_FCNTL: usize = 72;",
         "const SYS_FLISTXATTR: usize = 196;",
         "const SYS_RENAMEAT2: usize = 316;",
         "const RENAME_NOREPLACE: usize = 1;",
@@ -217,32 +227,30 @@ fn complete_raw_layer_and_production_callers_are_pinned() {
         "in(\"r8\") a5,",
         "syscall5(number, a1, a2, a3, 0, 0)",
         "syscall3(SYS_FLISTXATTR, file.as_raw_fd() as usize, 0, 0)",
-        "const F_GETFL: usize = 3;",
-        "const F_SETFL: usize = 4;",
-        "const O_NONBLOCK: usize = 0o4000;",
-        "const O_ACCMODE: usize = 3;",
         "#[allow(unsafe_code)]\nfn syscall5(",
     ] {
         assert!(raw.contains(pin), "{pin}");
+    }
+    // The clipboard destination's status commands went to td-ui with the
+    // writer (UNSAFE.md §19): no fcntl, no descriptor owner here.
+    for gone in ["SYS_FCNTL", "F_GETFL", "F_SETFL", "O_NONBLOCK", "Destination"] {
+        assert!(!raw.contains(gone), "{gone} is td-ui's");
     }
     assert!(!raw.contains("#![allow("));
     assert_eq!(raw.matches("core::arch::asm!").count(), 1);
     assert_eq!(raw.matches("from_raw_fd").count(), 0, "no adoption");
     assert_eq!(raw.matches("#[allow(unsafe_code)]").count(), 1);
+    // The transfer module keeps the receiver and re-exports the toolkit's
+    // writer; it names no raw module and adopts no descriptor.
     let transfer = include_str!("../src/transfer.rs");
-    assert_eq!(transfer.matches("crate::sys::").count(), 2);
+    assert_eq!(transfer.matches("crate::sys::").count(), 0);
     assert_eq!(
         transfer
-            .matches("crate::sys::Destination::new(fd)?")
+            .matches("pub use td_ui::clipboard::Outgoing;")
             .count(),
         1
     );
-    assert_eq!(
-        transfer
-            .matches("destination: crate::sys::Destination,")
-            .count(),
-        1
-    );
+    assert!(!transfer.contains("from_raw_fd") && !transfer.contains("as_raw_fd"));
     let files = include_str!("../src/files.rs");
     assert_eq!(files.matches("crate::sys::has_attributes(file)").count(), 1);
     assert!(files.contains("copy_mode_with(location, requested, require_no_attributes)"));

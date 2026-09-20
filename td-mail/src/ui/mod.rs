@@ -25,7 +25,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use td_editor::ui::Outcome;
 use td_ui::raster::{Raster, Surface};
-use td_ui::window::{Flow, Handler, Input, PointerPhase};
+use td_ui::window::{Clipboard, Flow, Handler, Input, PointerPhase};
 use views::compose::ComposeView;
 use views::mailbox_list::MailboxListView;
 use views::{Body, Scroll, ViewAction, ViewStack};
@@ -669,8 +669,10 @@ impl Handler for Session {
         "td-mail"
     }
 
-    fn input(&mut self, input: Input<'_>) -> Flow {
+    fn input(&mut self, input: Input<'_>, _clipboard: &mut dyn Clipboard) -> Flow {
         match input {
+            // The clipboard is the next increment's.
+            Input::Paste(_) => {}
             Input::Close => {
                 if self.close_requested() == Flow::Quit {
                     return Flow::Quit;
@@ -874,7 +876,7 @@ mod frame_tests {
     use super::*;
     use crate::config::PasswordSource;
     use crate::jmap::types::Mailbox;
-    use td_ui::window::PointerPhase;
+    use td_ui::window::{NoClipboard, PointerPhase};
 
     fn account() -> AccountConfig {
         AccountConfig {
@@ -970,17 +972,20 @@ mod frame_tests {
             chord,
             repeat: false,
         };
-        session.input(input);
+        session.input(input, &mut NoClipboard);
     }
 
     fn press(session: &mut Session, x: i64, y: i64) {
         for phase in [PointerPhase::Press, PointerPhase::Release] {
-            session.input(Input::Pointer {
-                phase,
-                x,
-                y,
-                extend: false,
-            });
+            session.input(
+                Input::Pointer {
+                    phase,
+                    x,
+                    y,
+                    extend: false,
+                },
+                &mut NoClipboard,
+            );
         }
     }
 
@@ -1136,10 +1141,13 @@ mod frame_tests {
         assert_eq!(session.stack.depth(), 1);
         // The wheel: two rows down from the first, then Return opens the
         // third; the page keys move by the rows the list shows.
-        session.input(Input::Wheel {
-            rows: 2,
-            columns: 0,
-        });
+        session.input(
+            Input::Wheel {
+                rows: 2,
+                columns: 0,
+            },
+            &mut NoClipboard,
+        );
         key(&mut session, "Return");
         session.shown();
         assert!(
@@ -1148,10 +1156,13 @@ mod frame_tests {
             session.title()
         );
         key(&mut session, "q");
-        session.input(Input::Wheel {
-            rows: -isize::MAX,
-            columns: 0,
-        });
+        session.input(
+            Input::Wheel {
+                rows: -isize::MAX,
+                columns: 0,
+            },
+            &mut NoClipboard,
+        );
         key(&mut session, "Return");
         session.shown();
         assert!(session.title().starts_with("INBOX"), "{}", session.title());
@@ -1163,10 +1174,13 @@ mod frame_tests {
         press(&mut session, 10, row(2).y + 3);
         session.poll(0);
         assert_eq!(session.stack.depth(), 1);
-        session.input(Input::Wheel {
-            rows: 2,
-            columns: 0,
-        });
+        session.input(
+            Input::Wheel {
+                rows: 2,
+                columns: 0,
+            },
+            &mut NoClipboard,
+        );
         key(&mut session, "Return");
         session.shown();
         assert!(session.title().starts_with("INBOX"), "{}", session.title());
@@ -1195,10 +1209,13 @@ mod frame_tests {
         let page = session.page();
         assert!(page > 1, "{page}");
         assert_eq!(session.pane.first_row(), Some(0));
-        session.input(Input::Wheel {
-            rows: 3,
-            columns: 0,
-        });
+        session.input(
+            Input::Wheel {
+                rows: 3,
+                columns: 0,
+            },
+            &mut NoClipboard,
+        );
         assert_eq!(session.pane.first_row(), Some(3));
         key(&mut session, "PageDown");
         assert_eq!(session.pane.first_row(), Some(3 + page));
@@ -1417,17 +1434,26 @@ mod frame_tests {
         key(&mut session, "Escape");
         // The window's close with the draft unsaved asks; Escape keeps
         // the window and the draft; a save closes it, the file written.
-        assert_eq!(session.input(Input::Close), Flow::Continue);
+        assert_eq!(
+            session.input(Input::Close, &mut NoClipboard),
+            Flow::Continue
+        );
         assert!(session.title.starts_with("Save "), "{}", session.title);
         key(&mut session, "Escape");
         assert!(session.title.starts_with("Draft "), "{}", session.title);
         assert!(!session.closing && !session.quitting);
-        assert_eq!(session.input(Input::Close), Flow::Continue);
         assert_eq!(
-            session.input(Input::Key {
-                chord: "y",
-                repeat: false
-            }),
+            session.input(Input::Close, &mut NoClipboard),
+            Flow::Continue
+        );
+        assert_eq!(
+            session.input(
+                Input::Key {
+                    chord: "y",
+                    repeat: false
+                },
+                &mut NoClipboard
+            ),
             Flow::Quit
         );
         assert!(std::fs::read_to_string(&fifth)
@@ -1437,9 +1463,10 @@ mod frame_tests {
         // the view's own, and a save writes it, not the text under it.
         let (mut small, _cmd_rx, _resp_tx) = self::session(true);
         key(&mut small, "?");
-        small.input(Input::Resize(
-            Surface::new(800, 40, Default::default()).unwrap(),
-        ));
+        small.input(
+            Input::Resize(Surface::new(800, 40, Default::default()).unwrap()),
+            &mut NoClipboard,
+        );
         assert!(small.shape().unwrap().layout.pane.is_none());
         key(&mut small, "q");
         key(&mut small, "c");
@@ -1453,7 +1480,7 @@ mod frame_tests {
             format!("w{template}")
         );
         // A clean draft lets the window close at once.
-        assert_eq!(small.input(Input::Close), Flow::Quit);
+        assert_eq!(small.input(Input::Close, &mut NoClipboard), Flow::Quit);
         let _ = std::fs::remove_dir_all(&draft_dir);
         let _ = std::fs::remove_dir_all(&small_dir);
     }

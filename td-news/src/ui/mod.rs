@@ -480,7 +480,8 @@ impl App {
                 }
             }
             Input::Wheel { rows, .. } if self.mouse_config => self.wheel(rows),
-            Input::Pointer { .. } | Input::Wheel { .. } => {}
+            // The clipboard is the next increment's.
+            Input::Pointer { .. } | Input::Wheel { .. } | Input::Paste(_) => {}
         }
         self.quitting
     }

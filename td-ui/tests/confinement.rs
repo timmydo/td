@@ -58,6 +58,7 @@ fn source_inventory_and_shared_mounts_are_closed() {
         .chain(
             [
                 "client.rs",
+                "clipboard.rs",
                 "control_socket.rs",
                 "control_worker.rs",
                 "lib.rs",
@@ -96,9 +97,10 @@ fn source_inventory_and_shared_mounts_are_closed() {
             },
             "unsafe keyword in {name}"
         );
-        // The raw module is named by the crate root's private declaration
-        // and by the transport's two imports and four wrapper calls; no
-        // other module, shared source or test-support reader reaches it.
+        // The raw module is named by the crate root's private declaration,
+        // by the transport's two imports and four wrapper calls and by the
+        // clipboard's import and five status calls; no other module,
+        // shared source or test-support reader reaches it.
         // The socket's pinned procfs pathname has a `sys` segment that is
         // not raw-module access.
         let raw_text = if name == "control_socket.rs" {
@@ -113,6 +115,7 @@ fn source_inventory_and_shared_mounts_are_closed() {
             match name.as_str() {
                 "lib.rs" => 1,
                 "wayland.rs" => 6,
+                "clipboard.rs" => 6,
                 _ => 0,
             },
             "raw-module access in {name}"
@@ -288,7 +291,7 @@ fn complete_raw_layer_and_its_sole_caller_are_pinned() {
         (h ^ u64::from(b)).wrapping_mul(0x100000001b3)
     });
     assert_eq!(
-        hash, 0xf41fcb5886e6e922,
+        hash, 0x614c3ddedf2ca24d,
         "review the complete raw layer before updating its fingerprint"
     );
     for pin in [
@@ -296,6 +299,8 @@ fn complete_raw_layer_and_its_sole_caller_are_pinned() {
         "const SYS_RECVMSG: usize = 47;",
         "const SYS_FCNTL: usize = 72;",
         "const F_DUPFD_CLOEXEC: usize = 1030;",
+        "const F_GETFL: usize = 3;",
+        "const F_SETFL: usize = 4;",
         "const SOL_SOCKET: i32 = 1;",
         "const SCM_RIGHTS: i32 = 1;",
         "const MSG_CTRUNC: i32 = 8;",
@@ -307,6 +312,10 @@ fn complete_raw_layer_and_its_sole_caller_are_pinned() {
         "in(\"r8\") a5,",
         "syscall5(number, a1, a2, a3, 0, 0)",
         "syscall3(SYS_FCNTL, fd as usize, F_DUPFD_CLOEXEC, 3)",
+        "syscall3(SYS_FCNTL, file.as_raw_fd() as usize, F_GETFL, 0)",
+        "result(syscall3(\n        SYS_FCNTL,\n        file.as_raw_fd() as usize,\n        F_SETFL,\n        flags,\n    ))",
+        "pub(crate) fn status(file: &File) -> io::Result<usize>",
+        "pub(crate) fn set_status(file: &File, flags: usize) -> io::Result<()>",
         "#[allow(unsafe_code)]\nfn syscall5(",
         "#[allow(unsafe_code)]\nfn adopt(",
         "pub(crate) fn inherited(fd: i32) -> io::Result<UnixStream>",
@@ -322,7 +331,45 @@ fn complete_raw_layer_and_its_sole_caller_are_pinned() {
     assert!(!production.contains("pub fn"), "nothing raw is public");
     assert!(!production.contains("pub struct"));
     assert!(!production.contains("pub(crate) struct"));
-    // The transport is the only caller, through exactly these wrappers.
+    // The transport and the clipboard's destination owner are the only
+    // callers, through exactly these wrappers and these call sites: the
+    // owner's whole implementation, its doc comment through its drop, is
+    // fingerprinted, and every status call in the module is one of the
+    // owner's five, at the site and in the form pinned here.
+    let clipboard = include_str!("../src/clipboard.rs");
+    let clipboard = clipboard.split("#[cfg(test)]").next().unwrap();
+    let owner = clipboard
+        .split("/// The received write endpoint")
+        .nth(1)
+        .and_then(|rest| rest.split("/// An immutable UTF-8 text").next())
+        .unwrap();
+    let hash = owner.bytes().fold(0xcbf29ce484222325u64, |h, b| {
+        (h ^ u64::from(b)).wrapping_mul(0x100000001b3)
+    });
+    assert_eq!(
+        hash, 0xe1cbd12dd735cac3,
+        "review the whole destination owner before updating its fingerprint"
+    );
+    assert_eq!(clipboard.matches("sys::").count(), 5);
+    assert_eq!(owner.matches("sys::").count(), 5);
+    assert_eq!(clipboard.matches("use crate::sys;").count(), 1);
+    for site in [
+        "let original = sys::status(&file)?;",
+        "sys::set_status(file, original | O_NONBLOCK)?;",
+        "if sys::status(file)? != original | O_NONBLOCK {",
+        "sys::set_status(&file, self.original)?;",
+        "if sys::status(&file)? != self.original {",
+    ] {
+        assert_eq!(owner.matches(site).count(), 1, "{site}");
+    }
+    assert_eq!(clipboard.matches("Destination::new(fd)?").count(), 1);
+    assert_eq!(clipboard.matches("struct Destination {").count(), 1);
+    assert_eq!(owner.matches("impl Drop for Destination {").count(), 1);
+    assert!(!clipboard.contains("pub struct Destination"));
+    assert!(!clipboard.contains("from_raw_fd") && !clipboard.contains("as_raw_fd"));
+    assert!(owner.contains("if !kind.is_fifo() && !kind.is_socket() {"));
+    assert!(clipboard.contains("const O_NONBLOCK: usize = 0o4000;"));
+    assert!(clipboard.contains("const O_ACCMODE: usize = 3;"));
     // The client is the toolkit's one consumer of a received right, through
     // two pops: the keymap reader's, exactly one per `wl_keyboard.keymap`,
     // reading a regular file positionally and compiling it whole, and the

@@ -2036,10 +2036,11 @@ lookup is involved.
 
 The descriptor transport (sendmsg, recvmsg and F_DUPFD_CLOEXEC, one syscall
 site and one owned-descriptor adoption site) is td-ui's, recorded as
-`UNSAFE.md` §19; the editor's own surface, §14, is the file adapter's
-size-only flistxattr query and renameat2 and the clipboard destination's
-fcntl status commands, through one syscall site that adopts no descriptor
-and changes no transport authorization. Endpoint resolution, the borrowed
+`UNSAFE.md` §19, as are the clipboard destination's fcntl status
+commands, moved there with the outgoing writer; the editor's own surface,
+§14, is the file adapter's size-only flistxattr query and renameat2,
+through one syscall site that adopts no descriptor and changes no
+transport authorization. Endpoint resolution, the borrowed
 `WAYLAND_SOCKET` and the bounded FIFO that owns every incoming descriptor
 are td-ui's `endpoint`, `connect` and `Connection`, under the rules
 `td-ui/DESIGN.md` records; the adapter passes the three environment values
@@ -2321,8 +2322,11 @@ This pure layer introduces no replay command or raw consumer.
 
 ### Implemented clipboard transport prerequisite
 
-The public `transfer` module owns bounded descriptor I/O independently of
-the window loop. The native adapter below binds Wayland data-device objects,
+The public `transfer` module owns the bounded paste receiver
+independently of the window loop and re-exports the toolkit's writer,
+`td_ui::clipboard::Outgoing`, whose contract `td-ui/DESIGN.md` records;
+the paragraphs on the writer below describe that contract as the editor
+relies on it. The native adapter below binds Wayland data-device objects,
 received rights and selection ownership to these transport primitives.
 
 `Incoming::begin` captures Paste intent and creates a private UnixStream
@@ -2341,10 +2345,11 @@ cancels and closes without editing. Final admission remains mandatory even
 after EOF; this helper is not authority to bypass the controller.
 
 `Outgoing::begin` retains an immutable Arc<str> of at most 1 MiB and owns
-exactly the supplied descriptor. The private raw Destination wrapper
-requires a writable pipe/socket, adds O_NONBLOCK to its existing status
-word and verifies readback before writing. Regular files, devices and
-read-only pipes are refused, never reopened through procfs. Each step
+exactly the supplied descriptor. The toolkit's private destination
+owner, in its `clipboard` module over its raw module's two status
+wrappers, requires a writable pipe/socket, adds O_NONBLOCK to its existing
+status word and verifies readback before writing. Regular files, devices
+and read-only pipes are refused, never reopened through procfs. Each step
 makes at most four writes of at most 16 KiB each. Completion and explicit
 Cancel restore the exact original status word with readback before std
 closes the descriptor; errors are reported. Drop attempts restoration but
@@ -2368,12 +2373,15 @@ object-lifetime and simultaneous-transfer admission rules.
 It must also prove interoperability with real toolkit sources: this endpoint
 is a socket, so a producer requiring a FIFO specifically is not supported.
 
-The raw amendment is limited to fcntl F_GETFL=3 and F_SETFL=4 in surface 14;
-there is no additional syscall, descriptor adoption site, worker or dependency.
-Confinement pins the complete raw source, constants and sole Destination
-consumer. Real pipe/socket tests cover byte-fragmented input, EOF-only
-admission, 1 MiB round trips, per-step work, deadlines, cancellation, broken
-pipes, non-endpoint refusal and restoration through shared descriptor aliases.
+The fcntl F_GETFL=3 and F_SETFL=4 commands are td-ui's surface 19,
+moved there from surface 14 with the writer; the editor has no
+additional syscall, descriptor adoption site, worker or dependency.
+Confinement pins the complete raw source and constants, that the
+transfer module names no raw module, and the re-export. The editor's
+real socket tests cover byte-fragmented input, EOF-only admission, 1 MiB
+round trips and per-step work through the receiver; the writer's own
+(deadlines, cancellation, broken pipes, non-endpoint refusal and
+restoration through shared descriptor aliases) are td-ui's.
 
 ### Implemented experimental native clipboard
 

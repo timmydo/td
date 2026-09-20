@@ -102,6 +102,16 @@ close request. td-news and td-mail have moved onto it, with their lists
 and td-editor's pane (APPLICATIONS.md §W.8, "Reworked again"), and the
 cell screen and its window are deleted (increment 13).
 
+Moved and newly built (increment 16): the clipboard's transfer owners
+under `clipboard`, td-editor's `Outgoing` moved here with the destination
+owner that makes the send's right nonblocking through the raw module's
+two pinned `fcntl` status commands, and a bounded `Incoming` that reads
+the selection's text whole; and the widget window's clipboard, a
+`Clipboard` handed to the handler with every input, through which it
+offers text as the selection at the press it is answering and asks the
+selection for its text, which the window delivers as `Input::Paste`. The
+editor's window keeps its own clipboard half over the moved writer.
+
 ## Purpose and trust position
 
 td-ui is target-zone source: it ships only inside the programs that embed
@@ -334,13 +344,31 @@ of its own files may name each module.
   `Payload`, the worker's request type for a driven consumer; `text`,
   the read-back of a composition's draw stream; `paint` and the `Frame`
   it returns with its `ppm`; and `fnv1a64`, the frame digest.
+- `clipboard`: `MAX_BYTES`, the text ceiling either way; `Outgoing`
+  (`begin` over the send's right, `step`, `expired`, `cancel`), the
+  bounded nonblocking writer of an offered text, which owns the right's
+  status flags for the transfer and restores them; and `Incoming`
+  (`begin`, `step`, `expired`, `finish`), the bounded reader of the
+  selection's text over a private socket pair, handing it on whole at
+  EOF as UTF-8. Both take the caller's clock in milliseconds, keep a
+  five-second deadline from `begin` and make at most four 16 KiB
+  attempts a step; a failure is terminal. They are transport owners
+  over the raw module's pinned `fcntl` status commands (`UNSAFE.md`
+  §19), not clipboard ownership, which is the client's.
 - `window`: `DEFAULT_WIDTH` and `DEFAULT_HEIGHT`; `Flow`;
   `PointerPhase`, the driven seam's, re-exported; `Input<'a>`, the
-  vocabulary a widget program reads; the `Handler` trait (`app_id`,
-  `title`, `input`, `poll`, `wait_ms`, `needs_redraw`, `paint`,
-  `notice`); `Object`, the empty tag; `Window<'h, H>` (`new`, `handler`,
-  `handler_mut`, `surface`), the `App` over a handler it borrows; and
-  `run`, under "Widget window" below.
+  vocabulary a widget program reads, `Paste` among it; `Refusal`, why a
+  copy or paste was not made (`NoDevice`, `NoFocus`, `NoSerial`,
+  `Sending`, `Pasting`, `NoSelection`, `TooLong`, `NoEndpoint`), with
+  its `Display`; the `Clipboard` trait
+  (`available`, `has_text`, `pasting`, `copy`, `paste`), what a handler
+  reaches with each input, `WindowClipboard<'w>`, the window's, and
+  `NoClipboard`, which refuses everything, for a test or a headless run;
+  the `Handler` trait (`app_id`, `title`, `input` with a clipboard,
+  `poll`, `wait_ms`, `needs_redraw`, `paint`, `notice`); `Object`, the
+  empty tag; `Window<'h, H>` (`new`, `handler`, `handler_mut`,
+  `surface`), the `App` over a handler it borrows; and `run`, under
+  "Widget window" below.
 
 ## Driving
 
@@ -917,9 +945,11 @@ not frames, and stays its own).
 - `unsafe` is confined to `sys`, the transport's raw module, under
   `UNSAFE.md` §19: two function-scoped allowances, one syscall instruction
   carrying `recvmsg`, `sendmsg` and `fcntl` pinned to `F_DUPFD_CLOEXEC`,
-  one descriptor adoption site, and a crate root that denies it. Only
-  `wayland` names the module. Reusing it does not transfer authorization
-  to a new consumer, which gets its own roster entry.
+  `F_GETFL` and `F_SETFL`, one descriptor adoption site, and a crate root
+  that denies it. Only `wayland` and `clipboard` name the module, the
+  transport through its three wrappers and the clipboard's destination
+  owner through the two status ones. Reusing it does not transfer
+  authorization to a new consumer, which gets its own roster entry.
 - The shared font and wire sources are mounted here by exact repository
   path and nowhere else among td-ui's consumers. A future move of their
   canonical home updates staging, check mappings and every consumer
@@ -1039,8 +1069,10 @@ and any dependency declaration, that the shared sources bind no input
 interface, and the raw layer: the complete fingerprint of `sys.rs`, its
 syscall and flag values, its two function-only allowances, the single
 instruction and adoption sites, that the crate root denies `unsafe` and
-declares the module private, that `wayland` is its only caller, through
-exactly four wrapper calls, that no production module calls the client's
+declares the module private, that `wayland` and `clipboard` are its only
+callers, the transport through exactly four wrapper calls and the
+clipboard's destination owner through exactly five status calls, that no
+production module calls the client's
 test support (`unconfigure`, `input_mut`), and that the client is the
 toolkit's one consumer of a received right, through the pinned keymap reader
 with its format, size and regular-file checks and the send that hands its
@@ -1199,9 +1231,43 @@ the loop absorbs are the extent's and the frame's. The title is read
 before every attempted present, which is when the window is dirty and a
 frame can be presented, and sent then when it changed, ahead of the
 frame's commit when a frame follows and alone when none can; a retitle
-made while painting rides the next attempt. The client's selection
-events are not delivered: the clipboard is a later increment, for the
-host that composes.
+made while painting rides the next attempt.
+
+The clipboard is the window's, reached by the handler through the
+`Clipboard` handed it with every input. `copy` offers a text as the
+seat's selection at the serial of the key or button press being
+delivered, the window focused, the data device live, no earlier copy
+still being sent and the text within `clipboard::MAX_BYTES`; it refuses
+otherwise with a `Refusal` that says which, and a copy asked outside a
+press (from a poll, a repeat, a paste or the button's release) has no
+serial and is refused, as td-editor refuses it. The text is kept behind
+the live source: each `wl_data_source.send` the client hands on begins
+an `Outgoing` over its right, a send arriving while one is pending
+drops exactly its right, the source's cancellation drops the text (a
+send already begun keeps its own), and the device's release with its
+seat or its manager cancels the send and drops the text. `paste` asks
+the selection for its text over a fresh private endpoint when the
+device is live, the window focused, the selection offers text and no
+paste is pending; the text arrives whole as `Input::Paste`, delivered
+from the end of an idle turn, one whose queue was drained, so a focus
+loss, a selection change or a close request still queued behind it is
+seen first. A paste in flight is dropped, with a notice, when the
+selection changes, when focus is lost, when the device goes, when a
+copy replaces the selection, or when the compositor asks the window to
+close (a handler that keeps the window asks again). Both transfers are
+stepped at the end of every idle turn under their own bounds, and at any
+turn once expired, the loop's wait capped at ten milliseconds while one
+is pending; a transfer that fails or expires is a notice, never a
+partial text. A request the connection refuses (the source's requests,
+the receive) is refused to the handler as no device and ends the loop
+with the connection's error once the input is handled, as the editor's
+window ends on it; a paste's private endpoint the process cannot make
+is a refusal with a notice, and the window goes on, as the editor's
+does. The tests pin the copy's requests and its text crossing the
+send's right, the paste's request and its text arriving as an input,
+each refusal but the endpoint's (which needs the process's descriptors
+exhausted), the idle-turn admission, the cancellations, the seat's
+removal, and the refused request ending the loop.
 
 ## Shared action button
 
@@ -1857,3 +1923,11 @@ regressions. Those increments extend the original sequence below.
     `held` verb; td-photo shows its chords while Alt is held. The widget
     window and the other consumers ignore the event (the task manager's
     remote answers `held` ignored). Landed.
+16. The clipboard: `clipboard` with td-editor's `Outgoing` and its
+    destination owner moved here, under the raw module's two pinned
+    `fcntl` status commands, and a bounded `Incoming`; the widget
+    window's `Clipboard` with `copy`, `paste` and `Input::Paste`, its
+    serial, focus and idle-turn rules the editor's, proven against the
+    scripted peer; td-editor's window on the moved writer,
+    its own raw module down to two syscalls. td-mail and td-news copy
+    and paste through it in their next increment. Landed.

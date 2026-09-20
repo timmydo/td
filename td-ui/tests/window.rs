@@ -10,18 +10,24 @@
 //! surface it lays out on configure and keeps through a refused extent,
 //! the chords, button phases, wheel travel, focus and close it hands the
 //! handler, the poll and wait it runs each turn, the frame it presents
-//! from the handler's paint, and the whole loop over a socket.
+//! from the handler's paint, the clipboard it copies to and pastes from
+//! for the handler, and the whole loop over a socket.
 
 use std::fs::File;
 use std::io::{Read, Write};
+use std::os::fd::OwnedFd;
 use std::os::unix::fs::FileExt;
 use std::os::unix::net::UnixStream;
+use std::sync::Arc;
 use std::time::Duration;
 use td_ui::client::{App, DISPLAY, REGISTRY, SHM, SURFACE, SYNC, TOPLEVEL, XDG_SURFACE};
+use td_ui::clipboard::MAX_BYTES;
+use td_ui::data::{PLAIN, UTF8};
 use td_ui::raster::{Primitive, Raster, Rect, Scale, Surface, PAPER};
 use td_ui::wayland::{backing_file, peer, Connection, IDLE_WAIT};
 use td_ui::window::{
-    run, Flow, Handler, Input, PointerPhase, Window, DEFAULT_HEIGHT, DEFAULT_WIDTH,
+    run, Clipboard, Flow, Handler, Input, PointerPhase, Refusal, Window, DEFAULT_HEIGHT,
+    DEFAULT_WIDTH,
 };
 use td_ui::wire::{self, Builder, Cursor, Message};
 
@@ -37,6 +43,7 @@ enum Record {
     Resize(usize, usize),
     Focus(bool),
     Close,
+    Paste(String),
 }
 
 impl Record {
@@ -54,6 +61,7 @@ impl Record {
             Input::Resize(surface) => Self::Resize(surface.width, surface.height),
             Input::Focus(focused) => Self::Focus(focused),
             Input::Close => Self::Close,
+            Input::Paste(text) => Self::Paste(text.to_string()),
         }
     }
 }
@@ -69,6 +77,14 @@ struct Recorder {
     redraw: bool,
     paints: Vec<Surface>,
     title: String,
+    /// A chord (or `press` and `release`, the left button's) on which
+    /// the recorder copies the text, and one on which it pastes; what
+    /// the clipboard answered each time, and what it said of itself at
+    /// each input.
+    copy_on: Option<(String, Arc<str>)>,
+    paste_on: Option<String>,
+    outcomes: Vec<Result<(), Refusal>>,
+    states: Vec<(bool, bool, bool)>,
 }
 
 impl Recorder {
@@ -83,6 +99,10 @@ impl Recorder {
             redraw: false,
             paints: Vec::new(),
             title: "Recorder".into(),
+            copy_on: None,
+            paste_on: None,
+            outcomes: Vec::new(),
+            states: Vec::new(),
         }
     }
     fn paints(&self) -> usize {
@@ -125,8 +145,35 @@ impl Handler for Recorder {
     fn app_id(&self) -> &str {
         "td-recorder"
     }
-    fn input(&mut self, input: Input<'_>) -> Flow {
+    fn input(&mut self, input: Input<'_>, clipboard: &mut dyn Clipboard) -> Flow {
         let record = Record::of(input);
+        self.states.push((
+            clipboard.available(),
+            clipboard.has_text(),
+            clipboard.pasting(),
+        ));
+        let name = match input {
+            Input::Key { chord, .. } => Some(chord.to_string()),
+            Input::Pointer {
+                phase: PointerPhase::Press,
+                ..
+            } => Some("press".to_string()),
+            Input::Pointer {
+                phase: PointerPhase::Release,
+                ..
+            } => Some("release".to_string()),
+            _ => None,
+        };
+        if let Some(name) = name {
+            if let Some((chord, text)) = &self.copy_on {
+                if *chord == name {
+                    self.outcomes.push(clipboard.copy(text.clone()));
+                }
+            }
+            if self.paste_on.as_deref() == Some(name.as_str()) {
+                self.outcomes.push(clipboard.paste());
+            }
+        }
         let quit = self.quit_on.as_ref() == Some(&record);
         self.inputs.push(record);
         if quit {
@@ -222,6 +269,87 @@ fn fixture(handler: &mut Recorder) -> (Window<'_, Recorder>, UnixStream, u32, u3
     let pointer = w.client().pointer().unwrap();
     drain(&b);
     (w, b, keyboard, pointer)
+}
+
+/// A bound window whose compositor also advertises a v3 data-device
+/// manager: `(window, peer, keyboard, pointer, device)`, the manager's
+/// bind and the device request checked and drained.
+fn clipboard_fixture(handler: &mut Recorder) -> (Window<'_, Recorder>, UnixStream, u32, u32, u32) {
+    let (a, b) = pair();
+    let mut w = Window::new(handler, a, std::env::temp_dir()).unwrap();
+    for event in [
+        global(1, "wl_compositor", 4),
+        global(2, "wl_shm", 1),
+        global(3, "xdg_wm_base", 1),
+        global(4, "wl_seat", 7),
+        global(5, "wl_data_device_manager", 3),
+    ] {
+        w.event(event).unwrap();
+    }
+    w.event(message(SYNC, 0, &[0])).unwrap();
+    w.event(message(DISPLAY, 1, &[SYNC])).unwrap();
+    w.event(message(SHM, 0, &[1])).unwrap();
+    let seat = w.client().seat().unwrap();
+    w.event(message(seat, 0, &[3])).unwrap();
+    let keyboard = w.client().keyboard().unwrap();
+    let pointer = w.client().pointer().unwrap();
+    assert!(w.client().clipboard());
+    let (requests, _) = drain(&b);
+    // The manager's bind names the new id last; the device request on
+    // that id names the device first.
+    let manager = requests
+        .iter()
+        .filter(|m| m.object == REGISTRY && m.opcode == 0)
+        .find_map(|m| {
+            let mut c = Cursor::new(&m.payload);
+            c.u32().unwrap();
+            let interface = c.string().unwrap();
+            c.u32().unwrap();
+            let id = c.u32().unwrap();
+            (interface == "wl_data_device_manager").then_some(id)
+        })
+        .unwrap();
+    let device = requests
+        .iter()
+        .find(|m| m.object == manager && m.opcode == 1)
+        .map(|m| Cursor::new(&m.payload).u32().unwrap())
+        .unwrap();
+    (w, b, keyboard, pointer, device)
+}
+
+/// A server offer announcing `mimes`, then selected.
+fn selection_offer(w: &mut Window<'_, Recorder>, device: u32, id: u32, mimes: &[&str]) {
+    w.event(message(device, 0, &[id])).unwrap();
+    for mime in mimes {
+        w.event(text_request(id, 0, mime)).unwrap();
+    }
+    w.event(message(device, 5, &[id])).unwrap();
+}
+
+/// `wl_data_source.send` for `mime` carrying `file`, across the socket.
+fn send_right(
+    w: &mut Window<'_, Recorder>,
+    peer: &UnixStream,
+    source: u32,
+    mime: &str,
+    file: &File,
+) {
+    let mut sender = Connection::new(peer.try_clone().unwrap()).unwrap();
+    let mut body = Builder::new();
+    body.string(mime).unwrap();
+    sender.send(source, 1, body, Some(file)).unwrap();
+    w.client().connection().read_more().unwrap();
+    while let Some(event) = w.client().connection().take().unwrap() {
+        w.event(event).unwrap();
+    }
+}
+
+fn endpoint() -> (UnixStream, File) {
+    let (reader, writer) = UnixStream::pair().unwrap();
+    reader
+        .set_read_timeout(Some(Duration::from_secs(1)))
+        .unwrap();
+    (reader, File::from(OwnedFd::from(writer)))
 }
 
 fn configure(w: &mut Window<'_, Recorder>, width: u32, height: u32) {
@@ -816,4 +944,403 @@ fn the_title_follows_the_handler_after_a_paint() {
     assert!(requests
         .iter()
         .any(|m| m.object == SURFACE && m.opcode == 6));
+}
+
+#[test]
+fn a_copy_offers_the_text_at_the_press_and_its_send_crosses_the_right() {
+    let mut handler = Recorder::new();
+    handler.copy_on = Some(("a".into(), Arc::from("hello, clipboard")));
+    let (mut w, peer, keyboard, pointer, device) = clipboard_fixture(&mut handler);
+    w.tick(100).unwrap();
+    focus_with_map(&mut w, &peer, keyboard);
+    drain(&peer);
+    press(&mut w, keyboard, 12, 30);
+    assert_eq!(w.handler().outcomes, [Ok(())]);
+    assert_eq!(w.handler().states.last(), Some(&(true, false, false)));
+    // A source with both text MIMEs is the selection at the press's
+    // serial.
+    let (requests, _) = drain(&peer);
+    let source = Cursor::new(&requests[0].payload).u32().unwrap();
+    assert_eq!(
+        requests,
+        [
+            message(requests[0].object, 0, &[source]),
+            text_request(source, 0, UTF8),
+            text_request(source, 0, PLAIN),
+            message(device, 1, &[source, 12]),
+        ]
+    );
+    // The send's right receives the text once an idle turn steps the
+    // transfer, and the loop waits no longer than the transfer's pace
+    // meanwhile; a turn with events still queued steps nothing.
+    let (mut reader, writer) = endpoint();
+    send_right(&mut w, &peer, source, PLAIN, &writer);
+    drop(writer);
+    w.end_turn(150, false).unwrap();
+    assert_eq!(
+        w.client().connection().wait(),
+        Duration::from_millis(10),
+        "sending: capped"
+    );
+    w.end_turn(200, true).unwrap();
+    let mut text = String::new();
+    reader.read_to_string(&mut text).unwrap();
+    assert_eq!(text, "hello, clipboard");
+    assert_eq!(w.client().connection().wait(), IDLE_WAIT, "sent: no cap");
+    assert!(w.handler().notices.is_empty(), "{:?}", w.handler().notices);
+    // A repeat has no serial to offer at, and neither has a paste; the
+    // left button's press has one.
+    release(&mut w, keyboard, 13, 30);
+    press(&mut w, keyboard, 14, 30);
+    w.end_turn(1000, true).unwrap();
+    assert_eq!(last(&w), Some(&Record::Key("a".into(), true)));
+    assert_eq!(
+        w.handler().outcomes,
+        [Ok(()), Ok(()), Err(Refusal::NoSerial)]
+    );
+    let (requests, _) = drain(&peer);
+    let second = Cursor::new(&requests[0].payload).u32().unwrap();
+    assert_eq!(
+        requests.last(),
+        Some(&message(source, 1, &[])),
+        "the old source destroyed"
+    );
+    release(&mut w, keyboard, 15, 30);
+    w.handler_mut().copy_on = Some(("press".into(), Arc::from("x".repeat(MAX_BYTES))));
+    w.event(message(pointer, 0, &[16, SURFACE, fixed(20), fixed(20)]))
+        .unwrap();
+    drain(&peer);
+    w.event(message(pointer, 3, &[17, 0, 0x110, 1])).unwrap();
+    assert_eq!(w.handler().outcomes.last(), Some(&Ok(())));
+    let (requests, _) = drain(&peer);
+    let big = Cursor::new(&requests[0].payload).u32().unwrap();
+    assert!(requests.contains(&message(device, 1, &[big, 17])));
+    assert_eq!(requests.last(), Some(&message(second, 1, &[])));
+    // A text too long is refused before anything is offered; a copy
+    // while the last is still being sent is refused too.
+    w.event(message(pointer, 3, &[18, 0, 0x110, 0])).unwrap();
+    w.handler_mut().copy_on = Some(("press".into(), Arc::from("x".repeat(MAX_BYTES + 1))));
+    w.event(message(pointer, 3, &[19, 0, 0x110, 1])).unwrap();
+    assert_eq!(w.handler().outcomes.last(), Some(&Err(Refusal::TooLong)));
+    assert!(drain(&peer).0.is_empty());
+    w.event(message(pointer, 3, &[20, 0, 0x110, 0])).unwrap();
+    // A socket with a read timeout: a send that outlives its cancel
+    // fails the read below rather than hanging it.
+    let (mut pending, writer) = endpoint();
+    send_right(&mut w, &peer, big, UTF8, &writer);
+    drop(writer);
+    w.end_turn(1300, true).unwrap();
+    assert_eq!(
+        w.client().connection().wait(),
+        Duration::from_millis(10),
+        "sending: capped"
+    );
+    w.handler_mut().copy_on = Some(("press".into(), Arc::from("short")));
+    w.event(message(pointer, 3, &[21, 0, 0x110, 1])).unwrap();
+    assert_eq!(w.handler().outcomes.last(), Some(&Err(Refusal::Sending)));
+    w.event(message(pointer, 3, &[22, 0, 0x110, 0])).unwrap();
+    // A second send while one is pending drops exactly its right.
+    let (mut other, writer) = endpoint();
+    send_right(&mut w, &peer, big, UTF8, &writer);
+    drop(writer);
+    assert_eq!(other.read(&mut [0]).unwrap(), 0, "dropped");
+    // The device released with its manager cancels the send: its
+    // endpoint closes short of the text, the wait is no longer capped,
+    // a later send of the retired source drops its right, and the next
+    // copy finds no device.
+    w.event(message(REGISTRY, 1, &[5])).unwrap();
+    assert!(!w.client().clipboard());
+    let mut prefix = Vec::new();
+    pending.read_to_end(&mut prefix).unwrap();
+    assert!(prefix.len() < MAX_BYTES, "cancelled short of the text");
+    w.end_turn(1400, true).unwrap();
+    assert_eq!(w.client().connection().wait(), IDLE_WAIT);
+    let (mut other, writer) = endpoint();
+    send_right(&mut w, &peer, big, UTF8, &writer);
+    drop(writer);
+    assert_eq!(other.read(&mut [0]).unwrap(), 0, "retired: dropped");
+    assert!(w.handler().notices.is_empty(), "{:?}", w.handler().notices);
+    w.event(message(pointer, 3, &[23, 0, 0x110, 1])).unwrap();
+    assert_eq!(w.handler().outcomes.last(), Some(&Err(Refusal::NoDevice)));
+    assert_eq!(w.handler().states.last(), Some(&(false, false, false)));
+}
+
+#[test]
+fn the_seat_going_cancels_the_send_and_the_focus_with_it() {
+    let mut handler = Recorder::new();
+    handler.copy_on = Some(("a".into(), Arc::from("x".repeat(MAX_BYTES))));
+    let (mut w, peer, keyboard, _, _) = clipboard_fixture(&mut handler);
+    focus_with_map(&mut w, &peer, keyboard);
+    drain(&peer);
+    press(&mut w, keyboard, 12, 30);
+    assert_eq!(w.handler().outcomes, [Ok(())]);
+    let (requests, _) = drain(&peer);
+    let source = Cursor::new(&requests[0].payload).u32().unwrap();
+    let (mut pending, writer) = endpoint();
+    send_right(&mut w, &peer, source, UTF8, &writer);
+    drop(writer);
+    w.end_turn(100, true).unwrap();
+    assert_eq!(w.client().connection().wait(), Duration::from_millis(10));
+    // The seat's removal releases the data device with it: the window's
+    // half cancels the send, so the endpoint closes short of the text,
+    // the wait is no longer capped, and the focus is lost.
+    w.event(message(REGISTRY, 1, &[4])).unwrap();
+    assert!(!w.client().clipboard());
+    let mut prefix = Vec::new();
+    pending.read_to_end(&mut prefix).unwrap();
+    assert!(prefix.len() < MAX_BYTES, "cancelled short of the text");
+    assert_eq!(last(&w), Some(&Record::Focus(false)));
+    assert!(w.handler().notices.is_empty(), "{:?}", w.handler().notices);
+    w.end_turn(200, true).unwrap();
+    assert_eq!(w.client().connection().wait(), IDLE_WAIT);
+}
+
+#[test]
+fn a_release_and_an_unfocused_window_have_no_clipboard_authority() {
+    let mut handler = Recorder::new();
+    handler.copy_on = Some(("press".into(), Arc::from("unfocused")));
+    handler.paste_on = Some("press".into());
+    let (mut w, peer, keyboard, pointer, device) = clipboard_fixture(&mut handler);
+    selection_offer(&mut w, device, 0xff00_0010, &[UTF8]);
+    drain(&peer);
+    // The pointer is in but the keyboard is not: neither request has the
+    // focus a selection follows.
+    w.event(message(pointer, 0, &[16, SURFACE, fixed(20), fixed(20)]))
+        .unwrap();
+    w.event(message(pointer, 3, &[17, 0, 0x110, 1])).unwrap();
+    assert_eq!(
+        w.handler().outcomes,
+        [Err(Refusal::NoFocus), Err(Refusal::NoFocus)]
+    );
+    w.event(message(pointer, 3, &[18, 0, 0x110, 0])).unwrap();
+    assert!(drain(&peer).0.is_empty());
+    // Focused, a copy asked at the button's release has no serial.
+    focus_with_map(&mut w, &peer, keyboard);
+    drain(&peer);
+    w.handler_mut().copy_on = Some(("release".into(), Arc::from("released")));
+    w.handler_mut().paste_on = None;
+    w.event(message(pointer, 3, &[19, 0, 0x110, 1])).unwrap();
+    w.event(message(pointer, 3, &[20, 0, 0x110, 0])).unwrap();
+    assert_eq!(
+        last(&w),
+        Some(&Record::Pointer(PointerPhase::Release, 20, 20, false))
+    );
+    assert_eq!(w.handler().outcomes.last(), Some(&Err(Refusal::NoSerial)));
+    assert!(drain(&peer).0.is_empty());
+}
+
+#[test]
+fn a_copy_or_a_close_request_drops_the_paste_in_flight_with_a_notice() {
+    let mut handler = Recorder::new();
+    handler.paste_on = Some("v".into());
+    handler.copy_on = Some(("c".into(), Arc::from("replaced")));
+    let (mut w, peer, keyboard, _, device) = clipboard_fixture(&mut handler);
+    focus_with_map(&mut w, &peer, keyboard);
+    selection_offer(&mut w, device, 0xff00_0010, &[UTF8]);
+    drain(&peer);
+    press(&mut w, keyboard, 9, 47);
+    assert_eq!(w.handler().outcomes, [Ok(())]);
+    let (_, files) = drain(&peer);
+    let mut file = files.into_iter().next().unwrap();
+    file.write_all(b"stale").unwrap();
+    // The copy replaces the selection the paste was asking: the notice
+    // is the copy's, once, and the compositor's selection event that
+    // follows finds no paste to cancel.
+    release(&mut w, keyboard, 10, 47);
+    press(&mut w, keyboard, 11, 46);
+    assert_eq!(w.handler().outcomes.last(), Some(&Ok(())));
+    assert_eq!(
+        w.handler().notices,
+        ["paste cancelled: a copy replaced the selection"]
+    );
+    assert_eq!(w.handler().states.last(), Some(&(true, true, true)));
+    let (requests, _) = drain(&peer);
+    let source = Cursor::new(&requests[0].payload).u32().unwrap();
+    assert!(requests.contains(&message(device, 1, &[source, 11])));
+    selection_offer(&mut w, device, 0xff00_0011, &[UTF8]);
+    assert_eq!(w.handler().notices.len(), 1);
+    drop(file);
+    let seen = w.handler().inputs.len();
+    w.end_turn(100, true).unwrap();
+    assert_eq!(w.handler().inputs.len(), seen);
+    assert_eq!(w.client().connection().wait(), IDLE_WAIT);
+    // A close request drops the paste too, before the handler hears it.
+    release(&mut w, keyboard, 12, 46);
+    press(&mut w, keyboard, 13, 47);
+    assert_eq!(w.handler().outcomes.last(), Some(&Ok(())));
+    let (_, files) = drain(&peer);
+    let mut file = files.into_iter().next().unwrap();
+    file.write_all(b"late").unwrap();
+    w.event(message(TOPLEVEL, 1, &[])).unwrap();
+    assert_eq!(last(&w), Some(&Record::Close));
+    assert_eq!(w.handler().states.last(), Some(&(true, true, false)));
+    assert_eq!(w.handler().notices.len(), 2);
+    assert_eq!(w.handler().notices[1], "paste cancelled: close requested");
+    drop(file);
+    let seen = w.handler().inputs.len();
+    w.end_turn(200, true).unwrap();
+    assert_eq!(w.handler().inputs.len(), seen);
+}
+
+#[test]
+fn a_clipboard_request_the_connection_refuses_ends_the_loop() {
+    let mut handler = Recorder::new();
+    handler.copy_on = Some(("a".into(), Arc::from("unsent")));
+    let (mut w, peer, keyboard, _, _) = clipboard_fixture(&mut handler);
+    focus_with_map(&mut w, &peer, keyboard);
+    drain(&peer);
+    // The compositor's end is gone: the source request fails at once,
+    // the copy is refused as no device, and the input's turn ends the
+    // loop with the write's error rather than the refusal.
+    drop(peer);
+    let outcome = w.event(message(keyboard, 3, &[12, 0, 30, 1]));
+    assert!(
+        outcome.as_ref().is_err_and(|e| e.contains("Wayland write")),
+        "{outcome:?}"
+    );
+    assert_eq!(w.handler().outcomes, [Err(Refusal::NoDevice)]);
+    assert_eq!(last(&w), Some(&Record::Key("a".into(), false)));
+    // The same for a paste's receive request.
+    let mut second = Recorder::new();
+    second.paste_on = Some("v".into());
+    drop(w);
+    let (mut w, peer, keyboard, _, device) = clipboard_fixture(&mut second);
+    focus_with_map(&mut w, &peer, keyboard);
+    selection_offer(&mut w, device, 0xff00_0010, &[UTF8]);
+    drain(&peer);
+    drop(peer);
+    let outcome = w.event(message(keyboard, 3, &[12, 0, 47, 1]));
+    assert!(
+        outcome.as_ref().is_err_and(|e| e.contains("Wayland write")),
+        "{outcome:?}"
+    );
+    assert_eq!(w.handler().outcomes, [Err(Refusal::NoDevice)]);
+}
+
+#[test]
+fn a_paste_asks_the_selection_and_its_text_arrives_as_an_input() {
+    let mut handler = Recorder::new();
+    handler.paste_on = Some("v".into());
+    let (mut w, peer, keyboard, _, device) = clipboard_fixture(&mut handler);
+    focus_with_map(&mut w, &peer, keyboard);
+    // Nothing selected: refused. An offer without text: refused.
+    press(&mut w, keyboard, 9, 47);
+    assert_eq!(w.handler().outcomes, [Err(Refusal::NoSelection)]);
+    selection_offer(&mut w, device, 0xff00_0010, &["image/png"]);
+    release(&mut w, keyboard, 10, 47);
+    press(&mut w, keyboard, 11, 47);
+    assert_eq!(
+        w.handler().outcomes.last(),
+        Some(&Err(Refusal::NoSelection))
+    );
+    assert_eq!(w.handler().states.last(), Some(&(true, false, false)));
+    // A text offer: the paste asks for it in the selection's preferred
+    // spelling, and the text arrives whole at the end of a turn.
+    selection_offer(
+        &mut w,
+        device,
+        0xff00_0011,
+        &[PLAIN, "text/plain;charset=utf-8"],
+    );
+    drain(&peer);
+    release(&mut w, keyboard, 12, 47);
+    press(&mut w, keyboard, 13, 47);
+    assert_eq!(w.handler().outcomes.last(), Some(&Ok(())));
+    let (requests, files) = drain(&peer);
+    assert_eq!(
+        requests,
+        [text_request(0xff00_0011, 1, "text/plain;charset=utf-8")]
+    );
+    // A second paste while one is arriving is refused; the loop waits
+    // no longer than the transfer's pace.
+    release(&mut w, keyboard, 14, 47);
+    press(&mut w, keyboard, 15, 47);
+    assert_eq!(w.handler().outcomes.last(), Some(&Err(Refusal::Pasting)));
+    assert_eq!(w.handler().states.last(), Some(&(true, true, true)));
+    w.end_turn(100, false).unwrap();
+    assert_eq!(w.client().connection().wait(), Duration::from_millis(10));
+    let mut file = files.into_iter().next().unwrap();
+    file.write_all("pasted \u{e9}".as_bytes()).unwrap();
+    drop(file);
+    // A turn with events still queued admits nothing, so a cancellation
+    // behind them is seen first; the idle turn delivers the text.
+    let seen = w.handler().inputs.len();
+    w.end_turn(150, false).unwrap();
+    assert_eq!(w.handler().inputs.len(), seen);
+    w.end_turn(200, true).unwrap();
+    assert_eq!(w.handler().inputs.len(), seen + 1);
+    assert_eq!(last(&w), Some(&Record::Paste("pasted \u{e9}".into())));
+    assert_eq!(w.handler().states.last(), Some(&(true, true, false)));
+    assert_eq!(w.client().connection().wait(), IDLE_WAIT);
+    assert!(w.handler().notices.is_empty(), "{:?}", w.handler().notices);
+    // A paste cancelled by the selection changing, by focus lost and by
+    // the device going is a notice, and never a text.
+    release(&mut w, keyboard, 16, 47);
+    press(&mut w, keyboard, 17, 47);
+    assert_eq!(w.handler().outcomes.last(), Some(&Ok(())));
+    let (_, files) = drain(&peer);
+    let mut file = files.into_iter().next().unwrap();
+    file.write_all(b"stale").unwrap();
+    selection_offer(&mut w, device, 0xff00_0012, &[UTF8]);
+    assert_eq!(
+        w.handler().notices,
+        ["paste cancelled: the selection changed"]
+    );
+    drop(file);
+    let seen = w.handler().inputs.len();
+    w.end_turn(300, true).unwrap();
+    assert_eq!(w.handler().inputs.len(), seen);
+    release(&mut w, keyboard, 18, 47);
+    press(&mut w, keyboard, 19, 47);
+    assert_eq!(w.handler().outcomes.last(), Some(&Ok(())));
+    drain(&peer);
+    w.event(message(keyboard, 2, &[20, SURFACE])).unwrap();
+    assert_eq!(w.handler().notices.len(), 2);
+    assert_eq!(w.handler().notices[1], "paste cancelled: focus lost");
+    assert_eq!(last(&w), Some(&Record::Focus(false)));
+    // The selection followed the focus out: a refocus needs a new offer
+    // before a paste can ask.
+    w.event(message(keyboard, 1, &[21, SURFACE, 0])).unwrap();
+    w.event(message(keyboard, 4, &[22, 0, 0, 0, 0])).unwrap();
+    press(&mut w, keyboard, 23, 47);
+    assert_eq!(
+        w.handler().outcomes.last(),
+        Some(&Err(Refusal::NoSelection))
+    );
+    selection_offer(&mut w, device, 0xff00_0013, &[UTF8]);
+    release(&mut w, keyboard, 24, 47);
+    press(&mut w, keyboard, 25, 47);
+    assert_eq!(w.handler().outcomes.last(), Some(&Ok(())));
+    drain(&peer);
+    w.event(message(REGISTRY, 1, &[5])).unwrap();
+    assert_eq!(w.handler().notices.len(), 3);
+    assert_eq!(
+        w.handler().notices[2],
+        "paste cancelled: the clipboard went away"
+    );
+    // A paste that stalls past its deadline is a notice too.
+    let mut second = Recorder::new();
+    second.paste_on = Some("v".into());
+    drop(w);
+    let (mut w, peer, keyboard, _, device) = clipboard_fixture(&mut second);
+    focus_with_map(&mut w, &peer, keyboard);
+    selection_offer(&mut w, device, 0xff00_0010, &[UTF8]);
+    drain(&peer);
+    w.tick(1000).unwrap();
+    press(&mut w, keyboard, 9, 47);
+    assert_eq!(w.handler().outcomes, [Ok(())]);
+    let (_, files) = drain(&peer);
+    let _held = files.into_iter().next().unwrap();
+    w.end_turn(5999, false).unwrap();
+    assert!(w.handler().notices.is_empty());
+    w.end_turn(6000, false).unwrap();
+    assert_eq!(
+        w.handler().notices,
+        ["paste failed: clipboard read deadline"]
+    );
+    assert!(!w
+        .handler()
+        .inputs
+        .iter()
+        .any(|r| matches!(r, Record::Paste(_))));
 }

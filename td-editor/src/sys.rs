@@ -1,22 +1,17 @@
-//! Linux x86-64 file and clipboard-endpoint syscalls; roster section 14.
-//! The Wayland transport is td-ui's, in its `wayland` module (UNSAFE.md §19).
+//! Linux x86-64 file syscalls; roster section 14. The Wayland transport
+//! and the clipboard destination's status commands are td-ui's, in its
+//! `wayland` and `clipboard` modules (UNSAFE.md §19).
 
 use std::fs::File;
 use std::io;
-use std::os::fd::{AsRawFd, OwnedFd};
-use std::os::unix::fs::FileTypeExt;
+use std::os::fd::AsRawFd;
 
 #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
-compile_error!("the editor file and clipboard syscalls require Linux x86-64");
+compile_error!("the editor file syscalls require Linux x86-64");
 
-const SYS_FCNTL: usize = 72;
 const SYS_FLISTXATTR: usize = 196;
 const SYS_RENAMEAT2: usize = 316;
 const RENAME_NOREPLACE: usize = 1;
-const F_GETFL: usize = 3;
-const F_SETFL: usize = 4;
-const O_NONBLOCK: usize = 0o4000;
-const O_ACCMODE: usize = 3;
 
 #[allow(unsafe_code)]
 fn syscall5(number: usize, a1: usize, a2: usize, a3: usize, a4: usize, a5: usize) -> isize {
@@ -81,82 +76,6 @@ fn result(value: isize) -> io::Result<usize> {
         return Err(io::Error::from_raw_os_error((-value) as i32));
     }
     Ok(value as usize)
-}
-
-fn status(file: &File) -> io::Result<usize> {
-    result(syscall3(SYS_FCNTL, file.as_raw_fd() as usize, F_GETFL, 0))
-}
-
-fn set_status(file: &File, flags: usize) -> io::Result<()> {
-    result(syscall3(
-        SYS_FCNTL,
-        file.as_raw_fd() as usize,
-        F_SETFL,
-        flags,
-    ))
-    .map(|_| ())
-}
-
-/// One received clipboard write endpoint, never a regular file or device.
-/// Status flags are shared by SCM_RIGHTS; restore the exact original word.
-pub(super) struct Destination {
-    file: Option<File>,
-    original: usize,
-}
-
-impl Destination {
-    pub(super) fn new(fd: OwnedFd) -> io::Result<Self> {
-        let file = File::from(fd);
-        let kind = file.metadata()?.file_type();
-        if !kind.is_fifo() && !kind.is_socket() {
-            return Err(io::Error::other(
-                "clipboard destination must be a pipe or socket",
-            ));
-        }
-        let original = status(&file)?;
-        if !matches!(original & O_ACCMODE, 1 | 2) {
-            return Err(io::Error::other("clipboard destination is not writable"));
-        }
-        let destination = Self {
-            file: Some(file),
-            original,
-        };
-        let file = destination
-            .file
-            .as_ref()
-            .ok_or_else(|| io::Error::other("closed clipboard destination"))?;
-        set_status(file, original | O_NONBLOCK)?;
-        if status(file)? != original | O_NONBLOCK {
-            return Err(io::Error::other("clipboard nonblocking readback differs"));
-        }
-        Ok(destination)
-    }
-
-    pub(super) fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        use std::io::Write;
-        self.file
-            .as_mut()
-            .ok_or_else(|| io::Error::other("closed clipboard destination"))?
-            .write(bytes)
-    }
-
-    pub(super) fn close(&mut self) -> io::Result<()> {
-        let Some(file) = self.file.take() else {
-            return Ok(());
-        };
-        set_status(&file, self.original)?;
-        if status(&file)? != self.original {
-            return Err(io::Error::other("clipboard status restore differs"));
-        }
-        Ok(())
-    }
-}
-
-impl Drop for Destination {
-    fn drop(&mut self) {
-        // Explicit completion/cancellation reports errors; teardown is best effort.
-        let _ = self.close();
-    }
 }
 
 /// Query list size only: no caller pointer, name, value or mutation.

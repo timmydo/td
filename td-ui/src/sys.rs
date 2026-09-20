@@ -1,11 +1,14 @@
-//! Linux x86-64 descriptor transport for the Wayland client; UNSAFE.md
-//! section 19. One function-scoped syscall instruction carries `recvmsg`,
-//! `sendmsg` and `fcntl` pinned to `F_DUPFD_CLOEXEC`; one function-scoped
-//! adoption site owns freshly installed descriptors. Safe `std` owns
-//! connection setup, byte-only sends, timeouts, file creation and every
-//! close. Nothing here is reachable from another crate: the connection in
-//! `wayland` is the sole caller, and a consumer that needs a raw surface of
-//! its own gets its own roster entry.
+//! Linux x86-64 descriptor transport for the Wayland client and the
+//! clipboard destination's status commands; UNSAFE.md section 19. One
+//! function-scoped syscall instruction carries `recvmsg`, `sendmsg` and
+//! `fcntl` pinned to `F_DUPFD_CLOEXEC` for the transport and to `F_GETFL`
+//! and `F_SETFL` for the destination owner; one function-scoped adoption
+//! site owns freshly installed descriptors. Safe `std` owns connection
+//! setup, byte-only sends, timeouts, file creation and every close.
+//! Nothing here is reachable from another crate: the connection in
+//! `wayland` and the destination owner in `clipboard` are the callers,
+//! and a consumer that needs a raw surface of its own gets its own roster
+//! entry.
 
 use std::fs::File;
 use std::io;
@@ -19,6 +22,8 @@ const SYS_SENDMSG: usize = 46;
 const SYS_RECVMSG: usize = 47;
 const SYS_FCNTL: usize = 72;
 const F_DUPFD_CLOEXEC: usize = 1030;
+const F_GETFL: usize = 3;
+const F_SETFL: usize = 4;
 const SOL_SOCKET: i32 = 1;
 const SCM_RIGHTS: i32 = 1;
 const MSG_CTRUNC: i32 = 8;
@@ -88,6 +93,25 @@ fn result(value: isize) -> io::Result<usize> {
         return Err(io::Error::from_raw_os_error((-value) as i32));
     }
     Ok(value as usize)
+}
+
+/// A borrowed descriptor's status word, for the clipboard destination
+/// owner: no descriptor is adopted, closed or chosen here.
+pub(crate) fn status(file: &File) -> io::Result<usize> {
+    result(syscall3(SYS_FCNTL, file.as_raw_fd() as usize, F_GETFL, 0))
+}
+
+/// Sets a borrowed descriptor's status word to `flags`, the word the
+/// caller read back or the original it captured; the caller reads it
+/// back again.
+pub(crate) fn set_status(file: &File, flags: usize) -> io::Result<()> {
+    result(syscall3(
+        SYS_FCNTL,
+        file.as_raw_fd() as usize,
+        F_SETFL,
+        flags,
+    ))
+    .map(|_| ())
 }
 
 /// Duplicate, never adopt or close, the environment's borrowed descriptor.

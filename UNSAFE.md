@@ -83,8 +83,10 @@ denies `unsafe` at its crate root; the keymap compiler, repeat policy,
 pointer decoder, raster, the chrome bands and the font and wire sources
 it mounts need none.
 A consumer inherits that surface through the toolkit's connection and
-nothing else; reusing the module does not transfer its authorization to a
-raw boundary of the consumer's own, which gets its own entry.
+its `clipboard::Outgoing`, which owns the send right's status flags for
+a transfer, and nothing else; reusing a module does not transfer its
+authorization to a raw boundary of the consumer's own, which gets its
+own entry.
 
 ## Roster
 
@@ -103,12 +105,12 @@ raw boundary of the consumer's own, which gets its own entry.
 | 11 | `td-profiler` | `close(2)`, `mmap(2)`, `munmap(2)`, `ioctl(2)` with four pinned requests, `setgroups(2)`, `setgid(2)`, `setuid(2)`, `clock_gettime(2)`, `perf_event_open(2)`, `socket(2)`, `bind(2)`, `recvfrom(2)` for fixed kernel CPU notifications |
 | 12 | `td-portal` | `recvmsg(2)`, `sendmsg(2)`, `close(2)` for the shared credential-descriptor module (also compiled by td-secret, §15); one scoped received-descriptor adoption. The Wayland dialog's descriptor passing moved to td-ui (§19) |
 | 13 | `td-audio` | `ioctl(2)` with eleven value-pinned PCM requests, `poll(2)`, `getsockopt(2)` pinned to `SOL_SOCKET`/`SO_PEERCRED` |
-| 14 | `td-editor` | `fcntl(2)` pinned to `F_GETFL` and `F_SETFL`, `flistxattr(2)` pinned to a size-only query, `renameat2(2)` pinned to two borrowed parents and `RENAME_NOREPLACE`; no descriptor adoption |
+| 14 | `td-editor` | `flistxattr(2)` pinned to a size-only query, `renameat2(2)` pinned to two borrowed parents and `RENAME_NOREPLACE`; no descriptor adoption. The clipboard destination's `fcntl(2)` status commands moved to td-ui (§19) |
 | 15 | `td-secret` | shared `recvmsg(2)`, `sendmsg(2)`, `close(2)` transport and scoped adoption for bounded credential replies; the named credential intake module of §16; plus the manual PIN terminal's two-request `ioctl(2)`, single-descriptor `poll(2)`, and fixed dumpability `prctl(2)` below |
 | 16 | `td-authd` | `recvmsg(2)`, `setsockopt(2)` with fixed `SO_PASSCRED`/`SO_PASSPIDFD`, `getsockopt(2)` with fixed `SO_PEERCRED`, and `poll(2)` on the peer pidfd; one scoped descriptor adoption; a separate mount instruction/adoption for `unshare(2)`, `open_tree(2)`, `mount_setattr(2)`, and `move_mount(2)` with the fixed portal file-grant values below; plus the separate named credential intake and six-request terminal ioctl/poll modules below |
 | 17 | `td-mail` | retired: `term_sys.rs`, td-sh's terminal half, went with the terminal; the crate forbids `unsafe` and draws through td-ui (§19) — see [§17](#17-td-mail--retired) |
 | 18 | `td-news` | retired: the copy of `term_sys.rs` went with the terminal; the crate forbids `unsafe` and draws through td-ui (§19) — see [§18](#18-td-news--retired) |
-| 19 | `td-ui` | `recvmsg(2)`, `sendmsg(2)`, `fcntl(2)` pinned to `F_DUPFD_CLOEXEC`, the shared Wayland client transport; plus one scoped descriptor adoption — see [§19](#19-td-ui--the-shared-wayland-client-transport) |
+| 19 | `td-ui` | `recvmsg(2)`, `sendmsg(2)`, `fcntl(2)` pinned to `F_DUPFD_CLOEXEC` for the shared Wayland client transport and to `F_GETFL` and `F_SETFL` for the clipboard destination owner; plus one scoped descriptor adoption — see [§19](#19-td-ui--the-shared-wayland-client-transport) |
 | 20 | `td-taskmgr` | `pidfd_send_signal(2)`, retained procfs process directories, named signals or a fixed signal-zero self probe |
 
 The control-plane exception (`builder/src/sys.rs`) is described under The
@@ -2254,15 +2256,16 @@ amendment here and in `APPLICATIONS.md` §K in the same landing.
 
 ## 14. `td-editor` — the Wayland scratch editor
 
-The editor's `sys.rs` carries exactly THREE x86-64 Linux syscalls through one
-function-scoped instruction: `fcntl` (72) pinned to `F_GETFL` and
-`F_SETFL`, `flistxattr` (196), and `renameat2` (316). It adopts no
-descriptor: the Wayland transport — `recvmsg`, `sendmsg`, `fcntl` pinned
-to `F_DUPFD_CLOEXEC` and the one adoption site — is td-ui's (§19), which
-the editor depends on by path and reaches only through the toolkit's
-connection. Safe `std` owns file creation/unlinking and every close. No
-raw pointer escapes this private module. Other architectures are refused
-at compile time rather than inheriting its ABI.
+The editor's `sys.rs` carries exactly TWO x86-64 Linux syscalls through one
+function-scoped instruction: `flistxattr` (196) and `renameat2` (316). It
+adopts no descriptor: the Wayland transport — `recvmsg`, `sendmsg`,
+`fcntl` pinned to `F_DUPFD_CLOEXEC` and the one adoption site — and the
+clipboard destination owner's `fcntl` pinned to `F_GETFL` and `F_SETFL`
+are td-ui's (§19), which the editor depends on by path and reaches only
+through the toolkit's connection and its `clipboard::Outgoing`. Safe
+`std` owns file creation/unlinking and every close. No raw pointer
+escapes this private module. Other architectures are refused at compile
+time rather than inheriting its ABI.
 The core, layout, renderer and controller still have no raw boundary.
 
 `flistxattr` is the file adapter's attribute query. `files.rs` alone calls
@@ -2301,24 +2304,13 @@ provide a source-inode compare-and-swap against a same-authority racer.
 After kernel success the worker always reports publication and updates file
 paths, even when sync/readback fails. See the editor rename contract.
 
-The `fcntl` caller is the clipboard destination owner, pinned to `F_GETFL`
-(3) and `F_SETFL` (4). The private `Destination` owner converts a supplied
-`OwnedFd` into
-a safe File, refuses anything but a pipe/socket and writable access mode,
-captures the original status word, adds only `O_NONBLOCK` (0o4000), and reads
-the exact status back before writing. Safe File writes are bounded by the
-transfer adapter's chunk, work and deadline limits. No descriptor number,
-caller-selected command or flags word escapes the raw module. Only
-`transfer.rs` constructs and uses this owner. Explicit completion and Cancel
-restore the original word with readback and report restoration failures;
-Drop does the same best-effort cleanup on teardown. The owned File remains
-live until restoration has been attempted, then std closes it. No
-adoption site or close syscall is needed. Flags are shared with the sender's
-open-file description; the caller must supply an exclusively used write
-endpoint, not one concurrently used or reconfigured by another writer.
-The public `transfer` module exposes bounded transport owners. The window
-hands `Outgoing` the send right td-ui's client delivers typed and passes
-the client a fresh private socket endpoint for receiving selected UTF-8
+The clipboard destination owner and its `fcntl` status commands are
+td-ui's (§19), reached as `td_ui::clipboard::Outgoing`, which the
+editor's `transfer` module re-exports as its `Outgoing`; the editor
+keeps `transfer::Incoming`, the receiver over a private socket pair
+this process makes nonblocking with safe `std`. The window hands
+`Outgoing` the send right td-ui's client delivers typed and passes the
+client a fresh private socket endpoint for receiving selected UTF-8
 text.
 
 Received rights reach the editor only through td-ui's client (§19), which
@@ -2328,12 +2320,13 @@ source's send, whose right the client hands the editor as an owned
 descriptor after checking the complete schema. The editor pops no right of
 its own. Tests inspect sent SHM pools through td-ui's `peer::drain` (§19).
 
-The editor's one descriptor owner is `transfer::Outgoing`, which takes the
-send right the client hands on for a live source and a supported MIME; the
-editor drops it while an outgoing writer is pending; what the client drops
-before handing on is §19's. No clipboard endpoint is reopened through procfs
-or admitted as a regular file. Destination writes use std and assume Rust's
-ignored SIGPIPE disposition, as documented by the transfer API.
+The editor's one descriptor consumer is td-ui's `clipboard::Outgoing`,
+which takes the send right the client hands on for a live source and a
+supported MIME; the editor drops it while an outgoing writer is pending;
+what the client drops before handing on is §19's. No clipboard endpoint
+is reopened through procfs or admitted as a regular file. Destination
+writes use std and assume Rust's ignored SIGPIPE disposition, as
+documented by the transfer API.
 
 The editor hands td-ui's descriptor send (§19) only the producer side of
 a fresh private UnixStream pair for `wl_data_offer.receive`; the SHM
@@ -2346,18 +2339,19 @@ pin that no source is mounted by path (the shared font, font data and wire
 sources are reached through td-ui), per-file keyword counts without prose
 slack, the function-only allowance, the complete raw source fingerprint,
 syscall values, all production wrapper call sites, that no file adopts a
-descriptor, that the Wayland adapter pops no right and that it never names
-the raw module.
+descriptor, that the Wayland adapter pops no right and that neither it
+nor the transfer module names the raw module.
 Conditional allowances, include paths, nested source directories and
-generated source includes are refused. Kernel tests of the transport are
-td-ui's (§19); the editor's exercise the clipboard destination owner over
-real pipes and sockets and the file transaction against a scripted peer.
+generated source includes are refused. Kernel tests of the transport and
+of the clipboard destination owner are td-ui's (§19); the editor's
+exercise its paste receiver over real sockets and the file transaction
+against a scripted peer.
 
 No mmap, ioctl, GPU access, poll, close syscall, credential call, child exec,
 raw environment-fd adoption or other received-fd consumer is authorized here. A
-fourth syscall, third fcntl command, another caller, incoming descriptor
-consumer, or additional allowance amends this section and
-`td-editor/DESIGN.md` in the same landing.
+third syscall, another caller, incoming descriptor consumer, or
+additional allowance amends this section and `td-editor/DESIGN.md` in the
+same landing.
 
 ## 15. `td-secret` — the credential portal client
 
@@ -2633,26 +2627,30 @@ td-sh's own entry.
 
 td-ui's `sys.rs` carries exactly THREE x86-64 Linux syscalls through one
 function-scoped instruction: `recvmsg` (47), `sendmsg` (46) and `fcntl` (72)
-pinned to `F_DUPFD_CLOEXEC` (1030). A second function-scoped allowance
-adopts newly installed nonnegative descriptors into `OwnedFd`. Safe `std`
-owns connection setup, byte-only sends, timeouts, pool file creation and
-unlinking, positional pixel writes and keymap reads, and every close. No raw
-pointer or unowned received descriptor escapes the private module; the crate
-root denies `unsafe`, and the two allowances are the module's only ones.
-Other architectures are refused at compile time rather than inheriting its
-ABI. The rest of the toolkit — the client over the transport, the raster,
-the chrome bands, the keymap compiler, the repeat policy, the pointer and
-data-device decoders and the mounted font and wire sources — has no raw
-boundary.
+pinned to `F_DUPFD_CLOEXEC` (1030) for the transport and to `F_GETFL` (3)
+and `F_SETFL` (4) for the clipboard destination owner. A second
+function-scoped allowance adopts newly installed nonnegative descriptors
+into `OwnedFd`. Safe `std` owns connection setup, byte-only sends,
+timeouts, pool file creation and unlinking, positional pixel writes and
+keymap reads, and every close. No raw pointer or unowned received
+descriptor escapes the private module; the crate root denies `unsafe`,
+and the two allowances are the module's only ones. Other architectures
+are refused at compile time rather than inheriting its ABI. The rest of
+the toolkit — the client over the transport, the raster, the chrome
+bands, the keymap compiler, the repeat policy, the pointer and
+data-device decoders, the widget window and the mounted font and wire
+sources — has no raw boundary.
 
 This surface is the editor's transport subset, moved here so that every
 td-owned graphical program shares one client, with one change: the
-ancillary length is written as the 8-byte `size_t` it is; §14 records
-what the editor kept. Reusing this module does not transfer its
-authorization to a new consumer: a program that depends on td-ui
-inherits the transport through `wayland::Connection`, alone or beneath
-`client::Client`, and nothing else, and one that needs a raw surface of
-its own gets its own roster entry.
+ancillary length is written as the 8-byte `size_t` it is; and, moved
+after it, the editor's clipboard destination owner, so that every such
+program's clipboard writes through one owner; §14 records what the
+editor kept. Reusing this module does not transfer its authorization to
+a new consumer: a program that depends on td-ui inherits the transport
+through `wayland::Connection`, alone or beneath `client::Client`, the
+destination owner through `clipboard::Outgoing`, and nothing else, and
+one that needs a raw surface of its own gets its own roster entry.
 
 The inherited-stream `fcntl` caller is pinned to `F_DUPFD_CLOEXEC`,
 minimum descriptor 3. It duplicates the borrowed `WAYLAND_SOCKET`
@@ -2663,6 +2661,29 @@ sockets, where reopening procfs does not. The original remains open until
 its existing owner or process exit closes it. This mode requires exclusive
 use of the inherited stream; socket timeouts are shared with the original.
 Failed duplication adopts nothing.
+
+The status `fcntl` callers are the clipboard destination owner's,
+`status` pinned to `F_GETFL` (3) and `set_status` to `F_SETFL` (4), with
+the caller's flags word. The private `Destination` in `clipboard.rs`
+converts the supplied `OwnedFd` into a safe `File`, refuses anything but
+a pipe/socket and writable access mode, captures the original status
+word, adds only `O_NONBLOCK` (0o4000), and reads the exact status back
+before writing; a readback that differs restores the word on the way
+out. Safe `File` writes are bounded by `Outgoing`'s chunk, work and
+deadline limits. No descriptor number or caller-selected command escapes
+the raw module, and the flags word a caller passes is the one it read
+back with `O_NONBLOCK` set, or the original. Only `Outgoing` constructs
+and uses the owner. The owner exists before the flag is set, so every
+exit after it restores the word: explicit completion and cancel restore
+the original with readback and report restoration failures; a refused
+readback in the constructor and drop make the same best-effort cleanup.
+The owned `File` remains live until restoration has been attempted, then
+std closes it: no adoption site or close syscall. Flags are shared with
+the sender's open-file description; the caller must supply an
+exclusively used write endpoint, not one concurrently used or
+reconfigured by another writer. `Incoming`, the reader, owns no received
+right: it makes its own socket pair nonblocking with safe `std` and hands
+the client the producer end to send.
 
 The receive callers are the connection's reader, `Connection::read_more`,
 and `peer::drain`, which reads the far end of a socket pair a consumer's
@@ -2715,24 +2736,31 @@ the keyboard without one until a later map succeeds. The other pop is
 right is popped per send; for the live source and a supported text MIME it
 is handed to the consumer as an owned descriptor inside the typed outcome,
 otherwise it is dropped, closing the descriptor, and the consumer's use of a
-handed-on right is its own contract (§14 for the editor's
-`transfer::Outgoing`). A missing descriptor waits in the loop for at most
-the write deadline, without assuming ancillary boundaries coincide with
-wire-message boundaries.
+handed-on right is its own contract: the widget window and the editor's
+window (§14) each hand it to `clipboard::Outgoing`. A missing descriptor
+waits in the loop for at most the write deadline, without assuming
+ancillary boundaries coincide with wire-message boundaries.
 
 Confinement tests pin the complete raw source fingerprint, the syscall and
 flag values, the two function-only allowances, the single instruction and
 adoption sites, that no other td-ui module names the raw module and that
-only `wayland.rs` calls its three wrappers, that the crate root denies
-`unsafe`, and that the keymap reader and the send are the only pops beyond
-the FIFO's own accessor, the reader with its format, size and regular-file
-checks. Kernel tests exercise transfer, close-on-exec duplication, refusal
-cleanup and truncated rights; a byte-level synthetic control test checks
-cleanup beyond unrecognized records and invalid entries.
+only `wayland.rs` calls its three transport wrappers and only
+`clipboard.rs` its two status wrappers, through the destination owner
+alone, whose whole implementation is fingerprinted and whose five status
+calls are pinned each at its exact site and in its exact form, that
+the crate root denies `unsafe`, and that the keymap reader and the send
+are the only pops beyond the FIFO's own accessor, the reader with its
+format, size and regular-file checks. Kernel tests exercise transfer,
+close-on-exec duplication, refusal cleanup and truncated rights, and the
+destination owner over real pipes and sockets: nonblocking mode and its
+restoration through a shared alias on completion, cancel and drop, the
+refusals, the deadline and the byte budget; a byte-level synthetic
+control test checks cleanup beyond unrecognized records and invalid
+entries.
 
 No mmap, ioctl, GPU access, poll, close syscall, credential call, child
 exec, raw environment-fd adoption or received-fd consumer beyond the keymap
-reader and the send hand-off is authorized here. A fourth syscall, second
+reader and the send hand-off is authorized here. A fourth syscall, fourth
 fcntl command, another caller, or additional allowance amends this section
 and `td-ui/DESIGN.md` in the same landing; a consumer that takes a right
 from the FIFO records that consumer in its own section.

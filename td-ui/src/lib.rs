@@ -19,14 +19,17 @@
 //! consecutive-frame runner behind a headless `--replay`; `driven`: the
 //! semantic seam, a `Controller` over a consumer's action table with the
 //! generic verbs routed over the envelope, text read back from the draw
-//! stream and the painted frame), and the widget window (`window`: the
-//! window that presents what a program paints over its surface and hands
-//! it chords, button phases and wheel travel in surface pixels). Outside
-//! `wayland`, `client`, the private raw module beneath them, the driving
-//! adapters `control_socket`, `control_worker` and `replay`, and the
-//! widget window `window`, nothing reads the environment, a clock, a
-//! descriptor or the filesystem: adapters supply explicit inputs, and
-//! `notices` embeds the face's licence texts at compile time.
+//! stream and the painted frame), the widget window (`window`: the window
+//! that presents what a program paints over its surface and hands it
+//! chords, button phases, wheel travel in surface pixels and the
+//! clipboard), and the clipboard's transfer owners (`clipboard`: the
+//! bounded nonblocking writer of an offered text over the send's right and
+//! the reader of the selection's text). Outside `wayland`, `client`,
+//! `clipboard`, the private raw module beneath them, the driving adapters
+//! `control_socket`, `control_worker` and `replay`, and the widget window
+//! `window`, nothing reads the environment, a clock, a descriptor or the
+//! filesystem: adapters supply explicit inputs, and `notices` embeds the
+//! face's licence texts at compile time.
 
 /// The bitmap cell every consumer lays text out on. The pinned Unifont face
 /// is 8x16 and `font::pinned` is held to these by a test, so pointer hit
@@ -37,6 +40,7 @@ pub const CELL_HEIGHT: usize = 16;
 pub mod charts;
 pub mod chrome;
 pub mod client;
+pub mod clipboard;
 pub mod confirmations;
 pub mod control;
 pub mod control_socket;

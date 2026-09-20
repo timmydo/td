@@ -6,7 +6,7 @@
 use std::sync::mpsc;
 
 use td_ui::raster::{Raster, Surface};
-use td_ui::window::{Flow, Handler, Input};
+use td_ui::window::{Clipboard, Flow, Handler, Input};
 
 use super::App;
 use crate::backend::{BackendCommand, BackendResponse};
@@ -34,7 +34,7 @@ impl Handler for Session<'_> {
         "Timmy's News"
     }
 
-    fn input(&mut self, input: Input<'_>) -> Flow {
+    fn input(&mut self, input: Input<'_>, _clipboard: &mut dyn Clipboard) -> Flow {
         if self.app.input(input, self.cache, self.cmd_tx) {
             Flow::Quit
         } else {
