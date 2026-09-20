@@ -157,14 +157,15 @@ copies. The UI design specifies the unsaved-edit behavior.
 
 `src/portable.rs` supplies the private, safe envelope primitive. It is
 compiled and tested by the td-secret recipe but has no public command,
-device consumer, filesystem writer or authorization API. Its synthetic
-protector inputs do not establish enrollment, UV or a presented operation.
+device consumer or authorization API. Its synthetic protector inputs do not
+establish enrollment, UV or a presented operation. The private ciphertext
+store below supplies publication.
 The future trusted backend must provide proved token output and kernel
 entropy; no application receives access to the raw-key primitive. An open
 snapshot pins the complete envelope digest, so revision refuses another
 vault or a different retained revision before producing output. Revision
 returns proposed encrypted bytes; it neither publishes nor consumes write
-authorization and cannot replace the future persistent-baseline check.
+authorization and cannot replace the ciphertext store's baseline check.
 The primitive permits competing proposals from the same snapshot; the
 backend must authorize and publish at most one against that baseline.
 A saved envelope needs a new open snapshot before a subsequent revision;
@@ -255,6 +256,68 @@ persisted hints after restart and revision, malformed COSE and curve points,
 valid-point substitutions against both wrapper and body authentication,
 and refusal of old/unknown versions. These are cryptographic
 and structural tests, not physical enrollment or recovery evidence.
+
+### Implemented ciphertext publication prerequisite
+
+`src/portable_store.rs`, a private child of the envelope module, owns short
+exclusive filesystem transactions. It accepts an already opened, trusted
+mode-0700 directory and an independently supplied owner UID. The future td
+and standalone adapters must acquire that descriptor through their admitted
+path traversal and durably create the directory when needed; this primitive
+neither resolves user paths nor infers authority from filesystem ownership.
+The adapter runs as that owner and preserves mode-0600 owner bits in its
+umask; this primitive does not change process or file ownership. If a newly
+created lock fails admission, it attempts to remove only that same inode.
+Existing or replaced invalid locks are preserved and refused.
+It introduces no command, plaintext writer, hardware consumer or application
+API. It is not yet a usable vault backend.
+
+The directory contains an empty mode-0600 `lock` and mode-0600 `vault`.
+Both must be regular single-link files owned by the supplied UID. Symlinks,
+wrong metadata and oversized or malformed envelopes are refused. Operations
+are relative to the pinned directory through Linux procfs. Lock acquisition
+is nonblocking. Retirement explicitly unlocks before closing the descriptor,
+so an inherited open-file description cannot extend a normally completed
+transaction. Abrupt exit still relies on descriptor closure; forked children
+must exec or close their inherited descriptors. Lock pathname
+identity is rechecked, and a replaced lock is refused. An unavailable lock
+mechanism fails closed. A newly created lock and its directory are synced;
+existing locks need no repeated sync because locking state is volatile.
+Successful vault publication always syncs the directory. The caller drops
+the read transaction before token
+presentation, retains its snapshot, then opens a new transaction to publish.
+
+A snapshot retains the directory descriptor, the committed inode and exact
+ciphertext. Publication consumes that snapshot and the transaction. It
+requires the same directory and baseline inode/bytes, or continued absence
+for initial creation. New envelopes start at revision one; subsequent ones
+must retain the vault identity and advance exactly one revision. These are
+structural checks, not authentication: the future backend must authenticate
+the retained bytes, prove both initial protectors and authorize the exact
+proposed operation before invoking publication. Raw parsed envelopes confer
+no such authority. The store neither merges nor automatically retries.
+
+Publication creates an exclusive random mode-0600 temporary, writes only
+ciphertext, syncs the file, rechecks the baseline and temporary inode, renames
+it over `vault`, and syncs the directory. Errors before the rename attempt
+preserve the old committed bytes. Once rename is attempted, every failure
+has a typed uncertain outcome with its fixed operation reason, including a
+rename error that might have been reported after taking effect. The caller
+must reload and authenticate before deciding what to do. Temporary
+collisions refuse without replacing anything. A crashed writer can leave
+orphan ciphertext; it is never adopted or automatically deleted. Ordinary
+errors before the rename attempt try to remove only their own retained
+temporary; uncertain attempts may leave orphan ciphertext.
+Cooperating writers serialize; a malicious process with the same owner or
+root can interfere between checks, and is outside this filesystem boundary.
+This does not prevent restoration of an older valid vault from disk.
+
+Tests reopen created and revised ciphertext with each synthetic protector,
+reject competing writers and changed baselines, exercise descriptor pinning,
+metadata/size/lock refusals, inject failures around publication, and abruptly
+exit owned subprocesses before and after rename. Process-exit tests establish
+restart behavior, not power-loss durability on every filesystem. Physical
+YubiKey recovery and Guix path/device/session integration remain outstanding.
 
 ### Dependency-free cryptography boundary
 

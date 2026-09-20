@@ -15,12 +15,24 @@ The recipe is `recipes/src/recipes/td-secret.rs`, built with
 the source-built Rust 1.96.0 at
 `/td/store/r9xqzb6pzpyv55h5sg8lbrm3wa4hpmqp-rust-toolchain-1.96.0`.
 The inspected output is
-`/td/store/i5g7hkscmlxzq5703c54rw78wk22slc3-td-secret-0.1`:
+`/td/store/bajphw0vdxzac9c76bsrpz2kyyjygb90-td-secret-0.1`:
 
 | File | SHA-256 |
 | --- | --- |
-| `bin/td-secret` | `56deafd377bbce9d756e9ea6b0a153293a41487c257410843979862ed8c80b10` |
-| `lib/debug/bin/td-secret.debug` | `e206a2c4841c8bdd844215bc39cd04043c666b8068ed350e6ea75cd503cacdc6` |
+| `bin/td-secret` | `cbe4a4c3080ae4df0344ce6ede09dd5c53c3f04a501b1d592b46ce4bbcfe02a8` |
+| `lib/debug/bin/td-secret.debug` | `cffeb99fc1c89386240fd973b52cc24c2c4d4edd8433781bfc78d5fda296f38a` |
+
+The ciphertext-publication prerequisite has no production caller yet. Its
+rebuilt diagnostic has byte-identical `.text`, `.rodata`, `.data.rel.ro`,
+`.got` and `.rela.plt` sections to the previously inspected
+`/td/store/i5g7hkscmlxzq5703c54rw78wk22slc3-td-secret-0.1` artifact.
+The arithmetic, outlined callees and addresses below are unchanged; file
+hashes change with debug information and the resulting build ID. This
+comparison does not certify a future storage or notebook consumer.
+
+On this host the same output bytes are available beneath
+`~/.td/build-daemon/ladder-shared-v1/build-cache/store/`; `/td/store` is
+the canonical path inside the build sandbox.
 
 The production invocation uses edition 2021, `-C opt-level=s`, target
 `x86_64-unknown-linux-gnu`, `-C target-feature=+crt-static`,
@@ -82,8 +94,8 @@ The diagnostic's repeat-secret comparison was also inspected: it reads and
 XOR/OR-folds all 32 bytes before branching on the equality result. Public
 length admission and the final success/failure branch are outside that loop.
 
-The source-built tests passed 236 cases with 30 existing VM/device cases
-ignored. Independent AES/P-256/PIN vectors and full diagnostic transcripts
+The source-built tests passed 249 cases with 30 existing VM/device cases
+and one explicitly invoked subprocess helper ignored. Independent AES/P-256/PIN vectors and full diagnostic transcripts
 test mathematical and protocol results separately from this inspection.
 No physical key was used to produce this record.
 

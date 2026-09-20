@@ -1,5 +1,8 @@
 //! Bounded portable envelope. Token authorization and persistence are adapters.
 
+#[path = "portable_store.rs"]
+pub(super) mod storage;
+
 use super::{crypto, fido_p256::PublicKey};
 use std::collections::BTreeSet;
 use std::io::Read;
@@ -628,7 +631,7 @@ mod tests {
         ]
     }
 
-    fn fixture() -> LockedVault {
+    pub(super) fn fixture() -> LockedVault {
         LockedVault::create(&notebook(), protectors(), &mut random()).unwrap()
     }
 
