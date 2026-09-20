@@ -114,7 +114,8 @@ const BOOT_FAIL_PARKED: &str = "td-boot-parked-v1";
 // current/previous from the Btrfs volume and kexecs the selected deployment.
 // That deployment's distinct initramfs requires the td.deployment handoff,
 // re-verifies root.erofs, binds it to a read-only loop device, mounts @var from
-// Btrfs, and switch_roots. `/etc` stays deployment-owned and immutable, with ONE
+// Btrfs, publishes any saved-name account projection read-only, and switch_roots.
+// `/etc` keeps its deployment-owned directory and reviewed account mounts, with ONE
 // reviewed symlink per mutable file out to writable state (the `MUTABLE_ETC` table
 // below) rather than an overlay — so the read-only-`/etc` assertion survives while
 // per-machine identity still persists; `/home` and `/root` are root-image symlinks
@@ -1382,7 +1383,7 @@ mod svc_timeouts {
 ///     initialization of their shared state directory.
 ///   td-firstboot mints the per-machine identity, so it precedes everything that reads
 ///     or checks it — rootcheck (asserts it is READABLE through the MUTABLE_ETC
-///     symlinks on a still-read-only /etc), and OpenSSH (whose immutable config
+///     symlinks on a still-read-only /etc), and OpenSSH (whose generated config
 ///     names those mutable paths). It also provisions the applications'
 ///     first configuration into the login user's home, which stage-1 init created
 ///     and handed to that user before sysinit began.
@@ -2132,7 +2133,6 @@ fn build_deployment_init(sys: &SystemDef) -> String {
      /bin/td-boot on-volume mount-var /sysroot/var\n\
      /bin/td-util printf '%s\\n' 2 > /proc/sys/kernel/perf_event_paranoid\n\
      /bin/td-util test \"$(/bin/td-util cat /proc/sys/kernel/perf_event_paranoid)\" = 2 || { echo 'td-init: kernel.perf_event_paranoid did not realize the pinned value 2' >&2; exit 1; }\n\
-     /bin/umount /dev\n\
      /bin/umount /sys\n\
      /bin/mount -t tmpfs -o mode=0755 tmpfs /sysroot/run\n\
      /bin/td-util printf '%s\\n' \"$deployment\" > /sysroot/run/td-deployment\n\
@@ -2147,10 +2147,38 @@ fn build_deployment_init(sys: &SystemDef) -> String {
             init.push_str(&format!(" /sysroot/var{}", user.home));
         }
     }
-    init.push_str(&format!(
+    init.push_str(
         "\n/bin/td-util chown 0:0 /sysroot/var /sysroot/var/home\n\
-         /bin/td-util chmod 0755 /sysroot/var /sysroot/var/home\n\
-         primary_home=$(/bin/td-firstboot prepare-primary-home /sysroot) || exit 1\n\
+         /bin/td-util chmod 0755 /sysroot/var /sysroot/var/home\n"
+    );
+    init.push_str(&format!(
+        "/bin/td-util mkdir -p /sysroot/var/lib/td-profiler/captures\n\
+         /bin/td-util chown 0:0 /sysroot/var/lib /sysroot/var/lib/td-profiler\n\
+         /bin/td-util chmod 0755 /sysroot/var/lib /sysroot/var/lib/td-profiler\n\
+         /bin/td-util chown {PROFILER_UID}:{PROFILER_READ_GID} /sysroot/var/lib/td-profiler/captures\n\
+         /bin/td-util chmod 2750 /sysroot/var/lib/td-profiler/captures\n\
+         if /bin/td-util test -e /sysroot/var/lib/td-test/td-jail-seccomp-probe; then\n\
+         /bin/td-util test -f /sysroot/var/lib/td-test/td-jail-seccomp-probe\n\
+         /bin/td-util chown 0:0 /sysroot/var/lib /sysroot/var/lib/td-test \
+         /sysroot/var/lib/td-test/td-jail-seccomp-probe\n\
+         /bin/td-util chmod 0755 /sysroot/var/lib /sysroot/var/lib/td-test\n\
+         /bin/td-util chmod 0555 /sysroot/var/lib/td-test/td-jail-seccomp-probe\n\
+         fi\n\
+         if /bin/td-util test -e /sysroot{QEMU_OPENSSH_ADMIN_PRIVATE_KEY}; then\n\
+         /bin/td-util test -f /sysroot{QEMU_OPENSSH_ADMIN_PRIVATE_KEY}\n\
+         /bin/td-util test -f /sysroot{SSHD_AUTHORIZED_KEYS_STATE}\n\
+         /bin/td-util chown 0:0 /sysroot/var/lib /sysroot/var/lib/td-test \
+         /sysroot{QEMU_OPENSSH_ADMIN_PRIVATE_KEY} /sysroot/var/lib/td \
+         /sysroot/var/lib/td/ssh /sysroot{SSHD_AUTHORIZED_KEYS_STATE}\n\
+         /bin/td-util chmod 0755 /sysroot/var/lib /sysroot/var/lib/td-test \
+         /sysroot/var/lib/td\n\
+         /bin/td-util chmod 0700 /sysroot/var/lib/td/ssh\n\
+         /bin/td-util chmod 0600 /sysroot{QEMU_OPENSSH_ADMIN_PRIVATE_KEY} \
+         /sysroot{SSHD_AUTHORIZED_KEYS_STATE}\n\
+         fi\n"
+    ));
+    init.push_str(&format!(
+        "primary_home=$(/bin/td-firstboot prepare-primary-profile /sysroot) || exit 1\n\
          /bin/sh -c 'umask 077; /bin/td-firstboot render-primary-sshd /sysroot > /sysroot{SSHD_CONFIG} && /bin/td-util chmod 0600 /sysroot{SSHD_CONFIG}' || exit 1\n\
          /bin/umount /proc\n\
          downloads=\"$primary_home/Downloads\"\n\
@@ -2186,33 +2214,8 @@ fn build_deployment_init(sys: &SystemDef) -> String {
             ));
         }
     }
-    init.push_str(&format!(
-        "/bin/td-util mkdir -p /sysroot/var/lib/td-profiler/captures\n\
-         /bin/td-util chown 0:0 /sysroot/var/lib /sysroot/var/lib/td-profiler\n\
-         /bin/td-util chmod 0755 /sysroot/var/lib /sysroot/var/lib/td-profiler\n\
-         /bin/td-util chown {PROFILER_UID}:{PROFILER_READ_GID} /sysroot/var/lib/td-profiler/captures\n\
-         /bin/td-util chmod 2750 /sysroot/var/lib/td-profiler/captures\n\
-         if /bin/td-util test -e /sysroot/var/lib/td-test/td-jail-seccomp-probe; then\n\
-         /bin/td-util test -f /sysroot/var/lib/td-test/td-jail-seccomp-probe\n\
-         /bin/td-util chown 0:0 /sysroot/var/lib /sysroot/var/lib/td-test \
-         /sysroot/var/lib/td-test/td-jail-seccomp-probe\n\
-         /bin/td-util chmod 0755 /sysroot/var/lib /sysroot/var/lib/td-test\n\
-         /bin/td-util chmod 0555 /sysroot/var/lib/td-test/td-jail-seccomp-probe\n\
-         fi\n\
-         if /bin/td-util test -e /sysroot{QEMU_OPENSSH_ADMIN_PRIVATE_KEY}; then\n\
-         /bin/td-util test -f /sysroot{QEMU_OPENSSH_ADMIN_PRIVATE_KEY}\n\
-         /bin/td-util test -f /sysroot{SSHD_AUTHORIZED_KEYS_STATE}\n\
-         /bin/td-util chown 0:0 /sysroot/var/lib /sysroot/var/lib/td-test \
-         /sysroot{QEMU_OPENSSH_ADMIN_PRIVATE_KEY} /sysroot/var/lib/td \
-         /sysroot/var/lib/td/ssh /sysroot{SSHD_AUTHORIZED_KEYS_STATE}\n\
-         /bin/td-util chmod 0755 /sysroot/var/lib /sysroot/var/lib/td-test \
-         /sysroot/var/lib/td\n\
-         /bin/td-util chmod 0700 /sysroot/var/lib/td/ssh\n\
-         /bin/td-util chmod 0600 /sysroot{QEMU_OPENSSH_ADMIN_PRIVATE_KEY} \
-         /sysroot{SSHD_AUTHORIZED_KEYS_STATE}\n\
-         fi\n\
-         exec /bin/switch_root /sysroot /init\n"
-    ));
+    // Child Stdio::null and shell redirections still need the real /dev/null.
+    init.push_str("/bin/umount /dev\nexec /bin/switch_root /sysroot /init\n");
     init
 }
 
@@ -3649,8 +3652,8 @@ fn etc_dirs() -> Vec<&'static str> {
     dirs
 }
 
-/// `/etc/mutable-state` — the reviewed list of every `/etc` path that is NOT
-/// immutable image content, written into the image as an ordinary (immutable) file.
+/// `/etc/mutable-state` describes writable-state symlinks and the separate
+/// read-only account projections in an ordinary immutable image file.
 ///
 /// The table above already decides the symlinks, so shipping it as text costs one
 /// small file and answers, ON the machine, the question the design provokes: why is
@@ -3659,12 +3662,15 @@ fn etc_dirs() -> Vec<&'static str> {
 /// stale.
 fn build_mutable_state() -> String {
     let mut s = String::from(
-        "# Every /etc path that is NOT immutable image content.\n\
+        "# Writable state reached through reviewed /etc symlinks.\n\
          #\n\
          # /etc is a read-only erofs directory (proved on each boot by /etc/rootcheck)\n\
          # and there is deliberately NO /etc overlay: each line below is one reviewed\n\
          # symlink out of it, so the set of mutable files is a fixed, auditable list\n\
          # rather than a whole writable directory.\n\
+         # passwd, group and shadow may instead be read-only account projections\n\
+         # prepared by td-firstboot from signed base tables and the saved username.\n\
+         # Those three file binds preserve numeric identities and authentication fields.\n\
          #\n\
          # volatile  = /run tmpfs, rebuilt every boot by td-netd\n\
          # persistent = /var Btrfs subvolume, minted once per machine by td-firstboot\n\
@@ -10262,7 +10268,7 @@ news\tnews-0.1\tsource\tstatic-runtime-1\tsource\n"
             })
                 && !init.contains("-t overlay")
                 && !init.contains(" /sysroot/etc"),
-            "stage-1 init must not restore tmpfs state or an overlay over immutable /etc"
+            "init issues no /etc mount; td-firstboot alone publishes the three read-only account file binds"
         );
         assert!(
             init.contains("mount -o move /volume /sysroot/run/td-volume")
@@ -10302,7 +10308,7 @@ news\tnews-0.1\tsource\tstatic-runtime-1\tsource\n"
                     "the hand-over precedes the mode, as the Downloads setup does"
                 );
             } else if user.uid == UI_UID {
-                assert!(init.contains("primary_home=$(/bin/td-firstboot prepare-primary-home /sysroot)"));
+                assert!(init.contains("primary_home=$(/bin/td-firstboot prepare-primary-profile /sysroot)"));
                 assert!(!init.contains(&path));
             } else if user.uid == 0 {
                 assert!(init.contains("/sysroot/var/root"));
@@ -10471,13 +10477,18 @@ news\tnews-0.1\tsource\tstatic-runtime-1\tsource\n"
     }
 
     #[test]
-    fn deployment_prepares_the_checked_home_before_releasing_procfs() {
+    fn deployment_prepares_the_checked_home_before_releasing_boot_filesystems() {
         let init = build_deployment_init(&SYSTEM);
         assert_eq!(init, build_deployment_init(&renamed_primary_system()));
-        let prepare = "primary_home=$(/bin/td-firstboot prepare-primary-home /sysroot) || exit 1";
+        let prepare = "primary_home=$(/bin/td-firstboot prepare-primary-profile /sysroot) || exit 1";
         assert_eq!(init.matches(prepare).count(), 1);
         assert!(init.find("mount-var /sysroot/var").unwrap() < init.find(prepare).unwrap());
+        assert!(init.find("/bin/td-util chmod 0755 /sysroot/var/lib /sysroot/var/lib/td-profiler").unwrap() < init.find(prepare).unwrap());
+        assert!(init.find(prepare).unwrap() < init.find("render-primary-sshd /sysroot").unwrap());
         assert!(init.find(prepare).unwrap() < init.find("/bin/umount /proc").unwrap());
+        assert_eq!(init.matches("/bin/umount /dev").count(), 1);
+        assert!(init.find(prepare).unwrap() < init.find("/bin/umount /dev").unwrap());
+        assert!(init.find("/bin/umount /dev").unwrap() < init.find("/bin/switch_root").unwrap());
         assert!(init.find(prepare).unwrap() < init.find("/bin/switch_root").unwrap());
         assert!(!init.contains("/home/tester") && !init.contains("/home/alice"));
         assert!(init.contains("downloads=\"$primary_home/Downloads\""));

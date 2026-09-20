@@ -2325,6 +2325,16 @@ fn validate_system_boot(
             tail(&result.console, 80)
         ));
     }
+    require_primary_profile(result, "tester")
+}
+
+fn require_primary_profile(result: &BootResult, name: &str) -> Result<(), String> {
+    let expected = format!("TD-PRIMARY-PROFILE-READY {name}");
+    let names: Vec<_> = result.console.lines().map(str::trim_end)
+        .filter(|line| line.starts_with("TD-PRIMARY-PROFILE-READY ")).collect();
+    if names != [expected.as_str()] {
+        return Err(format!("system did not activate its expected primary account {name}: {names:?}\n{}", tail(&result.console, 100)));
+    }
     Ok(())
 }
 
@@ -10471,7 +10481,13 @@ mod tests {
         };
         result.evidence.shutdown = true;
         result.evidence.td_claude_terminal = true;
+        result.console = "TD-PRIMARY-PROFILE-READY tester\n".into();
         assert_eq!(validate_session_boot(&result), Ok(()));
+        for console in ["", "TD-PRIMARY-PROFILE-READY alice\n", "TD-PRIMARY-PROFILE-READY tester\nTD-PRIMARY-PROFILE-READY tester\n"] {
+            let original = std::mem::replace(&mut result.console, console.into());
+            assert!(validate_session_boot(&result).unwrap_err().contains("expected primary account"));
+            result.console = original;
+        }
         for (consumed, exhausted) in [(true, false), (false, true)] {
             result.evidence.attempt_consumed = consumed;
             result.evidence.attempts_exhausted = exhausted;
@@ -10488,7 +10504,7 @@ mod tests {
             exited_clean: true,
             marker_killed: false,
             reason: String::new(),
-            console: String::new(),
+            console: "TD-PRIMARY-PROFILE-READY tester\n".into(),
             elapsed: Duration::from_secs(1),
             firefox_audio: FirefoxAudioCapture::NotRequested,
         };

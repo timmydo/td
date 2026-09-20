@@ -38,6 +38,7 @@ pub(crate) const MAIN_RS: &str = include_str!("../../../td-firstboot/src/main.rs
 
 // (module basename, source text). rustc resolves `mod NAME;` to `{src}/NAME.rs`.
 const MODULES: &[(&str, &str)] = &[
+    ("primary_profile", include_str!("../../../td-firstboot/src/primary_profile.rs")),
     ("ssh_policy", include_str!("../../../td-firstboot/src/ssh_policy.rs")),
     ("primary_home", include_str!("../../../td-firstboot/src/primary_home.rs")),
     ("hostname", include_str!("../../../td-firstboot/src/hostname.rs")),

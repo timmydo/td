@@ -90,17 +90,33 @@ fn primary_table_rename_preserves_near_matches_and_refuses_growth_past_the_bound
 struct AccountStageFixture(PathBuf);
 
 impl AccountStageFixture {
+    fn fresh_root(stamp: u128) -> std::io::Result<PathBuf> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SERIAL: AtomicU64 = AtomicU64::new(0);
+        for _ in 0..64 {
+            let serial = SERIAL.fetch_add(1, Ordering::Relaxed);
+            let root = std::env::temp_dir().join(format!(
+                "td-primary-stage-{}-{stamp}-{serial}", std::process::id()
+            ));
+            match std::fs::DirBuilder::new().mode(0o700).create(&root) {
+                Ok(()) => return Ok(root),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        Err(std::io::Error::other("account fixture staging names exhausted"))
+    }
+
     fn new() -> Self {
         let stamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let root =
-            std::env::temp_dir().join(format!("td-primary-stage-{}-{stamp}", std::process::id()));
-        std::fs::DirBuilder::new()
-            .mode(0o700)
-            .create(&root)
-            .unwrap();
+        Self::at(stamp)
+    }
+
+    fn at(stamp: u128) -> Self {
+        let root = Self::fresh_root(stamp).unwrap();
         std::fs::DirBuilder::new()
             .mode(0o700)
             .create(root.join("etc"))
@@ -435,4 +451,13 @@ fn malformed_launch_names_have_bounded_escaped_diagnostics() {
     assert!(!error.contains('\u{1b}'));
     assert!(error.len() < 300);
     assert!(error.contains("invalid launch account record"));
+}
+
+#[test]
+fn account_fixtures_do_not_share_a_root_when_clock_values_repeat() {
+    let first = AccountStageFixture::at(0);
+    let second = AccountStageFixture::at(0);
+    assert_ne!(first.0, second.0);
+    assert!(first.0.join("etc/passwd").is_file());
+    assert!(second.0.join("etc/passwd").is_file());
 }

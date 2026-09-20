@@ -228,6 +228,16 @@ readable file and directory modes. The persistent `/etc/hostname` link,
 boot-time default initialization, kernel activation and QEMU evidence are
 specified in INSTALLER.md. No user-selected value enters generated shell.
 
+An optional `--username NAME VERIFIED-ROOT TD-FIRSTBOOT` binds a selected name
+to the caller-authenticated stable deployment and an absolute source-built
+validator. Complete account admission must succeed before volume destination
+access or scratch removal. The formatter seeds `@var/lib/td/username` with the
+same modes and a final newline. INSTALLER.md owns early account publication,
+read-only projection, home preparation and recovery; the numeric UID/GID and
+authentication fields remain unchanged. Layout callers must perform that
+preflight before their first destructive command. This interface is a
+caller-bound primitive, not a user-selectable validator or disk authorization.
+
 `layout-preview` uses the same layout calculation without a destination
 operand or any filesystem access. Its geometry-only contract and output
 schema live in INSTALLER.md; it does not admit a disk or authorize writes.

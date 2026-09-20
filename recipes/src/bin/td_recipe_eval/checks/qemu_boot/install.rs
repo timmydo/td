@@ -139,6 +139,7 @@ const OUTPUTS: &[&str] = &[
     "td-install-qemu-test",
     "linux-x86-64",
     "td-install",
+    "td-firstboot",
     "td-init",
     "td-boot",
     "td-kexec",
@@ -227,7 +228,7 @@ struct LiveInstaller {
 impl LiveInstaller {
     fn load(runner: &RecipeCheckRunner, trust: &RunTrust) -> Result<Self, String> {
         let outputs = runner.build_and_stage("td-install-qemu-test", OUTPUTS)?;
-        let [probe, linux, installer, init, boot, kexec, btrfs, tzdata] = outputs.as_slice() else {
+        let [probe, linux, installer, firstboot, init, boot, kexec, btrfs, tzdata] = outputs.as_slice() else {
             return Err("installation fixture output roster mismatch".into());
         };
         let kernel = linux.join("bzImage");
@@ -247,6 +248,7 @@ impl LiveInstaller {
         let uuid = installation_uuid(&trust.public);
         let uuid_line = format!("{uuid}\n").into_bytes();
         let mut extra = vec![
+            ("bin/td-firstboot".into(), 0o755, read(&firstboot.join("bin/td-firstboot"))?),
             (
                 "bin/td-install".into(),
                 0o755,
@@ -1604,6 +1606,7 @@ fn validate_installed_system(
             tail(&result.console, 100)
         ));
     }
+    require_primary_profile(result, protocol::USERNAME)?;
     let expected_hostname = format!("TD-HOSTNAME-READY {}", protocol::HOSTNAME);
     let hostnames: Vec<_> = result.console.lines().map(str::trim_end)
         .filter(|line| line.starts_with("TD-HOSTNAME-READY ")).collect();
@@ -1804,6 +1807,17 @@ mod tests {
         assert!(validate_installed_system(&good, "uuid", "/dev/vda2", "deployment", true).is_ok());
     }
 
+    #[test]
+    fn installed_username_requires_exactly_one_verified_saved_name() {
+        let expected = format!("TD-PRIMARY-PROFILE-READY {}\n", protocol::USERNAME);
+        for replacement in [String::new(), "TD-PRIMARY-PROFILE-READY tester\n".into(), expected.repeat(2)] {
+            let mut bad = healthy_system();
+            bad.console = bad.console.replace(&expected, &replacement);
+            assert!(validate_installed_system(&bad, "uuid", "/dev/vda2", "deployment", true).is_err());
+        }
+        assert!(validate_installed_system(&healthy_system(), "uuid", "/dev/vda2", "deployment", true).is_ok());
+    }
+
     fn healthy_system() -> BootResult {
         let mut evidence = ConsoleEvidence {
             target: true,
@@ -1835,7 +1849,7 @@ mod tests {
         BootResult {
             evidence, exited_clean: false, marker_killed: true,
             reason: "fixture".into(),
-            console: format!("TD-BOOT-VOLUME uuid /dev/vda2\nTD-BOOT-SELECTED-CURRENT deployment\nTD-HOSTNAME-READY {}\n{SYSTEM_BOOT_SUCCESS_MARKER}\n", protocol::HOSTNAME),
+            console: format!("TD-BOOT-VOLUME uuid /dev/vda2\nTD-BOOT-SELECTED-CURRENT deployment\nTD-HOSTNAME-READY {}\nTD-PRIMARY-PROFILE-READY {}\n{SYSTEM_BOOT_SUCCESS_MARKER}\n", protocol::HOSTNAME, protocol::USERNAME),
             elapsed: Duration::ZERO, firefox_audio: FirefoxAudioCapture::NotRequested,
         }
     }

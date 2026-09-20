@@ -127,7 +127,7 @@ mod tests {
         ] { assert!(grant.contains(step), "{step}"); }
         let init = super::super::system_x86_64::deployment_init_fixture();
         assert!(init.contains(
-            "primary_home=$(/bin/td-firstboot prepare-primary-home /sysroot) || exit 1"
+            "primary_home=$(/bin/td-firstboot prepare-primary-profile /sysroot) || exit 1"
         ));
         assert!(init.contains("downloads=\"$primary_home/Downloads\""));
         assert!(SYSTEM_X86_64_RS.contains(

@@ -116,8 +116,9 @@ The live guest supplies `--trusted-key` to `td-install volume` instead of
 the three publishing operands. The formatter initializes the publication
 directories and key without a deployment or selector. The fixture requires
 empty staged boot, deployment and incoming directories, plus only the
-expected timezone and hostname settings beneath @var, then deletes
-its entire private scratch directory after partition refresh, then calls `td-boot install` with the resolved partition,
+expected timezone, hostname and (for the full system) username settings
+beneath @var, then deletes its entire private scratch directory after
+partition refresh, then calls `td-boot install` with the resolved partition,
 /source and the same read-only live public key. Successful mounted
 publication and sync precede the direct-publication and installation markers;
 the host requires both. The full cold-boot oracle still proves the expected
@@ -133,6 +134,22 @@ exactly one `TD-HOSTNAME-READY td-qemu-installed` line on every installed
 boot, including the additional application-evidence boot. That production
 marker follows setting and reading back the kernel hostname; merely
 saving the file cannot satisfy it.
+
+The full-system profile also chooses `alice`. After authenticating all ISO
+payloads, it read-only loop-mounts the signed EROFS and runs the source-built
+`td-firstboot check-primary-name` before layout. Volume repeats admission
+through `--username alice /root-image /bin/td-firstboot`; the verified source
+remains stable on read-only media. The fixture checks the exact mode-0644
+saved file in staged and mounted @var. Every installed full-system boot must
+report exactly one `TD-PRIMARY-PROFILE-READY alice`, after production account
+publication and home preparation. The existing SSH, terminal, ownership and
+application probes then run as that account. The live fixture unmounts
+its temporary EROFS view after formatting, retaining the read-only loop
+binding until its VM ends. That phase neither reuses loop0 nor unmounts
+the source; installed boots start in a fresh kernel. The tiny sentinel
+deployment has no account database and keeps its existing settings and
+boot protocol.
+This is a fixed diagnostic choice, not an operator account-configuration UI.
 
 The host then detaches media and cold-boots the destination through
 firmware. The selector emits read-only discovery evidence for its configured

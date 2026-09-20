@@ -151,8 +151,12 @@ and download probes. The immutable `/home` alias to `var/home` makes the
 account's canonical HOME and the provisioner's persistent home agree.
 The SSH server's self-test Match configuration also uses the admitted primary
 account, as specified below.
-These diagnostics do not publish or activate a selected username.
-Updates must retain the installed identity and settings.
+The early account-profile operation below activates the saved username before
+these consumers start. Updates retain the saved identity and settings and
+revalidate them against the newly selected deployment. An update that introduces
+a collision with the saved name refuses at boot. Update-time account preflight
+before publication is still required as a future availability improvement;
+rollback does not repair malformed shared state.
 
 `td-firstboot check-primary-name ROOT NAME` is a read-only preflight for a
 proposed name against an already verified, staged deployment. It shares the
@@ -175,8 +179,8 @@ It prints `TD-PRIMARY-NAME-CHECK-OK` only on success and never writes settings
 or account files. The caller supplies the staged root and must separately
 verify deployment authenticity; this command does not authorize erasure,
 enroll retained reservations, validate service configuration or activate the
-selected account. Wiring it into the installer and publishing the coherent
-boot-time account configuration remain part of the username cutover.
+selected account. The volume formatter and full-system installation fixture
+use this preflight as described below.
 
 `td-firstboot stage-primary-name ROOT NAME OUT` prepares that account
 configuration from the same caller-verified deployment. It validates the
@@ -199,18 +203,55 @@ directories are synced. A write failure can leave a private incomplete
 output; callers must require success before consuming it and use a new
 output for a retry. This command does not modify the input account files or live `/etc`,
 create homes, save an installer choice or start a session. Deployment
-verification, boot-time publication and the remaining coordinated cutover
-are still the caller's responsibility.
+verification and boot-time publication remain the caller's responsibility.
 
-`td-firstboot prepare-primary-home ROOT` is an early boot operation over
-an already authenticated deployment with its persistent `/var` mounted.
+`td-install volume` accepts `--username NAME VERIFIED-ROOT TD-FIRSTBOOT`
+after the regional settings and before its destination operands. The caller
+binds the absolute source-built validator and authenticated, stable deployment
+root, just as it binds the formatter and publisher tools. These paths are
+control-plane inputs, not wizard fields. Before opening the destination or
+clearing scratch, the formatter validates the bounded name syntax locally and
+requires successful `check-primary-name` for that root and name. Complete
+roster, collision and reservation admission remains the validator's job.
+The volume formatter seeds only `@var/lib/td/username`, a mode-0644 file
+containing the name and one newline under mode-0755 parents. A caller doing
+layout first must perform the same preflight before layout; volume cannot
+retroactively protect an earlier write. This primitive supplies no consent.
+
+`td-firstboot prepare-primary-profile ROOT` runs over an authenticated
+deployment with persistent `/var`, fresh volatile `/run`, and procfs mounted.
+The calling initramfs retains devtmpfs while this operation runs: spawning
+its mount applet with null stdin/stdout requires the real `/dev/null`.
+Devtmpfs is unmounted only after early preparation, before switching roots.
 Before writing, it admits the complete root-owned account and principal
-tables using the primary-name checks above. It derives `/var/home/NAME`
-from the validated UID/GID-1000 account. ROOT, its `var`, and `var/home`
-must be real root-owned mode-0755 directories; procfs must be available
-for descriptor-relative access. The caller supplies trusted ancestors and
-serializes this operation before any user process or competing root writer.
-It neither verifies the deployment signature nor proves the mount itself.
+tables. An absent saved username retains the deployment's primary name.
+When present, the file must be a single-link root-owned regular file at
+exactly mode 0644, at most 33 bytes, with the same name grammar and one final
+newline. The setting read descends through descriptor-pinned real root-owned
+mode-0755 ancestors; missing
+optional `var/lib` or `var/lib/td` means no choice, while aliases, bad modes,
+wrong ownership and malformed content refuse without repair.
+
+A selected name is staged through the complete account-table admission above
+in a new private `/run/td-primary`. The provisioner binds its prepared passwd,
+group and shadow files over the corresponding deployment paths and remounts
+each read-only, nodev, nosuid and noexec. It checks inode identity and requires
+write-opens to fail specifically with EROFS, then re-admits the complete live
+account set and verifies the selected name. The principal reservation table
+stays on the immutable deployment. The saved-setting descriptors close
+after reading; later staging and mount paths rely on the caller's serialized
+boot environment and the private prepared tree. No user process, SSH
+daemon or competing root writer may run until this sequence succeeds. A partial failure stops
+boot; the next boot starts with fresh volatile state. This is publication
+before consumers start, not a multi-file atomic update for running readers.
+The raw signed EROFS payload is never edited. With no saved name, its original
+account tables must also pass the read-only checks.
+
+Only after coherent publication does the operation derive `/var/home/NAME`
+from the UID/GID-1000 account and prepare the primary home. ROOT, its `var`,
+and `var/home` must be real root-owned mode-0755 directories. The caller
+supplies trusted ancestors and serializes the operation; the provisioner does
+not verify the deployment signature or establish the persistent mount itself.
 
 An existing primary home must be a real UID/GID-1000 directory. Its
 inode, contents and ownership are retained; after ownership validation,
@@ -236,8 +277,15 @@ that private record to release the same bind before `/var`, after the
 application and portal views are released. Invalid home ownership or
 type stops boot and requires inspection from a trusted recovery
 environment; user changes to home permissions do not prevent boot.
-Account-choice persistence and publication still need the coordinated
-installed-profile cutover.
+A successful profile emits `TD-PRIMARY-PROFILE-READY NAME` on stderr after
+account readback and home preparation; stdout contains only the home path.
+The full-system QEMU installer selects `alice` from the verified ISO payload
+before formatting and requires exactly one matching marker on every installed
+boot. This covers persistence across media removal and repeated boots.
+The stock QEMU boot instead requires exactly one `tester` profile marker,
+covering the branch with no saved username. This does not add a live account
+rename, migrate another home, enroll a PIN or provide the wizard's
+destructive authorization.
 
 `td-firstboot render-primary-sshd ROOT` is a read-only early boot operation
 using the same complete root-owned account admission as home preparation.
@@ -246,7 +294,7 @@ primary account. The caller owns deployment verification and serializes
 account publication before rendering. No name or policy fragment comes
 from argv, the environment or mutable home content. It preserves the
 per-machine administrator authorization and the distinct volatile,
-loopback-restricted human self-test key; it activates no saved username.
+loopback-restricted human self-test key. It runs after profile publication.
 
 The deployment initramfs writes that output to fresh volatile
 `/run/td-sshd.conf` with a private creation mask and final mode 0600,
@@ -352,8 +400,9 @@ Malformed shared state therefore prevents acknowledgement across deployments;
 rolling back does not repair it. Recovery requires restoring a canonical,
 root-owned mode-0644 `lib/td/hostname` in the volume's `@var` subvolume from
 a trusted recovery environment. There is no supported in-system rename or
-repair UI yet; activation of the complete installer profile still awaits
-that recovery flow. The current `su` escape hatch is not its intended API.
+repair UI yet. The saved account and hostname activate at boot, while the
+user-facing setup and recovery flows remain to be implemented. The current
+`su` escape hatch is not their intended API.
 The QEMU installer selects `td-qemu-installed`, checks its saved bytes
 alongside timezone state, and requires activation on both full-system
 cold boots and the additional application-evidence boot. Unit tests retain

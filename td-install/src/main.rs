@@ -64,7 +64,7 @@ fn invalid(message: String) -> io::Error {
 
 const USAGE: &str =
     "usage: td-install inventory\n       td-install timezones\n       td-install layout-preview <logical-sector-bytes> <capacity-bytes>\n       td-install layout <destination> [<efi-kernel> <selector-initramfs>]\n       \
-                     td-install volume [--uuid <uuid>] [--timezone <IANA-id>] [--hostname <name>] <destination> <mkfs.btrfs> <scratch-dir> \
+                     td-install volume [--uuid <uuid>] [--timezone <IANA-id>] [--hostname <name>] [--username <name> <verified-root> <td-firstboot>] <destination> <mkfs.btrfs> <scratch-dir> \
                      [<td-boot> <deployment> <trusted-key> | --trusted-key <trusted-key>]";
 
 #[derive(Debug, Eq, PartialEq)]
@@ -92,6 +92,7 @@ enum Mode {
         uuid: Option<VolumeUuid>,
         timezone: Option<String>,
         hostname: Option<hostname::Hostname>,
+        username: Option<Box<PrimarySelection>>,
         destination: PathBuf,
         mkfs: PathBuf,
         scratch: PathBuf,
@@ -99,6 +100,40 @@ enum Mode {
         /// Trust initializes only the key/layout and claims no deployment.
         seed: Option<VolumeSeed>,
     },
+}
+
+/// The caller binds this read-only validator to an authenticated deployment.
+#[derive(Debug, Eq, PartialEq)]
+struct PrimarySelection {
+    name: String,
+    root: PathBuf,
+    firstboot: PathBuf,
+}
+
+impl PrimarySelection {
+    // Keep this cheap CLI grammar aligned with td-authd/src/primary_account.rs;
+    // the bound firstboot validator still owns complete account admission.
+    fn syntax(name: &str) -> io::Result<()> {
+        if name.len() > 32 || !name.as_bytes().first().is_some_and(u8::is_ascii_lowercase)
+            || !name.bytes().all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"_-".contains(&byte)) {
+            return Err(invalid("username requires 1-32 lowercase ASCII letters, digits, underscores or hyphens, starting with a letter".into()));
+        }
+        Ok(())
+    }
+
+    fn check(&self) -> io::Result<()> {
+        Self::syntax(&self.name)?;
+        let status = std::process::Command::new(&self.firstboot)
+            .arg("check-primary-name").arg(&self.root).arg(&self.name)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .status().map_err(|error| io::Error::new(error.kind(),
+                format!("validate selected primary account: {error}")))?;
+        if !status.success() {
+            return Err(invalid(format!("selected primary account validation failed: {status}")));
+        }
+        Ok(())
+    }
 }
 
 /// A preselected identity shared with the selector before the ESP is written.
@@ -271,6 +306,24 @@ fn parse_args(mut args: impl Iterator<Item = OsString>) -> io::Result<Mode> {
         (Some(hostname::Hostname::parse(name).map_err(invalid)?),
             rest.get(2..).ok_or_else(|| invalid(USAGE.into()))?)
     } else { (None, rest) };
+    let (username, rest) = if rest.first().is_some_and(|arg| arg.as_os_str() == "--username") {
+        if verb != "volume" {
+            return Err(invalid("--username is only supported by volume".into()));
+        }
+        let Some([name, root, firstboot, tail @ ..]) = rest.get(1..) else {
+            return Err(invalid("--username requires NAME VERIFIED-ROOT TD-FIRSTBOOT".into()));
+        };
+        let name = name.to_str().filter(|name| !name.is_empty() && name.len() <= 32)
+            .ok_or_else(|| invalid("--username requires a UTF-8 name of 1..=32 bytes".into()))?;
+        PrimarySelection::syntax(name)?;
+        if !root.is_absolute() || !firstboot.is_absolute() {
+            return Err(invalid("--username requires absolute deployment-root and validator paths".into()));
+        }
+        (Some(Box::new(PrimarySelection { name: name.into(), root: root.clone(), firstboot: firstboot.clone() })), tail)
+    } else { (None, rest) };
+    if rest.iter().any(|arg| arg.as_os_str() == "--username") {
+        return Err(invalid("--username must appear once after regional settings and before volume operands".into()));
+    }
     if rest.iter().any(|arg| arg.as_os_str() == "--hostname") {
         return Err(invalid("--hostname must appear once after timezone and before the volume operands".into()));
     }
@@ -320,6 +373,7 @@ fn parse_args(mut args: impl Iterator<Item = OsString>) -> io::Result<Mode> {
                 uuid,
                 timezone,
                 hostname,
+                username,
                 destination: destination.clone(),
                 mkfs: mkfs.clone(),
                 scratch: scratch.clone(),
@@ -330,6 +384,7 @@ fn parse_args(mut args: impl Iterator<Item = OsString>) -> io::Result<Mode> {
                 uuid,
                 timezone,
                 hostname,
+                username,
                 destination: destination.clone(),
                 mkfs: mkfs.clone(),
                 scratch: scratch.clone(),
@@ -344,6 +399,7 @@ fn parse_args(mut args: impl Iterator<Item = OsString>) -> io::Result<Mode> {
             uuid,
             timezone,
             hostname,
+            username,
             destination: destination.clone(),
             mkfs: mkfs.clone(),
             scratch: scratch.clone(),
@@ -1526,6 +1582,7 @@ fn seed_into(staging: &Path, seed: &VolumeSeed, key: &[u8]) -> io::Result<()> {
 const TIMEZONE_ROOT: &str = "/etc/zoneinfo";
 const TIMEZONE_STATE_RELATIVE: &str = "lib/td/timezone";
 const HOSTNAME_STATE_RELATIVE: &str = "lib/td/hostname";
+const USERNAME_STATE_RELATIVE: &str = "lib/td/username";
 
 fn seed_timezone(subvol: &Path, timezone: &timezones::Selection) -> io::Result<()> {
     seed_setting(subvol, TIMEZONE_STATE_RELATIVE, timezone.id())
@@ -1550,6 +1607,7 @@ fn seed_setting(subvol: &Path, relative: &str, value: &str) -> io::Result<()> {
 struct VolumeSettings<'a> {
     timezone: Option<&'a timezones::Selection>,
     hostname: Option<&'a hostname::Hostname>,
+    username: Option<&'a PrimarySelection>,
 }
 
 fn run_volume(
@@ -1565,7 +1623,7 @@ fn run_volume(
     // is the ambient resolution the declared-input contract above rules out —
     // and the one form of it a caller cannot see they asked for.
     //
-    // BOTH programs, and both here, before anything is opened or removed. An
+    // All supplied programs are checked before anything is opened or removed. An
     // argv-shaped mistake should cost nothing, and the td-boot check began life
     // inside `seed_into` — which runs after the destination is open and,
     // worse, after the caller's staging tree has been emptied. A bare name in
@@ -1575,6 +1633,7 @@ fn run_volume(
     for (label, program) in [
         ("mkfs.btrfs", Some(mkfs)),
         ("td-boot", publish.map(|publish| publish.td_boot.as_path())),
+        ("td-firstboot", settings.username.map(|selection| selection.firstboot.as_path())),
     ] {
         if let Some(program) = program {
             if !program.is_absolute() {
@@ -1599,6 +1658,9 @@ fn run_volume(
     let key = seed
         .map(|seed| read_trusted_key(seed.trusted_key()))
         .transpose()?;
+    if let Some(selection) = settings.username {
+        selection.check()?;
+    }
     let mut file = paths::open_format_destination(destination)?;
     let disk_bytes = destination_bytes(&mut file)?;
     let sector_size = logical_sector_size(&file)?;
@@ -1645,6 +1707,9 @@ fn run_volume(
     }
     if let Some(hostname) = settings.hostname {
         seed_setting(&subvol, HOSTNAME_STATE_RELATIVE, hostname.name())?;
+    }
+    if let Some(selection) = settings.username {
+        seed_setting(&subvol, USERNAME_STATE_RELATIVE, &selection.name)?;
     }
     // BEFORE the mkfs that bakes this tree into the image, which is the whole
     // of why the publish can happen without a mount: `--rootdir` is what puts
@@ -1839,6 +1904,7 @@ fn main() -> ExitCode {
             uuid,
             timezone,
             hostname,
+            username,
             destination,
             mkfs,
             scratch,
@@ -1849,7 +1915,7 @@ fn main() -> ExitCode {
             .transpose()
             .and_then(|timezone| {
                 run_volume(
-                    VolumeSettings { timezone: timezone.as_ref(), hostname: hostname.as_ref() },
+                    VolumeSettings { timezone: timezone.as_ref(), hostname: hostname.as_ref(), username: username.as_deref() },
                     uuid.as_ref(),
                     &destination,
                     &mkfs,
@@ -1980,6 +2046,85 @@ mod tests {
         assert!(parse_args([OsString::from("volume"), OsString::from("--hostname"),
             OsString::from_vec(vec![0xff]), OsString::from("disk"), OsString::from("/mkfs"),
             OsString::from("scratch")].into_iter()).is_err());
+    }
+
+    #[test]
+    fn username_operands_require_one_bound_validator_and_verified_root() {
+        let parsed = parse_args(args(&["volume", "--timezone", "Etc/UTC", "--hostname",
+            "my-td", "--username", "alice", "/verified", "/firstboot", "disk", "/mkfs", "scratch"])).unwrap();
+        assert!(matches!(parsed, Mode::Volume { username: Some(ref choice), .. }
+            if choice.as_ref() == &PrimarySelection { name: "alice".into(), root: "/verified".into(), firstboot: "/firstboot".into() }));
+        for bad in [
+            vec!["volume", "--username"],
+            vec!["volume", "--username", "alice", "/verified"],
+            vec!["volume", "--username", "", "/verified", "/firstboot", "disk", "/mkfs", "scratch"],
+            vec!["volume", "--username", "alice", "verified", "/firstboot", "disk", "/mkfs", "scratch"],
+            vec!["volume", "--username", "alice", "/verified", "firstboot", "disk", "/mkfs", "scratch"],
+            vec!["volume", "disk", "/mkfs", "scratch", "--username", "alice", "/verified", "/firstboot"],
+            vec!["volume", "--username", "alice", "/verified", "/firstboot", "--username", "bob", "/verified", "/firstboot", "disk", "/mkfs", "scratch"],
+            vec!["layout", "--username", "alice", "/verified", "/firstboot", "disk"],
+        ] { assert!(parse_args(args(&bad)).is_err(), "{bad:?}"); }
+        for name in ["a", "tester", "a-b_c1", &"a".repeat(32)] {
+            assert!(parse_args(args(&["volume", "--username", name, "/verified", "/firstboot", "disk", "/mkfs", "scratch"])).is_ok(), "{name:?}");
+        }
+        for name in ["", "Alice", "alice\n", "alice:root", "alice,root", "a b", "../alice", "1alice", "-alice", "_alice", "é", &"a".repeat(33)] {
+            assert!(parse_args(args(&["volume", "--username", name, "/verified", "/firstboot", "disk", "/mkfs", "scratch"])).is_err(), "{name:?}");
+        }
+        use std::os::unix::ffi::OsStringExt;
+        let mut bad = args(&["volume", "--username"]).collect::<Vec<_>>();
+        bad.push(OsString::from_vec(vec![0xff]));
+        bad.extend(args(&["/verified", "/firstboot", "disk", "/mkfs", "scratch"]));
+        assert!(parse_args(bad.into_iter()).is_err());
+    }
+
+    #[test]
+    fn username_validation_refuses_before_destination_or_scratch_changes() {
+        let disk = Scratch::disk(DISK);
+        let dir = fake_mkfs("#!/bin/sh\nexit 1\n");
+        let sentinel = dir.join("td-volume-root/keep");
+        std::fs::create_dir(sentinel.parent().unwrap()).unwrap();
+        std::fs::write(&sentinel, b"untouched").unwrap();
+        let selection = PrimarySelection { name: "root".into(), root: "/verified".into(), firstboot: dir.join("mkfs.btrfs") };
+        let mut output = Vec::new();
+        // Neither a valid layout nor even an existing destination is required
+        // to reach the account refusal, and the preexisting stage survives it.
+        for destination in [&disk.path, &dir.join("absent")] {
+            let error = run_volume(VolumeSettings { username: Some(&selection), ..VolumeSettings::default() },
+                None, destination, &dir.join("mkfs.btrfs"), &dir, None, &mut output).unwrap_err();
+            assert!(error.to_string().contains("selected primary account validation failed"));
+        }
+        assert!(output.is_empty());
+        assert_eq!(std::fs::read(&sentinel).unwrap(), b"untouched");
+        assert!(!dir.join("absent").exists());
+        assert!(!dir.join("td-volume.img").exists());
+        let mut bytes = [1; 512];
+        File::open(&disk.path).unwrap().read_exact(&mut bytes).unwrap();
+        assert_eq!(bytes, [0; 512]);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn username_volume_binds_validator_argv_and_seeds_exact_readable_state() {
+        use std::os::unix::fs::PermissionsExt;
+        let disk = Scratch::disk(DISK);
+        run_layout(&disk.path, &mut Vec::new()).unwrap();
+        let validator = fake_mkfs(RECORDING_MKFS);
+        let formatter = fake_mkfs(RECORDING_MKFS);
+        let selection = PrimarySelection { name: "alice".into(), root: "/verified root".into(), firstboot: validator.join("mkfs.btrfs") };
+        run_volume(VolumeSettings { username: Some(&selection), ..VolumeSettings::default() },
+            None, &disk.path, &formatter.join("mkfs.btrfs"), &formatter, None, &mut Vec::new()).unwrap();
+        assert_eq!(std::fs::read(validator.join("argv")).unwrap(), b"check-primary-name\n/verified root\nalice\n");
+        let state = formatter.join("td-volume-root/@var");
+        let file = state.join(USERNAME_STATE_RELATIVE);
+        assert_eq!(std::fs::read(&file).unwrap(), b"alice\n");
+        assert_eq!(std::fs::metadata(&file).unwrap().permissions().mode() & 0o7777, 0o644);
+        for parent in ["", "lib", "lib/td"] {
+            assert_eq!(std::fs::metadata(state.join(parent)).unwrap().permissions().mode() & 0o7777, 0o755);
+        }
+        assert!(seed_setting(&state, USERNAME_STATE_RELATIVE, "bob").is_err());
+        assert_eq!(std::fs::read(file).unwrap(), b"alice\n");
+        std::fs::remove_dir_all(validator).unwrap();
+        std::fs::remove_dir_all(formatter).unwrap();
     }
 
     #[test]
@@ -2389,6 +2534,7 @@ mod tests {
                 uuid: None,
                 timezone: None,
                 hostname: None,
+                username: None,
                 destination: PathBuf::from("/dev/sda"),
                 mkfs: PathBuf::from("/bin/mkfs.btrfs"),
                 scratch: PathBuf::from("/tmp"),
@@ -2817,6 +2963,7 @@ mod tests {
             uuid: Some(identity),
             timezone: None,
             hostname: None,
+            username: None,
             destination,
             mkfs,
             scratch: staging_scratch,
@@ -2903,6 +3050,7 @@ mod tests {
                 uuid: None,
                 timezone: None,
                 hostname: None,
+                username: None,
                 destination: PathBuf::from("/dev/sda"),
                 mkfs: PathBuf::from("/bin/mkfs.btrfs"),
                 scratch: PathBuf::from("/tmp"),
@@ -2968,6 +3116,7 @@ mod tests {
                 uuid: None,
                 timezone: None,
                 hostname: None,
+                username: None,
                 destination: PathBuf::from("disk"),
                 mkfs: PathBuf::from("/mkfs"),
                 scratch: PathBuf::from("scratch"),
@@ -3040,6 +3189,7 @@ mod tests {
                 uuid: Some(VolumeUuid(uuid.into())),
                 timezone: None,
                 hostname: None,
+                username: None,
                 destination: PathBuf::from("disk"),
                 mkfs: PathBuf::from("/mkfs"),
                 scratch: PathBuf::from("scratch"),

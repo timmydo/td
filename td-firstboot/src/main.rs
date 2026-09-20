@@ -39,6 +39,7 @@ mod hostname;
 mod machineid;
 mod mounts;
 mod primary_home;
+mod primary_profile;
 mod principal_store;
 mod principals;
 mod ssh_policy;
@@ -258,7 +259,7 @@ fn usage() -> String {
          td-firstboot check-primary-name ROOT NAME checks a proposed human name without writing\n  \
          td-firstboot stage-primary-name ROOT NAME OUT prepares new account tables without activating them\n  \
          td-firstboot render-primary-sshd ROOT prints the validated primary-account server policy\n  \
-         td-firstboot prepare-primary-home ROOT prepares the validated primary home before users start\n  \
+         td-firstboot prepare-primary-profile ROOT publishes the selected primary account and prepares its home before users start\n  \
          td-firstboot check-launch-session USER UID COMPOSITOR_UID verifies live reservations\n  \
          td-firstboot check-launch-application OWNER APP selects an enrolled active application UID\n"
     )
@@ -277,8 +278,8 @@ fn run_with_primary(
             let primary = principals::primary_in_root(&root).map_err(Failure::Failed)?;
             return emit(&ssh_policy::config(primary.name())).map_err(Failure::Failed);
         }
-        Invocation::PreparePrimaryHome(root) => {
-            let home = primary_home::prepare(&root).map_err(Failure::Failed)?;
+        Invocation::PreparePrimaryProfile(root) => {
+            let home = primary_profile::prepare(&root).map_err(Failure::Failed)?;
             return emit(&format!("{home}\n")).map_err(Failure::Failed);
         }
         Invocation::Help => return emit(&usage()).map_err(Failure::Failed),
@@ -421,7 +422,7 @@ enum Invocation {
     CheckPrincipals(PathBuf),
     CheckPrimaryName(PathBuf, String),
     StagePrimaryName(PathBuf, String, PathBuf),
-    PreparePrimaryHome(PathBuf),
+    PreparePrimaryProfile(PathBuf),
     RenderPrimarySshd(PathBuf),
     CheckLaunchSession(String, u32, u32),
     CheckLaunchApplication(u32, String),
@@ -435,11 +436,11 @@ fn parse(args: &[String]) -> Result<Invocation, Failure> {
         };
         return Ok(Invocation::RenderPrimarySshd(PathBuf::from(root)));
     }
-    if args.first().is_some_and(|verb| verb == "prepare-primary-home") {
+    if args.first().is_some_and(|verb| verb == "prepare-primary-profile") {
         let [_, root] = args else {
-            return Err(Failure::Usage("prepare-primary-home requires ROOT".into()));
+            return Err(Failure::Usage("prepare-primary-profile requires ROOT".into()));
         };
-        return Ok(Invocation::PreparePrimaryHome(PathBuf::from(root)));
+        return Ok(Invocation::PreparePrimaryProfile(PathBuf::from(root)));
     }
     if args.first().is_some_and(|verb| verb == "stage-primary-name") {
         let [_, root, name, output] = args else {
@@ -1595,7 +1596,7 @@ mod tests {
             | Invocation::Hostname
             | Invocation::CheckPrincipals(_)
             | Invocation::CheckPrimaryName(_, _)
-            | Invocation::PreparePrimaryHome(_)
+            | Invocation::PreparePrimaryProfile(_)
             | Invocation::RenderPrimarySshd(_)
             | Invocation::StagePrimaryName(_, _, _)
             | Invocation::CheckLaunchApplication(..)
@@ -2108,11 +2109,11 @@ mod principal_arguments {
     }
 
     #[test]
-    fn primary_home_preparation_requires_only_the_staged_root() {
-        let args: Vec<String> = ["prepare-primary-home", "/sysroot"]
+    fn primary_profile_preparation_requires_only_the_staged_root() {
+        let args: Vec<String> = ["prepare-primary-profile", "/sysroot"]
             .into_iter().map(str::to_owned).collect();
-        assert!(matches!(parse(&args), Ok(Invocation::PreparePrimaryHome(root)) if root == Path::new("/sysroot")));
-        for args in [vec!["prepare-primary-home"], vec!["prepare-primary-home", "/sysroot", "alice"]] {
+        assert!(matches!(parse(&args), Ok(Invocation::PreparePrimaryProfile(root)) if root == Path::new("/sysroot")));
+        for args in [vec!["prepare-primary-profile"], vec!["prepare-primary-profile", "/sysroot", "alice"]] {
             let args: Vec<String> = args.into_iter().map(str::to_owned).collect();
             assert!(matches!(parse(&args), Err(Failure::Usage(_))));
         }

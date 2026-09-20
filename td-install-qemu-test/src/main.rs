@@ -398,35 +398,39 @@ fn install(device: &str, interrupt: bool, system_autotest: bool) -> Result<(), S
         "/bin/td-boot",
         &["validate-source", "/source", "/trusted.pub"],
     )?;
+    if system_autotest {
+        if !Path::new("/dev/loop0").exists() {
+            applet(&["mknod", "/dev/loop0", "b", "7", "0"])?;
+        }
+        command("/bin/losetup", &["-r", "/dev/loop0", "/source/root.erofs"])?;
+        applet(&["mount", "-t", "erofs", "-o", "ro,nodev,nosuid,noexec",
+            "/dev/loop0", "/root-image"])?;
+        command("/bin/td-firstboot", &["check-primary-name", "/root-image", USERNAME])?;
+    }
     command(
         "/bin/td-install",
         &["layout", device, "/source/bzImage", "/selector.cpio"],
     )?;
     // Keep negative cases testing the real writer's refusal before this report.
     preview(name, geometry)?;
-    command(
-        "/bin/td-install",
-        &[
-            "volume",
-            "--uuid",
-            &uuid,
-            "--timezone",
-            TIMEZONE_ID,
-            "--hostname",
-            HOSTNAME,
-            device,
-            "/bin/mkfs.btrfs",
-            "/scratch",
-            "--trusted-key",
-            "/trusted.pub",
-        ],
-    )?;
+    let mut volume_arguments = vec!["volume", "--uuid", &uuid,
+        "--timezone", TIMEZONE_ID, "--hostname", HOSTNAME];
+    if system_autotest {
+        volume_arguments.extend(["--username", USERNAME, "/root-image", "/bin/td-firstboot"]);
+    }
+    volume_arguments.extend([device, "/bin/mkfs.btrfs", "/scratch", "--trusted-key", "/trusted.pub"]);
+    command("/bin/td-install", &volume_arguments)?;
+    if system_autotest {
+        check_username(Path::new("/scratch/td-volume-root/@var"))?;
+        // The read-only loop binding lasts until this one-purpose VM ends.
+        command("/bin/umount", &["/root-image"])?;
+    }
     check_timezone(Path::new("/scratch/td-volume-root/@var"))?;
     check_hostname(Path::new("/scratch/td-volume-root/@var"))?;
     for (directory, expected) in [
         ("@var", &["lib"][..]),
         ("@var/lib", &["td"][..]),
-        ("@var/lib/td", &["hostname", "timezone"][..]),
+        ("@var/lib/td", if system_autotest { &["hostname", "timezone", "username"][..] } else { &["hostname", "timezone"][..] }),
     ] {
         let staged = Path::new("/scratch/td-volume-root").join(directory);
         let mut names = fs::read_dir(&staged)
@@ -471,6 +475,7 @@ fn install(device: &str, interrupt: bool, system_autotest: bool) -> Result<(), S
         seed_system_autotest(Path::new("/"), Path::new("/state"))?;
         check_timezone(Path::new("/state"))?;
         check_hostname(Path::new("/state"))?;
+        check_username(Path::new("/state"))?;
         command("/bin/umount", &["/state"])?;
     }
     applet(&["sync"])?;
@@ -729,6 +734,10 @@ fn selector() -> Result<(), String> {
         "/bin/td-boot",
         &["on-volume", "boot", "/volume", cmdline.trim_end()],
     )
+}
+
+fn check_username(state: &Path) -> Result<(), String> {
+    check_setting(state, "lib/td/username", USERNAME)
 }
 
 fn check_hostname(state: &Path) -> Result<(), String> {
