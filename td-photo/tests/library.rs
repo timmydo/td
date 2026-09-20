@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use td_photo::library::{self, Crop, Error, Filter, Flag, Key, Sidecar};
+use td_photo::library::{self, Crop, Error, Filter, Flag, Key, Sidecar, SIDECAR_HEADER};
 
 const SAMPLE: &str = "td-photo edit 1\nflag pick\nfuture 1 2 3\nexposure -0.33\ncrop 0.1000 0.0500 0.8000 0.9000\nlook classic-chrome\n";
 
@@ -30,26 +30,43 @@ fn a_sidecar_round_trips_and_keeps_unknown_lines_in_place() {
         Some(Crop::new(1000, 500, 8000, 9000).unwrap())
     );
     assert_eq!(sidecar.look(), Some("classic-chrome"));
-    assert_eq!(sidecar.text(), SAMPLE);
+    // A file from before the history seeds one step per develop key, in
+    // the file's order, written after the lines; the lines themselves
+    // are kept as they were.
+    let seeded = "step-1 on exposure -0.33\nstep-2 on crop 0.1000 0.0500 0.8000 0.9000\nstep-3 on look classic-chrome\n";
+    assert_eq!(sidecar.text(), format!("{SAMPLE}{seeded}"));
     assert_eq!(sidecar.entries().count(), 5);
-    // A set rewrites in place; the unknown line stays where it was.
+    assert_eq!(sidecar.steps().len(), 3);
+    assert_eq!(
+        sidecar.bytes() + SIDECAR_HEADER.len() + 1,
+        sidecar.text().len()
+    );
+    // A set rewrites the key in place and adds a step; the unknown line
+    // stays where it was.
     sidecar.set(Key::Exposure, Some("1.00")).unwrap();
+    let stepped = format!("{seeded}step-4 on exposure 1.00\n");
     assert_eq!(
         sidecar.text(),
-        SAMPLE.replace("exposure -0.33", "exposure 1.00")
+        format!(
+            "{}{stepped}",
+            SAMPLE.replace("exposure -0.33", "exposure 1.00")
+        )
     );
     sidecar.set(Key::Flag, None).unwrap();
     assert_eq!(
         sidecar.text(),
-        SAMPLE
-            .replace("flag pick\n", "")
-            .replace("exposure -0.33", "exposure 1.00")
+        format!(
+            "{}{stepped}",
+            SAMPLE
+                .replace("flag pick\n", "")
+                .replace("exposure -0.33", "exposure 1.00")
+        )
     );
-    // An absent key is appended.
+    // An absent key is appended, before the history.
     sidecar.set(Key::Flag, Some("reject")).unwrap();
     assert!(sidecar
         .text()
-        .ends_with("look classic-chrome\nflag reject\n"));
+        .ends_with(&format!("look classic-chrome\nflag reject\n{stepped}")));
     // Reset keeps the cull decision and what it does not know.
     sidecar.reset();
     assert_eq!(
@@ -760,7 +777,8 @@ fn list_flag_and_edit_go_through_the_sidecar_and_unlink_nothing() {
         ])
         .0
     );
-    let text = "td-photo edit 1\nflag pick\nexposure -0.33\nlook classic-chrome\ncrop 0.1000 0.0500 0.8000 0.9000\n";
+    let steps = "step-1 on exposure -0.33\nstep-2 on look classic-chrome\nstep-3 on crop 0.1000 0.0500 0.8000 0.9000\n";
+    let text = format!("td-photo edit 1\nflag pick\nexposure -0.33\nlook classic-chrome\ncrop 0.1000 0.0500 0.8000 0.9000\n{steps}");
     assert_eq!(fs::read_to_string(&sidecar).unwrap(), text);
     assert_eq!(td_photo(&["edit", photo_s]).1, text);
     assert_eq!(
@@ -776,13 +794,19 @@ fn list_flag_and_edit_go_through_the_sidecar_and_unlink_nothing() {
     // An unknown line survives, in place, a flag change and a reset.
     fs::write(
         &sidecar,
-        text.replace("exposure -0.33\n", "exposure -0.33\nfuture 1 2 3\n"),
+        text.replace("exposure -0.33\nlook", "exposure -0.33\nfuture 1 2 3\nlook"),
     )
     .unwrap();
     assert!(td_photo(&["flag", photo_s, "reject"]).0);
     assert_eq!(
         fs::read_to_string(&sidecar).unwrap(),
-        "td-photo edit 1\nflag reject\nexposure -0.33\nfuture 1 2 3\nlook classic-chrome\ncrop 0.1000 0.0500 0.8000 0.9000\n"
+        format!("td-photo edit 1\nflag reject\nexposure -0.33\nfuture 1 2 3\nlook classic-chrome\ncrop 0.1000 0.0500 0.8000 0.9000\n{steps}")
+    );
+    // Undo takes the last step back and rewrites the keys from the rest.
+    assert!(td_photo(&["edit", photo_s, "undo"]).0);
+    assert_eq!(
+        fs::read_to_string(&sidecar).unwrap(),
+        "td-photo edit 1\nflag reject\nexposure -0.33\nfuture 1 2 3\nlook classic-chrome\nstep-1 on exposure -0.33\nstep-2 on look classic-chrome\n"
     );
     assert!(td_photo(&["edit", photo_s, "reset"]).0);
     assert_eq!(
@@ -888,5 +912,168 @@ fn list_flag_and_edit_go_through_the_sidecar_and_unlink_nothing() {
             "notes.txt",
             "rejected",
         ]
+    );
+}
+
+/// The history: a develop key set is a step, a run of the same key one
+/// step, the keys the fold of the steps that are on; undo, toggle and
+/// delete rewrite the keys from what remains; the file's history is read
+/// over its summary; and every malformed step line refuses the file.
+#[test]
+fn a_history_folds_its_steps_and_the_keys_are_its_summary() {
+    let mut sidecar = Sidecar::default();
+    assert!(sidecar.steps().is_empty());
+    assert!(!sidecar.undo() && !sidecar.toggle_step(0) && !sidecar.delete_step(0));
+    sidecar.set(Key::Exposure, Some("0.33")).unwrap();
+    sidecar.set(Key::Exposure, Some("0.66")).unwrap();
+    // Every set is its own step, so undo is one nudge at a time.
+    assert_eq!(sidecar.steps().len(), 2);
+    assert_eq!(sidecar.exposure(), Some(66));
+    assert!(sidecar.undo());
+    assert_eq!(sidecar.exposure(), Some(33));
+    sidecar.set(Key::Exposure, Some("0.66")).unwrap();
+    assert!(sidecar.delete_step(0));
+    sidecar.set(Key::Look, Some("mono")).unwrap();
+    sidecar.set(Key::Exposure, Some("1.00")).unwrap();
+    let steps = |sidecar: &Sidecar| {
+        sidecar
+            .steps()
+            .iter()
+            .map(|step| step.text())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        steps(&sidecar),
+        ["on exposure 0.66", "on look mono", "on exposure 1.00"]
+    );
+    assert_eq!(
+        sidecar.text(),
+        "td-photo edit 1\nexposure 1.00\nlook mono\nstep-1 on exposure 0.66\nstep-2 on look mono\nstep-3 on exposure 1.00\n"
+    );
+    // The value a key already holds is no step, nor is clearing a key that
+    // is clear; the flag is never a step.
+    sidecar.set(Key::Look, Some("mono")).unwrap();
+    sidecar.set(Key::Crop, None).unwrap();
+    sidecar.set(Key::Flag, Some("pick")).unwrap();
+    assert_eq!(sidecar.steps().len(), 3);
+    // A step off is folded over: the earlier value of its key shows.
+    assert!(sidecar.toggle_step(2));
+    assert_eq!(sidecar.exposure(), Some(66));
+    assert!(sidecar.text().contains("step-3 off exposure 1.00\n"));
+    assert!(sidecar.toggle_step(2));
+    assert_eq!(sidecar.exposure(), Some(100));
+    // A clear is a step too, and the summary drops the key.
+    sidecar.set(Key::Look, None).unwrap();
+    assert_eq!(
+        steps(&sidecar).last().map(String::as_str),
+        Some("on look -")
+    );
+    assert_eq!(sidecar.look(), None);
+    assert!(!sidecar.text().contains("\nlook "));
+    // Deleting a step closes the rest up; undo takes the last back.
+    assert!(sidecar.delete_step(1));
+    assert_eq!(
+        steps(&sidecar),
+        ["on exposure 0.66", "on exposure 1.00", "on look -"]
+    );
+    assert!(sidecar.undo());
+    assert!(sidecar.undo());
+    assert_eq!(sidecar.exposure(), Some(66));
+    assert_eq!(
+        sidecar.text(),
+        "td-photo edit 1\nexposure 0.66\nflag pick\nstep-1 on exposure 0.66\n"
+    );
+    assert!(sidecar.undo() && !sidecar.undo());
+    assert_eq!(sidecar.text(), "td-photo edit 1\nflag pick\n");
+    // A round trip keeps steps that are off, and the bytes are the text's
+    // after the header.
+    let mut off = Sidecar::default();
+    off.set(Key::Crop, Some("0.1000 0.1000 0.5000 0.5000"))
+        .unwrap();
+    off.set(Key::Look, Some("mono")).unwrap();
+    off.toggle_step(0);
+    let text = off.text();
+    assert_eq!(
+        text,
+        "td-photo edit 1\nlook mono\nstep-1 off crop 0.1000 0.1000 0.5000 0.5000\nstep-2 on look mono\n"
+    );
+    let back = Sidecar::parse(text.as_bytes()).unwrap();
+    assert_eq!(back, off);
+    assert_eq!(back.bytes() + SIDECAR_HEADER.len() + 1, text.len());
+    // A summary that disagrees with its history is read by the history and
+    // rewritten from it.
+    let stale = Sidecar::parse(
+        b"td-photo edit 1\nexposure 2.00\nfuture 1\nstep-1 on exposure 0.50\nstep-2 on crop -\n",
+    )
+    .unwrap();
+    assert_eq!(stale.exposure(), Some(50));
+    assert_eq!(
+        stale.text(),
+        "td-photo edit 1\nexposure 0.50\nfuture 1\nstep-1 on exposure 0.50\nstep-2 on crop -\n"
+    );
+    // Reset clears the history with the keys.
+    let mut reset = stale.clone();
+    reset.reset();
+    assert_eq!(reset.text(), "td-photo edit 1\nfuture 1\n");
+    // A full history refuses a further step until one goes.
+    let mut full = Sidecar::default();
+    for i in 0..library::MAX_STEPS {
+        // Each value differs from the one in force, so each set is a step.
+        let value = format!("{}.{:02}", i / 100, i % 100);
+        full.set(Key::Exposure, Some(&value)).unwrap();
+    }
+    assert_eq!(full.steps().len(), library::MAX_STEPS);
+    assert_eq!(
+        full.set(Key::Crop, Some("0.1000 0.1000 0.5000 0.5000")),
+        Err(Error::HistoryFull)
+    );
+    assert_eq!(full.set(Key::Flag, Some("pick")), Ok(()));
+    assert!(full.undo());
+    assert_eq!(
+        full.set(Key::Crop, Some("0.1000 0.1000 0.5000 0.5000")),
+        Ok(())
+    );
+    let text = full.text();
+    assert_eq!(Sidecar::parse(text.as_bytes()).unwrap(), full);
+    // Every malformed step line refuses the file: out of sequence, a
+    // leading zero, past the ceiling, not on|off, a key that does not
+    // develop, a value outside the key's grammar.
+    let head = "td-photo edit 1\n";
+    for (body, number) in [
+        ("step-2 on exposure 1.00\n", 2),
+        ("step-01 on exposure 1.00\n", 2),
+        ("step-1 on exposure 1.00\nstep-1 on look mono\n", 3),
+        ("step-1 on exposure 1.00\nstep-3 on look mono\n", 3),
+        ("step-1 maybe exposure 1.00\n", 2),
+        ("step-1 on flag pick\n", 2),
+        ("step-1 on exposure 9.00\n", 2),
+        ("step-1 on exposure\n", 2),
+        ("step-1 on crop 0.1000 0.1000\n", 2),
+    ] {
+        assert_eq!(
+            Sidecar::parse(format!("{head}{body}").as_bytes()),
+            Err(Error::Step(number)),
+            "{body}"
+        );
+    }
+    let mut past = head.to_string();
+    for i in 1..=library::MAX_STEPS + 1 {
+        past.push_str(&format!("step-{i} on look l{i}\n"));
+    }
+    assert_eq!(
+        Sidecar::parse(past.as_bytes()),
+        Err(Error::Step(library::MAX_STEPS + 2))
+    );
+    assert_eq!(Error::Step(4).to_string(), "line 4 is not the next step");
+    // The bare `-` is the clear everywhere a look is set, so it is not a
+    // look: a file naming one is refused rather than read as a clear.
+    assert!(!library::valid_look("-") && library::valid_look("-x"));
+    assert_eq!(
+        Sidecar::parse(b"td-photo edit 1\nlook -\n"),
+        Err(Error::Value(Key::Look))
+    );
+    assert_eq!(
+        Error::HistoryFull.to_string(),
+        format!("history holds {} steps", library::MAX_STEPS)
     );
 }

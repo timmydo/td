@@ -695,7 +695,7 @@ fn the_window_develops_the_cursor_photo_over_the_native_compositor() {
     let layout = td_photo::ui::Layout::new(
         Surface::new(place.width, place.height, Scale::default()).unwrap(),
     );
-    let r#box = layout.preview_box().expect("a develop box on the tile");
+    let r#box = layout.develop_box().expect("a develop box on the tile");
     let developed = super::preview_develop(&client_directory, place.width, place.height, &roll, 0);
     assert!(
         super::varies(&developed, place.width, r#box),
@@ -712,7 +712,7 @@ fn the_window_develops_the_cursor_photo_over_the_native_compositor() {
     client.settle(5);
     assert_eq!(
         std::fs::read_to_string(roll.join("DSC_0001.NEF.edit")).unwrap(),
-        "td-photo edit 1\nexposure 0.33\n"
+        "td-photo edit 1\nexposure 0.33\nstep-1 on exposure 0.33\n"
     );
     let brighter = super::preview_develop(&client_directory, place.width, place.height, &roll, 0);
     // The develop box itself changes, not merely the facts line's exposure

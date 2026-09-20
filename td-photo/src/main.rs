@@ -93,12 +93,14 @@ const HELP: &str = concat!(
     "  when only the sidecar's move failed; the run fails after the rest\n",
     "  when any was kept or split. Each file is linked into rejected/ before\n",
     "  its old name is dropped, so no name is replaced and no file is lost.\n",
-    "td-photo edit FILE [KEY VALUE ... | reset]\n",
+    "td-photo edit FILE [KEY VALUE ... | reset | undo]\n",
     "  Prints FILE's sidecar, or sets exposure STOPS (-5.00 to 5.00), crop\n",
     "  X Y W H (fractions to four decimals), look STEM or flag pick|reject;\n",
-    "  a VALUE of - clears the key; reset clears all but the flag. The\n",
-    "  sidecar is written through NAME.edit.tmp and renamed into place,\n",
-    "  the one file td-photo replaces, since it is its own.\n",
+    "  a VALUE of - clears the key. A develop key set is a step of the\n",
+    "  sidecar's history (step-N lines, the keys their summary); undo takes\n",
+    "  the last step back and reset clears all but the flag. The sidecar\n",
+    "  is written through NAME.edit.tmp and renamed into place, the one\n",
+    "  file td-photo replaces, since it is its own.\n",
     "td-photo [open [ROLL] [--control-socket PATH]]\n",
     "  Opens the window on the Wayland display, on ROLL if given, a\n",
     "  folder of originals: the roll as a grid of thumbnails from the\n",
@@ -1572,7 +1574,7 @@ fn read_look(path: &Path) -> io::Result<Vec<u8>> {
 fn look_text(stem: &str) -> Result<(Vec<u8>, String), String> {
     if !library::valid_look(stem) {
         return Err(format!(
-            "look {stem:?} is not a look stem (1 to 64 of letters, digits, - _ and ., not starting with .)"
+            "look {stem:?} is not a look stem (1 to 64 of letters, digits, - _ and ., not starting with . and not - alone)"
         ));
     }
     let dir = looks_dir();
@@ -1697,7 +1699,7 @@ fn user_looks(dir: &Path) -> Result<Vec<(String, String)>, String> {
         if !library::valid_look(&stem) {
             looks.push((
                 format!("{stem:?}"),
-                "error not a look stem (1 to 64 of letters, digits, - _ and ., not starting with .)"
+                "error not a look stem (1 to 64 of letters, digits, - _ and ., not starting with . and not - alone)"
                     .to_string(),
             ));
             continue;
@@ -2068,6 +2070,10 @@ fn edit(path: &Path, rest: &[OsString]) -> Result<(), String> {
         .collect::<Result<Vec<&str>, String>>()?;
     if words == ["reset"] {
         sidecar.reset();
+        return write_sidecar(path, &sidecar);
+    }
+    if words == ["undo"] {
+        sidecar.undo();
         return write_sidecar(path, &sidecar);
     }
     let mut words = words.as_slice();
@@ -2569,6 +2575,26 @@ impl Session {
                         Ok(())
                     })?
                 }
+                // A history with no such step is left as it is, which `edit`
+                // settles as ignored, the file's word either way.
+                Effect::Undo { index, name } => {
+                    outcome = self.edit(index, name, |sidecar| {
+                        sidecar.undo();
+                        Ok(())
+                    })?
+                }
+                Effect::StepToggle { index, name, step } => {
+                    outcome = self.edit(index, name, |sidecar| {
+                        sidecar.toggle_step(step);
+                        Ok(())
+                    })?
+                }
+                Effect::StepDelete { index, name, step } => {
+                    outcome = self.edit(index, name, |sidecar| {
+                        sidecar.delete_step(step);
+                        Ok(())
+                    })?
+                }
                 Effect::Export { name, .. } => outcome = self.export(name)?,
                 Effect::DeleteRejected => outcome = self.delete_rejected()?,
                 Effect::List { folder, parent } => self.list(folder, parent)?,
@@ -2734,13 +2760,10 @@ impl Session {
         }
         if sidecar == before {
             // The value the file already holds: nothing is written, and the
-            // model takes the file's word, a change only if the file
-            // differed from the model's copy.
-            let held = Photo {
-                name,
-                sidecar: Some(sidecar),
-                error: None,
-            };
+            // model takes the file's word (as the file is, so a photo with
+            // no sidecar keeps none), a change only if the file differed
+            // from the model's copy.
+            let held = photo(name, load_sidecar(&original));
             return Ok(if self.ui.settle(index, held) {
                 Outcome::Changed
             } else {

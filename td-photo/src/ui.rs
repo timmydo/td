@@ -7,7 +7,7 @@
 
 use std::fmt;
 
-use td_ui::chrome::{Block, Buttons, Status, DISABLED, ROW};
+use td_ui::chrome::{Block, Button, Buttons, Item, List, Status, BUTTON_MARGIN, DISABLED, ROW};
 use td_ui::control::{self, decimal, hex, ErrorCode};
 use td_ui::driven::{self, Binding, Input, Outcome, PointerPhase};
 use td_ui::finder;
@@ -21,7 +21,7 @@ use td_ui::CELL_HEIGHT;
 use td_ui::CELL_WIDTH;
 
 use crate::image::Rgb8;
-use crate::library::{self, Crop, Filter, Flag, Key, Sidecar};
+use crate::library::{self, Crop, Filter, Flag, Key, Sidecar, Step};
 
 /// The surface a session starts on until it is resized.
 pub const DEFAULT_WIDTH: usize = 800;
@@ -155,10 +155,7 @@ impl Photo {
 
 /// The bytes a sidecar takes as text, what the roll's budget counts.
 pub fn sidecar_bytes(sidecar: &Sidecar) -> usize {
-    sidecar
-        .entries()
-        .map(|(key, value)| key.len() + value.len() + 2)
-        .sum()
+    sidecar.bytes()
 }
 
 /// What an adapter carries out after a dispatch: the file work the model
@@ -194,6 +191,26 @@ pub enum Effect {
     /// Reset this photo's develop keys to camera defaults, keeping the
     /// flag, on the file as it is then, and settle the model.
     Reset { index: usize, name: String },
+    /// Take the last step of this photo's develop history back, on the
+    /// file as it is then, and settle the model; a history with no step
+    /// is left as it is, which is `ignored`.
+    Undo { index: usize, name: String },
+    /// Turn step `step` (from 0) of this photo's develop history off or
+    /// back on, on the file as it is then, and settle the model; a step
+    /// the file does not hold is `ignored`.
+    StepToggle {
+        index: usize,
+        name: String,
+        step: usize,
+    },
+    /// Delete step `step` (from 0) of this photo's develop history, the
+    /// later ones closing up, on the file as it is then, and settle the
+    /// model; a step the file does not hold is `ignored`.
+    StepDelete {
+        index: usize,
+        name: String,
+        step: usize,
+    },
     /// Export this photo at full resolution into the roll's `exported/`
     /// through its sidecar as the file holds it then: the replay runs the
     /// verb on the request, the window hands it to its pool; either says
@@ -251,6 +268,9 @@ pub enum Action {
     Aspect,
     Looks,
     Reset,
+    Undo,
+    StepToggle,
+    StepDelete,
     Export,
     DeleteRejected,
     Scroll,
@@ -258,7 +278,7 @@ pub enum Action {
 }
 
 impl Action {
-    pub const ALL: [Action; 35] = [
+    pub const ALL: [Action; 38] = [
         Action::Open,
         Action::Choose,
         Action::Next,
@@ -290,6 +310,9 @@ impl Action {
         Action::Aspect,
         Action::Looks,
         Action::Reset,
+        Action::Undo,
+        Action::StepToggle,
+        Action::StepDelete,
         Action::Export,
         Action::DeleteRejected,
         Action::Scroll,
@@ -329,6 +352,9 @@ impl Action {
             Self::Aspect => "aspect",
             Self::Looks => "looks",
             Self::Reset => "reset",
+            Self::Undo => "undo",
+            Self::StepToggle => "step-toggle",
+            Self::StepDelete => "step-delete",
             Self::Export => "export",
             Self::DeleteRejected => "delete-rejected",
             Self::Scroll => "scroll",
@@ -355,7 +381,7 @@ impl Action {
 /// binds, the argument shape and the help line. Actions without a chord
 /// take an argument or are the agent's (`open`); the pointer reaches
 /// `select` by pressing a cell and `scroll` by the wheel.
-pub const BINDINGS: [Binding; 35] = [
+pub const BINDINGS: [Binding; 38] = [
     Binding {
         name: "open",
         chord: None,
@@ -384,13 +410,13 @@ pub const BINDINGS: [Binding; 35] = [
         name: "down",
         chord: Some("Down"),
         arguments: "",
-        help: "Move the cursor one grid row down.",
+        help: "Move the cursor one grid row down; in develop mode, the history selection down.",
     },
     Binding {
         name: "up",
         chord: Some("Up"),
         arguments: "",
-        help: "Move the cursor one grid row up.",
+        help: "Move the cursor one grid row up; in develop mode, the history selection up.",
     },
     Binding {
         name: "first",
@@ -540,7 +566,25 @@ pub const BINDINGS: [Binding; 35] = [
         name: "reset",
         chord: Some("0"),
         arguments: "",
-        help: "Reset exposure, crop and look to camera defaults (develop mode).",
+        help: "Reset exposure, crop and look to camera defaults, clearing the history (develop mode).",
+    },
+    Binding {
+        name: "undo",
+        chord: Some("z"),
+        arguments: "",
+        help: "Take the last step of the history back (develop mode).",
+    },
+    Binding {
+        name: "step-toggle",
+        chord: Some("t"),
+        arguments: "",
+        help: "Turn the selected history step off, or back on (develop mode).",
+    },
+    Binding {
+        name: "step-delete",
+        chord: Some("Backspace"),
+        arguments: "",
+        help: "Delete the selected history step (develop mode).",
     },
     Binding {
         name: "export",
@@ -582,6 +626,38 @@ const FILTER_NAMES: [&str; 4] = [FILTERS[0].1, FILTERS[1].1, FILTERS[2].1, FILTE
 /// The mode strip's labels: the roll chooser, the cull grid and develop,
 /// in the order `mode_states` reports them.
 const MODES: [&str; 3] = ["Roll Selection", "Culling", "Develop"];
+
+/// The develop history pane's width in reference pixels: 27 cells, room
+/// for an exposure or look step's row (a crop's shows in whole percents,
+/// `step_label`) and for the three buttons under the list.
+pub const PANE_W: usize = 216;
+
+/// A history step as the pane lists it: `KEY VALUE`, `-` a clear, a crop
+/// as `x,y wxh` in whole percents so it fits the pane's row.
+pub fn step_label(step: &Step) -> String {
+    let value = match (step.key, step.value.as_deref()) {
+        (_, None) => "-".to_string(),
+        (Key::Crop, Some(text)) => match Crop::parse(text) {
+            Ok(crop) => {
+                let pct = |n: u32| (n + library::CROP_UNIT / 200) / (library::CROP_UNIT / 100);
+                format!(
+                    "{},{} {}x{}",
+                    pct(crop.x),
+                    pct(crop.y),
+                    pct(crop.width),
+                    pct(crop.height)
+                )
+            }
+            Err(_) => text.to_string(),
+        },
+        (_, Some(text)) => text.to_string(),
+    };
+    format!("{} {value}", step.key.name())
+}
+
+/// The buttons under the history pane, in order: the selected step off or
+/// on, the selected step deleted, the last step taken back.
+pub const HISTORY_BUTTONS: [&str; 3] = ["Toggle", "Delete", "Undo"];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum View {
@@ -687,15 +763,77 @@ impl Layout {
     /// placeholder; the window and `--preview` blit the developed image into
     /// it in develop mode, so all three agree on where the pixels go.
     pub fn preview_box(&self) -> Option<Rect> {
+        self.box_in(self.area)
+    }
+
+    /// The develop view's box: the same geometry in the area right of the
+    /// history pane.
+    pub fn develop_box(&self) -> Option<Rect> {
+        self.box_in(self.develop_region())
+    }
+
+    /// The area right of the history pane: where develop mode shows the
+    /// photo's name, its facts and the preview.
+    pub fn develop_region(&self) -> Rect {
+        let pane = (PANE_W * self.surface.scale.value()) as u32;
+        Rect {
+            x: self.area.x + i64::from(pane),
+            width: self.area.width.saturating_sub(pane),
+            ..self.area
+        }
+    }
+
+    /// The history pane's list: the pane's width at the area's left, above
+    /// one band for its buttons; `None` when the area cannot hold a row.
+    pub fn history(&self) -> Option<List> {
+        let band = (ROW * self.surface.scale.value()) as u32;
+        let rect = Rect {
+            width: (PANE_W * self.surface.scale.value()) as u32,
+            height: self.area.height.saturating_sub(band),
+            ..self.area
+        };
+        List::new(self.surface, rect)
+    }
+
+    /// The pane's buttons on the band under its list, `HISTORY_BUTTONS` in
+    /// order from a cell in, each its label's cells and a cell each side,
+    /// a cell between, inset as a strip's are; `None` where the surface
+    /// cannot hold one whole.
+    pub fn history_buttons(&self) -> [Option<Button>; 3] {
+        let s = self.surface.scale.value();
+        let band = (ROW * s) as i64;
+        let y = self.area.y + i64::from(self.area.height) - band + (BUTTON_MARGIN * s) as i64;
+        let height = (ROW - 2 * BUTTON_MARGIN) * s;
+        let cell = (CELL_WIDTH * s) as i64;
+        let mut x = self.area.x + cell;
+        let mut buttons = [None; 3];
+        for (slot, label) in buttons.iter_mut().zip(HISTORY_BUTTONS) {
+            let width = cell * (label.len() as i64 + 2);
+            let rect = Rect {
+                x,
+                y,
+                width: width as u32,
+                height: height as u32,
+            };
+            *slot = self.history().and_then(|_| Button::new(self.surface, rect));
+            x += width + cell;
+        }
+        buttons
+    }
+
+    /// The largest 3:2 box under two text rows in `region`, the same
+    /// geometry the scene, the window and `--preview` share, so the
+    /// placeholder and the image land in one place.
+    fn box_in(&self, region: Rect) -> Option<Rect> {
         let s = self.surface.scale.value();
         let pad = (CELL_PAD * s) as i64;
         let row = (CELL_HEIGHT * s) as i64;
-        let text_x = self.area.x + pad;
-        let text_w = (i64::from(self.area.width) - 2 * pad).max(0);
+        let text_x = region.x + pad;
+        let text_w = (i64::from(region.width) - 2 * pad).max(0);
         // The two text rows sit at `pad/2`, then `row`, then `row`; the box
-        // opens `pad/2` below them and closes `pad` above the area's foot.
-        let top = self.area.y + pad / 2 + 2 * row + pad / 2;
-        let bottom = self.area.y + i64::from(self.area.height) - pad;
+        // opens `pad/2` below them and closes `pad` above the region's foot.
+        let top = region.y + pad / 2 + 2 * row + pad / 2;
+        let bottom = region.y + i64::from(region.height) - pad;
         let available_h = (bottom - top).max(0);
         let width = text_w.min(available_h * 3 / 2);
         let height = width * 2 / 3;
@@ -768,6 +906,13 @@ pub struct Controller {
     export: Option<String>,
     /// The roll chooser while it is open (`choose`, `o`); see `Chooser`.
     chooser: Option<Chooser>,
+    /// The history pane's selected step, an index into the cursor photo's
+    /// history, in develop mode with a step to select; the newest when a
+    /// photo is developed or a step is added, kept (clamped) as steps go.
+    history_step: Option<usize>,
+    /// The first history step the pane shows, moved as little as possible
+    /// to keep the selection in view.
+    history_first: usize,
 }
 
 /// The roll chooser: the toolkit's finder over the folder the adapter
@@ -1260,6 +1405,8 @@ impl Controller {
             look_list: false,
             export: None,
             chooser: None,
+            history_step: None,
+            history_first: 0,
         }
     }
 
@@ -1293,6 +1440,7 @@ impl Controller {
         self.chooser = None;
         self.refresh_shown();
         self.cursor = self.shown.first().copied();
+        self.sync_step(0);
         self.bump();
         Ok(())
     }
@@ -1407,6 +1555,8 @@ impl Controller {
     /// sidecar that would take the roll past it is not held, and the photo
     /// is shown as refused for `OVER_BUDGET`. Whether the model changed.
     pub fn settle(&mut self, index: usize, photo: Photo) -> bool {
+        let before = self.steps().len();
+        let cursor = self.cursor;
         let photo = if self.fits(index, photo.bytes()) {
             photo
         } else {
@@ -1429,6 +1579,9 @@ impl Controller {
         *slot = photo;
         self.refresh_shown();
         self.keep_cursor_shown();
+        // A settle that moved the cursor (a flag that hid its photo) shows
+        // another photo's history, its newest step selected.
+        self.sync_step(if self.cursor == cursor { before } else { 0 });
         self.bump();
         true
     }
@@ -1444,12 +1597,14 @@ impl Controller {
         if names.is_empty() || !self.photos.iter().any(|photo| names.contains(&photo.name)) {
             return false;
         }
+        let before = self.steps().len();
         let position = self.position();
         let kept = self
             .cursor
             .and_then(|index| self.photos.get(index))
             .filter(|photo| !names.contains(&photo.name))
             .map(|photo| photo.name.clone());
+        let same = kept.is_some();
         self.photos.retain(|photo| !names.contains(&photo.name));
         self.bytes = self
             .photos
@@ -1470,6 +1625,9 @@ impl Controller {
             }
         };
         self.keep_cursor_shown();
+        // The cursor's photo kept its history and its selection; another
+        // photo's shows with its newest step selected.
+        self.sync_step(if same { before } else { 0 });
         self.bump();
         true
     }
@@ -1553,6 +1711,68 @@ impl Controller {
             self.export = note;
             self.bump();
         }
+    }
+
+    /// The develop history the pane shows: the cursor photo's steps in
+    /// develop mode, oldest first; empty in cull or before a photo.
+    pub fn steps(&self) -> &[Step] {
+        if self.mode != Mode::Develop {
+            return &[];
+        }
+        self.cursor
+            .and_then(|index| self.photos.get(index))
+            .and_then(|photo| photo.sidecar.as_ref())
+            .map_or(&[], |sidecar| sidecar.steps())
+    }
+
+    /// The first step the pane shows, with the selection in view.
+    pub fn step_first(&self) -> usize {
+        let total = self.steps().len();
+        match (self.layout().history(), self.history_step) {
+            (Some(list), Some(step)) => list.reveal(total, step, self.history_first),
+            _ => 0,
+        }
+    }
+
+    /// Keeps the selection on the history as it stands: none without a
+    /// step or outside develop, the newest when the history grew past
+    /// `before` (a step just added, or a photo just developed), else the
+    /// one selected, clamped to the steps that remain.
+    fn sync_step(&mut self, before: usize) {
+        let total = self.steps().len();
+        self.history_step = if total == 0 {
+            None
+        } else if total > before {
+            Some(total - 1)
+        } else {
+            Some(
+                self.history_step
+                    .map_or(total - 1, |step| step.min(total - 1)),
+            )
+        };
+        self.history_first = self.step_first();
+    }
+
+    /// Moves the history selection by `delta` steps, clamped to the ends;
+    /// `Ignored` at an end it is already at, or with no step.
+    fn move_step(&mut self, delta: i64) -> Outcome {
+        let total = self.steps().len();
+        let Some(step) = self.history_step.filter(|_| total > 0) else {
+            return Outcome::Ignored;
+        };
+        let last = (total - 1) as i64;
+        let target = (step as i64).saturating_add(delta).clamp(0, last) as usize;
+        self.select_step(target)
+    }
+
+    /// Selects history step `target`, a change when it was not selected.
+    fn select_step(&mut self, target: usize) -> Outcome {
+        if target >= self.steps().len() || self.history_step == Some(target) {
+            return Outcome::Ignored;
+        }
+        self.history_step = Some(target);
+        self.history_first = self.step_first();
+        Outcome::Changed
     }
 
     /// The look palette for the scene, when it is open over a non-empty list:
@@ -1826,6 +2046,7 @@ impl Controller {
         self.adjusting = false;
         self.aspect = Aspect::Free;
         self.look_list = false;
+        self.history_step = None;
     }
 
     /// The develop preview's box: the layout's preview box when developing a
@@ -1836,7 +2057,7 @@ impl Controller {
         if self.mode != Mode::Develop || self.cursor.is_none() || self.chooser.is_some() {
             return None;
         }
-        self.layout().preview_box()
+        self.layout().develop_box()
     }
 
     /// The shown photos on screen and the boxes their thumbnails go in, in
@@ -1984,6 +2205,8 @@ impl Controller {
             self.chooser
                 .as_ref()
                 .map_or_else(dash, |chooser| hex(&chooser.folder)),
+            self.steps().len().to_string(),
+            self.history_step.map_or_else(dash, |step| step.to_string()),
         ]
         .join("\t")
     }
@@ -2089,6 +2312,10 @@ impl Controller {
             (Action::Grid, []) => self.back_to_grid(),
             (Action::Next, []) => self.step(1)?,
             (Action::Previous, []) => self.step(-1)?,
+            // In develop the rows are the history's: Down and Up move its
+            // selection, Left and Right still the cursor.
+            (Action::Down, []) if self.mode == Mode::Develop => self.move_step(1),
+            (Action::Up, []) if self.mode == Mode::Develop => self.move_step(-1),
             (Action::Down, []) => self.step(self.layout().columns as i64)?,
             (Action::Up, []) => self.step(-(self.layout().columns as i64))?,
             (Action::PageDown, []) => {
@@ -2131,6 +2358,9 @@ impl Controller {
             (Action::Aspect, [ratio]) => return self.set_aspect(ratio, effects),
             (Action::Looks, []) => self.toggle_looks()?,
             (Action::Reset, []) => return self.reset_develop(effects),
+            (Action::Undo, []) => return self.undo(effects),
+            (Action::StepToggle, []) => return self.step_effect(false, effects),
+            (Action::StepDelete, []) => return self.step_effect(true, effects),
             (Action::Export, []) => return self.export(effects),
             (Action::DeleteRejected, []) => return self.delete_rejected(effects),
             _ => return Err(control::Error::Protocol.into()),
@@ -2170,6 +2400,13 @@ impl Controller {
         // status row, the margins) starts no drag, as a filter press is inert
         // here. Nothing else in develop uses the pointer.
         if self.mode == Mode::Develop {
+            // The history pane: a press on a step selects it, on a button
+            // asks for what the button says; the pane's other pixels, and
+            // a move or release over it, are inert. The pane is left of the
+            // develop box, so nothing here starts or ends a crop drag.
+            if let Some(result) = self.pane_pointer(phase, x, y) {
+                return result;
+            }
             // The look palette owns the develop box while it is open: a press on
             // a name picks that look and no crop drag starts under it; a move or
             // release, or a press off the names, is inert. The pick is set
@@ -2233,6 +2470,86 @@ impl Controller {
             },
         };
         Ok((self.finish(outcome), Vec::new()))
+    }
+
+    /// The pointer over the history pane, `None` when it is not over it.
+    /// A press on a shown step selects it, on Toggle or Delete asks for
+    /// the selected step's, on Undo for the last step back; a press on
+    /// the pane's chrome, and a move or release over it, are `Ignored`.
+    fn pane_pointer(
+        &mut self,
+        phase: PointerPhase,
+        x: i64,
+        y: i64,
+    ) -> Option<Result<(Outcome, Vec<Effect>), Error>> {
+        // A crop drag in progress owns the pointer wherever it goes, so
+        // its release over the pane still ends it.
+        if self.drag.is_some() {
+            return None;
+        }
+        let layout = self.layout();
+        let list = layout.history()?;
+        let on_button = layout
+            .history_buttons()
+            .iter()
+            .position(|button| button.is_some_and(|button| button.hit(x, y)));
+        // The pane is the list and the band under it, the area's height.
+        let pane = Rect {
+            height: layout.area.height,
+            ..list.rect()
+        };
+        if !pane.contains(x, y) {
+            return None;
+        }
+        if phase != PointerPhase::Press {
+            return Some(Ok((Outcome::Ignored, Vec::new())));
+        }
+        if let Some(row) = list.hit(x, y) {
+            let outcome = self.select_step(self.step_first().saturating_add(row));
+            return Some(Ok((self.finish(outcome), Vec::new())));
+        }
+        Some(match on_button {
+            Some(0) => self.step_effect(false, Vec::new()),
+            Some(1) => self.step_effect(true, Vec::new()),
+            Some(2) => self.undo(Vec::new()),
+            _ => Ok((Outcome::Ignored, Vec::new())),
+        })
+    }
+
+    /// Asks for the last step of the cursor photo's history back: the
+    /// adapter takes it off the file as it stands, `ignored` when the file
+    /// holds none.
+    fn undo(&mut self, effects: Vec<Effect>) -> Result<(Outcome, Vec<Effect>), Error> {
+        let Some(index) = self.develop_photo()? else {
+            return Ok((Outcome::Ignored, effects));
+        };
+        self.develop_effect(index, |index, name| Effect::Undo { index, name }, effects)
+    }
+
+    /// Asks for the selected history step deleted, or turned off or back
+    /// on; `Ignored` with no step selected.
+    fn step_effect(
+        &mut self,
+        delete: bool,
+        effects: Vec<Effect>,
+    ) -> Result<(Outcome, Vec<Effect>), Error> {
+        let Some(index) = self.develop_photo()? else {
+            return Ok((Outcome::Ignored, effects));
+        };
+        let Some(step) = self.history_step else {
+            return Ok((Outcome::Ignored, effects));
+        };
+        self.develop_effect(
+            index,
+            move |index, name| {
+                if delete {
+                    Effect::StepDelete { index, name, step }
+                } else {
+                    Effect::StepToggle { index, name, step }
+                }
+            },
+            effects,
+        )
     }
 
     /// The pointer over the develop preview: the crop-adjust handles when the
@@ -2710,6 +3027,7 @@ impl Controller {
         self.adjusting = false;
         self.aspect = Aspect::Free;
         self.look_list = false;
+        self.sync_step(0);
         Ok(Outcome::Changed)
     }
 
@@ -2902,6 +3220,7 @@ impl Controller {
             self.adjusting = false;
             self.aspect = Aspect::Free;
             self.look_list = false;
+            self.history_step = None;
         }
         self.reveal();
     }
@@ -2932,6 +3251,8 @@ impl Controller {
         self.aspect = Aspect::Free;
         self.look_list = false;
         self.reveal();
+        // The history is the new photo's; its newest step is selected.
+        self.sync_step(0);
         Ok(Outcome::Changed)
     }
 
@@ -3157,16 +3478,87 @@ impl Scene<'_> {
         }
     }
 
-    fn single(&self, layout: &Layout, photo: &Photo, damage: Rect, sink: &mut dyn FnMut(Draw)) {
+    /// The history pane at the area's left: the cursor photo's steps as a
+    /// list, a step that is off dimmed, the selected one highlighted, and
+    /// the three buttons under it, Toggle and Delete enabled with a
+    /// selection, Undo with a step.
+    fn history(&self, layout: &Layout, damage: Rect, sink: &mut dyn FnMut(Draw)) {
+        let model = self.model;
+        let steps = model.steps();
+        // The pane's strip is chrome first, whatever the area holds of it,
+        // so a surface too short for a row, or narrower than the pane, is
+        // painted whole.
+        let pane = (PANE_W * layout.surface.scale.value()) as u32;
+        fill(
+            Rect {
+                width: layout.area.width.min(pane),
+                ..layout.area
+            },
+            CHROME,
+            damage,
+            sink,
+        );
+        if let Some(list) = layout.history() {
+            let first = model.step_first();
+            let labels: Vec<String> = steps
+                .iter()
+                .skip(first)
+                .take(list.rows())
+                .map(step_label)
+                .collect();
+            let items = labels
+                .iter()
+                .zip(steps.iter().skip(first))
+                .map(|(label, step)| Item {
+                    label,
+                    meta: "",
+                    enabled: step.on,
+                    marked: false,
+                });
+            list.emit(
+                items,
+                first,
+                model.history_step.unwrap_or(usize::MAX),
+                steps.len(),
+                damage,
+                sink,
+            );
+        }
+        let selected = model.history_step.is_some();
+        let enabled = [selected, selected, !steps.is_empty()];
+        for ((button, label), enabled) in layout
+            .history_buttons()
+            .into_iter()
+            .zip(HISTORY_BUTTONS)
+            .zip(enabled)
+        {
+            if let Some(button) = button {
+                button.emit(label, false, enabled, damage, sink);
+            }
+        }
+    }
+
+    /// The single view over `region`: the name, the facts and the preview
+    /// `r#box` under them (the cull view's `preview_box`, develop's
+    /// `develop_box`; `None` when the region cannot hold one).
+    fn single(
+        &self,
+        layout: &Layout,
+        region: Rect,
+        r#box: Option<Rect>,
+        photo: &Photo,
+        damage: Rect,
+        sink: &mut dyn FnMut(Draw),
+    ) {
         let s = layout.surface.scale.value();
         let scale = layout.surface.scale;
-        fill(layout.area, PAPER, damage, sink);
+        fill(region, PAPER, damage, sink);
         let pad = (CELL_PAD * s) as i64;
         let row = (CELL_HEIGHT * s) as i64;
         let text = Rect {
-            x: layout.area.x + pad,
-            y: layout.area.y + pad / 2,
-            width: (layout.area.width as i64 - 2 * pad).max(0) as u32,
+            x: region.x + pad,
+            y: region.y + pad / 2,
+            width: (region.width as i64 - 2 * pad).max(0) as u32,
             height: row as u32,
         };
         let style = GlyphStyle::medium(INK, PAPER);
@@ -3203,7 +3595,7 @@ impl Scene<'_> {
         // The preview's place: the largest 3:2 box under the two rows, the
         // same rectangle the window and `--preview` blit the developed image
         // into, so the placeholder and the image share one geometry.
-        if let Some(r#box) = layout.preview_box() {
+        if let Some(r#box) = r#box {
             fill(r#box, PLACEHOLDER, damage, sink);
             // The develop overlay over the preview -- the crop overlay, or the
             // look palette when it is open -- clipped to the box so it cannot
@@ -3382,9 +3774,29 @@ impl Composition for Scene<'_> {
             // The develop view shows the cursor photo's facts and a preview
             // box, the single view's layout until the raw render lands (a
             // later increment); the status row names the mode.
-            (Some(_), Mode::Develop, _) | (Some(_), Mode::Cull, View::Single) => match cursor_photo
-            {
-                Some(photo) => self.single(&layout, photo, damage, sink),
+            (Some(_), Mode::Develop, _) => match cursor_photo {
+                Some(photo) => {
+                    self.history(&layout, damage, sink);
+                    self.single(
+                        &layout,
+                        layout.develop_region(),
+                        layout.develop_box(),
+                        photo,
+                        damage,
+                        sink,
+                    )
+                }
+                None => self.grid(&layout, damage, sink),
+            },
+            (Some(_), Mode::Cull, View::Single) => match cursor_photo {
+                Some(photo) => self.single(
+                    &layout,
+                    layout.area,
+                    layout.preview_box(),
+                    photo,
+                    damage,
+                    sink,
+                ),
                 None => self.grid(&layout, damage, sink),
             },
             (Some(_), Mode::Cull, View::Grid) => self.grid(&layout, damage, sink),

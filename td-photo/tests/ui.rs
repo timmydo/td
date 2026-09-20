@@ -20,10 +20,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use td_photo::library::{self, Filter, Flag, Key, Sidecar};
 use td_photo::ui::{self, Action, Controller, Effect, Photo, View, BINDINGS};
+use td_ui::chrome::DISABLED;
 use td_ui::control::{frame, hex, valid_code, Decoder, ErrorCode};
 use td_ui::driven::{self, Input, Outcome, PointerPhase};
 use td_ui::finder;
-use td_ui::raster::{Rect, Scale, Surface};
+use td_ui::raster::{Composition, Primitive, Rect, Scale, Surface};
 use td_ui::CELL_HEIGHT;
 
 #[path = "support/synth_nef.rs"]
@@ -42,6 +43,8 @@ const STATUS: usize = 12;
 const JOBS: usize = 13;
 const GENERATION: usize = 14;
 const CHOOSER: usize = 15;
+const STEPS: usize = 16;
+const STEP: usize = 17;
 
 fn surface(width: usize, height: usize) -> Surface {
     Surface::new(width, height, Scale::new(1).unwrap()).unwrap()
@@ -190,7 +193,7 @@ fn a_session_walks_the_grid_and_reports_its_state() {
     assert_eq!((layout.columns, layout.rows), (4, 3));
     assert_eq!(
         c.state(),
-        "cull\t-\t0\t0\t-\tall\tgrid\t-\t-\t-\t-\t-\t-\t0\t0\t-"
+        "cull\t-\t0\t0\t-\tall\tgrid\t-\t-\t-\t-\t-\t-\t0\t0\t-\t0\t-"
     );
     for name in ["next", "pick", "view", "first"] {
         assert_eq!(
@@ -465,6 +468,9 @@ fn apply(c: &mut Controller, effects: &[Effect]) -> Result<Outcome, ui::Error> {
             | Effect::Edit { index, name, .. }
             | Effect::Expose { index, name, .. }
             | Effect::Reset { index, name }
+            | Effect::Undo { index, name }
+            | Effect::StepToggle { index, name, .. }
+            | Effect::StepDelete { index, name, .. }
             | Effect::Export { index, name } => (*index, name.clone()),
             Effect::DeleteRejected => {
                 // The adapter moves the rejects the files flag; here the
@@ -509,6 +515,15 @@ fn apply(c: &mut Controller, effects: &[Effect]) -> Result<Outcome, ui::Error> {
                     .unwrap();
             }
             Effect::Reset { .. } => sidecar.reset(),
+            Effect::Undo { .. } => {
+                sidecar.undo();
+            }
+            Effect::StepToggle { step, .. } => {
+                sidecar.toggle_step(*step);
+            }
+            Effect::StepDelete { step, .. } => {
+                sidecar.delete_step(*step);
+            }
             Effect::Open(_)
             | Effect::Export { .. }
             | Effect::DeleteRejected
@@ -539,6 +554,12 @@ fn apply(c: &mut Controller, effects: &[Effect]) -> Result<Outcome, ui::Error> {
 /// effects, where `act`, which forbids them, cannot be used.
 fn carry(c: &mut Controller, name: &str, args: &[&str]) -> Outcome {
     let (_, effects) = c.action(name, args).unwrap();
+    apply(c, &effects).unwrap()
+}
+
+/// `carry` for a key: the chord's effects carried on the model.
+fn carry_key(c: &mut Controller, chord: &str) -> Outcome {
+    let (_, effects) = c.input(Input::Key { chord }).unwrap();
     apply(c, &effects).unwrap()
 }
 
@@ -624,7 +645,7 @@ fn flags_change_the_sidecar_through_effects_and_never_a_refused_one() {
     assert_eq!(apply(&mut c, &effects).unwrap(), Outcome::Changed);
     assert_eq!(
         text(&c, 4).as_deref(),
-        Some("td-photo edit 1\nfuture 1\nexposure -0.33\nflag pick\n")
+        Some("td-photo edit 1\nfuture 1\nexposure -0.33\nflag pick\nstep-1 on exposure -0.33\n")
     );
     assert_eq!(c.photos()[4].value(Key::Exposure), "-0.33");
     // A refused sidecar is never rewritten: the dispatch asks, since the
@@ -1248,10 +1269,12 @@ fn the_binary_replays_the_cull_over_a_roll_and_writes_through_the_sidecar() {
             "none",
             "0",
             "1",
+            "-",
+            "0",
             "-"
         ]
     );
-    assert_eq!(&reply(2)[..2], ["ok", "35"]);
+    assert_eq!(&reply(2)[..2], ["ok", "38"]);
     assert_eq!(reply(3), ["ok", "changed"]);
     assert_eq!(reply(4), ["ok", &name(1), "pick", "-", "-", "-", "ok", "-"]);
     assert_eq!(
@@ -1338,7 +1361,7 @@ fn the_binary_replays_the_cull_over_a_roll_and_writes_through_the_sidecar() {
     assert_eq!(replies[1][14], "ok");
     assert_eq!(
         fs::read_to_string(roll.join("DSC_0001.NEF.edit")).unwrap(),
-        "td-photo edit 1\nexposure -0.50\nflag reject\n"
+        "td-photo edit 1\nexposure -0.50\nflag reject\nstep-1 on exposure -0.50\n"
     );
     fs::write(
         roll.join("DSC_0001.NEF.edit"),
@@ -1536,7 +1559,7 @@ fn the_binary_develops_a_photo_over_the_effects_and_writes_the_sidecar() {
     assert_eq!((a[11][11].as_str(), a[11][13].as_str()), ("0.10", "portra"));
     assert_eq!(
         fs::read_to_string(&edit_1).unwrap(),
-        "td-photo edit 1\nexposure 0.10\nlook portra\ncrop 0.1000 0.1000 0.5000 0.5000\n"
+        "td-photo edit 1\nexposure 0.10\nlook portra\ncrop 0.1000 0.1000 0.5000 0.5000\nstep-1 on exposure 0.33\nstep-2 on exposure 0.43\nstep-3 on exposure 0.10\nstep-4 on look portra\nstep-5 on crop 0.1000 0.1000 0.5000 0.5000\n"
     );
 
     // The exposure delta is added to the file's value, not the model's: an
@@ -2138,8 +2161,24 @@ fn the_develop_box_is_the_preview_box_only_in_develop_mode() {
     // In develop mode it is the layout's preview box, the same rectangle the
     // scene fills with a placeholder.
     assert_eq!(act(&mut c, "develop", &[]), Outcome::Changed);
-    assert_eq!(c.develop_box(), c.layout().preview_box());
+    assert_eq!(c.develop_box(), c.layout().develop_box());
     assert!(c.develop_box().is_some());
+    // Right of the history pane: the region's box, not the whole area's.
+    let region = c.layout().develop_region();
+    assert_eq!(
+        (region.x, region.width),
+        (ui::PANE_W as i64, 800 - ui::PANE_W as u32)
+    );
+    assert_ne!(c.develop_box(), c.layout().preview_box());
+    assert_eq!(
+        c.develop_box(),
+        Some(Rect {
+            x: 224,
+            y: 88,
+            width: 568,
+            height: 378,
+        })
+    );
 
     // A surface too small for a box has none, even in develop mode.
     let mut small = Controller::new(surface(400, 40));
@@ -2160,7 +2199,7 @@ fn a_crop_drag_over_the_preview_selects_a_sub_region() {
     // the drag's canvas; like the job count it never bumps the generation,
     // only the marquee the model derives from it does.
     let canvas = Rect {
-        x: 100,
+        x: 300,
         y: 100,
         width: 400,
         height: 300,
@@ -2172,11 +2211,11 @@ fn a_crop_drag_over_the_preview_selects_a_sub_region() {
 
     // A press inside the canvas arms a zero-size marquee: invisible, so no
     // frame change and no generation bump yet.
-    assert_eq!(press(&mut c, 200, 150), Outcome::Ignored);
+    assert_eq!(press(&mut c, 400, 150), Outcome::Ignored);
     assert_eq!(
         c.crop_drag(),
         Some(Rect {
-            x: 200,
+            x: 400,
             y: 150,
             width: 0,
             height: 0,
@@ -2185,11 +2224,11 @@ fn a_crop_drag_over_the_preview_selects_a_sub_region() {
     assert_eq!(fields(&c)[GENERATION], quiet);
 
     // A move rubber-bands the marquee: the frame changes, so a bump.
-    assert_eq!(drag_to(&mut c, 400, 300), Outcome::Changed);
+    assert_eq!(drag_to(&mut c, 600, 300), Outcome::Changed);
     assert_eq!(
         c.crop_drag(),
         Some(Rect {
-            x: 200,
+            x: 400,
             y: 150,
             width: 200,
             height: 150,
@@ -2201,7 +2240,7 @@ fn a_crop_drag_over_the_preview_selects_a_sub_region() {
     // through the same Edit the `crop` action emits, and the marquee is gone.
     // dx/dy = 100/50 of 400x300, dw/dh = 200/150: x=0.2500, y=0.1666 (floor),
     // w=h=0.5000 of the whole (uncropped) image.
-    let (outcome, effects) = release(&mut c, 400, 300);
+    let (outcome, effects) = release(&mut c, 600, 300);
     assert_eq!(outcome, Outcome::Changed);
     assert_eq!(
         effects,
@@ -2233,7 +2272,7 @@ fn a_crop_drag_composes_with_the_current_crop() {
     assert_eq!(fields(&c)[CROP], "0.2500 0.1666 0.5000 0.5000");
 
     let canvas = Rect {
-        x: 100,
+        x: 300,
         y: 100,
         width: 400,
         height: 300,
@@ -2244,9 +2283,9 @@ fn a_crop_drag_composes_with_the_current_crop() {
     // not the whole image. From the canvas top-left, 200x150 of 400x300 is
     // the top-left quarter-area; composed with the current crop (w=h=0.5000)
     // that leaves x=0.2500, y=0.1666 and shrinks w=h to 0.2500 -- a subset.
-    assert_eq!(press(&mut c, 100, 100), Outcome::Ignored);
-    assert_eq!(drag_to(&mut c, 300, 250), Outcome::Changed);
-    let (outcome, effects) = release(&mut c, 300, 250);
+    assert_eq!(press(&mut c, 300, 100), Outcome::Ignored);
+    assert_eq!(drag_to(&mut c, 500, 250), Outcome::Changed);
+    let (outcome, effects) = release(&mut c, 500, 250);
     assert_eq!(outcome, Outcome::Changed);
     assert_eq!(
         effects,
@@ -2267,7 +2306,7 @@ fn a_crop_drag_refuses_clicks_tiny_marquees_and_off_canvas_presses() {
     c.open("roll", b"/r", photos(5)).unwrap();
     assert_eq!(act(&mut c, "develop", &[]), Outcome::Changed);
     let canvas = Rect {
-        x: 100,
+        x: 300,
         y: 100,
         width: 400,
         height: 300,
@@ -2275,20 +2314,20 @@ fn a_crop_drag_refuses_clicks_tiny_marquees_and_off_canvas_presses() {
     c.set_preview_fit(Some(canvas));
 
     // A press off the canvas arms no drag: the far edges are exclusive.
-    assert_eq!(press(&mut c, 50, 50), Outcome::Ignored);
+    assert_eq!(press(&mut c, 250, 50), Outcome::Ignored);
     assert_eq!(c.crop_drag(), None);
-    assert_eq!(press(&mut c, 500, 200), Outcome::Ignored);
+    assert_eq!(press(&mut c, 700, 200), Outcome::Ignored);
     assert_eq!(c.crop_drag(), None);
 
     // A move or release with no drag armed is inert.
-    assert_eq!(drag_to(&mut c, 300, 250), Outcome::Ignored);
-    assert_eq!(release(&mut c, 300, 250).0, Outcome::Ignored);
+    assert_eq!(drag_to(&mut c, 500, 250), Outcome::Ignored);
+    assert_eq!(release(&mut c, 500, 250).0, Outcome::Ignored);
     assert_eq!(c.crop_drag(), None);
 
     // A plain click -- press and release with no move -- is a zero-size
     // marquee: nothing selected, no effect, no change.
-    assert_eq!(press(&mut c, 200, 150), Outcome::Ignored);
-    let (outcome, effects) = release(&mut c, 200, 150);
+    assert_eq!(press(&mut c, 400, 150), Outcome::Ignored);
+    let (outcome, effects) = release(&mut c, 400, 150);
     assert_eq!(outcome, Outcome::Ignored);
     assert!(effects.is_empty());
     assert_eq!(c.crop_drag(), None);
@@ -2296,9 +2335,9 @@ fn a_crop_drag_refuses_clicks_tiny_marquees_and_off_canvas_presses() {
     // A marquee that maps under the minimum edge selects nothing, but a
     // visible marquee that then vanishes is still a frame change: Changed
     // with no effect. 12px of 400 is 0.0300, under the 0.0500 minimum edge.
-    assert_eq!(press(&mut c, 200, 150), Outcome::Ignored);
-    assert_eq!(drag_to(&mut c, 212, 165), Outcome::Changed);
-    let (outcome, effects) = release(&mut c, 212, 165);
+    assert_eq!(press(&mut c, 400, 150), Outcome::Ignored);
+    assert_eq!(drag_to(&mut c, 412, 165), Outcome::Changed);
+    let (outcome, effects) = release(&mut c, 412, 165);
     assert_eq!(outcome, Outcome::Changed);
     assert!(effects.is_empty());
     assert_eq!(c.crop_drag(), None);
@@ -2345,7 +2384,7 @@ fn the_crop_marquee_is_drawn_into_the_scene_frame() {
     c.open("roll", b"/r", photos(5)).unwrap();
     assert_eq!(act(&mut c, "develop", &[]), Outcome::Changed);
     c.set_preview_fit(Some(Rect {
-        x: 100,
+        x: 300,
         y: 100,
         width: 400,
         height: 300,
@@ -2357,7 +2396,7 @@ fn the_crop_marquee_is_drawn_into_the_scene_frame() {
     let bare = driven::fnv1a64(&driven::paint(&c.scene()).unwrap().rgb);
 
     // Arming a zero-size marquee draws nothing: the frame is unchanged.
-    assert_eq!(press(&mut c, 200, 150), Outcome::Ignored);
+    assert_eq!(press(&mut c, 400, 150), Outcome::Ignored);
     assert_eq!(
         driven::fnv1a64(&driven::paint(&c.scene()).unwrap().rgb),
         bare
@@ -2365,13 +2404,13 @@ fn the_crop_marquee_is_drawn_into_the_scene_frame() {
 
     // Rubber-banding it outlines a rectangle over the preview: the frame
     // differs.
-    assert_eq!(drag_to(&mut c, 400, 300), Outcome::Changed);
+    assert_eq!(drag_to(&mut c, 600, 300), Outcome::Changed);
     let marked = driven::fnv1a64(&driven::paint(&c.scene()).unwrap().rgb);
     assert_ne!(marked, bare);
 
     // The release takes the drag (its crop is an effect the adapter settles,
     // not the scene): the marquee is gone and the frame is the bare one again.
-    let (_, effects) = release(&mut c, 400, 300);
+    let (_, effects) = release(&mut c, 600, 300);
     assert!(!effects.is_empty());
     assert_eq!(
         driven::fnv1a64(&driven::paint(&c.scene()).unwrap().rgb),
@@ -2385,7 +2424,7 @@ fn a_horizontal_or_vertical_crop_drag_paints_nothing() {
     c.open("roll", b"/r", photos(5)).unwrap();
     assert_eq!(act(&mut c, "develop", &[]), Outcome::Changed);
     c.set_preview_fit(Some(Rect {
-        x: 100,
+        x: 300,
         y: 100,
         width: 400,
         height: 300,
@@ -2396,9 +2435,9 @@ fn a_horizontal_or_vertical_crop_drag_paints_nothing() {
     // both painters suppress it. It is invisible, so no frame change -- the
     // move is Ignored, the generation holds, and the frame is the bare one,
     // even though the raw marquee (which crop_drag reports) did change.
-    assert_eq!(press(&mut c, 200, 150), Outcome::Ignored);
+    assert_eq!(press(&mut c, 400, 150), Outcome::Ignored);
     let quiet = fields(&c)[GENERATION].clone();
-    assert_eq!(drag_to(&mut c, 350, 150), Outcome::Ignored);
+    assert_eq!(drag_to(&mut c, 550, 150), Outcome::Ignored);
     assert_eq!(fields(&c)[GENERATION], quiet);
     assert_eq!(
         driven::fnv1a64(&driven::paint(&c.scene()).unwrap().rgb),
@@ -2407,7 +2446,7 @@ fn a_horizontal_or_vertical_crop_drag_paints_nothing() {
     assert_eq!(
         c.crop_drag(),
         Some(Rect {
-            x: 200,
+            x: 400,
             y: 150,
             width: 150,
             height: 0,
@@ -2415,7 +2454,7 @@ fn a_horizontal_or_vertical_crop_drag_paints_nothing() {
     );
 
     // Growing the height makes it visible: now a frame change.
-    assert_eq!(drag_to(&mut c, 350, 250), Outcome::Changed);
+    assert_eq!(drag_to(&mut c, 550, 250), Outcome::Changed);
     assert_ne!(fields(&c)[GENERATION], quiet);
     assert_ne!(
         driven::fnv1a64(&driven::paint(&c.scene()).unwrap().rgb),
@@ -2429,21 +2468,21 @@ fn a_second_press_during_a_drag_clears_the_visible_marquee() {
     c.open("roll", b"/r", photos(5)).unwrap();
     assert_eq!(act(&mut c, "develop", &[]), Outcome::Changed);
     c.set_preview_fit(Some(Rect {
-        x: 100,
+        x: 300,
         y: 100,
         width: 400,
         height: 300,
     }));
 
-    assert_eq!(press(&mut c, 200, 150), Outcome::Ignored);
-    assert_eq!(drag_to(&mut c, 400, 300), Outcome::Changed);
+    assert_eq!(press(&mut c, 400, 150), Outcome::Ignored);
+    assert_eq!(drag_to(&mut c, 600, 300), Outcome::Changed);
     let visible = fields(&c)[GENERATION].clone();
     let marked = driven::fnv1a64(&driven::paint(&c.scene()).unwrap().rgb);
 
     // A second press (the replay/socket vocabulary permits one during a drag)
     // arms a fresh zero-size marquee: the visible outline left the frame, so
     // that is a change even though the new marquee is itself invisible.
-    assert_eq!(press(&mut c, 250, 200), Outcome::Changed);
+    assert_eq!(press(&mut c, 450, 200), Outcome::Changed);
     assert_ne!(fields(&c)[GENERATION], visible);
     assert_ne!(
         driven::fnv1a64(&driven::paint(&c.scene()).unwrap().rgb),
@@ -2452,7 +2491,7 @@ fn a_second_press_during_a_drag_clears_the_visible_marquee() {
     assert_eq!(
         c.crop_drag(),
         Some(Rect {
-            x: 250,
+            x: 450,
             y: 200,
             width: 0,
             height: 0,
@@ -2466,7 +2505,7 @@ fn a_release_committing_the_current_crop_still_clears_the_marquee() {
     c.open("roll", b"/r", photos(5)).unwrap();
     assert_eq!(act(&mut c, "develop", &[]), Outcome::Changed);
     c.set_preview_fit(Some(Rect {
-        x: 100,
+        x: 300,
         y: 100,
         width: 400,
         height: 300,
@@ -2474,9 +2513,9 @@ fn a_release_committing_the_current_crop_still_clears_the_marquee() {
 
     // A drag over the whole canvas composes to exactly the full crop; commit
     // it so the sidecar holds it.
-    assert_eq!(press(&mut c, 100, 100), Outcome::Ignored);
-    assert_eq!(drag_to(&mut c, 500, 400), Outcome::Changed);
-    let (_, effects) = release(&mut c, 500, 400);
+    assert_eq!(press(&mut c, 300, 100), Outcome::Ignored);
+    assert_eq!(drag_to(&mut c, 700, 400), Outcome::Changed);
+    let (_, effects) = release(&mut c, 700, 400);
     assert_eq!(apply(&mut c, &effects).unwrap(), Outcome::Changed);
     let crop = fields(&c)[CROP].clone();
     assert_ne!(crop, "-");
@@ -2485,10 +2524,10 @@ fn a_release_committing_the_current_crop_still_clears_the_marquee() {
     // the sidecar, so settling it changes nothing. The marquee still left the
     // frame, so the release must move the generation on its own -- otherwise
     // the outline would stay painted until an unrelated change.
-    assert_eq!(press(&mut c, 100, 100), Outcome::Ignored);
-    assert_eq!(drag_to(&mut c, 500, 400), Outcome::Changed);
+    assert_eq!(press(&mut c, 300, 100), Outcome::Ignored);
+    assert_eq!(drag_to(&mut c, 700, 400), Outcome::Changed);
     let visible = fields(&c)[GENERATION].clone();
-    let (outcome, effects) = release(&mut c, 500, 400);
+    let (outcome, effects) = release(&mut c, 700, 400);
     assert_eq!(outcome, Outcome::Changed);
     assert_eq!(
         effects,
@@ -2512,25 +2551,25 @@ fn a_crop_drag_holds_the_canvas_it_started_on() {
     c.open("roll", b"/r", photos(5)).unwrap();
     assert_eq!(act(&mut c, "develop", &[]), Outcome::Changed);
     c.set_preview_fit(Some(Rect {
-        x: 100,
+        x: 300,
         y: 100,
         width: 400,
         height: 300,
     }));
 
-    assert_eq!(press(&mut c, 200, 150), Outcome::Ignored);
-    assert_eq!(drag_to(&mut c, 400, 300), Outcome::Changed);
+    assert_eq!(press(&mut c, 400, 150), Outcome::Ignored);
+    assert_eq!(drag_to(&mut c, 600, 300), Outcome::Changed);
 
     // A new fit arrives mid-drag (an in-flight develop lands at a different
     // size): the gesture keeps mapping against the canvas it started on, not
     // the new one, so the committed crop cannot escape the current crop.
     c.set_preview_fit(Some(Rect {
-        x: 200,
+        x: 400,
         y: 100,
         width: 200,
         height: 300,
     }));
-    let (_, effects) = release(&mut c, 400, 300);
+    let (_, effects) = release(&mut c, 600, 300);
     assert_eq!(
         effects,
         [Effect::Edit {
@@ -2548,7 +2587,7 @@ fn a_press_then_release_with_no_move_selects_from_the_two_points() {
     c.open("roll", b"/r", photos(5)).unwrap();
     assert_eq!(act(&mut c, "develop", &[]), Outcome::Changed);
     c.set_preview_fit(Some(Rect {
-        x: 100,
+        x: 300,
         y: 100,
         width: 400,
         height: 300,
@@ -2557,8 +2596,8 @@ fn a_press_then_release_with_no_move_selects_from_the_two_points() {
     // The replay/socket adapter can name a rubber-band by its two corners: a
     // press at one, a release at the other with no move between. The release
     // uses its own point, so the marquee spans the two and commits a crop.
-    assert_eq!(press(&mut c, 200, 150), Outcome::Ignored);
-    let (outcome, effects) = release(&mut c, 400, 300);
+    assert_eq!(press(&mut c, 400, 150), Outcome::Ignored);
+    let (outcome, effects) = release(&mut c, 600, 300);
     assert_eq!(outcome, Outcome::Changed);
     assert_eq!(
         effects,
@@ -2584,7 +2623,7 @@ fn adjusting(crop: &[&str]) -> Controller {
         assert_eq!(carry(&mut c, "crop", crop), Outcome::Changed);
     }
     c.set_preview_fit(Some(Rect {
-        x: 100,
+        x: 300,
         y: 100,
         width: 400,
         height: 300,
@@ -2634,7 +2673,7 @@ fn crop_adjust_maps_the_crop_onto_the_canvas() {
     assert_eq!(
         c.crop_adjust_rect(),
         Some(Rect {
-            x: 100,
+            x: 300,
             y: 100,
             width: 400,
             height: 300,
@@ -2646,7 +2685,7 @@ fn crop_adjust_maps_the_crop_onto_the_canvas() {
     assert_eq!(
         c.crop_adjust_rect(),
         Some(Rect {
-            x: 200,
+            x: 400,
             y: 175,
             width: 200,
             height: 150,
@@ -2661,9 +2700,9 @@ fn a_corner_handle_grows_the_crop() {
     // Grab the NW corner (200,175) and drag it to the canvas top-left: the crop
     // grows from a centred half to the top-left three-quarters -- a growth the
     // tighten marquee can never do. Grabbing paints nothing new (Ignored).
-    assert_eq!(press(&mut c, 200, 175), Outcome::Ignored);
-    assert_eq!(drag_to(&mut c, 100, 100), Outcome::Changed);
-    let (outcome, effects) = release(&mut c, 100, 100);
+    assert_eq!(press(&mut c, 400, 175), Outcome::Ignored);
+    assert_eq!(drag_to(&mut c, 300, 100), Outcome::Changed);
+    let (outcome, effects) = release(&mut c, 300, 100);
     assert_eq!(outcome, Outcome::Changed);
     assert_eq!(
         effects,
@@ -2685,9 +2724,9 @@ fn the_interior_handle_moves_the_crop() {
 
     // Press inside the crop rectangle and drag: the whole rectangle translates,
     // keeping its width and height.
-    assert_eq!(press(&mut c, 300, 250), Outcome::Ignored);
-    assert_eq!(drag_to(&mut c, 320, 260), Outcome::Changed);
-    let (_, effects) = release(&mut c, 320, 260);
+    assert_eq!(press(&mut c, 500, 250), Outcome::Ignored);
+    assert_eq!(drag_to(&mut c, 520, 260), Outcome::Changed);
+    let (_, effects) = release(&mut c, 520, 260);
     assert_eq!(
         effects,
         [Effect::Edit {
@@ -2704,9 +2743,9 @@ fn an_edge_handle_shrinks_to_the_minimum_and_grows_to_clear_the_crop() {
     // Dragging the east edge far in clamps to the minimum edge (0.0500), never
     // past it.
     let mut c = adjusting(&["0.2500", "0.2500", "0.5000", "0.5000"]);
-    assert_eq!(press(&mut c, 400, 250), Outcome::Ignored);
-    assert_eq!(drag_to(&mut c, 210, 250), Outcome::Changed);
-    let (_, effects) = release(&mut c, 210, 250);
+    assert_eq!(press(&mut c, 600, 250), Outcome::Ignored);
+    assert_eq!(drag_to(&mut c, 410, 250), Outcome::Changed);
+    let (_, effects) = release(&mut c, 410, 250);
     assert_eq!(
         effects,
         [Effect::Edit {
@@ -2720,9 +2759,9 @@ fn an_edge_handle_shrinks_to_the_minimum_and_grows_to_clear_the_crop() {
     // Dragging an edge out to the canvas so the rectangle covers the whole
     // image clears the crop (value None), not a redundant full-frame crop.
     let mut c = adjusting(&["0.0000", "0.0000", "0.5000", "1.0000"]);
-    assert_eq!(press(&mut c, 300, 250), Outcome::Ignored);
-    assert_eq!(drag_to(&mut c, 500, 250), Outcome::Changed);
-    let (_, effects) = release(&mut c, 500, 250);
+    assert_eq!(press(&mut c, 500, 250), Outcome::Ignored);
+    assert_eq!(drag_to(&mut c, 700, 250), Outcome::Changed);
+    let (_, effects) = release(&mut c, 700, 250);
     assert_eq!(
         effects,
         [Effect::Edit {
@@ -2742,7 +2781,7 @@ fn crop_adjust_is_witnessed_by_the_frame_not_state() {
     c.open("roll", b"/r", photos(5)).unwrap();
     assert_eq!(act(&mut c, "develop", &[]), Outcome::Changed);
     let canvas = Rect {
-        x: 100,
+        x: 300,
         y: 100,
         width: 400,
         height: 300,
@@ -2765,13 +2804,13 @@ fn crop_adjust_is_witnessed_by_the_frame_not_state() {
     // Grabbing a handle paints the rectangle already shown: no bump. Moving it
     // does bump.
     let armed = fields(&c)[GENERATION].clone();
-    assert_eq!(press(&mut c, 100, 100), Outcome::Ignored);
+    assert_eq!(press(&mut c, 300, 100), Outcome::Ignored);
     assert_eq!(fields(&c)[GENERATION], armed);
-    assert_eq!(drag_to(&mut c, 200, 175), Outcome::Changed);
+    assert_eq!(drag_to(&mut c, 400, 175), Outcome::Changed);
     assert_ne!(fields(&c)[GENERATION], armed);
 
     // Leaving crop-adjust removes the overlay: back to the bare frame.
-    let _ = release(&mut c, 200, 175);
+    let _ = release(&mut c, 400, 175);
     assert_eq!(act(&mut c, "adjust-crop", &[]), Outcome::Changed);
     assert!(!c.adjusting());
     assert_eq!(
@@ -2818,7 +2857,7 @@ fn toggling_crop_adjust_over_a_matching_marquee_is_a_frame_change() {
     c.open("roll", b"/r", photos(5)).unwrap();
     assert_eq!(act(&mut c, "develop", &[]), Outcome::Changed);
     let canvas = Rect {
-        x: 100,
+        x: 300,
         y: 100,
         width: 400,
         height: 300,
@@ -2826,8 +2865,8 @@ fn toggling_crop_adjust_over_a_matching_marquee_is_a_frame_change() {
     c.set_preview_fit(Some(canvas));
 
     // A tighten marquee spanning the whole canvas (no crop yet).
-    assert_eq!(press(&mut c, 100, 100), Outcome::Ignored);
-    assert_eq!(drag_to(&mut c, 500, 400), Outcome::Changed);
+    assert_eq!(press(&mut c, 300, 100), Outcome::Ignored);
+    assert_eq!(drag_to(&mut c, 700, 400), Outcome::Changed);
     assert_eq!(c.crop_drag(), Some(canvas));
     let marquee_gen = fields(&c)[GENERATION].clone();
     let marquee_digest = driven::fnv1a64(&driven::paint(&c.scene()).unwrap().rgb);
@@ -3246,8 +3285,8 @@ fn a_locked_corner_drag_maps_the_ratio_in_pixel_space() {
     // The crop starts 4:3 in pixels (200x150), not the locked 3:2.
     let mut c = develop_at(
         Rect {
-            x: 0,
-            y: 0,
+            x: 220,
+            y: 48,
             width: 400,
             height: 300,
         },
@@ -3260,12 +3299,12 @@ fn a_locked_corner_drag_maps_the_ratio_in_pixel_space() {
     assert_eq!(act(&mut c, "aspect", &["3:2"]), Outcome::Ignored);
     // Grabbing the south-east corner paints the crop already shown, not a
     // reshaped ratio box: a zero-delta grab keeps the free path.
-    assert_eq!(press(&mut c, 300, 225), Outcome::Ignored);
+    assert_eq!(press(&mut c, 520, 273), Outcome::Ignored);
     assert_eq!(
         c.crop_adjust_rect(),
         Some(Rect {
-            x: 100,
-            y: 75,
+            x: 320,
+            y: 123,
             width: 200,
             height: 150,
         })
@@ -3273,17 +3312,17 @@ fn a_locked_corner_drag_maps_the_ratio_in_pixel_space() {
     // Dragging the corner out holds 3:2 in pixels: 300x200 on screen, a 9:8
     // box in the crop's fractions; the live overlay is already the committed
     // box.
-    assert_eq!(drag_to(&mut c, 400, 300), Outcome::Changed);
+    assert_eq!(drag_to(&mut c, 620, 348), Outcome::Changed);
     assert_eq!(
         c.crop_adjust_rect(),
         Some(Rect {
-            x: 100,
-            y: 75,
+            x: 320,
+            y: 123,
             width: 300,
             height: 200,
         })
     );
-    let (outcome, effects) = release(&mut c, 400, 300);
+    let (outcome, effects) = release(&mut c, 620, 348);
     assert_eq!(outcome, Outcome::Changed);
     assert_eq!(
         effects,
@@ -3306,8 +3345,8 @@ fn a_locked_grab_without_moving_neither_reshapes_nor_commits() {
     // the press and then discard it on a stationary release.
     let mut c = develop_at(
         Rect {
-            x: 0,
-            y: 0,
+            x: 220,
+            y: 48,
             width: 600,
             height: 400,
         },
@@ -3316,18 +3355,18 @@ fn a_locked_grab_without_moving_neither_reshapes_nor_commits() {
     assert_eq!(act(&mut c, "aspect", &["1:1"]), Outcome::Ignored);
     assert_eq!(act(&mut c, "adjust-crop", &[]), Outcome::Changed);
     let full = Rect {
-        x: 0,
-        y: 0,
+        x: 220,
+        y: 48,
         width: 600,
         height: 400,
     };
     assert_eq!(c.crop_adjust_rect(), Some(full));
     let crop_before = fields(&c)[CROP].clone();
     // The grab does not reshape the full-frame overlay to a square.
-    assert_eq!(press(&mut c, 0, 0), Outcome::Ignored);
+    assert_eq!(press(&mut c, 220, 48), Outcome::Ignored);
     assert_eq!(c.crop_adjust_rect(), Some(full));
     // Releasing without moving commits nothing and leaves the crop untouched.
-    let (outcome, effects) = release(&mut c, 0, 0);
+    let (outcome, effects) = release(&mut c, 220, 48);
     assert_eq!(outcome, Outcome::Ignored);
     assert!(effects.is_empty());
     assert_eq!(fields(&c)[CROP], crop_before);
@@ -3337,8 +3376,8 @@ fn a_locked_grab_without_moving_neither_reshapes_nor_commits() {
 fn a_corner_drag_holds_the_locked_ratio() {
     let mut c = develop_at(
         Rect {
-            x: 0,
-            y: 0,
+            x: 220,
+            y: 48,
             width: 600,
             height: 400,
         },
@@ -3350,18 +3389,18 @@ fn a_corner_drag_holds_the_locked_ratio() {
     assert_eq!(act(&mut c, "aspect", &["3:2"]), Outcome::Ignored);
     // Drag the south-east corner out to the canvas: the box grows holding 3:2,
     // capped by the canvas edge; the live overlay is already the committed box.
-    assert_eq!(press(&mut c, 450, 200), Outcome::Ignored);
-    assert_eq!(drag_to(&mut c, 600, 400), Outcome::Changed);
+    assert_eq!(press(&mut c, 670, 248), Outcome::Ignored);
+    assert_eq!(drag_to(&mut c, 820, 448), Outcome::Changed);
     assert_eq!(
         c.crop_adjust_rect(),
         Some(Rect {
-            x: 150,
-            y: 0,
+            x: 370,
+            y: 48,
             width: 450,
             height: 300,
         })
     );
-    let (outcome, effects) = release(&mut c, 600, 400);
+    let (outcome, effects) = release(&mut c, 820, 448);
     assert_eq!(outcome, Outcome::Changed);
     assert_eq!(
         effects,
@@ -3378,8 +3417,8 @@ fn a_corner_drag_holds_the_locked_ratio() {
 fn an_edge_drag_under_a_lock_adjusts_the_orthogonal_dimension() {
     let mut c = develop_at(
         Rect {
-            x: 0,
-            y: 0,
+            x: 220,
+            y: 48,
             width: 600,
             height: 400,
         },
@@ -3389,9 +3428,9 @@ fn an_edge_drag_under_a_lock_adjusts_the_orthogonal_dimension() {
     assert_eq!(act(&mut c, "aspect", &["3:2"]), Outcome::Ignored);
     // Drag the east edge inward: the width shrinks and the height follows to
     // hold 3:2, centred on the crop's old horizontal midline.
-    assert_eq!(press(&mut c, 450, 200), Outcome::Ignored);
-    assert_eq!(drag_to(&mut c, 390, 200), Outcome::Changed);
-    let (_, effects) = release(&mut c, 390, 200);
+    assert_eq!(press(&mut c, 670, 248), Outcome::Ignored);
+    assert_eq!(drag_to(&mut c, 610, 248), Outcome::Changed);
+    let (_, effects) = release(&mut c, 610, 248);
     assert_eq!(
         effects,
         [Effect::Edit {
@@ -3407,8 +3446,8 @@ fn an_edge_drag_under_a_lock_adjusts_the_orthogonal_dimension() {
 fn a_one_to_one_lock_keeps_a_square_in_pixels() {
     let mut c = develop_at(
         Rect {
-            x: 0,
-            y: 0,
+            x: 220,
+            y: 48,
             width: 400,
             height: 400,
         },
@@ -3418,18 +3457,18 @@ fn a_one_to_one_lock_keeps_a_square_in_pixels() {
     // Arming the lock paints nothing (the full image is already 1:1 here).
     assert_eq!(act(&mut c, "aspect", &["1:1"]), Outcome::Ignored);
     // Drag the north-west corner in: the box stays square in pixels.
-    assert_eq!(press(&mut c, 0, 0), Outcome::Ignored);
-    assert_eq!(drag_to(&mut c, 100, 100), Outcome::Changed);
+    assert_eq!(press(&mut c, 220, 48), Outcome::Ignored);
+    assert_eq!(drag_to(&mut c, 320, 148), Outcome::Changed);
     assert_eq!(
         c.crop_adjust_rect(),
         Some(Rect {
-            x: 100,
-            y: 100,
+            x: 320,
+            y: 148,
             width: 300,
             height: 300,
         })
     );
-    let (_, effects) = release(&mut c, 100, 100);
+    let (_, effects) = release(&mut c, 320, 148);
     assert_eq!(
         effects,
         [Effect::Edit {
@@ -3445,8 +3484,8 @@ fn a_one_to_one_lock_keeps_a_square_in_pixels() {
 fn switching_the_lock_back_to_free_releases_the_constraint() {
     let mut c = develop_at(
         Rect {
-            x: 0,
-            y: 0,
+            x: 220,
+            y: 48,
             width: 600,
             height: 400,
         },
@@ -3457,9 +3496,9 @@ fn switching_the_lock_back_to_free_releases_the_constraint() {
     // Back to free: an east-edge drag now changes the width alone, leaving the
     // height at 0.5000 (the pre-lock free behaviour).
     assert_eq!(act(&mut c, "aspect", &["free"]), Outcome::Ignored);
-    assert_eq!(press(&mut c, 450, 200), Outcome::Ignored);
-    assert_eq!(drag_to(&mut c, 390, 200), Outcome::Changed);
-    let (_, effects) = release(&mut c, 390, 200);
+    assert_eq!(press(&mut c, 670, 248), Outcome::Ignored);
+    assert_eq!(drag_to(&mut c, 610, 248), Outcome::Changed);
+    let (_, effects) = release(&mut c, 610, 248);
     assert_eq!(
         effects,
         [Effect::Edit {
@@ -3475,8 +3514,8 @@ fn switching_the_lock_back_to_free_releases_the_constraint() {
 fn a_locked_edge_drag_clamps_to_the_minimum_holding_the_ratio() {
     let mut c = develop_at(
         Rect {
-            x: 0,
-            y: 0,
+            x: 220,
+            y: 48,
             width: 600,
             height: 400,
         },
@@ -3486,9 +3525,9 @@ fn a_locked_edge_drag_clamps_to_the_minimum_holding_the_ratio() {
     assert_eq!(act(&mut c, "aspect", &["3:2"]), Outcome::Ignored);
     // Drag the east edge far in: both edges pin to the minimum (0.0500) while
     // holding 3:2, never past it.
-    assert_eq!(press(&mut c, 450, 200), Outcome::Ignored);
-    assert_eq!(drag_to(&mut c, 100, 200), Outcome::Changed);
-    let (_, effects) = release(&mut c, 100, 200);
+    assert_eq!(press(&mut c, 670, 248), Outcome::Ignored);
+    assert_eq!(drag_to(&mut c, 320, 248), Outcome::Changed);
+    let (_, effects) = release(&mut c, 320, 248);
     assert_eq!(
         effects,
         [Effect::Edit {
@@ -3504,8 +3543,8 @@ fn a_locked_edge_drag_clamps_to_the_minimum_holding_the_ratio() {
 fn a_locked_tighten_marquee_snaps_the_selection() {
     let mut c = develop_at(
         Rect {
-            x: 0,
-            y: 0,
+            x: 220,
+            y: 48,
             width: 600,
             height: 400,
         },
@@ -3514,18 +3553,18 @@ fn a_locked_tighten_marquee_snaps_the_selection() {
     // Not in crop-adjust: the lock arms the tighten marquee too, and survives
     // the sub-mode boundary.
     assert_eq!(act(&mut c, "aspect", &["3:2"]), Outcome::Ignored);
-    assert_eq!(press(&mut c, 0, 0), Outcome::Ignored);
-    assert_eq!(drag_to(&mut c, 600, 300), Outcome::Changed);
+    assert_eq!(press(&mut c, 220, 48), Outcome::Ignored);
+    assert_eq!(drag_to(&mut c, 820, 348), Outcome::Changed);
     assert_eq!(
         c.crop_drag(),
         Some(Rect {
-            x: 0,
-            y: 0,
+            x: 220,
+            y: 48,
             width: 450,
             height: 300,
         })
     );
-    let (_, effects) = release(&mut c, 600, 300);
+    let (_, effects) = release(&mut c, 820, 348);
     assert_eq!(
         effects,
         [Effect::Edit {
@@ -3556,12 +3595,12 @@ fn the_lock_is_dropped_on_a_photo_switch() {
     assert!(!c.adjusting());
     // A fresh tighten marquee is unconstrained: a square drag stays square, so
     // the 3:2 lock did not survive the switch.
-    assert_eq!(press(&mut c, 100, 100), Outcome::Ignored);
-    assert_eq!(drag_to(&mut c, 400, 400), Outcome::Changed);
+    assert_eq!(press(&mut c, 300, 100), Outcome::Ignored);
+    assert_eq!(drag_to(&mut c, 600, 400), Outcome::Changed);
     assert_eq!(
         c.crop_drag(),
         Some(Rect {
-            x: 100,
+            x: 300,
             y: 100,
             width: 300,
             height: 300,
@@ -4754,7 +4793,7 @@ fn the_mode_strip_bumps_once_a_change_and_never_a_request() {
     assert_ne!(generation(&c), listed);
     // Culling out of crop-adjust drops the sub-mode with the mode.
     c.set_preview_fit(Some(Rect {
-        x: 100,
+        x: 300,
         y: 100,
         width: 400,
         height: 300,
@@ -4767,13 +4806,13 @@ fn the_mode_strip_bumps_once_a_change_and_never_a_request() {
     // effect made.
     assert_eq!(press(&mut c, 230, 12), Outcome::Changed);
     c.set_preview_fit(Some(Rect {
-        x: 100,
+        x: 300,
         y: 100,
         width: 400,
         height: 300,
     }));
-    assert_eq!(press(&mut c, 200, 200), Outcome::Ignored);
-    assert_eq!(drag_to(&mut c, 300, 300), Outcome::Changed);
+    assert_eq!(press(&mut c, 400, 200), Outcome::Ignored);
+    assert_eq!(drag_to(&mut c, 500, 300), Outcome::Changed);
     assert!(c.crop_drag().is_some());
     let (outcome, effects) = mode_press(&mut c, 150);
     assert_eq!((outcome, effects.len()), (Outcome::Changed, 0));
@@ -4850,4 +4889,333 @@ fn the_chooser_names_its_chords_as_the_keymap_spells_them() {
     assert_eq!(outcome, Outcome::Changed);
     assert_eq!(effects, [Effect::Open(b"/photos/2026-b".to_vec())]);
     assert!(c.chooser().is_none());
+}
+
+/// Develops the first photo and gives it three history steps: two
+/// exposure nudges, each its own step, and a look.
+fn with_history() -> Controller {
+    let mut c = Controller::new(surface(800, 600));
+    c.open("roll", b"/r", photos(5)).unwrap();
+    assert_eq!(act(&mut c, "develop", &[]), Outcome::Changed);
+    assert_eq!(&fields(&c)[STEPS..=STEP], ["0", "-"]);
+    assert_eq!(carry(&mut c, "expose-in", &[]), Outcome::Changed);
+    assert_eq!(&fields(&c)[STEPS..=STEP], ["1", "0"]);
+    assert_eq!(carry(&mut c, "expose-in", &[]), Outcome::Changed);
+    assert_eq!(&fields(&c)[STEPS..=STEP], ["2", "1"]);
+    assert_eq!(carry(&mut c, "look", &["portra"]), Outcome::Changed);
+    assert_eq!(&fields(&c)[STEPS..=STEP], ["3", "2"]);
+    assert_eq!(c.steps().len(), 3);
+    assert_eq!(fields(&c)[EXPOSURE], "0.66");
+    c
+}
+
+#[test]
+fn the_history_records_the_develop_steps_and_undoes_toggles_and_deletes_them() {
+    let mut c = with_history();
+
+    // The selection is the newest step; Up and Down walk it, clamped, and
+    // are the history's in develop rather than grid-row moves.
+    assert_eq!(key(&mut c, "Up"), Outcome::Changed);
+    assert_eq!(fields(&c)[STEP], "1");
+    assert_eq!(key(&mut c, "Up"), Outcome::Changed);
+    assert_eq!(fields(&c)[STEP], "0");
+    assert_eq!(key(&mut c, "Up"), Outcome::Ignored);
+    assert_eq!(key(&mut c, "Down"), Outcome::Changed);
+    assert_eq!(key(&mut c, "Down"), Outcome::Changed);
+    assert_eq!(fields(&c)[STEP], "2");
+    assert_eq!(key(&mut c, "Down"), Outcome::Ignored);
+    assert_eq!(fields(&c)[POSITION], "0");
+
+    // Toggling the selected step off takes its key out of the settings in
+    // force and leaves the step, and the selection, in place; toggling
+    // again brings it back.
+    let (outcome, effects) = c.action("step-toggle", &[]).unwrap();
+    assert_eq!(outcome, Outcome::Changed);
+    assert_eq!(
+        effects,
+        [Effect::StepToggle {
+            index: 0,
+            name: file(0),
+            step: 2,
+        }]
+    );
+    assert_eq!(apply(&mut c, &effects).unwrap(), Outcome::Changed);
+    assert_eq!(fields(&c)[LOOK], "-");
+    assert_eq!(&fields(&c)[STEPS..=STEP], ["3", "2"]);
+    assert!(!c.steps()[2].on);
+    assert_eq!(carry(&mut c, "step-toggle", &[]), Outcome::Changed);
+    assert_eq!(fields(&c)[LOOK], "portra");
+    assert!(c.steps()[2].on);
+
+    // A step off in the middle: its key falls back to the earlier step's
+    // value; set again, the new value is a new step, the off one kept.
+    assert_eq!(key(&mut c, "Up"), Outcome::Changed);
+    assert_eq!(carry_key(&mut c, "t"), Outcome::Changed);
+    assert_eq!(fields(&c)[EXPOSURE], "0.33");
+    assert_eq!(carry(&mut c, "expose-out", &[]), Outcome::Changed);
+    assert_eq!(&fields(&c)[STEPS..=STEP], ["4", "3"]);
+    assert_eq!(fields(&c)[EXPOSURE], "0.00");
+    assert_eq!(
+        c.steps()
+            .iter()
+            .map(|step| (step.on, step.key, step.value.clone()))
+            .collect::<Vec<_>>(),
+        [
+            (true, Key::Exposure, Some("0.33".to_string())),
+            (false, Key::Exposure, Some("0.66".to_string())),
+            (true, Key::Look, Some("portra".to_string())),
+            (true, Key::Exposure, Some("0.00".to_string())),
+        ]
+    );
+
+    // Deleting the selected step closes the later ones up; the selection
+    // stays at its index, clamped to the end.
+    let (_, effects) = c.action("step-delete", &[]).unwrap();
+    assert_eq!(
+        effects,
+        [Effect::StepDelete {
+            index: 0,
+            name: file(0),
+            step: 3,
+        }]
+    );
+    assert_eq!(apply(&mut c, &effects).unwrap(), Outcome::Changed);
+    assert_eq!(&fields(&c)[STEPS..=STEP], ["3", "2"]);
+    assert_eq!(fields(&c)[EXPOSURE], "0.33");
+    assert_eq!(key(&mut c, "Up"), Outcome::Changed);
+    assert_eq!(carry_key(&mut c, "Backspace"), Outcome::Changed);
+    assert_eq!(&fields(&c)[STEPS..=STEP], ["2", "1"]);
+    assert_eq!(fields(&c)[EXPOSURE], "0.33");
+    assert_eq!(fields(&c)[LOOK], "portra");
+
+    // Undo takes the last step back; with none left it asks all the same
+    // and the adapter, finding nothing to take, settles it ignored.
+    let (_, effects) = c.action("undo", &[]).unwrap();
+    assert_eq!(
+        effects,
+        [Effect::Undo {
+            index: 0,
+            name: file(0),
+        }]
+    );
+    assert_eq!(apply(&mut c, &effects).unwrap(), Outcome::Changed);
+    assert_eq!(&fields(&c)[STEPS..=STEP], ["1", "0"]);
+    assert_eq!(fields(&c)[LOOK], "-");
+    assert_eq!(carry_key(&mut c, "z"), Outcome::Changed);
+    assert_eq!(&fields(&c)[STEPS..=STEP], ["0", "-"]);
+    assert_eq!(fields(&c)[EXPOSURE], "-");
+    assert_eq!(carry_key(&mut c, "z"), Outcome::Ignored);
+    // Without a step, Up and Down have nothing to move, and the step
+    // actions nothing to act on: each is ignored and asks for nothing.
+    assert_eq!(key(&mut c, "Up"), Outcome::Ignored);
+    assert_eq!(key(&mut c, "Down"), Outcome::Ignored);
+    assert_eq!(act(&mut c, "step-toggle", &[]), Outcome::Ignored);
+    assert_eq!(act(&mut c, "step-delete", &[]), Outcome::Ignored);
+
+    // Reset clears the history with the keys.
+    assert_eq!(carry(&mut c, "expose-in", &[]), Outcome::Changed);
+    assert_eq!(carry(&mut c, "look", &["portra"]), Outcome::Changed);
+    assert_eq!(&fields(&c)[STEPS..=STEP], ["2", "1"]);
+    assert_eq!(carry(&mut c, "reset", &[]), Outcome::Changed);
+    assert_eq!(&fields(&c)[STEPS..=STEP], ["0", "-"]);
+
+    // The history is the cursor photo's: Right moves to a photo without
+    // one, Left back to this one, its newest step selected again; and
+    // leaving develop leaves the history behind, where undo and the step
+    // actions are not the mode's.
+    assert_eq!(carry(&mut c, "expose-in", &[]), Outcome::Changed);
+    assert_eq!(key(&mut c, "Right"), Outcome::Changed);
+    assert_eq!(&fields(&c)[STEPS..=STEP], ["0", "-"]);
+    assert_eq!(key(&mut c, "Left"), Outcome::Changed);
+    assert_eq!(&fields(&c)[STEPS..=STEP], ["1", "0"]);
+    assert_eq!(key(&mut c, "Escape"), Outcome::Changed);
+    assert_eq!(c.mode(), ui::Mode::Cull);
+    assert_eq!(&fields(&c)[STEPS..=STEP], ["0", "-"]);
+    for name in ["undo", "step-toggle", "step-delete"] {
+        assert_eq!(act(&mut c, name, &[]), Outcome::Ignored, "{name}");
+    }
+    // Down in cull is the grid-row move it was.
+    assert_eq!(key(&mut c, "Down"), Outcome::Changed);
+    assert_eq!(fields(&c)[POSITION], "4");
+}
+
+#[test]
+fn the_history_pane_takes_the_pointer_and_is_in_the_scene_frame() {
+    let mut c = with_history();
+    let layout = c.layout();
+    let list = layout.history().expect("a history pane on 800x600");
+    assert_eq!(list.rect().x, 0);
+    assert_eq!(list.rect().y, layout.area.y);
+    assert_eq!(list.rect().width as usize, ui::PANE_W);
+    let buttons = layout.history_buttons();
+    let button = |i: usize| buttons[i].expect("a pane button").rect();
+    // The buttons sit on the band under the list, from a cell in, inside
+    // the pane's width; the develop region begins where the pane ends.
+    assert_eq!(button(0).x, 8);
+    assert_eq!(button(0).width, 64);
+    assert_eq!(button(2).x + i64::from(button(2).width), 200);
+    assert_eq!(
+        button(0).y,
+        list.rect().y + i64::from(list.rect().height) + 2
+    );
+    assert_eq!(layout.develop_region().x, ui::PANE_W as i64);
+
+    // A press on a step selects it; on the selected one, nothing; the
+    // rows below the steps are chrome, as are a move and a release.
+    let row = |i: usize| {
+        let r = list.row(i).unwrap();
+        (
+            (r.x + i64::from(r.width) / 2) as u32,
+            (r.y + i64::from(r.height) / 2) as u32,
+        )
+    };
+    let (x, y) = row(0);
+    assert_eq!(press(&mut c, x, y), Outcome::Changed);
+    assert_eq!(fields(&c)[STEP], "0");
+    assert_eq!(press(&mut c, x, y), Outcome::Ignored);
+    let (x2, y2) = row(5);
+    assert_eq!(press(&mut c, x2, y2), Outcome::Ignored);
+    assert_eq!(drag_to(&mut c, x, y), Outcome::Ignored);
+    assert_eq!(release(&mut c, x, y).0, Outcome::Ignored);
+    assert_eq!(c.crop_drag(), None);
+
+    // The buttons ask for the selected step toggled or deleted, or the
+    // last step back, the same effects the keys make.
+    let centre = |r: Rect| {
+        (
+            (r.x + i64::from(r.width) / 2) as u32,
+            (r.y + i64::from(r.height) / 2) as u32,
+        )
+    };
+    let (bx, by) = centre(button(0));
+    let (outcome, effects) = c
+        .input(Input::Pointer {
+            phase: PointerPhase::Press,
+            x: bx,
+            y: by,
+        })
+        .unwrap();
+    assert_eq!(outcome, Outcome::Changed);
+    assert_eq!(
+        effects,
+        [Effect::StepToggle {
+            index: 0,
+            name: file(0),
+            step: 0,
+        }]
+    );
+    let (bx, by) = centre(button(1));
+    let (_, effects) = c
+        .input(Input::Pointer {
+            phase: PointerPhase::Press,
+            x: bx,
+            y: by,
+        })
+        .unwrap();
+    assert!(matches!(&effects[..], [Effect::StepDelete { step: 0, .. }]));
+    let (bx, by) = centre(button(2));
+    let (_, effects) = c
+        .input(Input::Pointer {
+            phase: PointerPhase::Press,
+            x: bx,
+            y: by,
+        })
+        .unwrap();
+    assert!(matches!(&effects[..], [Effect::Undo { index: 0, .. }]));
+    // The gap between two buttons is chrome.
+    let gap = (button(0).x + i64::from(button(0).width) + 4) as u32;
+    assert_eq!(press(&mut c, gap, by), Outcome::Ignored);
+
+    // The pane is in the scene: its steps read back as text, a step off
+    // paints differently (dimmed) from one on, and a selection move is a
+    // frame change.
+    // The pane's columns, not the facts row, list the steps.
+    let (_, _, text) = driven::text(&c.scene()).unwrap();
+    let pane_has = |text: &str, what: &str| {
+        text.lines().any(|line| {
+            line.chars()
+                .take(ui::PANE_W / 8)
+                .collect::<String>()
+                .contains(what)
+        })
+    };
+    assert!(
+        pane_has(&text, "exposure 0.33") && pane_has(&text, "exposure 0.66"),
+        "{text}"
+    );
+    assert!(pane_has(&text, "look portra"), "{text}");
+    assert!(
+        pane_has(&text, "Toggle") && pane_has(&text, "Delete") && pane_has(&text, "Undo"),
+        "{text}"
+    );
+    // A crop step shows in whole percents, so it fits the pane's row.
+    assert_eq!(
+        carry(&mut c, "crop", &["0.1250", "0.0500", "0.7500", "0.9000"]),
+        Outcome::Changed
+    );
+    let (_, _, text) = driven::text(&c.scene()).unwrap();
+    assert!(pane_has(&text, "crop 13,5 75x90"), "{text}");
+    assert_eq!(carry_key(&mut c, "z"), Outcome::Changed);
+    assert_eq!(key(&mut c, "Up"), Outcome::Changed);
+    assert_eq!(key(&mut c, "Up"), Outcome::Changed);
+    // A step off is painted in the disabled ink within the pane, which no
+    // step on is; the facts row changing too is not what this pins.
+    let dimmed = |c: &Controller| {
+        let mut count = 0;
+        let list = c.layout().history().unwrap().rect();
+        c.scene().emit(c.surface().bounds(), &mut |draw| {
+            if let Primitive::Glyph { x, y, style, .. } = draw.primitive {
+                if style.ink == DISABLED && list.contains(x, y) {
+                    count += 1;
+                }
+            }
+        });
+        count
+    };
+    assert_eq!(dimmed(&c), 0);
+    assert_eq!(carry(&mut c, "step-toggle", &[]), Outcome::Changed);
+    // The row's two-cell mark prefix is dimmed with its label.
+    assert_eq!(dimmed(&c), "  exposure 0.33".len());
+    let off = driven::fnv1a64(&driven::paint(&c.scene()).unwrap().rgb);
+    assert_eq!(key(&mut c, "Down"), Outcome::Changed);
+    assert_ne!(
+        driven::fnv1a64(&driven::paint(&c.scene()).unwrap().rgb),
+        off
+    );
+    // A drag begun over the preview ends on its release over the pane.
+    c.set_preview_fit(Some(Rect {
+        x: 300,
+        y: 100,
+        width: 400,
+        height: 300,
+    }));
+    assert_eq!(press(&mut c, 400, 150), Outcome::Ignored);
+    assert_eq!(drag_to(&mut c, 500, 250), Outcome::Changed);
+    assert!(c.crop_drag().is_some());
+    let (outcome, effects) = release(&mut c, x, y);
+    assert_eq!(outcome, Outcome::Changed);
+    assert!(matches!(
+        &effects[..],
+        [Effect::Edit { key: Key::Crop, .. }]
+    ));
+    assert_eq!(c.crop_drag(), None);
+    // The band's gaps and margins are the pane's, not the preview's: a
+    // press there starts no drag.
+    let gap_y = (button(0).y + i64::from(button(0).height) + 1) as u32;
+    assert_eq!(press(&mut c, gap, gap_y), Outcome::Ignored);
+    assert_eq!(c.crop_drag(), None);
+
+    // Outside develop there is no pane and the area's left is the grid's.
+    assert_eq!(key(&mut c, "Escape"), Outcome::Changed);
+    let (_, _, text) = driven::text(&c.scene()).unwrap();
+    assert!(!text.contains("Toggle"), "{text}");
+
+    // A surface too short for a row has no pane and no buttons, and the
+    // pointer over where one would be starts nothing.
+    let mut small = Controller::new(surface(800, 80));
+    small.open("roll", b"/r", photos(1)).unwrap();
+    assert_eq!(act(&mut small, "develop", &[]), Outcome::Changed);
+    assert!(small.layout().history().is_none());
+    assert!(small.layout().history_buttons().iter().all(Option::is_none));
+    assert_eq!(press(&mut small, 40, 50), Outcome::Ignored);
 }

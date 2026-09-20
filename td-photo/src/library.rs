@@ -25,6 +25,10 @@ pub const MIN_CROP_EDGE: u32 = 500;
 pub const MAX_LOOK_STEM: usize = 64;
 /// A sidecar key is at most this many bytes.
 pub const MAX_KEY: usize = 32;
+/// The develop history's line keys: `step-1`, `step-2`, ...
+pub const STEP_PREFIX: &str = "step-";
+/// A history holds at most this many steps.
+pub const MAX_STEPS: usize = 128;
 /// The folder an import files a photo under when it has no date.
 pub const UNDATED: &str = "undated";
 /// The folder under a roll that rejects are moved into.
@@ -49,6 +53,11 @@ pub enum Error {
     Value(Key),
     /// A known key appears twice.
     Repeated(Key),
+    /// The numbered line is a `step-N` out of sequence, past `MAX_STEPS`,
+    /// or not `on|off KEY VALUE` over a develop key.
+    Step(usize),
+    /// The history holds `MAX_STEPS`; a step must go before one comes.
+    HistoryFull,
 }
 
 impl fmt::Display for Error {
@@ -61,6 +70,8 @@ impl fmt::Display for Error {
             Self::Line(number) => write!(f, "line {number} is not `key value`"),
             Self::Value(key) => write!(f, "malformed {} value", key.name()),
             Self::Repeated(key) => write!(f, "{} given twice", key.name()),
+            Self::Step(number) => write!(f, "line {number} is not the next step"),
+            Self::HistoryFull => write!(f, "history holds {MAX_STEPS} steps"),
         }
     }
 }
@@ -91,6 +102,63 @@ impl Key {
     pub fn parse(name: &str) -> Option<Key> {
         Self::ALL.into_iter().find(|key| key.name() == name)
     }
+
+    /// Whether the key is a develop setting, one the history records; the
+    /// flag is a cull decision and is not.
+    pub fn develops(self) -> bool {
+        !matches!(self, Self::Flag)
+    }
+}
+
+/// One step of a photo's develop history: a develop key set to a value or
+/// cleared (`None`), and whether it is on. The settings in force are the
+/// steps that are on, folded in order, the last word on each key winning.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Step {
+    pub on: bool,
+    pub key: Key,
+    pub value: Option<String>,
+}
+
+impl Step {
+    /// The step as its line's value: `on|off KEY VALUE`, `-` a clear.
+    pub fn text(&self) -> String {
+        format!(
+            "{} {} {}",
+            if self.on { "on" } else { "off" },
+            self.key.name(),
+            self.value.as_deref().unwrap_or("-")
+        )
+    }
+
+    /// The step a line's value spells, or `None` when it is not one.
+    fn parse(text: &str) -> Option<Step> {
+        let (state, rest) = text.split_once(' ')?;
+        let on = match state {
+            "on" => true,
+            "off" => false,
+            _ => return None,
+        };
+        let (name, value) = rest.split_once(' ')?;
+        let key = Key::parse(name).filter(|key| key.develops())?;
+        let value = if value == "-" {
+            None
+        } else {
+            check(key, value).ok()?;
+            Some(value.to_string())
+        };
+        Some(Step { on, key, value })
+    }
+}
+
+/// The step number a `step-N` key names: `N` in decimal without a leading
+/// zero, from 1.
+fn step_number(key: &str) -> Option<usize> {
+    let digits = key.strip_prefix(STEP_PREFIX)?;
+    if digits.is_empty() || digits.starts_with('0') || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse().ok()
 }
 
 /// A cull decision; absent is unflagged.
@@ -200,7 +268,10 @@ pub fn exposure_text(hundredths: i32) -> String {
 /// A look's file stem: 1 to `MAX_LOOK_STEM` bytes of ASCII letters, digits,
 /// `-`, `_` and `.`, not starting with `.`.
 pub fn valid_look(stem: &str) -> bool {
+    // A bare `-` is the clear sentinel everywhere a look is set (the verb,
+    // the action, a history step), so it cannot name a look.
     !stem.is_empty()
+        && stem != "-"
         && stem.len() <= MAX_LOOK_STEM
         && !stem.starts_with('.')
         && stem
@@ -253,12 +324,18 @@ fn check(key: Key, value: &str) -> Result<(), Error> {
 }
 
 /// One photo's edits: the header, then `key value` lines in the order the
-/// file had them. Known keys are validated; any other line is kept
-/// verbatim and rewritten in place, so a later version's values survive
-/// this one's edit.
+/// file had them, then the develop history's `step-N` lines. Known keys
+/// are validated; any other line is kept verbatim and rewritten in place,
+/// so a later version's values survive this one's edit. The develop keys
+/// (exposure, crop, look) are the history's summary: what its steps that
+/// are on fold to, rewritten from it whenever it changes, so a reader
+/// that knows only the keys sees the settings in force. A file with a
+/// history is read by it; one without and with develop keys (an earlier
+/// write) seeds a step per key, so every edit from then on is a step.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct Sidecar {
     lines: Vec<(String, String)>,
+    steps: Vec<Step>,
 }
 
 impl Sidecar {
@@ -293,10 +370,129 @@ impl Sidecar {
                     return Err(Error::Repeated(known));
                 }
                 check(known, value)?;
+            } else if key.starts_with(STEP_PREFIX) {
+                let next = sidecar.steps.len() + 1;
+                if step_number(key) != Some(next) || next > MAX_STEPS {
+                    return Err(Error::Step(number));
+                }
+                let step = Step::parse(value).ok_or(Error::Step(number))?;
+                sidecar.steps.push(step);
+                continue;
             }
             sidecar.lines.push((key.to_string(), value.to_string()));
         }
+        if sidecar.steps.is_empty() {
+            sidecar.seed();
+        } else {
+            sidecar.derive();
+        }
         Ok(sidecar)
+    }
+
+    /// The history of a file written before there was one: a step per
+    /// develop key the file holds, in the file's order.
+    fn seed(&mut self) {
+        for (name, value) in &self.lines {
+            if let Some(key) = Key::parse(name).filter(|key| key.develops()) {
+                self.steps.push(Step {
+                    on: true,
+                    key,
+                    value: Some(value.clone()),
+                });
+            }
+        }
+    }
+
+    /// Rewrites the develop keys from the history: each the last value a
+    /// step that is on gives it, set in place or appended, or dropped when
+    /// no step sets it.
+    fn derive(&mut self) {
+        for key in Key::ALL.into_iter().filter(|key| key.develops()) {
+            let value = self
+                .steps
+                .iter()
+                .rev()
+                .find(|step| step.on && step.key == key)
+                .and_then(|step| step.value.clone());
+            self.set_line(key, value.as_deref());
+        }
+    }
+
+    fn set_line(&mut self, key: Key, value: Option<&str>) {
+        let Some(value) = value else {
+            self.lines.retain(|(name, _)| name != key.name());
+            return;
+        };
+        match self.lines.iter_mut().find(|(name, _)| name == key.name()) {
+            Some(line) => line.1 = value.to_string(),
+            None => self.lines.push((key.name().to_string(), value.to_string())),
+        }
+    }
+
+    /// The develop history, oldest first.
+    pub fn steps(&self) -> &[Step] {
+        &self.steps
+    }
+
+    /// Takes the last step back, `false` when there is none.
+    pub fn undo(&mut self) -> bool {
+        let taken = self.steps.pop().is_some();
+        if taken {
+            self.derive();
+        }
+        taken
+    }
+
+    /// Turns step `index` off or back on; `false` when there is no such
+    /// step.
+    pub fn toggle_step(&mut self, index: usize) -> bool {
+        let Some(step) = self.steps.get_mut(index) else {
+            return false;
+        };
+        step.on = !step.on;
+        self.derive();
+        true
+    }
+
+    /// Deletes step `index`, the later ones closing up; `false` when there
+    /// is no such step.
+    pub fn delete_step(&mut self, index: usize) -> bool {
+        if index >= self.steps.len() {
+            return false;
+        }
+        self.steps.remove(index);
+        self.derive();
+        true
+    }
+
+    /// What the lines take as text after the header, counted without
+    /// making it: what a roll's sidecar budget holds.
+    pub fn bytes(&self) -> usize {
+        let lines: usize = self
+            .lines
+            .iter()
+            .map(|(key, value)| key.len() + value.len() + 2)
+            .sum();
+        let steps: usize = self
+            .steps
+            .iter()
+            .enumerate()
+            .map(|(index, step)| {
+                // `step-N on|off KEY VALUE\n`, the value `-` when cleared.
+                let state = if step.on { "on".len() } else { "off".len() };
+                let value = step.value.as_ref().map_or(1, String::len);
+                STEP_PREFIX.len()
+                    + decimal_width(index + 1)
+                    + 1
+                    + state
+                    + 1
+                    + step.key.name().len()
+                    + 1
+                    + value
+                    + 1
+            })
+            .sum();
+        lines + steps
     }
 
     fn get(&self, key: Key) -> Option<&str> {
@@ -330,37 +526,53 @@ impl Sidecar {
         self.get(key)
     }
 
-    /// Every line, in order, known and unknown alike.
+    /// Every line but the history's, in order, known and unknown alike.
     pub fn entries(&self) -> impl Iterator<Item = (&str, &str)> {
         self.lines
             .iter()
             .map(|(key, value)| (key.as_str(), value.as_str()))
     }
 
-    /// Sets a known key in place, appending it if absent, or clears it
-    /// with `None`. The value is held to the key's grammar, the same one
-    /// `parse` holds a file to.
+    /// Sets a known key, or clears it with `None`. The flag is set in
+    /// place, appended if absent. A develop key is a step of the history:
+    /// one is added and the keys are rewritten from it; a value the key
+    /// already holds is no step, and a full history refuses one. The
+    /// value is held to the key's grammar, the same one `parse` holds a
+    /// file to.
     pub fn set(&mut self, key: Key, value: Option<&str>) -> Result<(), Error> {
-        let Some(value) = value else {
-            self.lines.retain(|(name, _)| name != key.name());
-            return Ok(());
-        };
-        check(key, value)?;
-        match self.lines.iter_mut().find(|(name, _)| name == key.name()) {
-            Some(line) => line.1 = value.to_string(),
-            None => self.lines.push((key.name().to_string(), value.to_string())),
+        if let Some(value) = value {
+            check(key, value)?;
         }
+        if !key.develops() {
+            self.set_line(key, value);
+            return Ok(());
+        }
+        if self.get(key) == value {
+            return Ok(());
+        }
+        if self.steps.len() >= MAX_STEPS {
+            return Err(Error::HistoryFull);
+        }
+        self.steps.push(Step {
+            on: true,
+            key,
+            value: value.map(str::to_string),
+        });
+        self.derive();
         Ok(())
     }
 
-    /// Back to the camera's defaults: exposure, crop and look cleared; the
-    /// flag, a cull decision, and any unknown line kept.
+    /// Back to the camera's defaults: the history cleared, and with it
+    /// exposure, crop and look; the flag, a cull decision, and any unknown
+    /// line kept.
     pub fn reset(&mut self) {
+        self.steps.clear();
         self.lines
             .retain(|(name, _)| Key::parse(name).is_none_or(|key| key == Key::Flag));
     }
 
-    /// The file's text: the header, then the lines, each ended by a newline.
+    /// The file's text: the header, then the lines, then the history's
+    /// `step-N` lines, each ended by a newline.
     pub fn text(&self) -> String {
         let mut out = String::from(SIDECAR_HEADER);
         out.push('\n');
@@ -370,8 +582,25 @@ impl Sidecar {
             out.push_str(value);
             out.push('\n');
         }
+        for (index, step) in self.steps.iter().enumerate() {
+            out.push_str(STEP_PREFIX);
+            out.push_str(&(index + 1).to_string());
+            out.push(' ');
+            out.push_str(&step.text());
+            out.push('\n');
+        }
         out
     }
+}
+
+/// The digits a number takes in decimal.
+fn decimal_width(mut n: usize) -> usize {
+    let mut width = 1;
+    while n >= 10 {
+        n /= 10;
+        width += 1;
+    }
+    width
 }
 
 /// Whether a name is an original a roll lists: the `nef` or `NEF`

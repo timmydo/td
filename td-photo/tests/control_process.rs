@@ -154,7 +154,7 @@ fn preview_develop_reflects_the_sidecar() {
     let base = preview_develop(&dir, 800, 600, &roll, 0);
     let layout = td_photo::ui::Layout::new(Surface::new(800, 600, Scale::default()).unwrap());
     let r#box = layout
-        .preview_box()
+        .develop_box()
         .expect("a develop box on an 800x600 surface");
     assert!(
         varies(&base, 800, r#box),
@@ -195,7 +195,7 @@ fn preview_develop_reflects_the_crop() {
     let base = preview_develop(&dir, 800, 600, &roll, 0);
     let layout = td_photo::ui::Layout::new(Surface::new(800, 600, Scale::default()).unwrap());
     let r#box = layout
-        .preview_box()
+        .develop_box()
         .expect("a develop box on an 800x600 surface");
     assert!(varies(&base, 800, r#box), "no developed image to crop");
 

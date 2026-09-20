@@ -140,18 +140,19 @@ window, all speaking the toolkit's one vocabulary.
   in `ui` (open a roll, choose one, the cursor moves, select, pick, reject,
   unflag, the four filters, the single view and back, scroll, quit, enter
   develop and its exposure, look, crop, crop-adjust, aspect, the look palette
-  (`looks`) and reset, export, and delete rejected).
+  (`looks`), reset, undo and the history's step toggle and delete, export,
+  and delete rejected).
   `ui::Controller` holds the model (the roll's names and sidecars, the cursor,
   the filter, the view, the scroll and the surface, and the shown list the
   filter admits, kept rather than rescanned); `action(name, fields)` and
   `input(Input)` apply one
   action to it and return the outcome and the `Effect`s the adapter carries out
   (`Open` this folder, `List` it for the chooser, `Flag` that photo, `Expose`
-  by a delta, `Edit` a crop or look, `Reset` to camera defaults, `Export` that
-  photo). The keyboard
-  bindings, the pointer hit-testing, the replay stream and the control socket
-  are four adapters over that one dispatcher, and nothing reaches the model
-  around it. The cursor is
+  by a delta, `Edit` a crop or look, `Reset` to camera defaults, `Undo` the
+  last step, `StepToggle` and `StepDelete` a step, `Export` that photo).
+  The keyboard bindings, the pointer hit-testing, the replay stream and the
+  control socket are four adapters over that one dispatcher, and nothing
+  reaches the model around it. The cursor is
   always among the shown or nowhere: a filter or a flag that hides it moves it
   to the first shown photo, and the single view ends when there is none, as
   develop mode does, both falling back to the cull grid. The
@@ -174,7 +175,8 @@ window, all speaking the toolkit's one vocabulary.
   the roll past it is refused before anything is written, and a sidecar that
   grew past it meanwhile is not held, its photo shown as refused.
 - **Two modes, and a strip that names them.** The controller is in `cull`
-  or `develop`; `develop` is a view of one photo, the cursor's, entered
+  or `develop`; `develop` is a view of one photo, the cursor's, its history
+  pane beside it, entered
   with the `develop` action (`d`) and left with `grid` (`Escape`), which
   returns to the cull grid. The mode strip (td-ui's `chrome::Buttons`,
   the window's first band: Roll Selection, Culling, Develop) shows which
@@ -199,9 +201,36 @@ window, all speaking the toolkit's one vocabulary.
   absolute values the adapter sets,
   their grammar judged in the dispatch so a stem that is not a look or a box
   under the minimum edge or outside the image is `bad-argument` before any
-  write; `reset` clears the develop keys and keeps the flag. Losing the cursor,
+  write; `reset` clears the develop keys, and the history with them, and
+  keeps the flag. Losing the cursor,
   when a flag hides the last shown photo, drops develop back to the cull grid as
   it ends the single view.
+- **The history pane.** Every develop edit is a step of the photo's sidecar
+  history (Files, Sidecar), and develop mode shows that history in a pane at
+  the area's left (td-ui's `chrome::List`, `PANE_W` (216) reference pixels
+  wide, above a band of three buttons: Toggle, Delete, Undo), the steps
+  oldest first as `KEY VALUE` (`-` a clear; a crop as `x,y wxh` in whole
+  percents, `ui::step_label`, so it fits the row), a step that is off
+  dimmed, one selected. The selection is the model's (`state` reports the
+  step count and the selected index): the newest step when a photo is
+  developed, when the cursor moves to another photo, and whenever a settle
+  brings a longer history (a step just added), else the one selected,
+  clamped as steps go; none without a step, and dropped on leaving develop. In
+  develop `Up` and `Down` walk the selection (the rows are the history's, not
+  the grid's; `Left` and `Right` still move the cursor), `Ignored` at an end
+  or with no step, and a press on a shown step selects it (a crop drag in
+  progress owns the pointer wherever it goes, so its release over the pane
+  ends it). `undo` (`z`) asks for the last step back, `step-toggle` (`t`) for
+  the selected step off or back on, `step-delete` (`Backspace`) for it
+  deleted; the pane's buttons ask the same. Each is a develop edit like the
+  others: `Ignored` in cull, and with no selection for the step actions; asked
+  of the adapter, which applies it to the sidecar as the file holds it
+  (`Undo`, `StepToggle`, `StepDelete` effects through the one `edit` path a
+  flag takes), settles the model from what it wrote and answers `ignored` when
+  the file had nothing to take or no such step, `changed` when it did. The
+  pane and its buttons are the frame's: a selection move, a step toggled and
+  the list itself are witnessed by the scene, so the replay `frame` and
+  `--preview` carry them.
 - **Export is the roll's, not develop's.** `export` (`e`) asks for the
   cursor photo's export in either mode; the dispatch is `changed` with the
   effect and moves nothing in the model. The adapter reads the sidecar as the
@@ -324,8 +353,9 @@ window, all speaking the toolkit's one vocabulary.
   filter, the view (`grid` or `single`), then the photo under the cursor (its
   name in hex, since the envelope is ASCII and a file name need not be, then
   flag, exposure, crop, look, sidecar state), the outstanding job count as the
-  window last reported it (the turn before), the frame generation and the
-  chooser's listed folder in hex, `-` for what is absent. The generation
+  window last reported it (the turn before), the frame generation, the
+  chooser's listed folder in hex, then the history's step count and the
+  selected step's index, `-` for what is absent. The generation
   moves on a change and
   on nothing else: not on a step at an end, a filter, view or size already set,
   a refused open, or a refused flag that leaves the file as the model held it; a
@@ -434,13 +464,44 @@ The library is folders of originals; there is no database.
   two decimals in -5.00..=5.00, `-0.00` not a spelling of zero; `crop` is `x y w
   h` as fractions of the oriented image with four decimals, all in 0..=1, `w`
   and `h` at least 0.05; `look` is a look's file stem, 1 to 64 bytes of ASCII
-  letters, digits, `-`, `_` and `.`, not starting with `.`. A key is 1 to 32
+  letters, digits, `-`, `_` and `.`, not starting with `.` and not the bare
+  `-`, the clear wherever a look is set. A key is 1 to 32
   bytes of lowercase ASCII letters, digits and `-`, starting with a letter, and
   a value is one or more characters with no control character and no space at
   either end: the grammar a later version's keys must keep. A line whose key is
   unknown is preserved verbatim and rewritten in place, so a later version's
   keys survive an earlier one's edit; a known key given twice, a blank line, or
-  a line that is not `key value` is a fault. A sidecar over 64 KiB or 1024
+  a line that is not `key value` is a fault. The develop history follows the
+  lines as `step-N on|off KEY VALUE` (`N` from 1 in order without a leading
+  zero, `KEY` a develop key, `VALUE` in its grammar or `-` for a clear):
+
+  ```text
+  step-1 on exposure -0.33
+  step-2 off look mono
+  step-3 on crop 0.1000 0.0500 0.8000 0.9000
+  ```
+
+  The develop keys are the history's summary: the steps that are on, folded
+  in order with the last word on each key winning, rewritten from it on
+  every change, so a reader that knows only the keys sees the settings in
+  force. A file with a history is read by it, its summary rewritten where it
+  disagrees; one without and with develop keys (a file from before there
+  was a history) seeds one step per key in the file's order, written at
+  its next rewrite (and counted toward the roll's sidecar budget as it
+  will be written), so every edit from then on is a step. The history is
+  always written after the lines: a file with lines after its steps is
+  read all the same and rewritten with them before. Setting a develop
+  key adds a step (each exposure nudge is its own, so undo is one nudge at
+  a time); a value the key already holds is no step; the flag is a cull
+  decision, never a step; and a history of `MAX_STEPS` (128) refuses a
+  further step until one goes. The `step-` key prefix is the history's:
+  a `step-` line that is not a step is a fault, not an unknown line kept.
+  `undo` takes the last step back, a step may be turned off (its
+  key falls back to the earlier step's value, or clears) or deleted (the
+  later ones closing up), and `reset` clears the history with the keys. A
+  `step-N` out of sequence or past the ceiling, or a step that is not the
+  shape above, is a fault (`Error::Step`), as is a known key given twice, a
+  blank line, or a line that is not `key value`. A sidecar over 64 KiB or 1024
   lines, a first line other than `td-photo edit 1`, or a malformed known value
   is refused as a whole and the photo is shown with camera defaults and an
   error, never with half its edits; `list` shows the error, and `flag` and
@@ -943,16 +1004,25 @@ many columns as the width holds and as many rows as the height between the bands
 holds, at least one of each, so a surface too small for a cell clips one rather
 than shows none, and the grid scrolls by rows, keeping the cursor's row shown.
 The single view shows the name, the facts and the largest 3:2 box under them;
-develop mode shows the same view of the cursor's photo, its status marked
-`develop`, with the developed preview blitted into that box once it is made.
-The box geometry (`Layout::preview_box`) is one function the scene, the window
-and `--preview` share, so the placeholder and the image land in one place. A
-press on a mode button changes the mode, on a filter button sets the filter,
-on a cell selects it, and in the single view anywhere in the area between the
-bands returns to the grid; the status row, a strip's margin and the gap between
-two buttons, and anything off the surface, are not targets, and the bands are
-hit-tested last painted first, so on a surface too short for them the status
-row covers the strips' buttons as it covers their pixels. A box whose
+develop mode shows the same view of the cursor's photo in the area right of
+the history pane (`Layout::develop_region`), its status marked `develop`, with
+the developed preview blitted into that box once it is made, and the pane at
+the area's left: the history list (`Layout::history`, a `chrome::List` over
+the pane's width, less one band) and, on the band under it, the Toggle,
+Delete and Undo buttons (`Layout::history_buttons`, `chrome::Button`s from a
+cell in, a cell between, inset as a strip's), Toggle and Delete enabled with a
+selection and Undo with a step; a surface too short for a row has neither.
+The box geometry (`Layout::box_in`, the single view's `preview_box` over the
+area and develop's `develop_box` over the region) is one function the scene,
+the window and `--preview` share, so the placeholder and the image land in
+one place. A press on a mode button changes the mode, on a filter button sets
+the filter, on a cell selects it, in develop on a history step selects it and
+on a pane button asks what it says (see Driving), and in the single view
+anywhere in the area between the bands returns to the grid; the status row, a
+strip's margin and the gap between two buttons, the pane's chrome, and
+anything off the surface, are not targets, and the bands are hit-tested last
+painted first, so on a surface too short for them the status row covers the
+strips' buttons as it covers their pixels. A box whose
 thumbnail is not held is a neutral placeholder, which is what `frame` digests
 either way; the develop box holds the developed preview once it is made, and
 the cull single view's box stays a placeholder.
@@ -1503,6 +1573,22 @@ preflight. A td-photo, td-ui or td-compositor edit selects this check in
 7. Packaging: the cargo recipe staging td-ui, the image entry, and the
    recipe check that develops the synthetic frame in the built artifact.
    Landed.
-8. Later: the 100% loupe from level 0, DNG and JPEG rolls, the Nikon High
+8. The develop history, in landings. (a) The sidecar history: `step-N`
+   lines with the develop keys their summary, seeded from a file without
+   one, `undo`, a step toggled or deleted,
+   `reset` clearing it, and `edit FILE undo`; the history pane at the
+   develop view's left with its Toggle, Delete and Undo buttons, `Up` and
+   `Down` walking its selection in develop, the `undo` (`z`),
+   `step-toggle` (`t`) and `step-delete` (`Backspace`) actions and their
+   effects, and the step count and selection in `state`. Landed. (b) The
+   develop controls: a tool strip above the preview with the crop, uncrop,
+   undo and reset buttons and the exposure in a td-ui slider
+   (`chrome::Slider`) beside its step buttons, a look strip with the looks
+   on `F1`..`F9`, and the status row naming the crop sub-mode. (c) A
+   filmstrip of the shown photos under the preview, `Left` and `Right` or
+   a press moving between them. (d) The crop tool drawing a fresh marquee
+   from a press outside the crop in crop-adjust, and a live preview under
+   it.
+9. Later: the 100% loupe from level 0, DNG and JPEG rolls, the Nikon High
    Efficiency codec, a better full-resolution demosaic, highlight
    reconstruction, the `.dtstyle` translator, and ratings.
