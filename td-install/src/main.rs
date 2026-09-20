@@ -1723,15 +1723,13 @@ fn format_volume(
     destination: &mut FormatDestination,
     out: &mut dyn Write,
 ) -> io::Result<()> {
-    let PreparedVolume {
-        settings,
-        uuid,
-        mkfs,
-        scratch,
-        seed,
-        key,
-    } = prepared;
-    let file = &mut destination.file;
+    // Size staging from this table; write_to rechecks the table at the write boundary.
+    let (_, len) = destination_volume(&mut destination.file)?;
+    let image = prepare_volume_image(prepared, destination, len)?;
+    image.write_to(destination, out)
+}
+
+fn destination_volume(file: &mut File) -> io::Result<(u64, u64)> {
     let disk_bytes = destination_bytes(file)?;
     let sector_size = logical_sector_size(file)?;
     if !disk_bytes.is_multiple_of(sector_size) {
@@ -1757,6 +1755,29 @@ fn format_volume(
         )));
     }
 
+    Ok((offset, len))
+}
+
+/// Admitted source bytes; ownership separates staging from destination writes.
+struct PreparedVolumeImage {
+    file: File,
+    len: u64,
+}
+
+fn prepare_volume_image(
+    prepared: PreparedVolume<'_>,
+    destination: &FormatDestination,
+    len: u64,
+) -> io::Result<PreparedVolumeImage> {
+    let PreparedVolume {
+        settings,
+        uuid,
+        mkfs,
+        scratch,
+        seed,
+        key,
+    } = prepared;
+    let file = &destination.file;
     // The image is the volume's own size, because `--byte-count` is what the
     // filesystem records as the device it lives on: a smaller one would make a
     // volume that reports less space than the partition it is copied into, and
@@ -1875,7 +1896,7 @@ fn format_volume(
         )));
     }
 
-    let (mut image, prepared) = realfile::open_real_file(&image_path, "prepared Btrfs image")?;
+    let (image, prepared) = realfile::open_real_file(&image_path, "prepared Btrfs image")?;
     {
         use std::os::unix::fs::MetadataExt;
         if created.dev() != prepared.dev() || created.ino() != prepared.ino() {
@@ -1891,47 +1912,79 @@ fn format_volume(
         )));
     }
     drop(staged_image);
+    Ok(PreparedVolumeImage { file: image, len })
+}
 
-    zero_edges(file, offset, len)?;
-    // Durable BEFORE the copy starts, or the ordering below buys nothing: a
-    // power loss could otherwise persist new filesystem blocks while the zero
-    // over the old superblock is still only in page cache, which is exactly the
-    // mixed, apparently-valid volume the deferral exists to prevent.
-    file.sync_all()?;
-    // The copy is ORDERED, for `run_layout`'s reason one level down: the
-    // superblock is this filesystem's commit point, as the primary table is the
-    // disk's, and it is only true once everything it points at is durable.
-    // Btrfs puts it 64 KiB in, so the FIRST chunk is the commit point — write it
-    // last, behind a barrier, and an interrupted `volume` leaves nothing at the
-    // offset a mount reads. Written first, the same interruption leaves a
-    // superblock a prober calls valid over chunks that are still the PREVIOUS
-    // install's bytes, which is a disk that reports a good btrfs and fails to
-    // mount.
-    //
-    // The PRIMARY only. A mirror 64 MiB in is written during the first pass,
-    // and deferring it too would not buy the same thing: the zeroing does not
-    // reach that far, so what stands there meanwhile is the previous install's
-    // mirror rather than nothing. `btrfs rescue super-recover` can promote a
-    // mirror, so an interrupted install is recoverable-into-nonsense by a tool
-    // asked to try; every path that MOUNTS reads the primary.
-    //
-    // This is also what makes the head half of `zero_edges` load-bearing rather
-    // than merely tidy: with the chunk deferred, those zeros are what stands in
-    // the superblock's place for the length of the copy.
-    let head = COPY_CHUNK.min(len);
-    let rest = copy_sparse(&mut image, file, offset, head, len)?;
-    file.sync_all()?;
-    let first = copy_sparse(&mut image, file, offset, 0, head)?;
-    file.sync_all()?;
-    let written = rest.saturating_add(first);
+impl PreparedVolumeImage {
+    fn write_to(
+        self,
+        destination: &mut FormatDestination,
+        out: &mut dyn Write,
+    ) -> io::Result<()> {
+        use std::os::unix::fs::MetadataExt;
+        let file = &mut destination.file;
+        let source = self.file.metadata()?;
+        let target = file.metadata()?;
+        if (source.dev(), source.ino()) == (target.dev(), target.ino()) {
+            return Err(invalid("prepared Btrfs image is the destination itself".into()));
+        }
+        let (offset, len) = destination_volume(file)?;
+        if len != self.len {
+            return Err(invalid(format!(
+                "prepared Btrfs image needs {} bytes, but the destination volume has {len}",
+                self.len
+            )));
+        }
+        let got = source.len();
+        if got != self.len {
+            return Err(invalid(format!(
+                "prepared Btrfs image changed size: {got} bytes, not the required {}",
+                self.len
+            )));
+        }
+        let mut image = self.file;
 
-    // The scratch directory is the CALLER's, and so is what is left in it. Not
-    // tidiness deferred: the image is the only artifact anything can check the
-    // filesystem itself against — `btrfs check` wants a device or a file, and
-    // the copy on the destination begins half a gigabyte in, where no tool can
-    // be pointed at it. Deleting it here would leave the strongest available
-    // check with nothing to run on.
-    writeln!(out, "{offset} {len} {written}")
+        zero_edges(file, offset, len)?;
+        // Durable BEFORE the copy starts, or the ordering below buys nothing: a
+        // power loss could otherwise persist new filesystem blocks while the zero
+        // over the old superblock is still only in page cache, which is exactly the
+        // mixed, apparently-valid volume the deferral exists to prevent.
+        file.sync_all()?;
+        // The copy is ORDERED, for `run_layout`'s reason one level down: the
+        // superblock is this filesystem's commit point, as the primary table is the
+        // disk's, and it is only true once everything it points at is durable.
+        // Btrfs puts it 64 KiB in, so the FIRST chunk is the commit point — write it
+        // last, behind a barrier, and an interrupted `volume` leaves nothing at the
+        // offset a mount reads. Written first, the same interruption leaves a
+        // superblock a prober calls valid over chunks that are still the PREVIOUS
+        // install's bytes, which is a disk that reports a good btrfs and fails to
+        // mount.
+        //
+        // The PRIMARY only. A mirror 64 MiB in is written during the first pass,
+        // and deferring it too would not buy the same thing: the zeroing does not
+        // reach that far, so what stands there meanwhile is the previous install's
+        // mirror rather than nothing. `btrfs rescue super-recover` can promote a
+        // mirror, so an interrupted install is recoverable-into-nonsense by a tool
+        // asked to try; every path that MOUNTS reads the primary.
+        //
+        // This is also what makes the head half of `zero_edges` load-bearing rather
+        // than merely tidy: with the chunk deferred, those zeros are what stands in
+        // the superblock's place for the length of the copy.
+        let head = COPY_CHUNK.min(len);
+        let rest = copy_sparse(&mut image, file, offset, head, len)?;
+        file.sync_all()?;
+        let first = copy_sparse(&mut image, file, offset, 0, head)?;
+        file.sync_all()?;
+        let written = rest.saturating_add(first);
+
+        // The scratch directory is the CALLER's, and so is what is left in it. Not
+        // tidiness deferred: the image is the only artifact anything can check the
+        // filesystem itself against — `btrfs check` wants a device or a file, and
+        // the copy on the destination begins half a gigabyte in, where no tool can
+        // be pointed at it. Deleting it here would leave the strongest available
+        // check with nothing to run on.
+        writeln!(out, "{offset} {len} {written}")
+    }
 }
 
 /// The FAT volume serial, taken from the ESP partition's own GUID.
@@ -5671,6 +5724,123 @@ mod tests {
         zero_edges(&mut file, MIB, MIB).unwrap();
         assert_eq!(dest.read_at(MIB, 4), [0; 4]);
         assert_eq!(dest.read_at(2 * MIB - 4, 4), [0; 4], "to its very end");
+    }
+
+    fn volume_write_snapshot(disk: &Scratch) -> Vec<Vec<u8>> {
+        let plan = plan(512, DISK).unwrap();
+        let offset = plan.volume_start * 512;
+        let len = (plan.volume_end - plan.volume_start + 1) * 512;
+        [(0, 2 * MIB), (offset, MIB), (offset + len / 2, 4096),
+            (offset + len - MIB, MIB), (DISK - 65536, 65536)]
+            .into_iter().map(|(at, len)| disk.read_at(at, len as usize)).collect()
+    }
+
+    fn unlaid_volume_image(len: u64) -> (Scratch, ScratchDirectory, FormatDestination, PreparedVolumeImage) {
+        let disk = Scratch::disk(DISK);
+        let mut destination = FormatDestination::open(&disk.path).unwrap();
+        let plan = plan(512, DISK).unwrap();
+        let offset = plan.volume_start * 512;
+        let volume_len = (plan.volume_end - plan.volume_start + 1) * 512;
+        for (at, count) in [(0, 4096), (MIB, 4096), (DISK - 4096, 4096),
+            (offset, MIB), (offset + volume_len / 2, 4096),
+            (offset + volume_len - MIB, MIB)] {
+            write_at(&mut destination.file, at, &vec![0xa5; count as usize]).unwrap();
+        }
+        let before = volume_write_snapshot(&disk);
+        let dir = ScratchDirectory(fake_mkfs(RECORDING_MKFS));
+        let mkfs = dir.0.join("mkfs.btrfs");
+        let prepared = prepare_volume(VolumeSettings::default(), None, &mkfs, &dir.0, None).unwrap();
+        let image = prepare_volume_image(prepared, &destination, len).unwrap();
+        assert!(before == volume_write_snapshot(&disk), "preparation wrote the destination");
+        assert_eq!(std::fs::metadata(&disk.path).unwrap().len(), DISK);
+        assert!(destination_volume(&mut destination.file).is_err(), "preparation laid out a disk");
+        (disk, dir, destination, image)
+    }
+
+    #[test]
+    fn staged_volume_before_layout_copies_the_held_image_after_path_replacement() {
+        let plan = plan(512, DISK).unwrap();
+        let len = (plan.volume_end - plan.volume_start + 1) * 512;
+        let (disk, dir, mut destination, image) = unlaid_volume_image(len);
+        let image_path = dir.0.join("td-volume.img");
+        // Finish caller-owned fixture bytes before copying, then replace only
+        // the name. The admitted descriptor must still supply the original.
+        let mut source = OpenOptions::new().write(true).open(&image_path).unwrap();
+        write_at(&mut source, 65536, b"original prepared bytes").unwrap();
+        drop(source);
+        std::fs::rename(&image_path, dir.0.join("original.img")).unwrap();
+        let mut replacement = File::create(&image_path).unwrap();
+        replacement.set_len(len).unwrap();
+        write_at(&mut replacement, 65536, b"replacement must survive").unwrap();
+        drop(replacement);
+
+        format_layout(&mut destination, None, &mut Vec::new()).unwrap();
+        let mut output = Vec::new();
+        image.write_to(&mut destination, &mut output).unwrap();
+        let offset = plan.volume_start * 512;
+        assert_eq!(disk.read_at(offset + 65536, 23), b"original prepared bytes");
+        assert_eq!(output, format!("{offset} {len} {MIB}\n").as_bytes());
+        let mut replacement = File::open(&image_path).unwrap();
+        assert_eq!(read_at(&mut replacement, 65536, 24).unwrap(), b"replacement must survive");
+        assert_eq!(replacement.metadata().unwrap().len(), len);
+        assert_eq!(destination_volume(&mut destination.file).unwrap(), (offset, len));
+        assert_eq!(std::fs::metadata(&disk.path).unwrap().len(), DISK);
+    }
+
+    #[test]
+    fn staged_volume_refuses_its_own_inode_as_the_copy_destination() {
+        let plan = plan(512, DISK).unwrap();
+        let len = (plan.volume_end - plan.volume_start + 1) * 512;
+        let (disk, dir, _destination, image) = unlaid_volume_image(len);
+        let mut alias = FormatDestination::open(&dir.0.join("td-volume.img")).unwrap();
+        write_at(&mut alias.file, 0, &[0x5a; 4096]).unwrap();
+        let before = volume_write_snapshot(&disk);
+        let mut output = Vec::new();
+        let error = image.write_to(&mut alias, &mut output).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(error.to_string(), "prepared Btrfs image is the destination itself");
+        assert_eq!(read_at(&mut alias.file, 0, 4096).unwrap(), vec![0x5a; 4096]);
+        assert_eq!(alias.file.metadata().unwrap().len(), len);
+        assert!(before == volume_write_snapshot(&disk));
+        assert!(output.is_empty());
+    }
+
+    #[test]
+    fn staged_volume_refuses_a_different_destination_extent_before_writes() {
+        let plan = plan(512, DISK).unwrap();
+        let len = (plan.volume_end - plan.volume_start + 1) * 512;
+        for prepared_len in [len - 512, len + 512] {
+            let (disk, _dir, mut destination, image) = unlaid_volume_image(prepared_len);
+            format_layout(&mut destination, None, &mut Vec::new()).unwrap();
+            let before = volume_write_snapshot(&disk);
+            let mut output = Vec::new();
+            let result = image.write_to(&mut destination, &mut output);
+            assert!(before == volume_write_snapshot(&disk), "extent refusal wrote the destination");
+            let error = result.unwrap_err();
+            assert!(error.to_string().contains("but the destination volume has"), "{error}");
+            assert_eq!(std::fs::metadata(&disk.path).unwrap().len(), DISK);
+            assert!(output.is_empty());
+        }
+    }
+
+    #[test]
+    fn staged_volume_refuses_a_resized_source_before_writes() {
+        let plan = plan(512, DISK).unwrap();
+        let len = (plan.volume_end - plan.volume_start + 1) * 512;
+        for changed_len in [len - 512, len + 512] {
+            let (disk, dir, mut destination, image) = unlaid_volume_image(len);
+            format_layout(&mut destination, None, &mut Vec::new()).unwrap();
+            OpenOptions::new().write(true).open(dir.0.join("td-volume.img")).unwrap()
+                .set_len(changed_len).unwrap();
+            let before = volume_write_snapshot(&disk);
+            let mut output = Vec::new();
+            let result = image.write_to(&mut destination, &mut output);
+            assert!(before == volume_write_snapshot(&disk), "source refusal wrote the destination");
+            let error = result.unwrap_err();
+            assert!(error.to_string().contains("prepared Btrfs image changed size"), "{error}");
+            assert_eq!(std::fs::metadata(&disk.path).unwrap().len(), DISK);
+            assert!(output.is_empty());
+        }
     }
 
     #[derive(Clone, Copy, Debug)]

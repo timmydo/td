@@ -572,6 +572,29 @@ validity. The declared mkfs and caller-controlled scratch remain trusted,
 and the caller must prevent concurrent source mutation during copying. No
 claim transfer, filesystem snapshot or destructive authorization is added.
 
+The internal `PreparedVolumeImage` owns the admitted read descriptor and
+its exact length. Staging takes a planned length and a held destination
+only for the scratch-alias check; it neither reads nor writes GPT and can
+finish before layout starts. Its consuming write step first refuses a
+source descriptor that aliases the destination inode, independently of the
+destination passed during staging. It then rereads the current
+GPT through the held destination, checks that the actual volume extent
+fits the disk and has exactly the prepared length, and rechecks the held
+source length before any edge clearing. Sparse copying and all existing
+sync barriers then use those same descriptors. A removed or replaced
+scratch pathname cannot redirect the copy. The scratch artifact remains
+caller-owned after completion.
+
+The existing volume CLI uses these same preparation and write steps with
+the length read from its current GPT. The internal split adds no command,
+service activation, immutable installation plan or capacity admission.
+An eventual coordinator must validate boot inputs, settings, scratch and
+disk eligibility before beginning layout. The image alone binds a length,
+not an offset, disk identity or destructive consent; its destination check
+reads the current table and does not authenticate it against a reviewed
+plan. Source bytes and destination topology must remain stable while
+copying, and a later refusal cannot undo layout already performed.
+
 ### Refreshing partitions after formatting
 
 `td-init reread-partitions DEVICE` is the explicit kernel refresh between
