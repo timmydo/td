@@ -13,6 +13,7 @@ const PROTOCOL_RS: &str = include_str!("../../../td-boot/src/protocol.rs");
 const REALFILE_RS: &str = include_str!("../../../td-boot/src/realfile.rs");
 const CRC32_RS: &str = include_str!("../../../engine/src/crc32.rs");
 const GPT_RS: &str = include_str!("../../../engine/src/gpt.rs");
+const CPIO_RS: &str = include_str!("../../../engine/src/cpio.rs");
 const FAT_RS: &str = include_str!("../../../engine/src/fat.rs");
 
 pub fn recipe() -> Recipe {
@@ -85,6 +86,11 @@ pub fn recipe() -> Recipe {
         Step::WriteFile {
             path: "{src}/engine/src/gpt.rs".into(),
             content: GPT_RS.into(),
+            exec: false,
+        },
+        Step::WriteFile {
+            path: "{src}/engine/src/cpio.rs".into(),
+            content: CPIO_RS.into(),
             exec: false,
         },
         Step::WriteFile {

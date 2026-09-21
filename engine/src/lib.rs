@@ -41,10 +41,10 @@
 //! "the same tree" means. It does no hashing of its own: this crate is
 //! `unsafe`-forbidding and dependency-free, and the NAR hash stays
 //! td-builder's confined syscall surface (`nar.rs`).
-// `cpio` writes the one-file archive a harness APPENDS to an initramfs, which
-// is how a per-run trusted key reaches td-boot without any recipe being
-// parameterized (DESIGN.md §6). Host-side only: it produces bytes for a check
-// to write, and no target binary includes it.
+// `cpio` writes selector appendices without parameterizing recipes: host
+// harnesses provision trusted keys and optional volume identities, while
+// target td-install binds the chosen identity in the live environment.
+// See td-install/DESIGN.md §§5–7 for the shared-source contract.
 pub mod application;
 pub mod application_spec;
 // `cache_use` is the last-use rule the build cache's reclaim reads: td-builder

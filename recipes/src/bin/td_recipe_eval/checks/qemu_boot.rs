@@ -3217,9 +3217,10 @@ pub(crate) fn verify_selector(boot: &Path) -> Result<VerifiedSelector, String> {
 /// A selector initramfs straight from the store, verified against its own
 /// manifest — and NOT yet bootable.
 ///
-/// The path is private on purpose. `provision_selector` is the only way to get
-/// a bootable one out, and it is what appends the run's trusted key, so a
-/// caller cannot boot the unprovisioned original by naming the wrong variable.
+/// The path is private on purpose. Both provisioning helpers append the run's
+/// trusted key: `provision_selector` also binds a volume, while
+/// `provision_selector_template` leaves that identity for the live installer.
+/// Neither exposes the unprovisioned original to a caller.
 /// That mistake has no symptom: the machine comes up with no trust root and
 /// nothing on either side reports it. A review found four mutations of exactly
 /// that shape surviving the whole suite, which is why this is a type rather
@@ -3903,7 +3904,35 @@ pub(crate) fn provision_selector(
     destination_dir: &Path,
     trust: &RunTrust,
 ) -> Result<PathBuf, String> {
-    let provisioned = destination_dir.join("selector-initramfs-trusted.cpio");
+    provision_selector_with_uuid(
+        selector,
+        destination_dir,
+        trust,
+        Some(&installation_uuid(&trust.public)),
+    )
+}
+
+/// The live installer supplies the destination identity after booting the ISO.
+pub(crate) fn provision_selector_template(
+    selector: &VerifiedSelector,
+    destination_dir: &Path,
+    trust: &RunTrust,
+) -> Result<PathBuf, String> {
+    provision_selector_with_uuid(selector, destination_dir, trust, None)
+}
+
+fn provision_selector_with_uuid(
+    selector: &VerifiedSelector,
+    destination_dir: &Path,
+    trust: &RunTrust,
+    uuid: Option<&str>,
+) -> Result<PathBuf, String> {
+    let filename = if uuid.is_some() {
+        "selector-initramfs-trusted.cpio"
+    } else {
+        "selector-initramfs-template.cpio"
+    };
+    let provisioned = destination_dir.join(filename);
     match fs::remove_file(&provisioned) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -3921,7 +3950,7 @@ pub(crate) fn provision_selector(
             provisioned.display()
         )
     })?;
-    append_selector_identity(&provisioned, &trust.trusted_key_line(), Some(&installation_uuid(&trust.public)))?;
+    append_selector_identity(&provisioned, &trust.trusted_key_line(), uuid)?;
     Ok(provisioned)
 }
 
@@ -9601,9 +9630,9 @@ mod tests {
     /// A review mutated four ways of losing this — returning the source instead
     /// of the copy, dropping the append in either caller, and booting the
     /// unprovisioned selector — and all four survived the whole suite. Three
-    /// are now type errors (`VerifiedSelector`'s path is private, and this is
-    /// the only way out of it); this covers the fourth, which is a body a
-    /// compiler cannot object to.
+    /// are now type errors (`VerifiedSelector`'s path is private, and both
+    /// exits use the key-appending helper); this covers the fourth, which is
+    /// a body a compiler cannot object to.
     #[test]
     fn provisioning_returns_a_keyed_copy_and_leaves_the_store_output_alone() {
         let seq = AtomicU64::new(2080);
@@ -9659,14 +9688,45 @@ mod tests {
         );
         let members = appendix_members(&bytes, BASE_LEN);
         let names: Vec<&str> = members.iter().map(|(n, _, _)| n.as_str()).collect();
-        assert_eq!(names, vec!["etc", "etc/td", "etc/td/deployment.pub", "etc/td/volume-uuid"]);
-        let (_, _, uuid) = members.iter().find(|(n, _, _)| n == "etc/td/volume-uuid").unwrap();
-        assert_eq!(uuid, format!("{}\n", installation_uuid(&trust.public)).as_bytes());
+        assert_eq!(
+            names,
+            vec![
+                "etc",
+                "etc/td",
+                "etc/td/deployment.pub",
+                "etc/td/volume-uuid"
+            ]
+        );
+        let (_, _, uuid) = members
+            .iter()
+            .find(|(n, _, _)| n == "etc/td/volume-uuid")
+            .unwrap();
+        assert_eq!(
+            uuid,
+            format!("{}\n", installation_uuid(&trust.public)).as_bytes()
+        );
         let (_, _, key) = members
             .iter()
             .find(|(n, _, _)| n == "etc/td/deployment.pub")
             .expect("the key member");
         assert_eq!(decode_hex_fixture::<32>(key), trust.public);
+
+        let bound_bytes = bytes;
+        let template =
+            provision_selector_template(&VerifiedSelector(store.clone()), &out, &trust).unwrap();
+        assert_ne!(template, booted);
+        assert_eq!(fs::read(&booted).unwrap(), bound_bytes);
+        let bytes = fs::read(&template).unwrap();
+        assert!(bytes.starts_with(BASE));
+        let members = appendix_members(&bytes, BASE_LEN);
+        let names: Vec<&str> = members.iter().map(|(name, _, _)| name.as_str()).collect();
+        assert_eq!(names, ["etc", "etc/td", "etc/td/deployment.pub"]);
+        let (_, _, key) = members
+            .iter()
+            .find(|(name, _, _)| name == "etc/td/deployment.pub")
+            .unwrap();
+        assert_eq!(decode_hex_fixture::<32>(key), trust.public);
+        assert_eq!(fs::read(&store).unwrap(), BASE);
     }
 
     #[test]

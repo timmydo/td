@@ -649,6 +649,19 @@ mount claim handoff or complete-installation success is supplied. The
 trust-only form still publishes the deployment later on the mounted disk;
 its later capacity or publication failures cannot preserve old contents.
 
+### Selector identity preparation
+
+`td-install prepare-selector TEMPLATE VOLUME-UUID OUTPUT` creates the
+private selector copy described in INSTALLER.md. It appends only the
+validated volume identity, using `engine/src/cpio.rs`, and leaves the
+trusted public key in the verified base template unchanged. The shared
+EFI copier pins the input and rejects size changes; exclusive output
+creation cannot overwrite an existing destination. This preparation
+belongs before raw formatting and supplies no destructive authority.
+The live QEMU installer uses the prepared copy; its ISO template no longer
+contains the host-selected test UUID. Other host-only boot oracles retain
+their existing provisioned selectors.
+
 ### Refreshing partitions after formatting
 
 `td-init reread-partitions DEVICE` is the explicit kernel refresh between
@@ -1318,16 +1331,18 @@ which ones is written down in `TARGET_INCLUDED_ENGINE_SOURCES`:
 
 | source | target consumer |
 |---|---|
-| `sha256.rs` | td-boot, td-compositor corpus verifier |
+| `principals.rs` | td-firstboot identity parsing and reservations |
+| `sha256.rs` | td-boot, td-update, td-compositor corpus verifier |
 | `crc32.rs` | td-install (via gpt) |
 | `gpt.rs` | td-install |
+| `cpio.rs` | td-install selector identity preparation |
 | `fat.rs` | td-install |
 | `ed25519.rs` | td-boot, td-net's `cfg(test)` ring differential |
 | `sha512.rs` | td-boot (pair with ed25519), td-net's ring differential |
 | `ed25519_sign.rs` | td-net's `cfg(test)` ring differential ONLY — never td-boot |
 
 Each entry stores the full consumer list the router prints in its note; the
-column above shows only the target half that distinguishes these seven.
+column above shows only the target half that distinguishes these nine.
 
 The last row is the one that is a declaration in both directions: being in
 this table records that a `#[path]` include exists, and its note records
@@ -1678,13 +1693,15 @@ Ordered by dependency, not by size. Each is one landing with its own tests.
    What is NOT proven is a real boot. The oracle for that is
    `qemu-boot-system`, which wants a warm store — a cold one means building
    the whole ladder. What stands in for it is that nothing can boot an
-   unprovisioned selector: every selector that reaches qemu comes from
-   `provision_selector`, and `VerifiedSelector`'s path is private, so the
-   store output cannot be reached around it.
+   unprovisioned selector: `VerifiedSelector` keeps its path private and
+   both provisioning exits append the trusted key through the same helper.
+   `provision_selector` also binds the volume; `provision_selector_template`
+   leaves that identity for the live installer before the ESP is written.
 7. **`td-install`**, a standalone crate outside the workspace (D9): GPT +
    FAT32 ESP + Btrfs volume onto a device or a regular file,
-   `#[path]`-including `gpt.rs`/`fat.rs`/`crc32.rs` and `protocol.rs`, and
-   delegating the publish to `td-boot install` (D1). Carries the
+   sharing the GPT, FAT, CPIO, checksum, boot protocol, real-file and
+   hostname implementations through `#[path]` includes, and delegating
+   publication to td-boot (D1). Carries the
    `mkfs.btrfs` build-time binding (D7). Registering a new crate no longer
    has touch points: `builder/src/affected.rs` discovers every
    `td-*/Cargo.toml` at the repo root and derives the lock roster, the routes

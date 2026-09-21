@@ -2,10 +2,12 @@
 //! build the small appendix td concatenates onto an initramfs, and no more.
 //!
 //! There is no reader here and no general archiver. What this exists for is one
-//! job, described in `td-install/DESIGN.md` §6: a harness must put a per-run
-//! trusted public key inside the SELECTOR initramfs — the one firmware loads,
+//! family of operations described in `td-install/DESIGN.md`: the host supplies
+//! a trusted public key and can bind a volume identity; reusable installation
+//! media leave that identity for the live installer to append. These bytes
+//! belong inside the SELECTOR initramfs — the one firmware loads,
 //! in whose rootfs the td-boot that VERIFIES runs — without any recipe being
-//! parameterized. Linux accepts CONCATENATED cpio archives, so the key rides
+//! parameterized. Linux accepts CONCATENATED cpio archives, so the data rides
 //! in a second archive appended to the recipe-built one. "The initramfs
 //! td-boot is in" is what this used to say, and it is ambiguous in the one way
 //! that matters: td-boot is in both of them.

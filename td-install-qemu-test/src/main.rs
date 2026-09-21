@@ -442,7 +442,8 @@ fn install(device: &str, interrupt: bool, system_autotest: bool) -> Result<(), S
             "/dev/loop0", "/root-image"])?;
         command("/bin/td-firstboot", &["check-primary-name", "/root-image", USERNAME])?;
     }
-    let mut format_arguments = vec!["format", "/source/bzImage", "/selector.cpio", "--uuid", &uuid,
+    command("/bin/td-install", &["prepare-selector", "/selector.cpio", &uuid, "/prepared-selector.cpio"])?;
+    let mut format_arguments = vec!["format", "/source/bzImage", "/prepared-selector.cpio", "--uuid", &uuid,
         "--timezone", TIMEZONE_ID, "--hostname", HOSTNAME];
     if system_autotest {
         format_arguments.extend(["--username", USERNAME, "/root-image", "/bin/td-firstboot"]);

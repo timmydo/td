@@ -17,6 +17,38 @@ use std::process::Command;
 type Res<T> = Result<T, Box<dyn Error>>;
 
 const BIN: &str = env!("CARGO_BIN_EXE_td-install");
+
+#[test]
+fn selector_preparation_is_silent_and_refusal_preserves_the_output() -> Res<()> {
+    let dir = scratch_dir("selector-stdout")?;
+    let template = dir.join("template");
+    let output = dir.join("selector");
+    std::fs::write(&template, b"verified selector template")?;
+    let invoke = || {
+        Command::new(BIN)
+            .arg("prepare-selector")
+            .arg(&template)
+            .arg("12345678-1234-4234-8234-123456789abc")
+            .arg(&output)
+            .output()
+    };
+    let prepared = invoke()?;
+    assert!(prepared.status.success(), "{prepared:?}");
+    assert!(prepared.stdout.is_empty(), "{prepared:?}");
+    assert!(prepared.stderr.is_empty(), "{prepared:?}");
+    let bytes = std::fs::read(&output)?;
+    let refused = invoke()?;
+    assert!(!refused.status.success(), "{refused:?}");
+    assert!(refused.stdout.is_empty(), "{refused:?}");
+    let diagnostic = String::from_utf8(refused.stderr)?;
+    assert_eq!(diagnostic.matches("td-install:").count(), 1);
+    assert_eq!(diagnostic.lines().count(), 1);
+    assert!(diagnostic.contains(&output.display().to_string()));
+    assert_eq!(std::fs::read(&output)?, bytes);
+    std::fs::remove_dir_all(dir)?;
+    Ok(())
+}
+
 /// The ESP plus the smallest volume `plan` accepts, with bounded alignment
 /// headroom. This is sparse, but the copy reads every byte of the volume.
 const DISK: u64 = 6 * 1024 * 1024 * 1024;

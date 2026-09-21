@@ -301,7 +301,6 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
     let scratch = Scratch {
         dir: create_scratch_dir(runner.scratch_dir(), &SEQ)?,
     };
-    let uuid_line = format!("{uuid}\n").into_bytes();
     let installed = initramfs(&base, &common, "installed\n", &[])?;
     let deployment = scratch.dir.join("source");
     fs::create_dir(&deployment).map_err(|e| format!("create deployment: {e}"))?;
@@ -336,10 +335,7 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
         &base,
         &common,
         "selector\n",
-        &[
-            (td_boot_protocol::TRUSTED_KEY_PATH.into(), 0o644, key),
-            (td_boot_protocol::VOLUME_UUID_PATH.into(), 0o644, uuid_line),
-        ],
+        &[(td_boot_protocol::TRUSTED_KEY_PATH.into(), 0o644, key)],
     )?;
     write(&scratch.dir.join("selector.cpio"), &selector)?;
     let payloads: Vec<_> = protocol::MEDIA_FILES
@@ -1435,8 +1431,9 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
     verify_deployment(&deployment)?;
     let id = crate::sha256::sha256_file(&deployment.join("manifest"))
         .map_err(|error| format!("hash system manifest: {error}"))?;
+    let template = provision_selector_template(&selector, &scratch.dir, &trust)?;
+    efi::copy_input(&template, &scratch.dir.join("selector.cpio"))?;
     let provisioned = provision_selector(&selector, &scratch.dir, &trust)?;
-    efi::copy_input(&provisioned, &scratch.dir.join("selector.cpio"))?;
     let payloads: Vec<_> = protocol::MEDIA_FILES
         .iter()
         .map(|(iso_name, name)| (*iso_name, scratch.dir.join(name)))

@@ -31,6 +31,8 @@ mod gpt;
 #[path = "../../engine/src/fat.rs"]
 #[allow(dead_code)]
 mod fat;
+#[path = "../../engine/src/cpio.rs"]
+mod cpio;
 // Test-only, and declared with the same redundant `#[path]` as td-boot's own
 // files, so that `every_compiled_file_is_one_the_guards_read` counts it and
 // both guards read it: a file compiled only into the test binary ships in
@@ -63,7 +65,7 @@ fn invalid(message: String) -> io::Error {
 }
 
 const USAGE: &str =
-    "usage: td-install inventory\n       td-install destinations\n       td-install timezones\n       td-install layout-preview <logical-sector-bytes> <capacity-bytes>\n       td-install format <efi-kernel> <selector-initramfs> <volume-options-and-operands>\n       td-install layout <destination> [<efi-kernel> <selector-initramfs>]\n       \
+    "usage: td-install inventory\n       td-install destinations\n       td-install prepare-selector <template> <volume-uuid> <output>\n       td-install timezones\n       td-install layout-preview <logical-sector-bytes> <capacity-bytes>\n       td-install format <efi-kernel> <selector-initramfs> <volume-options-and-operands>\n       td-install layout <destination> [<efi-kernel> <selector-initramfs>]\n       \
                      td-install volume [--uuid <uuid>] [--timezone <IANA-id>] [--hostname <name>] [--username <name> <verified-root> <td-firstboot>] <destination> <mkfs.btrfs> <scratch-dir> \
                      [<td-boot> <deployment> <trusted-key> | --trusted-key <trusted-key>]";
 
@@ -71,6 +73,11 @@ const USAGE: &str =
 enum Mode {
     Inventory,
     Destinations,
+    PrepareSelector {
+        template: PathBuf,
+        uuid: VolumeUuid,
+        output: PathBuf,
+    },
     Timezones,
     LayoutPreview {
         sector_bytes: u64,
@@ -229,6 +236,107 @@ impl BootInput {
     }
 }
 
+/// Admit the complete EFI input before creating the selector copy.
+fn selector_join_padding(len: u64, appendix_bytes: usize) -> io::Result<usize> {
+    let length =
+        usize::try_from(len).map_err(|_| invalid("selector template is too large".into()))?;
+    let padding = cpio::alignment_padding(length);
+    let total = len
+        .checked_add(padding as u64)
+        .and_then(|size| size.checked_add(appendix_bytes as u64))
+        .ok_or_else(|| invalid("prepared selector size overflow".into()))?;
+    if len == 0 || total > MAX_BOOT_FILE {
+        return Err(invalid(format!(
+            "template and identity must fit in 1..={MAX_BOOT_FILE} bytes"
+        )));
+    }
+    Ok(padding)
+}
+
+/// Prepare only the selector copy; its template already owns the trust root.
+fn prepare_selector(template: &Path, uuid: &VolumeUuid, output: &Path) -> io::Result<()> {
+    let (file, metadata) = realfile::open_real_file(template, "selector template")?;
+    let len = metadata.len();
+    let uuid_line = format!("{}\n", uuid.0);
+    let mut entries = Vec::new();
+    let mut end = 0usize;
+    while let Some(slash) = protocol::VOLUME_UUID_PATH
+        .get(end..)
+        .and_then(|tail| tail.find('/'))
+    {
+        end = end
+            .checked_add(slash)
+            .ok_or_else(|| invalid("selector parent offset overflow".into()))?;
+        let parent = protocol::VOLUME_UUID_PATH
+            .get(..end)
+            .ok_or_else(|| invalid("invalid selector parent".into()))?;
+        entries.push(cpio::Entry {
+            name: parent,
+            mode: 0o755,
+            kind: cpio::Kind::Directory,
+        });
+        end = end
+            .checked_add(1)
+            .ok_or_else(|| invalid("selector parent offset overflow".into()))?;
+    }
+    entries.push(cpio::Entry {
+        name: protocol::VOLUME_UUID_PATH,
+        mode: 0o644,
+        kind: cpio::Kind::File(uuid_line.as_bytes()),
+    });
+    let appendix = cpio::build(&entries).map_err(invalid)?;
+    let padding = selector_join_padding(len, appendix.len())
+        .map_err(|error| invalid(format!("{}: {error}", template.display())))?;
+    // Existing files, links and device nodes refuse before any output write.
+    let mut destination = paths::create_new_with_mode(output, 0o600)?;
+    let mut source = BootInput {
+        path: template.into(),
+        file,
+        len,
+    };
+    source.copy_to(&mut destination, output)?;
+    let output_error = |operation: &str, error: io::Error| {
+        io::Error::new(
+            error.kind(),
+            format!(
+                "{operation} prepared selector {}: {error}",
+                output.display()
+            ),
+        )
+    };
+    let zeros = [0u8; 3];
+    destination
+        .write_all(
+            zeros
+                .get(..padding)
+                .ok_or_else(|| invalid("invalid selector padding".into()))?,
+        )
+        .map_err(|error| output_error("write padding to", error))?;
+    destination
+        .write_all(&appendix)
+        .map_err(|error| output_error("append identity to", error))?;
+    use std::os::unix::fs::PermissionsExt;
+    destination
+        .set_permissions(std::fs::Permissions::from_mode(0o600))
+        .map_err(|error| output_error("set permissions on", error))?;
+    if destination
+        .metadata()
+        .map_err(|error| output_error("stat", error))?
+        .permissions()
+        .mode()
+        & 0o7777
+        != 0o600
+    {
+        return Err(invalid(format!(
+            "{}: prepared selector did not retain mode 0600",
+            output.display()
+        )));
+    }
+    destination
+        .sync_all()
+        .map_err(|error| output_error("sync", error))
+}
+
 #[derive(Debug, Eq, PartialEq)]
 struct Publish {
     /// Where `td-boot` is. Passed, never resolved: this crate execs what it is
@@ -369,6 +477,11 @@ fn parse_args(mut args: impl Iterator<Item = OsString>) -> io::Result<Mode> {
     match (verb.to_str(), rest) {
         (Some("inventory"), []) => Ok(Mode::Inventory),
         (Some("destinations"), []) => Ok(Mode::Destinations),
+        (Some("prepare-selector"), [template, uuid, output]) => Ok(Mode::PrepareSelector {
+            template: template.clone(),
+            uuid: VolumeUuid::parse(uuid.to_str().ok_or_else(|| invalid("volume UUID must be UTF-8".into()))?)?,
+            output: output.clone(),
+        }),
         (Some("timezones"), []) => Ok(Mode::Timezones),
         (Some("layout-preview"), [sector, capacity]) => Ok(Mode::LayoutPreview {
             sector_bytes: preview_number(sector.as_os_str(), "logical sector bytes")?,
@@ -2120,6 +2233,7 @@ fn main() -> ExitCode {
             timezones::run(Path::new(TIMEZONE_ROOT), &mut output)
                 .and_then(|()| output.flush())
         },
+        Mode::PrepareSelector { template, uuid, output } => prepare_selector(&template, &uuid, &output),
         Mode::Destinations => {
             let stdout = io::stdout();
             let mut output = io::BufWriter::new(stdout.lock());
@@ -2191,6 +2305,165 @@ mod tests {
     // this is the test half's own — a test opening a fixture is not a path the
     // installer takes from an operator, and the scan reads only the half above.
     use std::fs::OpenOptions;
+
+    #[test]
+    fn selector_preparation_cli_requires_exact_operands_and_canonical_identity() {
+        let good = "12345678-1234-4234-8234-123456789abc";
+        let args = |parts: &[&str]| {
+            parts
+                .iter()
+                .map(OsString::from)
+                .collect::<Vec<_>>()
+                .into_iter()
+        };
+        assert!(matches!(
+            parse_args(args(&["prepare-selector", "template", good, "out"])).unwrap(),
+            Mode::PrepareSelector { .. }
+        ));
+        for parts in [
+            vec!["prepare-selector"],
+            vec!["prepare-selector", "template", good],
+            vec!["prepare-selector", "template", good, "out", "extra"],
+            vec![
+                "prepare-selector",
+                "template",
+                "00000000-0000-0000-0000-000000000000",
+                "out",
+            ],
+            vec![
+                "prepare-selector",
+                "template",
+                "12345678-1234-4234-8234-123456789ABC",
+                "out",
+            ],
+            vec!["prepare-selector", "template", "../../state", "out"],
+        ] {
+            assert!(parse_args(args(&parts)).is_err());
+        }
+    }
+
+    #[test]
+    fn selector_copy_preserves_template_and_appends_aligned_root_owned_identity() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = ScratchDirectory(scratch::path("selector-copy"));
+        std::fs::create_dir_all(&dir.0).unwrap();
+        let template = dir.0.join("template");
+        let uuid = VolumeUuid::parse("12345678-1234-4234-8234-123456789abc").unwrap();
+        for length in 1..=8usize {
+            let base = vec![b'k'; length];
+            std::fs::write(&template, &base).unwrap();
+            let output = dir.0.join(format!("out-{length}"));
+            prepare_selector(&template, &uuid, &output).unwrap();
+            assert_eq!(std::fs::read(&template).unwrap(), base);
+            let bytes = std::fs::read(&output).unwrap();
+            assert_eq!(&bytes[..length], base);
+            assert_eq!(
+                std::fs::metadata(&output).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+            let mut at = (length + 3) & !3;
+            assert_eq!(bytes.len() - at, 532, "keep the exact-limit accounting tied to the real appendix");
+            assert!(bytes[length..at].iter().all(|b| *b == 0));
+            let mut names = Vec::new();
+            loop {
+                assert_eq!(&bytes[at..at + 6], b"070701");
+                let field = |n: usize| {
+                    u32::from_str_radix(
+                        std::str::from_utf8(&bytes[at + 6 + n * 8..at + 14 + n * 8]).unwrap(),
+                        16,
+                    )
+                    .unwrap()
+                };
+                let mode = field(1);
+                assert_eq!((field(2), field(3)), (0, 0));
+                let size = field(6) as usize;
+                let name_end = at + 110 + field(11) as usize;
+                assert_eq!(bytes[name_end - 1], 0);
+                let name = std::str::from_utf8(&bytes[at + 110..name_end - 1]).unwrap();
+                let data = (name_end + 3) & !3;
+                if name == "TRAILER!!!" {
+                    assert_eq!(size, 0);
+                    assert_eq!(data, bytes.len());
+                    break;
+                }
+                names.push(name.to_owned());
+                if name == "etc/td/volume-uuid" {
+                    assert_eq!(mode, 0o100644);
+                    assert_eq!(field(4), 1);
+                    assert_eq!(
+                        &bytes[data..data + size],
+                        format!("{}\n", uuid.0).as_bytes()
+                    );
+                } else {
+                    assert_eq!(mode, 0o040755);
+                    assert_eq!(field(4), 2);
+                    assert_eq!(size, 0);
+                }
+                at = (data + size + 3) & !3;
+            }
+            assert_eq!(names, ["etc", "etc/td", "etc/td/volume-uuid"]);
+        }
+    }
+
+    #[test]
+    fn selector_preparation_accepts_the_exact_complete_file_limit() {
+        let dir = ScratchDirectory(scratch::path("selector-limit"));
+        std::fs::create_dir_all(&dir.0).unwrap();
+        let template = dir.0.join("template");
+        let uuid = VolumeUuid::parse("12345678-1234-4234-8234-123456789abc").unwrap();
+        // Four newc records: two directories, UUID file, and trailer.
+        // Independently account for each aligned header/name and file body.
+        let appendix_bytes = 116 + 120 + 132 + 40 + 124;
+        let maximum_template = MAX_BOOT_FILE - appendix_bytes;
+        // Test the real admission helper without allocating a dense 256 MiB
+        // output on the fixture tmpfs; small copies exercise the same writer.
+        assert_eq!(
+            selector_join_padding(maximum_template, appendix_bytes as usize).unwrap(),
+            0
+        );
+        assert!(selector_join_padding(maximum_template + 1, appendix_bytes as usize).is_err());
+        assert!(selector_join_padding(u64::MAX, appendix_bytes as usize).is_err());
+        let too_large = dir.0.join("too-large");
+        File::create(&template)
+            .unwrap()
+            .set_len(maximum_template + 1)
+            .unwrap();
+        assert!(prepare_selector(&template, &uuid, &too_large).is_err());
+        assert!(!too_large.exists());
+    }
+
+    #[test]
+    fn selector_preparation_refuses_bad_sources_and_existing_outputs_without_changes() {
+        use std::os::unix::fs::symlink;
+        let dir = ScratchDirectory(scratch::path("selector-refusal"));
+        std::fs::create_dir_all(&dir.0).unwrap();
+        let template = dir.0.join("template");
+        let output = dir.0.join("output");
+        let uuid = VolumeUuid::parse("12345678-1234-4234-8234-123456789abc").unwrap();
+        for size in [0, MAX_BOOT_FILE, MAX_BOOT_FILE + 1] {
+            File::create(&template).unwrap().set_len(size).unwrap();
+            assert!(prepare_selector(&template, &uuid, &output).is_err());
+            assert!(!output.exists());
+            assert_eq!(std::fs::metadata(&template).unwrap().len(), size);
+        }
+        std::fs::write(&template, b"verified template bytes").unwrap();
+        let link = dir.0.join("link");
+        symlink(&template, &link).unwrap();
+        for input in [&link, &dir.0, &dir.0.join("missing")] {
+            assert!(prepare_selector(input, &uuid, &output).is_err());
+            assert!(!output.exists());
+        }
+        for existing in [&template, &link, &dir.0] {
+            assert!(prepare_selector(&template, &uuid, existing).is_err());
+            assert_eq!(
+                std::fs::read(&template).unwrap(),
+                b"verified template bytes"
+            );
+        }
+        std::fs::write(&output, b"preserve existing output").unwrap();
+        assert!(prepare_selector(&template, &uuid, &output).is_err());
+        assert_eq!(std::fs::read(&output).unwrap(), b"preserve existing output");
+    }
 
     #[test]
     fn cli_accepts_no_root_or_other_operands() {
@@ -4195,12 +4468,12 @@ mod tests {
     /// because that is the half the scan below keys on.
     const ALLOW: &str = concat!("#[all", "ow(clippy::disallowed_methods)]");
 
-    /// The ten files this binary compiles, with the item each allow in
+    /// The eleven files this binary compiles, with the item each allow in
     /// them must sit on. Shared pure modules and test-only scratch have none;
     /// inventory uses paths; timezones uses the regular-file reader.
     type Compiled = (&'static str, &'static str, &'static [&'static str]);
 
-    fn compiled_files() -> [Compiled; 10] {
+    fn compiled_files() -> [Compiled; 11] {
         [
             ("main.rs", include_str!("main.rs"), MAIN_CHOKE.as_slice()),
             (
@@ -4210,6 +4483,7 @@ mod tests {
             ),
             ("gpt.rs", include_str!("../../engine/src/gpt.rs"), [].as_slice()),
             ("fat.rs", include_str!("../../engine/src/fat.rs"), [].as_slice()),
+            ("cpio.rs", include_str!("../../engine/src/cpio.rs"), [].as_slice()),
             ("crc32.rs", include_str!("../../engine/src/crc32.rs"), [].as_slice()),
             (
                 "protocol.rs",
@@ -4223,7 +4497,7 @@ mod tests {
         ]
     }
 
-    /// THE LIST ABOVE IS HAND-KEPT, and an eleventh file compiled into this
+    /// THE LIST ABOVE IS HAND-KEPT, and an additional file compiled into this
     /// binary would be read by neither guard — silently, since both count only
     /// what they were handed. Nothing but this relates it to the `#[path]`
     /// declarations it mirrors. The marker is split so this file does not
@@ -4231,7 +4505,7 @@ mod tests {
     ///
     /// Over the UNCOMMENTED source, for the reason the allow scan is: a
     /// comment explaining a `#[path]` declaration is prose, and reading one as
-    /// a declaration reds a file that compiles exactly ten.
+    /// a declaration reds a file that compiles exactly eleven.
     #[test]
     fn every_compiled_file_is_one_the_guards_read() {
         // WHITESPACE-INSENSITIVE from the marker on: `#[path="x.rs"]` with no
@@ -4251,7 +4525,7 @@ mod tests {
         // include inside a `stringify!`, which satisfied the search while
         // `compiled_files` went on reading the original.
         let table_body = {
-            const HEAD: &str = "fn compiled_files() -> [Compiled; 10] {";
+            const HEAD: &str = "fn compiled_files() -> [Compiled; 11] {";
             let Some(at) = index_of(&text, HEAD) else {
                 panic!("the compiled-file table is not where this scan looks for it")
             };

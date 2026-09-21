@@ -65,10 +65,16 @@ stages only a trust layout and sparse Btrfs metadata image in RAM; the
 deployment is published directly onto the mounted disk.
 
 The host chooses the UUID from the run's throwaway provisioning public key
-before assembling the ISO. Its canonical text is placed in the live and
-selector initramfs at `/etc/td/volume-uuid`. The live fixture supplies that
-value through `td-install format` and its `--uuid` option; formatting cannot
-silently choose a different identity. Optical and USB destinations
+before assembling the ISO. Its canonical text is placed only in the live
+initramfs at `/etc/td/volume-uuid`. The ISO's selector template contains
+the trusted public key and no provisioned volume UUID. After validating
+the source, the live fixture invokes `td-install prepare-selector` to
+copy that template to `/prepared-selector.cpio` and append the UUID.
+It passes that prepared copy and the same `--uuid` value to `format`.
+Detached selector boots therefore depend on production live preparation;
+copying the ISO template directly would leave volume discovery unbound.
+The template stays on read-only media and the prepared copy stays in
+volatile state. Optical and USB destinations
 deliberately share that run's UUID but are never attached together.
 
 Target discovery waits up to thirty seconds for its fixed serial. Virtio
