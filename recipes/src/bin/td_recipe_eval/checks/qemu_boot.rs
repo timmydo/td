@@ -4553,6 +4553,8 @@ enum FirmwareAttachment {
     InstalledFixtureReordered,
     Optical,
     Usb,
+    /// Only an owned regular image in the installer medium-claim oracle.
+    WritableUsbFixture,
 }
 
 /// Firmware reads its kernel/initrd from the disk carried by BootPlan.
@@ -4582,6 +4584,18 @@ fn boot_with_timeout(
     )
 }
 
+fn validate_writable_usb_image(disk: &BootDisk<'_>) -> Result<(), String> {
+    if disk.read_only {
+        return Err("writable USB fixture cannot use a read-only image".into());
+    }
+    let metadata = fs::symlink_metadata(disk.path)
+        .map_err(|error| format!("inspect writable USB fixture image: {error}"))?;
+    if !metadata.file_type().is_file() {
+        return Err("writable USB fixture requires a regular image, not a link or device".into());
+    }
+    Ok(())
+}
+
 fn boot_source(
     qemu: &str,
     source: BootSource<'_>,
@@ -4607,6 +4621,15 @@ fn boot_source(
         attachment: FirmwareAttachment::Virtio | FirmwareAttachment::InstalledFixture, ..
     }) {
         return Err("an installation target requires optical or USB source media".into());
+    }
+    if matches!(source, BootSource::Firmware {
+        attachment: FirmwareAttachment::WritableUsbFixture, ..
+    }) {
+        let disk = plan.disk.as_ref().ok_or("writable USB fixture requires its image")?;
+        validate_writable_usb_image(disk)?;
+        if !matches!(source, BootSource::Firmware { installation_target: Some(_), .. }) {
+            return Err("writable USB fixture requires its private target".into());
+        }
     }
     validate_boot_plan_tokens(plan.extra_append)?;
     if matches!(source, BootSource::Firmware {
@@ -4769,10 +4792,11 @@ fn boot_source(
                 cmd.arg("-drive").arg(media::optical_drive_arg(disk.path));
             }
             BootSource::Firmware {
-                attachment: FirmwareAttachment::Usb, ..
+                attachment: attachment @ (FirmwareAttachment::Usb | FirmwareAttachment::WritableUsbFixture), ..
             } => {
                 cmd.args(["-device", "qemu-xhci,id=media-xhci"]);
-                cmd.arg("-drive").arg(drive_arg(disk.path, true));
+                let read_only = matches!(attachment, FirmwareAttachment::Usb) || disk.read_only;
+                cmd.arg("-drive").arg(drive_arg(disk.path, read_only));
                 cmd.arg("-device").arg(format!(
                     "usb-storage,bus=media-xhci.0,drive={},removable=on",
                     crate::checks::vm_profile::DRIVE_ID,
@@ -4794,7 +4818,7 @@ fn boot_source(
         }
     }
     if let BootSource::Firmware {
-        attachment: FirmwareAttachment::Optical | FirmwareAttachment::Usb,
+        attachment: FirmwareAttachment::Optical | FirmwareAttachment::Usb | FirmwareAttachment::WritableUsbFixture,
         installation_target: Some(target), ..
     } = source {
         cmd.arg("-drive").arg(install::target_drive_arg(target));

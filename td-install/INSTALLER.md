@@ -677,6 +677,16 @@ not imply an authenticated source. The installation medium is always
 absent. These are private optical/USB, virtio/AHCI/NVMe observations; no
 physical-device compatibility claim is added.
 
+The small QEMU matrix also boots one private writable USB source image,
+extended to fit ordinary destination geometry. Its read-only ISO mounts
+must exclude the medium from candidates, and all three raw formatting
+commands must refuse the source open with EBUSY. After releasing every
+source mount, an exclusive read-write open must succeed without writing.
+Whole-image length and SHA-256 comparisons preserve both source and target
+after QEMU is reaped. This tests the mounted-media claim and its release;
+the future service must keep its source mounts and plan identity alive.
+Other media cases remain write-protected, and no operator device is used.
+
 ## Read-only layout preview
 
 `td-install layout-preview <logical-sector-bytes> <capacity-bytes>`

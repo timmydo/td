@@ -1189,8 +1189,10 @@ meaning.
 Validation keeps the opened payload files for the duration of the command,
 then closes them. Its result is not a snapshot or authorization for a later
 write: the caller must keep source bytes and their namespace stable. The
-native ISO fixture supplies read-only media under a fixed test topology;
-volume publication still reauthenticates and checks every copied payload.
+native ISO fixture normally supplies read-only media under a fixed test
+topology; its writable-source claim test retains read-only payload mounts
+and never publishes. Volume publication still reauthenticates and checks
+every copied payload.
 Preflight does not validate the separate firmware selector, its key/UUID
 agreement, scratch capacity, destination eligibility or destructive consent.
 Those remain installation-coordinator responsibilities.
@@ -1492,6 +1494,12 @@ targets. Specific layout refusals and whole-target digests establish that
 neither case changed target bytes or reached partition refresh/publication.
 Both media attachments run these cases.
 QEMU block-backend write protection is not exclusive device admission.
+Additional cases exercise real scratch exhaustion before formatting writes
+and refusal to format mounted, writable USB source media. The writable
+source test requires an exclusive open to succeed after source unmounts
+and preserves both complete images. The
+[fixture design](../td-install-qemu-test/DESIGN.md) owns the complete boot
+roster and the exact evidence for these cases.
 
 The successful small installation matrix covers both 512-byte and
 4096-byte logical sectors. The guest reports the target geometry read
@@ -1502,8 +1510,8 @@ detached verified boots on 4Kn media; it is not a physical-device or
 512e performance claim. Refusal and interruption cases remain at 512
 bytes. Eight positive boots exercise AHCI targets at 512-byte geometry
 through both media attachments, including duplicate identity refusal and
-reordered detached boots on that same bus. The small matrix totals 56
-boots, including sixteen NVMe boots at 512-byte and 4Kn geometry through
+reordered detached boots on that same bus. The small matrix includes
+sixteen NVMe boots at 512-byte and 4Kn geometry through
 both media attachments. Each NVMe controller has one namespace; the
 second detached boot must move from nvme0n1p2 to nvme1n1p2. The kernel
 pins its PCI NVMe driver and core built-in, enables message-signaled

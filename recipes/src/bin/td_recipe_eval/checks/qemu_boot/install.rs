@@ -35,12 +35,7 @@ impl TargetDisk {
     }
 
     fn fingerprint(&self) -> Result<(u64, String), String> {
-        let len = fs::metadata(&self.path)
-            .map_err(|error| format!("stat {}: {error}", self.path.display()))?
-            .len();
-        let digest = crate::sha256::sha256_file(&self.path)
-            .map_err(|error| format!("hash {}: {error}", self.path.display()))?;
-        Ok((len, digest))
+        image_fingerprint(&self.path)
     }
 
     fn seed_preservation_canaries(&self) -> Result<(), String> {
@@ -117,6 +112,21 @@ impl TargetDisk {
             bus: DiskBus::Virtio,
         })
     }
+}
+
+fn writable_media_bytes(source_bytes: u64) -> Result<u64, String> {
+    source_bytes.max(MINIMUM_TARGET_BYTES).checked_add(511)
+        .map(|bytes| bytes & !511)
+        .ok_or_else(|| "writable USB fixture capacity overflows sector alignment".into())
+}
+
+fn image_fingerprint(path: &Path) -> Result<(u64, String), String> {
+    let len = fs::metadata(path)
+        .map_err(|error| format!("stat {}: {error}", path.display()))?
+        .len();
+    let digest = crate::sha256::sha256_file(path)
+        .map_err(|error| format!("hash {}: {error}", path.display()))?;
+    Ok((len, digest))
 }
 
 pub(super) fn target_drive_arg(target: &TargetDisk) -> OsString {
@@ -636,6 +646,53 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
             &refused, &target, source_device, &limited_iso, false, InventoryBefore::Fresh,
         )?;
     }
+    let protected_live = scratch.dir.join("protected-media.cpio");
+    write(&protected_live, &initramfs(&base, &common, "protect-media\n", &extra)?)?;
+    let protected_iso = scratch.dir.join("protected-media.iso");
+    media::write_image_with_payloads(&protected_iso, &kernel, &protected_live, &payloads)?;
+    // Model flashing an ISO onto a larger thumbdrive, with usable geometry.
+    let medium = OpenOptions::new().write(true).open(&protected_iso)
+        .map_err(|error| format!("open private writable USB image: {error}"))?;
+    let bytes = writable_media_bytes(medium.metadata().map_err(|error| error.to_string())?.len())?;
+    medium.set_len(bytes).and_then(|()| medium.sync_all())
+        .map_err(|error| format!("pad private writable USB image: {error}"))?;
+    drop(medium);
+    let target = TargetDisk::create(&scratch.dir, "protected-media-target.img")?;
+    target.seed_preservation_canaries()?;
+    let source_before = image_fingerprint(&protected_iso)?;
+    if !candidate_geometry(source_before.0, 512) {
+        return Err("writable USB fixture must fit the ordinary destination geometry".into());
+    }
+    let target_before = target.fingerprint()?;
+    let vars = scratch.dir.join("protected-media-vars.fd");
+    efi::copy_input(&vars_template, &vars)?;
+    println!("   [qemu-install] refusing raw formatting of mounted writable USB installation media");
+    let protected = boot_source(
+        &qemu,
+        BootSource::Firmware {
+            code: &code,
+            vars: &vars,
+            attachment: FirmwareAttachment::WritableUsbFixture,
+            installation_target: Some(&target),
+        },
+        plan(&protected_iso, false, protocol::MEDIA_RELEASED_MARKER),
+        &scratch.dir,
+        timeout,
+    )?;
+    if image_fingerprint(&protected_iso)? != source_before || target.fingerprint()? != target_before {
+        return Err(format!("writable-media claim test changed source or target bytes\n{}", tail(&protected.console, 80)));
+    }
+    validate_media_protection(&protected)?;
+    validate_live_reports(&protected, &InventoryExpected {
+        target_bytes: target_before.0,
+        source_bytes: source_before.0,
+        source_read_only: false,
+        sector_bytes: 512,
+        read_only: false,
+        source_name: "sda",
+        target_name: "vda",
+        before: InventoryBefore::Fresh,
+    }, false)?;
     let refuse = |case: &str, image: &Path, diagnostic: &str| -> Result<(), String> {
         for (name, attachment, source_device) in [
             ("optical", FirmwareAttachment::Optical, "/dev/sr0"),
@@ -730,7 +787,7 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
         td_boot_protocol::MANIFEST_UNAUTHENTICATED,
     )?;
     println!(
-        "PASS: native optical/USB virtio/NVMe 512-byte/4Kn and AHCI 512-byte installation and interrupted-publication refusal/reinstallation; guest-generated UUID binding across verified kexec and reordered disks; duplicate identity refusal; undersized/read-only targets, exhausted scratch and wrong-key/corrupt-payload optical/USB refusals preserve every target byte; two persistent installed boots"
+        "PASS: native optical/USB virtio/NVMe 512-byte/4Kn and AHCI 512-byte installation and interrupted-publication refusal/reinstallation; guest-generated UUID binding across verified kexec and reordered disks; duplicate identity refusal; mounted writable USB media, undersized/read-only targets, exhausted scratch and wrong-key/corrupt-payload optical/USB refusals preserve every target byte; two persistent installed boots"
     );
     Ok(())
 }
@@ -744,6 +801,7 @@ enum InventoryBefore {
 struct InventoryExpected<'a> {
     target_bytes: u64,
     source_bytes: u64,
+    source_read_only: bool,
     sector_bytes: u64,
     read_only: bool,
     source_name: &'a str,
@@ -930,7 +988,7 @@ fn inventory_snapshot(
             expected.target_bytes,
             expected.read_only,
         ),
-        (expected.source_name, source, expected.source_bytes, true),
+        (expected.source_name, source, expected.source_bytes, expected.source_read_only),
     ] {
         report_expect_number(device, name, "capacity_bytes", capacity)?;
         report_expect_field(device, name, "read_only", &Json::Bool(read_only))?;
@@ -1217,6 +1275,7 @@ fn require_live_reports(
             .map_err(|error| error.to_string())?
             .len(),
         source_bytes: fs::metadata(iso).map_err(|error| error.to_string())?.len(),
+        source_read_only: true,
         sector_bytes: target.sector_size.bytes(),
         read_only: target.read_only,
         source_name: source_device
@@ -1225,6 +1284,14 @@ fn require_live_reports(
         target_name: target.bus.name(false),
         before,
     };
+    validate_live_reports(result, &expected, partitioned)
+}
+
+fn validate_live_reports(
+    result: &BootResult,
+    expected: &InventoryExpected<'_>,
+    partitioned: bool,
+) -> Result<(), String> {
     validate_preview(
         &result.console,
         expected.target_bytes,
@@ -1237,8 +1304,8 @@ fn require_live_reports(
             tail(&result.console, 80)
         )
     })?;
-    validate_inventories(&result.console, &expected, partitioned)
-        .and_then(|()| validate_candidates(&result.console, &expected, partitioned))
+    validate_inventories(&result.console, expected, partitioned)
+        .and_then(|()| validate_candidates(&result.console, expected, partitioned))
         .map_err(|error| {
             format!(
                 "installer storage reports: {error}\n{}",
@@ -1249,6 +1316,29 @@ fn require_live_reports(
 
 fn refusal_plan(image: &Path) -> BootPlan<'_> {
     plan(image, true, protocol::REFUSAL_COMPLETE_MARKER)
+}
+
+fn validate_media_protection(result: &BootResult) -> Result<(), String> {
+    let media = format!("{} /dev/sda", protocol::MEDIA_MARKER);
+    require(result, &media, "read-only payload access")?;
+    let media_records: Vec<_> = result.console.lines().map(str::trim_end)
+        .filter(|line| line.starts_with(protocol::MEDIA_MARKER)).collect();
+    require(result, protocol::MEDIA_BUSY_MARKER, "mounted source formatter refusals")?;
+    require(result, protocol::MEDIA_RELEASED_MARKER, "released source exclusive claim")?;
+    let sequence: Vec<_> = result.console.lines().map(str::trim_end)
+        .filter(|line| matches!(*line, protocol::MEDIA_BUSY_MARKER | protocol::MEDIA_RELEASED_MARKER))
+        .collect();
+    if sequence != [protocol::MEDIA_BUSY_MARKER, protocol::MEDIA_RELEASED_MARKER]
+        || media_records != [media.as_str()]
+        || !result.evidence.target || !result.marker_killed || result.exited_clean
+        || result.evidence.selected_current || result.evidence.selected_previous
+        || [protocol::PARTITIONS_MARKER, protocol::DIRECT_MARKER, protocol::INSTALL_MARKER,
+            protocol::REFUSED_PREFIX, protocol::REFUSAL_COMPLETE_MARKER]
+            .iter().any(|marker| result.console.contains(marker))
+    {
+        return Err(format!("writable media protection failed: {}\n{}", result.reason, tail(&result.console, 80)));
+    }
+    Ok(())
 }
 
 fn validate_scratch_refusal(result: &BootResult, source_device: &str) -> Result<(), String> {
@@ -2158,6 +2248,111 @@ mod tests {
     }
 
     #[test]
+    fn writable_media_size_fits_candidate_geometry_without_truncation() {
+        for source in [0, 1024 * 1024 * 1024, MINIMUM_TARGET_BYTES, MINIMUM_TARGET_BYTES + 1] {
+            let bytes = writable_media_bytes(source).unwrap();
+            assert!(bytes >= source);
+            assert!(bytes.is_multiple_of(512));
+            assert!(candidate_geometry(bytes, 512));
+        }
+        assert_eq!(writable_media_bytes(MINIMUM_TARGET_BYTES + 1).unwrap(), MINIMUM_TARGET_BYTES + 512);
+        assert!(writable_media_bytes(u64::MAX).is_err());
+    }
+
+    #[test]
+    fn writable_usb_invalid_plans_refuse_before_qemu_or_firmware_access() {
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let scratch = Scratch { dir: create_scratch_dir(&env::temp_dir(), &SEQ).unwrap() };
+        let target = TargetDisk::with_capacity(&scratch.dir, "target.img", 4096).unwrap();
+        let image = TargetDisk::with_capacity(&scratch.dir, "source.iso", 4096).unwrap();
+        let missing = scratch.dir.join("missing-firmware");
+        for (attachment, read_only, present_target, reason) in [
+            (FirmwareAttachment::WritableUsbFixture, true, true, "writable USB fixture cannot use a read-only image"),
+            (FirmwareAttachment::WritableUsbFixture, false, false, "writable USB fixture requires its private target"),
+            (FirmwareAttachment::Usb, false, true, "optical and USB media oracles require read-only disks"),
+        ] {
+            let error = boot_source(
+                "/nonexistent-qemu-must-not-run",
+                BootSource::Firmware {
+                    code: &missing, vars: &missing, attachment,
+                    installation_target: present_target.then_some(&target),
+                },
+                plan(&image.path, read_only, protocol::MEDIA_RELEASED_MARKER),
+                &scratch.dir,
+                Duration::from_secs(1),
+            ).err().unwrap();
+            assert_eq!(error, reason);
+        }
+    }
+
+    #[test]
+    fn writable_media_protection_requires_both_claim_phases_and_no_installation() {
+        let mut result = interrupted_result();
+        let console = format!("{} /dev/sda\n{}\n{}\n", protocol::MEDIA_MARKER,
+            protocol::MEDIA_BUSY_MARKER, protocol::MEDIA_RELEASED_MARKER);
+        result.console = console.clone();
+        validate_media_protection(&result).unwrap();
+        for missing in [protocol::MEDIA_MARKER, protocol::MEDIA_BUSY_MARKER, protocol::MEDIA_RELEASED_MARKER] {
+            result.console = console.replace(missing, "missing");
+            assert!(validate_media_protection(&result).is_err());
+        }
+        for extra in [protocol::PARTITIONS_MARKER, protocol::DIRECT_MARKER, protocol::INSTALL_MARKER,
+            protocol::REFUSED_PREFIX, protocol::REFUSAL_COMPLETE_MARKER, protocol::MEDIA_BUSY_MARKER,
+            protocol::MEDIA_MARKER, protocol::MEDIA_RELEASED_MARKER] {
+            result.console = format!("{console}{extra}\n");
+            assert!(validate_media_protection(&result).is_err());
+        }
+        result.console = console.replace("/dev/sda", "/dev/sdb");
+        assert!(validate_media_protection(&result).is_err());
+        result.console = format!("{} /dev/sda\n{}\n{}\n", protocol::MEDIA_MARKER,
+            protocol::MEDIA_RELEASED_MARKER, protocol::MEDIA_BUSY_MARKER);
+        assert!(validate_media_protection(&result).is_err());
+        result.console = console;
+        result.marker_killed = false;
+        assert!(validate_media_protection(&result).is_err());
+        result.marker_killed = true;
+        result.exited_clean = true;
+        assert!(validate_media_protection(&result).is_err());
+        result.exited_clean = false;
+        result.evidence.selected_current = true;
+        assert!(validate_media_protection(&result).is_err());
+    }
+
+    #[test]
+    fn writable_usb_admission_refuses_links_directories_and_read_only_images() {
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let scratch = Scratch { dir: create_scratch_dir(&env::temp_dir(), &SEQ).unwrap() };
+        let target = TargetDisk::with_capacity(&scratch.dir, "media.iso", 4096).unwrap();
+        validate_writable_usb_image(&BootDisk::new(&target.path, false)).unwrap();
+        assert!(validate_writable_usb_image(&BootDisk::new(&target.path, true)).is_err());
+        assert!(validate_writable_usb_image(&BootDisk::new(&scratch.dir, false)).is_err());
+        let link = scratch.dir.join("link");
+        std::os::unix::fs::symlink(&target.path, &link).unwrap();
+        assert!(validate_writable_usb_image(&BootDisk::new(&link, false)).is_err());
+        assert!(validate_writable_usb_image(&BootDisk::new(&scratch.dir.join("missing"), false)).is_err());
+    }
+
+    #[test]
+    fn writable_media_inventory_cannot_be_satisfied_by_a_read_only_drive() {
+        let mut expected = inventory_expectation();
+        expected.source_name = "sda";
+        expected.source_read_only = false;
+        let usb = INVENTORY_FIXTURE.replace("\"sr0\"", "\"sda\"")
+            .replace("\"logical_sector_bytes\":2048", "\"logical_sector_bytes\":512");
+        assert!(validate_inventories(&inventory_console(&usb, None), &expected, false).is_err());
+        let writable = usb.replace("\"read_only\":true", "\"read_only\":false");
+        validate_inventories(&inventory_console(&writable, None), &expected, false).unwrap();
+        let mut result = interrupted_result();
+        result.console = candidate_console(true, false)
+            .replace("\"sr0\"", "\"sda\"")
+            .replace("\"logical_sector_bytes\":2048", "\"logical_sector_bytes\":512")
+            .replace("\"read_only\":true", "\"read_only\":false");
+        validate_live_reports(&result, &expected, false).unwrap();
+        expected.source_read_only = true;
+        assert!(validate_inventories(&inventory_console(&writable, None), &expected, false).is_err());
+    }
+
+    #[test]
     fn scratch_refusal_requires_exhaustion_in_the_formatter_before_publication() {
         let mut result = interrupted_result();
         result.console = format!(
@@ -2786,6 +2981,7 @@ mod tests {
         InventoryExpected {
             target_bytes: 6 * 1024 * 1024 * 1024,
             source_bytes: 1024 * 1024,
+            source_read_only: true,
             sector_bytes: 4096,
             read_only: false,
             source_name: "sr0",

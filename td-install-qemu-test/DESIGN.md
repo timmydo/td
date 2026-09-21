@@ -8,11 +8,12 @@ admission, destructive consent, account configuration or signing identity.
 
 The host oracle exclusively creates each sparse target inside its private
 scratch directory and exposes it as a writable virtio, AHCI or NVMe disk
-with the fixture serial. The ISO stays read-only. The fixture refuses outside PID 1 and admits
-exactly one whole virtio, SCSI-named AHCI or NVMe namespace target with
-that serial; it accepts
-no command-line destination. This is test identification, not a real installer authorization
-mechanism. Firmware variables are private copies, networking is disabled,
+with the fixture serial. The ISO normally stays read-only; the dedicated
+writable-media claim test below uses a private writable image. The fixture
+refuses outside PID 1 and admits exactly one whole virtio, SCSI-named AHCI
+or NVMe namespace target with that serial; it accepts no command-line
+destination. This is test identification, not a real installer
+authorization mechanism. Firmware variables are private copies, networking is disabled,
 and the host boot runner owns deadlines and QEMU teardown. Each boot defaults
 to 180 seconds; a positive TD_QEMU_BOOT_TIMEOUT_SECS overrides that limit.
 Target discovery also retries a matched node that has not yet appeared in
@@ -30,8 +31,8 @@ tiny signed deployment and fixed selector are streamed into separate ISO
 files. Boot files and tools read into the fixture initramfs are bounded at
 256 MiB. The shared composer accepts larger ISO payloads under MEDIA.md,
 while the full-system diagnostic supplies the built system deployment. The
-private key remains on the host outside derivations. The fixture calls the
-actual td-install format coordinator, followed by td-boot's verified mounted
+private key remains on the host outside derivations. Ordinary installation
+calls the actual td-install format coordinator, followed by td-boot's verified mounted
 publication. Its success marker follows formatting, partition refresh,
 mounted publication and sync.
 
@@ -276,7 +277,7 @@ not by itself demonstrate a UUID discovery defect. AHCI targets are
 restricted to 512-byte logical sectors before constructing QEMU arguments;
 QEMU ide-hd does not support the virtio 4Kn case.
 The same ISO bytes serve all target buses.
-The complete small oracle has fifty-six boots, all with fresh private firmware
+The complete small oracle has fifty-nine boots, all with fresh private firmware
 variables. Interruption and refusal cases retain virtio/512-byte geometry;
 the full-system diagnostic installs through both media attachments onto
 virtio and AHCI at 512-byte geometry, then boots each installation twice
@@ -371,7 +372,8 @@ version/scope, unique device names and queried fields, and compares
 target/source capacities with the private
 files it attached. Target geometry and write protection must match QEMU's
 configuration, its serial must match the fixture serial, and the source
-must report read-only media with the expected optical/USB sector size.
+must report the expected write protection and optical/USB sector size.
+Only the dedicated writable-media case expects a writable source.
 Fresh targets must report no target partitions before formatting; explicit
 reinstallation may retain them. Every reported device number must be unique.
 After formatting, exactly two target partitions must name the target
@@ -391,7 +393,7 @@ require only the before report and prohibit an after report; a future
 unmountable-media case needs its own earlier failure expectation. The
 existing whole-target byte comparisons still establish write preservation;
 inventory alone does not. These observations cover all live
-legs of the 58-boot matrix and all four full-system ISO installations without
+legs of the 59-boot matrix and all four full-system ISO installations without
 adding boots or changing target admission.
 
 The live fixture also runs `td-install layout-preview` after successful
@@ -495,3 +497,44 @@ This proves the current coordinated formatter refuses one real staging
 allocation failure before erasure; it does not establish a general
 scratch-capacity estimate or guarantee recovery after destination writes.
 The full-system matrix remains unchanged.
+
+## Mounted writable installation media
+
+One dedicated USB boot selects `protect-media` and exposes its exclusively
+created ISO image as writable. The private file is extended to at least
+6 GiB and rounded up to a 512-byte boundary, modeling an ISO flashed onto
+a larger thumbdrive and ensuring the source fits ordinary candidate
+geometry. The host explicitly verifies
+that geometry. The embedded GPT remains at its original offsets; the
+whole-source fingerprint also detects any firmware repair writes. This
+fixture-only firmware attachment refuses read-only images, symlinks,
+non-regular files and a missing private target before
+starting QEMU. All path ancestors and image contents remain owned and
+stable under the host oracle; this is not an admission boundary against
+an adversarial host pathname writer. Other optical/USB boots keep their
+read-only attachment rule.
+
+The guest mounts ISO9660 and its payload file binds read-only as usual.
+It requires a writable 512-byte /dev/sda source and reports inventory and
+candidates. The host compares both reports with its image geometry and
+requires only the unused destination in the candidate list, excluding the
+mounted writable source. The guest verifies the signed source, then tries
+all three actual raw formatters against that source. Every command must
+refuse its open with exit status 1, EBUSY, no stdout and unchanged first
+64 KiB before the media-busy record is emitted.
+
+The guest then unmounts every payload bind and the ISO filesystem. An
+exclusive read-write open of the same source must now succeed, observe a
+block device and close without writing before the final release record.
+The host requires exactly those two records in order, successful marker
+capture and no installation, publication, deployment-selection or fixture
+failure evidence. After QEMU is reaped, complete length/SHA-256 comparisons
+must preserve both the writable source image and the unused destination,
+including all sparse gaps. No operator block device is passed to QEMU.
+
+This proves mounted-source exclusion and the block-claim barrier on one
+writable USB topology. Unmounting deliberately releases that protection;
+the real service must retain source mounts and bind backing-device
+identity in its plan. No hotplug admission, protection from privileged
+raw I/O or physical thumbdrive compatibility is claimed. The full-system
+matrix remains unchanged.

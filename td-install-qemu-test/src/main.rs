@@ -272,7 +272,7 @@ fn media_device(target: &str) -> Result<&'static str, String> {
     }
 }
 
-fn mount_source(target: &str) -> Result<(), String> {
+fn mount_source(target: &str) -> Result<&'static str, String> {
     let device = media_device(target)?;
     applet(&[
         "mount",
@@ -306,7 +306,8 @@ fn mount_source(target: &str) -> Result<(), String> {
             Ok(_) => return Err(format!("media payload is writable: {destination}")),
         }
     }
-    report(std::io::stdout(), format_args!("{MEDIA_MARKER} {device}"))
+    report(std::io::stdout(), format_args!("{MEDIA_MARKER} {device}"))?;
+    Ok(device)
 }
 
 fn configured_uuid() -> Result<String, String> {
@@ -713,7 +714,7 @@ fn primary_metadata(device: &str) -> Result<Vec<u8>, String> {
     Ok(bytes)
 }
 
-fn reject_held_disk_users(device: &str, partition: &str) -> Result<(), String> {
+fn claim_fixture_disk(device: &str) -> Result<File, String> {
     if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
         return Err("whole-disk claim fixture requires x86-64 Linux".into());
     }
@@ -731,8 +732,13 @@ fn reject_held_disk_users(device: &str, partition: &str) -> Result<(), String> {
         .file_type()
         .is_block_device()
     {
-        return Err("claimed fixture destination is not a block device".into());
+        return Err(format!("claimed fixture disk {device} is not a block device"));
     }
+    Ok(claim)
+}
+
+fn reject_held_disk_users(device: &str, partition: &str) -> Result<(), String> {
+    let claim = claim_fixture_disk(device)?;
     reject_busy_formatters(device, "held whole disk")?;
     candidates(CANDIDATES_HELD_MARKER)?;
     let refused = Command::new("/bin/td-boot")
@@ -944,6 +950,28 @@ fn installed() -> Result<(), String> {
     report(std::io::stdout(), format_args!("{marker} {id}"))
 }
 
+fn protect_writable_media(target: &str) -> Result<(), String> {
+    let device = mount_source(target)?;
+    if device != "/dev/sda"
+        || read(Path::new("/sys/class/block/sda/ro"), 2)? != b"0\n"
+        || read(Path::new("/sys/class/block/sda/queue/logical_block_size"), 16)? != b"512\n"
+    {
+        return Err("media-claim fixture requires writable 512-byte USB media".into());
+    }
+    inventory(INVENTORY_BEFORE_MARKER)?;
+    candidates(CANDIDATES_BEFORE_MARKER)?;
+    command("/bin/td-boot", &["validate-source", "/source", "/trusted.pub"])?;
+    reject_busy_formatters(device, "mounted installer medium")?;
+    report(std::io::stdout(), format_args!("{MEDIA_BUSY_MARKER}"))?;
+    // Every file bind also retains the ISO filesystem's block-device claim.
+    for (_, name) in MEDIA_FILES.iter().rev() {
+        applet(&["umount", &format!("/{name}")])?;
+    }
+    applet(&["umount", "/media"])?;
+    drop(claim_fixture_disk(device)?);
+    report(std::io::stdout(), format_args!("{MEDIA_RELEASED_MARKER}"))
+}
+
 fn require_scratch_mount(bytes: &[u8]) -> Result<(), String> {
     let text = std::str::from_utf8(bytes).map_err(|_| "non-UTF-8 scratch mount report")?;
     let mut matching = text.lines().filter_map(|line| {
@@ -1018,6 +1046,7 @@ fn run() -> Result<(), String> {
         b"install-system\n" => install(&target()?, false, true),
         b"interrupt\n" => install(&target()?, true, false),
         b"install-scratch\n" => scratch_limited_install(&target()?),
+        b"protect-media\n" => protect_writable_media(&target()?),
         b"selector\n" => selector(),
         b"installed\n" => installed(),
         _ => Err("invalid fixture phase".into()),
