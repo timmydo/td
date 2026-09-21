@@ -931,12 +931,13 @@ Resizing the window recomputes level 2. Switching photo recomputes level 1
 from the cached level 0, or decodes when the photo is no longer cached. The
 window holds these levels and this memoization from increment 5(d)'s second
 slice, described here; its first slice developed the preview correctly but
-reran the whole pipeline on each edit. Prefetching the neighbouring level-0
-frames
-in the background is a later slice; until then the raw cache holds the
-current photo and those recently shown, evicting the least recently shown
-under `RAW_CACHE_BYTES`, so a return to a photo reruns level 1, not the
-codec. Level 1 is superpixel
+reran the whole pipeline on each edit. Its third slice prefetches the
+neighbouring level-0 frames in the background (Concurrency and memory), so
+a cursor move to a neighbour reruns level 1, not the codec, as a return to
+a recently shown photo does; the raw cache holds the current photo, those
+recently shown and the neighbours decoded ahead, evicting the least
+recently shown under `RAW_CACHE_BYTES` (a prefetch never evicts: it is
+taken only into room). Level 1 is superpixel
 (each 2x2 CFA quad becomes one RGB
 pixel: exact colour, no interpolation, a quarter of the samples), which is
 the right demosaic for every on-screen size below half resolution; export
@@ -1189,7 +1190,8 @@ modifier change with no key under it to `Input::Held` (the hints), a left
 button's press, motion and release to the pointer path (the crop drag reads
 the motion and release, not the press alone) and the wheel's frames to
 `scroll`, and `end_turn` takes the pool's results, asks for the thumbnails the
-model wants, reports the developed image's fitted rectangle within the develop
+model wants and the neighbours to decode ahead (Concurrency and memory),
+reports the developed image's fitted rectangle within the develop
 box as the crop drag's canvas (`set_preview_fit`, a fact that no more moves the
 generation than the job count does), serves the socket and hands the exports
 the session queued this turn to the pool, each with the photo's cached level 0
@@ -1278,9 +1280,41 @@ thumbnail is not ready paints a neutral placeholder and its name, never blocks.
   not be made charged its name and slot alone, the least recently shown that is
   not on screen evicted first; an eviction recomputes the wants, so a thumbnail
   let go while still wanted off screen is asked for again.
-- At most one develop, and so one raw decode, runs at a time (the codec is
-  sequential): the pool hands a worker the develop only when none is in flight.
-  The headless `export` verb runs on the calling thread, each band's
+- At most one develop, and so one raw decode of its own, runs at a time (the
+  codec is sequential): the pool hands a worker the develop only when none is
+  in flight. Beside it, at most one prefetch: the level-0 decode of a shown
+  neighbour of the cursor (`Controller::neighbours`, `PREFETCH_DEPTH` (2)
+  either side, next before previous, nearer first), the lowest class of work,
+  handed out only when no thumbnail, develop or export is pending and none
+  is being prefetched or waiting to be collected, so it is never taken ahead
+  of what is asked for (a decode once begun runs to its end, so a develop
+  asked for meanwhile takes another worker), and never of the photo the
+  develop or the export in flight is decoding (that frame is cached as it
+  lands); asked for only while the pool has a worker to spare
+  (`MIN_PREFETCH_WORKERS`, 2: on one worker it would hold the develop up)
+  and the raw cache has room for a frame the size of its largest without an
+  eviction. It is not a job: the count and `wait-idle` leave it out, since
+  nothing waits for it, though the turn loop polls at the frame rate while
+  one is queued, in flight or uncollected, as it does for a job, so the next
+  neighbour follows without an event; its frame joins the cache at the
+  turn's collect (before the wants are replanned, so a cursor move finds it)
+  when its roll is still held and there is still room, as the least recently
+  shown, never having been (so a develop's decode evicts it before a frame
+  that was), never evicting a frame shown; a neighbour that could not decode
+  is not asked for again while the memo lives, and one the cache had no room
+  for not until the room it needs is there (`Memo::prefetched`,
+  `prefetchable`). A develop that would decode the photo being prefetched
+  waits for that decode rather than running it twice: the slot is held until
+  the window collects the frame (so a plan made between the decode's end
+  and its collection waits too), the collect drops the waiting plan and
+  holds the next prefetch back until the wants are replaced, and the window
+  replans the develop from the cache in the same turn, so a worker takes it
+  first. The deference is the queue's, not the kernel's: the crate forbids
+  `unsafe`, so no thread is reniced (`setpriority` would be a new UNSAFE.md
+  surface), and a prefetch on one worker shares the cores with the
+  develop's bands on the others. A closing pool waits for a prefetch in
+  flight as it waits for a develop. The headless `export` verb runs on the
+  calling thread, each band's
   demosaic, pipeline and transform split across scoped threads as below.
   Demosaic and resampling split rows into bands on one shared queue that the
   calling thread and its scoped helper threads drain together, so no thread
@@ -1605,7 +1639,12 @@ display and leaving no socket behind when the display is not there;
 `src/window.rs`'s own tests hold `wait_ms`'s grammar, the envelope's ID, the
 charge of a held entry, the queue's replacement skipping what runs and the
 pool's count staying outstanding until a result is collected, the pool running
-one develop at a time and dropping its queued plan when one finishes, the memo
+one develop at a time and dropping its queued plan when one finishes, a
+prefetch taken after every wanted job and one at a time, not counted, the
+develop that would decode its photo waiting, dropped as the frame is collected
+and taken first once replanned, a prefetched frame joining the cache only into
+room and never evicting, evicted before a frame shown, refused for good when
+it could not decode and until the room is there when it had none, the memo
 planning each develop from what it holds (level 3 for an exposure or look edit,
 level 2 for a resize, level 1 for a cached photo, else a decode), untouched by a
 failed develop, caching but not becoming current for a develop that finishes off
@@ -1711,8 +1750,10 @@ preflight. A td-photo, td-ui or td-compositor edit selects this check in
    level 3 alone, a resize or crop edit level 2, and a
    photo switch level 1 from the cached level 0; the pool plans each develop
    from the window's memo and the raw cache evicts the least recently shown
-   under `RAW_CACHE_BYTES`. Landed; prefetching neighbouring level-0 frames
-   is a later slice. (e) First: the user crop applied to level 2 (the crop
+   under `RAW_CACHE_BYTES`. Landed. Third: the neighbouring level-0 frames
+   decoded ahead as the pool's lowest class of work, one at a time into the
+   cache's room, so an arrow key in develop reruns level 1, not the codec.
+   Landed. (e) First: the user crop applied to level 2 (the crop
    of level 1), mapped through the inverse of the orientation so an
    uncropped develop is byte-identical, in the window preview, `--preview`
    and the headless verb's `--crop`. Landed. Second: the crop drag over the

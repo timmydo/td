@@ -402,16 +402,24 @@ enum Done {
         request: crate::ExportRequest,
         result: std::result::Result<(PathBuf, Option<crate::RawFrame>), String>,
     },
+    /// A neighbour's level 0 decoded ahead of its develop, for the raw
+    /// cache; `None` when it could not be (said on stderr).
+    Prefetched {
+        key: PhotoKey,
+        frame: Option<crate::RawFrame>,
+    },
 }
 
 /// What a worker takes off the queue: an export carries the cached level 0
 /// when the window held it at submission, so a photo just developed exports
 /// without the codec; weakly, so the queue keeps no frame the raw cache has
-/// let go, and one evicted while queued is decoded again.
+/// let go, and one evicted while queued is decoded again. A prefetch is a
+/// neighbour's decode alone.
 enum Task {
     Thumb(Key),
     Develop(Preview, Start),
     Export(crate::ExportRequest, Option<Weak<crate::RawFrame>>),
+    Prefetch(PhotoKey),
 }
 
 #[derive(Default)]
@@ -435,6 +443,20 @@ struct Queue {
     /// it sends, so a closing pool drains its exports with no window to
     /// collect them.
     exporting: Option<crate::ExportRequest>,
+    /// The neighbours whose level 0 the window would have decoded ahead, in
+    /// order, and the one a worker is decoding or the window has not yet
+    /// collected: the lowest class of work, taken only when nothing wanted
+    /// is pending and none is in flight, so a prefetch never delays what is
+    /// asked for, and one at a time beside the develop's decode. Not a job:
+    /// `outstanding` leaves it out, since nothing waits for it and its
+    /// result only fills the cache. The slot is held until the window
+    /// collects the frame, so no develop decodes what is on its way.
+    prefetch: VecDeque<PhotoKey>,
+    prefetching: Option<PhotoKey>,
+    /// A collected prefetch dropped a develop that waited on it: no
+    /// prefetch is handed out until the window has replaced the wants,
+    /// so that develop, replanned, is taken first.
+    replan: bool,
     closing: bool,
 }
 
@@ -444,6 +466,7 @@ impl Queue {
     /// worker already holds, and says how many jobs are outstanding.
     fn replace(&mut self, thumbs: Vec<Key>, preview: Option<(Preview, Start)>) -> usize {
         let running = &self.running;
+        self.replan = false;
         self.pending.clear();
         self.pending
             .extend(thumbs.into_iter().filter(|key| !running.contains(key)));
@@ -453,6 +476,25 @@ impl Queue {
             other => other,
         };
         self.outstanding()
+    }
+
+    /// Replaces the prefetch wants with `keys`, less the one in flight.
+    fn replace_prefetch(&mut self, keys: Vec<PhotoKey>) {
+        let prefetching = &self.prefetching;
+        self.prefetch.clear();
+        self.prefetch.extend(
+            keys.into_iter()
+                .filter(|key| prefetching.as_ref() != Some(key)),
+        );
+    }
+
+    /// Whether the pending develop would decode the photo a prefetch is
+    /// decoding: it waits for that, so one frame is not decoded twice.
+    fn develop_waits(&self) -> bool {
+        match (&self.preview, &self.prefetching) {
+            (Some((preview, Start::Decode)), Some(key)) => key.is(preview),
+            _ => false,
+        }
     }
 
     fn outstanding(&self) -> usize {
@@ -466,16 +508,19 @@ impl Queue {
 
     /// The next task for a worker, or `None` to wait: a thumbnail first,
     /// then the develop when no develop is already in flight, so the one
-    /// raw decode is never run twice at once, then an export when none is
-    /// in flight. A closing queue hands out exports alone, so what was
-    /// asked for is written before the pool is joined.
+    /// raw decode is never run twice at once (and not while a prefetch
+    /// decodes its photo: that frame arrives and the develop is replanned
+    /// from it), then an export when none is in flight, then, with nothing
+    /// wanted pending and no prefetch in flight, a prefetch. A closing
+    /// queue hands out exports alone, so what was asked for is written
+    /// before the pool is joined.
     fn take(&mut self) -> Option<Task> {
         if !self.closing {
             if let Some(key) = self.pending.pop_front() {
                 self.running.insert(key.clone());
                 return Some(Task::Thumb(key));
             }
-            if self.developing.is_none() {
+            if self.developing.is_none() && !self.develop_waits() {
                 if let Some((preview, start)) = self.preview.take() {
                     self.developing = Some(preview.clone());
                     return Some(Task::Develop(preview, start));
@@ -488,7 +533,47 @@ impl Queue {
                 return Some(Task::Export(request, raw));
             }
         }
+        if !self.closing
+            && !self.replan
+            && self.prefetching.is_none()
+            && self.pending.is_empty()
+            && self.preview.is_none()
+            && self.exports.is_empty()
+        {
+            while let Some(key) = self.prefetch.pop_front() {
+                // The develop or the export in flight may be decoding this
+                // very photo; its frame will be cached as it lands, so the
+                // prefetch is dropped rather than decoded twice at once.
+                if self.decoding(&key) {
+                    continue;
+                }
+                self.prefetching = Some(key.clone());
+                return Some(Task::Prefetch(key));
+            }
+        }
         None
+    }
+
+    /// Whether the develop or the export in flight is of `key`'s photo.
+    fn decoding(&self, key: &PhotoKey) -> bool {
+        self.developing.as_ref().is_some_and(|p| key.is(p))
+            || self
+                .exporting
+                .as_ref()
+                .and_then(export_key)
+                .is_some_and(|exporting| exporting == *key)
+    }
+
+    /// A prefetch was collected: it leaves its slot, and a pending develop
+    /// that waited to decode the same photo is dropped, no prefetch handed
+    /// out until the window replaces the wants, so it replans that develop
+    /// from the merged cache and a worker takes it first.
+    fn prefetch_done(&mut self) {
+        if self.develop_waits() {
+            self.preview = None;
+            self.replan = true;
+        }
+        self.prefetching = None;
     }
 
     /// Whether a closing worker may leave: nothing to export and none in
@@ -552,16 +637,38 @@ impl Pool {
             .map_err(|_| "pool queue poisoned".to_string())
     }
 
-    /// Replaces the thumbnail wants and the develop want, and says how many
-    /// jobs are outstanding.
-    fn want(&self, thumbs: Vec<Key>, preview: Option<(Preview, Start)>) -> Result<usize> {
-        let outstanding = self.lock()?.replace(thumbs, preview);
+    /// Replaces the thumbnail wants, the develop want and the prefetch
+    /// wants, and says how many jobs are outstanding.
+    fn want(
+        &self,
+        thumbs: Vec<Key>,
+        preview: Option<(Preview, Start)>,
+        prefetch: Vec<PhotoKey>,
+    ) -> Result<usize> {
+        let outstanding = {
+            let mut queue = self.lock()?;
+            queue.replace_prefetch(prefetch);
+            queue.replace(thumbs, preview)
+        };
         self.queue.1.notify_all();
         Ok(outstanding)
     }
 
     fn outstanding(&self) -> Result<usize> {
         Ok(self.lock()?.outstanding())
+    }
+
+    /// Whether a prefetch is queued, in flight or uncollected: not a job,
+    /// but the turn loop polls for its frame as it does for a job's, so the
+    /// next neighbour follows it without waiting for an event.
+    fn prefetching(&self) -> Result<bool> {
+        let queue = self.lock()?;
+        Ok(queue.prefetching.is_some() || !queue.prefetch.is_empty())
+    }
+
+    /// The workers started.
+    fn workers(&self) -> usize {
+        self.threads.len()
     }
 
     /// Queues an export behind those already asked for, with the cached
@@ -581,10 +688,12 @@ impl Pool {
         Ok(outstanding)
     }
 
-    /// Takes what the workers made, each leaving the running set or the
-    /// develop-in-flight slot as it is taken, under the one lock, so what
-    /// `outstanding` counts next is exactly what the window does not hold.
-    /// An export left its slot as the worker sent it, under the same lock.
+    /// Takes what the workers made, each leaving the running set, the
+    /// develop-in-flight slot or the prefetch slot as it is taken, under
+    /// the one lock, so what `outstanding` counts next is exactly what the
+    /// window does not hold and no develop is planned to decode a frame
+    /// on its way. An export left its slot as the worker sent it, under
+    /// the same lock.
     fn collect(&self) -> Result<Vec<Done>> {
         let mut queue = self.lock()?;
         let done: Vec<Done> = std::iter::from_fn(|| self.done.try_recv().ok()).collect();
@@ -594,6 +703,7 @@ impl Pool {
                     queue.running.remove(key);
                 }
                 Done::Develop { .. } => queue.develop_done(),
+                Done::Prefetched { .. } => queue.prefetch_done(),
                 Done::Export { .. } => {}
             }
         }
@@ -607,6 +717,7 @@ impl Drop for Pool {
             queue.closing = true;
             queue.pending.clear();
             queue.preview = None;
+            queue.prefetch.clear();
         }
         self.queue.1.notify_all();
         for thread in self.threads.drain(..) {
@@ -661,6 +772,16 @@ fn work(queue: &(Mutex<Queue>, Condvar), done: &Sender<Done>) {
                     note(why);
                 }
                 Done::Export { request, result }
+            }
+            Task::Prefetch(key) => {
+                let frame = match crate::decode_raw(&key.roll.join(&key.name)) {
+                    Ok((raw, _)) => Some(raw),
+                    Err(why) => {
+                        note(&why);
+                        None
+                    }
+                };
+                Done::Prefetched { key, frame }
             }
         };
         if matches!(result, Done::Export { .. }) {
@@ -852,6 +973,10 @@ struct Cached {
     shown: u64,
 }
 
+/// The workers a pool needs before it prefetches: one to decode ahead and
+/// one free for what is asked for.
+const MIN_PREFETCH_WORKERS: usize = 2;
+
 /// What a raw-cache entry costs beside its samples and key: the slot alone,
 /// so the cache is bounded as the frames are.
 const RAW_OVERHEAD: usize = 128;
@@ -871,6 +996,10 @@ struct Memo {
     raw: VecDeque<Cached>,
     /// What the raw cache holds between its entries, for eviction.
     raw_bytes: usize,
+    /// The neighbours a prefetch could not decode (`None`: never asked for
+    /// again while the memo lives) or the cache had no room for (the bytes
+    /// it needed: asked for again once that much is free).
+    refused: Vec<(PhotoKey, Option<usize>)>,
 }
 
 impl Memo {
@@ -879,6 +1008,7 @@ impl Memo {
         self.current = None;
         self.raw.clear();
         self.raw_bytes = 0;
+        self.refused.clear();
     }
 
     /// The level a develop for `preview` starts from, given what is held:
@@ -1021,6 +1151,66 @@ impl Memo {
             };
             self.raw_bytes = self.raw_bytes.saturating_sub(gone.bytes);
         }
+    }
+
+    /// Takes a prefetch's result: the level-0 frame joins the cache when
+    /// there is room for it under `develop::RAW_CACHE_BYTES` without an
+    /// eviction (a prefetch never costs a frame shown), as the least
+    /// recently shown, never having been; one already held is left as it
+    /// is. A frame that could not be decoded, or had no room, is refused
+    /// (`prefetchable`). Says whether the frame is held.
+    fn prefetched(&mut self, key: PhotoKey, frame: Option<Arc<crate::RawFrame>>) -> bool {
+        // One entry a photo: a refusal replaces an earlier one.
+        self.refused.retain(|(refused, _)| *refused != key);
+        let Some(frame) = frame else {
+            self.refused.push((key, None));
+            return false;
+        };
+        if self.raw_frame(&key).is_some() {
+            return true;
+        }
+        let bytes = frame
+            .bytes()
+            .saturating_add(key.roll.as_os_str().len())
+            .saturating_add(key.name.len())
+            .saturating_add(RAW_OVERHEAD);
+        if self.raw_bytes.saturating_add(bytes) > develop::RAW_CACHE_BYTES {
+            self.refused.push((key, Some(bytes)));
+            return false;
+        }
+        self.raw.push_back(Cached {
+            key,
+            frame,
+            bytes,
+            shown: 0,
+        });
+        self.raw_bytes = self.raw_bytes.saturating_add(bytes);
+        true
+    }
+
+    /// Whether a neighbour is worth a prefetch: not held, not refused for
+    /// good, and not refused for room that is still not there.
+    fn prefetchable(&self, key: &PhotoKey) -> bool {
+        self.raw_frame(key).is_none()
+            && !self.refused.iter().any(|(refused, needed)| {
+                refused == key
+                    && needed.is_none_or(|bytes| {
+                        self.raw_bytes.saturating_add(bytes) > develop::RAW_CACHE_BYTES
+                    })
+            })
+    }
+
+    /// Whether a frame the size of the largest held would fit beside them
+    /// without an eviction: what a prefetch is asked for on. An empty cache
+    /// has room for a first.
+    fn room_for_another(&self) -> bool {
+        let largest = self
+            .raw
+            .iter()
+            .map(|cached| cached.bytes)
+            .max()
+            .unwrap_or(0);
+        self.raw_bytes.saturating_add(largest) <= develop::RAW_CACHE_BYTES
     }
 
     /// The cached level 0 of a photo, if held: what an export starts from.
@@ -1432,9 +1622,10 @@ impl Window {
         let jobs = self.want()?;
         self.session.ui.set_jobs(jobs);
         // The wait: the repeat's due time, at most a frame while work is
-        // outstanding, at most a control poll while the socket is served.
+        // outstanding or a prefetch is under way, at most a control poll
+        // while the socket is served.
         let mut wait = Duration::from_millis(self.client.wait_ms(now));
-        if jobs > 0 {
+        if jobs > 0 || self.pool.prefetching()? {
             wait = wait.min(Duration::from_millis(16));
         }
         if self.control.is_some() || !self.waiters.is_empty() {
@@ -1519,6 +1710,20 @@ impl Window {
                 // Only the newest develop matters; earlier ones are stale.
                 Done::Develop { preview, made } => developed = Some((preview, made)),
                 Done::Export { request, result } => self.exported(request, result),
+                Done::Prefetched { key, frame } => {
+                    // The frame joins the cache when its roll is still held
+                    // and there is room; either way the wants are recomputed,
+                    // so the next neighbour is asked for and a develop that
+                    // waited on this decode is planned from it.
+                    if self
+                        .held
+                        .as_ref()
+                        .is_some_and(|(roll, _)| *roll == key.roll)
+                    {
+                        self.memo.prefetched(key, frame.map(Arc::new));
+                    }
+                    self.wanted_at = None;
+                }
             }
         }
         if let Some((preview, made)) = developed {
@@ -1708,7 +1913,25 @@ impl Window {
             (Some(want), _) => Some((want.clone(), self.memo.plan(want))),
             (None, _) => None,
         };
-        self.pool.want(keys, submit)
+        // The neighbours' level 0, decoded ahead while the cache has room
+        // for another frame without an eviction and the pool has a worker
+        // to spare (on one worker a prefetch would hold the develop up):
+        // the ones not yet cached, nearest first.
+        let spare = self.pool.workers() >= MIN_PREFETCH_WORKERS;
+        let prefetch = match &self.held {
+            Some((roll, _)) if spare && self.memo.room_for_another() => ui
+                .neighbours()
+                .into_iter()
+                .filter_map(|index| ui.photos().get(index))
+                .map(|photo| PhotoKey {
+                    roll: roll.clone(),
+                    name: photo.name.clone(),
+                })
+                .filter(|key| self.memo.prefetchable(key))
+                .collect(),
+            _ => Vec::new(),
+        };
+        self.pool.want(keys, submit, prefetch)
     }
 
     /// Nothing outstanding, the wants computed for the model as it stands
@@ -2250,7 +2473,8 @@ mod tests {
         let pool = Pool::start(1).unwrap();
         assert_eq!(pool.outstanding().unwrap(), 0);
         assert_eq!(
-            pool.want(vec![key("a.NEF"), key("b.NEF")], None).unwrap(),
+            pool.want(vec![key("a.NEF"), key("b.NEF")], None, Vec::new())
+                .unwrap(),
             2
         );
         // Made or not, nothing leaves the count until `collect` takes it.
@@ -2268,7 +2492,7 @@ mod tests {
             .iter()
             .filter_map(|done| match done {
                 Done::Thumb { key, .. } => Some(key.name.clone()),
-                Done::Develop { .. } | Done::Export { .. } => None,
+                Done::Develop { .. } | Done::Export { .. } | Done::Prefetched { .. } => None,
             })
             .collect();
         names.sort_unstable();
@@ -2281,11 +2505,42 @@ mod tests {
     }
 
     #[test]
+    fn the_pool_runs_a_prefetch_outside_the_count_and_reports_a_failed_one() {
+        let pool = Pool::start(2).unwrap();
+        assert_eq!(
+            pool.want(Vec::new(), None, vec![photo_key("missing.NEF")])
+                .unwrap(),
+            0
+        );
+        assert!(pool.prefetching().unwrap());
+        let mut done = Vec::new();
+        for _ in 0..2000 {
+            assert_eq!(pool.outstanding().unwrap(), 0);
+            done.extend(pool.collect().unwrap());
+            if !done.is_empty() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // The roll is not there, so the frame could not be made; the slot
+        // was held until the collect and is free now.
+        assert!(matches!(
+            &done[..],
+            [Done::Prefetched { key, frame: None }] if key.name == "missing.NEF"
+        ));
+        assert!(!pool.prefetching().unwrap());
+    }
+
+    #[test]
     fn the_pool_runs_the_develop_and_keeps_it_outstanding() {
         let pool = Pool::start(2).unwrap();
         assert_eq!(
-            pool.want(Vec::new(), Some((preview("x.NEF"), Start::Decode)))
-                .unwrap(),
+            pool.want(
+                Vec::new(),
+                Some((preview("x.NEF"), Start::Decode)),
+                Vec::new()
+            )
+            .unwrap(),
             1
         );
         let mut got = false;
@@ -2409,6 +2664,135 @@ mod tests {
         assert!(memo.merge(&b, made_decoded(4, 300), 2, false).is_some());
         assert_eq!(memo.plan(&a).stage(), Stage::Level3);
         assert_eq!(memo.plan(&b).stage(), Stage::Level1);
+    }
+
+    #[test]
+    fn a_prefetch_is_taken_last_one_at_a_time_and_a_develop_waits_on_its_decode() {
+        let mut queue = Queue::default();
+        queue.replace_prefetch(vec![photo_key("b"), photo_key("c")]);
+        // Not a job: nothing waits for it.
+        assert_eq!(queue.outstanding(), 0);
+        // Wanted work goes first, whatever is queued to prefetch: a
+        // thumbnail, the develop, an export; only then a prefetch, and not
+        // a second while one is in flight.
+        queue.exports.push_back((export("e.NEF"), None));
+        assert_eq!(
+            queue.replace(vec![key("t")], Some((preview("a"), Start::Decode))),
+            3
+        );
+        assert!(matches!(queue.take(), Some(Task::Thumb(_))));
+        assert!(matches!(queue.take(), Some(Task::Develop(..))));
+        assert!(matches!(queue.take(), Some(Task::Export(..))));
+        match queue.take() {
+            Some(Task::Prefetch(key)) => assert_eq!(key.name, "b"),
+            _ => panic!("expected the prefetch"),
+        }
+        assert!(queue.take().is_none());
+        assert_eq!(queue.outstanding(), 3);
+        // The wants replaced keep the one in flight out of the queue.
+        queue.replace_prefetch(vec![photo_key("b"), photo_key("c")]);
+        let queued: Vec<&str> = queue.prefetch.iter().map(|k| k.name.as_str()).collect();
+        assert_eq!(queued, ["c"]);
+        // A pending develop that would decode the photo being prefetched
+        // waits for it (a develop of a photo with cached levels does not);
+        // the prefetch collected drops that plan and holds the next
+        // prefetch back until the wants are replaced, so the window replans
+        // the develop from the frame and a worker takes it first.
+        queue.developing = None;
+        queue.replace(Vec::new(), Some((preview("b"), Start::Decode)));
+        assert!(queue.develop_waits());
+        assert!(queue.take().is_none());
+        // The thumbnail running, the export in flight and the develop
+        // waiting count; the prefetch does not.
+        assert_eq!(queue.outstanding(), 3);
+        queue.prefetch_done();
+        assert!(queue.preview.is_none() && queue.prefetching.is_none());
+        assert!(queue.replan && queue.take().is_none());
+        queue.replace(
+            Vec::new(),
+            Some((
+                preview("b"),
+                Start::Level1 {
+                    raw: Arc::new(crate::RawFrame::synth(8)),
+                },
+            )),
+        );
+        assert!(!queue.replan && !queue.develop_waits());
+        assert!(matches!(queue.take(), Some(Task::Develop(..))));
+        match queue.take() {
+            Some(Task::Prefetch(key)) => assert_eq!(key.name, "c"),
+            _ => panic!("expected the next prefetch"),
+        }
+        // A prefetch collected with no develop waiting frees the slot alone.
+        queue.prefetch_done();
+        assert!(!queue.replan && queue.prefetching.is_none());
+        assert!(queue.developing.is_some());
+        // The photo the develop in flight is decoding is not prefetched
+        // beside it: dropped, the next taken; the export's likewise.
+        queue.replace_prefetch(vec![photo_key("b"), photo_key("d")]);
+        match queue.take() {
+            Some(Task::Prefetch(key)) => assert_eq!(key.name, "d"),
+            _ => panic!("expected the prefetch past the develop's photo"),
+        }
+        queue.prefetch_done();
+        queue.exporting = Some(crate::ExportRequest {
+            path: PathBuf::from("/td-photo/no-such-roll").join("d"),
+            exposure: 0,
+            crop: None,
+            look: None,
+        });
+        queue.replace_prefetch(vec![photo_key("d")]);
+        assert!(queue.take().is_none() && queue.prefetch.is_empty());
+        queue.exporting = None;
+        // Nothing to prefetch while a thumbnail is pending, and none from a
+        // closing queue.
+        queue.replace_prefetch(vec![photo_key("d")]);
+        queue.pending.push_back(key("v"));
+        assert!(matches!(queue.take(), Some(Task::Thumb(_))));
+        queue.closing = true;
+        assert!(queue.take().is_none());
+    }
+
+    #[test]
+    fn a_prefetched_frame_joins_the_cache_only_with_room_and_never_evicts() {
+        let mut memo = Memo::default();
+        let big = develop::RAW_CACHE_BYTES / 6 + 2_000_000;
+        let frame = |bytes| Some(Arc::new(crate::RawFrame::synth(bytes)));
+        assert!(memo.room_for_another() && memo.prefetchable(&photo_key("a")));
+        assert!(memo.prefetched(photo_key("a"), frame(big)));
+        assert!(!memo.prefetchable(&photo_key("a")), "held");
+        assert!(memo.room_for_another());
+        assert!(memo.prefetched(photo_key("b"), frame(big)));
+        // Two of three fit; a third the size of the largest would not, so
+        // none is asked for, and one that arrives anyway is dropped, the
+        // held frames untouched, and not asked for again while the room it
+        // needs is not there.
+        assert!(!memo.room_for_another());
+        assert!(!memo.prefetched(photo_key("c"), frame(big)));
+        let held: Vec<&str> = memo.raw.iter().map(|c| c.key.name.as_str()).collect();
+        assert_eq!(held, ["a", "b"]);
+        assert!(!memo.prefetchable(&photo_key("c")));
+        // A smaller one that would fit is still asked for; one that could
+        // not decode never is.
+        assert!(memo.prefetchable(&photo_key("d")));
+        assert!(!memo.prefetched(photo_key("d"), None));
+        assert!(!memo.prefetchable(&photo_key("d")));
+        // One already held is left as it is, not added twice.
+        assert!(memo.prefetched(photo_key("a"), frame(8)));
+        assert_eq!(memo.raw.len(), 2);
+        // A prefetched frame was never shown: a develop's decode evicts it
+        // before one that was, and the room it frees lets the refused one
+        // be asked for again.
+        memo.touch_raw(&photo_key("a"), 5);
+        memo.cache_raw(photo_key("e"), Arc::new(crate::RawFrame::synth(big)), 6);
+        let held: Vec<&str> = memo.raw.iter().map(|c| c.key.name.as_str()).collect();
+        assert_eq!(held, ["a", "e"]);
+        assert!(!memo.prefetchable(&photo_key("c")));
+        memo.drop_raw(&photo_key("e"));
+        assert!(memo.prefetchable(&photo_key("c")));
+        // Cleared with the memo.
+        memo.clear();
+        assert!(memo.prefetchable(&photo_key("d")));
     }
 
     #[test]

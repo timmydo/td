@@ -778,6 +778,10 @@ const _: () = assert!(TOOL_BUTTONS.len() == 6);
 
 /// The look band's first button: no look, the camera's rendering.
 pub const NO_LOOK: &str = "None";
+
+/// How many shown photos either side of the cursor the window prefetches
+/// the level-0 frames of in develop (`Controller::neighbours`).
+pub const PREFETCH_DEPTH: usize = 2;
 /// The actions that pick the first nine looks by place, the look
 /// buttons' hints after `NO_LOOK`'s (which has none).
 const LOOK_ACTIONS: [&str; 9] = [
@@ -2688,6 +2692,24 @@ impl Controller {
             .film_boxes(self.shown.len(), position)
             .into_iter()
             .filter_map(|(position, rect)| Some((*self.shown.get(position)?, rect)))
+            .collect()
+    }
+
+    /// The photos whose level-0 frames the window prefetches in develop, in
+    /// the order it wants them: the shown photos `PREFETCH_DEPTH` either
+    /// side of the cursor, the next before the previous, nearer first, so
+    /// an arrow key finds its photo decoded. Nothing outside develop, under
+    /// the chooser or without a cursor.
+    pub fn neighbours(&self) -> Vec<usize> {
+        if self.mode != Mode::Develop || self.chooser.is_some() {
+            return Vec::new();
+        }
+        let Some(position) = self.position() else {
+            return Vec::new();
+        };
+        (1..=PREFETCH_DEPTH)
+            .flat_map(|step| [position.checked_add(step), position.checked_sub(step)])
+            .filter_map(|position| position.and_then(|p| self.shown.get(p).copied()))
             .collect()
     }
 

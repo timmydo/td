@@ -6694,6 +6694,42 @@ fn a_press_off_the_crop_in_crop_adjust_draws_a_fresh_crop() {
     assert_eq!(release(&mut c, 400, 200), (Outcome::Ignored, vec![]));
 }
 
+/// The neighbours the window prefetches in develop: the shown photos
+/// `PREFETCH_DEPTH` either side of the cursor, next before previous,
+/// nearer first, cut at the roll's ends; none in cull, under the chooser
+/// or without a cursor.
+#[test]
+fn the_neighbours_are_the_shown_photos_either_side_of_the_cursor_nearer_first() {
+    let mut c = Controller::new(surface(800, 600));
+    assert!(c.neighbours().is_empty());
+    c.open("roll", b"/r", photos(5)).unwrap();
+    assert!(c.neighbours().is_empty(), "cull wants none");
+    assert_eq!(act(&mut c, "develop", &[]), Outcome::Changed);
+    assert_eq!(c.neighbours(), [1, 2]);
+    assert_eq!(key(&mut c, "Right"), Outcome::Changed);
+    assert_eq!(key(&mut c, "Right"), Outcome::Changed);
+    assert_eq!(c.neighbours(), [3, 1, 4, 0]);
+    assert_eq!(key(&mut c, "End"), Outcome::Changed);
+    assert_eq!(c.neighbours(), [3, 2]);
+    assert_eq!(ui::PREFETCH_DEPTH, 2);
+    // The chooser over develop wants none; closed, the same again.
+    let (outcome, _) = c.action("choose", &[]).unwrap();
+    assert_eq!(outcome, Outcome::Changed);
+    c.set_listing(b"/".to_vec(), listing("/", &["r"], &[]), Some("r"))
+        .unwrap();
+    assert!(c.neighbours().is_empty());
+    assert_eq!(key(&mut c, "Escape"), Outcome::Changed);
+    assert_eq!(c.neighbours(), [3, 2]);
+    // Among the shown: the unflagged filter hides the pick and the reject
+    // (photos 1 and 2), so the first photo's neighbours are the third and
+    // fourth.
+    assert_eq!(act(&mut c, "grid", &[]), Outcome::Changed);
+    assert_eq!(key(&mut c, "Home"), Outcome::Changed);
+    assert_eq!(key(&mut c, "4"), Outcome::Changed);
+    assert_eq!(act(&mut c, "develop", &[]), Outcome::Changed);
+    assert_eq!(c.neighbours(), [3, 4]);
+}
+
 /// Alt held shows each button's chord under its caption: the mode and
 /// filter strips', the tool band's, the look band's (`F1` through `F9`
 /// for the first nine looks, none for `None`) and the history pane's;
