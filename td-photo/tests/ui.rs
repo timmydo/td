@@ -20,7 +20,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use td_photo::library::{self, Filter, Flag, Key, Sidecar};
 use td_photo::look;
-use td_photo::ui::{self, Action, Controller, Effect, Photo, View, BINDINGS};
+use td_photo::ui::{self, Action, Controller, Effect, Photo, View, ZoomStep, BINDINGS};
 use td_ui::chrome::DISABLED;
 use td_ui::control::{frame, hex, valid_code, Decoder, ErrorCode};
 use td_ui::driven::{self, Input, Outcome, PointerPhase};
@@ -46,6 +46,7 @@ const GENERATION: usize = 14;
 const CHOOSER: usize = 15;
 const STEPS: usize = 16;
 const STEP: usize = 17;
+const ZOOM: usize = 18;
 
 fn surface(width: usize, height: usize) -> Surface {
     Surface::new(width, height, Scale::new(1).unwrap()).unwrap()
@@ -200,7 +201,7 @@ fn a_session_walks_the_grid_and_reports_its_state() {
     assert_eq!((layout.columns, layout.rows), (4, 3));
     assert_eq!(
         c.state(),
-        "cull\t-\t0\t0\t-\tall\tgrid\t-\t-\t-\t-\t-\t-\t0\t0\t-\t0\t-"
+        "cull\t-\t0\t0\t-\tall\tgrid\t-\t-\t-\t-\t-\t-\t0\t0\t-\t0\t-\tfit"
     );
     for name in ["next", "pick", "view", "first"] {
         assert_eq!(
@@ -1278,10 +1279,11 @@ fn the_binary_replays_the_cull_over_a_roll_and_writes_through_the_sidecar() {
             "1",
             "-",
             "0",
-            "-"
+            "-",
+            "fit"
         ]
     );
-    assert_eq!(&reply(2)[..2], ["ok", "49"]);
+    assert_eq!(&reply(2)[..2], ["ok", "53"]);
     assert_eq!(reply(3), ["ok", "changed"]);
     assert_eq!(reply(4), ["ok", &name(1), "pick", "-", "-", "-", "ok", "-"]);
     assert_eq!(
@@ -5488,9 +5490,13 @@ fn the_tool_band_drives_the_develop_edits() {
         224 + 48 + 64 + 48 + 56 + 24 + 24 + 5 * 8
     );
     let slider = tools.slider.expect("a slider after the buttons");
+    // Fit and 100% follow the exposure steps; the slider takes the rest
+    // of the row.
+    assert_eq!(button(6).x, 536);
+    assert_eq!(button(7).x, 584);
     assert_eq!(
         slider.rect().x,
-        button(5).x + i64::from(button(5).width) + 8
+        button(7).x + i64::from(button(7).width) + 8
     );
     assert_eq!(slider.rect().x + i64::from(slider.rect().width), 800 - 8);
     assert_eq!(slider.rect().y, 48);
@@ -5512,7 +5518,10 @@ fn the_tool_band_drives_the_develop_edits() {
     };
     // Crop toggles crop-adjust and shows selected; the status row names
     // the sub-mode.
-    assert_eq!(c.tool_states(0), [true, false, false, false, true, true]);
+    assert_eq!(
+        c.tool_states(0),
+        [true, false, false, false, true, true, true, true]
+    );
     assert_eq!(click(&mut c, button(0)), (Outcome::Changed, vec![]));
     assert!(c.adjusting());
     assert!(c.scene().status_line().ends_with(" | develop crop-adjust"));
@@ -5549,7 +5558,10 @@ fn the_tool_band_drives_the_develop_edits() {
     // The two nudges are one step, the second taking the first's.
     assert_eq!(&fields(&c)[STEPS..=STEP], ["1", "0"]);
     // With a step, Undo and Reset are enabled and ask for what the keys do.
-    assert_eq!(c.tool_states(0), [true, false, true, true, true, true]);
+    assert_eq!(
+        c.tool_states(0),
+        [true, false, true, true, true, true, true, true]
+    );
     let (_, effects) = click(&mut c, button(2));
     assert_eq!(
         effects,
@@ -5568,8 +5580,14 @@ fn the_tool_band_drives_the_develop_edits() {
     );
     // The states are the asked-about photo's, not the cursor's.
     assert_eq!(key(&mut c, "Right"), Outcome::Changed);
-    assert_eq!(c.tool_states(0), [true, false, true, true, true, true]);
-    assert_eq!(c.tool_states(1), [true, false, false, false, true, true]);
+    assert_eq!(
+        c.tool_states(0),
+        [true, false, true, true, true, true, true, true]
+    );
+    assert_eq!(
+        c.tool_states(1),
+        [true, false, false, false, true, true, true, true]
+    );
     assert_eq!(key(&mut c, "Left"), Outcome::Changed);
     // A crop enables Uncrop, which clears it through the crop Edit; `C`
     // is its key.
@@ -5634,8 +5652,8 @@ fn the_tool_band_drives_the_develop_edits() {
     assert!(!text.contains("| sidecar "), "{text}");
     assert!(text.contains("DSC_0000.NEF"), "{text}");
     // A surface too narrow for the buttons on one row wraps them: at 500,
-    // `+` would end at 528 and starts the second row, and the slider
-    // follows it on that row; the band is two rows.
+    // `+` would end at 528 and starts the second row, Fit and 100% follow
+    // it, and the slider follows them on that row; the band is two rows.
     let mut narrow = Controller::new(surface(500, 600));
     narrow.open("roll", b"/r", photos(1)).unwrap();
     assert_eq!(act(&mut narrow, "develop", &[]), Outcome::Changed);
@@ -5659,12 +5677,14 @@ fn the_tool_band_drives_the_develop_edits() {
             height: 20
         }
     );
+    assert_eq!(tools.buttons[6].unwrap().rect().x, 256);
+    assert_eq!(tools.buttons[7].unwrap().rect().x, 304);
     assert_eq!(
         tools.slider.unwrap().rect(),
         Rect {
-            x: 256,
+            x: 360,
             y: 72,
-            width: 492 - 256,
+            width: 492 - 360,
             height: 24
         }
     );
@@ -5673,11 +5693,11 @@ fn the_tool_band_drives_the_develop_edits() {
     assert_eq!(press(&mut narrow, 700, 60), Outcome::Ignored);
     // Room for the buttons but not a column per step on their row puts
     // the slider on a row of its own across the band; one column more,
-    // and it is after them with its hundred steps. The buttons (264 wide,
-    // six cells between and one before) end at 528, the slider starts a
-    // cell on at 536 and ends at width - 8, so its travel is width - 544
-    // - KNOB_WIDTH: 100 at 656.
-    for (width, own_row) in [(655, true), (656, false)] {
+    // and it is after them with its hundred steps. The buttons (352 wide,
+    // seven cells between and one before) end at 632, the slider starts
+    // a cell on at 640 and ends at width - 8, so its travel is width -
+    // 648 - KNOB_WIDTH: 100 at 760.
+    for (width, own_row) in [(759, true), (760, false)] {
         let c = Controller::new(surface(width, 600));
         let tools = c.layout().tools();
         assert!(tools.buttons.iter().all(Option::is_some), "{width}");
@@ -5688,7 +5708,7 @@ fn the_tool_band_drives_the_develop_edits() {
             assert_eq!(c.layout().tool_band().height, 48, "{width}");
         } else {
             assert_eq!(slider.rect().y, 48, "{width}");
-            assert_eq!(slider.rect().x, 536, "{width}");
+            assert_eq!(slider.rect().x, 640, "{width}");
             assert_eq!(slider.travel() as usize, ui::EXPOSURE_STEPS);
             assert_eq!(c.layout().tool_band().height, 24, "{width}");
         }
@@ -5739,8 +5759,351 @@ fn the_tool_band_drives_the_develop_edits() {
             height: 40
         }
     );
-    // Six labels of 6, 8, 6, 7, 3 and 3 cells at 16 each, a cell between.
-    assert_eq!(tools.slider.unwrap().rect().x, 448 + 528 + 96);
+    // Eight labels of 6, 8, 6, 7, 3, 3, 5 and 6 cells at 16 each, a cell
+    // between.
+    assert_eq!(tools.slider.unwrap().rect().x, 448 + 704 + 128);
+}
+
+/// The zoom: `zoom-fit` and `zoom-100` set it, `zoom-in` and `zoom-out`
+/// walk `ZOOM_STEPS` from the fit once the extent is reported, and the
+/// wheel walks them the same; the status row and the Fit and 100% buttons
+/// show it, `state` reports it with the centre, and it is develop's alone,
+/// dropped on leaving and by crop-adjust, kept across photos.
+#[test]
+fn zoom_walks_the_ladder_from_the_fit_and_the_wheel_turns_it() {
+    // The pure ladder: in to the first step past the zoom in force, out to
+    // the last short of it and past the fit, else the fit; nothing past an
+    // end.
+    let (r#in, out) = (ZoomStep::In, ZoomStep::Out);
+    assert_eq!(ui::zoom_step(None, 20, r#in), Some(25));
+    assert_eq!(ui::zoom_step(Some(25), 20, r#in), Some(50));
+    assert_eq!(ui::zoom_step(Some(50), 20, r#in), Some(100));
+    assert_eq!(ui::zoom_step(Some(100), 20, r#in), Some(100));
+    assert_eq!(ui::zoom_step(Some(100), 20, out), Some(50));
+    assert_eq!(ui::zoom_step(Some(50), 20, out), Some(25));
+    assert_eq!(ui::zoom_step(Some(25), 20, out), None);
+    assert_eq!(ui::zoom_step(None, 20, out), None);
+    // A fit between steps skips the steps under it both ways.
+    assert_eq!(ui::zoom_step(None, 40, r#in), Some(50));
+    assert_eq!(ui::zoom_step(Some(50), 40, out), None);
+    // An image the box holds whole fits at half, level 1 as it is: the
+    // one step in is 100, and out of it is the fit.
+    assert_eq!(ui::zoom_step(None, 50, r#in), Some(100));
+    assert_eq!(ui::zoom_step(Some(100), 50, out), None);
+    assert_eq!(ui::zoom_word(None), "fit");
+    assert_eq!(ui::zoom_word(Some((50, (1, 2)))), "50@1,2");
+
+    let mut c = Controller::new(surface(800, 600));
+    c.open("roll", b"/r", photos(5)).unwrap();
+    // Cull: not the mode's.
+    for name in ["zoom-fit", "zoom-100", "zoom-in", "zoom-out"] {
+        assert_eq!(act(&mut c, name, &[]), Outcome::Ignored, "{name}");
+    }
+    assert_eq!(fields(&c)[ZOOM], "fit");
+    assert_eq!(act(&mut c, "develop", &[]), Outcome::Changed);
+    assert_eq!(c.zoom(), None);
+    assert_eq!(
+        c.tool_selected(),
+        [false, false, false, false, false, false, true, false]
+    );
+    // Fitting already, the fit is `Ignored`; without the extent the
+    // ladder has no foot, so a step is too; 100% needs neither.
+    assert_eq!(act(&mut c, "zoom-fit", &[]), Outcome::Ignored);
+    assert_eq!(act(&mut c, "zoom-in", &[]), Outcome::Ignored);
+    let before = fields(&c)[GENERATION].clone();
+    assert_eq!(act(&mut c, "zoom-100", &[]), Outcome::Changed);
+    assert_ne!(fields(&c)[GENERATION], before);
+    assert_eq!(fields(&c)[ZOOM], "100@5000,5000");
+    assert_eq!(c.zoom(), Some((100, (5000, 5000))));
+    assert!(c.scene().status_line().ends_with(" | develop 100%"));
+    assert_eq!(
+        c.tool_selected(),
+        [false, false, false, false, false, false, false, true]
+    );
+    assert_eq!(act(&mut c, "zoom-100", &[]), Outcome::Ignored);
+    assert_eq!(act(&mut c, "zoom-fit", &[]), Outcome::Changed);
+    assert_eq!(fields(&c)[ZOOM], "fit");
+    assert!(c.scene().status_line().ends_with(" | develop"));
+    // The extent reported, the ladder walks from the fit: a large image
+    // fits under the first step, so in is 25, 50, 100 and no further, out
+    // back to the fit and no further. The extent is a fact: no bump.
+    let before = fields(&c)[GENERATION].clone();
+    c.set_zoom_extent(Some((60_000, 40_000)));
+    assert_eq!(fields(&c)[GENERATION], before);
+    for (name, word) in [
+        ("zoom-in", "25@5000,5000"),
+        ("zoom-in", "50@5000,5000"),
+        ("zoom-in", "100@5000,5000"),
+    ] {
+        assert_eq!(act(&mut c, name, &[]), Outcome::Changed, "{name} {word}");
+        assert_eq!(fields(&c)[ZOOM], word);
+    }
+    assert_eq!(act(&mut c, "zoom-in", &[]), Outcome::Ignored);
+    assert_eq!(key(&mut c, "]"), Outcome::Ignored);
+    for word in ["50@5000,5000", "25@5000,5000", "fit"] {
+        assert_eq!(key(&mut c, "["), Outcome::Changed, "{word}");
+        assert_eq!(fields(&c)[ZOOM], word);
+    }
+    assert_eq!(act(&mut c, "zoom-out", &[]), Outcome::Ignored);
+    // The wheel: up a step in, down a step out, one a turn whatever its
+    // size; a turn with no rows is nothing.
+    let wheel =
+        |c: &mut Controller, rows: i32| c.input(Input::Wheel { rows, columns: 0 }).unwrap().0;
+    assert_eq!(wheel(&mut c, -3), Outcome::Changed);
+    assert_eq!(fields(&c)[ZOOM], "25@5000,5000");
+    assert_eq!(wheel(&mut c, -1), Outcome::Changed);
+    assert_eq!(fields(&c)[ZOOM], "50@5000,5000");
+    assert_eq!(wheel(&mut c, 1), Outcome::Changed);
+    assert_eq!(fields(&c)[ZOOM], "25@5000,5000");
+    assert_eq!(wheel(&mut c, 0), Outcome::Ignored);
+    assert_eq!(wheel(&mut c, 2), Outcome::Changed);
+    assert_eq!(fields(&c)[ZOOM], "fit");
+    assert_eq!(wheel(&mut c, 2), Outcome::Ignored);
+    // An image the box holds whole fits at half (the fit never enlarges
+    // level 1): the one step in is 100, none further, and out is the fit.
+    c.set_zoom_extent(Some((100, 100)));
+    assert_eq!(act(&mut c, "zoom-in", &[]), Outcome::Changed);
+    assert_eq!(fields(&c)[ZOOM], "100@5000,5000");
+    assert_eq!(act(&mut c, "zoom-in", &[]), Outcome::Ignored);
+    assert_eq!(act(&mut c, "zoom-out", &[]), Outcome::Changed);
+    assert_eq!(fields(&c)[ZOOM], "fit");
+    assert_eq!(key(&mut c, "Z"), Outcome::Changed);
+    assert_eq!(fields(&c)[ZOOM], "100@5000,5000");
+    assert_eq!(key(&mut c, "["), Outcome::Changed);
+    assert_eq!(fields(&c)[ZOOM], "fit");
+    // The zoom is kept across photos; leaving develop drops it.
+    assert_eq!(key(&mut c, "Z"), Outcome::Changed);
+    assert_eq!(key(&mut c, "Right"), Outcome::Changed);
+    assert_eq!(fields(&c)[ZOOM], "100@5000,5000");
+    assert_eq!(key(&mut c, "Escape"), Outcome::Changed);
+    assert_eq!(fields(&c)[MODE], "cull");
+    assert_eq!(fields(&c)[ZOOM], "fit");
+    assert_eq!(key(&mut c, "d"), Outcome::Changed);
+    assert_eq!(fields(&c)[ZOOM], "fit");
+    // Crop-adjust drops the zoom, whose box is not its canvas, and holds
+    // the zoom actions, the wheel and the Fit and 100% buttons off while
+    // it is on (Fit not selected either); under the look palette the wheel
+    // is inert too.
+    assert_eq!(key(&mut c, "Z"), Outcome::Changed);
+    assert_eq!(act(&mut c, "adjust-crop", &[]), Outcome::Changed);
+    assert_eq!(fields(&c)[ZOOM], "fit");
+    assert_eq!(act(&mut c, "zoom-100", &[]), Outcome::Ignored);
+    assert_eq!(act(&mut c, "zoom-fit", &[]), Outcome::Ignored);
+    c.set_zoom_extent(Some((60_000, 40_000)));
+    assert_eq!(wheel(&mut c, -1), Outcome::Ignored);
+    assert_eq!(
+        c.tool_states(0),
+        [true, false, false, false, true, true, false, false]
+    );
+    assert_eq!(
+        c.tool_selected(),
+        [true, false, false, false, false, false, false, false]
+    );
+    assert_eq!(act(&mut c, "adjust-crop", &[]), Outcome::Changed);
+    assert!(c.tool_states(0)[6] && c.tool_states(0)[7]);
+    assert!(c.tool_selected()[6]);
+    c.set_looks(some_looks());
+    assert_eq!(act(&mut c, "looks", &[]), Outcome::Changed);
+    assert_eq!(wheel(&mut c, -1), Outcome::Ignored);
+    assert_eq!(fields(&c)[ZOOM], "fit");
+    assert_eq!(act(&mut c, "looks", &[]), Outcome::Changed);
+    // The Fit and 100% buttons press what the keys do.
+    let tools = c.layout().tools();
+    let button = |i: usize| tools.buttons[i].expect("a tool button").rect();
+    let click = |c: &mut Controller, r: Rect| {
+        press(
+            c,
+            (r.x + i64::from(r.width) / 2) as u32,
+            (r.y + i64::from(r.height) / 2) as u32,
+        )
+    };
+    assert_eq!(click(&mut c, button(6)), Outcome::Ignored);
+    assert_eq!(click(&mut c, button(7)), Outcome::Changed);
+    assert_eq!(fields(&c)[ZOOM], "100@5000,5000");
+    assert_eq!(click(&mut c, button(7)), Outcome::Ignored);
+    assert_eq!(click(&mut c, button(6)), Outcome::Changed);
+    assert_eq!(fields(&c)[ZOOM], "fit");
+    // A zoom during a crop drag drops the drag: the canvas it was taken
+    // against is gone, so the release is the pan's (nothing, unanchored)
+    // and the bands take the pointer again.
+    let r#box = c.develop_box().unwrap();
+    let (cx, cy) = (
+        (r#box.x + i64::from(r#box.width) / 2) as u32,
+        (r#box.y + i64::from(r#box.height) / 2) as u32,
+    );
+    assert_eq!(press(&mut c, cx, cy), Outcome::Ignored);
+    assert_eq!(drag_to(&mut c, cx + 30, cy + 20), Outcome::Changed);
+    assert!(c.crop_drag().is_some());
+    assert_eq!(key(&mut c, "Z"), Outcome::Changed);
+    assert!(c.crop_drag().is_none());
+    assert_eq!(release(&mut c, cx + 30, cy + 20).0, Outcome::Ignored);
+    assert_eq!(click(&mut c, button(6)), Outcome::Changed);
+    assert_eq!(fields(&c)[ZOOM], "fit");
+    // The bindings and the hints: the four chords are the actions'.
+    assert_eq!(
+        driven::bound(&BINDINGS, "f").map(|b| b.name),
+        Some("zoom-fit")
+    );
+    assert_eq!(
+        driven::bound(&BINDINGS, "Z").map(|b| b.name),
+        Some("zoom-100")
+    );
+    assert_eq!(
+        driven::bound(&BINDINGS, "]").map(|b| b.name),
+        Some("zoom-in")
+    );
+    assert_eq!(
+        driven::bound(&BINDINGS, "[").map(|b| b.name),
+        Some("zoom-out")
+    );
+}
+
+/// The pan over the zoomed box: a press in the box anchors it, a move
+/// shifts the held image (frame changes, `pan_shift`), and the release
+/// moves the centre against the travel at the zoom's photosites a pixel,
+/// clamped so the window stays inside the image; no crop drag starts
+/// while zoomed.
+#[test]
+fn a_pan_over_the_zoomed_box_moves_the_centre_against_the_travel() {
+    let mut c = Controller::new(surface(800, 600));
+    c.open("roll", b"/r", photos(5)).unwrap();
+    assert_eq!(act(&mut c, "develop", &[]), Outcome::Changed);
+    let r#box = c.develop_box().unwrap();
+    let (cx, cy) = (
+        (r#box.x + i64::from(r#box.width) / 2) as u32,
+        (r#box.y + i64::from(r#box.height) / 2) as u32,
+    );
+    // Fitting, a press in the box is the crop marquee's.
+    assert_eq!(press(&mut c, cx, cy), Outcome::Ignored);
+    assert!(c.crop_drag().is_some());
+    assert_eq!(drag_to(&mut c, cx + 20, cy + 20), Outcome::Changed);
+    assert_eq!(release(&mut c, cx, cy).0, Outcome::Changed);
+    assert!(c.crop_drag().is_none());
+    // Zoomed to 100 over a 6000 by 4000 image: a pixel is a photosite,
+    // so sixty pixels right and forty up are a hundredth of each axis.
+    c.set_zoom_extent(Some((6000, 4000)));
+    assert_eq!(act(&mut c, "zoom-100", &[]), Outcome::Changed);
+    assert_eq!(c.pan_shift(), (0, 0));
+    assert_eq!(press(&mut c, cx, cy), Outcome::Ignored);
+    assert!(c.crop_drag().is_none());
+    let before = fields(&c)[GENERATION].clone();
+    assert_eq!(drag_to(&mut c, cx + 60, cy - 40), Outcome::Changed);
+    assert_ne!(fields(&c)[GENERATION], before);
+    assert_eq!(c.pan_shift(), (60, -40));
+    assert_eq!(drag_to(&mut c, cx + 60, cy - 40), Outcome::Ignored);
+    // The release ends the shift and moves the centre the other way.
+    assert_eq!(release(&mut c, cx + 60, cy - 40).0, Outcome::Changed);
+    assert_eq!(c.pan_shift(), (0, 0));
+    assert_eq!(fields(&c)[ZOOM], "100@4900,5100");
+    // A click moves nothing; a move or release with no press is nothing;
+    // a press off the box starts nothing.
+    assert_eq!(press(&mut c, cx, cy), Outcome::Ignored);
+    assert_eq!(release(&mut c, cx, cy).0, Outcome::Ignored);
+    assert_eq!(fields(&c)[ZOOM], "100@4900,5100");
+    assert_eq!(drag_to(&mut c, cx + 5, cy), Outcome::Ignored);
+    assert_eq!(release(&mut c, cx + 5, cy).0, Outcome::Ignored);
+    assert_eq!(press(&mut c, 100, 300), Outcome::Ignored);
+    assert_eq!(drag_to(&mut c, 130, 330), Outcome::Ignored);
+    assert_eq!(c.pan_shift(), (0, 0));
+    // The release point ends the gesture as a move to it would, and the
+    // centre is clamped so the window stays inside the image: half the
+    // box, as photosites, from either edge.
+    assert_eq!(press(&mut c, cx, cy), Outcome::Ignored);
+    assert_eq!(
+        release(&mut c, cx + 100_000, cy + 100_000).0,
+        Outcome::Changed
+    );
+    let margin = |px: u32, extent: u64| u32::try_from(u64::from(px) * 5000 / extent).unwrap();
+    let (mx, my) = (margin(r#box.width, 6000), margin(r#box.height, 4000));
+    assert_eq!(c.zoom(), Some((100, (mx, my))));
+    // Leftward pans (the pointer cannot leave the surface's origin) walk
+    // the centre to the far edge, where it stops.
+    for _ in 0..40 {
+        assert_eq!(press(&mut c, cx, cy), Outcome::Ignored);
+        assert_eq!(release(&mut c, 0, cy).0, Outcome::Changed);
+    }
+    assert_eq!(c.zoom(), Some((100, (10_000 - mx, my))));
+    // Zooming out keeps the centre, held inside the wider window; a
+    // resize, a photo change or leaving develop drops a pan in progress.
+    assert_eq!(act(&mut c, "zoom-out", &[]), Outcome::Changed);
+    let (mx, my) = (margin(r#box.width, 3000), margin(r#box.height, 2000));
+    assert_eq!(c.zoom(), Some((50, (10_000 - mx, my))));
+    assert_eq!(press(&mut c, cx, cy), Outcome::Ignored);
+    assert_eq!(drag_to(&mut c, cx + 10, cy), Outcome::Changed);
+    assert_eq!(key(&mut c, "Right"), Outcome::Changed);
+    assert_eq!(c.pan_shift(), (0, 0));
+    assert_eq!(release(&mut c, cx + 10, cy).0, Outcome::Ignored);
+    assert_eq!(c.zoom(), Some((50, (10_000 - mx, my))));
+    // A pan with the extent unknown (the photo's develop not yet landed)
+    // shifts the frame but moves nothing.
+    c.set_zoom_extent(None);
+    assert_eq!(press(&mut c, cx, cy), Outcome::Ignored);
+    assert_eq!(drag_to(&mut c, cx + 10, cy), Outcome::Changed);
+    assert_eq!(release(&mut c, cx + 10, cy).0, Outcome::Changed);
+    assert_eq!(c.zoom(), Some((50, (10_000 - mx, my))));
+    // The clamp rule itself: half the window from either edge, the middle
+    // where the window covers the axis.
+    assert_eq!(
+        ui::clamped_centre((0, 0), 100, (6000, 4000), 600, 400),
+        (500, 500)
+    );
+    assert_eq!(
+        ui::clamped_centre((10_000, 10_000), 50, (6000, 4000), 600, 400),
+        (9000, 9000)
+    );
+    assert_eq!(
+        ui::clamped_centre((100, 9900), 100, (100, 100), 600, 400),
+        (5000, 5000)
+    );
+    // A reported extent the centre lies outside the window's room in (a
+    // photo switch, the zoom kept) holds the centre inside it, a
+    // normalization without a bump, and a resize does the same.
+    let before = fields(&c)[GENERATION].clone();
+    c.set_zoom_extent(Some((600, 400)));
+    assert_eq!(fields(&c)[GENERATION], before);
+    assert_eq!(c.zoom(), Some((50, (5000, 5000))));
+    c.set_zoom_extent(Some((6000, 4000)));
+    assert_eq!(c.zoom(), Some((50, (5000, 5000))));
+    assert_eq!(press(&mut c, cx, cy), Outcome::Ignored);
+    assert_eq!(release(&mut c, 0, cy).0, Outcome::Changed);
+    let (mx, my) = (margin(r#box.width, 3000), margin(r#box.height, 2000));
+    assert!(c.zoom().unwrap().1 .0 > 5000);
+    assert_eq!(
+        c.input(Input::Resize {
+            width: 400,
+            height: 300,
+            scale: 1
+        })
+        .unwrap()
+        .0,
+        Outcome::Changed
+    );
+    let small = c.develop_box().unwrap();
+    let (sx, sy) = (margin(small.width, 3000), margin(small.height, 2000));
+    assert!(sx < mx && sy < my);
+    let (x, y) = c.zoom().unwrap().1;
+    assert!(x <= 10_000 - sx && y >= sy, "{x} {y}");
+    assert_eq!(
+        c.input(Input::Resize {
+            width: 800,
+            height: 600,
+            scale: 1
+        })
+        .unwrap()
+        .0,
+        Outcome::Changed
+    );
+    // The centre is kept across photos and zooms, and is the middle again
+    // once develop is left.
+    let kept = c.zoom().unwrap().1;
+    assert_eq!(key(&mut c, "Z"), Outcome::Changed);
+    assert_eq!(c.zoom(), Some((100, kept)));
+    assert_eq!(key(&mut c, "Right"), Outcome::Changed);
+    assert_eq!(c.zoom(), Some((100, kept)));
+    assert_eq!(key(&mut c, "Escape"), Outcome::Changed);
+    assert_eq!(key(&mut c, "d"), Outcome::Changed);
+    assert_eq!(key(&mut c, "Z"), Outcome::Changed);
+    assert_eq!(c.zoom(), Some((100, (5000, 5000))));
 }
 
 /// The exposure slider: the knob at the sidecar's exposure, a press and
@@ -6305,14 +6668,14 @@ fn the_filmstrip_shows_the_shown_photos_under_the_preview() {
         [(0, lifted(0)), (1, lifted(1)), (2, lifted(2))]
     );
     // A region narrower than a box and its cells lays no band: the view
-    // keeps the foot (under the tool band's three rows here, the buttons
+    // keeps the foot (under the tool band's four rows here, the buttons
     // wrapping on 175). A cell wider, and it holds its one box.
     let mut narrow = Controller::new(surface(216 + 175, 600));
     narrow.open("roll", b"/r", photos(5)).unwrap();
     assert_eq!(act(&mut narrow, "develop", &[]), Outcome::Changed);
     assert_eq!(narrow.layout().film_band(), None);
-    assert_eq!(narrow.layout().tool_band().height, 72);
-    assert_eq!(narrow.layout().develop_view().height, 432);
+    assert_eq!(narrow.layout().tool_band().height, 96);
+    assert_eq!(narrow.layout().develop_view().height, 408);
     assert!(narrow.film().is_empty() && narrow.wanted().is_empty());
     let mut one = Controller::new(surface(216 + 176, 600));
     one.open("roll", b"/r", photos(5)).unwrap();
@@ -6789,7 +7152,10 @@ fn alt_held_shows_each_buttons_chord_under_its_caption() {
             .collect::<String>()
     };
     let tools = layout.tools();
-    assert_eq!(tools.buttons.map(under), ["c", "C", "z", "0", "-", "="]);
+    assert_eq!(
+        tools.buttons.map(under),
+        ["c", "C", "z", "0", "-", "=", "f", "Z"]
+    );
     let looks: Vec<String> = layout
         .look_buttons(&some_looks())
         .into_iter()

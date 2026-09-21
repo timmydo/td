@@ -744,6 +744,50 @@ fn the_window_develops_the_cursor_photo_over_the_native_compositor() {
         "the developed frame after the exposure"
     );
 
+    // A zoom to 100% over the socket re-develops the box from level 0: the
+    // frame is `--preview --develop --zoom` of the roll (the 64x48 frame a
+    // photosite a pixel, where the fit showed level 1's 32x24), and back
+    // to the fit it is the fitted frame again.
+    assert_eq!(
+        client.request(8, &["action", "zoom-100"]),
+        ["ok", "changed"]
+    );
+    client.settle(9);
+    let state = client.request(10, &["state"]);
+    assert_eq!(
+        state.last().map(String::as_str),
+        Some("100@5000,5000"),
+        "{state:?}"
+    );
+    let zoomed = super::preview_develop_args(
+        &client_directory,
+        place.width,
+        place.height,
+        &roll,
+        0,
+        &["--zoom"],
+    );
+    assert_ne!(
+        super::box_pixels(&brighter, place.width, r#box),
+        super::box_pixels(&zoomed, place.width, r#box),
+        "the zoom did not reach the developed pixels"
+    );
+    assert_eq!(
+        compositor.tile(&place),
+        zoomed,
+        "the developed frame at 100%"
+    );
+    assert_eq!(
+        client.request(11, &["action", "zoom-fit"]),
+        ["ok", "changed"]
+    );
+    client.settle(12);
+    assert_eq!(
+        compositor.tile(&place),
+        brighter,
+        "the developed frame fitted again"
+    );
+
     // A look the sidecar names but no file provides makes the develop for the
     // same photo fail: the box is redrawn to the neutral placeholder, not left
     // showing the last exposure's pixels, and `wait-idle` still settles.

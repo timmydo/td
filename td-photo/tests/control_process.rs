@@ -86,12 +86,25 @@ fn preview_develop(
     roll: &Path,
     position: usize,
 ) -> Vec<u8> {
+    preview_develop_args(dir, width, height, roll, position, &[])
+}
+
+/// `preview_develop` with `extra` arguments after `--develop POSITION`.
+fn preview_develop_args(
+    dir: &Directory,
+    width: usize,
+    height: usize,
+    roll: &Path,
+    position: usize,
+    extra: &[&str],
+) -> Vec<u8> {
     let output = Command::new(env!("CARGO_BIN_EXE_td-photo"))
         .arg("--preview")
         .arg(format!("{width}x{height}"))
         .arg(roll)
         .arg("--develop")
         .arg(position.to_string())
+        .args(extra)
         .env_clear()
         .env("XDG_CACHE_HOME", dir.0.join("cache"))
         .output()
@@ -226,6 +239,71 @@ fn preview_develop_reflects_the_crop() {
         box_pixels(&cropped, 800, r#box),
         "the crop did not reach the developed pixels"
     );
+}
+
+#[test]
+fn preview_develop_zooms_the_box_to_the_centre_at_100() {
+    // A 1600x1200 NEF, dark but for a bright square at its centre: the
+    // fit view shrinks the square with the frame, while `--zoom` shows the
+    // box's window of the photosites around the centre at 100%, where the
+    // square is its own size, so its pixels in the box multiply by the
+    // square of the fit's reduction (about a fifth on an 800x600 surface,
+    // whose box the built-in looks' rows shorten), and a fit that never
+    // enlarges tells the two apart. The square renders near white with a
+    // magenta cast, which the box's placeholder and the chrome, warmer
+    // and darker in blue, do not reach.
+    let dir = Directory::new();
+    let roll = dir.0.join("roll");
+    std::fs::create_dir(&roll).unwrap();
+    let (w, h) = (1600usize, 1200usize);
+    let samples: Vec<u16> = (0..w * h)
+        .map(|i| {
+            let (x, y) = (i % w, i / w);
+            if (750..850).contains(&x) && (550..650).contains(&y) {
+                12_000
+            } else {
+                1100
+            }
+        })
+        .collect();
+    std::fs::write(
+        roll.join("DSC_0001.NEF"),
+        synth_nef::uncompressed_nef(w, h, &samples),
+    )
+    .unwrap();
+    let layout = binary_layout(800, 600);
+    let r#box = layout
+        .develop_box()
+        .expect("a develop box on an 800x600 surface");
+    let bright = |pixels: &[u8]| {
+        let region = box_pixels(pixels, 800, r#box);
+        let (chunks, _) = region.as_chunks::<3>();
+        chunks
+            .iter()
+            .filter(|px| px[0] > 240 && px[2] > 240)
+            .count()
+    };
+    let fit = preview_develop(&dir, 800, 600, &roll, 0);
+    let zoomed = preview_develop_args(&dir, 800, 600, &roll, 0, &["--zoom"]);
+    assert!(varies(&fit, 800, r#box) && varies(&zoomed, 800, r#box));
+    let (at_fit, at_100) = (bright(&fit), bright(&zoomed));
+    assert!(at_fit > 0, "no bright square at the fit");
+    assert!(
+        at_100 > at_fit * 8,
+        "the square is {at_fit} bright pixels at the fit and {at_100} at 100%"
+    );
+    // The square is a hundred pixels on a side at 100%.
+    assert!((9_000..=11_000).contains(&at_100), "{at_100}");
+    // `--zoom` needs `--develop` before it.
+    let refused = Command::new(env!("CARGO_BIN_EXE_td-photo"))
+        .args(["--preview", "800x600"])
+        .arg(&roll)
+        .arg("--zoom")
+        .env_clear()
+        .output()
+        .unwrap();
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("--zoom needs --develop"));
 }
 
 /// A flat baseline JPEG of one colour, `width` by `height`, through the

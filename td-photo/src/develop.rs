@@ -761,6 +761,214 @@ fn subimage(rgb: &[u16], w: usize, x0: usize, y0: usize, cw: usize, ch: usize) -
     Some(out)
 }
 
+/// The zoom steps a view walks, in percent of full resolution: a full
+/// resolution pixel is `zoom / 100` canvas pixels. Through `HALF_ZOOM` a
+/// zoom is made from level 1 (the superpixel demosaic is half resolution);
+/// past it from level 0, bilinearly demosaiced in the window alone.
+pub const ZOOM_STEPS: [u32; 3] = [25, 50, 100];
+pub const HALF_ZOOM: u32 = 50;
+/// The unit a zoom's centre is given in: ten-thousandths of the oriented,
+/// cropped image, as a crop's fractions are.
+pub const CENTRE_UNIT: u32 = 10_000;
+
+/// A zoomed view as asked for: the zoom in percent of full resolution,
+/// its centre in `CENTRE_UNIT`s of the oriented, cropped image, and the
+/// box it fills.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Zoom {
+    pub percent: u32,
+    pub centre: (u32, u32),
+    pub box_w: usize,
+    pub box_h: usize,
+}
+
+/// A zoomed view's geometry over level 1: the window of the level shown,
+/// in the level's own (unoriented) coordinates, the window's size on the
+/// canvas before the orientation (the box, or less where the crop cuts
+/// the window short), and the zoom it is at.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Viewport {
+    pub x0: usize,
+    pub y0: usize,
+    pub width: usize,
+    pub height: usize,
+    pub target: (usize, usize),
+    pub zoom: u32,
+}
+
+/// The oriented, cropped image's extent at full resolution (two photosites
+/// a level-1 pixel on each axis) for a `w1` by `h1` level 1: what a zoom
+/// is a percentage of and its centre a fraction of. `None` for a
+/// degenerate crop or level.
+pub fn extent(
+    w1: usize,
+    h1: usize,
+    crop: Option<[f32; 4]>,
+    orientation: u16,
+) -> Option<(usize, usize)> {
+    if !pixels_ok(w1, h1) {
+        return None;
+    }
+    let (_, _, ccw, cch) = match crop {
+        None => (0, 0, w1, h1),
+        Some(fractions) => source_rect(fractions, w1, h1, orientation)?,
+    };
+    let (ocw, och) = if matches!(orientation, 6 | 8) {
+        (cch, ccw)
+    } else {
+        (ccw, cch)
+    };
+    Some((ocw.checked_mul(2)?, och.checked_mul(2)?))
+}
+
+/// The zoom, in percent, the fit shows the extent at in a `box_w` by
+/// `box_h` box: the lesser axis ratio, floored, at least 1 and at most
+/// `HALF_ZOOM`, since the fit never enlarges level 1, which is half
+/// resolution. What the zoom ladder steps from and back to.
+pub fn fit_zoom(extent: (usize, usize), box_w: usize, box_h: usize) -> u32 {
+    let ratio = |px: usize, full: usize| {
+        u32::try_from(px.saturating_mul(100) / full.max(1)).unwrap_or(u32::MAX)
+    };
+    ratio(box_w, extent.0)
+        .min(ratio(box_h, extent.1))
+        .clamp(1, HALF_ZOOM)
+}
+
+/// The window of a `w1` by `h1` level 1 the zoom's box shows at its
+/// percent of full resolution, centred as near its centre (past the unit
+/// clamped) as the crop's edges allow: the crop's oriented rectangle (the
+/// whole level with none), a window of it `box / (2 * zoom / 100)`
+/// level-1 pixels on each axis, rounded up and cut to the crop, moved
+/// inside it, then mapped back through the orientation as the crop is;
+/// its target is the window at `2 * zoom / 100`, rounded, and no more
+/// than the box (the rounding up can overshoot it by a pixel, which the
+/// zoomed level 2 leaves out rather than resamples away), so at
+/// `HALF_ZOOM` level 1 is shown as it is. A zoom of zero or past the last
+/// `ZOOM_STEPS`, an empty box, a degenerate crop or a bad level is
+/// refused.
+pub fn viewport(
+    w1: usize,
+    h1: usize,
+    crop: Option<[f32; 4]>,
+    orientation: u16,
+    zoom: Zoom,
+) -> Result<Viewport, Error> {
+    let Zoom {
+        percent: zoom,
+        centre,
+        box_w,
+        box_h,
+    } = zoom;
+    let last = ZOOM_STEPS.last().copied().unwrap_or(HALF_ZOOM);
+    if !pixels_ok(w1, h1) || zoom == 0 || zoom > last || box_w == 0 || box_h == 0 {
+        return Err(Error::Size);
+    }
+    let (cx0, cy0, ccw, cch) = match crop {
+        None => (0, 0, w1, h1),
+        Some(fractions) => source_rect(fractions, w1, h1, orientation).ok_or(Error::Crop)?,
+    };
+    // The crop's oriented axes.
+    let turned = matches!(orientation, 6 | 8);
+    let (ocw, och) = if turned { (cch, ccw) } else { (ccw, cch) };
+    let zoom_px = zoom as usize;
+    // The window, in oriented level-1 pixels: what the box holds at this
+    // zoom, cut to the crop.
+    let span = |px: usize, extent: usize| {
+        px.saturating_mul(100)
+            .div_ceil(2 * zoom_px)
+            .clamp(1, extent.max(1))
+    };
+    let (vw, vh) = (span(box_w, ocw), span(box_h, och));
+    let at = |fraction: u32, extent: usize, window: usize| {
+        let unit = CENTRE_UNIT as usize;
+        let centre = (fraction.min(CENTRE_UNIT) as usize).saturating_mul(extent) / unit;
+        centre
+            .saturating_sub(window / 2)
+            .min(extent.saturating_sub(window))
+    };
+    let (vx0, vy0) = (at(centre.0, ocw, vw), at(centre.1, och, vh));
+    // Back through the orientation to level 1, the inverse `source_rect`
+    // applies, then into the level from the crop's origin.
+    let (x0, y0, width, height) = match orientation {
+        3 => (ccw - vx0 - vw, cch - vy0 - vh, vw, vh),
+        6 => (vy0, cch - vx0 - vw, vh, vw),
+        8 => (ccw - vy0 - vh, vx0, vh, vw),
+        _ => (vx0, vy0, vw, vh),
+    };
+    let scale = |px: usize| (px.saturating_mul(2 * zoom_px).saturating_add(50) / 100).max(1);
+    // The target follows the window's axes, which the orientation swaps
+    // back to the box's.
+    let (box_x, box_y) = if turned {
+        (box_h, box_w)
+    } else {
+        (box_w, box_h)
+    };
+    Ok(Viewport {
+        x0: cx0 + x0,
+        y0: cy0 + y0,
+        width,
+        height,
+        target: (scale(width).min(box_x), scale(height).min(box_y)),
+        zoom,
+    })
+}
+
+/// Level 1 to a zoomed level 2: the viewport's window of the level
+/// resampled to its target and oriented. For zooms through `HALF_ZOOM`,
+/// where level 1 has every pixel the canvas shows.
+pub fn zoom_level2(
+    level1: &Level1,
+    view: Viewport,
+    orientation: u16,
+    threads: usize,
+) -> Result<Level2, Error> {
+    let (w, h) = (level1.width, level1.height);
+    if !pixels_ok(w, h) || level1.rgb.len() != w * h * 3 {
+        return Err(Error::Size);
+    }
+    let region =
+        subimage(&level1.rgb, w, view.x0, view.y0, view.width, view.height).ok_or(Error::Crop)?;
+    let (tw, th) = view.target;
+    let canvas = resample_u16(&region, view.width, view.height, tw, th, threads)?;
+    Ok(orient_level2(canvas, tw, th, orientation))
+}
+
+/// Level 0 to a zoomed level 2 at full resolution: the viewport's window
+/// doubled onto the sensor crop (level 1 is one pixel a quad), cut to the
+/// photosites the target shows at the zoom (`target * 100 / zoom`, so at
+/// 100 the region is the target and every photosite is a pixel),
+/// demosaiced bilinearly, resampled to the target and oriented. For zooms
+/// past `HALF_ZOOM`, where level 1 has fewer pixels than the canvas shows.
+pub fn zoom_level2_full(
+    source: &Source<'_>,
+    view: Viewport,
+    orientation: u16,
+    threads: usize,
+) -> Result<Level2, Error> {
+    let zoom = (view.zoom as usize).max(1);
+    let shown = |target: usize, window: usize| {
+        (target.saturating_mul(100) / zoom).clamp(1, window.saturating_mul(2))
+    };
+    let region = Region {
+        left: view.x0.saturating_mul(2),
+        top: view.y0.saturating_mul(2),
+        width: shown(view.target.0, view.width),
+        height: shown(view.target.1, view.height),
+    };
+    let level1 = bilinear(source, region, threads)?;
+    let (tw, th) = view.target;
+    let canvas = resample_u16(&level1.rgb, level1.width, level1.height, tw, th, threads)?;
+    Ok(orient_level2(canvas, tw, th, orientation))
+}
+
+fn orient_level2(canvas: Vec<f32>, w: usize, h: usize, orientation: u16) -> Level2 {
+    let (rgb, width, height) = match oriented3(&canvas, w, h, orientation) {
+        Some(turned) => turned,
+        None => (canvas, w, h),
+    };
+    Level2 { width, height, rgb }
+}
+
 /// Level 1 to level 2: the user crop's region of the `u16` level (the whole
 /// frame when there is none) resampled to the canvas that fits `long_edge`
 /// on the long side, then oriented. The crop is `x y w h` fractions of the
@@ -792,11 +1000,7 @@ pub fn level2(
             (dw, dh, resample_u16(&region, cw, ch, dw, dh, threads)?)
         }
     };
-    let (rgb, width, height) = match oriented3(&canvas, sw, sh, orientation) {
-        Some(turned) => turned,
-        None => (canvas, sw, sh),
-    };
-    Ok(Level2 { width, height, rgb })
+    Ok(orient_level2(canvas, sw, sh, orientation))
 }
 
 /// Level 2 to level 3: per pixel white balance and clip at the camera

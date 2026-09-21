@@ -16,12 +16,23 @@ use td_photo::color::{
     self, apply, camera_color, invert, multiply, srgb_encode, Transfer, MIDDLE_GREY,
 };
 use td_photo::develop::{
-    self, bilinear, export_band, export_geometry, fit, level2, level3, orient, resample,
-    resample_u16, superpixel, Export, Level1, Level2, Params, Region, Source,
+    self, bilinear, export_band, export_geometry, extent, fit, fit_zoom, level2, level3, orient,
+    resample, resample_u16, superpixel, viewport, zoom_level2, zoom_level2_full, Export, Level1,
+    Level2, Params, Region, Source, Viewport, Zoom, CENTRE_UNIT, HALF_ZOOM, ZOOM_STEPS,
 };
 use td_photo::image::Rgb8;
 use td_photo::look::Look;
 use td_photo::nef::{Cfa, Crop, Decoded};
+
+/// A zoom request, for the viewport tests.
+fn zoom(percent: u32, centre: (u32, u32), box_w: usize, box_h: usize) -> Zoom {
+    Zoom {
+        percent,
+        centre,
+        box_w,
+        box_h,
+    }
+}
 
 fn close(a: f32, b: f32, tolerance: f32) -> bool {
     (a - b).abs() <= tolerance
@@ -1406,4 +1417,286 @@ fn export_bands_concatenate_to_the_whole_at_every_orientation() {
     let upright = whole(None, 1);
     assert!(upright.data.iter().any(|&v| v > 0));
     assert_ne!(upright.pixel(0, 0), upright.pixel(11, 7));
+}
+
+#[test]
+fn the_extent_and_the_fit_zoom_follow_the_crop_and_the_orientation() {
+    // The extent is the oriented crop at full resolution: two photosites a
+    // level-1 pixel; the fit zoom is the lesser axis ratio, floored, and
+    // half at most, since the fit never enlarges the half-resolution level
+    // 1 however large the box.
+    assert_eq!(extent(8, 6, None, 1), Some((16, 12)));
+    assert_eq!(extent(8, 6, None, 3), Some((16, 12)));
+    assert_eq!(extent(8, 6, None, 6), Some((12, 16)));
+    assert_eq!(extent(8, 6, Some([0.25, 0.5, 0.5, 0.5]), 1), Some((8, 6)));
+    assert_eq!(extent(8, 6, Some([0.25, 0.5, 0.5, 0.5]), 8), Some((6, 8)));
+    assert_eq!(extent(8, 6, Some([1.0, 0.0, 0.5, 0.5]), 1), None);
+    assert_eq!(extent(0, 6, None, 1), None);
+    assert_eq!(fit_zoom((16, 12), 8, 6), 50);
+    assert_eq!(fit_zoom((16, 12), 16, 12), 50);
+    assert_eq!(fit_zoom((16, 12), 32, 12), 50);
+    assert_eq!(fit_zoom((16, 12), 4, 4), 25);
+    assert_eq!(fit_zoom((16, 12), 5, 6), 31);
+    assert_eq!(fit_zoom((1000, 1000), 1, 1), 1);
+    assert_eq!(fit_zoom((0, 0), 1, 1), 50);
+    assert_eq!(ZOOM_STEPS, [25, HALF_ZOOM, 100]);
+}
+
+#[test]
+fn a_viewport_holds_the_box_at_the_zoom_centred_and_clamped_to_the_crop() {
+    let view =
+        |percent, centre, bw, bh| viewport(8, 6, None, 1, zoom(percent, centre, bw, bh)).unwrap();
+    // At half zoom level 1 is shown as it is: a 4x2 box is a 4x2 window
+    // centred on the middle of the level, targeted at its own size.
+    let middle = (CENTRE_UNIT / 2, CENTRE_UNIT / 2);
+    assert_eq!(
+        view(HALF_ZOOM, middle, 4, 2),
+        Viewport {
+            x0: 2,
+            y0: 2,
+            width: 4,
+            height: 2,
+            target: (4, 2),
+            zoom: HALF_ZOOM,
+        }
+    );
+    // At 100 the box holds half as many level-1 pixels, shown at twice
+    // their size; at 25 twice as many, at half. The window is rounded up
+    // and cut to the level, so a box wider than the level at the zoom
+    // shows the whole axis; the target is never more than the box, so an
+    // odd box at 100 has its odd size, not the rounded-up window's.
+    assert_eq!(
+        view(100, middle, 4, 2),
+        Viewport {
+            x0: 3,
+            y0: 3,
+            width: 2,
+            height: 1,
+            target: (4, 2),
+            zoom: 100,
+        }
+    );
+    assert_eq!(
+        view(25, middle, 4, 2),
+        Viewport {
+            x0: 0,
+            y0: 1,
+            width: 8,
+            height: 4,
+            target: (4, 2),
+            zoom: 25,
+        }
+    );
+    assert_eq!(view(100, middle, 5, 3).target, (5, 3));
+    // At 25 the level's whole width (8, at half) is under the 5 box.
+    assert_eq!(view(25, middle, 5, 3).target, (4, 3));
+    assert_eq!(view(25, middle, 3, 3).target, (3, 3));
+    assert_eq!(view(25, middle, 40, 30), view(25, middle, 16, 12));
+    // Turned, the target follows the window's axes, cut by the box's.
+    let turned = viewport(8, 6, None, 6, zoom(100, middle, 3, 5)).unwrap();
+    assert_eq!((turned.width, turned.height), (3, 2));
+    assert_eq!(turned.target, (5, 3));
+    // The centre is moved inside the level, and past the unit clamped.
+    assert_eq!(
+        (
+            view(HALF_ZOOM, (0, 0), 4, 2).x0,
+            view(HALF_ZOOM, (0, 0), 4, 2).y0
+        ),
+        (0, 0)
+    );
+    let far = view(HALF_ZOOM, (CENTRE_UNIT, CENTRE_UNIT), 4, 2);
+    assert_eq!((far.x0, far.y0), (4, 4));
+    assert_eq!(
+        view(HALF_ZOOM, (CENTRE_UNIT * 3, CENTRE_UNIT * 3), 4, 2),
+        far
+    );
+    assert_eq!(view(HALF_ZOOM, (CENTRE_UNIT / 4, 0), 4, 2).x0, 0);
+    assert_eq!(view(HALF_ZOOM, (CENTRE_UNIT * 3 / 8, 0), 4, 2).x0, 1);
+    // A crop bounds the window as the level does, from the crop's origin.
+    let cropped = viewport(
+        8,
+        6,
+        Some([0.25, 0.5, 0.5, 0.5]),
+        1,
+        zoom(HALF_ZOOM, (0, 0), 40, 40),
+    );
+    assert_eq!(
+        cropped.unwrap(),
+        Viewport {
+            x0: 2,
+            y0: 3,
+            width: 4,
+            height: 3,
+            target: (4, 3),
+            zoom: HALF_ZOOM,
+        }
+    );
+    // Refused: a zoom of zero or past the ladder, an empty box, a
+    // degenerate crop or a bad level.
+    for bad in [
+        viewport(8, 6, None, 1, zoom(0, middle, 4, 2)),
+        viewport(8, 6, None, 1, zoom(101, middle, 4, 2)),
+        viewport(8, 6, None, 1, zoom(HALF_ZOOM, middle, 0, 2)),
+        viewport(8, 6, None, 1, zoom(HALF_ZOOM, middle, 4, 0)),
+        viewport(0, 6, None, 1, zoom(HALF_ZOOM, middle, 4, 2)),
+    ] {
+        assert_eq!(bad.unwrap_err(), develop::Error::Size);
+    }
+    assert_eq!(
+        viewport(
+            8,
+            6,
+            Some([1.0, 0.0, 0.5, 0.5]),
+            1,
+            zoom(HALF_ZOOM, middle, 4, 2)
+        )
+        .unwrap_err(),
+        develop::Error::Crop
+    );
+}
+
+#[test]
+fn a_zoomed_level2_is_that_window_of_the_whole_at_every_orientation() {
+    // At half zoom the window is level 1 as it is, so the zoomed level 2
+    // must equal the same rectangle cut from the whole frame's level 2 at
+    // a long edge past it (nothing resampled), after the orientation:
+    // this pins the viewport's inverse mapping against the orient it
+    // inverts, for the whole level and for a crop, and the window in the
+    // oriented image is where the centre says.
+    let (w, h) = (8usize, 6usize);
+    let mut pixels = Vec::new();
+    for y in 0..h {
+        for x in 0..w {
+            pixels.push([
+                0.1 + 0.02 * x as f32 + 0.13 * y as f32,
+                0.5 - 0.01 * x as f32,
+                0.03 * y as f32,
+            ]);
+        }
+    }
+    let level1 = level1_of(&pixels, w, h);
+    for crop in [None, Some([0.25f32, 0.5, 0.5, 0.5])] {
+        for orientation in [1u16, 3, 6, 8] {
+            let whole = level2(&level1, crop, 100, orientation, 2).unwrap();
+            // A box of 3x2 at the far corner: the window ends at the
+            // oriented crop's far edges, where every arm's arithmetic shows.
+            let (bw, bh) = (3usize, 2usize);
+            let far = (CENTRE_UNIT, CENTRE_UNIT);
+            let view = viewport(w, h, crop, orientation, zoom(HALF_ZOOM, far, bw, bh)).unwrap();
+            let zoomed = zoom_level2(&level1, view, orientation, 3).unwrap();
+            let (vw, vh) = (bw.min(whole.width), bh.min(whole.height));
+            assert_eq!(
+                (zoomed.width, zoomed.height),
+                (vw, vh),
+                "{crop:?} {orientation}"
+            );
+            let (ox, oy) = (whole.width - vw, whole.height - vh);
+            let mut want = Vec::with_capacity(vw * vh * 3);
+            for row in oy..oy + vh {
+                let start = (row * whole.width + ox) * 3;
+                want.extend_from_slice(&whole.rgb[start..start + vw * 3]);
+            }
+            assert_eq!(zoomed.rgb, want, "{crop:?} orientation {orientation}");
+        }
+    }
+    // A level whose buffer is not its size, or a window past it, is refused.
+    let short = Level1 {
+        width: 8,
+        height: 6,
+        rgb: vec![0; 10],
+    };
+    let view = viewport(8, 6, None, 1, zoom(HALF_ZOOM, (0, 0), 4, 2)).unwrap();
+    assert_eq!(
+        zoom_level2(&short, view, 1, 1).unwrap_err(),
+        develop::Error::Size
+    );
+    let past = Viewport { x0: 6, ..view };
+    assert_eq!(
+        zoom_level2(&level1, past, 1, 1).unwrap_err(),
+        develop::Error::Crop
+    );
+}
+
+#[test]
+fn a_zoom_past_half_reads_the_photosites_through_the_bilinear_demosaic() {
+    // At 100 the window is doubled onto the sensor crop and demosaiced
+    // bilinearly: the level 2 is that region's bilinear level 1 as f32,
+    // oriented, since the target is the region's own size. The frame
+    // varies so the region's place shows.
+    let (w, h) = (12usize, 10usize);
+    let samples: Vec<u16> = (0..w * h)
+        .map(|i| ((i as u32 * 7919 + 13) % 2000) as u16)
+        .collect();
+    let decoded = frame(w, h, samples);
+    let source = Source {
+        decoded: &decoded,
+        cfa: Cfa::RGGB,
+        crop: full(w, h),
+        black: 10,
+        white: 2010,
+    };
+    // Level 1 is 6x5; a 4x2 box at 100 is a 2x1 window of it, centred.
+    let view = viewport(
+        6,
+        5,
+        None,
+        1,
+        zoom(100, (CENTRE_UNIT / 2, CENTRE_UNIT / 2), 4, 2),
+    )
+    .unwrap();
+    assert_eq!((view.x0, view.y0, view.width, view.height), (2, 2, 2, 1));
+    assert_eq!(view.target, (4, 2));
+    let direct = bilinear(&source, region(4, 4, 4, 2), 1).unwrap();
+    let want: Vec<f32> = direct.rgb.iter().map(|v| f32::from(*v) / 65535.0).collect();
+    for orientation in [1u16, 6] {
+        let zoomed = zoom_level2_full(&source, view, orientation, 2).unwrap();
+        let expect = orient_f32(&want, 4, 2, orientation);
+        assert_eq!(
+            (zoomed.width, zoomed.height),
+            (expect.1, expect.2),
+            "{orientation}"
+        );
+        assert_eq!(zoomed.rgb, expect.0, "orientation {orientation}");
+    }
+    // An odd box at 100 is that many photosites exactly, not the doubled
+    // window's even count: the region is cut to the target.
+    let odd = viewport(
+        6,
+        5,
+        None,
+        1,
+        zoom(100, (CENTRE_UNIT / 2, CENTRE_UNIT / 2), 5, 3),
+    )
+    .unwrap();
+    assert_eq!((odd.width, odd.height, odd.target), (3, 2, (5, 3)));
+    let direct = bilinear(&source, region(odd.x0 * 2, odd.y0 * 2, 5, 3), 1).unwrap();
+    let want: Vec<f32> = direct.rgb.iter().map(|v| f32::from(*v) / 65535.0).collect();
+    let zoomed = zoom_level2_full(&source, odd, 1, 2).unwrap();
+    assert_eq!((zoomed.width, zoomed.height), (5, 3));
+    assert_eq!(zoomed.rgb, want);
+    // A window past the crop is refused by the demosaic.
+    let past = Viewport { x0: 5, ..view };
+    assert_eq!(
+        zoom_level2_full(&source, past, 1, 1).unwrap_err(),
+        develop::Error::Crop
+    );
+}
+
+/// An interleaved f32 image turned by `orientation`, through the public
+/// `orient` on an 8-bit stand-in of its indices.
+fn orient_f32(rgb: &[f32], w: usize, h: usize, orientation: u16) -> (Vec<f32>, usize, usize) {
+    // Each pixel's index rides in the red byte; the turned image says
+    // where each source pixel went.
+    let index = Rgb8 {
+        width: w,
+        height: h,
+        data: (0..w * h).flat_map(|i| [i as u8, 0, 0]).collect(),
+    };
+    let turned = orient(index, orientation);
+    let mut out = Vec::with_capacity(rgb.len());
+    for i in 0..turned.width * turned.height {
+        let from = usize::from(turned.data[i * 3]);
+        out.extend_from_slice(&rgb[from * 3..from * 3 + 3]);
+    }
+    (out, turned.width, turned.height)
 }

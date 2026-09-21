@@ -113,9 +113,11 @@ const HELP: &str = concat!(
     "  The window without a display: requests on stdin, answers on\n",
     "  stdout in td-ui's driving envelope, over the cull actions; ROLL is\n",
     "  opened at the start. See DESIGN.md, Driving.\n",
-    "td-photo --preview WxH [ROLL]\n",
+    "td-photo --preview WxH [ROLL] [--develop [POSITION] [--zoom]]\n",
     "  Writes what the window would show for ROLL at WxH once every\n",
-    "  thumbnail it wants is in, as a PPM on stdout.\n",
+    "  thumbnail it wants is in, as a PPM on stdout; --develop the\n",
+    "  develop view of the photo at POSITION (the first), --zoom its\n",
+    "  box at 100%.\n",
     "td-photo --help actions\n",
     "  Prints the action table: name, key, arguments and what it does.\n",
     "Other: --help\n",
@@ -741,6 +743,40 @@ pub(crate) fn level1_level2(
     develop::level2(level1, crop, long_edge, meta.orientation, threads).map_err(|e| e.to_string())
 }
 
+/// Level 1 to a zoomed level 2: the box's window of the crop at the zoom
+/// (`develop::viewport`), from level 1 through `HALF_ZOOM` and from level
+/// 0 past it, where level 1 has fewer pixels than the box shows; a zoom
+/// past half needs the frame. Rerun on a zoom, pan, crop or resize, reused
+/// across exposure and look edits as the fit level 2 is.
+pub(crate) fn zoom_level2(
+    level1: &develop::Level1,
+    raw: Option<&RawFrame>,
+    meta: &Meta,
+    crop: Option<[f32; 4]>,
+    zoom: develop::Zoom,
+    threads: usize,
+) -> Result<develop::Level2, String> {
+    let view = develop::viewport(level1.width, level1.height, crop, meta.orientation, zoom)
+        .map_err(|e| e.to_string())?;
+    if zoom.percent <= develop::HALF_ZOOM {
+        return develop::zoom_level2(level1, view, meta.orientation, threads)
+            .map_err(|e| e.to_string());
+    }
+    let raw = raw.ok_or_else(|| "a zoom past half needs the frame".to_string())?;
+    develop::zoom_level2_full(&raw.source(), view, meta.orientation, threads)
+        .map_err(|e| e.to_string())
+}
+
+/// The oriented, cropped image's extent at full resolution for a level 1:
+/// what the window reports to the model as the zoom's measure.
+pub(crate) fn level1_extent(
+    level1: &develop::Level1,
+    meta: &Meta,
+    crop: Option<[f32; 4]>,
+) -> Option<(usize, usize)> {
+    develop::extent(level1.width, level1.height, crop, meta.orientation)
+}
+
 /// Level 2 to the frame: the per-pixel pipeline at `stops` with `look`, then
 /// the shrink to the box for a shape taller than it, the thumbnail rule.
 /// What an exposure or look edit reruns; level 2 is untouched.
@@ -822,6 +858,7 @@ fn develop_preview(
     exposure: i32,
     look: Option<&str>,
     crop: Option<library::Crop>,
+    zoom: Option<(u32, (u32, u32))>,
     threads: usize,
 ) -> Option<Rgb8> {
     let path = roll.join(name);
@@ -838,12 +875,37 @@ fn develop_preview(
     let long_edge = box_w.max(box_h);
     let stops = exposure as f32 / 100.0;
     let crop = crop.map(crop_fractions);
-    let made = develop_raw(&path, crop, long_edge, stops, look.as_ref(), threads).and_then(
-        |(image, _)| {
-            develop::shrink(image, box_w, box_h, threads)
-                .map_err(|e| format!("{}: {e}", path.display()))
-        },
-    );
+    let made = match zoom {
+        // The zoomed box: the levels apart, as the window runs them, on
+        // this thread.
+        Some((percent, centre)) => decode_raw(&path)
+            .and_then(|(raw, _)| {
+                let level1 = raw_level1(&raw, threads)?;
+                let zoom = develop::Zoom {
+                    percent,
+                    centre,
+                    box_w,
+                    box_h,
+                };
+                let level2 = zoom_level2(&level1, Some(&raw), &raw.meta, crop, zoom, threads)?;
+                level2_frame(
+                    &level2,
+                    &raw.meta,
+                    box_w,
+                    box_h,
+                    stops,
+                    look.as_ref(),
+                    threads,
+                )
+            })
+            .map_err(|e| format!("{}: {e}", path.display())),
+        None => develop_raw(&path, crop, long_edge, stops, look.as_ref(), threads).and_then(
+            |(image, _)| {
+                develop::shrink(image, box_w, box_h, threads)
+                    .map_err(|e| format!("{}: {e}", path.display()))
+            },
+        ),
+    };
     match made {
         Ok(image) => Some(image),
         Err(why) => {

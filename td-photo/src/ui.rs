@@ -20,6 +20,7 @@ use td_ui::raster::{
 use td_ui::CELL_HEIGHT;
 use td_ui::CELL_WIDTH;
 
+use crate::develop::{self, CENTRE_UNIT, ZOOM_STEPS};
 use crate::image::Rgb8;
 use crate::library::{self, Crop, Filter, Flag, Key, Sidecar, Step};
 
@@ -275,6 +276,10 @@ pub enum Action {
     Exposure,
     /// The Nth (from 1) of the available looks, `F1`..`F9`.
     LookAt(u8),
+    ZoomFit,
+    Zoom100,
+    ZoomIn,
+    ZoomOut,
     Export,
     DeleteRejected,
     Scroll,
@@ -282,7 +287,7 @@ pub enum Action {
 }
 
 impl Action {
-    pub const ALL: [Action; 49] = [
+    pub const ALL: [Action; 53] = [
         Action::Open,
         Action::Choose,
         Action::Next,
@@ -328,6 +333,10 @@ impl Action {
         Action::LookAt(7),
         Action::LookAt(8),
         Action::LookAt(9),
+        Action::ZoomFit,
+        Action::Zoom100,
+        Action::ZoomIn,
+        Action::ZoomOut,
         Action::Export,
         Action::DeleteRejected,
         Action::Scroll,
@@ -383,6 +392,10 @@ impl Action {
             Self::LookAt(9) => "look-9",
             // Not an action: `parse` refuses it and dispatch ignores it.
             Self::LookAt(_) => "look-0",
+            Self::ZoomFit => "zoom-fit",
+            Self::Zoom100 => "zoom-100",
+            Self::ZoomIn => "zoom-in",
+            Self::ZoomOut => "zoom-out",
             Self::Export => "export",
             Self::DeleteRejected => "delete-rejected",
             Self::Scroll => "scroll",
@@ -409,7 +422,7 @@ impl Action {
 /// binds, the argument shape and the help line. Actions without a chord
 /// take an argument or are the agent's (`open`); the pointer reaches
 /// `select` by pressing a cell and `scroll` by the wheel.
-pub const BINDINGS: [Binding; 49] = [
+pub const BINDINGS: [Binding; 53] = [
     Binding {
         name: "open",
         chord: None,
@@ -681,6 +694,30 @@ pub const BINDINGS: [Binding; 49] = [
         help: "Set the look to the ninth available look (develop mode).",
     },
     Binding {
+        name: "zoom-fit",
+        chord: Some("f"),
+        arguments: "",
+        help: "Fit the whole image in the develop box (develop mode).",
+    },
+    Binding {
+        name: "zoom-100",
+        chord: Some("Z"),
+        arguments: "",
+        help: "Show the image at 100%, a photosite a pixel, around the centre (develop mode).",
+    },
+    Binding {
+        name: "zoom-in",
+        chord: Some("]"),
+        arguments: "",
+        help: "Zoom in a step: fit, then 25, 50 and 100% (develop mode; the wheel up).",
+    },
+    Binding {
+        name: "zoom-out",
+        chord: Some("["),
+        arguments: "",
+        help: "Zoom out a step, back to fit (develop mode; the wheel down).",
+    },
+    Binding {
         name: "export",
         chord: Some("e"),
         arguments: "",
@@ -762,19 +799,89 @@ const HISTORY_ACTIONS: [&str; 3] = ["step-toggle", "step-delete", "undo"];
 
 /// The tool band's buttons, in order, before the exposure slider: the
 /// crop-adjust sub-mode (selected while it is on), the crop cleared, the
-/// last step back, the history cleared, and the exposure a third of a
-/// stop down or up.
-pub const TOOL_BUTTONS: [&str; 6] = ["Crop", "Uncrop", "Undo", "Reset", "-", "+"];
-const TOOL_ACTIONS: [&str; 6] = [
+/// last step back, the history cleared, the exposure a third of a stop
+/// down or up, and the zoom to fit (selected while the view fits) or to
+/// 100% (selected while it is at 100%).
+pub const TOOL_BUTTONS: [&str; 8] = ["Crop", "Uncrop", "Undo", "Reset", "-", "+", "Fit", "100%"];
+const TOOL_ACTIONS: [&str; 8] = [
     "adjust-crop",
     "uncrop",
     "undo",
     "reset",
     "expose-out",
     "expose-in",
+    "zoom-fit",
+    "zoom-100",
 ];
-// The layout, the states and the paint zip the six by place.
-const _: () = assert!(TOOL_BUTTONS.len() == 6);
+/// How many tool buttons: the layout, the states and the paint zip them
+/// by place.
+pub const TOOL_COUNT: usize = 8;
+const _: () = assert!(TOOL_BUTTONS.len() == TOOL_COUNT && TOOL_ACTIONS.len() == TOOL_COUNT);
+
+/// The zoom of the develop box: `None` fits the whole image in it (the
+/// develop as it was), `Some(percent)` shows the image at that percent of
+/// full resolution around a centre. The `state` word: `fit`, or the
+/// percent and the centre as `Z@X,Y`.
+pub fn zoom_word(zoom: Option<(u32, (u32, u32))>) -> String {
+    match zoom {
+        None => "fit".to_string(),
+        Some((percent, (x, y))) => format!("{percent}@{x},{y}"),
+    }
+}
+
+/// The centre held where a `box_w` by `box_h` window at `zoom` percent
+/// over `extent` lies inside the image: at least half the window from
+/// either edge on each axis, so a pan has no dead travel at an edge, and
+/// the middle where the window covers the axis. The rule the develop's
+/// viewport clamps by too, so a centre outside it names the same window
+/// as its clamped one.
+pub fn clamped_centre(
+    centre: (u32, u32),
+    zoom: u32,
+    extent: (usize, usize),
+    box_w: u32,
+    box_h: u32,
+) -> (u32, u32) {
+    let unit = u64::from(CENTRE_UNIT);
+    // Half the window, in units of the axis: the box at `100 / zoom`
+    // photosites a pixel, halved, over the extent.
+    let margin = |px: u32, extent: usize| {
+        let half = u64::from(px) * 50 * unit / (u64::from(zoom).max(1) * (extent as u64).max(1));
+        u32::try_from(half.min(unit / 2)).unwrap_or(CENTRE_UNIT / 2)
+    };
+    let (mx, my) = (margin(box_w, extent.0), margin(box_h, extent.1));
+    (
+        centre.0.clamp(mx, CENTRE_UNIT - mx),
+        centre.1.clamp(my, CENTRE_UNIT - my),
+    )
+}
+
+/// Which way the zoom ladder is walked.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ZoomStep {
+    In,
+    Out,
+}
+
+/// The zoom a `step` in or out from `zoom` lands on, with the fit at
+/// `fit` percent: in, the first of `ZOOM_STEPS` past the zoom in force
+/// (the fit's percent when fitting); out, the last of them short of it
+/// and past the fit, else the fit. The zoom itself when there is no step
+/// that way.
+pub fn zoom_step(zoom: Option<u32>, fit: u32, step: ZoomStep) -> Option<u32> {
+    let now = zoom.unwrap_or(fit);
+    match step {
+        ZoomStep::In => match ZOOM_STEPS.iter().find(|&&step| step > now) {
+            Some(step) => Some(*step),
+            None => zoom,
+        },
+        ZoomStep::Out => ZOOM_STEPS
+            .iter()
+            .rev()
+            .find(|&&step| step < now && step > fit)
+            .copied(),
+    }
+}
 
 /// The look band's first button: no look, the camera's rendering.
 pub const NO_LOOK: &str = "None";
@@ -819,7 +926,7 @@ struct SingleView {
 /// it whole.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Tools {
-    pub buttons: [Option<Button>; 6],
+    pub buttons: [Option<Button>; TOOL_COUNT],
     pub slider: Option<Slider>,
 }
 
@@ -1118,7 +1225,7 @@ impl Layout {
             region.width,
             &TOOL_BUTTONS,
         );
-        let mut buttons = [None; 6];
+        let mut buttons = [None; TOOL_COUNT];
         for (slot, button) in buttons.iter_mut().zip(strip.buttons()) {
             *slot = button;
         }
@@ -1374,6 +1481,35 @@ pub struct Controller {
     /// the frame witnesses, so a change bumps the generation; absent from
     /// `state`.
     hints: bool,
+    /// The develop box's zoom: `None` fits the whole image, `Some(percent)`
+    /// shows it at that percent of full resolution around `centre`. Kept
+    /// across photos, dropped on leaving develop and on entering
+    /// crop-adjust (whose canvas is the whole frame); a `state` field, and
+    /// the status row names it.
+    zoom: Option<u32>,
+    /// The zoomed view's centre, `CENTRE_UNIT`s of the oriented, cropped
+    /// image on each axis, kept inside the image so far as the extent is
+    /// known (`clamp_centre`): the middle until a pan moves it, and the
+    /// middle again when the zoom is dropped (`drop_zoom`).
+    centre: (u32, u32),
+    /// The pan drag in progress while zoomed, in surface pixels: the
+    /// press anchor and the pointer's current point. The frame shifts the
+    /// image by their difference until the release moves the centre.
+    /// Dropped with the crop drag.
+    pan: Option<Pan>,
+    /// The cursor photo's oriented, cropped image extent at full
+    /// resolution, as the adapter last reported it from the levels it
+    /// holds: what the zoom ladder and a pan measure against. `None` until
+    /// a develop of the photo lands. A fact, absent from `state`.
+    extent: Option<(usize, usize)>,
+}
+
+/// A pan drag: the press anchor and the pointer's current point, both in
+/// surface pixels.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct Pan {
+    anchor: (i64, i64),
+    current: (i64, i64),
 }
 
 /// The roll chooser: the toolkit's finder over the folder the adapter
@@ -1919,6 +2055,10 @@ impl Controller {
             history_first: 0,
             slider: None,
             hints: false,
+            zoom: None,
+            centre: (CENTRE_UNIT / 2, CENTRE_UNIT / 2),
+            pan: None,
+            extent: None,
         }
     }
 
@@ -1944,6 +2084,7 @@ impl Controller {
         self.mode = Mode::Cull;
         self.first_row = 0;
         self.drag = None;
+        self.drop_zoom();
         self.slider = None;
         self.adjusting = false;
         self.aspect = Aspect::Free;
@@ -1987,6 +2128,7 @@ impl Controller {
                 .map_err(|_| Error::Refused)?;
                 // The pointer is the finder's now; a drag cannot go on.
                 self.drag = None;
+                self.pan = None;
                 self.slider = None;
                 self.chooser = Some(Chooser { finder, folder });
             }
@@ -2135,6 +2277,7 @@ impl Controller {
             Some(name) => self.photos.iter().position(|photo| photo.name == name),
             None => {
                 self.drag = None;
+                self.pan = None;
                 self.slider = None;
                 self.adjusting = false;
                 self.aspect = Aspect::Free;
@@ -2209,6 +2352,33 @@ impl Controller {
     /// generation; the drag rectangle the model derives from it does.
     pub fn set_preview_fit(&mut self, fit: Option<Rect>) {
         self.preview_fit = fit;
+    }
+
+    /// The cursor photo's oriented, cropped extent at full resolution, as
+    /// the adapter computed it from the levels it holds (`None` without
+    /// them): the zoom ladder's and a pan's measure. A fact like the fit,
+    /// so it never bumps the generation; the centre is held inside the
+    /// image it measures (`clamp_centre`), which moves no pixel, since the
+    /// develop clamps its window the same way, but keeps `state` and the
+    /// next pan at the centre the box shows.
+    pub fn set_zoom_extent(&mut self, extent: Option<(usize, usize)>) {
+        self.extent = extent;
+        self.clamp_centre();
+    }
+
+    /// The develop box's zoom and centre, `None` fitting: what the window
+    /// develops the box to.
+    pub fn zoom(&self) -> Option<(u32, (u32, u32))> {
+        self.zoom.map(|zoom| (zoom, self.centre))
+    }
+
+    /// How far a pan drag in progress has moved the pointer from its
+    /// anchor, in surface pixels: the window blits the held image shifted
+    /// by it until the release moves the centre. Zero without one.
+    pub fn pan_shift(&self) -> (i64, i64) {
+        self.pan.map_or((0, 0), |pan| {
+            (pan.current.0 - pan.anchor.0, pan.current.1 - pan.anchor.1)
+        })
     }
 
     /// The look stems the palette and the look band list (built-in and
@@ -2660,11 +2830,21 @@ impl Controller {
         self.mode = Mode::Cull;
         self.view = View::Grid;
         self.drag = None;
+        self.drop_zoom();
         self.slider = None;
         self.adjusting = false;
         self.aspect = Aspect::Free;
         self.look_list = false;
         self.history_step = None;
+    }
+
+    /// Back to the fit, the centre the middle again and any pan dropped:
+    /// on leaving develop, on entering crop-adjust (whose canvas is the
+    /// whole frame) and when a roll opens.
+    fn drop_zoom(&mut self) {
+        self.zoom = None;
+        self.pan = None;
+        self.centre = (CENTRE_UNIT / 2, CENTRE_UNIT / 2);
     }
 
     /// The develop preview's box: the layout's preview box when developing a
@@ -2806,6 +2986,23 @@ impl Controller {
             Input::Wheel { rows, .. } if self.chooser.is_some() => {
                 self.chooser_wheel(i64::from(rows))
             }
+            // The wheel in develop zooms, up in and down out, a step a
+            // turn whatever its size (the event carries no position, so
+            // it is the mode's wherever the pointer is); under the palette
+            // and in crop-adjust, where the box is not the zoom's, it is
+            // inert, the grid it would scroll being out of view.
+            Input::Wheel { rows, .. } if self.mode == Mode::Develop => {
+                if rows == 0 || self.look_list || self.adjusting {
+                    return Ok((Outcome::Ignored, Vec::new()));
+                }
+                let step = if rows < 0 {
+                    ZoomStep::In
+                } else {
+                    ZoomStep::Out
+                };
+                let outcome = self.zoom_by(step)?;
+                Ok((self.finish(outcome), Vec::new()))
+            }
             Input::Wheel { rows, .. } => {
                 let outcome = self.scroll(i64::from(rows));
                 Ok((self.finish(outcome), Vec::new()))
@@ -2823,7 +3020,10 @@ impl Controller {
                 self.surface = surface;
                 // The canvas moved under any drag; its pixels are stale.
                 self.drag = None;
+                self.pan = None;
                 self.slider = None;
+                // The box the zoomed window is measured by moved too.
+                self.clamp_centre();
                 self.reveal();
                 // The chooser is laid out again over the new area; one it
                 // cannot fit closes it.
@@ -2882,6 +3082,7 @@ impl Controller {
                 .map_or_else(dash, |chooser| hex(&chooser.folder)),
             self.steps().len().to_string(),
             self.history_step.map_or_else(dash, |step| step.to_string()),
+            zoom_word(self.zoom()),
         ]
         .join("\t")
     }
@@ -3039,6 +3240,10 @@ impl Controller {
             (Action::Uncrop, []) => return self.uncrop(effects),
             (Action::Exposure, [stops]) => return self.set_exposure(stops, effects),
             (Action::LookAt(n), []) => return self.look_at(usize::from(n), effects),
+            (Action::ZoomFit, []) => self.set_zoom(None)?,
+            (Action::Zoom100, []) => self.set_zoom(Some(100))?,
+            (Action::ZoomIn, []) => self.zoom_by(ZoomStep::In)?,
+            (Action::ZoomOut, []) => self.zoom_by(ZoomStep::Out)?,
             (Action::Export, []) => return self.export(effects),
             (Action::DeleteRejected, []) => return self.delete_rejected(effects),
             _ => return Err(control::Error::Protocol.into()),
@@ -3073,12 +3278,12 @@ impl Controller {
                 PointerPhase::Release => finder::Event::Release { x, y },
             });
         }
-        // Develop mode: a crop or slider drag in progress owns the pointer
-        // wherever it goes; otherwise the history pane, the two bands and
-        // the filmstrip take it over their own pixels, and the preview
-        // starts a crop drag on press. A press off all of them (the strips,
-        // the status row, the margins) starts no drag, as a filter press is
-        // inert here.
+        // Develop mode: a crop, pan or slider drag in progress owns the
+        // pointer wherever it goes; otherwise the history pane, the two
+        // bands and the filmstrip take it over their own pixels, and the
+        // preview starts a crop drag (a pan, zoomed) on press. A press off
+        // all of them (the strips, the status row, the margins) starts no
+        // drag, as a filter press is inert here.
         if self.mode == Mode::Develop {
             // The history pane: a press on a step selects it, on a button
             // asks for what the button says; the pane's other pixels, and
@@ -3176,9 +3381,9 @@ impl Controller {
         x: i64,
         y: i64,
     ) -> Option<Result<(Outcome, Vec<Effect>), Error>> {
-        // A crop or slider drag in progress owns the pointer wherever it
-        // goes, so its release over the pane still ends it.
-        if self.drag.is_some() || self.slider.is_some() {
+        // A crop, pan or slider drag in progress owns the pointer wherever
+        // it goes, so its release over the pane still ends it.
+        if self.drag.is_some() || self.pan.is_some() || self.slider.is_some() {
             return None;
         }
         let layout = self.layout();
@@ -3220,9 +3425,9 @@ impl Controller {
         x: i64,
         y: i64,
     ) -> Option<Result<(Outcome, Vec<Effect>), Error>> {
-        // A crop drag in progress owns the pointer wherever it goes (the
-        // slider's took its turn above).
-        if self.drag.is_some() {
+        // A crop or pan drag in progress owns the pointer wherever it goes
+        // (the slider's took its turn above).
+        if self.drag.is_some() || self.pan.is_some() {
             return None;
         }
         let layout = self.layout();
@@ -3260,7 +3465,7 @@ impl Controller {
         x: i64,
         y: i64,
     ) -> Option<Result<(Outcome, Vec<Effect>), Error>> {
-        if self.drag.is_some() {
+        if self.drag.is_some() || self.pan.is_some() {
             return None;
         }
         let layout = self.layout();
@@ -3352,7 +3557,13 @@ impl Controller {
                 2 => self.undo(Vec::new()),
                 3 => self.reset_develop(Vec::new()),
                 4 => self.expose(-EXPOSURE_STEP, Vec::new()),
-                _ => self.expose(EXPOSURE_STEP, Vec::new()),
+                5 => self.expose(EXPOSURE_STEP, Vec::new()),
+                6 => self
+                    .set_zoom(None)
+                    .map(|outcome| (self.finish(outcome), Vec::new())),
+                _ => self
+                    .set_zoom(Some(100))
+                    .map(|outcome| (self.finish(outcome), Vec::new())),
             });
         }
         let looks = layout.look_buttons(&self.looks);
@@ -3382,15 +3593,155 @@ impl Controller {
 
     /// Whether each tool button is enabled, `TOOL_BUTTONS` in order: Crop
     /// and the exposure steps always, Uncrop with a crop set, Undo and
-    /// Reset with a step in the history.
-    pub fn tool_states(&self, index: usize) -> [bool; 6] {
+    /// Reset with a step in the history, Fit and 100% outside crop-adjust.
+    pub fn tool_states(&self, index: usize) -> [bool; TOOL_COUNT] {
         let sidecar = self
             .photos
             .get(index)
             .and_then(|photo| photo.sidecar.as_ref());
         let cropped = sidecar.and_then(Sidecar::crop).is_some();
         let steps = sidecar.is_some_and(|sidecar| !sidecar.steps().is_empty());
-        [true, cropped, steps, steps, true, true]
+        let zooms = !self.adjusting;
+        [true, cropped, steps, steps, true, true, zooms, zooms]
+    }
+
+    /// Which tool buttons paint selected, `TOOL_BUTTONS` in order: Crop
+    /// while crop-adjust is on, Fit while the view fits (outside
+    /// crop-adjust, where the zoom is off), 100% while it is at 100%.
+    pub fn tool_selected(&self) -> [bool; TOOL_COUNT] {
+        let fit = self.zoom.is_none() && !self.adjusting;
+        let full = self.zoom == Some(100);
+        [self.adjusting, false, false, false, false, false, fit, full]
+    }
+
+    /// The zoom that fits the cursor photo in the develop box, in percent,
+    /// once the adapter has reported the photo's extent and there is a box.
+    fn fit_zoom(&self) -> Option<u32> {
+        let r#box = self.develop_box()?;
+        Some(develop::fit_zoom(
+            self.extent?,
+            r#box.width as usize,
+            r#box.height as usize,
+        ))
+    }
+
+    /// Sets the develop box's zoom, `None` to fit: only in develop mode
+    /// and outside crop-adjust, whose canvas is the whole frame (`Ignored`
+    /// elsewhere, as the develop edits are); the zoom in force is
+    /// `Ignored`. The status row names the zoom and the Fit and 100%
+    /// buttons show it, so a change is a frame change before the develop
+    /// lands; a crop or pan drag in progress is dropped (the canvas it was
+    /// taken against is gone) and the centre held inside the image at the
+    /// new zoom.
+    fn set_zoom(&mut self, zoom: Option<u32>) -> Result<Outcome, Error> {
+        if self.develop_photo()?.is_none() || self.adjusting || zoom == self.zoom {
+            return Ok(Outcome::Ignored);
+        }
+        self.zoom = zoom;
+        self.drag = None;
+        self.pan = None;
+        self.clamp_centre();
+        Ok(Outcome::Changed)
+    }
+
+    /// Zooms a step in or out along `ZOOM_STEPS` from the fit
+    /// (`zoom_step`), which needs the photo's extent to be known: until a
+    /// develop of it lands the ladder has no foot and the step is
+    /// `Ignored`, as a step past either end is.
+    fn zoom_by(&mut self, step: ZoomStep) -> Result<Outcome, Error> {
+        if self.develop_photo()?.is_none() || self.adjusting {
+            return Ok(Outcome::Ignored);
+        }
+        let Some(fit) = self.fit_zoom() else {
+            return Ok(Outcome::Ignored);
+        };
+        self.set_zoom(zoom_step(self.zoom, fit, step))
+    }
+
+    /// Keeps the centre where the zoomed window lies inside the image
+    /// (`clamped_centre`). With no zoom, extent or box the centre is left
+    /// as it is.
+    fn clamp_centre(&mut self) {
+        let (Some(zoom), Some(extent), Some(r#box)) = (self.zoom, self.extent, self.develop_box())
+        else {
+            return;
+        };
+        self.centre = clamped_centre(self.centre, zoom, extent, r#box.width, r#box.height);
+    }
+
+    /// The pan over the zoomed develop box: a press in the box anchors it,
+    /// a move shifts the held image by the pointer's travel (a frame
+    /// change), and the release moves the centre the other way, so the
+    /// content under the pointer stays under it -- `100 / zoom`
+    /// photosites a pixel, as a fraction of the extent -- clamped inside
+    /// the image (`clamp_centre`); the develop at the moved centre follows.
+    /// A release with no travel changes nothing; one with travel is a
+    /// frame change whether or not the centre moved, since the shifted
+    /// image returns.
+    fn pan_pointer(
+        &mut self,
+        phase: PointerPhase,
+        x: i64,
+        y: i64,
+    ) -> Result<(Outcome, Vec<Effect>), Error> {
+        let ignored = Ok((Outcome::Ignored, Vec::new()));
+        match phase {
+            PointerPhase::Press => {
+                let Some(r#box) = self.develop_box() else {
+                    return ignored;
+                };
+                if !r#box.contains(x, y) {
+                    return ignored;
+                }
+                self.pan = Some(Pan {
+                    anchor: (x, y),
+                    current: (x, y),
+                });
+                ignored
+            }
+            PointerPhase::Move => {
+                let Some(pan) = self.pan.as_mut() else {
+                    return ignored;
+                };
+                if pan.current == (x, y) {
+                    return ignored;
+                }
+                pan.current = (x, y);
+                Ok((self.finish(Outcome::Changed), Vec::new()))
+            }
+            PointerPhase::Release => {
+                let Some(pan) = self.pan.take() else {
+                    return ignored;
+                };
+                let (dx, dy) = (x - pan.anchor.0, y - pan.anchor.1);
+                if (dx, dy) == (0, 0) && pan.current == pan.anchor {
+                    return ignored;
+                }
+                if let (Some(zoom), Some(extent)) = (self.zoom, self.extent) {
+                    // From the centre the box shows: one held stale by a
+                    // photo switch is inside the image first, so the
+                    // travel is not spent reaching it.
+                    self.clamp_centre();
+                    let moved = |at: u32, travel: i64, extent: usize| {
+                        // Surface pixels to units of the axis, the image
+                        // moving with the pointer means the centre against it.
+                        let units = travel
+                            .saturating_mul(100)
+                            .saturating_mul(i64::from(CENTRE_UNIT))
+                            / i64::from(zoom)
+                                .saturating_mul(i64::try_from(extent.max(1)).unwrap_or(i64::MAX));
+                        u32::try_from((i64::from(at) - units).clamp(0, i64::from(CENTRE_UNIT)))
+                            .unwrap_or(at)
+                    };
+                    self.centre = (
+                        moved(self.centre.0, dx, extent.0),
+                        moved(self.centre.1, dy, extent.1),
+                    );
+                    self.clamp_centre();
+                }
+                Ok((self.finish(Outcome::Changed), Vec::new()))
+            }
+        }
     }
 
     /// The exposure slider's value as painted: the drag's while one is
@@ -3505,7 +3856,11 @@ impl Controller {
         x: i64,
         y: i64,
     ) -> Result<(Outcome, Vec<Effect>), Error> {
-        if self.adjusting {
+        if self.zoom.is_some() {
+            // The zoomed box shows a window of the image, not a canvas a
+            // crop maps onto: the pointer pans it.
+            self.pan_pointer(phase, x, y)
+        } else if self.adjusting {
             self.adjust_pointer(phase, x, y)
         } else {
             self.marquee_pointer(phase, x, y)
@@ -3910,6 +4265,7 @@ impl Controller {
         if self.mode == Mode::Develop && self.adjusting {
             self.adjusting = false;
             self.drag = None;
+            self.pan = None;
             self.preview_fit = None;
             return Outcome::Changed;
         }
@@ -3931,6 +4287,8 @@ impl Controller {
         }
         self.adjusting = !self.adjusting;
         self.drag = None;
+        // The sub-mode's canvas is the whole frame: the zoom goes with it.
+        self.drop_zoom();
         // The fit reported was of the frame the other crop shows: dropped
         // until the adapter reports one for this crop (its turn's end), so a
         // press in the same turn finds none in the sub-mode and the box
@@ -3962,6 +4320,7 @@ impl Controller {
             if self.look_list {
                 self.adjusting = false;
                 self.drag = None;
+                self.pan = None;
             } else {
                 return Ok(Outcome::Ignored);
             }
@@ -3983,6 +4342,7 @@ impl Controller {
         // grid throughout, not a stale `single` it will not return to.
         self.view = View::Grid;
         self.drag = None;
+        self.pan = None;
         self.slider = None;
         self.adjusting = false;
         self.aspect = Aspect::Free;
@@ -4169,6 +4529,7 @@ impl Controller {
             // The cursor left the photo the drag, crop-adjust, aspect lock and
             // look palette were for; end them.
             self.drag = None;
+            self.pan = None;
             self.slider = None;
             self.adjusting = false;
             self.aspect = Aspect::Free;
@@ -4178,6 +4539,7 @@ impl Controller {
             self.view = View::Grid;
             self.mode = Mode::Cull;
             self.drag = None;
+            self.drop_zoom();
             self.slider = None;
             self.adjusting = false;
             self.aspect = Aspect::Free;
@@ -4209,6 +4571,7 @@ impl Controller {
         // The cursor moved off the photo the drag, crop-adjust, aspect lock
         // and look palette were for; end them.
         self.drag = None;
+        self.pan = None;
         self.slider = None;
         self.adjusting = false;
         self.aspect = Aspect::Free;
@@ -4356,6 +4719,9 @@ impl Scene<'_> {
                     line.push_str(" looks");
                 } else if model.adjusting {
                     line.push_str(" crop-adjust");
+                }
+                if let Some(zoom) = model.zoom {
+                    line.push_str(&format!(" {zoom}%"));
                 }
             }
             Mode::Cull if model.view == View::Single => line.push_str(" | single"),
@@ -4538,8 +4904,9 @@ impl Scene<'_> {
     }
 
     /// The tool band and the look band over the develop view: chrome, the
-    /// tool buttons with the crop-adjust one selected while it is on and
-    /// each enabled as `tool_states` says, the exposure slider at the
+    /// tool buttons, the selected as `tool_selected` says (crop-adjust
+    /// while it is on, the zoom in force) and each enabled as
+    /// `tool_states` says, the exposure slider at the
     /// value in force or under the drag, then the look buttons with the
     /// current look selected (`None` without one). While the hints are
     /// shown each button carries its action's chord, the look buttons
@@ -4550,22 +4917,17 @@ impl Scene<'_> {
         fill(layout.look_band(), CHROME, damage, sink);
         let tools = layout.tools();
         let states = model.tool_states(index);
+        let selected = model.tool_selected();
         let buttons = tools
             .buttons
             .into_iter()
             .zip(TOOL_BUTTONS)
             .zip(TOOL_ACTIONS)
-            .zip(states);
-        for (which, (((button, label), action), enabled)) in buttons.enumerate() {
+            .zip(states)
+            .zip(selected);
+        for ((((button, label), action), enabled), selected) in buttons {
             if let Some(button) = button {
-                button.emit_hinted(
-                    label,
-                    model.hint(action),
-                    which == 0 && model.adjusting,
-                    enabled,
-                    damage,
-                    sink,
-                );
+                button.emit_hinted(label, model.hint(action), selected, enabled, damage, sink);
             }
         }
         if let Some(slider) = tools.slider {

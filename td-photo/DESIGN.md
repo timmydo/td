@@ -123,13 +123,19 @@ modes are the photographer's order of work.
    `l` lists the available looks with the current one marked, and a press on a
    name picks it. Two bands above the preview carry the same controls as
    buttons: a tool band with Crop (the crop-adjust toggle, shown selected
-   while it is on), Uncrop (`C`, clearing the crop), Undo, Reset and the
-   exposure's `-` and `+` beside a slider over the exposure's whole range, and
+   while it is on), Uncrop (`C`, clearing the crop), Undo, Reset, the
+   exposure's `-` and `+` beside a slider over the exposure's whole range,
+   and Fit and 100% (the zoom, the one in force selected), and
    a look band with None and every available look, the current one selected,
-   the first nine on `F1`..`F9`. A filmstrip under the preview shows the shown
+   the first nine on `F1`..`F9`. The preview fits the box until it is
+   zoomed: `Z` (or the 100% button) shows the photosites around the centre
+   one a pixel, the wheel or `]` and `[` step through 25, 50 and 100
+   percent from the fit and back, `f` (or Fit) fits again, and a drag over
+   the zoomed box pans it. A filmstrip under the preview shows the shown
    photos around the cursor's, `Left` and `Right` or a press moving along it.
    The status row names the sub-mode in force (`develop crop-adjust`, `develop
-   looks`). The immediate snap that reshapes the current crop and the scaled
+   looks`) and the zoom (`develop 100%`). The immediate snap that reshapes
+   the current crop and the scaled
    preview under the tighten marquee are later slices. Every change is saved
    to the sidecar as it is made, as a step of the photo's history (below);
    there is no explicit save.
@@ -155,7 +161,8 @@ window, all speaking the toolkit's one vocabulary.
   develop and its exposure nudges and absolute `exposure`, look and the
   look shortcuts `look-1`..`look-9`, crop and `uncrop`, crop-adjust, aspect,
   the look palette (`looks`), reset, undo and the history's step toggle and
-  delete, export, and delete rejected).
+  delete, the zoom (`zoom-fit`, `zoom-100`, `zoom-in`, `zoom-out`), export,
+  and delete rejected).
   `ui::Controller` holds the model (the roll's names and sidecars, the cursor,
   the filter, the view, the scroll and the surface, and the shown list the
   filter admits, kept rather than rescanned); `action(name, fields)` and
@@ -250,7 +257,8 @@ window, all speaking the toolkit's one vocabulary.
   `--preview` carry them.
 - **The develop controls.** Two bands lead the develop region, above the
   preview: the tool band (`Layout::tool_band`, the region's first rows)
-  with `TOOL_BUTTONS` -- Crop, Uncrop, Undo, Reset, `-`, `+` -- a td-ui
+  with `TOOL_BUTTONS` -- Crop, Uncrop, Undo, Reset, `-`, `+`, Fit, 100%
+  (`TOOL_COUNT`, 8) -- a td-ui
   `chrome::Buttons` strip on the region's width, wrapping to more rows
   where the width is short, and after them the exposure slider (td-ui's
   `chrome::Slider`, `EXPOSURE_STEPS` (100) steps of a tenth of a stop from
@@ -273,6 +281,58 @@ window, all speaking the toolkit's one vocabulary.
   the room td-ui asks and a column of travel per step (td-ui's `travel`
   contract: with fewer, a press on the knob's own centre would read as
   another step), on the buttons' row or its own.
+- **The zoom.** The develop box fits the whole image until it is zoomed:
+  the model's `zoom` is `None` (the fit) or a percent of full resolution
+  (a photosite is `zoom / 100` pixels) around a `centre`, ten-thousandths
+  of the oriented, cropped image on each axis (`develop::CENTRE_UNIT`),
+  the middle until a pan moves it. `zoom-100` (`Z`, the 100% button) and
+  `zoom-fit` (`f`, Fit) set it; `zoom-in` (`]`) and `zoom-out` (`[`) walk
+  `develop::ZOOM_STEPS` (25, 50, 100) from the fit's own percent
+  (`develop::fit_zoom`: the lesser axis ratio of the box to the extent,
+  floored and half at most, since the fit never enlarges the
+  half-resolution level 1, so an image the box holds whole fits at 50 and
+  its one step in is 100), in to the first step past the zoom in force,
+  out to the last short of it and past the fit, else the fit, `ignored`
+  past either end (`ui::zoom_step`); the wheel in develop does the same,
+  up a step in and down a step out, one a turn whatever its size (the
+  event carries no position, so it is the mode's wherever the pointer
+  is). The ladder needs the
+  photo's extent, a fact the window reports from the levels it holds
+  (`set_zoom_extent`, `None` until a develop of the photo lands, no more
+  moving the generation than the fit does), so a step before it lands is
+  `ignored`; `zoom-100` and `zoom-fit` need it not. The zoom is develop's
+  alone (`ignored` in cull), kept across photos, dropped to the fit with
+  the centre at the middle when develop is left, when a roll opens and
+  when crop-adjust is entered, whose canvas is the whole frame (the zoom
+  actions, the wheel and the two buttons are off while it is on, Fit not
+  selected either; under the look palette the wheel is inert too, the
+  grid it would scroll being out of view); a zoom the same as the one in
+  force is `ignored`. A change is a frame change before the develop
+  lands: the status row names the zoom (`develop 100%`), Fit is selected
+  while fitting and 100% at 100 (`tool_selected`), and `state` reports it
+  (`fit`, or `PERCENT@X,Y` with the centre); a crop drag in progress is
+  dropped, the canvas it was taken against being gone. Zoomed, the box shows a
+  window of the image, not a canvas a crop maps onto, so the pointer pans
+  instead of cropping: a press in the box anchors the pan (`Ignored`, as
+  arming a marquee is), a move shifts the held image by the pointer's
+  travel (a frame change; `pan_shift`, which the window blits by, the box
+  clipping it), and the release moves the centre against the travel at
+  `100 / zoom` photosites a pixel as a fraction of the extent, so what was
+  under the pointer stays under it, then the develop at the moved centre
+  follows; the centre is held where the window lies inside the image, half
+  the box's photosites from either edge and the middle where the window
+  covers the axis (`clamp_centre`: on a zoom change, before a release's
+  travel is applied, and when the extent or the surface changes, the
+  centre a photo switch or a resize left outside the room being brought
+  in without a bump, since the develop clamps its window the same way and
+  no pixel moves), so a pan has no dead travel at an edge, and with the
+  extent not yet known the release moves nothing. A pan in progress owns
+  the pointer as a crop drag does, and is dropped as one is: with the
+  photo, the mode, the surface or the zoom. A click moves nothing; a
+  release with travel is a frame change whether or not the centre moved:
+  the pointer's shift ends and the window blits the held image by the
+  held window's offset from the wanted one instead (Window), so the image
+  stays where the pointer left it until the develop lands.
   Crop toggles crop-adjust and is selected while it is on; Uncrop (`C`,
   the `uncrop` action) clears the crop through the same `Edit` the `crop`
   action makes; Undo and Reset ask what `z` and `0` do; `-` and `+` nudge
@@ -442,7 +502,9 @@ window, all speaking the toolkit's one vocabulary.
   flag, exposure, crop, look, sidecar state), the outstanding job count as the
   window last reported it (the turn before), the frame generation, the
   chooser's listed folder in hex, then the history's step count and the
-  selected step's index, `-` for what is absent. The generation
+  selected step's index, then the zoom (`fit`, or the percent and the
+  centre as `PERCENT@X,Y`, `fit` in cull too); `-` stands for a roll, a
+  photo, a chooser or a selection that is absent. The generation
   moves on a change and on nothing else: not on a step at an end, a filter, view
   or size already set, a refused open, or a refused flag that leaves the file as
   the model held it; a settle that brings a file changed meanwhile is a change.
@@ -941,9 +1003,26 @@ taken only into room). Level 1 is superpixel
 (each 2x2 CFA quad becomes one RGB
 pixel: exact colour, no interpolation, a quarter of the samples), which is
 the right demosaic for every on-screen size below half resolution; export
-(and the 100% loupe, a later increment) runs the full-resolution demosaic
+runs the full-resolution demosaic
 in row bands from level 0 so peak memory stays bounded by the band, never
-by the frame (Export, below).
+by the frame (Export, below), and a zoom past `HALF_ZOOM` (50) runs it on
+the box's window alone. A zoomed level 2 is the window of the image the
+box shows at the zoom (`develop::viewport`: `box / (2 * zoom / 100)`
+level-1 pixels on each axis, rounded up, cut to the crop's oriented
+rectangle and moved inside it, centred as near the centre as the edges
+allow, then mapped back through the orientation as the crop is, so a
+window at half zoom is level 1 as it is), resampled to the window at the
+zoom, no more than the box (the rounding up can overshoot it by a pixel,
+left out rather than resampled away, so 100% is a photosite a pixel on an
+odd box too), and oriented: from level 1 through half zoom
+(`zoom_level2`), where level 1 has every pixel the box shows, and from
+level 0 past it (`zoom_level2_full`, the window doubled onto the sensor
+crop and cut to the photosites the target shows, through `bilinear`),
+where it has fewer; then level 3 as the fit's is. The zoom is
+a percent of the oriented, cropped image at full resolution
+(`develop::extent`, two photosites a level-1 pixel), and the fit's own
+percent is `fit_zoom`, the lesser axis ratio of the box to that extent,
+floored.
 
 The resampler is separable area averaging for reduction and bilinear for
 enlargement, over `f32` rows, and is shared with thumbnails. It reads the
@@ -1163,7 +1242,7 @@ cull single view's box stays a placeholder.
 While Alt is held every button shows its chord under its caption in
 td-ui's hint face (`Buttons::emit_hinted`, `Button::emit_hinted`): the
 mode strip's `o`, `Escape` and `d`, the filter strip's `1` through `4`,
-the tool band's `c`, `C`, `z`, `0`, `-` and `=`, the look band's `F1`
+the tool band's `c`, `C`, `z`, `0`, `-`, `=`, `f` and `Z`, the look band's `F1`
 through `F9` under the first nine looks (`None` has none, and a tenth
 look none), and the pane's `t`, `Backspace` and `z`; each is the chord
 of the action the button presses, read from `BINDINGS`, so the two
@@ -1189,11 +1268,15 @@ the toolkit's repeat; a flag, a filter, a view or quit fires once), a
 modifier change with no key under it to `Input::Held` (the hints), a left
 button's press, motion and release to the pointer path (the crop drag reads
 the motion and release, not the press alone) and the wheel's frames to
-`scroll`, and `end_turn` takes the pool's results, asks for the thumbnails the
+`scroll` (in develop, the zoom's step), and `end_turn` takes the
+pool's results, asks for the thumbnails the
 model wants and the neighbours to decode ahead (Concurrency and memory),
 reports the developed image's fitted rectangle within the develop
 box as the crop drag's canvas (`set_preview_fit`, a fact that no more moves the
-generation than the job count does), serves the socket and hands the exports
+generation than the job count does) and the cursor photo's oriented, cropped
+extent at full resolution from the level 1 it holds current for it, the zoom
+ladder's and a pan's measure (`set_zoom_extent`, a fact the same way, `None`
+until a develop of the photo lands), serves the socket and hands the exports
 the session queued this turn to the pool, each with the photo's cached level 0
 when the memo holds it, keyed by the request's own path (so a roll opened in
 the same turn never lends a like-named photo's frame) and held weakly, so the
@@ -1206,7 +1289,19 @@ asked for in the closing turn reach the pool as the window finishes,
 whichever way it closed, so none is lost to a `quit` or a close request. While crop-adjust
 is on it asks the pool for the develop uncropped (the preview's crop `None`,
 the byte-identical path), so the handles overlay the whole frame and can grow
-the crop; the cropped result returns when the sub-mode is left.
+the crop; the cropped result returns when the sub-mode is left. Zoomed, it
+asks for the develop at the model's zoom and centre (the preview's `zoom`,
+so another zoom or centre is another develop), and blits the held image
+shifted by a pan in progress (`pan_shift`) and, once released, by the held
+window's offset from the wanted one (`held_shift`: the centres' difference
+as photosites at the zoom, both centres held inside the image by the
+model's rule (`ui::clamped_centre`) first, while the held develop differs
+from the wanted only by its centre, exposure or look), clipped to the
+box, until the release's develop lands. A held develop that differs from
+the wanted one by a centre the model normalized alone -- a photo switch
+lands the zoomed develop before its extent is known, then the clamp moves
+the centre to the window it already shows -- is the wanted one, neither
+shifted nor asked for again.
 It owns no Wayland objects of its own. A frame is presented whenever the
 generation submitted is not the model's: the scene through the toolkit's raster,
 then each held thumbnail centred in its box through `ui::blit`, a clipped XRGB
@@ -1226,10 +1321,12 @@ generation is submitted once. When a second consumer needs an image primitive it
 is promoted into `td_ui::raster` with a pixel oracle; until then the blitter is
 this crate's, in `ui` where its pixel oracle is, and the confinement test pins
 that the window writes frame bytes through nothing else. `td-photo --preview WxH
-[ROLL] [--develop [POSITION]]` is the same frame without a display, its
-thumbnails and, with `--develop`, the developed preview of the photo at
-`POSITION` (the cursor's, the first, by default) made on the calling thread:
-the oracle the native test holds a capture to.
+[ROLL] [--develop [POSITION] [--zoom]]` is the same frame without a display,
+its thumbnails and, with `--develop`, the developed preview of the photo at
+`POSITION` (the cursor's, the first, by default) made on the calling thread,
+with `--zoom` at 100% around the centre (the `zoom-100` action, so the
+frame is the window's at that zoom): the oracle the native test holds a
+capture to.
 
 Performance contract: no decode or resample runs on the turn loop's thread. The
 roll's listing and its sidecars' reads and writes do, as they do in the replay,
@@ -1323,7 +1420,14 @@ thumbnail is not ready paints a neutral placeholder and its name, never blocks.
   long edge, and caches level-0 frames (charged by their samples and key) under
   `RAW_CACHE_BYTES`, evicting the least recently shown, so a develop reruns only
   what its edit invalidated and a return to a recently shown photo skips the
-  codec. Each plan is keyed by the photo, so it never supplies another photo's
+  codec. A zoomed develop of the current photo starts at its level 1
+  (`Start::Zoom`, with the cached level 0 beside it past half zoom, which
+  needs the frame; evicted, the decode starts over and caches it again),
+  its zoomed level 2 transient -- made and shown, remade on the next zoom,
+  pan, crop or resize -- while the fit level 2 stays current, so back to
+  the fit is level 3 alone; a zoomed develop that decodes or starts at
+  level 1 makes the fit levels and the zoomed frame together. Each plan is
+  keyed by the photo, so it never supplies another photo's
   levels: a result from a previous roll is dropped, and one whose photo is no
   longer the cursor's does not become the current levels (its decoded level 0 is
   still cached), so a develop that finished after a switch never evicts the
@@ -1415,7 +1519,18 @@ buffer), the export geometry mapping the crop through every orientation to
 pinned regions and axes, and the export bands concatenating to the whole at
 every band size and orientation, with and without a crop, the uncropped
 export turned by `orient` being the turned export, and a band past the end
-or of no rows refused.
+or of no rows refused; and the zoom geometry: the extent and the fit zoom
+following the crop and the orientation (the fit half at most), the viewport
+holding the box at each zoom, rounded up and cut to the level, its target
+no more than the box (an odd box at 100 its own size) and following the
+window's axes when turned, centred and clamped to the crop's edges and
+refusing a zoom off the ladder, an empty box, a degenerate crop or a bad
+level, a zoomed level 2 at half zoom being that window of the whole
+frame's level 2 at every orientation with and without a crop (the inverse
+mapping pinned against the orient it inverts), a bad level or a window
+past it refused, and a zoom past half being the doubled window's bilinear
+level 1 oriented, an odd box's region cut to its photosites exactly, a
+window past the crop refused.
 
 `tests/look.rs` holds the look format to its refusals by line (the header, a
 blank line, an unknown word, a second or over-long name, every arity and range,
@@ -1606,6 +1721,23 @@ the develop controls (the bands' geometry, the buttons enabled as the
 photo's crop and steps allow and inert otherwise, each button's effect and
 `C`'s, `exposure` accepted and refused, the bands' chrome and a move or
 release over them inert, no facts row, a narrow surface laying no slider;
+the zoom: `zoom_step`'s ladder from any fit, the actions refused in cull,
+the fit and a step without the extent `ignored`, 100% a change reported in
+`state`, the status row and the selected button, the ladder walked in and
+out by action, key and wheel once the extent is reported (a turn a step,
+none with no rows), an image held whole with no step in, the zoom kept
+across photos and dropped on leaving develop and by crop-adjust (which
+holds the actions, the wheel and the buttons off, Fit unselected; the
+wheel inert under the palette), the Fit and 100% buttons, a zoom mid crop
+drag dropping the drag, the four chords; the pan: a
+press in the fitted box the marquee's and in the zoomed box the pan's, a
+move shifting the frame and `pan_shift` saying by how much, the release
+moving the centre against the travel at the zoom's photosites a pixel, a
+click, a stray move or release and a press off the box inert, the centre
+clamped to the window's room at either edge and held across a zoom, a
+photo switch dropping the pan, the extent unknown moving nothing, a
+reported extent or a resize bringing the centre into the room without a
+bump, and the centre the middle again once develop is left;
 the slider's mapping at its ends and between, a press on the knob's own
 step and a release there writing nothing, a jump, a drag and its release
 committing, a drag back to the value in force releasing without a write,
@@ -1624,7 +1756,9 @@ wider one, fewer shown than boxes, an even box count, the wants bounded on a
 roll of twenty, and the chooser withholding the boxes but not the wants); the
 `--preview --develop` of a roll whose embedded previews are flat JPEGs
 blitting each into its strip box (`control_process.rs`), the native
-compositor leg holding the live frame to it;
+compositor leg holding the live frame to it, and `--preview --develop
+--zoom` of a frame dark but for a square at its centre showing the square
+its own size where the fit shrank it, `--zoom` refused without `--develop`;
 the export action (asking for the cursor photo in either mode by verb and by
 `e`, refused without a roll or a photo, not repeating on a held key, the
 dispatch moving nothing; the note set, shown at the row's end, a new generation
@@ -1637,6 +1771,8 @@ cannot be decoded `refused` with the row saying it failed, a refused sidecar
 refusing a bad socket path, a second roll or a stray flag before it looks for a
 display and leaving no socket behind when the display is not there;
 `src/window.rs`'s own tests hold `wait_ms`'s grammar, the envelope's ID, the
+held shift (the centres' difference as pixels at the zoom, nothing for a
+centre the model normalized), the
 charge of a held entry, the queue's replacement skipping what runs and the
 pool's count staying outstanding until a result is collected, the pool running
 one develop at a time and dropping its queued plan when one finishes, a
@@ -1646,7 +1782,10 @@ and taken first once replanned, a prefetched frame joining the cache only into
 room and never evicting, evicted before a frame shown, refused for good when
 it could not decode and until the room is there when it had none, the memo
 planning each develop from what it holds (level 3 for an exposure or look edit,
-level 2 for a resize, level 1 for a cached photo, else a decode), untouched by a
+level 2 for a resize, level 1 for a cached photo, else a decode; a zoom of the
+current photo from its level 1 with the cached frame, without it through half
+zoom alone and past half a decode, a zoomed result leaving the fit levels
+current, and a zoom of a cached photo not current from level 1), untouched by a
 failed develop, caching but not becoming current for a develop that finishes off
 the cursor, the raw cache evicting the least recently shown under
 `RAW_CACHE_BYTES`, an export keyed by its own path as the memo keys it, and the
@@ -1667,7 +1806,9 @@ then parked in the desktop bar, since the seat draws the client's cursor over
 the tile), `first` over the socket restoring the frame, and `quit` closing the
 window with its socket gone. A second native case, on a synthesized decodable
 NEF, develops the cursor photo over the socket and holds the captured tile to
-`--preview --develop` of the roll before and after an exposure edit, then
+`--preview --develop` of the roll before and after an exposure edit, zooms
+to 100% over the socket (the tile `--preview --develop --zoom`, the box
+changed) and back to the fit (the tile the fitted frame again), then
 exports over the socket: with the sidecar naming a look no file provides the
 export fails and the row says so with nothing written, and with the look cleared
 `wait-idle` waits for the pool's export, the JPEG is in `exported/` and the row
@@ -1819,6 +1960,10 @@ preflight. A td-photo, td-ui or td-compositor edit selects this check in
    with no crop) draws a fresh crop over the whole frame the sub-mode develops,
    its handles adjust it, and leaving the sub-mode applies it, so the crop is
    chosen and adjusted over its own content before the preview crops. Landed.
-9. Later: the 100% loupe from level 0, DNG and JPEG rolls, the Nikon High
+   (e) The zoom: Fit and 100% on the tool band, `Z`, `f`, `]` and `[`, the
+   wheel stepping 25, 50 and 100 percent from the fit, a pan over the
+   zoomed box, the zoomed level 2 from level 1 through half zoom and from
+   level 0 past it, and `--preview --zoom`. Landed.
+9. Later: DNG and JPEG rolls, the Nikon High
    Efficiency codec, a better full-resolution demosaic, highlight
    reconstruction, the `.dtstyle` translator, and ratings.

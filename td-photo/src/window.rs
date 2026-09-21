@@ -107,16 +107,24 @@ pub fn open(rest: &[OsString]) -> Result<()> {
 /// `--preview WxH [ROLL]`: the frame the window would show for `ROLL` on a
 /// `W` by `H` surface once every thumbnail it wants is in, as a binary PPM
 /// on stdout: the scene as the seam paints it and the thumbnails blitted as
-/// the window blits them, made here on the calling thread.
+/// the window blits them, made here on the calling thread. `--zoom` after
+/// `--develop` shows the develop box at 100% around the image's centre, as
+/// `zoom-100` does.
 pub fn preview(rest: &[OsString]) -> Result<()> {
     let [size, rest @ ..] = rest else {
         return Err("--preview needs WxH; see --help".to_string());
     };
     let mut roll: Option<PathBuf> = None;
     let mut develop: Option<usize> = None;
+    let mut zoom = false;
     let mut args = rest.iter();
     while let Some(arg) = args.next() {
-        if arg == "--develop" {
+        if arg == "--zoom" {
+            if develop.is_none() {
+                return Err("--zoom needs --develop before it; see --help".to_string());
+            }
+            zoom = true;
+        } else if arg == "--develop" {
             if develop.is_some() {
                 return Err("--develop may be given only once".to_string());
             }
@@ -153,6 +161,12 @@ pub fn preview(rest: &[OsString]) -> Result<()> {
     let mut session = session(width, height, roll.as_deref())?;
     if let Some(position) = develop {
         enter_develop(&mut session, position)?;
+        if zoom {
+            session
+                .ui
+                .action("zoom-100", &[])
+                .map_err(|e| format!("--zoom: {e}"))?;
+        }
     }
     let font = td_ui::font::pinned()?;
     let surface = session.ui.surface();
@@ -248,9 +262,10 @@ fn enter_develop(session: &mut Session, position: usize) -> Result<()> {
 }
 
 /// The developed preview for a `--preview --develop` session: the develop
-/// box and the cursor photo developed to fit it, at the sidecar's exposure
-/// and look, made on the calling thread; `None` when not developing or the
-/// develop cannot be made, leaving the box its placeholder.
+/// box and the cursor photo developed to fit it, or to the model's zoom,
+/// at the sidecar's exposure and look, made on the calling thread; `None`
+/// when not developing or the develop cannot be made, leaving the box its
+/// placeholder.
 fn developed(session: &Session, roll: &Path) -> Option<(td_ui::raster::Rect, Rgb8)> {
     let r#box = session.ui.develop_box()?;
     let index = session.ui.cursor()?;
@@ -270,6 +285,7 @@ fn developed(session: &Session, roll: &Path) -> Option<(td_ui::raster::Rect, Rgb
         exposure,
         look,
         crop,
+        session.ui.zoom(),
         threads(),
     )?;
     Some((r#box, image))
@@ -294,9 +310,10 @@ impl Key {
 }
 
 /// What a worker develops the preview by: the roll, the photo in it, the
-/// box it fits, the sidecar's crop, exposure and look, so the same photo at
-/// another box, crop, exposure or look is another develop. There is no
-/// generation: two requests with the same fields yield the same pixels.
+/// box it fits, the sidecar's crop, exposure and look, and the zoom and
+/// its centre when the box does not fit the image, so the same photo at
+/// another box, crop, exposure, look or zoom is another develop. There is
+/// no generation: two requests with the same fields yield the same pixels.
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct Preview {
     roll: PathBuf,
@@ -306,13 +323,28 @@ struct Preview {
     crop: Option<library::Crop>,
     exposure: i32,
     look: Option<String>,
+    zoom: Option<(u32, (u32, u32))>,
+}
+
+impl Preview {
+    /// The zoom as the pipeline takes it, with the box.
+    fn zoom(&self) -> Option<develop::Zoom> {
+        self.zoom.map(|(percent, centre)| develop::Zoom {
+            percent,
+            centre,
+            box_w: self.box_w,
+            box_h: self.box_h,
+        })
+    }
 }
 
 /// The level a develop starts from, and the cached levels it reuses: an
 /// exposure or look edit starts at `Level3` (level 2 reused), a resize at
 /// `Level2` (level 1 reused), a photo whose level 0 is cached at `Level1`,
-/// and a new photo at `Decode`. The window plans it from what its memo
-/// holds; the worker runs from here forward.
+/// and a new photo at `Decode`; a zoomed develop of the current photo
+/// starts at `Zoom` (level 1 reused, and the cached level 0 with it past
+/// `HALF_ZOOM`). The window plans it from what its memo holds; the worker
+/// runs from here forward.
 enum Start {
     Decode,
     Level1 {
@@ -326,6 +358,11 @@ enum Start {
         meta: crate::Meta,
         level2: Arc<develop::Level2>,
     },
+    Zoom {
+        raw: Option<Arc<crate::RawFrame>>,
+        meta: crate::Meta,
+        level1: Arc<develop::Level1>,
+    },
 }
 
 /// Which level a develop began at: what the memo tests read from a plan.
@@ -336,6 +373,8 @@ enum Stage {
     Level1,
     Level2,
     Level3,
+    /// A zoom start, and whether it carries the level-0 frame.
+    Zoom(bool),
 }
 
 #[cfg(test)]
@@ -346,14 +385,17 @@ impl Start {
             Start::Level1 { .. } => Stage::Level1,
             Start::Level2 { .. } => Stage::Level2,
             Start::Level3 { .. } => Stage::Level3,
+            Start::Zoom { raw, .. } => Stage::Zoom(raw.is_some()),
         }
     }
 }
 
 /// What a develop produced, to merge into the window's memo and show: each
 /// variant carries only the levels recomputed, since the window already
-/// holds the earlier ones. `None` when it could not be made (said on
-/// stderr), which redraws the box's placeholder.
+/// holds the earlier ones; a zoomed develop's fit level 2 is kept as the
+/// current one so leaving the zoom reruns level 3 alone, while its zoomed
+/// level 2 is transient, remade on the next zoom or pan. `None` when it
+/// could not be made (said on stderr), which redraws the box's placeholder.
 enum Made {
     Decoded {
         raw: Arc<crate::RawFrame>,
@@ -379,6 +421,9 @@ enum Made {
         image: Rgb8,
     },
     Level3 {
+        image: Rgb8,
+    },
+    Zoom {
         image: Rgb8,
     },
     None,
@@ -842,19 +887,37 @@ fn develop_try(preview: &Preview, start: Start) -> Result<Made> {
             threads,
         )
     };
-    // Level 1 to its level 2 and frame, shared by the decode and cached-raw
-    // starts.
-    let from_level1 = |level1: &develop::Level1, meta: &crate::Meta| {
+    // The zoomed frame from level 1, and the level 0 past half zoom: the
+    // window's zoomed level 2 is transient, so it goes straight to the
+    // frame.
+    let zoomed = |level1: &develop::Level1, raw: Option<&crate::RawFrame>, meta: &crate::Meta| {
+        let zoom = preview.zoom().ok_or_else(|| "no zoom".to_string())?;
+        let level2 = crate::zoom_level2(level1, raw, meta, crop, zoom, threads)?;
+        frame(&level2, meta)
+    };
+    // Level 1 to its fit level 2 and the frame -- the zoomed one when the
+    // preview zooms, the fit level 2 kept either way -- shared by the
+    // decode and cached-raw starts, which have the frame for a zoom past
+    // half.
+    let from_level1 = |level1: &develop::Level1, raw: &crate::RawFrame, meta: &crate::Meta| {
         let level2 = crate::level1_level2(level1, meta, crop, long_edge, threads)?;
-        let image = frame(&level2, meta)?;
+        let image = if preview.zoom.is_some() {
+            zoomed(level1, Some(raw), meta)?
+        } else {
+            frame(&level2, meta)?
+        };
         Ok::<_, String>((level2, image))
     };
     Ok(match start {
         Start::Level3 { meta, level2 } => Made::Level3 {
             image: frame(&level2, &meta)?,
         },
+        Start::Zoom { raw, meta, level1 } => Made::Zoom {
+            image: zoomed(&level1, raw.as_deref(), &meta)?,
+        },
         Start::Level2 { meta, level1 } => {
-            let (level2, image) = from_level1(&level1, &meta)?;
+            let level2 = crate::level1_level2(&level1, &meta, crop, long_edge, threads)?;
+            let image = frame(&level2, &meta)?;
             Made::Level2 {
                 long_edge,
                 crop: preview.crop,
@@ -865,7 +928,7 @@ fn develop_try(preview: &Preview, start: Start) -> Result<Made> {
         Start::Level1 { raw } => {
             let meta = raw.meta();
             let level1 = crate::raw_level1(&raw, threads)?;
-            let (level2, image) = from_level1(&level1, &meta)?;
+            let (level2, image) = from_level1(&level1, &raw, &meta)?;
             Made::Level1 {
                 meta,
                 level1: Arc::new(level1),
@@ -879,7 +942,7 @@ fn develop_try(preview: &Preview, start: Start) -> Result<Made> {
             let (raw, _info) = crate::decode_raw(&preview.roll.join(&preview.name))?;
             let meta = raw.meta();
             let level1 = crate::raw_level1(&raw, threads)?;
-            let (level2, image) = from_level1(&level1, &meta)?;
+            let (level2, image) = from_level1(&level1, &raw, &meta)?;
             Made::Decoded {
                 raw: Arc::new(raw),
                 meta,
@@ -891,6 +954,39 @@ fn develop_try(preview: &Preview, start: Start) -> Result<Made> {
             }
         }
     })
+}
+
+/// How far a window developed around `from` lies from one wanted around
+/// `want`, in surface pixels at `zoom` percent over `extent` in a box:
+/// units of the axis to photosites, then to pixels, the held centre
+/// against the wanted one, so an image blitted by it is where its content
+/// is. Both centres are held inside the image first (`ui::clamped_centre`,
+/// the rule the viewport clamps by), so a centre the model normalized
+/// after the develop was asked for -- a photo switch landing before its
+/// extent is known -- names the same window and shifts nothing.
+fn centre_shift(
+    from: (u32, u32),
+    want: (u32, u32),
+    zoom: u32,
+    extent: (usize, usize),
+    r#box: (usize, usize),
+) -> (i64, i64) {
+    let (box_w, box_h) = (
+        u32::try_from(r#box.0).unwrap_or(u32::MAX),
+        u32::try_from(r#box.1).unwrap_or(u32::MAX),
+    );
+    let from = ui::clamped_centre(from, zoom, extent, box_w, box_h);
+    let want = ui::clamped_centre(want, zoom, extent, box_w, box_h);
+    let shift = |held: u32, want: u32, extent: usize| {
+        (i64::from(held) - i64::from(want))
+            .saturating_mul(i64::try_from(extent).unwrap_or(i64::MAX))
+            .saturating_mul(i64::from(zoom))
+            / (i64::from(develop::CENTRE_UNIT) * 100)
+    };
+    (
+        shift(from.0, want.0, extent.0),
+        shift(from.1, want.1, extent.1),
+    )
 }
 
 // ----------------------------------------------------------------- window
@@ -1014,28 +1110,43 @@ impl Memo {
     /// The level a develop for `preview` starts from, given what is held:
     /// level 3 when its level 2 is current for the box and crop, level 2 when
     /// only level 1 is (a resize or crop edit), level 1 when the level 0 is
-    /// cached, else a decode. Each start carries the cached levels the worker
-    /// reuses.
+    /// cached, else a decode; a zoomed develop of the current photo starts
+    /// at its level 1 with the cached level 0 (a zoom past half needs it:
+    /// evicted, the decode starts over, caching it again). Each start
+    /// carries the cached levels the worker reuses.
     fn plan(&self, preview: &Preview) -> Start {
         let long_edge = preview.box_w.max(preview.box_h);
+        let raw = self
+            .raw
+            .iter()
+            .find(|cached| cached.key.is(preview))
+            .map(|cached| Arc::clone(&cached.frame));
         if let Some(current) = &self.current {
             if current.key.is(preview) {
-                if current.long_edge == long_edge && current.crop == preview.crop {
+                if let Some((zoom, _)) = preview.zoom {
+                    if zoom <= develop::HALF_ZOOM || raw.is_some() {
+                        return Start::Zoom {
+                            raw,
+                            meta: current.meta,
+                            level1: Arc::clone(&current.level1),
+                        };
+                    }
+                } else if current.long_edge == long_edge && current.crop == preview.crop {
                     return Start::Level3 {
                         meta: current.meta,
                         level2: Arc::clone(&current.level2),
                     };
                 }
-                return Start::Level2 {
-                    meta: current.meta,
-                    level1: Arc::clone(&current.level1),
-                };
+                if preview.zoom.is_none() {
+                    return Start::Level2 {
+                        meta: current.meta,
+                        level1: Arc::clone(&current.level1),
+                    };
+                }
             }
         }
-        if let Some(cached) = self.raw.iter().find(|cached| cached.key.is(preview)) {
-            return Start::Level1 {
-                raw: Arc::clone(&cached.frame),
-            };
+        if let Some(raw) = raw {
+            return Start::Level1 { raw };
         }
         Start::Decode
     }
@@ -1116,6 +1227,11 @@ impl Memo {
                 _ => None,
             },
             Made::Level3 { image } => Some(image),
+            Made::Zoom { image } => {
+                // The level 0 it may have run from stays recent.
+                self.touch_raw(&key, shown);
+                Some(image)
+            }
             Made::None => None,
         }
     }
@@ -1658,16 +1774,93 @@ impl Window {
     }
 
     /// Reports the developed image's fitted rectangle to the model as the
-    /// crop drag's canvas: a fact, so it does not bump the generation.
+    /// crop drag's canvas, and the cursor photo's extent as the zoom's
+    /// measure: facts, so they do not bump the generation.
     fn report_preview_fit(&mut self) {
         let fit = self.preview_fit();
         self.session.ui.set_preview_fit(fit);
+        let extent = self.zoom_extent();
+        self.session.ui.set_zoom_extent(extent);
+    }
+
+    /// Whether the held develop is the wanted one up to a centre the model
+    /// normalized after it was asked for: a photo switch lands the zoomed
+    /// develop before its extent is known, then `clamp_centre` moves the
+    /// centre into the room, naming the window the develop already clamped
+    /// to, so it is not asked for again.
+    fn normalized(&self, want: &Preview, have: &Preview) -> bool {
+        let (Some((zoom, wanted)), Some((held_zoom, held))) = (want.zoom, have.zoom) else {
+            return false;
+        };
+        let (Some(extent), Ok(box_w), Ok(box_h)) = (
+            self.zoom_extent(),
+            u32::try_from(want.box_w),
+            u32::try_from(want.box_h),
+        ) else {
+            return false;
+        };
+        zoom == held_zoom
+            && Preview {
+                zoom: want.zoom,
+                ..have.clone()
+            } == *want
+            && ui::clamped_centre(held, zoom, extent, box_w, box_h)
+                == ui::clamped_centre(wanted, zoom, extent, box_w, box_h)
+    }
+
+    /// How far the held zoomed image's window lies from the one the model
+    /// wants, in surface pixels, while the develop at a moved centre is on
+    /// its way: the held image is blitted shifted by it, so a pan's release
+    /// leaves the image where the pointer left it until the new frame
+    /// lands, rather than snapping back and then jumping. Zero unless the
+    /// held develop differs from the wanted one only by its centre (an
+    /// exposure or look edit racing the release shifts the same), and zero
+    /// for a centre the model only normalized (`centre_shift`).
+    fn held_shift(&self) -> (i64, i64) {
+        let none = (0, 0);
+        let Some(wanted) = self.wanted_preview() else {
+            return none;
+        };
+        let Some((held, Some(_))) = self.developed.as_ref() else {
+            return none;
+        };
+        let (Some((zoom, want)), Some((held_zoom, from))) = (wanted.zoom, held.zoom) else {
+            return none;
+        };
+        let same = held_zoom == zoom
+            && held.name == wanted.name
+            && held.crop == wanted.crop
+            && (held.box_w, held.box_h) == (wanted.box_w, wanted.box_h);
+        let (Some(extent), true) = (self.zoom_extent(), same) else {
+            return none;
+        };
+        centre_shift(from, want, zoom, extent, (wanted.box_w, wanted.box_h))
+    }
+
+    /// The cursor photo's oriented, cropped extent at full resolution, at
+    /// the crop the mode wants, from the level 1 the memo holds current for
+    /// it; `None` before a develop of the photo lands.
+    fn zoom_extent(&self) -> Option<(usize, usize)> {
+        let wanted = self.wanted_preview()?;
+        let current = self
+            .memo
+            .current
+            .as_ref()
+            .filter(|current| current.key.is(&wanted))?;
+        crate::level1_extent(
+            &current.level1,
+            &current.meta,
+            wanted.crop.map(crate::crop_fractions),
+        )
     }
 
     /// The develop box rectangle the cursor photo's held developed image
     /// fills, centred as `ui::blit` centres it, or `None` when not developing
-    /// or no image is held for the cursor photo yet at the crop the mode
-    /// wants: in crop-adjust the uncropped frame, else the sidecar's crop.
+    /// or no image is held for the cursor photo yet at the crop and zoom the
+    /// mode wants: in crop-adjust the uncropped frame, else the sidecar's
+    /// crop. Zoomed, the fit is unused (the box is no crop canvas and the
+    /// pan needs none), so a held develop `normalized` treats as the wanted
+    /// one need not be one here.
     /// The held frame of the other crop is still shown while the wanted one
     /// is made, but it is no canvas: a crop drawn or dragged against it
     /// would map onto content the frame does not show.
@@ -1678,7 +1871,11 @@ impl Window {
         let image = self
             .developed
             .as_ref()
-            .filter(|(preview, _)| preview.name == wanted.name && preview.crop == wanted.crop)
+            .filter(|(preview, _)| {
+                preview.name == wanted.name
+                    && preview.crop == wanted.crop
+                    && preview.zoom == wanted.zoom
+            })
             .and_then(|(_, image)| image.as_ref())?;
         let width = i64::try_from(image.width).ok()?;
         let height = i64::try_from(image.height).ok()?;
@@ -1862,6 +2059,7 @@ impl Window {
                 .as_ref()
                 .and_then(|sidecar| sidecar.look())
                 .map(str::to_string),
+            zoom: ui.zoom(),
         })
     }
 
@@ -1909,7 +2107,7 @@ impl Window {
         // for, planned from the memo so only the invalidated levels rerun.
         let preview = self.wanted_preview();
         let submit = match (&preview, &self.developed) {
-            (Some(want), Some((have, _))) if want == have => None,
+            (Some(want), Some((have, _))) if want == have || self.normalized(want, have) => None,
             (Some(want), _) => Some((want.clone(), self.memo.plan(want))),
             (None, _) => None,
         };
@@ -2081,6 +2279,7 @@ impl Window {
         }
         let surface = self.session.ui.surface();
         let stride = surface.width * 4;
+        let held_shift = self.held_shift();
         let Window {
             client,
             font,
@@ -2128,7 +2327,17 @@ impl Window {
                 }
             }
             if let Some((r#box, image)) = develop {
-                ui::blit(pixels, surface, stride, area, r#box, image).map_err(error)?;
+                // A pan in progress shifts the held image by the pointer's
+                // travel, within the box, and once released by how far the
+                // held window lies from the one asked for (`held_shift`),
+                // until the develop at the moved centre lands.
+                let (dx, dy) = ui.pan_shift();
+                let shifted = td_ui::raster::Rect {
+                    x: r#box.x.saturating_add(dx).saturating_add(held_shift.0),
+                    y: r#box.y.saturating_add(dy).saturating_add(held_shift.1),
+                    ..r#box
+                };
+                ui::blit(pixels, surface, stride, r#box, shifted, image).map_err(error)?;
             }
             // Within the area as the blits were: the status band covers a
             // badge that runs under it.
@@ -2229,6 +2438,7 @@ mod tests {
             crop: None,
             exposure: 0,
             look: None,
+            zoom: None,
         }
     }
 
@@ -2636,6 +2846,103 @@ mod tests {
         // Cleared, everything is a decode again.
         memo.clear();
         assert_eq!(memo.plan(&a).stage(), Stage::Decode);
+    }
+
+    #[test]
+    fn a_zoomed_develop_starts_at_level_1_with_the_frame_past_half() {
+        let mut memo = Memo::default();
+        let a = preview("a");
+        let half = Preview {
+            zoom: Some((develop::HALF_ZOOM, (5000, 5000))),
+            ..a.clone()
+        };
+        let full = Preview {
+            zoom: Some((100, (5000, 5000))),
+            ..a.clone()
+        };
+        // Nothing held: a decode, which makes the fit levels and the
+        // zoomed frame together.
+        assert_eq!(memo.plan(&half).stage(), Stage::Decode);
+        assert!(memo.merge(&a, made_decoded(4, 300), 1, true).is_some());
+        // The photo current and its level 0 cached: a zoom start either
+        // way, carrying the frame.
+        assert_eq!(memo.plan(&half).stage(), Stage::Zoom(true));
+        assert_eq!(memo.plan(&full).stage(), Stage::Zoom(true));
+        // A zoom at another box or crop is still a zoom start: the fit
+        // level 2 is not what it draws from.
+        let wide = Preview {
+            box_w: 600,
+            ..half.clone()
+        };
+        assert_eq!(memo.plan(&wide).stage(), Stage::Zoom(true));
+        // A zoomed result leaves the fit levels current: back to the fit
+        // is level 3 alone.
+        assert!(memo
+            .merge(
+                &full,
+                Made::Zoom {
+                    image: Rgb8 {
+                        width: 1,
+                        height: 1,
+                        data: vec![0, 0, 0],
+                    },
+                },
+                2,
+                true
+            )
+            .is_some());
+        assert_eq!(memo.plan(&a).stage(), Stage::Level3);
+        // The level 0 evicted: through half the zoom runs from level 1
+        // alone; past it the decode starts over.
+        memo.raw.clear();
+        memo.raw_bytes = 0;
+        assert_eq!(memo.plan(&half).stage(), Stage::Zoom(false));
+        assert_eq!(memo.plan(&full).stage(), Stage::Decode);
+        // Another photo whose level 0 is cached but is not current: level
+        // 1, which makes the fit levels and the zoomed frame from the
+        // frame.
+        let b = preview("b");
+        assert!(memo.merge(&b, made_decoded(4, 300), 3, false).is_some());
+        let b_full = Preview {
+            zoom: Some((100, (0, 0))),
+            ..b
+        };
+        assert_eq!(memo.plan(&b_full).stage(), Stage::Level1);
+    }
+
+    #[test]
+    fn the_held_shift_is_the_centres_difference_as_pixels_and_zero_once_normalized() {
+        // At 100 over 6000x4000 in a 600x400 box: a release that moved the
+        // centre by a hundredth of each axis, right and up, shifts the held
+        // image sixty right and forty up, the travel that made it.
+        let extent = (6000, 4000);
+        let r#box = (600, 400);
+        assert_eq!(
+            centre_shift((5000, 5000), (4900, 5100), 100, extent, r#box),
+            (60, -40)
+        );
+        assert_eq!(
+            centre_shift((4900, 5100), (5000, 5000), 100, extent, r#box),
+            (-60, 40)
+        );
+        // At 50 a unit is half the pixels.
+        assert_eq!(
+            centre_shift((5000, 5000), (4900, 5100), 50, extent, r#box),
+            (30, -20)
+        );
+        // A held centre outside the room (a photo switch landing before the
+        // extent was known) names the clamped window: against the centre
+        // the model then normalized it to, nothing shifts.
+        let margin = 600 * 5000 / 6000;
+        assert_eq!(
+            ui::clamped_centre((9900, 5000), 100, extent, 600, 400),
+            (10_000 - margin, 5000)
+        );
+        assert_eq!(
+            centre_shift((9900, 5000), (10_000 - margin, 5000), 100, extent, r#box),
+            (0, 0)
+        );
+        assert_eq!(centre_shift((0, 0), (0, 0), 100, extent, r#box), (0, 0));
     }
 
     #[test]
