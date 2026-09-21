@@ -30,6 +30,50 @@ pub enum Key {
     /// A request of the document pane's kind (`save`, `close-tab`), from
     /// a bar label; the session serves it as it serves the pane's own.
     Request(&'static str),
+    /// A bar label that opens a dropdown of the view's keys rather than
+    /// being one: the session opens it under the label, and the key the
+    /// dropdown activates is the view's, as the label would have been.
+    Menu(Menu),
+}
+
+/// The dropdowns a bar label opens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Menu {
+    /// The mailbox list's folder actions.
+    Folder,
+}
+
+/// One row of a dropdown: its label, the shortcut shown at its right,
+/// the view's key it is, and whether it needs the view's list to have
+/// rows (a folder to delete), without which it is shown disabled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MenuRow {
+    pub label: &'static str,
+    pub shortcut: &'static str,
+    pub key: Key,
+    pub needs_row: bool,
+}
+
+impl Menu {
+    /// The dropdown's rows, in order.
+    pub fn rows(self) -> &'static [MenuRow] {
+        match self {
+            Menu::Folder => &[
+                MenuRow {
+                    label: "New folder",
+                    shortcut: "+",
+                    key: Key::Char('+'),
+                    needs_row: false,
+                },
+                MenuRow {
+                    label: "Delete folder",
+                    shortcut: "d",
+                    key: Key::Char('d'),
+                    needs_row: true,
+                },
+            ],
+        }
+    }
 }
 
 /// The key a chord names, or none.

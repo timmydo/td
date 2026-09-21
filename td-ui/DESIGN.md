@@ -1421,10 +1421,15 @@ The editor uses this controller for its complete menus. Its immutable
 data captures application availability, checks, shortcuts and
 tab/revision/key profile. Its adapter owns document cancellation policy
 and executes typed items through existing commands; it has no private
-menu navigation state. `tests/menus.rs` covers tree and text bounds,
-disabled navigation, nested pointer paths, left/replacement placement,
-Back, scroll/reveal, revision invalidation, focus/resize, repeated input
-and complete-mode compatibility. Draw-stream and pixel oracles preserve
+menu navigation state. td-mail's mailbox list opens a context menu of
+its folder actions under its action bar's Folder label through the same
+controller, in adaptive fit, the session routing keys and the pointer
+to it while it is open, painting it after its frame, and closing it
+when the view it was opened for goes under it.
+`tests/menus.rs` covers tree and text bounds, disabled navigation,
+nested pointer paths, left/replacement placement, Back, scroll/reveal,
+revision invalidation, focus/resize, repeated input and complete-mode
+compatibility. Draw-stream and pixel oracles preserve
 the editor's existing panel output at scales one through four; its scene
 and native input regressions remain.
 

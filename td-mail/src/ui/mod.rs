@@ -16,8 +16,8 @@ use crate::compose;
 use crate::config::{AccountConfig, RetentionPolicyConfig, SpamConfig};
 use crate::regex::UserRegex;
 use crate::rules::CompiledRule;
-use frame::{Draft, Frame, Layout, Pane};
-use input::Key;
+use frame::{Draft, Dropdown, Frame, Layout, Pane};
+use input::{Key, Menu};
 use std::io;
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -25,6 +25,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use td_editor::model::TabId;
 use td_editor::ui::Outcome;
+use td_ui::menus;
 use td_ui::raster::{Raster, Surface};
 use td_ui::window::{Clipboard, Flow, Handler, Input, PointerPhase, Refusal};
 use views::compose::ComposeView;
@@ -228,6 +229,10 @@ struct Session {
     /// What the clipboard last refused, or the window last noticed, in
     /// the status row until the next key or press.
     note: Option<String>,
+    /// The dropdown a bar label opened, over the frame and taking every
+    /// key and press until it activates one of the view's keys or is
+    /// dismissed.
+    menu: Option<Dropdown>,
 }
 
 impl Session {
@@ -257,6 +262,7 @@ impl Session {
             asks: Vec::new(),
             paste_target: None,
             note: None,
+            menu: None,
         };
         // The window reads the title at binding, before any poll.
         session.refresh_title();
@@ -571,6 +577,10 @@ impl Session {
             self.request(name);
             return;
         }
+        if let Key::Menu(menu) = key {
+            self.open_menu(menu);
+            return;
+        }
         let page = self.page();
         match self.stack.handle_key(key, page) {
             Some(action) => self.act(action),
@@ -607,6 +617,161 @@ impl Session {
                 }
             }
         }
+    }
+
+    /// Opens a bar label's dropdown under the label, a context menu of
+    /// the view's keys, a row that needs the list to have rows disabled
+    /// without them; a view whose bar has no such label opens nothing,
+    /// and a surface without room for the dropdown says so in the status
+    /// row instead.
+    fn open_menu(&mut self, menu: Menu) {
+        let Some((anchor, rows)) = self.shape().and_then(|shape| {
+            let index = shape.keys.iter().position(|&key| key == Key::Menu(menu))?;
+            let anchor = shape.layout.bar.header(index)?;
+            Some((anchor, shape.total.is_some_and(|total| total > 0)))
+        }) else {
+            return;
+        };
+        let (x, y) = (anchor.x, anchor.y.saturating_add(i64::from(anchor.height)));
+        let nodes: Vec<menus::Node<'static, Key>> = menu
+            .rows()
+            .iter()
+            .map(|row| menus::Node {
+                parent: None,
+                row: td_ui::chrome::Row {
+                    label: row.label,
+                    shortcut: row.shortcut,
+                    enabled: rows || !row.needs_row,
+                    checked: false,
+                },
+                item: menus::Item::Action(row.key),
+            })
+            .collect();
+        let opened = menus::Model::new(menus::Kind::Context, menu, &nodes)
+            .and_then(|model| menus::Controller::new(model, self.surface, menus::Fit::Adaptive))
+            .and_then(|mut widget| widget.open_context(x, y).map(|()| widget));
+        match opened {
+            Ok(widget) => self.menu = Some(widget),
+            Err(error) => self.note(format!("menu: {error}")),
+        }
+        self.redraw();
+    }
+
+    /// Whether the open dropdown is still the shown view's: the view it
+    /// was opened for may have gone under it (a response pushed another,
+    /// or the view changed its mode), and its rows are then nobody's.
+    fn menu_current(&self) -> Option<Menu> {
+        let menu = self.menu.as_ref()?.model().revision();
+        self.shape()
+            .filter(|shape| shape.keys.contains(&Key::Menu(menu)))
+            .map(|_| menu)
+    }
+
+    /// Closes the dropdown when the view it was opened for is no longer
+    /// the one shown.
+    fn drop_stale_menu(&mut self) {
+        if self.menu.is_some() && self.menu_current().is_none() {
+            self.menu = None;
+            self.redraw();
+        }
+    }
+
+    /// An input while a dropdown is open, which is the dropdown's: the
+    /// toolkit's keys as the chord names them and every other chord
+    /// consumed, the pointer's press, move and release (a press outside
+    /// it dismisses it), the wheel scrolling its panel, and a focus
+    /// loss or a resize dismissing it. The key it activates is the
+    /// view's, as the label would have been. True when the input went
+    /// no further; a resize and a focus loss are the frame's and the
+    /// pane's as well, and a close, a paste, a pointer cancel and a
+    /// focus gained are not the dropdown's at all. A dropdown whose
+    /// view has gone under it is stale to the controller, which closes
+    /// it, and the input is the view's.
+    fn menu_input(&mut self, input: &Input<'_>) -> bool {
+        let current = self.menu_current();
+        let panel = self.menu.as_ref().and_then(|menu| menu.panel(0));
+        let event = match *input {
+            Input::Key { chord, repeat } => {
+                let key = match chord {
+                    "Up" => Some(menus::Key::Up),
+                    "Down" => Some(menus::Key::Down),
+                    "Left" => Some(menus::Key::Left),
+                    "Right" => Some(menus::Key::Right),
+                    "Return" | "Space" | " " => Some(menus::Key::Activate),
+                    "Escape" => Some(menus::Key::Escape),
+                    _ => None,
+                };
+                key.map_or(menus::Event::Other, |key| menus::Event::Key {
+                    key,
+                    repeated: repeat,
+                })
+            }
+            Input::Pointer {
+                phase: PointerPhase::Press,
+                x,
+                y,
+                ..
+            } => menus::Event::Press { x, y },
+            Input::Pointer {
+                phase: PointerPhase::Move,
+                x,
+                y,
+                ..
+            } => menus::Event::Move { x, y },
+            Input::Pointer {
+                phase: PointerPhase::Release,
+                ..
+            } => menus::Event::Release,
+            // The session has no pointer position for the wheel; the
+            // panel's own is what the controller scrolls by.
+            Input::Wheel { rows, .. } => match panel {
+                Some(panel) => menus::Event::Wheel {
+                    x: panel.x,
+                    y: panel.y,
+                    rows,
+                },
+                None => menus::Event::Other,
+            },
+            Input::Focus(false) => menus::Event::FocusLost,
+            Input::Resize(surface) => menus::Event::Resize(surface),
+            Input::Focus(true) | Input::Close | Input::Paste(_) | Input::CancelPointer => {
+                return false;
+            }
+        };
+        if matches!(
+            input,
+            Input::Key { .. } | Input::Pointer { .. } | Input::Wheel { .. }
+        ) {
+            self.last_user_activity = Instant::now();
+        }
+        let Some(widget) = self.menu.as_mut() else {
+            return false;
+        };
+        let outcome = widget.event(current, event);
+        if current.is_none() {
+            self.menu = None;
+            self.redraw();
+            return false;
+        }
+        match outcome {
+            Ok(menus::Outcome::Activated(key)) => {
+                self.menu = None;
+                self.redraw();
+                self.key(key);
+            }
+            Ok(menus::Outcome::Dismissed | menus::Outcome::Stale) => {
+                self.menu = None;
+                self.redraw();
+            }
+            Ok(menus::Outcome::Changed) => self.redraw(),
+            Ok(menus::Outcome::Ignored | menus::Outcome::Consumed) => {}
+            Err(error) => {
+                self.menu = None;
+                self.redraw();
+                self.note(format!("menu: {error}"));
+            }
+        }
+        !matches!(input, Input::Resize(_) | Input::Focus(false))
     }
 
     /// The compositor asks the window to close: it closes at once
@@ -748,6 +913,7 @@ impl Session {
             first: slot.first,
             entry_first: slot.entry_first,
             pane: &self.pane,
+            menu: self.menu.as_ref(),
         };
         td_ui::driven::text(&frame).expect("text").2
     }
@@ -775,68 +941,72 @@ impl Handler for Session {
         if presses && self.note.take().is_some() {
             self.redraw();
         }
-        match input {
-            // The clipboard's text, into the draft it was asked for, over
-            // its selection, while that draft is still the one being
-            // edited: closed, or under its save question, or another
-            // draft's, it goes nowhere, with a note.
-            Input::Paste(text) => {
-                let target = self.paste_target.take();
-                if target.is_none() || target != self.pane.tab() || !self.editing(false) {
-                    self.note(
-                        "paste dropped: the draft it was asked for is not being edited".into(),
-                    );
-                } else {
-                    match self.pane.insert(text) {
-                        Ok(true) => self.redraw(),
-                        Ok(false) => {}
-                        Err(why) => self.note(format!("paste refused: {why}")),
+        // A dropdown open over the frame takes the input first.
+        let taken = self.menu.is_some() && self.menu_input(&input);
+        if !taken {
+            match input {
+                // The clipboard's text, into the draft it was asked for, over
+                // its selection, while that draft is still the one being
+                // edited: closed, or under its save question, or another
+                // draft's, it goes nowhere, with a note.
+                Input::Paste(text) => {
+                    let target = self.paste_target.take();
+                    if target.is_none() || target != self.pane.tab() || !self.editing(false) {
+                        self.note(
+                            "paste dropped: the draft it was asked for is not being edited".into(),
+                        );
+                    } else {
+                        match self.pane.insert(text) {
+                            Ok(true) => self.redraw(),
+                            Ok(false) => {}
+                            Err(why) => self.note(format!("paste refused: {why}")),
+                        }
                     }
                 }
-            }
-            Input::Close => {
-                if self.close_requested() == Flow::Quit {
-                    return Flow::Quit;
+                Input::Close => {
+                    if self.close_requested() == Flow::Quit {
+                        return Flow::Quit;
+                    }
                 }
-            }
-            Input::Resize(surface) => {
-                self.surface = surface;
-                self.redraw();
-            }
-            // A repeat, a held key, has no press for the clipboard to
-            // take a selection at, and a paste it asked is still
-            // arriving: the chord is the kill ring's alone.
-            Input::Key { chord, repeat } => {
-                self.chord(chord);
-                if repeat {
-                    self.asks = std::mem::take(&mut self.asks)
-                        .into_iter()
-                        .filter_map(|ask| match ask {
-                            Ask::Copy(_) => None,
-                            Ask::Paste { .. } => Some(Ask::Paste { clipboard: false }),
-                        })
-                        .collect();
+                Input::Resize(surface) => {
+                    self.surface = surface;
+                    self.redraw();
                 }
-            }
-            Input::Pointer {
-                phase,
-                x,
-                y,
-                extend,
-            } => {
-                if self.mouse {
-                    self.pointer(phase, x, y, extend);
+                // A repeat, a held key, has no press for the clipboard to
+                // take a selection at, and a paste it asked is still
+                // arriving: the chord is the kill ring's alone.
+                Input::Key { chord, repeat } => {
+                    self.chord(chord);
+                    if repeat {
+                        self.asks = std::mem::take(&mut self.asks)
+                            .into_iter()
+                            .filter_map(|ask| match ask {
+                                Ask::Copy(_) => None,
+                                Ask::Paste { .. } => Some(Ask::Paste { clipboard: false }),
+                            })
+                            .collect();
+                    }
                 }
-            }
-            Input::CancelPointer => self.pane.cancel_pointer(),
-            Input::Wheel { rows, .. } => {
-                if self.mouse {
-                    self.wheel(rows);
+                Input::Pointer {
+                    phase,
+                    x,
+                    y,
+                    extend,
+                } => {
+                    if self.mouse {
+                        self.pointer(phase, x, y, extend);
+                    }
                 }
-            }
-            Input::Focus(focused) => {
-                self.pane.focus(focused);
-                self.redraw();
+                Input::CancelPointer => self.pane.cancel_pointer(),
+                Input::Wheel { rows, .. } => {
+                    if self.mouse {
+                        self.wheel(rows);
+                    }
+                }
+                Input::Focus(focused) => {
+                    self.pane.focus(focused);
+                    self.redraw();
+                }
             }
         }
         self.serve(clipboard);
@@ -863,6 +1033,7 @@ impl Handler for Session {
             self.take_pending();
         }
         self.take_pending();
+        self.drop_stale_menu();
         // The caret's blink is a paint only where the pane is shown.
         if self.pane.tick(now)
             && self
@@ -909,6 +1080,7 @@ impl Handler for Session {
                 first: slot.first,
                 entry_first: slot.entry_first,
                 pane: &self.pane,
+                menu: self.menu.as_ref(),
             };
             frame::paint(raster, &frame)?;
         }
@@ -1857,5 +2029,228 @@ mod frame_tests {
         key(&mut session, "n");
         assert_eq!(session.stack.depth(), 1);
         let _ = std::fs::remove_dir_all(&draft_dir);
+    }
+
+    /// The Folder label opens a dropdown of the folder actions under it,
+    /// which has every key and press while it is open: an unmapped key
+    /// is consumed, Escape and a press outside dismiss it, Return on a
+    /// row and a press on one are that row's key to the view, and a
+    /// focus loss or a resize closes it; the frame shows its rows.
+    #[test]
+    fn the_folder_label_opens_a_dropdown_of_the_folder_actions() {
+        let (mut session, _cmd_rx, _resp_tx) = session(true);
+        fn labels(session: &Session) -> &'static [&'static str] {
+            session.stack.current().unwrap().scene().labels
+        }
+        let index = labels(&session)
+            .iter()
+            .position(|&label| label == "Folder")
+            .expect("a Folder label");
+        let folder = session
+            .shape()
+            .unwrap()
+            .layout
+            .bar
+            .header(index)
+            .expect("the label's header");
+        let open = |session: &mut Session| {
+            press(session, folder.x + 2, folder.y + 2);
+            assert!(session.menu.is_some(), "the press opens the dropdown");
+        };
+        open(&mut session);
+        let shown = session.shown();
+        assert!(
+            shown.contains("New folder") && shown.contains("Delete folder"),
+            "{shown}"
+        );
+        // A key the dropdown does not map is its own, consumed: `c` does
+        // not compose.
+        key(&mut session, "c");
+        assert_eq!(session.stack.depth(), 1);
+        assert!(session.menu.is_some());
+        // Escape dismisses it, and the frame is as it was.
+        key(&mut session, "Escape");
+        assert!(session.menu.is_none());
+        assert!(!session.shown().contains("Delete folder"));
+        // The first row, New folder, is selected as it opens, so Return
+        // is its key, which opens the name entry.
+        open(&mut session);
+        key(&mut session, "Return");
+        assert!(session.menu.is_none());
+        assert_eq!(labels(&session), &["Create", "Cancel"]);
+        key(&mut session, "Escape");
+        assert!(labels(&session).contains(&"Folder"));
+        // Down is the second row, Delete folder, which puts the question
+        // for the selected mailbox.
+        open(&mut session);
+        key(&mut session, "Down");
+        key(&mut session, "Return");
+        assert!(session.menu.is_none());
+        assert!(
+            session.title().starts_with("Delete folder 'INBOX'?"),
+            "{}",
+            session.title()
+        );
+        key(&mut session, "Escape");
+        // A press on a row is that row's key as well.
+        open(&mut session);
+        let row = session
+            .menu
+            .as_ref()
+            .and_then(|menu| menu.row_rect(0))
+            .expect("the first row");
+        press(&mut session, row.x + 4, row.y + 2);
+        assert!(session.menu.is_none());
+        assert_eq!(labels(&session), &["Create", "Cancel"]);
+        key(&mut session, "Escape");
+        // A press outside the dropdown dismisses it and goes no further:
+        // the row under it is not opened.
+        open(&mut session);
+        let panel = session
+            .menu
+            .as_ref()
+            .and_then(|menu| menu.panel(0))
+            .expect("the panel");
+        let list = session.shape().unwrap().layout.list.expect("a list");
+        let outside = list.row(2).expect("a row");
+        assert!(!panel.contains(outside.x + 2, outside.y + 2));
+        press(&mut session, outside.x + 2, outside.y + 2);
+        session.poll(0);
+        assert!(session.menu.is_none());
+        assert_eq!(session.stack.depth(), 1);
+        // Space, as the keymap spells it unmodified, activates too, and
+        // Left is the controller's dismissal.
+        open(&mut session);
+        key(&mut session, " ");
+        assert!(session.menu.is_none());
+        assert_eq!(labels(&session), &["Create", "Cancel"]);
+        key(&mut session, "Escape");
+        open(&mut session);
+        key(&mut session, "Left");
+        assert!(session.menu.is_none());
+        // The dropdown's keys count as activity for the idle-sync clock.
+        open(&mut session);
+        session.last_user_activity = Instant::now() - Duration::from_secs(3600);
+        key(&mut session, "Down");
+        assert!(session.last_user_activity.elapsed() < Duration::from_secs(60));
+        key(&mut session, "Escape");
+        // A focus loss closes it, as does a resize, the pane and the
+        // frame taking those as ever.
+        open(&mut session);
+        session.input(Input::Focus(false), &mut NoClipboard);
+        assert!(session.menu.is_none());
+        session.input(Input::Focus(true), &mut NoClipboard);
+        open(&mut session);
+        session.input(
+            Input::Resize(Surface::new(900, 700, Default::default()).unwrap()),
+            &mut NoClipboard,
+        );
+        assert!(session.menu.is_none());
+        assert_eq!(session.surface.width, 900);
+    }
+
+    /// A dropdown is the view's it was opened for: a view pushed under
+    /// it, by a row's pending open completing or otherwise, closes it,
+    /// and a key that finds it stale is the new view's. A row that
+    /// needs the list to have rows is disabled without them, so it is
+    /// skipped and never activated. On a surface that shows the panel
+    /// one row short, the wheel scrolls it.
+    #[test]
+    fn a_dropdown_closes_under_a_pushed_view_and_disables_delete_without_folders() {
+        let (mut session, _cmd_rx, _resp_tx) = session(true);
+        let folder_index = |session: &Session| {
+            session
+                .stack
+                .current()
+                .unwrap()
+                .scene()
+                .labels
+                .iter()
+                .position(|&label| label == "Folder")
+                .expect("a Folder label")
+        };
+        let open = |session: &mut Session| {
+            let index = folder_index(session);
+            let folder = session
+                .shape()
+                .unwrap()
+                .layout
+                .bar
+                .header(index)
+                .expect("the label's header");
+            press(session, folder.x + 2, folder.y + 2);
+            assert!(session.menu.is_some(), "the press opens the dropdown");
+        };
+        // A row pressed, its open pending; then Folder: the open
+        // completes at the poll, under the dropdown, which closes.
+        let list = session.shape().unwrap().layout.list.expect("a list");
+        let row = list.row(1).expect("a row");
+        press(&mut session, row.x + 2, row.y + 2);
+        open(&mut session);
+        assert_eq!(session.stack.depth(), 1);
+        session.poll(0);
+        assert_eq!(session.stack.depth(), 2);
+        assert!(
+            session.menu.is_none(),
+            "the dropdown is not the email list's"
+        );
+        key(&mut session, "q");
+        assert_eq!(session.stack.depth(), 1);
+        // A view pushed with no poll between: the next key finds the
+        // dropdown stale, closes it, and is the pushed view's (Escape
+        // pops the help).
+        open(&mut session);
+        session.act(ViewAction::Push(Box::new(views::help::HelpView::new())));
+        assert_eq!(session.stack.depth(), 2);
+        key(&mut session, "Escape");
+        assert!(session.menu.is_none());
+        assert_eq!(session.stack.depth(), 1);
+        // On a surface with one row of room the panel shows one row:
+        // the wheel brings the second into view.
+        session.input(
+            Input::Resize(Surface::new(800, 40, Default::default()).unwrap()),
+            &mut NoClipboard,
+        );
+        open(&mut session);
+        let menu = session.menu.as_ref().unwrap();
+        assert!(menu.row_rect(0).is_some() && menu.row_rect(1).is_none());
+        session.input(
+            Input::Wheel {
+                rows: 1,
+                columns: 0,
+            },
+            &mut NoClipboard,
+        );
+        let menu = session.menu.as_ref().expect("still open");
+        assert!(menu.row_rect(0).is_none() && menu.row_rect(1).is_some());
+        key(&mut session, "Escape");
+        // Without mailboxes, Delete folder is disabled: Down stays on
+        // New folder, and Return is its key.
+        let setup = setup();
+        let (cmd_tx, _cmd_rx) = mpsc::channel();
+        let (resp_tx, resp_rx) = mpsc::channel();
+        let view = setup.mailbox_view(&cmd_tx, &account());
+        let stack = ViewStack::new(Box::new(view));
+        let mut empty = Session::new(setup, stack, cmd_tx, resp_rx, true).unwrap();
+        resp_tx
+            .send(BackendResponse::Mailboxes(Ok(Vec::new())))
+            .unwrap();
+        assert_eq!(empty.poll(0), Flow::Continue);
+        assert!(empty.shown().contains("No mailboxes found."));
+        open(&mut empty);
+        let menu = empty.menu.as_ref().unwrap();
+        assert!(menu.model().node(0).unwrap().row.enabled);
+        assert!(!menu.model().node(1).unwrap().row.enabled);
+        key(&mut empty, "Down");
+        assert_eq!(
+            empty.menu.as_ref().unwrap().selection(),
+            menus::Selection::Node(0)
+        );
+        key(&mut empty, "Return");
+        assert!(empty.menu.is_none());
+        assert_eq!(
+            empty.stack.current().unwrap().scene().labels,
+            &["Create", "Cancel"]
+        );
     }
 }

@@ -16,7 +16,12 @@ use td_ui::chrome::{Bar, Field, Item, List, Status, TextEntry, ROW};
 use td_ui::raster::{Composition, Draw, Primitive, Raster, Rect, Surface, PAPER};
 use td_ui::window::PointerPhase;
 
+use super::input::{Key, Menu};
 use super::views::{Body, Scene};
+
+/// A bar label's dropdown as the session holds it: the toolkit's menu
+/// controller over the view's keys, its revision the dropdown it is.
+pub type Dropdown = td_ui::menus::Controller<'static, Key, Menu>;
 
 /// The rows a page key moves by when the layout has none to say: the
 /// terminal's fifteen.
@@ -553,6 +558,8 @@ pub struct Frame<'a> {
     pub first: usize,
     pub entry_first: usize,
     pub pane: &'a Pane,
+    /// The dropdown open over the frame, painted last.
+    pub menu: Option<&'a Dropdown>,
 }
 
 impl Composition for Frame<'_> {
@@ -620,6 +627,9 @@ impl Composition for Frame<'_> {
             }
         }
         layout.status.emit(self.scene.status.chars(), damage, sink);
+        if let Some(menu) = self.menu {
+            menu.emit(damage, sink);
+        }
     }
 }
 

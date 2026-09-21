@@ -9956,8 +9956,18 @@ selection in view, a press on a row is the row's key to the view, the
 wheel's travel a scroll key per row, and over a text the pane's own
 scroll; a view asks for the pane to move with a `Scroll` action, so the
 reading keys are the pane's and the arrows, Home and End its caret's,
-which brings back selection by drag. HTML is rendered to plain text,
-without the terminal's rendition sequences. The terminal client's
+which brings back selection by drag. A bar label may stand for a
+dropdown of the view's keys rather than one key: the mailbox list's
+Folder label opens the toolkit's context menu of its folder actions
+under the label, New folder and Delete folder with their keys as
+shortcuts, the latter disabled while the list has no rows, which has
+every key and press while it is open (the row it activates is that key
+to the view; Escape or Left, a press outside it, a focus loss or a
+resize dismisses it; the wheel scrolls it where the surface shows it
+short) and is painted over the frame, and which closes by itself when
+the view it was opened for goes under it; the keys themselves, `+` and
+`d`, are the view's as before. HTML is rendered to plain text, without
+the terminal's rendition sequences. The terminal client's
 `scrolloff` and `[theme]` keys are accepted and ignored, as td-news's
 are; `mouse = false` still turns the pointer off. The crate depends on
 `td-editor` beside `td-ui`, by the same sibling spelling, and its recipe

@@ -2,7 +2,7 @@ use crate::backend::{BackendCommand, BackendResponse, RetentionCandidate};
 use crate::compose;
 use crate::config::RetentionPolicyConfig;
 use crate::jmap::types::Mailbox;
-use crate::ui::input::Key;
+use crate::ui::input::{Key, Menu};
 use crate::ui::views::email_list::{CachedEmailListState, EmailListView};
 use crate::ui::views::help::HelpView;
 use crate::ui::views::retention_preview::RetentionPreviewView;
@@ -14,13 +14,13 @@ use std::sync::mpsc;
 use std::time::SystemTime;
 
 /// The action bar's labels for each of the view's modes, and the key each
-/// stands for; a press on a label is that key.
+/// stands for; a press on a label is that key, and Folder's is the
+/// dropdown of the folder actions (`+`, `d`), which stay keys as well.
 const LABELS: &[&str] = &[
     "Open",
     "Refresh",
     "Compose",
-    "New folder",
-    "Delete folder",
+    "Folder",
     "Mark read",
     "Account",
     "Help",
@@ -30,8 +30,7 @@ const KEYS: &[Key] = &[
     Key::Enter,
     Key::Char('g'),
     Key::Char('c'),
-    Key::Char('+'),
-    Key::Char('d'),
+    Key::Menu(Menu::Folder),
     Key::Char('u'),
     Key::Char('a'),
     Key::Char('?'),
