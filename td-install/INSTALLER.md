@@ -80,8 +80,13 @@ The raw `td-install format` command coordinates preparation and both
 filesystem writes through one held destination. Its exact interface and
 limits are in DESIGN.md's coordinated raw formatting contract. The QEMU
 fixture uses it after read-only source validation. Scratch preparation
-must succeed before the first GPT write. This command does not activate
-the service or provide the review/consent sequence.
+must succeed before the first GPT write. The optical/USB scratch-exhaustion
+oracle constrains the live formatter's private staging tmpfs to 64 KiB,
+verifies that mount size, requires a failed mkfs image-zeroing operation
+and an independent scratch ENOSPC probe, and checks every destination byte
+remains unchanged. This is a refusal test, not a scratch-size estimator.
+This command does not activate the service or provide the review/consent
+sequence.
 
 ## Choosing the volume identity
 

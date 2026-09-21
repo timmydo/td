@@ -944,6 +944,65 @@ fn installed() -> Result<(), String> {
     report(std::io::stdout(), format_args!("{marker} {id}"))
 }
 
+fn require_scratch_mount(bytes: &[u8]) -> Result<(), String> {
+    let text = std::str::from_utf8(bytes).map_err(|_| "non-UTF-8 scratch mount report")?;
+    let mut matching = text.lines().filter_map(|line| {
+        let (mount, filesystem) = line.split_once(" - ")?;
+        (mount.split_ascii_whitespace().nth(4) == Some("/scratch")).then_some(filesystem)
+    });
+    let filesystem = matching.next().ok_or("missing scratch mount")?;
+    if matching.next().is_some() {
+        return Err("duplicate scratch mount".into());
+    }
+    let mut fields = filesystem.split_ascii_whitespace();
+    if fields.next() != Some("tmpfs")
+        || fields.next() != Some("tmpfs")
+        || !fields
+            .next()
+            .is_some_and(|options| options.split(',').any(|o| o == "size=64k"))
+        || fields.next().is_some()
+    {
+        return Err("scratch is not the expected 64 KiB tmpfs".into());
+    }
+    Ok(())
+}
+
+fn scratch_limited_install(device: &str) -> Result<(), String> {
+    // Only the formatter's private staging filesystem is constrained.
+    applet(&[
+        "mount",
+        "-t",
+        "tmpfs",
+        "-o",
+        "size=64k,mode=0700,nodev,nosuid",
+        "tmpfs",
+        "/scratch",
+    ])?;
+    require_scratch_mount(&read(Path::new("/proc/self/mountinfo"), 64 * 1024)?)?;
+    report(std::io::stdout(), format_args!("{SCRATCH_LIMIT_MARKER}"))?;
+    let result = install(device, false, false);
+    if result.is_err() {
+        // The pinned mkfs reports a zeroing failure without retaining errno.
+        let mut probe = File::options()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open("/scratch/exhaustion-probe")
+            .map_err(|error| format!("create scratch exhaustion probe: {error}"))?;
+        match probe.write_all(&[0u8; 4096]) {
+            Err(error) if error.raw_os_error() == Some(28) => {
+                report(
+                    std::io::stdout(),
+                    format_args!("{SCRATCH_EXHAUSTED_MARKER}"),
+                )?;
+            }
+            Err(error) => return Err(format!("scratch probe failed without ENOSPC: {error}")),
+            Ok(()) => return Err("scratch refusal left space for a probe page".into()),
+        }
+    }
+    result
+}
+
 fn run() -> Result<(), String> {
     if std::process::id() != 1 {
         return Err("installation fixture must be guest PID 1".into());
@@ -958,6 +1017,7 @@ fn run() -> Result<(), String> {
         b"install\n" => install(&target()?, false, false),
         b"install-system\n" => install(&target()?, false, true),
         b"interrupt\n" => install(&target()?, true, false),
+        b"install-scratch\n" => scratch_limited_install(&target()?),
         b"selector\n" => selector(),
         b"installed\n" => installed(),
         _ => Err("invalid fixture phase".into()),
@@ -1000,6 +1060,20 @@ mod tests {
     impl Drop for Scratch {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn scratch_mount_requires_one_observed_tmpfs_with_the_configured_size() {
+        let good = "20 1 0:20 / /scratch rw,nosuid,nodev - tmpfs tmpfs rw,size=64k,mode=700\n";
+        require_scratch_mount(good.as_bytes()).unwrap();
+        for bad in [
+            String::new(), good.repeat(2), good.replace("size=64k", "size=64m"),
+            good.replace("size=64k", "size=65536k"), good.replace("size=64k,", ""),
+            good.replace(" - tmpfs ", " - ext4 "), good.replace("/scratch", "/other"),
+            good.replace(" - ", " "), format!("{good}20 1 0:20 / /scratch rw - ext4 /dev/vda2 rw\n"),
+        ] {
+            assert!(require_scratch_mount(bad.as_bytes()).is_err(), "{bad:?}");
         }
     }
 

@@ -391,7 +391,7 @@ require only the before report and prohibit an after report; a future
 unmountable-media case needs its own earlier failure expectation. The
 existing whole-target byte comparisons still establish write preservation;
 inventory alone does not. These observations cover all live
-legs of the 56-boot matrix and all four full-system ISO installations without
+legs of the 58-boot matrix and all four full-system ISO installations without
 adding boots or changing target admission.
 
 The live fixture also runs `td-install layout-preview` after successful
@@ -468,3 +468,30 @@ inside existing live boots across the small and full-system matrices.
 They exercise read-only claim admission on private disks and mounted
 partitions; they do not activate production destructive admission or
 prove physical-device, swap, hotplug or arbitrary raw-I/O exclusion.
+
+## Scratch exhaustion before destination writes
+
+The small installation matrix adds optical and USB boots with a valid
+signed source and an ordinary writable virtio destination. The dedicated
+`install-scratch` phase mounts only `/scratch` as a mode-0700, nodev/nosuid
+64 KiB tmpfs using the existing td-init mount applet. The fixture requires
+exactly one `/scratch` tmpfs entry with `size=64k` in its bounded mountinfo
+read before reporting the limit. Source validation, selector preparation and
+coordinated formatting otherwise use the normal installation path.
+
+The formatter creates a sparse image; this check deliberately pins failure
+during its first real writes. The pinned mkfs.btrfs maps the failed
+scratch-image zeroing write to a generic error without retaining errno. After installation fails, the
+fixture independently attempts one 4 KiB write to a new private scratch
+file. Only kernel ENOSPC (28) emits the exhaustion marker; other errors or
+a successful write refuse without it. No such probe writes the destination.
+The host requires both scratch markers, the actual mkfs zeroing diagnostic,
+a failed mkfs.btrfs scratch-image operation and the installer failure.
+Partition refresh, publication and deployment selection must be absent.
+After QEMU is reaped, the host checks the destination's complete byte
+length and SHA-256 against its pre-boot canaries and sparse gaps. An
+arbitrary fixture failure or a mount error cannot satisfy this oracle.
+This proves the current coordinated formatter refuses one real staging
+allocation failure before erasure; it does not establish a general
+scratch-capacity estimate or guarantee recovery after destination writes.
+The full-system matrix remains unchanged.

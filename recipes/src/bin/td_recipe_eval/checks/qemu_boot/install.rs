@@ -599,6 +599,43 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
             )?;
         }
     }
+    let limited_live = scratch.dir.join("limited-scratch.cpio");
+    write(&limited_live, &initramfs(&base, &common, "install-scratch\n", &extra)?)?;
+    let limited_iso = scratch.dir.join("limited-scratch.iso");
+    media::write_image_with_payloads(&limited_iso, &kernel, &limited_live, &payloads)?;
+    for (name, attachment, source_device) in [
+        ("optical", FirmwareAttachment::Optical, "/dev/sr0"),
+        ("usb", FirmwareAttachment::Usb, "/dev/sda"),
+    ] {
+        let target = TargetDisk::create(&scratch.dir, &format!("scratch-{name}.img"))?;
+        target.seed_preservation_canaries()?;
+        let before = target.fingerprint()?;
+        let vars = scratch.dir.join(format!("scratch-{name}-vars.fd"));
+        efi::copy_input(&vars_template, &vars)?;
+        println!("   [qemu-install] refusing exhausted scratch through {name} media before disk writes");
+        let refused = boot_source(
+            &qemu,
+            BootSource::Firmware {
+                code: &code,
+                vars: &vars,
+                attachment,
+                installation_target: Some(&target),
+            },
+            refusal_plan(&limited_iso),
+            &scratch.dir,
+            timeout,
+        )?;
+        if target.fingerprint()? != before {
+            return Err(format!(
+                "scratch exhaustion through {name} media changed the destination\n{}",
+                tail(&refused.console, 80)
+            ));
+        }
+        validate_scratch_refusal(&refused, source_device)?;
+        require_live_reports(
+            &refused, &target, source_device, &limited_iso, false, InventoryBefore::Fresh,
+        )?;
+    }
     let refuse = |case: &str, image: &Path, diagnostic: &str| -> Result<(), String> {
         for (name, attachment, source_device) in [
             ("optical", FirmwareAttachment::Optical, "/dev/sr0"),
@@ -693,7 +730,7 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
         td_boot_protocol::MANIFEST_UNAUTHENTICATED,
     )?;
     println!(
-        "PASS: native optical/USB virtio/NVMe 512-byte/4Kn and AHCI 512-byte installation and interrupted-publication refusal/reinstallation; guest-generated UUID binding across verified kexec and reordered disks; duplicate identity refusal; undersized/read-only targets and wrong-key/corrupt-payload optical/USB refusals preserve every target byte; two persistent installed boots"
+        "PASS: native optical/USB virtio/NVMe 512-byte/4Kn and AHCI 512-byte installation and interrupted-publication refusal/reinstallation; guest-generated UUID binding across verified kexec and reordered disks; duplicate identity refusal; undersized/read-only targets, exhausted scratch and wrong-key/corrupt-payload optical/USB refusals preserve every target byte; two persistent installed boots"
     );
     Ok(())
 }
@@ -1212,6 +1249,20 @@ fn require_live_reports(
 
 fn refusal_plan(image: &Path) -> BootPlan<'_> {
     plan(image, true, protocol::REFUSAL_COMPLETE_MARKER)
+}
+
+fn validate_scratch_refusal(result: &BootResult, source_device: &str) -> Result<(), String> {
+    require(result, protocol::SCRATCH_LIMIT_MARKER, "bounded scratch mount")?;
+    require(result, protocol::SCRATCH_EXHAUSTED_MARKER, "scratch ENOSPC probe")?;
+    validate_target_refusal(result, source_device, "unable to zero the output file")?;
+    if !result.console.contains("/bin/mkfs.btrfs failed on the scratch image") {
+        return Err(format!(
+            "scratch refusal did not reach the filesystem formatter: {}\n{}",
+            result.reason,
+            tail(&result.console, 80)
+        ));
+    }
+    Ok(())
 }
 
 fn validate_target_refusal(
@@ -2103,6 +2154,33 @@ mod tests {
                 latch_console_evidence(&mut evidence, &bytes[..received], plan.target_marker.as_bytes());
                 assert_eq!(evidence.target, received >= stop, "received {received} of {}", bytes.len());
             }
+        }
+    }
+
+    #[test]
+    fn scratch_refusal_requires_exhaustion_in_the_formatter_before_publication() {
+        let mut result = interrupted_result();
+        result.console = format!(
+            "{}\n{}\n{} /dev/sr0\nERROR: unable to zero the output file\ntd-install: /bin/mkfs.btrfs failed on the scratch image (exit status: 1)\n{} /bin/td-install failed: exit status: 1\n{}\n",
+            protocol::SCRATCH_LIMIT_MARKER, protocol::SCRATCH_EXHAUSTED_MARKER, protocol::MEDIA_MARKER, protocol::REFUSED_PREFIX, protocol::REFUSAL_COMPLETE_MARKER
+        );
+        assert!(validate_scratch_refusal(&result, "/dev/sr0").is_ok());
+        assert!(validate_scratch_refusal(&result, "/dev/sda").is_err());
+        let console = result.console.clone();
+        for missing in [
+            protocol::SCRATCH_LIMIT_MARKER,
+            protocol::SCRATCH_EXHAUSTED_MARKER,
+            "unable to zero the output file",
+            "/bin/mkfs.btrfs failed on the scratch image",
+            protocol::REFUSED_PREFIX,
+            protocol::REFUSAL_COMPLETE_MARKER,
+        ] {
+            result.console = console.replace(missing, "missing");
+            assert!(validate_scratch_refusal(&result, "/dev/sr0").is_err());
+        }
+        for extra in [protocol::PARTITIONS_MARKER, protocol::DIRECT_MARKER, protocol::INSTALL_MARKER] {
+            result.console = format!("{console}{extra}\n");
+            assert!(validate_scratch_refusal(&result, "/dev/sr0").is_err());
         }
     }
 
