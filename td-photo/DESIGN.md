@@ -98,8 +98,9 @@ modes are the photographer's order of work.
 2. **Cull** shows a roll as a grid of thumbnails made from the camera's medium
    embedded preview. The photographer walks it with the arrows, `Home`, `End`
    and the page keys, presses `p` to pick, `x` to reject and `u` to clear,
-   `Return` to see one photo at the medium preview's full size and `Return` or
-   `Escape` to go back, and `1` to `4` (or the filter strip) to show all,
+   `Return` (or the mode strip's Single) to see one photo developed to the
+   area, its edits applied, and `Return`, `Escape` or Culling to go back,
+   and `1` to `4` (or the filter strip) to show all,
    the picks, the rejects or the unflagged. `Delete` (`delete-rejected`)
    moves the rejects and their sidecars into the roll's `rejected/` folder,
    each file linked there before its old name is dropped, so no file is
@@ -195,20 +196,25 @@ window, all speaking the toolkit's one vocabulary.
   held, and the budget holds at every settle as at open: a flag that would take
   the roll past it is refused before anything is written, and a sidecar that
   grew past it meanwhile is not held, its photo shown as refused.
-- **Two modes, and a strip that names them.** The controller is in `cull`
+- **Two modes, and a strip that names what is in view.** The controller is
+  in `cull`
   or `develop`; `develop` is a view of one photo, the cursor's, its history
   pane beside it, entered
   with the `develop` action (`d`) and left with `grid` (`Escape`), which
   returns to the cull grid. The mode strip (td-ui's `chrome::Buttons`,
-  the window's first band: Roll Selection, Culling, Develop) shows which
-  is in view, the roll chooser while it is open and none before a roll,
+  the window's first band: Roll Selection, Culling, Single, Develop)
+  shows which is in view (cull's grid or single view apart), the roll
+  chooser while it is open and none before a roll,
   and a press on it is the one target every mode shares (`press_mode`):
   Roll Selection is `choose`, Culling closes the chooser or leaves
   develop whole (its palette, crop-adjust and any drag dropped, as `grid`
-  does once they are down), and Develop closes the chooser and develops
+  does once they are down) to the grid, Single does the same to the
+  single view of the cursor's photo (what `view`, `Return`, toggles from
+  the grid), and Develop closes the chooser and develops
   the cursor's photo. The
-  mode in view is `ignored`, as is a disabled button: Culling before a
-  roll, Develop before a photo (`mode_states`); `filter_states` disables
+  one in view is `ignored`, as is a disabled button: Culling before a
+  roll, Single and Develop before a photo (`mode_states`);
+  `filter_states` disables
   the filter strip in develop and under the chooser, where the filters
   are not the mode's, its buttons inert. The develop edits are
   that mode's alone and are `ignored` in cull; the cull filters and the
@@ -904,9 +910,9 @@ scale, area-resample in the encoded domain to exactly N, never enlarging,
 and turn the result by the file's orientation as `develop` turns the raw,
 so a portrait frame is a portrait thumbnail. The cull grid asks for N =
 `THUMB_WIDTH` (160) at the surface's scale, which on the Z 8 is its 160x120
-thumbnail as it is; the single-photo view's preview is the develop
-increment's and asks for N = 1600, which the same rule answers with the
-1620x1080 preview at 1/1. `td-photo thumb FILE OUT.ppm [--long-edge N]
+thumbnail as it is; the single view shows no thumbnail but the raw
+developed to its box, as develop does (Window). `td-photo thumb FILE
+OUT.ppm [--long-edge N]
 [--cache]` is the rule headless (N defaults to 400: on the Z 8 the
 1620x1080 preview at 1/4, 405x270, resampled to 400x267 in 80 ms), and
 `td-photo probe FILE` prints every
@@ -1193,8 +1199,9 @@ refused before anything is read.
 
 The scene is `ui::Scene`, a td-ui `Composition` the controller builds over its
 model per request: the mode strip and the filter strip (each a td-ui
-`chrome::Buttons`, the first band Roll Selection, Culling and Develop with the
-mode in view selected, the second All, Picks, Rejects and Unflagged with the
+`chrome::Buttons`, the first band Roll Selection, Culling, Single and Develop
+with the one in view selected, the second All, Picks, Rejects and Unflagged
+with the
 active filter selected, a button the mode cannot use disabled, see Driving:
 the buttons keep their places whichever is active, the selection styled rather
 than marked in the text; each strip wraps to more rows on a surface too
@@ -1211,8 +1218,13 @@ wears a two-pixel selected frame. Cells fill whole rows from the top-left, as
 many columns as the width holds and as many rows as the height between the bands
 holds, at least one of each, so a surface too small for a cell clips one rather
 than shows none, and the grid scrolls by rows, keeping the cursor's row shown.
-The single view shows the name, the facts and the largest 3:2 box under them;
-develop mode shows the name row and the box (no facts row: the bands take the
+The single view shows the name, the facts and the largest 3:2 box under them,
+the cursor's photo developed into the box as develop's is (its sidecar's
+crop, exposure and look applied, at the fit: the zoom, the crop drag and
+the bands are develop's), so `develop_box` is that box there and the
+window's develop path, its memo and the neighbours' prefetch serve both
+views; develop mode shows the name row and the box (no facts row: the
+bands take the
 room) of the cursor's photo in the area right of the history pane
 (`Layout::develop_region`), under the tool and look bands (`Layout::tools`,
 `Layout::look_buttons`, see Driving) and above the filmstrip
@@ -1226,7 +1238,11 @@ width, wrapping), Toggle and Delete enabled with a selection and Undo with a
 step; a surface too short for a row has neither. The box geometry
 (`Layout::box_in`, the single view's `preview_box` over the area and develop's
 `develop_box` over the develop view) is one function the scene, the window and
-`--preview` share, so the placeholder and the image land in one place. A press
+`--preview` share, so the placeholder and the image land in one place (the
+single view's box and develop's differ, so a switch between them is a
+level-2 rerun from the held level 1, and until it lands the window blits
+the image held for the other box, centred and clipped to the one in view,
+as it blits a develop held at the other crop). A press
 on a mode button changes the mode, on a filter button sets the filter, on a cell
 selects it, in develop on a history step or a filmstrip box selects it, on a
 pane, tool or look button asks what it says and on the slider starts its drag
@@ -1236,12 +1252,13 @@ buttons, the pane's chrome, and anything off the surface, are not targets, and
 the bands are hit-tested last painted first, so on a surface too short for them
 the status row covers the strips' buttons as it covers their pixels. A box whose
 thumbnail is not held is a neutral placeholder, which is what `frame` digests
-either way; the develop box holds the developed preview once it is made, and the
-cull single view's box stays a placeholder.
+either way; the develop box and the single view's hold the developed preview
+once it is made.
 
 While Alt is held every button shows its chord under its caption in
 td-ui's hint face (`Buttons::emit_hinted`, `Button::emit_hinted`): the
-mode strip's `o`, `Escape` and `d`, the filter strip's `1` through `4`,
+mode strip's `o`, `Escape`, `Return` and `d`, the filter strip's `1`
+through `4`,
 the tool band's `c`, `C`, `z`, `0`, `-`, `=`, `f` and `Z`, the look band's `F1`
 through `F9` under the first nine looks (`None` has none, and a tenth
 look none), and the pane's `t`, `Backspace` and `z`; each is the chord
@@ -1321,12 +1338,14 @@ generation is submitted once. When a second consumer needs an image primitive it
 is promoted into `td_ui::raster` with a pixel oracle; until then the blitter is
 this crate's, in `ui` where its pixel oracle is, and the confinement test pins
 that the window writes frame bytes through nothing else. `td-photo --preview WxH
-[ROLL] [--develop [POSITION] [--zoom]]` is the same frame without a display,
+[ROLL] [--develop [POSITION] [--zoom] | --single [POSITION]]` is the same
+frame without a display,
 its thumbnails and, with `--develop`, the developed preview of the photo at
 `POSITION` (the cursor's, the first, by default) made on the calling thread,
 with `--zoom` at 100% around the centre (the `zoom-100` action, so the
-frame is the window's at that zoom): the oracle the native test holds a
-capture to.
+frame is the window's at that zoom), or with `--single [POSITION]` in its
+place the cull single view of that photo: the oracle the native test holds
+a capture to.
 
 Performance contract: no decode or resample runs on the turn loop's thread. The
 roll's listing and its sidecars' reads and writes do, as they do in the replay,
@@ -1380,7 +1399,8 @@ thumbnail is not ready paints a neutral placeholder and its name, never blocks.
 - At most one develop, and so one raw decode of its own, runs at a time (the
   codec is sequential): the pool hands a worker the develop only when none is
   in flight. Beside it, at most one prefetch: the level-0 decode of a shown
-  neighbour of the cursor (`Controller::neighbours`, `PREFETCH_DEPTH` (2)
+  neighbour of the cursor in develop or the single view
+  (`Controller::neighbours`, `PREFETCH_DEPTH` (2)
   either side, next before previous, nearer first), the lowest class of work,
   handed out only when no thumbnail, develop or export is pending and none
   is being prefetched or waiting to be collected, so it is never taken ahead
@@ -1621,10 +1641,12 @@ in-process (the state before a roll and after, walking with every step and page,
 by action and by key, unbound keys, `quit`, scrolling by action and by wheel
 clamped to the roll and revealed by the cursor, resizes good and bad, the
 pointer on the filter strip, the mode strip (its transitions from the grid,
-the chooser over the grid and over develop, and develop with its palette,
-crop-adjust or a marquee up, the disabled buttons and the mode in view
-ignored, a change bumping once and a chooser request never, the states it
-reports), a gap and a margin, a cell, the status row (on a surface too short
+the single view and back by Single and Culling, the chooser over the grid,
+the single view and develop, and develop with its palette, crop-adjust or a
+marquee up, to the grid or the single view, the disabled buttons and the
+one in view ignored, a change bumping once and a chooser request never, the
+states it reports), a gap and a margin, a cell, the status row (on a
+surface too short
 for the bands too), off the surface and past the last photo, a resize to the
 size it has, an empty roll and one past `MAX_PHOTOS`; the effects a flag
 change asks
@@ -1815,7 +1837,8 @@ export fails and the row says so with nothing written, and with the look cleared
 names it, and an export asked for and quit at once is written, numbered, by the
 time the process has exited; a headless case (no compositor) holds `--preview
 --develop` to a develop box that carries a developed image and changes with the
-sidecar's exposure.
+sidecar's exposure, and `--preview --single` to the single view's box the
+same way (`--zoom` refused there, and the two flags together).
 
 The builder discovers the crate by existing; its gate runs `cargo test` and
 all-target Clippy.

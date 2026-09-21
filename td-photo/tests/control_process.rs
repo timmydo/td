@@ -242,6 +242,109 @@ fn preview_develop_reflects_the_crop() {
 }
 
 #[test]
+fn preview_single_shows_the_developed_photo_in_the_single_view() {
+    // The cull single view develops the cursor photo into its box as
+    // develop does, its sidecar's edits applied: `--preview --single` of
+    // a decodable NEF carries an image in the single view's box (the
+    // larger one over the whole area), and an exposure written to the
+    // sidecar changes it.
+    let dir = Directory::new();
+    let roll = dir.0.join("roll");
+    std::fs::create_dir(&roll).unwrap();
+    let (w, h) = (64usize, 48usize);
+    let samples: Vec<u16> = (0..w * h).map(|i| 1008 + (i as u16 % 4000)).collect();
+    std::fs::write(
+        roll.join("DSC_0001.NEF"),
+        synth_nef::uncompressed_nef(w, h, &samples),
+    )
+    .unwrap();
+    let single = |dir: &Directory| {
+        let output = Command::new(env!("CARGO_BIN_EXE_td-photo"))
+            .args(["--preview", "800x600"])
+            .arg(&roll)
+            .args(["--single", "0"])
+            .env_clear()
+            .env("XDG_CACHE_HOME", dir.0.join("cache"))
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output
+            .stdout
+            .strip_prefix(b"P6\n800 600\n255\n")
+            .expect("preview PPM header")
+            .to_vec()
+    };
+    let layout = binary_layout(800, 600);
+    let r#box = layout
+        .preview_box()
+        .expect("a single-view box on an 800x600 surface");
+    assert_ne!(Some(r#box), layout.develop_box());
+    let base = single(&dir);
+    assert!(
+        varies(&base, 800, r#box),
+        "the single view's box is a placeholder"
+    );
+    std::fs::write(
+        roll.join("DSC_0001.NEF.edit"),
+        "td-photo edit 1\nexposure 1.50\n",
+    )
+    .unwrap();
+    let brighter = single(&dir);
+    assert_ne!(
+        box_pixels(&base, 800, r#box),
+        box_pixels(&brighter, 800, r#box),
+        "the exposure did not reach the single view's pixels"
+    );
+    // Without a position the cursor's photo, the first: the same frame.
+    let cursors = Command::new(env!("CARGO_BIN_EXE_td-photo"))
+        .args(["--preview", "800x600"])
+        .arg(&roll)
+        .arg("--single")
+        .env_clear()
+        .env("XDG_CACHE_HOME", dir.0.join("cache"))
+        .output()
+        .unwrap();
+    assert!(cursors.status.success());
+    assert_eq!(
+        cursors.stdout.strip_prefix(b"P6\n800 600\n255\n"),
+        Some(brighter.as_slice())
+    );
+    // `--zoom` is develop's, the two views are one flag either way round,
+    // a position past the roll or past usize is refused under the flag's
+    // name, and the view needs a roll.
+    let wide = format!("{}0", usize::MAX);
+    for (args, message) in [
+        (["--single", "0", "--zoom"].as_slice(), "--zoom"),
+        (["--single", "--develop"].as_slice(), "only once"),
+        (["--develop", "--single"].as_slice(), "only once"),
+        (["--single", "1"].as_slice(), "--single 1: no-photo"),
+        (["--single", wide.as_str()].as_slice(), "--single POSITION"),
+    ] {
+        let refused = Command::new(env!("CARGO_BIN_EXE_td-photo"))
+            .args(["--preview", "800x600"])
+            .arg(&roll)
+            .args(args)
+            .env_clear()
+            .output()
+            .unwrap();
+        assert!(!refused.status.success(), "{args:?}");
+        let stderr = String::from_utf8_lossy(&refused.stderr);
+        assert!(stderr.contains(message), "{args:?}: {stderr}");
+    }
+    let rollless = Command::new(env!("CARGO_BIN_EXE_td-photo"))
+        .args(["--preview", "800x600", "--single"])
+        .env_clear()
+        .output()
+        .unwrap();
+    assert!(!rollless.status.success());
+    assert!(String::from_utf8_lossy(&rollless.stderr).contains("needs a ROLL"));
+}
+
+#[test]
 fn preview_develop_zooms_the_box_to_the_centre_at_100() {
     // A 1600x1200 NEF, dark but for a bright square at its centre: the
     // fit view shrinks the square with the frame, while `--zoom` shows the

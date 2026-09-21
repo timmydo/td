@@ -754,10 +754,10 @@ pub const FILTERS: [(Filter, &str); 4] = [
 /// The filter strip's labels, `FILTERS` in order.
 const FILTER_NAMES: [&str; 4] = [FILTERS[0].1, FILTERS[1].1, FILTERS[2].1, FILTERS[3].1];
 
-/// The mode strip's labels: the roll chooser, the cull grid and develop,
-/// in the order `mode_states` reports them.
-const MODES: [&str; 3] = ["Roll Selection", "Culling", "Develop"];
-const MODE_ACTIONS: [&str; 3] = ["choose", "grid", "develop"];
+/// The mode strip's labels: the roll chooser, the cull grid, the cull
+/// single view and develop, in the order `mode_states` reports them.
+const MODES: [&str; 4] = ["Roll Selection", "Culling", "Single", "Develop"];
+const MODE_ACTIONS: [&str; 4] = ["choose", "grid", "view", "develop"];
 
 /// The develop history pane's width in reference pixels: 27 cells, room
 /// for an exposure or look step's row (a crop's shows in whole percents,
@@ -1092,11 +1092,12 @@ impl Layout {
         Some((first_row + row) * self.columns + column)
     }
 
-    /// The single and develop view's preview box: the largest 3:2 rectangle
+    /// The cull single view's preview box: the largest 3:2 rectangle
     /// under the name and facts rows, centred in the area's width, or `None`
     /// when the area leaves no room for one. The scene fills it with a
     /// placeholder; the window and `--preview` blit the developed image into
-    /// it in develop mode, so all three agree on where the pixels go.
+    /// it in the single view (develop's box is `develop_box`), so all three
+    /// agree on where the pixels go.
     pub fn preview_box(&self) -> Option<Rect> {
         self.box_in(self.area, 2)
     }
@@ -2761,16 +2762,19 @@ impl Controller {
 
     /// The mode strip's buttons as `(selected, enabled)`, in `MODES`
     /// order: the one in view is selected (the chooser while it is open,
-    /// else the mode; nothing before a roll, when no mode is in view),
-    /// Culling can be pressed once a roll is open and Develop once there
-    /// is a photo under the cursor.
-    pub fn mode_states(&self) -> [(bool, bool); 3] {
+    /// else the mode, cull's grid or single view; nothing before a roll,
+    /// when no mode is in view), Culling can be pressed once a roll is
+    /// open and Single and Develop once there is a photo under the cursor.
+    pub fn mode_states(&self) -> [(bool, bool); 4] {
         let roll = self.roll.is_some();
+        let photo = roll && self.cursor.is_some();
         let in_view = if self.chooser.is_some() {
             0
         } else if !roll {
-            3
+            4
         } else if self.mode == Mode::Develop {
+            3
+        } else if self.view == View::Single {
             2
         } else {
             1
@@ -2778,7 +2782,8 @@ impl Controller {
         [
             (in_view == 0, true),
             (in_view == 1, roll),
-            (in_view == 2, roll && self.cursor.is_some()),
+            (in_view == 2, photo),
+            (in_view == 3, photo),
         ]
     }
 
@@ -2796,26 +2801,40 @@ impl Controller {
         ]
     }
 
-    /// A press on the mode strip: the roll chooser, the cull grid or
-    /// develop, from whatever is in view. The mode in view is `ignored`,
-    /// as is one whose button is disabled: culling before a roll, develop
-    /// before a photo. Culling leaves develop whole (its palette, its
-    /// crop-adjust and any drag with it) and closes the chooser; develop
-    /// closes the chooser too.
+    /// A press on the mode strip: the roll chooser, the cull grid, the
+    /// cull single view or develop, from whatever is in view. The one in
+    /// view is `ignored`, as is one whose button is disabled: culling
+    /// before a roll, single or develop before a photo. Culling and Single
+    /// leave develop whole (its palette, its crop-adjust and any drag with
+    /// it) and close the chooser, to the grid or the single view of the
+    /// cursor's photo; develop closes the chooser too.
     fn press_mode(&mut self, index: usize) -> Result<(Outcome, Vec<Effect>), Error> {
         let roll = self.roll.is_some();
         let photo = roll && self.cursor.is_some();
         let chooser = self.chooser.is_some();
+        // Culling or Single is a change unless its view is the one in view
+        // with nothing over it.
+        let to_grid = chooser || self.mode == Mode::Develop || self.view != View::Grid;
+        let to_single = chooser || self.mode == Mode::Develop || self.view != View::Single;
         match index {
             0 if !chooser => self.choose(Vec::new()),
-            1 if roll && (chooser || self.mode == Mode::Develop) => {
+            1 if roll && to_grid => {
                 self.chooser = None;
                 if self.mode == Mode::Develop {
                     self.leave_develop();
                 }
+                self.view = View::Grid;
                 Ok((self.finish(Outcome::Changed), Vec::new()))
             }
-            2 if photo && (chooser || self.mode == Mode::Cull) => {
+            2 if photo && to_single => {
+                self.chooser = None;
+                if self.mode == Mode::Develop {
+                    self.leave_develop();
+                }
+                self.view = View::Single;
+                Ok((self.finish(Outcome::Changed), Vec::new()))
+            }
+            3 if photo && (chooser || self.mode == Mode::Cull) => {
                 self.chooser = None;
                 self.enter_develop()?;
                 Ok((self.finish(Outcome::Changed), Vec::new()))
@@ -2836,6 +2855,7 @@ impl Controller {
         self.aspect = Aspect::Free;
         self.look_list = false;
         self.history_step = None;
+        self.preview_fit = None;
     }
 
     /// Back to the fit, the centre the middle again and any pan dropped:
@@ -2847,15 +2867,21 @@ impl Controller {
         self.centre = (CENTRE_UNIT / 2, CENTRE_UNIT / 2);
     }
 
-    /// The develop preview's box: the layout's preview box when developing a
-    /// photo under the cursor, else `None`. The window and `--preview` blit
-    /// the developed image here; the cull single view keeps the placeholder,
-    /// so this is `Some` only in develop mode.
+    /// The box the cursor photo is developed into: develop's box, or the
+    /// cull single view's preview box, when there is a photo under the
+    /// cursor and no chooser over the area; else `None`. The window and
+    /// `--preview` blit the developed image here, so the single view shows
+    /// the photo as develop does, its sidecar's edits applied, at the fit
+    /// (the zoom and the crop drag are develop's).
     pub fn develop_box(&self) -> Option<Rect> {
-        if self.mode != Mode::Develop || self.cursor.is_none() || self.chooser.is_some() {
+        if self.cursor.is_none() || self.chooser.is_some() {
             return None;
         }
-        self.layout().develop_box()
+        match (self.mode, self.view) {
+            (Mode::Develop, _) => self.layout().develop_box(),
+            (Mode::Cull, View::Single) => self.layout().preview_box(),
+            (Mode::Cull, View::Grid) => None,
+        }
     }
 
     /// The filmstrip's boxes and the photos in them: the shown photos
@@ -2875,13 +2901,14 @@ impl Controller {
             .collect()
     }
 
-    /// The photos whose level-0 frames the window prefetches in develop, in
-    /// the order it wants them: the shown photos `PREFETCH_DEPTH` either
-    /// side of the cursor, the next before the previous, nearer first, so
-    /// an arrow key finds its photo decoded. Nothing outside develop, under
-    /// the chooser or without a cursor.
+    /// The photos whose level-0 frames the window prefetches in develop
+    /// and the single view, in the order it wants them: the shown photos
+    /// `PREFETCH_DEPTH` either side of the cursor, the next before the
+    /// previous, nearer first, so an arrow key finds its photo decoded.
+    /// Nothing in the grid, under the chooser or without a cursor.
     pub fn neighbours(&self) -> Vec<usize> {
-        if self.mode != Mode::Develop || self.chooser.is_some() {
+        let single = self.mode == Mode::Cull && self.view == View::Single;
+        if (self.mode != Mode::Develop && !single) || self.chooser.is_some() {
             return Vec::new();
         }
         let Some(position) = self.position() else {
@@ -3157,8 +3184,9 @@ impl Controller {
         // While the chooser is open the window's actions are behind it:
         // only `choose` (closing it), `open`, `quit` and `scroll` (the
         // finder's wheel) reach through, the rest is `ignored`, as the
-        // keyboard cannot reach them either; the mode strip's Culling and
-        // Develop buttons reach through by the pointer (`press_mode`).
+        // keyboard cannot reach them either; the mode strip's Culling,
+        // Single and Develop buttons reach through by the pointer
+        // (`press_mode`).
         if self.chooser.is_some()
             && !matches!(
                 action,
@@ -4347,6 +4375,10 @@ impl Controller {
         self.adjusting = false;
         self.aspect = Aspect::Free;
         self.look_list = false;
+        // The fit reported was the single view's box's, or none: dropped
+        // until the adapter reports develop's, so a press in the same turn
+        // finds the box, never a canvas of the other box's size.
+        self.preview_fit = None;
         self.sync_step(true);
         Ok(Outcome::Changed)
     }

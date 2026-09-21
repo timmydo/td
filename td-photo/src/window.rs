@@ -107,29 +107,33 @@ pub fn open(rest: &[OsString]) -> Result<()> {
 /// `--preview WxH [ROLL]`: the frame the window would show for `ROLL` on a
 /// `W` by `H` surface once every thumbnail it wants is in, as a binary PPM
 /// on stdout: the scene as the seam paints it and the thumbnails blitted as
-/// the window blits them, made here on the calling thread. `--zoom` after
-/// `--develop` shows the develop box at 100% around the image's centre, as
-/// `zoom-100` does.
+/// the window blits them, made here on the calling thread. `--single` in
+/// place of `--develop` is the cull single view of the photo; `--zoom`
+/// after `--develop` shows the develop box at 100% around the image's
+/// centre, as `zoom-100` does.
 pub fn preview(rest: &[OsString]) -> Result<()> {
     let [size, rest @ ..] = rest else {
         return Err("--preview needs WxH; see --help".to_string());
     };
     let mut roll: Option<PathBuf> = None;
     let mut develop: Option<usize> = None;
+    let mut single = false;
     let mut zoom = false;
     let mut args = rest.iter();
     while let Some(arg) = args.next() {
         if arg == "--zoom" {
-            if develop.is_none() {
+            if develop.is_none() || single {
                 return Err("--zoom needs --develop before it; see --help".to_string());
             }
             zoom = true;
-        } else if arg == "--develop" {
+        } else if arg == "--develop" || arg == "--single" {
             if develop.is_some() {
-                return Err("--develop may be given only once".to_string());
+                return Err("--develop or --single may be given only once".to_string());
             }
+            single = arg == "--single";
             // A position follows when the next argument is a decimal;
             // otherwise the cursor's photo, which is the first at open.
+            let flag = if single { "--single" } else { "--develop" };
             let position = match args.clone().next() {
                 Some(next)
                     if next.to_str().is_some_and(|text| {
@@ -139,7 +143,7 @@ pub fn preview(rest: &[OsString]) -> Result<()> {
                     args.next();
                     next.to_str()
                         .and_then(|text| text.parse::<usize>().ok())
-                        .ok_or("--develop POSITION is out of range")?
+                        .ok_or_else(|| format!("{flag} POSITION is out of range"))?
                 }
                 _ => 0,
             };
@@ -151,7 +155,7 @@ pub fn preview(rest: &[OsString]) -> Result<()> {
         }
     }
     if develop.is_some() && roll.is_none() {
-        return Err("--develop needs a ROLL to develop; see --help".to_string());
+        return Err("--develop or --single needs a ROLL; see --help".to_string());
     }
     let (width, height) = size
         .to_str()
@@ -160,7 +164,7 @@ pub fn preview(rest: &[OsString]) -> Result<()> {
         .ok_or_else(|| format!("--preview {size:?} is not WxH"))?;
     let mut session = session(width, height, roll.as_deref())?;
     if let Some(position) = develop {
-        enter_develop(&mut session, position)?;
+        enter_view(&mut session, position, single)?;
         if zoom {
             session
                 .ui
@@ -192,10 +196,10 @@ pub fn preview(rest: &[OsString]) -> Result<()> {
                 ui::blit(&mut pixels, surface, stride, area, r#box, &image).map_err(error)?;
             }
         }
-        // The developed preview, when developing: the cursor photo blitted
-        // into the develop box, the same frame the window shows there, made
-        // here on the calling thread. The loop above blitted the grid's
-        // thumbnails in cull and the filmstrip's in develop.
+        // The developed preview, in develop or the single view: the cursor
+        // photo blitted into its box, the same frame the window shows
+        // there, made here on the calling thread. The loop above blitted
+        // the grid's thumbnails in cull and the filmstrip's in develop.
         if let Some((r#box, image)) = developed(&session, roll) {
             ui::blit(&mut pixels, surface, stride, area, r#box, &image).map_err(error)?;
         }
@@ -246,26 +250,28 @@ fn thumbnail(path: &Path, scale: usize, threads: usize) -> Option<Rgb8> {
     }
 }
 
-/// Puts a `--preview` session into the develop view of the photo at
+/// Puts a `--preview` session into the develop view, or with `single`
+/// the cull single view, of the photo at
 /// `position`, so the frame is the developed preview the window shows there.
 /// Neither action writes a sidecar, so there is nothing to carry out.
-fn enter_develop(session: &mut Session, position: usize) -> Result<()> {
+fn enter_view(session: &mut Session, position: usize, single: bool) -> Result<()> {
+    let flag = if single { "--single" } else { "--develop" };
     session
         .ui
         .action("select", &[position.to_string().as_str()])
-        .map_err(|e| format!("--develop {position}: {e}"))?;
+        .map_err(|e| format!("{flag} {position}: {e}"))?;
     session
         .ui
-        .action("develop", &[])
-        .map_err(|e| format!("--develop: {e}"))?;
+        .action(if single { "view" } else { "develop" }, &[])
+        .map_err(|e| format!("{flag}: {e}"))?;
     Ok(())
 }
 
-/// The developed preview for a `--preview --develop` session: the develop
-/// box and the cursor photo developed to fit it, or to the model's zoom,
-/// at the sidecar's exposure and look, made on the calling thread; `None`
-/// when not developing or the develop cannot be made, leaving the box its
-/// placeholder.
+/// The developed preview for a `--preview --develop` or `--single`
+/// session: the develop box (the single view's) and the cursor photo
+/// developed to fit it, or to the model's zoom, at the sidecar's exposure
+/// and look, made on the calling thread; `None` without a box or when the
+/// develop cannot be made, leaving the box its placeholder.
 fn developed(session: &Session, roll: &Path) -> Option<(td_ui::raster::Rect, Rgb8)> {
     let r#box = session.ui.develop_box()?;
     let index = session.ui.cursor()?;
@@ -1855,8 +1861,8 @@ impl Window {
     }
 
     /// The develop box rectangle the cursor photo's held developed image
-    /// fills, centred as `ui::blit` centres it, or `None` when not developing
-    /// or no image is held for the cursor photo yet at the crop and zoom the
+    /// fills, centred as `ui::blit` centres it, or `None` without a box or
+    /// when no image is held for the cursor photo yet at the crop and zoom the
     /// mode wants: in crop-adjust the uncropped frame, else the sidecar's
     /// crop. Zoomed, the fit is unused (the box is no crop canvas and the
     /// pan needs none), so a held develop `normalized` treats as the wanted
@@ -1875,6 +1881,7 @@ impl Window {
                 preview.name == wanted.name
                     && preview.crop == wanted.crop
                     && preview.zoom == wanted.zoom
+                    && (preview.box_w, preview.box_h) == (wanted.box_w, wanted.box_h)
             })
             .and_then(|(_, image)| image.as_ref())?;
         let width = i64::try_from(image.width).ok()?;
@@ -2028,8 +2035,8 @@ impl Window {
     }
 
     /// The develop the model wants now: the cursor photo fitted to the
-    /// develop box at its sidecar's crop, exposure and look, or `None`
-    /// outside develop mode or before a roll.
+    /// box (develop's or the single view's) at its sidecar's crop, exposure
+    /// and look, or `None` when the model shows no box.
     fn wanted_preview(&self) -> Option<Preview> {
         let ui = &self.session.ui;
         let r#box = ui.develop_box()?;
@@ -2269,9 +2276,9 @@ impl Window {
     /// Presents the model's generation when the frame last submitted is not
     /// it: the scene through the raster, then the thumbnails held for the
     /// photos on screen (the grid's cells, or develop's filmstrip) and, in
-    /// develop mode, the developed preview in the develop box, each centred
-    /// and clipped to the grid's area, then the flag badges again over the
-    /// thumbnails, within the area too.
+    /// develop or the single view, the developed preview in its box, each
+    /// centred and clipped to the grid's area, then the flag badges again
+    /// over the thumbnails, within the area too.
     fn draw(&mut self) -> Result<()> {
         let generation = self.session.ui.generation();
         if self.submitted == Some(generation) || !self.client.can_present() {
