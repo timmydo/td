@@ -65,12 +65,13 @@ fn invalid(message: String) -> io::Error {
 }
 
 const USAGE: &str =
-    "usage: td-install inventory\n       td-install destinations\n       td-install prepare-selector <template> <volume-uuid> <output>\n       td-install timezones\n       td-install layout-preview <logical-sector-bytes> <capacity-bytes>\n       td-install format <efi-kernel> <selector-initramfs> <volume-options-and-operands>\n       td-install layout <destination> [<efi-kernel> <selector-initramfs>]\n       \
+    "usage: td-install new-volume-uuid\n       td-install inventory\n       td-install destinations\n       td-install prepare-selector <template> <volume-uuid> <output>\n       td-install timezones\n       td-install layout-preview <logical-sector-bytes> <capacity-bytes>\n       td-install format <efi-kernel> <selector-initramfs> <volume-options-and-operands>\n       td-install layout <destination> [<efi-kernel> <selector-initramfs>]\n       \
                      td-install volume [--uuid <uuid>] [--timezone <IANA-id>] [--hostname <name>] [--username <name> <verified-root> <td-firstboot>] <destination> <mkfs.btrfs> <scratch-dir> \
                      [<td-boot> <deployment> <trusted-key> | --trusted-key <trusted-key>]";
 
 #[derive(Debug, Eq, PartialEq)]
 enum Mode {
+    NewVolumeUuid,
     Inventory,
     Destinations,
     PrepareSelector {
@@ -477,6 +478,7 @@ fn parse_args(mut args: impl Iterator<Item = OsString>) -> io::Result<Mode> {
     match (verb.to_str(), rest) {
         (Some("inventory"), []) => Ok(Mode::Inventory),
         (Some("destinations"), []) => Ok(Mode::Destinations),
+        (Some("new-volume-uuid"), []) => Ok(Mode::NewVolumeUuid),
         (Some("prepare-selector"), [template, uuid, output]) => Ok(Mode::PrepareSelector {
             template: template.clone(),
             uuid: VolumeUuid::parse(uuid.to_str().ok_or_else(|| invalid("volume UUID must be UTF-8".into()))?)?,
@@ -786,6 +788,12 @@ fn layout_preview(sector_bytes: u64, capacity_bytes: u64, out: &mut dyn Write) -
         layout.volume_start, layout.volume_end, volume_offset, volume_bytes)
 }
 
+/// Choose once before preparing the selector and formatting the same volume.
+fn new_volume_uuid(output: &mut dyn Write) -> io::Result<()> {
+    let uuid = random_guid()?.to_string().to_ascii_lowercase();
+    writeln!(output, "{uuid}")
+}
+
 /// 16 bytes from `/dev/urandom`, as an RFC 4122 version-4 GUID.
 ///
 /// A disk and its partitions are identified by these, so they are per-install
@@ -796,7 +804,9 @@ fn random_guid() -> io::Result<gpt::Guid> {
     let mut bytes = [0u8; 16];
     let urandom = Path::new("/dev/urandom");
     let mut file = paths::open_read(urandom)?;
-    file.read_exact(&mut bytes)?;
+    file.read_exact(&mut bytes).map_err(|error| {
+        io::Error::new(error.kind(), format!("read {}: {error}", urandom.display()))
+    })?;
     // Version 4 and the RFC 4122 variant, in the on-disk mixed-endian layout:
     // the version nibble is the high nibble of byte 7's field, which little-endian
     // encoding of the third group puts at index 7, and the variant at index 8.
@@ -2227,6 +2237,11 @@ fn main() -> ExitCode {
         }
     };
     let result = match mode {
+        Mode::NewVolumeUuid => {
+            let stdout = io::stdout();
+            let mut output = io::BufWriter::new(stdout.lock());
+            new_volume_uuid(&mut output).and_then(|()| output.flush())
+        },
         Mode::Timezones => {
             let stdout = io::stdout();
             let mut output = io::BufWriter::new(stdout.lock());
@@ -2305,6 +2320,31 @@ mod tests {
     // this is the test half's own — a test opening a fixture is not a path the
     // installer takes from an operator, and the scan reads only the half above.
     use std::fs::OpenOptions;
+
+    #[test]
+    fn volume_identity_cli_admits_no_operands_and_reports_output_failure() {
+        assert_eq!(
+            parse_args([OsString::from("new-volume-uuid")].into_iter()).unwrap(),
+            Mode::NewVolumeUuid
+        );
+        for extra in ["/dev/vda", "--uuid", "--help"] {
+            assert!(parse_args(
+                [OsString::from("new-volume-uuid"), OsString::from(extra)].into_iter()
+            )
+            .is_err());
+        }
+        let mut bytes = Vec::new();
+        new_volume_uuid(&mut bytes).unwrap();
+        let line = std::str::from_utf8(&bytes).unwrap();
+        let value = line.strip_suffix('\n').unwrap();
+        VolumeUuid::parse(value).unwrap();
+        assert_eq!(value.as_bytes().get(14), Some(&b'4'));
+        assert!(matches!(
+            value.as_bytes().get(19),
+            Some(b'8' | b'9' | b'a' | b'b')
+        ));
+        assert!(new_volume_uuid(&mut &mut [][..]).is_err());
+    }
 
     #[test]
     fn selector_preparation_cli_requires_exact_operands_and_canonical_identity() {

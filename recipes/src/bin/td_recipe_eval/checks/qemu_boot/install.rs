@@ -222,7 +222,6 @@ struct LiveInstaller {
     base: Vec<u8>,
     common: Vec<PackedFile>,
     extra: Vec<PackedFile>,
-    uuid: String,
 }
 
 impl LiveInstaller {
@@ -245,8 +244,6 @@ impl LiveInstaller {
         ] {
             common.push((name.to_owned(), 0o755, read(&source)?));
         }
-        let uuid = installation_uuid(&trust.public);
-        let uuid_line = format!("{uuid}\n").into_bytes();
         let mut extra = vec![
             ("bin/td-firstboot".into(), 0o755, read(&firstboot.join("bin/td-firstboot"))?),
             (
@@ -260,7 +257,6 @@ impl LiveInstaller {
                 read(&btrfs.join("bin/mkfs.btrfs"))?,
             ),
             ("trusted.pub".into(), 0o644, trust.trusted_key_line()),
-            (td_boot_protocol::VOLUME_UUID_PATH.into(), 0o644, uuid_line),
         ];
         let zoneinfo = tzdata.join("share/zoneinfo");
         let catalog = td_recipe::td_install_timezones::Catalog::load(&zoneinfo)
@@ -280,7 +276,6 @@ impl LiveInstaller {
             base,
             common,
             extra,
-            uuid,
         })
     }
 }
@@ -295,7 +290,6 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
         base,
         common,
         mut extra,
-        uuid,
     } = LiveInstaller::load(runner, &trust)?;
     static SEQ: AtomicU64 = AtomicU64::new(0);
     let scratch = Scratch {
@@ -346,6 +340,7 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
     write(&live, &initramfs(&base, &common, "install\n", &extra)?)?;
     let iso = scratch.dir.join("installer.iso");
     media::write_image_with_payloads(&iso, &kernel, &live, &payloads)?;
+    let mut volume_ids = std::collections::BTreeSet::new();
     for (bus, sector_size) in [
         (DiskBus::Virtio, SectorSize::Bytes512),
         (DiskBus::Virtio, SectorSize::Bytes4096),
@@ -381,6 +376,7 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
                 &scratch.dir,
                 timeout,
             )?;
+            let uuid = record_volume_identity(&result, &target, &mut volume_ids)?;
             require_installation(&result, &uuid, source_device, &target)?;
             require_live_reports(
                 &result,
@@ -414,10 +410,11 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
                     attachment: FirmwareAttachment::InstalledFixtureReordered,
                     installation_target: Some(&duplicate),
                 },
-                target_plan(&target, refused),
+                target_plan(&target, protocol::REFUSAL_COMPLETE_MARKER),
                 &scratch.dir,
                 timeout,
             )?;
+            require(&result, protocol::REFUSAL_COMPLETE_MARKER, "refusal completion")?;
             require(&result, refused, "duplicate volume refusal")?;
             if result.evidence.selected_current || result.evidence.selected_previous {
                 return Err("ambiguous volume reached deployment selection".into());
@@ -500,6 +497,7 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
             true,
             protocol::INTERRUPTED_MARKER,
         )?;
+        let uuid = record_volume_identity(&interrupted, &target, &mut volume_ids)?;
         validate_interruption(&interrupted, kernel_bytes, &uuid, source_device)?;
         require_live_reports(
             &interrupted,
@@ -519,13 +517,14 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
             &target.path,
             FirmwareAttachment::InstalledFixture,
             false,
-            &refused,
+            protocol::REFUSAL_COMPLETE_MARKER,
         )?;
         validate_interrupted_boot(&broken, &refused, &uuid)?;
         println!(
             "   [qemu-install] reinstalling after interrupted publication through {name} media"
         );
         let repaired = boot("repair", &iso, attachment, true, protocol::INSTALL_MARKER)?;
+        let uuid = record_volume_identity(&repaired, &target, &mut volume_ids)?;
         require_installation(&repaired, &uuid, source_device, &target)?;
         require_live_reports(
             &repaired,
@@ -579,7 +578,7 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
                     attachment,
                     installation_target: Some(&target),
                 },
-                plan(&iso, true, protocol::REFUSED_PREFIX),
+                refusal_plan(&iso),
                 &scratch.dir,
                 timeout,
             )?;
@@ -619,7 +618,7 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
                     attachment,
                     installation_target: Some(&target),
                 },
-                plan(image, true, protocol::REFUSED_PREFIX),
+                refusal_plan(image),
                 &scratch.dir,
                 timeout,
             )?;
@@ -630,6 +629,7 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
                     tail(&refused.console, 80)
                 ));
             }
+            require(&refused, protocol::REFUSAL_COMPLETE_MARKER, "refusal completion")?;
             require(
                 &refused,
                 &format!("{} {source_device}", protocol::MEDIA_MARKER),
@@ -693,7 +693,7 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
         td_boot_protocol::MANIFEST_UNAUTHENTICATED,
     )?;
     println!(
-        "PASS: native optical/USB virtio/NVMe 512-byte/4Kn and AHCI 512-byte installation and interrupted-publication refusal/reinstallation; provisioned UUID binding across verified kexec and reordered disks; duplicate identity refusal; undersized/read-only targets and wrong-key/corrupt-payload optical/USB refusals preserve every target byte; two persistent installed boots"
+        "PASS: native optical/USB virtio/NVMe 512-byte/4Kn and AHCI 512-byte installation and interrupted-publication refusal/reinstallation; guest-generated UUID binding across verified kexec and reordered disks; duplicate identity refusal; undersized/read-only targets and wrong-key/corrupt-payload optical/USB refusals preserve every target byte; two persistent installed boots"
     );
     Ok(())
 }
@@ -1210,11 +1210,16 @@ fn require_live_reports(
         })
 }
 
+fn refusal_plan(image: &Path) -> BootPlan<'_> {
+    plan(image, true, protocol::REFUSAL_COMPLETE_MARKER)
+}
+
 fn validate_target_refusal(
     result: &BootResult,
     source_device: &str,
     diagnostic: &str,
 ) -> Result<(), String> {
+    require(result, protocol::REFUSAL_COMPLETE_MARKER, "refusal completion")?;
     require(
         result,
         &format!("{} {source_device}", protocol::MEDIA_MARKER),
@@ -1317,6 +1322,7 @@ fn validate_interruption(
 }
 
 fn validate_interrupted_boot(result: &BootResult, refused: &str, uuid: &str) -> Result<(), String> {
+    require(result, protocol::REFUSAL_COMPLETE_MARKER, "refusal completion")?;
     require(result, refused, "interrupted installation boot refusal")?;
     if result.evidence.selected_current || result.evidence.selected_previous {
         return Err("incomplete installation reached deployment selection".into());
@@ -1411,7 +1417,6 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
         base,
         common,
         mut extra,
-        uuid,
     } = LiveInstaller::load(runner, &trust)?;
     static SEQ: AtomicU64 = AtomicU64::new(0);
     let scratch = Scratch {
@@ -1433,7 +1438,6 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
         .map_err(|error| format!("hash system manifest: {error}"))?;
     let template = provision_selector_template(&selector, &scratch.dir, &trust)?;
     efi::copy_input(&template, &scratch.dir.join("selector.cpio"))?;
-    let provisioned = provision_selector(&selector, &scratch.dir, &trust)?;
     let payloads: Vec<_> = protocol::MEDIA_FILES
         .iter()
         .map(|(iso_name, name)| (*iso_name, scratch.dir.join(name)))
@@ -1458,6 +1462,7 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
     let iso = scratch.dir.join("installer.iso");
     media::write_image_with_payloads(&iso, &kernel, &live, &payloads)?;
     let capacity = system_target_capacity(payload_bytes)?;
+    let mut volume_ids = std::collections::BTreeSet::new();
     let mut installations: Vec<(String, BootResult)> = Vec::new();
     for bus in [DiskBus::Virtio, DiskBus::Ahci] {
         for (media_name, attachment, source_device) in [
@@ -1494,6 +1499,7 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
                 "   [qemu-install-system] {name} installation elapsed: {:.2}s",
                 result.elapsed.as_secs_f64()
             );
+            let uuid = record_volume_identity(&result, &target, &mut volume_ids)?;
             require_installation(&result, &uuid, source_device, &target)?;
             require_live_reports(
                 &result,
@@ -1562,6 +1568,9 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
             if installations.is_empty() {
                 // Firmware cannot inject autotest tokens. Keep both stock firmware
                 // boots above and add one direct selector boot of that SAME disk.
+                let provisioned = provision_selector_with_uuid(
+                    &selector, &scratch.dir, &trust, Some(&uuid),
+                )?;
                 let app_timeout = boot_timeout();
                 let tokens =
                     format!("{AUTOTEST_CMDLINE_TOKEN} {}", autotest_wait_token(app_timeout));
@@ -1716,6 +1725,71 @@ fn validate_installed_system(
         return Err(format!("installed system identity: expected fresh={fresh}, new={}, stable={}, host key present={}\n{}", result.evidence.firstboot_new, result.evidence.firstboot_stable, result.evidence.host_key.is_some(), tail(&result.console, 100)));
     }
     validate_compositor_boot(result)
+}
+
+/// Read one exact post-format identity report before trusting it as an oracle input.
+fn reported_volume_identity(console: &str, device: &str) -> Result<String, String> {
+    let mut reports = console
+        .lines()
+        .filter(|line| line.starts_with(protocol::PARTITIONS_MARKER));
+    let line = reports.next().ok_or("missing formatted volume identity")?;
+    if reports.next().is_some() {
+        return Err("duplicate formatted volume identity".into());
+    }
+    let prefix = format!("{} ", protocol::PARTITIONS_MARKER);
+    let (uuid, actual_device) = line
+        .strip_prefix(&prefix)
+        .and_then(|fields| fields.split_once(' '))
+        .ok_or("malformed formatted volume identity")?;
+    if !protocol::is_v4_volume_uuid(uuid) || actual_device != device {
+        return Err(format!(
+            "invalid formatted volume identity or device: {line}"
+        ));
+    }
+    Ok(uuid.to_owned())
+}
+
+/// Independently spot-check the fsid in the private image's primary superblock.
+/// Detached td-boot boots perform the complete filesystem/profile admission.
+fn require_image_volume_identity(path: &Path, uuid: &str) -> Result<(), String> {
+    use std::os::unix::fs::FileExt;
+    let offset = td_boot_protocol::PARTITION_ALIGN_BYTES
+        .checked_add(td_boot_protocol::ESP_BYTES)
+        .and_then(|offset| offset.checked_add(65536))
+        .ok_or("fixture superblock offset overflow")?;
+    let mut header = [0u8; 80];
+    fs::File::open(path)
+        .and_then(|file| file.read_exact_at(&mut header, offset))
+        .map_err(|error| format!("read volume identity from {}: {error}", path.display()))?;
+    if header.get(64..72) != Some(b"_BHRfS_M".as_slice()) {
+        return Err("installed image has no primary Btrfs superblock".into());
+    }
+    let bytes = header.get(32..48).ok_or("short volume identity field")?;
+    let hex: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+    if hex != uuid.replace('-', "") {
+        return Err("installed image UUID differs from guest report".into());
+    }
+    Ok(())
+}
+
+fn record_volume_identity(
+    result: &BootResult,
+    target: &TargetDisk,
+    previous: &mut std::collections::BTreeSet<String>,
+) -> Result<String, String> {
+    let device = format!("/dev/{}", partition_name(target.bus.name(false), 2));
+    let uuid = reported_volume_identity(&result.console, &device).map_err(|error| {
+        format!(
+            "installation volume identity: {error}; {}\n{}",
+            result.reason,
+            tail(&result.console, 160)
+        )
+    })?;
+    require_image_volume_identity(&target.path, &uuid)?;
+    if !previous.insert(uuid.clone()) {
+        return Err("repeated installation reused a volume UUID from the same ISO".into());
+    }
+    Ok(uuid)
 }
 
 fn require_installation(
@@ -1948,6 +2022,91 @@ mod tests {
     }
 
     #[test]
+    fn volume_identity_report_requires_one_canonical_uuid_and_exact_device() {
+        let uuid = "12345678-1234-4234-8234-123456789abc";
+        let report = format!("{} {uuid} /dev/vda2\n", protocol::PARTITIONS_MARKER);
+        assert_eq!(
+            reported_volume_identity(&report, "/dev/vda2").unwrap(),
+            uuid
+        );
+        for bad in [
+            String::new(),
+            report.repeat(2),
+            report.replace(uuid, "uuid"),
+            report.replace(uuid, &uuid.to_uppercase()),
+            report.replace(" /dev", "  /dev"),
+            report.replace("vda2", "vdb2"),
+            report.replace("-4234-", "-1234-"),
+            report.replace("-8234-", "-7234-"),
+            report.replace("REFRESHED ", "REFRESHED:"),
+        ] {
+            assert!(
+                reported_volume_identity(&bad, "/dev/vda2").is_err(),
+                "{bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn volume_identity_is_read_from_the_private_image_and_cannot_repeat() {
+        use std::os::unix::fs::FileExt;
+        let dir = create_scratch_dir(&env::temp_dir(), &AtomicU64::new(0)).unwrap();
+        let _guard = Scratch { dir: dir.clone() };
+        let target = TargetDisk::create(&dir, "identity.img").unwrap();
+        let uuid = "12345678-1234-4234-8234-123456789abc";
+        let mut result = interrupted_result();
+        result.reason = "fixture timed out before formatting".into();
+        result.console = "early source refusal\n".into();
+        let mut seen = std::collections::BTreeSet::new();
+        let error = record_volume_identity(&result, &target, &mut seen).unwrap_err();
+        assert!(error.contains("missing formatted volume identity"));
+        assert!(error.contains(&result.reason));
+        assert!(error.contains("early source refusal"));
+        assert!(seen.is_empty());
+        result.console = format!("{} {uuid} /dev/vda2\n", protocol::PARTITIONS_MARKER);
+        assert!(record_volume_identity(&result, &target, &mut seen).is_err());
+        assert!(seen.is_empty());
+        let mut header = [0u8; 80];
+        header[32..48].copy_from_slice(&[
+            0x12, 0x34, 0x56, 0x78, 0x12, 0x34, 0x42, 0x34, 0x82, 0x34, 0x12, 0x34, 0x56, 0x78,
+            0x9a, 0xbc,
+        ]);
+        header[64..72].copy_from_slice(b"_BHRfS_M");
+        let file = fs::OpenOptions::new()
+            .write(true)
+            .open(&target.path)
+            .unwrap();
+        let offset = td_boot_protocol::PARTITION_ALIGN_BYTES + td_boot_protocol::ESP_BYTES + 65536;
+        file.write_all_at(&header, offset).unwrap();
+        assert_eq!(
+            record_volume_identity(&result, &target, &mut seen).unwrap(),
+            uuid
+        );
+        assert!(record_volume_identity(&result, &target, &mut seen).is_err());
+        seen.clear();
+        header[32] ^= 1;
+        file.write_all_at(&header, offset).unwrap();
+        assert!(record_volume_identity(&result, &target, &mut seen).is_err());
+        assert!(seen.is_empty());
+    }
+
+    #[test]
+    fn refusal_stop_waits_for_the_complete_diagnostic_across_serial_fragments() {
+        let plan = refusal_plan(Path::new("fixture.iso"));
+        assert!(plan.kill_on_marker);
+        for newline in ["\n", "\r\n"] {
+            let diagnostic = format!("{} /bin/td-install failed: exit status: 1{newline}", protocol::REFUSED_PREFIX);
+            let bytes = format!("{diagnostic}{}{newline}", protocol::REFUSAL_COMPLETE_MARKER).into_bytes();
+            let stop = diagnostic.len() + protocol::REFUSAL_COMPLETE_MARKER.len();
+            let mut evidence = ConsoleEvidence::default();
+            for received in 0..=bytes.len() {
+                latch_console_evidence(&mut evidence, &bytes[..received], plan.target_marker.as_bytes());
+                assert_eq!(evidence.target, received >= stop, "received {received} of {}", bytes.len());
+            }
+        }
+    }
+
+    #[test]
     fn target_refusal_requires_layout_failure_and_no_publication() {
         let validate = |result: &BootResult| {
             validate_target_refusal(result, "/dev/sr0", "destination is too small")
@@ -1957,11 +2116,14 @@ mod tests {
             "{} /dev/sr0\ntd-install: destination is too small\n{} /bin/td-install failed: exit status: 1\n",
             protocol::MEDIA_MARKER, protocol::REFUSED_PREFIX
         );
+        result.console.push_str(protocol::REFUSAL_COMPLETE_MARKER);
+        result.console.push('\n');
         assert!(validate(&result).is_ok());
         for missing in [
             protocol::MEDIA_MARKER,
             protocol::REFUSED_PREFIX,
             "destination is too small",
+            protocol::REFUSAL_COMPLETE_MARKER,
         ] {
             let console = result.console.clone();
             result.console = console.replace(missing, "wrong");
@@ -2037,8 +2199,10 @@ mod tests {
         );
         let mut result = interrupted_result();
         result.console = format!("TD-BOOT-VOLUME uuid /dev/vda2\nTD-INSTALL-VOLUME uuid /dev/vda2\ncurrent selector /volume/td/boot/current: No such file or directory (os error 2)\nprevious selector /volume/td/boot/previous: No such file or directory (os error 2)\n{refused}\n");
+        result.console.push_str(protocol::REFUSAL_COMPLETE_MARKER);
+        result.console.push('\n');
         assert!(validate_interrupted_boot(&result, &refused, "uuid").is_ok());
-        for missing in [refused.as_str(), "TD-BOOT-VOLUME uuid /dev/vda2"] {
+        for missing in [refused.as_str(), "TD-BOOT-VOLUME uuid /dev/vda2", protocol::REFUSAL_COMPLETE_MARKER] {
             let console = result.console.clone();
             result.console = console.replace(missing, "");
             assert!(validate_interrupted_boot(&result, &refused, "uuid").is_err());

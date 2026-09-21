@@ -658,9 +658,15 @@ trusted public key in the verified base template unchanged. The shared
 EFI copier pins the input and rejects size changes; exclusive output
 creation cannot overwrite an existing destination. This preparation
 belongs before raw formatting and supplies no destructive authority.
-The live QEMU installer uses the prepared copy; its ISO template no longer
-contains the host-selected test UUID. Other host-only boot oracles retain
-their existing provisioned selectors.
+The live QEMU installer uses `new-volume-uuid` to draw one version-4 identity
+through the formatter's existing random-device reader before preparing the
+copy. Neither its live configuration nor its ISO selector template carries
+a preselected destination UUID. The host checks the reported identity
+against the private image's primary Btrfs fsid and refuses reuse across
+installations, then requires the same binding on detached boots. The direct
+application-evidence boot uses the first installed volume's observed UUID;
+other host-only boot oracles retain their existing provisioned selectors.
+INSTALLER.md owns the generator's output and future-plan boundary.
 
 ### Refreshing partitions after formatting
 
@@ -755,13 +761,15 @@ Other operations require exactly one canonical `td.volume=` token from
 installation retain the identity chosen by the selector.
 
 VM provisioning puts the same UUID in the selector and Btrfs formatter.
-All VM profiles derive it from their provisioning public key using the
-installation UUID rule above. Independent provisioning keys yield distinct
-volumes; the test run's alternate disk fixtures intentionally retain that
-run's UUID and must not be attached together. The private installation
-profile retains its UUID across updates. Selector configuration is boot-source
-data, outside deployments and the writable volume's authority; this is not
-Secure Boot authentication of that source.
+Host-only provisioning profiles derive it from their provisioning public
+key using the installation UUID rule above. Independent provisioning keys
+yield distinct volumes; those profiles' alternate disk fixtures retain
+that run's UUID and must not be attached together. Live installation
+fixtures instead generate a fresh UUID inside the guest for every install
+and destructive reinstall. An installed volume retains its UUID across
+updates. Selector configuration is boot-source data, outside deployments
+and the writable volume's authority; this is not Secure Boot authentication
+of that source.
 
 After a complete uniqueness scan, `on-volume` reopens and validates the
 selected node and UUID, retaining its read-only descriptor through every
@@ -815,9 +823,10 @@ formatter cannot inspect or repair a mismatched selector. A UUID identifies
 the filesystem; it provides no authentication, uniqueness proof or erase
 consent. The caller owns unique provisioning, stable device topology and
 exclusive admission. Reusing a UUID on two attached volumes deliberately
-causes boot discovery to refuse. The diagnostic derives one UUID from its
-throwaway provisioning key and reuses it only across separately attached
-optical/USB test destinations; no installation private key ships on media.
+causes boot discovery to refuse. The live diagnostic generates a fresh UUID
+per installation with `new-volume-uuid`, including separate optical/USB
+destinations and destructive reinstalls. No installation private key ships
+on media.
 
 td boots by the **removable-media path**: `\EFI\BOOT\BOOTX64.EFI` on the ESP,
 which every UEFI implementation boots when no NVRAM boot entry names anything

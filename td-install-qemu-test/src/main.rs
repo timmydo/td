@@ -22,6 +22,11 @@ fn report(mut output: impl Write, message: std::fmt::Arguments<'_>) -> Result<()
         .map_err(|error| error.to_string())
 }
 
+fn report_refusal(output: impl Write, error: &str) -> Result<(), String> {
+    // Serial transmission can split even one write; the last record fences it.
+    report(output, format_args!("{REFUSED_PREFIX} {error}\n{REFUSAL_COMPLETE_MARKER}"))
+}
+
 fn command(program: &str, args: &[&str]) -> Result<(), String> {
     let status = Command::new(program)
         .args(args)
@@ -327,7 +332,7 @@ fn diagnostic_line(bytes: Vec<u8>, limit: usize, label: &str) -> Result<String, 
     Ok(text)
 }
 
-fn diagnostic(marker: &str, args: &[&str], limit: usize, label: &str) -> Result<(), String> {
+fn command_line(args: &[&str], limit: usize, label: &str) -> Result<String, String> {
     let mut child = Command::new("/bin/td-install")
         .args(args)
         .stdout(Stdio::piped())
@@ -356,6 +361,11 @@ fn diagnostic(marker: &str, args: &[&str], limit: usize, label: &str) -> Result<
     if !status.success() {
         return Err(format!("{label} failed: {status}"));
     }
+    Ok(json)
+}
+
+fn diagnostic(marker: &str, args: &[&str], limit: usize, label: &str) -> Result<(), String> {
+    let json = command_line(args, limit, label)?;
     report(
         std::io::stdout(),
         format_args!("{marker} {} {json}", json.len()),
@@ -405,7 +415,6 @@ fn install(device: &str, interrupt: bool, system_autotest: bool) -> Result<(), S
     mount_source(device)?;
     inventory(INVENTORY_BEFORE_MARKER)?;
     candidates(CANDIDATES_BEFORE_MARKER)?;
-    let uuid = configured_uuid()?;
     let name = device
         .strip_prefix("/dev/")
         .ok_or("invalid target device")?;
@@ -441,6 +450,10 @@ fn install(device: &str, interrupt: bool, system_autotest: bool) -> Result<(), S
         applet(&["mount", "-t", "erofs", "-o", "ro,nodev,nosuid,noexec",
             "/dev/loop0", "/root-image"])?;
         command("/bin/td-firstboot", &["check-primary-name", "/root-image", USERNAME])?;
+    }
+    let uuid = command_line(&["new-volume-uuid"], 37, "new volume identity")?;
+    if !is_v4_volume_uuid(&uuid) {
+        return Err("generated volume identity is not a canonical version-4 UUID".into());
     }
     command("/bin/td-install", &["prepare-selector", "/selector.cpio", &uuid, "/prepared-selector.cpio"])?;
     let mut format_arguments = vec!["format", "/source/bzImage", "/prepared-selector.cpio", "--uuid", &uuid,
@@ -954,7 +967,7 @@ fn run() -> Result<(), String> {
 fn main() -> ExitCode {
     let result = run();
     if let Err(error) = result {
-        let _ = report(std::io::stderr(), format_args!("{REFUSED_PREFIX} {error}"));
+        let _ = report_refusal(std::io::stderr(), &error);
         if std::process::id() != 1 {
             return ExitCode::FAILURE;
         }
@@ -1140,7 +1153,7 @@ mod tests {
     }
 
     #[test]
-    fn protocol_formatting_does_not_split_a_line_across_writes() {
+    fn refusal_formatting_prepares_error_and_completion_in_one_write() {
         #[derive(Default)]
         struct Output(Vec<Vec<u8>>);
         impl Write for Output {
@@ -1154,10 +1167,10 @@ mod tests {
         }
         let mut output = Output::default();
         let error = String::from("/bin/td-boot failed: exit status: 1");
-        report(&mut output, format_args!("{REFUSED_PREFIX} {error}")).unwrap();
+        report_refusal(&mut output, &error).unwrap();
         assert_eq!(
             output.0,
-            vec![format!("{REFUSED_PREFIX} {error}\n").into_bytes()]
+            vec![format!("{REFUSED_PREFIX} {error}\n{REFUSAL_COMPLETE_MARKER}\n").into_bytes()]
         );
     }
 

@@ -83,6 +83,22 @@ fixture uses it after read-only source validation. Scratch preparation
 must succeed before the first GPT write. This command does not activate
 the service or provide the review/consent sequence.
 
+## Choosing the volume identity
+
+`td-install new-volume-uuid` takes no operands and prints one canonical
+lowercase version-4 UUID and a newline. It uses the formatter's existing
+kernel random-device reader; each request draws a new value independently
+of the ISO's signing key. It opens no destination, writes no disk bytes,
+and does not reserve a UUID or grant destructive authority. Random values
+are not hardware authentication, secrets or a proof of global uniqueness.
+The live environment must provide its trusted kernel random device.
+
+The caller requires successful exit and complete output, retains that
+value once per proposed installation, and supplies it unchanged to
+`prepare-selector` and `format --uuid`. Output failures are failures even
+if a partial line was written. Plan retention, review and consent remain
+service responsibilities; retrying this command chooses a different value.
+
 ## Preparing the installed selector
 
 `td-install prepare-selector TEMPLATE VOLUME-UUID OUTPUT` makes a private
@@ -127,10 +143,12 @@ writes no block device and performs no source deployment publication.
 The small and full-system installation fixtures carry a trusted selector
 template without a host-provisioned volume UUID. In the live guest, after
 source validation, they prepare the selector with the fixture's chosen
-UUID and pass that copy to `format`. The fixture's live configuration still
-supplies a host-selected test UUID; service-owned generation and immutable
-plans remain separate work. Detached boots now require live selector
-preparation to supply the identity, across all existing bus/media cases.
+UUID and pass that copy to `format`. Each live installation calls
+`new-volume-uuid`; the ISO carries no destination UUID. The host validates
+one canonical identity report against the primary Btrfs fsid in its private
+disk image and rejects reuse across successful installs and interrupted
+reinstalls. Detached boots must bind that exact UUID across every existing
+bus/media case. Immutable plans and trusted consent remain separate work.
 
 ## Media, boot and persistence
 

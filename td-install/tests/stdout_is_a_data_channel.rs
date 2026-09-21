@@ -19,6 +19,41 @@ type Res<T> = Result<T, Box<dyn Error>>;
 const BIN: &str = env!("CARGO_BIN_EXE_td-install");
 
 #[test]
+fn generated_volume_identities_are_canonical_independent_process_results() -> Res<()> {
+    let mut identities = std::collections::BTreeSet::new();
+    for _ in 0..3 {
+        let result = Command::new(BIN).arg("new-volume-uuid").output()?;
+        assert!(result.status.success(), "{result:?}");
+        assert!(result.stderr.is_empty(), "{result:?}");
+        let line = String::from_utf8(result.stdout)?;
+        assert_eq!(line.len(), 37);
+        assert!(line.ends_with('\n'));
+        for (index, byte) in line.bytes().take(36).enumerate() {
+            if matches!(index, 8 | 13 | 18 | 23) {
+                assert_eq!(byte, b'-');
+            } else {
+                assert!(byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
+            }
+        }
+        assert_eq!(line.as_bytes().get(14), Some(&b'4'));
+        assert!(matches!(
+            line.as_bytes().get(19),
+            Some(b'8' | b'9' | b'a' | b'b')
+        ));
+        assert!(
+            identities.insert(line),
+            "separate requests reused a volume identity"
+        );
+    }
+    let refused = Command::new(BIN)
+        .args(["new-volume-uuid", "extra"])
+        .output()?;
+    assert!(!refused.status.success());
+    assert!(refused.stdout.is_empty());
+    Ok(())
+}
+
+#[test]
 fn selector_preparation_is_silent_and_refusal_preserves_the_output() -> Res<()> {
     let dir = scratch_dir("selector-stdout")?;
     let template = dir.join("template");

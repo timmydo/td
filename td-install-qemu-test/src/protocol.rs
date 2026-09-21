@@ -4,6 +4,7 @@ pub const INSTALL_MARKER: &str = "TD-INSTALL-DISK-WRITTEN";
 pub const FIRST_BOOT_MARKER: &str = "TD-INSTALL-PERSISTED-1";
 pub const SECOND_BOOT_MARKER: &str = "TD-INSTALL-PERSISTED-2";
 pub const REFUSED_PREFIX: &str = "TD-INSTALL-REFUSED:";
+pub const REFUSAL_COMPLETE_MARKER: &str = "TD-INSTALL-REFUSAL-COMPLETE";
 
 pub const DIRECT_MARKER: &str = "TD-INSTALL-PUBLISHED-ON-DISK";
 pub const PARTITIONS_MARKER: &str = "TD-INSTALL-PARTITIONS-REFRESHED";
@@ -43,3 +44,40 @@ pub const TIMEZONE_ID: &str = "Europe/London";
 /// Only the full-system diagnostic ISO carries these existing SSH test inputs.
 pub const SYSTEM_AUTOTEST_PRIVATE: &str = "system-autotest/private";
 pub const SYSTEM_AUTOTEST_AUTHORIZED: &str = "system-autotest/authorized_keys";
+
+/// Shape of the generator's canonical UUID, not proof of freshness or authority.
+pub fn is_v4_volume_uuid(value: &str) -> bool {
+    value.len() == 36
+        && value.bytes().enumerate().all(|(index, byte)| match index {
+            8 | 13 | 18 | 23 => byte == b'-',
+            14 => byte == b'4',
+            19 => matches!(byte, b'8' | b'9' | b'a' | b'b'),
+            _ => byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte),
+        })
+}
+
+#[cfg(test)]
+mod identity_tests {
+    use super::is_v4_volume_uuid;
+
+    #[test]
+    fn volume_uuid_shape_is_canonical_and_version_four() {
+        let good = "12345678-1234-4234-8234-123456789abc";
+        assert!(is_v4_volume_uuid(good));
+        for bad in [
+            "",
+            "00000000-0000-0000-0000-000000000000",
+            "12345678-1234-4234-8234-123456789ABC",
+            "12345678-1234-1234-8234-123456789abc",
+            "12345678-1234-4234-7234-123456789abc",
+            "12345678-1234-4234-8234-123456789abc\n",
+        ] {
+            assert!(!is_v4_volume_uuid(bad), "{bad:?}");
+        }
+        for index in [8, 13, 18, 23] {
+            let mut bad = good.to_owned();
+            bad.replace_range(index..index + 1, "0");
+            assert!(!is_v4_volume_uuid(&bad));
+        }
+    }
+}

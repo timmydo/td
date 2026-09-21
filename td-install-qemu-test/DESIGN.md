@@ -64,18 +64,28 @@ before layout; no initramfs copy is available as a fallback. The formatter
 stages only a trust layout and sparse Btrfs metadata image in RAM; the
 deployment is published directly onto the mounted disk.
 
-The host chooses the UUID from the run's throwaway provisioning public key
-before assembling the ISO. Its canonical text is placed only in the live
-initramfs at `/etc/td/volume-uuid`. The ISO's selector template contains
-the trusted public key and no provisioned volume UUID. After validating
-the source, the live fixture invokes `td-install prepare-selector` to
-copy that template to `/prepared-selector.cpio` and append the UUID.
-It passes that prepared copy and the same `--uuid` value to `format`.
-Detached selector boots therefore depend on production live preparation;
-copying the ISO template directly would leave volume discovery unbound.
-The template stays on read-only media and the prepared copy stays in
-volatile state. Optical and USB destinations
-deliberately share that run's UUID but are never attached together.
+The host provisions the run's throwaway public key before assembling the
+ISO, but neither the live configuration nor the selector template contains
+a volume UUID. After source validation, the live fixture invokes production
+`td-install new-volume-uuid`, requires successful bounded output with the
+canonical version-4 shape, and invokes `prepare-selector` to copy the
+read-only template to `/prepared-selector.cpio` with that identity.
+It passes the same value to `format --uuid`. The copy remains volatile.
+Detached boots therefore depend on live preparation; copying the ISO
+template directly would leave volume discovery unbound.
+
+The host requires one exact partition-refresh identity report for its
+expected device and independently reads the UUID field and magic from the
+primary Btrfs superblock in the private image at the fixed layout offset.
+This is an identity spot-check, not full superblock validation; detached
+td-boot boots retain their complete profile and checksum admission.
+Each installation and destructive reinstall must have a UUID distinct from
+every prior run in that matrix, including the interrupted installation.
+Repeated installs use the same ISO bytes and public key. Cold and reordered
+boots retain their own observed UUID; the full-system direct application
+boot receives a host selector bound to that installed volume's UUID.
+The fixture registry proves those observations, not global uniqueness or
+hardware identity. No operator device is inspected by this host oracle.
 
 Target discovery waits up to thirty seconds for its fixed serial. Virtio
 uses the root serial attribute; AHCI disks use the SCSI device serial.
@@ -182,7 +192,7 @@ UUID and invokes production `td-boot on-volume boot`. That entry reads the
 selector's own identity file, rejects an existing handoff token, and binds
 verified kexec to the configured volume. The selected fixture requires one
 UUID handoff and resolves it again. The host requires both phases to report
-the exact preselected UUID and expected device, plus the production bound
+the exact UUID reported during installation and expected device, plus the production bound
 entry's marker; agreement with an arbitrary discovered UUID is insufficient.
 The selected fixture uses `td-boot on-volume` for both mounts and
 acknowledgement. Before acknowledgement it deliberately leaves a writable
@@ -314,10 +324,15 @@ to raise verbosity on faults; level zero would suppress that recovery.
 Tool stdout/stderr and explicit fixture errors continue to reach the
 captured console.
 
-The fixture formats a complete protocol line before write_all, avoiding
-formatter-induced split writes that could separate the refusal prefix
-from its reason. Incomplete or interleaved evidence still fails the host
-oracle.
+The fixture formats complete protocol records before write_all, avoiding
+formatter-induced split writes. One write does not make serial delivery
+atomic: QEMU can observe a refusal prefix while the UART is still sending
+its reason. Every fixture failure therefore appends a separate
+`TD-INSTALL-REFUSAL-COMPLETE` record after the full diagnostic. Negative
+boot plans stop on that final record, and validators still require the
+complete expected error and all phase-specific evidence. The completion
+record cannot replace a reason or repair an interleaved report. Byte-wise
+host tests cover every truncation point with both LF and CRLF delivery.
 
 The fixture deliberately inspects the formatter's staging layout as an
 internal regression oracle. A formatter rename requires updating that
