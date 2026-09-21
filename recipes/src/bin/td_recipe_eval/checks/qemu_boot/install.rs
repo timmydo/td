@@ -1097,6 +1097,80 @@ fn validate_preview(
     Ok(())
 }
 
+fn candidate_geometry(capacity: u64, sector: u64) -> bool {
+    if !matches!(sector, 512 | 4096) || !capacity.is_multiple_of(sector) {
+        return false;
+    }
+    // The fixed ESP begins at one alignment unit in both supported geometries.
+    let prefix = td_boot_protocol::PARTITION_ALIGN_BYTES + td_boot_protocol::ESP_BYTES;
+    td_engine::gpt::last_usable_lba(sector, capacity / sector)
+        .ok()
+        .and_then(|last| last.checked_add(1))
+        .and_then(|end| end.checked_mul(sector))
+        .and_then(|end| end.checked_sub(prefix))
+        .is_some_and(|bytes| bytes >= td_boot_protocol::MIN_VOLUME_BYTES)
+}
+
+fn validate_candidates(
+    console: &str,
+    expected: &InventoryExpected<'_>,
+    partitioned: bool,
+) -> Result<(), String> {
+    let inventory = diagnostic_frame(
+        console,
+        protocol::INVENTORY_BEFORE_MARKER,
+        protocol::MAX_INVENTORY_BYTES,
+    )?;
+    let target = report_field(&inventory, "devices")?
+        .as_arr()
+        .ok_or("inventory devices is not an array")?
+        .iter()
+        .find(|device| {
+            report_field(device, "name")
+                .ok()
+                .and_then(|name| name.as_str())
+                == Some(expected.target_name)
+        })
+        .ok_or("candidate comparison lacks target inventory")?;
+    for (marker, required, available) in [
+        (
+            protocol::CANDIDATES_BEFORE_MARKER,
+            true,
+            !expected.read_only && candidate_geometry(expected.target_bytes, expected.sector_bytes),
+        ),
+        (protocol::CANDIDATES_HELD_MARKER, partitioned, false),
+        (protocol::CANDIDATES_MOUNTED_MARKER, partitioned, false),
+    ] {
+        if !required {
+            if console.lines().any(|line| line.starts_with(marker)) {
+                return Err(format!("unexpected {marker} on refused installation"));
+            }
+            continue;
+        }
+        let document = diagnostic_frame(console, marker, protocol::MAX_INVENTORY_BYTES)?;
+        if report_number(&document, "version")? != 1
+            || report_field(&document, "scope")?.as_str() != Some("candidate-only")
+        {
+            return Err(format!("{marker}: wrong version or scope"));
+        }
+        let devices = report_field(&document, "devices")?
+            .as_arr()
+            .ok_or("candidate devices is not an array")?;
+        // This fixture has exactly one supported writable target; all other
+        // devices must be absent, including the installation medium.
+        if available {
+            if devices.len() != 1 || devices.first() != Some(target) {
+                return Err(format!(
+                    "{marker}: expected only the unchanged target inventory"
+                ));
+            }
+        } else if !devices.is_empty() {
+            return Err(format!("{marker}: expected no destination candidates"));
+        }
+    }
+    Ok(())
+}
+
 fn require_live_reports(
     result: &BootResult,
     target: &TargetDisk,
@@ -1130,12 +1204,14 @@ fn require_live_reports(
             tail(&result.console, 80)
         )
     })?;
-    validate_inventories(&result.console, &expected, partitioned).map_err(|error| {
-        format!(
-            "installer inventory: {error}\n{}",
-            tail(&result.console, 80)
-        )
-    })
+    validate_inventories(&result.console, &expected, partitioned)
+        .and_then(|()| validate_candidates(&result.console, &expected, partitioned))
+        .map_err(|error| {
+            format!(
+                "installer storage reports: {error}\n{}",
+                tail(&result.console, 80)
+            )
+        })
 }
 
 fn validate_target_refusal(
@@ -2493,6 +2569,91 @@ mod tests {
             ));
         }
         console
+    }
+
+    #[test]
+    fn candidate_capacity_uses_the_layout_minimum_in_both_geometries() {
+        let without_tail = td_boot_protocol::PARTITION_ALIGN_BYTES
+            + td_boot_protocol::ESP_BYTES + td_boot_protocol::MIN_VOLUME_BYTES;
+        for sector in [512, 4096] {
+            assert!(!candidate_geometry(0, sector));
+            assert!(!candidate_geometry(without_tail, sector));
+            assert!(candidate_geometry(without_tail + 1024 * 1024, sector));
+            assert!(without_tail + 1024 * 1024 < MINIMUM_TARGET_BYTES);
+            assert!(!candidate_geometry(MINIMUM_TARGET_BYTES + 1, sector));
+        }
+        assert!(!candidate_geometry(MINIMUM_TARGET_BYTES, 0));
+        assert!(!candidate_geometry(MINIMUM_TARGET_BYTES, 1024));
+    }
+
+    fn candidate_console(available: bool, partitioned: bool) -> String {
+        let mut console = inventory_console(INVENTORY_FIXTURE, None);
+        let device = INVENTORY_FIXTURE
+            .split_once("\"devices\":[")
+            .unwrap()
+            .1
+            .split_once(",{\"name\":\"sr0\"")
+            .unwrap()
+            .0;
+        for (marker, include, target) in [
+            (protocol::CANDIDATES_BEFORE_MARKER, true, available),
+            (protocol::CANDIDATES_HELD_MARKER, partitioned, false),
+            (protocol::CANDIDATES_MOUNTED_MARKER, partitioned, false),
+        ] {
+            if include {
+                let devices = if target { device } else { "" };
+                let json =
+                    format!("{{\"version\":1,\"scope\":\"candidate-only\",\"devices\":[{devices}]}}");
+                console.push_str(&format!("{marker} {} {json}\n", json.len()));
+            }
+        }
+        console
+    }
+
+    #[test]
+    fn candidate_oracle_requires_free_target_and_both_busy_refusals() {
+        let mut expected = inventory_expectation();
+        let valid = candidate_console(true, true);
+        validate_candidates(&valid, &expected, true).unwrap();
+        let free = valid.lines().find(|line| line.starts_with(protocol::CANDIDATES_BEFORE_MARKER)).unwrap();
+        for marker in [protocol::CANDIDATES_HELD_MARKER, protocol::CANDIDATES_MOUNTED_MARKER] {
+            let busy = valid.lines().find(|line| line.starts_with(marker)).unwrap();
+            let admitted = free.replacen(protocol::CANDIDATES_BEFORE_MARKER, marker, 1);
+            assert!(validate_candidates(&valid.replace(busy, &admitted), &expected, true).is_err());
+        }
+
+        assert!(validate_candidates(&candidate_console(false, true), &expected, true).is_err());
+        assert!(validate_candidates(&candidate_console(true, false), &expected, true).is_err());
+        assert!(validate_candidates(&valid, &expected, false).is_err());
+        for (old, new) in [
+            ("candidate-only", "inventory-only"),
+            ("CANDIDATES-HELD", "CANDIDATES-MOUNTED"),
+        ] {
+            assert!(validate_candidates(&valid.replace(old, new), &expected, true).is_err());
+        }
+        let (inventory, candidates) = valid
+            .split_once(protocol::CANDIDATES_BEFORE_MARKER)
+            .unwrap();
+        for (old, new) in [
+            ("252:0", "252:9"),
+            ("6442450944", "6442450945"),
+            ("\"sequence\":11", "\"sequence\":12"),
+            ("\"vda\"", "\"sda\""),
+        ] {
+            let changed = format!(
+                "{inventory}{}{}",
+                protocol::CANDIDATES_BEFORE_MARKER,
+                candidates.replace(old, new)
+            );
+            assert!(validate_candidates(&changed, &expected, true).is_err());
+        }
+        expected.read_only = true;
+        validate_candidates(&candidate_console(false, false), &expected, false).unwrap();
+        assert!(validate_candidates(&candidate_console(true, false), &expected, false).is_err());
+        expected.read_only = false;
+        expected.target_bytes = 128 * 1024 * 1024;
+        validate_candidates(&candidate_console(false, false), &expected, false).unwrap();
+        assert!(validate_candidates(&candidate_console(true, false), &expected, false).is_err());
     }
 
     #[test]

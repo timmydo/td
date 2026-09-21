@@ -549,6 +549,62 @@ continuity are checked on successful/recovery installations; refusals must
 have no post-format report and retain the existing whole-disk byte preservation proof. These
 are observations under a disposable topology, not destination eligibility.
 
+## Advisory destination discovery
+
+`td-install destinations` prints the inventory's version-1 device schema
+with `scope: "candidate-only"` and only currently available candidates.
+It takes no operands, writes no disk bytes and uses no child processes.
+Direct virtio, SCSI/SATA and NVMe whole-disk names are supported; partitions,
+optical, loop, device-mapper, RAID and path-specific NVMe namespace names
+are excluded. Native NVMe multipath is disabled in the pinned kernel.
+Its aggregate namespace names can match this lexical filter on other
+kernels; those topologies are outside the supported profile. Each
+candidate must be writable according to sysfs, have 512-byte or 4096-byte
+logical sectors, and fit the formatter's layout. Any holder or slave edge
+on the disk or one of its partitions excludes the whole disk.
+
+For each remaining disk, discovery opens a temporary read-only Linux
+O_EXCL claim. A busy claim excludes that disk. Other open or metadata errors
+refuse the entire observation, with no partial candidate document. The
+opened descriptor must be a block device with the inventory's device
+number and capacity. A second complete inventory must equal the first
+after all probes finish. Collection bounds, JSON escaping and output-error
+handling remain the same as inventory. Empty candidates are a successful
+observation, not permission to bypass admission.
+
+This requires trusted devtmpfs/sysfs and their ancestors, and the live
+profile must retain mounts of the installation medium and every filesystem
+backing its files. Those kernel claims, or excluded stacked relationships,
+keep that storage out of the candidate set. This command does not discover
+an unmounted source by content or track arbitrary file-backed media.
+While held, each probe can temporarily refuse incompatible exclusive
+operations such as mounts. Concurrent discovery processes can omit each
+other's claimed disks even when both inventories agree. Discovery does not
+retry busy claims or missing devtmpfs nodes: busy means omitted, and a
+missing node or other probe error refuses the complete observation.
+The temporary claims close before the report is consumed. Model, serial,
+WWID, device number and disk sequence are observations, not hardware
+authentication or retained write authority. Matching two inventories is
+not an atomic snapshot, a time bound on kernel I/O, or protection against
+removal/replacement, changes that reverse between observations, unclaimed
+raw I/O or a privileged topology writer.
+
+The future service must bind the reviewed identity and settings in its
+immutable plan, independently resolve source backing storage, revalidate
+the selected device and retain its claim through destructive execution.
+This advisory CLI does not activate the service or provide that admission,
+consent, source verification, scratch or payload-fit checks.
+
+The QEMU host requires exactly its available target in the initial report,
+with the same complete identity as inventory, and no candidates while a
+whole-disk claim or mounted system partition holds the target busy.
+Read-only and undersized targets must be absent even though the fixture
+still invokes the formatter to test its refusal. Source-corruption cases
+also collect this read-only report before source validation; candidates do
+not imply an authenticated source. The installation medium is always
+absent. These are private optical/USB, virtio/AHCI/NVMe observations; no
+physical-device compatibility claim is added.
+
 ## Read-only layout preview
 
 `td-install layout-preview <logical-sector-bytes> <capacity-bytes>`

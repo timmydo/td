@@ -63,13 +63,14 @@ fn invalid(message: String) -> io::Error {
 }
 
 const USAGE: &str =
-    "usage: td-install inventory\n       td-install timezones\n       td-install layout-preview <logical-sector-bytes> <capacity-bytes>\n       td-install format <efi-kernel> <selector-initramfs> <volume-options-and-operands>\n       td-install layout <destination> [<efi-kernel> <selector-initramfs>]\n       \
+    "usage: td-install inventory\n       td-install destinations\n       td-install timezones\n       td-install layout-preview <logical-sector-bytes> <capacity-bytes>\n       td-install format <efi-kernel> <selector-initramfs> <volume-options-and-operands>\n       td-install layout <destination> [<efi-kernel> <selector-initramfs>]\n       \
                      td-install volume [--uuid <uuid>] [--timezone <IANA-id>] [--hostname <name>] [--username <name> <verified-root> <td-firstboot>] <destination> <mkfs.btrfs> <scratch-dir> \
                      [<td-boot> <deployment> <trusted-key> | --trusted-key <trusted-key>]";
 
 #[derive(Debug, Eq, PartialEq)]
 enum Mode {
     Inventory,
+    Destinations,
     Timezones,
     LayoutPreview {
         sector_bytes: u64,
@@ -367,6 +368,7 @@ fn parse_args(mut args: impl Iterator<Item = OsString>) -> io::Result<Mode> {
     }
     match (verb.to_str(), rest) {
         (Some("inventory"), []) => Ok(Mode::Inventory),
+        (Some("destinations"), []) => Ok(Mode::Destinations),
         (Some("timezones"), []) => Ok(Mode::Timezones),
         (Some("layout-preview"), [sector, capacity]) => Ok(Mode::LayoutPreview {
             sector_bytes: preview_number(sector.as_os_str(), "logical sector bytes")?,
@@ -786,12 +788,12 @@ mod paths {
         Ok(bytes)
     }
 
-    pub fn open_format_destination(path: &Path) -> io::Result<File> {
+    pub fn open_destination_claim(path: &Path, writable: bool) -> io::Result<File> {
         use std::os::unix::fs::OpenOptionsExt;
         if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
-                format!("{}: formatting requires x86-64 Linux", path.display()),
+                format!("{}: destination claims require x86-64 Linux", path.display()),
             ));
         }
         // Linux claims block devices through O_EXCL, including their partitions.
@@ -799,7 +801,7 @@ mod paths {
         const O_EXCL: i32 = 0x80;
         OpenOptions::new()
             .read(true)
-            .write(true)
+            .write(writable)
             .custom_flags(O_EXCL)
             .open(path)
             .at(path)
@@ -989,7 +991,7 @@ struct FormatDestination {
 impl FormatDestination {
     fn open(path: &Path) -> io::Result<Self> {
         Ok(Self {
-            file: paths::open_format_destination(path)?,
+            file: paths::open_destination_claim(path, true)?,
             label: path.to_owned(),
         })
     }
@@ -2117,6 +2119,11 @@ fn main() -> ExitCode {
             let mut output = io::BufWriter::new(stdout.lock());
             timezones::run(Path::new(TIMEZONE_ROOT), &mut output)
                 .and_then(|()| output.flush())
+        },
+        Mode::Destinations => {
+            let stdout = io::stdout();
+            let mut output = io::BufWriter::new(stdout.lock());
+            inventory::destinations(&mut output).and_then(|()| output.flush())
         },
         Mode::Inventory => {
             let stdout = io::stdout();

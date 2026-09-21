@@ -1,4 +1,4 @@
-//! Read-only block metadata; no target eligibility or write authority.
+//! Read-only inventory and advisory candidates; neither grants write authority.
 
 use crate::{invalid, paths};
 use std::collections::{BTreeMap, BTreeSet};
@@ -328,14 +328,100 @@ fn observe_twice(
     Ok(devices)
 }
 
+fn supported_disk_name(name: &str) -> bool {
+    if let Some(suffix) = name.strip_prefix("vd").or_else(|| name.strip_prefix("sd")) {
+        return !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_lowercase());
+    }
+    let Some((controller, namespace)) = name.strip_prefix("nvme").and_then(|s| s.split_once('n'))
+    else {
+        return false;
+    };
+    [controller, namespace]
+        .iter()
+        .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
+}
+
+fn candidate(device: &Device, devices: &[Device]) -> bool {
+    let Some(disk) = &device.disk else {
+        return false;
+    };
+    supported_disk_name(&device.name)
+        && !device.read_only
+        && matches!(disk.logical_sector_bytes, 512 | 4096)
+        && crate::plan(disk.logical_sector_bytes, device.bytes).is_ok()
+        && devices
+            .iter()
+            .filter(|peer| {
+                peer.name == device.name || peer.parent.as_deref() == Some(device.name.as_str())
+            })
+            .all(|peer| peer.holders.is_empty() && peer.slaves.is_empty())
+}
+
+fn probe(device: &Device) -> io::Result<bool> {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    let path = Path::new("/dev").join(&device.name);
+    let mut file = match paths::open_destination_claim(&path, false) {
+        Ok(file) => file,
+        // The path wrapper retains ErrorKind but deliberately drops raw errno.
+        Err(error) if error.kind() == io::ErrorKind::ResourceBusy => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    let metadata = file.metadata()?;
+    let (major, minor) = crate::device_numbers(metadata.rdev());
+    if !metadata.file_type().is_block_device() || device.number != format!("{major}:{minor}") {
+        return Err(invalid(format!(
+            "{}: opened device differs from inventory",
+            path.display()
+        )));
+    }
+    if crate::destination_bytes(&mut file)? != device.bytes {
+        return Err(invalid(format!(
+            "{}: opened capacity differs from inventory",
+            path.display()
+        )));
+    }
+    // The complete sysfs observations bracket this temporary claim. It is
+    // released here and cannot authorize later use of the name or device number.
+    Ok(true)
+}
+
+fn discover(
+    mut observation: impl FnMut() -> io::Result<Vec<Device>>,
+    mut available: impl FnMut(&Device) -> io::Result<bool>,
+    output: &mut impl Write,
+) -> io::Result<()> {
+    let devices = observation()?;
+    let mut candidates = Vec::new();
+    for device in &devices {
+        if candidate(device, &devices) && available(device)? {
+            candidates.push(device);
+        }
+    }
+    if devices != observation()? {
+        return Err(invalid(
+            "block inventory changed during candidate discovery; retry discovery".into(),
+        ));
+    }
+    write_devices(&candidates, "candidate-only", output)
+}
+
+pub fn destinations(output: &mut impl Write) -> io::Result<()> {
+    discover(|| collect(Path::new("/sys/class/block")), probe, output)
+}
+
 pub fn run(root: &Path, output: &mut impl Write) -> io::Result<()> {
     let devices = observe_twice(|| collect(root))?;
-    // No output until both complete observations agree. This is not an atomic
-    // snapshot and cannot authorize any later operation on a device path.
-    write!(
+    write_devices(
+        &devices.iter().collect::<Vec<_>>(),
+        "inventory-only",
         output,
-        "{{\"version\":1,\"scope\":\"inventory-only\",\"devices\":["
-    )?;
+    )
+}
+
+fn write_devices(devices: &[&Device], scope: &str, output: &mut impl Write) -> io::Result<()> {
+    write!(output, "{{\"version\":1,\"scope\":")?;
+    quoted(output, scope)?;
+    write!(output, ",\"devices\":[")?;
     for (index, device) in devices.iter().enumerate() {
         if index != 0 {
             write!(output, ",")?;
@@ -440,6 +526,111 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.base);
         }
+    }
+
+    #[test]
+    fn candidates_filter_topology_geometry_and_busy_disks() {
+        let fixture = Fixture::new();
+        let vda = fixture.disk("vda", "252:0", 512);
+        fixture.partition(&vda, "vda1", "252:1");
+        fixture.disk("nvme0n1", "259:0", 4096);
+        fixture.disk("sda", "8:0", 512);
+        for (name, dev, sector, key, value) in [
+            ("sdb", "8:16", 512, "ro", "1"),
+            ("sdc", "8:32", 512, "size", "100"),
+            ("sdd", "8:48", 1024, "ro", "0"),
+            ("loop0", "7:0", 512, "ro", "0"),
+            ("nvme0c1n1", "259:1", 512, "ro", "0"),
+            ("sr0", "11:0", 512, "ro", "0"),
+        ] {
+            let disk = fixture.disk(name, dev, sector);
+            fs::write(disk.join(key), value).unwrap();
+        }
+        let mut probed = Vec::new();
+        let mut output = Vec::new();
+        discover(
+            || collect(&fixture.class),
+            |device| {
+                probed.push(device.name.clone());
+                Ok(device.name != "sda")
+            },
+            &mut output,
+        )
+        .unwrap();
+        assert_eq!(probed, ["nvme0n1", "sda", "vda"]);
+        let json = String::from_utf8(output).unwrap();
+        assert!(json.contains("\"scope\":\"candidate-only\""));
+        assert!(json.contains("\"name\":\"vda\""));
+        assert!(json.contains("\"name\":\"nvme0n1\""));
+        assert!(!json.contains("\"name\":\"sda\""));
+        assert!(!json.contains("\"name\":\"vda1\""));
+
+        // A holder of any partition excludes its whole disk even if the
+        // disk itself has no holder edge and the claimed device is unmapped.
+        let partition = vda.join("vda1");
+        let mapped = fixture.disk("dm-0", "253:0", 512);
+        symlink(&mapped, partition.join("holders/dm-0")).unwrap();
+        symlink(&partition, mapped.join("slaves/vda1")).unwrap();
+        let devices = collect(&fixture.class).unwrap();
+        assert!(!candidate(
+            devices.iter().find(|d| d.name == "vda").unwrap(),
+            &devices
+        ));
+        assert!(!candidate(
+            devices.iter().find(|d| d.name == "dm-0").unwrap(),
+            &devices
+        ));
+    }
+
+    #[test]
+    fn whole_disk_holder_and_slave_edges_exclude_supported_names() {
+        let fixture = Fixture::new();
+        let first = fixture.disk("vda", "252:0", 512);
+        let second = fixture.disk("sda", "8:0", 512);
+        let devices = collect(&fixture.class).unwrap();
+        assert!(devices.iter().all(|device| candidate(device, &devices)));
+        symlink(&second, first.join("holders/sda")).unwrap();
+        symlink(&first, second.join("slaves/vda")).unwrap();
+        let devices = collect(&fixture.class).unwrap();
+        assert!(devices.iter().all(|device| !candidate(device, &devices)));
+    }
+
+    #[test]
+    fn candidate_errors_and_changes_publish_nothing() {
+        let fixture = Fixture::new();
+        let disk = fixture.disk("vda", "252:0", 512);
+        let mut output = Vec::new();
+        let error = discover(
+            || collect(&fixture.class),
+            |_| {
+                Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "probe refused",
+                ))
+            },
+            &mut output,
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert!(output.is_empty());
+        let error = discover(
+            || collect(&fixture.class),
+            |_| {
+                fs::write(disk.join("diskseq"), "8").unwrap();
+                Ok(true)
+            },
+            &mut output,
+        )
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("changed during candidate discovery"));
+        assert!(output.is_empty());
+        discover(|| collect(&fixture.class), |_| Ok(false), &mut output).unwrap();
+        assert_eq!(
+            String::from_utf8(output).unwrap(),
+            "{\"version\":1,\"scope\":\"candidate-only\",\"devices\":[]}\n"
+        );
     }
 
     #[test]

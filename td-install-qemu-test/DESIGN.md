@@ -422,3 +422,28 @@ pass with this kernel. This is direct PCI namespace coverage in QEMU,
 not a physical NVMe, hotplug,
 multipath, RAID or full-system NVMe compatibility claim. The twelve-boot
 full-system matrix continues to use virtio and AHCI destinations.
+
+## Advisory destination reports
+
+Before source validation, the fixture captures `td-install destinations`
+through the existing bounded inventory diagnostic path. The host requires
+one version-1 candidate-only document containing exactly its writable,
+sufficiently large target with every field equal to the before inventory.
+Read-only and undersized targets require an empty list; the fixture still
+invokes formatting so its existing refusal and whole-disk preservation
+proofs remain independent. The host derives the capacity threshold from
+the shared fixed ESP/alignment/minimum-volume constants and GPT tail at
+each supported sector size, independently of its usual 6 GiB fixture size.
+
+After formatting, the same query runs while the fixture holds its exclusive
+whole-disk claim and again while its system partition is mounted. Each
+report must contain no candidates. Both reports are required before
+successful partition refresh and forbidden on the existing early refusal
+legs. The source medium must never appear in any candidate report.
+Framing, byte/depth bounds and successful child-exit requirements are shared
+with inventory. Changed identity, an extra device, missing/duplicate
+reports or the wrong scope refuses the host oracle. The new assertions run
+inside existing live boots across the small and full-system matrices.
+They exercise read-only claim admission on private disks and mounted
+partitions; they do not activate production destructive admission or
+prove physical-device, swap, hotplug or arbitrary raw-I/O exclusion.

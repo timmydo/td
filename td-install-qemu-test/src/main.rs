@@ -362,6 +362,10 @@ fn diagnostic(marker: &str, args: &[&str], limit: usize, label: &str) -> Result<
     )
 }
 
+fn candidates(marker: &str) -> Result<(), String> {
+    diagnostic(marker, &["destinations"], MAX_INVENTORY_BYTES, "destination candidates")
+}
+
 fn inventory(marker: &str) -> Result<(), String> {
     diagnostic(marker, &["inventory"], MAX_INVENTORY_BYTES, "inventory")
 }
@@ -400,6 +404,7 @@ fn install(device: &str, interrupt: bool, system_autotest: bool) -> Result<(), S
     // Only install-system carries the disposable SSH administrator test key.
     mount_source(device)?;
     inventory(INVENTORY_BEFORE_MARKER)?;
+    candidates(CANDIDATES_BEFORE_MARKER)?;
     let uuid = configured_uuid()?;
     let name = device
         .strip_prefix("/dev/")
@@ -661,6 +666,7 @@ fn refresh_partitions(device: &str, uuid: &str) -> Result<String, String> {
     reject_held_disk_users(device, &partition)?;
     command("/bin/td-boot", &["mount-root", &partition, "/volume"])?;
     reject_busy_formatters(device, "mounted partition")?;
+    candidates(CANDIDATES_MOUNTED_MARKER)?;
     let refused = Command::new("/bin/td-init")
         .args(["reread-partitions", device])
         .output()
@@ -697,7 +703,7 @@ fn reject_held_disk_users(device: &str, partition: &str) -> Result<(), String> {
     if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
         return Err("whole-disk claim fixture requires x86-64 Linux".into());
     }
-    // Match td-install/src/main.rs::paths::open_format_destination.
+    // Match td-install/src/main.rs::paths::open_destination_claim.
     const O_EXCL: i32 = 0x80;
     let claim = fs::OpenOptions::new()
         .read(true)
@@ -714,6 +720,7 @@ fn reject_held_disk_users(device: &str, partition: &str) -> Result<(), String> {
         return Err("claimed fixture destination is not a block device".into());
     }
     reject_busy_formatters(device, "held whole disk")?;
+    candidates(CANDIDATES_HELD_MARKER)?;
     let refused = Command::new("/bin/td-boot")
         .args(["mount-root", partition, "/volume"])
         .output()

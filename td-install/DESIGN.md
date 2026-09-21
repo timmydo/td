@@ -551,6 +551,16 @@ and unchanged first 64 KiB after each attempt before continuing with
 partition refresh and normal publication. This bounds the preservation
 check to the protective MBR and primary GPT metadata, not the entire disk.
 
+### Advisory destination probes
+
+`td-install destinations` uses the same x86-64 Linux claim wrapper with
+write access disabled. INSTALLER.md's advisory destination discovery
+contract owns the bounded metadata filter, temporary claims, output schema
+and limitations. Only ResourceBusy (Linux EBUSY, retained as ErrorKind by
+the path wrapper) excludes a probed disk; other failures refuse discovery.
+No device bytes are written. This does not replace the formatter's
+read-write claim or establish the installation service's retained authority.
+
 ### Prepared volume image admission
 
 The volume formatter retains its exclusively created scratch-image inode
