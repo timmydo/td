@@ -76,6 +76,13 @@ automatically retries a destructive operation after reconnect or restart.
 Completion requires durable filesystem and deployment publication, verified
 boot artifacts, and settings publication. A queued request is not success.
 
+The raw `td-install format` command coordinates preparation and both
+filesystem writes through one held destination. Its exact interface and
+limits are in DESIGN.md's coordinated raw formatting contract. The QEMU
+fixture uses it after read-only source validation. Scratch preparation
+must succeed before the first GPT write. This command does not activate
+the service or provide the review/consent sequence.
+
 ## Media, boot and persistence
 
 [MEDIA.md](MEDIA.md) specifies the hybrid format and its current formatter

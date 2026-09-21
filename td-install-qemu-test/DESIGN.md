@@ -29,56 +29,56 @@ The live initramfs holds source-built tools and the public trust root. The
 tiny signed deployment and fixed selector are streamed into separate ISO
 files. Boot files and tools read into the fixture initramfs are bounded at
 256 MiB. The shared composer accepts larger ISO payloads under MEDIA.md,
-while the full-system diagnostic supplies the built system deployment.
-The private key remains on the host outside derivations. The fixture calls the
-actual td-install layout and volume primitives, including td-boot's verified
+while the full-system diagnostic supplies the built system deployment. The
+private key remains on the host outside derivations. The fixture calls the
+actual td-install format coordinator, followed by td-boot's verified mounted
 publication. Its success marker follows formatting, partition refresh,
 mounted publication and sync.
 
 Before any layout write, the guest polls for thirty seconds among exactly
 three fixed candidate paths: /dev/sr0 (SATA optical) and /dev/sda or
-/dev/sdb (USB), excluding the selected installation target. QEMU
-adds an empty default CD-ROM in both attachments: /dev/sr1 during optical
-boots (outside this candidate list) and /dev/sr0 during USB boots. A read-only
+/dev/sdb (USB), excluding the selected installation target. QEMU adds an
+empty default CD-ROM in both attachments: /dev/sr1 during optical boots
+(outside this candidate list) and /dev/sr0 during USB boots. A read-only
 block-device open must succeed; Linux ENOMEDIUM (123) skips an empty drive
 even when the driver publishes a placeholder capacity. ENXIO (6) also
-retries within the same deadline: USB can publish its node before the
-block driver accepts opens. A permanently absent/unready source still
-times out, and no install step runs before successful read-only access.
-Other open errors refuse. Zero-capacity
-devices are ignored. Malformed or unreadable capacities refuse. The host's
-VM deadline also bounds time spent in kernel operations during discovery.
-Absent, ambiguous or non-block candidates refuse. This convention applies
-only to this disposable QEMU profile, not production media discovery. Linux
-mounts ISO9660 read-only, nodev, nosuid and noexec. Individual read-only file
-binds adapt ISO filename case to td-boot's canonical payload names without
-copying the source into RAM or introducing symlinks. Every file must refuse
-a write-open with ReadOnlyFilesystem before the media-access marker prints
-the selected device. The host requires that device to match its attachment.
-The write-open check proves payloads are unwritable, not each individual
-bind-mount flag; all mount commands must independently succeed.
-The fixed selector is bound outside /source, which holds only the signed
-deployment bundle. Discovery checks only currently visible candidates;
-it does not establish exclusive admission against later hotplug.
-Missing payloads refuse before layout; no initramfs copy is available as a
-fallback. The formatter stages only a trust layout and sparse Btrfs metadata
-image in RAM; the deployment is published directly onto the mounted disk.
+retries within the same deadline: USB can publish its node before the block
+driver accepts opens. A permanently absent/unready source still times out,
+and no install step runs before successful read-only access. Other open
+errors refuse. Zero-capacity devices are ignored. Malformed or unreadable
+capacities refuse. The host's VM deadline also bounds time spent in kernel
+operations during discovery. Absent, ambiguous or non-block candidates
+refuse. This convention applies only to this disposable QEMU profile, not
+production media discovery. Linux mounts ISO9660 read-only, nodev, nosuid
+and noexec. Individual read-only file binds adapt ISO filename case to
+td-boot's canonical payload names without copying the source into RAM or
+introducing symlinks. Every file must refuse a write-open with
+ReadOnlyFilesystem before the media-access marker prints the selected
+device. The host requires that device to match its attachment. The
+write-open check proves payloads are unwritable, not each individual
+bind-mount flag; all mount commands must independently succeed. The fixed
+selector is bound outside /source, which holds only the signed deployment
+bundle. Discovery checks only currently visible candidates; it does not
+establish exclusive admission against later hotplug. Missing payloads refuse
+before layout; no initramfs copy is available as a fallback. The formatter
+stages only a trust layout and sparse Btrfs metadata image in RAM; the
+deployment is published directly onto the mounted disk.
 
 The host chooses the UUID from the run's throwaway provisioning public key
 before assembling the ISO. Its canonical text is placed in the live and
 selector initramfs at `/etc/td/volume-uuid`. The live fixture supplies that
-value through `td-install volume --uuid`; formatting cannot silently choose
-a different identity. Optical and USB destinations deliberately share that
-run's UUID but are never attached together.
+value through `td-install format` and its `--uuid` option; formatting cannot
+silently choose a different identity. Optical and USB destinations
+deliberately share that run's UUID but are never attached together.
 
 Target discovery waits up to thirty seconds for its fixed serial. Virtio
 uses the root serial attribute; AHCI disks use the SCSI device serial.
-Missing serial attributes and the pinned kernel's absent-VPD ENXIO are
-not matches. The selected node must also accept a read-only open; ENXIO
-retries target discovery within the same deadline. That probe descriptor
-closes before installation. Oversized serials and other errors refuse. Partition names
-and unsupported buses are excluded. This remains a private test topology,
-not discovery or admission for an operator's physical disk.
+Missing serial attributes and the pinned kernel's absent-VPD ENXIO are not
+matches. The selected node must also accept a read-only open; ENXIO retries
+target discovery within the same deadline. That probe descriptor closes
+before installation. Oversized serials and other errors refuse. Partition
+names and unsupported buses are excluded. This remains a private test
+topology, not discovery or admission for an operator's physical disk.
 
 Before invoking layout, the live fixture calls `td-boot validate-source` on
 the read-only source and the provisioned public key. Missing or invalid
@@ -91,24 +91,25 @@ the result is not a retained snapshot. Volume publication still repeats
 authentication and verifies copied payload hashes. Space, firmware-selector
 and target admission remain requirements for the production installer service.
 
-After both formatting commands, the guest asks td-init to reread the target's
-partition table. It resolves the configured UUID through the production
-reader and requires the expected target partition. Before mounting, the
-fixture holds the private whole disk open with the same x86-64 Linux O_EXCL
-claim as the formatter; other targets refuse this probe. Both raw formatter
-commands must refuse their destination open with exit status 1, EBUSY,
-no stdout and unchanged first 64 KiB. A td-boot mount-root of the system
-partition must also fail with exit status 1, EBUSY from its mount applet
-and no stdout. Disk-header comparison applies to raw formatter attempts;
-it cannot detect writes within the system partition during a mount. The
-fixture closes the whole-disk claim and requires that same partition mount
-to succeed before continuing. This proves the competing-operation barrier
-and release behavior in the disposable topology; it does not implement an
-atomic claim transfer, hotplug admission or exclusion of arbitrary raw I/O
-by another privileged process. The future coordinator's transition from
-raw formatting to mounted publication still needs its own protocol.
+After the combined formatting command, the guest asks td-init to reread the
+target's partition table. It resolves the configured UUID through the
+production reader and requires the expected target partition. Before
+mounting, the fixture holds the private whole disk open with the same x86-64
+Linux O_EXCL claim as the formatter; other targets refuse this probe. All
+three raw formatter commands (layout, volume and format) must refuse their
+destination open with exit status 1, EBUSY, no stdout and unchanged first 64
+KiB. A td-boot mount-root of the system partition must also fail with exit
+status 1, EBUSY from its mount applet and no stdout. Disk-header comparison
+applies to raw formatter attempts; it cannot detect writes within the system
+partition during a mount. The fixture closes the whole-disk claim and
+requires that same partition mount to succeed before continuing. This proves
+the competing-operation barrier and release behavior in the disposable
+topology; it does not implement an atomic claim transfer, hotplug admission
+or exclusion of arbitrary raw I/O by another privileged process. The future
+coordinator's transition from raw formatting to mounted publication still
+needs its own protocol.
 
-Once the partition is mounted through td-boot, both raw formatter commands
+Once the partition is mounted through td-boot, all three raw formatter commands
 must fail their destination open with exit status 1, EBUSY and no stdout. An
 assertion failure terminates the installation sequence and leaves PID 1
 parked for host collection and VM teardown, as with other fixture failures;
@@ -130,7 +131,7 @@ diagnostics and numeric OS error suffix. A diagnostic-format or path-binding
 change must update the fixture rather than accepting any nonzero exit as
 evidence of a busy device.
 
-The live guest supplies `--trusted-key` to `td-install volume` instead of
+The live guest supplies `--trusted-key` to `td-install format` instead of
 the three publishing operands. The formatter initializes the publication
 directories and key without a deployment or selector. The fixture requires
 empty staged boot, deployment and incoming directories, plus only the
@@ -373,7 +374,7 @@ legs of the 56-boot matrix and all four full-system ISO installations without
 adding boots or changing target admission.
 
 The live fixture also runs `td-install layout-preview` after successful
-layout and before volume formatting. It reads the target's bounded sysfs
+combined layout and volume formatting. It reads the target's bounded sysfs
 size in Linux 512-byte units, checks conversion to bytes and supplies that
 capacity and the observed logical sector size. This placement preserves
 the negative cases' direct exercise of the real layout writer: a preview

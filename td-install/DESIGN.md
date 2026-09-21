@@ -498,7 +498,7 @@ hotplug or a privileged namespace writer.
 
 ### Block destination formatting guard
 
-Both raw formatting commands open their destination read-write with Linux
+All raw formatting commands open their destination read-write with Linux
 `O_EXCL` (0x80) through safe `OpenOptionsExt`. The formatting wrapper
 refuses platforms other than x86-64 Linux before opening; another target
 architecture needs its flag mapping reviewed. On a block device, the held
@@ -524,16 +524,17 @@ but other source paths and contents must remain stable under the caller's
 control. This preparation does not establish payload fit, scratch capacity,
 disk eligibility, a reviewed installation plan or consent.
 
-The existing pathname CLI commands each construct and release their own
-object. A service holding a separate block claim still cannot invoke them:
-the distinct holder would conflict. There is no descriptor-number CLI,
-claim transfer through /proc, or cross-process descriptor protocol. The
-future service must own its formatting object in the process performing
-writes. Partition refresh and mounted deployment publication still need an
-explicit claim handoff design and kernel validation before service
-activation; borrowing a File across raw writes does not settle that phase.
-In particular, callers must not assume the current separate pathname-based
-refresh and mount commands can run while this exclusive claim is held.
+The pathname CLI commands each construct and release their own object;
+format retains one through both raw writes. A service holding a separate
+block claim still cannot invoke them: the distinct holder would conflict.
+There is no descriptor-number CLI, claim transfer through /proc, or
+cross-process descriptor protocol. The future service must own its
+formatting object in the process performing writes. Partition refresh and
+mounted deployment publication still need an explicit claim handoff design
+and kernel validation before service activation; borrowing a File across raw
+writes does not settle that phase. In particular, callers must not assume
+the current separate pathname-based refresh and mount commands can run while
+this exclusive claim is held.
 
 A regular-file regression replaces the destination name after opening,
 then formats both layout and volume through the retained object. It checks
@@ -544,7 +545,7 @@ cluster padding from the retained inode. This proves pathname independence,
 not block
 exclusivity against raw I/O or hostile hotplug.
 
-The QEMU fixture attempts both raw commands while the just-formatted
+The QEMU fixture attempts all three raw commands while the just-formatted
 partition is mounted and requires the destination-open EBUSY diagnostic
 and unchanged first 64 KiB after each attempt before continuing with
 partition refresh and normal publication. This bounds the preservation
@@ -585,15 +586,58 @@ sync barriers then use those same descriptors. A removed or replaced
 scratch pathname cannot redirect the copy. The scratch artifact remains
 caller-owned after completion.
 
-The existing volume CLI uses these same preparation and write steps with
-the length read from its current GPT. The internal split adds no command,
-service activation, immutable installation plan or capacity admission.
-An eventual coordinator must validate boot inputs, settings, scratch and
-disk eligibility before beginning layout. The image alone binds a length,
-not an offset, disk identity or destructive consent; its destination check
-reads the current table and does not authenticate it against a reviewed
-plan. Source bytes and destination topology must remain stable while
-copying, and a later refusal cannot undo layout already performed.
+The existing volume CLI uses these same preparation and write steps with the
+length read from its current GPT. The internal split itself supplies no
+service activation, immutable installation plan or capacity admission. The
+combined formatter below uses it before layout; a service must additionally
+admit disk eligibility. The image alone binds a length, not an offset, disk
+identity or destructive consent; its destination check reads the current
+table and does not authenticate it against a reviewed plan. Source bytes and
+destination topology must remain stable while copying, and a later refusal
+cannot undo layout already performed.
+
+### Coordinated raw formatting
+
+`td-install format EFI-KERNEL SELECTOR-INITRAMFS VOLUME-ARGUMENTS` accepts
+the same ordered options and operands as `volume`, after the two required
+boot files. Option-like boot names refuse with an ordering diagnostic; a
+relative filename starting with a dash must use a ./ prefix. It prepares
+settings, trust and account validation, opens the destination once, and
+builds the GPT/FAT metadata and holds both EFI inputs before staging the
+Btrfs image. The image length comes from the new layout, so no existing GPT
+is required. All scratch writes, optional staged deployment publication,
+mkfs output admission and scratch-image sync finish before the first
+destination write. Insufficient staging space or a failed mkfs therefore
+refuses before erasing the destination; this performs the real staging work
+rather than promising space from a free-byte estimate.
+
+`PreparedLayout` owns the generated metadata, placements and opened EFI
+files. Its consuming writer rechecks destination geometry and the held EFI
+file lengths before invalidating the old GPT. The combined coordinator
+also checks the held Btrfs image before starting layout, and the volume
+writer retains its independent GPT-extent and source checks before copying.
+The same `FormatDestination` stays open throughout preparation and both
+raw writes. The label and input pathnames are never reopened for writing
+or copying. The individual layout and volume commands retain their narrow
+interfaces and share these implementations.
+
+The combined command reports only the volume writer's three byte counts
+(offset, length, copied bytes), after both phases and their sync barriers
+succeed. It does not report an intermediate layout success. Existing
+write ordering is unchanged: GPT publication precedes volume copying, so
+this is not an atomic whole-disk transaction or rollback guarantee. A
+write, read, sync or final report failure after erasure can leave a changed
+disk. Scratch artifacts remain owned by the caller.
+
+This is a raw formatter, not the installation service. Callers still bind
+trusted source-built programs, verified deployment bytes, stable input
+contents and topology, and scratch outside the destination. Same-sized
+concurrent source mutation remains outside the contract. Boot-file
+admission checks type, bounds and FAT fit, not signatures or PE validity.
+No disk eligibility, media exclusion, reviewed identity, trusted consent,
+mount claim handoff or complete-installation success is supplied. The
+trust-only form still publishes the deployment later on the mounted disk;
+its later capacity or publication failures cannot preserve old contents.
 
 ### Refreshing partitions after formatting
 
@@ -615,7 +659,7 @@ Its read-only descriptor stays held across the request; namespace and device
 stability remain caller obligations. The kernel may block during the scan,
 so the caller owns the operation's outer deadline.
 
-Both formatter commands sync their destination before returning success;
+All three formatter commands sync their destination before returning success;
 the diagnostic relies on those explicit barriers before requesting a reread.
 The QEMU diagnostic invokes it after layout and volume formatting, resolves
 the preselected UUID on the expected new partition, mounts that Btrfs volume,
@@ -1370,7 +1414,7 @@ below remain required.
 
 `td-recipe-eval qemu-install` adds a native guest installation fixture,
 [td-install-qemu-test](../td-install-qemu-test/DESIGN.md). Its source-built
-PID 1 runs td-install layout and signed volume publication on an exclusively
+PID 1 runs td-install format and signed mounted publication on an exclusively
 created QEMU virtio or AHCI target. The same private ISO is exercised as optical and
 USB media. After installation, the host detaches media and cold-boots only
 the destination, requiring authenticated selector kexec, a read from the

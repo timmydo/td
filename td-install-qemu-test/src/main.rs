@@ -437,19 +437,15 @@ fn install(device: &str, interrupt: bool, system_autotest: bool) -> Result<(), S
             "/dev/loop0", "/root-image"])?;
         command("/bin/td-firstboot", &["check-primary-name", "/root-image", USERNAME])?;
     }
-    command(
-        "/bin/td-install",
-        &["layout", device, "/source/bzImage", "/selector.cpio"],
-    )?;
-    // Keep negative cases testing the real writer's refusal before this report.
-    preview(name, geometry)?;
-    let mut volume_arguments = vec!["volume", "--uuid", &uuid,
+    let mut format_arguments = vec!["format", "/source/bzImage", "/selector.cpio", "--uuid", &uuid,
         "--timezone", TIMEZONE_ID, "--hostname", HOSTNAME];
     if system_autotest {
-        volume_arguments.extend(["--username", USERNAME, "/root-image", "/bin/td-firstboot"]);
+        format_arguments.extend(["--username", USERNAME, "/root-image", "/bin/td-firstboot"]);
     }
-    volume_arguments.extend([device, "/bin/mkfs.btrfs", "/scratch", "--trusted-key", "/trusted.pub"]);
-    command("/bin/td-install", &volume_arguments)?;
+    format_arguments.extend([device, "/bin/mkfs.btrfs", "/scratch", "--trusted-key", "/trusted.pub"]);
+    command("/bin/td-install", &format_arguments)?;
+    // The real writer must refuse bad targets before the diagnostic preview.
+    preview(name, geometry)?;
     if system_autotest {
         check_username(Path::new("/scratch/td-volume-root/@var"))?;
         // The read-only loop binding lasts until this one-purpose VM ends.
@@ -743,6 +739,7 @@ fn reject_busy_formatters(device: &str, state: &str) -> Result<(), String> {
     let commands: &[&[&str]] = &[
         &["layout", device],
         &["volume", device, "/bin/mkfs.btrfs", "/scratch"],
+        &["format", "/source/bzImage", "/selector.cpio", device, "/bin/mkfs.btrfs", "/scratch"],
     ];
     for arguments in commands {
         let refused = Command::new("/bin/td-install")

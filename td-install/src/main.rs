@@ -63,7 +63,7 @@ fn invalid(message: String) -> io::Error {
 }
 
 const USAGE: &str =
-    "usage: td-install inventory\n       td-install timezones\n       td-install layout-preview <logical-sector-bytes> <capacity-bytes>\n       td-install layout <destination> [<efi-kernel> <selector-initramfs>]\n       \
+    "usage: td-install inventory\n       td-install timezones\n       td-install layout-preview <logical-sector-bytes> <capacity-bytes>\n       td-install format <efi-kernel> <selector-initramfs> <volume-options-and-operands>\n       td-install layout <destination> [<efi-kernel> <selector-initramfs>]\n       \
                      td-install volume [--uuid <uuid>] [--timezone <IANA-id>] [--hostname <name>] [--username <name> <verified-root> <td-firstboot>] <destination> <mkfs.btrfs> <scratch-dir> \
                      [<td-boot> <deployment> <trusted-key> | --trusted-key <trusted-key>]";
 
@@ -89,6 +89,8 @@ enum Mode {
     /// then copies the tree into the image, so a scratch sized from the volume
     /// alone runs out inside mkfs rather than here.
     Volume {
+        /// Present for the combined format command; volume alone keeps GPT.
+        boot: Option<BootFiles>,
         uuid: Option<VolumeUuid>,
         timezone: Option<String>,
         hostname: Option<hostname::Hostname>,
@@ -265,6 +267,19 @@ impl VolumeSeed {
 
 fn parse_args(mut args: impl Iterator<Item = OsString>) -> io::Result<Mode> {
     let verb = args.next().ok_or_else(|| invalid(USAGE.to_string()))?;
+    let (verb, boot) = if verb == "format" {
+        let kernel = args.next().ok_or_else(|| invalid(USAGE.into()))?;
+        let initramfs = args.next().ok_or_else(|| invalid(USAGE.into()))?;
+        if [&kernel, &initramfs].iter().any(|path| path.as_encoded_bytes().starts_with(b"-")) {
+            return Err(invalid("format requires EFI kernel and selector paths before volume options; prefix relative paths beginning with '-' with './'".into()));
+        }
+        (
+            OsString::from("volume"),
+            Some(BootFiles { kernel: kernel.into(), initramfs: initramfs.into() }),
+        )
+    } else {
+        (verb, None)
+    };
     let rest: Vec<PathBuf> = args.map(PathBuf::from).collect();
     let (uuid, rest) = if rest.first().is_some_and(|arg| arg.as_os_str() == "--uuid") {
         if verb != "volume" {
@@ -334,7 +349,7 @@ fn parse_args(mut args: impl Iterator<Item = OsString>) -> io::Result<Mode> {
     }
     if rest.iter().any(|arg| arg.as_os_str() == "--uuid") {
         return Err(invalid(if verb == "volume" {
-            "--uuid must appear once, immediately after volume".into()
+            "--uuid must appear once, before other volume options and operands".into()
         } else {
             "--uuid is only supported by volume".into()
         }));
@@ -370,6 +385,7 @@ fn parse_args(mut args: impl Iterator<Item = OsString>) -> io::Result<Mode> {
         }),
         (Some("volume"), [destination, mkfs, scratch, flag, trusted_key])
             if flag.as_os_str() == "--trusted-key" => Ok(Mode::Volume {
+                boot,
                 uuid,
                 timezone,
                 hostname,
@@ -381,6 +397,7 @@ fn parse_args(mut args: impl Iterator<Item = OsString>) -> io::Result<Mode> {
             }),
         (Some("volume"), [destination, mkfs, scratch, td_boot, deployment, trusted_key]) => {
             Ok(Mode::Volume {
+                boot,
                 uuid,
                 timezone,
                 hostname,
@@ -396,6 +413,7 @@ fn parse_args(mut args: impl Iterator<Item = OsString>) -> io::Result<Mode> {
             })
         }
         (Some("volume"), [destination, mkfs, scratch]) => Ok(Mode::Volume {
+            boot,
             uuid,
             timezone,
             hostname,
@@ -524,6 +542,11 @@ impl Plan {
 
     fn esp_sectors(&self) -> Option<u64> {
         self.esp_end.checked_sub(self.esp_start)?.checked_add(1)
+    }
+
+    fn volume_bytes(&self) -> Option<u64> {
+        self.volume_end.checked_sub(self.volume_start)?.checked_add(1)?
+            .checked_mul(self.sector_size)
     }
 }
 
@@ -986,15 +1009,29 @@ fn format_layout(
     boot: Option<&BootFiles>,
     out: &mut dyn Write,
 ) -> io::Result<()> {
+    prepare_layout(destination, boot)?.write_to(destination, out)
+}
+
+struct PreparedLayout {
+    plan: Plan,
+    table: gpt::Image,
+    esp: fat::Image<'static>,
+    metadata: u64,
+    payloads: Vec<(BootInput, u64, u64, u64)>,
+}
+
+fn prepare_layout(
+    destination: &mut FormatDestination,
+    boot: Option<&BootFiles>,
+) -> io::Result<PreparedLayout> {
     let file = &mut destination.file;
-    let label = destination.label.as_path();
     let disk_bytes = destination_bytes(file)?;
     let sector_size = logical_sector_size(file)?;
     let plan = plan(sector_size, disk_bytes).map_err(invalid)?;
 
     // Pin and size both sources before any destructive write. The caller owns
     // their content and must keep it stable throughout the operation.
-    let mut inputs = match boot {
+    let inputs = match boot {
         Some(boot) => Some((
             BootInput::open(&boot.kernel, file)?,
             BootInput::open(&boot.initramfs, file)?,
@@ -1099,7 +1136,7 @@ fn format_layout(
 
     // Resolve every placement and offset before invalidating the old GPT.
     let mut payloads = Vec::new();
-    if let Some((kernel, initramfs)) = &mut inputs {
+    if let Some((kernel, initramfs)) = inputs {
         for (name, input) in [
             (kernel_path.as_str(), kernel),
             (protocol::EFI_INITRD_PATH, initramfs),
@@ -1130,61 +1167,96 @@ fn format_layout(
         return Err(invalid("unexpected EFI file placement".into()));
     }
 
-    // A REINSTALL is the case this order exists for. On a disk that already
-    // carries a table, that table stays valid while the ESP beneath it is being
-    // rewritten, so an install that dies part way leaves a table pointing at a
-    // filesystem that is half replaced — which is worse than no table, because
-    // firmware will try it. So the old table goes FIRST and the disk spends the
-    // install carrying none.
-    //
-    // Each stage is flushed before the next. Nothing else orders one write
-    // against another across a power cut: without the barriers the table can
-    // reach the platter before the filesystem it describes. The primary table
-    // is written LAST because it is the commit point — it is what firmware
-    // reads first, and it is only correct once everything it points at is
-    // durable.
-    invalidate_table(file, &table)?;
-    file.sync_all()?;
+    Ok(PreparedLayout { plan, table, esp, metadata, payloads })
+}
 
-    zero_at(file, esp_offset, metadata)?;
-    for extent in &esp.extents {
-        let at = esp_offset
-            .checked_add(extent.offset)
-            .ok_or_else(|| invalid("an ESP extent overflowed".to_string()))?;
-        write_at(file, at, &extent.bytes)?;
+impl PreparedLayout {
+    fn write_to(self, destination: &mut FormatDestination, out: &mut dyn Write) -> io::Result<()> {
+        let Self {
+            plan: prepared_plan,
+            table,
+            esp,
+            metadata,
+            payloads,
+        } = self;
+        let file = &mut destination.file;
+        let label = destination.label.as_path();
+        let disk_bytes = destination_bytes(file)?;
+        let sector_size = logical_sector_size(file)?;
+        if plan(sector_size, disk_bytes).map_err(invalid)? != prepared_plan {
+            return Err(invalid(
+                "destination geometry changed during format preparation".into(),
+            ));
+        }
+        for (input, _, _, _) in &payloads {
+            if input.file.metadata()?.len() != input.len {
+                return Err(invalid(format!(
+                    "EFI input changed size before layout: {}",
+                    input.path.display()
+                )));
+            }
+        }
+        let plan = prepared_plan;
+        let esp_offset = plan
+            .esp_offset()
+            .ok_or_else(|| invalid("the ESP offset overflowed".into()))?;
+
+        // A REINSTALL is the case this order exists for. On a disk that already
+        // carries a table, that table stays valid while the ESP beneath it is being
+        // rewritten, so an install that dies part way leaves a table pointing at a
+        // filesystem that is half replaced — which is worse than no table, because
+        // firmware will try it. So the old table goes FIRST and the disk spends the
+        // install carrying none.
+        //
+        // Each stage is flushed before the next. Nothing else orders one write
+        // against another across a power cut: without the barriers the table can
+        // reach the platter before the filesystem it describes. The primary table
+        // is written LAST because it is the commit point — it is what firmware
+        // reads first, and it is only correct once everything it points at is
+        // durable.
+        invalidate_table(file, &table)?;
+        file.sync_all()?;
+
+        zero_at(file, esp_offset, metadata)?;
+        for extent in &esp.extents {
+            let at = esp_offset
+                .checked_add(extent.offset)
+                .ok_or_else(|| invalid("an ESP extent overflowed".to_string()))?;
+            write_at(file, at, &extent.bytes)?;
+        }
+        for (mut input, offset, end, padding) in payloads {
+            file.seek(SeekFrom::Start(offset))?;
+            input.copy_to(file, label)?;
+            // A partial final cluster must not disclose bytes from a previous ESP.
+            zero_at(file, end, padding)?;
+        }
+        file.sync_all()?;
+
+        write_at(file, table.backup_offset, &table.backup)?;
+        file.sync_all()?;
+        write_at(file, table.primary_offset, &table.primary)?;
+        file.sync_all()?;
+
+        // NUMBERS ONLY, whitespace-separated, and every one a BYTE OFFSET. The
+        // destination is deliberately not echoed back: a caller already knows what
+        // it passed, and a path is the one field here that can contain a space —
+        // which shifts every field a caller reads by position — or a newline, which
+        // would break the one-line promise outright. Nothing that can carry either
+        // goes on this channel.
+        //
+        // Bytes rather than the LBAs this function works in, because `volume`
+        // reports bytes and two verbs of one program reporting the same-shaped line
+        // in different units is a caller reading 2048 where the ESP is at 1048576 —
+        // with nothing on either line to say which it got.
+        let esp = plan
+            .esp_offset()
+            .ok_or_else(|| invalid("the ESP offset overflowed".to_string()))?;
+        let volume = plan
+            .volume_start
+            .checked_mul(plan.sector_size)
+            .ok_or_else(|| invalid("the volume offset overflowed".to_string()))?;
+        writeln!(out, "{esp} {volume}")
     }
-    for (input, offset, end, padding) in payloads {
-        file.seek(SeekFrom::Start(offset))?;
-        input.copy_to(file, label)?;
-        // A partial final cluster must not disclose bytes from a previous ESP.
-        zero_at(file, end, padding)?;
-    }
-    file.sync_all()?;
-
-    write_at(file, table.backup_offset, &table.backup)?;
-    file.sync_all()?;
-    write_at(file, table.primary_offset, &table.primary)?;
-    file.sync_all()?;
-
-    // NUMBERS ONLY, whitespace-separated, and every one a BYTE OFFSET. The
-    // destination is deliberately not echoed back: a caller already knows what
-    // it passed, and a path is the one field here that can contain a space —
-    // which shifts every field a caller reads by position — or a newline, which
-    // would break the one-line promise outright. Nothing that can carry either
-    // goes on this channel.
-    //
-    // Bytes rather than the LBAs this function works in, because `volume`
-    // reports bytes and two verbs of one program reporting the same-shaped line
-    // in different units is a caller reading 2048 where the ESP is at 1048576 —
-    // with nothing on either line to say which it got.
-    let esp = plan
-        .esp_offset()
-        .ok_or_else(|| invalid("the ESP offset overflowed".to_string()))?;
-    let volume = plan
-        .volume_start
-        .checked_mul(plan.sector_size)
-        .ok_or_else(|| invalid("the volume offset overflowed".to_string()))?;
-    writeln!(out, "{esp} {volume}")
 }
 
 /// The two byte ranges a table occupies, as `(offset, len)` pairs.
@@ -1649,6 +1721,24 @@ fn run_volume(
     format_volume(prepared, &mut destination, out)
 }
 
+/// Prepare both filesystems before the first destination write.
+fn run_format(
+    prepared: PreparedVolume<'_>,
+    destination: &Path,
+    boot: &BootFiles,
+    out: &mut dyn Write,
+) -> io::Result<()> {
+    let mut destination = FormatDestination::open(destination)?;
+    let layout = prepare_layout(&mut destination, Some(boot))?;
+    let len = layout.plan.volume_bytes()
+        .ok_or_else(|| invalid("planned volume length overflowed".into()))?;
+    let image = prepare_volume_image(prepared, &destination, len)?;
+    // Guard layout too; write_to keeps its own check for standalone volume use.
+    image.check_source(&destination.file)?;
+    layout.write_to(&mut destination, &mut io::sink())?;
+    image.write_to(&mut destination, out)
+}
+
 struct PreparedVolume<'a> {
     settings: VolumeSettings<'a>,
     uuid: Option<&'a VolumeUuid>,
@@ -1911,34 +2001,41 @@ fn prepare_volume_image(
             image_path.display(), prepared.len()
         )));
     }
+    // Surface delayed scratch allocation/write errors before erasing a disk.
+    image.sync_all()?;
     drop(staged_image);
     Ok(PreparedVolumeImage { file: image, len })
 }
 
 impl PreparedVolumeImage {
-    fn write_to(
-        self,
-        destination: &mut FormatDestination,
-        out: &mut dyn Write,
-    ) -> io::Result<()> {
+    fn check_source(&self, destination: &File) -> io::Result<()> {
         use std::os::unix::fs::MetadataExt;
-        let file = &mut destination.file;
         let source = self.file.metadata()?;
-        let target = file.metadata()?;
+        let target = destination.metadata()?;
         if (source.dev(), source.ino()) == (target.dev(), target.ino()) {
             return Err(invalid("prepared Btrfs image is the destination itself".into()));
-        }
-        let (offset, len) = destination_volume(file)?;
-        if len != self.len {
-            return Err(invalid(format!(
-                "prepared Btrfs image needs {} bytes, but the destination volume has {len}",
-                self.len
-            )));
         }
         let got = source.len();
         if got != self.len {
             return Err(invalid(format!(
                 "prepared Btrfs image changed size: {got} bytes, not the required {}",
+                self.len
+            )));
+        }
+        Ok(())
+    }
+
+    fn write_to(
+        self,
+        destination: &mut FormatDestination,
+        out: &mut dyn Write,
+    ) -> io::Result<()> {
+        let file = &mut destination.file;
+        self.check_source(file)?;
+        let (offset, len) = destination_volume(file)?;
+        if len != self.len {
+            return Err(invalid(format!(
+                "prepared Btrfs image needs {} bytes, but the destination volume has {len}",
                 self.len
             )));
         }
@@ -2041,6 +2138,7 @@ fn main() -> ExitCode {
             None => run_layout(&destination, &mut io::stdout()),
         },
         Mode::Volume {
+            boot,
             uuid,
             timezone,
             hostname,
@@ -2054,8 +2152,13 @@ fn main() -> ExitCode {
             .map(|id| timezones::Selection::load(Path::new(TIMEZONE_ROOT), id))
             .transpose()
             .and_then(|timezone| {
+                let settings = VolumeSettings { timezone: timezone.as_ref(), hostname: hostname.as_ref(), username: username.as_deref() };
+                if let Some(boot) = boot {
+                    let prepared = prepare_volume(settings, uuid.as_ref(), &mkfs, &scratch, seed.as_ref())?;
+                    return run_format(prepared, &destination, &boot, &mut io::stdout());
+                }
                 run_volume(
-                    VolumeSettings { timezone: timezone.as_ref(), hostname: hostname.as_ref(), username: username.as_deref() },
+                    settings,
                     uuid.as_ref(),
                     &destination,
                     &mkfs,
@@ -2684,6 +2787,7 @@ mod tests {
         assert_eq!(
             parse_args(args(&["volume", "/dev/sda", "/bin/mkfs.btrfs", "/tmp"])).unwrap(),
             Mode::Volume {
+                boot: None,
                 uuid: None,
                 timezone: None,
                 hostname: None,
@@ -3151,6 +3255,7 @@ mod tests {
         ]))
         .unwrap();
         let Mode::Volume {
+            boot: None,
             uuid: Some(identity),
             timezone: None,
             hostname: None,
@@ -3238,6 +3343,7 @@ mod tests {
             ]))
             .unwrap(),
             Mode::Volume {
+                boot: None,
                 uuid: None,
                 timezone: None,
                 hostname: None,
@@ -3304,6 +3410,7 @@ mod tests {
             ]))
             .unwrap(),
             Mode::Volume {
+                boot: None,
                 uuid: None,
                 timezone: None,
                 hostname: None,
@@ -3377,6 +3484,7 @@ mod tests {
             ]))
             .unwrap(),
             Mode::Volume {
+                boot: None,
                 uuid: Some(VolumeUuid(uuid.into())),
                 timezone: None,
                 hostname: None,
@@ -5724,6 +5832,243 @@ mod tests {
         zero_edges(&mut file, MIB, MIB).unwrap();
         assert_eq!(dest.read_at(MIB, 4), [0; 4]);
         assert_eq!(dest.read_at(2 * MIB - 4, 4), [0; 4], "to its very end");
+    }
+
+    #[test]
+    fn format_cli_reuses_volume_options_after_the_boot_pair() {
+        for tail in [
+            vec![],
+            vec!["--trusted-key", "/key"],
+            vec!["/td-boot", "/bundle", "/key"],
+        ] {
+            let mut values = vec![
+                "format",
+                "/kernel",
+                "/initrd",
+                "--uuid",
+                "12345678-1234-4234-8234-123456789abc",
+                "--timezone",
+                "Etc/UTC",
+                "--hostname",
+                "my-td",
+                "--username",
+                "alice",
+                "/verified",
+                "/firstboot",
+                "disk",
+                "/mkfs",
+                "scratch",
+            ];
+            values.extend(tail);
+            let parsed = parse_args(args(&values)).unwrap();
+            assert!(matches!(parsed, Mode::Volume { boot: Some(ref boot),
+                uuid: Some(_), timezone: Some(_), hostname: Some(_), username: Some(_), .. }
+                if boot == &BootFiles { kernel: "/kernel".into(), initramfs: "/initrd".into() }));
+        }
+        for values in [
+            vec!["format"],
+            vec!["format", "/kernel"],
+            vec!["format", "/kernel", "/initrd", "disk", "/mkfs"],
+            vec![
+                "format", "/kernel", "/initrd", "disk", "/mkfs", "scratch", "extra",
+            ],
+            vec![
+                "format", "/kernel", "/initrd", "--uuid", "invalid", "disk", "/mkfs", "scratch",
+            ],
+            vec![
+                "format",
+                "/kernel",
+                "/initrd",
+                "--timezone",
+                "Etc/UTC",
+                "--uuid",
+                "12345678-1234-4234-8234-123456789abc",
+                "disk",
+                "/mkfs",
+                "scratch",
+            ],
+        ] {
+            assert!(parse_args(args(&values)).is_err(), "{values:?}");
+        }
+    }
+
+    #[test]
+    fn format_cli_explains_options_before_boot_files() {
+        for pair in [["--uuid", "12345678-1234-4234-8234-123456789abc"],
+            ["/kernel", "--timezone"], ["-kernel", "/initrd"]] {
+            let error = parse_args(args(&["format", pair[0], pair[1], "disk", "/mkfs", "scratch"]))
+                .unwrap_err();
+            assert!(error.to_string().contains("paths before volume options"), "{error}");
+        }
+        assert!(parse_args(args(&["format", "./-kernel", "/initrd", "disk", "/mkfs", "scratch"])).is_ok());
+    }
+
+    fn combined_fixture(body: &str) -> (Scratch, ScratchDirectory, BootFiles) {
+        let disk = Scratch::disk(DISK);
+        run_layout(&disk.path, &mut Vec::new()).unwrap();
+        let mut file = OpenOptions::new().write(true).open(&disk.path).unwrap();
+        let offset = plan(512, DISK).unwrap().volume_start * 512;
+        for at in [MIB, offset, DISK - 2 * MIB] {
+            write_at(&mut file, at, &[0xa5; 4096]).unwrap();
+        }
+        let dir = ScratchDirectory(fake_mkfs(body));
+        let boot = BootFiles {
+            kernel: dir.0.join("kernel"),
+            initramfs: dir.0.join("initrd"),
+        };
+        std::fs::write(&boot.kernel, b"retained kernel").unwrap();
+        std::fs::write(&boot.initramfs, b"retained initrd").unwrap();
+        (disk, dir, boot)
+    }
+
+    #[test]
+    fn combined_format_preparation_failures_preserve_existing_layout_and_volume() {
+        for (body, reason) in [
+            ("#!/bin/sh\nexit 3\n", "failed on the scratch image"),
+            (
+                "#!/bin/sh\nfor image do :; done\nrm -- \"$image\"\n",
+                "prepared Btrfs image",
+            ),
+            (
+                "#!/bin/sh\nfor image do :; done\n: > \"$image\"\n",
+                "bytes, not the required",
+            ),
+            (
+                "#!/bin/sh\nfor image do :; done\nprintf x >> \"$image\"\n",
+                "bytes, not the required",
+            ),
+        ] {
+            let (disk, dir, boot) = combined_fixture(body);
+            let before = volume_write_snapshot(&disk);
+            let mkfs = dir.0.join("mkfs.btrfs");
+            let prepared =
+                prepare_volume(VolumeSettings::default(), None, &mkfs, &dir.0, None).unwrap();
+            let mut output = Vec::new();
+            let error = run_format(prepared, &disk.path, &boot, &mut output).unwrap_err();
+            assert!(error.to_string().contains(reason), "{error}");
+            assert!(
+                before == volume_write_snapshot(&disk),
+                "{reason} changed the disk"
+            );
+            assert_eq!(std::fs::metadata(&disk.path).unwrap().len(), DISK);
+            assert!(output.is_empty());
+        }
+    }
+
+    #[test]
+    fn combined_format_admits_boot_files_before_touching_scratch() {
+        let (disk, dir, mut boot) = combined_fixture(RECORDING_MKFS);
+        boot.initramfs = dir.0.join("missing");
+        let mkfs = dir.0.join("mkfs.btrfs");
+        let before = volume_write_snapshot(&disk);
+        let prepared =
+            prepare_volume(VolumeSettings::default(), None, &mkfs, &dir.0, None).unwrap();
+        let error = run_format(prepared, &disk.path, &boot, &mut Vec::new()).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        assert!(!dir.0.join("argv").exists());
+        assert!(!dir.0.join("td-volume-root").exists());
+        assert!(before == volume_write_snapshot(&disk));
+    }
+
+    #[test]
+    fn combined_format_refuses_unusable_scratch_before_layout() {
+        let (disk, dir, boot) = combined_fixture(RECORDING_MKFS);
+        let scratch = dir.0.join("not-a-directory");
+        std::fs::write(&scratch, b"keep").unwrap();
+        let before = volume_write_snapshot(&disk);
+        let mkfs = dir.0.join("mkfs.btrfs");
+        let prepared =
+            prepare_volume(VolumeSettings::default(), None, &mkfs, &scratch, None).unwrap();
+        assert!(run_format(prepared, &disk.path, &boot, &mut Vec::new()).is_err());
+        assert!(!dir.0.join("argv").exists());
+        assert_eq!(std::fs::read(scratch).unwrap(), b"keep");
+        assert!(before == volume_write_snapshot(&disk));
+    }
+
+    #[test]
+    fn combined_format_rechecks_boot_lengths_after_filesystem_preparation() {
+        let (disk, dir, boot) =
+            combined_fixture("#!/bin/sh\nset -eu\nbase=$(dirname \"$0\")\n: > \"$base/kernel\"\n");
+        let before = volume_write_snapshot(&disk);
+        let mkfs = dir.0.join("mkfs.btrfs");
+        let prepared =
+            prepare_volume(VolumeSettings::default(), None, &mkfs, &dir.0, None).unwrap();
+        let error = run_format(prepared, &disk.path, &boot, &mut Vec::new()).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("EFI input changed size before layout"),
+            "{error}"
+        );
+        assert!(before == volume_write_snapshot(&disk));
+    }
+
+    #[test]
+    fn combined_format_retains_destination_and_boot_inputs_across_preparation() {
+        let body = concat!("#!/bin/sh\nset -eu\nbase=$(dirname \"$0\")\n",
+            "mv -- \"$base/disk\" \"$base/retained\"\nprintf replacement > \"$base/disk\"\n",
+            "mv -- \"$base/kernel\" \"$base/kernel.old\"\nprintf replacement > \"$base/kernel\"\n",
+            "for image do :; done\nprintf prepared | dd of=\"$image\" bs=1 seek=65536 conv=notrunc 2>/dev/null\n");
+        let (disk, dir, boot) = combined_fixture(body);
+        let path = dir.0.join("disk");
+        std::fs::rename(&disk.path, &path).unwrap();
+        let mkfs = dir.0.join("mkfs.btrfs");
+        let prepared =
+            prepare_volume(VolumeSettings::default(), None, &mkfs, &dir.0, None).unwrap();
+        let mut output = Vec::new();
+        run_format(prepared, &path, &boot, &mut output).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"replacement");
+        assert_eq!(std::fs::read(&boot.kernel).unwrap(), b"replacement");
+        let mut original = File::open(dir.0.join("retained")).unwrap();
+        let (offset, len) = destination_volume(&mut original).unwrap();
+        assert_eq!(
+            read_at(&mut original, offset + 65536, 8).unwrap(),
+            b"prepared"
+        );
+        assert_eq!(output, format!("{offset} {len} {MIB}\n").as_bytes());
+        let esp_bytes = read_at(&mut original, MIB, 16 * MIB).unwrap();
+        assert!(esp_bytes
+            .windows(b"retained kernel".len())
+            .any(|bytes| bytes == b"retained kernel"));
+        assert!(esp_bytes
+            .windows(b"retained initrd".len())
+            .any(|bytes| bytes == b"retained initrd"));
+        assert!(!esp_bytes
+            .windows(b"replacement".len())
+            .any(|bytes| bytes == b"replacement"));
+    }
+
+    #[test]
+    fn combined_format_succeeds_without_an_existing_gpt() {
+        let disk = Scratch::disk(DISK);
+        let dir = ScratchDirectory(fake_mkfs(RECORDING_MKFS));
+        let boot = BootFiles { kernel: dir.0.join("kernel"), initramfs: dir.0.join("initrd") };
+        std::fs::write(&boot.kernel, b"kernel").unwrap();
+        std::fs::write(&boot.initramfs, b"initrd").unwrap();
+        assert!(destination_volume(&mut File::open(&disk.path).unwrap()).is_err());
+        let mkfs = dir.0.join("mkfs.btrfs");
+        let prepared = prepare_volume(VolumeSettings::default(), None, &mkfs, &dir.0, None).unwrap();
+        let mut output = Vec::new();
+        run_format(prepared, &disk.path, &boot, &mut output).unwrap();
+        let (offset, len) = destination_volume(&mut File::open(&disk.path).unwrap()).unwrap();
+        assert_eq!(offset, 537919488);
+        assert_eq!(output, format!("{offset} {len} 0\n").as_bytes());
+        assert_eq!(std::fs::metadata(&disk.path).unwrap().len(), DISK);
+    }
+
+    #[test]
+    fn prepared_layout_refuses_changed_geometry_without_writes() {
+        let (disk, _dir, boot) = combined_fixture(RECORDING_MKFS);
+        let mut destination = FormatDestination::open(&disk.path).unwrap();
+        let layout = prepare_layout(&mut destination, Some(&boot)).unwrap();
+        destination.file.set_len(DISK + MIB).unwrap();
+        let before = volume_write_snapshot(&disk);
+        let error = layout
+            .write_to(&mut destination, &mut Vec::new())
+            .unwrap_err();
+        assert!(error.to_string().contains("geometry changed"), "{error}");
+        assert!(before == volume_write_snapshot(&disk));
+        assert_eq!(destination.file.metadata().unwrap().len(), DISK + MIB);
     }
 
     fn volume_write_snapshot(disk: &Scratch) -> Vec<Vec<u8>> {
