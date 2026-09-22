@@ -20,12 +20,46 @@ pub const MAX_LONG_EDGE: u32 = MAX_AXIS as u32;
 /// The long edge's word for the source's own size.
 pub const FULL: &str = "full";
 
-/// What every export is written with: the JPEG quality and the long edge
-/// the image is shrunk to, `None` for the source's own size. Never
-/// enlarged: a long edge past the source's is the source's.
+/// The file an export is written as.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum Format {
+    /// Baseline JPEG, `jpeg::Encoder`.
+    #[default]
+    Jpeg,
+    /// AVIF, `av1::Encoder` in `avif`'s container.
+    Avif,
+}
+
+impl Format {
+    /// Every format, in the order the view offers them.
+    pub const ALL: [Format; 2] = [Format::Jpeg, Format::Avif];
+
+    /// The word the settings and the verbs spell the format by.
+    pub fn name(self) -> &'static str {
+        match self {
+            Format::Jpeg => "jpeg",
+            Format::Avif => "avif",
+        }
+    }
+
+    /// The export's file extension.
+    pub fn extension(self) -> &'static str {
+        match self {
+            Format::Jpeg => "jpg",
+            Format::Avif => "avif",
+        }
+    }
+}
+
+/// What every export is written with: the format, its quality and the
+/// long edge the image is shrunk to, `None` for the source's own size.
+/// Never enlarged: a long edge past the source's is the source's.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Settings {
-    /// 1 to 100, the encoder's scale of the standard tables.
+    /// The file the export is written as.
+    pub format: Format,
+    /// 1 to 100: the JPEG encoder's scale of the standard tables, or
+    /// the AV1 encoder's step.
     pub quality: u8,
     /// 1 to `MAX_LONG_EDGE`, or `None` for the source's own size.
     pub long_edge: Option<u32>,
@@ -34,6 +68,7 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Settings {
+            format: Format::Jpeg,
             quality: QUALITY,
             long_edge: None,
         }
@@ -72,8 +107,14 @@ impl fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
+const FORMAT_KEY: &str = "format";
 const QUALITY_KEY: &str = "quality";
 const LONG_EDGE_KEY: &str = "long-edge";
+
+/// A format's text, or `None` when it is not a format's name.
+pub fn parse_format(text: &str) -> Option<Format> {
+    Format::ALL.into_iter().find(|format| format.name() == text)
+}
 
 /// A quality's text, or `None` when it is not 1 to 100 in plain decimal.
 pub fn parse_quality(text: &str) -> Option<u8> {
@@ -112,9 +153,10 @@ fn decimal(text: &str) -> Option<u64> {
 
 impl Settings {
     /// A settings file's bytes, refused as a whole at the first fault: the
-    /// header, then `quality N` and `long-edge N|full`, each at most once,
-    /// a key left out at its default. An unknown key is refused: the file
-    /// is td-photo's own, so one it does not know is another version's.
+    /// header, then `format jpeg|avif`, `quality N` and `long-edge
+    /// N|full`, each at most once, a key left out at its default. An
+    /// unknown key is refused: the file is td-photo's own, so one it does
+    /// not know is another version's.
     pub fn parse(bytes: &[u8]) -> Result<Settings, Error> {
         if bytes.len() > MAX_BYTES {
             return Err(Error::TooLong);
@@ -125,11 +167,17 @@ impl Settings {
             return Err(Error::Header);
         }
         let mut settings = Settings::default();
-        let (mut quality, mut long_edge) = (false, false);
+        let (mut format, mut quality, mut long_edge) = (false, false, false);
         for (index, line) in lines.enumerate() {
             let number = index + 2;
             let (key, value) = line.split_once(' ').ok_or(Error::Line(number))?;
             match key {
+                FORMAT_KEY => {
+                    if std::mem::replace(&mut format, true) {
+                        return Err(Error::Repeated(FORMAT_KEY));
+                    }
+                    settings.format = parse_format(value).ok_or(Error::Value(FORMAT_KEY))?;
+                }
                 QUALITY_KEY => {
                     if std::mem::replace(&mut quality, true) {
                         return Err(Error::Repeated(QUALITY_KEY));
@@ -149,11 +197,12 @@ impl Settings {
         Ok(settings)
     }
 
-    /// The file's text: the header, then both keys, each ended by a
-    /// newline; what `parse` reads back to the same settings.
+    /// The file's text: the header, then the three keys, each ended by
+    /// a newline; what `parse` reads back to the same settings.
     pub fn text(&self) -> String {
         format!(
-            "{HEADER}\n{QUALITY_KEY} {}\n{LONG_EDGE_KEY} {}\n",
+            "{HEADER}\n{FORMAT_KEY} {}\n{QUALITY_KEY} {}\n{LONG_EDGE_KEY} {}\n",
+            self.format.name(),
             self.quality,
             long_edge_text(self.long_edge)
         )
@@ -169,14 +218,17 @@ mod tests {
         for settings in [
             Settings::default(),
             Settings {
+                format: Format::Jpeg,
                 quality: 1,
                 long_edge: Some(1),
             },
             Settings {
+                format: Format::Avif,
                 quality: 100,
                 long_edge: Some(MAX_LONG_EDGE),
             },
             Settings {
+                format: Format::Avif,
                 quality: 75,
                 long_edge: Some(2048),
             },
@@ -190,23 +242,40 @@ mod tests {
         assert_eq!(
             Settings::parse(b"td-photo export 1\nlong-edge 1600\n"),
             Ok(Settings {
+                format: Format::Jpeg,
                 quality: QUALITY,
                 long_edge: Some(1600),
             })
         );
         assert_eq!(
-            Settings::default().text(),
-            "td-photo export 1\nquality 92\nlong-edge full\n"
+            Settings::parse(b"td-photo export 1\nformat avif\n"),
+            Ok(Settings {
+                format: Format::Avif,
+                ..Settings::default()
+            })
         );
+        assert_eq!(
+            Settings::default().text(),
+            "td-photo export 1\nformat jpeg\nquality 92\nlong-edge full\n"
+        );
+        assert_eq!(parse_format("jpeg"), Some(Format::Jpeg));
+        assert_eq!(parse_format("jpg"), None);
+        assert_eq!(parse_format("AVIF"), None);
+        assert_eq!(Format::Avif.extension(), "avif");
     }
 
     #[test]
     fn a_fault_refuses_the_file_whole() {
-        let cases: [(&[u8], Error); 12] = [
+        let cases: [(&[u8], Error); 14] = [
             (b"", Error::Header),
             (b"td-photo edit 1\nquality 50\n", Error::Header),
             (b"td-photo export 1\nquality\n", Error::Line(2)),
-            (b"td-photo export 1\nformat avif\n", Error::Line(2)),
+            (b"td-photo export 1\nformat\n", Error::Line(2)),
+            (b"td-photo export 1\nformat webp\n", Error::Value("format")),
+            (
+                b"td-photo export 1\nformat avif\nformat jpeg\n",
+                Error::Repeated("format"),
+            ),
             (b"td-photo export 1\nquality 0\n", Error::Value("quality")),
             (b"td-photo export 1\nquality 101\n", Error::Value("quality")),
             (b"td-photo export 1\nquality 092\n", Error::Value("quality")),

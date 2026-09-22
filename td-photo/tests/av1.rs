@@ -15,6 +15,7 @@
 use std::process::Command;
 
 use td_photo::av1::{qindex, Encoder, Geometry, Reconstruction};
+use td_photo::avif;
 
 fn scratch(name: &str) -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!("td-photo-av1-{}", std::process::id()));
@@ -409,5 +410,34 @@ fn the_streams_are_the_bytes_dav1d_decoded() {
             assert_eq!(decoded, planes, "{name}: dav1d differs from the encoder");
         }
         assert_eq!(fnv(&obus), hash, "{name}: {:#018x}", fnv(&obus));
+    }
+}
+
+/// The container carries the stream where its `iloc` says, and the
+/// stream it carries decodes: the item's extent read back from the file
+/// is the OBUs, and dav1d decodes them to the reconstruction.
+#[test]
+fn the_container_carries_the_stream_where_it_says() {
+    let (width, height, quality) = (300, 200, 60);
+    let (obus, reconstruction) = encode(width, height, quality, 2);
+    let geometry = Geometry::new(width, height).unwrap();
+    let data = avif::file(&geometry, &obus);
+    assert!(data.starts_with(b"\0\0\0\x20ftypavif"), "{:?}", &data[..16]);
+    let at = data.windows(4).position(|w| w == b"iloc").unwrap();
+    let offset = u32::from_be_bytes(data[at + 18..at + 22].try_into().unwrap()) as usize;
+    let length = u32::from_be_bytes(data[at + 22..at + 26].try_into().unwrap()) as usize;
+    assert_eq!(&data[offset..offset + length], &obus[..]);
+    assert_eq!(
+        &data[offset - 8..offset - 4],
+        &(length as u32 + 8).to_be_bytes()
+    );
+    assert_eq!(&data[offset - 4..offset], b"mdat");
+    assert_eq!(offset + length, data.len());
+    if let Some(decoded) = dav1d(&data[offset..offset + length], "container") {
+        let mut planes = Vec::new();
+        for plane in &reconstruction.planes {
+            planes.extend_from_slice(plane);
+        }
+        assert_eq!(decoded, planes, "dav1d differs from the encoder");
     }
 }

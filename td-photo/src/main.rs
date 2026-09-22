@@ -30,9 +30,9 @@ use td_photo::image::{self, read_ppm, write_ppm, Rgb8};
 use td_photo::library::{self, Filter, Flag, Key, Sidecar};
 use td_photo::look::{self, Look};
 use td_photo::nef::{self, Nef};
-use td_photo::settings::{self, Settings};
+use td_photo::settings::{self, Format, Settings};
 use td_photo::ui::{self, Effect, Photo};
-use td_photo::{camera, jpeg, tiff};
+use td_photo::{av1, avif, camera, jpeg, tiff};
 
 mod window;
 
@@ -51,16 +51,19 @@ const HELP: &str = concat!(
     "  the whole frame), written through a fresh\n",
     "  OUT.ppm.tmp and linked into place. OUT.ppm must not exist: td-photo\n",
     "  never overwrites a file.\n",
-    "td-photo export FILE [--quality N] [--long-edge N|full]\n",
+    "td-photo export FILE [--format jpeg|avif] [--quality N]\n",
+    "                 [--long-edge N|full]\n",
     "  Renders FILE's raw at full resolution (a bilinear demosaic, in row\n",
     "  bands) with its sidecar's exposure, crop and look, shrinks it to N\n",
     "  pixels on the long side when --long-edge asks (default full, never\n",
-    "  enlarged), and writes it as a JPEG (--quality 1 to 100, default 92;\n",
-    "  4:4:4) into exported/ beside FILE: STEM.jpg, or STEM-2.jpg,\n",
-    "  STEM-3.jpg ... when that name is taken, through a fresh STEM.jpg.tmp\n",
-    "  linked into place. Never overwrites, and a sidecar the reader\n",
-    "  refuses refuses the export rather than dropping its edits.\n",
-    "td-photo export-picks ROLL [--quality N] [--long-edge N|full]\n",
+    "  enlarged), and writes it as a JPEG (4:4:4; the default) or an AVIF\n",
+    "  (8-bit 4:2:0) at --quality 1 to 100 (default 92) into exported/\n",
+    "  beside FILE: STEM.jpg, or STEM-2.jpg, STEM-3.jpg ... when that name\n",
+    "  is taken (STEM.avif likewise), through a fresh STEM.jpg.tmp or\n",
+    "  STEM.avif.tmp linked into place. Never overwrites, and a sidecar the\n",
+    "  reader refuses refuses the export rather than dropping its edits.\n",
+    "td-photo export-picks ROLL [--format jpeg|avif] [--quality N]\n",
+    "                 [--long-edge N|full]\n",
     "  Exports every pick in ROLL (flag pick in its sidecar) as export\n",
     "  does, in name order, one line each: exported NAME -> OUT, or failed\n",
     "  NAME: why; the run fails after the rest when any failed. The window's\n",
@@ -992,7 +995,7 @@ impl Batch {
     }
 }
 
-/// What an export made: the JPEG's path, the frame it decoded (for the
+/// What an export made: the file's path, the frame it decoded (for the
 /// window's raw cache, absent when the caller supplied one), and the
 /// decode's facts.
 pub(crate) struct Exported {
@@ -1020,10 +1023,16 @@ pub(crate) fn export_request(path: &Path, settings: Settings) -> Result<ExportRe
     })
 }
 
-/// The export settings `--quality N` and `--long-edge N|full` spell, each
-/// at its default when absent.
+/// The export settings `--format jpeg|avif`, `--quality N` and
+/// `--long-edge N|full` spell, each at its default when absent.
 fn export_settings(rest: &[OsString]) -> Result<Settings, String> {
     let mut settings = Settings::default();
+    if let Some(text) = option(rest, "--format")? {
+        settings.format = settings::parse_format(&text).ok_or_else(|| {
+            let names: Vec<&str> = Format::ALL.iter().map(|f| f.name()).collect();
+            format!("--format {text:?} is not {}", names.join(" or "))
+        })?;
+    }
     if let Some(text) = option(rest, "--quality")? {
         settings.quality = settings::parse_quality(&text)
             .ok_or_else(|| format!("--quality {text:?} is not 1..=100"))?;
@@ -1039,6 +1048,60 @@ fn export_settings(rest: &[OsString]) -> Result<Settings, String> {
     Ok(settings)
 }
 
+/// The export's encoder by the settings' format: fed the output rows in
+/// bands, drained of what it has coded (the JPEG as it goes, the AVIF
+/// nothing until the end, since its container names the stream's
+/// length), and closed for the tail.
+enum Output {
+    Jpeg(Box<jpeg::Encoder>),
+    Avif(Box<av1::Encoder>),
+}
+
+impl Output {
+    fn open(
+        settings: Settings,
+        width: usize,
+        height: usize,
+        threads: usize,
+    ) -> Result<Output, String> {
+        Ok(match settings.format {
+            Format::Jpeg => Output::Jpeg(Box::new(
+                jpeg::Encoder::new(width, height, settings.quality, threads)
+                    .map_err(|e| e.to_string())?,
+            )),
+            Format::Avif => Output::Avif(Box::new(
+                av1::Encoder::new(width, height, settings.quality, threads)
+                    .map_err(|e| e.to_string())?,
+            )),
+        })
+    }
+
+    fn encode_rows(&mut self, rows: &[u8]) -> Result<(), String> {
+        match self {
+            Output::Jpeg(encoder) => encoder.encode_rows(rows).map_err(|e| e.to_string()),
+            Output::Avif(encoder) => encoder.encode_rows(rows).map_err(|e| e.to_string()),
+        }
+    }
+
+    fn take(&mut self) -> Vec<u8> {
+        match self {
+            Output::Jpeg(encoder) => encoder.take(),
+            Output::Avif(_) => Vec::new(),
+        }
+    }
+
+    fn finish(self) -> Result<Vec<u8>, String> {
+        match self {
+            Output::Jpeg(encoder) => encoder.finish().map_err(|e| e.to_string()),
+            Output::Avif(encoder) => {
+                let geometry = encoder.geometry().clone();
+                let obus = encoder.finish().map_err(|e| e.to_string())?;
+                Ok(avif::file(&geometry, &obus))
+            }
+        }
+    }
+}
+
 /// Runs one export: the look resolved (a stem no look answers to refuses
 /// it before anything is decoded or written), the raw decoded unless
 /// `raw` supplies the frame, the frame developed a band of rows at a time
@@ -1046,11 +1109,12 @@ fn export_settings(rest: &[OsString]) -> Result<Settings, String> {
 /// `image::Shrink` when the settings' long edge is under the frame's,
 /// each source band giving back the output rows it completes -- so no
 /// whole-frame RGB buffer is held, and the stream written through a fresh
-/// `exported/STEM.jpg.tmp`, synced, then linked to the first free name --
-/// `STEM.jpg`, or `STEM-2.jpg` on from 2 when that is taken -- so a name
-/// that appears meanwhile is skipped rather than replaced. The folder is
-/// made once there is something to put in it; anything else at its name, a
-/// link included, is refused.
+/// `exported/STEM.EXT.tmp` (`jpg` or `avif`, the settings' format),
+/// synced, then linked to the first free name -- `STEM.EXT`, or
+/// `STEM-2.EXT` on from 2 when that is taken -- so a name that appears
+/// meanwhile is skipped rather than replaced. The folder is made once
+/// there is something to put in it; anything else at its name, a link
+/// included, is refused.
 pub(crate) fn export_file(
     request: &ExportRequest,
     raw: Option<&RawFrame>,
@@ -1104,7 +1168,8 @@ pub(crate) fn export_file(
     // The folder is made once there is something to put in it, so a raw
     // that cannot be developed or shrunk leaves the roll as it was.
     let dir = own_folder(&roll, library::EXPORTED)?;
-    let temporary = dir.join(format!("{stem}.jpg.tmp"));
+    let ext = request.settings.format.extension();
+    let temporary = dir.join(format!("{stem}.{ext}.tmp"));
     let file = fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -1118,8 +1183,7 @@ pub(crate) fn export_file(
     };
     let mut write = |file: fs::File| -> Result<(), String> {
         let mut writer = BufWriter::new(file);
-        let mut encoder = jpeg::Encoder::new(out_w, out_h, request.settings.quality, threads)
-            .map_err(|e| e.to_string())?;
+        let mut encoder = Output::open(request.settings, out_w, out_h, threads)?;
         let mut first = 0;
         while first < geometry.height {
             let band = develop::export_band(
@@ -1142,7 +1206,7 @@ pub(crate) fn export_file(
                 },
                 None => band,
             };
-            encoder.encode_rows(&rows.data).map_err(|e| e.to_string())?;
+            encoder.encode_rows(&rows.data)?;
             writer
                 .write_all(&encoder.take())
                 .map_err(|e| e.to_string())?;
@@ -1150,7 +1214,7 @@ pub(crate) fn export_file(
         if shrink.as_ref().is_some_and(|shrink| shrink.done() != out_h) {
             return Err("the shrink gave back too few rows".to_string());
         }
-        let tail = encoder.finish().map_err(|e| e.to_string())?;
+        let tail = encoder.finish()?;
         writer.write_all(&tail).map_err(|e| e.to_string())?;
         writer
             .into_inner()
@@ -1167,9 +1231,9 @@ pub(crate) fn export_file(
     let mut published = None;
     for n in 1..=MAX_EXPORT_NAMES {
         let name = if n == 1 {
-            format!("{stem}.jpg")
+            format!("{stem}.{ext}")
         } else {
-            format!("{stem}-{n}.jpg")
+            format!("{stem}-{n}.{ext}")
         };
         let out = dir.join(name);
         match publish(&temporary, &out) {
@@ -1201,10 +1265,11 @@ pub(crate) fn export_file(
 }
 
 /// `td-photo export FILE`: the original developed at full resolution
-/// through its sidecar and written as a JPEG into `exported/` beside it
+/// through its sidecar and written as the settings' format into
+/// `exported/` beside it
 /// (`export_request` and `export_file`, which the window's pool runs too).
 fn export(path: &Path, rest: &[OsString]) -> Result<(), String> {
-    check_flags(rest, &["--quality", "--long-edge"], &[])?;
+    check_flags(rest, &["--format", "--quality", "--long-edge"], &[])?;
     let request = export_request(path, export_settings(rest)?)?;
     let started = Instant::now();
     let exported = export_file(&request, None, threads())?;
@@ -1240,7 +1305,7 @@ fn read_picks(roll: &Path) -> Result<Vec<String>, String> {
 /// rest when any did: one that fails keeps the others coming, since each
 /// is its own file.
 fn export_picks(roll: &Path, rest: &[OsString]) -> Result<(), String> {
-    check_flags(rest, &["--quality", "--long-edge"], &[])?;
+    check_flags(rest, &["--format", "--quality", "--long-edge"], &[])?;
     let settings = export_settings(rest)?;
     let picks = read_picks(roll)?;
     let stdout = io::stdout();

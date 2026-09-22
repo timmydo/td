@@ -2219,6 +2219,8 @@ fn the_command_line_exports_at_a_quality_and_a_long_edge_and_every_pick() {
         ("--long-edge", "0", "full or 1..=16384"),
         ("--long-edge", "16385", "full or 1..=16384"),
         ("--long-edge", "Full", "full or 1..=16384"),
+        ("--format", "jpg", "jpeg or avif"),
+        ("--format", "AVIF", "jpeg or avif"),
     ] {
         let (ok, _, stderr) = run(&[
             OsStr::new("export"),
@@ -2230,6 +2232,66 @@ fn the_command_line_exports_at_a_quality_and_a_long_edge_and_every_pick() {
         assert!(stderr.contains(why), "{flag} {value}: {stderr}");
     }
     assert_eq!(listing().len(), 3);
+    // An AVIF: the file named by its format, an AVIF (`ftyp` with the
+    // brand, the item's size the shrunk frame's) whose picture is the
+    // JPEG export's within the two codings' error; a lower quality
+    // fewer bytes.
+    let (ok, stdout, stderr) = run(&[
+        OsStr::new("export"),
+        file.as_os_str(),
+        OsStr::new("--format"),
+        OsStr::new("avif"),
+        OsStr::new("--long-edge"),
+        OsStr::new("30"),
+    ]);
+    assert!(ok, "{stderr}");
+    assert!(stdout.contains("exported 64x32 -> 30x14 into"), "{stdout}");
+    assert!(stdout.contains("DSC_0001.avif"), "{stdout}");
+    let avif = std::fs::read(exported.join("DSC_0001.avif")).unwrap();
+    assert!(avif.starts_with(b"\0\0\0\x20ftypavif"), "{:?}", &avif[..16]);
+    let at = avif.windows(4).position(|w| w == b"ispe").unwrap();
+    assert_eq!(&avif[at + 8..at + 16], &[0, 0, 0, 30, 0, 0, 0, 14]);
+    let luma = |rgb: &[u8]| -> Vec<u8> {
+        rgb.as_chunks::<3>()
+            .0
+            .iter()
+            .map(|p| {
+                ((77 * u32::from(p[0]) + 150 * u32::from(p[1]) + 29 * u32::from(p[2]) + 128) >> 8)
+                    as u8
+            })
+            .collect()
+    };
+    let expected = luma(&small.data);
+    let at = avif.windows(4).position(|w| w == b"mdat").unwrap();
+    let decoded = td_photo_av1_decode(&avif[at + 4..], 30, 14);
+    if let Some(decoded) = decoded {
+        let worst = decoded
+            .iter()
+            .zip(&expected)
+            .map(|(a, b)| a.abs_diff(*b))
+            .max()
+            .unwrap();
+        assert!(worst <= 12, "luma differs by {worst}");
+    }
+    let (ok, _, stderr) = run(&[
+        OsStr::new("export"),
+        file.as_os_str(),
+        OsStr::new("--format"),
+        OsStr::new("avif"),
+        OsStr::new("--long-edge"),
+        OsStr::new("30"),
+        OsStr::new("--quality"),
+        OsStr::new("20"),
+    ]);
+    assert!(ok, "{stderr}");
+    let coarse_avif = std::fs::read(exported.join("DSC_0001-2.avif")).unwrap();
+    assert!(
+        coarse_avif.len() < avif.len(),
+        "{} < {}",
+        coarse_avif.len(),
+        avif.len()
+    );
+    assert_eq!(listing().len(), 5);
     // A frame taller than a source band (64 rows), shrunk: the output
     // rows come from several bands and are the shrink of the full-size
     // export within the two codings' error.
@@ -2277,11 +2339,11 @@ fn the_command_line_exports_at_a_quality_and_a_long_edge_and_every_pick() {
         .max()
         .unwrap();
     assert!(worst <= 6, "worst {worst}");
-    assert_eq!(listing().len(), 5);
+    assert_eq!(listing().len(), 7);
     std::fs::remove_file(exported.join("DSC_0004.jpg")).unwrap();
     std::fs::remove_file(exported.join("DSC_0004-2.jpg")).unwrap();
     std::fs::remove_file(&tall).unwrap();
-    assert_eq!(listing().len(), 3);
+    assert_eq!(listing().len(), 5);
 
     // export-picks: every pick in name order, the unflagged and the
     // rejects left out, a line each and the count; a pick that fails
@@ -2323,7 +2385,23 @@ fn the_command_line_exports_at_a_quality_and_a_long_edge_and_every_pick() {
     assert_eq!(lines[2], "2 of 2 picks exported");
     let third = decode("DSC_0003.jpg");
     assert_eq!((third.width, third.height), (16, 7));
-    assert_eq!(listing().len(), 5);
+    assert_eq!(listing().len(), 7);
+    let (ok, stdout, stderr) = run(&[
+        OsStr::new("export-picks"),
+        roll.as_os_str(),
+        OsStr::new("--format"),
+        OsStr::new("avif"),
+        OsStr::new("--long-edge"),
+        OsStr::new("16"),
+    ]);
+    assert!(ok, "{stderr}");
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert!(lines[0].ends_with("DSC_0001-3.avif"), "{stdout}");
+    assert!(lines[1].ends_with("DSC_0003.avif"), "{stdout}");
+    assert!(std::fs::read(exported.join("DSC_0003.avif"))
+        .unwrap()
+        .starts_with(b"\0\0\0\x20ftypavif"));
+    assert_eq!(listing().len(), 9);
     std::fs::write(roll.join("DSC_0003.NEF"), b"not a nef").unwrap();
     let (ok, stdout, stderr) = run(&[OsStr::new("export-picks"), roll.as_os_str()]);
     assert!(!ok);
@@ -2335,7 +2413,7 @@ fn the_command_line_exports_at_a_quality_and_a_long_edge_and_every_pick() {
     assert!(lines[1].starts_with("failed DSC_0003.NEF: "), "{stdout}");
     assert_eq!(lines[2], "1 of 2 picks exported");
     assert!(stderr.contains("1 of 2 picks failed"), "{stderr}");
-    assert_eq!(listing().len(), 6);
+    assert_eq!(listing().len(), 10);
     // The roll and the settings are checked before any export.
     let (ok, _, stderr) = run(&[
         OsStr::new("export-picks"),
@@ -2350,6 +2428,30 @@ fn the_command_line_exports_at_a_quality_and_a_long_edge_and_every_pick() {
     assert!(stderr.contains("needs ROLL"), "{stderr}");
     let (ok, _, stderr) = run(&[OsStr::new("export-picks"), file.as_os_str()]);
     assert!(!ok, "{stderr}");
-    assert_eq!(listing().len(), 6);
+    assert_eq!(listing().len(), 10);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The luma plane dav1d decodes from an AV1 stream (a section-5 stream
+/// led by a temporal delimiter), or `None` without `TD_TEST_DAV1D`.
+fn td_photo_av1_decode(obus: &[u8], width: usize, height: usize) -> Option<Vec<u8>> {
+    let dav1d = std::env::var_os("TD_TEST_DAV1D")?;
+    let dir = scratch("avif-decode");
+    let input = dir.join("in.obu");
+    let output = dir.join("out.yuv");
+    let mut stream = vec![0x12, 0x00];
+    stream.extend_from_slice(obus);
+    std::fs::write(&input, &stream).unwrap();
+    let status = std::process::Command::new(dav1d)
+        .args(["-q", "-i"])
+        .arg(&input)
+        .arg("-o")
+        .arg(&output)
+        .args(["--muxer", "yuv"])
+        .status()
+        .expect("dav1d runs");
+    assert!(status.success(), "dav1d refused the export's stream");
+    let decoded = std::fs::read(&output).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+    Some(decoded[..width * height].to_vec())
 }

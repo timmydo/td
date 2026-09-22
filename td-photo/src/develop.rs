@@ -83,7 +83,7 @@ fn band_rows(rows: usize, threads: usize) -> usize {
 /// system refuses to create is simply absent: the caller drains what is
 /// left, so the result never depends on how many threads started. The one
 /// place the crate spreads work across threads; the JPEG encoder borrows
-/// it for its transform.
+/// it for its transform and the AV1 encoder for its tiles.
 pub(crate) fn bands<T: Send>(items: Vec<T>, threads: usize, work: impl Fn(T) + Sync) {
     let threads = threads.clamp(1, MAX_THREADS);
     let queue = Mutex::new(items);

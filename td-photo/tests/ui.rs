@@ -20,7 +20,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use td_photo::library::{self, Filter, Flag, Key, Sidecar};
 use td_photo::look;
-use td_photo::settings::Settings;
+use td_photo::settings::{Format, Settings};
 use td_photo::ui::{self, Action, Controller, Effect, Photo, View, ZoomStep, BINDINGS};
 use td_ui::chrome::DISABLED;
 use td_ui::control::{frame, hex, valid_code, Decoder, ErrorCode};
@@ -4332,7 +4332,7 @@ fn the_binary_keeps_the_export_settings_and_exports_the_picks_over_the_replay() 
     assert_eq!(&a[3][21..], ["80", "32"]);
     assert_eq!(
         fs::read_to_string(&file).unwrap(),
-        "td-photo export 1\nquality 80\nlong-edge 32\n"
+        "td-photo export 1\nformat jpeg\nquality 80\nlong-edge 32\n"
     );
     assert_eq!(&a[4][1..], ["ok", "ignored"]);
     assert_eq!(a[5][1..3], ["error", "bad-argument"]);
@@ -4404,7 +4404,7 @@ fn the_binary_keeps_the_export_settings_and_exports_the_picks_over_the_replay() 
     assert!(ok, "{err}");
     assert_eq!(&replies[0][21..], ["92", "full"], "the empty configuration");
     assert_eq!(&replies_env[0][21..], ["80", "32"]);
-    fs::write(&file, "td-photo export 1\nquality 80\nformat avif\n").unwrap();
+    fs::write(&file, "td-photo export 1\nquality 80\nsharpen 3\n").unwrap();
     let mut session = Replay::start_with_env(&["--size", "1100x400", roll_s], &env);
     let replies = session.send(&[
         request(1, &["state"]),
@@ -4417,7 +4417,18 @@ fn the_binary_keeps_the_export_settings_and_exports_the_picks_over_the_replay() 
     assert!(err.contains("export settings at their defaults"), "{err}");
     assert_eq!(
         fs::read_to_string(&file).unwrap(),
-        "td-photo export 1\nquality 10\nlong-edge full\n"
+        "td-photo export 1\nformat jpeg\nquality 10\nlong-edge full\n"
+    );
+    // A format the file holds is kept through a change to another key.
+    fs::write(&file, "td-photo export 1\nformat avif\n").unwrap();
+    let mut session = Replay::start_with_env(&["--size", "1100x400", roll_s], &env);
+    let replies = session.send(&[request(1, &["action", "quality", "10"])]);
+    assert_eq!(&replies[0][1..], ["ok", "changed"]);
+    let (ok, _, err) = session.finish();
+    assert!(ok, "{err}");
+    assert_eq!(
+        fs::read_to_string(&file).unwrap(),
+        "td-photo export 1\nformat avif\nquality 10\nlong-edge full\n"
     );
     // A folder (or a fifo, a link) at the file's name is refused by name
     // before any open, so the session starts, at the defaults; and the
@@ -7692,6 +7703,7 @@ fn the_export_settings_are_set_through_effects_and_settled() {
     assert_eq!(
         effects,
         [Effect::Settings(Settings {
+            format: Format::Jpeg,
             quality: 80,
             long_edge: None,
         })]
@@ -7700,6 +7712,7 @@ fn the_export_settings_are_set_through_effects_and_settled() {
     let generation = fields(&c)[GENERATION].clone();
     assert_eq!(
         c.set_settings(Settings {
+            format: Format::Jpeg,
             quality: 80,
             long_edge: None,
         }),
@@ -7709,6 +7722,7 @@ fn the_export_settings_are_set_through_effects_and_settled() {
     assert_eq!(&fields(&c)[QUALITY..=EDGE], ["80", "full"]);
     assert_eq!(
         c.set_settings(Settings {
+            format: Format::Jpeg,
             quality: 80,
             long_edge: None,
         }),
@@ -7782,6 +7796,7 @@ fn the_export_view_buttons_and_slider_ask_what_they_say() {
     assert_eq!(
         effects,
         [Effect::Settings(Settings {
+            format: Format::Jpeg,
             quality: 92,
             long_edge: Some(2048),
         })]
@@ -7867,6 +7882,7 @@ fn the_export_view_buttons_and_slider_ask_what_they_say() {
     assert_eq!(
         effects,
         [Effect::Settings(Settings {
+            format: Format::Jpeg,
             quality: 50,
             long_edge: None,
         })]

@@ -30,6 +30,7 @@ fn names(dir: &str, extension: &str) -> BTreeSet<String> {
 
 const PURE: &[&str] = &[
     "av1.rs",
+    "avif.rs",
     "camera.rs",
     "cdf.rs",
     "color.rs",
@@ -393,7 +394,11 @@ fn budgets_are_the_documented_values() {
     assert!(window.contains("crate::export_file("));
     assert!(window.contains("fn submit_exports("));
     assert!(main.contains("exports: Option<Vec<ExportRequest>>"));
-    assert!(main.contains("format!(\"{stem}.jpg.tmp\")"));
+    assert!(main.contains("format!(\"{stem}.{ext}.tmp\")"));
+    assert!(main.contains("av1::Encoder::new("));
+    assert!(main.contains("avif::file("));
+    let av1 = read("src/av1.rs");
+    assert!(av1.contains("crate::develop::bands("));
     assert!(main.contains("const EXPORT_BAND_ROWS: usize = 64;"));
     assert!(main.contains("const MAX_EXPORT_NAMES: u32 = 1000;"));
     let jpeg = read("src/jpeg.rs");

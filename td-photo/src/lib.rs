@@ -9,11 +9,13 @@
 //! rule, `look` the look format with its built-in set, `settings` the
 //! export settings' grammar, `transform`, `cdf` and `av1` the AV1 still
 //! picture encoder (the transforms and quantizers, the default symbol
-//! probabilities, and the coder), and `ui` the cull controller over
+//! probabilities, and the coder), `avif` its container, and `ui` the
+//! cull controller over
 //! td-ui's driven seam. None of these reads a file, the environment, a
 //! clock or a descriptor: `main` owns I/O. DESIGN.md is the contract.
 
 pub mod av1;
+pub mod avif;
 pub mod camera;
 pub mod cdf;
 pub mod color;

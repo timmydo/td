@@ -31,7 +31,9 @@ the look in it, and the full-resolution bilinear demosaic export runs in row
 bands (`develop`), the RGB image buffers and PPM writer and reader
 (`image`), the baseline JPEG decoder for the embedded previews with its
 reduced-transform scaling and the baseline encoder export writes through
-(`jpeg`), the thumbnail rule and the thumbnail cache,
+(`jpeg`), the AV1 still-picture encoder (`av1` over `transform` and
+`cdf`) and the AVIF container (`avif`) export writes through instead when
+asked, the thumbnail rule and the thumbnail cache,
 the library's sidecar grammar, roll rules and dating rule (`library`), the cull
 and develop controller over td-ui's driven seam with its action table and scene
 (`ui`), the
@@ -57,8 +59,9 @@ seam and the socket are in, as are the developed preview and the crop drag
 with its edge and corner handles and the look palette; the `export` verb and
 the window's `export` action are in, `delete-rejected` with them, and the
 export view with its settings and the picks' export close the export
-increment but for AVIF, whose AV1 encoder is in and whose container,
-format setting and buttons follow. The crate is packaged: the `td-photo`
+increment but for AVIF, whose AV1 encoder, container, `format` setting
+and `--format` are in and whose view buttons follow. The crate is
+packaged: the `td-photo`
 target recipe builds it static over the staged td-ui and td-compositor
 trees, the image copies its output and links `/bin/td-photo`, and
 `td-photo-test` runs the built binary's verbs over a synthetic frame
@@ -425,11 +428,16 @@ window, all speaking the toolkit's one vocabulary.
   cursor's moves still walk the shown (`Left`, `Right`, the pages), a
   cursor lost to a flag does not end it, and the wheel and `scroll`,
   `view` and the grid's own actions are `ignored`. The settings are the
-  JPEG `quality` (1 to 100, `jpeg::QUALITY`, 92, at first) and the
-  `long-edge` (`full`, or 1 to `settings::MAX_LONG_EDGE`, 16384, pixels
-  on the long side, the source's own size at first) every export is
-  shrunk to, never enlarged; `state` reports both as its last two fields
-  and they are kept across rolls and modes. Each is set by its action
+  `format` (`jpeg` or `avif`, JPEG at first; the window exports the
+  file's format while the view's text still says JPEG, since the view's
+  format row and the `format` action are the next landing), the
+  `quality` (1 to 100,
+  `jpeg::QUALITY`, 92, at first; the JPEG tables' scale or the AV1 step)
+  and the `long-edge` (`full`, or 1 to `settings::MAX_LONG_EDGE`, 16384,
+  pixels on the long side, the source's own size at first) every export
+  is shrunk to, never enlarged; `state` reports the quality and the long
+  edge as its last two fields and all three are kept across rolls and
+  modes. The quality and the long edge are each set by their action
   in any mode (`quality N`, `long-edge N|full`, `bad-argument` outside
   its grammar): the value in force is `ignored` with nothing asked,
   else the dispatch is `changed` with a `Settings` effect carrying the
@@ -555,11 +563,12 @@ window, all speaking the toolkit's one vocabulary.
 - **A headless verb for every durable effect.** Whatever an action does to
   files is also a command-line verb: `import`, `list`, `flag`, `edit`
   (get and set of a sidecar's values), `delete-rejected`, `develop`,
-  `export`, `export-picks` (both taking `--quality` and `--long-edge` on
-  the command line, at their defaults without; the settings file is the
-  window's), `thumb`, `looks` and `cache clear`. Verbs are the batch
-  face: they read the same sidecars and write them the same way, and an
-  agent that does not need to see pixels never opens a window.
+  `export`, `export-picks` (both taking `--format`, `--quality` and
+  `--long-edge` on the command line, at their defaults without; the
+  settings file is the window's), `thumb`, `looks` and `cache clear`.
+  Verbs are the batch face: they read the same sidecars and write them
+  the same way, and an agent that does not need to see pixels never
+  opens a window.
 - **`--replay`: the window without a display.** `td-photo --replay [--size WxH]
   [ROLL]` reads requests on stdin and answers on stdout through td-ui's replay
   runner and `driven::request`, in the envelope td-ui/DESIGN.md defines: a
@@ -829,12 +838,14 @@ The library is folders of originals; there is no database.
 
   ```text
   td-photo export 1
+  format jpeg
   quality 92
   long-edge 2048
   ```
 
-  `quality` is 1 to 100 and `long-edge` 1 to `MAX_LONG_EDGE` (16384) or
-  `full`, each at most once and at its default when left out; a file past
+  `format` is `jpeg` or `avif`, `quality` is 1 to 100 and `long-edge` 1 to
+  `MAX_LONG_EDGE` (16384) or `full`, each at most once and at its default
+  (JPEG, 92, `full`) when left out; a file past
   `settings::MAX_BYTES` (4096), not UTF-8, without the header, with a line
   that is not `key value`, a key this version does not know (the file is
   td-photo's own, so an unknown key is another version's) or a value
@@ -848,8 +859,8 @@ The library is folders of originals; there is no database.
   `export.tmp` as the sidecar is written (`replace_own`; the folder made
   as needed; a stale temporary is reported, not reused or removed, and
   refuses the change): the last write wins. The verbs never read it;
-  `export` and `export-picks` take `--quality` and `--long-edge` on the
-  command line.
+  `export` and `export-picks` take `--format`, `--quality` and
+  `--long-edge` on the command line.
 - **Cache**: `$XDG_CACHE_HOME/td-photo` when that variable is absolute
   (`~/.cache/td-photo` otherwise), holding `thumbs/` and nothing else in version
   1. The base directory is the user's and may be a symlink; `td-photo` and
@@ -1154,7 +1165,10 @@ window alike (the resampler's middle pass and the orient hold transient
 `td-photo export` develops from level 0 at full resolution, one band of
 output rows at a time, straight into the JPEG encoder, so the frame is
 never held as RGB: level 0 (the decoded CFA frame, 87 MiB on a Z 8) plus
-one band is the peak. `develop::export_geometry` plans it: the user crop's
+one band is the peak (an AVIF adds a few copies of its coded stream at
+the end, the tiles, the frame OBU and the file, since the container
+names the stream's length). `develop::export_geometry` plans
+it: the user crop's
 fractions of the oriented frame are mapped back through the inverse of the
 orientation to a `Region` of the sensor crop by the mapping `level2`
 applies to level 1 (the same rounding at twice the scale, so the export
@@ -1178,7 +1192,9 @@ it, since an export is never enlarged), and `image::Shrink` is the area
 resample fed the same source bands of `EXPORT_BAND_ROWS` rows, giving
 back the output rows each band completes for the encoder, so the peak
 stays level 0, one source band and the rows in progress whatever the
-ratio (a source row lies in at most two output rows). Each output pixel
+ratio (a source row lies in at most two output rows; `main::Output` is
+the encoder the settings' format picks, fed and drained the same way,
+the export named `STEM.jpg` or `STEM.avif` by it). Each output pixel
 is the mean of the source box it covers, a source pixel on the box's
 edge weighted by the part of it inside, in whole arithmetic (`span`: the
 shares of an output pixel over the source pixels it covers, in units of
@@ -1276,6 +1292,30 @@ deltas, a better distortion measure, straight-line transforms and
 per-tile scratch buffers in place of the per-trial allocations are the
 performance and fidelity follow-ups; a 24-megapixel export takes tens
 of seconds on one thread and a few on eight.
+
+The AVIF (`avif::file`) is the least HEIF file the format asks for and
+every reader expects: `ftyp` with the `avif` brand and `mif1`, `miaf`
+and, to level 5.1, the AVIF Baseline profile `MA1B` compatible (the
+Advanced profile names the high profile, which the stream is not, so
+past Baseline no profile is claimed); `meta`
+(version 0) holding `hdlr` `pict`, `pitm`
+naming item 1, `iloc` (version 0, four-byte offset and length, no base
+offset) with the item's one extent at its absolute offset in the file,
+`iinf` with one `infe` (version 2) of type `av01`, and `iprp` whose
+`ipco` carries `ispe` (the frame's size), `pixi` (three channels of
+eight bits), `av1C` (`av1::av1c`: the profile and level the sequence
+header claims, 8-bit 4:2:0, no configuration OBUs since the item's data
+carries the sequence header) and `colr` `nclx` (the colour `av1`
+declares, full range), associated to the item by `ipma` with `av1C`
+essential; then `mdat` holding the sequence header and frame OBUs, no
+temporal delimiter. The meta box's length is the same whatever the
+offset, so it is written twice, the second time with the offset the
+layout gives; sizes and offsets are four bytes, which a frame of at most
+`MAX_AXIS` square keeps under. The unit tests hold every box to its
+bytes, the profile brand to the level and the extent to the data;
+`tests/av1.rs` reads the extent back and decodes it with
+dav1d; ffmpeg 6.1's demuxer read the samples' size, range and colour as
+written and its libdav1d and libaom decoders agreed on them out of band.
 
 ## Looks
 
@@ -1798,25 +1838,31 @@ to a stream whose reconstruction is the encoder's own and, with
 exactly; three streams held to the hashes recorded under that decode,
 the same bytes on one thread and three; the stream's sequence header
 and the frame header's opening field by field, the quality buying luma
-PSNR and costing bytes; and the rows refused by name. The transforms' unit
+PSNR and costing bytes; the rows refused by name; and the container's
+extent read back as the stream and decoded. The transforms' unit
 tests hold every kernel to the real transform it approximates and to
 orthogonality, the scans to their anti-diagonals, the quantiser tables to
 their ends; the coder's unit tests round-trip symbols and bits through a
 transcription of the spec's decoder, pin the adaptation, the bit writer,
 `leb128` and the OBU framing, the trailing-bit rule (spec 8.2.4, which
 libaom's decoder enforces), the end-of-block classes and the predictors
-by value.
+by value; `avif`'s hold every box to its bytes.
 
-`tests/nef.rs`'s third command case runs `export` with `--long-edge` and
-`--quality` over a temporary roll (the export shrunk with its ratio kept,
-an edge past the source and `full` the source's own size, a lower quality
-fewer bytes at the same size and the shrunk frame's mean the full one's
-within the codings' error, each bad setting refused by name before
-anything is written) and `export-picks` (no pick a count of none, the
-picks in name order with the rejects and the unflagged left out, a line
-each and the count, a pick that fails keeping the others coming and
-failing the run after the rest, a bad setting, no ROLL and a file for
-ROLL refused first), and a taller frame shrunk over several source bands
+`tests/nef.rs`'s third command case runs `export` with `--long-edge`,
+`--quality` and `--format` over a temporary roll (the export shrunk with
+its ratio kept, an edge past the source and `full` the source's own size,
+a lower quality fewer bytes at the same size and the shrunk frame's mean
+the full one's within the codings' error, an AVIF named by its format
+with the shrunk size in its `ispe` and, with `TD_TEST_DAV1D` alone, its
+luma the JPEG export's within the codings' error (the gate holds the
+streams by hash in `tests/av1.rs`), a lower quality fewer bytes, each
+bad setting refused by name before anything is written) and
+`export-picks` (no pick a count of none, the picks in name order with
+the rejects and the unflagged left out, a line each and the count, the
+picks' AVIFs named by the format, a pick that fails keeping the others
+coming and failing the run after the rest, a bad setting, no ROLL and a
+file for ROLL refused first), and a taller frame shrunk over several
+source bands
 decoding to the shrink of the full-size export within the codings'
 error. `tests/nef.rs`'s second command case runs `export`
 over a temporary roll:
@@ -2038,7 +2084,8 @@ and one failed and the export shrunk to the long edge in force, from the
 view and from the grid by `C-e`; the next session reading the file back and
 the empty configuration every other replay session runs under not, a
 refused file leaving the defaults with the reason on stderr and the next
-change replacing it, a folder at its name refused by name with the session
+change replacing it, a format the file holds kept through a change to
+another key, a folder at its name refused by name with the session
 starting, and a change refused when the file cannot be written, the model
 as it was), and `open`
 refusing a bad socket path, a second roll or a stray flag before it looks for a
@@ -2220,10 +2267,10 @@ preflight. A td-photo, td-ui or td-compositor edit selects this check in
    export runner, `export-picks` (`C-e`, the button, the `ExportPicks`
    effect, the batch note) and `td-photo export-picks ROLL`. Landed.
    (g) AVIF, in landings: the AV1 still-picture encoder in pure `std`
-   (`transform`, `cdf`, `av1`), held to dav1d. Landed. Then the HEIF
+   (`transform`, `cdf`, `av1`), held to dav1d. Landed. The HEIF
    container (`avif`), the export settings' `format` and `--format` on
-   the export verbs, and the view's format buttons. Planned; the
-   settings file refuses a `format` key until then.
+   the export verbs. Landed. Then the view's format row, its buttons
+   and the `format` action. Planned.
 7. Packaging: the cargo recipe staging td-ui, the image entry, and the
    recipe check that develops the synthetic frame in the built artifact.
    Landed.
