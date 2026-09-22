@@ -88,6 +88,84 @@ remains unchanged. This is a refusal test, not a scratch-size estimator.
 This command does not activate the service or provide the review/consent
 sequence.
 
+## Immutable review data
+
+The `td-install` Rust library exports `installation_plan::{Plan,
+Destination, DestinationObservation, Settings}`. It is a pure data
+prerequisite for the service and UI, with no CLI, device access,
+filesystem access, entropy generation, transport or installation
+execution. The Cargo library target is host/preflight-only today. A
+target consumer must declare this shared source in its recipe and its
+own confinement roster before compiling it through `#[path]`. The
+current target formatter remains its existing standalone binary. A
+decoded plan conveys no authority.
+
+A plan owns a nonzero 32-byte proposal nonce, the complete destination
+observations, a 32-byte deployment manifest digest, a version-4 volume
+UUID, and username, hostname, keyboard and timezone choices. Its
+destination contains the kernel name, major/minor, disk sequence,
+capacity, logical sector size, removable flag and optional model, serial
+and WWID. All retained fields are private and accessible only through
+shared references or copied scalar values. Equality compares every
+field, including optional labels and nonce. A clone is the same
+proposal, never a fresh consent or retry. The v1 record describes whole-
+disk erasure, unencrypted storage and automatic login; these policies
+are not caller-selectable flags.
+
+The public `DestinationObservation` names each unvalidated input field;
+`Destination::new` validates and copies it. Construction and decoding
+admit the wire representation only. Destination names have 1..=64 ASCII
+letters, digits, underscores or hyphens; major and disk sequence are
+nonzero. Capacity is nonzero and aligned to the admitted 512- or
+4096-byte logical sector. Labels retain up to 256 UTF-8 bytes exactly,
+matching discovery's representation. Missing, present-empty, and
+nonempty labels are distinct; no trimming or normalization occurs here.
+They are untrusted display data: a future renderer must escape control
+characters and handle directionality without letting a label impersonate
+trusted prompt text. Choices are nonempty printable ASCII without
+spaces, bounded to 32, 63, 64 and 64 bytes respectively. These bounds do
+not establish account name grammar, hostname policy, keyboard support or
+timezone membership. Account, hostname and timezone checks remain
+mandatory before review; keyboard catalog admission must be implemented
+before that choice is used. Wire admission deliberately does not claim a
+disk fits a deployment or is an eligible whole disk. Device labels are
+observations, not authentication.
+
+`Plan::encode` produces one canonical binary record. `Plan::decode`
+rejects inputs over 2048 bytes before parsing, unknown versions,
+truncation, invalid lengths, invalid flags, invalid field
+representations and trailing bytes. The complete framing is checked
+before allocating field strings. No native-endian numbers, JSON numeric
+rounding or path resolution enters the codec. The field order is:
+
+- Eight bytes `TDPLAN01`, nonce (32), deployment digest (32), UUID (16).
+- Big-endian major/minor (u32 each), sequence/capacity (u64 each), sector
+  size (u32), and removable (one byte, exactly zero or one).
+- Kernel name, then model, serial and WWID. Each optional label starts with
+  a zero/one presence byte; only a present label has a string payload.
+- Username, hostname, keyboard and timezone, in that order.
+
+Every string has a big-endian u16 byte count followed by exactly its
+bytes (UTF-8 for labels, ASCII for names and choices). The current
+maximal admitted record is 1191 bytes. UUID bytes are in textual/network
+order, with version 4 and the RFC variant bits checked; any 32-byte
+deployment digest is representable, including all zeroes. A digest is a
+full-width hash value, not a reserved nonce sentinel; only source
+authentication can establish that it names the intended manifest. The
+codec does not prove a nonce is fresh or a UUID globally unique. The
+authority generates them.
+
+Before a future service presents this value, it must authenticate and
+retain its source, validate all choices against that source, establish
+destination eligibility and layout/payload/scratch fit, and retain the
+exact proposed value. Execution must require fresh trusted consent bound
+to that whole value and revalidate the selected disk under a retained
+exclusive claim. Neither matching plan bytes nor possession of the nonce
+grants consent. No public request, reconnect or service restart may
+silently retry erasure. This increment does not connect the value to the
+existing update-only consent operation or activate a whole-disk service
+or wizard action.
+
 ## Choosing the volume identity
 
 `td-install new-volume-uuid` takes no operands and prints one canonical
