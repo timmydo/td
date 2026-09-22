@@ -438,7 +438,7 @@ enum Made {
 /// What a worker finished: a thumbnail for a key (`None` when it could not
 /// be made, said on stderr, which leaves the box its placeholder), the
 /// developed preview for a request, carrying what it made, or an export,
-/// carrying the JPEG's path and the frame it decoded (for the raw cache)
+/// carrying the file's path and the frame it decoded (for the raw cache)
 /// or why it failed (said on stderr).
 enum Done {
     Thumb {

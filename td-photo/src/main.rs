@@ -2825,7 +2825,7 @@ fn photo(name: String, loaded: Loaded) -> Photo {
     }
 }
 
-/// The status row's note for a finished export: the JPEG's name.
+/// The status row's note for a finished export: the file's name.
 pub(crate) fn export_note(out: &Path) -> String {
     format!(
         "exported {}",

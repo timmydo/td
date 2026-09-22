@@ -50,6 +50,7 @@ const STEP: usize = 17;
 const ZOOM: usize = 18;
 const QUALITY: usize = 19;
 const EDGE: usize = 20;
+const FORMAT: usize = 21;
 
 fn surface(width: usize, height: usize) -> Surface {
     Surface::new(width, height, Scale::new(1).unwrap()).unwrap()
@@ -160,6 +161,7 @@ fn the_action_table_is_closed_aligned_and_reachable() {
                         "exposure",
                         "quality",
                         "long-edge",
+                        "format",
                     ]
                     .contains(&binding.name),
                     "{} has no key",
@@ -214,7 +216,7 @@ fn a_session_walks_the_grid_and_reports_its_state() {
     assert_eq!((layout.columns, layout.rows), (4, 3));
     assert_eq!(
         c.state(),
-        "cull\t-\t0\t0\t-\tall\tgrid\t-\t-\t-\t-\t-\t-\t0\t0\t-\t0\t-\tfit\t92\tfull"
+        "cull\t-\t0\t0\t-\tall\tgrid\t-\t-\t-\t-\t-\t-\t0\t0\t-\t0\t-\tfit\t92\tfull\tjpeg"
     );
     for name in ["next", "pick", "view", "first"] {
         assert_eq!(
@@ -1335,10 +1337,11 @@ fn the_binary_replays_the_cull_over_a_roll_and_writes_through_the_sidecar() {
             "-",
             "fit",
             "92",
-            "full"
+            "full",
+            "jpeg"
         ]
     );
-    assert_eq!(&reply(2)[..2], ["ok", "57"]);
+    assert_eq!(&reply(2)[..2], ["ok", "58"]);
     assert_eq!(reply(3), ["ok", "changed"]);
     assert_eq!(reply(4), ["ok", &name(1), "pick", "-", "-", "-", "ok", "-"]);
     assert_eq!(
@@ -4326,10 +4329,10 @@ fn the_binary_keeps_the_export_settings_and_exports_the_picks_over_the_replay() 
         request(9, &["text"]),
         request(10, &["action", "export-picks"]),
     ]);
-    assert_eq!(&a[0][21..], ["92", "full"]);
+    assert_eq!(&a[0][21..], ["92", "full", "jpeg"]);
     assert_eq!(&a[1][1..], ["ok", "changed"]);
     assert_eq!(&a[2][1..], ["ok", "changed"]);
-    assert_eq!(&a[3][21..], ["80", "32"]);
+    assert_eq!(&a[3][21..], ["80", "32", "jpeg"]);
     assert_eq!(
         fs::read_to_string(&file).unwrap(),
         "td-photo export 1\nformat jpeg\nquality 80\nlong-edge 32\n"
@@ -4402,15 +4405,19 @@ fn the_binary_keeps_the_export_settings_and_exports_the_picks_over_the_replay() 
         (ok, replies, err)
     };
     assert!(ok, "{err}");
-    assert_eq!(&replies[0][21..], ["92", "full"], "the empty configuration");
-    assert_eq!(&replies_env[0][21..], ["80", "32"]);
+    assert_eq!(
+        &replies[0][21..],
+        ["92", "full", "jpeg"],
+        "the empty configuration"
+    );
+    assert_eq!(&replies_env[0][21..], ["80", "32", "jpeg"]);
     fs::write(&file, "td-photo export 1\nquality 80\nsharpen 3\n").unwrap();
     let mut session = Replay::start_with_env(&["--size", "1100x400", roll_s], &env);
     let replies = session.send(&[
         request(1, &["state"]),
         request(2, &["action", "quality", "10"]),
     ]);
-    assert_eq!(&replies[0][21..], ["92", "full"]);
+    assert_eq!(&replies[0][21..], ["92", "full", "jpeg"]);
     assert_eq!(&replies[1][1..], ["ok", "changed"]);
     let (ok, _, err) = session.finish();
     assert!(ok, "{err}");
@@ -4419,16 +4426,37 @@ fn the_binary_keeps_the_export_settings_and_exports_the_picks_over_the_replay() 
         fs::read_to_string(&file).unwrap(),
         "td-photo export 1\nformat jpeg\nquality 10\nlong-edge full\n"
     );
-    // A format the file holds is kept through a change to another key.
+    // A format the file holds is reported and kept through a change to
+    // another key; the `format` action sets it, writing the file.
     fs::write(&file, "td-photo export 1\nformat avif\n").unwrap();
     let mut session = Replay::start_with_env(&["--size", "1100x400", roll_s], &env);
-    let replies = session.send(&[request(1, &["action", "quality", "10"])]);
+    let replies = session.send(&[
+        request(1, &["state"]),
+        request(2, &["action", "quality", "10"]),
+        request(3, &["action", "format", "avif"]),
+        request(4, &["action", "format", "png"]),
+        request(5, &["state"]),
+    ]);
+    assert_eq!(&replies[0][21..], ["92", "full", "avif"]);
+    assert_eq!(&replies[1][1..], ["ok", "changed"]);
+    assert_eq!(&replies[2][1..], ["ok", "ignored"]);
+    assert_eq!(&replies[3][1..3], ["error", "bad-argument"]);
+    assert_eq!(&replies[4][21..], ["10", "full", "avif"]);
+    assert_eq!(
+        fs::read_to_string(&file).unwrap(),
+        "td-photo export 1\nformat avif\nquality 10\nlong-edge full\n"
+    );
+    let replies = session.send(&[
+        request(6, &["action", "format", "jpeg"]),
+        request(7, &["state"]),
+    ]);
     assert_eq!(&replies[0][1..], ["ok", "changed"]);
+    assert_eq!(&replies[1][21..], ["10", "full", "jpeg"]);
     let (ok, _, err) = session.finish();
     assert!(ok, "{err}");
     assert_eq!(
         fs::read_to_string(&file).unwrap(),
-        "td-photo export 1\nformat avif\nquality 10\nlong-edge full\n"
+        "td-photo export 1\nformat jpeg\nquality 10\nlong-edge full\n"
     );
     // A folder (or a fifo, a link) at the file's name is refused by name
     // before any open, so the session starts, at the defaults; and the
@@ -4441,9 +4469,9 @@ fn the_binary_keeps_the_export_settings_and_exports_the_picks_over_the_replay() 
         request(2, &["action", "quality", "10"]),
         request(3, &["state"]),
     ]);
-    assert_eq!(&replies[0][21..], ["92", "full"]);
+    assert_eq!(&replies[0][21..], ["92", "full", "jpeg"]);
     assert_eq!(replies[1][1..3], ["error", "refused"]);
-    assert_eq!(&replies[2][21..], ["92", "full"]);
+    assert_eq!(&replies[2][21..], ["92", "full", "jpeg"]);
     let (ok, _, err) = session.finish();
     assert!(ok, "{err}");
     assert_eq!(err.matches("not a regular file").count(), 2, "{err}");
@@ -7586,7 +7614,7 @@ fn the_export_view_is_a_mode_of_the_roll_with_the_strip_naming_it() {
     assert_eq!(press(&mut c, 400, 12), Outcome::Ignored);
     c.open("roll", b"/r", photos(5)).unwrap();
     assert_eq!(fields(&c)[MODE], "cull");
-    assert_eq!(&fields(&c)[QUALITY..=EDGE], ["92", "full"]);
+    assert_eq!(&fields(&c)[QUALITY..=FORMAT], ["92", "full", "jpeg"]);
     // `E` shows it: the mode word, the status row and the strip say so,
     // and the grid's boxes are withheld, the filters disabled and inert.
     assert_eq!(key(&mut c, "E"), Outcome::Changed);
@@ -7635,11 +7663,11 @@ fn the_export_view_is_a_mode_of_the_roll_with_the_strip_naming_it() {
         "Roll Selection   Culling   Single   Develop   Export"
     );
     assert!(
-        lines.contains(
-            &"Export the 1 picked of 5 into roll/exported/ as JPEG, never replacing a name"
-        ),
+        lines.contains(&"Export the 1 picked of 5 into roll/exported/, never replacing a name"),
         "{text}"
     );
+    assert!(lines.contains(&"Format jpeg"), "{text}");
+    assert!(lines.contains(&"JPEG   AVIF"), "{text}");
     assert!(lines.contains(&"Quality 92"), "{text}");
     assert!(lines.contains(&"Long edge full"), "{text}");
     assert!(lines.contains(&"Full   1024   2048   4096"), "{text}");
@@ -7745,6 +7773,27 @@ fn the_export_settings_are_set_through_effects_and_settled() {
             "{bad}"
         );
     }
+    for bad in ["jpg", "AVIF", "png", ""] {
+        assert_eq!(
+            c.action("format", &[bad]).unwrap_err(),
+            ui::Error::BadArgument,
+            "{bad}"
+        );
+    }
+    assert_eq!(act(&mut c, "format", &["jpeg"]), Outcome::Ignored);
+    let (outcome, effects) = c.action("format", &["avif"]).unwrap();
+    assert_eq!(outcome, Outcome::Changed);
+    assert_eq!(
+        effects,
+        [Effect::Settings(Settings {
+            format: Format::Avif,
+            quality: 80,
+            long_edge: None,
+        })]
+    );
+    assert_eq!(fields(&c)[FORMAT], "jpeg");
+    assert_eq!(carry(&mut c, "format", &["avif"]), Outcome::Changed);
+    assert_eq!(fields(&c)[FORMAT], "avif");
     assert_eq!(carry(&mut c, "long-edge", &["2048"]), Outcome::Changed);
     assert_eq!(&fields(&c)[QUALITY..=EDGE], ["80", "2048"]);
     assert_eq!(act(&mut c, "long-edge", &["2048"]), Outcome::Ignored);
@@ -7757,13 +7806,15 @@ fn the_export_settings_are_set_through_effects_and_settled() {
     assert_eq!(act(&mut c, "develop", &[]), Outcome::Changed);
     assert_eq!(carry(&mut c, "quality", &["1"]), Outcome::Changed);
     assert_eq!(&fields(&c)[QUALITY..=EDGE], ["1", "16384"]);
-    // The export view paints them: the long edge's caption names a size
-    // no button has, none selected.
+    // The export view paints them: the format's caption, the long edge's
+    // naming a size no button has, none selected.
     assert_eq!(act(&mut c, "export-mode", &[]), Outcome::Changed);
     let (_, _, text) = driven::text(&c.scene()).unwrap();
+    assert!(text.contains("Format avif\n"), "{text}");
     assert!(text.contains("Quality 1\n"), "{text}");
     assert!(text.contains("Long edge 16384"), "{text}");
     let panel = c.layout().export_panel();
+    assert!(panel.formats.iter().all(Option::is_some));
     assert!(panel.edges.iter().all(Option::is_some));
     assert!(panel.run.is_some());
     assert!(panel.slider.is_some());
@@ -7815,6 +7866,31 @@ fn the_export_view_buttons_and_slider_ask_what_they_say() {
         .1;
     assert_eq!(effects, [Effect::Settings(Settings::default())]);
     assert_eq!(apply(&mut c, &effects).unwrap(), Outcome::Changed);
+    // A format button sets that format as `format` does; the one in
+    // force is `Ignored`, and the selection follows the setting.
+    let (x, y) = centre(panel.formats[0]);
+    assert_eq!(press(&mut c, x, y), Outcome::Ignored);
+    let (x, y) = centre(panel.formats[1]);
+    let (outcome, effects) = c
+        .input(Input::Pointer {
+            phase: PointerPhase::Press,
+            x,
+            y,
+        })
+        .unwrap();
+    assert_eq!(outcome, Outcome::Changed);
+    assert_eq!(
+        effects,
+        [Effect::Settings(Settings {
+            format: Format::Avif,
+            ..Settings::default()
+        })]
+    );
+    assert_eq!(apply(&mut c, &effects).unwrap(), Outcome::Changed);
+    assert_eq!(fields(&c)[FORMAT], "avif");
+    assert_eq!(press(&mut c, x, y), Outcome::Ignored);
+    let (_, _, text) = driven::text(&c.scene()).unwrap();
+    assert!(text.contains("Format avif\n"), "{text}");
     // Export picks asks for the picks' export: the effect carries no
     // names, the files say which; the note the adapter sets shows on the
     // status row. With none picked the button is disabled and inert,
@@ -7870,19 +7946,33 @@ fn the_export_view_buttons_and_slider_ask_what_they_say() {
     let (x, _) = quality_knob(&c, 49);
     assert_eq!(drag_to(&mut c, x, 500), Outcome::Changed);
     assert_eq!(drag_to(&mut c, x, 500), Outcome::Ignored);
-    // A press on a long-edge button mid-drag is the drag's, not the
-    // button's.
-    let (bx, by) = centre(panel.edges[3]);
-    assert_eq!(press(&mut c, bx, by), Outcome::Changed);
+    // A press on a long-edge or format button mid-drag is the drag's,
+    // not the button's: the knob moves (a frame change, no effect) and
+    // the settings stay.
+    for button in [panel.edges[3], panel.formats[0]] {
+        let (bx, by) = centre(button);
+        let generation = fields(&c)[GENERATION].clone();
+        let (outcome, effects) = c
+            .input(Input::Pointer {
+                phase: PointerPhase::Press,
+                x: bx,
+                y: by,
+            })
+            .unwrap();
+        assert_eq!((outcome, effects), (Outcome::Changed, Vec::new()));
+        assert_ne!(fields(&c)[GENERATION], generation);
+        assert_eq!(&fields(&c)[EDGE..=FORMAT], ["full", "avif"]);
+    }
     let (x, _) = quality_knob(&c, 49);
     assert_eq!(drag_to(&mut c, x, 500), Outcome::Changed);
     let before = fields(&c)[GENERATION].clone();
     let (outcome, effects) = release(&mut c, x, 500);
     assert_eq!(outcome, Outcome::Changed);
+    // The slider's effect carries the format set above with it.
     assert_eq!(
         effects,
         [Effect::Settings(Settings {
-            format: Format::Jpeg,
+            format: Format::Avif,
             quality: 50,
             long_edge: None,
         })]
@@ -7942,11 +8032,13 @@ fn the_export_view_buttons_and_slider_ask_what_they_say() {
     .unwrap();
     let panel = c.layout().export_panel();
     assert!(panel.slider.is_none() && panel.run.is_none());
+    assert!(panel.formats.iter().all(Option::is_none));
     assert!(panel.edges.iter().all(Option::is_none));
-    assert!(panel.summary.is_some() && panel.quality.is_none() && panel.edge.is_none());
+    assert!(panel.summary.is_some() && panel.format.is_none());
+    assert!(panel.quality.is_none() && panel.edge.is_none());
     let (_, _, text) = driven::text(&c.scene()).unwrap();
     assert!(
-        text.contains("Export the") && !text.contains("Quality"),
+        text.contains("Export the") && !text.contains("Format") && !text.contains("Quality"),
         "{text}"
     );
     assert_eq!(press(&mut c, x, y), Outcome::Ignored);

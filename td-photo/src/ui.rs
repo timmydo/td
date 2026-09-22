@@ -23,7 +23,7 @@ use td_ui::CELL_WIDTH;
 use crate::develop::{self, CENTRE_UNIT, ZOOM_STEPS};
 use crate::image::Rgb8;
 use crate::library::{self, Crop, Filter, Flag, Key, Sidecar, Step};
-use crate::settings::{self, Settings};
+use crate::settings::{self, Format, Settings};
 
 /// The surface a session starts on until it is resized.
 pub const DEFAULT_WIDTH: usize = 800;
@@ -296,6 +296,7 @@ pub enum Action {
     Export,
     ExportMode,
     ExportPicks,
+    Format,
     Quality,
     LongEdge,
     DeleteRejected,
@@ -304,7 +305,7 @@ pub enum Action {
 }
 
 impl Action {
-    pub const ALL: [Action; 57] = [
+    pub const ALL: [Action; 58] = [
         Action::Open,
         Action::Choose,
         Action::Next,
@@ -357,6 +358,7 @@ impl Action {
         Action::Export,
         Action::ExportMode,
         Action::ExportPicks,
+        Action::Format,
         Action::Quality,
         Action::LongEdge,
         Action::DeleteRejected,
@@ -420,6 +422,7 @@ impl Action {
             Self::Export => "export",
             Self::ExportMode => "export-mode",
             Self::ExportPicks => "export-picks",
+            Self::Format => "format",
             Self::Quality => "quality",
             Self::LongEdge => "long-edge",
             Self::DeleteRejected => "delete-rejected",
@@ -447,7 +450,7 @@ impl Action {
 /// binds, the argument shape and the help line. Actions without a chord
 /// take an argument or are the agent's (`open`); the pointer reaches
 /// `select` by pressing a cell and `scroll` by the wheel.
-pub const BINDINGS: [Binding; 57] = [
+pub const BINDINGS: [Binding; 58] = [
     Binding {
         name: "open",
         chord: None,
@@ -761,10 +764,16 @@ pub const BINDINGS: [Binding; 57] = [
         help: "Export every pick of the roll into exported/, each with its sidecar's edits, with the export settings.",
     },
     Binding {
+        name: "format",
+        chord: None,
+        arguments: "jpeg|avif",
+        help: "Write every export as a JPEG or an AVIF; the export view's format buttons set one.",
+    },
+    Binding {
         name: "quality",
         chord: None,
         arguments: "N",
-        help: "Set the export JPEG quality to N, 1 to 100; the export view's slider commits one on release.",
+        help: "Set the export quality to N, 1 to 100 (the JPEG tables' scale or the AV1 step); the export view's slider commits one on release.",
     },
     Binding {
         name: "long-edge",
@@ -809,6 +818,8 @@ const FILTER_NAMES: [&str; 4] = [FILTERS[0].1, FILTERS[1].1, FILTERS[2].1, FILTE
 const MODES: [&str; 5] = ["Roll Selection", "Culling", "Single", "Develop", "Export"];
 const MODE_ACTIONS: [&str; 5] = ["choose", "grid", "view", "develop", "export-mode"];
 
+/// The export view's format buttons: `Format::ALL` in order, by name.
+const FORMAT_LABELS: [&str; Format::ALL.len()] = ["JPEG", "AVIF"];
 /// The quality slider's steps: a step a quality, 1 to 100.
 pub const QUALITY_STEPS: usize = 99;
 /// The export view's long-edge buttons: the source's own size, then the
@@ -990,12 +1001,15 @@ pub struct Tools {
 }
 
 /// The export view's controls down the area: the text rows (the picks'
-/// count, the quality, the long edge's caption), the quality slider, the
+/// count, the format's, the quality, the long edge's caption), the
+/// format buttons (`Format::ALL` in order), the quality slider, the
 /// long-edge buttons (`LONG_EDGES` in order) and the `EXPORT_PICKS`
 /// button, each control `None` where the area cannot hold it whole.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ExportPanel {
     pub summary: Option<Rect>,
+    pub format: Option<Rect>,
+    pub formats: [Option<Button>; Format::ALL.len()],
     pub quality: Option<Rect>,
     pub slider: Option<Slider>,
     pub edge: Option<Rect>,
@@ -1412,12 +1426,13 @@ impl Layout {
 
     /// The export view's controls (`ExportPanel`) down the area from its
     /// top, a cell in from each side: a text row for the picks' count, a
-    /// blank one, one for the quality, the slider a band tall across the
-    /// width (when its travel gives every step its own column, td-ui's
-    /// `travel` contract, else `None`), a text row for the long edge's
-    /// caption, the long-edge strip wrapping on the width, then the
-    /// `EXPORT_PICKS` strip; a row or control cut by the area's foot is
-    /// `None`.
+    /// blank one, one for the format's caption, the format strip wrapping
+    /// on the width, a row for the quality, the slider a band tall across
+    /// the width (when its travel gives every step its own column,
+    /// td-ui's `travel` contract, else `None`), a text row for the long
+    /// edge's caption, the long-edge strip wrapping on the width, then
+    /// the `EXPORT_PICKS` strip; a row or control cut by the area's foot
+    /// is `None`.
     pub fn export_panel(&self) -> ExportPanel {
         let s = self.surface.scale.value();
         let pad = (CELL_PAD * s) as i64;
@@ -1439,6 +1454,14 @@ impl Layout {
         let summary = text_row(y);
         // A blank row parts the summary from the settings.
         y += 2 * row;
+        let format = text_row(y);
+        y += row;
+        let strip = Buttons::in_band(self.surface, x, y, width, &FORMAT_LABELS);
+        let mut formats = [None; Format::ALL.len()];
+        for (slot, button) in formats.iter_mut().zip(strip.buttons()) {
+            *slot = button.filter(|b| within(area, b.rect()));
+        }
+        y += (strip.rows() as i64) * band;
         let quality = text_row(y);
         y += row;
         let slider = Slider::new(
@@ -1466,6 +1489,8 @@ impl Layout {
             .filter(|b| within(area, b.rect()));
         ExportPanel {
             summary,
+            format,
+            formats,
             quality,
             slider,
             edge,
@@ -3297,13 +3322,15 @@ impl Controller {
         }
     }
 
-    /// The tab-separated facts: the mode (`cull` or `develop`), the roll's
-    /// path in hex, how many photos and how many shown, the cursor's
-    /// position among the shown, the filter, the cull view (`grid` or
-    /// `single`, where develop mode returns), then the photo under the
-    /// cursor (its name in hex, flag, exposure, crop, look, sidecar state),
-    /// the outstanding job count, the generation and the chooser's listed
-    /// folder in hex. Absent values are `-`.
+    /// The tab-separated facts: the mode (`cull`, `develop` or `export`),
+    /// the roll's path in hex, how many photos and how many shown, the
+    /// cursor's position among the shown, the filter, the cull view
+    /// (`grid` or `single`, where develop mode returns), then the photo
+    /// under the cursor (its name in hex, flag, exposure, crop, look,
+    /// sidecar state), the outstanding job count, the generation, the
+    /// chooser's listed folder in hex, the history's step count and the
+    /// selected step, the zoom, then the export quality, long edge and
+    /// format. Absent values are `-`.
     pub fn state(&self) -> String {
         let position = self.position();
         let photo = self.cursor.and_then(|index| self.photos.get(index));
@@ -3332,6 +3359,7 @@ impl Controller {
             zoom_word(self.zoom()),
             self.settings.quality.to_string(),
             settings::long_edge_text(self.settings.long_edge),
+            self.settings.format.name().to_string(),
         ]
         .join("\t")
     }
@@ -3502,6 +3530,7 @@ impl Controller {
             (Action::Export, []) => return self.export(effects),
             (Action::ExportMode, []) => self.enter_export()?,
             (Action::ExportPicks, []) => return self.export_picks(effects),
+            (Action::Format, [format]) => return self.set_format(format, effects),
             (Action::Quality, [quality]) => return self.set_quality(quality, effects),
             (Action::LongEdge, [edge]) => return self.set_long_edge(edge, effects),
             (Action::DeleteRejected, []) => return self.delete_rejected(effects),
@@ -3600,9 +3629,9 @@ impl Controller {
             return self.crop_pointer(phase, x, y);
         }
         // The export view: the slider's drag owns the pointer once
-        // pressed; a press on a long-edge button or Export picks asks
-        // what it says; the rest of the area, the filter strip and a
-        // move or release are inert.
+        // pressed; a press on a format or long-edge button or Export
+        // picks asks what it says; the rest of the area, the filter
+        // strip and a move or release are inert.
         if self.mode == Mode::Export {
             return self.export_pointer(phase, x, y);
         }
@@ -3643,8 +3672,9 @@ impl Controller {
     /// change; its release commits the step it rests on as the `quality`
     /// action would, or nothing when that is the setting's own step (then
     /// a frame change only if the drag had moved the knob). A press on a
-    /// long-edge button sets that edge as `long-edge` would (`Ignored` on
-    /// the one in force), on Export picks asks for the picks' export
+    /// format button sets that format as `format` would and on a
+    /// long-edge button that edge as `long-edge` would (`Ignored` on the
+    /// one in force), on Export picks asks for the picks' export
     /// (`Ignored` with none picked); anything else is `Ignored`.
     fn export_pointer(
         &mut self,
@@ -3696,6 +3726,16 @@ impl Controller {
             || Status::new(self.surface).rect().contains(x, y)
         {
             return Ok((Outcome::Ignored, Vec::new()));
+        }
+        if let Some(which) = panel
+            .formats
+            .iter()
+            .position(|button| button.is_some_and(|button| button.hit(x, y)))
+        {
+            let Some(format) = Format::ALL.get(which) else {
+                return Ok((Outcome::Ignored, Vec::new()));
+            };
+            return self.set_format(format.name(), Vec::new());
         }
         if let Some(slider) = panel.slider.filter(|slider| slider.hit(x, y)) {
             let at = slider.value_at(x, QUALITY_STEPS);
@@ -4891,6 +4931,24 @@ impl Controller {
         Ok((Outcome::Changed, effects))
     }
 
+    /// Asks for the export format `text` names (`jpeg` or `avif`, else
+    /// `bad-argument`), as `set_quality` asks for the quality.
+    fn set_format(
+        &mut self,
+        text: &str,
+        mut effects: Vec<Effect>,
+    ) -> Result<(Outcome, Vec<Effect>), Error> {
+        let format = settings::parse_format(text).ok_or(Error::BadArgument)?;
+        if format == self.settings.format {
+            return Ok((Outcome::Ignored, effects));
+        }
+        effects.push(Effect::Settings(Settings {
+            format,
+            ..self.settings
+        }));
+        Ok((Outcome::Changed, effects))
+    }
+
     /// Asks for the export long edge `text` spells (`full`, or 1 to
     /// `settings::MAX_LONG_EDGE`, else `bad-argument`), as `set_quality`
     /// asks for the quality.
@@ -5365,6 +5423,7 @@ impl Scene<'_> {
     }
 
     /// The export view over the area: the picks' count and where they go,
+    /// the format's caption and its buttons with the setting's selected,
     /// the quality and its slider at the setting or under the drag, the
     /// long edge's caption and its buttons with the setting's selected
     /// (none when the `long-edge` action set a size that is no button's),
@@ -5393,13 +5452,29 @@ impl Scene<'_> {
         text(
             panel.summary,
             format!(
-                "Export the {picks} picked of {} into {}/{}/ as JPEG, never replacing a name",
+                "Export the {picks} picked of {} into {}/{}/, never replacing a name",
                 model.photos.len(),
                 roll.label,
                 library::EXPORTED
             ),
             sink,
         );
+        text(
+            panel.format,
+            format!("Format {}", model.settings.format.name()),
+            sink,
+        );
+        for ((button, label), format) in panel
+            .formats
+            .into_iter()
+            .zip(FORMAT_LABELS)
+            .zip(Format::ALL)
+        {
+            if let Some(button) = button {
+                let selected = format == model.settings.format;
+                button.emit_hinted(label, None, selected, true, damage, sink);
+            }
+        }
         text(
             panel.quality,
             format!("Quality {}", model.quality_value() + 1),
