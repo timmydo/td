@@ -26,10 +26,11 @@ use td_ui::raster::{Composition, Scale, Surface};
 
 use td_photo::color::{camera_color, CameraColor, Transfer};
 use td_photo::develop::{self, Params, MAX_THREADS};
-use td_photo::image::{read_ppm, write_ppm, Rgb8};
+use td_photo::image::{self, read_ppm, write_ppm, Rgb8};
 use td_photo::library::{self, Filter, Flag, Key, Sidecar};
 use td_photo::look::{self, Look};
 use td_photo::nef::{self, Nef};
+use td_photo::settings::{self, Settings};
 use td_photo::ui::{self, Effect, Photo};
 use td_photo::{camera, jpeg, tiff};
 
@@ -50,13 +51,22 @@ const HELP: &str = concat!(
     "  the whole frame), written through a fresh\n",
     "  OUT.ppm.tmp and linked into place. OUT.ppm must not exist: td-photo\n",
     "  never overwrites a file.\n",
-    "td-photo export FILE\n",
+    "td-photo export FILE [--quality N] [--long-edge N|full]\n",
     "  Renders FILE's raw at full resolution (a bilinear demosaic, in row\n",
-    "  bands) with its sidecar's exposure, crop and look, and writes it as\n",
-    "  a JPEG (quality 92, 4:4:4) into exported/ beside FILE: STEM.jpg, or\n",
-    "  STEM-2.jpg, STEM-3.jpg ... when that name is taken, through a fresh\n",
-    "  STEM.jpg.tmp linked into place. Never overwrites, and a sidecar the\n",
-    "  reader refuses refuses the export rather than dropping its edits.\n",
+    "  bands) with its sidecar's exposure, crop and look, shrinks it to N\n",
+    "  pixels on the long side when --long-edge asks (default full, never\n",
+    "  enlarged), and writes it as a JPEG (--quality 1 to 100, default 92;\n",
+    "  4:4:4) into exported/ beside FILE: STEM.jpg, or STEM-2.jpg,\n",
+    "  STEM-3.jpg ... when that name is taken, through a fresh STEM.jpg.tmp\n",
+    "  linked into place. Never overwrites, and a sidecar the reader\n",
+    "  refuses refuses the export rather than dropping its edits.\n",
+    "td-photo export-picks ROLL [--quality N] [--long-edge N|full]\n",
+    "  Exports every pick in ROLL (flag pick in its sidecar) as export\n",
+    "  does, in name order, one line each: exported NAME -> OUT, or failed\n",
+    "  NAME: why; the run fails after the rest when any failed. The window's\n",
+    "  Export view does the same with the settings it keeps in\n",
+    "  $XDG_CONFIG_HOME/td-photo/export (~/.config/td-photo/export when\n",
+    "  that is not absolute); the verbs take theirs on the command line.\n",
     "td-photo thumb FILE OUT.ppm [--long-edge N] [--cache]\n",
     "  Writes the thumbnail: the smallest embedded preview that covers N\n",
     "  pixels on the long side (default 400), decoded at the coarsest\n",
@@ -148,6 +158,8 @@ fn main() -> ExitCode {
         }
         [verb, file, rest @ ..] if verb == "export" => export(Path::new(file), rest),
         [verb] if verb == "export" => Err("export needs FILE; see --help".to_string()),
+        [verb, roll, rest @ ..] if verb == "export-picks" => export_picks(Path::new(roll), rest),
+        [verb] if verb == "export-picks" => Err("export-picks needs ROLL; see --help".to_string()),
         [verb, file, out, rest @ ..] if verb == "thumb" => {
             thumb_file(Path::new(file), Path::new(out), rest)
         }
@@ -926,15 +938,58 @@ const EXPORT_BAND_ROWS: usize = 64;
 const MAX_EXPORT_NAMES: u32 = 1000;
 
 /// One export as asked for: the original and its sidecar's exposure, crop
-/// and look as the file held them when the export was asked for, so the
-/// verb, the replay and the window's pool job develop the same thing. The
-/// look is a stem here and resolved where the export runs.
+/// and look as the file held them when the export was asked for, and the
+/// settings it is written with, so the verb, the replay and the window's
+/// pool job develop the same thing. The look is a stem here and resolved
+/// where the export runs.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ExportRequest {
     pub(crate) path: PathBuf,
     pub(crate) exposure: i32,
     pub(crate) crop: Option<library::Crop>,
     pub(crate) look: Option<String>,
+    pub(crate) settings: Settings,
+    /// One of the picks' batch, counted in the batch's note as it lands,
+    /// rather than an export of its own.
+    pub(crate) batch: bool,
+}
+
+/// The picks' export as it goes, for the status row's note: the roll it
+/// is of, how many were asked for, how many have landed (the refused
+/// counted at once) and how many of those failed. A batch of another
+/// roll is another batch: one still landing when a roll opens is counted
+/// on stderr, not into the next.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct Batch {
+    pub(crate) roll: PathBuf,
+    pub(crate) total: usize,
+    pub(crate) done: usize,
+    pub(crate) failed: usize,
+}
+
+impl Batch {
+    /// The status row's note for the batch: which pick is being written,
+    /// or once all have landed how many were exported and how many
+    /// failed.
+    pub(crate) fn note(&self) -> String {
+        if self.done < self.total {
+            return format!("exporting pick {} of {}", self.done + 1, self.total);
+        }
+        let mut note = format!(
+            "exported {} of {} picks",
+            self.total - self.failed.min(self.total),
+            self.total
+        );
+        if self.failed > 0 {
+            note.push_str(&format!(", {} failed", self.failed));
+        }
+        note
+    }
+
+    /// Whether every export asked for has landed.
+    pub(crate) fn finished(&self) -> bool {
+        self.done >= self.total
+    }
 }
 
 /// What an export made: the JPEG's path, the frame it decoded (for the
@@ -948,10 +1003,11 @@ pub(crate) struct Exported {
     pub(crate) height: usize,
 }
 
-/// The export `path` asks for, from its sidecar as the file holds it now. A
-/// sidecar the reader refuses refuses the export: developing with camera
-/// defaults would silently drop the edits the file holds.
-pub(crate) fn export_request(path: &Path) -> Result<ExportRequest, String> {
+/// The export `path` asks for, from its sidecar as the file holds it now,
+/// written with `settings`. A sidecar the reader refuses refuses the
+/// export: developing with camera defaults would silently drop the edits
+/// the file holds.
+pub(crate) fn export_request(path: &Path, settings: Settings) -> Result<ExportRequest, String> {
     original(path)?;
     let sidecar = read_sidecar(path)?;
     Ok(ExportRequest {
@@ -959,14 +1015,37 @@ pub(crate) fn export_request(path: &Path) -> Result<ExportRequest, String> {
         exposure: sidecar.exposure().unwrap_or(0),
         crop: sidecar.crop(),
         look: sidecar.look().map(str::to_string),
+        settings,
+        batch: false,
     })
+}
+
+/// The export settings `--quality N` and `--long-edge N|full` spell, each
+/// at its default when absent.
+fn export_settings(rest: &[OsString]) -> Result<Settings, String> {
+    let mut settings = Settings::default();
+    if let Some(text) = option(rest, "--quality")? {
+        settings.quality = settings::parse_quality(&text)
+            .ok_or_else(|| format!("--quality {text:?} is not 1..=100"))?;
+    }
+    if let Some(text) = option(rest, "--long-edge")? {
+        settings.long_edge = settings::parse_long_edge(&text).ok_or_else(|| {
+            format!(
+                "--long-edge {text:?} is not full or 1..={}",
+                settings::MAX_LONG_EDGE
+            )
+        })?;
+    }
+    Ok(settings)
 }
 
 /// Runs one export: the look resolved (a stem no look answers to refuses
 /// it before anything is decoded or written), the raw decoded unless
 /// `raw` supplies the frame, the frame developed a band of rows at a time
-/// (`develop::export_band`) straight into the encoder, so no whole-frame
-/// RGB buffer is held, and the stream written through a fresh
+/// (`develop::export_band`) straight into the encoder -- through
+/// `image::Shrink` when the settings' long edge is under the frame's,
+/// each source band giving back the output rows it completes -- so no
+/// whole-frame RGB buffer is held, and the stream written through a fresh
 /// `exported/STEM.jpg.tmp`, synced, then linked to the first free name --
 /// `STEM.jpg`, or `STEM-2.jpg` on from 2 when that is taken -- so a name
 /// that appears meanwhile is skipped rather than replaced. The folder is
@@ -1007,8 +1086,23 @@ pub(crate) fn export_file(
     let meta = frame.meta();
     let geometry = develop::export_geometry(&source, crop, meta.orientation)
         .map_err(|e| format!("{}: {e}", path.display()))?;
+    let (out_w, out_h) = match request.settings.long_edge {
+        Some(edge) => image::shrunk(geometry.width, geometry.height, edge as usize),
+        None => (geometry.width, geometry.height),
+    };
+    // Shrunk, each source band feeds the shrink and the output rows it
+    // completes go to the encoder, so the peak stays a source band and
+    // the rows in progress whatever the ratio.
+    let mut shrink = if (out_w, out_h) != (geometry.width, geometry.height) {
+        Some(
+            image::Shrink::new(geometry.width, geometry.height, out_w, out_h)
+                .ok_or("the export cannot be shrunk to that size")?,
+        )
+    } else {
+        None
+    };
     // The folder is made once there is something to put in it, so a raw
-    // that cannot be developed leaves the roll as it was.
+    // that cannot be developed or shrunk leaves the roll as it was.
     let dir = own_folder(&roll, library::EXPORTED)?;
     let temporary = dir.join(format!("{stem}.jpg.tmp"));
     let file = fs::OpenOptions::new()
@@ -1022,11 +1116,10 @@ pub(crate) fn export_file(
         threads,
         look: look.as_ref(),
     };
-    let write = |file: fs::File| -> Result<(), String> {
+    let mut write = |file: fs::File| -> Result<(), String> {
         let mut writer = BufWriter::new(file);
-        let mut encoder =
-            jpeg::Encoder::new(geometry.width, geometry.height, jpeg::QUALITY, threads)
-                .map_err(|e| e.to_string())?;
+        let mut encoder = jpeg::Encoder::new(out_w, out_h, request.settings.quality, threads)
+            .map_err(|e| e.to_string())?;
         let mut first = 0;
         while first < geometry.height {
             let band = develop::export_band(
@@ -1040,11 +1133,22 @@ pub(crate) fn export_file(
                 &params,
             )
             .map_err(|e| e.to_string())?;
-            encoder.encode_rows(&band.data).map_err(|e| e.to_string())?;
+            first += band.height;
+            let rows = match shrink.as_mut() {
+                Some(shrink) => match shrink.push(&band) {
+                    Some(Ok(rows)) => rows,
+                    Some(Err(())) => return Err("the shrink refused a band".to_string()),
+                    None => continue,
+                },
+                None => band,
+            };
+            encoder.encode_rows(&rows.data).map_err(|e| e.to_string())?;
             writer
                 .write_all(&encoder.take())
                 .map_err(|e| e.to_string())?;
-            first += band.height;
+        }
+        if shrink.as_ref().is_some_and(|shrink| shrink.done() != out_h) {
+            return Err("the shrink gave back too few rows".to_string());
         }
         let tail = encoder.finish().map_err(|e| e.to_string())?;
         writer.write_all(&tail).map_err(|e| e.to_string())?;
@@ -1091,8 +1195,8 @@ pub(crate) fn export_file(
         out,
         raw: decoded.map(|(frame, _)| frame),
         info,
-        width: geometry.width,
-        height: geometry.height,
+        width: out_w,
+        height: out_h,
     })
 }
 
@@ -1100,8 +1204,8 @@ pub(crate) fn export_file(
 /// through its sidecar and written as a JPEG into `exported/` beside it
 /// (`export_request` and `export_file`, which the window's pool runs too).
 fn export(path: &Path, rest: &[OsString]) -> Result<(), String> {
-    check_flags(rest, &[], &[])?;
-    let request = export_request(path)?;
+    check_flags(rest, &["--quality", "--long-edge"], &[])?;
+    let request = export_request(path, export_settings(rest)?)?;
     let started = Instant::now();
     let exported = export_file(&request, None, threads())?;
     writeln!(
@@ -1117,6 +1221,54 @@ fn export(path: &Path, rest: &[OsString]) -> Result<(), String> {
         started.elapsed().as_millis()
     )
     .map_err(|e| e.to_string())
+}
+
+/// The roll's picks, as their sidecars flag them now, in the roll's order:
+/// what `export-picks` and the window's Export view export.
+fn read_picks(roll: &Path) -> Result<Vec<String>, String> {
+    Ok(read_roll(roll)?
+        .into_iter()
+        .filter(|name| match load_sidecar(&roll.join(name)) {
+            Loaded::Sidecar(sidecar) => sidecar.flag() == Some(Flag::Pick),
+            Loaded::None | Loaded::Refused(_) => false,
+        })
+        .collect())
+}
+
+/// `td-photo export-picks ROLL`: every pick exported as `export` does, in
+/// order, each reported on its own line, and the run failing after the
+/// rest when any did: one that fails keeps the others coming, since each
+/// is its own file.
+fn export_picks(roll: &Path, rest: &[OsString]) -> Result<(), String> {
+    check_flags(rest, &["--quality", "--long-edge"], &[])?;
+    let settings = export_settings(rest)?;
+    let picks = read_picks(roll)?;
+    let stdout = io::stdout();
+    let mut out = stdout.lock();
+    let mut failed = 0usize;
+    for name in &picks {
+        let line = match export_request(&roll.join(name), settings)
+            .and_then(|request| export_file(&request, None, threads()))
+        {
+            Ok(exported) => format!("exported {name} -> {}", exported.out.display()),
+            Err(why) => {
+                failed += 1;
+                format!("failed {name}: {why}")
+            }
+        };
+        writeln!(out, "{line}").map_err(|e| e.to_string())?;
+    }
+    writeln!(
+        out,
+        "{} of {} picks exported",
+        picks.len().saturating_sub(failed),
+        picks.len()
+    )
+    .map_err(|e| e.to_string())?;
+    if failed > 0 {
+        return Err(format!("{failed} of {} picks failed", picks.len()));
+    }
+    Ok(())
 }
 
 /// The never-overwrite rule, checked by name: anything at `out` (a file, a
@@ -1589,8 +1741,9 @@ fn cache_clear() -> Result<(), String> {
 
 // ------------------------------------------------------------------ looks
 
-/// `$XDG_CONFIG_HOME/td-photo/looks`, or `$HOME/.config/td-photo/looks`.
-fn looks_dir() -> Result<PathBuf, String> {
+/// `$XDG_CONFIG_HOME/td-photo`, or `$HOME/.config/td-photo`: the user's
+/// looks and export settings.
+fn config_dir() -> Result<PathBuf, String> {
     let base = match std::env::var_os("XDG_CONFIG_HOME").filter(|v| Path::new(v).is_absolute()) {
         Some(v) => PathBuf::from(v),
         None => {
@@ -1600,7 +1753,75 @@ fn looks_dir() -> Result<PathBuf, String> {
             PathBuf::from(home).join(".config")
         }
     };
-    Ok(base.join("td-photo").join("looks"))
+    Ok(base.join("td-photo"))
+}
+
+/// `$XDG_CONFIG_HOME/td-photo/looks`, or `$HOME/.config/td-photo/looks`.
+fn looks_dir() -> Result<PathBuf, String> {
+    Ok(config_dir()?.join("looks"))
+}
+
+// -------------------------------------------------------------- settings
+
+/// The user's export settings as the file holds them: the defaults when
+/// there is no file or no user directory, and the defaults with the
+/// reason on stderr when the file is there and refused (the next change
+/// written replaces it). Anything but a regular file at its name (a
+/// fifo, a folder, a link) is refused by name before the open, so a
+/// session cannot block on it; the window between the check and the
+/// open is the one the look reader has.
+fn read_settings() -> Settings {
+    let path = match config_dir() {
+        Ok(dir) => dir.join(settings::FILE),
+        Err(_) => return Settings::default(),
+    };
+    let refused = |why: &str| {
+        note(&format!(
+            "{}: {why}; export settings at their defaults",
+            path.display()
+        ));
+        Settings::default()
+    };
+    // By name and without following a link: the file is td-photo's own,
+    // written in place, so a link there would be replaced, not followed.
+    match fs::symlink_metadata(&path) {
+        Ok(meta) if meta.is_file() => {}
+        Ok(_) => return refused("not a regular file"),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Settings::default(),
+        Err(e) => return refused(&e.to_string()),
+    }
+    let mut file = match fs::File::open(&path) {
+        Ok(file) => file,
+        Err(e) => return refused(&e.to_string()),
+    };
+    // A byte past the ceiling, so an oversize file is refused as such
+    // without being read whole.
+    let mut bytes = Vec::new();
+    let read = (&mut file)
+        .take(settings::MAX_BYTES as u64 + 1)
+        .read_to_end(&mut bytes);
+    if let Err(e) = read {
+        return refused(&e.to_string());
+    }
+    match Settings::parse(&bytes) {
+        Ok(settings) => settings,
+        Err(e) => refused(&e.to_string()),
+    }
+}
+
+/// Writes the export settings to `export` in the user's td-photo
+/// directory (made as needed) as the sidecar is written (`replace_own`):
+/// the file is td-photo's own, so the last write wins.
+fn write_settings(settings: &Settings) -> Result<(), String> {
+    let dir = config_dir()?;
+    fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let path = dir.join(settings::FILE);
+    // Only a regular file, or nothing, is replaced: never a link or a
+    // folder at the name (checked by name, as the read checks).
+    if fs::symlink_metadata(&path).is_ok_and(|meta| !meta.is_file()) {
+        return Err(format!("{}: not a regular file", path.display()));
+    }
+    replace_own(&path, &settings.text())
 }
 
 /// Reads a look file, bounded a byte past its ceiling so an oversize one
@@ -1841,10 +2062,9 @@ fn read_sidecar(original: &Path) -> Result<Sidecar, String> {
 }
 
 /// Writes the sidecar through `NAME.edit.tmp`, synced, then renamed into
-/// place: the one file td-photo replaces, since the sidecar is its own.
-/// The temporary is created exclusively, so a stale one is reported, not
-/// reused or removed; and a sidecar the reader would refuse is not
-/// written, so what td-photo writes it reads.
+/// place (`replace_own`): a file td-photo replaces, since the sidecar is
+/// its own. A sidecar the reader would refuse is not written, so what
+/// td-photo writes it reads.
 fn write_sidecar(original: &Path, sidecar: &Sidecar) -> Result<(), String> {
     let path = sidecar_path(original);
     let text = sidecar.text();
@@ -1856,6 +2076,15 @@ fn write_sidecar(original: &Path, sidecar: &Sidecar) -> Result<(), String> {
             path.display()
         ));
     }
+    replace_own(&path, &text)
+}
+
+/// Writes one of td-photo's own files -- the sidecar, the export settings
+/// -- through `PATH.tmp`, synced, then renamed into place: the files
+/// td-photo replaces, since they are its own; everything else is
+/// published by a link that cannot replace. The temporary is created
+/// exclusively, so a stale one is reported, not reused or removed.
+fn replace_own(path: &Path, text: &str) -> Result<(), String> {
     let mut temporary = path.as_os_str().to_owned();
     temporary.push(".tmp");
     let temporary = PathBuf::from(temporary);
@@ -1867,7 +2096,7 @@ fn write_sidecar(original: &Path, sidecar: &Sidecar) -> Result<(), String> {
     let write = |mut file: fs::File| -> io::Result<()> {
         file.write_all(text.as_bytes())?;
         file.sync_all()?;
-        fs::rename(&temporary, &path)
+        fs::rename(&temporary, path)
     };
     write(file).map_err(|e| {
         // Ours to remove: created exclusively above.
@@ -2504,6 +2733,11 @@ struct Session {
     /// replay does; the window sets `Some` and drains the requests to its
     /// pool each turn, so no decode runs on its thread.
     exports: Option<Vec<ExportRequest>>,
+    /// The picks' export the window has queued and not seen land whole,
+    /// for the status row's note; the replay runs a batch within the turn
+    /// and keeps none. Of one roll: a roll opening leaves it to finish on
+    /// stderr, and the next batch is that roll's own.
+    batch: Option<Batch>,
 }
 
 /// One photo as the model takes it, from a sidecar as found.
@@ -2550,11 +2784,15 @@ impl Session {
         // a look added on disk mid-session appears on the next run, as the
         // `looks` verb would show it.
         ui.set_looks(look_stems());
+        // The export settings, the user's file's or the defaults, settled
+        // before the first frame.
+        ui.set_settings(read_settings());
         Session {
             ui,
             idle: true,
             quit: false,
             exports: None,
+            batch: None,
         }
     }
 
@@ -2659,6 +2897,8 @@ impl Session {
                     })?
                 }
                 Effect::Export { name, .. } => outcome = self.export(name)?,
+                Effect::ExportPicks => outcome = self.export_picks()?,
+                Effect::Settings(settings) => outcome = self.save_settings(settings)?,
                 Effect::DeleteRejected => outcome = self.delete_rejected()?,
                 Effect::List { folder, parent } => self.list(folder, parent)?,
             }
@@ -2718,7 +2958,7 @@ impl Session {
     fn export(&mut self, name: String) -> Result<Outcome, ui::Error> {
         let roll = self.ui.roll().ok_or(ui::Error::NoRoll)?;
         let original = PathBuf::from(OsStr::from_bytes(roll)).join(&name);
-        let request = match export_request(&original) {
+        let request = match export_request(&original, self.ui.settings()) {
             Ok(request) => request,
             Err(why) => {
                 note(&why);
@@ -2745,6 +2985,97 @@ impl Session {
                 }
             },
         }
+    }
+
+    /// Exports every pick of the roll, as the files flag them now, as the
+    /// verb does with the model's settings: the replay runs them in turn
+    /// within the request, `changed` with the batch's note set, `refused`
+    /// when any failed (each reason on stderr); the window queues them to
+    /// its pool behind any export already asked for, `changed` as they are
+    /// queued, the note counting them as they land (a request the sidecar
+    /// refuses counted at once). `ignored` when the files hold no pick.
+    fn export_picks(&mut self) -> Result<Outcome, ui::Error> {
+        let roll = self.ui.roll().ok_or(ui::Error::NoRoll)?;
+        let roll = PathBuf::from(OsStr::from_bytes(roll));
+        let picks = match read_picks(&roll) {
+            Ok(picks) => picks,
+            Err(why) => {
+                note(&why);
+                return Err(ui::Error::Refused);
+            }
+        };
+        if picks.is_empty() {
+            return Ok(Outcome::Ignored);
+        }
+        let settings = self.ui.settings();
+        let requests = picks.iter().map(|name| {
+            export_request(&roll.join(name), settings).map(|request| ExportRequest {
+                batch: true,
+                ..request
+            })
+        });
+        match self.exports.as_mut() {
+            Some(queue) => {
+                // Behind the roll's own batch still landing, the counts
+                // adding up; another roll's is left to finish on stderr.
+                let mut batch = self
+                    .batch
+                    .take()
+                    .filter(|batch| batch.roll == roll)
+                    .unwrap_or_else(|| Batch {
+                        roll: roll.clone(),
+                        ..Batch::default()
+                    });
+                batch.total += picks.len();
+                for request in requests {
+                    match request {
+                        Ok(request) => queue.push(request),
+                        Err(why) => {
+                            note(&why);
+                            batch.done += 1;
+                            batch.failed += 1;
+                        }
+                    }
+                }
+                self.ui.set_export(Some(batch.note()));
+                if !batch.finished() {
+                    self.batch = Some(batch);
+                }
+                Ok(Outcome::Changed)
+            }
+            None => {
+                let mut batch = Batch {
+                    roll: roll.clone(),
+                    total: picks.len(),
+                    ..Batch::default()
+                };
+                for request in requests {
+                    batch.done += 1;
+                    if let Err(why) =
+                        request.and_then(|request| export_file(&request, None, threads()))
+                    {
+                        note(&why);
+                        batch.failed += 1;
+                    }
+                }
+                self.ui.set_export(Some(batch.note()));
+                if batch.failed > 0 {
+                    return Err(ui::Error::Refused);
+                }
+                Ok(Outcome::Changed)
+            }
+        }
+    }
+
+    /// Writes the export settings the dispatch asked for to the user's
+    /// file and settles the model on them: `refused` with the reason on
+    /// stderr when the file cannot be written, the model as it was.
+    fn save_settings(&mut self, settings: Settings) -> Result<Outcome, ui::Error> {
+        if let Err(why) = write_settings(&settings) {
+            note(&why);
+            return Err(ui::Error::Refused);
+        }
+        Ok(self.ui.set_settings(settings))
     }
 
     /// Moves the roll's rejects into `rejected/` as the verb does, on the
@@ -2951,6 +3282,29 @@ fn help_actions() -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The batch's note names the pick being written while any is
+    /// outstanding, then counts what landed and what failed.
+    #[test]
+    fn the_batch_note_counts_as_the_picks_land() {
+        let mut batch = Batch {
+            total: 3,
+            ..Batch::default()
+        };
+        assert!(!batch.finished());
+        assert_eq!(batch.note(), "exporting pick 1 of 3");
+        batch.done = 2;
+        batch.failed = 1;
+        assert_eq!(batch.note(), "exporting pick 3 of 3");
+        batch.done = 3;
+        assert!(batch.finished());
+        assert_eq!(batch.note(), "exported 2 of 3 picks, 1 failed");
+        batch.failed = 0;
+        assert_eq!(batch.note(), "exported 3 of 3 picks");
+        let none = Batch::default();
+        assert!(none.finished());
+        assert_eq!(none.note(), "exported 0 of 0 picks");
+    }
 
     /// A reject whose sidecar cannot follow its original is reported as
     /// moved without it, and the next reject still moves.

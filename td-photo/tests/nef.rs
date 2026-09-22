@@ -2127,3 +2127,229 @@ fn the_thumb_verb_and_the_cache_follow_the_rules() {
     assert!(stderr.contains("no baseline JPEG preview"), "{stderr}");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn the_command_line_exports_at_a_quality_and_a_long_edge_and_every_pick() {
+    use std::ffi::OsStr;
+    let dir = scratch("export-picks");
+    let roll = dir.join("roll");
+    std::fs::create_dir(&roll).unwrap();
+    let (w, h) = (64usize, 32usize);
+    let samples: Vec<u16> = (0..w * h)
+        .map(|i| 1100 + 40 * (i % w) as u16 + 60 * (i / w) as u16)
+        .collect();
+    let bytes = Synth::lossless(w, h, &samples).build();
+    for name in ["DSC_0001.NEF", "DSC_0002.NEF", "DSC_0003.NEF"] {
+        std::fs::write(roll.join(name), &bytes).unwrap();
+    }
+    let file = roll.join("DSC_0001.NEF");
+    let exported = roll.join("exported");
+    let listing = || -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(&exported)
+            .map(|dir| {
+                dir.map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default();
+        names.sort();
+        names
+    };
+    let decode = |name: &str| {
+        td_photo::jpeg::decode(
+            &std::fs::read(exported.join(name)).unwrap(),
+            td_photo::jpeg::Scale::Full,
+        )
+        .unwrap()
+    };
+
+    // The long edge shrinks the export, its ratio kept; one past the
+    // source is the source's own size, as `full` is; the quality changes
+    // the bytes and nothing else about the frame.
+    let (ok, stdout, stderr) = run(&[
+        OsStr::new("export"),
+        file.as_os_str(),
+        OsStr::new("--long-edge"),
+        OsStr::new("30"),
+    ]);
+    assert!(ok, "{stderr}");
+    assert!(stdout.contains("exported 64x32 -> 30x14 into"), "{stdout}");
+    let small = decode("DSC_0001.jpg");
+    assert_eq!((small.width, small.height), (30, 14));
+    let (ok, stdout, stderr) = run(&[
+        OsStr::new("export"),
+        file.as_os_str(),
+        OsStr::new("--long-edge"),
+        OsStr::new("4096"),
+        OsStr::new("--quality"),
+        OsStr::new("30"),
+    ]);
+    assert!(ok, "{stderr}");
+    assert!(stdout.contains("exported 64x32 -> 60x28 into"), "{stdout}");
+    let coarse = std::fs::read(exported.join("DSC_0001-2.jpg")).unwrap();
+    let (ok, _, stderr) = run(&[
+        OsStr::new("export"),
+        file.as_os_str(),
+        OsStr::new("--long-edge"),
+        OsStr::new("full"),
+    ]);
+    assert!(ok, "{stderr}");
+    let fine = std::fs::read(exported.join("DSC_0001-3.jpg")).unwrap();
+    assert!(
+        coarse.len() < fine.len(),
+        "{} < {}",
+        coarse.len(),
+        fine.len()
+    );
+    let (coarse, fine) = (decode("DSC_0001-2.jpg"), decode("DSC_0001-3.jpg"));
+    assert_eq!((coarse.width, coarse.height), (fine.width, fine.height));
+    // The shrunk export is the shrink of the full one within the two
+    // codings' error: the mean of a smooth frame survives both.
+    let mean = |image: &[u8]| image.iter().map(|v| u64::from(*v)).sum::<u64>() / image.len() as u64;
+    let full = mean(&fine.data);
+    assert!(
+        mean(&small.data).abs_diff(full) <= 4,
+        "{} vs {full}",
+        mean(&small.data)
+    );
+    // Bad settings are refused by name before anything is written.
+    for (flag, value, why) in [
+        ("--quality", "0", "1..=100"),
+        ("--quality", "101", "1..=100"),
+        ("--quality", "x", "1..=100"),
+        ("--long-edge", "0", "full or 1..=16384"),
+        ("--long-edge", "16385", "full or 1..=16384"),
+        ("--long-edge", "Full", "full or 1..=16384"),
+    ] {
+        let (ok, _, stderr) = run(&[
+            OsStr::new("export"),
+            file.as_os_str(),
+            OsStr::new(flag),
+            OsStr::new(value),
+        ]);
+        assert!(!ok, "{flag} {value}");
+        assert!(stderr.contains(why), "{flag} {value}: {stderr}");
+    }
+    assert_eq!(listing().len(), 3);
+    // A frame taller than a source band (64 rows), shrunk: the output
+    // rows come from several bands and are the shrink of the full-size
+    // export within the two codings' error.
+    let (tw, th) = (48usize, 200usize);
+    let tall_samples: Vec<u16> = (0..tw * th)
+        .map(|i| 1100 + 30 * (i % tw) as u16 + 11 * (i / tw) as u16)
+        .collect();
+    let tall = roll.join("DSC_0004.NEF");
+    std::fs::write(&tall, Synth::lossless(tw, th, &tall_samples).build()).unwrap();
+    let (ok, stdout, stderr) = run(&[
+        OsStr::new("export"),
+        tall.as_os_str(),
+        OsStr::new("--quality"),
+        OsStr::new("100"),
+    ]);
+    assert!(ok, "{stderr}");
+    assert!(
+        stdout.contains("exported 48x200 -> 44x196 into"),
+        "{stdout}"
+    );
+    let (ok, stdout, stderr) = run(&[
+        OsStr::new("export"),
+        tall.as_os_str(),
+        OsStr::new("--long-edge"),
+        OsStr::new("100"),
+        OsStr::new("--quality"),
+        OsStr::new("100"),
+    ]);
+    assert!(ok, "{stderr}");
+    assert!(
+        stdout.contains("exported 48x200 -> 22x100 into"),
+        "{stdout}"
+    );
+    let full = decode("DSC_0004.jpg");
+    let shrunk = decode("DSC_0004-2.jpg");
+    assert_eq!((shrunk.width, shrunk.height), (22, 100));
+    let mut shrink = td_photo::image::Shrink::new(44, 196, 22, 100).unwrap();
+    let expected = shrink.push(&full).unwrap().unwrap();
+    assert_eq!((expected.width, expected.height), (22, 100));
+    let worst = shrunk
+        .data
+        .iter()
+        .zip(expected.data.iter())
+        .map(|(a, b)| (i32::from(*a) - i32::from(*b)).abs())
+        .max()
+        .unwrap();
+    assert!(worst <= 6, "worst {worst}");
+    assert_eq!(listing().len(), 5);
+    std::fs::remove_file(exported.join("DSC_0004.jpg")).unwrap();
+    std::fs::remove_file(exported.join("DSC_0004-2.jpg")).unwrap();
+    std::fs::remove_file(&tall).unwrap();
+    assert_eq!(listing().len(), 3);
+
+    // export-picks: every pick in name order, the unflagged and the
+    // rejects left out, a line each and the count; a pick that fails
+    // keeps the others coming and fails the run after the rest; no pick
+    // is a count of none.
+    let (ok, stdout, stderr) = run(&[OsStr::new("export-picks"), roll.as_os_str()]);
+    assert!(ok, "{stderr}");
+    assert_eq!(stdout, "0 of 0 picks exported\n");
+    for (name, flag) in [
+        ("DSC_0001", "pick"),
+        ("DSC_0002", "reject"),
+        ("DSC_0003", "pick"),
+    ] {
+        std::fs::write(
+            roll.join(format!("{name}.NEF.edit")),
+            format!("td-photo edit 1\nflag {flag}\n"),
+        )
+        .unwrap();
+    }
+    let (ok, stdout, stderr) = run(&[
+        OsStr::new("export-picks"),
+        roll.as_os_str(),
+        OsStr::new("--long-edge"),
+        OsStr::new("16"),
+    ]);
+    assert!(ok, "{stderr}");
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(lines.len(), 3, "{stdout}");
+    assert!(
+        lines[0].starts_with("exported DSC_0001.NEF -> "),
+        "{stdout}"
+    );
+    assert!(lines[0].ends_with("DSC_0001-4.jpg"), "{stdout}");
+    assert!(
+        lines[1].starts_with("exported DSC_0003.NEF -> "),
+        "{stdout}"
+    );
+    assert!(lines[1].ends_with("DSC_0003.jpg"), "{stdout}");
+    assert_eq!(lines[2], "2 of 2 picks exported");
+    let third = decode("DSC_0003.jpg");
+    assert_eq!((third.width, third.height), (16, 7));
+    assert_eq!(listing().len(), 5);
+    std::fs::write(roll.join("DSC_0003.NEF"), b"not a nef").unwrap();
+    let (ok, stdout, stderr) = run(&[OsStr::new("export-picks"), roll.as_os_str()]);
+    assert!(!ok);
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert!(
+        lines[0].starts_with("exported DSC_0001.NEF -> "),
+        "{stdout}"
+    );
+    assert!(lines[1].starts_with("failed DSC_0003.NEF: "), "{stdout}");
+    assert_eq!(lines[2], "1 of 2 picks exported");
+    assert!(stderr.contains("1 of 2 picks failed"), "{stderr}");
+    assert_eq!(listing().len(), 6);
+    // The roll and the settings are checked before any export.
+    let (ok, _, stderr) = run(&[
+        OsStr::new("export-picks"),
+        roll.as_os_str(),
+        OsStr::new("--quality"),
+        OsStr::new("200"),
+    ]);
+    assert!(!ok);
+    assert!(stderr.contains("1..=100"), "{stderr}");
+    let (ok, _, stderr) = run(&[OsStr::new("export-picks")]);
+    assert!(!ok);
+    assert!(stderr.contains("needs ROLL"), "{stderr}");
+    let (ok, _, stderr) = run(&[OsStr::new("export-picks"), file.as_os_str()]);
+    assert!(!ok, "{stderr}");
+    assert_eq!(listing().len(), 6);
+    let _ = std::fs::remove_dir_all(&dir);
+}

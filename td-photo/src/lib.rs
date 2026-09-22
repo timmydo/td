@@ -6,8 +6,9 @@
 //! `develop` the demosaic, resampler and pipeline, `jpeg` the baseline
 //! decoder for the camera's embedded previews, `image` the RGB buffers
 //! and PPM writer, `library` the sidecar grammar, roll rules and dating
-//! rule, `look` the look format with its built-in set, and `ui` the cull
-//! controller over td-ui's driven seam. None of these reads a file, the
+//! rule, `look` the look format with its built-in set, `settings` the
+//! export settings' grammar, and `ui` the cull controller over td-ui's
+//! driven seam. None of these reads a file, the
 //! environment, a clock or a descriptor: `main` owns I/O. DESIGN.md is
 //! the contract.
 
@@ -19,5 +20,6 @@ pub mod jpeg;
 pub mod library;
 pub mod look;
 pub mod nef;
+pub mod settings;
 pub mod tiff;
 pub mod ui;

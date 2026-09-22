@@ -20,6 +20,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use td_photo::library::{self, Filter, Flag, Key, Sidecar};
 use td_photo::look;
+use td_photo::settings::Settings;
 use td_photo::ui::{self, Action, Controller, Effect, Photo, View, ZoomStep, BINDINGS};
 use td_ui::chrome::DISABLED;
 use td_ui::control::{frame, hex, valid_code, Decoder, ErrorCode};
@@ -47,6 +48,8 @@ const CHOOSER: usize = 15;
 const STEPS: usize = 16;
 const STEP: usize = 17;
 const ZOOM: usize = 18;
+const QUALITY: usize = 19;
+const EDGE: usize = 20;
 
 fn surface(width: usize, height: usize) -> Surface {
     Surface::new(width, height, Scale::new(1).unwrap()).unwrap()
@@ -147,8 +150,18 @@ fn the_action_table_is_closed_aligned_and_reachable() {
         match binding.chord {
             None => {
                 assert!(
-                    ["open", "select", "scroll", "look", "crop", "aspect", "exposure"]
-                        .contains(&binding.name),
+                    [
+                        "open",
+                        "select",
+                        "scroll",
+                        "look",
+                        "crop",
+                        "aspect",
+                        "exposure",
+                        "quality",
+                        "long-edge",
+                    ]
+                    .contains(&binding.name),
                     "{} has no key",
                     binding.name
                 );
@@ -201,7 +214,7 @@ fn a_session_walks_the_grid_and_reports_its_state() {
     assert_eq!((layout.columns, layout.rows), (4, 3));
     assert_eq!(
         c.state(),
-        "cull\t-\t0\t0\t-\tall\tgrid\t-\t-\t-\t-\t-\t-\t0\t0\t-\t0\t-\tfit"
+        "cull\t-\t0\t0\t-\tall\tgrid\t-\t-\t-\t-\t-\t-\t0\t0\t-\t0\t-\tfit\t92\tfull"
     );
     for name in ["next", "pick", "view", "first"] {
         assert_eq!(
@@ -388,21 +401,24 @@ fn a_session_walks_the_grid_and_reports_its_state() {
 
     // The pointer: a filter button sets the filter, a cell selects, the
     // rest is ignored, and only a press does anything; the gap between
-    // two buttons and the strip's margin are no targets.
-    assert_eq!(press(&mut c, 80, 36), Outcome::Changed);
+    // two buttons and the strip's margin are no targets. On 400 the mode
+    // strip wraps to two rows (Export on the second), so the filter strip
+    // is the third.
+    assert_eq!(press(&mut c, 80, 60), Outcome::Changed);
     assert_eq!(c.filter(), Filter::Picks);
-    assert_eq!(press(&mut c, 80, 36), Outcome::Ignored);
-    assert_eq!(press(&mut c, 10, 36), Outcome::Changed);
+    assert_eq!(press(&mut c, 80, 60), Outcome::Ignored);
+    assert_eq!(press(&mut c, 10, 60), Outcome::Changed);
     assert_eq!(c.filter(), Filter::All);
-    assert_eq!(press(&mut c, 52, 36), Outcome::Ignored);
-    assert_eq!(press(&mut c, 80, 25), Outcome::Ignored);
+    assert_eq!(press(&mut c, 52, 60), Outcome::Ignored);
+    assert_eq!(press(&mut c, 80, 49), Outcome::Ignored);
+    assert_eq!(press(&mut c, 80, 36), Outcome::Ignored);
     assert_eq!(act(&mut c, "first", &[]), Outcome::Changed);
     assert_eq!(press(&mut c, 300, 100), Outcome::Changed);
     assert_eq!(fields(&c)[POSITION], "1");
     assert_eq!(press(&mut c, 300, 100), Outcome::Ignored);
     assert_eq!(press(&mut c, 300, 290), Outcome::Ignored);
     // Off the 400x300 surface nothing is a target, not even a strip's row.
-    assert_eq!(press(&mut c, 400, 36), Outcome::Ignored);
+    assert_eq!(press(&mut c, 400, 60), Outcome::Ignored);
     assert_eq!(press(&mut c, 10, 300), Outcome::Ignored);
     assert_eq!(c.filter(), Filter::All);
     assert_eq!(
@@ -417,13 +433,13 @@ fn a_session_walks_the_grid_and_reports_its_state() {
     );
     // On a surface too short for all the bands the status row paints over
     // the strips, so a press there is the status row's, never a button's:
-    // at 64 tall it covers the filter strip's lower half, at 40 the mode
+    // at 88 tall it covers the filter strip's lower half, at 40 the mode
     // strip's, and the part left showing is still a target.
-    let mut short = Controller::new(surface(400, 64));
+    let mut short = Controller::new(surface(400, 88));
     short.open("roll", b"/r", photos(2)).unwrap();
-    assert_eq!(press(&mut short, 80, 44), Outcome::Ignored);
+    assert_eq!(press(&mut short, 80, 68), Outcome::Ignored);
     assert_eq!(short.filter(), Filter::All);
-    assert_eq!(press(&mut short, 80, 30), Outcome::Changed);
+    assert_eq!(press(&mut short, 80, 54), Outcome::Changed);
     assert_eq!(short.filter(), Filter::Picks);
     let mut short = Controller::new(surface(400, 40));
     short.open("roll", b"/r", photos(2)).unwrap();
@@ -437,7 +453,7 @@ fn a_session_walks_the_grid_and_reports_its_state() {
     assert_eq!(act(&mut c, "view", &[]), Outcome::Changed);
     assert_eq!(press(&mut c, 300, 290), Outcome::Ignored);
     assert_eq!(c.view(), View::Single);
-    assert_eq!(press(&mut c, 20, 60), Outcome::Changed);
+    assert_eq!(press(&mut c, 20, 84), Outcome::Changed);
     assert_eq!(c.view(), View::Grid);
     assert_eq!(act(&mut c, "view", &[]), Outcome::Changed);
     assert_eq!(press(&mut c, 200, 150), Outcome::Changed);
@@ -496,6 +512,27 @@ fn apply(c: &mut Controller, effects: &[Effect]) -> Result<Outcome, ui::Error> {
                 };
                 continue;
             }
+            Effect::ExportPicks => {
+                // The adapter exports the picks the files flag; here the
+                // model's copies stand in, and the note counts them.
+                let picks = c
+                    .photos()
+                    .iter()
+                    .filter(|photo| photo.error.is_none() && photo.flag() == Some(Flag::Pick))
+                    .count();
+                outcome = if picks == 0 {
+                    Outcome::Ignored
+                } else {
+                    c.set_export(Some(format!("exported {picks} of {picks} picks")));
+                    Outcome::Changed
+                };
+                continue;
+            }
+            Effect::Settings(settings) => {
+                // The adapter writes the user's file, then settles.
+                outcome = c.set_settings(*settings);
+                continue;
+            }
             Effect::Open(_) | Effect::List { .. } => panic!("{effect:?}"),
         };
         if let Effect::Export { .. } = effect {
@@ -534,6 +571,8 @@ fn apply(c: &mut Controller, effects: &[Effect]) -> Result<Outcome, ui::Error> {
             }
             Effect::Open(_)
             | Effect::Export { .. }
+            | Effect::ExportPicks
+            | Effect::Settings(_)
             | Effect::DeleteRejected
             | Effect::List { .. } => {
                 panic!("{effect:?}")
@@ -964,7 +1003,7 @@ fn the_scene_reads_back_as_text_and_paints_deterministically() {
     let lines: Vec<&str> = text.lines().collect();
     assert_eq!(
         lines[0].trim(),
-        "Roll Selection   Culling   Single   Develop"
+        "Roll Selection   Culling   Single   Develop   Export"
     );
     assert_eq!(lines[1].trim(), "All   Picks   Rejects   Unflagged");
     let strip = lines[1].to_string();
@@ -1119,9 +1158,20 @@ struct Replay {
 
 impl Replay {
     fn start(args: &[&str]) -> Replay {
+        Self::start_with_env(args, &[])
+    }
+
+    /// With `env` over the harness's own: a configuration directory that
+    /// is empty and shared, so no session reads the developer's settings
+    /// or looks and none writes there (a test that writes sets its own).
+    fn start_with_env(args: &[&str], env: &[(&str, &Path)]) -> Replay {
+        let empty = std::env::temp_dir().join("td-photo-ui-empty-config");
+        let _ = fs::create_dir_all(&empty);
         let mut child = Command::new(env!("CARGO_BIN_EXE_td-photo"))
             .arg("--replay")
             .args(args)
+            .env("XDG_CONFIG_HOME", &empty)
+            .envs(env.iter().map(|(k, v)| (*k, *v)))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -1283,10 +1333,12 @@ fn the_binary_replays_the_cull_over_a_roll_and_writes_through_the_sidecar() {
             "-",
             "0",
             "-",
-            "fit"
+            "fit",
+            "92",
+            "full"
         ]
     );
-    assert_eq!(&reply(2)[..2], ["ok", "53"]);
+    assert_eq!(&reply(2)[..2], ["ok", "57"]);
     assert_eq!(reply(3), ["ok", "changed"]);
     assert_eq!(reply(4), ["ok", &name(1), "pick", "-", "-", "-", "ok", "-"]);
     assert_eq!(
@@ -1996,13 +2048,13 @@ fn the_window_helpers_place_thumbnails_and_report_jobs() {
     // lower rows; painted within the grid's area, as the window paints
     // them, the badges leave the band as the scene left it, and painted
     // over the whole surface they would not.
-    let short = Surface::new(400, 84, Scale::default()).unwrap();
+    let short = Surface::new(400, 108, Scale::default()).unwrap();
     let mut c = Controller::new(short);
     c.open("roll", b"/r", photos(3)).unwrap();
     let area = c.layout().area;
-    assert_eq!((area.y, area.height), (48, 12));
+    assert_eq!((area.y, area.height), (72, 12));
     assert_eq!(c.visible()[1].0, 1, "the pick is on the one row");
-    let mut pixels = vec![0u8; big_stride * 84];
+    let mut pixels = vec![0u8; big_stride * 108];
     Raster::new(&mut pixels, &font, short, big_stride)
         .unwrap()
         .paint(&c.scene(), short.bounds())
@@ -3958,7 +4010,7 @@ fn delete_rejected_takes_the_rejects_out_of_the_model_and_keeps_the_cursor_near(
 }
 
 #[test]
-fn export_asks_for_the_cursor_photo_in_either_mode_and_notes_the_status_row() {
+fn export_asks_for_the_cursor_photo_in_any_mode_and_notes_the_status_row() {
     let mut c = Controller::new(surface(800, 600));
     assert_eq!(c.action("export", &[]).unwrap_err(), ui::Error::NoRoll);
     c.open("roll", b"/r", Vec::new()).unwrap();
@@ -4233,6 +4285,158 @@ fn the_binary_exports_over_the_replay_and_notes_the_status_row() {
         err.contains("DSC_0002.NEF") && err.contains("DSC_0003.NEF.edit"),
         "{err}"
     );
+}
+
+#[test]
+fn the_binary_keeps_the_export_settings_and_exports_the_picks_over_the_replay() {
+    let temp = Temp::new("export-picks");
+    let roll = temp.0.join("roll");
+    fs::create_dir_all(&roll).unwrap();
+    let (w, h) = (64usize, 48usize);
+    let samples: Vec<u16> = (0..w * h).map(|i| 1008 + (i as u16 % 4000)).collect();
+    fs::write(
+        roll.join("DSC_0001.NEF"),
+        synth_nef::uncompressed_nef(w, h, &samples),
+    )
+    .unwrap();
+    fs::write(roll.join("DSC_0002.NEF"), b"not really a nef").unwrap();
+    fs::write(roll.join("DSC_0003.NEF"), b"not really a nef").unwrap();
+    let roll_s = roll.to_str().unwrap();
+    let config = temp.0.join("config");
+    let env: [(&str, &Path); 1] = [("XDG_CONFIG_HOME", config.as_path())];
+    let file = config.join("td-photo").join("export");
+    let text_of = |reply: &[String]| -> String {
+        String::from_utf8(td_ui::control::unhex(&reply[3]).unwrap()).unwrap()
+    };
+
+    // The settings start at their defaults with no file; a change writes
+    // the file and settles the model, the same value again is nothing,
+    // and a bad one is `bad-argument` before any write.
+    assert!(!file.exists());
+    let mut session = Replay::start_with_env(&["--size", "1100x400", roll_s], &env);
+    let a = session.send(&[
+        request(1, &["state"]),
+        request(2, &["action", "quality", "80"]),
+        request(3, &["action", "long-edge", "32"]),
+        request(4, &["state"]),
+        request(5, &["action", "quality", "80"]),
+        request(6, &["action", "quality", "500"]),
+        request(7, &["action", "long-edge", "0"]),
+        request(8, &["key", &hex(b"E")]),
+        request(9, &["text"]),
+        request(10, &["action", "export-picks"]),
+    ]);
+    assert_eq!(&a[0][21..], ["92", "full"]);
+    assert_eq!(&a[1][1..], ["ok", "changed"]);
+    assert_eq!(&a[2][1..], ["ok", "changed"]);
+    assert_eq!(&a[3][21..], ["80", "32"]);
+    assert_eq!(
+        fs::read_to_string(&file).unwrap(),
+        "td-photo export 1\nquality 80\nlong-edge 32\n"
+    );
+    assert_eq!(&a[4][1..], ["ok", "ignored"]);
+    assert_eq!(a[5][1..3], ["error", "bad-argument"]);
+    assert_eq!(a[6][1..3], ["error", "bad-argument"]);
+    assert_eq!(&a[7][1..], ["ok", "changed"]);
+    let text = text_of(&a[8][1..]);
+    assert!(
+        text.contains("Quality 80") && text.contains("Long edge 32"),
+        "{text}"
+    );
+    assert!(text.contains("| export"), "{text}");
+    // No pick in the files: nothing to export.
+    assert_eq!(&a[9][1..], ["ok", "ignored"]);
+
+    // Two picks, one of which cannot be decoded: the replay runs the batch
+    // on the request, the one that failed keeping the other from nothing;
+    // `refused` for the failure, its reason on stderr, the note counting
+    // both, and the export shrunk to the long edge in force.
+    let b = session.send(&[
+        request(11, &["action", "pick"]),
+        request(12, &["action", "select", "1"]),
+        request(13, &["action", "pick"]),
+        request(14, &["action", "export-picks"]),
+        request(15, &["text"]),
+    ]);
+    assert_eq!(&b[0][1..], ["ok", "changed"]);
+    assert_eq!(&b[2][1..], ["ok", "changed"]);
+    assert_eq!(b[3][1..3], ["error", "refused"]);
+    assert!(
+        text_of(&b[4][1..]).ends_with("| export | exported 1 of 2 picks, 1 failed"),
+        "{}",
+        text_of(&b[4][1..])
+    );
+    assert_eq!(names(&roll.join("exported")), ["DSC_0001.jpg"]);
+    let head =
+        td_photo::jpeg::header(&fs::read(roll.join("exported/DSC_0001.jpg")).unwrap()).unwrap();
+    assert_eq!((head.width, head.height), (32, 23));
+    // From the grid too, by the key.
+    let c = session.send(&[
+        request(16, &["key", &hex(b"Escape")]),
+        request(17, &["key", &hex(b"C-e")]),
+        request(18, &["text"]),
+    ]);
+    assert_eq!(c[1][1..3], ["error", "refused"]);
+    assert!(
+        text_of(&c[2][1..]).ends_with("| exported 1 of 2 picks, 1 failed"),
+        "{}",
+        text_of(&c[2][1..])
+    );
+    assert_eq!(
+        names(&roll.join("exported")),
+        ["DSC_0001-2.jpg", "DSC_0001.jpg"]
+    );
+    let (ok, _, err) = session.finish();
+    assert!(ok, "{err}");
+    assert!(err.contains("DSC_0002.NEF"), "{err}");
+
+    // The next session reads the file back; a file the reader refuses
+    // leaves the defaults, with the reason on stderr, and the next change
+    // replaces it.
+    let (ok, replies, err) = replay(&["--size", "1100x400", roll_s], &[request(1, &["state"])]);
+    assert!(ok, "{err}");
+    let (ok, replies_env, err) = {
+        let mut session = Replay::start_with_env(&["--size", "1100x400", roll_s], &env);
+        let replies = session.send(&[request(1, &["state"])]);
+        let (ok, _, err) = session.finish();
+        (ok, replies, err)
+    };
+    assert!(ok, "{err}");
+    assert_eq!(&replies[0][21..], ["92", "full"], "the empty configuration");
+    assert_eq!(&replies_env[0][21..], ["80", "32"]);
+    fs::write(&file, "td-photo export 1\nquality 80\nformat avif\n").unwrap();
+    let mut session = Replay::start_with_env(&["--size", "1100x400", roll_s], &env);
+    let replies = session.send(&[
+        request(1, &["state"]),
+        request(2, &["action", "quality", "10"]),
+    ]);
+    assert_eq!(&replies[0][21..], ["92", "full"]);
+    assert_eq!(&replies[1][1..], ["ok", "changed"]);
+    let (ok, _, err) = session.finish();
+    assert!(ok, "{err}");
+    assert!(err.contains("export settings at their defaults"), "{err}");
+    assert_eq!(
+        fs::read_to_string(&file).unwrap(),
+        "td-photo export 1\nquality 10\nlong-edge full\n"
+    );
+    // A folder (or a fifo, a link) at the file's name is refused by name
+    // before any open, so the session starts, at the defaults; and the
+    // write refuses it too, the model as it was.
+    fs::remove_file(&file).unwrap();
+    fs::create_dir(&file).unwrap();
+    let mut session = Replay::start_with_env(&["--size", "1100x400", roll_s], &env);
+    let replies = session.send(&[
+        request(1, &["state"]),
+        request(2, &["action", "quality", "10"]),
+        request(3, &["state"]),
+    ]);
+    assert_eq!(&replies[0][21..], ["92", "full"]);
+    assert_eq!(replies[1][1..3], ["error", "refused"]);
+    assert_eq!(&replies[2][21..], ["92", "full"]);
+    let (ok, _, err) = session.finish();
+    assert!(ok, "{err}");
+    assert_eq!(err.matches("not a regular file").count(), 2, "{err}");
+    assert!(fs::metadata(&file).unwrap().is_dir());
 }
 
 /// A bare `td-photo` is the window, not the help: without a compositor it
@@ -4861,6 +5065,7 @@ fn the_mode_strip_names_the_mode_in_view_and_changes_it() {
             (false, true),
             (false, false),
             (false, false),
+            (false, false),
             (false, false)
         ]
     );
@@ -4868,7 +5073,7 @@ fn the_mode_strip_names_the_mode_in_view_and_changes_it() {
     let (_, _, text) = driven::text(&c.scene()).unwrap();
     assert_eq!(
         text.lines().next().unwrap().trim(),
-        "Roll Selection   Culling   Single   Develop"
+        "Roll Selection   Culling   Single   Develop   Export"
     );
     assert_eq!(press(&mut c, 150, 12), Outcome::Ignored);
     assert_eq!(press(&mut c, 250, 12), Outcome::Ignored);
@@ -4893,7 +5098,13 @@ fn the_mode_strip_names_the_mode_in_view_and_changes_it() {
     .unwrap();
     assert_eq!(
         c.mode_states(),
-        [(true, true), (false, false), (false, false), (false, false)]
+        [
+            (true, true),
+            (false, false),
+            (false, false),
+            (false, false),
+            (false, false)
+        ]
     );
     assert!(c.filter_states().iter().all(|state| !state.1));
     assert_eq!(press(&mut c, 20, 12), Outcome::Ignored);
@@ -4907,7 +5118,13 @@ fn the_mode_strip_names_the_mode_in_view_and_changes_it() {
     c.open("roll", b"/r", photos(3)).unwrap();
     assert_eq!(
         c.mode_states(),
-        [(false, true), (true, true), (false, true), (false, true)]
+        [
+            (false, true),
+            (true, true),
+            (false, true),
+            (false, true),
+            (false, true)
+        ]
     );
     assert_eq!(press(&mut c, 150, 12), Outcome::Ignored);
     // Single is the single view of the cursor's photo, as Return is, in
@@ -4916,7 +5133,13 @@ fn the_mode_strip_names_the_mode_in_view_and_changes_it() {
     assert_eq!((c.mode(), c.view()), (ui::Mode::Cull, View::Single));
     assert_eq!(
         c.mode_states(),
-        [(false, true), (false, true), (true, true), (false, true)]
+        [
+            (false, true),
+            (false, true),
+            (true, true),
+            (false, true),
+            (false, true)
+        ]
     );
     assert_eq!(press(&mut c, 250, 12), Outcome::Ignored);
     assert_eq!(press(&mut c, 150, 12), Outcome::Changed);
@@ -4929,7 +5152,13 @@ fn the_mode_strip_names_the_mode_in_view_and_changes_it() {
     assert_eq!((c.mode(), c.view()), (ui::Mode::Develop, View::Grid));
     assert_eq!(
         c.mode_states(),
-        [(false, true), (false, true), (false, true), (true, true)]
+        [
+            (false, true),
+            (false, true),
+            (false, true),
+            (true, true),
+            (false, true)
+        ]
     );
     assert!(c.filter_states().iter().all(|state| !state.1));
     assert_eq!(press(&mut c, 80, 36), Outcome::Ignored);
@@ -4972,7 +5201,13 @@ fn the_mode_strip_names_the_mode_in_view_and_changes_it() {
         .unwrap();
     assert_eq!(
         c.mode_states(),
-        [(true, true), (false, true), (false, true), (false, true)]
+        [
+            (true, true),
+            (false, true),
+            (false, true),
+            (false, true),
+            (false, true)
+        ]
     );
     assert_eq!(press(&mut c, 150, 12), Outcome::Changed);
     assert!(c.chooser().is_none());
@@ -5013,7 +5248,13 @@ fn the_mode_strip_bumps_once_a_change_and_never_a_request() {
     c.open("roll", b"/r", photos(0)).unwrap();
     assert_eq!(
         c.mode_states(),
-        [(false, true), (true, true), (false, false), (false, false)]
+        [
+            (false, true),
+            (true, true),
+            (false, false),
+            (false, false),
+            (false, true)
+        ]
     );
     let before = generation(&c);
     assert_eq!(press(&mut c, 330, 12), Outcome::Ignored);
@@ -6509,18 +6750,19 @@ fn the_look_band_and_the_f_keys_pick_looks() {
         [Effect::Edit { key: Key::Look, value: Some(stem), .. }] if stem == "look-number-04"
     ));
     // A surface too short for every row keeps the view a name row and a
-    // thumbnail-tall box: at 400 by 400 the region is 184 wide, the tool
+    // thumbnail-tall box: at 400 by 424 (the mode strip wraps to two rows
+    // on 400, so the strips are 72) the region is 184 wide, the tool
     // band three rows (the slider on its own) and a look a row, and the
     // look band is cut to the four rows that leave that room; the looks
     // past it are not laid, and the palette (and `F5`) reach them.
-    let mut short = Controller::new(surface(400, 400));
+    let mut short = Controller::new(surface(400, 424));
     short.open("roll", b"/r", photos(5)).unwrap();
     assert_eq!(act(&mut short, "develop", &[]), Outcome::Changed);
     short.set_looks(long.clone());
     let layout = short.layout();
     assert_eq!(layout.tool_band().height, 3 * 24);
     assert_eq!(layout.look_band().height, 4 * 24);
-    assert_eq!(layout.develop_view().height, 400 - 72 - 7 * 24);
+    assert_eq!(layout.develop_view().height, 424 - 96 - 7 * 24);
     assert!(layout.develop_box().is_some());
     let laid = layout.look_buttons(&long);
     assert_eq!(laid.iter().filter(|b| b.is_some()).count(), 4);
@@ -6736,7 +6978,7 @@ fn the_filmstrip_shows_the_shown_photos_under_the_preview() {
     // A region narrower than a box and its cells lays no band: the view
     // keeps the foot (under the tool band's four rows here, the buttons
     // wrapping on 175). A cell wider, and it holds its one box.
-    let mut narrow = Controller::new(surface(216 + 175, 600));
+    let mut narrow = Controller::new(surface(216 + 175, 624));
     narrow.open("roll", b"/r", photos(5)).unwrap();
     assert_eq!(act(&mut narrow, "develop", &[]), Outcome::Changed);
     assert_eq!(narrow.layout().film_band(), None);
@@ -7237,7 +7479,7 @@ fn alt_held_shows_each_buttons_chord_under_its_caption() {
         .filter(|(_, y, _)| *y < 24)
         .map(|(_, _, scalar)| *scalar)
         .collect();
-    assert_eq!(row, "oEscapeReturnd");
+    assert_eq!(row, "oEscapeReturndE");
     let row: String = all
         .iter()
         .filter(|(_, y, _)| (24..48).contains(y))
@@ -7280,7 +7522,7 @@ fn alt_held_shows_each_buttons_chord_under_its_caption() {
     let mut all = marks(&c);
     all.sort_by_key(|(x, y, _)| (*y, *x));
     let text: String = all.iter().map(|(_, _, scalar)| *scalar).collect();
-    assert_eq!(text, "oEscapeReturnd1234");
+    assert_eq!(text, "oEscapeReturndE1234");
 }
 
 #[test]
@@ -7308,4 +7550,388 @@ fn a_fit_reported_for_the_single_view_is_no_canvas_in_develop() {
     assert_eq!(press(&mut c, x + 10, y + 10), Outcome::Ignored);
     assert_eq!(drag_to(&mut c, x + 50, y + 50), Outcome::Changed);
     assert!(c.crop_drag().is_some());
+}
+
+/// The centre of the export view's quality knob at `value`.
+fn quality_knob(c: &Controller, value: usize) -> (u32, u32) {
+    let knob = c
+        .layout()
+        .export_panel()
+        .slider
+        .unwrap()
+        .knob(value, ui::QUALITY_STEPS);
+    (
+        (knob.x + i64::from(knob.width) / 2) as u32,
+        (knob.y + i64::from(knob.height) / 2) as u32,
+    )
+}
+
+#[test]
+fn the_export_view_is_a_mode_of_the_roll_with_the_strip_naming_it() {
+    let mut c = Controller::new(surface(800, 600));
+    // Before a roll there is nothing to export: the action refuses and
+    // the button is disabled.
+    assert_eq!(c.action("export-mode", &[]).unwrap_err(), ui::Error::NoRoll);
+    assert_eq!(press(&mut c, 400, 12), Outcome::Ignored);
+    c.open("roll", b"/r", photos(5)).unwrap();
+    assert_eq!(fields(&c)[MODE], "cull");
+    assert_eq!(&fields(&c)[QUALITY..=EDGE], ["92", "full"]);
+    // `E` shows it: the mode word, the status row and the strip say so,
+    // and the grid's boxes are withheld, the filters disabled and inert.
+    assert_eq!(key(&mut c, "E"), Outcome::Changed);
+    assert_eq!(c.mode(), ui::Mode::Export);
+    assert_eq!(fields(&c)[MODE], "export");
+    assert!(c.scene().status_line().ends_with(" | export"));
+    assert_eq!(
+        c.mode_states(),
+        [
+            (false, true),
+            (false, true),
+            (false, true),
+            (false, true),
+            (true, true)
+        ]
+    );
+    assert!(c.filter_states().iter().all(|state| !state.1));
+    assert!(c.visible().is_empty());
+    assert_eq!(c.develop_box(), None);
+    assert!(c.neighbours().is_empty());
+    assert_eq!(act(&mut c, "picks", &[]), Outcome::Ignored);
+    assert_eq!(press(&mut c, 80, 36), Outcome::Ignored);
+    assert_eq!(c.filter(), Filter::All);
+    // Again is nothing; the grid's own actions are not the view's.
+    assert_eq!(act(&mut c, "export-mode", &[]), Outcome::Ignored);
+    assert_eq!(press(&mut c, 400, 12), Outcome::Ignored);
+    assert_eq!(act(&mut c, "view", &[]), Outcome::Ignored);
+    assert_eq!(act(&mut c, "scroll", &["1"]), Outcome::Ignored);
+    assert_eq!(
+        c.input(Input::Wheel {
+            rows: 1,
+            columns: 0
+        })
+        .unwrap()
+        .0,
+        Outcome::Ignored
+    );
+    assert_eq!(act(&mut c, "delete-rejected", &[]), Outcome::Ignored);
+    assert_eq!(act(&mut c, "adjust-crop", &[]), Outcome::Ignored);
+    // The view reads back: what is exported, the quality, the long edge
+    // and its buttons, and the one action button.
+    let (_, _, text) = driven::text(&c.scene()).unwrap();
+    let lines: Vec<&str> = text.lines().map(str::trim).collect();
+    assert_eq!(
+        lines[0],
+        "Roll Selection   Culling   Single   Develop   Export"
+    );
+    assert!(
+        lines.contains(
+            &"Export the 1 picked of 5 into roll/exported/ as JPEG, never replacing a name"
+        ),
+        "{text}"
+    );
+    assert!(lines.contains(&"Quality 92"), "{text}");
+    assert!(lines.contains(&"Long edge full"), "{text}");
+    assert!(lines.contains(&"Full   1024   2048   4096"), "{text}");
+    assert!(lines.contains(&"Export picks"), "{text}");
+    // Escape leaves for the grid; so do Culling, Single and Develop; the
+    // cursor's moves are the roll's still.
+    assert_eq!(key(&mut c, "Escape"), Outcome::Changed);
+    assert_eq!(c.mode(), ui::Mode::Cull);
+    assert_eq!(c.view(), View::Grid);
+    assert_eq!(press(&mut c, 400, 12), Outcome::Changed);
+    assert_eq!(c.mode(), ui::Mode::Export);
+    assert_eq!(key(&mut c, "Right"), Outcome::Changed);
+    assert_eq!(fields(&c)[POSITION], "1");
+    assert_eq!(press(&mut c, 150, 12), Outcome::Changed);
+    assert_eq!((c.mode(), c.view()), (ui::Mode::Cull, View::Grid));
+    assert_eq!(press(&mut c, 400, 12), Outcome::Changed);
+    assert_eq!(press(&mut c, 250, 12), Outcome::Changed);
+    assert_eq!((c.mode(), c.view()), (ui::Mode::Cull, View::Single));
+    // From the single view, and from develop, the same; Develop from it
+    // develops the cursor's photo and its view word is the grid's.
+    assert_eq!(key(&mut c, "E"), Outcome::Changed);
+    assert_eq!((c.mode(), c.view()), (ui::Mode::Export, View::Grid));
+    assert_eq!(fields(&c)[VIEW], "grid");
+    assert_eq!(press(&mut c, 330, 12), Outcome::Changed);
+    assert_eq!(c.mode(), ui::Mode::Develop);
+    assert_eq!(key(&mut c, "E"), Outcome::Changed);
+    assert_eq!(c.mode(), ui::Mode::Export);
+    assert_eq!(key(&mut c, "d"), Outcome::Changed);
+    assert_eq!(c.mode(), ui::Mode::Develop);
+    assert_eq!(act(&mut c, "export-mode", &[]), Outcome::Changed);
+    // The chooser over it withholds the panel as it withholds the grid;
+    // closing it shows the view again.
+    let (outcome, _) = c.action("choose", &[]).unwrap();
+    assert_eq!(outcome, Outcome::Changed);
+    c.set_listing(b"/".to_vec(), listing("/", &["r"], &[]), Some("r"))
+        .unwrap();
+    assert_eq!(c.mode_states()[0], (true, true));
+    assert_eq!(c.mode_states()[4], (false, true));
+    assert_eq!(act(&mut c, "quality", &["50"]), Outcome::Ignored);
+    assert_eq!(key(&mut c, "Escape"), Outcome::Changed);
+    assert_eq!(c.mode(), ui::Mode::Export);
+    // Losing the cursor (every photo hidden) keeps the view: it is the
+    // roll's, not the cursor's.
+    assert!(c.remove(&[file(0), file(1), file(2), file(3), file(4)]));
+    assert_eq!(c.cursor(), None);
+    assert_eq!(c.mode(), ui::Mode::Export);
+    assert_eq!(fields(&c)[POSITION], "-");
+    // A roll opening leaves it for the grid, as it leaves develop.
+    c.open("other", b"/o", photos(2)).unwrap();
+    assert_eq!(c.mode(), ui::Mode::Cull);
+}
+
+#[test]
+fn the_export_settings_are_set_through_effects_and_settled() {
+    let mut c = Controller::new(surface(800, 600));
+    c.open("roll", b"/r", photos(5)).unwrap();
+    // Set in any mode: the effect carries the whole settings, the model
+    // changes when the adapter settles them, and `state` reports them.
+    let (outcome, effects) = c.action("quality", &["80"]).unwrap();
+    assert_eq!(outcome, Outcome::Changed);
+    assert_eq!(
+        effects,
+        [Effect::Settings(Settings {
+            quality: 80,
+            long_edge: None,
+        })]
+    );
+    assert_eq!(c.settings().quality, 92);
+    let generation = fields(&c)[GENERATION].clone();
+    assert_eq!(
+        c.set_settings(Settings {
+            quality: 80,
+            long_edge: None,
+        }),
+        Outcome::Changed
+    );
+    assert_ne!(fields(&c)[GENERATION], generation);
+    assert_eq!(&fields(&c)[QUALITY..=EDGE], ["80", "full"]);
+    assert_eq!(
+        c.set_settings(Settings {
+            quality: 80,
+            long_edge: None,
+        }),
+        Outcome::Ignored
+    );
+    // The value in force is `Ignored` without an effect; a bad one is
+    // `bad-argument` in either grammar.
+    assert_eq!(act(&mut c, "quality", &["80"]), Outcome::Ignored);
+    for bad in ["0", "101", "080", "-5", "ninety", ""] {
+        assert_eq!(
+            c.action("quality", &[bad]).unwrap_err(),
+            ui::Error::BadArgument,
+            "{bad}"
+        );
+    }
+    for bad in ["0", "16385", "Full", "-", "1e3"] {
+        assert_eq!(
+            c.action("long-edge", &[bad]).unwrap_err(),
+            ui::Error::BadArgument,
+            "{bad}"
+        );
+    }
+    assert_eq!(carry(&mut c, "long-edge", &["2048"]), Outcome::Changed);
+    assert_eq!(&fields(&c)[QUALITY..=EDGE], ["80", "2048"]);
+    assert_eq!(act(&mut c, "long-edge", &["2048"]), Outcome::Ignored);
+    assert_eq!(carry(&mut c, "long-edge", &["full"]), Outcome::Changed);
+    assert_eq!(carry(&mut c, "long-edge", &["16384"]), Outcome::Changed);
+    assert_eq!(&fields(&c)[QUALITY..=EDGE], ["80", "16384"]);
+    // The settings are kept across rolls and modes.
+    c.open("other", b"/o", photos(2)).unwrap();
+    assert_eq!(&fields(&c)[QUALITY..=EDGE], ["80", "16384"]);
+    assert_eq!(act(&mut c, "develop", &[]), Outcome::Changed);
+    assert_eq!(carry(&mut c, "quality", &["1"]), Outcome::Changed);
+    assert_eq!(&fields(&c)[QUALITY..=EDGE], ["1", "16384"]);
+    // The export view paints them: the long edge's caption names a size
+    // no button has, none selected.
+    assert_eq!(act(&mut c, "export-mode", &[]), Outcome::Changed);
+    let (_, _, text) = driven::text(&c.scene()).unwrap();
+    assert!(text.contains("Quality 1\n"), "{text}");
+    assert!(text.contains("Long edge 16384"), "{text}");
+    let panel = c.layout().export_panel();
+    assert!(panel.edges.iter().all(Option::is_some));
+    assert!(panel.run.is_some());
+    assert!(panel.slider.is_some());
+}
+
+#[test]
+fn the_export_view_buttons_and_slider_ask_what_they_say() {
+    let mut c = Controller::new(surface(800, 600));
+    c.open("roll", b"/r", photos(5)).unwrap();
+    assert_eq!(act(&mut c, "export-mode", &[]), Outcome::Changed);
+    let panel = c.layout().export_panel();
+    let centre = |button: Option<td_ui::chrome::Button>| {
+        let rect = button.unwrap().rect();
+        (
+            (rect.x + i64::from(rect.width) / 2) as u32,
+            (rect.y + i64::from(rect.height) / 2) as u32,
+        )
+    };
+    // A long-edge button sets that edge as the action does, through the
+    // same effect; the one in force is `Ignored`.
+    let (x, y) = centre(panel.edges[2]);
+    let (outcome, effects) = c
+        .input(Input::Pointer {
+            phase: PointerPhase::Press,
+            x,
+            y,
+        })
+        .unwrap();
+    assert_eq!(outcome, Outcome::Changed);
+    assert_eq!(
+        effects,
+        [Effect::Settings(Settings {
+            quality: 92,
+            long_edge: Some(2048),
+        })]
+    );
+    assert_eq!(apply(&mut c, &effects).unwrap(), Outcome::Changed);
+    assert_eq!(fields(&c)[EDGE], "2048");
+    assert_eq!(press(&mut c, x, y), Outcome::Ignored);
+    let (x, y) = centre(panel.edges[0]);
+    let effects = c
+        .input(Input::Pointer {
+            phase: PointerPhase::Press,
+            x,
+            y,
+        })
+        .unwrap()
+        .1;
+    assert_eq!(effects, [Effect::Settings(Settings::default())]);
+    assert_eq!(apply(&mut c, &effects).unwrap(), Outcome::Changed);
+    // Export picks asks for the picks' export: the effect carries no
+    // names, the files say which; the note the adapter sets shows on the
+    // status row. With none picked the button is disabled and inert,
+    // while the action still asks (the files may hold one).
+    let (x, y) = centre(panel.run);
+    let (outcome, effects) = c
+        .input(Input::Pointer {
+            phase: PointerPhase::Press,
+            x,
+            y,
+        })
+        .unwrap();
+    assert_eq!(
+        (outcome, effects.as_slice()),
+        (Outcome::Changed, &[Effect::ExportPicks][..])
+    );
+    assert_eq!(apply(&mut c, &effects).unwrap(), Outcome::Changed);
+    assert!(c
+        .scene()
+        .status_line()
+        .ends_with(" | export | exported 1 of 1 picks"));
+    assert_eq!(act(&mut c, "select", &["1"]), Outcome::Changed);
+    assert_eq!(carry(&mut c, "unflag", &[]), Outcome::Changed);
+    assert_eq!(press(&mut c, x, y), Outcome::Ignored);
+    let (outcome, effects) = c.action("export-picks", &[]).unwrap();
+    assert_eq!(
+        (outcome, effects),
+        (Outcome::Changed, vec![Effect::ExportPicks])
+    );
+    assert_eq!(key(&mut c, "C-e"), Outcome::Changed);
+    // The key works from the grid too: the export is the roll's.
+    assert_eq!(key(&mut c, "Escape"), Outcome::Changed);
+    let (outcome, effects) = c.input(Input::Key { chord: "C-e" }).unwrap();
+    assert_eq!(
+        (outcome, effects),
+        (Outcome::Changed, vec![Effect::ExportPicks])
+    );
+    assert_eq!(act(&mut c, "export-mode", &[]), Outcome::Changed);
+    // The slider: a press on the knob's own centre moves nothing and its
+    // release writes nothing; a press elsewhere jumps the knob there (a
+    // frame change, no write), the drag follows the pointer's column
+    // wherever it goes, and the release commits the step as `quality`
+    // would, a frame change of its own.
+    let (x, y) = quality_knob(&c, 91);
+    assert_eq!(press(&mut c, x, y), Outcome::Ignored);
+    assert_eq!(release(&mut c, x, y), (Outcome::Ignored, vec![]));
+    let (x, y) = quality_knob(&c, 69);
+    let before = fields(&c)[GENERATION].clone();
+    assert_eq!(press(&mut c, x, y), Outcome::Changed);
+    assert_ne!(fields(&c)[GENERATION], before);
+    let (_, _, text) = driven::text(&c.scene()).unwrap();
+    assert!(text.contains("Quality 70"), "{text}");
+    let (x, _) = quality_knob(&c, 49);
+    assert_eq!(drag_to(&mut c, x, 500), Outcome::Changed);
+    assert_eq!(drag_to(&mut c, x, 500), Outcome::Ignored);
+    // A press on a long-edge button mid-drag is the drag's, not the
+    // button's.
+    let (bx, by) = centre(panel.edges[3]);
+    assert_eq!(press(&mut c, bx, by), Outcome::Changed);
+    let (x, _) = quality_knob(&c, 49);
+    assert_eq!(drag_to(&mut c, x, 500), Outcome::Changed);
+    let before = fields(&c)[GENERATION].clone();
+    let (outcome, effects) = release(&mut c, x, 500);
+    assert_eq!(outcome, Outcome::Changed);
+    assert_eq!(
+        effects,
+        [Effect::Settings(Settings {
+            quality: 50,
+            long_edge: None,
+        })]
+    );
+    assert_ne!(fields(&c)[GENERATION], before);
+    assert_eq!(apply(&mut c, &effects).unwrap(), Outcome::Changed);
+    assert_eq!(fields(&c)[QUALITY], "50");
+    let (_, _, text) = driven::text(&c.scene()).unwrap();
+    assert!(text.contains("Quality 50"), "{text}");
+    // Back to the setting's own step: no write, and the frame changed
+    // with the knob's travel, not again on the release; a click there is
+    // nothing at all.
+    let (x, y) = quality_knob(&c, 60);
+    assert_eq!(press(&mut c, x, y), Outcome::Changed);
+    let (x, _) = quality_knob(&c, 49);
+    assert_eq!(drag_to(&mut c, x, y), Outcome::Changed);
+    assert_eq!(release(&mut c, x, y), (Outcome::Ignored, vec![]));
+    assert_eq!(press(&mut c, x, y), Outcome::Ignored);
+    assert_eq!(release(&mut c, x, y), (Outcome::Ignored, vec![]));
+    // Leaving the view drops a drag in progress.
+    let (x, y) = quality_knob(&c, 20);
+    assert_eq!(press(&mut c, x, y), Outcome::Changed);
+    assert_eq!(key(&mut c, "Escape"), Outcome::Changed);
+    assert_eq!(fields(&c)[QUALITY], "50");
+    assert_eq!(act(&mut c, "export-mode", &[]), Outcome::Changed);
+    let (_, _, text) = driven::text(&c.scene()).unwrap();
+    assert!(text.contains("Quality 50"), "{text}");
+    // Alt shows the chords: the strip's `E`, and `C-e` under Export
+    // picks.
+    assert_eq!(
+        c.input(Input::Held(td_ui::keyboard::Held {
+            alt: true,
+            ..td_ui::keyboard::Held::default()
+        }))
+        .unwrap()
+        .0,
+        Outcome::Changed
+    );
+    let run = c.layout().export_panel().run.unwrap().rect();
+    let mut hint: Vec<(i64, char)> = Vec::new();
+    c.scene().emit(c.surface().bounds(), &mut |draw| {
+        if let Primitive::Mark { x, y, scalar, .. } = draw.primitive {
+            if run.contains(x, y) {
+                hint.push((x, scalar));
+            }
+        }
+    });
+    hint.sort();
+    assert_eq!(hint.into_iter().map(|(_, c)| c).collect::<String>(), "C-e");
+    // A short surface lays what it can: the panel's controls past its
+    // foot are `None` and no target.
+    c.input(Input::Resize {
+        width: 800,
+        height: 120,
+        scale: 1,
+    })
+    .unwrap();
+    let panel = c.layout().export_panel();
+    assert!(panel.slider.is_none() && panel.run.is_none());
+    assert!(panel.edges.iter().all(Option::is_none));
+    assert!(panel.summary.is_some() && panel.quality.is_none() && panel.edge.is_none());
+    let (_, _, text) = driven::text(&c.scene()).unwrap();
+    assert!(
+        text.contains("Export the") && !text.contains("Quality"),
+        "{text}"
+    );
+    assert_eq!(press(&mut c, x, y), Outcome::Ignored);
 }

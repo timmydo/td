@@ -37,6 +37,7 @@ const PURE: &[&str] = &[
     "library.rs",
     "look.rs",
     "nef.rs",
+    "settings.rs",
     "tiff.rs",
     "ui.rs",
 ];
@@ -183,14 +184,18 @@ fn pure_modules_reach_no_file_environment_clock_network_or_process() {
     assert!(main.contains("fs::symlink_metadata(out).is_ok()"));
     assert!(!main.contains("File::create("), "a truncating create");
     // Publication is a link, which cannot replace. A rename is the fallback
-    // for a file system without links, and the sidecar's write: the one
-    // file td-photo replaces, through a temporary of its own (DESIGN.md,
-    // Files). Culling's move into `rejected/` is the same rule over the
-    // original: linked, then its old name dropped, with the same fallback.
-    // No fourth rename.
+    // for a file system without links, and the write of td-photo's own
+    // files, the sidecar and the export settings, the ones it replaces,
+    // through one temporary path (`replace_own`; DESIGN.md, Files).
+    // Culling's move into `rejected/` is the same rule over the original:
+    // linked, then its old name dropped, with the same fallback. No
+    // fourth rename.
     assert!(main.contains("fs::hard_link(temporary, out)"));
     assert!(main.contains("fs::rename(temporary, out)"));
-    assert!(main.contains("fs::rename(&temporary, &path)"));
+    assert!(main.contains("fs::rename(&temporary, path)"));
+    assert_eq!(main.matches("fn replace_own(").count(), 1);
+    assert_eq!(main.matches("replace_own(&path, &text)").count(), 1);
+    assert_eq!(main.matches("replace_own(&path, &settings.text())").count(), 1);
     assert!(main.contains("fs::hard_link(from, to)"));
     assert!(main.contains("fs::rename(from, to)"));
     assert_eq!(main.matches("fs::rename(").count(), 3);

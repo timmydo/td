@@ -2017,6 +2017,7 @@ impl Window {
             .zip(key.as_ref())
             .is_some_and(|((roll, _), key)| *roll == key.roll);
         let name = key.as_ref().map_or("", |key| key.name.as_str());
+        let failed = result.is_err();
         let text = match result {
             Ok((out, raw)) => {
                 if let (Some(raw), true, Some(key)) = (raw, held, key.clone()) {
@@ -2027,6 +2028,36 @@ impl Window {
             // The worker noted why.
             Err(_) => format!("export of {name} failed"),
         };
+        // One of the picks' batch: its roll's batch counts it, the note
+        // on the row while that roll is held and on stderr once another
+        // is (as the batch's own), the export's own note only when it
+        // failed; one of a batch the session no longer holds (another
+        // roll's began since) is counted nowhere, its failure noted.
+        if request.batch {
+            if failed {
+                note(&text);
+            }
+            let batch = self
+                .session
+                .batch
+                .as_mut()
+                .filter(|batch| key.as_ref().is_some_and(|key| key.roll == batch.roll));
+            if let Some(batch) = batch {
+                batch.done += 1;
+                batch.failed += usize::from(failed);
+                let finished = batch.finished();
+                let text = batch.note();
+                if finished {
+                    self.session.batch = None;
+                }
+                if held {
+                    self.session.ui.set_export(Some(text));
+                } else {
+                    note(&text);
+                }
+            }
+            return;
+        }
         if held {
             self.session.ui.set_export(Some(text));
         } else {
@@ -2538,6 +2569,8 @@ mod tests {
             exposure: 0,
             crop: None,
             look: None,
+            settings: crate::Settings::default(),
+            batch: false,
         }
     }
 
@@ -3054,6 +3087,8 @@ mod tests {
             exposure: 0,
             crop: None,
             look: None,
+            settings: crate::Settings::default(),
+            batch: false,
         });
         queue.replace_prefetch(vec![photo_key("d")]);
         assert!(queue.take().is_none() && queue.prefetch.is_empty());

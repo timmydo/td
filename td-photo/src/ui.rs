@@ -23,6 +23,7 @@ use td_ui::CELL_WIDTH;
 use crate::develop::{self, CENTRE_UNIT, ZOOM_STEPS};
 use crate::image::Rgb8;
 use crate::library::{self, Crop, Filter, Flag, Key, Sidecar, Step};
+use crate::settings::{self, Settings};
 
 /// The surface a session starts on until it is resized.
 pub const DEFAULT_WIDTH: usize = 800;
@@ -65,6 +66,7 @@ pub const EXPOSURE_FINE: i32 = 10;
 pub enum Mode {
     Cull,
     Develop,
+    Export,
 }
 
 impl Mode {
@@ -72,6 +74,7 @@ impl Mode {
         match self {
             Self::Cull => "cull",
             Self::Develop => "develop",
+            Self::Export => "export",
         }
     }
 }
@@ -212,11 +215,21 @@ pub enum Effect {
         name: String,
         step: usize,
     },
-    /// Export this photo at full resolution into the roll's `exported/`
+    /// Export this photo into the roll's `exported/` at the export settings
     /// through its sidecar as the file holds it then: the replay runs the
     /// verb on the request, the window hands it to its pool; either says
     /// what came of it through `set_export`, the status row's note.
     Export { index: usize, name: String },
+    /// Export every pick of the roll, as the files flag them then, as
+    /// `Export` exports one, with the model's settings, in the roll's
+    /// order: the replay runs them in turn, the window queues them; either
+    /// says how the batch goes through `set_export`, and `ignored` when
+    /// the files hold no pick.
+    ExportPicks,
+    /// Write these export settings to the user's settings file and settle
+    /// the model through `set_settings`; a file that cannot be written
+    /// leaves the model as it was, which is `refused`.
+    Settings(Settings),
     /// Move the roll's rejects, as the files flag them then, with their
     /// sidecars into `rejected/`, and take the moved ones out of the model
     /// through `remove`.
@@ -281,13 +294,17 @@ pub enum Action {
     ZoomIn,
     ZoomOut,
     Export,
+    ExportMode,
+    ExportPicks,
+    Quality,
+    LongEdge,
     DeleteRejected,
     Scroll,
     Quit,
 }
 
 impl Action {
-    pub const ALL: [Action; 53] = [
+    pub const ALL: [Action; 57] = [
         Action::Open,
         Action::Choose,
         Action::Next,
@@ -338,6 +355,10 @@ impl Action {
         Action::ZoomIn,
         Action::ZoomOut,
         Action::Export,
+        Action::ExportMode,
+        Action::ExportPicks,
+        Action::Quality,
+        Action::LongEdge,
         Action::DeleteRejected,
         Action::Scroll,
         Action::Quit,
@@ -397,6 +418,10 @@ impl Action {
             Self::ZoomIn => "zoom-in",
             Self::ZoomOut => "zoom-out",
             Self::Export => "export",
+            Self::ExportMode => "export-mode",
+            Self::ExportPicks => "export-picks",
+            Self::Quality => "quality",
+            Self::LongEdge => "long-edge",
             Self::DeleteRejected => "delete-rejected",
             Self::Scroll => "scroll",
             Self::Quit => "quit",
@@ -422,7 +447,7 @@ impl Action {
 /// binds, the argument shape and the help line. Actions without a chord
 /// take an argument or are the agent's (`open`); the pointer reaches
 /// `select` by pressing a cell and `scroll` by the wheel.
-pub const BINDINGS: [Binding; 53] = [
+pub const BINDINGS: [Binding; 57] = [
     Binding {
         name: "open",
         chord: None,
@@ -721,7 +746,31 @@ pub const BINDINGS: [Binding; 53] = [
         name: "export",
         chord: Some("e"),
         arguments: "",
-        help: "Export the photo under the cursor at full resolution into exported/, with its sidecar's edits.",
+        help: "Export the photo under the cursor into exported/, with its sidecar's edits, at the export settings.",
+    },
+    Binding {
+        name: "export-mode",
+        chord: Some("E"),
+        arguments: "",
+        help: "Show the export view: the settings every export is written with, and the picks' export.",
+    },
+    Binding {
+        name: "export-picks",
+        chord: Some("C-e"),
+        arguments: "",
+        help: "Export every pick of the roll into exported/, each with its sidecar's edits, with the export settings.",
+    },
+    Binding {
+        name: "quality",
+        chord: None,
+        arguments: "N",
+        help: "Set the export JPEG quality to N, 1 to 100; the export view's slider commits one on release.",
+    },
+    Binding {
+        name: "long-edge",
+        chord: None,
+        arguments: "N|full",
+        help: "Shrink every export to N pixels on the long side (never enlarged), or full for the source's own size.",
     },
     Binding {
         name: "delete-rejected",
@@ -755,9 +804,19 @@ pub const FILTERS: [(Filter, &str); 4] = [
 const FILTER_NAMES: [&str; 4] = [FILTERS[0].1, FILTERS[1].1, FILTERS[2].1, FILTERS[3].1];
 
 /// The mode strip's labels: the roll chooser, the cull grid, the cull
-/// single view and develop, in the order `mode_states` reports them.
-const MODES: [&str; 4] = ["Roll Selection", "Culling", "Single", "Develop"];
-const MODE_ACTIONS: [&str; 4] = ["choose", "grid", "view", "develop"];
+/// single view, develop and the export view, in the order `mode_states`
+/// reports them.
+const MODES: [&str; 5] = ["Roll Selection", "Culling", "Single", "Develop", "Export"];
+const MODE_ACTIONS: [&str; 5] = ["choose", "grid", "view", "develop", "export-mode"];
+
+/// The quality slider's steps: a step a quality, 1 to 100.
+pub const QUALITY_STEPS: usize = 99;
+/// The export view's long-edge buttons: the source's own size, then the
+/// common sizes, in order; the `long-edge` action takes any size.
+pub const LONG_EDGES: [Option<u32>; 4] = [None, Some(1024), Some(2048), Some(4096)];
+const EDGE_LABELS: [&str; 4] = ["Full", "1024", "2048", "4096"];
+/// The export view's one action button.
+pub const EXPORT_PICKS: &str = "Export picks";
 
 /// The develop history pane's width in reference pixels: 27 cells, room
 /// for an exposure or look step's row (a crop's shows in whole percents,
@@ -928,6 +987,20 @@ struct SingleView {
 pub struct Tools {
     pub buttons: [Option<Button>; TOOL_COUNT],
     pub slider: Option<Slider>,
+}
+
+/// The export view's controls down the area: the text rows (the picks'
+/// count, the quality, the long edge's caption), the quality slider, the
+/// long-edge buttons (`LONG_EDGES` in order) and the `EXPORT_PICKS`
+/// button, each control `None` where the area cannot hold it whole.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ExportPanel {
+    pub summary: Option<Rect>,
+    pub quality: Option<Rect>,
+    pub slider: Option<Slider>,
+    pub edge: Option<Rect>,
+    pub edges: [Option<Button>; 4],
+    pub run: Option<Button>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1337,6 +1410,70 @@ impl Layout {
         }
     }
 
+    /// The export view's controls (`ExportPanel`) down the area from its
+    /// top, a cell in from each side: a text row for the picks' count, a
+    /// blank one, one for the quality, the slider a band tall across the
+    /// width (when its travel gives every step its own column, td-ui's
+    /// `travel` contract, else `None`), a text row for the long edge's
+    /// caption, the long-edge strip wrapping on the width, then the
+    /// `EXPORT_PICKS` strip; a row or control cut by the area's foot is
+    /// `None`.
+    pub fn export_panel(&self) -> ExportPanel {
+        let s = self.surface.scale.value();
+        let pad = (CELL_PAD * s) as i64;
+        let row = (CELL_HEIGHT * s) as i64;
+        let band = (ROW * s) as i64;
+        let area = self.area;
+        let x = area.x + pad;
+        let width = (i64::from(area.width) - 2 * pad).max(0) as u32;
+        let mut y = area.y + pad / 2;
+        let text_row = |y: i64| {
+            Some(Rect {
+                x,
+                y,
+                width,
+                height: row as u32,
+            })
+            .filter(|rect| within(area, *rect))
+        };
+        let summary = text_row(y);
+        // A blank row parts the summary from the settings.
+        y += 2 * row;
+        let quality = text_row(y);
+        y += row;
+        let slider = Slider::new(
+            self.surface,
+            Rect {
+                x,
+                y,
+                width,
+                height: band as u32,
+            },
+        )
+        .filter(|slider| slider.travel() as usize >= QUALITY_STEPS)
+        .filter(|slider| within(area, slider.rect()));
+        y += band;
+        let edge = text_row(y);
+        y += row;
+        let strip = Buttons::in_band(self.surface, x, y, width, &EDGE_LABELS);
+        let mut edges = [None; 4];
+        for (slot, button) in edges.iter_mut().zip(strip.buttons()) {
+            *slot = button.filter(|b| within(area, b.rect()));
+        }
+        y += (strip.rows() as i64) * band;
+        let run = Buttons::in_band(self.surface, x, y, width, &[EXPORT_PICKS])
+            .button(0)
+            .filter(|b| within(area, b.rect()));
+        ExportPanel {
+            summary,
+            quality,
+            slider,
+            edge,
+            edges,
+            run,
+        }
+    }
+
     /// The pane's button band: `HISTORY_BUTTONS` as a strip on the pane's
     /// width, wrapping, at the area's foot.
     fn history_strip(&self) -> Buttons<'static> {
@@ -1473,9 +1610,10 @@ pub struct Controller {
     /// The first history step the pane shows, moved as little as possible
     /// to keep the selection in view.
     history_first: usize,
-    /// The exposure slider's drag: the value under the pointer since the
-    /// press, painted as the knob, committed on release. Dropped with the
-    /// crop drag when the photo, mode or surface changes.
+    /// The exposure slider's drag (the quality slider's in the export
+    /// view): the value under the pointer since the press, painted as the
+    /// knob, committed on release. Dropped with the crop drag when the
+    /// photo, mode or surface changes.
     slider: Option<usize>,
     /// Whether the buttons show their chords as hints: while Alt is held
     /// (`Input::Held`), until it is released or the focus leaves. A fact
@@ -1503,6 +1641,11 @@ pub struct Controller {
     /// holds: what the zoom ladder and a pan measure against. `None` until
     /// a develop of the photo lands. A fact, absent from `state`.
     extent: Option<(usize, usize)>,
+    /// The export settings every export is written with, as the adapter
+    /// last settled them (`set_settings`: the user's file at open, then
+    /// each `Settings` effect it wrote): `state` fields the export view
+    /// shows, kept across rolls and modes.
+    settings: Settings,
 }
 
 /// A pan drag: the press anchor and the pointer's current point, both in
@@ -2060,6 +2203,7 @@ impl Controller {
             centre: (CENTRE_UNIT / 2, CENTRE_UNIT / 2),
             pan: None,
             extent: None,
+            settings: Settings::default(),
         }
     }
 
@@ -2415,6 +2559,40 @@ impl Controller {
         }
     }
 
+    /// The export settings as the adapter settled them: the user's file
+    /// at open, then each `Settings` effect as it is written. A change
+    /// (`state` reports them, and the export view shows them) is a new
+    /// generation; the same settings again are `Ignored`.
+    pub fn set_settings(&mut self, settings: Settings) -> Outcome {
+        if self.settings == settings {
+            return Outcome::Ignored;
+        }
+        self.settings = settings;
+        self.bump();
+        Outcome::Changed
+    }
+
+    /// The export settings in force.
+    pub fn settings(&self) -> Settings {
+        self.settings
+    }
+
+    /// The quality slider's value: the drag's while one is on, else the
+    /// setting's.
+    fn quality_value(&self) -> usize {
+        self.slider
+            .unwrap_or(usize::from(self.settings.quality.saturating_sub(1)))
+    }
+
+    /// The picks the model holds: what the export view counts and what
+    /// enables its button; the files decide what `export-picks` exports.
+    fn picks(&self) -> usize {
+        self.photos
+            .iter()
+            .filter(|photo| photo.flag() == Some(Flag::Pick))
+            .count()
+    }
+
     /// The develop history the pane shows: the cursor photo's steps in
     /// develop mode, oldest first; empty in cull or before a photo.
     pub fn steps(&self) -> &[Step] {
@@ -2765,12 +2943,14 @@ impl Controller {
     /// else the mode, cull's grid or single view; nothing before a roll,
     /// when no mode is in view), Culling can be pressed once a roll is
     /// open and Single and Develop once there is a photo under the cursor.
-    pub fn mode_states(&self) -> [(bool, bool); 4] {
+    pub fn mode_states(&self) -> [(bool, bool); 5] {
         let roll = self.roll.is_some();
         let photo = roll && self.cursor.is_some();
         let in_view = if self.chooser.is_some() {
             0
         } else if !roll {
+            5
+        } else if self.mode == Mode::Export {
             4
         } else if self.mode == Mode::Develop {
             3
@@ -2784,6 +2964,7 @@ impl Controller {
             (in_view == 1, roll),
             (in_view == 2, photo),
             (in_view == 3, photo),
+            (in_view == 4, roll),
         ]
     }
 
@@ -2802,45 +2983,82 @@ impl Controller {
     }
 
     /// A press on the mode strip: the roll chooser, the cull grid, the
-    /// cull single view or develop, from whatever is in view. The one in
-    /// view is `ignored`, as is one whose button is disabled: culling
-    /// before a roll, single or develop before a photo. Culling and Single
-    /// leave develop whole (its palette, its crop-adjust and any drag with
-    /// it) and close the chooser, to the grid or the single view of the
-    /// cursor's photo; develop closes the chooser too.
+    /// cull single view, develop or the export view, from whatever is in
+    /// view. The one in view is `ignored`, as is one whose button is
+    /// disabled: culling or export before a roll, single or develop
+    /// before a photo. Culling and Single leave develop whole (its
+    /// palette, its crop-adjust and any drag with it) or the export view
+    /// and close the chooser, to the grid or the single view of the
+    /// cursor's photo; Develop and Export close the chooser too.
     fn press_mode(&mut self, index: usize) -> Result<(Outcome, Vec<Effect>), Error> {
         let roll = self.roll.is_some();
         let photo = roll && self.cursor.is_some();
         let chooser = self.chooser.is_some();
         // Culling or Single is a change unless its view is the one in view
         // with nothing over it.
-        let to_grid = chooser || self.mode == Mode::Develop || self.view != View::Grid;
-        let to_single = chooser || self.mode == Mode::Develop || self.view != View::Single;
+        let to_grid = chooser || self.mode != Mode::Cull || self.view != View::Grid;
+        let to_single = chooser || self.mode != Mode::Cull || self.view != View::Single;
         match index {
             0 if !chooser => self.choose(Vec::new()),
             1 if roll && to_grid => {
                 self.chooser = None;
-                if self.mode == Mode::Develop {
-                    self.leave_develop();
-                }
+                self.leave_mode();
                 self.view = View::Grid;
                 Ok((self.finish(Outcome::Changed), Vec::new()))
             }
             2 if photo && to_single => {
                 self.chooser = None;
-                if self.mode == Mode::Develop {
-                    self.leave_develop();
-                }
+                self.leave_mode();
                 self.view = View::Single;
                 Ok((self.finish(Outcome::Changed), Vec::new()))
             }
-            3 if photo && (chooser || self.mode == Mode::Cull) => {
+            3 if photo && (chooser || self.mode != Mode::Develop) => {
                 self.chooser = None;
                 self.enter_develop()?;
                 Ok((self.finish(Outcome::Changed), Vec::new()))
             }
+            4 if roll && (chooser || self.mode != Mode::Export) => {
+                self.chooser = None;
+                self.enter_export()?;
+                Ok((self.finish(Outcome::Changed), Vec::new()))
+            }
             _ => Ok((Outcome::Ignored, Vec::new())),
         }
+    }
+
+    /// Develop or the export view to the cull grid, whichever is open;
+    /// nothing in cull.
+    fn leave_mode(&mut self) {
+        match self.mode {
+            Mode::Develop => self.leave_develop(),
+            Mode::Export => self.leave_export(),
+            Mode::Cull => {}
+        }
+    }
+
+    /// The export view: the settings every export is written with and
+    /// the picks' export, over the area in place of the grid. Needs a
+    /// roll; `Ignored` when it is in view; leaves develop whole, as
+    /// Culling does, and the single view.
+    fn enter_export(&mut self) -> Result<Outcome, Error> {
+        self.need_roll()?;
+        if self.mode == Mode::Export {
+            return Ok(Outcome::Ignored);
+        }
+        if self.mode == Mode::Develop {
+            self.leave_develop();
+        }
+        self.mode = Mode::Export;
+        self.view = View::Grid;
+        self.slider = None;
+        Ok(Outcome::Changed)
+    }
+
+    /// The export view to the cull grid, a slider drag dropped.
+    fn leave_export(&mut self) {
+        self.mode = Mode::Cull;
+        self.view = View::Grid;
+        self.slider = None;
     }
 
     /// Develop to the cull grid, its sub-modes and drag dropped: what
@@ -2880,7 +3098,7 @@ impl Controller {
         match (self.mode, self.view) {
             (Mode::Develop, _) => self.layout().develop_box(),
             (Mode::Cull, View::Single) => self.layout().preview_box(),
-            (Mode::Cull, View::Grid) => None,
+            (Mode::Cull, View::Grid) | (Mode::Export, _) => None,
         }
     }
 
@@ -2930,7 +3148,7 @@ impl Controller {
         if self.mode == Mode::Develop {
             return self.film();
         }
-        if self.view != View::Grid {
+        if self.view != View::Grid || self.mode == Mode::Export {
             return Vec::new();
         }
         let layout = self.layout();
@@ -3030,6 +3248,8 @@ impl Controller {
                 let outcome = self.zoom_by(step)?;
                 Ok((self.finish(outcome), Vec::new()))
             }
+            // The export view has no grid to scroll.
+            Input::Wheel { .. } if self.mode == Mode::Export => Ok((Outcome::Ignored, Vec::new())),
             Input::Wheel { rows, .. } => {
                 let outcome = self.scroll(i64::from(rows));
                 Ok((self.finish(outcome), Vec::new()))
@@ -3110,6 +3330,8 @@ impl Controller {
             self.steps().len().to_string(),
             self.history_step.map_or_else(dash, |step| step.to_string()),
             zoom_word(self.zoom()),
+            self.settings.quality.to_string(),
+            settings::long_edge_text(self.settings.long_edge),
         ]
         .join("\t")
     }
@@ -3208,6 +3430,11 @@ impl Controller {
                 return Ok((Outcome::Changed, effects));
             }
             (Action::Quit, []) => Outcome::Quit,
+            // The export view has no grid to scroll.
+            (Action::Scroll, [rows]) if self.mode == Mode::Export => {
+                signed(rows)?;
+                Outcome::Ignored
+            }
             (Action::Scroll, [rows]) => self.scroll(signed(rows)?),
             (Action::All, []) => self.set_filter(Filter::All),
             (Action::Picks, []) => self.set_filter(Filter::Picks),
@@ -3273,6 +3500,10 @@ impl Controller {
             (Action::ZoomIn, []) => self.zoom_by(ZoomStep::In)?,
             (Action::ZoomOut, []) => self.zoom_by(ZoomStep::Out)?,
             (Action::Export, []) => return self.export(effects),
+            (Action::ExportMode, []) => self.enter_export()?,
+            (Action::ExportPicks, []) => return self.export_picks(effects),
+            (Action::Quality, [quality]) => return self.set_quality(quality, effects),
+            (Action::LongEdge, [edge]) => return self.set_long_edge(edge, effects),
             (Action::DeleteRejected, []) => return self.delete_rejected(effects),
             _ => return Err(control::Error::Protocol.into()),
         };
@@ -3368,6 +3599,13 @@ impl Controller {
             }
             return self.crop_pointer(phase, x, y);
         }
+        // The export view: the slider's drag owns the pointer once
+        // pressed; a press on a long-edge button or Export picks asks
+        // what it says; the rest of the area, the filter strip and a
+        // move or release are inert.
+        if self.mode == Mode::Export {
+            return self.export_pointer(phase, x, y);
+        }
         // Only a press, and only on the surface: a button the width does
         // not show whole is not a target. The bands are tested last
         // painted first, so on a surface too short for them the status row
@@ -3397,6 +3635,92 @@ impl Controller {
             },
         };
         Ok((self.finish(outcome), Vec::new()))
+    }
+
+    /// The pointer in the export view. The quality slider: a press on it
+    /// moves the knob to the pointer's step and starts a drag that follows
+    /// the pointer's column wherever it goes, each step it crosses a frame
+    /// change; its release commits the step it rests on as the `quality`
+    /// action would, or nothing when that is the setting's own step (then
+    /// a frame change only if the drag had moved the knob). A press on a
+    /// long-edge button sets that edge as `long-edge` would (`Ignored` on
+    /// the one in force), on Export picks asks for the picks' export
+    /// (`Ignored` with none picked); anything else is `Ignored`.
+    fn export_pointer(
+        &mut self,
+        phase: PointerPhase,
+        x: i64,
+        y: i64,
+    ) -> Result<(Outcome, Vec<Effect>), Error> {
+        let panel = self.layout().export_panel();
+        let held = usize::from(self.settings.quality.saturating_sub(1));
+        if let Some(value) = self.slider {
+            let Some(slider) = panel.slider else {
+                self.slider = None;
+                return Ok((self.finish(Outcome::Changed), Vec::new()));
+            };
+            let at = slider.value_at(x, QUALITY_STEPS);
+            return match phase {
+                PointerPhase::Press | PointerPhase::Move => {
+                    if at == value {
+                        Ok((Outcome::Ignored, Vec::new()))
+                    } else {
+                        self.slider = Some(at);
+                        Ok((self.finish(Outcome::Changed), Vec::new()))
+                    }
+                }
+                PointerPhase::Release => {
+                    self.slider = None;
+                    if held == at {
+                        // Back where the knob was: a frame change only if
+                        // the drag had moved it.
+                        let outcome = if value == at {
+                            Outcome::Ignored
+                        } else {
+                            Outcome::Changed
+                        };
+                        return Ok((self.finish(outcome), Vec::new()));
+                    }
+                    // The knob paints the setting again from here,
+                    // whatever becomes of the write, so the frame moves.
+                    if held != value {
+                        self.bump();
+                    }
+                    let quality = u8::try_from(at + 1).map_err(|_| Error::BadArgument)?;
+                    self.set_quality(&quality.to_string(), Vec::new())
+                }
+            };
+        }
+        if phase != PointerPhase::Press
+            || !self.surface.bounds().contains(x, y)
+            || Status::new(self.surface).rect().contains(x, y)
+        {
+            return Ok((Outcome::Ignored, Vec::new()));
+        }
+        if let Some(slider) = panel.slider.filter(|slider| slider.hit(x, y)) {
+            let at = slider.value_at(x, QUALITY_STEPS);
+            self.slider = Some(at);
+            let outcome = if held == at {
+                Outcome::Ignored
+            } else {
+                Outcome::Changed
+            };
+            return Ok((self.finish(outcome), Vec::new()));
+        }
+        if let Some(which) = panel
+            .edges
+            .iter()
+            .position(|button| button.is_some_and(|button| button.hit(x, y)))
+        {
+            let Some(edge) = LONG_EDGES.get(which) else {
+                return Ok((Outcome::Ignored, Vec::new()));
+            };
+            return self.set_long_edge(&settings::long_edge_text(*edge), Vec::new());
+        }
+        if panel.run.is_some_and(|button| button.hit(x, y)) && self.picks() > 0 {
+            return self.export_picks(Vec::new());
+        }
+        Ok((Outcome::Ignored, Vec::new()))
     }
 
     /// The pointer over the history pane, `None` when it is not over it.
@@ -4149,7 +4473,7 @@ impl Controller {
     /// develop is scoped to the one photo. The strips are still painted, so the
     /// keys `1`-`4` and a press on it are inert here, not absent.
     fn set_filter(&mut self, filter: Filter) -> Outcome {
-        if self.mode == Mode::Develop || self.filter == filter {
+        if self.mode != Mode::Cull || self.filter == filter {
             return Outcome::Ignored;
         }
         self.filter = filter;
@@ -4299,6 +4623,10 @@ impl Controller {
         }
         if self.mode == Mode::Develop {
             self.leave_develop();
+            return Outcome::Changed;
+        }
+        if self.mode == Mode::Export {
+            self.leave_export();
             return Outcome::Changed;
         }
         self.set_view(View::Grid)
@@ -4509,7 +4837,7 @@ impl Controller {
         Ok((Outcome::Ignored, effects))
     }
 
-    /// Asks for the cursor photo's export, in either mode: the export is not
+    /// Asks for the cursor photo's export, in any mode: the export is not
     /// a develop edit but the roll's, so the cull grid exports too. The
     /// adapter carries it out and reports through `set_export`.
     fn export(&mut self, effects: Vec<Effect>) -> Result<(Outcome, Vec<Effect>), Error> {
@@ -4527,10 +4855,58 @@ impl Controller {
         mut effects: Vec<Effect>,
     ) -> Result<(Outcome, Vec<Effect>), Error> {
         self.need_roll()?;
-        if self.mode == Mode::Develop {
+        if self.mode != Mode::Cull {
             return Ok((Outcome::Ignored, effects));
         }
         effects.push(Effect::DeleteRejected);
+        Ok((Outcome::Changed, effects))
+    }
+
+    /// Asks for every pick's export, in any mode: the files say which
+    /// photos are picks, as they say which are rejects, so the dispatch
+    /// asks whenever a roll is open and the adapter answers `ignored`
+    /// when they hold none.
+    fn export_picks(&mut self, mut effects: Vec<Effect>) -> Result<(Outcome, Vec<Effect>), Error> {
+        self.need_roll()?;
+        effects.push(Effect::ExportPicks);
+        Ok((Outcome::Changed, effects))
+    }
+
+    /// Asks for the export quality `text` spells (1 to 100, else
+    /// `bad-argument`): `Ignored` when it is the setting in force, else
+    /// the adapter writes the settings and settles them.
+    fn set_quality(
+        &mut self,
+        text: &str,
+        mut effects: Vec<Effect>,
+    ) -> Result<(Outcome, Vec<Effect>), Error> {
+        let quality = settings::parse_quality(text).ok_or(Error::BadArgument)?;
+        if quality == self.settings.quality {
+            return Ok((Outcome::Ignored, effects));
+        }
+        effects.push(Effect::Settings(Settings {
+            quality,
+            ..self.settings
+        }));
+        Ok((Outcome::Changed, effects))
+    }
+
+    /// Asks for the export long edge `text` spells (`full`, or 1 to
+    /// `settings::MAX_LONG_EDGE`, else `bad-argument`), as `set_quality`
+    /// asks for the quality.
+    fn set_long_edge(
+        &mut self,
+        text: &str,
+        mut effects: Vec<Effect>,
+    ) -> Result<(Outcome, Vec<Effect>), Error> {
+        let long_edge = settings::parse_long_edge(text).ok_or(Error::BadArgument)?;
+        if long_edge == self.settings.long_edge {
+            return Ok((Outcome::Ignored, effects));
+        }
+        effects.push(Effect::Settings(Settings {
+            long_edge,
+            ..self.settings
+        }));
         Ok((Outcome::Changed, effects))
     }
 
@@ -4567,7 +4943,8 @@ impl Controller {
             self.aspect = Aspect::Free;
             self.look_list = false;
         }
-        if self.cursor.is_none() {
+        // The export view is the roll's, not the cursor's, so it stays.
+        if self.cursor.is_none() && self.mode != Mode::Export {
             self.view = View::Grid;
             self.mode = Mode::Cull;
             self.drag = None;
@@ -4758,6 +5135,7 @@ impl Scene<'_> {
             }
             Mode::Cull if model.view == View::Single => line.push_str(" | single"),
             Mode::Cull => {}
+            Mode::Export => line.push_str(" | export"),
         }
         if let Some(note) = &model.export {
             line.push_str(" | ");
@@ -4983,6 +5361,76 @@ impl Scene<'_> {
                     .and_then(|action| model.hint(action));
                 button.emit_hinted(label, hint, selected, true, damage, sink);
             }
+        }
+    }
+
+    /// The export view over the area: the picks' count and where they go,
+    /// the quality and its slider at the setting or under the drag, the
+    /// long edge's caption and its buttons with the setting's selected
+    /// (none when the `long-edge` action set a size that is no button's),
+    /// and Export picks, enabled while a photo is picked. While the hints
+    /// are shown Export picks carries its chord.
+    fn export(&self, layout: &Layout, roll: &Roll, damage: Rect, sink: &mut dyn FnMut(Draw)) {
+        let model = self.model;
+        let scale = layout.surface.scale;
+        fill(layout.area, PAPER, damage, sink);
+        let panel = layout.export_panel();
+        let style = GlyphStyle::medium(INK, PAPER);
+        let picks = model.picks();
+        let text = |rect: Option<Rect>, line: String, sink: &mut dyn FnMut(Draw)| {
+            if let Some(rect) = rect {
+                text_run(
+                    scale,
+                    line.chars(),
+                    (rect.x, rect.y),
+                    rect,
+                    style,
+                    damage,
+                    sink,
+                );
+            }
+        };
+        text(
+            panel.summary,
+            format!(
+                "Export the {picks} picked of {} into {}/{}/ as JPEG, never replacing a name",
+                model.photos.len(),
+                roll.label,
+                library::EXPORTED
+            ),
+            sink,
+        );
+        text(
+            panel.quality,
+            format!("Quality {}", model.quality_value() + 1),
+            sink,
+        );
+        if let Some(slider) = panel.slider {
+            slider.emit(model.quality_value(), QUALITY_STEPS, true, damage, sink);
+        }
+        text(
+            panel.edge,
+            format!(
+                "Long edge {}",
+                settings::long_edge_text(model.settings.long_edge)
+            ),
+            sink,
+        );
+        for ((button, label), edge) in panel.edges.into_iter().zip(EDGE_LABELS).zip(LONG_EDGES) {
+            if let Some(button) = button {
+                let selected = edge == model.settings.long_edge;
+                button.emit_hinted(label, None, selected, true, damage, sink);
+            }
+        }
+        if let Some(button) = panel.run {
+            button.emit_hinted(
+                EXPORT_PICKS,
+                model.hint("export-picks"),
+                false,
+                picks > 0,
+                damage,
+                sink,
+            );
         }
     }
 
@@ -5261,6 +5709,7 @@ impl Composition for Scene<'_> {
                 None => self.grid(&layout, damage, sink),
             },
             (Some(_), Mode::Cull, View::Grid) => self.grid(&layout, damage, sink),
+            (Some(roll), Mode::Export, _) => self.export(&layout, roll, damage, sink),
         }
         Status::new(layout.surface).emit(self.status_line().chars(), damage, sink);
     }

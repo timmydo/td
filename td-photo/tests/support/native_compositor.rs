@@ -754,8 +754,9 @@ fn the_window_develops_the_cursor_photo_over_the_native_compositor() {
     );
     client.settle(9);
     let state = client.request(10, &["state"]);
+    // The zoom is the field before the two export settings.
     assert_eq!(
-        state.last().map(String::as_str),
+        state.get(state.len().wrapping_sub(3)).map(String::as_str),
         Some("100@5000,5000"),
         "{state:?}"
     );

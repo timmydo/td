@@ -55,8 +55,9 @@ with and the Wayland client the window runs on; the window's develop mode
 lands over its own slices: the mode, its keys and the develop edits over the
 seam and the socket are in, as are the developed preview and the crop drag
 with its edge and corner handles and the look palette; the `export` verb and
-the window's `export` action are in, and `delete-rejected` closes the
-export increment. The crate is packaged: the `td-photo` target recipe
+the window's `export` action are in, `delete-rejected` with them, and the
+export view with its settings and the picks' export closes the export
+increment but for AVIF. The crate is packaged: the `td-photo` target recipe
 builds it static over the staged td-ui and td-compositor trees, the image
 copies its output and links `/bin/td-photo`, and `td-photo-test` runs the
 built binary's verbs over a synthetic frame (Packaging below).
@@ -89,7 +90,7 @@ is its one dependency and which files name which of its modules.
 
 ## Workflow
 
-One window, three modes, all keyboard-first; the pointer does the same
+One window, four modes, all keyboard-first; the pointer does the same
 things, and so does an agent, through the same actions (see Driving). The
 modes are the photographer's order of work.
 
@@ -145,7 +146,15 @@ modes are the photographer's order of work.
    writes an sRGB JPEG into the roll's `exported/` folder, never
    overwriting: a second export of the same name takes a numbered suffix
    (Files, below). The status row says what came of it. `td-photo export
-   FILE` is it headless.
+   FILE` is it headless. The export view, entered with `E` (or the mode
+   strip's Export) and left with `Escape`, shows the settings every export
+   is written with -- the JPEG quality on a slider, the long edge the
+   image is shrunk to on a row of buttons (Full, 1024, 2048, 4096) --
+   kept in the user's settings file between sessions (Files, Settings),
+   and its Export picks button (`C-e` anywhere) exports every pick of the
+   roll with them, the status row counting them as they land.
+   `td-photo export-picks ROLL` is that headless, the settings on its
+   command line.
 
 ## Driving
 
@@ -163,7 +172,8 @@ window, all speaking the toolkit's one vocabulary.
   look shortcuts `look-1`..`look-9`, crop and `uncrop`, crop-adjust, aspect,
   the look palette (`looks`), reset, undo and the history's step toggle and
   delete, the zoom (`zoom-fit`, `zoom-100`, `zoom-in`, `zoom-out`), export,
-  and delete rejected).
+  the export view (`export-mode`), its settings (`quality`, `long-edge`),
+  the picks' export (`export-picks`), and delete rejected).
   `ui::Controller` holds the model (the roll's names and sidecars, the cursor,
   the filter, the view, the scroll and the surface, and the shown list the
   filter admits, kept rather than rescanned); `action(name, fields)` and
@@ -171,7 +181,8 @@ window, all speaking the toolkit's one vocabulary.
   action to it and return the outcome and the `Effect`s the adapter carries out
   (`Open` this folder, `List` it for the chooser, `Flag` that photo, `Expose`
   by a delta, `Edit` a crop or look, `Reset` to camera defaults, `Undo` the
-  last step, `StepToggle` and `StepDelete` a step, `Export` that photo).
+  last step, `StepToggle` and `StepDelete` a step, `Export` that photo,
+  `ExportPicks` every pick, `Settings` the export settings).
   The keyboard bindings, the pointer hit-testing, the replay stream and the
   control socket are four adapters over that one dispatcher, and nothing
   reaches the model around it. The cursor is
@@ -196,29 +207,32 @@ window, all speaking the toolkit's one vocabulary.
   held, and the budget holds at every settle as at open: a flag that would take
   the roll past it is refused before anything is written, and a sidecar that
   grew past it meanwhile is not held, its photo shown as refused.
-- **Two modes, and a strip that names what is in view.** The controller is
-  in `cull`
-  or `develop`; `develop` is a view of one photo, the cursor's, its history
-  pane beside it, entered
+- **Three modes, and a strip that names what is in view.** The controller
+  is in `cull`, `develop` or `export`; `develop` is a view of one photo,
+  the cursor's, its history pane beside it, entered
   with the `develop` action (`d`) and left with `grid` (`Escape`), which
-  returns to the cull grid. The mode strip (td-ui's `chrome::Buttons`,
-  the window's first band: Roll Selection, Culling, Single, Develop)
+  returns to the cull grid; `export` is the roll's export view (below),
+  entered with `export-mode` (`E`) and left the same way. The mode strip
+  (td-ui's `chrome::Buttons`, the window's first band: Roll Selection,
+  Culling, Single, Develop, Export)
   shows which is in view (cull's grid or single view apart), the roll
   chooser while it is open and none before a roll,
   and a press on it is the one target every mode shares (`press_mode`):
   Roll Selection is `choose`, Culling closes the chooser or leaves
   develop whole (its palette, crop-adjust and any drag dropped, as `grid`
-  does once they are down) to the grid, Single does the same to the
-  single view of the cursor's photo (what `view`, `Return`, toggles from
-  the grid), and Develop closes the chooser and develops
-  the cursor's photo. The
-  one in view is `ignored`, as is a disabled button: Culling before a
-  roll, Single and Develop before a photo (`mode_states`);
+  does once they are down) or the export view to the grid, Single does
+  the same to the single view of the cursor's photo (what `view`,
+  `Return`, toggles from the grid), Develop closes the chooser and
+  develops the cursor's photo, and Export closes the chooser and shows
+  the export view. The
+  one in view is `ignored`, as is a disabled button: Culling and Export
+  before a roll, Single and Develop before a photo (`mode_states`);
   `filter_states` disables
-  the filter strip in develop and under the chooser, where the filters
-  are not the mode's, its buttons inert. The develop edits are
-  that mode's alone and are `ignored` in cull; the cull filters and the
-  single-view toggle are cull's and are `ignored` in develop. Exposure is a
+  the filter strip in develop, in the export view and under the chooser,
+  where the filters are not the mode's, its buttons inert. The develop
+  edits are that mode's alone and are `ignored` in cull and export; the
+  cull filters, `delete-rejected` and the single-view toggle are cull's
+  and are `ignored` in develop and export. Exposure is a
   delta, `expose-in`/`expose-out` a third of a stop and
   `expose-in-fine`/`expose-out-fine` a tenth, added by the adapter to the
   file's exposure as it stands (concurrency-correct as a flag is, not the
@@ -384,7 +398,7 @@ window, all speaking the toolkit's one vocabulary.
   and none without a strip (the wants stand under the chooser, as the grid's
   do).
 - **Export is the roll's, not develop's.** `export` (`e`) asks for the
-  cursor photo's export in either mode; the dispatch is `changed` with the
+  cursor photo's export in any mode; the dispatch is `changed` with the
   effect and moves nothing in the model. The adapter reads the sidecar as the
   file holds it when the action arrives (a refused sidecar refuses the action
   before anything is read) and runs `export_file`, the verb's own runner: the
@@ -397,7 +411,68 @@ window, all speaking the toolkit's one vocabulary.
   but one the row shows, so a note that differs from the one held moves the
   generation and the same note again does not; it is cleared when a roll
   opens, and the row's note is the open roll's: an export of a roll opened
-  before that finishes after the switch is noted on stderr instead.
+  before that finishes after the switch is noted on stderr instead. Every
+  export is written with the export settings in force (below), read from
+  the model when the request is made.
+- **The export view.** `export-mode` (`E`, the strip's Export) shows,
+  over the area in place of the grid, the settings every export is
+  written with and the picks' export; it needs a roll (`no-roll`), is
+  `ignored` when it is in view, leaves develop whole as Culling does and
+  ends the single view, and `grid` (`Escape`) returns to the grid; a
+  roll opening leaves it too. It is the roll's, not the cursor's: the
+  cursor's moves still walk the shown (`Left`, `Right`, the pages), a
+  cursor lost to a flag does not end it, and the wheel and `scroll`,
+  `view` and the grid's own actions are `ignored`. The settings are the
+  JPEG `quality` (1 to 100, `jpeg::QUALITY`, 92, at first) and the
+  `long-edge` (`full`, or 1 to `settings::MAX_LONG_EDGE`, 16384, pixels
+  on the long side, the source's own size at first) every export is
+  shrunk to, never enlarged; `state` reports both as its last two fields
+  and they are kept across rolls and modes. Each is set by its action
+  in any mode (`quality N`, `long-edge N|full`, `bad-argument` outside
+  its grammar): the value in force is `ignored` with nothing asked,
+  else the dispatch is `changed` with a `Settings` effect carrying the
+  whole settings, the adapter writes them to the user's file (Files,
+  Settings) and settles the model through `set_settings`, a change and
+  a bump when they differ from those held, and a file that cannot be
+  written is `refused` with the reason on stderr, the model as it was.
+  The view (`Layout::export_panel`, down the area a cell in from each
+  side) is a text row counting the picks and naming where they go, a
+  row naming the quality, the quality slider (td-ui's `chrome::Slider`,
+  `QUALITY_STEPS` (99) steps, a quality each, across the width when the
+  travel gives every step its own column, else none), a row naming the
+  long edge, the long-edge strip (`LONG_EDGES`: Full, 1024, 2048, 4096,
+  the setting's selected, none when the action set another size,
+  wrapping on the width) and the Export picks button, enabled while the
+  model holds a pick; a control the area cannot hold whole is not laid.
+  The slider drags as the exposure slider does: a press moves the knob
+  to the pointer's step and starts a drag that owns the pointer wherever
+  it goes, each step crossed a frame change and no write, and the
+  release commits the step it rests on as `quality` would, or writes
+  nothing when it is the setting's own step; a long-edge button sets
+  that edge as `long-edge` would; the view's other pixels, the filter
+  strip and a move or release are inert. Leaving the view drops a drag.
+  `export-picks` (`C-e`, the button) asks for every pick's export in any
+  mode with a roll: as `delete-rejected` asks, the files say which
+  photos are picks, so the dispatch asks whenever a roll is open with
+  an `ExportPicks` effect and the adapter reads the roll's picks as
+  their sidecars flag them (`read_picks`), `ignored` when they hold
+  none. Each pick is an export as `export` makes one, with the settings
+  in force, in the roll's order: the replay runs them in turn on the
+  request, `changed` when all landed and `refused` when any failed
+  (each reason on stderr), the note set once; the window queues them to
+  its pool behind any export already asked for, `changed` as they are
+  queued, and counts them as they land (`Batch`, the roll's: a pick
+  whose sidecar is refused between the listing and its request is
+  counted failed at once; one refused at the listing is no pick, as it
+  is no reject to `delete-rejected`): the note is `exporting pick N of
+  M` while any is outstanding, then `exported K of M picks` with `, F
+  failed` when any did, an export of the batch never noted on its own
+  but on stderr when it failed; a second batch of the same roll asked
+  for while one runs queues behind it and the counts add up, while a
+  roll opening leaves the batch to finish on stderr (its note the
+  batch's, as a single export's is) and the next batch is the new
+  roll's own, the old tally dropped with it (its landings counted
+  nowhere, a failure still noted).
 - **Delete rejected is the files'.** `delete-rejected` (`Delete`) is the
   cull grid's action, as the filters are, so develop mode ignores it; with
   a roll open the dispatch asks whenever it is called, since the files, not
@@ -478,10 +553,11 @@ window, all speaking the toolkit's one vocabulary.
 - **A headless verb for every durable effect.** Whatever an action does to
   files is also a command-line verb: `import`, `list`, `flag`, `edit`
   (get and set of a sidecar's values), `delete-rejected`, `develop`,
-  `export`, `thumb`,
-  `looks` and `cache clear`. Verbs are the batch face: they read the same
-  sidecars and write them the same way, and an agent that does not need
-  to see pixels never opens a window.
+  `export`, `export-picks` (both taking `--quality` and `--long-edge` on
+  the command line, at their defaults without; the settings file is the
+  window's), `thumb`, `looks` and `cache clear`. Verbs are the batch
+  face: they read the same sidecars and write them the same way, and an
+  agent that does not need to see pixels never opens a window.
 - **`--replay`: the window without a display.** `td-photo --replay [--size WxH]
   [ROLL]` reads requests on stdin and answers on stdout through td-ui's replay
   runner and `driven::request`, in the envelope td-ui/DESIGN.md defines: a
@@ -509,8 +585,10 @@ window, all speaking the toolkit's one vocabulary.
   window last reported it (the turn before), the frame generation, the
   chooser's listed folder in hex, then the history's step count and the
   selected step's index, then the zoom (`fit`, or the percent and the
-  centre as `PERCENT@X,Y`, `fit` in cull too); `-` stands for a roll, a
-  photo, a chooser or a selection that is absent. The generation
+  centre as `PERCENT@X,Y`, `fit` in cull too), then the export quality
+  and the long edge (`full` or the pixels); `-` stands for a roll, a
+  photo, a chooser or a selection that is absent. The mode is `cull`,
+  `develop` or `export`. The generation
   moves on a change and on nothing else: not on a step at an end, a filter, view
   or size already set, a refused open, or a refused flag that leaves the file as
   the model held it; a settle that brings a file changed meanwhile is a change.
@@ -594,11 +672,11 @@ window, all speaking the toolkit's one vocabulary.
   action name, the key it binds, argument shape and a help line, held to the
   seam's grammar by `driven::check` in `tests/ui.rs`, which also pins that every
   action either binds a key, takes a typed argument (`look` a stem, `aspect` a
-  ratio) or is reached by the pointer (`select` by a press on a cell, `scroll`
-  by the wheel, `crop` by a marquee or a crop-adjust handle over the develop
-  preview) or is the agent's (`open`; `choose`, `o`, is the person's way to
-  one). `td-photo --help actions` prints the
-  table so an agent can read it
+  ratio, `quality` and `long-edge` a size) or is reached by the pointer
+  (`select` by a press on a cell, `scroll` by the wheel, `crop` by a
+  marquee or a crop-adjust handle over the develop preview) or is the
+  agent's (`open`; `choose`, `o`, is the person's way to one).
+  `td-photo --help actions` prints the table so an agent can read it
   instead of guessing.
 
 ## Files
@@ -695,8 +773,9 @@ The library is folders of originals; there is no database.
   `edit` refuse to rewrite it. A name at the sidecar's place that is not a
   regular file (a link, a fifo, a folder) is refused the same way, checked by
   name before the open, with the window between the two that the Cache bullet
-  names. Writes go through `NAME.ext.edit.tmp`, synced and renamed into place:
-  the sidecar is td-photo's own file and the one it replaces, and the temporary
+  names. Writes go through `NAME.ext.edit.tmp`, synced and renamed into place
+  (`replace_own`): the sidecar is td-photo's own file, one of the two it
+  replaces (the export settings are the other), and the temporary
   is created exclusively, so a stale one is reported rather than reused or
   removed; an edit that would take the sidecar past the ceilings above is
   refused before anything is written, so what td-photo writes it reads.
@@ -738,7 +817,37 @@ The library is folders of originals; there is no database.
   replaced. The export takes the sidecar's exposure, crop and look as the
   file holds them; a sidecar the reader refuses, or a look it cannot find,
   refuses the export before anything is written, since developing at camera
-  defaults would silently drop the edits.
+  defaults would silently drop the edits. It is written at the export
+  settings' quality and shrunk to their long edge (Colour and development,
+  Export).
+- **Settings**: `$XDG_CONFIG_HOME/td-photo/export` (`~/.config/td-photo/
+  export` when that variable is not absolute), the export settings the
+  window keeps between sessions, UTF-8 text in the sidecar's shape
+  (`settings::Settings`):
+
+  ```text
+  td-photo export 1
+  quality 92
+  long-edge 2048
+  ```
+
+  `quality` is 1 to 100 and `long-edge` 1 to `MAX_LONG_EDGE` (16384) or
+  `full`, each at most once and at its default when left out; a file past
+  `settings::MAX_BYTES` (4096), not UTF-8, without the header, with a line
+  that is not `key value`, a key this version does not know (the file is
+  td-photo's own, so an unknown key is another version's) or a value
+  outside its grammar is refused whole: the session starts at the
+  defaults with the reason on stderr, and the next change replaces the
+  file; anything but a regular file at its name (a fifo, a folder, a
+  link) is refused by name before the open, so a session cannot block on
+  it, and before a write. It is read once when a session starts (the
+  replay and the window alike) and written, whole, on every change the
+  export view or the `quality` and `long-edge` actions make, through
+  `export.tmp` as the sidecar is written (`replace_own`; the folder made
+  as needed; a stale temporary is reported, not reused or removed, and
+  refuses the change): the last write wins. The verbs never read it;
+  `export` and `export-picks` take `--quality` and `--long-edge` on the
+  command line.
 - **Cache**: `$XDG_CACHE_HOME/td-photo` when that variable is absolute
   (`~/.cache/td-photo` otherwise), holding `thumbs/` and nothing else in version
   1. The base directory is the user's and may be a symlink; `td-photo` and
@@ -1060,6 +1169,26 @@ both. `main` feeds `EXPORT_BAND_ROWS` (64) rows a band, a multiple of the
 encoder's block row and enough of them that a band's transform spreads
 over the pool.
 
+A long edge under the export's shrinks it: `image::shrunk` sizes the
+output (the longer axis to the edge, the other to the nearest pixel of
+the same ratio, one at least; the source's own size when the edge covers
+it, since an export is never enlarged), and `image::Shrink` is the area
+resample fed the same source bands of `EXPORT_BAND_ROWS` rows, giving
+back the output rows each band completes for the encoder, so the peak
+stays level 0, one source band and the rows in progress whatever the
+ratio (a source row lies in at most two output rows). Each output pixel
+is the mean of the source box it covers, a source pixel on the box's
+edge weighted by the part of it inside, in whole arithmetic (`span`: the
+shares of an output pixel over the source pixels it covers, in units of
+`1 / out`, summing to the source axis; with the axes swapped, the output
+rows a source row lies in) rounded half up, so the rows are the same
+bytes whatever the bands and a shrink to the same size is the identity;
+the tests pin the weights, a flat frame, a checker's mean, every band
+size giving the same rows, the rows coming out as they complete with at
+most two in progress, and the refusals (an axis past its source or zero,
+a band of another width or past the foot). The encoder is opened at the
+output's size and the settings' quality.
+
 The bilinear demosaic makes one pixel per photosite: its own channel the
 sample as it is, each other channel the rounded mean of that channel's
 neighbours in the 3x3 around it (on a Bayer grid the four axial neighbours
@@ -1073,10 +1202,11 @@ crop's. A better full-resolution demosaic is a later increment.
 The encoder (`jpeg::Encoder`) is baseline: JFIF, YCbCr 4:4:4 (one block
 per component per MCU, so a band of eight rows is a row of MCUs and the
 right edge and bottom pad by replicating the last column and row), the
-T.81 Annex K quantisation tables scaled at `QUALITY` (92) the way every
-encoder since IJG scales them (`5000 / q` below 50, `200 - 2q` from 50 up,
-entries held to 1..=255) and the Annex K.3 Huffman tables, written into
-the stream, no restart intervals. The colour transform is the JFIF one the
+T.81 Annex K quantisation tables scaled at the settings' quality
+(`QUALITY`, 92, at first) the way every encoder since IJG scales them
+(`5000 / q` below 50, `200 - 2q` from 50 up, entries held to 1..=255)
+and the Annex K.3 Huffman tables, written into the stream, no restart
+intervals. The colour transform is the JFIF one the
 decoder inverts; the forward transform is the decoder's `T8` basis
 transposed, in `f32`, rows then columns; coefficients are held to the
 categories the tables carry (the DC to -1024..=1023, each AC to
@@ -1253,7 +1383,10 @@ the bands are hit-tested last painted first, so on a surface too short for them
 the status row covers the strips' buttons as it covers their pixels. A box whose
 thumbnail is not held is a neutral placeholder, which is what `frame` digests
 either way; the develop box and the single view's hold the developed preview
-once it is made.
+once it is made. The export view has no box and no thumbnail: `visible` is
+empty and `develop_box` is `None` there, as under the chooser, and the
+wants stand as the grid's, so the grid is ready when the view returns to
+it.
 
 While Alt is held every button shows its chord under its caption in
 td-ui's hint face (`Buttons::emit_hinted`, `Button::emit_hinted`): the
@@ -1600,7 +1733,19 @@ frame and scan segments whole, each table's counts, the luma quantiser's
 first zigzag entries and the chroma's last at `QUALITY`); the standard
 tables' completeness is an inline unit test in `jpeg`.
 
-`tests/nef.rs`'s second command case runs `export` over a temporary roll:
+`tests/nef.rs`'s third command case runs `export` with `--long-edge` and
+`--quality` over a temporary roll (the export shrunk with its ratio kept,
+an edge past the source and `full` the source's own size, a lower quality
+fewer bytes at the same size and the shrunk frame's mean the full one's
+within the codings' error, each bad setting refused by name before
+anything is written) and `export-picks` (no pick a count of none, the
+picks in name order with the rejects and the unflagged left out, a line
+each and the count, a pick that fails keeping the others coming and
+failing the run after the rest, a bad setting, no ROLL and a file for
+ROLL refused first), and a taller frame shrunk over several source bands
+decoding to the shrink of the full-size export within the codings'
+error. `tests/nef.rs`'s second command case runs `export`
+over a temporary roll:
 the JPEG in `exported/` decoding to the in-process export of the same frame
 within the round trip's tolerance, the second and third exports numbered
 and a gap filled, the sidecar's exposure brightening, `mono` greying and a
@@ -1609,6 +1754,11 @@ refusing before anything is written, a stale temporary reported and left, a
 non-original, a stray argument and a missing FILE refused by name, a turned
 frame exporting turned, a file at `exported/` refusing, and the originals
 unchanged.
+
+Unit tests in `settings` pin the file's grammar: the text reading back, a
+key left out at its default, every refusal by name, and the actions'
+words; in `image` the shrink's sizes, shares, means, bands and refusals
+as above; and in `main` the batch note's counts.
 
 `tests/library.rs` holds the sidecar grammar to its refusals by name and to
 in-place rewriting around an unknown line, the canonical value spellings, and
@@ -1645,7 +1795,22 @@ the single view and back by Single and Culling, the chooser over the grid,
 the single view and develop, and develop with its palette, crop-adjust or a
 marquee up, to the grid or the single view, the disabled buttons and the
 one in view ignored, a change bumping once and a chooser request never, the
-states it reports), a gap and a margin, a cell, the status row (on a
+states it reports; on 400 wide the strip wraps to two rows, Export on the
+second, and the tests at that width lay the filter strip and the area under
+them), the export view (refused before a roll, shown by `E`, the strip and
+the action, its mode word, status row, states, withheld boxes, disabled and
+inert filters, the grid's actions ignored, its text read back, left by
+Escape and every other mode button and entered from each, the chooser over
+it, a lost cursor keeping it and a roll opening leaving it; the settings
+set through `Settings` effects in any mode and settled, the value in force
+ignored, each bad value refused, `state` reporting them and keeping them
+across rolls and modes, the panel painting a size no button has; the
+long-edge buttons and Export picks asking what they say, the button
+disabled without a pick while the action and `C-e` still ask from any mode,
+the slider's press, drag and release as the exposure slider's, a
+long-edge press mid-drag the drag's, the drag dropped on leaving, `C-e`
+under the button while Alt is held, and a short surface laying none of the
+controls), a gap and a margin, a cell, the status row (on a
 surface too short
 for the bands too), off the surface and past the last photo, a resize to the
 size it has, an empty roll and one past `MAX_PHOTOS`; the effects a flag
@@ -1781,7 +1946,7 @@ blitting each into its strip box (`control_process.rs`), the native
 compositor leg holding the live frame to it, and `--preview --develop
 --zoom` of a frame dark but for a square at its centre showing the square
 its own size where the fit shrank it, `--zoom` refused without `--develop`;
-the export action (asking for the cursor photo in either mode by verb and by
+the export action (asking for the cursor photo in any mode by verb and by
 `e`, refused without a roll or a photo, not repeating on a held key, the
 dispatch moving nothing; the note set, shown at the row's end, a new generation
 when it differs and none when it is the same, absent from `state` but for the
@@ -1789,7 +1954,19 @@ generation, and cleared by an open); the binary's `--replay` exporting a
 synthesized decodable NEF on the request (the JPEG there and the row noting it
 when the reply is, the second export numbered, the job count zero, a frame that
 cannot be decoded `refused` with the row saying it failed, a refused sidecar
-`refused` before anything is read, and nothing written for either), and `open`
+`refused` before anything is read, and nothing written for either), the
+binary's `--replay` under an `XDG_CONFIG_HOME` of its own keeping the export
+settings (the defaults with no file, a change writing the file's exact text
+and settling, the same value ignored and a bad one `bad-argument`, the
+export view's text, `export-picks` ignored with no pick and, with two picks
+one of which cannot be decoded, `refused` with the row counting one of two
+and one failed and the export shrunk to the long edge in force, from the
+view and from the grid by `C-e`; the next session reading the file back and
+the empty configuration every other replay session runs under not, a
+refused file leaving the defaults with the reason on stderr and the next
+change replacing it, a folder at its name refused by name with the session
+starting, and a change refused when the file cannot be written, the model
+as it was), and `open`
 refusing a bad socket path, a second roll or a stray flag before it looks for a
 display and leaving no socket behind when the display is not there;
 `src/window.rs`'s own tests hold `wait_ms`'s grammar, the envelope's ID, the
@@ -1962,7 +2139,15 @@ preflight. A td-photo, td-ui or td-compositor edit selects this check in
    folder in view through the `open` path, and a bare `td-photo` opening
    the window. Landed. (e) The mode strip and the filter strip over
    td-ui's bezelled button strip, the mode strip a target in every mode.
-   Landed.
+   Landed. (f) The export view: `export-mode` (`E`, the strip's Export)
+   over the area, the quality and long-edge settings (`settings`, the
+   user's `export` file, the `quality` and `long-edge` actions and the
+   `Settings` effect), the area shrink (`image::Shrink`) in the
+   export runner, `export-picks` (`C-e`, the button, the `ExportPicks`
+   effect, the batch note) and `td-photo export-picks ROLL`. Landed.
+   (g) AVIF: an AV1 intra encoder in pure `std` and the HEIF container,
+   the export settings' format and the view's format buttons. Planned;
+   the settings file refuses a `format` key until then.
 7. Packaging: the cargo recipe staging td-ui, the image entry, and the
    recipe check that develops the synthetic frame in the built artifact.
    Landed.
