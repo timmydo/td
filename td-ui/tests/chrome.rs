@@ -466,6 +466,70 @@ fn reveal_moves_the_window_the_least_to_show_the_selection() {
 }
 
 #[test]
+fn reveal_within_keeps_the_margin_rows_shown_around_the_selection() {
+    let surface = surface(320, 200, 1);
+    let list = List::new(
+        surface,
+        Rect {
+            x: 0,
+            y: 0,
+            width: 320,
+            height: 120,
+        },
+    )
+    .unwrap();
+    assert_eq!(list.rows(), 5);
+    // Moving down through a window of five with one row kept below: the
+    // selection at the fourth row is shown with the fifth, the selection
+    // reaching the fifth scrolls one so a row is below it again.
+    assert_eq!(list.reveal_within(20, 2, 0, 1), 0);
+    assert_eq!(list.reveal_within(20, 3, 0, 1), 0);
+    assert_eq!(list.reveal_within(20, 4, 0, 1), 1);
+    assert_eq!(list.reveal_within(20, 7, 1, 1), 4);
+    // Moving up with one row kept above.
+    assert_eq!(list.reveal_within(20, 5, 4, 1), 4);
+    assert_eq!(list.reveal_within(20, 4, 4, 1), 3);
+    // At the ends the window stops: the first item is shown at the top row
+    // and the last at the bottom, the margin past them being nothing.
+    assert_eq!(list.reveal_within(20, 0, 3, 2), 0);
+    assert_eq!(list.reveal_within(20, 1, 3, 2), 0);
+    assert_eq!(list.reveal_within(20, 19, 0, 2), 15);
+    assert_eq!(list.reveal_within(20, 18, 15, 2), 15);
+    // A margin is clamped to the whole number below half the rows, two of
+    // five, so a large one centres the selection while the list has rows
+    // on both sides.
+    assert_eq!(list.reveal_within(20, 10, 0, 99), 8);
+    assert_eq!(list.reveal_within(20, 10, 8, 2), 8);
+    assert_eq!(list.reveal_within(20, 10, 8, 99), 8);
+    // A jump far away lands the selection with its margin, not at an edge.
+    assert_eq!(list.reveal_within(20, 12, 0, 1), 9);
+    assert_eq!(list.reveal_within(20, 2, 15, 1), 1);
+    // No margin is `reveal`'s least move, and the clamps still hold.
+    assert_eq!(list.reveal_within(20, 7, 0, 0), list.reveal(20, 7, 0));
+    assert_eq!(list.reveal_within(3, 2, 0, 2), 0);
+    assert_eq!(list.reveal_within(20, 99, 99, 2), 15);
+    assert_eq!(list.reveal_within(0, 0, 0, 2), 0);
+    // A list of one or two rows has no room for a margin: the clamp makes
+    // it nought, and the selection is the shown row or one of the two.
+    for (height, rows) in [(24, 1), (48, 2)] {
+        let list = List::new(
+            surface,
+            Rect {
+                x: 0,
+                y: 0,
+                width: 320,
+                height,
+            },
+        )
+        .unwrap();
+        assert_eq!(list.rows(), rows);
+        assert_eq!(list.reveal_within(20, 7, 0, 3), 7 + 1 - rows);
+        assert_eq!(list.reveal_within(20, 7, 0, 3), list.reveal(20, 7, 0));
+        assert_eq!(list.reveal_within(20, 0, 7, 3), 0);
+    }
+}
+
+#[test]
 fn the_scrollbar_thumb_tracks_the_window() {
     let surface = surface(320, 200, 1);
     let list = List::new(

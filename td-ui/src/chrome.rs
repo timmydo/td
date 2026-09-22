@@ -859,19 +859,39 @@ impl List {
 
     /// `first` moved as little as possible so `selected` is a shown row.
     pub fn reveal(self, total: usize, selected: usize, first: usize) -> usize {
+        self.reveal_within(total, selected, first, 0)
+    }
+
+    /// `first` moved as little as possible so `selected` is a shown row
+    /// with `margin` rows shown on each side of it, where the list has
+    /// them: at its ends the window stops, so the first and last items are
+    /// still shown at the top and bottom rows. The margin is clamped to
+    /// the whole number below half the rows, `(rows - 1) / 2`, so a
+    /// selection inside it is always possible and a large margin keeps
+    /// the selection centred, as an editor's `scrolloff` does.
+    pub fn reveal_within(
+        self,
+        total: usize,
+        selected: usize,
+        first: usize,
+        margin: usize,
+    ) -> usize {
         let rows = self.rows();
         if rows == 0 || total == 0 {
             return 0;
         }
+        let last_page = total.saturating_sub(rows);
         let selected = selected.min(total - 1);
-        let first = first.min(total.saturating_sub(rows));
-        if selected < first {
-            selected
-        } else if selected >= first + rows {
-            selected + 1 - rows
+        let first = first.min(last_page);
+        let margin = margin.min((rows - 1) / 2);
+        let first = if selected < first.saturating_add(margin) {
+            selected.saturating_sub(margin)
+        } else if selected.saturating_add(margin) >= first.saturating_add(rows) {
+            selected.saturating_add(margin + 1).saturating_sub(rows)
         } else {
             first
-        }
+        };
+        first.min(last_page)
     }
 
     /// Paints the window `first..` given by `items`, the item at `selected`

@@ -65,9 +65,15 @@ name = "Hacker News"
 url = "https://news.ycombinator.com/rss"
 ```
 
-The terminal reader's `page_size`, `scrolloff` and `[theme]` keys are
-read as any unknown key is, and ignored: the lists page by what the
-window shows and draw in the toolkit's palette.
+`scrolloff = N` under `[ui]` keeps N rows shown past the selection on
+each side of it as it moves through a list, as the terminal reader's key
+did, so the items after the one being read stay in view; the window
+stops at the list's ends, a margin of half the window's rows or more
+centres the selection, and a press on a row inside the margin moves the
+window as a key would. It defaults to 0, the least move that shows the
+selection. The terminal reader's `page_size` and `[theme]` keys are read
+as any unknown key is, and ignored: the lists page by what the window
+shows and draw in the toolkit's palette.
 
 ## Usage
 

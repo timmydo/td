@@ -218,8 +218,12 @@ of its own files may name each module.
   rectangle, the same highlight, dim and prefix, a marked row starred
   and an optional right-aligned `Item` column, empty rows below left
   chrome, and a scrollbar in a `SCROLL_GUTTER` (16)-pixel gutter at its
-  right; `reveal` keeps the selection shown and `hit` maps a point to a
-  row. `Block` wraps a caption at its columns, the
+  right; `reveal` keeps the selection shown, `reveal_within` keeps a
+  margin of rows shown on each side of it too where the list has them,
+  the window stopping at the list's ends and the margin clamped to the
+  whole number below half the rows, `(rows - 1) / 2`, so a large one
+  centres the selection (an editor's `scrolloff`), and `hit` maps a
+  point to a row. `Block` wraps a caption at its columns, the
   width less a cell each side, over up to `BLOCK_ROWS` (15) rows, a
   newline starting the next, at most `BLOCK_SCALARS` (`BLOCK_ROWS` * 73)
   scalars visited. `Strip` lays `TAB_WIDTH` (160)-pixel tabs from the left
@@ -994,8 +998,10 @@ border and fill land and the rows above stay untouched. The list adds
 its own: the selection highlight, disabled dim, star mark and
 right-aligned column, the whole rect painted chrome behind the rows, a
 selection off the window drawing no highlight, `reveal`'s least-move
-window, the scrollbar thumb tracking it and a disabled bar's border
-thumb, `hit` mapping a point to a row, `new` refusing a rect the surface
+window and `reveal_within`'s margin kept on each side, stopped at the
+ends and clamped to the whole number below half the rows, the
+scrollbar thumb tracking it and a disabled bar's border thumb, `hit`
+mapping a point to a row, `new` refusing a rect the surface
 or the gutter cannot hold, all at more than one scale, and a
 whole-surface pixel oracle for its selection, its scrollbar and the
 pixels around it left untouched. The text entry adds its own: the paper

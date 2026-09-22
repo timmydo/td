@@ -13,6 +13,10 @@ pub struct UiConfig {
     pub mouse: bool,
     pub sync_interval_secs: u64,
     pub browser: Option<String>,
+    /// Rows kept shown past the selection on each side of it in a list,
+    /// as the terminal reader's `scrolloff` kept them; nought is the
+    /// least move that shows the selection.
+    pub scrolloff: usize,
 }
 
 impl Default for UiConfig {
@@ -21,6 +25,7 @@ impl Default for UiConfig {
             mouse: true,
             sync_interval_secs: default_sync_interval(),
             browser: None,
+            scrolloff: 0,
         }
     }
 }
@@ -49,6 +54,7 @@ impl UiConfig {
                 .optional_u64("sync_interval_secs")?
                 .unwrap_or_else(default_sync_interval),
             browser: table.optional_str("browser")?.map(str::to_string),
+            scrolloff: table.optional_usize("scrolloff")?.unwrap_or(0),
         })
     }
 }
@@ -158,6 +164,7 @@ url = \"https://blog.rust-lang.org/feed.xml\"
         assert_eq!(config.ui.sync_interval_secs, 300);
         assert!(config.ui.mouse);
         assert!(config.ui.browser.is_none());
+        assert_eq!(config.ui.scrolloff, 0);
     }
 
     #[test]
@@ -171,9 +178,9 @@ url = \"https://blog.rust-lang.org/feed.xml\"
         assert!(config.ui.browser.is_none());
     }
 
-    /// The keys of the terminal reader, `page_size`, `scrolloff` and the
-    /// `[theme]` colours, are read as unknown keys are: a configuration
-    /// that still names them loads.
+    /// `scrolloff` is read as the terminal reader read it; its `page_size`
+    /// and `[theme]` colours are read as unknown keys are, so a
+    /// configuration that still names them loads.
     #[test]
     fn parse_full_config() {
         let toml_str = concat!(
@@ -199,6 +206,7 @@ url = \"https://blog.rust-lang.org/feed.xml\"
         assert_eq!(config.feeds.len(), 2);
         assert!(!config.ui.mouse);
         assert_eq!(config.ui.sync_interval_secs, 600);
+        assert_eq!(config.ui.scrolloff, 3);
     }
 
     /// The mapping's refusals, in serde's words: a `[[feed]]` short of a
@@ -221,6 +229,17 @@ url = \"https://blog.rust-lang.org/feed.xml\"
         assert_eq!(
             refused("[ui]\nsync_interval_secs = \"many\"\n"),
             "config parse error: invalid type for `sync_interval_secs`: expected an integer, found string"
+        );
+        assert_eq!(
+            refused("[ui]\nscrolloff = \"five\"\n"),
+            "config parse error: invalid type for `scrolloff`: expected an integer, found string"
+        );
+        assert_eq!(
+            refused("[ui]\nscrolloff = -1\n"),
+            format!(
+                "config parse error: invalid value for `scrolloff`: expected an integer between 0 and {}, found -1",
+                usize::MAX
+            )
         );
         assert_eq!(
             refused("[ui]\nsync_interval_secs = -1\n"),

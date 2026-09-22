@@ -233,6 +233,8 @@ struct App {
     quitting: bool,
     pending_redraw: bool,
     mouse_config: bool,
+    /// Rows kept shown past a list's selection on each side, `[ui].scrolloff`.
+    scrolloff: usize,
     browser: Option<String>,
     article_urls: Vec<String>,
     url_picking: bool,
@@ -316,6 +318,7 @@ impl App {
             quitting: false,
             pending_redraw: true,
             mouse_config: config.ui.mouse,
+            scrolloff: config.ui.scrolloff,
             browser: config.ui.browser.clone(),
             article_urls: Vec::new(),
             url_picking: false,
@@ -1273,25 +1276,38 @@ impl App {
         layout
     }
 
-    /// Lays the frame out: the lists reveal their selections, the pane is
-    /// placed and holds what the view shows. Before every paint and every
-    /// read of the frame.
+    /// Lays the frame out: the lists reveal their selections, with the
+    /// configured rows kept shown past each, the pane is placed and holds
+    /// what the view shows. Before every paint and every read of the frame.
     fn prepare_frame(&mut self) {
         let layout = self.layout();
         if let Some(list) = layout.list {
+            let margin = self.scrolloff;
             match self.view {
                 View::FeedList => {
-                    self.feed_first =
-                        list.reveal(self.feed_row_count(), self.selected_feed, self.feed_first);
+                    self.feed_first = list.reveal_within(
+                        self.feed_row_count(),
+                        self.selected_feed,
+                        self.feed_first,
+                        margin,
+                    );
                 }
                 View::ArticleList => {
                     let total = self.filtered_article_indices().len();
-                    self.article_first =
-                        list.reveal(total, self.selected_article, self.article_first);
+                    self.article_first = list.reveal_within(
+                        total,
+                        self.selected_article,
+                        self.article_first,
+                        margin,
+                    );
                 }
                 View::Article => {
-                    self.url_first =
-                        list.reveal(self.article_urls.len(), self.url_cursor, self.url_first);
+                    self.url_first = list.reveal_within(
+                        self.article_urls.len(),
+                        self.url_cursor,
+                        self.url_first,
+                        margin,
+                    );
                 }
                 View::Log | View::Help => {}
             }
@@ -2923,6 +2939,68 @@ pub(super) mod tests {
         app.mouse_config = false;
         press(&mut app, 10, row(0).y + 3);
         assert_eq!(app.selected_feed, last, "the mouse off");
+    }
+
+    /// `[ui].scrolloff` keeps that many rows shown past the selection as it
+    /// moves down and up a list, the window stopping at the list's ends;
+    /// its default keeps none, the least move that shows the selection.
+    #[test]
+    fn scrolloff_keeps_rows_shown_past_the_selection() {
+        let dir = tempdir().expect("tempdir");
+        let cache = Cache::open_at(dir.path().join("test.tdkv")).expect("cache");
+        seed_cache(&cache, false);
+        let mut config = test_config();
+        config.feeds = (0..40)
+            .map(|index| FeedConfig {
+                name: format!("Feed {index}"),
+                url: format!("https://example.com/{index}/rss"),
+            })
+            .collect();
+        config.ui.scrolloff = 3;
+        let (cmd_tx, _cmd_rx) = mpsc::channel();
+        let mut app = App::new(&config, &cache, true).expect("app");
+        let key = |app: &mut App, chord: &str| {
+            let input = Input::Key {
+                chord,
+                repeat: false,
+            };
+            app.input(input, &cache, &cmd_tx);
+            app.prepare_frame();
+        };
+        app.prepare_frame();
+        let rows = app.list_rows();
+        assert!(rows > 8 && rows < app.feed_row_count(), "{rows}");
+        // Down to the row three above the window's last: still at the top.
+        for _ in 0..rows - 4 {
+            key(&mut app, "Down");
+        }
+        assert_eq!((app.selected_feed, app.feed_first), (rows - 4, 0));
+        // One more and the window follows, three rows kept below.
+        key(&mut app, "Down");
+        assert_eq!((app.selected_feed, app.feed_first), (rows - 3, 1));
+        key(&mut app, "Down");
+        assert_eq!((app.selected_feed, app.feed_first), (rows - 2, 2));
+        // At the end the window stops and the last rows are shown.
+        key(&mut app, "End");
+        let last = app.feed_row_count() - 1;
+        assert_eq!((app.selected_feed, app.feed_first), (last, last + 1 - rows));
+        // Up through the kept rows leaves the window; past them it follows.
+        for _ in 0..rows - 4 {
+            key(&mut app, "Up");
+        }
+        assert_eq!(app.feed_first, last + 1 - rows);
+        key(&mut app, "Up");
+        assert_eq!(app.feed_first, last - rows);
+        // Without the key, the selection reaches the window's last row
+        // before it moves.
+        config.ui.scrolloff = 0;
+        let mut app = App::new(&config, &cache, true).expect("app");
+        for _ in 0..rows - 1 {
+            key(&mut app, "Down");
+        }
+        assert_eq!((app.selected_feed, app.feed_first), (rows - 1, 0));
+        key(&mut app, "Down");
+        assert_eq!((app.selected_feed, app.feed_first), (rows, 1));
     }
 
     /// A wheel frame moves a list's selection by its rows and the log's

@@ -9923,10 +9923,13 @@ document view"), read-only, for the article, a window of the log and the
 help. The pane brings back the text selection the cell screen lost, by
 drag, and the arrows, Home and End are its own chords; the reader's
 letters, the wheel and the page keys scroll it and the lists by what the
-layout shows, so the terminal reader's `page_size` and `scrolloff` keys
-and its `[theme]` colours are read as unknown keys and ignored, the
-window drawing in the toolkit's palette. `Ctrl-C` copies the selection
-to the system clipboard through the widget window's `Clipboard`
+layout shows, so the terminal reader's `page_size` key and its `[theme]`
+colours are read as unknown keys and ignored, the window drawing in the
+toolkit's palette; its `scrolloff` is read as it was, the rows the lists
+keep shown past the selection on each side (`List::reveal_within`,
+`td-ui/DESIGN.md`), so what follows the item being read stays in view.
+`Ctrl-C` copies the selection to the system clipboard through the
+widget window's `Clipboard`
 (`td-ui/DESIGN.md`, increment 16): the reader captures the selection
 when the pane asks for a copy and offers it while the chord is still
 being delivered, since the clipboard takes a selection only at the
@@ -9968,8 +9971,9 @@ short) and is painted over the frame, and which closes by itself when
 the view it was opened for goes under it; the keys themselves, `+` and
 `d`, are the view's as before. HTML is rendered to plain text, without
 the terminal's rendition sequences. The terminal client's
-`scrolloff` and `[theme]` keys are accepted and ignored, as td-news's
-are; `mouse = false` still turns the pointer off. The crate depends on
+`scrolloff` and `[theme]` keys are accepted and ignored (td-news reads
+its `scrolloff` again; td-mail's lists follow in their own increment);
+`mouse = false` still turns the pointer off. The crate depends on
 `td-editor` beside `td-ui`, by the same sibling spelling, and its recipe
 stages the `td-editor` tree with the two it staged; the package, the
 unit and its readiness probe are unchanged. The cell screen and its

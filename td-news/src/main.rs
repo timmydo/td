@@ -316,7 +316,8 @@ fn print_help_config() {
     eprintln!(
         "                               # executed via sh -c; falls back to $BROWSER, xdg-open"
     );
-    eprintln!("  # page_size, scrolloff and a [theme] table are the terminal reader's:");
+    eprintln!("  scrolloff = 0                # rows kept shown past the selection on each side (default: 0)");
+    eprintln!("  # page_size and a [theme] table are the terminal reader's:");
     eprintln!("  # read as unknown keys and ignored");
     eprintln!();
     eprintln!("[[feed]]");
