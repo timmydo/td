@@ -56,11 +56,13 @@ lands over its own slices: the mode, its keys and the develop edits over the
 seam and the socket are in, as are the developed preview and the crop drag
 with its edge and corner handles and the look palette; the `export` verb and
 the window's `export` action are in, `delete-rejected` with them, and the
-export view with its settings and the picks' export closes the export
-increment but for AVIF. The crate is packaged: the `td-photo` target recipe
-builds it static over the staged td-ui and td-compositor trees, the image
-copies its output and links `/bin/td-photo`, and `td-photo-test` runs the
-built binary's verbs over a synthetic frame (Packaging below).
+export view with its settings and the picks' export close the export
+increment but for AVIF, whose AV1 encoder is in and whose container,
+format setting and buttons follow. The crate is packaged: the `td-photo`
+target recipe builds it static over the staged td-ui and td-compositor
+trees, the image copies its output and links `/bin/td-photo`, and
+`td-photo-test` runs the built binary's verbs over a synthetic frame
+(Packaging below).
 
 The rules below define version 1; the increments identify the order of
 implementation, not choices left to each implementing agent.
@@ -1224,6 +1226,57 @@ black, and the standard tables are pinned complete (every baseline DC
 category and AC run/size once) with no code of all ones, which is what the
 decoder refuses; the clamp is pinned by a unit test over `forward`.
 
+The AVIF export codes the frame with the crate's own AV1 encoder
+(`av1::Encoder`, over `transform` and `cdf`), pure `std` like the rest:
+a still picture (`still_picture` and `reduced_still_picture_header`
+set), main profile, 8-bit 4:2:0 at full range in BT.601 (`Y = (77R +
+150G + 29B + 128) >> 8`, the chroma the mean of each 2x2 offset by 128),
+one key frame of intra blocks. The tools are the subset a decoder must
+carry and an encoder can verify: 64-pixel superblocks always split,
+then square blocks of 32, 16 or 8 (a partition of `NONE` or `SPLIT`
+alone, the frame's edges splitting as the spec forces them; no 64-wide
+block is ever a leaf, since there is no 64-point transform here), one
+transform the block's size (`TX_MODE_LARGEST`, the reduced transform
+set, so a block's type is the one its mode implies, `DCT_DCT` at 32),
+the thirteen intra modes without
+an angle delta, filter, palette or chroma-from-luma, no loop filter,
+CDEF, restoration, superres or film grain, and the symbol adaptation the
+spec runs by default. The quality maps to `qindex` as `255 - ((q - 1) *
+254 + 49) / 99`, the dead-zone quantiser rounds the DC at half a step and
+each AC at three eighths, and a block's mode is chosen by rate-distortion
+(`(D << 7) + (R * rdmult) >> 9`, `rdmult` from the DC step as libaom sets
+it, the rate the coder's own cost of its symbols under the tile's live
+probabilities): the modes are screened by the SAD of their predictions,
+the best three (two for chroma, one mode for both planes) coded in full,
+and a superblock's partition is decided by trials that save and restore
+the contexts and pixels they touch before the chosen tree is emitted, so
+the decoder's state is the encoder's exactly. The frame is tiled
+uniformly by its size alone, so the bytes are the same whatever the
+thread count, as the JPEG encoder's are: as many tile columns as the
+width allows while the uniform column stays four superblocks wide (the
+last column is the remainder), within the tile columns the level the
+picture size sets allows (Annex A.3), and the fewest rows the tile area
+needs, which is none up to level 6; past it a column the cap left wide
+and rounded up to whole superblocks can pass the tile area, and the
+rows then split again. The tiles of a superblock row are coded in
+their own coders over `develop::bands`, so the threads spread over the
+columns; the tile sizes are written in four bytes, and the sequence
+header claims the least level whose picture size, tile count and tile
+columns admit the frame. `av1::av1c` and the colour constants are the
+configuration the container repeats, from the same values the sequence
+header writes. The transforms are the spec's integer butterflies from
+generated stage tables, so the reconstruction the encoder keeps is what
+any conforming decoder shows; `tests/av1.rs` holds that to dav1d when
+one is named (`TD_TEST_DAV1D`), and holds three small streams to the
+hashes of bytes dav1d decoded, so a change to any emitted symbol is
+verified against the decoder before the hash moves. It is fed rows like
+the JPEG encoder and codes a superblock row when one is complete, so
+the export band rules hold; a frame is at most 16384 on an axis. Angle
+deltas, a better distortion measure, straight-line transforms and
+per-tile scratch buffers in place of the per-trial allocations are the
+performance and fidelity follow-ups; a 24-megapixel export takes tens
+of seconds on one thread and a few on eight.
+
 ## Looks
 
 A look is a text file, `stem.look`, one operation per line, applied in file
@@ -1733,6 +1786,27 @@ frame and scan segments whole, each table's counts, the luma quantiser's
 first zigzag entries and the chroma's last at `QUALITY`); the standard
 tables' completeness is an inline unit test in `jpeg`.
 
+`tests/av1.rs` pins the AV1 encoder: the geometry by value (the mode-info
+and superblock grids, the tile column starts the width and the level
+allow, the rows the area past level 6, the rounding and a caller ask
+for, the level of each size and grid, the axes refused, the quality to
+`qindex` map monotone with its ends); a range of shapes, whole and partial
+superblocks of every edge, one pixel, a frame wider than a tile, tile
+columns and two and five tile rows on one and two threads, each coding
+to a stream whose reconstruction is the encoder's own and, with
+`TD_TEST_DAV1D` naming a dav1d binary, decoded by it to the same bytes
+exactly; three streams held to the hashes recorded under that decode,
+the same bytes on one thread and three; the stream's sequence header
+and the frame header's opening field by field, the quality buying luma
+PSNR and costing bytes; and the rows refused by name. The transforms' unit
+tests hold every kernel to the real transform it approximates and to
+orthogonality, the scans to their anti-diagonals, the quantiser tables to
+their ends; the coder's unit tests round-trip symbols and bits through a
+transcription of the spec's decoder, pin the adaptation, the bit writer,
+`leb128` and the OBU framing, the trailing-bit rule (spec 8.2.4, which
+libaom's decoder enforces), the end-of-block classes and the predictors
+by value.
+
 `tests/nef.rs`'s third command case runs `export` with `--long-edge` and
 `--quality` over a temporary roll (the export shrunk with its ratio kept,
 an edge past the source and `full` the source's own size, a lower quality
@@ -2145,9 +2219,11 @@ preflight. A td-photo, td-ui or td-compositor edit selects this check in
    `Settings` effect), the area shrink (`image::Shrink`) in the
    export runner, `export-picks` (`C-e`, the button, the `ExportPicks`
    effect, the batch note) and `td-photo export-picks ROLL`. Landed.
-   (g) AVIF: an AV1 intra encoder in pure `std` and the HEIF container,
-   the export settings' format and the view's format buttons. Planned;
-   the settings file refuses a `format` key until then.
+   (g) AVIF, in landings: the AV1 still-picture encoder in pure `std`
+   (`transform`, `cdf`, `av1`), held to dav1d. Landed. Then the HEIF
+   container (`avif`), the export settings' `format` and `--format` on
+   the export verbs, and the view's format buttons. Planned; the
+   settings file refuses a `format` key until then.
 7. Packaging: the cargo recipe staging td-ui, the image entry, and the
    recipe check that develops the synthetic frame in the built artifact.
    Landed.

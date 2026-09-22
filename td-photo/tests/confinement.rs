@@ -29,7 +29,9 @@ fn names(dir: &str, extension: &str) -> BTreeSet<String> {
 }
 
 const PURE: &[&str] = &[
+    "av1.rs",
     "camera.rs",
+    "cdf.rs",
     "color.rs",
     "develop.rs",
     "image.rs",
@@ -39,6 +41,7 @@ const PURE: &[&str] = &[
     "nef.rs",
     "settings.rs",
     "tiff.rs",
+    "transform.rs",
     "ui.rs",
 ];
 
@@ -52,6 +55,7 @@ fn source_inventory_is_closed() {
         .collect();
     assert_eq!(names("src", "rs"), expected);
     let tests: BTreeSet<String> = [
+        "av1.rs",
         "confinement.rs",
         "control_process.rs",
         "develop.rs",
@@ -195,7 +199,10 @@ fn pure_modules_reach_no_file_environment_clock_network_or_process() {
     assert!(main.contains("fs::rename(&temporary, path)"));
     assert_eq!(main.matches("fn replace_own(").count(), 1);
     assert_eq!(main.matches("replace_own(&path, &text)").count(), 1);
-    assert_eq!(main.matches("replace_own(&path, &settings.text())").count(), 1);
+    assert_eq!(
+        main.matches("replace_own(&path, &settings.text())").count(),
+        1
+    );
     assert!(main.contains("fs::hard_link(from, to)"));
     assert!(main.contains("fs::rename(from, to)"));
     assert_eq!(main.matches("fs::rename(").count(), 3);
