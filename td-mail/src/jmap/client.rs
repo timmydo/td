@@ -1,4 +1,4 @@
-use crate::json::{self, ToJson};
+use crate::json::{self, Json, ObjectBuilder, ToJson};
 
 /// The whole of td-mail's transport is td's fetch service. It holds the TLS
 /// trust, the resolver, the timeouts and the body caps; this side holds a
@@ -82,6 +82,11 @@ pub struct JmapClient {
     api_url: String,
     account_id: String,
     download_url: Option<String>,
+    upload_url: Option<String>,
+    /// The session's `maxSizeUpload`, when it names one.
+    max_size_upload: Option<u64>,
+    /// Whether the session lists mail submission for the account.
+    submission: bool,
 }
 
 #[cfg(test)]
@@ -95,6 +100,9 @@ impl JmapClient {
             api_url: "https://mail.invalid/jmap".to_string(),
             account_id: "account".to_string(),
             download_url: None,
+            upload_url: None,
+            max_size_upload: None,
+            submission: false,
         }
     }
 }
@@ -107,6 +115,10 @@ pub enum JmapError {
     /// No fetch service to carry the request. Its own text is the whole
     /// diagnostic, so it is printed without a category prefix.
     NoFetchService(String),
+    /// The server may have done part of what was asked
+    /// (`serverPartialFail`, RFC 8620 §3.6.2): what it did must be asked
+    /// for before the request is made again.
+    Unsettled(String),
 }
 
 impl std::fmt::Display for JmapError {
@@ -116,6 +128,7 @@ impl std::fmt::Display for JmapError {
             JmapError::Parse(e) => write!(f, "Parse error: {}", e),
             JmapError::Api(e) => write!(f, "API error: {}", e),
             JmapError::NoFetchService(e) => write!(f, "{}", e),
+            JmapError::Unsettled(e) => write!(f, "unsettled: {}", e),
         }
     }
 }
@@ -322,12 +335,21 @@ impl JmapClient {
 
         log_info!("[JMAP] Discovery successful, account_id: {}", account_id);
 
+        let submission = session.submits(&account_id);
+        log_info!(
+            "[JMAP] Mail submission for account {}: {}",
+            account_id,
+            if submission { "listed" } else { "not listed" }
+        );
         let client = JmapClient {
             username: username.to_string(),
             password: password.to_string(),
             api_url: session.api_url.clone(),
             account_id,
             download_url: session.download_url.clone(),
+            upload_url: session.upload_url.clone(),
+            max_size_upload: session.max_size_upload,
+            submission,
         };
 
         Ok((session, client))
@@ -1086,6 +1108,465 @@ impl JmapClient {
         Err(JmapError::Api(
             "Unexpected response for Email/set".to_string(),
         ))
+    }
+
+    // ---- submission ------------------------------------------------------
+
+    /// Whether the session lists mail submission for this account.
+    pub fn can_submit(&self) -> bool {
+        self.submission
+    }
+
+    /// The most bytes one upload may carry: the server's ceiling when the
+    /// session names one, and the fetch service's request bound always.
+    pub fn upload_ceiling(&self) -> u64 {
+        self.max_size_upload
+            .map_or(crate::td_fetch::MAX_REQUEST_BODY, |max| {
+                max.min(crate::td_fetch::MAX_REQUEST_BODY)
+            })
+    }
+
+    /// The account's identities, `Identity/get` with every id.
+    pub fn get_identities(&self) -> Result<Vec<Identity>, JmapError> {
+        log_info!("[JMAP] Identity/get for account: {}", self.account_id);
+        let request = JmapRequest {
+            using: vec![
+                "urn:ietf:params:jmap:core",
+                "urn:ietf:params:jmap:submission",
+            ],
+            method_calls: vec![MethodCall(
+                "Identity/get",
+                json!({
+                    "accountId": self.account_id,
+                    "ids": Json::Null
+                }),
+                "0".to_string(),
+            )],
+        };
+        let response = self.call(request)?;
+        let Some(method_response) = response.method_responses.first() else {
+            return Err(JmapError::Api(
+                "Empty response for Identity/get".to_string(),
+            ));
+        };
+        if method_response.0 != "Identity/get" {
+            return Err(Self::method_error("Identity/get", method_response));
+        }
+        let list = method_response
+            .1
+            .get("list")
+            .and_then(|list| list.as_array())
+            .ok_or_else(|| JmapError::Parse("Identity/get has no list".to_string()))?;
+        let mut identities = Vec::with_capacity(list.len());
+        for value in list {
+            identities.push(Identity::from_json(value).map_err(JmapError::Parse)?);
+        }
+        Ok(identities)
+    }
+
+    /// Uploads `bytes` as a blob of `content_type` at the session's upload
+    /// URL and answers its blob id.
+    pub fn upload_blob(&self, bytes: &[u8], content_type: &str) -> Result<String, JmapError> {
+        if !crate::td_fetch::available() {
+            return Err(no_fetch_service());
+        }
+        let Some(upload_url) = &self.upload_url else {
+            return Err(JmapError::Api(
+                "the session names no upload URL, so nothing can be attached".to_string(),
+            ));
+        };
+        let url = upload_url.replace("{accountId}", &uri_encode(&self.account_id));
+        log_info!(
+            "[JMAP] Uploading {} bytes of {} to {}",
+            bytes.len(),
+            content_type,
+            url
+        );
+        let auth = Self::auth_header(&self.username, &self.password);
+        let response = crate::td_fetch::post(
+            &url,
+            &[
+                ("authorization", auth.as_str()),
+                ("content-type", content_type),
+            ],
+            bytes,
+            RESPONSE_LIMIT,
+        )
+        .map_err(|e| JmapError::Http(e.to_string()))?;
+        if response.status >= 400 {
+            return Err(JmapError::Http(format!(
+                "{}: status code {}",
+                url, response.status
+            )));
+        }
+        let text = String::from_utf8(response.body)
+            .map_err(|e| JmapError::Parse(format!("Failed to read the upload's reply: {e}")))?;
+        let value = json::parse(&text)
+            .map_err(|e| JmapError::Parse(format!("Failed to parse the upload's reply: {e}")))?;
+        value
+            .get("blobId")
+            .and_then(|id| id.as_str())
+            .map(str::to_string)
+            .ok_or_else(|| {
+                JmapError::Parse(format!(
+                    "the upload's reply names no blobId: {}",
+                    truncate_str(&text, 200)
+                ))
+            })
+    }
+
+    /// Creates the message and submits it in one request: `Email/set`
+    /// creates it in `mailbox_id` with `$draft` and `$seen`, and
+    /// `EmailSubmission/set` sends it under `identity_id`, on success
+    /// dropping `$draft` and, when `sent_mailbox_id` is another mailbox,
+    /// moving it there. Answers the email's id and the submission's, and
+    /// whether that filing was done: its implicit `Email/set` answer is
+    /// read, so a message sent but left a draft is said to be. A refused
+    /// submission has the message the server made destroyed, best
+    /// effort, since the file is the draft of record.
+    pub fn submit_email(
+        &self,
+        email: Json,
+        identity_id: &str,
+        mailbox_id: &str,
+        sent_mailbox_id: Option<&str>,
+    ) -> Result<Submitted, JmapError> {
+        let mut email = email;
+        if let Json::Obj(pairs) = &mut email {
+            pairs.push(("mailboxIds".to_string(), json!({ mailbox_id: true })));
+            pairs.push((
+                "keywords".to_string(),
+                json!({ "$draft": true, "$seen": true }),
+            ));
+        }
+        let mut on_success = ObjectBuilder::new().set("keywords/$draft", Json::Null);
+        if let Some(sent) = sent_mailbox_id.filter(|sent| *sent != mailbox_id) {
+            on_success = on_success
+                .set(format!("mailboxIds/{sent}"), true)
+                .set(format!("mailboxIds/{mailbox_id}"), Json::Null);
+        }
+        log_info!(
+            "[JMAP] Email/set create and EmailSubmission/set for identity {}",
+            identity_id
+        );
+        let request = JmapRequest {
+            using: vec![
+                "urn:ietf:params:jmap:core",
+                "urn:ietf:params:jmap:mail",
+                "urn:ietf:params:jmap:submission",
+            ],
+            method_calls: vec![
+                MethodCall(
+                    "Email/set",
+                    json!({
+                        "accountId": self.account_id,
+                        "create": { "draft": email }
+                    }),
+                    "0".to_string(),
+                ),
+                MethodCall(
+                    "EmailSubmission/set",
+                    json!({
+                        "accountId": self.account_id,
+                        "create": {
+                            "submission": {
+                                "emailId": "#draft",
+                                "identityId": identity_id
+                            }
+                        },
+                        "onSuccessUpdateEmail": { "#submission": on_success.build() }
+                    }),
+                    "1".to_string(),
+                ),
+            ],
+        };
+        let response = self.call(request)?;
+
+        let mut email_id = None;
+        let mut submission_id = None;
+        let mut filed = Ok(());
+        for method_response in &response.method_responses {
+            match method_response.0.as_str() {
+                "Email/set" if method_response.2 == "1" => {
+                    // The filing on success, updating the created message.
+                    let not_updated = method_response
+                        .1
+                        .get("notUpdated")
+                        .and_then(|n| n.as_object())
+                        .filter(|n| !n.is_empty());
+                    if let Some(not_updated) = not_updated {
+                        let refusal = email_id
+                            .as_deref()
+                            .and_then(|id| not_updated.iter().find(|(key, _)| key == id))
+                            .or_else(|| not_updated.first())
+                            .map(|(_, error)| Self::set_error_text(error))
+                            .unwrap_or_else(|| "refused".to_string());
+                        filed = Err(refusal);
+                    }
+                }
+                "Email/set" if method_response.2 == "0" => {
+                    if let Some(refusal) = method_response.1.get_path(&["notCreated", "draft"]) {
+                        return Err(JmapError::Api(format!(
+                            "the server refused the message: {}",
+                            Self::set_error_text(refusal)
+                        )));
+                    }
+                    email_id = method_response
+                        .1
+                        .get_path(&["created", "draft", "id"])
+                        .and_then(|id| id.as_str())
+                        .map(str::to_string);
+                }
+                "EmailSubmission/set" => {
+                    if let Some(refusal) = method_response.1.get_path(&["notCreated", "submission"])
+                    {
+                        let cleanup = self.cleanup_created(email_id.as_ref());
+                        return Err(JmapError::Api(format!(
+                            "the server refused to send: {}{cleanup}",
+                            Self::set_error_text(refusal)
+                        )));
+                    }
+                    submission_id = method_response
+                        .1
+                        .get_path(&["created", "submission", "id"])
+                        .and_then(|id| id.as_str())
+                        .map(str::to_string);
+                }
+                "error" => {
+                    // The call id says whose error it is: the implicit
+                    // Email/set of the filing answers under the
+                    // submission's id, after the submission is created.
+                    match method_response.2.as_str() {
+                        "0" => return Err(Self::method_error("Email/set", method_response)),
+                        _ if submission_id.is_none() => {
+                            let error = Self::method_error("EmailSubmission/set", method_response);
+                            // A partial failure may have sent: nothing
+                            // is removed until the server is asked.
+                            let kind = method_response.1.get("type").and_then(|t| t.as_str());
+                            if kind == Some("serverPartialFail") {
+                                return Err(JmapError::Unsettled(error.to_string()));
+                            }
+                            let cleanup = self.cleanup_created(email_id.as_ref());
+                            return Err(JmapError::Api(format!("{error}{cleanup}")));
+                        }
+                        _ => {
+                            filed =
+                                Err(Self::method_error("the filing", method_response).to_string());
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        match (email_id, submission_id) {
+            (Some(email_id), Some(submission_id)) => Ok(Submitted {
+                email_id,
+                submission_id,
+                filed,
+            }),
+            (None, _) => Err(JmapError::Api(
+                "the server created no message for the draft".to_string(),
+            )),
+            (Some(_), None) => Err(JmapError::Api(
+                "the server created the message but reported no submission".to_string(),
+            )),
+        }
+    }
+
+    /// The copy `Email/set` made of a message whose submission was not
+    /// created is removed again, best effort: the draft of record is the
+    /// file. What to append to the refusal, nothing when nothing was made
+    /// or the copy went.
+    fn cleanup_created(&self, email_id: Option<&String>) -> String {
+        match email_id {
+            Some(id) => match self.destroy_emails(std::slice::from_ref(id)) {
+                Ok(()) => String::new(),
+                Err(e) => format!("; the copy the server made, {id}, could not be removed: {e}"),
+            },
+            None => String::new(),
+        }
+    }
+
+    /// The submissions the identity made between `since` and `until`
+    /// (RFC 3339), each with the id of the message it sent:
+    /// `EmailSubmission/query` by identity and time, then
+    /// `EmailSubmission/get`. The way a send whose answer was lost is
+    /// found again; a query by the Message-ID header would name it
+    /// directly, but servers answer that filter as they please
+    /// (Stalwart, for one, matches nothing), and every server answers
+    /// time.
+    pub fn submissions_between(
+        &self,
+        identity_id: &str,
+        since: &str,
+        until: &str,
+    ) -> Result<Vec<(String, String)>, JmapError> {
+        log_info!(
+            "[JMAP] EmailSubmission/query for identity {} between {} and {}",
+            identity_id,
+            since,
+            until
+        );
+        let using = vec![
+            "urn:ietf:params:jmap:core",
+            "urn:ietf:params:jmap:submission",
+        ];
+        let request = JmapRequest {
+            using: using.clone(),
+            method_calls: vec![MethodCall(
+                "EmailSubmission/query",
+                json!({
+                    "accountId": self.account_id,
+                    "filter": { "identityIds": [identity_id], "after": since, "before": until }
+                }),
+                "0".to_string(),
+            )],
+        };
+        let response = self.call(request)?;
+        let Some(method_response) = response.method_responses.first() else {
+            return Err(JmapError::Api(
+                "Empty response for EmailSubmission/query".to_string(),
+            ));
+        };
+        if method_response.0 != "EmailSubmission/query" {
+            return Err(Self::method_error("EmailSubmission/query", method_response));
+        }
+        let ids: Vec<String> = method_response
+            .1
+            .get("ids")
+            .and_then(|ids| ids.as_array())
+            .map(|ids| {
+                ids.iter()
+                    .filter_map(|id| id.as_str())
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let request = JmapRequest {
+            using,
+            method_calls: vec![MethodCall(
+                "EmailSubmission/get",
+                json!({
+                    "accountId": self.account_id,
+                    "ids": ids,
+                    "properties": ["id", "emailId"]
+                }),
+                "0".to_string(),
+            )],
+        };
+        let response = self.call(request)?;
+        let Some(method_response) = response.method_responses.first() else {
+            return Err(JmapError::Api(
+                "Empty response for EmailSubmission/get".to_string(),
+            ));
+        };
+        if method_response.0 != "EmailSubmission/get" {
+            return Err(Self::method_error("EmailSubmission/get", method_response));
+        }
+        Ok(method_response
+            .1
+            .get("list")
+            .and_then(|list| list.as_array())
+            .map(|list| {
+                list.iter()
+                    .filter_map(|submission| {
+                        let id = submission.get("id")?.as_str()?;
+                        let email_id = submission.get("emailId")?.as_str()?;
+                        Some((id.to_string(), email_id.to_string()))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default())
+    }
+
+    /// The messages' filing: keywords, mailboxes and Message-IDs.
+    pub fn get_email_filing(&self, ids: &[String]) -> Result<Vec<Email>, JmapError> {
+        if ids.is_empty() {
+            return Ok(vec![]);
+        }
+        log_info!("[JMAP] Email/get filing for {} email IDs", ids.len());
+        let request = JmapRequest {
+            using: vec!["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:mail"],
+            method_calls: vec![MethodCall(
+                "Email/get",
+                json!({
+                    "accountId": self.account_id,
+                    "ids": ids,
+                    "properties": ["id", "keywords", "mailboxIds", "messageId"]
+                }),
+                "0".to_string(),
+            )],
+        };
+        let response = self.call(request)?;
+        let Some(method_response) = response.method_responses.first() else {
+            return Err(JmapError::Api("Empty response for Email/get".to_string()));
+        };
+        if method_response.0 != "Email/get" {
+            return Err(Self::method_error("Email/get", method_response));
+        }
+        let email_response =
+            EmailGetResponse::from_json(&method_response.1).map_err(JmapError::Parse)?;
+        Ok(email_response.list)
+    }
+
+    /// A method-level `error` response, or a response of the wrong name,
+    /// as one line.
+    fn method_error(method: &str, response: &MethodResponse) -> JmapError {
+        if response.0 == "error" {
+            let kind = response
+                .1
+                .get("type")
+                .and_then(|t| t.as_str())
+                .unwrap_or("unknown");
+            let description = response
+                .1
+                .get("description")
+                .and_then(|d| d.as_str())
+                .unwrap_or("");
+            JmapError::Api(
+                format!("{method} failed: {kind} {description}")
+                    .trim_end()
+                    .to_string(),
+            )
+        } else {
+            JmapError::Api(format!("Unexpected response for {method}: {}", response.0))
+        }
+    }
+
+    /// A `SetError`'s type, description and properties as one line.
+    fn set_error_text(error: &Json) -> String {
+        let kind = error
+            .get("type")
+            .and_then(|t| t.as_str())
+            .unwrap_or("unknown");
+        let description = error
+            .get("description")
+            .and_then(|d| d.as_str())
+            .unwrap_or("");
+        let properties = error
+            .get("properties")
+            .and_then(|p| p.as_array())
+            .map(|list| {
+                list.iter()
+                    .filter_map(|p| p.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .filter(|p| !p.is_empty());
+        let mut text = kind.to_string();
+        if !description.is_empty() {
+            text.push_str(": ");
+            text.push_str(description);
+        }
+        if let Some(properties) = properties {
+            text.push_str(" (");
+            text.push_str(&properties);
+            text.push(')');
+        }
+        text
     }
 
     pub fn download_blob(

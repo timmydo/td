@@ -174,6 +174,17 @@ pub trait View {
     fn on_reveal(&mut self) -> bool {
         false
     }
+    /// Whether the view is waiting on the backend for what it holds, so
+    /// the window's close request is put to it rather than taken.
+    fn waiting(&self) -> bool {
+        false
+    }
+    /// Whether the view's draft is not to change: read-only in the pane
+    /// while the view waits on the backend for it, and once the server
+    /// has taken it, so the file retired is the file sent.
+    fn held(&self) -> bool {
+        false
+    }
 }
 
 /// A view on the stack with what the frame keeps for it: the first row

@@ -111,4 +111,27 @@ mod tests {
             assert!(mail == news, "{name} differs between td-mail and td-news");
         }
     }
+
+    /// The request-body ceiling the client applies before an upload is
+    /// the service's own: a change to one line without the other would
+    /// have td-mail refuse an attachment the service takes, or upload
+    /// one it refuses.
+    #[test]
+    fn the_client_request_body_ceiling_is_the_service_bound() {
+        let bound = |text: &str, prefix: &str| {
+            text.lines()
+                .find_map(|line| line.trim_start().strip_prefix(prefix))
+                .map(|rest| rest.trim_end_matches(';').trim().to_string())
+        };
+        let client = bound(
+            include_str!("../../../td-mail/src/td_fetch.rs"),
+            "pub const MAX_REQUEST_BODY: u64 =",
+        );
+        let service = bound(
+            include_str!("../../../net/src/fetchd.rs"),
+            "const MAX_REQUEST_BODY: u64 =",
+        );
+        assert_eq!(client.as_deref(), Some("32 * 1024 * 1024"));
+        assert_eq!(client, service);
+    }
 }

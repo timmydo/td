@@ -7,6 +7,16 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
+/// Now as JMAP's `UTCDate`, so what the mock makes is inside the window
+/// a client asks about.
+fn now_rfc3339() -> String {
+    let c = crate::civil::unix_to_civil_utc(crate::civil::now_unix());
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+        c.year, c.month, c.day, c.hour, c.minute, c.second
+    )
+}
+
 #[derive(Clone)]
 struct EmailRecord {
     id: String,
@@ -18,7 +28,11 @@ struct EmailRecord {
     received_at: String,
     mailbox_id: String,
     is_read: bool,
+    is_draft: bool,
     attachments: Vec<Value>,
+    /// The Message-ID an `Email/set` create gave the message; the seed
+    /// messages make theirs up from their ids.
+    message_id: Option<String>,
 }
 
 impl EmailRecord {
@@ -26,6 +40,9 @@ impl EmailRecord {
         let mut keywords = ObjectBuilder::new();
         if self.is_read {
             keywords.insert("$seen".to_string(), json!(true));
+        }
+        if self.is_draft {
+            keywords.insert("$draft".to_string(), json!(true));
         }
         let keywords = keywords.build();
 
@@ -45,7 +62,10 @@ impl EmailRecord {
             "bodyValues": {"1": {"value": self.body, "isEncodingProblem": false, "isTruncated": false}},
             "keywords": keywords,
             "mailboxIds": {self.mailbox_id.clone(): true},
-            "messageId": [format!("<{}@example.com>", self.id)],
+            "messageId": [self
+                .message_id
+                .clone()
+                .unwrap_or_else(|| format!("<{}@example.com>", self.id))],
             "references": null,
             "attachments": self.attachments.clone()
         })
@@ -54,6 +74,22 @@ impl EmailRecord {
 
 struct MockState {
     emails: HashMap<String, EmailRecord>,
+    /// Every blob uploaded: its id, type and bytes.
+    uploads: Vec<(String, String, Vec<u8>)>,
+    /// Every `Email/set` create object, with the id it was given.
+    created: Vec<(String, Value)>,
+    /// Every `EmailSubmission/set` create object, with the id it was given.
+    submissions: Vec<(String, Value)>,
+    /// Each submission's id with the id of the message it sent, resolved,
+    /// and when it was sent, as the server lists it.
+    submission_emails: Vec<(String, String, String)>,
+    /// Creation ids of this connection's request, for `#ref` resolution.
+    creation_refs: HashMap<String, String>,
+    /// Subjects marked `[lose]` whose first create was answered with a
+    /// broken reply, the request served all the same: once each.
+    lost: Vec<String>,
+    /// The reply to the request being served is to be lost.
+    lose_answer: bool,
 }
 
 impl MockState {
@@ -71,6 +107,7 @@ impl MockState {
                 received_at: "2025-01-15T10:30:00Z".to_string(),
                 mailbox_id: "mbox-inbox".to_string(),
                 is_read: true,
+                is_draft: false,
                 attachments: vec![json!({
                     "partId": "2",
                     "blobId": "blob-att-001",
@@ -78,6 +115,7 @@ impl MockState {
                     "name": "test-document.pdf",
                     "size": 1024
                 })],
+                message_id: None,
             },
             EmailRecord {
                 id: "email-002".to_string(),
@@ -89,7 +127,9 @@ impl MockState {
                 received_at: "2025-12-06T11:00:00Z".to_string(),
                 mailbox_id: "mbox-inbox".to_string(),
                 is_read: false,
+                is_draft: false,
                 attachments: vec![],
+                message_id: None,
             },
             EmailRecord {
                 id: "email-003".to_string(),
@@ -101,7 +141,9 @@ impl MockState {
                 received_at: "2025-12-20T09:00:00Z".to_string(),
                 mailbox_id: "mbox-inbox".to_string(),
                 is_read: false,
+                is_draft: false,
                 attachments: vec![],
+                message_id: None,
             },
             EmailRecord {
                 id: "email-004".to_string(),
@@ -113,7 +155,9 @@ impl MockState {
                 received_at: "2025-12-22T08:00:00Z".to_string(),
                 mailbox_id: "mbox-inbox".to_string(),
                 is_read: true,
+                is_draft: false,
                 attachments: vec![],
+                message_id: None,
             },
             EmailRecord {
                 id: "email-005".to_string(),
@@ -125,7 +169,9 @@ impl MockState {
                 received_at: "2025-11-01T08:00:00Z".to_string(),
                 mailbox_id: "mbox-archive".to_string(),
                 is_read: true,
+                is_draft: false,
                 attachments: vec![],
+                message_id: None,
             },
         ];
 
@@ -133,7 +179,321 @@ impl MockState {
             emails.insert(e.id.clone(), e);
         }
 
-        Self { emails }
+        Self {
+            emails,
+            uploads: Vec::new(),
+            created: Vec::new(),
+            submissions: Vec::new(),
+            submission_emails: Vec::new(),
+            creation_refs: HashMap::new(),
+            lost: Vec::new(),
+            lose_answer: false,
+        }
+    }
+
+    /// An `Email/set` create: the object becomes a record in the first
+    /// mailbox it names, its text the named body value, its attachments
+    /// as given; the id is `email-created-N`.
+    fn create_email(&mut self, creation_id: &str, object: &Value) -> Value {
+        let id = format!("email-created-{}", self.created.len() + 1);
+        let from = object
+            .get("from")
+            .and_then(Value::as_array)
+            .and_then(|f| f.first());
+        let part_id = object
+            .get_path(&["textBody"])
+            .and_then(Value::as_array)
+            .and_then(|t| t.first())
+            .and_then(|t| t.get("partId"))
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let body = object
+            .get_path(&["bodyValues", part_id, "value"])
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let mailbox_id = object
+            .get("mailboxIds")
+            .and_then(Value::as_object)
+            .and_then(|m| m.iter().find(|(_, v)| v.as_bool().unwrap_or(false)))
+            .map(|(k, _)| k.clone())
+            .unwrap_or_default();
+        let attachments = object
+            .get("attachments")
+            .and_then(Value::as_array)
+            .map(|list| {
+                list.iter()
+                    .enumerate()
+                    .map(|(i, a)| {
+                        let blob_id = a.get("blobId").and_then(Value::as_str).unwrap_or("");
+                        let size = self
+                            .uploads
+                            .iter()
+                            .find(|(id, _, _)| id == blob_id)
+                            .map_or(0, |(_, _, bytes)| bytes.len());
+                        json!({
+                            "partId": format!("{}", i + 2),
+                            "blobId": blob_id,
+                            "type": a.get("type").cloned().unwrap_or(Value::Null),
+                            "name": a.get("name").cloned().unwrap_or(Value::Null),
+                            "size": size
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let record = EmailRecord {
+            id: id.clone(),
+            thread_id: format!("thread-{id}"),
+            from_name: from
+                .and_then(|f| f.get("name"))
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            from_email: from
+                .and_then(|f| f.get("email"))
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+            subject: object
+                .get("subject")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+            body,
+            received_at: now_rfc3339(),
+            mailbox_id,
+            is_read: object
+                .get_path(&["keywords", "$seen"])
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            is_draft: object
+                .get_path(&["keywords", "$draft"])
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            attachments,
+            message_id: object
+                .get("messageId")
+                .and_then(Value::as_array)
+                .and_then(|ids| ids.first())
+                .and_then(Value::as_str)
+                .map(str::to_string),
+        };
+        // A subject marked [lose] has its first create's answer lost on
+        // the way back, the server having done everything asked.
+        let subject = object.get("subject").and_then(Value::as_str).unwrap_or("");
+        if subject.contains("[lose]") && !self.lost.iter().any(|s| s == subject) {
+            self.lost.push(subject.to_string());
+            self.lose_answer = true;
+        }
+        self.emails.insert(id.clone(), record);
+        self.creation_refs
+            .insert(creation_id.to_string(), id.clone());
+        self.created.push((id.clone(), object.clone()));
+        json!({
+            "id": id,
+            "blobId": format!("blob-raw-{id}"),
+            "threadId": format!("thread-{id}"),
+            "size": 1
+        })
+    }
+
+    /// A patch as `Email/set` update and `onSuccessUpdateEmail` write it:
+    /// `keywords/$seen`, `keywords/$draft`, `mailboxIds/ID` and a whole
+    /// `mailboxIds`.
+    fn patch_email(email: &mut EmailRecord, patch: &Value) {
+        if let Some(seen) = patch.get("keywords/$seen") {
+            email.is_read = seen.as_bool().unwrap_or(false);
+        }
+        if let Some(draft) = patch.get("keywords/$draft") {
+            email.is_draft = draft.as_bool().unwrap_or(false);
+        }
+        if let Some(mailbox_ids) = patch.get("mailboxIds").and_then(Value::as_object) {
+            if let Some((target, _)) = mailbox_ids
+                .iter()
+                .find(|(_, v)| v.as_bool().unwrap_or(false))
+            {
+                email.mailbox_id = target.clone();
+            }
+        }
+        if let Some(pairs) = patch.as_object() {
+            for (key, value) in pairs {
+                if let Some(id) = key.strip_prefix("mailboxIds/") {
+                    if value.as_bool().unwrap_or(false) {
+                        email.mailbox_id = id.to_string();
+                    }
+                }
+            }
+        }
+    }
+
+    /// `EmailSubmission/set`: one create, its `emailId` a `#ref` or an id,
+    /// its `identityId` the one identity; a recipient at `refuse.invalid`
+    /// is refused as a server would refuse a forbidden one. On success
+    /// the `onSuccessUpdateEmail` patches are applied and answered as an
+    /// implicit `Email/set`.
+    fn apply_submission_set(&mut self, args: &Value, call_id: &str) -> Vec<Value> {
+        let mut created = ObjectBuilder::new();
+        let mut not_created = ObjectBuilder::new();
+        let mut succeeded = Vec::new();
+        if let Some(create) = args.get("create").and_then(Value::as_object) {
+            for (creation_id, object) in create {
+                let email_ref = object.get("emailId").and_then(Value::as_str).unwrap_or("");
+                let email_id = match email_ref.strip_prefix('#') {
+                    Some(reference) => self.creation_refs.get(reference).cloned(),
+                    None => Some(email_ref.to_string()),
+                };
+                let Some(email_id) = email_id.filter(|id| self.emails.contains_key(id)) else {
+                    not_created.insert(
+                        creation_id.clone(),
+                        json!({"type": "invalidProperties", "properties": ["emailId"]}),
+                    );
+                    continue;
+                };
+                if object.get("identityId").and_then(Value::as_str) != Some("ident-001") {
+                    not_created.insert(
+                        creation_id.clone(),
+                        json!({
+                            "type": "invalidProperties",
+                            "properties": ["identityId"],
+                            "description": "unknown identity"
+                        }),
+                    );
+                    continue;
+                }
+                let refused = self
+                    .created
+                    .iter()
+                    .find(|(id, _)| *id == email_id)
+                    .is_some_and(|(_, object)| {
+                        object
+                            .get("to")
+                            .and_then(Value::as_array)
+                            .is_some_and(|to| {
+                                to.iter().any(|a| {
+                                    a.get("email")
+                                        .and_then(Value::as_str)
+                                        .is_some_and(|e| e.ends_with("@refuse.invalid"))
+                                })
+                            })
+                    });
+                if refused {
+                    not_created.insert(
+                        creation_id.clone(),
+                        json!({
+                            "type": "forbiddenToSend",
+                            "description": "the recipient's domain is refused"
+                        }),
+                    );
+                    continue;
+                }
+                let id = format!("sub-{}", self.submissions.len() + 1);
+                self.submissions.push((id.clone(), object.clone()));
+                let create_object = self
+                    .created
+                    .iter()
+                    .find(|(created_id, _)| *created_id == email_id)
+                    .map(|(_, object)| object.clone());
+                let subject = self
+                    .emails
+                    .get(&email_id)
+                    .map(|e| e.subject.clone())
+                    .unwrap_or_default();
+                // A subject marked [forget] is sent by a server that keeps
+                // no record of the submission afterwards (RFC 8621 §7
+                // lets it delete them): created and answered, never
+                // listed again.
+                let send_at = now_rfc3339();
+                if !subject.contains("[forget]") {
+                    self.submission_emails
+                        .push((id.clone(), email_id.clone(), send_at.clone()));
+                }
+                // A message addressed to this account is delivered to it
+                // too: a copy in INBOX with the same Message-ID, as a
+                // server would make.
+                let to_self = create_object.as_ref().is_some_and(|object| {
+                    ["to", "cc", "bcc"].iter().any(|field| {
+                        object
+                            .get(*field)
+                            .and_then(Value::as_array)
+                            .is_some_and(|list| {
+                                list.iter().any(|a| {
+                                    a.get("email").and_then(Value::as_str)
+                                        == Some("test@example.com")
+                                })
+                            })
+                    })
+                });
+                if let (true, Some(object), Some(copy)) =
+                    (to_self, create_object, self.emails.get(&email_id).cloned())
+                {
+                    let delivered_id = format!("email-delivered-{}", self.created.len() + 1);
+                    self.emails.insert(
+                        delivered_id.clone(),
+                        EmailRecord {
+                            id: delivered_id.clone(),
+                            mailbox_id: "mbox-inbox".to_string(),
+                            is_read: false,
+                            is_draft: false,
+                            ..copy
+                        },
+                    );
+                    self.created.push((delivered_id, object));
+                }
+                created.insert(
+                    creation_id.clone(),
+                    json!({"id": id, "undoStatus": "final", "sendAt": send_at}),
+                );
+                succeeded.push((creation_id.clone(), email_id));
+            }
+        }
+        let mut response = ObjectBuilder::new()
+            .set("accountId", "account-001")
+            .set("oldState", "sstate-001")
+            .set("newState", "sstate-002");
+        let created = created.build();
+        if !created.as_object().unwrap_or(&[]).is_empty() {
+            response = response.set("created", created);
+        }
+        let not_created = not_created.build();
+        if !not_created.as_object().unwrap_or(&[]).is_empty() {
+            response = response.set("notCreated", not_created);
+        }
+        let mut responses = vec![json!(["EmailSubmission/set", response.build(), call_id])];
+        if let Some(on_success) = args.get("onSuccessUpdateEmail").and_then(Value::as_object) {
+            let mut updated = ObjectBuilder::new();
+            let mut not_updated = ObjectBuilder::new();
+            for (reference, patch) in on_success {
+                let Some((_, email_id)) = succeeded
+                    .iter()
+                    .find(|(cid, _)| reference.strip_prefix('#') == Some(cid.as_str()))
+                else {
+                    continue;
+                };
+                if let Some(email) = self.emails.get_mut(email_id) {
+                    // A subject marked [stay] is a filing the server refuses.
+                    if email.subject.contains("[stay]") {
+                        not_updated.insert(
+                            email_id.clone(),
+                            json!({"type": "invalidPatch", "description": "kept as a draft"}),
+                        );
+                        continue;
+                    }
+                    Self::patch_email(email, patch);
+                    updated.insert(email_id.clone(), Value::Null);
+                }
+            }
+            let mut implicit = ObjectBuilder::new()
+                .set("accountId", "account-001")
+                .set("oldState", "estate-002")
+                .set("newState", "estate-003")
+                .set("updated", updated.build());
+            let not_updated = not_updated.build();
+            if !not_updated.as_object().unwrap_or(&[]).is_empty() {
+                implicit = implicit.set("notUpdated", not_updated);
+            }
+            responses.push(json!(["Email/set", implicit.build(), call_id]));
+        }
+        responses
     }
 
     fn query_email_ids(&self, filter: &Value, limit: usize, position: usize) -> Vec<String> {
@@ -141,7 +501,6 @@ impl MockState {
         let mut text: Option<String> = None;
         let mut after: Option<String> = None;
         let mut before: Option<String> = None;
-
         fn parse_filter(
             f: &Value,
             in_mailbox: &mut Option<String>,
@@ -223,24 +582,21 @@ impl MockState {
         let mut not_updated = ObjectBuilder::new();
         let mut not_destroyed = ObjectBuilder::new();
 
+        let mut created = ObjectBuilder::new();
+        if let Some(create) = args.get("create").and_then(Value::as_object) {
+            for (creation_id, object) in create {
+                let made = self.create_email(creation_id, object);
+                created.insert(creation_id.clone(), made);
+            }
+        }
+
         if let Some(update) = args.get("update").and_then(Value::as_object) {
             for (id, patch) in update {
                 let Some(email) = self.emails.get_mut(id) else {
                     not_updated.insert(id.clone(), json!({"type": "notFound"}));
                     continue;
                 };
-
-                if let Some(seen) = patch.get("keywords/$seen") {
-                    email.is_read = seen.as_bool().unwrap_or(false);
-                }
-                if let Some(mailbox_ids) = patch.get("mailboxIds").and_then(Value::as_object) {
-                    if let Some((target, _)) = mailbox_ids
-                        .iter()
-                        .find(|(_, v)| v.as_bool().unwrap_or(false))
-                    {
-                        email.mailbox_id = target.clone();
-                    }
-                }
+                Self::patch_email(email, patch);
                 updated.insert(id.clone(), Value::Null);
             }
         }
@@ -260,9 +616,13 @@ impl MockState {
             .set("accountId", "account-001")
             .set("oldState", "estate-001")
             .set("newState", "estate-002");
+        let created = created.build();
         let updated = updated.build();
         let not_updated = not_updated.build();
         let not_destroyed = not_destroyed.build();
+        if !created.as_object().unwrap_or(&[]).is_empty() {
+            resp = resp.set("created", created);
+        }
         if !updated.as_object().unwrap_or(&[]).is_empty() {
             resp = resp.set("updated", updated);
         }
@@ -280,6 +640,7 @@ pub struct MockJmapServer {
     port: u16,
     shutdown: Arc<AtomicBool>,
     handle: Option<thread::JoinHandle<()>>,
+    state: Arc<Mutex<MockState>>,
 }
 
 impl MockJmapServer {
@@ -289,24 +650,55 @@ impl MockJmapServer {
         let shutdown = Arc::new(AtomicBool::new(false));
         let shutdown_clone = shutdown.clone();
         let state = Arc::new(Mutex::new(MockState::new()));
+        let served = Arc::clone(&state);
 
         listener
             .set_nonblocking(true)
             .expect("set_nonblocking on listener");
 
         let handle = thread::spawn(move || {
-            Self::serve(listener, shutdown_clone, state, port);
+            Self::serve(listener, shutdown_clone, served, port);
         });
 
         MockJmapServer {
             port,
             shutdown,
             handle: Some(handle),
+            state,
         }
     }
 
     pub fn url(&self) -> String {
         format!("http://127.0.0.1:{}", self.port)
+    }
+
+    /// Every blob uploaded so far: id, type and bytes.
+    #[allow(dead_code)]
+    pub fn uploads(&self) -> Vec<(String, String, Vec<u8>)> {
+        self.state.lock().expect("state lock").uploads.clone()
+    }
+
+    /// Every `Email/set` create so far: the id given and the object.
+    #[allow(dead_code)]
+    pub fn created_emails(&self) -> Vec<(String, Value)> {
+        self.state.lock().expect("state lock").created.clone()
+    }
+
+    /// Every `EmailSubmission/set` create so far: the id and the object.
+    #[allow(dead_code)]
+    pub fn submissions(&self) -> Vec<(String, Value)> {
+        self.state.lock().expect("state lock").submissions.clone()
+    }
+
+    /// A stored message's mailbox and keywords, for what a send left.
+    #[allow(dead_code)]
+    pub fn email_state(&self, id: &str) -> Option<(String, bool, bool)> {
+        self.state
+            .lock()
+            .expect("state lock")
+            .emails
+            .get(id)
+            .map(|e| (e.mailbox_id.clone(), e.is_read, e.is_draft))
     }
 
     fn serve(
@@ -347,6 +739,7 @@ impl MockJmapServer {
         }
 
         let mut content_length: usize = 0;
+        let mut request_type = String::new();
         loop {
             let mut header = String::new();
             if reader.read_line(&mut header).is_err() {
@@ -356,27 +749,29 @@ impl MockJmapServer {
             if trimmed.is_empty() {
                 break;
             }
-            if let Some(val) = trimmed.strip_prefix("Content-Length:") {
-                if let Ok(len) = val.trim().parse() {
-                    content_length = len;
-                }
-            }
-            if let Some(val) = trimmed.strip_prefix("content-length:") {
-                if let Ok(len) = val.trim().parse() {
-                    content_length = len;
+            if let Some((name, value)) = trimmed.split_once(':') {
+                match name.to_ascii_lowercase().as_str() {
+                    "content-length" => {
+                        if let Ok(len) = value.trim().parse() {
+                            content_length = len;
+                        }
+                    }
+                    "content-type" => request_type = value.trim().to_string(),
+                    _ => {}
                 }
             }
         }
 
-        let body = if content_length > 0 {
+        let raw_body = if content_length > 0 {
             let mut buf = vec![0u8; content_length];
             if reader.read_exact(&mut buf).is_err() {
                 return;
             }
-            String::from_utf8_lossy(&buf).to_string()
+            buf
         } else {
-            String::new()
+            Vec::new()
         };
+        let body = String::from_utf8_lossy(&raw_body).to_string();
 
         let parts: Vec<&str> = request_line.split_whitespace().collect();
         if parts.len() < 2 {
@@ -395,6 +790,23 @@ impl MockJmapServer {
             } else if method == "GET" && path.starts_with("/download/") {
                 let (s, b) = Self::handle_download(path);
                 (s, b, "application/octet-stream")
+            } else if method == "POST" && path.starts_with("/upload/account-001") {
+                let mut guard = state.lock().expect("state lock");
+                let blob_id = format!("blob-up-{}", guard.uploads.len() + 1);
+                guard
+                    .uploads
+                    .push((blob_id.clone(), request_type.clone(), raw_body.clone()));
+                let reply = json!({
+                    "accountId": "account-001",
+                    "blobId": blob_id,
+                    "type": request_type,
+                    "size": raw_body.len()
+                });
+                (
+                    "201 Created".to_string(),
+                    reply.to_string(),
+                    "application/json",
+                )
             } else {
                 (
                     "404 Not Found".to_string(),
@@ -447,14 +859,25 @@ impl MockJmapServer {
             "username": "test@example.com",
             "apiUrl": format!("http://127.0.0.1:{}/api", port),
             "downloadUrl": format!("http://127.0.0.1:{}/download/{{accountId}}/{{blobId}}/{{name}}?type={{type}}", port),
+            "uploadUrl": format!("http://127.0.0.1:{}/upload/{{accountId}}/", port),
+            "capabilities": {
+                "urn:ietf:params:jmap:core": { "maxSizeUpload": 1000000 },
+                "urn:ietf:params:jmap:mail": {},
+                "urn:ietf:params:jmap:submission": { "maxDelayedSend": 0 }
+            },
             "primaryAccounts": {
-                "urn:ietf:params:jmap:mail": "account-001"
+                "urn:ietf:params:jmap:mail": "account-001",
+                "urn:ietf:params:jmap:submission": "account-001"
             },
             "accounts": {
                 "account-001": {
                     "name": "Test Account",
                     "isPersonal": true,
-                    "isReadOnly": false
+                    "isReadOnly": false,
+                    "accountCapabilities": {
+                        "urn:ietf:params:jmap:mail": {},
+                        "urn:ietf:params:jmap:submission": { "maxDelayedSend": 0 }
+                    }
                 }
             }
         });
@@ -523,6 +946,22 @@ impl MockJmapServer {
                                 "totalEmails": 0,
                                 "unreadEmails": 0,
                                 "sortOrder": 4
+                            },
+                            {
+                                "id": "mbox-drafts",
+                                "name": "Drafts",
+                                "role": "drafts",
+                                "totalEmails": 0,
+                                "unreadEmails": 0,
+                                "sortOrder": 5
+                            },
+                            {
+                                "id": "mbox-sent",
+                                "name": "Sent",
+                                "role": "sent",
+                                "totalEmails": 0,
+                                "unreadEmails": 0,
+                                "sortOrder": 6
                             }
                         ],
                         "notFound": []
@@ -593,6 +1032,123 @@ impl MockJmapServer {
                     };
                     json!(["Email/set", payload, call_id])
                 }
+                "Identity/get" => json!([
+                    "Identity/get",
+                    {
+                        "accountId": "account-001",
+                        "state": "istate-001",
+                        "list": [
+                            {
+                                "id": "ident-001",
+                                "name": "Test User",
+                                "email": "test@example.com",
+                                "mayDelete": false
+                            }
+                        ],
+                        "notFound": []
+                    },
+                    call_id
+                ]),
+                "EmailSubmission/set" => {
+                    let all = {
+                        let mut guard = state.lock().expect("state lock");
+                        guard.apply_submission_set(args, call_id)
+                    };
+                    responses.extend(all);
+                    continue;
+                }
+                "EmailSubmission/query" => {
+                    let filter = args.get("filter").cloned().unwrap_or_else(|| json!({}));
+                    let strings = |key: &str| -> Option<Vec<String>> {
+                        filter.get(key).and_then(Value::as_array).map(|list| {
+                            list.iter()
+                                .filter_map(Value::as_str)
+                                .map(str::to_string)
+                                .collect()
+                        })
+                    };
+                    let email_ids = strings("emailIds");
+                    let identity_ids = strings("identityIds");
+                    let after = filter
+                        .get("after")
+                        .and_then(Value::as_str)
+                        .map(str::to_string);
+                    let before = filter
+                        .get("before")
+                        .and_then(Value::as_str)
+                        .map(str::to_string);
+                    let ids: Vec<String> = {
+                        let guard = state.lock().expect("state lock");
+                        guard
+                            .submission_emails
+                            .iter()
+                            .filter(|(_, email_id, send_at)| {
+                                email_ids.as_ref().is_none_or(|ids| ids.contains(email_id))
+                                    && identity_ids
+                                        .as_ref()
+                                        .is_none_or(|ids| ids.iter().any(|id| id == "ident-001"))
+                                    && after.as_ref().is_none_or(|after| send_at > after)
+                                    && before.as_ref().is_none_or(|before| send_at < before)
+                            })
+                            .map(|(id, _, _)| id.clone())
+                            .collect()
+                    };
+                    json!([
+                        "EmailSubmission/query",
+                        {
+                            "accountId": "account-001",
+                            "queryState": "sqstate-001",
+                            "ids": ids,
+                            "position": 0,
+                            "total": ids.len()
+                        },
+                        call_id
+                    ])
+                }
+                "EmailSubmission/get" => {
+                    let wanted: Vec<String> = args
+                        .get("ids")
+                        .and_then(Value::as_array)
+                        .map(|ids| {
+                            ids.iter()
+                                .filter_map(Value::as_str)
+                                .map(str::to_string)
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    let (list, not_found): (Vec<Value>, Vec<String>) = {
+                        let guard = state.lock().expect("state lock");
+                        let mut list = Vec::new();
+                        let mut not_found = Vec::new();
+                        for id in wanted {
+                            match guard
+                                .submission_emails
+                                .iter()
+                                .find(|(sub_id, _, _)| *sub_id == id)
+                            {
+                                Some((sub_id, email_id, send_at)) => list.push(json!({
+                                    "id": sub_id,
+                                    "emailId": email_id,
+                                    "identityId": "ident-001",
+                                    "sendAt": send_at,
+                                    "undoStatus": "final"
+                                })),
+                                None => not_found.push(id),
+                            }
+                        }
+                        (list, not_found)
+                    };
+                    json!([
+                        "EmailSubmission/get",
+                        {
+                            "accountId": "account-001",
+                            "state": "sstate-002",
+                            "list": list,
+                            "notFound": not_found
+                        },
+                        call_id
+                    ])
+                }
                 "Thread/get" => json!([
                     "Thread/get",
                     {
@@ -624,6 +1180,18 @@ impl MockJmapServer {
             "methodResponses": responses,
             "sessionState": "session-001"
         });
+
+        // The request was served in full; only its answer is lost.
+        let lose = {
+            let mut guard = state.lock().expect("state lock");
+            std::mem::take(&mut guard.lose_answer)
+        };
+        if lose {
+            return (
+                "502 Bad Gateway".to_string(),
+                "the answer was lost".to_string(),
+            );
+        }
 
         ("200 OK".to_string(), jmap_response.to_string())
     }

@@ -2,7 +2,7 @@ use crate::backend::{self, BackendCommand, BackendResponse};
 use crate::compose;
 use crate::config::Config;
 use crate::jmap::types::{Email, Mailbox};
-use crate::json::{self, Json as Value};
+use crate::json::{self, Json as Value, ObjectBuilder};
 use crate::keybindings;
 use crate::regex::UserRegex;
 use crate::rules::{self, CompiledRule};
@@ -264,6 +264,7 @@ fn dispatch(state: &mut CliState, input: &Value) -> Value {
         "compose_draft" => cmd_compose_draft(state),
         "reply_draft" => cmd_reply_draft(state, input),
         "forward_draft" => cmd_forward_draft(state, input),
+        "send_draft" => cmd_send_draft(state, input),
         "keybindings" => cmd_keybindings(),
         _ => err_response(&format!("unknown command '{}'", command)),
     }
@@ -1313,6 +1314,50 @@ fn cmd_reply_draft(state: &mut CliState, input: &Value) -> Value {
     }
 }
 
+/// Sends the retained draft at "path" through the account's server and,
+/// sent, retires it to the sent directory beside its drafts directory
+/// (with "attachment_dir" when the draft has a sidecar); a draft that was
+/// sent but could not be moved is still "ok", with "retired_to" null and
+/// the reason in "warning".
+fn cmd_send_draft(state: &mut CliState, input: &Value) -> Value {
+    let path = match input.get("path").and_then(|v| v.as_str()) {
+        Some(path) if !path.is_empty() => std::path::PathBuf::from(path),
+        _ => return err_response("missing 'path' field"),
+    };
+    let attachment_dir = input
+        .get("attachment_dir")
+        .and_then(|v| v.as_str())
+        .filter(|dir| !dir.is_empty())
+        .map(std::path::PathBuf::from);
+    if let Err(e) = state.send_cmd(BackendCommand::SendDraft { path: path.clone() }) {
+        return err_response(&e);
+    }
+    match state.recv_resp() {
+        Ok(BackendResponse::DraftSent { result, .. }) => match result {
+            Ok(sent) => {
+                let mut reply = ObjectBuilder::new()
+                    .set("email_id", &sent.email_id)
+                    .set("submission_id", &sent.submission_id)
+                    .set("kept_in", &sent.kept_in);
+                match compose::retire_draft(&path, attachment_dir.as_deref()) {
+                    Ok(retired) => {
+                        reply = reply.set("retired_to", retired.to_string_lossy().as_ref());
+                    }
+                    Err(e) => {
+                        reply = reply
+                            .set("retired_to", Value::Null)
+                            .set("warning", format!("not retired: {e}"));
+                    }
+                }
+                ok_response(reply.build())
+            }
+            Err(e) => err_response(&e),
+        },
+        Ok(_) => err_response("unexpected response from backend"),
+        Err(e) => err_response(&e),
+    }
+}
+
 fn cmd_forward_draft(state: &mut CliState, input: &Value) -> Value {
     let id = match input.get("id").and_then(|v| v.as_str()) {
         Some(id) => id.to_string(),
@@ -1724,6 +1769,10 @@ reply_draft: Generate a reply draft.
 forward_draft: Generate a forward draft.
    > {{"command": "forward_draft", "id": "email-id"}}
    < {{"ok": true, "draft": "From: ...\nTo: \nSubject: Fwd: ...\n\n---------- Forwarded message ----------\n..."}}
+
+send_draft: Send a retained draft through the account's server (JMAP EmailSubmission), then move it to the sent directory beside its drafts directory.
+   > {{"command": "send_draft", "path": "/home/me/.local/state/td-mail/drafts/td-mail-draft-1-2.eml", "attachment_dir": "/home/me/.local/state/td-mail/drafts/td-mail-att-1-2"}}
+   < {{"ok": true, "email_id": "...", "submission_id": "...", "kept_in": "Sent", "retired_to": "/home/me/.local/state/td-mail/sent/td-mail-draft-1-2.eml"}}
 
 Keybindings
 -----------

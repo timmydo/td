@@ -30,6 +30,7 @@ mod kv;
 mod regex;
 mod rules;
 mod spam;
+mod submit;
 mod td_fetch;
 #[cfg(test)]
 mod testing;
@@ -284,6 +285,7 @@ Rules:
 - `password_command` is a shell command that prints the password to stdout.
 - Quoted strings support \", \\, \n, \t escapes.
 - `scrolloff` and `[theme]` were the terminal's; they are accepted and ignored. The window keeps the selection in view and draws with the toolkit's colours.
+- Sending needs nothing here: a draft goes through the account's JMAP server (mail submission, RFC 8621), under the identity whose address the draft's From names; there is no SMTP setting.
 - `archive_folder` and `deleted_folder` are mailbox targets for `a` and `d` in list views.
 - `rules_mailbox_regex` controls which mailbox names auto-run rules on refresh/fetch; default is `^INBOX$`.
 - `my_email_regex` is matched against combined To/Cc and used by rules with `skip_if_to_me = true`.

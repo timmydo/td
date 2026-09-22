@@ -179,12 +179,19 @@ fn opt_list<T>(
     }
 }
 
+/// The capability an account that sends mail carries (RFC 8621 §7).
+pub const SUBMISSION_CAPABILITY: &str = "urn:ietf:params:jmap:submission";
+const CORE_CAPABILITY: &str = "urn:ietf:params:jmap:core";
+
 // JMAP Session (from .well-known/jmap)
 #[derive(Debug)]
 pub struct JmapSession {
     pub username: String,
     pub api_url: String,
     pub download_url: Option<String>,
+    pub upload_url: Option<String>,
+    /// The core capability's `maxSizeUpload`, when the session names it.
+    pub max_size_upload: Option<u64>,
     pub primary_accounts: HashMap<String, String>,
     pub accounts: HashMap<String, JmapAccount>,
 }
@@ -203,12 +210,33 @@ impl JmapSession {
                 out
             }
         };
+        let max_size_upload = match present(obj, "capabilities") {
+            None => None,
+            Some(capabilities) => {
+                match present(object(capabilities, "capabilities")?, CORE_CAPABILITY) {
+                    None => None,
+                    Some(core) => opt_u64(object(core, CORE_CAPABILITY)?, "maxSizeUpload")?,
+                }
+            }
+        };
         Ok(JmapSession {
             username: req_str(obj, "username")?,
             api_url: req_str(obj, "apiUrl")?,
             download_url: opt_str(obj, "downloadUrl")?,
+            upload_url: opt_str(obj, "uploadUrl")?,
+            max_size_upload,
             primary_accounts: def_string_map(obj, "primaryAccounts")?,
             accounts,
+        })
+    }
+
+    /// Whether the session lists mail submission for `account_id`.
+    pub fn submits(&self, account_id: &str) -> bool {
+        self.accounts.get(account_id).is_some_and(|account| {
+            account
+                .capabilities
+                .iter()
+                .any(|uri| uri == SUBMISSION_CAPABILITY)
         })
     }
 }
@@ -218,17 +246,83 @@ pub struct JmapAccount {
     pub name: String,
     pub is_personal: bool,
     pub is_read_only: bool,
+    /// The URIs of `accountCapabilities`.
+    pub capabilities: Vec<String>,
 }
 
 impl JmapAccount {
     pub fn from_json(value: &Json) -> Result<Self, JsonError> {
         let obj = object(value, "JmapAccount")?;
+        let capabilities = match present(obj, "accountCapabilities") {
+            None => Vec::new(),
+            Some(v) => object(v, "accountCapabilities")?
+                .iter()
+                .map(|(uri, _)| uri.clone())
+                .collect(),
+        };
         Ok(JmapAccount {
             name: req_str(obj, "name")?,
             is_personal: def_bool(obj, "isPersonal")?,
             is_read_only: def_bool(obj, "isReadOnly")?,
+            capabilities,
         })
     }
+}
+
+/// An address the account may send as, `Identity/get`'s object.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Identity {
+    pub id: String,
+    pub name: String,
+    pub email: String,
+}
+
+impl Identity {
+    pub fn from_json(value: &Json) -> Result<Self, JsonError> {
+        let obj = object(value, "Identity")?;
+        Ok(Identity {
+            id: req_str(obj, "id")?,
+            name: def_str(obj, "name")?,
+            email: req_str(obj, "email")?,
+        })
+    }
+
+    /// Whether the identity is `email`, case aside.
+    pub fn is_address(&self, email: &str) -> bool {
+        self.email.eq_ignore_ascii_case(email)
+    }
+
+    /// Whether the identity sends as `email`: the same address, case
+    /// aside, or a `*@domain` identity for an address at that domain.
+    pub fn matches(&self, email: &str) -> bool {
+        if self.is_address(email) {
+            return true;
+        }
+        match (self.email.strip_prefix("*@"), email.rsplit_once('@')) {
+            (Some(wild), Some((_, domain))) => wild.eq_ignore_ascii_case(domain),
+            _ => false,
+        }
+    }
+
+    /// The identity among `identities` that sends as `email`: the one
+    /// that is the address before a wildcard for its domain, whatever
+    /// order the server lists them in.
+    pub fn sending_as<'a>(identities: &'a [Identity], email: &str) -> Option<&'a Identity> {
+        identities
+            .iter()
+            .find(|identity| identity.is_address(email))
+            .or_else(|| identities.iter().find(|identity| identity.matches(email)))
+    }
+}
+
+/// What `EmailSubmission/set` created, with the message it sent, and
+/// whether the filing asked for on success (out of Drafts, into Sent)
+/// was done, the server's reason when it was not.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Submitted {
+    pub email_id: String,
+    pub submission_id: String,
+    pub filed: Result<(), String>,
 }
 
 impl JmapSession {
@@ -545,7 +639,7 @@ impl ToJson for Email {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EmailAddress {
     pub name: Option<String>,
     pub email: Option<String>,
@@ -567,6 +661,53 @@ impl ToJson for EmailAddress {
             .set("name", &self.name)
             .set("email", &self.email)
             .build()
+    }
+}
+
+impl EmailAddress {
+    /// The address as a draft header carries it, on one line: `Name
+    /// <box@host>` with the name quoted, `"` and `\` escaped, when it
+    /// carries anything but RFC 5322 atext and spaces, so a name with a
+    /// comma or angle brackets reads back as one address; `box@host`
+    /// alone without a name. A control character in either, the newline
+    /// a decoded header may hold included, is a space in the name and
+    /// dropped from the address, so neither begins another header line.
+    pub fn header_form(&self) -> String {
+        let quoted_name = self.name.as_deref().filter(|n| !n.is_empty()).map(|name| {
+            let name: String = name
+                .chars()
+                .map(|c| if c.is_control() { ' ' } else { c })
+                .collect();
+            let plain = name.chars().all(|c| {
+                c == ' ' || c.is_ascii_alphanumeric() || "!#$%&'*+-/=?^_`{|}~".contains(c)
+            });
+            if plain {
+                name
+            } else {
+                let mut quoted = String::with_capacity(name.len() + 2);
+                quoted.push('"');
+                for c in name.chars() {
+                    if c == '"' || c == '\\' {
+                        quoted.push('\\');
+                    }
+                    quoted.push(c);
+                }
+                quoted.push('"');
+                quoted
+            }
+        });
+        let email = self.email.as_deref().map(|email| {
+            email
+                .chars()
+                .filter(|c| !c.is_control())
+                .collect::<String>()
+        });
+        match (quoted_name, email) {
+            (Some(name), Some(email)) => format!("{name} <{email}>"),
+            (None, Some(email)) => email,
+            (Some(name), None) => name,
+            (None, None) => String::new(),
+        }
     }
 }
 
@@ -753,6 +894,79 @@ mod tests {
         assert_eq!(acc.name, "Personal");
         assert!(acc.is_personal);
         assert!(!acc.is_read_only);
+    }
+
+    /// The upload URL, the core capability's upload ceiling and the
+    /// account's submission capability are read from the session; an
+    /// account without the capability, or a session without the tables,
+    /// does not submit. An identity matches its own address, case aside,
+    /// and a `*@domain` identity matches any address at its domain.
+    #[test]
+    fn the_session_says_whether_and_how_an_account_submits() {
+        let data = json!({
+            "username": "u@e.com",
+            "apiUrl": "https://api.e.com/jmap",
+            "uploadUrl": "https://api.e.com/upload/{accountId}/",
+            "capabilities": {
+                "urn:ietf:params:jmap:core": { "maxSizeUpload": 50000000 },
+                "urn:ietf:params:jmap:mail": {},
+                "urn:ietf:params:jmap:submission": { "maxDelayedSend": 0 }
+            },
+            "primaryAccounts": { "urn:ietf:params:jmap:mail": "a" },
+            "accounts": {
+                "a": {
+                    "name": "Main",
+                    "isPersonal": true,
+                    "accountCapabilities": {
+                        "urn:ietf:params:jmap:mail": {},
+                        "urn:ietf:params:jmap:submission": { "maxDelayedSend": 0 }
+                    }
+                },
+                "b": {
+                    "name": "Shared",
+                    "isPersonal": false,
+                    "accountCapabilities": { "urn:ietf:params:jmap:mail": {} }
+                }
+            }
+        });
+        let session = JmapSession::from_json(&data).unwrap();
+        assert_eq!(
+            session.upload_url.as_deref(),
+            Some("https://api.e.com/upload/{accountId}/")
+        );
+        assert_eq!(session.max_size_upload, Some(50_000_000));
+        assert!(session.submits("a"));
+        assert!(!session.submits("b"));
+        assert!(!session.submits("nobody"));
+        let bare = json!({ "username": "u", "apiUrl": "https://api.e.com/jmap" });
+        let session = JmapSession::from_json(&bare).unwrap();
+        assert!(session.upload_url.is_none());
+        assert!(session.max_size_upload.is_none());
+        assert!(!session.submits("a"));
+
+        let identity = Identity::from_json(&json!({
+            "id": "i1", "name": "Me", "email": "Me@Example.com"
+        }))
+        .unwrap();
+        assert!(identity.matches("me@example.com"));
+        assert!(!identity.matches("you@example.com"));
+        let wild = Identity::from_json(&json!({ "id": "i2", "email": "*@example.com" })).unwrap();
+        assert_eq!(wild.name, "");
+        assert!(wild.matches("anyone@EXAMPLE.com"));
+        assert!(!wild.matches("anyone@other.com"));
+        assert!(!wild.matches("no-at-sign"));
+        assert!(Identity::from_json(&json!({ "id": "i3" })).is_err());
+        // The address itself outranks the wildcard listed before it.
+        let listed = [wild.clone(), identity.clone()];
+        assert_eq!(
+            Identity::sending_as(&listed, "me@example.com").map(|i| i.id.as_str()),
+            Some("i1")
+        );
+        assert_eq!(
+            Identity::sending_as(&listed, "other@example.com").map(|i| i.id.as_str()),
+            Some("i2")
+        );
+        assert!(Identity::sending_as(&listed, "x@other.com").is_none());
     }
 
     #[test]

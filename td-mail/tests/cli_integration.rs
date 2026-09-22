@@ -5,6 +5,9 @@
 #[allow(dead_code)]
 #[path = "../src/json.rs"]
 mod json;
+#[allow(dead_code)]
+#[path = "../src/civil.rs"]
+mod civil;
 
 mod mock_fetch;
 mod mock_jmap;
@@ -107,6 +110,11 @@ password_command = "echo test"
         }
     }
 
+    /// The mock server, for what it received.
+    fn server(&self) -> &MockJmapServer {
+        &self._server
+    }
+
     fn send(&mut self, cmd: Value) -> Value {
         let line = cmd.to_string();
         writeln!(self.stdin, "{}", line).expect("write to stdin");
@@ -170,7 +178,7 @@ fn test_connect_and_list_mailboxes() {
     assert!(resp["ok"].is_true(), "list_mailboxes failed: {}", resp);
 
     let mailboxes = resp["mailboxes"].as_array().expect("mailboxes array");
-    assert_eq!(mailboxes.len(), 3);
+    assert_eq!(mailboxes.len(), 5);
 
     let names: Vec<&str> = mailboxes
         .iter()
@@ -178,6 +186,8 @@ fn test_connect_and_list_mailboxes() {
         .collect();
     assert!(names.contains(&"INBOX"));
     assert!(names.contains(&"Archive"));
+    assert!(names.contains(&"Drafts"));
+    assert!(names.contains(&"Sent"));
     assert!(names.contains(&"Trash"));
 }
 
@@ -573,4 +583,354 @@ fn test_connect_without_fetch_service_names_the_socket() {
         runtime_dir.path().display()
     );
     assert!(error.contains(&expected), "error was: {}", error);
+}
+
+/// `send_draft` parses the retained draft, uploads its attachment, creates
+/// the message in Drafts and submits it in one request under the account's
+/// identity, the server then moving it to Sent, read and no longer a
+/// draft; the draft and its sidecar retire to `sent` beside `drafts`. A
+/// From nobody sends as, and a recipient the server refuses, are errors
+/// naming why, and the draft stays where it was.
+#[test]
+fn test_send_draft_submits_through_jmap_and_retires_the_draft() {
+    let mut h = CliHarness::start();
+    let resp = h.send(json!({"command": "connect", "account": "test"}));
+    assert!(resp["ok"].is_true(), "connect failed: {}", resp);
+
+    let state = testing::tempdir().expect("state dir");
+    let drafts = state.path().join("td-mail/drafts");
+    std::fs::create_dir_all(&drafts).expect("drafts dir");
+    let sidecar = drafts.join("td-mail-att-9-9");
+    std::fs::create_dir_all(&sidecar).expect("sidecar dir");
+    let attachment = sidecar.join("hello.txt");
+    std::fs::write(&attachment, "hello attachment").expect("attachment");
+    let draft = drafts.join("td-mail-draft-9-9.eml");
+    std::fs::write(
+        &draft,
+        format!(
+            "From: Test User <test@example.com>\nTo: Bob <bob@example.com>\nCc: carol@example.com\nSubject: Sent from td-mail\n--text follows this line--\n\nHello Bob.\n\n<#part type=\"text/plain\" filename=\"{}\" disposition=\"attachment\">\n<#/part>\n",
+            attachment.display()
+        ),
+    )
+    .expect("draft");
+
+    let resp = h.send(json!({
+        "command": "send_draft",
+        "path": draft.to_string_lossy(),
+        "attachment_dir": sidecar.to_string_lossy()
+    }));
+    assert!(resp["ok"].is_true(), "send_draft failed: {}", resp);
+    assert_eq!(text(&resp["email_id"]), "email-created-1");
+    assert_eq!(text(&resp["submission_id"]), "sub-1");
+    assert_eq!(text(&resp["kept_in"]), "Sent");
+    let retired = Path::new(text(&resp["retired_to"]));
+    assert_eq!(
+        retired,
+        state.path().join("td-mail/sent/td-mail-draft-9-9.eml")
+    );
+    assert!(retired.exists() && !draft.exists(), "the draft moved");
+    assert!(
+        state
+            .path()
+            .join("td-mail/sent/td-mail-att-9-9/hello.txt")
+            .exists()
+            && !sidecar.exists(),
+        "the sidecar moved with it"
+    );
+
+    // What the server saw: the upload, the create and the submission.
+    let uploads = h.server().uploads();
+    assert_eq!(uploads.len(), 1);
+    assert_eq!(uploads[0].1, "text/plain");
+    assert_eq!(uploads[0].2, b"hello attachment");
+    let created = h.server().created_emails();
+    assert_eq!(created.len(), 1);
+    let (id, object) = &created[0];
+    assert_eq!(id, "email-created-1");
+    assert_eq!(text(&object["from"][0]["email"]), "test@example.com");
+    assert_eq!(text(&object["from"][0]["name"]), "Test User");
+    assert_eq!(text(&object["to"][0]["email"]), "bob@example.com");
+    assert_eq!(text(&object["to"][0]["name"]), "Bob");
+    assert_eq!(text(&object["cc"][0]["email"]), "carol@example.com");
+    assert!(object["bcc"].is_null());
+    assert_eq!(text(&object["subject"]), "Sent from td-mail");
+    assert_eq!(text(&object["bodyValues"]["text"]["value"]), "Hello Bob.\n");
+    assert_eq!(text(&object["attachments"][0]["blobId"]), &uploads[0].0);
+    assert_eq!(text(&object["attachments"][0]["name"]), "hello.txt");
+    assert!(object["mailboxIds"]["mbox-drafts"].is_true());
+    assert!(object["keywords"]["$draft"].is_true());
+    assert!(object["keywords"]["$seen"].is_true());
+    assert!(text(&object["messageId"][0]).ends_with("@example.com"));
+    let submissions = h.server().submissions();
+    assert_eq!(submissions.len(), 1);
+    assert_eq!(text(&submissions[0].1["emailId"]), "#draft");
+    assert_eq!(text(&submissions[0].1["identityId"]), "ident-001");
+    // The server's copy is in Sent, read and no longer a draft.
+    assert_eq!(
+        h.server().email_state("email-created-1"),
+        Some(("mbox-sent".to_string(), true, false))
+    );
+    let resp = h.send(json!({"command": "query_emails", "mailbox_id": "mbox-sent"}));
+    assert!(resp["ok"].is_true(), "query failed: {}", resp);
+    let subjects: Vec<&str> = resp["emails"]
+        .as_array()
+        .expect("emails")
+        .iter()
+        .map(|e| text(&e["subject"]))
+        .collect();
+    assert_eq!(subjects, ["Sent from td-mail"]);
+
+    // A From nobody sends as is refused before anything is uploaded.
+    let other = drafts.join("td-mail-draft-9-10.eml");
+    std::fs::write(
+        &other,
+        "From: other@example.com\nTo: bob@example.com\nSubject: Nope\n--text follows this line--\nhi\n",
+    )
+    .expect("draft");
+    let resp = h.send(json!({"command": "send_draft", "path": other.to_string_lossy()}));
+    assert!(!resp["ok"].is_true(), "{}", resp);
+    assert_eq!(
+        text(&resp["error"]),
+        "no identity of this account sends as other@example.com; the server lists: test@example.com"
+    );
+    assert!(other.exists(), "the draft stays");
+    assert_eq!(h.server().uploads().len(), 1);
+
+    // A recipient the server refuses to send to is its refusal, named.
+    std::fs::write(
+        &other,
+        "From: test@example.com\nTo: nobody@refuse.invalid\nSubject: Nope\n--text follows this line--\nhi\n",
+    )
+    .expect("draft");
+    let resp = h.send(json!({"command": "send_draft", "path": other.to_string_lossy()}));
+    assert!(!resp["ok"].is_true(), "{}", resp);
+    assert_eq!(
+        text(&resp["error"]),
+        "API error: the server refused to send: forbiddenToSend: the recipient's domain is refused"
+    );
+    assert!(other.exists(), "the draft stays");
+    assert_eq!(h.server().submissions().len(), 1);
+    assert_eq!(
+        h.server().email_state("email-created-2"),
+        None,
+        "the copy the server made of the refused message went"
+    );
+
+    // A message sent but left a draft by the server says so, and is
+    // still retired: it went.
+    std::fs::write(
+        &other,
+        "From: test@example.com\nTo: bob@example.com\nSubject: [stay] here\n--text follows this line--\nhi\n",
+    )
+    .expect("draft");
+    let resp = h.send(json!({"command": "send_draft", "path": other.to_string_lossy()}));
+    assert!(resp["ok"].is_true(), "{}", resp);
+    assert_eq!(
+        text(&resp["kept_in"]),
+        "Drafts, still a draft: invalidPatch: kept as a draft"
+    );
+    assert_eq!(
+        h.server().email_state(text(&resp["email_id"])),
+        Some(("mbox-drafts".to_string(), true, true))
+    );
+    assert!(!other.exists(), "retired all the same");
+
+    // A send whose answer is lost is not sent twice: the next send asks
+    // the server, finds the message and its submission, and answers as
+    // the lost reply would have, creating and sending nothing.
+    let lost = drafts.join("td-mail-draft-9-11.eml");
+    std::fs::write(
+        &lost,
+        "From: test@example.com\nTo: bob@example.com\nSubject: [lose] gone\n--text follows this line--\nhi\n",
+    )
+    .expect("draft");
+    let resp = h.send(json!({"command": "send_draft", "path": lost.to_string_lossy()}));
+    assert!(!resp["ok"].is_true(), "{}", resp);
+    let error = text(&resp["error"]).to_string();
+    assert!(
+        error.starts_with("HTTP error: ")
+            && error
+                .contains("the answer was lost, so the next send of this draft asks the server"),
+        "{error}"
+    );
+    assert!(lost.exists(), "the draft stays");
+    let created = h.server().created_emails();
+    let lost_id = created.last().map(|(id, _)| id.clone()).expect("created");
+    let sent_before = h.server().submissions().len();
+    assert_eq!(
+        h.server().email_state(&lost_id),
+        Some(("mbox-sent".to_string(), true, false)),
+        "the server sent it and filed it"
+    );
+    let resp = h.send(json!({"command": "send_draft", "path": lost.to_string_lossy()}));
+    assert!(resp["ok"].is_true(), "{}", resp);
+    assert_eq!(text(&resp["email_id"]), lost_id);
+    assert_eq!(text(&resp["kept_in"]), "Sent");
+    assert_eq!(
+        h.server().created_emails().len(),
+        created.len(),
+        "created once"
+    );
+    assert_eq!(h.server().submissions().len(), sent_before, "sent once");
+    assert!(!lost.exists(), "retired");
+
+    // Lost, and the message was addressed to this account too, so the
+    // server holds two copies with the Message-ID: the one with the
+    // submission is the answer, and the delivered one is not touched.
+    let echo = drafts.join("td-mail-draft-9-12.eml");
+    std::fs::write(
+        &echo,
+        "From: test@example.com\nTo: bob@example.com\nCc: test@example.com\nSubject: [lose] echo\n--text follows this line--\nhi\n",
+    )
+    .expect("draft");
+    let resp = h.send(json!({"command": "send_draft", "path": echo.to_string_lossy()}));
+    assert!(
+        text(&resp["error"]).contains("the answer was lost"),
+        "{resp}"
+    );
+    let created = h.server().created_emails();
+    let (sent_copy, delivered) = match created.as_slice() {
+        [.., (sent_copy, _), (delivered, _)] => (sent_copy.clone(), delivered.clone()),
+        _ => panic!("two copies"),
+    };
+    assert!(delivered.starts_with("email-delivered-"), "{delivered}");
+    assert_eq!(
+        h.server().email_state(&delivered),
+        Some(("mbox-inbox".to_string(), false, false))
+    );
+    let sent_before = h.server().submissions().len();
+    let resp = h.send(json!({"command": "send_draft", "path": echo.to_string_lossy()}));
+    assert!(resp["ok"].is_true(), "{resp}");
+    assert_eq!(text(&resp["email_id"]), sent_copy);
+    assert_eq!(text(&resp["kept_in"]), "Sent");
+    assert_eq!(
+        h.server().created_emails().len(),
+        created.len(),
+        "created once"
+    );
+    assert_eq!(h.server().submissions().len(), sent_before, "sent once");
+    assert_eq!(
+        h.server().email_state(&delivered),
+        Some(("mbox-inbox".to_string(), false, false)),
+        "the delivered copy stays"
+    );
+    assert!(!echo.exists(), "retired");
+
+    // Lost, on a server that keeps no record of submissions: the copy,
+    // no longer a draft, says the message went, and that is the answer.
+    let forgotten = drafts.join("td-mail-draft-9-13.eml");
+    std::fs::write(
+        &forgotten,
+        "From: test@example.com\nTo: bob@example.com\nSubject: [lose] [forget] gone\n--text follows this line--\nhi\n",
+    )
+    .expect("draft");
+    let resp = h.send(json!({"command": "send_draft", "path": forgotten.to_string_lossy()}));
+    assert!(
+        text(&resp["error"]).contains("the answer was lost"),
+        "{resp}"
+    );
+    let created = h.server().created_emails();
+    let sent_before = h.server().submissions().len();
+    let resp = h.send(json!({"command": "send_draft", "path": forgotten.to_string_lossy()}));
+    assert!(resp["ok"].is_true(), "{resp}");
+    assert_eq!(text(&resp["submission_id"]), "none on record");
+    assert_eq!(text(&resp["kept_in"]), "Sent");
+    assert_eq!(
+        h.server().email_state(text(&resp["email_id"])),
+        Some(("mbox-sent".to_string(), true, false))
+    );
+    assert_eq!(
+        h.server().created_emails().len(),
+        created.len(),
+        "created once"
+    );
+    assert_eq!(h.server().submissions().len(), sent_before, "sent once");
+    assert!(!forgotten.exists(), "retired");
+
+    // Lost, and the server had refused the submission: the copy it made
+    // is removed and the send is made afresh, answered this time.
+    std::fs::write(
+        &other,
+        "From: test@example.com\nTo: nobody@refuse.invalid\nSubject: [lose] refused\n--text follows this line--\nhi\n",
+    )
+    .expect("draft");
+    let resp = h.send(json!({"command": "send_draft", "path": other.to_string_lossy()}));
+    assert!(!resp["ok"].is_true(), "{}", resp);
+    assert!(
+        text(&resp["error"]).contains("the answer was lost"),
+        "{}",
+        resp
+    );
+    let unsent_id = h
+        .server()
+        .created_emails()
+        .last()
+        .map(|(id, _)| id.clone())
+        .expect("created");
+    assert_eq!(
+        h.server().email_state(&unsent_id),
+        Some(("mbox-drafts".to_string(), true, true)),
+        "the copy is there, a draft, unsent"
+    );
+    let resp = h.send(json!({"command": "send_draft", "path": other.to_string_lossy()}));
+    assert!(!resp["ok"].is_true(), "{}", resp);
+    assert_eq!(
+        text(&resp["error"]),
+        "API error: the server refused to send: forbiddenToSend: the recipient's domain is refused"
+    );
+    assert_eq!(
+        h.server().email_state(&unsent_id),
+        None,
+        "the unsent copy went"
+    );
+    let afresh = h
+        .server()
+        .created_emails()
+        .last()
+        .map(|(id, _)| id.clone())
+        .expect("created afresh");
+    assert_ne!(afresh, unsent_id);
+    assert_eq!(
+        h.server().email_state(&afresh),
+        None,
+        "the refused copy went too"
+    );
+    assert!(other.exists(), "the draft stays");
+
+    // A draft that is not one says which line.
+    std::fs::write(
+        &other,
+        "To: bob@example.com\n--text follows this line--\nhi\n",
+    )
+    .expect("draft");
+    let resp = h.send(json!({"command": "send_draft", "path": other.to_string_lossy()}));
+    assert_eq!(text(&resp["error"]), "the draft has no From address");
+    let resp = h.send(json!({"command": "send_draft"}));
+    assert_eq!(text(&resp["error"]), "missing 'path' field");
+}
+
+/// Offline, a send is refused at once with the connection's reason; the
+/// draft is not queued, since the person is waiting on it.
+#[test]
+fn test_send_draft_offline_is_refused_not_queued() {
+    let mut h = CliHarness::start_with_opts("", true, None, None);
+    let state = testing::tempdir().expect("state dir");
+    let drafts = state.path().join("td-mail/drafts");
+    std::fs::create_dir_all(&drafts).expect("drafts dir");
+    let draft = drafts.join("td-mail-draft-1-1.eml");
+    std::fs::write(
+        &draft,
+        "From: test@example.com\nTo: bob@example.com\nSubject: Later\n--text follows this line--\nhi\n",
+    )
+    .expect("draft");
+    let resp = h.send(json!({"command": "connect", "account": "test"}));
+    assert!(resp["ok"].is_true(), "connect failed: {}", resp);
+    let resp = h.send(json!({"command": "send_draft", "path": draft.to_string_lossy()}));
+    assert!(!resp["ok"].is_true(), "{}", resp);
+    assert!(
+        text(&resp["error"]).starts_with("cannot send (offline mode"),
+        "{}",
+        resp
+    );
+    assert!(draft.exists());
 }

@@ -114,6 +114,8 @@ impl HelpView {
             String::new(),
             "Compose".to_string(),
             "-------".to_string(),
+            "  Ctrl-Enter  Send the draft through the account's server (saves it first)"
+                .to_string(),
             "  Ctrl-S      Save the draft over its retained file".to_string(),
             "  Ctrl-W      Close (asks when unsaved: y saves, n keeps the file as saved)"
                 .to_string(),

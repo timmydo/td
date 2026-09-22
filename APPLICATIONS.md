@@ -10019,6 +10019,46 @@ The
 `scrolloff` is; and the editor-launch code, its shell-word classifier
 and their tests are gone.
 
+**Sending: the draft goes through the JMAP server, not SMTP.** The
+message-mode draft was Emacs's to encode and `smtpmail`'s to submit;
+without Emacs nothing sent it. td-mail now sends it itself, and the
+transport is the one it has: Ctrl-Enter, or the bar's Send, saves the
+draft and hands its path to the backend, which reads it back (the
+headers to the separator, the text, each MML `<#part>` tag as a file),
+matches its From to one of the account's identities (`Identity/get`),
+uploads each attachment to the session's `uploadUrl`, and in one
+request creates the message as a structured `Email/set` (headers as
+fields, the text as a body value, the attachments as blob ids, so the
+server assembles the MIME and td-mail carries no encoder) in the
+Drafts mailbox and submits it with `EmailSubmission/set`, whose
+`onSuccessUpdateEmail` drops `$draft` and moves the copy to Sent (RFC
+8621 §7). Every request is a `POST` through the fetch service, so the
+jail's `sockets=fetch` grant is the whole of it: no SMTP, no new port,
+no second credential, and a server that does not list
+`urn:ietf:params:jmap:submission` for the account refuses the send by
+name. While the server is answering the draft is held read-only, so
+the file sent is the file retired. Sent, the draft and its sidecar move
+together to `sent` beside `drafts` under the state directory and the
+view closes; refused, the server's copy is removed and the draft is
+the pane's again with the reason, and offline the send is refused at
+once rather than queued, since the person is waiting on it. A send
+whose answer never came is not repeated blind: the next send of that
+draft finds the attempt on the server by its Message-ID among the
+submissions and the Drafts and Sent copies made since it, and answers
+with it when it went (a submission on record, or a copy no longer a
+draft where it was made), or removes the copy still a draft and sends
+afresh.
+The draft is read as the person wrote it, so what a writer puts into
+one is bounded: everything a replied or forwarded message supplies
+below the separator has each MML tag quoted `<#!` (as Emacs quotes
+yanked text), so a message that names a file cannot have it attached
+on the next send, and a decoded subject or name is kept to its one
+header line. The CLI's `send_draft` is the same path. The
+mock server in the crate's tests serves the session's capabilities,
+`Identity/get`, the upload, the create and the submission, and the CLI
+test drives a draft with an attachment through them and checks what
+the server received and where the draft went.
+
 ## X. Host mode — development only
 
 The separately specified td-pass standalone product is an explicit exception

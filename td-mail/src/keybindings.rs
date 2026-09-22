@@ -521,6 +521,12 @@ pub fn all_keybindings() -> Vec<KeyBinding> {
         // td-editor's default profile; the rest of the keyboard types.
         KeyBinding {
             view: "compose",
+            key: "Ctrl-Enter",
+            action: "send",
+            description: "Send the draft through the account's server, saving it first",
+        },
+        KeyBinding {
+            view: "compose",
             key: "Ctrl-S",
             action: "save",
             description: "Save the draft over its retained file",

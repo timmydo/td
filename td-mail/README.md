@@ -6,7 +6,7 @@
 
 - Fast, keyboard-first email workflow in a window on td's compositor: lists to move through, a document view to read in, an action bar for the pointer.
 - Composition in place: a draft is edited in the window, in td-editor's document view, and retained as a file.
-- Clear separation of concerns: `td-mail` reads/manages mail; message submission is external.
+- Clear separation of concerns: `td-mail` reads/manages mail; message submission is the server's, through JMAP, so td-mail encodes no MIME and speaks no SMTP.
 - Scriptable automation through a JSON-over-stdin/stdout CLI mode.
 
 ## What td-mail Does
@@ -14,7 +14,7 @@
 - Connects to one or more JMAP accounts.
 - Lists mailboxes and emails, opens message view, and shows threads.
 - Supports read/unread, flag/unflag, move, archive, delete, and mailbox-wide mark-read.
-- Supports compose/reply/reply-all/forward draft generation.
+- Supports compose/reply/reply-all/forward draft generation, and sends a draft through the account's JMAP server.
 - Supports optional mail rules and retention policies.
 - Provides `--cli` NDJSON mode for integrations and automation.
 
@@ -62,7 +62,92 @@ longer needed. The matching `td-mail-att-ID` directory belongs to
 `td-mail-draft-ID.eml`: keep it while the draft needs its attachments
 and remove it separately when discarding that draft. Moving only the
 `.eml` file does not move or rewrite attachment references. There is no
-draft-list UI, automatic expiry or mail submission in this increment.
+draft-list UI or automatic expiry in this increment.
+
+## Sending
+
+Ctrl-Enter, or the Send label, sends the draft being edited: it is
+saved first when it has unsaved changes, then handed to the account's
+server through JMAP mail submission (RFC 8621 `EmailSubmission`), which
+the server must list for the account (`urn:ietf:params:jmap:submission`
+among its `accountCapabilities`; Stalwart, Cyrus, Fastmail and Apache
+James do). td-mail reads the draft back as message-mode wrote it: the
+headers to `--text follows this line--` (or, for a plain message pasted
+in, to the first empty line), of which `From`, `To`, `Cc`, `Bcc`,
+`Reply-To`, `Subject`, `In-Reply-To` and `References` are sent and any
+other is refused by name; the text after it; and each MML
+`<#part type="…" filename="/absolute/path" …>` tag as a regular file to
+attach, uploaded as a blob (the `type` a media type, `kind/subtype`;
+a line quoted `<#!`, as forwarded text is written so a message cannot
+name a file to attach, is sent as text with one `!` fewer, as Emacs
+sends it). `From` must be one address that one of the account's
+identities sends as (the server's `Identity/get`, an exact identity
+before a `*@domain` one), and `To`, `Cc` and `Bcc` must name a
+recipient between them. The server assembles the message from these
+parts (`Email/set` creates it in the Drafts mailbox, `$draft` and
+`$seen`, in the same request as `EmailSubmission/set` sends it; on
+success the server drops `$draft` and moves it to the Sent mailbox; an
+account without a Sent mailbox keeps it in Drafts, one without Drafts
+creates it in Sent, one without either cannot send). A submission the
+server refuses, by a refusal or an error of its own, has the copy
+`Email/set` made removed again; a message sent but left a draft by
+the server, its filing refused, is reported so ("kept in Drafts, still
+a draft: …") and is sent all the same. The Date and Message-ID are
+td-mail's. Attachments are refused before any upload when one is not a
+regular file or is larger than the server's `maxSizeUpload` or the
+fetch service's 32 MiB request bound; each is read from the file
+opened, to a byte past the ceiling at most.
+
+A send whose answer never came (the fetch service or the server not
+answering, an answer that could not be read, or a `serverPartialFail`)
+may have gone: it is refused with that said, and the next send of the
+same draft asks the server first, by the Message-ID the attempt carried
+and when it was made. The identity's submissions around then
+(`EmailSubmission/query` by identity and time, a day of slack either
+side for the clocks; the match is by Message-ID, the window only bounds
+what is read; then `EmailSubmission/get`) are read with the messages
+they sent, and the one carrying the Message-ID is the answer, its
+mailbox read back. With none on record, the copies made in that window
+in the mailbox the send creates in and in Sent (`Email/query` by mailbox
+and time) say: one carrying the Message-ID and no longer a draft where
+it was made (filed to Sent by a server that keeps no submissions) went,
+and is the answer, "none on record" as its submission; one still a draft
+where it was made never went, so it is removed and the draft is sent
+afresh, as it is when no copy is there. Only those two mailboxes are
+read, so a copy delivered to this account is never touched. (A query by
+the Message-ID header would name the copy directly, but servers answer
+that filter as they please: Stalwart matches nothing by it, so nothing
+here rests on it.) So nothing is sent twice for want of an answer, as
+long as td-mail is the same process, except on a server that keeps no
+submissions and left the copy a draft; after a restart the person checks
+Sent before sending the draft again. What is settled is the attempt: a
+draft edited after its answer was lost and sent again is answered with
+that attempt when it went, the edits not sent.
+
+While the answer is awaited the draft is held read-only, so the file
+sent is the file retired: a second send, a save and a close, the
+window's included, are refused in the status row until it comes. The
+wait is bounded only by the fetch service's timeouts on each request
+of the send (a minute for the head, five for the origin), since the
+person asked to send and is waiting on it. A refusal (the server's,
+the draft's, the connection's; offline there is no queue, the send is
+refused at once) is the status row's and the draft is the pane's again
+to be mended. Sent, the draft and its `td-mail-att-ID` sidecar are
+moved together, or not at all, to `$XDG_STATE_HOME/td-mail/sent` (the
+`sent` directory beside `drafts`, made private as it is) and the view
+closes; the log records the message id, the submission id, the mailbox
+the copy was kept in and the retired path. A sent draft whose name is
+already in `sent` is not overwritten: the draft stays open, sent and
+still held, the status saying so; Send then retries the move alone,
+never the send, and Close puts the draft away. Nothing deletes a
+retired draft. The CLI's `send_draft` sends and retires the same way.
+
+A reply or forward is written so it reads back as the message it came
+from: a display name with a comma, quote or bracket is quoted in the
+header, a control character in a decoded subject or name is a space on
+its one header line, and everything the message supplies below the
+separator (the forwarded header block, the "wrote:" line, the text)
+has each line beginning `<#` quoted `<#!`.
 
 Attachment-bearing drafts require a UTF-8 storage path without quotes,
 backslashes, angle brackets or control characters; unrepresentable MML

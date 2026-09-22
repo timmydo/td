@@ -512,6 +512,14 @@ impl<'a> Draft<'a> {
             self.saved(point);
         }
     }
+
+    /// Whether the document is held read-only: the pane keeps its keys,
+    /// selection, motion and find included, and typing is ignored.
+    pub fn hold(&mut self, held: bool) {
+        if let Some(tab) = self.tab {
+            self.pane.event(Event::ReadOnly { tab, enabled: held });
+        }
+    }
 }
 
 /// `text` as the pane admits it: a leading byte order mark dropped, CRLF

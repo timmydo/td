@@ -43,6 +43,10 @@ const WHEEL_EVENTS: usize = 64;
 /// is the title, and one of any length must fit the protocol's message.
 const TITLE_SCALARS: usize = 256;
 
+/// The chord that sends the draft being edited, Ctrl-Enter, which the
+/// pane does not bind; every other chord is the pane's while editing.
+const SEND_CHORD: &str = "C-Return";
+
 /// Wait on a fire-and-forget child in a detached thread so it does not linger
 /// as a zombie. `Child` has no reaping `Drop` impl, so a dropped handle leaks a
 /// PID slot for the lifetime of td-mail.
@@ -370,7 +374,11 @@ impl Session {
         if let Some(path) = &prepared.attachment_dir {
             crate::log_info!("Draft attachments retained at {}", path.display());
         }
-        match ComposeView::open(prepared.draft_path, prepared.attachment_dir) {
+        match ComposeView::open(
+            prepared.draft_path,
+            prepared.attachment_dir,
+            self.cmd_tx.clone(),
+        ) {
             Ok(view) => self.act(ViewAction::Push(Box::new(view))),
             Err(e) => {
                 crate::log_error!("Failed to read the retained draft back: {}", e);
@@ -389,6 +397,33 @@ impl Session {
                 Body::Edit { focused, .. } if focused || asking
             )
         })
+    }
+
+    /// The close the window asked is over once the draft it asked about
+    /// is the pane's again, kept: the question answered so, or the send
+    /// refused and the draft handed back. The next close asks again. A
+    /// draft still with the backend keeps the close waiting.
+    fn settle_close(&mut self) {
+        let waiting = self.stack.current().is_some_and(|view| view.waiting());
+        if self.closing && !self.quitting && !waiting && self.editing(false) {
+            self.closing = false;
+        }
+    }
+
+    /// The top view's draft is held read-only while the view says so:
+    /// while it waits on the backend for it, and once the server has
+    /// taken it, so the file sent is the file retired; the pane keeps
+    /// its keys, and its save and close requests still reach the view.
+    /// Only a draft is held: a text shown read-only stays so.
+    fn hold_draft(&mut self) {
+        let Some(view) = self.stack.current() else {
+            return;
+        };
+        if !matches!(view.scene().body, Body::Edit { .. }) {
+            return;
+        }
+        let held = view.held();
+        self.draft().hold(held);
     }
 
     /// The top view's draft: the document its slot holds, whether or
@@ -443,6 +478,7 @@ impl Session {
                 let action = stack
                     .current_mut()
                     .map(|view| view.request(name, &mut draft));
+                self.hold_draft();
                 if let Some(action) = action {
                     self.act(action);
                 }
@@ -588,16 +624,20 @@ impl Session {
         }
     }
 
-    /// A chord: every one is the pane's while a draft is edited, and
-    /// none is while its view asks about it, when only the client's
-    /// keys reach the view; otherwise the client's key when it names
-    /// one, and else the pane's, when a text is shown, so a chord the
-    /// client does not claim (an arrow with Shift, Tab, a copy) reaches
-    /// the document.
+    /// A chord: every one is the pane's while a draft is edited, but
+    /// Ctrl-Enter, which sends it, and none is while its view asks about
+    /// it, when only the client's keys reach the view; otherwise the
+    /// client's key when it names one, and else the pane's, when a text
+    /// is shown, so a chord the client does not claim (an arrow with
+    /// Shift, Tab, a copy) reaches the document.
     fn chord(&mut self, chord: &str) {
         if self.editing(false) {
             self.last_user_activity = Instant::now();
-            self.pane_chord(chord);
+            if chord == SEND_CHORD {
+                self.request("send");
+            } else {
+                self.pane_chord(chord);
+            }
             return;
         }
         if self.editing(true) {
@@ -780,7 +820,8 @@ impl Session {
     /// window; Escape keeps it, with the draft), so nothing typed is
     /// lost to the close and a save that fails is seen.
     fn close_requested(&mut self) -> Flow {
-        if self.editing(true) && self.draft().dirty() {
+        let waiting = self.stack.current().is_some_and(|view| view.waiting());
+        if self.editing(true) && (waiting || self.draft().dirty()) {
             self.closing = true;
             self.request("close-tab");
             self.redraw();
@@ -1010,11 +1051,7 @@ impl Handler for Session {
             }
         }
         self.serve(clipboard);
-        // The question the close put was answered with the draft kept:
-        // the next close asks again.
-        if self.closing && !self.quitting && self.editing(false) {
-            self.closing = false;
-        }
+        self.settle_close();
         self.refresh_title();
         if self.quitting {
             Flow::Quit
@@ -1030,9 +1067,11 @@ impl Handler for Session {
             if self.stack.handle_response(&response) {
                 self.redraw();
             }
+            self.hold_draft();
             self.take_pending();
         }
         self.take_pending();
+        self.settle_close();
         self.drop_stale_menu();
         // The caret's blink is a paint only where the pane is shown.
         if self.pane.tick(now)
@@ -1221,14 +1260,18 @@ mod frame_tests {
                 min_training: 20,
             },
             offline: true,
-            draft_dir: Some(std::env::temp_dir().join(format!(
-                "td-mail-drafts-{}-{}",
-                std::process::id(),
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_nanos()
-            ))),
+            draft_dir: Some(
+                std::env::temp_dir()
+                    .join(format!(
+                        "td-mail-state-{}-{}",
+                        std::process::id(),
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap()
+                            .as_nanos()
+                    ))
+                    .join("drafts"),
+            ),
             connector: None,
         }
     }
@@ -1638,6 +1681,218 @@ mod frame_tests {
         assert_eq!(session.pane.editor().tabs().count(), 1);
     }
 
+    /// Ctrl-Enter, as the Send label, saves an unsaved draft and hands
+    /// its path to the backend as `SendDraft`; while the answer is
+    /// awaited a second send, a save and a close are refused in the
+    /// status row and the draft is held read-only, so the file sent is
+    /// the file retired; a refusal gives the draft back with the reason;
+    /// a sent answer retires the draft and its sidecar to the `sent`
+    /// directory beside `drafts` and pops the view; and a draft that
+    /// cannot be retired stays open, sent and held, saying so.
+    #[test]
+    fn sending_a_draft_hands_it_to_the_backend_and_retires_it_when_sent() {
+        let (mut session, cmd_rx, resp_tx) = session(true);
+        let draft_dir = session.setup.draft_dir.clone().unwrap();
+        let sent_dir = draft_dir.parent().unwrap().join("sent");
+        let path_of =
+            |session: &Session| draft_dir.join(session.title.trim_start_matches("Draft "));
+        let status = |session: &Session| session.stack.current().unwrap().scene().status;
+        // The command channel also carries the mailbox list's refreshes:
+        // the send is the `SendDraft` among what has been sent, if any.
+        let sent_draft = |cmd_rx: &Receiver<BackendCommand>| -> Option<PathBuf> {
+            let mut found = None;
+            while let Ok(command) = cmd_rx.try_recv() {
+                if let BackendCommand::SendDraft { path } = command {
+                    found = Some(path);
+                }
+            }
+            found
+        };
+        key(&mut session, "c");
+        let path = path_of(&session);
+        let template = std::fs::read_to_string(&path).unwrap();
+        key(&mut session, "C-End");
+        key(&mut session, "h");
+        // While the view asks about the draft, Send is not a key of its
+        // and the bar has no Send label: nothing is sent.
+        key(&mut session, "C-w");
+        assert!(session.title().starts_with("Save "), "{}", session.title());
+        key(&mut session, "C-Return");
+        assert_eq!(sent_draft(&cmd_rx), None, "not while asking");
+        key(&mut session, "Escape");
+        assert!(session.title().starts_with("Draft "), "{}", session.title());
+        key(&mut session, "C-Return");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            format!("{template}h"),
+            "saved before sending"
+        );
+        assert_eq!(sent_draft(&cmd_rx), Some(path.clone()));
+        assert!(
+            status(&session).starts_with("Sending "),
+            "{}",
+            status(&session)
+        );
+        // Meanwhile: no second send, no save, no close, and the draft is
+        // held read-only, typing ignored, the window's close request
+        // put to the view too.
+        key(&mut session, "C-Return");
+        assert_eq!(sent_draft(&cmd_rx), None, "one send at a time");
+        assert!(status(&session).contains("already"), "{}", status(&session));
+        key(&mut session, "C-w");
+        assert_eq!(session.stack.depth(), 2);
+        assert!(
+            status(&session).contains("closes when"),
+            "{}",
+            status(&session)
+        );
+        key(&mut session, "i");
+        key(&mut session, "q");
+        assert_eq!(text(&session), format!("{template}h"), "held read-only");
+        assert_eq!(session.stack.depth(), 2, "the pane's keys, not the list's");
+        key(&mut session, "C-s");
+        assert!(
+            status(&session).contains("wait for the server"),
+            "{}",
+            status(&session)
+        );
+        assert_eq!(
+            session.input(Input::Close, &mut NoClipboard),
+            Flow::Continue
+        );
+        assert!(session.closing && !session.quitting, "the close waits");
+        assert!(
+            status(&session).contains("closes when"),
+            "{}",
+            status(&session)
+        );
+        // A refusal: the draft is the pane's again with the reason shown,
+        // the window's close is over, and Send works again, saving the
+        // new edit first.
+        resp_tx
+            .send(BackendResponse::DraftSent {
+                path: path.clone(),
+                result: Err("no identity sends as me@example.com".to_string()),
+            })
+            .unwrap();
+        assert_eq!(session.poll(0), Flow::Continue);
+        assert!(!session.closing && !session.quitting, "the close is over");
+        assert_eq!(session.stack.depth(), 2);
+        assert_eq!(
+            status(&session),
+            "Not sent: no identity sends as me@example.com"
+        );
+        key(&mut session, "i");
+        assert_eq!(text(&session), format!("{template}hi"));
+        key(&mut session, "C-Return");
+        assert_eq!(sent_draft(&cmd_rx), Some(path.clone()));
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            format!("{template}hi")
+        );
+        // Sent: the draft is retired beside drafts and the view pops.
+        resp_tx
+            .send(BackendResponse::DraftSent {
+                path: path.clone(),
+                result: Ok(backend::SentDraft {
+                    email_id: "e1".to_string(),
+                    submission_id: "s1".to_string(),
+                    kept_in: "Sent".to_string(),
+                }),
+            })
+            .unwrap();
+        session.poll(0);
+        assert_eq!(session.stack.depth(), 1);
+        assert_eq!(session.pane.editor().tabs().count(), 0);
+        assert!(!path.exists());
+        let retired = sent_dir.join(path.file_name().unwrap());
+        assert_eq!(
+            std::fs::read_to_string(&retired).unwrap(),
+            format!("{template}hi")
+        );
+        // An answer for a draft no view holds is nothing.
+        resp_tx
+            .send(BackendResponse::DraftSent {
+                path: path.clone(),
+                result: Err("late".to_string()),
+            })
+            .unwrap();
+        session.poll(0);
+        assert_eq!(session.stack.depth(), 1);
+        // A draft that cannot be retired (its name already in sent) stays
+        // open, sent, the status saying so; Close then pops it.
+        key(&mut session, "c");
+        let second = path_of(&session);
+        std::fs::write(sent_dir.join(second.file_name().unwrap()), "taken").unwrap();
+        key(&mut session, "C-Return");
+        assert_eq!(sent_draft(&cmd_rx), Some(second.clone()));
+        resp_tx
+            .send(BackendResponse::DraftSent {
+                path: second.clone(),
+                result: Ok(backend::SentDraft {
+                    email_id: "e2".to_string(),
+                    submission_id: "s2".to_string(),
+                    kept_in: "Drafts".to_string(),
+                }),
+            })
+            .unwrap();
+        session.poll(0);
+        assert_eq!(session.stack.depth(), 2);
+        assert!(second.exists());
+        assert!(
+            status(&session).starts_with("Sent, kept in Drafts; not retired: "),
+            "{}",
+            status(&session)
+        );
+        // Sent, the draft is held: what is retired is what went.
+        let sent_text = text(&session);
+        key(&mut session, "i");
+        assert_eq!(text(&session), sent_text, "held read-only once sent");
+        // Send again sends nothing: it retries the move, which succeeds
+        // once the name is free, and the view pops.
+        key(&mut session, "C-Return");
+        assert_eq!(sent_draft(&cmd_rx), None, "not sent twice");
+        assert_eq!(session.stack.depth(), 2);
+        std::fs::remove_file(sent_dir.join(second.file_name().unwrap())).unwrap();
+        key(&mut session, "C-Return");
+        assert_eq!(sent_draft(&cmd_rx), None, "still not sent twice");
+        assert_eq!(session.stack.depth(), 1);
+        assert!(!second.exists());
+        assert!(sent_dir.join(second.file_name().unwrap()).exists());
+        // The bar's Send label is the same request.
+        key(&mut session, "c");
+        let send = session
+            .shape()
+            .unwrap()
+            .layout
+            .bar
+            .header(0)
+            .expect("send label");
+        press(&mut session, send.x + 2, send.y + 2);
+        assert_eq!(sent_draft(&cmd_rx), Some(path_of(&session)));
+        // The window's close asked during that send is kept: sent, the
+        // draft retires, the view pops and the window follows.
+        let third = path_of(&session);
+        assert_eq!(
+            session.input(Input::Close, &mut NoClipboard),
+            Flow::Continue
+        );
+        assert!(session.closing && !session.quitting);
+        resp_tx
+            .send(BackendResponse::DraftSent {
+                path: third.clone(),
+                result: Ok(backend::SentDraft {
+                    email_id: "e3".to_string(),
+                    submission_id: "s3".to_string(),
+                    kept_in: "Sent".to_string(),
+                }),
+            })
+            .unwrap();
+        assert_eq!(session.poll(0), Flow::Quit);
+        assert!(session.quitting);
+        assert!(!third.exists() && sent_dir.join(third.file_name().unwrap()).exists());
+    }
+
     /// `c` retains a draft and opens it in the pane, editable and
     /// auto-filled, where every chord types (a `q` too); Ctrl-S writes
     /// the pane's text over the file, as the Save label does; Ctrl-W
@@ -1743,13 +1998,17 @@ mod frame_tests {
         let fourth = path_of(&session);
         key(&mut session, "z");
         let bar = session.shape().unwrap().layout.bar;
-        let save = bar.header(0).expect("save label");
+        assert_eq!(
+            session.stack.current().unwrap().scene().labels,
+            ["Send", "Save", "Close"]
+        );
+        let save = bar.header(1).expect("save label");
         press(&mut session, save.x + 2, save.y + 2);
         assert_eq!(
             std::fs::read_to_string(&fourth).unwrap(),
             format!("z{template}")
         );
-        let close = bar.header(1).expect("close label");
+        let close = bar.header(2).expect("close label");
         press(&mut session, close.x + 2, close.y + 2);
         assert_eq!(session.stack.depth(), 1);
         // The question's labels answer it: Discard, pressed, pops with

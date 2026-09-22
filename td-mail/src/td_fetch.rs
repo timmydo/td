@@ -25,6 +25,9 @@ const SOCKET_FILE: &str = "socket";
 const MAX_LINE: usize = 8 * 1024;
 /// The service's own ceiling, asked for when the caller names none.
 const DEFAULT_LIMIT: u64 = 64 * 1024 * 1024;
+/// The most a request body may carry: the service refuses one past it.
+#[allow(dead_code)]
+pub const MAX_REQUEST_BODY: u64 = 32 * 1024 * 1024;
 /// The service answers within its budgets (a minute for the head, five for
 /// the origin); this only bounds a service that has gone away mid-reply.
 const REPLY_TIMEOUT: Duration = Duration::from_secs(420);

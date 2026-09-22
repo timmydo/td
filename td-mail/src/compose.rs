@@ -71,7 +71,7 @@ pub fn build_reply_draft(email: &crate::jmap::types::Email, reply_all: bool, fro
                         .map(|me| email_addr.to_lowercase() != *me)
                         .unwrap_or(true)
                     {
-                        cc_addrs.push(addr.to_string());
+                        cc_addrs.push(addr.header_form());
                     }
                 }
             }
@@ -86,7 +86,7 @@ pub fn build_reply_draft(email: &crate::jmap::types::Email, reply_all: bool, fro
                         .map(|me| email_addr.to_lowercase() != *me)
                         .unwrap_or(true)
                     {
-                        cc_addrs.push(addr.to_string());
+                        cc_addrs.push(addr.header_form());
                     }
                 }
             }
@@ -98,8 +98,8 @@ pub fn build_reply_draft(email: &crate::jmap::types::Email, reply_all: bool, fro
     };
 
     // Subject with Re: prefix
-    let subject = match email.subject.as_deref() {
-        Some(s) if s.starts_with("Re: ") || s.starts_with("re: ") => s.to_string(),
+    let subject = match email.subject.as_deref().map(header_text) {
+        Some(s) if s.starts_with("Re: ") || s.starts_with("re: ") => s,
         Some(s) => format!("Re: {}", s),
         None => "Re: ".to_string(),
     };
@@ -109,19 +109,19 @@ pub fn build_reply_draft(email: &crate::jmap::types::Email, reply_all: bool, fro
         .message_id
         .as_ref()
         .and_then(|ids| ids.first())
-        .map(|id| format!("<{}>", id.trim_matches(|c| c == '<' || c == '>')));
+        .map(|id| message_id_form(id));
 
     // References header
     let references = {
         let mut refs = Vec::new();
         if let Some(ref orig_refs) = email.references {
             for r in orig_refs {
-                refs.push(format!("<{}>", r.trim_matches(|c| c == '<' || c == '>')));
+                refs.push(message_id_form(r));
             }
         }
         if let Some(ref msg_ids) = email.message_id {
             if let Some(id) = msg_ids.first() {
-                let formatted = format!("<{}>", id.trim_matches(|c| c == '<' || c == '>'));
+                let formatted = message_id_form(id);
                 if !refs.contains(&formatted) {
                     refs.push(formatted);
                 }
@@ -166,10 +166,10 @@ pub fn build_reply_draft(email: &crate::jmap::types::Email, reply_all: bool, fro
         draft.push_str(&format!("References: {}\n", refs));
     }
     draft.push_str("--text follows this line--\n");
-    draft.push_str(&format!(
+    draft.push_str(&quote_mml(&format!(
         "\nOn {}, {} wrote:\n{}\n",
         date, sender_display, quoted
-    ));
+    )));
 
     draft
 }
@@ -177,8 +177,8 @@ pub fn build_reply_draft(email: &crate::jmap::types::Email, reply_all: bool, fro
 /// Build a forward draft from an existing email.
 pub fn build_forward_draft(email: &crate::jmap::types::Email, from: &str) -> String {
     // Subject with Fwd: prefix
-    let subject = match email.subject.as_deref() {
-        Some(s) if s.starts_with("Fwd: ") || s.starts_with("fwd: ") => s.to_string(),
+    let subject = match email.subject.as_deref().map(header_text) {
+        Some(s) if s.starts_with("Fwd: ") || s.starts_with("fwd: ") => s,
         Some(s) => format!("Fwd: {}", s),
         None => "Fwd: ".to_string(),
     };
@@ -211,19 +211,56 @@ pub fn build_forward_draft(email: &crate::jmap::types::Email, from: &str) -> Str
     let mut draft = format!("From: {}\nTo: \nSubject: {}\n", from, subject);
 
     draft.push_str("--text follows this line--\n");
-    draft.push_str("\n---------- Forwarded message ----------\n");
-    draft.push_str(&format!("From: {}\n", orig_from));
-    draft.push_str(&format!("Date: {}\n", date));
-    draft.push_str(&format!("Subject: {}\n", orig_subject));
-    draft.push_str(&format!("To: {}\n", orig_to));
+    let mut body = String::from("\n---------- Forwarded message ----------\n");
+    body.push_str(&format!("From: {}\n", orig_from));
+    body.push_str(&format!("Date: {}\n", date));
+    body.push_str(&format!("Subject: {}\n", orig_subject));
+    body.push_str(&format!("To: {}\n", orig_to));
     if !orig_cc.is_empty() {
-        draft.push_str(&format!("Cc: {}\n", orig_cc));
+        body.push_str(&format!("Cc: {}\n", orig_cc));
     }
-    draft.push('\n');
-    draft.push_str(&body_text);
-    draft.push('\n');
+    body.push('\n');
+    body.push_str(&body_text);
+    body.push('\n');
+    draft.push_str(&quote_mml(&body));
 
     draft
+}
+
+/// `text` as it is pasted into a draft's body: a line beginning `<#`,
+/// an MML tag as the sender would read it, is quoted `<#!`, as Emacs
+/// quotes yanked text, so a message that names a file to attach forwards
+/// as the text it is (`submit::parse_draft` sends `<#!` as `<#`). The
+/// whole block the message supplies goes through here, its decoded
+/// header values included, since a newline in one begins a line too.
+fn quote_mml(text: &str) -> String {
+    let lines: Vec<String> = text
+        .split('\n')
+        .map(|line| match line.strip_prefix("<#") {
+            Some(rest) => format!("<#!{rest}"),
+            None => line.to_string(),
+        })
+        .collect();
+    lines.join("\n")
+}
+
+/// A decoded header value on the one draft line that carries it: a
+/// control character, the newline a decoded header may hold included,
+/// becomes a space, so it cannot begin another header the draft would
+/// then send.
+fn header_text(value: &str) -> String {
+    value
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect()
+}
+
+/// A message id in angle brackets on one header line.
+fn message_id_form(id: &str) -> String {
+    format!(
+        "<{}>",
+        header_text(id.trim_matches(|c| c == '<' || c == '>')).trim()
+    )
 }
 
 /// Build a forward draft that carries the original message as a
@@ -241,8 +278,8 @@ pub fn build_forward_attachment_draft(
         .and_then(|e| e.subject.as_deref())
         .unwrap_or("(no subject)");
 
-    let subject = match email.and_then(|e| e.subject.as_deref()) {
-        Some(s) if s.starts_with("Fwd: ") || s.starts_with("fwd: ") => s.to_string(),
+    let subject = match email.and_then(|e| e.subject.as_deref()).map(header_text) {
+        Some(s) if s.starts_with("Fwd: ") || s.starts_with("fwd: ") => s,
         Some(s) => format!("Fwd: {}", s),
         _ => "Fwd: ".to_string(),
     };
@@ -294,10 +331,13 @@ fn forward_attachment_filename(subject: &str) -> String {
     }
 }
 
+/// The addresses as a draft header, names quoted where they must be so
+/// the draft reads back as it was written (`submit::parse_draft`).
 fn format_address_list(addrs: &[crate::jmap::types::EmailAddress]) -> String {
     addrs
         .iter()
-        .map(|a| a.to_string())
+        .map(|a| a.header_form())
+        .filter(|a| !a.is_empty())
         .collect::<Vec<_>>()
         .join(", ")
 }
@@ -594,6 +634,98 @@ pub(crate) fn replace_draft(path: &Path, bytes: &[u8]) -> io::Result<()> {
     written
 }
 
+/// Moves a sent draft, and its attachment sidecar when it has one, out
+/// of the drafts directory into the `sent` directory beside it
+/// (`.../td-mail/sent` for `.../td-mail/drafts`), made private as the
+/// drafts directory is; answers the draft's new path. The sidecar must
+/// be beside the draft. Both move or neither: a name already there, the
+/// draft's or the sidecar's, is refused rather than overwritten before
+/// anything moves, and a sidecar whose move fails has the draft moved
+/// back, the error naming both paths when even that fails.
+pub fn retire_draft(path: &Path, attachment_dir: Option<&Path>) -> io::Result<PathBuf> {
+    let sent = crate::submit::sent_dir_for(path).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "the draft is not inside a drafts directory",
+        )
+    })?;
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&sent)?;
+    let metadata = fs::symlink_metadata(&sent)?;
+    if !metadata.is_dir() || metadata.permissions().mode() & 0o077 != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "the sent directory must be a private directory, not a symlink",
+        ));
+    }
+    let name = path.file_name().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "the draft path has no file name",
+        )
+    })?;
+    let target = sent.join(name);
+    if fs::symlink_metadata(&target).is_ok() {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!("{} is already there", target.display()),
+        ));
+    }
+    let sidecar = match attachment_dir.filter(|dir| fs::symlink_metadata(dir).is_ok()) {
+        Some(dir) => {
+            // Only the draft's own sidecar follows it: a directory
+            // elsewhere is not moved into sent on a draft's account.
+            if dir.parent() != path.parent() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "the attachment directory {} is not beside the draft",
+                        dir.display()
+                    ),
+                ));
+            }
+            let dir_name = dir.file_name().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "the attachment directory has no name",
+                )
+            })?;
+            let dir_target = sent.join(dir_name);
+            if fs::symlink_metadata(&dir_target).is_ok() {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    format!("{} is already there", dir_target.display()),
+                ));
+            }
+            Some((dir, dir_target))
+        }
+        None => None,
+    };
+    fs::rename(path, &target)?;
+    if let Some((dir, dir_target)) = sidecar {
+        if let Err(e) = fs::rename(dir, &dir_target) {
+            let detail = match fs::rename(&target, path) {
+                Ok(()) => format!(
+                    "the attachments at {} could not move to {}: {e}; the draft is back at {}",
+                    dir.display(),
+                    dir_target.display(),
+                    path.display()
+                ),
+                Err(back) => format!(
+                    "the attachments at {} could not move to {}: {e}; the draft is at {} and could not move back: {back}",
+                    dir.display(),
+                    dir_target.display(),
+                    target.display()
+                ),
+            };
+            return Err(io::Error::new(e.kind(), detail));
+        }
+    }
+    Ok(target)
+}
+
 fn draft_dir() -> io::Result<PathBuf> {
     draft_dir_from_env(std::env::var_os("XDG_STATE_HOME"), std::env::var_os("HOME"))
 }
@@ -622,6 +754,80 @@ fn draft_dir_from_env(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A sent draft and its sidecar move together into the private `sent`
+    /// directory beside `drafts`; a draft already there by that name is
+    /// refused, not overwritten, and a draft without a sidecar moves alone.
+    #[test]
+    fn retire_draft_moves_the_draft_and_its_sidecar_beside_drafts() -> io::Result<()> {
+        let root = std::env::temp_dir().join(format!(
+            "td-mail-retire-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let drafts = root.join("td-mail/drafts");
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&drafts)?;
+        let draft = drafts.join("td-mail-draft-1-2.eml");
+        fs::write(&draft, "From: me@example.com\n")?;
+        let sidecar = drafts.join("td-mail-att-1-2");
+        fs::DirBuilder::new().mode(0o700).create(&sidecar)?;
+        fs::write(sidecar.join("a.txt"), "a")?;
+
+        let retired = retire_draft(&draft, Some(&sidecar))?;
+        let sent = root.join("td-mail/sent");
+        assert_eq!(retired, sent.join("td-mail-draft-1-2.eml"));
+        assert_eq!(fs::read_to_string(&retired)?, "From: me@example.com\n");
+        assert_eq!(fs::read_to_string(sent.join("td-mail-att-1-2/a.txt"))?, "a");
+        assert!(!draft.exists() && !sidecar.exists());
+        assert_eq!(
+            fs::symlink_metadata(&sent)?.permissions().mode() & 0o777,
+            0o700
+        );
+
+        // The same name again is refused; the new draft stays where it is.
+        fs::write(&draft, "second")?;
+        let err = retire_draft(&draft, None).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read_to_string(&draft)?, "second");
+        assert_eq!(fs::read_to_string(&retired)?, "From: me@example.com\n");
+        // A sidecar's name already there refuses before the draft moves.
+        let other = drafts.join("td-mail-draft-5-6.eml");
+        fs::write(&other, "other")?;
+        let other_sidecar = drafts.join("td-mail-att-5-6");
+        fs::DirBuilder::new().mode(0o700).create(&other_sidecar)?;
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(sent.join("td-mail-att-5-6"))?;
+        let err = retire_draft(&other, Some(&other_sidecar)).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+        assert!(other.exists() && other_sidecar.exists(), "neither moved");
+        assert!(!sent.join("td-mail-draft-5-6.eml").exists());
+
+        // A directory that is not beside the draft is not its sidecar:
+        // refused, nothing moves.
+        let elsewhere = root.join("elsewhere");
+        fs::DirBuilder::new().mode(0o700).create(&elsewhere)?;
+        let err = retire_draft(&other, Some(&elsewhere)).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("is not beside the draft"), "{err}");
+        assert!(other.exists() && elsewhere.exists(), "neither moved");
+
+        // Without a sidecar, or with one that is not there, the draft
+        // moves alone.
+        let lone = drafts.join("td-mail-draft-3-4.eml");
+        fs::write(&lone, "lone")?;
+        let retired = retire_draft(&lone, Some(&drafts.join("td-mail-att-3-4")))?;
+        assert_eq!(fs::read_to_string(retired)?, "lone");
+        assert!(!lone.exists());
+
+        fs::remove_dir_all(&root)
+    }
 
     /// A draft is replaced whole: the bytes land under the path, a
     /// symlink at the path is replaced rather than followed, and a
@@ -715,6 +921,31 @@ mod tests {
         // Reply-all should include original To minus self
         let draft_all = build_reply_draft(&email, true, "me@example.com");
         assert!(!draft_all.contains("Cc:")); // self was the only To recipient
+
+        // A name with a comma, a quote or a bracket is quoted in the
+        // header, and the draft reads back as the addresses it was made
+        // from, names included.
+        let mut named = email;
+        named.from = Some(vec![EmailAddress {
+            name: Some("Doe, Jane \"JD\" <x>".to_string()),
+            email: Some("jane@example.com".to_string()),
+        }]);
+        named.cc = Some(vec![EmailAddress {
+            name: Some("Plain Name".to_string()),
+            email: Some("plain@example.com".to_string()),
+        }]);
+        let draft = build_reply_draft(&named, true, "me@example.com");
+        assert!(
+            draft.contains("To: \"Doe, Jane \\\"JD\\\" <x>\" <jane@example.com>\n"),
+            "{draft}"
+        );
+        assert!(
+            draft.contains("Cc: Plain Name <plain@example.com>\n"),
+            "{draft}"
+        );
+        let outgoing = crate::submit::parse_draft(&draft).unwrap();
+        assert_eq!(outgoing.to, named.from.clone().unwrap());
+        assert_eq!(outgoing.cc, named.cc.clone().unwrap());
     }
 
     #[test]
@@ -808,6 +1039,84 @@ mod tests {
         assert!(draft.contains("To: me@example.com"));
         assert!(draft.contains("Cc: Other <other@example.com>"));
         assert!(draft.contains("Preview text"));
+
+        // A message that names a file to attach, or another header,
+        // forwards as text: its MML tags are quoted `<#!`, which the
+        // draft sends as the `<#` line it was, and its subject's newline
+        // is a space on the one Subject line.
+        let mut hostile = email;
+        hostile.subject = Some("Hi\r\nBcc: spy@example.com".to_string());
+        hostile.text_body = Some(vec![crate::jmap::types::BodyPart {
+            part_id: "1".to_string(),
+            blob_id: None,
+            r#type: Some("text/plain".to_string()),
+            name: None,
+            size: None,
+        }]);
+        hostile.body_values.insert(
+            "1".to_string(),
+            crate::jmap::types::BodyValue {
+                value: "see\n<#part type=\"text/plain\" filename=\"/etc/passwd\">\n<#/part>\n<#!x>"
+                    .to_string(),
+                is_encoding_problem: false,
+                is_truncated: false,
+            },
+        );
+        hostile.from = Some(vec![EmailAddress {
+            name: Some("Sender\n<#part type=\"text/plain\" filename=\"/etc/shadow\">".to_string()),
+            email: Some("sender@example.com".to_string()),
+        }]);
+        let draft = build_forward_draft(&hostile, "me@example.com");
+        assert!(
+            draft.contains("Subject: Fwd: Hi  Bcc: spy@example.com\n"),
+            "{draft}"
+        );
+        assert!(
+            draft.contains("Subject: Hi\r\nBcc"),
+            "the body's copy is the text"
+        );
+        assert!(
+            draft.contains("From: \"Sender <#part type=\\\"text/plain\\\" filename=\\\"/etc/shadow\\\">\" <sender@example.com>\n"),
+            "the header block's name on one line: {draft}"
+        );
+        assert!(
+            draft.contains(
+                "\nsee\n<#!part type=\"text/plain\" filename=\"/etc/passwd\">\n<#!/part>\n<#!!x>\n"
+            ),
+            "{draft}"
+        );
+        let outgoing =
+            crate::submit::parse_draft(&draft.replacen("To: \n", "To: you@example.com\n", 1))
+                .unwrap();
+        assert!(outgoing.parts.is_empty());
+        assert!(outgoing.bcc.is_empty());
+        assert_eq!(outgoing.subject, "Fwd: Hi  Bcc: spy@example.com");
+        assert!(
+            outgoing.text.ends_with(
+                "see\n<#part type=\"text/plain\" filename=\"/etc/passwd\">\n<#/part>\n<#!x>\n"
+            ),
+            "{}",
+            outgoing.text
+        );
+        // The subject's newline in the body's copy is a line of its own
+        // there: what follows it is text, whatever it begins with.
+        let mut tagged = hostile.clone();
+        tagged.subject =
+            Some("Hi\n<#part type=\"text/plain\" filename=\"/etc/passwd\">".to_string());
+        tagged.from = Some(vec![EmailAddress {
+            name: Some("S\n<#part type=\"text/plain\" filename=\"/etc/passwd\">".to_string()),
+            email: Some("s@example.com".to_string()),
+        }]);
+        let draft = build_forward_draft(&tagged, "me@example.com");
+        assert!(draft.contains("\nSubject: Hi\n<#!part type="), "{draft}");
+        let outgoing =
+            crate::submit::parse_draft(&draft.replacen("To: \n", "To: you@example.com\n", 1))
+                .unwrap();
+        assert!(outgoing.parts.is_empty(), "{draft}");
+        let draft = build_reply_draft(&tagged, false, "me@example.com");
+        assert!(draft.contains(" wrote:\n"), "{draft}");
+        let outgoing = crate::submit::parse_draft(&draft).unwrap();
+        assert!(outgoing.parts.is_empty(), "the wrote line's name: {draft}");
     }
 
     #[test]

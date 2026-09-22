@@ -1,12 +1,15 @@
 use crate::cache::Cache;
+use crate::civil;
 use crate::config::{RetentionPolicyConfig, SpamConfig};
-use crate::jmap::client::JmapClient;
-use crate::jmap::types::{Email, Mailbox};
+use crate::jmap::client::{JmapClient, JmapError};
+use crate::jmap::types::{Email, Identity, Mailbox};
 use crate::json::{self, Json, ObjectBuilder, ToJson};
 use crate::regex::UserRegex;
 use crate::rules::{self, CompiledRule};
 use crate::spam::{self, SpamModel};
+use crate::submit;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc};
 use std::thread;
@@ -93,6 +96,11 @@ pub enum BackendCommand {
         blob_id: String,
         name: String,
         content_type: String,
+    },
+    /// Submit the retained draft at `path` through the account's server
+    /// (JMAP `EmailSubmission`); the file itself is not changed.
+    SendDraft {
+        path: PathBuf,
     },
     PreviewRetentionExpiry {
         policies: Vec<RetentionPolicyConfig>,
@@ -207,6 +215,10 @@ pub enum BackendResponse {
     AttachmentDownloaded {
         name: String,
         result: Result<std::path::PathBuf, String>,
+    },
+    DraftSent {
+        path: PathBuf,
+        result: Result<SentDraft, String>,
     },
     RetentionPreview {
         result: Result<RetentionPreviewResult, String>,
@@ -1138,6 +1150,12 @@ fn handle_offline_command(
                 result: Err(offline_error("not available", reason)),
             });
         }
+        BackendCommand::SendDraft { path } => {
+            let _ = resp_tx.send(BackendResponse::DraftSent {
+                path: path.clone(),
+                result: Err(offline_error("cannot send", reason)),
+            });
+        }
         BackendCommand::PreviewRetentionExpiry { .. } => {
             let _ = resp_tx.send(BackendResponse::RetentionPreview {
                 result: Err(offline_error("not available", reason)),
@@ -1428,6 +1446,9 @@ fn backend_loop(
     // Why the loop is offline, when a connection was tried and failed:
     // named in every answer served from the cache until one is made.
     let mut offline_reason: Option<String> = None;
+    // Each draft's last send whose answer was lost, by path: the next
+    // send of that draft asks the server first.
+    let mut lost_sends: HashMap<PathBuf, LostSend> = HashMap::new();
     if let Some(cache) = cache.as_ref() {
         if let Some(mboxes) = cache.get_mailboxes() {
             cached_mailboxes = mboxes;
@@ -2198,6 +2219,14 @@ fn backend_loop(
                     .and_then(|opt| opt.ok_or_else(|| "Email not found".to_string()));
                 let _ = resp_tx.send(BackendResponse::EmailRaw { id, result });
             }
+            BackendCommand::SendDraft { path } => {
+                log_info!("[Backend] cmd#{} SendDraft {}", command_seq, path.display());
+                let result = send_draft(client, &path, &mut lost_sends);
+                if let Err(e) = &result {
+                    log_error!("[Backend] SendDraft {} failed: {}", path.display(), e);
+                }
+                let _ = resp_tx.send(BackendResponse::DraftSent { path, result });
+            }
             BackendCommand::DownloadAttachment {
                 blob_id,
                 name,
@@ -2434,6 +2463,282 @@ fn backend_loop(
             }
         }
     }
+}
+
+/// What a sent draft became on the server.
+#[derive(Debug, Clone)]
+pub struct SentDraft {
+    pub email_id: String,
+    pub submission_id: String,
+    /// Where the copy was left: the Sent mailbox's name, else the mailbox
+    /// it was created in.
+    pub kept_in: String,
+}
+
+/// Sends the retained draft at `path`: parsed as `submit::parse_draft`
+/// reads it, its From matched to one of the account's identities, its
+/// attachments uploaded, then created and submitted in one request, the
+/// server keeping the copy in the Sent mailbox (in Drafts until it goes,
+/// and there if the account has no Sent). Nothing on disk changes here.
+///
+/// A send whose answer was lost (the request may have been served) is
+/// recorded in `lost_sends` under the draft's path with the Message-ID
+/// it carried, and the next send of that draft asks the server first,
+/// through `settle_lost_send`, so nothing is sent twice for want of an
+/// answer; a refusal the server answered is not recorded, the message
+/// having gone nowhere.
+fn send_draft(
+    client: &JmapClient,
+    path: &Path,
+    lost_sends: &mut HashMap<PathBuf, LostSend>,
+) -> Result<SentDraft, String> {
+    if !client.can_submit() {
+        return Err(
+            "the server's session lists no mail submission for this account \
+                    (urn:ietf:params:jmap:submission)"
+                .to_string(),
+        );
+    }
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| format!("cannot read the draft {}: {e}", path.display()))?;
+    let outgoing = submit::parse_draft(&text).map_err(|e| e.to_string())?;
+
+    let from_email = outgoing
+        .from
+        .email
+        .as_deref()
+        .ok_or_else(|| "the draft's From has no address".to_string())?;
+    let identities = client.get_identities().map_err(|e| e.to_string())?;
+    let identity = Identity::sending_as(&identities, from_email).ok_or_else(|| {
+        let known: Vec<&str> = identities.iter().map(|i| i.email.as_str()).collect();
+        format!(
+            "no identity of this account sends as {from_email}; the server lists: {}",
+            if known.is_empty() {
+                "none".to_string()
+            } else {
+                known.join(", ")
+            }
+        )
+    })?;
+
+    let mailboxes = client.get_mailboxes().map_err(|e| e.to_string())?;
+    let by_role = |role: &str| {
+        mailboxes
+            .iter()
+            .find(|m| m.role.as_deref() == Some(role))
+            .map(|m| (m.id.clone(), m.name.clone()))
+    };
+    let drafts = by_role("drafts");
+    let sent = by_role("sent");
+    let (create_in, create_in_name) = drafts.clone().or_else(|| sent.clone()).ok_or_else(|| {
+        "the account has neither a Drafts nor a Sent mailbox to keep the message in".to_string()
+    })?;
+
+    if let Some(lost) = lost_sends.get(path).cloned() {
+        let settled = settle_lost_send(
+            client,
+            &lost,
+            &create_in,
+            sent.as_ref().map(|(id, _)| id.as_str()),
+            &mailboxes,
+        )?;
+        lost_sends.remove(path);
+        if let Some(sent) = settled {
+            log_info!(
+                "[Backend] The lost send of {} went: email {} submission {}, kept in {}",
+                path.display(),
+                sent.email_id,
+                sent.submission_id,
+                sent.kept_in
+            );
+            return Ok(sent);
+        }
+    }
+
+    let ceiling = client.upload_ceiling();
+    let read = submit::read_parts(&outgoing.parts, ceiling).map_err(|e| e.to_string())?;
+    let mut blob_ids = Vec::with_capacity(read.len());
+    for (index, bytes) in &read {
+        let part = outgoing
+            .parts
+            .get(*index)
+            .ok_or_else(|| "attachment index out of range".to_string())?;
+        let blob_id = client
+            .upload_blob(bytes, &part.content_type)
+            .map_err(|e| format!("uploading {}: {e}", part.name))?;
+        blob_ids.push(blob_id);
+    }
+
+    let message_id = submit::new_message_id(&outgoing.from);
+    let now = civil::now_unix();
+    let email = submit::email_json(&outgoing, identity, &blob_ids, now, &message_id);
+    let submitted = match client.submit_email(
+        email,
+        &identity.id,
+        &create_in,
+        sent.as_ref().map(|(id, _)| id.as_str()),
+    ) {
+        Ok(submitted) => submitted,
+        // The server answered: the message went nowhere.
+        Err(e @ JmapError::Api(_)) => return Err(e.to_string()),
+        // No answer, or one that says the server may have done part of
+        // it: the message may have gone.
+        Err(e) => {
+            lost_sends.insert(
+                path.to_path_buf(),
+                LostSend {
+                    message_id,
+                    since: now,
+                    identity_id: identity.id.clone(),
+                },
+            );
+            return Err(format!(
+                "{e}; the answer was lost, so the next send of this draft asks the \
+                 server whether the message went before sending it again"
+            ));
+        }
+    };
+    let kept_in = match (&submitted.filed, sent) {
+        (Ok(()), Some((_, name))) => name,
+        (Ok(()), None) => create_in_name,
+        (Err(why), _) => format!("{create_in_name}, still a draft: {why}"),
+    };
+    log_info!(
+        "[Backend] Sent {} as email {} submission {}, kept in {}",
+        path.display(),
+        submitted.email_id,
+        submitted.submission_id,
+        kept_in
+    );
+    Ok(SentDraft {
+        email_id: submitted.email_id,
+        submission_id: submitted.submission_id,
+        kept_in,
+    })
+}
+
+/// A send whose answer was lost: the Message-ID the attempt carried,
+/// when it was made and the identity it was made under, so the server
+/// can be asked about it.
+#[derive(Debug, Clone)]
+struct LostSend {
+    message_id: String,
+    since: i64,
+    identity_id: String,
+}
+
+/// A send whose answer was lost, asked about. The identity's submissions
+/// around the attempt (a day of slack either side for the clocks; the
+/// match is by Message-ID, the window only bounds what is read) are
+/// read with the messages they sent, and the one carrying the attempt's
+/// Message-ID is the answer the lost reply would have carried, its
+/// filing read from the copy. With no such submission on record, the
+/// copies made in that window in the mailbox the send creates in and in
+/// Sent say: one carrying the id and no longer a draft where it was made
+/// (filed to Sent by a server that keeps no submissions) went, and is
+/// the answer; still a draft where it was made, it never went, so it is
+/// removed and `None` says to send afresh, as it does when no copy is
+/// there. Only those two mailboxes are read, so a copy delivered to this
+/// account is never touched. An error is the server not answering the
+/// question, which then stands.
+fn settle_lost_send(
+    client: &JmapClient,
+    lost: &LostSend,
+    create_in: &str,
+    sent: Option<&str>,
+    mailboxes: &[Mailbox],
+) -> Result<Option<SentDraft>, String> {
+    let asking = |e: JmapError| format!("asking the server whether the last send went: {e}");
+    const SLACK: i64 = 24 * 3600;
+    let since = submit::rfc3339_utc(lost.since.saturating_sub(SLACK));
+    let until = submit::rfc3339_utc(lost.since.saturating_add(SLACK));
+    let identity_id = lost.identity_id.as_str();
+    let carries = |email: &Email| {
+        email
+            .message_id
+            .as_ref()
+            .is_some_and(|ids| ids.contains(&lost.message_id))
+    };
+    let filing = |copy: &Email| {
+        let mut names: Vec<&str> = copy
+            .mailbox_ids
+            .iter()
+            .filter(|(_, present)| **present)
+            .filter_map(|(id, _)| mailboxes.iter().find(|m| &m.id == id))
+            .map(|m| m.name.as_str())
+            .collect();
+        names.sort_unstable();
+        let name = if names.is_empty() {
+            "an unknown mailbox".to_string()
+        } else {
+            names.join(", ")
+        };
+        if copy.keywords.get("$draft").copied().unwrap_or(false) {
+            format!("{name}, still a draft")
+        } else {
+            name
+        }
+    };
+
+    let submissions = client
+        .submissions_between(identity_id, &since, &until)
+        .map_err(asking)?;
+    if !submissions.is_empty() {
+        let ids: Vec<String> = submissions.iter().map(|(_, id)| id.clone()).collect();
+        let emails = client.get_email_filing(&ids).map_err(asking)?;
+        if let Some(email) = emails.iter().find(|email| carries(email)) {
+            let submission_id = submissions
+                .iter()
+                .find(|(_, id)| *id == email.id)
+                .map(|(submission_id, _)| submission_id.clone())
+                .ok_or_else(|| {
+                    "asking the server whether the last send went: a submission's message is not its own".to_string()
+                })?;
+            return Ok(Some(SentDraft {
+                email_id: email.id.clone(),
+                submission_id,
+                kept_in: filing(email),
+            }));
+        }
+    }
+
+    let still_draft = |copy: &Email| {
+        copy.keywords.get("$draft").copied().unwrap_or(false)
+            && copy.mailbox_ids.get(create_in).copied().unwrap_or(false)
+    };
+    let mut looked_in = vec![create_in];
+    if let Some(sent) = sent.filter(|sent| *sent != create_in) {
+        looked_in.push(sent);
+    }
+    for mailbox in looked_in {
+        let ids = client
+            .query_emails(mailbox, 100, 0, None, Some(&since), Some(&until))
+            .map_err(asking)?
+            .ids;
+        if ids.is_empty() {
+            continue;
+        }
+        let emails = client.get_email_filing(&ids).map_err(asking)?;
+        let copies: Vec<&Email> = emails.iter().filter(|email| carries(email)).collect();
+        if let Some(went) = copies.iter().find(|copy| !still_draft(copy)) {
+            return Ok(Some(SentDraft {
+                email_id: went.id.clone(),
+                submission_id: "none on record".to_string(),
+                kept_in: filing(went),
+            }));
+        }
+        if !copies.is_empty() {
+            let ids: Vec<String> = copies.iter().map(|copy| copy.id.clone()).collect();
+            client.destroy_emails(&ids).map_err(|e| {
+                format!(
+                    "the copy the server made of the unsent draft, {}, could not be removed: {e}",
+                    ids.join(", ")
+                )
+            })?;
+            return Ok(None);
+        }
+    }
+    Ok(None)
 }
 
 /// Fetch a message's raw source, train the model with the given label, and
