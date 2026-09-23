@@ -1202,6 +1202,10 @@ every copied payload.
 Preflight does not validate the separate firmware selector, its key/UUID
 agreement, scratch capacity, destination eligibility or destructive consent.
 Those remain installation-coordinator responsibilities.
+`td-install observe-source-plan` compares this preflight's canonical
+manifest ID with a bounded reviewed plan and reports only that observation.
+It inherits the same closed-descriptor lifetime and cannot authorize a
+later formatting step.
 
 `td-boot install` carries the detached signature. Two things used to stop it
 reaching a machine at all, and both are closed:

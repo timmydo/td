@@ -789,6 +789,20 @@ unchanged first, middle and final device canaries after each check.
 Read-only and undersized fixture targets do not run the positive
 observation.
 
+`td-install observe-source-plan <td-boot> <deployment-directory> <trusted-key>` takes
+the same bounded plan from standard input. It runs the shipped
+absolute `td-boot validate-source` to authenticate the manifest and verify
+all three payload hashes with the supplied trust key, then compares the canonical
+manifest SHA-256 ID byte-for-byte with the plan's deployment digest. Only
+after both checks succeed does it print a version-1 JSON report scoped
+`source-plan-observation-only`. A malformed plan or relative path refuses
+before launching `td-boot`; a failed child or digest mismatch prints no
+success report. The child closes its source descriptors before the report,
+so this observation does not retain source bytes, authorize a later write,
+or replace the service's source mount and claim lifetime. The QEMU fixture
+requires the exact report and a changed plan digest to be refused while
+the target's disk canaries remain unchanged.
+
 ## Read-only layout preview
 
 `td-install layout-preview <logical-sector-bytes> <capacity-bytes>`

@@ -55,6 +55,23 @@ fn plan() -> Plan {
 }
 
 #[test]
+fn deployment_id_requires_exact_lowercase_manifest_digest() {
+    let p = Plan::new([1; 32], destination(), [0xab; 32], uuid(), settings()).unwrap();
+    let exact = "ab".repeat(32);
+    assert!(p.matches_deployment_id(&exact));
+    for changed in [
+        exact.to_uppercase(),
+        exact[..62].to_owned(),
+        format!("{exact}ab"),
+        format!("{exact}\n"),
+        format!("ac{}", &exact[2..]),
+        "zz".repeat(32),
+    ] {
+        assert!(!p.matches_deployment_id(&changed));
+    }
+}
+
+#[test]
 fn wire_order_is_independently_specified_and_lossless() {
     let p = plan();
     let mut bytes = b"TDPLAN01".to_vec();

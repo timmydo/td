@@ -224,6 +224,22 @@ impl Plan {
     pub fn deployment(&self) -> &[u8; 32] {
         &self.deployment
     }
+    /// Compare with the canonical manifest ID printed by td-boot. This is
+    /// data equality, not proof that the source was authenticated or retained.
+    pub fn matches_deployment_id(&self, id: &str) -> bool {
+        if id.len() != 64 {
+            return false;
+        }
+        id.as_bytes().as_chunks::<2>().0.iter().zip(self.deployment).all(|([high, low], expected)| {
+            let digit = |byte| match byte {
+                b'0'..=b'9' => Some(byte - b'0'),
+                b'a'..=b'f' => Some(byte - b'a' + 10),
+                _ => None,
+            };
+            digit(*high).zip(digit(*low))
+                .is_some_and(|(high, low)| high * 16 + low == expected)
+        })
+    }
     pub fn volume_uuid(&self) -> &[u8; 16] {
         &self.volume_uuid
     }

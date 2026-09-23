@@ -395,6 +395,7 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
                 &iso,
                 true,
                 InventoryBefore::Fresh,
+                Some(&id),
             )?;
             require(
                 &result,
@@ -516,6 +517,7 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
             &interrupted_iso,
             true,
             InventoryBefore::Fresh,
+            Some(&id),
         )?;
         println!("   [qemu-install] refusing an incomplete installation, {name} media detached");
         let refused = format!(
@@ -543,6 +545,7 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
             &iso,
             true,
             InventoryBefore::Reinstall,
+            Some(&id),
         )?;
         let expected = format!("{} {id}", protocol::FIRST_BOOT_MARKER);
         let installed = boot(
@@ -606,6 +609,7 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
                 &iso,
                 false,
                 InventoryBefore::Fresh,
+                None,
             )?;
         }
     }
@@ -643,7 +647,7 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
         }
         validate_scratch_refusal(&refused, source_device)?;
         require_live_reports(
-            &refused, &target, source_device, &limited_iso, false, InventoryBefore::Fresh,
+            &refused, &target, source_device, &limited_iso, false, InventoryBefore::Fresh, Some(&id),
         )?;
     }
     let protected_live = scratch.dir.join("protected-media.cpio");
@@ -692,7 +696,7 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
         source_name: "sda",
         target_name: "vda",
         before: InventoryBefore::Fresh,
-    }, false, false)?;
+    }, false, false, None)?;
     let refuse = |case: &str, image: &Path, diagnostic: &str| -> Result<(), String> {
         for (name, attachment, source_device) in [
             ("optical", FirmwareAttachment::Optical, "/dev/sr0"),
@@ -736,6 +740,7 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
                 image,
                 false,
                 InventoryBefore::Fresh,
+                None,
             )?;
             if !refused.evidence.target
                 || !refused.console.lines().any(|line| {
@@ -1262,11 +1267,13 @@ fn validate_candidates(
     Ok(())
 }
 
-fn validate_plan_observation(console: &str, expected: &InventoryExpected<'_>, partitioned: bool, attempted: bool) -> Result<(), String> {
+fn validate_plan_observation(console: &str, expected: &InventoryExpected<'_>, partitioned: bool, attempted: bool, source_id: Option<&str>) -> Result<(), String> {
     if !attempted {
         if console.lines().any(|line| line.starts_with(protocol::PLAN_OBSERVATION_MARKER)
             || line.trim_end() == protocol::PLAN_STALE_MARKER
-            || line.trim_end() == protocol::PLAN_BUSY_MARKER) {
+            || line.trim_end() == protocol::PLAN_BUSY_MARKER
+            || line.starts_with(protocol::SOURCE_PLAN_OBSERVATION_MARKER)
+            || line.trim_end() == protocol::SOURCE_PLAN_STALE_MARKER) {
             return Err("plan observation ran for an unavailable target".into());
         }
         return Ok(());
@@ -1280,6 +1287,22 @@ fn validate_plan_observation(console: &str, expected: &InventoryExpected<'_>, pa
     }
     if report_field(&document, "destination")?.as_str() != Some(expected.target_name) {
         return Err("plan observation did not name the reviewed target".into());
+    }
+    if let Some(expected_id) = source_id {
+        let source = diagnostic_frame(console, protocol::SOURCE_PLAN_OBSERVATION_MARKER, 256)?;
+        if report_number(&source, "version")? != 1
+            || report_field(&source, "scope")?.as_str() != Some("source-plan-observation-only") {
+            return Err("source plan observation has wrong version or scope".into());
+        }
+        if report_field(&source, "deployment")?.as_str() != Some(expected_id) {
+            return Err("source plan report differs from fixture manifest ID".into());
+        }
+        if console.lines().filter(|line| line.trim_end() == protocol::SOURCE_PLAN_STALE_MARKER).count() != 1 {
+            return Err("stale source plan refusal has no unique completion marker".into());
+        }
+    } else if console.lines().any(|line| line.starts_with(protocol::SOURCE_PLAN_OBSERVATION_MARKER)
+        || line.trim_end() == protocol::SOURCE_PLAN_STALE_MARKER) {
+        return Err("source plan observation ran without a validated source".into());
     }
     if console.lines().filter(|line| line.trim_end() == protocol::PLAN_STALE_MARKER).count() != 1 {
         return Err("stale plan refusal has no unique completion marker".into());
@@ -1297,6 +1320,7 @@ fn require_live_reports(
     iso: &Path,
     partitioned: bool,
     before: InventoryBefore,
+    source_id: Option<&str>,
 ) -> Result<(), String> {
     let expected = InventoryExpected {
         target_bytes: fs::metadata(&target.path)
@@ -1314,7 +1338,7 @@ fn require_live_reports(
     };
     let plan_expected = !target.read_only
         && expected.target_bytes >= protocol::PLAN_PROBE_MINIMUM_SECTORS * 512;
-    validate_live_reports(result, &expected, partitioned, plan_expected)
+    validate_live_reports(result, &expected, partitioned, plan_expected, source_id)
 }
 
 fn validate_live_reports(
@@ -1322,6 +1346,7 @@ fn validate_live_reports(
     expected: &InventoryExpected<'_>,
     partitioned: bool,
     plan_expected: bool,
+    source_id: Option<&str>,
 ) -> Result<(), String> {
     validate_preview(
         &result.console,
@@ -1337,7 +1362,7 @@ fn validate_live_reports(
     })?;
     validate_inventories(&result.console, expected, partitioned)
         .and_then(|()| validate_candidates(&result.console, expected, partitioned))
-        .and_then(|()| validate_plan_observation(&result.console, expected, partitioned, plan_expected))
+        .and_then(|()| validate_plan_observation(&result.console, expected, partitioned, plan_expected, source_id))
         .map_err(|error| {
             format!(
                 "installer storage reports: {error}\n{}",
@@ -1681,6 +1706,7 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
                 &iso,
                 true,
                 InventoryBefore::Fresh,
+                Some(&id),
             )?;
             let mut first = None;
             for count in 1..=2 {
@@ -2379,7 +2405,7 @@ mod tests {
             .replace("\"sr0\"", "\"sda\"")
             .replace("\"logical_sector_bytes\":2048", "\"logical_sector_bytes\":512")
             .replace("\"read_only\":true", "\"read_only\":false");
-        validate_live_reports(&result, &expected, false, false).unwrap();
+        validate_live_reports(&result, &expected, false, false, None).unwrap();
         expected.source_read_only = true;
         assert!(validate_inventories(&inventory_console(&writable, None), &expected, false).is_err());
     }
@@ -3059,6 +3085,9 @@ mod tests {
             let report = "{\"version\":1,\"scope\":\"plan-observation-only\",\"destination\":\"vda\"}";
             console.push_str(&format!("{} {} {report}\n", protocol::PLAN_OBSERVATION_MARKER, report.len()));
             console.push_str(&format!("{}\n", protocol::PLAN_STALE_MARKER));
+            let report = format!("{{\"version\":1,\"scope\":\"source-plan-observation-only\",\"deployment\":\"{}\"}}", "02".repeat(32));
+            console.push_str(&format!("{} {} {report}\n", protocol::SOURCE_PLAN_OBSERVATION_MARKER, report.len()));
+            console.push_str(&format!("{}\n", protocol::SOURCE_PLAN_STALE_MARKER));
             if partitioned {
                 console.push_str(&format!("{}\n", protocol::PLAN_BUSY_MARKER));
             }
@@ -3089,22 +3118,39 @@ mod tests {
     fn plan_observation_oracle_requires_exact_target_and_stale_refusal() {
         let expected = inventory_expectation();
         let valid = candidate_console(true, false, true);
-        validate_plan_observation(&valid, &expected, false, true).unwrap();
+        validate_plan_observation(&valid, &expected, false, true, Some(&"02".repeat(32))).unwrap();
         for changed in [
             valid.replace("plan-observation-only", "candidate-only"),
             valid.replace("\"destination\":\"vda\"", "\"destination\":\"sda\""),
             valid.replace(&format!("{}\n", protocol::PLAN_STALE_MARKER), ""),
             format!("{valid}{}\n", protocol::PLAN_STALE_MARKER),
+            valid.replace("source-plan-observation-only", "source-plan-observation-onlx"),
+            valid.replace(&"02".repeat(32), &"z2".repeat(32)),
+            valid.replace(&"02".repeat(32), &"03".repeat(32)),
+            valid.replace("\"version\":1,\"scope\":\"source-plan-observation-only\"", "\"version\":2,\"scope\":\"source-plan-observation-only\""),
+            valid.replace(&format!("{}\n", protocol::SOURCE_PLAN_STALE_MARKER), ""),
+            format!("{valid}{}\n", protocol::SOURCE_PLAN_STALE_MARKER),
         ] {
-            assert!(validate_plan_observation(&changed, &expected, false, true).is_err());
+            assert!(validate_plan_observation(&changed, &expected, false, true, Some(&"02".repeat(32))).is_err());
         }
         let mut unavailable = inventory_expectation();
         unavailable.read_only = true;
-        validate_plan_observation(&candidate_console(false, false, false), &unavailable, false, false).unwrap();
-        assert!(validate_plan_observation(&valid, &unavailable, false, false).is_err());
+        validate_plan_observation(&candidate_console(false, false, false), &unavailable, false, false, None).unwrap();
+        assert!(validate_plan_observation(&valid, &unavailable, false, false, None).is_err());
+        for unexpected in [
+            format!("{} {} {{}}\n", protocol::SOURCE_PLAN_OBSERVATION_MARKER, 2),
+            format!("{}\n", protocol::SOURCE_PLAN_STALE_MARKER),
+        ] {
+            let console = format!("{}{}", candidate_console(false, false, false), unexpected);
+            assert!(validate_plan_observation(&console, &unavailable, false, false, None).is_err());
+        }
         let partitioned = candidate_console(true, true, true);
-        validate_plan_observation(&partitioned, &expected, true, true).unwrap();
-        assert!(validate_plan_observation(&partitioned, &expected, false, true).is_err());
+        validate_plan_observation(&partitioned, &expected, true, true, Some(&"02".repeat(32))).unwrap();
+        assert!(validate_plan_observation(&partitioned, &expected, false, true, Some(&"02".repeat(32))).is_err());
+        let disk_only = valid.lines().filter(|line| !line.starts_with(protocol::SOURCE_PLAN_OBSERVATION_MARKER)
+            && *line != protocol::SOURCE_PLAN_STALE_MARKER).collect::<Vec<_>>().join("\n") + "\n";
+        validate_plan_observation(&disk_only, &expected, false, true, None).unwrap();
+        assert!(validate_plan_observation(&valid, &expected, false, true, None).is_err());
     }
 
     #[test]

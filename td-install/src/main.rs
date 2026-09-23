@@ -69,7 +69,7 @@ fn invalid(message: String) -> io::Error {
 }
 
 const USAGE: &str =
-    "usage: td-install new-volume-uuid\n       td-install inventory\n       td-install destinations\n       td-install observe-plan < plan.bin\n       td-install prepare-selector <template> <volume-uuid> <output>\n       td-install timezones\n       td-install layout-preview <logical-sector-bytes> <capacity-bytes>\n       td-install format <efi-kernel> <selector-initramfs> <volume-options-and-operands>\n       td-install layout <destination> [<efi-kernel> <selector-initramfs>]\n       \
+    "usage: td-install new-volume-uuid\n       td-install inventory\n       td-install destinations\n       td-install observe-plan < plan.bin\n       td-install observe-source-plan <td-boot> <deployment-directory> <trusted-key> < plan.bin\n       td-install prepare-selector <template> <volume-uuid> <output>\n       td-install timezones\n       td-install layout-preview <logical-sector-bytes> <capacity-bytes>\n       td-install format <efi-kernel> <selector-initramfs> <volume-options-and-operands>\n       td-install layout <destination> [<efi-kernel> <selector-initramfs>]\n       \
                      td-install volume [--uuid <uuid>] [--timezone <IANA-id>] [--hostname <name>] [--username <name> <verified-root> <td-firstboot>] <destination> <mkfs.btrfs> <scratch-dir> \
                      [<td-boot> <deployment> <trusted-key> | --trusted-key <trusted-key>]";
 
@@ -79,6 +79,7 @@ enum Mode {
     Inventory,
     Destinations,
     ObservePlan,
+    ObserveSourcePlan { td_boot: PathBuf, source: PathBuf, trusted_key: PathBuf },
     PrepareSelector {
         template: PathBuf,
         uuid: VolumeUuid,
@@ -484,6 +485,11 @@ fn parse_args(mut args: impl Iterator<Item = OsString>) -> io::Result<Mode> {
         (Some("inventory"), []) => Ok(Mode::Inventory),
         (Some("destinations"), []) => Ok(Mode::Destinations),
         (Some("observe-plan"), []) => Ok(Mode::ObservePlan),
+        (Some("observe-source-plan"), [td_boot, source, trusted_key]) => Ok(Mode::ObserveSourcePlan {
+            td_boot: PathBuf::from(td_boot),
+            source: PathBuf::from(source),
+            trusted_key: PathBuf::from(trusted_key),
+        }),
         (Some("new-volume-uuid"), []) => Ok(Mode::NewVolumeUuid),
         (Some("prepare-selector"), [template, uuid, output]) => Ok(Mode::PrepareSelector {
             template: template.clone(),
@@ -550,9 +556,8 @@ fn parse_args(mut args: impl Iterator<Item = OsString>) -> io::Result<Mode> {
     }
 }
 
-/// Check only the current observation. The held claim ends when this call
-/// returns, so its result cannot authorize a later format invocation.
-fn observe_plan(input: &mut impl Read, output: &mut impl Write) -> io::Result<()> {
+/// Decode the bounded wire representation supplied by the caller.
+fn read_plan(input: &mut impl Read) -> io::Result<installation_plan::Plan> {
     let mut bytes = Vec::new();
     input
         .take(installation_plan::MAX_BYTES as u64 + 1)
@@ -560,13 +565,59 @@ fn observe_plan(input: &mut impl Read, output: &mut impl Write) -> io::Result<()
     if bytes.len() > installation_plan::MAX_BYTES {
         return Err(invalid("installation plan exceeds maximum length".into()));
     }
-    let plan = installation_plan::Plan::decode(&bytes).map_err(invalid)?;
+    installation_plan::Plan::decode(&bytes).map_err(invalid)
+}
+
+/// Check only the current observation. The held claim ends when this call
+/// returns, so its result cannot authorize a later format invocation.
+fn observe_plan(input: &mut impl Read, output: &mut impl Write) -> io::Result<()> {
+    let plan = read_plan(input)?;
     let _claim = inventory::claim_plan(&plan)?;
     writeln!(
         output,
         "{{\"version\":1,\"scope\":\"plan-observation-only\",\"destination\":\"{}\"}}",
         plan.destination().name()
     )?;
+    output.flush()
+}
+
+/// Authenticate all payloads through td-boot, then compare its canonical
+/// manifest ID with the reviewed plan. The child closes its source descriptors
+/// before this returns, so the report grants no later write authority.
+fn observe_source_plan(
+    input: &mut impl Read,
+    output: &mut impl Write,
+    td_boot: &Path,
+    source: &Path,
+    trusted_key: &Path,
+) -> io::Result<()> {
+    if !td_boot.is_absolute() || !source.is_absolute() || !trusted_key.is_absolute() {
+        return Err(invalid("td-boot, source and trusted key must be absolute paths".into()));
+    }
+    let plan = read_plan(input)?;
+    let result = std::process::Command::new(td_boot)
+        .arg("validate-source")
+        .arg(source)
+        .arg(trusted_key)
+        .output()?;
+    if !result.status.success() {
+        return Err(invalid(format!(
+            "source validation failed: {}: {}",
+            result.status,
+            String::from_utf8_lossy(&result.stderr).trim_end()
+        )));
+    }
+    let id = std::str::from_utf8(&result.stdout)
+        .map_err(|_| invalid("source validator returned a non-UTF-8 ID".into()))?
+        .strip_suffix('\n')
+        .ok_or_else(|| invalid("source validator ID lacks newline".into()))?;
+    if id.len() != 64 || !id.bytes().all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f')) {
+        return Err(invalid("source validator returned a noncanonical ID".into()));
+    }
+    if !plan.matches_deployment_id(id) {
+        return Err(invalid("reviewed deployment differs from authenticated source".into()));
+    }
+    writeln!(output, "{{\"version\":1,\"scope\":\"source-plan-observation-only\",\"deployment\":\"{id}\"}}")?;
     output.flush()
 }
 
@@ -2285,6 +2336,11 @@ fn main() -> ExitCode {
             let mut output = io::BufWriter::new(stdout.lock());
             observe_plan(&mut io::stdin().lock(), &mut output)
         },
+        Mode::ObserveSourcePlan { td_boot, source, trusted_key } => {
+            let stdout = io::stdout();
+            let mut output = io::BufWriter::new(stdout.lock());
+            observe_source_plan(&mut io::stdin().lock(), &mut output, &td_boot, &source, &trusted_key)
+        },
         Mode::Inventory => {
             let stdout = io::stdout();
             let mut output = io::BufWriter::new(stdout.lock());
@@ -2365,6 +2421,82 @@ mod tests {
             let mut output = Vec::new();
             assert!(observe_plan(&mut io::Cursor::new(bytes), &mut output).is_err());
             assert!(output.is_empty());
+        }
+    }
+
+    #[test]
+    fn source_plan_requires_explicit_paths_and_rejects_bad_wire_before_execution() {
+        assert_eq!(
+            parse_args([
+                OsString::from("observe-source-plan"),
+                OsString::from("/bin/td-boot"),
+                OsString::from("/source"),
+                OsString::from("/trusted.pub"),
+            ].into_iter()).unwrap(),
+            Mode::ObserveSourcePlan {
+                td_boot: PathBuf::from("/bin/td-boot"),
+                source: PathBuf::from("/source"),
+                trusted_key: PathBuf::from("/trusted.pub"),
+            }
+        );
+        for args in [
+            vec![OsString::from("observe-source-plan")],
+            vec![OsString::from("observe-source-plan"), OsString::from("/source")],
+            vec![OsString::from("observe-source-plan"), OsString::from("/bin/td-boot"), OsString::from("/source")],
+            vec![OsString::from("observe-source-plan"), OsString::from("/bin/td-boot"), OsString::from("/source"), OsString::from("/trusted.pub"), OsString::from("extra")],
+        ] {
+            assert!(parse_args(args.into_iter()).is_err());
+        }
+        let mut output = Vec::new();
+        assert!(observe_source_plan(&mut io::Cursor::new(b"bad"), &mut output,
+            Path::new("/bin/td-boot"), Path::new("/source"), Path::new("/trusted.pub")).is_err());
+        assert!(output.is_empty());
+        let error = observe_source_plan(&mut io::Cursor::new(Vec::<u8>::new()), &mut output,
+            Path::new("/bin/td-boot"), Path::new("source"), Path::new("/trusted.pub")).unwrap_err();
+        assert!(error.to_string().contains("absolute paths"));
+        assert!(output.is_empty());
+    }
+
+    #[test]
+    fn source_plan_reports_only_a_matching_validated_id() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = scratch::path("source-plan-validator");
+        std::fs::create_dir(&directory).unwrap();
+        let _cleanup = ScratchDirectory(directory.clone());
+        let validator = directory.join("td-boot");
+        let source = directory.join("source");
+        let key = directory.join("trusted.pub");
+        let destination = installation_plan::Destination::new(
+            installation_plan::DestinationObservation {
+                name: "vda", major: 253, minor: 0, sequence: 1,
+                capacity: DISK, sector: 512, removable: false,
+                model: None, serial: None, wwid: None,
+            },
+        ).unwrap();
+        let settings = installation_plan::Settings::new("tester", "td", "us", "Etc/UTC").unwrap();
+        let mut uuid = [0; 16];
+        uuid[6] = 0x40;
+        uuid[8] = 0x80;
+        let plan = installation_plan::Plan::new([1; 32], destination, [0xab; 32], uuid, settings).unwrap();
+        let wire = plan.encode();
+        for (body, reason) in [
+            (format!("printf '{}\\n'\n", "ab".repeat(32)), None),
+            (format!("printf '{}\\n'\n", "ac".repeat(32)), Some("reviewed deployment differs")),
+            ("printf 'bad\\n'\n".into(), Some("noncanonical ID")),
+            ("printf 'invalid source\\n' >&2; exit 1\n".into(), Some("invalid source")),
+        ] {
+            std::fs::write(&validator, format!("#!/bin/sh\n[ \"$1\" = validate-source ] || exit 2\n[ \"$2\" = \"{}\" ] || exit 3\n[ \"$3\" = \"{}\" ] || exit 4\n{body}", source.display(), key.display())).unwrap();
+            std::fs::set_permissions(&validator, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let mut output = Vec::new();
+            let result = observe_source_plan(&mut io::Cursor::new(&wire), &mut output, &validator, &source, &key);
+            if let Some(reason) = reason {
+                assert!(result.unwrap_err().to_string().contains(reason));
+                assert!(output.is_empty());
+            } else {
+                result.unwrap();
+                let report = String::from_utf8(output).unwrap();
+                assert!(report.contains(&format!("\"deployment\":\"{}\"", "ab".repeat(32))));
+            }
         }
     }
 

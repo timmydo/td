@@ -422,7 +422,7 @@ fn put_plan_optional(bytes: &mut Vec<u8>, value: Option<String>) -> Result<(), S
 
 /// Independently frame the QEMU device observations, so the guest checks the
 /// shipped decoder against bytes that its own codec did not produce.
-fn observed_plan(device: &str) -> Result<Vec<u8>, String> {
+fn observed_plan(device: &str, deployment: [u8; 32]) -> Result<Vec<u8>, String> {
     let name = device.strip_prefix("/dev/").ok_or("invalid target path")?;
     let base = Path::new("/sys/class/block").join(name);
     let number = required_attribute(&base.join("dev"))?;
@@ -451,7 +451,7 @@ fn observed_plan(device: &str) -> Result<Vec<u8>, String> {
     let mut bytes = Vec::with_capacity(256);
     bytes.extend_from_slice(b"TDPLAN01");
     bytes.extend_from_slice(&[1; 32]);
-    bytes.extend_from_slice(&[0; 32]);
+    bytes.extend_from_slice(&deployment);
     let mut uuid = [0; 16];
     *uuid.get_mut(6).ok_or("fixture UUID has no version byte")? = 0x40;
     *uuid.get_mut(8).ok_or("fixture UUID has no variant byte")? = 0x80;
@@ -472,9 +472,9 @@ fn observed_plan(device: &str) -> Result<Vec<u8>, String> {
     Ok(bytes)
 }
 
-fn plan_observation(plan: &[u8]) -> Result<std::process::Output, String> {
+fn plan_observation(args: &[&str], plan: &[u8]) -> Result<std::process::Output, String> {
     let mut child = Command::new("/bin/td-install")
-        .arg("observe-plan")
+        .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -501,10 +501,32 @@ fn canaries(device: &str) -> Result<Vec<u8>, String> {
     Ok(bytes)
 }
 
+fn source_deployment() -> Result<([u8; 32], String), String> {
+    let result = Command::new("/bin/td-boot")
+        .args(["validate-source", "/source", "/trusted.pub"])
+        .output().map_err(|error| format!("validate source: {error}"))?;
+    if !result.status.success() {
+        return Err(format!("source validation failed: {}: {}", result.status,
+            String::from_utf8_lossy(&result.stderr).trim_end()));
+    }
+    let id = result.stdout.strip_suffix(b"\n").ok_or("source ID lacks newline")?;
+    if id.len() != 64 || !id.iter().all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f')) {
+        return Err("source ID is not canonical lowercase SHA-256".into());
+    }
+    let mut digest = [0; 32];
+    for (index, pair) in id.as_chunks::<2>().0.iter().enumerate() {
+        let text = std::str::from_utf8(pair).map_err(|_| "source ID is not ASCII")?;
+        *digest.get_mut(index).ok_or("source ID exceeds digest")? =
+            u8::from_str_radix(text, 16).map_err(|_| "source ID has invalid hex")?;
+    }
+    let id = String::from_utf8(id.to_vec()).map_err(|_| "source ID is not UTF-8")?;
+    Ok((digest, id))
+}
+
 fn check_plan_observation(device: &str) -> Result<(), String> {
     let before = canaries(device)?;
-    let plan = observed_plan(device)?;
-    let response = plan_observation(&plan)?;
+    let plan = observed_plan(device, [0; 32])?;
+    let response = plan_observation(&["observe-plan"], &plan)?;
     if !response.status.success() {
         return Err(format!("current plan observation failed: {}", response.status));
     }
@@ -520,7 +542,7 @@ fn check_plan_observation(device: &str) -> Result<(), String> {
     let mut stale = plan;
     stale.get_mut(96..104).ok_or("fixture plan lacks disk sequence")?
         .copy_from_slice(&changed.to_be_bytes());
-    let response = plan_observation(&stale)?;
+    let response = plan_observation(&["observe-plan"], &stale)?;
     let diagnostic = String::from_utf8_lossy(&response.stderr);
     if response.status.success() || !response.stdout.is_empty()
         || !diagnostic.contains("reviewed destination is no longer an unchanged candidate") {
@@ -530,6 +552,32 @@ fn check_plan_observation(device: &str) -> Result<(), String> {
         return Err("plan observation changed target disk canaries".into());
     }
     report(std::io::stdout(), format_args!("{PLAN_STALE_MARKER}"))
+}
+
+fn check_source_plan_observation(device: &str, deployment: [u8; 32], id: &str) -> Result<(), String> {
+    let before = canaries(device)?;
+    let plan = observed_plan(device, deployment)?;
+    let source = plan_observation(&["observe-source-plan", "/bin/td-boot", "/source", "/trusted.pub"], &plan)?;
+    let expected_source = format!("{{\"version\":1,\"scope\":\"source-plan-observation-only\",\"deployment\":\"{id}\"}}\n");
+    if !source.status.success() || source.stdout != expected_source.as_bytes() {
+        return Err(format!("current source plan observation failed or returned a different report: status {}; stderr {}",
+            source.status, String::from_utf8_lossy(&source.stderr).trim_end()));
+    }
+    report(std::io::stdout(), format_args!("{SOURCE_PLAN_OBSERVATION_MARKER} {} {}", expected_source.trim_end().len(), expected_source.trim_end()))?;
+    let mut stale_source = plan;
+    let digest_first = stale_source.get_mut(40).ok_or("fixture plan lacks deployment digest")?;
+    *digest_first ^= 1;
+    let refused = plan_observation(&["observe-source-plan", "/bin/td-boot", "/source", "/trusted.pub"], &stale_source)?;
+    let diagnostic = String::from_utf8_lossy(&refused.stderr);
+    if refused.status.success() || !refused.stdout.is_empty()
+        || !diagnostic.contains("reviewed deployment differs from authenticated source") {
+        return Err(format!("changed source plan was accepted or refused for another reason: status {}; stderr {diagnostic}",
+            refused.status));
+    }
+    if before != canaries(device)? {
+        return Err("source plan observation changed target disk canaries".into());
+    }
+    report(std::io::stdout(), format_args!("{SOURCE_PLAN_STALE_MARKER}"))
 }
 
 fn inventory(marker: &str) -> Result<(), String> {
@@ -599,12 +647,12 @@ fn install(device: &str, interrupt: bool, system_autotest: bool) -> Result<(), S
     if writable && sectors >= PLAN_PROBE_MINIMUM_SECTORS {
         check_plan_observation(device)?;
     }
-    // Validate the stable read-only source before the first destructive command.
-    // Publication below still rechecks the copied payloads and signature.
-    command(
-        "/bin/td-boot",
-        &["validate-source", "/source", "/trusted.pub"],
-    )?;
+    // Validate the source before the first destructive command. Publication
+    // still rechecks every copied payload and its signature.
+    let (deployment, id) = source_deployment()?;
+    if writable && sectors >= PLAN_PROBE_MINIMUM_SECTORS {
+        check_source_plan_observation(device, deployment, &id)?;
+    }
     if system_autotest {
         if !Path::new("/dev/loop0").exists() {
             applet(&["mknod", "/dev/loop0", "b", "7", "0"])?;
@@ -849,7 +897,7 @@ fn refresh_partitions(device: &str, uuid: &str) -> Result<String, String> {
         .parse::<u64>().map_err(|_| "invalid target sector count")?;
     if sectors >= PLAN_PROBE_MINIMUM_SECTORS {
         let before = canaries(device)?;
-        let refused = plan_observation(&observed_plan(device)?)?;
+        let refused = plan_observation(&["observe-plan"], &observed_plan(device, [0; 32])?)?;
         let diagnostic = String::from_utf8_lossy(&refused.stderr);
         if refused.status.success() || !refused.stdout.is_empty()
             || !diagnostic.contains("(os error 16)") {
