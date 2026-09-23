@@ -1220,8 +1220,16 @@ Those remain installation-coordinator responsibilities.
 `td-install observe-source-plan` holds the reviewed destination's exclusive
 claim while this preflight compares the canonical manifest ID with the
 bounded plan. Its report names the disk identity checked at claim time and
-the deployment authenticated while that claim remains open. A claim does
-not detect physical removal or a changed disk sequence during hashing.
+again after hashing, and the deployment authenticated while that claim
+remains open. After source
+validation, it rechecks the held descriptor's capacity and compares a
+fresh, bracketed sysfs inventory with the plan before reporting success.
+The descriptor's device number is reasserted but cannot change for that
+opened inode. Removal or a changed disk sequence observed at that point
+refuses; unrelated inventory changes only matter if they occur between the
+two recheck scans. The claim itself does not prevent physical hotplug
+during hashing, and an intervening change restored before recheck is
+undetectable.
 The child closes
 its source descriptors and the destination claim closes before return, so
 the report cannot authorize a later formatting step. The service must keep

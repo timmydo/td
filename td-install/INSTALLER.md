@@ -885,15 +885,21 @@ absolute `td-boot validate-source` to authenticate the manifest and verify
 all three payload hashes with the supplied trust key, then compares the canonical
 manifest SHA-256 ID byte-for-byte with the plan's deployment digest. It
 holds the reviewed disk's exclusive claim during that source validation.
-Only after both checks succeed does it print a version-1 JSON report scoped
+Only after source authentication, digest comparison and the post-validation
+disk recheck succeed does it print a version-1 JSON report scoped
 `held-source-plan-observation-only`, naming the disk and deployment. A
 malformed plan or relative path refuses before the claim or child; a busy
-disk, failed child, or digest mismatch prints no success report. The child
+disk, failed child, digest mismatch or failed disk recheck prints no success
+report. The child
 closes its source descriptors and the disk claim closes before return, so
 this observation does not retain authority or authorize a later write. It
-does not detect physical disk removal or disk-sequence changes while the
-source is hashed, and does not replace the service's source mount and claim
-lifetime. The QEMU fixture requires the exact report, a changed digest
+rechecks the held descriptor's capacity and bracketed sysfs inventory after
+hashing, refusing removal or changed disk sequence visible then. The
+opened descriptor's device number is reasserted but cannot change for that
+inode. Physical hotplug is not prevented, and a change restored before
+recheck is undetectable.
+The command does not replace the service's source mount and claim lifetime.
+The QEMU fixture requires the exact report, a changed digest
 refusal, and a mounted disk refusal with unchanged target canaries. A
 test-only validator also attempts an exclusive open during source
 validation and must receive EBUSY; this pins the overlap, rather than only

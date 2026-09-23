@@ -677,7 +677,7 @@ fn observe_plan(input: &mut impl Read, output: &mut impl Write) -> io::Result<()
 }
 
 /// Keep the reviewed disk claimed while td-boot authenticates every payload.
-/// Both claims end before return; the report grants no later write authority.
+/// The claim ends before return; the report grants no later write authority.
 fn observe_source_plan(
     input: &mut impl Read,
     output: &mut impl Write,
@@ -691,9 +691,30 @@ fn observe_source_plan(
         ));
     }
     let plan = read_plan(input)?;
-    let _claim = inventory::claim_plan(&plan)?;
-    let id = validate_source_plan(&plan, td_boot, source, trusted_key)?;
-    write_source_plan_report(output, &plan, &id)?;
+    observe_source_plan_with_claim(
+        &plan,
+        output,
+        td_boot,
+        source,
+        trusted_key,
+        inventory::claim_plan,
+        inventory::recheck_claim_plan,
+    )
+}
+
+fn observe_source_plan_with_claim<C>(
+    plan: &installation_plan::Plan,
+    output: &mut impl Write,
+    td_boot: &Path,
+    source: &Path,
+    trusted_key: &Path,
+    claim: impl FnOnce(&installation_plan::Plan) -> io::Result<C>,
+    recheck: impl FnOnce(&installation_plan::Plan, &mut C) -> io::Result<()>,
+) -> io::Result<()> {
+    let mut claim = claim(plan)?;
+    let id = validate_source_plan(plan, td_boot, source, trusted_key)?;
+    recheck(plan, &mut claim)?;
+    write_source_plan_report(output, plan, &id)?;
     output.flush()
 }
 
@@ -2724,6 +2745,69 @@ mod tests {
                 assert_eq!(report, format!("{{\"version\":1,\"scope\":\"held-source-plan-observation-only\",\"destination\":\"vda\",\"deployment\":\"{}\"}}\n", "ab".repeat(32)).as_bytes());
             }
         }
+    }
+
+    #[test]
+    fn source_plan_refuses_identity_changed_during_validation() {
+        let directory = scratch::path("source-plan-recheck");
+        std::fs::create_dir(&directory).unwrap();
+        let _cleanup = ScratchDirectory(directory.clone());
+        let validator = directory.join("td-boot");
+        let observed_sequence = directory.join("diskseq");
+        let source = directory.join("source");
+        let key = directory.join("trusted.pub");
+        let destination =
+            installation_plan::Destination::new(installation_plan::DestinationObservation {
+                name: "vda",
+                major: 253,
+                minor: 0,
+                sequence: 1,
+                capacity: DISK,
+                sector: 512,
+                removable: false,
+                model: None,
+                serial: None,
+                wwid: None,
+            })
+            .unwrap();
+        let settings = installation_plan::Settings::new("tester", "td", "us", "Etc/UTC").unwrap();
+        let mut uuid = [0; 16];
+        uuid[6] = 0x40;
+        uuid[8] = 0x80;
+        let plan =
+            installation_plan::Plan::new([1; 32], destination, [0xab; 32], uuid, settings).unwrap();
+        std::fs::write(&observed_sequence, "1").unwrap();
+        scratch::executable(
+            &validator,
+            &format!(
+                "#!/bin/sh\nprintf 2 > '{}'\nprintf '{}\\n'\n",
+                observed_sequence.display(),
+                "ab".repeat(32),
+            ),
+        )
+        .unwrap();
+        let mut report = Vec::new();
+        let error = observe_source_plan_with_claim(
+            &plan,
+            &mut report,
+            &validator,
+            &source,
+            &key,
+            |_| Ok(()),
+            |_, _| {
+                let sequence = std::fs::read_to_string(&observed_sequence)?;
+                if sequence == "1" {
+                    Ok(())
+                } else {
+                    Err(invalid(
+                        "claimed destination changed during validation".into(),
+                    ))
+                }
+            },
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("claimed destination changed"));
+        assert!(report.is_empty());
     }
 
     #[test]

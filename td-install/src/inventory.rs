@@ -397,36 +397,71 @@ fn matches_plan(device: &Device, plan: &installation_plan::Plan) -> io::Result<b
 /// Hold a read-write O_EXCL claim through the caller's observation. This
 /// function writes no bytes and does not authenticate the deployment or source.
 pub fn claim_plan(plan: &installation_plan::Plan) -> io::Result<File> {
-    use std::os::unix::fs::{FileTypeExt, MetadataExt};
     let devices = collect(Path::new("/sys/class/block"))?;
-    let device = devices
-        .iter()
-        .find(|device| device.name == plan.destination().name())
-        .ok_or_else(|| invalid("reviewed destination is no longer present".into()))?;
-    if !candidate(device, &devices) || !matches_plan(device, plan)? {
-        return Err(invalid(
-            "reviewed destination is no longer an unchanged candidate".into(),
-        ));
-    }
-    let path = Path::new("/dev").join(&device.name);
+    plan_candidate(&devices, plan)?;
+    let path = Path::new("/dev").join(plan.destination().name());
     let mut file = paths::open_destination_claim(&path, true)?;
-    let metadata = file.metadata()?;
-    let number = crate::device_numbers(metadata.rdev());
-    let (major, minor) = plan.destination().number();
-    if !metadata.file_type().is_block_device()
-        || number != (u64::from(major), u64::from(minor))
-        || crate::destination_bytes(&mut file)? != plan.destination().capacity()
-    {
-        return Err(invalid(
-            "opened destination differs from reviewed plan".into(),
-        ));
-    }
+    check_claimed_file(&mut file, plan)?;
     if devices != collect(Path::new("/sys/class/block"))? {
         return Err(invalid(
             "block inventory changed during plan observation".into(),
         ));
     }
     Ok(file)
+}
+
+fn plan_candidate(devices: &[Device], plan: &installation_plan::Plan) -> io::Result<()> {
+    let device = devices
+        .iter()
+        .find(|device| device.name == plan.destination().name())
+        .ok_or_else(|| invalid("reviewed destination is no longer present".into()))?;
+    if !candidate(device, devices) || !matches_plan(device, plan)? {
+        return Err(invalid(
+            "reviewed destination is no longer an unchanged candidate".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn check_claimed_file(file: &mut File, plan: &installation_plan::Plan) -> io::Result<()> {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    let metadata = file.metadata()?;
+    let number = crate::device_numbers(metadata.rdev());
+    let (major, minor) = plan.destination().number();
+    if !metadata.file_type().is_block_device()
+        || number != (u64::from(major), u64::from(minor))
+        || crate::destination_bytes(file)? != plan.destination().capacity()
+    {
+        return Err(invalid(
+            "opened destination differs from reviewed plan".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Recheck the same claimed descriptor and disk inventory after a long
+/// read-only source operation, before its success report is emitted.
+pub fn recheck_claim_plan(plan: &installation_plan::Plan, file: &mut File) -> io::Result<()> {
+    recheck_inventory(plan, Path::new("/sys/class/block"), || {
+        check_claimed_file(file, plan)
+    })
+    .map_err(|error| io::Error::new(error.kind(), format!("after source validation: {error}")))
+}
+
+fn recheck_inventory(
+    plan: &installation_plan::Plan,
+    class: &Path,
+    check_claim: impl FnOnce() -> io::Result<()>,
+) -> io::Result<()> {
+    let devices = collect(class)?;
+    plan_candidate(&devices, plan)?;
+    check_claim()?;
+    if devices != collect(class)? {
+        return Err(invalid(
+            "block inventory changed during plan recheck".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn probe(device: &Device) -> io::Result<bool> {
@@ -657,11 +692,7 @@ mod tests {
         uuid[8] = 0x80;
         let plan = Plan::new([1; 32], destination, [2; 32], uuid, settings).unwrap();
         let current = || collect(&fixture.class).unwrap();
-        let matches = |devices: &[Device]| {
-            let device = devices.iter().find(|d| d.name == "vda").unwrap();
-            candidate(device, devices) && matches_plan(device, &plan).unwrap()
-        };
-        assert!(matches(&current()));
+        plan_candidate(&current(), &plan).unwrap();
         for (path, stale) in [
             ("diskseq", "8"),
             ("size", "12582914"),
@@ -675,15 +706,65 @@ mod tests {
             let file = disk.join(path);
             let old = fs::read(&file).ok();
             fs::write(&file, stale).unwrap();
-            assert!(!matches(&current()), "{path}");
+            let error = plan_candidate(&current(), &plan).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("no longer an unchanged candidate"),
+                "{path}: {error}"
+            );
             match old {
                 Some(old) => fs::write(&file, old).unwrap(),
                 None => fs::remove_file(&file).unwrap(),
             }
-            assert!(matches(&current()), "{path} restoration");
+            plan_candidate(&current(), &plan).unwrap();
         }
         fs::write(disk.join("ro"), "1").unwrap();
-        assert!(!matches(&current()));
+        let error = plan_candidate(&current(), &plan).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("no longer an unchanged candidate"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn recheck_refuses_changed_target_and_change_between_scans() {
+        let fixture = Fixture::new();
+        let disk = fixture.disk("vda", "252:0", 512);
+        let destination = Destination::new(DestinationObservation {
+            name: "vda",
+            major: 252,
+            minor: 0,
+            sequence: 7,
+            capacity: 6 * 1024 * 1024 * 1024,
+            sector: 512,
+            removable: false,
+            model: None,
+            serial: None,
+            wwid: None,
+        })
+        .unwrap();
+        let settings = Settings::new("alice", "td-host", "us", "Etc/UTC").unwrap();
+        let mut uuid = [0; 16];
+        uuid[6] = 0x40;
+        uuid[8] = 0x80;
+        let plan = Plan::new([1; 32], destination, [2; 32], uuid, settings).unwrap();
+        recheck_inventory(&plan, &fixture.class, || Ok(())).unwrap();
+        fs::write(disk.join("diskseq"), "8").unwrap();
+        let error = recheck_inventory(&plan, &fixture.class, || Ok(())).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("no longer an unchanged candidate"));
+        fs::write(disk.join("diskseq"), "7").unwrap();
+        let error = recheck_inventory(&plan, &fixture.class, || {
+            fs::write(disk.join("diskseq"), "8")
+        })
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("block inventory changed during plan recheck"));
     }
 
     #[test]
