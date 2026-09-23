@@ -119,6 +119,9 @@ rosters; overflow/zero/inconsistent budgets refuse. The client inventory covers
 upload, structured creation, submission success filing and lost-response query.
 No network listeners or capabilities are enabled by this skeleton.
 
+M01's initial ledger is in RESOURCES.md; CONFORMANCE.md carries the complete
+method/property inventory, client call sites and discovered compatibility gaps.
+
 ## M02 — Freeze store, queue, and protocol contracts
 
 **Depends on:** M01. **Own:** module interfaces, format specification and golden

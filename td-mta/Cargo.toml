@@ -1,0 +1,21 @@
+[package]
+name = "td-mta"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Bounded std-only core for td's personal mail service"
+
+# Independent target library; TLS and the installed binary belong to M03.
+[workspace]
+
+[package.metadata.td-gate]
+clippy-all-targets = true
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+unreachable = "deny"
+todo = "deny"
+unimplemented = "deny"
+indexing_slicing = "deny"

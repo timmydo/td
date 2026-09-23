@@ -7,6 +7,11 @@ This is the normative target for a new service, not a claim that it exists.
 An incomplete increment must not advertise capabilities it cannot provide.
 The v1 release requires the acceptance evidence in section 15.
 
+The M01 library skeleton provides typed local IDs, configuration versioning and
+checked resource planning only. [RESOURCES.md](RESOURCES.md) records its initial
+byte ledger; [CONFORMANCE.md](CONFORMANCE.md) inventories the unimplemented JMAP
+contract and current client calls. There are no protocol handlers or listeners.
+
 The initial deployment is one person's approximately 1 GB of mail, multiple
 domains, and explicit aliases on each domain pointing into one account's
 mailbox store. Account IDs remain explicit in every storage and authorization
@@ -255,6 +260,11 @@ the resource table does not replace RFC limits. The implementation must add an
 arena ledger with byte counts, worker stack sizes, scratch reservations, and
 TLS headroom before committing a default profile. A larger configured pool
 cannot silently retain the default memory claim.
+
+The M01 ledger reserves 62874880 bytes under the default 64 MiB budget,
+including planned stack, TLS, reload and process allowances. It is not RSS
+evidence. M02/M07 must fit concrete structures and measured provider use within
+those reservations or amend the ledger before enabling service admission.
 
 The no-allocation contract covers td-owned hot processing: SMTP parsing and
 streaming, MIME scanning, HTTP/JSON parsing, JMAP evaluation/serialization,
