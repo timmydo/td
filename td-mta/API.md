@@ -4,7 +4,8 @@ This normative M02c2 contract accompanies the compiling interfaces in
 src/ports.rs and the state codecs in src/sync.rs. Interfaces do not supply a
 store, network runtime, cryptographic provider or allocation/durability proof.
 M05/M07–M09 implement and test the adapters; M13–M17 implement their protocol
-consumers. M02c3 supplies worker, buffer and work ledgers before consumers.
+consumers. RESOURCES.md fixes worker/buffer ownership; M02c3b supplies work
+and disk ledgers before consumers.
 
 ## 1. Ownership and I/O
 
@@ -21,7 +22,9 @@ or compare it across boots. Entropy fills the entire output or fails; callers
 discard the entire output on failure. Crypto SHA-256 is streaming. P-256
 keys are PKCS#8, public points uncompressed SEC1, ES256 signatures fixed
 32-byte r followed by 32-byte s. The provider owns secure key storage;
-generation/load are cold operations. TLS owns peer certificate verification.
+generation/load are cold operations. equal_digest uses the reviewed provider
+for constant-time equality of fixed 32-byte password verifiers; core Rust
+comparison is not a substitute. TLS owns peer certificate verification.
 Neither a fake digest nor these trait signatures prove cryptographic quality.
 
 Transport methods are nonblocking and make bounded progress. Bytes(n) means
@@ -144,7 +147,7 @@ DiskBudget separately reserves physical new-blob bytes/files, metadata
 bytes/files and logical upload/queue quota increases (including a new pin on
 an existing body). Logical quotas may overlap physical bytes and are not
 added to them a second time. When size is unknown reserve the admitted maximum.
-M02c3 fixes quota ceilings and checkpoint/free-space headroom; no blob creation
+M02c3b fixes quota ceilings and checkpoint/free-space headroom; no blob creation
 may bypass this reservation. Exceeding a logical quota returns Quota; temporary
 pool/storage pressure returns Capacity/Busy. Dropping or expiring releases
 unused capacity once; already-written orphan bytes remain charged until cleanup.
@@ -160,6 +163,38 @@ bound to the same still-active reservation that pins its pending blob against
 GC. It is not an authorization credential. M05 owns root paths, publication
 checks and orphan cleanup. A publication error may leave an orphan but cannot
 create metadata. Dropping a writer ends its borrow, not the reservation.
+
+M02c3a refines transaction handoff to TransactionInput: one immutable encoded
+byte slice plus operation count, using all FORMAT.md PUT/DELETE/CHANGE
+operation headers and key/value encodings without a journal frame header.
+There is no separately allocated CHANGE slice. Validate every input byte,
+tag, count, length and semantic key/row before append; TransactionInput
+is not a proof of validity. Owned StagedOperation offsets (bounded to 32 bytes
+per slot, including parsed operation kind/type/action) index the input arena.
+Each Row/Key is decoded only while used.
+Do not store an array of borrowed Mutations beside their mutable backing arena:
+that prevents safe buffer reuse across requests. The single-record Mutation
+enum remains an encoder input, not a pooled self-referencing object graph.
+M05 supplies the operation encoder/parser; this increment only fixes handoff
+and checked startup layout. Frame header/footer bytes must fit in addition
+to the supplied operation bytes (which already include CHANGE). Input and
+output buffers are distinct. Both arenas reserve `frame_bytes`, but valid
+input is at most `frame_bytes - FRAME_HEADER_BYTES - FRAME_FOOTER_BYTES`;
+reject a larger operation stream before encoding or append. Unused input
+arena capacity does not increase the permitted journal frame size.
+The extra input arena is deliberate: protocol-owned canonical input stays
+immutable while the store builds and validates its own complete frame. This
+keeps the commit interface independent of store-private mutable buffer leases
+and gives inspection/fault adapters the same handoff. V1 pays one bounded copy
+instead of requiring vectored append or exposing a writer arena to callers.
+M05 uses the checked StagedOperation slot representation, or amends its size
+contract before substituting a different internal descriptor.
+
+Ports express the thread handoff: transports, digest state, reservations and
+blob handles are Send; shared stores, clocks, crypto and read views are Sync.
+This does not permit concurrent mutation or erase borrowed lifetimes. Startup
+owners outlive scoped workers and their leased handles; queues still carry
+slot IDs, never lifetime casts. TLS factories are worker-owned Send values.
 
 Store::commit runs only on the serialized writer worker. Recheck reservation
 ownership/deadline, expected account sequence, authorization supplied by the
@@ -324,7 +359,7 @@ SMTP rejects unavailable admission with temporary status before DATA and
 returns final 250 only after proven durable commit. No local error maps to
 acceptance. After HTTP headers are sent, a read failure closes the incomplete
 response; never emit a second HTTP status or valid-looking truncated JSON.
-M02c3 supplies response retention so later method failures cannot erase
+M02c3b supplies response retention so later method failures cannot erase
 earlier successes. Tests in this increment cover token bytes/bounds/scoping;
 future adapter and protocol suites must prove these operational mappings.
 

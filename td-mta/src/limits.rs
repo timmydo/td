@@ -3,6 +3,10 @@ use std::fmt;
 
 pub const KIB: usize = 1024;
 pub const MIB: usize = 1024 * KIB;
+/// QUEUE.md's fixed per-attempt ceiling, independent of inbound envelope size.
+pub const OUTBOUND_RECIPIENT_BATCH: usize = 100;
+/// Owned operation offsets/ordinal/type/kind, including Option layout.
+pub const OPERATION_SLOT_BYTES: usize = 32;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ResourceError {
@@ -66,7 +70,7 @@ limits! {
     https_connections: 8, 1, 32;
     tls_handshakes: 2, 1, 8;
     event_streams: 2, 0, 8;
-    outbound_deliveries: 1, 1, 4;
+    outbound_deliveries: 1, 1, 1;
     body_jobs: 2, 1, 8;
     storage_views: 2, 1, 8;
     message_bytes: 32 * MIB, 1, 128 * MIB;
@@ -155,6 +159,11 @@ impl Limits {
         self.validate_ranges()?;
         for (valid, rule) in [
             (
+                std::mem::size_of::<Option<crate::ports::StagedOperation>>()
+                    <= OPERATION_SLOT_BYTES,
+                "operation index exceeds its staging slot",
+            ),
+            (
                 self.smtp_per_peer <= self.smtp_sessions,
                 "per-peer SMTP cap exceeds session pool",
             ),
@@ -209,6 +218,17 @@ impl Limits {
         let mime_descriptors = product("MIME parts", self.mime_parts, 64)?;
         let recipient_bytes = product("SMTP recipients", self.smtp_recipients, 320)?;
         let journal_descriptors = product("journal descriptors", self.journal_operations, 32)?;
+        let mutation_slots = product(
+            "transaction operation index",
+            self.frame_operations,
+            OPERATION_SLOT_BYTES,
+        )?;
+        let outbound_recipients = product("outbound recipients", OUTBOUND_RECIPIENT_BATCH, 320)?;
+        let outbound_replies = product(
+            "outbound RCPT replies",
+            OUTBOUND_RECIPIENT_BATCH,
+            crate::format::row::MAX_SMTP_REPLY,
+        )?;
         let response_ids = product(
             "method object scratch",
             self.objects_per_method.max(self.query_page),
@@ -254,6 +274,8 @@ impl Limits {
                         self.journal_bytes,
                         journal_descriptors,
                         self.frame_bytes,
+                        self.frame_bytes, // Borrowed key/value staging, separate from frame output.
+                        mutation_slots,
                         256 * KIB,
                     ],
                 )?,
@@ -266,7 +288,10 @@ impl Limits {
             Reservation {
                 name: "outbound slots",
                 count: self.outbound_deliveries,
-                bytes_each: sum("outbound slot", &[recipient_bytes, 128 * KIB])?,
+                bytes_each: sum(
+                    "outbound slot",
+                    &[outbound_recipients, outbound_replies, 128 * KIB],
+                )?,
             },
             Reservation {
                 name: "sort run and merge buffers",
@@ -353,10 +378,58 @@ mod tests {
     #[test]
     fn default_ledger_pins_documented_budget() -> Result<(), ResourceError> {
         let plan = Limits::default().plan()?;
-        assert_eq!(plan.total_bytes(), 62_874_880);
+        assert_eq!(plan.total_bytes(), 64_464_128);
         assert!(plan.total_bytes() < 64 * MIB);
         assert_eq!(plan.log_disk_bytes(), 40 * MIB);
         Ok(())
+    }
+
+    #[test]
+    fn outbound_replies_and_transaction_staging_have_separate_capacity() -> Result<(), ResourceError>
+    {
+        let plan = Limits::default().plan()?;
+        let larger_inbound = Limits {
+            smtp_recipients: 1000,
+            ..Limits::default()
+        }
+        .plan()?;
+        for profile in [&plan, &larger_inbound] {
+            let outbound = profile
+                .reservations()
+                .iter()
+                .find(|r| r.name == "outbound slots")
+                .ok_or(ResourceError::Inconsistent("missing outbound reservation"))?;
+            assert_eq!(outbound.count, 1);
+            assert_eq!(outbound.bytes_each, 572_672);
+            let writer = profile
+                .reservations()
+                .iter()
+                .find(|r| r.name == "writer/checkpoint")
+                .ok_or(ResourceError::Inconsistent("missing writer reservation"))?;
+            assert_eq!(writer.bytes_each, 6_946_816);
+        }
+        assert_eq!(
+            larger_inbound.total_bytes() - plan.total_bytes(),
+            8 * 900 * 320
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn larger_memory_budget_does_not_enable_parallel_relay_attempts() {
+        let limits = Limits {
+            outbound_deliveries: 2,
+            memory_budget_bytes: 128 * MIB,
+            ..Limits::default()
+        };
+        assert_eq!(
+            limits.plan(),
+            Err(ResourceError::OutOfRange {
+                field: "outbound_deliveries",
+                min: 1,
+                max: 1,
+            })
+        );
     }
 
     #[test]

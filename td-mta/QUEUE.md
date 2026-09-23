@@ -116,9 +116,9 @@ a truncated prefix into a successful status.
 Journal reservations cover the whole selected batch and its CHANGE. The
 maximum encoded recipient row is 9019 bytes; a PUT adds 12 operation-header
 bytes and a 20-byte key. A 100-row update is 905100 bytes before frame and
-submission/CHANGE overhead, below the 1 MiB frame ceiling. M02c3 accounts
-separately for retaining distinct replies while the remote peer is slow;
-the shared writer frame cannot be held across a network round trip.
+submission/CHANGE overhead, below the 1 MiB frame ceiling. RESOURCES.md
+accounts separately for retaining distinct replies while the remote peer
+is slow; the shared writer frame cannot be held across a network round trip.
 Before committing AcceptancePossible, hold both its frame reservation and
 a separate worst-case final-outcome reservation for the selected DATA subset,
 including submission/CHANGE overhead. Only the phase reservation is consumed

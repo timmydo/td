@@ -71,20 +71,22 @@ pub struct Time {
     pub utc_ms: i64,
     pub monotonic: Tick,
 }
-pub trait Clock {
+pub trait Clock: Send + Sync {
     fn sample(&self) -> Result<Time, Error>;
 }
 pub trait Entropy {
     fn fill(&mut self, output: &mut [u8]) -> Result<(), Error>;
 }
-pub trait Digest {
+pub trait Digest: Send {
     fn update(&mut self, bytes: &[u8]) -> Result<(), Error>;
     fn finish(self) -> Result<[u8; 32], Error>;
 }
-pub trait Crypto {
+pub trait Crypto: Send + Sync {
     type Sha256: Digest;
     type SigningKey: Send + Sync;
     fn sha256(&self) -> Self::Sha256;
+    /// Provider-backed constant-time equality for fixed-size password verifiers.
+    fn equal_digest(&self, left: &[u8; 32], right: &[u8; 32]) -> bool;
     /// Cold path only; output is a complete PKCS#8 P-256 private key.
     fn generate_p256(&self, output: &mut [u8]) -> Result<usize, Error>;
     /// Cold path only; a key's owned provider storage counts in the cold ledger.
@@ -113,7 +115,7 @@ pub enum FlushProgress {
 }
 /// Nonblocking operation. Bytes(n) has 1 <= n <= slice.len(); empty input
 /// returns Pending. Closed is EOF on read; write failure is an Error.
-pub trait Transport {
+pub trait Transport: Send {
     fn read(&mut self, output: &mut [u8]) -> Result<IoProgress, Error>;
     fn write(&mut self, input: &[u8]) -> Result<IoProgress, Error>;
     /// Drain adapter-owned output (including TLS records), not peer receipt.
@@ -158,7 +160,7 @@ pub struct TlsPolicyId {
     pub generation: u64,
     pub index: u16,
 }
-pub trait TlsFactory {
+pub trait TlsFactory: Send {
     type Plain: Transport;
     type Secure: TlsTransport;
     /// Consumes and closes plaintext on refusal. Unconsumed plaintext must be
@@ -223,7 +225,7 @@ pub enum ChangeStep {
     },
     Complete,
 }
-pub trait ReadView {
+pub trait ReadView: Send + Sync {
     fn identity(&self) -> ViewIdentity;
     /// Scan strictly after the cursor, within the pinned history and endpoint.
     /// Body PUTs are skipped with bounded I/O; no whole-frame allocation.
@@ -247,6 +249,31 @@ pub trait ReadView {
 pub enum Mutation<'a> {
     Put { key: Key<'a>, row: Row<'a> },
     Delete(Key<'a>),
+}
+/// Canonical FORMAT PUT/DELETE/CHANGE operations, without a frame header.
+/// The store validates count, framing, rows and references before any append.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TransactionInput<'a> {
+    pub bytes: &'a [u8],
+    pub count: usize,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OperationKind {
+    Put,
+    Delete,
+    Change(ChangeAction),
+}
+/// Owned offsets into TransactionInput, never references into a reusable arena.
+/// All ranges are validated by the store; Rust layout is not serialized.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StagedOperation {
+    pub kind: OperationKind,
+    pub type_tag: u16,
+    pub key_offset: u32,
+    pub key_len: u32,
+    pub value_offset: u32,
+    pub value_len: u32,
+    pub ordinal: u32,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ChangeAction {
@@ -298,7 +325,7 @@ pub struct ReservationId {
     pub slot: u32,
     pub generation: u64,
 }
-pub trait Reservation {
+pub trait Reservation: Send {
     fn identity(&self) -> ReservationId;
     fn account(&self) -> AccountId;
     fn size(&self) -> ReservationSize;
@@ -335,7 +362,7 @@ impl std::error::Error for CommitFailure {
 }
 /// The writer worker alone calls commit; frontends submit fixed-slot requests.
 /// Associated handles lease startup pools; Drop releases their resources.
-pub trait Store {
+pub trait Store: Send + Sync {
     type View<'a>: ReadView
     where
         Self: 'a;
@@ -379,12 +406,11 @@ pub trait Store {
         reservation: &mut Self::Reserved<'_>,
         expected: Sequence,
         published: &[PublishedBlob],
-        mutations: &[Mutation<'_>],
-        changes: &[Change],
+        transaction: TransactionInput<'_>,
     ) -> Result<Commit, CommitFailure>;
 }
 /// The owning view/lease remains live while this reader is used.
-pub trait BlobReader {
+pub trait BlobReader: Send {
     fn len(&self) -> u64;
     fn is_empty(&self) -> bool {
         self.len() == 0
@@ -416,7 +442,7 @@ impl PublishedBlob {
         &self.digest
     }
 }
-pub trait BlobWriter {
+pub trait BlobWriter: Send {
     /// All-or-error: no caller retry of the same chunk after an error.
     fn write(&mut self, bytes: &[u8]) -> Result<(), Error>;
     /// Sync file and publication directories; does not create a metadata reference.

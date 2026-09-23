@@ -8,7 +8,7 @@ An incomplete increment must not advertise capabilities it cannot provide.
 The v1 release requires the acceptance evidence in section 15.
 
 The M01 library skeleton provides typed local IDs, configuration versioning and
-checked resource planning only. [RESOURCES.md](RESOURCES.md) records its initial
+checked resource planning only. [RESOURCES.md](RESOURCES.md) records its checked startup
 byte ledger; [CONFORMANCE.md](CONFORMANCE.md) inventories the unimplemented JMAP
 contract and current client calls. There are no protocol handlers or listeners.
 The M02a/M02b format module adds checked scalar/key/row codecs and literal
@@ -225,13 +225,14 @@ disposable disk indexes with a fixed cache. No unbounded mmap or memory-sized-to
 strategy is permitted. Maintenance shares an explicit budget with live work.
 
 Event-source streams hold connection slots but no storage read view between
-events. They use bounded state notifications and a dedicated fixed execution
-budget or nonblocking scheduling; they cannot occupy all workers that process
-ordinary requests, commits or health checks. M02 pins that scheduling choice.
-Safe std supports a bounded round-robin scan of nonblocking sockets with a
-deadline-based timed wait; it does not expose poll/epoll. If M02 instead chooses
-fixed blocking workers, reserve event workers separately and count all stacks.
-An OS readiness adapter requires the explicit unsafe review from section 3.
+events. RESOURCES.md fixes their nonblocking main-thread scheduling and the
+eight fixed worker threads across six roles; event peers cannot occupy
+request/commit/control workers.
+Use safe std with a bounded round-robin socket scan and a deadline-based wait
+of at most five milliseconds. Established TLS record work is bounded per
+slot; disk, dial, handshake and DNS jobs use fixed workers. Safe std exposes
+no poll/epoll; adding an OS readiness adapter would require the explicit
+unsafe review from section 3 and a resource-contract amendment.
 Read slots are acquired per store operation with a bounded fair wait queue;
 exhaustion returns a retryable HTTP 503 before response headers or the mapped
 JMAP method error. A streaming response that has begun cannot fabricate an
@@ -268,7 +269,7 @@ arena ledger with byte counts, worker stack sizes, scratch reservations, and
 TLS headroom before committing a default profile. A larger configured pool
 cannot silently retain the default memory claim.
 
-The M01 ledger reserves 62874880 bytes under the default 64 MiB budget,
+The M02c3a ledger reserves 64464128 bytes under the default 64 MiB budget,
 including planned stack, TLS, reload and process allowances. It is not RSS
 evidence. M02/M07 must fit concrete structures and measured provider use within
 those reservations or amend the ledger before enabling service admission.

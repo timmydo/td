@@ -138,11 +138,12 @@ writing production mail or advertising capabilities.
   increments. **M02c1** freezes generic/local wire IDs and checked MIME-part
   locator codecs with literal fixtures. **M02c2** freezes queue transitions,
   restart/JMAP mappings, synchronization states and compiling adapter/store
-  APIs in `ports.rs`/`sync.rs`, API.md and QUEUE.md. **M02c3** freezes
-  worker/work/maintenance budgets, request/result
-  retention, thread/search/MIME policies and the traceable wire fixture
-  inventory. Each is independently reviewed; none relaxes the M02 dependency
-  gate for protocol consumers.
+  APIs in `ports.rs`/`sync.rs`, API.md and QUEUE.md. **M02c3** is completed
+  in three independently reviewed parts: **M02c3a** accounts for transaction/
+  reply staging and fixed worker/pool ownership; **M02c3b** freezes disk/work/
+  maintenance budgets and request/result retention; **M02c3c** freezes
+  thread/search/MIME policies and the traceable wire fixture inventory.
+  None relaxes the M02 dependency gate for protocol consumers.
 
 **Depends on:** M01. **Own:** module interfaces, format specification and golden
 fixture descriptions. **Read:** DESIGN sections 8-11 and standards inventory.
