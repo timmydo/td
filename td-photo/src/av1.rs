@@ -1132,6 +1132,41 @@ struct Coded {
     recon: Vec<u8>,
 }
 
+impl Default for Coded {
+    fn default() -> Coded {
+        Coded {
+            cost: u64::MAX,
+            tx: TxType::DctDct,
+            levels: Vec::new(),
+            eob: 0,
+            recon: Vec::new(),
+        }
+    }
+}
+
+/// The buffers a tile's trials reuse from block to block: every
+/// screened mode's prediction, `MODES` in order end to end, the
+/// transform's working blocks, and per plane the trial's coding and the
+/// best so far, swapped when the trial wins. They only grow, so a block
+/// after a smaller one clears nothing.
+#[derive(Default)]
+struct Scratch {
+    preds: Vec<u8>,
+    work: Work,
+    trial: [Coded; 3],
+    best: [Coded; 3],
+}
+
+/// A transform's residual, coefficients and dequantized levels, each
+/// written whole before it is read; empty until the first trial, so the
+/// placeholder `best_leaf` leaves in the tile allocates nothing.
+#[derive(Default)]
+struct Work {
+    residual: Vec<i32>,
+    coeffs: Vec<i32>,
+    dequant: Vec<i32>,
+}
+
 /// One plane's quantized levels in the transform's row-major layout,
 /// and their end of block in scan order (0 for none).
 #[derive(Clone, Copy)]
@@ -1170,9 +1205,13 @@ struct Saved {
     pixels: Option<Vec<u8>>,
 }
 
+/// The context slices a block writes: the level and DC columns and rows
+/// of the three planes, then the skip, mode and size columns and rows.
+const SEGMENTS: usize = 18;
+
 impl Contexts {
     /// Every context slice a block at the position writes.
-    fn segments(&mut self, at: At) -> Vec<&mut [u8]> {
+    fn segments<'a>(&'a mut self, at: At) -> [&'a mut [u8]; SEGMENTS] {
         let units = at.units();
         let sb_row = at.sb_row();
         let mi_col = at.mi_col;
@@ -1189,7 +1228,13 @@ impl Contexts {
             left_height_log2,
             ..
         } = self;
-        let mut out: Vec<&mut [u8]> = Vec::with_capacity(18);
+        let mut out: [&'a mut [u8]; SEGMENTS] = Default::default();
+        let mut slots = out.iter_mut();
+        let mut push = |segment: &'a mut [u8]| {
+            if let Some(slot) = slots.next() {
+                *slot = segment;
+            }
+        };
         for (plane, (above, left)) in above_level
             .iter_mut()
             .chain(above_dc.iter_mut())
@@ -1198,14 +1243,14 @@ impl Contexts {
         {
             let sub = usize::from(plane % 3 > 0);
             let (x4, y4, u) = (mi_col >> sub, sb_row >> sub, units >> sub);
-            out.push(above.get_mut(x4..x4 + u).unwrap_or(&mut []));
-            out.push(left.get_mut(y4..y4 + u).unwrap_or(&mut []));
+            push(above.get_mut(x4..x4 + u).unwrap_or(&mut []));
+            push(left.get_mut(y4..y4 + u).unwrap_or(&mut []));
         }
         for above in [above_skip, above_mode, above_width_log2] {
-            out.push(above.get_mut(mi_col..mi_col + units).unwrap_or(&mut []));
+            push(above.get_mut(mi_col..mi_col + units).unwrap_or(&mut []));
         }
         for left in [left_skip, left_mode, left_height_log2] {
-            out.push(left.get_mut(sb_row..sb_row + units).unwrap_or(&mut []));
+            push(left.get_mut(sb_row..sb_row + units).unwrap_or(&mut []));
         }
         out
     }
@@ -1235,6 +1280,11 @@ struct Tile {
     coder: Coder,
     qindex: u8,
     rdmult: u64,
+    scratch: Scratch,
+    /// Saved states' context and pixel copies, returned by `restore` and
+    /// `recycle`.
+    spare_segments: Vec<Vec<u8>>,
+    spare_pixels: Vec<Vec<u8>>,
 }
 
 fn plane_size(log2: u32, plane: usize) -> Size {
@@ -1281,6 +1331,9 @@ impl Tile {
             coder: Coder::new(),
             qindex,
             rdmult,
+            scratch: Scratch::default(),
+            spare_segments: Vec::new(),
+            spare_pixels: Vec::new(),
         }
     }
 
@@ -1404,6 +1457,7 @@ impl Tile {
             out.push(Node::Block(leaf));
             none_cost
         } else {
+            self.recycle(after_none);
             out.append(&mut children);
             split_cost
         }
@@ -1480,8 +1534,11 @@ impl Tile {
     /// Saves what a trial at the block may change.
     fn save(&mut self, at: At, pixels: bool) -> Saved {
         let side = at.side();
-        let pixels = pixels.then(|| {
-            let mut copy = Vec::with_capacity(side * side * 3 / 2);
+        let mut segments = self.spare_segments.pop().unwrap_or_default();
+        segments.clear();
+        let spare = pixels.then(|| self.spare_pixels.pop().unwrap_or_default());
+        let pixels = spare.map(|mut copy| {
+            copy.clear();
             for (plane, band) in self.recon.iter().enumerate() {
                 let sub = usize::from(plane > 0);
                 let n = side >> sub;
@@ -1493,7 +1550,6 @@ impl Tile {
             }
             copy
         });
-        let mut segments = Vec::with_capacity(300);
         for segment in self.contexts.segments(at) {
             segments.extend_from_slice(segment);
         }
@@ -1515,26 +1571,32 @@ impl Tile {
             rest = tail;
         }
         self.contexts.decoded = saved.decoded;
-        let Some(pixels) = saved.pixels else {
-            return;
-        };
-        let side = saved.at.side();
-        let mut rest = pixels.as_slice();
-        for (plane, band) in self.recon.iter_mut().enumerate() {
-            let sub = usize::from(plane > 0);
-            let n = side >> sub;
-            let x = (saved.at.mi_col * MI) >> sub;
-            let y = ((saved.at.mi_row - self.band_mi_row) * MI) >> sub;
-            for r in 0..n {
-                let Some((src, tail)) = rest.split_at_checked(n) else {
-                    return;
-                };
-                rest = tail;
-                if let Some(dst) = band.row_mut(y + 1 + r).get_mut(x..x + n) {
-                    dst.copy_from_slice(src);
+        if let Some(pixels) = &saved.pixels {
+            let side = saved.at.side();
+            let mut rest = pixels.as_slice();
+            'planes: for (plane, band) in self.recon.iter_mut().enumerate() {
+                let sub = usize::from(plane > 0);
+                let n = side >> sub;
+                let x = (saved.at.mi_col * MI) >> sub;
+                let y = ((saved.at.mi_row - self.band_mi_row) * MI) >> sub;
+                for r in 0..n {
+                    let Some((src, tail)) = rest.split_at_checked(n) else {
+                        break 'planes;
+                    };
+                    rest = tail;
+                    if let Some(dst) = band.row_mut(y + 1 + r).get_mut(x..x + n) {
+                        dst.copy_from_slice(src);
+                    }
                 }
             }
         }
+        self.recycle(saved);
+    }
+
+    /// Returns a saved state's buffers to the pools.
+    fn recycle(&mut self, saved: Saved) {
+        self.spare_segments.push(saved.segments);
+        self.spare_pixels.extend(saved.pixels);
     }
 
     // ---------------------------------------------------------- leaves
@@ -1542,6 +1604,14 @@ impl Tile {
     /// The best-coded block at the position: modes chosen by
     /// rate-distortion cost, reconstruction and contexts applied.
     fn best_leaf(&mut self, at: At) -> (Leaf, u64) {
+        let mut scratch = std::mem::take(&mut self.scratch);
+        let chosen = self.best_leaf_in(at, &mut scratch);
+        self.scratch = scratch;
+        chosen
+    }
+
+    /// `best_leaf` with the tile's scratch taken out of it.
+    fn best_leaf_in(&mut self, at: At, scratch: &mut Scratch) -> (Leaf, u64) {
         let side = at.side();
         let mut leaf = Leaf {
             at,
@@ -1552,77 +1622,99 @@ impl Tile {
             levels: [Vec::new(), Vec::new(), Vec::new()],
             eob: [0; 3],
         };
+        let Scratch {
+            preds,
+            work,
+            trial,
+            best,
+        } = scratch;
+        let [trial_y, trial_u, trial_v] = trial;
+        let [best_y, best_u, best_v] = best;
         // Luma: every mode screened by its residual's magnitude, the
         // closest few coded in full.
         let edges = self.pred_edges(0, at);
-        let mut screened: Vec<(u64, u8, Vec<u8>)> = MODES
-            .iter()
-            .map(|&mode| {
-                let mut pred = vec![0u8; side * side];
-                predict_block(mode, &edges, &mut pred);
-                (self.sad(0, at, &pred), mode, pred)
-            })
-            .collect();
-        screened.sort_unstable_by_key(|(sad, mode, _)| (*sad, *mode));
-        let mut best: Option<(u8, Coded)> = None;
-        for (_, mode, pred) in screened.iter().take(LUMA_TRIALS) {
-            let coded = self.code_plane(0, at, *mode, pred);
-            if best.as_ref().is_none_or(|b| coded.cost < b.1.cost) {
-                best = Some((*mode, coded));
+        let area = side * side;
+        let luma = grown(preds, MODES.len() * area);
+        let mut screened = [(0u64, 0u8, 0usize); MODES.len()];
+        for (k, ((slot, &mode), pred)) in screened
+            .iter_mut()
+            .zip(&MODES)
+            .zip(luma.chunks_exact_mut(area))
+            .enumerate()
+        {
+            predict_block(mode, &edges, pred);
+            *slot = (self.sad(0, at, pred), mode, k);
+        }
+        screened.sort_unstable();
+        let mut y_mode = None;
+        for &(_, mode, k) in screened.iter().take(LUMA_TRIALS) {
+            let pred = luma.get(k * area..(k + 1) * area).unwrap_or(&[]);
+            self.code_plane(0, at, mode, pred, work, trial_y);
+            if y_mode.is_none() || trial_y.cost < best_y.cost {
+                std::mem::swap(trial_y, best_y);
+                y_mode = Some(mode);
             }
         }
-        let Some((y_mode, luma)) = best else {
+        let Some(y_mode) = y_mode else {
             return (leaf, 0);
         };
-        let y_cost = luma.cost;
+        let y_cost = best_y.cost;
         leaf.y_mode = y_mode;
-        leaf.tx_type = luma.tx;
-        self.write_recon(0, at, &luma.recon);
-        leaf.levels[0] = luma.levels;
-        leaf.eob[0] = luma.eob;
-        // Chroma: both planes share a mode.
+        leaf.tx_type = best_y.tx;
+        self.write_recon(0, at, &best_y.recon);
+        leaf.levels[0] = std::mem::take(&mut best_y.levels);
+        leaf.eob[0] = best_y.eob;
+        // Chroma: both planes share a mode, each mode's u then v.
         let n = side / 2;
+        let area = n * n;
         let (edges_u, edges_v) = (self.pred_edges(1, at), self.pred_edges(2, at));
-        let mut screened: Vec<(u64, u8, Vec<u8>)> = MODES
-            .iter()
-            .map(|&mode| {
-                let mut pred = vec![0u8; n * n * 2];
-                let (u, v) = pred.split_at_mut(n * n);
-                predict_block(mode, &edges_u, u);
-                predict_block(mode, &edges_v, v);
-                let total = self.sad(1, at, u) + self.sad(2, at, v);
-                (total, mode, pred)
-            })
-            .collect();
-        screened.sort_unstable_by_key(|(sad, mode, _)| (*sad, *mode));
-        let mut best: Option<(u8, Coded, Coded)> = None;
-        for (_, mode, pred) in screened.iter().take(CHROMA_TRIALS) {
-            let (pu, pv) = pred.split_at(n * n);
-            let u = self.code_plane(1, at, *mode, pu);
-            let v = self.code_plane(2, at, *mode, pv);
-            if best
-                .as_ref()
-                .is_none_or(|b| u.cost + v.cost < b.1.cost + b.2.cost)
-            {
-                best = Some((*mode, u, v));
+        let chroma = grown(preds, MODES.len() * area * 2);
+        for (k, ((slot, &mode), pred)) in screened
+            .iter_mut()
+            .zip(&MODES)
+            .zip(chroma.chunks_exact_mut(area * 2))
+            .enumerate()
+        {
+            let (u, v) = pred.split_at_mut(area);
+            predict_block(mode, &edges_u, u);
+            predict_block(mode, &edges_v, v);
+            *slot = (self.sad(1, at, u) + self.sad(2, at, v), mode, k);
+        }
+        screened.sort_unstable();
+        let mut uv_mode = None;
+        for &(_, mode, k) in screened.iter().take(CHROMA_TRIALS) {
+            let pred = chroma.get(k * area * 2..(k + 1) * area * 2).unwrap_or(&[]);
+            let (pu, pv) = pred.split_at(area.min(pred.len()));
+            self.code_plane(1, at, mode, pu, work, trial_u);
+            self.code_plane(2, at, mode, pv, work, trial_v);
+            let (trial_cost, best_cost) = (
+                trial_u.cost.saturating_add(trial_v.cost),
+                best_u.cost.saturating_add(best_v.cost),
+            );
+            if uv_mode.is_none() || trial_cost < best_cost {
+                std::mem::swap(trial_u, best_u);
+                std::mem::swap(trial_v, best_v);
+                uv_mode = Some(mode);
             }
         }
-        let Some((uv_mode, u, v)) = best else {
+        let Some(uv_mode) = uv_mode else {
             return (leaf, y_cost);
         };
-        let uv_cost = u.cost + v.cost;
+        let uv_cost = best_u.cost.saturating_add(best_v.cost);
         leaf.uv_mode = uv_mode;
-        self.write_recon(1, at, &u.recon);
-        self.write_recon(2, at, &v.recon);
-        leaf.levels[1] = u.levels;
-        leaf.levels[2] = v.levels;
-        leaf.eob[1] = u.eob;
-        leaf.eob[2] = v.eob;
+        self.write_recon(1, at, &best_u.recon);
+        self.write_recon(2, at, &best_v.recon);
+        leaf.levels[1] = std::mem::take(&mut best_u.levels);
+        leaf.levels[2] = std::mem::take(&mut best_v.levels);
+        leaf.eob[1] = best_u.eob;
+        leaf.eob[2] = best_v.eob;
         leaf.skip = leaf.eob.iter().all(|&e| e == 0);
         // The mode symbols' rate, then the block is applied.
         let mut counter = Counter(0);
         self.mode_symbols(&mut counter, &leaf);
-        let cost = y_cost + uv_cost + self.rd(0, counter.0);
+        let cost = y_cost
+            .saturating_add(uv_cost)
+            .saturating_add(self.rd(0, counter.0));
         self.apply_contexts(&leaf);
         (leaf, cost)
     }
@@ -1646,54 +1738,70 @@ impl Tile {
         total
     }
 
-    /// Codes one plane of a block under a mode from its prediction:
-    /// transform, quantization, reconstruction; nothing is written to
-    /// the tile.
-    fn code_plane(&mut self, plane: usize, at: At, mode: u8, pred: &[u8]) -> Coded {
+    /// Codes one plane of a block under a mode from its prediction into
+    /// `out`: transform, quantization, reconstruction; nothing is written
+    /// to the tile.
+    fn code_plane(
+        &mut self,
+        plane: usize,
+        at: At,
+        mode: u8,
+        pred: &[u8],
+        work: &mut Work,
+        out: &mut Coded,
+    ) {
         let sub = usize::from(plane > 0);
         let n = at.side() >> sub;
         let size = plane_size(at.log2, plane);
         let tx = mode_tx_type(mode, size);
         let x = (at.mi_col * MI) >> sub;
         let y = ((at.mi_row - self.band_mi_row) * MI) >> sub;
-        let mut residual = [0i32; SB * SB / 4];
-        let mut coeffs = [0i32; SB * SB / 4];
-        let (Some(residual), Some(coeffs)) = (residual.get_mut(..n * n), coeffs.get_mut(..n * n))
-        else {
-            return Coded {
-                cost: u64::MAX,
-                tx,
-                levels: Vec::new(),
-                eob: 0,
-                recon: pred.to_vec(),
-            };
-        };
-        if let Some(source) = self.source.get(plane) {
-            for (r, (res, prow)) in residual
-                .chunks_exact_mut(n)
-                .zip(pred.chunks_exact(n))
-                .enumerate()
-            {
-                let srow = source.row(y + r).get(x..x + n).unwrap_or(&[]);
-                for ((d, p), s) in res.iter_mut().zip(prow).zip(srow) {
-                    *d = i32::from(*s) - i32::from(*p);
+        out.tx = tx;
+        out.recon.clear();
+        out.recon.extend_from_slice(pred);
+        // The work blocks hold the last trial's values: every row of the
+        // residual is written and the transforms write every output, so
+        // a prediction or transform of another size is refused.
+        if pred.len() != n * n || size.points() != n {
+            out.cost = u64::MAX;
+            out.levels.clear();
+            out.eob = 0;
+            return;
+        }
+        let (residual, coeffs, dequant) = (
+            grown(&mut work.residual, n * n),
+            grown(&mut work.coeffs, n * n),
+            grown(&mut work.dequant, n * n),
+        );
+        let source = self.source.get(plane);
+        for (r, (res, prow)) in residual
+            .chunks_exact_mut(n)
+            .zip(pred.chunks_exact(n))
+            .enumerate()
+        {
+            match source.and_then(|band| band.row(y + r).get(x..x + n)) {
+                Some(srow) => {
+                    for ((d, p), s) in res.iter_mut().zip(prow).zip(srow) {
+                        *d = i32::from(*s) - i32::from(*p);
+                    }
                 }
+                None => res.fill(0),
             }
         }
         transform::forward(size, tx, residual, coeffs);
-        let (levels, eob) = self.quantize(size, coeffs);
-        let mut recon = pred.to_vec();
+        let eob = self.quantize(size, coeffs, &mut out.levels);
+        out.eob = eob;
         if eob > 0 {
-            let dequant = self.dequantize(size, &levels);
+            self.dequantize(size, &out.levels, dequant);
             let back = residual;
-            transform::inverse(size, tx, &dequant, back);
-            for (rec, b) in recon.iter_mut().zip(back.iter()) {
+            transform::inverse(size, tx, dequant, back);
+            for (rec, b) in out.recon.iter_mut().zip(back.iter()) {
                 *rec = (i32::from(*rec) + b).clamp(0, 255) as u8;
             }
         }
         let mut distortion = 0u64;
         if let Some(source) = self.source.get(plane) {
-            for (r, rrow) in recon.chunks_exact(n).enumerate() {
+            for (r, rrow) in out.recon.chunks_exact(n).enumerate() {
                 let srow = source.row(y + r).get(x..x + n).unwrap_or(&[]);
                 for (rec, s) in rrow.iter().zip(srow) {
                     let d = i64::from(*rec) - i64::from(*s);
@@ -1703,25 +1811,21 @@ impl Tile {
         }
         let mut counter = Counter(0);
         let coded = Levels {
-            levels: &levels,
+            levels: &out.levels,
             eob,
         };
         self.coefficient_symbols(&mut counter, plane, at, mode, tx, coded);
-        Coded {
-            cost: self.rd(distortion, counter.0),
-            tx,
-            levels,
-            eob,
-            recon,
-        }
+        out.cost = self.rd(distortion, counter.0);
     }
 
-    /// Levels by a dead-zone quantizer, and the end of block.
-    fn quantize(&self, size: Size, coeffs: &[i32]) -> (Vec<i32>, usize) {
+    /// Levels by a dead-zone quantizer into `levels`, and the end of
+    /// block.
+    fn quantize(&self, size: Size, coeffs: &[i32], levels: &mut Vec<i32>) -> usize {
         let dc = i64::from(transform::dc_q(self.qindex));
         let ac = i64::from(transform::ac_q(self.qindex));
         let shift = size.dequant_shift();
-        let mut levels = vec![0i32; coeffs.len()];
+        levels.clear();
+        levels.resize(coeffs.len(), 0);
         let mut eob = 0;
         for (c, &pos) in size.scan().iter().enumerate() {
             let pos = usize::from(pos);
@@ -1740,28 +1844,20 @@ impl Tile {
                 }
             }
         }
-        (levels, eob)
+        eob
     }
 
-    /// The spec's dequantization of levels (7.12.3).
-    fn dequantize(&self, size: Size, levels: &[i32]) -> Vec<i32> {
+    /// The spec's dequantization of levels (7.12.3) into `out`.
+    fn dequantize(&self, size: Size, levels: &[i32], out: &mut [i32]) {
         let dc = transform::dc_q(self.qindex);
         let ac = transform::ac_q(self.qindex);
         let shift = size.dequant_shift();
-        levels
-            .iter()
-            .enumerate()
-            .map(|(pos, &level)| {
-                let q = if pos == 0 { dc } else { ac };
-                let dq = ((level.unsigned_abs() * q as u32) & 0xFFFFFF) >> shift;
-                let dq = dq.min(0x8000) as i32;
-                if level < 0 {
-                    -dq
-                } else {
-                    dq.min(0x7FFF)
-                }
-            })
-            .collect()
+        for (pos, (slot, &level)) in out.iter_mut().zip(levels).enumerate() {
+            let q = if pos == 0 { dc } else { ac };
+            let dq = ((level.unsigned_abs() * q as u32) & 0xFFFFFF) >> shift;
+            let dq = dq.min(0x8000) as i32;
+            *slot = if level < 0 { -dq } else { dq.min(0x7FFF) };
+        }
     }
 
     fn write_recon(&mut self, plane: usize, at: At, pixels: &[u8]) {
@@ -2296,6 +2392,14 @@ fn eob_group_start(t: usize) -> usize {
 }
 
 // --------------------------------------------------- prediction kernels
+
+/// The first `len` of a buffer that only grows.
+fn grown<T: Copy + Default>(buffer: &mut Vec<T>, len: usize) -> &mut [T] {
+    if buffer.len() < len {
+        buffer.resize(len, T::default());
+    }
+    buffer.get_mut(..len).unwrap_or(&mut [])
+}
 
 /// A plane's prediction edges for an `n` square: `above[1 + i]` is the
 /// spec's `AboveRow[i]`, `above[0]` its `AboveRow[-1]`, the corner; the

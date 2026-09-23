@@ -1292,11 +1292,12 @@ verified against the decoder before the hash moves. It is fed rows like
 the JPEG encoder and codes a superblock row when one is complete, so
 the export band rules hold; a frame is at most 16384 on an axis. A
 block's prediction edges are read once per plane and every mode is
-predicted from them. Angle deltas, a better distortion measure and
-per-tile scratch buffers in place of the per-trial allocations are the
-performance and fidelity follow-ups; a 24-megapixel export takes over
-ten seconds on one thread and a few on eight (`tests/av1.rs`'s
-`bench`).
+predicted from them into the tile's scratch, which also holds the
+transform's working blocks and each plane's trial and best coding and
+only grows, so a block allocates only the levels its leaf keeps. Angle
+deltas and a better distortion measure are the fidelity follow-ups; a
+24-megapixel export takes over ten seconds on one thread and a few on
+eight (`tests/av1.rs`'s `bench`).
 
 The AVIF (`avif::file`) is the least HEIF file the format asks for and
 every reader expects: `ftyp` with the `avif` brand and `mif1`, `miaf`
