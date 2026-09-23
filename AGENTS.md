@@ -16,6 +16,7 @@ needs them:
 - Before changing or adding `unsafe`, read `UNSAFE.md` and the touched crate's
   normative document.
 - For login or credentials, read `td-login/THREAT-MODEL.md`.
+- For mail serving, storage, or submission, read `td-mta/DESIGN.md`.
 - For disk encryption or session unlock, read `td-install/ENCRYPTION.md`.
 - For compositor/UI, service supervision, or installation, read the matching
   `td-compositor/DESIGN.md`, `td-svc/DESIGN.md`, or `td-install/DESIGN.md`;
