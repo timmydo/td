@@ -405,7 +405,10 @@ fn parse_part(number: usize, rest: &str) -> Result<Part, DraftError> {
     })
 }
 
-fn tag_attributes(number: usize, body: &str) -> Result<Vec<(String, String)>, DraftError> {
+pub(crate) fn tag_attributes(
+    number: usize,
+    body: &str,
+) -> Result<Vec<(String, String)>, DraftError> {
     let mut out = Vec::new();
     let mut rest = body.trim_start();
     while !rest.is_empty() {

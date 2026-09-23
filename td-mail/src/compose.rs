@@ -654,10 +654,16 @@ pub(crate) fn replace_draft(path: &Path, bytes: &[u8]) -> io::Result<()> {
 /// of the drafts directory into the `sent` directory beside it
 /// (`.../td-mail/sent` for `.../td-mail/drafts`), made private as the
 /// drafts directory is; answers the draft's new path. The sidecar must
-/// be beside the draft. Both move or neither: a name already there, the
-/// draft's or the sidecar's, is refused rather than overwritten before
-/// anything moves, and a sidecar whose move fails has the draft moved
-/// back, the error naming both paths when even that fails.
+/// be a directory, not a link, beside the draft. Both move or neither:
+/// a name already there, the draft's or the sidecar's, is refused rather
+/// than overwritten before anything moves, and a sidecar whose move
+/// fails (a link spelled with a trailing `/` among them) has the draft
+/// moved back, the error naming both paths when even that fails. Once
+/// both have moved, the retired draft is settled as what went
+/// (`settle_retired`): its tags pointed at the sidecar's place in `sent`
+/// and, when the sidecar is the draft's own (`attach::sidecar_for`), its
+/// files no tag names removed, best effort, since the retirement itself
+/// has happened.
 pub fn retire_draft(path: &Path, attachment_dir: Option<&Path>) -> io::Result<PathBuf> {
     let sent = crate::submit::sent_dir_for(path).ok_or_else(|| {
         io::Error::new(
@@ -702,6 +708,15 @@ pub fn retire_draft(path: &Path, attachment_dir: Option<&Path>) -> io::Result<Pa
                     ),
                 ));
             }
+            if !fs::symlink_metadata(dir).is_ok_and(|m| m.is_dir()) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "the attachment directory {} is not a directory",
+                        dir.display()
+                    ),
+                ));
+            }
             let dir_name = dir.file_name().ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::InvalidInput,
@@ -719,6 +734,15 @@ pub fn retire_draft(path: &Path, attachment_dir: Option<&Path>) -> io::Result<Pa
         }
         None => None,
     };
+    // Which tags name files in the sidecar, read before it moves; and
+    // whether it is the draft's own, the only one whose files are pruned.
+    let inside = sidecar
+        .as_ref()
+        .map(|(dir, _)| tags_inside(path, dir))
+        .unwrap_or_default();
+    let own = sidecar.as_ref().is_some_and(|(dir, _)| {
+        crate::attach::sidecar_for(path).is_ok_and(|own| own.file_name() == dir.file_name())
+    });
     fs::rename(path, &target)?;
     if let Some((dir, dir_target)) = sidecar {
         if let Err(e) = fs::rename(dir, &dir_target) {
@@ -738,8 +762,217 @@ pub fn retire_draft(path: &Path, attachment_dir: Option<&Path>) -> io::Result<Pa
             };
             return Err(io::Error::new(e.kind(), detail));
         }
+        settle_retired(&target, &inside, &dir_target, own);
     }
     Ok(target)
+}
+
+/// Each `<#part>` tag's absolute `filename` in the draft at `draft` that
+/// names a file inside the sidecar `dir`, however either is spelled,
+/// with its path under `dir`: the filename's directory resolved, its own
+/// name kept, so a link inside the sidecar is not followed out of it.
+/// Read before the sidecar moves; a filename climbing out of it (`..`)
+/// or naming the sidecar itself is not inside.
+fn tags_inside(draft: &Path, dir: &Path) -> Vec<(String, PathBuf)> {
+    let (Ok(text), Ok(root)) = (fs::read_to_string(draft), fs::canonicalize(dir)) else {
+        return Vec::new();
+    };
+    let mut inside: Vec<(String, PathBuf)> = Vec::new();
+    for attributes in text.split('\n').filter_map(part_attributes) {
+        for (key, value) in attributes {
+            if key != "filename" || inside.iter().any(|(named, _)| *named == value) {
+                continue;
+            }
+            let file = Path::new(&value);
+            let (Some(parent), Some(name)) = (file.parent(), file.file_name()) else {
+                continue;
+            };
+            if !file.is_absolute() {
+                continue;
+            }
+            let Ok(parent) = fs::canonicalize(parent) else {
+                continue;
+            };
+            let resolved = parent.join(name);
+            let Ok(rest) = resolved.strip_prefix(&root) else {
+                continue;
+            };
+            let plain = rest.components().count() > 0
+                && rest
+                    .components()
+                    .all(|part| matches!(part, std::path::Component::Normal(_)));
+            if plain {
+                let rest = rest.to_path_buf();
+                inside.push((value, rest));
+            }
+        }
+    }
+    inside
+}
+
+/// The attributes of `line` when it is a `<#part>` tag as the send reads
+/// one: the tag name, then a space, a tab or `>`, the line ending in `>`.
+fn part_attributes(line: &str) -> Option<Vec<(String, String)>> {
+    let body = line.strip_prefix("<#part")?;
+    if !body.starts_with([' ', '\t', '>']) {
+        return None;
+    }
+    let inner = body.trim_end().strip_suffix('>')?;
+    crate::submit::tag_attributes(0, inner).ok()
+}
+
+/// The retired draft at `target` made to name its attachments where they
+/// went, its sidecar now `sidecar` in `sent`: each tag `inside` the
+/// sidecar as it was is pointed inside `sidecar`'s resolved path
+/// (`repoint_parts`), the draft replaced whole; then, when the sidecar is
+/// the draft's `own`, its files no tag names, which did not go, are
+/// removed (`prune_unsent`). Best effort, logged: a draft that is not a
+/// regular UTF-8 file, or whose rewrite fails, is left as it moved and
+/// its sidecar whole.
+fn settle_retired(target: &Path, inside: &[(String, PathBuf)], sidecar: &Path, own: bool) {
+    let read = match fs::symlink_metadata(target) {
+        Ok(m) if m.is_file() => fs::read_to_string(target),
+        Ok(_) => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "not a regular file",
+        )),
+        Err(e) => Err(e),
+    };
+    let text = match read {
+        Ok(text) => text,
+        Err(e) => {
+            crate::log_warn!(
+                "Left {} and every file in {} as they moved: {}",
+                target.display(),
+                sidecar.display(),
+                e
+            );
+            return;
+        }
+    };
+    let to = fs::canonicalize(sidecar).unwrap_or_else(|_| sidecar.to_path_buf());
+    let settled = repoint_parts(&text, inside, &to);
+    if settled != text {
+        if let Err(e) = replace_draft(target, settled.as_bytes()) {
+            crate::log_error!(
+                "Could not point {}'s attachments into {}: {}",
+                target.display(),
+                to.display(),
+                e
+            );
+            return;
+        }
+    }
+    if own {
+        prune_unsent(&settled, &to);
+    } else {
+        crate::log_warn!(
+            "Kept every file in {}: it is not {}'s own attachment directory",
+            to.display(),
+            target.display()
+        );
+    }
+}
+
+/// The draft's text with each `<#part>` tag whose `filename` is one of
+/// `inside` pointed inside `to` instead: the tag read as the send reads
+/// it (`part_attributes`) and written again with its attributes quoted,
+/// a line's `\r` kept. A tag naming a file elsewhere, one MML cannot
+/// carry once pointed, and every other line, quoted `<#!` ones included,
+/// are as written.
+fn repoint_parts(text: &str, inside: &[(String, PathBuf)], to: &Path) -> String {
+    let lines: Vec<String> = text
+        .split('\n')
+        .map(|line| repoint_line(line, inside, to).unwrap_or_else(|| line.to_string()))
+        .collect();
+    lines.join("\n")
+}
+
+fn repoint_line(line: &str, inside: &[(String, PathBuf)], to: &Path) -> Option<String> {
+    let mut attributes = part_attributes(line)?;
+    let mut changed = false;
+    for (key, value) in attributes.iter_mut() {
+        if key != "filename" {
+            continue;
+        }
+        let Some((_, rest)) = inside.iter().find(|(named, _)| named == value) else {
+            continue;
+        };
+        *value = to.join(rest).to_str()?.to_string();
+        changed = true;
+    }
+    if !changed
+        || attributes
+            .iter()
+            .any(|(_, value)| !valid_mml_attribute(value))
+    {
+        return None;
+    }
+    let mut out = String::from("<#part");
+    for (key, value) in &attributes {
+        out.push_str(&format!(" {key}=\"{value}\""));
+    }
+    out.push('>');
+    if line.ends_with('\r') {
+        out.push('\r');
+    }
+    Some(out)
+}
+
+/// The regular files in the sidecar `dir` that no `<#part>` tag of the
+/// retired draft names, removed: they were attached and their tags taken
+/// out, so they did not go. A tag names a file by what it opens, so the
+/// match is by file identity (device and inode), not by how the path is
+/// spelled. Nothing is removed when the draft does not read back as a
+/// send, or when a tag names a file that cannot be found, since then
+/// nothing says for certain what went; a file that cannot be removed is
+/// logged and stays.
+fn prune_unsent(text: &str, dir: &Path) {
+    use std::os::unix::fs::MetadataExt;
+    let outgoing = match crate::submit::parse_draft(text) {
+        Ok(outgoing) => outgoing,
+        Err(e) => {
+            crate::log_warn!(
+                "Kept every file in {}: the draft does not read back: {}",
+                dir.display(),
+                e
+            );
+            return;
+        }
+    };
+    let mut named = Vec::with_capacity(outgoing.parts.len());
+    for part in &outgoing.parts {
+        match fs::metadata(&part.path) {
+            Ok(m) => named.push((m.dev(), m.ino())),
+            Err(e) => {
+                crate::log_warn!(
+                    "Kept every file in {}: {} is not found: {}",
+                    dir.display(),
+                    part.path.display(),
+                    e
+                );
+                return;
+            }
+        }
+    }
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) => {
+            crate::log_warn!("Kept every file in {}: {}", dir.display(), e);
+            return;
+        }
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(m) = fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if m.is_file() && !named.contains(&(m.dev(), m.ino())) {
+            if let Err(e) = fs::remove_file(&path) {
+                crate::log_error!("Could not remove the unsent {}: {}", path.display(), e);
+            }
+        }
+    }
 }
 
 fn draft_dir() -> io::Result<PathBuf> {
@@ -833,6 +1066,13 @@ mod tests {
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
         assert!(err.to_string().contains("is not beside the draft"), "{err}");
         assert!(other.exists() && elsewhere.exists(), "neither moved");
+        // Nor is a link beside it, whatever it points at.
+        let pointer = drafts.join("td-mail-att-5-6-link");
+        std::os::unix::fs::symlink(&elsewhere, &pointer)?;
+        let err = retire_draft(&other, Some(&pointer)).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("is not a directory"), "{err}");
+        assert!(other.exists() && pointer.exists(), "neither moved");
 
         // Without a sidecar, or with one that is not there, the draft
         // moves alone.
@@ -843,6 +1083,153 @@ mod tests {
         assert!(!lone.exists());
 
         fs::remove_dir_all(&root)
+    }
+
+    /// A retired draft names its attachments in `sent`, and a copy no tag
+    /// names, which was not sent, is left out; a tag naming a file
+    /// elsewhere and a quoted line are as written.
+    #[test]
+    fn a_retired_draft_names_its_attachments_where_they_went() -> io::Result<()> {
+        let scratch = std::env::temp_dir().join(format!(
+            "td-mail-retire-parts-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        fs::DirBuilder::new().mode(0o700).create(&scratch)?;
+        // The tags spell the sidecar by its real path.
+        let root = fs::canonicalize(&scratch)?;
+        let drafts = root.join("td-mail/drafts");
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&drafts)?;
+        let sidecar = drafts.join("td-mail-att-7-8");
+        fs::DirBuilder::new().mode(0o700).create(&sidecar)?;
+        fs::write(sidecar.join("sent.pdf"), "s")?;
+        fs::write(sidecar.join("also.txt"), "a")?;
+        fs::write(sidecar.join("dropped.txt"), "d")?;
+        fs::write(sidecar.join("up.txt"), "u")?;
+        fs::write(sidecar.join("alias.txt"), "l")?;
+        fs::write(sidecar.join("crlf.txt"), "c")?;
+        // Named only through a hard link outside: kept, as what it opens
+        // went.
+        fs::write(sidecar.join("linked.txt"), "h")?;
+        let hard = root.join("hard.txt");
+        fs::hard_link(sidecar.join("linked.txt"), &hard)?;
+        // A sibling whose name the sidecar's is a prefix of.
+        let sibling = drafts.join("td-mail-att-7-8x");
+        fs::DirBuilder::new().mode(0o700).create(&sibling)?;
+        fs::write(sibling.join("near.txt"), "n")?;
+        let outside = root.join("outside.txt");
+        fs::write(&outside, "o")?;
+        let s = sidecar.display();
+        let o = outside.display();
+        let x = sibling.display();
+        let h = hard.display();
+        let link = root.join("root-link");
+        std::os::unix::fs::symlink(&root, &link)?;
+        let aliased = link.join("td-mail/drafts/td-mail-att-7-8");
+        let l = aliased.display();
+        let draft = drafts.join("td-mail-draft-7-8.eml");
+        let head = "From: me@example.com\nTo: you@example.com\nSubject: s\n\
+                    --text follows this line--\nhi\n";
+        let text = format!(
+            "{head}<#!part filename=\"{s}/dropped.txt\">\n\
+             <#part type=\"application/pdf\" filename=\"{s}/sent.pdf\" disposition=\"attachment\">\n<#/part>\n\
+             <#part type=text/plain\tfilename = {s}/also.txt>\n<#/part>\n\
+             <#part type=\"text/plain\" filename=\"{o}\" description=\"see filename={s}/up.txt\">\n<#/part>\n\
+             <#part type=\"text/plain\" filename=\"{x}/near.txt\">\n<#/part>\n\
+             <#part type=\"text/plain\" filename=\"{l}/alias.txt\">\n<#/part>\n\
+             <#part type=\"text/plain\" filename=\"{s}/crlf.txt\">\r\n<#/part>\r\n\
+             <#part type=\"text/plain\" filename=\"{h}\">\n<#/part>\n\
+             <#part type=\"text/plain\" filename=\"{s}/up.txt\">\n<#/part>\n"
+        );
+        fs::write(&draft, &text)?;
+
+        // The draft and its sidecar spelled another way than most tags
+        // spell them: through a link to the root, and a `.`; one tag
+        // spells it through the link.
+        let linked = link.join("td-mail/drafts");
+        let retired = retire_draft(
+            &linked.join("td-mail-draft-7-8.eml"),
+            Some(&linked.join(".").join("td-mail-att-7-8")),
+        )?;
+        // Pointed at the sidecar's resolved place.
+        let moved = root.join("td-mail/sent/td-mail-att-7-8");
+        let m = moved.display();
+        let expected = format!(
+            "{head}<#!part filename=\"{s}/dropped.txt\">\n\
+             <#part type=\"application/pdf\" filename=\"{m}/sent.pdf\" disposition=\"attachment\">\n<#/part>\n\
+             <#part type=\"text/plain\" filename=\"{m}/also.txt\">\n<#/part>\n\
+             <#part type=\"text/plain\" filename=\"{o}\" description=\"see filename={s}/up.txt\">\n<#/part>\n\
+             <#part type=\"text/plain\" filename=\"{x}/near.txt\">\n<#/part>\n\
+             <#part type=\"text/plain\" filename=\"{m}/alias.txt\">\n<#/part>\n\
+             <#part type=\"text/plain\" filename=\"{m}/crlf.txt\">\r\n<#/part>\r\n\
+             <#part type=\"text/plain\" filename=\"{h}\">\n<#/part>\n\
+             <#part type=\"text/plain\" filename=\"{m}/up.txt\">\n<#/part>\n"
+        );
+        assert_eq!(fs::read_to_string(&retired)?, expected);
+        assert_eq!(fs::read_to_string(moved.join("sent.pdf"))?, "s");
+        assert_eq!(fs::read_to_string(moved.join("also.txt"))?, "a");
+        assert_eq!(fs::read_to_string(moved.join("up.txt"))?, "u");
+        assert_eq!(fs::read_to_string(moved.join("alias.txt"))?, "l");
+        assert_eq!(fs::read_to_string(moved.join("crlf.txt"))?, "c");
+        assert_eq!(fs::read_to_string(moved.join("linked.txt"))?, "h");
+        assert!(!moved.join("dropped.txt").exists(), "not sent, left out");
+        assert_eq!(
+            fs::symlink_metadata(&retired)?.permissions().mode() & 0o777,
+            0o600
+        );
+        assert!(!draft.exists() && !sidecar.exists() && outside.exists());
+        assert!(sibling.join("near.txt").exists());
+
+        // A filename climbing out of the sidecar, or naming the sidecar
+        // itself, is not inside it.
+        let probe = root.join("probe.eml");
+        fs::write(
+            &probe,
+            format!(
+                "<#part type=\"text/plain\" filename=\"{m}/../beside.txt\">\n\
+                 <#part type=\"text/plain\" filename=\"{m}/.\">\n\
+                 <#part type=\"text/plain\" filename=\"{m}/sent.pdf\">\n"
+            ),
+        )?;
+        assert_eq!(
+            tags_inside(&probe, &moved),
+            vec![(format!("{m}/sent.pdf"), PathBuf::from("sent.pdf"))]
+        );
+
+        // A tag naming a file that cannot be found keeps the sidecar whole.
+        let other = drafts.join("td-mail-draft-9.eml");
+        let other_sidecar = drafts.join("td-mail-att-9");
+        fs::DirBuilder::new().mode(0o700).create(&other_sidecar)?;
+        fs::write(other_sidecar.join("kept.txt"), "k")?;
+        let gone = root.join("gone.txt");
+        fs::write(
+            &other,
+            format!(
+                "{head}<#part type=\"text/plain\" filename=\"{}\">\n<#/part>\n",
+                gone.display()
+            ),
+        )?;
+        retire_draft(&other, Some(&other_sidecar))?;
+        let kept = root.join("td-mail/sent/td-mail-att-9/kept.txt");
+        assert_eq!(fs::read_to_string(kept)?, "k");
+
+        // A directory that is not the draft's own sidecar moves with it
+        // but keeps its files.
+        let tagless = drafts.join("td-mail-draft-10.eml");
+        fs::write(&tagless, head)?;
+        let theirs = drafts.join("td-mail-att-11");
+        fs::DirBuilder::new().mode(0o700).create(&theirs)?;
+        fs::write(theirs.join("theirs.txt"), "t")?;
+        retire_draft(&tagless, Some(&theirs))?;
+        let kept = root.join("td-mail/sent/td-mail-att-11/theirs.txt");
+        assert_eq!(fs::read_to_string(kept)?, "t");
+        fs::remove_dir_all(&scratch)
     }
 
     /// A draft is replaced whole: the bytes land under the path, a

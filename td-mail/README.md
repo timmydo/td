@@ -91,8 +91,8 @@ own at the end of the draft, unsaved as any edit is. The send reads
 the copy, so a file changed or removed after it was attached does not
 change the message, and the copy retires with the draft to `sent`; a
 copy whose tag is deleted from the draft, or undone, stays in the
-sidecar unsent and retires with it all the same, so the sidecar holds
-what was attached and the draft's tags say what went. A copy is also
+sidecar while the draft is one and is removed when it is sent, so the
+retired sidecar holds what went. A copy is also
 named for the recipient without a bidirectional control a name may
 carry, so it cannot show another extension than it has.
 A tag written by hand still attaches the file it names, read when the
@@ -170,12 +170,22 @@ refused at once) is the status row's and the draft is the pane's again
 to be mended. Sent, the draft and its `td-mail-att-ID` sidecar are
 moved together, or not at all, to `$XDG_STATE_HOME/td-mail/sent` (the
 `sent` directory beside `drafts`, made private as it is) and the view
-closes; the log records the message id, the submission id, the mailbox
-the copy was kept in and the retired path. A sent draft whose name is
-already in `sent` is not overwritten: the draft stays open, sent and
-still held, the status saying so; Send then retries the move alone,
-never the send, and Close puts the draft away. Nothing deletes a
-retired draft. The CLI's `send_draft` sends and retires the same way.
+closes. Once both have moved, the retired draft names its attachments
+where they now are: each tag whose `filename` is inside the sidecar,
+however the path is spelled, is pointed into `sent` and the draft
+replaced whole (a tag naming a file elsewhere, or climbing out of the
+sidecar with `..`, is left as written); then a file in the sidecar no
+tag names, which did not go, is removed, matched by what each tag
+opens rather than by its spelling, and only when the draft reads back
+as a send and every tag it names is found. Both are best effort and
+logged, since the move has happened. The log records the message id,
+the submission id, the mailbox the copy was kept in and the retired
+path.
+A sent draft whose name is already in `sent` is not overwritten: the
+draft stays open, sent and still held, the status saying so; Send then
+retries the move alone, never the send, and Close puts the draft away.
+Nothing deletes a retired draft. The CLI's `send_draft` sends and
+retires the same way.
 
 A reply or forward is written so it reads back as the message it came
 from: a display name with a comma, quote or bracket is quoted in the
