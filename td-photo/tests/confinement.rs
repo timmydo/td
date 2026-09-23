@@ -34,6 +34,7 @@ const PURE: &[&str] = &[
     "camera.rs",
     "cdf.rs",
     "color.rs",
+    "deblock.rs",
     "develop.rs",
     "image.rs",
     "jpeg.rs",

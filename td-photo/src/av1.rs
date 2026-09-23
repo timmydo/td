@@ -12,14 +12,15 @@
 //! default; one transform per plane per block; the multi-symbol
 //! arithmetic coder with adapting CDFs from the defaults; uniform tile
 //! columns by the frame's size alone, which the threads spread over.
-//! Loop filter, CDEF, restoration, superres, film grain and
-//! screen-content tools stay off, so the decoder side is the smallest
-//! AV1 has. `transform` holds the transforms, quantizers and scans,
-//! `cdf` the default CDFs.
+//! The deblocking filter is on at a level from the quantizer; CDEF,
+//! restoration, superres, film grain and screen-content tools stay off.
+//! `transform` holds the transforms, quantizers and scans, `cdf` the
+//! default CDFs, `deblock` the filter.
 
 use std::fmt;
 
 use crate::cdf;
+use crate::deblock;
 use crate::transform::{self, Size, TxType};
 
 /// The longest axis: what `image::MAX_AXIS` allows, which the level
@@ -883,7 +884,7 @@ fn sequence_header(geometry: &Geometry) -> Vec<u8> {
 
 /// The frame OBU's header bits, to the byte alignment before the tile
 /// group.
-fn frame_header(geometry: &Geometry, qindex: u8) -> Bits {
+fn frame_header(geometry: &Geometry, qindex: u8, levels: deblock::Levels) -> Bits {
     let mut b = Bits::new();
     b.flag(false);
     b.flag(false);
@@ -896,14 +897,36 @@ fn frame_header(geometry: &Geometry, qindex: u8) -> Bits {
     b.flag(false);
     b.flag(false);
     b.flag(false);
-    b.put(6, 0);
-    b.put(6, 0);
+    // loop_filter_params: luma's two levels, the chroma ones when luma
+    // filters at all, no sharpness and no deltas.
+    b.put(6, u32::from(levels.luma[0]));
+    b.put(6, u32::from(levels.luma[1]));
+    if levels.luma != [0, 0] {
+        b.put(6, u32::from(levels.u));
+        b.put(6, u32::from(levels.v));
+    }
     b.put(3, 0);
     b.flag(false);
     b.flag(false);
     b.flag(true);
     b.align();
     b
+}
+
+/// The deblocking level of a frame from its quantizer, every plane and
+/// direction alike: libaom's for an 8-bit key frame (`LPF_PICK_FROM_Q`,
+/// a linear fit of the AC step to the levels its search chose) half
+/// again, which measured better on a photo than the fit at every rate
+/// and as well as double it but for RGB fidelity.
+fn filter_levels(qindex: u8) -> deblock::Levels {
+    let q = i64::from(transform::ac_q(qindex));
+    let fit = (q * 17563 - 421574 + (1 << 17)) >> 18;
+    let level = (fit * 3 / 2).clamp(0, 63) as u8;
+    deblock::Levels {
+        luma: [level, level],
+        u: level,
+        v: level,
+    }
 }
 
 // ------------------------------------------------------------ planes
@@ -1293,6 +1316,9 @@ struct Tile {
     /// `screen`'s rate weight, `16 isqrt(rdmult * 128)`.
     screen_weight: u64,
     scratch: Scratch,
+    /// The band's block sizes, a luma 4x4 each (the log2 of the side),
+    /// `width / MI` to a row: what the deblocking filter reads.
+    sizes: Vec<u8>,
     /// Saved states' context and pixel copies, returned by `restore` and
     /// `recycle`.
     spare_segments: Vec<Vec<u8>>,
@@ -1345,6 +1371,7 @@ impl Tile {
             rdmult,
             screen_weight: 16 * (rdmult * 128).isqrt(),
             scratch: Scratch::default(),
+            sizes: vec![3; SB_MI * (width / MI)],
             spare_segments: Vec::new(),
             spare_pixels: Vec::new(),
         }
@@ -2434,6 +2461,21 @@ impl Tile {
                 }
                 self.coder = coder;
                 self.apply_contexts(&leaf);
+                self.record_size(leaf.at);
+            }
+        }
+    }
+
+    /// Records a coded block's size over the 4x4s it covers in the band.
+    fn record_size(&mut self, at: At) {
+        let cols = self.width / MI;
+        let units = at.units();
+        for r in 0..units {
+            let row = at.mi_row - self.band_mi_row + r;
+            let start = row * cols + at.mi_col;
+            let end = (start + units).min((row + 1) * cols);
+            if let Some(slots) = self.sizes.get_mut(start..end) {
+                slots.fill(at.log2 as u8);
             }
         }
     }
@@ -2679,8 +2721,19 @@ pub struct Encoder {
     /// Coded tiles' bytes in tile order.
     coded: Vec<Vec<u8>>,
     sb_row: usize,
-    /// The reconstruction, gathered when asked for.
-    reconstruction: Option<Reconstruction>,
+    /// The frame's deblocking levels.
+    levels: deblock::Levels,
+    /// The reconstruction as a decoder holds it before the filter,
+    /// gathered when asked for.
+    kept: Option<Kept>,
+}
+
+/// The reconstruction before deblocking: the planes padded to whole
+/// superblocks, which hold every pixel the filter reads, and each luma
+/// 4x4's block size (the log2 of its side), `sb_cols * SB_MI` to a row.
+struct Kept {
+    planes: [Vec<u8>; 3],
+    sizes: Vec<u8>,
 }
 
 impl Encoder {
@@ -2710,18 +2763,18 @@ impl Encoder {
             tiles: Vec::new(),
             coded: Vec::new(),
             sb_row: 0,
-            reconstruction: None,
+            levels: filter_levels(qindex(quality)),
+            kept: None,
         })
     }
 
     /// Asks for the reconstruction to be kept for `finish_with`.
     pub fn keep_reconstruction(&mut self) {
-        let (w, h) = (self.geometry.width, self.geometry.height);
-        let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
-        self.reconstruction = Some(Reconstruction {
-            width: w,
-            height: h,
-            planes: [vec![0; w * h], vec![0; cw * ch], vec![0; cw * ch]],
+        let (w, h) = (self.geometry.sb_cols * SB, self.geometry.sb_rows * SB);
+        let cells = self.geometry.sb_cols * SB_MI * self.geometry.sb_rows * SB_MI;
+        self.kept = Some(Kept {
+            planes: [vec![0; w * h], vec![0; w * h / 4], vec![0; w * h / 4]],
+            sizes: vec![3; cells],
         });
     }
 
@@ -2778,7 +2831,7 @@ impl Encoder {
             OBU_SEQUENCE_HEADER,
             &sequence_header(&self.geometry),
         );
-        let mut frame = frame_header(&self.geometry, self.qindex).bytes;
+        let mut frame = frame_header(&self.geometry, self.qindex, self.levels).bytes;
         let tiles = self.geometry.tile_cols() * self.geometry.tile_rows();
         if tiles > 1 {
             // tile_start_and_end_present_flag, then the alignment.
@@ -2792,7 +2845,47 @@ impl Encoder {
             frame.extend_from_slice(data);
         }
         obu(&mut out, OBU_FRAME, &frame);
-        Ok((out, self.reconstruction.take()))
+        let reconstruction = self.kept.take().map(|kept| self.reconstruct(kept));
+        Ok((out, reconstruction))
+    }
+
+    /// The kept frame filtered as a decoder filters it, then cropped to
+    /// the picture.
+    fn reconstruct(&self, kept: Kept) -> Reconstruction {
+        let Kept { mut planes, sizes } = kept;
+        let (width, height) = (self.geometry.width, self.geometry.height);
+        let stride = self.geometry.sb_cols * SB;
+        let mi_stride = self.geometry.sb_cols * SB_MI;
+        let [y, u, v] = &mut planes;
+        let plane = |data, sub: usize| deblock::Plane {
+            data,
+            stride: stride >> sub,
+            width: width.div_ceil(1 << sub),
+            height: height.div_ceil(1 << sub),
+        };
+        deblock::filter(
+            [plane(y, 0), plane(u, 1), plane(v, 1)],
+            self.levels,
+            |mi_row, mi_col| {
+                sizes
+                    .get(mi_row * mi_stride + mi_col)
+                    .map_or(3, |&s| u32::from(s))
+            },
+        );
+        let crop = |padded: &[u8], sub: usize| -> Vec<u8> {
+            let (w, h) = (width.div_ceil(1 << sub), height.div_ceil(1 << sub));
+            padded
+                .chunks_exact(stride >> sub)
+                .take(h)
+                .flat_map(|row| row.get(..w).unwrap_or(&[]))
+                .copied()
+                .collect()
+        };
+        Reconstruction {
+            width,
+            height,
+            planes: [crop(y, 0), crop(u, 1), crop(v, 1)],
+        }
     }
 
     /// Converts a band of `rows` RGB rows into the planes, padded, and
@@ -2850,31 +2943,30 @@ impl Encoder {
         }
         let items: Vec<&mut Tile> = self.tiles.iter_mut().collect();
         crate::develop::bands(items, self.threads, |tile| tile.encode_sb_row(band_mi_row));
-        if let Some(reconstruction) = self.reconstruction.as_mut() {
-            let y0 = self.sb_row * SB;
+        if let Some(kept) = self.kept.as_mut() {
+            let stride = self.geometry.sb_cols * SB;
+            let mi_stride = self.geometry.sb_cols * SB_MI;
             for tile in &self.tiles {
                 for (plane, band) in tile.recon.iter().enumerate() {
                     let sub = usize::from(plane > 0);
-                    let (w, h) = (
-                        reconstruction.width.div_ceil(1 << sub),
-                        reconstruction.height.div_ceil(1 << sub),
-                    );
-                    let x0 = tile.x0 >> sub;
-                    let Some(out) = reconstruction.planes.get_mut(plane) else {
+                    let (w, x0) = (tile.width >> sub, tile.x0 >> sub);
+                    let Some(out) = kept.planes.get_mut(plane) else {
                         continue;
                     };
                     for r in 0..(SB >> sub) {
-                        let y = (y0 >> sub) + r;
-                        if y >= h {
-                            break;
-                        }
-                        let width = (tile.width >> sub).min(w.saturating_sub(x0));
-                        if let (Some(src), Some(dst)) = (
-                            band.row(r + 1).get(..width),
-                            out.get_mut(y * w + x0..y * w + x0 + width),
-                        ) {
+                        let at = (((self.sb_row * SB) >> sub) + r) * (stride >> sub) + x0;
+                        if let (Some(src), Some(dst)) =
+                            (band.row(r + 1).get(..w), out.get_mut(at..at + w))
+                        {
                             dst.copy_from_slice(src);
                         }
+                    }
+                }
+                let cols = tile.width / MI;
+                for (r, row) in tile.sizes.chunks_exact(cols).enumerate() {
+                    let at = (band_mi_row + r) * mi_stride + tile.x0 / MI;
+                    if let Some(dst) = kept.sizes.get_mut(at..at + cols) {
+                        dst.copy_from_slice(row);
                     }
                 }
             }
@@ -3274,11 +3366,24 @@ mod tests {
         let g = Geometry::new(64, 48).unwrap();
         let seq = sequence_header(&g);
         assert_eq!(seq.len(), 12);
-        let header = frame_header(&g, 21);
+        let header = frame_header(&g, 21, deblock::Levels::default());
         // Nine flags and a byte of quantizer, six-bit filter levels and
         // the rest: the header is byte-aligned at a known length.
         assert_eq!(header.used, 0);
         assert_eq!(header.bytes.len(), 5);
+        // A filtering frame adds the two chroma levels' twelve bits.
+        let levels = deblock::Levels {
+            luma: [5, 6],
+            u: 7,
+            v: 8,
+        };
+        assert_eq!(frame_header(&g, 21, levels).bytes.len(), 6);
         assert_eq!(qindex(92), 22);
+        // The from-quantizer levels: none at the finest steps, the
+        // most at the coarsest, rising with the step between.
+        assert_eq!(filter_levels(qindex(100)), deblock::Levels::default());
+        assert_eq!(filter_levels(255).luma, [63, 63]);
+        let steps: Vec<u8> = [92, 60, 30].map(|q| filter_levels(qindex(q)).u).to_vec();
+        assert!(steps.windows(2).all(|w| w[0] < w[1]), "{steps:?}");
     }
 }

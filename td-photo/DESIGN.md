@@ -31,9 +31,9 @@ the look in it, and the full-resolution bilinear demosaic export runs in row
 bands (`develop`), the RGB image buffers and PPM writer and reader
 (`image`), the baseline JPEG decoder for the embedded previews with its
 reduced-transform scaling and the baseline encoder export writes through
-(`jpeg`), the AV1 still-picture encoder (`av1` over `transform` and
-`cdf`) and the AVIF container (`avif`) export writes through instead when
-asked, the thumbnail rule and the thumbnail cache,
+(`jpeg`), the AV1 still-picture encoder (`av1` over `transform`, `cdf`
+and `deblock`) and the AVIF container (`avif`) export writes through
+instead when asked, the thumbnail rule and the thumbnail cache,
 the library's sidecar grammar, roll rules and dating rule (`library`), the cull
 and develop controller over td-ui's driven seam with its action table and scene
 (`ui`), the
@@ -1245,7 +1245,7 @@ category and AC run/size once) with no code of all ones, which is what the
 decoder refuses; the clamp is pinned by a unit test over `forward`.
 
 The AVIF export codes the frame with the crate's own AV1 encoder
-(`av1::Encoder`, over `transform` and `cdf`), pure `std` like the rest:
+(`av1::Encoder`, over `transform`, `cdf` and `deblock`), pure `std`:
 a still picture (`still_picture` and `reduced_still_picture_header`
 set), main profile, 8-bit 4:2:0 at full range in BT.601 (`Y = (77R +
 150G + 29B + 128) >> 8`, the chroma the mean of each 2x2 offset by 128),
@@ -1258,8 +1258,8 @@ transform the block's size (`TX_MODE_LARGEST`, the reduced transform
 set: a luma block below 32 may signal any of the four DCT and ADST
 pairs, chroma's is the one its mode implies, `DCT_DCT` at 32), the
 thirteen intra modes without an angle delta, filter, palette or
-chroma-from-luma, no loop filter, CDEF, restoration, superres or film
-grain, and the symbol adaptation the spec runs by default. The quality
+chroma-from-luma, deblocking but no CDEF, restoration, superres or
+film grain, and the symbol adaptation the spec runs by default. The quality
 maps to `qindex` as `255 - ((q - 1) * 254 + 49) / 99`, the dead-zone
 quantiser rounds the DC at half a step and each AC at three eighths,
 and a block's mode is chosen by rate-distortion (`(16 D << 7) +
@@ -1290,11 +1290,20 @@ columns admit the frame. `av1::av1c` and the colour constants are the
 configuration the container repeats, from the same values the sequence
 header writes. The transforms are the spec's integer butterflies, each
 a table of stages that `butterfly!` expands to straight code over fixed
-arrays, so the reconstruction the encoder keeps is what any conforming
-decoder shows; `tests/av1.rs` holds that to dav1d when
-one is named (`TD_TEST_DAV1D`), and holds three small streams to the
-hashes of bytes dav1d decoded, so a change to any emitted symbol is
-verified against the decoder before the hash moves. It is fed rows like
+arrays, and the deblocking filter (`deblock`) is the spec's edge loop
+over 4x4 units: an edge's length is the smaller transform beside it (4,
+8 or 14 luma taps, 4 or 6 chroma), no intra block counts as skipped, and
+the level, one for every plane and direction, is libaom's fit of the AC
+step for a key frame (`LPF_PICK_FROM_Q`) half again, which measured
+better on a photo than the fit at every rate and as well as double it
+but for RGB fidelity. Prediction reads the unfiltered pixels, so the
+filter runs once the frame is coded, over the superblock-padded planes
+a decoder filters, and only on a reconstruction the caller asked to
+keep, which is then what any conforming decoder shows; `tests/av1.rs`
+holds that to dav1d when one is named (`TD_TEST_DAV1D`), and holds
+three small streams to the hashes of bytes dav1d decoded, so a change
+to any emitted symbol is verified against the decoder before the hash
+moves. It is fed rows like
 the JPEG encoder and codes a superblock row when one is complete, so
 the export band rules hold; a frame is at most 16384 on an axis. A
 block's prediction edges are read once per plane and every mode is
@@ -1303,14 +1312,13 @@ transform's working blocks and each plane's trial and best coding and
 only grows, so a block allocates only the levels its leaf keeps. A
 24-megapixel export takes under twenty seconds on one thread and a few
 on eight (`tests/av1.rs`'s `bench`). Against libaom's all-intra speed 6
-on a real 2048-pixel photo the encoder needs about 3% more bits for the
-same PSNR from 0.3 to 3 bits a pixel and about 15% below that, where
-libaom's deblocking counts; the compression follow-ups, by what
-libaom's tools measured there, are more modes coded in full, trellis
-quantisation, a skip test under a chroma weight (zeroing chroma saves
-luma bits but costs RGB fidelity), rectangular partitions and
-transforms, deblocking and CDEF (most at low rates), angle deltas and
-chroma-from-luma.
+on a real 2048-pixel photo the encoder needs about 2% more bits for the
+same PSNR from 0.3 to 3 bits a pixel and about 10% below that; the
+compression follow-ups, by what libaom's tools measured there, are more
+modes coded in full, trellis quantisation, a skip test under a chroma
+weight (zeroing chroma saves luma bits but costs RGB fidelity),
+rectangular partitions and transforms, CDEF (most at low rates), angle
+deltas and chroma-from-luma.
 
 The AVIF (`avif::file`) is the least HEIF file the format asks for and
 every reader expects: `ftyp` with the `avif` brand and `mif1`, `miaf`

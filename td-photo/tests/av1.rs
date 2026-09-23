@@ -18,9 +18,11 @@ use td_photo::av1::{qindex, Encoder, Geometry, Reconstruction};
 use td_photo::avif;
 
 fn scratch(name: &str) -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!("td-photo-av1-{}", std::process::id()));
+    // One directory to a stream, so a test removing its own never takes
+    // one a parallel test is writing into.
+    let dir = std::env::temp_dir().join(format!("td-photo-av1-{}-{name}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
-    dir.join(name)
+    dir
 }
 
 /// A synthetic photo: a soft gradient with a few edges and some noise.
@@ -79,8 +81,8 @@ fn encode_tiled(
 /// delimiter) to raw 4:2:0 planes, or `None` without the binary.
 fn dav1d(obus: &[u8], name: &str) -> Option<Vec<u8>> {
     let dav1d = std::env::var_os("TD_TEST_DAV1D")?;
-    let input = scratch(&format!("{name}.obu"));
-    let output = scratch(&format!("{name}.yuv"));
+    let dir = scratch(name);
+    let (input, output) = (dir.join("stream.obu"), dir.join("stream.yuv"));
     let mut stream = vec![0x12, 0x00];
     stream.extend_from_slice(obus);
     std::fs::write(&input, &stream).unwrap();
@@ -100,7 +102,7 @@ fn dav1d(obus: &[u8], name: &str) -> Option<Vec<u8>> {
     // at.
     std::fs::remove_file(&input).unwrap();
     std::fs::remove_file(&output).unwrap();
-    let _ = std::fs::remove_dir(input.parent().unwrap());
+    let _ = std::fs::remove_dir(&dir);
     Some(decoded)
 }
 
@@ -391,9 +393,9 @@ fn fnv(bytes: &[u8]) -> u64 {
 #[test]
 fn the_streams_are_the_bytes_dav1d_decoded() {
     for (width, height, quality, rows_log2, hash) in [
-        (65, 33, 30, 0, 0x85d697538c01ac1cu64),
-        (520, 40, 60, 0, 0xcafcb50b61002866),
-        (200, 200, 75, 1, 0xe00fac57b2bb8a0a),
+        (65, 33, 30, 0, 0x1346228bfaccdbcdu64),
+        (520, 40, 60, 0, 0xd7ae334026a9b472),
+        (200, 200, 75, 1, 0x33b2d3c18f8f3366),
     ] {
         let name = format!("g{width}x{height}q{quality}r{rows_log2}");
         let (obus, reconstruction) = encode_tiled(width, height, quality, 1, rows_log2);
