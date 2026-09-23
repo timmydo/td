@@ -1,8 +1,9 @@
-//! Format-v1 scalar/key contracts. These codecs do not validate store integrity.
+//! Format-v1 scalar/key/row contracts. These codecs do not validate store integrity.
 //! FORMAT.md owns the byte layout; persistence and digest checks follow in M05.
 use std::fmt;
 
 pub mod key;
+pub mod row;
 pub mod scalar;
 
 pub const CONTAINER_VERSION: u16 = 1;
@@ -36,6 +37,7 @@ pub enum Error {
     OutputFull,
     TrailingBytes,
     InvalidTag,
+    InvalidValue,
     InvalidUtf8,
     Limit,
     Overflow,
@@ -49,6 +51,7 @@ impl fmt::Display for Error {
             Self::OutputFull => "format output buffer too small",
             Self::TrailingBytes => "trailing format bytes",
             Self::InvalidTag => "invalid format tag or identifier",
+            Self::InvalidValue => "inconsistent or invalid format value",
             Self::InvalidUtf8 => "invalid format UTF-8",
             Self::Limit => "format field exceeds its bound",
             Self::Overflow => "format length arithmetic overflow",

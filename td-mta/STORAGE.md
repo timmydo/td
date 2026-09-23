@@ -107,11 +107,13 @@ Keys contain raw 16-byte IDs and bounded UTF-8 bytes, not displayed hex.
 | `threads` | thread ID | Persisted immutable grouping identity |
 | `thread-anchors` | Length-prefixed Message-ID + email ID | Empty; authoritative lookup from message header ID to live email |
 | `submissions` | submission ID | Email/thread/identity IDs, immutable transmitted blob ID, envelope sender, sendAt, lifecycle/notification state |
-| `recipients` | submission ID + recipient ordinal | Address, attempt/phase, result, retry time, expiry, bounded diagnostic |
+| `recipients` | submission ID + recipient ordinal | Address, attempt/phase, result, retry time, uncertainty, bounded diagnostic |
 | `leases` | upload blob ID | Owning account/device, expiry and permitted use |
 | `imports` | source-instance ID + source object kind + length-prefixed source-account and object bytes | Local IDs and verified source digest/mapping |
 
-Every record carries its last changed transaction sequence. Fields needed for
+Every record carries its last changed transaction sequence. Submission expiry
+is shared by its recipients; the exact positional fields
+and enum tags are in FORMAT.md section 6. Fields needed for
 submission remain in its record even if the visible email is later deleted.
 Recipient ordinal is a big-endian u32 in the key so its byte order is numeric;
 ordinary integer values use the encoding in section 4. Indexable timestamps and

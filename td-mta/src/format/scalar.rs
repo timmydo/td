@@ -10,6 +10,10 @@ impl<'a> Reader<'a> {
         Self { remaining: bytes }
     }
 
+    pub const fn remaining(&self) -> &'a [u8] {
+        self.remaining
+    }
+
     pub fn take(&mut self, len: usize) -> Result<&'a [u8], Error> {
         let (value, rest) = self
             .remaining
@@ -67,21 +71,36 @@ impl<'a> Reader<'a> {
 }
 
 pub struct Writer<'a> {
-    bytes: &'a mut [u8],
+    bytes: Option<&'a mut [u8]>,
     used: usize,
 }
 
 impl<'a> Writer<'a> {
     pub fn new(bytes: &'a mut [u8]) -> Self {
-        Self { bytes, used: 0 }
+        Self {
+            bytes: Some(bytes),
+            used: 0,
+        }
+    }
+    pub(super) fn measuring() -> Self {
+        Self {
+            bytes: None,
+            used: 0,
+        }
+    }
+    fn check_end(&self, end: usize) -> Result<(), Error> {
+        if let Some(bytes) = self.bytes.as_ref() {
+            bytes.get(self.used..end).ok_or(Error::OutputFull)?;
+        }
+        Ok(())
     }
     pub fn put(&mut self, bytes: &[u8]) -> Result<(), Error> {
         let end = self.used.checked_add(bytes.len()).ok_or(Error::Overflow)?;
-        let destination = self
-            .bytes
-            .get_mut(self.used..end)
-            .ok_or(Error::OutputFull)?;
-        destination.copy_from_slice(bytes);
+        self.check_end(end)?;
+        if let Some(output) = self.bytes.as_mut() {
+            let destination = output.get_mut(self.used..end).ok_or(Error::OutputFull)?;
+            destination.copy_from_slice(bytes);
+        }
         self.used = end;
         Ok(())
     }
@@ -116,7 +135,7 @@ impl<'a> Writer<'a> {
             .checked_add(4)
             .and_then(|n| n.checked_add(value.len()))
             .ok_or(Error::Overflow)?;
-        self.bytes.get(self.used..end).ok_or(Error::OutputFull)?;
+        self.check_end(end)?;
         self.u32(len)?;
         self.put(value)
     }

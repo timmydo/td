@@ -133,6 +133,7 @@ writing production mail or advertising capabilities.
   canonical scalar/key bytes, malformed input and cross-type import identity.
 - **M02b — Rows and golden fixtures:** complete value field registry, bounded
   row codecs, full row/container byte examples and digest-provider test inputs.
+  Implemented in `format/row.rs` and `tests/format_rows.rs`.
 - **M02c — Runtime and protocol contracts:** compiling adapter/store APIs,
   queue transitions/JMAP mappings, part locators, worker/work/maintenance
   budgets, thread/search/MIME policies and traceable wire fixture inventory.

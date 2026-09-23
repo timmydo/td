@@ -70,6 +70,7 @@ object_ids!(
     ThreadId,
     BlobId,
     SubmissionId,
+    AttemptId,
     IdentityId,
     DeviceId,
     StoreEpoch,
