@@ -91,15 +91,19 @@ status row and nothing copied; while the connection is still being made,
 the copy waits for it, so that it knows the limit, and a copy queues
 behind the backend's work in hand. While the copy is made the draft can
 be edited but not sent, closed (the window's close included) or attached
-to again, and when the tag goes in the caret and any selection stay
-where they were (a caret at the very end of a draft ending in a newline
-moving past the tag). The copy keeps the file's name, cleaned to one
-path component a tag can carry, with `-2`, `-3`, … before the extension
-when that is taken, the tag then naming it for the recipient as the file
-was. Its `<#part>` tag, the media type from the name's extension
-(`application/octet-stream` for one not known), goes on a line of its
-own at the end of the draft when the copy is made, unsaved as any edit
-is. The CLI's `attach_file` does the same for a retained draft, saving
+to again, and when the tag goes in the caret and any selection stay with
+the text they were on (a caret where the tag goes keeping to its own
+line, and a range ending there staying before the tag). The copy keeps
+the file's name, cleaned to one path component a tag can carry, with
+`-2`, `-3`, … before the extension when that is taken, the tag then
+naming it for the recipient as the file was. Its `<#part>` tag, the
+media type from the name's extension (`application/octet-stream` for one
+not known), goes on a line of its own when the copy is made: with the
+caret in the body, at the caret's line (before it when the caret starts
+it, else after it, and past the `<#/part>` of a tag the caret is on or
+whose close it starts; of a selection, its lower end's line), and with
+the caret in the headers at the end of the draft, unsaved as any edit
+is. The CLI's `attach_file` appends it to a retained draft's end, saving
 the tag into it. The send reads the copy, so a file changed or removed
 after it was attached does not change the message, and the copy retires
 with the draft to `sent`; a copy whose tag is deleted from the draft, or

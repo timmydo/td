@@ -2587,6 +2587,47 @@ mod frame_tests {
         );
     }
 
+    /// With the caret in the body the tag lands at the caret's line when
+    /// the copy is made, the caret staying where it was typing.
+    #[test]
+    fn an_attachment_goes_at_the_carets_line_in_the_body() {
+        let (mut session, cmd_rx, resp_tx) = session(true);
+        let state = session
+            .setup
+            .draft_dir
+            .clone()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        key(&mut session, "c");
+        let files = state.join("files");
+        std::fs::create_dir_all(&files).unwrap();
+        std::fs::write(files.join("notes.txt"), b"n").unwrap();
+        session.attach_folder = Some(files.clone());
+        key(&mut session, "C-End");
+        for chord in ["h", "i", "Return", "b", "y", "e", "Up"] {
+            key(&mut session, chord);
+        }
+        key(&mut session, "C-S-a");
+        key(&mut session, "Return");
+        serve_attach(&mut session, &cmd_rx, &resp_tx);
+        let body = text(&session);
+        let tail = body
+            .split("--text follows this line--\n")
+            .nth(1)
+            .unwrap_or_default()
+            .to_string();
+        assert!(tail.trim_start().starts_with("hi\n<#part "), "{tail}");
+        assert!(tail.ends_with("<#/part>\nbye"), "{tail}");
+        key(&mut session, "x");
+        assert!(
+            text(&session).contains("hix\n<#part "),
+            "{}",
+            text(&session)
+        );
+    }
+
     /// Ctrl-H in the finder lists the names beginning `.` and leaves them
     /// out again, the filter cleared and the selection kept (the first
     /// when it is hidden), the status row saying which, the draft

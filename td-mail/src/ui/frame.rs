@@ -384,51 +384,61 @@ impl Pane {
         self.kill.clone()
     }
 
-    /// `text` at the end of the document `tab`, as a paste is put, on a
-    /// line of its own: the caret is put at the end first by selection,
-    /// not by a chord (which the pane's keymap may take otherwise, or
-    /// refuse unfocused), and the text goes in only when it is there; a
-    /// newline goes before the text when the document does not end in
-    /// one. The selection is then put back where it was, as it is when
-    /// the text is refused, so typing goes on where it was going: a caret
-    /// at the document's end stays before the newline put in, or with
-    /// none put in moves after the text, never into its line, and a range
-    /// reaching the end stays before the text rather than taking it in.
-    /// Whether the document changed (a read-only one does not), or why
-    /// the text was refused.
-    fn append(&mut self, tab: TabId, text: &str) -> Result<bool, String> {
+    /// `text` on a line of its own in the document `tab`, as a paste is
+    /// put: below the line `body` (the draft's separator) at the caret's
+    /// line when the caret is there (`line_at`; of a range, its lower
+    /// end's line, so the text never goes inside it), else, and without
+    /// `body`, at the end. The caret is put there first by selection, not
+    /// by a chord (which the pane's keymap may take otherwise, or refuse
+    /// unfocused), and the text goes in only when it is there; a newline
+    /// goes before the text at the end of a document that does not end
+    /// in one, and after it when it has none. The
+    /// selection is then put back where it was, as it is when the text is
+    /// refused, so typing goes on where it was going: text before the
+    /// place does not move and text after it moves with it; a caret at
+    /// the place keeps to its own line, staying before the newline put in
+    /// at a document's end, else moving after the text, never into its
+    /// line, and a range ending at the place stays before the text rather
+    /// than taking it in. Whether the document changed (a read-only one
+    /// does not), or why the text was refused.
+    fn put_line(&mut self, tab: TabId, text: &str, body: Option<&str>) -> Result<bool, String> {
         let Ok(document) = self.controller.editor().document(tab) else {
             return Ok(false);
         };
         if document.read_only() {
             return Ok(false);
         }
-        let lined = document.text().is_empty() || document.text().ends_with('\n');
-        let text = if lined {
-            text.to_string()
-        } else {
-            format!("\n{text}")
-        };
         let end = document.text().len();
         let before = document.selection();
+        let high = before.anchor.max(before.caret);
+        let at = body.map_or(end, |separator| line_at(document.text(), high, separator));
+        let lined = document.text().is_empty() || document.text().ends_with('\n');
+        let mut text = if at == end && !lined {
+            format!("\n{text}")
+        } else {
+            text.to_string()
+        };
+        if !text.ends_with('\n') {
+            text.push('\n');
+        }
         self.select(
             tab,
             Selection {
-                anchor: end,
-                caret: end,
+                anchor: at,
+                caret: at,
             },
         );
-        let at_end = self
+        let placed = self
             .controller
             .editor()
             .document(tab)
             .is_ok_and(|document| {
                 let selection = document.selection();
-                document.text().len() == end && selection.anchor == end && selection.caret == end
+                document.text().len() == end && selection.anchor == at && selection.caret == at
             });
-        if !at_end {
+        if !placed {
             self.select(tab, before);
-            return Err("the draft's end could not be reached".to_string());
+            return Err("the draft's place for it could not be reached".to_string());
         }
         let Some((tab, revision)) = self.target_of(tab) else {
             return Ok(false);
@@ -450,13 +460,13 @@ impl Pane {
             self.select(tab, before);
             return Ok(false);
         }
-        let after = end.saturating_add(text.len());
-        let empty = before.anchor == before.caret;
-        let back = |at: usize| {
-            if at < end || !lined || !empty {
-                at
+        let len = text.len();
+        let range = before.anchor != before.caret;
+        let back = |p: usize| {
+            if p < at || (p == at && ((at == end && !lined) || (range && p == high))) {
+                p
             } else {
-                after
+                p.saturating_add(len)
             }
         };
         self.select(
@@ -617,12 +627,13 @@ impl<'a> Draft<'a> {
         }
     }
 
-    /// `text` on a line of its own at the end of the document, the
-    /// selection kept (`Pane::append`): whether the document changed, or
-    /// why it was refused.
-    pub fn append(&mut self, text: &str) -> Result<bool, String> {
+    /// `text` on a line of its own at the caret's line when the caret is
+    /// below the line `body`, else at the end of the document, the
+    /// selection kept (`Pane::put_line`): whether the document changed,
+    /// or why it was refused.
+    pub fn put_line(&mut self, text: &str, body: Option<&str>) -> Result<bool, String> {
         match self.tab {
-            Some(tab) => self.pane.append(tab, text),
+            Some(tab) => self.pane.put_line(tab, text, body),
             None => Ok(false),
         }
     }
@@ -634,6 +645,60 @@ impl<'a> Draft<'a> {
             self.pane.event(Event::ReadOnly { tab, enabled: held });
         }
     }
+}
+
+/// Where a line goes in `text` for a caret at byte `caret`: below the
+/// line `separator`, in the body, the start of the caret's line when the
+/// caret starts it, else the start of the next line (the end when there
+/// is none), and past a `<#/part>` line that would follow a `<#part`
+/// line there, so a tag never goes between another and its close; with
+/// the caret on or above the separator, or no separator, the end.
+fn line_at(text: &str, caret: usize, separator: &str) -> usize {
+    let end = text.len();
+    let mut start = 0;
+    let mut body = None;
+    for line in text.split_inclusive('\n') {
+        start += line.len();
+        if line.trim_end() == separator {
+            body = Some(start);
+            break;
+        }
+    }
+    let Some(body) = body.filter(|body| caret >= *body && caret <= end) else {
+        return end;
+    };
+    let starts = caret == body
+        || caret
+            .checked_sub(1)
+            .and_then(|i| text.as_bytes().get(i))
+            .is_some_and(|b| *b == b'\n');
+    let at = if starts {
+        caret
+    } else {
+        match text.get(caret..).and_then(|rest| rest.find('\n')) {
+            Some(i) => caret + i + 1,
+            None => end,
+        }
+    };
+    let previous = text
+        .get(..at)
+        .and_then(|head| head.strip_suffix('\n'))
+        .map(|head| head.rsplit('\n').next().unwrap_or(head));
+    let next = text
+        .get(at..)
+        .map(|rest| rest.split('\n').next().unwrap_or(rest));
+    let tag = |line: &str| {
+        line.trim_end()
+            .strip_prefix("<#part")
+            .is_some_and(|rest| rest.starts_with([' ', '\t', '>']))
+    };
+    if previous.is_some_and(tag) && next.is_some_and(|line| line.trim_end() == "<#/part>") {
+        return match text.get(at..).and_then(|rest| rest.find('\n')) {
+            Some(i) => at + i + 1,
+            None => end,
+        };
+    }
+    at
 }
 
 /// `text` as the pane admits it: a leading byte order mark dropped, CRLF
@@ -966,7 +1031,7 @@ mod tests {
         // reached.
         pane.focus(false);
         assert_eq!(
-            Draft::new(&mut pane, Some(tab)).append("<#part>\n"),
+            Draft::new(&mut pane, Some(tab)).put_line("<#part>\n", None),
             Ok(true)
         );
         pane.focus(true);
@@ -976,7 +1041,7 @@ mod tests {
             "To: a\n--text follows this line--\nhi\n<#part>\n"
         );
         assert_eq!(
-            Draft::new(&mut pane, Some(tab)).append("<#two>\n"),
+            Draft::new(&mut pane, Some(tab)).put_line("<#two>\n", None),
             Ok(true)
         );
         assert_eq!(pane.chord("x"), Outcome::Changed);
@@ -996,7 +1061,7 @@ mod tests {
         };
         select(&mut pane, 1, 3);
         assert_eq!(
-            Draft::new(&mut pane, Some(tab)).append("<#three>\n"),
+            Draft::new(&mut pane, Some(tab)).put_line("<#three>\n", None),
             Ok(true)
         );
         let selection = pane.editor().document(tab).unwrap().selection();
@@ -1006,7 +1071,7 @@ mod tests {
         let end = text(&pane).len();
         select(&mut pane, end, end);
         assert_eq!(
-            Draft::new(&mut pane, Some(tab)).append("<#four>\n"),
+            Draft::new(&mut pane, Some(tab)).put_line("<#four>\n", None),
             Ok(true)
         );
         assert_eq!(pane.chord("y"), Outcome::Changed);
@@ -1018,7 +1083,7 @@ mod tests {
         // At the end of a last line, it stays on that line.
         assert_eq!(pane.chord("C-End"), Outcome::Changed);
         assert_eq!(
-            Draft::new(&mut pane, Some(tab)).append("<#five>\n"),
+            Draft::new(&mut pane, Some(tab)).put_line("<#five>\n", None),
             Ok(true)
         );
         assert_eq!(pane.chord("z"), Outcome::Changed);
@@ -1032,7 +1097,7 @@ mod tests {
         let end = text(&pane).len();
         select(&mut pane, end - 3, end);
         assert_eq!(
-            Draft::new(&mut pane, Some(tab)).append("<#six>\n"),
+            Draft::new(&mut pane, Some(tab)).put_line("<#six>\n", None),
             Ok(true)
         );
         let selection = pane.editor().document(tab).unwrap().selection();
@@ -1044,17 +1109,147 @@ mod tests {
             text(&pane)
         );
         Draft::new(&mut pane, Some(tab)).hold(true);
-        assert_eq!(Draft::new(&mut pane, Some(tab)).append("no"), Ok(false));
+        assert_eq!(
+            Draft::new(&mut pane, Some(tab)).put_line("no", None),
+            Ok(false)
+        );
         let mut shown = None;
         pane.show(&mut shown, "t", 40, || "read".to_string());
         let read = pane.tab();
-        assert_eq!(Draft::new(&mut pane, read).append("no"), Ok(false));
-        assert_eq!(Draft::new(&mut pane, None).append("no"), Ok(false));
+        assert_eq!(Draft::new(&mut pane, read).put_line("no", None), Ok(false));
+        assert_eq!(Draft::new(&mut pane, None).put_line("no", None), Ok(false));
         assert_eq!(
             pane.editor().document(read.unwrap()).unwrap().text(),
             "read"
         );
         pane.close(draft);
         pane.close(shown);
+    }
+
+    /// A line's place: in the body at the caret's line, before it when the
+    /// caret starts it, after it otherwise, and never between a tag and
+    /// its close; in the headers, or with no separator, at the end.
+    #[test]
+    fn a_line_goes_at_the_carets_line_in_the_body() {
+        let sep = "--text follows this line--";
+        let text = "To: a\n--text follows this line--\none\ntwo\n<#part x>\n<#/part>\nend";
+        let at = |needle: &str| text.find(needle).unwrap();
+        // In the headers and on the separator: the end.
+        assert_eq!(line_at(text, 2, sep), text.len());
+        assert_eq!(line_at(text, at("--text") + 3, sep), text.len());
+        // The body's first line: at its start, before it; inside it, after.
+        assert_eq!(line_at(text, at("one"), sep), at("one"));
+        assert_eq!(line_at(text, at("one") + 1, sep), at("two"));
+        assert_eq!(line_at(text, at("two") + 3, sep), at("<#part"));
+        // On a tag, or at its close's start: past the close.
+        assert_eq!(line_at(text, at("<#part") + 2, sep), at("end"));
+        assert_eq!(line_at(text, at("<#/part>"), sep), at("end"));
+        assert_eq!(line_at(text, at("<#/part>") + 1, sep), at("end"));
+        // The last line, unended: the end.
+        assert_eq!(line_at(text, at("end") + 1, sep), text.len());
+        assert_eq!(line_at(text, text.len(), sep), text.len());
+        // A line that only looks like a tag is none.
+        let party = "S: x\n--text follows this line--\n<#party>\n<#/part>\nz";
+        assert_eq!(
+            line_at(party, party.find("<#party>").unwrap() + 2, sep),
+            party.find("<#/part>").unwrap()
+        );
+        // Past the text, or no separator: the end.
+        assert_eq!(line_at(text, text.len() + 5, sep), text.len());
+        assert_eq!(line_at("one\ntwo\n", 1, sep), 8);
+    }
+
+    /// With the caret in the body the line goes at the caret's line and
+    /// the selection keeps to the text it was on; in the headers it goes
+    /// at the end.
+    #[test]
+    fn a_put_line_goes_where_the_caret_is_in_the_body() {
+        let sep = "--text follows this line--";
+        let mut pane = Pane::new().unwrap();
+        let mut draft = None;
+        pane.edit(&mut draft, "d", || {
+            "To: a\n--text follows this line--\nhello world\nbye\n".to_string()
+        });
+        let tab = pane.tab().expect("the draft");
+        let text = |pane: &Pane| pane.editor().document(tab).unwrap().text().to_string();
+        let select = |pane: &mut Pane, anchor: usize, caret: usize| {
+            let revision = pane.editor().document(tab).unwrap().revision();
+            pane.event(Event::Edit {
+                tab,
+                revision,
+                command: Command::Select(Selection { anchor, caret }),
+            });
+        };
+        let hello = text(&pane).find("hello").unwrap();
+        // Mid-line: after the line, the caret still mid-word.
+        select(&mut pane, hello + 5, hello + 5);
+        assert_eq!(
+            Draft::new(&mut pane, Some(tab)).put_line("<#a>\n", Some(sep)),
+            Ok(true)
+        );
+        assert_eq!(
+            text(&pane),
+            "To: a\n--text follows this line--\nhello world\n<#a>\nbye\n"
+        );
+        assert_eq!(pane.chord("x"), Outcome::Changed);
+        assert!(
+            text(&pane).contains("hellox world\n<#a>\n"),
+            "{}",
+            text(&pane)
+        );
+        // At a line's start: before the line, the caret staying with it.
+        let bye = text(&pane).find("bye").unwrap();
+        select(&mut pane, bye, bye);
+        assert_eq!(
+            Draft::new(&mut pane, Some(tab)).put_line("<#b>", Some(sep)),
+            Ok(true)
+        );
+        assert_eq!(pane.chord("y"), Outcome::Changed);
+        assert!(
+            text(&pane).ends_with("<#a>\n<#b>\nybye\n"),
+            "{}",
+            text(&pane)
+        );
+        // A range ending where the line goes stays before it; one after
+        // it moves with its text.
+        let a = text(&pane).find("<#a>").unwrap();
+        select(&mut pane, a - 6, a);
+        assert_eq!(
+            Draft::new(&mut pane, Some(tab)).put_line("<#c>\n", Some(sep)),
+            Ok(true)
+        );
+        let selection = pane.editor().document(tab).unwrap().selection();
+        assert_eq!((selection.anchor, selection.caret), (a - 6, a));
+        assert!(
+            text(&pane).contains("world\n<#c>\n<#a>\n"),
+            "{}",
+            text(&pane)
+        );
+        // A range reversed over a line boundary (anchor below the caret)
+        // is placed after by its lower end's line, and not taken in.
+        let world = text(&pane).find("world").unwrap();
+        let ybye = text(&pane).find("ybye").unwrap();
+        select(&mut pane, ybye + 2, world);
+        assert_eq!(
+            Draft::new(&mut pane, Some(tab)).put_line("<#r>\n", Some(sep)),
+            Ok(true)
+        );
+        let selection = pane.editor().document(tab).unwrap().selection();
+        assert_eq!((selection.anchor, selection.caret), (ybye + 2, world));
+        assert!(text(&pane).contains("ybye\n<#r>\n"), "{}", text(&pane));
+        // In the headers: at the end.
+        select(&mut pane, 1, 1);
+        assert_eq!(
+            Draft::new(&mut pane, Some(tab)).put_line("<#d>\n", Some(sep)),
+            Ok(true)
+        );
+        assert!(
+            text(&pane).ends_with("ybye\n<#r>\n<#d>\n"),
+            "{}",
+            text(&pane)
+        );
+        let selection = pane.editor().document(tab).unwrap().selection();
+        assert_eq!((selection.anchor, selection.caret), (1, 1));
+        pane.close(draft);
     }
 }

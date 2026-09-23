@@ -530,7 +530,7 @@ pub fn all_keybindings() -> Vec<KeyBinding> {
             key: "Ctrl-Shift-A",
             action: "attach",
             description:
-                "Attach a file chosen in the finder: copied beside the draft, tagged at its end",
+                "Attach a file chosen in the finder: copied beside the draft, tagged at the caret's line in the body, else at its end",
         },
         KeyBinding {
             view: "compose",

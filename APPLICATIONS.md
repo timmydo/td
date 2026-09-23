@@ -10068,10 +10068,10 @@ since the FileChooser portal grants nothing outside an existing grant
 either (§E, row 3) and td-mail carries no D-Bus client. The chosen file
 is copied into the draft's attachment sidecar by the backend, off the
 window's thread, read as the send reads a part and bounded by what the
-connected server takes, and its `<#part>` tag goes at the draft's end,
-so the send reads the copy and the copy retires with the draft, whose
-tags are pointed at the sidecar's place in `sent`, a copy whose tag was
-taken out removed as unsent.
+connected server takes, and its `<#part>` tag goes at the caret's line
+in the body, else at the draft's end, so the send reads the copy and the
+copy retires with the draft, whose tags are pointed at the sidecar's
+place in `sent`, a copy whose tag was taken out removed as unsent.
 
 ## X. Host mode — development only
 

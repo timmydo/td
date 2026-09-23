@@ -15,12 +15,13 @@
 //! to be mended. Attach opens the finder over the body, and the file
 //! chosen is copied by the backend into the draft's attachment sidecar
 //! (`crate::attach`), off the window's thread and bounded by what the
-//! server takes when connected; on its answer the `<#part>` tag is added
-//! at the draft's end, so the send reads the copy. While the copy is made the
-//! draft is the pane's, but it is not sent, closed or attached to
-//! again, so nothing goes before its tag is in. Every chord is the
-//! pane's while the draft is being edited; the view's own keys are the
-//! bar's labels and, while it asks, the answer.
+//! server takes when connected; on its answer the `<#part>` tag is
+//! added on a line of its own at the caret's line when the caret is in
+//! the body, else at the draft's end, so the send reads the copy. While
+//! the copy is made the draft is the pane's, but it is not sent, closed
+//! or attached to again, so nothing goes before its tag is in. Every
+//! chord is the pane's while the draft is being edited; the view's own
+//! keys are the bar's labels and, while it asks, the answer.
 
 use crate::backend::{BackendCommand, BackendResponse};
 use crate::ui::frame::Draft;
@@ -246,7 +247,8 @@ impl ComposeView {
                 return;
             }
         };
-        let refused = match draft.append(attached.tag.trim_start_matches('\n')) {
+        let tag = attached.tag.trim_start_matches('\n');
+        let refused = match draft.put_line(tag, Some(crate::submit::SEPARATOR)) {
             Ok(true) => None,
             Ok(false) => Some("the draft cannot take it".to_string()),
             Err(why) => Some(why),
