@@ -692,7 +692,7 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
         source_name: "sda",
         target_name: "vda",
         before: InventoryBefore::Fresh,
-    }, false)?;
+    }, false, false)?;
     let refuse = |case: &str, image: &Path, diagnostic: &str| -> Result<(), String> {
         for (name, attachment, source_device) in [
             ("optical", FirmwareAttachment::Optical, "/dev/sr0"),
@@ -1262,6 +1262,34 @@ fn validate_candidates(
     Ok(())
 }
 
+fn validate_plan_observation(console: &str, expected: &InventoryExpected<'_>, partitioned: bool, attempted: bool) -> Result<(), String> {
+    if !attempted {
+        if console.lines().any(|line| line.starts_with(protocol::PLAN_OBSERVATION_MARKER)
+            || line.trim_end() == protocol::PLAN_STALE_MARKER
+            || line.trim_end() == protocol::PLAN_BUSY_MARKER) {
+            return Err("plan observation ran for an unavailable target".into());
+        }
+        return Ok(());
+    }
+    let document = diagnostic_frame(console, protocol::PLAN_OBSERVATION_MARKER, 256)?;
+    if report_number(&document, "version")? != 1 {
+        return Err("plan observation report version differs".into());
+    }
+    if report_field(&document, "scope")?.as_str() != Some("plan-observation-only") {
+        return Err("plan observation report scope differs".into());
+    }
+    if report_field(&document, "destination")?.as_str() != Some(expected.target_name) {
+        return Err("plan observation did not name the reviewed target".into());
+    }
+    if console.lines().filter(|line| line.trim_end() == protocol::PLAN_STALE_MARKER).count() != 1 {
+        return Err("stale plan refusal has no unique completion marker".into());
+    }
+    if console.lines().filter(|line| line.trim_end() == protocol::PLAN_BUSY_MARKER).count() != usize::from(partitioned) {
+        return Err("busy plan refusal has an unexpected completion marker".into());
+    }
+    Ok(())
+}
+
 fn require_live_reports(
     result: &BootResult,
     target: &TargetDisk,
@@ -1284,13 +1312,16 @@ fn require_live_reports(
         target_name: target.bus.name(false),
         before,
     };
-    validate_live_reports(result, &expected, partitioned)
+    let plan_expected = !target.read_only
+        && expected.target_bytes >= protocol::PLAN_PROBE_MINIMUM_SECTORS * 512;
+    validate_live_reports(result, &expected, partitioned, plan_expected)
 }
 
 fn validate_live_reports(
     result: &BootResult,
     expected: &InventoryExpected<'_>,
     partitioned: bool,
+    plan_expected: bool,
 ) -> Result<(), String> {
     validate_preview(
         &result.console,
@@ -1306,6 +1337,7 @@ fn validate_live_reports(
     })?;
     validate_inventories(&result.console, expected, partitioned)
         .and_then(|()| validate_candidates(&result.console, expected, partitioned))
+        .and_then(|()| validate_plan_observation(&result.console, expected, partitioned, plan_expected))
         .map_err(|error| {
             format!(
                 "installer storage reports: {error}\n{}",
@@ -2343,11 +2375,11 @@ mod tests {
         let writable = usb.replace("\"read_only\":true", "\"read_only\":false");
         validate_inventories(&inventory_console(&writable, None), &expected, false).unwrap();
         let mut result = interrupted_result();
-        result.console = candidate_console(true, false)
+        result.console = candidate_console(true, false, false)
             .replace("\"sr0\"", "\"sda\"")
             .replace("\"logical_sector_bytes\":2048", "\"logical_sector_bytes\":512")
             .replace("\"read_only\":true", "\"read_only\":false");
-        validate_live_reports(&result, &expected, false).unwrap();
+        validate_live_reports(&result, &expected, false, false).unwrap();
         expected.source_read_only = true;
         assert!(validate_inventories(&inventory_console(&writable, None), &expected, false).is_err());
     }
@@ -3021,8 +3053,16 @@ mod tests {
         assert!(!candidate_geometry(MINIMUM_TARGET_BYTES, 1024));
     }
 
-    fn candidate_console(available: bool, partitioned: bool) -> String {
+    fn candidate_console(available: bool, partitioned: bool, plan_expected: bool) -> String {
         let mut console = inventory_console(INVENTORY_FIXTURE, None);
+        if plan_expected {
+            let report = "{\"version\":1,\"scope\":\"plan-observation-only\",\"destination\":\"vda\"}";
+            console.push_str(&format!("{} {} {report}\n", protocol::PLAN_OBSERVATION_MARKER, report.len()));
+            console.push_str(&format!("{}\n", protocol::PLAN_STALE_MARKER));
+            if partitioned {
+                console.push_str(&format!("{}\n", protocol::PLAN_BUSY_MARKER));
+            }
+        }
         let device = INVENTORY_FIXTURE
             .split_once("\"devices\":[")
             .unwrap()
@@ -3046,9 +3086,31 @@ mod tests {
     }
 
     #[test]
+    fn plan_observation_oracle_requires_exact_target_and_stale_refusal() {
+        let expected = inventory_expectation();
+        let valid = candidate_console(true, false, true);
+        validate_plan_observation(&valid, &expected, false, true).unwrap();
+        for changed in [
+            valid.replace("plan-observation-only", "candidate-only"),
+            valid.replace("\"destination\":\"vda\"", "\"destination\":\"sda\""),
+            valid.replace(&format!("{}\n", protocol::PLAN_STALE_MARKER), ""),
+            format!("{valid}{}\n", protocol::PLAN_STALE_MARKER),
+        ] {
+            assert!(validate_plan_observation(&changed, &expected, false, true).is_err());
+        }
+        let mut unavailable = inventory_expectation();
+        unavailable.read_only = true;
+        validate_plan_observation(&candidate_console(false, false, false), &unavailable, false, false).unwrap();
+        assert!(validate_plan_observation(&valid, &unavailable, false, false).is_err());
+        let partitioned = candidate_console(true, true, true);
+        validate_plan_observation(&partitioned, &expected, true, true).unwrap();
+        assert!(validate_plan_observation(&partitioned, &expected, false, true).is_err());
+    }
+
+    #[test]
     fn candidate_oracle_requires_free_target_and_both_busy_refusals() {
         let mut expected = inventory_expectation();
-        let valid = candidate_console(true, true);
+        let valid = candidate_console(true, true, true);
         validate_candidates(&valid, &expected, true).unwrap();
         let free = valid.lines().find(|line| line.starts_with(protocol::CANDIDATES_BEFORE_MARKER)).unwrap();
         for marker in [protocol::CANDIDATES_HELD_MARKER, protocol::CANDIDATES_MOUNTED_MARKER] {
@@ -3057,8 +3119,8 @@ mod tests {
             assert!(validate_candidates(&valid.replace(busy, &admitted), &expected, true).is_err());
         }
 
-        assert!(validate_candidates(&candidate_console(false, true), &expected, true).is_err());
-        assert!(validate_candidates(&candidate_console(true, false), &expected, true).is_err());
+        assert!(validate_candidates(&candidate_console(false, true, false), &expected, true).is_err());
+        assert!(validate_candidates(&candidate_console(true, false, true), &expected, true).is_err());
         assert!(validate_candidates(&valid, &expected, false).is_err());
         for (old, new) in [
             ("candidate-only", "inventory-only"),
@@ -3083,12 +3145,12 @@ mod tests {
             assert!(validate_candidates(&changed, &expected, true).is_err());
         }
         expected.read_only = true;
-        validate_candidates(&candidate_console(false, false), &expected, false).unwrap();
-        assert!(validate_candidates(&candidate_console(true, false), &expected, false).is_err());
+        validate_candidates(&candidate_console(false, false, false), &expected, false).unwrap();
+        assert!(validate_candidates(&candidate_console(true, false, true), &expected, false).is_err());
         expected.read_only = false;
         expected.target_bytes = 128 * 1024 * 1024;
-        validate_candidates(&candidate_console(false, false), &expected, false).unwrap();
-        assert!(validate_candidates(&candidate_console(true, false), &expected, false).is_err());
+        validate_candidates(&candidate_console(false, false, false), &expected, false).unwrap();
+        assert!(validate_candidates(&candidate_console(true, false, true), &expected, false).is_err());
     }
 
     #[test]

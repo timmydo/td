@@ -94,11 +94,11 @@ The `td-install` Rust library exports `installation_plan::{Plan,
 Destination, DestinationObservation, Settings}`. It is a pure data
 prerequisite for the service and UI, with no CLI, device access,
 filesystem access, entropy generation, transport or installation
-execution. The Cargo library target is host/preflight-only today. A
-target consumer must declare this shared source in its recipe and its
-own confinement roster before compiling it through `#[path]`. The
-current target formatter remains its existing standalone binary. A
-decoded plan conveys no authority.
+execution. The Cargo library target remains host/preflight-only. The
+target-built formatter now stages the same module through `#[path]` for
+`observe-plan`, with its recipe and compiled-file guard declaring that
+source. Each further target consumer must declare the source in its
+own recipe and confinement roster. A decoded plan conveys no authority.
 
 A plan owns a nonzero 32-byte proposal nonce, the complete destination
 observations, a 32-byte deployment manifest digest, a version-4 volume
@@ -764,6 +764,30 @@ Whole-image length and SHA-256 comparisons preserve both source and target
 after QEMU is reaped. This tests the mounted-media claim and its release;
 the future service must keep its source mounts and plan identity alive.
 Other media cases remain write-protected, and no operator device is used.
+
+## Plan observation
+
+`td-install observe-plan` takes one canonical binary plan from standard input
+and no operands. It refuses malformed or oversized records before accessing
+sysfs, then requires the reviewed disk to remain a whole-disk candidate with
+the same name, major/minor, disk sequence, capacity, sector size, removable
+flag, model, serial and WWID. It opens `/dev/<kernel-name>` read-write with a
+Linux exclusive claim, compares the opened block device number and size, and
+requires the pre-claim and under-claim sysfs inventories to agree.
+No write call is made. Success prints one JSON object with version 1, scope
+`plan-observation-only` and the destination name; failure prints no success
+document. The claim closes after output, so this diagnostic grants no later
+write authority, does not authenticate the deployment or settings, and is
+not a replacement for the service's retained claim and trusted consent.
+An unmounted installation medium can pass the candidate filter; the future
+service must independently retain and exclude source backing storage.
+The disposable optical/USB QEMU installer constructs a canonical plan from
+guest sysfs for its available target and runs the shipped command before
+formatting. It requires an exact success report, refusal of a changed disk
+sequence without a success report, refusal of a mounted target, and
+unchanged first, middle and final device canaries after each check.
+Read-only and undersized fixture targets do not run the positive
+observation.
 
 ## Read-only layout preview
 

@@ -1,7 +1,8 @@
 //! Read-only inventory and advisory candidates; neither grants write authority.
 
-use crate::{invalid, paths};
+use crate::{installation_plan, invalid, paths};
 use std::collections::{BTreeMap, BTreeSet};
+use std::fs::File;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
@@ -357,6 +358,74 @@ fn candidate(device: &Device, devices: &[Device]) -> bool {
             .all(|peer| peer.holders.is_empty() && peer.slaves.is_empty())
 }
 
+fn matches_plan(device: &Device, plan: &installation_plan::Plan) -> io::Result<bool> {
+    let disk = device
+        .disk
+        .as_ref()
+        .ok_or_else(|| invalid("observed destination is not a whole disk".into()))?;
+    let (major, minor) = device
+        .number
+        .split_once(':')
+        .ok_or_else(|| invalid("observed destination has no device number".into()))?;
+    let major = major
+        .parse::<u32>()
+        .map_err(|_| invalid("observed destination major exceeds u32".into()))?;
+    let minor = minor
+        .parse::<u32>()
+        .map_err(|_| invalid("observed destination minor exceeds u32".into()))?;
+    let sector = u32::try_from(disk.logical_sector_bytes)
+        .map_err(|_| invalid("observed destination sector size exceeds u32".into()))?;
+    let observed = installation_plan::Destination::new(installation_plan::DestinationObservation {
+        name: &device.name,
+        major,
+        minor,
+        sequence: disk.sequence,
+        capacity: device.bytes,
+        sector,
+        removable: disk.removable,
+        model: disk.model.as_deref(),
+        serial: disk.serial.as_deref(),
+        wwid: disk.wwid.as_deref(),
+    })
+    .map_err(invalid)?;
+    Ok(&observed == plan.destination())
+}
+
+/// Hold a read-write O_EXCL claim through the caller's observation. This
+/// function writes no bytes and does not authenticate the deployment or source.
+pub fn claim_plan(plan: &installation_plan::Plan) -> io::Result<File> {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    let devices = collect(Path::new("/sys/class/block"))?;
+    let device = devices
+        .iter()
+        .find(|device| device.name == plan.destination().name())
+        .ok_or_else(|| invalid("reviewed destination is no longer present".into()))?;
+    if !candidate(device, &devices) || !matches_plan(device, plan)? {
+        return Err(invalid(
+            "reviewed destination is no longer an unchanged candidate".into(),
+        ));
+    }
+    let path = Path::new("/dev").join(&device.name);
+    let mut file = paths::open_destination_claim(&path, true)?;
+    let metadata = file.metadata()?;
+    let number = crate::device_numbers(metadata.rdev());
+    let (major, minor) = plan.destination().number();
+    if !metadata.file_type().is_block_device()
+        || number != (u64::from(major), u64::from(minor))
+        || crate::destination_bytes(&mut file)? != plan.destination().capacity()
+    {
+        return Err(invalid(
+            "opened destination differs from reviewed plan".into(),
+        ));
+    }
+    if devices != collect(Path::new("/sys/class/block"))? {
+        return Err(invalid(
+            "block inventory changed during plan observation".into(),
+        ));
+    }
+    Ok(file)
+}
+
 fn probe(device: &Device) -> io::Result<bool> {
     use std::os::unix::fs::{FileTypeExt, MetadataExt};
     let path = Path::new("/dev").join(&device.name);
@@ -470,6 +539,7 @@ fn write_devices(devices: &[&Device], scope: &str, output: &mut impl Write) -> i
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::installation_plan::{Destination, DestinationObservation, Plan, Settings};
     use std::fs;
     use std::os::unix::fs::symlink;
 
@@ -526,6 +596,58 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.base);
         }
+    }
+
+    #[test]
+    fn plan_identity_refuses_changed_observations_and_ineligible_disks() {
+        let fixture = Fixture::new();
+        let disk = fixture.disk("vda", "252:0", 512);
+        let destination = Destination::new(DestinationObservation {
+            name: "vda",
+            major: 252,
+            minor: 0,
+            sequence: 7,
+            capacity: 6 * 1024 * 1024 * 1024,
+            sector: 512,
+            removable: false,
+            model: None,
+            serial: None,
+            wwid: None,
+        })
+        .unwrap();
+        let settings = Settings::new("alice", "td-host", "us", "Etc/UTC").unwrap();
+        let mut uuid = [0; 16];
+        uuid[6] = 0x40;
+        uuid[8] = 0x80;
+        let plan = Plan::new([1; 32], destination, [2; 32], uuid, settings).unwrap();
+        let current = || collect(&fixture.class).unwrap();
+        let matches = |devices: &[Device]| {
+            let device = devices.iter().find(|d| d.name == "vda").unwrap();
+            candidate(device, devices) && matches_plan(device, &plan).unwrap()
+        };
+        assert!(matches(&current()));
+        for (path, stale) in [
+            ("diskseq", "8"),
+            ("size", "12582914"),
+            ("queue/logical_block_size", "4096"),
+            ("removable", "1"),
+            ("dev", "252:2"),
+            ("device/model", "changed"),
+            ("serial", "changed"),
+            ("wwid", "changed"),
+        ] {
+            let file = disk.join(path);
+            let old = fs::read(&file).ok();
+            fs::write(&file, stale).unwrap();
+            assert!(!matches(&current()), "{path}");
+            match old {
+                Some(old) => fs::write(&file, old).unwrap(),
+                None => fs::remove_file(&file).unwrap(),
+            }
+            assert!(matches(&current()), "{path} restoration");
+        }
+        fs::write(disk.join("ro"), "1").unwrap();
+        assert!(!matches(&current()));
     }
 
     #[test]

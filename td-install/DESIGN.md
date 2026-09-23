@@ -560,6 +560,12 @@ and limitations. Only ResourceBusy (Linux EBUSY, retained as ErrorKind by
 the path wrapper) excludes a probed disk; other failures refuse discovery.
 No device bytes are written. This does not replace the formatter's
 read-write claim or establish the installation service's retained authority.
+`td-install observe-plan` separately takes a read-write exclusive claim,
+compares a bounded reviewed plan with two complete inventories and the
+opened block device, then releases the claim after its observation report.
+Read-write access mirrors formatter admission and refuses devices where the
+future destructive path could not obtain its required claim.
+The report grants no authority to a later formatter invocation.
 
 ### Prepared volume image admission
 

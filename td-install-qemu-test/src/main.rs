@@ -1,7 +1,7 @@
 //! Test-only native init for an oracle-owned VM; never packed in a system image.
 #![forbid(unsafe_code)]
 use std::fs::{self, File};
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -377,6 +377,161 @@ fn candidates(marker: &str) -> Result<(), String> {
     diagnostic(marker, &["destinations"], MAX_INVENTORY_BYTES, "destination candidates")
 }
 
+fn attribute(path: &Path, optional: bool) -> Result<Option<String>, String> {
+    let file = match File::open(path) {
+        Ok(file) => file,
+        Err(error) if optional && error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("open {}: {error}", path.display())),
+    };
+    let mut bytes = Vec::new();
+    match file.take(257).read_to_end(&mut bytes) {
+        Ok(_) => {}
+        Err(error) if optional && error.raw_os_error() == Some(ENXIO) => return Ok(None),
+        Err(error) => return Err(format!("read {}: {error}", path.display())),
+    }
+    if bytes.len() > 256 {
+        return Err(format!("{} exceeds 256 bytes", path.display()));
+    }
+    let value = String::from_utf8(bytes).map_err(|_| format!("{} is not UTF-8", path.display()))?;
+    Ok(Some(value.trim().to_owned()))
+}
+
+fn required_attribute(path: &Path) -> Result<String, String> {
+    attribute(path, false)?.ok_or_else(|| format!("{} is missing", path.display()))
+}
+
+fn put_plan_text(bytes: &mut Vec<u8>, value: &str) -> Result<(), String> {
+    let length = u16::try_from(value.len()).map_err(|_| "fixture plan text is too long")?;
+    bytes.extend_from_slice(&length.to_be_bytes());
+    bytes.extend_from_slice(value.as_bytes());
+    Ok(())
+}
+
+fn put_plan_optional(bytes: &mut Vec<u8>, value: Option<String>) -> Result<(), String> {
+    match value {
+        Some(value) => {
+            bytes.push(1);
+            put_plan_text(bytes, &value)
+        }
+        None => {
+            bytes.push(0);
+            Ok(())
+        }
+    }
+}
+
+/// Independently frame the QEMU device observations, so the guest checks the
+/// shipped decoder against bytes that its own codec did not produce.
+fn observed_plan(device: &str) -> Result<Vec<u8>, String> {
+    let name = device.strip_prefix("/dev/").ok_or("invalid target path")?;
+    let base = Path::new("/sys/class/block").join(name);
+    let number = required_attribute(&base.join("dev"))?;
+    let (major, minor) = number.split_once(':').ok_or("invalid target device number")?;
+    let major = major.parse::<u32>().map_err(|_| "invalid target major")?;
+    let minor = minor.parse::<u32>().map_err(|_| "invalid target minor")?;
+    let sequence = required_attribute(&base.join("diskseq"))?.parse::<u64>()
+        .map_err(|_| "invalid target disk sequence")?;
+    let capacity = required_attribute(&base.join("size"))?.parse::<u64>()
+        .map_err(|_| "invalid target capacity")?.checked_mul(512)
+        .ok_or("target capacity overflow")?;
+    let sector = required_attribute(&base.join("queue/logical_block_size"))?.parse::<u32>()
+        .map_err(|_| "invalid target sector size")?;
+    let removable = match required_attribute(&base.join("removable"))?.as_str() {
+        "0" => 0, "1" => 1, _ => return Err("invalid target removable flag".into()),
+    };
+    let model = attribute(&base.join("device/model"), true)?;
+    let serial = match attribute(&base.join("serial"), true)? {
+        Some(value) => Some(value),
+        None => attribute(&base.join("device/serial"), true)?,
+    };
+    let wwid = match attribute(&base.join("wwid"), true)? {
+        Some(value) => Some(value),
+        None => attribute(&base.join("device/wwid"), true)?,
+    };
+    let mut bytes = Vec::with_capacity(256);
+    bytes.extend_from_slice(b"TDPLAN01");
+    bytes.extend_from_slice(&[1; 32]);
+    bytes.extend_from_slice(&[0; 32]);
+    let mut uuid = [0; 16];
+    *uuid.get_mut(6).ok_or("fixture UUID has no version byte")? = 0x40;
+    *uuid.get_mut(8).ok_or("fixture UUID has no variant byte")? = 0x80;
+    bytes.extend_from_slice(&uuid);
+    bytes.extend_from_slice(&major.to_be_bytes());
+    bytes.extend_from_slice(&minor.to_be_bytes());
+    bytes.extend_from_slice(&sequence.to_be_bytes());
+    bytes.extend_from_slice(&capacity.to_be_bytes());
+    bytes.extend_from_slice(&sector.to_be_bytes());
+    bytes.push(removable);
+    put_plan_text(&mut bytes, name)?;
+    for label in [model, serial, wwid] {
+        put_plan_optional(&mut bytes, label)?;
+    }
+    for choice in ["alice", "td-qemu-installed", "us", "Europe/London"] {
+        put_plan_text(&mut bytes, choice)?;
+    }
+    Ok(bytes)
+}
+
+fn plan_observation(plan: &[u8]) -> Result<std::process::Output, String> {
+    let mut child = Command::new("/bin/td-install")
+        .arg("observe-plan")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("start plan observation: {error}"))?;
+    let fed = child.stdin.take().ok_or("plan observation stdin is unavailable")?
+        .write_all(plan).map_err(|error| format!("feed plan observation: {error}"));
+    let result = child.wait_with_output()
+        .map_err(|error| format!("finish plan observation: {error}"));
+    fed?;
+    result
+}
+
+fn canaries(device: &str) -> Result<Vec<u8>, String> {
+    let mut file = File::open(device).map_err(|error| error.to_string())?;
+    let len = file.seek(SeekFrom::End(0)).map_err(|error| error.to_string())?;
+    let mut bytes = Vec::with_capacity(96);
+    for offset in [0, len / 2, len.saturating_sub(32)] {
+        file.seek(SeekFrom::Start(offset)).map_err(|error| error.to_string())?;
+        let mut sample = [0; 32];
+        file.read_exact(&mut sample).map_err(|error| error.to_string())?;
+        bytes.extend_from_slice(&sample);
+    }
+    Ok(bytes)
+}
+
+fn check_plan_observation(device: &str) -> Result<(), String> {
+    let before = canaries(device)?;
+    let plan = observed_plan(device)?;
+    let response = plan_observation(&plan)?;
+    if !response.status.success() {
+        return Err(format!("current plan observation failed: {}", response.status));
+    }
+    let name = device.strip_prefix("/dev/").ok_or("invalid target path")?;
+    let expected = format!("{{\"version\":1,\"scope\":\"plan-observation-only\",\"destination\":\"{name}\"}}\n");
+    if response.stdout != expected.as_bytes() {
+        return Err("current plan observation returned a different report".into());
+    }
+    report(std::io::stdout(), format_args!("{PLAN_OBSERVATION_MARKER} {} {}", expected.trim_end().len(), expected.trim_end()))?;
+    let sequence = required_attribute(&Path::new("/sys/class/block").join(name).join("diskseq"))?
+        .parse::<u64>().map_err(|_| "invalid target disk sequence")?;
+    let changed = sequence.checked_add(1).ok_or("fixture disk sequence overflow")?;
+    let mut stale = plan;
+    stale.get_mut(96..104).ok_or("fixture plan lacks disk sequence")?
+        .copy_from_slice(&changed.to_be_bytes());
+    let response = plan_observation(&stale)?;
+    let diagnostic = String::from_utf8_lossy(&response.stderr);
+    if response.status.success() || !response.stdout.is_empty()
+        || !diagnostic.contains("reviewed destination is no longer an unchanged candidate") {
+        return Err("stale plan observation was accepted or reported success".into());
+    }
+    if before != canaries(device)? {
+        return Err("plan observation changed target disk canaries".into());
+    }
+    report(std::io::stdout(), format_args!("{PLAN_STALE_MARKER}"))
+}
+
 fn inventory(marker: &str) -> Result<(), String> {
     diagnostic(marker, &["inventory"], MAX_INVENTORY_BYTES, "inventory")
 }
@@ -437,6 +592,13 @@ fn install(device: &str, interrupt: bool, system_autotest: bool) -> Result<(), S
         std::io::stdout(),
         format_args!("{SECTOR_BYTES_MARKER} {geometry}"),
     )?;
+    let sysfs = Path::new("/sys/class/block").join(name);
+    let writable = required_attribute(&sysfs.join("ro"))? == "0";
+    let sectors = required_attribute(&sysfs.join("size"))?.parse::<u64>()
+        .map_err(|_| "invalid target sector count")?;
+    if writable && sectors >= PLAN_PROBE_MINIMUM_SECTORS {
+        check_plan_observation(device)?;
+    }
     // Validate the stable read-only source before the first destructive command.
     // Publication below still rechecks the copied payloads and signature.
     command(
@@ -682,6 +844,22 @@ fn refresh_partitions(device: &str, uuid: &str) -> Result<String, String> {
     command("/bin/td-boot", &["mount-root", &partition, "/volume"])?;
     reject_busy_formatters(device, "mounted partition")?;
     candidates(CANDIDATES_MOUNTED_MARKER)?;
+    let name = device.strip_prefix("/dev/").ok_or("invalid target path")?;
+    let sectors = required_attribute(&Path::new("/sys/class/block").join(name).join("size"))?
+        .parse::<u64>().map_err(|_| "invalid target sector count")?;
+    if sectors >= PLAN_PROBE_MINIMUM_SECTORS {
+        let before = canaries(device)?;
+        let refused = plan_observation(&observed_plan(device)?)?;
+        let diagnostic = String::from_utf8_lossy(&refused.stderr);
+        if refused.status.success() || !refused.stdout.is_empty()
+            || !diagnostic.contains("(os error 16)") {
+            return Err(format!("mounted target plan observation did not refuse as busy: {diagnostic}"));
+        }
+        if before != canaries(device)? {
+            return Err("busy plan observation changed target disk canaries".into());
+        }
+        report(std::io::stdout(), format_args!("{PLAN_BUSY_MARKER}"))?;
+    }
     let refused = Command::new("/bin/td-init")
         .args(["reread-partitions", device])
         .output()

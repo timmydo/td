@@ -44,6 +44,10 @@ mod scratch;
 #[path = "inventory.rs"]
 mod inventory;
 
+#[path = "installation_plan.rs"]
+#[allow(dead_code)]
+mod installation_plan;
+
 #[path = "timezones.rs"]
 mod timezones;
 
@@ -65,7 +69,7 @@ fn invalid(message: String) -> io::Error {
 }
 
 const USAGE: &str =
-    "usage: td-install new-volume-uuid\n       td-install inventory\n       td-install destinations\n       td-install prepare-selector <template> <volume-uuid> <output>\n       td-install timezones\n       td-install layout-preview <logical-sector-bytes> <capacity-bytes>\n       td-install format <efi-kernel> <selector-initramfs> <volume-options-and-operands>\n       td-install layout <destination> [<efi-kernel> <selector-initramfs>]\n       \
+    "usage: td-install new-volume-uuid\n       td-install inventory\n       td-install destinations\n       td-install observe-plan < plan.bin\n       td-install prepare-selector <template> <volume-uuid> <output>\n       td-install timezones\n       td-install layout-preview <logical-sector-bytes> <capacity-bytes>\n       td-install format <efi-kernel> <selector-initramfs> <volume-options-and-operands>\n       td-install layout <destination> [<efi-kernel> <selector-initramfs>]\n       \
                      td-install volume [--uuid <uuid>] [--timezone <IANA-id>] [--hostname <name>] [--username <name> <verified-root> <td-firstboot>] <destination> <mkfs.btrfs> <scratch-dir> \
                      [<td-boot> <deployment> <trusted-key> | --trusted-key <trusted-key>]";
 
@@ -74,6 +78,7 @@ enum Mode {
     NewVolumeUuid,
     Inventory,
     Destinations,
+    ObservePlan,
     PrepareSelector {
         template: PathBuf,
         uuid: VolumeUuid,
@@ -478,6 +483,7 @@ fn parse_args(mut args: impl Iterator<Item = OsString>) -> io::Result<Mode> {
     match (verb.to_str(), rest) {
         (Some("inventory"), []) => Ok(Mode::Inventory),
         (Some("destinations"), []) => Ok(Mode::Destinations),
+        (Some("observe-plan"), []) => Ok(Mode::ObservePlan),
         (Some("new-volume-uuid"), []) => Ok(Mode::NewVolumeUuid),
         (Some("prepare-selector"), [template, uuid, output]) => Ok(Mode::PrepareSelector {
             template: template.clone(),
@@ -542,6 +548,26 @@ fn parse_args(mut args: impl Iterator<Item = OsString>) -> io::Result<Mode> {
         }),
         _ => Err(invalid(USAGE.to_string())),
     }
+}
+
+/// Check only the current observation. The held claim ends when this call
+/// returns, so its result cannot authorize a later format invocation.
+fn observe_plan(input: &mut impl Read, output: &mut impl Write) -> io::Result<()> {
+    let mut bytes = Vec::new();
+    input
+        .take(installation_plan::MAX_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > installation_plan::MAX_BYTES {
+        return Err(invalid("installation plan exceeds maximum length".into()));
+    }
+    let plan = installation_plan::Plan::decode(&bytes).map_err(invalid)?;
+    let _claim = inventory::claim_plan(&plan)?;
+    writeln!(
+        output,
+        "{{\"version\":1,\"scope\":\"plan-observation-only\",\"destination\":\"{}\"}}",
+        plan.destination().name()
+    )?;
+    output.flush()
 }
 
 fn preview_number(value: &OsStr, label: &str) -> io::Result<u64> {
@@ -2254,6 +2280,11 @@ fn main() -> ExitCode {
             let mut output = io::BufWriter::new(stdout.lock());
             inventory::destinations(&mut output).and_then(|()| output.flush())
         },
+        Mode::ObservePlan => {
+            let stdout = io::stdout();
+            let mut output = io::BufWriter::new(stdout.lock());
+            observe_plan(&mut io::stdin().lock(), &mut output)
+        },
         Mode::Inventory => {
             let stdout = io::stdout();
             let mut output = io::BufWriter::new(stdout.lock());
@@ -2320,6 +2351,22 @@ mod tests {
     // this is the test half's own — a test opening a fixture is not a path the
     // installer takes from an operator, and the scan reads only the half above.
     use std::fs::OpenOptions;
+
+    #[test]
+    fn observe_plan_accepts_no_operands_and_refuses_bad_wire_before_discovery() {
+        assert_eq!(
+            parse_args([OsString::from("observe-plan")].into_iter()).unwrap(),
+            Mode::ObservePlan
+        );
+        for extra in ["/dev/vda", "--uuid", "plan.bin"] {
+            assert!(parse_args([OsString::from("observe-plan"), OsString::from(extra)].into_iter()).is_err());
+        }
+        for bytes in [Vec::new(), b"TDPLAN01".to_vec(), vec![0; installation_plan::MAX_BYTES + 1]] {
+            let mut output = Vec::new();
+            assert!(observe_plan(&mut io::Cursor::new(bytes), &mut output).is_err());
+            assert!(output.is_empty());
+        }
+    }
 
     #[test]
     fn volume_identity_cli_admits_no_operands_and_reports_output_failure() {
@@ -4508,12 +4555,12 @@ mod tests {
     /// because that is the half the scan below keys on.
     const ALLOW: &str = concat!("#[all", "ow(clippy::disallowed_methods)]");
 
-    /// The eleven files this binary compiles, with the item each allow in
+    /// The twelve files this binary compiles, with the item each allow in
     /// them must sit on. Shared pure modules and test-only scratch have none;
     /// inventory uses paths; timezones uses the regular-file reader.
     type Compiled = (&'static str, &'static str, &'static [&'static str]);
 
-    fn compiled_files() -> [Compiled; 11] {
+    fn compiled_files() -> [Compiled; 12] {
         [
             ("main.rs", include_str!("main.rs"), MAIN_CHOKE.as_slice()),
             (
@@ -4532,6 +4579,7 @@ mod tests {
             ),
             ("scratch.rs", include_str!("scratch.rs"), [].as_slice()),
             ("inventory.rs", include_str!("inventory.rs"), [].as_slice()),
+            ("installation_plan.rs", include_str!("installation_plan.rs"), [].as_slice()),
             ("timezones.rs", include_str!("timezones.rs"), [].as_slice()),
             ("hostname.rs", include_str!("../../td-firstboot/src/hostname.rs"), [].as_slice()),
         ]
@@ -4545,7 +4593,7 @@ mod tests {
     ///
     /// Over the UNCOMMENTED source, for the reason the allow scan is: a
     /// comment explaining a `#[path]` declaration is prose, and reading one as
-    /// a declaration reds a file that compiles exactly eleven.
+    /// a declaration reds a file that compiles exactly twelve.
     #[test]
     fn every_compiled_file_is_one_the_guards_read() {
         // WHITESPACE-INSENSITIVE from the marker on: `#[path="x.rs"]` with no
@@ -4565,7 +4613,7 @@ mod tests {
         // include inside a `stringify!`, which satisfied the search while
         // `compiled_files` went on reading the original.
         let table_body = {
-            const HEAD: &str = "fn compiled_files() -> [Compiled; 11] {";
+            const HEAD: &str = "fn compiled_files() -> [Compiled; 12] {";
             let Some(at) = index_of(&text, HEAD) else {
                 panic!("the compiled-file table is not where this scan looks for it")
             };
