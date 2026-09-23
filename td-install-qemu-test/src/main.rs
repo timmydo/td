@@ -558,12 +558,29 @@ fn check_source_plan_observation(device: &str, deployment: [u8; 32], id: &str) -
     let before = canaries(device)?;
     let plan = observed_plan(device, deployment)?;
     let source = plan_observation(&["observe-source-plan", "/bin/td-boot", "/source", "/trusted.pub"], &plan)?;
-    let expected_source = format!("{{\"version\":1,\"scope\":\"source-plan-observation-only\",\"deployment\":\"{id}\"}}\n");
+    let name = device.strip_prefix("/dev/").ok_or("invalid target path")?;
+    let expected_source = format!("{{\"version\":1,\"scope\":\"held-source-plan-observation-only\",\"destination\":\"{name}\",\"deployment\":\"{id}\"}}\n");
     if !source.status.success() || source.stdout != expected_source.as_bytes() {
         return Err(format!("current source plan observation failed or returned a different report: status {}; stderr {}",
             source.status, String::from_utf8_lossy(&source.stderr).trim_end()));
     }
     report(std::io::stdout(), format_args!("{SOURCE_PLAN_OBSERVATION_MARKER} {} {}", expected_source.trim_end().len(), expected_source.trim_end()))?;
+    let probe = Path::new("/scratch/source-claim-probe");
+    fs::create_dir_all(probe).map_err(|error| format!("create source claim probe: {error}"))?;
+    fs::write(probe.join("device"), device).map_err(|error| format!("write source claim probe device: {error}"))?;
+    fs::write(probe.join("id"), id).map_err(|error| format!("write source claim probe ID: {error}"))?;
+    let overlap = plan_observation(
+        &["observe-source-plan", "/init", "/scratch/source-claim-probe", "/trusted.pub"],
+        &plan,
+    )?;
+    if !overlap.status.success() || overlap.stdout != expected_source.as_bytes() {
+        return Err(format!("source validator did not observe the held disk claim: status {}; stderr {}",
+            overlap.status, String::from_utf8_lossy(&overlap.stderr).trim_end()));
+    }
+    if before != canaries(device)? {
+        return Err("overlapping source validation changed target disk canaries".into());
+    }
+    report(std::io::stdout(), format_args!("{SOURCE_PLAN_CLAIM_MARKER}"))?;
     let mut stale_source = plan;
     let digest_first = stale_source.get_mut(40).ok_or("fixture plan lacks deployment digest")?;
     *digest_first ^= 1;
@@ -578,6 +595,25 @@ fn check_source_plan_observation(device: &str, deployment: [u8; 32], id: &str) -
         return Err("source plan observation changed target disk canaries".into());
     }
     report(std::io::stdout(), format_args!("{SOURCE_PLAN_STALE_MARKER}"))
+}
+
+fn claim_probe_validator(source: &Path, key: &Path) -> Result<(), String> {
+    if source != Path::new("/scratch/source-claim-probe") || key != Path::new("/trusted.pub") {
+        return Err("source claim probe received unexpected operands".into());
+    }
+    let device = fs::read_to_string(source.join("device"))
+        .map_err(|error| format!("read source claim probe device: {error}"))?;
+    let id = fs::read_to_string(source.join("id"))
+        .map_err(|error| format!("read source claim probe ID: {error}"))?;
+    match fs::OpenOptions::new().read(true).write(true).custom_flags(0x80).open(&device) {
+        Err(error) if error.raw_os_error() == Some(16) => {}
+        Err(error) => return Err(format!("source claim probe got wrong open failure: {error}")),
+        Ok(_) => return Err("source validator opened an unclaimed destination".into()),
+    }
+    if id.len() != 64 || !id.bytes().all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f')) {
+        return Err("source claim probe received a noncanonical ID".into());
+    }
+    report(std::io::stdout(), format_args!("{id}"))
 }
 
 fn inventory(marker: &str) -> Result<(), String> {
@@ -900,6 +936,7 @@ fn refresh_partitions(device: &str, uuid: &str) -> Result<String, String> {
         let refused = plan_observation(&["observe-plan"], &observed_plan(device, [0; 32])?)?;
         let diagnostic = String::from_utf8_lossy(&refused.stderr);
         if refused.status.success() || !refused.stdout.is_empty()
+            || !diagnostic.contains(&format!("{device}:"))
             || !diagnostic.contains("(os error 16)") {
             return Err(format!("mounted target plan observation did not refuse as busy: {diagnostic}"));
         }
@@ -907,6 +944,20 @@ fn refresh_partitions(device: &str, uuid: &str) -> Result<String, String> {
             return Err("busy plan observation changed target disk canaries".into());
         }
         report(std::io::stdout(), format_args!("{PLAN_BUSY_MARKER}"))?;
+        let refused = plan_observation(
+            &["observe-source-plan", "/bin/td-boot", "/source", "/trusted.pub"],
+            &observed_plan(device, [0; 32])?,
+        )?;
+        let diagnostic = String::from_utf8_lossy(&refused.stderr);
+        if refused.status.success() || !refused.stdout.is_empty()
+            || !diagnostic.contains(&format!("{device}:"))
+            || !diagnostic.contains("(os error 16)") {
+            return Err(format!("mounted target source-plan observation did not refuse as busy: {diagnostic}"));
+        }
+        if before != canaries(device)? {
+            return Err("busy source-plan observation changed target disk canaries".into());
+        }
+        report(std::io::stdout(), format_args!("{SOURCE_PLAN_BUSY_MARKER}"))?;
     }
     let refused = Command::new("/bin/td-init")
         .args(["reread-partitions", device])
@@ -1280,6 +1331,21 @@ fn run() -> Result<(), String> {
 }
 
 fn main() -> ExitCode {
+    if std::process::id() != 1 {
+        let args: Vec<_> = std::env::args_os().skip(1).collect();
+        let result = match args.as_slice() {
+            [verb, source, key] if verb == "validate-source" =>
+                claim_probe_validator(Path::new(source), Path::new(key)),
+            _ => Err("invalid source claim probe arguments".into()),
+        };
+        return match result {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                let _ = report(std::io::stderr(), format_args!("{error}"));
+                ExitCode::FAILURE
+            }
+        };
+    }
     let result = run();
     if let Err(error) = result {
         let _ = report_refusal(std::io::stderr(), &error);

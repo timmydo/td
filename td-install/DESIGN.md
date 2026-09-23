@@ -1202,10 +1202,15 @@ every copied payload.
 Preflight does not validate the separate firmware selector, its key/UUID
 agreement, scratch capacity, destination eligibility or destructive consent.
 Those remain installation-coordinator responsibilities.
-`td-install observe-source-plan` compares this preflight's canonical
-manifest ID with a bounded reviewed plan and reports only that observation.
-It inherits the same closed-descriptor lifetime and cannot authorize a
-later formatting step.
+`td-install observe-source-plan` holds the reviewed destination's exclusive
+claim while this preflight compares the canonical manifest ID with the
+bounded plan. Its report names the disk identity checked at claim time and
+the deployment authenticated while that claim remains open. A claim does
+not detect physical removal or a changed disk sequence during hashing.
+The child closes
+its source descriptors and the destination claim closes before return, so
+the report cannot authorize a later formatting step. The service must keep
+its own source and destination lifetimes through consent and writes.
 
 `td-boot install` carries the detached signature. Two things used to stop it
 reaching a machine at all, and both are closed:

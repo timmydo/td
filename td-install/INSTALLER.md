@@ -793,15 +793,21 @@ observation.
 the same bounded plan from standard input. It runs the shipped
 absolute `td-boot validate-source` to authenticate the manifest and verify
 all three payload hashes with the supplied trust key, then compares the canonical
-manifest SHA-256 ID byte-for-byte with the plan's deployment digest. Only
-after both checks succeed does it print a version-1 JSON report scoped
-`source-plan-observation-only`. A malformed plan or relative path refuses
-before launching `td-boot`; a failed child or digest mismatch prints no
-success report. The child closes its source descriptors before the report,
-so this observation does not retain source bytes, authorize a later write,
-or replace the service's source mount and claim lifetime. The QEMU fixture
-requires the exact report and a changed plan digest to be refused while
-the target's disk canaries remain unchanged.
+manifest SHA-256 ID byte-for-byte with the plan's deployment digest. It
+holds the reviewed disk's exclusive claim during that source validation.
+Only after both checks succeed does it print a version-1 JSON report scoped
+`held-source-plan-observation-only`, naming the disk and deployment. A
+malformed plan or relative path refuses before the claim or child; a busy
+disk, failed child, or digest mismatch prints no success report. The child
+closes its source descriptors and the disk claim closes before return, so
+this observation does not retain authority or authorize a later write. It
+does not detect physical disk removal or disk-sequence changes while the
+source is hashed, and does not replace the service's source mount and claim
+lifetime. The QEMU fixture requires the exact report, a changed digest
+refusal, and a mounted disk refusal with unchanged target canaries. A
+test-only validator also attempts an exclusive open during source
+validation and must receive EBUSY; this pins the overlap, rather than only
+the order of two sequential checks.
 
 ## Read-only layout preview
 

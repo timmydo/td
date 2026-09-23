@@ -1273,7 +1273,9 @@ fn validate_plan_observation(console: &str, expected: &InventoryExpected<'_>, pa
             || line.trim_end() == protocol::PLAN_STALE_MARKER
             || line.trim_end() == protocol::PLAN_BUSY_MARKER
             || line.starts_with(protocol::SOURCE_PLAN_OBSERVATION_MARKER)
-            || line.trim_end() == protocol::SOURCE_PLAN_STALE_MARKER) {
+            || line.trim_end() == protocol::SOURCE_PLAN_STALE_MARKER
+            || line.trim_end() == protocol::SOURCE_PLAN_BUSY_MARKER
+            || line.trim_end() == protocol::SOURCE_PLAN_CLAIM_MARKER) {
             return Err("plan observation ran for an unavailable target".into());
         }
         return Ok(());
@@ -1291,8 +1293,11 @@ fn validate_plan_observation(console: &str, expected: &InventoryExpected<'_>, pa
     if let Some(expected_id) = source_id {
         let source = diagnostic_frame(console, protocol::SOURCE_PLAN_OBSERVATION_MARKER, 256)?;
         if report_number(&source, "version")? != 1
-            || report_field(&source, "scope")?.as_str() != Some("source-plan-observation-only") {
+            || report_field(&source, "scope")?.as_str() != Some("held-source-plan-observation-only") {
             return Err("source plan observation has wrong version or scope".into());
+        }
+        if report_field(&source, "destination")?.as_str() != Some(expected.target_name) {
+            return Err("source plan report differs from reviewed target".into());
         }
         if report_field(&source, "deployment")?.as_str() != Some(expected_id) {
             return Err("source plan report differs from fixture manifest ID".into());
@@ -1300,8 +1305,16 @@ fn validate_plan_observation(console: &str, expected: &InventoryExpected<'_>, pa
         if console.lines().filter(|line| line.trim_end() == protocol::SOURCE_PLAN_STALE_MARKER).count() != 1 {
             return Err("stale source plan refusal has no unique completion marker".into());
         }
+        if console.lines().filter(|line| line.trim_end() == protocol::SOURCE_PLAN_CLAIM_MARKER).count() != 1 {
+            return Err("source plan validation has no unique held-claim probe marker".into());
+        }
+        if console.lines().filter(|line| line.trim_end() == protocol::SOURCE_PLAN_BUSY_MARKER).count() != usize::from(partitioned) {
+            return Err("busy source plan refusal has an unexpected completion marker".into());
+        }
     } else if console.lines().any(|line| line.starts_with(protocol::SOURCE_PLAN_OBSERVATION_MARKER)
-        || line.trim_end() == protocol::SOURCE_PLAN_STALE_MARKER) {
+        || line.trim_end() == protocol::SOURCE_PLAN_STALE_MARKER
+        || line.trim_end() == protocol::SOURCE_PLAN_BUSY_MARKER
+        || line.trim_end() == protocol::SOURCE_PLAN_CLAIM_MARKER) {
         return Err("source plan observation ran without a validated source".into());
     }
     if console.lines().filter(|line| line.trim_end() == protocol::PLAN_STALE_MARKER).count() != 1 {
@@ -3085,11 +3098,13 @@ mod tests {
             let report = "{\"version\":1,\"scope\":\"plan-observation-only\",\"destination\":\"vda\"}";
             console.push_str(&format!("{} {} {report}\n", protocol::PLAN_OBSERVATION_MARKER, report.len()));
             console.push_str(&format!("{}\n", protocol::PLAN_STALE_MARKER));
-            let report = format!("{{\"version\":1,\"scope\":\"source-plan-observation-only\",\"deployment\":\"{}\"}}", "02".repeat(32));
+            let report = format!("{{\"version\":1,\"scope\":\"held-source-plan-observation-only\",\"destination\":\"vda\",\"deployment\":\"{}\"}}", "02".repeat(32));
             console.push_str(&format!("{} {} {report}\n", protocol::SOURCE_PLAN_OBSERVATION_MARKER, report.len()));
             console.push_str(&format!("{}\n", protocol::SOURCE_PLAN_STALE_MARKER));
+            console.push_str(&format!("{}\n", protocol::SOURCE_PLAN_CLAIM_MARKER));
             if partitioned {
                 console.push_str(&format!("{}\n", protocol::PLAN_BUSY_MARKER));
+                console.push_str(&format!("{}\n", protocol::SOURCE_PLAN_BUSY_MARKER));
             }
         }
         let device = INVENTORY_FIXTURE
@@ -3121,15 +3136,18 @@ mod tests {
         validate_plan_observation(&valid, &expected, false, true, Some(&"02".repeat(32))).unwrap();
         for changed in [
             valid.replace("plan-observation-only", "candidate-only"),
-            valid.replace("\"destination\":\"vda\"", "\"destination\":\"sda\""),
+            valid.replace("\"scope\":\"plan-observation-only\",\"destination\":\"vda\"", "\"scope\":\"plan-observation-only\",\"destination\":\"sda\""),
             valid.replace(&format!("{}\n", protocol::PLAN_STALE_MARKER), ""),
             format!("{valid}{}\n", protocol::PLAN_STALE_MARKER),
-            valid.replace("source-plan-observation-only", "source-plan-observation-onlx"),
+            valid.replace("held-source-plan-observation-only", "held-source-plan-observation-onlx"),
+            valid.replace("\"scope\":\"held-source-plan-observation-only\",\"destination\":\"vda\"", "\"scope\":\"held-source-plan-observation-only\",\"destination\":\"sda\""),
             valid.replace(&"02".repeat(32), &"z2".repeat(32)),
             valid.replace(&"02".repeat(32), &"03".repeat(32)),
-            valid.replace("\"version\":1,\"scope\":\"source-plan-observation-only\"", "\"version\":2,\"scope\":\"source-plan-observation-only\""),
+            valid.replace("\"version\":1,\"scope\":\"held-source-plan-observation-only\"", "\"version\":2,\"scope\":\"held-source-plan-observation-only\""),
             valid.replace(&format!("{}\n", protocol::SOURCE_PLAN_STALE_MARKER), ""),
             format!("{valid}{}\n", protocol::SOURCE_PLAN_STALE_MARKER),
+            valid.replace(&format!("{}\n", protocol::SOURCE_PLAN_CLAIM_MARKER), ""),
+            format!("{valid}{}\n", protocol::SOURCE_PLAN_CLAIM_MARKER),
         ] {
             assert!(validate_plan_observation(&changed, &expected, false, true, Some(&"02".repeat(32))).is_err());
         }
@@ -3140,6 +3158,8 @@ mod tests {
         for unexpected in [
             format!("{} {} {{}}\n", protocol::SOURCE_PLAN_OBSERVATION_MARKER, 2),
             format!("{}\n", protocol::SOURCE_PLAN_STALE_MARKER),
+            format!("{}\n", protocol::SOURCE_PLAN_CLAIM_MARKER),
+            format!("{}\n", protocol::SOURCE_PLAN_BUSY_MARKER),
         ] {
             let console = format!("{}{}", candidate_console(false, false, false), unexpected);
             assert!(validate_plan_observation(&console, &unavailable, false, false, None).is_err());
@@ -3147,10 +3167,15 @@ mod tests {
         let partitioned = candidate_console(true, true, true);
         validate_plan_observation(&partitioned, &expected, true, true, Some(&"02".repeat(32))).unwrap();
         assert!(validate_plan_observation(&partitioned, &expected, false, true, Some(&"02".repeat(32))).is_err());
+        assert!(validate_plan_observation(&partitioned.replace(&format!("{}\n", protocol::SOURCE_PLAN_BUSY_MARKER), ""), &expected, true, true, Some(&"02".repeat(32))).is_err());
+        assert!(validate_plan_observation(&format!("{partitioned}{}\n", protocol::SOURCE_PLAN_BUSY_MARKER), &expected, true, true, Some(&"02".repeat(32))).is_err());
         let disk_only = valid.lines().filter(|line| !line.starts_with(protocol::SOURCE_PLAN_OBSERVATION_MARKER)
-            && *line != protocol::SOURCE_PLAN_STALE_MARKER).collect::<Vec<_>>().join("\n") + "\n";
+            && *line != protocol::SOURCE_PLAN_STALE_MARKER
+            && *line != protocol::SOURCE_PLAN_CLAIM_MARKER).collect::<Vec<_>>().join("\n") + "\n";
         validate_plan_observation(&disk_only, &expected, false, true, None).unwrap();
         assert!(validate_plan_observation(&valid, &expected, false, true, None).is_err());
+        assert!(validate_plan_observation(&format!("{disk_only}{}\n", protocol::SOURCE_PLAN_BUSY_MARKER), &expected, false, true, None).is_err());
+        assert!(validate_plan_observation(&format!("{valid}{}\n", protocol::SOURCE_PLAN_BUSY_MARKER), &expected, false, true, Some(&"02".repeat(32))).is_err());
     }
 
     #[test]

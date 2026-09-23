@@ -581,9 +581,8 @@ fn observe_plan(input: &mut impl Read, output: &mut impl Write) -> io::Result<()
     output.flush()
 }
 
-/// Authenticate all payloads through td-boot, then compare its canonical
-/// manifest ID with the reviewed plan. The child closes its source descriptors
-/// before this returns, so the report grants no later write authority.
+/// Keep the reviewed disk claimed while td-boot authenticates every payload.
+/// Both claims end before return; the report grants no later write authority.
 fn observe_source_plan(
     input: &mut impl Read,
     output: &mut impl Write,
@@ -595,6 +594,22 @@ fn observe_source_plan(
         return Err(invalid("td-boot, source and trusted key must be absolute paths".into()));
     }
     let plan = read_plan(input)?;
+    let _claim = inventory::claim_plan(&plan)?;
+    let id = validate_source_plan(&plan, td_boot, source, trusted_key)?;
+    write_source_plan_report(output, &plan, &id)?;
+    output.flush()
+}
+
+fn write_source_plan_report(output: &mut impl Write, plan: &installation_plan::Plan, id: &str) -> io::Result<()> {
+    writeln!(output, "{{\"version\":1,\"scope\":\"held-source-plan-observation-only\",\"destination\":\"{}\",\"deployment\":\"{id}\"}}", plan.destination().name())
+}
+
+fn validate_source_plan(
+    plan: &installation_plan::Plan,
+    td_boot: &Path,
+    source: &Path,
+    trusted_key: &Path,
+) -> io::Result<String> {
     let result = std::process::Command::new(td_boot)
         .arg("validate-source")
         .arg(source)
@@ -617,8 +632,7 @@ fn observe_source_plan(
     if !plan.matches_deployment_id(id) {
         return Err(invalid("reviewed deployment differs from authenticated source".into()));
     }
-    writeln!(output, "{{\"version\":1,\"scope\":\"source-plan-observation-only\",\"deployment\":\"{id}\"}}")?;
-    output.flush()
+    Ok(id.to_owned())
 }
 
 fn preview_number(value: &OsStr, label: &str) -> io::Result<u64> {
@@ -2478,7 +2492,6 @@ mod tests {
         uuid[6] = 0x40;
         uuid[8] = 0x80;
         let plan = installation_plan::Plan::new([1; 32], destination, [0xab; 32], uuid, settings).unwrap();
-        let wire = plan.encode();
         for (body, reason) in [
             (format!("printf '{}\\n'\n", "ab".repeat(32)), None),
             (format!("printf '{}\\n'\n", "ac".repeat(32)), Some("reviewed deployment differs")),
@@ -2487,15 +2500,14 @@ mod tests {
         ] {
             std::fs::write(&validator, format!("#!/bin/sh\n[ \"$1\" = validate-source ] || exit 2\n[ \"$2\" = \"{}\" ] || exit 3\n[ \"$3\" = \"{}\" ] || exit 4\n{body}", source.display(), key.display())).unwrap();
             std::fs::set_permissions(&validator, std::fs::Permissions::from_mode(0o755)).unwrap();
-            let mut output = Vec::new();
-            let result = observe_source_plan(&mut io::Cursor::new(&wire), &mut output, &validator, &source, &key);
+            let result = validate_source_plan(&plan, &validator, &source, &key);
             if let Some(reason) = reason {
                 assert!(result.unwrap_err().to_string().contains(reason));
-                assert!(output.is_empty());
             } else {
-                result.unwrap();
-                let report = String::from_utf8(output).unwrap();
-                assert!(report.contains(&format!("\"deployment\":\"{}\"", "ab".repeat(32))));
+                assert_eq!(result.unwrap(), "ab".repeat(32));
+                let mut report = Vec::new();
+                write_source_plan_report(&mut report, &plan, &"ab".repeat(32)).unwrap();
+                assert_eq!(report, format!("{{\"version\":1,\"scope\":\"held-source-plan-observation-only\",\"destination\":\"vda\",\"deployment\":\"{}\"}}\n", "ab".repeat(32)).as_bytes());
             }
         }
     }
