@@ -395,3 +395,15 @@ cargo test
 cargo clippy
 cargo fmt -- --check
 ```
+
+The window's one native case, `tests/control_process.rs`, launches
+td-mail offline under the real headless td-compositor with its home,
+state and configuration in a private directory, composes with `c`,
+attaches with Ctrl-Shift-A, a filter and Return in the finder, saves
+with Ctrl-S, and reads the draft, its tag and the sidecar's copy back
+from disk; td-mail has no control socket, so the files are the oracle.
+It is `#[ignore]`d for plain `cargo test`; `ready` runs it, and so does:
+
+```bash
+target/release/td-builder gate-crates native-compositor --manifest-path td-mail/Cargo.toml
+```

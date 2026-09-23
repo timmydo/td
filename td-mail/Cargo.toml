@@ -17,6 +17,19 @@ path = "src/main.rs"
 name = "cli_integration"
 path = "tests/cli_integration.rs"
 
+# The window under the real headless td-compositor, driven by its seat
+# (`ready`'s native tier runs it; see the metadata below).
+[[test]]
+name = "control_process"
+path = "tests/control_process.rs"
+
+[package.metadata.td-gate]
+# td-mail is a live Wayland client; its native case launches it offline
+# under the real headless td-compositor (tests/control_process.rs). This
+# opt-in builds that binary for the gate and adds it as a test-only reader
+# dependency.
+native-compositor-tests = true
+
 # td-mail is a TARGET-built application, NOT part of the control-plane engine
 # workspace. It is standalone — its own workspace root — with a lock that
 # names itself and the two siblings it draws through. No external

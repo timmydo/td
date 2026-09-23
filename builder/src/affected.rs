@@ -5163,7 +5163,7 @@ mod tests {
         // a tool edge (not a source read) discovered by the native runner.
         assert_eq!(
             readers_of("td-compositor"),
-            ["td-authd", "td-editor", "td-jail", "td-photo", "td-portal", "td-seatd", "td-secret", "td-setup", "td-taskmgr", "td-ui", "td-vm", "td-vm-guest"]
+            ["td-authd", "td-editor", "td-jail", "td-mail", "td-photo", "td-portal", "td-seatd", "td-secret", "td-setup", "td-taskmgr", "td-ui", "td-vm", "td-vm-guest"]
         );
         // Jail, login and the VM helper share the primary-account reader.
         assert_eq!(readers_of("td-authd"), ["td-compositor", "td-firstboot", "td-jail", "td-login", "td-secret", "td-vm-guest"]);
@@ -7314,10 +7314,10 @@ mod tests {
                 "td-vm-guest"
             ]
         );
-        // td-photo's native case makes its commands three, as td-setup's are;
-        // td-news and td-mail, toolkit consumers with no native case, add
-        // two each.
-        assert_eq!(comp.len(), 43, "{comp:?}");
+        // td-photo's and td-mail's native cases make their commands three,
+        // as td-setup's are; td-news, a toolkit consumer with no native
+        // case, adds two.
+        assert_eq!(comp.len(), 44, "{comp:?}");
         // Runtime td-vm/ spellings conservatively connect the same reader set.
         assert_eq!(vm, comp);
         assert_eq!(
@@ -7559,7 +7559,7 @@ mod tests {
                 // Test and clippy, plus the native fixture where declared.
                 assert_eq!(
                     commands.iter().filter(|c| c.contains(&manifest)).count(),
-                    if matches!(consumer, "td-news" | "td-mail" | "td-ui") { 2 } else { 3 },
+                    if matches!(consumer, "td-news" | "td-ui") { 2 } else { 3 },
                     "{path}: {consumer}"
                 );
             }
