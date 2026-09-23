@@ -44,25 +44,39 @@ window holds a draft the file is its own: an edit made to it elsewhere
 is overwritten by the next save. A draft larger than the document view's
 ceiling (16 MiB) is retained but not opened, and the log says so. Cut,
 copy and paste are Ctrl-X, Ctrl-C and Ctrl-V (Ctrl-A selects all): a
-selection made in any text, a message's view or an error's, is copied
-to the system clipboard and kept in td-mail's own kill ring, a cut one
-too, and a paste into a draft takes the system clipboard's text when it
-has any and the kill ring's otherwise. The clipboard's text arrives a
-moment later, into the draft it was asked for while that draft is still
-the one being edited; closed, under its save question or replaced by
-another draft, it goes nowhere. A refused copy or paste (a selection
-past the clipboard's 1 MiB ceiling, a paste still arriving, a paste
-that failed or was cancelled) is said in the status row until the next
-key; a held key repeats the kill ring's copy or paste only; and a
-compositor without a clipboard leaves the kill ring as the whole of
-it, silently. Nothing here deletes the draft or
-its attachment sidecar, and the log records both paths. Reopen the
-`.eml` file with an editor or file manager; delete it explicitly when no
-longer needed. The matching `td-mail-att-ID` directory belongs to
-`td-mail-draft-ID.eml`: keep it while the draft needs its attachments
-and remove it separately when discarding that draft. Moving only the
-`.eml` file does not move or rewrite attachment references. There is no
-draft-list UI or automatic expiry in this increment.
+selection made in any text, a message's view or an error's, is copied to
+the system clipboard and kept in td-mail's own kill ring, a cut one too,
+and a paste into a draft takes the system clipboard's text when it has
+any and the kill ring's otherwise. The clipboard's text arrives a moment
+later, into the draft it was asked for while that draft is still the one
+being edited; closed, under its save question or replaced by another
+draft, it goes nowhere. A refused copy or paste (a selection past the
+clipboard's 1 MiB ceiling, a paste still arriving, a paste that failed
+or was cancelled) is said in the status row until the next key; a held
+key repeats the kill ring's copy or paste only; and a compositor without
+a clipboard leaves the kill ring as the whole of it, silently. Nothing
+here deletes the draft or its attachment sidecar, and the log records
+both paths. D on the mailbox list (the Drafts label) lists the drafts
+retained and, after them, those sent to `sent` beside them, each newest
+first, with its Subject, To and when it last changed. Return, or a
+press, on a draft reopens it in the window to edit, with its attachment
+sidecar when it has one, so Send and Attach work as on a new draft; on a
+sent one it shows the file as it was retired, read-only. g reads the
+directories again, as closing a view over the list does, so a draft sent
+meanwhile is listed as sent, the selection kept on it. Only regular
+files named `td-mail-draft-ID.eml` are listed, the newest 1000 of the
+first 8192 names read from each directory (the status row says when it
+cut one short), and a directory that cannot be read is named in the
+status row. A draft with a send on record that has not settled (its
+`.lost` record is beside it: an answer lost, or a send that went before
+the retire) is marked `send unsettled`, and the status row says that its
+next Send asks the server first and, when that send went, sends none of
+the edits made since. The same file can also be opened with an editor or
+file manager; delete it explicitly when no longer needed. The matching
+`td-mail-att-ID` directory belongs to `td-mail-draft-ID.eml`: keep it
+while the draft needs its attachments and remove it separately when
+discarding that draft. Moving only the `.eml` file does not move or
+rewrite attachment references. Nothing expires a draft.
 
 ## Attaching
 

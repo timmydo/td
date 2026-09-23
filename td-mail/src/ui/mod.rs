@@ -32,6 +32,7 @@ use td_ui::menus;
 use td_ui::raster::{Raster, Surface};
 use td_ui::window::{Clipboard, Flow, Handler, Input, PointerPhase, Refusal};
 use views::compose::ComposeView;
+use views::drafts::DraftsView;
 use views::mailbox_list::MailboxListView;
 use views::{Body, Scene, Scroll, Slot, ViewAction, ViewStack};
 
@@ -385,6 +386,7 @@ impl Session {
             }
             ViewAction::Request(name) => self.request(name),
             ViewAction::ChooseAttachment => self.open_chooser(),
+            ViewAction::Drafts => self.drafts(),
         }
     }
 
@@ -759,6 +761,26 @@ impl Session {
             Ok(view) => self.act(ViewAction::Push(Box::new(view))),
             Err(e) => {
                 crate::log_error!("Failed to read the retained draft back: {}", e);
+                self.redraw();
+            }
+        }
+    }
+
+    /// The drafts retained where `compose` retains them, and those sent
+    /// beside them, listed; a directory the environment does not name is
+    /// logged and nothing opens.
+    fn drafts(&mut self) {
+        let dir = match &self.setup.draft_dir {
+            Some(dir) => Ok(dir.clone()),
+            None => compose::draft_dir(),
+        };
+        match dir {
+            Ok(dir) => self.act(ViewAction::Push(Box::new(DraftsView::new(
+                dir,
+                self.cmd_tx.clone(),
+            )))),
+            Err(e) => {
+                crate::log_error!("No drafts to list: {}", e);
                 self.redraw();
             }
         }
@@ -3356,5 +3378,122 @@ mod frame_tests {
             empty.stack.current().unwrap().scene().labels,
             &["Create", "Cancel"]
         );
+    }
+
+    /// D lists the drafts retained and those sent beside them, drafts
+    /// first; Return on a draft reopens it to edit, with its sidecar,
+    /// and on a sent one shows it read-only; the list is read again as
+    /// a view over it closes.
+    #[test]
+    fn the_drafts_view_lists_retained_and_sent_drafts_and_reopens_one() {
+        let (mut session, _cmd_rx, _resp_tx) = session(true);
+        let draft_dir = session.setup.draft_dir.clone().unwrap();
+        let sent_dir = draft_dir.parent().unwrap().join("sent");
+        let status = |session: &Session| session.stack.current().unwrap().scene().status;
+        key(&mut session, "D");
+        assert_eq!(session.title, "Drafts");
+        assert!(
+            text(&session).starts_with("No drafts or sent drafts in "),
+            "{}",
+            text(&session)
+        );
+        key(&mut session, "q");
+        assert_eq!(session.stack.depth(), 1);
+
+        key(&mut session, "c");
+        let path = draft_dir.join(session.title.trim_start_matches("Draft "));
+        key(&mut session, "C-w");
+        assert_eq!(session.stack.depth(), 1);
+        let draft = "From: me@example.com\nTo: bob@example.com\nSubject: Plans\n\
+                     --text follows this line--\nhi\n";
+        std::fs::write(&path, draft).unwrap();
+        let sidecar = attach::sidecar_for(&path).unwrap();
+        std::fs::create_dir(&sidecar).unwrap();
+        std::fs::create_dir_all(&sent_dir).unwrap();
+        let went = sent_dir.join("td-mail-draft-1-1.eml");
+        std::fs::write(&went, "Subject: Went\n\nbody\n").unwrap();
+
+        let selected = |session: &Session| match session.stack.current().unwrap().scene().body {
+            Body::List { selected, row, .. } => row(selected),
+            _ => panic!("the list"),
+        };
+        // A draft whose send lost its answer is marked, and says what its
+        // next Send does.
+        let record = compose::lost_record_for(&path);
+        std::fs::write(&record, "x").unwrap();
+        key(&mut session, "D");
+        assert_eq!(session.stack.depth(), 2);
+        assert!(
+            selected(&session)
+                .meta
+                .starts_with("draft, send unsettled "),
+            "{:?}",
+            selected(&session)
+        );
+        assert!(
+            status(&session).starts_with("A send of this draft is on record, unsettled: "),
+            "{}",
+            status(&session)
+        );
+        std::fs::remove_file(&record).unwrap();
+        key(&mut session, "g");
+        assert!(
+            status(&session).starts_with("1 draft, 1 sent"),
+            "{}",
+            status(&session)
+        );
+        let shown = session.shown();
+        let (plans, gone) = (shown.find("Plans — bob@example.com"), shown.find("Went"));
+        assert!(plans.is_some() && gone.is_some() && plans < gone, "{shown}");
+
+        // A draft reopens to edit, its sidecar with it.
+        key(&mut session, "Return");
+        assert_eq!(session.stack.depth(), 3);
+        assert_eq!(
+            session.title,
+            format!("Draft {}", path.file_name().unwrap().to_string_lossy())
+        );
+        assert_eq!(text(&session), draft);
+        assert!(
+            status(&session).contains(&format!("attachments at {}", sidecar.display())),
+            "{}",
+            status(&session)
+        );
+        key(&mut session, "C-w");
+        assert_eq!(session.stack.depth(), 2);
+        assert_eq!(session.title, "Drafts");
+
+        // Retired while it is open, the draft is listed as sent when the
+        // view closes, the selection on it, behind the newer sent one.
+        key(&mut session, "Return");
+        std::fs::rename(&path, sent_dir.join(path.file_name().unwrap())).unwrap();
+        key(&mut session, "C-w");
+        assert_eq!(session.title, "Drafts");
+        assert!(
+            status(&session).starts_with("0 drafts, 2 sent"),
+            "{}",
+            status(&session)
+        );
+        let on = selected(&session);
+        assert!(
+            on.label.starts_with("Plans") && on.meta.starts_with("sent "),
+            "{on:?}"
+        );
+
+        // A sent one shows read-only.
+        key(&mut session, "k");
+        key(&mut session, "Return");
+        assert_eq!(session.title, "Sent td-mail-draft-1-1.eml");
+        let tab = session.pane.tab().expect("the sent draft");
+        assert!(session.pane.editor().document(tab).unwrap().read_only());
+        assert!(
+            text(&session).starts_with("Subject: Went"),
+            "{}",
+            text(&session)
+        );
+        key(&mut session, "q");
+        assert_eq!(session.title, "Drafts");
+        key(&mut session, "q");
+        assert_eq!(session.stack.depth(), 1);
     }
 }

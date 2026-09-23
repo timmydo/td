@@ -992,7 +992,7 @@ fn prune_unsent(text: &str, dir: &Path) {
     }
 }
 
-fn draft_dir() -> io::Result<PathBuf> {
+pub(crate) fn draft_dir() -> io::Result<PathBuf> {
     draft_dir_from_env(std::env::var_os("XDG_STATE_HOME"), std::env::var_os("HOME"))
 }
 

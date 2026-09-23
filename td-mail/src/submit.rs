@@ -462,6 +462,33 @@ pub fn read_parts(parts: &[Part], ceiling: u64) -> Result<Vec<(usize, Vec<u8>)>,
     Ok(out)
 }
 
+/// The file at `path` opened to read, refused unless what was opened is
+/// a regular file; opened without blocking, as `read_regular` opens one,
+/// so a pipe put where the file was does not wait for a writer.
+pub fn open_regular(path: &Path) -> std::io::Result<std::fs::File> {
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(O_NONBLOCK)
+        .open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "not a regular file",
+        ));
+    }
+    Ok(file)
+}
+
+/// The regular file at `path` read to a byte past `ceiling` at most, so
+/// a longer one is told by its length rather than read whole.
+pub fn read_bounded(path: &Path, ceiling: usize) -> std::io::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    open_regular(path)?
+        .take(u64::try_from(ceiling).unwrap_or(u64::MAX).saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
 /// The attachment file at `path` read whole, refusing one that is not a
 /// regular file (a device or a pipe has no end to read to) or past
 /// `ceiling` bytes. It is opened without blocking, so a pipe put where

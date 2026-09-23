@@ -79,13 +79,15 @@ impl ComposeView {
         attachment_dir: Option<PathBuf>,
         cmd_tx: Sender<BackendCommand>,
     ) -> io::Result<Self> {
-        let text = std::fs::read_to_string(&path)?;
-        if text.len() > td_editor::text::MAX_FILE_BYTES {
+        let bytes = crate::submit::read_bounded(&path, td_editor::text::MAX_FILE_BYTES)?;
+        if bytes.len() > td_editor::text::MAX_FILE_BYTES {
             return Err(io::Error::other(format!(
                 "the draft is larger than the pane's ceiling of {} bytes",
                 td_editor::text::MAX_FILE_BYTES
             )));
         }
+        let text = String::from_utf8(bytes)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "the draft is not UTF-8"))?;
         let mut status = format!("Draft retained at {}", path.display());
         if let Some(dir) = &attachment_dir {
             status.push_str(&format!("; attachments at {}", dir.display()));

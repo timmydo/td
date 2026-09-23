@@ -12,6 +12,7 @@
 //! through `View::request`, with the draft in hand.
 
 pub mod compose;
+pub mod drafts;
 pub mod email_list;
 pub mod email_view;
 pub mod help;
@@ -30,13 +31,21 @@ use std::time::SystemTime;
 /// and this is called from a render path.
 static ZONE: OnceLock<Zone> = OnceLock::new();
 
-pub fn format_system_time(time: SystemTime) -> String {
+fn local_civil(time: SystemTime) -> civil::Civil {
     let duration = time
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap_or_default();
     let secs = i64::try_from(duration.as_secs()).unwrap_or(i64::MAX);
-    let (local, _offset) = ZONE.get_or_init(Zone::local).to_local(secs);
-    civil::format_hms(&local)
+    ZONE.get_or_init(Zone::local).to_local(secs).0
+}
+
+pub fn format_system_time(time: SystemTime) -> String {
+    civil::format_hms(&local_civil(time))
+}
+
+/// The local date and time of `time`.
+pub fn format_system_date_time(time: SystemTime) -> String {
+    civil::format_ymd_hms(&local_civil(time))
 }
 
 /// One row of a list: its label, the note at its right, and whether it is
@@ -145,6 +154,8 @@ pub enum ViewAction {
     /// draft; what is chosen, or that nothing was, reaches the view
     /// through `View::attach`.
     ChooseAttachment,
+    /// List the retained drafts and the sent ones beside them.
+    Drafts,
 }
 
 pub trait View {

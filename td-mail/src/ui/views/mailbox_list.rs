@@ -20,6 +20,7 @@ const LABELS: &[&str] = &[
     "Open",
     "Refresh",
     "Compose",
+    "Drafts",
     "Folder",
     "Mark read",
     "Account",
@@ -30,6 +31,7 @@ const KEYS: &[Key] = &[
     Key::Enter,
     Key::Char('g'),
     Key::Char('c'),
+    Key::Char('D'),
     Key::Menu(Menu::Folder),
     Key::Char('u'),
     Key::Char('a'),
@@ -225,17 +227,17 @@ impl MailboxListView {
             "Confirm delete | y:delete n/Esc:cancel".to_string()
         } else if self.loading {
             format!(
-                "Loading... | q:quit g:refresh c:compose +:new-folder d:delete-folder u:read-all x:preview-expire X:expire{}",
+                "Loading... | q:quit g:refresh c:compose D:drafts +:new-folder d:delete-folder u:read-all x:preview-expire X:expire{}",
                 account_hint
             )
         } else if self.mailboxes.is_empty() {
             format!(
-                "q:quit g:refresh c:compose +:new-folder x:preview-expire X:expire{}",
+                "q:quit g:refresh c:compose D:drafts +:new-folder x:preview-expire X:expire{}",
                 account_hint
             )
         } else {
             format!(
-                "{}/{} | q:quit n/p:navigate RET:open g:refresh c:compose +:new-folder d:delete-folder u:read-all x:preview-expire X:expire ?:help{}",
+                "{}/{} | q:quit n/p:navigate RET:open g:refresh c:compose D:drafts +:new-folder d:delete-folder u:read-all x:preview-expire X:expire ?:help{}",
                 self.cursor + 1,
                 self.mailboxes.len(),
                 account_hint,
@@ -483,6 +485,7 @@ impl View for MailboxListView {
                 let draft = compose::build_compose_draft(from);
                 ViewAction::Compose(draft.into())
             }
+            Key::Char('D') => ViewAction::Drafts,
             Key::Char('a') => {
                 if let Some(next) = self.next_account_name() {
                     ViewAction::SwitchAccount(next)

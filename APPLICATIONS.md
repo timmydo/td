@@ -10073,6 +10073,13 @@ in the body, else at the draft's end, so the send reads the copy and the
 copy retires with the draft, whose tags are pointed at the sidecar's
 place in `sent`, a copy whose tag was taken out removed as unsent.
 
+**Drafts: listed from the state directory.** D on the mailbox list lists
+the drafts retained under the state directory and those retired to
+`sent` beside them, read by td-mail itself, so it asks no grant beyond
+the state directory it already writes. A draft reopens in the pane to
+edit, with its sidecar, and sends and attaches as a new one does; a sent
+one shows read-only, as it was retired.
+
 ## X. Host mode — development only
 
 The separately specified td-pass standalone product is an explicit exception

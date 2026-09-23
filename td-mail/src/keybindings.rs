@@ -54,6 +54,12 @@ pub fn all_keybindings() -> Vec<KeyBinding> {
         },
         KeyBinding {
             view: "mailbox_list",
+            key: "D",
+            action: "drafts",
+            description: "List retained and sent drafts",
+        },
+        KeyBinding {
+            view: "mailbox_list",
             key: "+",
             action: "create_folder",
             description: "Create folder",
@@ -516,6 +522,24 @@ pub fn all_keybindings() -> Vec<KeyBinding> {
             key: "1-9",
             action: "open_url",
             description: "Open URL by number in configured browser",
+        },
+        KeyBinding {
+            view: "drafts",
+            key: "Enter",
+            action: "open",
+            description: "Reopen the draft to edit, or show the sent one read-only",
+        },
+        KeyBinding {
+            view: "drafts",
+            key: "g",
+            action: "refresh",
+            description: "Read the drafts and sent directories again",
+        },
+        KeyBinding {
+            view: "drafts",
+            key: "q",
+            action: "back",
+            description: "Back to the mailbox list",
         },
         // Compose: the draft in the editable pane, whose keys are
         // td-editor's default profile; the rest of the keyboard types.
