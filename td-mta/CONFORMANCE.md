@@ -4,7 +4,9 @@ This is the M01 coverage inventory for td-mta. Every endpoint, method and
 property below is **unimplemented**. The library skeleton advertises no JMAP
 capability. Tables name acceptance obligations and owning tasks, not passing
 tests. M02 freezes wire/error fixtures; M13-M17 implement them; M22/M24 prove
-real-client compatibility and standards coverage before release.
+real-client compatibility and standards coverage before release. API.md and
+QUEUE.md fix state/error and submission policies; these do not implement the
+endpoints inventoried below.
 
 Normative references: [RFC 8620](https://www.rfc-editor.org/rfc/rfc8620.html)
 and [RFC 8621](https://www.rfc-editor.org/rfc/rfc8621.html). Section numbers in
@@ -139,8 +141,9 @@ Filters to inventory in M02's wire fixtures:
 Required sort comparators are Mailbox `sortOrder` and `name`, Email
 `receivedAt`, and EmailSubmission `emailId`, `threadId` and `sentAt` (8621
 §§2.3, 4.4.2, 7.3). The last spelling is exactly as printed in §7.3, although
-the submission object property is `sendAt`; M02 must resolve that discrepancy
-in its wire fixtures before implementation. M02 selects additional comparators
+the submission object property is `sendAt`; QUEUE.md supports both comparator
+spellings against immutable sendAt, without adding an object property. M02c3
+adds their wire fixtures and selects additional comparators
 and collation behavior, with standard `unsupportedFilter`/`unsupportedSort`
 errors (8620 §5.5). ReceivedAt ascending/descending with an ID tie break is
 also required by td-mail. Required standards behavior remains a release gate

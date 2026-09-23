@@ -228,9 +228,12 @@ last-change sequence comes from the frame, not another embedded field. CHANGE
 uses a 16-byte object ID as key and no value; its type tags are Mailbox=1,
 Thread=2, Email=3, Identity=4, EmailSubmission=5. Unknown tags fail closed.
 Both row operations and CHANGE count toward frame/journal operation caps.
-CHANGE is evidence for state APIs, not a row mutation; M02c defines required
-coalescing from the final transaction view. A transaction may affect several
-JMAP types. Repeated writes to a key retain stored ordinal order; the final
+CHANGE is evidence for state APIs, not a row mutation; API.md defines required
+coalescing from the final transaction view. Identity=4 remains a known byte
+tag but is rejected by v1 transaction validation: identities are an atomic
+configuration snapshot, with their separate API.md state token.
+A transaction may affect several JMAP types. Repeated writes to a key retain
+stored ordinal order; the final
 operation wins. Byte/operation reservations include the entire frame and all
 descriptors, preventing apparently small metadata changes from exceeding caps.
 
@@ -347,7 +350,9 @@ attempt. Increment attemptCount with checked arithmetic; exhaustion refuses a
 new attempt. Nonzero count requires attempt, lastAttemptAt and a non-None
 phase; zero count forbids all three. Replies are optional, nonempty when
 present, normalized single-line SMTP replies, separately preserving RCPT and
-DATA results. Full reply syntax, multiline normalization and attribution are
+message-level results. dataReply also holds an actual negative MAIL/DATA-
+command refusal under QUEUE.md's attribution rules; positive MAIL/interim
+354 replies never substitute for final DATA acceptance. Full reply syntax, multiline normalization and attribution are
 M02c/M17 contracts; the codec enforces bounds and rejects controls. Local
 failures use reason/diagnostic and must not invent an SMTP response. Callers
 normalize multiline replies per RFC 8621 and replace/escape control characters

@@ -5,6 +5,8 @@ before changing persistence, queries, submission records, migration or backup.
 It specifies an unimplemented target. [FORMAT.md](FORMAT.md) owns the numeric
 registry and byte layout. M02 completes row codecs and golden fixtures before
 any production data is written; scalar/key codecs alone do not open a store.
+[API.md](API.md) owns adapter/state contracts; [QUEUE.md](QUEUE.md) owns the
+submission transition and restart contract.
 
 ## 1. Storage model
 
@@ -433,12 +435,13 @@ for /changes. Retain old segments separately from current-state replay, selected
 by the manifest. Default history targets seven days, subject to ceilings of
 128 MiB and 64 retained segments. Publish the retained sequence floor; a state
 older than it gets the protocol resynchronization error. A state token contains
-account, store epoch and sequence. Restoration changes the epoch. History
+account, store epoch, object type and account sequence (API.md). Restoration
+changes the epoch. History
 expiry is not permission to delete current rows or pending queue data.
 Read retained segments one at a time within the history/work budget. Return
 bounded change pages with hasMoreChanges and a state at a complete transaction
-boundary; never assemble all retained history in RAM. M02 specifies coalescing
-and the standard cannotCalculateChanges behavior when no legal page fits.
+boundary; never assemble all retained history in RAM. API.md specifies
+coalescing and cannotCalculateChanges behavior when no legal page fits.
 
 Historical PUT records may name bodies that are no longer live. /changes needs
 identity/change evidence, not historical body versions; retained history alone

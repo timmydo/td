@@ -16,6 +16,8 @@ format fixtures. [FORMAT.md](FORMAT.md) fixes their byte layout and the
 container registry; persistence and the remaining M02 contracts are not
 implemented by those codecs. [WIRE.md](WIRE.md) pins implemented wire-ID and
 MIME-part locator codecs separately from the future protocol handlers.
+[API.md](API.md) defines the compiling M02c2 adapter contracts and implemented
+state codecs; [QUEUE.md](QUEUE.md) freezes future queue/restart/JMAP semantics.
 
 The initial deployment is one person's approximately 1 GB of mail, multiple
 domains, and explicit aliases on each domain pointing into one account's
@@ -540,6 +542,9 @@ not decoded as documents. Index build, rebuild and query must obey section 5.
 
 ## 11. Submission and retry semantics
 
+[QUEUE.md](QUEUE.md) owns the exact transition, cancellation, retry and standard
+JMAP projection contract; the following summarizes its service behavior.
+
 Authorize identity, header From/Sender and envelope sender/recipients before
 creating a submission. Bound recipients, sizes, header injection and recipient
 expansion. Serialize structured JMAP messages into immutable MIME, including
@@ -584,7 +589,7 @@ mail remains queued subject to its normal expiry. Manual retry cannot bypass
 the route's concurrency or minimum retry interval.
 
 Default automatic retry starts at five minutes, doubles to an hourly cap with
-jitter, and expires after five days. Respect bounded server retry hints.
+jitter, and expires after five days. V1 ignores free-text server retry hints.
 Persist UTC scheduling data; use monotonic time within a running attempt and
 bound catch-up after clock changes/restart. No sleeping thread per queue item.
 Use a disk due-time index and fixed queue window, not an in-memory full queue.

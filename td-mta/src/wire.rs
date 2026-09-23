@@ -115,7 +115,7 @@ fn digit(value: u8) -> Result<u8, Error> {
         _ => Err(Error::Syntax),
     }
 }
-fn unhex<const N: usize>(bytes: &[u8]) -> Result<[u8; N], Error> {
+pub(crate) fn unhex<const N: usize>(bytes: &[u8]) -> Result<[u8; N], Error> {
     if bytes.len() != N.checked_mul(2).ok_or(Error::Overflow)? {
         return Err(Error::Syntax);
     }
@@ -126,7 +126,7 @@ fn unhex<const N: usize>(bytes: &[u8]) -> Result<[u8; N], Error> {
     }
     Ok(output)
 }
-fn hex(bytes: &[u8], output: &mut [u8]) -> Result<(), Error> {
+pub(crate) fn hex(bytes: &[u8], output: &mut [u8]) -> Result<(), Error> {
     let output = output
         .get_mut(..bytes.len().checked_mul(2).ok_or(Error::Overflow)?)
         .ok_or(Error::OutputFull)?;

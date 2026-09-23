@@ -167,5 +167,6 @@ existing storage-ID display spelling. Output refusal leaves caller storage
 unchanged. Production codecs allocate no memory and use checked
 slicing/arithmetic. These tests prove neither parent access checks nor
 parser matching; M06/M13-M15 must exercise those with actual MIME and
-account fixtures. State/error mappings, queue transitions, adapters, work
-budgets and the rest of the M02c wire inventory remain separate contracts.
+account fixtures. API.md now owns state/error mappings and adapter contracts;
+QUEUE.md owns queue transitions. Work budgets and the remaining M02c wire
+fixture inventory belong to M02c3.
