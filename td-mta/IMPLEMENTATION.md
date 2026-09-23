@@ -2,7 +2,8 @@
 
 ## How to use this plan
 
-Read `DESIGN.md`, root `AGENTS.md`, and `DEVELOPMENT.md` before work. This plan
+Read `DESIGN.md`, root `AGENTS.md`, and `DEVELOPMENT.md` before work.
+Storage tasks also read the normative `STORAGE.md`. This plan
 describes future implementation; none of its tasks are complete merely because
 this file exists. Its scope is the personal service specified in the design.
 
@@ -122,10 +123,12 @@ No network listeners or capabilities are enabled by this skeleton.
 **Depends on:** M01. **Own:** module interfaces, format specification and golden
 fixture descriptions. **Read:** DESIGN sections 8-11 and standards inventory.
 
-Write exact journal frame/commit/snapshot/CURRENT encodings, format version,
-checksums, endian rules, stable IDs, epoch handling, sequence exhaustion and
-transaction crash points. Define account/mailbox/email/thread/blob/submission
-records and indexes. Pin thread merge/ID behavior, duplicated Message-ID handling,
+Complete STORAGE.md's numeric field/table registry and exact byte offsets,
+with golden encodings for every row, journal frame, manifest and CURRENT.
+Preserve its chosen sorted-checkpoint/bounded-journal model, byte/operation
+ceilings, endian rules and authority distinctions. Pin sequence exhaustion,
+crash points and the source-key encoding; do not reopen the storage-engine
+choice in a consumer task. Pin thread merge/ID behavior, duplicated Message-ID handling,
 and multi-mailbox membership. Define the submission state transition table and
 its exact standard JMAP field mapping, including uncertain outcomes and partial
 recipient results. Freeze the adapter and store APIs in compiling modules.
@@ -181,6 +184,9 @@ store locking and initial replay; no search index or protocol endpoints.
 
 Implement exclusive store access, generated private paths, streamed temporary
 blobs, digesting through the adapter, file/directory sync and journal commit.
+Use STORAGE.md publication order, admission reservations and complete-frame
+versus incomplete-tail rules. Do not deduplicate bodies or pack MIME into a
+metadata value.
 Implement bounded sequential replay with incomplete-tail recovery and explicit
 interior-corruption refusal. Expose committed visibility only after durability.
 Provide deterministic failure injection before/after each filesystem operation.
@@ -232,16 +238,23 @@ the lock unnoticed. No live CA/provider contact and no ignore-cert-errors flag.
 snapshot/compaction, change history and garbage collection.
 
 Implement mailbox hierarchy/membership/keywords, immutable email objects,
-thread assignments, account state and retained changes. Use paged disk indexes
-with bounded cache and rebuild/merge work. Pin read/backup generations and
-implement atomic snapshot selection. Include upload/queue references in blob
-liveness. Enforce disk reservations and compaction overlap budgets.
+thread assignments, account state and retained changes. Implement STORAGE.md's sorted flat tables,
+fixed journal arenas/descriptors, exact-prefix read views and streaming merge.
+Pause new mutations during checkpointing; publish table/manifest/journal pairs
+through CURRENT in the specified order. Sparse/secondary disk indexes remain
+rebuildable. Bound retired-generation pins and enforce history floors, disk
+reservations and checkpoint overlap budgets. Implement body reclamation only
+inside the specified exclusive maintenance window, including queue/lease roots.
 
 **Acceptance:** remove indexes, rebuild and compare object IDs, bytes, folder
 membership and states. Readers never observe half a transaction or an index
 ahead of commit. Kill at every compaction/reclaim boundary. Old state tokens
 produce explicit resync errors; restored epochs cannot alias previous states.
-Scale many small objects without mailbox-sized RAM. Do not implement JMAP here.
+Scale many small objects without mailbox-sized RAM. Exercise both journal
+byte/operation ceilings, read views spanning commit/checkpoint, pin exhaustion,
+queue references after visible email deletion, and orphan cleanup after a failed
+publication. Inspect identical logical views before and after checkpointing.
+Do not implement JMAP here.
 
 ## M09 — Bounded DNS and outbound HTTPS transport
 
@@ -426,7 +439,8 @@ sink, runtime health/status aggregation and config generation lifecycle.
 
 Wire the DESIGN section 6 command set through a private control socket or
 exclusive offline lock. Implement versioned JSON output, pagination, queue
-inspection/operations, device creation/revocation, doctor, redacted config and
+inspection/operations, storage layout/record/journal inspection and raw export,
+device creation/revocation, doctor, redacted config and
 atomic reload. Add size-based log rotation, suppression counters and fallback
 diagnostics. Ensure a restart-required change does not partly apply.
 
@@ -442,7 +456,9 @@ or memory without bound. No public administrative API or shell hooks.
 backup manifests; reuse the store's codecs and locking rather than bypassing it.
 
 Implement read-only verify, explicit repair planning/apply while stopped,
-generation-pinned backup and restore to a new root. Preserve a pre-repair copy
+generation/prefix-pinned account backup and restore to a new root, following
+STORAGE.md. Snapshot service-wide credentials/configuration only while stopped
+until a separate consistency protocol exists. Preserve a pre-repair copy
 or manifest sufficient to audit changes. Rebuild indexes independently. Change
 store epoch on restore and refuse incompatible formats without altering them.
 

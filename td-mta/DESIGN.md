@@ -186,8 +186,8 @@ cgroup memory separately: filesystem page cache can affect the latter.
 Use a fixed set of long-lived workers, preallocated connection slots, and
 bounded queues of slot IDs. Allocate and touch application arenas before
 opening listeners. Do not spawn a thread per connection/request or load the
-mailbox's full metadata/content into RAM. Use bounded I/O chunks and an
-on-disk index with a fixed page cache. No unbounded mmap or memory-sized-to-mail
+mailbox's full metadata/content into RAM. Use bounded I/O chunks, sorted metadata files, and
+disposable disk indexes with a fixed cache. No unbounded mmap or memory-sized-to-mail
 strategy is permitted. Maintenance shares an explicit budget with live work.
 
 Initial default ceilings (validated together at startup):
@@ -206,6 +206,7 @@ Initial default ceilings (validated together at startup):
 | JMAP object IDs per get/set / query page | 256 / 256 |
 | JSON nesting / parser tokens per request | 32 / 32768 |
 | Combined resident index cache | 8 MiB |
+| Storage read views | 2, each with a 4 MiB journal arena plus bounded descriptors |
 | Unattached upload storage | 128 MiB per account, expiry after 24 hours |
 | Pending outbound storage | 256 MiB and 1000 submissions |
 | Active log plus retained generations | 8 MiB each, 4 retained |
@@ -279,6 +280,7 @@ Planned commands, with stable JSON output and exit codes:
 | `queue list`, `queue inspect ID` | Paginated status and redacted reasons |
 | `queue retry ID`, `queue cancel ID` | Named, journaled operation; never repeat accepted recipients |
 | `device create`, `device revoke ID` | Local credential administration |
+| `store layout`, `store inspect`, `store journal`, `store export` | Bounded read-only decoding/export under local administrator authority |
 | `store verify`, `store repair` | Read-only verification; explicit offline repair with a manifest |
 | `backup`, `restore`, `migrate` | Bounded, resumable tools using the storage contract |
 
@@ -342,81 +344,33 @@ reviewed artifact update. A test trust override must not disable verification.
 
 ## 8. On-disk store and crash consistency
 
-Use a local Linux filesystem supporting atomic same-filesystem rename, file
-and directory sync, and process-scoped exclusive locking. V1 supports ext4 and
-Btrfs after recovery tests; NFS and concurrent writers are unsupported. The
-store has a format version and service-instance identity. Refuse unknown newer
-formats; never guess or auto-downgrade them.
+[STORAGE.md](STORAGE.md) is the normative physical storage specification.
+Read it before implementing persistence, queries, queues, migration or backup.
+It owns the directory/file layout, authoritative row model, binary container
+rules, transaction publication, checkpoint/replay, bounded read views,
+reclamation, inspection commands and storage-engine comparison.
 
-Logical layout (all identifiers generated internally):
+The chosen representation is ordinary immutable `.eml` files plus compact
+binary metadata inspected through td-mta commands. Folder names, membership,
+keywords, JMAP IDs/history and submission outcomes are authoritative metadata;
+message bytes alone cannot reconstruct them. Parsed headers, offsets and search
+indexes are disposable caches. There is no requirement for Maildir compatibility
+or human editing of live metadata, and no database dependency is added.
 
-```text
-store/
-  FORMAT
-  LOCK
-  accounts/ACCOUNT/
-    blobs/SHARD/BLOB.eml
-    uploads/SHARD/BLOB
-    journal/SEGMENT
-    snapshots/GENERATION/
-    CURRENT
-    indexes/GENERATION/
-    tmp/
-  acme/
-  devices/
-```
+One sorted metadata checkpoint plus a bounded recent-change journal forms the
+current account state. The single writer pauses new mutation admission during
+checkpointing; readers pin a checkpoint and an exact committed journal prefix.
+This is a small purpose-built storage engine with explicit recovery obligations,
+not a claim that filesystem rename alone supplies multi-object transactions.
+Large message bytes are streamed and never included in metadata checkpoints.
 
-Immutable raw messages and committed metadata snapshots/journals are the source
-of truth. Metadata contains stable email/mailbox/thread/submission IDs,
-mailbox membership, keywords, received dates, blob references, and queue state.
-Index files are disposable accelerators; deleting them must not lose mail,
-folder membership, read flags, submission outcomes, or change history still
-within retention. A single message can belong to multiple JMAP mailboxes.
-Blob equality does not imply email-object equality: distinct deliveries remain
-distinct even with identical bytes or Message-ID headers.
-
-One writer serializes transactions for the initial account. Readers operate on
-immutable committed generations. Small operations follow this publication:
-
-1. Stream new immutable data to exclusively created temporary files while
-   checking limits and calculating its digest.
-2. Sync each file, publish its final generated pathname on the same filesystem,
-   and sync the affected directories. Existing committed files are not replaced.
-3. Append a length-delimited, checksummed, versioned metadata transaction with
-   a monotonic sequence and commit boundary; sync the journal.
-4. Publish its in-memory visibility and answer success. Derived indexes may
-   lag, but reads must overlay committed journal changes correctly.
-
-Recovery streams from the selected snapshot and replays complete transactions.
-An incomplete final uncommitted frame is ignored and reported. Interior damage,
-sequence discontinuity, or missing committed blobs stops mutation and requires
-diagnosis; never skip arbitrary corrupt lines to appear healthy. Data published
-before an uncommitted transaction is orphaned and can be collected only after
-recovery proves it unreferenced. A failed sync has uncertain persistence:
-stop the writer and recover, rather than returning success or appending past it.
-
-Snapshot/compaction publication writes and syncs a new generation, atomically
-replaces CURRENT, and syncs its directory before old generations are reclaimed.
-Pin generations for active readers/backups. The format increment must specify
-the exact framing, endianness, checksums, replay rules, and crash points with
-golden fixtures before any protocol writer is implemented. Use explicit fixed-
-width integers and checked conversions; never serialize Rust memory layouts.
-
-Maintain indexes with fixed-size pages, bounded cache, and external merge or
-incremental work; no full-mailbox in-memory map. Change-state tokens include
-the account/store epoch and sequence. Restoring a backup changes the epoch so
-stale client states cannot appear current. Retain at least seven days of change
-history subject to a configured disk ceiling; older states explicitly return
-the JMAP resynchronization error. Stable object IDs survive compaction.
-
-Disk quotas account for uploads, queue blobs, journals, scratch, and compaction
-overlap, not just delivered email bytes. Reserve cleanup/recovery headroom and
-refuse admission before exhausting it. Because external disk consumers can
-still fill the device, every write/sync handles ENOSPC/EIO. No body-sized RAM
-fallback is permitted. Backups use a pinned consistent generation, or a fully
-stopped service, and include referenced blobs, credentials/config as explicitly
-selected, and a verification manifest. Restore is tested, not inferred from
-successful copying. Runtime sockets and disposable indexes are not backups.
+The core publication rule remains: sync new immutable bytes and their published
+directory entries, then append/sync the complete metadata transaction, then
+expose it and acknowledge success. Preserve queued transmitted bytes independently
+of the visible email's lifetime. A failed sync stops the writer for recovery.
+Storage corruption is distinct from a rebuildable index failure. Account backups
+pin one exact view; capturing all service secrets/configuration initially requires
+a stopped whole-service backup.
 
 ## 9. SMTP receiving and message representation
 
