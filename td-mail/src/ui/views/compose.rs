@@ -380,7 +380,8 @@ impl View for ComposeView {
                     return ViewAction::Continue;
                 }
                 self.status = "Attach: Return opens a folder or attaches the file, \
-                    Backspace on an empty filter goes up, a letter filters, Escape cancels"
+                    Backspace on an empty filter goes up, a letter filters, \
+                    Ctrl-H shows or hides hidden files, Escape cancels"
                     .to_string();
                 self.choosing = true;
                 ViewAction::ChooseAttachment

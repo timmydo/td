@@ -265,6 +265,9 @@ struct Session {
     /// The folder a file was last attached from, where the next finder
     /// opens.
     attach_folder: Option<PathBuf>,
+    /// Whether the finder lists names beginning `.`, Ctrl-H's toggle,
+    /// kept for the next finder.
+    attach_hidden: bool,
 }
 
 impl Session {
@@ -297,6 +300,7 @@ impl Session {
             menu: None,
             chooser: None,
             attach_folder: None,
+            attach_hidden: false,
         };
         // The window reads the title at binding, before any poll.
         session.refresh_title();
@@ -400,8 +404,9 @@ impl Session {
         let Some(shape) = self.shape() else {
             return;
         };
+        let hidden = self.attach_hidden;
         let remembered = self.attach_folder.clone().and_then(|folder| {
-            match attach::list_folder(&folder, attach::CEILING) {
+            match attach::list_folder(&folder, attach::CEILING, hidden) {
                 Ok(listing) => Some((folder, listing)),
                 Err(_) => {
                     self.attach_folder = None;
@@ -413,7 +418,7 @@ impl Session {
             Some((folder, listing)) => (folder, Ok(listing)),
             None => {
                 let folder = attach::start_folder();
-                let listed = attach::list_folder(&folder, attach::CEILING);
+                let listed = attach::list_folder(&folder, attach::CEILING, hidden);
                 (folder, listed)
             }
         };
@@ -485,8 +490,9 @@ impl Session {
     /// An input while the finder is open, which is the finder's: its keys
     /// as the chord names them (Return opens a folder or chooses the
     /// file, Ctrl-Return chooses it, Backspace on an empty filter, Alt-Up
-    /// and `^` go up, Escape closes it, and a single printable character
-    /// filters) and every other chord consumed; the pointer's press, move
+    /// and `^` go up, Ctrl-H shows or hides names beginning `.`, Escape
+    /// closes it, and a single printable character filters) and every
+    /// other chord consumed; the pointer's press, move
     /// and release, a second press on the same row of its list soon after
     /// the first choosing it as Return does; and the wheel over its list;
     /// with the mouse off, the pointer and the wheel are consumed unread.
@@ -514,6 +520,13 @@ impl Session {
                 "M-Up" | "^" => key(finder::Key::Parent, repeat),
                 "Escape" => key(finder::Key::Escape, repeat),
                 "Space" => finder::Event::Insert(' '),
+                "C-h" => {
+                    if !repeat {
+                        self.last_user_activity = Instant::now();
+                        self.toggle_hidden();
+                    }
+                    return true;
+                }
                 _ => {
                     let mut chars = chord.chars();
                     match (chars.next(), chars.next()) {
@@ -653,13 +666,46 @@ impl Session {
         }
     }
 
+    /// Ctrl-H in the finder: names beginning `.` shown when they were
+    /// left out and left out when shown, here and in the next finder,
+    /// the folder listed again with the selected entry kept when it is
+    /// still listed, and the status row saying which; a folder that
+    /// cannot be listed again leaves the setting as it was, the reason
+    /// in the status row.
+    fn toggle_hidden(&mut self) {
+        let Some((folder, select)) = self.chooser.as_ref().map(|chooser| {
+            let select = chooser
+                .finder
+                .selected_entry()
+                .map(|entry| entry.name().to_string());
+            (chooser.folder.clone(), select)
+        }) else {
+            return;
+        };
+        self.attach_hidden = !self.attach_hidden;
+        if !self.chooser_list(folder, select.as_deref()) {
+            self.attach_hidden = !self.attach_hidden;
+            return;
+        }
+        let note = if self.attach_hidden {
+            "Hidden files shown; Ctrl-H hides them"
+        } else {
+            "Hidden files left out; Ctrl-H shows them"
+        };
+        if let Some(chooser) = self.chooser.as_mut() {
+            if let Err(e) = chooser.finder.set_note(note) {
+                crate::log_error!("finder note: {}", e);
+            }
+        }
+    }
+
     /// The finder shows `folder`, `select` selected when listed; a folder
     /// that cannot be listed leaves it where it was, the reason in its
-    /// status row.
-    fn chooser_list(&mut self, folder: PathBuf, select: Option<&str>) {
-        let listed = attach::list_folder(&folder, attach::CEILING);
+    /// status row. Whether it was listed.
+    fn chooser_list(&mut self, folder: PathBuf, select: Option<&str>) -> bool {
+        let listed = attach::list_folder(&folder, attach::CEILING, self.attach_hidden);
         let Some(chooser) = self.chooser.as_mut() else {
-            return;
+            return false;
         };
         let installed = listed.and_then(|listing| {
             chooser
@@ -667,16 +713,21 @@ impl Session {
                 .set_listing(listing, select)
                 .map_err(|e| format!("{}: {e}", folder.display()))
         });
-        match installed {
-            Ok(()) => chooser.folder = folder,
+        let listed = match installed {
+            Ok(()) => {
+                chooser.folder = folder;
+                true
+            }
             Err(why) => {
                 if let Err(e) = chooser.finder.set_note(&fit_note(&why)) {
                     crate::log_error!("finder note: {}", e);
                 }
+                false
             }
-        }
+        };
         chooser.press = None;
         self.redraw();
+        listed
     }
 
     /// Retains the draft as a file, as the `$EDITOR` child was handed
@@ -2534,6 +2585,116 @@ mod frame_tests {
             std::fs::read(retired.join("report-2.pdf")).unwrap(),
             b"%PDF"
         );
+    }
+
+    /// Ctrl-H in the finder lists the names beginning `.` and leaves them
+    /// out again, the filter cleared and the selection kept (the first
+    /// when it is hidden), the status row saying which, the draft
+    /// untouched and a held key's repeats ignored; a folder that cannot
+    /// be listed again keeps the setting; the next finder opens as the
+    /// last was left.
+    #[test]
+    fn ctrl_h_in_the_finder_shows_and_hides_hidden_files() {
+        let (mut session, _cmd_rx, _resp_tx) = session(true);
+        let state = session
+            .setup
+            .draft_dir
+            .clone()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        key(&mut session, "c");
+        let template = text(&session);
+        let files = state.join("files");
+        std::fs::create_dir_all(files.join(".config")).unwrap();
+        std::fs::write(files.join(".profile"), b"p").unwrap();
+        std::fs::write(files.join("notes.txt"), b"n").unwrap();
+        std::fs::write(files.join("zeta.txt"), b"z").unwrap();
+        session.attach_folder = Some(files.clone());
+        let names = |session: &Session| -> Vec<String> {
+            let chooser = session.chooser.as_ref().unwrap();
+            chooser
+                .finder
+                .listing()
+                .entries()
+                .iter()
+                .map(|entry| entry.name().to_string())
+                .collect()
+        };
+        let note = |session: &Session| session.chooser.as_ref().unwrap().finder.note().to_string();
+
+        key(&mut session, "C-S-a");
+        assert_eq!(names(&session), ["notes.txt", "zeta.txt"]);
+        key(&mut session, "n");
+        assert_eq!(session.chooser.as_ref().unwrap().finder.query(), "n");
+        key(&mut session, "C-h");
+        assert_eq!(
+            names(&session),
+            [".config", ".profile", "notes.txt", "zeta.txt"]
+        );
+        assert_eq!(session.chooser.as_ref().unwrap().finder.query(), "");
+        let chooser = session.chooser.as_ref().unwrap();
+        assert_eq!(chooser.folder, files);
+        assert_eq!(chooser.finder.selected_entry().unwrap().name(), "notes.txt");
+        assert_eq!(note(&session), "Hidden files shown; Ctrl-H hides them");
+        assert!(session.shown().contains(".profile"), "{}", session.shown());
+        assert_eq!(text(&session), template, "the chord is the finder's");
+        // A held Ctrl-H's repeats change nothing.
+        session.input(
+            Input::Key {
+                chord: "C-h",
+                repeat: true,
+            },
+            &mut NoClipboard,
+        );
+        assert_eq!(names(&session).len(), 4);
+        // Hidden again in the same finder with a dot file selected: the
+        // selection goes to the first listed.
+        key(&mut session, "Up");
+        assert_eq!(
+            session
+                .chooser
+                .as_ref()
+                .unwrap()
+                .finder
+                .selected_entry()
+                .unwrap()
+                .name(),
+            ".profile"
+        );
+        key(&mut session, "C-h");
+        assert_eq!(names(&session), ["notes.txt", "zeta.txt"]);
+        assert_eq!(note(&session), "Hidden files left out; Ctrl-H shows them");
+        let chooser = session.chooser.as_ref().unwrap();
+        assert_eq!(chooser.finder.selected_entry().unwrap().name(), "notes.txt");
+        key(&mut session, "C-h");
+        assert_eq!(names(&session).len(), 4);
+        // A folder that cannot be listed again keeps the setting and the
+        // listing, the reason in the status row.
+        std::fs::rename(&files, state.join("moved")).unwrap();
+        key(&mut session, "C-h");
+        assert!(session.attach_hidden, "still shown");
+        assert_eq!(names(&session).len(), 4);
+        assert!(
+            note(&session).contains("No such file"),
+            "the reason, not the toggle's note: {}",
+            note(&session)
+        );
+        std::fs::rename(state.join("moved"), &files).unwrap();
+        key(&mut session, "Escape");
+        assert!(session.chooser.is_none());
+
+        key(&mut session, "C-S-a");
+        assert_eq!(
+            names(&session),
+            [".config", ".profile", "notes.txt", "zeta.txt"]
+        );
+        key(&mut session, "C-h");
+        assert_eq!(names(&session), ["notes.txt", "zeta.txt"]);
+        assert_eq!(note(&session), "Hidden files left out; Ctrl-H shows them");
+        key(&mut session, "Escape");
+        assert_eq!(text(&session), template);
     }
 
     /// `c` retains a draft and opens it in the pane, editable and

@@ -40,11 +40,11 @@ pub const EXAMINED: usize = 16 * finder::ENTRIES;
 /// the listing says it was cut short when an entry that would be listed
 /// was left out or the read stopped at `EXAMINED`. A link is followed to learn
 /// what it is, a folder shown marked `link`; a file shows its size and
-/// is disabled past `ceiling`. A name beginning `.`, an entry that is
-/// neither a folder nor a regular file (a pipe, a socket, a device), one
-/// gone or unreadable between the read and its type, and a name that is
-/// not text or that the finder cannot show, are left out.
-pub fn list_folder(path: &Path, ceiling: u64) -> Result<finder::Listing, String> {
+/// is disabled past `ceiling`. A name beginning `.` unless `hidden`, an
+/// entry that is neither a folder nor a regular file (a pipe, a socket,
+/// a device), one gone or unreadable between the read and its type, and
+/// a name that is not text or that the finder cannot show, are left out.
+pub fn list_folder(path: &Path, ceiling: u64, hidden: bool) -> Result<finder::Listing, String> {
     let named = |e: io::Error| format!("{}: {e}", path.display());
     // (folders before files, the name with case aside, the name, the
     // size, a link): a max-heap keeps the first ENTRIES in that order.
@@ -61,8 +61,9 @@ pub fn list_folder(path: &Path, ceiling: u64) -> Result<finder::Listing, String>
         let Some(name) = entry.file_name().to_str().map(str::to_string) else {
             continue;
         };
-        // A hidden name, and one the finder would refuse, take no place.
-        if name.starts_with('.')
+        // A hidden name unless asked for, and one the finder would
+        // refuse, take no place.
+        if (!hidden && name.starts_with('.'))
             || name.len() > finder::NAME_BYTES
             || name.chars().any(char::is_control)
         {
@@ -431,7 +432,7 @@ mod tests {
         // leaves the case untried rather than the test failed.
         let _socket = std::os::unix::net::UnixListener::bind(dir.join("sock"));
 
-        let listing = list_folder(&dir, 100).unwrap();
+        let listing = list_folder(&dir, 100, false).unwrap();
         assert_eq!(listing.path(), dir.to_string_lossy());
         assert!(!listing.truncated());
         let shown: Vec<(&str, &str, finder::Kind, bool)> = listing
@@ -451,9 +452,24 @@ mod tests {
                 ("to-b", "5 B", finder::Kind::File, true),
             ]
         );
-        assert!(list_folder(&dir.join("missing"), 100)
+        assert!(list_folder(&dir.join("missing"), 100, false)
             .unwrap_err()
             .contains("missing"));
+        // Asked for, the hidden are listed among the rest, in the same
+        // order.
+        let names: Vec<String> = list_folder(&dir, 100, true)
+            .unwrap()
+            .entries()
+            .iter()
+            .map(|e| e.name().to_string())
+            .collect();
+        assert_eq!(
+            names,
+            [
+                ".hidden", "Alpha", "beta", "to-beta", ".secret", "A.pdf", "b.txt", "big.bin",
+                "to-b"
+            ]
+        );
         fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -467,7 +483,7 @@ mod tests {
             fs::write(dir.join(format!("f{n:05}")), b"").unwrap();
         }
         fs::create_dir(dir.join("z-folder")).unwrap();
-        let listing = list_folder(&dir, 100).unwrap();
+        let listing = list_folder(&dir, 100, false).unwrap();
         assert!(listing.truncated());
         let names: Vec<&str> = listing.entries().iter().map(|e| e.name()).collect();
         assert_eq!(names.len(), finder::ENTRIES);

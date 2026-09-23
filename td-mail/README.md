@@ -74,7 +74,10 @@ Alt-Up and `^` go up, typed characters filter the names, and Escape
 closes the finder with nothing attached. It lists the folders and
 regular files td-mail can read (in its jail its state directory and the
 Downloads grant, on a host everything), leaving out names beginning with
-`.`, folders first and each sorted; a folder of more than 4096 of them
+`.` until Ctrl-H shows them (Ctrl-H again leaves them out, the folder
+listed again with the filter cleared and the selection kept, the status
+row saying which; the choice holds for the next finder while td-mail
+runs), folders first and each sorted; a folder of more than 4096 of them
 shows the first 4096 in that order, and one of more than 65536 entries
 is read that far. A file past the fetch service's 32 MiB request bound
 is shown dimmed and cannot be chosen, since it could not be sent. The
