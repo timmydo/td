@@ -6,13 +6,15 @@
 //! the view under a popped one is back where it was read to. The pane
 //! keeps the kill ring too: a selection cut or copied in any of its
 //! documents, pasted into an editable one; the session offers the same
-//! selection to the window's clipboard and pastes what it answers.
+//! selection to the window's clipboard and pastes what it answers. The
+//! finder a draft's Attach opens is painted over the body in its place.
 
 use std::sync::Arc;
 use td_editor::clipboard::{Paste, Snapshot};
-use td_editor::model::{Command, SavePoint, TabId};
+use td_editor::model::{Command, SavePoint, Selection, TabId};
 use td_editor::ui::{Controller, Event, Outcome, PointerPhase as PanePhase};
 use td_ui::chrome::{Bar, Field, Item, List, Status, TextEntry, ROW};
+use td_ui::finder;
 use td_ui::raster::{Composition, Draw, Primitive, Raster, Rect, Surface, PAPER};
 use td_ui::window::PointerPhase;
 
@@ -46,6 +48,9 @@ pub struct Layout {
     pub entry: Option<TextEntry>,
     pub list: Option<List>,
     pub pane: Option<Rect>,
+    /// The band between the entry, or the bar, and the status row, which
+    /// the list or the pane fills, and the finder when one is open.
+    pub body: Rect,
     pub status: Status,
 }
 
@@ -71,6 +76,7 @@ impl Layout {
             entry: None,
             list: None,
             pane: None,
+            body,
             status,
         };
         if scene.entry.is_some() {
@@ -86,6 +92,7 @@ impl Layout {
                 };
             }
         }
+        layout.body = body;
         match scene.body {
             Body::List { .. } => layout.list = List::new(surface, body),
             Body::Text { .. } | Body::Edit { .. } => {
@@ -377,6 +384,60 @@ impl Pane {
         self.kill.clone()
     }
 
+    /// `text` at the end of the document `tab`, as a paste is put, on a
+    /// line of its own: the caret is put at the end first by selection,
+    /// not by a chord (which the pane's keymap may take otherwise, or
+    /// refuse unfocused), and the text goes in only when it is there; a
+    /// newline goes before the text when the document does not end in
+    /// one. Whether the document changed (a read-only one does not), or
+    /// why the text was refused.
+    fn append(&mut self, tab: TabId, text: &str) -> Result<bool, String> {
+        let Ok(document) = self.controller.editor().document(tab) else {
+            return Ok(false);
+        };
+        if document.read_only() {
+            return Ok(false);
+        }
+        let text = if document.text().is_empty() || document.text().ends_with('\n') {
+            text.to_string()
+        } else {
+            format!("\n{text}")
+        };
+        let end = document.text().len();
+        let Some((tab, revision)) = self.target_of(tab) else {
+            return Ok(false);
+        };
+        self.event(Event::Edit {
+            tab,
+            revision,
+            command: Command::Select(Selection {
+                anchor: end,
+                caret: end,
+            }),
+        });
+        let at_end = self
+            .controller
+            .editor()
+            .document(tab)
+            .is_ok_and(|document| {
+                let selection = document.selection();
+                document.text().len() == end && selection.anchor == end && selection.caret == end
+            });
+        if !at_end {
+            return Err("the draft's end could not be reached".to_string());
+        }
+        let Some((tab, revision)) = self.target_of(tab) else {
+            return Ok(false);
+        };
+        let paste = Paste::begin(self.controller.editor(), tab, revision)
+            .and_then(|mut paste| {
+                paste.push(text.as_bytes())?;
+                Ok(paste)
+            })
+            .map_err(|error| describe(error, "the text"))?;
+        Ok(self.event(Event::Paste(paste)) == Outcome::Changed)
+    }
+
     /// The kill ring into the document, over its selection: whether the
     /// document changed, or why the paste was refused.
     pub fn paste(&mut self) -> Result<bool, String> {
@@ -513,6 +574,15 @@ impl<'a> Draft<'a> {
         }
     }
 
+    /// `text` on a line of its own at the end of the document, the caret
+    /// after it: whether the document changed, or why it was refused.
+    pub fn append(&mut self, text: &str) -> Result<bool, String> {
+        match self.tab {
+            Some(tab) => self.pane.append(tab, text),
+            None => Ok(false),
+        }
+    }
+
     /// Whether the document is held read-only: the pane keeps its keys,
     /// selection, motion and find included, and typing is ignored.
     pub fn hold(&mut self, held: bool) {
@@ -566,6 +636,8 @@ pub struct Frame<'a> {
     pub first: usize,
     pub entry_first: usize,
     pub pane: &'a Pane,
+    /// The finder open over the body, painted in its place.
+    pub chooser: Option<&'a finder::Controller>,
     /// The dropdown open over the frame, painted last.
     pub menu: Option<&'a Dropdown>,
 }
@@ -605,6 +677,7 @@ impl Composition for Frame<'_> {
             );
         }
         match &self.scene.body {
+            _ if self.chooser.is_some() => {}
             Body::List {
                 total,
                 selected,
@@ -633,6 +706,9 @@ impl Composition for Frame<'_> {
                     self.pane.emit(damage, sink);
                 }
             }
+        }
+        if let Some(chooser) = self.chooser {
+            chooser.emit(damage, sink);
         }
         layout.status.emit(self.scene.status.chars(), damage, sink);
         if let Some(menu) = self.menu {
@@ -827,5 +903,52 @@ mod tests {
         pane.close(draft);
         pane.close(text);
         assert_eq!(pane.editor().tabs().count(), 0);
+    }
+
+    /// Appended text goes on a line of its own at the end of the draft,
+    /// wherever the caret was, the caret after it; a held draft, a
+    /// read-only text and no document take nothing.
+    #[test]
+    fn appended_text_goes_on_its_own_line_at_the_drafts_end() {
+        let mut pane = Pane::new().unwrap();
+        let mut draft = None;
+        pane.edit(&mut draft, "d", || {
+            "To: a\n--text follows this line--\nhi".to_string()
+        });
+        let tab = pane.tab().expect("the draft");
+        assert_eq!(pane.chord("C-Home"), Outcome::Changed);
+        // Unfocused, where the pane takes no chord, the end is still
+        // reached.
+        pane.focus(false);
+        assert_eq!(
+            Draft::new(&mut pane, Some(tab)).append("<#part>\n"),
+            Ok(true)
+        );
+        pane.focus(true);
+        let text = || pane.editor().document(tab).unwrap().text().to_string();
+        assert_eq!(text(), "To: a\n--text follows this line--\nhi\n<#part>\n");
+        assert_eq!(
+            Draft::new(&mut pane, Some(tab)).append("<#two>\n"),
+            Ok(true)
+        );
+        assert_eq!(pane.chord("x"), Outcome::Changed);
+        assert_eq!(
+            pane.editor().document(tab).unwrap().text(),
+            "To: a\n--text follows this line--\nhi\n<#part>\n<#two>\nx",
+            "the caret is after what was appended"
+        );
+        Draft::new(&mut pane, Some(tab)).hold(true);
+        assert_eq!(Draft::new(&mut pane, Some(tab)).append("no"), Ok(false));
+        let mut shown = None;
+        pane.show(&mut shown, "t", 40, || "read".to_string());
+        let read = pane.tab();
+        assert_eq!(Draft::new(&mut pane, read).append("no"), Ok(false));
+        assert_eq!(Draft::new(&mut pane, None).append("no"), Ok(false));
+        assert_eq!(
+            pane.editor().document(read.unwrap()).unwrap().text(),
+            "read"
+        );
+        pane.close(draft);
+        pane.close(shown);
     }
 }

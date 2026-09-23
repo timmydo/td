@@ -5,12 +5,14 @@
 //! action bar, text entry and list, and td-editor's document pane,
 //! read-only for a message and editable for a draft. The window owns
 //! the Wayland connection; the session owns the views, the pane, the
-//! backend and the account.
+//! backend and the account, and the finder a draft's Attach opens over
+//! the body.
 
 pub mod frame;
 pub mod input;
 pub mod views;
 
+use crate::attach;
 use crate::backend::{self, BackendCommand, BackendResponse};
 use crate::compose;
 use crate::config::{AccountConfig, RetentionPolicyConfig, SpamConfig};
@@ -19,12 +21,13 @@ use crate::rules::CompiledRule;
 use frame::{Draft, Dropdown, Frame, Layout, Pane};
 use input::{Key, Menu};
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use td_editor::model::TabId;
 use td_editor::ui::Outcome;
+use td_ui::finder;
 use td_ui::menus;
 use td_ui::raster::{Raster, Surface};
 use td_ui::window::{Clipboard, Flow, Handler, Input, PointerPhase, Refusal};
@@ -46,6 +49,14 @@ const TITLE_SCALARS: usize = 256;
 /// The chord that sends the draft being edited, Ctrl-Enter, which the
 /// pane does not bind; every other chord is the pane's while editing.
 const SEND_CHORD: &str = "C-Return";
+
+/// The chord that opens the finder for a file to attach to the draft
+/// being edited, Ctrl-Shift-A, which the pane does not bind either.
+const ATTACH_CHORD: &str = "C-S-a";
+
+/// How soon a second press on the finder's row must follow the first to
+/// choose it, as Return does.
+const DOUBLE_PRESS: Duration = Duration::from_millis(400);
 
 /// Wait on a fire-and-forget child in a detached thread so it does not linger
 /// as a zombie. `Child` has no reaping `Drop` impl, so a dropped handle leaks a
@@ -206,6 +217,17 @@ enum Ask {
     },
 }
 
+/// The finder open over the body for a file to attach: the toolkit's
+/// controller, the folder it lists, the draft it was opened for, and
+/// the last press on an entry of its list, when and which, for a second
+/// on the same entry.
+struct Chooser {
+    finder: finder::Controller,
+    folder: PathBuf,
+    tab: Option<TabId>,
+    press: Option<(Instant, usize)>,
+}
+
 struct Session {
     setup: Setup,
     stack: ViewStack,
@@ -237,6 +259,12 @@ struct Session {
     /// key and press until it activates one of the view's keys or is
     /// dismissed.
     menu: Option<Dropdown>,
+    /// The finder a draft's Attach opened, over the body and taking
+    /// every key and press until a file is chosen or it is closed.
+    chooser: Option<Chooser>,
+    /// The folder a file was last attached from, where the next finder
+    /// opens.
+    attach_folder: Option<PathBuf>,
 }
 
 impl Session {
@@ -267,6 +295,8 @@ impl Session {
             paste_target: None,
             note: None,
             menu: None,
+            chooser: None,
+            attach_folder: None,
         };
         // The window reads the title at binding, before any poll.
         session.refresh_title();
@@ -350,7 +380,303 @@ impl Session {
                 }
             }
             ViewAction::Request(name) => self.request(name),
+            ViewAction::ChooseAttachment => self.open_chooser(),
         }
+    }
+
+    /// The top view's document in the pane: its draft, when it edits one.
+    fn top_tab(&self) -> Option<TabId> {
+        self.stack
+            .top()
+            .and_then(|slot| slot.text.as_ref().map(frame::Shown::tab))
+    }
+
+    /// Opens the finder over the body for a file to attach to the top
+    /// view's draft, on the folder one was last attached from while it
+    /// can be listed, else the start folder; one that cannot be listed,
+    /// or a body that cannot hold the finder, is the view's `attach` with
+    /// nothing and the status row's note.
+    fn open_chooser(&mut self) {
+        let Some(shape) = self.shape() else {
+            return;
+        };
+        let remembered = self.attach_folder.clone().and_then(|folder| {
+            match attach::list_folder(&folder, attach::CEILING) {
+                Ok(listing) => Some((folder, listing)),
+                Err(_) => {
+                    self.attach_folder = None;
+                    None
+                }
+            }
+        });
+        let (folder, listed) = match remembered {
+            Some((folder, listing)) => (folder, Ok(listing)),
+            None => {
+                let folder = attach::start_folder();
+                let listed = attach::list_folder(&folder, attach::CEILING);
+                (folder, listed)
+            }
+        };
+        let opened = listed.and_then(|listing| {
+            finder::Controller::new(
+                listing,
+                finder::Choose::File,
+                self.surface,
+                shape.layout.body,
+                None,
+            )
+            .map_err(|e| format!("the window cannot show the finder: {e}"))
+        });
+        let tab = self.top_tab();
+        match opened {
+            Ok(finder) => {
+                // The pointer is the finder's now; a drag cannot go on.
+                if self.pane.drag {
+                    self.pane.cancel_pointer();
+                }
+                self.chooser = Some(Chooser {
+                    finder,
+                    folder,
+                    tab,
+                    press: None,
+                });
+                self.redraw();
+            }
+            Err(why) => {
+                self.attach_chosen(tab, None);
+                self.note(format!("attach: {why}"));
+            }
+        }
+    }
+
+    /// What the finder was closed on, to the view whose draft it was
+    /// opened for while that draft is still the one shown; dropped with
+    /// a note otherwise.
+    fn attach_chosen(&mut self, tab: Option<TabId>, chosen: Option<&Path>) {
+        self.redraw();
+        if tab != self.top_tab() {
+            self.note("attach dropped: the draft it was chosen for is not the one shown".into());
+            return;
+        }
+        let Session { stack, pane, .. } = self;
+        let mut draft = Draft::new(pane, tab);
+        let action = stack
+            .current_mut()
+            .map(|view| view.attach(chosen, &mut draft));
+        self.hold_draft();
+        if let Some(action) = action {
+            self.act(action);
+        }
+    }
+
+    /// Closes the finder when the draft it was opened for is no longer
+    /// the one shown, with a note.
+    fn drop_stale_chooser(&mut self) {
+        if self
+            .chooser
+            .as_ref()
+            .is_some_and(|chooser| chooser.tab != self.top_tab())
+        {
+            self.chooser = None;
+            self.note("attach closed: the draft it was opened for is not the one shown".into());
+        }
+    }
+
+    /// An input while the finder is open, which is the finder's: its keys
+    /// as the chord names them (Return opens a folder or chooses the
+    /// file, Ctrl-Return chooses it, Backspace on an empty filter, Alt-Up
+    /// and `^` go up, Escape closes it, and a single printable character
+    /// filters) and every other chord consumed; the pointer's press, move
+    /// and release, a second press on the same row of its list soon after
+    /// the first choosing it as Return does; and the wheel over its list;
+    /// with the mouse off, the pointer and the wheel are consumed unread.
+    /// A resize lays it out again and is the frame's too; the window's
+    /// close closes it with nothing chosen and is then the session's; a
+    /// focus change, a paste and a pointer cancel are not the finder's.
+    /// True when the input went no further.
+    fn chooser_input(&mut self, input: &Input<'_>) -> bool {
+        self.drop_stale_chooser();
+        let Some(list) = self.chooser.as_ref().map(|c| c.finder.list_rect()) else {
+            return false;
+        };
+        let key = |key, repeated| finder::Event::Key { key, repeated };
+        let event = match *input {
+            Input::Key { chord, repeat } => match chord {
+                "Up" => key(finder::Key::Up, repeat),
+                "Down" => key(finder::Key::Down, repeat),
+                "PageUp" => key(finder::Key::PageUp, repeat),
+                "PageDown" => key(finder::Key::PageDown, repeat),
+                "Home" => key(finder::Key::Home, repeat),
+                "End" => key(finder::Key::End, repeat),
+                "Return" => key(finder::Key::Activate, repeat),
+                "C-Return" => key(finder::Key::Accept, repeat),
+                "Backspace" => key(finder::Key::Backspace, repeat),
+                "M-Up" | "^" => key(finder::Key::Parent, repeat),
+                "Escape" => key(finder::Key::Escape, repeat),
+                "Space" => finder::Event::Insert(' '),
+                _ => {
+                    let mut chars = chord.chars();
+                    match (chars.next(), chars.next()) {
+                        (Some(c), None) if !c.is_control() => finder::Event::Insert(c),
+                        _ => finder::Event::Other,
+                    }
+                }
+            },
+            Input::Pointer { phase, x, y, .. } => match phase {
+                PointerPhase::Press => finder::Event::Press { x, y },
+                PointerPhase::Move => finder::Event::Move { x, y },
+                PointerPhase::Release => finder::Event::Release { x, y },
+            },
+            Input::Wheel { rows, .. } => finder::Event::Wheel {
+                x: list.x,
+                y: list.y,
+                rows,
+            },
+            Input::Resize(surface) => {
+                let Some(rect) = self
+                    .stack
+                    .current()
+                    .map(|view| Layout::new(surface, &view.scene()).body)
+                else {
+                    return false;
+                };
+                finder::Event::Resize { surface, rect }
+            }
+            Input::Close => {
+                if let Some(chooser) = self.chooser.take() {
+                    self.attach_chosen(chooser.tab, None);
+                }
+                return false;
+            }
+            Input::Focus(_) | Input::Paste(_) | Input::CancelPointer => return false,
+        };
+        let pointed = matches!(input, Input::Pointer { .. } | Input::Wheel { .. });
+        if pointed && !self.mouse {
+            return true;
+        }
+        let surface = self.surface;
+        if matches!(
+            input,
+            Input::Key { .. } | Input::Pointer { .. } | Input::Wheel { .. }
+        ) {
+            self.last_user_activity = Instant::now();
+        }
+        let Some(chooser) = self.chooser.as_mut() else {
+            return false;
+        };
+        // The entry a press lands on, by the listing's index, which a
+        // filter typed between two presses does not move; a press off
+        // the rows lands on none.
+        let hit = match event {
+            finder::Event::Press { x, y } => td_ui::chrome::List::new(surface, list)
+                .and_then(|rows| rows.hit(x, y))
+                .and_then(|row| chooser.finder.first().checked_add(row))
+                .and_then(|position| chooser.finder.shown().get(position).copied()),
+            _ => None,
+        };
+        let mut outcome = chooser.finder.event(event);
+        match event {
+            finder::Event::Press { .. } => {
+                let now = Instant::now();
+                let again = hit.is_some()
+                    && chooser.press.is_some_and(|(at, entry)| {
+                        Some(entry) == hit && now.duration_since(at) <= DOUBLE_PRESS
+                    });
+                chooser.press = if again {
+                    None
+                } else {
+                    hit.map(|entry| (now, entry))
+                };
+                if again {
+                    outcome = chooser.finder.event(key(finder::Key::Activate, false));
+                }
+            }
+            finder::Event::Move { .. } | finder::Event::Release { .. } => {}
+            _ => chooser.press = None,
+        }
+        self.chooser_outcome(outcome);
+        !matches!(input, Input::Resize(_))
+    }
+
+    /// What the finder made of an input: a folder to list, its parent to
+    /// list with the folder it came from selected, or its close, a file
+    /// chosen or nothing, which is the view's.
+    fn chooser_outcome(&mut self, outcome: finder::Outcome) {
+        match outcome {
+            finder::Outcome::Ignored | finder::Outcome::Consumed => {}
+            finder::Outcome::Changed => self.redraw(),
+            finder::Outcome::Descend(index) => {
+                let Some(folder) = self.chooser.as_ref().and_then(|chooser| {
+                    let entry = chooser.finder.listing().entries().get(index)?;
+                    Some(chooser.folder.join(entry.name()))
+                }) else {
+                    return;
+                };
+                self.chooser_list(folder, None);
+            }
+            finder::Outcome::Ascend => {
+                let Some((parent, from)) = self.chooser.as_ref().and_then(|chooser| {
+                    let parent = chooser.folder.parent()?.to_path_buf();
+                    let from = chooser.folder.file_name()?.to_str()?.to_string();
+                    Some((parent, from))
+                }) else {
+                    return;
+                };
+                self.chooser_list(parent, Some(&from));
+            }
+            finder::Outcome::Closed(choice) => {
+                let Some(chooser) = self.chooser.take() else {
+                    return;
+                };
+                match choice {
+                    finder::Choice::Entry(index) => {
+                        let chosen = chooser
+                            .finder
+                            .listing()
+                            .entries()
+                            .get(index)
+                            .map(|entry| chooser.folder.join(entry.name()));
+                        self.attach_folder = Some(chooser.folder);
+                        self.attach_chosen(chooser.tab, chosen.as_deref());
+                    }
+                    finder::Choice::Unavailable(error) => {
+                        self.attach_chosen(chooser.tab, None);
+                        self.note(format!(
+                            "attach: the window cannot show the finder: {error}"
+                        ));
+                    }
+                    finder::Choice::Here | finder::Choice::Cancelled => {
+                        self.attach_chosen(chooser.tab, None);
+                    }
+                }
+            }
+        }
+    }
+
+    /// The finder shows `folder`, `select` selected when listed; a folder
+    /// that cannot be listed leaves it where it was, the reason in its
+    /// status row.
+    fn chooser_list(&mut self, folder: PathBuf, select: Option<&str>) {
+        let listed = attach::list_folder(&folder, attach::CEILING);
+        let Some(chooser) = self.chooser.as_mut() else {
+            return;
+        };
+        let installed = listed.and_then(|listing| {
+            chooser
+                .finder
+                .set_listing(listing, select)
+                .map_err(|e| format!("{}: {e}", folder.display()))
+        });
+        match installed {
+            Ok(()) => chooser.folder = folder,
+            Err(why) => {
+                if let Err(e) = chooser.finder.set_note(&fit_note(&why)) {
+                    crate::log_error!("finder note: {}", e);
+                }
+            }
+        }
+        chooser.press = None;
+        self.redraw();
     }
 
     /// Retains the draft as a file, as the `$EDITOR` child was handed
@@ -635,6 +961,8 @@ impl Session {
             self.last_user_activity = Instant::now();
             if chord == SEND_CHORD {
                 self.request("send");
+            } else if chord == ATTACH_CHORD {
+                self.request("attach");
             } else {
                 self.pane_chord(chord);
             }
@@ -954,10 +1282,30 @@ impl Session {
             first: slot.first,
             entry_first: slot.entry_first,
             pane: &self.pane,
+            chooser: self.chooser.as_ref().map(|chooser| &chooser.finder),
             menu: self.menu.as_ref(),
         };
         td_ui::driven::text(&frame).expect("text").2
     }
+}
+
+/// A note for the finder's status row: control characters blanked and,
+/// past its bound, the tail kept after an ellipsis, since the reason
+/// follows the path.
+fn fit_note(note: &str) -> String {
+    let fitted: String = note
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    if fitted.len() <= finder::NOTE_BYTES {
+        return fitted;
+    }
+    let keep = finder::NOTE_BYTES - '\u{2026}'.len_utf8();
+    let mut start = fitted.len() - keep;
+    while !fitted.is_char_boundary(start) {
+        start += 1;
+    }
+    format!("\u{2026}{}", fitted.get(start..).unwrap_or_default())
 }
 
 impl Handler for Session {
@@ -982,8 +1330,10 @@ impl Handler for Session {
         if presses && self.note.take().is_some() {
             self.redraw();
         }
-        // A dropdown open over the frame takes the input first.
+        // A dropdown open over the frame takes the input first, and then
+        // the finder open over the body.
         let taken = self.menu.is_some() && self.menu_input(&input);
+        let taken = taken || (self.chooser.is_some() && self.chooser_input(&input));
         if !taken {
             match input {
                 // The clipboard's text, into the draft it was asked for, over
@@ -1073,6 +1423,7 @@ impl Handler for Session {
         self.take_pending();
         self.settle_close();
         self.drop_stale_menu();
+        self.drop_stale_chooser();
         // The caret's blink is a paint only where the pane is shown.
         if self.pane.tick(now)
             && self
@@ -1119,6 +1470,7 @@ impl Handler for Session {
                 first: slot.first,
                 entry_first: slot.entry_first,
                 pane: &self.pane,
+                chooser: self.chooser.as_ref().map(|chooser| &chooser.finder),
                 menu: self.menu.as_ref(),
             };
             frame::paint(raster, &frame)?;
@@ -1893,6 +2245,208 @@ mod frame_tests {
         assert!(!third.exists() && sent_dir.join(third.file_name().unwrap()).exists());
     }
 
+    /// Ctrl-Shift-A, or the Attach label, opens the finder over the body
+    /// on the folder given, where the keys are the finder's: a letter
+    /// filters, Return descends into a folder and chooses a file, a
+    /// second press on a row chooses it; the file chosen is copied into
+    /// the draft's sidecar, its tag added at the draft's end, the next
+    /// finder opening where it came from; Escape attaches nothing; the
+    /// sidecar retires with the sent draft; and while the send is
+    /// awaited nothing can be attached.
+    #[test]
+    fn attach_copies_the_file_chosen_into_the_drafts_sidecar_and_tags_it() {
+        let (mut session, cmd_rx, resp_tx) = session(true);
+        let draft_dir = session.setup.draft_dir.clone().unwrap();
+        let state = draft_dir.parent().unwrap().to_path_buf();
+        let status = |session: &Session| session.stack.current().unwrap().scene().status;
+        key(&mut session, "c");
+        let path = draft_dir.join(session.title.trim_start_matches("Draft "));
+        let template = std::fs::read_to_string(&path).unwrap();
+        let id = path
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .trim_start_matches("td-mail-draft-")
+            .trim_end_matches(".eml")
+            .to_string();
+        let sidecar = draft_dir.join(format!("td-mail-att-{id}"));
+        let files = state.join("files");
+        std::fs::create_dir_all(files.join("docs")).unwrap();
+        std::fs::write(files.join("docs/report.pdf"), b"%PDF").unwrap();
+        std::fs::write(files.join("notes.txt"), b"n").unwrap();
+        session.attach_folder = Some(files.clone());
+
+        key(&mut session, "C-S-a");
+        assert_eq!(session.chooser.as_ref().unwrap().folder, files);
+        let shown = session.shown();
+        assert!(
+            shown.contains("docs") && shown.contains("notes.txt"),
+            "{shown}"
+        );
+        assert!(
+            status(&session).starts_with("Attach: Return"),
+            "{}",
+            status(&session)
+        );
+        key(&mut session, "d");
+        key(&mut session, "o");
+        assert_eq!(text(&session), template, "the letters filtered");
+        key(&mut session, "Return");
+        assert_eq!(session.chooser.as_ref().unwrap().folder, files.join("docs"));
+        // Backspace on the empty filter goes up, onto the folder it came
+        // from; Return goes back in.
+        key(&mut session, "Backspace");
+        let chooser = session.chooser.as_ref().unwrap();
+        assert_eq!(chooser.folder, files);
+        assert_eq!(chooser.finder.selected_entry().unwrap().name(), "docs");
+        key(&mut session, "Return");
+        assert_eq!(session.chooser.as_ref().unwrap().folder, files.join("docs"));
+        key(&mut session, "Return");
+        assert!(session.chooser.is_none());
+        let tag = |name: &str, shown: &str| {
+            format!(
+                "<#part type=\"application/pdf\" filename=\"{}\" disposition=\"attachment\"{shown}>\n<#/part>\n",
+                sidecar.join(name).display()
+            )
+        };
+        assert_eq!(std::fs::read(sidecar.join("report.pdf")).unwrap(), b"%PDF");
+        assert_eq!(
+            text(&session),
+            format!("{template}{}", tag("report.pdf", ""))
+        );
+        assert!(
+            status(&session).starts_with("Attached report.pdf (4 B)"),
+            "{}",
+            status(&session)
+        );
+
+        // The Attach label opens it again where the file came from, and
+        // a second press on the row chooses: a second copy, named for
+        // the recipient as the file was.
+        let shape = session.shape().unwrap();
+        let label = shape
+            .keys
+            .iter()
+            .position(|&key| key == Key::Request("attach"))
+            .and_then(|index| shape.layout.bar.header(index))
+            .expect("the Attach label");
+        press(&mut session, label.x + 2, label.y + 2);
+        let list = session
+            .chooser
+            .as_ref()
+            .expect("the finder")
+            .finder
+            .list_rect();
+        assert_eq!(session.chooser.as_ref().unwrap().folder, files.join("docs"));
+        press(&mut session, list.x + 4, list.y + 4);
+        assert!(session.chooser.is_some(), "one press selects");
+        press(&mut session, list.x + 4, list.y + 4);
+        assert!(session.chooser.is_none(), "the second chooses");
+        assert_eq!(
+            text(&session),
+            format!(
+                "{template}{}{}",
+                tag("report.pdf", ""),
+                tag("report-2.pdf", " name=\"report.pdf\"")
+            )
+        );
+
+        let attached = text(&session);
+
+        // A press on the row and then on the list below the rows, or two
+        // with the mouse off, choose nothing.
+        key(&mut session, "C-S-a");
+        let list = session.chooser.as_ref().unwrap().finder.list_rect();
+        press(&mut session, list.x + 4, list.y + 4);
+        press(
+            &mut session,
+            list.x + 4,
+            list.y + i64::from(list.height) - 2,
+        );
+        assert!(session.chooser.is_some(), "the blank is not the row");
+        session.mouse = false;
+        press(&mut session, list.x + 4, list.y + 4);
+        press(&mut session, list.x + 4, list.y + 4);
+        assert!(session.chooser.is_some(), "the mouse is off");
+        session.mouse = true;
+
+        // The window's close closes the finder with nothing attached and
+        // then asks about the unsaved draft; Escape keeps both.
+        assert_eq!(
+            session.input(Input::Close, &mut NoClipboard),
+            Flow::Continue
+        );
+        assert!(session.chooser.is_none());
+        assert!(session.title.starts_with("Save "), "{}", session.title);
+        key(&mut session, "Escape");
+        assert!(session.title.starts_with("Draft "), "{}", session.title);
+
+        // A finder whose draft is no longer shown is closed with a note,
+        // and the draft, shown again, says nothing was attached.
+        key(&mut session, "C-S-a");
+        session.act(ViewAction::Push(Box::new(views::help::HelpView::new())));
+        session.poll(0);
+        assert!(session.chooser.is_none());
+        session.act(ViewAction::Pop);
+        assert_eq!(status(&session), "Nothing attached");
+        assert_eq!(text(&session), attached);
+
+        // Escape attaches nothing, and the next finder still opens where
+        // the last file came from; one that can no longer be listed is
+        // forgotten for the start folder.
+        key(&mut session, "C-S-a");
+        assert_eq!(session.chooser.as_ref().unwrap().folder, files.join("docs"));
+        key(&mut session, "Escape");
+        assert!(session.chooser.is_none());
+        assert_eq!(status(&session), "Nothing attached");
+        key(&mut session, "C-S-a");
+        assert_eq!(session.chooser.as_ref().unwrap().folder, files.join("docs"));
+        key(&mut session, "Escape");
+        session.attach_folder = Some(files.join("gone"));
+        key(&mut session, "C-S-a");
+        assert_eq!(
+            session.chooser.as_ref().unwrap().folder,
+            attach::start_folder()
+        );
+        assert_eq!(session.attach_folder, None);
+        key(&mut session, "Escape");
+
+        // Sent: the sidecar retires with the draft; while the send is
+        // awaited, Attach is refused.
+        key(&mut session, "C-Return");
+        let mut sent = false;
+        while let Ok(command) = cmd_rx.try_recv() {
+            sent |= matches!(command, BackendCommand::SendDraft { .. });
+        }
+        assert!(sent);
+        key(&mut session, "C-S-a");
+        assert!(session.chooser.is_none());
+        assert!(
+            status(&session).contains("wait for the server"),
+            "{}",
+            status(&session)
+        );
+        resp_tx
+            .send(BackendResponse::DraftSent {
+                path: path.clone(),
+                result: Ok(backend::SentDraft {
+                    email_id: "e1".to_string(),
+                    submission_id: "s1".to_string(),
+                    kept_in: "Sent".to_string(),
+                }),
+            })
+            .unwrap();
+        session.poll(0);
+        assert_eq!(session.stack.depth(), 1);
+        let retired = state.join("sent").join(sidecar.file_name().unwrap());
+        assert!(!sidecar.exists());
+        assert_eq!(
+            std::fs::read(retired.join("report-2.pdf")).unwrap(),
+            b"%PDF"
+        );
+    }
+
     /// `c` retains a draft and opens it in the pane, editable and
     /// auto-filled, where every chord types (a `q` too); Ctrl-S writes
     /// the pane's text over the file, as the Save label does; Ctrl-W
@@ -2000,15 +2554,15 @@ mod frame_tests {
         let bar = session.shape().unwrap().layout.bar;
         assert_eq!(
             session.stack.current().unwrap().scene().labels,
-            ["Send", "Save", "Close"]
+            ["Send", "Attach", "Save", "Close"]
         );
-        let save = bar.header(1).expect("save label");
+        let save = bar.header(2).expect("save label");
         press(&mut session, save.x + 2, save.y + 2);
         assert_eq!(
             std::fs::read_to_string(&fourth).unwrap(),
             format!("z{template}")
         );
-        let close = bar.header(2).expect("close label");
+        let close = bar.header(3).expect("close label");
         press(&mut session, close.x + 2, close.y + 2);
         assert_eq!(session.stack.depth(), 1);
         // The question's labels answer it: Discard, pressed, pops with

@@ -449,48 +449,54 @@ fn tag_attributes(number: usize, body: &str) -> Result<Vec<(String, String)>, Dr
 const O_NONBLOCK: i32 = 0o4000;
 
 /// The draft's attachment files read, each with its bytes, refusing one
-/// that is not a regular file (a device or a pipe has no end to read to)
-/// or past `ceiling` bytes, before any is uploaded. The file opened is
-/// the one measured and read, and the read stops a byte past the
-/// ceiling, so a file swapped or grown under the check is refused, not
-/// read whole.
+/// that is not a regular file or is past `ceiling` bytes (`read_regular`),
+/// before any is uploaded.
 pub fn read_parts(parts: &[Part], ceiling: u64) -> Result<Vec<(usize, Vec<u8>)>, DraftError> {
     let mut out = Vec::with_capacity(parts.len());
     for (index, part) in parts.iter().enumerate() {
-        let attachment =
-            |e: std::io::Error| DraftError(format!("attachment {}: {e}", part.path.display()));
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(O_NONBLOCK)
-            .open(&part.path)
-            .map_err(attachment)?;
-        let metadata = file.metadata().map_err(attachment)?;
-        if !metadata.is_file() {
-            return refuse(format!(
-                "attachment {} is not a regular file",
-                part.path.display()
-            ));
-        }
-        let size = metadata.len();
-        if size > ceiling {
-            return refuse(format!(
-                "attachment {} is {size} bytes, past the {ceiling} the server or the fetch service takes",
-                part.path.display()
-            ));
-        }
-        let mut bytes = Vec::new();
-        file.take(ceiling.saturating_add(1))
-            .read_to_end(&mut bytes)
-            .map_err(attachment)?;
-        if bytes.len() as u64 > ceiling {
-            return refuse(format!(
-                "attachment {} grew past the {ceiling} bytes the server or the fetch service takes",
-                part.path.display()
-            ));
-        }
-        out.push((index, bytes));
+        out.push((index, read_regular(&part.path, ceiling)?));
     }
     Ok(out)
+}
+
+/// The attachment file at `path` read whole, refusing one that is not a
+/// regular file (a device or a pipe has no end to read to) or past
+/// `ceiling` bytes. It is opened without blocking, so a pipe put where
+/// the file was does not wait for a writer; the file opened is the one
+/// measured and read, and the read stops a byte past the ceiling, so a
+/// file swapped or grown under the check is refused, not read whole.
+pub fn read_regular(path: &Path, ceiling: u64) -> Result<Vec<u8>, DraftError> {
+    let attachment = |e: std::io::Error| DraftError(format!("attachment {}: {e}", path.display()));
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(O_NONBLOCK)
+        .open(path)
+        .map_err(attachment)?;
+    let metadata = file.metadata().map_err(attachment)?;
+    if !metadata.is_file() {
+        return refuse(format!(
+            "attachment {} is not a regular file",
+            path.display()
+        ));
+    }
+    let size = metadata.len();
+    if size > ceiling {
+        return refuse(format!(
+            "attachment {} is {size} bytes, past the {ceiling} the server or the fetch service takes",
+            path.display()
+        ));
+    }
+    let mut bytes = Vec::new();
+    file.take(ceiling.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(attachment)?;
+    if bytes.len() as u64 > ceiling {
+        return refuse(format!(
+            "attachment {} grew past the {ceiling} bytes the server or the fetch service takes",
+            path.display()
+        ));
+    }
+    Ok(bytes)
 }
 
 /// Where a sent draft is kept: the `sent` directory beside the draft's

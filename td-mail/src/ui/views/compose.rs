@@ -12,8 +12,11 @@
 //! closed, so what was sent is what the file holds, and on the answer
 //! the draft is retired to the sent directory and the view pops, or
 //! the refusal is the status row's and the draft is the pane's again,
-//! to be mended. Every chord is the pane's while the draft is being
-//! edited; the view's own keys are the bar's labels and, while it
+//! to be mended. Attach opens the finder over the body, and the file
+//! chosen is copied into the draft's attachment sidecar and its
+//! `<#part>` tag added at the draft's end (`crate::attach`), so the
+//! send reads the copy. Every chord is the pane's while the draft is
+//! being edited; the view's own keys are the bar's labels and, while it
 //! asks, the answer.
 
 use crate::backend::{BackendCommand, BackendResponse};
@@ -21,12 +24,13 @@ use crate::ui::frame::Draft;
 use crate::ui::input::Key;
 use crate::ui::views::{Body, Scene, View, ViewAction};
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::Sender;
 
-const EDIT_LABELS: &[&str] = &["Send", "Save", "Close"];
+const EDIT_LABELS: &[&str] = &["Send", "Attach", "Save", "Close"];
 const EDIT_KEYS: &[Key] = &[
     Key::Request("send"),
+    Key::Request("attach"),
     Key::Request("save"),
     Key::Request("close-tab"),
 ];
@@ -49,6 +53,8 @@ pub struct ComposeView {
     /// The server took the draft but it could not be retired: it is not
     /// sent again nor changed, and Send retries the move alone.
     sent: Option<crate::backend::SentDraft>,
+    /// Attach opened the finder, whose close has not reached the view.
+    choosing: bool,
     status: String,
     cmd_tx: Sender<BackendCommand>,
     pending: Option<ViewAction>,
@@ -83,6 +89,7 @@ impl ComposeView {
             closing: false,
             sending: false,
             sent: None,
+            choosing: false,
             status,
             cmd_tx,
             pending: None,
@@ -153,6 +160,78 @@ impl ComposeView {
             }
         }
         ViewAction::Continue
+    }
+
+    /// Whether the draft may change: not while the backend has it, nor
+    /// once the server took it; the status says why when it may not.
+    fn changeable(&mut self) -> bool {
+        if self.sending {
+            self.status = format!("Sending {}; wait for the server", self.file_name());
+            return false;
+        }
+        if self.sent.is_some() {
+            self.status = format!(
+                "{} was sent; Send retries its move, Close puts it away",
+                self.file_name()
+            );
+            return false;
+        }
+        true
+    }
+
+    /// The file chosen for the draft: copied into its sidecar, which it
+    /// has from then on, and its tag added at the draft's end, unsaved
+    /// as any edit is; a tag the pane refuses has its copy removed again,
+    /// and the sidecar too when this made it and it is empty.
+    fn attach_file(&mut self, chosen: &Path, draft: &mut Draft<'_>) {
+        let attached = match crate::attach::attach_file(
+            &self.path,
+            self.attachment_dir.as_deref(),
+            chosen,
+            crate::attach::CEILING,
+        ) {
+            Ok(attached) => attached,
+            Err(e) => {
+                crate::log_error!("Could not attach {}: {}", chosen.display(), e);
+                self.status = format!("Not attached: {e}");
+                return;
+            }
+        };
+        let refused = match draft.append(attached.tag.trim_start_matches('\n')) {
+            Ok(true) => None,
+            Ok(false) => Some("the draft cannot take it".to_string()),
+            Err(why) => Some(why),
+        };
+        match refused {
+            None => {
+                self.attachment_dir = Some(attached.sidecar.clone());
+                crate::log_info!(
+                    "Attached {} as {}",
+                    chosen.display(),
+                    attached.path.display()
+                );
+                self.status = format!(
+                    "Attached {} ({}); a copy is in {}",
+                    attached.name,
+                    crate::attach::size_text(attached.bytes as u64),
+                    attached.sidecar.display()
+                );
+            }
+            Some(why) => {
+                let removed = std::fs::remove_file(&attached.path);
+                if self.attachment_dir.is_none() {
+                    let _ = std::fs::remove_dir(&attached.sidecar);
+                }
+                crate::log_error!("Could not add the tag for {}: {}", chosen.display(), why);
+                self.status = match removed {
+                    Ok(()) => format!("Not attached: {why}"),
+                    Err(e) => format!(
+                        "Not attached: {why}; the copy remains at {}: {e}",
+                        attached.path.display()
+                    ),
+                };
+            }
+        }
     }
 
     /// The server took the draft: it is retired to the sent directory,
@@ -241,6 +320,16 @@ impl View for ComposeView {
     fn request(&mut self, name: &str, draft: &mut Draft<'_>) -> ViewAction {
         match name {
             "send" => self.send(draft),
+            "attach" => {
+                if !self.changeable() {
+                    return ViewAction::Continue;
+                }
+                self.status = "Attach: Return opens a folder or attaches the file, \
+                    Backspace on an empty filter goes up, a letter filters, Escape cancels"
+                    .to_string();
+                self.choosing = true;
+                ViewAction::ChooseAttachment
+            }
             "save" => {
                 let saved = self.save(draft);
                 if saved && self.closing {
@@ -294,8 +383,32 @@ impl View for ComposeView {
         true
     }
 
+    fn attach(&mut self, chosen: Option<&Path>, draft: &mut Draft<'_>) -> ViewAction {
+        self.choosing = false;
+        match chosen {
+            None => self.status = "Nothing attached".to_string(),
+            Some(chosen) => {
+                if self.changeable() {
+                    self.attach_file(chosen, draft);
+                }
+            }
+        }
+        ViewAction::Continue
+    }
+
     fn take_pending_action(&mut self) -> Option<ViewAction> {
         self.pending.take()
+    }
+
+    /// Back on top after the finder was closed for another view: nothing
+    /// was attached, which the status says in place of the finder's keys.
+    fn on_reveal(&mut self) -> bool {
+        if !self.choosing {
+            return false;
+        }
+        self.choosing = false;
+        self.status = "Nothing attached".to_string();
+        true
     }
 
     fn waiting(&self) -> bool {

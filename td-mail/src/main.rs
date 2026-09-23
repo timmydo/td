@@ -9,6 +9,7 @@ mod log;
 #[macro_use]
 mod json;
 
+mod attach;
 mod b64;
 mod backend;
 mod cache;

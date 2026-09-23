@@ -10059,6 +10059,18 @@ mock server in the crate's tests serves the session's capabilities,
 test drives a draft with an attachment through them and checks what
 the server received and where the draft went.
 
+**Attaching: a file chosen in td-ui's finder.** Ctrl-Shift-A, or the
+bar's Attach, opens td-ui's shared finder (`td-ui/DESIGN.md`, "Shared
+directory finder") over the draft's body, and td-mail lists each
+folder itself, so what it offers is what the jail lets it read, its
+state directory and the `xdg-download` grant: no new grant and no
+portal call, since the FileChooser portal grants nothing outside an
+existing grant either (§E, row 3) and td-mail carries no D-Bus client.
+The chosen file is copied into the draft's attachment sidecar, read as
+the send reads a part, and its `<#part>` tag goes at the draft's end,
+so the send reads the copy and the copy retires with the draft; the
+sidecar holds what was attached, the draft's tags what went.
+
 ## X. Host mode — development only
 
 The separately specified td-pass standalone product is an explicit exception

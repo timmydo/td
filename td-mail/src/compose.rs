@@ -479,6 +479,7 @@ fn prepare_draft(draft: &ComposeDraft, dir: &Path, stamp: &str) -> io::Result<Pr
         body.push_str(&mml_part(
             &att.content_type,
             &path,
+            None,
             att.description.as_deref(),
         )?);
         parts.push((path, att.data.as_slice()));
@@ -525,7 +526,7 @@ fn prepare_draft(draft: &ComposeDraft, dir: &Path, stamp: &str) -> io::Result<Pr
     })
 }
 
-fn create_secure_file(path: &Path) -> io::Result<fs::File> {
+pub(crate) fn create_secure_file(path: &Path) -> io::Result<fs::File> {
     fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -533,14 +534,20 @@ fn create_secure_file(path: &Path) -> io::Result<fs::File> {
         .open(path)
 }
 
-fn valid_mml_attribute(text: &str) -> bool {
+pub(crate) fn valid_mml_attribute(text: &str) -> bool {
     !text
         .chars()
         .any(|c| c.is_control() || matches!(c, '"' | '\\' | '<' | '>'))
 }
 
-/// Render an MML part tag that tells message-mode to attach `path` on send.
-fn mml_part(content_type: &str, path: &Path, description: Option<&str>) -> io::Result<String> {
+/// Render an MML part tag that tells message-mode to attach `path` on send,
+/// under `name` when the recipient is to see another than the file's.
+pub(crate) fn mml_part(
+    content_type: &str,
+    path: &Path,
+    name: Option<&str>,
+    description: Option<&str>,
+) -> io::Result<String> {
     let path = path
         .to_str()
         .filter(|text| valid_mml_attribute(text))
@@ -560,6 +567,15 @@ fn mml_part(content_type: &str, path: &Path, description: Option<&str>) -> io::R
         "\n<#part type=\"{}\" filename=\"{}\" disposition=\"attachment\"",
         content_type, path
     );
+    if let Some(name) = name {
+        if !valid_mml_attribute(name) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "attachment name cannot be represented by MML",
+            ));
+        }
+        tag.push_str(&format!(" name=\"{}\"", name));
+    }
     if let Some(desc) = description {
         // Strip characters that would terminate the attribute / tag.
         let clean: String = desc
@@ -1227,6 +1243,7 @@ mod tests {
         let part = mml_part(
             "message/rfc822",
             Path::new("/tmp/fwd/orig.eml"),
+            None,
             Some("Forwarded: say \"hi\"\nthere"),
         )
         .unwrap();
@@ -1364,16 +1381,23 @@ mod tests {
             "bad>name",
             "bad<name",
         ] {
-            assert!(mml_part("text/plain", Path::new(value), None).is_err());
-            assert!(mml_part(value, Path::new("/safe/file"), None).is_err());
+            assert!(mml_part("text/plain", Path::new(value), None, None).is_err());
+            assert!(mml_part(value, Path::new("/safe/file"), None, None).is_err());
+            assert!(mml_part("text/plain", Path::new("/safe/file"), Some(value), None).is_err());
         }
         let part = mml_part(
             "text/plain",
             Path::new("/safe/file"),
+            None,
             Some("bad\\\"\n\r\tname"),
         )
         .unwrap();
         assert!(part.contains("description=\"bad/'   name\""));
+        assert!(!part.contains(" name="));
+        let part = mml_part("text/plain", Path::new("/safe/file-2"), Some("file"), None).unwrap();
+        assert!(
+            part.contains("filename=\"/safe/file-2\" disposition=\"attachment\" name=\"file\">")
+        );
     }
 
     #[test]

@@ -527,6 +527,13 @@ pub fn all_keybindings() -> Vec<KeyBinding> {
         },
         KeyBinding {
             view: "compose",
+            key: "Ctrl-Shift-A",
+            action: "attach",
+            description:
+                "Attach a file chosen in the finder: copied beside the draft, tagged at its end",
+        },
+        KeyBinding {
+            view: "compose",
             key: "Ctrl-S",
             action: "save",
             description: "Save the draft over its retained file",

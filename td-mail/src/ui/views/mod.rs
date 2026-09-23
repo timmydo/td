@@ -141,6 +141,10 @@ pub enum ViewAction {
     /// session answers the clipboard's, and hands the view the rest
     /// through `View::request`.
     Request(&'static str),
+    /// Open the finder over the body for a file to attach to the view's
+    /// draft; what is chosen, or that nothing was, reaches the view
+    /// through `View::attach`.
+    ChooseAttachment,
 }
 
 pub trait View {
@@ -153,6 +157,16 @@ pub trait View {
     /// for, with the draft the pane shows: `save`, `close-tab`, `quit`,
     /// or one the view ignores.
     fn request(&mut self, _name: &str, _draft: &mut super::frame::Draft<'_>) -> ViewAction {
+        ViewAction::Continue
+    }
+    /// The file the finder a `ChooseAttachment` opened was closed on,
+    /// to attach to the draft the pane holds for the view; none when it
+    /// was closed without one.
+    fn attach(
+        &mut self,
+        _chosen: Option<&std::path::Path>,
+        _draft: &mut super::frame::Draft<'_>,
+    ) -> ViewAction {
         ViewAction::Continue
     }
     /// Handle a response from the backend thread.

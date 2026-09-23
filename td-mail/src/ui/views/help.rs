@@ -116,6 +116,11 @@ impl HelpView {
             "-------".to_string(),
             "  Ctrl-Enter  Send the draft through the account's server (saves it first)"
                 .to_string(),
+            "  Ctrl-Shift-A Attach a file: a copy goes beside the draft, its tag at the end"
+                .to_string(),
+            "              (the finder: Return opens or attaches, Backspace on an empty"
+                .to_string(),
+            "              filter goes up, letters filter, Escape closes it)".to_string(),
             "  Ctrl-S      Save the draft over its retained file".to_string(),
             "  Ctrl-W      Close (asks when unsaved: y saves, n keeps the file as saved)"
                 .to_string(),
