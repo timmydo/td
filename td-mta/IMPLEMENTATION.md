@@ -55,7 +55,8 @@ Dependency edges:
 ```text
 M01 -> M02
 M02 -> M03, M04
-M04 -> M05, M06
+M04 -> M06
+M04 + M07 -> M05
 M05 + M06 -> M08
 M03 + M04 -> M07
 M04 + M07 -> M09
@@ -128,14 +129,17 @@ with golden encodings for every row, journal frame, manifest and CURRENT.
 Preserve its chosen sorted-checkpoint/bounded-journal model, byte/operation
 ceilings, endian rules and authority distinctions. Pin sequence exhaustion,
 crash points and the source-key encoding; do not reopen the storage-engine
-choice in a consumer task. Pin thread merge/ID behavior, duplicated Message-ID handling,
-and multi-mailbox membership. Define the submission state transition table and
+choice in a consumer task. Pin immutable thread assignment/anchor lookup, duplicated Message-ID handling,
+and multi-mailbox membership. Freeze typed MIME part blob locators, checked
+streaming decode and parent pin/reuse rules. Define the submission state transition table and
 its exact standard JMAP field mapping, including uncertain outcomes and partial
 recipient results. Freeze the adapter and store APIs in compiling modules.
 
 Specify receivedAt sorting/text semantics, MIME/property/charset coverage,
 initial retry/cancel behavior, error mapping, and bounded per-operation work.
 Choose the minimum worker layout and TLS/cold-path budget within M01's ledger.
+Pin event-stream scheduling, read-slot wait/error mappings, maintenance work
+budgets and journal reservation transfer across the checkpoint commit barrier.
 This is the main design review checkpoint; protocol consumers wait for it.
 
 **Acceptance:** byte-level format examples round-trip through tiny encoders/
@@ -159,6 +163,9 @@ specific checked closure rather than a generic external-dependency escape hatch.
 ELF inspection finds no interpreter or dynamic dependencies. Lock tampering or
 an extra runtime/core dependency fails the gate. Offline source provisioning
 is reproducible and does not depend on host libssl or td-net at runtime.
+Pin the host portability toolchain manifest from DESIGN section 3, including
+musl target std, C compiler/linker/sysroot and checksum/provenance evidence.
+A clean fixture builds without undeclared ambient host toolchain inputs.
 
 ## M04 — Bounded primitives, configuration, and event records
 
@@ -179,7 +186,7 @@ store mutations, live reload or filesystem log rotation in this task.
 
 ## M05 — Immutable blobs and journal commit/replay
 
-**Depends on:** M02/M04. **Own:** storage I/O adapter, blob files, journal codec,
+**Depends on:** M02/M04/M07. **Own:** storage I/O adapter, blob files, journal codec,
 store locking and initial replay; no search index or protocol endpoints.
 
 Implement exclusive store access, generated private paths, streamed temporary
@@ -189,13 +196,19 @@ versus incomplete-tail rules. Do not deduplicate bodies or pack MIME into a
 metadata value.
 Implement bounded sequential replay with incomplete-tail recovery and explicit
 interior-corruption refusal. Expose committed visibility only after durability.
+The std-only core accepts the Crypto interface; its deterministic fake tests
+check ordering/failure behavior, not digest correctness. M05 owns additional
+runtime integration tests using M07's real provider for every SHA-256-bearing
+golden frame/table/blob. These run alongside core tests without introducing
+an external dependency or runtime-to-core cycle into the core manifest.
 Provide deterministic failure injection before/after each filesystem operation.
 
 **Acceptance:** two writers cannot open the store; partial/short writes and
 failed sync never return committed success. Every crash boundary preserves
 previous commits, and uncommitted orphan data is distinguishable from missing
 committed data. Malicious IDs cannot escape the root. Tiny configured limits
-exercise oversize behavior without large allocations. Test ENOSPC/EIO and
+exercise oversize behavior without large allocations. Test full-length bad-checksum final frames without silently truncating them.
+Test ENOSPC/EIO and
 lock release on process death. Never claim process-kill tests alone prove
 power-loss ordering; include the fault I/O model and later VM evidence.
 
@@ -212,7 +225,7 @@ boundary generation through Entropy, reply headers and Bcc separation.
 **Acceptance:** fragmented input, nested multiparts, malformed encodings, huge
 headers, cyclic-looking boundary data and unsupported charsets do not panic or
 grow working memory. Part downloads match original bytes/decoded content as
-specified. Round-trip fixtures prove From/To/Cc/Bcc and attachment behavior.
+specified; forged locators and parent-deletion/reuse races follow STORAGE §3.1. Round-trip fixtures prove From/To/Cc/Bcc and attachment behavior.
 Raw-message retention does not depend on rendering success. Do not reuse an
 allocating client parser merely because it is already std-only.
 
@@ -228,17 +241,18 @@ resumption/early-data features. Measure handshake and steady-state allocations.
 
 **Acceptance:** local certificate fixtures cover valid/untrusted/expired/wrong-
 name chains, mTLS admission, fragmented records, handshake saturation, and
-wrong keys. No auth bytes reach a peer before successful verified TLS. Library
+wrong keys. Test known SHA-256 vectors and M02 digest-bearing fixture inputs
+through the real provider; never call fake-adapter output a digest oracle. No auth bytes reach a peer before successful verified TLS. Library
 allocation headroom is documented and tested; a second provider cannot enter
 the lock unnoticed. No live CA/provider contact and no ignore-cert-errors flag.
 
-## M08 — Store objects, indexes, snapshots and reclamation
+## M08 — Store objects, indexes, checkpoints and reclamation
 
 **Depends on:** M05/M06. **Own:** object transactions, read views, index cache,
-snapshot/compaction, change history and garbage collection.
+checkpoint publication, change history and garbage collection.
 
 Implement mailbox hierarchy/membership/keywords, immutable email objects,
-thread assignments, account state and retained changes. Implement STORAGE.md's sorted flat tables,
+thread assignments and authoritative anchors, account state and retained changes. Implement STORAGE.md's sorted flat tables,
 fixed journal arenas/descriptors, exact-prefix read views and streaming merge.
 Pause new mutations during checkpointing; publish table/manifest/journal pairs
 through CURRENT in the specified order. Sparse/secondary disk indexes remain
@@ -248,12 +262,14 @@ inside the specified exclusive maintenance window, including queue/lease roots.
 
 **Acceptance:** remove indexes, rebuild and compare object IDs, bytes, folder
 membership and states. Readers never observe half a transaction or an index
-ahead of commit. Kill at every compaction/reclaim boundary. Old state tokens
+ahead of commit. Kill at every checkpoint/reclaim boundary. Old state tokens
 produce explicit resync errors; restored epochs cannot alias previous states.
 Scale many small objects without mailbox-sized RAM. Exercise both journal
 byte/operation ceilings, read views spanning commit/checkpoint, pin exhaustion,
 queue references after visible email deletion, and orphan cleanup after a failed
 publication. Inspect identical logical views before and after checkpointing.
+Exercise repeated operations on one key in a frame, reserved streaming work
+finishing across checkpoint, physical orphan scans and abandoned sort cleanup.
 Do not implement JMAP here.
 
 ## M09 — Bounded DNS and outbound HTTPS transport
@@ -285,8 +301,8 @@ and return final acceptance only after store success. Deduplicate multiple
 aliases to the same account within one SMTP transaction.
 
 **Acceptance:** transcript fixtures split at every framing boundary; exercise
-invalid sequencing, RSET, null sender, 8-bit content, unknown/nonlocal recipients,
-oversize mail, dot-stuffing, bare-LF smuggling and resource exhaustion. The
+invalid sequencing, RSET, null sender, 8-bit content, unknown/nonlocal recipients, case-sensitive ordinary aliases, domainless and mixed-case
+Postmaster, non-enumerating VRFY, oversize mail, dot-stuffing, bare-LF smuggling and resource exhaustion. The
 acceptance transcript's 250 maps to recovered durable mail. No general relay,
 public AUTH, DSN advertisement, or port binding in this task.
 
@@ -312,7 +328,8 @@ for the tests and no production port configuration changes.
 **Depends on:** M11. **Own:** gateway configuration and peer admission adapter.
 
 Add a distinct listener policy with explicit address allowlists and verified
-client certificate identities; map admitted peers to fixed gateway IDs.
+client certificate identities from a gateway-specific private trust root; map
+admitted peers to fixed gateway IDs. Public outbound roots cannot authorize peers.
 Enforce identical local-recipient rules after peer admission. Record gateway
 identity separately from untrusted headers, and expose the expected upstream
 recipient-policy requirements in configuration output.
@@ -322,6 +339,8 @@ network clients and nonlocal recipients fail. Accepted gateway delivery uses
 the same durable path as direct SMTP. Direct mode still accepts eligible
 plaintext peers. No PROXY protocol, XCLIENT, trusted Authentication-Results,
 upstream forwarding daemon or original-IP reconstruction.
+Include a gateway-only listener with a distinct server hostname and verify
+the upstream peer's hostname/chain checks against its provisioned certificate.
 
 ## M13 — HTTPS, authentication and JMAP Core
 
@@ -341,6 +360,8 @@ cross-account IDs/blobs, bad auth and revoked credentials fail predictably.
 Streaming data cannot bypass upload limits. Tests prove auth is HTTPS-only,
 device verifiers contain no reusable plaintext secret, and error output leaks
 no credentials. Unimplemented mail capabilities remain absent until M14/M15.
+Two event streams must not pin storage views or starve ordinary method workers;
+read-slot saturation has the bounded retry/error behavior frozen in M02.
 
 ## M14 — JMAP mail reads, changes, and queries
 
@@ -405,6 +426,8 @@ capability-based transfer, envelope/DATA dot-stuffing and response parsing.
 Implement partial-recipient handling, retry/backoff/expiry, route pause,
 uncertain attempts and local failure notifications. Include a default fixture
 profile matching Migadu's documented port-465 behavior, with test credentials.
+DNS timeout/SERVFAIL/NXDOMAIN back off the route without immediately failing
+recipients; normal queue expiry and minimum retry intervals still apply.
 
 **Acceptance:** run every DESIGN section 15 SMTP fault case; verify exact
 captured bytes and per-recipient attempt counts. Successful RCPT followed by
@@ -430,6 +453,7 @@ hostnames. Generate DNS/policy output without editing external DNS.
 verification and a local CA key. Cover initial issuance, badNonce, retry hints,
 rate limits, invalid SAN/key/chain, restart, renewal overlap and expiration.
 Prove old sessions survive a valid rotation and new sessions see the new cert.
+Cover a distinct ACME-managed gateway hostname and provisioned private names.
 No public CA accounts created and no actual deployment DNS/ports changed.
 
 ## M19 — Administration, logs, health and reload
@@ -437,12 +461,16 @@ No public CA accounts created and no actual deployment DNS/ports changed.
 **Depends on:** M04/M08/M12/M17/M18. **Own:** CLI/control socket, rolling-file
 sink, runtime health/status aggregation and config generation lifecycle.
 
-Wire the DESIGN section 6 command set through a private control socket or
-exclusive offline lock. Implement versioned JSON output, pagination, queue
+Wire the runtime administration subset of DESIGN section 6 through a private
+control socket or exclusive offline lock: config check/show, serve, status,
+doctor, dns-plan, reload, queue/device operations, and store layout/inspect/
+journal/export. Implement versioned JSON output, pagination, queue
 inspection/operations, storage layout/record/journal inspection and raw export,
 device creation/revocation, doctor, redacted config and
 atomic reload. Add size-based log rotation, suppression counters and fallback
 diagnostics. Ensure a restart-required change does not partly apply.
+M20 owns verify/repair/backup/restore; M21 owns migrate. Those commands remain
+unavailable until their owning increment lands; M19 supplies shared CLI wiring.
 
 **Acceptance:** unauthorized socket access fails by filesystem policy; stale
 IDs and concurrent controls cannot duplicate delivery. Health reports disk,
@@ -519,7 +547,7 @@ unsafe instrumentation needs the repository's documented test surface.
 or a reviewed design amendment supported by measurements before release.
 Repeated ingestion, queries, retries, renewals and reloads do not grow retained
 RAM. Saturation yields defined refusals and reserves progress for health and
-existing accepted work. Disk full and compaction pressure cannot corrupt mail.
+existing accepted work. Disk full and checkpoint pressure cannot corrupt mail.
 Fix concrete hot-path violations in their owning modules, with focused tests.
 
 ## M24 — Crash matrix and protocol robustness release gate

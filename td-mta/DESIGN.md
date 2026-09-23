@@ -11,6 +11,7 @@ The initial deployment is one person's approximately 1 GB of mail, multiple
 domains, and explicit aliases on each domain pointing into one account's
 mailbox store. Account IDs remain explicit in every storage and authorization
 interface; v1 need not provide shared accounts or delegated access.
+Configuration validation rejects a second account and any alias targeting it.
 
 The service receives Internet SMTP for local recipients, stores and serves
 mail through JMAP, and submits outgoing messages through a configured smart
@@ -94,6 +95,14 @@ first dependency increment must demonstrate static musl linking and bounded
 TLS behavior before later tasks depend on its API. Exact versions belong in
 the lock and dependency review, not in this design's prose.
 
+The portable musl artifact has a separate, host-only build manifest: pin Rust
+and its target standard library, the musl C compiler/linker and sysroot needed
+by the crypto provider, and their source/artifact checksums and provenance.
+Provision them before offline builds; ambient host tools cannot silently fill
+missing inputs. M03 owns these exact pins and a clean build fixture. This
+portability workflow is outside td's source-built glibc target artifact graph;
+it must not import host-built outputs into that graph or claim its provenance.
+
 Core adapters provide typed errors and caller-owned buffers for transport,
 clock, entropy, digest/signature operations, and fault-injected persistence.
 Network workers cannot bypass the store's commit API. A crypto adapter also
@@ -117,7 +126,8 @@ that do not negotiate TLS, as selected by the operator for compatibility.
 Once STARTTLS begins, a failed handshake closes the connection; it never
 continues that session in plaintext. Reset SMTP state after successful TLS.
 
-Port 443 serves JMAP HTTPS only. Port 80 serves ACME HTTP-01 challenges and
+Port 443 serves JMAP HTTPS and configured MTA-STS policy hosts. Port 80 serves
+ACME HTTP-01 challenges and
 may redirect ordinary GET requests to a fixed configured HTTPS origin; it
 never accepts credentials or JMAP writes. URLs in JMAP discovery are generated
 from configured origins, never an untrusted Host header.
@@ -138,6 +148,19 @@ address admission in td-mta. Require STARTTLS with verified client certificates
 for a network gateway; a private VPN can additionally protect the route.
 Plaintext is allowed only in an explicitly configured loopback fixture mode.
 Trusted peer admission never permits nonlocal recipients.
+
+Configure the gateway listener's server hostname explicitly. The upstream
+gateway verifies that name and certificate chain; certificate provisioning and
+renewal cover it even when this host is not the public MX. An operator-provided
+certificate/private CA is permitted for a private gateway, with the same name
+and expiry checks and an explicit operator renewal responsibility.
+
+Gateway client authentication uses a dedicated configured private trust root
+and exact allowed certificate identities mapped to gateway IDs. Verify chain,
+validity, client-auth usage and identity in addition to peer address admission.
+The bundled outbound public roots never authorize gateway clients. A valid
+client certificate for another identity is insufficient. Bound trust reload
+and define revocation/rotation fixtures before enabling the listener.
 
 The authenticated identity is the gateway, not the original sender. Record
 both the socket peer and configured gateway ID. V1 does not implement PROXY
@@ -179,9 +202,8 @@ or a prerequisite silently downloaded by the test suite.
 
 Targets for the default personal profile are RSS below 64 MiB idle and below
 128 MiB under the workload in section 15. These are unverified release gates,
-not measurements. The supplied Stalwart observation was 371072 KiB RSS
-(approximately 362 MiB); VSZ is not used as the comparison. Record RSS and
-cgroup memory separately: filesystem page cache can affect the latter.
+not measurements. Record RSS and cgroup memory separately: filesystem page
+cache can affect the latter.
 
 Use a fixed set of long-lived workers, preallocated connection slots, and
 bounded queues of slot IDs. Allocate and touch application arenas before
@@ -189,6 +211,21 @@ opening listeners. Do not spawn a thread per connection/request or load the
 mailbox's full metadata/content into RAM. Use bounded I/O chunks, sorted metadata files, and
 disposable disk indexes with a fixed cache. No unbounded mmap or memory-sized-to-mail
 strategy is permitted. Maintenance shares an explicit budget with live work.
+
+Event-source streams hold connection slots but no storage read view between
+events. They use bounded state notifications and a dedicated fixed execution
+budget or nonblocking scheduling; they cannot occupy all workers that process
+ordinary requests, commits or health checks. M02 pins that scheduling choice.
+Safe std supports a bounded round-robin scan of nonblocking sockets with a
+deadline-based timed wait; it does not expose poll/epoll. If M02 instead chooses
+fixed blocking workers, reserve event workers separately and count all stacks.
+An OS readiness adapter requires the explicit unsafe review from section 3.
+Read slots are acquired per store operation with a bounded fair wait queue;
+exhaustion returns a retryable HTTP 503 before response headers or the mapped
+JMAP method error. A streaming response that has begun cannot fabricate an
+error object inside its body: finish from its admitted view or terminate it.
+An online backup uses one read slot; interactive work shares the other. This
+intentional concurrency limit preserves the memory budget.
 
 Initial default ceilings (validated together at startup):
 
@@ -209,6 +246,7 @@ Initial default ceilings (validated together at startup):
 | Storage read views | 2, each with a 4 MiB journal arena plus bounded descriptors |
 | Unattached upload storage | 128 MiB per account, expiry after 24 hours |
 | Pending outbound storage | 256 MiB and 1000 submissions |
+| Maintenance sort scratch on disk | 64 MiB per account |
 | Active log plus retained generations | 8 MiB each, 4 retained |
 
 Values are operator-adjustable within compiled maxima and an explicit startup
@@ -317,7 +355,10 @@ ACME runs inside the executable using HTTPS, JWS, and the crypto provider.
 Start with HTTP-01 on port 80; DNS-01 and TLS-ALPN-01 are deferred. The operator
 controls the deployment host's ports and DNS; this development host is not
 configured as the mail server. Certificate identifiers include the MX/JMAP
-hostname and enabled MTA-STS policy hostnames, not automatically every alias.
+hostname, configured gateway listener names selected for ACME, and enabled
+MTA-STS policy hostnames, not automatically every alias. ACME-managed gateway
+names require reachable HTTP-01 validation; private names use provisioned
+certificates rather than starting an order that cannot be validated.
 
 Persist the ACME account key and resumable order state privately. Bound
 directory/nonces/order responses and certificate chain sizes. Validate nonce,
@@ -348,14 +389,14 @@ reviewed artifact update. A test trust override must not disable verification.
 Read it before implementing persistence, queries, queues, migration or backup.
 It owns the directory/file layout, authoritative row model, binary container
 rules, transaction publication, checkpoint/replay, bounded read views,
-reclamation, inspection commands and storage-engine comparison.
+reclamation and inspection commands.
 
 The chosen representation is ordinary immutable `.eml` files plus compact
 binary metadata inspected through td-mta commands. Folder names, membership,
 keywords, JMAP IDs/history and submission outcomes are authoritative metadata;
 message bytes alone cannot reconstruct them. Parsed headers, offsets and search
-indexes are disposable caches. There is no requirement for Maildir compatibility
-or human editing of live metadata, and no database dependency is added.
+indexes are disposable caches. Live metadata changes use the transaction API;
+direct file editing is unsupported. No database dependency is added.
 
 One sorted metadata checkpoint plus a bounded recent-change journal forms the
 current account state. The single writer pauses new mutation admission during
@@ -379,13 +420,21 @@ NOOP, QUIT, SIZE, 8BITMIME, STARTTLS, and enhanced status codes. Advertise
 PIPELINING only after its ordered parsing and error paths are tested.
 Do not advertise SMTPUTF8, CHUNKING, BINARYMIME, DSN, or AUTH in v1 reception.
 Local configured addresses use ASCII domains/local-parts; domains compare
-case-insensitively, while local-part matching is an explicit exact alias map.
+case-insensitively, while ordinary local-parts match aliases case-sensitively.
+Reserve case-insensitive `postmaster` at every served domain and the SMTP
+domainless Postmaster form, routing both to the sole account. Configuration
+must validate that route; it cannot disable it or redirect it outside the
+account. Support VRFY with the standard non-enumerating 252 response.
 Unicode message display names and MIME content remain supported.
 
 Reject unknown/nonlocal recipients at RCPT. Resolve accepted aliases to stable
 account IDs and deduplicate delivery to the same account within one transaction;
 retain the accepted envelope recipients for inspection. Delivery decisions are
 pinned for that transaction rather than changing halfway through a reload.
+Every v1 inbound delivery files once in the account's Inbox, including when
+several accepted aliases match. Aliases select accounts, not folders; alias
+names remain envelope metadata. Provision exactly one Inbox before receipt
+and forbid its deletion or role reassignment while receiving is enabled.
 V1 has one account, so its final DATA success is one store transaction. Extending
 to multiple recipient accounts requires a durable delivery manifest before
 acknowledgement; independent partial writes cannot masquerade as atomic success.
@@ -462,8 +511,10 @@ references, and account isolation must be explicit. A multi-method request is
 not one global transaction: earlier successful methods remain successful if
 later methods fail. Thread assignment is deterministic and persisted using
 Message-ID, References and In-Reply-To; duplicate or cyclic headers cannot
-merge accounts or cause unbounded work. The format increment defines merge and
-ID stability rules with fixtures.
+merge accounts or cause unbounded work. An existing Email's threadId is
+immutable. New arrivals may join one existing thread, but never merge or
+renumber existing Email threadIds. STORAGE section 3 owns authoritative lookup
+and deterministic conflict rules; M02 freezes their byte encodings/fixtures.
 
 Text search streams decoded searchable data with bounded working memory and
 uses disk indexes for candidate selection where available. Queries have stable
@@ -510,6 +561,12 @@ DATA leaves those recipients pending or failed according to that final reply.
 Never resend recipients whose final DATA acceptance is durably recorded.
 Refused authentication or bad certificates pause the affected route,
 retain pending mail, and expose an actionable error instead of a tight loop.
+
+Smart-host DNS failures, including timeout, SERVFAIL and NXDOMAIN, are route
+transport failures. Apply bounded exponential route backoff and health/log
+diagnostics; no DNS response by itself permanently fails a recipient. Pending
+mail remains queued subject to its normal expiry. Manual retry cannot bypass
+the route's concurrency or minimum retry interval.
 
 Default automatic retry starts at five minutes, doubles to an hourly cap with
 jitter, and expires after five days. Respect bounded server retry hints.
@@ -623,7 +680,9 @@ V1 is ready only with reproducible evidence for all of the following:
 - Static-musl executable inspection (no PT_INTERP or DT_NEEDED), operation in
   a clean Linux environment without td helpers, and host-independent data
   encoding fixtures. Build/test the core on aarch64 when tooling is available;
-  x86-only assembly and native-usize serialization are prohibited regardless.
+  td-owned x86-only assembly and native-usize serialization are prohibited.
+  Provider assembly must have a supported implementation for each target; its
+  presence alone does not prohibit reviewed per-architecture acceleration.
 - Syntax/confinement lint coverage and malformed-input property/fuzz fixtures
   for SMTP, HTTP, JSON, MIME, config, journal, DNS and certificates. Fuzzing
   tooling is development-only and separately pinned/approved if external.
@@ -638,7 +697,7 @@ V1 is ready only with reproducible evidence for all of the following:
   compiler/profile, kernel, filesystem, corpus seed, limits and page-cache
   accounting. Corpus bytes and object count are separate scaling dimensions.
 - Kill/fault injection at each publication/sync boundary for inbound receipt,
-  JMAP mutation, submission creation/attempt, compaction, renewal, migration
+  JMAP mutation, submission creation/attempt, checkpointing, renewal, migration
   and restore. Verify acknowledgements against recovered state and prove no
   committed object is reclaimed. Include disk full, short I/O and failed sync.
 - Real td-mail + real td-fetch + real td-mta: receive/read/search/move/flag/

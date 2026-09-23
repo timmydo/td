@@ -5,38 +5,19 @@ before changing persistence, queries, submission records, migration or backup.
 It specifies an unimplemented target. M02 supplies the remaining field-tag
 registry and golden byte fixtures before any production data is written.
 
-## 1. Decision and alternatives
+## 1. Storage model
 
-The selected design keeps ordinary immutable `.eml` files and compact binary
-metadata inspectable through td-mta commands. It does not require Maildir
-compatibility or human editing of live metadata. The metadata layer is a small
-database we own: calling its contents files does not remove the obligation to
-implement transactions and crash recovery.
+Keep ordinary immutable `.eml` files and compact binary metadata inspectable
+through td-mta commands. Live metadata is mutated only through the service's
+transaction API. Bodies and metadata have separate publication steps, with
+transactions and crash recovery binding them into one committed account view.
 
-Message-body storage and metadata storage are separate decisions:
-
-| Alternative | Physical representation | What it supplies | Cost for this service |
-| --- | --- | --- | --- |
-| PostgreSQL | Database-managed relation/index files and WAL; bodies can be external | Transactions, SQL queries, indexes, recovery | Separate server and operational dependency; external bodies still need publication ordering |
-| RocksDB | Key/value WAL, memory write buffers, sorted files, compaction | Embedded storage, atomic batch/transaction primitives | Native dependency and memory/compaction policy; application keys and indexes remain our work |
-| SQLite + `.eml` | Embedded database, journal/WAL and ordinary body files | SQL metadata transactions without a server | A new dependency outside the current std-only policy |
-| Maildir | Message per file, folder directories, filename flags | Familiar access with existing mail tools | Additional JMAP identity/change/queue metadata and multi-folder semantics |
-| mbox | Messages concatenated into mailbox files | Simple interchange and sequential reading | Locking and potentially large rewrites for removal/modification |
-| dbox | Individual or packed message files plus authoritative metadata indexes | Mail-specific storage | Its metadata indexes require preservation and format-aware tooling |
-| This design | Immutable bodies, one metadata checkpoint, bounded recent journal | Explicit domain transactions and resource bounds | We implement and test the storage engine |
-
-We choose the last row under the current dependency and allocation constraints.
-If the dependency policy changes, SQLite plus external bodies is the first
-alternative to reconsider. PostgreSQL/RocksDB are not inherently unable to run
-small mailboxes; their actual memory use depends on configuration and workload.
-The observed Stalwart RSS does not identify the database's individual cost.
-Stalwart 0.15.2 has a filesystem blob backend as well as RocksDB: comparing
-metadata engines does not establish where a particular installation puts bodies.
-
-V1 deliberately uses a single sorted checkpoint plus a bounded recent-change
-journal, with write admission paused during checkpoint publication. There is
-no general mutable B-tree, multi-level LSM compactor, or whole-mailbox RAM map.
-This favors an auditable implementation over sustained write throughput.
+V1 uses a single sorted checkpoint plus a bounded recent-change journal,
+with write admission paused during checkpoint publication. Metadata is streamed
+from disk through bounded arenas; the service does not load the whole mailbox
+into RAM. This favors an auditable implementation over sustained write
+throughput. The following sections define authority, encoding, commit ordering,
+read views, retention and recovery for this storage engine.
 
 ## 2. Files and authority
 
@@ -65,6 +46,7 @@ get distinct email/blob IDs. V1 does not deduplicate message contents.
         memberships.tbl
         keywords.tbl
         threads.tbl
+        thread-anchors.tbl
         submissions.tbl
         recipients.tbl
         leases.tbl
@@ -121,7 +103,8 @@ Keys contain raw 16-byte IDs and bounded UTF-8 bytes, not displayed hex.
 | `emails` | email ID | Message blob ID, thread ID, receivedAt, SMTP receipt/envelope metadata |
 | `memberships` | email ID + mailbox ID | Empty; presence means membership |
 | `keywords` | email ID + keyword bytes | Empty; presence means set |
-| `threads` | thread ID | Persisted grouping identity, bounded merge/alias information |
+| `threads` | thread ID | Persisted immutable grouping identity |
+| `thread-anchors` | Length-prefixed Message-ID + email ID | Empty; authoritative lookup from message header ID to live email |
 | `submissions` | submission ID | Email/thread/identity IDs, immutable transmitted blob ID, envelope sender, sendAt, lifecycle/notification state |
 | `recipients` | submission ID + recipient ordinal | Address, attempt/phase, result, retry time, expiry, bounded diagnostic |
 | `leases` | upload blob ID | Owning account/device, expiry and permitted use |
@@ -150,6 +133,22 @@ Import mappings likewise retain historical local IDs after deletion; inspection
 and resumed import report a deleted target instead of dereferencing it or
 silently recreating it. Historical IDs never pin their former targets or grant
 authorization. Lease device IDs retain provenance; revocation prevents use.
+Thread anchors must reference live emails and are removed with their email.
+
+Thread assignment does not depend on disposable indexes or rescanning every
+body. Store at most one anchor per email: its first syntactically valid
+Message-ID within a 1004-byte ceiling (four-byte length plus ID plus 16-byte
+email ID fits the key limit). Header ID matching is byte-exact after parsing
+away delimiters/outer whitespace. Absent or oversize IDs produce no anchor;
+raw headers remain unchanged. Examine at most the last 32 References IDs,
+nearest first, then bounded In-Reply-To IDs. Use the first ID with a live
+anchor; duplicate anchors select the lexicographically smallest email ID.
+Join that email's persisted thread. If no candidate resolves, create a fresh
+thread. Existing email/thread assignments are immutable, even when a later
+arrival connects two conversations. M02 pins malformed-header behavior and
+fixtures. Resource/I/O failure is an explicit temporary error, not permission
+to silently choose a different thread. Authoritative anchor lookup remains
+available without a cache, using bounded-work sorted-table access.
 
 A committing writer validates these rules, blob kinds, keyword limits and
 submission/blob pins. Derived counters are calculated or cached, never
@@ -175,6 +174,26 @@ come from the email, membership and keyword tables overlaid with recent
 committed updates. `m7`'s name comes from its mailbox row. Subject and attachment
 names come from the message or its disposable parsing cache.
 
+### 3.1 MIME part blob identities
+
+File blob IDs and JMAP part blob IDs are distinct typed forms. A part ID is
+a versioned encoding of its parent message blob ID, encoded-body offset/length
+and transfer-encoding tag; M02 freezes its canonical bounded wire encoding
+within JMAP's ID length limit. It never names an independently stored file or
+an entry in `blobs`. Resolve it only in an authorized account and live parent
+view; validate checked ranges and require an exact match to a parsed MIME part
+descriptor, rebuilt boundedly if its cache is absent. A forged locator cannot
+select arbitrary filesystem bytes or bypass parent authorization.
+
+Download streams transfer-decoded part contents from the immutable parent;
+unknown transfer encodings follow the JMAP identity-decoding rule. A read view
+pins the parent for the entire stream. Email/set attachment reuse resolves and
+pins the parent while assembling the new immutable message, then commits its
+own body; the new email must not depend on the original surviving. Part IDs
+do not keep parents alive after all ordinary references expire. No decoded
+attachment file or cache is authoritative. Parser/schema upgrades preserve
+existing locator semantics or require an explicit format migration.
+
 ## 4. Binary encoding and limits
 
 The v1 container rules are:
@@ -198,6 +217,8 @@ The v1 container rules are:
   they cannot be copied wholesale into an email row to evade these bounds.
 
 The journal starts with an account/epoch/segment header and base sequence.
+It is append-only and not preallocated or padded on disk: physical EOF is its
+written extent. Memory arenas, rather than journal file extents, are reserved.
 Each subsequent frame is exactly one transaction:
 
 ```text
@@ -220,6 +241,11 @@ use the protocol's per-object results and transactions rather than splitting
 one indivisible storage transaction. A single object's operation that cannot
 fit is refused. Reserve frame/overlay capacity before streaming a newly admitted
 message so a final DATA commit cannot be stranded by an avoidable metadata cap.
+Reservation accounting is global to the writer coordinator: committed frame
+bytes/operations plus all outstanding reservations must fit the active-journal
+ceilings. Refuse or wait before admitting work whose reservation cannot fit.
+Reservations have bounded slot IDs and deadlines, not preassigned sequences
+or journal file handles. Cancellation releases them; commit consumes them.
 
 M02 must record the numeric table/field tags, exact header/footer byte offsets,
 enum values, limits for every variable field, and full encode/decode golden
@@ -269,6 +295,14 @@ to previously durable storage cannot always be distinguished from an incomplete
 write; sync guarantees presume a functioning storage stack, and backups/verify
 cover damage outside that model.
 
+Incomplete means fewer physical bytes than the validated frame length (or a
+physically short header). A full-length final frame with an invalid footer is
+not incomplete, even if a torn write could have caused it. Preserve it and
+refuse mutations for diagnosis; do not silently discard a possibly previously
+acknowledged transaction. Fault tests cover both truncated and full-length
+torn tails. This fail-closed rule prioritizes preserving evidence over automatic
+availability when the two cases cannot be distinguished.
+
 Recovery validates live owning references and historical identifier encodings
 under section 3 before permitting mutation. Missing committed message bytes
 require diagnosis; synthesizing empty messages is forbidden.
@@ -293,7 +327,9 @@ operations. Limit both, not just distinct keys. Checkpoint before admitting a
 frame that would cross either bound. Default storage-read concurrency is two;
 each slot owns a 4 MiB journal arena and a separately budgeted fixed descriptor
 array. Parse the prefix into borrowed operation views, sort descriptors by
-table/key/sequence, and use the latest operation for each key. No per-record
+table/key/sequence/operation ordinal, and use the latest operation for each key.
+The ordinal is its position within the frame, preserving last-operation-wins
+even when the same key is changed twice in one transaction. No per-record
 heap allocation or whole-mailbox map is allowed. The writer/checkpointer has
 its own bounded scratch reservation; these bytes are additional to the 8 MiB
 combined index cache and must appear in the memory ledger.
@@ -308,7 +344,14 @@ has not finished. Older index candidates require overlay reconciliation;
 changed rows and deletions cannot disappear from query results. Content search
 may need body reads and retains its independent time/work limits.
 
-Checkpointing pauses new mutation admission, freezes sequence S, then:
+Checkpointing pauses new mutation admission and installs a writer commit
+barrier after the current commit finishes, freezing sequence S. No transaction,
+including a completion from previously admitted work, may append while this
+barrier is held. Streaming can continue within its existing reservation; its
+completion waits boundedly in the fixed commit queue. Outstanding reservations
+belong to the coordinator and transfer unchanged to the next active journal;
+new admission stays closed until their byte/operation totals are accounted for.
+Sequence numbers are assigned only when actually committing. Then:
 
 1. Merge each old sorted table with the bounded sorted journal updates into
    fresh tables under `tmp/`. Stream unchanged records; omit deleted rows.
@@ -382,6 +425,10 @@ by the manifest. Default history targets seven days, subject to ceilings of
 older than it gets the protocol resynchronization error. A state token contains
 account, store epoch and sequence. Restoration changes the epoch. History
 expiry is not permission to delete current rows or pending queue data.
+Read retained segments one at a time within the history/work budget. Return
+bounded change pages with hasMoreChanges and a state at a complete transaction
+boundary; never assemble all retained history in RAM. M02 specifies coalescing
+and the standard cannotCalculateChanges behavior when no legal page fits.
 
 Historical PUT records may name bodies that are no longer live. /changes needs
 identity/change evidence, not historical body versions; retained history alone
@@ -403,6 +450,22 @@ merge against blob inventory. Never rely solely on an in-memory reference count.
 Referenced MIME attachments are already inside immutable message bytes; assembly
 must finish before upload leases can be released.
 
+Both drain and exclusive phases have finite configured deadlines and I/O work
+budgets, frozen in M02. On reaching an exclusive-phase limit, finish the current
+bounded durable batch, retain safe progress and resume admission/dispatch.
+Storage faults instead enter the normal recovery/refusal path. Readiness and
+logs expose maintenance; refusals are retryable. This intentionally accepts a
+temporary service pause. Concurrent reclamation is outside v1: elapsed age
+alone cannot prove that no read view or in-flight writer needs a body.
+
+Use private `tmp/sort/RUN/` directories with exclusive run names and a 64 MiB
+default account scratch quota. External sorting uses preallocated run buffers
+and bounded merge fan-in/file descriptors from the M02 ledger. Charge every
+spill byte before writing; exhaustion defers reclamation without touching live
+blobs. Failed or abandoned sort runs are disposable and removed under the
+exclusive lock at startup, before listeners open. Never treat checkpoint or
+body publication files as sort scratch.
+
 For unreferenced blobs, first remove inventory rows and expired lease rows in
 a durable transaction, then unlink their files and sync directories. Use bounded
 batches if one frame cannot hold the sweep. A crash may leave an orphan file,
@@ -410,6 +473,16 @@ which the next sweep can remove; it cannot leave a live reference to deleted
 bytes. Orphans from interrupted publication are identified by inventory absence
 only while the exclusive window proves no writer/upload can be using them.
 Do not unlink files based only on age or a filename absent from one old index.
+
+Inventory scanning alone cannot find files never registered by a commit.
+In the exclusive phase, enumerate `messages/` and `uploads/` shards with a
+bounded directory cursor, validating each filename/type and comparing IDs
+against the current committed inventory. External sort batches use the same
+scratch quota, fixed buffers and I/O budget. Only confirmed absent IDs can be
+removed as orphans. Report unexpected entries; never follow symlinks. The
+writer remains stopped through each comparison/unlink batch. On interruption
+or budget exhaustion a later exclusive sweep may restart traversal; progress
+must not depend on a directory-entry offset surviving directory changes.
 
 Disk reservations include temporary bodies, journal/history, active/retired
 checkpoints, backup pins and merge scratch. Free-space checks do not eliminate
@@ -462,7 +535,7 @@ separately selected backup components with their own consistency/protection
 rules. A stopped whole-service backup is the initial supported way to capture
 all of them together. Never call a live directory copy a consistent backup.
 
-## 10. Storage-specific acceptance and sources
+## 10. Storage-specific acceptance
 
 In addition to DESIGN section 15, require byte fixtures for every row/envelope,
 all operation types, unsupported schemas, checksum failures and exact limits;
@@ -473,19 +546,10 @@ deletion with a pending submission; recovery with deleted historical targets;
 maintenance drain with an admitted SMTP commit and an outbound completion;
 maintenance timeout without reclamation; and every CURRENT publication crash
 point.
-
-The comparison in section 1 draws on these primary descriptions:
-
-- [PostgreSQL physical layout](https://www.postgresql.org/docs/current/storage-file-layout.html)
-  and [WAL](https://www.postgresql.org/docs/current/wal-intro.html).
-- [RocksDB overview](https://github.com/facebook/rocksdb/wiki/RocksDB-Overview)
-  and [memory accounting](https://github.com/facebook/rocksdb/wiki/Memory-usage-in-RocksDB).
-- [SQLite use cases](https://www.sqlite.org/whentouse.html) and
-  [WAL/backup considerations](https://www.sqlite.org/wal.html).
-- [Dovecot Maildir](https://doc.dovecot.org/latest/core/config/mailbox_formats/maildir.html),
-  [mbox](https://doc.dovecot.org/main/core/config/mailbox_formats/mbox.html), and
-  [dbox metadata authority](https://doc.dovecot.org/2.3/admin_manual/mailbox_formats/dbox/).
-- [Stalwart 0.15.2 filesystem blobs](https://raw.githubusercontent.com/stalwartlabs/stalwart/v0.15.2/crates/store/src/backend/fs/mod.rs)
-  and [RocksDB backend](https://raw.githubusercontent.com/stalwartlabs/stalwart/v0.15.2/crates/store/src/backend/rocksdb/main.rs).
-
-No external database dependency is introduced by this comparison or decision.
+Also cover duplicate-key operations within one frame; outstanding reservations
+across checkpoint publication; event streams without held read views; bounded
+read-slot contention; orphan files absent from inventory; and scratch quota,
+interrupted-sort cleanup and exclusive-phase budget exhaustion.
+Include cache-free reply assignment, conflicting/duplicate header IDs without
+changing existing threadIds, forged part locators, streamed part decoding and
+attachment reuse concurrent with parent deletion.
