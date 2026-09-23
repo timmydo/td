@@ -64,10 +64,11 @@ mapping, not a blanket Markdown exemption: documentation that selects a check
 still runs it. `ready` remains required for documentation updates.
 
 The repository-root entry scripts are `./start` and `./build-qcow`, which
-build the system through the Cargo runner, and `./news` and `./mail`,
+build the system through the Cargo runner, `./test-iso`, which boots a
+retained ISO with a private QEMU disk, and `./news` and `./mail`,
 which run the checkout's two applications on this host unjailed
 (`td-builder host-run`, APPLICATIONS.md §X.7). `tests/start.sh` and
-`tests/host-run.sh` prove each pair's bootstrap.
+`tests/host-run.sh` prove their bootstrap.
 
 `ready` runs the selected checks once over the branch tip. It does not prove
 that an intermediate commit is green, so keep every commit independently

@@ -25,6 +25,7 @@
 //!   compose-iso OUTPUT KERNEL INITRAMFS [ISO-NAME=FILE ...]
 //!                         stream built inputs into a retained hybrid ISO;
 //!                         no build, signing, device access or live-profile creation
+//!   test-iso ISO [--usb]  interactively boot an ISO and disposable install disk
 //!   bundle [--out DIR] [--raw] [--zlib] [--force]
 //!                         build system-x86-64 and write a redistributable demo
 //!                         VM — the boot payloads plus a POSIX-sh `start`
@@ -352,6 +353,11 @@ fn main() {
                 die(&error);
             }
         }
+        Some("test-iso") => {
+            if let Err(error) = checks::qemu_boot::test_iso::cli(args.get(2..).unwrap_or(&[])) {
+                die(&error);
+            }
+        }
         Some("qemu-install-system") => {
             if let Err(error) = check_runner::qemu_install_system_cli(args.get(2..).unwrap_or(&[])) {
                 die_runner(&error);
@@ -500,7 +506,7 @@ fn main() {
                 die(&e);
             }
         }
-        _ => die("usage: td-recipe-eval list|emit|check-list|check-count|check-script|check-run|build-run|clear-store|gc-store|qemu-secret|qemu-secret-system|qemu-boot|qemu-boot-uefi|qemu-boot-media|qemu-install|qemu-install-system|compose-iso|qemu-boot-erofs|qemu-boot-system|qemu-update|qemu-boot-net|qemu-boot-kexec|run|bundle|warm|verify-store|payload-closure|application-closure|vendor-warm-args|source-pins|source-pin|ostree-pins|ostree-pin|seed-digests|local-source-roster ..."),
+        _ => die("usage: td-recipe-eval list|emit|check-list|check-count|check-script|check-run|build-run|clear-store|gc-store|qemu-secret|qemu-secret-system|qemu-boot|qemu-boot-uefi|qemu-boot-media|qemu-install|qemu-install-system|compose-iso|test-iso|qemu-boot-erofs|qemu-boot-system|qemu-update|qemu-boot-net|qemu-boot-kexec|run|bundle|warm|verify-store|payload-closure|application-closure|vendor-warm-args|source-pins|source-pin|ostree-pins|ostree-pin|seed-digests|local-source-roster ..."),
     }
 }
 

@@ -1,0 +1,27 @@
+#!/bin/sh
+set -eu
+
+case "$0" in
+    */*) start_dir=${0%/*} ;;
+    *) start_dir=. ;;
+esac
+case "${1-}" in
+    -h|--help)
+        echo 'usage: ./test-iso ISO [--usb]'
+        exit 0
+        ;;
+esac
+if [ "$#" -gt 0 ]; then
+    iso=$1
+    shift
+    case "$iso" in
+        /*) ;;
+        *) iso="$(pwd -P)/$iso" ;;
+    esac
+    set -- "$iso" "$@"
+fi
+cd "$start_dir"
+
+. ./host-preflight.sh
+
+exec cargo run --release --manifest-path recipes/Cargo.toml --bin td-recipe-eval -- test-iso "$@"

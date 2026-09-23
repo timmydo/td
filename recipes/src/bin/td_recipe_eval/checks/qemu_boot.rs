@@ -32,6 +32,7 @@ pub(crate) mod efi;
 pub(crate) mod install;
 pub(crate) mod media;
 pub(crate) mod secret;
+pub(crate) mod test_iso;
 pub(crate) mod update;
 
 use std::env;

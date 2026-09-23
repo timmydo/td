@@ -2,11 +2,11 @@
 # The checkout entry points must bootstrap the Cargo runner before `cargo run`
 # can ask that runner to execute td-recipe-eval.
 #
-# There are two of them — `start` boots the system, `build-qcow` bundles it —
+# `start` boots the system, `build-qcow` bundles it and `test-iso` runs QEMU —
 # and they share one sourced `host-preflight.sh` precisely so the bootstrap and
-# the Rust floor cannot differ between them. The legs below run BOTH through
+# the Rust floor cannot differ between them. The legs below run all three through
 # the same fixtures: a preflight that only `start` enforces is the bug this
-# file exists to prevent, and it is invisible from either script alone.
+# file exists to prevent, and it is invisible from any single script alone.
 set -euo pipefail
 
 if [[ ${TD_START_TEST_FAKE_TOOLS:-} == 1 ]]; then
@@ -53,6 +53,7 @@ make_fixture() {
     mkdir -p "$1/.cargo"
     cp "$root/start" "$1/start"
     cp "$root/build-qcow" "$1/build-qcow"
+    cp "$root/test-iso" "$1/test-iso"
     cp "$root/host-preflight.sh" "$1/host-preflight.sh"
     cp "$root/.cargo/config.toml" "$1/.cargo/config.toml"
 }
@@ -102,7 +103,7 @@ assert_isolated_runner_build() {
 # runner bootstrap and before Cargo starts building the system — from EITHER
 # entry point. `build-qcow` runs a far longer build than `start`, so an
 # unenforced floor there is the more expensive one to discover.
-for script in start build-qcow; do
+for script in start build-qcow test-iso; do
     old_rust=$work/old-rust-$script
     make_fixture "$old_rust"
     old_rust_log=$work/old-rust-$script.log
@@ -136,7 +137,7 @@ done
 
 # A successful Cargo exit without the promised artifact must not reach the
 # system build through an old or dangling runner.
-for script in start build-qcow; do
+for script in start build-qcow test-iso; do
     missing=$work/missing-$script
     make_fixture "$missing"
     missing_log=$work/missing-$script.log
@@ -217,6 +218,27 @@ test -z "$bundle_third" || {
     exit 1
 }
 
+# A path relative to the caller stays relative to that caller when the
+# wrapper enters its checkout for the host preflight.
+iso_log=$work/iso.log
+: > "$iso_log"
+(
+    cd "$work"
+    run_entry_point "$fixture" "$iso_log" test-iso input.iso --usb
+)
+iso_first=$(sed -n '1p' "$iso_log")
+iso_second=$(sed -n '2p' "$iso_log")
+iso_third=$(sed -n '3p' "$iso_log")
+assert_isolated_runner_build "$iso_first" "$fixture" test-iso
+test "$iso_second" = "$ambient_target|wrong-target|$ambient_home|$fixture|run --release --manifest-path recipes/Cargo.toml --bin td-recipe-eval -- test-iso $work/input.iso --usb" || {
+    echo "FAIL: test-iso lost the caller's ISO path or skipped bootstrapping: $iso_second" >&2
+    exit 1
+}
+test -z "$iso_third" || {
+    echo "FAIL: test-iso issued an unexpected third Cargo command: $iso_third" >&2
+    exit 1
+}
+
 mapfile -t runner_paths < <(
     sed -n 's/^runner = \["\([^"]*\)", "run-capped"\]$/\1/p' \
         "$fixture/.cargo/config.toml"
@@ -237,4 +259,4 @@ test -x "$fixture/$runner_path" || {
     exit 1
 }
 
-echo "PASS: start and build-qcow require Rust 1.95 and bootstrap their Cargo runner"
+echo "PASS: start, build-qcow and test-iso require Rust 1.95 and bootstrap their Cargo runner"

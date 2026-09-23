@@ -202,6 +202,25 @@ payloads, use `td-recipe-eval compose-iso OUTPUT KERNEL INITRAMFS
 input and publication rules. The command assembles bytes; the complete live
 installer profile and physical-device installation flow are still in progress.
 
+To boot a retained ISO interactively with a disposable destination disk:
+
+```sh
+./test-iso path/to/installer.iso
+./test-iso path/to/installer.iso --usb
+```
+
+The first command attaches the ISO as optical media; `--usb` tests the same
+image as USB mass storage. QEMU opens the ISO read-only and creates a private
+16 GiB sparse destination. After the first VM exits, type `boot` to start the
+destination alone with fresh UEFI variables, or press Enter to stop. Inspect both
+sessions manually; QEMU exit status alone does not prove installation worked.
+The disk is removed when the command exits normally. Scratch files default to
+`target/`; set `TMPDIR` to choose another host filesystem with room for the
+disk's written contents. After Ctrl-C, remove any leftover `target/td-test-iso-*`
+directory from that run. The current `compose-iso` command does not yet produce
+a graphical installer image.
+Set `TD_QEMU_ACCEL=tcg` to force software emulation when KVM is available.
+
 ## License
 
 GPL-3.0-or-later. See [COPYING](COPYING).

@@ -1085,13 +1085,14 @@ fn map_path(root: &Path, roster: &Result<Vec<GateCrate>, String>, p: &str, sel: 
         return;
     }
 
-    // The repository-root entry points and the preflight fragment they both
-    // source, plus the test that drives all three. `build-qcow` and
+    // The repository-root entry points and the preflight fragment they
+    // source, plus the test that drives them. `build-qcow`, `test-iso` and
     // `host-preflight.sh` route here rather than to the generic shell arm
     // because `start-bootstrap` is what actually proves them: bash -n would
     // accept a `build-qcow` that had quietly stopped running the preflight.
     if p == "start"
         || p == "build-qcow"
+        || p == "test-iso"
         || p == "host-preflight.sh"
         || p == "tests/start.sh"
     {
@@ -1643,7 +1644,7 @@ fn map_path(root: &Path, roster: &Result<Vec<GateCrate>, String>, p: &str, sel: 
 /// The shell scripts' syntax check, one `bash -n` per script: given several
 /// names at once, bash checks the first and hands the rest to it as its
 /// arguments.
-const SHELL_SYNTAX: &str = "for f in start build-qcow host-preflight.sh news mail tests/*.sh ci/*.sh tools/*.sh; do bash -n \"$f\" || exit 1; done";
+const SHELL_SYNTAX: &str = "for f in start build-qcow test-iso host-preflight.sh news mail tests/*.sh ci/*.sh tools/*.sh; do bash -n \"$f\" || exit 1; done";
 
 fn preflight_cmd(root: &Path, name: &str, changed: &[String]) -> Option<String> {
     match name {
@@ -2713,6 +2714,8 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     assert_preflight!("tests/start.sh", "start-bootstrap");
     assert_preflight!("build-qcow", "shell-syntax");
     assert_preflight!("build-qcow", "start-bootstrap");
+    assert_preflight!("test-iso", "shell-syntax");
+    assert_preflight!("test-iso", "start-bootstrap");
     assert_preflight!("host-preflight.sh", "shell-syntax");
     assert_preflight!("host-preflight.sh", "start-bootstrap");
     assert_preflight!("news", "shell-syntax");
@@ -8851,7 +8854,7 @@ mod tests {
                 "  check.sh",
                 "",
                 "Selected checks:",
-                "  for f in start build-qcow host-preflight.sh news mail tests/*.sh ci/*.sh tools/*.sh; do bash -n \"$f\" || exit 1; done",
+                "  for f in start build-qcow test-iso host-preflight.sh news mail tests/*.sh ci/*.sh tools/*.sh; do bash -n \"$f\" || exit 1; done",
                 &full_cargo,
                 "  td-builder check check",
                 "",

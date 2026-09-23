@@ -118,6 +118,43 @@ identities. Identical stable inputs produce identical ISO contents. Firmware
 and filesystem hardware compatibility still require the v2 device tests,
 including simultaneous attachment of two media with these template GUIDs.
 
+## Interactive QEMU run
+
+`./test-iso ISO [--usb]` boots an existing nonempty regular ISO through OVMF
+and host QEMU with a graphical host display. Optical attachment is the default;
+`--usb` attaches the same file as USB mass storage. The runner opens the ISO as
+a regular file and
+passes that held read-only descriptor through QEMU's standard input, which
+QEMU opens as `/proc/self/fd/0`. Path replacement after admission cannot
+redirect it to another file. The media is read-only, networking is disabled and
+the sole writable destination is a fresh private 16 GiB sparse raw file.
+The runner tries KVM on x86-64 when `/dev/kvm` opens read-write, then falls
+back to software emulation if KVM initialization fails. `TD_QEMU_ACCEL=tcg`
+forces emulation; `TD_QEMU_ACCEL=kvm` requires usable KVM. Firmware variables
+are private copies. No operator destination disk or block device is selected.
+After the first
+QEMU exit, typing `boot` starts a cold boot of the destination with
+the installation media detached and fresh firmware variables. The command
+does not inject a kernel, initramfs or command line, or interpret a guest
+success marker. It returns QEMU launch and exit errors, not an installation
+verdict: the operator inspects the interactive installer and installed desktop.
+Pressing Enter, typing another answer or reaching input EOF skips that boot.
+A reboot of the installed guest ends the second QEMU session; it does not
+start a third boot.
+The private files are removed when the command returns normally; Ctrl-C or an
+abrupt process death may leave its `td-test-iso-*` directory under the checkout's
+`target/` directory (or `TMPDIR` when set). Remove that run's leftover directory
+manually. QEMU reports target-disk I/O errors rather than pausing indefinitely.
+Both boot stages write serial logs there for inspection while the command runs.
+On QEMU failure, the final 8192 bytes of the serial log are
+printed before cleanup. Set `TMPDIR` to choose where the sparse disk grows.
+`TD_QEMU_EFI_CODE` and `TD_QEMU_EFI_VARS` select the same optional
+firmware pair as the existing firmware oracles.
+
+This runner is useful for a retained development ISO now. The complete
+desktop installer producer and its automated end-to-end oracle remain the
+activation requirements in INSTALLER.md.
+
 ## Repeatable firmware oracle
 
 `td-recipe-eval qemu-boot-media` builds the declared source-built kernel
