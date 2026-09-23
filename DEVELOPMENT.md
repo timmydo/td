@@ -499,9 +499,9 @@ review one exact revision of it, which is not always the revision that lands:
 The roster depends on the acting agent:
 
 - Claude acting: latest Opus subagent, Codex CLI, Agy CLI.
-- Codex acting: `gpt-5.6-sol` subagent, Claude CLI, Agy CLI.
+- Codex acting: `gpt-6-sol` subagent, Claude CLI, Agy CLI.
 
-When Codex is acting, explicitly select `gpt-5.6-sol` in the subagent spawn.
+When Codex is acting, explicitly select `gpt-6-sol` in the subagent spawn.
 Do not rely on the acting agent's inherited or configured default. A model
 override requires a no-history or bounded-history fork, so set `fork_turns`
 to `none` or a positive turn count and put the exact commit plus all context
@@ -639,8 +639,8 @@ then closes the commit message with one trailer per reviewer and the checks
 that ran:
 
 ```text
-Reviewed-by: subagent/opus-5
-Reviewed-by: codex/gpt-5.6-sol
+Reviewed-by: subagent/opus-5.5
+Reviewed-by: codex/gpt-6-sol
 Reviewed-by: agy/gemini-3.8-flash-high
 Checks: affected-checks --committed-only (green)
 ```
@@ -649,7 +649,7 @@ Use the identities that actually reviewed. `td-builder ready` requires a
 `subagent/<model>`, Agy, the non-acting model-family CLI, and non-empty
 `Checks:`. It compares model families so the acting model cannot review itself
 through a second frontend. For a Codex-acting review, the subagent trailer is
-`Reviewed-by: subagent/gpt-5.6-sol`; a generic or inherited model identity does
+`Reviewed-by: subagent/gpt-6-sol`; a generic or inherited model identity does
 not satisfy the roster.
 
 The trailer block must close the message, with no text below it and no wrapped
