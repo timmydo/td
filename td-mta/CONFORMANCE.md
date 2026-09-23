@@ -34,10 +34,11 @@ limits, including 32 MiB uploads and 256-object get/set windows.
 M02 must pin supported collation/search behavior and all variable-length
 limits. Unsupported optional behavior gets the standard error where permitted;
 mandatory properties/methods cannot disappear behind a client-only subset.
-M02 also fixes the wire-ID mapping: RFC 8620 §1.2 recommends IDs that start
-with a letter and cannot be parsed as numbers. The local 16-byte hex types
-are storage identities; the protocol adapter must consider this recommendation
-without treating every syntactically valid absent JMAP ID as a local hex ID.
+[WIRE.md](WIRE.md) fixes the wire-ID mapping: generated IDs use type letters
+plus canonical storage hex; MIME parts use distinct checked locators. The
+parser separately accepts the full generic RFC 8620 §1.2 Id grammar, so valid
+absent IDs receive the proper notFound outcome. Implemented codecs do not
+provide endpoint or authorization evidence.
 
 ## Methods and HTTP endpoints
 

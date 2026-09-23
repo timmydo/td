@@ -4,6 +4,7 @@
 pub mod format;
 pub mod ids;
 pub mod limits;
+pub mod wire;
 
 /// Operator configuration schema, independent of the future storage format.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

@@ -165,7 +165,7 @@ For example, `store inspect email e123 --json` might decode:
 ```json
 {
   "emailId": "e123",
-  "blobId": "ab91",
+  "blobId": "b91",
   "threadId": "t55",
   "receivedAt": "2026-09-22T18:30:00Z",
   "mailboxIds": ["m1", "m7"],
@@ -174,6 +174,9 @@ For example, `store inspect email e123 --json` might decode:
 }
 ```
 
+Inspection object-ID fields use the type-prefixed wire form from WIRE.md;
+the shortened IDs in these worked examples are schematic, not valid inputs.
+Physical primary keys remain the binary encodings in FORMAT.md.
 That JSON is an assembled inspection view, not a JSON file on disk. Its fields
 come from the email, membership and keyword tables overlaid with recent
 committed updates. `m7`'s name comes from its mailbox row. Subject and attachment
@@ -182,11 +185,13 @@ names come from the message or its disposable parsing cache.
 ### 3.1 MIME part blob identities
 
 File blob IDs and JMAP part blob IDs are distinct typed forms. A part ID is
-a versioned encoding of its parent message blob ID, encoded-body offset/length
-and transfer-encoding tag; M02 freezes its canonical bounded wire encoding
-within JMAP's ID length limit. It never names an independently stored file or
-an entry in `blobs`. Resolve it only in an authorized account and live parent
-view; validate checked ranges and require an exact match to a parsed MIME part
+a versioned encoding of its parent file blob ID, encoded-body offset/length
+and transfer-encoding tag; [WIRE.md](WIRE.md) freezes its canonical bounded
+wire encoding within JMAP's ID length limit. Nested attached messages use its
+bounded chain of decoded-stream ranges. A part never names an independently
+stored file or an entry in `blobs`. Resolve it only in an authorized account and live parent
+view, or against an authorized unexpired upload lease for a parsed raw message;
+validate checked ranges and require an exact match to a parsed MIME part
 descriptor, rebuilt boundedly if its cache is absent. A forged locator cannot
 select arbitrary filesystem bytes or bypass parent authorization.
 
