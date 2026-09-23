@@ -7,14 +7,15 @@
 //!
 //! What the encoder uses of AV1: 64x64 superblocks split down to square
 //! blocks of 32, 16 and 8 pixels by rate-distortion choice; every intra
-//! mode but CfL, palette and filter-intra, with the mode's default
-//! transform type from the reduced set; one transform per plane per
-//! block; the multi-symbol arithmetic coder with adapting CDFs from the
-//! defaults; uniform tile columns by the frame's size alone, which the
-//! threads spread over. Loop filter, CDEF, restoration, superres, film grain and
-//! screen-content tools stay off, so the decoder side is the smallest AV1
-//! has. `transform` holds the transforms, quantizers and scans, `cdf` the
-//! default CDFs.
+//! mode but CfL, palette and filter-intra; for luma below 32 the best
+//! of the reduced set's four DCT and ADST pairs, for chroma the mode's
+//! default; one transform per plane per block; the multi-symbol
+//! arithmetic coder with adapting CDFs from the defaults; uniform tile
+//! columns by the frame's size alone, which the threads spread over.
+//! Loop filter, CDEF, restoration, superres, film grain and
+//! screen-content tools stay off, so the decoder side is the smallest
+//! AV1 has. `transform` holds the transforms, quantizers and scans,
+//! `cdf` the default CDFs.
 
 use std::fmt;
 
@@ -123,6 +124,15 @@ fn mode_context(mode: u8) -> usize {
         _ => 4,
     }
 }
+
+/// The luma transform types a block below 32x32 may signal
+/// (`TX_SET_INTRA_2` without `IDTX`).
+const TX_TYPES: [TxType; 4] = [
+    TxType::DctDct,
+    TxType::AdstDct,
+    TxType::DctAdst,
+    TxType::AdstAdst,
+];
 
 /// The spec's `Mode_To_Txfm`, the transform a mode's residual gets
 /// when the size admits one other than DCT.
@@ -1280,6 +1290,8 @@ struct Tile {
     coder: Coder,
     qindex: u8,
     rdmult: u64,
+    /// `screen`'s rate weight, `16 isqrt(rdmult * 128)`.
+    screen_weight: u64,
     scratch: Scratch,
     /// Saved states' context and pixel copies, returned by `restore` and
     /// `recycle`.
@@ -1331,6 +1343,7 @@ impl Tile {
             coder: Coder::new(),
             qindex,
             rdmult,
+            screen_weight: 16 * (rdmult * 128).isqrt(),
             scratch: Scratch::default(),
             spare_segments: Vec::new(),
             spare_pixels: Vec::new(),
@@ -1463,8 +1476,21 @@ impl Tile {
         }
     }
 
+    /// A screening score of a prediction's SATD and its mode's rate in
+    /// 1/512 bit, `2^18` times `SATD + 16 sqrt(rdmult / 2048) bits`:
+    /// sixteen times the root of the multiplier per squared error. The
+    /// root alone undervalues the rate, a block's SATD summing what the
+    /// error's root does not; eight to thirty-two times it measured alike
+    /// on a photo.
+    fn screen(&self, satd: u64, rate: u64) -> u64 {
+        (satd << 18) + rate * self.screen_weight
+    }
+
+    /// libaom's `RDCOST` of a squared error and a rate in 1/512 bit. Its
+    /// distortion is sixteen times the pixels' squared error
+    /// (`dist_block_px_domain`), the scale its `rdmult` assumes.
     fn rd(&self, distortion: u64, rate: u64) -> u64 {
-        (distortion << 7) + ((rate * self.rdmult) >> 9)
+        (distortion << (4 + 7)) + ((rate * self.rdmult) >> 9)
     }
 
     /// The rate of the partition symbol a node needs, none or split.
@@ -1630,8 +1656,8 @@ impl Tile {
         } = scratch;
         let [trial_y, trial_u, trial_v] = trial;
         let [best_y, best_u, best_v] = best;
-        // Luma: every mode screened by its residual's magnitude, the
-        // closest few coded in full.
+        // Luma: every mode screened by its residual's SATD and its rate,
+        // the closest few coded in full.
         let edges = self.pred_edges(0, at);
         let area = side * side;
         let luma = grown(preds, MODES.len() * area);
@@ -1643,21 +1669,45 @@ impl Tile {
             .enumerate()
         {
             predict_block(mode, &edges, pred);
-            *slot = (self.sad(0, at, pred), mode, k);
+            let mut counter = Counter(0);
+            self.y_mode_symbols(&mut counter, at, mode);
+            *slot = (self.screen(self.satd(0, at, pred), counter.0), mode, k);
         }
         screened.sort_unstable();
+        let size = plane_size(at.log2, 0);
         let mut y_mode = None;
+        let mut best_score = u64::MAX;
         for &(_, mode, k) in screened.iter().take(LUMA_TRIALS) {
             let pred = luma.get(k * area..(k + 1) * area).unwrap_or(&[]);
-            self.code_plane(0, at, mode, pred, work, trial_y);
-            if y_mode.is_none() || trial_y.cost < best_y.cost {
+            self.code_plane(0, at, mode, mode_tx_type(mode, size), pred, work, trial_y);
+            let mut counter = Counter(0);
+            self.y_mode_symbols(&mut counter, at, mode);
+            let score = trial_y.cost.saturating_add(self.rd(0, counter.0));
+            if y_mode.is_none() || score < best_score {
                 std::mem::swap(trial_y, best_y);
-                y_mode = Some(mode);
+                y_mode = Some((mode, k));
+                best_score = score;
             }
         }
-        let Some(y_mode) = y_mode else {
+        let Some((y_mode, k)) = y_mode else {
             return (leaf, 0);
         };
+        // The chosen mode under the other types its size signals: the
+        // mode's rate is the same under each, so the trials' costs alone
+        // compare.
+        if size != Size::S32 && best_y.eob > 0 {
+            let pred = luma.get(k * area..(k + 1) * area).unwrap_or(&[]);
+            let coded = mode_tx_type(y_mode, size);
+            for tx in TX_TYPES {
+                if tx == coded {
+                    continue;
+                }
+                self.code_plane(0, at, y_mode, tx, pred, work, trial_y);
+                if trial_y.cost < best_y.cost {
+                    std::mem::swap(trial_y, best_y);
+                }
+            }
+        }
         let y_cost = best_y.cost;
         leaf.y_mode = y_mode;
         leaf.tx_type = best_y.tx;
@@ -1678,23 +1728,31 @@ impl Tile {
             let (u, v) = pred.split_at_mut(area);
             predict_block(mode, &edges_u, u);
             predict_block(mode, &edges_v, v);
-            *slot = (self.sad(1, at, u) + self.sad(2, at, v), mode, k);
+            let mut counter = Counter(0);
+            self.uv_mode_symbols(&mut counter, y_mode, mode);
+            let satd = self.satd(1, at, u) + self.satd(2, at, v);
+            *slot = (self.screen(satd, counter.0), mode, k);
         }
         screened.sort_unstable();
         let mut uv_mode = None;
+        let mut best_score = u64::MAX;
         for &(_, mode, k) in screened.iter().take(CHROMA_TRIALS) {
             let pred = chroma.get(k * area * 2..(k + 1) * area * 2).unwrap_or(&[]);
             let (pu, pv) = pred.split_at(area.min(pred.len()));
-            self.code_plane(1, at, mode, pu, work, trial_u);
-            self.code_plane(2, at, mode, pv, work, trial_v);
-            let (trial_cost, best_cost) = (
-                trial_u.cost.saturating_add(trial_v.cost),
-                best_u.cost.saturating_add(best_v.cost),
-            );
-            if uv_mode.is_none() || trial_cost < best_cost {
+            let tx = mode_tx_type(mode, plane_size(at.log2, 1));
+            self.code_plane(1, at, mode, tx, pu, work, trial_u);
+            self.code_plane(2, at, mode, tx, pv, work, trial_v);
+            let mut counter = Counter(0);
+            self.uv_mode_symbols(&mut counter, y_mode, mode);
+            let score = trial_u
+                .cost
+                .saturating_add(trial_v.cost)
+                .saturating_add(self.rd(0, counter.0));
+            if uv_mode.is_none() || score < best_score {
                 std::mem::swap(trial_u, best_u);
                 std::mem::swap(trial_v, best_v);
                 uv_mode = Some(mode);
+                best_score = score;
             }
         }
         let Some(uv_mode) = uv_mode else {
@@ -1719,8 +1777,10 @@ impl Tile {
         (leaf, cost)
     }
 
-    /// The sum of absolute differences of a prediction against the source.
-    fn sad(&self, plane: usize, at: At, pred: &[u8]) -> u64 {
+    /// The sum of absolute Hadamard-transformed differences of a
+    /// prediction against the source, 4x4 by 4x4: closer to what the
+    /// residual costs to code than the plain differences.
+    fn satd(&self, plane: usize, at: At, pred: &[u8]) -> u64 {
         let sub = usize::from(plane > 0);
         let n = at.side() >> sub;
         let x = (at.mi_col * MI) >> sub;
@@ -1729,23 +1789,36 @@ impl Tile {
             return 0;
         };
         let mut total = 0u64;
-        for (r, prow) in pred.chunks_exact(n).enumerate() {
-            let srow = source.row(y + r).get(x..x + n).unwrap_or(&[]);
-            for (p, s) in prow.iter().zip(srow) {
-                total += u64::from(p.abs_diff(*s));
+        for (by, prows) in pred.chunks_exact(n * 4).enumerate() {
+            for bx in 0..n / 4 {
+                let mut d = [[0i32; 4]; 4];
+                let col = bx * 4;
+                for (r, row) in d.iter_mut().enumerate() {
+                    let p = prows.get(r * n + col..r * n + col + 4).unwrap_or(&[]);
+                    let s = source
+                        .row(y + by * 4 + r)
+                        .get(x + col..x + col + 4)
+                        .unwrap_or(&[]);
+                    for ((slot, p), s) in row.iter_mut().zip(p).zip(s) {
+                        *slot = i32::from(*s) - i32::from(*p);
+                    }
+                }
+                total += hadamard4(&d);
             }
         }
         total
     }
 
-    /// Codes one plane of a block under a mode from its prediction into
-    /// `out`: transform, quantization, reconstruction; nothing is written
-    /// to the tile.
+    /// Codes one plane of a block under a mode and transform type from
+    /// its prediction into `out`: transform, quantization,
+    /// reconstruction; nothing is written to the tile.
+    #[allow(clippy::too_many_arguments)]
     fn code_plane(
         &mut self,
         plane: usize,
         at: At,
         mode: u8,
+        tx: TxType,
         pred: &[u8],
         work: &mut Work,
         out: &mut Coded,
@@ -1753,7 +1826,6 @@ impl Tile {
         let sub = usize::from(plane > 0);
         let n = at.side() >> sub;
         let size = plane_size(at.log2, plane);
-        let tx = mode_tx_type(mode, size);
         let x = (at.mi_col * MI) >> sub;
         let y = ((at.mi_row - self.band_mi_row) * MI) >> sub;
         out.tx = tx;
@@ -1973,6 +2045,15 @@ impl Tile {
         if let Some(cdf) = self.cdfs.skip.get_mut(usize::from(above_skip + left_skip)) {
             sink.symbol(cdf, usize::from(leaf.skip));
         }
+        self.y_mode_symbols(sink, leaf.at, leaf.y_mode);
+        self.uv_mode_symbols(sink, leaf.y_mode, leaf.uv_mode);
+    }
+
+    /// The luma mode's symbols of a block at the position: `y_mode` under
+    /// its neighbours' modes and, for a directional one, a zero angle
+    /// delta.
+    fn y_mode_symbols(&mut self, sink: &mut impl Sink, at: At, y_mode: u8) {
+        let (mi_row, mi_col) = (at.mi_row, at.mi_col);
         let above_mode = if self.avail_up(mi_row) {
             self.contexts
                 .above_mode
@@ -1997,26 +2078,23 @@ impl Tile {
             .get_mut(mode_context(above_mode))
             .and_then(|row| row.get_mut(mode_context(left_mode)))
         {
-            sink.symbol(cdf, usize::from(leaf.y_mode));
+            sink.symbol(cdf, usize::from(y_mode));
         }
-        if is_directional(leaf.y_mode) {
-            if let Some(cdf) = self
-                .cdfs
-                .angle_delta
-                .get_mut(usize::from(leaf.y_mode - V_PRED))
-            {
+        if is_directional(y_mode) {
+            if let Some(cdf) = self.cdfs.angle_delta.get_mut(usize::from(y_mode - V_PRED)) {
                 sink.symbol(cdf, 3);
             }
         }
-        if let Some(cdf) = self.cdfs.uv_mode.get_mut(usize::from(leaf.y_mode)) {
-            sink.symbol(cdf, usize::from(leaf.uv_mode));
+    }
+
+    /// The chroma mode's symbols under the luma mode: `uv_mode` and, for
+    /// a directional one, a zero angle delta.
+    fn uv_mode_symbols(&mut self, sink: &mut impl Sink, y_mode: u8, uv_mode: u8) {
+        if let Some(cdf) = self.cdfs.uv_mode.get_mut(usize::from(y_mode)) {
+            sink.symbol(cdf, usize::from(uv_mode));
         }
-        if is_directional(leaf.uv_mode) {
-            if let Some(cdf) = self
-                .cdfs
-                .angle_delta
-                .get_mut(usize::from(leaf.uv_mode - V_PRED))
-            {
+        if is_directional(uv_mode) {
+            if let Some(cdf) = self.cdfs.angle_delta.get_mut(usize::from(uv_mode - V_PRED)) {
                 sink.symbol(cdf, 3);
             }
         }
@@ -2399,6 +2477,26 @@ fn grown<T: Copy + Default>(buffer: &mut Vec<T>, len: usize) -> &mut [T] {
         buffer.resize(len, T::default());
     }
     buffer.get_mut(..len).unwrap_or(&mut [])
+}
+
+/// The sum of the absolute values of a 4x4's Hadamard transform, halved
+/// as x264 does.
+fn hadamard4(d: &[[i32; 4]; 4]) -> u64 {
+    let mut m = [[0i32; 4]; 4];
+    for (row, out) in d.iter().zip(m.iter_mut()) {
+        let (a, b) = (row[0] + row[1], row[0] - row[1]);
+        let (c, e) = (row[2] + row[3], row[2] - row[3]);
+        *out = [a + c, b + e, a - c, b - e];
+    }
+    let mut total = 0u64;
+    for (((&r0, &r1), &r2), &r3) in m[0].iter().zip(&m[1]).zip(&m[2]).zip(&m[3]) {
+        let (a, b) = (r0 + r1, r0 - r1);
+        let (c, e) = (r2 + r3, r2 - r3);
+        for v in [a + c, b + e, a - c, b - e] {
+            total += u64::from(v.unsigned_abs());
+        }
+    }
+    total / 2
 }
 
 /// A plane's prediction edges for an `n` square: `above[1 + i]` is the

@@ -391,9 +391,9 @@ fn fnv(bytes: &[u8]) -> u64 {
 #[test]
 fn the_streams_are_the_bytes_dav1d_decoded() {
     for (width, height, quality, rows_log2, hash) in [
-        (65, 33, 30, 0, 0xce4a3b13c20c87fdu64),
-        (520, 40, 60, 0, 0xb9d5a35ea1e5f2c9),
-        (200, 200, 75, 1, 0x2fd0e5e8478c7be5),
+        (65, 33, 30, 0, 0x85d697538c01ac1cu64),
+        (520, 40, 60, 0, 0xcafcb50b61002866),
+        (200, 200, 75, 1, 0xe00fac57b2bb8a0a),
     ] {
         let name = format!("g{width}x{height}q{quality}r{rows_log2}");
         let (obus, reconstruction) = encode_tiled(width, height, quality, 1, rows_log2);

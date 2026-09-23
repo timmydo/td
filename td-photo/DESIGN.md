@@ -1255,20 +1255,26 @@ then square blocks of 32, 16 or 8 (a partition of `NONE` or `SPLIT`
 alone, the frame's edges splitting as the spec forces them; no 64-wide
 block is ever a leaf, since there is no 64-point transform here), one
 transform the block's size (`TX_MODE_LARGEST`, the reduced transform
-set, so a block's type is the one its mode implies, `DCT_DCT` at 32),
-the thirteen intra modes without
-an angle delta, filter, palette or chroma-from-luma, no loop filter,
-CDEF, restoration, superres or film grain, and the symbol adaptation the
-spec runs by default. The quality maps to `qindex` as `255 - ((q - 1) *
-254 + 49) / 99`, the dead-zone quantiser rounds the DC at half a step and
-each AC at three eighths, and a block's mode is chosen by rate-distortion
-(`(D << 7) + (R * rdmult) >> 9`, `rdmult` from the DC step as libaom sets
-it, the rate the coder's own cost of its symbols under the tile's live
-probabilities): the modes are screened by the SAD of their predictions,
-the best three (two for chroma, one mode for both planes) coded in full,
-and a superblock's partition is decided by trials that save and restore
-the contexts and pixels they touch before the chosen tree is emitted, so
-the decoder's state is the encoder's exactly. The frame is tiled
+set: a luma block below 32 may signal any of the four DCT and ADST
+pairs, chroma's is the one its mode implies, `DCT_DCT` at 32), the
+thirteen intra modes without an angle delta, filter, palette or
+chroma-from-luma, no loop filter, CDEF, restoration, superres or film
+grain, and the symbol adaptation the spec runs by default. The quality
+maps to `qindex` as `255 - ((q - 1) * 254 + 49) / 99`, the dead-zone
+quantiser rounds the DC at half a step and each AC at three eighths,
+and a block's mode is chosen by rate-distortion (`(16 D << 7) +
+(R * rdmult) >> 9`, `rdmult` from the DC step as libaom sets it and
+`D` the squared error, sixteen times it the scale libaom's distortion
+and `rdmult` share, the rate the coder's own cost of its symbols under
+the tile's live probabilities): the modes are
+screened by the 4x4 Hadamard SATD of their predictions plus their mode
+symbols' rate under sixteen times the root of the multiplier, the best
+three (two for chroma, one mode for both planes) coded in full and
+compared with their mode's rate, then the chosen luma mode coded under
+the other transform types when it left any coefficient, and a
+superblock's partition is decided by trials that save and restore the
+contexts and pixels they touch before the chosen tree is emitted, so the
+decoder's state is the encoder's exactly. The frame is tiled
 uniformly by its size alone, so the bytes are the same whatever the
 thread count, as the JPEG encoder's are: as many tile columns as the
 width allows while the uniform column stays four superblocks wide (the
@@ -1294,10 +1300,17 @@ the export band rules hold; a frame is at most 16384 on an axis. A
 block's prediction edges are read once per plane and every mode is
 predicted from them into the tile's scratch, which also holds the
 transform's working blocks and each plane's trial and best coding and
-only grows, so a block allocates only the levels its leaf keeps. Angle
-deltas and a better distortion measure are the fidelity follow-ups; a
-24-megapixel export takes over ten seconds on one thread and a few on
-eight (`tests/av1.rs`'s `bench`).
+only grows, so a block allocates only the levels its leaf keeps. A
+24-megapixel export takes under twenty seconds on one thread and a few
+on eight (`tests/av1.rs`'s `bench`). Against libaom's all-intra speed 6
+on a real 2048-pixel photo the encoder needs about 3% more bits for the
+same PSNR from 0.3 to 3 bits a pixel and about 15% below that, where
+libaom's deblocking counts; the compression follow-ups, by what
+libaom's tools measured there, are more modes coded in full, trellis
+quantisation, a skip test under a chroma weight (zeroing chroma saves
+luma bits but costs RGB fidelity), rectangular partitions and
+transforms, deblocking and CDEF (most at low rates), angle deltas and
+chroma-from-luma.
 
 The AVIF (`avif::file`) is the least HEIF file the format asks for and
 every reader expects: `ftyp` with the `avif` brand and `mif1`, `miaf`
