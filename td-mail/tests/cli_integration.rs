@@ -110,6 +110,28 @@ password_command = "echo test"
         }
     }
 
+    /// td-mail ended and started again with the same configuration,
+    /// against the same server and fetch socket.
+    fn restart(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        let mut child = Command::new(env!("CARGO_BIN_EXE_td-mail"))
+            .arg("--cli")
+            .arg(format!(
+                "--config={}",
+                self._config_dir.path().join("config.toml").display()
+            ))
+            .env("XDG_RUNTIME_DIR", self._fetch.runtime_dir())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn td-mail --cli");
+        self.stdin = child.stdin.take().expect("take stdin");
+        self.reader = BufReader::new(child.stdout.take().expect("take stdout"));
+        self.child = child;
+    }
+
     /// The mock server, for what it received.
     fn server(&self) -> &MockJmapServer {
         &self._server
@@ -788,6 +810,15 @@ fn test_send_draft_submits_through_jmap_and_retires_the_draft() {
         "API error: the server refused to send: forbiddenToSend: the recipient's domain is refused"
     );
     assert!(other.exists(), "the draft stays");
+    assert!(
+        !drafts
+            .join(format!(
+                "{}.lost",
+                other.file_name().unwrap().to_string_lossy()
+            ))
+            .exists(),
+        "a refusal the server answered keeps no record"
+    );
     assert_eq!(h.server().submissions().len(), 1);
     assert_eq!(
         h.server().email_state("email-created-2"),
@@ -833,6 +864,8 @@ fn test_send_draft_submits_through_jmap_and_retires_the_draft() {
         "{error}"
     );
     assert!(lost.exists(), "the draft stays");
+    let record = drafts.join("td-mail-draft-9-11.eml.lost");
+    assert!(record.exists(), "the attempt is recorded beside the draft");
     let created = h.server().created_emails();
     let lost_id = created.last().map(|(id, _)| id.clone()).expect("created");
     let sent_before = h.server().submissions().len();
@@ -841,6 +874,10 @@ fn test_send_draft_submits_through_jmap_and_retires_the_draft() {
         Some(("mbox-sent".to_string(), true, false)),
         "the server sent it and filed it"
     );
+    // td-mail ended and started again still asks before sending.
+    h.restart();
+    let resp = h.send(json!({"command": "connect", "account": "test"}));
+    assert!(resp["ok"].is_true(), "connect failed: {}", resp);
     let resp = h.send(json!({"command": "send_draft", "path": lost.to_string_lossy()}));
     assert!(resp["ok"].is_true(), "{}", resp);
     assert_eq!(text(&resp["email_id"]), lost_id);
@@ -852,6 +889,71 @@ fn test_send_draft_submits_through_jmap_and_retires_the_draft() {
     );
     assert_eq!(h.server().submissions().len(), sent_before, "sent once");
     assert!(!lost.exists(), "retired");
+    assert!(!record.exists(), "the record goes with the answer");
+
+    // A record that cannot be kept (the drafts directory read-only)
+    // refuses the send before anything goes.
+    let locked = drafts.join("td-mail-draft-9-21.eml");
+    std::fs::write(
+        &locked,
+        "From: test@example.com\nTo: bob@example.com\nSubject: Locked\n--text follows this line--\nhi\n",
+    )
+    .expect("draft");
+    let sent_before = h.server().submissions().len();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&drafts, std::fs::Permissions::from_mode(0o500)).expect("lock");
+        let resp = h.send(json!({"command": "send_draft", "path": locked.to_string_lossy()}));
+        std::fs::set_permissions(&drafts, std::fs::Permissions::from_mode(0o700)).expect("unlock");
+        assert!(!resp["ok"].is_true(), "{}", resp);
+        assert!(
+            text(&resp["error"]).contains("cannot keep the record of this send"),
+            "{}",
+            resp
+        );
+    }
+    assert_eq!(h.server().submissions().len(), sent_before, "nothing sent");
+    std::fs::remove_file(&locked).expect("draft gone");
+
+    // Sent, but the draft could not be retired (its name is taken in
+    // sent): the record stays, so after a restart the next send asks the
+    // server, finds the message, and sends nothing.
+    let stuck = drafts.join("td-mail-draft-9-20.eml");
+    std::fs::write(
+        &stuck,
+        "From: test@example.com\nTo: bob@example.com\nSubject: Stuck\n--text follows this line--\nhi\n",
+    )
+    .expect("draft");
+    let blocker = state.path().join("td-mail/sent/td-mail-draft-9-20.eml");
+    std::fs::write(&blocker, "in the way").expect("blocker");
+    let resp = h.send(json!({"command": "send_draft", "path": stuck.to_string_lossy()}));
+    assert!(resp["ok"].is_true(), "{}", resp);
+    assert!(resp["retired_to"].is_null(), "{}", resp);
+    let stuck_id = text(&resp["email_id"]).to_string();
+    let stuck_record = drafts.join("td-mail-draft-9-20.eml.lost");
+    assert!(
+        stuck.exists() && stuck_record.exists(),
+        "kept until retired"
+    );
+    let sent_before = h.server().submissions().len();
+    let created_before = h.server().created_emails().len();
+    std::fs::remove_file(&blocker).expect("blocker gone");
+    h.restart();
+    let resp = h.send(json!({"command": "connect", "account": "test"}));
+    assert!(resp["ok"].is_true(), "connect failed: {}", resp);
+    let resp = h.send(json!({"command": "send_draft", "path": stuck.to_string_lossy()}));
+    assert!(resp["ok"].is_true(), "{}", resp);
+    assert_eq!(text(&resp["email_id"]), stuck_id);
+    assert_eq!(h.server().submissions().len(), sent_before, "sent once");
+    assert_eq!(
+        h.server().created_emails().len(),
+        created_before,
+        "created once"
+    );
+    assert!(
+        !stuck.exists() && !stuck_record.exists(),
+        "retired, the record with it"
+    );
 
     // Lost, and the message was addressed to this account too, so the
     // server holds two copies with the Message-ID: the one with the
@@ -894,6 +996,10 @@ fn test_send_draft_submits_through_jmap_and_retires_the_draft() {
         "the delivered copy stays"
     );
     assert!(!echo.exists(), "retired");
+    assert!(
+        !drafts.join("td-mail-draft-9-12.eml.lost").exists(),
+        "the record went with the retire"
+    );
 
     // Lost, on a server that keeps no record of submissions: the copy,
     // no longer a draft, says the message went, and that is the answer.
@@ -925,6 +1031,10 @@ fn test_send_draft_submits_through_jmap_and_retires_the_draft() {
     );
     assert_eq!(h.server().submissions().len(), sent_before, "sent once");
     assert!(!forgotten.exists(), "retired");
+    assert!(
+        !drafts.join("td-mail-draft-9-13.eml.lost").exists(),
+        "the record went with the retire"
+    );
 
     // Lost, and the server had refused the submission: the copy it made
     // is removed and the send is made afresh, answered this time.
@@ -975,6 +1085,52 @@ fn test_send_draft_submits_through_jmap_and_retires_the_draft() {
         "the refused copy went too"
     );
     assert!(other.exists(), "the draft stays");
+    assert!(
+        !drafts.join("td-mail-draft-9-10.eml.lost").exists(),
+        "neither the lost attempt's record nor the fresh one's stays"
+    );
+
+    // A draft outside a drafts directory is never retired, so the send
+    // that went takes its record with it rather than leaving it to
+    // answer every later send.
+    let elsewhere = drafts.parent().unwrap().join("elsewhere");
+    std::fs::create_dir_all(&elsewhere).expect("elsewhere");
+    let loose = elsewhere.join("td-mail-draft-9-30.eml");
+    let loose_record = elsewhere.join("td-mail-draft-9-30.eml.lost");
+    std::fs::write(
+        &loose,
+        "From: test@example.com\nTo: bob@example.com\nSubject: [lose] loose\n--text follows this line--\nhi\n",
+    )
+    .expect("draft");
+    let resp = h.send(json!({"command": "send_draft", "path": loose.to_string_lossy()}));
+    assert!(
+        text(&resp["error"]).contains("the answer was lost"),
+        "{resp}"
+    );
+    assert!(loose_record.exists(), "the lost attempt is recorded");
+    let sent_before = h.server().submissions().len();
+    let resp = h.send(json!({"command": "send_draft", "path": loose.to_string_lossy()}));
+    assert!(resp["ok"].is_true(), "{resp}");
+    assert_eq!(h.server().submissions().len(), sent_before, "sent once");
+    assert!(
+        text(&resp["warning"]).starts_with("not retired: "),
+        "{resp}"
+    );
+    assert!(loose.exists(), "not retired");
+    assert!(!loose_record.exists(), "the record went with the answer");
+    std::fs::write(
+        &loose,
+        "From: test@example.com\nTo: bob@example.com\nSubject: again\n--text follows this line--\nhi\n",
+    )
+    .expect("draft");
+    let resp = h.send(json!({"command": "send_draft", "path": loose.to_string_lossy()}));
+    assert!(resp["ok"].is_true(), "{resp}");
+    assert_eq!(
+        h.server().submissions().len(),
+        sent_before + 1,
+        "a later send is sent"
+    );
+    assert!(!loose_record.exists(), "and keeps no record");
 
     // A draft that is not one says which line.
     std::fs::write(

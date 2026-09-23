@@ -152,28 +152,38 @@ opened, to a byte past the ceiling at most.
 A send whose answer never came (the fetch service or the server not
 answering, an answer that could not be read, or a `serverPartialFail`)
 may have gone: it is refused with that said, and the next send of the
-same draft asks the server first, by the Message-ID the attempt carried
-and when it was made. The identity's submissions around then
-(`EmailSubmission/query` by identity and time, a day of slack either
-side for the clocks; the match is by Message-ID, the window only bounds
-what is read; then `EmailSubmission/get`) are read with the messages
-they sent, and the one carrying the Message-ID is the answer, its
-mailbox read back. With none on record, the copies made in that window
-in the mailbox the send creates in and in Sent (`Email/query` by mailbox
-and time) say: one carrying the Message-ID and no longer a draft where
-it was made (filed to Sent by a server that keeps no submissions) went,
-and is the answer, "none on record" as its submission; one still a draft
-where it was made never went, so it is removed and the draft is sent
-afresh, as it is when no copy is there. Only those two mailboxes are
-read, so a copy delivered to this account is never touched. (A query by
-the Message-ID header would name the copy directly, but servers answer
-that filter as they please: Stalwart matches nothing by it, so nothing
-here rests on it.) So nothing is sent twice for want of an answer, as
-long as td-mail is the same process, except on a server that keeps no
-submissions and left the copy a draft; after a restart the person checks
-Sent before sending the draft again. What is settled is the attempt: a
-draft edited after its answer was lost and sent again is answered with
-that attempt when it went, the edits not sent.
+same draft asks the server first, in this td-mail or after a restart, by
+the Message-ID the attempt carried and when it was made. The identity's
+submissions around then (`EmailSubmission/query` by identity and time, a
+day of slack either side for the clocks; the match is by Message-ID, the
+window only bounds what is read; then `EmailSubmission/get`) are read
+with the messages they sent, and the one carrying the Message-ID is the
+answer, its mailbox read back. With none on record, the copies made in
+that window in the mailbox the send creates in and in Sent
+(`Email/query` by mailbox and time) say: one carrying the Message-ID and
+no longer a draft where it was made (filed to Sent by a server that
+keeps no submissions) went, and is the answer, "none on record" as its
+submission; one still a draft where it was made never went, so it is
+removed and the draft is sent afresh, as it is when no copy is there.
+Only those two mailboxes are read, so a copy delivered to this account
+is never touched. (A query by the Message-ID header would name the copy
+directly, but servers answer that filter as they please: Stalwart
+matches nothing by it, so nothing here rests on it.) The attempt is
+recorded beside the draft before the request goes
+(`td-mail-draft-ID.eml.lost`, private: the Message-ID, when, and the
+identity) and removed when the server refuses it or when the draft,
+sent, is retired to `sent` (a draft outside a `drafts` directory, which
+is never retired, has its record removed once the server answers that
+it went), so an answer lost to td-mail ending
+mid-request, or td-mail ending before the retire, or a retire that
+fails, is asked about too; a record that cannot be kept refuses the send
+before anything goes, and one that cannot be read refuses it, named,
+until the person, having checked Sent, removes it. So nothing is sent
+twice for want of an answer, except on a server that keeps no
+submissions and left the copy a draft, or when two td-mails send the
+same draft at the same moment, which nothing guards. What is settled is
+the attempt: a draft edited after its answer was lost and sent again is
+answered with that attempt when it went, the edits not sent.
 
 While the answer is awaited the draft is held read-only, so the file
 sent is the file retired: a second send, a save and a close, the

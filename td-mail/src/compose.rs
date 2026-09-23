@@ -650,6 +650,16 @@ pub(crate) fn replace_draft(path: &Path, bytes: &[u8]) -> io::Result<()> {
     written
 }
 
+/// Where the record of a send of the draft at `path` is kept from before
+/// its request goes until the draft is retired, or the server refuses it
+/// (`backend::send_draft`): beside the draft, its name with `.lost`
+/// after it.
+pub(crate) fn lost_record_for(path: &Path) -> PathBuf {
+    let mut record = path.as_os_str().to_os_string();
+    record.push(".lost");
+    PathBuf::from(record)
+}
+
 /// Moves a sent draft, and its attachment sidecar when it has one, out
 /// of the drafts directory into the `sent` directory beside it
 /// (`.../td-mail/sent` for `.../td-mail/drafts`), made private as the
@@ -663,7 +673,7 @@ pub(crate) fn replace_draft(path: &Path, bytes: &[u8]) -> io::Result<()> {
 /// (`settle_retired`): its tags pointed at the sidecar's place in `sent`
 /// and, when the sidecar is the draft's own (`attach::sidecar_for`), its
 /// files no tag names removed, best effort, since the retirement itself
-/// has happened.
+/// has happened; the send's record (`lost_record_for`) is removed.
 pub fn retire_draft(path: &Path, attachment_dir: Option<&Path>) -> io::Result<PathBuf> {
     let sent = crate::submit::sent_dir_for(path).ok_or_else(|| {
         io::Error::new(
@@ -763,6 +773,13 @@ pub fn retire_draft(path: &Path, attachment_dir: Option<&Path>) -> io::Result<Pa
             return Err(io::Error::new(e.kind(), detail));
         }
         settle_retired(&target, &inside, &dir_target, own);
+    }
+    // The draft's send is settled once it has gone: its record goes.
+    let record = lost_record_for(path);
+    if let Err(e) = fs::remove_file(&record) {
+        if e.kind() != io::ErrorKind::NotFound {
+            crate::log_error!("Could not remove {}: {}", record.display(), e);
+        }
     }
     Ok(target)
 }
@@ -1028,7 +1045,10 @@ mod tests {
         fs::DirBuilder::new().mode(0o700).create(&sidecar)?;
         fs::write(sidecar.join("a.txt"), "a")?;
 
+        let record = lost_record_for(&draft);
+        fs::write(&record, "message-id <a@b>\nsince 1\nidentity i\n")?;
         let retired = retire_draft(&draft, Some(&sidecar))?;
+        assert!(!record.exists(), "the send's record goes with the draft");
         let sent = root.join("td-mail/sent");
         assert_eq!(retired, sent.join("td-mail-draft-1-2.eml"));
         assert_eq!(fs::read_to_string(&retired)?, "From: me@example.com\n");

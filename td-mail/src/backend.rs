@@ -1474,9 +1474,6 @@ fn backend_loop(
     // Why the loop is offline, when a connection was tried and failed:
     // named in every answer served from the cache until one is made.
     let mut offline_reason: Option<String> = None;
-    // Each draft's last send whose answer was lost, by path: the next
-    // send of that draft asks the server first.
-    let mut lost_sends: HashMap<PathBuf, LostSend> = HashMap::new();
     if let Some(cache) = cache.as_ref() {
         if let Some(mboxes) = cache.get_mailboxes() {
             cached_mailboxes = mboxes;
@@ -2268,7 +2265,7 @@ fn backend_loop(
             }
             BackendCommand::SendDraft { path } => {
                 log_info!("[Backend] cmd#{} SendDraft {}", command_seq, path.display());
-                let result = send_draft(client, &path, &mut lost_sends);
+                let result = send_draft(client, &path);
                 if let Err(e) = &result {
                     log_error!("[Backend] SendDraft {} failed: {}", path.display(), e);
                 }
@@ -2528,17 +2525,19 @@ pub struct SentDraft {
 /// server keeping the copy in the Sent mailbox (in Drafts until it goes,
 /// and there if the account has no Sent). Nothing on disk changes here.
 ///
-/// A send whose answer was lost (the request may have been served) is
-/// recorded in `lost_sends` under the draft's path with the Message-ID
-/// it carried, and the next send of that draft asks the server first,
-/// through `settle_lost_send`, so nothing is sent twice for want of an
-/// answer; a refusal the server answered is not recorded, the message
-/// having gone nowhere.
-fn send_draft(
-    client: &JmapClient,
-    path: &Path,
-    lost_sends: &mut HashMap<PathBuf, LostSend>,
-) -> Result<SentDraft, String> {
+/// Before the request goes, the attempt (the Message-ID it carries,
+/// when, and under which identity) is recorded beside the draft
+/// (`compose::lost_record_for`). A refusal the server answered removes
+/// the record; a send that went keeps it until the draft is retired
+/// (`compose::retire_draft` removes it), so td-mail ending before the
+/// retire, or a retire that fails, still leaves it; and a send whose
+/// answer was lost, to the network or to td-mail ending mid-request,
+/// leaves it too. The next send of a draft with a record, in this
+/// process or a later one, asks the server first through
+/// `settle_lost_send`, so nothing is sent twice for want of an answer or
+/// a retire. A record that cannot be kept refuses the send before
+/// anything goes; one that cannot be read refuses it, named.
+fn send_draft(client: &JmapClient, path: &Path) -> Result<SentDraft, String> {
     if !client.can_submit() {
         return Err(
             "the server's session lists no mail submission for this account \
@@ -2567,6 +2566,23 @@ fn send_draft(
             }
         )
     })?;
+    // The record holds the identity's id as a line of its own: a JMAP Id,
+    // letters, digits, `-` and `_`.
+    if identity.id.is_empty()
+        || !identity
+            .id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return Err(format!(
+            "the server's identity id {:?} is not a JMAP Id, so nothing was sent",
+            identity.id
+        ));
+    }
+    // A draft outside a `drafts` directory is never retired, so a send of
+    // it that went removes its own record rather than leaving it to answer
+    // every later send.
+    let retired = submit::sent_dir_for(path).is_some();
 
     let mailboxes = client.get_mailboxes().map_err(|e| e.to_string())?;
     let by_role = |role: &str| {
@@ -2581,7 +2597,7 @@ fn send_draft(
         "the account has neither a Drafts nor a Sent mailbox to keep the message in".to_string()
     })?;
 
-    if let Some(lost) = lost_sends.get(path).cloned() {
+    if let Some(lost) = read_lost(path)? {
         let settled = settle_lost_send(
             client,
             &lost,
@@ -2589,7 +2605,7 @@ fn send_draft(
             sent.as_ref().map(|(id, _)| id.as_str()),
             &mailboxes,
         )?;
-        lost_sends.remove(path);
+        // One that went keeps its record until the draft is retired.
         if let Some(sent) = settled {
             log_info!(
                 "[Backend] The lost send of {} went: email {} submission {}, kept in {}",
@@ -2598,8 +2614,12 @@ fn send_draft(
                 sent.submission_id,
                 sent.kept_in
             );
+            if !retired {
+                clear_lost(path);
+            }
             return Ok(sent);
         }
+        clear_lost(path);
     }
 
     let ceiling = client.upload_ceiling();
@@ -2619,26 +2639,38 @@ fn send_draft(
     let message_id = submit::new_message_id(&outgoing.from);
     let now = civil::now_unix();
     let email = submit::email_json(&outgoing, identity, &blob_ids, now, &message_id);
+    let attempt = LostSend {
+        message_id,
+        since: now,
+        identity_id: identity.id.clone(),
+    };
+    write_lost(path, &attempt).map_err(|e| {
+        format!(
+            "cannot keep the record of this send at {} ({e}), so nothing was sent",
+            crate::compose::lost_record_for(path).display()
+        )
+    })?;
     let submitted = match client.submit_email(
         email,
         &identity.id,
         &create_in,
         sent.as_ref().map(|(id, _)| id.as_str()),
     ) {
-        Ok(submitted) => submitted,
+        // Sent: the record stays until the draft is retired.
+        Ok(submitted) => {
+            if !retired {
+                clear_lost(path);
+            }
+            submitted
+        }
         // The server answered: the message went nowhere.
-        Err(e @ JmapError::Api(_)) => return Err(e.to_string()),
+        Err(e @ JmapError::Api(_)) => {
+            clear_lost(path);
+            return Err(e.to_string());
+        }
         // No answer, or one that says the server may have done part of
-        // it: the message may have gone.
+        // it: the message may have gone, and the record stays.
         Err(e) => {
-            lost_sends.insert(
-                path.to_path_buf(),
-                LostSend {
-                    message_id,
-                    since: now,
-                    identity_id: identity.id.clone(),
-                },
-            );
             return Err(format!(
                 "{e}; the answer was lost, so the next send of this draft asks the \
                  server whether the message went before sending it again"
@@ -2681,11 +2713,103 @@ fn attach_file(
 /// A send whose answer was lost: the Message-ID the attempt carried,
 /// when it was made and the identity it was made under, so the server
 /// can be asked about it.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 struct LostSend {
     message_id: String,
     since: i64,
     identity_id: String,
+}
+
+/// The most a lost send's record is read to.
+const LOST_RECORD_BYTES: u64 = 4096;
+
+impl LostSend {
+    /// The record as kept: a `key value` line each.
+    fn to_record(&self) -> String {
+        format!(
+            "message-id {}\nsince {}\nidentity {}\n",
+            self.message_id, self.since, self.identity_id
+        )
+    }
+
+    /// A record read back; none when a line is not one of the three
+    /// keys with a value free of controls, or a key is missing or given
+    /// twice.
+    fn from_record(text: &str) -> Option<Self> {
+        let (mut message_id, mut since, mut identity_id) = (None, None, None);
+        for line in text.lines() {
+            let (key, value) = line.split_once(' ')?;
+            if value.is_empty() || value.chars().any(char::is_control) {
+                return None;
+            }
+            match key {
+                "message-id" if message_id.is_none() => message_id = Some(value.to_string()),
+                "since" if since.is_none() => since = Some(value.parse().ok()?),
+                "identity" if identity_id.is_none() => identity_id = Some(value.to_string()),
+                _ => return None,
+            }
+        }
+        Some(LostSend {
+            message_id: message_id?,
+            since: since?,
+            identity_id: identity_id?,
+        })
+    }
+}
+
+/// The record of a lost send of the draft at `path`, none when there is
+/// none. One that cannot be read (not a regular file, too long, or not a
+/// record) is an error naming it: without it nothing says whether the
+/// message went.
+fn read_lost(path: &Path) -> Result<Option<LostSend>, String> {
+    let record = crate::compose::lost_record_for(path);
+    let unreadable = |why: String| {
+        format!(
+            "the record of an earlier send at {} {why}; having checked the Sent \
+             mailbox for that message, remove the record to send the draft",
+            record.display()
+        )
+    };
+    match std::fs::symlink_metadata(&record) {
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(unreadable(format!("cannot be read ({e})"))),
+    }
+    let bytes = match submit::read_regular(&record, LOST_RECORD_BYTES) {
+        Ok(bytes) => bytes,
+        // Removed between the look and the read: settled elsewhere.
+        Err(_)
+            if std::fs::symlink_metadata(&record)
+                .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            return Ok(None)
+        }
+        Err(e) => return Err(unreadable(format!("cannot be read ({e})"))),
+    };
+    std::str::from_utf8(&bytes)
+        .ok()
+        .and_then(LostSend::from_record)
+        .map(Some)
+        .ok_or_else(|| unreadable("is not a record td-mail keeps".to_string()))
+}
+
+/// The attempt recorded beside the draft at `path`, private and whole.
+fn write_lost(path: &Path, lost: &LostSend) -> std::io::Result<()> {
+    crate::compose::replace_draft(
+        &crate::compose::lost_record_for(path),
+        lost.to_record().as_bytes(),
+    )
+}
+
+/// The record beside the draft at `path` removed, the send settled; one
+/// that cannot be removed is logged, and asks the server again next time.
+fn clear_lost(path: &Path) {
+    let record = crate::compose::lost_record_for(path);
+    if let Err(e) = std::fs::remove_file(&record) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            log_error!("[Backend] Could not remove {}: {}", record.display(), e);
+        }
+    }
 }
 
 /// A send whose answer was lost, asked about. The identity's submissions
@@ -3429,6 +3553,51 @@ mod tests {
     use super::*;
     use crate::cache::Cache;
     use std::collections::HashMap;
+
+    /// A lost send's record reads back as written, beside the draft and
+    /// private; one that is not a record, too long, or not a regular
+    /// file is an error naming it; none is none; cleared, it is gone.
+    #[test]
+    fn a_lost_sends_record_is_kept_beside_the_draft() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = crate::testing::tempdir().unwrap();
+        let draft = dir.path().join("td-mail-draft-1-1.eml");
+        let record = dir.path().join("td-mail-draft-1-1.eml.lost");
+        assert_eq!(crate::compose::lost_record_for(&draft), record);
+        assert_eq!(read_lost(&draft), Ok(None));
+        let lost = LostSend {
+            message_id: "<a.b@example.com>".to_string(),
+            since: 1_700_000_000,
+            identity_id: "id-1".to_string(),
+        };
+        write_lost(&draft, &lost).unwrap();
+        assert_eq!(
+            std::fs::metadata(&record).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(read_lost(&draft), Ok(Some(lost.clone())));
+        for junk in [
+            "message-id <a@b>\nsince 1\n",
+            "message-id <a@b>\nsince soon\nidentity i\n",
+            "message-id <a@b>\nsince 1\nidentity i\nextra x\n",
+            "message-id \nsince 1\nidentity i\n",
+            "message-id <a@b>\nsince 1\nidentity i\nmessage-id <c@d>\n",
+        ] {
+            std::fs::write(&record, junk).unwrap();
+            let err = read_lost(&draft).unwrap_err();
+            assert!(err.contains("td-mail-draft-1-1.eml.lost"), "{err}");
+        }
+        std::fs::write(&record, "x".repeat(5000)).unwrap();
+        assert!(read_lost(&draft).is_err());
+        std::fs::remove_file(&record).unwrap();
+        std::fs::create_dir(&record).unwrap();
+        assert!(read_lost(&draft).is_err(), "a directory is not a record");
+        std::fs::remove_dir(&record).unwrap();
+        write_lost(&draft, &lost).unwrap();
+        clear_lost(&draft);
+        assert!(!record.exists());
+        clear_lost(&draft);
+    }
 
     /// Offline, an attach is still made, bounded by the fetch service's
     /// request bound since the server's is not known.
