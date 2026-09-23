@@ -2,8 +2,9 @@
 
 This is the normative storage companion to [DESIGN.md](DESIGN.md). Read both
 before changing persistence, queries, submission records, migration or backup.
-It specifies an unimplemented target. M02 supplies the remaining field-tag
-registry and golden byte fixtures before any production data is written.
+It specifies an unimplemented target. [FORMAT.md](FORMAT.md) owns the numeric
+registry and byte layout. M02 completes row codecs and golden fixtures before
+any production data is written; scalar/key codecs alone do not open a store.
 
 ## 1. Storage model
 
@@ -108,7 +109,7 @@ Keys contain raw 16-byte IDs and bounded UTF-8 bytes, not displayed hex.
 | `submissions` | submission ID | Email/thread/identity IDs, immutable transmitted blob ID, envelope sender, sendAt, lifecycle/notification state |
 | `recipients` | submission ID + recipient ordinal | Address, attempt/phase, result, retry time, expiry, bounded diagnostic |
 | `leases` | upload blob ID | Owning account/device, expiry and permitted use |
-| `imports` | source-instance ID + length-prefixed source-account and object bytes | Local IDs and verified source digest/mapping |
+| `imports` | source-instance ID + source object kind + length-prefixed source-account and object bytes | Local IDs and verified source digest/mapping |
 
 Every record carries its last changed transaction sequence. Fields needed for
 submission remain in its record even if the visible email is later deleted.
@@ -117,7 +118,9 @@ ordinary integer values use the encoding in section 4. Indexable timestamps and
 addresses do not become primary keys solely for query speed.
 
 The source account/object part of an import key, including its two u32 length
-prefixes, is at most 1008 bytes, giving a total key ceiling of 1024 bytes.
+prefixes, is at most 1007 bytes; instance and kind take 17 bytes, giving a
+total key ceiling of 1024 bytes. The kind distinguishes a mailbox and email
+with the same source ID; source IDs are not globally unique across JMAP types.
 Import must report an unrepresentable source ID; hashing without a
 collision-resolving source record is not a substitute.
 Keywords and addresses obey their more specific protocol/config limits.

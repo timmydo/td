@@ -11,6 +11,9 @@ The M01 library skeleton provides typed local IDs, configuration versioning and
 checked resource planning only. [RESOURCES.md](RESOURCES.md) records its initial
 byte ledger; [CONFORMANCE.md](CONFORMANCE.md) inventories the unimplemented JMAP
 contract and current client calls. There are no protocol handlers or listeners.
+The M02a format module adds checked scalar/key codecs. [FORMAT.md](FORMAT.md)
+fixes their byte layout and the container registry; persistence, row schemas
+and the remaining M02 contracts are not implemented by those codecs.
 
 The initial deployment is one person's approximately 1 GB of mail, multiple
 domains, and explicit aliases on each domain pointing into one account's

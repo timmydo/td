@@ -124,6 +124,19 @@ method/property inventory, client call sites and discovered compatibility gaps.
 
 ## M02 — Freeze store, queue, and protocol contracts
 
+M02 is split at the format/API boundaries into three independently reviewed
+commits. Consumers of M02 wait for all three; the first two do not authorize
+writing production mail or advertising capabilities.
+
+- **M02a — Scalars, keys and framing registry:** checked borrowed codecs,
+  table/key tags, exact container offsets and sequence exhaustion. Tests pin
+  canonical scalar/key bytes, malformed input and cross-type import identity.
+- **M02b — Rows and golden fixtures:** complete value field registry, bounded
+  row codecs, full row/container byte examples and digest-provider test inputs.
+- **M02c — Runtime and protocol contracts:** compiling adapter/store APIs,
+  queue transitions/JMAP mappings, part locators, worker/work/maintenance
+  budgets, thread/search/MIME policies and traceable wire fixture inventory.
+
 **Depends on:** M01. **Own:** module interfaces, format specification and golden
 fixture descriptions. **Read:** DESIGN sections 8-11 and standards inventory.
 
