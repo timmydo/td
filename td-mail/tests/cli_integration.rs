@@ -585,6 +585,85 @@ fn test_connect_without_fetch_service_names_the_socket() {
     assert!(error.contains(&expected), "error was: {}", error);
 }
 
+/// `attach_file` copies a file into the draft's sidecar under the
+/// connected server's `maxSizeUpload` and appends its tag; a missing draft
+/// and a file past the limit are refused with nothing copied.
+#[test]
+fn test_attach_file_copies_under_the_servers_limit() {
+    let mut h = CliHarness::start();
+    let resp = h.send(json!({"command": "connect", "account": "test"}));
+    assert!(resp["ok"].is_true(), "connect failed: {}", resp);
+
+    let state = testing::tempdir().expect("state dir");
+    let drafts = state.path().join("td-mail/drafts");
+    std::fs::create_dir_all(&drafts).expect("drafts dir");
+    let draft = drafts.join("td-mail-draft-4-4.eml");
+    let template =
+        "From: me@example.com\nTo: you@example.com\nSubject: s\n--text follows this line--\nhi";
+    std::fs::write(&draft, template).expect("draft");
+    let files = testing::tempdir().expect("files dir");
+    let small = files.path().join("notes.txt");
+    std::fs::write(&small, "some notes").expect("small file");
+    // One byte past the mock's maxSizeUpload.
+    let large = files.path().join("large.bin");
+    std::fs::write(&large, vec![0u8; 1_000_001]).expect("large file");
+
+    // No draft there: refused, nothing copied.
+    let missing = drafts.join("td-mail-draft-5-5.eml");
+    let resp = h.send(json!({
+        "command": "attach_file",
+        "path": missing.to_string_lossy(),
+        "file": small.to_string_lossy()
+    }));
+    assert!(!resp["ok"].is_true(), "attached to no draft: {}", resp);
+    assert!(
+        text(&resp["error"]).contains("is not a draft file"),
+        "refused before the copy: {}",
+        resp
+    );
+    assert!(!drafts.join("td-mail-att-5-5").exists(), "no sidecar made");
+
+    // Past the server's limit: refused before anything is copied.
+    let resp = h.send(json!({
+        "command": "attach_file",
+        "path": draft.to_string_lossy(),
+        "file": large.to_string_lossy()
+    }));
+    assert!(
+        !resp["ok"].is_true(),
+        "a file past the limit attached: {}",
+        resp
+    );
+    assert!(
+        text(&resp["error"]).contains("1000000"),
+        "the refusal cites the server's limit: {}",
+        resp
+    );
+    assert_eq!(std::fs::read_to_string(&draft).expect("draft"), template);
+    assert!(!drafts.join("td-mail-att-4-4").exists(), "no sidecar made");
+
+    let resp = h.send(json!({
+        "command": "attach_file",
+        "path": draft.to_string_lossy(),
+        "file": small.to_string_lossy()
+    }));
+    assert!(resp["ok"].is_true(), "attach_file failed: {}", resp);
+    let sidecar = drafts.join("td-mail-att-4-4");
+    assert_eq!(Path::new(text(&resp["attachment_dir"])), sidecar);
+    let copy = sidecar.join("notes.txt");
+    assert_eq!(Path::new(text(&resp["copy"])), copy);
+    assert_eq!(text(&resp["name"]), "notes.txt");
+    assert_eq!(number(&resp["bytes"]), 10);
+    assert_eq!(std::fs::read_to_string(&copy).expect("copy"), "some notes");
+    let written = std::fs::read_to_string(&draft).expect("draft");
+    assert!(
+        written.starts_with(&format!("{template}\n<#part "))
+            && written.contains(&format!("filename=\"{}\"", copy.display()))
+            && written.ends_with("<#/part>\n"),
+        "the tag appended: {written}"
+    );
+}
+
 /// `send_draft` parses the retained draft, uploads its attachment, creates
 /// the message in Drafts and submits it in one request under the account's
 /// identity, the server then moving it to Sent, read and no longer a

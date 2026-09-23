@@ -265,6 +265,7 @@ fn dispatch(state: &mut CliState, input: &Value) -> Value {
         "reply_draft" => cmd_reply_draft(state, input),
         "forward_draft" => cmd_forward_draft(state, input),
         "send_draft" => cmd_send_draft(state, input),
+        "attach_file" => cmd_attach_file(state, input),
         "keybindings" => cmd_keybindings(),
         _ => err_response(&format!("unknown command '{}'", command)),
     }
@@ -1314,6 +1315,77 @@ fn cmd_reply_draft(state: &mut CliState, input: &Value) -> Value {
     }
 }
 
+/// Copies "file" into the attachment sidecar of the retained draft at
+/// "path" ("attachment_dir" when it has one, else made beside it) under
+/// what the connected server takes, and appends its tag to the draft; a
+/// draft that cannot take the tag has the copy removed again, and the
+/// sidecar when this made it.
+fn cmd_attach_file(state: &mut CliState, input: &Value) -> Value {
+    let path = match input.get("path").and_then(|v| v.as_str()) {
+        Some(path) if !path.is_empty() => std::path::PathBuf::from(path),
+        _ => return err_response("missing 'path' field"),
+    };
+    let file = match input.get("file").and_then(|v| v.as_str()) {
+        Some(file) if !file.is_empty() => std::path::PathBuf::from(file),
+        _ => return err_response("missing 'file' field"),
+    };
+    let sidecar = input
+        .get("attachment_dir")
+        .and_then(|v| v.as_str())
+        .filter(|dir| !dir.is_empty())
+        .map(std::path::PathBuf::from);
+    // Nothing is copied for a draft that could not take the tag.
+    if !std::fs::symlink_metadata(&path).is_ok_and(|m| m.is_file()) {
+        return err_response(&format!("{} is not a draft file", path.display()));
+    }
+    if let Err(e) = state.send_cmd(BackendCommand::AttachFile {
+        draft: path.clone(),
+        sidecar,
+        source: file.clone(),
+    }) {
+        return err_response(&e);
+    }
+    let attached = match state.recv_resp() {
+        Ok(BackendResponse::FileAttached {
+            draft,
+            source,
+            result,
+        }) if draft == path && source == file => match result {
+            Ok(attached) => attached,
+            Err(e) => return err_response(&e),
+        },
+        Ok(_) => return err_response("unexpected response from backend"),
+        Err(e) => return err_response(&e),
+    };
+    // The tag on a line of its own at the draft's end, the draft replaced
+    // whole; the copy removed again when the draft cannot take it.
+    let appended = std::fs::read_to_string(&path).and_then(|mut text| {
+        if !text.is_empty() && !text.ends_with('\n') {
+            text.push('\n');
+        }
+        text.push_str(attached.tag.trim_start_matches('\n'));
+        compose::replace_draft(&path, text.as_bytes())
+    });
+    if let Err(e) = appended {
+        let _ = std::fs::remove_file(&attached.path);
+        if attached.created {
+            let _ = std::fs::remove_dir(&attached.sidecar);
+        }
+        return err_response(&format!("the draft could not take the tag: {e}"));
+    }
+    ok_response(
+        ObjectBuilder::new()
+            .set(
+                "attachment_dir",
+                attached.sidecar.to_string_lossy().as_ref(),
+            )
+            .set("copy", attached.path.to_string_lossy().as_ref())
+            .set("name", &attached.name)
+            .set("bytes", attached.bytes as u64)
+            .build(),
+    )
+}
+
 /// Sends the retained draft at "path" through the account's server and,
 /// sent, retires it to the sent directory beside its drafts directory
 /// (with "attachment_dir" when the draft has a sidecar); a draft that was
@@ -1769,6 +1841,10 @@ reply_draft: Generate a reply draft.
 forward_draft: Generate a forward draft.
    > {{"command": "forward_draft", "id": "email-id"}}
    < {{"ok": true, "draft": "From: ...\nTo: \nSubject: Fwd: ...\n\n---------- Forwarded message ----------\n..."}}
+
+attach_file: Copy a file into a retained draft's attachment directory (made beside the draft when it has none) and append its MML tag to the draft, the file bounded by what the connected server takes, else by the fetch service's 32 MiB request bound.
+   > {{"command": "attach_file", "path": "/home/me/.local/state/td-mail/drafts/td-mail-draft-1-2.eml", "file": "/home/me/Downloads/report.pdf"}}
+   < {{"ok": true, "attachment_dir": "/home/me/.local/state/td-mail/drafts/td-mail-att-1-2", "copy": ".../td-mail-att-1-2/report.pdf", "name": "report.pdf", "bytes": 12345}}
 
 send_draft: Send a retained draft through the account's server (JMAP EmailSubmission), then move it to the sent directory beside its drafts directory.
    > {{"command": "send_draft", "path": "/home/me/.local/state/td-mail/drafts/td-mail-draft-1-2.eml", "attachment_dir": "/home/me/.local/state/td-mail/drafts/td-mail-att-1-2"}}

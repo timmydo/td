@@ -73,31 +73,40 @@ second press on a row attaches that file, Backspace on an empty filter,
 Alt-Up and `^` go up, typed characters filter the names, and Escape
 closes the finder with nothing attached. It lists the folders and
 regular files td-mail can read (in its jail its state directory and the
-Downloads grant, on a host everything), leaving out names beginning
-with `.`, folders first and each sorted; a folder of more than 4096 of
-them shows the first 4096 in that order, and one of more than 65536
-entries is read that far. A file past the fetch service's 32 MiB
-request bound is shown dimmed and cannot be chosen, since it could not
-be sent. The file
-chosen is copied into the draft's `td-mail-att-ID` sidecar, made
-private beside the draft when it has none, read as the send reads an
-attachment (a regular file, not blocking, to a byte past the bound at
-most). The copy keeps the file's name, cleaned to one path component a
-tag can carry, with `-2`, `-3`, … before the extension when that is
-taken, the tag then naming it for the recipient as the file was. Its
-`<#part>` tag, the media type from the name's extension
+Downloads grant, on a host everything), leaving out names beginning with
+`.`, folders first and each sorted; a folder of more than 4096 of them
+shows the first 4096 in that order, and one of more than 65536 entries
+is read that far. A file past the fetch service's 32 MiB request bound
+is shown dimmed and cannot be chosen, since it could not be sent. The
+file chosen is copied by the backend, off the window's thread, into the
+draft's `td-mail-att-ID` sidecar, made private beside the draft when it
+has none, read as the send reads an attachment (a regular file, not
+blocking, to a byte past the bound at most). When connected the bound is
+also what the account's server takes (its `maxSizeUpload`), so a file it
+would refuse at send is refused at attach instead, the reason in the
+status row and nothing copied; while the connection is still being made,
+the copy waits for it, so that it knows the limit, and a copy queues
+behind the backend's work in hand. While the copy is made the draft can
+be edited but not sent, closed (the window's close included) or attached
+to again, and when the tag goes in the caret and any selection stay
+where they were (a caret at the very end of a draft ending in a newline
+moving past the tag). The copy keeps the file's name, cleaned to one
+path component a tag can carry, with `-2`, `-3`, … before the extension
+when that is taken, the tag then naming it for the recipient as the file
+was. Its `<#part>` tag, the media type from the name's extension
 (`application/octet-stream` for one not known), goes on a line of its
-own at the end of the draft, unsaved as any edit is. The send reads
-the copy, so a file changed or removed after it was attached does not
-change the message, and the copy retires with the draft to `sent`; a
-copy whose tag is deleted from the draft, or undone, stays in the
-sidecar while the draft is one and is removed when it is sent, so the
-retired sidecar holds what went. A copy is also
-named for the recipient without a bidirectional control a name may
-carry, so it cannot show another extension than it has.
-A tag written by hand still attaches the file it names, read when the
-draft is sent. Nothing is attached while a send is awaited or once the
-server has taken the draft.
+own at the end of the draft when the copy is made, unsaved as any edit
+is. The CLI's `attach_file` does the same for a retained draft, saving
+the tag into it. The send reads the copy, so a file changed or removed
+after it was attached does not change the message, and the copy retires
+with the draft to `sent`; a copy whose tag is deleted from the draft, or
+undone, stays in the sidecar while the draft is one and is removed when
+it is sent, so the retired sidecar holds what went. A copy is also named
+for the recipient without a bidirectional control a name may carry, so
+it cannot show another extension than it has. A tag written by hand
+still attaches the file it names, read when the draft is sent. Nothing
+is attached while a send is awaited or once the server has taken the
+draft.
 
 ## Sending
 

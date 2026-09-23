@@ -389,8 +389,13 @@ impl Pane {
     /// not by a chord (which the pane's keymap may take otherwise, or
     /// refuse unfocused), and the text goes in only when it is there; a
     /// newline goes before the text when the document does not end in
-    /// one. Whether the document changed (a read-only one does not), or
-    /// why the text was refused.
+    /// one. The selection is then put back where it was, as it is when
+    /// the text is refused, so typing goes on where it was going: a caret
+    /// at the document's end stays before the newline put in, or with
+    /// none put in moves after the text, never into its line, and a range
+    /// reaching the end stays before the text rather than taking it in.
+    /// Whether the document changed (a read-only one does not), or why
+    /// the text was refused.
     fn append(&mut self, tab: TabId, text: &str) -> Result<bool, String> {
         let Ok(document) = self.controller.editor().document(tab) else {
             return Ok(false);
@@ -398,23 +403,21 @@ impl Pane {
         if document.read_only() {
             return Ok(false);
         }
-        let text = if document.text().is_empty() || document.text().ends_with('\n') {
+        let lined = document.text().is_empty() || document.text().ends_with('\n');
+        let text = if lined {
             text.to_string()
         } else {
             format!("\n{text}")
         };
         let end = document.text().len();
-        let Some((tab, revision)) = self.target_of(tab) else {
-            return Ok(false);
-        };
-        self.event(Event::Edit {
+        let before = document.selection();
+        self.select(
             tab,
-            revision,
-            command: Command::Select(Selection {
+            Selection {
                 anchor: end,
                 caret: end,
-            }),
-        });
+            },
+        );
         let at_end = self
             .controller
             .editor()
@@ -424,6 +427,7 @@ impl Pane {
                 document.text().len() == end && selection.anchor == end && selection.caret == end
             });
         if !at_end {
+            self.select(tab, before);
             return Err("the draft's end could not be reached".to_string());
         }
         let Some((tab, revision)) = self.target_of(tab) else {
@@ -434,8 +438,47 @@ impl Pane {
                 paste.push(text.as_bytes())?;
                 Ok(paste)
             })
-            .map_err(|error| describe(error, "the text"))?;
-        Ok(self.event(Event::Paste(paste)) == Outcome::Changed)
+            .map_err(|error| describe(error, "the text"));
+        let changed = match paste {
+            Ok(paste) => self.event(Event::Paste(paste)) == Outcome::Changed,
+            Err(why) => {
+                self.select(tab, before);
+                return Err(why);
+            }
+        };
+        if !changed {
+            self.select(tab, before);
+            return Ok(false);
+        }
+        let after = end.saturating_add(text.len());
+        let empty = before.anchor == before.caret;
+        let back = |at: usize| {
+            if at < end || !lined || !empty {
+                at
+            } else {
+                after
+            }
+        };
+        self.select(
+            tab,
+            Selection {
+                anchor: back(before.anchor),
+                caret: back(before.caret),
+            },
+        );
+        Ok(true)
+    }
+
+    /// The document `tab`'s selection set, by the editor's own command,
+    /// at its current revision.
+    fn select(&mut self, tab: TabId, selection: Selection) {
+        if let Some((tab, revision)) = self.target_of(tab) {
+            self.event(Event::Edit {
+                tab,
+                revision,
+                command: Command::Select(selection),
+            });
+        }
     }
 
     /// The kill ring into the document, over its selection: whether the
@@ -574,8 +617,9 @@ impl<'a> Draft<'a> {
         }
     }
 
-    /// `text` on a line of its own at the end of the document, the caret
-    /// after it: whether the document changed, or why it was refused.
+    /// `text` on a line of its own at the end of the document, the
+    /// selection kept (`Pane::append`): whether the document changed, or
+    /// why it was refused.
     pub fn append(&mut self, text: &str) -> Result<bool, String> {
         match self.tab {
             Some(tab) => self.pane.append(tab, text),
@@ -906,8 +950,9 @@ mod tests {
     }
 
     /// Appended text goes on a line of its own at the end of the draft,
-    /// wherever the caret was, the caret after it; a held draft, a
-    /// read-only text and no document take nothing.
+    /// wherever the caret was, the selection kept, and a caret at the end
+    /// kept out of the appended line; a held draft, a read-only text and
+    /// no document take nothing.
     #[test]
     fn appended_text_goes_on_its_own_line_at_the_drafts_end() {
         let mut pane = Pane::new().unwrap();
@@ -925,17 +970,78 @@ mod tests {
             Ok(true)
         );
         pane.focus(true);
-        let text = || pane.editor().document(tab).unwrap().text().to_string();
-        assert_eq!(text(), "To: a\n--text follows this line--\nhi\n<#part>\n");
+        let text = |pane: &Pane| pane.editor().document(tab).unwrap().text().to_string();
+        assert_eq!(
+            text(&pane),
+            "To: a\n--text follows this line--\nhi\n<#part>\n"
+        );
         assert_eq!(
             Draft::new(&mut pane, Some(tab)).append("<#two>\n"),
             Ok(true)
         );
         assert_eq!(pane.chord("x"), Outcome::Changed);
         assert_eq!(
-            pane.editor().document(tab).unwrap().text(),
-            "To: a\n--text follows this line--\nhi\n<#part>\n<#two>\nx",
-            "the caret is after what was appended"
+            text(&pane),
+            "xTo: a\n--text follows this line--\nhi\n<#part>\n<#two>\n",
+            "the caret stays where it was"
+        );
+        // A selection before the end is kept as it was.
+        let select = |pane: &mut Pane, anchor: usize, caret: usize| {
+            let revision = pane.editor().document(tab).unwrap().revision();
+            pane.event(Event::Edit {
+                tab,
+                revision,
+                command: Command::Select(Selection { anchor, caret }),
+            });
+        };
+        select(&mut pane, 1, 3);
+        assert_eq!(
+            Draft::new(&mut pane, Some(tab)).append("<#three>\n"),
+            Ok(true)
+        );
+        let selection = pane.editor().document(tab).unwrap().selection();
+        assert_eq!((selection.anchor, selection.caret), (1, 3));
+        // At the end after a newline, the caret goes past the appended
+        // line rather than into it.
+        let end = text(&pane).len();
+        select(&mut pane, end, end);
+        assert_eq!(
+            Draft::new(&mut pane, Some(tab)).append("<#four>\n"),
+            Ok(true)
+        );
+        assert_eq!(pane.chord("y"), Outcome::Changed);
+        assert!(
+            text(&pane).ends_with("<#three>\n<#four>\ny"),
+            "{}",
+            text(&pane)
+        );
+        // At the end of a last line, it stays on that line.
+        assert_eq!(pane.chord("C-End"), Outcome::Changed);
+        assert_eq!(
+            Draft::new(&mut pane, Some(tab)).append("<#five>\n"),
+            Ok(true)
+        );
+        assert_eq!(pane.chord("z"), Outcome::Changed);
+        assert!(
+            text(&pane).ends_with("<#four>\nyz\n<#five>\n"),
+            "{}",
+            text(&pane)
+        );
+        // A range reaching the end stays before the appended line, so
+        // what is typed over it does not take the line with it.
+        let end = text(&pane).len();
+        select(&mut pane, end - 3, end);
+        assert_eq!(
+            Draft::new(&mut pane, Some(tab)).append("<#six>\n"),
+            Ok(true)
+        );
+        let selection = pane.editor().document(tab).unwrap().selection();
+        assert_eq!((selection.anchor, selection.caret), (end - 3, end));
+        assert_eq!(pane.chord("Backspace"), Outcome::Changed);
+        assert!(
+            text(&pane).ends_with("<#four>\nyz\n<#fiv<#six>\n"),
+            "{}",
+            text(&pane)
         );
         Draft::new(&mut pane, Some(tab)).hold(true);
         assert_eq!(Draft::new(&mut pane, Some(tab)).append("no"), Ok(false));

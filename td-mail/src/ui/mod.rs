@@ -1735,6 +1735,40 @@ mod frame_tests {
         }
     }
 
+    /// Plays the backend's part for the attach commands sent so far: each
+    /// copy made as the backend makes it, under the fetch service's bound,
+    /// answered and polled; the other commands drained are answered.
+    fn serve_attach(
+        session: &mut Session,
+        cmd_rx: &Receiver<BackendCommand>,
+        resp_tx: &Sender<BackendResponse>,
+    ) -> Vec<BackendCommand> {
+        let mut others = Vec::new();
+        while let Ok(command) = cmd_rx.try_recv() {
+            match command {
+                BackendCommand::AttachFile {
+                    draft,
+                    sidecar,
+                    source,
+                } => {
+                    let result =
+                        attach::attach_file(&draft, sidecar.as_deref(), &source, attach::CEILING)
+                            .map_err(|e| e.to_string());
+                    resp_tx
+                        .send(BackendResponse::FileAttached {
+                            draft,
+                            source,
+                            result,
+                        })
+                        .unwrap();
+                }
+                other => others.push(other),
+            }
+        }
+        session.poll(0);
+        others
+    }
+
     fn press(session: &mut Session, x: i64, y: i64) {
         for phase in [PointerPhase::Press, PointerPhase::Release] {
             session.input(
@@ -2304,6 +2338,30 @@ mod frame_tests {
         assert_eq!(session.chooser.as_ref().unwrap().folder, files.join("docs"));
         key(&mut session, "Return");
         assert!(session.chooser.is_none());
+        // The copy is the backend's: until it answers nothing is tagged,
+        // and the draft is not sent, closed or attached to again, though
+        // it is still the pane's to type in.
+        assert_eq!(text(&session), template);
+        let attaching = |session: &Session| status(session).starts_with("Attaching report.pdf");
+        assert!(attaching(&session), "{}", status(&session));
+        key(&mut session, "C-Return");
+        assert!(attaching(&session), "{}", status(&session));
+        key(&mut session, "C-w");
+        assert!(attaching(&session), "{}", status(&session));
+        assert_eq!(session.stack.depth(), 2);
+        // The window's close waits for the copy too, the draft clean.
+        assert!(!session.draft().dirty());
+        assert_eq!(session.close_requested(), Flow::Continue);
+        assert_eq!(session.stack.depth(), 2);
+        key(&mut session, "C-S-a");
+        assert!(session.chooser.is_none() && attaching(&session));
+        let others = serve_attach(&mut session, &cmd_rx, &resp_tx);
+        assert!(
+            !others
+                .iter()
+                .any(|c| matches!(c, BackendCommand::SendDraft { .. })),
+            "nothing is sent before its tag is in"
+        );
         let tag = |name: &str, shown: &str| {
             format!(
                 "<#part type=\"application/pdf\" filename=\"{}\" disposition=\"attachment\"{shown}>\n<#/part>\n",
@@ -2343,6 +2401,7 @@ mod frame_tests {
         assert!(session.chooser.is_some(), "one press selects");
         press(&mut session, list.x + 4, list.y + 4);
         assert!(session.chooser.is_none(), "the second chooses");
+        serve_attach(&mut session, &cmd_rx, &resp_tx);
         assert_eq!(
             text(&session),
             format!(
@@ -2353,6 +2412,36 @@ mod frame_tests {
         );
 
         let attached = text(&session);
+
+        // A copy the backend refuses tags nothing, the reason in the status;
+        // an answer for another file than the one awaited is not this one.
+        key(&mut session, "C-S-a");
+        key(&mut session, "Return");
+        while cmd_rx.try_recv().is_ok() {}
+        let answer = |source: &Path, result: Result<attach::Attached, String>| {
+            BackendResponse::FileAttached {
+                draft: path.clone(),
+                source: source.to_path_buf(),
+                result,
+            }
+        };
+        resp_tx
+            .send(answer(&files.join("other.pdf"), Err("stray".to_string())))
+            .unwrap();
+        session.poll(0);
+        assert!(attaching(&session), "{}", status(&session));
+        resp_tx
+            .send(answer(
+                &files.join("docs/report.pdf"),
+                Err("attachment is 4 bytes, past the 3 the server takes".to_string()),
+            ))
+            .unwrap();
+        session.poll(0);
+        assert_eq!(
+            status(&session),
+            "Not attached: attachment is 4 bytes, past the 3 the server takes"
+        );
+        assert_eq!(text(&session), attached);
 
         // A press on the row and then on the list below the rows, or two
         // with the mouse off, choose nothing.

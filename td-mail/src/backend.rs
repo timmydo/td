@@ -102,6 +102,16 @@ pub enum BackendCommand {
     SendDraft {
         path: PathBuf,
     },
+    /// Copy the file at `source` into the draft's attachment sidecar and
+    /// make its tag (`attach::attach_file`), off the window's thread, the
+    /// file bounded by what the account's server takes when connected
+    /// and by the fetch service's request bound offline; the draft itself
+    /// is not changed.
+    AttachFile {
+        draft: PathBuf,
+        sidecar: Option<PathBuf>,
+        source: PathBuf,
+    },
     PreviewRetentionExpiry {
         policies: Vec<RetentionPolicyConfig>,
     },
@@ -219,6 +229,11 @@ pub enum BackendResponse {
     DraftSent {
         path: PathBuf,
         result: Result<SentDraft, String>,
+    },
+    FileAttached {
+        draft: PathBuf,
+        source: PathBuf,
+        result: Result<crate::attach::Attached, String>,
     },
     RetentionPreview {
         result: Result<RetentionPreviewResult, String>,
@@ -1154,6 +1169,19 @@ fn handle_offline_command(
             let _ = resp_tx.send(BackendResponse::DraftSent {
                 path: path.clone(),
                 result: Err(offline_error("cannot send", reason)),
+            });
+        }
+        // Attaching is local: offline it is bounded by the fetch service's
+        // request bound, the server's own not known.
+        BackendCommand::AttachFile {
+            draft,
+            sidecar,
+            source,
+        } => {
+            let _ = resp_tx.send(BackendResponse::FileAttached {
+                draft: draft.clone(),
+                source: source.clone(),
+                result: attach_file(draft, sidecar.as_deref(), source, crate::attach::CEILING),
             });
         }
         BackendCommand::PreviewRetentionExpiry { .. } => {
@@ -2219,6 +2247,25 @@ fn backend_loop(
                     .and_then(|opt| opt.ok_or_else(|| "Email not found".to_string()));
                 let _ = resp_tx.send(BackendResponse::EmailRaw { id, result });
             }
+            BackendCommand::AttachFile {
+                draft,
+                sidecar,
+                source,
+            } => {
+                log_info!(
+                    "[Backend] cmd#{} AttachFile {} to {}",
+                    command_seq,
+                    source.display(),
+                    draft.display()
+                );
+                let result =
+                    attach_file(&draft, sidecar.as_deref(), &source, client.upload_ceiling());
+                let _ = resp_tx.send(BackendResponse::FileAttached {
+                    draft,
+                    source,
+                    result,
+                });
+            }
             BackendCommand::SendDraft { path } => {
                 log_info!("[Backend] cmd#{} SendDraft {}", command_seq, path.display());
                 let result = send_draft(client, &path, &mut lost_sends);
@@ -2614,6 +2661,20 @@ fn send_draft(
         email_id: submitted.email_id,
         submission_id: submitted.submission_id,
         kept_in,
+    })
+}
+
+/// The file at `source` copied into the draft's sidecar under `ceiling`,
+/// and its tag, or why not.
+fn attach_file(
+    draft: &Path,
+    sidecar: Option<&Path>,
+    source: &Path,
+    ceiling: u64,
+) -> Result<crate::attach::Attached, String> {
+    crate::attach::attach_file(draft, sidecar, source, ceiling).map_err(|e| {
+        log_warn!("[Backend] AttachFile {} refused: {}", source.display(), e);
+        e.to_string()
     })
 }
 
@@ -3368,6 +3429,45 @@ mod tests {
     use super::*;
     use crate::cache::Cache;
     use std::collections::HashMap;
+
+    /// Offline, an attach is still made, bounded by the fetch service's
+    /// request bound since the server's is not known.
+    #[test]
+    fn an_offline_backend_attaches_under_the_fetch_bound() {
+        let dir = crate::testing::tempdir().unwrap();
+        let drafts = dir.path().join("td-mail/drafts");
+        std::fs::create_dir_all(&drafts).unwrap();
+        let draft = drafts.join("td-mail-draft-1-1.eml");
+        std::fs::write(&draft, "From: me@example.com\n").unwrap();
+        let source = dir.path().join("notes.txt");
+        std::fs::write(&source, "n").unwrap();
+        let (resp_tx, resp_rx) = mpsc::channel();
+        let command = BackendCommand::AttachFile {
+            draft: draft.clone(),
+            sidecar: None,
+            source: source.clone(),
+        };
+        assert!(handle_offline_command(
+            &command,
+            &resp_tx,
+            &None,
+            &mut Vec::new(),
+            1,
+            Some("no network")
+        ));
+        let Ok(BackendResponse::FileAttached {
+            draft: answered,
+            source: from,
+            result: Ok(attached),
+        }) = resp_rx.try_recv()
+        else {
+            panic!("no attach answered");
+        };
+        assert_eq!((answered, from), (draft, source));
+        assert!(attached.created);
+        assert_eq!(attached.path, drafts.join("td-mail-att-1-1/notes.txt"));
+        assert_eq!(std::fs::read_to_string(&attached.path).unwrap(), "n");
+    }
 
     /// A backend started connecting holds a fetch until the connection is
     /// decided: a failure answers it from the (absent) cache with the

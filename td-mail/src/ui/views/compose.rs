@@ -13,11 +13,14 @@
 //! the draft is retired to the sent directory and the view pops, or
 //! the refusal is the status row's and the draft is the pane's again,
 //! to be mended. Attach opens the finder over the body, and the file
-//! chosen is copied into the draft's attachment sidecar and its
-//! `<#part>` tag added at the draft's end (`crate::attach`), so the
-//! send reads the copy. Every chord is the pane's while the draft is
-//! being edited; the view's own keys are the bar's labels and, while it
-//! asks, the answer.
+//! chosen is copied by the backend into the draft's attachment sidecar
+//! (`crate::attach`), off the window's thread and bounded by what the
+//! server takes when connected; on its answer the `<#part>` tag is added
+//! at the draft's end, so the send reads the copy. While the copy is made the
+//! draft is the pane's, but it is not sent, closed or attached to
+//! again, so nothing goes before its tag is in. Every chord is the
+//! pane's while the draft is being edited; the view's own keys are the
+//! bar's labels and, while it asks, the answer.
 
 use crate::backend::{BackendCommand, BackendResponse};
 use crate::ui::frame::Draft;
@@ -55,6 +58,12 @@ pub struct ComposeView {
     sent: Option<crate::backend::SentDraft>,
     /// Attach opened the finder, whose close has not reached the view.
     choosing: bool,
+    /// The file the backend is copying into the sidecar, its answer not
+    /// yet in: the draft is not sent, closed or attached to meanwhile.
+    attaching: Option<PathBuf>,
+    /// The backend's answer for the file it copied, which the view puts
+    /// into its draft once the session hands it the draft.
+    landed: Option<(PathBuf, Result<crate::attach::Attached, String>)>,
     status: String,
     cmd_tx: Sender<BackendCommand>,
     pending: Option<ViewAction>,
@@ -90,6 +99,8 @@ impl ComposeView {
             sending: false,
             sent: None,
             choosing: false,
+            attaching: None,
+            landed: None,
             status,
             cmd_tx,
             pending: None,
@@ -135,6 +146,9 @@ impl ComposeView {
     /// read-only): only its move is retried, the view popping when it
     /// goes.
     fn send(&mut self, draft: &mut Draft<'_>) -> ViewAction {
+        if self.copying() {
+            return ViewAction::Continue;
+        }
         if self.sending {
             self.status = format!(
                 "Sending {} already; waiting for the server",
@@ -179,20 +193,55 @@ impl ComposeView {
         true
     }
 
-    /// The file chosen for the draft: copied into its sidecar, which it
-    /// has from then on, and its tag added at the draft's end, unsaved
-    /// as any edit is; a tag the pane refuses has its copy removed again,
-    /// and the sidecar too when this made it and it is empty.
-    fn attach_file(&mut self, chosen: &Path, draft: &mut Draft<'_>) {
-        let attached = match crate::attach::attach_file(
-            &self.path,
-            self.attachment_dir.as_deref(),
-            chosen,
-            crate::attach::CEILING,
-        ) {
+    /// Whether a file is being attached to the draft, its copy made or
+    /// its answer not yet placed, the status saying so when it is; asked
+    /// only where the answer is a refusal because of it.
+    fn copying(&mut self) -> bool {
+        let Some(source) = self
+            .attaching
+            .as_ref()
+            .or(self.landed.as_ref().map(|(source, _)| source))
+        else {
+            return false;
+        };
+        let name = source.file_name().map_or_else(
+            || source.display().to_string(),
+            |name| name.to_string_lossy().into_owned(),
+        );
+        self.status = format!("Attaching {name}; wait for the copy");
+        true
+    }
+
+    /// The file chosen for the draft, handed to the backend to copy into
+    /// the sidecar; its answer comes as `FileAttached`.
+    fn attach_file(&mut self, chosen: &Path) {
+        match self.cmd_tx.send(BackendCommand::AttachFile {
+            draft: self.path.clone(),
+            sidecar: self.attachment_dir.clone(),
+            source: chosen.to_path_buf(),
+        }) {
+            Ok(()) => {
+                self.attaching = Some(chosen.to_path_buf());
+                self.copying();
+            }
+            Err(e) => self.status = format!("Attach failed to reach the backend: {e}"),
+        }
+    }
+
+    /// The backend's copy of `chosen`: its tag added at the draft's end,
+    /// unsaved as any edit is, the sidecar the draft's from then on; a
+    /// tag the pane refuses has its copy removed again, and the sidecar
+    /// too when it was new and is empty.
+    fn place(
+        &mut self,
+        chosen: &Path,
+        attached: Result<crate::attach::Attached, String>,
+        draft: &mut Draft<'_>,
+    ) {
+        let attached = match attached {
             Ok(attached) => attached,
             Err(e) => {
-                crate::log_error!("Could not attach {}: {}", chosen.display(), e);
+                crate::log_warn!("Could not attach {}: {}", chosen.display(), e);
                 self.status = format!("Not attached: {e}");
                 return;
             }
@@ -219,7 +268,7 @@ impl ComposeView {
             }
             Some(why) => {
                 let removed = std::fs::remove_file(&attached.path);
-                if self.attachment_dir.is_none() {
+                if attached.created {
                     let _ = std::fs::remove_dir(&attached.sidecar);
                 }
                 crate::log_error!("Could not add the tag for {}: {}", chosen.display(), why);
@@ -320,8 +369,14 @@ impl View for ComposeView {
     fn request(&mut self, name: &str, draft: &mut Draft<'_>) -> ViewAction {
         match name {
             "send" => self.send(draft),
+            "attached" => {
+                if let Some((chosen, attached)) = self.landed.take() {
+                    self.place(&chosen, attached, draft);
+                }
+                ViewAction::Continue
+            }
             "attach" => {
-                if !self.changeable() {
+                if self.copying() || !self.changeable() {
                     return ViewAction::Continue;
                 }
                 self.status = "Attach: Return opens a folder or attaches the file, \
@@ -340,7 +395,9 @@ impl View for ComposeView {
                 ViewAction::Continue
             }
             "close-tab" | "quit" => {
-                if self.sending {
+                if self.copying() {
+                    ViewAction::Continue
+                } else if self.sending {
                     self.status = format!(
                         "Sending {}; it closes when the server answers",
                         self.file_name()
@@ -362,6 +419,20 @@ impl View for ComposeView {
     }
 
     fn on_response(&mut self, response: &BackendResponse) -> bool {
+        if let BackendResponse::FileAttached {
+            draft,
+            source,
+            result,
+        } = response
+        {
+            if *draft != self.path || self.attaching.as_ref() != Some(source) {
+                return false;
+            }
+            self.attaching = None;
+            self.landed = Some((source.clone(), result.clone()));
+            self.pending = Some(ViewAction::Request("attached"));
+            return true;
+        }
         let BackendResponse::DraftSent { path, result } = response else {
             return false;
         };
@@ -383,13 +454,13 @@ impl View for ComposeView {
         true
     }
 
-    fn attach(&mut self, chosen: Option<&Path>, draft: &mut Draft<'_>) -> ViewAction {
+    fn attach(&mut self, chosen: Option<&Path>, _draft: &mut Draft<'_>) -> ViewAction {
         self.choosing = false;
         match chosen {
             None => self.status = "Nothing attached".to_string(),
             Some(chosen) => {
-                if self.changeable() {
-                    self.attach_file(chosen, draft);
+                if !self.copying() && self.changeable() {
+                    self.attach_file(chosen);
                 }
             }
         }
@@ -412,7 +483,7 @@ impl View for ComposeView {
     }
 
     fn waiting(&self) -> bool {
-        self.sending
+        self.sending || self.attaching.is_some() || self.landed.is_some()
     }
 
     fn held(&self) -> bool {

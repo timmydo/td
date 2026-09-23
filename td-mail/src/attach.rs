@@ -194,12 +194,13 @@ pub fn media_type(name: &str) -> &'static str {
     }
 }
 
-/// A file attached: the sidecar it was copied into, the copy's path, the
-/// name the recipient sees, its size, and the tag naming it, to go into
-/// the draft.
-#[derive(Debug)]
+/// A file attached: the sidecar it was copied into and whether this
+/// made it, the copy's path, the name the recipient sees, its size, and
+/// the tag naming it, to go into the draft.
+#[derive(Clone, Debug)]
 pub struct Attached {
     pub sidecar: PathBuf,
+    pub created: bool,
     pub path: PathBuf,
     pub name: String,
     pub bytes: usize,
@@ -298,6 +299,7 @@ pub fn attach_file(
     match result {
         Ok((path, tag)) => Ok(Attached {
             sidecar,
+            created,
             path,
             name,
             bytes: bytes.len(),

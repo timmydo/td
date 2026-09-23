@@ -10061,13 +10061,14 @@ the server received and where the draft went.
 
 **Attaching: a file chosen in td-ui's finder.** Ctrl-Shift-A, or the
 bar's Attach, opens td-ui's shared finder (`td-ui/DESIGN.md`, "Shared
-directory finder") over the draft's body, and td-mail lists each
-folder itself, so what it offers is what the jail lets it read, its
-state directory and the `xdg-download` grant: no new grant and no
-portal call, since the FileChooser portal grants nothing outside an
-existing grant either (§E, row 3) and td-mail carries no D-Bus client.
-The chosen file is copied into the draft's attachment sidecar, read as
-the send reads a part, and its `<#part>` tag goes at the draft's end,
+directory finder") over the draft's body, and td-mail lists each folder
+itself, so what it offers is what the jail lets it read, its state
+directory and the `xdg-download` grant: no new grant and no portal call,
+since the FileChooser portal grants nothing outside an existing grant
+either (§E, row 3) and td-mail carries no D-Bus client. The chosen file
+is copied into the draft's attachment sidecar by the backend, off the
+window's thread, read as the send reads a part and bounded by what the
+connected server takes, and its `<#part>` tag goes at the draft's end,
 so the send reads the copy and the copy retires with the draft, whose
 tags are pointed at the sidecar's place in `sent`, a copy whose tag was
 taken out removed as unsent.
