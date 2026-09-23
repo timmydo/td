@@ -3,7 +3,9 @@
 ## How to use this plan
 
 Read `DESIGN.md`, root `AGENTS.md`, and `DEVELOPMENT.md` before work.
-Storage tasks also read the normative `STORAGE.md`. This plan
+Service-facing tasks also read `RESOURCES.md` and `ADMISSION.md`, including
+their named milestone-specific evidence. Storage tasks read `STORAGE.md`.
+This plan
 describes future implementation; none of its tasks are complete merely because
 this file exists. Its scope is the personal service specified in the design.
 
@@ -141,7 +143,7 @@ writing production mail or advertising capabilities.
   APIs in `ports.rs`/`sync.rs`, API.md and QUEUE.md. **M02c3** is completed
   in three independently reviewed parts: **M02c3a** accounts for transaction/
   reply staging and fixed worker/pool ownership; **M02c3b** freezes disk/work/
-  maintenance budgets and request/result retention; **M02c3c** freezes
+  maintenance budgets and request/result retention in ADMISSION.md; **M02c3c** freezes
   thread/search/MIME policies and the traceable wire fixture inventory.
   None relaxes the M02 dependency gate for protocol consumers.
 
@@ -201,6 +203,9 @@ effective configuration, alias/identity resolution and secret-file references.
 Define typed JSON log/status encoders with maximum sizes and redaction. Add
 config check and redacted effective-config library operations; later CLI wiring
 uses these exact functions.
+Implement ADMISSION.md's checked u64 disk/work configuration and filesystem
+reservation coordinator. This does not implement a platform space probe;
+M05 supplies that reviewed boundary and its fault-injected fake.
 
 **Acceptance:** oversized/malformed/duplicate/unknown config fails with location
 and stable codes; no secret is echoed. Resource overflow, exhausted slots and
@@ -209,6 +214,10 @@ Bounded structures never increase capacity after construction. No networking,
 store mutations, live reload or filesystem log rotation in this task.
 
 ## M05 — Immutable blobs and journal commit/replay
+
+ADMISSION.md's physical completion reserves and free-space probe are required
+before write admission. Any unsafe platform probe follows the separate
+UNSAFE.md amendment/confinement workflow; no new surface is preauthorized.
 
 **Depends on:** M02/M04/M07. **Own:** storage I/O adapter, blob files, journal codec,
 store locking and initial replay; no search index or protocol endpoints.
@@ -283,6 +292,11 @@ through CURRENT in the specified order. Sparse/secondary disk indexes remain
 rebuildable. Bound retired-generation pins and enforce history floors, disk
 reservations and checkpoint overlap budgets. Implement body reclamation only
 inside the specified exclusive maintenance window, including queue/lease roots.
+Enforce ADMISSION.md's corrected checkpoint record-overhead reserve, separate
+closed-journal/history charges, background-view arbitration, startup orphan
+cleanup and quota-derived maintenance work bounds. Prove a complete GC pass
+at configured caps across bounded candidate windows and a validated scheduling
+cursor; a scan that always restarts without progress is not reclamation support.
 
 **Acceptance:** remove indexes, rebuild and compare object IDs, bytes, folder
 membership and states. Readers never observe half a transaction or an index
@@ -367,6 +381,10 @@ Include a gateway-only listener with a distinct server hostname and verify
 the upstream peer's hostname/chain checks against its provisioned certificate.
 
 ## M13 — HTTPS, authentication and JMAP Core
+
+Use ADMISSION.md's exact bounded response spool, creation-ID map, result
+reference evaluation and per-method capacity preflight. Required tests include
+query/mutation/reference ordering and failure after an earlier committed method.
 
 **Depends on:** M02/M04/M07/M09. **Own:** HTTP server framing, bounded JSON token
 parser/writer, auth/device verification, discovery and core dispatcher.

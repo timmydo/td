@@ -7,6 +7,8 @@ registry and byte layout. M02 completes row codecs and golden fixtures before
 any production data is written; scalar/key codecs alone do not open a store.
 [API.md](API.md) owns adapter/state contracts; [QUEUE.md](QUEUE.md) owns the
 submission transition and restart contract.
+[ADMISSION.md](ADMISSION.md) owns disk/reservation ceilings, maintenance work
+and deadlines, and private request-result retention.
 
 ## 1. Storage model
 
@@ -57,10 +59,12 @@ get distinct email/blob IDs. V1 does not deduplicate message contents.
       journal/000043.log         active file named by selected manifest
       journal/000041.log         retained change history, when selected
     cache/                       entirely rebuildable and version-tagged
+      gc-cursor                  disposable reclamation scheduling hint
       000042/email-offsets.idx
       000042/mailbox-order.idx
       000042/search.idx
     tmp/                         unpublished bodies/checkpoints/sort scratch
+      requests/REQUEST/          disposable private JMAP response/creation map
   devices/                       private device verifiers, separate schema
   acme/                          private keys, orders and certificate generations
 ```
@@ -385,8 +389,10 @@ sync stops the writer for recovery; it must not guess which journal to append
 to. Checkpoints rewrite metadata only, never unchanged message bodies.
 
 Readers and one admitted backup pin old generations. At most two retired
-generations may remain pinned in the default profile; a further checkpoint
-waits within its deadline or defers new mutations with temporary errors. Read
+generations may remain pinned in the default profile; a checkpoint that would
+exceed that count waits or defers admission. Replacing an unpinned current
+generation does not add a retired pin. ADMISSION.md also bounds closed journals
+independently of advertised history. Read
 views have deadlines and release descriptors/buffers on cancellation. Do not
 grow memory or delete pinned state to make checkpoint progress. Measure write
 pause duration on the many-small-message corpus; if this architecture cannot
@@ -457,45 +463,38 @@ for all read views, streams, outbound attempts and the backup to drain. If the
 deadline expires, defer reclamation and restore normal admission/dispatch.
 Only after draining enter the exclusive phase, with maintenance as the sole
 writer and no new work admitted. Flush and checkpoint the current view.
-Stream authoritative live references from email rows,
-submission rows and valid upload leases into bounded external-sort scratch;
-merge against blob inventory. Never rely solely on an in-memory reference count.
-Referenced MIME attachments are already inside immutable message bytes; assembly
-must finish before upload leases can be released.
+Use a fixed window of at most 128 blob IDs, selected from current inventory
+and validated message/upload shard entries. ADMISSION.md fixes its scratch,
+work and restart cursor. For each candidate window, stream all authoritative
+owning references from current email rows, submission rows and valid upload
+leases, marking candidate IDs live. A missing/corrupt reference scan never
+proves absence. MIME attachments remain inside their parent immutable message;
+assembly finishes before upload leases can be released.
+
+Only after a complete scan under that same exclusive window may an unmarked
+candidate be reclaimed. Remove its inventory and expired lease rows in a
+durable transaction, then unlink its file and sync the affected directory.
+Batches obey both the frame limit and the 100-file work ceiling. A crash may
+leave an orphan file but never a live reference to deleted bytes. Candidate
+selection also enumerates messages/ and uploads/ so files never registered by
+an interrupted publication are eventually found. Report unexpected names/types;
+never follow symlinks or remove a file merely because of its age.
 
 Both drain and exclusive phases have finite configured deadlines and I/O work
-budgets, frozen in M02. On reaching an exclusive-phase limit, finish the current
-bounded durable batch, retain safe progress and resume admission/dispatch.
-Storage faults instead enter the normal recovery/refusal path. Readiness and
-logs expose maintenance; refusals are retryable. This intentionally accepts a
-temporary service pause. Concurrent reclamation is outside v1: elapsed age
-alone cannot prove that no read view or in-flight writer needs a body.
+budgets in ADMISSION.md. On reaching an exclusive-phase limit, finish the current
+admitted durable batch, retain safe cursor progress, and resume service. If a
+candidate window's proof is incomplete, unlink none of its unproved IDs. The
+next window rescans current references after reacquiring exclusivity; a saved
+cursor is only a scheduling hint, never a saved liveness result. Progress uses
+validated namespace/shard/blob-ID ordering, not a directory-entry offset that
+can become invalid after unlink. New IDs before the cursor are visited after
+wraparound. Concurrent reclamation remains outside v1.
 
-Use private `tmp/sort/RUN/` directories with exclusive run names and a 64 MiB
-default account scratch quota. External sorting uses preallocated run buffers
-and bounded merge fan-in/file descriptors from the M02 ledger. Charge every
-spill byte before writing; exhaustion defers reclamation without touching live
-blobs. Failed or abandoned sort runs are disposable and removed under the
-exclusive lock at startup, before listeners open. Never treat checkpoint or
-body publication files as sort scratch.
-
-For unreferenced blobs, first remove inventory rows and expired lease rows in
-a durable transaction, then unlink their files and sync directories. Use bounded
-batches if one frame cannot hold the sweep. A crash may leave an orphan file,
-which the next sweep can remove; it cannot leave a live reference to deleted
-bytes. Orphans from interrupted publication are identified by inventory absence
-only while the exclusive window proves no writer/upload can be using them.
-Do not unlink files based only on age or a filename absent from one old index.
-
-Inventory scanning alone cannot find files never registered by a commit.
-In the exclusive phase, enumerate `messages/` and `uploads/` shards with a
-bounded directory cursor, validating each filename/type and comparing IDs
-against the current committed inventory. External sort batches use the same
-scratch quota, fixed buffers and I/O budget. Only confirmed absent IDs can be
-removed as orphans. Report unexpected entries; never follow symlinks. The
-writer remains stopped through each comparison/unlink batch. On interruption
-or budget exhaustion a later exclusive sweep may restart traversal; progress
-must not depend on a directory-entry offset surviving directory changes.
+Generic query/index external sorts still use private tmp/sort/RUN/ directories,
+exclusive names and the 64 MiB default quota. Their preallocated buffers,
+merge fan-in and overlap charges come from ADMISSION.md. Sort exhaustion is an
+explicit failure and cannot authorize deleting a live blob. Abandoned runs are
+removed under LOCK at startup, separately from publication/checkpoint files.
 
 Disk reservations include temporary bodies, journal/history, active/retired
 checkpoints, backup pins and merge scratch. Free-space checks do not eliminate

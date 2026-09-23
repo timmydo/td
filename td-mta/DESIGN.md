@@ -240,6 +240,12 @@ error object inside its body: finish from its admitted view or terminate it.
 An online backup uses one read slot; interactive work shares the other. This
 intentional concurrency limit preserves the memory budget.
 
+[ADMISSION.md](ADMISSION.md) fixes disk quotas, checkpoint completion space,
+maintenance drain/exclusive budgets, network timers and exact JMAP response
+retention. These are admission contracts, not measured throughput or guarantees
+against a host disk filling concurrently. They gate persistence and protocol
+implementations alongside the RAM ledger.
+
 Initial default ceilings (validated together at startup):
 
 | Resource | Default limit |
@@ -258,7 +264,7 @@ Initial default ceilings (validated together at startup):
 | Combined resident index cache | 8 MiB |
 | Storage read views | 2, each with a 4 MiB journal arena plus bounded descriptors |
 | Unattached upload storage | 128 MiB per account, expiry after 24 hours |
-| Pending outbound storage | 256 MiB and 1000 submissions |
+| Retained submission storage | 256 MiB and 1000 submissions |
 | Maintenance sort scratch on disk | 64 MiB per account |
 | Active log plus retained generations | 8 MiB each, 4 retained |
 

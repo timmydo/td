@@ -51,7 +51,7 @@ configured memory budget does not preserve the default RSS claim.
   get/set/query result window entry, and 96 KiB framing/output scratch.
   Escaped strings are streamed; request tokens borrow the request arena.
   Earlier method results and created-ID maps use the bounded disk retention
-  contract in M02c3b, never extra per-method heap trees. Event streams use slots
+  contract in ADMISSION.md, never extra per-method heap trees. Event streams use slots
   without pinning storage views between emissions.
 - Body job: headers, 64 bytes per MIME descriptor, 96 KiB decode/work scratch.
   Nested parsing and transfer decoding share that reservation.
@@ -68,6 +68,8 @@ configured memory budget does not preserve the default RSS claim.
   a time from the input bytes while encoding the separate output frame; never
   retain a self-referencing row array or alias input with mutable output.
   Pending commits reference fixed protocol slots and have no private frame.
+  Exclusive GC reuses 4 KiB of writer scratch for 128 candidate cells; it
+  cannot allocate an inventory-sized live-ID set.
 - Outbound: exactly 100 envelope cells of 320 bytes, 100 distinct 4096-byte
   RCPT reply cells, and 128 KiB transfer/reply scratch. This per-attempt batch
   is independent of the configured inbound recipient ceiling. The final DATA
@@ -94,8 +96,9 @@ configured memory budget does not preserve the default RSS claim.
 Message size, upload/queue quotas, queue length and log file limits are disk or
 admission bounds. Growing them does not reserve whole bodies or a whole queue in
 RAM. The default log disk reservation is five 8 MiB files (active plus four
-retained). Free-space/metadata/inode quotas and storage maintenance reservations
-are frozen by M02c3b and enforced by M05/M08 before mail can be accepted.
+retained). ADMISSION.md freezes free-space/metadata/inode quotas, completion
+reserves and maintenance work/deadlines, enforced by M05/M08 before mail can
+be accepted.
 
 The per-upload byte ceiling is `message_bytes`, initially 32 MiB; M13 publishes
 that value as `maxSizeUpload` and enforces it even for attachment uploads.
@@ -106,8 +109,9 @@ records the default byte ledger only. Journal/frame limits are fixed to the
 storage contract. SMTP retains room for at least 100 recipients. Disabled event
 streams may use zero slots; mandatory pools and byte budgets cannot be zero.
 The bounds are startup validation, not protocol error mappings or proof that
-all combinations meet standards. M02c3b/M02c3c add operation-specific work/field
-limits, and M13 publishes only limits that its admission code actually enforces.
+all combinations meet standards. ADMISSION.md fixes operation work limits;
+M02c3c adds parser/search field limits. M13 publishes only limits that its
+admission code actually enforces.
 
 ## Fixed execution ownership
 
@@ -184,12 +188,14 @@ Event streams use main's normal nonblocking output scheduling and one coalesced
 state notification per slot; they hold no read view or body worker between
 emissions. Health uses a bounded cached snapshot. The control worker can update
 that snapshot without making every health poll wait for an ACME/DNS request.
-Only one sort/search job leases the shared sort buffer at a time. Backup uses
-one existing read view and control coordination, leaving the other default
-view for interactive work. Extra view/job requests wait in the bounded queue;
+Only one sort/search job leases the shared sort buffer at a time. Long background
+views share one permit under ADMISSION.md: backup and outbound body transfer
+cannot together occupy both default views. Backup uses an existing view and
+control coordination, preserving one foreground view. Extra requests wait;
 they do not allocate replacements.
-With storage_views=1 online backup is disabled with a temporary capacity error;
-offline backup remains possible. The fixed 64 reservation records are a shared
+An online configuration enabling backup/outbound background views requires
+storage_views >= 2; one-view foreground/offline profiles remain valid.
+The fixed 64 reservation records are a shared
 admission cap, not one guaranteed record per configured connection. Connections
 without a record wait/refuse before body or metadata effects; each outbound
 attempt must acquire its phase and outcome records before the acceptance fence.
@@ -201,14 +207,14 @@ TLS session. V1 allows one outbound SMTP transaction at once. A control lease
 lasts at most 60 seconds; release it between ACME polling waits.
 When both classes wait, alternate a queue attempt and a
 control lease. This schedules opportunities, not a promise of successful
-network progress. Every lease also has idle/total deadlines from M02c3b.
+network progress. ADMISSION.md fixes every lease's idle/total deadlines.
 
 Migration is an offline CLI operation holding the exclusive store lock, not a
 job in the running service. It instantiates the same checked ledger with one
 outbound slot and HTTPS request/token arenas for JMAP source pages, with no
 serving listeners or queue dispatch. Its source-response ceiling is json_bytes
 and json_tokens; page sizes must fit, and an overlarge page is an explicit
-failure. Raw blobs stream under message_bytes. M02c3b fixes finite transfer
+failure. Raw blobs stream under message_bytes. ADMISSION.md fixes finite transfer
 deadlines suitable for an offline import rather than ACME's 60-second lease.
 M21 must measure this separate process and its bounded page/body lifecycle.
 
@@ -277,7 +283,7 @@ only for bounded operation lifetimes and reauthorize Access as API.md specifies.
 Exact stanza/field limits and snapshot structs are M04's implementation gate.
 
 This ledger does not budget whole earlier JMAP responses, generic JSON trees,
-or all MIME body values in memory. M02c3b defines bounded private response
+or all MIME body values in memory. ADMISSION.md defines bounded private response
 spools/result references and their work/disk admission. M02c3c defines parser,
 charset/search/thread policies and the fixture inventory. Those remaining
 contracts still gate every M02 consumer.

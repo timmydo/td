@@ -4,8 +4,8 @@ This normative M02c2 contract accompanies the compiling interfaces in
 src/ports.rs and the state codecs in src/sync.rs. Interfaces do not supply a
 store, network runtime, cryptographic provider or allocation/durability proof.
 M05/M07–M09 implement and test the adapters; M13–M17 implement their protocol
-consumers. RESOURCES.md fixes worker/buffer ownership; M02c3b supplies work
-and disk ledgers before consumers.
+consumers. RESOURCES.md fixes worker/buffer ownership; ADMISSION.md fixes
+disk/work ledgers and exact request retention before consumers.
 
 ## 1. Ownership and I/O
 
@@ -147,10 +147,13 @@ DiskBudget separately reserves physical new-blob bytes/files, metadata
 bytes/files and logical upload/queue quota increases (including a new pin on
 an existing body). Logical quotas may overlap physical bytes and are not
 added to them a second time. When size is unknown reserve the admitted maximum.
-M02c3b fixes quota ceilings and checkpoint/free-space headroom; no blob creation
+ADMISSION.md fixes quota ceilings and checkpoint/free-space headroom; no blob creation
 may bypass this reservation. Exceeding a logical quota returns Quota; temporary
 pool/storage pressure returns Capacity/Busy. Dropping or expiring releases
 unused capacity once; already-written orphan bytes remain charged until cleanup.
+DiskBudget covers store operations. Request retention, sort/cache runs, logs
+and cold-state files have separate typed leases from the same filesystem
+admission coordinator; they cannot bypass its aggregate completion reserves.
 
 Store::begin_blob borrows an active reservation exclusively and charges its
 physical quota before creating the private file. BlobWriter writes whole
@@ -339,6 +342,7 @@ Unknown well-formed IDs have notFound semantics as specified by WIRE.md.
 | --- | --- |
 | No admission/read slot before HTTP headers | Retryable HTTP 503 with bounded Retry-After |
 | Temporary Busy/Capacity/Deadline before this JMAP method has any effects | serverUnavailable; earlier method successes remain in the response |
+| Deterministic per-request output/work ceiling, before this method's effects | serverFail with the exhausted limit; an identical retry is not promised to fit |
 | Request-level maxSizeRequest/maxCallsInRequest/maxConcurrentRequests exceeded | HTTP problem details of type urn:ietf:params:jmap:error:limit with the limit property, before processing any method |
 | Method object/count/size or logical quota limit | requestTooLarge or method-specific tooLarge/overQuota as the applicable RFC requires; never reuse requestTooLarge for arbitrary output size |
 | Client ifInState mismatch | stateMismatch before object mutations |
@@ -349,18 +353,22 @@ Unknown well-formed IDs have notFound semantics as specified by WIRE.md.
 
 Method-level errors other than serverPartialFail require no externally
 visible change by that method (RFC 8620 §3.6.2). If earlier objects in a Set
-method committed, return its normal per-object success/error results for the
-remaining objects; do not replace them with a method-level serverUnavailable
-or serverFail. Reserve response capacity before mutation. serverPartialFail
-is reserved for an unavoidable known partial method effect requiring resync;
-an indeterminate journal outcome follows section 3, never a guessed result.
+method committed, return normal per-object results where the remaining
+refusals have truthful defined SetError semantics. Predictable resource
+exhaustion must be refused before mutation. An unavoidable later failure
+without a suitable standard SetError uses serverPartialFail and requires
+resync; never replace known effects with method-level serverUnavailable or
+serverFail. RFC 8620 §5.3 does not enumerate those generic method failures
+as SetErrors. ADMISSION.md specifies the exact retained-response behavior.
+Reserve response capacity before mutation. An indeterminate journal outcome
+follows section 3, never a guessed result.
 
 SMTP rejects unavailable admission with temporary status before DATA and
 returns final 250 only after proven durable commit. No local error maps to
 acceptance. After HTTP headers are sent, a read failure closes the incomplete
 response; never emit a second HTTP status or valid-looking truncated JSON.
-M02c3b supplies response retention so later method failures cannot erase
-earlier successes. Tests in this increment cover token bytes/bounds/scoping;
+ADMISSION.md supplies response retention so later method failures cannot erase
+earlier method successes. Tests in M02c2 cover token bytes/bounds/scoping;
 future adapter and protocol suites must prove these operational mappings.
 
 Sources: [JMAP Core, RFC 8620 §5](https://www.rfc-editor.org/rfc/rfc8620.html#section-5)
